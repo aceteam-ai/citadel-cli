@@ -1,40 +1,46 @@
-/*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-
-*/
 package cmd
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 )
 
+var nexusURL string
+
 // loginCmd represents the login command
 var loginCmd = &cobra.Command{
 	Use:   "login",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "Authenticate the CLI with the AceTeam Nexus",
+	Long: `This command authenticates the Citadel CLI with your AceTeam account.
+It will trigger a device-based OAuth flow, asking you to open a browser
+and log in to authorize this machine to join your private network.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("login called")
+		fmt.Println("--- Starting AceTeam Authentication ---")
+		fmt.Println("Please follow the instructions in your browser to complete login.")
+
+		// Construct the tailscale command
+		tailscaleCmd := exec.Command("tailscale", "login", "--login-server="+nexusURL)
+
+		// Pipe the command's output directly to our terminal so the user can see it
+		tailscaleCmd.Stdout = os.Stdout
+		tailscaleCmd.Stderr = os.Stderr
+
+		// Run the command
+		err := tailscaleCmd.Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error running tailscale login: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("\n✅ Authentication successful! This machine can now join the fabric.")
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(loginCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// loginCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// loginCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	loginCmd.Flags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
+	loginCmd.MarkFlagRequired("nexus")
 }
