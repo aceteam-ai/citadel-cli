@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -73,6 +75,18 @@ type ollamaErrorResponse struct {
 	Error string `json:"error"`
 }
 
+func getUserHomeDir() string {
+	// When running under sudo, SUDO_USER has the original user's name
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		// This is a bit of a shortcut; a more robust way would be to look up the user.
+		// For our case, this is reliable enough.
+		return "/home/" + sudoUser
+	}
+	// Fallback for when not running under sudo
+	homeDir, _ := os.UserHomeDir()
+	return homeDir
+}
+
 // executeJob runs the job, captures its output, and reports the status back to Nexus.
 func executeJob(client *nexus.Client, job *nexus.Job) {
 	var output []byte
@@ -90,6 +104,165 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 		parts := strings.Fields(cmdString)
 		cmd := exec.Command(parts[0], parts[1:]...)
 		output, err = cmd.CombinedOutput()
+
+	case "DOWNLOAD_MODEL":
+		repoURL, repoOk := job.Payload["repo_url"]
+		fileName, fileOk := job.Payload["file_name"]
+		modelType, typeOk := job.Payload["model_type"]
+		if !repoOk || !fileOk || !typeOk {
+			err = fmt.Errorf("job payload missing 'repo_url', 'file_name', or 'model_type'")
+			break
+		}
+
+		fullURL, urlErr := url.JoinPath(repoURL, "resolve/main", fileName)
+		if urlErr != nil {
+			err = fmt.Errorf("could not construct valid download URL: %w", urlErr)
+			break
+		}
+
+		// Use the current user's home directory, which is correct since the agent now runs as the user.
+		homeDir, _ := os.UserHomeDir()
+		destDir := filepath.Join(homeDir, "citadel-cache", modelType)
+		destPath := filepath.Join(destDir, fileName)
+
+		fmt.Printf("     - [Job %s] Preparing to download model to %s\n", job.ID, destPath)
+
+		// This ensures that even if Docker created it first as root, we can still use it.
+		// A better long-term fix is to not run the agent as root, but this is robust.
+		// Let's create the parent directory first.
+		parentDir := filepath.Dir(destDir)
+		if err = os.MkdirAll(parentDir, 0777); err != nil {
+			err = fmt.Errorf("failed to create parent cache directory %s: %w", parentDir, err)
+			break
+		}
+		// Now create the final directory.
+		if err = os.MkdirAll(destDir, 0777); err != nil {
+			err = fmt.Errorf("failed to create destination directory %s: %w", destDir, err)
+			break
+		}
+
+		// Let's also be explicit about setting permissions.
+		exec.Command("chmod", "-R", "777", parentDir).Run()
+
+		if _, statErr := os.Stat(destPath); statErr == nil {
+			fmt.Printf("     - [Job %s] Model already exists. Skipping download.\n", job.ID)
+			output = []byte(fmt.Sprintf("Model '%s' already exists at %s", fileName, destPath))
+			break
+		}
+
+		// Use curl to download the file.
+		fmt.Printf("     - [Job %s] Starting download...\n", job.ID)
+		cmd := exec.Command("curl", "-L", "--create-dirs", "-o", destPath, fullURL)
+		output, err = cmd.CombinedOutput()
+
+	case "LLAMACPP_INFERENCE":
+		modelFile, modelOk := job.Payload["model_file"]
+		prompt, promptOk := job.Payload["prompt"]
+		if !modelOk || !promptOk {
+			err = fmt.Errorf("job payload missing 'model_file' or 'prompt' field")
+			break
+		}
+
+		// --- Step 1: Restart the llama.cpp container with the correct model ---
+		fmt.Printf("     - [Job %s] Configuring llama.cpp to use model '%s'\n", job.ID, modelFile)
+
+		// This is a simplification. A better way would be to read the manifest to find the compose file path.
+		homeDir := getUserHomeDir()
+		composeFile := filepath.Join(homeDir, "services/llamacpp.yml")
+
+		// The new command for the container
+		newCommand := fmt.Sprintf("--model /models/%s --host 0.0.0.0 --port 8080 --n-gpu-layers 35", modelFile)
+
+		// Use `docker compose up`. It will recreate the container if its config (like the command) has changed.
+		restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
+
+		// *** FIX: Set the environment variable to pass the new command to the container ***
+		restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))
+
+		if output, restartErr := restartCmd.CombinedOutput(); restartErr != nil {
+			err = fmt.Errorf("failed to restart llama.cpp service with new model: %s", string(output))
+			break
+		}
+
+		// Give the server a moment to start up and load the model
+		fmt.Printf("     - [Job %s] Waiting for llama.cpp server to initialize...\n", job.ID)
+		time.Sleep(10 * time.Second) // Increased wait time for model loading
+
+		// --- Step 2: Perform the inference ---
+		fmt.Printf("     - [Job %s] Running Llama.cpp inference\n", job.ID)
+
+		// *** FIX: The missing inference logic is now included ***
+		llamacppURL := "http://localhost:8080/completion"
+		requestPayload := map[string]interface{}{
+			"prompt":      prompt,
+			"n_predict":   256,
+			"temperature": 0.7,
+		}
+		reqBody, _ := json.Marshal(requestPayload)
+
+		resp, httpErr := http.Post(llamacppURL, "application/json", bytes.NewBuffer(reqBody))
+		if httpErr != nil {
+			err = fmt.Errorf("failed to connect to llama.cpp service: %w", httpErr)
+			break
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			err = fmt.Errorf("llama.cpp API returned non-200 status: %s, Body: %s", resp.Status, string(bodyBytes))
+			break
+		}
+
+		var responsePayload map[string]interface{}
+		if json.NewDecoder(resp.Body).Decode(&responsePayload) != nil {
+			err = fmt.Errorf("failed to parse llama.cpp response")
+			break
+		}
+		content, ok := responsePayload["content"].(string)
+		if !ok {
+			err = fmt.Errorf("could not find 'content' in llama.cpp response: %+v", responsePayload)
+			break
+		}
+		output = []byte(content)
+
+	case "VLLM_INFERENCE":
+		model, modelOk := job.Payload["model"]
+		prompt, promptOk := job.Payload["prompt"]
+		if !modelOk || !promptOk {
+			err = fmt.Errorf("job payload missing 'model' or 'prompt' field")
+			break
+		}
+		fmt.Printf("     - [Job %s] Running vLLM inference on model '%s'\n", job.ID, model)
+
+		// 1. Construct the request to the local vLLM service (OpenAI compatible)
+		vllmURL := "http://localhost:8000/v1/completions"
+		requestPayload := map[string]interface{}{
+			"model":       model,
+			"prompt":      prompt,
+			"max_tokens":  256,
+			"temperature": 0.7,
+		}
+		reqBody, _ := json.Marshal(requestPayload)
+
+		// 2. Execute and handle response
+		resp, httpErr := http.Post(vllmURL, "application/json", bytes.NewBuffer(reqBody))
+		if httpErr != nil {
+			err = fmt.Errorf("failed to connect to vllm service: %w", httpErr)
+			break
+		}
+		defer resp.Body.Close()
+
+		// 3. Parse the OpenAI-compatible response
+		var responsePayload struct {
+			Choices []struct {
+				Text string `json:"text"`
+			} `json:"choices"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&responsePayload) != nil || len(responsePayload.Choices) == 0 {
+			err = fmt.Errorf("failed to parse vLLM response or no choices returned")
+			break
+		}
+		output = []byte(responsePayload.Choices[0].Text)
 
 	case "OLLAMA_INFERENCE":
 		model, modelOk := job.Payload["model"]

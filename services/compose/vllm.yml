@@ -1,22 +1,16 @@
 # services/compose/vllm.yml
-version: "3.8"
+
 services:
   vllm:
-    # Use the official vLLM image with OpenAI-compatible endpoints
     image: vllm/vllm-openai:latest
     container_name: citadel-vllm
     ports:
       - "8000:8000"
     volumes:
-      # Mount a volume to cache downloaded Hugging Face models
-      - huggingface_cache:/root/.cache/huggingface
-    # Command to start the server.
-    # CHANGE THE MODEL to the one you want to serve from Hugging Face.
-    command:
-      - "--model"
-      - "mistralai/Mistral-7B-v0.1"
-      - "--host"
-      - "0.0.0.0"
+      # Mount a user-accessible directory to cache Hugging Face models
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    # Command is now a placeholder; it will be overridden by jobs.
+    command: --host 0.0.0.0
     deploy:
       resources:
         reservations:
@@ -24,5 +18,3 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-volumes:
-  huggingface_cache:

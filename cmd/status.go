@@ -10,7 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"text/tabwriter"
+	"time"
 
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
 )
 
@@ -23,73 +28,190 @@ type TailscaleStatus struct {
 	} `json:"Self"`
 }
 
-// statusCmd represents the status command
 var statusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Shows the status of the Citadel node and its services",
-	Long: `Provides a health check of the Citadel node. It checks:
-1. Network Status: Verifies connection to the AceTeam Nexus via Tailscale.
-2. Service Status: Checks the state of containers defined in citadel.yaml.`,
+	Short: "Shows a comprehensive status of the Citadel node",
+	Long: `Provides a full health check and resource overview of the Citadel node.
+It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
+and the state of all managed services.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("--- Citadel Node Status ---")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		defer w.Flush()
 
-		// 1. Check Network Status
-		fmt.Println("\n🌐 Network Status:")
-		tsCmd := exec.Command("tailscale", "status", "--json")
-		output, err := tsCmd.Output()
-		if err != nil {
-			fmt.Println("  ❌ Could not get Tailscale status. Is the daemon running? Try 'sudo systemctl start tailscaled'")
-			fmt.Fprintf(os.Stderr, "     Error: %v\n", err)
+		fmt.Fprintln(w, "--- 📊 Citadel Node Status ---")
+
+		// --- 1. System Vitals ---
+		fmt.Fprintln(w, "\n💻 SYSTEM VITALS\t")
+		printMemInfo(w)
+		printCPUInfo(w)
+		printDiskInfo(w)
+
+		// --- 2. GPU Status ---
+		fmt.Fprintln(w, "\n💎 GPU STATUS\t")
+		printGPUInfo(w)
+
+		// --- 3. Network Status ---
+		fmt.Fprintln(w, "\n🌐 NETWORK STATUS\t")
+		printNetworkInfo(w)
+
+		// --- 4. Service Status ---
+		fmt.Fprintln(w, "\n🚀 MANAGED SERVICES\t")
+		printServiceInfo(w)
+	},
+}
+
+func printMemInfo(w *tabwriter.Writer) {
+	v, err := mem.VirtualMemory()
+	if err != nil {
+		fmt.Fprintf(w, "  Memory:\tError getting memory info: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "  Memory:\t%.1f%% (%s / %s)\n", v.UsedPercent, formatBytes(v.Used), formatBytes(v.Total))
+}
+
+func printCPUInfo(w *tabwriter.Writer) {
+	percentages, err := cpu.Percent(time.Second, false)
+	if err != nil || len(percentages) == 0 {
+		fmt.Fprintf(w, "  CPU Usage:\tError getting CPU info: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "  CPU Usage:\t%.1f%%\n", percentages[0])
+}
+
+func printDiskInfo(w *tabwriter.Writer) {
+	d, err := disk.Usage("/")
+	if err != nil {
+		fmt.Fprintf(w, "  Disk (/):\tError getting disk info: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "  Disk (/):\t%.1f%% (%s / %s)\n", d.UsedPercent, formatBytes(d.Used), formatBytes(d.Total))
+}
+
+func printGPUInfo(w *tabwriter.Writer) {
+	// nvidia-smi is the source of truth. Query it for specific fields.
+	cmd := exec.Command("nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintln(w, "  NVIDIA GPU:\tNot detected or nvidia-smi not found.\t")
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for i, line := range lines {
+		parts := strings.Split(line, ", ")
+		if len(parts) < 6 {
+			continue
+		}
+		gpuName := parts[0]
+		temp := parts[1]
+		power := parts[2]
+		memUsed := parts[3]
+		memTotal := parts[4]
+		util := parts[5]
+
+		fmt.Fprintf(w, "  GPU %d:\t%s\n", i, gpuName)
+		fmt.Fprintf(w, "  \tTemp: %s°C\tPower: %sW\tUtil: %s%%\n", temp, power, util)
+		fmt.Fprintf(w, "  \tMemory:\t%sMiB / %sMiB\n", memUsed, memTotal)
+	}
+}
+
+func printNetworkInfo(w *tabwriter.Writer) {
+	tsCmd := exec.Command("tailscale", "status", "--json")
+	output, err := tsCmd.Output()
+	if err != nil {
+		fmt.Fprintln(w, "  Connection:\t🔴 OFFLINE (Tailscale daemon not responding)\t")
+		return
+	}
+
+	var status TailscaleStatus
+	if err := json.Unmarshal(output, &status); err != nil {
+		fmt.Fprintln(w, "  Connection:\t⚠️  WARNING (Could not parse Tailscale status)\t")
+		return
+	}
+
+	if status.Self.Online {
+		fmt.Fprintln(w, "  Connection:\t🟢 ONLINE to Nexus\t")
+		fmt.Fprintf(w, "  Hostname:\t%s\n", strings.TrimSuffix(status.Self.DNSName, "."))
+		fmt.Fprintf(w, "  IP Address:\t%s\n", status.Self.TailscaleIPs[0])
+	} else {
+		fmt.Fprintln(w, "  Connection:\t🔴 OFFLINE (Not connected to Nexus)\t")
+	}
+}
+
+func printServiceInfo(w *tabwriter.Writer) {
+	manifest, err := readManifest("citadel.yaml")
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(w, "  (No citadel.yaml found, no services to check)\t\t")
 		} else {
-			var status TailscaleStatus
-			if err := json.Unmarshal(output, &status); err != nil {
-				fmt.Println("  ❌ Could not parse Tailscale status JSON.")
-			} else {
-				if status.Self.Online {
-					fmt.Println("  ✅ Connected to Nexus")
-					fmt.Printf("     - Hostname: %s\n", strings.TrimSuffix(status.Self.DNSName, "."))
-					fmt.Printf("     - IP Address: %s\n", status.Self.TailscaleIPs[0])
-				} else {
-					fmt.Println("  ⚠️  Not connected to Nexus. Node is offline.")
-				}
-			}
+			fmt.Fprintf(w, "  Error reading manifest: %v\n", err)
 		}
+		return
+	}
 
-		// 2. Check Service Status
-		fmt.Println("\n🚀 Service Status:")
-		manifest, err := readManifest("citadel.yaml")
+	if len(manifest.Services) == 0 {
+		fmt.Fprintln(w, "  (Manifest contains no services)\t\t")
+		return
+	}
+
+	for _, service := range manifest.Services {
+		psCmd := exec.Command("docker", "compose", "-f", service.ComposeFile, "ps", "--format", "json")
+		output, err := psCmd.Output()
 		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Println("  🤷 No citadel.yaml found, no manifest services to check.")
-				return
+			fmt.Fprintf(w, "  - %s:\t⚠️  Could not get status\n", service.Name)
+			continue
+		}
+
+		var containers []struct {
+			Name   string `json:"Name"`
+			State  string `json:"State"`
+			Health string `json:"Health"`
+			Image  string `json:"Image"`
+		}
+
+		// Docker compose ps --format json returns a stream of json objects, not an array
+		decoder := json.NewDecoder(strings.NewReader(string(output)))
+		for decoder.More() {
+			var c struct {
+				Name   string `json:"Name"`
+				State  string `json:"State"`
+				Health string `json:"Health"`
+				Image  string `json:"Image"`
 			}
-			fmt.Fprintf(os.Stderr, "  ❌ Error reading manifest: %v\n", err)
-			return
-		}
-
-		if len(manifest.Services) == 0 {
-			fmt.Println("  ℹ️  Manifest contains no services.")
-			return
-		}
-
-		for _, service := range manifest.Services {
-			fmt.Printf("  - Service: %s (%s)\n", service.Name, service.ComposeFile)
-			if _, err := os.Stat(service.ComposeFile); os.IsNotExist(err) {
-				fmt.Printf("    ❌ Status: Compose file not found.\n")
+			if err := decoder.Decode(&c); err != nil {
 				continue
 			}
-			psCmd := exec.Command("docker", "compose", "-f", service.ComposeFile, "ps", "--format", "pretty")
-			psOut, err := psCmd.CombinedOutput()
-			if err != nil {
-				fmt.Printf("    ❌ Could not get status: %v\n", err)
-			} else {
-				// Indent the output for better readability
-				for _, line := range strings.Split(strings.TrimSpace(string(psOut)), "\n") {
-					fmt.Printf("    %s\n", line)
-				}
-			}
+			containers = append(containers, c)
 		}
-	},
+
+		if len(containers) == 0 {
+			fmt.Fprintf(w, "  - %s:\t⚫ STOPPED\n", service.Name)
+		} else {
+			// For simplicity, report status of the first container for the service
+			state := strings.ToUpper(containers[0].State)
+			statusIcon := "⚫" // Default to stopped/unknown
+			if strings.Contains(state, "RUNNING") || strings.Contains(state, "UP") {
+				statusIcon = "🟢"
+			} else if strings.Contains(state, "EXITED") || strings.Contains(state, "DEAD") {
+				statusIcon = "🔴"
+			}
+			fmt.Fprintf(w, "  - %s:\t%s %s\n", service.Name, statusIcon, state)
+		}
+	}
+}
+
+// formatBytes is a helper to convert bytes to a human-readable string.
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func init() {
