@@ -8,8 +8,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var nexusURL string
-
 // loginCmd represents the login command
 var loginCmd = &cobra.Command{
 	Use:   "login",
@@ -41,6 +39,5 @@ and log in to authorize this machine to join your private network.`,
 
 func init() {
 	rootCmd.AddCommand(loginCmd)
-	loginCmd.Flags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
-	loginCmd.MarkFlagRequired("nexus")
+
 }

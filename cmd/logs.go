@@ -1,6 +1,5 @@
 /*
 Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-
 */
 package cmd
 
@@ -13,13 +12,11 @@ import (
 // logsCmd represents the logs command
 var logsCmd = &cobra.Command{
 	Use:   "logs",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "Get logs from Citadel",
+	Long: `Citadel is a CLI for AceTeam that deploys a secure translator agent in your network. 
+It takes commands from our AcetTeam Control Plane and translates them into actions on your ML network devices.
+This application is a tool to connect your ML network devices to the AceTeam Control Plane
+and provides an easy way to quickly create a Citadel application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("logs called")
 	},

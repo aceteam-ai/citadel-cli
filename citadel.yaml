@@ -1,0 +1,10 @@
+name: test-node-local
+tags: [testing, development]
+
+services:
+  - name: hello-world-service
+    type: simple-test
+    tags: [test]
+    endpoint: "none"
+    compose_file: docker-compose.test.yml
+
