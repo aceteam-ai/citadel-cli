@@ -1,36 +1,62 @@
 #!/bin/bash
 # build.sh
-# This script builds the Citadel CLI for common server architectures.
+# This script builds the Citadel CLI for common server architectures
+# and packages them for a formal release.
 
 set -e
 
-echo "--- Building Citadel CLI..."
-# Use git to determine version, fall back to "dev"
+echo "--- Building and Packaging Citadel CLI..."
+
+# --- Configuration ---
 VERSION=$(git describe --tags --always --dirty || echo "dev")
-OUTPUT_DIR="build"
-
-# Get the Go module path from go.mod
+BUILD_DIR="build"
+RELEASE_DIR="release"
 MODULE_PATH=$(go list -m)
-
-# The full path to the Version variable in the cmd package
 VERSION_VAR_PATH="${MODULE_PATH}/cmd.Version"
 
-# Clean previous builds
-rm -rf "$OUTPUT_DIR"
-echo "--- Cleaned old build directory ---"
+# --- Clean Up ---
+rm -rf "$BUILD_DIR" "$RELEASE_DIR"
+mkdir -p "$BUILD_DIR" "$RELEASE_DIR"
+echo "--- Cleaned old build and release directories ---"
 
-# --- Build for Linux AMD64 (most common servers) ---
-PLATFORM_DIR_AMD64="$OUTPUT_DIR/linux-amd64"
-mkdir -p "$PLATFORM_DIR_AMD64"
-echo "Building for linux/amd64..."
-GOOS=linux GOARCH=amd64 go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$PLATFORM_DIR_AMD64/citadel" .
+# --- Build and Package Loop ---
+ARCHS=("amd64" "arm64")
+for ARCH in "${ARCHS[@]}"; do
+    echo ""
+    echo "--- Processing linux/$ARCH ---"
+    
+    # Define paths and names
+    PLATFORM_DIR="$BUILD_DIR/linux-$ARCH"
+    BINARY_PATH="$PLATFORM_DIR/citadel"
+    RELEASE_NAME="citadel_${VERSION}_linux_${ARCH}.tar.gz"
+    RELEASE_PATH="$RELEASE_DIR/$RELEASE_NAME"
+    
+    mkdir -p "$PLATFORM_DIR"
 
-# --- Build for Linux ARM64 (e.g., AWS Graviton, Raspberry Pi) ---
-PLATFORM_DIR_ARM64="$OUTPUT_DIR/linux-arm64"
-mkdir -p "$PLATFORM_DIR_ARM64"
-echo "Building for linux/arm64..."
-GOOS=linux GOARCH=arm64 go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$PLATFORM_DIR_ARM64/citadel" .
+    # 1. Build the binary
+    echo "Building binary..."
+    GOOS=linux GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
 
+    # 2. Package into a .tar.gz
+    echo "Packaging to $RELEASE_NAME..."
+    # The -C flag changes directory before archiving, so we don't get the full path in the tarball.
+    tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel
+done
+
+# --- Generate Checksums ---
 echo ""
-echo "✅ Build complete. Binaries are in the './$OUTPUT_DIR' directory."
-tree "$OUTPUT_DIR"
+echo "--- Generating Checksums ---"
+(cd "$RELEASE_DIR" && sha256sum *.tar.gz > checksums.txt)
+
+echo "✅ Build and packaging complete."
+echo ""
+echo "Binaries for local use are in: './$BUILD_DIR'"
+tree "$BUILD_DIR"
+echo ""
+echo "Release artifacts are in: './$RELEASE_DIR'"
+tree "$RELEASE_DIR"
+echo ""
+echo "📋 SHA256 Checksums (copy this into your release notes):"
+echo "----------------------------------------------------"
+cat "$RELEASE_DIR/checksums.txt"
+echo "----------------------------------------------------"
