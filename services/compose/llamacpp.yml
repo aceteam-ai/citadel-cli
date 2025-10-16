@@ -1,0 +1,24 @@
+# services/compose/llamacpp.yml
+version: "3.8"
+services:
+  llamacpp:
+    # This image provides the llama.cpp server endpoint
+    image: ghcr.io/ggerganov/llama.cpp:server
+    container_name: citadel-llamacpp
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount a volume to store your downloaded models
+      - llamacpp_models:/models
+    # Command to start the server. You must place your GGUF models in the volume.
+    # This example loads a model named 'model.gguf'.
+    command: --model /models/model.gguf --host 0.0.0.0 --port 8080
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+volumes:
+  llamacpp_models:

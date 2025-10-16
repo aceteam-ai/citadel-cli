@@ -1,0 +1,24 @@
+# services/compose/lmstudio.yml
+version: "3.8"
+services:
+  lmstudio:
+    # Using a popular community-maintained image for headless LM Studio
+    image: technovangelist/lm-studio:latest
+    container_name: citadel-lmstudio
+    ports:
+      - "1234:1234"
+    volumes:
+      # Mount a volume to persist LM Studio's cache and models
+      - lmstudio_data:/root/.cache/lm-studio
+    # Required environment variable for the image
+    environment:
+      - DOCKER=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+volumes:
+  lmstudio_data:

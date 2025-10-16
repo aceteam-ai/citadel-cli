@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/aceboss/citadel-cli/services"
 
@@ -18,16 +19,16 @@ var detachRun bool
 var runCmd = &cobra.Command{
 	Use:   "run [service]",
 	Short: "Run a pre-packaged service like ollama, vllm, etc.",
-	Long: `Deploys a containerized, pre-configured service onto the node.
+	Long: fmt.Sprintf(`Deploys a containerized, pre-configured service onto the node.
 This command is for running ad-hoc services and does not use the citadel.yaml manifest.
-Available services: ollama, vllm`,
+Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		serviceName := args[0]
 		composeContent, ok := services.ServiceMap[serviceName]
 		if !ok {
 			fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
-			fmt.Println("Available services: ollama, vllm") // TODO: list keys from map
+			fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
 			os.Exit(1)
 		}
 
@@ -63,8 +64,10 @@ Available services: ollama, vllm`,
 
 		if detachRun {
 			fmt.Printf("\n✅ Service '%s' is running in the background.\n", serviceName)
-			fmt.Printf("   - To see logs, run: docker logs citadel-%s -f\n", serviceName)
-			fmt.Printf("   - To stop, run: docker stop citadel-%s\n", serviceName)
+			// Updated help text to be more specific
+			containerName := fmt.Sprintf("citadel-%s", serviceName)
+			fmt.Printf("   - To see logs, run: docker logs %s -f\n", containerName)
+			fmt.Printf("   - To stop, run: docker stop %s\n", containerName)
 		}
 	},
 }
