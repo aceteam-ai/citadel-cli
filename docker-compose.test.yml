@@ -1,4 +1,4 @@
-version: '3.8'
+# docker-compose.test.yml
 services:
   test-service:
     image: hello-world

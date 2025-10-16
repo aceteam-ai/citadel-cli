@@ -7,14 +7,14 @@ show_help() {
     echo
     echo 'Options:'
     echo '  --help              Show this help message and exit'
-    echo '  --file-types TYPES  Comma-separated list of file extensions to process (default: tsx,ts,sh,css,py,astro,go)'
+    echo '  --file-types TYPES  Comma-separated list of file extensions to process (default: tsx,ts,sh,css,py,astro,go,yml,yaml)'
     echo '  --copy-contents     Copy contents of processed files into a single file (default: false)'
     echo
     echo 'If no FOLDER is provided, the script runs from the current working directory.'
 }
 
 parse_arguments() {
-    file_types='tsx,ts,sh,css,py,astro,go'
+    file_types='tsx,ts,sh,css,py,astro,go,yml,yaml'
     copy_contents=false
     target_dir='.'
 
@@ -288,7 +288,30 @@ add_file_comment() {
             cat "$file" >> "$temp_file"
             echo "Added comment to $relative_path"
         fi
+        
+    elif [[ "$file_extension" == "yml" || "$file_extension" == "yaml" ]]; then
+        local new_comment="# $relative_path"
+        local first_line=$(head -n 1 "$file")
+
+        if [[ "$first_line" =~ ^#[[:space:]]* ]]; then
+            local existing_path=$(echo "$first_line" | sed 's/^#[[:space:]]*//')
+            if [[ "$existing_path" != "$relative_path" ]]; then
+                echo "$new_comment" > "$temp_file"
+                tail -n 2 "$file" >> "$temp_file"
+                echo "Updated comment in $relative_path (was: $existing_path)"
+            else
+                rm "$temp_file"
+                return
+            fi
+        else
+            echo "$new_comment" > "$temp_file"
+            cat "$file" >> "$temp_file"
+            echo "Added comment to $relative_path"
+        fi
+
     fi
+
+   
 
     cat "$temp_file" > "$file"
     rm "$temp_file"

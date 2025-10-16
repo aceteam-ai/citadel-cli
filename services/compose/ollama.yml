@@ -1,3 +1,4 @@
+# services/compose/ollama.yml
 version: "3.8"
 services:
   ollama:
