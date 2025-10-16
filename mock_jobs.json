@@ -40,10 +40,10 @@
     }
   },
   {
-    "id": "job-infer-vllm-mistral",
+    "id": "job-infer-vllm-qwen3",
     "type": "VLLM_INFERENCE",
     "payload": {
-      "model": "mistralai/Mistral-7B-Instruct-v0.1",
+      "model": "Qwen/Qwen3-0.6B",
       "prompt": "Explain the concept of a 'sovereign compute fabric' in three bullet points."
     }
   }

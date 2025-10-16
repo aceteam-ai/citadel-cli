@@ -272,26 +272,46 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 		output = []byte(content)
 
 	case "VLLM_INFERENCE":
-		model, modelOk := job.Payload["model"] // e.g., "mistralai/Mistral-7B-Instruct-v0.1"
+		model, modelOk := job.Payload["model"]
 		prompt, promptOk := job.Payload["prompt"]
 		if !modelOk || !promptOk {
 			err = fmt.Errorf("job payload missing 'model' or 'prompt' field")
 			break
 		}
 
-		fmt.Printf("     - [Job %s] Running vLLM inference on model '%s'\n", job.ID, model)
+		// --- HEALTH CHECK BLOCK ---
+		fmt.Printf("     - [Job %s] Waiting for vLLM service to become ready...\n", job.ID)
+		vllmHealthURL := "http://localhost:8000/health"
+		ready := false
+		maxWait := 60 * time.Second // Wait up to 60 seconds
+		pollInterval := 1 * time.Second
+		startTime := time.Now()
 
-		// The container is already running. We just talk to its API.
-		// No more docker compose restarts!
+		for time.Since(startTime) < maxWait {
+			resp, httpErr := http.Get(vllmHealthURL)
+			if httpErr == nil && resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				ready = true
+				break
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+			time.Sleep(pollInterval)
+		}
+
+		if !ready {
+			err = fmt.Errorf("vllm service did not become ready within %v", maxWait)
+			break
+		}
+		fmt.Printf("     - [Job %s] vLLM service is ready. Running inference on model '%s'\n", job.ID, model)
+		// --- END OF HEALTH CHECK BLOCK ---
 
 		vllmCompletionsURL := "http://localhost:8000/v1/completions"
-
-		// The key change: The 'model' is now part of the request payload,
-		// which is the standard OpenAI API format that vLLM emulates.
 		requestPayload := map[string]interface{}{
-			"model":       model, // <-- THIS IS THE MAGIC
+			"model":       model,
 			"prompt":      prompt,
-			"max_tokens":  512, // Increased for more useful responses
+			"max_tokens":  512,
 			"temperature": 0.7,
 		}
 		reqBody, _ := json.Marshal(requestPayload)
