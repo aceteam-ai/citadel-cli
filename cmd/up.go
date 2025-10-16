@@ -30,7 +30,7 @@ type CitadelManifest struct {
 // upCmd represents the up command
 var upCmd = &cobra.Command{
 	Use:   "up",
-	Short: "Brings a Citadel Node online and starts its services",
+	Short: "Brings a Citadel Node online and starts its services from a manifest",
 	Long: `Reads the citadel.yaml manifest, joins the network, and launches services.
 In interactive mode, it checks for an existing login.
 In automated mode (with --authkey), it joins the network non-interactively.`,

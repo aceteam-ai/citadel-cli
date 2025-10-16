@@ -1,6 +1,6 @@
 // cmd/nodes.go
 /*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
+Copyright © 2025 Jason Sun <jason@aceteam.ai>
 
 */
 package cmd

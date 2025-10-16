@@ -1,12 +1,13 @@
 // cmd/down.go
 /*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-
+Copyright © 2025 Jason Sun <jason@aceteam.ai>
 */
 package cmd
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 )
@@ -14,28 +15,55 @@ import (
 // downCmd represents the down command
 var downCmd = &cobra.Command{
 	Use:   "down",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "Stops and removes the services defined in citadel.yaml",
+	Long: `Reads the citadel.yaml manifest and runs 'docker compose down' for each
+service, stopping and removing the containers, networks, and volumes created by 'up'.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("down called")
+		manifest, err := readManifest("citadel.yaml")
+		if err != nil {
+			// If the manifest doesn't exist, there's nothing to do.
+			if os.IsNotExist(err) {
+				fmt.Println("🤷 No citadel.yaml found, nothing to bring down.")
+				return
+			}
+			fmt.Fprintf(os.Stderr, "❌ Error reading manifest: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("--- Tearing down services for node: %s ---\n", manifest.Name)
+
+		// We process in reverse order for graceful shutdown, though not strictly necessary.
+		for i := len(manifest.Services) - 1; i >= 0; i-- {
+			service := manifest.Services[i]
+			fmt.Printf("🔻 Stopping service: %s (%s)\n", service.Name, service.ComposeFile)
+			err := stopService(service)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   ❌ Failed to stop service %s: %v\n", service.Name, err)
+			} else {
+				fmt.Printf("   ✅ Service %s is down.\n", service.Name)
+			}
+		}
+		fmt.Println("\n🎉 Citadel Node services are offline.")
 	},
+}
+
+func stopService(s Service) error {
+	if s.ComposeFile == "" {
+		return fmt.Errorf("service %s has no compose_file defined", s.Name)
+	}
+
+	// Check if the compose file exists before trying to use it
+	if _, err := os.Stat(s.ComposeFile); os.IsNotExist(err) {
+		return fmt.Errorf("compose file '%s' not found, cannot stop service", s.ComposeFile)
+	}
+
+	composeCmd := exec.Command("docker", "compose", "-f", s.ComposeFile, "down")
+	output, err := composeCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker compose down failed: %s", string(output))
+	}
+	return nil
 }
 
 func init() {
 	rootCmd.AddCommand(downCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// downCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// downCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }

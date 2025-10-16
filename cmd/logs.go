@@ -1,38 +1,87 @@
 // cmd/logs.go
 /*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
+Copyright © 2025 Jason Sun <jason@aceteam.ai>
 */
 package cmd
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 )
 
+var follow bool
+var tail string
+
 // logsCmd represents the logs command
 var logsCmd = &cobra.Command{
-	Use:   "logs",
-	Short: "Get logs from Citadel",
-	Long: `Citadel is a CLI for AceTeam that deploys a secure translator agent in your network. 
-It takes commands from our AcetTeam Control Plane and translates them into actions on your ML network devices.
-This application is a tool to connect your ML network devices to the AceTeam Control Plane
-and provides an easy way to quickly create a Citadel application.`,
+	Use:   "logs <service-name>",
+	Short: "Fetch the logs of a running service",
+	Long: `Streams the logs for a specified service defined in the citadel.yaml manifest.
+This command uses 'docker compose logs' to retrieve the output from the service's containers.`,
+	Args: cobra.ExactArgs(1), // Requires exactly one argument: the service name
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("logs called")
+		serviceName := args[0]
+
+		manifest, err := readManifest("citadel.yaml")
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Println("  🤷 No citadel.yaml found, cannot find service.")
+				return
+			}
+			fmt.Fprintf(os.Stderr, "  ❌ Error reading manifest: %v\n", err)
+			return
+		}
+
+		var targetService *Service
+		for i, s := range manifest.Services {
+			if s.Name == serviceName {
+				targetService = &manifest.Services[i]
+				break
+			}
+		}
+
+		if targetService == nil {
+			fmt.Fprintf(os.Stderr, "Service '%s' not found in citadel.yaml\n", serviceName)
+			os.Exit(1)
+		}
+
+		dockerArgs := []string{
+			"compose",
+			"-f",
+			targetService.ComposeFile,
+			"logs",
+		}
+
+		if follow {
+			dockerArgs = append(dockerArgs, "--follow")
+		}
+		if tail != "" {
+			dockerArgs = append(dockerArgs, "--tail", tail)
+		}
+
+		dockerArgs = append(dockerArgs, serviceName)
+		logCmd := exec.Command("docker", dockerArgs...)
+
+		// Pipe the command's output directly to the user's terminal
+		logCmd.Stdout = os.Stdout
+		logCmd.Stderr = os.Stderr
+
+		fmt.Printf("--- Streaming logs for service '%s' (Ctrl+C to stop) ---\n", serviceName)
+		if err := logCmd.Run(); err != nil {
+			// The error is often just that the user pressed Ctrl+C, so we don't always need to print it.
+			// However, for debugging, it can be useful.
+			fmt.Fprintf(os.Stderr, "\nError streaming logs: %v\n", err)
+		}
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(logsCmd)
 
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// logsCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// logsCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// Add flags for 'follow' and 'tail' to mimic 'docker logs'
+	logsCmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output.")
+	logsCmd.Flags().StringVarP(&tail, "tail", "t", "100", "Number of lines to show from the end of the logs.")
 }
