@@ -9,9 +9,10 @@ services:
     volumes:
       # Mount a user-accessible directory to cache Hugging Face models
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
-    # Use an environment variable for the command.
-    # The part after the colon is the default if the variable isn't set.
-    command: ${VLLM_COMMAND:--host 0.0.0.0}
+    # This command starts the server without pre-loading any specific model
+    # can be started without a specific model, and it will download and
+    # cache models on-demand when they are first requested via the API
+    command: --host 0.0.0.0 --port 8000
     deploy:
       resources:
         reservations:

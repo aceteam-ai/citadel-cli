@@ -279,60 +279,17 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 			break
 		}
 
-		// --- Step 1: Restart the vLLM container with the correct model ---
-		fmt.Printf("     - [Job %s] Configuring vLLM to use model '%s'\n", job.ID, model)
+		fmt.Printf("     - [Job %s] Running vLLM inference on model '%s'\n", job.ID, model)
 
-		// This assumes the compose file is in a standard location relative to the user's home.
-		// This matches the pattern used by the Llama.cpp implementation.
-		homeDir := getUserHomeDir()
-		composeFile := filepath.Join(homeDir, "services/vllm.yml") // Make sure this path is correct in your setup
+		// The container is already running. We just talk to its API.
+		// No more docker compose restarts!
 
-		// The new command for the container, specifying the model from the job payload.
-		newCommand := fmt.Sprintf("--model %s --host 0.0.0.0", model)
-
-		// Use `docker compose up`. It will recreate the container because its config (the command) has changed.
-		restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
-
-		// Set the environment variable to pass the new command to the container
-		restartCmd.Env = append(os.Environ(), fmt.Sprintf("VLLM_COMMAND=%s", newCommand))
-
-		if output, restartErr := restartCmd.CombinedOutput(); restartErr != nil {
-			err = fmt.Errorf("failed to restart vllm service with new model: %s", string(output))
-			break
-		}
-
-		// --- Step 2: Wait for the vLLM server to become ready ---
-		fmt.Printf("     - [Job %s] Waiting for vLLM server to initialize and load model...\n", job.ID)
-
-		vllmHealthURL := "http://localhost:8000/health"
-		ready := false
-		maxWait := 5 * time.Minute // Give it up to 5 minutes to download and load a large model
-		pollInterval := 2 * time.Second
-		startTime := time.Now()
-
-		for time.Since(startTime) < maxWait {
-			resp, httpErr := http.Get(vllmHealthURL)
-			if httpErr == nil && resp.StatusCode == http.StatusOK {
-				resp.Body.Close()
-				ready = true
-				break
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
-			time.Sleep(pollInterval)
-		}
-
-		if !ready {
-			err = fmt.Errorf("vllm server did not become ready within %v", maxWait)
-			break
-		}
-		fmt.Printf("     - [Job %s] vLLM server is ready.\n", job.ID)
-
-		// --- Step 3: Perform the inference (This is your existing, correct code) ---
-		fmt.Printf("     - [Job %s] Running vLLM inference\n", job.ID)
 		vllmCompletionsURL := "http://localhost:8000/v1/completions"
+
+		// The key change: The 'model' is now part of the request payload,
+		// which is the standard OpenAI API format that vLLM emulates.
 		requestPayload := map[string]interface{}{
+			"model":       model, // <-- THIS IS THE MAGIC
 			"prompt":      prompt,
 			"max_tokens":  512, // Increased for more useful responses
 			"temperature": 0.7,
