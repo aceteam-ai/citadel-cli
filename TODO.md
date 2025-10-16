@@ -1,3 +1,29 @@
+# Citadel CLI TODO
+
+## Core Features
+
+- [x] `bootstrap` command for node provisioning
+- [x] `up` command to start services from manifest
+- [x] `down` command to stop services from manifest
+- [x] `status` command for node health check
+- [x] `logs` command to stream service logs
+- [x] `run` command for pre-packaged services (ollama, etc.)
+- [ ] `agent` command to listen for jobs from Nexus
+- [ ] `nodes` command to list nodes from Nexus API
+
+## Next Steps
+
+1.  **Implement Nexus API Client:** Create a new `internal/nexus` package. This will be a Go client for making authenticated API calls to the Nexus control plane. It will be used by `nodes` and `agent`.
+2.  **Implement `nodes` command:** Use the new Nexus API client to fetch and display a list of nodes. This will be the first real test of the API client.
+3.  **Flesh out `agent` command:** Replace the placeholder loop with a real gRPC client that connects to Nexus, listens for jobs, executes them, and reports status.
+
+## Polish & DX
+
+- [ ] `init` command to generate a template `citadel.yaml`.
+- [ ] `logout` command.
+- [ ] Integrate `viper` for configuration management.
+- [ ] Add more pre-packaged services to the `run` command (lmstudio, llamacpp).
+
 Alright, let's pop the case open and see what we've got. Today's October 1st, 2025, and we've got a good frame here, but we're missing the core components to make this thing really hum. You've built a solid scaffolding with `bootstrap`, `login`, and `up`. That's like having the chassis, power supply, and the OS installer ready.
 
 Here's a breakdown of what's missing to turn this into a fully functional system, ordered from most critical to "nice-to-have."
