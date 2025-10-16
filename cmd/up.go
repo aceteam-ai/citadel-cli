@@ -167,10 +167,11 @@ func startService(s Service) error {
 	if s.ComposeFile == "" {
 		return fmt.Errorf("service %s has no compose_file defined", s.Name)
 	}
-	composeCmd := exec.Command("docker-compose", "-f", s.ComposeFile, "up", "-d")
+
+	composeCmd := exec.Command("docker", "compose", "-f", s.ComposeFile, "up", "-d")
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker-compose failed: %s", string(output))
+		return fmt.Errorf("docker compose failed: %s", string(output))
 	}
 	return nil
 }

@@ -33,6 +33,7 @@ authkey. It is idempotent and can be run multiple times.`,
 			{"Package Lists", "", updateApt}, // No check needed for apt update
 			{"Core Dependencies", "", installCoreDeps},
 			{"Docker", "docker", installDocker},
+			{"Docker Service", "", startDockerDaemon},
 			{"System User", "", setupUser},
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
 			{"Tailscale", "tailscale", installTailscale},
@@ -72,10 +73,11 @@ authkey. It is idempotent and can be run multiple times.`,
 			os.Exit(1)
 		}
 
-		// Pass the authkey to the 'up' command
-		upCmd := exec.Command("/usr/bin/sudo", "-u", originalUser, executablePath,
-			"up", "--authkey", authKey,
-		)
+		// MODIFIED: Use `newgrp docker` to ensure the user's new group membership is active
+		// for the 'citadel up' command, allowing it to access the docker socket.
+		upCommandString := fmt.Sprintf("%s up --authkey %s", executablePath, authKey)
+		upCmd := exec.Command("/usr/bin/sudo", "-u", originalUser, "newgrp", "docker", "-c", upCommandString)
+
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
 
@@ -88,9 +90,15 @@ authkey. It is idempotent and can be run multiple times.`,
 
 // --- Helper Functions ---
 
+func startDockerDaemon() error {
+	fmt.Println("     - Starting Docker daemon (dockerd)...")
+	// In a non-systemd environment (like a container), we need to start the daemon manually.
+	cmd := exec.Command("sh", "-c", "dockerd > /dev/null 2>&1 &")
+	return cmd.Run()
+}
+
 func startTailscaleDaemon() error {
 	fmt.Println("     - Starting tailscaled service...")
-	// In a container, running the daemon directly in the background is most reliable.
 	// The `&` sends the command to the background.
 	cmd := exec.Command("sh", "-c", "tailscaled &")
 	return cmd.Run()
@@ -124,7 +132,6 @@ func installCoreDeps() error {
 	return runCommand("apt-get", "install", "-y", "-qq", "sudo", "curl", "gpg", "ca-certificates")
 }
 
-// MODIFIED: No longer needs to install curl/ca-certificates
 func installDocker() error {
 	fmt.Println("     - Running official Docker install script...")
 	installScript := "curl -fsSL https://get.docker.com | sh"
@@ -161,7 +168,6 @@ func setupUser() error {
 	// 3. Grant passwordless sudo to the user
 	fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
 	sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
-	// The file permissions (0440) are important for sudoers files.
 	err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
 	if err != nil {
 		return fmt.Errorf("failed to configure passwordless sudo: %w", err)
