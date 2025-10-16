@@ -62,7 +62,6 @@ This command uses 'docker compose logs' to retrieve the output from the service'
 			dockerArgs = append(dockerArgs, "--tail", tail)
 		}
 
-		dockerArgs = append(dockerArgs, serviceName)
 		logCmd := exec.Command("docker", dockerArgs...)
 
 		// Pipe the command's output directly to the user's terminal
@@ -72,12 +71,18 @@ This command uses 'docker compose logs' to retrieve the output from the service'
 		fmt.Printf("--- Streaming logs for service '%s' (Ctrl+C to stop) ---\n", serviceName)
 		if err := logCmd.Run(); err != nil {
 			// The error is often just that the user pressed Ctrl+C, so we don't always need to print it.
-			// However, for debugging, it can be useful.
-			fmt.Fprintf(os.Stderr, "\nError streaming logs: %v\n", err)
+			if exitError, ok := err.(*exec.ExitError); ok {
+				if exitError.ExitCode() != 130 { // 130 = script terminated by Ctrl+C
+					fmt.Fprintf(os.Stderr, "  ❌ Script terminated by Ctrl+C: %v\n", err)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "  ❌ Error executing docker logs: %v\n", err)
+			}
 		}
 	},
 }
 
+// NOTE: The init() function remains the same.
 func init() {
 	rootCmd.AddCommand(logsCmd)
 
