@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -38,7 +37,7 @@ authkey. It is idempotent and can be run multiple times.`,
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
 			{"Tailscale", "tailscale", installTailscale},
 			{"Tailscale Service", "", startTailscaleDaemon},
-			{"Wait for Tailscale Daemon", "", waitForTailscaleDaemon},
+			// The daemon-ready check is now handled by 'citadel up'
 		}
 
 		fmt.Println("--- 🚀 Starting Node Provisioning ---")
@@ -73,8 +72,9 @@ authkey. It is idempotent and can be run multiple times.`,
 			os.Exit(1)
 		}
 
+		// Pass the authkey to the 'up' command
 		upCmd := exec.Command("/usr/bin/sudo", "-u", originalUser, executablePath,
-			"up",
+			"up", "--authkey", authKey,
 		)
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
@@ -87,20 +87,6 @@ authkey. It is idempotent and can be run multiple times.`,
 }
 
 // --- Helper Functions ---
-func waitForTailscaleDaemon() error {
-	fmt.Println("     - Waiting for tailscaled to be ready...")
-	maxAttempts := 10
-	for i := 0; i < maxAttempts; i++ {
-		// Use a lightweight command like `tailscale version` which still needs the daemon
-		cmd := exec.Command("tailscale", "version")
-		if err := cmd.Run(); err == nil {
-			fmt.Println("     ✅ Daemon is ready.")
-			return nil // Success!
-		}
-		time.Sleep(500 * time.Millisecond) // Wait before retrying
-	}
-	return fmt.Errorf("timed out waiting for tailscaled daemon to start")
-}
 
 func startTailscaleDaemon() error {
 	fmt.Println("     - Starting tailscaled service...")
@@ -168,7 +154,20 @@ func setupUser() error {
 
 	// 2. Ensure user is in the docker group
 	fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
-	return runCommand("usermod", "-aG", "docker", originalUser)
+	if err := runCommand("usermod", "-aG", "docker", originalUser); err != nil {
+		return err
+	}
+
+	// 3. Grant passwordless sudo to the user
+	fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
+	sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
+	// The file permissions (0440) are important for sudoers files.
+	err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
+	if err != nil {
+		return fmt.Errorf("failed to configure passwordless sudo: %w", err)
+	}
+
+	return nil
 }
 
 func installNvidiaToolkit() error {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -35,14 +36,16 @@ In interactive mode, it checks for an existing login.
 In automated mode (with --authkey), it joins the network non-interactively.`,
 
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		// This pre-run check now verifies the daemon is ready for all modes,
-		// and checks for an interactive login if no authkey is provided.
-		if authKey == "" {
-			// This check only runs if an authkey is NOT provided.
-			fmt.Println("--- Verifying Tailscale status...")
-			return checkTailscaleState()
+		// First, wait for the daemon to be responsive. This is crucial
+		// after a fresh install or service start.
+		if err := waitForTailscaleDaemon(); err != nil {
+			return err
 		}
-		return nil // Skip check if using authkey
+
+		// Now, check the login status. This function handles both
+		// interactive and authkey-based scenarios correctly.
+		fmt.Println("--- Verifying Tailscale status...")
+		return checkTailscaleState()
 	},
 
 	Run: func(cmd *cobra.Command, args []string) {
@@ -79,6 +82,21 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 		fmt.Println("\n🎉 Citadel Node is online and services are running.")
 		fmt.Println("   - (TODO) Starting background agent to listen for jobs...")
 	},
+}
+
+func waitForTailscaleDaemon() error {
+	fmt.Println("--- Waiting for Tailscale daemon to be ready...")
+	maxAttempts := 10
+	for i := 0; i < maxAttempts; i++ {
+		// Use a lightweight command like `tailscale version` which still needs the daemon
+		cmd := exec.Command("tailscale", "version")
+		if err := cmd.Run(); err == nil {
+			fmt.Println("✅ Daemon is ready.")
+			return nil // Success!
+		}
+		time.Sleep(500 * time.Millisecond) // Wait before retrying
+	}
+	return fmt.Errorf("timed out waiting for tailscaled daemon to start")
 }
 
 func joinNetwork(hostname, serverURL, key string) error {
