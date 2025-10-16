@@ -1,3 +1,4 @@
+// cmd/status.go
 /*
 Copyright © 2025 NAME HERE <EMAIL ADDRESS>
 

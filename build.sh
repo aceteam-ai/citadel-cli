@@ -1,4 +1,5 @@
 #!/bin/bash
+# build.sh
 # This script builds the Citadel CLI for common server architectures.
 
 set -e
