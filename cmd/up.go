@@ -74,7 +74,7 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, service.ComposeFile)
 			err := startService(service)
 			if err != nil {
-				// *** CHANGE: If any service fails, print the error and exit immediately. ***
+				// If any service fails, print the error and exit immediately. No retries.
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
 				os.Exit(1)
 			}

@@ -1,10 +1,16 @@
+# citadel.yaml
 node:
   name: ubuntu-3090-node
   tags: [rtx-3090, gpu, dev]
 
+# NOTE: You probably only want ONE of these containers running
+# as they can be quite resource intensive.
 services:
   - name: llamacpp
     compose_file: ./services/llamacpp.yml
 
   - name: ollama
     compose_file: ./services/ollama.yml
+
+  - name: vllm
+    compose_file: ./services/vllm.yml

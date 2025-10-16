@@ -9,8 +9,9 @@ services:
     volumes:
       # Mount a user-accessible directory to cache Hugging Face models
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
-    # Command is now a placeholder; it will be overridden by jobs.
-    command: --host 0.0.0.0
+    # Use an environment variable for the command.
+    # The part after the colon is the default if the variable isn't set.
+    command: ${VLLM_COMMAND:--host 0.0.0.0}
     deploy:
       resources:
         reservations:

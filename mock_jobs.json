@@ -38,5 +38,13 @@
       "model_file": "llama-2-7b-chat.Q4_K_M.gguf",
       "prompt": "Write a short poem about servers and code."
     }
+  },
+  {
+    "id": "job-infer-vllm-mistral",
+    "type": "VLLM_INFERENCE",
+    "payload": {
+      "model": "mistralai/Mistral-7B-Instruct-v0.1",
+      "prompt": "Explain the concept of a 'sovereign compute fabric' in three bullet points."
+    }
   }
 ]
