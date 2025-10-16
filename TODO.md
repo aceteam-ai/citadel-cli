@@ -8,7 +8,13 @@
 - [x] `status` command for node health check
 - [x] `logs` command to stream service logs
 - [x] `run` command for pre-packaged services (ollama, etc.)
-- [ ] `agent` command to listen for jobs from Nexus
+- [x] `agent` command to listen for jobs from Nexus
+  - [x] Job Execution: Shell Commands
+  - [x] Job Execution: Model Downloads
+  - [x] Job Execution: Llama.cpp Inference
+  - [x] Job Execution: Ollama Inference
+  - [ ] Job Execution: VLLM Inference (Code exists, needs testing)
+  - [ ] Replace Mock Job Server with Real Nexus API Client
 - [ ] `nodes` command to list nodes from Nexus API
 
 ## Next Steps

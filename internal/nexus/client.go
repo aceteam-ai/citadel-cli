@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -59,72 +60,34 @@ func (c *Client) ListNodes() ([]Node, error) {
 }
 
 // --- MOCK IMPLEMENTATION ---
-var mockJobs = []Job{
-	{
-		ID:   "job-download-llama2", // Let's make the first job useful
-		Type: "DOWNLOAD_MODEL",
-		Payload: map[string]string{
-			// Ollama doesn't use HF URLs, it uses its own registry.
-			// So this job type isn't right for Ollama. Let's download the GGUF instead.
-			// Let's re-order the jobs to be more logical.
-			"repo_url":   "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF",
-			"file_name":  "llama-2-7b-chat.Q4_K_M.gguf",
-			"model_type": "llamacpp",
-		},
-	},
-	{
-		ID:   "job-infer-llama2",
-		Type: "LLAMACPP_INFERENCE",
-		Payload: map[string]string{
-			"model_file": "llama-2-7b-chat.Q4_K_M.gguf",
-			"prompt":     "In one sentence, what is the purpose of a sovereign compute fabric?",
-		},
-	},
-
-	// {
-	// 	ID:   "job-ollama-456",
-	// 	Type: "OLLAMA_INFERENCE",
-	// 	Payload: map[string]string{
-	// 		"model":  "llama2",
-	// 		"prompt": "In one sentence, what is the purpose of a sovereign compute fabric?",
-	// 	},
-	// },
-	// {
-	// 	ID:   "job-llamacpp-789",
-	// 	Type: "LLAMACPP_INFERENCE",
-	// 	Payload: map[string]string{
-	// 		"prompt": "Write a short poem about servers and code.",
-	// 	},
-	// },
-	// {
-	// 	ID:   "job-vllm-101",
-	// 	Type: "VLLM_INFERENCE",
-	// 	Payload: map[string]string{
-	// 		"model":  "facebook/opt-125m", // The default model in our vllm.yml
-	// 		"prompt": "What are the three laws of robotics?",
-	// 	},
-	// },
-	// {
-	// 	ID:   "job-download-deepseek",
-	// 	Type: "DOWNLOAD_MODEL",
-	// 	Payload: map[string]string{
-	// 		"repo_url":   "https://huggingface.co/unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
-	// 		"file_name":  "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
-	// 		"model_type": "llamacpp",
-	// 	},
-	// },
-	// {
-	// 	ID:   "job-infer-deepseek",
-	// 	Type: "LLAMACPP_INFERENCE",
-	// 	Payload: map[string]string{
-	// 		"model_file": "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
-	// 		"prompt":     "Write a short story about a sentient AI living in a compute cluster.",
-	// 	},
-	// },
-}
+var mockJobs []Job
 var jobIndex = 0
+var jobsLoaded = false
+
+func loadMockJobs() error {
+	if jobsLoaded {
+		return nil
+	}
+	fmt.Println("[DEBUG] NexusClient: Loading mock jobs from mock_jobs.json...")
+	file, err := os.ReadFile("mock_jobs.json")
+	if err != nil {
+		return fmt.Errorf("could not read mock_jobs.json: %w", err)
+	}
+	err = json.Unmarshal(file, &mockJobs)
+	if err != nil {
+		return fmt.Errorf("could not parse mock_jobs.json: %w", err)
+	}
+	jobsLoaded = true
+	fmt.Printf("[DEBUG] NexusClient: Loaded %d mock jobs.\n", len(mockJobs))
+	return nil
+}
 
 func (c *Client) GetNextJob() (*Job, error) {
+	if err := loadMockJobs(); err != nil {
+		// On failure, return the error and stop.
+		return nil, err
+	}
+
 	if jobIndex < len(mockJobs) {
 		job := mockJobs[jobIndex]
 		jobIndex++

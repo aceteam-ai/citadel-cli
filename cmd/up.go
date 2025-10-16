@@ -113,7 +113,6 @@ func prepareCacheDirectories() error {
 	cacheBase := filepath.Join(homeDir, "citadel-cache")
 	// A list of all potential cache directories our services might use.
 	dirsToCreate := []string{
-		cacheBase,
 		filepath.Join(cacheBase, "ollama"),
 		filepath.Join(cacheBase, "vllm"),
 		filepath.Join(cacheBase, "llamacpp"),
@@ -122,12 +121,19 @@ func prepareCacheDirectories() error {
 	}
 
 	fmt.Println("--- Preparing cache directories ---")
+	// First, create the base directory
+	if err := os.MkdirAll(cacheBase, 0755); err != nil {
+		return fmt.Errorf("failed to create base cache directory %s: %w", cacheBase, err)
+	}
+
+	// Then create all the subdirectories
 	for _, dir := range dirsToCreate {
 		// 0755 permissions are rwx for user, r-x for group/others.
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create cache directory %s: %w", dir, err)
 		}
 	}
+
 	fmt.Println("✅ Cache directories are ready.")
 	return nil
 }

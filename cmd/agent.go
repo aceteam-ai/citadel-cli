@@ -50,7 +50,9 @@ run as a background service.`,
 				}
 				if job != nil {
 					fmt.Printf("   - 📥 Received job %s of type %s. Executing...\n", job.ID, job.Type)
-					go executeJob(client, job)
+					// go executeJob(client, job)
+					// NOTE: the 'go' keyword to process jobs sequentially but can cause race condition ***
+					executeJob(client, job)
 				}
 			case <-sigs:
 				break agentLoop
@@ -155,6 +157,17 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 		cmd := exec.Command("curl", "-L", "--create-dirs", "-o", destPath, fullURL)
 		output, err = cmd.CombinedOutput()
 
+	case "OLLAMA_PULL":
+		model, modelOk := job.Payload["model"]
+		if !modelOk {
+			err = fmt.Errorf("job payload missing 'model' field")
+			break
+		}
+		fmt.Printf("     - [Job %s] Pulling Ollama model '%s'\n", job.ID, model)
+		// We execute the command inside the running container
+		cmd := exec.Command("docker", "exec", "citadel-ollama", "ollama", "pull", model)
+		output, err = cmd.CombinedOutput()
+
 	case "LLAMACPP_INFERENCE":
 		modelFile, modelOk := job.Payload["model_file"]
 		prompt, promptOk := job.Payload["prompt"]
@@ -176,7 +189,7 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 		// Use `docker compose up`. It will recreate the container if its config (like the command) has changed.
 		restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
 
-		// *** FIX: Set the environment variable to pass the new command to the container ***
+		// Set the environment variable to pass the new command to the container
 		restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))
 
 		if output, restartErr := restartCmd.CombinedOutput(); restartErr != nil {
@@ -189,7 +202,7 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 
 		llamacppURL := "http://localhost:8080/completion"
 		ready := false
-		maxWait := 90 * time.Second // Give it up to 90 seconds to load a large model
+		maxWait := 120 * time.Second // Give it up to 120 seconds to load a large model
 		pollInterval := 2 * time.Second
 		startTime := time.Now()
 
