@@ -1,41 +1,60 @@
 // cmd/nodes.go
 /*
 Copyright © 2025 Jason Sun <jason@aceteam.ai>
-
 */
 package cmd
 
 import (
 	"fmt"
+	"os"
+	"text/tabwriter"
+	"time"
 
+	"github.com/aceboss/citadel-cli/internal/nexus" // <-- IMPORT
 	"github.com/spf13/cobra"
 )
 
 // nodesCmd represents the nodes command
 var nodesCmd = &cobra.Command{
 	Use:   "nodes",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "List all compute nodes in your AceTeam fabric",
+	Long: `Connects to the Nexus control plane and retrieves a list of all
+registered compute nodes, showing their status, IP address, and last-seen time.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("nodes called")
+		// Use the global nexusURL flag from root.go
+		client := nexus.NewClient(nexusURL)
+
+		fmt.Println("--- Fetching nodes from Nexus... ---")
+		nodes, err := client.ListNodes()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error fetching nodes: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(nodes) == 0 {
+			fmt.Println("🤷 No nodes found in your fabric.")
+			return
+		}
+
+		// Use a tabwriter for nicely formatted, aligned columns
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "NAME\tSTATUS\tIP ADDRESS\tLAST SEEN")
+		fmt.Fprintln(w, "----\t------\t----------\t---------")
+
+		for _, node := range nodes {
+			status := "🟢 ONLINE"
+			if node.Status != "online" {
+				status = "🔴 OFFLINE"
+			}
+			// Format the "Last Seen" time to be human-readable
+			lastSeen := time.Since(node.LastSeen).Round(time.Second).String() + " ago"
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", node.Name, status, node.IPAddress, lastSeen)
+		}
+
+		w.Flush()
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(nodesCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// nodesCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// nodesCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }
