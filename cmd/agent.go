@@ -186,13 +186,46 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 
 		// Give the server a moment to start up and load the model
 		fmt.Printf("     - [Job %s] Waiting for llama.cpp server to initialize...\n", job.ID)
-		time.Sleep(10 * time.Second) // Increased wait time for model loading
+
+		llamacppURL := "http://localhost:8080/completion"
+		ready := false
+		maxWait := 90 * time.Second // Give it up to 90 seconds to load a large model
+		pollInterval := 2 * time.Second
+		startTime := time.Now()
+
+		for time.Since(startTime) < maxWait {
+			// We send a dummy POST request.
+			resp, httpErr := http.Post(llamacppURL, "application/json", bytes.NewBuffer([]byte("{}")))
+
+			if httpErr != nil {
+				// This is a network error (e.g., connection refused). The server is not up yet.
+				time.Sleep(pollInterval)
+				continue // Try again
+			}
+
+			// The server is up, but is it ready? Check the status code.
+			// The server helpfully returns 503 while it's loading the model.
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				resp.Body.Close() // Always close the body
+				time.Sleep(pollInterval)
+				continue // Not ready yet, try again
+			}
+
+			// Any other response (200, 400, 500, etc.) means the model has finished loading
+			// and the server is actively processing requests. We are ready.
+			resp.Body.Close()
+			ready = true
+			break
+		}
+
+		if !ready {
+			err = fmt.Errorf("llama.cpp server did not become ready within %v", maxWait)
+			break
+		}
 
 		// --- Step 2: Perform the inference ---
 		fmt.Printf("     - [Job %s] Running Llama.cpp inference\n", job.ID)
 
-		// *** FIX: The missing inference logic is now included ***
-		llamacppURL := "http://localhost:8080/completion"
 		requestPayload := map[string]interface{}{
 			"prompt":      prompt,
 			"n_predict":   256,

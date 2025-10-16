@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -63,6 +64,11 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			fmt.Println("✅ Tailscale login verified.")
 		}
 
+		if err := prepareCacheDirectories(); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error preparing cache: %v\n", err)
+			os.Exit(1)
+		}
+
 		fmt.Println("--- Launching services ---")
 		for _, service := range manifest.Services {
 			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, service.ComposeFile)
@@ -96,6 +102,34 @@ func waitForTailscaleDaemon() error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for tailscaled daemon to start")
+}
+
+func prepareCacheDirectories() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not find user home directory: %w", err)
+	}
+
+	cacheBase := filepath.Join(homeDir, "citadel-cache")
+	// A list of all potential cache directories our services might use.
+	dirsToCreate := []string{
+		cacheBase,
+		filepath.Join(cacheBase, "ollama"),
+		filepath.Join(cacheBase, "vllm"),
+		filepath.Join(cacheBase, "llamacpp"),
+		filepath.Join(cacheBase, "lmstudio"),
+		filepath.Join(cacheBase, "huggingface"),
+	}
+
+	fmt.Println("--- Preparing cache directories ---")
+	for _, dir := range dirsToCreate {
+		// 0755 permissions are rwx for user, r-x for group/others.
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create cache directory %s: %w", dir, err)
+		}
+	}
+	fmt.Println("✅ Cache directories are ready.")
+	return nil
 }
 
 func joinNetwork(hostname, serverURL, key string) error {
