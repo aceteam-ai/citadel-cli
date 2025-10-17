@@ -60,6 +60,11 @@ get_file_permissions() {
 
 add_file_comment() {
     local file="$1"
+    # Ignore generated protobuf files
+    if [[ "$file" == *".pb.go" || "$file" == *".pb.gw.go" ]]; then
+        return
+    fi
+
     local root_dir=$(find_package_json_dir "$target_dir_abs")
     local relative_path=${file#"$root_dir/"}
     local file_extension="${file##*.}"
@@ -69,57 +74,79 @@ add_file_comment() {
     if [[ "$file_extension" == "sh" ]]; then
         local new_comment="# $relative_path"
         local first_line=$(head -n 1 "$file")
-        local second_line=$(sed -n '2p' "$file")
 
         if [[ "$first_line" =~ ^#!/ ]]; then
+            # Shebang exists. Preserve it and process from line 2.
+            local second_line=$(sed -n '2p' "$file")
+            local third_line=$(sed -n '3p' "$file")
+
+            # Idempotency checks
+            if [[ "$second_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+            if [[ "$second_line" =~ ^#[[:space:]]* && "$third_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+
+            echo "$first_line" > "$temp_file" # Preserve shebang
+
+            # Check if line 2 is a comment to preserve
             if [[ "$second_line" =~ ^#[[:space:]]* ]]; then
-                local existing_path=$(echo "$second_line" | sed 's/^#[[:space:]]*//')
-                if [[ "$existing_path" != "$relative_path" ]]; then
-                    echo "$first_line" > "$temp_file"
-                    echo "$new_comment" >> "$temp_file"
-                    tail -n +3 "$file" >> "$temp_file"
-                    echo "Updated comment in $relative_path (preserving shebang, was: $existing_path)"
+                echo "$second_line" >> "$temp_file"
+                echo "$new_comment" >> "$temp_file"
+                # If line 3 was also a comment, we replace it.
+                if [[ "$third_line" =~ ^#[[:space:]]* ]]; then
+                    tail -n +4 "$file" >> "$temp_file"
+                    echo "Updated comment in $relative_path (preserving shebang & top comment)"
                 else
-                    rm "$temp_file"
-                    return
+                    tail -n +3 "$file" >> "$temp_file"
+                    echo "Added comment to $relative_path (preserving shebang & top comment)"
                 fi
-            else
-                echo "$first_line" > "$temp_file"
+            else # Line 2 is not a comment, insert ours.
                 echo "$new_comment" >> "$temp_file"
                 tail -n +2 "$file" >> "$temp_file"
                 echo "Added comment to $relative_path (preserving shebang)"
             fi
-        elif [[ "$first_line" =~ ^#[[:space:]]* ]]; then
-            local existing_path=$(echo "$first_line" | sed 's/^#[[:space:]]*//')
-            if [[ "$existing_path" != "$relative_path" ]]; then
-                echo "$new_comment" > "$temp_file"
-                tail -n +2 "$file" >> "$temp_file"
-                echo "Updated comment in $relative_path (was: $existing_path)"
-            else
-                rm "$temp_file"
-                return
-            fi
         else
-            echo "#!/usr/bin/env bash" > "$temp_file"
-            echo "$new_comment" >> "$temp_file"
-            cat "$file" >> "$temp_file"
-            echo "Added comment and shebang to $relative_path"
+            # No shebang. Process from line 1.
+            local second_line=$(sed -n '2p' "$file")
+
+            # Idempotency check
+            if [[ "$first_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+
+            # If the comment exists on the second line (from a previous run), move it to the first.
+            if [[ "$first_line" =~ ^#[[:space:]]* && "$second_line" == "$new_comment" ]]; then
+                echo "$new_comment" > "$temp_file"
+                echo "$first_line" >> "$temp_file"
+                tail -n +3 "$file" >> "$temp_file"
+                echo "Moved comment to top in $relative_path"
+            elif [[ "$first_line" =~ ^#[[:space:]]* ]]; then
+                # First line is another comment, prepend ours.
+                echo "$new_comment" > "$temp_file"
+                cat "$file" >> "$temp_file"
+                echo "Added comment to $relative_path"
+            else # No comment on line 1, prepend ours (and a shebang for good measure)
+                echo "#!/usr/bin/env bash" > "$temp_file"
+                echo "$new_comment" >> "$temp_file"
+                cat "$file" >> "$temp_file"
+                echo "Added comment and shebang to $relative_path"
+            fi
         fi
     elif [[ "$file_extension" == "css" ]]; then
         local new_comment="/* $relative_path */"
         local first_line=$(head -n 1 "$file")
+        local second_line=$(sed -n '2p' "$file")
 
-        if [[ "$first_line" =~ ^/\*[[:space:]]* ]]; then
-            local existing_path=$(echo "$first_line" | sed 's/^\/\*[[:space:]]*//' | sed 's/[[:space:]]*\*\///')
-            if [[ "$existing_path" != "$relative_path" ]]; then
-                echo "$new_comment" > "$temp_file"
-                tail -n +2 "$file" >> "$temp_file"
-                echo "Updated comment in $relative_path (was: $existing_path)"
-            else
-                rm "$temp_file"
-                return
-            fi
+        # Idempotency check
+        if [[ "$first_line" == "$new_comment" ]]; then
+            rm "$temp_file"
+            return
+        fi
+
+        # If the comment exists on the second line (from a previous run), move it to the first.
+        if [[ "$first_line" =~ ^/\* && "$second_line" == "$new_comment" ]]; then
+            echo "$new_comment" > "$temp_file"
+            echo "$first_line" >> "$temp_file"
+            tail -n +3 "$file" >> "$temp_file"
+            echo "Moved comment to top in $relative_path"
         else
+            # Prepend our comment to the file.
             echo "$new_comment" > "$temp_file"
             cat "$file" >> "$temp_file"
             echo "Added comment to $relative_path"
@@ -127,64 +154,90 @@ add_file_comment() {
     elif [[ "$file_extension" == "py" ]]; then
         local new_comment="# $relative_path"
         local first_line=$(head -n 1 "$file")
-        local second_line=$(sed -n '2p' "$file")
 
         if [[ "$first_line" =~ ^#!/usr/bin/env[[:space:]]+python ]]; then
+            # Shebang exists. Preserve it and process from line 2.
+            local second_line=$(sed -n '2p' "$file")
+            local third_line=$(sed -n '3p' "$file")
+
+            # Idempotency checks
+            if [[ "$second_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+            if [[ "$second_line" =~ ^#[[:space:]]* && "$third_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+
+            echo "$first_line" > "$temp_file" # Preserve shebang
+
+            # Check if line 2 is a comment to preserve
             if [[ "$second_line" =~ ^#[[:space:]]* ]]; then
-                local existing_path=$(echo "$second_line" | sed 's/^#[[:space:]]*//')
-                if [[ "$existing_path" != "$relative_path" ]]; then
-                    echo "$first_line" > "$temp_file"
-                    echo "$new_comment" >> "$temp_file"
-                    tail -n +3 "$file" >> "$temp_file"
-                    echo "Updated comment in $relative_path (preserving env/python line, was: $existing_path)"
+                echo "$second_line" >> "$temp_file"
+                echo "$new_comment" >> "$temp_file"
+                if [[ "$third_line" =~ ^#[[:space:]]* ]]; then
+                    tail -n +4 "$file" >> "$temp_file"
+                    echo "Updated comment in $relative_path (preserving shebang & top comment)"
                 else
-                    rm "$temp_file"
-                    return
+                    tail -n +3 "$file" >> "$temp_file"
+                    echo "Added comment to $relative_path (preserving shebang & top comment)"
                 fi
-            else
-                echo "$first_line" > "$temp_file"
+            else # Line 2 is not a comment, insert ours.
                 echo "$new_comment" >> "$temp_file"
                 tail -n +2 "$file" >> "$temp_file"
-                echo "Added comment to $relative_path (preserving env/python line)"
+                echo "Added comment to $relative_path (preserving shebang)"
             fi
-        elif [[ "$first_line" =~ ^#[[:space:]]* ]]; then
-            local existing_path=$(echo "$first_line" | sed 's/^#[[:space:]]*//')
-            if [[ "$existing_path" != "$relative_path" ]]; then
-                echo "$new_comment" > "$temp_file"
-                tail -n +2 "$file" >> "$temp_file"
-                echo "Updated comment in $relative_path (was: $existing_path)"
-            else
+        else
+            # No shebang. Process from line 1.
+            local second_line=$(sed -n '2p' "$file")
+
+            # Idempotency check
+            if [[ "$first_line" == "$new_comment" ]]; then
                 rm "$temp_file"
                 return
             fi
-        else
-            echo "$new_comment" > "$temp_file"
-            cat "$file" >> "$temp_file"
-            echo "Added comment to $relative_path"
+
+            # If the comment exists on the second line (from a previous run), move it to the first.
+            if [[ "$first_line" =~ ^#[[:space:]]* && "$second_line" == "$new_comment" ]]; then
+                echo "$new_comment" > "$temp_file"
+                echo "$first_line" >> "$temp_file"
+                tail -n +3 "$file" >> "$temp_file"
+                echo "Moved comment to top in $relative_path"
+            else
+                # Prepend our comment to the file.
+                echo "$new_comment" > "$temp_file"
+                cat "$file" >> "$temp_file"
+                echo "Added comment to $relative_path"
+            fi
         fi
     elif [[ "$file_extension" == "astro" ]]; then
         local new_comment="// $relative_path"
-        local first_three_lines=$(head -n 3 "$file")
+        local first_line=$(head -n 1 "$file")
 
-        if [[ $(echo "$first_three_lines" | head -n 1) == "---" ]]; then
-            if [[ $(echo "$first_three_lines" | sed -n '2p') =~ ^//[[:space:]]* ]]; then
-                local existing_path=$(echo "$first_three_lines" | sed -n '2p' | sed 's/^\/\/[[:space:]]*//')
-                if [[ "$existing_path" != "$relative_path" ]]; then
-                    echo "---" > "$temp_file"
-                    echo "$new_comment" >> "$temp_file"
-                    tail -n +3 "$file" >> "$temp_file"
-                    echo "Updated comment in $relative_path (was: $existing_path)"
+        if [[ "$first_line" == "---" ]]; then
+            # Frontmatter exists. Preserve it and process from line 2.
+            local second_line=$(sed -n '2p' "$file")
+            local third_line=$(sed -n '3p' "$file")
+
+            # Idempotency checks
+            if [[ "$second_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+            if [[ "$second_line" =~ ^//[[:space:]]* && "$third_line" == "$new_comment" ]]; then rm "$temp_file"; return; fi
+
+            echo "$first_line" > "$temp_file" # Preserve frontmatter start
+
+            # Check if line 2 is a comment to preserve
+            if [[ "$second_line" =~ ^//[[:space:]]* ]]; then
+                echo "$second_line" >> "$temp_file"
+                echo "$new_comment" >> "$temp_file"
+                if [[ "$third_line" =~ ^//[[:space:]]* ]]; then
+                    tail -n +4 "$file" >> "$temp_file"
+                    echo "Updated comment in $relative_path (preserving top comment)"
                 else
-                    rm "$temp_file"
-                    return
+                    tail -n +3 "$file" >> "$temp_file"
+                    echo "Added comment to $relative_path (preserving top comment)"
                 fi
-            else
-                echo "---" > "$temp_file"
+            else # Line 2 is not a comment, insert ours.
                 echo "$new_comment" >> "$temp_file"
                 tail -n +2 "$file" >> "$temp_file"
                 echo "Added comment to $relative_path"
             fi
         else
+            # No frontmatter, add it with our comment.
             echo "---" > "$temp_file"
             echo "$new_comment" >> "$temp_file"
             echo "---" >> "$temp_file"
@@ -272,18 +325,22 @@ add_file_comment() {
     elif [[ "$file_extension" == "ts" || "$file_extension" == "tsx" || "$file_extension" == "go" ]]; then
         local new_comment="// $relative_path"
         local first_line=$(head -n 1 "$file")
+        local second_line=$(sed -n '2p' "$file")
 
-        if [[ "$first_line" =~ ^//[[:space:]]* ]]; then
-            local existing_path=$(echo "$first_line" | sed 's/^\/\/[[:space:]]*//')
-            if [[ "$existing_path" != "$relative_path" ]]; then
-                echo "$new_comment" > "$temp_file"
-                tail -n +2 "$file" >> "$temp_file"
-                echo "Updated comment in $relative_path (was: $existing_path)"
-            else
-                rm "$temp_file"
-                return
-            fi
+        # Idempotency check
+        if [[ "$first_line" == "$new_comment" ]]; then
+            rm "$temp_file"
+            return
+        fi
+
+        # If the comment exists on the second line (from a previous run), move it to the first.
+        if [[ "$first_line" =~ ^//[[:space:]]* && "$second_line" == "$new_comment" ]]; then
+            echo "$new_comment" > "$temp_file"
+            echo "$first_line" >> "$temp_file"
+            tail -n +3 "$file" >> "$temp_file"
+            echo "Moved comment to top in $relative_path"
         else
+            # Prepend our comment to the file.
             echo "$new_comment" > "$temp_file"
             cat "$file" >> "$temp_file"
             echo "Added comment to $relative_path"
@@ -292,26 +349,27 @@ add_file_comment() {
     elif [[ "$file_extension" == "yml" || "$file_extension" == "yaml" ]]; then
         local new_comment="# $relative_path"
         local first_line=$(head -n 1 "$file")
+        local second_line=$(sed -n '2p' "$file")
 
-        if [[ "$first_line" =~ ^#[[:space:]]* ]]; then
-            local existing_path=$(echo "$first_line" | sed 's/^#[[:space:]]*//')
-            if [[ "$existing_path" != "$relative_path" ]]; then
-                echo "$new_comment" > "$temp_file"
-                tail -n 2 "$file" >> "$temp_file"
-                echo "Updated comment in $relative_path (was: $existing_path)"
-            else
-                rm "$temp_file"
-                return
-            fi
+        # Idempotency check
+        if [[ "$first_line" == "$new_comment" ]]; then
+            rm "$temp_file"
+            return
+        fi
+
+        # If the comment exists on the second line (from a previous run), move it to the first.
+        if [[ "$first_line" =~ ^#[[:space:]]* && "$second_line" == "$new_comment" ]]; then
+            echo "$new_comment" > "$temp_file"
+            echo "$first_line" >> "$temp_file"
+            tail -n +3 "$file" >> "$temp_file"
+            echo "Moved comment to top in $relative_path"
         else
+            # Prepend our comment to the file.
             echo "$new_comment" > "$temp_file"
             cat "$file" >> "$temp_file"
             echo "Added comment to $relative_path"
         fi
-
     fi
-
-   
 
     cat "$temp_file" > "$file"
     rm "$temp_file"

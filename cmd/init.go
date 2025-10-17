@@ -1,3 +1,4 @@
+// cmd/init.go
 package cmd
 
 import (
