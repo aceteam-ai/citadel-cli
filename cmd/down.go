@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -19,7 +20,12 @@ var downCmd = &cobra.Command{
 	Long: `Reads the citadel.yaml manifest and runs 'docker compose down' for each
 service, stopping and removing the containers, networks, and volumes created by 'up'.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		manifest, err := readManifest("citadel.yaml")
+		manifest, configDir, err := findAndReadManifest()
+		if err != nil {
+			// The error from findAndReadManifest is already user-friendly
+			fmt.Fprintf(os.Stderr, "  %s\n", badColor.Sprint(err.Error()))
+			return
+		}
 		if err != nil {
 			// If the manifest doesn't exist, there's nothing to do.
 			if os.IsNotExist(err) {
@@ -34,7 +40,8 @@ service, stopping and removing the containers, networks, and volumes created by 
 		// We process in reverse order for graceful shutdown, though not strictly necessary.
 		for i := len(manifest.Services) - 1; i >= 0; i-- {
 			service := manifest.Services[i]
-			fmt.Printf("🔻 Stopping service: %s (%s)\n", service.Name, service.ComposeFile)
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			fmt.Printf("🔻 Stopping service: %s (%s)\n", service.Name, fullComposePath)
 			err := stopService(service)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to stop service %s: %v\n", service.Name, err)

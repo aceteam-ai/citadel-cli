@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -25,7 +26,12 @@ This command uses 'docker compose logs' to retrieve the output from the service'
 	Run: func(cmd *cobra.Command, args []string) {
 		serviceName := args[0]
 
-		manifest, err := readManifest("citadel.yaml")
+		manifest, configDir, err := findAndReadManifest()
+		if err != nil {
+			// The error from findAndReadManifest is already user-friendly
+			fmt.Fprintf(os.Stderr, "  %s\n", badColor.Sprint(err.Error()))
+			return
+		}
 		if err != nil {
 			if os.IsNotExist(err) {
 				fmt.Println("  🤷 No citadel.yaml found, cannot find service.")
@@ -47,11 +53,11 @@ This command uses 'docker compose logs' to retrieve the output from the service'
 			fmt.Fprintf(os.Stderr, "Service '%s' not found in citadel.yaml\n", serviceName)
 			os.Exit(1)
 		}
-
+		fullComposePath := filepath.Join(configDir, targetService.ComposeFile)
 		dockerArgs := []string{
 			"compose",
 			"-f",
-			targetService.ComposeFile,
+			fullComposePath,
 			"logs",
 		}
 

@@ -41,6 +41,12 @@ interactively or with flags for automation.`,
 		fmt.Println("✅ Running with root privileges.")
 
 		// --- 1. Determine Configuration ---
+		finalAuthKey, err := getAuthKeyOrConfirmLogin() // --- MODIFIED: Use new smart logic
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
+			os.Exit(1)
+		}
+
 		selectedService, err := getSelectedService()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -68,6 +74,10 @@ interactively or with flags for automation.`,
 		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to generate configuration files: %v\n", err)
+			os.Exit(1)
+		}
+		if err := createGlobalConfig(configDir); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to create global system configuration: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -102,14 +112,26 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
-		// --- 4. Final Handoff: Either test or run agent directly ---
-		fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
+		// --- 4. Final Handoff ---
+		// --- MODIFIED: This whole block is new logic ---
+		if finalAuthKey == "" {
+			fmt.Println("\n✅ Node is provisioned. Since you are already logged in, services will start now.")
+			fmt.Println("   Run 'citadel status' from the '~/citadel-node' directory to check health.")
+		} else {
+			fmt.Println("\n✅ Node is provisioned. Now connecting to the network...")
+		}
+
 		executablePath, _ := os.Executable()
+		upArgs := []string{"up"}
+		if finalAuthKey != "" {
+			upArgs = append(upArgs, "--authkey", finalAuthKey)
+		}
 
 		if initTest {
 			// Step 4a: Bring services up without the agent for the test
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
-			upCmdString := fmt.Sprintf("cd %s && %s up --services-only --authkey %s", configDir, executablePath, authkey)
+			testUpArgs := append(upArgs, "--services-only")
+			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
 			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCmdString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
@@ -125,13 +147,12 @@ interactively or with flags for automation.`,
 			testCmd.Stdout = os.Stdout
 			testCmd.Stderr = os.Stderr
 			if err := testCmd.Run(); err != nil {
-				// The test command prints its own failure message, so we just exit.
 				os.Exit(1)
 			}
 		} else {
 			// Step 4b: Hand off to the full 'citadel up' to bring the node online and start the agent
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
-			upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authkey)
+			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
 			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
@@ -143,10 +164,58 @@ interactively or with flags for automation.`,
 	},
 }
 
-// (All helper functions like getSelectedService, getNodeName, generateCitadelConfig, etc. remain unchanged)
+func createGlobalConfig(nodeConfigDir string) error {
+	fmt.Println("--- Registering node configuration system-wide ---")
+	globalConfigDir := "/etc/citadel"
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+
+	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+		return fmt.Errorf("failed to create global config directory %s: %w", globalConfigDir, err)
+	}
+
+	configContent := fmt.Sprintf("node_config_dir: %s\n", nodeConfigDir)
+
+	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0644); err != nil {
+		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
+	}
+
+	fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
+	return nil
+}
+
+// getAuthKeyOrConfirmLogin checks for an authkey, verifies existing login, or prompts the user.
+func getAuthKeyOrConfirmLogin() (string, error) {
+	// Case 1: Authkey provided via flag (for automation)
+	if authkey != "" {
+		fmt.Println("✅ Authkey provided via flag.")
+		return authkey, nil
+	}
+
+	// Case 2: No flag, check if already logged in.
+	fmt.Println("--- Checking network status...")
+	statusCmd := exec.Command("tailscale", "status")
+	output, _ := statusCmd.CombinedOutput()
+
+	if strings.Contains(string(output), "Logged out") || strings.Contains(string(output), "tailscaled is not running") {
+		// Case 3: Not logged in, so we must prompt for the key.
+		fmt.Println("   - ⚠️ You are not connected to the Nexus network.")
+		prompt := &survey.Input{
+			Message: "Please enter your Nexus authkey:",
+		}
+		var keyInput string
+		if err := survey.AskOne(prompt, &keyInput, survey.WithValidator(survey.Required)); err != nil {
+			return "", fmt.Errorf("aborted")
+		}
+		return strings.TrimSpace(keyInput), nil
+	}
+
+	// Case 2 (continued): Already logged in.
+	fmt.Println("   - ✅ Already connected to the Nexus network. No authkey needed.")
+	return "", nil // Return empty string to signify no 'up' command with authkey is needed.
+}
+
 func getSelectedService() (string, error) {
 	if initService != "" {
-		// Validate the service provided by flag
 		validServices := append(services.GetAvailableServices(), "none")
 		for _, s := range validServices {
 			if initService == s {
@@ -155,8 +224,6 @@ func getSelectedService() (string, error) {
 		}
 		return "", fmt.Errorf("invalid service '%s' specified", initService)
 	}
-
-	// Interactive prompt
 	prompt := &survey.Select{
 		Message: "Which primary service should this node run?",
 		Options: []string{
@@ -170,7 +237,6 @@ func getSelectedService() (string, error) {
 	if err := survey.AskOne(prompt, &selection); err != nil {
 		return "", err
 	}
-	// Extract the short name (e.g., "vllm" from "vllm (...)")
 	return strings.Fields(selection)[0], nil
 }
 
@@ -203,7 +269,6 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		return "", err
 	}
 
-	// Generate service compose files
 	for name, content := range services.ServiceMap {
 		filePath := filepath.Join(servicesDir, name+".yml")
 		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
@@ -211,7 +276,6 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		}
 	}
 
-	// Generate citadel.yaml
 	manifest := CitadelManifest{
 		Node: struct {
 			Name string   `yaml:"name"`
@@ -240,7 +304,6 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		return "", err
 	}
 
-	// IMPORTANT: Change ownership of the generated files to the original user
 	userInfo, err := exec.Command("id", "-u", user).Output()
 	if err != nil {
 		return "", err
@@ -362,7 +425,7 @@ func installTailscale() error {
 }
 
 type DockerPsResult struct {
-	Name  string `json:"Names"` // Note: Docker uses "Names" in JSON output (not a typo)
+	Name  string `json:"Names"`
 	Image string `json:"Image"`
 }
 
@@ -371,7 +434,6 @@ func checkForRunningServices(serviceToStart string) error {
 	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		// This is not a fatal error, might just mean docker isn't running yet.
 		fmt.Println("     - Could not query Docker, skipping check.")
 		return nil
 	}
@@ -381,7 +443,6 @@ func checkForRunningServices(serviceToStart string) error {
 	for decoder.More() {
 		var res DockerPsResult
 		if err := decoder.Decode(&res); err == nil {
-			// Don't list the service we are about to start anyway
 			if !strings.Contains(res.Name, serviceToStart) {
 				runningServices = append(runningServices, res)
 			}
@@ -430,7 +491,6 @@ func checkForRunningServices(serviceToStart string) error {
 func init() {
 	rootCmd.AddCommand(initCmd)
 	initCmd.Flags().StringVar(&authkey, "authkey", "", "The pre-authenticated key to join the network")
-	initCmd.MarkFlagRequired("authkey")
 	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")

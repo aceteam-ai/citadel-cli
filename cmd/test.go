@@ -84,6 +84,8 @@ by 'init --test'.`,
 			os.Exit(1)
 		} else {
 			fmt.Println("\n✅ POST successful. Node is verified and ready.")
+			fmt.Println("You can run 'citadel status' to see more information about your node.")
+			os.Exit(0)
 		}
 	},
 }

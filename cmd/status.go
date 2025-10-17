@@ -208,13 +208,10 @@ func printNetworkInfo(w *tabwriter.Writer) {
 }
 
 func printServiceInfo(w *tabwriter.Writer) {
-	manifest, err := readManifest("citadel.yaml")
+	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Fprintln(w, "  (No citadel.yaml found, no services to check)")
-		} else {
-			fmt.Fprintf(w, "  %s\n", badColor.Sprintf("Error reading manifest: %v", err))
-		}
+		// The error from findAndReadManifest is already user-friendly
+		fmt.Fprintf(w, "  %s\n", badColor.Sprint(err.Error()))
 		return
 	}
 
@@ -224,7 +221,8 @@ func printServiceInfo(w *tabwriter.Writer) {
 	}
 
 	for _, service := range manifest.Services {
-		psCmd := exec.Command("docker", "compose", "-f", service.ComposeFile, "ps", "--format", "json")
+		fullComposePath := filepath.Join(configDir, service.ComposeFile)
+		psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "ps", "--format", "json")
 		output, err := psCmd.Output()
 		if err != nil {
 			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))

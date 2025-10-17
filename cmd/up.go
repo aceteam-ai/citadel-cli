@@ -15,20 +15,6 @@ import (
 
 var servicesOnly bool
 
-// (Struct definitions remain the same)
-type Service struct {
-	Name        string `yaml:"name"`
-	ComposeFile string `yaml:"compose_file"`
-}
-
-type CitadelManifest struct {
-	Node struct {
-		Name string   `yaml:"name"`
-		Tags []string `yaml:"tags"`
-	} `yaml:"node"`
-	Services []Service `yaml:"services"`
-}
-
 // upCmd represents the up command
 var upCmd = &cobra.Command{
 	Use:   "up",
@@ -46,9 +32,9 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 	},
 
 	Run: func(cmd *cobra.Command, args []string) {
-		manifest, err := readManifest("citadel.yaml")
+		manifest, configDir, err := findAndReadManifest()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error reading manifest: %v\n", err)
+			fmt.Fprintf(os.Stderr, "❌ Error loading configuration: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("✅ Manifest loaded for node: %s\n", manifest.Node.Name)
@@ -72,10 +58,10 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 
 		fmt.Println("--- Launching services ---")
 		for _, service := range manifest.Services {
-			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, service.ComposeFile)
-			err := startService(service)
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, fullComposePath)
+			err := startService(service.Name, fullComposePath)
 			if err != nil {
-				// If any service fails, print the error and exit immediately. No retries.
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
 				os.Exit(1)
 			}
@@ -132,8 +118,9 @@ func prepareCacheDirectories() error {
 
 	// Then create all the subdirectories
 	for _, dir := range dirsToCreate {
-		// 0755 permissions are rwx for user, r-x for group/others.
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		// 0655 permissions are rwx for user, group, and others.
+		// This solves the Docker volume permission issue for the container user.
+		if err := os.MkdirAll(dir, 0655); err != nil {
 			return fmt.Errorf("failed to create cache directory %s: %w", dir, err)
 		}
 	}
@@ -188,11 +175,11 @@ func readManifest(filePath string) (*CitadelManifest, error) {
 	return &manifest, nil
 }
 
-func startService(s Service) error {
-	if s.ComposeFile == "" {
-		return fmt.Errorf("service %s has no compose_file defined", s.Name)
+func startService(serviceName, composeFilePath string) error {
+	if composeFilePath == "" {
+		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
-	composeCmd := exec.Command("docker", "compose", "-f", s.ComposeFile, "up", "-d")
+	composeCmd := exec.Command("docker", "compose", "-f", composeFilePath, "up", "-d")
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker compose failed: %s", string(output))
