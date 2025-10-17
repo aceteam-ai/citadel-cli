@@ -92,35 +92,44 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
-		// --- 4. Hand off to 'citadel up' to bring services online ---
+		// --- 4. Final Handoff: Either test or run agent directly ---
 		fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 		executablePath, _ := os.Executable()
-		upCommandString := fmt.Sprintf("cd %s && %s up --services-only --authkey %s", configDir, executablePath, authkey)
-		upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
-		upCmd.Stdout = os.Stdout
-		upCmd.Stderr = os.Stderr
-		if err := upCmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed: %v\n", err)
-			os.Exit(1)
-		}
 
-		// --- 5. Run Test if Requested ---
 		if initTest {
+			// Step 4a: Bring services up without the agent for the test
+			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
+			upCmdString := fmt.Sprintf("cd %s && %s up --services-only --authkey %s", configDir, executablePath, authkey)
+			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCmdString)
+			upCmd.Stdout = os.Stdout
+			upCmd.Stderr = os.Stderr
+			if err := upCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed during pre-test setup: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Step 5: Run the actual test
 			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
 			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
 			testCmd.Stdout = os.Stdout
 			testCmd.Stderr = os.Stderr
 			if err := testCmd.Run(); err != nil {
-				// The test command prints its own success/failure message, so we just exit.
+				// The test command prints its own failure message, so we just exit.
+				os.Exit(1)
+			}
+		} else {
+			// Step 4b: Hand off to the full 'citadel up' to bring the node online and start the agent
+			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
+			upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authkey)
+			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
+			upCmd.Stdout = os.Stdout
+			upCmd.Stderr = os.Stderr
+			if err := upCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed: %v\n", err)
 				os.Exit(1)
 			}
 		}
-
-		// --- 6. Final Message ---
-		// This message informs the user that the next step is for the agent to run.
-		// In a real-world scenario, a systemd service would be configured to run 'citadel up'.
-		fmt.Println("\n--- Agent is now running in the background, polling for jobs ---")
 	},
 }
 
@@ -348,5 +357,5 @@ func init() {
 	initCmd.MarkFlagRequired("authkey")
 	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
-	initCmd.Flags().BoolVar(&initTest, "test", false, "Run a diagnostic test after provisioning")
+	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 }
