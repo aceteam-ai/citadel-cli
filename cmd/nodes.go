@@ -10,7 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/nexus" // <-- IMPORT
+	"github.com/aceboss/citadel-cli/internal/nexus"
 	"github.com/spf13/cobra"
 )
 

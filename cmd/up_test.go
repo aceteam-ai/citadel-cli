@@ -2,7 +2,7 @@
 package cmd
 
 import (
-	"errors" // <-- IMPORT THIS
+	"errors"
 	"os"
 	"testing"
 )

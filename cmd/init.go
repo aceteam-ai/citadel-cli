@@ -1,4 +1,3 @@
-// cmd/init.go
 package cmd
 
 import (
@@ -13,6 +12,7 @@ import (
 	"syscall"
 	"text/tabwriter"
 
+	"github.com/aceboss/citadel-cli/internal/nexus"
 	"github.com/aceboss/citadel-cli/internal/ui"
 	"github.com/aceboss/citadel-cli/services"
 	"github.com/spf13/cobra"
@@ -24,19 +24,6 @@ var (
 	initService  string
 	initNodeName string
 	initTest     bool
-)
-
-type initTailscaleStatus struct {
-	Self struct {
-		Online bool `json:"Online"`
-	} `json:"Self"`
-}
-
-const (
-	netChoiceAuthkey  = "authkey"
-	netChoiceBrowser  = "browser"
-	netChoiceSkip     = "skip"
-	netChoiceVerified = "verified"
 )
 
 var initCmd = &cobra.Command{
@@ -53,7 +40,8 @@ interactively or with flags for automation.`,
 		fmt.Println("✅ Running with root privileges.")
 
 		// --- 1. Determine Configuration ---
-		choice, key, err := getNetworkChoice()
+		// --- UPDATED: Now calls the shared helper with the authkey flag ---
+		choice, key, err := nexus.GetNetworkChoice(authkey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 			os.Exit(1)
@@ -71,13 +59,11 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
-		// --- Pre-flight check for running services ---
 		if err := checkForRunningServices(selectedService); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 			os.Exit(1)
 		}
 
-		// --- 2. Generate Config Files ---
 		originalUser := os.Getenv("SUDO_USER")
 		if originalUser == "" {
 			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
@@ -93,7 +79,7 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
-		// --- 3. Provision System ---
+		// --- 2. Provision System ---
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
@@ -124,14 +110,15 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
-		// --- 4. Final Handoff ---
-		if choice == netChoiceSkip {
+		// --- 3. Final Handoff ---
+		// --- UPDATED: Uses the public constants from the nexus package ---
+		if choice == nexus.NetChoiceSkip {
 			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
 			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel up --authkey <key>'")
 			return
 		}
 
-		if choice == netChoiceVerified {
+		if choice == nexus.NetChoiceVerified {
 			fmt.Println("\n✅ Node is provisioned. Since you are already logged in, services will start now.")
 		} else {
 			fmt.Println("\n✅ Node is provisioned. Now connecting to the network...")
@@ -140,7 +127,7 @@ interactively or with flags for automation.`,
 		executablePath, _ := os.Executable()
 		var upArgs []string
 
-		if choice == netChoiceBrowser {
+		if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
 			loginCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", loginCmdStr)
 			loginCmd.Stdout = os.Stdout
@@ -192,50 +179,8 @@ interactively or with flags for automation.`,
 	},
 }
 
-func getNetworkChoice() (choice string, key string, err error) {
-	if authkey != "" {
-		fmt.Println("✅ Authkey provided via flag.")
-		return netChoiceAuthkey, authkey, nil
-	}
-
-	fmt.Println("--- Checking network status...")
-	statusCmd := exec.Command("tailscale", "status", "--json")
-	output, _ := statusCmd.Output()
-
-	var status initTailscaleStatus
-	if json.Unmarshal(output, &status) == nil && status.Self.Online {
-		fmt.Println("   - ✅ Already connected to the Nexus network.")
-		return netChoiceVerified, "", nil
-	}
-
-	fmt.Println("   - ⚠️  You are not connected to the Nexus network.")
-	// --- UPDATED CALL ---
-	selection, err := ui.AskSelect(
-		"How would you like to connect this node?",
-		[]string{
-			"Use a pre-generated authkey (Recommended for servers)",
-			"Log in with a browser",
-			"Skip network connection for now",
-		},
-	)
-	if err != nil {
-		return "", "", err
-	}
-
-	switch {
-	case strings.Contains(selection, "authkey"):
-		keyInput, err := ui.AskInput("Enter your Nexus authkey:", "nexus-auth-...", "")
-		if err != nil {
-			return "", "", err
-		}
-		return netChoiceAuthkey, strings.TrimSpace(keyInput), nil
-	case strings.Contains(selection, "browser"):
-		return netChoiceBrowser, "", nil
-	default:
-		return netChoiceSkip, "", nil
-	}
-}
-
+// (The rest of the file is unchanged, omitted for brevity)
+// ...
 func getSelectedService() (string, error) {
 	if initService != "" {
 		validServices := append(services.GetAvailableServices(), "none")
@@ -246,7 +191,6 @@ func getSelectedService() (string, error) {
 		}
 		return "", fmt.Errorf("invalid service '%s' specified", initService)
 	}
-	// --- UPDATED CALL ---
 	selection, err := ui.AskSelect(
 		"Which primary service should this node run?",
 		[]string{
@@ -267,7 +211,6 @@ func getNodeName() (string, error) {
 		return initNodeName, nil
 	}
 	defaultName, _ := os.Hostname()
-	// --- UPDATED CALL ---
 	return ui.AskInput("Enter a name for this node:", "e.g., gpu-node-1", defaultName)
 }
 
@@ -331,8 +274,6 @@ func checkForRunningServices(serviceToStart string) error {
 	return nil
 }
 
-// (The rest of the file is unchanged and omitted for brevity)
-// ...
 func createGlobalConfig(nodeConfigDir string) error {
 	fmt.Println("--- Registering node configuration system-wide ---")
 	globalConfigDir := "/etc/citadel"
