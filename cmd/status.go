@@ -1,7 +1,3 @@
-// cmd/status.go
-/*
-Copyright © 2025 Jason Sun <jason@aceteam.ai>
-*/
 package cmd
 
 import (
@@ -9,17 +5,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
 )
 
-// TailscaleStatus represents the relevant fields from `tailscale status --json`
 type TailscaleStatus struct {
 	Self struct {
 		DNSName      string   `json:"DNSName"`
@@ -28,6 +26,15 @@ type TailscaleStatus struct {
 	} `json:"Self"`
 }
 
+var (
+	headerColor = color.New(color.FgCyan, color.Bold)
+	goodColor   = color.New(color.FgGreen)
+	warnColor   = color.New(color.FgYellow)
+	badColor    = color.New(color.FgRed)
+	labelColor  = color.New(color.Bold)
+	noColor     bool // Flag to disable color
+)
+
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Shows a comprehensive status of the Citadel node",
@@ -35,64 +42,121 @@ var statusCmd = &cobra.Command{
 It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
 and the state of all managed services.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		// Handle the --no-color flag
+		if noColor {
+			color.NoColor = true
+		}
+
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		defer w.Flush()
 
-		fmt.Fprintln(w, "--- 📊 Citadel Node Status ---")
+		headerColor.Fprintln(w, "--- 📊 Citadel Node Status ---")
 
-		// --- 1. System Vitals ---
-		fmt.Fprintln(w, "\n💻 SYSTEM VITALS\t")
+		headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
 		printMemInfo(w)
 		printCPUInfo(w)
 		printDiskInfo(w)
 
-		// --- 2. GPU Status ---
-		fmt.Fprintln(w, "\n💎 GPU STATUS\t")
+		headerColor.Fprintln(w, "\n🗂️ CACHE USAGE (~/citadel-cache)")
+		printCacheInfo(w)
+
+		headerColor.Fprintln(w, "\n💎 GPU STATUS")
 		printGPUInfo(w)
 
-		// --- 3. Network Status ---
-		fmt.Fprintln(w, "\n🌐 NETWORK STATUS\t")
+		headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
 		printNetworkInfo(w)
 
-		// --- 4. Service Status ---
-		fmt.Fprintln(w, "\n🚀 MANAGED SERVICES\t")
+		headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 		printServiceInfo(w)
 	},
 }
 
+// --- printCacheInfo IS NOW FIXED ---
+func printCacheInfo(w *tabwriter.Writer) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(w, "  %s\n", badColor.Sprintf("Could not determine home directory: %v", err))
+		return
+	}
+	cacheDir := filepath.Join(homeDir, "citadel-cache")
+
+	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+		fmt.Fprintf(w, "  (Cache directory not found)\t\n")
+		return
+	}
+
+	// Get total size (this part was already correct)
+	totalCmd := exec.Command("du", "-sh", cacheDir)
+	totalOutput, err := totalCmd.Output()
+	if err == nil {
+		parts := strings.Fields(string(totalOutput))
+		if len(parts) > 0 {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Total Size"), parts[0])
+		}
+	}
+
+	// --- REWRITTEN BREAKDOWN LOGIC ---
+	fmt.Fprintf(w, "  %s:\n", labelColor.Sprint("Breakdown"))
+	// Use Go's Glob to find all subdirectories/files
+	entries, err := filepath.Glob(filepath.Join(cacheDir, "*"))
+	if err != nil || len(entries) == 0 {
+		fmt.Fprintf(w, "    (Empty)\n")
+		return
+	}
+
+	// Iterate over the found entries and run `du` on each one
+	for _, entry := range entries {
+		cmd := exec.Command("du", "-sh", entry)
+		output, err := cmd.Output()
+		if err != nil {
+			continue // Skip if we can't get the size of an entry
+		}
+		parts := strings.Fields(string(output))
+		if len(parts) >= 2 {
+			size := parts[0]
+			// Use filepath.Base to get just the directory name
+			name := filepath.Base(parts[1])
+			fmt.Fprintf(w, "    - %s:\t%s\n", name, size)
+		}
+	}
+}
+
+// (The rest of the file remains largely the same, with minor formatting tweaks)
 func printMemInfo(w *tabwriter.Writer) {
 	v, err := mem.VirtualMemory()
 	if err != nil {
-		fmt.Fprintf(w, "  Memory:\tError getting memory info: %v\n", err)
+		fmt.Fprintf(w, "  🧠 Memory:\t%s\n", badColor.Sprintf("Error getting memory info: %v", err))
 		return
 	}
-	fmt.Fprintf(w, "  Memory:\t%.1f%% (%s / %s)\n", v.UsedPercent, formatBytes(v.Used), formatBytes(v.Total))
+	percentStr := colorizePercent(v.UsedPercent)
+	fmt.Fprintf(w, "  🧠 %s:\t%s (%s / %s)\n", labelColor.Sprint("Memory"), percentStr, formatBytes(v.Used), formatBytes(v.Total))
 }
 
 func printCPUInfo(w *tabwriter.Writer) {
 	percentages, err := cpu.Percent(time.Second, false)
 	if err != nil || len(percentages) == 0 {
-		fmt.Fprintf(w, "  CPU Usage:\tError getting CPU info: %v\n", err)
+		fmt.Fprintf(w, "  ⚡️ CPU Usage:\t%s\n", badColor.Sprintf("Error getting CPU info: %v", err))
 		return
 	}
-	fmt.Fprintf(w, "  CPU Usage:\t%.1f%%\n", percentages[0])
+	percentStr := colorizePercent(percentages[0])
+	fmt.Fprintf(w, "  ⚡️ %s:\t%s\n", labelColor.Sprint("CPU Usage"), percentStr)
 }
 
 func printDiskInfo(w *tabwriter.Writer) {
 	d, err := disk.Usage("/")
 	if err != nil {
-		fmt.Fprintf(w, "  Disk (/):\tError getting disk info: %v\n", err)
+		fmt.Fprintf(w, "  💾 Disk (/):\t%s\n", badColor.Sprintf("Error getting disk info: %v", err))
 		return
 	}
-	fmt.Fprintf(w, "  Disk (/):\t%.1f%% (%s / %s)\n", d.UsedPercent, formatBytes(d.Used), formatBytes(d.Total))
+	percentStr := colorizePercent(d.UsedPercent)
+	fmt.Fprintf(w, "  💾 %s:\t%s (%s / %s)\n", labelColor.Sprint("Disk (/)"), percentStr, formatBytes(d.Used), formatBytes(d.Total))
 }
 
 func printGPUInfo(w *tabwriter.Writer) {
-	// nvidia-smi is the source of truth. Query it for specific fields.
 	cmd := exec.Command("nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits")
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Fprintln(w, "  NVIDIA GPU:\tNot detected or nvidia-smi not found.\t")
+		fmt.Fprintln(w, "  NVIDIA GPU:\tNot detected or nvidia-smi not found.")
 		return
 	}
 
@@ -102,16 +166,21 @@ func printGPUInfo(w *tabwriter.Writer) {
 		if len(parts) < 6 {
 			continue
 		}
-		gpuName := parts[0]
-		temp := parts[1]
-		power := parts[2]
-		memUsed := parts[3]
-		memTotal := parts[4]
-		util := parts[5]
+		gpuName, temp, power := parts[0], parts[1], parts[2]
+		memUsed, _ := strconv.ParseFloat(parts[3], 64)
+		memTotal, _ := strconv.ParseFloat(parts[4], 64)
+		util, _ := strconv.ParseFloat(parts[5], 64)
 
-		fmt.Fprintf(w, "  GPU %d:\t%s\n", i, gpuName)
-		fmt.Fprintf(w, "  \tTemp: %s°C\tPower: %sW\tUtil: %s%%\n", temp, power, util)
-		fmt.Fprintf(w, "  \tMemory:\t%sMiB / %sMiB\n", memUsed, memTotal)
+		memPercent := 0.0
+		if memTotal > 0 {
+			memPercent = (memUsed / memTotal) * 100
+		}
+
+		fmt.Fprintf(w, "  %s %d:\t%s\n", labelColor.Sprint("GPU"), i, gpuName)
+		fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Temp"), colorizeTemp(temp))
+		fmt.Fprintf(w, "    - %s:\t%sW\n", labelColor.Sprint("Power"), power)
+		fmt.Fprintf(w, "    - %s:\t%s (%sMiB / %sMiB)\n", labelColor.Sprint("VRAM"), colorizePercent(memPercent), parts[3], parts[4])
+		fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Util"), colorizePercent(util))
 	}
 }
 
@@ -119,22 +188,22 @@ func printNetworkInfo(w *tabwriter.Writer) {
 	tsCmd := exec.Command("tailscale", "status", "--json")
 	output, err := tsCmd.Output()
 	if err != nil {
-		fmt.Fprintln(w, "  Connection:\t🔴 OFFLINE (Tailscale daemon not responding)\t")
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Tailscale daemon not responding)"))
 		return
 	}
 
 	var status TailscaleStatus
 	if err := json.Unmarshal(output, &status); err != nil {
-		fmt.Fprintln(w, "  Connection:\t⚠️  WARNING (Could not parse Tailscale status)\t")
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprint("⚠️  WARNING (Could not parse Tailscale status)"))
 		return
 	}
 
 	if status.Self.Online {
-		fmt.Fprintln(w, "  Connection:\t🟢 ONLINE to Nexus\t")
-		fmt.Fprintf(w, "  Hostname:\t%s\n", strings.TrimSuffix(status.Self.DNSName, "."))
-		fmt.Fprintf(w, "  IP Address:\t%s\n", status.Self.TailscaleIPs[0])
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), goodColor.Sprint("🟢 ONLINE to Nexus"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), strings.TrimSuffix(status.Self.DNSName, "."))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.Self.TailscaleIPs[0])
 	} else {
-		fmt.Fprintln(w, "  Connection:\t🔴 OFFLINE (Not connected to Nexus)\t")
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not connected to Nexus)"))
 	}
 }
 
@@ -142,15 +211,15 @@ func printServiceInfo(w *tabwriter.Writer) {
 	manifest, err := readManifest("citadel.yaml")
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Fprintln(w, "  (No citadel.yaml found, no services to check)\t\t")
+			fmt.Fprintln(w, "  (No citadel.yaml found, no services to check)")
 		} else {
-			fmt.Fprintf(w, "  Error reading manifest: %v\n", err)
+			fmt.Fprintf(w, "  %s\n", badColor.Sprintf("Error reading manifest: %v", err))
 		}
 		return
 	}
 
 	if len(manifest.Services) == 0 {
-		fmt.Fprintln(w, "  (Manifest contains no services)\t\t")
+		fmt.Fprintln(w, "  (Manifest contains no services)")
 		return
 	}
 
@@ -158,49 +227,66 @@ func printServiceInfo(w *tabwriter.Writer) {
 		psCmd := exec.Command("docker", "compose", "-f", service.ComposeFile, "ps", "--format", "json")
 		output, err := psCmd.Output()
 		if err != nil {
-			fmt.Fprintf(w, "  - %s:\t⚠️  Could not get status\n", service.Name)
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
 			continue
 		}
 
 		var containers []struct {
-			Name   string `json:"Name"`
-			State  string `json:"State"`
-			Health string `json:"Health"`
-			Image  string `json:"Image"`
+			State string `json:"State"`
 		}
-
-		// Docker compose ps --format json returns a stream of json objects, not an array
 		decoder := json.NewDecoder(strings.NewReader(string(output)))
 		for decoder.More() {
 			var c struct {
-				Name   string `json:"Name"`
-				State  string `json:"State"`
-				Health string `json:"Health"`
-				Image  string `json:"Image"`
+				State string `json:"State"`
 			}
-			if err := decoder.Decode(&c); err != nil {
-				continue
+			if err := decoder.Decode(&c); err == nil {
+				containers = append(containers, c)
 			}
-			containers = append(containers, c)
 		}
 
 		if len(containers) == 0 {
-			fmt.Fprintf(w, "  - %s:\t⚫ STOPPED\n", service.Name)
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
 		} else {
-			// For simplicity, report status of the first container for the service
 			state := strings.ToUpper(containers[0].State)
-			statusIcon := "⚫" // Default to stopped/unknown
+			var statusStr string
 			if strings.Contains(state, "RUNNING") || strings.Contains(state, "UP") {
-				statusIcon = "🟢"
+				statusStr = goodColor.Sprintf("🟢 %s", state)
 			} else if strings.Contains(state, "EXITED") || strings.Contains(state, "DEAD") {
-				statusIcon = "🔴"
+				statusStr = badColor.Sprintf("🔴 %s", state)
+			} else {
+				statusStr = warnColor.Sprintf("🟡 %s", state)
 			}
-			fmt.Fprintf(w, "  - %s:\t%s %s\n", service.Name, statusIcon, state)
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
 		}
 	}
 }
 
-// formatBytes is a helper to convert bytes to a human-readable string.
+func colorizePercent(p float64) string {
+	s := fmt.Sprintf("%.1f%%", p)
+	if p > 90.0 {
+		return badColor.Sprint(s)
+	}
+	if p > 75.0 {
+		return warnColor.Sprint(s)
+	}
+	return goodColor.Sprint(s)
+}
+
+func colorizeTemp(t string) string {
+	temp, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return t
+	}
+	s := fmt.Sprintf("%s°C", t)
+	if temp > 85.0 {
+		return badColor.Sprint(s)
+	}
+	if temp > 70.0 {
+		return warnColor.Sprint(s)
+	}
+	return goodColor.Sprint(s)
+}
+
 func formatBytes(b uint64) string {
 	const unit = 1024
 	if b < unit {
@@ -216,4 +302,6 @@ func formatBytes(b uint64) string {
 
 func init() {
 	rootCmd.AddCommand(statusCmd)
+	// Add the --no-color flag
+	statusCmd.Flags().BoolVar(&noColor, "no-color", false, "Disable colorized output")
 }
