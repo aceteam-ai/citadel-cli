@@ -51,9 +51,9 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 		}
 		fmt.Printf("✅ Manifest loaded for node: %s\n", manifest.Node.Name)
 
-		if authKey != "" {
+		if authkey != "" {
 			fmt.Println("--- Establishing secure tunnel via authkey ---")
-			err = joinNetwork(manifest.Node.Name, nexusURL, authKey)
+			err = joinNetwork(manifest.Node.Name, nexusURL, authkey)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Error joining network: %v\n", err)
 				os.Exit(1)
@@ -163,7 +163,7 @@ func checkTailscaleState() error {
 	if err != nil && !strings.Contains(outputStr, "Logged out") {
 		return fmt.Errorf("tailscale daemon is not responding: %s", outputStr)
 	}
-	if authKey == "" {
+	if authkey == "" {
 		if strings.Contains(outputStr, "Logged out") {
 			return fmt.Errorf("you are not logged into Tailscale. Please run 'citadel login' or use an --authkey")
 		}
@@ -197,5 +197,5 @@ func startService(s Service) error {
 
 func init() {
 	rootCmd.AddCommand(upCmd)
-	upCmd.Flags().StringVar(&authKey, "authkey", "", "The pre-authenticated key to join the network (for automation)")
+	upCmd.Flags().StringVar(&authkey, "authkey", "", "The pre-authenticated key to join the network (for automation)")
 }

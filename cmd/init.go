@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	authKey      string
+	authkey      string
 	initService  string
 	initNodeName string
 	initTest     bool
@@ -95,7 +95,7 @@ interactively or with flags for automation.`,
 		// --- 4. Hand off to 'citadel up' ---
 		fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 		executablePath, _ := os.Executable()
-		upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authKey)
+		upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authkey)
 		upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
@@ -344,7 +344,7 @@ func installTailscale() error {
 
 func init() {
 	rootCmd.AddCommand(initCmd)
-	initCmd.Flags().StringVar(&authKey, "authkey", "", "The pre-authenticated key to join the network")
+	initCmd.Flags().StringVar(&authkey, "authkey", "", "The pre-authenticated key to join the network")
 	initCmd.MarkFlagRequired("authkey")
 	// New flags for automation
 	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
