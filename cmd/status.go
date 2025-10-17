@@ -51,7 +51,7 @@ and the state of all managed services.`,
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		defer w.Flush()
 
-		headerColor.Fprintln(w, "--- 📊 Citadel Node Status ---")
+		headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
 		headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
 		printMemInfo(w)

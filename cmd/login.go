@@ -39,7 +39,13 @@ nothing. Otherwise, it interactively prompts for an authentication method
 			tsCmd = exec.Command("sudo", "tailscale", "login", "--login-server="+nexusURL)
 		case nexus.NetChoiceAuthkey:
 			fmt.Println("--- Authenticating with authkey ---")
-			nodeName, err := ui.AskInput("Enter a name for this node:", "e.g., my-laptop", "")
+			fmt.Println("   - Using system hostname as node name.")
+			suggestedHostname, err := os.Hostname()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not determine system hostname: %v\n", err)
+			}
+
+			nodeName, err := ui.AskInput("Enter a name for this node:", "e.g., my-laptop", suggestedHostname)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Could not determine node name: %v\n", err)
 				os.Exit(1)
