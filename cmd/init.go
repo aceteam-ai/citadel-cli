@@ -1,4 +1,4 @@
-// cmd/bootstrap.go
+// cmd/init.go
 package cmd
 
 import (
@@ -16,23 +16,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var authKey string
-
 var (
-	bootstrapService  string
-	bootstrapNodeName string
-	bootstrapTest     bool
+	authKey      string
+	initService  string
+	initNodeName string
+	initTest     bool
 )
 
-var bootstrapCmd = &cobra.Command{
-	Use:   "bootstrap",
-	Short: "Provisions a fresh Ubuntu server to become a Citadel Node",
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Provisions a fresh server to become a Citadel Node",
 	Long: `RUN WITH SUDO. This command installs all necessary dependencies, generates a
 configuration based on your input, and brings the node online. It can be run
 interactively or with flags for automation.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
-			fmt.Fprintln(os.Stderr, "❌ Error: bootstrap command must be run with sudo.")
+			fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
 			os.Exit(1)
 		}
 		fmt.Println("✅ Running with root privileges.")
@@ -63,7 +62,6 @@ interactively or with flags for automation.`,
 		}
 
 		// --- 3. Provision System ---
-		// (This part is the same as before)
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
@@ -107,8 +105,8 @@ interactively or with flags for automation.`,
 		}
 
 		// --- 5. Run Test if Requested ---
-		if bootstrapTest {
-			fmt.Println("\n--- 🚀 Handing off to 'citadel test' to verify node health ---")
+		if initTest {
+			fmt.Println("\n--- 🔬 Handing off to 'citadel test' to verify node health ---")
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
 			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
 			testCmd.Stdout = os.Stdout
@@ -122,16 +120,16 @@ interactively or with flags for automation.`,
 }
 
 func getSelectedService() (string, error) {
-	if bootstrapService != "" {
+	if initService != "" {
 		// Validate the service provided by flag
 		validServices := append(services.GetAvailableServices(), "none")
 		for _, s := range validServices {
-			if bootstrapService == s {
-				fmt.Printf("✅ Using specified service: %s\n", bootstrapService)
-				return bootstrapService, nil
+			if initService == s {
+				fmt.Printf("✅ Using specified service: %s\n", initService)
+				return initService, nil
 			}
 		}
-		return "", fmt.Errorf("invalid service '%s' specified", bootstrapService)
+		return "", fmt.Errorf("invalid service '%s' specified", initService)
 	}
 
 	// Interactive prompt
@@ -153,9 +151,9 @@ func getSelectedService() (string, error) {
 }
 
 func getNodeName() (string, error) {
-	if bootstrapNodeName != "" {
-		fmt.Printf("✅ Using specified node name: %s\n", bootstrapNodeName)
-		return bootstrapNodeName, nil
+	if initNodeName != "" {
+		fmt.Printf("✅ Using specified node name: %s\n", initNodeName)
+		return initNodeName, nil
 	}
 	defaultName, err := os.Hostname()
 	if err != nil {
@@ -246,6 +244,7 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	return configDir, nil
 }
 
+// Helper functions (isCommandAvailable, isRoot, runCommand, etc.) remain the same
 func isCommandAvailable(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
@@ -319,7 +318,6 @@ func setupUser() error {
 }
 
 func installNvidiaToolkit() error {
-
 	fmt.Println("     - Running NVIDIA install script...")
 	script := `curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
   && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
@@ -336,7 +334,6 @@ func installNvidiaToolkit() error {
 }
 
 func installTailscale() error {
-
 	fmt.Println("     - Running Tailscale install script...")
 	script := "curl -fsSL https://tailscale.com/install.sh | sh"
 	cmd := exec.Command("sh", "-c", script)
@@ -346,12 +343,11 @@ func installTailscale() error {
 }
 
 func init() {
-	rootCmd.AddCommand(bootstrapCmd)
-	bootstrapCmd.Flags().StringVar(&authKey, "authkey", "", "The pre-authenticated key to join the network")
-	bootstrapCmd.MarkFlagRequired("authkey")
+	rootCmd.AddCommand(initCmd)
+	initCmd.Flags().StringVar(&authKey, "authkey", "", "The pre-authenticated key to join the network")
+	initCmd.MarkFlagRequired("authkey")
 	// New flags for automation
-	bootstrapCmd.Flags().StringVar(&bootstrapService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
-	bootstrapCmd.Flags().StringVar(&bootstrapNodeName, "node-name", "", "Set the node name (defaults to hostname)")
-	bootstrapCmd.Flags().BoolVar(&bootstrapTest, "test", false, "Run a diagnostic test after provisioning")
-
+	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
+	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
+	initCmd.Flags().BoolVar(&initTest, "test", false, "Run a diagnostic test after provisioning")
 }

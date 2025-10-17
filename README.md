@@ -7,7 +7,7 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 - **AceTeam:** The cloud-based control plane where you design and manage workflows.
 - **Citadel:** The on-premise agent you run on your own hardware (the "node").
 - **Nexus:** The secure coordination server (e.g., `nexus.aceteam.ai`) that manages the network, built on Headscale.
-- **`citadel.yaml`:** The manifest file that declares a node's identity and the services it provides. This file is **automatically generated** by the `bootstrap` command.
+- **`citadel.yaml`:** The manifest file that declares a node's identity and the services it provides. This file is **automatically generated** by the `init` command.
 
 ## Installation
 
@@ -24,13 +24,13 @@ You can then copy the appropriate binary (`./build/linux-amd64/citadel`) to your
 
 ### Node Setup & Provisioning
 
-| Command                                                                        | Description                                                                                                                                                                                               |
-| :----------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `citadel bootstrap`                                                            | **(Run with sudo)** The primary command for provisioning a new server. It installs dependencies, interactively prompts for configuration, generates all necessary files, and brings the node online.      |
-| `citadel bootstrap --authkey <key> --service <name> --node-name <name> --test` | The non-interactive version of bootstrap, perfect for automation. Allows you to specify the service (`vllm`, `ollama`, `llamacpp`, `none`), set the node name, and run a diagnostic test upon completion. |
-| `citadel up`                                                                   | Brings a node online using an existing configuration in the current directory. This is typically called automatically by `bootstrap`.                                                                     |
-| `citadel down`                                                                 | Stops and removes all services defined in the local `citadel.yaml`.                                                                                                                                       |
-| `citadel login`                                                                | Authenticates your machine interactively via a browser. Useful for local development.                                                                                                                     |
+| Command                                                                   | Description                                                                                                                                                                                            |
+| :------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `citadel init`                                                            | **(Run with sudo)** The primary command for provisioning a new server. It installs dependencies, interactively prompts for configuration, generates all necessary files, and brings the node online.   |
+| `citadel init --authkey <key> --service <name> --node-name <name> --test` | The non-interactive version of `init`, perfect for automation. Allows you to specify the service (`vllm`, `ollama`, `llamacpp`, `none`), set the node name, and run a diagnostic test upon completion. |
+| `citadel up`                                                              | Brings a node online using an existing configuration in the current directory. This is typically called automatically by `init`.                                                                       |
+| `citadel down`                                                            | Stops and removes all services defined in the local `citadel.yaml`.                                                                                                                                    |
+| `citadel login`                                                           | Authenticates your machine interactively via a browser. Useful for local development.                                                                                                                  |
 
 ### Node Operation & Monitoring
 
@@ -52,14 +52,14 @@ This workflow shows how to take a fresh Ubuntu server and turn it into a fully o
 1.  **Generate an Auth Key:**
     Log in to your Nexus/Headscale admin panel and generate a new, single-use, non-expiring authentication key.
 
-2.  **Bootstrap the Node:**
-    Copy the `citadel` binary to the new server. Run the `bootstrap` command with your auth key. It will handle all system setup, configuration, and service deployment.
+2.  **Initialize the Node:**
+    Copy the `citadel` binary to the new server. Run the `init` command with your auth key. It will handle all system setup, configuration, and service deployment.
 
     **Interactive Example:**
 
     ```bash
     # The command will prompt you to choose a service and name the node.
-    sudo ./citadel bootstrap --authkey tskey-auth-k1A2b3C4d5E6f...
+    sudo ./citadel init --authkey tskey-auth-k1A2b3C4d5E6f...
     ```
 
     **Automated Example:**
@@ -67,17 +67,17 @@ This workflow shows how to take a fresh Ubuntu server and turn it into a fully o
 
     ```bash
     # This command will provision a vLLM node named 'gpu-node-01' and run a test.
-    sudo ./citadel bootstrap \
+    sudo ./citadel init \
       --authkey tskey-auth-k1A2b3C4d5E6f... \
       --service vllm \
       --node-name gpu-node-01 \
       --test
     ```
 
-    After running, `bootstrap` will create a `~/citadel-node` directory containing the generated `citadel.yaml` and service files.
+    After running, `init` will create a `~/citadel-node` directory containing the generated `citadel.yaml` and service files.
 
 3.  **Verify the Status:**
-    Once bootstrap is complete, you can check the node's health at any time.
+    Once initialization is complete, you can check the node's health at any time.
 
     ```bash
     # Navigate to the generated directory to manage your node
@@ -91,7 +91,7 @@ This workflow shows how to take a fresh Ubuntu server and turn it into a fully o
 
 ### The `citadel.yaml` Manifest
 
-The `bootstrap` command generates this file for you. It defines the node's identity and the service it runs.
+The `init` command generates this file for you. It defines the node's identity and the service it runs.
 
 **Example `citadel.yaml` (generated for a vLLM node):**
 
