@@ -29,7 +29,7 @@ service, stopping and removing the containers, networks, and volumes created by 
 			fmt.Fprintf(os.Stderr, "❌ Error reading manifest: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("--- Tearing down services for node: %s ---\n", manifest.Name)
+		fmt.Printf("--- Tearing down services for node: %s ---\n", manifest.Node.Name)
 
 		// We process in reverse order for graceful shutdown, though not strictly necessary.
 		for i := len(manifest.Services) - 1; i >= 0; i-- {

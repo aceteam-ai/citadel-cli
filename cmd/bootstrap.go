@@ -5,19 +5,31 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/aceboss/citadel-cli/services"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var authKey string
 
-// bootstrapCmd represents the bootstrap command
+var (
+	bootstrapService  string
+	bootstrapNodeName string
+	bootstrapTest     bool
+)
+
 var bootstrapCmd = &cobra.Command{
 	Use:   "bootstrap",
 	Short: "Provisions a fresh Ubuntu server to become a Citadel Node",
-	Long: `RUN WITH SUDO. This command installs all necessary dependencies (Docker,
-NVIDIA drivers, Tailscale) and then brings the node online using the provided
-authkey. It is idempotent and can be run multiple times.`,
+	Long: `RUN WITH SUDO. This command installs all necessary dependencies, generates a
+configuration based on your input, and brings the node online. It can be run
+interactively or with flags for automation.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
 			fmt.Fprintln(os.Stderr, "❌ Error: bootstrap command must be run with sudo.")
@@ -25,28 +37,50 @@ authkey. It is idempotent and can be run multiple times.`,
 		}
 		fmt.Println("✅ Running with root privileges.")
 
+		// --- 1. Determine Configuration ---
+		selectedService, err := getSelectedService()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
+			os.Exit(1)
+		}
+
+		nodeName, err := getNodeName()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+			os.Exit(1)
+		}
+
+		// --- 2. Generate Config Files ---
+		originalUser := os.Getenv("SUDO_USER")
+		if originalUser == "" {
+			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
+			os.Exit(1)
+		}
+		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to generate configuration files: %v\n", err)
+			os.Exit(1)
+		}
+
+		// --- 3. Provision System ---
+		// (This part is the same as before)
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
 			run      func() error
 		}{
-			{"Package Lists", "", updateApt}, // No check needed for apt update
+			{"Package Lists", "", updateApt},
 			{"Core Dependencies", "", installCoreDeps},
 			{"Docker", "docker", installDocker},
-			{"Docker Service", "", startDockerDaemon},
 			{"System User", "", setupUser},
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
 			{"Tailscale", "tailscale", installTailscale},
-			{"Tailscale Service", "", startTailscaleDaemon},
-			// The daemon-ready check is now handled by 'citadel up'
 		}
-
 		fmt.Println("--- 🚀 Starting Node Provisioning ---")
 		for _, step := range provisionSteps {
 			fmt.Printf("   - Processing step: %s\n", step.name)
-
 			if step.checkCmd != "" && isCommandAvailable(step.checkCmd) {
-				fmt.Printf("     ✅ Prerequisite '%s' is already installed. Skipping installation.\n", step.checkCmd)
+				fmt.Printf("     ✅ Prerequisite '%s' is already installed. Skipping.\n", step.checkCmd)
 			} else {
 				if err := step.run(); err != nil {
 					if step.name == "NVIDIA Container Toolkit" {
@@ -60,48 +94,156 @@ authkey. It is idempotent and can be run multiple times.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
+		// --- 4. Hand off to 'citadel up' ---
 		fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
-		originalUser := os.Getenv("SUDO_USER")
-		if originalUser == "" {
-			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
-			os.Exit(1)
-		}
-
-		executablePath, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Could not find path to citadel binary: %v\n", err)
-			os.Exit(1)
-		}
-
-		// MODIFIED: Use `newgrp docker` to ensure the user's new group membership is active
-		// for the 'citadel up' command, allowing it to access the docker socket.
-		upCommandString := fmt.Sprintf("%s up --authkey %s", executablePath, authKey)
-		upCmd := exec.Command("/usr/bin/sudo", "-u", originalUser, "newgrp", "docker", "-c", upCommandString)
-
+		executablePath, _ := os.Executable()
+		upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authKey)
+		upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
-
 		if err := upCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed: %v\n", err)
 			os.Exit(1)
 		}
+
+		// --- 5. Run Test if Requested ---
+		if bootstrapTest {
+			fmt.Println("\n--- 🚀 Handing off to 'citadel test' to verify node health ---")
+			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
+			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
+			testCmd.Stdout = os.Stdout
+			testCmd.Stderr = os.Stderr
+			if err := testCmd.Run(); err != nil {
+				// The test command prints its own success/failure message, so we just exit.
+				os.Exit(1)
+			}
+		}
 	},
 }
 
-// --- Helper Functions ---
+func getSelectedService() (string, error) {
+	if bootstrapService != "" {
+		// Validate the service provided by flag
+		validServices := append(services.GetAvailableServices(), "none")
+		for _, s := range validServices {
+			if bootstrapService == s {
+				fmt.Printf("✅ Using specified service: %s\n", bootstrapService)
+				return bootstrapService, nil
+			}
+		}
+		return "", fmt.Errorf("invalid service '%s' specified", bootstrapService)
+	}
 
-func startDockerDaemon() error {
-	fmt.Println("     - Starting Docker daemon (dockerd)...")
-	// In a non-systemd environment (like a container), we need to start the daemon manually.
-	cmd := exec.Command("sh", "-c", "dockerd > /dev/null 2>&1 &")
-	return cmd.Run()
+	// Interactive prompt
+	prompt := &survey.Select{
+		Message: "Which primary service should this node run?",
+		Options: []string{
+			"vllm (High-throughput OpenAI-compatible API)",
+			"ollama (General purpose, easy to use)",
+			"llamacpp (Versatile GGUF server)",
+			"none (Connect to network only)",
+		},
+	}
+	var selection string
+	if err := survey.AskOne(prompt, &selection); err != nil {
+		return "", err
+	}
+	// Extract the short name (e.g., "vllm" from "vllm (...)")
+	return strings.Fields(selection)[0], nil
 }
 
-func startTailscaleDaemon() error {
-	fmt.Println("     - Starting tailscaled service...")
-	// The `&` sends the command to the background.
-	cmd := exec.Command("sh", "-c", "tailscaled &")
-	return cmd.Run()
+func getNodeName() (string, error) {
+	if bootstrapNodeName != "" {
+		fmt.Printf("✅ Using specified node name: %s\n", bootstrapNodeName)
+		return bootstrapNodeName, nil
+	}
+	defaultName, err := os.Hostname()
+	if err != nil {
+		return "", err
+	}
+	prompt := &survey.Input{
+		Message: "Enter a name for this node:",
+		Default: defaultName,
+	}
+	var nodeName string
+	if err := survey.AskOne(prompt, &nodeName); err != nil {
+		return "", err
+	}
+	return nodeName, nil
+}
+
+func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
+	fmt.Println("--- 📝 Generating configuration files ---")
+	homeDir := "/home/" + user
+	configDir := filepath.Join(homeDir, "citadel-node")
+	servicesDir := filepath.Join(configDir, "services")
+
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		return "", err
+	}
+
+	// Generate service compose files
+	for name, content := range services.ServiceMap {
+		filePath := filepath.Join(servicesDir, name+".yml")
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			return "", err
+		}
+	}
+
+	// Generate citadel.yaml
+	manifest := CitadelManifest{
+		Node: struct {
+			Name string   `yaml:"name"`
+			Tags []string `yaml:"tags"`
+		}{
+			Name: nodeName,
+			Tags: []string{"gpu", "provisioned-by-citadel"},
+		},
+	}
+	if serviceName != "none" {
+		manifest.Services = []Service{
+			{
+				Name:        serviceName,
+				ComposeFile: filepath.Join("./services", serviceName+".yml"),
+			},
+		}
+	}
+
+	yamlData, err := yaml.Marshal(&manifest)
+	if err != nil {
+		return "", err
+	}
+
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	if err := os.WriteFile(manifestPath, yamlData, 0644); err != nil {
+		return "", err
+	}
+
+	// IMPORTANT: Change ownership of the generated files to the original user
+	userInfo, err := exec.Command("id", "-u", user).Output()
+	if err != nil {
+		return "", err
+	}
+	uid, _ := strconv.Atoi(strings.TrimSpace(string(userInfo)))
+
+	groupInfo, err := exec.Command("id", "-g", user).Output()
+	if err != nil {
+		return "", err
+	}
+	gid, _ := strconv.Atoi(strings.TrimSpace(string(groupInfo)))
+
+	err = filepath.Walk(configDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return syscall.Chown(path, uid, gid)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to chown config directory: %w", err)
+	}
+
+	fmt.Printf("✅ Configuration generated in %s\n", configDir)
+	return configDir, nil
 }
 
 func isCommandAvailable(name string) bool {
@@ -207,4 +349,9 @@ func init() {
 	rootCmd.AddCommand(bootstrapCmd)
 	bootstrapCmd.Flags().StringVar(&authKey, "authkey", "", "The pre-authenticated key to join the network")
 	bootstrapCmd.MarkFlagRequired("authkey")
+	// New flags for automation
+	bootstrapCmd.Flags().StringVar(&bootstrapService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
+	bootstrapCmd.Flags().StringVar(&bootstrapNodeName, "node-name", "", "Set the node name (defaults to hostname)")
+	bootstrapCmd.Flags().BoolVar(&bootstrapTest, "test", false, "Run a diagnostic test after provisioning")
+
 }

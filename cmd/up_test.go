@@ -32,8 +32,8 @@ services:
 			t.Errorf("readManifest() returned an unexpected error: %v", err)
 		}
 
-		if manifest.Name != "test-node-valid" {
-			t.Errorf("Expected manifest name 'test-node-valid', got '%s'", manifest.Name)
+		if manifest.Node.Name != "test-node-valid" {
+			t.Errorf("Expected manifest name 'test-node-valid', got '%s'", manifest.Node.Name)
 		}
 
 		if len(manifest.Services) != 1 {

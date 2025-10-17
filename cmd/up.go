@@ -15,16 +15,15 @@ import (
 
 // (Struct definitions remain the same)
 type Service struct {
-	Name        string   `yaml:"name"`
-	Type        string   `yaml:"type"`
-	Tags        []string `yaml:"tags"`
-	Endpoint    string   `yaml:"endpoint"`
-	ComposeFile string   `yaml:"compose_file"`
+	Name        string `yaml:"name"`
+	ComposeFile string `yaml:"compose_file"`
 }
 
 type CitadelManifest struct {
-	Name     string    `yaml:"name"`
-	Tags     []string  `yaml:"tags"`
+	Node struct {
+		Name string   `yaml:"name"`
+		Tags []string `yaml:"tags"`
+	} `yaml:"node"`
 	Services []Service `yaml:"services"`
 }
 
@@ -50,11 +49,11 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			fmt.Fprintf(os.Stderr, "❌ Error reading manifest: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ Manifest loaded for node: %s\n", manifest.Name)
+		fmt.Printf("✅ Manifest loaded for node: %s\n", manifest.Node.Name)
 
 		if authKey != "" {
 			fmt.Println("--- Establishing secure tunnel via authkey ---")
-			err = joinNetwork(manifest.Name, nexusURL, authKey)
+			err = joinNetwork(manifest.Node.Name, nexusURL, authKey)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Error joining network: %v\n", err)
 				os.Exit(1)
@@ -178,17 +177,9 @@ func readManifest(filePath string) (*CitadelManifest, error) {
 		return nil, fmt.Errorf("could not read file %s: %w", filePath, err)
 	}
 	var manifest CitadelManifest
-	var manifestWrapper struct {
-		Node     CitadelManifest `yaml:"node"`
-		Services []Service       `yaml:"services"`
-	}
-	err = yaml.Unmarshal(data, &manifestWrapper)
-	if err != nil {
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("could not parse YAML in %s: %w", filePath, err)
 	}
-	manifest.Name = manifestWrapper.Node.Name
-	manifest.Tags = manifestWrapper.Node.Tags
-	manifest.Services = manifestWrapper.Services
 	return &manifest, nil
 }
 

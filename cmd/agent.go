@@ -90,7 +90,7 @@ func getUserHomeDir() string {
 }
 
 // executeJob runs the job, captures its output, and reports the status back to Nexus.
-func executeJob(client *nexus.Client, job *nexus.Job) {
+func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	var output []byte
 	var err error
 	var status string
@@ -398,7 +398,12 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 
 	if err != nil {
 		status = "FAILURE"
-		output = []byte(fmt.Sprintf("Execution Error: %v\n---\n%s", err, string(output)))
+		errorMsg := fmt.Sprintf("Execution Error: %v", err)
+		// Combine the error and any command output for a full report
+		if len(output) > 0 {
+			errorMsg = fmt.Sprintf("%s\n---\n%s", errorMsg, string(output))
+		}
+		output = []byte(errorMsg)
 		fmt.Fprintf(os.Stderr, "     - [Job %s] ❌ Execution failed: %v\n", job.ID, err)
 	} else {
 		status = "SUCCESS"
@@ -410,9 +415,11 @@ func executeJob(client *nexus.Client, job *nexus.Job) {
 		Output: string(output),
 	}
 
-	if err := client.UpdateJobStatus(job.ID, update); err != nil {
-		fmt.Fprintf(os.Stderr, "     - [Job %s] ⚠️ CRITICAL: Failed to report status back to Nexus: %v\n", job.ID, err)
+	if reportErr := client.UpdateJobStatus(job.ID, update); reportErr != nil {
+		fmt.Fprintf(os.Stderr, "     - [Job %s] ⚠️ CRITICAL: Failed to report status back to Nexus: %v\n", job.ID, reportErr)
 	}
+	return status, err
+
 }
 
 func init() {

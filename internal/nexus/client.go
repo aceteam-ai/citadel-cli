@@ -2,10 +2,10 @@
 package nexus
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -62,32 +62,26 @@ func (c *Client) ListNodes() ([]Node, error) {
 // --- MOCK IMPLEMENTATION ---
 var mockJobs []Job
 var jobIndex = 0
-var jobsLoaded = false
 
-func loadMockJobs() error {
-	if jobsLoaded {
-		return nil
+//go:embed mock_jobs.json
+var MockJobsFS embed.FS
+
+func LoadMockJobs() {
+	if mockJobs == nil { // Only load once
+		fmt.Println("[DEBUG] NexusClient: Loading mock jobs from mock_jobs.json...")
+		data, err := MockJobsFS.ReadFile("mock_jobs.json")
+		if err != nil {
+			panic(fmt.Sprintf("failed to read embedded mock_jobs.json: %v", err))
+		}
+		if err := json.Unmarshal(data, &mockJobs); err != nil {
+			panic(fmt.Sprintf("failed to parse mock_jobs.json: %v", err))
+		}
+		fmt.Printf("[DEBUG] NexusClient: Loaded %d mock jobs.\n", len(mockJobs))
 	}
-	fmt.Println("[DEBUG] NexusClient: Loading mock jobs from mock_jobs.json...")
-	file, err := os.ReadFile("mock_jobs.json")
-	if err != nil {
-		return fmt.Errorf("could not read mock_jobs.json: %w", err)
-	}
-	err = json.Unmarshal(file, &mockJobs)
-	if err != nil {
-		return fmt.Errorf("could not parse mock_jobs.json: %w", err)
-	}
-	jobsLoaded = true
-	fmt.Printf("[DEBUG] NexusClient: Loaded %d mock jobs.\n", len(mockJobs))
-	return nil
 }
 
 func (c *Client) GetNextJob() (*Job, error) {
-	if err := loadMockJobs(); err != nil {
-		// On failure, return the error and stop.
-		return nil, err
-	}
-
+	LoadMockJobs() // Ensure jobs are loaded
 	if jobIndex < len(mockJobs) {
 		job := mockJobs[jobIndex]
 		jobIndex++
