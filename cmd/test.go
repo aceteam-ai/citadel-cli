@@ -18,10 +18,8 @@ var testCmd = &cobra.Command{
 	Short: "Run a diagnostic test for a specific service",
 	Long: `This command runs a pre-defined suite of mock jobs against a newly provisioned
 service to ensure it is working correctly. It is typically called automatically
-by 'bootstrap --test'.`,
+by 'init --test'.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("--- 🔬 Running diagnostic test for service: %s ---\n", testService)
-
 		// 1. Define which job types belong to which service test
 		serviceJobMap := map[string][]string{
 			"llamacpp": {"DOWNLOAD_MODEL", "LLAMACPP_INFERENCE"},
@@ -42,6 +40,7 @@ by 'bootstrap --test'.`,
 		}
 
 		// 2. Load all mock jobs and filter them
+		fmt.Println("[DEBUG] POST: Loading test suite from mock_jobs.json...")
 		var allMockJobs []nexus.Job
 		data, _ := nexus.MockJobsFS.ReadFile("mock_jobs.json")
 		json.Unmarshal(data, &allMockJobs)
@@ -50,13 +49,13 @@ by 'bootstrap --test'.`,
 		for _, job := range allMockJobs {
 			for _, requiredType := range requiredJobTypes {
 				if job.Type == requiredType {
-					// Important: create a new variable for the pointer
 					jobCopy := job
 					jobsToRun = append(jobsToRun, &jobCopy)
 					break
 				}
 			}
 		}
+		fmt.Printf("[DEBUG] POST: Filtering test suite for '%s' jobs. Found %d relevant tests.\n", testService, len(jobsToRun))
 
 		if len(jobsToRun) == 0 {
 			fmt.Fprintf(os.Stderr, "⚠️ No mock jobs found for service '%s'.\n", testService)
@@ -67,12 +66,15 @@ by 'bootstrap --test'.`,
 		client := nexus.NewClient(nexusURL)
 		jobFailed := false
 		for i, job := range jobsToRun {
-			fmt.Printf("   - Running test job %d of %d (Type: %s)\n", i+1, len(jobsToRun), job.Type)
+			fmt.Printf("[DEBUG] POST: Running test %d of %d (Type: %s)...\n", i+1, len(jobsToRun), job.Type)
+			fmt.Printf("   - 📥 Executing test job %s...\n", job.ID)
 			status, _ := executeJob(client, job)
 			if status != "SUCCESS" {
 				jobFailed = true
+				fmt.Printf("[DEBUG] POST: Test '%s' FAILED.\n", job.ID)
+			} else {
+				fmt.Printf("[DEBUG] POST: Test '%s' PASSED.\n", job.ID)
 			}
-			// Add a small delay between jobs
 			time.Sleep(1 * time.Second)
 		}
 
@@ -81,7 +83,7 @@ by 'bootstrap --test'.`,
 			fmt.Println("\n--- ❌ Test failed. Please check the logs above for errors. ---")
 			os.Exit(1)
 		} else {
-			fmt.Println("\n--- ✅ Test successful! The node is operating correctly. ---")
+			fmt.Println("\n✅ POST successful. Node is verified and ready.")
 		}
 	},
 }

@@ -2,7 +2,7 @@
 
 ## Core Features
 
-- [x] `bootstrap` command for node provisioning
+- [x] `init` command for node provisioning
 - [x] `up` command to start services from manifest
 - [x] `down` command to stop services from manifest
 - [x] `status` command for node health check
@@ -30,7 +30,7 @@
 - [ ] Integrate `viper` for configuration management.
 - [ ] Add more pre-packaged services to the `run` command (lmstudio, llamacpp).
 
-Alright, let's pop the case open and see what we've got. Today's October 1st, 2025, and we've got a good frame here, but we're missing the core components to make this thing really hum. You've built a solid scaffolding with `bootstrap`, `login`, and `up`. That's like having the chassis, power supply, and the OS installer ready.
+Alright, let's pop the case open and see what we've got. Today's October 1st, 2025, and we've got a good frame here, but we're missing the core components to make this thing really hum. You've built a solid scaffolding with `init`, `login`, and `up`. That's like having the chassis, power supply, and the OS installer ready.
 
 Here's a breakdown of what's missing to turn this into a fully functional system, ordered from most critical to "nice-to-have."
 
@@ -119,11 +119,11 @@ You have `login`, you need `logout`. This would simply be a wrapper around `sudo
 
 - In `up.go`, what happens if `citadel.yaml` doesn't exist? It panics. It should print a friendly error: "`citadel.yaml` not found. Please create one or run `citadel init`."
 - What if a `compose_file` listed in the manifest doesn't exist? Validate all paths before trying to execute commands.
-- The `bootstrap` command is powerful. Add more checks and clearer output. Use a spinner or progress indicator for long-running steps like `apt-get update`.
+- The `init` command is powerful. Add more checks and clearer output. Use a spinner or progress indicator for long-running steps like `apt-get update`.
 
 #### 4. Security Hardening
 
-- The `bootstrap` command passes the `--authkey` on the command line, which means it gets stored in shell history (`.bash_history`). You should support reading the key from an environment variable (`CITADEL_AUTHKEY`) or a file to improve security.
+- The `init` command passes the `--authkey` on the command line, which means it gets stored in shell history (`.bash_history`). You should support reading the key from an environment variable (`CITADEL_AUTHKEY`) or a file to improve security.
 
 ### Prioritized Implementation Plan:
 

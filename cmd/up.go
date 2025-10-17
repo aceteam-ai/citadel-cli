@@ -13,6 +13,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var servicesOnly bool
+
 // (Struct definitions remain the same)
 type Service struct {
 	Name        string `yaml:"name"`
@@ -82,8 +84,11 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 
 		fmt.Println("\n🎉 Citadel Node is online and services are running.")
 
+		if servicesOnly {
+			return // Exit before starting the agent
+		}
+
 		// Start the agent as the final step
-		fmt.Println("--- 🚀 Starting Citadel Agent ---")
 		agentCmd.Run(cmd, args)
 	},
 }
@@ -198,4 +203,6 @@ func startService(s Service) error {
 func init() {
 	rootCmd.AddCommand(upCmd)
 	upCmd.Flags().StringVar(&authkey, "authkey", "", "The pre-authenticated key to join the network (for automation)")
+	upCmd.Flags().BoolVar(&servicesOnly, "services-only", false, "Only start services and exit (internal use for init)")
+	upCmd.Flags().MarkHidden("services-only")
 }

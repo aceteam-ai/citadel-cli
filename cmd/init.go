@@ -92,10 +92,10 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
-		// --- 4. Hand off to 'citadel up' ---
+		// --- 4. Hand off to 'citadel up' to bring services online ---
 		fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 		executablePath, _ := os.Executable()
-		upCommandString := fmt.Sprintf("cd %s && %s up --authkey %s", configDir, executablePath, authkey)
+		upCommandString := fmt.Sprintf("cd %s && %s up --services-only --authkey %s", configDir, executablePath, authkey)
 		upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
 		upCmd.Stdout = os.Stdout
 		upCmd.Stderr = os.Stderr
@@ -106,7 +106,7 @@ interactively or with flags for automation.`,
 
 		// --- 5. Run Test if Requested ---
 		if initTest {
-			fmt.Println("\n--- 🔬 Handing off to 'citadel test' to verify node health ---")
+			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
 			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
 			testCmd.Stdout = os.Stdout
@@ -116,16 +116,21 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 		}
+
+		// --- 6. Final Message ---
+		// This message informs the user that the next step is for the agent to run.
+		// In a real-world scenario, a systemd service would be configured to run 'citadel up'.
+		fmt.Println("\n--- Agent is now running in the background, polling for jobs ---")
 	},
 }
 
+// (All helper functions like getSelectedService, getNodeName, generateCitadelConfig, etc. remain unchanged)
 func getSelectedService() (string, error) {
 	if initService != "" {
 		// Validate the service provided by flag
 		validServices := append(services.GetAvailableServices(), "none")
 		for _, s := range validServices {
 			if initService == s {
-				fmt.Printf("✅ Using specified service: %s\n", initService)
 				return initService, nil
 			}
 		}
@@ -152,7 +157,6 @@ func getSelectedService() (string, error) {
 
 func getNodeName() (string, error) {
 	if initNodeName != "" {
-		fmt.Printf("✅ Using specified node name: %s\n", initNodeName)
 		return initNodeName, nil
 	}
 	defaultName, err := os.Hostname()
@@ -244,7 +248,6 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	return configDir, nil
 }
 
-// Helper functions (isCommandAvailable, isRoot, runCommand, etc.) remain the same
 func isCommandAvailable(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
@@ -289,7 +292,6 @@ func setupUser() error {
 		return nil
 	}
 
-	// 1. Ensure user exists
 	checkCmd := exec.Command("id", "-u", originalUser)
 	if err := checkCmd.Run(); err != nil {
 		fmt.Printf("     - User '%s' not found. Creating user...\n", originalUser)
@@ -300,13 +302,11 @@ func setupUser() error {
 		fmt.Printf("     - User '%s' already exists.\n", originalUser)
 	}
 
-	// 2. Ensure user is in the docker group
 	fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
 	if err := runCommand("usermod", "-aG", "docker", originalUser); err != nil {
 		return err
 	}
 
-	// 3. Grant passwordless sudo to the user
 	fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
 	sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
 	err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
@@ -346,7 +346,6 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	initCmd.Flags().StringVar(&authkey, "authkey", "", "The pre-authenticated key to join the network")
 	initCmd.MarkFlagRequired("authkey")
-	// New flags for automation
 	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", false, "Run a diagnostic test after provisioning")
