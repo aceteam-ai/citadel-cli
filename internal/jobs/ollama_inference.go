@@ -1,3 +1,4 @@
+// internal/jobs/ollama_inference.go
 package jobs
 
 import (
