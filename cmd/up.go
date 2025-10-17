@@ -27,7 +27,7 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 		if err := waitForTailscaleDaemon(); err != nil {
 			return err
 		}
-		fmt.Println("--- Verifying Tailscale status...")
+		fmt.Println("--- Verifying network status...")
 		return checkTailscaleState()
 	},
 
@@ -48,7 +48,7 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			}
 			fmt.Println("✅ Secure tunnel established.")
 		} else {
-			fmt.Println("✅ Tailscale login verified.")
+			fmt.Println("✅ Network login verified.")
 		}
 
 		if err := prepareCacheDirectories(); err != nil {
@@ -79,9 +79,8 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 	},
 }
 
-// (waitForTailscaleDaemon, joinNetwork, checkTailscaleState, readManifest, startService functions remain the same)
 func waitForTailscaleDaemon() error {
-	fmt.Println("--- Waiting for Tailscale daemon to be ready...")
+	fmt.Println("--- Waiting for Network daemon to be ready...")
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
 		cmd := exec.Command("tailscale", "version")
@@ -130,7 +129,7 @@ func prepareCacheDirectories() error {
 }
 
 func joinNetwork(hostname, serverURL, key string) error {
-	fmt.Printf("   - Running tailscale up with sudo...\n")
+	fmt.Printf("   - Bringing network up with sudo...\n")
 	exec.Command("sudo", "tailscale", "logout").Run()
 	tsCmd := exec.Command("sudo", "tailscale", "up",
 		"--login-server="+serverURL,
@@ -140,10 +139,10 @@ func joinNetwork(hostname, serverURL, key string) error {
 	)
 	output, err := tsCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("tailscale up failed: %s", string(output))
+		return fmt.Errorf("Network up failed: %s", string(output))
 	}
 	if !strings.Contains(string(output), "Success") {
-		fmt.Printf("   - Tailscale output: %s\n", string(output))
+		fmt.Printf("   - Network output: %s\n", string(output))
 	}
 	return nil
 }
@@ -157,7 +156,7 @@ func checkTailscaleState() error {
 	}
 	if authkey == "" {
 		if strings.Contains(outputStr, "Logged out") {
-			return fmt.Errorf("you are not logged into Tailscale. Please run 'citadel login' or use an --authkey")
+			return fmt.Errorf("you are not logged into Network. Please run 'citadel login' or use an --authkey")
 		}
 	}
 	return nil

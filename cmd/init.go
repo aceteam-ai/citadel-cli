@@ -2,6 +2,8 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,12 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-
-	"bytes"
-	"encoding/json"
 	"text/tabwriter"
 
-	"github.com/AlecAivazis/survey/v2"
+	"github.com/aceboss/citadel-cli/internal/ui"
 	"github.com/aceboss/citadel-cli/services"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -25,6 +24,19 @@ var (
 	initService  string
 	initNodeName string
 	initTest     bool
+)
+
+type initTailscaleStatus struct {
+	Self struct {
+		Online bool `json:"Online"`
+	} `json:"Self"`
+}
+
+const (
+	netChoiceAuthkey  = "authkey"
+	netChoiceBrowser  = "browser"
+	netChoiceSkip     = "skip"
+	netChoiceVerified = "verified"
 )
 
 var initCmd = &cobra.Command{
@@ -41,7 +53,7 @@ interactively or with flags for automation.`,
 		fmt.Println("✅ Running with root privileges.")
 
 		// --- 1. Determine Configuration ---
-		finalAuthKey, err := getAuthKeyOrConfirmLogin() // --- MODIFIED: Use new smart logic
+		choice, key, err := getNetworkChoice()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 			os.Exit(1)
@@ -113,22 +125,40 @@ interactively or with flags for automation.`,
 		fmt.Println("✅ System provisioning complete.")
 
 		// --- 4. Final Handoff ---
-		// --- MODIFIED: This whole block is new logic ---
-		if finalAuthKey == "" {
+		if choice == netChoiceSkip {
+			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
+			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel up --authkey <key>'")
+			return
+		}
+
+		if choice == netChoiceVerified {
 			fmt.Println("\n✅ Node is provisioned. Since you are already logged in, services will start now.")
-			fmt.Println("   Run 'citadel status' from the '~/citadel-node' directory to check health.")
 		} else {
 			fmt.Println("\n✅ Node is provisioned. Now connecting to the network...")
 		}
 
 		executablePath, _ := os.Executable()
-		upArgs := []string{"up"}
-		if finalAuthKey != "" {
-			upArgs = append(upArgs, "--authkey", finalAuthKey)
+		var upArgs []string
+
+		if choice == netChoiceBrowser {
+			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
+			loginCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", loginCmdStr)
+			loginCmd.Stdout = os.Stdout
+			loginCmd.Stderr = os.Stderr
+			loginCmd.Stdin = os.Stdin
+			if err := loginCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Login command failed. Please try again.\n")
+				os.Exit(1)
+			}
+			upArgs = []string{"up"}
+		} else {
+			upArgs = []string{"up"}
+			if key != "" {
+				upArgs = append(upArgs, "--authkey", key)
+			}
 		}
 
 		if initTest {
-			// Step 4a: Bring services up without the agent for the test
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
 			testUpArgs := append(upArgs, "--services-only")
 			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
@@ -140,7 +170,6 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 
-			// Step 5: Run the actual test
 			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
 			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
@@ -150,7 +179,6 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 		} else {
-			// Step 4b: Hand off to the full 'citadel up' to bring the node online and start the agent
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
 			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
@@ -164,6 +192,147 @@ interactively or with flags for automation.`,
 	},
 }
 
+func getNetworkChoice() (choice string, key string, err error) {
+	if authkey != "" {
+		fmt.Println("✅ Authkey provided via flag.")
+		return netChoiceAuthkey, authkey, nil
+	}
+
+	fmt.Println("--- Checking network status...")
+	statusCmd := exec.Command("tailscale", "status", "--json")
+	output, _ := statusCmd.Output()
+
+	var status initTailscaleStatus
+	if json.Unmarshal(output, &status) == nil && status.Self.Online {
+		fmt.Println("   - ✅ Already connected to the Nexus network.")
+		return netChoiceVerified, "", nil
+	}
+
+	fmt.Println("   - ⚠️  You are not connected to the Nexus network.")
+	// --- UPDATED CALL ---
+	selection, err := ui.AskSelect(
+		"How would you like to connect this node?",
+		[]string{
+			"Use a pre-generated authkey (Recommended for servers)",
+			"Log in with a browser",
+			"Skip network connection for now",
+		},
+	)
+	if err != nil {
+		return "", "", err
+	}
+
+	switch {
+	case strings.Contains(selection, "authkey"):
+		keyInput, err := ui.AskInput("Enter your Nexus authkey:", "nexus-auth-...", "")
+		if err != nil {
+			return "", "", err
+		}
+		return netChoiceAuthkey, strings.TrimSpace(keyInput), nil
+	case strings.Contains(selection, "browser"):
+		return netChoiceBrowser, "", nil
+	default:
+		return netChoiceSkip, "", nil
+	}
+}
+
+func getSelectedService() (string, error) {
+	if initService != "" {
+		validServices := append(services.GetAvailableServices(), "none")
+		for _, s := range validServices {
+			if initService == s {
+				return initService, nil
+			}
+		}
+		return "", fmt.Errorf("invalid service '%s' specified", initService)
+	}
+	// --- UPDATED CALL ---
+	selection, err := ui.AskSelect(
+		"Which primary service should this node run?",
+		[]string{
+			"vllm (High-throughput OpenAI-compatible API)",
+			"ollama (General purpose, easy to use)",
+			"llamacpp (Versatile GGUF server)",
+			"none (Connect to network only)",
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+	return strings.Fields(selection)[0], nil
+}
+
+func getNodeName() (string, error) {
+	if initNodeName != "" {
+		return initNodeName, nil
+	}
+	defaultName, _ := os.Hostname()
+	// --- UPDATED CALL ---
+	return ui.AskInput("Enter a name for this node:", "e.g., gpu-node-1", defaultName)
+}
+
+func checkForRunningServices(serviceToStart string) error {
+	fmt.Println("--- 🔍 Checking for existing services ---")
+	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("     - Could not query Docker, skipping check.")
+		return nil
+	}
+
+	var runningServices []DockerPsResult
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for decoder.More() {
+		var res DockerPsResult
+		if err := decoder.Decode(&res); err == nil {
+			if !strings.Contains(res.Name, serviceToStart) {
+				runningServices = append(runningServices, res)
+			}
+		}
+	}
+
+	if len(runningServices) == 0 {
+		fmt.Println("     ✅ No other conflicting Citadel services are running.")
+		return nil
+	}
+
+	fmt.Println("     ⚠️  Found other resource-intensive Citadel services running:")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "     \tCONTAINER NAME\tIMAGE")
+	fmt.Fprintln(w, "     \t--------------\t-----")
+	for _, s := range runningServices {
+		fmt.Fprintf(w, "     \t%s\t%s\n", s.Name, s.Image)
+	}
+	w.Flush()
+	fmt.Println("     It is highly recommended to run only one AI service at a time to conserve GPU memory.")
+
+	confirm := false
+	fmt.Print("     Do you want to stop these services before proceeding? (y/N) ")
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(strings.TrimSpace(response)) == "y" {
+		confirm = true
+	}
+
+	if !confirm {
+		fmt.Println("     - Skipping service shutdown. Proceeding with initialization.")
+		return nil
+	}
+
+	fmt.Println("     - Stopping services...")
+	for _, s := range runningServices {
+		fmt.Printf("       - Stopping %s...\n", s.Name)
+		stopCmd := exec.Command("docker", "stop", s.Name)
+		if err := stopCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "       - ⚠️  Could not stop %s: %v\n", s.Name, err)
+		}
+	}
+	fmt.Println("     ✅ Services stopped.")
+	return nil
+}
+
+// (The rest of the file is unchanged and omitted for brevity)
+// ...
 func createGlobalConfig(nodeConfigDir string) error {
 	fmt.Println("--- Registering node configuration system-wide ---")
 	globalConfigDir := "/etc/citadel"
@@ -181,82 +350,6 @@ func createGlobalConfig(nodeConfigDir string) error {
 
 	fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
 	return nil
-}
-
-// getAuthKeyOrConfirmLogin checks for an authkey, verifies existing login, or prompts the user.
-func getAuthKeyOrConfirmLogin() (string, error) {
-	// Case 1: Authkey provided via flag (for automation)
-	if authkey != "" {
-		fmt.Println("✅ Authkey provided via flag.")
-		return authkey, nil
-	}
-
-	// Case 2: No flag, check if already logged in.
-	fmt.Println("--- Checking network status...")
-	statusCmd := exec.Command("tailscale", "status")
-	output, _ := statusCmd.CombinedOutput()
-
-	if strings.Contains(string(output), "Logged out") || strings.Contains(string(output), "tailscaled is not running") {
-		// Case 3: Not logged in, so we must prompt for the key.
-		fmt.Println("   - ⚠️ You are not connected to the Nexus network.")
-		prompt := &survey.Input{
-			Message: "Please enter your Nexus authkey:",
-		}
-		var keyInput string
-		if err := survey.AskOne(prompt, &keyInput, survey.WithValidator(survey.Required)); err != nil {
-			return "", fmt.Errorf("aborted")
-		}
-		return strings.TrimSpace(keyInput), nil
-	}
-
-	// Case 2 (continued): Already logged in.
-	fmt.Println("   - ✅ Already connected to the Nexus network. No authkey needed.")
-	return "", nil // Return empty string to signify no 'up' command with authkey is needed.
-}
-
-func getSelectedService() (string, error) {
-	if initService != "" {
-		validServices := append(services.GetAvailableServices(), "none")
-		for _, s := range validServices {
-			if initService == s {
-				return initService, nil
-			}
-		}
-		return "", fmt.Errorf("invalid service '%s' specified", initService)
-	}
-	prompt := &survey.Select{
-		Message: "Which primary service should this node run?",
-		Options: []string{
-			"vllm (High-throughput OpenAI-compatible API)",
-			"ollama (General purpose, easy to use)",
-			"llamacpp (Versatile GGUF server)",
-			"none (Connect to network only)",
-		},
-	}
-	var selection string
-	if err := survey.AskOne(prompt, &selection); err != nil {
-		return "", err
-	}
-	return strings.Fields(selection)[0], nil
-}
-
-func getNodeName() (string, error) {
-	if initNodeName != "" {
-		return initNodeName, nil
-	}
-	defaultName, err := os.Hostname()
-	if err != nil {
-		return "", err
-	}
-	prompt := &survey.Input{
-		Message: "Enter a name for this node:",
-		Default: defaultName,
-	}
-	var nodeName string
-	if err := survey.AskOne(prompt, &nodeName); err != nil {
-		return "", err
-	}
-	return nodeName, nil
 }
 
 func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
@@ -427,65 +520,6 @@ func installTailscale() error {
 type DockerPsResult struct {
 	Name  string `json:"Names"`
 	Image string `json:"Image"`
-}
-
-func checkForRunningServices(serviceToStart string) error {
-	fmt.Println("--- 🔍 Checking for existing services ---")
-	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Println("     - Could not query Docker, skipping check.")
-		return nil
-	}
-
-	var runningServices []DockerPsResult
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	for decoder.More() {
-		var res DockerPsResult
-		if err := decoder.Decode(&res); err == nil {
-			if !strings.Contains(res.Name, serviceToStart) {
-				runningServices = append(runningServices, res)
-			}
-		}
-	}
-
-	if len(runningServices) == 0 {
-		fmt.Println("     ✅ No other conflicting Citadel services are running.")
-		return nil
-	}
-
-	fmt.Println("     ⚠️  Found other resource-intensive Citadel services running:")
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "     \tCONTAINER NAME\tIMAGE")
-	fmt.Fprintln(w, "     \t--------------\t-----")
-	for _, s := range runningServices {
-		fmt.Fprintf(w, "     \t%s\t%s\n", s.Name, s.Image)
-	}
-	w.Flush()
-	fmt.Println("     It is highly recommended to run only one AI service at a time to conserve GPU memory.")
-
-	confirm := false
-	prompt := &survey.Confirm{
-		Message: "Do you want to stop these services before proceeding?",
-		Default: true,
-	}
-	survey.AskOne(prompt, &confirm)
-
-	if !confirm {
-		fmt.Println("     - Skipping service shutdown. Proceeding with initialization.")
-		return nil
-	}
-
-	fmt.Println("     - Stopping services...")
-	for _, s := range runningServices {
-		fmt.Printf("       - Stopping %s...\n", s.Name)
-		stopCmd := exec.Command("docker", "stop", s.Name)
-		if err := stopCmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "       - ⚠️  Could not stop %s: %v\n", s.Name, err)
-		}
-	}
-	fmt.Println("     ✅ Services stopped.")
-	return nil
 }
 
 func init() {
