@@ -10,6 +10,10 @@ import (
 	"strings"
 	"syscall"
 
+	"bytes"
+	"encoding/json"
+	"text/tabwriter"
+
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/aceboss/citadel-cli/services"
 	"github.com/spf13/cobra"
@@ -46,6 +50,12 @@ interactively or with flags for automation.`,
 		nodeName, err := getNodeName()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+			os.Exit(1)
+		}
+
+		// --- Pre-flight check for running services ---
+		if err := checkForRunningServices(selectedService); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -349,6 +359,72 @@ func installTailscale() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+type DockerPsResult struct {
+	Name  string `json:"Names"` // Note: Docker uses "Names" in JSON output (not a typo)
+	Image string `json:"Image"`
+}
+
+func checkForRunningServices(serviceToStart string) error {
+	fmt.Println("--- 🔍 Checking for existing services ---")
+	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		// This is not a fatal error, might just mean docker isn't running yet.
+		fmt.Println("     - Could not query Docker, skipping check.")
+		return nil
+	}
+
+	var runningServices []DockerPsResult
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for decoder.More() {
+		var res DockerPsResult
+		if err := decoder.Decode(&res); err == nil {
+			// Don't list the service we are about to start anyway
+			if !strings.Contains(res.Name, serviceToStart) {
+				runningServices = append(runningServices, res)
+			}
+		}
+	}
+
+	if len(runningServices) == 0 {
+		fmt.Println("     ✅ No other conflicting Citadel services are running.")
+		return nil
+	}
+
+	fmt.Println("     ⚠️  Found other resource-intensive Citadel services running:")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "     \tCONTAINER NAME\tIMAGE")
+	fmt.Fprintln(w, "     \t--------------\t-----")
+	for _, s := range runningServices {
+		fmt.Fprintf(w, "     \t%s\t%s\n", s.Name, s.Image)
+	}
+	w.Flush()
+	fmt.Println("     It is highly recommended to run only one AI service at a time to conserve GPU memory.")
+
+	confirm := false
+	prompt := &survey.Confirm{
+		Message: "Do you want to stop these services before proceeding?",
+		Default: true,
+	}
+	survey.AskOne(prompt, &confirm)
+
+	if !confirm {
+		fmt.Println("     - Skipping service shutdown. Proceeding with initialization.")
+		return nil
+	}
+
+	fmt.Println("     - Stopping services...")
+	for _, s := range runningServices {
+		fmt.Printf("       - Stopping %s...\n", s.Name)
+		stopCmd := exec.Command("docker", "stop", s.Name)
+		if err := stopCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "       - ⚠️  Could not stop %s: %v\n", s.Name, err)
+		}
+	}
+	fmt.Println("     ✅ Services stopped.")
+	return nil
 }
 
 func init() {
