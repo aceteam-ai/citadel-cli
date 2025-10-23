@@ -136,6 +136,7 @@ func joinNetwork(hostname, serverURL, key string) error {
 		"--authkey="+key,
 		"--hostname="+hostname,
 		"--accept-routes",
+		"--accept-dns",
 	)
 	output, err := tsCmd.CombinedOutput()
 	if err != nil {

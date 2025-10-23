@@ -57,6 +57,7 @@ nothing. Otherwise, it interactively prompts for an authentication method
 				"--authkey="+key,
 				"--hostname="+nodeName,
 				"--accept-routes",
+				"--accept-dns",
 			)
 		}
 
