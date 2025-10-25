@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceboss/citadel-cli/internal/jobs"
 	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceboss/citadel-cli/internal/relay"
 	"github.com/spf13/cobra"
 )
 
@@ -28,6 +29,8 @@ run as a background service.`,
 		if cmd.CalledAs() == "agent" {
 			fmt.Println("--- 🚀 Starting Citadel Agent ---")
 		}
+		go relay.StartServer()
+
 		client := nexus.NewClient(nexusURL)
 		fmt.Printf("   - Nexus endpoint: %s\n", nexusURL)
 		sigs := make(chan os.Signal, 1)
