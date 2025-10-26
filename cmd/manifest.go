@@ -9,12 +9,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// --- Structs moved here from up.go to be shared ---
+// Service defines a single managed service.
 type Service struct {
 	Name        string `yaml:"name"`
 	ComposeFile string `yaml:"compose_file"`
 }
 
+// CitadelManifest defines the structure of the citadel.yaml file.
 type CitadelManifest struct {
 	Node struct {
 		Name string   `yaml:"name"`
@@ -23,33 +24,19 @@ type CitadelManifest struct {
 	Services []Service `yaml:"services"`
 }
 
-// findAndReadManifest is the new, smart way to load the config.
-// It returns the manifest, the directory it was found in, and any error.
+// findAndReadManifest locates and parses the node's manifest file.
+// It exclusively uses the global config file as the single source of truth for
+// locating the node's configuration directory. This ensures consistent behavior
+// regardless of the current working directory.
 func findAndReadManifest() (*CitadelManifest, string, error) {
-	// 1. Check current directory first
-	localPath := "citadel.yaml"
-	if _, err := os.Stat(localPath); err == nil {
-		data, err := os.ReadFile(localPath)
-		if err != nil {
-			return nil, "", fmt.Errorf("could not read local manifest %s: %w", localPath, err)
-		}
-		var manifest CitadelManifest
-		if err := yaml.Unmarshal(data, &manifest); err != nil {
-			return nil, "", fmt.Errorf("could not parse local manifest %s: %w", localPath, err)
-		}
-		// Return current working directory as the base path
-		wd, _ := os.Getwd()
-		return &manifest, wd, nil
-	}
-
-	// 2. If not local, check global config
 	globalConfigFile := "/etc/citadel/config.yaml"
-	if _, err := os.Stat(globalConfigFile); os.IsNotExist(err) {
-		return nil, "", fmt.Errorf("could not find citadel.yaml in the current directory, and no global config is set at %s. Have you run 'citadel init'?", globalConfigFile)
-	}
 
+	// Step 1: Read the global config file to find the node's directory.
 	globalConfigData, err := os.ReadFile(globalConfigFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("global config not found at %s. Please run 'citadel init'", globalConfigFile)
+		}
 		return nil, "", fmt.Errorf("could not read global config %s: %w", globalConfigFile, err)
 	}
 
@@ -64,17 +51,23 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 		return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
 	}
 
-	// 3. Load manifest from the path specified in the global config
-	manifestPath := filepath.Join(globalConf.NodeConfigDir, "citadel.yaml")
-	data, err := os.ReadFile(manifestPath)
+	// Step 2: Load the manifest from the path specified in the global config.
+	nodeConfigDir := globalConf.NodeConfigDir
+	manifestPath := filepath.Join(nodeConfigDir, "citadel.yaml")
+
+	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("manifest not found at %s. The configuration is incomplete or corrupt", manifestPath)
+		}
 		return nil, "", fmt.Errorf("could not read manifest from global path %s: %w", manifestPath, err)
 	}
 
 	var manifest CitadelManifest
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
+	if err := yaml.Unmarshal(manifestData, &manifest); err != nil {
 		return nil, "", fmt.Errorf("could not parse manifest from global path %s: %w", manifestPath, err)
 	}
 
-	return &manifest, globalConf.NodeConfigDir, nil
+	// Return the manifest and the absolute path to its directory.
+	return &manifest, nodeConfigDir, nil
 }

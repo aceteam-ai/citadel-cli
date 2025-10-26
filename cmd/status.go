@@ -11,6 +11,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"errors"
 
 	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -72,7 +73,6 @@ and the state of all managed services.`,
 	},
 }
 
-// --- printCacheInfo IS NOW FIXED ---
 func printCacheInfo(w *tabwriter.Writer) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -86,7 +86,6 @@ func printCacheInfo(w *tabwriter.Writer) {
 		return
 	}
 
-	// Get total size (this part was already correct)
 	totalCmd := exec.Command("du", "-sh", cacheDir)
 	totalOutput, err := totalCmd.Output()
 	if err == nil {
@@ -96,7 +95,6 @@ func printCacheInfo(w *tabwriter.Writer) {
 		}
 	}
 
-	// --- REWRITTEN BREAKDOWN LOGIC ---
 	fmt.Fprintf(w, "  %s:\n", labelColor.Sprint("Breakdown"))
 	// Use Go's Glob to find all subdirectories/files
 	entries, err := filepath.Glob(filepath.Join(cacheDir, "*"))
@@ -122,7 +120,6 @@ func printCacheInfo(w *tabwriter.Writer) {
 	}
 }
 
-// (The rest of the file remains largely the same, with minor formatting tweaks)
 func printMemInfo(w *tabwriter.Writer) {
 	v, err := mem.VirtualMemory()
 	if err != nil {
@@ -154,13 +151,34 @@ func printDiskInfo(w *tabwriter.Writer) {
 }
 
 func printGPUInfo(w *tabwriter.Writer) {
-	cmd := exec.Command("nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits")
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Fprintln(w, "  NVIDIA GPU:\tNot detected or nvidia-smi not found.")
+	// Step 1: Check for physical NVIDIA hardware using lspci.
+	lspciCmd := exec.Command("sh", "-c", "lspci | grep -i 'VGA compatible controller.*NVIDIA'")
+	if err := lspciCmd.Run(); err != nil {
+		// The command returns a non-zero exit code if grep finds no matches.
+		fmt.Fprintln(w, "  NVIDIA GPU:\tNo NVIDIA GPU detected on this system.")
 		return
 	}
 
+	// Step 2: If hardware is found, then check for the driver/tooling.
+	smiCmd := exec.Command("nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits")
+	output, err := smiCmd.Output()
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			fmt.Fprintln(w, "  NVIDIA GPU:\tHardware detected, but 'nvidia-smi' not found. Is the NVIDIA driver installed?")
+			return
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr := string(exitErr.Stderr)
+			if strings.Contains(string(output)+stderr, "No devices were found") {
+				fmt.Fprintln(w, "  NVIDIA GPU:\tHardware detected, but driver is not communicating with it.")
+				return
+			}
+		}
+		fmt.Fprintf(w, "  NVIDIA GPU:\tError running nvidia-smi: %v\n", err)
+		return
+	}
+
+	// Step 3: Parse and display the status if everything is working.
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	for i, line := range lines {
 		parts := strings.Split(line, ", ")
@@ -217,16 +235,42 @@ func printServiceInfo(w *tabwriter.Writer) {
 	}
 
 	if len(manifest.Services) == 0 {
-		fmt.Fprintln(w, "  (Manifest contains no services)")
+		fmt.Fprintln(w, "  No managed services are configured.")
+		return
+	}
+
+	// If services are listed in the manifest, the 'services' directory must exist.
+	servicesDir := filepath.Join(configDir, "services")
+	if _, statErr := os.Stat(servicesDir); os.IsNotExist(statErr) {
+		fmt.Fprintf(w, "  %s\n", warnColor.Sprint("⚠️  Configuration Error"))
+		fmt.Fprintf(w, "    The configuration file lists services, but the 'services' directory is missing.\n")
+		fmt.Fprintf(w, "    Expected at: %s\n", servicesDir)
 		return
 	}
 
 	for _, service := range manifest.Services {
 		fullComposePath := filepath.Join(configDir, service.ComposeFile)
+
+		// Proactively check if the compose file exists to provide a better error message.
+		if _, statErr := os.Stat(fullComposePath); os.IsNotExist(statErr) {
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Configuration Error"))
+			fmt.Fprintf(w, "    Compose file not found: %s\n", service.ComposeFile)
+			continue
+		}
+
 		psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "ps", "--format", "json")
-		output, err := psCmd.Output()
+		output, err := psCmd.CombinedOutput() // Use CombinedOutput to get stderr
 		if err != nil {
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
+			errMsg := string(output)
+			if strings.Contains(errMsg, "permission denied") && strings.Contains(errMsg, "docker.sock") {
+				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprint("❌ PERMISSION DENIED"))
+				fmt.Fprintf(w, "    %s\n", "Could not connect to the Docker daemon.")
+				fmt.Fprintf(w, "    %s\n", "Hint: Add your user to the 'docker' group (`sudo usermod -aG docker $USER`)")
+				fmt.Fprintf(w, "    %s\n", "      then log out and log back in for the change to take effect.")
+			} else {
+				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
+				fmt.Fprintf(w, "    %s\n", strings.TrimSpace(errMsg))
+			}
 			continue
 		}
 
@@ -301,6 +345,5 @@ func formatBytes(b uint64) string {
 
 func init() {
 	rootCmd.AddCommand(statusCmd)
-	// Add the --no-color flag
 	statusCmd.Flags().BoolVar(&noColor, "no-color", false, "Disable colorized output")
 }

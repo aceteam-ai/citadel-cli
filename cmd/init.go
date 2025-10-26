@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,8 +41,6 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ Running with root privileges.")
 
-		// --- 1. Determine Configuration ---
-		// --- UPDATED: Now calls the shared helper with the authkey flag ---
 		choice, key, err := nexus.GetNetworkChoice(authkey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -91,7 +90,7 @@ interactively or with flags for automation.`,
 			{"Docker", "docker", installDocker},
 			{"System User", "", setupUser},
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
-			{"Configure Docker for NVIDIA", "", configureNvidiaDocker}, // This step now ensures Docker is always configured correctly
+			{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
 			{"Tailscale", "tailscale", installTailscale},
 		}
 		fmt.Println("--- 🚀 Starting Node Provisioning ---")
@@ -114,6 +113,11 @@ interactively or with flags for automation.`,
 
 		// --- 3. Final Handoff ---
 		// --- UPDATED: Uses the public constants from the nexus package ---
+		if originalUser != "" && originalUser != "root" {
+			fmt.Println("\n⚠️  IMPORTANT: For Docker permissions to apply, you must log out and log back in,")
+			fmt.Printf("   or start a new login shell with: exec su -l %s\n", originalUser)
+		}
+
 		if choice == nexus.NetChoiceSkip {
 			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
 			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel up --authkey <key>'")
@@ -178,11 +182,22 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 		}
+
+		fmt.Println("\n--- ✅ Initialization Complete ---")
+		fmt.Println("You can run 'citadel status' at any time to check the node's health.")
+		fmt.Println("Running a final status check now...")
+
+		statusCmdString := fmt.Sprintf("%s status", executablePath)
+		statusCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", statusCmdString)
+		statusCmd.Stdout = os.Stdout
+		statusCmd.Stderr = os.Stderr
+		if err := statusCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "\n⚠️  Could not run final status check: %v\n", err)
+			// Do not exit, as the main init process was successful.
+		}
 	},
 }
 
-// (The rest of the file is unchanged, omitted for brevity)
-// ...
 func getSelectedService() (string, error) {
 	if initService != "" {
 		validServices := append(services.GetAvailableServices(), "none")
@@ -196,10 +211,10 @@ func getSelectedService() (string, error) {
 	selection, err := ui.AskSelect(
 		"Which primary service should this node run?",
 		[]string{
+			"none (Connect to network only)",
 			"vllm (High-throughput OpenAI-compatible API)",
 			"ollama (General purpose, easy to use)",
 			"llamacpp (Versatile GGUF server)",
-			"none (Connect to network only)",
 		},
 	)
 	if err != nil {
@@ -300,11 +315,19 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	homeDir := "/home/" + user
 	configDir := filepath.Join(homeDir, "citadel-node")
 	servicesDir := filepath.Join(configDir, "services")
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
+	// --- FIX: Clean up previous configuration to ensure a fresh start ---
+	// This prevents state from a previous 'init' run from causing conflicts.
+	// We ignore errors here because the directory might not exist on a fresh install.
+	os.RemoveAll(servicesDir)
+
+	// Create the main config directory and the services subdirectory.
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create services directory: %w", err)
 	}
 
+	// Always write all available service definitions to allow for easy switching later.
 	for name, content := range services.ServiceMap {
 		filePath := filepath.Join(servicesDir, name+".yml")
 		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
@@ -321,6 +344,9 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 			Tags: []string{"gpu", "provisioned-by-citadel"},
 		},
 	}
+
+	// Only add the selected service to the manifest if one was chosen.
+	// If serviceName is "none", manifest.Services will be an empty list.
 	if serviceName != "none" {
 		manifest.Services = []Service{
 			{
@@ -335,11 +361,11 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		return "", err
 	}
 
-	manifestPath := filepath.Join(configDir, "citadel.yaml")
 	if err := os.WriteFile(manifestPath, yamlData, 0644); err != nil {
 		return "", err
 	}
 
+	// ... (rest of the function for chown etc. remains the same)
 	userInfo, err := exec.Command("id", "-u", user).Output()
 	if err != nil {
 		return "", err
@@ -395,12 +421,63 @@ func installCoreDeps() error {
 }
 
 func installDocker() error {
-	fmt.Println("     - Running official Docker install script...")
+	// --- Step 1: Run the official Docker install script ---
+	// This script requires root privileges to install packages and configure services.
+	fmt.Println("     - Running official Docker install script (requires sudo)...")
 	installScript := "curl -fsSL https://get.docker.com | sh"
-	cmd := exec.Command("sh", "-c", installScript)
+	cmd := exec.Command("sudo", "sh", "-c", installScript)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run Docker install script: %w", err)
+	}
+
+	// --- Step 2: Ensure the 'docker' group exists ---
+	// The official script should create this, but we ensure it here to be robust.
+	// We run this with sudo as it's a system-level change.
+	fmt.Println("     - Ensuring 'docker' group exists...")
+	cmd = exec.Command("sudo", "groupadd", "docker")
+	// We don't check the error strictly, as a non-zero exit code is expected
+	// if the group already exists.
+	if err := cmd.Run(); err != nil {
+		fmt.Println("     - (Note: 'docker' group likely already exists, which is expected.)")
+	}
+
+	// --- Step 3: Add the current user to the 'docker' group ---
+	currentUser, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("could not determine current user: %w", err)
+	}
+	username := currentUser.Username
+
+	// It's pointless to add 'root' to the docker group.
+	if username == "root" {
+		fmt.Println("     - Running as root, no need to add to docker group. Skipping.")
+	} else {
+		fmt.Printf("     - Adding current user '%s' to the 'docker' group...\n", username)
+		cmd = exec.Command("sudo", "usermod", "-aG", "docker", username)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to add user '%s' to docker group: %w", username, err)
+		}
+	}
+
+	// --- Step 4: Instruct the user on how to apply and verify the changes ---
+	// This is a crucial step, as the group changes are not applied to the current session automatically.
+	fmt.Println("\n✅ Docker installed and user configured successfully!")
+	fmt.Println("--------------------------------------------------------------------------")
+	fmt.Println("IMPORTANT: To apply the new group membership, you must do one of the following:")
+	fmt.Println("\n  Option 1 (Recommended): Log out of your system and log back in.")
+	fmt.Println("     OR")
+	fmt.Println("  Option 2 (Immediate, for this terminal only): Run the following command:")
+	fmt.Printf("     newgrp docker\n")
+	fmt.Println("\nAfter applying the changes, you can verify that Docker runs without sudo:")
+	fmt.Println("     docker run hello-world")
+	fmt.Println("--------------------------------------------------------------------------")
+
+	return nil
+
 }
 
 func setupUser() error {
