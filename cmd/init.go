@@ -91,6 +91,7 @@ interactively or with flags for automation.`,
 			{"Docker", "docker", installDocker},
 			{"System User", "", setupUser},
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
+			{"Configure Docker for NVIDIA", "", configureNvidiaDocker}, // This step now ensures Docker is always configured correctly
 			{"Tailscale", "tailscale", installTailscale},
 		}
 		fmt.Println("--- 🚀 Starting Node Provisioning ---")
@@ -436,18 +437,38 @@ func setupUser() error {
 
 func installNvidiaToolkit() error {
 	fmt.Println("     - Running NVIDIA install script...")
+	// This script now ONLY handles installation. Configuration is a separate step.
 	script := `curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
   && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
     tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null \
   && apt-get update -qq \
-  && apt-get install -y -qq nvidia-container-toolkit \
-  && nvidia-ctk runtime configure --runtime=docker \
-  && systemctl restart docker`
+  && apt-get install -y -qq nvidia-container-toolkit`
 	cmd := exec.Command("sh", "-c", script)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// configureNvidiaDocker ensures the Docker daemon is correctly configured to use the NVIDIA runtime.
+// This is now a separate, unconditional step to fix broken installs.
+func configureNvidiaDocker() error {
+	if !isCommandAvailable("nvidia-ctk") {
+		fmt.Println("     - 'nvidia-ctk' not found. Skipping Docker GPU configuration (expected on non-GPU systems).")
+		return nil
+	}
+	fmt.Println("     - Ensuring Docker is configured for NVIDIA runtime...")
+	if err := runCommand("nvidia-ctk", "runtime", "configure", "--runtime=docker"); err != nil {
+		// This can fail on systems with nvidia-docker2, which is okay. We log a warning.
+		fmt.Fprintf(os.Stderr, "     - ⚠️  Could not configure nvidia-ctk automatically. This might be okay if you're using an older setup. Error: %v\n", err)
+	}
+
+	fmt.Println("     - Restarting Docker daemon to apply changes...")
+	if err := runCommand("systemctl", "restart", "docker"); err != nil {
+		return fmt.Errorf("failed to restart docker: %w", err)
+	}
+	fmt.Println("     ✅ Docker configured and restarted.")
+	return nil
 }
 
 func installTailscale() error {
