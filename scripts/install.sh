@@ -8,7 +8,7 @@
 # This script is designed to be idempotent and safe.
 #
 # Usage:
-#   curl -fsSL https://aceteam.ai/citadel/install.sh | sudo bash
+#   curl -fsSL https://get.aceteam.ai/citadel.sh | sudo bash
 #
 
 # --- Configuration ---
@@ -20,7 +20,7 @@ BINARY_NAME="citadel"
 
 # --- Helper Functions ---
 msg() {
-  echo -e "\033[1;32m=>\033[0m \033[1m$1\033[0m"
+  echo -e "\033[1;32m=>\033[0m \033[1m$1\033[0m" >&2
 }
 
 err() {
@@ -126,6 +126,11 @@ install_citadel() {
   if ! install -m 755 "$extracted_binary" "${INSTALL_DIR}/${BINARY_NAME}"; then
     err "Failed to install '${BINARY_NAME}' to ${INSTALL_DIR}. Check permissions."
   fi
+
+  # Explicitly clean up the temp directory now that we're done.
+  rm -rf "$tmp_dir"
+  # Disarm the trap so it doesn't fire on script exit with an out-of-scope variable.
+  trap - EXIT
 }
 
 # --- Execution ---
@@ -148,11 +153,11 @@ main() {
   local installed_version
   installed_version=$(${INSTALL_DIR}/${BINARY_NAME} version)
   
-  echo ""
+  echo "" >&2
   msg "Installation complete!"
-  echo "  Version: ${installed_version}"
-  echo "  Run 'citadel --help' to get started."
-  echo "  To provision this node, run: sudo citadel init"
+  echo "  Version: ${installed_version}" >&2
+  echo "  Run 'citadel --help' to get started." >&2
+  echo "  To provision this node, run: sudo citadel init" >&2
 }
 
 main
