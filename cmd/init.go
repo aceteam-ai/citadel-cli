@@ -133,7 +133,39 @@ interactively or with flags for automation.`,
 		executablePath, _ := os.Executable()
 		var upArgs []string
 
-		if choice == nexus.NetChoiceBrowser {
+		if choice == nexus.NetChoiceDevice {
+			// Device authorization flow
+			fmt.Println("\n--- Starting device authorization flow ---")
+
+			client := nexus.NewDeviceAuthClient(authServiceURL)
+
+			// Start the flow and get device code
+			resp, err := client.StartFlow()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to start device authorization: %v\n", err)
+				fmt.Fprintln(os.Stderr, "\nAlternative: Generate an authkey at https://aceteam.ai/fabric")
+				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
+				os.Exit(1)
+			}
+
+			// Display device code to user
+			fmt.Println()
+			ui.DisplayDeviceCode(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
+			fmt.Println()
+
+			// Poll for token
+			fmt.Println("⏳ Polling for authorization...")
+			token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Device authorization failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Println("✅ Authorization successful! Received authentication key.")
+
+			// Use the token as an authkey for the rest of the flow
+			upArgs = []string{"up", "--authkey", token.Authkey}
+		} else if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
 			loginCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", loginCmdStr)
 			loginCmd.Stdout = os.Stdout

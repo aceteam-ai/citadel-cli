@@ -14,6 +14,8 @@ import (
 type NetworkChoice string
 
 const (
+	// NetChoiceDevice indicates the user will use device authorization flow.
+	NetChoiceDevice NetworkChoice = "device"
 	// NetChoiceAuthkey indicates the user will provide a pre-generated key.
 	NetChoiceAuthkey NetworkChoice = "authkey"
 	// NetChoiceBrowser indicates the user will log in via a web browser.
@@ -52,8 +54,9 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 	selection, err := ui.AskSelect(
 		"How would you like to connect this node?",
 		[]string{
-			"Use a pre-generated authkey (Recommended for servers)",
-			"Log in with a browser",
+			"Device authorization (Recommended)",
+			"Use a pre-generated authkey (For automation)",
+			"Log in with a browser (Legacy Headscale OAuth)",
 			"Skip network connection for now",
 		},
 	)
@@ -62,8 +65,10 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 	}
 
 	switch {
+	case strings.Contains(selection, "Device authorization"):
+		return NetChoiceDevice, "", nil
 	case strings.Contains(selection, "authkey"):
-		keyInput, err := ui.AskInput("Enter your Nexus authkey:", "nexus-auth-...", "")
+		keyInput, err := ui.AskInput("Enter your Nexus authkey:", "tskey-auth-...", "")
 		if err != nil {
 			return "", "", err
 		}

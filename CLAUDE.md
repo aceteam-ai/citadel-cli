@@ -165,11 +165,20 @@ vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json
 The `init` command configures this automatically.
 
 ### Authentication Patterns
-Two auth flows supported:
-1. **Authkey**: Non-interactive, uses pre-generated single-use keys from Nexus admin panel
-2. **Browser**: Interactive OAuth flow using `tailscale login`
+Three auth flows supported:
+1. **Device Authorization** (RFC 8628): OAuth 2.0 device flow with code display (Claude Code-style)
+   - User runs `citadel init` → CLI displays device code → User enters code at aceteam.ai/device
+   - Implemented in `internal/nexus/deviceauth.go` and `internal/ui/devicecode.go`
+   - Default/recommended flow for interactive use
+2. **Authkey**: Non-interactive, uses pre-generated single-use keys from Nexus admin panel
+   - Still supported via `--authkey` flag for automation/CI/CD
+3. **Browser**: Legacy interactive OAuth flow using `tailscale login`
 
-The `--authkey` flag enables automated provisioning for CI/CD and fleet management.
+The device flow polls `/api/fabric/device-auth/token` endpoint until user approves at aceteam.ai/device.
+
+**Configuration:**
+- `--auth-service <url>` flag or `CITADEL_AUTH_HOST` env var sets auth service URL (default: https://aceteam.ai)
+- `--nexus <url>` flag sets Headscale server URL (default: https://nexus.aceteam.ai)
 
 ## Testing Philosophy
 
@@ -187,4 +196,8 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
 
 **Version Injection**: The `build.sh` script injects version via linker flags: `-ldflags="-X '${MODULE_PATH}/cmd.Version=${VERSION}'"`. Version is set as global var in `cmd/version.go`.
 
-**Mock Mode**: The Nexus client in `internal/nexus/client.go` has a mock mode using `mock_jobs.json` for local testing without a live Nexus server.
+**Mock Mode**:
+- The Nexus client in `internal/nexus/client.go` has a mock mode using `mock_jobs.json` for local testing
+- Device auth client has mock server in `internal/nexus/deviceauth_mock.go` for testing without backend
+  - Usage: `mock := nexus.StartMockDeviceAuthServer(3); defer mock.Close()`
+  - Returns `authorization_pending` for N polls, then returns success

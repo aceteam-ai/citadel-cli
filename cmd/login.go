@@ -34,6 +34,56 @@ nothing. Otherwise, it interactively prompts for an authentication method
 		case nexus.NetChoiceSkip:
 			fmt.Println("Login skipped.")
 			return
+		case nexus.NetChoiceDevice:
+			// Device authorization flow
+			fmt.Println("--- Starting device authorization flow ---")
+
+			client := nexus.NewDeviceAuthClient(authServiceURL)
+
+			// Start the flow and get device code
+			resp, err := client.StartFlow()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to start device authorization: %v\n", err)
+				fmt.Fprintln(os.Stderr, "\nAlternative: Use 'citadel login' and select authkey option")
+				os.Exit(1)
+			}
+
+			// Display device code to user
+			fmt.Println()
+			ui.DisplayDeviceCode(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
+			fmt.Println()
+
+			// Poll for token
+			fmt.Println("⏳ Polling for authorization...")
+			token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Device authorization failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Println("✅ Authorization successful! Received authentication key.")
+
+			// Get node name
+			suggestedHostname, err := os.Hostname()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not determine system hostname: %v\n", err)
+			}
+
+			nodeName, err := ui.AskInput("Enter a name for this node:", "e.g., my-laptop", suggestedHostname)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not determine node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Use the token as authkey
+			exec.Command("sudo", "tailscale", "logout").Run()
+			tsCmd = exec.Command("sudo", "tailscale", "up",
+				"--login-server="+nexusURL,
+				"--authkey="+token.Authkey,
+				"--hostname="+nodeName,
+				"--accept-routes",
+				"--accept-dns",
+			)
 		case nexus.NetChoiceBrowser:
 			fmt.Println("--- Starting browser authentication ---")
 			fmt.Println("Please follow the instructions in your browser to complete login.")
