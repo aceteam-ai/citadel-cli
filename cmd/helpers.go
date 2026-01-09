@@ -12,8 +12,6 @@ import (
 // runDeviceAuthFlow executes the OAuth 2.0 device authorization flow
 // and returns the token response upon successful authorization
 func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
-	fmt.Println("--- Starting device authorization flow ---")
-
 	client := nexus.NewDeviceAuthClient(authServiceURL)
 
 	// Start the flow and get device code
@@ -23,34 +21,28 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 	}
 
 	// Ask user if they want to open the browser
-	fmt.Println("\nTo complete authorization, you need to visit the following URL:")
-	fmt.Printf("  %s\n\n", resp.VerificationURI)
+	urlToOpen := resp.VerificationURIComplete
+	if urlToOpen == "" {
+		urlToOpen = resp.VerificationURI + "?code=" + resp.UserCode
+	}
 
+	browserOpened := false
 	openBrowser, err := ui.AskSelect(
-		"Would you like to open this URL in your default browser?",
-		[]string{"Yes (recommended)", "No, I'll open it manually"},
+		"Open browser to complete authorization?",
+		[]string{"Yes, open browser", "No, I'll copy the link"},
 	)
-	if err != nil {
-		// If prompt fails, continue without opening browser
-		fmt.Println("Continuing without opening browser...")
-	} else if openBrowser == "Yes (recommended)" {
-		// Open browser with complete URL (includes code pre-filled)
-		urlToOpen := resp.VerificationURIComplete
-		if urlToOpen == "" {
-			// Fallback if complete URI not provided
-			urlToOpen = resp.VerificationURI
-		}
-
+	if err == nil && openBrowser == "Yes, open browser" {
 		if err := platform.OpenURL(urlToOpen); err != nil {
-			fmt.Printf("⚠️  Could not open browser automatically: %v\n", err)
-			fmt.Println("Please open the URL manually.")
+			fmt.Printf("⚠️  Could not open browser: %v\n", err)
 		} else {
-			fmt.Println("✓ Browser opened successfully")
+			browserOpened = true
+			fmt.Println("✓ Browser opened")
 		}
 	}
 	fmt.Println()
 
-	// Create UI program
+	// Create UI program with device code display
+	// The UI shows clickable links and copy-to-clipboard options
 	model := ui.NewDeviceCodeModel(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
 	program := ui.NewDeviceCodeProgram(model)
 
@@ -69,8 +61,13 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 		ui.UpdateStatus(program, "approved")
 	}()
 
-	// Run the UI (blocks until approved or error)
+	// Show reminder if browser was opened
+	if browserOpened {
+		fmt.Println("Complete authorization in your browser")
+	}
 	fmt.Println()
+
+	// Run the UI (blocks until approved or error)
 	if _, err := program.Run(); err != nil {
 		return nil, fmt.Errorf("UI error: %w", err)
 	}
@@ -79,7 +76,7 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 	// Check results
 	select {
 	case token := <-tokenChan:
-		fmt.Println("✅ Authorization successful! Received authentication key.")
+		fmt.Println("✅ Authorization successful!")
 		return token, nil
 	case err := <-errChan:
 		return nil, fmt.Errorf("device authorization failed: %w", err)

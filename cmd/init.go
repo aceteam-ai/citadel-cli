@@ -65,6 +65,20 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
+		// If device authorization was selected, run the flow immediately
+		// This shows the authorization box first, before other setup prompts
+		var deviceAuthToken *nexus.TokenResponse
+		if choice == nexus.NetChoiceDevice {
+			deviceAuthToken, err = runDeviceAuthFlow(authServiceURL)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
+				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
+				os.Exit(1)
+			}
+			fmt.Println("\n--- Continuing with node setup ---")
+		}
+
 		selectedService, err := getSelectedService()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
@@ -152,17 +166,9 @@ interactively or with flags for automation.`,
 		var upArgs []string
 
 		if choice == nexus.NetChoiceDevice {
-			// Device authorization flow
-			token, err := runDeviceAuthFlow(authServiceURL)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
-				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
-				os.Exit(1)
-			}
-
-			// Use the token as an authkey for the rest of the flow
-			upArgs = []string{"up", "--authkey", token.Authkey}
+			// Device authorization was already completed at the start
+			// Use the stored token as an authkey for the rest of the flow
+			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
 		} else if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
 			loginCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", loginCmdStr)
