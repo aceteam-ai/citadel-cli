@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fatih/color"
+	"github.com/mattn/go-runewidth"
 )
 
 // DeviceCodeModel represents the state for displaying device authorization code
@@ -70,36 +71,43 @@ func (m DeviceCodeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m DeviceCodeModel) View() string {
 	var sb strings.Builder
+	const boxWidth = 63
+
+	// Helper function to create a padded line
+	padLine := func(content string, leftPad int) string {
+		visibleLen := runewidth.StringWidth(stripANSI(content))
+		rightPad := boxWidth - leftPad - visibleLen
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		return "│" + strings.Repeat(" ", leftPad) + content + strings.Repeat(" ", rightPad) + "│\n"
+	}
 
 	// Top border
-	sb.WriteString("┌" + strings.Repeat("─", 63) + "┐\n")
-	sb.WriteString("│" + centerText("", 63) + "│\n")
-	sb.WriteString("│" + centerText("Device Authorization", 63) + "│\n")
-	sb.WriteString("│" + centerText("", 63) + "│\n")
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
+	sb.WriteString("┌" + strings.Repeat("─", boxWidth) + "┐\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	sb.WriteString("│" + centerText("Device Authorization", boxWidth) + "│\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Instructions
-	sb.WriteString("│   To complete setup, visit this URL in your browser:        │\n")
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
-	// Handle long URLs by calculating proper spacing
-	uriLine := "│     " + m.verificationURI
-	padding := 63 - len(m.verificationURI) - 6 // 6 = length of "│     " prefix
-	if padding < 0 {
-		padding = 0
-	}
-	uriLine += strings.Repeat(" ", padding) + "│\n"
-	sb.WriteString(uriLine)
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
-	sb.WriteString("│   and enter the following code:                              │\n")
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
+	sb.WriteString(padLine("To complete setup, visit this URL in your browser:", 2))
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	sb.WriteString(padLine(m.verificationURI, 4))
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	sb.WriteString(padLine("and enter the following code:", 2))
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Code box (emphasized)
 	codeBox := "╔══════════════╗"
-	sb.WriteString("│" + centerText(codeBox, 63) + "│\n")
-	codeText := fmt.Sprintf("║  %s   ║", m.userCode)
-	sb.WriteString("│" + centerText(color.CyanString(codeText), 63+len(color.CyanString(""))-len(codeText)) + "│\n")
-	sb.WriteString("│" + centerText("╚══════════════╝", 63) + "│\n")
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
+	sb.WriteString("│" + centerText(codeBox, boxWidth) + "│\n")
+
+	plainCodeText := fmt.Sprintf("║  %s   ║", m.userCode)
+	coloredCodeText := fmt.Sprintf("║  %s   ║", color.CyanString(m.userCode))
+	sb.WriteString("│" + centerTextColored(coloredCodeText, plainCodeText, boxWidth) + "│\n")
+
+	sb.WriteString("│" + centerText("╚══════════════╝", boxWidth) + "│\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Status
 	if m.status == "waiting" {
@@ -111,66 +119,90 @@ func (m DeviceCodeModel) View() string {
 		seconds := int(remaining.Seconds()) % 60
 
 		statusText := fmt.Sprintf("⏳ Waiting for authorization... (%d:%02d remaining)", minutes, seconds)
-		statusPadding := 63 - 3 - len(statusText)
-		if statusPadding < 0 {
-			statusPadding = 0
-		}
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
+		sb.WriteString(padLine(statusText, 2))
 	} else if m.status == "approved" {
-		statusText := color.GreenString("✅ Authorization successful!")
 		plainText := "✅ Authorization successful!"
-		statusPadding := 63 - 3 - len(plainText)
-		if statusPadding < 0 {
-			statusPadding = 0
-		}
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
+		coloredText := color.GreenString(plainText)
+		sb.WriteString(padLineColored(coloredText, plainText, 2))
 	} else if m.status == "error" {
-		statusText := color.RedString("❌ " + m.errorMessage)
 		plainText := "❌ " + m.errorMessage
-		statusPadding := 63 - 3 - len(plainText)
-		if statusPadding < 0 {
-			statusPadding = 0
-		}
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
+		coloredText := color.RedString(plainText)
+		sb.WriteString(padLineColored(coloredText, plainText, 2))
 	}
 
-	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Browser hint
 	if m.status == "waiting" {
-		sb.WriteString("│   Browser didn't open? Copy the URL above or visit:          │\n")
+		sb.WriteString(padLine("Browser didn't open? Copy the URL above or visit:", 2))
 		completeURI := m.verificationURI + "?code=" + m.userCode
-		if len(completeURI) <= 55 {
-			uriPadding := 63 - 3 - len(completeURI)
-			if uriPadding < 0 {
-				uriPadding = 0
-			}
-			sb.WriteString("│   " + completeURI + strings.Repeat(" ", uriPadding) + "│\n")
+		if len(completeURI) <= 57 {
+			sb.WriteString(padLine(completeURI, 2))
 		} else {
-			uriPadding := 63 - 3 - len(m.verificationURI)
-			if uriPadding < 0 {
-				uriPadding = 0
-			}
-			sb.WriteString("│   " + m.verificationURI + strings.Repeat(" ", uriPadding) + "│\n")
+			sb.WriteString(padLine(m.verificationURI, 2))
 		}
-		sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
+		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	}
 
 	// Bottom border
-	sb.WriteString("└" + strings.Repeat("─", 63) + "┘\n")
+	sb.WriteString("└" + strings.Repeat("─", boxWidth) + "┘\n")
 
 	return sb.String()
 }
 
+// padLineColored creates a padded line with colored text
+func padLineColored(coloredContent, plainContent string, leftPad int) string {
+	const boxWidth = 63
+	visibleLen := runewidth.StringWidth(plainContent)
+	rightPad := boxWidth - leftPad - visibleLen
+	if rightPad < 0 {
+		rightPad = 0
+	}
+	return "│" + strings.Repeat(" ", leftPad) + coloredContent + strings.Repeat(" ", rightPad) + "│\n"
+}
+
 // centerText centers text within a given width
 func centerText(text string, width int) string {
-	textLen := len(text)
+	textLen := runewidth.StringWidth(text)
 	if textLen >= width {
 		return text
 	}
 	leftPad := (width - textLen) / 2
 	rightPad := width - textLen - leftPad
 	return strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)
+}
+
+// centerTextColored centers colored text within a given width
+func centerTextColored(coloredText, plainText string, width int) string {
+	textLen := runewidth.StringWidth(plainText)
+	if textLen >= width {
+		return coloredText
+	}
+	leftPad := (width - textLen) / 2
+	rightPad := width - textLen - leftPad
+	return strings.Repeat(" ", leftPad) + coloredText + strings.Repeat(" ", rightPad)
+}
+
+// stripANSI removes ANSI color codes from a string
+func stripANSI(str string) string {
+	// Simple ANSI stripper - removes escape sequences
+	var result strings.Builder
+	inEscape := false
+	for i := 0; i < len(str); i++ {
+		if str[i] == '\x1b' && i+1 < len(str) && str[i+1] == '[' {
+			inEscape = true
+			i++ // skip '['
+			continue
+		}
+		if inEscape {
+			if (str[i] >= 'A' && str[i] <= 'Z') || (str[i] >= 'a' && str[i] <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		result.WriteByte(str[i])
+	}
+	return result.String()
 }
 
 // NewDeviceCodeProgram creates a new tea.Program for device code display
