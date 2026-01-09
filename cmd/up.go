@@ -22,6 +22,11 @@ var upCmd = &cobra.Command{
 	Long: `Reads the citadel.yaml manifest, joins the network, and launches services.
 In interactive mode, it checks for an existing login.
 In automated mode (with --authkey), it joins the network non-interactively.`,
+	Example: `  # Start services with existing network login
+  citadel up
+
+  # Start services with a new authkey (automated/CI)
+  citadel up --authkey <your-key>`,
 
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		if err := waitForTailscaleDaemon(); err != nil {

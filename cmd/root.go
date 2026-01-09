@@ -28,10 +28,7 @@ var rootCmd = &cobra.Command{
 	Short: "Citadel is the agent for the AceTeam Sovereign Compute Fabric",
 	Long: `A self-contained agent and CLI for connecting your hardware
 to the AceTeam control plane, making your resources available to your private workflows.`,
-
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+	Version: Version,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

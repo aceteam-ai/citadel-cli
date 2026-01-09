@@ -22,6 +22,11 @@ var runCmd = &cobra.Command{
 	Long: fmt.Sprintf(`Deploys a containerized, pre-configured service onto the node.
 This command is for running ad-hoc services and does not use the citadel.yaml manifest.
 Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
+	Example: `  # Run vLLM in detached mode (background)
+  citadel run vllm
+
+  # Run Ollama without detaching (foreground)
+  citadel run ollama --detach=false`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		serviceName := args[0]
