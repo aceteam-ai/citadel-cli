@@ -31,8 +31,9 @@
             # Utilities used by build script
             tree
 
-            # Tailscale CLI (for network operations)
-            tailscale
+            # Note: Tailscale is intentionally not included here as it's
+            # typically installed system-wide and runs as a daemon.
+            # Install via: brew install tailscale (macOS) or system package manager
 
             # Common development tools
             curl
