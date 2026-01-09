@@ -36,7 +36,17 @@ check_root() {
 }
 
 check_deps() {
-  local deps=("curl" "tar" "grep" "cut" "sha256sum")
+  local deps=("curl" "tar" "grep" "cut")
+
+  # On Linux, check for sha256sum; on macOS, use shasum
+  local os
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  if [ "$os" = "linux" ]; then
+    deps+=("sha256sum")
+  elif [ "$os" = "darwin" ]; then
+    deps+=("shasum")
+  fi
+
   for dep in "${deps[@]}"; do
     if ! command -v "$dep" &>/dev/null; then
       err "Required command '$dep' is not installed. Please install it and try again."
@@ -53,7 +63,7 @@ get_arch() {
 
   case "$os" in
     linux) os="linux" ;;
-    darwin) err "macOS is not yet supported by this installer." ;;
+    darwin) os="darwin" ;;
     *) err "Unsupported operating system: $os" ;;
   esac
 
@@ -107,7 +117,17 @@ install_citadel() {
   msg "Verifying checksum..."
   # Use a subshell to change directory temporarily.
   # The `--ignore-missing` flag is crucial because checksums.txt contains hashes for all architectures.
-  (cd "$tmp_dir" && sha256sum -c --ignore-missing "$checksum_file")
+  local os
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+  if [ "$os" = "darwin" ]; then
+    # On macOS, use shasum with -a 256 for SHA-256
+    (cd "$tmp_dir" && shasum -a 256 -c --ignore-missing "$checksum_file")
+  else
+    # On Linux, use sha256sum
+    (cd "$tmp_dir" && sha256sum -c --ignore-missing "$checksum_file")
+  fi
+
   if [ $? -ne 0 ]; then
       err "Checksum validation failed! The downloaded file may be corrupt or tampered with."
   fi

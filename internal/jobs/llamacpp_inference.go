@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceboss/citadel-cli/internal/platform"
 )
 
 type LlamaCppInferenceHandler struct{}
@@ -105,8 +106,11 @@ func (h *LlamaCppInferenceHandler) performInference(prompt string) ([]byte, erro
 }
 
 func getUserHomeDir() string {
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		return "/home/" + sudoUser
+	if sudoUser := platform.GetSudoUser(); sudoUser != "" {
+		homeDir, err := platform.HomeDir(sudoUser)
+		if err == nil {
+			return homeDir
+		}
 	}
 	homeDir, _ := os.UserHomeDir()
 	return homeDir

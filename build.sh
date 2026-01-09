@@ -20,27 +20,31 @@ mkdir -p "$BUILD_DIR" "$RELEASE_DIR"
 echo "--- Cleaned old build and release directories ---"
 
 # --- Build and Package Loop ---
+PLATFORMS=("linux" "darwin")
 ARCHS=("amd64" "arm64")
-for ARCH in "${ARCHS[@]}"; do
-    echo ""
-    echo "--- Processing linux/$ARCH ---"
-    
-    # Define paths and names
-    PLATFORM_DIR="$BUILD_DIR/linux-$ARCH"
-    BINARY_PATH="$PLATFORM_DIR/citadel"
-    RELEASE_NAME="citadel_${VERSION}_linux_${ARCH}.tar.gz"
-    RELEASE_PATH="$RELEASE_DIR/$RELEASE_NAME"
-    
-    mkdir -p "$PLATFORM_DIR"
 
-    # 1. Build the binary
-    echo "Building binary..."
-    GOOS=linux GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
+for OS in "${PLATFORMS[@]}"; do
+    for ARCH in "${ARCHS[@]}"; do
+        echo ""
+        echo "--- Processing $OS/$ARCH ---"
 
-    # 2. Package into a .tar.gz
-    echo "Packaging to $RELEASE_NAME..."
-    # The -C flag changes directory before archiving, so we don't get the full path in the tarball.
-    tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel
+        # Define paths and names
+        PLATFORM_DIR="$BUILD_DIR/${OS}-${ARCH}"
+        BINARY_PATH="$PLATFORM_DIR/citadel"
+        RELEASE_NAME="citadel_${VERSION}_${OS}_${ARCH}.tar.gz"
+        RELEASE_PATH="$RELEASE_DIR/$RELEASE_NAME"
+
+        mkdir -p "$PLATFORM_DIR"
+
+        # 1. Build the binary
+        echo "Building binary..."
+        GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
+
+        # 2. Package into a .tar.gz
+        echo "Packaging to $RELEASE_NAME..."
+        # The -C flag changes directory before archiving, so we don't get the full path in the tarball.
+        tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel
+    done
 done
 
 # --- Generate Checksums ---

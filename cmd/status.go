@@ -11,8 +11,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
-	"errors"
 
+	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -151,55 +151,49 @@ func printDiskInfo(w *tabwriter.Writer) {
 }
 
 func printGPUInfo(w *tabwriter.Writer) {
-	// Step 1: Check for physical NVIDIA hardware using lspci.
-	lspciCmd := exec.Command("sh", "-c", "lspci | grep -i 'VGA compatible controller.*NVIDIA'")
-	if err := lspciCmd.Run(); err != nil {
-		// The command returns a non-zero exit code if grep finds no matches.
-		fmt.Fprintln(w, "  NVIDIA GPU:\tNo NVIDIA GPU detected on this system.")
+	detector, err := platform.GetGPUDetector()
+	if err != nil {
+		fmt.Fprintf(w, "  GPU:\t%s\n", badColor.Sprintf("Error: %v", err))
 		return
 	}
 
-	// Step 2: If hardware is found, then check for the driver/tooling.
-	smiCmd := exec.Command("nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits")
-	output, err := smiCmd.Output()
+	if !detector.HasGPU() {
+		fmt.Fprintln(w, "  GPU:\tNo GPU detected on this system.")
+		return
+	}
+
+	gpus, err := detector.GetGPUInfo()
 	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			fmt.Fprintln(w, "  NVIDIA GPU:\tHardware detected, but 'nvidia-smi' not found. Is the NVIDIA driver installed?")
-			return
+		fmt.Fprintf(w, "  GPU:\t%s\n", warnColor.Sprintf("Hardware detected, but could not get details: %v", err))
+		return
+	}
+
+	for i, gpu := range gpus {
+		fmt.Fprintf(w, "  %s %d:\t%s\n", labelColor.Sprint("GPU"), i, gpu.Name)
+
+		if gpu.Memory != "" {
+			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Memory"), gpu.Memory)
 		}
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr := string(exitErr.Stderr)
-			if strings.Contains(string(output)+stderr, "No devices were found") {
-				fmt.Fprintln(w, "  NVIDIA GPU:\tHardware detected, but driver is not communicating with it.")
-				return
+
+		if gpu.Temperature != "" {
+			// Parse temperature to colorize it
+			tempStr := strings.TrimSuffix(gpu.Temperature, "°C")
+			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Temp"), colorizeTemp(tempStr))
+		}
+
+		if gpu.Utilization != "" {
+			// Parse utilization to colorize it
+			utilStr := strings.TrimSuffix(gpu.Utilization, "%")
+			if utilFloat, err := strconv.ParseFloat(utilStr, 64); err == nil {
+				fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Util"), colorizePercent(utilFloat))
+			} else {
+				fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Util"), gpu.Utilization)
 			}
 		}
-		fmt.Fprintf(w, "  NVIDIA GPU:\tError running nvidia-smi: %v\n", err)
-		return
-	}
 
-	// Step 3: Parse and display the status if everything is working.
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for i, line := range lines {
-		parts := strings.Split(line, ", ")
-		if len(parts) < 6 {
-			continue
+		if gpu.Driver != "" {
+			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Driver"), gpu.Driver)
 		}
-		gpuName, temp, power := parts[0], parts[1], parts[2]
-		memUsed, _ := strconv.ParseFloat(parts[3], 64)
-		memTotal, _ := strconv.ParseFloat(parts[4], 64)
-		util, _ := strconv.ParseFloat(parts[5], 64)
-
-		memPercent := 0.0
-		if memTotal > 0 {
-			memPercent = (memUsed / memTotal) * 100
-		}
-
-		fmt.Fprintf(w, "  %s %d:\t%s\n", labelColor.Sprint("GPU"), i, gpuName)
-		fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Temp"), colorizeTemp(temp))
-		fmt.Fprintf(w, "    - %s:\t%sW\n", labelColor.Sprint("Power"), power)
-		fmt.Fprintf(w, "    - %s:\t%s (%sMiB / %sMiB)\n", labelColor.Sprint("VRAM"), colorizePercent(memPercent), parts[3], parts[4])
-		fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Util"), colorizePercent(util))
 	}
 }
 

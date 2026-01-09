@@ -201,3 +201,68 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
 - Device auth client has mock server in `internal/nexus/deviceauth_mock.go` for testing without backend
   - Usage: `mock := nexus.StartMockDeviceAuthServer(3); defer mock.Close()`
   - Returns `authorization_pending` for N polls, then returns success
+
+## macOS Support
+
+Citadel CLI has full cross-platform support for both Linux and macOS (darwin). The codebase uses platform abstraction layers in `internal/platform/` to handle OS-specific operations.
+
+### Platform Abstractions
+
+**Core Platform Utilities** (`internal/platform/platform.go`):
+- `IsLinux()`, `IsDarwin()` - OS detection
+- `IsRoot()` - Privilege checking (works on both Linux and macOS)
+- `HomeDir(username)` - Cross-platform home directory resolution
+- `ConfigDir()` - Returns `/etc/citadel` on Linux, `/usr/local/etc/citadel` on macOS
+
+**Package Management** (`internal/platform/packages.go`):
+- `GetPackageManager()` - Returns apt (Linux) or brew (macOS) manager
+- `EnsureHomebrew()` - Installs Homebrew if not present on macOS
+
+**User Management** (`internal/platform/users.go`):
+- `GetUserManager()` - Returns Linux (useradd/usermod) or Darwin (dscl) manager
+- Handles user and group creation across platforms
+
+**Docker Management** (`internal/platform/docker.go`):
+- `GetDockerManager()` - Returns Docker Engine (Linux) or Docker Desktop (macOS) manager
+- Handles installation, startup, and permissions appropriately per platform
+
+**GPU Detection** (`internal/platform/gpu.go`):
+- `GetGPUDetector()` - Returns NVIDIA (Linux) or Metal (macOS) detector
+- Linux: Uses `nvidia-smi` and `lspci` for NVIDIA GPU detection
+- macOS: Uses `system_profiler SPDisplaysDataType` for Metal-compatible GPU detection
+
+### Platform-Specific Behavior
+
+**Linux**:
+- Uses apt package manager for dependencies
+- Installs Docker Engine via official script
+- Configures NVIDIA Container Toolkit for GPU support
+- Uses systemctl for service management
+- Creates system users with useradd/usermod
+
+**macOS**:
+- Uses Homebrew for package management (auto-installs if missing)
+- Installs Docker Desktop via `brew install --cask docker`
+- GPU support handled automatically by Docker Desktop (especially on Apple Silicon)
+- No NVIDIA Container Toolkit (not applicable)
+- Creates users with dscl (Directory Service command line)
+- Uses `/usr/local/etc/citadel` for global config instead of `/etc/citadel`
+
+### GPU Support Notes
+
+**Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
+
+**macOS**:
+- Docker Desktop on Apple Silicon (M1/M2/M3) has built-in GPU support via Metal framework
+- Intel Macs do not have GPU acceleration for containers
+- The `driver: nvidia` specifications in compose files are Linux-specific and ignored on macOS
+- Services will still run on macOS but without explicit GPU device reservations
+- Docker Desktop automatically handles GPU access for Metal-compatible workloads
+
+### Known Limitations on macOS
+
+- NVIDIA Container Toolkit steps are skipped (not applicable)
+- systemctl commands are not used (Docker Desktop manages the daemon)
+- User/group management uses different commands (dscl vs useradd)
+- Passwordless sudo configuration only applies to Linux
+- GPU device reservations in compose files are Linux-specific
