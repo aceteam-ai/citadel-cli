@@ -225,7 +225,7 @@ func DisplayDeviceCode(userCode, verificationURI string, expiresIn int) error {
 	// Check final status
 	m := finalModel.(DeviceCodeModel)
 	if m.status == "error" {
-		return fmt.Errorf(m.errorMessage)
+		return fmt.Errorf("%s", m.errorMessage)
 	}
 
 	return nil
