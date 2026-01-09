@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/aceboss/citadel-cli/internal/ui"
 )
 
@@ -20,6 +21,34 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to start device authorization: %w", err)
 	}
+
+	// Ask user if they want to open the browser
+	fmt.Println("\nTo complete authorization, you need to visit the following URL:")
+	fmt.Printf("  %s\n\n", resp.VerificationURI)
+
+	openBrowser, err := ui.AskSelect(
+		"Would you like to open this URL in your default browser?",
+		[]string{"Yes (recommended)", "No, I'll open it manually"},
+	)
+	if err != nil {
+		// If prompt fails, continue without opening browser
+		fmt.Println("Continuing without opening browser...")
+	} else if openBrowser == "Yes (recommended)" {
+		// Open browser with complete URL (includes code pre-filled)
+		urlToOpen := resp.VerificationURIComplete
+		if urlToOpen == "" {
+			// Fallback if complete URI not provided
+			urlToOpen = resp.VerificationURI
+		}
+
+		if err := platform.OpenURL(urlToOpen); err != nil {
+			fmt.Printf("⚠️  Could not open browser automatically: %v\n", err)
+			fmt.Println("Please open the URL manually.")
+		} else {
+			fmt.Println("✓ Browser opened successfully")
+		}
+	}
+	fmt.Println()
 
 	// Create UI program
 	model := ui.NewDeviceCodeModel(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
