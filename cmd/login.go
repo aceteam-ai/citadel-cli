@@ -34,6 +34,36 @@ nothing. Otherwise, it interactively prompts for an authentication method
 		case nexus.NetChoiceSkip:
 			fmt.Println("Login skipped.")
 			return
+		case nexus.NetChoiceDevice:
+			// Device authorization flow
+			token, err := runDeviceAuthFlow(authServiceURL)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				fmt.Fprintln(os.Stderr, "\nAlternative: Use 'citadel login' and select authkey option")
+				os.Exit(1)
+			}
+
+			// Get node name
+			suggestedHostname, err := os.Hostname()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not determine system hostname: %v\n", err)
+			}
+
+			nodeName, err := ui.AskInput("Enter a name for this node:", "e.g., my-laptop", suggestedHostname)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not determine node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Use the token as authkey
+			exec.Command("sudo", "tailscale", "logout").Run()
+			tsCmd = exec.Command("sudo", "tailscale", "up",
+				"--login-server="+nexusURL,
+				"--authkey="+token.Authkey,
+				"--hostname="+nodeName,
+				"--accept-routes",
+				"--accept-dns",
+			)
 		case nexus.NetChoiceBrowser:
 			fmt.Println("--- Starting browser authentication ---")
 			fmt.Println("Please follow the instructions in your browser to complete login.")
