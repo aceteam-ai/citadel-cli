@@ -115,21 +115,29 @@ install_citadel() {
   fi
 
   msg "Verifying checksum..."
-  # Use a subshell to change directory temporarily.
-  # The `--ignore-missing` flag is crucial because checksums.txt contains hashes for all architectures.
+  # checksums.txt contains hashes for all architectures, so we need to filter for our specific file.
   local os
   os=$(uname -s | tr '[:upper:]' '[:lower:]')
 
-  if [ "$os" = "darwin" ]; then
-    # On macOS, use shasum with -a 256 for SHA-256
-    (cd "$tmp_dir" && shasum -a 256 -c --ignore-missing "$checksum_file")
-  else
-    # On Linux, use sha256sum
-    (cd "$tmp_dir" && sha256sum -c --ignore-missing "$checksum_file")
+  # Extract just the checksum line for our binary
+  local expected_checksum
+  expected_checksum=$(grep "$binary_archive" "${tmp_dir}/${checksum_file}" | cut -d ' ' -f 1)
+
+  if [ -z "$expected_checksum" ]; then
+    err "Could not find checksum for ${binary_archive} in checksums file."
   fi
 
-  if [ $? -ne 0 ]; then
-      err "Checksum validation failed! The downloaded file may be corrupt or tampered with."
+  local actual_checksum
+  if [ "$os" = "darwin" ]; then
+    # On macOS, use shasum with -a 256 for SHA-256
+    actual_checksum=$(shasum -a 256 "${tmp_dir}/${binary_archive}" | cut -d ' ' -f 1)
+  else
+    # On Linux, use sha256sum
+    actual_checksum=$(sha256sum "${tmp_dir}/${binary_archive}" | cut -d ' ' -f 1)
+  fi
+
+  if [ "$expected_checksum" != "$actual_checksum" ]; then
+    err "Checksum validation failed! The downloaded file may be corrupt or tampered with."
   fi
   msg "Checksum valid."
 

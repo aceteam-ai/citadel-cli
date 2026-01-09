@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -86,16 +87,62 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 
 func waitForTailscaleDaemon() error {
 	fmt.Println("--- Waiting for Network daemon to be ready...")
+
+	// On macOS, we may need to start tailscaled manually
+	if platform.IsDarwin() {
+		if err := ensureTailscaledRunningMacOS(); err != nil {
+			fmt.Printf("   - Warning: Could not start tailscaled: %v\n", err)
+		}
+	}
+
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
-		cmd := exec.Command("tailscale", "version")
-		if err := cmd.Run(); err == nil {
+		cmd := exec.Command("tailscale", "status")
+		output, err := cmd.CombinedOutput()
+		outputStr := string(output)
+		// If we get output (even "Tailscale is stopped" or "Logged out"), the daemon is responding
+		// We only fail if the command itself errors without meaningful output
+		if err == nil || strings.Contains(outputStr, "Logged out") || strings.Contains(outputStr, "stopped") {
 			fmt.Println("✅ Daemon is ready.")
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for tailscaled daemon to start")
+}
+
+// ensureTailscaledRunningMacOS attempts to start the tailscaled daemon on macOS
+func ensureTailscaledRunningMacOS() error {
+	// Check if tailscaled is already responding
+	cmd := exec.Command("tailscale", "status")
+	if err := cmd.Run(); err == nil {
+		return nil // Already running
+	}
+
+	fmt.Println("   - Starting tailscaled on macOS...")
+
+	// Try brew services first (if installed via Homebrew)
+	brewCmd := exec.Command("brew", "services", "start", "tailscale")
+	if err := brewCmd.Run(); err == nil {
+		time.Sleep(1 * time.Second) // Give it a moment to start
+		return nil
+	}
+
+	// Fall back to launchctl for standalone installation
+	launchctlCmd := exec.Command("sudo", "launchctl", "load", "/Library/LaunchDaemons/com.tailscale.tailscaled.plist")
+	if err := launchctlCmd.Run(); err == nil {
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+
+	// Last resort: start tailscaled directly in the background
+	// Note: This is less ideal as it won't persist across reboots
+	tailscaledCmd := exec.Command("sudo", "tailscaled", "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock")
+	if err := tailscaledCmd.Start(); err != nil {
+		return fmt.Errorf("could not start tailscaled: %w", err)
+	}
+	time.Sleep(1 * time.Second)
+	return nil
 }
 
 func prepareCacheDirectories() error {
@@ -157,11 +204,19 @@ func checkTailscaleState() error {
 	cmd := exec.Command("tailscale", "status")
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
-	if err != nil && !strings.Contains(outputStr, "Logged out") {
+
+	// "Tailscale is stopped" or "Logged out" means daemon is responding but not connected
+	// This is fine if we have an authkey - we'll connect with it
+	isStopped := strings.Contains(outputStr, "stopped") || strings.Contains(outputStr, "Stopped")
+	isLoggedOut := strings.Contains(outputStr, "Logged out")
+
+	if err != nil && !isLoggedOut && !isStopped {
 		return fmt.Errorf("tailscale daemon is not responding: %s", outputStr)
 	}
+
+	// If no authkey provided, we need to already be connected
 	if authkey == "" {
-		if strings.Contains(outputStr, "Logged out") {
+		if isLoggedOut || isStopped {
 			return fmt.Errorf("you are not logged into Network. Please run 'citadel login' or use an --authkey")
 		}
 	}
