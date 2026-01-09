@@ -2,6 +2,7 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -59,8 +60,21 @@ func (b *BrewPackageManager) Name() string {
 	return "brew"
 }
 
+// brewCommand creates a command to run brew, handling the case where we're running as root via sudo.
+// Homebrew refuses to run as root, so we need to run as the original user.
+func brewCommand(args ...string) *exec.Cmd {
+	// If running as root via sudo, run brew as the original user
+	if os.Geteuid() == 0 {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			sudoArgs := append([]string{"-u", sudoUser, "brew"}, args...)
+			return exec.Command("sudo", sudoArgs...)
+		}
+	}
+	return exec.Command("brew", args...)
+}
+
 func (b *BrewPackageManager) Update() error {
-	cmd := exec.Command("brew", "update")
+	cmd := brewCommand("update")
 	cmd.Stdout = nil // Silent
 	cmd.Stderr = nil
 	return cmd.Run()
@@ -68,15 +82,14 @@ func (b *BrewPackageManager) Update() error {
 
 func (b *BrewPackageManager) Install(packages ...string) error {
 	// brew install will skip already-installed packages automatically
-	args := append([]string{"install"}, packages...)
-	cmd := exec.Command("brew", args...)
+	cmd := brewCommand(append([]string{"install"}, packages...)...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	return cmd.Run()
 }
 
 func (b *BrewPackageManager) IsInstalled(pkg string) bool {
-	cmd := exec.Command("brew", "list", pkg)
+	cmd := brewCommand("list", pkg)
 	return cmd.Run() == nil
 }
 
@@ -92,8 +105,19 @@ func EnsureHomebrew() error {
 	}
 
 	fmt.Println("Homebrew not found. Installing Homebrew...")
-	installScript := `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-	cmd := exec.Command("bash", "-c", installScript)
+	installScript := `NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
+
+	var cmd *exec.Cmd
+	// Homebrew installer also refuses to run as root, so run as original user
+	if os.Geteuid() == 0 {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			cmd = exec.Command("sudo", "-u", sudoUser, "bash", "-c", installScript)
+		} else {
+			return fmt.Errorf("cannot install Homebrew as root without SUDO_USER set")
+		}
+	} else {
+		cmd = exec.Command("bash", "-c", installScript)
+	}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
