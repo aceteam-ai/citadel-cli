@@ -31,6 +31,69 @@ If you need to build from the latest source code:
 ./build.sh
 ```
 
+## Releasing (For Maintainers)
+
+The `release.sh` script automates the complete release process:
+
+```bash
+# Interactive mode - prompts for version
+./release.sh
+
+# Non-interactive mode - specify version
+./release.sh v1.2.0
+```
+
+### Release Process
+
+The script will:
+
+1. **Validate Environment**
+   - Check for uncommitted changes (working directory must be clean)
+   - Verify GitHub CLI (`gh`) is installed
+   - Validate version format (must be `vX.Y.Z` or `vX.Y.Z-rc1`)
+
+2. **Create and Push Tag**
+   - Create a git tag with the specified version
+   - Push the tag to the remote repository
+
+3. **Build Artifacts**
+   - Run `build.sh` to create binaries for Linux (amd64 and arm64)
+   - Generate SHA256 checksums
+
+4. **Create GitHub Release**
+   - Generate release notes from commits since the last tag
+   - Upload binaries and checksums to GitHub Releases
+   - Display the release URL
+
+### Version Numbering
+
+Follow semantic versioning (semver):
+- **Major version** (`v2.0.0`): Breaking changes
+- **Minor version** (`v1.1.0`): New features, backwards compatible
+- **Patch version** (`v1.0.1`): Bug fixes, backwards compatible
+- **Pre-release** (`v1.1.0-rc1`): Release candidates for testing
+
+### Manual Release Process
+
+If you need to release manually without the script:
+
+```bash
+# 1. Create and push tag
+git tag v1.2.0
+git push origin v1.2.0
+
+# 2. Build artifacts
+./build.sh
+
+# 3. Create GitHub release
+gh release create v1.2.0 \
+  --title "v1.2.0" \
+  --notes "Release notes here" \
+  release/citadel_v1.2.0_linux_amd64.tar.gz \
+  release/citadel_v1.2.0_linux_arm64.tar.gz \
+  release/checksums.txt
+```
+
 ## Command Reference
 
 ### Node Setup & Provisioning
