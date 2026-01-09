@@ -530,11 +530,13 @@ func setupUser() error {
 		fmt.Printf("     - User '%s' already exists.\n", originalUser)
 	}
 
-	// Ensure user is in docker group
-	fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
-	if !userMgr.IsUserInGroup(originalUser, "docker") {
-		if err := userMgr.AddUserToGroup(originalUser, "docker"); err != nil {
-			return fmt.Errorf("failed to add user to docker group: %w", err)
+	// Ensure user is in docker group (Linux only - Docker Desktop on macOS doesn't use a docker group)
+	if platform.IsLinux() {
+		fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
+		if !userMgr.IsUserInGroup(originalUser, "docker") {
+			if err := userMgr.AddUserToGroup(originalUser, "docker"); err != nil {
+				return fmt.Errorf("failed to add user to docker group: %w", err)
+			}
 		}
 	}
 
