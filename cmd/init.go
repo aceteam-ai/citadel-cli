@@ -135,33 +135,13 @@ interactively or with flags for automation.`,
 
 		if choice == nexus.NetChoiceDevice {
 			// Device authorization flow
-			fmt.Println("\n--- Starting device authorization flow ---")
-
-			client := nexus.NewDeviceAuthClient(authServiceURL)
-
-			// Start the flow and get device code
-			resp, err := client.StartFlow()
+			token, err := runDeviceAuthFlow(authServiceURL)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to start device authorization: %v\n", err)
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
 				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
 				os.Exit(1)
 			}
-
-			// Display device code to user
-			fmt.Println()
-			ui.DisplayDeviceCode(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
-			fmt.Println()
-
-			// Poll for token
-			fmt.Println("⏳ Polling for authorization...")
-			token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Device authorization failed: %v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Println("✅ Authorization successful! Received authentication key.")
 
 			// Use the token as an authkey for the rest of the flow
 			upArgs = []string{"up", "--authkey", token.Authkey}

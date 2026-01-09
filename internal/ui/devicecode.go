@@ -173,6 +173,12 @@ func centerText(text string, width int) string {
 	return strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)
 }
 
+// NewDeviceCodeProgram creates a new tea.Program for device code display
+// This allows external callers to send status updates via UpdateStatus
+func NewDeviceCodeProgram(model DeviceCodeModel) *tea.Program {
+	return tea.NewProgram(model)
+}
+
 // DisplayDeviceCode shows the device code and waits for authorization
 // This is a helper function that can be called from command code
 func DisplayDeviceCode(userCode, verificationURI string, expiresIn int) error {
