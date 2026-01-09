@@ -32,6 +32,17 @@ var initCmd = &cobra.Command{
 	Long: `RUN WITH SUDO. This command installs all necessary dependencies, generates a
 configuration based on your input, and brings the node online. It can be run
 interactively or with flags for automation.`,
+	Example: `  # Interactive setup (recommended for first-time setup)
+  sudo citadel init
+
+  # Automated setup with specific service
+  sudo citadel init --service vllm --node-name gpu-server-1
+
+  # Setup with pre-generated authkey (for CI/CD)
+  sudo citadel init --authkey <your-key> --service ollama
+
+  # Setup without running tests
+  sudo citadel init --test=false`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
 			fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")

@@ -16,8 +16,9 @@ import (
 
 // nodesCmd represents the nodes command
 var nodesCmd = &cobra.Command{
-	Use:   "nodes",
-	Short: "List all compute nodes in your AceTeam fabric",
+	Use:     "nodes",
+	Aliases: []string{"ls", "list"},
+	Short:   "List all compute nodes in your AceTeam fabric",
 	Long: `Connects to the Nexus control plane and retrieves a list of all
 registered compute nodes, showing their status, IP address, and last-seen time.`,
 	Run: func(cmd *cobra.Command, args []string) {

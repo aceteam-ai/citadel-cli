@@ -22,6 +22,14 @@ var logsCmd = &cobra.Command{
 	Short: "Fetch the logs of a running service",
 	Long: `Streams the logs for a specified service defined in the citadel.yaml manifest.
 This command uses 'docker compose logs' to retrieve the output from the service's containers.`,
+	Example: `  # View last 100 lines of vllm logs
+  citadel logs vllm
+
+  # Follow ollama logs in real-time
+  citadel logs ollama -f
+
+  # View last 50 lines and follow
+  citadel logs llamacpp -f -t 50`,
 	Args: cobra.ExactArgs(1), // Requires exactly one argument: the service name
 	Run: func(cmd *cobra.Command, args []string) {
 		serviceName := args[0]

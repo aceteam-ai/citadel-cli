@@ -38,11 +38,17 @@ var (
 )
 
 var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Shows a comprehensive status of the Citadel node",
+	Use:     "status",
+	Aliases: []string{"st", "info"},
+	Short:   "Shows a comprehensive status of the Citadel node",
 	Long: `Provides a full health check and resource overview of the Citadel node.
 It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
 and the state of all managed services.`,
+	Example: `  # View full node status with colors
+  citadel status
+
+  # View status without colors (for scripts/logging)
+  citadel status --no-color`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Handle the --no-color flag
 		if noColor {
