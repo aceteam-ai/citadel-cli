@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/aceboss/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -29,7 +30,7 @@ type CitadelManifest struct {
 // locating the node's configuration directory. This ensures consistent behavior
 // regardless of the current working directory.
 func findAndReadManifest() (*CitadelManifest, string, error) {
-	globalConfigFile := "/etc/citadel/config.yaml"
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
 
 	// Step 1: Read the global config file to find the node's directory.
 	globalConfigData, err := os.ReadFile(globalConfigFile)
