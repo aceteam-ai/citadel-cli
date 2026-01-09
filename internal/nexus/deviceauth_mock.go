@@ -47,8 +47,8 @@ func (m *MockDeviceAuthServer) handleStart(w http.ResponseWriter, r *http.Reques
 	json.NewEncoder(w).Encode(DeviceCodeResponse{
 		DeviceCode:              "mock-device-code-12345",
 		UserCode:                "MOCK-1234",
-		VerificationURI:         "https://aceteam.ai/device",
-		VerificationURIComplete: "https://aceteam.ai/device?code=MOCK-1234",
+		VerificationURI:         m.server.URL + "/device",
+		VerificationURIComplete: m.server.URL + "/device?code=MOCK-1234",
 		ExpiresIn:               600,
 		Interval:                1, // Fast polling for tests
 	})

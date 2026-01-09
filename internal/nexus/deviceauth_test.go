@@ -30,6 +30,16 @@ func TestDeviceAuthStartFlow(t *testing.T) {
 	if resp.VerificationURI == "" {
 		t.Error("VerificationURI is empty")
 	}
+	// Verify verification URI uses mock server URL
+	expectedVerificationURI := mock.URL() + "/device"
+	if resp.VerificationURI != expectedVerificationURI {
+		t.Errorf("Expected VerificationURI '%s', got '%s'", expectedVerificationURI, resp.VerificationURI)
+	}
+	// Verify complete URI includes code parameter
+	expectedCompleteURI := mock.URL() + "/device?code=MOCK-1234"
+	if resp.VerificationURIComplete != expectedCompleteURI {
+		t.Errorf("Expected VerificationURIComplete '%s', got '%s'", expectedCompleteURI, resp.VerificationURIComplete)
+	}
 	if resp.ExpiresIn != 600 {
 		t.Errorf("Expected ExpiresIn 600, got %d", resp.ExpiresIn)
 	}
@@ -159,4 +169,45 @@ func TestMockServerResetPollCount(t *testing.T) {
 	if count2 != 0 {
 		t.Errorf("Expected poll count 0 after reset, got %d", count2)
 	}
+}
+
+func TestAuthServiceURLUsedForPolling(t *testing.T) {
+	// Start mock server to act as auth service
+	mock := StartMockDeviceAuthServer(2)
+	defer mock.Close()
+
+	// Create client with mock server URL as auth-service
+	client := NewDeviceAuthClient(mock.URL())
+
+	// Start flow - this should hit mock server's /start endpoint
+	resp, err := client.StartFlow()
+	if err != nil {
+		t.Fatalf("StartFlow failed: %v", err)
+	}
+
+	// Verify the verification URI matches the auth-service URL (mock server)
+	expectedVerificationURI := mock.URL() + "/device"
+	if resp.VerificationURI != expectedVerificationURI {
+		t.Errorf("VerificationURI should use auth-service URL. Expected '%s', got '%s'",
+			expectedVerificationURI, resp.VerificationURI)
+	}
+
+	// Poll for token - this should hit mock server's /token endpoint
+	token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+	if err != nil {
+		t.Fatalf("PollForToken failed: %v", err)
+	}
+
+	// Verify we got a token (proves polling worked against mock server)
+	if token.Authkey == "" {
+		t.Error("Expected authkey from polling, got empty string")
+	}
+
+	// Verify polling actually happened against the mock server
+	pollCount := mock.GetPollCount()
+	if pollCount < 2 {
+		t.Errorf("Expected at least 2 polls against mock server, got %d", pollCount)
+	}
+
+	t.Logf("✓ Verified: Both StartFlow and PollForToken use the auth-service URL (%s)", mock.URL())
 }

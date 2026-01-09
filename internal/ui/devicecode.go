@@ -74,14 +74,21 @@ func (m DeviceCodeModel) View() string {
 	// Top border
 	sb.WriteString("┌" + strings.Repeat("─", 63) + "┐\n")
 	sb.WriteString("│" + centerText("", 63) + "│\n")
-	sb.WriteString("│" + centerText("Authenticate with AceTeam Nexus", 63) + "│\n")
+	sb.WriteString("│" + centerText("Device Authorization", 63) + "│\n")
 	sb.WriteString("│" + centerText("", 63) + "│\n")
 	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
 
 	// Instructions
 	sb.WriteString("│   To complete setup, visit this URL in your browser:        │\n")
 	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
-	sb.WriteString("│     " + m.verificationURI + strings.Repeat(" ", 63-6-len(m.verificationURI)) + "│\n")
+	// Handle long URLs by calculating proper spacing
+	uriLine := "│     " + m.verificationURI
+	padding := 63 - len(m.verificationURI) - 6 // 6 = length of "│     " prefix
+	if padding < 0 {
+		padding = 0
+	}
+	uriLine += strings.Repeat(" ", padding) + "│\n"
+	sb.WriteString(uriLine)
 	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
 	sb.WriteString("│   and enter the following code:                              │\n")
 	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
@@ -104,15 +111,27 @@ func (m DeviceCodeModel) View() string {
 		seconds := int(remaining.Seconds()) % 60
 
 		statusText := fmt.Sprintf("⏳ Waiting for authorization... (%d:%02d remaining)", minutes, seconds)
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", 63-3-len(statusText)) + "│\n")
+		statusPadding := 63 - 3 - len(statusText)
+		if statusPadding < 0 {
+			statusPadding = 0
+		}
+		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
 	} else if m.status == "approved" {
 		statusText := color.GreenString("✅ Authorization successful!")
 		plainText := "✅ Authorization successful!"
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", 63-3-len(plainText)) + "│\n")
+		statusPadding := 63 - 3 - len(plainText)
+		if statusPadding < 0 {
+			statusPadding = 0
+		}
+		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
 	} else if m.status == "error" {
 		statusText := color.RedString("❌ " + m.errorMessage)
 		plainText := "❌ " + m.errorMessage
-		sb.WriteString("│   " + statusText + strings.Repeat(" ", 63-3-len(plainText)) + "│\n")
+		statusPadding := 63 - 3 - len(plainText)
+		if statusPadding < 0 {
+			statusPadding = 0
+		}
+		sb.WriteString("│   " + statusText + strings.Repeat(" ", statusPadding) + "│\n")
 	}
 
 	sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
@@ -122,9 +141,17 @@ func (m DeviceCodeModel) View() string {
 		sb.WriteString("│   Browser didn't open? Copy the URL above or visit:          │\n")
 		completeURI := m.verificationURI + "?code=" + m.userCode
 		if len(completeURI) <= 55 {
-			sb.WriteString("│   " + completeURI + strings.Repeat(" ", 63-3-len(completeURI)) + "│\n")
+			uriPadding := 63 - 3 - len(completeURI)
+			if uriPadding < 0 {
+				uriPadding = 0
+			}
+			sb.WriteString("│   " + completeURI + strings.Repeat(" ", uriPadding) + "│\n")
 		} else {
-			sb.WriteString("│   " + m.verificationURI + strings.Repeat(" ", 63-3-len(m.verificationURI)) + "│\n")
+			uriPadding := 63 - 3 - len(m.verificationURI)
+			if uriPadding < 0 {
+				uriPadding = 0
+			}
+			sb.WriteString("│   " + m.verificationURI + strings.Repeat(" ", uriPadding) + "│\n")
 		}
 		sb.WriteString("│" + strings.Repeat(" ", 63) + "│\n")
 	}

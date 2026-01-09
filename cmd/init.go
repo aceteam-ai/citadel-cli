@@ -143,7 +143,7 @@ interactively or with flags for automation.`,
 			resp, err := client.StartFlow()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Failed to start device authorization: %v\n", err)
-				fmt.Fprintln(os.Stderr, "\nAlternative: Generate an authkey at https://aceteam.ai/fabric")
+				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
 				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
 				os.Exit(1)
 			}
