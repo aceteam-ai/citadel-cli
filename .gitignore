@@ -1,2 +1,6 @@
 build
 release
+
+# direnv
+.direnv/
+.envrc.local
