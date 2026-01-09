@@ -50,6 +50,15 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ Running with root privileges.")
 
+		// Check if already connected to Tailscale and logout to start fresh
+		if nexus.IsTailscaleConnected() {
+			fmt.Println("--- 🔌 Existing Tailscale connection detected ---")
+			if err := nexus.TailscaleLogout(); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Warning: %v\n", err)
+				// Continue anyway - we'll try to connect with new credentials
+			}
+		}
+
 		choice, key, err := nexus.GetNetworkChoice(authkey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)

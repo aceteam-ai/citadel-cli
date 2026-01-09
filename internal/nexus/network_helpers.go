@@ -32,6 +32,32 @@ type tailscaleStatus struct {
 	} `json:"Self"`
 }
 
+// IsTailscaleConnected checks if Tailscale is currently connected to a network.
+func IsTailscaleConnected() bool {
+	statusCmd := exec.Command("tailscale", "status", "--json")
+	output, err := statusCmd.Output()
+	if err != nil {
+		return false
+	}
+
+	var status tailscaleStatus
+	if json.Unmarshal(output, &status) == nil && status.Self.Online {
+		return true
+	}
+	return false
+}
+
+// TailscaleLogout logs out of the current Tailscale network.
+func TailscaleLogout() error {
+	fmt.Println("   - Logging out of current Tailscale connection...")
+	logoutCmd := exec.Command("tailscale", "logout")
+	if output, err := logoutCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to logout from Tailscale: %s", string(output))
+	}
+	fmt.Println("   - ✅ Successfully logged out of Tailscale.")
+	return nil
+}
+
 // GetNetworkChoice checks the current network status and, if offline, prompts the
 // user to select a connection method. It accepts the authkey from a flag as a parameter.
 func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err error) {
