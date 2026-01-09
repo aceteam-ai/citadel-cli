@@ -147,7 +147,7 @@ interactively or with flags for automation.`,
 			upArgs = []string{"up", "--authkey", token.Authkey}
 		} else if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
-			loginCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", loginCmdStr)
+			loginCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", loginCmdStr)
 			loginCmd.Stdout = os.Stdout
 			loginCmd.Stderr = os.Stderr
 			loginCmd.Stdin = os.Stdin
@@ -167,7 +167,7 @@ interactively or with flags for automation.`,
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
 			testUpArgs := append(upArgs, "--services-only")
 			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
-			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCmdString)
+			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCmdString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -177,7 +177,7 @@ interactively or with flags for automation.`,
 
 			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
-			testCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", testCommandString)
+			testCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", testCommandString)
 			testCmd.Stdout = os.Stdout
 			testCmd.Stderr = os.Stderr
 			if err := testCmd.Run(); err != nil {
@@ -186,7 +186,7 @@ interactively or with flags for automation.`,
 		} else {
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
-			upCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", upCommandString)
+			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCommandString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -200,7 +200,7 @@ interactively or with flags for automation.`,
 		fmt.Println("Running a final status check now...")
 
 		statusCmdString := fmt.Sprintf("%s status", executablePath)
-		statusCmd := exec.Command("sudo", "-u", originalUser, "sh", "-c", statusCmdString)
+		statusCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", statusCmdString)
 		statusCmd.Stdout = os.Stdout
 		statusCmd.Stderr = os.Stderr
 		if err := statusCmd.Run(); err != nil {
@@ -326,17 +326,19 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	fmt.Println("--- 📝 Generating configuration files ---")
 	homeDir := "/home/" + user
 	configDir := filepath.Join(homeDir, "citadel-node")
+	cacheDir := filepath.Join(homeDir, "citadel-cache")
 	servicesDir := filepath.Join(configDir, "services")
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
-	// --- FIX: Clean up previous configuration to ensure a fresh start ---
-	// This prevents state from a previous 'init' run from causing conflicts.
-	// We ignore errors here because the directory might not exist on a fresh install.
+	// Clean up previous service configurations to ensure a fresh start.
 	os.RemoveAll(servicesDir)
 
 	// Create the main config directory and the services subdirectory.
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create services directory: %w", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	// Always write all available service definitions to allow for easy switching later.
@@ -358,7 +360,6 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	}
 
 	// Only add the selected service to the manifest if one was chosen.
-	// If serviceName is "none", manifest.Services will be an empty list.
 	if serviceName != "none" {
 		manifest.Services = []Service{
 			{
@@ -377,7 +378,7 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		return "", err
 	}
 
-	// ... (rest of the function for chown etc. remains the same)
+	// Get user and group IDs to set correct ownership
 	userInfo, err := exec.Command("id", "-u", user).Output()
 	if err != nil {
 		return "", err
@@ -390,14 +391,16 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 	}
 	gid, _ := strconv.Atoi(strings.TrimSpace(string(groupInfo)))
 
-	err = filepath.Walk(configDir, func(path string, info os.FileInfo, err error) error {
+	for _, dir := range []string{configDir, cacheDir} {
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			return syscall.Chown(path, uid, gid)
+		})
 		if err != nil {
-			return err
+			return "", fmt.Errorf("failed to chown directory %s: %w", dir, err)
 		}
-		return syscall.Chown(path, uid, gid)
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to chown config directory: %w", err)
 	}
 
 	fmt.Printf("✅ Configuration generated in %s\n", configDir)
@@ -540,7 +543,6 @@ func installNvidiaToolkit() error {
 }
 
 // configureNvidiaDocker ensures the Docker daemon is correctly configured to use the NVIDIA runtime.
-// This is now a separate, unconditional step to fix broken installs.
 func configureNvidiaDocker() error {
 	if !isCommandAvailable("nvidia-ctk") {
 		fmt.Println("     - 'nvidia-ctk' not found. Skipping Docker GPU configuration (expected on non-GPU systems).")
