@@ -95,6 +95,13 @@ func waitForTailscaleDaemon() error {
 		}
 	}
 
+	// On Windows, we may need to start the Tailscale service
+	if platform.IsWindows() {
+		if err := ensureTailscaledRunningWindows(); err != nil {
+			fmt.Printf("   - Warning: Could not start Tailscale service: %v\n", err)
+		}
+	}
+
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
 		cmd := exec.Command("tailscale", "status")
@@ -142,6 +149,40 @@ func ensureTailscaledRunningMacOS() error {
 		return fmt.Errorf("could not start tailscaled: %w", err)
 	}
 	time.Sleep(1 * time.Second)
+	return nil
+}
+
+// ensureTailscaledRunningWindows attempts to start the Tailscale service on Windows
+func ensureTailscaledRunningWindows() error {
+	// Check if Tailscale is already responding
+	cmd := exec.Command("tailscale", "status")
+	if err := cmd.Run(); err == nil {
+		return nil // Already running
+	}
+
+	fmt.Println("   - Starting Tailscale service on Windows...")
+
+	// Use net start to start the Tailscale service
+	// The service name is "Tailscale"
+	startCmd := exec.Command("net", "start", "Tailscale")
+	output, err := startCmd.CombinedOutput()
+	outputStr := string(output)
+
+	// Check if service is already running (not an error)
+	if strings.Contains(outputStr, "already") || strings.Contains(outputStr, "started") {
+		time.Sleep(1 * time.Second) // Give it a moment to be fully ready
+		return nil
+	}
+
+	if err != nil {
+		// Try sc start as an alternative
+		scCmd := exec.Command("sc", "start", "Tailscale")
+		if err := scCmd.Run(); err != nil {
+			return fmt.Errorf("could not start Tailscale service: %w", err)
+		}
+	}
+
+	time.Sleep(1 * time.Second) // Give it a moment to start
 	return nil
 }
 
