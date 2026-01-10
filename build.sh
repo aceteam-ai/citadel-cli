@@ -98,6 +98,14 @@ for OS in "${PLATFORMS[@]}"; do
     done
 done
 
+# --- Create Symlink for Current Platform ---
+CURRENT_BINARY="$BUILD_DIR/${CURRENT_OS}-${CURRENT_ARCH}/citadel"
+if [[ -f "$CURRENT_BINARY" ]]; then
+    ln -sf "$CURRENT_BINARY" citadel
+    echo ""
+    echo "--- Created symlink: citadel -> $CURRENT_BINARY ---"
+fi
+
 # --- Generate Checksums ---
 echo ""
 echo "--- Generating Checksums ---"
