@@ -13,7 +13,9 @@ import (
 // Service defines a single managed service.
 type Service struct {
 	Name        string `yaml:"name"`
-	ComposeFile string `yaml:"compose_file"`
+	Type        string `yaml:"type,omitempty"`        // "native" or "docker" (default: auto-detect)
+	ComposeFile string `yaml:"compose_file,omitempty"` // For docker services
+	Port        int    `yaml:"port,omitempty"`         // For native services
 }
 
 // CitadelManifest defines the structure of the citadel.yaml file.
