@@ -15,8 +15,8 @@ var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Authenticate this machine with the AceTeam Nexus",
 	Long: `Connects this machine to your AceTeam network. If already connected, it does
-nothing. Otherwise, it interactively prompts for an authentication method
-(authkey or browser). This command may require sudo to modify system network settings.`,
+nothing. Otherwise, it interactively prompts for an authentication method.
+This command may require sudo to modify system network settings.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// The login command doesn't have an authkey flag, so we pass an empty string.
 		choice, key, err := nexus.GetNetworkChoice("")
@@ -64,10 +64,6 @@ nothing. Otherwise, it interactively prompts for an authentication method
 				"--accept-routes",
 				"--accept-dns",
 			)
-		case nexus.NetChoiceBrowser:
-			fmt.Println("--- Starting browser authentication ---")
-			fmt.Println("Please follow the instructions in your browser to complete login.")
-			tsCmd = exec.Command("sudo", "tailscale", "login", "--login-server="+nexusURL)
 		case nexus.NetChoiceAuthkey:
 			fmt.Println("--- Authenticating with authkey ---")
 			fmt.Println("   - Using system hostname as node name.")
