@@ -181,14 +181,17 @@ interactively or with flags for automation.`,
 			)
 		}
 
-		// Tailscale is always needed for network connectivity
-		provisionSteps = append(provisionSteps,
-			struct {
-				name     string
-				checkCmd string
-				run      func() error
-			}{"Tailscale", "tailscale", installTailscale},
-		)
+		// Tailscale is only needed if we're connecting to the network
+		// If user chose to skip network, don't install Tailscale yet
+		if choice != nexus.NetChoiceSkip {
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Tailscale", "tailscale", installTailscale},
+			)
+		}
 
 		for _, step := range provisionSteps {
 			if initVerbose {
@@ -214,10 +217,12 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ System provisioning complete.")
 
-		// Clarify what was skipped for "none" service
+		// Clarify what was skipped
 		if selectedService == "none" {
 			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
-			fmt.Println("   This node will connect to the network without running containerized services.")
+		}
+		if choice == nexus.NetChoiceSkip {
+			fmt.Println("   ℹ️  Tailscale installation was skipped (network connection will be set up later).")
 		}
 
 		// --- 3. Final Handoff ---
@@ -815,14 +820,26 @@ func installTailscale() error {
 			fmt.Println("     - Installing Tailscale via winget...")
 		}
 		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
-		if initVerbose {
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-		} else {
-			cmd.Stdout = nil
-			cmd.Stderr = nil
+
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			outputStr := string(output)
+			// Check if it's already installed
+			if strings.Contains(outputStr, "already installed") ||
+			   strings.Contains(outputStr, "No applicable upgrade found") ||
+			   strings.Contains(outputStr, "No available upgrade found") {
+				if initVerbose {
+					fmt.Println("     ✅ Tailscale is already installed.")
+				}
+				return nil
+			}
+			// Show helpful error message
+			if initVerbose {
+				fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
+			}
+			return fmt.Errorf("winget install failed: %w", err)
 		}
-		return cmd.Run()
+		return nil
 	}
 
 	if initVerbose {
