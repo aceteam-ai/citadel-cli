@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/aceboss/citadel-cli/internal/ui"
 )
 
@@ -20,29 +19,8 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 		return nil, fmt.Errorf("failed to start device authorization: %w", err)
 	}
 
-	// Ask user if they want to open the browser
-	urlToOpen := resp.VerificationURIComplete
-	if urlToOpen == "" {
-		urlToOpen = resp.VerificationURI + "?code=" + resp.UserCode
-	}
-
-	browserOpened := false
-	openBrowser, err := ui.AskSelect(
-		"Open browser to complete authorization?",
-		[]string{"Yes, open browser", "No, I'll copy the link"},
-	)
-	if err == nil && openBrowser == "Yes, open browser" {
-		if err := platform.OpenURL(urlToOpen); err != nil {
-			fmt.Printf("⚠️  Could not open browser: %v\n", err)
-		} else {
-			browserOpened = true
-			fmt.Println("✓ Browser opened")
-		}
-	}
-	fmt.Println()
-
 	// Create UI program with device code display
-	// The UI shows clickable links and copy-to-clipboard options
+	// The UI shows clickable links and keyboard shortcuts for browser/clipboard
 	model := ui.NewDeviceCodeModel(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
 	program := ui.NewDeviceCodeProgram(model)
 
@@ -61,13 +39,8 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 		ui.UpdateStatus(program, "approved")
 	}()
 
-	// Show reminder if browser was opened
-	if browserOpened {
-		fmt.Println("Complete authorization in your browser")
-	}
-	fmt.Println()
-
 	// Run the UI (blocks until approved or error)
+	fmt.Println()
 	if _, err := program.Run(); err != nil {
 		return nil, fmt.Errorf("UI error: %w", err)
 	}
