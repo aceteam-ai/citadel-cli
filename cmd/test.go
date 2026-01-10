@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceboss/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -64,27 +65,29 @@ by 'init --test'.`,
 
 		// 3. Run the filtered jobs
 		client := nexus.NewClient(nexusURL)
+		status := ui.NewStatusLine()
 		jobFailed := false
+
+		fmt.Println()
+		status.Info(fmt.Sprintf("Running %d test(s) for %s", len(jobsToRun), testService))
+		fmt.Println()
+
 		for i, job := range jobsToRun {
-			fmt.Printf("[DEBUG] POST: Running test %d of %d (Type: %s)...\n", i+1, len(jobsToRun), job.Type)
-			fmt.Printf("   - 📥 Executing test job %s...\n", job.ID)
-			status, _ := executeJob(client, job)
-			if status != "SUCCESS" {
+			status.Step(i+1, len(jobsToRun), fmt.Sprintf("Running %s", job.Type))
+			result, _ := executeJob(client, job, status)
+			if result != "SUCCESS" {
 				jobFailed = true
-				fmt.Printf("[DEBUG] POST: Test '%s' FAILED.\n", job.ID)
-			} else {
-				fmt.Printf("[DEBUG] POST: Test '%s' PASSED.\n", job.ID)
 			}
 			time.Sleep(1 * time.Second)
 		}
 
 		// 4. Report final status
+		fmt.Println()
 		if jobFailed {
-			fmt.Println("\n--- ❌ Test failed. Please check the logs above for errors. ---")
+			status.Fail("Test failed - check logs above for errors")
 			os.Exit(1)
 		} else {
-			fmt.Println("\n✅ POST successful. Node is verified and ready.")
-			fmt.Println("You can run 'citadel status' to see more information about your node.")
+			status.Success("All tests passed - node is verified and ready")
 			os.Exit(0)
 		}
 	},

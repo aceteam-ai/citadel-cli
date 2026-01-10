@@ -87,15 +87,21 @@ interactively or with flags for automation.`,
 			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
 			os.Exit(1)
 		}
+		// Generate configuration with spinner
+		configSpinner := ui.NewSpinner(ui.StyleWorking)
+		configSpinner.Start("Generating configuration files")
 		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to generate configuration files: %v\n", err)
+			configSpinner.Fail("Failed to generate configuration files")
+			fmt.Fprintf(os.Stderr, "   Error: %v\n", err)
 			os.Exit(1)
 		}
 		if err := createGlobalConfig(configDir); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to create global system configuration: %v\n", err)
+			configSpinner.Fail("Failed to create global system configuration")
+			fmt.Fprintf(os.Stderr, "   Error: %v\n", err)
 			os.Exit(1)
 		}
+		configSpinner.Success("Configuration files generated")
 
 		// --- 2. Provision System ---
 		provisionSteps := []struct {
@@ -103,31 +109,50 @@ interactively or with flags for automation.`,
 			checkCmd string
 			run      func() error
 		}{
-			{"Package Lists", "", updateApt},
-			{"Core Dependencies", "", installCoreDeps},
-			{"Docker", "docker", installDocker},
-			{"System User", "", setupUser},
-			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
-			{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
-			{"Tailscale", "tailscale", installTailscale},
+			{"Updating package lists", "", updateApt},
+			{"Installing core dependencies", "", installCoreDeps},
+			{"Installing Docker", "docker", installDocker},
+			{"Configuring system user", "", setupUser},
+			{"Installing NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
+			{"Configuring Docker for NVIDIA", "", configureNvidiaDocker},
+			{"Installing Tailscale", "tailscale", installTailscale},
 		}
-		fmt.Println("--- 🚀 Starting Node Provisioning ---")
-		for _, step := range provisionSteps {
-			fmt.Printf("   - Processing step: %s\n", step.name)
+
+		status := ui.NewStatusLine()
+		fmt.Println()
+		status.Info("Starting node provisioning")
+		fmt.Println()
+
+		for i, step := range provisionSteps {
+			stepNum := i + 1
+			totalSteps := len(provisionSteps)
+
 			if step.checkCmd != "" && isCommandAvailable(step.checkCmd) {
-				fmt.Printf("     ✅ Prerequisite '%s' is already installed. Skipping.\n", step.checkCmd)
-			} else {
-				if err := step.run(); err != nil {
-					if step.name == "NVIDIA Container Toolkit" {
-						fmt.Fprintf(os.Stderr, "     ⚠️  WARNING: Could not install %s. This is expected on non-GPU systems. Error: %v\n", step.name, err)
-					} else {
-						fmt.Fprintf(os.Stderr, "     ❌ FAILED: %s\n        Error: %v\n", step.name, err)
-						os.Exit(1)
-					}
+				status.Step(stepNum, totalSteps, fmt.Sprintf("%s (already installed)", step.name))
+				continue
+			}
+
+			// Use spinner for long-running operations
+			spinner := ui.NewSpinner(ui.StyleWorking)
+			spinner.Start(fmt.Sprintf("[%d/%d] %s", stepNum, totalSteps, step.name))
+
+			err := step.run()
+
+			if err != nil {
+				if step.name == "Installing NVIDIA Container Toolkit" {
+					spinner.Warning(fmt.Sprintf("[%d/%d] %s (skipped - no GPU detected)", stepNum, totalSteps, step.name))
+				} else {
+					spinner.Fail(fmt.Sprintf("[%d/%d] %s", stepNum, totalSteps, step.name))
+					fmt.Fprintf(os.Stderr, "   Error: %v\n", err)
+					os.Exit(1)
 				}
+			} else {
+				spinner.Success(fmt.Sprintf("[%d/%d] %s", stepNum, totalSteps, step.name))
 			}
 		}
-		fmt.Println("✅ System provisioning complete.")
+
+		fmt.Println()
+		status.Success("System provisioning complete")
 
 		// --- 3. Final Handoff ---
 		// --- UPDATED: Uses the public constants from the nexus package ---

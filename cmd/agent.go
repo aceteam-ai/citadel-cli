@@ -10,6 +10,7 @@ import (
 
 	"github.com/aceboss/citadel-cli/internal/jobs"
 	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceboss/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -25,43 +26,59 @@ var agentCmd = &cobra.Command{
 and waits for remote jobs to execute on this node. It should typically be
 run as a background service.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		status := ui.NewStatusLine()
+
 		if cmd.CalledAs() == "agent" {
-			fmt.Println("--- 🚀 Starting Citadel Agent ---")
+			fmt.Println()
+			status.Info("Starting Citadel Agent")
 		}
+
 		client := nexus.NewClient(nexusURL)
-		fmt.Printf("   - Nexus endpoint: %s\n", nexusURL)
+		status.Thinking(fmt.Sprintf("Connecting to Nexus at %s", nexusURL))
+
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		fmt.Println("   - ✅ Agent started. Polling for jobs...")
+
+		status.Success("Agent started - polling for jobs")
+		fmt.Println()
+
 	agentLoop:
 		for {
 			select {
 			case <-ticker.C:
 				job, err := client.GetNextJob()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "   - ⚠️ Error fetching job: %v\n", err)
+					status.Warning(fmt.Sprintf("Error fetching job: %v", err))
 					continue
 				}
 				if job != nil {
-					fmt.Printf("   - 📥 Received job %s of type %s. Executing...\n", job.ID, job.Type)
-					executeJob(client, job)
+					executeJob(client, job, status)
 				}
 			case <-sigs:
 				break agentLoop
 			}
 		}
-		fmt.Println("\n--- 🛑 Shutting down agent ---")
-		fmt.Println("   - ✅ Agent stopped.")
+
+		fmt.Println()
+		status.Info("Shutting down agent")
+		status.Success("Agent stopped")
 	},
 }
 
 // executeJob is now a clean dispatcher. It finds the right handler and runs it.
-func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
+func executeJob(client *nexus.Client, job *nexus.Job, statusLine *ui.StatusLine) (string, error) {
 	var output []byte
 	var err error
-	var status string
+	var jobStatus string
+
+	// Show job received
+	statusLine.Working(fmt.Sprintf("Received job %s (%s)", job.ID[:8], job.Type))
+
+	// Execute with spinner
+	spinner := ui.NewSpinner(ui.StyleWorking)
+	spinner.Start(fmt.Sprintf("Executing %s", job.Type))
 
 	handler, ok := jobHandlers[job.Type]
 	if !ok {
@@ -72,28 +89,30 @@ func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	}
 
 	if err != nil {
-		status = "FAILURE"
+		jobStatus = "FAILURE"
 		errorMsg := fmt.Sprintf("Execution Error: %v", err)
 		// Combine the error and any command output for a full report
 		if len(output) > 0 {
 			errorMsg = fmt.Sprintf("%s\n---\n%s", errorMsg, string(output))
 		}
 		output = []byte(errorMsg)
-		fmt.Fprintf(os.Stderr, "     - [Job %s] ❌ Execution failed: %v\n", job.ID, err)
+		spinner.Fail(fmt.Sprintf("Job %s failed: %v", job.ID[:8], err))
 	} else {
-		status = "SUCCESS"
-		fmt.Printf("     - [Job %s] ✅ Execution successful.\n", job.ID)
+		jobStatus = "SUCCESS"
+		spinner.Success(fmt.Sprintf("Job %s completed", job.ID[:8]))
 	}
 
+	// Report status back to Nexus
 	update := nexus.JobStatusUpdate{
-		Status: status,
+		Status: jobStatus,
 		Output: string(output),
 	}
 
 	if reportErr := client.UpdateJobStatus(job.ID, update); reportErr != nil {
-		fmt.Fprintf(os.Stderr, "     - [Job %s] ⚠️ CRITICAL: Failed to report status back to Nexus: %v\n", job.ID, reportErr)
+		statusLine.Warning(fmt.Sprintf("Failed to report job %s status to Nexus: %v", job.ID[:8], reportErr))
 	}
-	return status, err
+
+	return jobStatus, err
 }
 
 func init() {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceboss/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -33,7 +34,6 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 		if err := waitForTailscaleDaemon(); err != nil {
 			return err
 		}
-		fmt.Println("--- Verifying network status...")
 		return checkTailscaleState()
 	},
 
@@ -62,19 +62,27 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			os.Exit(1)
 		}
 
-		fmt.Println("--- Launching services ---")
-		for _, service := range manifest.Services {
+		status := ui.NewStatusLine()
+		fmt.Println()
+		status.Working("Launching services")
+
+		for i, service := range manifest.Services {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, fullComposePath)
+
+			spinner := ui.NewSpinner(ui.StyleWorking)
+			spinner.Start(fmt.Sprintf("Starting %s", service.Name))
+
 			err := startService(service.Name, fullComposePath)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+				spinner.Fail(fmt.Sprintf("Failed to start %s", service.Name))
+				fmt.Fprintf(os.Stderr, "   Error: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("   ✅ Service %s is up.\n", service.Name)
+			spinner.Success(fmt.Sprintf("Service %s is running (%d/%d)", service.Name, i+1, len(manifest.Services)))
 		}
 
-		fmt.Println("\n🎉 Citadel Node is online and services are running.")
+		fmt.Println()
+		status.Success("Citadel Node is online")
 
 		if servicesOnly {
 			return // Exit before starting the agent
@@ -86,28 +94,31 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 }
 
 func waitForTailscaleDaemon() error {
-	fmt.Println("--- Waiting for Network daemon to be ready...")
+	spinner := ui.NewSpinner(ui.StyleThinking)
+	spinner.Start("Waiting for network daemon")
 
 	// On macOS, we may need to start tailscaled manually
 	if platform.IsDarwin() {
 		if err := ensureTailscaledRunningMacOS(); err != nil {
-			fmt.Printf("   - Warning: Could not start tailscaled: %v\n", err)
+			// Non-fatal, continue anyway
 		}
 	}
 
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
+		spinner.UpdateDetail(fmt.Sprintf("(%d/%d)", i+1, maxAttempts))
 		cmd := exec.Command("tailscale", "status")
 		output, err := cmd.CombinedOutput()
 		outputStr := string(output)
 		// If we get output (even "Tailscale is stopped" or "Logged out"), the daemon is responding
 		// We only fail if the command itself errors without meaningful output
 		if err == nil || strings.Contains(outputStr, "Logged out") || strings.Contains(outputStr, "stopped") {
-			fmt.Println("✅ Daemon is ready.")
+			spinner.Success("Network daemon ready")
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+	spinner.Fail("Network daemon timeout")
 	return fmt.Errorf("timed out waiting for tailscaled daemon to start")
 }
 
