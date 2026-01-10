@@ -356,8 +356,45 @@ func startService(serviceName, composeFilePath string) error {
 	if composeFilePath == "" {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
+
+	containerName := "citadel-" + serviceName
+
+	// Check if container already exists and its state
+	inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+	output, err := inspectCmd.Output()
+
+	if err == nil {
+		status := strings.TrimSpace(string(output))
+
+		if status == "running" {
+			// Container is already running - skip starting
+			fmt.Printf("   ✅ Container %s is already running.\n", containerName)
+			return nil
+		}
+
+		// Container exists but is stopped/exited/paused
+		fmt.Printf("   ⚠️  Container %s exists but is %s.\n", containerName, status)
+		fmt.Print("   Recreate container? (Y/n) ")
+		var response string
+		fmt.Scanln(&response)
+		response = strings.TrimSpace(strings.ToLower(response))
+
+		if response != "" && response != "y" && response != "yes" {
+			return fmt.Errorf("container %s exists but is not running - user chose not to recreate", containerName)
+		}
+
+		// User wants to recreate - use --force-recreate
+		composeCmd := exec.Command("docker", "compose", "-f", composeFilePath, "up", "-d", "--force-recreate")
+		output, err := composeCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("docker compose failed: %s", string(output))
+		}
+		return nil
+	}
+
+	// Container doesn't exist - start normally
 	composeCmd := exec.Command("docker", "compose", "-f", composeFilePath, "up", "-d")
-	output, err := composeCmd.CombinedOutput()
+	output, err = composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker compose failed: %s", string(output))
 	}
