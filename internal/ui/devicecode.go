@@ -199,7 +199,7 @@ func (m DeviceCodeModel) View() string {
 	// Keyboard shortcuts and browser hint
 	if m.status == "waiting" {
 		dimStyle := color.New(color.Faint)
-		shortcutsPlain := "Press 'b' to open browser  •  'c' to copy URL  •  'C' to copy code"
+		shortcutsPlain := "'b' browser  •  'c' copy URL  •  'C' copy code"
 		shortcutsStyled := dimStyle.Sprint(shortcutsPlain)
 		sb.WriteString(padLineColored(shortcutsStyled, shortcutsPlain, 2))
 

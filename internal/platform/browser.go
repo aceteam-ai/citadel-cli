@@ -14,7 +14,20 @@ func OpenURL(url string) error {
 
 	switch runtime.GOOS {
 	case "linux":
-		cmd = exec.Command("xdg-open", url)
+		// Try multiple browser openers in order of preference
+		if isCommandAvailable("xdg-open") {
+			cmd = exec.Command("xdg-open", url)
+		} else if isCommandAvailable("sensible-browser") {
+			cmd = exec.Command("sensible-browser", url)
+		} else if isCommandAvailable("firefox") {
+			cmd = exec.Command("firefox", url)
+		} else if isCommandAvailable("google-chrome") {
+			cmd = exec.Command("google-chrome", url)
+		} else if isCommandAvailable("chromium-browser") {
+			cmd = exec.Command("chromium-browser", url)
+		} else {
+			return fmt.Errorf("no browser found (install xdg-open or a browser)")
+		}
 	case "darwin":
 		cmd = exec.Command("open", url)
 	default:

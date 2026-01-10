@@ -39,9 +39,3 @@ func CopyToClipboard(text string) error {
 
 	return nil
 }
-
-// isCommandAvailable checks if a command is available in PATH
-func isCommandAvailable(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
