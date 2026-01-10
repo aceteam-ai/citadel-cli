@@ -54,3 +54,36 @@ func TestWindowsDockerManagerNoOps(t *testing.T) {
 		t.Errorf("WindowsDockerManager.ConfigureRuntime() error = %v, want nil", err)
 	}
 }
+
+func TestWindowsDockerManagerWSLDetection(t *testing.T) {
+	if !IsWindows() {
+		t.Skip("Skipping Windows-specific test")
+	}
+
+	dm := &WindowsDockerManager{}
+
+	// Test hasWSL2 - should not panic even if WSL not installed
+	hasWSL2 := dm.hasWSL2()
+	t.Logf("hasWSL2() = %v", hasWSL2)
+
+	// Test getWSLStatus - should return one of the valid status strings
+	status := dm.getWSLStatus()
+	t.Logf("getWSLStatus() = %s", status)
+
+	validStatuses := map[string]bool{
+		"wsl_not_installed": true,
+		"wsl_command_failed": true,
+		"wsl1_only":         true,
+		"wsl2_installed":    true,
+		"no_distributions":  true,
+	}
+
+	if !validStatuses[status] {
+		t.Errorf("getWSLStatus() returned unexpected status: %s", status)
+	}
+
+	// If hasWSL2 is true, status should be wsl2_installed
+	if hasWSL2 && status != "wsl2_installed" {
+		t.Errorf("hasWSL2() = true but getWSLStatus() = %s, want wsl2_installed", status)
+	}
+}

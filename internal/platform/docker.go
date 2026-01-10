@@ -198,9 +198,55 @@ func (w *WindowsDockerManager) Install() error {
 
 	// Check for WSL2 (required for Docker Desktop on Windows)
 	if !w.hasWSL2() {
+		status := w.getWSLStatus()
+
+		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "⚠️  WSL2 is required for Docker Desktop on Windows.")
-		fmt.Fprintln(os.Stderr, "Install WSL2 with: wsl --install")
-		fmt.Fprintln(os.Stderr, "Then restart your computer and run citadel init again.")
+		fmt.Fprintln(os.Stderr, "")
+
+		switch status {
+		case "wsl_not_installed":
+			fmt.Fprintln(os.Stderr, "WSL is not installed on this system.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "To install WSL2:")
+			fmt.Fprintln(os.Stderr, "  1. Open PowerShell or Command Prompt as Administrator")
+			fmt.Fprintln(os.Stderr, "  2. Run: wsl --install")
+			fmt.Fprintln(os.Stderr, "  3. Restart your computer")
+			fmt.Fprintln(os.Stderr, "  4. Run citadel init again")
+
+		case "wsl1_only":
+			fmt.Fprintln(os.Stderr, "WSL1 is installed, but Docker Desktop requires WSL2.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "To upgrade to WSL2:")
+			fmt.Fprintln(os.Stderr, "  1. Open PowerShell or Command Prompt as Administrator")
+			fmt.Fprintln(os.Stderr, "  2. Run: wsl --set-default-version 2")
+			fmt.Fprintln(os.Stderr, "  3. Convert existing distributions: wsl --set-version <distro-name> 2")
+			fmt.Fprintln(os.Stderr, "     (Replace <distro-name> with your distribution, e.g., Ubuntu)")
+			fmt.Fprintln(os.Stderr, "  4. Run citadel init again")
+
+		case "no_distributions":
+			fmt.Fprintln(os.Stderr, "WSL is installed but no distributions are installed.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "To install a WSL2 distribution:")
+			fmt.Fprintln(os.Stderr, "  1. Open PowerShell or Command Prompt as Administrator")
+			fmt.Fprintln(os.Stderr, "  2. Run: wsl --install -d Ubuntu")
+			fmt.Fprintln(os.Stderr, "  3. Restart your computer if prompted")
+			fmt.Fprintln(os.Stderr, "  4. Run citadel init again")
+
+		default:
+			fmt.Fprintln(os.Stderr, "Unable to detect WSL2.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "To install or enable WSL2:")
+			fmt.Fprintln(os.Stderr, "  1. Open PowerShell or Command Prompt as Administrator")
+			fmt.Fprintln(os.Stderr, "  2. Run: wsl --install")
+			fmt.Fprintln(os.Stderr, "  3. Restart your computer")
+			fmt.Fprintln(os.Stderr, "  4. Run citadel init again")
+		}
+
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "For more information, see: https://docs.microsoft.com/en-us/windows/wsl/install")
+		fmt.Fprintln(os.Stderr, "")
+
 		return fmt.Errorf("WSL2 not found - please install WSL2 first")
 	}
 
@@ -273,13 +319,92 @@ func (w *WindowsDockerManager) ConfigureRuntime() error {
 
 // hasWSL2 checks if WSL2 is installed on the Windows system
 func (w *WindowsDockerManager) hasWSL2() bool {
+	// First, check if wsl command exists
+	if _, err := exec.LookPath("wsl"); err != nil {
+		return false
+	}
+
+	// Try wsl --status (works on newer Windows versions)
 	cmd := exec.Command("wsl", "--status")
 	output, err := cmd.Output()
+	if err == nil {
+		outputStr := string(output)
+		// Check for WSL 2 indicators
+		if strings.Contains(outputStr, "WSL 2") ||
+		   strings.Contains(outputStr, "Default Version: 2") ||
+		   strings.Contains(outputStr, "version: 2") {
+			return true
+		}
+	}
+
+	// Fallback: Check if any WSL2 distributions are installed
+	cmd = exec.Command("wsl", "--list", "--verbose")
+	output, err = cmd.Output()
 	if err != nil {
 		return false
 	}
-	// Check if output contains "WSL 2" or "Default Version: 2"
+
 	outputStr := string(output)
-	return strings.Contains(outputStr, "WSL 2") || strings.Contains(outputStr, "Default Version: 2")
+	// Look for VERSION 2 in the output (wsl -l -v shows version column)
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		// Skip header line and empty lines
+		if strings.Contains(line, "NAME") || strings.TrimSpace(line) == "" {
+			continue
+		}
+		// Check if this line has a version 2 distribution
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field == "2" && i > 0 {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// getWSLStatus returns detailed WSL status information for better error messages
+func (w *WindowsDockerManager) getWSLStatus() string {
+	// Check if wsl command exists
+	if _, err := exec.LookPath("wsl"); err != nil {
+		return "wsl_not_installed"
+	}
+
+	// Check for WSL distributions
+	cmd := exec.Command("wsl", "--list", "--verbose")
+	output, err := cmd.Output()
+	if err != nil {
+		return "wsl_command_failed"
+	}
+
+	outputStr := string(output)
+	lines := strings.Split(outputStr, "\n")
+
+	hasWSL1 := false
+	hasWSL2 := false
+
+	for _, line := range lines {
+		if strings.Contains(line, "NAME") || strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field == "1" && i > 0 {
+				hasWSL1 = true
+			}
+			if field == "2" && i > 0 {
+				hasWSL2 = true
+			}
+		}
+	}
+
+	if hasWSL2 {
+		return "wsl2_installed"
+	}
+	if hasWSL1 {
+		return "wsl1_only"
+	}
+	return "no_distributions"
 }
 

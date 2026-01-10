@@ -164,6 +164,41 @@ cat .\release\checksums.txt
 
 ## Common Issues & Solutions
 
+### Issue: "WSL2 is required for Docker Desktop"
+
+**Problem:** Running `citadel init` shows an error that WSL2 is not found.
+
+**Solution:** The error message will tell you exactly what's wrong and how to fix it:
+
+1. **WSL not installed**:
+   ```powershell
+   # Run as Administrator
+   wsl --install
+   # Restart your computer
+   ```
+
+2. **WSL1 only (need to upgrade to WSL2)**:
+   ```powershell
+   # Run as Administrator
+   wsl --set-default-version 2
+   wsl --set-version Ubuntu 2  # Replace Ubuntu with your distro name
+   ```
+
+3. **No WSL distributions installed**:
+   ```powershell
+   # Run as Administrator
+   wsl --install -d Ubuntu
+   # Restart if prompted
+   ```
+
+4. **Check WSL version**:
+   ```powershell
+   wsl --list --verbose
+   # Should show VERSION 2 for at least one distribution
+   ```
+
+**Note:** After installing or upgrading WSL2, you may need to restart your computer before Docker Desktop can use it.
+
 ### Issue: "tar is not recognized"
 
 **Problem:** Cross-platform builds fail when creating .tar.gz packages.
