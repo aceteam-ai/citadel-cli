@@ -87,32 +87,28 @@ func (l *LinuxDockerManager) EnsureUserInDockerGroup(username string) error {
 
 func (l *LinuxDockerManager) ConfigureRuntime() error {
 	// This is for NVIDIA runtime configuration on Linux
-	// Check if nvidia-container-toolkit is needed
+	// Check if nvidia-container-toolkit is installed
+	if _, err := exec.LookPath("nvidia-ctk"); err != nil {
+		// NVIDIA Container Toolkit not installed, skip runtime configuration
+		return nil
+	}
+
+	// Check if nvidia-smi exists (indicates NVIDIA GPU present)
 	if _, err := exec.LookPath("nvidia-smi"); err != nil {
 		// No NVIDIA GPU, skip runtime configuration
 		return nil
 	}
 
-	fmt.Println("Configuring NVIDIA Container Toolkit...")
-
-	// Install nvidia-container-toolkit
-	// This is distribution-specific, but we'll use the official method
-	script := `
-		distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-		curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-		curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-			sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-			tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-		apt-get update
-		apt-get install -y nvidia-container-toolkit
-		nvidia-ctk runtime configure --runtime=docker
-		systemctl restart docker
-	`
+	// Configure the NVIDIA runtime for Docker
+	script := `nvidia-ctk runtime configure --runtime=docker --set-as-default 2>/dev/null && systemctl restart docker 2>/dev/null`
 
 	cmd := exec.Command("sh", "-c", script)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Warning: Failed to configure NVIDIA runtime. This is OK if you don't have an NVIDIA GPU.")
-		return nil // Don't fail on this
+		// Don't fail if configuration doesn't work - might already be configured
+		return nil
 	}
 
 	return nil

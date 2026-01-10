@@ -34,18 +34,68 @@ func (a *AptPackageManager) Name() string {
 }
 
 func (a *AptPackageManager) Update() error {
-	cmd := exec.Command("apt-get", "update")
-	cmd.Stdout = nil // Silent
-	cmd.Stderr = nil
-	return cmd.Run()
+	// Try up to 3 times with a 3-second delay between attempts
+	// This handles cases where apt lock files are held by another process
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("apt-get", "update", "-qq")
+		output, err := cmd.CombinedOutput()
+
+		if err == nil {
+			return nil
+		}
+
+		// Check if it's a lock error (exit status 100)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 100 {
+			if attempt < maxRetries {
+				fmt.Fprintf(os.Stderr, "     - apt is locked, waiting 3 seconds (attempt %d/%d)...\n", attempt, maxRetries)
+				exec.Command("sleep", "3").Run()
+				continue
+			}
+			return fmt.Errorf("apt-get update failed after %d attempts (lock held): %w\n%s", maxRetries, err, string(output))
+		}
+
+		// For other errors, return immediately with the full output
+		if len(output) > 0 {
+			return fmt.Errorf("apt-get update failed: %w\n%s", err, string(output))
+		}
+		return err
+	}
+	return fmt.Errorf("apt-get update failed after %d attempts", maxRetries)
 }
 
 func (a *AptPackageManager) Install(packages ...string) error {
-	args := append([]string{"install", "-y"}, packages...)
-	cmd := exec.Command("apt-get", args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
+	args := append([]string{"install", "-y", "-qq"}, packages...)
+
+	// Try up to 3 times with a 3-second delay between attempts
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cmd := exec.Command("apt-get", args...)
+		// Set DEBIAN_FRONTEND=noninteractive to avoid any prompts
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		output, err := cmd.CombinedOutput()
+
+		if err == nil {
+			return nil
+		}
+
+		// Check if it's a lock error (exit status 100)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 100 {
+			if attempt < maxRetries {
+				fmt.Fprintf(os.Stderr, "     - apt is locked, waiting 3 seconds (attempt %d/%d)...\n", attempt, maxRetries)
+				exec.Command("sleep", "3").Run()
+				continue
+			}
+			return fmt.Errorf("apt-get install failed after %d attempts (lock held): %w\n%s", maxRetries, err, string(output))
+		}
+
+		// For other errors, return immediately with the full output
+		if len(output) > 0 {
+			return fmt.Errorf("apt-get install failed: %w\n%s", err, string(output))
+		}
+		return err
+	}
+	return fmt.Errorf("apt-get install failed after %d attempts", maxRetries)
 }
 
 func (a *AptPackageManager) IsInstalled(pkg string) bool {
