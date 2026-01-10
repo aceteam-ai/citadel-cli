@@ -10,8 +10,9 @@ import (
 func TestReadManifest(t *testing.T) {
 	t.Run("ValidManifest", func(t *testing.T) {
 		content := `
-name: test-node-valid
-tags: [gpu, test]
+node:
+  name: test-node-valid
+  tags: [gpu, test]
 services:
   - name: test-service
     compose_file: docker-compose.test.yml
