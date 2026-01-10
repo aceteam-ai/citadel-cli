@@ -253,7 +253,7 @@ interactively or with flags for automation.`,
 			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
 		} else if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
-			loginCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", loginCmdStr)
+			loginCmd := runAsUser(originalUser, loginCmdStr)
 			loginCmd.Stdout = os.Stdout
 			loginCmd.Stderr = os.Stderr
 			loginCmd.Stdin = os.Stdin
@@ -273,7 +273,7 @@ interactively or with flags for automation.`,
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
 			testUpArgs := append(upArgs, "--services-only")
 			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
-			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCmdString)
+			upCmd := runAsUser(originalUser, upCmdString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -283,7 +283,7 @@ interactively or with flags for automation.`,
 
 			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
-			testCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", testCommandString)
+			testCmd := runAsUser(originalUser, testCommandString)
 			testCmd.Stdout = os.Stdout
 			testCmd.Stderr = os.Stderr
 			if err := testCmd.Run(); err != nil {
@@ -292,7 +292,7 @@ interactively or with flags for automation.`,
 		} else {
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
-			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCommandString)
+			upCmd := runAsUser(originalUser, upCommandString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -306,7 +306,7 @@ interactively or with flags for automation.`,
 		fmt.Println("Running a final status check now...")
 
 		statusCmdString := fmt.Sprintf("%s status", executablePath)
-		statusCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", statusCmdString)
+		statusCmd := runAsUser(originalUser, statusCmdString)
 		statusCmd.Stdout = os.Stdout
 		statusCmd.Stderr = os.Stderr
 		if err := statusCmd.Run(); err != nil {
@@ -569,6 +569,20 @@ func runCommand(name string, args ...string) error {
 		return fmt.Errorf("command '%s' failed: %s", cmd.String(), string(output))
 	}
 	return nil
+}
+
+// runAsUser executes a command as a specific user in a cross-platform way
+// On Linux/macOS: uses sudo -H -u <user> sh -c <command>
+// On Windows: runs directly (already running as Administrator)
+func runAsUser(user string, cmdString string) *exec.Cmd {
+	if platform.IsWindows() {
+		// On Windows, run directly with cmd.exe
+		// The user is already running as Administrator
+		// Use cmd /c to execute the command string (supports && syntax)
+		return exec.Command("cmd", "/c", cmdString)
+	}
+	// On Linux/macOS, use sudo to run as the original user
+	return exec.Command("sudo", "-H", "-u", user, "sh", "-c", cmdString)
 }
 
 func ensureCoreDependencies() error {
