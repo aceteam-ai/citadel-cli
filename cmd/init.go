@@ -141,17 +141,54 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
+		// Build provision steps based on selected service
+		// If service is "none", skip Docker-related steps
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
 			run      func() error
-		}{
-			{"Docker", "docker", installDocker},
-			{"System User", "", setupUser},
-			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
-			{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
-			{"Tailscale", "tailscale", installTailscale},
+		}{}
+
+		// Docker and related steps are only needed for containerized services
+		if selectedService != "none" {
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Docker", "docker", installDocker},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"System User", "", setupUser},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
+			)
 		}
+
+		// Tailscale is always needed for network connectivity
+		provisionSteps = append(provisionSteps,
+			struct {
+				name     string
+				checkCmd string
+				run      func() error
+			}{"Tailscale", "tailscale", installTailscale},
+		)
 
 		for _, step := range provisionSteps {
 			if initVerbose {
@@ -176,6 +213,12 @@ interactively or with flags for automation.`,
 			}
 		}
 		fmt.Println("✅ System provisioning complete.")
+
+		// Clarify what was skipped for "none" service
+		if selectedService == "none" {
+			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
+			fmt.Println("   This node will connect to the network without running containerized services.")
+		}
 
 		// --- 3. Final Handoff ---
 		// Only show Docker permissions warning if we actually added the user to the group
