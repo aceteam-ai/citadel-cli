@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceboss/citadel-cli/internal/services"
 	"github.com/aceboss/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -68,12 +69,24 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 
 		fmt.Println("--- Launching services ---")
 		for _, service := range manifest.Services {
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			fmt.Printf("🚀 Starting service: %s (%s)\n", service.Name, fullComposePath)
-			err := startService(service.Name, fullComposePath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
-				os.Exit(1)
+			// Determine service type (native vs docker)
+			serviceType := determineServiceType(service)
+
+			if serviceType == services.ServiceTypeNative {
+				fmt.Printf("🚀 Starting service: %s (native)\n", service.Name)
+				err := startNativeService(service.Name, configDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+					os.Exit(1)
+				}
+			} else {
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				fmt.Printf("🚀 Starting service: %s (docker: %s)\n", service.Name, fullComposePath)
+				err := startService(service.Name, fullComposePath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+					os.Exit(1)
+				}
 			}
 			fmt.Printf("   ✅ Service %s is up.\n", service.Name)
 		}
@@ -443,6 +456,59 @@ func startService(serviceName, composeFilePath string) error {
 	if err != nil {
 		return fmt.Errorf("docker compose failed: %s", string(output))
 	}
+	return nil
+}
+
+// determineServiceType decides whether to use native or docker for a service
+func determineServiceType(service Service) services.ServiceType {
+	// If explicitly set in manifest, use that
+	if service.Type == "native" {
+		return services.ServiceTypeNative
+	}
+	if service.Type == "docker" {
+		return services.ServiceTypeDocker
+	}
+
+	// Auto-detect: prefer native if available
+	if services.IsNativeAvailable(service.Name) {
+		return services.ServiceTypeNative
+	}
+
+	// Fall back to docker
+	return services.ServiceTypeDocker
+}
+
+// startNativeService starts a service using its native binary
+func startNativeService(serviceName, configDir string) error {
+	// Check if already running
+	if services.IsNativeServiceRunning(serviceName) {
+		fmt.Printf("   ✅ Service %s is already running.\n", serviceName)
+		return nil
+	}
+
+	// Get log directory
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("could not find home directory: %w", err)
+	}
+	logDir := filepath.Join(homeDir, "citadel-node", "logs")
+
+	// Start the service
+	process, err := services.StartNativeService(serviceName, logDir)
+	if err != nil {
+		return err
+	}
+
+	// Wait for service to be ready (max 30 seconds)
+	fmt.Printf("   ⏳ Waiting for %s to be ready...\n", serviceName)
+	if err := services.WaitForServiceReady(serviceName, 30*time.Second); err != nil {
+		// Try to stop the process if it failed to become ready
+		if process.Cmd.Process != nil {
+			process.Cmd.Process.Kill()
+		}
+		return err
+	}
+
 	return nil
 }
 
