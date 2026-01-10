@@ -251,17 +251,6 @@ interactively or with flags for automation.`,
 			// Device authorization was already completed at the start
 			// Use the stored token as an authkey for the rest of the flow
 			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
-		} else if choice == nexus.NetChoiceBrowser {
-			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
-			loginCmd := runAsUser(originalUser, loginCmdStr)
-			loginCmd.Stdout = os.Stdout
-			loginCmd.Stderr = os.Stderr
-			loginCmd.Stdin = os.Stdin
-			if err := loginCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Login command failed. Please try again.\n")
-				os.Exit(1)
-			}
-			upArgs = []string{"up"}
 		} else {
 			upArgs = []string{"up"}
 			if key != "" {

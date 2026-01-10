@@ -33,8 +33,6 @@ const (
 	NetChoiceDevice NetworkChoice = "device"
 	// NetChoiceAuthkey indicates the user will provide a pre-generated key.
 	NetChoiceAuthkey NetworkChoice = "authkey"
-	// NetChoiceBrowser indicates the user will log in via a web browser.
-	NetChoiceBrowser NetworkChoice = "browser"
 	// NetChoiceSkip indicates the user has chosen to skip network connection.
 	NetChoiceSkip NetworkChoice = "skip"
 	// NetChoiceVerified indicates the user is already online and authenticated.
@@ -100,7 +98,6 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 		[]string{
 			"Device authorization (Recommended)",
 			"Use a pre-generated authkey (For automation)",
-			"Log in with a browser (Legacy Headscale OAuth)",
 			"Skip network connection for now",
 		},
 	)
@@ -117,8 +114,6 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 			return "", "", err
 		}
 		return NetChoiceAuthkey, strings.TrimSpace(keyInput), nil
-	case strings.Contains(selection, "browser"):
-		return NetChoiceBrowser, "", nil
 	default:
 		return NetChoiceSkip, "", nil
 	}
