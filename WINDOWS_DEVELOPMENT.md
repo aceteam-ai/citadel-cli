@@ -40,6 +40,31 @@ See the [Installation](README.md#installation) section in the main README.
 
 The sections below are for developers who want to build Citadel CLI from source.
 
+### Quick Start for Developers ⚡
+
+**Get set up in under 5 minutes:**
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/setup-dev-windows.ps1 | iex
+```
+
+This automated script will:
+- ✅ Check for Go and Git (install via winget if missing)
+- ✅ Clone the repository
+- ✅ Download dependencies
+- ✅ Build the project
+- ✅ Run tests
+
+**Done!** Skip to [Development Workflow](#development-workflow) to start coding.
+
+See [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md) for more details.
+
+---
+
+### Manual Setup
+
+If you prefer to set up manually, follow the prerequisites below:
+
 ## Prerequisites
 
 ### Required Software

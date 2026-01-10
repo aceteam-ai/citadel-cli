@@ -75,7 +75,16 @@ If you need to build from the latest source code:
 
 #### Windows
 
-For Windows developers, use the PowerShell build script:
+**Quick Setup (Automated):**
+
+```powershell
+# One-command setup: installs Go/Git, clones repo, builds, tests
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/setup-dev-windows.ps1 | iex
+```
+
+See [**WINDOWS_QUICKSTART.md**](WINDOWS_QUICKSTART.md) for a 5-minute getting started guide.
+
+**Manual Build:**
 
 ```powershell
 # Build for Windows (native PowerShell)
