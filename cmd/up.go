@@ -85,6 +85,21 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 	},
 }
 
+// getTailscaleCLI returns the path to the tailscale CLI executable.
+// On Windows, we need to use the full path because the PATH might not be updated
+// in child processes (especially when launched via cmd /c from init).
+func getTailscaleCLI() string {
+	if platform.IsWindows() {
+		// Standard installation path for Tailscale on Windows
+		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
+		if _, err := os.Stat(fullPath); err == nil {
+			return fullPath
+		}
+		// Fall back to PATH if the standard location doesn't exist
+	}
+	return "tailscale"
+}
+
 func waitForTailscaleDaemon() error {
 	fmt.Println("--- Waiting for Network daemon to be ready...")
 
@@ -102,9 +117,10 @@ func waitForTailscaleDaemon() error {
 		}
 	}
 
+	tailscaleCLI := getTailscaleCLI()
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
-		cmd := exec.Command("tailscale", "status")
+		cmd := exec.Command(tailscaleCLI, "status")
 		output, err := cmd.CombinedOutput()
 		outputStr := string(output)
 		// If we get output (even "Tailscale is stopped" or "Logged out"), the daemon is responding
@@ -155,7 +171,8 @@ func ensureTailscaledRunningMacOS() error {
 // ensureTailscaledRunningWindows attempts to start the Tailscale service on Windows
 func ensureTailscaledRunningWindows() error {
 	// Check if Tailscale is already responding
-	cmd := exec.Command("tailscale", "status")
+	tailscaleCLI := getTailscaleCLI()
+	cmd := exec.Command(tailscaleCLI, "status")
 	if err := cmd.Run(); err == nil {
 		return nil // Already running
 	}
@@ -258,15 +275,37 @@ func prepareCacheDirectories() error {
 }
 
 func joinNetwork(hostname, serverURL, key string) error {
-	fmt.Printf("   - Bringing network up with sudo...\n")
-	exec.Command("sudo", "tailscale", "logout").Run()
-	tsCmd := exec.Command("sudo", "tailscale", "up",
-		"--login-server="+serverURL,
-		"--authkey="+key,
-		"--hostname="+hostname,
-		"--accept-routes",
-		"--accept-dns",
-	)
+	fmt.Printf("   - Bringing network up...\n")
+	tailscaleCLI := getTailscaleCLI()
+
+	// Logout first (ignore errors)
+	if platform.IsWindows() {
+		exec.Command(tailscaleCLI, "logout").Run()
+	} else {
+		exec.Command("sudo", tailscaleCLI, "logout").Run()
+	}
+
+	// Build the tailscale up command
+	var tsCmd *exec.Cmd
+	if platform.IsWindows() {
+		// On Windows, we're already running as Administrator
+		tsCmd = exec.Command(tailscaleCLI, "up",
+			"--login-server="+serverURL,
+			"--authkey="+key,
+			"--hostname="+hostname,
+			"--accept-routes",
+			"--accept-dns",
+		)
+	} else {
+		// On Linux/macOS, use sudo
+		tsCmd = exec.Command("sudo", tailscaleCLI, "up",
+			"--login-server="+serverURL,
+			"--authkey="+key,
+			"--hostname="+hostname,
+			"--accept-routes",
+			"--accept-dns",
+		)
+	}
 	output, err := tsCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Network up failed: %s", string(output))
@@ -278,7 +317,8 @@ func joinNetwork(hostname, serverURL, key string) error {
 }
 
 func checkTailscaleState() error {
-	cmd := exec.Command("tailscale", "status")
+	tailscaleCLI := getTailscaleCLI()
+	cmd := exec.Command(tailscaleCLI, "status")
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
 
