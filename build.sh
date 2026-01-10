@@ -2,8 +2,31 @@
 # build.sh
 # This script builds the Citadel CLI for common server architectures
 # and packages them for a formal release.
+#
+# Usage:
+#   ./build.sh          # Build for current platform only
+#   ./build.sh --all    # Build for all platforms (linux/darwin, amd64/arm64)
 
 set -e
+
+# --- Parse Arguments ---
+BUILD_ALL=false
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Build the Citadel CLI binary."
+    echo ""
+    echo "Options:"
+    echo "  --all       Build for all platforms (linux/darwin, amd64/arm64)"
+    echo "  --help, -h  Show this help message"
+    echo ""
+    echo "By default, builds only for the current platform."
+    exit 0
+fi
+
+if [[ "$1" == "--all" ]]; then
+    BUILD_ALL=true
+fi
 
 echo "--- Building and Packaging Citadel CLI..."
 
@@ -19,9 +42,37 @@ rm -rf "$BUILD_DIR" "$RELEASE_DIR"
 mkdir -p "$BUILD_DIR" "$RELEASE_DIR"
 echo "--- Cleaned old build and release directories ---"
 
+# --- Detect Current Platform ---
+CURRENT_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+CURRENT_ARCH=$(uname -m)
+
+# Normalize OS name
+case "$CURRENT_OS" in
+    linux) CURRENT_OS="linux" ;;
+    darwin) CURRENT_OS="darwin" ;;
+    *) echo "⚠️  Unknown OS: $CURRENT_OS, defaulting to linux"; CURRENT_OS="linux" ;;
+esac
+
+# Normalize architecture name
+case "$CURRENT_ARCH" in
+    x86_64|amd64) CURRENT_ARCH="amd64" ;;
+    aarch64|arm64) CURRENT_ARCH="arm64" ;;
+    *) echo "⚠️  Unknown architecture: $CURRENT_ARCH, defaulting to amd64"; CURRENT_ARCH="amd64" ;;
+esac
+
+# --- Determine Build Targets ---
+if [[ "$BUILD_ALL" == true ]]; then
+    echo "--- Building for all platforms (--all flag detected) ---"
+    PLATFORMS=("linux" "darwin")
+    ARCHS=("amd64" "arm64")
+else
+    echo "--- Building for current platform only: $CURRENT_OS/$CURRENT_ARCH ---"
+    echo "    (Use --all flag to build for all platforms)"
+    PLATFORMS=("$CURRENT_OS")
+    ARCHS=("$CURRENT_ARCH")
+fi
+
 # --- Build and Package Loop ---
-PLATFORMS=("linux" "darwin")
-ARCHS=("amd64" "arm64")
 
 for OS in "${PLATFORMS[@]}"; do
     for ARCH in "${ARCHS[@]}"; do

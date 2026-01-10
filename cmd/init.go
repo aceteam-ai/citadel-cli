@@ -20,10 +20,12 @@ import (
 )
 
 var (
-	authkey      string
-	initService  string
-	initNodeName string
-	initTest     bool
+	authkey               string
+	initService           string
+	initNodeName          string
+	initTest              bool
+	initVerbose           bool
+	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
 var initCmd = &cobra.Command{
@@ -40,6 +42,9 @@ interactively or with flags for automation.`,
 
   # Setup with pre-generated authkey (for CI/CD)
   sudo citadel init --authkey <your-key> --service ollama
+
+  # Setup with verbose output (for debugging)
+  sudo citadel init --verbose
 
   # Setup without running tests
   sudo citadel init --test=false`,
@@ -77,9 +82,16 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
-		if err := checkForRunningServices(selectedService); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
-			os.Exit(1)
+		if !initVerbose {
+			if err := checkForRunningServicesQuiet(selectedService); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := checkForRunningServices(selectedService); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		originalUser := platform.GetSudoUser()
@@ -98,28 +110,45 @@ interactively or with flags for automation.`,
 		}
 
 		// --- 2. Provision System ---
+		if !initVerbose {
+			fmt.Println("--- 🚀 Provisioning node...")
+		} else {
+			fmt.Println("--- 🚀 Starting Node Provisioning (verbose mode) ---")
+		}
+
+		// First ensure core dependencies are installed
+		if err := ensureCoreDependencies(); err != nil {
+			fmt.Fprintf(os.Stderr, "     ❌ FAILED: Core Dependencies\n        Error: %v\n", err)
+			os.Exit(1)
+		}
+
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
 			run      func() error
 		}{
-			{"Package Lists", "", updateApt},
-			{"Core Dependencies", "", installCoreDeps},
 			{"Docker", "docker", installDocker},
 			{"System User", "", setupUser},
 			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
 			{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
 			{"Tailscale", "tailscale", installTailscale},
 		}
-		fmt.Println("--- 🚀 Starting Node Provisioning ---")
+
 		for _, step := range provisionSteps {
-			fmt.Printf("   - Processing step: %s\n", step.name)
+			if initVerbose {
+				fmt.Printf("   - Processing step: %s\n", step.name)
+			}
+
 			if step.checkCmd != "" && isCommandAvailable(step.checkCmd) {
-				fmt.Printf("     ✅ Prerequisite '%s' is already installed. Skipping.\n", step.checkCmd)
+				if initVerbose {
+					fmt.Printf("     ✅ '%s' is already installed. Skipping.\n", step.checkCmd)
+				}
 			} else {
 				if err := step.run(); err != nil {
 					if step.name == "NVIDIA Container Toolkit" {
-						fmt.Fprintf(os.Stderr, "     ⚠️  WARNING: Could not install %s. This is expected on non-GPU systems. Error: %v\n", step.name, err)
+						if initVerbose {
+							fmt.Fprintf(os.Stderr, "     ⚠️  WARNING: Could not install %s. This is expected on non-GPU systems. Error: %v\n", step.name, err)
+						}
 					} else {
 						fmt.Fprintf(os.Stderr, "     ❌ FAILED: %s\n        Error: %v\n", step.name, err)
 						os.Exit(1)
@@ -130,8 +159,8 @@ interactively or with flags for automation.`,
 		fmt.Println("✅ System provisioning complete.")
 
 		// --- 3. Final Handoff ---
-		// --- UPDATED: Uses the public constants from the nexus package ---
-		if originalUser != "" && originalUser != "root" {
+		// Only show Docker permissions warning if we actually added the user to the group
+		if userAddedToDockerGroup && originalUser != "" && originalUser != "root" {
 			fmt.Println("\n⚠️  IMPORTANT: For Docker permissions to apply, you must log out and log back in,")
 			fmt.Printf("   or start a new login shell with: exec su -l %s\n", originalUser)
 		}
@@ -261,6 +290,49 @@ func getNodeName() (string, error) {
 	return ui.AskInput("Enter a name for this node:", "e.g., gpu-node-1", defaultName)
 }
 
+func checkForRunningServicesQuiet(serviceToStart string) error {
+	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		// Could not query Docker, skip check silently
+		return nil
+	}
+
+	var runningServices []DockerPsResult
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for decoder.More() {
+		var res DockerPsResult
+		if err := decoder.Decode(&res); err == nil {
+			if !strings.Contains(res.Name, serviceToStart) {
+				runningServices = append(runningServices, res)
+			}
+		}
+	}
+
+	// No conflicting services - continue silently
+	if len(runningServices) == 0 {
+		return nil
+	}
+
+	// Found conflicting services - show warning
+	fmt.Println("⚠️  Found other Citadel services running. It's recommended to run only one AI service at a time.")
+	fmt.Print("Stop these services before proceeding? (y/N) ")
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(strings.TrimSpace(response)) != "y" {
+		return nil
+	}
+
+	// Stop services quietly
+	for _, s := range runningServices {
+		stopCmd := exec.Command("docker", "stop", s.Name)
+		if err := stopCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️  Could not stop %s: %v\n", s.Name, err)
+		}
+	}
+	return nil
+}
+
 func checkForRunningServices(serviceToStart string) error {
 	fmt.Println("--- 🔍 Checking for existing services ---")
 	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
@@ -322,7 +394,10 @@ func checkForRunningServices(serviceToStart string) error {
 }
 
 func createGlobalConfig(nodeConfigDir string) error {
-	fmt.Println("--- Registering node configuration system-wide ---")
+	if initVerbose {
+		fmt.Println("--- Registering node configuration system-wide ---")
+	}
+
 	globalConfigDir := platform.ConfigDir()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
@@ -336,12 +411,17 @@ func createGlobalConfig(nodeConfigDir string) error {
 		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
 	}
 
-	fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
+	if initVerbose {
+		fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
+	}
 	return nil
 }
 
 func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
-	fmt.Println("--- 📝 Generating configuration files ---")
+	if initVerbose {
+		fmt.Println("--- 📝 Generating configuration files ---")
+	}
+
 	homeDir, err := platform.HomeDir(user)
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory for user %s: %w", user, err)
@@ -406,7 +486,11 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 		}
 	}
 
-	fmt.Printf("✅ Configuration generated in %s\n", configDir)
+	if initVerbose {
+		fmt.Printf("✅ Configuration generated in %s\n", configDir)
+	} else {
+		fmt.Printf("✅ Configuration generated at %s\n", configDir)
+	}
 	return configDir, nil
 }
 
@@ -428,8 +512,7 @@ func runCommand(name string, args ...string) error {
 	return nil
 }
 
-func updateApt() error {
-	fmt.Printf("     - Updating package manager (%s)...\n", platform.OS())
+func ensureCoreDependencies() error {
 	pm, err := platform.GetPackageManager()
 	if err != nil {
 		return err
@@ -442,28 +525,48 @@ func updateApt() error {
 		}
 	}
 
-	return pm.Update()
-}
-
-func installCoreDeps() error {
-	fmt.Println("     - Installing core dependencies...")
-	pm, err := platform.GetPackageManager()
-	if err != nil {
-		return err
-	}
-
-	// Dependencies vary by platform
+	// Check which packages are needed
 	var packages []string
+	var missingPackages []string
+
 	if platform.IsLinux() {
 		packages = []string{"sudo", "curl", "gpg", "ca-certificates"}
 	} else if platform.IsDarwin() {
 		packages = []string{"curl", "gpg"} // sudo is built-in on macOS
 	}
 
-	return pm.Install(packages...)
+	for _, pkg := range packages {
+		if !pm.IsInstalled(pkg) {
+			missingPackages = append(missingPackages, pkg)
+		}
+	}
+
+	// Only run apt update and install if there are missing packages
+	if len(missingPackages) > 0 {
+		if initVerbose {
+			fmt.Printf("     - Updating package manager (%s)...\n", platform.OS())
+		}
+		if err := pm.Update(); err != nil {
+			return fmt.Errorf("failed to update package manager: %w", err)
+		}
+
+		if initVerbose {
+			fmt.Printf("     - Installing missing dependencies: %s\n", strings.Join(missingPackages, ", "))
+		}
+		return pm.Install(missingPackages...)
+	}
+
+	if initVerbose {
+		fmt.Println("     - Core dependencies already installed.")
+	}
+	return nil
 }
 
 func installDocker() error {
+	if initVerbose {
+		fmt.Println("     - Installing Docker...")
+	}
+
 	dockerMgr, err := platform.GetDockerManager()
 	if err != nil {
 		return err
@@ -482,29 +585,39 @@ func installDocker() error {
 	// Ensure user has Docker access
 	originalUser := platform.GetSudoUser()
 	if originalUser != "" && originalUser != "root" {
+		// Check if user is already in docker group before adding
+		if platform.IsLinux() {
+			userMgr, err := platform.GetUserManager()
+			if err == nil && !userMgr.IsUserInGroup(originalUser, "docker") {
+				userAddedToDockerGroup = true
+			}
+		}
+
 		if err := dockerMgr.EnsureUserInDockerGroup(originalUser); err != nil {
 			return fmt.Errorf("failed to configure Docker access for user: %w", err)
 		}
 	}
 
-	if platform.IsLinux() {
-		fmt.Println("\n✅ Docker installed and user configured successfully!")
-		fmt.Println("--------------------------------------------------------------------------")
-		fmt.Println("IMPORTANT: To apply the new group membership, you must do one of the following:")
-		fmt.Println("\n  Option 1 (Recommended): Log out of your system and log back in.")
-		fmt.Println("     OR")
-		fmt.Println("  Option 2 (Immediate, for this terminal only): Run the following command:")
-		fmt.Printf("     newgrp docker\n")
-		fmt.Println("\nAfter applying the changes, you can verify that Docker runs without sudo:")
-		fmt.Println("     docker run hello-world")
-		fmt.Println("--------------------------------------------------------------------------")
-	} else if platform.IsDarwin() {
-		fmt.Println("\n✅ Docker Desktop installed successfully!")
-		fmt.Println("--------------------------------------------------------------------------")
-		fmt.Println("IMPORTANT: Please ensure Docker Desktop is running before continuing.")
-		fmt.Println("You can verify Docker is running with:")
-		fmt.Println("     docker ps")
-		fmt.Println("--------------------------------------------------------------------------")
+	if initVerbose {
+		if platform.IsLinux() {
+			fmt.Println("\n✅ Docker installed and user configured successfully!")
+			fmt.Println("--------------------------------------------------------------------------")
+			fmt.Println("IMPORTANT: To apply the new group membership, you must do one of the following:")
+			fmt.Println("\n  Option 1 (Recommended): Log out of your system and log back in.")
+			fmt.Println("     OR")
+			fmt.Println("  Option 2 (Immediate, for this terminal only): Run the following command:")
+			fmt.Printf("     newgrp docker\n")
+			fmt.Println("\nAfter applying the changes, you can verify that Docker runs without sudo:")
+			fmt.Println("     docker run hello-world")
+			fmt.Println("--------------------------------------------------------------------------")
+		} else if platform.IsDarwin() {
+			fmt.Println("\n✅ Docker Desktop installed successfully!")
+			fmt.Println("--------------------------------------------------------------------------")
+			fmt.Println("IMPORTANT: Please ensure Docker Desktop is running before continuing.")
+			fmt.Println("You can verify Docker is running with:")
+			fmt.Println("     docker ps")
+			fmt.Println("--------------------------------------------------------------------------")
+		}
 	}
 
 	return nil
@@ -513,7 +626,9 @@ func installDocker() error {
 func setupUser() error {
 	originalUser := platform.GetSudoUser()
 	if originalUser == "" || originalUser == "root" {
-		fmt.Println("     - No regular user detected ($SUDO_USER is empty or root). Skipping user setup.")
+		if initVerbose {
+			fmt.Println("     - No regular user detected ($SUDO_USER is empty or root). Skipping user setup.")
+		}
 		return nil
 	}
 
@@ -524,7 +639,9 @@ func setupUser() error {
 
 	// Check if user exists, create if not
 	if !userMgr.UserExists(originalUser) {
-		fmt.Printf("     - User '%s' not found. Creating user...\n", originalUser)
+		if initVerbose {
+			fmt.Printf("     - User '%s' not found. Creating user...\n", originalUser)
+		}
 		if err := userMgr.CreateUser(originalUser, false); err != nil {
 			return fmt.Errorf("failed to create user %s: %w", originalUser, err)
 		}
@@ -532,26 +649,34 @@ func setupUser() error {
 		// On Linux, add to sudo group
 		if platform.IsLinux() {
 			if err := userMgr.AddUserToGroup(originalUser, "sudo"); err != nil {
-				fmt.Printf("     - Warning: Could not add user to sudo group: %v\n", err)
+				if initVerbose {
+					fmt.Printf("     - Warning: Could not add user to sudo group: %v\n", err)
+				}
 			}
 		}
-	} else {
+	} else if initVerbose {
 		fmt.Printf("     - User '%s' already exists.\n", originalUser)
 	}
 
 	// Ensure user is in docker group (Linux only - Docker Desktop on macOS doesn't use a docker group)
 	if platform.IsLinux() {
-		fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
+		if initVerbose {
+			fmt.Printf("     - Ensuring user '%s' is in the 'docker' group...\n", originalUser)
+		}
 		if !userMgr.IsUserInGroup(originalUser, "docker") {
 			if err := userMgr.AddUserToGroup(originalUser, "docker"); err != nil {
 				return fmt.Errorf("failed to add user to docker group: %w", err)
 			}
+			// Track that we added the user to docker group in this run
+			userAddedToDockerGroup = true
 		}
 	}
 
 	// Grant passwordless sudo (Linux only - on macOS, this is handled differently)
 	if platform.IsLinux() {
-		fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
+		if initVerbose {
+			fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
+		}
 		sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
 		err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
 		if err != nil {
@@ -565,20 +690,34 @@ func setupUser() error {
 func installNvidiaToolkit() error {
 	// NVIDIA Container Toolkit is Linux-only
 	if !platform.IsLinux() {
-		fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS).")
+		if initVerbose {
+			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS).")
+		}
 		return nil
 	}
 
-	fmt.Println("     - Running NVIDIA install script...")
-	script := `curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+	if initVerbose {
+		fmt.Println("     - Installing NVIDIA Container Toolkit...")
+	}
+
+	// Remove old keyring if it exists to avoid prompts, then install toolkit
+	script := `rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+  && curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
   && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
     tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null \
   && apt-get update -qq \
-  && apt-get install -y -qq nvidia-container-toolkit`
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit`
 	cmd := exec.Command("sh", "-c", script)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	if initVerbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	}
+
 	return cmd.Run()
 }
 
@@ -586,8 +725,14 @@ func installNvidiaToolkit() error {
 func configureNvidiaDocker() error {
 	// NVIDIA runtime configuration is Linux-only
 	if !platform.IsLinux() {
-		fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS).")
+		if initVerbose {
+			fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS).")
+		}
 		return nil
+	}
+
+	if initVerbose {
+		fmt.Println("     - Configuring Docker for NVIDIA runtime...")
 	}
 
 	dockerMgr, err := platform.GetDockerManager()
@@ -599,11 +744,21 @@ func configureNvidiaDocker() error {
 }
 
 func installTailscale() error {
-	fmt.Println("     - Running Tailscale install script...")
+	if initVerbose {
+		fmt.Println("     - Running Tailscale install script...")
+	}
+
 	script := "curl -fsSL https://tailscale.com/install.sh | sh"
 	cmd := exec.Command("sh", "-c", script)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	if initVerbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	}
+
 	return cmd.Run()
 }
 
@@ -618,4 +773,5 @@ func init() {
 	initCmd.Flags().StringVar(&initService, "service", "", "Service to configure (vllm, ollama, llamacpp, none)")
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
+	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
 }

@@ -16,10 +16,13 @@ Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It 
 
 ### Building
 ```bash
-# Build for Linux (amd64 and arm64) - creates binaries in ./build/
+# Build for current platform only (default) - creates binary in ./build/
 ./build.sh
 
-# Quick local build (current architecture only)
+# Build for all platforms (linux/darwin, amd64/arm64) - for releases
+./build.sh --all
+
+# Quick local build (current architecture only, no packaging)
 go build -o citadel .
 ```
 
@@ -103,17 +106,21 @@ Citadel uses Tailscale to create a secure mesh network:
 
 ### Provisioning Flow (`citadel init`)
 
+By default, `citadel init` runs with minimal output. Use `--verbose` flag to see detailed provisioning steps.
+
 1. **Network Choice**: Checks if already connected to Tailscale, prompts for authkey/browser/skip
 2. **Service Selection**: Interactive prompt or `--service` flag to choose inference engine
 3. **Node Naming**: Prompts for node name or uses `--node-name` flag
-4. **System Provisioning**: Sequential installation of dependencies:
-   - Updates apt packages
-   - Installs curl, wget, ca-certificates, gnupg, lsb-release
+4. **System Provisioning**: Smart installation of dependencies (skips already-installed packages):
+   - Installs core dependencies (curl, gpg, ca-certificates) only if missing
    - Installs Docker (using official Docker install script if needed)
-   - Creates `citadel` system user and adds to docker group
-   - Installs NVIDIA Container Toolkit (warns if fails on non-GPU systems)
+   - Configures user permissions for Docker access
+   - Installs NVIDIA Container Toolkit (silently skips on non-GPU systems)
    - Configures Docker daemon for NVIDIA runtime
    - Installs Tailscale
+
+   **Note**: Package manager operations now include retry logic for apt lock conflicts.
+
 5. **Config Generation**: Creates `~/citadel-node/` directory with:
    - `citadel.yaml` manifest
    - `services/*.yml` Docker Compose files
