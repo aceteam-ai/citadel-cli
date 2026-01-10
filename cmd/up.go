@@ -162,28 +162,64 @@ func ensureTailscaledRunningWindows() error {
 
 	fmt.Println("   - Starting Tailscale service on Windows...")
 
-	// Use net start to start the Tailscale service
-	// The service name is "Tailscale"
+	// Try multiple approaches to start Tailscale
+
+	// Approach 1: Try to start the Windows service
+	// Note: This requires Administrator privileges
 	startCmd := exec.Command("net", "start", "Tailscale")
 	output, err := startCmd.CombinedOutput()
 	outputStr := string(output)
 
-	// Check if service is already running (not an error)
-	if strings.Contains(outputStr, "already") || strings.Contains(outputStr, "started") {
-		time.Sleep(1 * time.Second) // Give it a moment to be fully ready
+	if err == nil {
+		fmt.Println("     ✓ Tailscale service started successfully")
+		time.Sleep(2 * time.Second)
 		return nil
 	}
 
-	if err != nil {
-		// Try sc start as an alternative
-		scCmd := exec.Command("sc", "start", "Tailscale")
-		if err := scCmd.Run(); err != nil {
-			return fmt.Errorf("could not start Tailscale service: %w", err)
+	// Check if service is already running
+	if strings.Contains(outputStr, "already") || strings.Contains(outputStr, "started") {
+		fmt.Println("     ✓ Tailscale service is already running")
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+
+	// If we get "Access is denied" or similar, we need elevation
+	if strings.Contains(outputStr, "Access") || strings.Contains(outputStr, "denied") {
+		fmt.Println("     ⚠️  Cannot start service without Administrator privileges")
+		fmt.Println("     ℹ️  Attempting to launch Tailscale application...")
+
+		// Approach 2: Try to launch the Tailscale GUI application
+		// This can work without elevation and will start the service
+		tailscaleExe := `C:\Program Files\Tailscale\tailscale-ipn.exe`
+		if _, err := os.Stat(tailscaleExe); err == nil {
+			appCmd := exec.Command(tailscaleExe)
+			if err := appCmd.Start(); err == nil {
+				fmt.Println("     ✓ Tailscale application launched")
+				time.Sleep(3 * time.Second) // Give it more time to start the service
+				return nil
+			}
+		}
+
+		// Approach 3: Check if Tailscale was installed via winget to the user's local path
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData != "" {
+			userTailscale := filepath.Join(localAppData, "Microsoft", "WinGet", "Packages", "Tailscale.Tailscale_Microsoft.Winget.Source_8wekyb3d8bbwe", "tailscale-ipn.exe")
+			if _, err := os.Stat(userTailscale); err == nil {
+				appCmd := exec.Command(userTailscale)
+				if err := appCmd.Start(); err == nil {
+					fmt.Println("     ✓ Tailscale application launched from user installation")
+					time.Sleep(3 * time.Second)
+					return nil
+				}
+			}
 		}
 	}
 
-	time.Sleep(1 * time.Second) // Give it a moment to start
-	return nil
+	// Log the actual error for debugging
+	fmt.Printf("     ⚠️  Could not start Tailscale service: %s\n", outputStr)
+
+	// Return the error but don't fail completely - the daemon check will retry
+	return fmt.Errorf("could not start Tailscale: %w (output: %s)", err, outputStr)
 }
 
 func prepareCacheDirectories() error {

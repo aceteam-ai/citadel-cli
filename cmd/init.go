@@ -836,6 +836,7 @@ func installTailscale() error {
 		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
 
 		output, err := cmd.CombinedOutput()
+		alreadyInstalled := false
 		if err != nil {
 			outputStr := string(output)
 			// Check if it's already installed
@@ -845,14 +846,48 @@ func installTailscale() error {
 				if initVerbose {
 					fmt.Println("     ✅ Tailscale is already installed.")
 				}
-				return nil
+				alreadyInstalled = true
+			} else {
+				// Show helpful error message
+				if initVerbose {
+					fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
+				}
+				return fmt.Errorf("winget install failed: %w", err)
 			}
-			// Show helpful error message
-			if initVerbose {
-				fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
-			}
-			return fmt.Errorf("winget install failed: %w", err)
 		}
+
+		// Start the Tailscale service now while we have Administrator privileges
+		// This ensures the service is running before we hand off to 'citadel up'
+		if initVerbose {
+			fmt.Println("     - Ensuring Tailscale service is started...")
+		}
+		startCmd := exec.Command("net", "start", "Tailscale")
+		startOutput, startErr := startCmd.CombinedOutput()
+		startOutputStr := string(startOutput)
+
+		if startErr == nil {
+			if initVerbose {
+				fmt.Println("     ✅ Tailscale service started successfully.")
+			}
+		} else if strings.Contains(startOutputStr, "already") || strings.Contains(startOutputStr, "started") {
+			if initVerbose {
+				fmt.Println("     ✅ Tailscale service is already running.")
+			}
+		} else if alreadyInstalled {
+			// If Tailscale was already installed but service won't start, it might be running already
+			// Check with tailscale status
+			statusCmd := exec.Command("tailscale", "status")
+			if statusCmd.Run() == nil {
+				if initVerbose {
+					fmt.Println("     ✅ Tailscale is responding to status checks.")
+				}
+			} else if initVerbose {
+				fmt.Printf("     ⚠️  Warning: Could not verify Tailscale service status: %s\n", startOutputStr)
+			}
+		} else if initVerbose {
+			fmt.Printf("     ⚠️  Warning: Could not start Tailscale service: %s\n", startOutputStr)
+		}
+
 		return nil
 	}
 
