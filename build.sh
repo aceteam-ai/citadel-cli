@@ -109,7 +109,12 @@ fi
 # --- Generate Checksums ---
 echo ""
 echo "--- Generating Checksums ---"
-(cd "$RELEASE_DIR" && sha256sum *.tar.gz > checksums.txt)
+# Use shasum on macOS, sha256sum on Linux
+if command -v sha256sum &> /dev/null; then
+    (cd "$RELEASE_DIR" && sha256sum *.tar.gz > checksums.txt)
+else
+    (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz > checksums.txt)
+fi
 
 echo "✅ Build and packaging complete."
 echo ""
