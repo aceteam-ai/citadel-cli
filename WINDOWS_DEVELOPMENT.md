@@ -2,6 +2,44 @@
 
 This guide helps Windows developers set up their environment to build and develop Citadel CLI.
 
+> **Note:** If you just want to **use** Citadel CLI (not develop it), see the simplified installation options in the [README](README.md).
+
+## Installation for End Users
+
+If you're looking to install Citadel CLI for use (not development), choose one of these options:
+
+### Option 1: One-Line Installer (Easiest)
+
+Open PowerShell and run:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.ps1 | iex
+```
+
+This automatically:
+- Downloads the latest release
+- Extracts and installs to `%LOCALAPPDATA%\Citadel`
+- Adds to your PATH
+- No admin rights required
+
+### Option 2: Windows Package Manager (Coming Soon)
+
+Once published to the Microsoft winget repository:
+
+```powershell
+winget install AceTeam.Citadel
+```
+
+### Option 3: Manual Download
+
+See the [Installation](README.md#installation) section in the main README.
+
+---
+
+## Development Setup
+
+The sections below are for developers who want to build Citadel CLI from source.
+
 ## Prerequisites
 
 ### Required Software

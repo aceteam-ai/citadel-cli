@@ -26,7 +26,27 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 
 #### Windows
 
-1.  Go to the [**Releases Page**](https://github.com/aceboss/citadel-cli/releases).
+**Option 1: One-Line Installer (Recommended)**
+
+Open PowerShell and run:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.ps1 | iex
+```
+
+This will automatically download, install, and add Citadel to your PATH.
+
+**Option 2: Windows Package Manager (winget)**
+
+Once published to winget (coming soon):
+
+```powershell
+winget install AceTeam.Citadel
+```
+
+**Option 3: Manual Installation**
+
+1.  Go to the [**Releases Page**](https://github.com/aceteam-ai/citadel-cli/releases).
 2.  Download the latest `.zip` archive for Windows (e.g., `citadel_vX.Y.Z_windows_amd64.zip`).
 3.  Extract the archive and place `citadel.exe` in your `PATH`.
 
