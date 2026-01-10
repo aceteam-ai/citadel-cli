@@ -326,42 +326,88 @@ func (w *WindowsDockerManager) hasWSL2() bool {
 
 	// Try wsl --status (works on newer Windows versions)
 	cmd := exec.Command("wsl", "--status")
-	output, err := cmd.Output()
-	if err == nil {
-		outputStr := string(output)
+	// Use CombinedOutput to capture both stdout and stderr
+	output, err := cmd.CombinedOutput()
+	if err == nil && len(output) > 0 {
+		outputStr := decodeWindowsOutput(output)
 		// Check for WSL 2 indicators
 		if strings.Contains(outputStr, "WSL 2") ||
 		   strings.Contains(outputStr, "Default Version: 2") ||
+		   strings.Contains(outputStr, "default version: 2") ||
 		   strings.Contains(outputStr, "version: 2") {
 			return true
 		}
 	}
 
-	// Fallback: Check if any WSL2 distributions are installed
+	// Method 2: Check if any WSL2 distributions are installed
 	cmd = exec.Command("wsl", "--list", "--verbose")
-	output, err = cmd.Output()
-	if err != nil {
-		return false
+	// Use CombinedOutput to capture both stdout and stderr
+	output, err = cmd.CombinedOutput()
+	// Don't fail if command returns error - wsl.exe sometimes returns non-zero even on success
+	if len(output) > 0 {
+		outputStr := decodeWindowsOutput(output)
+		// Look for VERSION 2 in the output (wsl -l -v shows version column)
+		lines := strings.Split(outputStr, "\n")
+		for _, line := range lines {
+			// Skip header line and empty lines
+			if strings.Contains(line, "NAME") || strings.TrimSpace(line) == "" {
+				continue
+			}
+			// Check if this line has a version 2 distribution
+			// Format is typically: NAME STATE VERSION
+			// Or with asterisk: * NAME Running 2
+			fields := strings.Fields(line)
+			for i, field := range fields {
+				if field == "2" && i > 0 {
+					return true
+				}
+			}
+		}
 	}
 
-	outputStr := string(output)
-	// Look for VERSION 2 in the output (wsl -l -v shows version column)
-	lines := strings.Split(outputStr, "\n")
-	for _, line := range lines {
-		// Skip header line and empty lines
-		if strings.Contains(line, "NAME") || strings.TrimSpace(line) == "" {
-			continue
-		}
-		// Check if this line has a version 2 distribution
-		fields := strings.Fields(line)
-		for i, field := range fields {
-			if field == "2" && i > 0 {
+	// Method 3: Try to run a simple WSL command to check if WSL2 is functional
+	cmd = exec.Command("wsl", "--exec", "echo", "test")
+	if err := cmd.Run(); err == nil {
+		// If we can execute WSL commands, check the version
+		cmd = exec.Command("wsl", "--list", "--quiet")
+		output, err = cmd.CombinedOutput()
+		if err == nil && len(output) > 0 {
+			// If we have distributions and can run commands, assume WSL2 is available
+			// (WSL1 is rare in modern Windows)
+			outputStr := decodeWindowsOutput(output)
+			if len(strings.TrimSpace(outputStr)) > 0 {
 				return true
 			}
 		}
 	}
 
 	return false
+}
+
+// decodeWindowsOutput handles UTF-16 encoding from wsl.exe
+func decodeWindowsOutput(data []byte) string {
+	// Windows wsl.exe often outputs in UTF-16 LE with BOM
+	// Try to detect and convert
+	if len(data) >= 2 {
+		// Check for UTF-16 LE BOM (0xFF 0xFE)
+		if data[0] == 0xFF && data[1] == 0xFE {
+			// Convert UTF-16 LE to UTF-8
+			u16 := make([]uint16, 0, len(data)/2)
+			for i := 2; i < len(data)-1; i += 2 {
+				u16 = append(u16, uint16(data[i])|uint16(data[i+1])<<8)
+			}
+			// Simple UTF-16 to UTF-8 conversion
+			result := make([]rune, 0, len(u16))
+			for _, v := range u16 {
+				if v != 0 {
+					result = append(result, rune(v))
+				}
+			}
+			return string(result)
+		}
+	}
+	// Fallback to UTF-8
+	return string(data)
 }
 
 // getWSLStatus returns detailed WSL status information for better error messages
@@ -373,12 +419,17 @@ func (w *WindowsDockerManager) getWSLStatus() string {
 
 	// Check for WSL distributions
 	cmd := exec.Command("wsl", "--list", "--verbose")
-	output, err := cmd.Output()
-	if err != nil {
+	output, err := cmd.CombinedOutput()
+	// Don't fail on error - check if we have output
+	if err != nil && len(output) == 0 {
 		return "wsl_command_failed"
 	}
 
-	outputStr := string(output)
+	outputStr := decodeWindowsOutput(output)
+	if len(strings.TrimSpace(outputStr)) == 0 {
+		return "no_distributions"
+	}
+
 	lines := strings.Split(outputStr, "\n")
 
 	hasWSL1 := false

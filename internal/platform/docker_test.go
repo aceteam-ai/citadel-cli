@@ -87,3 +87,30 @@ func TestWindowsDockerManagerWSLDetection(t *testing.T) {
 		t.Errorf("hasWSL2() = true but getWSLStatus() = %s, want wsl2_installed", status)
 	}
 }
+
+func TestDecodeWindowsOutput(t *testing.T) {
+	if !IsWindows() {
+		t.Skip("Skipping Windows-specific test")
+	}
+
+	// Test UTF-8 input (no conversion needed)
+	utf8Input := []byte("Hello World")
+	result := decodeWindowsOutput(utf8Input)
+	if result != "Hello World" {
+		t.Errorf("UTF-8 decode failed: got %q, want %q", result, "Hello World")
+	}
+
+	// Test UTF-16 LE with BOM
+	// "Hi" in UTF-16 LE with BOM: FF FE 48 00 69 00
+	utf16Input := []byte{0xFF, 0xFE, 0x48, 0x00, 0x69, 0x00}
+	result = decodeWindowsOutput(utf16Input)
+	if result != "Hi" {
+		t.Errorf("UTF-16 decode failed: got %q, want %q", result, "Hi")
+	}
+
+	// Test empty input
+	result = decodeWindowsOutput([]byte{})
+	if result != "" {
+		t.Errorf("Empty decode failed: got %q, want empty string", result)
+	}
+}
