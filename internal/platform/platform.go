@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -24,10 +25,18 @@ func IsDarwin() bool {
 	return runtime.GOOS == "darwin"
 }
 
+// IsWindows returns true if running on Windows
+func IsWindows() bool {
+	return runtime.GOOS == "windows"
+}
+
 // IsRoot checks if the current user has root/admin privileges
 func IsRoot() bool {
 	if IsLinux() || IsDarwin() {
 		return os.Geteuid() == 0
+	}
+	if IsWindows() {
+		return isWindowsAdmin()
 	}
 	return false
 }
@@ -61,7 +70,11 @@ func GetSudoUser() string {
 }
 
 // GetUID returns the UID for the given username
+// On Windows, this is not applicable and returns empty string
 func GetUID(username string) (string, error) {
+	if IsWindows() {
+		return "", nil // Windows uses SIDs, not UIDs
+	}
 	cmd := exec.Command("id", "-u", username)
 	output, err := cmd.Output()
 	if err != nil {
@@ -71,7 +84,11 @@ func GetUID(username string) (string, error) {
 }
 
 // GetGID returns the GID for the given username
+// On Windows, this is not applicable and returns empty string
 func GetGID(username string) (string, error) {
+	if IsWindows() {
+		return "", nil // Windows uses SIDs, not GIDs
+	}
 	cmd := exec.Command("id", "-g", username)
 	output, err := cmd.Output()
 	if err != nil {
@@ -81,7 +98,12 @@ func GetGID(username string) (string, error) {
 }
 
 // ChownR changes ownership of a file or directory recursively
+// On Windows, this is a no-op as Windows uses ACLs instead of Unix permissions
 func ChownR(path, owner string) error {
+	if IsWindows() {
+		return nil // Windows uses ACLs, not chown
+	}
+
 	uid, err := GetUID(owner)
 	if err != nil {
 		return err
@@ -101,8 +123,12 @@ func ConfigDir() string {
 	if IsLinux() {
 		return "/etc/citadel"
 	}
-	// On macOS, use /usr/local/etc for consistency with Homebrew conventions
-	return "/usr/local/etc/citadel"
+	if IsDarwin() {
+		// On macOS, use /usr/local/etc for consistency with Homebrew conventions
+		return "/usr/local/etc/citadel"
+	}
+	// Windows: Use ProgramData for system-wide config
+	return `C:\ProgramData\Citadel`
 }
 
 // DefaultNodeDir returns the default directory for node configuration
@@ -111,5 +137,5 @@ func DefaultNodeDir(username string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s/citadel-node", home), nil
+	return filepath.Join(home, "citadel-node"), nil
 }

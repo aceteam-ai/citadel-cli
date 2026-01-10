@@ -2,6 +2,7 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -30,6 +31,8 @@ func GetGPUDetector() (GPUDetector, error) {
 		return &LinuxGPUDetector{}, nil
 	case "darwin":
 		return &DarwinGPUDetector{}, nil
+	case "windows":
+		return &WindowsGPUDetector{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operating system: %s", OS())
 	}
@@ -240,3 +243,92 @@ func GetGPUMemoryMB() int {
 
 	return 0
 }
+
+// WindowsGPUDetector implements GPUDetector for Windows systems (NVIDIA)
+type WindowsGPUDetector struct{}
+
+func (w *WindowsGPUDetector) HasGPU() bool {
+	// Primary: Check for nvidia-smi.exe in standard location
+	nvidiaSmiPath := `C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`
+	if _, err := os.Stat(nvidiaSmiPath); err == nil {
+		cmd := exec.Command(nvidiaSmiPath)
+		return cmd.Run() == nil
+	}
+
+	// Fallback: Check PATH for nvidia-smi
+	if _, err := exec.LookPath("nvidia-smi"); err == nil {
+		cmd := exec.Command("nvidia-smi")
+		return cmd.Run() == nil
+	}
+
+	// Final fallback: Use WMI to detect NVIDIA GPU
+	return w.hasGPUViaWMI()
+}
+
+func (w *WindowsGPUDetector) GetGPUCount() int {
+	cmd := w.nvidiaSmiCommand("--query-gpu=name", "--format=csv,noheader")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	return len(lines)
+}
+
+func (w *WindowsGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
+	cmd := w.nvidiaSmiCommand(
+		"--query-gpu=name,memory.total,temperature.gpu,utilization.gpu,driver_version",
+		"--format=csv,noheader,nounits",
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to query NVIDIA GPUs: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	gpus := make([]GPUInfo, 0, len(lines))
+
+	for _, line := range lines {
+		parts := strings.Split(line, ",")
+		if len(parts) < 5 {
+			continue
+		}
+
+		gpu := GPUInfo{
+			Name:        strings.TrimSpace(parts[0]),
+			Memory:      strings.TrimSpace(parts[1]) + " MB",
+			Temperature: strings.TrimSpace(parts[2]) + "°C",
+			Utilization: strings.TrimSpace(parts[3]) + "%",
+			Driver:      strings.TrimSpace(parts[4]),
+		}
+		gpus = append(gpus, gpu)
+	}
+
+	return gpus, nil
+}
+
+// nvidiaSmiCommand creates an exec.Cmd for nvidia-smi with the given arguments
+// Tries standard Windows installation path first, then falls back to PATH
+func (w *WindowsGPUDetector) nvidiaSmiCommand(args ...string) *exec.Cmd {
+	// Try standard installation path first
+	nvidiaSmiPath := `C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`
+	if _, err := os.Stat(nvidiaSmiPath); err == nil {
+		return exec.Command(nvidiaSmiPath, args...)
+	}
+
+	// Fallback to PATH
+	return exec.Command("nvidia-smi", args...)
+}
+
+// hasGPUViaWMI uses WMI to check for NVIDIA GPUs as a fallback method
+func (w *WindowsGPUDetector) hasGPUViaWMI() bool {
+	cmd := exec.Command("wmic", "path", "win32_VideoController", "get", "name")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(output)), "nvidia")
+}
+

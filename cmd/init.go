@@ -50,7 +50,12 @@ interactively or with flags for automation.`,
   sudo citadel init --test=false`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
-			fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+			if platform.IsWindows() {
+				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run as Administrator.")
+				fmt.Fprintln(os.Stderr, "   Right-click Command Prompt or PowerShell and select 'Run as administrator'")
+			} else {
+				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+			}
 			os.Exit(1)
 		}
 		fmt.Println("✅ Running with root privileges.")
@@ -531,6 +536,18 @@ func ensureCoreDependencies() error {
 		}
 	}
 
+	// On Windows, check for winget availability
+	if platform.IsWindows() {
+		if _, err := exec.LookPath("winget"); err != nil {
+			return fmt.Errorf("winget not found - please upgrade to Windows 10 1809+ or Windows 11")
+		}
+		// curl is built-in on Windows 10 1803+, no additional packages needed
+		if initVerbose {
+			fmt.Println("     - Core dependencies already available on Windows.")
+		}
+		return nil
+	}
+
 	// Check which packages are needed
 	var packages []string
 	var missingPackages []string
@@ -678,7 +695,7 @@ func setupUser() error {
 		}
 	}
 
-	// Grant passwordless sudo (Linux only - on macOS, this is handled differently)
+	// Grant passwordless sudo (Linux only - on macOS/Windows, this is handled differently)
 	if platform.IsLinux() {
 		if initVerbose {
 			fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
@@ -697,7 +714,7 @@ func installNvidiaToolkit() error {
 	// NVIDIA Container Toolkit is Linux-only
 	if !platform.IsLinux() {
 		if initVerbose {
-			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS).")
+			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS/Windows).")
 		}
 		return nil
 	}
@@ -732,7 +749,7 @@ func configureNvidiaDocker() error {
 	// NVIDIA runtime configuration is Linux-only
 	if !platform.IsLinux() {
 		if initVerbose {
-			fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS).")
+			fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS/Windows).")
 		}
 		return nil
 	}
@@ -750,6 +767,21 @@ func configureNvidiaDocker() error {
 }
 
 func installTailscale() error {
+	if platform.IsWindows() {
+		if initVerbose {
+			fmt.Println("     - Installing Tailscale via winget...")
+		}
+		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+		if initVerbose {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+		} else {
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+		}
+		return cmd.Run()
+	}
+
 	if initVerbose {
 		fmt.Println("     - Running Tailscale install script...")
 	}

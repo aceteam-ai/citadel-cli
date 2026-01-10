@@ -28,11 +28,18 @@ func CopyToClipboard(text string) error {
 		} else {
 			return fmt.Errorf("no clipboard utility found (install xclip, xsel, or wl-copy)")
 		}
+	case "windows":
+		// Use PowerShell's Set-Clipboard cmdlet
+		cmd = exec.Command("powershell", "-command", "Set-Clipboard", "-Value", text)
 	default:
 		return fmt.Errorf("clipboard not supported on %s", runtime.GOOS)
 	}
 
-	cmd.Stdin = strings.NewReader(text)
+	// For Windows PowerShell, the text is passed as an argument, not via stdin
+	if runtime.GOOS != "windows" {
+		cmd.Stdin = strings.NewReader(text)
+	}
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to copy to clipboard: %w", err)
 	}

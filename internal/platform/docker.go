@@ -2,7 +2,10 @@ package platform
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
+	"time"
 )
 
 // DockerManager interface defines operations for Docker installation and management
@@ -21,6 +24,8 @@ func GetDockerManager() (DockerManager, error) {
 		return &LinuxDockerManager{}, nil
 	case "darwin":
 		return &DarwinDockerManager{}, nil
+	case "windows":
+		return &WindowsDockerManager{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operating system: %s", OS())
 	}
@@ -177,3 +182,104 @@ func (d *DarwinDockerManager) ConfigureRuntime() error {
 	// No additional configuration needed
 	return nil
 }
+
+// WindowsDockerManager implements DockerManager for Windows systems with Docker Desktop
+type WindowsDockerManager struct{}
+
+func (w *WindowsDockerManager) IsInstalled() bool {
+	_, err := exec.LookPath("docker")
+	return err == nil
+}
+
+func (w *WindowsDockerManager) Install() error {
+	if w.IsInstalled() {
+		return nil // Already installed
+	}
+
+	// Check for WSL2 (required for Docker Desktop on Windows)
+	if !w.hasWSL2() {
+		fmt.Fprintln(os.Stderr, "⚠️  WSL2 is required for Docker Desktop on Windows.")
+		fmt.Fprintln(os.Stderr, "Install WSL2 with: wsl --install")
+		fmt.Fprintln(os.Stderr, "Then restart your computer and run citadel init again.")
+		return fmt.Errorf("WSL2 not found - please install WSL2 first")
+	}
+
+	fmt.Println("Installing Docker Desktop for Windows...")
+	pm, err := GetPackageManager()
+	if err != nil {
+		return err
+	}
+
+	if err := pm.Install("Docker.DockerDesktop"); err != nil {
+		return fmt.Errorf("failed to install Docker Desktop: %w\n\nAlternatively, download Docker Desktop manually from: https://www.docker.com/products/docker-desktop", err)
+	}
+
+	fmt.Println("Docker Desktop installed successfully.")
+	fmt.Println("Please start Docker Desktop and ensure it's running before continuing.")
+
+	return nil
+}
+
+func (w *WindowsDockerManager) Start() error {
+	// Check if Docker Desktop is already running
+	cmd := exec.Command("docker", "info")
+	if err := cmd.Run(); err == nil {
+		fmt.Println("Docker Desktop is already running.")
+		return nil
+	}
+
+	// Start Docker Desktop
+	dockerPath := `C:\Program Files\Docker\Docker\Docker Desktop.exe`
+	if _, err := os.Stat(dockerPath); err != nil {
+		return fmt.Errorf("Docker Desktop executable not found at %s\nPlease install Docker Desktop first", dockerPath)
+	}
+
+	fmt.Println("Starting Docker Desktop...")
+	cmd = exec.Command(dockerPath)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start Docker Desktop: %w\nPlease start Docker Desktop manually", err)
+	}
+
+	fmt.Println("Docker Desktop is starting. This may take a minute...")
+	fmt.Println("Waiting for Docker to be ready...")
+
+	// Wait for Docker to be ready (up to 60 seconds)
+	for i := 0; i < 60; i++ {
+		time.Sleep(1 * time.Second)
+		cmd = exec.Command("docker", "info")
+		if err := cmd.Run(); err == nil {
+			fmt.Println("✅ Docker Desktop is ready!")
+			return nil
+		}
+	}
+
+	fmt.Println("⚠️  Docker Desktop is taking longer than expected to start.")
+	fmt.Println("Please wait for Docker Desktop to finish starting, then continue.")
+	return nil
+}
+
+func (w *WindowsDockerManager) EnsureUserInDockerGroup(username string) error {
+	// Docker Desktop on Windows doesn't require group membership
+	// Access is controlled by Docker Desktop via Windows ACLs
+	return nil
+}
+
+func (w *WindowsDockerManager) ConfigureRuntime() error {
+	// Docker Desktop on Windows handles runtime configuration automatically
+	// For NVIDIA GPUs, Docker Desktop uses WSL2 with CUDA support
+	// No manual configuration needed
+	return nil
+}
+
+// hasWSL2 checks if WSL2 is installed on the Windows system
+func (w *WindowsDockerManager) hasWSL2() bool {
+	cmd := exec.Command("wsl", "--status")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	// Check if output contains "WSL 2" or "Default Version: 2"
+	outputStr := string(output)
+	return strings.Contains(outputStr, "WSL 2") || strings.Contains(outputStr, "Default Version: 2")
+}
+

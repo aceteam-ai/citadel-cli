@@ -1,7 +1,9 @@
 package platform
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"os/exec"
 	"os/user"
 	"strconv"
@@ -25,6 +27,8 @@ func GetUserManager() (UserManager, error) {
 		return &LinuxUserManager{}, nil
 	case "darwin":
 		return &DarwinUserManager{}, nil
+	case "windows":
+		return &WindowsUserManager{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operating system: %s", OS())
 	}
@@ -232,3 +236,98 @@ func (d *DarwinUserManager) IsUserInGroup(username, groupname string) bool {
 
 	return strings.Contains(string(output), username)
 }
+
+// WindowsUserManager implements UserManager for Windows systems
+type WindowsUserManager struct{}
+
+func (w *WindowsUserManager) UserExists(username string) bool {
+	_, err := user.Lookup(username)
+	return err == nil
+}
+
+func (w *WindowsUserManager) CreateUser(username string, system bool) error {
+	if w.UserExists(username) {
+		return nil // Already exists
+	}
+
+	// Generate a random password for the user (Windows requires a password)
+	password, err := generateRandomPassword(16)
+	if err != nil {
+		return fmt.Errorf("failed to generate password: %w", err)
+	}
+
+	// Create user with net user command
+	cmd := exec.Command("net", "user", username, password, "/add")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create user %s: %w", username, err)
+	}
+
+	// For system users, set password to never expire
+	if system {
+		cmd = exec.Command("wmic", "useraccount", "where", fmt.Sprintf("name='%s'", username), "set", "passwordexpires=false")
+		_ = cmd.Run() // Ignore error - not critical
+	}
+
+	return nil
+}
+
+func (w *WindowsUserManager) GroupExists(groupname string) bool {
+	cmd := exec.Command("net", "localgroup", groupname)
+	return cmd.Run() == nil
+}
+
+func (w *WindowsUserManager) CreateGroup(groupname string, system bool) error {
+	if w.GroupExists(groupname) {
+		return nil // Already exists
+	}
+
+	cmd := exec.Command("net", "localgroup", groupname, "/add")
+	return cmd.Run()
+}
+
+func (w *WindowsUserManager) AddUserToGroup(username, groupname string) error {
+	cmd := exec.Command("net", "localgroup", groupname, username, "/add")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Check if error is because user is already a member
+		if strings.Contains(string(output), "already a member") || strings.Contains(string(output), "1378") {
+			return nil // User already in group, not an error
+		}
+		return fmt.Errorf("failed to add user to group: %w\n%s", err, string(output))
+	}
+	return nil
+}
+
+func (w *WindowsUserManager) IsUserInGroup(username, groupname string) bool {
+	cmd := exec.Command("net", "localgroup", groupname)
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	// Parse output to check if username appears in the group members list
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == username {
+			return true
+		}
+	}
+	return false
+}
+
+// generateRandomPassword generates a secure random password for Windows user creation
+func generateRandomPassword(length int) (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+	password := make([]byte, length)
+
+	for i := range password {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		password[i] = charset[num.Int64()]
+	}
+
+	return string(password), nil
+}
+
