@@ -1,6 +1,7 @@
 build
 release
 citadel
+citadel-cli
 
 # direnv
 .direnv/

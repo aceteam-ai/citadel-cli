@@ -1,17 +1,19 @@
 package platform
 
 import (
+	"os"
 	"runtime"
 	"testing"
 )
 
 func TestOpenURLValidation(t *testing.T) {
-	// Test that OpenURL doesn't panic with a valid URL
-	// We can't actually open a browser in tests, but we can verify
-	// the function exists and handles basic validation
+	// Skip if not in CI or test environment variable is set
+	// to avoid opening browsers during local testing
+	if os.Getenv("CI") == "" && os.Getenv("CITADEL_SKIP_BROWSER_TESTS") != "false" {
+		t.Skip("Skipping browser test to avoid opening URLs (set CITADEL_SKIP_BROWSER_TESTS=false to run)")
+	}
 
-	// This will try to open the URL but likely fail in CI
-	// We just verify it doesn't panic
+	// Test that OpenURL doesn't panic with a valid URL
 	defer func() {
 		if r := recover(); r != nil {
 			t.Errorf("OpenURL() panicked: %v", r)
@@ -23,10 +25,13 @@ func TestOpenURLValidation(t *testing.T) {
 }
 
 func TestOpenURLPlatformSpecific(t *testing.T) {
-	// Verify that each platform has a handler
-	// We can't actually test opening URLs in unit tests
-	// but we can verify the logic paths exist
+	// Skip if not in CI or test environment variable is set
+	// to avoid opening browsers during local testing
+	if os.Getenv("CI") == "" && os.Getenv("CITADEL_SKIP_BROWSER_TESTS") != "false" {
+		t.Skip("Skipping browser test to avoid opening URLs (set CITADEL_SKIP_BROWSER_TESTS=false to run)")
+	}
 
+	// Verify that each platform has a handler
 	switch runtime.GOOS {
 	case "linux", "darwin", "windows":
 		// These platforms are supported

@@ -1,15 +1,18 @@
 package platform
 
 import (
+	"os"
 	"runtime"
 	"testing"
 )
 
 func TestCopyToClipboardValidation(t *testing.T) {
-	// Test that CopyToClipboard doesn't panic with valid text
-	// We can't actually test clipboard in CI, but we can verify
-	// the function exists and handles basic validation
+	// Skip if not in CI to avoid modifying clipboard during local testing
+	if os.Getenv("CI") == "" && os.Getenv("CITADEL_SKIP_CLIPBOARD_TESTS") != "false" {
+		t.Skip("Skipping clipboard test to avoid modifying clipboard (set CITADEL_SKIP_CLIPBOARD_TESTS=false to run)")
+	}
 
+	// Test that CopyToClipboard doesn't panic with valid text
 	defer func() {
 		if r := recover(); r != nil {
 			t.Errorf("CopyToClipboard() panicked: %v", r)
@@ -21,8 +24,12 @@ func TestCopyToClipboardValidation(t *testing.T) {
 }
 
 func TestCopyToClipboardPlatformSpecific(t *testing.T) {
-	// Verify that each platform has a handler
+	// Skip if not in CI to avoid modifying clipboard during local testing
+	if os.Getenv("CI") == "" && os.Getenv("CITADEL_SKIP_CLIPBOARD_TESTS") != "false" {
+		t.Skip("Skipping clipboard test to avoid modifying clipboard (set CITADEL_SKIP_CLIPBOARD_TESTS=false to run)")
+	}
 
+	// Verify that each platform has a handler
 	switch runtime.GOOS {
 	case "linux", "darwin", "windows":
 		// These platforms are supported
