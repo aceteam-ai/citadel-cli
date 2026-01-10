@@ -204,7 +204,8 @@ func printGPUInfo(w *tabwriter.Writer) {
 }
 
 func printNetworkInfo(w *tabwriter.Writer) {
-	tsCmd := exec.Command("tailscale", "status", "--json")
+	tailscaleCLI := getTailscaleCLI()
+	tsCmd := exec.Command(tailscaleCLI, "status", "--json")
 	output, err := tsCmd.Output()
 	if err != nil {
 		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Tailscale daemon not responding)"))

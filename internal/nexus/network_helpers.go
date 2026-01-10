@@ -4,11 +4,26 @@ package nexus
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/aceboss/citadel-cli/internal/ui"
 )
+
+// getTailscaleCLI returns the path to the tailscale CLI executable.
+// On Windows, we use the full path because the PATH might not include
+// the Tailscale installation directory in all contexts.
+func getTailscaleCLI() string {
+	if runtime.GOOS == "windows" {
+		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
+		if _, err := os.Stat(fullPath); err == nil {
+			return fullPath
+		}
+	}
+	return "tailscale"
+}
 
 // NetworkChoice represents the user's selected method for network connection.
 type NetworkChoice string
@@ -34,7 +49,8 @@ type tailscaleStatus struct {
 
 // IsTailscaleConnected checks if Tailscale is currently connected to a network.
 func IsTailscaleConnected() bool {
-	statusCmd := exec.Command("tailscale", "status", "--json")
+	tailscaleCLI := getTailscaleCLI()
+	statusCmd := exec.Command(tailscaleCLI, "status", "--json")
 	output, err := statusCmd.Output()
 	if err != nil {
 		return false
@@ -49,8 +65,9 @@ func IsTailscaleConnected() bool {
 
 // TailscaleLogout logs out of the current Tailscale network.
 func TailscaleLogout() error {
+	tailscaleCLI := getTailscaleCLI()
 	fmt.Println("   - Logging out of current Tailscale connection...")
-	logoutCmd := exec.Command("tailscale", "logout")
+	logoutCmd := exec.Command(tailscaleCLI, "logout")
 	if output, err := logoutCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to logout from Tailscale: %s", string(output))
 	}
@@ -66,8 +83,9 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 		return NetChoiceAuthkey, authkey, nil
 	}
 
+	tailscaleCLI := getTailscaleCLI()
 	fmt.Println("--- Checking network status...")
-	statusCmd := exec.Command("tailscale", "status", "--json")
+	statusCmd := exec.Command(tailscaleCLI, "status", "--json")
 	output, _ := statusCmd.Output()
 
 	var status tailscaleStatus

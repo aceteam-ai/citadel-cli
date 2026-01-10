@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // PackageManager interface defines operations for system package management
@@ -21,6 +22,8 @@ func GetPackageManager() (PackageManager, error) {
 		return &AptPackageManager{}, nil
 	case "darwin":
 		return &BrewPackageManager{}, nil
+	case "windows":
+		return &WingetPackageManager{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported operating system: %s", OS())
 	}
@@ -178,3 +181,50 @@ func EnsureHomebrew() error {
 
 	return nil
 }
+
+// WingetPackageManager implements PackageManager for Windows Package Manager (winget)
+type WingetPackageManager struct{}
+
+func (w *WingetPackageManager) Name() string {
+	return "winget"
+}
+
+func (w *WingetPackageManager) Update() error {
+	// Update winget sources
+	cmd := exec.Command("winget", "source", "update")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	// Don't fail if update fails - winget can work without explicit updates
+	_ = cmd.Run()
+	return nil
+}
+
+func (w *WingetPackageManager) Install(packages ...string) error {
+	for _, pkg := range packages {
+		if w.IsInstalled(pkg) {
+			continue // Skip already installed packages
+		}
+
+		cmd := exec.Command("winget", "install", "--id", pkg, "--silent", "--accept-package-agreements", "--accept-source-agreements")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			// Check if error is because package is already installed
+			if strings.Contains(string(output), "already installed") {
+				continue
+			}
+			return fmt.Errorf("failed to install %s: %w\n%s", pkg, err, string(output))
+		}
+	}
+	return nil
+}
+
+func (w *WingetPackageManager) IsInstalled(pkg string) bool {
+	cmd := exec.Command("winget", "list", "--id", pkg, "--exact")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	// Check if the package ID appears in the output (case-insensitive)
+	return strings.Contains(strings.ToLower(string(output)), strings.ToLower(pkg))
+}
+

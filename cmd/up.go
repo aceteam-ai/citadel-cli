@@ -85,6 +85,21 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 	},
 }
 
+// getTailscaleCLI returns the path to the tailscale CLI executable.
+// On Windows, we need to use the full path because the PATH might not be updated
+// in child processes (especially when launched via cmd /c from init).
+func getTailscaleCLI() string {
+	if platform.IsWindows() {
+		// Standard installation path for Tailscale on Windows
+		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
+		if _, err := os.Stat(fullPath); err == nil {
+			return fullPath
+		}
+		// Fall back to PATH if the standard location doesn't exist
+	}
+	return "tailscale"
+}
+
 func waitForTailscaleDaemon() error {
 	fmt.Println("--- Waiting for Network daemon to be ready...")
 
@@ -95,9 +110,17 @@ func waitForTailscaleDaemon() error {
 		}
 	}
 
+	// On Windows, we may need to start the Tailscale service
+	if platform.IsWindows() {
+		if err := ensureTailscaledRunningWindows(); err != nil {
+			fmt.Printf("   - Warning: Could not start Tailscale service: %v\n", err)
+		}
+	}
+
+	tailscaleCLI := getTailscaleCLI()
 	maxAttempts := 10
 	for i := 0; i < maxAttempts; i++ {
-		cmd := exec.Command("tailscale", "status")
+		cmd := exec.Command(tailscaleCLI, "status")
 		output, err := cmd.CombinedOutput()
 		outputStr := string(output)
 		// If we get output (even "Tailscale is stopped" or "Logged out"), the daemon is responding
@@ -145,6 +168,77 @@ func ensureTailscaledRunningMacOS() error {
 	return nil
 }
 
+// ensureTailscaledRunningWindows attempts to start the Tailscale service on Windows
+func ensureTailscaledRunningWindows() error {
+	// Check if Tailscale is already responding
+	tailscaleCLI := getTailscaleCLI()
+	cmd := exec.Command(tailscaleCLI, "status")
+	if err := cmd.Run(); err == nil {
+		return nil // Already running
+	}
+
+	fmt.Println("   - Starting Tailscale service on Windows...")
+
+	// Try multiple approaches to start Tailscale
+
+	// Approach 1: Try to start the Windows service
+	// Note: This requires Administrator privileges
+	startCmd := exec.Command("net", "start", "Tailscale")
+	output, err := startCmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err == nil {
+		fmt.Println("     ✓ Tailscale service started successfully")
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
+	// Check if service is already running
+	if strings.Contains(outputStr, "already") || strings.Contains(outputStr, "started") {
+		fmt.Println("     ✓ Tailscale service is already running")
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+
+	// If we get "Access is denied" or similar, we need elevation
+	if strings.Contains(outputStr, "Access") || strings.Contains(outputStr, "denied") {
+		fmt.Println("     ⚠️  Cannot start service without Administrator privileges")
+		fmt.Println("     ℹ️  Attempting to launch Tailscale application...")
+
+		// Approach 2: Try to launch the Tailscale GUI application
+		// This can work without elevation and will start the service
+		tailscaleExe := `C:\Program Files\Tailscale\tailscale-ipn.exe`
+		if _, err := os.Stat(tailscaleExe); err == nil {
+			appCmd := exec.Command(tailscaleExe)
+			if err := appCmd.Start(); err == nil {
+				fmt.Println("     ✓ Tailscale application launched")
+				time.Sleep(3 * time.Second) // Give it more time to start the service
+				return nil
+			}
+		}
+
+		// Approach 3: Check if Tailscale was installed via winget to the user's local path
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData != "" {
+			userTailscale := filepath.Join(localAppData, "Microsoft", "WinGet", "Packages", "Tailscale.Tailscale_Microsoft.Winget.Source_8wekyb3d8bbwe", "tailscale-ipn.exe")
+			if _, err := os.Stat(userTailscale); err == nil {
+				appCmd := exec.Command(userTailscale)
+				if err := appCmd.Start(); err == nil {
+					fmt.Println("     ✓ Tailscale application launched from user installation")
+					time.Sleep(3 * time.Second)
+					return nil
+				}
+			}
+		}
+	}
+
+	// Log the actual error for debugging
+	fmt.Printf("     ⚠️  Could not start Tailscale service: %s\n", outputStr)
+
+	// Return the error but don't fail completely - the daemon check will retry
+	return fmt.Errorf("could not start Tailscale: %w (output: %s)", err, outputStr)
+}
+
 func prepareCacheDirectories() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -181,15 +275,37 @@ func prepareCacheDirectories() error {
 }
 
 func joinNetwork(hostname, serverURL, key string) error {
-	fmt.Printf("   - Bringing network up with sudo...\n")
-	exec.Command("sudo", "tailscale", "logout").Run()
-	tsCmd := exec.Command("sudo", "tailscale", "up",
-		"--login-server="+serverURL,
-		"--authkey="+key,
-		"--hostname="+hostname,
-		"--accept-routes",
-		"--accept-dns",
-	)
+	fmt.Printf("   - Bringing network up...\n")
+	tailscaleCLI := getTailscaleCLI()
+
+	// Logout first (ignore errors)
+	if platform.IsWindows() {
+		exec.Command(tailscaleCLI, "logout").Run()
+	} else {
+		exec.Command("sudo", tailscaleCLI, "logout").Run()
+	}
+
+	// Build the tailscale up command
+	var tsCmd *exec.Cmd
+	if platform.IsWindows() {
+		// On Windows, we're already running as Administrator
+		tsCmd = exec.Command(tailscaleCLI, "up",
+			"--login-server="+serverURL,
+			"--authkey="+key,
+			"--hostname="+hostname,
+			"--accept-routes",
+			"--accept-dns",
+		)
+	} else {
+		// On Linux/macOS, use sudo
+		tsCmd = exec.Command("sudo", tailscaleCLI, "up",
+			"--login-server="+serverURL,
+			"--authkey="+key,
+			"--hostname="+hostname,
+			"--accept-routes",
+			"--accept-dns",
+		)
+	}
 	output, err := tsCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Network up failed: %s", string(output))
@@ -201,7 +317,8 @@ func joinNetwork(hostname, serverURL, key string) error {
 }
 
 func checkTailscaleState() error {
-	cmd := exec.Command("tailscale", "status")
+	tailscaleCLI := getTailscaleCLI()
+	cmd := exec.Command(tailscaleCLI, "status")
 	output, err := cmd.CombinedOutput()
 	outputStr := string(output)
 

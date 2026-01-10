@@ -50,7 +50,12 @@ interactively or with flags for automation.`,
   sudo citadel init --test=false`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
-			fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+			if platform.IsWindows() {
+				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run as Administrator.")
+				fmt.Fprintln(os.Stderr, "   Right-click Command Prompt or PowerShell and select 'Run as administrator'")
+			} else {
+				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+			}
 			os.Exit(1)
 		}
 		fmt.Println("✅ Running with root privileges.")
@@ -136,16 +141,56 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
+		// Build provision steps based on selected service
+		// If service is "none", skip Docker-related steps
 		provisionSteps := []struct {
 			name     string
 			checkCmd string
 			run      func() error
-		}{
-			{"Docker", "docker", installDocker},
-			{"System User", "", setupUser},
-			{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
-			{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
-			{"Tailscale", "tailscale", installTailscale},
+		}{}
+
+		// Docker and related steps are only needed for containerized services
+		if selectedService != "none" {
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Docker", "docker", installDocker},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"System User", "", setupUser},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"NVIDIA Container Toolkit", "nvidia-ctk", installNvidiaToolkit},
+			)
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Configure Docker for NVIDIA", "", configureNvidiaDocker},
+			)
+		}
+
+		// Tailscale is only needed if we're connecting to the network
+		// If user chose to skip network, don't install Tailscale yet
+		if choice != nexus.NetChoiceSkip {
+			provisionSteps = append(provisionSteps,
+				struct {
+					name     string
+					checkCmd string
+					run      func() error
+				}{"Tailscale", "tailscale", installTailscale},
+			)
 		}
 
 		for _, step := range provisionSteps {
@@ -171,6 +216,14 @@ interactively or with flags for automation.`,
 			}
 		}
 		fmt.Println("✅ System provisioning complete.")
+
+		// Clarify what was skipped
+		if selectedService == "none" {
+			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
+		}
+		if choice == nexus.NetChoiceSkip {
+			fmt.Println("   ℹ️  Tailscale installation was skipped (network connection will be set up later).")
+		}
 
 		// --- 3. Final Handoff ---
 		// Only show Docker permissions warning if we actually added the user to the group
@@ -200,7 +253,7 @@ interactively or with flags for automation.`,
 			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
 		} else if choice == nexus.NetChoiceBrowser {
 			loginCmdStr := fmt.Sprintf("%s login --nexus %s", executablePath, nexusURL)
-			loginCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", loginCmdStr)
+			loginCmd := runAsUser(originalUser, loginCmdStr)
 			loginCmd.Stdout = os.Stdout
 			loginCmd.Stderr = os.Stderr
 			loginCmd.Stdin = os.Stdin
@@ -220,7 +273,7 @@ interactively or with flags for automation.`,
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
 			testUpArgs := append(upArgs, "--services-only")
 			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
-			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCmdString)
+			upCmd := runAsUser(originalUser, upCmdString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -230,7 +283,7 @@ interactively or with flags for automation.`,
 
 			fmt.Printf("\n--- 🔬 Running Power-On Self-Test (POST) for '%s' service ---\n", selectedService)
 			testCommandString := fmt.Sprintf("cd %s && %s test --service %s", configDir, executablePath, selectedService)
-			testCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", testCommandString)
+			testCmd := runAsUser(originalUser, testCommandString)
 			testCmd.Stdout = os.Stdout
 			testCmd.Stderr = os.Stderr
 			if err := testCmd.Run(); err != nil {
@@ -239,7 +292,7 @@ interactively or with flags for automation.`,
 		} else {
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
 			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
-			upCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", upCommandString)
+			upCmd := runAsUser(originalUser, upCommandString)
 			upCmd.Stdout = os.Stdout
 			upCmd.Stderr = os.Stderr
 			if err := upCmd.Run(); err != nil {
@@ -253,7 +306,7 @@ interactively or with flags for automation.`,
 		fmt.Println("Running a final status check now...")
 
 		statusCmdString := fmt.Sprintf("%s status", executablePath)
-		statusCmd := exec.Command("sudo", "-H", "-u", originalUser, "sh", "-c", statusCmdString)
+		statusCmd := runAsUser(originalUser, statusCmdString)
 		statusCmd.Stdout = os.Stdout
 		statusCmd.Stderr = os.Stderr
 		if err := statusCmd.Run(); err != nil {
@@ -518,6 +571,20 @@ func runCommand(name string, args ...string) error {
 	return nil
 }
 
+// runAsUser executes a command as a specific user in a cross-platform way
+// On Linux/macOS: uses sudo -H -u <user> sh -c <command>
+// On Windows: runs directly (already running as Administrator)
+func runAsUser(user string, cmdString string) *exec.Cmd {
+	if platform.IsWindows() {
+		// On Windows, run directly with cmd.exe
+		// The user is already running as Administrator
+		// Use cmd /c to execute the command string (supports && syntax)
+		return exec.Command("cmd", "/c", cmdString)
+	}
+	// On Linux/macOS, use sudo to run as the original user
+	return exec.Command("sudo", "-H", "-u", user, "sh", "-c", cmdString)
+}
+
 func ensureCoreDependencies() error {
 	pm, err := platform.GetPackageManager()
 	if err != nil {
@@ -529,6 +596,18 @@ func ensureCoreDependencies() error {
 		if err := platform.EnsureHomebrew(); err != nil {
 			return fmt.Errorf("failed to ensure Homebrew is installed: %w", err)
 		}
+	}
+
+	// On Windows, check for winget availability
+	if platform.IsWindows() {
+		if _, err := exec.LookPath("winget"); err != nil {
+			return fmt.Errorf("winget not found - please upgrade to Windows 10 1809+ or Windows 11")
+		}
+		// curl is built-in on Windows 10 1803+, no additional packages needed
+		if initVerbose {
+			fmt.Println("     - Core dependencies already available on Windows.")
+		}
+		return nil
 	}
 
 	// Check which packages are needed
@@ -678,7 +757,7 @@ func setupUser() error {
 		}
 	}
 
-	// Grant passwordless sudo (Linux only - on macOS, this is handled differently)
+	// Grant passwordless sudo (Linux only - on macOS/Windows, this is handled differently)
 	if platform.IsLinux() {
 		if initVerbose {
 			fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
@@ -697,7 +776,7 @@ func installNvidiaToolkit() error {
 	// NVIDIA Container Toolkit is Linux-only
 	if !platform.IsLinux() {
 		if initVerbose {
-			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS).")
+			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS/Windows).")
 		}
 		return nil
 	}
@@ -732,7 +811,7 @@ func configureNvidiaDocker() error {
 	// NVIDIA runtime configuration is Linux-only
 	if !platform.IsLinux() {
 		if initVerbose {
-			fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS).")
+			fmt.Println("     - Skipping NVIDIA Docker configuration (not required on macOS/Windows).")
 		}
 		return nil
 	}
@@ -750,6 +829,68 @@ func configureNvidiaDocker() error {
 }
 
 func installTailscale() error {
+	if platform.IsWindows() {
+		if initVerbose {
+			fmt.Println("     - Installing Tailscale via winget...")
+		}
+		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+
+		output, err := cmd.CombinedOutput()
+		alreadyInstalled := false
+		if err != nil {
+			outputStr := string(output)
+			// Check if it's already installed
+			if strings.Contains(outputStr, "already installed") ||
+			   strings.Contains(outputStr, "No applicable upgrade found") ||
+			   strings.Contains(outputStr, "No available upgrade found") {
+				if initVerbose {
+					fmt.Println("     ✅ Tailscale is already installed.")
+				}
+				alreadyInstalled = true
+			} else {
+				// Show helpful error message
+				if initVerbose {
+					fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
+				}
+				return fmt.Errorf("winget install failed: %w", err)
+			}
+		}
+
+		// Start the Tailscale service now while we have Administrator privileges
+		// This ensures the service is running before we hand off to 'citadel up'
+		if initVerbose {
+			fmt.Println("     - Ensuring Tailscale service is started...")
+		}
+		startCmd := exec.Command("net", "start", "Tailscale")
+		startOutput, startErr := startCmd.CombinedOutput()
+		startOutputStr := string(startOutput)
+
+		if startErr == nil {
+			if initVerbose {
+				fmt.Println("     ✅ Tailscale service started successfully.")
+			}
+		} else if strings.Contains(startOutputStr, "already") || strings.Contains(startOutputStr, "started") {
+			if initVerbose {
+				fmt.Println("     ✅ Tailscale service is already running.")
+			}
+		} else if alreadyInstalled {
+			// If Tailscale was already installed but service won't start, it might be running already
+			// Check with tailscale status
+			statusCmd := exec.Command("tailscale", "status")
+			if statusCmd.Run() == nil {
+				if initVerbose {
+					fmt.Println("     ✅ Tailscale is responding to status checks.")
+				}
+			} else if initVerbose {
+				fmt.Printf("     ⚠️  Warning: Could not verify Tailscale service status: %s\n", startOutputStr)
+			}
+		} else if initVerbose {
+			fmt.Printf("     ⚠️  Warning: Could not start Tailscale service: %s\n", startOutputStr)
+		}
+
+		return nil
+	}
+
 	if initVerbose {
 		fmt.Println("     - Running Tailscale install script...")
 	}

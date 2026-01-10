@@ -13,6 +13,8 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 
 ### From a Release (Recommended)
 
+#### Linux / macOS
+
 1.  Go to the [**Releases Page**](https://github.com/aceboss/citadel-cli/releases).
 2.  Download the latest `.tar.gz` archive for your architecture (e.g., `citadel_vX.Y.Z_linux_amd64.tar.gz`).
 3.  Extract the archive and place the `citadel` binary in your `PATH`.
@@ -22,14 +24,80 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
     sudo mv citadel /usr/local/bin/
     ```
 
+#### Windows
+
+**Option 1: One-Line Installer (Recommended)**
+
+Open PowerShell and run:
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.ps1 | iex
+```
+
+This will automatically download, install, and add Citadel to your PATH.
+
+**Option 2: Windows Package Manager (winget)**
+
+Once published to winget (coming soon):
+
+```powershell
+winget install AceTeam.Citadel
+```
+
+**Option 3: Manual Installation**
+
+1.  Go to the [**Releases Page**](https://github.com/aceteam-ai/citadel-cli/releases).
+2.  Download the latest `.zip` archive for Windows (e.g., `citadel_vX.Y.Z_windows_amd64.zip`).
+3.  Extract the archive and place `citadel.exe` in your `PATH`.
+
+    ```powershell
+    # Extract the zip file
+    Expand-Archive citadel_vX.Y.Z_windows_amd64.zip -DestinationPath C:\Tools\citadel
+
+    # Add to PATH (PowerShell as Administrator)
+    $env:Path += ";C:\Tools\citadel"
+    [Environment]::SetEnvironmentVariable("Path", $env:Path, [System.EnvironmentVariableTarget]::Machine)
+    ```
+
 ### Building from Source
+
+#### Linux / macOS
 
 If you need to build from the latest source code:
 
 ```bash
-# This will create binaries for Linux (amd64 and arm64) in the ./build directory.
+# This will create binaries for your platform in the ./build directory
 ./build.sh
+
+# Build for all platforms (requires cross-compilation tools)
+./build.sh --all
 ```
+
+#### Windows
+
+**Quick Setup (Automated):**
+
+```powershell
+# One-command setup: installs Go/Git, clones repo, builds, tests
+iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/setup-dev-windows.ps1 | iex
+```
+
+See [**WINDOWS_QUICKSTART.md**](WINDOWS_QUICKSTART.md) for a 5-minute getting started guide.
+
+**Manual Build:**
+
+```powershell
+# Build for Windows (native PowerShell)
+.\build.ps1
+
+# Build for all platforms (requires tar for cross-platform packages)
+.\build.ps1 -All
+
+# Quick development build
+go build -o citadel.exe .
+```
+
+See [**WINDOWS_DEVELOPMENT.md**](WINDOWS_DEVELOPMENT.md) for detailed Windows development setup instructions.
 
 ## Releasing (For Maintainers)
 

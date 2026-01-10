@@ -19,7 +19,7 @@ Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It 
 # Build for current platform only (default) - creates binary in ./build/
 ./build.sh
 
-# Build for all platforms (linux/darwin, amd64/arm64) - for releases
+# Build for all platforms (linux/darwin/windows, amd64/arm64) - for releases
 ./build.sh --all
 
 # Quick local build (current architecture only, no packaging)
@@ -209,34 +209,35 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
   - Usage: `mock := nexus.StartMockDeviceAuthServer(3); defer mock.Close()`
   - Returns `authorization_pending` for N polls, then returns success
 
-## macOS Support
+## Cross-Platform Support (Linux, macOS, Windows)
 
-Citadel CLI has full cross-platform support for both Linux and macOS (darwin). The codebase uses platform abstraction layers in `internal/platform/` to handle OS-specific operations.
+Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windows. The codebase uses platform abstraction layers in `internal/platform/` to handle OS-specific operations.
 
 ### Platform Abstractions
 
 **Core Platform Utilities** (`internal/platform/platform.go`):
-- `IsLinux()`, `IsDarwin()` - OS detection
-- `IsRoot()` - Privilege checking (works on both Linux and macOS)
+- `IsLinux()`, `IsDarwin()`, `IsWindows()` - OS detection
+- `IsRoot()` - Privilege checking (works on Linux, macOS, and Windows Administrator)
 - `HomeDir(username)` - Cross-platform home directory resolution
-- `ConfigDir()` - Returns `/etc/citadel` on Linux, `/usr/local/etc/citadel` on macOS
+- `ConfigDir()` - Returns `/etc/citadel` on Linux, `/usr/local/etc/citadel` on macOS, `C:\ProgramData\Citadel` on Windows
 
 **Package Management** (`internal/platform/packages.go`):
-- `GetPackageManager()` - Returns apt (Linux) or brew (macOS) manager
+- `GetPackageManager()` - Returns apt (Linux), brew (macOS), or winget (Windows) manager
 - `EnsureHomebrew()` - Installs Homebrew if not present on macOS
 
 **User Management** (`internal/platform/users.go`):
-- `GetUserManager()` - Returns Linux (useradd/usermod) or Darwin (dscl) manager
+- `GetUserManager()` - Returns Linux (useradd/usermod), Darwin (dscl), or Windows (net user) manager
 - Handles user and group creation across platforms
 
 **Docker Management** (`internal/platform/docker.go`):
-- `GetDockerManager()` - Returns Docker Engine (Linux) or Docker Desktop (macOS) manager
+- `GetDockerManager()` - Returns Docker Engine (Linux) or Docker Desktop (macOS/Windows) manager
 - Handles installation, startup, and permissions appropriately per platform
 
 **GPU Detection** (`internal/platform/gpu.go`):
-- `GetGPUDetector()` - Returns NVIDIA (Linux) or Metal (macOS) detector
+- `GetGPUDetector()` - Returns NVIDIA (Linux/Windows) or Metal (macOS) detector
 - Linux: Uses `nvidia-smi` and `lspci` for NVIDIA GPU detection
 - macOS: Uses `system_profiler SPDisplaysDataType` for Metal-compatible GPU detection
+- Windows: Uses `nvidia-smi.exe` (primary) and WMI queries (fallback) for NVIDIA GPU detection
 
 ### Platform-Specific Behavior
 
@@ -273,3 +274,92 @@ Citadel CLI has full cross-platform support for both Linux and macOS (darwin). T
 - User/group management uses different commands (dscl vs useradd)
 - Passwordless sudo configuration only applies to Linux
 - GPU device reservations in compose files are Linux-specific
+
+## Windows Support
+
+Citadel CLI has full Windows 10/11 support using Windows-specific platform implementations.
+
+### Windows Platform Abstractions
+
+**WingetPackageManager** (`internal/platform/packages.go`):
+- Uses Windows Package Manager (winget) for software installation
+- Built-in on Windows 10 1809+ and Windows 11 (no bootstrap required)
+- Silently handles already-installed packages
+- Package IDs: `Docker.DockerDesktop`, `Tailscale.Tailscale`, etc.
+
+**WindowsDockerManager** (`internal/platform/docker.go`):
+- Manages Docker Desktop for Windows with WSL2 backend
+- Checks for WSL2 availability before installation
+- Waits up to 60 seconds for Docker Desktop to start and be ready
+- No group management needed (Docker Desktop uses Windows ACLs)
+- Installs via: `winget install Docker.DockerDesktop`
+- Starts via: `C:\Program Files\Docker\Docker\Docker Desktop.exe`
+
+**WindowsUserManager** (`internal/platform/users.go`):
+- Uses `net user` and `net localgroup` commands for user/group management
+- Generates secure random passwords for user creation (required by Windows)
+- Sets passwords to never expire for system accounts
+- Error code 1378 indicates user already in group (treated as success)
+
+**WindowsGPUDetector** (`internal/platform/gpu.go`):
+- Primary: Uses `nvidia-smi.exe` from `C:\Program Files\NVIDIA Corporation\NVSMI\`
+- Fallback: Uses PATH to find nvidia-smi
+- Final fallback: WMI query via `wmic path win32_VideoController get name`
+- Same CSV output format as Linux for GPU info parsing
+
+**Windows Privilege Detection** (`internal/platform/platform_windows.go`):
+- Uses Windows API via `golang.org/x/sys/windows` package
+- Checks if current process token is member of Administrators group
+- Build-tagged file (only compiles on Windows)
+
+### Platform-Specific Behavior
+
+**Windows**:
+- Uses winget (Windows Package Manager) for dependencies
+- Installs Docker Desktop for Windows (requires WSL2)
+- GPU support via WSL2 integration with NVIDIA drivers
+- No NVIDIA Container Toolkit (handled by Docker Desktop + WSL2)
+- No group management needed (ACL-based permissions)
+- Uses `C:\ProgramData\Citadel` for global config
+- Uses `%USERPROFILE%\citadel-node` for user config
+- Administrator elevation required (no sudo equivalent)
+
+### WSL2 Requirements
+
+Docker Desktop on Windows requires WSL2:
+- **Minimum**: Windows 10 version 2004 (May 2020) or Windows 11
+- **Installation**: `wsl --install` (requires restart)
+- **Detection**: Checks for "WSL 2" in `wsl --status` output
+- **Error handling**: Clear error message with installation instructions if WSL2 not found
+
+### GPU Support on Windows
+
+**NVIDIA GPUs**:
+- Requires NVIDIA driver 470.76+ on Windows host
+- Requires Docker Desktop 3.1.0+ with WSL2 backend
+- Docker Desktop automatically handles GPU passthrough to WSL2
+- No NVIDIA Container Toolkit needed (Linux-only)
+- Services use same compose files with `driver: nvidia` (handled by Docker Desktop)
+
+**Detection**:
+1. `nvidia-smi.exe` in standard path: `C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`
+2. `nvidia-smi` in PATH
+3. WMI query: `wmic path win32_VideoController get name` (checks for "nvidia")
+
+### Known Limitations on Windows
+
+- WSL2 is required (not available on older Windows versions)
+- NVIDIA Container Toolkit steps are skipped (not applicable)
+- systemctl commands are not used (Docker Desktop self-manages)
+- User/group management uses net user commands instead of useradd
+- Passwordless sudo configuration is skipped (Windows uses different privilege model)
+- GPU device reservations in compose files rely on Docker Desktop's WSL2 integration
+
+### Build Script Updates
+
+**Windows Binary Packaging** (`build.sh`):
+- Detects Windows via `mingw*|msys*|cygwin*` in uname output
+- Builds with `.exe` extension: `citadel.exe`
+- Packages using `.zip` instead of `.tar.gz`
+- Cross-compilation: `GOOS=windows GOARCH=amd64 go build -o citadel.exe`
+- Release artifacts: `citadel_VERSION_windows_amd64.zip`

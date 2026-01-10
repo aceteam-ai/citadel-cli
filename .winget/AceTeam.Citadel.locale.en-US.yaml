@@ -1,0 +1,50 @@
+# Created using wingetcreate 1.6.1.0
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: AceTeam.Citadel
+PackageVersion: 1.3.0
+PackageLocale: en-US
+Publisher: AceTeam
+PublisherUrl: https://aceteam.ai
+PublisherSupportUrl: https://github.com/aceteam-ai/citadel-cli/issues
+# PrivacyUrl:
+Author: AceTeam
+PackageName: Citadel CLI
+PackageUrl: https://github.com/aceteam-ai/citadel-cli
+License: Proprietary
+# LicenseUrl:
+Copyright: Copyright (c) AceTeam
+# CopyrightUrl:
+ShortDescription: On-premise agent for the AceTeam Sovereign Compute Fabric
+Description: |-
+  The citadel CLI is the on-premise agent and administrator's toolkit for the AceTeam Sovereign Compute Fabric.
+  It allows you to securely connect your own hardware to your AceTeam account, making your resources available to your private workflows.
+
+  Features:
+  - Secure mesh networking via Tailscale
+  - Docker-based service management (vLLM, Ollama, llama.cpp)
+  - GPU detection and configuration
+  - Automated dependency installation
+  - Remote job execution and monitoring
+Moniker: citadel
+Tags:
+- ai
+- llm
+- gpu
+- infrastructure
+- cli
+- docker
+- kubernetes
+- compute
+ReleaseNotes: |-
+  For release notes, see: https://github.com/aceteam-ai/citadel-cli/releases/tag/v1.3.0
+ReleaseNotesUrl: https://github.com/aceteam-ai/citadel-cli/releases/tag/v1.3.0
+# PurchaseUrl:
+# InstallationNotes:
+Documentations:
+- DocumentLabel: README
+  DocumentUrl: https://github.com/aceteam-ai/citadel-cli/blob/main/README.md
+- DocumentLabel: Windows Development Guide
+  DocumentUrl: https://github.com/aceteam-ai/citadel-cli/blob/main/WINDOWS_DEVELOPMENT.md
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
