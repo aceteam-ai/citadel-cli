@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> See [aceteam-ai/.github](https://github.com/aceteam-ai/.github/blob/main/CLAUDE.md) for organization-wide conventions.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
