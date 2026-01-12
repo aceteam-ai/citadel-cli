@@ -130,7 +130,7 @@ By default, `citadel init` runs with minimal output. Use `--verbose` flag to see
 6. **Network Connection**: Joins Tailscale network if authkey provided
 7. **Service Startup**: Runs `citadel up` to start configured services
 
-### Agent Loop
+### Agent Loop (Nexus HTTP Polling)
 
 The agent (`citadel up` or `citadel agent`) runs continuously:
 1. Polls Nexus `/api/v1/jobs/next` every 5 seconds
@@ -140,6 +140,74 @@ The agent (`citadel up` or `citadel agent`) runs continuously:
 5. Reports status back to Nexus with `{status: "SUCCESS"|"FAILURE", output: "..."}`
 
 Job handlers registered in `cmd/agent.go:init()` map job types to handler implementations.
+
+### Worker Mode (Redis Streams) - High-Performance Private Cloud
+
+The worker (`citadel worker`) is the high-performance job queue mode designed for AceTeam's private GPU cloud infrastructure. Written in Go for maximum concurrency and throughput, it routes inference requests to private vLLM/Ollama/llama.cpp clusters.
+
+**Why Go?** The Citadel worker is intentionally written in Go (not Python) for:
+- High concurrency via goroutines (thousands of concurrent jobs)
+- Low memory overhead per connection
+- Fast startup and minimal latency
+- Designed for high-throughput GPU cluster routing
+
+**Architecture: Python Worker vs Citadel Worker**
+```
+                         Redis Streams
+                              │
+          ┌───────────────────┴───────────────────┐
+          │                                       │
+          ▼                                       ▼
+┌─────────────────────┐               ┌─────────────────────┐
+│   Python Worker     │               │   Citadel Worker    │
+│   (lightweight)     │               │   (high-perf Go)    │
+│                     │               │                     │
+│   → OpenAI API      │               │   → Private vLLM    │
+│   → Anthropic API   │               │   → Private Ollama  │
+│   → Google API      │               │   → GPU clusters    │
+└─────────────────────┘               └─────────────────────┘
+      Superscalers                     AceTeam Private Cloud
+```
+
+- **Python Worker**: Lightweight proxy for external API calls (OpenAI, Anthropic, etc.)
+- **Citadel Worker**: High-performance router for AceTeam's private GPU infrastructure
+
+```bash
+# Start worker with Redis connection
+citadel worker --redis-url redis://localhost:6379 --queue jobs:v1:gpu-general
+
+# Or using environment variables
+export REDIS_URL=redis://localhost:6379
+export WORKER_QUEUE=jobs:v1:gpu-general
+citadel worker
+```
+
+**Worker Architecture:**
+1. Connects to Redis Streams as a consumer in a consumer group
+2. Uses XREADGROUP to claim and process jobs (high-throughput)
+3. Routes jobs to private GPU cluster endpoints
+4. Streams responses back via Redis Pub/Sub (`stream:v1:{jobId}`)
+5. ACKs messages on success, moves to DLQ on repeated failure
+
+**Supported Job Types:**
+- `llm_inference` - Routes to private vLLM, Ollama, or llama.cpp clusters
+
+**Job Handler Pattern (Worker):**
+```go
+type WorkerJobHandler interface {
+    Execute(ctx context.Context, client *redis.Client, job *redis.Job) error
+    CanHandle(jobType string) bool
+}
+```
+
+**Key Differences from Agent Mode:**
+| Feature | Agent (Nexus) | Worker (Redis) |
+|---------|---------------|----------------|
+| Job source | HTTP polling | Redis Streams |
+| Streaming | N/A | Redis Pub/Sub |
+| Retry handling | Nexus server | Consumer groups + DLQ |
+| Scaling | Single node | Horizontal via consumer groups |
+| Target | User's on-prem | AceTeam private cloud |
 
 ## Important Implementation Notes
 
