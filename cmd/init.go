@@ -258,6 +258,9 @@ interactively or with flags for automation.`,
 			}
 		}
 
+		// Always use --force when spawning from init to avoid interactive prompts
+		upArgs = append(upArgs, "--force")
+
 		if initTest {
 			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
 			testUpArgs := append(upArgs, "--services-only")
