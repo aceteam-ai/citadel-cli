@@ -20,11 +20,12 @@ import (
 )
 
 var (
-	authkey               string
-	initService           string
-	initNodeName          string
-	initTest              bool
-	initVerbose           bool
+	authkey                string
+	initService            string
+	initNodeName           string
+	initTest               bool
+	initVerbose            bool
+	initNetworkOnly        bool
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
@@ -37,17 +38,17 @@ interactively or with flags for automation.`,
 	Example: `  # Interactive setup (recommended for first-time setup)
   sudo citadel init
 
+  # Network-only setup (no services, no Docker)
+  sudo citadel init --network-only
+
   # Automated setup with specific service
-  sudo citadel init --service vllm --node-name gpu-server-1
+  sudo citadel init --service vllm
 
   # Setup with pre-generated authkey (for CI/CD)
   sudo citadel init --authkey <your-key> --service ollama
 
   # Setup with verbose output (for debugging)
-  sudo citadel init --verbose
-
-  # Setup without running tests
-  sudo citadel init --test=false`,
+  sudo citadel init --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if !isRoot() {
 			if platform.IsWindows() {
@@ -87,6 +88,43 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 			fmt.Println("\n--- Continuing with node setup ---")
+		}
+
+		// Handle --network-only: just join network and exit
+		if initNetworkOnly {
+			nodeName, err := getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Install Tailscale if needed
+			if err := ensureTailscaleInstalled(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Determine authkey to use
+			var authkeyToUse string
+			if choice == nexus.NetChoiceDevice && deviceAuthToken != nil {
+				authkeyToUse = deviceAuthToken.Authkey
+			} else if key != "" {
+				authkeyToUse = key
+			}
+
+			if authkeyToUse != "" {
+				fmt.Printf("Joining network as '%s'...\n", nodeName)
+				if err := joinTailscaleNetwork(nodeName, authkeyToUse); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("\n✅ Successfully joined the AceTeam network!")
+			} else if choice != nexus.NetChoiceSkip {
+				fmt.Println("⚠️  No authkey available. Run 'citadel join' to complete network setup.")
+			}
+
+			fmt.Printf("Node name: %s\n", nodeName)
+			return
 		}
 
 		selectedService, err := getSelectedService()
@@ -337,8 +375,12 @@ func getNodeName() (string, error) {
 	if initNodeName != "" {
 		return initNodeName, nil
 	}
-	defaultName, _ := os.Hostname()
-	return ui.AskInput("Enter a name for this node:", "e.g., gpu-node-1", defaultName)
+	// Use hostname by default without prompting
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("could not determine hostname: %w", err)
+	}
+	return hostname, nil
 }
 
 func checkForRunningServicesQuiet(serviceToStart string) error {
@@ -913,4 +955,5 @@ func init() {
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
+	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Only join the network, skip service provisioning")
 }
