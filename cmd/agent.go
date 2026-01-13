@@ -19,14 +19,18 @@ import (
 var jobHandlers map[string]jobs.JobHandler
 
 var agentCmd = &cobra.Command{
-	Use:   "agent",
-	Short: "Run the Citadel agent to listen for jobs from the Nexus",
+	Use:        "agent",
+	Short:      "Run the Citadel agent to listen for jobs from the Nexus",
+	Deprecated: "use 'citadel work --mode=nexus' instead",
 	Long: `This is a long-running command that connects to the AceTeam Nexus
 and waits for remote jobs to execute on this node. It should typically be
-run as a background service.`,
+run as a background service.
+
+DEPRECATED: This command is deprecated. Please use 'citadel work --mode=nexus' instead.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if cmd.CalledAs() == "agent" {
 			fmt.Println("--- 🚀 Starting Citadel Agent ---")
+			fmt.Println("⚠️  Note: 'citadel agent' is deprecated. Use 'citadel work --mode=nexus' instead.")
 		}
 		client := nexus.NewClient(nexusURL)
 		fmt.Printf("   - Nexus endpoint: %s\n", nexusURL)
