@@ -5,7 +5,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/aceboss/citadel-cli/internal/heartbeat"
+	"github.com/aceboss/citadel-cli/internal/status"
 	"github.com/aceboss/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -20,6 +24,13 @@ var (
 	workGroup      string
 	workPollMs     int
 	workMaxRetries int
+
+	// Status server and heartbeat flags
+	workStatusPort   int
+	workHeartbeat    bool
+	workHeartbeatURL string
+	workAPIKey       string
+	workNodeName     string
 )
 
 var workCmd = &cobra.Command{
@@ -39,13 +50,26 @@ Examples:
   # Run as Redis worker (consumes from stream)
   citadel work --mode=redis --redis-url=redis://localhost:6379
 
+  # Run with status server and heartbeat
+  citadel work --mode=nexus --status-port=8080 --heartbeat
+
   # Run with custom queue and consumer group
   citadel work --mode=redis --queue=jobs:v1:gpu-general --group=my-workers`,
 	Run: runWork,
 }
 
 func runWork(cmd *cobra.Command, args []string) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Setup signal handling
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		fmt.Println("\n   - Received shutdown signal...")
+		cancel()
+	}()
 
 	// Validate mode
 	if workMode != "nexus" && workMode != "redis" {
@@ -110,6 +134,70 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
 
+	// Get node name
+	nodeName := workNodeName
+	if nodeName == "" {
+		nodeName = os.Getenv("CITADEL_NODE_NAME")
+	}
+	if nodeName == "" {
+		hostname, _ := os.Hostname()
+		nodeName = hostname
+	}
+
+	// Create status collector (used by both status server and heartbeat)
+	var collector *status.Collector
+	if workStatusPort > 0 || workHeartbeat {
+		collector = status.NewCollector(status.CollectorConfig{
+			NodeName:  nodeName,
+			ConfigDir: "", // TODO: get from manifest
+			Services:  nil,
+		})
+	}
+
+	// Start status server if enabled
+	if workStatusPort > 0 {
+		statusServer := status.NewServer(status.ServerConfig{
+			Port:    workStatusPort,
+			Version: Version,
+		}, collector)
+
+		go func() {
+			fmt.Printf("   - Status server: http://localhost:%d\n", workStatusPort)
+			if err := statusServer.Start(ctx); err != nil && err != context.Canceled {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Status server error: %v\n", err)
+			}
+		}()
+	}
+
+	// Start heartbeat if enabled
+	if workHeartbeat {
+		heartbeatURL := workHeartbeatURL
+		if heartbeatURL == "" {
+			heartbeatURL = os.Getenv("HEARTBEAT_URL")
+		}
+		if heartbeatURL == "" {
+			heartbeatURL = "https://aceteam.ai"
+		}
+
+		apiKey := workAPIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("CITADEL_API_KEY")
+		}
+
+		hbClient := heartbeat.NewClient(heartbeat.ClientConfig{
+			BaseURL: heartbeatURL,
+			NodeID:  nodeName,
+			APIKey:  apiKey,
+		}, collector)
+
+		go func() {
+			fmt.Printf("   - Heartbeat: %s (every 30s)\n", hbClient.Endpoint())
+			if err := hbClient.Start(ctx); err != nil && err != context.Canceled {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Heartbeat error: %v\n", err)
+			}
+		}()
+	}
+
 	// Create handlers (use legacy adapters for now)
 	handlers := worker.CreateLegacyHandlers()
 
@@ -126,8 +214,10 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Run the worker
 	if err := runner.Run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		if err != context.Canceled {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -147,4 +237,11 @@ func init() {
 	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
 	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Poll/block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
+
+	// Status and heartbeat flags
+	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
+	workCmd.Flags().BoolVar(&workHeartbeat, "heartbeat", false, "Enable heartbeat reporting to AceTeam API")
+	workCmd.Flags().StringVar(&workHeartbeatURL, "heartbeat-url", "", "Heartbeat endpoint base URL (default: https://aceteam.ai)")
+	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for heartbeat authentication (or set CITADEL_API_KEY env)")
+	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")
 }
