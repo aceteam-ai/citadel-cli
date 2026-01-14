@@ -58,6 +58,22 @@ go run . nodes --nexus https://nexus.aceteam.ai
 go run . test --service vllm
 ```
 
+## Development Workflow
+
+### Multi-Phase Implementation Plans
+
+When working on features with multiple implementation phases, follow this process:
+
+1. **Create a branch** for the work (if on main)
+2. **Create a PR** containing the plan as a markdown document in `docs/`
+3. **For each phase**: make a commit, push, and add a PR comment explaining what the commit did
+4. **Add tests** at the end or alongside each phase
+
+This ensures:
+- Clear documentation of the implementation approach
+- Reviewable progress with context for each change
+- Easy rollback if needed
+
 ## Architecture
 
 ### Command Structure
