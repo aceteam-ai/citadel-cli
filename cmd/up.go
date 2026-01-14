@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceboss/citadel-cli/internal/worker"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -81,9 +84,45 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 			return // Exit before starting the agent
 		}
 
-		// Start the agent as the final step
-		agentCmd.Run(cmd, args)
+		// Start the worker using the new unified runner
+		runNexusWorker()
 	},
+}
+
+// runNexusWorker starts the Nexus worker using the new worker abstractions.
+func runNexusWorker() {
+	ctx := context.Background()
+
+	// Determine Nexus URL
+	nexusEndpoint := nexusURL
+	if nexusEndpoint == "" {
+		nexusEndpoint = os.Getenv("NEXUS_URL")
+	}
+	if nexusEndpoint == "" {
+		nexusEndpoint = "https://nexus.aceteam.ai"
+	}
+
+	// Create Nexus source
+	source := worker.NewNexusSource(worker.NexusSourceConfig{
+		NexusURL: nexusEndpoint,
+	})
+
+	// Create worker ID
+	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
+
+	// Create handlers using legacy adapters
+	handlers := worker.CreateLegacyHandlers()
+
+	// Create and run the worker
+	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
+		WorkerID: workerID,
+		Verbose:  true,
+	})
+
+	if err := runner.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Worker error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // getTailscaleCLI returns the path to the tailscale CLI executable.
