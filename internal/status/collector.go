@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"

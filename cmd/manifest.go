@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 

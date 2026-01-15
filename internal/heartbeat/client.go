@@ -22,7 +22,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 // Client sends periodic heartbeats to the AceTeam API.

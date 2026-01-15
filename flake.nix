@@ -74,7 +74,7 @@
           vendorHash = null; # Set to the correct hash after first build, or use vendorHash = pkgs.lib.fakeSha256;
 
           ldflags = [
-            "-X github.com/aceboss/citadel-cli/cmd.Version=${self.rev or "dev"}"
+            "-X github.com/aceteam-ai/citadel-cli/cmd.Version=${self.rev or "dev"}"
           ];
 
           meta = with pkgs.lib; {

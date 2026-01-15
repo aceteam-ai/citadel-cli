@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 func TestNewClient(t *testing.T) {

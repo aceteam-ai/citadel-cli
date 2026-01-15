@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/aceboss/citadel-cli/services"
+	"github.com/aceteam-ai/citadel-cli/services"
 
 	"github.com/spf13/cobra"
 )

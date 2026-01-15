@@ -15,7 +15,7 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 
 #### Linux / macOS
 
-1.  Go to the [**Releases Page**](https://github.com/aceboss/citadel-cli/releases).
+1.  Go to the [**Releases Page**](https://github.com/aceteam-ai/citadel-cli/releases).
 2.  Download the latest `.tar.gz` archive for your architecture (e.g., `citadel_vX.Y.Z_linux_amd64.tar.gz`).
 3.  Extract the archive and place the `citadel` binary in your `PATH`.
 

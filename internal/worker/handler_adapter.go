@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/jobs"
-	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.

@@ -11,10 +11,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/platform"
-	"github.com/aceboss/citadel-cli/internal/ui"
-	"github.com/aceboss/citadel-cli/services"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )

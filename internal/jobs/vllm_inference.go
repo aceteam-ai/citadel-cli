@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 type VLLMInferenceHandler struct{}

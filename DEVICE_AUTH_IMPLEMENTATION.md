@@ -67,7 +67,7 @@ $ go test -v ./internal/nexus -run TestDeviceAuth
 === RUN   TestDeviceAuthInvalidURL
 --- PASS: TestDeviceAuthInvalidURL (0.01s)
 PASS
-ok      github.com/aceboss/citadel-cli/internal/nexus   2.011s
+ok      github.com/aceteam-ai/citadel-cli/internal/nexus   2.011s
 ```
 
 ### Build Test

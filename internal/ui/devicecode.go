@@ -10,7 +10,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/mattn/go-runewidth"
 
-	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // DeviceCodeModel represents the state for displaying device authorization code

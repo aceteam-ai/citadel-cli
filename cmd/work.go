@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/aceboss/citadel-cli/internal/heartbeat"
-	"github.com/aceboss/citadel-cli/internal/status"
-	"github.com/aceboss/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )

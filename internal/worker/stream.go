@@ -3,7 +3,7 @@ package worker
 import (
 	"context"
 
-	redisclient "github.com/aceboss/citadel-cli/internal/redis"
+	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
 // RedisStreamWriter implements StreamWriter using Redis Pub/Sub.

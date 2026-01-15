@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aceboss/citadel-cli/internal/jobs"
-	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 // TestLegacyHandler is a mock jobs.JobHandler for testing.

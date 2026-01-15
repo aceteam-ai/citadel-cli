@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	redisclient "github.com/aceboss/citadel-cli/internal/redis"
+	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
 // LLMInferenceHandler handles llm_inference jobs from the Redis queue.
