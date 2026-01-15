@@ -15,8 +15,10 @@ import (
 
 // downCmd represents the down command
 var downCmd = &cobra.Command{
-	Use:   "down",
-	Short: "Stops and removes the services defined in citadel.yaml",
+	Use:        "down",
+	Short:      "Stops and removes the services defined in citadel.yaml",
+	Hidden:     true, // Deprecated: use 'citadel stop' instead
+	Deprecated: "use 'citadel stop' instead",
 	Long: `Reads the citadel.yaml manifest and runs 'docker compose down' for each
 service, stopping and removing the containers, networks, and volumes created by 'up'.`,
 	Run: func(cmd *cobra.Command, args []string) {

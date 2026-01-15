@@ -4,12 +4,12 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
 
 	"github.com/spf13/cobra"
@@ -20,70 +20,132 @@ var detachRun bool
 // runCmd represents the run command
 var runCmd = &cobra.Command{
 	Use:   "run [service]",
-	Short: "Run a pre-packaged service like ollama, vllm, etc.",
-	Long: fmt.Sprintf(`Deploys a containerized, pre-configured service onto the node.
-This command is for running ad-hoc services and does not use the citadel.yaml manifest.
+	Short: "Start services (all if no service specified, or a specific one)",
+	Long: fmt.Sprintf(`Starts services and adds them to the manifest for tracking.
+
+When a service name is provided, it is added to the manifest (if not already present)
+and started. When no service is specified, all services in the manifest are started.
+
 Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
-	Example: `  # Run vLLM in detached mode (background)
+	Example: `  # Start a specific service (adds to manifest)
   citadel run vllm
 
-  # Run Ollama without detaching (foreground)
+  # Start all services in the manifest
+  citadel run
+
+  # Start in foreground mode
   citadel run ollama --detach=false`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		serviceName := args[0]
-		composeContent, ok := services.ServiceMap[serviceName]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
-			fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
-			os.Exit(1)
+		if len(args) == 0 {
+			// No service specified - start all manifest services
+			runAllServices()
+			return
 		}
 
-		// Strip GPU device reservations on non-Linux platforms
-		if !platform.IsLinux() {
-			filtered, err := compose.StripGPUDevices([]byte(composeContent))
+		// Start specific service
+		serviceName := args[0]
+		runSingleService(serviceName)
+	},
+}
+
+// runAllServices starts all services defined in the manifest.
+func runAllServices() {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		fmt.Fprintln(os.Stderr, "   Hint: Run 'citadel run <service>' to create a configuration.")
+		os.Exit(1)
+	}
+
+	if len(manifest.Services) == 0 {
+		fmt.Println("No services configured in manifest.")
+		fmt.Println("   Hint: Run 'citadel run <service>' to add and start a service.")
+		return
+	}
+
+	fmt.Printf("--- 🚀 Starting %d service(s) ---\n", len(manifest.Services))
+
+	for _, service := range manifest.Services {
+		serviceType := determineServiceType(service)
+
+		if serviceType == internalServices.ServiceTypeNative {
+			fmt.Printf("🚀 Starting service: %s (native)\n", service.Name)
+			if err := startNativeService(service.Name, configDir); err != nil {
+				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+				os.Exit(1)
+			}
+		} else {
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			fmt.Printf("🚀 Starting service: %s\n", service.Name)
+			if err := startService(service.Name, fullComposePath); err != nil {
+				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+				os.Exit(1)
+			}
+		}
+		fmt.Printf("   ✅ Service %s is up.\n", service.Name)
+	}
+
+	fmt.Println("\n🎉 All services are running.")
+}
+
+// runSingleService adds a service to the manifest (if needed) and starts it.
+func runSingleService(serviceName string) {
+	// Validate service name
+	if _, ok := services.ServiceMap[serviceName]; !ok {
+		fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
+		fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
+		os.Exit(1)
+	}
+
+	// Find or create manifest
+	manifest, configDir, err := findOrCreateManifest()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to initialize configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Ensure compose file exists
+	if err := ensureComposeFile(configDir, serviceName); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to create compose file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Strip GPU device reservations on non-Linux platforms
+	composePath := filepath.Join(configDir, "services", serviceName+".yml")
+	if !platform.IsLinux() {
+		content, err := os.ReadFile(composePath)
+		if err == nil {
+			filtered, err := compose.StripGPUDevices(content)
 			if err == nil {
-				composeContent = string(filtered)
+				os.WriteFile(composePath, filtered, 0644)
 				fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
 			}
 		}
+	}
 
-		// Write the embedded content to a temporary file
-		tmpDir := os.TempDir()
-		tmpFileName := fmt.Sprintf("citadel-run-%s-compose.yml", serviceName)
-		tmpFilePath := filepath.Join(tmpDir, tmpFileName)
-
-		err := os.WriteFile(tmpFilePath, []byte(composeContent), 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to write temporary compose file: %v\n", err)
+	// Add to manifest if not present
+	if !hasService(manifest, serviceName) {
+		if err := addServiceToManifest(configDir, serviceName); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to update manifest: %v\n", err)
 			os.Exit(1)
 		}
-		defer os.Remove(tmpFilePath) // Clean up after we're done
+		fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
+	}
 
-		fmt.Printf("--- 🚀 Launching pre-packaged service: %s ---\n", serviceName)
+	// Start the service
+	fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
 
-		// Use a unique project name to avoid conflicts
-		projectName := fmt.Sprintf("citadel-run-%s", serviceName)
-		composeArgs := []string{"compose", "-p", projectName, "-f", tmpFilePath, "up"}
-		if detachRun {
-			composeArgs = append(composeArgs, "-d")
-		}
+	if err := startService(serviceName, composePath); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to start service '%s': %v\n", serviceName, err)
+		os.Exit(1)
+	}
 
-		runCmd := exec.Command("docker", composeArgs...)
-		runCmd.Stdout = os.Stdout
-		runCmd.Stderr = os.Stderr
-
-		if err := runCmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "\n❌ Failed to start service '%s'.\n", serviceName)
-			os.Exit(1)
-		}
-
-		if detachRun {
-			fmt.Printf("\n✅ Service '%s' is running in the background.\n", serviceName)
-			fmt.Printf("   - To see logs, run: citadel logs %s -f\n", serviceName)
-			fmt.Printf("   - To stop, run: citadel stop %s\n", serviceName)
-		}
-	},
+	if detachRun {
+		fmt.Printf("\n✅ Service '%s' is running.\n", serviceName)
+		fmt.Printf("   - To see logs, run: citadel logs %s -f\n", serviceName)
+		fmt.Printf("   - To stop, run: citadel stop %s\n", serviceName)
+	}
 }
 
 func init() {
