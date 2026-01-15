@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceboss/citadel-cli/internal/compose"
 	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/aceboss/citadel-cli/internal/services"
 	"github.com/aceboss/citadel-cli/internal/worker"
@@ -451,7 +452,26 @@ func startService(serviceName, composeFilePath string) error {
 	}
 
 	// Start the service (container either doesn't exist or was just removed)
-	composeCmd := exec.Command("docker", "compose", "-f", composeFilePath, "up", "-d")
+	actualComposePath := composeFilePath
+
+	// On non-Linux platforms, strip GPU device reservations from compose file
+	if !platform.IsLinux() {
+		content, readErr := os.ReadFile(composeFilePath)
+		if readErr == nil {
+			filtered, filterErr := compose.StripGPUDevices(content)
+			if filterErr == nil {
+				// Write filtered content to a temp file
+				tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("citadel-compose-%s.yml", serviceName))
+				if writeErr := os.WriteFile(tmpPath, filtered, 0644); writeErr == nil {
+					actualComposePath = tmpPath
+					defer os.Remove(tmpPath)
+					fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
+				}
+			}
+		}
+	}
+
+	composeCmd := exec.Command("docker", "compose", "-f", actualComposePath, "up", "-d")
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker compose failed: %s", string(output))

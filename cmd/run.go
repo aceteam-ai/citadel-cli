@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceboss/citadel-cli/internal/compose"
+	"github.com/aceboss/citadel-cli/internal/platform"
 	"github.com/aceboss/citadel-cli/services"
 
 	"github.com/spf13/cobra"
@@ -35,6 +37,15 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 			fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
 			fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
 			os.Exit(1)
+		}
+
+		// Strip GPU device reservations on non-Linux platforms
+		if !platform.IsLinux() {
+			filtered, err := compose.StripGPUDevices([]byte(composeContent))
+			if err == nil {
+				composeContent = string(filtered)
+				fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
+			}
 		}
 
 		// Write the embedded content to a temporary file
@@ -69,10 +80,8 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 
 		if detachRun {
 			fmt.Printf("\n✅ Service '%s' is running in the background.\n", serviceName)
-			// Updated help text to be more specific
-			containerName := fmt.Sprintf("citadel-%s", serviceName)
-			fmt.Printf("   - To see logs, run: docker logs %s -f\n", containerName)
-			fmt.Printf("   - To stop, run: docker stop %s\n", containerName)
+			fmt.Printf("   - To see logs, run: citadel logs %s -f\n", serviceName)
+			fmt.Printf("   - To stop, run: citadel stop %s\n", serviceName)
 		}
 	},
 }
