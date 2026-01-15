@@ -4,8 +4,8 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // runDeviceAuthFlow executes the OAuth 2.0 device authorization flow

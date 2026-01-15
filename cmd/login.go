@@ -6,8 +6,8 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 

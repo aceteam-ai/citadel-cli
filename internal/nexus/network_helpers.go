@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/aceboss/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // getTailscaleCLI returns the path to the tailscale CLI executable.

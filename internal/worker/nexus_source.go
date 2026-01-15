@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 // NexusSource implements JobSource for Nexus HTTP polling.

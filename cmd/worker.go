@@ -8,8 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/aceboss/citadel-cli/internal/jobs"
-	redisclient "github.com/aceboss/citadel-cli/internal/redis"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 	"github.com/spf13/cobra"
 )
 

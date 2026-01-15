@@ -12,7 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"

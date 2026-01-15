@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	redisclient "github.com/aceboss/citadel-cli/internal/redis"
+	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
 // RedisSource implements JobSource for Redis Streams.
