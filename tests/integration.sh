@@ -1,10 +1,8 @@
 #!/bin/bash
 # tests/integration.sh
 
-# tests/integration.sh
-
 # This script performs a basic integration test of the citadel CLI.
-# It tests the up -> status -> logs -> down lifecycle.
+# It tests the run -> status -> logs -> stop lifecycle.
 
 set -e
 
@@ -16,25 +14,27 @@ docker compose -f docker-compose.test.yml down --remove-orphans > /dev/null 2>&1
 
 echo "   - Creating test citadel.yaml"
 cat > citadel.yaml << EOF
-name: integration-test-node
+node:
+  name: integration-test-node
+  tags: []
 services:
   - name: test-service
     compose_file: docker-compose.test.yml
 EOF
 
 # --- Test Execution ---
-echo "--- 2. Execution: Running 'citadel up' ---"
-./citadel up
+echo "--- 2. Execution: Running 'citadel run' ---"
+./citadel run --force
 
 echo "   - Verifying container status with docker..."
 if ! docker ps | grep -q "citadel-test-service"; then
-    echo "   ❌ FAILED: 'citadel up' ran, but test container is not running."
+    echo "   ❌ FAILED: 'citadel run' ran, but test container is not running."
     exit 1
 fi
 echo "   ✅ Container is running."
 
 echo "--- 3. Execution: Running 'citadel status' ---"
-# FIX: Grep for the SERVICE name ("test-service"), not the CONTAINER name.
+# Grep for the SERVICE name ("test-service"), not the CONTAINER name.
 if ! ./citadel status | grep -q "test-service"; then
     echo "   ❌ FAILED: 'citadel status' did not report the running test service."
     exit 1
@@ -49,12 +49,12 @@ if ! ./citadel logs test-service --tail 50 | grep -q "Hello from Docker!"; then
 fi
 echo "   ✅ Logs command retrieved logs correctly."
 
-echo "--- 5. Execution: Running 'citadel down' ---"
-./citadel down
+echo "--- 5. Execution: Running 'citadel stop' ---"
+./citadel stop
 
 echo "   - Verifying container is stopped..."
 if docker ps | grep -q "citadel-test-service"; then
-    echo "   ❌ FAILED: 'citadel down' ran, but test container is still running."
+    echo "   ❌ FAILED: 'citadel stop' ran, but test container is still running."
     exit 1
 fi
 echo "   ✅ Container is stopped."

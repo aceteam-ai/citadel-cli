@@ -46,7 +46,7 @@ network settings (or Administrator privileges on Windows).`,
 		}
 
 		fmt.Println("✅ Successfully disconnected from the AceTeam network.")
-		fmt.Println("   To reconnect, run 'citadel login' or 'citadel up --authkey <key>'")
+		fmt.Println("   To reconnect, run 'citadel login' or 'citadel join --authkey <key>'")
 	},
 }
 

@@ -151,4 +151,5 @@ func runSingleService(serviceName string) {
 func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().BoolVarP(&detachRun, "detach", "d", true, "Run in detached mode (background).")
+	runCmd.Flags().BoolVarP(&forceRecreate, "force", "f", false, "Force recreate containers without prompting.")
 }

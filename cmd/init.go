@@ -272,7 +272,7 @@ interactively or with flags for automation.`,
 
 		if choice == nexus.NetChoiceSkip {
 			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
-			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel up --authkey <key>'")
+			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel join --authkey <key>'")
 			return
 		}
 
@@ -283,31 +283,39 @@ interactively or with flags for automation.`,
 		}
 
 		executablePath, _ := os.Executable()
-		var upArgs []string
 
+		// Join the network if we have an authkey (device auth or provided key)
+		var authKey string
 		if choice == nexus.NetChoiceDevice {
-			// Device authorization was already completed at the start
-			// Use the stored token as an authkey for the rest of the flow
-			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
-		} else {
-			upArgs = []string{"up"}
-			if key != "" {
-				upArgs = append(upArgs, "--authkey", key)
+			authKey = deviceAuthToken.Authkey
+		} else if key != "" {
+			authKey = key
+		}
+
+		if authKey != "" {
+			fmt.Println("--- 🌐 Joining network ---")
+			joinArgs := []string{"join", "--authkey", authKey, "--node-name", nodeName}
+			joinCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(joinArgs, " "))
+			joinCmd := exec.Command("sudo", "sh", "-c", joinCmdString)
+			joinCmd.Stdout = os.Stdout
+			joinCmd.Stderr = os.Stderr
+			if err := joinCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel join' command failed: %v\n", err)
+				os.Exit(1)
 			}
 		}
 
-		// Always use --force when spawning from init to avoid interactive prompts
-		upArgs = append(upArgs, "--force")
+		// Start services with --force to avoid interactive prompts
+		runArgs := []string{"run", "--force"}
 
 		if initTest {
-			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
-			testUpArgs := append(upArgs, "--services-only")
-			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
-			upCmd := runAsUser(originalUser, upCmdString)
-			upCmd.Stdout = os.Stdout
-			upCmd.Stderr = os.Stderr
-			if err := upCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed during pre-test setup: %v\n", err)
+			fmt.Println("--- 🚀 Starting services for testing ---")
+			runCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(runArgs, " "))
+			runCmd := runAsUser(originalUser, runCmdString)
+			runCmd.Stdout = os.Stdout
+			runCmd.Stderr = os.Stderr
+			if err := runCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel run' command failed during pre-test setup: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -320,13 +328,13 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 		} else {
-			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
-			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
-			upCmd := runAsUser(originalUser, upCommandString)
-			upCmd.Stdout = os.Stdout
-			upCmd.Stderr = os.Stderr
-			if err := upCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed: %v\n", err)
+			fmt.Println("--- 🚀 Starting services ---")
+			runCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(runArgs, " "))
+			runCmd := runAsUser(originalUser, runCommandString)
+			runCmd.Stdout = os.Stdout
+			runCmd.Stderr = os.Stderr
+			if err := runCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel run' command failed: %v\n", err)
 				os.Exit(1)
 			}
 		}

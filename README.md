@@ -170,9 +170,10 @@ gh release create v1.2.0 \
 | :------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `citadel init`                                                            | **(Run with sudo)** The primary command for provisioning a new server. It installs dependencies, interactively prompts for configuration, generates all necessary files, and brings the node online.   |
 | `citadel init --authkey <key> --service <name> --node-name <name> --test` | The non-interactive version of `init`, perfect for automation. Allows you to specify the service (`vllm`, `ollama`, `llamacpp`, `none`), set the node name, and run a diagnostic test upon completion. |
-| `citadel up`                                                              | Brings a node online using an existing configuration. This is typically called automatically by `init`.                                                                                                |
-| `citadel down`                                                            | Stops and removes all services defined in the local `citadel.yaml`.                                                                                                                                    |
+| `citadel run [service]`                                                   | Starts services. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                          |
+| `citadel stop [service]`                                                  | Stops services. With no arguments, stops all manifest services. With a service name, stops that specific service.                                                                                       |
 | `citadel login`                                                           | **(Run with sudo)** Connects the machine to the network. It's intelligent: if already online, it does nothing. If offline, it provides interactive prompts to connect via authkey or a browser.        |
+| `citadel join --authkey <key>`                                            | **(Run with sudo)** Joins the AceTeam network using an authkey. Lightweight command for network connectivity only.                                                                                      |
 
 ### Node Operation & Monitoring
 
@@ -182,7 +183,7 @@ gh release create v1.2.0 \
 | `citadel test --service <name>` | Runs a diagnostic test for a specific service to verify its functionality.                                                                   |
 | `citadel logs <service-name>`   | Streams the logs for a specific service defined in `citadel.yaml`. Supports `-f` to follow the log output.                                   |
 | `citadel nodes`                 | Connects to the Nexus API and lists all nodes in your compute fabric.                                                                        |
-| `citadel run <service-name>`    | Runs a pre-packaged, ad-hoc service without needing a manifest. Great for quick tests.                                                       |
+| `citadel restart`               | Restarts all services defined in `citadel.yaml`.                                                                                             |
 | `citadel version`               | Prints the current version of the CLI.                                                                                                       |
 
 ---
