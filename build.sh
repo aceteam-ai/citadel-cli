@@ -95,7 +95,7 @@ for OS in "${PLATFORMS[@]}"; do
 
         # 1. Build the binary
         echo "Building binary..."
-        GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
+        CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
 
         # 2. Package (Windows uses .zip, others use .tar.gz)
         if [[ "$OS" == "windows" ]]; then
