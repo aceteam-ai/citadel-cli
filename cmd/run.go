@@ -4,6 +4,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 )
 
 var detachRun bool
+var restartServices bool
 
 // runCmd represents the run command
 var runCmd = &cobra.Command{
@@ -26,6 +28,8 @@ var runCmd = &cobra.Command{
 When a service name is provided, it is added to the manifest (if not already present)
 and started. When no service is specified, all services in the manifest are started.
 
+Use --restart to restart running services instead of starting fresh.
+
 Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 	Example: `  # Start a specific service (adds to manifest)
   citadel run vllm
@@ -33,10 +37,19 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
   # Start all services in the manifest
   citadel run
 
+  # Restart all services
+  citadel run --restart
+
   # Start in foreground mode
   citadel run ollama --detach=false`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		if restartServices {
+			// Restart mode
+			restartAllServices()
+			return
+		}
+
 		if len(args) == 0 {
 			// No service specified - start all manifest services
 			runAllServices()
@@ -148,8 +161,40 @@ func runSingleService(serviceName string) {
 	}
 }
 
+// restartAllServices restarts all services defined in the manifest.
+func restartAllServices() {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(manifest.Services) == 0 {
+		fmt.Println("No services configured in manifest.")
+		return
+	}
+
+	fmt.Printf("--- 🔄 Restarting %d service(s) ---\n", len(manifest.Services))
+
+	for _, service := range manifest.Services {
+		fullComposePath := filepath.Join(configDir, service.ComposeFile)
+		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
+
+		composeCmd := exec.Command("docker", "compose", "-f", fullComposePath, "restart")
+		output, err := composeCmd.CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))
+		} else {
+			fmt.Printf("   ✅ Service %s restarted.\n", service.Name)
+		}
+	}
+
+	fmt.Println("\n🎉 All services have been restarted.")
+}
+
 func init() {
 	rootCmd.AddCommand(runCmd)
 	runCmd.Flags().BoolVarP(&detachRun, "detach", "d", true, "Run in detached mode (background).")
 	runCmd.Flags().BoolVarP(&forceRecreate, "force", "f", false, "Force recreate containers without prompting.")
+	runCmd.Flags().BoolVarP(&restartServices, "restart", "r", false, "Restart services instead of starting fresh.")
 }

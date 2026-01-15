@@ -120,7 +120,7 @@ interactively or with flags for automation.`,
 				}
 				fmt.Println("\n✅ Successfully joined the AceTeam network!")
 			} else if choice != nexus.NetChoiceSkip {
-				fmt.Println("⚠️  No authkey available. Run 'citadel join' to complete network setup.")
+				fmt.Println("⚠️  No authkey available. Run 'citadel login' to complete network setup.")
 			}
 
 			fmt.Printf("Node name: %s\n", nodeName)
@@ -272,7 +272,7 @@ interactively or with flags for automation.`,
 
 		if choice == nexus.NetChoiceSkip {
 			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
-			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel join --authkey <key>'")
+			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel login --authkey <key>'")
 			return
 		}
 
@@ -294,13 +294,13 @@ interactively or with flags for automation.`,
 
 		if authKey != "" {
 			fmt.Println("--- 🌐 Joining network ---")
-			joinArgs := []string{"join", "--authkey", authKey, "--node-name", nodeName}
-			joinCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(joinArgs, " "))
-			joinCmd := exec.Command("sudo", "sh", "-c", joinCmdString)
-			joinCmd.Stdout = os.Stdout
-			joinCmd.Stderr = os.Stderr
-			if err := joinCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel join' command failed: %v\n", err)
+			loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
+			loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
+			loginCmd := exec.Command("sudo", "sh", "-c", loginCmdString)
+			loginCmd.Stdout = os.Stdout
+			loginCmd.Stderr = os.Stderr
+			if err := loginCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel login' command failed: %v\n", err)
 				os.Exit(1)
 			}
 		}

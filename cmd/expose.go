@@ -119,7 +119,7 @@ func showAccessInfo() {
 	output, err := statusCmd.Output()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error: not connected to Tailscale network")
-		fmt.Fprintln(os.Stderr, "Run 'citadel join' to connect first")
+		fmt.Fprintln(os.Stderr, "Run 'citadel login' to connect first")
 		os.Exit(1)
 	}
 
