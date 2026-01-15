@@ -4,47 +4,18 @@ package nexus
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // getTailscaleCLI returns the path to the tailscale CLI executable.
-// Checks PATH first, then platform-specific locations:
-// - Windows: C:\Program Files\Tailscale\tailscale.exe
-// - macOS: Homebrew paths and App Store location
+// Delegates to the centralized platform.GetTailscaleCLI() which handles
+// PATH lookup and platform-specific fallback locations for Windows, macOS, and Linux.
 func getTailscaleCLI() string {
-	// First check if tailscale is in PATH
-	if path, err := exec.LookPath("tailscale"); err == nil {
-		return path
-	}
-
-	// Windows: Check standard installation path
-	if runtime.GOOS == "windows" {
-		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
-		if _, err := os.Stat(fullPath); err == nil {
-			return fullPath
-		}
-	}
-
-	// macOS: Check Homebrew and App Store locations
-	if runtime.GOOS == "darwin" {
-		macPaths := []string{
-			"/opt/homebrew/bin/tailscale",                          // Homebrew (Apple Silicon)
-			"/usr/local/bin/tailscale",                             // Homebrew (Intel)
-			"/Applications/Tailscale.app/Contents/MacOS/Tailscale", // App Store
-		}
-		for _, p := range macPaths {
-			if _, err := os.Stat(p); err == nil {
-				return p
-			}
-		}
-	}
-
-	return "tailscale" // Fallback
+	return platform.GetTailscaleCLI()
 }
 
 // NetworkChoice represents the user's selected method for network connection.

@@ -259,15 +259,11 @@ func listExposedPorts() {
 	fmt.Println(string(output))
 }
 
-// getTailscaleCLIPath returns the path to the tailscale CLI
+// getTailscaleCLIPath returns the path to the tailscale CLI.
+// Delegates to the centralized platform.GetTailscaleCLI() which handles
+// PATH lookup and platform-specific fallback locations for Windows, macOS, and Linux.
 func getTailscaleCLIPath() string {
-	if platform.IsWindows() {
-		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
-		if _, err := os.Stat(fullPath); err == nil {
-			return fullPath
-		}
-	}
-	return "tailscale"
+	return platform.GetTailscaleCLI()
 }
 
 func init() {

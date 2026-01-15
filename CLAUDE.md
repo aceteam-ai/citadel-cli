@@ -74,6 +74,37 @@ This ensures:
 - Reviewable progress with context for each change
 - Easy rollback if needed
 
+### Bug Fix and Issue-Driven Development
+
+When fixing bugs or implementing changes based on user feedback/issues:
+
+1. **Document the problem**: In the PR description, include:
+   - **Context**: Why this change is needed (link to issue, user feedback, onboarding problems)
+   - **Root Cause Analysis**: What was causing the issue
+   - **Solution**: What changes were made and why
+
+2. **Include verification steps**: Always document how to test the changes:
+   - Manual testing commands
+   - Expected behavior before/after
+   - Edge cases to verify
+
+3. **Update CLAUDE.md**: If the fix reveals architectural patterns or important implementation details that future developers should know, add them to this file.
+
+**Example PR structure:**
+```markdown
+## Context
+[Link to issue or description of the problem encountered]
+
+## Root Cause
+[Technical explanation of what was wrong]
+
+## Changes
+- [List of changes with file paths]
+
+## Testing
+[Commands and steps to verify the fix]
+```
+
 ## Architecture
 
 ### Command Structure
@@ -94,6 +125,8 @@ Built with Cobra. Main command files are in `cmd/`:
 
 **Tailscale Integration**: Network connectivity uses Tailscale for secure mesh networking between nodes and Nexus. Commands check Tailscale status via `tailscale status --json` and authenticate using device authorization or authkeys.
 
+**IMPORTANT**: All Tailscale CLI path resolution MUST use `platform.GetTailscaleCLI()` from `internal/platform/tailscale.go`. This function handles cross-platform path resolution (Windows, macOS Homebrew, macOS App Store, Linux). Never hardcode `"tailscale"` or create local path resolution functions.
+
 **Job Handler Pattern**: The agent uses a pluggable handler system for remote job execution:
 ```go
 type JobHandler interface {
@@ -109,7 +142,8 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 ### Key Packages
 
 - **`cmd/`**: Cobra command implementations
-- **`internal/nexus/`**: HTTP client for Nexus API, network helpers for Tailscale operations
+- **`internal/nexus/`**: HTTP client for Nexus API, SSH key sync, device authentication
+- **`internal/platform/`**: Cross-platform utilities (OS detection, package managers, Docker, GPU, Tailscale CLI resolution)
 - **`internal/jobs/`**: Job handler implementations (shell, inference, model download)
 - **`internal/ui/`**: Interactive prompts using survey library
 - **`services/`**: Embedded Docker Compose files and service registry
