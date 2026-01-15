@@ -160,33 +160,27 @@ func runInteractiveLogin() {
 	fmt.Println("\n✅ Authentication successful! This machine is now connected to the fabric.")
 }
 
-// getTailscalePath returns the path to the tailscale CLI binary
-// Checks: PATH first, then platform-specific locations
+// getTailscalePath returns the path to the tailscale CLI binary.
+// Returns empty string if Tailscale is not installed.
+// Delegates to platform.GetTailscaleCLI() for the actual path resolution.
 func getTailscalePath() string {
-	if path, err := exec.LookPath("tailscale"); err == nil {
-		return path
+	if !platform.IsTailscaleInstalled() {
+		return ""
 	}
-	// macOS: Check Homebrew and App Store locations
-	if platform.IsDarwin() {
-		macPaths := []string{
-			"/opt/homebrew/bin/tailscale",                        // Homebrew (Apple Silicon)
-			"/usr/local/bin/tailscale",                           // Homebrew (Intel)
-			"/Applications/Tailscale.app/Contents/MacOS/Tailscale", // App Store
-		}
-		for _, p := range macPaths {
-			if _, err := os.Stat(p); err == nil {
-				return p
-			}
-		}
-	}
-	return "" // Not found
+	return platform.GetTailscaleCLI()
 }
 
-// ensureTailscaleInstalled checks if Tailscale is installed and installs it if not
+// ensureTailscaleInstalled checks if Tailscale is installed and installs it if not.
+// After installation, it verifies that the CLI is functional (important for macOS
+// App Store installations where CLI must be enabled in Settings).
 func ensureTailscaleInstalled() error {
 	// Check if tailscale is available (PATH or macOS App Store)
 	if getTailscalePath() != "" {
-		return nil // Already installed
+		// Verify CLI is functional (may require manual enabling on macOS App Store)
+		if err := platform.CheckTailscaleCLIEnabled(); err != nil {
+			return err
+		}
+		return nil // Already installed and functional
 	}
 
 	fmt.Println("Installing Tailscale...")
@@ -199,7 +193,11 @@ func ensureTailscaleInstalled() error {
 			if strings.Contains(outputStr, "already installed") ||
 				strings.Contains(outputStr, "No applicable upgrade found") ||
 				strings.Contains(outputStr, "No available upgrade found") {
-				return nil // Already installed
+				// Already installed, verify CLI is functional
+				if err := platform.CheckTailscaleCLIEnabled(); err != nil {
+					return err
+				}
+				return nil
 			}
 			return fmt.Errorf("winget install failed: %w", err)
 		}
@@ -214,7 +212,19 @@ func ensureTailscaleInstalled() error {
 	cmd := exec.Command("sh", "-c", script)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	// On macOS, verify CLI is functional after installation
+	// (App Store installations require manual CLI enabling in Settings)
+	if platform.IsDarwin() {
+		if err := platform.CheckTailscaleCLIEnabled(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // joinTailscaleNetwork connects to the Tailscale network with the given credentials

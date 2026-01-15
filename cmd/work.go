@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
@@ -31,6 +33,10 @@ var (
 	workHeartbeatURL string
 	workAPIKey       string
 	workNodeName     string
+
+	// SSH key sync flags
+	workSSHSync     bool
+	workSSHSyncMins int
 )
 
 var workCmd = &cobra.Command{
@@ -169,23 +175,24 @@ func runWork(cmd *cobra.Command, args []string) {
 		}()
 	}
 
+	// Resolve API key and base URL (used by heartbeat and SSH sync)
+	apiKey := workAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("CITADEL_API_KEY")
+	}
+
+	baseURL := workHeartbeatURL
+	if baseURL == "" {
+		baseURL = os.Getenv("HEARTBEAT_URL")
+	}
+	if baseURL == "" {
+		baseURL = "https://aceteam.ai"
+	}
+
 	// Start heartbeat if enabled
 	if workHeartbeat {
-		heartbeatURL := workHeartbeatURL
-		if heartbeatURL == "" {
-			heartbeatURL = os.Getenv("HEARTBEAT_URL")
-		}
-		if heartbeatURL == "" {
-			heartbeatURL = "https://aceteam.ai"
-		}
-
-		apiKey := workAPIKey
-		if apiKey == "" {
-			apiKey = os.Getenv("CITADEL_API_KEY")
-		}
-
 		hbClient := heartbeat.NewClient(heartbeat.ClientConfig{
-			BaseURL: heartbeatURL,
+			BaseURL: baseURL,
 			NodeID:  nodeName,
 			APIKey:  apiKey,
 		}, collector)
@@ -196,6 +203,44 @@ func runWork(cmd *cobra.Command, args []string) {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Heartbeat error: %v\n", err)
 			}
 		}()
+	}
+
+	// Start SSH key sync if enabled
+	if workSSHSync && apiKey != "" {
+		syncInterval := time.Duration(workSSHSyncMins) * time.Minute
+		sshConfig := nexus.SSHSyncConfig{
+			APIToken: apiKey,
+			NodeID:   nodeName,
+			BaseURL:  baseURL,
+		}
+
+		go func() {
+			fmt.Printf("   - SSH key sync: enabled (every %dm)\n", workSSHSyncMins)
+
+			// Initial sync
+			if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Initial SSH sync failed: %v\n", err)
+			} else {
+				fmt.Println("   - ✅ SSH keys synchronized")
+			}
+
+			// Periodic sync
+			ticker := time.NewTicker(syncInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ SSH sync failed: %v\n", err)
+					}
+				}
+			}
+		}()
+	} else if workSSHSync && apiKey == "" {
+		fmt.Fprintln(os.Stderr, "   - ⚠️ SSH sync enabled but no API key configured")
 	}
 
 	// Create handlers (use legacy adapters for now)
@@ -244,4 +289,8 @@ func init() {
 	workCmd.Flags().StringVar(&workHeartbeatURL, "heartbeat-url", "", "Heartbeat endpoint base URL (default: https://aceteam.ai)")
 	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for heartbeat authentication (or set CITADEL_API_KEY env)")
 	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")
+
+	// SSH key sync flags
+	workCmd.Flags().BoolVar(&workSSHSync, "ssh-sync", false, "Enable SSH authorized_keys synchronization from AceTeam")
+	workCmd.Flags().IntVar(&workSSHSyncMins, "ssh-sync-interval", 5, "SSH sync interval in minutes")
 }

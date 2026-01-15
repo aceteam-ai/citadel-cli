@@ -164,28 +164,37 @@ install_citadel() {
 # --- Execution ---
 main() {
   msg "Starting Citadel CLI installation..."
-  
+
   check_root
   check_deps
-  
+
   local arch
   arch=$(get_arch)
-  
+
   local version
   version=$(get_latest_version)
-  
+
   install_citadel "$arch" "$version"
-  
+
   msg "Citadel CLI installed successfully to ${INSTALL_DIR}/${BINARY_NAME}"
-  
+
   local installed_version
   installed_version=$(${INSTALL_DIR}/${BINARY_NAME} version)
-  
+
   echo "" >&2
   msg "Installation complete!"
   echo "  Version: ${installed_version}" >&2
-  echo "  Run 'citadel --help' to get started." >&2
-  echo "  To provision this node, run: sudo citadel init" >&2
+
+  # Auto-run citadel init if running interactively
+  if [ -t 0 ] && [ -t 1 ]; then
+    echo "" >&2
+    msg "Starting device provisioning..."
+    echo "" >&2
+    ${INSTALL_DIR}/${BINARY_NAME} init
+  else
+    echo "  Run 'citadel --help' to get started." >&2
+    echo "  To provision this node, run: sudo citadel init" >&2
+  fi
 }
 
 main

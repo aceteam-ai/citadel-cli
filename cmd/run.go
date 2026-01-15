@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -100,6 +101,9 @@ func runAllServices() {
 	}
 
 	fmt.Println("\n🎉 All services are running.")
+
+	// Try to sync SSH keys if configured
+	syncSSHKeysIfConfigured(configDir)
 }
 
 // runSingleService adds a service to the manifest (if needed) and starts it.
@@ -190,6 +194,27 @@ func restartAllServices() {
 	}
 
 	fmt.Println("\n🎉 All services have been restarted.")
+}
+
+// syncSSHKeysIfConfigured attempts to sync SSH keys if configuration exists.
+// Silently does nothing if SSH sync is not configured.
+func syncSSHKeysIfConfigured(configDir string) {
+	config, err := nexus.LoadSSHSyncConfig(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "   ⚠️ SSH sync config error: %v\n", err)
+		return
+	}
+	if config == nil {
+		// Not configured, silently skip
+		return
+	}
+
+	fmt.Println("   - Syncing SSH authorized keys...")
+	if err := nexus.SyncAuthorizedKeys(*config); err != nil {
+		fmt.Fprintf(os.Stderr, "   ⚠️ SSH key sync failed: %v\n", err)
+	} else {
+		fmt.Println("   ✅ SSH keys synchronized")
+	}
 }
 
 func init() {
