@@ -80,10 +80,8 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 
 		if detachRun {
 			fmt.Printf("\n✅ Service '%s' is running in the background.\n", serviceName)
-			// Updated help text to be more specific
-			containerName := fmt.Sprintf("citadel-%s", serviceName)
-			fmt.Printf("   - To see logs, run: docker logs %s -f\n", containerName)
-			fmt.Printf("   - To stop, run: docker stop %s\n", containerName)
+			fmt.Printf("   - To see logs, run: citadel logs %s -f\n", serviceName)
+			fmt.Printf("   - To stop, run: citadel stop %s\n", serviceName)
 		}
 	},
 }

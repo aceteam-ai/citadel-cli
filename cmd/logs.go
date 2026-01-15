@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/aceboss/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
 
@@ -20,8 +22,8 @@ var tail string
 var logsCmd = &cobra.Command{
 	Use:   "logs <service-name>",
 	Short: "Fetch the logs of a running service",
-	Long: `Streams the logs for a specified service defined in the citadel.yaml manifest.
-This command uses 'docker compose logs' to retrieve the output from the service's containers.`,
+	Long: fmt.Sprintf(`Streams the logs for a service started with 'citadel run' or defined in citadel.yaml.
+Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 	Example: `  # View last 100 lines of vllm logs
   citadel logs vllm
 
@@ -34,60 +36,80 @@ This command uses 'docker compose logs' to retrieve the output from the service'
 	Run: func(cmd *cobra.Command, args []string) {
 		serviceName := args[0]
 
+		// First, try to find service in manifest
+		var fullComposePath string
 		manifest, configDir, err := findAndReadManifest()
-		if err != nil {
-			// The error from findAndReadManifest is already user-friendly
-			fmt.Fprintf(os.Stderr, "  %s\n", badColor.Sprint(err.Error()))
-			return
-		}
-		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Println("  🤷 No citadel.yaml found, cannot find service.")
-				return
-			}
-			fmt.Fprintf(os.Stderr, "  ❌ Error reading manifest: %v\n", err)
-			return
-		}
-
-		var targetService *Service
-		for i, s := range manifest.Services {
-			if s.Name == serviceName {
-				targetService = &manifest.Services[i]
-				break
+		if err == nil {
+			for _, s := range manifest.Services {
+				if s.Name == serviceName {
+					fullComposePath = filepath.Join(configDir, s.ComposeFile)
+					break
+				}
 			}
 		}
 
-		if targetService == nil {
-			fmt.Fprintf(os.Stderr, "Service '%s' not found in citadel.yaml\n", serviceName)
+		// If found in manifest, use docker compose logs
+		if fullComposePath != "" {
+			dockerArgs := []string{"compose", "-f", fullComposePath, "logs"}
+			if follow {
+				dockerArgs = append(dockerArgs, "--follow")
+			}
+			if tail != "" {
+				dockerArgs = append(dockerArgs, "--tail", tail)
+			}
+
+			logCmd := exec.Command("docker", dockerArgs...)
+			logCmd.Stdout = os.Stdout
+			logCmd.Stderr = os.Stderr
+
+			fmt.Printf("--- Streaming logs for service '%s' (Ctrl+C to stop) ---\n", serviceName)
+			if err := logCmd.Run(); err != nil {
+				if exitError, ok := err.(*exec.ExitError); ok {
+					if exitError.ExitCode() != 130 {
+						fmt.Fprintf(os.Stderr, "  ❌ Error: %v\n", err)
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "  ❌ Error executing docker logs: %v\n", err)
+				}
+			}
+			return
+		}
+
+		// Fallback: try direct container access (for 'citadel run' services)
+		containerName := fmt.Sprintf("citadel-%s", serviceName)
+
+		// Check if container exists
+		inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+		if _, err := inspectCmd.Output(); err != nil {
+			// Validate service name before giving error
+			if _, ok := services.ServiceMap[serviceName]; !ok {
+				fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
+				fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
+			} else {
+				fmt.Fprintf(os.Stderr, "❌ Container '%s' not found. Is the service running?\n", containerName)
+			}
 			os.Exit(1)
 		}
-		fullComposePath := filepath.Join(configDir, targetService.ComposeFile)
-		dockerArgs := []string{
-			"compose",
-			"-f",
-			fullComposePath,
-			"logs",
-		}
 
+		// Use docker logs directly
+		dockerArgs := []string{"logs"}
 		if follow {
-			dockerArgs = append(dockerArgs, "--follow")
+			dockerArgs = append(dockerArgs, "-f")
 		}
 		if tail != "" {
 			dockerArgs = append(dockerArgs, "--tail", tail)
 		}
+		dockerArgs = append(dockerArgs, containerName)
 
 		logCmd := exec.Command("docker", dockerArgs...)
-
-		// Pipe the command's output directly to the user's terminal
 		logCmd.Stdout = os.Stdout
 		logCmd.Stderr = os.Stderr
 
 		fmt.Printf("--- Streaming logs for service '%s' (Ctrl+C to stop) ---\n", serviceName)
 		if err := logCmd.Run(); err != nil {
-			// The error is often just that the user pressed Ctrl+C, so we don't always need to print it.
 			if exitError, ok := err.(*exec.ExitError); ok {
-				if exitError.ExitCode() != 130 { // 130 = script terminated by Ctrl+C
-					fmt.Fprintf(os.Stderr, "  ❌ Script terminated by Ctrl+C: %v\n", err)
+				if exitError.ExitCode() != 130 {
+					fmt.Fprintf(os.Stderr, "  ❌ Error: %v\n", err)
 				}
 			} else {
 				fmt.Fprintf(os.Stderr, "  ❌ Error executing docker logs: %v\n", err)
