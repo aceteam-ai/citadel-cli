@@ -13,16 +13,38 @@ import (
 )
 
 // getTailscaleCLI returns the path to the tailscale CLI executable.
-// On Windows, we use the full path because the PATH might not include
-// the Tailscale installation directory in all contexts.
+// Checks PATH first, then platform-specific locations:
+// - Windows: C:\Program Files\Tailscale\tailscale.exe
+// - macOS: Homebrew paths and App Store location
 func getTailscaleCLI() string {
+	// First check if tailscale is in PATH
+	if path, err := exec.LookPath("tailscale"); err == nil {
+		return path
+	}
+
+	// Windows: Check standard installation path
 	if runtime.GOOS == "windows" {
 		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
 		if _, err := os.Stat(fullPath); err == nil {
 			return fullPath
 		}
 	}
-	return "tailscale"
+
+	// macOS: Check Homebrew and App Store locations
+	if runtime.GOOS == "darwin" {
+		macPaths := []string{
+			"/opt/homebrew/bin/tailscale",                          // Homebrew (Apple Silicon)
+			"/usr/local/bin/tailscale",                             // Homebrew (Intel)
+			"/Applications/Tailscale.app/Contents/MacOS/Tailscale", // App Store
+		}
+		for _, p := range macPaths {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+
+	return "tailscale" // Fallback
 }
 
 // NetworkChoice represents the user's selected method for network connection.

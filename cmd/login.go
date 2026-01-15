@@ -160,10 +160,32 @@ func runInteractiveLogin() {
 	fmt.Println("\n✅ Authentication successful! This machine is now connected to the fabric.")
 }
 
+// getTailscalePath returns the path to the tailscale CLI binary
+// Checks: PATH first, then platform-specific locations
+func getTailscalePath() string {
+	if path, err := exec.LookPath("tailscale"); err == nil {
+		return path
+	}
+	// macOS: Check Homebrew and App Store locations
+	if platform.IsDarwin() {
+		macPaths := []string{
+			"/opt/homebrew/bin/tailscale",                        // Homebrew (Apple Silicon)
+			"/usr/local/bin/tailscale",                           // Homebrew (Intel)
+			"/Applications/Tailscale.app/Contents/MacOS/Tailscale", // App Store
+		}
+		for _, p := range macPaths {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return "" // Not found
+}
+
 // ensureTailscaleInstalled checks if Tailscale is installed and installs it if not
 func ensureTailscaleInstalled() error {
-	// Check if tailscale command exists
-	if _, err := exec.LookPath("tailscale"); err == nil {
+	// Check if tailscale is available (PATH or macOS App Store)
+	if getTailscalePath() != "" {
 		return nil // Already installed
 	}
 
@@ -209,17 +231,25 @@ func joinTailscaleNetwork(nodeName, authkey string) error {
 
 // tailscaleLogout logs out of Tailscale (ignoring errors)
 func tailscaleLogout() {
+	tsPath := getTailscalePath()
+	if tsPath == "" {
+		return // Tailscale not installed, nothing to logout
+	}
 	if platform.IsWindows() {
-		exec.Command("tailscale", "logout").Run()
+		exec.Command(tsPath, "logout").Run()
 	} else {
-		exec.Command("sudo", "tailscale", "logout").Run()
+		exec.Command("sudo", tsPath, "logout").Run()
 	}
 }
 
 // tailscaleUpCommand builds the tailscale up command for the platform
 func tailscaleUpCommand(nodeName, authkey string) *exec.Cmd {
+	tsPath := getTailscalePath()
+	if tsPath == "" {
+		tsPath = "tailscale" // Fallback to PATH lookup
+	}
 	if platform.IsWindows() {
-		return exec.Command("tailscale", "up",
+		return exec.Command(tsPath, "up",
 			"--login-server="+nexusURL,
 			"--authkey="+authkey,
 			"--hostname="+nodeName,
@@ -227,7 +257,7 @@ func tailscaleUpCommand(nodeName, authkey string) *exec.Cmd {
 			"--accept-dns",
 		)
 	}
-	return exec.Command("sudo", "tailscale", "up",
+	return exec.Command("sudo", tsPath, "up",
 		"--login-server="+nexusURL,
 		"--authkey="+authkey,
 		"--hostname="+nodeName,
