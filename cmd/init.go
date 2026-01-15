@@ -79,6 +79,9 @@ interactively or with flags for automation.`,
 		// If device authorization was selected, run the flow immediately
 		// This shows the authorization box first, before other setup prompts
 		var deviceAuthToken *nexus.TokenResponse
+		var earlyNetworkConnected bool
+		var nodeName string // Declare early for reuse throughout init
+
 		if choice == nexus.NetChoiceDevice {
 			deviceAuthToken, err = runDeviceAuthFlow(authServiceURL)
 			if err != nil {
@@ -87,15 +90,73 @@ interactively or with flags for automation.`,
 				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
 				os.Exit(1)
 			}
+
+			// Immediately connect to network after device auth succeeds
+			fmt.Println("\n--- 🌐 Connecting to network ---")
+
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := ensureTailscaleInstalled(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Joining network as '%s'...\n", nodeName)
+			if err := joinTailscaleNetwork(nodeName, deviceAuthToken.Authkey); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ Successfully connected to the AceTeam network!")
+			earlyNetworkConnected = true
+
+			fmt.Println("\n--- Continuing with node setup ---")
+		}
+
+		// Also connect early when authkey is provided via flag
+		if choice == nexus.NetChoiceAuthkey && key != "" && !earlyNetworkConnected {
+			fmt.Println("\n--- 🌐 Connecting to network ---")
+
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := ensureTailscaleInstalled(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Joining network as '%s'...\n", nodeName)
+			if err := joinTailscaleNetwork(nodeName, key); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ Successfully connected to the AceTeam network!")
+			earlyNetworkConnected = true
+
 			fmt.Println("\n--- Continuing with node setup ---")
 		}
 
 		// Handle --network-only: just join network and exit
 		if initNetworkOnly {
-			nodeName, err := getNodeName()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
-				os.Exit(1)
+			// If we already connected early, just exit
+			if earlyNetworkConnected {
+				fmt.Printf("Node name: %s\n", nodeName)
+				return
+			}
+
+			// Get node name if not already set
+			if nodeName == "" {
+				nodeName, err = getNodeName()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+					os.Exit(1)
+				}
 			}
 
 			// Install Tailscale if needed
@@ -133,10 +194,13 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
-		nodeName, err := getNodeName()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
-			os.Exit(1)
+		// Get node name if not already set during early network connection
+		if nodeName == "" {
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		if !initVerbose {
@@ -220,8 +284,8 @@ interactively or with flags for automation.`,
 		}
 
 		// Tailscale is only needed if we're connecting to the network
-		// If user chose to skip network, don't install Tailscale yet
-		if choice != nexus.NetChoiceSkip {
+		// Skip if already installed during early network connection or user chose to skip
+		if choice != nexus.NetChoiceSkip && !earlyNetworkConnected {
 			provisionSteps = append(provisionSteps,
 				struct {
 					name     string
@@ -276,32 +340,34 @@ interactively or with flags for automation.`,
 			return
 		}
 
-		if choice == nexus.NetChoiceVerified {
-			fmt.Println("\n✅ Node is provisioned. Since you are already logged in, services will start now.")
+		if choice == nexus.NetChoiceVerified || earlyNetworkConnected {
+			fmt.Println("\n✅ Node is provisioned. Network is connected, services will start now.")
 		} else {
 			fmt.Println("\n✅ Node is provisioned. Now connecting to the network...")
 		}
 
 		executablePath, _ := os.Executable()
 
-		// Join the network if we have an authkey (device auth or provided key)
-		var authKey string
-		if choice == nexus.NetChoiceDevice {
-			authKey = deviceAuthToken.Authkey
-		} else if key != "" {
-			authKey = key
-		}
+		// Join the network if we have an authkey and haven't connected early
+		if !earlyNetworkConnected {
+			var authKey string
+			if choice == nexus.NetChoiceDevice {
+				authKey = deviceAuthToken.Authkey
+			} else if key != "" {
+				authKey = key
+			}
 
-		if authKey != "" {
-			fmt.Println("--- 🌐 Joining network ---")
-			loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
-			loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
-			loginCmd := exec.Command("sudo", "sh", "-c", loginCmdString)
-			loginCmd.Stdout = os.Stdout
-			loginCmd.Stderr = os.Stderr
-			if err := loginCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel login' command failed: %v\n", err)
-				os.Exit(1)
+			if authKey != "" {
+				fmt.Println("--- 🌐 Joining network ---")
+				loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
+				loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
+				loginCmd := exec.Command("sudo", "sh", "-c", loginCmdString)
+				loginCmd.Stdout = os.Stdout
+				loginCmd.Stderr = os.Stderr
+				if err := loginCmd.Run(); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ 'citadel login' command failed: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		}
 
