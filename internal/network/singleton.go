@@ -140,6 +140,24 @@ func GetGlobalStatus(ctx context.Context) (*NetworkStatus, error) {
 	return s.Status(ctx)
 }
 
+// GetGlobalPeers returns the list of peers from the global server.
+func GetGlobalPeers(ctx context.Context) ([]PeerInfo, error) {
+	s := Global()
+	if s == nil {
+		return nil, fmt.Errorf("not connected to network")
+	}
+	return s.GetPeers(ctx)
+}
+
+// PingPeer pings a peer via the global server.
+func PingPeer(ctx context.Context, ip string) (latencyMs float64, connType string, relay string, err error) {
+	s := Global()
+	if s == nil {
+		return 0, "", "", fmt.Errorf("not connected")
+	}
+	return s.PingPeer(ctx, ip)
+}
+
 // VerifyOrReconnect checks connection and reconnects if state exists but not connected.
 // Returns (connected, error). No error if simply not logged in.
 func VerifyOrReconnect(ctx context.Context) (bool, error) {

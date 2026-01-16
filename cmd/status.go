@@ -71,11 +71,12 @@ and the state of all managed services.`,
 
 		headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
 		printNetworkInfo(w, manifest)
+		printPeerInfo(w)
 
-		// Only show Redis section if configured
+		// Only show Job Queue section if configured
 		if os.Getenv("REDIS_URL") != "" {
-			headerColor.Fprintln(w, "\n📬 REDIS QUEUE")
-			printRedisInfo(w)
+			headerColor.Fprintln(w, "\n📋 JOB QUEUE")
+			printJobQueueInfo(w)
 		}
 
 		headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
@@ -259,7 +260,76 @@ func printNetworkInfo(w *tabwriter.Writer, manifest *CitadelManifest) {
 	}
 }
 
-func printRedisInfo(w *tabwriter.Writer) {
+func printPeerInfo(w *tabwriter.Writer) {
+	// Only show peers if we're connected
+	if !network.HasState() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Get our own IP to filter ourselves out of peer list
+	myIP, _ := network.GetGlobalIPv4()
+
+	peers, err := network.GetGlobalPeers(ctx)
+	if err != nil {
+		// Silently skip if we can't get peers (e.g., not connected)
+		return
+	}
+
+	// Filter out ourselves from the peer list
+	var otherPeers []network.PeerInfo
+	for _, peer := range peers {
+		if peer.IP != myIP {
+			otherPeers = append(otherPeers, peer)
+		}
+	}
+
+	if len(otherPeers) == 0 {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Peers"), "(no other nodes on network)")
+		return
+	}
+
+	fmt.Fprintf(w, "  %s:\n", labelColor.Sprint("Peers"))
+	for _, peer := range otherPeers {
+		statusStr := badColor.Sprint("⚫")
+		extraInfo := ""
+
+		if peer.Online {
+			statusStr = goodColor.Sprint("🟢")
+
+			// Ping online peers (with short timeout)
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			latency, connType, relay, err := network.PingPeer(pingCtx, peer.IP)
+			pingCancel()
+
+			if err == nil {
+				extraInfo = fmt.Sprintf(" %.0fms", latency)
+				if connType == "relay" && relay != "" {
+					extraInfo += fmt.Sprintf(" [relay:%s]", relay)
+				} else if connType == "direct" {
+					extraInfo += " [direct]"
+				}
+			}
+
+			// Add OS if available
+			if peer.OS != "" {
+				extraInfo += fmt.Sprintf(" (%s)", peer.OS)
+			}
+		}
+
+		// Show hostname and IP
+		peerDisplay := peer.Hostname
+		if peer.IP != "" {
+			peerDisplay = fmt.Sprintf("%s %s", peer.Hostname, peer.IP)
+		}
+
+		fmt.Fprintf(w, "    %s %s%s\n", statusStr, peerDisplay, extraInfo)
+	}
+}
+
+func printJobQueueInfo(w *tabwriter.Writer) {
 	// Get Redis URL from environment (same as work command)
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -276,6 +346,9 @@ func printRedisInfo(w *tabwriter.Writer) {
 	if consumerGroup == "" {
 		consumerGroup = "citadel-workers"
 	}
+
+	// Extract just the channel/tag part for display (e.g., "gpu-general" from "jobs:v1:gpu-general")
+	channel := extractChannelName(queueName)
 
 	// Connect to Redis
 	opts, err := redis.ParseURL(redisURL)
@@ -300,22 +373,22 @@ func printRedisInfo(w *tabwriter.Writer) {
 		return
 	}
 
-	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), goodColor.Sprint("🟢 Connected"))
-	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Queue"), queueName)
+	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), goodColor.Sprint("🟢 Listening"))
+	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Channel"), channel)
 
-	// Get queue length (XLEN)
+	// Get queue length (XLEN) - displayed as "Pending Jobs"
 	queueLen, err := client.XLen(ctx, queueName).Result()
 	if err == nil {
-		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("Queue Length"), queueLen)
+		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("Pending Jobs"), queueLen)
 	}
 
-	// Get pending count (XPENDING)
+	// Get in-progress count (XPENDING)
 	pending, err := client.XPending(ctx, queueName, consumerGroup).Result()
 	if err == nil && pending != nil {
-		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("Pending"), pending.Count)
+		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("In Progress"), pending.Count)
 	}
 
-	// Get DLQ count
+	// Get DLQ count - displayed as "Failed Jobs"
 	dlqName := getDLQName(queueName)
 	dlqLen, err := client.XLen(ctx, dlqName).Result()
 	if err == nil {
@@ -323,8 +396,17 @@ func printRedisInfo(w *tabwriter.Writer) {
 		if dlqLen > 0 {
 			colorFn = warnColor
 		}
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("DLQ Count"), colorFn.Sprintf("%d", dlqLen))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Failed Jobs"), colorFn.Sprintf("%d", dlqLen))
 	}
+}
+
+func extractChannelName(queueName string) string {
+	// "jobs:v1:gpu-general" → "gpu-general"
+	parts := strings.Split(queueName, ":")
+	if len(parts) >= 3 {
+		return parts[len(parts)-1]
+	}
+	return queueName
 }
 
 func getDLQName(queueName string) string {

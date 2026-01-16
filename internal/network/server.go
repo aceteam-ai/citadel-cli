@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"tailscale.com/client/tailscale"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
@@ -336,4 +337,124 @@ type NetworkStatus struct {
 	IPv4         string `json:"ipv4,omitempty"`
 	IPv6         string `json:"ipv6,omitempty"`
 	ControlURL   string `json:"control_url"`
+}
+
+// PeerInfo represents information about a peer node on the network.
+type PeerInfo struct {
+	Hostname   string  `json:"hostname"`
+	DNSName    string  `json:"dns_name,omitempty"`
+	IP         string  `json:"ip,omitempty"`
+	Online     bool    `json:"online"`
+	OS         string  `json:"os,omitempty"`
+	LastSeen   string  `json:"last_seen,omitempty"`
+	ExitNode   bool    `json:"exit_node,omitempty"`
+	ShareeFor  string  `json:"sharee_for,omitempty"` // If shared by another user
+	LatencyMs  float64 `json:"latency_ms,omitempty"` // Ping latency in milliseconds
+	Connection string  `json:"connection,omitempty"` // "direct" or "relay"
+	Relay      string  `json:"relay,omitempty"`      // DERP region code if relay
+}
+
+// GetPeers returns a list of peer nodes on the network.
+// Only returns peers belonging to the same user/organization.
+func (s *NetworkServer) GetPeers(ctx context.Context) ([]PeerInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.srv == nil {
+		return nil, fmt.Errorf("not connected to network")
+	}
+
+	lc, err := s.srv.LocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local client: %w", err)
+	}
+
+	status, err := lc.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status: %w", err)
+	}
+
+	// Get current user's ID to filter peers to same org
+	var selfUserID tailcfg.UserID
+	if status.Self != nil {
+		selfUserID = status.Self.UserID
+	}
+
+	peers := make([]PeerInfo, 0, len(status.Peer))
+	for _, peer := range status.Peer {
+		if peer == nil {
+			continue
+		}
+
+		// Filter: only show peers from the same user/org
+		// If selfUserID is 0 (unknown), show all peers as fallback
+		if selfUserID != 0 && peer.UserID != selfUserID {
+			continue
+		}
+
+		info := PeerInfo{
+			Hostname: peer.HostName,
+			DNSName:  peer.DNSName,
+			Online:   peer.Online,
+			OS:       peer.OS,
+			ExitNode: peer.ExitNode,
+		}
+
+		// Get the first IPv4 address if available
+		for _, ip := range peer.TailscaleIPs {
+			if ip.Is4() {
+				info.IP = ip.String()
+				break
+			}
+		}
+
+		// Format last seen time
+		if !peer.LastSeen.IsZero() {
+			info.LastSeen = peer.LastSeen.Format("2006-01-02 15:04:05")
+		}
+
+		// Check if shared by another user
+		if peer.ShareeNode {
+			info.ShareeFor = "shared"
+		}
+
+		peers = append(peers, info)
+	}
+
+	return peers, nil
+}
+
+// PingPeer pings a peer and returns latency and connection info.
+func (s *NetworkServer) PingPeer(ctx context.Context, ip string) (latencyMs float64, connType string, relay string, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.srv == nil {
+		return 0, "", "", fmt.Errorf("not connected")
+	}
+
+	lc, err := s.srv.LocalClient()
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	result, err := lc.Ping(ctx, addr, tailcfg.PingDisco)
+	if err != nil {
+		return 0, "", "", err
+	}
+
+	latencyMs = result.LatencySeconds * 1000
+	if result.DERPRegionCode != "" {
+		connType = "relay"
+		relay = result.DERPRegionCode
+	} else if result.Endpoint != "" {
+		connType = "direct"
+	}
+
+	return latencyMs, connType, relay, nil
 }
