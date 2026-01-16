@@ -3,12 +3,12 @@ package status
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -85,28 +85,19 @@ func (c *Collector) collectNodeInfo() NodeInfo {
 		UptimeSeconds: int64(time.Since(c.startTime).Seconds()),
 	}
 
-	// Get Tailscale IP
-	info.TailscaleIP = c.getTailscaleIP()
+	// Get Network IP
+	info.TailscaleIP = c.getNetworkIP()
 
 	return info
 }
 
-// getTailscaleIP retrieves the node's Tailscale IP address.
-func (c *Collector) getTailscaleIP() string {
-	tailscaleCLI := "tailscale"
-	if platform.IsWindows() {
-		fullPath := `C:\Program Files\Tailscale\tailscale.exe`
-		if _, err := os.Stat(fullPath); err == nil {
-			tailscaleCLI = fullPath
-		}
-	}
-
-	cmd := exec.Command(tailscaleCLI, "ip", "-4")
-	output, err := cmd.Output()
+// getNetworkIP retrieves the node's AceTeam Network IP address.
+func (c *Collector) getNetworkIP() string {
+	ip, err := network.GetGlobalIPv4()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(output))
+	return ip
 }
 
 // collectSystemMetrics gathers CPU, memory, and disk utilization.

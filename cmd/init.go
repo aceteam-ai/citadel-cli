@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,7 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -61,10 +64,10 @@ interactively or with flags for automation.`,
 		}
 		fmt.Println("✅ Running with root privileges.")
 
-		// Check if already connected to Tailscale and logout to start fresh
-		if nexus.IsTailscaleConnected() {
-			fmt.Println("--- 🔌 Existing Tailscale connection detected ---")
-			if err := nexus.TailscaleLogout(); err != nil {
+		// Check if already connected to network and logout to start fresh
+		if network.IsGlobalConnected() {
+			fmt.Println("--- 🔌 Existing network connection detected ---")
+			if err := network.Logout(); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: %v\n", err)
 				// Continue anyway - we'll try to connect with new credentials
 			}
@@ -92,7 +95,7 @@ interactively or with flags for automation.`,
 			}
 
 			// Immediately connect to network after device auth succeeds
-			fmt.Println("\n--- 🌐 Connecting to network ---")
+			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
 
 			nodeName, err = getNodeName()
 			if err != nil {
@@ -100,17 +103,12 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 
-			if err := ensureTailscaleInstalled(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
+			fmt.Printf("Connecting as '%s'...\n", nodeName)
+			if err := connectToNetwork(nodeName, deviceAuthToken.Authkey); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
-
-			fmt.Printf("Joining network as '%s'...\n", nodeName)
-			if err := joinTailscaleNetwork(nodeName, deviceAuthToken.Authkey); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("✅ Successfully connected to the AceTeam network!")
+			fmt.Println("✅ Successfully connected to the AceTeam Network!")
 			earlyNetworkConnected = true
 
 			fmt.Println("\n--- Continuing with node setup ---")
@@ -118,7 +116,7 @@ interactively or with flags for automation.`,
 
 		// Also connect early when authkey is provided via flag
 		if choice == nexus.NetChoiceAuthkey && key != "" && !earlyNetworkConnected {
-			fmt.Println("\n--- 🌐 Connecting to network ---")
+			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
 
 			nodeName, err = getNodeName()
 			if err != nil {
@@ -126,17 +124,12 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 
-			if err := ensureTailscaleInstalled(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
+			fmt.Printf("Connecting as '%s'...\n", nodeName)
+			if err := connectToNetwork(nodeName, key); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
-
-			fmt.Printf("Joining network as '%s'...\n", nodeName)
-			if err := joinTailscaleNetwork(nodeName, key); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("✅ Successfully connected to the AceTeam network!")
+			fmt.Println("✅ Successfully connected to the AceTeam Network!")
 			earlyNetworkConnected = true
 
 			fmt.Println("\n--- Continuing with node setup ---")
@@ -159,12 +152,6 @@ interactively or with flags for automation.`,
 				}
 			}
 
-			// Install Tailscale if needed
-			if err := ensureTailscaleInstalled(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ Failed to install Tailscale: %v\n", err)
-				os.Exit(1)
-			}
-
 			// Determine authkey to use
 			var authkeyToUse string
 			if choice == nexus.NetChoiceDevice && deviceAuthToken != nil {
@@ -174,12 +161,12 @@ interactively or with flags for automation.`,
 			}
 
 			if authkeyToUse != "" {
-				fmt.Printf("Joining network as '%s'...\n", nodeName)
-				if err := joinTailscaleNetwork(nodeName, authkeyToUse); err != nil {
-					fmt.Fprintf(os.Stderr, "❌ Failed to join network: %v\n", err)
+				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
+				if err := connectToNetwork(nodeName, authkeyToUse); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 					os.Exit(1)
 				}
-				fmt.Println("\n✅ Successfully joined the AceTeam network!")
+				fmt.Println("\n✅ Successfully connected to the AceTeam Network!")
 			} else if choice != nexus.NetChoiceSkip {
 				fmt.Println("⚠️  No authkey available. Run 'citadel login' to complete network setup.")
 			}
@@ -283,17 +270,8 @@ interactively or with flags for automation.`,
 			)
 		}
 
-		// Tailscale is only needed if we're connecting to the network
-		// Skip if already installed during early network connection or user chose to skip
-		if choice != nexus.NetChoiceSkip && !earlyNetworkConnected {
-			provisionSteps = append(provisionSteps,
-				struct {
-					name     string
-					checkCmd string
-					run      func() error
-				}{"Tailscale", "tailscale", installTailscale},
-			)
-		}
+		// Note: Network connectivity is now handled via embedded tsnet library
+		// No external Tailscale installation is needed
 
 		for _, step := range provisionSteps {
 			if initVerbose {
@@ -322,9 +300,6 @@ interactively or with flags for automation.`,
 		// Clarify what was skipped
 		if selectedService == "none" {
 			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
-		}
-		if choice == nexus.NetChoiceSkip {
-			fmt.Println("   ℹ️  Tailscale installation was skipped (network connection will be set up later).")
 		}
 
 		// --- 3. Final Handoff ---
@@ -936,85 +911,29 @@ func configureNvidiaDocker() error {
 	return dockerMgr.ConfigureRuntime()
 }
 
-func installTailscale() error {
-	if platform.IsWindows() {
-		if initVerbose {
-			fmt.Println("     - Installing Tailscale via winget...")
-		}
-		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+// connectToNetwork connects to the AceTeam Network using the embedded tsnet library.
+// No external Tailscale installation is required.
+func connectToNetwork(nodeName, authKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
-		output, err := cmd.CombinedOutput()
-		alreadyInstalled := false
-		if err != nil {
-			outputStr := string(output)
-			// Check if it's already installed
-			if strings.Contains(outputStr, "already installed") ||
-			   strings.Contains(outputStr, "No applicable upgrade found") ||
-			   strings.Contains(outputStr, "No available upgrade found") {
-				if initVerbose {
-					fmt.Println("     ✅ Tailscale is already installed.")
-				}
-				alreadyInstalled = true
-			} else {
-				// Show helpful error message
-				if initVerbose {
-					fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
-				}
-				return fmt.Errorf("winget install failed: %w", err)
-			}
-		}
-
-		// Start the Tailscale service now while we have Administrator privileges
-		// This ensures the service is running before we hand off to 'citadel up'
-		if initVerbose {
-			fmt.Println("     - Ensuring Tailscale service is started...")
-		}
-		startCmd := exec.Command("net", "start", "Tailscale")
-		startOutput, startErr := startCmd.CombinedOutput()
-		startOutputStr := string(startOutput)
-
-		if startErr == nil {
-			if initVerbose {
-				fmt.Println("     ✅ Tailscale service started successfully.")
-			}
-		} else if strings.Contains(startOutputStr, "already") || strings.Contains(startOutputStr, "started") {
-			if initVerbose {
-				fmt.Println("     ✅ Tailscale service is already running.")
-			}
-		} else if alreadyInstalled {
-			// If Tailscale was already installed but service won't start, it might be running already
-			// Check with tailscale status
-			statusCmd := exec.Command("tailscale", "status")
-			if statusCmd.Run() == nil {
-				if initVerbose {
-					fmt.Println("     ✅ Tailscale is responding to status checks.")
-				}
-			} else if initVerbose {
-				fmt.Printf("     ⚠️  Warning: Could not verify Tailscale service status: %s\n", startOutputStr)
-			}
-		} else if initVerbose {
-			fmt.Printf("     ⚠️  Warning: Could not start Tailscale service: %s\n", startOutputStr)
-		}
-
-		return nil
+	config := network.ServerConfig{
+		Hostname:   nodeName,
+		ControlURL: nexusURL, // From root.go
+		AuthKey:    authKey,
 	}
 
-	if initVerbose {
-		fmt.Println("     - Running Tailscale install script...")
+	srv, err := network.Connect(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	script := "curl -fsSL https://tailscale.com/install.sh | sh"
-	cmd := exec.Command("sh", "-c", script)
-
-	if initVerbose {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	} else {
-		cmd.Stdout = nil
-		cmd.Stderr = nil
+	ip, _ := srv.GetIPv4()
+	if ip != "" {
+		fmt.Printf("   IP: %s\n", ip)
 	}
 
-	return cmd.Run()
+	return nil
 }
 
 type DockerPsResult struct {
