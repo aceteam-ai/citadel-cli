@@ -14,27 +14,46 @@ The terminal service creates a WebSocket server that:
 ## Quick Start
 
 ```bash
-# Start the terminal server (requires org-id)
+# Start using org-id from manifest (set during 'citadel init')
+citadel terminal-server
+
+# Start with explicit organization ID
 citadel terminal-server --org-id my-org-id
 
 # Start on a custom port
-citadel terminal-server --org-id my-org-id --port 8080
+citadel terminal-server --port 8080
 
 # Start with custom idle timeout (in minutes)
-citadel terminal-server --org-id my-org-id --idle-timeout 60
+citadel terminal-server --idle-timeout 60
+
+# Start in test mode (accepts any token, for development)
+citadel terminal-server --test
+
+# Integrated with citadel work command
+citadel work --mode=nexus --terminal --terminal-port 7860
 ```
 
 ## Configuration
 
 ### Command-Line Flags
 
+**Standalone Terminal Server (`citadel terminal-server`):**
+
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--org-id` | Organization ID for token validation (required) | - |
+| `--org-id` | Organization ID for token validation | From manifest |
 | `--port` | WebSocket server port | 7860 |
 | `--idle-timeout` | Session idle timeout in minutes | 30 |
 | `--shell` | Shell to use for sessions | Platform-specific |
 | `--max-connections` | Maximum concurrent sessions | 10 |
+| `--test` | Test mode - accepts any token (for development) | false |
+
+**Integrated with Work Command (`citadel work`):**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--terminal` | Enable terminal WebSocket server | false |
+| `--terminal-port` | Terminal server port | 7860 |
 
 ### Environment Variables
 
@@ -46,6 +65,7 @@ citadel terminal-server --org-id my-org-id --idle-timeout 60
 | `CITADEL_TERMINAL_MAX_CONNECTIONS` | Max concurrent sessions | 10 |
 | `CITADEL_TERMINAL_SHELL` | Shell to spawn | Platform default |
 | `CITADEL_AUTH_HOST` | Authentication service URL | https://aceteam.ai |
+| `CITADEL_TOKEN_REFRESH_INTERVAL` | Token cache refresh interval in minutes | 60 |
 
 ### Platform Defaults
 
@@ -74,21 +94,126 @@ citadel terminal-server --org-id my-org-id --idle-timeout 60
                                        └─────────────────────┘
 ```
 
+## Integration with Work Command
+
+The terminal server can be started as part of `citadel work`, running alongside job processing:
+
+```bash
+# Start worker with terminal server enabled
+citadel work --mode=nexus --terminal
+
+# With custom terminal port
+citadel work --mode=nexus --terminal --terminal-port 8080
+
+# Combined with other work features
+citadel work --mode=nexus --terminal --heartbeat --ssh-sync
+```
+
+**Architecture (Integrated Mode):**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    citadel work --terminal                    │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌────────────────┐  ┌────────────────┐  ┌───────────────┐  │
+│  │  Job Worker    │  │  Terminal      │  │  Heartbeat    │  │
+│  │  (Nexus/Redis) │  │  Server        │  │  Publisher    │  │
+│  └────────────────┘  └────────────────┘  └───────────────┘  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Notes:**
+- Uses org-id from manifest (must run `citadel init` first)
+- Token validation uses the same auth service as other work features
+- Terminal server runs in a goroutine alongside the main worker loop
+
 ## Authentication
+
+### Token Caching (CachingTokenValidator)
+
+In production mode, the terminal server uses a **caching token validator** to avoid API calls on every connection:
+
+```
+┌─────────────────┐                    ┌─────────────────────┐
+│  Client         │                    │  Terminal Server    │
+│  (with token)   │ ──────────────────►│                     │
+└─────────────────┘                    │  1. Hash token      │
+                                       │  2. Check cache     │
+                                       │  3. If found: allow │
+                                       └─────────┬───────────┘
+                                                 │
+                  Background refresh (hourly)    │
+                                                 ▼
+                                       ┌─────────────────────┐
+                                       │  AceTeam API        │
+                                       │  (token list)       │
+                                       └─────────────────────┘
+```
+
+**How It Works:**
+
+1. On startup, the server fetches all valid token **hashes** from the API
+2. Incoming tokens are hashed with SHA-256 and compared locally (no API call)
+3. The cache is refreshed hourly (configurable via `CITADEL_TOKEN_REFRESH_INTERVAL`)
+4. On cache miss, an immediate refresh is triggered before rejecting
+5. Exponential backoff (1s → 5min) is used on API failures
+
+**Benefits:**
+- Fast validation (no network round-trip per connection)
+- Reduced load on the auth service
+- Continues working during brief API outages
 
 ### Token Validation Flow
 
 1. Client connects to `/terminal?token=<token>`
-2. Server validates token via `GET /api/fabric/terminal/tokens/{orgId}` on the auth service
-3. Auth service returns token info (user ID, permissions, expiration)
-4. On success: PTY session is created
-5. On failure: Connection is closed with error message
+2. Server hashes token with SHA-256 and checks local cache
+3. If cache miss: refreshes from API and checks again
+4. On cache hit: validates org ID and expiration
+5. On success: PTY session is created
+6. On failure: Connection is closed with error message
 
-### Implementing Token Validation
+### Test Mode
 
-Your auth service must implement:
+For development and testing, use the `--test` flag:
 
-**Endpoint:** `GET ${CITADEL_AUTH_HOST}/api/fabric/terminal/tokens/{orgId}`
+```bash
+citadel terminal-server --test
+```
+
+In test mode:
+- Accepts `test-token` as a valid token
+- No auth service connection required
+- **Not for production use**
+
+### Implementing Token Validation (API Requirements)
+
+Your auth service must implement two endpoints:
+
+**1. Token List Endpoint (for caching):**
+
+`GET ${CITADEL_AUTH_HOST}/api/fabric/terminal/tokens/{orgId}`
+
+Returns SHA-256 hashes of all valid tokens for the organization.
+
+**Response (200 OK):**
+```json
+{
+  "tokens": [
+    {
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "user_id": "user-123",
+      "org_id": "org-456",
+      "expires_at": "2024-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+**2. Single Token Validation (fallback):**
+
+`GET ${CITADEL_AUTH_HOST}/api/fabric/terminal/tokens/{orgId}`
 
 **Headers:**
 - `Authorization: Bearer <token>`
