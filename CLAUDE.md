@@ -200,10 +200,43 @@ Citadel uses embedded tsnet (Tailscale's Go library) to create a secure WireGuar
 
 **Network State**: Connection state is stored in `~/.citadel-node/network/` and persists across restarts.
 
+**Tailscale/tsnet Interoperability**: Citadel nodes (using embedded tsnet) work alongside regular Tailscale CLI clients on the same Headscale network. Both implement the same Tailscale v2 control protocol:
+
+```
+                    Nexus (Headscale)
+                   nexus.aceteam.ai
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+    Citadel Node    Tailscale CLI    Other tsnet
+    (embedded tsnet) (system-wide)    applications
+```
+
+| | Citadel (tsnet) | Tailscale CLI |
+|---|---|---|
+| Root required | No (userspace networking) | Yes (system VPN) |
+| Scope | Per-application | System-wide |
+| State directory | `~/.citadel-node/network/` | `/var/lib/tailscale/` |
+| Protocol | Tailscale v2 + WireGuard | Tailscale v2 + WireGuard |
+
+Both can coexist on the same machine (separate state directories) and reach each other on the mesh network.
+
 ### Provisioning Flow (`citadel init`)
 
-By default, `citadel init` runs with minimal output. Use `--verbose` flag to see detailed provisioning steps.
+By default, `citadel init` only joins the network (no sudo required). Use `--provision` for full system provisioning.
 
+```bash
+citadel init                    # Default: network-only (no sudo)
+sudo citadel init --provision   # Full provisioning (requires sudo)
+```
+
+**Default Mode (network-only):**
+1. Prompts for device authorization or accepts `--authkey`
+2. Connects to AceTeam Network using embedded tsnet
+3. Services can be configured later via AceTeam web management page
+
+**Full Provisioning Mode (`--provision`):**
 1. **Network Choice**: Checks if already connected to AceTeam Network, prompts for device authorization/authkey/skip
 2. **Service Selection**: Interactive prompt or `--service` flag to choose inference engine
 3. **Node Naming**: Prompts for node name or uses `--node-name` flag
@@ -222,6 +255,8 @@ By default, `citadel init` runs with minimal output. Use `--verbose` flag to see
    - `services/*.yml` Docker Compose files
 6. **Network Connection**: Connects to AceTeam Network using tsnet if authkey provided
 7. **Service Startup**: Runs `citadel run` to start configured services
+
+Use `--verbose` flag to see detailed output during provisioning.
 
 ### Agent Loop (Nexus HTTP Polling)
 
