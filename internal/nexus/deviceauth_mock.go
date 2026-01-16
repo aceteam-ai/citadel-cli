@@ -10,10 +10,11 @@ import (
 
 // MockDeviceAuthServer provides a mock HTTP server for testing device authorization flow
 type MockDeviceAuthServer struct {
-	server     *httptest.Server
-	pollCount  int
-	pollMutex  sync.Mutex
+	server            *httptest.Server
+	pollCount         int
+	pollMutex         sync.Mutex
 	pollsUntilSuccess int
+	lastHostname      string
 }
 
 // StartMockDeviceAuthServer creates and starts a mock device authorization server
@@ -41,6 +42,14 @@ func (m *MockDeviceAuthServer) handleStart(w http.ResponseWriter, r *http.Reques
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Decode request to capture hostname
+	var req StartFlowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+		m.pollMutex.Lock()
+		m.lastHostname = req.Hostname
+		m.pollMutex.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -106,4 +115,11 @@ func (m *MockDeviceAuthServer) GetPollCount() int {
 	m.pollMutex.Lock()
 	defer m.pollMutex.Unlock()
 	return m.pollCount
+}
+
+// GetLastHostname returns the hostname from the last StartFlow request
+func (m *MockDeviceAuthServer) GetLastHostname() string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return m.lastHostname
 }

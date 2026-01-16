@@ -139,7 +139,8 @@ Built with Cobra. Main command files are in `cmd/`:
 - `init.go`: Provisions fresh servers (installs deps, generates config, connects to network)
 - `up.go`: Brings node online, starts services, runs agent loop
 - `agent.go`: Long-running job dispatcher that polls Nexus for work
-- `work.go`: Unified worker for Redis Streams (private cloud) or Nexus (on-prem)
+- `work.go`: Unified worker for Redis Streams (private cloud) or Nexus (on-prem), with optional terminal server
+- `terminal_server.go`: Standalone WebSocket terminal server for remote access
 - `status.go`: Health check dashboard (system vitals, GPU, network, services)
 - `login.go`: Interactive AceTeam Network authentication
 - `logout.go`: Disconnect from AceTeam Network
@@ -185,6 +186,7 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 - **`internal/heartbeat/`**: Status publishing (HTTP to AceTeam API, Redis Pub/Sub + Streams)
 - **`internal/status/`**: System metrics collection (CPU, memory, GPU, services)
 - **`internal/redis/`**: Redis Streams client for job queue
+- **`internal/terminal/`**: WebSocket terminal server with PTY management and token caching
 - **`internal/ui/`**: Interactive prompts using survey library
 - **`services/`**: Embedded Docker Compose files and service registry
 
@@ -351,6 +353,47 @@ Handles device configuration from onboarding wizard. Config fields:
 - `customTags`: Tags for node classification
 - `healthMonitoringEnabled`, `alertOnOffline`, `alertOnHighTemp`: Monitoring settings
 
+### Terminal Service
+
+The terminal service provides WebSocket-based terminal access to nodes. See [docs/terminal-service.md](docs/terminal-service.md) for full documentation.
+
+**Key Packages:**
+- **`internal/terminal/server.go`**: WebSocket server with rate limiting
+- **`internal/terminal/session.go`**: PTY session management (creack/pty)
+- **`internal/terminal/auth.go`**: Token validation (HTTP and caching validators)
+- **`internal/terminal/protocol.go`**: JSON message protocol
+
+**Running the Terminal Server:**
+```bash
+# Standalone (for testing)
+citadel terminal-server --test --port 7860
+
+# Integrated with work command (production)
+citadel work --mode=nexus --terminal --terminal-port 7860
+```
+
+**Token Caching (CachingTokenValidator):**
+
+The terminal server uses a caching validator to avoid API calls per connection:
+1. Fetches token hashes from API at startup and hourly
+2. Validates tokens locally via SHA-256 hash comparison
+3. Refreshes on cache miss before rejecting
+4. Exponential backoff (1s → 5min) on API failures
+
+```go
+// Create caching validator
+auth := terminal.NewCachingTokenValidator(baseURL, orgID, time.Hour)
+auth.Start()  // Starts background refresh
+defer auth.Stop()
+
+// Validate locally (no API call)
+info, err := auth.ValidateToken(token, orgID)
+```
+
+**Platform Support:**
+- Linux/macOS: Full PTY support via `creack/pty`
+- Windows: Not yet supported (requires ConPTY implementation)
+
 ## Important Implementation Notes
 
 ### Manifest Loading
@@ -389,6 +432,7 @@ Two auth flows supported:
    - User runs `citadel init` → CLI displays device code → User enters code at aceteam.ai/device
    - Implemented in `internal/nexus/deviceauth.go` and `internal/ui/devicecode.go`
    - Default/recommended flow for interactive use
+   - Sends machine hostname to API for device name auto-fill in web UI
 2. **Authkey**: Non-interactive, uses pre-generated single-use keys from Nexus admin panel
    - Supported via `--authkey` flag for automation/CI/CD
 

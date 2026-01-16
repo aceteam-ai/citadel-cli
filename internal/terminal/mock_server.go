@@ -2,6 +2,8 @@
 package terminal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -60,8 +62,32 @@ func StartMockAuthServer() *MockAuthServer {
 		}
 		orgID := pathParts[5]
 
-		// Get the authorization token
+		// Check for Authorization header
 		authHeader := r.Header.Get("Authorization")
+
+		// If no Authorization header, return list of token hashes (for CachingTokenValidator)
+		if authHeader == "" {
+			mock.mu.RLock()
+			var tokens []TokenHashEntry
+			for token, info := range mock.validTokens {
+				if info.OrgID == orgID {
+					h := sha256.Sum256([]byte(token))
+					tokens = append(tokens, TokenHashEntry{
+						Hash:      hex.EncodeToString(h[:]),
+						UserID:    info.UserID,
+						OrgID:     info.OrgID,
+						ExpiresAt: info.ExpiresAt,
+					})
+				}
+			}
+			mock.mu.RUnlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(TokensResponse{Tokens: tokens})
+			return
+		}
+
+		// Single token validation path (for HTTPTokenValidator)
 		if !strings.HasPrefix(authHeader, "Bearer ") {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
