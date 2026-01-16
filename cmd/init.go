@@ -118,7 +118,12 @@ interactively or with flags for automation.`,
 			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
 			os.Exit(1)
 		}
-		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService)
+		// Extract org-id from device auth token if available
+		orgID := ""
+		if deviceAuthToken != nil {
+			orgID = deviceAuthToken.OrgID
+		}
+		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService, orgID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to generate configuration files: %v\n", err)
 			os.Exit(1)
@@ -465,7 +470,7 @@ func createGlobalConfig(nodeConfigDir string) error {
 	return nil
 }
 
-func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
+func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, error) {
 	if initVerbose {
 		fmt.Println("--- 📝 Generating configuration files ---")
 	}
@@ -500,11 +505,13 @@ func generateCitadelConfig(user, nodeName, serviceName string) (string, error) {
 
 	manifest := CitadelManifest{
 		Node: struct {
-			Name string   `yaml:"name"`
-			Tags []string `yaml:"tags"`
+			Name  string   `yaml:"name"`
+			Tags  []string `yaml:"tags"`
+			OrgID string   `yaml:"org_id,omitempty"`
 		}{
-			Name: nodeName,
-			Tags: []string{"gpu", "provisioned-by-citadel"},
+			Name:  nodeName,
+			Tags:  []string{"gpu", "provisioned-by-citadel"},
+			OrgID: orgID,
 		},
 	}
 

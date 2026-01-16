@@ -30,6 +30,7 @@ type TokenResponse struct {
 	Authkey   string `json:"authkey"`
 	ExpiresIn int    `json:"expires_in"`
 	NexusURL  string `json:"nexus_url,omitempty"`
+	OrgID     string `json:"org_id,omitempty"`
 }
 
 // TokenError represents an error response from the /token endpoint

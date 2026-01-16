@@ -6,10 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/aceboss/citadel-cli/internal/platform"
+	"github.com/aceboss/citadel-cli/internal/terminal"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -78,6 +80,21 @@ In automated mode (with --authkey), it joins the network non-interactively.`,
 
 		if servicesOnly {
 			return // Exit before starting the agent
+		}
+
+		// Start terminal server if org-id is configured (non-Windows only)
+		if manifest.Node.OrgID != "" && runtime.GOOS != "windows" {
+			fmt.Println("--- Starting Terminal Server ---")
+			termConfig := terminal.DefaultConfig()
+			termConfig.OrgID = manifest.Node.OrgID
+			termConfig.AuthServiceURL = authServiceURL
+
+			termServer := terminal.NewServer(termConfig, terminal.NewHTTPTokenValidator(authServiceURL))
+			if err := termServer.Start(); err != nil {
+				fmt.Printf("   - ⚠️ Terminal server failed to start: %v\n", err)
+			} else {
+				fmt.Printf("   - ✅ Terminal server running on port %d\n", termConfig.Port)
+			}
 		}
 
 		// Start the agent as the final step

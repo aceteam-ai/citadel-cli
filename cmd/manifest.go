@@ -19,8 +19,9 @@ type Service struct {
 // CitadelManifest defines the structure of the citadel.yaml file.
 type CitadelManifest struct {
 	Node struct {
-		Name string   `yaml:"name"`
-		Tags []string `yaml:"tags"`
+		Name  string   `yaml:"name"`
+		Tags  []string `yaml:"tags"`
+		OrgID string   `yaml:"org_id,omitempty"`
 	} `yaml:"node"`
 	Services []Service `yaml:"services"`
 }

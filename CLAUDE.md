@@ -69,6 +69,7 @@ Built with Cobra. Main command files are in `cmd/`:
 - `run.go`: Ad-hoc service execution without manifest
 - `logs.go`: Service log streaming
 - `test.go`: Service diagnostic testing
+- `terminal_server.go`: WebSocket terminal server for remote browser-based access
 
 ### Core Architecture Patterns
 
@@ -93,6 +94,7 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 - **`cmd/`**: Cobra command implementations
 - **`internal/nexus/`**: HTTP client for Nexus API, network helpers for Tailscale operations
 - **`internal/jobs/`**: Job handler implementations (shell, inference, model download)
+- **`internal/terminal/`**: WebSocket terminal server for browser-based access
 - **`internal/ui/`**: Interactive prompts using survey library
 - **`services/`**: Embedded Docker Compose files and service registry
 
@@ -138,6 +140,36 @@ The agent (`citadel up` or `citadel agent`) runs continuously:
 5. Reports status back to Nexus with `{status: "SUCCESS"|"FAILURE", output: "..."}`
 
 Job handlers registered in `cmd/agent.go:init()` map job types to handler implementations.
+
+### Terminal Service Architecture
+
+The terminal service (`citadel terminal-server`) provides WebSocket-based remote terminal access for browser-based sessions through the AceTeam web app.
+
+**Key Files:**
+- `internal/terminal/config.go`: Configuration from env vars and flags
+- `internal/terminal/protocol.go`: WebSocket message types (input, output, resize, ping/pong)
+- `internal/terminal/auth.go`: Token validation against AceTeam API
+- `internal/terminal/ratelimit.go`: Per-IP rate limiting using `golang.org/x/time/rate`
+- `internal/terminal/session.go`: PTY session management using `creack/pty`
+- `internal/terminal/server.go`: WebSocket server and connection handling
+- `internal/terminal/mock_server.go`: Mock auth server for testing
+
+**Architecture Flow:**
+1. Client connects to `/terminal?token=<token>`
+2. Server validates token via `GET /api/fabric/terminal/tokens/{orgId}`
+3. On success: spawns PTY session with configured shell
+4. Two goroutines handle bidirectional streaming: PTY→WebSocket, WebSocket→PTY
+5. Idle sessions are closed after configurable timeout
+6. Graceful shutdown closes all sessions on SIGINT/SIGTERM
+
+**Platform Support:**
+- Linux/macOS: Full PTY support via `creack/pty` package
+- Windows: Not yet supported (requires ConPTY implementation)
+
+**Testing:**
+- Unit tests: `go test ./internal/terminal/... -v`
+- Mock auth server: `terminal.StartMockAuthServer()` for testing without backend
+- Mock token validator: `terminal.NewMockTokenValidator()` for unit tests
 
 ## Important Implementation Notes
 
