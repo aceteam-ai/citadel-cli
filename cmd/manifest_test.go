@@ -50,8 +50,9 @@ func TestWriteManifest(t *testing.T) {
 
 	manifest := &CitadelManifest{
 		Node: struct {
-			Name string   `yaml:"name"`
-			Tags []string `yaml:"tags"`
+			Name  string   `yaml:"name"`
+			Tags  []string `yaml:"tags"`
+			OrgID string   `yaml:"org_id,omitempty"`
 		}{
 			Name: "test-node",
 			Tags: []string{"test", "gpu"},
@@ -155,8 +156,9 @@ func TestAddServiceToManifest(t *testing.T) {
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 	initialManifest := &CitadelManifest{
 		Node: struct {
-			Name string   `yaml:"name"`
-			Tags []string `yaml:"tags"`
+			Name  string   `yaml:"name"`
+			Tags  []string `yaml:"tags"`
+			OrgID string   `yaml:"org_id,omitempty"`
 		}{
 			Name: "test-node",
 			Tags: []string{},

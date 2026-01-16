@@ -195,6 +195,35 @@ gh release create v1.2.0 \
 | `citadel nodes`                 | Connects to the Nexus API and lists all nodes in your compute fabric.                                                                        |
 | `citadel run --restart`         | Restarts all services defined in `citadel.yaml`.                                                                                             |
 | `citadel version`               | Prints the current version of the CLI.                                                                                                       |
+| `citadel terminal-server`       | Starts a WebSocket terminal server for remote browser-based terminal access.                                                                 |
+
+---
+
+## Terminal Service
+
+The Citadel Terminal Service provides WebSocket-based terminal access to nodes, enabling browser-based terminal sessions through the AceTeam web application.
+
+### Quick Start
+
+```bash
+# Start the terminal server (requires org-id)
+citadel terminal-server --org-id my-org-id
+
+# Start on a custom port with 1-hour idle timeout
+citadel terminal-server --org-id my-org-id --port 8080 --idle-timeout 60
+```
+
+### Configuration Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--org-id` | Organization ID for token validation (required) | - |
+| `--port` | WebSocket server port | 7860 |
+| `--idle-timeout` | Session idle timeout in minutes | 30 |
+| `--shell` | Shell to use for sessions | Platform default |
+| `--max-connections` | Maximum concurrent sessions | 10 |
+
+For detailed documentation, see [**docs/terminal-service.md**](docs/terminal-service.md).
 
 ---
 
