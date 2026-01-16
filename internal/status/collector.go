@@ -85,8 +85,10 @@ func (c *Collector) collectNodeInfo() NodeInfo {
 		UptimeSeconds: int64(time.Since(c.startTime).Seconds()),
 	}
 
-	// Get Network IP
-	info.TailscaleIP = c.getNetworkIP()
+	// Get Network IP - populate both fields for backwards compatibility
+	networkIP := c.getNetworkIP()
+	info.NetworkIP = networkIP
+	info.TailscaleIP = networkIP // Kept for backwards compatibility
 
 	return info
 }

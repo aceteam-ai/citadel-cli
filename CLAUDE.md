@@ -14,6 +14,17 @@ Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It 
 - **Node**: A physical/virtual machine running the Citadel agent
 - **Services**: Dockerized AI inference engines (vLLM, Ollama, llama.cpp, LM Studio)
 
+**User-Facing Terminology Convention:**
+When writing user-facing content (CLI help text, README, error messages), use these terms:
+| Internal/Technical | User-Facing |
+|-------------------|-------------|
+| tsnet, Tailscale | "AceTeam Network" |
+| WireGuard | "secure mesh network" or omit |
+| Headscale | "coordination server" or omit |
+| TailscaleIP | "network IP" (keep `tailscale_ip` in JSON for backwards compat) |
+
+This keeps implementation details hidden from users while maintaining technical accuracy in code comments and internal documentation (like this file).
+
 ## Build and Development Commands
 
 ### Building

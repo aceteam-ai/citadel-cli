@@ -179,11 +179,12 @@ gh release create v1.2.0 \
 
 | Command                                                                   | Description                                                                                                                                                                                            |
 | :------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `citadel init`                                                            | **(Run with sudo)** The primary command for provisioning a new server. It installs dependencies, interactively prompts for configuration, generates all necessary files, and brings the node online.   |
+| `citadel init`                                                            | Join the AceTeam Network (no sudo required). Use `--provision` for full system provisioning (requires sudo).                                                                                           |
 | `citadel init --authkey <key> --service <name> --node-name <name> --test` | The non-interactive version of `init`, perfect for automation. Allows you to specify the service (`vllm`, `ollama`, `llamacpp`, `none`), set the node name, and run a diagnostic test upon completion. |
-| `citadel run [service]`                                                   | Starts services. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                          |
+| `citadel work`                                                            | **(Primary command)** Starts services from manifest AND runs the job worker. This is the main command for running a node.                                                                              |
+| `citadel run [service]`                                                   | Starts services only. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                     |
 | `citadel stop [service]`                                                  | Stops services. With no arguments, stops all manifest services. With a service name, stops that specific service.                                                                                       |
-| `citadel login`                                                           | **(Run with sudo)** Connects the machine to the network. Interactive prompts by default, or use `--authkey <key>` for non-interactive automation.                                                       |
+| `citadel login`                                                           | Connects the machine to the network. Interactive prompts by default, or use `--authkey <key>` for non-interactive automation.                                                                           |
 
 ### Node Operation & Monitoring
 
@@ -227,48 +228,79 @@ For detailed documentation, see [**docs/terminal-service.md**](docs/terminal-ser
 
 ---
 
+## Health Checks
+
+Citadel nodes expose HTTP endpoints for health monitoring. Since ICMP ping doesn't work with userspace networking, use HTTP health checks instead.
+
+```bash
+# Lightweight ping check (minimal overhead)
+curl http://<node-ip>:8080/ping
+# Returns: {"status":"pong","timestamp":"2024-01-15T10:30:00Z"}
+
+# Full health status
+curl http://<node-ip>:8080/health
+# Returns: {"status":"ok","version":"1.3.0"}
+
+# Complete node status (system metrics, GPU, services)
+curl http://<node-ip>:8080/status
+```
+
+The status server runs when using `citadel work --status-port=8080`.
+
+---
+
 ## Example Workflow: Provisioning a New GPU Node
 
-This workflow shows how to take a fresh Ubuntu server and turn it into a fully operational Citadel node with a single command.
+This workflow shows how to take a fresh server and turn it into a fully operational Citadel node.
 
-1.  **(Optional) Generate an Auth Key:**
-    For automated deployments, log in to your Nexus admin panel and generate a new, single-use, non-expiring authentication key. For interactive setup, you can skip this and log in via your browser.
+### Quick Start (2 Commands)
 
-2.  **Initialize the Node:**
-    Copy the `citadel` binary to the new server and run the `init` command. It will handle all system setup, configuration, and service deployment.
+```bash
+# 1. Join the AceTeam Network (interactive - opens browser for auth)
+./citadel init
 
-    **Interactive Example:**
+# 2. Start services and run the worker
+./citadel work --mode=nexus --status-port=8080
+```
 
-    ```bash
-    # The command will guide you through selecting a service, naming the node,
-    # and choosing a connection method (browser or authkey).
-    sudo ./citadel init
-    ```
+That's it! Your node is now online and accepting jobs.
 
-    **Automated Example:**
-    For scripted deployments, you can provide all options as flags. The `--test` flag is highly recommended to verify the deployment.
+### Full Provisioning (with system setup)
 
-    ```bash
-    # This command will provision a vLLM node named 'gpu-node-01' and run a test.
-    sudo ./citadel init \
-      --authkey tskey-auth-k1A2b3C4d5E6f... \
-      --service vllm \
-      --node-name gpu-node-01 \
-      --test
-    ```
+For fresh servers that need Docker and dependencies installed:
 
-    After running, `init` will create a `~/citadel-node` directory containing the generated `citadel.yaml` and service files.
+```bash
+# Interactive setup with full provisioning
+sudo ./citadel init --provision
 
-3.  **Verify the Status:**
-    Once initialization is complete, you can check the node's health at any time.
+# Then start the worker
+./citadel work --mode=nexus
+```
 
-    ```bash
-    # Navigate to the generated directory to manage your node
-    cd ~/citadel-node
-    ./citadel status
-    ```
+### Automated Deployment
 
-    You should see `🟢 ONLINE` for the network connection and `🟢 RUNNING` for your configured service. Your node is now ready to accept jobs from the AceTeam control plane.
+For scripted deployments, provide all options as flags:
+
+```bash
+# Provision and configure in one command
+sudo ./citadel init --provision \
+  --authkey tskey-auth-k1A2b3C4d5E6f... \
+  --service vllm \
+  --node-name gpu-node-01
+
+# Start the node
+./citadel work --mode=nexus --status-port=8080 --heartbeat
+```
+
+### Verify Status
+
+Check the node's health at any time:
+
+```bash
+./citadel status
+```
+
+You should see `🟢 ONLINE` for the network connection and `🟢 RUNNING` for your configured service.
 
 ---
 

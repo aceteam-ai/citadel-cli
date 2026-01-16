@@ -12,6 +12,8 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -47,30 +49,38 @@ var (
 	// Terminal server flags
 	workTerminal     bool
 	workTerminalPort int
+
+	// Service auto-start flags
+	workNoServices bool
 )
 
 var workCmd = &cobra.Command{
 	Use:   "work",
-	Short: "Run as a job worker for Nexus or Redis",
-	Long: `Unified job worker that can consume from either Nexus (HTTP polling) or
-Redis Streams (consumer groups).
+	Short: "Start services and run the job worker (primary node command)",
+	Long: `Unified Citadel worker that starts services and processes jobs.
+
+This is the primary command for running a Citadel node. It:
+  1. Auto-starts services from manifest (use --no-services to skip)
+  2. Runs the job worker (Nexus or Redis mode)
+  3. Reports status via heartbeat
+  4. Optionally runs terminal server for remote access
 
 Modes:
   nexus   Poll Nexus API for jobs (for on-premise nodes)
   redis   Consume from Redis Streams (for AceTeam private GPU cloud)
 
 Examples:
-  # Run as Nexus worker (polls HTTP endpoint)
-  citadel work --mode=nexus --nexus-url=https://nexus.aceteam.ai
+  # Run node (starts services + worker)
+  citadel work --mode=nexus
 
-  # Run as Redis worker (consumes from stream)
-  citadel work --mode=redis --redis-url=redis://localhost:6379
+  # Run without auto-starting services
+  citadel work --mode=nexus --no-services
 
   # Run with status server and heartbeat
   citadel work --mode=nexus --status-port=8080 --heartbeat
 
-  # Run with custom queue and consumer group
-  citadel work --mode=redis --queue=jobs:v1:gpu-general --group=my-workers`,
+  # Run as Redis worker (for private GPU cloud)
+  citadel work --mode=redis --redis-url=redis://localhost:6379`,
 	Run: runWork,
 }
 
@@ -91,6 +101,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	if workMode != "nexus" && workMode != "redis" {
 		fmt.Fprintf(os.Stderr, "Error: --mode must be 'nexus' or 'redis'\n")
 		os.Exit(1)
+	}
+
+	// Auto-start services from manifest (unless --no-services is set)
+	if !workNoServices {
+		if err := autoStartServices(); err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: Service auto-start: %v\n", err)
+		}
 	}
 
 	// Create the appropriate job source
@@ -376,6 +393,50 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 }
 
+// autoStartServices starts all services defined in the manifest.
+// This is called automatically by the work command unless --no-services is set.
+func autoStartServices() error {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		// No manifest found - this is fine, just skip service startup
+		return nil
+	}
+
+	if len(manifest.Services) == 0 {
+		return nil
+	}
+
+	fmt.Printf("--- Starting %d service(s) ---\n", len(manifest.Services))
+
+	for _, service := range manifest.Services {
+		serviceType := determineServiceType(service)
+
+		if serviceType == internalServices.ServiceTypeNative {
+			fmt.Printf("   - Starting %s (native)...\n", service.Name)
+			if err := startNativeService(service.Name, configDir); err != nil {
+				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				continue
+			}
+		} else {
+			// Validate that compose file path stays within config directory (prevent path traversal)
+			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "     Warning: %s: invalid compose file path: %v\n", service.Name, err)
+				continue
+			}
+			fmt.Printf("   - Starting %s...\n", service.Name)
+			if err := startService(service.Name, fullComposePath); err != nil {
+				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
+				continue
+			}
+		}
+		fmt.Printf("   - %s is running\n", service.Name)
+	}
+
+	fmt.Println("--- Services started ---")
+	return nil
+}
+
 func init() {
 	rootCmd.AddCommand(workCmd)
 
@@ -411,4 +472,7 @@ func init() {
 	// Terminal server flags
 	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")
 	workCmd.Flags().IntVar(&workTerminalPort, "terminal-port", 7860, "Terminal server port (default: 7860)")
+
+	// Service auto-start flags
+	workCmd.Flags().BoolVar(&workNoServices, "no-services", false, "Skip auto-starting services from manifest")
 }

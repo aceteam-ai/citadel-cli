@@ -21,7 +21,7 @@ Description: |-
   It allows you to securely connect your own hardware to your AceTeam account, making your resources available to your private workflows.
 
   Features:
-  - Secure mesh networking via Tailscale
+  - Secure mesh networking via AceTeam Network
   - Docker-based service management (vLLM, Ollama, llama.cpp)
   - GPU detection and configuration
   - Automated dependency installation
