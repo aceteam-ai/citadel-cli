@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -41,6 +43,10 @@ var (
 	// Redis status publishing flags
 	workRedisStatus bool
 	workDeviceCode  string
+
+	// Terminal server flags
+	workTerminal     bool
+	workTerminalPort int
 )
 
 var workCmd = &cobra.Command{
@@ -285,6 +291,52 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Start terminal server if enabled
+	if workTerminal {
+		// Check platform support
+		if runtime.GOOS == "windows" {
+			fmt.Fprintln(os.Stderr, "   - ⚠️ Terminal server is not supported on Windows")
+		} else {
+			// Get org ID from manifest
+			orgID := ""
+			if manifest, _, err := findAndReadManifest(); err == nil {
+				orgID = manifest.Node.OrgID
+			}
+
+			if orgID == "" {
+				fmt.Fprintln(os.Stderr, "   - ⚠️ Terminal server requires org-id (run 'citadel init' first)")
+			} else {
+				termConfig := terminal.DefaultConfig()
+				termConfig.OrgID = orgID
+				termConfig.AuthServiceURL = baseURL
+				if workTerminalPort > 0 {
+					termConfig.Port = workTerminalPort
+				}
+
+				// Use CachingTokenValidator for production
+				cachingAuth := terminal.NewCachingTokenValidator(
+					baseURL,
+					orgID,
+					termConfig.TokenRefreshInterval,
+				)
+
+				termServer := terminal.NewServer(termConfig, cachingAuth)
+
+				go func() {
+					// Start the token cache
+					if err := cachingAuth.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Token cache error: %v\n", err)
+					}
+
+					fmt.Printf("   - Terminal server: ws://localhost:%d/terminal\n", termConfig.Port)
+					if err := termServer.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Terminal server error: %v\n", err)
+					}
+				}()
+			}
+		}
+	}
+
 	// Create handlers (use legacy adapters for now)
 	handlers := worker.CreateLegacyHandlers()
 
@@ -339,4 +391,8 @@ func init() {
 	// Redis status publishing flags
 	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", false, "Enable Redis status publishing for real-time updates")
 	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
+
+	// Terminal server flags
+	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")
+	workCmd.Flags().IntVar(&workTerminalPort, "terminal-port", 7860, "Terminal server port (default: 7860)")
 }

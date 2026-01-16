@@ -36,19 +36,23 @@ type Config struct {
 
 	// RateLimitBurst is the burst limit for rate limiting
 	RateLimitBurst int
+
+	// TokenRefreshInterval is how often to refresh the token cache from the API
+	TokenRefreshInterval time.Duration
 }
 
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		Port:           getEnvInt("CITADEL_TERMINAL_PORT", 7860),
-		Enabled:        getEnvBool("CITADEL_TERMINAL_ENABLED", true),
-		IdleTimeout:    time.Duration(getEnvInt("CITADEL_TERMINAL_IDLE_TIMEOUT", 30)) * time.Minute,
-		MaxConnections: getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
-		Shell:          getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
-		AuthServiceURL: getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
-		RateLimitRPS:   1.0, // 1 connection attempt per second per IP
-		RateLimitBurst: 5,   // Allow bursts of 5
+		Port:                 getEnvInt("CITADEL_TERMINAL_PORT", 7860),
+		Enabled:              getEnvBool("CITADEL_TERMINAL_ENABLED", true),
+		IdleTimeout:          time.Duration(getEnvInt("CITADEL_TERMINAL_IDLE_TIMEOUT", 30)) * time.Minute,
+		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
+		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
+		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
+		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
+		RateLimitBurst:       5,   // Allow bursts of 5
+		TokenRefreshInterval: time.Duration(getEnvInt("CITADEL_TOKEN_REFRESH_INTERVAL", 60)) * time.Minute,
 	}
 }
 

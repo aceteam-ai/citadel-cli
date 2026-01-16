@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -44,6 +45,7 @@ type TokenError struct {
 type StartFlowRequest struct {
 	ClientID      string `json:"client_id"`
 	ClientVersion string `json:"client_version"`
+	Hostname      string `json:"hostname,omitempty"`
 }
 
 // TokenRequest represents the request body for /token endpoint
@@ -66,10 +68,14 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 func (c *DeviceAuthClient) StartFlow() (*DeviceCodeResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/start"
 
+	// Get hostname for device identification
+	hostname, _ := os.Hostname()
+
 	// Create request body
 	reqBody := StartFlowRequest{
 		ClientID:      "citadel-cli",
 		ClientVersion: "1.0.0", // TODO: Get from version const
+		Hostname:      hostname,
 	}
 
 	jsonData, err := json.Marshal(reqBody)

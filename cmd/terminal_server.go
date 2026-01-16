@@ -20,6 +20,7 @@ var (
 	terminalIdleTimeout int
 	terminalShell       string
 	terminalMaxConns    int
+	terminalTestMode    bool
 )
 
 var terminalServerCmd = &cobra.Command{
@@ -41,12 +42,21 @@ authenticated connection, streaming input and output over WebSocket.`,
   citadel terminal-server --port 8080
 
   # Start with custom idle timeout (in minutes)
-  citadel terminal-server --idle-timeout 60`,
+  citadel terminal-server --idle-timeout 60
+
+  # Start in test mode (accepts any token, for development)
+  citadel terminal-server --test`,
 
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		// Check platform support
 		if runtime.GOOS == "windows" {
 			return fmt.Errorf("terminal server is not yet supported on Windows (PTY support requires ConPTY)")
+		}
+
+		// Test mode skips org-id validation
+		if terminalTestMode {
+			terminalOrgID = "test-org"
+			return nil
 		}
 
 		// Try to get org-id from manifest if not provided via flag
@@ -92,10 +102,39 @@ authenticated connection, streaming input and output over WebSocket.`,
 		}
 
 		// Create the token validator
-		auth := terminal.NewHTTPTokenValidator(config.AuthServiceURL)
+		var auth terminal.TokenValidator
+		var cachingAuth *terminal.CachingTokenValidator
+
+		if terminalTestMode {
+			// Test mode: accept any token
+			mockAuth := terminal.NewMockTokenValidator()
+			mockAuth.AddValidToken("test-token", &terminal.TokenInfo{
+				UserID:    "test-user",
+				OrgID:     config.OrgID,
+				ExpiresAt: time.Now().Add(24 * time.Hour),
+			})
+			auth = mockAuth
+			fmt.Println("   - ⚠️  TEST MODE: Accepting test token (not for production)")
+		} else {
+			// Production mode: use caching validator
+			cachingAuth = terminal.NewCachingTokenValidator(
+				config.AuthServiceURL,
+				config.OrgID,
+				config.TokenRefreshInterval,
+			)
+			auth = cachingAuth
+		}
 
 		// Create and start the server
 		server := terminal.NewServer(config, auth)
+
+		// Start the caching validator's background refresh (if not in test mode)
+		if cachingAuth != nil {
+			if err := cachingAuth.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to start token cache: %v\n", err)
+				os.Exit(1)
+			}
+		}
 
 		if err := server.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to start server: %v\n", err)
@@ -122,6 +161,11 @@ authenticated connection, streaming input and output over WebSocket.`,
 
 		fmt.Println("\n--- Shutting down terminal server ---")
 
+		// Stop the caching validator
+		if cachingAuth != nil {
+			cachingAuth.Stop()
+		}
+
 		// Graceful shutdown with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -142,4 +186,5 @@ func init() {
 	terminalServerCmd.Flags().IntVar(&terminalIdleTimeout, "idle-timeout", 0, "Idle timeout in minutes (default: 30)")
 	terminalServerCmd.Flags().StringVar(&terminalShell, "shell", "", "Shell to use for terminal sessions")
 	terminalServerCmd.Flags().IntVar(&terminalMaxConns, "max-connections", 0, "Maximum concurrent connections (default: 10)")
+	terminalServerCmd.Flags().BoolVar(&terminalTestMode, "test", false, "Test mode - accepts any token (for development)")
 }

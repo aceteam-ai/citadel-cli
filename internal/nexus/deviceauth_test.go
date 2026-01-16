@@ -2,6 +2,7 @@
 package nexus
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -210,4 +211,26 @@ func TestAuthServiceURLUsedForPolling(t *testing.T) {
 	}
 
 	t.Logf("✓ Verified: Both StartFlow and PollForToken use the auth-service URL (%s)", mock.URL())
+}
+
+func TestDeviceAuthSendsHostname(t *testing.T) {
+	mock := StartMockDeviceAuthServer(1)
+	defer mock.Close()
+
+	client := NewDeviceAuthClient(mock.URL())
+	_, err := client.StartFlow()
+	if err != nil {
+		t.Fatalf("StartFlow failed: %v", err)
+	}
+
+	hostname := mock.GetLastHostname()
+	if hostname == "" {
+		t.Error("Expected hostname to be sent, got empty string")
+	}
+
+	// Verify it matches actual hostname
+	expected, _ := os.Hostname()
+	if hostname != expected {
+		t.Errorf("Expected hostname '%s', got '%s'", expected, hostname)
+	}
 }
