@@ -96,7 +96,12 @@ func runAllServices() {
 				os.Exit(1)
 			}
 		} else {
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			// Validate that compose file path stays within config directory (prevent path traversal)
+			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   ❌ Invalid compose file path for %s: %v\n", service.Name, err)
+				os.Exit(1)
+			}
 			fmt.Printf("🚀 Starting service: %s\n", service.Name)
 			if err := startService(service.Name, fullComposePath); err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
@@ -187,7 +192,12 @@ func restartAllServices() {
 	fmt.Printf("--- 🔄 Restarting %d service(s) ---\n", len(manifest.Services))
 
 	for _, service := range manifest.Services {
-		fullComposePath := filepath.Join(configDir, service.ComposeFile)
+		// Validate that compose file path stays within config directory (prevent path traversal)
+		fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   ❌ Invalid compose file path for %s: %v\n", service.Name, err)
+			continue
+		}
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
 		composeCmd := exec.Command("docker", "compose", "-f", fullComposePath, "restart")

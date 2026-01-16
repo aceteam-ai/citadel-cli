@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
@@ -418,7 +418,12 @@ func autoStartServices() error {
 				continue
 			}
 		} else {
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			// Validate that compose file path stays within config directory (prevent path traversal)
+			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "     Warning: %s: invalid compose file path: %v\n", service.Name, err)
+				continue
+			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
 			if err := startService(service.Name, fullComposePath); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
