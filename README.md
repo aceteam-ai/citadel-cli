@@ -11,7 +11,17 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 
 ## Installation
 
-### From a Release (Recommended)
+### One-Line Installer (Recommended)
+
+#### Linux / macOS
+
+```bash
+curl -fsSL https://get.aceteam.ai/citadel.sh | bash
+```
+
+This installs to `~/.local/bin` and automatically configures your PATH. For system-wide install, use `sudo bash` instead.
+
+### Manual Installation
 
 #### Linux / macOS
 
@@ -21,7 +31,8 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 
     ```bash
     tar -xvf citadel_vX.Y.Z_linux_amd64.tar.gz
-    sudo mv citadel /usr/local/bin/
+    mv citadel ~/.local/bin/    # User-local (no sudo)
+    # or: sudo mv citadel /usr/local/bin/  # System-wide
     ```
 
 #### Windows

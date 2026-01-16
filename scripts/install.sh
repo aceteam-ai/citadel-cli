@@ -3,24 +3,37 @@
 # Citadel CLI Installer
 #
 # Fetches the latest stable version of the Citadel CLI from GitHub,
-# verifies its checksum, and installs it to /usr/local/bin.
+# verifies its checksum, and installs it.
 #
 # This script is designed to be idempotent and safe.
 #
 # Usage:
-#   curl -fsSL https://get.aceteam.ai/citadel.sh | sudo bash
+#   curl -fsSL https://get.aceteam.ai/citadel.sh | bash           # User-local install
+#   curl -fsSL https://get.aceteam.ai/citadel.sh | sudo bash      # System-wide install
 #
 
 # --- Configuration ---
 set -e -u -o pipefail
 
 REPO="aceteam-ai/citadel-cli"
-INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="citadel"
+
+# Determine install location based on privileges
+if [ "$(id -u)" -eq 0 ]; then
+  INSTALL_DIR="/usr/local/bin"
+  INSTALL_MODE="system"
+else
+  INSTALL_DIR="${HOME}/.local/bin"
+  INSTALL_MODE="user"
+fi
 
 # --- Helper Functions ---
 msg() {
   echo -e "\033[1;32m=>\033[0m \033[1m$1\033[0m" >&2
+}
+
+warn() {
+  echo -e "\033[1;33mWARNING:\033[0m $1" >&2
 }
 
 err() {
@@ -29,10 +42,91 @@ err() {
 }
 
 # --- Pre-flight Checks ---
-check_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "This script must be run with sudo or as root. Try: curl ... | sudo bash"
+setup_install_dir() {
+  if [ "$INSTALL_MODE" = "user" ]; then
+    # Create ~/.local/bin if it doesn't exist
+    if [ ! -d "$INSTALL_DIR" ]; then
+      msg "Creating ${INSTALL_DIR}..."
+      mkdir -p "$INSTALL_DIR"
+    fi
   fi
+
+  # Verify we can write to the install directory
+  if [ ! -w "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR" ]; then
+    err "Cannot write to ${INSTALL_DIR}. Try running with sudo for system-wide install."
+  fi
+}
+
+detect_shell_profile() {
+  # Detect the user's shell and return the appropriate profile file
+  local shell_name
+  shell_name=$(basename "$SHELL")
+
+  case "$shell_name" in
+    zsh)
+      echo "${HOME}/.zshrc"
+      ;;
+    bash)
+      # Prefer .bashrc on Linux, .bash_profile on macOS
+      if [ -f "${HOME}/.bashrc" ]; then
+        echo "${HOME}/.bashrc"
+      elif [ -f "${HOME}/.bash_profile" ]; then
+        echo "${HOME}/.bash_profile"
+      else
+        echo "${HOME}/.bashrc"
+      fi
+      ;;
+    fish)
+      echo "${HOME}/.config/fish/config.fish"
+      ;;
+    *)
+      # Default to .profile for unknown shells
+      echo "${HOME}/.profile"
+      ;;
+  esac
+}
+
+is_in_path() {
+  # Check if a directory is in PATH
+  local dir="$1"
+  case ":${PATH}:" in
+    *":${dir}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+add_to_path() {
+  # Add directory to shell profile if not already in PATH
+  local profile_file
+  profile_file=$(detect_shell_profile)
+  local shell_name
+  shell_name=$(basename "$SHELL")
+
+  # Check if the export line already exists in the profile
+  local export_line
+  if [ "$shell_name" = "fish" ]; then
+    export_line="fish_add_path ${INSTALL_DIR}"
+  else
+    export_line="export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+  fi
+
+  # Create profile directory if needed (for fish)
+  if [ "$shell_name" = "fish" ] && [ ! -d "$(dirname "$profile_file")" ]; then
+    mkdir -p "$(dirname "$profile_file")"
+  fi
+
+  # Check if already added
+  if [ -f "$profile_file" ] && grep -qF ".local/bin" "$profile_file" 2>/dev/null; then
+    return 0  # Already configured
+  fi
+
+  # Add to profile
+  msg "Adding ${INSTALL_DIR} to PATH in ${profile_file}..."
+  echo "" >> "$profile_file"
+  echo "# Added by Citadel CLI installer" >> "$profile_file"
+  echo "$export_line" >> "$profile_file"
+
+  return 1  # Indicates we added it (needs source)
 }
 
 check_deps() {
@@ -81,7 +175,7 @@ get_latest_version() {
   # Your 'v1.0.1-rc1' will be ignored by this. This is generally what you want for a stable installer.
   local latest_url="https://api.github.com/repos/${REPO}/releases/latest"
   local version
-  
+
   msg "Fetching latest stable version information..."
   version=$(curl -sSL "$latest_url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 
@@ -97,15 +191,15 @@ install_citadel() {
   local version="$2"
   local binary_archive="${BINARY_NAME}_${version}_${arch}.tar.gz"
   local checksum_file="checksums.txt" # Matches your release asset name
-  
+
   local download_url_base="https://github.com/${REPO}/releases/download/${version}"
-  
+
   local tmp_dir
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT # Ensure cleanup on exit/error
 
   msg "Downloading Citadel CLI ${version} for ${arch}..."
-  
+
   # Download the archive and checksums
   if ! curl -sSL -o "${tmp_dir}/${binary_archive}" "${download_url_base}/${binary_archive}"; then
     err "Failed to download binary archive. Check version and architecture."
@@ -163,9 +257,13 @@ install_citadel() {
 
 # --- Execution ---
 main() {
-  msg "Starting Citadel CLI installation..."
+  if [ "$INSTALL_MODE" = "system" ]; then
+    msg "Starting Citadel CLI installation (system-wide)..."
+  else
+    msg "Starting Citadel CLI installation (user-local)..."
+  fi
 
-  check_root
+  setup_install_dir
   check_deps
 
   local arch
@@ -185,15 +283,39 @@ main() {
   msg "Installation complete!"
   echo "  Version: ${installed_version}" >&2
 
-  # Auto-run citadel init if running interactively
-  if [ -t 0 ] && [ -t 1 ]; then
+  # Handle PATH configuration for user-local installs
+  if [ "$INSTALL_MODE" = "user" ]; then
+    if is_in_path "$INSTALL_DIR"; then
+      echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
+    else
+      # Add to PATH in shell profile
+      if add_to_path; then
+        echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
+      else
+        local profile_file
+        profile_file=$(detect_shell_profile)
+        echo "" >&2
+        warn "To use citadel, restart your terminal or run:"
+        echo "  source ${profile_file}" >&2
+      fi
+    fi
     echo "" >&2
-    msg "Starting device provisioning..."
-    echo "" >&2
-    ${INSTALL_DIR}/${BINARY_NAME} init
-  else
     echo "  Run 'citadel --help' to get started." >&2
-    echo "  To provision this node, run: sudo citadel init" >&2
+    echo "  To provision this node, run: citadel init" >&2
+    echo "" >&2
+    echo "  Note: Full provisioning (Docker, GPU toolkit) requires sudo." >&2
+    echo "  You can run 'citadel init --network-only' for network setup without sudo." >&2
+  else
+    # System-wide install: auto-run citadel init if running interactively
+    if [ -t 0 ] && [ -t 1 ]; then
+      echo "" >&2
+      msg "Starting device provisioning..."
+      echo "" >&2
+      ${INSTALL_DIR}/${BINARY_NAME} init
+    else
+      echo "  Run 'citadel --help' to get started." >&2
+      echo "  To provision this node, run: sudo citadel init" >&2
+    fi
   fi
 }
 
