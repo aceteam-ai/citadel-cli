@@ -5,6 +5,8 @@ package network
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -74,6 +76,11 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	if _, err := EnsureStateDir(); err != nil {
 		return fmt.Errorf("failed to create state directory: %w", err)
 	}
+
+	// Suppress tsnet's internal logging (uses Go's standard log package)
+	origOutput := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(origOutput)
 
 	// Create tsnet server
 	s.srv = &tsnet.Server{

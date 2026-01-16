@@ -9,7 +9,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
-	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -118,24 +117,16 @@ func runInteractiveLogin() {
 		}
 		authKey = token.Authkey
 
-		// Get node name
-		suggestedHostname, _ := os.Hostname()
-		nodeName, err = ui.AskInput("Enter a name for this node:", "e.g., my-laptop", suggestedHostname)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Could not determine node name: %v\n", err)
-			os.Exit(1)
-		}
-
 	case nexus.NetChoiceAuthkey:
 		fmt.Println("--- Authenticating with authkey ---")
 		authKey = key
+	}
 
-		suggestedHostname, _ := os.Hostname()
-		nodeName, err = ui.AskInput("Enter a name for this node:", "e.g., my-laptop", suggestedHostname)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Could not determine node name: %v\n", err)
-			os.Exit(1)
-		}
+	// Use --node-name if provided, otherwise fall back to hostname
+	if loginNodeName != "" {
+		nodeName = loginNodeName
+	} else {
+		nodeName, _ = os.Hostname()
 	}
 
 	// Disconnect any existing connection first
