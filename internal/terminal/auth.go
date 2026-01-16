@@ -121,20 +121,25 @@ type CachingTokenValidator struct {
 	backoff         time.Duration
 	minBackoff      time.Duration
 	maxBackoff      time.Duration
+
+	// Rate limiting for on-demand refresh (prevents abuse via invalid tokens)
+	lastRefreshAttempt time.Time
+	refreshRateLimit   time.Duration
 }
 
 // NewCachingTokenValidator creates a new caching token validator
 func NewCachingTokenValidator(baseURL, orgID string, refreshInterval time.Duration) *CachingTokenValidator {
 	return &CachingTokenValidator{
-		baseURL:         baseURL,
-		orgID:           orgID,
-		httpClient:      &http.Client{Timeout: 10 * time.Second},
-		cache:           make(map[string]*CachedTokenEntry),
-		refreshInterval: refreshInterval,
-		stopCh:          make(chan struct{}),
-		minBackoff:      1 * time.Second,
-		maxBackoff:      5 * time.Minute,
-		backoff:         1 * time.Second,
+		baseURL:          baseURL,
+		orgID:            orgID,
+		httpClient:       &http.Client{Timeout: 10 * time.Second},
+		cache:            make(map[string]*CachedTokenEntry),
+		refreshInterval:  refreshInterval,
+		stopCh:           make(chan struct{}),
+		minBackoff:       1 * time.Second,
+		maxBackoff:       5 * time.Minute,
+		backoff:          1 * time.Second,
+		refreshRateLimit: 10 * time.Second, // Limit on-demand refresh to once per 10 seconds
 	}
 }
 
@@ -248,14 +253,22 @@ func (v *CachingTokenValidator) ValidateToken(token string, orgID string) (*Toke
 	// Check cache
 	v.cacheMu.RLock()
 	entry, ok := v.cache[hash]
+	lastAttempt := v.lastRefreshAttempt
 	v.cacheMu.RUnlock()
 
 	if !ok {
-		// Token not found in cache - try a refresh and check again
-		if err := v.fetchAndCacheTokens(); err == nil {
-			v.cacheMu.RLock()
-			entry, ok = v.cache[hash]
-			v.cacheMu.RUnlock()
+		// Token not found in cache - try a refresh if rate limit allows
+		// This prevents attackers from triggering excessive API calls with invalid tokens
+		if time.Since(lastAttempt) >= v.refreshRateLimit {
+			v.cacheMu.Lock()
+			v.lastRefreshAttempt = time.Now()
+			v.cacheMu.Unlock()
+
+			if err := v.fetchAndCacheTokens(); err == nil {
+				v.cacheMu.RLock()
+				entry, ok = v.cache[hash]
+				v.cacheMu.RUnlock()
+			}
 		}
 
 		if !ok {

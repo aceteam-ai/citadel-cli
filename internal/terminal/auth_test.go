@@ -289,3 +289,80 @@ func TestHashToken(t *testing.T) {
 		t.Errorf("expected hash length 64, got %d", len(hash1))
 	}
 }
+
+func TestCachingTokenValidatorRateLimiting(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	// Add one valid token
+	mock.AddValidToken("valid-token", &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-456",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+
+	// Create validator with short rate limit for testing
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", time.Hour)
+	validator.refreshRateLimit = 100 * time.Millisecond // Short for testing
+	validator.Start()
+	defer validator.Stop()
+
+	mock.ResetRequestCount()
+
+	// First invalid token should trigger refresh
+	_, err := validator.ValidateToken("invalid-token-1", "org-456")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
+	}
+	firstCount := mock.GetRequestCount()
+	if firstCount < 1 {
+		t.Error("expected at least 1 request for first invalid token")
+	}
+
+	// Immediate second invalid token should NOT trigger refresh (rate limited)
+	_, err = validator.ValidateToken("invalid-token-2", "org-456")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
+	}
+	secondCount := mock.GetRequestCount()
+	if secondCount != firstCount {
+		t.Errorf("expected no additional requests due to rate limit, got %d (was %d)", secondCount, firstCount)
+	}
+
+	// Wait for rate limit to expire
+	time.Sleep(150 * time.Millisecond)
+
+	// Third invalid token should trigger refresh again
+	_, err = validator.ValidateToken("invalid-token-3", "org-456")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
+	}
+	thirdCount := mock.GetRequestCount()
+	if thirdCount <= secondCount {
+		t.Error("expected additional request after rate limit expired")
+	}
+}
+
+func TestCachingTokenValidatorOrgIsolation(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	// Add token for org-A
+	mock.AddValidToken("org-a-token", &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-A",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+
+	// Create validator for org-B
+	validator := NewCachingTokenValidator(mock.URL(), "org-B", time.Hour)
+	validator.Start()
+	defer validator.Stop()
+
+	// Attempt to use org-A's token with org-B validator
+	// Token won't be in cache (different org), and even if it were, org check should fail
+	_, err := validator.ValidateToken("org-a-token", "org-B")
+	if err != ErrInvalidToken && err != ErrUnauthorized {
+		t.Errorf("expected ErrInvalidToken or ErrUnauthorized for cross-org access, got %v", err)
+	}
+}

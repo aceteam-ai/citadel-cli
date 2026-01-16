@@ -53,8 +53,12 @@ authenticated connection, streaming input and output over WebSocket.`,
 			return fmt.Errorf("terminal server is not yet supported on Windows (PTY support requires ConPTY)")
 		}
 
-		// Test mode skips org-id validation
+		// Test mode skips org-id validation but requires explicit opt-in
 		if terminalTestMode {
+			// Require environment variable to prevent accidental production use
+			if os.Getenv("CITADEL_ALLOW_TEST_MODE") != "true" {
+				return fmt.Errorf("--test mode requires CITADEL_ALLOW_TEST_MODE=true environment variable (security safeguard)")
+			}
 			terminalOrgID = "test-org"
 			return nil
 		}
