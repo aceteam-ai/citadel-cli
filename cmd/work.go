@@ -289,6 +289,22 @@ func runWork(cmd *cobra.Command, args []string) {
 				}
 			}()
 		}
+
+		// Start config queue consumer for device configuration jobs
+		configConsumer, err := heartbeat.NewConfigConsumer(heartbeat.ConfigConsumerConfig{
+			RedisURL:      workRedisURL,
+			RedisPassword: workRedisPass,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config consumer: %v\n", err)
+		} else {
+			go func() {
+				fmt.Printf("   - Config queue: %s (listening for device config)\n", configConsumer.QueueName())
+				if err := configConsumer.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Config consumer error: %v\n", err)
+				}
+			}()
+		}
 	}
 
 	// Start terminal server if enabled
