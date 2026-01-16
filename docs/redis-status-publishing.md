@@ -47,6 +47,33 @@ This feature enables real-time node status publishing via Redis for live dashboa
 
 Publishes node status to Redis for real-time UI updates and reliable processing.
 
+### 1a. Config Queue Consumer
+
+**Location:** `internal/heartbeat/config_consumer.go`
+
+Consumes device configuration jobs from the `jobs:v1:config` Redis stream. This runs in parallel with the main status publisher to apply configurations from the onboarding wizard.
+
+```go
+type ConfigConsumer struct {
+    client        *redis.Client
+    workerID      string
+    queueName     string      // "jobs:v1:config"
+    consumerGroup string      // "citadel-config-consumers"
+    configHandler *jobs.ConfigHandler
+}
+```
+
+**Key Methods:**
+- `NewConfigConsumer(cfg)` - Create new config consumer
+- `Start(ctx)` - Start consuming config jobs (blocking)
+- `Close()` - Close Redis connection
+
+**Behavior:**
+1. Connects to Redis and creates consumer group `citadel-config-consumers`
+2. Reads jobs from `jobs:v1:config` stream using XREADGROUP
+3. Parses `APPLY_DEVICE_CONFIG` jobs and delegates to ConfigHandler
+4. ACKs successfully processed jobs
+
 ```go
 type RedisPublisher struct {
     client     *redis.Client
@@ -319,11 +346,13 @@ redis-cli XREVRANGE node:status:stream + - COUNT 5
 |------|--------|-------------|
 | `internal/heartbeat/redis.go` | CREATE | Redis status publisher |
 | `internal/heartbeat/redis_test.go` | CREATE | Publisher tests |
+| `internal/heartbeat/config_consumer.go` | CREATE | Config queue consumer for device config jobs |
+| `internal/heartbeat/config_consumer_test.go` | CREATE | Config consumer tests |
 | `internal/jobs/config_handler.go` | CREATE | Device config job handler |
 | `internal/worker/job.go` | MODIFY | Add `JobTypeApplyDeviceConfig` |
 | `internal/worker/handler_adapter.go` | MODIFY | Register config handler |
 | `cmd/helpers.go` | MODIFY | Return device_code from auth flow |
-| `cmd/work.go` | MODIFY | Add `--redis-status` and `--device-code` flags |
+| `cmd/work.go` | MODIFY | Add `--redis-status`, `--device-code` flags, start config consumer |
 
 ## Security Considerations
 
