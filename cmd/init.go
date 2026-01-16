@@ -35,14 +35,17 @@ var (
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
-	Long: `RUN WITH SUDO. This command installs all necessary dependencies, generates a
-configuration based on your input, and brings the node online. It can be run
-interactively or with flags for automation.`,
-	Example: `  # Interactive setup (recommended for first-time setup)
-  sudo citadel init
+	Long: `Provisions a fresh server to become a Citadel Node. This command can install
+dependencies, generate configuration, and connect to the AceTeam Network.
 
-  # Network-only setup (no services, no Docker)
-  sudo citadel init --network-only
+Full provisioning (default) requires sudo for Docker installation, NVIDIA toolkit,
+and system user configuration. Network-only mode (--network-only) uses embedded
+tsnet and does NOT require sudo.`,
+	Example: `  # Network-only setup (no sudo required)
+  citadel init --network-only
+
+  # Full interactive setup (requires sudo)
+  sudo citadel init
 
   # Automated setup with specific service
   sudo citadel init --service vllm
@@ -53,16 +56,22 @@ interactively or with flags for automation.`,
   # Setup with verbose output (for debugging)
   sudo citadel init --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if !isRoot() {
+		// Root is only required for full provisioning (Docker, NVIDIA toolkit, system user setup)
+		// Network-only mode uses embedded tsnet which doesn't require root
+		if !initNetworkOnly && !isRoot() {
 			if platform.IsWindows() {
 				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run as Administrator.")
 				fmt.Fprintln(os.Stderr, "   Right-click Command Prompt or PowerShell and select 'Run as administrator'")
+				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without elevation)")
 			} else {
 				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without sudo)")
 			}
 			os.Exit(1)
 		}
-		fmt.Println("✅ Running with root privileges.")
+		if !initNetworkOnly {
+			fmt.Println("✅ Running with root privileges.")
+		}
 
 		// Check if already connected to network and logout to start fresh
 		if network.IsGlobalConnected() {

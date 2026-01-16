@@ -323,7 +323,7 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
 
 ## Common Gotchas
 
-**Sudo Requirements**: `citadel init` and `citadel login` require sudo for system provisioning and Tailscale authentication.
+**Sudo Requirements**: `citadel init` requires sudo only for full provisioning (Docker, NVIDIA toolkit, system user setup). Use `--network-only` to skip system provisioning and run without sudo. `citadel login` does NOT require sudo (uses embedded tsnet for userspace networking).
 
 **Docker Group Membership**: After `init`, users must log out and back in (or run `exec su -l $USER`) for Docker group membership to take effect.
 
