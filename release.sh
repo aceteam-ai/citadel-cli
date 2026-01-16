@@ -251,34 +251,46 @@ $SUMMARY_SECTION
 
 ## Installation
 
+### One-Line Installer (Recommended)
+
+\`\`\`bash
+# User-local install (no sudo required)
+curl -fsSL https://get.aceteam.ai/citadel.sh | bash
+
+# Or system-wide install
+curl -fsSL https://get.aceteam.ai/citadel.sh | sudo bash
+\`\`\`
+
+### Manual Installation
+
 Download the appropriate binary for your platform and architecture:
 
-### Linux
+#### Linux
 
 \`\`\`bash
 # For amd64
 curl -LO https://github.com/aceteam-ai/citadel-cli/releases/download/$VERSION/citadel_${VERSION}_linux_amd64.tar.gz
 tar -xzf citadel_${VERSION}_linux_amd64.tar.gz
-sudo mv citadel /usr/local/bin/
+mv citadel ~/.local/bin/  # or: sudo mv citadel /usr/local/bin/
 
 # For arm64
 curl -LO https://github.com/aceteam-ai/citadel-cli/releases/download/$VERSION/citadel_${VERSION}_linux_arm64.tar.gz
 tar -xzf citadel_${VERSION}_linux_arm64.tar.gz
-sudo mv citadel /usr/local/bin/
+mv citadel ~/.local/bin/  # or: sudo mv citadel /usr/local/bin/
 \`\`\`
 
-### macOS
+#### macOS
 
 \`\`\`bash
 # For Intel Macs (amd64)
 curl -LO https://github.com/aceteam-ai/citadel-cli/releases/download/$VERSION/citadel_${VERSION}_darwin_amd64.tar.gz
 tar -xzf citadel_${VERSION}_darwin_amd64.tar.gz
-sudo mv citadel /usr/local/bin/
+mv citadel ~/.local/bin/  # or: sudo mv citadel /usr/local/bin/
 
 # For Apple Silicon (arm64)
 curl -LO https://github.com/aceteam-ai/citadel-cli/releases/download/$VERSION/citadel_${VERSION}_darwin_arm64.tar.gz
 tar -xzf citadel_${VERSION}_darwin_arm64.tar.gz
-sudo mv citadel /usr/local/bin/
+mv citadel ~/.local/bin/  # or: sudo mv citadel /usr/local/bin/
 \`\`\`
 
 ## SHA256 Checksums
