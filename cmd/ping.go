@@ -4,11 +4,14 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/spf13/cobra"
 )
+
+const maxPingCount = 100 // Prevent accidental resource exhaustion
 
 var pingCount int
 
@@ -34,6 +37,15 @@ With no arguments, pings all online peers once to show network health.`,
 		}
 
 		target := args[0]
+
+		// Validate ping count
+		if pingCount > maxPingCount {
+			badColor.Printf("Ping count cannot exceed %d\n", maxPingCount)
+			return
+		}
+		if pingCount < 1 {
+			pingCount = 1
+		}
 
 		// Check if we're connected
 		if !network.HasState() {
@@ -192,13 +204,8 @@ func pingAllPeers() {
 }
 
 func isIPAddress(s string) bool {
-	// Simple check: if it contains dots and all parts are numbers, it's likely an IP
-	for _, c := range s {
-		if c != '.' && (c < '0' || c > '9') {
-			return false
-		}
-	}
-	return true
+	_, err := netip.ParseAddr(s)
+	return err == nil
 }
 
 func resolveHostnameToIP(hostname string) (string, error) {
