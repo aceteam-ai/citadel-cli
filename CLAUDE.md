@@ -60,6 +60,33 @@ go run . test --service vllm
 
 ## Development Workflow
 
+### Git Workflow
+
+**IMPORTANT**: Never commit and push directly to `main`. Always create a feature branch and submit changes via a pull request.
+
+```bash
+# Create a branch for your work
+git checkout -b fix/description-of-change
+
+# Make changes, commit, then push
+git push -u origin fix/description-of-change
+
+# Create PR via GitHub CLI
+gh pr create --title "fix: description" --body "..."
+```
+
+### Future Work and TODOs
+
+When identifying future work or improvements during development, create GitHub issues instead of leaving TODO comments in the code. This ensures:
+- Visibility and tracking of all planned work
+- Ability to prioritize and assign tasks
+- Discussion and context in one place
+
+```bash
+# Create an issue for future work
+gh issue create --title "feat: description" --body "Context and details..."
+```
+
 ### Multi-Phase Implementation Plans
 
 When working on features with multiple implementation phases, follow this process:
@@ -323,7 +350,7 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
 
 ## Common Gotchas
 
-**Sudo Requirements**: `citadel init` and `citadel login` require sudo for system provisioning and Tailscale authentication.
+**Sudo Requirements**: `citadel init` requires sudo only for full provisioning (Docker, NVIDIA toolkit, system user setup). Use `--network-only` to skip system provisioning and run without sudo. `citadel login` does NOT require sudo (uses embedded tsnet for userspace networking).
 
 **Docker Group Membership**: After `init`, users must log out and back in (or run `exec su -l $USER`) for Docker group membership to take effect.
 
