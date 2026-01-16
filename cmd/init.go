@@ -28,48 +28,51 @@ var (
 	initNodeName           string
 	initTest               bool
 	initVerbose            bool
-	initNetworkOnly        bool
+	initNetworkOnly        bool // Deprecated: kept for backwards compatibility
+	initProvision          bool
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
-	Long: `Provisions a fresh server to become a Citadel Node. This command can install
-dependencies, generate configuration, and connect to the AceTeam Network.
+	Long: `Provisions a fresh server to become a Citadel Node. This command connects
+the node to the AceTeam Network.
 
-Full provisioning (default) requires sudo for Docker installation, NVIDIA toolkit,
-and system user configuration. Network-only mode (--network-only) uses embedded
-tsnet and does NOT require sudo.`,
-	Example: `  # Network-only setup (no sudo required)
-  citadel init --network-only
+By default, citadel init only joins the network (no sudo required). Services
+can be configured via the AceTeam web management page.
 
-  # Full interactive setup (requires sudo)
-  sudo citadel init
+Use --provision for full provisioning including Docker installation, NVIDIA toolkit,
+and system user configuration (requires sudo).`,
+	Example: `  # Default: join network only (no sudo required)
+  citadel init
 
-  # Automated setup with specific service
-  sudo citadel init --service vllm
+  # Full provisioning with Docker and NVIDIA toolkit (requires sudo)
+  sudo citadel init --provision
+
+  # Full provisioning with specific service
+  sudo citadel init --provision --service vllm
 
   # Setup with pre-generated authkey (for CI/CD)
-  sudo citadel init --authkey <your-key> --service ollama
+  citadel init --authkey <your-key>
 
-  # Setup with verbose output (for debugging)
-  sudo citadel init --verbose`,
+  # Full provisioning with verbose output (for debugging)
+  sudo citadel init --provision --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Root is only required for full provisioning (Docker, NVIDIA toolkit, system user setup)
-		// Network-only mode uses embedded tsnet which doesn't require root
-		if !initNetworkOnly && !isRoot() {
+		// Root is only required for full provisioning (--provision flag)
+		// Default mode only joins the network using embedded tsnet (no root required)
+		if initProvision && !isRoot() {
 			if platform.IsWindows() {
-				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run as Administrator.")
+				fmt.Fprintln(os.Stderr, "❌ Error: init --provision must be run as Administrator.")
 				fmt.Fprintln(os.Stderr, "   Right-click Command Prompt or PowerShell and select 'Run as administrator'")
-				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without elevation)")
+				fmt.Fprintln(os.Stderr, "   (Remove --provision to just join the network without elevation)")
 			} else {
-				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
-				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without sudo)")
+				fmt.Fprintln(os.Stderr, "❌ Error: init --provision must be run with sudo.")
+				fmt.Fprintln(os.Stderr, "   (Remove --provision to just join the network without sudo)")
 			}
 			os.Exit(1)
 		}
-		if !initNetworkOnly {
+		if initProvision {
 			fmt.Println("✅ Running with root privileges.")
 		}
 
@@ -144,8 +147,8 @@ tsnet and does NOT require sudo.`,
 			fmt.Println("\n--- Continuing with node setup ---")
 		}
 
-		// Handle --network-only: just join network and exit
-		if initNetworkOnly {
+		// Default mode: join network and exit (use --provision for full provisioning)
+		if !initProvision {
 			// If we already connected early, just exit
 			if earlyNetworkConnected {
 				fmt.Printf("Node name: %s\n", nodeName)
@@ -964,5 +967,8 @@ func init() {
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
-	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Only join the network, skip service provisioning")
+	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with Docker, NVIDIA toolkit, and services (requires sudo)")
+	// Deprecated: --network-only is now the default behavior
+	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Deprecated: network-only is now the default")
+	initCmd.Flags().MarkHidden("network-only")
 }
