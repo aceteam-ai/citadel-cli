@@ -22,7 +22,7 @@ THE SOFTWARE.
 */
 package main
 
-import "github.com/aceboss/citadel-cli/cmd"
+import "github.com/aceteam-ai/citadel-cli/cmd"
 
 func main() {
 	cmd.Execute()

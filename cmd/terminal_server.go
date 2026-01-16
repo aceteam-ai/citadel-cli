@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aceboss/citadel-cli/internal/terminal"
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/spf13/cobra"
 )
 

@@ -4,13 +4,20 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
+// DeviceAuthResult contains the result of a device authorization flow.
+type DeviceAuthResult struct {
+	Token      *nexus.TokenResponse
+	DeviceCode string // The device code used during auth (for config lookup)
+}
+
 // runDeviceAuthFlow executes the OAuth 2.0 device authorization flow
-// and returns the token response upon successful authorization
-func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
+// and returns the token response and device code upon successful authorization.
+// The device code is returned for use in status publishing to enable config lookup.
+func runDeviceAuthFlow(authServiceURL string) (*DeviceAuthResult, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
 
 	// Start the flow and get device code
@@ -50,7 +57,10 @@ func runDeviceAuthFlow(authServiceURL string) (*nexus.TokenResponse, error) {
 	select {
 	case token := <-tokenChan:
 		fmt.Println("✅ Authorization successful!")
-		return token, nil
+		return &DeviceAuthResult{
+			Token:      token,
+			DeviceCode: resp.DeviceCode,
+		}, nil
 	case err := <-errChan:
 		return nil, fmt.Errorf("device authorization failed: %w", err)
 	default:

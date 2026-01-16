@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,60 +11,72 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
-	"github.com/aceboss/citadel-cli/internal/platform"
-	"github.com/aceboss/citadel-cli/internal/ui"
-	"github.com/aceboss/citadel-cli/services"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	authkey               string
-	initService           string
-	initNodeName          string
-	initTest              bool
-	initVerbose           bool
+	authkey                string
+	initService            string
+	initNodeName           string
+	initTest               bool
+	initVerbose            bool
+	initNetworkOnly        bool
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
-	Long: `RUN WITH SUDO. This command installs all necessary dependencies, generates a
-configuration based on your input, and brings the node online. It can be run
-interactively or with flags for automation.`,
-	Example: `  # Interactive setup (recommended for first-time setup)
+	Long: `Provisions a fresh server to become a Citadel Node. This command can install
+dependencies, generate configuration, and connect to the AceTeam Network.
+
+Full provisioning (default) requires sudo for Docker installation, NVIDIA toolkit,
+and system user configuration. Network-only mode (--network-only) uses embedded
+tsnet and does NOT require sudo.`,
+	Example: `  # Network-only setup (no sudo required)
+  citadel init --network-only
+
+  # Full interactive setup (requires sudo)
   sudo citadel init
 
   # Automated setup with specific service
-  sudo citadel init --service vllm --node-name gpu-server-1
+  sudo citadel init --service vllm
 
   # Setup with pre-generated authkey (for CI/CD)
   sudo citadel init --authkey <your-key> --service ollama
 
   # Setup with verbose output (for debugging)
-  sudo citadel init --verbose
-
-  # Setup without running tests
-  sudo citadel init --test=false`,
+  sudo citadel init --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if !isRoot() {
+		// Root is only required for full provisioning (Docker, NVIDIA toolkit, system user setup)
+		// Network-only mode uses embedded tsnet which doesn't require root
+		if !initNetworkOnly && !isRoot() {
 			if platform.IsWindows() {
 				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run as Administrator.")
 				fmt.Fprintln(os.Stderr, "   Right-click Command Prompt or PowerShell and select 'Run as administrator'")
+				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without elevation)")
 			} else {
 				fmt.Fprintln(os.Stderr, "❌ Error: init command must be run with sudo.")
+				fmt.Fprintln(os.Stderr, "   (Use --network-only to skip system provisioning and run without sudo)")
 			}
 			os.Exit(1)
 		}
-		fmt.Println("✅ Running with root privileges.")
+		if !initNetworkOnly {
+			fmt.Println("✅ Running with root privileges.")
+		}
 
-		// Check if already connected to Tailscale and logout to start fresh
-		if nexus.IsTailscaleConnected() {
-			fmt.Println("--- 🔌 Existing Tailscale connection detected ---")
-			if err := nexus.TailscaleLogout(); err != nil {
+		// Check if already connected to network and logout to start fresh
+		if network.IsGlobalConnected() {
+			fmt.Println("--- 🔌 Existing network connection detected ---")
+			if err := network.Logout(); err != nil {
 				fmt.Fprintf(os.Stderr, "⚠️  Warning: %v\n", err)
 				// Continue anyway - we'll try to connect with new credentials
 			}
@@ -77,16 +90,98 @@ interactively or with flags for automation.`,
 
 		// If device authorization was selected, run the flow immediately
 		// This shows the authorization box first, before other setup prompts
-		var deviceAuthToken *nexus.TokenResponse
+		var deviceAuthResult *DeviceAuthResult
+		var earlyNetworkConnected bool
+		var nodeName string // Declare early for reuse throughout init
+
 		if choice == nexus.NetChoiceDevice {
-			deviceAuthToken, err = runDeviceAuthFlow(authServiceURL)
+			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
 				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
 				os.Exit(1)
 			}
+
+			// Immediately connect to network after device auth succeeds
+			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
+
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Connecting as '%s'...\n", nodeName)
+			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ Successfully connected to the AceTeam Network!")
+			earlyNetworkConnected = true
+
 			fmt.Println("\n--- Continuing with node setup ---")
+		}
+
+		// Also connect early when authkey is provided via flag
+		if choice == nexus.NetChoiceAuthkey && key != "" && !earlyNetworkConnected {
+			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
+
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Connecting as '%s'...\n", nodeName)
+			if err := connectToNetwork(nodeName, key); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("✅ Successfully connected to the AceTeam Network!")
+			earlyNetworkConnected = true
+
+			fmt.Println("\n--- Continuing with node setup ---")
+		}
+
+		// Handle --network-only: just join network and exit
+		if initNetworkOnly {
+			// If we already connected early, just exit
+			if earlyNetworkConnected {
+				fmt.Printf("Node name: %s\n", nodeName)
+				return
+			}
+
+			// Get node name if not already set
+			if nodeName == "" {
+				nodeName, err = getNodeName()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+					os.Exit(1)
+				}
+			}
+
+			// Determine authkey to use
+			var authkeyToUse string
+			if choice == nexus.NetChoiceDevice && deviceAuthResult != nil {
+				authkeyToUse = deviceAuthResult.Token.Authkey
+			} else if key != "" {
+				authkeyToUse = key
+			}
+
+			if authkeyToUse != "" {
+				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
+				if err := connectToNetwork(nodeName, authkeyToUse); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("\n✅ Successfully connected to the AceTeam Network!")
+			} else if choice != nexus.NetChoiceSkip {
+				fmt.Println("⚠️  No authkey available. Run 'citadel login' to complete network setup.")
+			}
+
+			fmt.Printf("Node name: %s\n", nodeName)
+			return
 		}
 
 		selectedService, err := getSelectedService()
@@ -95,10 +190,13 @@ interactively or with flags for automation.`,
 			os.Exit(1)
 		}
 
-		nodeName, err := getNodeName()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
-			os.Exit(1)
+		// Get node name if not already set during early network connection
+		if nodeName == "" {
+			nodeName, err = getNodeName()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		if !initVerbose {
@@ -120,8 +218,8 @@ interactively or with flags for automation.`,
 		}
 		// Extract org-id from device auth token if available
 		orgID := ""
-		if deviceAuthToken != nil {
-			orgID = deviceAuthToken.OrgID
+		if deviceAuthResult != nil && deviceAuthResult.Token != nil {
+			orgID = deviceAuthResult.Token.OrgID
 		}
 		configDir, err := generateCitadelConfig(originalUser, nodeName, selectedService, orgID)
 		if err != nil {
@@ -186,17 +284,8 @@ interactively or with flags for automation.`,
 			)
 		}
 
-		// Tailscale is only needed if we're connecting to the network
-		// If user chose to skip network, don't install Tailscale yet
-		if choice != nexus.NetChoiceSkip {
-			provisionSteps = append(provisionSteps,
-				struct {
-					name     string
-					checkCmd string
-					run      func() error
-				}{"Tailscale", "tailscale", installTailscale},
-			)
-		}
+		// Note: Network connectivity is now handled via embedded tsnet library
+		// No external Tailscale installation is needed
 
 		for _, step := range provisionSteps {
 			if initVerbose {
@@ -226,9 +315,6 @@ interactively or with flags for automation.`,
 		if selectedService == "none" {
 			fmt.Println("   ℹ️  Docker installation was skipped (service=none).")
 		}
-		if choice == nexus.NetChoiceSkip {
-			fmt.Println("   ℹ️  Tailscale installation was skipped (network connection will be set up later).")
-		}
 
 		// --- 3. Final Handoff ---
 		// Only show Docker permissions warning if we actually added the user to the group
@@ -239,39 +325,52 @@ interactively or with flags for automation.`,
 
 		if choice == nexus.NetChoiceSkip {
 			fmt.Println("\n✅ Node is provisioned. Network connection was skipped.")
-			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel up --authkey <key>'")
+			fmt.Println("   To connect to the network later, run 'citadel login' or 'citadel login --authkey <key>'")
 			return
 		}
 
-		if choice == nexus.NetChoiceVerified {
-			fmt.Println("\n✅ Node is provisioned. Since you are already logged in, services will start now.")
+		if choice == nexus.NetChoiceVerified || earlyNetworkConnected {
+			fmt.Println("\n✅ Node is provisioned. Network is connected, services will start now.")
 		} else {
 			fmt.Println("\n✅ Node is provisioned. Now connecting to the network...")
 		}
 
 		executablePath, _ := os.Executable()
-		var upArgs []string
 
-		if choice == nexus.NetChoiceDevice {
-			// Device authorization was already completed at the start
-			// Use the stored token as an authkey for the rest of the flow
-			upArgs = []string{"up", "--authkey", deviceAuthToken.Authkey}
-		} else {
-			upArgs = []string{"up"}
-			if key != "" {
-				upArgs = append(upArgs, "--authkey", key)
+		// Join the network if we have an authkey and haven't connected early
+		if !earlyNetworkConnected {
+			var authKey string
+			if choice == nexus.NetChoiceDevice {
+				authKey = deviceAuthResult.Token.Authkey
+			} else if key != "" {
+				authKey = key
+			}
+
+			if authKey != "" {
+				fmt.Println("--- 🌐 Joining network ---")
+				loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
+				loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
+				loginCmd := exec.Command("sudo", "sh", "-c", loginCmdString)
+				loginCmd.Stdout = os.Stdout
+				loginCmd.Stderr = os.Stderr
+				if err := loginCmd.Run(); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ 'citadel login' command failed: %v\n", err)
+					os.Exit(1)
+				}
 			}
 		}
 
+		// Start services with --force to avoid interactive prompts
+		runArgs := []string{"run", "--force"}
+
 		if initTest {
-			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring services online for testing ---")
-			testUpArgs := append(upArgs, "--services-only")
-			upCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(testUpArgs, " "))
-			upCmd := runAsUser(originalUser, upCmdString)
-			upCmd.Stdout = os.Stdout
-			upCmd.Stderr = os.Stderr
-			if err := upCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed during pre-test setup: %v\n", err)
+			fmt.Println("--- 🚀 Starting services for testing ---")
+			runCmdString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(runArgs, " "))
+			runCmd := runAsUser(originalUser, runCmdString)
+			runCmd.Stdout = os.Stdout
+			runCmd.Stderr = os.Stderr
+			if err := runCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel run' command failed during pre-test setup: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -284,13 +383,13 @@ interactively or with flags for automation.`,
 				os.Exit(1)
 			}
 		} else {
-			fmt.Println("--- 🚀 Handing off to 'citadel up' to bring node online ---")
-			upCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(upArgs, " "))
-			upCmd := runAsUser(originalUser, upCommandString)
-			upCmd.Stdout = os.Stdout
-			upCmd.Stderr = os.Stderr
-			if err := upCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ 'citadel up' command failed: %v\n", err)
+			fmt.Println("--- 🚀 Starting services ---")
+			runCommandString := fmt.Sprintf("cd %s && %s %s", configDir, executablePath, strings.Join(runArgs, " "))
+			runCmd := runAsUser(originalUser, runCommandString)
+			runCmd.Stdout = os.Stdout
+			runCmd.Stderr = os.Stderr
+			if err := runCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 'citadel run' command failed: %v\n", err)
 				os.Exit(1)
 			}
 		}
@@ -339,8 +438,12 @@ func getNodeName() (string, error) {
 	if initNodeName != "" {
 		return initNodeName, nil
 	}
-	defaultName, _ := os.Hostname()
-	return ui.AskInput("Enter a name for this node:", "e.g., gpu-node-1", defaultName)
+	// Use hostname by default without prompting
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("could not determine hostname: %w", err)
+	}
+	return hostname, nil
 }
 
 func checkForRunningServicesQuiet(serviceToStart string) error {
@@ -824,85 +927,29 @@ func configureNvidiaDocker() error {
 	return dockerMgr.ConfigureRuntime()
 }
 
-func installTailscale() error {
-	if platform.IsWindows() {
-		if initVerbose {
-			fmt.Println("     - Installing Tailscale via winget...")
-		}
-		cmd := exec.Command("winget", "install", "--id", "Tailscale.Tailscale", "--silent", "--accept-package-agreements", "--accept-source-agreements")
+// connectToNetwork connects to the AceTeam Network using the embedded tsnet library.
+// No external Tailscale installation is required.
+func connectToNetwork(nodeName, authKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
-		output, err := cmd.CombinedOutput()
-		alreadyInstalled := false
-		if err != nil {
-			outputStr := string(output)
-			// Check if it's already installed
-			if strings.Contains(outputStr, "already installed") ||
-			   strings.Contains(outputStr, "No applicable upgrade found") ||
-			   strings.Contains(outputStr, "No available upgrade found") {
-				if initVerbose {
-					fmt.Println("     ✅ Tailscale is already installed.")
-				}
-				alreadyInstalled = true
-			} else {
-				// Show helpful error message
-				if initVerbose {
-					fmt.Fprintf(os.Stderr, "     Winget output: %s\n", outputStr)
-				}
-				return fmt.Errorf("winget install failed: %w", err)
-			}
-		}
-
-		// Start the Tailscale service now while we have Administrator privileges
-		// This ensures the service is running before we hand off to 'citadel up'
-		if initVerbose {
-			fmt.Println("     - Ensuring Tailscale service is started...")
-		}
-		startCmd := exec.Command("net", "start", "Tailscale")
-		startOutput, startErr := startCmd.CombinedOutput()
-		startOutputStr := string(startOutput)
-
-		if startErr == nil {
-			if initVerbose {
-				fmt.Println("     ✅ Tailscale service started successfully.")
-			}
-		} else if strings.Contains(startOutputStr, "already") || strings.Contains(startOutputStr, "started") {
-			if initVerbose {
-				fmt.Println("     ✅ Tailscale service is already running.")
-			}
-		} else if alreadyInstalled {
-			// If Tailscale was already installed but service won't start, it might be running already
-			// Check with tailscale status
-			statusCmd := exec.Command("tailscale", "status")
-			if statusCmd.Run() == nil {
-				if initVerbose {
-					fmt.Println("     ✅ Tailscale is responding to status checks.")
-				}
-			} else if initVerbose {
-				fmt.Printf("     ⚠️  Warning: Could not verify Tailscale service status: %s\n", startOutputStr)
-			}
-		} else if initVerbose {
-			fmt.Printf("     ⚠️  Warning: Could not start Tailscale service: %s\n", startOutputStr)
-		}
-
-		return nil
+	config := network.ServerConfig{
+		Hostname:   nodeName,
+		ControlURL: nexusURL, // From root.go
+		AuthKey:    authKey,
 	}
 
-	if initVerbose {
-		fmt.Println("     - Running Tailscale install script...")
+	srv, err := network.Connect(ctx, config)
+	if err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	script := "curl -fsSL https://tailscale.com/install.sh | sh"
-	cmd := exec.Command("sh", "-c", script)
-
-	if initVerbose {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	} else {
-		cmd.Stdout = nil
-		cmd.Stderr = nil
+	ip, _ := srv.GetIPv4()
+	if ip != "" {
+		fmt.Printf("   IP: %s\n", ip)
 	}
 
-	return cmd.Run()
+	return nil
 }
 
 type DockerPsResult struct {
@@ -917,4 +964,5 @@ func init() {
 	initCmd.Flags().StringVar(&initNodeName, "node-name", "", "Set the node name (defaults to hostname)")
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
+	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Only join the network, skip service provisioning")
 }

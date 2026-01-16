@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/aceboss/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 type OllamaInferenceHandler struct{}
