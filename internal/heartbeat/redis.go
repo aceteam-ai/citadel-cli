@@ -18,11 +18,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/redis/go-redis/v9"
 )
+
+// nodeIDPattern validates node IDs to prevent injection attacks.
+// Only allows alphanumeric characters, hyphens, underscores, and dots.
+var nodeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
 // StatusMessage is the payload published to Redis for status updates.
 type StatusMessage struct {
@@ -35,11 +41,14 @@ type StatusMessage struct {
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
 type RedisPublisher struct {
-	client     *redis.Client
-	nodeID     string
+	client    *redis.Client
+	nodeID    string
+	interval  time.Duration
+	collector *status.Collector
+
+	// deviceCode is protected by mu since it can be updated after auth
+	mu         sync.RWMutex
 	deviceCode string
-	interval   time.Duration
-	collector  *status.Collector
 
 	// Redis key names
 	pubSubChannel string // For real-time UI updates
@@ -68,6 +77,11 @@ type RedisPublisherConfig struct {
 func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*RedisPublisher, error) {
 	if cfg.Interval == 0 {
 		cfg.Interval = 30 * time.Second
+	}
+
+	// Validate NodeID to prevent injection attacks
+	if cfg.NodeID != "" && !nodeIDPattern.MatchString(cfg.NodeID) {
+		return nil, fmt.Errorf("invalid node ID: must be 1-64 alphanumeric characters, hyphens, underscores, or dots")
 	}
 
 	// Parse Redis URL
@@ -129,12 +143,15 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to collect status: %w", err)
 	}
 
+	// Get device code (thread-safe)
+	deviceCode := p.getDeviceCode()
+
 	// Build status message
 	msg := StatusMessage{
 		Version:    "1.0",
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		NodeID:     p.nodeID,
-		DeviceCode: p.deviceCode,
+		DeviceCode: deviceCode,
 		Status:     nodeStatus,
 	}
 
@@ -155,8 +172,8 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		"timestamp": msg.Timestamp,
 		"payload":   string(jsonData),
 	}
-	if p.deviceCode != "" {
-		streamFields["deviceCode"] = p.deviceCode
+	if deviceCode != "" {
+		streamFields["deviceCode"] = deviceCode
 	}
 
 	if err := p.client.XAdd(ctx, &redis.XAddArgs{
@@ -172,8 +189,18 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 }
 
 // SetDeviceCode updates the device code (used after device auth completes).
+// This method is thread-safe.
 func (p *RedisPublisher) SetDeviceCode(code string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.deviceCode = code
+}
+
+// getDeviceCode returns the device code in a thread-safe manner.
+func (p *RedisPublisher) getDeviceCode() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.deviceCode
 }
 
 // PublishOnce sends a single status update and returns.

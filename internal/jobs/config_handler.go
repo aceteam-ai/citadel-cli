@@ -10,12 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
+
+// serviceNamePattern validates service names to prevent path traversal.
+// Only allows lowercase alphanumeric characters and hyphens.
+var serviceNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
 // DeviceConfig represents the configuration received from the onboarding wizard.
 type DeviceConfig struct {
@@ -140,7 +145,12 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 
 	manifest.Services = nil
 	for _, svcName := range config.Services {
-		// Check if service is available
+		// Validate service name to prevent path traversal
+		if !serviceNamePattern.MatchString(svcName) {
+			continue // Skip invalid service names
+		}
+
+		// Check if service is available in the whitelist
 		if _, ok := services.ServiceMap[svcName]; !ok {
 			continue // Skip unknown services
 		}
@@ -185,6 +195,11 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 	servicesDir := filepath.Join(configDir, "services")
 
 	for _, svcName := range serviceNames {
+		// Validate service name to prevent path traversal
+		if !serviceNamePattern.MatchString(svcName) {
+			continue // Skip invalid service names
+		}
+
 		composeFile := filepath.Join(servicesDir, svcName+".yml")
 
 		// Check if compose file exists
