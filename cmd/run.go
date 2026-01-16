@@ -31,6 +31,9 @@ and started. When no service is specified, all services in the manifest are star
 
 Use --restart to restart running services instead of starting fresh.
 
+Note: For production use, consider 'citadel work' which starts services AND runs
+the job worker in a single command.
+
 Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 	Example: `  # Start a specific service (adds to manifest)
   citadel run vllm
@@ -42,7 +45,10 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
   citadel run --restart
 
   # Start in foreground mode
-  citadel run ollama --detach=false`,
+  citadel run ollama --detach=false
+
+  # Recommended: Start services + worker together
+  citadel work --mode=nexus`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		if restartServices {

@@ -132,11 +132,16 @@ func (m DeviceCodeModel) View() string {
 		return "│" + strings.Repeat(" ", leftPad) + displayText + strings.Repeat(" ", rightPad) + "│\n"
 	}
 
+	// Instruction text OUTSIDE the box (at the very top, only when waiting)
+	if m.status == "waiting" {
+		sb.WriteString(color.New(color.Faint).Sprint(
+			"(Press 'b' to open browser, 'c' to copy URL, 'q' to quit)\n\n"))
+	}
+
 	// Top border
 	sb.WriteString("┌" + strings.Repeat("─", boxWidth) + "┐\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	sb.WriteString("│" + centerText("Device Authorization", boxWidth) + "│\n")
-	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Instructions
@@ -161,6 +166,13 @@ func (m DeviceCodeModel) View() string {
 
 	sb.WriteString("│" + centerText("╚══════════════╝", boxWidth) + "│\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+
+	// Keyboard shortcuts - MORE PROMINENT, right after code box
+	if m.status == "waiting" {
+		shortcutsPlain := "[b] Open Browser   [c] Copy URL   [C] Copy Code"
+		sb.WriteString(padLine(shortcutsPlain, 2))
+		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	}
 
 	// Status
 	if m.status == "waiting" {
@@ -196,18 +208,10 @@ func (m DeviceCodeModel) View() string {
 		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	}
 
-	// Keyboard shortcuts and browser hint
-	if m.status == "waiting" {
-		dimStyle := color.New(color.Faint)
-		shortcutsPlain := "'b' browser  •  'c' copy URL  •  'C' copy code"
-		shortcutsStyled := dimStyle.Sprint(shortcutsPlain)
-		sb.WriteString(padLineColored(shortcutsStyled, shortcutsPlain, 2))
-
-		// Show complete URL as clickable link
-		if len(completeURL) <= 57 {
-			clickableComplete := Hyperlink(completeURL, completeURL)
-			sb.WriteString(padLineHyperlink(clickableComplete, completeURL, 2))
-		}
+	// Show complete URL as clickable link at bottom
+	if m.status == "waiting" && len(completeURL) <= 57 {
+		clickableComplete := Hyperlink(completeURL, completeURL)
+		sb.WriteString(padLineHyperlink(clickableComplete, completeURL, 2))
 		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	}
 

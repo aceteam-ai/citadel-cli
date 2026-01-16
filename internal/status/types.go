@@ -24,8 +24,9 @@ type NodeStatus struct {
 
 // NodeInfo contains basic node identification.
 type NodeInfo struct {
-	Name         string `json:"name"`
-	TailscaleIP  string `json:"tailscale_ip,omitempty"`
+	Name          string `json:"name"`
+	NetworkIP     string `json:"network_ip,omitempty"`     // Preferred: AceTeam Network IP
+	TailscaleIP   string `json:"tailscale_ip,omitempty"`   // Kept for backwards compatibility
 	UptimeSeconds int64  `json:"uptime_seconds"`
 }
 

@@ -39,6 +39,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 // This method blocks until the context is cancelled.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
@@ -134,5 +135,21 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"services": status.Services,
+	})
+}
+
+// handlePing returns a lightweight pong response for health checks.
+// GET /ping
+// This is useful since ICMP ping doesn't work with userspace networking.
+func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "pong",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
