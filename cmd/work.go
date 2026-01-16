@@ -37,6 +37,10 @@ var (
 	// SSH key sync flags
 	workSSHSync     bool
 	workSSHSyncMins int
+
+	// Redis status publishing flags
+	workRedisStatus bool
+	workDeviceCode  string
 )
 
 var workCmd = &cobra.Command{
@@ -243,6 +247,44 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - ⚠️ SSH sync enabled but no API key configured")
 	}
 
+	// Start Redis status publisher if enabled (for Redis mode)
+	if workRedisStatus && workRedisURL != "" {
+		// Get device code from flag or environment
+		deviceCode := workDeviceCode
+		if deviceCode == "" {
+			deviceCode = os.Getenv("CITADEL_DEVICE_CODE")
+		}
+
+		// Create collector if not already created
+		if collector == nil {
+			collector = status.NewCollector(status.CollectorConfig{
+				NodeName:  nodeName,
+				ConfigDir: "",
+				Services:  nil,
+			})
+		}
+
+		redisPublisher, err := heartbeat.NewRedisPublisher(heartbeat.RedisPublisherConfig{
+			RedisURL:      workRedisURL,
+			RedisPassword: workRedisPass,
+			NodeID:        nodeName,
+			DeviceCode:    deviceCode,
+		}, collector)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
+		} else {
+			go func() {
+				fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
+				if deviceCode != "" {
+					fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
+				}
+				if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
+				}
+			}()
+		}
+	}
+
 	// Create handlers (use legacy adapters for now)
 	handlers := worker.CreateLegacyHandlers()
 
@@ -293,4 +335,8 @@ func init() {
 	// SSH key sync flags
 	workCmd.Flags().BoolVar(&workSSHSync, "ssh-sync", false, "Enable SSH authorized_keys synchronization from AceTeam")
 	workCmd.Flags().IntVar(&workSSHSyncMins, "ssh-sync-interval", 5, "SSH sync interval in minutes")
+
+	// Redis status publishing flags
+	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", false, "Enable Redis status publishing for real-time updates")
+	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
 }
