@@ -2,7 +2,11 @@
 
 **Issue:** [#30](https://github.com/aceteam-ai/citadel-cli/issues/30)
 
-## Architecture Overview
+## Overview
+
+This feature enables real-time node status publishing via Redis for live dashboard updates and reliable device configuration from the onboarding wizard. It bridges the gap between the Citadel CLI agent and the AceTeam web platform.
+
+## Architecture
 
 ```
 ┌─────────────────┐                      ┌─────────────────┐
@@ -25,138 +29,305 @@
          │                                        │
 ```
 
-**Data Flow:**
-1. CLI publishes status to Redis (both Pub/Sub for real-time UI and Streams for reliable processing)
-2. Python worker consumes status from Streams, persists to database
-3. Python worker looks up device config (from onboarding wizard) and pushes config job
-4. CLI receives config job via existing worker infrastructure
-5. CLI applies configuration (starts services, sets tags, etc.)
+### Data Flow
 
-## Implementation Components
+1. **Status Publishing**: Citadel publishes node status to Redis every 30 seconds
+   - Pub/Sub channel for real-time UI updates
+   - Stream for reliable processing by Python worker
+2. **Status Persistence**: Python worker consumes from stream, persists to `fabric_nodes` table
+3. **Config Lookup**: When status contains `deviceCode`, Python worker looks up onboarding config
+4. **Config Push**: Python worker pushes `APPLY_DEVICE_CONFIG` job to Redis
+5. **Config Application**: Citadel applies configuration (updates manifest, starts services)
 
-### 1. Redis Status Publisher (`internal/heartbeat/redis.go`)
+## Components
+
+### 1. Redis Status Publisher
+
+**Location:** `internal/heartbeat/redis.go`
 
 Publishes node status to Redis for real-time UI updates and reliable processing.
 
-**Key Features:**
-- Publishes to Pub/Sub for real-time UI updates (`node:status:{nodeId}`)
-- Publishes to Streams for reliable processing (`node:status:stream`)
-- Includes device_code in status payload for config lookup
-- Reuses existing `status.Collector` for metrics
+```go
+type RedisPublisher struct {
+    client     *redis.Client
+    nodeID     string
+    deviceCode string  // Set after device auth
+    interval   time.Duration
+    collector  *status.Collector
+}
 
-### 2. Device Config Job Handler (`internal/jobs/config_handler.go`)
+type RedisPublisherConfig struct {
+    RedisURL      string        // Redis connection URL
+    RedisPassword string        // Optional password
+    NodeID        string        // Node identifier (hostname)
+    DeviceCode    string        // Device auth code for config lookup
+    Interval      time.Duration // Publish interval (default: 30s)
+}
+```
 
-Handles `APPLY_DEVICE_CONFIG` jobs to configure the node based on onboarding wizard selections.
+**Key Methods:**
+- `NewRedisPublisher(cfg, collector)` - Create new publisher
+- `Start(ctx)` - Start periodic publishing (blocking)
+- `PublishOnce(ctx)` - Send single status update
+- `SetDeviceCode(code)` - Update device code after auth
+- `Close()` - Close Redis connection
 
-**DeviceConfig Fields:**
-- `deviceName`: Node display name
-- `services`: Services to run (vllm, ollama, etc.)
-- `autoStartServices`: Whether to auto-start services
-- `sshEnabled`: Enable SSH access
-- `customTags`: Tags for node classification
-- `healthMonitoringEnabled`: Enable health monitoring
-- `alertOnOffline`: Alert when node goes offline
-- `alertOnHighTemp`: Alert on high GPU temperature
-
-### 3. Status Message Schema
+### 2. Status Message Schema
 
 ```go
 type StatusMessage struct {
     Version    string             `json:"version"`
-    Timestamp  string             `json:"timestamp"`
+    Timestamp  string             `json:"timestamp"`      // RFC3339
     NodeID     string             `json:"nodeId"`
     DeviceCode string             `json:"deviceCode,omitempty"`
     Status     *status.NodeStatus `json:"status"`
 }
 ```
 
+**Example Payload:**
+```json
+{
+  "version": "1.0",
+  "timestamp": "2024-01-15T12:00:00Z",
+  "nodeId": "gpu-server-1",
+  "deviceCode": "abc123def456",
+  "status": {
+    "version": "1.0",
+    "timestamp": "2024-01-15T12:00:00Z",
+    "node": {
+      "name": "gpu-server-1",
+      "tailscale_ip": "100.64.0.5",
+      "uptime_seconds": 86400
+    },
+    "system": {
+      "cpu_percent": 45.2,
+      "memory_used_gb": 24.5,
+      "memory_total_gb": 64.0,
+      "memory_percent": 38.3,
+      "disk_used_gb": 250.0,
+      "disk_total_gb": 1000.0,
+      "disk_percent": 25.0
+    },
+    "gpu": [
+      {
+        "index": 0,
+        "name": "NVIDIA RTX 4090",
+        "memory_total_mb": 24576,
+        "utilization_percent": 85.0,
+        "temperature_celsius": 72
+      }
+    ],
+    "services": [
+      {
+        "name": "vllm",
+        "type": "llm",
+        "status": "running",
+        "port": 8000,
+        "health": "ok",
+        "models": ["meta-llama/Llama-2-7b-chat-hf"]
+      }
+    ]
+  }
+}
+```
+
+### 3. Device Config Handler
+
+**Location:** `internal/jobs/config_handler.go`
+
+Handles `APPLY_DEVICE_CONFIG` jobs to configure the node based on onboarding wizard selections.
+
+```go
+type DeviceConfig struct {
+    DeviceName              string   `json:"deviceName"`
+    Services                []string `json:"services"`
+    AutoStartServices       bool     `json:"autoStartServices"`
+    SSHEnabled              bool     `json:"sshEnabled"`
+    CustomTags              []string `json:"customTags"`
+    HealthMonitoringEnabled bool     `json:"healthMonitoringEnabled"`
+    AlertOnOffline          bool     `json:"alertOnOffline"`
+    AlertOnHighTemp         bool     `json:"alertOnHighTemp"`
+}
+```
+
+**Handler Behavior:**
+1. Parse config from job payload
+2. Update `citadel.yaml` manifest with new settings
+3. Write service compose files to `~/citadel-node/services/`
+4. Start services if `autoStartServices` is true
+5. Return success/failure status
+
 ## Redis Keys/Channels
 
-| Key Pattern | Type | Purpose |
-|-------------|------|---------|
-| `node:status:{nodeId}` | Pub/Sub | Real-time status updates for UI |
-| `node:status:stream` | Stream | Reliable status processing |
-| `jobs:v1:config` | Stream | Config jobs pushed by Python worker |
+| Key Pattern | Type | Purpose | TTL/MaxLen |
+|-------------|------|---------|------------|
+| `node:status:{nodeId}` | Pub/Sub | Real-time status updates for UI | N/A |
+| `node:status:stream` | Stream | Reliable status processing | ~10,000 entries |
+| `jobs:v1:config` | Stream | Config jobs from Python worker | Varies |
+
+### Stream Entry Format
+
+**node:status:stream:**
+```
+XADD node:status:stream * \
+  nodeId "gpu-server-1" \
+  timestamp "2024-01-15T12:00:00Z" \
+  deviceCode "abc123" \
+  payload '{"version":"1.0",...}'
+```
+
+**jobs:v1:config:**
+```
+XADD jobs:v1:config * \
+  jobId "uuid-here" \
+  type "APPLY_DEVICE_CONFIG" \
+  payload '{"config":{"services":["ollama"],"autoStartServices":true}}'
+```
 
 ## Usage
 
-### Starting the Worker with Redis Status Publishing
-
-```bash
-# Environment variables
-export REDIS_URL=redis://localhost:6379
-export CITADEL_DEVICE_CODE=abc123  # Optional, from device auth
-
-# Run worker with Redis status publishing
-citadel work --mode=redis --redis-url=$REDIS_URL
-```
-
 ### Command-Line Flags
 
-The Redis status publisher is automatically started when running in Redis mode:
-
 ```bash
-citadel work --mode=redis \
+# Full command with all flags
+citadel work \
+  --mode=redis \
   --redis-url=redis://localhost:6379 \
-  --queue=jobs:v1:gpu-general
+  --redis-password=secret \
+  --redis-status \
+  --device-code=abc123 \
+  --queue=jobs:v1:gpu-general \
+  --group=citadel-workers
 ```
 
-Device code can be set via:
-- `CITADEL_DEVICE_CODE` environment variable
-- Automatically captured during device auth flow
+### Environment Variables
 
-## Verification
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `REDIS_URL` | Redis connection URL | Required |
+| `REDIS_PASSWORD` | Redis password | None |
+| `CITADEL_DEVICE_CODE` | Device auth code | None |
+| `WORKER_QUEUE` | Queue to consume from | `jobs:v1:gpu-general` |
+| `CONSUMER_GROUP` | Consumer group name | `citadel-workers` |
+| `CITADEL_NODE_NAME` | Node identifier | Hostname |
+
+### Example: Full Worker Startup
+
+```bash
+export REDIS_URL=redis://redis.aceteam.ai:6379
+export REDIS_PASSWORD=your-password
+export CITADEL_DEVICE_CODE=abc123def456
+export CITADEL_NODE_NAME=my-gpu-server
+
+citadel work --mode=redis --redis-status
+```
+
+## Verification & Testing
 
 ### 1. Status Publishing
 
 ```bash
-# Start citadel with Redis
-REDIS_URL=redis://localhost:6379 citadel work --mode=redis
+# Terminal 1: Start citadel worker
+REDIS_URL=redis://localhost:6379 citadel work --mode=redis --redis-status
 
-# Monitor Pub/Sub
-redis-cli SUBSCRIBE "node:status:*"
+# Terminal 2: Monitor Pub/Sub
+redis-cli PSUBSCRIBE "node:status:*"
 
-# Check Stream
+# Terminal 3: Check Stream
 redis-cli XREAD STREAMS node:status:stream 0
+
+# Check stream length
+redis-cli XLEN node:status:stream
 ```
 
 ### 2. Config Application
 
 ```bash
-# Manually push a config job
+# Push a test config job
 redis-cli XADD jobs:v1:config '*' \
-  jobId "test-123" \
+  jobId "test-$(date +%s)" \
   type "APPLY_DEVICE_CONFIG" \
-  payload '{"services":["ollama"],"autoStartServices":true}'
+  payload '{"config":{"deviceName":"test-node","services":["ollama"],"autoStartServices":true,"customTags":["test"]}}'
 
-# Verify service starts
-docker ps | grep citadel-ollama
+# Verify manifest was updated
+cat ~/citadel-node/citadel.yaml
+
+# Verify services started
+docker ps | grep citadel-
 ```
 
-### 3. End-to-End
+### 3. End-to-End Flow
 
-1. Run `citadel init` with device auth
-2. Complete onboarding wizard in browser
-3. Verify services auto-start based on wizard selection
+1. Run `citadel init` with device authorization
+2. Note the device code displayed during auth
+3. Complete onboarding wizard in browser at aceteam.ai
+4. Watch worker logs for `APPLY_DEVICE_CONFIG` job
+5. Verify services auto-start based on wizard selection
+
+## Troubleshooting
+
+### Common Issues
+
+**Redis Connection Failed:**
+```
+Error: failed to connect to Redis: dial tcp: lookup redis: no such host
+```
+- Verify `REDIS_URL` is correct
+- Check Redis is running: `redis-cli ping`
+- Check network connectivity
+
+**Status Not Publishing:**
+```
+Warning: Redis status publish failed: ...
+```
+- Check Redis connection
+- Verify worker has `--redis-status` flag
+- Check Redis memory usage
+
+**Config Job Not Applied:**
+```
+Error: missing 'config' field in job payload
+```
+- Verify job payload format matches expected schema
+- Check `config` is a JSON string in the payload
+
+### Debug Commands
+
+```bash
+# Check Redis connection
+redis-cli -u $REDIS_URL ping
+
+# Monitor all Redis traffic
+redis-cli -u $REDIS_URL MONITOR
+
+# Check pending messages in stream
+redis-cli XPENDING node:status:stream citadel-workers
+
+# View recent stream entries
+redis-cli XREVRANGE node:status:stream + - COUNT 5
+```
 
 ## Related Issues
 
-- **aceteam-ai/aceteam#1222**: Python Worker - Node Status Consumer (consume from `node:status:stream`, persist to DB)
-- **aceteam-ai/aceteam#1223**: Python Worker - Device Config Job Publisher (push config jobs on new device registration)
-- **aceteam-ai/aceteam#1224**: Frontend - Real-time Status Updates (subscribe to Pub/Sub for live dashboard)
+- **aceteam-ai/aceteam#1222**: Python Worker - Node Status Consumer
+- **aceteam-ai/aceteam#1223**: Python Worker - Device Config Job Publisher
+- **aceteam-ai/aceteam#1224**: Frontend - Real-time Status Updates
 
 ## Files Changed
 
 | File | Action | Description |
 |------|--------|-------------|
 | `internal/heartbeat/redis.go` | CREATE | Redis status publisher |
+| `internal/heartbeat/redis_test.go` | CREATE | Publisher tests |
 | `internal/jobs/config_handler.go` | CREATE | Device config job handler |
+| `internal/worker/job.go` | MODIFY | Add `JobTypeApplyDeviceConfig` |
+| `internal/worker/handler_adapter.go` | MODIFY | Register config handler |
 | `cmd/helpers.go` | MODIFY | Return device_code from auth flow |
-| `cmd/work.go` | MODIFY | Start Redis publisher, integrate config handler |
+| `cmd/work.go` | MODIFY | Add `--redis-status` and `--device-code` flags |
 
-## Python Worker Responsibilities (Out of Scope)
+## Security Considerations
 
-The Python worker will need to:
-1. Subscribe to `node:status:stream` as a consumer
-2. Persist status to database (fabric_nodes table)
-3. On new device_code, lookup device_config and push job to `jobs:v1:config`
+1. **Redis Authentication**: Always use password authentication in production
+2. **Device Code Handling**: Device codes are single-use and expire after 10 minutes
+3. **Config Validation**: Config handler validates service names against known services
+4. **No Sensitive Data in Status**: Status payloads contain metrics only, no credentials
