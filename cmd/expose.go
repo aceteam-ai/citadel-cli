@@ -14,10 +14,11 @@ import (
 )
 
 var (
-	exposeService string
-	exposeList    bool
-	exposeRemove  bool
-	exposeHTTPS   bool
+	exposeService   string
+	exposeList      bool
+	exposeRemove    bool
+	exposeHTTPS     bool
+	exposeLocalPort int // --to flag for destination port
 )
 
 // Known service ports
@@ -29,19 +30,28 @@ var servicePorts = map[string]int{
 }
 
 var exposeCmd = &cobra.Command{
-	Use:   "expose [port]",
+	Use:   "expose [port] or [network-port:local-port]",
 	Short: "Expose a local port over the Tailscale network",
 	Long: `Expose a local service port so other nodes in the network can access it.
 
 By default, services are accessible via your Tailscale IP. This command
 uses 'tailscale serve' to create friendly HTTPS URLs.
 
+Port mapping can be specified as:
+  - Single port: expose the same port (e.g., 8080 -> localhost:8080)
+  - Port pair: network-port:local-port (e.g., 443:8000 -> localhost:8000 as 443)
+  - With --to flag: citadel expose 443 --to 8000
+
 Without any arguments, shows the current node's access information.`,
 	Example: `  # Show current access info (Tailscale IP and hostname)
   citadel expose
 
-  # Expose a specific port
+  # Expose a specific port (same port locally and on network)
   citadel expose 8080
+
+  # Expose local port 8000 as port 443 on the network
+  citadel expose 443:8000
+  citadel expose 443 --to 8000
 
   # Expose a known service by name
   citadel expose --service ollama
@@ -65,8 +75,8 @@ Without any arguments, shows the current node's access information.`,
 				fmt.Fprintln(os.Stderr, "Error: specify a port or --service to remove")
 				os.Exit(1)
 			}
-			port := getPort(args)
-			removeExposedPort(port)
+			mapping := getPortMapping(args)
+			removeExposedPort(mapping.networkPort)
 			return
 		}
 
@@ -77,12 +87,18 @@ Without any arguments, shows the current node's access information.`,
 		}
 
 		// Expose a port
-		port := getPort(args)
-		exposePort(port)
+		mapping := getPortMapping(args)
+		exposePortMapping(mapping)
 	},
 }
 
-func getPort(args []string) int {
+// portMapping holds the network port and local port for exposure
+type portMapping struct {
+	networkPort int // Port exposed on the network
+	localPort   int // Local port to forward to
+}
+
+func getPortMapping(args []string) portMapping {
 	// If service flag is set, use service port
 	if exposeService != "" {
 		port, ok := servicePorts[exposeService]
@@ -91,7 +107,7 @@ func getPort(args []string) int {
 			fmt.Fprintln(os.Stderr, "Known services: vllm, ollama, llamacpp, lmstudio")
 			os.Exit(1)
 		}
-		return port
+		return portMapping{networkPort: port, localPort: port}
 	}
 
 	// Otherwise parse port from args
@@ -100,12 +116,34 @@ func getPort(args []string) int {
 		os.Exit(1)
 	}
 
-	port, err := strconv.Atoi(args[0])
+	portArg := args[0]
+
+	// Check for port:port syntax (network:local)
+	if strings.Contains(portArg, ":") {
+		parts := strings.SplitN(portArg, ":", 2)
+		networkPort, err1 := strconv.Atoi(parts[0])
+		localPort, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil || networkPort < 1 || networkPort > 65535 || localPort < 1 || localPort > 65535 {
+			fmt.Fprintf(os.Stderr, "Error: invalid port mapping '%s' (use network-port:local-port)\n", portArg)
+			os.Exit(1)
+		}
+		return portMapping{networkPort: networkPort, localPort: localPort}
+	}
+
+	// Single port
+	port, err := strconv.Atoi(portArg)
 	if err != nil || port < 1 || port > 65535 {
-		fmt.Fprintf(os.Stderr, "Error: invalid port number '%s'\n", args[0])
+		fmt.Fprintf(os.Stderr, "Error: invalid port number '%s'\n", portArg)
 		os.Exit(1)
 	}
-	return port
+
+	// Check if --to flag is set for local port
+	localPort := port
+	if exposeLocalPort > 0 {
+		localPort = exposeLocalPort
+	}
+
+	return portMapping{networkPort: port, localPort: localPort}
 }
 
 func showAccessInfo() {
@@ -167,19 +205,37 @@ func showAccessInfo() {
 	fmt.Println("To expose a port with HTTPS, run: citadel expose <port>")
 }
 
-func exposePort(port int) {
+func exposePortMapping(mapping portMapping) {
 	tailscaleCLI := getTailscaleCLIPath()
 
-	fmt.Printf("Exposing port %d...\n", port)
+	if mapping.networkPort != mapping.localPort {
+		fmt.Printf("Exposing localhost:%d as port %d on network...\n", mapping.localPort, mapping.networkPort)
+	} else {
+		fmt.Printf("Exposing port %d...\n", mapping.networkPort)
+	}
 
 	// Use tailscale serve to expose the port
+	// Format: tailscale serve https:<network-port> / http://127.0.0.1:<local-port>
 	var serveCmd *exec.Cmd
-	localURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	localURL := fmt.Sprintf("http://127.0.0.1:%d", mapping.localPort)
+
+	// If network port differs from local, we need to specify the port in serve
+	var serveArgs []string
+	if mapping.networkPort != mapping.localPort && mapping.networkPort != 443 {
+		// Use specific port syntax: tailscale serve --https=<port> --bg <local-url>
+		serveArgs = []string{"serve", fmt.Sprintf("--https=%d", mapping.networkPort), "--bg", localURL}
+	} else if mapping.networkPort == 443 {
+		// Default HTTPS port
+		serveArgs = []string{"serve", "--bg", localURL}
+	} else {
+		// Same port - use direct syntax
+		serveArgs = []string{"serve", "--bg", localURL}
+	}
 
 	if platform.IsWindows() {
-		serveCmd = exec.Command(tailscaleCLI, "serve", "--bg", localURL)
+		serveCmd = exec.Command(tailscaleCLI, serveArgs...)
 	} else {
-		serveCmd = exec.Command("sudo", tailscaleCLI, "serve", "--bg", localURL)
+		serveCmd = exec.Command("sudo", append([]string{tailscaleCLI}, serveArgs...)...)
 	}
 
 	output, err := serveCmd.CombinedOutput()
@@ -187,7 +243,7 @@ func exposePort(port int) {
 		// Check if it's just a "already serving" type message
 		outputStr := string(output)
 		if strings.Contains(outputStr, "already") {
-			fmt.Printf("Port %d is already exposed.\n", port)
+			fmt.Printf("Port %d is already exposed.\n", mapping.networkPort)
 			return
 		}
 		fmt.Fprintf(os.Stderr, "Error exposing port: %s\n", outputStr)
@@ -198,22 +254,22 @@ func exposePort(port int) {
 	statusCmd := exec.Command(tailscaleCLI, "serve", "status", "--json")
 	statusOutput, _ := statusCmd.Output()
 
-	fmt.Printf("Port %d is now exposed!\n\n", port)
+	fmt.Printf("Port mapping %d -> localhost:%d is now active!\n\n", mapping.networkPort, mapping.localPort)
 	fmt.Println("Access URLs:")
 
 	// Show the Tailscale IP access
 	ipCmd := exec.Command(tailscaleCLI, "ip", "-4")
 	if ipOutput, err := ipCmd.Output(); err == nil {
 		ip := strings.TrimSpace(string(ipOutput))
-		fmt.Printf("  http://%s:%d\n", ip, port)
+		fmt.Printf("  http://%s:%d -> localhost:%d\n", ip, mapping.networkPort, mapping.localPort)
 	}
 
 	// Parse serve status for HTTPS URL
 	if len(statusOutput) > 0 {
-		var serveStatus map[string]interface{}
+		var serveStatus map[string]any
 		if json.Unmarshal(statusOutput, &serveStatus) == nil {
 			// Try to extract the serve URL
-			if web, ok := serveStatus["Web"].(map[string]interface{}); ok {
+			if web, ok := serveStatus["Web"].(map[string]any); ok {
 				for url := range web {
 					fmt.Printf("  %s\n", url)
 				}
@@ -286,4 +342,5 @@ func init() {
 	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Expose a known service by name (vllm, ollama, llamacpp, lmstudio)")
 	exposeCmd.Flags().BoolVar(&exposeList, "list", false, "List currently exposed ports")
 	exposeCmd.Flags().BoolVar(&exposeRemove, "remove", false, "Stop exposing a port")
+	exposeCmd.Flags().IntVar(&exposeLocalPort, "to", 0, "Local port to forward to (e.g., --to 8000 forwards to localhost:8000)")
 }
