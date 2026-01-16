@@ -118,8 +118,8 @@ func showAccessInfo() {
 	statusCmd := exec.Command(tailscaleCLI, "status", "--json")
 	output, err := statusCmd.Output()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error: not connected to Tailscale network")
-		fmt.Fprintln(os.Stderr, "Run 'citadel join' to connect first")
+		fmt.Fprintln(os.Stderr, "Error: not connected to AceTeam Network")
+		fmt.Fprintln(os.Stderr, "Run 'citadel login' to connect first")
 		os.Exit(1)
 	}
 
@@ -127,10 +127,18 @@ func showAccessInfo() {
 		Self struct {
 			DNSName      string   `json:"DNSName"`
 			TailscaleIPs []string `json:"TailscaleIPs"`
+			Online       bool     `json:"Online"`
 		} `json:"Self"`
 	}
 	if err := json.Unmarshal(output, &status); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing Tailscale status: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error parsing network status: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check if actually online
+	if !status.Self.Online {
+		fmt.Fprintln(os.Stderr, "Error: not connected to AceTeam Network")
+		fmt.Fprintln(os.Stderr, "Run 'citadel login' to connect first")
 		os.Exit(1)
 	}
 
@@ -139,8 +147,11 @@ func showAccessInfo() {
 		fmt.Printf("Tailscale IP:  %s\n", status.Self.TailscaleIPs[0])
 	}
 	if status.Self.DNSName != "" {
-		// Remove trailing dot from DNS name
+		// Remove trailing dot and tailnet suffix for cleaner display
 		dnsName := strings.TrimSuffix(status.Self.DNSName, ".")
+		if idx := strings.Index(dnsName, "."); idx > 0 {
+			dnsName = dnsName[:idx]
+		}
 		fmt.Printf("Hostname:      %s\n", dnsName)
 	}
 	fmt.Println()
