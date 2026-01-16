@@ -139,6 +139,7 @@ Built with Cobra. Main command files are in `cmd/`:
 - `init.go`: Provisions fresh servers (installs deps, generates config, connects to network)
 - `up.go`: Brings node online, starts services, runs agent loop
 - `agent.go`: Long-running job dispatcher that polls Nexus for work
+- `work.go`: Unified worker for Redis Streams (private cloud) or Nexus (on-prem)
 - `status.go`: Health check dashboard (system vitals, GPU, network, services)
 - `login.go`: Interactive AceTeam Network authentication
 - `logout.go`: Disconnect from AceTeam Network
@@ -179,7 +180,11 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 - **`internal/network/`**: Embedded tsnet wrapper for AceTeam Network connectivity
 - **`internal/nexus/`**: HTTP client for Nexus API, SSH key sync, device authentication
 - **`internal/platform/`**: Cross-platform utilities (OS detection, package managers, Docker, GPU)
-- **`internal/jobs/`**: Job handler implementations (shell, inference, model download)
+- **`internal/jobs/`**: Job handler implementations (shell, inference, model download, config)
+- **`internal/worker/`**: Unified job runner for Redis Streams and Nexus sources
+- **`internal/heartbeat/`**: Status publishing (HTTP to AceTeam API, Redis Pub/Sub + Streams)
+- **`internal/status/`**: System metrics collection (CPU, memory, GPU, services)
+- **`internal/redis/`**: Redis Streams client for job queue
 - **`internal/ui/`**: Interactive prompts using survey library
 - **`services/`**: Embedded Docker Compose files and service registry
 
@@ -294,6 +299,57 @@ type WorkerJobHandler interface {
 | Retry handling | Nexus server | Consumer groups + DLQ |
 | Scaling | Single node | Horizontal via consumer groups |
 | Target | User's on-prem | AceTeam private cloud |
+
+### Redis Status Publishing
+
+The worker supports real-time status publishing to Redis for live dashboard updates and reliable status processing.
+
+**Key Packages:**
+- **`internal/heartbeat/redis.go`**: Redis status publisher
+- **`internal/jobs/config_handler.go`**: Device configuration job handler
+
+**Architecture:**
+```
+Citadel Node                                Redis
+┌─────────────┐    PUBLISH node:status:X   ┌─────────────┐
+│   Redis     │ ────────────────────────▶  │  Pub/Sub    │ → Real-time UI
+│  Publisher  │                            └─────────────┘
+│   (30s)     │    XADD node:status:stream ┌─────────────┐
+│             │ ────────────────────────▶  │  Streams    │ → Python Worker
+└─────────────┘                            └─────────────┘
+```
+
+**Usage:**
+```bash
+# Enable Redis status publishing
+citadel work --mode=redis --redis-url=redis://localhost:6379 --redis-status
+
+# With device code for config lookup (from device auth flow)
+CITADEL_DEVICE_CODE=abc123 citadel work --mode=redis --redis-status
+```
+
+**Redis Keys:**
+| Key Pattern | Type | Purpose |
+|-------------|------|---------|
+| `node:status:{nodeId}` | Pub/Sub | Real-time status updates for UI |
+| `node:status:stream` | Stream | Reliable status processing by Python worker |
+| `jobs:v1:config` | Stream | Config jobs pushed by Python worker |
+
+**Device Configuration Flow:**
+1. User runs `citadel init` with device authorization
+2. Citadel publishes status with `deviceCode` to Redis
+3. Python worker consumes status, looks up config from onboarding wizard
+4. Python worker pushes `APPLY_DEVICE_CONFIG` job
+5. Citadel applies config (starts services, updates manifest)
+
+**APPLY_DEVICE_CONFIG Job Handler:**
+Handles device configuration from onboarding wizard. Config fields:
+- `deviceName`: Node display name
+- `services`: Services to run (vllm, ollama, etc.)
+- `autoStartServices`: Auto-start services after config
+- `sshEnabled`: Enable SSH access
+- `customTags`: Tags for node classification
+- `healthMonitoringEnabled`, `alertOnOffline`, `alertOnHighTemp`: Monitoring settings
 
 ## Important Implementation Notes
 

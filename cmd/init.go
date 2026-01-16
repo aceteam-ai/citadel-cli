@@ -90,12 +90,12 @@ tsnet and does NOT require sudo.`,
 
 		// If device authorization was selected, run the flow immediately
 		// This shows the authorization box first, before other setup prompts
-		var deviceAuthToken *nexus.TokenResponse
+		var deviceAuthResult *DeviceAuthResult
 		var earlyNetworkConnected bool
 		var nodeName string // Declare early for reuse throughout init
 
 		if choice == nexus.NetChoiceDevice {
-			deviceAuthToken, err = runDeviceAuthFlow(authServiceURL)
+			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
@@ -113,7 +113,7 @@ tsnet and does NOT require sudo.`,
 			}
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
-			if err := connectToNetwork(nodeName, deviceAuthToken.Authkey); err != nil {
+			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
@@ -163,8 +163,8 @@ tsnet and does NOT require sudo.`,
 
 			// Determine authkey to use
 			var authkeyToUse string
-			if choice == nexus.NetChoiceDevice && deviceAuthToken != nil {
-				authkeyToUse = deviceAuthToken.Authkey
+			if choice == nexus.NetChoiceDevice && deviceAuthResult != nil {
+				authkeyToUse = deviceAuthResult.Token.Authkey
 			} else if key != "" {
 				authkeyToUse = key
 			}
@@ -336,7 +336,7 @@ tsnet and does NOT require sudo.`,
 		if !earlyNetworkConnected {
 			var authKey string
 			if choice == nexus.NetChoiceDevice {
-				authKey = deviceAuthToken.Authkey
+				authKey = deviceAuthResult.Token.Authkey
 			} else if key != "" {
 				authKey = key
 			}

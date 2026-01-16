@@ -3,9 +3,29 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
+
+// maskRedisURL masks the password in a Redis URL for safe logging.
+// redis://:password@host:port -> redis://***@host:port
+func maskRedisURL(redisURL string) string {
+	u, err := url.Parse(redisURL)
+	if err != nil {
+		// If parsing fails, just show the scheme and a placeholder
+		if strings.HasPrefix(redisURL, "redis://") {
+			return "redis://***"
+		}
+		return "***"
+	}
+	// If there's a password, mask it
+	if _, hasPass := u.User.Password(); hasPass {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
+}
 
 // RedisSource implements JobSource for Redis Streams.
 // This is the job source for AceTeam's private GPU cloud infrastructure.
@@ -79,7 +99,7 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to create consumer group: %w", err)
 	}
 
-	fmt.Printf("   - Redis URL: %s\n", s.config.URL)
+	fmt.Printf("   - Redis: %s\n", maskRedisURL(s.config.URL))
 	fmt.Printf("   - Worker ID: %s\n", s.client.WorkerID())
 	fmt.Printf("   - Queue: %s\n", s.client.QueueName())
 	fmt.Printf("   - Consumer group: %s\n", s.config.ConsumerGroup)

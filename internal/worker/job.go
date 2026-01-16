@@ -95,6 +95,7 @@ const (
 	JobTypeLlamaCppInference = "LLAMACPP_INFERENCE"
 	JobTypeVLLMInference     = "VLLM_INFERENCE"
 	JobTypeOllamaInference   = "OLLAMA_INFERENCE"
-	JobTypeLLMInference      = "llm_inference" // Redis worker format
-	JobTypeEmbedding         = "embedding"     // Redis worker format
+	JobTypeLLMInference      = "llm_inference"       // Redis worker format
+	JobTypeEmbedding         = "embedding"           // Redis worker format
+	JobTypeApplyDeviceConfig = "APPLY_DEVICE_CONFIG" // Device config from onboarding
 )
