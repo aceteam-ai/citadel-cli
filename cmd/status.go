@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/fatih/color"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -19,14 +21,6 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
 )
-
-type TailscaleStatus struct {
-	Self struct {
-		DNSName      string   `json:"DNSName"`
-		TailscaleIPs []string `json:"TailscaleIPs"`
-		Online       bool     `json:"Online"`
-	} `json:"Self"`
-}
 
 var (
 	headerColor = color.New(color.FgCyan, color.Bold)
@@ -204,26 +198,33 @@ func printGPUInfo(w *tabwriter.Writer) {
 }
 
 func printNetworkInfo(w *tabwriter.Writer) {
-	tailscaleCLI := getTailscaleCLI()
-	tsCmd := exec.Command(tailscaleCLI, "status", "--json")
-	output, err := tsCmd.Output()
+	// Check if we have network state
+	if !network.HasState() {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not logged in)"))
+		fmt.Fprintf(w, "  %s\n", "   Run 'citadel login' to connect to the AceTeam Network")
+		return
+	}
+
+	// Try to get network status
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status, err := network.GetGlobalStatus(ctx)
 	if err != nil {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Tailscale daemon not responding)"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprint("⚠️  WARNING (Could not get network status)"))
 		return
 	}
 
-	var status TailscaleStatus
-	if err := json.Unmarshal(output, &status); err != nil {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprint("⚠️  WARNING (Could not parse Tailscale status)"))
-		return
-	}
-
-	if status.Self.Online {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), goodColor.Sprint("🟢 ONLINE to Nexus"))
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), strings.TrimSuffix(status.Self.DNSName, "."))
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.Self.TailscaleIPs[0])
+	if status.Connected {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), goodColor.Sprint("🟢 ONLINE to AceTeam Network"))
+		if status.Hostname != "" {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), status.Hostname)
+		}
+		if status.IPv4 != "" {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.IPv4)
+		}
 	} else {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not connected to Nexus)"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not connected to AceTeam Network)"))
 	}
 }
 

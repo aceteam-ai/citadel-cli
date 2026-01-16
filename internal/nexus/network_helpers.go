@@ -2,21 +2,12 @@
 package nexus
 
 import (
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
-
-// getTailscaleCLI returns the path to the tailscale CLI executable.
-// Delegates to the centralized platform.GetTailscaleCLI() which handles
-// PATH lookup and platform-specific fallback locations for Windows, macOS, and Linux.
-func getTailscaleCLI() string {
-	return platform.GetTailscaleCLI()
-}
 
 // NetworkChoice represents the user's selected method for network connection.
 type NetworkChoice string
@@ -32,37 +23,18 @@ const (
 	NetChoiceVerified NetworkChoice = "verified"
 )
 
-type tailscaleStatus struct {
-	Self struct {
-		Online bool `json:"Online"`
-	} `json:"Self"`
+// IsNetworkConnected checks if currently connected to the AceTeam Network.
+func IsNetworkConnected() bool {
+	return network.IsGlobalConnected()
 }
 
-// IsTailscaleConnected checks if Tailscale is currently connected to a network.
-func IsTailscaleConnected() bool {
-	tailscaleCLI := getTailscaleCLI()
-	statusCmd := exec.Command(tailscaleCLI, "status", "--json")
-	output, err := statusCmd.Output()
-	if err != nil {
-		return false
+// NetworkLogout logs out of the current network connection.
+func NetworkLogout() error {
+	fmt.Println("   - Logging out of current network connection...")
+	if err := network.Logout(); err != nil {
+		return fmt.Errorf("failed to logout: %w", err)
 	}
-
-	var status tailscaleStatus
-	if json.Unmarshal(output, &status) == nil && status.Self.Online {
-		return true
-	}
-	return false
-}
-
-// TailscaleLogout logs out of the current Tailscale network.
-func TailscaleLogout() error {
-	tailscaleCLI := getTailscaleCLI()
-	fmt.Println("   - Logging out of current Tailscale connection...")
-	logoutCmd := exec.Command(tailscaleCLI, "logout")
-	if output, err := logoutCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to logout from Tailscale: %s", string(output))
-	}
-	fmt.Println("   - ✅ Successfully logged out of Tailscale.")
+	fmt.Println("   - ✅ Successfully logged out.")
 	return nil
 }
 
@@ -74,18 +46,15 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 		return NetChoiceAuthkey, authkey, nil
 	}
 
-	tailscaleCLI := getTailscaleCLI()
 	fmt.Println("--- Checking network status...")
-	statusCmd := exec.Command(tailscaleCLI, "status", "--json")
-	output, _ := statusCmd.Output()
 
-	var status tailscaleStatus
-	if json.Unmarshal(output, &status) == nil && status.Self.Online {
-		fmt.Println("   - ✅ Already connected to the Nexus network.")
+	// Check if connected using the network package
+	if network.IsGlobalConnected() || network.HasState() {
+		fmt.Println("   - ✅ Already connected to the AceTeam Network.")
 		return NetChoiceVerified, "", nil
 	}
 
-	fmt.Println("   - ⚠️  You are not connected to the Nexus network.")
+	fmt.Println("   - ⚠️  You are not connected to the AceTeam Network.")
 	selection, err := ui.AskSelect(
 		"How would you like to connect this node?",
 		[]string{
@@ -102,7 +71,7 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 	case strings.Contains(selection, "Device authorization"):
 		return NetChoiceDevice, "", nil
 	case strings.Contains(selection, "authkey"):
-		keyInput, err := ui.AskInput("Enter your Nexus authkey:", "tskey-auth-...", "")
+		keyInput, err := ui.AskInput("Enter your AceTeam authkey:", "tskey-auth-...", "")
 		if err != nil {
 			return "", "", err
 		}
