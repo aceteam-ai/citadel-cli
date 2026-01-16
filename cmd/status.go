@@ -205,10 +205,22 @@ func printNetworkInfo(w *tabwriter.Writer) {
 		return
 	}
 
-	// Try to get network status
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Try to reconnect if state exists but not connected
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	connected, reconnectErr := network.VerifyOrReconnect(ctx)
+	if !connected {
+		if reconnectErr != nil {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprintf("🟡 DISCONNECTED (%v)", reconnectErr))
+		} else {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Could not reconnect)"))
+		}
+		fmt.Fprintf(w, "  %s\n", "   Run 'citadel login' to re-authenticate")
+		return
+	}
+
+	// Get detailed status
 	status, err := network.GetGlobalStatus(ctx)
 	if err != nil {
 		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprint("⚠️  WARNING (Could not get network status)"))

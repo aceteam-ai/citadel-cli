@@ -2,8 +2,10 @@
 package nexus
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -48,10 +50,27 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 
 	fmt.Println("--- Checking network status...")
 
-	// Check if connected using the network package
-	if network.IsGlobalConnected() || network.HasState() {
+	// Check if already connected
+	if network.IsGlobalConnected() {
 		fmt.Println("   - ✅ Already connected to the AceTeam Network.")
 		return NetChoiceVerified, "", nil
+	}
+
+	// If state exists, try to reconnect
+	if network.HasState() {
+		fmt.Println("   - Found existing network credentials. Reconnecting...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		connected, reconnectErr := network.VerifyOrReconnect(ctx)
+		if connected {
+			fmt.Println("   - ✅ Connected to the AceTeam Network.")
+			return NetChoiceVerified, "", nil
+		}
+		if reconnectErr != nil {
+			fmt.Printf("   - ⚠️  Could not reconnect: %v\n", reconnectErr)
+		}
+		// Fall through to prompt for new auth method
 	}
 
 	fmt.Println("   - ⚠️  You are not connected to the AceTeam Network.")

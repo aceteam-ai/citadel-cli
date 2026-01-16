@@ -6,31 +6,74 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"gopkg.in/yaml.v3"
 )
 
 // GetStateDir returns the state directory path for network state.
 // This is where tsnet stores WireGuard keys and connection state.
 //
-// Locations:
-//   - Linux/macOS: ~/.citadel-node/network/
-//   - Windows: %USERPROFILE%\citadel-node\network\
+// The state directory is determined by:
+// 1. First checking the global config file for node_config_dir setting
+// 2. If not found, falling back to user home directory
+//
+// This ensures consistency when running with sudo - state follows the config.
 func GetStateDir() string {
-	var baseDir string
+	// First, try to get state dir from global config (follows config location)
+	if nodeDir := getNodeConfigDirFromGlobalConfig(); nodeDir != "" {
+		return filepath.Join(nodeDir, "network")
+	}
 
+	// Fallback to user home directory
+	return filepath.Join(getUserHomeDir(), "citadel-node", "network")
+}
+
+// getUserHomeDir returns the user's home directory
+func getUserHomeDir() string {
 	if runtime.GOOS == "windows" {
-		baseDir = os.Getenv("USERPROFILE")
+		baseDir := os.Getenv("USERPROFILE")
 		if baseDir == "" {
 			baseDir = os.Getenv("HOME")
 		}
-	} else {
-		var err error
-		baseDir, err = os.UserHomeDir()
-		if err != nil {
-			baseDir = os.Getenv("HOME")
-		}
+		return baseDir
 	}
 
-	return filepath.Join(baseDir, "citadel-node", "network")
+	baseDir, err := os.UserHomeDir()
+	if err != nil {
+		baseDir = os.Getenv("HOME")
+	}
+	return baseDir
+}
+
+// getNodeConfigDirFromGlobalConfig reads node_config_dir from global config
+func getNodeConfigDirFromGlobalConfig() string {
+	globalConfigFile := filepath.Join(getGlobalConfigDirForState(), "config.yaml")
+
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return ""
+	}
+
+	var config struct {
+		NodeConfigDir string `yaml:"node_config_dir"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+
+	return config.NodeConfigDir
+}
+
+// getGlobalConfigDirForState returns the global config directory path
+func getGlobalConfigDirForState() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/usr/local/etc/citadel"
+	case "windows":
+		return filepath.Join(os.Getenv("ProgramData"), "Citadel")
+	default:
+		return "/etc/citadel"
+	}
 }
 
 // EnsureStateDir creates the state directory if it doesn't exist.
