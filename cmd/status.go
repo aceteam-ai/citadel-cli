@@ -60,6 +60,9 @@ and the state of all managed services.`,
 
 		headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
+		// Show node identity first
+		printNodeInfo(w)
+
 		headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
 		printMemInfo(w)
 		printCPUInfo(w)
@@ -77,6 +80,31 @@ and the state of all managed services.`,
 		headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 		printServiceInfo(w)
 	},
+}
+
+func printNodeInfo(w *tabwriter.Writer) {
+	manifest, _, err := findAndReadManifest()
+	if err != nil {
+		// No manifest found - show minimal info
+		hostname, _ := os.Hostname()
+		if hostname != "" {
+			headerColor.Fprintln(w, "\n🏷️  NODE IDENTITY")
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), hostname)
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), warnColor.Sprint("Not initialized (run 'citadel init')"))
+		}
+		return
+	}
+
+	headerColor.Fprintln(w, "\n🏷️  NODE IDENTITY")
+	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Node Name"), manifest.Node.Name)
+
+	if manifest.Node.OrgID != "" {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Org ID"), manifest.Node.OrgID)
+	}
+
+	if len(manifest.Node.Tags) > 0 {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Tags"), strings.Join(manifest.Node.Tags, ", "))
+	}
 }
 
 func printCacheInfo(w *tabwriter.Writer) {
@@ -137,13 +165,44 @@ func printMemInfo(w *tabwriter.Writer) {
 }
 
 func printCPUInfo(w *tabwriter.Writer) {
+	// Get CPU info first
+	cpuInfo, infoErr := cpu.Info()
+
+	// Try to get CPU usage percentage
 	percentages, err := cpu.Percent(time.Second, false)
-	if err != nil || len(percentages) == 0 {
-		fmt.Fprintf(w, "  ⚡️ CPU Usage:\t%s\n", badColor.Sprintf("Error getting CPU info: %v", err))
-		return
+	if err == nil && len(percentages) > 0 {
+		percentStr := colorizePercent(percentages[0])
+		fmt.Fprintf(w, "  ⚡️ %s:\t%s\n", labelColor.Sprint("CPU Usage"), percentStr)
 	}
-	percentStr := colorizePercent(percentages[0])
-	fmt.Fprintf(w, "  ⚡️ %s:\t%s\n", labelColor.Sprint("CPU Usage"), percentStr)
+
+	// Show CPU model/cores info
+	if infoErr == nil && len(cpuInfo) > 0 {
+		// Get logical core count
+		logicalCores, _ := cpu.Counts(true)
+		physicalCores, _ := cpu.Counts(false)
+
+		cpuModel := cpuInfo[0].ModelName
+		if cpuModel == "" && platform.IsDarwin() {
+			// On macOS, try sysctl for better CPU name
+			if out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
+				cpuModel = strings.TrimSpace(string(out))
+			}
+		}
+
+		if cpuModel != "" {
+			fmt.Fprintf(w, "  🖥️  %s:\t%s\n", labelColor.Sprint("CPU"), cpuModel)
+		}
+		if logicalCores > 0 {
+			coreStr := fmt.Sprintf("%d cores", logicalCores)
+			if physicalCores > 0 && physicalCores != logicalCores {
+				coreStr = fmt.Sprintf("%d cores (%d physical)", logicalCores, physicalCores)
+			}
+			fmt.Fprintf(w, "  🔢 %s:\t%s\n", labelColor.Sprint("Cores"), coreStr)
+		}
+	} else if err != nil {
+		// Only show error if we couldn't get any CPU info at all
+		fmt.Fprintf(w, "  ⚡️ %s:\t%s\n", labelColor.Sprint("CPU"), warnColor.Sprint("Could not get CPU info"))
+	}
 }
 
 func printDiskInfo(w *tabwriter.Writer) {
@@ -208,22 +267,32 @@ func printNetworkInfo(w *tabwriter.Writer) {
 	tsCmd := exec.Command(tailscaleCLI, "status", "--json")
 	output, err := tsCmd.Output()
 	if err != nil {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Tailscale daemon not responding)"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), badColor.Sprint("🔴 Offline"))
+		fmt.Fprintln(w, "    Network daemon not responding")
 		return
 	}
 
 	var status TailscaleStatus
 	if err := json.Unmarshal(output, &status); err != nil {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), warnColor.Sprint("⚠️  WARNING (Could not parse Tailscale status)"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), warnColor.Sprint("⚠️ Unknown"))
+		fmt.Fprintln(w, "    Could not parse network status")
 		return
 	}
 
 	if status.Self.Online {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), goodColor.Sprint("🟢 ONLINE to Nexus"))
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), strings.TrimSuffix(status.Self.DNSName, "."))
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.Self.TailscaleIPs[0])
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), goodColor.Sprint("🟢 Connected"))
+		hostname := strings.TrimSuffix(status.Self.DNSName, ".")
+		// Remove the tailnet suffix for cleaner display
+		if idx := strings.Index(hostname, "."); idx > 0 {
+			hostname = hostname[:idx]
+		}
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Hostname"), hostname)
+		if len(status.Self.TailscaleIPs) > 0 {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.Self.TailscaleIPs[0])
+		}
 	} else {
-		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not connected to Nexus)"))
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), badColor.Sprint("🔴 Disconnected"))
+		fmt.Fprintln(w, "    Run 'citadel login' to connect to the network")
 	}
 }
 
@@ -289,18 +358,22 @@ func printServiceInfo(w *tabwriter.Writer) {
 		}
 
 		if len(containers) == 0 {
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint(service.Name), "⚫ Stopped")
 		} else {
-			state := strings.ToUpper(containers[0].State)
+			state := strings.ToLower(containers[0].State)
 			var statusStr string
-			if strings.Contains(state, "RUNNING") || strings.Contains(state, "UP") {
-				statusStr = goodColor.Sprintf("🟢 %s", state)
-			} else if strings.Contains(state, "EXITED") || strings.Contains(state, "DEAD") {
-				statusStr = badColor.Sprintf("🔴 %s", state)
+			if strings.Contains(state, "running") || strings.Contains(state, "up") {
+				statusStr = goodColor.Sprint("🟢 Running")
+			} else if strings.Contains(state, "exited") || strings.Contains(state, "dead") {
+				statusStr = badColor.Sprint("🔴 Exited")
 			} else {
+				// Capitalize first letter
+				if len(state) > 0 {
+					state = strings.ToUpper(state[:1]) + state[1:]
+				}
 				statusStr = warnColor.Sprintf("🟡 %s", state)
 			}
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint(service.Name), statusStr)
 		}
 	}
 }
