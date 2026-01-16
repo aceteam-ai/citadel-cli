@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/fatih/color"
+	"github.com/redis/go-redis/v9"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -52,6 +53,9 @@ and the state of all managed services.`,
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 		defer w.Flush()
 
+		// Load manifest once for use in multiple sections
+		manifest, _, _ := findAndReadManifest()
+
 		headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
 		headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
@@ -66,7 +70,13 @@ and the state of all managed services.`,
 		printGPUInfo(w)
 
 		headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
-		printNetworkInfo(w)
+		printNetworkInfo(w, manifest)
+
+		// Only show Redis section if configured
+		if os.Getenv("REDIS_URL") != "" {
+			headerColor.Fprintln(w, "\n📬 REDIS QUEUE")
+			printRedisInfo(w)
+		}
 
 		headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 		printServiceInfo(w)
@@ -197,7 +207,7 @@ func printGPUInfo(w *tabwriter.Writer) {
 	}
 }
 
-func printNetworkInfo(w *tabwriter.Writer) {
+func printNetworkInfo(w *tabwriter.Writer, manifest *CitadelManifest) {
 	// Check if we have network state
 	if !network.HasState() {
 		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not logged in)"))
@@ -235,9 +245,92 @@ func printNetworkInfo(w *tabwriter.Writer) {
 		if status.IPv4 != "" {
 			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("IP Address"), status.IPv4)
 		}
+		// Display organization info from manifest
+		if manifest != nil && manifest.Node.OrgID != "" {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Organization"), manifest.Node.OrgID)
+		}
+		// Display node tags from manifest
+		if manifest != nil && len(manifest.Node.Tags) > 0 {
+			tagsStr := strings.Join(manifest.Node.Tags, ", ")
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Tags"), tagsStr)
+		}
 	} else {
 		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Connection"), badColor.Sprint("🔴 OFFLINE (Not connected to AceTeam Network)"))
 	}
+}
+
+func printRedisInfo(w *tabwriter.Writer) {
+	// Get Redis URL from environment (same as work command)
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		return
+	}
+
+	// Get queue name from environment or use default
+	queueName := os.Getenv("WORKER_QUEUE")
+	if queueName == "" {
+		queueName = "jobs:v1:gpu-general"
+	}
+
+	consumerGroup := os.Getenv("CONSUMER_GROUP")
+	if consumerGroup == "" {
+		consumerGroup = "citadel-workers"
+	}
+
+	// Connect to Redis
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), warnColor.Sprintf("Invalid URL: %v", err))
+		return
+	}
+
+	if password := os.Getenv("REDIS_PASSWORD"); password != "" {
+		opts.Password = password
+	}
+
+	client := redis.NewClient(opts)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Check connection
+	if err := client.Ping(ctx).Err(); err != nil {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), badColor.Sprintf("❌ Connection failed: %v", err))
+		return
+	}
+
+	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Status"), goodColor.Sprint("🟢 Connected"))
+	fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Queue"), queueName)
+
+	// Get queue length (XLEN)
+	queueLen, err := client.XLen(ctx, queueName).Result()
+	if err == nil {
+		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("Queue Length"), queueLen)
+	}
+
+	// Get pending count (XPENDING)
+	pending, err := client.XPending(ctx, queueName, consumerGroup).Result()
+	if err == nil && pending != nil {
+		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("Pending"), pending.Count)
+	}
+
+	// Get DLQ count
+	dlqName := getDLQName(queueName)
+	dlqLen, err := client.XLen(ctx, dlqName).Result()
+	if err == nil {
+		colorFn := goodColor
+		if dlqLen > 0 {
+			colorFn = warnColor
+		}
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("DLQ Count"), colorFn.Sprintf("%d", dlqLen))
+	}
+}
+
+func getDLQName(queueName string) string {
+	parts := strings.Split(queueName, ":")
+	suffix := parts[len(parts)-1]
+	return fmt.Sprintf("dlq:v1:%s", suffix)
 }
 
 func printServiceInfo(w *tabwriter.Writer) {
