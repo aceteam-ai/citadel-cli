@@ -55,6 +55,9 @@ var (
 
 	// Update check flag
 	workNoUpdate bool
+
+	// Test mode flag
+	workTestMode bool
 )
 
 var workCmd = &cobra.Command{
@@ -64,26 +67,29 @@ var workCmd = &cobra.Command{
 
 This is the primary command for running a Citadel node. It:
   1. Auto-starts services from manifest (use --no-services to skip)
-  2. Runs the job worker (Nexus or Redis mode)
+  2. Runs the job worker (polls Nexus or consumes from Redis)
   3. Reports status via heartbeat
-  4. Optionally runs terminal server for remote access
+  4. Subscribes to real-time config updates (when --redis-status is enabled)
 
 Modes:
-  nexus   Poll Nexus API for jobs (for on-premise nodes)
+  nexus   Poll Nexus API for jobs (default, for on-premise nodes)
   redis   Consume from Redis Streams (for AceTeam private GPU cloud)
 
 Examples:
-  # Run node (starts services + worker)
-  citadel work --mode=nexus
+  # Run node with default settings (Nexus mode)
+  citadel work
 
   # Run without auto-starting services
-  citadel work --mode=nexus --no-services
+  citadel work --no-services
 
-  # Run with status server and heartbeat
-  citadel work --mode=nexus --status-port=8080 --heartbeat
+  # Run with heartbeat reporting
+  citadel work --heartbeat
 
   # Run as Redis worker (for private GPU cloud)
-  citadel work --mode=redis --redis-url=redis://localhost:6379`,
+  citadel work --mode=redis --redis-url=redis://localhost:6379 --redis-status
+
+  # Test mode with mock jobs (for development)
+  citadel work --test`,
 	Run: runWork,
 }
 
@@ -135,8 +141,13 @@ func runWork(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
+		if workTestMode {
+			fmt.Println("   - Test mode enabled (using mock jobs)")
+		}
+
 		source = worker.NewNexusSource(worker.NexusSourceConfig{
 			NexusURL: workNexusURL,
+			MockMode: workTestMode,
 		})
 
 	case "redis":
@@ -504,4 +515,7 @@ func init() {
 
 	// Update check flags
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "Skip checking for updates on startup")
+
+	// Test mode flag
+	workCmd.Flags().BoolVar(&workTestMode, "test", false, "Enable test mode with mock jobs (for development)")
 }

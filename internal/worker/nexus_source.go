@@ -15,6 +15,7 @@ type NexusSource struct {
 	nexusURL     string
 	pollInterval time.Duration
 	ticker       *time.Ticker
+	mockMode     bool
 }
 
 // NexusSourceConfig holds configuration for NexusSource.
@@ -24,6 +25,9 @@ type NexusSourceConfig struct {
 
 	// PollInterval is how often to poll for new jobs (default: 5s)
 	PollInterval time.Duration
+
+	// MockMode enables mock job testing (--test flag)
+	MockMode bool
 }
 
 // NewNexusSource creates a new Nexus HTTP polling job source.
@@ -34,6 +38,7 @@ func NewNexusSource(cfg NexusSourceConfig) *NexusSource {
 	return &NexusSource{
 		nexusURL:     cfg.NexusURL,
 		pollInterval: cfg.PollInterval,
+		mockMode:     cfg.MockMode,
 	}
 }
 
@@ -44,7 +49,11 @@ func (s *NexusSource) Name() string {
 
 // Connect establishes connection to Nexus.
 func (s *NexusSource) Connect(ctx context.Context) error {
-	s.client = nexus.NewClient(s.nexusURL)
+	var opts []nexus.ClientOption
+	if s.mockMode {
+		opts = append(opts, nexus.WithMockMode())
+	}
+	s.client = nexus.NewClient(s.nexusURL, opts...)
 	s.ticker = time.NewTicker(s.pollInterval)
 	fmt.Printf("   - Nexus endpoint: %s\n", s.nexusURL)
 	fmt.Printf("   - Poll interval: %v\n", s.pollInterval)
