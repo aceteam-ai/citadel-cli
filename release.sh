@@ -208,7 +208,7 @@ fi
 # Step 1: Create and push tag
 echo ""
 echo -e "${GREEN}Step 1/3: Creating and pushing git tag${NC}"
-run_cmd git tag "$VERSION"
+run_cmd git tag -a "$VERSION" -m "$VERSION"
 run_cmd git push origin "$VERSION"
 echo "✅ Tag $VERSION created and pushed"
 
@@ -303,7 +303,7 @@ $CHECKSUMS
 if [[ "$DRY_RUN" == true ]]; then
     echo -e "${BLUE}[DRY-RUN] Would create GitHub release with:${NC}"
     echo "  Title: $VERSION"
-    echo "  Assets: linux_amd64, linux_arm64, darwin_amd64, darwin_arm64, checksums.txt"
+    echo "  Assets: linux_amd64, linux_arm64, darwin_amd64, darwin_arm64, windows_amd64, windows_arm64, checksums.txt"
     echo ""
     echo "Release notes preview:"
     echo "----------------------------------------"
@@ -318,6 +318,8 @@ else
       release/citadel_${VERSION}_linux_arm64.tar.gz \
       release/citadel_${VERSION}_darwin_amd64.tar.gz \
       release/citadel_${VERSION}_darwin_arm64.tar.gz \
+      release/citadel_${VERSION}_windows_amd64.zip \
+      release/citadel_${VERSION}_windows_arm64.zip \
       release/checksums.txt
 fi
 
