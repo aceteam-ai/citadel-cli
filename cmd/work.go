@@ -330,6 +330,24 @@ func runWork(cmd *cobra.Command, args []string) {
 				}
 			}()
 		}
+
+		// Start config Pub/Sub subscriber for real-time config updates
+		configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
+			RedisURL:      workRedisURL,
+			RedisPassword: workRedisPass,
+			NodeID:        nodeName,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)
+		} else {
+			go func() {
+				defer configSubscriber.Close() // Ensure Redis connection is cleaned up
+				fmt.Printf("   - Config subscriber: %s (real-time config updates)\n", configSubscriber.Channel())
+				if err := configSubscriber.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Config subscriber error: %v\n", err)
+				}
+			}()
+		}
 	}
 
 	// Start terminal server if enabled
