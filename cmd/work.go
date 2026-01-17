@@ -52,6 +52,9 @@ var (
 
 	// Service auto-start flags
 	workNoServices bool
+
+	// Update check flag
+	workNoUpdate bool
 )
 
 var workCmd = &cobra.Command{
@@ -101,6 +104,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	if workMode != "nexus" && workMode != "redis" {
 		fmt.Fprintf(os.Stderr, "Error: --mode must be 'nexus' or 'redis'\n")
 		os.Exit(1)
+	}
+
+	// Check for updates in background (unless --no-update is set)
+	if !workNoUpdate {
+		go CheckForUpdateInBackground()
 	}
 
 	// Auto-start services from manifest (unless --no-services is set)
@@ -475,4 +483,7 @@ func init() {
 
 	// Service auto-start flags
 	workCmd.Flags().BoolVar(&workNoServices, "no-services", false, "Skip auto-starting services from manifest")
+
+	// Update check flags
+	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "Skip checking for updates on startup")
 }
