@@ -162,6 +162,20 @@ and system user configuration (requires sudo).`,
 				return
 			}
 
+			// If already connected via existing credentials, show success and exit
+			if choice == nexus.NetChoiceVerified {
+				fmt.Println("✅ Node is already connected to the AceTeam Network.")
+				// Try to get node name from network status
+				if nodeName == "" {
+					nodeName, _ = getNodeName()
+				}
+				if nodeName != "" {
+					fmt.Printf("Node name: %s\n", nodeName)
+				}
+				fmt.Println("\nRun 'citadel status' to view node details.")
+				return
+			}
+
 			// Get node name if not already set
 			if nodeName == "" {
 				nodeName, err = getNodeName()
