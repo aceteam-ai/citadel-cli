@@ -25,6 +25,18 @@ When writing user-facing content (CLI help text, README, error messages), use th
 
 This keeps implementation details hidden from users while maintaining technical accuracy in code comments and internal documentation (like this file).
 
+## ⛔ CRITICAL: Git Branch Policy
+
+**NEVER commit directly to `main` branch.** This is a hard rule with no exceptions.
+
+Always:
+1. Create a feature branch: `git checkout -b fix/description` or `git checkout -b feat/description`
+2. Make commits on the feature branch
+3. Push the branch: `git push -u origin <branch-name>`
+4. Create a PR: `gh pr create`
+
+If you find yourself about to run `git push origin main`, STOP and create a branch instead.
+
 ## Build and Development Commands
 
 ### Building
@@ -73,18 +85,20 @@ go run . test --service vllm
 
 ### Git Workflow
 
-**IMPORTANT**: Never commit and push directly to `main`. Always create a feature branch and submit changes via a pull request.
+**See "⛔ CRITICAL: Git Branch Policy" section above. NEVER push to main.**
 
 ```bash
-# Create a branch for your work
+# ALWAYS create a branch first
 git checkout -b fix/description-of-change
 
-# Make changes, commit, then push
+# Make changes, commit, then push THE BRANCH (not main!)
 git push -u origin fix/description-of-change
 
 # Create PR via GitHub CLI
 gh pr create --title "fix: description" --body "..."
 ```
+
+Even for "small fixes" or "quick changes" - always use a branch and PR.
 
 ### Future Work and TODOs
 
