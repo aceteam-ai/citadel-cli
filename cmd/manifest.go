@@ -140,7 +140,7 @@ func writeManifest(path string, manifest *CitadelManifest) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal manifest: %w", err)
 	}
-	if err := os.WriteFile(path, yamlData, 0644); err != nil {
+	if err := os.WriteFile(path, yamlData, 0600); err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
 	return nil
@@ -156,7 +156,7 @@ func writeGlobalConfig(nodeConfigDir string) error {
 	}
 
 	configContent := fmt.Sprintf("node_config_dir: %s\n", nodeConfigDir)
-	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0644); err != nil {
+	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0600); err != nil {
 		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
 	}
 	return nil
@@ -219,8 +219,8 @@ func ensureComposeFile(configDir, serviceName string) error {
 		return fmt.Errorf("failed to create services directory: %w", err)
 	}
 
-	// Write compose file
-	if err := os.WriteFile(destPath, []byte(content), 0644); err != nil {
+	// Write compose file (0600 to protect any sensitive env vars)
+	if err := os.WriteFile(destPath, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write compose file: %w", err)
 	}
 

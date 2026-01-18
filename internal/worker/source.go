@@ -3,7 +3,7 @@ package worker
 import "context"
 
 // JobSource defines the interface for fetching jobs from a queue/stream.
-// Implementations include NexusSource (HTTP polling) and RedisSource (Redis Streams).
+// The primary implementation is RedisSource (Redis Streams).
 type JobSource interface {
 	// Name returns the source identifier (e.g., "nexus", "redis")
 	Name() string

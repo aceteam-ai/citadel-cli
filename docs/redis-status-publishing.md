@@ -216,12 +216,16 @@ XADD jobs:v1:config * \
 ### Command-Line Flags
 
 ```bash
+# Simple: use defaults (connects to redis.aceteam.ai with status enabled)
+citadel work
+
+# Override Redis URL for local development
+citadel work --redis-url=redis://localhost:6379
+
 # Full command with all flags
 citadel work \
-  --mode=redis \
   --redis-url=redis://localhost:6379 \
   --redis-password=secret \
-  --redis-status \
   --device-code=abc123 \
   --queue=jobs:v1:gpu-general \
   --group=citadel-workers
@@ -231,22 +235,29 @@ citadel work \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `REDIS_URL` | Redis connection URL | Required |
+| `REDIS_URL` | Redis connection URL | From config (set by `citadel init`) |
 | `REDIS_PASSWORD` | Redis password | None |
 | `CITADEL_DEVICE_CODE` | Device auth code | None |
 | `WORKER_QUEUE` | Queue to consume from | `jobs:v1:gpu-general` |
 | `CONSUMER_GROUP` | Consumer group name | `citadel-workers` |
 | `CITADEL_NODE_NAME` | Node identifier | Hostname |
 
+**Notes:**
+- `--redis-status` is enabled by default. Use `--redis-status=false` to disable.
+- Redis URL is obtained from local config (set during `citadel init`). Use `REDIS_URL` env var to override.
+
 ### Example: Full Worker Startup
 
 ```bash
-export REDIS_URL=redis://redis.aceteam.ai:6379
+# Simple: just run with defaults
+citadel work
+
+# Or with explicit environment variables
 export REDIS_PASSWORD=your-password
 export CITADEL_DEVICE_CODE=abc123def456
 export CITADEL_NODE_NAME=my-gpu-server
 
-citadel work --mode=redis --redis-status
+citadel work
 ```
 
 ## Verification & Testing
@@ -254,8 +265,11 @@ citadel work --mode=redis --redis-status
 ### 1. Status Publishing
 
 ```bash
-# Terminal 1: Start citadel worker
-REDIS_URL=redis://localhost:6379 citadel work --mode=redis --redis-status
+# Terminal 1: Start citadel worker (uses defaults)
+citadel work
+
+# Or with local Redis for testing
+citadel work --redis-url=redis://localhost:6379
 
 # Terminal 2: Monitor Pub/Sub
 redis-cli PSUBSCRIBE "node:status:*"
@@ -308,7 +322,7 @@ Error: failed to connect to Redis: dial tcp: lookup redis: no such host
 Warning: Redis status publish failed: ...
 ```
 - Check Redis connection
-- Verify worker has `--redis-status` flag
+- Ensure `--redis-status=false` was not passed (status is enabled by default)
 - Check Redis memory usage
 
 **Config Job Not Applied:**

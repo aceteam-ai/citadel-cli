@@ -146,7 +146,7 @@ func runSingleService(serviceName string) {
 		if err == nil {
 			filtered, err := compose.StripGPUDevices(content)
 			if err == nil {
-				os.WriteFile(composePath, filtered, 0644)
+				os.WriteFile(composePath, filtered, 0600)
 				fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
 			}
 		}

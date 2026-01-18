@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -19,11 +20,10 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var (
-	workMode       string
-	workNexusURL   string
 	workRedisURL   string
 	workRedisPass  string
 	workQueue      string
@@ -64,26 +64,28 @@ var workCmd = &cobra.Command{
 
 This is the primary command for running a Citadel node. It:
   1. Auto-starts services from manifest (use --no-services to skip)
-  2. Runs the job worker (Nexus or Redis mode)
-  3. Reports status via heartbeat
-  4. Optionally runs terminal server for remote access
+  2. Connects to Redis and consumes jobs from the queue
+  3. Reports status via Redis pub/sub (enabled by default)
+  4. Subscribes to real-time config updates
 
-Modes:
-  nexus   Poll Nexus API for jobs (for on-premise nodes)
-  redis   Consume from Redis Streams (for AceTeam private GPU cloud)
+Redis URL is obtained from local config (set by 'citadel init').
+Use REDIS_URL env var or --redis-url flag to override.
 
 Examples:
-  # Run node (starts services + worker)
-  citadel work --mode=nexus
+  # Run after citadel init (uses config)
+  citadel work
+
+  # Override Redis URL for development
+  citadel work --redis-url=redis://localhost:6379
+
+  # Disable status publishing
+  citadel work --redis-status=false
 
   # Run without auto-starting services
-  citadel work --mode=nexus --no-services
+  citadel work --no-services
 
-  # Run with status server and heartbeat
-  citadel work --mode=nexus --status-port=8080 --heartbeat
-
-  # Run as Redis worker (for private GPU cloud)
-  citadel work --mode=redis --redis-url=redis://localhost:6379`,
+  # Run with heartbeat reporting to AceTeam API
+  citadel work --heartbeat`,
 	Run: runWork,
 }
 
@@ -100,12 +102,6 @@ func runWork(cmd *cobra.Command, args []string) {
 		cancel()
 	}()
 
-	// Validate mode
-	if workMode != "nexus" && workMode != "redis" {
-		fmt.Fprintf(os.Stderr, "Error: --mode must be 'nexus' or 'redis'\n")
-		os.Exit(1)
-	}
-
 	// Check for updates in background (unless --no-update is set)
 	if !workNoUpdate {
 		go CheckForUpdateInBackground()
@@ -118,59 +114,42 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create the appropriate job source
-	var source worker.JobSource
-	var streamFactory func(jobID string) worker.StreamWriter
-
-	switch workMode {
-	case "nexus":
-		if workNexusURL == "" {
-			workNexusURL = os.Getenv("NEXUS_URL")
-		}
-		if workNexusURL == "" {
-			workNexusURL = nexusURL // Use global nexusURL from root.go
-		}
-		if workNexusURL == "" {
-			fmt.Fprintf(os.Stderr, "Error: Nexus URL is required. Set --nexus-url or NEXUS_URL env var.\n")
-			os.Exit(1)
-		}
-
-		source = worker.NewNexusSource(worker.NexusSourceConfig{
-			NexusURL: workNexusURL,
-		})
-
-	case "redis":
-		if workRedisURL == "" {
-			workRedisURL = os.Getenv("REDIS_URL")
-		}
-		if workRedisURL == "" {
-			fmt.Fprintf(os.Stderr, "Error: Redis URL is required. Set --redis-url or REDIS_URL env var.\n")
-			os.Exit(1)
-		}
-
-		if workRedisPass == "" {
-			workRedisPass = os.Getenv("REDIS_PASSWORD")
-		}
-		if workQueue == "" {
-			workQueue = os.Getenv("WORKER_QUEUE")
-		}
-		if workGroup == "" {
-			workGroup = os.Getenv("CONSUMER_GROUP")
-		}
-
-		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
-			URL:           workRedisURL,
-			Password:      workRedisPass,
-			QueueName:     workQueue,
-			ConsumerGroup: workGroup,
-			BlockMs:       workPollMs,
-			MaxAttempts:   workMaxRetries,
-		})
-		source = redisSource
-
-		// Enable streaming for Redis mode
-		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+	// Resolve Redis URL: flag > env > config
+	if workRedisURL == "" {
+		workRedisURL = os.Getenv("REDIS_URL")
 	}
+	if workRedisURL == "" {
+		workRedisURL = getRedisURLFromConfig()
+	}
+	if workRedisURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure, or set REDIS_URL env var.\n")
+		os.Exit(1)
+	}
+
+	if workRedisPass == "" {
+		workRedisPass = os.Getenv("REDIS_PASSWORD")
+	}
+	if workQueue == "" {
+		workQueue = os.Getenv("WORKER_QUEUE")
+	}
+	if workGroup == "" {
+		workGroup = os.Getenv("CONSUMER_GROUP")
+	}
+
+	// Create Redis job source
+	redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
+		URL:           workRedisURL,
+		Password:      workRedisPass,
+		QueueName:     workQueue,
+		ConsumerGroup: workGroup,
+		BlockMs:       workPollMs,
+		MaxAttempts:   workMaxRetries,
+	})
+	source := redisSource
+
+	// Enable streaming
+	streamFactory := worker.CreateRedisStreamWriterFactory(ctx, redisSource)
 
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
@@ -330,6 +309,24 @@ func runWork(cmd *cobra.Command, args []string) {
 				}
 			}()
 		}
+
+		// Start config Pub/Sub subscriber for real-time config updates
+		configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
+			RedisURL:      workRedisURL,
+			RedisPassword: workRedisPass,
+			NodeID:        nodeName,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)
+		} else {
+			go func() {
+				defer configSubscriber.Close() // Ensure Redis connection is cleaned up
+				fmt.Printf("   - Config subscriber: %s (real-time config updates)\n", configSubscriber.Channel())
+				if err := configSubscriber.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Config subscriber error: %v\n", err)
+				}
+			}()
+		}
 	}
 
 	// Start terminal server if enabled
@@ -445,21 +442,33 @@ func autoStartServices() error {
 	return nil
 }
 
+// getRedisURLFromConfig reads Redis URL from global config file.
+// Returns empty string if not configured.
+func getRedisURLFromConfig() string {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return ""
+	}
+
+	var config struct {
+		RedisURL string `yaml:"redis_url"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	return config.RedisURL
+}
+
 func init() {
 	rootCmd.AddCommand(workCmd)
-
-	// Mode selection
-	workCmd.Flags().StringVar(&workMode, "mode", "nexus", "Worker mode: 'nexus' (HTTP polling) or 'redis' (Redis Streams)")
-
-	// Nexus flags
-	workCmd.Flags().StringVar(&workNexusURL, "nexus-url", "", "Nexus server URL (or set NEXUS_URL env)")
 
 	// Redis flags
 	workCmd.Flags().StringVar(&workRedisURL, "redis-url", "", "Redis connection URL (or set REDIS_URL env)")
 	workCmd.Flags().StringVar(&workRedisPass, "redis-password", "", "Redis password (or set REDIS_PASSWORD env)")
 	workCmd.Flags().StringVar(&workQueue, "queue", "", "Queue/stream name to consume from (default: jobs:v1:gpu-general)")
 	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
-	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Poll/block timeout in milliseconds")
+	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
 
 	// Status and heartbeat flags
@@ -474,7 +483,7 @@ func init() {
 	workCmd.Flags().IntVar(&workSSHSyncMins, "ssh-sync-interval", 5, "SSH sync interval in minutes")
 
 	// Redis status publishing flags
-	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", false, "Enable Redis status publishing for real-time updates")
+	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", true, "Enable Redis status publishing for real-time updates")
 	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
 
 	// Terminal server flags

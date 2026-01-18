@@ -155,10 +155,10 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 			continue // Skip unknown services
 		}
 
-		// Write service compose file
+		// Write service compose file (0600 to protect any sensitive env vars)
 		composeFile := filepath.Join(servicesDir, svcName+".yml")
 		if content, ok := services.ServiceMap[svcName]; ok {
-			if err := os.WriteFile(composeFile, []byte(content), 0644); err != nil {
+			if err := os.WriteFile(composeFile, []byte(content), 0600); err != nil {
 				return fmt.Errorf("failed to write compose file for %s: %w", svcName, err)
 			}
 		}
@@ -183,7 +183,7 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 		return fmt.Errorf("failed to marshal manifest: %w", err)
 	}
 
-	if err := os.WriteFile(manifestPath, data, 0644); err != nil {
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
 
