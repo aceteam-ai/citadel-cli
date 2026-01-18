@@ -106,6 +106,13 @@ and system user configuration (requires sudo).`,
 				os.Exit(1)
 			}
 
+			// Save Redis URL to config if provided by backend
+			if deviceAuthResult.Token.RedisURL != "" {
+				if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
+					fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+				}
+			}
+
 			// Immediately connect to network after device auth succeeds
 			fmt.Println("\n--- 🌐 Connecting to AceTeam Network ---")
 
@@ -566,12 +573,47 @@ func createGlobalConfig(nodeConfigDir string) error {
 
 	configContent := fmt.Sprintf("node_config_dir: %s\n", nodeConfigDir)
 
-	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0644); err != nil {
+	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0600); err != nil {
 		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
 	}
 
 	if initVerbose {
 		fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
+	}
+	return nil
+}
+
+// saveRedisURLToConfig saves the Redis URL to the global config file.
+// This is called after device auth to store the org-specific Redis endpoint.
+func saveRedisURLToConfig(redisURL string) error {
+	globalConfigDir := platform.ConfigDir()
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+
+	// Ensure config directory exists
+	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+		return fmt.Errorf("failed to create global config directory: %w", err)
+	}
+
+	// Read existing config if it exists
+	var config map[string]interface{}
+	data, err := os.ReadFile(globalConfigFile)
+	if err == nil {
+		yaml.Unmarshal(data, &config)
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	// Add Redis URL
+	config["redis_url"] = redisURL
+
+	// Write back
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
 	}
 	return nil
 }
@@ -604,7 +646,7 @@ func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, e
 	// Always write all available service definitions to allow for easy switching later.
 	for name, content := range services.ServiceMap {
 		filePath := filepath.Join(servicesDir, name+".yml")
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		if err := os.WriteFile(filePath, []byte(content), 0600); err != nil {
 			return "", err
 		}
 	}
@@ -636,7 +678,7 @@ func generateCitadelConfig(user, nodeName, serviceName, orgID string) (string, e
 		return "", err
 	}
 
-	if err := os.WriteFile(manifestPath, yamlData, 0644); err != nil {
+	if err := os.WriteFile(manifestPath, yamlData, 0600); err != nil {
 		return "", err
 	}
 

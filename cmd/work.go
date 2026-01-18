@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -63,23 +65,26 @@ var workCmd = &cobra.Command{
 This is the primary command for running a Citadel node. It:
   1. Auto-starts services from manifest (use --no-services to skip)
   2. Connects to Redis and consumes jobs from the queue
-  3. Reports status via heartbeat and Redis pub/sub
+  3. Reports status via Redis pub/sub (enabled by default)
   4. Subscribes to real-time config updates
 
-Requires REDIS_URL environment variable or --redis-url flag.
+Redis URL is obtained from local config (set by 'citadel init').
+Use REDIS_URL env var or --redis-url flag to override.
 
 Examples:
-  # Run with Redis URL from environment
-  export REDIS_URL=redis://localhost:6379
+  # Run after citadel init (uses config)
   citadel work
 
-  # Run with explicit Redis URL
+  # Override Redis URL for development
   citadel work --redis-url=redis://localhost:6379
+
+  # Disable status publishing
+  citadel work --redis-status=false
 
   # Run without auto-starting services
   citadel work --no-services
 
-  # Run with heartbeat reporting
+  # Run with heartbeat reporting to AceTeam API
   citadel work --heartbeat`,
 	Run: runWork,
 }
@@ -109,12 +114,16 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Require Redis URL
+	// Resolve Redis URL: flag > env > config
 	if workRedisURL == "" {
 		workRedisURL = os.Getenv("REDIS_URL")
 	}
 	if workRedisURL == "" {
-		fmt.Fprintf(os.Stderr, "Error: Redis URL is required. Set --redis-url or REDIS_URL env var.\n")
+		workRedisURL = getRedisURLFromConfig()
+	}
+	if workRedisURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure, or set REDIS_URL env var.\n")
 		os.Exit(1)
 	}
 
@@ -433,6 +442,24 @@ func autoStartServices() error {
 	return nil
 }
 
+// getRedisURLFromConfig reads Redis URL from global config file.
+// Returns empty string if not configured.
+func getRedisURLFromConfig() string {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return ""
+	}
+
+	var config struct {
+		RedisURL string `yaml:"redis_url"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	return config.RedisURL
+}
+
 func init() {
 	rootCmd.AddCommand(workCmd)
 
@@ -456,7 +483,7 @@ func init() {
 	workCmd.Flags().IntVar(&workSSHSyncMins, "ssh-sync-interval", 5, "SSH sync interval in minutes")
 
 	// Redis status publishing flags
-	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", false, "Enable Redis status publishing for real-time updates")
+	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", true, "Enable Redis status publishing for real-time updates")
 	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
 
 	// Terminal server flags

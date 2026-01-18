@@ -312,13 +312,16 @@ The worker (`citadel worker`) is the high-performance job queue mode designed fo
 - **Citadel Worker**: High-performance router for AceTeam's private GPU infrastructure
 
 ```bash
-# Start worker with Redis connection
-citadel worker --redis-url redis://localhost:6379 --queue jobs:v1:gpu-general
+# Start worker with defaults (connects to redis.aceteam.ai)
+citadel work
 
-# Or using environment variables
+# Or with local Redis for development
+citadel work --redis-url=redis://localhost:6379
+
+# Environment variables can override defaults
 export REDIS_URL=redis://localhost:6379
 export WORKER_QUEUE=jobs:v1:gpu-general
-citadel worker
+citadel work
 ```
 
 **Worker Architecture:**
@@ -339,14 +342,14 @@ type WorkerJobHandler interface {
 }
 ```
 
-**Key Differences from Agent Mode:**
-| Feature | Agent (Nexus) | Worker (Redis) |
-|---------|---------------|----------------|
-| Job source | HTTP polling | Redis Streams |
-| Streaming | N/A | Redis Pub/Sub |
-| Retry handling | Nexus server | Consumer groups + DLQ |
-| Scaling | Single node | Horizontal via consumer groups |
-| Target | User's on-prem | AceTeam private cloud |
+**Worker Features:**
+| Feature | Description |
+|---------|-------------|
+| Job source | Redis Streams |
+| Streaming | Redis Pub/Sub |
+| Retry handling | Consumer groups + DLQ |
+| Scaling | Horizontal via consumer groups |
+| Default endpoint | redis.aceteam.ai (AceTeam private cloud) |
 
 ### Redis Status Publishing
 
@@ -369,11 +372,14 @@ Citadel Node                                Redis
 
 **Usage:**
 ```bash
-# Enable Redis status publishing
-citadel work --mode=redis --redis-url=redis://localhost:6379 --redis-status
+# Status publishing is enabled by default
+citadel work
 
 # With device code for config lookup (from device auth flow)
-CITADEL_DEVICE_CODE=abc123 citadel work --mode=redis --redis-status
+CITADEL_DEVICE_CODE=abc123 citadel work
+
+# Disable status publishing if needed
+citadel work --redis-status=false
 ```
 
 **Redis Keys:**
@@ -415,7 +421,7 @@ The terminal service provides WebSocket-based terminal access to nodes. See [doc
 citadel terminal-server --test --port 7860
 
 # Integrated with work command (production)
-citadel work --mode=nexus --terminal --terminal-port 7860
+citadel work --terminal --terminal-port 7860
 ```
 
 **Token Caching (CachingTokenValidator):**
