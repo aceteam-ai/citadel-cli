@@ -109,9 +109,9 @@ func startService(serviceName, composeFilePath string) error {
 		if readErr == nil {
 			filtered, filterErr := compose.StripGPUDevices(content)
 			if filterErr == nil {
-				// Write filtered content to a temp file
+				// Write filtered content to a temp file (0600 for security)
 				tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("citadel-compose-%s.yml", serviceName))
-				if writeErr := os.WriteFile(tmpPath, filtered, 0644); writeErr == nil {
+				if writeErr := os.WriteFile(tmpPath, filtered, 0600); writeErr == nil {
 					actualComposePath = tmpPath
 					defer os.Remove(tmpPath)
 					fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")

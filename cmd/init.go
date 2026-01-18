@@ -598,7 +598,10 @@ func saveRedisURLToConfig(redisURL string) error {
 	var config map[string]interface{}
 	data, err := os.ReadFile(globalConfigFile)
 	if err == nil {
-		yaml.Unmarshal(data, &config)
+		if unmarshalErr := yaml.Unmarshal(data, &config); unmarshalErr != nil {
+			// If existing config is malformed, start fresh
+			config = nil
+		}
 	}
 	if config == nil {
 		config = make(map[string]interface{})
