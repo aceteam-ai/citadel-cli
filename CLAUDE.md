@@ -33,7 +33,9 @@ Always:
 1. Create a feature branch: `git checkout -b fix/description` or `git checkout -b feat/description`
 2. Make commits on the feature branch
 3. Push the branch: `git push -u origin <branch-name>`
-4. Create a PR: `gh pr create`
+4. **WAIT for user to request a PR** - do NOT automatically create PRs
+
+**Do NOT automatically create PRs.** Only create a PR when the user explicitly asks (e.g., "create a PR", "make a PR", "submit PR"). After pushing a branch, just inform the user and wait for instructions.
 
 If you find yourself about to run `git push origin main`, STOP and create a branch instead.
 
