@@ -162,9 +162,31 @@ and system user configuration (requires sudo).`,
 				return
 			}
 
-			// If already connected via existing credentials, show success and exit
+			// If already connected via existing credentials, check if fully configured
 			if choice == nexus.NetChoiceVerified {
 				fmt.Println("✅ Node is already connected to the AceTeam Network.")
+
+				// Check if Redis URL is configured
+				if !hasRedisURLConfigured() {
+					fmt.Println("\n⚠️  Redis URL not configured. Re-authenticating to fetch configuration...")
+					deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+						os.Exit(1)
+					}
+
+					// Save Redis URL from device auth response
+					if deviceAuthResult.Token.RedisURL != "" {
+						if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
+							fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+						} else {
+							fmt.Println("✅ Redis URL configured successfully.")
+						}
+					} else {
+						fmt.Fprintf(os.Stderr, "⚠️  Warning: No Redis URL received from server.\n")
+					}
+				}
+
 				// Try to get node name from network status
 				if nodeName == "" {
 					nodeName, _ = getNodeName()
@@ -172,7 +194,7 @@ and system user configuration (requires sudo).`,
 				if nodeName != "" {
 					fmt.Printf("Node name: %s\n", nodeName)
 				}
-				fmt.Println("\nRun 'citadel status' to view node details.")
+				fmt.Println("\nRun 'citadel work' to start processing jobs.")
 				return
 			}
 
@@ -595,6 +617,23 @@ func createGlobalConfig(nodeConfigDir string) error {
 		fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
 	}
 	return nil
+}
+
+// hasRedisURLConfigured checks if a Redis URL is stored in the global config.
+func hasRedisURLConfigured() bool {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return false
+	}
+
+	var config struct {
+		RedisURL string `yaml:"redis_url"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return false
+	}
+	return config.RedisURL != ""
 }
 
 // saveRedisURLToConfig saves the Redis URL to the global config file.

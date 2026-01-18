@@ -23,11 +23,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	// Default Redis URL for AceTeam production
-	defaultRedisURL = "redis://redis.aceteam.ai:6379"
-)
-
 var (
 	workRedisURL   string
 	workRedisPass  string
@@ -119,7 +114,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Resolve Redis URL: flag > env > config > default
+	// Resolve Redis URL: flag > env > config
 	if workRedisURL == "" {
 		workRedisURL = os.Getenv("REDIS_URL")
 	}
@@ -127,8 +122,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		workRedisURL = getRedisURLFromConfig()
 	}
 	if workRedisURL == "" {
-		workRedisURL = defaultRedisURL
-		fmt.Printf("   - Using default Redis: %s\n", defaultRedisURL)
+		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
+		os.Exit(1)
 	}
 
 	if workRedisPass == "" {
