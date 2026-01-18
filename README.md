@@ -181,7 +181,7 @@ gh release create v1.2.0 \
 | :------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `citadel init`                                                            | Join the AceTeam Network (no sudo required). Use `--provision` for full system provisioning (requires sudo).                                                                                           |
 | `citadel init --authkey <key> --service <name> --node-name <name> --test` | The non-interactive version of `init`, perfect for automation. Allows you to specify the service (`vllm`, `ollama`, `llamacpp`, `none`), set the node name, and run a diagnostic test upon completion. |
-| `citadel work`                                                            | **(Primary command)** Starts services from manifest AND runs the job worker. This is the main command for running a node.                                                                              |
+| `citadel work`                                                            | **(Primary command)** Starts services from manifest AND runs the job worker (Redis Streams). Includes auto-update checks.                                                                              |
 | `citadel run [service]`                                                   | Starts services only. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                     |
 | `citadel stop [service]`                                                  | Stops services. With no arguments, stops all manifest services. With a service name, stops that specific service.                                                                                       |
 | `citadel login`                                                           | Connects the machine to the network. Interactive prompts by default, or use `--authkey <key>` for non-interactive automation.                                                                           |
@@ -196,6 +196,9 @@ gh release create v1.2.0 \
 | `citadel nodes`                 | Connects to the Nexus API and lists all nodes in your compute fabric.                                                                        |
 | `citadel run --restart`         | Restarts all services defined in `citadel.yaml`.                                                                                             |
 | `citadel version`               | Prints the current version of the CLI.                                                                                                       |
+| `citadel update check`          | Check for available updates.                                                                                                                 |
+| `citadel update install`        | Download and install the latest version.                                                                                                     |
+| `citadel update rollback`       | Restore the previous version if an update fails.                                                                                             |
 | `citadel terminal-server`       | Starts a WebSocket terminal server for remote browser-based terminal access.                                                                 |
 
 ---
@@ -260,7 +263,7 @@ This workflow shows how to take a fresh server and turn it into a fully operatio
 ./citadel init
 
 # 2. Start services and run the worker
-./citadel work --mode=nexus --status-port=8080
+./citadel work
 ```
 
 That's it! Your node is now online and accepting jobs.
@@ -274,7 +277,7 @@ For fresh servers that need Docker and dependencies installed:
 sudo ./citadel init --provision
 
 # Then start the worker
-./citadel work --mode=nexus
+./citadel work
 ```
 
 ### Automated Deployment
@@ -289,7 +292,7 @@ sudo ./citadel init --provision \
   --node-name gpu-node-01
 
 # Start the node
-./citadel work --mode=nexus --status-port=8080 --heartbeat
+./citadel work --status-port=8080 --heartbeat
 ```
 
 ### Verify Status
