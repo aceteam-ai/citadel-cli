@@ -4,11 +4,9 @@ package nexus
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // NetworkChoice represents the user's selected method for network connection.
@@ -71,29 +69,7 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 		// Fall through to prompt for new auth method
 	}
 
-	fmt.Println("Not connected to AceTeam Network.")
-	selection, err := ui.AskSelect(
-		"How would you like to connect this node?",
-		[]string{
-			"Device authorization (Recommended)",
-			"Use a pre-generated authkey (For automation)",
-			"Skip network connection for now",
-		},
-	)
-	if err != nil {
-		return "", "", err
-	}
-
-	switch {
-	case strings.Contains(selection, "Device authorization"):
-		return NetChoiceDevice, "", nil
-	case strings.Contains(selection, "authkey"):
-		keyInput, err := ui.AskInput("Enter your AceTeam authkey:", "tskey-auth-...", "")
-		if err != nil {
-			return "", "", err
-		}
-		return NetChoiceAuthkey, strings.TrimSpace(keyInput), nil
-	default:
-		return NetChoiceSkip, "", nil
-	}
+	// Default to device authorization flow
+	// Use --authkey flag for automation/CI
+	return NetChoiceDevice, "", nil
 }
