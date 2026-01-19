@@ -77,8 +77,13 @@ and system user configuration (requires sudo).`,
 			fmt.Println("✅ Running with root privileges.")
 		}
 
+		Debug("auth-service: %s", authServiceURL)
+		Debug("nexus: %s", nexusURL)
+		Debug("config dir: %s", platform.ConfigDir())
+
 		// Handle --relogin: force logout and fresh authentication
 		if initRelogin {
+			Debug("--relogin flag set, forcing fresh authentication")
 			if network.IsGlobalConnected() || network.HasState() {
 				fmt.Print("Logging out... ")
 				if err := network.Logout(); err != nil {
@@ -89,9 +94,15 @@ and system user configuration (requires sudo).`,
 			}
 			// Clear saved config to force fresh auth
 			clearSavedConfig()
+			Debug("cleared saved config")
 		}
 
+		Debug("checking network status...")
+		Debug("IsGlobalConnected: %v", network.IsGlobalConnected())
+		Debug("HasState: %v", network.HasState())
+
 		choice, key, err := nexus.GetNetworkChoice(authkey)
+		Debug("network choice: %s", choice)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Canceled: %v\n", err)
 			os.Exit(1)
@@ -104,6 +115,7 @@ and system user configuration (requires sudo).`,
 		var nodeName string // Declare early for reuse throughout init
 
 		if choice == nexus.NetChoiceDevice {
+			Debug("starting device authorization flow...")
 			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
@@ -112,11 +124,22 @@ and system user configuration (requires sudo).`,
 				os.Exit(1)
 			}
 
+			Debug("device auth successful")
+			Debug("token response - authkey: %s...", deviceAuthResult.Token.Authkey[:min(20, len(deviceAuthResult.Token.Authkey))])
+			Debug("token response - redis_url: %s", deviceAuthResult.Token.RedisURL)
+			Debug("token response - nexus_url: %s", deviceAuthResult.Token.NexusURL)
+			Debug("token response - org_id: %s", deviceAuthResult.Token.OrgID)
+
 			// Save Redis URL to config if provided by backend
 			if deviceAuthResult.Token.RedisURL != "" {
+				Debug("saving redis URL to config...")
 				if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
 					fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+				} else {
+					Debug("redis URL saved successfully")
 				}
+			} else {
+				Debug("no redis URL in token response")
 			}
 
 			// Immediately connect to network after device auth succeeds

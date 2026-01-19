@@ -116,17 +116,23 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Resolve Redis URL: flag > env > config
+	Debug("resolving Redis URL...")
+	Debug("--redis-url flag: %q", workRedisURL)
+	Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
 	if workRedisURL == "" {
 		workRedisURL = os.Getenv("REDIS_URL")
 	}
 	if workRedisURL == "" {
-		workRedisURL = getRedisURLFromConfig()
+		configURL := getRedisURLFromConfig()
+		Debug("redis URL from config: %q", configURL)
+		workRedisURL = configURL
 	}
 	if workRedisURL == "" {
 		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
 		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
 		os.Exit(1)
 	}
+	Debug("final Redis URL: %s", workRedisURL)
 
 	if workRedisPass == "" {
 		workRedisPass = os.Getenv("REDIS_PASSWORD")
@@ -157,19 +163,25 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Get node name - prefer the actual registered name from network
 	nodeName := workNodeName
+	Debug("resolving node name...")
+	Debug("workNodeName flag: %q", workNodeName)
+	Debug("CITADEL_NODE_NAME env: %q", os.Getenv("CITADEL_NODE_NAME"))
 	if nodeName == "" {
 		nodeName = os.Getenv("CITADEL_NODE_NAME")
 	}
 	if nodeName == "" {
 		// Try to get the actual registered hostname from network status
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
+			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname
 		} else {
 			// Fallback to local hostname
 			hostname, _ := os.Hostname()
+			Debug("using local hostname fallback: %s", hostname)
 			nodeName = hostname
 		}
 	}
+	Debug("final node name: %s", nodeName)
 
 	// Create status collector (used by both status server and heartbeat)
 	var collector *status.Collector
