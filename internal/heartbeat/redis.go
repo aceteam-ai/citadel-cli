@@ -42,6 +42,7 @@ type StatusMessage struct {
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
 type RedisPublisher struct {
 	client    *redis.Client
+	redisURL  string // For debug logging
 	nodeID    string
 	interval  time.Duration
 	collector *status.Collector
@@ -114,6 +115,7 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 
 	return &RedisPublisher{
 		client:        client,
+		redisURL:      cfg.RedisURL,
 		nodeID:        cfg.NodeID,
 		deviceCode:    cfg.DeviceCode,
 		interval:      cfg.Interval,
@@ -134,7 +136,9 @@ func (p *RedisPublisher) debug(format string, args ...any) {
 // Start begins publishing status periodically to Redis.
 // This method blocks until the context is cancelled.
 func (p *RedisPublisher) Start(ctx context.Context) error {
-	p.debug("starting Redis publisher for node %s", p.nodeID)
+	p.debug("starting Redis publisher")
+	p.debug("redis: %s", p.redisURL)
+	p.debug("nodeId: %s", p.nodeID)
 	p.debug("pub/sub channel: %s", p.pubSubChannel)
 	p.debug("stream: %s", p.streamName)
 	p.debug("interval: %s", p.interval)
