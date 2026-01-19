@@ -5,6 +5,7 @@ Copyright © 2025 AceTeam <dev@aceteam.ai>
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -21,6 +22,14 @@ func getEnvOrDefault(key, defaultValue string) string {
 var cfgFile string
 var nexusURL string
 var authServiceURL string
+var debugMode bool
+
+// Debug prints a message if debug mode is enabled
+func Debug(format string, args ...interface{}) {
+	if debugMode {
+		fmt.Printf("[DEBUG] "+format+"\n", args...)
+	}
+}
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -48,6 +57,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.citadel-cli.yaml)")
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
+	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.

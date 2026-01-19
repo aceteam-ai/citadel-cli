@@ -58,34 +58,25 @@ func (m DeviceCodeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c", "q", "Q":
 			return m, tea.Quit
-		case "c":
+		case "c", "C":
 			// Copy the complete URL to clipboard
 			completeURL := m.verificationURI + "?code=" + m.userCode
 			if err := platform.CopyToClipboard(completeURL); err != nil {
 				m.copyMessage = "⚠️  Could not copy: " + err.Error()
 			} else {
-				m.copyMessage = "✓ URL copied to clipboard!"
-			}
-			m.copyMessageTime = time.Now()
-			return m, nil
-		case "C":
-			// Copy just the code to clipboard
-			if err := platform.CopyToClipboard(m.userCode); err != nil {
-				m.copyMessage = "⚠️  Could not copy: " + err.Error()
-			} else {
-				m.copyMessage = "✓ Code copied to clipboard!"
+				m.copyMessage = "✓ Link copied!"
 			}
 			m.copyMessageTime = time.Now()
 			return m, nil
 		case "b", "B":
-			// Open browser manually
+			// Open browser
 			completeURL := m.verificationURI + "?code=" + m.userCode
 			if err := platform.OpenURL(completeURL); err != nil {
 				m.copyMessage = "⚠️  Could not open browser: " + err.Error()
 			} else {
-				m.copyMessage = "✓ Browser opened!"
+				m.copyMessage = "✓ Opening browser..."
 			}
 			m.copyMessageTime = time.Now()
 			return m, nil
@@ -109,7 +100,7 @@ func (m DeviceCodeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m DeviceCodeModel) View() string {
 	var sb strings.Builder
-	const boxWidth = 63
+	const boxWidth = 60
 
 	// Helper function to create a padded line
 	padLine := func(content string, leftPad int) string {
@@ -122,7 +113,6 @@ func (m DeviceCodeModel) View() string {
 	}
 
 	// Helper to create a padded line with a clickable hyperlink
-	// plainText is for width calculation, displayText contains the hyperlink
 	padLineHyperlink := func(displayText, plainText string, leftPad int) string {
 		visibleLen := runewidth.StringWidth(plainText)
 		rightPad := boxWidth - leftPad - visibleLen
@@ -132,47 +122,49 @@ func (m DeviceCodeModel) View() string {
 		return "│" + strings.Repeat(" ", leftPad) + displayText + strings.Repeat(" ", rightPad) + "│\n"
 	}
 
-	// Instruction text OUTSIDE the box (at the very top, only when waiting)
-	if m.status == "waiting" {
-		sb.WriteString(color.New(color.Faint).Sprint(
-			"(Press 'b' to open browser, 'c' to copy URL, 'q' to quit)\n\n"))
-	}
+	completeURL := m.verificationURI + "?code=" + m.userCode
 
 	// Top border
 	sb.WriteString("┌" + strings.Repeat("─", boxWidth) + "┐\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
-	sb.WriteString("│" + centerText("Device Authorization", boxWidth) + "│\n")
+	sb.WriteString("│" + centerText("🔐 Device Authorization", boxWidth) + "│\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
-	// Instructions
-	sb.WriteString(padLine("To complete setup, visit this URL in your browser:", 2))
+	// Simple instruction + clickable URL
+	sb.WriteString(padLine("Open this link to sign in:", 2))
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
-	// Make the URL clickable using OSC 8 hyperlink
-	completeURL := m.verificationURI + "?code=" + m.userCode
-	clickableURL := Hyperlink(completeURL, m.verificationURI)
-	sb.WriteString(padLineHyperlink(clickableURL, m.verificationURI, 4))
-	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
-	sb.WriteString(padLine("and enter the following code:", 2))
+	// Show clickable complete URL (with code baked in)
+	clickableURL := Hyperlink(completeURL, completeURL)
+	// Truncate display if too long, but keep full URL in hyperlink
+	displayURL := completeURL
+	if len(displayURL) > boxWidth-6 {
+		displayURL = displayURL[:boxWidth-9] + "..."
+	}
+	clickableURL = Hyperlink(completeURL, displayURL)
+	sb.WriteString(padLineHyperlink(clickableURL, displayURL, 3))
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
-	// Code box (emphasized)
+	// Code box (for manual entry if needed)
+	sb.WriteString(padLine("Or enter this code manually:", 2))
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	codeBox := "╔══════════════╗"
 	sb.WriteString("│" + centerText(codeBox, boxWidth) + "│\n")
-
 	plainCodeText := fmt.Sprintf("║  %s   ║", m.userCode)
 	coloredCodeText := fmt.Sprintf("║  %s   ║", color.CyanString(m.userCode))
 	sb.WriteString("│" + centerTextColored(coloredCodeText, plainCodeText, boxWidth) + "│\n")
-
 	sb.WriteString("│" + centerText("╚══════════════╝", boxWidth) + "│\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
-	// Keyboard shortcuts - MORE PROMINENT, right after code box
+	// Hotkeys - prominent, inside a visual separator
 	if m.status == "waiting" {
-		shortcutsPlain := "[b] Open Browser   [c] Copy URL   [C] Copy Code"
-		sb.WriteString(padLine(shortcutsPlain, 2))
-		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+		sb.WriteString("│" + strings.Repeat("─", boxWidth) + "│\n")
+		sb.WriteString(padLine("KEYBOARD SHORTCUTS:", 2))
+		sb.WriteString(padLine("  [B] Open in browser    [C] Copy link    [Q] Quit", 2))
+		sb.WriteString("│" + strings.Repeat("─", boxWidth) + "│\n")
 	}
+
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Status
 	if m.status == "waiting" {
@@ -183,7 +175,7 @@ func (m DeviceCodeModel) View() string {
 		minutes := int(remaining.Minutes())
 		seconds := int(remaining.Seconds()) % 60
 
-		statusText := fmt.Sprintf("⏳ Waiting for authorization... (%d:%02d remaining)", minutes, seconds)
+		statusText := fmt.Sprintf("⏳ Waiting... (%d:%02d)", minutes, seconds)
 		sb.WriteString(padLine(statusText, 2))
 	} else if m.status == "approved" {
 		plainText := "✅ Authorization successful!"
@@ -195,25 +187,18 @@ func (m DeviceCodeModel) View() string {
 		sb.WriteString(padLineColored(coloredText, plainText, 2))
 	}
 
-	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
-
 	// Copy message (shown temporarily after copying)
 	if m.copyMessage != "" {
+		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 		plainMsg := m.copyMessage
 		coloredMsg := color.GreenString(m.copyMessage)
 		if strings.HasPrefix(m.copyMessage, "⚠️") {
 			coloredMsg = color.YellowString(m.copyMessage)
 		}
 		sb.WriteString(padLineColored(coloredMsg, plainMsg, 2))
-		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 	}
 
-	// Show complete URL as clickable link at bottom
-	if m.status == "waiting" && len(completeURL) <= 57 {
-		clickableComplete := Hyperlink(completeURL, completeURL)
-		sb.WriteString(padLineHyperlink(clickableComplete, completeURL, 2))
-		sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
-	}
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
 	// Bottom border
 	sb.WriteString("└" + strings.Repeat("─", boxWidth) + "┘\n")

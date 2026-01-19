@@ -42,6 +42,7 @@ type StatusMessage struct {
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
 type RedisPublisher struct {
 	client    *redis.Client
+	redisURL  string // For debug logging
 	nodeID    string
 	interval  time.Duration
 	collector *status.Collector
@@ -53,6 +54,9 @@ type RedisPublisher struct {
 	// Redis key names
 	pubSubChannel string // For real-time UI updates
 	streamName    string // For reliable processing
+
+	// Debug callback (optional)
+	debugFunc func(format string, args ...any)
 }
 
 // RedisPublisherConfig holds configuration for the Redis status publisher.
@@ -71,6 +75,13 @@ type RedisPublisherConfig struct {
 
 	// Interval is the time between status publishes (default: 30s)
 	Interval time.Duration
+
+	// ChannelOverride overrides the default pub/sub channel name (for debugging)
+	// If empty, uses "node:status:{NodeID}"
+	ChannelOverride string
+
+	// DebugFunc is an optional callback for debug logging
+	DebugFunc func(format string, args ...any)
 }
 
 // NewRedisPublisher creates a new Redis status publisher.
@@ -96,26 +107,51 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 
 	client := redis.NewClient(opts)
 
+	// Determine pub/sub channel name
+	pubSubChannel := cfg.ChannelOverride
+	if pubSubChannel == "" {
+		pubSubChannel = fmt.Sprintf("node:status:%s", cfg.NodeID)
+	}
+
 	return &RedisPublisher{
 		client:        client,
+		redisURL:      cfg.RedisURL,
 		nodeID:        cfg.NodeID,
 		deviceCode:    cfg.DeviceCode,
 		interval:      cfg.Interval,
 		collector:     collector,
-		pubSubChannel: fmt.Sprintf("node:status:%s", cfg.NodeID),
+		pubSubChannel: pubSubChannel,
 		streamName:    "node:status:stream",
+		debugFunc:     cfg.DebugFunc,
 	}, nil
+}
+
+// debug logs a message if debug function is configured
+func (p *RedisPublisher) debug(format string, args ...any) {
+	if p.debugFunc != nil {
+		p.debugFunc(format, args...)
+	}
 }
 
 // Start begins publishing status periodically to Redis.
 // This method blocks until the context is cancelled.
 func (p *RedisPublisher) Start(ctx context.Context) error {
+	p.debug("starting Redis publisher")
+	p.debug("redis: %s", p.redisURL)
+	p.debug("nodeId: %s", p.nodeID)
+	p.debug("pub/sub channel: %s", p.pubSubChannel)
+	p.debug("stream: %s", p.streamName)
+	p.debug("interval: %s", p.interval)
+
 	// Verify connection
+	p.debug("pinging Redis...")
 	if err := p.client.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
+	p.debug("Redis ping successful")
 
 	// Send initial status immediately
+	p.debug("sending initial heartbeat...")
 	if err := p.publishStatus(ctx); err != nil {
 		fmt.Printf("   - Warning: Initial Redis status publish failed: %v\n", err)
 	}
@@ -126,6 +162,7 @@ func (p *RedisPublisher) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			p.debug("context cancelled, stopping publisher")
 			return ctx.Err()
 		case <-ticker.C:
 			if err := p.publishStatus(ctx); err != nil {
@@ -161,10 +198,15 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal status: %w", err)
 	}
 
+	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
+	p.debug("heartbeat: nodeId=%s, deviceCode=%s, timestamp=%s", msg.NodeID, msg.DeviceCode, msg.Timestamp)
+	p.debug("heartbeat: payload (%d bytes): %s", len(jsonData), string(jsonData))
+
 	// Publish to Pub/Sub for real-time UI updates
 	if err := p.client.Publish(ctx, p.pubSubChannel, jsonData).Err(); err != nil {
 		return fmt.Errorf("failed to publish to Pub/Sub: %w", err)
 	}
+	p.debug("heartbeat: pub/sub publish successful")
 
 	// Add to Stream for reliable processing
 	streamFields := map[string]any{
@@ -184,6 +226,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 	}).Err(); err != nil {
 		return fmt.Errorf("failed to add to stream: %w", err)
 	}
+	p.debug("heartbeat: stream XADD successful")
 
 	return nil
 }

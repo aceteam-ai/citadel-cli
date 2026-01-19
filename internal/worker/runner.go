@@ -66,7 +66,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	fmt.Printf("   - Handlers: %d registered\n", len(r.handlers))
 	fmt.Println("   - ✅ Worker started. Listening for jobs...")
 
-	// Main processing loop
+	// Main processing loop with exponential backoff on errors
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
 runLoop:
 	for {
 		select {
@@ -83,9 +86,22 @@ runLoop:
 				if ctx.Err() != nil {
 					break runLoop // Context cancelled
 				}
-				fmt.Fprintf(os.Stderr, "   - ⚠️ Error fetching job: %v\n", err)
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Error fetching job: %v (retry in %s)\n", err, backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					break runLoop
+				}
+				// Exponential backoff up to max
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 				continue
 			}
+
+			// Reset backoff on success
+			backoff = time.Second
 
 			if job == nil {
 				continue // No job available, loop again

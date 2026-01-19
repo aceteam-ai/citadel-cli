@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"os"
 	"runtime"
 	"testing"
 )
@@ -48,19 +49,33 @@ func TestConfigDir(t *testing.T) {
 		t.Error("ConfigDir() returned empty string")
 	}
 
-	// Verify platform-specific paths
+	// When not running as root, ConfigDir returns ~/.citadel-cli
+	// When running as root, it returns system paths
+	if !IsRoot() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatalf("Failed to get home dir: %v", err)
+		}
+		expected := home + "/.citadel-cli"
+		if dir != expected {
+			t.Errorf("ConfigDir() as non-root = %s, want %s", dir, expected)
+		}
+		return
+	}
+
+	// Verify platform-specific system paths (only when running as root)
 	switch runtime.GOOS {
 	case "linux":
 		if dir != "/etc/citadel" {
-			t.Errorf("ConfigDir() on Linux = %s, want /etc/citadel", dir)
+			t.Errorf("ConfigDir() on Linux as root = %s, want /etc/citadel", dir)
 		}
 	case "darwin":
 		if dir != "/usr/local/etc/citadel" {
-			t.Errorf("ConfigDir() on macOS = %s, want /usr/local/etc/citadel", dir)
+			t.Errorf("ConfigDir() on macOS as root = %s, want /usr/local/etc/citadel", dir)
 		}
 	case "windows":
 		if dir != `C:\ProgramData\Citadel` {
-			t.Errorf("ConfigDir() on Windows = %s, want C:\\ProgramData\\Citadel", dir)
+			t.Errorf("ConfigDir() on Windows as admin = %s, want C:\\ProgramData\\Citadel", dir)
 		}
 	}
 }

@@ -89,14 +89,21 @@ go run . test --service vllm
 
 **See "⛔ CRITICAL: Git Branch Policy" section above. NEVER push to main.**
 
+**Additional rules:**
+1. **If on main** - Create a feature branch first
+2. **If already on a feature branch** - Commit and push directly to that branch (don't create new branches)
+3. **Never auto-create PRs** - Only create a PR when the user explicitly asks
+
 ```bash
-# ALWAYS create a branch first
+# If on main, create a branch first
 git checkout -b fix/description-of-change
 
-# Make changes, commit, then push THE BRANCH (not main!)
-git push -u origin fix/description-of-change
+# If already on a feature branch, just commit and push
+git add <files>
+git commit -m "message"
+git push
 
-# Create PR via GitHub CLI
+# Only create PR when user explicitly requests it
 gh pr create --title "fix: description" --body "..."
 ```
 

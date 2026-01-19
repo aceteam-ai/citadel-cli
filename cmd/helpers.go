@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -34,8 +35,10 @@ func runDeviceAuthFlow(authServiceURL string) (*DeviceAuthResult, error) {
 	// Start polling in background goroutine
 	tokenChan := make(chan *nexus.TokenResponse, 1)
 	errChan := make(chan error, 1)
+	doneChan := make(chan struct{})
 
 	go func() {
+		defer close(doneChan)
 		token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
 		if err != nil {
 			errChan <- err
@@ -46,14 +49,15 @@ func runDeviceAuthFlow(authServiceURL string) (*DeviceAuthResult, error) {
 		ui.UpdateStatus(program, "approved")
 	}()
 
-	// Run the UI (blocks until approved or error)
+	// Run the UI (blocks until approved, error, or user quits)
 	fmt.Println()
 	if _, err := program.Run(); err != nil {
 		return nil, fmt.Errorf("UI error: %w", err)
 	}
 	fmt.Println()
 
-	// Check results
+	// Wait for polling goroutine to complete (with timeout for safety)
+	// The goroutine should complete quickly after UI exits since it sent the status
 	select {
 	case token := <-tokenChan:
 		fmt.Println("✅ Authorization successful!")
@@ -63,7 +67,8 @@ func runDeviceAuthFlow(authServiceURL string) (*DeviceAuthResult, error) {
 		}, nil
 	case err := <-errChan:
 		return nil, fmt.Errorf("device authorization failed: %w", err)
-	default:
+	case <-time.After(2 * time.Second):
+		// If UI exited but no result yet, user likely canceled
 		return nil, fmt.Errorf("device authorization was canceled")
 	}
 }

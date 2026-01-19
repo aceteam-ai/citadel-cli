@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -21,11 +22,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
-)
-
-const (
-	// Default Redis URL for AceTeam production
-	defaultRedisURL = "redis://redis.aceteam.ai:6379"
 )
 
 var (
@@ -48,8 +44,9 @@ var (
 	workSSHSyncMins int
 
 	// Redis status publishing flags
-	workRedisStatus bool
-	workDeviceCode  string
+	workRedisStatus   bool
+	workDeviceCode    string
+	workStatusChannel string
 
 	// Terminal server flags
 	workTerminal     bool
@@ -119,17 +116,24 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Resolve Redis URL: flag > env > config > default
+	// Resolve Redis URL: flag > env > config
+	Debug("resolving Redis URL...")
+	Debug("--redis-url flag: %q", workRedisURL)
+	Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
 	if workRedisURL == "" {
 		workRedisURL = os.Getenv("REDIS_URL")
 	}
 	if workRedisURL == "" {
-		workRedisURL = getRedisURLFromConfig()
+		configURL := getRedisURLFromConfig()
+		Debug("redis URL from config: %q", configURL)
+		workRedisURL = configURL
 	}
 	if workRedisURL == "" {
-		workRedisURL = defaultRedisURL
-		fmt.Printf("   - Using default Redis: %s\n", defaultRedisURL)
+		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
+		os.Exit(1)
 	}
+	Debug("final Redis URL: %s", workRedisURL)
 
 	if workRedisPass == "" {
 		workRedisPass = os.Getenv("REDIS_PASSWORD")
@@ -158,15 +162,27 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
 
-	// Get node name
+	// Get node name - prefer the actual registered name from network
 	nodeName := workNodeName
+	Debug("resolving node name...")
+	Debug("workNodeName flag: %q", workNodeName)
+	Debug("CITADEL_NODE_NAME env: %q", os.Getenv("CITADEL_NODE_NAME"))
 	if nodeName == "" {
 		nodeName = os.Getenv("CITADEL_NODE_NAME")
 	}
 	if nodeName == "" {
-		hostname, _ := os.Hostname()
-		nodeName = hostname
+		// Try to get the actual registered hostname from network status
+		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
+			Debug("got hostname from network status: %s", netStatus.Hostname)
+			nodeName = netStatus.Hostname
+		} else {
+			// Fallback to local hostname
+			hostname, _ := os.Hostname()
+			Debug("using local hostname fallback: %s", hostname)
+			nodeName = hostname
+		}
 	}
+	Debug("final node name: %s", nodeName)
 
 	// Create status collector (used by both status server and heartbeat)
 	var collector *status.Collector
@@ -279,10 +295,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		redisPublisher, err := heartbeat.NewRedisPublisher(heartbeat.RedisPublisherConfig{
-			RedisURL:      workRedisURL,
-			RedisPassword: workRedisPass,
-			NodeID:        nodeName,
-			DeviceCode:    deviceCode,
+			RedisURL:        workRedisURL,
+			RedisPassword:   workRedisPass,
+			NodeID:          nodeName,
+			DeviceCode:      deviceCode,
+			ChannelOverride: workStatusChannel,
+			DebugFunc:       Debug,
 		}, collector)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
@@ -489,6 +507,7 @@ func init() {
 	// Redis status publishing flags
 	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", true, "Enable Redis status publishing for real-time updates")
 	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
+	workCmd.Flags().StringVar(&workStatusChannel, "status-channel", "", "Override Redis pub/sub channel for status (default: node:status:{node-name})")
 
 	// Terminal server flags
 	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")

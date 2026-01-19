@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -319,10 +320,25 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 		ipv6 = ip6.String()
 	}
 
+	// Use the actual registered hostname from Tailscale, not what we requested
+	// Try DNSName first (contains the Headscale-assigned unique name)
+	hostname := s.hostname
+	if status.Self != nil {
+		if status.Self.DNSName != "" {
+			// DNSName is like "ubuntu-gpu-8gluaaom.tailnet.ts.net." - extract first part
+			dnsName := status.Self.DNSName
+			if idx := strings.Index(dnsName, "."); idx > 0 {
+				hostname = dnsName[:idx]
+			}
+		} else if status.Self.HostName != "" {
+			hostname = status.Self.HostName
+		}
+	}
+
 	return &NetworkStatus{
 		Connected:    status.BackendState == "Running",
 		BackendState: status.BackendState,
-		Hostname:     s.hostname,
+		Hostname:     hostname,
 		IPv4:         ipv4,
 		IPv6:         ipv6,
 		ControlURL:   s.controlURL,

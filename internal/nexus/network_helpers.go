@@ -4,11 +4,9 @@ package nexus
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // NetworkChoice represents the user's selected method for network connection.
@@ -44,58 +42,26 @@ func NetworkLogout() error {
 // user to select a connection method. It accepts the authkey from a flag as a parameter.
 func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err error) {
 	if authkey != "" {
-		fmt.Println("✅ Authkey provided via flag.")
 		return NetChoiceAuthkey, authkey, nil
 	}
 
-	fmt.Println("--- Checking network status...")
-
 	// Check if already connected
 	if network.IsGlobalConnected() {
-		fmt.Println("   - ✅ Already connected to the AceTeam Network.")
 		return NetChoiceVerified, "", nil
 	}
 
-	// If state exists, try to reconnect
+	// If state exists, try to reconnect silently
 	if network.HasState() {
-		fmt.Println("   - Found existing network credentials. Reconnecting...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		connected, reconnectErr := network.VerifyOrReconnect(ctx)
-		if connected {
-			fmt.Println("   - ✅ Connected to the AceTeam Network.")
+		if connected, _ := network.VerifyOrReconnect(ctx); connected {
 			return NetChoiceVerified, "", nil
 		}
-		if reconnectErr != nil {
-			fmt.Printf("   - ⚠️  Could not reconnect: %v\n", reconnectErr)
-		}
-		// Fall through to prompt for new auth method
+		// Reconnect failed - need fresh auth
 	}
 
-	fmt.Println("   - ⚠️  You are not connected to the AceTeam Network.")
-	selection, err := ui.AskSelect(
-		"How would you like to connect this node?",
-		[]string{
-			"Device authorization (Recommended)",
-			"Use a pre-generated authkey (For automation)",
-			"Skip network connection for now",
-		},
-	)
-	if err != nil {
-		return "", "", err
-	}
-
-	switch {
-	case strings.Contains(selection, "Device authorization"):
-		return NetChoiceDevice, "", nil
-	case strings.Contains(selection, "authkey"):
-		keyInput, err := ui.AskInput("Enter your AceTeam authkey:", "tskey-auth-...", "")
-		if err != nil {
-			return "", "", err
-		}
-		return NetChoiceAuthkey, strings.TrimSpace(keyInput), nil
-	default:
-		return NetChoiceSkip, "", nil
-	}
+	// Default to device authorization flow
+	// Use --authkey flag for automation/CI
+	return NetChoiceDevice, "", nil
 }
