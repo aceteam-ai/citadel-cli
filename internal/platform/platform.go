@@ -118,8 +118,18 @@ func ChownR(path, owner string) error {
 	return cmd.Run()
 }
 
-// ConfigDir returns the appropriate global config directory for the OS
+// ConfigDir returns the appropriate config directory for the OS.
+// Uses system-wide paths when running as root, user-local paths otherwise.
 func ConfigDir() string {
+	// If not running as root/admin, use user-local config
+	if !IsRoot() {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, ".citadel-cli")
+		}
+	}
+
+	// System-wide paths for root/admin
 	if IsLinux() {
 		return "/etc/citadel"
 	}
