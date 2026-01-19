@@ -44,8 +44,9 @@ var (
 	workSSHSyncMins int
 
 	// Redis status publishing flags
-	workRedisStatus bool
-	workDeviceCode  string
+	workRedisStatus   bool
+	workDeviceCode    string
+	workStatusChannel string
 
 	// Terminal server flags
 	workTerminal     bool
@@ -294,11 +295,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		redisPublisher, err := heartbeat.NewRedisPublisher(heartbeat.RedisPublisherConfig{
-			RedisURL:      workRedisURL,
-			RedisPassword: workRedisPass,
-			NodeID:        nodeName,
-			DeviceCode:    deviceCode,
-			DebugFunc:     Debug,
+			RedisURL:        workRedisURL,
+			RedisPassword:   workRedisPass,
+			NodeID:          nodeName,
+			DeviceCode:      deviceCode,
+			ChannelOverride: workStatusChannel,
+			DebugFunc:       Debug,
 		}, collector)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
@@ -505,6 +507,7 @@ func init() {
 	// Redis status publishing flags
 	workCmd.Flags().BoolVar(&workRedisStatus, "redis-status", true, "Enable Redis status publishing for real-time updates")
 	workCmd.Flags().StringVar(&workDeviceCode, "device-code", "", "Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)")
+	workCmd.Flags().StringVar(&workStatusChannel, "status-channel", "", "Override Redis pub/sub channel for status (default: node:status:{node-name})")
 
 	// Terminal server flags
 	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")

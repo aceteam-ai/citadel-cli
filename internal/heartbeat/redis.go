@@ -75,6 +75,10 @@ type RedisPublisherConfig struct {
 	// Interval is the time between status publishes (default: 30s)
 	Interval time.Duration
 
+	// ChannelOverride overrides the default pub/sub channel name (for debugging)
+	// If empty, uses "node:status:{NodeID}"
+	ChannelOverride string
+
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc func(format string, args ...any)
 }
@@ -102,13 +106,19 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 
 	client := redis.NewClient(opts)
 
+	// Determine pub/sub channel name
+	pubSubChannel := cfg.ChannelOverride
+	if pubSubChannel == "" {
+		pubSubChannel = fmt.Sprintf("node:status:%s", cfg.NodeID)
+	}
+
 	return &RedisPublisher{
 		client:        client,
 		nodeID:        cfg.NodeID,
 		deviceCode:    cfg.DeviceCode,
 		interval:      cfg.Interval,
 		collector:     collector,
-		pubSubChannel: fmt.Sprintf("node:status:%s", cfg.NodeID),
+		pubSubChannel: pubSubChannel,
 		streamName:    "node:status:stream",
 		debugFunc:     cfg.DebugFunc,
 	}, nil
@@ -184,7 +194,9 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal status: %w", err)
 	}
 
-	p.debug("heartbeat: publishing to %s (payload: %d bytes)", p.pubSubChannel, len(jsonData))
+	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
+	p.debug("heartbeat: nodeId=%s, deviceCode=%s, timestamp=%s", msg.NodeID, msg.DeviceCode, msg.Timestamp)
+	p.debug("heartbeat: payload (%d bytes): %s", len(jsonData), string(jsonData))
 
 	// Publish to Pub/Sub for real-time UI updates
 	if err := p.client.Publish(ctx, p.pubSubChannel, jsonData).Err(); err != nil {
