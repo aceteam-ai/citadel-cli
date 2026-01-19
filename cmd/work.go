@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -154,14 +155,20 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
 
-	// Get node name
+	// Get node name - prefer the actual registered name from network
 	nodeName := workNodeName
 	if nodeName == "" {
 		nodeName = os.Getenv("CITADEL_NODE_NAME")
 	}
 	if nodeName == "" {
-		hostname, _ := os.Hostname()
-		nodeName = hostname
+		// Try to get the actual registered hostname from network status
+		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
+			nodeName = netStatus.Hostname
+		} else {
+			// Fallback to local hostname
+			hostname, _ := os.Hostname()
+			nodeName = hostname
+		}
 	}
 
 	// Create status collector (used by both status server and heartbeat)

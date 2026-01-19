@@ -319,10 +319,16 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 		ipv6 = ip6.String()
 	}
 
+	// Use the actual registered hostname from Tailscale, not what we requested
+	hostname := s.hostname
+	if status.Self != nil && status.Self.HostName != "" {
+		hostname = status.Self.HostName
+	}
+
 	return &NetworkStatus{
 		Connected:    status.BackendState == "Running",
 		BackendState: status.BackendState,
-		Hostname:     s.hostname,
+		Hostname:     hostname,
 		IPv4:         ipv4,
 		IPv6:         ipv6,
 		ControlURL:   s.controlURL,
