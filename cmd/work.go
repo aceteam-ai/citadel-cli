@@ -298,6 +298,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			RedisPassword: workRedisPass,
 			NodeID:        nodeName,
 			DeviceCode:    deviceCode,
+			DebugFunc:     Debug,
 		}, collector)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
