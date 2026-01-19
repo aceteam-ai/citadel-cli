@@ -25,6 +25,20 @@ When writing user-facing content (CLI help text, README, error messages), use th
 
 This keeps implementation details hidden from users while maintaining technical accuracy in code comments and internal documentation (like this file).
 
+## ⛔ CRITICAL: Git Branch Policy
+
+**NEVER commit directly to `main` branch.** This is a hard rule with no exceptions.
+
+Always:
+1. Create a feature branch: `git checkout -b fix/description` or `git checkout -b feat/description`
+2. Make commits on the feature branch
+3. Push the branch: `git push -u origin <branch-name>`
+4. **WAIT for user to request a PR** - do NOT automatically create PRs
+
+**Do NOT automatically create PRs.** Only create a PR when the user explicitly asks (e.g., "create a PR", "make a PR", "submit PR"). After pushing a branch, just inform the user and wait for instructions.
+
+If you find yourself about to run `git push origin main`, STOP and create a branch instead.
+
 ## Build and Development Commands
 
 ### Building
@@ -73,8 +87,10 @@ go run . test --service vllm
 
 ### Git Workflow
 
-**CRITICAL RULES:**
-1. **Never commit to `main`** - If on main, create a feature branch first
+**See "⛔ CRITICAL: Git Branch Policy" section above. NEVER push to main.**
+
+**Additional rules:**
+1. **If on main** - Create a feature branch first
 2. **If already on a feature branch** - Commit and push directly to that branch (don't create new branches)
 3. **Never auto-create PRs** - Only create a PR when the user explicitly asks
 
@@ -90,6 +106,8 @@ git push
 # Only create PR when user explicitly requests it
 gh pr create --title "fix: description" --body "..."
 ```
+
+Even for "small fixes" or "quick changes" - always use a branch and PR.
 
 ### Future Work and TODOs
 
