@@ -73,16 +73,21 @@ go run . test --service vllm
 
 ### Git Workflow
 
-**IMPORTANT**: Never commit and push directly to `main`. Always create a feature branch and submit changes via a pull request.
+**CRITICAL RULES:**
+1. **Never commit to `main`** - If on main, create a feature branch first
+2. **If already on a feature branch** - Commit and push directly to that branch (don't create new branches)
+3. **Never auto-create PRs** - Only create a PR when the user explicitly asks
 
 ```bash
-# Create a branch for your work
+# If on main, create a branch first
 git checkout -b fix/description-of-change
 
-# Make changes, commit, then push
-git push -u origin fix/description-of-change
+# If already on a feature branch, just commit and push
+git add <files>
+git commit -m "message"
+git push
 
-# Create PR via GitHub CLI
+# Only create PR when user explicitly requests it
 gh pr create --title "fix: description" --body "..."
 ```
 
