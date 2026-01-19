@@ -94,7 +94,10 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create consumer group: %w", err)
 	}
 
-	// Main consumption loop
+	// Main consumption loop with exponential backoff on errors
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -105,9 +108,22 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				fmt.Printf("   - ⚠️ Config consumer read error: %v\n", err)
+				fmt.Printf("   - ⚠️ Config consumer read error: %v (retry in %s)\n", err, backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				// Exponential backoff up to max
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 				continue
 			}
+
+			// Reset backoff on success
+			backoff = time.Second
 
 			if job == nil {
 				continue // No job available
