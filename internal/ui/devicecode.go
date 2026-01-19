@@ -145,6 +145,17 @@ func (m DeviceCodeModel) View() string {
 	sb.WriteString(padLineHyperlink(clickableURL, displayURL, 3))
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
 
+	// Code box (for manual entry if needed)
+	sb.WriteString(padLine("Or enter this code manually:", 2))
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+	codeBox := "╔══════════════╗"
+	sb.WriteString("│" + centerText(codeBox, boxWidth) + "│\n")
+	plainCodeText := fmt.Sprintf("║  %s   ║", m.userCode)
+	coloredCodeText := fmt.Sprintf("║  %s   ║", color.CyanString(m.userCode))
+	sb.WriteString("│" + centerTextColored(coloredCodeText, plainCodeText, boxWidth) + "│\n")
+	sb.WriteString("│" + centerText("╚══════════════╝", boxWidth) + "│\n")
+	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
+
 	// Hotkeys - prominent, inside a visual separator
 	if m.status == "waiting" {
 		sb.WriteString("│" + strings.Repeat("─", boxWidth) + "│\n")
