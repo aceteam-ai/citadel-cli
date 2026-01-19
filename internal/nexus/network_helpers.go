@@ -50,23 +50,15 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 		return NetChoiceVerified, "", nil
 	}
 
-	// If state exists, try to reconnect
+	// If state exists, try to reconnect silently
 	if network.HasState() {
-		fmt.Print("Connecting... ")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		connected, reconnectErr := network.VerifyOrReconnect(ctx)
-		if connected {
-			fmt.Println("done")
+		if connected, _ := network.VerifyOrReconnect(ctx); connected {
 			return NetChoiceVerified, "", nil
 		}
-		if reconnectErr != nil {
-			fmt.Printf("failed: %v\n", reconnectErr)
-		} else {
-			fmt.Println("failed")
-		}
-		// Fall through to prompt for new auth method
+		// Reconnect failed - need fresh auth
 	}
 
 	// Default to device authorization flow
