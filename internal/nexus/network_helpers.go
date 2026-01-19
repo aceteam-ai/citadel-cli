@@ -44,36 +44,34 @@ func NetworkLogout() error {
 // user to select a connection method. It accepts the authkey from a flag as a parameter.
 func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err error) {
 	if authkey != "" {
-		fmt.Println("✅ Authkey provided via flag.")
 		return NetChoiceAuthkey, authkey, nil
 	}
 
-	fmt.Println("--- Checking network status...")
-
 	// Check if already connected
 	if network.IsGlobalConnected() {
-		fmt.Println("   - ✅ Already connected to the AceTeam Network.")
 		return NetChoiceVerified, "", nil
 	}
 
 	// If state exists, try to reconnect
 	if network.HasState() {
-		fmt.Println("   - Found existing network credentials. Reconnecting...")
+		fmt.Print("Connecting... ")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		connected, reconnectErr := network.VerifyOrReconnect(ctx)
 		if connected {
-			fmt.Println("   - ✅ Connected to the AceTeam Network.")
+			fmt.Println("done")
 			return NetChoiceVerified, "", nil
 		}
 		if reconnectErr != nil {
-			fmt.Printf("   - ⚠️  Could not reconnect: %v\n", reconnectErr)
+			fmt.Printf("failed: %v\n", reconnectErr)
+		} else {
+			fmt.Println("failed")
 		}
 		// Fall through to prompt for new auth method
 	}
 
-	fmt.Println("   - ⚠️  You are not connected to the AceTeam Network.")
+	fmt.Println("Not connected to AceTeam Network.")
 	selection, err := ui.AskSelect(
 		"How would you like to connect this node?",
 		[]string{

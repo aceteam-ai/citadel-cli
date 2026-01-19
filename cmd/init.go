@@ -164,11 +164,9 @@ and system user configuration (requires sudo).`,
 
 			// If already connected via existing credentials, check if fully configured
 			if choice == nexus.NetChoiceVerified {
-				fmt.Println("✅ Node is already connected to the AceTeam Network.")
-
 				// Check if Redis URL is configured
 				if !hasRedisURLConfigured() {
-					fmt.Println("\n⚠️  Redis URL not configured. Re-authenticating to fetch configuration...")
+					fmt.Println("⚠️  Redis URL not configured. Authenticating...")
 					deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "❌ %v\n", err)
@@ -178,23 +176,18 @@ and system user configuration (requires sudo).`,
 					// Save Redis URL from device auth response
 					if deviceAuthResult.Token.RedisURL != "" {
 						if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
-							fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
-						} else {
-							fmt.Println("✅ Redis URL configured successfully.")
+							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
-					} else {
-						fmt.Fprintf(os.Stderr, "⚠️  Warning: No Redis URL received from server.\n")
 					}
 				}
 
-				// Try to get node name from network status
+				// Get node name from network status
 				if nodeName == "" {
 					nodeName, _ = getNodeName()
 				}
-				if nodeName != "" {
-					fmt.Printf("Node name: %s\n", nodeName)
-				}
-				fmt.Println("\nRun 'citadel work' to start processing jobs.")
+
+				fmt.Printf("✅ Connected as %s\n", nodeName)
+				fmt.Println("\nTo switch accounts: citadel logout && citadel init")
 				return
 			}
 
