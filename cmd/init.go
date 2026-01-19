@@ -30,6 +30,7 @@ var (
 	initVerbose            bool
 	initNetworkOnly        bool // Deprecated: kept for backwards compatibility
 	initProvision          bool
+	initRelogin            bool
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
@@ -76,13 +77,18 @@ and system user configuration (requires sudo).`,
 			fmt.Println("✅ Running with root privileges.")
 		}
 
-		// Check if already connected to network and logout to start fresh
-		if network.IsGlobalConnected() {
-			fmt.Println("--- 🔌 Existing network connection detected ---")
-			if err := network.Logout(); err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️  Warning: %v\n", err)
-				// Continue anyway - we'll try to connect with new credentials
+		// Handle --relogin: force logout and fresh authentication
+		if initRelogin {
+			if network.IsGlobalConnected() || network.HasState() {
+				fmt.Print("Logging out... ")
+				if err := network.Logout(); err != nil {
+					fmt.Printf("warning: %v\n", err)
+				} else {
+					fmt.Println("done")
+				}
 			}
+			// Clear saved config to force fresh auth
+			clearSavedConfig()
 		}
 
 		choice, key, err := nexus.GetNetworkChoice(authkey)
@@ -629,6 +635,12 @@ func hasRedisURLConfigured() bool {
 	return config.RedisURL != ""
 }
 
+// clearSavedConfig removes the saved config file to force fresh authentication.
+func clearSavedConfig() {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	_ = os.Remove(globalConfigFile)
+}
+
 // saveRedisURLToConfig saves the Redis URL to the global config file.
 // This is called after device auth to store the org-specific Redis endpoint.
 func saveRedisURLToConfig(redisURL string) error {
@@ -1059,6 +1071,7 @@ func init() {
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
 	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with Docker, NVIDIA toolkit, and services (requires sudo)")
+	initCmd.Flags().BoolVar(&initRelogin, "relogin", false, "Force re-authentication (logout and login again)")
 	// Deprecated: --network-only is now the default behavior
 	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Deprecated: network-only is now the default")
 	initCmd.Flags().MarkHidden("network-only")
