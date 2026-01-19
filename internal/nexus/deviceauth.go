@@ -117,6 +117,11 @@ func (c *DeviceAuthClient) StartFlow() (*DeviceCodeResponse, error) {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
+	// Override verification URI to use the auth service base URL
+	// This ensures local development works correctly
+	response.VerificationURI = c.baseURL + "/device"
+	response.VerificationURIComplete = c.baseURL + "/device?code=" + response.UserCode
+
 	return &response, nil
 }
 
