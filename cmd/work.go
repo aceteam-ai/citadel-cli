@@ -57,6 +57,9 @@ var (
 
 	// Update check flag
 	workNoUpdate bool
+
+	// API mode flag
+	workForceDirectRedis bool
 )
 
 var workCmd = &cobra.Command{
@@ -116,48 +119,111 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Resolve Redis URL: flag > env > config
-	Debug("resolving Redis URL...")
-	Debug("--redis-url flag: %q", workRedisURL)
-	Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
-	if workRedisURL == "" {
-		workRedisURL = os.Getenv("REDIS_URL")
-	}
-	if workRedisURL == "" {
-		configURL := getRedisURLFromConfig()
-		Debug("redis URL from config: %q", configURL)
-		workRedisURL = configURL
-	}
-	if workRedisURL == "" {
-		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
-		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
-		os.Exit(1)
-	}
-	Debug("final Redis URL: %s", workRedisURL)
+	// Resolve job source: API mode (device_api_token) vs direct Redis (legacy)
+	Debug("resolving job source mode...")
 
-	if workRedisPass == "" {
-		workRedisPass = os.Getenv("REDIS_PASSWORD")
-	}
-	if workQueue == "" {
-		workQueue = os.Getenv("WORKER_QUEUE")
-	}
-	if workGroup == "" {
-		workGroup = os.Getenv("CONSUMER_GROUP")
+	// Load device config from file
+	deviceConfig := getDeviceConfigFromFile()
+	if deviceConfig != nil {
+		Debug("config loaded: device_api_token=%q, api_base_url=%q, redis_url=%q",
+			maskToken(deviceConfig.DeviceAPIToken),
+			deviceConfig.APIBaseURL,
+			deviceConfig.RedisURL)
+	} else {
+		Debug("config file not found or empty")
 	}
 
-	// Create Redis job source
-	redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
-		URL:           workRedisURL,
-		Password:      workRedisPass,
-		QueueName:     workQueue,
-		ConsumerGroup: workGroup,
-		BlockMs:       workPollMs,
-		MaxAttempts:   workMaxRetries,
-	})
-	source := redisSource
+	// Check for API mode: device_api_token takes precedence (unless forced to direct Redis)
+	var source worker.JobSource
+	var streamFactory func(jobID string) worker.StreamWriter
+	var useAPIMode bool
 
-	// Enable streaming
-	streamFactory := worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+	if !workForceDirectRedis && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		// API mode: use secure HTTP API instead of direct Redis
+		Debug("using API mode (device_api_token found)")
+		useAPIMode = true
+
+		apiBaseURL := deviceConfig.APIBaseURL
+		if apiBaseURL == "" {
+			apiBaseURL = authServiceURL // Default to auth service URL
+		}
+		Debug("API base URL: %s", apiBaseURL)
+
+		if workQueue == "" {
+			workQueue = os.Getenv("WORKER_QUEUE")
+		}
+		if workGroup == "" {
+			workGroup = os.Getenv("CONSUMER_GROUP")
+		}
+
+		apiSource := worker.NewAPISource(worker.APISourceConfig{
+			BaseURL:       apiBaseURL,
+			Token:         deviceConfig.DeviceAPIToken,
+			QueueName:     workQueue,
+			ConsumerGroup: workGroup,
+			BlockMs:       workPollMs,
+			MaxAttempts:   workMaxRetries,
+			DebugFunc:     Debug,
+		})
+		source = apiSource
+		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
+
+		fmt.Println("   - Mode: Redis API (secure)")
+	} else {
+		// Legacy mode: direct Redis connection
+		Debug("using direct Redis mode")
+
+		// Resolve Redis URL: flag > env > config
+		Debug("resolving Redis URL...")
+		Debug("--redis-url flag: %q", workRedisURL)
+		Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
+		if workRedisURL == "" {
+			workRedisURL = os.Getenv("REDIS_URL")
+		}
+		if workRedisURL == "" && deviceConfig != nil {
+			Debug("redis URL from config: %q", deviceConfig.RedisURL)
+			workRedisURL = deviceConfig.RedisURL
+		}
+		if workRedisURL == "" {
+			// Fallback to old config reading for backwards compatibility
+			configURL := getRedisURLFromConfig()
+			Debug("redis URL from legacy config: %q", configURL)
+			workRedisURL = configURL
+		}
+		if workRedisURL == "" {
+			fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+			fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
+			os.Exit(1)
+		}
+		Debug("final Redis URL: %s", workRedisURL)
+
+		if workRedisPass == "" {
+			workRedisPass = os.Getenv("REDIS_PASSWORD")
+		}
+		if workQueue == "" {
+			workQueue = os.Getenv("WORKER_QUEUE")
+		}
+		if workGroup == "" {
+			workGroup = os.Getenv("CONSUMER_GROUP")
+		}
+
+		// Create Redis job source
+		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
+			URL:           workRedisURL,
+			Password:      workRedisPass,
+			QueueName:     workQueue,
+			ConsumerGroup: workGroup,
+			BlockMs:       workPollMs,
+			MaxAttempts:   workMaxRetries,
+		})
+		source = redisSource
+		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+
+		fmt.Println("   - Mode: Direct Redis (legacy)")
+	}
+
+	// Log mode for debugging
+	_ = useAPIMode
 
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
@@ -482,6 +548,34 @@ func getRedisURLFromConfig() string {
 	return config.RedisURL
 }
 
+// DeviceConfig holds device authentication configuration from the global config file.
+type DeviceConfig struct {
+	DeviceAPIToken string `yaml:"device_api_token"`
+	APIBaseURL     string `yaml:"api_base_url"`
+	RedisURL       string `yaml:"redis_url"`
+}
+
+// getDeviceConfigFromFile reads device authentication config from global config file.
+func getDeviceConfigFromFile() *DeviceConfig {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return nil
+	}
+
+	var config DeviceConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil
+	}
+
+	// Return nil if no relevant config found
+	if config.DeviceAPIToken == "" && config.RedisURL == "" {
+		return nil
+	}
+
+	return &config
+}
+
 func init() {
 	rootCmd.AddCommand(workCmd)
 
@@ -492,6 +586,7 @@ func init() {
 	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
 	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
+	workCmd.Flags().BoolVar(&workForceDirectRedis, "force-direct-redis", false, "Force direct Redis mode instead of API mode")
 
 	// Status and heartbeat flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")

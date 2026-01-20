@@ -28,11 +28,13 @@ type DeviceCodeResponse struct {
 
 // TokenResponse represents a successful token response
 type TokenResponse struct {
-	Authkey   string `json:"authkey"`
-	ExpiresIn int    `json:"expires_in"`
-	NexusURL  string `json:"nexus_url,omitempty"`
-	OrgID     string `json:"org_id,omitempty"`
-	RedisURL  string `json:"redis_url,omitempty"`
+	Authkey        string `json:"authkey"`
+	ExpiresIn      int    `json:"expires_in"`
+	NexusURL       string `json:"nexus_url,omitempty"`
+	OrgID          string `json:"org_id,omitempty"`
+	RedisURL       string `json:"redis_url,omitempty"`       // Deprecated: use DeviceAPIToken
+	DeviceAPIToken string `json:"device_api_token,omitempty"` // New secure API token
+	APIBaseURL     string `json:"api_base_url,omitempty"`     // Base URL for API calls
 }
 
 // TokenError represents an error response from the /token endpoint
