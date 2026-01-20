@@ -68,18 +68,18 @@ type PublishResponse struct {
 	Receivers  int64 `json:"receivers,omitempty"`
 }
 
-// StreamAddRequest is the request body for adding to Redis Streams (via publish endpoint)
+// StreamAddRequest is the request body for POST /api/fabric/redis/streams/add
 type StreamAddRequest struct {
-	Stream string         `json:"stream"`
-	Values map[string]any `json:"values"`
-	MaxLen int64          `json:"max_len,omitempty"`
-	Approx bool           `json:"approx,omitempty"`
+	Stream string            `json:"stream"`
+	Values map[string]string `json:"values"`
+	MaxLen int64             `json:"maxLen,omitempty"`
+	Approx bool              `json:"approx,omitempty"`
 }
 
-// StreamAddResponse is the response from stream add operations
+// StreamAddResponse is the response from POST /api/fabric/redis/streams/add
 type StreamAddResponse struct {
 	Success   bool   `json:"success"`
-	MessageID string `json:"message_id,omitempty"`
+	MessageID string `json:"messageId,omitempty"`
 }
 
 // KVGetRequest is the query params for GET /api/fabric/redis/kv

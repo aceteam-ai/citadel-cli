@@ -735,10 +735,13 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 		config = make(map[string]interface{})
 	}
 
-	// Add device API token and base URL (secure mode)
+	// Add device API token, base URL, and org ID (secure mode)
 	config["device_api_token"] = token.DeviceAPIToken
 	if token.APIBaseURL != "" {
 		config["api_base_url"] = token.APIBaseURL
+	}
+	if token.OrgID != "" {
+		config["org_id"] = token.OrgID
 	}
 	// Remove redis_url - not needed when using API mode
 	delete(config, "redis_url")

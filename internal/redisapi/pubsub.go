@@ -144,7 +144,7 @@ func (c *Client) DeleteKey(ctx context.Context, key string) (bool, error) {
 }
 
 // StreamAdd adds an entry to a Redis Stream (for status publishing).
-func (c *Client) StreamAdd(ctx context.Context, stream string, values map[string]any, maxLen int64) error {
+func (c *Client) StreamAdd(ctx context.Context, stream string, values map[string]string, maxLen int64) error {
 	req := StreamAddRequest{
 		Stream: stream,
 		Values: values,
@@ -153,9 +153,13 @@ func (c *Client) StreamAdd(ctx context.Context, stream string, values map[string
 	}
 
 	var resp StreamAddResponse
-	err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/pubsub/publish", req, &resp)
+	err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/streams/add", req, &resp)
 	if err != nil {
 		return err
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("stream add failed")
 	}
 
 	return nil

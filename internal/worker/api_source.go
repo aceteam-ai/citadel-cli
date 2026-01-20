@@ -65,6 +65,11 @@ func (s *APISource) Name() string {
 
 // Connect establishes connection to the API.
 func (s *APISource) Connect(ctx context.Context) error {
+	// Skip if already connected
+	if s.client != nil {
+		return nil
+	}
+
 	s.client = redisapi.NewClient(redisapi.ClientConfig{
 		BaseURL:   s.config.BaseURL,
 		Token:     s.config.Token,
