@@ -173,6 +173,14 @@ func runWork(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
+		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)
+		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
+			// WebSocket is optional - fall back to HTTP
+			Debug("WebSocket not available, using HTTP for pub/sub: %v", err)
+		} else {
+			Debug("WebSocket enabled for real-time pub/sub")
+		}
+
 		source = apiSource
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
 

@@ -9,7 +9,17 @@ import (
 )
 
 // Publish publishes a message to a Redis Pub/Sub channel.
+// Uses WebSocket when connected, falls back to HTTP otherwise.
 func (c *Client) Publish(ctx context.Context, channel string, message any) error {
+	// Prefer WebSocket when connected
+	if c.wsClient != nil && c.wsClient.IsConnected() {
+		c.debug("publish: using WebSocket for channel %s", channel)
+		return c.wsClient.Publish(ctx, channel, message)
+	}
+
+	// Fall back to HTTP
+	c.debug("publish: using HTTP for channel %s", channel)
+
 	// Serialize message to JSON
 	msgJSON, err := json.Marshal(message)
 	if err != nil {

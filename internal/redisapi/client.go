@@ -19,6 +19,9 @@ type Client struct {
 	httpClient *http.Client
 	workerID   string
 
+	// WebSocket client for real-time pub/sub (optional)
+	wsClient *WSClient
+
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
 }
@@ -90,9 +93,45 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the HTTP client (no-op for now, but provided for interface consistency).
+// Close closes the HTTP client and WebSocket if connected.
 func (c *Client) Close() error {
+	if c.wsClient != nil {
+		return c.wsClient.Close()
+	}
 	return nil
+}
+
+// EnableWebSocket connects the WebSocket client for real-time pub/sub.
+// This allows Publish calls to use WebSocket instead of HTTP when connected.
+func (c *Client) EnableWebSocket(ctx context.Context) error {
+	if c.wsClient != nil && c.wsClient.IsConnected() {
+		return nil
+	}
+
+	c.wsClient = NewWSClient(WSClientConfig{
+		BaseURL:          c.baseURL,
+		Token:            c.token,
+		ReconnectEnabled: true,
+		DebugFunc:        c.debugFunc,
+	})
+
+	if err := c.wsClient.Connect(ctx); err != nil {
+		c.wsClient = nil
+		return fmt.Errorf("failed to connect WebSocket: %w", err)
+	}
+
+	c.debug("WebSocket enabled for real-time pub/sub")
+	return nil
+}
+
+// WebSocket returns the WebSocket client if enabled, nil otherwise.
+func (c *Client) WebSocket() *WSClient {
+	return c.wsClient
+}
+
+// IsWebSocketConnected returns whether the WebSocket is currently connected.
+func (c *Client) IsWebSocketConnected() bool {
+	return c.wsClient != nil && c.wsClient.IsConnected()
 }
 
 // doRequest performs an HTTP request with authentication and JSON handling.
