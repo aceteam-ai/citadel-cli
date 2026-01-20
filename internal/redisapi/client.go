@@ -69,8 +69,7 @@ func (c *Client) WorkerID() string {
 
 // Ping verifies the API connection by making a simple request.
 func (c *Client) Ping(ctx context.Context) error {
-	// Use a simple KV get to verify connectivity
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/fabric/redis/kv?key=__ping__", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/fabric/redis/ping", nil)
 	if err != nil {
 		return fmt.Errorf("failed to create ping request: %w", err)
 	}
@@ -83,8 +82,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	// 404 (key not found) is also a valid response - it means the API is working
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("ping failed with status %d: %s", resp.StatusCode, string(body))
 	}

@@ -77,6 +77,9 @@ and system user configuration (requires sudo).`,
 			fmt.Println("✅ Running with root privileges.")
 		}
 
+		// Wire up debug logging for nexus package
+		nexus.DebugFunc = Debug
+
 		Debug("auth-service: %s", authServiceURL)
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())

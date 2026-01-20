@@ -41,7 +41,7 @@ type APISourceConfig struct {
 // NewAPISource creates a new API-backed job source.
 func NewAPISource(cfg APISourceConfig) *APISource {
 	if cfg.QueueName == "" {
-		cfg.QueueName = "jobs:v1:gpu-general"
+		cfg.QueueName = "jobs:v1:cpu-general"
 	}
 	if cfg.ConsumerGroup == "" {
 		cfg.ConsumerGroup = "citadel-workers"
@@ -86,11 +86,11 @@ func (s *APISource) Connect(ctx context.Context) error {
 // Next blocks until a job is available or context is cancelled.
 func (s *APISource) Next(ctx context.Context) (*Job, error) {
 	apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
-		Queue:         s.config.QueueName,
-		ConsumerGroup: s.config.ConsumerGroup,
-		Consumer:      s.client.WorkerID(),
-		Count:         1,
-		BlockMs:       s.config.BlockMs,
+		Queue:    s.config.QueueName,
+		Group:    s.config.ConsumerGroup,
+		Consumer: s.client.WorkerID(),
+		Count:    1,
+		BlockMs:  s.config.BlockMs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to consume job from API: %w", err)
@@ -119,9 +119,9 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 func (s *APISource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
 	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
-		Queue:         s.config.QueueName,
-		ConsumerGroup: s.config.ConsumerGroup,
-		MessageID:     job.MessageID,
+		Queue:     s.config.QueueName,
+		Group:     s.config.ConsumerGroup,
+		MessageID: job.MessageID,
 	})
 }
 

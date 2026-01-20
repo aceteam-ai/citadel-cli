@@ -2,6 +2,7 @@ package redisapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
@@ -24,11 +25,37 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 		return nil, err
 	}
 
-	if len(resp.Jobs) == 0 {
+	if len(resp.Messages) == 0 {
 		return nil, nil // No job available
 	}
 
-	return &resp.Jobs[0], nil
+	// Convert the first StreamMessage to a Job
+	msg := resp.Messages[0]
+	return parseStreamMessage(msg)
+}
+
+// parseStreamMessage converts a StreamMessage to a Job.
+func parseStreamMessage(msg StreamMessage) (*Job, error) {
+	job := &Job{
+		MessageID: msg.ID,
+		JobID:     msg.Data.JobID,
+	}
+
+	// Parse the payload JSON string
+	if msg.Data.Payload != "" {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(msg.Data.Payload), &payload); err != nil {
+			return nil, fmt.Errorf("failed to parse job payload: %w", err)
+		}
+		job.Payload = payload
+
+		// Extract type from payload if present
+		if jobType, ok := payload["type"].(string); ok {
+			job.Type = jobType
+		}
+	}
+
+	return job, nil
 }
 
 // AcknowledgeJob acknowledges a successfully processed job.

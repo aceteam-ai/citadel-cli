@@ -9,19 +9,32 @@ package redisapi
 
 // ConsumeRequest is the request body for POST /api/fabric/redis/jobs/consume
 type ConsumeRequest struct {
-	Queue         string `json:"queue"`
-	ConsumerGroup string `json:"consumer_group"`
-	Consumer      string `json:"consumer"`
-	Count         int    `json:"count"`
-	BlockMs       int    `json:"block_ms"`
+	Queue    string `json:"queue"`
+	Group    string `json:"group"`
+	Consumer string `json:"consumer"`
+	Count    int    `json:"count,omitempty"`
+	BlockMs  int    `json:"blockMs,omitempty"`
 }
 
 // ConsumeResponse is the response from POST /api/fabric/redis/jobs/consume
 type ConsumeResponse struct {
-	Jobs []Job `json:"jobs"`
+	Messages []StreamMessage `json:"messages"`
 }
 
-// Job represents a job returned from the API
+// StreamMessage represents a message from Redis Streams
+type StreamMessage struct {
+	ID   string            `json:"id"`
+	Data StreamMessageData `json:"data"`
+}
+
+// StreamMessageData contains the job data within a stream message
+type StreamMessageData struct {
+	JobID      string `json:"jobId"`
+	Payload    string `json:"payload"` // JSON-encoded job payload
+	EnqueuedAt string `json:"enqueuedAt"`
+}
+
+// Job represents a parsed job ready for processing
 type Job struct {
 	MessageID string         `json:"message_id"`
 	JobID     string         `json:"job_id"`
@@ -32,9 +45,9 @@ type Job struct {
 
 // AcknowledgeRequest is the request body for POST /api/fabric/redis/jobs/acknowledge
 type AcknowledgeRequest struct {
-	Queue         string `json:"queue"`
-	ConsumerGroup string `json:"consumer_group"`
-	MessageID     string `json:"message_id"`
+	Queue     string `json:"queue"`
+	Group     string `json:"group"`
+	MessageID string `json:"messageId"`
 }
 
 // AcknowledgeResponse is the response from POST /api/fabric/redis/jobs/acknowledge
