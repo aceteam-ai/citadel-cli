@@ -77,6 +77,9 @@ and system user configuration (requires sudo).`,
 			fmt.Println("✅ Running with root privileges.")
 		}
 
+		// Wire up debug logging for nexus package
+		nexus.DebugFunc = Debug
+
 		Debug("auth-service: %s", authServiceURL)
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())
@@ -127,19 +130,29 @@ and system user configuration (requires sudo).`,
 			Debug("device auth successful")
 			Debug("token response - authkey: %s...", deviceAuthResult.Token.Authkey[:min(20, len(deviceAuthResult.Token.Authkey))])
 			Debug("token response - redis_url: %s", deviceAuthResult.Token.RedisURL)
+			Debug("token response - device_api_token: %s", maskToken(deviceAuthResult.Token.DeviceAPIToken))
+			Debug("token response - api_base_url: %s", deviceAuthResult.Token.APIBaseURL)
 			Debug("token response - nexus_url: %s", deviceAuthResult.Token.NexusURL)
 			Debug("token response - org_id: %s", deviceAuthResult.Token.OrgID)
 
-			// Save Redis URL to config if provided by backend
-			if deviceAuthResult.Token.RedisURL != "" {
-				Debug("saving redis URL to config...")
+			// Save device API token if provided (preferred secure mode)
+			if deviceAuthResult.Token.DeviceAPIToken != "" {
+				Debug("saving device API token to config...")
+				if err := saveDeviceConfigToFile(deviceAuthResult.Token); err != nil {
+					fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save device config: %v\n", err)
+				} else {
+					Debug("device API token saved successfully")
+				}
+			} else if deviceAuthResult.Token.RedisURL != "" {
+				// Fallback: Save Redis URL to config if device_api_token not provided
+				Debug("saving redis URL to config (legacy mode)...")
 				if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
 					fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
 				} else {
 					Debug("redis URL saved successfully")
 				}
 			} else {
-				Debug("no redis URL in token response")
+				Debug("no device config in token response")
 			}
 
 			// Immediately connect to network after device auth succeeds
@@ -193,17 +206,21 @@ and system user configuration (requires sudo).`,
 
 			// If already connected via existing credentials, check if fully configured
 			if choice == nexus.NetChoiceVerified {
-				// Check if Redis URL is configured
-				if !hasRedisURLConfigured() {
-					fmt.Println("⚠️  Redis URL not configured. Authenticating...")
+				// Check if device config is present (API token or Redis URL)
+				if !hasDeviceConfigured() {
+					fmt.Println("⚠️  Device config not found. Authenticating...")
 					deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 						os.Exit(1)
 					}
 
-					// Save Redis URL from device auth response
-					if deviceAuthResult.Token.RedisURL != "" {
+					// Save device config from device auth response
+					if deviceAuthResult.Token.DeviceAPIToken != "" {
+						if err := saveDeviceConfigToFile(deviceAuthResult.Token); err != nil {
+							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
+						}
+					} else if deviceAuthResult.Token.RedisURL != "" {
 						if err := saveRedisURLToConfig(deviceAuthResult.Token.RedisURL); err != nil {
 							fmt.Fprintf(os.Stderr, "⚠️  Could not save config: %v\n", err)
 						}
@@ -642,6 +659,7 @@ func createGlobalConfig(nodeConfigDir string) error {
 }
 
 // hasRedisURLConfigured checks if a Redis URL is stored in the global config.
+// Deprecated: use hasDeviceConfigured instead.
 func hasRedisURLConfigured() bool {
 	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
 	data, err := os.ReadFile(globalConfigFile)
@@ -658,13 +676,89 @@ func hasRedisURLConfigured() bool {
 	return config.RedisURL != ""
 }
 
+// hasDeviceConfigured checks if device authentication config is present.
+// Returns true if either device_api_token or redis_url is configured.
+func hasDeviceConfigured() bool {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return false
+	}
+
+	var config struct {
+		DeviceAPIToken string `yaml:"device_api_token"`
+		RedisURL       string `yaml:"redis_url"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return false
+	}
+	return config.DeviceAPIToken != "" || config.RedisURL != ""
+}
+
 // clearSavedConfig removes the saved config file to force fresh authentication.
 func clearSavedConfig() {
 	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
 	_ = os.Remove(globalConfigFile)
 }
 
+// maskToken masks a token for safe logging, showing only first/last few chars.
+func maskToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	if len(token) <= 8 {
+		return "***"
+	}
+	return token[:4] + "..." + token[len(token)-4:]
+}
+
+// saveDeviceConfigToFile saves device authentication config to the global config file.
+// This is called after device auth to store the device_api_token and api_base_url.
+func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
+	globalConfigDir := platform.ConfigDir()
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+
+	// Ensure config directory exists
+	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+		return fmt.Errorf("failed to create global config directory: %w", err)
+	}
+
+	// Read existing config if it exists
+	var config map[string]interface{}
+	data, err := os.ReadFile(globalConfigFile)
+	if err == nil {
+		if unmarshalErr := yaml.Unmarshal(data, &config); unmarshalErr != nil {
+			config = nil
+		}
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	// Add device API token, base URL, and org ID (secure mode)
+	config["device_api_token"] = token.DeviceAPIToken
+	if token.APIBaseURL != "" {
+		config["api_base_url"] = token.APIBaseURL
+	}
+	if token.OrgID != "" {
+		config["org_id"] = token.OrgID
+	}
+	// Remove redis_url - not needed when using API mode
+	delete(config, "redis_url")
+
+	// Write back
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+	return nil
+}
+
 // saveRedisURLToConfig saves the Redis URL to the global config file.
+// Deprecated: use saveDeviceConfigToFile instead.
 // This is called after device auth to store the org-specific Redis endpoint.
 func saveRedisURLToConfig(redisURL string) error {
 	globalConfigDir := platform.ConfigDir()

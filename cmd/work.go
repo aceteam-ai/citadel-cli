@@ -57,6 +57,9 @@ var (
 
 	// Update check flag
 	workNoUpdate bool
+
+	// API mode flag
+	workForceDirectRedis bool
 )
 
 var workCmd = &cobra.Command{
@@ -116,48 +119,127 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Resolve Redis URL: flag > env > config
-	Debug("resolving Redis URL...")
-	Debug("--redis-url flag: %q", workRedisURL)
-	Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
-	if workRedisURL == "" {
-		workRedisURL = os.Getenv("REDIS_URL")
-	}
-	if workRedisURL == "" {
-		configURL := getRedisURLFromConfig()
-		Debug("redis URL from config: %q", configURL)
-		workRedisURL = configURL
-	}
-	if workRedisURL == "" {
-		fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
-		fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
-		os.Exit(1)
-	}
-	Debug("final Redis URL: %s", workRedisURL)
+	// Resolve job source: API mode (device_api_token) vs direct Redis (legacy)
+	Debug("resolving job source mode...")
 
-	if workRedisPass == "" {
-		workRedisPass = os.Getenv("REDIS_PASSWORD")
-	}
-	if workQueue == "" {
-		workQueue = os.Getenv("WORKER_QUEUE")
-	}
-	if workGroup == "" {
-		workGroup = os.Getenv("CONSUMER_GROUP")
+	// Load device config from file
+	deviceConfig := getDeviceConfigFromFile()
+	if deviceConfig != nil {
+		Debug("config loaded: device_api_token=%q, api_base_url=%q, redis_url=%q",
+			maskToken(deviceConfig.DeviceAPIToken),
+			deviceConfig.APIBaseURL,
+			deviceConfig.RedisURL)
+	} else {
+		Debug("config file not found or empty")
 	}
 
-	// Create Redis job source
-	redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
-		URL:           workRedisURL,
-		Password:      workRedisPass,
-		QueueName:     workQueue,
-		ConsumerGroup: workGroup,
-		BlockMs:       workPollMs,
-		MaxAttempts:   workMaxRetries,
-	})
-	source := redisSource
+	// Check for API mode: device_api_token takes precedence (unless forced to direct Redis)
+	var source worker.JobSource
+	var streamFactory func(jobID string) worker.StreamWriter
+	var useAPIMode bool
+	var apiSource *worker.APISource // Keep reference for heartbeat
 
-	// Enable streaming
-	streamFactory := worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+	if !workForceDirectRedis && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		// API mode: use secure HTTP API instead of direct Redis
+		Debug("using API mode (device_api_token found)")
+		useAPIMode = true
+
+		apiBaseURL := deviceConfig.APIBaseURL
+		if apiBaseURL == "" {
+			apiBaseURL = authServiceURL // Default to auth service URL
+		}
+		Debug("API base URL: %s", apiBaseURL)
+
+		if workQueue == "" {
+			workQueue = os.Getenv("WORKER_QUEUE")
+		}
+		if workGroup == "" {
+			workGroup = os.Getenv("CONSUMER_GROUP")
+		}
+
+		apiSource = worker.NewAPISource(worker.APISourceConfig{
+			BaseURL:       apiBaseURL,
+			Token:         deviceConfig.DeviceAPIToken,
+			QueueName:     workQueue,
+			ConsumerGroup: workGroup,
+			BlockMs:       workPollMs,
+			MaxAttempts:   workMaxRetries,
+			DebugFunc:     Debug,
+		})
+
+		// Connect early so client is available for heartbeat
+		if err := apiSource.Connect(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Failed to connect to Redis API: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)
+		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
+			// WebSocket is optional - fall back to HTTP
+			Debug("WebSocket not available, using HTTP for pub/sub: %v", err)
+		} else {
+			Debug("WebSocket enabled for real-time pub/sub")
+		}
+
+		source = apiSource
+		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
+
+		fmt.Println("   - Mode: Redis API (secure)")
+	} else {
+		// Legacy mode: direct Redis connection
+		Debug("using direct Redis mode")
+
+		// Resolve Redis URL: flag > env > config
+		Debug("resolving Redis URL...")
+		Debug("--redis-url flag: %q", workRedisURL)
+		Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
+		if workRedisURL == "" {
+			workRedisURL = os.Getenv("REDIS_URL")
+		}
+		if workRedisURL == "" && deviceConfig != nil {
+			Debug("redis URL from config: %q", deviceConfig.RedisURL)
+			workRedisURL = deviceConfig.RedisURL
+		}
+		if workRedisURL == "" {
+			// Fallback to old config reading for backwards compatibility
+			configURL := getRedisURLFromConfig()
+			Debug("redis URL from legacy config: %q", configURL)
+			workRedisURL = configURL
+		}
+		if workRedisURL == "" {
+			fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
+			fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
+			os.Exit(1)
+		}
+		Debug("final Redis URL: %s", workRedisURL)
+
+		if workRedisPass == "" {
+			workRedisPass = os.Getenv("REDIS_PASSWORD")
+		}
+		if workQueue == "" {
+			workQueue = os.Getenv("WORKER_QUEUE")
+		}
+		if workGroup == "" {
+			workGroup = os.Getenv("CONSUMER_GROUP")
+		}
+
+		// Create Redis job source
+		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
+			URL:           workRedisURL,
+			Password:      workRedisPass,
+			QueueName:     workQueue,
+			ConsumerGroup: workGroup,
+			BlockMs:       workPollMs,
+			MaxAttempts:   workMaxRetries,
+		})
+		source = redisSource
+		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+
+		fmt.Println("   - Mode: Direct Redis (legacy)")
+	}
+
+	// Log mode for debugging
+	_ = useAPIMode
 
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
@@ -277,14 +359,8 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - ⚠️ SSH sync enabled but no API key configured")
 	}
 
-	// Start Redis status publisher if enabled (for Redis mode)
-	if workRedisStatus && workRedisURL != "" {
-		// Get device code from flag or environment
-		deviceCode := workDeviceCode
-		if deviceCode == "" {
-			deviceCode = os.Getenv("CITADEL_DEVICE_CODE")
-		}
-
+	// Start status publisher if enabled
+	if workRedisStatus {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
@@ -294,60 +370,103 @@ func runWork(cmd *cobra.Command, args []string) {
 			})
 		}
 
-		redisPublisher, err := heartbeat.NewRedisPublisher(heartbeat.RedisPublisherConfig{
-			RedisURL:        workRedisURL,
-			RedisPassword:   workRedisPass,
-			NodeID:          nodeName,
-			DeviceCode:      deviceCode,
-			ChannelOverride: workStatusChannel,
-			DebugFunc:       Debug,
-		}, collector)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
-		} else {
-			go func() {
-				fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
-				if deviceCode != "" {
-					fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
+		if useAPIMode && apiSource != nil {
+			// API mode: use secure API publisher
+			// Get org ID from device config (saved during init)
+			orgID := ""
+			if deviceConfig != nil {
+				orgID = deviceConfig.OrgID
+			}
+			// Fallback to manifest if not in device config
+			if orgID == "" {
+				if manifest, _, err := findAndReadManifest(); err == nil {
+					orgID = manifest.Node.OrgID
 				}
-				if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
-				}
-			}()
-		}
+			}
 
-		// Start config queue consumer for device configuration jobs
-		configConsumer, err := heartbeat.NewConfigConsumer(heartbeat.ConfigConsumerConfig{
-			RedisURL:      workRedisURL,
-			RedisPassword: workRedisPass,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config consumer: %v\n", err)
-		} else {
-			go func() {
-				fmt.Printf("   - Config queue: %s (listening for device config)\n", configConsumer.QueueName())
-				if err := configConsumer.Start(ctx); err != nil && err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "   - ⚠️ Config consumer error: %v\n", err)
+			if orgID == "" {
+				fmt.Fprintln(os.Stderr, "   - ⚠️ API status publisher requires org-id (run 'citadel init' first)")
+			} else {
+				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
+					Client:    apiSource.Client(),
+					NodeID:    nodeName,
+					OrgID:     orgID,
+					DebugFunc: Debug,
+				}, collector)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
+				} else {
+					go func() {
+						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
+						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+							fmt.Fprintf(os.Stderr, "   - ⚠️ API status publisher error: %v\n", err)
+						}
+					}()
 				}
-			}()
-		}
+			}
+		} else if workRedisURL != "" {
+			// Legacy mode: direct Redis publisher
+			// Get device code from flag or environment
+			deviceCode := workDeviceCode
+			if deviceCode == "" {
+				deviceCode = os.Getenv("CITADEL_DEVICE_CODE")
+			}
 
-		// Start config Pub/Sub subscriber for real-time config updates
-		configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
-			RedisURL:      workRedisURL,
-			RedisPassword: workRedisPass,
-			NodeID:        nodeName,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)
-		} else {
-			go func() {
-				defer configSubscriber.Close() // Ensure Redis connection is cleaned up
-				fmt.Printf("   - Config subscriber: %s (real-time config updates)\n", configSubscriber.Channel())
-				if err := configSubscriber.Start(ctx); err != nil && err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "   - ⚠️ Config subscriber error: %v\n", err)
-				}
-			}()
+			redisPublisher, err := heartbeat.NewRedisPublisher(heartbeat.RedisPublisherConfig{
+				RedisURL:        workRedisURL,
+				RedisPassword:   workRedisPass,
+				NodeID:          nodeName,
+				DeviceCode:      deviceCode,
+				ChannelOverride: workStatusChannel,
+				DebugFunc:       Debug,
+			}, collector)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
+			} else {
+				go func() {
+					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
+					if deviceCode != "" {
+						fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
+					}
+					if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
+					}
+				}()
+			}
+
+			// Start config queue consumer for device configuration jobs
+			configConsumer, err := heartbeat.NewConfigConsumer(heartbeat.ConfigConsumerConfig{
+				RedisURL:      workRedisURL,
+				RedisPassword: workRedisPass,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config consumer: %v\n", err)
+			} else {
+				go func() {
+					fmt.Printf("   - Config queue: %s (listening for device config)\n", configConsumer.QueueName())
+					if err := configConsumer.Start(ctx); err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Config consumer error: %v\n", err)
+					}
+				}()
+			}
+
+			// Start config Pub/Sub subscriber for real-time config updates
+			configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
+				RedisURL:      workRedisURL,
+				RedisPassword: workRedisPass,
+				NodeID:        nodeName,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)
+			} else {
+				go func() {
+					defer configSubscriber.Close() // Ensure Redis connection is cleaned up
+					fmt.Printf("   - Config subscriber: %s (real-time config updates)\n", configSubscriber.Channel())
+					if err := configSubscriber.Start(ctx); err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Config subscriber error: %v\n", err)
+					}
+				}()
+			}
 		}
 	}
 
@@ -482,6 +601,35 @@ func getRedisURLFromConfig() string {
 	return config.RedisURL
 }
 
+// DeviceConfig holds device authentication configuration from the global config file.
+type DeviceConfig struct {
+	DeviceAPIToken string `yaml:"device_api_token"`
+	APIBaseURL     string `yaml:"api_base_url"`
+	OrgID          string `yaml:"org_id"`
+	RedisURL       string `yaml:"redis_url"`
+}
+
+// getDeviceConfigFromFile reads device authentication config from global config file.
+func getDeviceConfigFromFile() *DeviceConfig {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return nil
+	}
+
+	var config DeviceConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil
+	}
+
+	// Return nil if no relevant config found
+	if config.DeviceAPIToken == "" && config.RedisURL == "" {
+		return nil
+	}
+
+	return &config
+}
+
 func init() {
 	rootCmd.AddCommand(workCmd)
 
@@ -492,6 +640,7 @@ func init() {
 	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
 	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
+	workCmd.Flags().BoolVar(&workForceDirectRedis, "force-direct-redis", false, "Force direct Redis mode instead of API mode")
 
 	// Status and heartbeat flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
