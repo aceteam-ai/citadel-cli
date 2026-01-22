@@ -18,11 +18,14 @@ type DeviceAuthResult struct {
 // runDeviceAuthFlow executes the OAuth 2.0 device authorization flow
 // and returns the token response and device code upon successful authorization.
 // The device code is returned for use in status publishing to enable config lookup.
-func runDeviceAuthFlow(authServiceURL string) (*DeviceAuthResult, error) {
+// If forceNew is true, the backend will ignore existing machine mappings and
+// create a fresh device registration.
+func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
 
 	// Start the flow and get device code
-	resp, err := client.StartFlow()
+	opts := &nexus.StartFlowOptions{ForceNew: forceNew}
+	resp, err := client.StartFlow(opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start device authorization: %w", err)
 	}

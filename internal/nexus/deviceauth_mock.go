@@ -15,6 +15,8 @@ type MockDeviceAuthServer struct {
 	pollMutex         sync.Mutex
 	pollsUntilSuccess int
 	lastHostname      string
+	lastMachineID     string
+	lastForceNew      bool
 }
 
 // StartMockDeviceAuthServer creates and starts a mock device authorization server
@@ -44,11 +46,13 @@ func (m *MockDeviceAuthServer) handleStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Decode request to capture hostname
+	// Decode request to capture hostname, machine ID, and force_new
 	var req StartFlowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
 		m.pollMutex.Lock()
 		m.lastHostname = req.Hostname
+		m.lastMachineID = req.MachineID
+		m.lastForceNew = req.ForceNew
 		m.pollMutex.Unlock()
 	}
 
@@ -122,4 +126,18 @@ func (m *MockDeviceAuthServer) GetLastHostname() string {
 	m.pollMutex.Lock()
 	defer m.pollMutex.Unlock()
 	return m.lastHostname
+}
+
+// GetLastMachineID returns the machine ID from the last StartFlow request
+func (m *MockDeviceAuthServer) GetLastMachineID() string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return m.lastMachineID
+}
+
+// GetLastForceNew returns the force_new flag from the last StartFlow request
+func (m *MockDeviceAuthServer) GetLastForceNew() bool {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return m.lastForceNew
 }
