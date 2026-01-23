@@ -7,6 +7,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
+	"github.com/fatih/color"
 )
 
 // DeviceAuthResult contains the result of a device authorization flow.
@@ -74,4 +75,39 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 		// If UI exited but no result yet, user likely canceled
 		return nil, fmt.Errorf("device authorization was canceled")
 	}
+}
+
+// printNetworkSuccessInfo displays helpful post-connection info explaining
+// userspace networking limitations and available peer commands.
+func printNetworkSuccessInfo(nodeName, ip string) {
+	successColor := color.New(color.FgGreen, color.Bold)
+	dimColor := color.New(color.Faint)
+
+	fmt.Println()
+	successColor.Println("✅ Successfully connected to the AceTeam Network!")
+	fmt.Println()
+
+	// Display node info
+	if nodeName != "" {
+		fmt.Printf("   Node:    %s\n", nodeName)
+	}
+	if ip != "" {
+		fmt.Printf("   IP:      %s\n", ip)
+	}
+	fmt.Println()
+
+	// Explain userspace networking limitation
+	dimColor.Println("   This IP is for AceTeam network traffic only.")
+	dimColor.Println("   System tools (ping, curl) cannot reach it directly.")
+	fmt.Println()
+
+	// Available commands
+	fmt.Println("   Next steps:")
+	fmt.Println("     citadel status    - View network status and peers")
+	fmt.Println("     citadel ssh       - SSH to other nodes")
+	fmt.Println("     citadel proxy     - Forward local ports to peers")
+	fmt.Println()
+
+	// System-wide option hint
+	dimColor.Println("   For system-wide network access, use: sudo citadel init --system")
 }

@@ -82,11 +82,7 @@ func runNonInteractiveLogin() {
 	}
 
 	ip, _ := srv.GetIPv4()
-	fmt.Println("\n✅ Successfully connected to the AceTeam Network!")
-	fmt.Printf("   Node: %s\n", nodeName)
-	if ip != "" {
-		fmt.Printf("   IP: %s\n", ip)
-	}
+	printNetworkSuccessInfo(nodeName, ip)
 }
 
 // runInteractiveLogin handles the interactive login flow
@@ -151,10 +147,7 @@ func runInteractiveLogin() {
 	}
 
 	ip, _ := srv.GetIPv4()
-	fmt.Println("\n✅ Authentication successful! This machine is now connected to the AceTeam Network.")
-	if ip != "" {
-		fmt.Printf("   IP: %s\n", ip)
-	}
+	printNetworkSuccessInfo(nodeName, ip)
 }
 
 func init() {

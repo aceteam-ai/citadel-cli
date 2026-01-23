@@ -16,6 +16,8 @@ var (
 	exposeService string
 	exposeList    bool
 	exposeRemove  bool
+	exposePeers   bool
+	exposeCheck   bool
 )
 
 // Known service ports
@@ -28,36 +30,51 @@ var servicePorts = map[string]int{
 
 var exposeCmd = &cobra.Command{
 	Use:   "expose [port]",
-	Short: "Expose a local port over the AceTeam network",
-	Long: `Expose a local service port so other nodes in the network can access it.
+	Short: "Show access information for this node and network peers",
+	Long: `Shows network access information for this node and services on the AceTeam Network.
 
-Services are accessible via your network IP address. Use 'citadel expose' without
-arguments to show access information for your node.
-
-Note: Port exposure via 'citadel expose <port>' requires the worker daemon to be
-running. For simple access, services are automatically accessible via your network
-IP when connected.`,
-	Example: `  # Show current access info (network IP and common service URLs)
+Without arguments, displays this node's network IP and common service URLs.
+Use --peers to see services available on other nodes in your network.
+Use --check to verify that services are actually reachable.`,
+	Example: `  # Show this node's access info (network IP and common service URLs)
   citadel expose
 
-  # Show known service ports with access URLs
-  citadel expose --service ollama`,
+  # Show services available on all peers
+  citadel expose --peers
+
+  # Show this node's services and verify they're reachable
+  citadel expose --check
+
+  # Show peer services with reachability check
+  citadel expose --peers --check`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		// Handle --list flag
+		// Handle --list flag (deprecated, same as no args)
 		if exposeList {
 			listExposedPorts()
 			return
 		}
 
-		// Handle --remove flag
+		// Handle --remove flag (legacy)
 		if exposeRemove {
 			if len(args) == 0 && exposeService == "" {
 				fmt.Fprintln(os.Stderr, "Error: specify a port or --service to remove")
 				os.Exit(1)
 			}
-			port := getPort(args)
+			port := getExposePort(args)
 			removeExposedPort(port)
+			return
+		}
+
+		// Handle --peers flag
+		if exposePeers {
+			showPeerServices()
+			return
+		}
+
+		// Handle --check flag (with or without --peers)
+		if exposeCheck {
+			showAccessInfoWithCheck()
 			return
 		}
 
@@ -67,13 +84,13 @@ IP when connected.`,
 			return
 		}
 
-		// Expose a port
-		port := getPort(args)
+		// Expose a port (legacy behavior)
+		port := getExposePort(args)
 		exposePort(port)
 	},
 }
 
-func getPort(args []string) int {
+func getExposePort(args []string) int {
 	// If service flag is set, use service port
 	if exposeService != "" {
 		port, ok := servicePorts[exposeService]
@@ -159,9 +176,153 @@ func listExposedPorts() {
 	fmt.Println("Run 'citadel expose' to see your access URLs.")
 }
 
+// showPeerServices displays services available on all network peers.
+func showPeerServices() {
+	fmt.Println("Peer Services on AceTeam Network")
+	fmt.Println("=================================")
+	fmt.Println()
+
+	// Ensure network connection
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := ensureNetworkConnected(ctx); err != nil {
+		badColor.Println(err)
+		os.Exit(1)
+	}
+
+	// Get our own IP to filter ourselves out
+	myIP, _ := network.GetGlobalIPv4()
+
+	// Get peers
+	peers, err := network.GetGlobalPeers(ctx)
+	if err != nil {
+		badColor.Printf("Failed to get peers: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Filter to other online peers
+	var onlinePeers []network.PeerInfo
+	for _, peer := range peers {
+		if peer.IP != "" && peer.IP != myIP {
+			onlinePeers = append(onlinePeers, peer)
+		}
+	}
+
+	if len(onlinePeers) == 0 {
+		fmt.Println("No other peers found on the network.")
+		return
+	}
+
+	for _, peer := range onlinePeers {
+		statusIcon := "⚫"
+		if peer.Online {
+			statusIcon = goodColor.Sprint("🟢")
+		}
+
+		fmt.Printf("%s %s (%s)\n", statusIcon, peer.Hostname, peer.IP)
+
+		if peer.Online {
+			// Show potential service URLs
+			for name, port := range servicePorts {
+				fmt.Printf("     %s: http://%s:%d\n", name, peer.IP, port)
+			}
+
+			// Show proxy hint
+			fmt.Printf("     Use: citadel proxy <local-port> %s:<port>\n", peer.Hostname)
+		} else {
+			fmt.Println("     (offline)")
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("Tip: Use 'citadel expose --peers --check' to verify service reachability.")
+}
+
+// showAccessInfoWithCheck shows access info and verifies service connectivity.
+func showAccessInfoWithCheck() {
+	fmt.Println("Service Reachability Check")
+	fmt.Println("==========================")
+	fmt.Println()
+
+	// Ensure network connection
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := ensureNetworkConnected(ctx); err != nil {
+		badColor.Println(err)
+		os.Exit(1)
+	}
+
+	// Get network status
+	status, err := network.GetGlobalStatus(ctx)
+	if err != nil || !status.Connected {
+		badColor.Println("Not connected to AceTeam Network")
+		os.Exit(1)
+	}
+
+	// Display our info
+	fmt.Printf("This Node: %s (%s)\n\n", status.Hostname, status.IPv4)
+
+	// If --peers is also set, check peer services
+	if exposePeers {
+		checkPeerServices()
+	} else {
+		// Check local services
+		fmt.Println("Checking local service ports...")
+		for name, port := range servicePorts {
+			checkServicePort(status.IPv4, port, name)
+		}
+	}
+}
+
+// checkPeerServices checks connectivity to services on all peers.
+func checkPeerServices() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	myIP, _ := network.GetGlobalIPv4()
+	peers, err := network.GetGlobalPeers(ctx)
+	if err != nil {
+		badColor.Printf("Failed to get peers: %v\n", err)
+		return
+	}
+
+	for _, peer := range peers {
+		if peer.IP == "" || peer.IP == myIP || !peer.Online {
+			continue
+		}
+
+		fmt.Printf("\n%s (%s):\n", peer.Hostname, peer.IP)
+		for name, port := range servicePorts {
+			checkServicePort(peer.IP, port, name)
+		}
+	}
+}
+
+// checkServicePort attempts to connect to a port and reports success/failure.
+func checkServicePort(ip string, port int, serviceName string) {
+	addr := fmt.Sprintf("%s:%d", ip, port)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := network.Dial(ctx, "tcp", addr)
+	if err != nil {
+		badColor.Printf("  %s (:%d): ❌ unreachable\n", serviceName, port)
+		return
+	}
+	conn.Close()
+	goodColor.Printf("  %s (:%d): ✅ reachable\n", serviceName, port)
+}
+
 func init() {
 	rootCmd.AddCommand(exposeCmd)
 	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Show access info for a known service (vllm, ollama, llamacpp, lmstudio)")
-	exposeCmd.Flags().BoolVar(&exposeList, "list", false, "List currently exposed ports")
-	exposeCmd.Flags().BoolVar(&exposeRemove, "remove", false, "Stop exposing a port")
+	exposeCmd.Flags().BoolVar(&exposePeers, "peers", false, "Show services available on all network peers")
+	exposeCmd.Flags().BoolVar(&exposeCheck, "check", false, "Verify service reachability (can combine with --peers)")
+	exposeCmd.Flags().BoolVar(&exposeList, "list", false, "List currently exposed ports (deprecated)")
+	exposeCmd.Flags().BoolVar(&exposeRemove, "remove", false, "Stop exposing a port (deprecated)")
+	exposeCmd.Flags().MarkHidden("list")
+	exposeCmd.Flags().MarkHidden("remove")
 }
