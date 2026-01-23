@@ -185,6 +185,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
 
 		fmt.Println("   - Mode: Redis API (secure)")
+		if deviceConfig.UserEmail != "" {
+			if deviceConfig.UserName != "" {
+				fmt.Printf("   - Account: %s (%s)\n", deviceConfig.UserEmail, deviceConfig.UserName)
+			} else {
+				fmt.Printf("   - Account: %s\n", deviceConfig.UserEmail)
+			}
+		}
 	} else {
 		// Legacy mode: direct Redis connection
 		Debug("using direct Redis mode")
@@ -619,6 +626,8 @@ type DeviceConfig struct {
 	APIBaseURL     string `yaml:"api_base_url"`
 	OrgID          string `yaml:"org_id"`
 	RedisURL       string `yaml:"redis_url"`
+	UserEmail      string `yaml:"user_email"`
+	UserName       string `yaml:"user_name"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from global config file.

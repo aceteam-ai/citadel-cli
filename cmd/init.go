@@ -731,6 +731,8 @@ func clearSavedConfig() {
 	delete(config, "api_base_url")
 	delete(config, "org_id")
 	delete(config, "redis_url")
+	delete(config, "user_email")
+	delete(config, "user_name")
 
 	// If only node_config_dir remains (or nothing), write it back
 	if hasNodeConfigDir {
@@ -792,6 +794,12 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	}
 	if token.OrgID != "" {
 		config["org_id"] = token.OrgID
+	}
+	if token.UserEmail != "" {
+		config["user_email"] = token.UserEmail
+	}
+	if token.UserName != "" {
+		config["user_name"] = token.UserName
 	}
 	// Remove redis_url - not needed when using API mode
 	delete(config, "redis_url")
