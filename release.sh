@@ -332,13 +332,29 @@ if [[ "$DRY_RUN" == true ]]; then
 else
     RELEASE_URL=$(gh release view "$VERSION" --json url -q .url)
 
+    # Extract macOS SHA256 values for Homebrew tap update
+    DARWIN_AMD64_SHA=$(grep "darwin_amd64" release/checksums.txt | awk '{print $1}')
+    DARWIN_ARM64_SHA=$(grep "darwin_arm64" release/checksums.txt | awk '{print $1}')
+    VERSION_NUM=${VERSION#v}  # Remove 'v' prefix for Homebrew
+
     echo ""
     echo -e "${GREEN}✅ Release $VERSION published successfully!${NC}"
     echo ""
     echo "📦 Release URL: $RELEASE_URL"
     echo ""
+    echo -e "${YELLOW}🍺 Homebrew Tap Update${NC}"
+    echo "   Update aceteam-ai/homebrew-tap/Formula/citadel.rb with:"
+    echo ""
+    echo "   version \"$VERSION_NUM\""
+    echo ""
+    echo "   # Apple Silicon (arm64)"
+    echo "   sha256 \"$DARWIN_ARM64_SHA\""
+    echo ""
+    echo "   # Intel Mac (amd64)"
+    echo "   sha256 \"$DARWIN_AMD64_SHA\""
+    echo ""
     echo "Next steps:"
     echo "  1. Review the release notes and edit if needed"
-    echo "  2. Announce the release to your team"
-    echo "  3. Update any documentation that references version numbers"
+    echo "  2. Update the Homebrew tap: aceteam-ai/homebrew-tap"
+    echo "  3. Announce the release to your team"
 fi

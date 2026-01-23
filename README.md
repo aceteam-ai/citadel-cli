@@ -21,6 +21,19 @@ curl -fsSL https://get.aceteam.ai/citadel.sh | bash
 
 This installs to `~/.local/bin` and automatically configures your PATH. For system-wide install, use `sudo bash` instead.
 
+#### macOS (Homebrew)
+
+```bash
+brew tap aceteam-ai/tap
+brew install citadel
+```
+
+Or as a one-liner:
+
+```bash
+brew install aceteam-ai/tap/citadel
+```
+
 ### Manual Installation
 
 #### Linux / macOS
