@@ -53,7 +53,33 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 	}
 
 	if globalConf.NodeConfigDir == "" {
-		return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
+		// Try to auto-fix by checking default location
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
+		}
+
+		defaultNodeDir := filepath.Join(homeDir, "citadel-node")
+		defaultManifest := filepath.Join(defaultNodeDir, "citadel.yaml")
+
+		if _, err := os.Stat(defaultManifest); err == nil {
+			// Found manifest in default location - auto-fix the config
+			globalConf.NodeConfigDir = defaultNodeDir
+
+			// Read existing config to preserve other fields
+			var config map[string]interface{}
+			if err := yaml.Unmarshal(globalConfigData, &config); err != nil {
+				config = make(map[string]interface{})
+			}
+			config["node_config_dir"] = defaultNodeDir
+
+			// Write back
+			if newData, err := yaml.Marshal(config); err == nil {
+				_ = os.WriteFile(globalConfigFile, newData, 0600)
+			}
+		} else {
+			return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
+		}
 	}
 
 	// Step 2: Load the manifest from the path specified in the global config.
