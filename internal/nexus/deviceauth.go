@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // DeviceAuthClient handles OAuth 2.0 Device Authorization Grant flow (RFC 8628)
@@ -49,6 +51,13 @@ type StartFlowRequest struct {
 	ClientID      string `json:"client_id"`
 	ClientVersion string `json:"client_version"`
 	Hostname      string `json:"hostname,omitempty"`
+	MachineID     string `json:"machine_id,omitempty"`
+	ForceNew      bool   `json:"force_new,omitempty"`
+}
+
+// StartFlowOptions contains options for starting the device authorization flow
+type StartFlowOptions struct {
+	ForceNew bool // Force fresh registration, ignoring existing machine mapping
 }
 
 // TokenRequest represents the request body for /token endpoint
@@ -67,18 +76,28 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 	}
 }
 
-// StartFlow initiates the device authorization flow by requesting device and user codes
-func (c *DeviceAuthClient) StartFlow() (*DeviceCodeResponse, error) {
+// StartFlow initiates the device authorization flow by requesting device and user codes.
+// If opts is nil, default options are used.
+func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/start"
 
 	// Get hostname for device identification
 	hostname, _ := os.Hostname()
+
+	// Generate machine ID for device fingerprinting
+	machineID, _ := platform.GenerateMachineID()
 
 	// Create request body
 	reqBody := StartFlowRequest{
 		ClientID:      "citadel-cli",
 		ClientVersion: "1.0.0", // TODO: Get from version const
 		Hostname:      hostname,
+		MachineID:     machineID,
+	}
+
+	// Apply options if provided
+	if opts != nil {
+		reqBody.ForceNew = opts.ForceNew
 	}
 
 	jsonData, err := json.Marshal(reqBody)

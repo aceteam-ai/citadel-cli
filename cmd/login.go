@@ -109,7 +109,7 @@ func runInteractiveLogin() {
 		return
 	case nexus.NetChoiceDevice:
 		// Device authorization flow
-		authResult, err := runDeviceAuthFlow(authServiceURL)
+		authResult, err := runDeviceAuthFlow(authServiceURL, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			fmt.Fprintln(os.Stderr, "\nAlternative: Use 'citadel login --authkey <key>' for non-interactive login")

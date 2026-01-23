@@ -31,6 +31,7 @@ var (
 	initNetworkOnly        bool // Deprecated: kept for backwards compatibility
 	initProvision          bool
 	initRelogin            bool
+	initNewDevice          bool // Force fresh registration, ignoring existing machine mapping
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
@@ -119,7 +120,7 @@ and system user configuration (requires sudo).`,
 
 		if choice == nexus.NetChoiceDevice {
 			Debug("starting device authorization flow...")
-			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
+			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL, initNewDevice)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
@@ -209,7 +210,7 @@ and system user configuration (requires sudo).`,
 				// Check if device config is present (API token or Redis URL)
 				if !hasDeviceConfigured() {
 					fmt.Println("⚠️  Device config not found. Authenticating...")
-					deviceAuthResult, err = runDeviceAuthFlow(authServiceURL)
+					deviceAuthResult, err = runDeviceAuthFlow(authServiceURL, initNewDevice)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 						os.Exit(1)
@@ -1189,6 +1190,7 @@ func init() {
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
 	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with Docker, NVIDIA toolkit, and services (requires sudo)")
 	initCmd.Flags().BoolVar(&initRelogin, "relogin", false, "Force re-authentication (logout and login again)")
+	initCmd.Flags().BoolVar(&initNewDevice, "new-device", false, "Force fresh registration, ignoring existing machine mapping")
 	// Deprecated: --network-only is now the default behavior
 	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Deprecated: network-only is now the default")
 	initCmd.Flags().MarkHidden("network-only")

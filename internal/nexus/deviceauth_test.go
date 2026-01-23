@@ -16,7 +16,7 @@ func TestDeviceAuthStartFlow(t *testing.T) {
 	client := NewDeviceAuthClient(mock.URL())
 
 	// Test StartFlow
-	resp, err := client.StartFlow()
+	resp, err := client.StartFlow(nil)
 	if err != nil {
 		t.Fatalf("StartFlow failed: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestDeviceAuthPollForToken(t *testing.T) {
 	client := NewDeviceAuthClient(mock.URL())
 
 	// Start flow to get device code
-	resp, err := client.StartFlow()
+	resp, err := client.StartFlow(nil)
 	if err != nil {
 		t.Fatalf("StartFlow failed: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestDeviceAuthImmediateSuccess(t *testing.T) {
 	client := NewDeviceAuthClient(mock.URL())
 
 	// Start flow
-	resp, err := client.StartFlow()
+	resp, err := client.StartFlow(nil)
 	if err != nil {
 		t.Fatalf("StartFlow failed: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestDeviceAuthInvalidURL(t *testing.T) {
 	client := NewDeviceAuthClient("http://invalid-url-that-does-not-exist-12345.com")
 
 	// StartFlow should fail
-	_, err := client.StartFlow()
+	_, err := client.StartFlow(nil)
 	if err == nil {
 		t.Error("Expected error for invalid URL, got nil")
 	}
@@ -156,7 +156,7 @@ func TestMockServerResetPollCount(t *testing.T) {
 	client := NewDeviceAuthClient(mock.URL())
 
 	// First flow
-	resp, _ := client.StartFlow()
+	resp, _ := client.StartFlow(nil)
 	client.PollForToken(resp.DeviceCode, 1)
 
 	count1 := mock.GetPollCount()
@@ -181,7 +181,7 @@ func TestAuthServiceURLUsedForPolling(t *testing.T) {
 	client := NewDeviceAuthClient(mock.URL())
 
 	// Start flow - this should hit mock server's /start endpoint
-	resp, err := client.StartFlow()
+	resp, err := client.StartFlow(nil)
 	if err != nil {
 		t.Fatalf("StartFlow failed: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestDeviceAuthSendsHostname(t *testing.T) {
 	defer mock.Close()
 
 	client := NewDeviceAuthClient(mock.URL())
-	_, err := client.StartFlow()
+	_, err := client.StartFlow(nil)
 	if err != nil {
 		t.Fatalf("StartFlow failed: %v", err)
 	}
@@ -232,5 +232,55 @@ func TestDeviceAuthSendsHostname(t *testing.T) {
 	expected, _ := os.Hostname()
 	if hostname != expected {
 		t.Errorf("Expected hostname '%s', got '%s'", expected, hostname)
+	}
+}
+
+func TestDeviceAuthSendsMachineID(t *testing.T) {
+	mock := StartMockDeviceAuthServer(1)
+	defer mock.Close()
+
+	client := NewDeviceAuthClient(mock.URL())
+	_, err := client.StartFlow(nil)
+	if err != nil {
+		t.Fatalf("StartFlow failed: %v", err)
+	}
+
+	machineID := mock.GetLastMachineID()
+	if machineID == "" {
+		t.Error("Expected machine_id to be sent, got empty string")
+	}
+
+	// Verify it's a valid SHA-256 hex string (64 characters)
+	if len(machineID) != 64 {
+		t.Errorf("Expected 64-character hex string, got %d characters: %s", len(machineID), machineID)
+	}
+
+	t.Logf("Machine ID sent: %s", machineID)
+}
+
+func TestDeviceAuthSendsForceNew(t *testing.T) {
+	mock := StartMockDeviceAuthServer(1)
+	defer mock.Close()
+
+	client := NewDeviceAuthClient(mock.URL())
+
+	// Test without force_new (default)
+	_, err := client.StartFlow(nil)
+	if err != nil {
+		t.Fatalf("StartFlow failed: %v", err)
+	}
+
+	if mock.GetLastForceNew() {
+		t.Error("Expected force_new to be false by default")
+	}
+
+	// Test with force_new = true
+	_, err = client.StartFlow(&StartFlowOptions{ForceNew: true})
+	if err != nil {
+		t.Fatalf("StartFlow with ForceNew failed: %v", err)
+	}
+
+	if !mock.GetLastForceNew() {
+		t.Error("Expected force_new to be true when ForceNew option is set")
 	}
 }
