@@ -85,20 +85,23 @@ and system user configuration (requires sudo).`,
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())
 
-		// Handle --relogin: force logout and fresh authentication
+		// Handle --relogin: force fresh authentication while preserving network identity
+		// We disconnect but keep tsnet state (machine key) to preserve IP address
 		if initRelogin {
 			Debug("--relogin flag set, forcing fresh authentication")
-			if network.IsGlobalConnected() || network.HasState() {
-				fmt.Print("Logging out... ")
-				if err := network.Logout(); err != nil {
+			if network.IsGlobalConnected() {
+				fmt.Print("Disconnecting... ")
+				// Use Disconnect() instead of Logout() to preserve tsnet state (machine key)
+				// This allows Headscale to recognize the same node and preserve the IP
+				if err := network.Disconnect(); err != nil {
 					fmt.Printf("warning: %v\n", err)
 				} else {
 					fmt.Println("done")
 				}
 			}
-			// Clear saved config to force fresh auth
+			// Clear saved config to force fresh auth (but NOT network state)
 			clearSavedConfig()
-			Debug("cleared saved config")
+			Debug("cleared saved config (network state preserved for IP retention)")
 		}
 
 		Debug("checking network status...")
@@ -233,7 +236,13 @@ and system user configuration (requires sudo).`,
 					nodeName, _ = getNodeName()
 				}
 
+				// Get IP address
+				ip, _ := network.GetGlobalIPv4()
+
 				fmt.Printf("✅ Connected as %s\n", nodeName)
+				if ip != "" {
+					fmt.Printf("   IP: %s\n", ip)
+				}
 				fmt.Println("\nTo switch accounts: citadel logout && citadel init")
 				return
 			}
@@ -699,7 +708,47 @@ func hasDeviceConfigured() bool {
 // clearSavedConfig removes the saved config file to force fresh authentication.
 func clearSavedConfig() {
 	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	_ = os.Remove(globalConfigFile)
+
+	// Read existing config to preserve node_config_dir
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		// File doesn't exist, nothing to clear
+		return
+	}
+
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		// Can't parse, remove it entirely
+		_ = os.Remove(globalConfigFile)
+		return
+	}
+
+	// Preserve node_config_dir, clear device-specific fields
+	nodeConfigDir, hasNodeConfigDir := config["node_config_dir"]
+
+	// Clear device auth fields
+	delete(config, "device_api_token")
+	delete(config, "api_base_url")
+	delete(config, "org_id")
+	delete(config, "redis_url")
+
+	// If only node_config_dir remains (or nothing), write it back
+	if hasNodeConfigDir {
+		config["node_config_dir"] = nodeConfigDir
+	}
+
+	if len(config) == 0 {
+		_ = os.Remove(globalConfigFile)
+		return
+	}
+
+	// Write back preserved config
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		_ = os.Remove(globalConfigFile)
+		return
+	}
+	_ = os.WriteFile(globalConfigFile, newData, 0600)
 }
 
 // maskToken masks a token for safe logging, showing only first/last few chars.
@@ -1189,7 +1238,7 @@ func init() {
 	initCmd.Flags().BoolVar(&initTest, "test", true, "Run a diagnostic test after provisioning")
 	initCmd.Flags().BoolVar(&initVerbose, "verbose", false, "Show detailed output during provisioning")
 	initCmd.Flags().BoolVar(&initProvision, "provision", false, "Full provisioning with Docker, NVIDIA toolkit, and services (requires sudo)")
-	initCmd.Flags().BoolVar(&initRelogin, "relogin", false, "Force re-authentication (logout and login again)")
+	initCmd.Flags().BoolVar(&initRelogin, "relogin", false, "Force re-authentication while preserving IP address")
 	initCmd.Flags().BoolVar(&initNewDevice, "new-device", false, "Force fresh registration, ignoring existing machine mapping")
 	// Deprecated: --network-only is now the default behavior
 	initCmd.Flags().BoolVar(&initNetworkOnly, "network-only", false, "Deprecated: network-only is now the default")

@@ -244,7 +244,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
 
-	// Get node name - prefer the actual registered name from network
+	// Ensure network connection is established (reconnects if state exists)
+	// This is needed to get the actual Headscale-assigned hostname
+	Debug("verifying network connection...")
+	if connected, err := network.VerifyOrReconnect(ctx); err != nil {
+		Debug("network reconnect failed: %v", err)
+	} else if connected {
+		Debug("network connected")
+	} else {
+		Debug("network not configured (no saved state)")
+	}
+
+	// Get node name - prefer the actual registered name from network (Headscale-assigned)
 	nodeName := workNodeName
 	Debug("resolving node name...")
 	Debug("workNodeName flag: %q", workNodeName)
@@ -254,6 +265,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if nodeName == "" {
 		// Try to get the actual registered hostname from network status
+		// This returns the Headscale-assigned name (e.g., "ubuntu-gpu-8gluaaom") not just the requested name
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname
