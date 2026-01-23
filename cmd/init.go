@@ -173,7 +173,8 @@ and system user configuration (requires sudo).`,
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Println("✅ Successfully connected to the AceTeam Network!")
+			ip, _ := network.GetGlobalIPv4()
+			printNetworkSuccessInfo(nodeName, ip)
 			earlyNetworkConnected = true
 
 			fmt.Println("\n--- Continuing with node setup ---")
@@ -194,7 +195,8 @@ and system user configuration (requires sudo).`,
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Println("✅ Successfully connected to the AceTeam Network!")
+			ip, _ := network.GetGlobalIPv4()
+			printNetworkSuccessInfo(nodeName, ip)
 			earlyNetworkConnected = true
 
 			fmt.Println("\n--- Continuing with node setup ---")
@@ -239,11 +241,13 @@ and system user configuration (requires sudo).`,
 				// Get IP address
 				ip, _ := network.GetGlobalIPv4()
 
+				// Already connected - show brief info
 				fmt.Printf("✅ Connected as %s\n", nodeName)
 				if ip != "" {
 					fmt.Printf("   IP: %s\n", ip)
 				}
-				fmt.Println("\nTo switch accounts: citadel logout && citadel init")
+				fmt.Println("\n   Run 'citadel status' to see network details and peers.")
+				fmt.Println("   To switch accounts: citadel logout && citadel init")
 				return
 			}
 
@@ -270,7 +274,8 @@ and system user configuration (requires sudo).`,
 					fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
 					os.Exit(1)
 				}
-				fmt.Println("\n✅ Successfully connected to the AceTeam Network!")
+				ip, _ := network.GetGlobalIPv4()
+				printNetworkSuccessInfo(nodeName, ip)
 			} else if choice != nexus.NetChoiceSkip {
 				fmt.Println("⚠️  No authkey available. Run 'citadel login' to complete network setup.")
 			}

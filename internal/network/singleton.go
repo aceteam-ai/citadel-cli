@@ -5,6 +5,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -156,6 +157,24 @@ func PingPeer(ctx context.Context, ip string) (latencyMs float64, connType strin
 		return 0, "", "", fmt.Errorf("not connected")
 	}
 	return s.PingPeer(ctx, ip)
+}
+
+// Dial connects to a remote address through the global server's network.
+func Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	s := Global()
+	if s == nil {
+		return nil, fmt.Errorf("not connected to AceTeam Network")
+	}
+	return s.Dial(ctx, network, addr)
+}
+
+// Listen creates a listener on the network for the given address via the global server.
+func Listen(network, addr string) (net.Listener, error) {
+	s := Global()
+	if s == nil {
+		return nil, fmt.Errorf("not connected to AceTeam Network")
+	}
+	return s.Listen(network, addr)
 }
 
 // VerifyOrReconnect checks connection and reconnects if state exists but not connected.
