@@ -34,9 +34,11 @@ type TokenResponse struct {
 	ExpiresIn      int    `json:"expires_in"`
 	NexusURL       string `json:"nexus_url,omitempty"`
 	OrgID          string `json:"org_id,omitempty"`
-	RedisURL       string `json:"redis_url,omitempty"`       // Deprecated: use DeviceAPIToken
+	RedisURL       string `json:"redis_url,omitempty"`        // Deprecated: use DeviceAPIToken
 	DeviceAPIToken string `json:"device_api_token,omitempty"` // New secure API token
 	APIBaseURL     string `json:"api_base_url,omitempty"`     // Base URL for API calls
+	UserEmail      string `json:"user_email,omitempty"`       // User email for display
+	UserName       string `json:"user_name,omitempty"`        // User display name
 }
 
 // TokenError represents an error response from the /token endpoint
