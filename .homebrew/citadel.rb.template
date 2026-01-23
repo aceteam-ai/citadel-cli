@@ -1,0 +1,32 @@
+# Homebrew formula for Citadel CLI
+#
+# This is a template file with VERSION placeholders.
+# Copy to aceteam-ai/homebrew-tap/Formula/citadel.rb and replace:
+#   - VERSION with the actual version (e.g., 1.3.0)
+#   - ARM64_SHA256 with the SHA256 of darwin_arm64.tar.gz
+#   - AMD64_SHA256 with the SHA256 of darwin_amd64.tar.gz
+
+class Citadel < Formula
+  desc "On-premise agent for the AceTeam Sovereign Compute Fabric"
+  homepage "https://github.com/aceteam-ai/citadel-cli"
+  version "VERSION"
+  license "Apache-2.0"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/aceteam-ai/citadel-cli/releases/download/vVERSION/citadel_vVERSION_darwin_arm64.tar.gz"
+      sha256 "ARM64_SHA256"
+    elsif Hardware::CPU.intel?
+      url "https://github.com/aceteam-ai/citadel-cli/releases/download/vVERSION/citadel_vVERSION_darwin_amd64.tar.gz"
+      sha256 "AMD64_SHA256"
+    end
+  end
+
+  def install
+    bin.install "citadel"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/citadel version")
+  end
+end
