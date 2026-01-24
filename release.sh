@@ -293,6 +293,21 @@ tar -xzf citadel_${VERSION}_darwin_arm64.tar.gz
 mv citadel ~/.local/bin/  # or: sudo mv citadel /usr/local/bin/
 \`\`\`
 
+### Man Page (Optional)
+
+Linux and macOS tarballs include a man page. To install:
+
+\`\`\`bash
+# User-local
+mkdir -p ~/.local/share/man/man1
+mv citadel.1 ~/.local/share/man/man1/
+
+# System-wide
+sudo mv citadel.1 /usr/local/share/man/man1/
+\`\`\`
+
+Then run \`man citadel\` to view the manual.
+
 ## SHA256 Checksums
 
 \`\`\`
