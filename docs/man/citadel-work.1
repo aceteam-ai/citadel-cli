@@ -1,0 +1,155 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-work - Start services and run the job worker (primary node command)
+
+
+.SH SYNOPSIS
+\fBcitadel work [flags]\fP
+
+
+.SH DESCRIPTION
+Unified Citadel worker that starts services and processes jobs.
+
+.PP
+This is the primary command for running a Citadel node. It:
+  1. Auto-starts services from manifest (use --no-services to skip)
+  2. Connects to Redis and consumes jobs from the queue
+  3. Reports status via Redis pub/sub (enabled by default)
+  4. Subscribes to real-time config updates
+
+.PP
+Redis URL is obtained from local config (set by 'citadel init').
+Use REDIS_URL env var or --redis-url flag to override.
+
+.PP
+Examples:
+  # Run after citadel init (uses config)
+  citadel work
+
+.PP
+# Override Redis URL for development
+  citadel work --redis-url=redis://localhost:6379
+
+.PP
+# Disable status publishing
+  citadel work --redis-status=false
+
+.PP
+# Run without auto-starting services
+  citadel work --no-services
+
+.PP
+# Run with heartbeat reporting to AceTeam API
+  citadel work --heartbeat
+
+
+.SH OPTIONS
+\fB--api-key\fP=""
+	API key for heartbeat authentication (or set CITADEL_API_KEY env)
+
+.PP
+\fB--device-code\fP=""
+	Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)
+
+.PP
+\fB--force-direct-redis\fP[=false]
+	Force direct Redis mode instead of API mode
+
+.PP
+\fB--group\fP=""
+	Consumer group name (default: citadel-workers)
+
+.PP
+\fB--heartbeat\fP[=false]
+	Enable heartbeat reporting to AceTeam API
+
+.PP
+\fB--heartbeat-url\fP=""
+	Heartbeat endpoint base URL (default: https://aceteam.ai)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for work
+
+.PP
+\fB--max-retries\fP=3
+	Maximum retry attempts before DLQ
+
+.PP
+\fB--no-services\fP[=false]
+	Skip auto-starting services from manifest
+
+.PP
+\fB--no-update\fP[=false]
+	Skip checking for updates on startup
+
+.PP
+\fB--node-name\fP=""
+	Node name for status reporting (default: hostname)
+
+.PP
+\fB--poll-ms\fP=5000
+	Block timeout in milliseconds
+
+.PP
+\fB--queue\fP=""
+	Queue/stream name to consume from (default: jobs:v1:gpu-general)
+
+.PP
+\fB--redis-password\fP=""
+	Redis password (or set REDIS_PASSWORD env)
+
+.PP
+\fB--redis-status\fP[=true]
+	Enable Redis status publishing for real-time updates
+
+.PP
+\fB--redis-url\fP=""
+	Redis connection URL (or set REDIS_URL env)
+
+.PP
+\fB--ssh-sync\fP[=false]
+	Enable SSH authorized_keys synchronization from AceTeam
+
+.PP
+\fB--ssh-sync-interval\fP=5
+	SSH sync interval in minutes
+
+.PP
+\fB--status-channel\fP=""
+	Override Redis pub/sub channel for status (default: node:status:{node-name})
+
+.PP
+\fB--status-port\fP=0
+	Enable status HTTP server on port (0 = disabled)
+
+.PP
+\fB--terminal\fP[=false]
+	Enable terminal WebSocket server for remote access
+
+.PP
+\fB--terminal-port\fP=7860
+	Terminal server port (default: 7860)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

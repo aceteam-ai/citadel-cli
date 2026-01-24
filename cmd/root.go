@@ -137,6 +137,11 @@ func Execute() {
 	}
 }
 
+// GetRootCmd returns the root command for documentation generation.
+func GetRootCmd() *cobra.Command {
+	return rootCmd
+}
+
 func init() {
 	// Here you will define your flags and configuration settings.
 	// Cobra supports persistent flags, which, if defined here,

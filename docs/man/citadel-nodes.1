@@ -1,0 +1,40 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-nodes - List all compute nodes in your AceTeam fabric
+
+
+.SH SYNOPSIS
+\fBcitadel nodes [flags]\fP
+
+
+.SH DESCRIPTION
+Connects to the Nexus control plane and retrieves a list of all
+registered compute nodes, showing their status, IP address, and last-seen time.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for nodes
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

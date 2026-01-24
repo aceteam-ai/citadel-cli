@@ -48,6 +48,19 @@ brew install aceteam-ai/tap/citadel
     # or: sudo mv citadel /usr/local/bin/  # System-wide
     ```
 
+4.  (Optional) Install the man page for `man citadel` support:
+
+    ```bash
+    # User-local
+    mkdir -p ~/.local/share/man/man1
+    mv citadel.1 ~/.local/share/man/man1/
+
+    # System-wide (requires sudo)
+    sudo mv citadel.1 /usr/local/share/man/man1/
+    ```
+
+    Homebrew installations include the man page automatically.
+
 #### Windows
 
 **Option 1: One-Line Installer (Recommended)**
