@@ -37,10 +37,19 @@ RELEASE_DIR="release"
 MODULE_PATH=$(go list -m)
 VERSION_VAR_PATH="${MODULE_PATH}/cmd.Version"
 
+# --- Man Page Generation ---
+MAN_DIR="docs/man"
+
 # --- Clean Up ---
-rm -rf "$BUILD_DIR" "$RELEASE_DIR"
+rm -rf "$BUILD_DIR" "$RELEASE_DIR" "$MAN_DIR"
 mkdir -p "$BUILD_DIR" "$RELEASE_DIR"
 echo "--- Cleaned old build and release directories ---"
+
+# Generate man pages (for release builds or when --all is specified)
+if [[ "$BUILD_ALL" == true ]]; then
+    echo "--- Generating man pages ---"
+    go run docs/gen-manpage.go
+fi
 
 # --- Detect Current Platform ---
 CURRENT_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -97,7 +106,12 @@ for OS in "${PLATFORMS[@]}"; do
         echo "Building binary..."
         CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
 
-        # 2. Package (Windows uses .zip, others use .tar.gz)
+        # 2. Copy man page if available (not for Windows)
+        if [[ "$OS" != "windows" ]] && [[ -f "$MAN_DIR/citadel.1" ]]; then
+            cp "$MAN_DIR/citadel.1" "$PLATFORM_DIR/"
+        fi
+
+        # 3. Package (Windows uses .zip, others use .tar.gz)
         if [[ "$OS" == "windows" ]]; then
             RELEASE_NAME="citadel_${VERSION}_${OS}_${ARCH}.zip"
             RELEASE_PATH="$RELEASE_DIR/$RELEASE_NAME"
@@ -109,8 +123,12 @@ for OS in "${PLATFORMS[@]}"; do
             RELEASE_NAME="citadel_${VERSION}_${OS}_${ARCH}.tar.gz"
             RELEASE_PATH="$RELEASE_DIR/$RELEASE_NAME"
             echo "Packaging to $RELEASE_NAME..."
-            # The -C flag changes directory before archiving, so we don't get the full path in the tarball.
-            tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel
+            # Include man page if available
+            if [[ -f "$PLATFORM_DIR/citadel.1" ]]; then
+                tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel citadel.1
+            else
+                tar -C "$PLATFORM_DIR" -czf "$RELEASE_PATH" citadel
+            fi
         fi
     done
 done
