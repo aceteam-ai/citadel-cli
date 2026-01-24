@@ -347,29 +347,67 @@ if [[ "$DRY_RUN" == true ]]; then
 else
     RELEASE_URL=$(gh release view "$VERSION" --json url -q .url)
 
-    # Extract macOS SHA256 values for Homebrew tap update
+    # Extract SHA256 values for Homebrew tap update
     DARWIN_AMD64_SHA=$(grep "darwin_amd64" release/checksums.txt | awk '{print $1}')
     DARWIN_ARM64_SHA=$(grep "darwin_arm64" release/checksums.txt | awk '{print $1}')
+    LINUX_AMD64_SHA=$(grep "linux_amd64" release/checksums.txt | awk '{print $1}')
+    LINUX_ARM64_SHA=$(grep "linux_arm64" release/checksums.txt | awk '{print $1}')
     VERSION_NUM=${VERSION#v}  # Remove 'v' prefix for Homebrew
 
     echo ""
     echo -e "${GREEN}✅ Release $VERSION published successfully!${NC}"
     echo ""
     echo "📦 Release URL: $RELEASE_URL"
+
+    # Step 4: Update Homebrew tap
     echo ""
-    echo -e "${YELLOW}🍺 Homebrew Tap Update${NC}"
-    echo "   Update aceteam-ai/homebrew-tap/Formula/citadel.rb with:"
+    echo -e "${GREEN}Step 4/4: Updating Homebrew tap${NC}"
+
+    HOMEBREW_TAP_DIR=$(mktemp -d)
+    if gh repo clone aceteam-ai/homebrew-tap "$HOMEBREW_TAP_DIR" 2>/dev/null; then
+        FORMULA_FILE="$HOMEBREW_TAP_DIR/Formula/citadel.rb"
+
+        if [[ -f "$FORMULA_FILE" ]]; then
+            # Update version
+            sed -i "s/version \"[^\"]*\"/version \"$VERSION_NUM\"/" "$FORMULA_FILE"
+
+            # Update SHA256 hashes - match the pattern and replace
+            # Darwin arm64
+            sed -i "/darwin_arm64/,/sha256/{s/sha256 \"[^\"]*\"/sha256 \"$DARWIN_ARM64_SHA\"/}" "$FORMULA_FILE"
+            # Darwin amd64
+            sed -i "/darwin_amd64/,/sha256/{s/sha256 \"[^\"]*\"/sha256 \"$DARWIN_AMD64_SHA\"/}" "$FORMULA_FILE"
+            # Linux arm64
+            sed -i "/linux_arm64/,/sha256/{s/sha256 \"[^\"]*\"/sha256 \"$LINUX_ARM64_SHA\"/}" "$FORMULA_FILE"
+            # Linux amd64
+            sed -i "/linux_amd64/,/sha256/{s/sha256 \"[^\"]*\"/sha256 \"$LINUX_AMD64_SHA\"/}" "$FORMULA_FILE"
+
+            # Commit and push
+            cd "$HOMEBREW_TAP_DIR"
+            git add Formula/citadel.rb
+            git commit -m "Update citadel to $VERSION"
+            git push
+            cd - > /dev/null
+
+            echo "✅ Homebrew tap updated"
+
+            # Also update local copy
+            cp "$FORMULA_FILE" homebrew-tap/Formula/citadel.rb 2>/dev/null || true
+        else
+            echo -e "${YELLOW}⚠️  Formula file not found, skipping Homebrew tap update${NC}"
+        fi
+
+        rm -rf "$HOMEBREW_TAP_DIR"
+    else
+        echo -e "${YELLOW}⚠️  Could not clone homebrew-tap, skipping update${NC}"
+    fi
+
     echo ""
-    echo "   version \"$VERSION_NUM\""
+    echo -e "${GREEN}🎉 Release complete!${NC}"
     echo ""
-    echo "   # Apple Silicon (arm64)"
-    echo "   sha256 \"$DARWIN_ARM64_SHA\""
-    echo ""
-    echo "   # Intel Mac (amd64)"
-    echo "   sha256 \"$DARWIN_AMD64_SHA\""
+    echo "📦 Release URL: $RELEASE_URL"
+    echo "🍺 Homebrew: brew install aceteam-ai/tap/citadel"
     echo ""
     echo "Next steps:"
     echo "  1. Review the release notes and edit if needed"
-    echo "  2. Update the Homebrew tap: aceteam-ai/homebrew-tap"
-    echo "  3. Announce the release to your team"
+    echo "  2. Announce the release to your team"
 fi
