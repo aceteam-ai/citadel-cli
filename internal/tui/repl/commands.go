@@ -65,8 +65,18 @@ func (r *CommandRegistry) List() []*Command {
 	return cmds
 }
 
-// Names returns all command names and aliases
+// Names returns all command names (not aliases, for cleaner display)
 func (r *CommandRegistry) Names() []string {
+	var names []string
+	for name := range r.commands {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// AllNames returns all command names and aliases
+func (r *CommandRegistry) AllNames() []string {
 	var names []string
 	for name := range r.commands {
 		names = append(names, name)

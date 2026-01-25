@@ -70,12 +70,23 @@ func (c *Completer) Complete(input string) []string {
 func (c *Completer) completeCommand(prefix string) []string {
 	var matches []string
 
-	for _, name := range c.registry.Names() {
+	// Use AllNames for completion so aliases work, but prioritize main names
+	for _, name := range c.registry.AllNames() {
 		if strings.HasPrefix(name, prefix) {
 			matches = append(matches, "/"+name)
 		}
 	}
 
+	sort.Strings(matches)
+	return matches
+}
+
+// CompleteMainCommands returns only main command completions (no aliases)
+func (c *Completer) CompleteMainCommands() []string {
+	var matches []string
+	for _, name := range c.registry.Names() {
+		matches = append(matches, "/"+name)
+	}
 	sort.Strings(matches)
 	return matches
 }
