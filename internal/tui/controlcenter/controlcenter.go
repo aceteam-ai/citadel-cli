@@ -102,6 +102,7 @@ type ControlCenter struct {
 	peersView    *tview.Table
 	statusBar    *tview.TextView
 	helpBar      *tview.TextView
+	cmdInput     *tview.InputField
 
 	// State
 	activities    []ActivityEntry
@@ -248,6 +249,19 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(cc.peersView, 0, 1, false).
 		AddItem(cc.activityView, 0, 1, false)
 
+	// Command input
+	cc.cmdInput = tview.NewInputField().
+		SetLabel(" > ").
+		SetFieldWidth(0).
+		SetPlaceholder("Type command or ? for help").
+		SetFieldBackgroundColor(tcell.ColorDefault).
+		SetDoneFunc(cc.onCommandEntered)
+
+	// Input container with border
+	inputContainer := tview.NewFlex().
+		AddItem(cc.cmdInput, 0, 1, true)
+	inputContainer.SetBorder(true).SetTitle(" Command ")
+
 	// Help bar
 	cc.helpBar = tview.NewTextView().
 		SetDynamicColors(true).
@@ -265,20 +279,39 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(topRow, 7, 0, false).
 		AddItem(middleRow, 0, 1, true).
 		AddItem(bottomRow, 10, 0, false).
+		AddItem(inputContainer, 3, 0, false).
 		AddItem(cc.helpBar, 1, 0, false).
 		AddItem(cc.statusBar, 1, 0, false)
 
 	// Track focusable panels
-	cc.panels = []tview.Primitive{cc.servicesView}
+	cc.panels = []tview.Primitive{cc.servicesView, cc.cmdInput}
 
 	cc.app.SetRoot(cc.mainFlex, true)
 	cc.app.SetFocus(cc.servicesView)
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
+	// Check if input field is focused - let it handle its own input
+	if cc.app.GetFocus() == cc.cmdInput {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			// Escape from input back to services
+			cc.app.SetFocus(cc.servicesView)
+			return nil
+		case tcell.KeyTab:
+			cc.app.SetFocus(cc.servicesView)
+			return nil
+		}
+		return event
+	}
+
 	switch event.Key() {
 	case tcell.KeyEsc:
 		cc.showQuitConfirm()
+		return nil
+	case tcell.KeyTab:
+		// Tab to command input
+		cc.app.SetFocus(cc.cmdInput)
 		return nil
 	case tcell.KeyRune:
 		switch event.Rune() {
@@ -298,9 +331,108 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		case '?':
 			cc.showHelpModal()
 			return nil
+		case '/', ':':
+			// Jump to command input when typing / or :
+			cc.app.SetFocus(cc.cmdInput)
+			return nil
 		}
 	}
 	return event
+}
+
+func (cc *ControlCenter) onCommandEntered(key tcell.Key) {
+	if key != tcell.KeyEnter {
+		return
+	}
+
+	cmd := strings.TrimSpace(cc.cmdInput.GetText())
+	cc.cmdInput.SetText("")
+
+	if cmd == "" {
+		cc.app.SetFocus(cc.servicesView)
+		return
+	}
+
+	// Process command
+	cc.processCommand(cmd)
+	cc.app.SetFocus(cc.servicesView)
+}
+
+func (cc *ControlCenter) processCommand(cmd string) {
+	// Remove leading / or : if present
+	cmd = strings.TrimPrefix(cmd, "/")
+	cmd = strings.TrimPrefix(cmd, ":")
+
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return
+	}
+
+	command := strings.ToLower(parts[0])
+
+	switch command {
+	case "help", "?", "h":
+		cc.showHelpModal()
+	case "refresh", "r":
+		go cc.refresh()
+		cc.AddActivity("info", "Manual refresh triggered")
+	case "auto", "a":
+		cc.autoRefresh = !cc.autoRefresh
+		if cc.autoRefresh {
+			cc.AddActivity("info", "Auto-refresh enabled (30s)")
+		} else {
+			cc.AddActivity("info", "Auto-refresh disabled")
+		}
+		cc.updateStatusBar()
+	case "quit", "q", "exit":
+		cc.showQuitConfirm()
+	case "logs", "l":
+		if len(parts) > 1 {
+			// TODO: Show logs for specific service
+			cc.AddActivity("info", fmt.Sprintf("Logs for %s (not implemented yet)", parts[1]))
+		} else {
+			cc.showLogsModal()
+		}
+	case "start":
+		if len(parts) > 1 && cc.startServiceFn != nil {
+			svcName := parts[1]
+			cc.AddActivity("info", fmt.Sprintf("Starting %s...", svcName))
+			go func() {
+				if err := cc.startServiceFn(svcName); err != nil {
+					cc.AddActivity("error", fmt.Sprintf("Failed to start %s: %v", svcName, err))
+				} else {
+					cc.AddActivity("success", fmt.Sprintf("%s started", svcName))
+					cc.refresh()
+				}
+			}()
+		} else {
+			cc.AddActivity("warning", "Usage: start <service-name>")
+		}
+	case "stop":
+		if len(parts) > 1 && cc.stopServiceFn != nil {
+			svcName := parts[1]
+			cc.AddActivity("info", fmt.Sprintf("Stopping %s...", svcName))
+			go func() {
+				if err := cc.stopServiceFn(svcName); err != nil {
+					cc.AddActivity("error", fmt.Sprintf("Failed to stop %s: %v", svcName, err))
+				} else {
+					cc.AddActivity("success", fmt.Sprintf("%s stopped", svcName))
+					cc.refresh()
+				}
+			}()
+		} else {
+			cc.AddActivity("warning", "Usage: stop <service-name>")
+		}
+	case "status":
+		go cc.refresh()
+		cc.AddActivity("info", "Refreshing status...")
+	case "login":
+		cc.AddActivity("info", "Run 'citadel login' in terminal to connect")
+	case "work", "worker":
+		cc.AddActivity("info", "Run 'citadel work' in terminal to start worker")
+	default:
+		cc.AddActivity("warning", fmt.Sprintf("Unknown command: %s (type ? for help)", command))
+	}
 }
 
 func (cc *ControlCenter) showQuitConfirm() {
@@ -367,6 +499,8 @@ func (cc *ControlCenter) showHelpModal() {
 	helpText := `[yellow::b]Citadel Control Center Help[-:-:-]
 
 [yellow]Keyboard Shortcuts:[-]
+  [white::b]Tab[-:-:-]     Focus command input
+  [white::b]/ or :[-:-:-]  Quick jump to command input
   [white::b]r[-:-:-]       Manual refresh
   [white::b]a[-:-:-]       Toggle auto-refresh (30s interval)
   [white::b]l[-:-:-]       View logs for selected service
@@ -375,10 +509,18 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]?[-:-:-]       Show this help
   [white::b]q/Esc[-:-:-]   Quit
 
-[yellow]Other Citadel Commands:[-]
+[yellow]Commands (type in command box):[-]
+  [white]help[-]            Show this help
+  [white]refresh[-]         Refresh status
+  [white]auto[-]            Toggle auto-refresh
+  [white]start <svc>[-]     Start a service
+  [white]stop <svc>[-]      Stop a service
+  [white]logs [svc][-]      View service logs
+  [white]quit[-]            Exit
+
+[yellow]Other Citadel CLI Commands:[-]
   [gray]citadel login[-]      Connect to AceTeam Network
   [gray]citadel logout[-]     Disconnect from network
-  [gray]citadel status[-]     View node status (non-interactive)
   [gray]citadel work[-]       Start job worker for GPU tasks
   [gray]citadel up[-]         Start services and agent
   [gray]citadel down[-]       Stop all services
@@ -409,6 +551,10 @@ func (cc *ControlCenter) showHelpModal() {
 }
 
 func (cc *ControlCenter) onServiceSelected(row, col int) {
+	// Check if we have services and valid selection
+	if len(cc.data.Services) == 0 {
+		return
+	}
 	if row < 1 || row > len(cc.data.Services) {
 		return
 	}
@@ -427,6 +573,7 @@ func (cc *ControlCenter) onServiceSelected(row, col int) {
 	}
 
 	if actionFn == nil {
+		cc.AddActivity("warning", "Service control not available")
 		return
 	}
 
@@ -449,7 +596,10 @@ func (cc *ControlCenter) onServiceSelected(row, col int) {
 				}()
 			}
 		})
+
+	// Set root AND focus on modal to ensure it receives input
 	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
 }
 
 func (cc *ControlCenter) updateAllPanels() {
@@ -601,21 +751,37 @@ func (cc *ControlCenter) updateJobsPanel() {
 func (cc *ControlCenter) updatePeersView() {
 	cc.peersView.Clear()
 
+	// Show network connection status first
+	networkStatus := "[red]● Disconnected[-]"
+	networkDetail := "Run [yellow]citadel login[-] to connect"
+	if cc.data.Connected {
+		networkStatus = "[green]● Connected to AceTeam Network[-]"
+		networkDetail = ""
+		if cc.data.NodeIP != "" {
+			networkDetail = fmt.Sprintf("[gray]IP: %s[-]", cc.data.NodeIP)
+		}
+	}
+
+	cc.peersView.SetCell(0, 0, tview.NewTableCell(" "+networkStatus).SetSelectable(false))
+	cc.peersView.SetCell(0, 1, tview.NewTableCell(networkDetail).SetSelectable(false))
+
+	if len(cc.data.Peers) == 0 {
+		if cc.data.Connected {
+			cc.peersView.SetCell(1, 0, tview.NewTableCell(" [gray]No other peers on network[-]").SetSelectable(false))
+		}
+		return
+	}
+
+	// Headers
 	headers := []string{"", "HOSTNAME", "IP", "LATENCY"}
 	for i, h := range headers {
 		cell := tview.NewTableCell("[yellow::b]" + h + "[-:-:-]").
 			SetSelectable(false)
-		cc.peersView.SetCell(0, i, cell)
-	}
-
-	if len(cc.data.Peers) == 0 {
-		cc.peersView.SetCell(1, 0, tview.NewTableCell("").SetSelectable(false))
-		cc.peersView.SetCell(1, 1, tview.NewTableCell("[gray]No peers connected[-]").SetSelectable(false))
-		return
+		cc.peersView.SetCell(1, i, cell)
 	}
 
 	for i, peer := range cc.data.Peers {
-		row := i + 1
+		row := i + 2 // Start after status and header
 
 		icon := "[gray]○[-]"
 		if peer.Online {
@@ -667,7 +833,7 @@ func (cc *ControlCenter) updateActivityView() {
 }
 
 func (cc *ControlCenter) updateHelpBar() {
-	cc.helpBar.SetText("[yellow::b]r[-:-:-] refresh  [yellow::b]a[-:-:-] auto  [yellow::b]l[-:-:-] logs  [yellow::b]Enter[-:-:-] start/stop  [yellow::b]q[-:-:-] quit")
+	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]a[-:-:-] auto  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 }
 
 func (cc *ControlCenter) updateStatusBar() {
@@ -722,6 +888,7 @@ func (cc *ControlCenter) autoRefreshLoop() {
 // UpdateData updates the control center data (thread-safe)
 func (cc *ControlCenter) UpdateData(data StatusData) {
 	cc.data = data
+	cc.lastRefresh = time.Now()
 	if cc.app != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateAllPanels()
