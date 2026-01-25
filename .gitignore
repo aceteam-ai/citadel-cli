@@ -1,7 +1,7 @@
 build
 release
-citadel
-citadel-cli
+/citadel
+/citadel-cli
 
 # direnv
 .direnv/
