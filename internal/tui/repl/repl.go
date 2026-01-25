@@ -15,19 +15,20 @@ import (
 
 // Model is the BubbleTea model for the REPL
 type Model struct {
-	input       textinput.Model
-	registry    *CommandRegistry
-	completer   *Completer
-	history     []string
-	historyIdx  int
-	suggestions []string
+	input          textinput.Model
+	registry       *CommandRegistry
+	completer      *Completer
+	history        []string
+	historyIdx     int
+	suggestions    []string
+	selectedSug    int  // Currently selected suggestion index
 	showSuggestions bool
-	output      string
-	err         error
-	quitting    bool
-	version     string
-	width       int
-	height      int
+	output         string
+	err            error
+	quitting       bool
+	version        string
+	width          int
+	height         int
 }
 
 // Config holds REPL configuration
@@ -43,12 +44,8 @@ func New(cfg Config) Model {
 	ti.Focus()
 	ti.CharLimit = 256
 	ti.Width = 60
-
-	// Style the prompt
-	ti.Prompt = lipgloss.NewStyle().
-		Foreground(tui.ColorPrimary).
-		Bold(true).
-		Render("citadel> ")
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(tui.ColorPrimary).Bold(true)
+	ti.Prompt = "citadel> "
 
 	registry := DefaultCommands()
 	completer := NewCompleter(registry)
@@ -79,6 +76,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEnter:
+			// If suggestions visible and one is selected, use it
+			if m.showSuggestions && len(m.suggestions) > 0 && m.selectedSug >= 0 {
+				m.input.SetValue(m.suggestions[m.selectedSug] + " ")
+				m.input.CursorEnd()
+				m.showSuggestions = false
+				m.selectedSug = -1
+				return m, nil
+			}
+
 			input := strings.TrimSpace(m.input.Value())
 			if input == "" {
 				return m, nil
@@ -88,10 +94,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, input)
 			m.historyIdx = len(m.history)
 
-			// Clear input
+			// Clear input and suggestions
 			m.input.SetValue("")
 			m.suggestions = nil
 			m.showSuggestions = false
+			m.selectedSug = -1
 
 			// Execute command
 			m.output, m.err = m.executeInput(input)
@@ -105,6 +112,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyUp:
+			// Navigate suggestions if visible
+			if m.showSuggestions && len(m.suggestions) > 0 {
+				m.selectedSug--
+				if m.selectedSug < 0 {
+					m.selectedSug = len(m.suggestions) - 1
+				}
+				return m, nil
+			}
 			// Navigate history
 			if len(m.history) > 0 && m.historyIdx > 0 {
 				m.historyIdx--
@@ -114,6 +129,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyDown:
+			// Navigate suggestions if visible
+			if m.showSuggestions && len(m.suggestions) > 0 {
+				m.selectedSug++
+				if m.selectedSug >= len(m.suggestions) {
+					m.selectedSug = 0
+				}
+				return m, nil
+			}
 			// Navigate history
 			if m.historyIdx < len(m.history)-1 {
 				m.historyIdx++
@@ -133,10 +156,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.SetValue(suggestions[0] + " ")
 				m.input.CursorEnd()
 				m.showSuggestions = false
+				m.selectedSug = -1
 			} else if len(suggestions) > 1 {
 				// Multiple matches - show suggestions and complete common prefix
 				m.suggestions = suggestions
 				m.showSuggestions = true
+				m.selectedSug = 0
 				commonPrefix := FindLongestCommonPrefix(suggestions)
 				if len(commonPrefix) > len(m.input.Value()) {
 					m.input.SetValue(commonPrefix)
@@ -148,13 +173,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEsc:
 			// Hide suggestions
 			m.showSuggestions = false
+			m.selectedSug = -1
 			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = msg.Width - 12 // Account for prompt
+		m.input.Width = msg.Width - 12
 		return m, nil
 	}
 
@@ -163,16 +189,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.input, cmd = m.input.Update(msg)
 	cmds = append(cmds, cmd)
 
-	// Update suggestions as user types
+	// Update suggestions as user types (but keep them visible)
 	if strings.HasPrefix(m.input.Value(), "/") {
-		m.suggestions = m.completer.Complete(m.input.Value())
-		if len(m.suggestions) > 0 && len(m.suggestions) <= 10 {
+		newSuggestions := m.completer.Complete(m.input.Value())
+		if len(newSuggestions) > 0 && len(newSuggestions) <= 12 {
+			m.suggestions = newSuggestions
 			m.showSuggestions = true
-		} else {
+			// Reset selection if suggestions changed
+			if m.selectedSug >= len(m.suggestions) {
+				m.selectedSug = 0
+			}
+		} else if len(newSuggestions) == 0 {
 			m.showSuggestions = false
+			m.selectedSug = -1
 		}
-	} else {
-		m.showSuggestions = false
+	} else if m.input.Value() == "" {
+		// Keep suggestions visible even when input is cleared to show available commands
+		m.suggestions = m.completer.Complete("/")
+		if len(m.suggestions) > 0 {
+			m.showSuggestions = true
+			m.selectedSug = -1
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -181,47 +218,79 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var sb strings.Builder
 
-	// Header
-	header := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(tui.ColorPrimary).
-		Render("Citadel Interactive Mode")
-	sb.WriteString(header)
-	sb.WriteString(" ")
-	sb.WriteString(tui.MutedStyle.Render("(" + m.version + ")"))
-	sb.WriteString("\n")
-	sb.WriteString(tui.MutedStyle.Render("Type /help for commands, /quit to exit"))
+	// Header box
+	headerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(tui.ColorBorder).
+		Padding(0, 2).
+		Width(50)
+
+	header := lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary).Render("⚡ Citadel Interactive Mode")
+	header += " " + tui.MutedStyle.Render("("+m.version+")")
+	sb.WriteString(headerStyle.Render(header))
 	sb.WriteString("\n\n")
 
 	// Output from last command
 	if m.output != "" {
-		sb.WriteString(m.output)
-		if !strings.HasSuffix(m.output, "\n") {
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
+		outputStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(tui.ColorMuted).
+			Padding(0, 1).
+			MaxWidth(m.width - 4)
+		sb.WriteString(outputStyle.Render(strings.TrimSpace(m.output)))
+		sb.WriteString("\n\n")
 	}
 
 	// Error from last command
 	if m.err != nil && m.err != ErrQuit {
-		sb.WriteString(tui.ErrorStyle.Render("Error: " + m.err.Error()))
+		errorStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(tui.ColorError).
+			Padding(0, 1)
+		sb.WriteString(errorStyle.Render(tui.ErrorStyle.Render("✗ " + m.err.Error())))
 		sb.WriteString("\n\n")
 	}
 
-	// Suggestions
+	// Input line
+	sb.WriteString(m.input.View())
+	sb.WriteString("\n")
+
+	// Suggestions panel (always below input when visible)
 	if m.showSuggestions && len(m.suggestions) > 0 {
-		sb.WriteString(tui.MutedStyle.Render("Suggestions: "))
+		sb.WriteString("\n")
+
+		sugStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(tui.ColorSecondary).
+			Padding(0, 1)
+
+		var sugLines []string
+		sugLines = append(sugLines, tui.MutedStyle.Render("Tab completions (↑/↓ to select, Enter to use):"))
+		sugLines = append(sugLines, "")
+
 		for i, s := range m.suggestions {
-			if i > 0 {
-				sb.WriteString("  ")
+			prefix := "  "
+			style := tui.ValueStyle
+			if i == m.selectedSug {
+				prefix = tui.SuccessStyle.Render("▸ ")
+				style = lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary)
 			}
-			sb.WriteString(tui.SpinnerStyle.Render(s))
+			// Get command description if available
+			cmdName := strings.TrimPrefix(s, "/")
+			desc := ""
+			if cmd := m.registry.Get(cmdName); cmd != nil {
+				desc = " " + tui.MutedStyle.Render("- "+cmd.Description)
+			}
+			sugLines = append(sugLines, prefix+style.Render(s)+desc)
 		}
+
+		sb.WriteString(sugStyle.Render(strings.Join(sugLines, "\n")))
 		sb.WriteString("\n")
 	}
 
-	// Input
-	sb.WriteString(m.input.View())
+	// Help hint
+	sb.WriteString("\n")
+	sb.WriteString(tui.MutedStyle.Render("Type /help for commands • /quit to exit • Tab for completion"))
 
 	return sb.String()
 }

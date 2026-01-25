@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -65,6 +66,7 @@ type StatusModel struct {
 	autoRefresh  bool
 	err          error
 	loading      bool
+	spinner      spinner.Model
 
 	// Callback to refresh data
 	refreshFn func() (StatusData, error)
@@ -81,16 +83,22 @@ type DataMsg struct {
 
 // NewStatusModel creates a new status dashboard model
 func NewStatusModel(data StatusData, refreshFn func() (StatusData, error)) StatusModel {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(tui.ColorPrimary)
+
 	return StatusModel{
 		data:        data,
 		autoRefresh: true,
 		refreshFn:   refreshFn,
+		spinner:     s,
 	}
 }
 
 func (m StatusModel) Init() tea.Cmd {
 	return tea.Batch(
 		tea.EnterAltScreen,
+		m.spinner.Tick,
 		refreshCmd(m.refreshFn),
 	)
 }
@@ -118,11 +126,9 @@ func (m StatusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
 		case "r":
-			// Manual refresh
 			m.loading = true
 			return m, refreshCmd(m.refreshFn)
 		case "a":
-			// Toggle auto-refresh
 			m.autoRefresh = !m.autoRefresh
 			if m.autoRefresh {
 				return m, autoRefreshCmd()
@@ -158,6 +164,11 @@ func (m StatusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, autoRefreshCmd()
 		}
 		return m, nil
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	}
 
 	return m, nil
@@ -168,159 +179,280 @@ func (m StatusModel) View() string {
 		return "Loading..."
 	}
 
-	var sections []string
-
-	// Title bar
-	title := m.renderTitle()
-	sections = append(sections, title)
-
-	// Main content area
-	leftCol := m.renderLeftColumn()
-	rightCol := m.renderRightColumn()
-
-	// Join columns side by side
-	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftCol, "  ", rightCol)
-	sections = append(sections, mainContent)
-
-	// Services panel (full width)
-	if len(m.data.Services) > 0 {
-		servicesPanel := ServicePanel{
-			Title:    "SERVICES",
-			Services: m.data.Services,
-			Width:    m.width - 4,
-		}
-		sections = append(sections, servicesPanel.Render())
+	// Calculate box width (constrained to reasonable size)
+	boxWidth := m.width - 4
+	if boxWidth > 70 {
+		boxWidth = 70
 	}
+	if boxWidth < 50 {
+		boxWidth = 50
+	}
+
+	var sb strings.Builder
+
+	// ┌─────────────────── CITADEL STATUS ────────────────────┐
+	title := " CITADEL STATUS "
+	titlePadding := (boxWidth - 2 - len(title)) / 2
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render("┌"))
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render(strings.Repeat("─", titlePadding)))
+	sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary).Render(title))
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render(strings.Repeat("─", boxWidth-2-titlePadding-len(title))))
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render("┐"))
+	sb.WriteString("\n")
+
+	// Node info row
+	nodeInfo := m.formatNodeLine(boxWidth - 4)
+	sb.WriteString(m.boxLine(nodeInfo, boxWidth))
+
+	statusInfo := m.formatStatusLine(boxWidth - 4)
+	sb.WriteString(m.boxLine(statusInfo, boxWidth))
+
+	// Divider
+	sb.WriteString(m.divider(boxWidth))
+
+	// SYSTEM VITALS header
+	sb.WriteString(m.boxLine(lipgloss.NewStyle().Bold(true).Foreground(tui.ColorSecondary).Render("SYSTEM VITALS"), boxWidth))
+
+	// Vitals rows (2x2 grid)
+	vitalsRow1 := m.formatVitalsRow("CPU", m.data.CPUPercent, "Memory", m.data.MemoryPercent, boxWidth-4)
+	sb.WriteString(m.boxLine(vitalsRow1, boxWidth))
+
+	// GPU utilization or disk
+	var vitalsRow2 string
+	if len(m.data.GPUs) > 0 && m.data.GPUs[0].Utilization > 0 {
+		vitalsRow2 = m.formatVitalsRow("Disk", m.data.DiskPercent, "GPU", m.data.GPUs[0].Utilization, boxWidth-4)
+	} else {
+		vitalsRow2 = m.formatVitalsRow("Disk", m.data.DiskPercent, "", 0, boxWidth-4)
+	}
+	sb.WriteString(m.boxLine(vitalsRow2, boxWidth))
+
+	// Services section (if any)
+	if len(m.data.Services) > 0 {
+		sb.WriteString(m.divider(boxWidth))
+		sb.WriteString(m.boxLine(lipgloss.NewStyle().Bold(true).Foreground(tui.ColorSecondary).Render("SERVICES"), boxWidth))
+
+		// Header
+		header := fmt.Sprintf("  %-18s %-14s %s", "NAME", "STATUS", "UPTIME")
+		sb.WriteString(m.boxLine(tui.MutedStyle.Render(header), boxWidth))
+
+		for _, svc := range m.data.Services {
+			svcLine := m.formatServiceLine(svc, boxWidth-4)
+			sb.WriteString(m.boxLine(svcLine, boxWidth))
+		}
+	}
+
+	// Peers section (if any)
+	if len(m.data.Peers) > 0 {
+		sb.WriteString(m.divider(boxWidth))
+		sb.WriteString(m.boxLine(lipgloss.NewStyle().Bold(true).Foreground(tui.ColorSecondary).Render("NETWORK PEERS"), boxWidth))
+
+		for _, peer := range m.data.Peers {
+			peerLine := m.formatPeerLine(peer)
+			sb.WriteString(m.boxLine(peerLine, boxWidth))
+		}
+	}
+
+	// Bottom border
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render("└"))
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render(strings.Repeat("─", boxWidth-2)))
+	sb.WriteString(lipgloss.NewStyle().Foreground(tui.ColorBorder).Render("┘"))
+	sb.WriteString("\n")
 
 	// Help bar
-	helpItems := []HelpItem{
-		{Key: "r", Label: "efresh"},
-		{Key: "a", Label: "uto-refresh: " + boolStr(m.autoRefresh)},
-		{Key: "q", Label: "uit"},
-	}
-	helpBar := HelpBar(helpItems)
-	sections = append(sections, "\n"+helpBar)
+	sb.WriteString(m.renderHelpBar())
+	sb.WriteString("\n")
 
 	// Status line
-	statusLine := m.renderStatusLine()
-	sections = append(sections, statusLine)
+	sb.WriteString(m.renderStatusLine())
 
-	return strings.Join(sections, "\n")
+	return sb.String()
 }
 
-func (m StatusModel) renderTitle() string {
-	title := fmt.Sprintf("CITADEL STATUS (%s)", m.data.Version)
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(tui.ColorPrimary).
-		Width(m.width).
-		Align(lipgloss.Center)
-
-	return titleStyle.Render(title)
+func (m StatusModel) boxLine(content string, width int) string {
+	border := lipgloss.NewStyle().Foreground(tui.ColorBorder)
+	// Calculate visible length (strip ANSI)
+	visLen := visibleLength(content)
+	padding := width - 4 - visLen
+	if padding < 0 {
+		padding = 0
+	}
+	return border.Render("│") + " " + content + strings.Repeat(" ", padding) + " " + border.Render("│") + "\n"
 }
 
-func (m StatusModel) renderLeftColumn() string {
-	halfWidth := (m.width - 6) / 2
-
-	// Node info panel
-	nodeItems := []KeyValue{
-		{Key: "Node", Value: m.data.NodeName},
-		{Key: "IP", Value: m.data.NodeIP},
-	}
-	if m.data.OrgID != "" {
-		nodeItems = append(nodeItems, KeyValue{Key: "Organization", Value: m.data.OrgID})
-	}
-	if len(m.data.Tags) > 0 {
-		nodeItems = append(nodeItems, KeyValue{Key: "Tags", Value: strings.Join(m.data.Tags, ", ")})
-	}
-
-	statusVal := "ONLINE"
-	statusStyle := tui.SuccessStyle
-	if !m.data.Connected {
-		statusVal = "OFFLINE"
-		statusStyle = tui.ErrorStyle
-	}
-	nodeItems = append(nodeItems, KeyValue{Key: "Status", Value: statusVal, Style: statusStyle})
-
-	nodePanel := KeyValuePanel{
-		Title: "NODE",
-		Items: nodeItems,
-		Width: halfWidth,
-	}
-
-	// System vitals panel
-	vitalsItems := []ProgressItem{
-		{Label: "CPU", Percent: m.data.CPUPercent},
-		{Label: "Memory", Percent: m.data.MemoryPercent, Detail: fmt.Sprintf("%s / %s", m.data.MemoryUsed, m.data.MemoryTotal)},
-		{Label: "Disk", Percent: m.data.DiskPercent, Detail: fmt.Sprintf("%s / %s", m.data.DiskUsed, m.data.DiskTotal)},
-	}
-
-	vitalsPanel := ProgressPanel{
-		Title: "SYSTEM VITALS",
-		Items: vitalsItems,
-		Width: halfWidth,
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, nodePanel.Render(), vitalsPanel.Render())
+func (m StatusModel) divider(width int) string {
+	border := lipgloss.NewStyle().Foreground(tui.ColorBorder)
+	return border.Render("├") + border.Render(strings.Repeat("─", width-2)) + border.Render("┤") + "\n"
 }
 
-func (m StatusModel) renderRightColumn() string {
-	halfWidth := (m.width - 6) / 2
+func (m StatusModel) formatNodeLine(width int) string {
+	nodeName := m.data.NodeName
+	if nodeName == "" {
+		nodeName = "unknown"
+	}
+	nodeIP := m.data.NodeIP
+	if nodeIP == "" {
+		nodeIP = "-"
+	}
 
-	// GPU panel
-	var gpuContent string
-	if len(m.data.GPUs) == 0 {
-		gpuContent = tui.MutedStyle.Render("No GPU detected")
+	left := tui.LabelStyle.Render("Node: ") + nodeName
+	right := tui.LabelStyle.Render("IP: ") + nodeIP
+
+	leftLen := visibleLength(left)
+	rightLen := visibleLength(right)
+	spacing := width - leftLen - rightLen
+	if spacing < 2 {
+		spacing = 2
+	}
+
+	return left + strings.Repeat(" ", spacing) + right
+}
+
+func (m StatusModel) formatStatusLine(width int) string {
+	org := m.data.OrgID
+	if org == "" {
+		org = "-"
+	}
+
+	var statusStr string
+	if m.data.Connected {
+		statusStr = tui.SuccessStyle.Render("🟢 ONLINE")
 	} else {
-		var lines []string
-		for i, gpu := range m.data.GPUs {
-			lines = append(lines, tui.LabelStyle.Render(fmt.Sprintf("GPU %d:", i))+" "+gpu.Name)
-			if gpu.Memory != "" {
-				lines = append(lines, "  "+tui.MutedStyle.Render("Memory:")+" "+gpu.Memory)
-			}
-			if gpu.Temperature != "" {
-				lines = append(lines, "  "+tui.MutedStyle.Render("Temp:")+" "+gpu.Temperature)
-			}
-			if gpu.Utilization > 0 {
-				bar := tui.ProgressBar(gpu.Utilization, 15)
-				pct := fmt.Sprintf("%.0f%%", gpu.Utilization)
-				lines = append(lines, "  "+tui.MutedStyle.Render("Util:")+" "+bar+" "+pct)
-			}
+		statusStr = tui.ErrorStyle.Render("🔴 OFFLINE")
+	}
+
+	left := tui.LabelStyle.Render("Organization: ") + org
+	right := tui.LabelStyle.Render("Status: ") + statusStr
+
+	leftLen := visibleLength(left)
+	rightLen := visibleLength(right)
+	spacing := width - leftLen - rightLen
+	if spacing < 2 {
+		spacing = 2
+	}
+
+	return left + strings.Repeat(" ", spacing) + right
+}
+
+func (m StatusModel) formatVitalsRow(label1 string, pct1 float64, label2 string, pct2 float64, width int) string {
+	bar1 := m.progressBar(pct1, 10)
+	item1 := fmt.Sprintf("  %s: %s %s", tui.LabelStyle.Render(label1), bar1, m.colorPercent(pct1))
+
+	if label2 == "" {
+		return item1
+	}
+
+	bar2 := m.progressBar(pct2, 10)
+	item2 := fmt.Sprintf("%s: %s %s", tui.LabelStyle.Render(label2), bar2, m.colorPercent(pct2))
+
+	item1Len := visibleLength(item1)
+	item2Len := visibleLength(item2)
+	spacing := width - item1Len - item2Len
+	if spacing < 2 {
+		spacing = 2
+	}
+
+	return item1 + strings.Repeat(" ", spacing) + item2
+}
+
+func (m StatusModel) progressBar(percent float64, width int) string {
+	filled := int(percent / 100.0 * float64(width))
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+
+	var color lipgloss.Style
+	switch {
+	case percent >= 90:
+		color = tui.ErrorStyle
+	case percent >= 75:
+		color = tui.WarningStyle
+	default:
+		color = tui.SuccessStyle
+	}
+
+	return color.Render(strings.Repeat("█", filled)) + tui.MutedStyle.Render(strings.Repeat("░", empty))
+}
+
+func (m StatusModel) colorPercent(pct float64) string {
+	s := fmt.Sprintf("%5.1f%%", pct)
+	switch {
+	case pct >= 90:
+		return tui.ErrorStyle.Render(s)
+	case pct >= 75:
+		return tui.WarningStyle.Render(s)
+	default:
+		return tui.SuccessStyle.Render(s)
+	}
+}
+
+func (m StatusModel) formatServiceLine(svc ServiceStatus, width int) string {
+	var statusIcon string
+	switch svc.Status {
+	case "running":
+		statusIcon = tui.SuccessStyle.Render("🟢 running")
+	case "stopped":
+		statusIcon = tui.MutedStyle.Render("⚫ stopped")
+	case "error":
+		statusIcon = tui.ErrorStyle.Render("🔴 error")
+	default:
+		statusIcon = tui.WarningStyle.Render("🟡 " + svc.Status)
+	}
+
+	uptime := svc.Uptime
+	if uptime == "" {
+		uptime = "-"
+	}
+
+	return fmt.Sprintf("  %-18s %-14s %s", svc.Name, statusIcon, tui.MutedStyle.Render(uptime))
+}
+
+func (m StatusModel) formatPeerLine(peer PeerInfo) string {
+	var indicator string
+	if peer.Online {
+		indicator = tui.SuccessStyle.Render("🟢")
+	} else {
+		indicator = tui.MutedStyle.Render("⚫")
+	}
+
+	name := peer.Hostname
+	if peer.IP != "" {
+		name += " " + tui.MutedStyle.Render(peer.IP)
+	}
+
+	extra := ""
+	if peer.Online && peer.Latency != "" {
+		extra = tui.MutedStyle.Render(peer.Latency)
+		if peer.ConnType != "" {
+			extra += " " + tui.MutedStyle.Render("["+peer.ConnType+"]")
 		}
-		gpuContent = strings.Join(lines, "\n")
-	}
-	gpuPanel := Panel{
-		Title:   "GPU",
-		Content: gpuContent,
-		Width:   halfWidth,
 	}
 
-	// Peers panel
-	peerPanel := PeerPanel{
-		Title: "NETWORK PEERS",
-		Peers: m.data.Peers,
-		Width: halfWidth,
-	}
+	return fmt.Sprintf("  %s %s %s", indicator, name, extra)
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, gpuPanel.Render(), peerPanel.Render())
+func (m StatusModel) renderHelpBar() string {
+	items := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary).Render("[r]") + tui.MutedStyle.Render("efresh"),
+		lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary).Render("[a]") + tui.MutedStyle.Render("uto: "+boolStr(m.autoRefresh)),
+		lipgloss.NewStyle().Bold(true).Foreground(tui.ColorPrimary).Render("[q]") + tui.MutedStyle.Render("uit"),
+	}
+	return "  " + strings.Join(items, "  ")
 }
 
 func (m StatusModel) renderStatusLine() string {
-	var parts []string
-
 	if m.loading {
-		parts = append(parts, tui.SpinnerStyle.Render("Refreshing..."))
-	} else if m.err != nil {
-		parts = append(parts, tui.ErrorStyle.Render("Error: "+m.err.Error()))
-	} else {
-		lastUpdate := "never"
-		if !m.refreshTimer.IsZero() {
-			lastUpdate = m.refreshTimer.Format("15:04:05")
-		}
-		parts = append(parts, tui.MutedStyle.Render("Last update: "+lastUpdate))
+		return "  " + m.spinner.View() + " " + tui.SpinnerStyle.Render("Refreshing...")
+	}
+	if m.err != nil {
+		return "  " + tui.ErrorStyle.Render("Error: "+m.err.Error())
 	}
 
-	return strings.Join(parts, "  ")
+	lastUpdate := "never"
+	if !m.refreshTimer.IsZero() {
+		lastUpdate = m.refreshTimer.Format("15:04:05")
+	}
+	return "  " + tui.MutedStyle.Render("Last update: "+lastUpdate)
 }
 
 func boolStr(b bool) string {
@@ -328,6 +460,28 @@ func boolStr(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// visibleLength returns the visible length of a string (excluding ANSI codes)
+func visibleLength(s string) int {
+	// Simple ANSI stripper
+	inEscape := false
+	length := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			inEscape = true
+			i++
+			continue
+		}
+		if inEscape {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		length++
+	}
+	return length
 }
 
 // RunDashboard runs the interactive status dashboard
