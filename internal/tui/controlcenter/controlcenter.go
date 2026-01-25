@@ -78,6 +78,9 @@ type PeerInfo struct {
 	Latency  string
 }
 
+// RefreshInterval is the default auto-refresh interval (matches heartbeat)
+const RefreshInterval = 30 * time.Second
+
 // ControlCenter is the main TUI application
 type ControlCenter struct {
 	app  *tview.Application
@@ -108,6 +111,7 @@ type ControlCenter struct {
 	selectedPanel int
 	panels        []tview.Primitive
 	running       bool
+	lastRefresh   time.Time
 }
 
 // Config holds control center configuration
@@ -291,6 +295,9 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		case 'l', 'L':
 			cc.showLogsModal()
 			return nil
+		case '?':
+			cc.showHelpModal()
+			return nil
 		}
 	}
 	return event
@@ -354,6 +361,51 @@ func (cc *ControlCenter) showLogsModal() {
 
 	cc.app.SetRoot(logView, true)
 	cc.app.SetFocus(logView)
+}
+
+func (cc *ControlCenter) showHelpModal() {
+	helpText := `[yellow::b]Citadel Control Center Help[-:-:-]
+
+[yellow]Keyboard Shortcuts:[-]
+  [white::b]r[-:-:-]       Manual refresh
+  [white::b]a[-:-:-]       Toggle auto-refresh (30s interval)
+  [white::b]l[-:-:-]       View logs for selected service
+  [white::b]Enter[-:-:-]   Start/stop selected service
+  [white::b]↑/↓[-:-:-]     Navigate services
+  [white::b]?[-:-:-]       Show this help
+  [white::b]q/Esc[-:-:-]   Quit
+
+[yellow]Other Citadel Commands:[-]
+  [gray]citadel login[-]      Connect to AceTeam Network
+  [gray]citadel logout[-]     Disconnect from network
+  [gray]citadel status[-]     View node status (non-interactive)
+  [gray]citadel work[-]       Start job worker for GPU tasks
+  [gray]citadel up[-]         Start services and agent
+  [gray]citadel down[-]       Stop all services
+
+[yellow]Coming Soon:[-]
+  [gray]citadel ssh[-]        SSH into remote nodes
+  [gray]citadel expose[-]     Expose local ports to network
+  [gray]citadel tunnel[-]     Create secure tunnels
+
+[gray]Press Esc to close[-]`
+
+	helpView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetText(helpText)
+	helpView.SetBorder(true).SetTitle(" Help ")
+
+	helpView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc || event.Rune() == '?' {
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetFocus(cc.servicesView)
+			return nil
+		}
+		return event
+	})
+
+	cc.app.SetRoot(helpView, true)
+	cc.app.SetFocus(helpView)
 }
 
 func (cc *ControlCenter) onServiceSelected(row, col int) {
@@ -621,9 +673,15 @@ func (cc *ControlCenter) updateHelpBar() {
 func (cc *ControlCenter) updateStatusBar() {
 	autoStr := "[red]off[-]"
 	if cc.autoRefresh {
-		autoStr = "[green]on[-]"
+		autoStr = "[green]on (30s)[-]"
 	}
-	cc.statusBar.SetText(fmt.Sprintf("Auto-refresh: %s  │  Press [yellow::b]?[-:-:-] for help", autoStr))
+
+	lastRefreshStr := "[gray]never[-]"
+	if !cc.lastRefresh.IsZero() {
+		lastRefreshStr = "[gray]" + cc.lastRefresh.Format("15:04:05") + "[-]"
+	}
+
+	cc.statusBar.SetText(fmt.Sprintf("Auto-refresh: %s  │  Last refresh: %s  │  Press [yellow::b]?[-:-:-] for help", autoStr, lastRefreshStr))
 }
 
 func (cc *ControlCenter) refresh() {
@@ -638,6 +696,7 @@ func (cc *ControlCenter) refresh() {
 	}
 
 	cc.data = data
+	cc.lastRefresh = time.Now()
 
 	cc.app.QueueUpdateDraw(func() {
 		cc.updateAllPanels()
@@ -645,7 +704,7 @@ func (cc *ControlCenter) refresh() {
 }
 
 func (cc *ControlCenter) autoRefreshLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(RefreshInterval)
 	defer ticker.Stop()
 
 	for {
