@@ -35,7 +35,7 @@ if (-not $VERSION) {
 $BUILD_DIR = "build"
 $RELEASE_DIR = "release"
 $MODULE_PATH = (go list -m)
-$VERSION_VAR_PATH = "${MODULE_PATH}/cmd.Version"
+$VERSION_VAR_PATH = "${MODULE_PATH}/cmd.version"
 
 # --- Clean Up ---
 if (Test-Path $BUILD_DIR) {
@@ -95,7 +95,7 @@ foreach ($OS in $PLATFORMS) {
         $env:CGO_ENABLED = "0"
 
         $ldflags = "-X '$VERSION_VAR_PATH=$VERSION'"
-        go build -ldflags $ldflags -o $BINARY_PATH .
+        go build -ldflags $ldflags -o $BINARY_PATH ./cmd/citadel
 
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Build failed for $OS/$ARCH"

@@ -35,7 +35,7 @@ VERSION=$(git describe --tags --always --dirty || echo "dev")
 BUILD_DIR="build"
 RELEASE_DIR="release"
 MODULE_PATH=$(go list -m)
-VERSION_VAR_PATH="${MODULE_PATH}/cmd.Version"
+VERSION_VAR_PATH="${MODULE_PATH}/cmd.version"
 
 # --- Man Page Generation ---
 MAN_DIR="docs/man"
@@ -104,7 +104,7 @@ for OS in "${PLATFORMS[@]}"; do
 
         # 1. Build the binary
         echo "Building binary..."
-        CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" .
+        CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build -ldflags="-X '${VERSION_VAR_PATH}=${VERSION}'" -o "$BINARY_PATH" ./cmd/citadel
 
         # 2. Copy man page if available (not for Windows)
         if [[ "$OS" != "windows" ]] && [[ -f "$MAN_DIR/citadel.1" ]]; then

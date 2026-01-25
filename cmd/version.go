@@ -3,12 +3,26 @@ package cmd
 
 import (
 	"fmt"
+	"runtime/debug"
 
 	"github.com/spf13/cobra"
 )
 
-// Version will be set at build time
-var Version = "dev"
+// version is set via ldflags at build time
+var version = ""
+
+// Version returns the CLI version, preferring ldflags, then build info, then "dev"
+var Version = func() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+	}
+	return "dev"
+}()
 
 var versionCmd = &cobra.Command{
 	Use:   "version",

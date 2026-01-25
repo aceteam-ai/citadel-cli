@@ -34,6 +34,16 @@ Or as a one-liner:
 brew install aceteam-ai/tap/citadel
 ```
 
+#### Go Install
+
+If you have Go 1.21+ installed:
+
+```bash
+go install github.com/aceteam-ai/citadel-cli/cmd/citadel@latest
+```
+
+This installs the `citadel` binary to your `$GOPATH/bin` or `$GOBIN`.
+
 ### Manual Installation
 
 #### Linux / macOS
@@ -131,7 +141,7 @@ See [**WINDOWS_QUICKSTART.md**](WINDOWS_QUICKSTART.md) for a 5-minute getting st
 .\build.ps1 -All
 
 # Quick development build
-go build -o citadel.exe .
+go build -o citadel.exe ./cmd/citadel
 ```
 
 See [**WINDOWS_DEVELOPMENT.md**](WINDOWS_DEVELOPMENT.md) for detailed Windows development setup instructions.
