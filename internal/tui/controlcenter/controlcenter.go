@@ -3,6 +3,7 @@ package controlcenter
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -286,20 +287,14 @@ func (cc *ControlCenter) buildUI() {
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
-	// Ctrl+C always quits immediately (emergency exit)
-	if event.Key() == tcell.KeyCtrlC {
-		cc.Stop()
-		return nil
-	}
-
 	// If in a modal, let the modal handle all input
 	if cc.inModal {
 		return event
 	}
 
-	// Most input goes to the command field
+	// Trap all quit attempts and show confirmation
 	switch event.Key() {
-	case tcell.KeyEsc:
+	case tcell.KeyCtrlC, tcell.KeyEsc:
 		cc.showQuitConfirm()
 		return nil
 	case tcell.KeyRune:
@@ -323,13 +318,11 @@ func (cc *ControlCenter) onCommandEntered(key tcell.Key) {
 	cc.cmdInput.SetText("")
 
 	if cmd == "" {
-		cc.app.SetFocus(cc.servicesView)
 		return
 	}
 
 	// Process command
 	cc.processCommand(cmd)
-	cc.app.SetFocus(cc.servicesView)
 }
 
 func (cc *ControlCenter) processCommand(cmd string) {
@@ -397,32 +390,70 @@ func (cc *ControlCenter) processCommand(cmd string) {
 func (cc *ControlCenter) showQuitConfirm() {
 	cc.inModal = true
 
+	warningText := `⚠️  Are you sure you want to exit?
+
+If you quit:
+• Your services will no longer be accessible on the network
+• Other nodes won't be able to connect to this machine
+• Jobs won't be processed on this node
+
+To keep Citadel running in the background, install it as a system service.`
+
 	modal := tview.NewModal().
-		SetText("Exit Citadel Control Center?").
-		AddButtons([]string{"Cancel", "Exit"}).
+		SetText(warningText).
+		AddButtons([]string{"Cancel", "Install Service", "Exit Anyway"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			cc.inModal = false
-			if buttonLabel == "Exit" {
+			switch buttonLabel {
+			case "Exit Anyway":
 				cc.Stop()
-			} else {
+			case "Install Service":
+				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetFocus(cc.cmdInput)
+				cc.showInstallServiceHelp()
+			default:
 				cc.app.SetRoot(cc.mainFlex, true)
 				cc.app.SetFocus(cc.cmdInput)
 			}
 		})
 
-	// Allow Esc to cancel
-	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.cmdInput)
-			return nil
-		}
-		return event
-	})
-
 	cc.app.SetRoot(modal, true)
 	cc.app.SetFocus(modal)
+}
+
+func (cc *ControlCenter) showInstallServiceHelp() {
+	cc.AddActivity("info", "To install Citadel as a system service:")
+	cc.AddActivity("info", "")
+
+	// Detect OS and show appropriate instructions
+	switch {
+	case isLinux():
+		cc.AddActivity("info", "[Linux] Run: sudo citadel service install")
+		cc.AddActivity("info", "         Or manually create a systemd unit file")
+	case isDarwin():
+		cc.AddActivity("info", "[macOS] Run: citadel service install")
+		cc.AddActivity("info", "         Or use: brew services start citadel")
+	case isWindows():
+		cc.AddActivity("info", "[Windows] Run as Admin: citadel service install")
+		cc.AddActivity("info", "          Creates a Windows Service")
+	default:
+		cc.AddActivity("info", "Run: citadel service install")
+	}
+
+	cc.AddActivity("info", "")
+	cc.AddActivity("info", "This will keep Citadel running in the background.")
+}
+
+func isLinux() bool {
+	return strings.Contains(strings.ToLower(runtime.GOOS), "linux")
+}
+
+func isDarwin() bool {
+	return strings.Contains(strings.ToLower(runtime.GOOS), "darwin")
+}
+
+func isWindows() bool {
+	return strings.Contains(strings.ToLower(runtime.GOOS), "windows")
 }
 
 func (cc *ControlCenter) showHelpModal() {
@@ -433,24 +464,21 @@ func (cc *ControlCenter) showHelpModal() {
   [white]refresh[-]         Refresh status
   [white]start <svc>[-]     Start a service
   [white]stop <svc>[-]      Stop a service
-  [white]quit[-]            Exit
+  [white]quit[-]            Exit (with confirmation)
 
 [yellow]Shortcuts:[-]
   [white::b]?[-:-:-]         Show this help
-  [white::b]Esc[-:-:-]       Quit (with confirmation)
-  [white::b]Ctrl+C[-:-:-]    Quit immediately
+  [white::b]Esc/Ctrl+C[-:-:-] Quit (with confirmation)
 
-[yellow]Other Citadel CLI Commands:[-]
+[yellow]Background Service:[-]
+  To run Citadel in the background without this UI:
+  [gray]citadel service install[-]   Install as system service
+  [gray]citadel --daemon[-]          Run in daemon mode (no UI)
+
+[yellow]Other Citadel Commands:[-]
   [gray]citadel login[-]      Connect to AceTeam Network
   [gray]citadel logout[-]     Disconnect from network
   [gray]citadel work[-]       Start job worker for GPU tasks
-  [gray]citadel up[-]         Start services and agent
-  [gray]citadel down[-]       Stop all services
-
-[yellow]Coming Soon:[-]
-  [gray]citadel ssh[-]        SSH into remote nodes
-  [gray]citadel expose[-]     Expose local ports to network
-  [gray]citadel tunnel[-]     Create secure tunnels
 
 [gray]Press Esc/q/? to close[-]`
 
