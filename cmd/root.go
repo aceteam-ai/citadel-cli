@@ -29,6 +29,7 @@ var cfgFile string
 var nexusURL string
 var authServiceURL string
 var debugMode bool
+var daemonMode bool
 
 // logFile is the file handle for logging
 var logFile *os.File
@@ -109,9 +110,14 @@ When run without a subcommand, Citadel starts interactive mode with slash comman
 Use 'citadel help' to see all available commands.`,
 	Version: Version,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Default behavior: launch interactive mode if TTY, otherwise show help
+		// Default behavior: launch control center if TTY, otherwise show help
+		if daemonMode {
+			// TODO: Run in daemon mode (background worker)
+			fmt.Println("Daemon mode not yet implemented. Use 'citadel work' for now.")
+			return
+		}
 		if tui.IsTTY() {
-			runInteractiveMode()
+			runControlCenter()
 		} else {
 			cmd.Help()
 		}
@@ -163,6 +169,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
+	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
