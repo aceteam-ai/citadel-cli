@@ -15,6 +15,8 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/tui"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/dashboard"
 	"github.com/fatih/color"
 	"github.com/redis/go-redis/v9"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -24,12 +26,13 @@ import (
 )
 
 var (
-	headerColor = color.New(color.FgCyan, color.Bold)
-	goodColor   = color.New(color.FgGreen)
-	warnColor   = color.New(color.FgYellow)
-	badColor    = color.New(color.FgRed)
-	labelColor  = color.New(color.Bold)
-	noColor     bool // Flag to disable color
+	headerColor   = color.New(color.FgCyan, color.Bold)
+	goodColor     = color.New(color.FgGreen)
+	warnColor     = color.New(color.FgYellow)
+	badColor      = color.New(color.FgRed)
+	labelColor    = color.New(color.Bold)
+	noColor       bool // Flag to disable color
+	interactiveUI bool // Flag to enable interactive TUI dashboard
 )
 
 var statusCmd = &cobra.Command{
@@ -43,45 +46,224 @@ and the state of all managed services.`,
   citadel status
 
   # View status without colors (for scripts/logging)
-  citadel status --no-color`,
+  citadel status --no-color
+
+  # Interactive dashboard with live updates
+  citadel status -i`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Handle the --no-color flag
 		if noColor {
 			color.NoColor = true
 		}
 
-		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		defer w.Flush()
-
-		// Load manifest once for use in multiple sections
-		manifest, _, _ := findAndReadManifest()
-
-		headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
-
-		headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
-		printMemInfo(w)
-		printCPUInfo(w)
-		printDiskInfo(w)
-
-		headerColor.Fprintln(w, "\n🗂️ CACHE USAGE (~/citadel-cache)")
-		printCacheInfo(w)
-
-		headerColor.Fprintln(w, "\n💎 GPU STATUS")
-		printGPUInfo(w)
-
-		headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
-		printNetworkInfo(w, manifest)
-		printPeerInfo(w)
-
-		// Only show Job Queue section if configured
-		if os.Getenv("REDIS_URL") != "" {
-			headerColor.Fprintln(w, "\n📋 JOB QUEUE")
-			printJobQueueInfo(w)
+		// Check if interactive mode requested and available
+		if interactiveUI && tui.ShouldUseInteractive(true, noColor) {
+			runInteractiveDashboard()
+			return
 		}
 
-		headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
-		printServiceInfo(w)
+		// Fall back to standard tabwriter output
+		runStandardStatus()
 	},
+}
+
+// runStandardStatus displays status using the traditional tabwriter format
+func runStandardStatus() {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+
+	// Load manifest once for use in multiple sections
+	manifest, _, _ := findAndReadManifest()
+
+	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
+
+	headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
+	printMemInfo(w)
+	printCPUInfo(w)
+	printDiskInfo(w)
+
+	headerColor.Fprintln(w, "\n🗂️ CACHE USAGE (~/citadel-cache)")
+	printCacheInfo(w)
+
+	headerColor.Fprintln(w, "\n💎 GPU STATUS")
+	printGPUInfo(w)
+
+	headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
+	printNetworkInfo(w, manifest)
+	printPeerInfo(w)
+
+	// Only show Job Queue section if configured
+	if os.Getenv("REDIS_URL") != "" {
+		headerColor.Fprintln(w, "\n📋 JOB QUEUE")
+		printJobQueueInfo(w)
+	}
+
+	headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
+	printServiceInfo(w)
+}
+
+// runInteractiveDashboard runs the interactive TUI dashboard
+func runInteractiveDashboard() {
+	// Gather initial data
+	data, _ := gatherStatusData()
+
+	// Run the dashboard with refresh callback
+	if err := dashboard.RunDashboard(data, gatherStatusData); err != nil {
+		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// gatherStatusData collects all status data for the dashboard
+func gatherStatusData() (dashboard.StatusData, error) {
+	data := dashboard.StatusData{
+		Version: Version,
+	}
+
+	// Load manifest
+	manifest, _, _ := findAndReadManifest()
+	if manifest != nil {
+		data.NodeName = manifest.Node.Name
+		data.OrgID = manifest.Node.OrgID
+		data.Tags = manifest.Node.Tags
+	}
+
+	// Get hostname if not in manifest
+	if data.NodeName == "" {
+		data.NodeName, _ = os.Hostname()
+	}
+
+	// System vitals - Memory
+	if v, err := mem.VirtualMemory(); err == nil {
+		data.MemoryPercent = v.UsedPercent
+		data.MemoryUsed = formatBytes(v.Used)
+		data.MemoryTotal = formatBytes(v.Total)
+	}
+
+	// System vitals - CPU
+	if percentages, err := cpu.Percent(500*time.Millisecond, false); err == nil && len(percentages) > 0 {
+		data.CPUPercent = percentages[0]
+	}
+
+	// System vitals - Disk
+	if d, err := disk.Usage("/"); err == nil {
+		data.DiskPercent = d.UsedPercent
+		data.DiskUsed = formatBytes(d.Used)
+		data.DiskTotal = formatBytes(d.Total)
+	}
+
+	// GPU info
+	if detector, err := platform.GetGPUDetector(); err == nil && detector.HasGPU() {
+		if gpus, err := detector.GetGPUInfo(); err == nil {
+			for _, gpu := range gpus {
+				gpuInfo := dashboard.GPUInfo{
+					Name:        gpu.Name,
+					Memory:      gpu.Memory,
+					Temperature: gpu.Temperature,
+					Driver:      gpu.Driver,
+				}
+				if gpu.Utilization != "" {
+					utilStr := strings.TrimSuffix(gpu.Utilization, "%")
+					if util, err := strconv.ParseFloat(utilStr, 64); err == nil {
+						gpuInfo.Utilization = util
+					}
+				}
+				data.GPUs = append(data.GPUs, gpuInfo)
+			}
+		}
+	}
+
+	// Network status
+	if network.HasState() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		connected, _ := network.VerifyOrReconnect(ctx)
+		data.Connected = connected
+
+		if status, err := network.GetGlobalStatus(ctx); err == nil {
+			data.NodeIP = status.IPv4
+			if data.NodeName == "" {
+				data.NodeName = status.Hostname
+			}
+		}
+
+		// Get peers
+		myIP, _ := network.GetGlobalIPv4()
+		if peers, err := network.GetGlobalPeers(ctx); err == nil {
+			for _, peer := range peers {
+				if peer.IP != myIP {
+					peerInfo := dashboard.PeerInfo{
+						Hostname: peer.Hostname,
+						IP:       peer.IP,
+						Online:   peer.Online,
+					}
+
+					// Ping online peers
+					if peer.Online {
+						pingCtx, pingCancel := context.WithTimeout(context.Background(), 1*time.Second)
+						if latency, connType, _, err := network.PingPeer(pingCtx, peer.IP); err == nil {
+							peerInfo.Latency = fmt.Sprintf("%.0fms", latency)
+							peerInfo.ConnType = connType
+						}
+						pingCancel()
+					}
+
+					data.Peers = append(data.Peers, peerInfo)
+				}
+			}
+		}
+	}
+
+	// Services
+	if manifest != nil {
+		configDir := ""
+		if m, cd, err := findAndReadManifest(); err == nil && m != nil {
+			configDir = cd
+		}
+
+		for _, service := range manifest.Services {
+			svcStatus := dashboard.ServiceStatus{
+				Name:   service.Name,
+				Status: "stopped",
+			}
+
+			if configDir != "" {
+				fullComposePath := filepath.Join(configDir, service.ComposeFile)
+				if _, err := os.Stat(fullComposePath); err == nil {
+					psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "ps", "--format", "json")
+					if output, err := psCmd.Output(); err == nil {
+						var containers []struct {
+							State string `json:"State"`
+						}
+						decoder := json.NewDecoder(strings.NewReader(string(output)))
+						for decoder.More() {
+							var c struct {
+								State string `json:"State"`
+							}
+							if err := decoder.Decode(&c); err == nil {
+								containers = append(containers, c)
+							}
+						}
+						if len(containers) > 0 {
+							state := strings.ToLower(containers[0].State)
+							if strings.Contains(state, "running") || strings.Contains(state, "up") {
+								svcStatus.Status = "running"
+							} else if strings.Contains(state, "exited") || strings.Contains(state, "dead") {
+								svcStatus.Status = "stopped"
+							} else {
+								svcStatus.Status = state
+							}
+						}
+					}
+				}
+			}
+
+			data.Services = append(data.Services, svcStatus)
+		}
+	}
+
+	return data, nil
 }
 
 func printCacheInfo(w *tabwriter.Writer) {
@@ -535,4 +717,5 @@ func formatBytes(b uint64) string {
 func init() {
 	rootCmd.AddCommand(statusCmd)
 	statusCmd.Flags().BoolVar(&noColor, "no-color", false, "Disable colorized output")
+	statusCmd.Flags().BoolVarP(&interactiveUI, "interactive", "i", false, "Launch interactive dashboard with live updates")
 }

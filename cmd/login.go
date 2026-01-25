@@ -9,6 +9,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/spf13/cobra"
 )
 
@@ -63,8 +64,9 @@ func runNonInteractiveLogin() {
 		nodeName = hostname
 	}
 
-	// Connect to the network
-	fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
+	// Connect to the network with animated spinner
+	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
+	spinner.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -77,11 +79,12 @@ func runNonInteractiveLogin() {
 
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error connecting to network: %v\n", err)
+		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
 
 	ip, _ := srv.GetIPv4()
+	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
 	printNetworkSuccessInfo(nodeName, ip)
 }
 
@@ -128,8 +131,9 @@ func runInteractiveLogin() {
 	// Disconnect any existing connection first
 	_ = network.Logout()
 
-	// Connect using tsnet
-	fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
+	// Connect using tsnet with animated spinner
+	spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
+	spinner.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -142,11 +146,12 @@ func runInteractiveLogin() {
 
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Failed to connect: %v\n", err)
+		spinner.StopWithError(fmt.Sprintf("Failed to connect: %v", err))
 		os.Exit(1)
 	}
 
 	ip, _ := srv.GetIPv4()
+	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
 	printNetworkSuccessInfo(nodeName, ip)
 }
 

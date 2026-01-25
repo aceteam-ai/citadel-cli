@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -102,8 +103,19 @@ var rootCmd = &cobra.Command{
 	Use:   "citadel",
 	Short: "Citadel is the agent for the AceTeam Sovereign Compute Fabric",
 	Long: `A self-contained agent and CLI for connecting your hardware
-to the AceTeam control plane, making your resources available to your private workflows.`,
+to the AceTeam control plane, making your resources available to your private workflows.
+
+When run without a subcommand, Citadel starts interactive mode with slash commands.
+Use 'citadel help' to see all available commands.`,
 	Version: Version,
+	Run: func(cmd *cobra.Command, args []string) {
+		// Default behavior: launch interactive mode if TTY, otherwise show help
+		if tui.IsTTY() {
+			runInteractiveMode()
+		} else {
+			cmd.Help()
+		}
+	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// Always log the command (Log() handles console output based on --debug)
 		fullCmd := "citadel"
