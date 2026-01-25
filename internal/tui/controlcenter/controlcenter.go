@@ -112,6 +112,7 @@ type ControlCenter struct {
 	panels        []tview.Primitive
 	running       bool
 	lastRefresh   time.Time
+	inModal       bool // Track if we're in a modal (help, logs, etc.)
 }
 
 // Config holds control center configuration
@@ -289,10 +290,15 @@ func (cc *ControlCenter) buildUI() {
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
-	// Ctrl+C always quits immediately
+	// Ctrl+C always quits immediately (emergency exit)
 	if event.Key() == tcell.KeyCtrlC {
 		cc.Stop()
 		return nil
+	}
+
+	// If in a modal, let the modal handle all input
+	if cc.inModal {
+		return event
 	}
 
 	// Check if input field is focused - let it handle its own input
@@ -311,7 +317,7 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 
 	switch event.Key() {
 	case tcell.KeyEsc:
-		cc.Stop()
+		cc.showQuitConfirm()
 		return nil
 	case tcell.KeyTab:
 		// Tab to command input
@@ -320,7 +326,7 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyRune:
 		switch event.Rune() {
 		case 'q', 'Q':
-			cc.Stop()
+			cc.showQuitConfirm()
 			return nil
 		case 'r', 'R':
 			go cc.refresh()
@@ -427,14 +433,47 @@ func (cc *ControlCenter) processCommand(cmd string) {
 	}
 }
 
+func (cc *ControlCenter) showQuitConfirm() {
+	cc.inModal = true
+
+	modal := tview.NewModal().
+		SetText("Exit Citadel Control Center?").
+		AddButtons([]string{"Cancel", "Exit"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cc.inModal = false
+			if buttonLabel == "Exit" {
+				cc.Stop()
+			} else {
+				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetFocus(cc.servicesView)
+			}
+		})
+
+	// Allow Esc to cancel
+	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetFocus(cc.servicesView)
+			return nil
+		}
+		return event
+	})
+
+	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
+}
+
 func (cc *ControlCenter) showLogsModal() {
 	if len(cc.data.Services) == 0 {
+		cc.AddActivity("info", "No services configured - add services to citadel.yaml")
 		return
 	}
 
 	// Get selected service
 	row, _ := cc.servicesView.GetSelection()
 	if row < 1 || row > len(cc.data.Services) {
+		cc.AddActivity("warning", "Select a service first")
 		return
 	}
 	svc := cc.data.Services[row-1]
@@ -443,6 +482,7 @@ func (cc *ControlCenter) showLogsModal() {
 	cc.AddActivity("info", fmt.Sprintf("Fetching logs for %s...", svc.Name))
 
 	if cc.viewLogsFn == nil {
+		cc.AddActivity("error", "Log viewing not available")
 		return
 	}
 
@@ -452,6 +492,8 @@ func (cc *ControlCenter) showLogsModal() {
 		return
 	}
 
+	cc.inModal = true
+
 	// Create logs modal
 	logView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -460,7 +502,8 @@ func (cc *ControlCenter) showLogsModal() {
 	logView.SetBorder(true).SetTitle(fmt.Sprintf(" Logs: %s [Esc to close] ", svc.Name))
 
 	logView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
+		if event.Key() == tcell.KeyEsc || event.Rune() == 'q' {
+			cc.inModal = false
 			cc.app.SetRoot(cc.mainFlex, true)
 			cc.app.SetFocus(cc.servicesView)
 			return nil
@@ -483,7 +526,7 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]Enter[-:-:-]   Start/stop selected service
   [white::b]↑/↓[-:-:-]     Navigate services
   [white::b]?[-:-:-]       Show this help
-  [white::b]q/Esc[-:-:-]   Quit
+  [white::b]q/Esc[-:-:-]   Quit (with confirmation)
   [white::b]Ctrl+C[-:-:-]  Quit immediately
 
 [yellow]Commands (type in command box):[-]
@@ -491,7 +534,7 @@ func (cc *ControlCenter) showHelpModal() {
   [white]refresh[-]         Refresh status
   [white]start <svc>[-]     Start a service
   [white]stop <svc>[-]      Stop a service
-  [white]logs [svc][-]      View service logs
+  [white]logs[-]            View logs for selected service
   [white]quit[-]            Exit
 
 [yellow]Other Citadel CLI Commands:[-]
@@ -506,15 +549,18 @@ func (cc *ControlCenter) showHelpModal() {
   [gray]citadel expose[-]     Expose local ports to network
   [gray]citadel tunnel[-]     Create secure tunnels
 
-[gray]Press Esc to close[-]`
+[gray]Press Esc/q to close[-]`
+
+	cc.inModal = true
 
 	helpView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetText(helpText)
-	helpView.SetBorder(true).SetTitle(" Help ")
+	helpView.SetBorder(true).SetTitle(" Help [Esc to close] ")
 
 	helpView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc || event.Rune() == '?' {
+		if event.Key() == tcell.KeyEsc || event.Rune() == '?' || event.Rune() == 'q' {
+			cc.inModal = false
 			cc.app.SetRoot(cc.mainFlex, true)
 			cc.app.SetFocus(cc.servicesView)
 			return nil
@@ -553,10 +599,13 @@ func (cc *ControlCenter) onServiceSelected(row, col int) {
 		return
 	}
 
+	cc.inModal = true
+
 	modal := tview.NewModal().
 		SetText(fmt.Sprintf("%s service '%s'?", action, svc.Name)).
 		AddButtons([]string{"Cancel", action}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cc.inModal = false
 			cc.app.SetRoot(cc.mainFlex, true)
 			cc.app.SetFocus(cc.servicesView)
 
@@ -573,7 +622,17 @@ func (cc *ControlCenter) onServiceSelected(row, col int) {
 			}
 		})
 
-	// Set root AND focus on modal to ensure it receives input
+	// Allow Esc to cancel
+	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetFocus(cc.servicesView)
+			return nil
+		}
+		return event
+	})
+
 	cc.app.SetRoot(modal, true)
 	cc.app.SetFocus(modal)
 }
@@ -809,7 +868,7 @@ func (cc *ControlCenter) updateActivityView() {
 }
 
 func (cc *ControlCenter) updateHelpBar() {
-	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-]/[yellow::b]Ctrl+C[-:-:-] quit")
+	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 }
 
 func (cc *ControlCenter) updateStatusBar() {
