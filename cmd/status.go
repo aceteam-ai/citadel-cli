@@ -107,8 +107,8 @@ func runInteractiveDashboard() {
 	// Gather initial data
 	data, _ := gatherStatusData()
 
-	// Run the dashboard with refresh callback
-	if err := dashboard.RunDashboard(data, gatherStatusData); err != nil {
+	// Run the tview dashboard with refresh callback
+	if err := dashboard.RunTviewDashboard(data, gatherStatusData); err != nil {
 		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
 		os.Exit(1)
 	}

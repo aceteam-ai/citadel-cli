@@ -63,7 +63,7 @@ func (c *Completer) Complete(input string) []string {
 		argPrefix = parts[len(parts)-1]
 	}
 
-	return c.completeArgs(cmd, parts[1:], argPrefix)
+	return c.completeArgs(cmd, argPrefix)
 }
 
 // completeCommand returns command name completions
@@ -92,7 +92,7 @@ func (c *Completer) CompleteMainCommands() []string {
 }
 
 // completeArgs returns argument completions for a command
-func (c *Completer) completeArgs(cmd *Command, args []string, prefix string) []string {
+func (c *Completer) completeArgs(cmd *Command, prefix string) []string {
 	switch cmd.Name {
 	case "logs", "services":
 		// Complete service names
