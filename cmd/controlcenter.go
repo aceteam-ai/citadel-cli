@@ -38,10 +38,12 @@ func runControlCenter() {
 
 	cc := controlcenter.New(cfg)
 
-	// Initial data load
-	if data, err := gatherControlCenterData(); err == nil {
-		cc.UpdateData(data)
-	}
+	// Start the UI immediately, load data in background
+	go func() {
+		if data, err := gatherControlCenterData(); err == nil {
+			cc.UpdateData(data)
+		}
+	}()
 
 	if err := cc.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Control center error: %v\n", err)
@@ -102,43 +104,39 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 		}
 	}
 
-	// Network status
+	// Network status - check connection state without blocking
 	if network.HasState() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
+		// Check if already connected (don't try to reconnect, that blocks)
+		if network.IsGlobalConnected() {
+			data.Connected = true
 
-		connected, _ := network.VerifyOrReconnect(ctx)
-		data.Connected = connected
-
-		if status, err := network.GetGlobalStatus(ctx); err == nil {
-			data.NodeIP = status.IPv4
-			if data.NodeName == "" {
-				data.NodeName = status.Hostname
-			}
-		}
-
-		// Get peers
-		myIP, _ := network.GetGlobalIPv4()
-		if peers, err := network.GetGlobalPeers(ctx); err == nil {
-			for _, peer := range peers {
-				if peer.IP != myIP {
-					peerInfo := controlcenter.PeerInfo{
-						Hostname: peer.Hostname,
-						IP:       peer.IP,
-						Online:   peer.Online,
-					}
-
-					if peer.Online {
-						pingCtx, pingCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-						if latency, _, _, err := network.PingPeer(pingCtx, peer.IP); err == nil {
-							peerInfo.Latency = fmt.Sprintf("%.0fms", latency)
-						}
-						pingCancel()
-					}
-
-					data.Peers = append(data.Peers, peerInfo)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if status, err := network.GetGlobalStatus(ctx); err == nil {
+				data.NodeIP = status.IPv4
+				if data.NodeName == "" {
+					data.NodeName = status.Hostname
 				}
 			}
+			cancel()
+
+			// Get peers (with short timeout)
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+			myIP, _ := network.GetGlobalIPv4()
+			if peers, err := network.GetGlobalPeers(ctx2); err == nil {
+				for _, peer := range peers {
+					if peer.IP != myIP {
+						peerInfo := controlcenter.PeerInfo{
+							Hostname: peer.Hostname,
+							IP:       peer.IP,
+							Online:   peer.Online,
+						}
+
+						// Skip ping for now to avoid blocking
+						data.Peers = append(data.Peers, peerInfo)
+					}
+				}
+			}
+			cancel2()
 		}
 	}
 
@@ -195,8 +193,8 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 // extractUptime tries to extract uptime from docker status string like "Up 2 hours"
 func extractUptime(status string) string {
 	status = strings.ToLower(status)
-	if strings.HasPrefix(status, "up ") {
-		return strings.TrimPrefix(status, "up ")
+	if uptime, found := strings.CutPrefix(status, "up "); found {
+		return uptime
 	}
 	return ""
 }
