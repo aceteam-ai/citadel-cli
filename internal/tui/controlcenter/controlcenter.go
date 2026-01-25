@@ -90,7 +90,6 @@ type ControlCenter struct {
 	refreshFn      func() (StatusData, error)
 	startServiceFn func(name string) error
 	stopServiceFn  func(name string) error
-	viewLogsFn     func(name string) (string, error)
 
 	// UI components
 	mainFlex     *tview.Flex
@@ -121,7 +120,6 @@ type Config struct {
 	RefreshFn      func() (StatusData, error)
 	StartServiceFn func(name string) error
 	StopServiceFn  func(name string) error
-	ViewLogsFn     func(name string) (string, error)
 }
 
 // New creates a new control center
@@ -133,7 +131,6 @@ func New(cfg Config) *ControlCenter {
 		refreshFn:      cfg.RefreshFn,
 		startServiceFn: cfg.StartServiceFn,
 		stopServiceFn:  cfg.StopServiceFn,
-		viewLogsFn:     cfg.ViewLogsFn,
 	}
 }
 
@@ -214,12 +211,11 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(cc.nodePanel, 0, 1, false).
 		AddItem(cc.vitalsPanel, 0, 1, false)
 
-	// Services table
+	// Services table (display only)
 	cc.servicesView = tview.NewTable().
 		SetBorders(false).
-		SetSelectable(true, false)
-	cc.servicesView.SetBorder(true).SetTitle(" Services [Enter: toggle] ")
-	cc.servicesView.SetSelectedFunc(cc.onServiceSelected)
+		SetSelectable(false, false)
+	cc.servicesView.SetBorder(true).SetTitle(" Services ")
 
 	// Jobs panel
 	cc.jobsPanel = tview.NewTextView().
@@ -282,11 +278,11 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(cc.helpBar, 1, 0, false).
 		AddItem(cc.statusBar, 1, 0, false)
 
-	// Track focusable panels
-	cc.panels = []tview.Primitive{cc.servicesView, cc.cmdInput}
+	// Track focusable panels - command input is the main interaction point
+	cc.panels = []tview.Primitive{cc.cmdInput}
 
 	cc.app.SetRoot(cc.mainFlex, true)
-	cc.app.SetFocus(cc.servicesView)
+	cc.app.SetFocus(cc.cmdInput)
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
@@ -301,48 +297,20 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		return event
 	}
 
-	// Check if input field is focused - let it handle its own input
-	if cc.app.GetFocus() == cc.cmdInput {
-		switch event.Key() {
-		case tcell.KeyEsc:
-			// Escape from input back to services
-			cc.app.SetFocus(cc.servicesView)
-			return nil
-		case tcell.KeyTab:
-			cc.app.SetFocus(cc.servicesView)
-			return nil
-		}
-		return event
-	}
-
+	// Most input goes to the command field
 	switch event.Key() {
 	case tcell.KeyEsc:
 		cc.showQuitConfirm()
 		return nil
-	case tcell.KeyTab:
-		// Tab to command input
-		cc.app.SetFocus(cc.cmdInput)
-		return nil
 	case tcell.KeyRune:
 		switch event.Rune() {
-		case 'q', 'Q':
-			cc.showQuitConfirm()
-			return nil
-		case 'r', 'R':
-			go cc.refresh()
-			return nil
-		case 'l', 'L':
-			cc.showLogsModal()
-			return nil
 		case '?':
 			cc.showHelpModal()
 			return nil
-		case '/', ':':
-			// Jump to command input when typing / or :
-			cc.app.SetFocus(cc.cmdInput)
-			return nil
 		}
 	}
+
+	// Let the input field handle everything else
 	return event
 }
 
@@ -383,14 +351,7 @@ func (cc *ControlCenter) processCommand(cmd string) {
 		go cc.refresh()
 		cc.AddActivity("info", "Manual refresh triggered")
 	case "quit", "q", "exit":
-		cc.Stop()
-	case "logs", "l":
-		if len(parts) > 1 {
-			// TODO: Show logs for specific service
-			cc.AddActivity("info", fmt.Sprintf("Logs for %s (not implemented yet)", parts[1]))
-		} else {
-			cc.showLogsModal()
-		}
+		cc.showQuitConfirm()
 	case "start":
 		if len(parts) > 1 && cc.startServiceFn != nil {
 			svcName := parts[1]
@@ -445,7 +406,7 @@ func (cc *ControlCenter) showQuitConfirm() {
 				cc.Stop()
 			} else {
 				cc.app.SetRoot(cc.mainFlex, true)
-				cc.app.SetFocus(cc.servicesView)
+				cc.app.SetFocus(cc.cmdInput)
 			}
 		})
 
@@ -454,7 +415,7 @@ func (cc *ControlCenter) showQuitConfirm() {
 		if event.Key() == tcell.KeyEsc {
 			cc.inModal = false
 			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.servicesView)
+			cc.app.SetFocus(cc.cmdInput)
 			return nil
 		}
 		return event
@@ -464,78 +425,20 @@ func (cc *ControlCenter) showQuitConfirm() {
 	cc.app.SetFocus(modal)
 }
 
-func (cc *ControlCenter) showLogsModal() {
-	if len(cc.data.Services) == 0 {
-		cc.AddActivity("info", "No services configured - add services to citadel.yaml")
-		return
-	}
-
-	// Get selected service
-	row, _ := cc.servicesView.GetSelection()
-	if row < 1 || row > len(cc.data.Services) {
-		cc.AddActivity("warning", "Select a service first")
-		return
-	}
-	svc := cc.data.Services[row-1]
-
-	// Show loading
-	cc.AddActivity("info", fmt.Sprintf("Fetching logs for %s...", svc.Name))
-
-	if cc.viewLogsFn == nil {
-		cc.AddActivity("error", "Log viewing not available")
-		return
-	}
-
-	logs, err := cc.viewLogsFn(svc.Name)
-	if err != nil {
-		cc.AddActivity("error", fmt.Sprintf("Failed to get logs: %v", err))
-		return
-	}
-
-	cc.inModal = true
-
-	// Create logs modal
-	logView := tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true).
-		SetText(logs)
-	logView.SetBorder(true).SetTitle(fmt.Sprintf(" Logs: %s [Esc to close] ", svc.Name))
-
-	logView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc || event.Rune() == 'q' {
-			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.servicesView)
-			return nil
-		}
-		return event
-	})
-
-	cc.app.SetRoot(logView, true)
-	cc.app.SetFocus(logView)
-}
-
 func (cc *ControlCenter) showHelpModal() {
 	helpText := `[yellow::b]Citadel Control Center Help[-:-:-]
 
-[yellow]Keyboard Shortcuts:[-]
-  [white::b]Tab[-:-:-]     Focus command input
-  [white::b]/ or :[-:-:-]  Quick jump to command input
-  [white::b]r[-:-:-]       Manual refresh
-  [white::b]l[-:-:-]       View logs for selected service
-  [white::b]Enter[-:-:-]   Start/stop selected service
-  [white::b]↑/↓[-:-:-]     Navigate services
-  [white::b]?[-:-:-]       Show this help
-  [white::b]q/Esc[-:-:-]   Quit (with confirmation)
-  [white::b]Ctrl+C[-:-:-]  Quit immediately
-
-[yellow]Commands (type in command box):[-]
+[yellow]Commands:[-]
   [white]help[-]            Show this help
   [white]refresh[-]         Refresh status
   [white]start <svc>[-]     Start a service
   [white]stop <svc>[-]      Stop a service
-  [white]logs[-]            View logs for selected service
   [white]quit[-]            Exit
+
+[yellow]Shortcuts:[-]
+  [white::b]?[-:-:-]         Show this help
+  [white::b]Esc[-:-:-]       Quit (with confirmation)
+  [white::b]Ctrl+C[-:-:-]    Quit immediately
 
 [yellow]Other Citadel CLI Commands:[-]
   [gray]citadel login[-]      Connect to AceTeam Network
@@ -549,20 +452,20 @@ func (cc *ControlCenter) showHelpModal() {
   [gray]citadel expose[-]     Expose local ports to network
   [gray]citadel tunnel[-]     Create secure tunnels
 
-[gray]Press Esc/q to close[-]`
+[gray]Press Esc/q/? to close[-]`
 
 	cc.inModal = true
 
 	helpView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetText(helpText)
-	helpView.SetBorder(true).SetTitle(" Help [Esc to close] ")
+	helpView.SetBorder(true).SetTitle(" Help ")
 
 	helpView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc || event.Rune() == '?' || event.Rune() == 'q' {
 			cc.inModal = false
 			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.servicesView)
+			cc.app.SetFocus(cc.cmdInput)
 			return nil
 		}
 		return event
@@ -570,71 +473,6 @@ func (cc *ControlCenter) showHelpModal() {
 
 	cc.app.SetRoot(helpView, true)
 	cc.app.SetFocus(helpView)
-}
-
-func (cc *ControlCenter) onServiceSelected(row, col int) {
-	// Check if we have services and valid selection
-	if len(cc.data.Services) == 0 {
-		return
-	}
-	if row < 1 || row > len(cc.data.Services) {
-		return
-	}
-
-	svc := cc.data.Services[row-1]
-
-	var action string
-	var actionFn func(string) error
-
-	if svc.Status == "running" {
-		action = "Stop"
-		actionFn = cc.stopServiceFn
-	} else {
-		action = "Start"
-		actionFn = cc.startServiceFn
-	}
-
-	if actionFn == nil {
-		cc.AddActivity("warning", "Service control not available")
-		return
-	}
-
-	cc.inModal = true
-
-	modal := tview.NewModal().
-		SetText(fmt.Sprintf("%s service '%s'?", action, svc.Name)).
-		AddButtons([]string{"Cancel", action}).
-		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.servicesView)
-
-			if buttonLabel == action {
-				cc.AddActivity("info", fmt.Sprintf("%sing %s...", action, svc.Name))
-				go func() {
-					if err := actionFn(svc.Name); err != nil {
-						cc.AddActivity("error", fmt.Sprintf("Failed to %s %s: %v", strings.ToLower(action), svc.Name, err))
-					} else {
-						cc.AddActivity("success", fmt.Sprintf("%s %sed", svc.Name, strings.ToLower(action)))
-						cc.refresh()
-					}
-				}()
-			}
-		})
-
-	// Allow Esc to cancel
-	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
-			cc.app.SetFocus(cc.servicesView)
-			return nil
-		}
-		return event
-	})
-
-	cc.app.SetRoot(modal, true)
-	cc.app.SetFocus(modal)
 }
 
 func (cc *ControlCenter) updateAllPanels() {
@@ -868,7 +706,7 @@ func (cc *ControlCenter) updateActivityView() {
 }
 
 func (cc *ControlCenter) updateHelpBar() {
-	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+	cc.helpBar.SetText("[yellow::b]?[-:-:-] help  [yellow::b]Esc[-:-:-] quit  │  Type commands: [gray]start <svc>, stop <svc>, refresh, help[-]")
 }
 
 func (cc *ControlCenter) updateStatusBar() {

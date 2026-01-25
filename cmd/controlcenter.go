@@ -33,7 +33,6 @@ func runControlCenter() {
 		RefreshFn:      gatherControlCenterData,
 		StartServiceFn: ccStartService,
 		StopServiceFn:  ccStopService,
-		ViewLogsFn:     viewServiceLogs,
 	}
 
 	cc := controlcenter.New(cfg)
@@ -235,21 +234,3 @@ func ccStopService(name string) error {
 	return fmt.Errorf("service not found: %s", name)
 }
 
-// viewServiceLogs returns the logs for a service
-func viewServiceLogs(name string) (string, error) {
-	manifest, configDir, err := findAndReadManifest()
-	if err != nil {
-		return "", err
-	}
-
-	for _, service := range manifest.Services {
-		if service.Name == name {
-			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "100")
-			output, err := cmd.CombinedOutput()
-			return string(output), err
-		}
-	}
-
-	return "", fmt.Errorf("service not found: %s", name)
-}
