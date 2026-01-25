@@ -359,8 +359,9 @@ func (d *TviewDashboard) updateStatusBar() {
 		lastUpdate = d.data.LastUpdate.Format("15:04:05")
 	}
 
+	// Use [[] to escape brackets in tview
 	d.statusBar.SetText(fmt.Sprintf(
-		" [yellow][r][-]efresh  [yellow][a][-]uto-refresh: %s  [yellow][q][-]uit  |  Last update: [gray]%s[-]",
+		" [yellow::b]r[-:-:-] refresh  [yellow::b]a[-:-:-] auto-refresh: %s  [yellow::b]q[-:-:-] quit  │  Last update: [gray]%s[-]",
 		autoStr, lastUpdate,
 	))
 }
