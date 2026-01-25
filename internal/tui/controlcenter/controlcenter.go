@@ -107,6 +107,7 @@ type ControlCenter struct {
 	stopChan      chan struct{}
 	selectedPanel int
 	panels        []tview.Primitive
+	running       bool
 }
 
 // Config holds control center configuration
@@ -151,8 +152,8 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 		cc.activities = cc.activities[:100]
 	}
 
-	// Update UI if running
-	if cc.app != nil && cc.activityView != nil {
+	// Update UI if running (check that app event loop has started)
+	if cc.app != nil && cc.activityView != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateActivityView()
 		})
@@ -165,14 +166,21 @@ func (cc *ControlCenter) Run() error {
 	cc.buildUI()
 	cc.updateAllPanels()
 
-	// Initial activity
-	cc.AddActivity("info", "Control center started")
-
-	// Start auto-refresh
-	go cc.autoRefreshLoop()
-
 	// Key bindings
 	cc.app.SetInputCapture(cc.handleInput)
+
+	// Set up callback for when app starts drawing (means event loop is running)
+	cc.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		if !cc.running {
+			cc.running = true
+			// Now it's safe to use QueueUpdateDraw
+			go func() {
+				cc.AddActivity("info", "Control center started")
+				cc.autoRefreshLoop()
+			}()
+		}
+		return false
+	})
 
 	return cc.app.Run()
 }
@@ -660,7 +668,7 @@ func (cc *ControlCenter) autoRefreshLoop() {
 // UpdateData updates the control center data (thread-safe)
 func (cc *ControlCenter) UpdateData(data StatusData) {
 	cc.data = data
-	if cc.app != nil {
+	if cc.app != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateAllPanels()
 		})
@@ -670,7 +678,7 @@ func (cc *ControlCenter) UpdateData(data StatusData) {
 // UpdateJobStats updates just the job statistics
 func (cc *ControlCenter) UpdateJobStats(stats JobStats) {
 	cc.data.Jobs = stats
-	if cc.app != nil && cc.jobsPanel != nil {
+	if cc.app != nil && cc.jobsPanel != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateJobsPanel()
 		})
@@ -681,7 +689,7 @@ func (cc *ControlCenter) UpdateJobStats(stats JobStats) {
 func (cc *ControlCenter) SetWorkerRunning(running bool, queue string) {
 	cc.data.WorkerRunning = running
 	cc.data.WorkerQueue = queue
-	if cc.app != nil && cc.jobsPanel != nil {
+	if cc.app != nil && cc.jobsPanel != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateJobsPanel()
 		})
