@@ -107,7 +107,6 @@ type ControlCenter struct {
 	// State
 	activities    []ActivityEntry
 	activityMu    sync.Mutex
-	autoRefresh   bool
 	stopChan      chan struct{}
 	selectedPanel int
 	panels        []tview.Primitive
@@ -127,11 +126,10 @@ type Config struct {
 // New creates a new control center
 func New(cfg Config) *ControlCenter {
 	return &ControlCenter{
-		autoRefresh: true,
-		stopChan:    make(chan struct{}),
-		activities:  make([]ActivityEntry, 0, 100),
-		data:        StatusData{Version: cfg.Version},
-		refreshFn:   cfg.RefreshFn,
+		stopChan:       make(chan struct{}),
+		activities:     make([]ActivityEntry, 0, 100),
+		data:           StatusData{Version: cfg.Version},
+		refreshFn:      cfg.RefreshFn,
 		startServiceFn: cfg.StartServiceFn,
 		stopServiceFn:  cfg.StopServiceFn,
 		viewLogsFn:     cfg.ViewLogsFn,
@@ -291,6 +289,12 @@ func (cc *ControlCenter) buildUI() {
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
+	// Ctrl+C always quits immediately
+	if event.Key() == tcell.KeyCtrlC {
+		cc.Stop()
+		return nil
+	}
+
 	// Check if input field is focused - let it handle its own input
 	if cc.app.GetFocus() == cc.cmdInput {
 		switch event.Key() {
@@ -307,7 +311,7 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 
 	switch event.Key() {
 	case tcell.KeyEsc:
-		cc.showQuitConfirm()
+		cc.Stop()
 		return nil
 	case tcell.KeyTab:
 		// Tab to command input
@@ -316,14 +320,10 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyRune:
 		switch event.Rune() {
 		case 'q', 'Q':
-			cc.showQuitConfirm()
+			cc.Stop()
 			return nil
 		case 'r', 'R':
 			go cc.refresh()
-			return nil
-		case 'a', 'A':
-			cc.autoRefresh = !cc.autoRefresh
-			cc.updateStatusBar()
 			return nil
 		case 'l', 'L':
 			cc.showLogsModal()
@@ -376,16 +376,8 @@ func (cc *ControlCenter) processCommand(cmd string) {
 	case "refresh", "r":
 		go cc.refresh()
 		cc.AddActivity("info", "Manual refresh triggered")
-	case "auto", "a":
-		cc.autoRefresh = !cc.autoRefresh
-		if cc.autoRefresh {
-			cc.AddActivity("info", "Auto-refresh enabled (30s)")
-		} else {
-			cc.AddActivity("info", "Auto-refresh disabled")
-		}
-		cc.updateStatusBar()
 	case "quit", "q", "exit":
-		cc.showQuitConfirm()
+		cc.Stop()
 	case "logs", "l":
 		if len(parts) > 1 {
 			// TODO: Show logs for specific service
@@ -433,21 +425,6 @@ func (cc *ControlCenter) processCommand(cmd string) {
 	default:
 		cc.AddActivity("warning", fmt.Sprintf("Unknown command: %s (type ? for help)", command))
 	}
-}
-
-func (cc *ControlCenter) showQuitConfirm() {
-	modal := tview.NewModal().
-		SetText("Exit Citadel Control Center?").
-		AddButtons([]string{"Cancel", "Exit"}).
-		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			if buttonLabel == "Exit" {
-				cc.Stop()
-			} else {
-				cc.app.SetRoot(cc.mainFlex, true)
-				cc.app.SetFocus(cc.servicesView)
-			}
-		})
-	cc.app.SetRoot(modal, true)
 }
 
 func (cc *ControlCenter) showLogsModal() {
@@ -502,17 +479,16 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]Tab[-:-:-]     Focus command input
   [white::b]/ or :[-:-:-]  Quick jump to command input
   [white::b]r[-:-:-]       Manual refresh
-  [white::b]a[-:-:-]       Toggle auto-refresh (30s interval)
   [white::b]l[-:-:-]       View logs for selected service
   [white::b]Enter[-:-:-]   Start/stop selected service
   [white::b]↑/↓[-:-:-]     Navigate services
   [white::b]?[-:-:-]       Show this help
   [white::b]q/Esc[-:-:-]   Quit
+  [white::b]Ctrl+C[-:-:-]  Quit immediately
 
 [yellow]Commands (type in command box):[-]
   [white]help[-]            Show this help
   [white]refresh[-]         Refresh status
-  [white]auto[-]            Toggle auto-refresh
   [white]start <svc>[-]     Start a service
   [white]stop <svc>[-]      Stop a service
   [white]logs [svc][-]      View service logs
@@ -833,21 +809,16 @@ func (cc *ControlCenter) updateActivityView() {
 }
 
 func (cc *ControlCenter) updateHelpBar() {
-	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]a[-:-:-] auto  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+	cc.helpBar.SetText("[yellow::b]Tab[-:-:-] command  [yellow::b]r[-:-:-] refresh  [yellow::b]l[-:-:-] logs  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-]/[yellow::b]Ctrl+C[-:-:-] quit")
 }
 
 func (cc *ControlCenter) updateStatusBar() {
-	autoStr := "[red]off[-]"
-	if cc.autoRefresh {
-		autoStr = "[green]on (30s)[-]"
-	}
-
-	lastRefreshStr := "[gray]never[-]"
+	lastRefreshStr := "[gray]starting...[-]"
 	if !cc.lastRefresh.IsZero() {
 		lastRefreshStr = "[gray]" + cc.lastRefresh.Format("15:04:05") + "[-]"
 	}
 
-	cc.statusBar.SetText(fmt.Sprintf("Auto-refresh: %s  │  Last refresh: %s  │  Press [yellow::b]?[-:-:-] for help", autoStr, lastRefreshStr))
+	cc.statusBar.SetText(fmt.Sprintf("Refresh: [green]auto (30s)[-]  │  Last: %s  │  Press [yellow::b]?[-:-:-] for help", lastRefreshStr))
 }
 
 func (cc *ControlCenter) refresh() {
@@ -878,9 +849,7 @@ func (cc *ControlCenter) autoRefreshLoop() {
 		case <-cc.stopChan:
 			return
 		case <-ticker.C:
-			if cc.autoRefresh {
-				cc.refresh()
-			}
+			cc.refresh()
 		}
 	}
 }
