@@ -136,8 +136,6 @@ func New(cfg Config) *ControlCenter {
 // AddActivity adds an entry to the activity log
 func (cc *ControlCenter) AddActivity(level, message string) {
 	cc.activityMu.Lock()
-	defer cc.activityMu.Unlock()
-
 	entry := ActivityEntry{
 		Time:    time.Now(),
 		Level:   level,
@@ -151,8 +149,10 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 	if len(cc.activities) > 100 {
 		cc.activities = cc.activities[:100]
 	}
+	cc.activityMu.Unlock()
 
-	// Update UI if running (check that app event loop has started)
+	// Update UI if running - MUST be outside the lock to avoid deadlock
+	// since updateActivityView also acquires the lock
 	if cc.app != nil && cc.activityView != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateActivityView()
@@ -169,18 +169,13 @@ func (cc *ControlCenter) Run() error {
 	// Key bindings
 	cc.app.SetInputCapture(cc.handleInput)
 
-	// Set up callback for when app starts drawing (means event loop is running)
-	cc.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
-		if !cc.running {
-			cc.running = true
-			// Now it's safe to use QueueUpdateDraw
-			go func() {
-				cc.AddActivity("info", "Control center started")
-				cc.autoRefreshLoop()
-			}()
-		}
-		return false
-	})
+	// Start background tasks after a brief delay to ensure event loop is running
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cc.running = true
+		cc.AddActivity("info", "Control center started")
+		go cc.autoRefreshLoop()
+	}()
 
 	return cc.app.Run()
 }
