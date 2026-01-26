@@ -10,15 +10,31 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/services"
+	"github.com/google/uuid"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
+)
+
+// Worker state for TUI management
+var (
+	ccWorkerMu       sync.Mutex
+	ccWorkerRunning  bool
+	ccWorkerCancel   context.CancelFunc
+	ccWorkerQueue    string
+	ccActivityFn     func(level, msg string)
 )
 
 // runControlCenter launches the unified control center TUI
@@ -28,19 +44,76 @@ func runControlCenter() {
 		os.Exit(1)
 	}
 
+	// Suppress tsnet/tailscale logs to prevent TUI corruption
+	network.SuppressLogs()
+
 	cfg := controlcenter.Config{
-		Version:        Version,
-		RefreshFn:      gatherControlCenterData,
-		StartServiceFn: ccStartService,
-		StopServiceFn:  ccStopService,
+		Version:         Version,
+		AuthServiceURL:  authServiceURL,
+		NexusURL:        nexusURL,
+		RefreshFn:       gatherControlCenterData,
+		StartServiceFn:  ccStartService,
+		StopServiceFn:   ccStopService,
+		AddServiceFn:    ccAddService,
+		GetServicesFn:   services.GetAvailableServices,
+		GetConfiguredFn: ccGetConfiguredServices,
+		DeviceAuth: controlcenter.DeviceAuthCallbacks{
+			StartFlow:  ccStartDeviceAuthFlow,
+			PollToken:  ccPollDeviceAuthToken,
+			Connect:    ccConnectWithAuthkey,
+			Disconnect: ccDisconnect,
+		},
+		Worker: controlcenter.WorkerCallbacks{
+			Start:     ccStartWorker,
+			Stop:      ccStopWorker,
+			IsRunning: ccWorkerIsRunning,
+		},
 	}
 
 	cc := controlcenter.New(cfg)
 
-	// Start the UI immediately, load data in background
+	// Auto-connect to network and start worker
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		networkConnected := false
+
+		// Try to reconnect if we have saved state
+		if network.HasState() {
+			cc.AddActivity("info", "Reconnecting to network...")
+			if connected, err := network.VerifyOrReconnect(ctx); err != nil {
+				cc.AddActivity("warning", fmt.Sprintf("Network reconnect failed: %v", err))
+			} else if connected {
+				cc.AddActivity("success", "Connected to AceTeam Network")
+				networkConnected = true
+			}
+		}
+
+		// Gather initial data after network check
 		if data, err := gatherControlCenterData(); err == nil {
 			cc.UpdateData(data)
+			// Update networkConnected based on actual status
+			networkConnected = data.Connected
+		}
+
+		// Auto-start worker after network is connected
+		if networkConnected {
+			deviceConfig := getDeviceConfigFromFile()
+			if deviceConfig != nil && (deviceConfig.DeviceAPIToken != "" || deviceConfig.RedisURL != "") {
+				// Small delay to ensure network is fully ready
+				time.Sleep(500 * time.Millisecond)
+				cc.AddActivity("info", "Starting worker...")
+				if err := ccStartWorker(cc.AddActivity); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("Worker auto-start failed: %v", err))
+				} else {
+					// Refresh to update worker status in UI
+					time.Sleep(500 * time.Millisecond)
+					if data, err := gatherControlCenterData(); err == nil {
+						cc.UpdateData(data)
+					}
+				}
+			}
 		}
 	}()
 
@@ -61,6 +134,15 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	if manifest != nil {
 		data.NodeName = manifest.Node.Name
 		data.OrgID = manifest.Node.OrgID
+	}
+
+	// Load user info from device config
+	if deviceConfig := getDeviceConfigFromFile(); deviceConfig != nil {
+		data.UserEmail = deviceConfig.UserEmail
+		data.UserName = deviceConfig.UserName
+		if data.OrgID == "" && deviceConfig.OrgID != "" {
+			data.OrgID = deviceConfig.OrgID
+		}
 	}
 
 	// Get hostname if not in manifest
@@ -186,6 +268,19 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 		}
 	}
 
+	// Detect system tailscale (dual connection)
+	running, ip, name, sameNetwork := controlcenter.DetectSystemTailscale(nexusURL)
+	data.SystemTailscaleRunning = running
+	data.SystemTailscaleIP = ip
+	data.SystemTailscaleName = name
+	data.DualConnection = running && sameNetwork && data.Connected
+
+	// Worker status
+	ccWorkerMu.Lock()
+	data.WorkerRunning = ccWorkerRunning
+	data.WorkerQueue = ccWorkerQueue
+	ccWorkerMu.Unlock()
+
 	return data, nil
 }
 
@@ -232,5 +327,316 @@ func ccStopService(name string) error {
 	}
 
 	return fmt.Errorf("service not found: %s", name)
+}
+
+// ccAddService adds a new service to the manifest and extracts its compose file
+func ccAddService(name string) error {
+	// Find or create config directory
+	_, configDir, err := findOrCreateManifest()
+	if err != nil {
+		return fmt.Errorf("failed to get config directory: %w", err)
+	}
+
+	// Ensure compose file exists
+	if err := ensureComposeFile(configDir, name); err != nil {
+		return err
+	}
+
+	// Add to manifest
+	if err := addServiceToManifest(configDir, name); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ccGetConfiguredServices returns the list of services already configured in the manifest
+func ccGetConfiguredServices() []string {
+	manifest, _, err := findAndReadManifest()
+	if err != nil {
+		return nil
+	}
+
+	var configured []string
+	for _, svc := range manifest.Services {
+		configured = append(configured, svc.Name)
+	}
+	return configured
+}
+
+// ccStartDeviceAuthFlow starts the device authorization flow and returns the config
+func ccStartDeviceAuthFlow() (*controlcenter.DeviceAuthConfig, error) {
+	client := nexus.NewDeviceAuthClient(authServiceURL)
+
+	resp, err := client.StartFlow(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &controlcenter.DeviceAuthConfig{
+		UserCode:        resp.UserCode,
+		VerificationURI: resp.VerificationURI,
+		DeviceCode:      resp.DeviceCode,
+		ExpiresIn:       resp.ExpiresIn,
+		Interval:        resp.Interval,
+	}, nil
+}
+
+// ccPollDeviceAuthToken polls for device authorization token (single check)
+func ccPollDeviceAuthToken(deviceCode string, interval int) (string, error) {
+	client := nexus.NewDeviceAuthClient(authServiceURL)
+
+	// Use checkToken for single poll (not blocking PollForToken)
+	token, err := client.CheckToken(deviceCode)
+	if err != nil {
+		return "", err
+	}
+	if token == nil || token.Authkey == "" {
+		return "", fmt.Errorf("authorization_pending")
+	}
+
+	// Save the device config including user info when auth succeeds
+	if token.DeviceAPIToken != "" || token.UserEmail != "" {
+		if err := saveDeviceConfigToFile(token); err != nil {
+			// Log but don't fail - we have the authkey
+			Debug("failed to save device config: %v", err)
+		}
+	}
+
+	return token.Authkey, nil
+}
+
+// ccConnectWithAuthkey connects to the network using an authkey
+func ccConnectWithAuthkey(authkey string) error {
+	// Get node name from manifest or hostname
+	nodeName := ""
+	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
+		nodeName = manifest.Node.Name
+	}
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	config := network.ServerConfig{
+		Hostname:   nodeName,
+		ControlURL: nexusURL,
+		AuthKey:    authkey,
+	}
+
+	_, err := network.Connect(ctx, config)
+	return err
+}
+
+// ccDisconnect disconnects from the network
+func ccDisconnect() error {
+	return network.Logout()
+}
+
+// ccWorkerIsRunning returns true if the worker is running
+func ccWorkerIsRunning() bool {
+	ccWorkerMu.Lock()
+	defer ccWorkerMu.Unlock()
+	return ccWorkerRunning
+}
+
+// ccStartWorker starts the worker in the background
+func ccStartWorker(activityFn func(level, msg string)) error {
+	ccWorkerMu.Lock()
+	if ccWorkerRunning {
+		ccWorkerMu.Unlock()
+		return fmt.Errorf("worker is already running")
+	}
+	ccActivityFn = activityFn
+	ccWorkerMu.Unlock()
+
+	// Create a cancellable context for the worker
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ccWorkerMu.Lock()
+	ccWorkerCancel = cancel
+	ccWorkerMu.Unlock()
+
+	// Start worker in goroutine
+	go func() {
+		defer func() {
+			ccWorkerMu.Lock()
+			ccWorkerRunning = false
+			ccWorkerQueue = ""
+			ccWorkerMu.Unlock()
+		}()
+
+		if err := runTUIWorker(ctx, activityFn); err != nil {
+			if err != context.Canceled && activityFn != nil {
+				activityFn("error", fmt.Sprintf("Worker error: %v", err))
+			}
+		}
+	}()
+
+	ccWorkerMu.Lock()
+	ccWorkerRunning = true
+	ccWorkerMu.Unlock()
+
+	return nil
+}
+
+// ccStopWorker stops the running worker
+func ccStopWorker() error {
+	ccWorkerMu.Lock()
+	defer ccWorkerMu.Unlock()
+
+	if !ccWorkerRunning {
+		return fmt.Errorf("worker is not running")
+	}
+
+	if ccWorkerCancel != nil {
+		ccWorkerCancel()
+		ccWorkerCancel = nil
+	}
+
+	return nil
+}
+
+// runTUIWorker runs the worker for the TUI (simplified version of runWork)
+func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
+	activity := func(level, msg string) {
+		if activityFn != nil {
+			activityFn(level, msg)
+		}
+	}
+
+	// Load device config from file
+	deviceConfig := getDeviceConfigFromFile()
+
+	// Determine job source mode
+	var source worker.JobSource
+	var streamFactory func(jobID string) worker.StreamWriter
+
+	if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		// API mode
+		apiBaseURL := deviceConfig.APIBaseURL
+		if apiBaseURL == "" {
+			apiBaseURL = authServiceURL
+		}
+
+		apiSource := worker.NewAPISource(worker.APISourceConfig{
+			BaseURL:       apiBaseURL,
+			Token:         deviceConfig.DeviceAPIToken,
+			QueueName:     "",
+			ConsumerGroup: "",
+			BlockMs:       5000,
+			MaxAttempts:   3,
+		})
+
+		if err := apiSource.Connect(ctx); err != nil {
+			return fmt.Errorf("failed to connect to Redis API: %w", err)
+		}
+
+		// Enable WebSocket for real-time pub/sub
+		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
+			activity("warning", "WebSocket not available, using HTTP")
+		}
+
+		source = apiSource
+		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
+
+		activity("info", "Worker mode: API (secure)")
+
+		ccWorkerMu.Lock()
+		ccWorkerQueue = "api"
+		ccWorkerMu.Unlock()
+	} else if deviceConfig != nil && deviceConfig.RedisURL != "" {
+		// Direct Redis mode
+		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
+			URL:           deviceConfig.RedisURL,
+			Password:      "",
+			QueueName:     "",
+			ConsumerGroup: "",
+			BlockMs:       5000,
+			MaxAttempts:   3,
+		})
+		source = redisSource
+		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+
+		activity("info", "Worker mode: Direct Redis")
+
+		ccWorkerMu.Lock()
+		ccWorkerQueue = "redis"
+		ccWorkerMu.Unlock()
+	} else {
+		return fmt.Errorf("no job source configured (run 'citadel init' first)")
+	}
+
+	// Get node name
+	nodeName := ""
+	if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
+		nodeName = netStatus.Hostname
+	} else {
+		nodeName, _ = os.Hostname()
+	}
+
+	// Create status collector for heartbeat
+	collector := status.NewCollector(status.CollectorConfig{
+		NodeName:  nodeName,
+		ConfigDir: "",
+		Services:  nil,
+	})
+
+	// Start heartbeat publisher if we have API mode
+	if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		orgID := ""
+		if deviceConfig.OrgID != "" {
+			orgID = deviceConfig.OrgID
+		} else if manifest, _, err := findAndReadManifest(); err == nil {
+			orgID = manifest.Node.OrgID
+		}
+
+		if orgID != "" {
+			if apiSource, ok := source.(*worker.APISource); ok {
+				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
+					Client:    apiSource.Client(),
+					NodeID:    nodeName,
+					OrgID:     orgID,
+					DebugFunc: nil,
+				}, collector)
+				if err == nil {
+					go func() {
+						activity("info", "Heartbeat publishing started")
+						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+							activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
+						}
+					}()
+				}
+			}
+		}
+	}
+
+	// Create worker ID
+	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])
+
+	// Create handlers
+	handlers := worker.CreateLegacyHandlers()
+
+	// Create runner with TUI callbacks
+	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
+		WorkerID:   workerID,
+		Verbose:    false,
+		ActivityFn: activity, // Route logs through TUI
+		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+			// Job recording callback - could be extended to pass to TUI
+			// For now, the activity log covers job status
+		},
+	})
+
+	if streamFactory != nil {
+		runner.WithStreamWriterFactory(streamFactory)
+	}
+
+	activity("success", "Worker started, listening for jobs...")
+
+	// Run the worker (blocks until context is cancelled)
+	return runner.Run(ctx)
 }
 
