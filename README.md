@@ -146,16 +146,59 @@ go build -o citadel.exe ./cmd/citadel
 
 See [**WINDOWS_DEVELOPMENT.md**](WINDOWS_DEVELOPMENT.md) for detailed Windows development setup instructions.
 
+## Updating
+
+Citadel includes built-in auto-update detection. When running `citadel work`, it checks for updates once per day and notifies you if a new version is available.
+
+### Update Methods by Installation Type
+
+| Installation Method | Update Command |
+|---------------------|----------------|
+| One-line installer | `citadel update install` |
+| Homebrew | `brew upgrade citadel` |
+| Go install | `go install github.com/aceteam-ai/citadel-cli/cmd/citadel@latest` |
+| Manual download | Download new release from GitHub |
+
+### Built-in Update Commands
+
+```bash
+# Check for updates
+citadel update check
+
+# Download and install the latest version
+citadel update install
+
+# Show update status and versions
+citadel update status
+
+# Restore previous version if update fails
+citadel update rollback
+
+# Enable/disable auto-update checks
+citadel update enable
+citadel update disable
+```
+
+The built-in updater:
+- Downloads from GitHub releases
+- Verifies SHA256 checksum before installing
+- Backs up the current version for rollback
+- Validates the new binary before completing
+- Auto-rolls back if the new binary fails to start
+
 ## Releasing (For Maintainers)
 
-The `release.sh` script automates the complete release process:
+**Always use `release.sh`** to create releases. Do not manually create tags or GitHub releases.
 
 ```bash
 # Interactive mode - prompts for version
 ./release.sh
 
 # Non-interactive mode - specify version
-./release.sh v1.2.0
+./release.sh -v v1.2.0 -y
+
+# Dry run to preview what will happen
+./release.sh --dry-run -v v1.2.0
 ```
 
 ### Release Process
@@ -172,13 +215,17 @@ The script will:
    - Push the tag to the remote repository
 
 3. **Build Artifacts**
-   - Run `build.sh` to create binaries for Linux (amd64 and arm64)
+   - Run `build.sh` to create binaries for all platforms (linux/darwin/windows, amd64/arm64)
    - Generate SHA256 checksums
 
 4. **Create GitHub Release**
    - Generate release notes from commits since the last tag
    - Upload binaries and checksums to GitHub Releases
    - Display the release URL
+
+5. **Update Homebrew Tap**
+   - Automatically updates the `aceteam-ai/homebrew-tap` formula
+   - Commits new version and SHA256 checksums
 
 ### Version Numbering
 
@@ -190,23 +237,27 @@ Follow semantic versioning (semver):
 
 ### Manual Release Process
 
-If you need to release manually without the script:
+> **Note:** Manual releases will NOT update the Homebrew tap. Always prefer `release.sh`.
+
+If you absolutely must release manually:
 
 ```bash
 # 1. Create and push tag
-git tag v1.2.0
+git tag -a v1.2.0 -m "v1.2.0"
 git push origin v1.2.0
 
-# 2. Build artifacts
-./build.sh
+# 2. Build artifacts for all platforms
+./build.sh --all
 
 # 3. Create GitHub release
 gh release create v1.2.0 \
   --title "v1.2.0" \
   --notes "Release notes here" \
-  release/citadel_v1.2.0_linux_amd64.tar.gz \
-  release/citadel_v1.2.0_linux_arm64.tar.gz \
+  release/citadel_v1.2.0_*.tar.gz \
+  release/citadel_v1.2.0_*.zip \
   release/checksums.txt
+
+# 4. Manually update Homebrew tap (aceteam-ai/homebrew-tap)
 ```
 
 ## Command Reference
