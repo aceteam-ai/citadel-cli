@@ -141,6 +141,16 @@ func GetGlobalStatus(ctx context.Context) (*NetworkStatus, error) {
 	return s.Status(ctx)
 }
 
+// KeepAlive triggers network activity to keep Headscale's lastSeen fresh.
+// Safe to call even if not connected (returns nil).
+func KeepAlive(ctx context.Context) error {
+	s := Global()
+	if s == nil {
+		return nil
+	}
+	return s.KeepAlive(ctx)
+}
+
 // GetGlobalPeers returns the list of peers from the global server.
 func GetGlobalPeers(ctx context.Context) ([]PeerInfo, error) {
 	s := Global()

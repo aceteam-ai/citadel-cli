@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/redis/go-redis/v9"
 )
@@ -57,6 +58,9 @@ type RedisPublisher struct {
 
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
+
+	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
+	heartbeatCount int
 }
 
 // RedisPublisherConfig holds configuration for the Redis status publisher.
@@ -167,6 +171,13 @@ func (p *RedisPublisher) Start(ctx context.Context) error {
 		case <-ticker.C:
 			if err := p.publishStatus(ctx); err != nil {
 				fmt.Printf("   - Warning: Redis status publish failed: %v\n", err)
+			}
+			// Trigger network keep-alive every 60s (every 2nd heartbeat at 30s interval)
+			p.heartbeatCount++
+			if p.heartbeatCount%2 == 0 {
+				if err := network.KeepAlive(ctx); err != nil {
+					p.debug("network keep-alive failed: %v", err)
+				}
 			}
 		}
 	}

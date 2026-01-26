@@ -351,6 +351,29 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 	}, nil
 }
 
+// KeepAlive triggers Tailscale control plane activity to keep Headscale's lastSeen fresh.
+// Should be called periodically (every 60s). Safe to call when not connected.
+func (s *NetworkServer) KeepAlive(ctx context.Context) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.srv == nil {
+		return nil // Not connected, nothing to do
+	}
+
+	lc, err := s.srv.LocalClient()
+	if err != nil {
+		return fmt.Errorf("failed to get local client: %w", err)
+	}
+
+	_, err = lc.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to refresh status: %w", err)
+	}
+
+	return nil
+}
+
 // NetworkStatus represents the current network connection status.
 type NetworkStatus struct {
 	Connected    bool   `json:"connected"`
