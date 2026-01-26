@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
 )
@@ -102,12 +103,13 @@ func init() {
 }
 
 func checkForUpdate() {
-	fmt.Println("Checking for updates...")
+	spinner := whimsy.NewSimpleSpinner(whimsy.ProcessingMessages)
+	spinner.Start()
 
 	client := update.NewClient(Version)
 	release, err := client.CheckForUpdate()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
+		spinner.StopWithError(fmt.Sprintf("Error checking for updates: %v", err))
 		os.Exit(1)
 	}
 
@@ -117,10 +119,11 @@ func checkForUpdate() {
 	_ = update.SaveState(state)
 
 	if release == nil {
-		fmt.Printf("You are running the latest version (%s)\n", Version)
+		spinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", Version))
 		return
 	}
 
+	spinner.Stop()
 	fmt.Printf("\nUpdate available: %s -> %s\n", Version, release.TagName)
 	fmt.Printf("Release: %s\n", release.Name)
 	fmt.Printf("URL: %s\n", release.HTMLURL)
@@ -128,36 +131,42 @@ func checkForUpdate() {
 }
 
 func installUpdate() {
-	fmt.Println("Checking for updates...")
+	// Check for updates
+	checkSpinner := whimsy.NewSimpleSpinner(whimsy.ProcessingMessages)
+	checkSpinner.Start()
 
 	client := update.NewClient(Version)
 	release, err := client.CheckForUpdate()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
+		checkSpinner.StopWithError(fmt.Sprintf("Error checking for updates: %v", err))
 		os.Exit(1)
 	}
 
 	if release == nil {
-		fmt.Printf("You are running the latest version (%s)\n", Version)
+		checkSpinner.StopWithSuccess(fmt.Sprintf("You are running the latest version (%s)", Version))
 		return
 	}
 
-	fmt.Printf("\nUpdate available: %s -> %s\n", Version, release.TagName)
-	fmt.Printf("Downloading and verifying...\n")
+	checkSpinner.StopWithSuccess(fmt.Sprintf("Update available: %s -> %s", Version, release.TagName))
 
-	// Download to pending path
+	// Download update
+	dlSpinner := whimsy.NewSimpleSpinner(whimsy.DownloadMessages)
+	dlSpinner.Start()
+
 	pendingPath := update.GetPendingBinaryPath()
 	if err := client.DownloadAndVerify(release, pendingPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error downloading update: %v\n", err)
+		dlSpinner.StopWithError(fmt.Sprintf("Error downloading update: %v", err))
 		os.Exit(1)
 	}
 
-	fmt.Println("Checksum verified.")
-	fmt.Println("Installing update...")
+	dlSpinner.StopWithSuccess("Downloaded and verified checksum")
 
-	// Apply the update (includes backup and validation)
+	// Install update
+	installSpinner := whimsy.NewSimpleSpinner(whimsy.ProvisioningMessages)
+	installSpinner.Start()
+
 	if err := update.ApplyUpdate(pendingPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error installing update: %v\n", err)
+		installSpinner.StopWithError(fmt.Sprintf("Error installing update: %v", err))
 		os.Exit(1)
 	}
 
@@ -167,7 +176,7 @@ func installUpdate() {
 	update.UpdateLastCheck(state)
 	_ = update.SaveState(state)
 
-	fmt.Printf("\nSuccessfully updated to %s\n", release.TagName)
+	installSpinner.StopWithSuccess(fmt.Sprintf("Successfully updated to %s", release.TagName))
 	fmt.Println("Previous version saved for rollback.")
 	fmt.Println("\nRun 'citadel version' to verify.")
 }

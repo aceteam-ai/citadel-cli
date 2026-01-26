@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -28,6 +29,7 @@ var cfgFile string
 var nexusURL string
 var authServiceURL string
 var debugMode bool
+var daemonMode bool
 
 // logFile is the file handle for logging
 var logFile *os.File
@@ -102,8 +104,24 @@ var rootCmd = &cobra.Command{
 	Use:   "citadel",
 	Short: "Citadel is the agent for the AceTeam Sovereign Compute Fabric",
 	Long: `A self-contained agent and CLI for connecting your hardware
-to the AceTeam control plane, making your resources available to your private workflows.`,
+to the AceTeam control plane, making your resources available to your private workflows.
+
+When run without a subcommand, Citadel starts interactive mode with slash commands.
+Use 'citadel help' to see all available commands.`,
 	Version: Version,
+	Run: func(cmd *cobra.Command, args []string) {
+		// Default behavior: launch control center if TTY, otherwise show help
+		if daemonMode {
+			// TODO: Run in daemon mode (background worker)
+			fmt.Println("Daemon mode not yet implemented. Use 'citadel work' for now.")
+			return
+		}
+		if tui.IsTTY() {
+			runControlCenter()
+		} else {
+			cmd.Help()
+		}
+	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// Always log the command (Log() handles console output based on --debug)
 		fullCmd := "citadel"
@@ -151,6 +169,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
+	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.

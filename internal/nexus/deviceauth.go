@@ -156,7 +156,7 @@ func (c *DeviceAuthClient) PollForToken(deviceCode string, interval int) (*Token
 
 	for time.Since(startTime) < timeout {
 		// Make token request
-		token, err := c.checkToken(deviceCode)
+		token, err := c.CheckToken(deviceCode)
 
 		// Success case
 		if token != nil && token.Authkey != "" {
@@ -194,8 +194,9 @@ func (c *DeviceAuthClient) PollForToken(deviceCode string, interval int) (*Token
 	return nil, fmt.Errorf("authentication timeout after 10 minutes")
 }
 
-// checkToken makes a single request to the /token endpoint
-func (c *DeviceAuthClient) checkToken(deviceCode string) (*TokenResponse, error) {
+// CheckToken makes a single request to the /token endpoint.
+// This is useful for non-blocking polling in UIs.
+func (c *DeviceAuthClient) CheckToken(deviceCode string) (*TokenResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/token"
 
 	// Create request body

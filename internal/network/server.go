@@ -29,6 +29,12 @@ type NetworkServer struct {
 	connected bool
 }
 
+// SuppressLogs disables all tsnet/tailscale log output.
+// Call this before starting a TUI to prevent log messages from corrupting the display.
+func SuppressLogs() {
+	log.SetOutput(io.Discard)
+}
+
 // ServerConfig holds configuration for creating a NetworkServer.
 type ServerConfig struct {
 	// Hostname is the name this node will have on the network

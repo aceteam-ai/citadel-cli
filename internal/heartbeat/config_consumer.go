@@ -35,6 +35,7 @@ type ConfigConsumer struct {
 	consumerGroup string
 	blockMs       int
 	configHandler *jobs.ConfigHandler
+	activityFn    func(level, msg string)
 }
 
 // ConfigConsumerConfig holds configuration for the ConfigConsumer.
@@ -80,6 +81,22 @@ func NewConfigConsumer(cfg ConfigConsumerConfig) (*ConfigConsumer, error) {
 	}, nil
 }
 
+// SetActivityFn sets a callback for log messages (for TUI integration).
+// If not set, messages are printed to stdout.
+func (c *ConfigConsumer) SetActivityFn(fn func(level, msg string)) {
+	c.activityFn = fn
+}
+
+// log outputs a message - uses activity callback if set, otherwise prints to stdout
+func (c *ConfigConsumer) log(level, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if c.activityFn != nil {
+		c.activityFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
+}
+
 // Start begins consuming config jobs from Redis.
 // This method blocks until the context is cancelled.
 func (c *ConfigConsumer) Start(ctx context.Context) error {
@@ -108,7 +125,7 @@ func (c *ConfigConsumer) Start(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				fmt.Printf("   - ⚠️ Config consumer read error: %v (retry in %s)\n", err, backoff)
+				c.log("warning", "Config consumer read error: %v (retry in %s)", err, backoff)
 				select {
 				case <-time.After(backoff):
 				case <-ctx.Done():
