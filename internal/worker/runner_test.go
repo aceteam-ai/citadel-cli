@@ -340,3 +340,288 @@ func TestNoOpStreamWriter(t *testing.T) {
 		t.Errorf("WriteError error = %v, want nil", err)
 	}
 }
+
+// TestRunnerActivityCallback tests that the activity callback is invoked during job processing
+func TestRunnerActivityCallback(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+	handlers := []JobHandler{handler}
+
+	// Track activity messages
+	var activityMessages []struct {
+		level string
+		msg   string
+	}
+	var activityMu sync.Mutex
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, struct {
+				level string
+				msg   string
+			}{level, msg})
+			activityMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	// Check that activity callback was called
+	activityMu.Lock()
+	msgCount := len(activityMessages)
+	activityMu.Unlock()
+
+	if msgCount == 0 {
+		t.Error("Activity callback was not called")
+	}
+
+	// Check that we have at least the expected message types
+	hasInfoMessage := false
+	hasSuccessMessage := false
+
+	activityMu.Lock()
+	for _, m := range activityMessages {
+		if m.level == "info" {
+			hasInfoMessage = true
+		}
+		if m.level == "success" {
+			hasSuccessMessage = true
+		}
+	}
+	activityMu.Unlock()
+
+	if !hasInfoMessage {
+		t.Error("Expected at least one 'info' level activity message")
+	}
+	if !hasSuccessMessage {
+		t.Error("Expected at least one 'success' level activity message for completed job")
+	}
+}
+
+// TestRunnerJobRecordCallback tests that the job record callback is invoked on job completion
+func TestRunnerJobRecordCallback(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+		{ID: "job-2", Type: "FAIL_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	successHandler := NewMockJobHandler("TEST_JOB", false)
+	failHandler := NewMockJobHandler("FAIL_JOB", true)
+	handlers := []JobHandler{successHandler, failHandler}
+
+	// Track job records
+	var jobRecords []struct {
+		id        string
+		jobType   string
+		status    string
+		started   time.Time
+		completed time.Time
+		err       error
+	}
+	var recordMu sync.Mutex
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+			recordMu.Lock()
+			jobRecords = append(jobRecords, struct {
+				id        string
+				jobType   string
+				status    string
+				started   time.Time
+				completed time.Time
+				err       error
+			}{id, jobType, status, started, completed, err})
+			recordMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	// Check that job records were created
+	recordMu.Lock()
+	recordCount := len(jobRecords)
+	recordMu.Unlock()
+
+	if recordCount != 2 {
+		t.Errorf("Expected 2 job records, got %d", recordCount)
+	}
+
+	// Check success record
+	recordMu.Lock()
+	var successRecord, failRecord struct {
+		id        string
+		jobType   string
+		status    string
+		started   time.Time
+		completed time.Time
+		err       error
+	}
+	for _, r := range jobRecords {
+		if r.id == "job-1" {
+			successRecord = r
+		}
+		if r.id == "job-2" {
+			failRecord = r
+		}
+	}
+	recordMu.Unlock()
+
+	if successRecord.status != "success" {
+		t.Errorf("Success job status = %s, want success", successRecord.status)
+	}
+	if successRecord.err != nil {
+		t.Errorf("Success job error = %v, want nil", successRecord.err)
+	}
+	if successRecord.started.IsZero() {
+		t.Error("Success job started time should not be zero")
+	}
+	if successRecord.completed.IsZero() {
+		t.Error("Success job completed time should not be zero")
+	}
+
+	// Check failed record
+	if failRecord.status != "failed" {
+		t.Errorf("Failed job status = %s, want failed", failRecord.status)
+	}
+	if failRecord.err == nil {
+		t.Error("Failed job error should not be nil")
+	}
+}
+
+// TestRunnerActivityCallbackOnError tests that activity callback logs errors
+func TestRunnerActivityCallbackOnError(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "UNKNOWN_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("OTHER_JOB", false) // Doesn't handle UNKNOWN_JOB
+	handlers := []JobHandler{handler}
+
+	var hasErrorMessage bool
+	var messageMu sync.Mutex
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		ActivityFn: func(level, msg string) {
+			if level == "error" {
+				messageMu.Lock()
+				hasErrorMessage = true
+				messageMu.Unlock()
+			}
+		},
+	}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	messageMu.Lock()
+	hadError := hasErrorMessage
+	messageMu.Unlock()
+
+	if !hadError {
+		t.Error("Expected error activity message when no handler found")
+	}
+}
+
+// TestRunnerConfigActivityFnSetOnNew tests that ActivityFn is set from config
+func TestRunnerConfigActivityFnSetOnNew(t *testing.T) {
+	source := NewMockJobSource("test", nil)
+
+	activityCalled := false
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		ActivityFn: func(level, msg string) {
+			activityCalled = true
+		},
+	}
+
+	runner := NewRunner(source, nil, config)
+
+	if runner.activityFn == nil {
+		t.Error("activityFn should be set from config")
+	}
+
+	// Verify the function is the one we passed
+	runner.activityFn("info", "test")
+	if !activityCalled {
+		t.Error("activityFn should invoke our callback")
+	}
+}
+
+// TestRunnerConfigJobRecordFnSetOnNew tests that JobRecordFn is set from config
+func TestRunnerConfigJobRecordFnSetOnNew(t *testing.T) {
+	source := NewMockJobSource("test", nil)
+
+	recordCalled := false
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+			recordCalled = true
+		},
+	}
+
+	runner := NewRunner(source, nil, config)
+
+	if runner.jobRecordFn == nil {
+		t.Error("jobRecordFn should be set from config")
+	}
+
+	// Verify the function is the one we passed
+	runner.jobRecordFn("test-id", "test-type", "success", time.Now(), time.Now(), nil)
+	if !recordCalled {
+		t.Error("jobRecordFn should invoke our callback")
+	}
+}
+
+// TestRunnerLogWithoutActivityFn tests log method falls back to stdout when no callback
+func TestRunnerLogWithoutActivityFn(t *testing.T) {
+	source := NewMockJobSource("test", nil)
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		// No ActivityFn set - should use default stdout/stderr
+	}
+
+	runner := NewRunner(source, nil, config)
+
+	// This should not panic even without ActivityFn
+	runner.log("info", "test message %s", "arg")
+	runner.log("error", "error message")
+	runner.log("warning", "warning message")
+}
+
+// TestRunnerRecordJobWithoutCallback tests recordJob is no-op without callback
+func TestRunnerRecordJobWithoutCallback(t *testing.T) {
+	source := NewMockJobSource("test", nil)
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		// No JobRecordFn set
+	}
+
+	runner := NewRunner(source, nil, config)
+
+	// This should not panic even without JobRecordFn
+	runner.recordJob("test-id", "test-type", "success", time.Now(), time.Now(), nil)
+}
