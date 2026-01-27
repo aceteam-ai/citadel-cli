@@ -159,29 +159,35 @@ Use 'citadel help' to see all available commands.`,
 	},
 }
 
-// checkForUpdateOnStartup performs a quick update check on any command.
-// Only checks once per day (respects ShouldCheck) and has a short timeout.
-// Runs synchronously but fast - adds ~0-2s on first daily command.
+// checkForUpdateOnStartup shows cached update notification and triggers background check.
+// Non-blocking: shows cached result immediately, runs network check in background.
 func checkForUpdateOnStartup() {
 	state, err := update.LoadState()
-	if err != nil || !update.ShouldCheck(state) {
+	if err != nil {
 		return
 	}
 
-	// Use a short timeout client for startup checks
-	client := update.NewClientWithTimeout(Version, 3*time.Second)
-	release, err := client.CheckForUpdate()
-
-	// Update last check time regardless of result
-	update.UpdateLastCheck(state)
-	_ = update.SaveState(state)
-
-	if err != nil || release == nil {
-		return
+	// Show cached update notification immediately (no network call)
+	if state.AvailableUpdate != "" && state.AvailableUpdate != Version {
+		fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
 	}
 
-	// Notify user about available update
-	fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, release.TagName)
+	// Run background check if needed (non-blocking)
+	if update.ShouldCheck(state) {
+		go func() {
+			client := update.NewClientWithTimeout(Version, 5*time.Second)
+			release, err := client.CheckForUpdate()
+
+			// Update state regardless of result
+			update.UpdateLastCheck(state)
+			if err == nil && release != nil {
+				state.AvailableUpdate = release.TagName
+			} else if err == nil {
+				state.AvailableUpdate = "" // Clear if on latest
+			}
+			_ = update.SaveState(state)
+		}()
+	}
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
