@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -143,7 +144,50 @@ Use 'citadel help' to see all available commands.`,
 			fullCmd += " " + strings.Join(args, " ")
 		}
 		Log("command: %s", fullCmd)
+
+		// Check for updates (skip for update/version/help commands)
+		cmdName := cmd.Name()
+		parentName := ""
+		if cmd.Parent() != nil {
+			parentName = cmd.Parent().Name()
+		}
+		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
+			cmdName == "version" || cmdName == "help"
+		if !skipUpdateCheck {
+			checkForUpdateOnStartup()
+		}
 	},
+}
+
+// checkForUpdateOnStartup shows cached update notification and triggers background check.
+// Non-blocking: shows cached result immediately, runs network check in background.
+func checkForUpdateOnStartup() {
+	state, err := update.LoadState()
+	if err != nil {
+		return
+	}
+
+	// Show cached update notification immediately (no network call)
+	if state.AvailableUpdate != "" && state.AvailableUpdate != Version {
+		fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
+	}
+
+	// Run background check if needed (non-blocking)
+	if update.ShouldCheck(state) {
+		go func() {
+			client := update.NewClientWithTimeout(Version, 5*time.Second)
+			release, err := client.CheckForUpdate()
+
+			// Update state regardless of result
+			update.UpdateLastCheck(state)
+			if err == nil && release != nil {
+				state.AvailableUpdate = release.TagName
+			} else if err == nil {
+				state.AvailableUpdate = "" // Clear if on latest
+			}
+			_ = update.SaveState(state)
+		}()
+	}
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

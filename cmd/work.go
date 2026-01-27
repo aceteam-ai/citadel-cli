@@ -107,10 +107,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		cancel()
 	}()
 
-	// Check for updates in background (unless --no-update is set)
-	if !workNoUpdate {
-		go CheckForUpdateInBackground()
-	}
+	// Note: Update check is now handled by root.go's PersistentPreRun
 
 	// Auto-start services from manifest (unless --no-services is set)
 	if !workNoServices {
@@ -686,6 +683,7 @@ func init() {
 	// Service auto-start flags
 	workCmd.Flags().BoolVar(&workNoServices, "no-services", false, "Skip auto-starting services from manifest")
 
-	// Update check flags
-	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "Skip checking for updates on startup")
+	// Update check flags (deprecated - update check now runs on all commands via root.go)
+	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
+	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 }

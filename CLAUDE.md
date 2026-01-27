@@ -53,6 +53,27 @@ If you find yourself about to run `git push origin main`, STOP and create a bran
 go build -o citadel .
 ```
 
+### Releasing
+
+**Always use `release.sh` to create releases.** Do not manually create tags or GitHub releases.
+
+```bash
+# Interactive release
+./release.sh
+
+# Non-interactive with version
+./release.sh -v v1.2.0 -y
+
+# Dry run to preview
+./release.sh --dry-run -v v1.2.0
+```
+
+The release script handles:
+1. Creating and pushing the git tag
+2. Building artifacts for all platforms
+3. Creating the GitHub release with binaries
+4. **Updating the Homebrew tap** (aceteam-ai/homebrew-tap)
+
 ### Testing
 ```bash
 # Run all tests

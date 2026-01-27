@@ -14,6 +14,7 @@ import (
 type State struct {
 	CurrentVersion  string    `json:"current_version"`
 	PreviousVersion string    `json:"previous_version,omitempty"`
+	AvailableUpdate string    `json:"available_update,omitempty"` // Cached latest version for instant notification
 	LastCheck       time.Time `json:"last_check"`
 	LastUpdate      time.Time `json:"last_update,omitzero"`
 	AutoUpdate      bool      `json:"auto_update"`
