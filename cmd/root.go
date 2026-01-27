@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -143,7 +144,44 @@ Use 'citadel help' to see all available commands.`,
 			fullCmd += " " + strings.Join(args, " ")
 		}
 		Log("command: %s", fullCmd)
+
+		// Check for updates (skip for update/version/help commands)
+		cmdName := cmd.Name()
+		parentName := ""
+		if cmd.Parent() != nil {
+			parentName = cmd.Parent().Name()
+		}
+		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
+			cmdName == "version" || cmdName == "help"
+		if !skipUpdateCheck {
+			checkForUpdateOnStartup()
+		}
 	},
+}
+
+// checkForUpdateOnStartup performs a quick update check on any command.
+// Only checks once per day (respects ShouldCheck) and has a short timeout.
+// Runs synchronously but fast - adds ~0-2s on first daily command.
+func checkForUpdateOnStartup() {
+	state, err := update.LoadState()
+	if err != nil || !update.ShouldCheck(state) {
+		return
+	}
+
+	// Use a short timeout client for startup checks
+	client := update.NewClientWithTimeout(Version, 3*time.Second)
+	release, err := client.CheckForUpdate()
+
+	// Update last check time regardless of result
+	update.UpdateLastCheck(state)
+	_ = update.SaveState(state)
+
+	if err != nil || release == nil {
+		return
+	}
+
+	// Notify user about available update
+	fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, release.TagName)
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.

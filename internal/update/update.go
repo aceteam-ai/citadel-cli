@@ -56,13 +56,18 @@ type Client struct {
 	httpClient     *http.Client
 }
 
-// NewClient creates a new update client
+// NewClient creates a new update client with default timeout (30s)
 func NewClient(currentVersion string) *Client {
+	return NewClientWithTimeout(currentVersion, 30*time.Second)
+}
+
+// NewClientWithTimeout creates a new update client with a custom timeout
+func NewClientWithTimeout(currentVersion string, timeout time.Duration) *Client {
 	return &Client{
 		CurrentVersion: currentVersion,
 		Channel:        "stable",
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
