@@ -1,0 +1,92 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-ssh - SSH to another node on the AceTeam Network
+
+
+.SH SYNOPSIS
+\fBcitadel ssh [peer] [flags]\fP
+
+
+.SH DESCRIPTION
+Establishes an SSH connection to another node on the AceTeam Network.
+
+.PP
+PEER IDENTIFICATION:
+  You can specify the peer in multiple ways:
+  - By hostname:  citadel ssh gpu-node-1
+  - By IP:        citadel ssh 100.64.0.25
+  - Interactive:  citadel ssh  (shows a list of online peers to choose from)
+
+.PP
+HOW IT WORKS:
+  This command tunnels SSH through the AceTeam Network's secure mesh.
+  It works even when system tools (ping, ssh) can't reach the peer directly,
+  because it uses the internal tsnet userspace network.
+
+.PP
+REQUIREMENTS:
+  - Both machines must be registered to the same AceTeam Network
+  - The target peer must have SSH enabled (port 22 or custom port)
+  - You must have valid SSH credentials for the target machine
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for ssh
+
+.PP
+\fB-p\fP, \fB--port\fP=""
+	SSH port (defaults to 22)
+
+.PP
+\fB-u\fP, \fB--user\fP=""
+	SSH username (defaults to current user)
+
+.PP
+\fB-v\fP, \fB--verbose\fP[=false]
+	Enable verbose SSH output
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH EXAMPLE
+.EX
+  # Interactive mode - select from available peers
+  citadel ssh
+
+  # Connect by hostname
+  citadel ssh gpu-node-1
+
+  # Connect by network IP address
+  citadel ssh 100.64.0.25
+
+  # Specify SSH username
+  citadel ssh gpu-node-1 -u ubuntu
+
+  # Specify custom SSH port
+  citadel ssh gpu-node-1 -p 2222
+
+  # Combine options
+  citadel ssh gpu-node-1 -u admin -p 2222 -v
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

@@ -1,0 +1,59 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-interactive - Start interactive mode with slash commands
+
+
+.SH SYNOPSIS
+\fBcitadel interactive [flags]\fP
+
+
+.SH DESCRIPTION
+Starts an interactive shell with slash commands for managing your Citadel node.
+
+.PP
+Available commands:
+  /status    - Show node status dashboard
+  /services  - List and manage services
+  /logs      - View service logs
+  /peers     - Show network peers
+  /jobs      - Show job queue status
+  /help      - Show available commands
+  /quit      - Exit interactive mode
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for interactive
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH EXAMPLE
+.EX
+  # Start interactive mode
+  citadel interactive
+
+  # Or use the short alias
+  citadel i
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

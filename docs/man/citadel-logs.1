@@ -1,0 +1,61 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-logs - Fetch the logs of a running service
+
+
+.SH SYNOPSIS
+\fBcitadel logs  [flags]\fP
+
+
+.SH DESCRIPTION
+Streams the logs for a service started with 'citadel run' or defined in citadel.yaml.
+Available services: llamacpp, lmstudio, ollama, vllm
+
+
+.SH OPTIONS
+\fB-f\fP, \fB--follow\fP[=false]
+	Follow log output.
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for logs
+
+.PP
+\fB-t\fP, \fB--tail\fP="100"
+	Number of lines to show from the end of the logs.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH EXAMPLE
+.EX
+  # View last 100 lines of vllm logs
+  citadel logs vllm
+
+  # Follow ollama logs in real-time
+  citadel logs ollama -f
+
+  # View last 50 lines and follow
+  citadel logs llamacpp -f -t 50
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

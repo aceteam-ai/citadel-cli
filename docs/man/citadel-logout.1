@@ -1,0 +1,56 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-logout - Disconnect and deregister this machine from the AceTeam Network
+
+
+.SH SYNOPSIS
+\fBcitadel logout [flags]\fP
+
+
+.SH DESCRIPTION
+Disconnects this machine from your AceTeam network and deregisters it from
+the coordination server. This allows the node to be re-registered under a
+different organization when running 'citadel init' again.
+
+.PP
+By default, logout will:
+  1. Deregister the node from Headscale (allows re-registration to different org)
+  2. Disconnect from the network
+  3. Clear local network state
+
+.PP
+Use --keep-registration to only disconnect locally without deregistering from
+Headscale. This is useful for temporary disconnects where you want to reconnect
+to the same organization later.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for logout
+
+.PP
+\fB--keep-registration\fP[=false]
+	Only disconnect locally, keep node registered in Headscale (for temporary disconnects)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

@@ -1,0 +1,62 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-status - Shows a comprehensive status of the Citadel node
+
+
+.SH SYNOPSIS
+\fBcitadel status [flags]\fP
+
+
+.SH DESCRIPTION
+Provides a full health check and resource overview of the Citadel node.
+It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
+and the state of all managed services.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for status
+
+.PP
+\fB-i\fP, \fB--interactive\fP[=false]
+	Launch interactive dashboard with live updates
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH EXAMPLE
+.EX
+  # View full node status with colors
+  citadel status
+
+  # View status without colors (for scripts/logging)
+  citadel status --no-color
+
+  # Interactive dashboard with live updates
+  citadel status -i
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

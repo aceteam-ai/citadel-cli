@@ -1,0 +1,88 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-terminal-server - Starts the WebSocket terminal server for remote terminal access
+
+
+.SH SYNOPSIS
+\fBcitadel terminal-server [flags]\fP
+
+
+.SH DESCRIPTION
+Starts a WebSocket server that enables browser-based terminal access
+through the AceTeam web application. The server authenticates connections
+using tokens validated against the AceTeam API.
+
+.PP
+The terminal server creates PTY (pseudo-terminal) sessions for each
+authenticated connection, streaming input and output over WebSocket.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for terminal-server
+
+.PP
+\fB--idle-timeout\fP=0
+	Idle timeout in minutes (default: 30)
+
+.PP
+\fB--max-connections\fP=0
+	Maximum concurrent connections (default: 10)
+
+.PP
+\fB--org-id\fP=""
+	Organization ID for token validation (reads from manifest if not provided)
+
+.PP
+\fB--port\fP=0
+	Port to listen on (default: 7860)
+
+.PP
+\fB--shell\fP=""
+	Shell to use for terminal sessions
+
+.PP
+\fB--test\fP[=false]
+	Test mode - accepts any token (for development)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH EXAMPLE
+.EX
+  # Start using org-id from manifest (set during 'citadel init')
+  citadel terminal-server
+
+  # Start with explicit organization ID
+  citadel terminal-server --org-id my-org-id
+
+  # Start on a custom port
+  citadel terminal-server --port 8080
+
+  # Start with custom idle timeout (in minutes)
+  citadel terminal-server --idle-timeout 60
+
+  # Start in test mode (accepts any token, for development)
+  citadel terminal-server --test
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

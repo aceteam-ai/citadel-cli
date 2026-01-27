@@ -1,0 +1,42 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service - Manage Citadel as a system service
+
+
+.SH SYNOPSIS
+\fBcitadel service [flags]\fP
+
+
+.SH DESCRIPTION
+Install, uninstall, start, stop, or check the status of Citadel as a system service.
+
+.PP
+This allows Citadel to run in the background and start automatically on boot.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for service
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-service-install(1)\fP, \fBcitadel-service-start(1)\fP, \fBcitadel-service-status(1)\fP, \fBcitadel-service-stop(1)\fP, \fBcitadel-service-uninstall(1)\fP

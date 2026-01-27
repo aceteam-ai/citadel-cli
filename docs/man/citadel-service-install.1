@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-install - Install Citadel as a system service
+
+
+.SH SYNOPSIS
+\fBcitadel service install [flags]\fP
+
+
+.SH DESCRIPTION
+Install Citadel as a system service that runs in the background.
+
+.PP
+On Linux: Creates a systemd service unit
+On macOS: Creates a launchd plist
+On Windows: Creates a Windows Service
+
+.PP
+The service will start automatically on boot and keep your node connected to the AceTeam Network.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for install
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+
+.SH SEE ALSO
+\fBcitadel-service(1)\fP
