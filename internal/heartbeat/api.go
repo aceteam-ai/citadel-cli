@@ -41,6 +41,9 @@ type APIPublisher struct {
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
 
+	// Log callback (optional, for TUI mode)
+	logFn func(level, msg string)
+
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
 }
@@ -61,6 +64,9 @@ type APIPublisherConfig struct {
 
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc func(format string, args ...any)
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewAPIPublisher creates a new API-based status publisher.
@@ -93,6 +99,7 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 		pubSubChannel: pubSubChannel,
 		streamName:    "node:status:stream",
 		debugFunc:     cfg.DebugFunc,
+		logFn:         cfg.LogFn,
 	}, nil
 }
 
@@ -100,6 +107,16 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 func (p *APIPublisher) debug(format string, args ...any) {
 	if p.debugFunc != nil {
 		p.debugFunc(format, args...)
+	}
+}
+
+// log outputs a message - uses logFn callback if set, otherwise prints to stdout.
+func (p *APIPublisher) log(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if p.logFn != nil {
+		p.logFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
 	}
 }
 
@@ -115,7 +132,7 @@ func (p *APIPublisher) Start(ctx context.Context) error {
 	// Send initial status immediately
 	p.debug("sending initial heartbeat...")
 	if err := p.publishStatus(ctx); err != nil {
-		fmt.Printf("   - Warning: Initial API status publish failed: %v\n", err)
+		p.log("warning", "   - Warning: Initial API status publish failed: %v", err)
 	}
 
 	ticker := time.NewTicker(p.interval)
@@ -128,7 +145,7 @@ func (p *APIPublisher) Start(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := p.publishStatus(ctx); err != nil {
-				fmt.Printf("   - Warning: API status publish failed: %v\n", err)
+				p.log("warning", "   - Warning: API status publish failed: %v", err)
 			}
 			// Trigger network keep-alive every 60s (every 2nd heartbeat at 30s interval)
 			p.heartbeatCount++
@@ -184,7 +201,7 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 	if err := p.client.StreamAdd(ctx, p.streamName, streamFields, 10000); err != nil {
 		// Log but don't fail - pub/sub already succeeded
 		p.debug("heartbeat: stream add failed: %v", err)
-		fmt.Printf("   - Warning: Stream add failed: %v\n", err)
+		p.log("warning", "   - Warning: Stream add failed: %v", err)
 	} else {
 		p.debug("heartbeat: stream add successful")
 	}

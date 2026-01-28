@@ -53,6 +53,9 @@ type RedisSourceConfig struct {
 
 	// MaxAttempts is the maximum retry count before DLQ (default: 3)
 	MaxAttempts int
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewRedisSource creates a new Redis Streams job source.
@@ -80,6 +83,16 @@ func (s *RedisSource) Name() string {
 	return "redis"
 }
 
+// log outputs a message - uses LogFn callback if set, otherwise prints to stdout/stderr.
+func (s *RedisSource) log(level, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if s.config.LogFn != nil {
+		s.config.LogFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
+}
+
 // Connect establishes connection to Redis.
 func (s *RedisSource) Connect(ctx context.Context) error {
 	s.client = redisclient.NewClient(redisclient.ClientConfig{
@@ -99,10 +112,10 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to create consumer group: %w", err)
 	}
 
-	fmt.Printf("   - Redis: %s\n", maskRedisURL(s.config.URL))
-	fmt.Printf("   - Worker ID: %s\n", s.client.WorkerID())
-	fmt.Printf("   - Queue: %s\n", s.client.QueueName())
-	fmt.Printf("   - Consumer group: %s\n", s.config.ConsumerGroup)
+	s.log("info", "   - Redis: %s", maskRedisURL(s.config.URL))
+	s.log("info", "   - Worker ID: %s", s.client.WorkerID())
+	s.log("info", "   - Queue: %s", s.client.QueueName())
+	s.log("info", "   - Consumer group: %s", s.config.ConsumerGroup)
 	return nil
 }
 
@@ -120,10 +133,10 @@ func (s *RedisSource) Next(ctx context.Context) (*Job, error) {
 	// Check delivery count for DLQ handling
 	deliveryCount, _ := s.client.GetDeliveryCount(ctx, redisJob.MessageID)
 	if int(deliveryCount) >= s.client.MaxAttempts() {
-		fmt.Printf("   - Job %s exceeded max attempts (%d), moving to DLQ\n",
+		s.log("warning", "   - Job %s exceeded max attempts (%d), moving to DLQ",
 			redisJob.JobID, s.client.MaxAttempts())
 		if err := s.client.MoveToDLQ(ctx, redisJob, "Exceeded max retry attempts"); err != nil {
-			fmt.Printf("   - Failed to move job to DLQ: %v\n", err)
+			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
 		s.client.AckJob(ctx, redisJob.MessageID)
 		return nil, nil // Return nil to continue to next job

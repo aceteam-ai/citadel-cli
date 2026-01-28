@@ -32,6 +32,9 @@ var authServiceURL string
 var debugMode bool
 var daemonMode bool
 
+// deferredUpdateNotification stores update info when TUI will handle the display
+var deferredUpdateNotification string
+
 // logFile is the file handle for logging
 var logFile *os.File
 var logMu sync.Mutex
@@ -153,15 +156,22 @@ Use 'citadel help' to see all available commands.`,
 		}
 		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
 			cmdName == "version" || cmdName == "help"
+
+		// Detect if we're about to launch TUI control center
+		// In this case, suppress stdout printing and defer to TUI activity log
+		isTUIContext := cmdName == "citadel" && len(args) == 0 && !daemonMode && tui.IsTTY()
+
 		if !skipUpdateCheck {
-			checkForUpdateOnStartup()
+			checkForUpdateOnStartup(isTUIContext)
 		}
 	},
 }
 
 // checkForUpdateOnStartup shows cached update notification and triggers background check.
 // Non-blocking: shows cached result immediately, runs network check in background.
-func checkForUpdateOnStartup() {
+// When silent=true, the notification is stored in deferredUpdateNotification for TUI display
+// instead of printing directly to stdout (which would corrupt the TUI).
+func checkForUpdateOnStartup(silent bool) {
 	state, err := update.LoadState()
 	if err != nil {
 		return
@@ -169,7 +179,13 @@ func checkForUpdateOnStartup() {
 
 	// Show cached update notification immediately (no network call)
 	if state.AvailableUpdate != "" && state.AvailableUpdate != Version {
-		fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
+		if silent {
+			// Store for TUI to display via activity log
+			deferredUpdateNotification = state.AvailableUpdate
+		} else {
+			// Print to stdout for non-TUI commands
+			fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
+		}
 	}
 
 	// Run background check if needed (non-blocking)

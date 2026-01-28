@@ -98,6 +98,11 @@ func runControlCenter() {
 
 	cc := controlcenter.New(cfg)
 
+	// Show deferred update notification in TUI activity log (if any)
+	if deferredUpdateNotification != "" {
+		cc.AddActivity("info", fmt.Sprintf("Update available: %s -> %s (run 'citadel update install')", Version, deferredUpdateNotification))
+	}
+
 	// Set heartbeat callback so worker can update TUI
 	ccHeartbeatFn = cc.UpdateHeartbeat
 
@@ -789,6 +794,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			ConsumerGroup: "",
 			BlockMs:       5000,
 			MaxAttempts:   3,
+			LogFn:         activity, // Route logs through TUI
 		})
 
 		if err := apiSource.Connect(ctx); err != nil {
@@ -817,6 +823,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			ConsumerGroup: "",
 			BlockMs:       5000,
 			MaxAttempts:   3,
+			LogFn:         activity, // Route logs through TUI
 		})
 		source = redisSource
 		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
@@ -861,6 +868,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					NodeID:    nodeName,
 					OrgID:     orgID,
 					DebugFunc: nil,
+					LogFn:     activity, // Route logs through TUI
 				}, collector)
 				if err == nil {
 					go func() {

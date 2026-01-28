@@ -36,6 +36,9 @@ type APISourceConfig struct {
 
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc func(format string, args ...any)
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewAPISource creates a new API-backed job source.
@@ -63,6 +66,16 @@ func (s *APISource) Name() string {
 	return "redis-api"
 }
 
+// log outputs a message - uses LogFn callback if set, otherwise prints to stdout.
+func (s *APISource) log(level, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if s.config.LogFn != nil {
+		s.config.LogFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
+}
+
 // Connect establishes connection to the API.
 func (s *APISource) Connect(ctx context.Context) error {
 	// Skip if already connected
@@ -81,10 +94,10 @@ func (s *APISource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Redis API: %w", err)
 	}
 
-	fmt.Printf("   - API: %s\n", s.config.BaseURL)
-	fmt.Printf("   - Worker ID: %s\n", s.client.WorkerID())
-	fmt.Printf("   - Queue: %s\n", s.config.QueueName)
-	fmt.Printf("   - Consumer group: %s\n", s.config.ConsumerGroup)
+	s.log("info", "   - API: %s", s.config.BaseURL)
+	s.log("info", "   - Worker ID: %s", s.client.WorkerID())
+	s.log("info", "   - Queue: %s", s.config.QueueName)
+	s.log("info", "   - Consumer group: %s", s.config.ConsumerGroup)
 	return nil
 }
 

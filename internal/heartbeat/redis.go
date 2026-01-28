@@ -59,6 +59,9 @@ type RedisPublisher struct {
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
 
+	// Log callback (optional, for TUI mode)
+	logFn func(level, msg string)
+
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
 }
@@ -86,6 +89,9 @@ type RedisPublisherConfig struct {
 
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc func(format string, args ...any)
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewRedisPublisher creates a new Redis status publisher.
@@ -127,6 +133,7 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 		pubSubChannel: pubSubChannel,
 		streamName:    "node:status:stream",
 		debugFunc:     cfg.DebugFunc,
+		logFn:         cfg.LogFn,
 	}, nil
 }
 
@@ -134,6 +141,16 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 func (p *RedisPublisher) debug(format string, args ...any) {
 	if p.debugFunc != nil {
 		p.debugFunc(format, args...)
+	}
+}
+
+// log outputs a message - uses logFn callback if set, otherwise prints to stdout.
+func (p *RedisPublisher) log(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if p.logFn != nil {
+		p.logFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
 	}
 }
 
@@ -157,7 +174,7 @@ func (p *RedisPublisher) Start(ctx context.Context) error {
 	// Send initial status immediately
 	p.debug("sending initial heartbeat...")
 	if err := p.publishStatus(ctx); err != nil {
-		fmt.Printf("   - Warning: Initial Redis status publish failed: %v\n", err)
+		p.log("warning", "   - Warning: Initial Redis status publish failed: %v", err)
 	}
 
 	ticker := time.NewTicker(p.interval)
@@ -170,7 +187,7 @@ func (p *RedisPublisher) Start(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := p.publishStatus(ctx); err != nil {
-				fmt.Printf("   - Warning: Redis status publish failed: %v\n", err)
+				p.log("warning", "   - Warning: Redis status publish failed: %v", err)
 			}
 			// Trigger network keep-alive every 60s (every 2nd heartbeat at 30s interval)
 			p.heartbeatCount++
