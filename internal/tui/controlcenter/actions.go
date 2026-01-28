@@ -18,6 +18,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/recommend"
 )
 
 
@@ -215,7 +216,7 @@ func (cc *ControlCenter) showServiceDetailModal() {
 	cc.app.SetFocus(textView)
 }
 
-// showAddServiceModal shows available services to add (Action 1)
+// showAddServiceModal shows available services to add with recommendations (Action 1)
 func (cc *ControlCenter) showAddServiceModal() {
 	if cc.getServicesFn == nil {
 		cc.AddActivity("error", "Service management not available")
@@ -250,7 +251,35 @@ func (cc *ControlCenter) showAddServiceModal() {
 		return
 	}
 
-	cc.showListModal("Add Service", toAdd, func(selected string) {
+	// Get recommendations for hardware-based sorting
+	recommendations := recommend.GetRecommendations()
+	recMap := make(map[string]recommend.ServiceRecommendation)
+	for _, rec := range recommendations {
+		recMap[rec.Service] = rec
+	}
+
+	// Build display items with recommendations
+	var items []serviceItem
+	for _, svc := range toAdd {
+		item := serviceItem{name: svc}
+		if rec, ok := recMap[svc]; ok {
+			item.recommended = rec.Recommended
+			item.reason = rec.Reason
+		}
+		items = append(items, item)
+	}
+
+	// Sort: recommended first
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if !items[i].recommended && items[j].recommended {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+
+	// Show custom modal with recommendations
+	cc.showServiceListModal(items, func(selected string) {
 		if cc.addServiceFn == nil {
 			cc.AddActivity("error", "Cannot add service: no handler configured")
 			return
@@ -266,6 +295,54 @@ func (cc *ControlCenter) showAddServiceModal() {
 			}
 		}()
 	})
+}
+
+// serviceItem represents a service with recommendation info
+type serviceItem struct {
+	name        string
+	recommended bool
+	reason      string
+}
+
+// showServiceListModal displays a list of services with recommendations
+func (cc *ControlCenter) showServiceListModal(items []serviceItem, onSelect func(selected string)) {
+	cc.inModal = true
+
+	list := tview.NewList()
+	list.SetBorder(true).SetTitle(" Add Service ")
+	list.SetHighlightFullLine(true)
+	list.SetSelectedBackgroundColor(tcell.ColorDarkCyan)
+
+	for _, item := range items {
+		label := item.name
+		if item.recommended {
+			label = fmt.Sprintf("[green]%s (Recommended)[-]", item.name)
+		}
+		secondary := ""
+		if item.reason != "" {
+			secondary = fmt.Sprintf("[gray]%s[-]", item.reason)
+		}
+		name := item.name // capture for closure
+		list.AddItem(label, secondary, 0, func() {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			onSelect(name)
+		})
+	}
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			return nil
+		}
+		return event
+	})
+
+	cc.app.SetRoot(list, true)
+	cc.app.SetFocus(list)
 }
 
 // showExposePortModal shows a form to expose a local port (Action 2)
@@ -1038,6 +1115,11 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			sb.WriteString(fmt.Sprintf("[red]%s[-]\n", errMsg))
 		}
 
+		// macOS firewall warning
+		if runtime.GOOS == "darwin" {
+			sb.WriteString("\n[gray]Note: macOS may ask to allow network access. Click 'Allow'.[-]\n")
+		}
+
 		sb.WriteString("\n[yellow]B[-] open browser  [yellow]C[-] copy link  [gray]Esc[-] cancel")
 		contentView.SetText(sb.String())
 	}
@@ -1167,6 +1249,9 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				// Connect to network
 				if cc.deviceAuth.Connect != nil {
 					cc.AddActivity("info", "Connecting to network...")
+					if runtime.GOOS == "darwin" {
+						cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
+					}
 					if err := cc.deviceAuth.Connect(authkey); err != nil {
 						cc.AddActivity("error", fmt.Sprintf("Failed to connect: %v", err))
 					} else {
