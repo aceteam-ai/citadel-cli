@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 	"github.com/rivo/tview"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/recommend"
 )
 
 
@@ -86,7 +89,134 @@ func (cc *ControlCenter) showInfoModal(title, content string) {
 	cc.app.SetFocus(textView)
 }
 
-// showAddServiceModal shows available services to add (Action 1)
+// showServiceDetailModal displays a modal with service details and actions
+func (cc *ControlCenter) showServiceDetailModal() {
+	svcName := cc.getSelectedServiceName()
+	if svcName == "" {
+		cc.AddActivity("info", "No service selected")
+		return
+	}
+
+	cc.inModal = true
+
+	// Find service info
+	var svcInfo *ServiceInfo
+	for i := range cc.data.Services {
+		if cc.data.Services[i].Name == svcName {
+			svcInfo = &cc.data.Services[i]
+			break
+		}
+	}
+
+	if svcInfo == nil {
+		cc.inModal = false
+		cc.AddActivity("error", "Service not found")
+		return
+	}
+
+	// Build content
+	updateContent := func(svc *ServiceInfo) string {
+		var sb strings.Builder
+
+		sb.WriteString(fmt.Sprintf("[yellow::b]Service: %s[-:-:-]\n\n", svc.Name))
+
+		// Status with icon
+		switch svc.Status {
+		case "running":
+			sb.WriteString("[green]● Status: running[-]\n")
+		case "stopped":
+			sb.WriteString("[gray]○ Status: stopped[-]\n")
+		case "error":
+			sb.WriteString("[red]✗ Status: error[-]\n")
+		default:
+			sb.WriteString(fmt.Sprintf("[yellow]? Status: %s[-]\n", svc.Status))
+		}
+
+		// Uptime
+		if svc.Uptime != "" {
+			sb.WriteString(fmt.Sprintf("[yellow]Uptime:[-] %s\n", svc.Uptime))
+		}
+
+		// Container info if running (get via docker inspect)
+		if svc.Status == "running" && cc.getServiceDetailFn != nil {
+			if detail := cc.getServiceDetailFn(svc.Name); detail != nil {
+				if detail.ContainerID != "" {
+					sb.WriteString(fmt.Sprintf("[yellow]Container:[-] %s\n", detail.ContainerID))
+				}
+				if detail.Image != "" {
+					sb.WriteString(fmt.Sprintf("[yellow]Image:[-] %s\n", detail.Image))
+				}
+				if detail.ComposePath != "" {
+					sb.WriteString(fmt.Sprintf("[yellow]Compose:[-] %s\n", detail.ComposePath))
+				}
+				if len(detail.Ports) > 0 {
+					sb.WriteString(fmt.Sprintf("[yellow]Ports:[-] %s\n", strings.Join(detail.Ports, ", ")))
+				}
+			}
+		}
+
+		// Actions hint
+		sb.WriteString("\n[gray]─────────────────────────────────────────[-]\n")
+		if svc.Status == "running" {
+			sb.WriteString("[yellow]X[-] Stop  │  [yellow]R[-] Restart  │  [yellow]L[-] Logs  │  [gray]Esc[-] Close")
+		} else {
+			sb.WriteString("[yellow]S[-] Start  │  [yellow]L[-] Logs  │  [gray]Esc[-] Close")
+		}
+
+		return sb.String()
+	}
+
+	textView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetScrollable(true)
+	textView.SetText(updateContent(svcInfo))
+	textView.SetBorder(true).SetTitle(fmt.Sprintf(" %s ", svcName))
+
+	closeModal := func() {
+		cc.inModal = false
+		cc.app.SetRoot(cc.mainFlex, true)
+		cc.updatePaneFocus()
+	}
+
+	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			closeModal()
+			return nil
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 's', 'S':
+				if svcInfo.Status != "running" {
+					closeModal()
+					cc.startSelectedService()
+				}
+				return nil
+			case 'x', 'X':
+				if svcInfo.Status == "running" {
+					closeModal()
+					cc.stopSelectedService()
+				}
+				return nil
+			case 'r', 'R':
+				if svcInfo.Status == "running" {
+					closeModal()
+					cc.restartSelectedService()
+				}
+				return nil
+			case 'l', 'L':
+				closeModal()
+				cc.showServiceLogs(svcName)
+				return nil
+			}
+		}
+		return event
+	})
+
+	cc.app.SetRoot(textView, true)
+	cc.app.SetFocus(textView)
+}
+
+// showAddServiceModal shows available services to add with recommendations (Action 1)
 func (cc *ControlCenter) showAddServiceModal() {
 	if cc.getServicesFn == nil {
 		cc.AddActivity("error", "Service management not available")
@@ -121,7 +251,35 @@ func (cc *ControlCenter) showAddServiceModal() {
 		return
 	}
 
-	cc.showListModal("Add Service", toAdd, func(selected string) {
+	// Get recommendations for hardware-based sorting
+	recommendations := recommend.GetRecommendations()
+	recMap := make(map[string]recommend.ServiceRecommendation)
+	for _, rec := range recommendations {
+		recMap[rec.Service] = rec
+	}
+
+	// Build display items with recommendations
+	var items []serviceItem
+	for _, svc := range toAdd {
+		item := serviceItem{name: svc}
+		if rec, ok := recMap[svc]; ok {
+			item.recommended = rec.Recommended
+			item.reason = rec.Reason
+		}
+		items = append(items, item)
+	}
+
+	// Sort: recommended first
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if !items[i].recommended && items[j].recommended {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+
+	// Show custom modal with recommendations
+	cc.showServiceListModal(items, func(selected string) {
 		if cc.addServiceFn == nil {
 			cc.AddActivity("error", "Cannot add service: no handler configured")
 			return
@@ -137,6 +295,54 @@ func (cc *ControlCenter) showAddServiceModal() {
 			}
 		}()
 	})
+}
+
+// serviceItem represents a service with recommendation info
+type serviceItem struct {
+	name        string
+	recommended bool
+	reason      string
+}
+
+// showServiceListModal displays a list of services with recommendations
+func (cc *ControlCenter) showServiceListModal(items []serviceItem, onSelect func(selected string)) {
+	cc.inModal = true
+
+	list := tview.NewList()
+	list.SetBorder(true).SetTitle(" Add Service ")
+	list.SetHighlightFullLine(true)
+	list.SetSelectedBackgroundColor(tcell.ColorDarkCyan)
+
+	for _, item := range items {
+		label := item.name
+		if item.recommended {
+			label = fmt.Sprintf("[green]%s (Recommended)[-]", item.name)
+		}
+		secondary := ""
+		if item.reason != "" {
+			secondary = fmt.Sprintf("[gray]%s[-]", item.reason)
+		}
+		name := item.name // capture for closure
+		list.AddItem(label, secondary, 0, func() {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			onSelect(name)
+		})
+	}
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			return nil
+		}
+		return event
+	})
+
+	cc.app.SetRoot(list, true)
+	cc.app.SetFocus(list)
 }
 
 // showExposePortModal shows a form to expose a local port (Action 2)
@@ -504,40 +710,109 @@ func (cc *ControlCenter) pingPeers() {
 
 // showInstallServiceModal shows system service installation options (Action 6)
 func (cc *ControlCenter) showInstallServiceModal() {
-	var sb strings.Builder
+	cc.inModal = true
 
-	// Check if already installed (simple heuristic - check if running as service)
-	isInstalled := isServiceInstalled()
+	// Check if already installed
+	installed := isServiceInstalled()
 
-	if isInstalled {
+	if installed {
+		// Already installed - show status and management options
+		var sb strings.Builder
 		sb.WriteString("[green::b]Status: Citadel is installed as a system service[-:-:-]\n\n")
-		sb.WriteString("[yellow]Management commands:[-]\n")
-	} else {
-		sb.WriteString("[yellow::b]Install Citadel as a system service?[-:-:-]\n\n")
-		sb.WriteString("This will keep Citadel running on boot.\n\n")
+
+		switch runtime.GOOS {
+		case "linux":
+			sb.WriteString("[yellow]Management commands:[-]\n")
+			sb.WriteString("  [gray]sudo systemctl status citadel[-]\n")
+			sb.WriteString("  [gray]sudo systemctl restart citadel[-]\n")
+			sb.WriteString("  [gray]sudo systemctl stop citadel[-]\n")
+			sb.WriteString("  [gray]sudo citadel service uninstall[-]\n")
+		case "darwin":
+			sb.WriteString("[yellow]Management commands:[-]\n")
+			sb.WriteString("  [gray]launchctl list | grep citadel[-]\n")
+			sb.WriteString("  [gray]citadel service uninstall[-]\n")
+		case "windows":
+			sb.WriteString("[yellow]Management commands:[-]\n")
+			sb.WriteString("  [gray]sc query citadel[-]\n")
+			sb.WriteString("  [gray]citadel service uninstall[-]  (Run as Administrator)\n")
+		}
+
+		sb.WriteString("\n[gray]Press any key to close[-]")
+		cc.showInfoModal("Install Service", sb.String())
+		return
 	}
 
+	// Not installed - show confirmation to install
+	var description string
 	switch runtime.GOOS {
 	case "linux":
-		sb.WriteString("[yellow]Linux (systemd):[-]\n")
-		sb.WriteString("  [white]sudo citadel service install[-]\n")
-		sb.WriteString("  [gray]sudo systemctl status citadel[-]\n")
-		sb.WriteString("  [gray]sudo systemctl stop citadel[-]\n")
+		description = "This will create a systemd service that starts Citadel on boot."
 	case "darwin":
-		sb.WriteString("[yellow]macOS (launchd):[-]\n")
-		sb.WriteString("  [white]citadel service install[-]\n")
-		sb.WriteString("  [gray]launchctl list | grep citadel[-]\n")
+		description = "This will create a launchd service that starts Citadel on boot."
 	case "windows":
-		sb.WriteString("[yellow]Windows (Service):[-]\n")
-		sb.WriteString("  [white]citadel service install[-]  (Run as Administrator)\n")
-		sb.WriteString("  [gray]sc query citadel[-]\n")
+		description = "This will create a Windows Service that starts Citadel on boot.\n\nNote: Requires Administrator privileges."
 	default:
-		sb.WriteString("[gray]System service installation not supported on this platform[-]\n")
+		cc.inModal = false
+		cc.AddActivity("warning", "System service installation not supported on this platform")
+		return
 	}
 
-	sb.WriteString("\n[gray]Press any key to close[-]")
+	modal := tview.NewModal().
+		SetText(fmt.Sprintf("[yellow::b]Install Citadel as a system service?[-:-:-]\n\n%s\n\nThis will keep Citadel running in the background.", description)).
+		AddButtons([]string{"Cancel", "Install Now"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cc.inModal = false
+			if buttonLabel == "Install Now" {
+				go cc.executeServiceInstall()
+			}
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+		})
 
-	cc.showInfoModal("Install Service", sb.String())
+	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
+}
+
+// executeServiceInstall runs the service installation command
+func (cc *ControlCenter) executeServiceInstall() {
+	cc.AddActivity("info", "Installing Citadel service...")
+
+	// Find citadel binary path
+	exePath, err := os.Executable()
+	if err != nil {
+		cc.AddActivity("error", fmt.Sprintf("Failed to find executable: %v", err))
+		return
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		// Requires sudo on Linux
+		cmd = exec.Command("sudo", exePath, "service", "install")
+	case "darwin":
+		cmd = exec.Command(exePath, "service", "install")
+	case "windows":
+		cmd = exec.Command(exePath, "service", "install")
+	default:
+		cc.AddActivity("error", "Platform not supported")
+		return
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		cc.AddActivity("error", fmt.Sprintf("Install failed: %v", err))
+		if len(output) > 0 {
+			// Log first line of output
+			lines := strings.Split(string(output), "\n")
+			if len(lines) > 0 && lines[0] != "" {
+				cc.AddActivity("error", lines[0])
+			}
+		}
+		return
+	}
+
+	cc.AddActivity("success", "Citadel service installed successfully")
+	cc.AddActivity("info", "Service will start automatically on boot")
 }
 
 // isServiceInstalled checks if citadel is installed as a system service.
@@ -556,11 +831,6 @@ func isServiceInstalled() bool {
 	return false
 }
 
-// showViewQueuesModal shows worker queue information (Action 7)
-func (cc *ControlCenter) showViewQueuesModal() {
-	// Just redirect to the jobs detail modal which has start/stop buttons
-	cc.showJobsDetailModal()
-}
 
 // showNetworkModal shows connect or disconnect options based on current state (Action 0)
 func (cc *ControlCenter) showNetworkModal() {
@@ -588,6 +858,54 @@ func (cc *ControlCenter) showConnectModal() {
 
 	// Normal flow - start device auth
 	cc.startDeviceAuthFlow()
+}
+
+// ShowLoginPrompt shows a modal prompting the user to log in if not connected.
+// Returns true if the prompt was shown, false if already connected.
+func (cc *ControlCenter) ShowLoginPrompt() bool {
+	if cc.data.Connected {
+		return false
+	}
+
+	cc.inModal = true
+
+	modal := tview.NewModal().
+		SetText(`[yellow::b]Not Connected[-:-:-]
+
+You're not connected to the AceTeam Network.
+
+Connect to enable:
+• Remote access to your services
+• Network-wide port forwarding
+• Peer-to-peer connectivity
+• Job queue processing
+
+Log in now?`).
+		AddButtons([]string{"Log In", "Continue Offline"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cc.inModal = false
+			if buttonLabel == "Log In" {
+				cc.startDeviceAuthFlow()
+			} else {
+				cc.app.SetRoot(cc.mainFlex, true)
+				cc.updatePaneFocus()
+			}
+		})
+
+	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
+	return true
+}
+
+// QueueShowLoginPrompt safely queues the login prompt to be shown on the main thread.
+// Use this when calling from a goroutine.
+func (cc *ControlCenter) QueueShowLoginPrompt() {
+	if cc.app == nil {
+		return
+	}
+	cc.app.QueueUpdateDraw(func() {
+		cc.ShowLoginPrompt()
+	})
 }
 
 // showAlreadyConnectedModal explains dual connection status
@@ -797,7 +1115,12 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			sb.WriteString(fmt.Sprintf("[red]%s[-]\n", errMsg))
 		}
 
-		sb.WriteString("\n[gray]Press Esc to cancel[-]")
+		// macOS firewall warning
+		if runtime.GOOS == "darwin" {
+			sb.WriteString("\n[gray]Note: macOS may ask to allow network access. Click 'Allow'.[-]\n")
+		}
+
+		sb.WriteString("\n[yellow]B[-] open browser  [yellow]C[-] copy link  [gray]Esc[-] cancel")
 		contentView.SetText(sb.String())
 	}
 
@@ -810,7 +1133,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	doneChan := make(chan struct{})
 	var pollCancel context.CancelFunc
 
-	// Input capture for escape
+	// Input capture for escape, B, and C keys
 	contentView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
 			if pollCancel != nil {
@@ -822,6 +1145,26 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			cc.app.SetFocus(cc.servicesView)
 			cc.AddActivity("info", "Authorization canceled")
 			return nil
+		}
+		if event.Key() == tcell.KeyRune {
+			switch event.Rune() {
+			case 'b', 'B':
+				// Open browser with the verification URL
+				if err := platform.OpenURL(completeURL); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("Failed to open browser: %v", err))
+				} else {
+					cc.AddActivity("info", "Opened browser")
+				}
+				return nil
+			case 'c', 'C':
+				// Copy URL to clipboard
+				if err := platform.CopyToClipboard(completeURL); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("Failed to copy: %v", err))
+				} else {
+					cc.AddActivity("success", "Link copied to clipboard")
+				}
+				return nil
+			}
 		}
 		return event
 	})
@@ -906,6 +1249,9 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				// Connect to network
 				if cc.deviceAuth.Connect != nil {
 					cc.AddActivity("info", "Connecting to network...")
+					if runtime.GOOS == "darwin" {
+						cc.AddActivity("info", "macOS may prompt for network access - click 'Allow'")
+					}
 					if err := cc.deviceAuth.Connect(authkey); err != nil {
 						cc.AddActivity("error", fmt.Sprintf("Failed to connect: %v", err))
 					} else {

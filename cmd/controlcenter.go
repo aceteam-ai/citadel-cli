@@ -30,11 +30,12 @@ import (
 
 // Worker state for TUI management
 var (
-	ccWorkerMu       sync.Mutex
-	ccWorkerRunning  bool
-	ccWorkerCancel   context.CancelFunc
-	ccWorkerQueue    string
-	ccActivityFn     func(level, msg string)
+	ccWorkerMu        sync.Mutex
+	ccWorkerRunning   bool
+	ccWorkerCancel    context.CancelFunc
+	ccWorkerQueue     string
+	ccActivityFn      func(level, msg string)
+	ccHeartbeatFn     func(active bool) // Callback when heartbeat publishes
 )
 
 // runControlCenter launches the unified control center TUI
@@ -48,15 +49,18 @@ func runControlCenter() {
 	network.SuppressLogs()
 
 	cfg := controlcenter.Config{
-		Version:         Version,
-		AuthServiceURL:  authServiceURL,
-		NexusURL:        nexusURL,
-		RefreshFn:       gatherControlCenterData,
-		StartServiceFn:  ccStartService,
-		StopServiceFn:   ccStopService,
-		AddServiceFn:    ccAddService,
-		GetServicesFn:   services.GetAvailableServices,
-		GetConfiguredFn: ccGetConfiguredServices,
+		Version:            Version,
+		AuthServiceURL:     authServiceURL,
+		NexusURL:           nexusURL,
+		RefreshFn:          gatherControlCenterData,
+		StartServiceFn:     ccStartService,
+		StopServiceFn:      ccStopService,
+		RestartServiceFn:   ccRestartService,
+		AddServiceFn:       ccAddService,
+		GetServicesFn:      services.GetAvailableServices,
+		GetConfiguredFn:    ccGetConfiguredServices,
+		GetServiceDetailFn: ccGetServiceDetail,
+		GetServiceLogsFn:   ccGetServiceLogs,
 		DeviceAuth: controlcenter.DeviceAuthCallbacks{
 			StartFlow:  ccStartDeviceAuthFlow,
 			PollToken:  ccPollDeviceAuthToken,
@@ -71,6 +75,9 @@ func runControlCenter() {
 	}
 
 	cc := controlcenter.New(cfg)
+
+	// Set heartbeat callback so worker can update TUI
+	ccHeartbeatFn = cc.UpdateHeartbeat
 
 	// Auto-connect to network and start worker
 	go func() {
@@ -114,6 +121,11 @@ func runControlCenter() {
 					}
 				}
 			}
+		} else {
+			// Not connected - show login prompt after a short delay
+			// to allow the TUI to fully initialize
+			time.Sleep(1 * time.Second)
+			cc.QueueShowLoginPrompt()
 		}
 	}()
 
@@ -327,6 +339,100 @@ func ccStopService(name string) error {
 	}
 
 	return fmt.Errorf("service not found: %s", name)
+}
+
+// ccRestartService restarts a service by name
+func ccRestartService(name string) error {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		return err
+	}
+
+	for _, service := range manifest.Services {
+		if service.Name == name {
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "restart")
+			return cmd.Run()
+		}
+	}
+
+	return fmt.Errorf("service not found: %s", name)
+}
+
+// ccGetServiceDetail returns detailed information about a service
+func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		return nil
+	}
+
+	for _, service := range manifest.Services {
+		if service.Name == name {
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			detail := &controlcenter.ServiceDetailInfo{
+				ComposePath: service.ComposeFile,
+			}
+
+			// Get container info via docker compose ps
+			psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "ps", "--format", "json")
+			if output, err := psCmd.Output(); err == nil {
+				var container struct {
+					ID      string `json:"ID"`
+					Image   string `json:"Image"`
+					Service string `json:"Service"`
+					State   string `json:"State"`
+					Ports   string `json:"Ports"`
+				}
+				decoder := json.NewDecoder(strings.NewReader(string(output)))
+				if err := decoder.Decode(&container); err == nil {
+					if len(container.ID) > 12 {
+						detail.ContainerID = container.ID[:12]
+					} else {
+						detail.ContainerID = container.ID
+					}
+					detail.Image = container.Image
+					if container.Ports != "" {
+						// Parse ports string like "0.0.0.0:8000->8000/tcp"
+						detail.Ports = strings.Split(container.Ports, ", ")
+					}
+				}
+			}
+
+			return detail
+		}
+	}
+
+	return nil
+}
+
+// ccGetServiceLogs returns recent log lines for a service
+func ccGetServiceLogs(name string) ([]string, error) {
+	manifest, configDir, err := findAndReadManifest()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, service := range manifest.Services {
+		if service.Name == name {
+			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			output, err := cmd.Output()
+			if err != nil {
+				return nil, err
+			}
+			lines := strings.Split(string(output), "\n")
+			// Filter out empty lines
+			var result []string
+			for _, line := range lines {
+				if strings.TrimSpace(line) != "" {
+					result = append(result, line)
+				}
+			}
+			return result, nil
+		}
+	}
+
+	return nil, fmt.Errorf("service not found: %s", name)
 }
 
 // ccAddService adds a new service to the manifest and extracts its compose file
@@ -604,6 +710,28 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				if err == nil {
 					go func() {
 						activity("info", "Heartbeat publishing started")
+
+						// Update TUI heartbeat indicator periodically
+						heartbeatTicker := time.NewTicker(30 * time.Second)
+						defer heartbeatTicker.Stop()
+
+						go func() {
+							// Initial heartbeat indicator
+							if ccHeartbeatFn != nil {
+								ccHeartbeatFn(true)
+							}
+							for {
+								select {
+								case <-ctx.Done():
+									return
+								case <-heartbeatTicker.C:
+									if ccHeartbeatFn != nil {
+										ccHeartbeatFn(true)
+									}
+								}
+							}
+						}()
+
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
 							activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
 						}

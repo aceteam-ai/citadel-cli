@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -58,6 +59,11 @@ func prepareCacheDirectories() error {
 func startService(serviceName, composeFilePath string) error {
 	if composeFilePath == "" {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
+	}
+
+	// Check for Mac-specific warnings
+	if warning := macServiceWarning(serviceName); warning != "" {
+		fmt.Printf("   ⚠️  %s\n", warning)
 	}
 
 	containerName := "citadel-" + serviceName
@@ -143,8 +149,38 @@ func determineServiceType(service Service) services.ServiceType {
 		return services.ServiceTypeNative
 	}
 
+	// On macOS, strongly prefer native for Ollama (Docker has issues)
+	if runtime.GOOS == "darwin" && service.Name == "ollama" {
+		// Check if Ollama is installed via Homebrew or app
+		if _, err := exec.LookPath("ollama"); err == nil {
+			return services.ServiceTypeNative
+		}
+		// Suggest installing native Ollama
+		fmt.Println("   ℹ️  Tip: Install native Ollama for best performance on macOS:")
+		fmt.Println("      brew install ollama")
+		fmt.Println("      or download from https://ollama.com/download")
+	}
+
 	// Fall back to docker
 	return services.ServiceTypeDocker
+}
+
+// macServiceWarning returns a warning message for services that have known issues on macOS.
+func macServiceWarning(serviceName string) string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+
+	switch serviceName {
+	case "lmstudio":
+		return "LM Studio Docker image is Linux-only. Install the native macOS app from https://lmstudio.ai"
+	case "vllm":
+		return "vLLM requires NVIDIA GPU (Linux only). Consider using Ollama on macOS."
+	case "llamacpp":
+		return "llama.cpp Docker may have limited performance on macOS. Consider native installation."
+	default:
+		return ""
+	}
 }
 
 // startNativeService starts a service using its native binary.

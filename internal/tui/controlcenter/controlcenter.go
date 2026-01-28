@@ -97,6 +97,10 @@ type StatusData struct {
 	WorkerQueue   string
 	Queues        []QueueInfo  // All subscribed queues
 	RecentJobs    []JobRecord  // Last N jobs processed
+
+	// Heartbeat status
+	HeartbeatActive bool
+	LastHeartbeat   time.Time
 }
 
 // ServiceInfo holds service information
@@ -104,6 +108,14 @@ type ServiceInfo struct {
 	Name   string
 	Status string // "running", "stopped", "error"
 	Uptime string
+}
+
+// ServiceDetailInfo holds detailed service information for the modal
+type ServiceDetailInfo struct {
+	ContainerID string
+	Image       string
+	ComposePath string
+	Ports       []string
 }
 
 // PeerInfo holds peer information
@@ -131,16 +143,19 @@ type ControlCenter struct {
 	data StatusData
 
 	// Callbacks
-	refreshFn       func() (StatusData, error)
-	startServiceFn  func(name string) error
-	stopServiceFn   func(name string) error
-	addServiceFn    func(name string) error // Add a new service to manifest
-	getServicesFn   func() []string         // Get available services
-	getConfiguredFn func() []string         // Get already configured services
-	deviceAuth      DeviceAuthCallbacks     // Device authorization callbacks
-	worker          WorkerCallbacks         // Worker management callbacks
-	authServiceURL  string                  // URL for device auth service
-	nexusURL        string                  // URL for headscale/nexus coordination server
+	refreshFn          func() (StatusData, error)
+	startServiceFn     func(name string) error
+	stopServiceFn      func(name string) error
+	restartServiceFn   func(name string) error     // Restart a service
+	addServiceFn       func(name string) error     // Add a new service to manifest
+	getServicesFn      func() []string             // Get available services
+	getConfiguredFn    func() []string             // Get already configured services
+	getServiceDetailFn func(name string) *ServiceDetailInfo // Get detailed service info
+	getServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
+	deviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
+	worker             WorkerCallbacks             // Worker management callbacks
+	authServiceURL     string                      // URL for device auth service
+	nexusURL           string                      // URL for headscale/nexus coordination server
 
 	// UI components
 	mainFlex     *tview.Flex
@@ -207,32 +222,38 @@ type WorkerCallbacks struct {
 
 // Config holds control center configuration
 type Config struct {
-	Version         string
-	AuthServiceURL  string                  // URL for device auth service
-	NexusURL        string                  // URL for headscale/nexus coordination server
-	RefreshFn       func() (StatusData, error)
-	StartServiceFn  func(name string) error
-	StopServiceFn   func(name string) error
-	AddServiceFn    func(name string) error // Add a new service to manifest
-	GetServicesFn   func() []string         // Get available services
-	GetConfiguredFn func() []string         // Get already configured services
-	DeviceAuth      DeviceAuthCallbacks     // Device authorization callbacks
-	Worker          WorkerCallbacks         // Worker management callbacks
+	Version            string
+	AuthServiceURL     string                  // URL for device auth service
+	NexusURL           string                  // URL for headscale/nexus coordination server
+	RefreshFn          func() (StatusData, error)
+	StartServiceFn     func(name string) error
+	StopServiceFn      func(name string) error
+	RestartServiceFn   func(name string) error     // Restart a service
+	AddServiceFn       func(name string) error     // Add a new service to manifest
+	GetServicesFn      func() []string             // Get available services
+	GetConfiguredFn    func() []string             // Get already configured services
+	GetServiceDetailFn func(name string) *ServiceDetailInfo // Get detailed service info
+	GetServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
+	DeviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
+	Worker             WorkerCallbacks             // Worker management callbacks
 }
 
 // New creates a new control center
 func New(cfg Config) *ControlCenter {
 	return &ControlCenter{
-		stopChan:        make(chan struct{}),
-		activities:      make([]ActivityEntry, 0, 100),
-		activeForwards:  make([]PortForward, 0),
-		data:            StatusData{Version: cfg.Version},
-		refreshFn:       cfg.RefreshFn,
-		startServiceFn:  cfg.StartServiceFn,
-		stopServiceFn:   cfg.StopServiceFn,
-		addServiceFn:    cfg.AddServiceFn,
-		getServicesFn:   cfg.GetServicesFn,
-		getConfiguredFn: cfg.GetConfiguredFn,
+		stopChan:           make(chan struct{}),
+		activities:         make([]ActivityEntry, 0, 100),
+		activeForwards:     make([]PortForward, 0),
+		data:               StatusData{Version: cfg.Version},
+		refreshFn:          cfg.RefreshFn,
+		startServiceFn:     cfg.StartServiceFn,
+		stopServiceFn:      cfg.StopServiceFn,
+		restartServiceFn:   cfg.RestartServiceFn,
+		addServiceFn:       cfg.AddServiceFn,
+		getServicesFn:      cfg.GetServicesFn,
+		getConfiguredFn:    cfg.GetConfiguredFn,
+		getServiceDetailFn: cfg.GetServiceDetailFn,
+		getServiceLogsFn:   cfg.GetServiceLogsFn,
 		deviceAuth:      cfg.DeviceAuth,
 		worker:          cfg.Worker,
 		authServiceURL:  cfg.AuthServiceURL,
@@ -481,9 +502,6 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		case '6':
 			cc.showInstallServiceModal()
 			return nil
-		case '7':
-			cc.showViewQueuesModal()
-			return nil
 		case '0':
 			cc.showNetworkModal()
 			return nil
@@ -583,7 +601,7 @@ func (cc *ControlCenter) handleEnter() {
 	case paneJobs:
 		cc.showJobsDetailModal()
 	case paneServices:
-		cc.toggleSelectedService()
+		cc.showServiceDetailModal()
 	case paneActions:
 		cc.executeSelectedAction()
 	case panePeers:
@@ -759,6 +777,91 @@ func (cc *ControlCenter) stopSelectedService() {
 	}()
 }
 
+// restartSelectedService restarts the currently selected service
+func (cc *ControlCenter) restartSelectedService() {
+	svcName := cc.getSelectedServiceName()
+	if svcName == "" {
+		return
+	}
+
+	// Use dedicated restart if available, otherwise stop then start
+	if cc.restartServiceFn != nil {
+		go func() {
+			cc.AddActivity("info", fmt.Sprintf("Restarting %s...", svcName))
+			if err := cc.restartServiceFn(svcName); err != nil {
+				cc.AddActivity("error", fmt.Sprintf("Failed to restart %s: %v", svcName, err))
+			} else {
+				cc.AddActivity("success", fmt.Sprintf("%s restarted", svcName))
+				cc.refresh()
+			}
+		}()
+	} else if cc.stopServiceFn != nil && cc.startServiceFn != nil {
+		go func() {
+			cc.AddActivity("info", fmt.Sprintf("Restarting %s...", svcName))
+			if err := cc.stopServiceFn(svcName); err != nil {
+				cc.AddActivity("error", fmt.Sprintf("Failed to stop %s: %v", svcName, err))
+				return
+			}
+			if err := cc.startServiceFn(svcName); err != nil {
+				cc.AddActivity("error", fmt.Sprintf("Failed to start %s: %v", svcName, err))
+			} else {
+				cc.AddActivity("success", fmt.Sprintf("%s restarted", svcName))
+				cc.refresh()
+			}
+		}()
+	}
+}
+
+// showServiceLogs shows recent logs for the selected service
+func (cc *ControlCenter) showServiceLogs(svcName string) {
+	if cc.getServiceLogsFn == nil {
+		cc.AddActivity("info", "Service logs not available")
+		return
+	}
+
+	cc.inModal = true
+
+	textView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetScrollable(true)
+	textView.SetBorder(true).SetTitle(fmt.Sprintf(" Logs: %s ", svcName))
+
+	// Fetch logs
+	go func() {
+		logs, err := cc.getServiceLogsFn(svcName)
+		cc.app.QueueUpdateDraw(func() {
+			if err != nil {
+				textView.SetText(fmt.Sprintf("[red]Error fetching logs:[-] %v\n\n[gray]Press Esc to close[-]", err))
+			} else if len(logs) == 0 {
+				textView.SetText("[gray]No logs available[-]\n\n[gray]Press Esc to close[-]")
+			} else {
+				var sb strings.Builder
+				for _, line := range logs {
+					sb.WriteString(line)
+					sb.WriteString("\n")
+				}
+				sb.WriteString("\n[gray]Press Esc to close[-]")
+				textView.SetText(sb.String())
+			}
+		})
+	}()
+
+	textView.SetText("[gray]Loading logs...[-]")
+
+	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			return nil
+		}
+		return event
+	})
+
+	cc.app.SetRoot(textView, true)
+	cc.app.SetFocus(textView)
+}
+
 func (cc *ControlCenter) showQuitConfirm() {
 	cc.inModal = true
 
@@ -847,7 +950,7 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]1[-:-:-]  Add Service      [white::b]2[-:-:-]  Expose Port
   [white::b]3[-:-:-]  Port Forwards    [white::b]4[-:-:-]  SSH Access
   [white::b]5[-:-:-]  Ping All Peers   [white::b]6[-:-:-]  Install Service
-  [white::b]7[-:-:-]  View Queues      [white::b]0[-:-:-]  Connect/Disconnect
+  [white::b]0[-:-:-]  Connect/Disconnect
 
 [yellow]General:[-]
   [white::b]r[-:-:-]             Refresh status
@@ -908,7 +1011,6 @@ func (cc *ControlCenter) getActions() []actionDef {
 		{key: "4", name: "SSH Access", desc: "[gray]Enable inbound SSH[-]", fn: cc.showSSHAccessModal},
 		{key: "5", name: "Ping Peers", desc: "[gray]Test connectivity[-]", fn: cc.pingPeers},
 		{key: "6", name: "Install Service", desc: "[gray]Run as system svc[-]", fn: cc.showInstallServiceModal},
-		{key: "7", name: "View Queues", desc: "[gray]Worker queue info[-]", fn: cc.showViewQueuesModal},
 		connectAction,
 	}
 }
@@ -968,7 +1070,21 @@ func (cc *ControlCenter) updateNodePanel() {
 		sb.WriteString(fmt.Sprintf(" [yellow]User:[-]   %s\n", userDisplay))
 	}
 
-	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s", statusIcon, statusText))
+	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s\n", statusIcon, statusText))
+
+	// Heartbeat indicator
+	if cc.data.HeartbeatActive {
+		ago := time.Since(cc.data.LastHeartbeat)
+		var agoStr string
+		if ago < time.Minute {
+			agoStr = fmt.Sprintf("%ds ago", int(ago.Seconds()))
+		} else {
+			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
+		}
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]●[-] %s", agoStr))
+	} else if cc.data.WorkerRunning {
+		sb.WriteString(" [yellow]Heartbeat:[-] [gray]○[-] starting...")
+	}
 
 	cc.nodePanel.SetText(sb.String())
 }
@@ -1358,6 +1474,17 @@ func (cc *ControlCenter) UpdateJobStats(stats JobStats) {
 	}
 }
 
+// UpdateHeartbeat updates the heartbeat status (thread-safe)
+func (cc *ControlCenter) UpdateHeartbeat(active bool) {
+	cc.data.HeartbeatActive = active
+	cc.data.LastHeartbeat = time.Now()
+	if cc.app != nil && cc.nodePanel != nil && cc.running {
+		cc.app.QueueUpdateDraw(func() {
+			cc.updateNodePanel()
+		})
+	}
+}
+
 // SetWorkerRunning updates the worker status
 func (cc *ControlCenter) SetWorkerRunning(running bool, queue string) {
 	cc.data.WorkerRunning = running
@@ -1632,28 +1759,62 @@ func (cc *ControlCenter) showActivityFullScreen() {
 	cc.app.SetFocus(textView)
 }
 
-// copyActivityLogs copies activity logs to a file
+// copyActivityLogs copies recent log lines to clipboard
 func (cc *ControlCenter) copyActivityLogs() {
-	cc.activityMu.Lock()
-	var sb strings.Builder
-	sb.WriteString("=== CITADEL ACTIVITY LOG ===\n")
-	sb.WriteString(fmt.Sprintf("Exported: %s\n", time.Now().Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("Entries: %d\n\n", len(cc.activities)))
+	var content string
+	var lineCount int
 
-	for _, entry := range cc.activities {
-		sb.WriteString(fmt.Sprintf("%s [%s] %s\n", entry.Time.Format("2006-01-02 15:04:05"), entry.Level, entry.Message))
+	// Try to read from log file first
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		logPath := homeDir + "/.citadel-cli/logs/latest.log"
+		if data, err := os.ReadFile(logPath); err == nil && len(data) > 0 {
+			// Get last 50 lines
+			lines := strings.Split(string(data), "\n")
+			start := len(lines) - 50
+			if start < 0 {
+				start = 0
+			}
+			lineCount = len(lines) - start
+			content = strings.Join(lines[start:], "\n")
+		}
 	}
-	cc.activityMu.Unlock()
 
-	content := sb.String()
-	filePath := "/tmp/citadel-activity.log"
+	// Fall back to activity log if no log file
+	if content == "" {
+		cc.activityMu.Lock()
+		var sb strings.Builder
+		// Get up to 50 entries (activity log is already newest-first)
+		count := len(cc.activities)
+		if count > 50 {
+			count = 50
+		}
+		lineCount = count
+		for i := count - 1; i >= 0; i-- {
+			entry := cc.activities[i]
+			sb.WriteString(fmt.Sprintf("%s [%s] %s\n", entry.Time.Format("15:04:05"), entry.Level, entry.Message))
+		}
+		cc.activityMu.Unlock()
+		content = sb.String()
+	}
 
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-		cc.AddActivity("error", fmt.Sprintf("Failed to save logs: %v", err))
+	if content == "" {
+		cc.AddActivity("info", "No logs to copy")
 		return
 	}
 
-	cc.AddActivity("success", fmt.Sprintf("Logs saved to %s", filePath))
+	// Copy to clipboard
+	if err := cc.copyToClipboard(content); err != nil {
+		// Fall back to file
+		filePath := "/tmp/citadel-logs.txt"
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			cc.AddActivity("error", fmt.Sprintf("Failed to copy logs: %v", err))
+			return
+		}
+		cc.AddActivity("success", fmt.Sprintf("%d lines saved to %s", lineCount, filePath))
+	} else {
+		cc.AddActivity("success", fmt.Sprintf("%d lines copied to clipboard", lineCount))
+	}
 }
 
 // getNodeText returns plain text representation of node info
