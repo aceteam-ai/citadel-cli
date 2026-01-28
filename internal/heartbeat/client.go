@@ -33,6 +33,7 @@ type Client struct {
 	collector  *status.Collector
 	httpClient *http.Client
 	nodeID     string
+	logFn      func(level, msg string)
 }
 
 // ClientConfig holds configuration for the heartbeat client.
@@ -51,6 +52,9 @@ type ClientConfig struct {
 
 	// Timeout is the HTTP request timeout (default: 10s)
 	Timeout time.Duration
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewClient creates a new heartbeat client.
@@ -70,9 +74,20 @@ func NewClient(cfg ClientConfig, collector *status.Collector) *Client {
 		apiKey:    cfg.APIKey,
 		collector: collector,
 		nodeID:    cfg.NodeID,
+		logFn:     cfg.LogFn,
 		httpClient: &http.Client{
 			Timeout: cfg.Timeout,
 		},
+	}
+}
+
+// log outputs a message - uses logFn callback if set, otherwise prints to stdout.
+func (c *Client) log(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if c.logFn != nil {
+		c.logFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
 	}
 }
 
@@ -82,7 +97,7 @@ func (c *Client) Start(ctx context.Context) error {
 	// Send initial heartbeat immediately
 	if err := c.sendHeartbeat(ctx); err != nil {
 		// Log but don't fail on first heartbeat error
-		fmt.Printf("   - ⚠️ Initial heartbeat failed: %v\n", err)
+		c.log("warning", "   - ⚠️ Initial heartbeat failed: %v", err)
 	}
 
 	ticker := time.NewTicker(c.interval)
@@ -95,7 +110,7 @@ func (c *Client) Start(ctx context.Context) error {
 		case <-ticker.C:
 			if err := c.sendHeartbeat(ctx); err != nil {
 				// Log errors but continue running
-				fmt.Printf("   - ⚠️ Heartbeat failed: %v\n", err)
+				c.log("warning", "   - ⚠️ Heartbeat failed: %v", err)
 			}
 		}
 	}

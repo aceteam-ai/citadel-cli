@@ -223,11 +223,11 @@ func (c *ConfigConsumer) parseMessage(msg redis.XMessage) (*nexus.Job, error) {
 
 // processJob applies the device configuration.
 func (c *ConfigConsumer) processJob(ctx context.Context, job *nexus.Job, msgID string) {
-	fmt.Printf("   - 📥 Config job received: %s (type: %s)\n", job.ID, job.Type)
+	c.log("info", "   - 📥 Config job received: %s (type: %s)", job.ID, job.Type)
 
 	// Only process APPLY_DEVICE_CONFIG jobs
 	if job.Type != "APPLY_DEVICE_CONFIG" {
-		fmt.Printf("   - ⚠️ Ignoring unknown config job type: %s\n", job.Type)
+		c.log("warning", "   - ⚠️ Ignoring unknown config job type: %s", job.Type)
 		c.ackJob(ctx, msgID)
 		return
 	}
@@ -237,19 +237,19 @@ func (c *ConfigConsumer) processJob(ctx context.Context, job *nexus.Job, msgID s
 	output, err := c.configHandler.Execute(jobCtx, job)
 
 	if err != nil {
-		fmt.Printf("   - ❌ Config job failed: %v\n", err)
+		c.log("error", "   - ❌ Config job failed: %v", err)
 		// Don't ACK - let it retry
 		return
 	}
 
-	fmt.Printf("   - ✅ Config applied: %s\n", string(output))
+	c.log("success", "   - ✅ Config applied: %s", string(output))
 	c.ackJob(ctx, msgID)
 }
 
 // ackJob acknowledges a processed message.
 func (c *ConfigConsumer) ackJob(ctx context.Context, msgID string) {
 	if err := c.client.XAck(ctx, c.queueName, c.consumerGroup, msgID).Err(); err != nil {
-		fmt.Printf("   - ⚠️ Failed to ACK config job: %v\n", err)
+		c.log("warning", "   - ⚠️ Failed to ACK config job: %v", err)
 	}
 }
 

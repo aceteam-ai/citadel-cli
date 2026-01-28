@@ -64,6 +64,9 @@ type ConfigSubscriber struct {
 	minBackoff time.Duration
 	maxBackoff time.Duration
 	backoff    time.Duration
+
+	// Log callback (optional, for TUI mode)
+	logFn func(level, msg string)
 }
 
 // ConfigSubscriberConfig holds configuration for the ConfigSubscriber.
@@ -79,6 +82,9 @@ type ConfigSubscriberConfig struct {
 
 	// ConfigDir is where citadel config is stored (optional, defaults to ~/citadel-node)
 	ConfigDir string
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	LogFn func(level, msg string)
 }
 
 // NewConfigSubscriber creates a new config Pub/Sub subscriber.
@@ -113,7 +119,18 @@ func NewConfigSubscriber(cfg ConfigSubscriberConfig) (*ConfigSubscriber, error) 
 		minBackoff:    1 * time.Second,
 		maxBackoff:    5 * time.Minute,
 		backoff:       1 * time.Second,
+		logFn:         cfg.LogFn,
 	}, nil
+}
+
+// log outputs a message - uses logFn callback if set, otherwise prints to stdout.
+func (s *ConfigSubscriber) log(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if s.logFn != nil {
+		s.logFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
 }
 
 // Start begins subscribing to config updates.
@@ -133,7 +150,7 @@ func (s *ConfigSubscriber) Start(ctx context.Context) error {
 			}
 			// Exponential backoff on failures
 			s.backoff = min(s.backoff*2, s.maxBackoff)
-			fmt.Printf("   - Config subscription error (retrying in %v): %v\n", s.backoff, err)
+			s.log("warning", "   - Config subscription error (retrying in %v): %v", s.backoff, err)
 
 			select {
 			case <-ctx.Done():
@@ -178,7 +195,7 @@ func (s *ConfigSubscriber) subscribe(ctx context.Context) error {
 			}
 			if err := s.handleMessage(msg); err != nil {
 				// Log error but don't disconnect - continue processing other messages
-				fmt.Printf("   - Warning: Failed to handle config message: %v\n", err)
+				s.log("warning", "   - Warning: Failed to handle config message: %v", err)
 			}
 		}
 	}
@@ -206,7 +223,7 @@ func (s *ConfigSubscriber) handleMessage(msg *redis.Message) error {
 		return fmt.Errorf("config validation failed: %w", err)
 	}
 
-	fmt.Printf("   - Config update received\n")
+	s.log("info", "   - Config update received")
 
 	// Convert to DeviceConfig for existing handler
 	deviceConfig := jobs.DeviceConfig{
@@ -236,7 +253,7 @@ func (s *ConfigSubscriber) handleMessage(msg *redis.Message) error {
 		return fmt.Errorf("failed to apply config: %w", err)
 	}
 
-	fmt.Printf("   - Config applied successfully\n")
+	s.log("success", "   - Config applied successfully")
 	return nil
 }
 
