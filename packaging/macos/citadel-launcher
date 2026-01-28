@@ -1,0 +1,76 @@
+#!/bin/bash
+# Citadel Launcher - Opens Terminal and runs the citadel CLI
+# This script is the entry point for the Citadel.app bundle
+
+# Get the directory where this script is located (inside the .app bundle)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CITADEL_BIN="$SCRIPT_DIR/citadel"
+
+# Create a temporary script that will run in Terminal
+TEMP_SCRIPT=$(mktemp /tmp/citadel-launcher.XXXXXX)
+chmod +x "$TEMP_SCRIPT"
+
+cat > "$TEMP_SCRIPT" << 'TERMSCRIPT'
+#!/bin/bash
+# Clear screen for clean start
+clear
+
+# Get the citadel binary path from environment
+CITADEL_BIN="$CITADEL_BIN_PATH"
+
+echo "=========================================="
+echo "  Citadel - AceTeam Sovereign Compute"
+echo "=========================================="
+echo ""
+
+# Check if citadel binary exists
+if [ ! -x "$CITADEL_BIN" ]; then
+    echo "Error: Citadel binary not found at: $CITADEL_BIN"
+    echo ""
+    echo "Please reinstall Citadel from https://aceteam.ai"
+    echo ""
+    echo "Press any key to close..."
+    read -n 1
+    exit 1
+fi
+
+# Run citadel with any passed arguments, defaulting to help if none
+if [ $# -eq 0 ]; then
+    echo "Running: citadel --help"
+    echo ""
+    "$CITADEL_BIN" --help
+else
+    "$CITADEL_BIN" "$@"
+fi
+
+EXIT_CODE=$?
+
+echo ""
+echo "------------------------------------------"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "Citadel exited successfully."
+else
+    echo "Citadel exited with code: $EXIT_CODE"
+fi
+echo ""
+echo "You can now run citadel commands in this terminal."
+echo "Type 'citadel --help' for usage information."
+echo ""
+
+# Start an interactive shell so the user can continue using citadel
+# Export PATH to include the citadel binary location
+export PATH="$(dirname "$CITADEL_BIN"):$PATH"
+exec bash --login
+TERMSCRIPT
+
+# Export the citadel binary path for the temp script
+export CITADEL_BIN_PATH="$CITADEL_BIN"
+
+# Open Terminal.app and run the temp script
+# The temp script will be cleaned up when the shell exits
+osascript << EOF
+tell application "Terminal"
+    activate
+    set newWindow to do script "export CITADEL_BIN_PATH='$CITADEL_BIN'; source '$TEMP_SCRIPT'; rm -f '$TEMP_SCRIPT'"
+end tell
+EOF
