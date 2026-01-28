@@ -207,14 +207,14 @@ fi
 
 # Step 1: Create and push tag
 echo ""
-echo -e "${GREEN}Step 1/3: Creating and pushing git tag${NC}"
+echo -e "${GREEN}Step 1/5: Creating and pushing git tag${NC}"
 run_cmd git tag -a "$VERSION" -m "$VERSION"
 run_cmd git push origin "$VERSION"
 echo "✅ Tag $VERSION created and pushed"
 
 # Step 2: Build artifacts
 echo ""
-echo -e "${GREEN}Step 2/3: Building release artifacts${NC}"
+echo -e "${GREEN}Step 2/5: Building release artifacts${NC}"
 if [[ "$DRY_RUN" == true ]]; then
     echo -e "${BLUE}[DRY-RUN] Would execute: ./build.sh --all${NC}"
 else
@@ -224,7 +224,7 @@ echo "✅ Build complete"
 
 # Step 3: Generate release notes and create release
 echo ""
-echo -e "${GREEN}Step 3/3: Creating GitHub release${NC}"
+echo -e "${GREEN}Step 3/5: Creating GitHub release${NC}"
 
 # Read checksums (or use placeholder for dry run)
 if [[ "$DRY_RUN" == true ]]; then
@@ -361,7 +361,7 @@ else
 
     # Step 4: Update Homebrew tap
     echo ""
-    echo -e "${GREEN}Step 4/4: Updating Homebrew tap${NC}"
+    echo -e "${GREEN}Step 4/5: Updating Homebrew tap${NC}"
 
     HOMEBREW_TAP_DIR=$(mktemp -d)
     if gh repo clone aceteam-ai/homebrew-tap "$HOMEBREW_TAP_DIR" 2>/dev/null; then
@@ -399,6 +399,16 @@ else
         rm -rf "$HOMEBREW_TAP_DIR"
     else
         echo -e "${YELLOW}⚠️  Could not clone homebrew-tap, skipping update${NC}"
+    fi
+
+    # Step 5: Commit any generated file changes
+    if [[ -n $(git status -s docs/man/ homebrew-tap/ 2>/dev/null) ]]; then
+        echo ""
+        echo -e "${GREEN}Step 5/5: Committing generated file updates${NC}"
+        git add docs/man/ homebrew-tap/
+        git commit -m "chore: sync generated files after $VERSION release"
+        git push origin main
+        echo "✅ Generated files committed"
     fi
 
     echo ""
