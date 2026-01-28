@@ -21,6 +21,7 @@ var (
 	terminalShell       string
 	terminalMaxConns    int
 	terminalTestMode    bool
+	terminalDebug       bool
 )
 
 var terminalServerCmd = &cobra.Command{
@@ -98,6 +99,9 @@ authenticated connection, streaming input and output over WebSocket.`,
 		if terminalMaxConns != 0 {
 			config.MaxConnections = terminalMaxConns
 		}
+		if terminalDebug {
+			config.Debug = true
+		}
 
 		// Validate configuration
 		if err := config.Validate(); err != nil {
@@ -151,7 +155,10 @@ authenticated connection, streaming input and output over WebSocket.`,
 		fmt.Printf("   - Max connections: %d\n", config.MaxConnections)
 		fmt.Printf("   - Auth service: %s\n", config.AuthServiceURL)
 		fmt.Printf("   - Organization: %s\n", config.OrgID)
-		fmt.Println("   - ✅ Terminal server is running")
+		if config.Debug {
+			fmt.Println("   - Debug logging: enabled")
+		}
+		fmt.Println("   - Terminal server is running")
 		fmt.Println()
 		fmt.Printf("WebSocket endpoint: ws://localhost:%d/terminal\n", config.Port)
 		fmt.Printf("Health endpoint:    http://localhost:%d/health\n", config.Port)
@@ -191,4 +198,5 @@ func init() {
 	terminalServerCmd.Flags().StringVar(&terminalShell, "shell", "", "Shell to use for terminal sessions")
 	terminalServerCmd.Flags().IntVar(&terminalMaxConns, "max-connections", 0, "Maximum concurrent connections (default: 10)")
 	terminalServerCmd.Flags().BoolVar(&terminalTestMode, "test", false, "Test mode - accepts any token (for development)")
+	terminalServerCmd.Flags().BoolVar(&terminalDebug, "debug", false, "Enable verbose debug logging")
 }

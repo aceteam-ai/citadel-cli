@@ -4,14 +4,46 @@ package terminal
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// Logger is the interface for terminal server logging
+type Logger interface {
+	Printf(format string, v ...interface{})
+	Debugf(format string, v ...interface{})
+}
+
+// defaultLogger is the default logger that writes to stderr
+type defaultLogger struct {
+	logger *log.Logger
+	debug  bool
+}
+
+func newDefaultLogger(debug bool) *defaultLogger {
+	return &defaultLogger{
+		logger: log.New(os.Stderr, "[terminal] ", log.LstdFlags),
+		debug:  debug,
+	}
+}
+
+func (l *defaultLogger) Printf(format string, v ...interface{}) {
+	l.logger.Printf(format, v...)
+}
+
+func (l *defaultLogger) Debugf(format string, v ...interface{}) {
+	if l.debug {
+		l.logger.Printf("[DEBUG] "+format, v...)
+	}
+}
 
 // Server is the WebSocket terminal server
 type Server struct {
@@ -19,6 +51,7 @@ type Server struct {
 	sessions *SessionManager
 	auth     TokenValidator
 	limiter  *RateLimiter
+	logger   *defaultLogger
 
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
@@ -28,37 +61,61 @@ type Server struct {
 
 	// stopIdleChecker signals the idle checker to stop
 	stopIdleChecker chan struct{}
+
+	// Connection tracking for debugging
+	totalConnections  int64
+	failedConnections int64
+	activeConnections int64
 }
 
 // NewServer creates a new terminal server
 func NewServer(config *Config, auth TokenValidator) *Server {
-	return &Server{
-		config:   config,
-		sessions: NewSessionManager(config.MaxConnections),
-		auth:     auth,
-		limiter:  NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				// Allow connections from aceteam.ai domains
-				origin := r.Header.Get("Origin")
-				if origin == "" {
-					return true // Allow requests without origin (e.g., CLI tools)
-				}
-				// Allow localhost for development
-				if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-					return true
-				}
-				// Allow aceteam.ai domains
-				if strings.Contains(origin, "aceteam.ai") {
-					return true
-				}
-				return false
-			},
-		},
+	logger := newDefaultLogger(config.Debug)
+	s := &Server{
+		config:          config,
+		sessions:        NewSessionManager(config.MaxConnections),
+		auth:            auth,
+		limiter:         NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
+		logger:          logger,
 		stopIdleChecker: make(chan struct{}),
 	}
+
+	s.upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			return s.checkOrigin(r)
+		},
+	}
+
+	return s
+}
+
+// NewServerWithDebug creates a new terminal server with debug logging enabled
+func NewServerWithDebug(config *Config, auth TokenValidator) *Server {
+	config.Debug = true
+	return NewServer(config, auth)
+}
+
+// checkOrigin validates the WebSocket origin header
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		s.logger.Debugf("allowing connection without origin header (CLI tool or same-origin)")
+		return true // Allow requests without origin (e.g., CLI tools)
+	}
+	// Allow localhost for development
+	if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
+		s.logger.Debugf("allowing localhost origin: %s", origin)
+		return true
+	}
+	// Allow aceteam.ai domains
+	if strings.Contains(origin, "aceteam.ai") {
+		s.logger.Debugf("allowing aceteam.ai origin: %s", origin)
+		return true
+	}
+	s.logger.Printf("rejecting origin: %s (not in allowlist)", origin)
+	return false
 }
 
 // Start starts the terminal server
@@ -71,10 +128,15 @@ func (s *Server) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
+	s.logger.Printf("starting terminal server on port %d", s.config.Port)
+	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, shell=%s, org_id=%s",
+		s.config.MaxConnections, s.config.IdleTimeout, s.config.Shell, s.config.OrgID)
+
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
 	mux.HandleFunc("/terminal", s.handleWebSocket)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/stats", s.handleStats)
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.config.Port),
@@ -93,12 +155,17 @@ func (s *Server) Start() error {
 		s.mu.Lock()
 		s.running = false
 		s.mu.Unlock()
+		s.logger.Printf("failed to start: %v", err)
 		return fmt.Errorf("failed to listen on port %d: %w", s.config.Port, err)
 	}
 
+	// Get the actual port (useful when port 0 is specified)
+	actualAddr := listener.Addr().(*net.TCPAddr)
+	s.logger.Printf("listening on %s", actualAddr.String())
+
 	go func() {
 		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("Terminal server error: %v\n", err)
+			s.logger.Printf("server error: %v", err)
 		}
 	}()
 
@@ -115,6 +182,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.running = false
 	s.mu.Unlock()
 
+	s.logger.Printf("stopping terminal server...")
+
 	// Stop the idle checker
 	close(s.stopIdleChecker)
 
@@ -122,13 +191,22 @@ func (s *Server) Stop(ctx context.Context) error {
 	s.limiter.Stop()
 
 	// Close all sessions
+	sessionCount := s.sessions.Count()
 	s.sessions.CloseAll()
+	if sessionCount > 0 {
+		s.logger.Printf("closed %d active session(s)", sessionCount)
+	}
 
 	// Shutdown HTTP server
 	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+		if err := s.httpServer.Shutdown(ctx); err != nil {
+			s.logger.Printf("shutdown error: %v", err)
+			return err
+		}
 	}
 
+	s.logger.Printf("terminal server stopped (total=%d, failed=%d)",
+		atomic.LoadInt64(&s.totalConnections), atomic.LoadInt64(&s.failedConnections))
 	return nil
 }
 
@@ -139,13 +217,30 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","sessions":%d}`, s.sessions.Count())
 }
 
+// handleStats handles stats requests (for debugging)
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ok","sessions":%d,"total_connections":%d,"failed_connections":%d,"active_connections":%d,"rate_limit_tracked_ips":%d}`,
+		s.sessions.Count(),
+		atomic.LoadInt64(&s.totalConnections),
+		atomic.LoadInt64(&s.failedConnections),
+		atomic.LoadInt64(&s.activeConnections),
+		s.limiter.Count())
+}
+
 // handleWebSocket handles WebSocket upgrade and terminal session
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Get client IP for rate limiting
 	ip := getClientIP(r)
 
+	atomic.AddInt64(&s.totalConnections, 1)
+	s.logger.Debugf("new connection attempt from %s", ip)
+
 	// Check rate limit
 	if !s.limiter.Allow(ip) {
+		s.logger.Printf("rate limit exceeded for %s", ip)
+		atomic.AddInt64(&s.failedConnections, 1)
 		http.Error(w, ErrRateLimited.Error(), http.StatusTooManyRequests)
 		return
 	}
@@ -153,12 +248,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Get and validate token
 	token := r.URL.Query().Get("token")
 	if token == "" {
+		s.logger.Printf("missing token from %s", ip)
+		atomic.AddInt64(&s.failedConnections, 1)
 		http.Error(w, "missing token parameter", http.StatusUnauthorized)
 		return
 	}
 
+	// Log token validation attempt (don't log the actual token for security)
+	s.logger.Debugf("validating token for org %s from %s", s.config.OrgID, ip)
+
 	tokenInfo, err := s.auth.ValidateToken(token, s.config.OrgID)
 	if err != nil {
+		s.logger.Printf("token validation failed from %s: %v", ip, err)
+		atomic.AddInt64(&s.failedConnections, 1)
 		switch err {
 		case ErrInvalidToken, ErrTokenExpired:
 			http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -172,8 +274,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Debugf("token validated for user %s from %s", tokenInfo.UserID, ip)
+
 	// Check connection limit
 	if s.sessions.Count() >= s.config.MaxConnections {
+		s.logger.Printf("max connections reached (%d), rejecting %s", s.config.MaxConnections, ip)
+		atomic.AddInt64(&s.failedConnections, 1)
 		http.Error(w, ErrMaxConnectionsReached.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -181,12 +287,22 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Upgrade to WebSocket
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		s.logger.Printf("websocket upgrade failed for %s: %v", ip, err)
+		atomic.AddInt64(&s.failedConnections, 1)
 		return // Upgrade already sent error response
 	}
-	defer conn.Close()
+
+	// Track active connection
+	atomic.AddInt64(&s.activeConnections, 1)
+	defer func() {
+		conn.Close()
+		atomic.AddInt64(&s.activeConnections, -1)
+	}()
 
 	// Generate session ID
 	sessionID := generateSessionID()
+
+	s.logger.Printf("creating session %s for user %s from %s", sessionID, tokenInfo.UserID, ip)
 
 	// Create PTY session
 	session, err := NewSession(SessionConfig{
@@ -198,9 +314,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		InitialRows: 24,
 		OnClose: func() {
 			s.sessions.Remove(sessionID)
+			s.logger.Debugf("session %s removed from manager", sessionID)
 		},
 	})
 	if err != nil {
+		s.logger.Printf("failed to create PTY session %s: %v", sessionID, err)
 		msg := NewErrorMessage(err.Error())
 		data, _ := msg.Marshal()
 		conn.WriteMessage(websocket.TextMessage, data)
@@ -209,6 +327,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Add session to manager
 	if err := s.sessions.Add(session); err != nil {
+		s.logger.Printf("failed to add session %s to manager: %v", sessionID, err)
 		session.Close()
 		msg := NewErrorMessage(err.Error())
 		data, _ := msg.Marshal()
@@ -216,8 +335,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Printf("session %s started (user=%s, shell=%s, sessions=%d)",
+		sessionID, tokenInfo.UserID, s.config.Shell, s.sessions.Count())
+
 	// Handle the connection
 	s.handleConnection(conn, session)
+
+	s.logger.Printf("session %s ended (sessions=%d)", sessionID, s.sessions.Count())
 }
 
 // handleConnection manages the bidirectional communication between WebSocket and PTY
@@ -226,8 +350,9 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 	defer cancel()
 	defer session.Close()
 
-	// Set up ping/pong
+	// Set up ping/pong for connection health
 	conn.SetPingHandler(func(appData string) error {
+		s.logger.Debugf("received ping from session %s", session.ID)
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
 	})
 
@@ -241,6 +366,7 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 			default:
 				n, err := session.Read(buf)
 				if err != nil {
+					s.logger.Debugf("PTY read error for session %s: %v", session.ID, err)
 					cancel()
 					return
 				}
@@ -248,9 +374,11 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 					msg := NewOutputMessage(buf[:n])
 					data, err := msg.Marshal()
 					if err != nil {
+						s.logger.Debugf("failed to marshal output for session %s: %v", session.ID, err)
 						continue
 					}
 					if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+						s.logger.Debugf("WebSocket write error for session %s: %v", session.ID, err)
 						cancel()
 						return
 					}
@@ -267,15 +395,25 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 		default:
 			_, data, err := conn.ReadMessage()
 			if err != nil {
+				// Check if this is a normal close
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					s.logger.Debugf("client disconnected normally from session %s", session.ID)
+				} else if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					s.logger.Printf("unexpected WebSocket close for session %s: %v", session.ID, err)
+				} else {
+					s.logger.Debugf("WebSocket read error for session %s: %v", session.ID, err)
+				}
 				return
 			}
 
 			msg, err := UnmarshalMessage(data)
 			if err != nil {
+				s.logger.Debugf("invalid message from session %s: %v", session.ID, err)
 				continue
 			}
 
 			if err := msg.Validate(); err != nil {
+				s.logger.Debugf("message validation failed for session %s: %v", session.ID, err)
 				errMsg := NewErrorMessage(err.Error())
 				errData, _ := errMsg.Marshal()
 				conn.WriteMessage(websocket.TextMessage, errData)
@@ -285,17 +423,21 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 			switch msg.Type {
 			case MessageTypeInput:
 				if _, err := session.Write(msg.Payload); err != nil {
+					s.logger.Debugf("PTY write error for session %s: %v", session.ID, err)
 					return
 				}
 
 			case MessageTypeResize:
+				s.logger.Debugf("resizing session %s to %dx%d", session.ID, msg.Cols, msg.Rows)
 				if err := session.Resize(msg.Cols, msg.Rows); err != nil {
+					s.logger.Debugf("resize failed for session %s: %v", session.ID, err)
 					errMsg := NewErrorMessage(err.Error())
 					errData, _ := errMsg.Marshal()
 					conn.WriteMessage(websocket.TextMessage, errData)
 				}
 
 			case MessageTypePing:
+				s.logger.Debugf("received application ping from session %s", session.ID)
 				pong := NewPongMessage()
 				pongData, _ := pong.Marshal()
 				conn.WriteMessage(websocket.TextMessage, pongData)
@@ -314,7 +456,7 @@ func (s *Server) idleCheckerLoop() {
 		case <-ticker.C:
 			closed := s.sessions.CloseIdle(s.config.IdleTimeout)
 			if closed > 0 {
-				fmt.Printf("Closed %d idle terminal session(s)\n", closed)
+				s.logger.Printf("closed %d idle terminal session(s)", closed)
 			}
 		case <-s.stopIdleChecker:
 			return
@@ -366,4 +508,11 @@ func (s *Server) SessionCount() int {
 // Port returns the configured port
 func (s *Server) Port() int {
 	return s.config.Port
+}
+
+// Stats returns the server statistics
+func (s *Server) Stats() (total, failed, active int64) {
+	return atomic.LoadInt64(&s.totalConnections),
+		atomic.LoadInt64(&s.failedConnections),
+		atomic.LoadInt64(&s.activeConnections)
 }
