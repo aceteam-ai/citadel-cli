@@ -30,11 +30,12 @@ import (
 
 // Worker state for TUI management
 var (
-	ccWorkerMu       sync.Mutex
-	ccWorkerRunning  bool
-	ccWorkerCancel   context.CancelFunc
-	ccWorkerQueue    string
-	ccActivityFn     func(level, msg string)
+	ccWorkerMu        sync.Mutex
+	ccWorkerRunning   bool
+	ccWorkerCancel    context.CancelFunc
+	ccWorkerQueue     string
+	ccActivityFn      func(level, msg string)
+	ccHeartbeatFn     func(active bool) // Callback when heartbeat publishes
 )
 
 // runControlCenter launches the unified control center TUI
@@ -74,6 +75,9 @@ func runControlCenter() {
 	}
 
 	cc := controlcenter.New(cfg)
+
+	// Set heartbeat callback so worker can update TUI
+	ccHeartbeatFn = cc.UpdateHeartbeat
 
 	// Auto-connect to network and start worker
 	go func() {
@@ -706,6 +710,28 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				if err == nil {
 					go func() {
 						activity("info", "Heartbeat publishing started")
+
+						// Update TUI heartbeat indicator periodically
+						heartbeatTicker := time.NewTicker(30 * time.Second)
+						defer heartbeatTicker.Stop()
+
+						go func() {
+							// Initial heartbeat indicator
+							if ccHeartbeatFn != nil {
+								ccHeartbeatFn(true)
+							}
+							for {
+								select {
+								case <-ctx.Done():
+									return
+								case <-heartbeatTicker.C:
+									if ccHeartbeatFn != nil {
+										ccHeartbeatFn(true)
+									}
+								}
+							}
+						}()
+
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
 							activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
 						}

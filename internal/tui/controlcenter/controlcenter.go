@@ -97,6 +97,10 @@ type StatusData struct {
 	WorkerQueue   string
 	Queues        []QueueInfo  // All subscribed queues
 	RecentJobs    []JobRecord  // Last N jobs processed
+
+	// Heartbeat status
+	HeartbeatActive bool
+	LastHeartbeat   time.Time
 }
 
 // ServiceInfo holds service information
@@ -1066,7 +1070,21 @@ func (cc *ControlCenter) updateNodePanel() {
 		sb.WriteString(fmt.Sprintf(" [yellow]User:[-]   %s\n", userDisplay))
 	}
 
-	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s", statusIcon, statusText))
+	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s\n", statusIcon, statusText))
+
+	// Heartbeat indicator
+	if cc.data.HeartbeatActive {
+		ago := time.Since(cc.data.LastHeartbeat)
+		var agoStr string
+		if ago < time.Minute {
+			agoStr = fmt.Sprintf("%ds ago", int(ago.Seconds()))
+		} else {
+			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
+		}
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]●[-] %s", agoStr))
+	} else if cc.data.WorkerRunning {
+		sb.WriteString(" [yellow]Heartbeat:[-] [gray]○[-] starting...")
+	}
 
 	cc.nodePanel.SetText(sb.String())
 }
@@ -1452,6 +1470,17 @@ func (cc *ControlCenter) UpdateJobStats(stats JobStats) {
 	if cc.app != nil && cc.jobsPanel != nil && cc.running {
 		cc.app.QueueUpdateDraw(func() {
 			cc.updateJobsPanel()
+		})
+	}
+}
+
+// UpdateHeartbeat updates the heartbeat status (thread-safe)
+func (cc *ControlCenter) UpdateHeartbeat(active bool) {
+	cc.data.HeartbeatActive = active
+	cc.data.LastHeartbeat = time.Now()
+	if cc.app != nil && cc.nodePanel != nil && cc.running {
+		cc.app.QueueUpdateDraw(func() {
+			cc.updateNodePanel()
 		})
 	}
 }
