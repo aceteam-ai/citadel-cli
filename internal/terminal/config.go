@@ -39,6 +39,9 @@ type Config struct {
 
 	// TokenRefreshInterval is how often to refresh the token cache from the API
 	TokenRefreshInterval time.Duration
+
+	// Debug enables verbose debug logging
+	Debug bool
 }
 
 // DefaultConfig returns a Config with sensible defaults
@@ -53,6 +56,7 @@ func DefaultConfig() *Config {
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
 		RateLimitBurst:       5,   // Allow bursts of 5
 		TokenRefreshInterval: time.Duration(getEnvInt("CITADEL_TOKEN_REFRESH_INTERVAL", 60)) * time.Minute,
+		Debug:                getEnvBool("CITADEL_TERMINAL_DEBUG", false),
 	}
 }
 

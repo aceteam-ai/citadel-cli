@@ -49,8 +49,9 @@ var (
 	workStatusChannel string
 
 	// Terminal server flags
-	workTerminal     bool
-	workTerminalPort int
+	workTerminal      bool
+	workTerminalPort  int
+	workTerminalDebug bool
 
 	// Service auto-start flags
 	workNoServices bool
@@ -507,6 +508,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				if workTerminalPort > 0 {
 					termConfig.Port = workTerminalPort
 				}
+				if workTerminalDebug {
+					termConfig.Debug = true
+				}
 
 				// Use CachingTokenValidator for production
 				cachingAuth := terminal.NewCachingTokenValidator(
@@ -679,6 +683,7 @@ func init() {
 	// Terminal server flags
 	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")
 	workCmd.Flags().IntVar(&workTerminalPort, "terminal-port", 7860, "Terminal server port (default: 7860)")
+	workCmd.Flags().BoolVar(&workTerminalDebug, "terminal-debug", false, "Enable verbose debug logging for terminal server")
 
 	// Service auto-start flags
 	workCmd.Flags().BoolVar(&workNoServices, "no-services", false, "Skip auto-starting services from manifest")

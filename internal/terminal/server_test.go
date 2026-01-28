@@ -143,6 +143,72 @@ func TestServerSessionCount(t *testing.T) {
 	}
 }
 
+func TestServerStats(t *testing.T) {
+	config := &Config{
+		Port:           17863,
+		MaxConnections: 10,
+		IdleTimeout:    30 * time.Minute,
+		OrgID:          "test-org",
+		Shell:          "/bin/sh",
+		RateLimitRPS:   1.0,
+		RateLimitBurst: 5,
+	}
+
+	auth := NewMockTokenValidator()
+	server := NewServer(config, auth)
+
+	// Stats should be zero before starting
+	total, failed, active := server.Stats()
+	if total != 0 || failed != 0 || active != 0 {
+		t.Errorf("expected all stats to be 0, got total=%d, failed=%d, active=%d", total, failed, active)
+	}
+
+	err := server.Start()
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer server.Stop(context.Background())
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Test stats endpoint
+	resp, err := http.Get("http://localhost:17863/stats")
+	if err != nil {
+		t.Fatalf("stats request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestServerWithDebug(t *testing.T) {
+	config := &Config{
+		Port:           17864,
+		MaxConnections: 10,
+		IdleTimeout:    30 * time.Minute,
+		OrgID:          "test-org",
+		Shell:          "/bin/sh",
+		RateLimitRPS:   1.0,
+		RateLimitBurst: 5,
+		Debug:          false,
+	}
+
+	auth := NewMockTokenValidator()
+	server := NewServerWithDebug(config, auth)
+
+	if server == nil {
+		t.Fatal("expected server, got nil")
+	}
+
+	// Config should have Debug enabled
+	if !config.Debug {
+		t.Error("expected Debug to be true after NewServerWithDebug")
+	}
+}
+
 func TestGetClientIP(t *testing.T) {
 	tests := []struct {
 		name       string
