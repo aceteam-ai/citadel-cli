@@ -125,6 +125,9 @@ type CachingTokenValidator struct {
 	// Rate limiting for on-demand refresh (prevents abuse via invalid tokens)
 	lastRefreshAttempt time.Time
 	refreshRateLimit   time.Duration
+
+	// LogFn is an optional callback for logging (if nil, prints to stdout)
+	logFn func(level, msg string)
 }
 
 // NewCachingTokenValidator creates a new caching token validator
@@ -143,12 +146,28 @@ func NewCachingTokenValidator(baseURL, orgID string, refreshInterval time.Durati
 	}
 }
 
+// SetLogFn sets the logging callback. If set, warnings will be routed through
+// this callback instead of printing to stdout. Use this for TUI mode.
+func (v *CachingTokenValidator) SetLogFn(logFn func(level, msg string)) {
+	v.logFn = logFn
+}
+
+// log outputs a message - uses logFn callback if set, otherwise prints to stdout.
+func (v *CachingTokenValidator) log(level, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if v.logFn != nil {
+		v.logFn(level, msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
+}
+
 // Start begins the background token refresh goroutine
 func (v *CachingTokenValidator) Start() error {
 	// Initial fetch
 	if err := v.fetchAndCacheTokens(); err != nil {
 		// Log but don't fail - we'll retry on the schedule
-		fmt.Printf("Warning: initial token fetch failed: %v\n", err)
+		v.log("warning", "Initial token fetch failed: %v", err)
 	}
 
 	// Start background refresh
@@ -174,7 +193,7 @@ func (v *CachingTokenValidator) refreshLoop() {
 			if err := v.fetchAndCacheTokens(); err != nil {
 				// Use exponential backoff on failures
 				v.backoff = min(v.backoff*2, v.maxBackoff)
-				fmt.Printf("Warning: token refresh failed (will retry in %v): %v\n", v.backoff, err)
+				v.log("warning", "Token refresh failed (will retry in %v): %v", v.backoff, err)
 			} else {
 				// Reset backoff on success
 				v.backoff = v.minBackoff

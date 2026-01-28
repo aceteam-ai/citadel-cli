@@ -239,6 +239,13 @@ func startTerminalServer(orgID string) error {
 		config.TokenRefreshInterval,
 	)
 
+	// Set log callback to suppress stdout output in TUI mode
+	// Warnings will be silently ignored to prevent TUI corruption
+	ccTerminalAuth.SetLogFn(func(level, msg string) {
+		// In TUI mode, terminal server warnings are suppressed
+		// since they would corrupt the display
+	})
+
 	// Start the validator's background refresh
 	if err := ccTerminalAuth.Start(); err != nil {
 		return fmt.Errorf("failed to start token cache: %w", err)
