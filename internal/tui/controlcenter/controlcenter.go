@@ -179,6 +179,11 @@ type ControlCenter struct {
 	activeForwards []PortForward // Active port forwards
 	focusedPane    int           // 0=services, 1=peers
 
+	// Suggestions bar
+	suggestionBar     *tview.TextView
+	showingSuggestion bool
+	suggestionTimer   *time.Timer
+
 	// Job tracking
 	recentJobs   []JobRecord
 	recentJobsMu sync.Mutex
@@ -306,6 +311,12 @@ func (cc *ControlCenter) Run() error {
 		cc.running = true
 		cc.AddActivity("info", "Control center started")
 		go cc.autoRefreshLoop()
+
+		// Show context-aware suggestion after startup
+		time.Sleep(500 * time.Millisecond)
+		cc.app.QueueUpdateDraw(func() {
+			cc.showSuggestion()
+		})
 	}()
 
 	return cc.app.Run()
@@ -404,9 +415,15 @@ func (cc *ControlCenter) buildUI() {
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 
+	// Suggestions bar (shows context-aware tips, auto-dismisses)
+	cc.suggestionBar = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+
 	// Main layout - more uniform heights
 	cc.mainFlex = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(header, 3, 0, false).
+		AddItem(cc.suggestionBar, 1, 0, false).
 		AddItem(topRow, 8, 0, false).
 		AddItem(middleRow, 0, 1, true).
 		AddItem(bottomRow, 0, 1, false).
@@ -419,6 +436,11 @@ func (cc *ControlCenter) buildUI() {
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
+	// Dismiss suggestion on any keypress
+	if cc.showingSuggestion {
+		cc.dismissSuggestion()
+	}
+
 	// If in a modal, let the modal handle all input
 	if cc.inModal {
 		return event
@@ -1418,6 +1440,73 @@ func (cc *ControlCenter) updateStatusBar() {
 	}
 
 	cc.statusBar.SetText(fmt.Sprintf("Refresh: [green]auto (30s)[-]  │  Last: %s  │  Press [yellow::b]?[-:-:-] for help", lastRefreshStr))
+}
+
+// showSuggestion displays a context-aware suggestion that auto-dismisses
+func (cc *ControlCenter) showSuggestion() {
+	suggestion := cc.getContextualSuggestion()
+	if suggestion == "" {
+		cc.suggestionBar.SetText("")
+		return
+	}
+
+	cc.showingSuggestion = true
+	cc.suggestionBar.SetText(fmt.Sprintf("[yellow]Tip:[-] %s  [gray](press any key to dismiss)[-]", suggestion))
+
+	// Auto-dismiss after 10 seconds
+	if cc.suggestionTimer != nil {
+		cc.suggestionTimer.Stop()
+	}
+	cc.suggestionTimer = time.AfterFunc(10*time.Second, func() {
+		cc.app.QueueUpdateDraw(func() {
+			cc.dismissSuggestion()
+		})
+	})
+}
+
+// dismissSuggestion hides the suggestion bar
+func (cc *ControlCenter) dismissSuggestion() {
+	if !cc.showingSuggestion {
+		return
+	}
+	cc.showingSuggestion = false
+	cc.suggestionBar.SetText("")
+	if cc.suggestionTimer != nil {
+		cc.suggestionTimer.Stop()
+		cc.suggestionTimer = nil
+	}
+}
+
+// getContextualSuggestion returns a context-aware suggestion based on current state
+func (cc *ControlCenter) getContextualSuggestion() string {
+	// Not connected - suggest connecting
+	if !cc.data.Connected && !cc.data.SystemTailscaleRunning {
+		return "Press [yellow::b]0[-:-:-] to connect to AceTeam Network"
+	}
+
+	// No services configured - suggest adding one
+	if len(cc.data.Services) == 0 {
+		return "Press [yellow::b]1[-:-:-] to add your first service (Ollama, vLLM, etc.)"
+	}
+
+	// All services stopped - suggest starting one
+	allStopped := true
+	for _, svc := range cc.data.Services {
+		if svc.Status == "running" {
+			allStopped = false
+			break
+		}
+	}
+	if allStopped && len(cc.data.Services) > 0 {
+		return "Select a service and press [yellow::b]Enter[-:-:-] to manage it"
+	}
+
+	// Worker not running but connected - suggest starting worker
+	if cc.data.Connected && !cc.data.WorkerRunning {
+		return "Worker not running - jobs won't be processed on this node"
+	}
+
+	return ""
 }
 
 func (cc *ControlCenter) refresh() {
