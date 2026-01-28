@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -38,6 +40,21 @@ var (
 	ccHeartbeatFn     func(active bool) // Callback when heartbeat publishes
 )
 
+// Demo server state
+var (
+	ccDemoServer  *demo.Server
+	ccDemoCancel  context.CancelFunc
+	ccDemoPort    = 7777
+)
+
+// Terminal server state
+var (
+	ccTerminalServer  *terminal.Server
+	ccTerminalAuth    *terminal.CachingTokenValidator
+	ccTerminalPort    = 7860
+	ccTerminalRunning bool
+)
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -47,6 +64,11 @@ func runControlCenter() {
 
 	// Suppress tsnet/tailscale logs to prevent TUI corruption
 	network.SuppressLogs()
+
+	// Start the demo server in the background
+	startDemoServer()
+	defer stopDemoServer()
+	defer stopTerminalServer()
 
 	cfg := controlcenter.Config{
 		Version:            Version,
@@ -104,8 +126,17 @@ func runControlCenter() {
 			networkConnected = data.Connected
 		}
 
-		// Auto-start worker after network is connected
+		// Auto-start worker and terminal server after network is connected
 		if networkConnected {
+			// Start terminal server for remote SSH access
+			if orgID := getOrgIDFromConfig(); orgID != "" {
+				if err := startTerminalServer(orgID); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("Terminal server failed: %v", err))
+				} else {
+					cc.AddActivity("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+				}
+			}
+
 			deviceConfig := getDeviceConfigFromFile()
 			if deviceConfig != nil && (deviceConfig.DeviceAPIToken != "" || deviceConfig.RedisURL != "") {
 				// Small delay to ensure network is fully ready
@@ -133,6 +164,122 @@ func runControlCenter() {
 		fmt.Fprintf(os.Stderr, "Control center error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// startDemoServer starts the demo HTTP server in the background
+func startDemoServer() {
+	// Create info callback for demo server
+	getInfo := func() demo.NodeInfo {
+		hostname, _ := os.Hostname()
+		info := demo.NodeInfo{
+			Hostname: hostname,
+			Version:  Version,
+		}
+
+		// Check network connection
+		if network.IsGlobalConnected() {
+			info.Connected = true
+			if ip, err := network.GetGlobalIPv4(); err == nil {
+				info.NetworkIP = ip
+			}
+		}
+
+		// Get services from manifest
+		if manifest, _, err := findAndReadManifest(); err == nil {
+			for _, svc := range manifest.Services {
+				info.Services = append(info.Services, svc.Name)
+			}
+		}
+
+		return info
+	}
+
+	ccDemoServer = demo.NewServer(ccDemoPort, Version, getInfo)
+
+	// Start in background with cancellable context
+	var ctx context.Context
+	ctx, ccDemoCancel = context.WithCancel(context.Background())
+	go func() {
+		// Ignore error - server runs until cancelled
+		_ = ccDemoServer.Start(ctx)
+	}()
+}
+
+// stopDemoServer stops the demo HTTP server
+func stopDemoServer() {
+	if ccDemoCancel != nil {
+		ccDemoCancel()
+	}
+	if ccDemoServer != nil {
+		_ = ccDemoServer.Stop()
+	}
+}
+
+// startTerminalServer starts the terminal server for remote SSH access
+func startTerminalServer(orgID string) error {
+	if ccTerminalRunning {
+		return nil // Already running
+	}
+
+	// Build configuration
+	config := terminal.DefaultConfig()
+	config.OrgID = orgID
+	config.AuthServiceURL = authServiceURL
+	config.Port = ccTerminalPort
+
+	// Create the caching token validator
+	ccTerminalAuth = terminal.NewCachingTokenValidator(
+		config.AuthServiceURL,
+		config.OrgID,
+		config.TokenRefreshInterval,
+	)
+
+	// Start the validator's background refresh
+	if err := ccTerminalAuth.Start(); err != nil {
+		return fmt.Errorf("failed to start token cache: %w", err)
+	}
+
+	// Create and start the server
+	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
+	if err := ccTerminalServer.Start(); err != nil {
+		ccTerminalAuth.Stop()
+		return fmt.Errorf("failed to start terminal server: %w", err)
+	}
+
+	ccTerminalRunning = true
+	return nil
+}
+
+// stopTerminalServer stops the terminal server
+func stopTerminalServer() {
+	if !ccTerminalRunning {
+		return
+	}
+
+	if ccTerminalAuth != nil {
+		ccTerminalAuth.Stop()
+	}
+
+	if ccTerminalServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = ccTerminalServer.Stop(ctx)
+	}
+
+	ccTerminalRunning = false
+}
+
+// getOrgIDFromConfig gets the organization ID from manifest or device config
+func getOrgIDFromConfig() string {
+	// Try manifest first
+	if manifest, _, err := findAndReadManifest(); err == nil && manifest.Node.OrgID != "" {
+		return manifest.Node.OrgID
+	}
+	// Try device config
+	if deviceConfig := getDeviceConfigFromFile(); deviceConfig != nil && deviceConfig.OrgID != "" {
+		return deviceConfig.OrgID
+	}
+	return ""
 }
 
 // gatherControlCenterData collects all data for the control center
@@ -292,6 +439,14 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	data.WorkerRunning = ccWorkerRunning
 	data.WorkerQueue = ccWorkerQueue
 	ccWorkerMu.Unlock()
+
+	// Demo server URL (always running when control center is active)
+	data.DemoServerURL = fmt.Sprintf("http://localhost:%d", ccDemoPort)
+
+	// Terminal server URL (only shown when running and connected)
+	if ccTerminalRunning {
+		data.TerminalServerURL = fmt.Sprintf("ws://localhost:%d/terminal", ccTerminalPort)
+	}
 
 	return data, nil
 }
