@@ -92,6 +92,12 @@ type StatusData struct {
 	// Jobs
 	Jobs JobStats
 
+	// Demo server
+	DemoServerURL string
+
+	// Terminal server
+	TerminalServerURL string
+
 	// Worker status
 	WorkerRunning bool
 	WorkerQueue   string
@@ -1093,6 +1099,16 @@ func (cc *ControlCenter) updateNodePanel() {
 	}
 
 	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s\n", statusIcon, statusText))
+
+	// Demo server URL
+	if cc.data.DemoServerURL != "" {
+		sb.WriteString(fmt.Sprintf(" [yellow]Demo:[-]   [cyan]%s[-]\n", cc.data.DemoServerURL))
+	}
+
+	// Terminal server URL (only shown when connected)
+	if cc.data.TerminalServerURL != "" {
+		sb.WriteString(fmt.Sprintf(" [yellow]Terminal:[-] [cyan]%s[-]\n", cc.data.TerminalServerURL))
+	}
 
 	// Heartbeat indicator
 	if cc.data.HeartbeatActive {
