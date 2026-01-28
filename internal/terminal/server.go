@@ -128,18 +128,19 @@ func (s *Server) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	s.logger.Printf("starting terminal server on port %d", s.config.Port)
+	s.logger.Printf("starting terminal server on %s:%d", s.config.Host, s.config.Port)
 	s.logger.Debugf("configuration: max_connections=%d, idle_timeout=%v, shell=%s, org_id=%s",
 		s.config.MaxConnections, s.config.IdleTimeout, s.config.Shell, s.config.OrgID)
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/terminal", s.handleWebSocket)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/stats", s.handleStats)
 
 	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf(":%d", s.config.Port),
+		Addr:         fmt.Sprintf("%s:%d", s.config.Host, s.config.Port),
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -210,6 +211,20 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
+// writeJSONError writes a JSON-formatted error response
+func writeJSONError(w http.ResponseWriter, message string, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"error":"%s","status":%d}`, message, status)
+}
+
+// handleRoot handles requests to the root endpoint
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"service":"citadel-terminal","version":"%s","endpoints":["/terminal","/health","/stats"]}`, s.config.Version)
+}
+
 // handleHealth handles health check requests
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -241,7 +256,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !s.limiter.Allow(ip) {
 		s.logger.Printf("rate limit exceeded for %s", ip)
 		atomic.AddInt64(&s.failedConnections, 1)
-		http.Error(w, ErrRateLimited.Error(), http.StatusTooManyRequests)
+		writeJSONError(w, ErrRateLimited.Error(), http.StatusTooManyRequests)
 		return
 	}
 
@@ -250,7 +265,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		s.logger.Printf("missing token from %s", ip)
 		atomic.AddInt64(&s.failedConnections, 1)
-		http.Error(w, "missing token parameter", http.StatusUnauthorized)
+		writeJSONError(w, "missing token parameter", http.StatusUnauthorized)
 		return
 	}
 
@@ -263,13 +278,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&s.failedConnections, 1)
 		switch err {
 		case ErrInvalidToken, ErrTokenExpired:
-			http.Error(w, err.Error(), http.StatusUnauthorized)
+			writeJSONError(w, err.Error(), http.StatusUnauthorized)
 		case ErrUnauthorized:
-			http.Error(w, err.Error(), http.StatusForbidden)
+			writeJSONError(w, err.Error(), http.StatusForbidden)
 		case ErrAuthServiceUnavailable:
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			writeJSONError(w, err.Error(), http.StatusServiceUnavailable)
 		default:
-			http.Error(w, "authentication failed", http.StatusUnauthorized)
+			writeJSONError(w, "authentication failed", http.StatusUnauthorized)
 		}
 		return
 	}
@@ -280,7 +295,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if s.sessions.Count() >= s.config.MaxConnections {
 		s.logger.Printf("max connections reached (%d), rejecting %s", s.config.MaxConnections, ip)
 		atomic.AddInt64(&s.failedConnections, 1)
-		http.Error(w, ErrMaxConnectionsReached.Error(), http.StatusServiceUnavailable)
+		writeJSONError(w, ErrMaxConnectionsReached.Error(), http.StatusServiceUnavailable)
 		return
 	}
 

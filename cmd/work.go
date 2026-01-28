@@ -50,6 +50,7 @@ var (
 
 	// Terminal server flags
 	workTerminal      bool
+	workTerminalHost  string
 	workTerminalPort  int
 	workTerminalDebug bool
 
@@ -505,6 +506,10 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig := terminal.DefaultConfig()
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
+				termConfig.Version = Version
+				if workTerminalHost != "" {
+					termConfig.Host = workTerminalHost
+				}
 				if workTerminalPort > 0 {
 					termConfig.Port = workTerminalPort
 				}
@@ -527,7 +532,7 @@ func runWork(cmd *cobra.Command, args []string) {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ Token cache error: %v\n", err)
 					}
 
-					fmt.Printf("   - Terminal server: ws://localhost:%d/terminal\n", termConfig.Port)
+					fmt.Printf("   - Terminal server: ws://%s:%d/terminal\n", termConfig.Host, termConfig.Port)
 					if err := termServer.Start(); err != nil {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ Terminal server error: %v\n", err)
 					}
@@ -682,6 +687,7 @@ func init() {
 
 	// Terminal server flags
 	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")
+	workCmd.Flags().StringVar(&workTerminalHost, "terminal-host", "", "Terminal server bind address (default: 0.0.0.0)")
 	workCmd.Flags().IntVar(&workTerminalPort, "terminal-port", 7860, "Terminal server port (default: 7860)")
 	workCmd.Flags().BoolVar(&workTerminalDebug, "terminal-debug", false, "Enable verbose debug logging for terminal server")
 

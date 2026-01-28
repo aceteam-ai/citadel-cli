@@ -10,8 +10,14 @@ import (
 
 // Config holds the terminal server configuration
 type Config struct {
+	// Host is the address the WebSocket server binds to (default: 0.0.0.0)
+	Host string
+
 	// Port is the port the WebSocket server listens on
 	Port int
+
+	// Version is the server version string (passed from cmd package)
+	Version string
 
 	// Enabled determines whether the terminal service is active
 	Enabled bool
@@ -47,7 +53,9 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
+		Host:                 getEnvOrDefault("CITADEL_TERMINAL_HOST", "0.0.0.0"),
 		Port:                 getEnvInt("CITADEL_TERMINAL_PORT", 7860),
+		Version:              "dev",
 		Enabled:              getEnvBool("CITADEL_TERMINAL_ENABLED", true),
 		IdleTimeout:          time.Duration(getEnvInt("CITADEL_TERMINAL_IDLE_TIMEOUT", 30)) * time.Minute,
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
