@@ -253,6 +253,10 @@ func startTerminalServer(orgID string) error {
 
 	// Create and start the server
 	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
+
+	// Suppress terminal server logging in TUI mode to prevent display corruption
+	ccTerminalServer.SetSilent()
+
 	if err := ccTerminalServer.Start(); err != nil {
 		ccTerminalAuth.Stop()
 		return fmt.Errorf("failed to start terminal server: %w", err)
@@ -914,8 +918,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])
 
-	// Create handlers
-	handlers := worker.CreateLegacyHandlers()
+	// Create handlers with activity callback to route job output through TUI
+	handlers := worker.CreateLegacyHandlers(activity)
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{

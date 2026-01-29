@@ -34,7 +34,7 @@ func (h *OllamaInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return nil, fmt.Errorf("job payload missing 'model' or 'prompt' field")
 	}
 
-	fmt.Printf("     - [Job %s] Running Ollama inference on model '%s'\n", job.ID, model)
+	ctx.Log("info", "     - [Job %s] Running Ollama inference on model '%s'", job.ID, model)
 
 	ollamaURL := "http://localhost:11434/api/generate"
 	reqPayload := ollamaRequest{

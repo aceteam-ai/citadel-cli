@@ -15,7 +15,7 @@ func (h *OllamaPullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	if !modelOk {
 		return nil, fmt.Errorf("job payload missing 'model' field")
 	}
-	fmt.Printf("     - [Job %s] Pulling Ollama model '%s'\n", job.ID, model)
+	ctx.Log("info", "     - [Job %s] Pulling Ollama model '%s'", job.ID, model)
 	cmd := exec.Command("docker", "exec", "citadel-ollama", "ollama", "pull", model)
 	return cmd.CombinedOutput()
 }

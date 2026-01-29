@@ -23,11 +23,11 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	}
 
 	// --- HEALTH CHECK BLOCK (Preserved as requested) ---
-	fmt.Printf("     - [Job %s] Waiting for vLLM service to become ready...\n", job.ID)
+	ctx.Log("info", "     - [Job %s] Waiting for vLLM service to become ready...", job.ID)
 	if err := h.waitForVLLMReady(); err != nil {
 		return nil, err
 	}
-	fmt.Printf("     - [Job %s] vLLM service is ready. Running inference on model '%s'\n", job.ID, model)
+	ctx.Log("info", "     - [Job %s] vLLM service is ready. Running inference on model '%s'", job.ID, model)
 
 	// --- INFERENCE LOGIC ---
 	vllmCompletionsURL := "http://localhost:8000/v1/completions"
