@@ -11,17 +11,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
-	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
@@ -60,6 +63,12 @@ func runControlCenter() {
 	if !tui.IsTTY() {
 		fmt.Fprintln(os.Stderr, "Control center requires a terminal. Use --daemon for background mode.")
 		os.Exit(1)
+	}
+
+	// Auto-update on startup
+	if updated := ccAutoUpdate(); updated {
+		// Binary was updated, restart
+		return
 	}
 
 	// Suppress tsnet/tailscale logs to prevent TUI corruption
@@ -143,7 +152,7 @@ func runControlCenter() {
 			}
 
 			deviceConfig := getDeviceConfigFromFile()
-			if deviceConfig != nil && (deviceConfig.DeviceAPIToken != "" || deviceConfig.RedisURL != "") {
+			if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 				// Small delay to ensure network is fully ready
 				time.Sleep(500 * time.Millisecond)
 				cc.AddActivity("info", "Starting worker...")
@@ -825,27 +834,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccWorkerMu.Lock()
 		ccWorkerQueue = "api"
 		ccWorkerMu.Unlock()
-	} else if deviceConfig != nil && deviceConfig.RedisURL != "" {
-		// Direct Redis mode
-		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
-			URL:           deviceConfig.RedisURL,
-			Password:      "",
-			QueueName:     "",
-			ConsumerGroup: "",
-			BlockMs:       5000,
-			MaxAttempts:   3,
-			LogFn:         activity, // Route logs through TUI
-		})
-		source = redisSource
-		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
-
-		activity("info", "Worker mode: Direct Redis")
-
-		ccWorkerMu.Lock()
-		ccWorkerQueue = "redis"
-		ccWorkerMu.Unlock()
 	} else {
-		return fmt.Errorf("no job source configured (run 'citadel init' first)")
+		// No device_api_token configured - worker can't start
+		// Note: Direct Redis mode is only available via 'citadel work' command
+		return fmt.Errorf("no API token configured (complete device authorization first)")
 	}
 
 	// Get node name
@@ -940,5 +932,75 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Run the worker (blocks until context is cancelled)
 	return runner.Run(ctx)
+}
+
+// ccAutoUpdate checks for updates and auto-updates if available.
+// Returns true if the binary was updated (caller should restart).
+func ccAutoUpdate() bool {
+	// Check for updates
+	spinner := whimsy.NewSimpleSpinner([]string{"Checking for updates..."})
+	spinner.Start()
+
+	client := update.NewClient(Version)
+	release, err := client.CheckForUpdate()
+	if err != nil {
+		spinner.StopWithWarning(fmt.Sprintf("Update check failed: %v", err))
+		return false
+	}
+
+	if release == nil {
+		spinner.StopWithSuccess(fmt.Sprintf("Running latest version (%s)", Version))
+		return false
+	}
+
+	spinner.StopWithSuccess(fmt.Sprintf("Update available: %s → %s", Version, release.TagName))
+
+	// Download update
+	dlSpinner := whimsy.NewSimpleSpinner([]string{"Downloading update..."})
+	dlSpinner.Start()
+
+	pendingPath := update.GetPendingBinaryPath()
+	if err := client.DownloadAndVerify(release, pendingPath); err != nil {
+		dlSpinner.StopWithError(fmt.Sprintf("Download failed: %v", err))
+		return false
+	}
+
+	dlSpinner.StopWithSuccess("Downloaded and verified")
+
+	// Install update
+	installSpinner := whimsy.NewSimpleSpinner([]string{"Installing update..."})
+	installSpinner.Start()
+
+	if err := update.ApplyUpdate(pendingPath); err != nil {
+		installSpinner.StopWithError(fmt.Sprintf("Install failed: %v", err))
+		return false
+	}
+
+	// Update state
+	state, _ := update.LoadState()
+	update.RecordUpdate(state, Version, release.TagName)
+	update.UpdateLastCheck(state)
+	_ = update.SaveState(state)
+
+	installSpinner.StopWithSuccess(fmt.Sprintf("Updated to %s, restarting...", release.TagName))
+
+	// Small delay to show the message
+	time.Sleep(500 * time.Millisecond)
+
+	// Restart by exec'ing the new binary
+	execPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
+		fmt.Println("Please restart citadel manually.")
+		return true
+	}
+
+	// Re-exec with the same arguments
+	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
+		fmt.Println("Please restart citadel manually.")
+	}
+
+	return true
 }
 
