@@ -30,18 +30,18 @@ func (h *DownloadModelHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	destDir := filepath.Join(homeDir, "citadel-cache", modelType)
 	destPath := filepath.Join(destDir, fileName)
 
-	fmt.Printf("     - [Job %s] Preparing to download model to %s\n", job.ID, destPath)
+	ctx.Log("info", "     - [Job %s] Preparing to download model to %s", job.ID, destPath)
 
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create destination directory %s: %w", destDir, err)
 	}
 
 	if _, statErr := os.Stat(destPath); statErr == nil {
-		fmt.Printf("     - [Job %s] Model already exists. Skipping download.\n", job.ID)
+		ctx.Log("info", "     - [Job %s] Model already exists. Skipping download.", job.ID)
 		return []byte(fmt.Sprintf("Model '%s' already exists at %s", fileName, destPath)), nil
 	}
 
-	fmt.Printf("     - [Job %s] Starting download...\n", job.ID)
+	ctx.Log("info", "     - [Job %s] Starting download...", job.ID)
 	cmd := exec.Command("curl", "-L", "--create-dirs", "-o", destPath, fullURL)
 	return cmd.CombinedOutput()
 }

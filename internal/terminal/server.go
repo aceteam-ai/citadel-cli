@@ -45,13 +45,19 @@ func (l *defaultLogger) Debugf(format string, v ...interface{}) {
 	}
 }
 
+// noOpLogger is a silent logger for TUI mode
+type noOpLogger struct{}
+
+func (l *noOpLogger) Printf(format string, v ...interface{}) {}
+func (l *noOpLogger) Debugf(format string, v ...interface{}) {}
+
 // Server is the WebSocket terminal server
 type Server struct {
 	config   *Config
 	sessions *SessionManager
 	auth     TokenValidator
 	limiter  *RateLimiter
-	logger   *defaultLogger
+	logger   Logger
 
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
@@ -70,13 +76,12 @@ type Server struct {
 
 // NewServer creates a new terminal server
 func NewServer(config *Config, auth TokenValidator) *Server {
-	logger := newDefaultLogger(config.Debug)
 	s := &Server{
 		config:          config,
 		sessions:        NewSessionManager(config.MaxConnections),
 		auth:            auth,
 		limiter:         NewRateLimiter(config.RateLimitRPS, config.RateLimitBurst),
-		logger:          logger,
+		logger:          newDefaultLogger(config.Debug),
 		stopIdleChecker: make(chan struct{}),
 	}
 
@@ -89,6 +94,12 @@ func NewServer(config *Config, auth TokenValidator) *Server {
 	}
 
 	return s
+}
+
+// SetSilent switches to a no-op logger to suppress all output.
+// Use this in TUI mode to prevent log messages from corrupting the display.
+func (s *Server) SetSilent() {
+	s.logger = &noOpLogger{}
 }
 
 // NewServerWithDebug creates a new terminal server with debug logging enabled

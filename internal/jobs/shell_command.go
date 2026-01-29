@@ -16,7 +16,7 @@ func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, e
 	if !ok {
 		return nil, fmt.Errorf("job payload missing 'command' field")
 	}
-	fmt.Printf("     - [Job %s] Running shell command: '%s'\n", job.ID, cmdString)
+	ctx.Log("info", "     - [Job %s] Running shell command: '%s'", job.ID, cmdString)
 	parts := strings.Fields(cmdString)
 	cmd := exec.Command(parts[0], parts[1:]...)
 	return cmd.CombinedOutput()

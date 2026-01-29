@@ -13,6 +13,7 @@ import (
 type LegacyHandlerAdapter struct {
 	jobType string
 	handler jobs.JobHandler
+	logFn   func(level, msg string)
 }
 
 // NewLegacyHandlerAdapter creates an adapter for an existing job handler.
@@ -21,6 +22,11 @@ func NewLegacyHandlerAdapter(jobType string, handler jobs.JobHandler) *LegacyHan
 		jobType: jobType,
 		handler: handler,
 	}
+}
+
+// SetLogFn sets the logging callback for routing job output through TUI.
+func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
+	a.logFn = logFn
 }
 
 // CanHandle returns true if this adapter handles the given job type.
@@ -48,8 +54,8 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 		}
 	}
 
-	// Execute the legacy handler
-	jobCtx := jobs.JobContext{}
+	// Execute the legacy handler with log callback
+	jobCtx := jobs.JobContext{LogFn: a.logFn}
 	output, err := a.handler.Execute(jobCtx, nexusJob)
 
 	duration := time.Since(start)
@@ -79,8 +85,14 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
-func CreateLegacyHandlers() []JobHandler {
-	return []JobHandler{
+// If logFn is provided, job output will be routed through it instead of stdout.
+func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
+	var fn func(level, msg string)
+	if len(logFn) > 0 {
+		fn = logFn[0]
+	}
+
+	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeShellCommand, &jobs.ShellCommandHandler{}),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),
@@ -89,4 +101,18 @@ func CreateLegacyHandlers() []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeOllamaInference, &jobs.OllamaInferenceHandler{}),
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
 	}
+
+	// Set log function on all handlers
+	if fn != nil {
+		for _, h := range handlers {
+			h.SetLogFn(fn)
+		}
+	}
+
+	// Convert to []JobHandler
+	result := make([]JobHandler, len(handlers))
+	for i, h := range handlers {
+		result[i] = h
+	}
+	return result
 }

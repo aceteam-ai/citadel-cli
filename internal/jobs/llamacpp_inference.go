@@ -31,7 +31,7 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	}
 
 	// --- Step 1: Restart the llama.cpp container with the correct model ---
-	fmt.Printf("     - [Job %s] Configuring llama.cpp to use model '%s'\n", job.ID, modelFile)
+	ctx.Log("info", "     - [Job %s] Configuring llama.cpp to use model '%s'", job.ID, modelFile)
 	homeDir := getUserHomeDir()
 	composeFile := filepath.Join(homeDir, "citadel-node/services/llamacpp.yml") // Assuming standard path
 	newCommand := fmt.Sprintf("--model /models/%s --host 0.0.0.0 --port 8080 --n-gpu-layers -1", modelFile)
@@ -43,13 +43,13 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	}
 
 	// --- Step 2: Wait for the server to become ready ---
-	fmt.Printf("     - [Job %s] Waiting for llama.cpp server to initialize...\n", job.ID)
+	ctx.Log("info", "     - [Job %s] Waiting for llama.cpp server to initialize...", job.ID)
 	if err := h.waitForLlamaCppReady(); err != nil {
 		return nil, err
 	}
 
 	// --- Step 3: Perform the inference ---
-	fmt.Printf("     - [Job %s] Running Llama.cpp inference\n", job.ID)
+	ctx.Log("info", "     - [Job %s] Running Llama.cpp inference", job.ID)
 	return h.performInference(prompt)
 }
 
