@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -18,8 +19,10 @@ import (
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
+	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -284,6 +287,22 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	Debug("final node name: %s", nodeName)
 
+	// Open usage store for per-job compute tracking
+	var usageStore *usage.Store
+	if nodeDir, err := platform.DefaultNodeDir(""); err != nil {
+		fmt.Fprintf(os.Stderr, "   - Warning: Usage tracking disabled (no node dir): %v\n", err)
+	} else {
+		usageDBPath := filepath.Join(nodeDir, "usage.db")
+		store, err := usage.OpenStore(usageDBPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: Usage tracking disabled: %v\n", err)
+		} else {
+			usageStore = store
+			defer usageStore.Close()
+			Debug("usage store: %s", usageDBPath)
+		}
+	}
+
 	// Create status collector (used by both status server and heartbeat)
 	var collector *status.Collector
 	if workStatusPort > 0 || workHeartbeat {
@@ -541,13 +560,44 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Start usage syncer if store is available
+	if usageStore != nil {
+		publishFn := createUsagePublishFn(useAPIMode, apiSource, workRedisURL, workRedisPass)
+		if publishFn != nil {
+			syncer := usage.NewSyncer(usage.SyncerConfig{
+				Store:     usageStore,
+				PublishFn: publishFn,
+			})
+			go func() {
+				Debug("usage syncer started (60s interval)")
+				if err := syncer.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - Warning: Usage syncer error: %v\n", err)
+				}
+			}()
+		} else {
+			Debug("usage syncer: no publish target available (local-only tracking)")
+		}
+	}
+
 	// Create handlers (use legacy adapters for now)
 	handlers := worker.CreateLegacyHandlers()
 
+	// Build job record function for usage tracking
+	var jobRecordFn func(record usage.UsageRecord)
+	if usageStore != nil {
+		jobRecordFn = func(record usage.UsageRecord) {
+			record.NodeID = nodeName
+			if err := usageStore.Insert(record); err != nil {
+				Debug("usage insert error: %v", err)
+			}
+		}
+	}
+
 	// Create runner
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
-		WorkerID: workerID,
-		Verbose:  true,
+		WorkerID:    workerID,
+		Verbose:     true,
+		JobRecordFn: jobRecordFn,
 	})
 
 	// Add stream writer factory if available
@@ -655,6 +705,116 @@ func getDeviceConfigFromFile() *DeviceConfig {
 	}
 
 	return &config
+}
+
+// createUsagePublishFn returns a function that publishes usage records to Redis.
+// Returns nil if no publish target is available (records will be stored locally only).
+func createUsagePublishFn(useAPI bool, apiSource *worker.APISource, redisURL, redisPass string) usage.PublishFunc {
+	const streamName = "node:usage:stream"
+	const maxLen int64 = 50000
+
+	if useAPI && apiSource != nil {
+		// API mode: use the secure API client
+		return func(ctx context.Context, records []usage.UsageRecord) error {
+			client := apiSource.Client()
+			for _, r := range records {
+				payload, err := json.Marshal(usageStreamEntry{
+					Version: "1.0",
+					NodeID:  r.NodeID,
+					Record:  usageRecordPayload(r),
+				})
+				if err != nil {
+					return fmt.Errorf("marshal usage record: %w", err)
+				}
+				if err := client.StreamAdd(ctx, streamName, map[string]string{
+					"data": string(payload),
+				}, maxLen); err != nil {
+					return fmt.Errorf("stream add: %w", err)
+				}
+			}
+			return nil
+		}
+	}
+
+	if redisURL != "" {
+		// Direct Redis mode: create client once, reuse across sync cycles
+		opts, err := goredis.ParseURL(redisURL)
+		if err != nil {
+			return nil
+		}
+		if redisPass != "" {
+			opts.Password = redisPass
+		}
+		rdb := goredis.NewClient(opts)
+
+		return func(ctx context.Context, records []usage.UsageRecord) error {
+			for _, r := range records {
+				payload, err := json.Marshal(usageStreamEntry{
+					Version: "1.0",
+					NodeID:  r.NodeID,
+					Record:  usageRecordPayload(r),
+				})
+				if err != nil {
+					return fmt.Errorf("marshal usage record: %w", err)
+				}
+				if err := rdb.XAdd(ctx, &goredis.XAddArgs{
+					Stream: streamName,
+					MaxLen: maxLen,
+					Approx: true,
+					Values: map[string]string{
+						"data": string(payload),
+					},
+				}).Err(); err != nil {
+					return fmt.Errorf("xadd: %w", err)
+				}
+			}
+			return nil
+		}
+	}
+
+	return nil
+}
+
+type usageStreamEntry struct {
+	Version string             `json:"version"`
+	NodeID  string             `json:"nodeId"`
+	Record  usageRecordJSON    `json:"record"`
+}
+
+// usageRecordJSON is the JSON representation published to Redis.
+// ErrorMessage is intentionally excluded to avoid leaking internal error details.
+type usageRecordJSON struct {
+	JobID            string `json:"jobId"`
+	JobType          string `json:"jobType"`
+	Backend          string `json:"backend,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Status           string `json:"status"`
+	StartedAt        string `json:"startedAt"`
+	CompletedAt      string `json:"completedAt"`
+	DurationMs       int64  `json:"durationMs"`
+	PromptTokens     int64  `json:"promptTokens,omitempty"`
+	CompletionTokens int64  `json:"completionTokens,omitempty"`
+	TotalTokens      int64  `json:"totalTokens,omitempty"`
+	RequestBytes     int64  `json:"requestBytes,omitempty"`
+	ResponseBytes    int64  `json:"responseBytes,omitempty"`
+}
+
+func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
+	return usageRecordJSON{
+		JobID:            r.JobID,
+		JobType:          r.JobType,
+		Backend:          r.Backend,
+		Model:            r.Model,
+		Status:           r.Status,
+		StartedAt:        r.StartedAt.UTC().Format(time.RFC3339),
+		CompletedAt:      r.CompletedAt.UTC().Format(time.RFC3339),
+		DurationMs:       r.DurationMs,
+		PromptTokens:     r.PromptTokens,
+		CompletionTokens: r.CompletionTokens,
+		TotalTokens:      r.TotalTokens,
+		RequestBytes:     r.RequestBytes,
+		ResponseBytes:    r.ResponseBytes,
+	}
 }
 
 func init() {

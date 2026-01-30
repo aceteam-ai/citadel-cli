@@ -2,11 +2,15 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
 // Runner orchestrates job processing from a source through handlers.
@@ -18,7 +22,7 @@ type Runner struct {
 	// Optional integrations (set via WithXxx methods)
 	streamWriterFactory func(jobID string) StreamWriter
 	activityFn          func(level, msg string)
-	jobRecordFn         func(id, jobType, status string, started, completed time.Time, err error)
+	jobRecordFn         func(record usage.UsageRecord)
 }
 
 // RunnerConfig holds configuration for the runner.
@@ -32,8 +36,8 @@ type RunnerConfig struct {
 	// ActivityFn is called for log messages (if set, suppresses stdout)
 	ActivityFn func(level, msg string)
 
-	// JobRecordFn is called when a job completes (for history tracking)
-	JobRecordFn func(id, jobType, status string, started, completed time.Time, err error)
+	// JobRecordFn is called when a job completes (for usage tracking)
+	JobRecordFn func(record usage.UsageRecord)
 }
 
 // NewRunner creates a new job runner.
@@ -62,10 +66,10 @@ func (r *Runner) log(level, format string, args ...interface{}) {
 	}
 }
 
-// recordJob records a job completion for history tracking
-func (r *Runner) recordJob(id, jobType, status string, started, completed time.Time, err error) {
+// recordJob records a job completion for usage tracking
+func (r *Runner) recordJob(record usage.UsageRecord) {
 	if r.jobRecordFn != nil {
-		r.jobRecordFn(id, jobType, status, started, completed, err)
+		r.jobRecordFn(record)
 	}
 }
 
@@ -168,7 +172,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	if handler == nil {
 		err := fmt.Errorf("no handler for job type: %s", job.Type)
 		r.log("error", "No handler: %v", err)
-		r.recordJob(job.ID, job.Type, "failed", startTime, time.Now(), err)
+		r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
 		r.source.Nack(ctx, job, err)
 		return
 	}
@@ -194,7 +198,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 			actualErr = result.Error
 		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
-		r.recordJob(job.ID, job.Type, "failed", startTime, endTime, actualErr)
+		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
 		stream.WriteError(actualErr, false)
 		r.source.Nack(ctx, job, actualErr)
 		return
@@ -202,20 +206,87 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 
 	if result != nil && result.Status == JobStatusRetry {
 		r.log("warning", "Job %s needs retry (%v)", job.ID, duration)
-		r.recordJob(job.ID, job.Type, "retry", startTime, endTime, result.Error)
+		r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, result.Error))
 		r.source.Nack(ctx, job, result.Error)
 		return
 	}
 
 	// Success
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
-	r.recordJob(job.ID, job.Type, "success", startTime, endTime, nil)
+	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
 	if result != nil {
 		stream.WriteEnd(result.Output)
 	} else {
 		stream.WriteEnd(nil)
 	}
 	r.source.Ack(ctx, job)
+}
+
+// buildUsageRecord constructs a UsageRecord from job execution context.
+func buildUsageRecord(job *Job, status string, started, completed time.Time, result *JobResult, err error) usage.UsageRecord {
+	r := usage.UsageRecord{
+		JobID:       job.ID,
+		JobType:     job.Type,
+		Status:      status,
+		StartedAt:   started,
+		CompletedAt: completed,
+		DurationMs:  completed.Sub(started).Milliseconds(),
+	}
+
+	// Extract backend and model from job payload
+	if v, ok := job.Payload["backend"]; ok {
+		if s, ok := v.(string); ok {
+			r.Backend = s
+		}
+	}
+	if v, ok := job.Payload["model"]; ok {
+		if s, ok := v.(string); ok {
+			r.Model = s
+		}
+	}
+
+	// Extract usage metrics from result output (_usage_* keys)
+	if result != nil && result.Output != nil {
+		r.PromptTokens = intFromOutput(result.Output, "_usage_prompt_tokens")
+		r.CompletionTokens = intFromOutput(result.Output, "_usage_completion_tokens")
+		r.TotalTokens = intFromOutput(result.Output, "_usage_total_tokens")
+		r.RequestBytes = intFromOutput(result.Output, "_usage_request_bytes")
+		r.ResponseBytes = intFromOutput(result.Output, "_usage_response_bytes")
+	}
+
+	if err != nil {
+		msg := err.Error()
+		if len(msg) > 1024 {
+			msg = msg[:1024]
+		}
+		r.ErrorMessage = msg
+	}
+
+	return r
+}
+
+// intFromOutput extracts an int64 value from a map[string]any.
+func intFromOutput(m map[string]any, key string) int64 {
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		if n != n || n > float64(math.MaxInt64) || n < float64(math.MinInt64) { // NaN or overflow
+			return 0
+		}
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+	}
+	return 0
 }
 
 // RegisterHandler adds a handler to the runner.

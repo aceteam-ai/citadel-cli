@@ -25,6 +25,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
@@ -918,9 +919,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		WorkerID:   workerID,
 		Verbose:    false,
 		ActivityFn: activity, // Route logs through TUI
-		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+		JobRecordFn: func(record usage.UsageRecord) {
 			// Job recording callback - could be extended to pass to TUI
 			// For now, the activity log covers job status
+			_ = record
 		},
 	})
 
