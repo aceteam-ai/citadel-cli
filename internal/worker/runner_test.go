@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
 // MockJobSource is a test implementation of JobSource.
@@ -422,28 +424,14 @@ func TestRunnerJobRecordCallback(t *testing.T) {
 	handlers := []JobHandler{successHandler, failHandler}
 
 	// Track job records
-	var jobRecords []struct {
-		id        string
-		jobType   string
-		status    string
-		started   time.Time
-		completed time.Time
-		err       error
-	}
+	var jobRecords []usage.UsageRecord
 	var recordMu sync.Mutex
 
 	config := RunnerConfig{
 		WorkerID: "test-worker",
-		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+		JobRecordFn: func(record usage.UsageRecord) {
 			recordMu.Lock()
-			jobRecords = append(jobRecords, struct {
-				id        string
-				jobType   string
-				status    string
-				started   time.Time
-				completed time.Time
-				err       error
-			}{id, jobType, status, started, completed, err})
+			jobRecords = append(jobRecords, record)
 			recordMu.Unlock()
 		},
 	}
@@ -466,43 +454,39 @@ func TestRunnerJobRecordCallback(t *testing.T) {
 
 	// Check success record
 	recordMu.Lock()
-	var successRecord, failRecord struct {
-		id        string
-		jobType   string
-		status    string
-		started   time.Time
-		completed time.Time
-		err       error
-	}
+	var successRecord, failRecord usage.UsageRecord
 	for _, r := range jobRecords {
-		if r.id == "job-1" {
+		if r.JobID == "job-1" {
 			successRecord = r
 		}
-		if r.id == "job-2" {
+		if r.JobID == "job-2" {
 			failRecord = r
 		}
 	}
 	recordMu.Unlock()
 
-	if successRecord.status != "success" {
-		t.Errorf("Success job status = %s, want success", successRecord.status)
+	if successRecord.Status != "success" {
+		t.Errorf("Success job status = %s, want success", successRecord.Status)
 	}
-	if successRecord.err != nil {
-		t.Errorf("Success job error = %v, want nil", successRecord.err)
+	if successRecord.ErrorMessage != "" {
+		t.Errorf("Success job error = %q, want empty", successRecord.ErrorMessage)
 	}
-	if successRecord.started.IsZero() {
+	if successRecord.StartedAt.IsZero() {
 		t.Error("Success job started time should not be zero")
 	}
-	if successRecord.completed.IsZero() {
+	if successRecord.CompletedAt.IsZero() {
 		t.Error("Success job completed time should not be zero")
+	}
+	if successRecord.DurationMs < 0 {
+		t.Error("Success job duration should not be negative")
 	}
 
 	// Check failed record
-	if failRecord.status != "failed" {
-		t.Errorf("Failed job status = %s, want failed", failRecord.status)
+	if failRecord.Status != "failed" {
+		t.Errorf("Failed job status = %s, want failed", failRecord.Status)
 	}
-	if failRecord.err == nil {
-		t.Error("Failed job error should not be nil")
+	if failRecord.ErrorMessage == "" {
+		t.Error("Failed job error should not be empty")
 	}
 }
 
@@ -578,7 +562,7 @@ func TestRunnerConfigJobRecordFnSetOnNew(t *testing.T) {
 	recordCalled := false
 	config := RunnerConfig{
 		WorkerID: "test-worker",
-		JobRecordFn: func(id, jobType, status string, started, completed time.Time, err error) {
+		JobRecordFn: func(record usage.UsageRecord) {
 			recordCalled = true
 		},
 	}
@@ -590,7 +574,7 @@ func TestRunnerConfigJobRecordFnSetOnNew(t *testing.T) {
 	}
 
 	// Verify the function is the one we passed
-	runner.jobRecordFn("test-id", "test-type", "success", time.Now(), time.Now(), nil)
+	runner.jobRecordFn(usage.UsageRecord{JobID: "test-id", JobType: "test-type", Status: "success"})
 	if !recordCalled {
 		t.Error("jobRecordFn should invoke our callback")
 	}
@@ -623,5 +607,5 @@ func TestRunnerRecordJobWithoutCallback(t *testing.T) {
 	runner := NewRunner(source, nil, config)
 
 	// This should not panic even without JobRecordFn
-	runner.recordJob("test-id", "test-type", "success", time.Now(), time.Now(), nil)
+	runner.recordJob(usage.UsageRecord{JobID: "test-id", JobType: "test-type", Status: "success"})
 }
