@@ -111,8 +111,12 @@ func (s *Store) QueryUnsynced(limit int) ([]UsageRecord, error) {
 		); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		r.StartedAt, _ = time.Parse(time.RFC3339, startedAt)
-		r.CompletedAt, _ = time.Parse(time.RFC3339, completedAt)
+		if t, err := time.Parse(time.RFC3339, startedAt); err == nil {
+			r.StartedAt = t
+		}
+		if t, err := time.Parse(time.RFC3339, completedAt); err == nil {
+			r.CompletedAt = t
+		}
 		records = append(records, r)
 	}
 	return records, rows.Err()

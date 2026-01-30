@@ -57,6 +57,7 @@ func NewSyncer(cfg SyncerConfig) *Syncer {
 }
 
 // Start runs the sync loop until the context is cancelled.
+// On shutdown, performs a final drain to publish any remaining records.
 func (s *Syncer) Start(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -64,6 +65,10 @@ func (s *Syncer) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Final drain: try to sync remaining records with a short timeout
+			drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			s.syncOnce(drainCtx)
+			cancel()
 			return ctx.Err()
 		case <-ticker.C:
 			s.syncOnce(ctx)

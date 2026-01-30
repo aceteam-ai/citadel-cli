@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -254,7 +255,11 @@ func buildUsageRecord(job *Job, status string, started, completed time.Time, res
 	}
 
 	if err != nil {
-		r.ErrorMessage = err.Error()
+		msg := err.Error()
+		if len(msg) > 1024 {
+			msg = msg[:1024]
+		}
+		r.ErrorMessage = msg
 	}
 
 	return r
@@ -272,6 +277,9 @@ func intFromOutput(m map[string]any, key string) int64 {
 	case int64:
 		return n
 	case float64:
+		if n != n || n > float64(math.MaxInt64) || n < float64(math.MinInt64) { // NaN or overflow
+			return 0
+		}
 		return int64(n)
 	case json.Number:
 		if i, err := n.Int64(); err == nil {

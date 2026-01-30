@@ -288,14 +288,19 @@ func runWork(cmd *cobra.Command, args []string) {
 	Debug("final node name: %s", nodeName)
 
 	// Open usage store for per-job compute tracking
-	nodeDir, _ := platform.DefaultNodeDir("")
-	usageDBPath := filepath.Join(nodeDir, "usage.db")
-	usageStore, err := usage.OpenStore(usageDBPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "   - Warning: Usage tracking disabled: %v\n", err)
+	var usageStore *usage.Store
+	if nodeDir, err := platform.DefaultNodeDir(""); err != nil {
+		fmt.Fprintf(os.Stderr, "   - Warning: Usage tracking disabled (no node dir): %v\n", err)
 	} else {
-		defer usageStore.Close()
-		Debug("usage store: %s", usageDBPath)
+		usageDBPath := filepath.Join(nodeDir, "usage.db")
+		store, err := usage.OpenStore(usageDBPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: Usage tracking disabled: %v\n", err)
+		} else {
+			usageStore = store
+			defer usageStore.Close()
+			Debug("usage store: %s", usageDBPath)
+		}
 	}
 
 	// Create status collector (used by both status server and heartbeat)
@@ -732,18 +737,17 @@ func createUsagePublishFn(useAPI bool, apiSource *worker.APISource, redisURL, re
 	}
 
 	if redisURL != "" {
-		// Direct Redis mode
-		return func(ctx context.Context, records []usage.UsageRecord) error {
-			opts, err := goredis.ParseURL(redisURL)
-			if err != nil {
-				return fmt.Errorf("parse redis url: %w", err)
-			}
-			if redisPass != "" {
-				opts.Password = redisPass
-			}
-			rdb := goredis.NewClient(opts)
-			defer rdb.Close()
+		// Direct Redis mode: create client once, reuse across sync cycles
+		opts, err := goredis.ParseURL(redisURL)
+		if err != nil {
+			return nil
+		}
+		if redisPass != "" {
+			opts.Password = redisPass
+		}
+		rdb := goredis.NewClient(opts)
 
+		return func(ctx context.Context, records []usage.UsageRecord) error {
 			for _, r := range records {
 				payload, err := json.Marshal(usageStreamEntry{
 					Version: "1.0",
@@ -777,6 +781,8 @@ type usageStreamEntry struct {
 	Record  usageRecordJSON    `json:"record"`
 }
 
+// usageRecordJSON is the JSON representation published to Redis.
+// ErrorMessage is intentionally excluded to avoid leaking internal error details.
 type usageRecordJSON struct {
 	JobID            string `json:"jobId"`
 	JobType          string `json:"jobType"`
