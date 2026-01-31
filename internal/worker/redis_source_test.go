@@ -46,8 +46,8 @@ func TestNewRedisSource(t *testing.T) {
 			if source == nil {
 				t.Fatal("NewRedisSource returned nil")
 			}
-			if source.config.QueueName != tt.wantQueue {
-				t.Errorf("QueueName = %v, want %v", source.config.QueueName, tt.wantQueue)
+			if len(source.queueNames) == 0 || source.queueNames[0] != tt.wantQueue {
+				t.Errorf("queueNames[0] = %v, want %v", source.queueNames, tt.wantQueue)
 			}
 			if source.config.ConsumerGroup != tt.wantGroup {
 				t.Errorf("ConsumerGroup = %v, want %v", source.config.ConsumerGroup, tt.wantGroup)

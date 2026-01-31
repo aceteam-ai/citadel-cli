@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -65,6 +66,10 @@ var (
 
 	// API mode flag
 	workForceDirectRedis bool
+
+	// Capability detection flags
+	workCapabilities string
+	workAutoDetect   bool
 )
 
 var workCmd = &cobra.Command{
@@ -232,11 +237,44 @@ func runWork(cmd *cobra.Command, args []string) {
 			workGroup = os.Getenv("CONSUMER_GROUP")
 		}
 
+		// Resolve queue names: explicit --queue takes priority, otherwise use capabilities
+		var queueNames []string
+		if workQueue != "" {
+			// Explicit queue specified — use it directly (backwards compat)
+			queueNames = []string{workQueue}
+		} else {
+			// Detect and/or parse capabilities to determine queues
+			var allCaps []capabilities.Capability
+
+			if workAutoDetect {
+				fmt.Println("--- Detecting node capabilities ---")
+				detected := capabilities.Detect()
+				allCaps = append(allCaps, detected...)
+				for _, c := range detected {
+					fmt.Printf("   - Detected: %s (%s)\n", c.Tag, c.Description)
+				}
+			}
+
+			if workCapabilities != "" {
+				manual := capabilities.ParseTags(workCapabilities)
+				allCaps = append(allCaps, manual...)
+				for _, c := range manual {
+					fmt.Printf("   - Manual: %s\n", c.Tag)
+				}
+			}
+
+			if len(allCaps) > 0 {
+				baseQueue := "jobs:v1:gpu-general"
+				queueNames = capabilities.ResolveQueues(allCaps, baseQueue)
+			}
+		}
+
 		// Create Redis job source
 		redisSource := worker.NewRedisSource(worker.RedisSourceConfig{
 			URL:           workRedisURL,
 			Password:      workRedisPass,
 			QueueName:     workQueue,
+			QueueNames:    queueNames,
 			ConsumerGroup: workGroup,
 			BlockMs:       workPollMs,
 			MaxAttempts:   workMaxRetries,
@@ -776,9 +814,9 @@ func createUsagePublishFn(useAPI bool, apiSource *worker.APISource, redisURL, re
 }
 
 type usageStreamEntry struct {
-	Version string             `json:"version"`
-	NodeID  string             `json:"nodeId"`
-	Record  usageRecordJSON    `json:"record"`
+	Version string          `json:"version"`
+	NodeID  string          `json:"nodeId"`
+	Record  usageRecordJSON `json:"record"`
 }
 
 // usageRecordJSON is the JSON representation published to Redis.
@@ -857,4 +895,8 @@ func init() {
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
+
+	// Capability detection flags
+	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")
+	workCmd.Flags().BoolVar(&workAutoDetect, "auto-detect", false, "Auto-detect node capabilities (GPU, models, CPU)")
 }
