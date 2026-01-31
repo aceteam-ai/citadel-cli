@@ -219,8 +219,30 @@ func addServiceToManifest(configDir, serviceName string) error {
 		ComposeFile: filepath.Join("./services", serviceName+".yml"),
 	})
 
+	// Auto-add capability tags for specific services
+	serviceTags := map[string][]string{
+		"gliner2": {"extraction:gliner2", "model:gliner2-base-v1"},
+	}
+	if tags, ok := serviceTags[serviceName]; ok {
+		for _, tag := range tags {
+			if !containsTag(manifest.Node.Tags, tag) {
+				manifest.Node.Tags = append(manifest.Node.Tags, tag)
+			}
+		}
+	}
+
 	// Write back
 	return writeManifest(manifestPath, manifest)
+}
+
+// containsTag checks if a tag is already in the tags slice.
+func containsTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureComposeFile ensures the compose file exists in the services directory.

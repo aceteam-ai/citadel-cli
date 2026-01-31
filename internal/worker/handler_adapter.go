@@ -100,6 +100,7 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeVLLMInference, &jobs.VLLMInferenceHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaInference, &jobs.OllamaInferenceHandler{}),
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
+		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 	}
 
 	// Set log function on all handlers

@@ -25,6 +25,7 @@ by 'init --test'.`,
 			"llamacpp": {"DOWNLOAD_MODEL", "LLAMACPP_INFERENCE"},
 			"ollama":   {"OLLAMA_PULL", "OLLAMA_INFERENCE"},
 			"vllm":     {"VLLM_INFERENCE"},
+			"gliner2":  {"GLINER_EXTRACTION"},
 			"none":     {},
 		}
 

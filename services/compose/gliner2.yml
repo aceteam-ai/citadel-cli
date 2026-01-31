@@ -1,0 +1,12 @@
+services:
+  gliner2:
+    image: ghcr.io/aceteam-ai/gliner2-service:latest
+    container_name: citadel-gliner2
+    ports:
+      - "8100:8100"
+    volumes:
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    environment:
+      - MODEL_NAME=fastino/gliner2-base-v1
+      - PORT=8100
+    restart: unless-stopped
