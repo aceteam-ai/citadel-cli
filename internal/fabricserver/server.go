@@ -131,6 +131,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	serviceCount := len(s.services)
 	s.mu.RUnlock()
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   "ok",
 		"node":     s.config.NodeName,
@@ -148,6 +149,7 @@ func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"node":     s.config.NodeName,
 		"services": names,
