@@ -226,10 +226,16 @@ func (c *Client) GetDeliveryCountOnQueue(ctx context.Context, queue, messageID s
 
 // MoveToDLQFromQueue moves a failed message to the DLQ, specifying the source queue.
 func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job, reason string) error {
-	// Extract queue suffix for DLQ name
-	parts := strings.Split(queue, ":")
-	suffix := parts[len(parts)-1]
-	dlqName := fmt.Sprintf("dlq:v1:%s", suffix)
+	// Build DLQ name preserving full tag context
+	// jobs:v1:tag:gpu:rtx4090 -> dlq:v1:tag:gpu:rtx4090
+	// jobs:v1:cpu-general -> dlq:v1:cpu-general
+	var dlqName string
+	if strings.HasPrefix(queue, "jobs:v1:") {
+		dlqName = "dlq:v1:" + strings.TrimPrefix(queue, "jobs:v1:")
+	} else {
+		parts := strings.Split(queue, ":")
+		dlqName = fmt.Sprintf("dlq:v1:%s", parts[len(parts)-1])
+	}
 
 	fields := map[string]interface{}{
 		"original_message_id": job.MessageID,
