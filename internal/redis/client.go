@@ -117,6 +117,19 @@ func (c *Client) EnsureConsumerGroup(ctx context.Context) error {
 	return nil
 }
 
+// EnsureConsumerGroups creates consumer groups for multiple queues.
+func (c *Client) EnsureConsumerGroups(ctx context.Context, queues []string) error {
+	for _, queue := range queues {
+		err := c.client.XGroupCreateMkStream(ctx, queue, c.consumerGroup, "0").Err()
+		if err != nil {
+			if !strings.Contains(err.Error(), "BUSYGROUP") {
+				return fmt.Errorf("failed to create consumer group for %s: %w", queue, err)
+			}
+		}
+	}
+	return nil
+}
+
 // ReadJob reads the next available job from the stream using XREADGROUP.
 // Returns nil if no job is available within the block timeout.
 func (c *Client) ReadJob(ctx context.Context) (*Job, error) {
@@ -141,6 +154,106 @@ func (c *Client) ReadJob(ctx context.Context) (*Job, error) {
 
 	msg := streams[0].Messages[0]
 	return c.parseMessage(msg)
+}
+
+// ReadJobMulti reads the next available job from multiple streams using XREADGROUP.
+// Returns the job and the queue it came from, or nil if no job is available.
+func (c *Client) ReadJobMulti(ctx context.Context, queues []string) (*Job, string, error) {
+	if len(queues) == 0 {
+		return nil, "", fmt.Errorf("no queues specified")
+	}
+
+	// Build streams arg: [queue1, queue2, ..., ">", ">", ...]
+	streamArgs := make([]string, 0, len(queues)*2)
+	streamArgs = append(streamArgs, queues...)
+	for range queues {
+		streamArgs = append(streamArgs, ">")
+	}
+
+	streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    c.consumerGroup,
+		Consumer: c.workerID,
+		Streams:  streamArgs,
+		Count:    1,
+		Block:    time.Duration(c.blockMs) * time.Millisecond,
+	}).Result()
+
+	if err != nil {
+		if err == redis.Nil {
+			return nil, "", nil
+		}
+		return nil, "", fmt.Errorf("failed to read from streams: %w", err)
+	}
+
+	for _, stream := range streams {
+		if len(stream.Messages) > 0 {
+			job, err := c.parseMessage(stream.Messages[0])
+			if err != nil {
+				return nil, "", err
+			}
+			return job, stream.Stream, nil
+		}
+	}
+
+	return nil, "", nil
+}
+
+// AckJobOnQueue acknowledges a message on a specific queue (for multi-queue mode).
+func (c *Client) AckJobOnQueue(ctx context.Context, queue, messageID string) error {
+	return c.client.XAck(ctx, queue, c.consumerGroup, messageID).Err()
+}
+
+// GetDeliveryCountOnQueue returns the delivery count for a message on a specific queue.
+func (c *Client) GetDeliveryCountOnQueue(ctx context.Context, queue, messageID string) (int64, error) {
+	pending, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: queue,
+		Group:  c.consumerGroup,
+		Start:  messageID,
+		End:    messageID,
+		Count:  1,
+	}).Result()
+
+	if err != nil {
+		return 0, err
+	}
+
+	if len(pending) > 0 {
+		return pending[0].RetryCount, nil
+	}
+
+	return 0, nil
+}
+
+// MoveToDLQFromQueue moves a failed message to the DLQ, specifying the source queue.
+func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job, reason string) error {
+	// Build DLQ name preserving full tag context
+	// jobs:v1:tag:gpu:rtx4090 -> dlq:v1:tag:gpu:rtx4090
+	// jobs:v1:cpu-general -> dlq:v1:cpu-general
+	var dlqName string
+	if strings.HasPrefix(queue, "jobs:v1:") {
+		dlqName = "dlq:v1:" + strings.TrimPrefix(queue, "jobs:v1:")
+	} else {
+		parts := strings.Split(queue, ":")
+		dlqName = fmt.Sprintf("dlq:v1:%s", parts[len(parts)-1])
+	}
+
+	fields := map[string]interface{}{
+		"original_message_id": job.MessageID,
+		"original_queue":      queue,
+		"reason":              reason,
+		"moved_at":            time.Now().UTC().Format(time.RFC3339),
+		"worker_id":           c.workerID,
+		"jobId":               job.JobID,
+	}
+
+	if payloadBytes, err := json.Marshal(job.Payload); err == nil {
+		fields["payload"] = string(payloadBytes)
+	}
+
+	return c.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: dlqName,
+		Values: fields,
+	}).Err()
 }
 
 // parseMessage converts a Redis stream message to a Job.

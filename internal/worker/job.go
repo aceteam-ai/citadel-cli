@@ -38,6 +38,9 @@ type Job struct {
 
 	// Metadata contains additional source-specific information
 	Metadata JobMetadata
+
+	// SourceQueue is the queue this job was read from (for multi-queue ACK)
+	SourceQueue string
 }
 
 // JobMetadata contains optional job metadata.
