@@ -89,6 +89,26 @@ go test -v ./cmd -run TestReadManifest
 ./tests/integration.sh
 ```
 
+### Windows E2E Test
+```bash
+# Full E2E test (clean → install → init → verify) on a Windows machine via WinRM
+./scripts/windows-e2e-test.sh --host 192.168.2.207 --user aceteam --password 'P@ssword' --authkey tskey-auth-xxx
+
+# Run a single phase
+./scripts/windows-e2e-test.sh verify --host 192.168.2.207 --user aceteam --password 'P@ssword'
+
+# Skip clean phase (test on already-dirty machine)
+./scripts/windows-e2e-test.sh --skip-clean --host 192.168.2.207 ...
+
+# Install a specific version
+./scripts/windows-e2e-test.sh --version v2.3.0 --host 192.168.2.207 ...
+
+# Dry run (show commands without executing)
+./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+```
+
+Requires `pywinrm` (`pip install pywinrm`) and WinRM enabled on the target machine. See `scripts/windows-e2e-test.sh` header for WinRM setup instructions.
+
 ### Running Locally
 ```bash
 # Most commands require the citadel.yaml manifest in the current directory
@@ -705,6 +725,36 @@ Docker Desktop on Windows requires WSL2:
 - User/group management uses net user commands instead of useradd
 - Passwordless sudo configuration is skipped (Windows uses different privilege model)
 - GPU device reservations in compose files rely on Docker Desktop's WSL2 integration
+- **tsnet syspolicy Access Denied (#92)**: `citadel init` fails to connect to the network on Windows with `syspolicy: failed to get a store reader: Access is denied`. This occurs even when running as Administrator. The tsnet `syspolicy` package tries to register a Windows policy change callback and fails. May be specific to WinRM sessions or non-domain-joined machines. Needs investigation — see issue #92.
+
+### Windows E2E Test Infrastructure
+
+A remote E2E test script (`scripts/windows-e2e-test.sh`) validates the full first-time user experience on a Windows machine via WinRM. It tests: clean → install → init → verify.
+
+**Test machine**: `192.168.2.207` (DESKTOP-6UKHJAN, Windows 11, 8 GiB RAM, user: `acewin`)
+
+**WinRM prerequisites** (one-time on the Windows machine, elevated PowerShell):
+```powershell
+Enable-PSRemoting -Force
+winrm set winrm/config/service/auth '@{Basic="true"}'
+winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+New-NetFirewallRule -Name "WinRM-HTTP" -DisplayName "WinRM HTTP" -Protocol TCP -LocalPort 5985 -Action Allow
+```
+
+**Running**:
+```bash
+# Requires pywinrm in a venv
+PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
+  --host 192.168.2.207 --user acewin --password '***' --authkey tskey-auth-xxx
+```
+
+**Current test status** (as of v2.3.0):
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Clean | PASS | Removes Docker, Citadel dirs, PATH, WSL |
+| Install | PASS | install.ps1 works, binary at `%LOCALAPPDATA%\Citadel` |
+| Provision | FAIL | tsnet syspolicy Access Denied (#92) |
+| Verify (partial) | 2/5 PASS | `citadel version` and `citadel status` work; Docker/network blocked by #92 |
 
 ### Build Script Updates
 

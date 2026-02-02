@@ -392,6 +392,28 @@ Check the node's health at any time:
 
 You should see `🟢 ONLINE` for the network connection and `🟢 RUNNING` for your configured service.
 
+### Windows E2E Testing
+
+A remote E2E test script validates the full first-time user experience on a Windows machine via WinRM (clean → install → init → verify).
+
+```bash
+# Prerequisites: pip install pywinrm (or use a venv)
+# WinRM must be enabled on the target Windows machine
+
+# Full test (all phases)
+PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
+  --host 192.168.2.207 --user acewin --password 'P@ssword' \
+  --authkey tskey-auth-xxx
+
+# Dry run (show commands without executing)
+./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+
+# Run a single phase: clean, install, provision, or verify
+./scripts/windows-e2e-test.sh verify --host 192.168.2.207 ...
+```
+
+See `scripts/windows-e2e-test.sh` for all options and WinRM setup instructions.
+
 ---
 
 ### The `citadel.yaml` Manifest
