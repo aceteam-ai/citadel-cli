@@ -20,6 +20,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WINRM_CMD="$SCRIPT_DIR/winrm-cmd.py"
 
+# --- Python interpreter (override with PYTHON env var) ---
+PYTHON="${PYTHON:-python3}"
+
 # --- Defaults ---
 HOST="${WINRM_HOST:-192.168.2.207}"
 USER="${WINRM_USER:-}"
@@ -95,11 +98,15 @@ fi
 
 # --- Ensure pywinrm is available ---
 ensure_pywinrm() {
-    if ! python3 -c "import winrm" 2>/dev/null; then
+    if ! "$PYTHON" -c "import winrm" 2>/dev/null; then
         echo -e "${YELLOW}Installing pywinrm...${NC}"
-        pip install pywinrm >/dev/null 2>&1
-        if ! python3 -c "import winrm" 2>/dev/null; then
-            echo -e "${RED}Failed to install pywinrm. Run: pip install pywinrm${NC}" >&2
+        if command -v uv &>/dev/null; then
+            uv pip install --python "$PYTHON" pywinrm >/dev/null 2>&1 || true
+        else
+            pip install pywinrm >/dev/null 2>&1 || true
+        fi
+        if ! "$PYTHON" -c "import winrm" 2>/dev/null; then
+            echo -e "${RED}Failed to install pywinrm. Run: pip install pywinrm (or uv pip install pywinrm)${NC}" >&2
             exit 1
         fi
     fi
@@ -120,7 +127,7 @@ run_remote() {
     echo -e "  ${BLUE}→${NC} $description"
     local output
     local exit_code=0
-    output=$(python3 "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" "$command" 2>&1) || exit_code=$?
+    output=$("$PYTHON" "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" "$command" 2>&1) || exit_code=$?
 
     if [[ -n "$output" ]]; then
         echo "$output" | sed 's/^/    /'
@@ -142,27 +149,27 @@ check() {
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "  ${BLUE}[DRY RUN]${NC} Check: $description"
         echo "    PS> $command"
-        ((SKIP_COUNT++))
+        ((SKIP_COUNT++)) || true
         return 0
     fi
 
     echo -ne "  ${BLUE}→${NC} Check: $description ... "
     local output
     local exit_code=0
-    output=$(python3 "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" "$command" 2>&1) || exit_code=$?
+    output=$("$PYTHON" "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" "$command" 2>&1) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         echo -e "${GREEN}PASS${NC}"
         if [[ -n "$output" ]]; then
             echo "$output" | head -5 | sed 's/^/    /'
         fi
-        ((PASS_COUNT++))
+        ((PASS_COUNT++)) || true
     else
         echo -e "${RED}FAIL${NC}"
         if [[ -n "$output" ]]; then
             echo "$output" | head -10 | sed 's/^/    /'
         fi
-        ((FAIL_COUNT++))
+        ((FAIL_COUNT++)) || true
     fi
 }
 
@@ -352,7 +359,7 @@ main() {
     # Test WinRM connectivity
     echo -e "\n${BLUE}Testing WinRM connectivity...${NC}"
     if [[ "$DRY_RUN" != "true" ]]; then
-        if ! python3 "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" 'Write-Output "WinRM OK: $(hostname)"' 2>/dev/null; then
+        if ! "$PYTHON" "$WINRM_CMD" "$HOST" "$USER" "$PASSWORD" 'Write-Output "WinRM OK: $(hostname)"' 2>/dev/null; then
             echo -e "${RED}Cannot connect to ${HOST} via WinRM. Ensure WinRM is enabled.${NC}" >&2
             exit 1
         fi
