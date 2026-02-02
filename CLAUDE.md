@@ -89,6 +89,26 @@ go test -v ./cmd -run TestReadManifest
 ./tests/integration.sh
 ```
 
+### Windows E2E Test
+```bash
+# Full E2E test (clean → install → init → verify) on a Windows machine via WinRM
+./scripts/windows-e2e-test.sh --host 192.168.2.207 --user aceteam --password 'P@ssword' --authkey tskey-auth-xxx
+
+# Run a single phase
+./scripts/windows-e2e-test.sh verify --host 192.168.2.207 --user aceteam --password 'P@ssword'
+
+# Skip clean phase (test on already-dirty machine)
+./scripts/windows-e2e-test.sh --skip-clean --host 192.168.2.207 ...
+
+# Install a specific version
+./scripts/windows-e2e-test.sh --version v2.3.0 --host 192.168.2.207 ...
+
+# Dry run (show commands without executing)
+./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+```
+
+Requires `pywinrm` (`pip install pywinrm`) and WinRM enabled on the target machine. See `scripts/windows-e2e-test.sh` header for WinRM setup instructions.
+
 ### Running Locally
 ```bash
 # Most commands require the citadel.yaml manifest in the current directory
