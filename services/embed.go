@@ -18,16 +18,16 @@ var LlamacppCompose string
 //go:embed compose/lmstudio.yml
 var LMStudioCompose string
 
-//go:embed compose/gliner2.yml
-var GlinerCompose string
+//go:embed compose/extraction.yml
+var ExtractionCompose string
 
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
-	"ollama":   OllamaCompose,
-	"vllm":     VLLMCompose,
-	"llamacpp": LlamacppCompose,
-	"lmstudio": LMStudioCompose,
-	"gliner2":  GlinerCompose,
+	"ollama":     OllamaCompose,
+	"vllm":       VLLMCompose,
+	"llamacpp":   LlamacppCompose,
+	"lmstudio":   LMStudioCompose,
+	"extraction": ExtractionCompose,
 }
 
 // GetAvailableServices returns a sorted list of service names.

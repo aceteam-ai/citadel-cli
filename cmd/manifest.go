@@ -221,7 +221,7 @@ func addServiceToManifest(configDir, serviceName string) error {
 
 	// Auto-add capability tags for specific services
 	serviceTags := map[string][]string{
-		"gliner2": {"extraction:gliner2", "model:gliner2-base-v1"},
+		"extraction": {"extraction:gliner2", "model:gliner2-base-v1"},
 	}
 	if tags, ok := serviceTags[serviceName]; ok {
 		for _, tag := range tags {
