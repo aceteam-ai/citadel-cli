@@ -1,7 +1,7 @@
 services:
-  gliner2:
+  extraction:
     image: ghcr.io/aceteam-ai/gliner2-service:latest
-    container_name: citadel-gliner2
+    container_name: citadel-extraction
     ports:
       - "8100:8100"
     volumes:

@@ -9,8 +9,8 @@ const (
 	// JobTypeEmbedding handles local embedding generation (future)
 	JobTypeEmbedding = "embedding"
 
-	// JobTypeExtraction handles entity/relation extraction via GLiNER2
-	JobTypeExtraction = "GLINER_EXTRACTION"
+	// JobTypeExtraction handles entity/relation extraction
+	JobTypeExtraction = "EXTRACTION"
 )
 
 // Queue names following PR #1105 convention

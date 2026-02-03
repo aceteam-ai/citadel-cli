@@ -526,7 +526,7 @@ func getSelectedService() (string, error) {
 			"vllm (High-throughput OpenAI-compatible API)",
 			"ollama (General purpose, easy to use)",
 			"llamacpp (Versatile GGUF server)",
-			"gliner2 (Entity/relation extraction, CPU-only)",
+			"extraction (Entity/relation extraction, CPU-only)",
 		},
 	)
 	if err != nil {

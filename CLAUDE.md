@@ -725,7 +725,7 @@ Docker Desktop on Windows requires WSL2:
 - User/group management uses net user commands instead of useradd
 - Passwordless sudo configuration is skipped (Windows uses different privilege model)
 - GPU device reservations in compose files rely on Docker Desktop's WSL2 integration
-- **tsnet syspolicy Access Denied (#92)**: `citadel init` fails to connect to the network on Windows with `syspolicy: failed to get a store reader: Access is denied`. This occurs even when running as Administrator. The tsnet `syspolicy` package tries to register a Windows policy change callback and fails. May be specific to WinRM sessions or non-domain-joined machines. Needs investigation — see issue #92.
+- **tsnet syspolicy Access Denied (#92)**: Fixed. `citadel init` previously failed on Windows in non-interactive sessions (WinRM, services) because tsnet's `syspolicy` package tried to acquire a Group Policy read lock via `EnterCriticalPolicySection()`, which requires an interactive logon session. The fix calls `gp.RestrictPolicyLocks()` before `tsnet.Server.Start()` (same approach as `tailscaled_windows.go`), then lifts the restriction after startup. See `internal/network/syspolicy_windows.go`.
 
 ### Windows E2E Test Infrastructure
 
@@ -753,8 +753,8 @@ PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
 |-------|--------|-------|
 | Clean | PASS | Removes Docker, Citadel dirs, PATH, WSL |
 | Install | PASS | install.ps1 works, binary at `%LOCALAPPDATA%\Citadel` |
-| Provision | FAIL | tsnet syspolicy Access Denied (#92) |
-| Verify (partial) | 2/5 PASS | `citadel version` and `citadel status` work; Docker/network blocked by #92 |
+| Provision | PASS | Fixed in #92 (syspolicy lock restriction) |
+| Verify | PENDING | Needs re-run after #92 fix |
 
 ### Build Script Updates
 
