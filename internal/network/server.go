@@ -100,10 +100,16 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 		Logf:       func(format string, args ...any) {}, // Suppress verbose tsnet logs
 	}
 
+	// On Windows, restrict Group Policy locks to avoid ERROR_ACCESS_DENIED
+	// in non-interactive sessions (WinRM, services). No-op on other platforms.
+	removeRestriction := restrictPolicyLocks()
+
 	// Start the server (this initiates the connection)
 	if err := s.srv.Start(); err != nil {
+		removeRestriction()
 		return fmt.Errorf("failed to start network: %w", err)
 	}
+	removeRestriction()
 
 	// Wait for connection to be established
 	if err := s.waitForConnection(ctx); err != nil {
