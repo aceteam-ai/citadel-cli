@@ -35,6 +35,10 @@
             # typically installed system-wide and runs as a daemon.
             # Install via: brew install tailscale (macOS) or system package manager
 
+            # Documentation site (Docusaurus)
+            nodejs_22
+            pnpm
+
             # Common development tools
             curl
             wget

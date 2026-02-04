@@ -6,3 +6,6 @@ release
 # direnv
 .direnv/
 .envrc.local
+docs-site/node_modules/
+docs-site/build/
+docs-site/.docusaurus/
