@@ -12,18 +12,17 @@ Citadel is the on-premise agent that connects your hardware to the AceTeam Sover
 
 **Sovereign.** Your data never leaves your hardware. AI inference runs locally on your machines, not in someone else's data center. Meet compliance requirements without sacrificing capability.
 
-**Simple.** Two commands to go from bare metal to production-ready AI node. No complex networking configuration, no cloud console, no Kubernetes expertise required.
+**Simple.** One command to go from bare metal to production-ready AI node. No complex networking configuration, no cloud console, no Kubernetes expertise required.
 
 **Secure.** Every connection is encrypted end-to-end through a secure mesh network. No inbound ports to open, no VPN appliances to manage, no attack surface to worry about.
 
-## Get Started in 2 Commands
+## Get Started in 1 Command
 
 ```bash
-citadel init
-citadel work
+citadel
 ```
 
-That is all it takes to connect your hardware and start accepting AI workloads from the AceTeam platform.
+That's it. The interactive control center handles everything: login, network connection, service management, and accepting AI workloads. No subcommands to memorize.
 
 ## Documentation Guide
 

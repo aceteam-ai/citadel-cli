@@ -7,6 +7,14 @@ title: Command Reference
 
 All Citadel CLI commands organized by category. Run `citadel <command> --help` for full flag documentation, or `man citadel-<command>` if man pages are installed.
 
+## Interactive Mode
+
+Running `citadel` with no subcommand launches the interactive control center. This is the recommended way to use Citadel -- it handles login, network connection, service management, and job processing in a single unified TUI.
+
+```bash
+citadel
+```
+
 ## Setup and Provisioning
 
 | Command | Description | Key Flags |

@@ -5,72 +5,46 @@ title: Quick Start
 
 # Quick Start
 
-Get your node online in 2 commands.
+Get your node online in 1 command.
 
-## Step 1: Join the AceTeam Network
-
-```bash
-citadel init
-```
-
-This starts the device authorization flow:
-
-1. The CLI displays a one-time code and a URL.
-2. Open [aceteam.ai/device](https://aceteam.ai/device) in your browser.
-3. Enter the code shown in your terminal.
-4. Once approved, your node joins the AceTeam Network automatically.
-
-```
-Your device code is: ABCD-1234
-
-Open https://aceteam.ai/device in your browser and enter the code above.
-Waiting for authorization...
-
-Connected! Node registered as "gpu-server-01"
-```
-
-No sudo required. The CLI uses userspace networking -- no system-level VPN or driver installation needed.
-
-## Step 2: Start the worker
+## Run Citadel
 
 ```bash
-citadel work
+citadel
 ```
 
-This starts your node's services (defined in `citadel.yaml`) and begins accepting AI workloads from the job queue. The worker runs continuously, polling for new jobs and reporting status back to the control plane.
+The interactive control center launches and walks you through everything:
+
+1. **Login** -- If this is your first time, Citadel displays a one-time code and prompts you to open [aceteam.ai/device](https://aceteam.ai/device) in your browser. Enter the code to authorize your node.
+2. **Connect** -- Once authorized, your node joins the AceTeam Network automatically. No sudo required -- the CLI uses userspace networking with no system-level VPN or driver installation.
+3. **Work** -- The worker starts automatically, accepting AI workloads from the job queue.
+
+The control center shows a live dashboard with system vitals, GPU status, network connectivity, running services, and worker activity -- all in one place.
 
 ```
-Starting services...
-  vllm: running
-Worker connected to job queue
-Listening for jobs...
+ ╭─────────────────────────────────────────╮
+ │  CITADEL CONTROL CENTER                 │
+ │                                         │
+ │  Node:     gpu-server-01                │
+ │  Network:  Connected (100.64.0.12)      │
+ │  Worker:   Running                      │
+ │                                         │
+ │  CPU: 8%    MEM: 4.2/32 GiB    GPU: 3%  │
+ │                                         │
+ │  Services:                              │
+ │    vllm     running   port 8000         │
+ │                                         │
+ │  Activity:                              │
+ │    Connected to AceTeam Network         │
+ │    Worker started, listening for jobs... │
+ ╰─────────────────────────────────────────╯
 ```
 
-## Step 3: Verify
-
-```bash
-citadel status
-```
-
-This displays a health dashboard showing system vitals, GPU status, network connectivity, and running services:
-
-```
-Node:       gpu-server-01
-Status:     Online
-Network:    Connected (100.64.0.12)
-Uptime:     2m 34s
-
-CPU:        12 cores, 8% usage
-Memory:     32 GiB total, 4.2 GiB used
-GPU:        NVIDIA RTX 4090 (24 GiB VRAM)
-
-Services:
-  vllm      running   port 8000
-```
+No subcommands to memorize. Everything is managed interactively from the control center.
 
 ## What just happened?
 
-In those two commands, your node:
+By running `citadel`, your node:
 
 1. **Joined the AceTeam Network** -- an encrypted secure mesh network connecting your hardware to the AceTeam control plane. All traffic is end-to-end encrypted.
 2. **Announced its capabilities** -- CPU, memory, GPU, and available services are reported to the platform so workloads can be routed to the right hardware.

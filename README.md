@@ -266,6 +266,12 @@ gh release create v1.2.0 \
 
 ## Command Reference
 
+### Interactive Mode
+
+| Command | Description |
+| :------ | :---------- |
+| `citadel` | **(Recommended)** Launch the interactive control center. Handles login, network, services, and job processing in one place. |
+
 ### Node Setup & Provisioning
 
 | Command                                                                   | Description                                                                                                                                                                                            |
@@ -347,17 +353,14 @@ The status server runs when using `citadel work --status-port=8080`.
 
 This workflow shows how to take a fresh server and turn it into a fully operational Citadel node.
 
-### Quick Start (2 Commands)
+### Quick Start (1 Command)
 
 ```bash
-# 1. Join the AceTeam Network (interactive - opens browser for auth)
-./citadel init
-
-# 2. Start services and run the worker
-./citadel work
+# Launch the interactive control center
+./citadel
 ```
 
-That's it! Your node is now online and accepting jobs.
+That's it! The control center handles login, network connection, service startup, and job processing -- all interactively.
 
 ### Full Provisioning (with system setup)
 
