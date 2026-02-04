@@ -2,6 +2,10 @@
 
 The `citadel` CLI is the on-premise agent and administrator's toolkit for the AceTeam Sovereign Compute Fabric. It allows you to securely connect your own hardware to your AceTeam account, making your resources available to your private workflows.
 
+## Documentation
+
+Full documentation is available at **[aceteam-ai.github.io/citadel-cli](https://aceteam-ai.github.io/citadel-cli/)** -- including architecture guides, tutorials, command reference, and development docs.
+
 ## Core Concepts
 
 - **AceTeam:** The cloud-based control plane where you design and manage workflows.
