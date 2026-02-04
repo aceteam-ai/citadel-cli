@@ -7,82 +7,21 @@ title: Project Structure
 
 An overview of the Citadel CLI repository layout, key files, and internal package responsibilities.
 
-## Directory Tree
+## Top-Level Directories
 
-```
-citadel-cli/
-├── main.go                    # Entry point
-├── build.sh                   # Build script (single or all platforms)
-├── release.sh                 # Release automation
-├── go.mod / go.sum            # Go module definition
-│
-├── cmd/                       # Cobra command implementations
-│   ├── root.go                # Base command and global flags
-│   ├── version.go             # Version variable (injected at build time)
-│   ├── init.go                # Node provisioning and network join
-│   ├── work.go                # Worker mode (Redis Streams job processing)
-│   ├── run.go                 # Start services from manifest
-│   ├── stop.go                # Stop services
-│   ├── status.go              # Health dashboard
-│   ├── login.go               # AceTeam Network authentication
-│   ├── logout.go              # Disconnect from network
-│   ├── logs.go                # Service log streaming
-│   ├── test.go                # Service diagnostic testing
-│   ├── job_handlers.go        # Job handler registration
-│   ├── peers.go               # Service discovery
-│   ├── call.go                # Inter-node HTTP calls
-│   ├── ping.go                # Node reachability check
-│   ├── ssh.go                 # SSH to peer nodes
-│   ├── proxy.go               # HTTP proxy to remote services
-│   ├── expose.go              # Expose local services to fabric
-│   ├── update.go              # Auto-update management
-│   ├── service_cmd.go         # System service management
-│   ├── manifest.go            # Manifest loading and parsing
-│   └── ...                    # Additional command files
-│
-├── internal/                  # Private packages
-│   ├── network/               # Embedded tsnet wrapper
-│   ├── worker/                # Redis Streams job runner
-│   ├── jobs/                  # Job handler implementations
-│   ├── nexus/                 # Nexus API client and device auth
-│   ├── platform/              # Cross-platform utilities
-│   ├── heartbeat/             # Status publishing (HTTP + Redis)
-│   ├── status/                # System metrics collection
-│   ├── redis/                 # Redis Streams client
-│   ├── redisapi/              # Redis API utilities
-│   ├── terminal/              # WebSocket terminal server
-│   ├── discovery/             # Service discovery client
-│   ├── fabricserver/          # Fabric server for inter-node communication
-│   ├── capabilities/          # Node capability detection
-│   ├── services/              # Service management utilities
-│   ├── tui/                   # Terminal UI components
-│   ├── ui/                    # Interactive prompts (survey)
-│   ├── update/                # Auto-update logic
-│   ├── usage/                 # Usage tracking
-│   ├── recommend/             # Service recommendations
-│   ├── compose/               # Docker Compose helpers
-│   └── demo/                  # Demo mode utilities
-│
-├── services/
-│   ├── embed.go               # go:embed directives for compose files
-│   └── compose/               # Embedded Docker Compose files
-│       ├── vllm.yml
-│       ├── ollama.yml
-│       ├── llamacpp.yml
-│       ├── lmstudio.yml
-│       └── extraction.yml
-│
-├── e2e/                       # End-to-end integration tests
-├── tests/                     # Integration test scripts
-│   └── integration.sh
-├── scripts/                   # Build, release, and testing scripts
-│   └── windows-e2e-test.sh
-├── packaging/                 # Platform-specific packaging (macOS app bundle)
-├── homebrew-tap/              # Homebrew formula
-├── .winget/                   # Windows Package Manager manifest
-├── docs/                      # Technical documentation
-└── docs-site/                 # Docusaurus documentation site
-```
+| Directory | Description |
+|-----------|-------------|
+| `cmd/` | Cobra command implementations (one file per command: `init.go`, `work.go`, `status.go`, etc.) |
+| `internal/` | Private Go packages (see [Internal Packages](#internal-packages) below) |
+| `services/` | Embedded Docker Compose files for inference engines (`vllm.yml`, `ollama.yml`, etc.) |
+| `e2e/` | End-to-end integration tests |
+| `tests/` | Integration test scripts |
+| `scripts/` | Build, release, and testing scripts |
+| `packaging/` | Platform-specific packaging (macOS app bundle) |
+| `homebrew-tap/` | Homebrew formula |
+| `.winget/` | Windows Package Manager manifest |
+| `docs/` | Technical documentation |
+| `docs-site/` | Docusaurus documentation site (this site) |
 
 ## Key Files
 

@@ -5,6 +5,10 @@ title: Use Cases
 
 # Use Cases
 
+## Agentic Execution Protocol
+
+Some capabilities described in the Enterprise AI Factory and GPU Marketplace scenarios below are enabled by the upcoming **Agentic Execution Protocol (AEP)**, a vendor-neutral protocol for cross-organization agent invocation. AEP abstracts worker interactions into a standard protocol, allowing any compliant system to participate in the compute fabric. See the [AceTeam roadmap](https://aceteam.ai) for current status.
+
 ## Enterprise AI Factory
 
 ### Regulated Document Processing On-Premise
@@ -25,6 +29,8 @@ By installing Citadel on their GPU servers, the operator connects idle capacity 
 
 The operator generates new revenue from hardware that was previously earning nothing during off-peak hours. Marketplace buyers get access to enterprise-grade GPU infrastructure at competitive rates. The primary tenants experience no performance impact because the orchestration layer respects priority boundaries.
 
+> This use case is detailed further in the [AceTeam Sovereign Compute Whitepaper](https://aceteam.ai/whitepaper).
+
 ## Consultant Multi-Tenant
 
 ### One Platform, Fifteen Clients
@@ -44,3 +50,29 @@ A logistics company processes shipping manifests, customs declarations, and deli
 The company deploys Citadel nodes in each region -- two servers in Frankfurt, two in Singapore, one in Chicago. Using the AceTeam platform's workflow builder, they construct an automated pipeline: incoming documents are classified, routed to the appropriate regional node for extraction, enriched with data from their ERP system, and delivered to downstream systems. The entire pipeline is defined visually in the AceTeam console and executed across the distributed Citadel nodes.
 
 What previously required a team of three engineers maintaining custom integration code across multiple cloud providers now runs as a managed workflow. Processing time drops from hours to minutes. Regional compliance is enforced automatically by the routing rules. And when volume spikes during peak shipping season, the company adds temporary GPU nodes in each region by installing Citadel on rented bare-metal servers -- no code changes, no pipeline redesign, just more capacity joining the network.
+
+## Edge AI and Computer Vision
+
+### Monitoring Remote Sites with On-Device Intelligence
+
+A cattle rancher manages herds across three remote properties, each with limited internet connectivity. Traditional cloud-based monitoring would require reliable broadband at each site -- impractical when the nearest fiber connection is 50 miles away. The rancher needs real-time herd counts, movement tracking, and alerts for animals in distress, all processed locally.
+
+The rancher installs Citadel on a compact edge device (an NVIDIA Jetson or similar) at each property, connected to weatherproof cameras covering pastures and water points. Each node runs an object detection model (such as RF-DETR or YOLO) as a Citadel-managed Docker service. The model processes camera feeds locally -- detecting, counting, and classifying animals in real time -- without sending raw video anywhere.
+
+Detection results (timestamped counts, movement patterns, anomaly flags) are compact structured data, typically a few kilobytes per update. Citadel relays these results through the mesh network to a central node at the ranch office, which runs a database service. Even over a low-bandwidth satellite or cellular link, the detection summaries flow reliably -- raw video stays on the edge device, only insights travel the network.
+
+On the central node, an AceTeam workflow runs periodic analysis over the accumulated data: daily herd counts by pasture, grazing pattern trends, and alerts when a count drops unexpectedly (indicating a gate left open or an animal in trouble). The rancher checks a dashboard from anywhere, with data that is minutes old rather than days.
+
+This same pattern applies beyond agriculture. A logistics company counts trucks at loading docks. A municipality monitors traffic flow at intersections. A warehouse tracks pallet movements. In each case, the architecture is identical: Citadel at the edge running a CV model, the mesh network carrying structured results to a central store, and workflows turning raw detections into actionable intelligence.
+
+## Voice and Audio Generation
+
+### Self-Hosted Creative and Production Audio
+
+Open-source audio models have reached a tipping point. Music generation models like ACE-Step produce full songs in seconds on consumer GPUs. Text-to-speech models like Bark and XTTS clone voices with minutes of sample audio. Speech recognition models like Whisper rival commercial transcription services. All of them run locally, all of them fit in Docker containers, and all of them expose HTTP APIs.
+
+A music production studio installs Citadel on two workstations, each with an RTX 4090. One node runs ACE-Step for music generation and Bark for vocal synthesis. The other runs Whisper for transcription and a fine-tuned XTTS model for the studio's signature voice. Through the fabric, any producer in the studio -- or remote collaborators with access to the network -- can hit these models as standard API endpoints. No cloud subscription, no per-generation fees, no audio data leaving the studio's network.
+
+The same architecture serves production deployments. A company building a voice-enabled customer service application self-hosts its entire audio pipeline on Citadel nodes: Whisper for real-time transcription, a fine-tuned LLM for response generation, and XTTS for natural-sounding replies. The application calls these models through the fabric exactly as it would call a cloud API, but the infrastructure runs on hardware the company controls. When call volume grows, adding another GPU node to the fabric scales the pipeline without code changes.
+
+Because Citadel treats any Docker container with an HTTP endpoint as a service, the voice and audio workflow requires no special integration. The same service management, mesh networking, and job routing that handles LLM inference handles audio generation. A `citadel.yaml` manifest that defines an ACE-Step service looks identical to one that defines a vLLM service -- different container image, same operational model.

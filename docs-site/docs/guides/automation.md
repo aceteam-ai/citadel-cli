@@ -39,9 +39,11 @@ This requires sudo because it modifies system packages and configuration.
 Install Citadel as a system service so it starts automatically on boot:
 
 ```bash
-citadel service install
-citadel service start
+sudo citadel service install
+sudo citadel service start
 ```
+
+> **Note:** System service installation requires root/administrator privileges.
 
 Manage the service lifecycle:
 

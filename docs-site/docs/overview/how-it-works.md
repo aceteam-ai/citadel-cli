@@ -75,3 +75,11 @@ Adding compute capacity to your AceTeam deployment is as simple as installing th
 Each new node independently joins the network, registers its capabilities (GPU model, available memory, supported inference engines), and begins accepting work from the job queue. The orchestration layer discovers new nodes automatically and begins routing work within seconds of the node coming online.
 
 This model scales from a single workstation under a desk to hundreds of GPU servers across multiple data centers -- with the same installation process and the same two commands.
+
+## Performance
+
+The mesh network is built on the WireGuard protocol, an open standard for encrypted tunneling. In most deployments, nodes establish **direct peer-to-peer connections**, meaning traffic flows directly between machines without passing through any intermediary server. This results in near-native network latency -- typically adding less than 1ms overhead compared to unencrypted connections on the same network.
+
+When direct connections are not possible (for example, when both nodes are behind symmetric NAT), the network falls back to relay servers that forward encrypted traffic. Relay connections add latency proportional to the distance between the node and the relay, but this is the exception rather than the rule. In practice, the vast majority of node-to-node traffic uses direct connections.
+
+For AI inference workloads, the network overhead is negligible. A typical LLM inference request involves a few kilobytes of prompt data and a streaming response of token chunks. The compute time on the GPU dominates end-to-end latency by orders of magnitude. Network optimization matters for the job queue and streaming paths, which is why those use Redis Streams and Pub/Sub (see [Job Processing](../architecture/job-processing)) rather than HTTP polling.

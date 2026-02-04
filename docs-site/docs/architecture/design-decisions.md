@@ -24,6 +24,7 @@ This page documents the key architectural decisions in Citadel CLI, the alternat
 **Rationale:**
 
 - **tsnet requires Go.** The embedded Tailscale network stack is a Go library. Using another language would mean either maintaining FFI bindings or running Tailscale as a separate process, defeating the purpose of embedding.
+- **Headscale fork.** AceTeam maintains a fork of Headscale (the coordination server), which is also written in Go. Sharing the language enables direct integration and code reuse between the Citadel agent and the coordination server.
 - **Single binary deployment.** `go build` produces a statically-linked binary with no runtime dependencies. Users download one file and run it. No package managers, no virtual environments, no version conflicts.
 - **Goroutines for the worker.** The Redis Streams worker handles concurrent jobs, streaming responses, heartbeat publishing, and terminal sessions simultaneously. Goroutines provide lightweight concurrency (thousands of concurrent operations with minimal memory overhead) without the complexity of async/await or thread pools.
 - **Cross-compilation.** `GOOS=linux GOARCH=arm64 go build` produces a Linux ARM64 binary from a macOS development machine. The build matrix in `build.sh` covers 6 platform/architecture combinations from a single codebase.
@@ -48,6 +49,7 @@ This page documents the key architectural decisions in Citadel CLI, the alternat
 **Rationale:**
 
 - **No root required.** This is the single most important factor. Requiring `sudo` for installation creates friction, raises security concerns in enterprise environments, and makes the product harder to evaluate. With tsnet, a regular user can run `citadel init` and join the mesh.
+- **Windows bundling.** On Windows, an external network client would require a separate installer, MSI package, and system service setup -- adding significant onboarding friction. Embedding tsnet means the Citadel binary is entirely self-contained on all platforms, including Windows.
 - **No dependency conflicts.** Many machines already run Tailscale for corporate VPN. An external Tailscale installation for Citadel would conflict with the existing one. tsnet uses a separate state directory and does not touch the host's routing table.
 - **Single artifact.** The binary is the complete product. No multi-step installation, no "install Tailscale first" prerequisite, no version compatibility matrix to maintain.
 
@@ -64,7 +66,7 @@ This page documents the key architectural decisions in Citadel CLI, the alternat
 | Approach | Pros | Cons |
 |----------|------|------|
 | **Kubernetes** | Industry standard orchestration | Massive overhead for single-node, requires cluster setup |
-| **Podman** | Rootless, daemonless | Less ecosystem support, GPU passthrough less mature |
+| **Podman** | Rootless, daemonless | Less ecosystem support, GPU passthrough less mature. Worth revisiting as GPU passthrough matures -- rootless containers would eliminate the Docker daemon dependency. |
 | **Native installation** | No container overhead | Dependency hell (CUDA versions, Python versions, library conflicts) |
 | **Docker Compose** | Simple, familiar, portable, GPU support | Requires Docker daemon |
 
@@ -80,7 +82,9 @@ This page documents the key architectural decisions in Citadel CLI, the alternat
 var composeFS embed.FS
 ```
 
-**Service management** uses subprocess calls to `docker compose`:
+**Future consideration:** Podman support is worth exploring once rootless GPU passthrough is stable across distributions. It would remove the Docker daemon as the only external dependency Citadel requires.
+
+**Service management** currently uses subprocess calls to `docker compose`:
 
 ```
 docker compose -f <path> -p citadel-<name> up -d
@@ -89,6 +93,8 @@ docker compose -f <path> -p citadel-<name> logs -f
 ```
 
 The `-p` flag ensures consistent project naming: `citadel-vllm`, `citadel-ollama`, etc.
+
+> **Note:** Subprocess calls to `docker compose` are a known limitation. A future improvement would use a Go library (e.g., the Docker SDK) for container management, improving reliability and error handling.
 
 **Tradeoffs:** Docker daemon is an external dependency (the only one Citadel requires). Docker Desktop on macOS/Windows has licensing implications for large enterprises. Container overhead adds ~50-100 MB memory per service. These are acceptable given the alternative of managing native CUDA/cuDNN installations.
 
@@ -127,6 +133,15 @@ graph LR
 
 **Why not just HTTP polling for everything?** Because 5-second polling latency and lack of streaming are unacceptable for production inference. Users expect sub-second first-token latency when chatting with an LLM.
 
+**Why not WebSockets?** WebSockets were considered but Redis Streams provides several advantages for this workload:
+
+- **Persistence.** If a worker crashes, unacknowledged messages remain in the stream and can be claimed by another worker. WebSocket messages are lost on disconnect.
+- **Consumer groups.** Redis natively distributes messages across multiple consumers with exactly-once delivery semantics. Implementing equivalent fan-out and load balancing over WebSockets requires a custom broker.
+- **Replay.** New workers can read historical messages from the stream. WebSockets only deliver live messages.
+- **Decoupled producers/consumers.** The Python backend and Citadel workers do not need to maintain persistent connections to each other. Redis acts as the durable intermediary.
+
+**Abstraction:** The codebase already abstracts the job source behind a `JobSource` interface, making it possible to add new transport backends (WebSockets, NATS, etc.) without modifying the worker logic.
+
 ## Why Manifest-Driven Configuration?
 
 **Decision:** Node configuration is defined in a `citadel.yaml` manifest file, generated by `citadel init`.
@@ -140,6 +155,7 @@ graph LR
 | **CLI flags only** | No files to manage | Not persistent, error-prone, hard to reproduce |
 | **Environment variables** | Twelve-factor compatible | Hard to see full config, no structure |
 | **Database/API-driven** | Centralized management | Requires connectivity, complex, hard to debug |
+| **SQLite database** | Structured queries, migrations, transactional updates | Not human-editable, harder to debug, overkill for simple config |
 | **YAML manifest** | Declarative, version-controllable, portable | One more file to manage |
 
 **Rationale:**
@@ -148,6 +164,7 @@ graph LR
 - **Version control friendly.** Teams can check `citadel.yaml` into git, template it for fleet deployments, or generate it programmatically.
 - **Debuggable.** When something is wrong, `cat citadel.yaml` shows the full configuration. No hidden state, no "what flags did I pass last time."
 - **Portable.** Copy the manifest to a new machine, run `citadel up`, and get an identical node.
+- **Human-editable.** Unlike SQLite, YAML is readable and editable in any text editor, which matters for operator debugging. When something is wrong, `cat citadel.yaml` shows the full configuration instantly. SQLite would be more appropriate for structured query-heavy configurations, but Citadel's config is small and flat enough that YAML is the better fit.
 
 ## Why Platform Abstractions?
 

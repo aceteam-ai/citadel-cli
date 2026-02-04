@@ -79,6 +79,8 @@ When running in worker mode (`citadel work`), Citadel exposes local HTTP endpoin
 
 These endpoints are bound to the mesh network interface, not the public network. Only nodes on the same AceTeam Network mesh can reach them.
 
+The **AceTeam web dashboard** is the primary consumer of this status data, displaying real-time node health, GPU utilization, and service status across the fleet. The TUI-based status display (`citadel status`) provides a local view of the same data. A future enhancement could expose the TUI as a web-based terminal UI, giving operators a rich status view directly in their browser without SSH access.
+
 ## Device Configuration Flow
 
 The status reporting system enables a zero-touch provisioning flow where users configure nodes from the web UI without further CLI interaction.
@@ -133,6 +135,8 @@ The `internal/heartbeat/` package provides two publisher implementations:
 - Includes the `deviceCode` field when available (populated from `CITADEL_DEVICE_CODE` environment variable or the device auth flow).
 
 Both publishers run as background goroutines and are started by `citadel work` and `citadel up`.
+
+> **Direction: Agentic Execution Protocol (AEP).** The Python worker that processes status streams is evolving toward a protocol-based system -- the Agentic Execution Protocol -- which abstracts worker interactions into a vendor-neutral protocol for cross-organization agent invocation. This would allow any compliant worker (not just the current Python implementation) to consume status events and trigger actions. See the [Agentic Execution Protocol](../overview/use-cases#agentic-execution-protocol) design documentation (in progress).
 
 ## Monitoring Integration
 

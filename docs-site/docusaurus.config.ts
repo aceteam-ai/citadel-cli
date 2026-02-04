@@ -11,8 +11,8 @@ const config: Config = {
     v4: true,
   },
 
-  url: 'https://citadel.aceteam.ai',
-  baseUrl: '/docs/',
+  url: 'https://aceteam-ai.github.io',
+  baseUrl: '/citadel-cli/',
 
   organizationName: 'aceteam-ai',
   projectName: 'citadel-cli',

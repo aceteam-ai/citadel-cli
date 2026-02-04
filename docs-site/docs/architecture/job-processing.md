@@ -42,6 +42,16 @@ graph LR
 - **Nexus mode** is designed for individual on-prem nodes. It is simple, stateless, and requires only HTTP connectivity to Nexus. No Redis infrastructure needed. Ideal for a single GPU workstation in an office.
 - **Redis mode** is designed for AceTeam's private GPU cloud. It handles thousands of concurrent inference requests, supports streaming token delivery, and scales horizontally by adding workers to a consumer group. Required for production inference serving.
 
+### Adaptive Mode Selection
+
+A planned enhancement is automatic mode detection: when a Citadel node starts, it could probe for Redis availability and upgrade from Nexus HTTP polling to Redis Streams transparently. This would allow on-prem nodes to benefit from Redis Streams features when Redis infrastructure is available, without requiring manual configuration changes. The upgrade path would look like:
+
+1. Node starts in Nexus polling mode (zero-config default).
+2. If Redis is detected (via environment variable or service discovery), the worker switches to Redis Streams mode.
+3. If Redis becomes unavailable, the worker falls back to Nexus polling automatically.
+
+This adaptive approach ensures nodes always have a working job processing path while taking advantage of Redis when available.
+
 ## Nexus HTTP Polling
 
 The agent loop runs continuously in `citadel agent` (or `citadel up`, which starts services then runs the agent):
