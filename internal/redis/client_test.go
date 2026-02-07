@@ -1,6 +1,8 @@
 package redis
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,6 +131,7 @@ func TestStreamEvent(t *testing.T) {
 		Version:   "1.0",
 		Type:      "chunk",
 		JobID:     "job-123",
+		RayID:     "ray-abc",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data: map[string]interface{}{
 			"content": "test chunk",
@@ -145,8 +148,49 @@ func TestStreamEvent(t *testing.T) {
 	if event.JobID != "job-123" {
 		t.Errorf("JobID = %v, want job-123", event.JobID)
 	}
+	if event.RayID != "ray-abc" {
+		t.Errorf("RayID = %v, want ray-abc", event.RayID)
+	}
 	if event.Data["content"] != "test chunk" {
 		t.Errorf("Data[content] = %v, want 'test chunk'", event.Data["content"])
+	}
+}
+
+func TestStreamEventOmitsEmptyRayID(t *testing.T) {
+	event := StreamEvent{
+		Version: "1.0",
+		Type:    "start",
+		JobID:   "job-456",
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// RayID should be omitted when empty (omitempty tag)
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, "rayId") {
+		t.Errorf("Empty RayID should be omitted from JSON, got: %s", jsonStr)
+	}
+}
+
+func TestStreamEventIncludesRayID(t *testing.T) {
+	event := StreamEvent{
+		Version: "1.0",
+		Type:    "start",
+		JobID:   "job-456",
+		RayID:   "ray-xyz",
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"rayId":"ray-xyz"`) {
+		t.Errorf("RayID should be included in JSON, got: %s", jsonStr)
 	}
 }
 

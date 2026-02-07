@@ -12,14 +12,16 @@ import (
 type RedisStreamWriter struct {
 	client *redisclient.Client
 	jobID  string
+	rayID  string
 	ctx    context.Context
 }
 
 // NewRedisStreamWriter creates a new Redis-backed stream writer.
-func NewRedisStreamWriter(ctx context.Context, client *redisclient.Client, jobID string) *RedisStreamWriter {
+func NewRedisStreamWriter(ctx context.Context, client *redisclient.Client, jobID, rayID string) *RedisStreamWriter {
 	return &RedisStreamWriter{
 		client: client,
 		jobID:  jobID,
+		rayID:  rayID,
 		ctx:    ctx,
 	}
 }
@@ -27,22 +29,28 @@ func NewRedisStreamWriter(ctx context.Context, client *redisclient.Client, jobID
 // WriteStart signals the beginning of job processing.
 func (w *RedisStreamWriter) WriteStart(message string) error {
 	w.client.SetJobStatus(w.ctx, w.jobID, "processing", nil)
-	return w.client.PublishStart(w.ctx, w.jobID, message)
+	return w.client.PublishStart(w.ctx, w.jobID, w.rayID, message)
 }
 
 // WriteChunk sends an incremental output chunk (e.g., LLM token).
 func (w *RedisStreamWriter) WriteChunk(content string, index int) error {
-	return w.client.PublishChunk(w.ctx, w.jobID, content, index)
+	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
 // WriteEnd signals successful job completion with final result.
 func (w *RedisStreamWriter) WriteEnd(result map[string]any) error {
-	return w.client.PublishEnd(w.ctx, w.jobID, result)
+	return w.client.PublishEnd(w.ctx, w.jobID, w.rayID, result)
 }
 
 // WriteError signals job failure.
 func (w *RedisStreamWriter) WriteError(err error, recoverable bool) error {
-	return w.client.PublishError(w.ctx, w.jobID, err.Error(), recoverable)
+	return w.client.PublishError(w.ctx, w.jobID, w.rayID, err.Error(), recoverable)
+}
+
+// WriteCancelled signals job cancellation.
+func (w *RedisStreamWriter) WriteCancelled(reason string) error {
+	w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
+	return w.client.PublishCancelled(w.ctx, w.jobID, w.rayID, reason)
 }
 
 // Ensure RedisStreamWriter implements StreamWriter
@@ -50,9 +58,9 @@ var _ StreamWriter = (*RedisStreamWriter)(nil)
 
 // CreateRedisStreamWriterFactory returns a factory function for creating Redis stream writers.
 // This is used with Runner.WithStreamWriterFactory().
-func CreateRedisStreamWriterFactory(ctx context.Context, source *RedisSource) func(jobID string) StreamWriter {
-	return func(jobID string) StreamWriter {
-		return NewRedisStreamWriter(ctx, source.Client(), jobID)
+func CreateRedisStreamWriterFactory(ctx context.Context, source *RedisSource) func(job *Job) StreamWriter {
+	return func(job *Job) StreamWriter {
+		return NewRedisStreamWriter(ctx, source.Client(), job.ID, job.RayID)
 	}
 }
 
@@ -61,14 +69,16 @@ func CreateRedisStreamWriterFactory(ctx context.Context, source *RedisSource) fu
 type APIStreamWriter struct {
 	client *redisapi.Client
 	jobID  string
+	rayID  string
 	ctx    context.Context
 }
 
 // NewAPIStreamWriter creates a new API-backed stream writer.
-func NewAPIStreamWriter(ctx context.Context, client *redisapi.Client, jobID string) *APIStreamWriter {
+func NewAPIStreamWriter(ctx context.Context, client *redisapi.Client, jobID, rayID string) *APIStreamWriter {
 	return &APIStreamWriter{
 		client: client,
 		jobID:  jobID,
+		rayID:  rayID,
 		ctx:    ctx,
 	}
 }
@@ -76,22 +86,28 @@ func NewAPIStreamWriter(ctx context.Context, client *redisapi.Client, jobID stri
 // WriteStart signals the beginning of job processing.
 func (w *APIStreamWriter) WriteStart(message string) error {
 	w.client.SetJobStatus(w.ctx, w.jobID, "processing", nil)
-	return w.client.PublishStart(w.ctx, w.jobID, message)
+	return w.client.PublishStart(w.ctx, w.jobID, w.rayID, message)
 }
 
 // WriteChunk sends an incremental output chunk (e.g., LLM token).
 func (w *APIStreamWriter) WriteChunk(content string, index int) error {
-	return w.client.PublishChunk(w.ctx, w.jobID, content, index)
+	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
 // WriteEnd signals successful job completion with final result.
 func (w *APIStreamWriter) WriteEnd(result map[string]any) error {
-	return w.client.PublishEnd(w.ctx, w.jobID, result)
+	return w.client.PublishEnd(w.ctx, w.jobID, w.rayID, result)
 }
 
 // WriteError signals job failure.
 func (w *APIStreamWriter) WriteError(err error, recoverable bool) error {
-	return w.client.PublishError(w.ctx, w.jobID, err.Error(), recoverable)
+	return w.client.PublishError(w.ctx, w.jobID, w.rayID, err.Error(), recoverable)
+}
+
+// WriteCancelled signals job cancellation.
+func (w *APIStreamWriter) WriteCancelled(reason string) error {
+	w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
+	return w.client.PublishCancelled(w.ctx, w.jobID, w.rayID, reason)
 }
 
 // Ensure APIStreamWriter implements StreamWriter
@@ -99,8 +115,8 @@ var _ StreamWriter = (*APIStreamWriter)(nil)
 
 // CreateAPIStreamWriterFactory returns a factory function for creating API stream writers.
 // This is used with Runner.WithStreamWriterFactory().
-func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(jobID string) StreamWriter {
-	return func(jobID string) StreamWriter {
-		return NewAPIStreamWriter(ctx, source.Client(), jobID)
+func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(job *Job) StreamWriter {
+	return func(job *Job) StreamWriter {
+		return NewAPIStreamWriter(ctx, source.Client(), job.ID, job.RayID)
 	}
 }

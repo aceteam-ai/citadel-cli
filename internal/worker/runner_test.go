@@ -12,14 +12,15 @@ import (
 
 // MockJobSource is a test implementation of JobSource.
 type MockJobSource struct {
-	name      string
-	jobs      []*Job
-	jobIndex  int
-	acked     []*Job
-	nacked    []*Job
-	connected bool
-	closed    bool
-	mu        sync.Mutex
+	name           string
+	jobs           []*Job
+	jobIndex       int
+	acked          []*Job
+	nacked         []*Job
+	connected      bool
+	closed         bool
+	mu             sync.Mutex
+	cancelledJobs  map[string]bool
 }
 
 func NewMockJobSource(name string, jobs []*Job) *MockJobSource {
@@ -69,6 +70,15 @@ func (m *MockJobSource) Nack(ctx context.Context, job *Job, err error) error {
 	defer m.mu.Unlock()
 	m.nacked = append(m.nacked, job)
 	return nil
+}
+
+func (m *MockJobSource) IsJobCancelled(ctx context.Context, jobID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancelledJobs == nil {
+		return false
+	}
+	return m.cancelledJobs[jobID]
 }
 
 func (m *MockJobSource) Close() error {
@@ -134,10 +144,11 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 
 // MockStreamWriter is a test implementation of StreamWriter.
 type MockStreamWriter struct {
-	started bool
-	chunks  []string
-	ended   bool
-	errored bool
+	started   bool
+	chunks    []string
+	ended     bool
+	errored   bool
+	cancelled bool
 }
 
 func (m *MockStreamWriter) WriteStart(message string) error {
@@ -157,6 +168,11 @@ func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 
 func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 	m.errored = true
+	return nil
+}
+
+func (m *MockStreamWriter) WriteCancelled(reason string) error {
+	m.cancelled = true
 	return nil
 }
 
@@ -191,7 +207,7 @@ func TestRunnerWithStreamWriterFactory(t *testing.T) {
 
 	runner := NewRunner(source, handlers, config)
 
-	factory := func(jobID string) StreamWriter {
+	factory := func(job *Job) StreamWriter {
 		return &MockStreamWriter{}
 	}
 
@@ -340,6 +356,45 @@ func TestNoOpStreamWriter(t *testing.T) {
 	}
 	if err := sw.WriteError(errors.New("test"), false); err != nil {
 		t.Errorf("WriteError error = %v, want nil", err)
+	}
+	if err := sw.WriteCancelled("test reason"); err != nil {
+		t.Errorf("WriteCancelled error = %v, want nil", err)
+	}
+}
+
+func TestRunnerCancelledJobSkipsHandler(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	source.cancelledJobs = map[string]bool{"job-1": true}
+
+	handler := NewMockJobHandler("TEST_JOB", false)
+	handlers := []JobHandler{handler}
+
+	mockStream := &MockStreamWriter{}
+	config := RunnerConfig{WorkerID: "test-worker"}
+	runner := NewRunner(source, handlers, config)
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter {
+		return mockStream
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	// Handler should NOT have executed
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("Expected 0 executed jobs, got %d", len(handler.ExecutedJobs()))
+	}
+	// Job should be acked (removed from queue)
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Expected 1 acked job, got %d", len(source.AckedJobs()))
+	}
+	// Cancelled event should have been written
+	if !mockStream.cancelled {
+		t.Error("Expected WriteCancelled to be called")
 	}
 }
 

@@ -210,13 +210,22 @@ func (s *RedisSource) nextMulti(ctx context.Context) (*Job, error) {
 
 // convertJob converts a redis.Job to a worker.Job.
 func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
-	return &Job{
+	job := &Job{
 		ID:        rj.JobID,
 		Type:      rj.Type,
 		Payload:   rj.Payload,
 		Source:    "redis",
 		MessageID: rj.MessageID,
 	}
+	// Extract rayId: check RawData first (top-level stream field), then payload
+	if rayID, ok := rj.RawData["rayId"].(string); ok && rayID != "" {
+		job.RayID = rayID
+	} else if rj.Payload != nil {
+		if rayID, ok := rj.Payload["rayId"].(string); ok {
+			job.RayID = rayID
+		}
+	}
+	return job
 }
 
 // Ack acknowledges successful job completion.
@@ -254,6 +263,16 @@ func (s *RedisSource) Client() *redisclient.Client {
 // QueueNames returns the list of queues being consumed.
 func (s *RedisSource) QueueNames() []string {
 	return s.queueNames
+}
+
+// IsJobCancelled checks whether a job has been cancelled by the producer.
+func (s *RedisSource) IsJobCancelled(ctx context.Context, jobID string) bool {
+	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
+	if err != nil {
+		s.log("warning", "Failed to check cancellation for %s: %v", jobID, err)
+		return false
+	}
+	return cancelled
 }
 
 // Ensure RedisSource implements JobSource

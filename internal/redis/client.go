@@ -27,19 +27,21 @@ import (
 // StreamEvent represents an event published to Redis Pub/Sub for streaming responses.
 type StreamEvent struct {
 	Version   string                 `json:"version"`
-	Type      string                 `json:"type"` // "start", "chunk", "end", "error"
+	Type      string                 `json:"type"` // "start", "chunk", "end", "error", "cancelled"
 	JobID     string                 `json:"jobId"`
+	RayID     string                 `json:"rayId,omitempty"`
 	Timestamp string                 `json:"timestamp"`
 	Data      map[string]interface{} `json:"data,omitempty"`
 }
 
 // Job represents a job read from Redis Streams.
 type Job struct {
-	MessageID string
-	JobID     string
-	Type      string
-	Payload   map[string]interface{}
-	RawData   map[string]interface{}
+	MessageID  string
+	JobID      string
+	Type       string
+	Payload    map[string]interface{}
+	RawData    map[string]interface{}
+	EnqueuedAt string // JQS-Core: original enqueue timestamp, preserved for DLQ
 }
 
 // Client wraps Redis operations for the job queue system.
@@ -246,6 +248,13 @@ func (c *Client) MoveToDLQFromQueue(ctx context.Context, queue string, job *Job,
 		"jobId":               job.JobID,
 	}
 
+	// JQS-Core Section 7.2.1: preserve enqueuedAt in DLQ entry
+	if job.EnqueuedAt != "" {
+		fields["enqueuedAt"] = job.EnqueuedAt
+	} else if ea, ok := job.RawData["enqueuedAt"].(string); ok {
+		fields["enqueuedAt"] = ea
+	}
+
 	if payloadBytes, err := json.Marshal(job.Payload); err == nil {
 		fields["payload"] = string(payloadBytes)
 	}
@@ -276,6 +285,11 @@ func (c *Client) parseMessage(msg redis.XMessage) (*Job, error) {
 	// Extract type
 	if jobType, ok := msg.Values["type"].(string); ok {
 		job.Type = jobType
+	}
+
+	// Extract enqueuedAt timestamp (preserved for DLQ entries)
+	if enqueuedAt, ok := msg.Values["enqueuedAt"].(string); ok {
+		job.EnqueuedAt = enqueuedAt
 	}
 
 	// Parse payload JSON
@@ -323,7 +337,7 @@ func (c *Client) GetDeliveryCount(ctx context.Context, messageID string) (int64,
 	return 0, nil
 }
 
-// MoveToD LQ moves a failed message to the Dead Letter Queue.
+// MoveToDLQ moves a failed message to the Dead Letter Queue.
 func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 	dlqName := c.getDLQName()
 
@@ -334,6 +348,13 @@ func (c *Client) MoveToDLQ(ctx context.Context, job *Job, reason string) error {
 		"moved_at":            time.Now().UTC().Format(time.RFC3339),
 		"worker_id":           c.workerID,
 		"jobId":               job.JobID,
+	}
+
+	// JQS-Core Section 7.2.1: preserve enqueuedAt in DLQ entry
+	if job.EnqueuedAt != "" {
+		fields["enqueuedAt"] = job.EnqueuedAt
+	} else if ea, ok := job.RawData["enqueuedAt"].(string); ok {
+		fields["enqueuedAt"] = ea
 	}
 
 	// Include original payload
@@ -356,13 +377,14 @@ func (c *Client) getDLQName() string {
 }
 
 // PublishStreamEvent publishes a streaming event to Redis Pub/Sub.
-func (c *Client) PublishStreamEvent(ctx context.Context, jobID string, eventType string, data map[string]interface{}) error {
+func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]interface{}) error {
 	streamName := fmt.Sprintf("stream:v1:%s", jobID)
 
 	event := StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,
 		JobID:     jobID,
+		RayID:     rayID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      data,
 	}
@@ -376,33 +398,51 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID string, eventType
 }
 
 // PublishStart publishes a "start" event for a job.
-func (c *Client) PublishStart(ctx context.Context, jobID string, message string) error {
-	return c.PublishStreamEvent(ctx, jobID, "start", map[string]interface{}{
+func (c *Client) PublishStart(ctx context.Context, jobID, rayID, message string) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "start", map[string]interface{}{
 		"message": message,
 	})
 }
 
 // PublishChunk publishes a "chunk" event for streaming responses.
-func (c *Client) PublishChunk(ctx context.Context, jobID string, content string, index int) error {
-	return c.PublishStreamEvent(ctx, jobID, "chunk", map[string]interface{}{
+func (c *Client) PublishChunk(ctx context.Context, jobID, rayID, content string, index int) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "chunk", map[string]interface{}{
 		"content": content,
 		"index":   index,
 	})
 }
 
 // PublishEnd publishes an "end" event when job completes.
-func (c *Client) PublishEnd(ctx context.Context, jobID string, result map[string]interface{}) error {
-	return c.PublishStreamEvent(ctx, jobID, "end", map[string]interface{}{
+func (c *Client) PublishEnd(ctx context.Context, jobID, rayID string, result map[string]interface{}) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "end", map[string]interface{}{
 		"result": result,
 	})
 }
 
 // PublishError publishes an "error" event when job fails.
-func (c *Client) PublishError(ctx context.Context, jobID string, errMsg string, recoverable bool) error {
-	return c.PublishStreamEvent(ctx, jobID, "error", map[string]interface{}{
+func (c *Client) PublishError(ctx context.Context, jobID, rayID, errMsg string, recoverable bool) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "error", map[string]interface{}{
 		"error":       errMsg,
 		"recoverable": recoverable,
 	})
+}
+
+// PublishCancelled publishes a "cancelled" terminal event when a job is cancelled.
+func (c *Client) PublishCancelled(ctx context.Context, jobID, rayID, reason string) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "cancelled", map[string]interface{}{
+		"reason": reason,
+	})
+}
+
+// IsJobCancelled checks whether a cancellation flag exists for the given job.
+// The producer sets key "job:cancelled:{jobId}" to signal cancellation.
+func (c *Client) IsJobCancelled(ctx context.Context, jobID string) (bool, error) {
+	key := fmt.Sprintf("job:cancelled:%s", jobID)
+	result, err := c.client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return result > 0, nil
 }
 
 // SetJobStatus stores job status in Redis (simpler than Supabase for now).

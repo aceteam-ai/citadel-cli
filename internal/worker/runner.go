@@ -20,7 +20,7 @@ type Runner struct {
 	config   RunnerConfig
 
 	// Optional integrations (set via WithXxx methods)
-	streamWriterFactory func(jobID string) StreamWriter
+	streamWriterFactory func(job *Job) StreamWriter
 	activityFn          func(level, msg string)
 	jobRecordFn         func(record usage.UsageRecord)
 }
@@ -75,7 +75,7 @@ func (r *Runner) recordJob(record usage.UsageRecord) {
 
 // WithStreamWriterFactory sets a factory for creating stream writers.
 // If not set, a NoOpStreamWriter is used.
-func (r *Runner) WithStreamWriterFactory(factory func(jobID string) StreamWriter) *Runner {
+func (r *Runner) WithStreamWriterFactory(factory func(job *Job) StreamWriter) *Runner {
 	r.streamWriterFactory = factory
 	return r
 }
@@ -160,6 +160,23 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 	startTime := time.Now()
 
+	// JQS-Core Section 5.6: Check cancellation before processing
+	if r.source.IsJobCancelled(ctx, job.ID) {
+		r.log("info", "Job %s was cancelled before processing", job.ID)
+		var stream StreamWriter
+		if r.streamWriterFactory != nil {
+			stream = r.streamWriterFactory(job)
+		} else {
+			stream = &NoOpStreamWriter{}
+		}
+		if err := stream.WriteCancelled("Job cancelled before processing"); err != nil {
+			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, err)
+		}
+		r.recordJob(buildUsageRecord(job, "cancelled", startTime, time.Now(), nil, nil))
+		r.source.Ack(ctx, job)
+		return
+	}
+
 	// Find handler
 	var handler JobHandler
 	for _, h := range r.handlers {
@@ -180,7 +197,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	// Create stream writer
 	var stream StreamWriter
 	if r.streamWriterFactory != nil {
-		stream = r.streamWriterFactory(job.ID)
+		stream = r.streamWriterFactory(job)
 	} else {
 		stream = &NoOpStreamWriter{}
 	}

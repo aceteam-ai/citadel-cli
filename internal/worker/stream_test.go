@@ -22,7 +22,8 @@ func TestCreateRedisStreamWriterFactory(t *testing.T) {
 	}
 
 	// Factory should return a StreamWriter
-	writer := factory("test-job-id")
+	job := &Job{ID: "test-job-id", RayID: "ray-test-123"}
+	writer := factory(job)
 	if writer == nil {
 		t.Error("Factory returned nil StreamWriter")
 	}
@@ -36,6 +37,9 @@ func TestCreateRedisStreamWriterFactory(t *testing.T) {
 	if rsw.jobID != "test-job-id" {
 		t.Errorf("jobID = %v, want test-job-id", rsw.jobID)
 	}
+	if rsw.rayID != "ray-test-123" {
+		t.Errorf("rayID = %v, want ray-test-123", rsw.rayID)
+	}
 }
 
 func TestNewRedisStreamWriter(t *testing.T) {
@@ -44,13 +48,16 @@ func TestNewRedisStreamWriter(t *testing.T) {
 		URL: "redis://localhost:6379",
 	})
 
-	writer := NewRedisStreamWriter(ctx, source.Client(), "job-123")
+	writer := NewRedisStreamWriter(ctx, source.Client(), "job-123", "ray-456")
 
 	if writer == nil {
 		t.Fatal("NewRedisStreamWriter returned nil")
 	}
 	if writer.jobID != "job-123" {
 		t.Errorf("jobID = %v, want job-123", writer.jobID)
+	}
+	if writer.rayID != "ray-456" {
+		t.Errorf("rayID = %v, want ray-456", writer.rayID)
 	}
 	if writer.ctx != ctx {
 		t.Error("ctx not set correctly")
