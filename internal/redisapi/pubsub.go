@@ -45,13 +45,14 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 }
 
 // PublishStreamEvent publishes a streaming event to Redis Pub/Sub.
-func (c *Client) PublishStreamEvent(ctx context.Context, jobID string, eventType string, data map[string]any) error {
+func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]any) error {
 	streamName := fmt.Sprintf("stream:v1:%s", jobID)
 
 	event := StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,
 		JobID:     jobID,
+		RayID:     rayID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Data:      data,
 	}
@@ -60,33 +61,51 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID string, eventType
 }
 
 // PublishStart publishes a "start" event for a job.
-func (c *Client) PublishStart(ctx context.Context, jobID string, message string) error {
-	return c.PublishStreamEvent(ctx, jobID, "start", map[string]any{
+func (c *Client) PublishStart(ctx context.Context, jobID, rayID, message string) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "start", map[string]any{
 		"message": message,
 	})
 }
 
 // PublishChunk publishes a "chunk" event for streaming responses.
-func (c *Client) PublishChunk(ctx context.Context, jobID string, content string, index int) error {
-	return c.PublishStreamEvent(ctx, jobID, "chunk", map[string]any{
+func (c *Client) PublishChunk(ctx context.Context, jobID, rayID, content string, index int) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "chunk", map[string]any{
 		"content": content,
 		"index":   index,
 	})
 }
 
 // PublishEnd publishes an "end" event when job completes.
-func (c *Client) PublishEnd(ctx context.Context, jobID string, result map[string]any) error {
-	return c.PublishStreamEvent(ctx, jobID, "end", map[string]any{
+func (c *Client) PublishEnd(ctx context.Context, jobID, rayID string, result map[string]any) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "end", map[string]any{
 		"result": result,
 	})
 }
 
 // PublishError publishes an "error" event when job fails.
-func (c *Client) PublishError(ctx context.Context, jobID string, errMsg string, recoverable bool) error {
-	return c.PublishStreamEvent(ctx, jobID, "error", map[string]any{
+func (c *Client) PublishError(ctx context.Context, jobID, rayID, errMsg string, recoverable bool) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "error", map[string]any{
 		"error":       errMsg,
 		"recoverable": recoverable,
 	})
+}
+
+// PublishCancelled publishes a "cancelled" terminal event when a job is cancelled.
+func (c *Client) PublishCancelled(ctx context.Context, jobID, rayID, reason string) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "cancelled", map[string]any{
+		"reason": reason,
+	})
+}
+
+// IsJobCancelled checks whether a cancellation flag exists for the given job.
+func (c *Client) IsJobCancelled(ctx context.Context, jobID string) (bool, error) {
+	key := fmt.Sprintf("job:cancelled:%s", jobID)
+	_, ttl, err := c.GetKey(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	// ttl == -2 means key doesn't exist
+	return ttl != -2, nil
 }
 
 // GetKey retrieves a value from Redis KV storage.

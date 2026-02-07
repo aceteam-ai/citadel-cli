@@ -31,17 +31,33 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, client *redisclient.C
 		return fmt.Errorf("invalid payload: %w", err)
 	}
 
+	// Extract rayId for event tracing
+	rayID := extractRayID(job)
+
 	// Route to appropriate backend
 	switch payload.Backend {
 	case "vllm":
-		return h.executeVLLM(ctx, client, job.JobID, payload)
+		return h.executeVLLM(ctx, client, job.JobID, rayID, payload)
 	case "ollama":
-		return h.executeOllama(ctx, client, job.JobID, payload)
+		return h.executeOllama(ctx, client, job.JobID, rayID, payload)
 	case "llamacpp":
-		return h.executeLlamaCpp(ctx, client, job.JobID, payload)
+		return h.executeLlamaCpp(ctx, client, job.JobID, rayID, payload)
 	default:
 		return fmt.Errorf("unsupported backend: %s", payload.Backend)
 	}
+}
+
+// extractRayID gets the rayId from a redis.Job's RawData or Payload.
+func extractRayID(job *redisclient.Job) string {
+	if rayID, ok := job.RawData["rayId"].(string); ok && rayID != "" {
+		return rayID
+	}
+	if job.Payload != nil {
+		if rayID, ok := job.Payload["rayId"].(string); ok {
+			return rayID
+		}
+	}
+	return ""
 }
 
 func (h *LLMInferenceHandler) parsePayload(data map[string]any) (*LLMInferencePayload, error) {
@@ -71,7 +87,7 @@ func (h *LLMInferenceHandler) parsePayload(data map[string]any) (*LLMInferencePa
 }
 
 // executeVLLM handles inference via vLLM's OpenAI-compatible API.
-func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, client *redisclient.Client, jobID string, payload *LLMInferencePayload) error {
+func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
 	// Wait for vLLM to be ready
 	if err := h.waitForVLLMReady(ctx); err != nil {
 		return err
@@ -114,13 +130,13 @@ func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, client *redisclie
 	}
 
 	if payload.Stream {
-		return h.handleVLLMStream(ctx, client, jobID, resp.Body)
+		return h.handleVLLMStream(ctx, client, jobID, rayID, resp.Body)
 	}
 
-	return h.handleVLLMNonStream(ctx, client, jobID, resp.Body)
+	return h.handleVLLMNonStream(ctx, client, jobID, rayID, resp.Body)
 }
 
-func (h *LLMInferenceHandler) handleVLLMStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleVLLMStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	scanner := bufio.NewScanner(body)
 	chunkIndex := 0
 	var fullContent strings.Builder
@@ -154,7 +170,7 @@ func (h *LLMInferenceHandler) handleVLLMStream(ctx context.Context, client *redi
 			fullContent.WriteString(text)
 
 			// Publish chunk to Redis
-			client.PublishChunk(ctx, jobID, text, chunkIndex)
+			client.PublishChunk(ctx, jobID, rayID, text, chunkIndex)
 			chunkIndex++
 
 			if chunk.Choices[0].FinishReason != "" {
@@ -164,7 +180,7 @@ func (h *LLMInferenceHandler) handleVLLMStream(ctx context.Context, client *redi
 	}
 
 	// Publish end event
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       fullContent.String(),
 		"finish_reason": "stop",
 	})
@@ -172,7 +188,7 @@ func (h *LLMInferenceHandler) handleVLLMStream(ctx context.Context, client *redi
 	return scanner.Err()
 }
 
-func (h *LLMInferenceHandler) handleVLLMNonStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleVLLMNonStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -201,8 +217,8 @@ func (h *LLMInferenceHandler) handleVLLMNonStream(ctx context.Context, client *r
 	content := strings.TrimSpace(response.Choices[0].Text)
 
 	// Publish single chunk then end
-	client.PublishChunk(ctx, jobID, content, 0)
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishChunk(ctx, jobID, rayID, content, 0)
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       content,
 		"finish_reason": response.Choices[0].FinishReason,
 		"usage": map[string]any{
@@ -243,7 +259,7 @@ func (h *LLMInferenceHandler) waitForVLLMReady(ctx context.Context) error {
 }
 
 // executeOllama handles inference via Ollama's API.
-func (h *LLMInferenceHandler) executeOllama(ctx context.Context, client *redisclient.Client, jobID string, payload *LLMInferencePayload) error {
+func (h *LLMInferenceHandler) executeOllama(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
 	ollamaURL := "http://localhost:11434/api/generate"
 
 	reqPayload := map[string]any{
@@ -278,13 +294,13 @@ func (h *LLMInferenceHandler) executeOllama(ctx context.Context, client *rediscl
 	}
 
 	if payload.Stream {
-		return h.handleOllamaStream(ctx, client, jobID, resp.Body)
+		return h.handleOllamaStream(ctx, client, jobID, rayID, resp.Body)
 	}
 
-	return h.handleOllamaNonStream(ctx, client, jobID, resp.Body)
+	return h.handleOllamaNonStream(ctx, client, jobID, rayID, resp.Body)
 }
 
-func (h *LLMInferenceHandler) handleOllamaStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleOllamaStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	scanner := bufio.NewScanner(body)
 	chunkIndex := 0
 	var fullContent strings.Builder
@@ -306,7 +322,7 @@ func (h *LLMInferenceHandler) handleOllamaStream(ctx context.Context, client *re
 
 		if chunk.Response != "" {
 			fullContent.WriteString(chunk.Response)
-			client.PublishChunk(ctx, jobID, chunk.Response, chunkIndex)
+			client.PublishChunk(ctx, jobID, rayID, chunk.Response, chunkIndex)
 			chunkIndex++
 		}
 
@@ -315,7 +331,7 @@ func (h *LLMInferenceHandler) handleOllamaStream(ctx context.Context, client *re
 		}
 	}
 
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       fullContent.String(),
 		"finish_reason": "stop",
 	})
@@ -323,7 +339,7 @@ func (h *LLMInferenceHandler) handleOllamaStream(ctx context.Context, client *re
 	return scanner.Err()
 }
 
-func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -337,8 +353,8 @@ func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client 
 		return fmt.Errorf("failed to parse Ollama response: %w", err)
 	}
 
-	client.PublishChunk(ctx, jobID, response.Response, 0)
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishChunk(ctx, jobID, rayID, response.Response, 0)
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       response.Response,
 		"finish_reason": "stop",
 	})
@@ -347,7 +363,7 @@ func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client 
 }
 
 // executeLlamaCpp handles inference via llama.cpp server API.
-func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redisclient.Client, jobID string, payload *LLMInferencePayload) error {
+func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
 	llamaCppURL := "http://localhost:8080/completion"
 
 	reqPayload := map[string]any{
@@ -384,13 +400,13 @@ func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redis
 	}
 
 	if payload.Stream {
-		return h.handleLlamaCppStream(ctx, client, jobID, resp.Body)
+		return h.handleLlamaCppStream(ctx, client, jobID, rayID, resp.Body)
 	}
 
-	return h.handleLlamaCppNonStream(ctx, client, jobID, resp.Body)
+	return h.handleLlamaCppNonStream(ctx, client, jobID, rayID, resp.Body)
 }
 
-func (h *LLMInferenceHandler) handleLlamaCppStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleLlamaCppStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	scanner := bufio.NewScanner(body)
 	chunkIndex := 0
 	var fullContent strings.Builder
@@ -416,7 +432,7 @@ func (h *LLMInferenceHandler) handleLlamaCppStream(ctx context.Context, client *
 
 		if chunk.Content != "" {
 			fullContent.WriteString(chunk.Content)
-			client.PublishChunk(ctx, jobID, chunk.Content, chunkIndex)
+			client.PublishChunk(ctx, jobID, rayID, chunk.Content, chunkIndex)
 			chunkIndex++
 		}
 
@@ -425,7 +441,7 @@ func (h *LLMInferenceHandler) handleLlamaCppStream(ctx context.Context, client *
 		}
 	}
 
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       fullContent.String(),
 		"finish_reason": "stop",
 	})
@@ -433,7 +449,7 @@ func (h *LLMInferenceHandler) handleLlamaCppStream(ctx context.Context, client *
 	return scanner.Err()
 }
 
-func (h *LLMInferenceHandler) handleLlamaCppNonStream(ctx context.Context, client *redisclient.Client, jobID string, body io.Reader) error {
+func (h *LLMInferenceHandler) handleLlamaCppNonStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -447,8 +463,8 @@ func (h *LLMInferenceHandler) handleLlamaCppNonStream(ctx context.Context, clien
 		return fmt.Errorf("failed to parse llama.cpp response: %w", err)
 	}
 
-	client.PublishChunk(ctx, jobID, response.Content, 0)
-	client.PublishEnd(ctx, jobID, map[string]any{
+	client.PublishChunk(ctx, jobID, rayID, response.Content, 0)
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
 		"content":       response.Content,
 		"finish_reason": "stop",
 	})

@@ -29,16 +29,20 @@ type StreamWriter interface {
 
 	// WriteError signals job failure.
 	WriteError(err error, recoverable bool) error
+
+	// WriteCancelled signals job cancellation (JQS-Core terminal event).
+	WriteCancelled(reason string) error
 }
 
 // NoOpStreamWriter is a StreamWriter that does nothing.
 // Used when streaming is not supported or needed.
 type NoOpStreamWriter struct{}
 
-func (n *NoOpStreamWriter) WriteStart(message string) error       { return nil }
+func (n *NoOpStreamWriter) WriteStart(message string) error            { return nil }
 func (n *NoOpStreamWriter) WriteChunk(content string, index int) error { return nil }
-func (n *NoOpStreamWriter) WriteEnd(result map[string]any) error  { return nil }
+func (n *NoOpStreamWriter) WriteEnd(result map[string]any) error       { return nil }
 func (n *NoOpStreamWriter) WriteError(err error, recoverable bool) error { return nil }
+func (n *NoOpStreamWriter) WriteCancelled(reason string) error         { return nil }
 
 // Ensure NoOpStreamWriter implements StreamWriter
 var _ StreamWriter = (*NoOpStreamWriter)(nil)

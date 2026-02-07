@@ -25,6 +25,11 @@ type JobSource interface {
 	// Depending on implementation, job may be retried or moved to DLQ.
 	Nack(ctx context.Context, job *Job, err error) error
 
+	// IsJobCancelled checks whether a job has been cancelled by the producer.
+	// Returns true if the cancellation flag exists in the backing store.
+	// JQS-Core Section 5.6: checked after claiming and before processing.
+	IsJobCancelled(ctx context.Context, jobID string) bool
+
 	// Close cleanly disconnects from the job source.
 	Close() error
 }

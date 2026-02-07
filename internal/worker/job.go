@@ -41,6 +41,9 @@ type Job struct {
 
 	// SourceQueue is the queue this job was read from (for multi-queue ACK)
 	SourceQueue string
+
+	// RayID is the tracing/correlation ID for distributed tracing (JQS-Core)
+	RayID string
 }
 
 // JobMetadata contains optional job metadata.

@@ -799,7 +799,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Determine job source mode
 	var source worker.JobSource
-	var streamFactory func(jobID string) worker.StreamWriter
+	var streamFactory func(job *worker.Job) worker.StreamWriter
 
 	if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode

@@ -130,8 +130,9 @@ func (e *APIError) Err() string {
 // StreamEvent represents an event for streaming responses (published via Pub/Sub)
 type StreamEvent struct {
 	Version   string         `json:"version"`
-	Type      string         `json:"type"` // "start", "chunk", "end", "error"
+	Type      string         `json:"type"` // "start", "chunk", "end", "error", "cancelled"
 	JobID     string         `json:"jobId"`
+	RayID     string         `json:"rayId,omitempty"`
 	Timestamp string         `json:"timestamp"`
 	Data      map[string]any `json:"data,omitempty"`
 }

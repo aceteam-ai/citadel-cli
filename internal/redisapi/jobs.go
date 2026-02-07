@@ -39,6 +39,12 @@ func parseStreamMessage(msg StreamMessage) (*Job, error) {
 	job := &Job{
 		MessageID: msg.ID,
 		JobID:     msg.Data.JobID,
+		RawData:   make(map[string]any),
+	}
+
+	// Preserve raw fields from stream message data
+	if msg.Data.EnqueuedAt != "" {
+		job.RawData["enqueuedAt"] = msg.Data.EnqueuedAt
 	}
 
 	// Parse the payload JSON string

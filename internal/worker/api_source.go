@@ -124,13 +124,25 @@ func (s *APISource) Next(ctx context.Context) (*Job, error) {
 
 // convertJob converts an API job to a worker.Job.
 func (s *APISource) convertJob(aj *redisapi.Job) *Job {
-	return &Job{
+	job := &Job{
 		ID:        aj.JobID,
 		Type:      aj.Type,
 		Payload:   aj.Payload,
 		Source:    "redis-api",
 		MessageID: aj.MessageID,
 	}
+	// Extract rayId: check RawData first, then payload
+	if aj.RawData != nil {
+		if rayID, ok := aj.RawData["rayId"].(string); ok && rayID != "" {
+			job.RayID = rayID
+		}
+	}
+	if job.RayID == "" && aj.Payload != nil {
+		if rayID, ok := aj.Payload["rayId"].(string); ok {
+			job.RayID = rayID
+		}
+	}
+	return job
 }
 
 // Ack acknowledges successful job completion.
@@ -164,6 +176,16 @@ func (s *APISource) Close() error {
 // Client returns the underlying API client for stream writing.
 func (s *APISource) Client() *redisapi.Client {
 	return s.client
+}
+
+// IsJobCancelled checks whether a job has been cancelled by the producer.
+func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
+	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
+	if err != nil {
+		// Log but don't block — treat check failure as "not cancelled"
+		return false
+	}
+	return cancelled
 }
 
 // Ensure APISource implements JobSource

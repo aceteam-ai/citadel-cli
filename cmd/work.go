@@ -142,7 +142,7 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Check for API mode: device_api_token takes precedence (unless forced to direct Redis)
 	var source worker.JobSource
-	var streamFactory func(jobID string) worker.StreamWriter
+	var streamFactory func(job *worker.Job) worker.StreamWriter
 	var useAPIMode bool
 	var apiSource *worker.APISource // Keep reference for heartbeat
 
