@@ -183,6 +183,7 @@ func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
 	if err != nil {
 		// Log but don't block — treat check failure as "not cancelled"
+		s.log("warning", "Failed to check cancellation for %s: %v", jobID, err)
 		return false
 	}
 	return cancelled

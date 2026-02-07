@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -110,7 +111,7 @@ func (c *Client) IsJobCancelled(ctx context.Context, jobID string) (bool, error)
 
 // GetKey retrieves a value from Redis KV storage.
 func (c *Client) GetKey(ctx context.Context, key string) (string, int, error) {
-	path := fmt.Sprintf("/api/fabric/redis/kv?key=%s", key)
+	path := fmt.Sprintf("/api/fabric/redis/kv?key=%s", url.QueryEscape(key))
 
 	var resp KVGetResponse
 	err := c.doRequest(ctx, http.MethodGet, path, nil, &resp)
@@ -161,7 +162,7 @@ func (c *Client) SetKey(ctx context.Context, key string, value any, ttl int) err
 
 // DeleteKey removes a key from Redis KV storage.
 func (c *Client) DeleteKey(ctx context.Context, key string) (bool, error) {
-	path := fmt.Sprintf("/api/fabric/redis/kv?key=%s", key)
+	path := fmt.Sprintf("/api/fabric/redis/kv?key=%s", url.QueryEscape(key))
 
 	var resp KVDeleteResponse
 	err := c.doRequest(ctx, http.MethodDelete, path, nil, &resp)

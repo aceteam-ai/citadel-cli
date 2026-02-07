@@ -169,7 +169,9 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		} else {
 			stream = &NoOpStreamWriter{}
 		}
-		stream.WriteCancelled("Job cancelled before processing")
+		if err := stream.WriteCancelled("Job cancelled before processing"); err != nil {
+			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, err)
+		}
 		r.recordJob(buildUsageRecord(job, "cancelled", startTime, time.Now(), nil, nil))
 		r.source.Ack(ctx, job)
 		return

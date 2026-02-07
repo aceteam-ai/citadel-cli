@@ -46,6 +46,9 @@ func parseStreamMessage(msg StreamMessage) (*Job, error) {
 	if msg.Data.EnqueuedAt != "" {
 		job.RawData["enqueuedAt"] = msg.Data.EnqueuedAt
 	}
+	if msg.Data.RayID != "" {
+		job.RawData["rayId"] = msg.Data.RayID
+	}
 
 	// Parse the payload JSON string
 	if msg.Data.Payload != "" {

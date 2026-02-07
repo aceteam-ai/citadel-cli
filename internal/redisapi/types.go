@@ -32,6 +32,7 @@ type StreamMessageData struct {
 	JobID      string `json:"jobId"`
 	Payload    string `json:"payload"` // JSON-encoded job payload
 	EnqueuedAt string `json:"enqueuedAt"`
+	RayID      string `json:"rayId"`
 }
 
 // Job represents a parsed job ready for processing
