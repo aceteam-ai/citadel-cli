@@ -2,6 +2,10 @@ build
 release
 /citadel
 /citadel-cli
+*.exe
+
+.env
+.claude/settings.local.json
 
 # direnv
 .direnv/
