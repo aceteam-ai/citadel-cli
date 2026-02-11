@@ -152,32 +152,6 @@ func (h *AceTeamHarness) ApproveDevice(ctx context.Context, userCode, authToken 
 	return nil
 }
 
-// SendHeartbeat sends a node heartbeat
-func (h *AceTeamHarness) SendHeartbeat(ctx context.Context, nodeID string, status map[string]interface{}) error {
-	url := fmt.Sprintf("%s/api/fabric/nodes/%s/heartbeat", h.baseURL, nodeID)
-
-	payloadBytes, _ := json.Marshal(status)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
 // GetNodes retrieves the list of fabric nodes
 func (h *AceTeamHarness) GetNodes(ctx context.Context, authToken string) ([]map[string]interface{}, error) {
 	url := fmt.Sprintf("%s/api/fabric/nodes", h.baseURL)

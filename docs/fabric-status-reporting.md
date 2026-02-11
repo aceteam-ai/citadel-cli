@@ -97,14 +97,14 @@ This is an acceptable tradeoff between detection speed and false positive rate.
 │         ┌────────────────┼────────────────┐                        │
 │         ▼                ▼                ▼                        │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                │
-│  │ HTTP Server │  │  Heartbeat  │  │   Worker    │                │
-│  │   :8080     │  │   Client    │  │   (Redis)   │                │
+│  │ HTTP Server │  │   Redis     │  │   Worker    │                │
+│  │   :8080     │  │  Publisher  │  │   (Redis)   │                │
 │  └──────┬──────┘  └──────┬──────┘  └─────────────┘                │
 │         │                │                                         │
 └─────────┼────────────────┼─────────────────────────────────────────┘
           │                │
-          │ Tailscale      │ Tailscale
-          │ Mesh           │ Mesh
+          │ Tailscale      │ Redis (via API or direct)
+          │ Mesh           │
           ▼                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      AceTeam Control Plane                          │
@@ -115,26 +115,27 @@ This is an acceptable tradeoff between detection speed and false positive rate.
 │  │  GET /api/fabric/nodes           ← List nodes with status    │   │
 │  │  GET /api/fabric/nodes/:id       ← Node details (cached)     │   │
 │  │  GET /api/fabric/nodes/:id/live  ← Query node directly       │   │
-│  │  POST /api/fabric/nodes/:id/heartbeat ← Receive heartbeat    │   │
 │  │                                                              │   │
 │  └───────────────────────────────┬──────────────────────────────┘   │
 │                                  │                                  │
-│                                  ▼                                  │
-│                         ┌─────────────────┐                         │
-│                         │   PostgreSQL    │                         │
-│                         │  (node_status)  │                         │
-│                         └─────────────────┘                         │
+│                       ┌──────────┴──────────┐                       │
+│                       ▼                     ▼                       │
+│              ┌─────────────────┐   ┌─────────────────┐              │
+│              │   PostgreSQL    │   │   Redis         │              │
+│              │  (node_status)  │   │  (pub/sub +     │              │
+│              └─────────────────┘   │   streams)      │              │
+│                                    └─────────────────┘              │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.2 Data Flow
 
-**Heartbeat Flow (Push)**
+**Redis Status Flow (Push)**
 1. Citadel node collects status every 30 seconds
-2. POSTs compact JSON to `/api/fabric/nodes/{nodeId}/heartbeat`
-3. AceTeam upserts into `node_status` table
-4. Fabric page queries cached status for display
+2. Publishes to Redis via Pub/Sub (direct Redis or API proxy)
+3. Python worker validates, looks up org, upserts into `fabric_node_status` table
+4. Worker republishes to org-scoped Pub/Sub channel for real-time dashboard
 
 **On-Demand Flow (Pull)**
 1. User clicks on node in Fabric page
@@ -234,33 +235,18 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 | vLLM | `GET http://localhost:8000/v1/models` | OpenAI-compatible model list |
 | Ollama | `GET http://localhost:11434/api/tags` | Ollama tag list |
 
-### 4.3 Phase 3: Heartbeat Client
+### 4.3 Phase 3: Redis Status Publisher
 
-**Goal**: Periodic status reporting to control plane.
+**Goal**: Periodic status reporting to control plane via Redis.
 
-```go
-// internal/heartbeat/client.go
-type HeartbeatClient struct {
-    endpoint  string        // https://aceteam.ai/api/fabric/nodes/{nodeId}/heartbeat
-    interval  time.Duration // 30 seconds
-    collector *status.Collector
-}
+The original design proposed an HTTP heartbeat client that would POST to
+`/api/fabric/nodes/{nodeId}/heartbeat`. This was superseded by Redis-based
+publishers that use either direct Redis or the authenticated API proxy:
 
-func (c *HeartbeatClient) Start(ctx context.Context) error {
-    ticker := time.NewTicker(c.interval)
-    for {
-        select {
-        case <-ticker.C:
-            status := c.collector.CollectCompact()
-            c.send(status)
-        case <-ctx.Done():
-            return nil
-        }
-    }
-}
-```
+- **RedisPublisher** (`internal/heartbeat/redis.go`): Direct Redis Pub/Sub + Streams
+- **APIPublisher** (`internal/heartbeat/api.go`): Redis via authenticated API proxy (preferred)
 
-**Integration**: Started as goroutine when `citadel up` or `citadel worker` runs.
+**Integration**: Started as goroutine when `citadel work` runs with `--redis-status` (enabled by default).
 
 ### 4.4 Phase 4: Model Discovery
 
@@ -289,22 +275,10 @@ All communication occurs over the Tailscale mesh:
 - Authenticated (Tailscale ACLs)
 - No public internet exposure
 
-### 5.2 Heartbeat Authentication
+### 5.2 Status Publisher Authentication
 
-Options:
-1. **Tailscale identity**: Verify source IP is in expected range
-2. **API key**: Include bearer token from node registration
-3. **mTLS**: Mutual TLS with node certificates (complex)
-
-**Recommendation**: Start with Tailscale identity + API key header.
-
-### 5.3 Rate Limiting
-
-Heartbeat endpoint should rate limit per node to prevent:
-- Accidental tight loops
-- Malicious flooding
-
-Suggested: 1 request per 10 seconds per node.
+- **API mode**: Uses device API token obtained during `citadel init`, authenticated via the API proxy
+- **Direct Redis**: Connects directly to Redis with credentials from config
 
 ## 6. Testing Strategy
 
@@ -312,7 +286,9 @@ Suggested: 1 request per 10 seconds per node.
 
 - `internal/status/collector_test.go` - Mock system calls
 - `internal/status/server_test.go` - HTTP handler tests
-- `internal/heartbeat/client_test.go` - Mock HTTP client
+- `internal/heartbeat/redis_test.go` - Redis publisher tests
+- `internal/heartbeat/config_consumer_test.go` - Config consumer tests
+- `internal/heartbeat/config_subscriber_test.go` - Config subscriber tests
 
 ### 6.2 Integration Tests
 
@@ -352,9 +328,9 @@ Suggested: 1 request per 10 seconds per node.
 | `internal/status/collector.go` | Create | Metrics collection |
 | `internal/status/models.go` | Create | Model discovery |
 | `internal/status/types.go` | Create | Status data types |
-| `internal/heartbeat/client.go` | Create | Heartbeat mechanism |
-| `cmd/up.go` | Modify | Start status server + heartbeat |
-| `cmd/worker.go` | Modify | Start status server + heartbeat |
+| `internal/heartbeat/redis.go` | Create | Redis status publisher (direct) |
+| `internal/heartbeat/api.go` | Create | Redis status publisher (via API proxy) |
+| `cmd/work.go` | Modify | Start status server + Redis publisher |
 
 ### Tests
 
@@ -362,4 +338,6 @@ Suggested: 1 request per 10 seconds per node.
 |------|---------|
 | `internal/status/collector_test.go` | Collector unit tests |
 | `internal/status/server_test.go` | HTTP server tests |
-| `internal/heartbeat/client_test.go` | Heartbeat client tests |
+| `internal/heartbeat/redis_test.go` | Redis publisher tests |
+| `internal/heartbeat/config_consumer_test.go` | Config consumer tests |
+| `internal/heartbeat/config_subscriber_test.go` | Config subscriber tests |
