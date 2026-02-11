@@ -47,7 +47,10 @@ func runPeers(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	baseURL := os.Getenv("HEARTBEAT_URL")
+	baseURL := os.Getenv("ACETEAM_URL")
+	if baseURL == "" {
+		baseURL = os.Getenv("HEARTBEAT_URL") // backward compat
+	}
 	if baseURL == "" {
 		baseURL = "https://aceteam.ai"
 	}

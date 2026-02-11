@@ -40,14 +40,10 @@ Examples:
 # Run without auto-starting services
   citadel work --no-services
 
-.PP
-# Run with heartbeat reporting to AceTeam API
-  citadel work --heartbeat
-
 
 .SH OPTIONS
 \fB--api-key\fP=""
-	API key for heartbeat authentication (or set CITADEL_API_KEY env)
+	API key for authentication (or set CITADEL_API_KEY env)
 
 .PP
 \fB--device-code\fP=""
@@ -62,12 +58,8 @@ Examples:
 	Consumer group name (default: citadel-workers)
 
 .PP
-\fB--heartbeat\fP[=false]
-	Enable heartbeat reporting to AceTeam API
-
-.PP
-\fB--heartbeat-url\fP=""
-	Heartbeat endpoint base URL (default: https://aceteam.ai)
+\fB--base-url\fP=""
+	AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)
 
 .PP
 \fB-h\fP, \fB--help\fP[=false]

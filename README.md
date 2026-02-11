@@ -386,7 +386,7 @@ sudo ./citadel init --provision \
   --node-name gpu-node-01
 
 # Start the node
-./citadel work --status-port=8080 --heartbeat
+./citadel work --status-port=8080
 ```
 
 ### Verify Status

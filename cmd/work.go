@@ -36,12 +36,11 @@ var (
 	workPollMs     int
 	workMaxRetries int
 
-	// Status server and heartbeat flags
-	workStatusPort   int
-	workHeartbeat    bool
-	workHeartbeatURL string
-	workAPIKey       string
-	workNodeName     string
+	// Status server flags
+	workStatusPort int
+	workBaseURL    string
+	workAPIKey     string
+	workNodeName   string
 
 	// SSH key sync flags
 	workSSHSync     bool
@@ -97,10 +96,7 @@ Examples:
   citadel work --redis-status=false
 
   # Run without auto-starting services
-  citadel work --no-services
-
-  # Run with heartbeat reporting to AceTeam API
-  citadel work --heartbeat`,
+  citadel work --no-services`,
 	Run: runWork,
 }
 
@@ -341,9 +337,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create status collector (used by both status server and heartbeat)
+	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
-	if workStatusPort > 0 || workHeartbeat {
+	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
 			NodeName:  nodeName,
 			ConfigDir: "", // TODO: get from manifest
@@ -366,34 +362,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		}()
 	}
 
-	// Resolve API key and base URL (used by heartbeat and SSH sync)
+	// Resolve API key and base URL (used by SSH sync and terminal)
 	apiKey := workAPIKey
 	if apiKey == "" {
 		apiKey = os.Getenv("CITADEL_API_KEY")
 	}
 
-	baseURL := workHeartbeatURL
+	baseURL := workBaseURL
 	if baseURL == "" {
-		baseURL = os.Getenv("HEARTBEAT_URL")
+		baseURL = os.Getenv("ACETEAM_URL")
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("HEARTBEAT_URL") // backward compat
 	}
 	if baseURL == "" {
 		baseURL = "https://aceteam.ai"
-	}
-
-	// Start heartbeat if enabled
-	if workHeartbeat {
-		hbClient := heartbeat.NewClient(heartbeat.ClientConfig{
-			BaseURL: baseURL,
-			NodeID:  nodeName,
-			APIKey:  apiKey,
-		}, collector)
-
-		go func() {
-			fmt.Printf("   - Heartbeat: %s (every 30s)\n", hbClient.Endpoint())
-			if err := hbClient.Start(ctx); err != nil && err != context.Canceled {
-				fmt.Fprintf(os.Stderr, "   - ⚠️ Heartbeat error: %v\n", err)
-			}
-		}()
 	}
 
 	// Start SSH key sync if enabled
@@ -867,11 +850,10 @@ func init() {
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
 	workCmd.Flags().BoolVar(&workForceDirectRedis, "force-direct-redis", false, "Force direct Redis mode instead of API mode")
 
-	// Status and heartbeat flags
+	// Status flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
-	workCmd.Flags().BoolVar(&workHeartbeat, "heartbeat", false, "Enable heartbeat reporting to AceTeam API")
-	workCmd.Flags().StringVar(&workHeartbeatURL, "heartbeat-url", "", "Heartbeat endpoint base URL (default: https://aceteam.ai)")
-	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for heartbeat authentication (or set CITADEL_API_KEY env)")
+	workCmd.Flags().StringVar(&workBaseURL, "base-url", "", "AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)")
+	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for authentication (or set CITADEL_API_KEY env)")
 	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")
 
 	// SSH key sync flags
