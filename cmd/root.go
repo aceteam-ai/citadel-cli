@@ -14,6 +14,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -31,6 +32,7 @@ var nexusURL string
 var authServiceURL string
 var debugMode bool
 var daemonMode bool
+var noColorGlobal bool
 
 // deferredUpdateNotification stores update info when TUI will handle the display
 var deferredUpdateNotification string
@@ -127,6 +129,11 @@ Use 'citadel help' to see all available commands.`,
 		}
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Handle global --no-color flag and NO_COLOR env var
+		if noColorGlobal || os.Getenv("NO_COLOR") != "" {
+			color.NoColor = true
+		}
+
 		// Always log the command (Log() handles console output based on --debug)
 		fullCmd := "citadel"
 		if cmd.Name() != "citadel" {
@@ -229,6 +236,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
+	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
 	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 
 	// Cobra also supports local flags, which will only run

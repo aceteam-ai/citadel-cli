@@ -5,6 +5,7 @@ Copyright © 2025 Jason Sun <jason@aceteam.ai>
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -13,6 +14,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/spf13/cobra"
 )
+
+var nodesJSON bool
 
 // nodesCmd represents the nodes command
 var nodesCmd = &cobra.Command{
@@ -33,7 +36,21 @@ registered compute nodes, showing their status, IP address, and last-seen time.`
 		}
 
 		if len(nodes) == 0 {
-			fmt.Println("🤷 No nodes found in your fabric.")
+			if nodesJSON {
+				fmt.Println("[]")
+			} else {
+				fmt.Println("🤷 No nodes found in your fabric.")
+			}
+			return
+		}
+
+		if nodesJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(nodes); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Failed to encode JSON: %v\n", err)
+				os.Exit(1)
+			}
 			return
 		}
 
@@ -58,4 +75,5 @@ registered compute nodes, showing their status, IP address, and last-seen time.`
 
 func init() {
 	rootCmd.AddCommand(nodesCmd)
+	nodesCmd.Flags().BoolVar(&nodesJSON, "json", false, "Output in JSON format")
 }

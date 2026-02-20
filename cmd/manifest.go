@@ -89,7 +89,7 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, "", fmt.Errorf("manifest not found at %s. The configuration is incomplete or corrupt", manifestPath)
+			return nil, "", fmt.Errorf("manifest not found at %s. Run 'citadel init' to regenerate the configuration", manifestPath)
 		}
 		return nil, "", fmt.Errorf("could not read manifest from global path %s: %w", manifestPath, err)
 	}

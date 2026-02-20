@@ -31,8 +31,8 @@ var (
 	warnColor     = color.New(color.FgYellow)
 	badColor      = color.New(color.FgRed)
 	labelColor    = color.New(color.Bold)
-	noColor       bool // Flag to disable color
 	interactiveUI bool // Flag to enable interactive TUI dashboard
+	statusJSON    bool // Flag to output JSON format
 )
 
 var statusCmd = &cobra.Command{
@@ -51,13 +51,14 @@ and the state of all managed services.`,
   # Interactive dashboard with live updates
   citadel status -i`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Handle the --no-color flag
-		if noColor {
-			color.NoColor = true
+		// JSON output mode
+		if statusJSON {
+			runJSONStatus()
+			return
 		}
 
 		// Check if interactive mode requested and available
-		if interactiveUI && tui.ShouldUseInteractive(true, noColor) {
+		if interactiveUI && tui.ShouldUseInteractive(true, color.NoColor) {
 			runInteractiveDashboard()
 			return
 		}
@@ -65,6 +66,21 @@ and the state of all managed services.`,
 		// Fall back to standard tabwriter output
 		runStandardStatus()
 	},
+}
+
+// runJSONStatus outputs status data as JSON
+func runJSONStatus() {
+	data, err := gatherStatusData()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to gather status: %v\n", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(data); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Failed to encode JSON: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 // runStandardStatus displays status using the traditional tabwriter format
@@ -716,6 +732,6 @@ func formatBytes(b uint64) string {
 
 func init() {
 	rootCmd.AddCommand(statusCmd)
-	statusCmd.Flags().BoolVar(&noColor, "no-color", false, "Disable colorized output")
 	statusCmd.Flags().BoolVarP(&interactiveUI, "interactive", "i", false, "Launch interactive dashboard with live updates")
+	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output in JSON format")
 }

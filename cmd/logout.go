@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -14,6 +15,7 @@ import (
 
 var (
 	logoutKeepRegistration bool
+	logoutForce            bool
 )
 
 var logoutCmd = &cobra.Command{
@@ -35,13 +37,29 @@ to the same organization later.`,
 }
 
 func runLogout(cmd *cobra.Command, args []string) {
-	fmt.Println("--- Disconnecting from the AceTeam Network ---")
-
 	// Check if connected or has state
 	if !network.IsGlobalConnected() && !network.HasState() {
 		fmt.Println("Not connected to any network.")
 		return
 	}
+
+	// Confirm before disconnecting
+	if !logoutForce {
+		action := "Disconnect and deregister from the AceTeam Network?"
+		if logoutKeepRegistration {
+			action = "Disconnect from the AceTeam Network?"
+		}
+		fmt.Printf("%s (y/N) ", action)
+		var response string
+		fmt.Scanln(&response)
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response != "y" && response != "yes" {
+			fmt.Println("Aborted.")
+			return
+		}
+	}
+
+	fmt.Println("--- Disconnecting from the AceTeam Network ---")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -115,4 +133,5 @@ func init() {
 
 	logoutCmd.Flags().BoolVar(&logoutKeepRegistration, "keep-registration", false,
 		"Only disconnect locally, keep node registered in Headscale (for temporary disconnects)")
+	logoutCmd.Flags().BoolVarP(&logoutForce, "force", "f", false, "Skip confirmation prompt.")
 }

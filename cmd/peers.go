@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ var (
 	peersCapability   string
 	peersOnlineOnly   bool
 	peersIncludeStats bool
+	peersJSON         bool
 )
 
 var peersCmd = &cobra.Command{
@@ -76,10 +78,22 @@ func runPeers(cmd *cobra.Command, args []string) {
 	}
 
 	if len(nodes) == 0 {
-		if len(capabilities) > 0 {
+		if peersJSON {
+			fmt.Println("[]")
+		} else if len(capabilities) > 0 {
 			fmt.Printf("No peers found matching capabilities: %s\n", strings.Join(capabilities, ", "))
 		} else {
 			fmt.Println("No peers found in your organization.")
+		}
+		return
+	}
+
+	if peersJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(nodes); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Failed to encode JSON: %v\n", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -159,4 +173,5 @@ func init() {
 	peersCmd.Flags().StringVar(&peersCapability, "capability", "", "Filter by capability tags (comma-separated, e.g., gpu:a100,llm:llama3)")
 	peersCmd.Flags().BoolVar(&peersOnlineOnly, "online-only", false, "Only show online peers")
 	peersCmd.Flags().BoolVar(&peersIncludeStats, "stats", false, "Include hardware stats (CPU, memory, GPU usage)")
+	peersCmd.Flags().BoolVar(&peersJSON, "json", false, "Output in JSON format")
 }

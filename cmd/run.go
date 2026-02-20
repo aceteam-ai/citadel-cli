@@ -93,6 +93,7 @@ func runAllServices() {
 			fmt.Printf("🚀 Starting service: %s (native)\n", service.Name)
 			if err := startNativeService(service.Name, configDir); err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+				fmt.Fprintf(os.Stderr, "   Hint: Run 'citadel logs %s' to see detailed output.\n", service.Name)
 				os.Exit(1)
 			}
 		} else {
@@ -105,6 +106,7 @@ func runAllServices() {
 			fmt.Printf("🚀 Starting service: %s\n", service.Name)
 			if err := startService(service.Name, fullComposePath); err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
+				fmt.Fprintf(os.Stderr, "   Hint: Run 'citadel logs %s' to see detailed output.\n", service.Name)
 				os.Exit(1)
 			}
 		}

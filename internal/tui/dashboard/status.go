@@ -14,47 +14,47 @@ import (
 
 // StatusData holds all the data for the status dashboard
 type StatusData struct {
-	NodeName   string
-	NodeIP     string
-	OrgID      string
-	Tags       []string
-	Connected  bool
-	Version    string
-	LastUpdate time.Time
+	NodeName   string    `json:"nodeName"`
+	NodeIP     string    `json:"nodeIP"`
+	OrgID      string    `json:"orgID,omitempty"`
+	Tags       []string  `json:"tags,omitempty"`
+	Connected  bool      `json:"connected"`
+	Version    string    `json:"version"`
+	LastUpdate time.Time `json:"lastUpdate"`
 
 	// System vitals
-	CPUPercent    float64
-	MemoryPercent float64
-	MemoryUsed    string
-	MemoryTotal   string
-	DiskPercent   float64
-	DiskUsed      string
-	DiskTotal     string
+	CPUPercent    float64 `json:"cpuPercent"`
+	MemoryPercent float64 `json:"memoryPercent"`
+	MemoryUsed    string  `json:"memoryUsed"`
+	MemoryTotal   string  `json:"memoryTotal"`
+	DiskPercent   float64 `json:"diskPercent"`
+	DiskUsed      string  `json:"diskUsed"`
+	DiskTotal     string  `json:"diskTotal"`
 
 	// GPU info
-	GPUs []GPUInfo
+	GPUs []GPUInfo `json:"gpus,omitempty"`
 
 	// Services
-	Services []ServiceStatus
+	Services []ServiceStatus `json:"services,omitempty"`
 
 	// Peers
-	Peers []PeerInfo
+	Peers []PeerInfo `json:"peers,omitempty"`
 
 	// Job queue (optional)
-	JobQueueEnabled bool
-	JobChannel      string
-	PendingJobs     int64
-	InProgressJobs  int64
-	FailedJobs      int64
+	JobQueueEnabled bool   `json:"jobQueueEnabled,omitempty"`
+	JobChannel      string `json:"jobChannel,omitempty"`
+	PendingJobs     int64  `json:"pendingJobs,omitempty"`
+	InProgressJobs  int64  `json:"inProgressJobs,omitempty"`
+	FailedJobs      int64  `json:"failedJobs,omitempty"`
 }
 
 // GPUInfo holds GPU information
 type GPUInfo struct {
-	Name        string
-	Memory      string
-	Temperature string
-	Utilization float64
-	Driver      string
+	Name        string  `json:"name"`
+	Memory      string  `json:"memory"`
+	Temperature string  `json:"temperature,omitempty"`
+	Utilization float64 `json:"utilization"`
+	Driver      string  `json:"driver,omitempty"`
 }
 
 // StatusModel is the BubbleTea model for the interactive status dashboard
