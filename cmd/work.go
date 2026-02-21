@@ -69,6 +69,9 @@ var (
 	// Capability detection flags
 	workCapabilities string
 	workAutoDetect   bool
+
+	// Concurrency flag
+	workMaxConcurrency int
 )
 
 var workCmd = &cobra.Command{
@@ -614,11 +617,27 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Resolve concurrency from flag or auto-detect from GPU count
+	maxConcurrency := workMaxConcurrency
+	var gpuTracker *worker.GPUTracker
+	gpuCount := platform.GetGPUCountSimple()
+	if gpuCount > 0 {
+		gpuTracker = worker.NewGPUTracker(gpuCount)
+		if maxConcurrency == 0 {
+			maxConcurrency = gpuCount
+		}
+	}
+	if maxConcurrency == 0 {
+		maxConcurrency = 1 // Default: sequential
+	}
+
 	// Create runner
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
-		WorkerID:    workerID,
-		Verbose:     true,
-		JobRecordFn: jobRecordFn,
+		WorkerID:       workerID,
+		Verbose:        true,
+		JobRecordFn:    jobRecordFn,
+		MaxConcurrency: maxConcurrency,
+		GPUTracker:     gpuTracker,
 	})
 
 	// Add stream writer factory if available
@@ -881,4 +900,7 @@ func init() {
 	// Capability detection flags
 	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")
 	workCmd.Flags().BoolVar(&workAutoDetect, "auto-detect", false, "Auto-detect node capabilities (GPU, models, CPU)")
+
+	// Concurrency flags
+	workCmd.Flags().IntVar(&workMaxConcurrency, "max-concurrency", 0, "Maximum concurrent jobs (0 = auto-detect from GPU count)")
 }

@@ -12,6 +12,7 @@ import (
 type GPUInfo struct {
 	Name        string
 	Memory      string
+	MemoryUsed  string
 	Temperature string
 	Utilization string
 	Driver      string
@@ -67,7 +68,7 @@ func (l *LinuxGPUDetector) GetGPUCount() int {
 func (l *LinuxGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 	cmd := exec.Command(
 		"nvidia-smi",
-		"--query-gpu=name,memory.total,temperature.gpu,utilization.gpu,driver_version",
+		"--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version",
 		"--format=csv,noheader,nounits",
 	)
 
@@ -81,16 +82,17 @@ func (l *LinuxGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 
 	for _, line := range lines {
 		parts := strings.Split(line, ",")
-		if len(parts) < 5 {
+		if len(parts) < 6 {
 			continue
 		}
 
 		gpu := GPUInfo{
 			Name:        strings.TrimSpace(parts[0]),
 			Memory:      strings.TrimSpace(parts[1]) + " MB",
-			Temperature: strings.TrimSpace(parts[2]) + "°C",
-			Utilization: strings.TrimSpace(parts[3]) + "%",
-			Driver:      strings.TrimSpace(parts[4]),
+			MemoryUsed:  strings.TrimSpace(parts[2]) + " MB",
+			Temperature: strings.TrimSpace(parts[3]) + "°C",
+			Utilization: strings.TrimSpace(parts[4]) + "%",
+			Driver:      strings.TrimSpace(parts[5]),
 		}
 		gpus = append(gpus, gpu)
 	}
@@ -278,7 +280,7 @@ func (w *WindowsGPUDetector) GetGPUCount() int {
 
 func (w *WindowsGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 	cmd := w.nvidiaSmiCommand(
-		"--query-gpu=name,memory.total,temperature.gpu,utilization.gpu,driver_version",
+		"--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version",
 		"--format=csv,noheader,nounits",
 	)
 
@@ -292,16 +294,17 @@ func (w *WindowsGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 
 	for _, line := range lines {
 		parts := strings.Split(line, ",")
-		if len(parts) < 5 {
+		if len(parts) < 6 {
 			continue
 		}
 
 		gpu := GPUInfo{
 			Name:        strings.TrimSpace(parts[0]),
 			Memory:      strings.TrimSpace(parts[1]) + " MB",
-			Temperature: strings.TrimSpace(parts[2]) + "°C",
-			Utilization: strings.TrimSpace(parts[3]) + "%",
-			Driver:      strings.TrimSpace(parts[4]),
+			MemoryUsed:  strings.TrimSpace(parts[2]) + " MB",
+			Temperature: strings.TrimSpace(parts[3]) + "°C",
+			Utilization: strings.TrimSpace(parts[4]) + "%",
+			Driver:      strings.TrimSpace(parts[5]),
 		}
 		gpus = append(gpus, gpu)
 	}

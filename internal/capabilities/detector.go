@@ -107,7 +107,7 @@ func detectGPU() []Capability {
 		return nil
 	}
 	var caps []Capability
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	for idx, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -118,11 +118,27 @@ func detectGPU() []Capability {
 		}
 		gpuName := strings.TrimSpace(parts[0])
 		memoryMB := strings.TrimSpace(parts[1])
-		if gpuTag := NormalizeGPUName(gpuName); gpuTag != "" {
+		gpuTag := NormalizeGPUName(gpuName)
+		vramGB := NormalizeVRAM(memoryMB)
+
+		// Aggregate tags (e.g., gpu:rtx4090, vram:24gb)
+		if gpuTag != "" {
 			caps = append(caps, Capability{Tag: fmt.Sprintf("gpu:%s", gpuTag), Category: "gpu", Description: gpuName})
 		}
-		if vramGB := NormalizeVRAM(memoryMB); vramGB != "" {
+		if vramGB != "" {
 			caps = append(caps, Capability{Tag: fmt.Sprintf("vram:%sgb", vramGB), Category: "vram", Description: fmt.Sprintf("%s MB VRAM", memoryMB)})
+		}
+
+		// Indexed tags for per-GPU targeting (e.g., gpu:0:rtx4090:24gb)
+		if gpuTag != "" && vramGB != "" {
+			indexedTag := fmt.Sprintf("gpu:%d:%s:%sgb", idx, gpuTag, vramGB)
+			if ValidateTag(indexedTag) {
+				caps = append(caps, Capability{
+					Tag:         indexedTag,
+					Category:    "gpu",
+					Description: fmt.Sprintf("GPU %d: %s (%s MB VRAM)", idx, gpuName, memoryMB),
+				})
+			}
 		}
 	}
 	return caps
