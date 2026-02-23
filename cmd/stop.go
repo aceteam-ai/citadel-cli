@@ -12,7 +12,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var removeContainer bool
+var (
+	removeContainer bool
+	forceStop       bool
+	dryRunStop      bool
+)
 
 // stopCmd represents the stop command
 var stopCmd = &cobra.Command{
@@ -30,8 +34,14 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
   # Stop all services in the manifest
   citadel stop
 
-  # Stop and remove the container
-  citadel stop ollama --rm`,
+  # Stop and remove the container and volumes
+  citadel stop ollama --rm
+
+  # Skip confirmation prompts (for scripts)
+  citadel stop --force
+
+  # Preview what would be stopped
+  citadel stop --dry-run`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) == 0 {
@@ -46,6 +56,30 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
 	},
 }
 
+// confirmPrompt asks the user a yes/no question. Returns true if confirmed.
+// defaultYes controls the default when the user presses Enter without typing.
+// Skips the prompt and returns true if --force is set.
+func confirmPrompt(question string, defaultYes bool) bool {
+	if forceStop {
+		return true
+	}
+
+	hint := "(y/N)"
+	if defaultYes {
+		hint = "(Y/n)"
+	}
+	fmt.Printf("%s %s ", question, hint)
+
+	var response string
+	fmt.Scanln(&response)
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	if response == "" {
+		return defaultYes
+	}
+	return response == "y" || response == "yes"
+}
+
 // stopAllServices stops all services defined in the manifest.
 func stopAllServices() {
 	manifest, configDir, err := findAndReadManifest()
@@ -57,6 +91,33 @@ func stopAllServices() {
 	if len(manifest.Services) == 0 {
 		fmt.Println("No services configured in manifest.")
 		return
+	}
+
+	// List services that will be affected
+	serviceNames := make([]string, len(manifest.Services))
+	for i, s := range manifest.Services {
+		serviceNames[i] = s.Name
+	}
+
+	if dryRunStop {
+		fmt.Printf("Would stop %d service(s): %s\n", len(manifest.Services), strings.Join(serviceNames, ", "))
+		if removeContainer {
+			fmt.Println("Would also remove containers and volumes.")
+		}
+		return
+	}
+
+	// Confirm before stopping all services
+	if removeContainer {
+		if !confirmPrompt(fmt.Sprintf("Remove %d service(s) and their volumes (%s)?", len(manifest.Services), strings.Join(serviceNames, ", ")), false) {
+			fmt.Println("Aborted.")
+			return
+		}
+	} else {
+		if !confirmPrompt(fmt.Sprintf("Stop %d service(s) (%s)?", len(manifest.Services), strings.Join(serviceNames, ", ")), true) {
+			fmt.Println("Aborted.")
+			return
+		}
 	}
 
 	fmt.Printf("--- 🛑 Stopping %d service(s) ---\n", len(manifest.Services))
@@ -84,6 +145,22 @@ func stopSingleService(serviceName string) {
 		fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
 		fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
 		os.Exit(1)
+	}
+
+	if dryRunStop {
+		fmt.Printf("Would stop service: %s\n", serviceName)
+		if removeContainer {
+			fmt.Println("Would also remove container and volumes.")
+		}
+		return
+	}
+
+	// Confirm before removing volumes (data-destructive)
+	if removeContainer {
+		if !confirmPrompt(fmt.Sprintf("Remove service '%s' and its volumes?", serviceName), false) {
+			fmt.Println("Aborted.")
+			return
+		}
 	}
 
 	// Try to find the service in the manifest
@@ -141,7 +218,7 @@ func stopServiceByCompose(composePath string, remove bool) error {
 	cmd := exec.Command("docker", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker compose down failed: %s", string(output))
+		return fmt.Errorf("docker compose down failed:\n%s\n   Hint: Is Docker running? Check with 'docker info'", strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -154,7 +231,7 @@ func stopServiceByContainer(serviceName string) error {
 	inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
 	output, err := inspectCmd.Output()
 	if err != nil {
-		return fmt.Errorf("container '%s' not found. Is the service running?", containerName)
+		return fmt.Errorf("container '%s' not found. Run 'citadel status' to see running services", containerName)
 	}
 
 	status := strings.TrimSpace(string(output))
@@ -196,4 +273,6 @@ func removeContainerByName(containerName string) error {
 func init() {
 	rootCmd.AddCommand(stopCmd)
 	stopCmd.Flags().BoolVar(&removeContainer, "rm", false, "Remove the container/volumes after stopping.")
+	stopCmd.Flags().BoolVarP(&forceStop, "force", "f", false, "Skip confirmation prompts.")
+	stopCmd.Flags().BoolVar(&dryRunStop, "dry-run", false, "Show what would be stopped without doing it.")
 }

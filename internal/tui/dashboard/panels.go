@@ -154,9 +154,9 @@ type ServicePanel struct {
 
 // ServiceStatus represents a service's status
 type ServiceStatus struct {
-	Name   string
-	Status string // "running", "stopped", "error"
-	Uptime string // e.g., "2d 14h"
+	Name   string `json:"name"`
+	Status string `json:"status"` // "running", "stopped", "error"
+	Uptime string `json:"uptime,omitempty"` // e.g., "2d 14h"
 }
 
 // Render renders the service panel
@@ -209,11 +209,11 @@ type PeerPanel struct {
 
 // PeerInfo represents a network peer
 type PeerInfo struct {
-	Hostname  string
-	IP        string
-	Online    bool
-	Latency   string // e.g., "12ms"
-	ConnType  string // "direct" or "relay"
+	Hostname string `json:"hostname"`
+	IP       string `json:"ip"`
+	Online   bool   `json:"online"`
+	Latency  string `json:"latency,omitempty"` // e.g., "12ms"
+	ConnType string `json:"connType,omitempty"` // "direct" or "relay"
 }
 
 // Render renders the peer panel

@@ -148,12 +148,21 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 			Driver: gpu.Driver,
 		}
 
-		// Parse memory (e.g., "24576 MB" or "24 GB")
+		// Parse total memory (e.g., "24576 MB" or "24 GB")
 		if gpu.Memory != "" {
 			memStr := strings.TrimSuffix(gpu.Memory, " MB")
 			memStr = strings.TrimSuffix(memStr, "MB")
 			if mb, err := strconv.Atoi(strings.TrimSpace(memStr)); err == nil {
 				metrics.MemoryTotalMB = mb
+			}
+		}
+
+		// Parse used memory (e.g., "8192 MB")
+		if gpu.MemoryUsed != "" {
+			memStr := strings.TrimSuffix(gpu.MemoryUsed, " MB")
+			memStr = strings.TrimSuffix(memStr, "MB")
+			if mb, err := strconv.Atoi(strings.TrimSpace(memStr)); err == nil {
+				metrics.MemoryUsedMB = mb
 			}
 		}
 

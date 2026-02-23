@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,10 @@ type Runner struct {
 	streamWriterFactory func(job *Job) StreamWriter
 	activityFn          func(level, msg string)
 	jobRecordFn         func(record usage.UsageRecord)
+
+	// Concurrency support
+	maxConcurrency int
+	gpuTracker     *GPUTracker
 }
 
 // RunnerConfig holds configuration for the runner.
@@ -38,16 +43,24 @@ type RunnerConfig struct {
 
 	// JobRecordFn is called when a job completes (for usage tracking)
 	JobRecordFn func(record usage.UsageRecord)
+
+	// MaxConcurrency is the max number of concurrent jobs (0 or 1 = sequential)
+	MaxConcurrency int
+
+	// GPUTracker manages GPU slot allocation (optional, for GPU-aware jobs)
+	GPUTracker *GPUTracker
 }
 
 // NewRunner creates a new job runner.
 func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Runner {
 	return &Runner{
-		source:      source,
-		handlers:    handlers,
-		config:      config,
-		activityFn:  config.ActivityFn,
-		jobRecordFn: config.JobRecordFn,
+		source:         source,
+		handlers:       handlers,
+		config:         config,
+		activityFn:     config.ActivityFn,
+		jobRecordFn:    config.JobRecordFn,
+		maxConcurrency: config.MaxConcurrency,
+		gpuTracker:     config.GPUTracker,
 	}
 }
 
@@ -82,6 +95,7 @@ func (r *Runner) WithStreamWriterFactory(factory func(job *Job) StreamWriter) *R
 
 // Run starts the job processing loop.
 // This method blocks until the context is cancelled or a signal is received.
+// When MaxConcurrency > 1, jobs are processed concurrently via a goroutine pool.
 func (r *Runner) Run(ctx context.Context) error {
 	// Setup signal handling
 	ctx, cancel := context.WithCancel(ctx)
@@ -97,13 +111,24 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	defer r.source.Close()
 
+	// Resolve concurrency
+	concurrency := r.maxConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
 	if r.activityFn == nil {
 		// Only show verbose startup info if not in TUI mode
 		fmt.Printf("   - Worker ID: %s\n", r.config.WorkerID)
 		fmt.Printf("   - Source: %s\n", r.source.Name())
 		fmt.Printf("   - Handlers: %d registered\n", len(r.handlers))
+		fmt.Printf("   - Max Concurrency: %d\n", concurrency)
 	}
 	r.log("success", "Worker started, listening for jobs...")
+
+	// Semaphore for concurrent job processing
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
 	// Main processing loop with exponential backoff on errors
 	backoff := time.Second
@@ -146,10 +171,23 @@ runLoop:
 				continue // No job available, loop again
 			}
 
-			// Process the job
-			r.processJob(ctx, job)
+			// Process the job (concurrently if maxConcurrency > 1)
+			if concurrency > 1 {
+				sem <- struct{}{} // Acquire semaphore slot
+				wg.Add(1)
+				go func(j *Job) {
+					defer wg.Done()
+					defer func() { <-sem }() // Release semaphore slot
+					r.processJob(ctx, j)
+				}(job)
+			} else {
+				r.processJob(ctx, job)
+			}
 		}
 	}
+
+	// Wait for in-flight jobs to complete
+	wg.Wait()
 
 	r.log("info", "Worker shutdown complete")
 	return nil
@@ -192,6 +230,48 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
 		r.source.Nack(ctx, job, err)
 		return
+	}
+
+	// GPU tracking: acquire/release GPU slot if tracker is set
+	gpuIndex := -1
+	if r.gpuTracker != nil {
+		// Check if job requests a specific GPU
+		if targetGpu, ok := job.Payload["targetGpu"]; ok {
+			if idx, ok := targetGpu.(float64); ok {
+				gpuIdx := int(idx)
+				if !r.gpuTracker.AcquireSpecific(gpuIdx) {
+					err := fmt.Errorf("requested GPU %d is unavailable", gpuIdx)
+					r.log("error", "GPU unavailable: %v", err)
+					r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
+					var stream StreamWriter
+					if r.streamWriterFactory != nil {
+						stream = r.streamWriterFactory(job)
+					} else {
+						stream = &NoOpStreamWriter{}
+					}
+					stream.WriteError(err, false)
+					r.source.Nack(ctx, job, err)
+					return
+				}
+				gpuIndex = gpuIdx
+			}
+		}
+		if gpuIndex < 0 {
+			// Auto-acquire any available GPU
+			idx, ok := r.gpuTracker.Acquire()
+			if !ok {
+				err := fmt.Errorf("no GPU slots available")
+				r.log("warning", "No GPU slots: %v", err)
+				r.recordJob(buildUsageRecord(job, "retry", startTime, time.Now(), nil, err))
+				r.source.Nack(ctx, job, err)
+				return
+			}
+			gpuIndex = idx
+		}
+		defer r.gpuTracker.Release(gpuIndex)
+		r.log("info", "Job %s assigned to GPU %d", job.ID, gpuIndex)
+		// Store GPU index in job payload for handler to use
+		job.Payload["_gpuIndex"] = gpuIndex
 	}
 
 	// Create stream writer
