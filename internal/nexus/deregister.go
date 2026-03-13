@@ -13,18 +13,18 @@ import (
 // DeregisterClient handles node deregistration from Headscale
 type DeregisterClient struct {
 	baseURL    string
+	apiToken   string
 	httpClient *http.Client
 }
 
 // DeregisterRequest represents the request body for the /deregister endpoint
 type DeregisterRequest struct {
-	OrgID    string `json:"org_id,omitempty"`
-	NodeName string `json:"node_name,omitempty"`
+	NodeName string `json:"node_name"`
 }
 
 // DeregisterResponse represents a successful deregister response
 type DeregisterResponse struct {
-	Status  string `json:"status"`
+	Success bool   `json:"success"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -41,10 +41,12 @@ func (e *DeregisterError) Error() string {
 	return e.ErrorCode
 }
 
-// NewDeregisterClient creates a new deregister client
-func NewDeregisterClient(baseURL string) *DeregisterClient {
+// NewDeregisterClient creates a new deregister client.
+// apiToken is the Bearer token for authentication (e.g. CITADEL_API_KEY).
+func NewDeregisterClient(baseURL, apiToken string) *DeregisterClient {
 	return &DeregisterClient{
-		baseURL: baseURL,
+		baseURL:  baseURL,
+		apiToken: apiToken,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -68,6 +70,9 @@ func (c *DeregisterClient) Deregister(ctx context.Context, req DeregisterRequest
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiToken)
+	}
 
 	// Send request
 	resp, err := c.httpClient.Do(httpReq)
