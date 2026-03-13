@@ -88,13 +88,12 @@ func runLogout(cmd *cobra.Command, args []string) {
 // deregisterFromBackend attempts to deregister the node from Headscale via the backend API.
 // This is a best-effort operation - errors are logged but don't block logout.
 func deregisterFromBackend(ctx context.Context) {
-	var orgID, nodeName string
+	var nodeName string
 
 	// Try to get node identity from manifest
 	if manifest, _, err := findAndReadManifest(); err == nil {
-		orgID = manifest.Node.OrgID
 		nodeName = manifest.Node.Name
-		Debug("from manifest: orgID=%s, nodeName=%s", orgID, nodeName)
+		Debug("from manifest: nodeName=%s", nodeName)
 	}
 
 	// Try to get more accurate hostname from network status (if connected)
@@ -106,16 +105,23 @@ func deregisterFromBackend(ctx context.Context) {
 	}
 
 	// Skip if we have no identity information
-	if orgID == "" && nodeName == "" {
+	if nodeName == "" {
 		Debug("no node identity found, skipping deregistration")
 		return
 	}
 
+	// Resolve API key for authentication
+	apiKey := os.Getenv("CITADEL_API_KEY")
+	if apiKey == "" {
+		Debug("no API key configured, skipping deregistration")
+		fmt.Println("   - Warning: CITADEL_API_KEY not set, cannot deregister from backend")
+		return
+	}
+
 	// Call backend to deregister
-	Debug("deregistering from backend: orgID=%s, nodeName=%s", orgID, nodeName)
-	client := nexus.NewDeregisterClient(authServiceURL)
+	Debug("deregistering from backend: nodeName=%s", nodeName)
+	client := nexus.NewDeregisterClient(authServiceURL, apiKey)
 	req := nexus.DeregisterRequest{
-		OrgID:    orgID,
 		NodeName: nodeName,
 	}
 
