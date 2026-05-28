@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -107,6 +108,12 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	// Start the server (this initiates the connection)
 	if err := s.srv.Start(); err != nil {
 		removeRestriction()
+		// On Windows, wrap cryptic syspolicy errors with actionable guidance.
+		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "syspolicy") {
+			return fmt.Errorf("Windows requires SYSTEM privileges for network access.\n"+
+				"   Run via a scheduled task with /ru SYSTEM, or install as a service.\n"+
+				"   Original error: %w", err)
+		}
 		return fmt.Errorf("failed to start network: %w", err)
 	}
 	removeRestriction()
