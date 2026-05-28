@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-work - Start services and run the job worker (primary node command)
@@ -46,6 +46,18 @@ Examples:
 	API key for authentication (or set CITADEL_API_KEY env)
 
 .PP
+\fB--auto-detect\fP[=false]
+	Auto-detect node capabilities (GPU, models, CPU)
+
+.PP
+\fB--base-url\fP=""
+	AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)
+
+.PP
+\fB--capabilities\fP=""
+	Comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)
+
+.PP
 \fB--device-code\fP=""
 	Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)
 
@@ -58,12 +70,12 @@ Examples:
 	Consumer group name (default: citadel-workers)
 
 .PP
-\fB--base-url\fP=""
-	AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)
-
-.PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for work
+
+.PP
+\fB--max-concurrency\fP=0
+	Maximum concurrent jobs (0 = auto-detect from GPU count)
 
 .PP
 \fB--max-retries\fP=3
@@ -145,6 +157,10 @@ Examples:
 .PP
 \fB--nexus\fP="https://nexus.aceteam.ai"
 	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
 
 
 .SH SEE ALSO

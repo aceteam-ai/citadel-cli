@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-nodes - List all compute nodes in your AceTeam fabric
@@ -18,6 +18,10 @@ registered compute nodes, showing their status, IP address, and last-seen time.
 \fB-h\fP, \fB--help\fP[=false]
 	help for nodes
 
+.PP
+\fB--json\fP[=false]
+	Output in JSON format
+
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
 \fB--auth-service\fP="https://aceteam.ai"
@@ -34,6 +38,10 @@ registered compute nodes, showing their status, IP address, and last-seen time.
 .PP
 \fB--nexus\fP="https://nexus.aceteam.ai"
 	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
 
 
 .SH SEE ALSO

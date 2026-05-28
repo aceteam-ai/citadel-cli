@@ -1,0 +1,87 @@
+.nh
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-completion - Generate shell completion scripts
+
+
+.SH SYNOPSIS
+\fBcitadel completion [bash|zsh|fish|powershell]\fP
+
+
+.SH DESCRIPTION
+Generate shell completion scripts for Citadel CLI.
+
+.PP
+To load completions:
+
+.PP
+Bash:
+  $ source <(citadel completion bash)
+
+.PP
+# To load completions for each session, execute once:
+  # Linux:
+  $ citadel completion bash > /etc/bash_completion.d/citadel
+  # macOS:
+  $ citadel completion bash > $(brew --prefix)/etc/bash_completion.d/citadel
+
+.PP
+Zsh:
+  # If shell completion is not already enabled in your environment,
+  # you will need to enable it. You can execute the following once:
+  $ echo "autoload -U compinit; compinit" >> ~/.zshrc
+
+.PP
+# To load completions for each session, execute once:
+  $ citadel completion zsh > "${fpath[1]}/_citadel"
+
+.PP
+# You will need to start a new shell for this setup to take effect.
+
+.PP
+Fish:
+  $ citadel completion fish | source
+
+.PP
+# To load completions for each session, execute once:
+  $ citadel completion fish > ~/.config/fish/completions/citadel.fish
+
+.PP
+PowerShell:
+  PS> citadel completion powershell | Out-String | Invoke-Expression
+
+.PP
+# To load completions for every new session, add the output to your profile:
+  PS> citadel completion powershell > citadel.ps1
+  # and source this file from your PowerShell profile.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for completion
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

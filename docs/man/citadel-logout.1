@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-logout - Disconnect and deregister this machine from the AceTeam Network
@@ -27,6 +27,10 @@ to the same organization later.
 
 
 .SH OPTIONS
+\fB-f\fP, \fB--force\fP[=false]
+	Skip confirmation prompt.
+
+.PP
 \fB-h\fP, \fB--help\fP[=false]
 	help for logout
 
@@ -50,6 +54,10 @@ to the same organization later.
 .PP
 \fB--nexus\fP="https://nexus.aceteam.ai"
 	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
 
 
 .SH SEE ALSO

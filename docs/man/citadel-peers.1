@@ -1,0 +1,73 @@
+.nh
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-peers - Discover peer nodes in your organization
+
+
+.SH SYNOPSIS
+\fBcitadel peers [flags]\fP
+
+
+.SH DESCRIPTION
+Queries the AceTeam service discovery API to find peer nodes
+in your organization. Optionally filter by capability tags.
+
+.PP
+Examples:
+  # List all peers
+  citadel peers
+
+.PP
+# Find peers with GPU capabilities
+  citadel peers --capability gpu:a100
+
+.PP
+# Find online peers with LLM models, include hardware stats
+  citadel peers --capability llm:llama3 --online-only --stats
+
+
+.SH OPTIONS
+\fB--capability\fP=""
+	Filter by capability tags (comma-separated, e.g., gpu:a100,llm:llama3)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for peers
+
+.PP
+\fB--json\fP[=false]
+	Output in JSON format
+
+.PP
+\fB--online-only\fP[=false]
+	Only show online peers
+
+.PP
+\fB--stats\fP[=false]
+	Include hardware stats (CPU, memory, GPU usage)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-status - Shows a comprehensive status of the Citadel node
@@ -24,8 +24,8 @@ and the state of all managed services.
 	Launch interactive dashboard with live updates
 
 .PP
-\fB--no-color\fP[=false]
-	Disable colorized output
+\fB--json\fP[=false]
+	Output in JSON format
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -43,6 +43,10 @@ and the state of all managed services.
 .PP
 \fB--nexus\fP="https://nexus.aceteam.ai"
 	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
 
 
 .SH EXAMPLE

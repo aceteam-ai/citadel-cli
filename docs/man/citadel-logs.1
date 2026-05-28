@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jan 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "May 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-logs - Fetch the logs of a running service
@@ -11,7 +11,7 @@ citadel-logs - Fetch the logs of a running service
 
 .SH DESCRIPTION
 Streams the logs for a service started with 'citadel run' or defined in citadel.yaml.
-Available services: llamacpp, lmstudio, ollama, vllm
+Available services: extraction, llamacpp, lmstudio, ollama, vllm
 
 
 .SH OPTIONS
@@ -42,6 +42,10 @@ Available services: llamacpp, lmstudio, ollama, vllm
 .PP
 \fB--nexus\fP="https://nexus.aceteam.ai"
 	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
 
 
 .SH EXAMPLE
