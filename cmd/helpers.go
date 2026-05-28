@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/fatih/color"
 )
@@ -21,6 +22,9 @@ type DeviceAuthResult struct {
 // The device code is returned for use in status publishing to enable config lookup.
 // If forceNew is true, the backend will ignore existing machine mappings and
 // create a fresh device registration.
+//
+// When no TTY is available (e.g. SSH without -t, CI, pipes), the device code
+// and URL are printed as plain text and the flow polls without bubbletea.
 func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult, error) {
 	client := nexus.NewDeviceAuthClient(authServiceURL)
 
@@ -31,8 +35,29 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 		return nil, fmt.Errorf("failed to start device authorization: %w", err)
 	}
 
-	// Create UI program with device code display
-	// The UI shows clickable links and keyboard shortcuts for browser/clipboard
+	// Non-TTY path: print plain text and poll without bubbletea
+	if !tui.IsTTY() {
+		completeURL := resp.VerificationURI + "?code=" + resp.UserCode
+		fmt.Println()
+		fmt.Println("Device authorization required.")
+		fmt.Printf("Open this URL to sign in: %s\n", completeURL)
+		fmt.Printf("Or enter code manually:   %s\n", resp.UserCode)
+		fmt.Println()
+		fmt.Println("Waiting for authorization...")
+
+		token, err := client.PollForToken(resp.DeviceCode, resp.Interval)
+		if err != nil {
+			return nil, fmt.Errorf("device authorization failed: %w", err)
+		}
+
+		fmt.Println("Authorization successful!")
+		return &DeviceAuthResult{
+			Token:      token,
+			DeviceCode: resp.DeviceCode,
+		}, nil
+	}
+
+	// TTY path: interactive bubbletea UI
 	model := ui.NewDeviceCodeModel(resp.UserCode, resp.VerificationURI, resp.ExpiresIn)
 	program := ui.NewDeviceCodeProgram(model)
 
