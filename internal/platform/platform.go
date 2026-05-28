@@ -120,8 +120,27 @@ func ChownR(path, owner string) error {
 
 // ConfigDir returns the appropriate config directory for the OS.
 // Uses system-wide paths when running as root, user-local paths otherwise.
+// On Windows, always uses a user-local path (%LOCALAPPDATA%\Citadel) to
+// match the install location and avoid requiring admin privileges.
 func ConfigDir() string {
-	// If not running as root/admin, use user-local config
+	// Windows: always use user-local path regardless of elevation.
+	// The installer places the binary in %LOCALAPPDATA%\Citadel, so config
+	// should live there too. Using ProgramData would silently fail without
+	// admin and diverge from the install path.
+	if IsWindows() {
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			return filepath.Join(v, "Citadel")
+		}
+		if v := os.Getenv("APPDATA"); v != "" {
+			return filepath.Join(v, "Citadel")
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "AppData", "Local", "Citadel")
+		}
+		return `C:\ProgramData\Citadel`
+	}
+
+	// Linux/macOS: use user-local config when not root
 	if !IsRoot() {
 		home, err := os.UserHomeDir()
 		if err == nil {
@@ -137,8 +156,7 @@ func ConfigDir() string {
 		// On macOS, use /usr/local/etc for consistency with Homebrew conventions
 		return "/usr/local/etc/citadel"
 	}
-	// Windows: Use ProgramData for system-wide config
-	return `C:\ProgramData\Citadel`
+	return "/etc/citadel"
 }
 
 // DefaultNodeDir returns the default directory for node configuration

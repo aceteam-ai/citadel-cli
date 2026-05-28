@@ -116,6 +116,17 @@ func runInteractiveLogin() {
 		}
 		authKey = authResult.Token.Authkey
 
+		// Persist device config so the token survives across sessions
+		if authResult.Token.DeviceAPIToken != "" {
+			if err := saveDeviceConfigToFile(authResult.Token); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save device config: %v\n", err)
+			}
+		} else if authResult.Token.RedisURL != "" {
+			if err := saveRedisURLToConfig(authResult.Token.RedisURL); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠️  Warning: Could not save Redis URL to config: %v\n", err)
+			}
+		}
+
 	case nexus.NetChoiceAuthkey:
 		fmt.Println("--- Authenticating with authkey ---")
 		authKey = key
