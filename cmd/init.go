@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
@@ -402,6 +403,8 @@ and system user configuration (requires sudo).`,
 						if initVerbose {
 							fmt.Fprintf(os.Stderr, "     ⚠️  WARNING: Could not install %s. This is expected on non-GPU systems. Error: %v\n", step.name, err)
 						}
+					} else if platform.IsWindows() && !isCommandAvailable("winget") {
+						fmt.Fprintf(os.Stderr, "     ⚠️  WARNING: Could not install %s (winget not available). Install manually.\n", step.name)
 					} else {
 						fmt.Fprintf(os.Stderr, "     ❌ FAILED: %s\n        Error: %v\n", step.name, err)
 						os.Exit(1)
@@ -519,6 +522,15 @@ func getSelectedService() (string, error) {
 		}
 		return "", fmt.Errorf("invalid service '%s' specified", initService)
 	}
+
+	// In non-interactive sessions (SSH, CI), default to "none" instead of
+	// showing an arrow-key menu that would hang forever.
+	if !tui.IsTTY() {
+		fmt.Fprintln(os.Stderr, "⚠️  No TTY detected, defaulting to service=none.")
+		fmt.Fprintln(os.Stderr, "   Use --service flag to specify a service in non-interactive sessions.")
+		return "none", nil
+	}
+
 	selection, err := ui.AskSelect(
 		"Which primary service should this node run?",
 		[]string{
@@ -987,7 +999,8 @@ func ensureCoreDependencies() error {
 	// On Windows, check for winget availability
 	if platform.IsWindows() {
 		if _, err := exec.LookPath("winget"); err != nil {
-			return fmt.Errorf("winget not found - please upgrade to Windows 10 1809+ or Windows 11")
+			fmt.Fprintln(os.Stderr, "⚠️  winget not found. Package installation will be skipped.")
+			fmt.Fprintln(os.Stderr, "   Install software manually or upgrade to Windows 10 1809+ / Windows 11.")
 		}
 		// curl is built-in on Windows 10 1803+, no additional packages needed
 		if initVerbose {

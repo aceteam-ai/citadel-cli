@@ -133,6 +133,6 @@ func printNetworkSuccessInfo(nodeName, ip string) {
 	fmt.Println("     citadel proxy     - Forward local ports to peers")
 	fmt.Println()
 
-	// System-wide option hint
-	dimColor.Println("   For system-wide network access, use: sudo citadel init --system")
+	// Note: system-wide access is handled by the embedded tsnet library.
+	// No separate system-level command is needed.
 }
