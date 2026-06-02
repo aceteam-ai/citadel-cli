@@ -54,6 +54,13 @@ if [ -z "${AUTHKEY}" ]; then
     exit 0
 fi
 
+# Validate authkey format to prevent shell injection.
+# Tailscale/Headscale authkeys contain only alphanumerics and hyphens.
+if ! echo "${AUTHKEY}" | grep -qE '^[A-Za-z0-9-]+$'; then
+    log "ERROR: Authkey contains invalid characters. Refusing to proceed."
+    exit 1
+fi
+
 # -----------------------------------------------------------------------
 # 2. Run citadel init (network join only, no --provision)
 # -----------------------------------------------------------------------

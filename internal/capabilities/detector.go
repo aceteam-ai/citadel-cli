@@ -167,7 +167,6 @@ func DetectNodeCapabilities() *NodeCapabilities {
 
 // detectRunningEngines checks for running inference engine processes/containers.
 func detectRunningEngines() []string {
-	var engines []string
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
 
@@ -175,25 +174,51 @@ func detectRunningEngines() []string {
 	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
-		return engines
+		return nil
 	}
 
-	known := map[string]string{
-		"vllm":     "vllm",
-		"ollama":   "ollama",
-		"llamacpp": "llamacpp",
-		"llama":    "llamacpp",
-		"lmstudio": "lmstudio",
-	}
+	names := strings.Split(strings.TrimSpace(string(output)), "\n")
+	return matchEngines(names)
+}
 
+// matchEngines maps container names to inference engine identifiers.
+// Exported for testing. The "llama" keyword only matches when the name
+// does NOT also contain "ollama", preventing false llamacpp detection.
+func matchEngines(names []string) []string {
+	var engines []string
 	seen := make(map[string]bool)
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		name := strings.ToLower(strings.TrimSpace(line))
-		for keyword, engine := range known {
-			if strings.Contains(name, keyword) && !seen[engine] {
-				seen[engine] = true
-				engines = append(engines, engine)
+
+	for _, raw := range names {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+
+		hasOllama := strings.Contains(name, "ollama")
+
+		type rule struct {
+			keyword string
+			engine  string
+		}
+		rules := []rule{
+			{"vllm", "vllm"},
+			{"ollama", "ollama"},
+			{"llamacpp", "llamacpp"},
+			{"lmstudio", "lmstudio"},
+		}
+
+		for _, r := range rules {
+			if strings.Contains(name, r.keyword) && !seen[r.engine] {
+				seen[r.engine] = true
+				engines = append(engines, r.engine)
 			}
+		}
+
+		// "llama" is a fallback for llamacpp, but only when the name
+		// does not also contain "ollama" (which is a substring match).
+		if strings.Contains(name, "llama") && !hasOllama && !seen["llamacpp"] {
+			seen["llamacpp"] = true
+			engines = append(engines, "llamacpp")
 		}
 	}
 

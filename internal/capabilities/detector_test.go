@@ -223,6 +223,68 @@ func TestDetectNodeCapabilities_NoGPU(t *testing.T) {
 	}
 }
 
+func TestMatchEngines(t *testing.T) {
+	tests := []struct {
+		name       string
+		containers []string
+		want       []string
+		notWant    []string
+	}{
+		{
+			name:       "ollama container does not produce llamacpp",
+			containers: []string{"ollama-server"},
+			want:       []string{"ollama"},
+			notWant:    []string{"llamacpp"},
+		},
+		{
+			name:       "llama container without ollama produces llamacpp",
+			containers: []string{"llama-cpp-server"},
+			want:       []string{"llamacpp"},
+			notWant:    []string{"ollama"},
+		},
+		{
+			name:       "llamacpp keyword matches directly",
+			containers: []string{"citadel-llamacpp"},
+			want:       []string{"llamacpp"},
+			notWant:    nil,
+		},
+		{
+			name:       "multiple engines detected independently",
+			containers: []string{"citadel-vllm", "citadel-ollama"},
+			want:       []string{"vllm", "ollama"},
+			notWant:    []string{"llamacpp"},
+		},
+		{
+			name:       "empty input returns nil",
+			containers: []string{""},
+			want:       nil,
+			notWant:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchEngines(tt.containers)
+
+			gotSet := make(map[string]bool)
+			for _, e := range got {
+				gotSet[e] = true
+			}
+
+			for _, w := range tt.want {
+				if !gotSet[w] {
+					t.Errorf("matchEngines(%v) missing expected engine %q, got %v", tt.containers, w, got)
+				}
+			}
+			for _, nw := range tt.notWant {
+				if gotSet[nw] {
+					t.Errorf("matchEngines(%v) should NOT contain %q, got %v", tt.containers, nw, got)
+				}
+			}
+		})
+	}
+}
+
 func TestResolveQueuesWithEngines(t *testing.T) {
 	caps := []Capability{
 		{Tag: "gpu:rtx3090", Category: "gpu"},

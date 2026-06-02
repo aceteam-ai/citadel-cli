@@ -106,8 +106,9 @@ source "qemu" "citadel-node" {
   # Boot
   boot_wait = "30s"
 
-  # Shutdown
-  shutdown_command = "sudo shutdown -P now"
+  # Shutdown -- remove cloud-init NOPASSWD grant just before powering off.
+  # Single sudo invocation so the grant is still active when shutdown runs.
+  shutdown_command = "sudo sh -c 'rm -f /etc/sudoers.d/90-cloud-init-users && shutdown -P now'"
 }
 
 # -----------------------------------------------------------------------------
@@ -163,6 +164,11 @@ build {
       "sudo truncate -s 0 /etc/machine-id",
       "sudo rm -f /etc/ssh/ssh_host_*",
       "sudo rm -f /home/${var.ssh_username}/.ssh/authorized_keys",
+      # Lock the build user password so the image ships without known credentials
+      "sudo passwd -l ${var.ssh_username}",
+      # Disable SSH password authentication
+      "sudo sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config",
+      "sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config",
       "sudo sync"
     ]
   }
