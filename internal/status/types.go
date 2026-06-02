@@ -9,34 +9,38 @@
 //   - Both are used by the heartbeat client for periodic reporting
 package status
 
-import "time"
+import (
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/desktop"
+)
 
 // NodeStatus represents the complete status of a Citadel node.
 // This is the payload sent in heartbeats and returned from /status endpoint.
 type NodeStatus struct {
-	Version      string            `json:"version"`
-	Timestamp    time.Time         `json:"timestamp"`
-	Node         NodeInfo          `json:"node"`
-	System       SystemMetrics     `json:"system"`
-	GPU          []GPUMetrics      `json:"gpu,omitempty"`
-	Services     []ServiceInfo     `json:"services,omitempty"`
-	Capabilities *NodeCapabilities `json:"capabilities,omitempty"`
+	Version      string                `json:"version"`
+	Timestamp    time.Time             `json:"timestamp"`
+	Node         NodeInfo              `json:"node"`
+	System       SystemMetrics         `json:"system"`
+	GPU          []GPUMetrics          `json:"gpu,omitempty"`
+	Services     []ServiceInfo         `json:"services,omitempty"`
+	Capabilities *NodeCapabilities     `json:"capabilities,omitempty"`
+	Desktop      *desktop.Capabilities `json:"desktop,omitempty"`
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
-// Published in heartbeats so the control plane can route jobs appropriately.
 type NodeCapabilities struct {
 	GPUs    []GPUCapability `json:"gpus,omitempty"`
-	Engines []string        `json:"engines,omitempty"` // running inference engines
-	Tags    []string        `json:"tags,omitempty"`    // all capability tags for queue routing
+	Engines []string        `json:"engines,omitempty"`
+	Tags    []string        `json:"tags,omitempty"`
 }
 
 // GPUCapability describes a single GPU's identity for capability reporting.
 type GPUCapability struct {
 	Name    string `json:"name"`
 	VRAMMb  int    `json:"vram_mb"`
-	Tag     string `json:"tag"`      // normalized e.g. "rtx3090"
-	VRAMTag string `json:"vram_tag"` // e.g. "24gb"
+	Tag     string `json:"tag"`
+	VRAMTag string `json:"vram_tag"`
 }
 
 // NodeInfo contains basic node identification.
