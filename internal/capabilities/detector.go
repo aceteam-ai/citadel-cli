@@ -6,6 +6,7 @@ import (
 	"math"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +20,184 @@ type Capability struct {
 	Tag         string
 	Category    string
 	Description string
+}
+
+// GPUDevice represents a single detected GPU with structured fields.
+type GPUDevice struct {
+	Name    string `json:"name" yaml:"name"`
+	VRAMMb  int    `json:"vram_mb" yaml:"vram_mb"`
+	Tag     string `json:"tag" yaml:"tag"`           // normalized tag e.g. "rtx3090"
+	VRAMTag string `json:"vram_tag" yaml:"vram_tag"` // e.g. "24gb"
+}
+
+// GPUCapabilities holds the full GPU capability summary for a node.
+type GPUCapabilities struct {
+	Devices []GPUDevice `json:"devices,omitempty" yaml:"devices,omitempty"`
+	Count   int         `json:"count" yaml:"count"`
+}
+
+// NodeCapabilities aggregates all detected capabilities for a node.
+type NodeCapabilities struct {
+	GPU     *GPUCapabilities `json:"gpu,omitempty" yaml:"gpu,omitempty"`
+	Engines []string         `json:"engines,omitempty" yaml:"engines,omitempty"` // running inference engines
+	Tags    []string         `json:"tags,omitempty" yaml:"tags,omitempty"`       // all capability tags
+}
+
+// DetectGPUCapabilities runs nvidia-smi and returns structured GPU information.
+// Returns nil if no nvidia-smi or no GPUs detected.
+func DetectGPUCapabilities() *GPUCapabilities {
+	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=name,memory.total,count", "--format=csv,noheader,nounits")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var devices []GPUDevice
+	totalCount := 0
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ",", 3)
+		if len(parts) < 2 {
+			continue
+		}
+
+		gpuName := strings.TrimSpace(parts[0])
+		memoryMBStr := strings.TrimSpace(parts[1])
+		gpuTag := NormalizeGPUName(gpuName)
+		vramGB := NormalizeVRAM(memoryMBStr)
+
+		vramMB := 0
+		if v, err := strconv.Atoi(memoryMBStr); err == nil {
+			vramMB = v
+		}
+
+		// nvidia-smi "count" returns the total GPU count on every row
+		if len(parts) >= 3 {
+			if c, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil && c > totalCount {
+				totalCount = c
+			}
+		}
+
+		vramTag := ""
+		if vramGB != "" {
+			vramTag = vramGB + "gb"
+		}
+
+		devices = append(devices, GPUDevice{
+			Name:    gpuName,
+			VRAMMb:  vramMB,
+			Tag:     gpuTag,
+			VRAMTag: vramTag,
+		})
+	}
+
+	if len(devices) == 0 {
+		return nil
+	}
+
+	if totalCount == 0 {
+		totalCount = len(devices)
+	}
+
+	return &GPUCapabilities{
+		Devices: devices,
+		Count:   totalCount,
+	}
+}
+
+// DetectNodeCapabilities returns the full node capabilities including GPU and running engines.
+func DetectNodeCapabilities() *NodeCapabilities {
+	caps := &NodeCapabilities{}
+
+	// GPU detection
+	gpuCaps := DetectGPUCapabilities()
+	if gpuCaps != nil {
+		caps.GPU = gpuCaps
+
+		// Build tags from GPU info
+		seen := make(map[string]bool)
+		for i, dev := range gpuCaps.Devices {
+			if dev.Tag != "" {
+				tag := "gpu:" + dev.Tag
+				if !seen[tag] {
+					seen[tag] = true
+					caps.Tags = append(caps.Tags, tag)
+				}
+			}
+			if dev.VRAMTag != "" {
+				tag := "vram:" + dev.VRAMTag
+				if !seen[tag] {
+					seen[tag] = true
+					caps.Tags = append(caps.Tags, tag)
+				}
+			}
+			// Indexed tag
+			if dev.Tag != "" && dev.VRAMTag != "" {
+				indexedTag := fmt.Sprintf("gpu:%d:%s:%s", i, dev.Tag, dev.VRAMTag)
+				if ValidateTag(indexedTag) {
+					caps.Tags = append(caps.Tags, indexedTag)
+				}
+			}
+		}
+	}
+
+	// Detect running inference engines
+	caps.Engines = detectRunningEngines()
+
+	// Add engine tags
+	for _, engine := range caps.Engines {
+		tag := "engine:" + engine
+		if ValidateTag(tag) {
+			caps.Tags = append(caps.Tags, tag)
+		}
+	}
+
+	// Always add cpu:general
+	caps.Tags = append(caps.Tags, "cpu:general")
+
+	return caps
+}
+
+// detectRunningEngines checks for running inference engine processes/containers.
+func detectRunningEngines() []string {
+	var engines []string
+	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
+	defer cancel()
+
+	// Check for running docker containers matching known engine names
+	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return engines
+	}
+
+	known := map[string]string{
+		"vllm":     "vllm",
+		"ollama":   "ollama",
+		"llamacpp": "llamacpp",
+		"llama":    "llamacpp",
+		"lmstudio": "lmstudio",
+	}
+
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		name := strings.ToLower(strings.TrimSpace(line))
+		for keyword, engine := range known {
+			if strings.Contains(name, keyword) && !seen[engine] {
+				seen[engine] = true
+				engines = append(engines, engine)
+			}
+		}
+	}
+
+	return engines
 }
 
 // Detect auto-detects hardware and software capabilities of the current node.

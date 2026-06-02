@@ -138,3 +138,114 @@ func TestTagsHelper(t *testing.T) {
 		t.Errorf("Tags() = %v, want [gpu:rtx4090, llm:llama3]", tags)
 	}
 }
+
+func TestGPUDevice(t *testing.T) {
+	dev := GPUDevice{
+		Name:    "NVIDIA GeForce RTX 3090",
+		VRAMMb:  24576,
+		Tag:     "rtx3090",
+		VRAMTag: "24gb",
+	}
+
+	if dev.Name != "NVIDIA GeForce RTX 3090" {
+		t.Errorf("Name = %q, want %q", dev.Name, "NVIDIA GeForce RTX 3090")
+	}
+	if dev.VRAMMb != 24576 {
+		t.Errorf("VRAMMb = %d, want %d", dev.VRAMMb, 24576)
+	}
+	if dev.Tag != "rtx3090" {
+		t.Errorf("Tag = %q, want %q", dev.Tag, "rtx3090")
+	}
+	if dev.VRAMTag != "24gb" {
+		t.Errorf("VRAMTag = %q, want %q", dev.VRAMTag, "24gb")
+	}
+}
+
+func TestGPUCapabilities(t *testing.T) {
+	caps := GPUCapabilities{
+		Devices: []GPUDevice{
+			{Name: "RTX 3090", VRAMMb: 24576, Tag: "rtx3090", VRAMTag: "24gb"},
+			{Name: "RTX 3090", VRAMMb: 24576, Tag: "rtx3090", VRAMTag: "24gb"},
+		},
+		Count: 2,
+	}
+
+	if caps.Count != 2 {
+		t.Errorf("Count = %d, want 2", caps.Count)
+	}
+	if len(caps.Devices) != 2 {
+		t.Errorf("len(Devices) = %d, want 2", len(caps.Devices))
+	}
+}
+
+func TestNodeCapabilities(t *testing.T) {
+	nodeCaps := NodeCapabilities{
+		GPU: &GPUCapabilities{
+			Devices: []GPUDevice{
+				{Name: "RTX 4090", VRAMMb: 24576, Tag: "rtx4090", VRAMTag: "24gb"},
+			},
+			Count: 1,
+		},
+		Engines: []string{"vllm"},
+		Tags:    []string{"gpu:rtx4090", "vram:24gb", "engine:vllm", "cpu:general"},
+	}
+
+	if nodeCaps.GPU == nil {
+		t.Fatal("GPU should not be nil")
+	}
+	if nodeCaps.GPU.Count != 1 {
+		t.Errorf("GPU.Count = %d, want 1", nodeCaps.GPU.Count)
+	}
+	if len(nodeCaps.Engines) != 1 || nodeCaps.Engines[0] != "vllm" {
+		t.Errorf("Engines = %v, want [vllm]", nodeCaps.Engines)
+	}
+	if len(nodeCaps.Tags) != 4 {
+		t.Errorf("len(Tags) = %d, want 4", len(nodeCaps.Tags))
+	}
+}
+
+func TestDetectNodeCapabilities_NoGPU(t *testing.T) {
+	// When nvidia-smi is not available, GPU should be nil but function should not panic
+	caps := DetectNodeCapabilities()
+	if caps == nil {
+		t.Fatal("DetectNodeCapabilities should never return nil")
+	}
+	// Should always have cpu:general tag
+	hasCPU := false
+	for _, tag := range caps.Tags {
+		if tag == "cpu:general" {
+			hasCPU = true
+			break
+		}
+	}
+	if !hasCPU {
+		t.Error("Tags should always contain cpu:general")
+	}
+}
+
+func TestResolveQueuesWithEngines(t *testing.T) {
+	caps := []Capability{
+		{Tag: "gpu:rtx3090", Category: "gpu"},
+		{Tag: "vram:24gb", Category: "vram"},
+		{Tag: "engine:vllm", Category: "engine"},
+		{Tag: "cpu:general", Category: "cpu"},
+	}
+	queues := ResolveQueues(caps, "jobs:v1:gpu-general")
+
+	// Should have gpu:rtx3090 queue, vram:24gb queue, engine:vllm queue, and base queue
+	// cpu:general is excluded (handled by base queue)
+	expected := map[string]bool{
+		"jobs:v1:tag:gpu:rtx3090":  true,
+		"jobs:v1:tag:vram:24gb":    true,
+		"jobs:v1:tag:engine:vllm":  true,
+		"jobs:v1:gpu-general":      true,
+	}
+	if len(queues) != len(expected) {
+		t.Fatalf("expected %d queues, got %d: %v", len(expected), len(queues), queues)
+	}
+	for _, q := range queues {
+		if !expected[q] {
+			t.Errorf("unexpected queue: %q", q)
+		}
+	}
+}

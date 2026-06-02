@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -125,6 +126,50 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Resolve node capabilities early (used for queue routing and heartbeat)
+	var nodeCaps *capabilities.NodeCapabilities
+	workManifest, _, _ := findAndReadManifest()
+	if workManifest != nil && workManifest.Capabilities != nil {
+		nodeCaps = manifestToNodeCapabilities(workManifest.Capabilities)
+		fmt.Println("   - Capabilities: loaded from manifest")
+	} else {
+		nodeCaps = capabilities.DetectNodeCapabilities()
+		fmt.Println("   - Capabilities: auto-detected")
+	}
+	if nodeCaps != nil && nodeCaps.GPU != nil && len(nodeCaps.GPU.Devices) > 0 {
+		fmt.Printf("   - GPUs: %d detected", nodeCaps.GPU.Count)
+		fmt.Printf(" (%s", nodeCaps.GPU.Devices[0].Name)
+		if nodeCaps.GPU.Devices[0].VRAMTag != "" {
+			fmt.Printf(", %s", strings.ToUpper(nodeCaps.GPU.Devices[0].VRAMTag))
+		}
+		fmt.Printf(")\n")
+	}
+	if len(nodeCaps.Engines) > 0 {
+		fmt.Printf("   - Engines: %s\n", strings.Join(nodeCaps.Engines, ", "))
+	}
+	if len(nodeCaps.Tags) > 0 {
+		Debug("capability tags: %v", nodeCaps.Tags)
+	}
+
+	// Convert capabilities to status types for heartbeat
+	var statusCaps *status.NodeCapabilities
+	if nodeCaps != nil {
+		statusCaps = &status.NodeCapabilities{
+			Engines: nodeCaps.Engines,
+			Tags:    nodeCaps.Tags,
+		}
+		if nodeCaps.GPU != nil {
+			for _, dev := range nodeCaps.GPU.Devices {
+				statusCaps.GPUs = append(statusCaps.GPUs, status.GPUCapability{
+					Name:    dev.Name,
+					VRAMMb:  dev.VRAMMb,
+					Tag:     dev.Tag,
+					VRAMTag: dev.VRAMTag,
+				})
+			}
+		}
+	}
+
 	// Resolve job source: API mode (device_api_token) vs direct Redis (legacy)
 	Debug("resolving job source mode...")
 
@@ -146,7 +191,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	var apiSource *worker.APISource // Keep reference for heartbeat
 
 	if !workForceDirectRedis && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
-		// API mode: use secure HTTP API instead of direct Redis
+		// API mode: use secure HTTP API instead of direct Redis.
+		// NOTE: API mode currently uses a single queue. Capability-based multi-queue
+		// routing requires extending APISource (tracked separately). Capabilities are
+		// still published in the heartbeat so the control plane can route upstream.
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -239,26 +287,29 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Resolve queue names: explicit --queue takes priority, otherwise use capabilities
 		var queueNames []string
 		if workQueue != "" {
-			// Explicit queue specified — use it directly (backwards compat)
+			// Explicit queue specified -- use it directly (backwards compat)
 			queueNames = []string{workQueue}
 		} else {
-			// Detect and/or parse capabilities to determine queues
+			// Use resolved node capabilities for queue routing
 			var allCaps []capabilities.Capability
 
-			if workAutoDetect {
-				fmt.Println("--- Detecting node capabilities ---")
-				detected := capabilities.Detect()
-				allCaps = append(allCaps, detected...)
-				for _, c := range detected {
-					fmt.Printf("   - Detected: %s (%s)\n", c.Tag, c.Description)
+			// Add capabilities from auto-detected nodeCaps (already resolved above)
+			if nodeCaps != nil && len(nodeCaps.Tags) > 0 {
+				for _, tag := range nodeCaps.Tags {
+					category := tag
+					if idx := strings.Index(tag, ":"); idx > 0 {
+						category = tag[:idx]
+					}
+					allCaps = append(allCaps, capabilities.Capability{Tag: tag, Category: category})
 				}
 			}
 
+			// Also honor --capabilities flag for manual overrides
 			if workCapabilities != "" {
 				manual := capabilities.ParseTags(workCapabilities)
 				allCaps = append(allCaps, manual...)
 				for _, c := range manual {
-					fmt.Printf("   - Manual: %s\n", c.Tag)
+					fmt.Printf("   - Manual tag: %s\n", c.Tag)
 				}
 			}
 
@@ -344,9 +395,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	var collector *status.Collector
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
-			NodeName:  nodeName,
-			ConfigDir: "", // TODO: get from manifest
-			Services:  nil,
+			NodeName:     nodeName,
+			ConfigDir:    "", // TODO: get from manifest
+			Services:     nil,
+			Capabilities: statusCaps,
 		})
 	}
 
@@ -425,9 +477,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
-				NodeName:  nodeName,
-				ConfigDir: "",
-				Services:  nil,
+				NodeName:     nodeName,
+				ConfigDir:    "",
+				Services:     nil,
+				Capabilities: statusCaps,
 			})
 		}
 
@@ -898,8 +951,8 @@ func init() {
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
 	// Capability detection flags
-	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")
-	workCmd.Flags().BoolVar(&workAutoDetect, "auto-detect", false, "Auto-detect node capabilities (GPU, models, CPU)")
+	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Additional comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")
+	workCmd.Flags().BoolVar(&workAutoDetect, "auto-detect", false, "(Deprecated) Capabilities are now always auto-detected unless declared in citadel.yaml")
 
 	// Concurrency flags
 	workCmd.Flags().IntVar(&workMaxConcurrency, "max-concurrency", 0, "Maximum concurrent jobs (0 = auto-detect from GPU count)")
