@@ -375,16 +375,15 @@ func (l *LinuxVNCManager) Configure(password string, port int) error {
 		return fmt.Errorf("failed to create .vnc directory: %w", err)
 	}
 
-	// Store password using x11vnc's password tool
+	// Write VNC passwd file directly using DES encryption (avoids leaking
+	// password in /proc/PID/cmdline via x11vnc -storepasswd)
 	passwdFile := filepath.Join(vncDir, "passwd")
-	cmd := exec.Command("x11vnc", "-storepasswd", password, passwdFile)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to store VNC password: %w", err)
+	encrypted, err := EncryptVNCPassword(password)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt VNC password: %w", err)
 	}
-
-	// Restrict password file permissions
-	if err := os.Chmod(passwdFile, 0600); err != nil {
-		return fmt.Errorf("failed to set password file permissions: %w", err)
+	if err := os.WriteFile(passwdFile, encrypted, 0600); err != nil {
+		return fmt.Errorf("failed to write VNC password file: %w", err)
 	}
 
 	return nil
