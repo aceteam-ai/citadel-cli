@@ -61,6 +61,16 @@ func TestVNCEnableFlags(t *testing.T) {
 	}
 }
 
+func TestVNCDisableUninstallFlag(t *testing.T) {
+	flag := vncDisableCmd.Flags().Lookup("uninstall")
+	if flag == nil {
+		t.Fatal("--uninstall flag not found on vnc disable")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--uninstall default = %q, want %q", flag.DefValue, "false")
+	}
+}
+
 func TestVNCEnablePortDefault(t *testing.T) {
 	if platform.DefaultVNCPort != 5900 {
 		t.Errorf("DefaultVNCPort = %d, want 5900", platform.DefaultVNCPort)

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
@@ -144,16 +145,28 @@ func runSvcInstall(cmd *cobra.Command, args []string) error {
 }
 
 func runSvcUninstall(cmd *cobra.Command, args []string) error {
+	var err error
 	switch runtime.GOOS {
 	case "linux":
-		return uninstallLinuxSvc()
+		err = uninstallLinuxSvc()
 	case "darwin":
-		return uninstallDarwinSvc()
+		err = uninstallDarwinSvc()
 	case "windows":
-		return uninstallWindowsSvc()
+		err = uninstallWindowsSvc()
 	default:
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
+
+	// Clean up VNC if installed
+	vncMgr := platform.GetVNCManager()
+	if vncMgr.IsInstalled() {
+		fmt.Println("Removing VNC server...")
+		if vncErr := vncMgr.Uninstall(); vncErr != nil {
+			fmt.Printf("Warning: VNC removal failed: %v\n", vncErr)
+		}
+	}
+
+	return err
 }
 
 func runSvcStart(cmd *cobra.Command, args []string) error {
