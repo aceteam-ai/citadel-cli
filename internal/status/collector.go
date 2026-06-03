@@ -23,6 +23,7 @@ type Collector struct {
 	services       []ServiceConfig
 	startTime      time.Time
 	modelDiscovery *ModelDiscovery
+	capabilities   *NodeCapabilities // cached capabilities (set once at startup)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -35,9 +36,10 @@ type ServiceConfig struct {
 
 // CollectorConfig holds configuration for the status collector.
 type CollectorConfig struct {
-	NodeName  string
-	ConfigDir string
-	Services  []ServiceConfig
+	NodeName     string
+	ConfigDir    string
+	Services     []ServiceConfig
+	Capabilities *NodeCapabilities // pre-detected capabilities (optional)
 }
 
 // NewCollector creates a new status collector.
@@ -48,7 +50,13 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		services:       cfg.Services,
 		startTime:      time.Now(),
 		modelDiscovery: NewModelDiscovery(),
+		capabilities:   cfg.Capabilities,
 	}
+}
+
+// SetCapabilities sets the cached capabilities for heartbeat publishing.
+func (c *Collector) SetCapabilities(caps *NodeCapabilities) {
+	c.capabilities = caps
 }
 
 // Collect gathers all status metrics and returns a NodeStatus.
@@ -69,6 +77,9 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 
 	// Collect service status
 	status.Services = c.collectServiceStatus()
+
+	// Include cached capabilities if available
+	status.Capabilities = c.capabilities
 
 	return status, nil
 }

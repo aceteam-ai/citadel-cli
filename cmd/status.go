@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
@@ -103,6 +104,9 @@ func runStandardStatus() {
 
 	headerColor.Fprintln(w, "\n💎 GPU STATUS")
 	printGPUInfo(w)
+
+	headerColor.Fprintln(w, "\n🔧 CAPABILITIES")
+	printCapabilities(w, manifest)
 
 	headerColor.Fprintln(w, "\n🌐 NETWORK STATUS")
 	printNetworkInfo(w, manifest)
@@ -404,6 +408,113 @@ func printGPUInfo(w *tabwriter.Writer) {
 			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Driver"), gpu.Driver)
 		}
 	}
+}
+
+func printCapabilities(w *tabwriter.Writer, manifest *CitadelManifest) {
+	// If manifest declares capabilities, show those; otherwise auto-detect
+	nodeCaps := resolveCapabilities(manifest)
+
+	if nodeCaps.GPU != nil && len(nodeCaps.GPU.Devices) > 0 {
+		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("GPU Count"), nodeCaps.GPU.Count)
+		for i, dev := range nodeCaps.GPU.Devices {
+			vramStr := ""
+			if dev.VRAMTag != "" {
+				vramStr = fmt.Sprintf(" (%s)", strings.ToUpper(dev.VRAMTag))
+			}
+			fmt.Fprintf(w, "  %s %d:\t%s%s\n", labelColor.Sprint("GPU"), i, dev.Name, vramStr)
+		}
+	} else {
+		fmt.Fprintln(w, "  GPU:\tNone detected")
+	}
+
+	if len(nodeCaps.Engines) > 0 {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Engines"), strings.Join(nodeCaps.Engines, ", "))
+	}
+
+	if len(nodeCaps.Tags) > 0 {
+		fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Tags"), strings.Join(nodeCaps.Tags, ", "))
+	}
+}
+
+// resolveCapabilities returns node capabilities from manifest if declared, or auto-detects.
+func resolveCapabilities(manifest *CitadelManifest) *capabilities.NodeCapabilities {
+	if manifest != nil && manifest.Capabilities != nil {
+		return manifestToNodeCapabilities(manifest.Capabilities)
+	}
+	return capabilities.DetectNodeCapabilities()
+}
+
+// manifestToNodeCapabilities converts declared manifest capabilities to the common struct.
+func manifestToNodeCapabilities(mc *ManifestCapabilities) *capabilities.NodeCapabilities {
+	caps := &capabilities.NodeCapabilities{
+		Engines: mc.Engines,
+	}
+
+	if len(mc.GPUs) > 0 {
+		gpuCaps := &capabilities.GPUCapabilities{}
+		totalCount := 0
+		for _, mg := range mc.GPUs {
+			count := mg.Count
+			if count <= 0 {
+				count = 1
+			}
+			totalCount += count
+			tag := capabilities.NormalizeGPUName(mg.Name)
+			vramTag := ""
+			if mg.VRAMMb > 0 {
+				vramTag = capabilities.NormalizeVRAM(fmt.Sprintf("%d", mg.VRAMMb))
+				if vramTag != "" {
+					vramTag += "gb"
+				}
+			}
+			for i := 0; i < count; i++ {
+				gpuCaps.Devices = append(gpuCaps.Devices, capabilities.GPUDevice{
+					Name:    mg.Name,
+					VRAMMb:  mg.VRAMMb,
+					Tag:     tag,
+					VRAMTag: vramTag,
+				})
+			}
+		}
+		gpuCaps.Count = totalCount
+		caps.GPU = gpuCaps
+
+		// Build tags from GPU info
+		seen := make(map[string]bool)
+		for i, dev := range gpuCaps.Devices {
+			if dev.Tag != "" {
+				tag := "gpu:" + dev.Tag
+				if !seen[tag] {
+					seen[tag] = true
+					caps.Tags = append(caps.Tags, tag)
+				}
+			}
+			if dev.VRAMTag != "" {
+				tag := "vram:" + dev.VRAMTag
+				if !seen[tag] {
+					seen[tag] = true
+					caps.Tags = append(caps.Tags, tag)
+				}
+			}
+			if dev.Tag != "" && dev.VRAMTag != "" {
+				indexedTag := fmt.Sprintf("gpu:%d:%s:%s", i, dev.Tag, dev.VRAMTag)
+				if capabilities.ValidateTag(indexedTag) {
+					caps.Tags = append(caps.Tags, indexedTag)
+				}
+			}
+		}
+	}
+
+	// Add engine tags
+	for _, engine := range mc.Engines {
+		tag := "engine:" + engine
+		if capabilities.ValidateTag(tag) {
+			caps.Tags = append(caps.Tags, tag)
+		}
+	}
+
+	caps.Tags = append(caps.Tags, "cpu:general")
+	return caps
 }
 
 func printNetworkInfo(w *tabwriter.Writer, manifest *CitadelManifest) {

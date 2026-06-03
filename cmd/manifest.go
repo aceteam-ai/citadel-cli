@@ -19,6 +19,20 @@ type Service struct {
 	Port        int    `yaml:"port,omitempty"`         // For native services
 }
 
+// ManifestCapabilities defines the optional capabilities section in citadel.yaml.
+// If not declared, capabilities are auto-detected at startup.
+type ManifestCapabilities struct {
+	GPUs    []ManifestGPU `yaml:"gpus,omitempty"`
+	Engines []string      `yaml:"engines,omitempty"` // inference engines: vllm, ollama, llamacpp
+}
+
+// ManifestGPU describes a GPU declared in the manifest.
+type ManifestGPU struct {
+	Name   string `yaml:"name"`             // e.g. "NVIDIA GeForce RTX 3090"
+	VRAMMb int    `yaml:"vram_mb,omitempty"` // e.g. 24576
+	Count  int    `yaml:"count,omitempty"`   // defaults to 1
+}
+
 // CitadelManifest defines the structure of the citadel.yaml file.
 type CitadelManifest struct {
 	Node struct {
@@ -26,7 +40,8 @@ type CitadelManifest struct {
 		Tags  []string `yaml:"tags"`
 		OrgID string   `yaml:"org_id,omitempty"`
 	} `yaml:"node"`
-	Services []Service `yaml:"services"`
+	Services     []Service             `yaml:"services"`
+	Capabilities *ManifestCapabilities `yaml:"capabilities,omitempty"`
 }
 
 // findAndReadManifest locates and parses the node's manifest file.

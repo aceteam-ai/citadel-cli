@@ -250,6 +250,10 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 
 **Docker Compose Management**: Services are managed through `docker compose` commands. The code uses subprocess calls to docker/docker-compose CLI for container lifecycle.
 
+**Capability-Based Queue Routing**: Nodes auto-detect hardware (GPUs via `nvidia-smi`, engines via `docker ps`) and generate tags (e.g., `gpu:rtx3090`, `engine:vllm`). Tags map to Redis Streams queues (`jobs:v1:tag:gpu:rtx3090`) via `capabilities.TagQueueName()`. Capabilities can also be declared manually in the `capabilities:` section of `citadel.yaml`, which takes precedence over auto-detection.
+
+**Node Installer**: `install.sh` is a standalone script served at `get.aceteam.ai/citadel` that provisions a fresh Ubuntu machine end-to-end (NVIDIA drivers, Docker, citadel binary, systemd service, vLLM pre-pull). `uninstall.sh` reverses it. The Packer template (`packer/`) bakes the same stack into a qcow2 VM image for Proxmox-based fleet deployment.
+
 ### Key Packages
 
 - **`cmd/`**: Cobra command implementations
@@ -263,6 +267,7 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 - **`internal/redis/`**: Redis Streams client for job queue
 - **`internal/terminal/`**: WebSocket terminal server with PTY management and token caching
 - **`internal/ui/`**: Interactive prompts using survey library
+- **`internal/capabilities/`**: GPU and engine auto-detection, tag normalization, queue routing resolution
 - **`services/`**: Embedded Docker Compose files and service registry
 
 ### Network Architecture

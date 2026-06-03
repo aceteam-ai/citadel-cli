@@ -14,3 +14,13 @@ services:
 
   - name: vllm
     compose_file: ./services/vllm.yml
+
+# Optional: declare GPU capabilities explicitly.
+# If omitted, capabilities are auto-detected via nvidia-smi at startup.
+# capabilities:
+#   gpus:
+#     - name: "NVIDIA GeForce RTX 3090"
+#       vram_mb: 24576
+#       count: 1
+#   engines:
+#     - vllm
