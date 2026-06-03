@@ -107,9 +107,6 @@ func reverseBits(b byte) byte {
 	return result
 }
 
-// EncryptVNCPassword is exported for testing.
-var EncryptVNCPassword = encryptVNCPassword
-
 // --- Windows implementation ---
 
 // WindowsVNCManager manages TightVNC on Windows.
