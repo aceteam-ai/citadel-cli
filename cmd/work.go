@@ -189,6 +189,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	var streamFactory func(job *worker.Job) worker.StreamWriter
 	var useAPIMode bool
 	var apiSource *worker.APISource // Keep reference for heartbeat
+	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
 
 	if !workForceDirectRedis && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
@@ -237,6 +238,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		source = apiSource
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
+		setNodeMeta = func(nodeID, nodeName string) {
+			apiSource.Client().SetNodeMeta(nodeID, nodeName)
+		}
 
 		fmt.Println("   - Mode: Redis API (secure)")
 		if deviceConfig.UserEmail != "" {
@@ -331,6 +335,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		})
 		source = redisSource
 		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
+		setNodeMeta = func(nodeID, nodeName string) {
+			redisSource.Client().SetNodeMeta(nodeID, nodeName)
+		}
 
 		fmt.Println("   - Mode: Direct Redis (legacy)")
 	}
@@ -374,6 +381,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 	Debug("final node name: %s", nodeName)
+
+	// Set node identity on the stream event publisher for operator attribution
+	if setNodeMeta != nil {
+		setNodeMeta(nodeName, nodeName)
+		Debug("node meta set: node_id=%s, node_name=%s", nodeName, nodeName)
+	}
 
 	// Open usage store for per-job compute tracking
 	var usageStore *usage.Store

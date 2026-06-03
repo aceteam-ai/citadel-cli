@@ -137,3 +137,9 @@ type StreamEvent struct {
 	Timestamp string         `json:"timestamp"`
 	Data      map[string]any `json:"data,omitempty"`
 }
+
+// NodeMeta holds node identity metadata injected into every stream event.
+type NodeMeta struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+}

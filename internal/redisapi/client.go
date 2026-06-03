@@ -24,6 +24,9 @@ type Client struct {
 
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
+
+	// Node identity metadata injected into stream events
+	nodeMeta *NodeMeta
 }
 
 // ClientConfig holds configuration for the API client.
@@ -132,6 +135,11 @@ func (c *Client) WebSocket() *WSClient {
 // IsWebSocketConnected returns whether the WebSocket is currently connected.
 func (c *Client) IsWebSocketConnected() bool {
 	return c.wsClient != nil && c.wsClient.IsConnected()
+}
+
+// SetNodeMeta sets the node identity metadata that will be included in all stream events.
+func (c *Client) SetNodeMeta(nodeID, nodeName string) {
+	c.nodeMeta = &NodeMeta{NodeID: nodeID, NodeName: nodeName}
 }
 
 // doRequest performs an HTTP request with authentication and JSON handling.

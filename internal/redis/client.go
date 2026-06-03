@@ -44,6 +44,12 @@ type Job struct {
 	EnqueuedAt string // JQS-Core: original enqueue timestamp, preserved for DLQ
 }
 
+// NodeMeta holds node identity metadata injected into every stream event.
+type NodeMeta struct {
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name"`
+}
+
 // Client wraps Redis operations for the job queue system.
 type Client struct {
 	client        *redis.Client
@@ -52,6 +58,7 @@ type Client struct {
 	consumerGroup string
 	blockMs       int
 	maxAttempts   int
+	nodeMeta      *NodeMeta
 }
 
 // ClientConfig holds configuration for the Redis client.
@@ -380,6 +387,14 @@ func (c *Client) getDLQName() string {
 func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]interface{}) error {
 	streamName := fmt.Sprintf("stream:v1:%s", jobID)
 
+	// Inject node identity metadata into every event for operator attribution
+	if c.nodeMeta != nil {
+		if data == nil {
+			data = make(map[string]interface{})
+		}
+		data["meta"] = c.nodeMeta
+	}
+
 	event := StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,
@@ -483,4 +498,9 @@ func (c *Client) QueueName() string {
 // MaxAttempts returns the maximum retry attempts before DLQ.
 func (c *Client) MaxAttempts() int {
 	return c.maxAttempts
+}
+
+// SetNodeMeta sets the node identity metadata that will be included in all stream events.
+func (c *Client) SetNodeMeta(nodeID, nodeName string) {
+	c.nodeMeta = &NodeMeta{NodeID: nodeID, NodeName: nodeName}
 }
