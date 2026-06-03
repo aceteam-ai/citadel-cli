@@ -169,6 +169,7 @@ build {
       # Disable SSH password authentication
       "sudo sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config",
       "sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config",
+      "sudo rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf",
       "sudo sync"
     ]
   }

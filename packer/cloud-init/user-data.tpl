@@ -6,7 +6,7 @@ users:
   - name: ${username}
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    lock_passwd: true
+    lock_passwd: false
     plain_text_passwd: "${password}"
 
 ssh_pwauth: true
