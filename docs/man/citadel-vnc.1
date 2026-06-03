@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-vnc - Manage VNC server on this node
+
+
+.SH SYNOPSIS
+\fBcitadel vnc [flags]\fP
+
+
+.SH DESCRIPTION
+Install, configure, and manage a VNC server for remote desktop access.
+
+.PP
+On Windows, this installs and configures TightVNC as a system service.
+On Linux and macOS, VNC provisioning is currently a stub (most nodes are headless).
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for vnc
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-vnc-disable(1)\fP, \fBcitadel-vnc-enable(1)\fP, \fBcitadel-vnc-status(1)\fP
