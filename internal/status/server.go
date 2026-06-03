@@ -4,23 +4,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/desktop"
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 )
 
 // Server provides an HTTP server for node status queries.
 // This enables on-demand queries from the AceTeam control plane.
 type Server struct {
-	collector  *Collector
-	port       int
-	httpServer *http.Server
-	version    string
+	collector      *Collector
+	port           int
+	httpServer     *http.Server
+	version        string
+	tokenValidator terminal.TokenValidator
+	orgID          string
 }
 
 // ServerConfig holds configuration for the status server.
 type ServerConfig struct {
-	Port    int    // HTTP server port (default: 8080)
-	Version string // Citadel version string
+	Port           int                      // HTTP server port (default: 8080)
+	Version        string                   // Citadel version string
+	TokenValidator terminal.TokenValidator   // Optional: enables authenticated desktop endpoints
+	OrgID          string                   // Required when TokenValidator is set
 }
 
 // NewServer creates a new status HTTP server.
@@ -29,9 +38,11 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		cfg.Port = 8080
 	}
 	return &Server{
-		collector: collector,
-		port:      cfg.Port,
-		version:   cfg.Version,
+		collector:      collector,
+		port:           cfg.Port,
+		version:        cfg.Version,
+		tokenValidator: cfg.TokenValidator,
+		orgID:          cfg.OrgID,
 	}
 }
 
@@ -43,6 +54,11 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
+
+	if s.tokenValidator != nil {
+		mux.HandleFunc("/api/screenshot", s.requireAuth(s.handleScreenshot))
+		mux.HandleFunc("/api/actions", s.requireAuth(s.handleActions))
+	}
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
@@ -151,5 +167,72 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "pong",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" || token == r.Header.Get("Authorization") {
+			http.Error(w, `{"error":"authorization required"}`, http.StatusUnauthorized)
+			return
+		}
+		if _, err := s.tokenValidator.ValidateToken(token, s.orgID); err != nil {
+			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// handleScreenshot captures and returns a PNG screenshot of the display.
+// GET /api/screenshot
+func (s *Server) handleScreenshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	png, err := desktop.CaptureScreenshot(r.Context())
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Write(png)
+}
+
+// handleActions executes mouse/keyboard actions on the display.
+// POST /api/actions
+func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "failed to read body"})
+		return
+	}
+	actions, err := desktop.ParseActions(body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if err := desktop.ExecuteActions(r.Context(), actions); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      true,
+		"actions": len(actions),
 	})
 }

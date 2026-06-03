@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -81,6 +82,8 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Include cached capabilities if available
 	status.Capabilities = c.capabilities
 
+	// Collect desktop capabilities
+	status.Desktop = desktop.DetectCapabilities()
 	return status, nil
 }
 

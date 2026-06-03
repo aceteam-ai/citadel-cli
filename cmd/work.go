@@ -391,33 +391,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create status collector (used by status server and Redis status publisher)
-	var collector *status.Collector
-	if workStatusPort > 0 {
-		collector = status.NewCollector(status.CollectorConfig{
-			NodeName:     nodeName,
-			ConfigDir:    "", // TODO: get from manifest
-			Services:     nil,
-			Capabilities: statusCaps,
-		})
-	}
-
-	// Start status server if enabled
-	if workStatusPort > 0 {
-		statusServer := status.NewServer(status.ServerConfig{
-			Port:    workStatusPort,
-			Version: Version,
-		}, collector)
-
-		go func() {
-			fmt.Printf("   - Status server: http://localhost:%d\n", workStatusPort)
-			if err := statusServer.Start(ctx); err != nil && err != context.Canceled {
-				fmt.Fprintf(os.Stderr, "   - ⚠️ Status server error: %v\n", err)
-			}
-		}()
-	}
-
-	// Resolve API key and base URL (used by SSH sync and terminal)
+	// Resolve API key and base URL (used by status server, SSH sync, and terminal)
 	apiKey := workAPIKey
 	if apiKey == "" {
 		apiKey = os.Getenv("CITADEL_API_KEY")
@@ -432,6 +406,58 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if baseURL == "" {
 		baseURL = "https://aceteam.ai"
+	}
+
+	// Create status collector (used by status server and Redis status publisher)
+	var collector *status.Collector
+	if workStatusPort > 0 {
+		collector = status.NewCollector(status.CollectorConfig{
+			NodeName:     nodeName,
+			ConfigDir:    "",
+			Services:     nil,
+			Capabilities: statusCaps,
+		})
+	}
+
+	// Start status server if enabled
+	if workStatusPort > 0 {
+		serverCfg := status.ServerConfig{
+			Port:    workStatusPort,
+			Version: Version,
+		}
+
+		// Wire up desktop API auth if org ID is available
+		statusOrgID := ""
+		if deviceConfig != nil {
+			statusOrgID = deviceConfig.OrgID
+		}
+		if statusOrgID == "" {
+			if manifest, _, err := findAndReadManifest(); err == nil {
+				statusOrgID = manifest.Node.OrgID
+			}
+		}
+		if statusOrgID != "" && baseURL != "" {
+			serverCfg.TokenValidator = terminal.NewCachingTokenValidator(baseURL, statusOrgID, 30*time.Second)
+			serverCfg.OrgID = statusOrgID
+		}
+
+		statusServer := status.NewServer(serverCfg, collector)
+
+		go func() {
+			if serverCfg.TokenValidator != nil {
+				if cachingVal, ok := serverCfg.TokenValidator.(*terminal.CachingTokenValidator); ok {
+					if err := cachingVal.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Desktop API token cache error: %v\n", err)
+					}
+				}
+				fmt.Printf("   - Status server: http://localhost:%d (desktop API enabled)\n", workStatusPort)
+			} else {
+				fmt.Printf("   - Status server: http://localhost:%d\n", workStatusPort)
+			}
+			if err := statusServer.Start(ctx); err != nil && err != context.Canceled {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Status server error: %v\n", err)
+			}
+		}()
 	}
 
 	// Start SSH key sync if enabled
