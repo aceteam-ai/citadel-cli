@@ -32,6 +32,8 @@ type DeviceConfig struct {
 	HealthMonitoringEnabled bool     `json:"healthMonitoringEnabled"`
 	AlertOnOffline          bool     `json:"alertOnOffline"`
 	AlertOnHighTemp         bool     `json:"alertOnHighTemp"`
+	VNCEnabled              bool     `json:"vncEnabled"`
+	VNCPassword             string   `json:"vncPassword,omitempty"`
 }
 
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
@@ -88,6 +90,47 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		result += fmt.Sprintf("\nStarted %d service(s): %v", len(config.Services), config.Services)
 	}
 
+	// Handle VNC enable/disable (non-fatal: log warning and continue)
+	if config.VNCEnabled {
+		vncMgr := platform.GetVNCManager()
+		if !vncMgr.IsInstalled() {
+			if err := vncMgr.Install(); err != nil {
+				result += fmt.Sprintf("\nWarning: failed to install VNC server: %v", err)
+			}
+		}
+		if vncMgr.IsInstalled() {
+			// Use provided password or generate one
+			pw := config.VNCPassword
+			if pw == "" {
+				generated, err := platform.GenerateVNCPassword()
+				if err != nil {
+					result += fmt.Sprintf("\nWarning: failed to generate VNC password: %v", err)
+				} else {
+					pw = generated
+				}
+			}
+			if pw != "" {
+				if err := vncMgr.Configure(pw, platform.DefaultVNCPort); err != nil {
+					result += fmt.Sprintf("\nWarning: failed to configure VNC: %v", err)
+				}
+				if err := vncMgr.Start(); err != nil {
+					result += fmt.Sprintf("\nWarning: failed to start VNC: %v", err)
+				} else {
+					result += fmt.Sprintf("\nVNC server enabled on port %d", platform.DefaultVNCPort)
+				}
+			}
+		}
+	} else {
+		vncMgr := platform.GetVNCManager()
+		if vncMgr.IsRunning() {
+			if err := vncMgr.Stop(); err != nil {
+				result += fmt.Sprintf("\nWarning: failed to stop VNC: %v", err)
+			} else {
+				result += "\nVNC server disabled"
+			}
+		}
+	}
+
 	return []byte(result), nil
 }
 
@@ -113,6 +156,7 @@ type ManifestConfig struct {
 	HealthMonitoringEnabled bool `yaml:"health_monitoring_enabled,omitempty"`
 	AlertOnOffline          bool `yaml:"alert_on_offline,omitempty"`
 	AlertOnHighTemp         bool `yaml:"alert_on_high_temp,omitempty"`
+	VNCEnabled              bool `yaml:"vnc_enabled,omitempty"`
 }
 
 // updateManifest updates the citadel.yaml with the new configuration.
@@ -175,6 +219,7 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 		HealthMonitoringEnabled: config.HealthMonitoringEnabled,
 		AlertOnOffline:          config.AlertOnOffline,
 		AlertOnHighTemp:         config.AlertOnHighTemp,
+		VNCEnabled:              config.VNCEnabled,
 	}
 
 	// Write updated manifest

@@ -26,6 +26,7 @@ type NodeStatus struct {
 	Services     []ServiceInfo         `json:"services,omitempty"`
 	Capabilities *NodeCapabilities     `json:"capabilities,omitempty"`
 	Desktop      *desktop.Capabilities `json:"desktop,omitempty"`
+	VNCPort      int                   `json:"vnc_port"`
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.

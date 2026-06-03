@@ -84,6 +84,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
+
+	// Detect VNC server status for top-level vnc_port field
+	vncMgr := platform.GetVNCManager()
+	if vncMgr.IsRunning() {
+		status.VNCPort = vncMgr.Port()
+	}
 	return status, nil
 }
 
