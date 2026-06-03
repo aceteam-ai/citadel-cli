@@ -49,6 +49,14 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]any) error {
 	streamName := fmt.Sprintf("stream:v1:%s", jobID)
 
+	// Inject node identity metadata into every event for operator attribution
+	if c.nodeMeta != nil {
+		if data == nil {
+			data = make(map[string]any)
+		}
+		data["meta"] = c.nodeMeta
+	}
+
 	event := StreamEvent{
 		Version:   "1.0",
 		Type:      eventType,

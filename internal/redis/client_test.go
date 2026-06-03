@@ -223,3 +223,92 @@ func TestJob(t *testing.T) {
 		t.Errorf("Payload[prompt] = %v, want Hello", job.Payload["prompt"])
 	}
 }
+
+func TestNodeMeta(t *testing.T) {
+	meta := NodeMeta{
+		NodeID:   "758",
+		NodeName: "desktop-6ukhjan",
+	}
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"node_id":"758"`) {
+		t.Errorf("Expected node_id in JSON, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"node_name":"desktop-6ukhjan"`) {
+		t.Errorf("Expected node_name in JSON, got: %s", jsonStr)
+	}
+}
+
+func TestSetNodeMeta(t *testing.T) {
+	client := NewClient(ClientConfig{})
+
+	// Initially nil
+	if client.nodeMeta != nil {
+		t.Error("nodeMeta should be nil initially")
+	}
+
+	// Set meta
+	client.SetNodeMeta("758", "desktop-6ukhjan")
+
+	if client.nodeMeta == nil {
+		t.Fatal("nodeMeta should not be nil after SetNodeMeta")
+	}
+	if client.nodeMeta.NodeID != "758" {
+		t.Errorf("NodeID = %s, want 758", client.nodeMeta.NodeID)
+	}
+	if client.nodeMeta.NodeName != "desktop-6ukhjan" {
+		t.Errorf("NodeName = %s, want desktop-6ukhjan", client.nodeMeta.NodeName)
+	}
+}
+
+func TestStreamEventIncludesNodeMeta(t *testing.T) {
+	// Verify that StreamEvent data can contain meta and it serializes correctly
+	meta := &NodeMeta{
+		NodeID:   "758",
+		NodeName: "desktop-6ukhjan",
+	}
+
+	event := StreamEvent{
+		Version:   "1.0",
+		Type:      "end",
+		JobID:     "job-123",
+		Timestamp: "2026-06-01T00:00:00Z",
+		Data: map[string]interface{}{
+			"result": map[string]interface{}{"output": "hello"},
+			"meta":   meta,
+		},
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Verify the structure round-trips correctly
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	dataField, ok := parsed["data"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Expected data to be a map")
+	}
+
+	metaField, ok := dataField["meta"].(map[string]interface{})
+	if !ok {
+		t.Fatal("Expected data.meta to be a map")
+	}
+
+	if metaField["node_id"] != "758" {
+		t.Errorf("data.meta.node_id = %v, want 758", metaField["node_id"])
+	}
+	if metaField["node_name"] != "desktop-6ukhjan" {
+		t.Errorf("data.meta.node_name = %v, want desktop-6ukhjan", metaField["node_name"])
+	}
+}
