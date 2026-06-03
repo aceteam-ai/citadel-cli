@@ -89,6 +89,84 @@ func TestVNCManagerInterfaceCompliance(t *testing.T) {
 	var _ VNCManager = (*DarwinVNCManager)(nil)
 }
 
+func TestEncryptVNCPassword(t *testing.T) {
+	// Test with a known password. The VNC DES encryption is deterministic
+	// given the same input, so we can verify the output is consistent.
+	encrypted1, err := encryptVNCPassword("testpass")
+	if err != nil {
+		t.Fatalf("encryptVNCPassword() error = %v", err)
+	}
+
+	// Must produce a 16-char hex string (8 bytes = 16 hex chars)
+	if len(encrypted1) != 16 {
+		t.Errorf("encryptVNCPassword() hex length = %d, want 16", len(encrypted1))
+	}
+
+	// Must be valid hex
+	for _, c := range encrypted1 {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			t.Errorf("encryptVNCPassword() contains non-hex character: %c", c)
+		}
+	}
+
+	// Same input must produce same output (deterministic)
+	encrypted2, err := encryptVNCPassword("testpass")
+	if err != nil {
+		t.Fatalf("encryptVNCPassword() second call error = %v", err)
+	}
+	if encrypted1 != encrypted2 {
+		t.Errorf("encryptVNCPassword() not deterministic: %s != %s", encrypted1, encrypted2)
+	}
+
+	// Different passwords must produce different output
+	encrypted3, err := encryptVNCPassword("diffpass")
+	if err != nil {
+		t.Fatalf("encryptVNCPassword() third call error = %v", err)
+	}
+	if encrypted1 == encrypted3 {
+		t.Errorf("encryptVNCPassword() same output for different passwords")
+	}
+
+	// Short password should be zero-padded (not error)
+	encrypted4, err := encryptVNCPassword("ab")
+	if err != nil {
+		t.Fatalf("encryptVNCPassword(short) error = %v", err)
+	}
+	if len(encrypted4) != 16 {
+		t.Errorf("encryptVNCPassword(short) hex length = %d, want 16", len(encrypted4))
+	}
+
+	// Empty password should work (zero-padded)
+	encrypted5, err := encryptVNCPassword("")
+	if err != nil {
+		t.Fatalf("encryptVNCPassword(empty) error = %v", err)
+	}
+	if len(encrypted5) != 16 {
+		t.Errorf("encryptVNCPassword(empty) hex length = %d, want 16", len(encrypted5))
+	}
+}
+
+func TestReverseBits(t *testing.T) {
+	tests := []struct {
+		input    byte
+		expected byte
+	}{
+		{0x00, 0x00},
+		{0xFF, 0xFF},
+		{0x01, 0x80},
+		{0x80, 0x01},
+		{0xAA, 0x55}, // 10101010 -> 01010101
+		{0x55, 0xAA}, // 01010101 -> 10101010
+	}
+
+	for _, tt := range tests {
+		result := reverseBits(tt.input)
+		if result != tt.expected {
+			t.Errorf("reverseBits(0x%02X) = 0x%02X, want 0x%02X", tt.input, result, tt.expected)
+		}
+	}
+}
+
 func TestLinuxVNCManagerIsRunning(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Skipping Linux-specific test")

@@ -1,18 +1,23 @@
 package platform
 
 import (
+	"crypto/des"
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"math/big"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 // DefaultVNCPort is the standard VNC port.
 const DefaultVNCPort = 5900
+
+// vncDESKey is the well-known fixed key used by all VNC implementations
+// (RFB protocol) to DES-encrypt stored passwords. This is NOT a secret --
+// it is hardcoded in every VNC implementation's source code.
+var vncDESKey = []byte{0x17, 0x52, 0x6b, 0x06, 0x23, 0x4e, 0x58, 0x07}
 
 // VNCManager interface defines operations for VNC server management.
 type VNCManager interface {
@@ -63,6 +68,46 @@ func ValidateVNCPort(port int) error {
 	return nil
 }
 
+// encryptVNCPassword encrypts a password using the standard VNC DES scheme.
+// The password is truncated/padded to exactly 8 bytes, then DES-encrypted
+// with the well-known fixed VNC key. Returns the hex-encoded ciphertext
+// suitable for writing to the Windows registry as REG_BINARY.
+func encryptVNCPassword(password string) (string, error) {
+	// Truncate or pad to exactly 8 bytes
+	pwBytes := make([]byte, 8)
+	copy(pwBytes, []byte(password))
+
+	// DES requires the key bits to be reversed per byte (VNC quirk)
+	reversedKey := make([]byte, 8)
+	for i, b := range vncDESKey {
+		reversedKey[i] = reverseBits(b)
+	}
+
+	block, err := des.NewCipher(reversedKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to create DES cipher: %w", err)
+	}
+
+	encrypted := make([]byte, 8)
+	block.Encrypt(encrypted, pwBytes)
+
+	return hex.EncodeToString(encrypted), nil
+}
+
+// reverseBits reverses the bit order in a byte.
+// VNC's DES implementation uses reversed bit ordering for the key.
+func reverseBits(b byte) byte {
+	var result byte
+	for i := 0; i < 8; i++ {
+		result = (result << 1) | (b & 1)
+		b >>= 1
+	}
+	return result
+}
+
+// EncryptVNCPassword is exported for testing.
+var EncryptVNCPassword = encryptVNCPassword
+
 // --- Windows implementation ---
 
 // WindowsVNCManager manages TightVNC on Windows.
@@ -88,7 +133,7 @@ func (w *WindowsVNCManager) Install() error {
 
 	fmt.Println("Installing TightVNC...")
 
-	// Try winget first
+	// Try winget first (no password setting via winget -- configure separately)
 	cmd := exec.Command("winget", "install", "GlavSoft.TightVNC",
 		"--accept-package-agreements", "--accept-source-agreements", "--silent")
 	if err := cmd.Run(); err == nil {
@@ -97,7 +142,6 @@ func (w *WindowsVNCManager) Install() error {
 	}
 
 	// Fallback: download MSI and run silent install
-	// TightVNC MSI supports silent install with public properties for password
 	fmt.Println("winget install failed, attempting MSI fallback...")
 	downloadCmd := exec.Command("powershell", "-NoProfile", "-Command",
 		`$url = "https://www.tightvnc.com/download/2.8.85/tightvnc-2.8.85-gpl-setup-64bit.msi"; `+
@@ -113,8 +157,8 @@ func (w *WindowsVNCManager) Install() error {
 	installCmd := exec.Command("msiexec", "/i", msiPath,
 		"/quiet", "/norestart",
 		"ADDLOCAL=Server",
-		"SET_USEVNCAUTHENTICATION=1",
-		"VALUE_OF_USEVNCAUTHENTICATION=1")
+		"SERVER_REGISTER_AS_SERVICE=1",
+		"SERVER_ADD_FIREWALL_EXCEPTION=1")
 	if err := installCmd.Run(); err != nil {
 		return fmt.Errorf("failed to install TightVNC via MSI: %w", err)
 	}
@@ -142,25 +186,20 @@ func (w *WindowsVNCManager) Configure(password string, port int) error {
 		return fmt.Errorf("failed to set VNC port in registry: %w", err)
 	}
 
-	// Set the VNC password using TightVNC's own command-line tool.
-	// TightVNC stores passwords as DES-encrypted blobs, not plaintext.
-	// The tvnserver -controlservice -setparam handles encryption internally.
-	pwCmd := exec.Command(`C:\Program Files\TightVNC\tvnserver.exe`,
-		"-controlservice", "-setparam", fmt.Sprintf("Password=%s", password))
+	// Encrypt password using the standard VNC DES scheme and write as REG_BINARY.
+	// TightVNC stores Password as a DES-encrypted blob, not plaintext.
+	encryptedHex, err := encryptVNCPassword(password)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt VNC password: %w", err)
+	}
+
+	// Write the encrypted password as REG_BINARY
+	pwCmd := exec.Command("reg", "add",
+		`HKLM\SOFTWARE\TightVNC\Server`,
+		"/v", "Password", "/t", "REG_BINARY",
+		"/d", encryptedHex, "/f")
 	if err := pwCmd.Run(); err != nil {
-		// Fallback: re-install via MSI with password set as a public property.
-		// The MSI handles DES encryption of the password at install time.
-		altCmd := exec.Command("msiexec", "/i",
-			`C:\Program Files\TightVNC\tightvnc.msi`,
-			"/quiet", "/norestart",
-			"ADDLOCAL=Server",
-			"SET_USEVNCAUTHENTICATION=1",
-			"VALUE_OF_USEVNCAUTHENTICATION=1",
-			fmt.Sprintf("SET_PASSWORD=%s", password),
-			fmt.Sprintf("VALUE_OF_PASSWORD=%s", password))
-		if altErr := altCmd.Run(); altErr != nil {
-			return fmt.Errorf("failed to set VNC password: tvnserver error: %v, MSI fallback error: %v", err, altErr)
-		}
+		return fmt.Errorf("failed to set VNC password in registry: %w", err)
 	}
 
 	// Enable VNC authentication in registry
@@ -184,6 +223,14 @@ func (w *WindowsVNCManager) Configure(password string, port int) error {
 	if err := fwCmd.Run(); err != nil {
 		// Non-fatal: firewall rule may already exist or firewall may be disabled
 		fmt.Printf("Warning: failed to add firewall rule: %v\n", err)
+	}
+
+	// Reload TightVNC service configuration so it picks up registry changes
+	reloadCmd := exec.Command(`C:\Program Files\TightVNC\tvnserver.exe`,
+		"-controlservice", "-reload")
+	if err := reloadCmd.Run(); err != nil {
+		// Non-fatal: service may not be running yet (will pick up on next start)
+		fmt.Printf("Note: could not reload TightVNC config (will apply on next start): %v\n", err)
 	}
 
 	return nil
@@ -259,163 +306,67 @@ func (w *WindowsVNCManager) Port() int {
 	return DefaultVNCPort
 }
 
-// --- Linux implementation ---
+// --- Linux implementation (stub) ---
 
-// LinuxVNCManager manages x11vnc on Linux.
-type LinuxVNCManager struct {
-	port int // configured port; 0 means use DefaultVNCPort
-}
+// LinuxVNCManager is a stub VNC manager for Linux.
+// Most Citadel Linux nodes are headless and don't need desktop VNC.
+type LinuxVNCManager struct{}
 
 func (l *LinuxVNCManager) IsInstalled() bool {
-	_, err := exec.LookPath("x11vnc")
-	return err == nil
+	// Check if x11vnc or tigervnc exists in PATH
+	if _, err := exec.LookPath("x11vnc"); err == nil {
+		return true
+	}
+	if _, err := exec.LookPath("vncserver"); err == nil {
+		return true
+	}
+	return false
 }
 
 func (l *LinuxVNCManager) Install() error {
-	if l.IsInstalled() {
-		return nil
-	}
-
-	fmt.Println("Installing x11vnc...")
-
-	// Detect package manager and install
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		updateCmd := exec.Command("apt-get", "update", "-qq")
-		_ = updateCmd.Run() // best-effort; install may succeed from cache
-
-		installCmd := exec.Command("apt-get", "install", "-y", "-qq", "x11vnc")
-		installCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-		if err := installCmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via apt: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("yum"); err == nil {
-		cmd := exec.Command("yum", "install", "-y", "x11vnc")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via yum: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("pacman"); err == nil {
-		cmd := exec.Command("pacman", "-S", "--noconfirm", "x11vnc")
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via pacman: %w", err)
-		}
-		return nil
-	}
-
-	return fmt.Errorf("no supported package manager found (tried apt-get, yum, pacman)")
+	fmt.Println("VNC server provisioning not yet supported on Linux")
+	return nil
 }
 
 func (l *LinuxVNCManager) Configure(password string, port int) error {
-	if err := ValidateVNCPort(port); err != nil {
-		return err
-	}
-	l.port = port
-
-	// Truncate password to 8 chars (VNC DES limit)
-	if len(password) > 8 {
-		password = password[:8]
-	}
-
-	// Ensure ~/.vnc directory exists
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
-	}
-	vncDir := filepath.Join(homeDir, ".vnc")
-	if err := os.MkdirAll(vncDir, 0700); err != nil {
-		return fmt.Errorf("failed to create .vnc directory: %w", err)
-	}
-
-	// Store password using x11vnc's password tool
-	passwdFile := filepath.Join(vncDir, "passwd")
-	cmd := exec.Command("x11vnc", "-storepasswd", password, passwdFile)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to store VNC password: %w", err)
-	}
-
-	// Restrict password file permissions
-	if err := os.Chmod(passwdFile, 0600); err != nil {
-		return fmt.Errorf("failed to set password file permissions: %w", err)
-	}
-
+	fmt.Println("VNC server provisioning not yet supported on Linux")
 	return nil
 }
 
 func (l *LinuxVNCManager) Start() error {
-	if l.IsRunning() {
-		return nil // Already running, idempotent
-	}
-
-	port := l.effectivePort()
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
-	}
-	passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
-
-	// Start x11vnc in the background
-	cmd := exec.Command("x11vnc",
-		"-display", ":0",
-		"-auth", "guess",
-		"-rfbauth", passwdFile,
-		"-rfbport", strconv.Itoa(port),
-		"-forever",
-		"-bg",
-	)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to start x11vnc: %w", err)
-	}
-
+	fmt.Println("VNC server provisioning not yet supported on Linux")
 	return nil
 }
 
 func (l *LinuxVNCManager) Stop() error {
-	cmd := exec.Command("pkill", "x11vnc")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Exit code 1 means no processes matched -- not an error
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return nil
-		}
-		return fmt.Errorf("failed to stop x11vnc: %w (output: %s)", err, string(output))
-	}
+	fmt.Println("VNC server provisioning not yet supported on Linux")
 	return nil
 }
 
 func (l *LinuxVNCManager) IsRunning() bool {
-	cmd := exec.Command("pgrep", "-x", "x11vnc")
-	return cmd.Run() == nil
-}
-
-func (l *LinuxVNCManager) Port() int {
-	port := l.effectivePort()
-	// Verify the port is actually listening
+	// Check if VNC is listening on common ports
 	cmd := exec.Command("ss", "-tlnp")
 	output, err := cmd.Output()
 	if err != nil {
-		return port
+		return false
 	}
-	if strings.Contains(string(output), fmt.Sprintf(":%d ", port)) {
-		return port
-	}
-	// Check common fallback ports
-	for _, p := range []int{5900, 5901} {
-		if strings.Contains(string(output), fmt.Sprintf(":%d ", p)) {
-			return p
-		}
-	}
-	return port
+	outputStr := string(output)
+	return strings.Contains(outputStr, ":5900 ") || strings.Contains(outputStr, ":5901 ")
 }
 
-func (l *LinuxVNCManager) effectivePort() int {
-	if l.port > 0 {
-		return l.port
+func (l *LinuxVNCManager) Port() int {
+	cmd := exec.Command("ss", "-tlnp")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
 	}
-	return DefaultVNCPort
+	outputStr := string(output)
+	for _, port := range []int{5900, 5901} {
+		if strings.Contains(outputStr, fmt.Sprintf(":%d ", port)) {
+			return port
+		}
+	}
+	return 0
 }
 
 // --- macOS implementation (stub) ---

@@ -99,17 +99,24 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			}
 		}
 		if vncMgr.IsInstalled() {
-			pw, err := platform.GenerateVNCPassword()
-			if err != nil {
-				result += fmt.Sprintf("\nWarning: failed to generate VNC password: %v", err)
-			} else {
+			// Use provided password or generate one
+			pw := config.VNCPassword
+			if pw == "" {
+				generated, err := platform.GenerateVNCPassword()
+				if err != nil {
+					result += fmt.Sprintf("\nWarning: failed to generate VNC password: %v", err)
+				} else {
+					pw = generated
+				}
+			}
+			if pw != "" {
 				if err := vncMgr.Configure(pw, platform.DefaultVNCPort); err != nil {
 					result += fmt.Sprintf("\nWarning: failed to configure VNC: %v", err)
 				}
 				if err := vncMgr.Start(); err != nil {
 					result += fmt.Sprintf("\nWarning: failed to start VNC: %v", err)
 				} else {
-					result += fmt.Sprintf("\nVNC server enabled on port %d (password: %s)", platform.DefaultVNCPort, pw)
+					result += fmt.Sprintf("\nVNC server enabled on port %d", platform.DefaultVNCPort)
 				}
 			}
 		}
