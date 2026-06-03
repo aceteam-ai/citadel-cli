@@ -192,6 +192,18 @@ func TestWindowsVNCManagerIsRunning(t *testing.T) {
 	_ = mgr.Port()
 }
 
+func TestVNCManagerUninstallNoPanic(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Uninstall is destructive on Windows; no-panic test is Linux-only")
+	}
+	mgr := GetVNCManager()
+	// Uninstall() should not panic on any platform, even if nothing is installed
+	err := mgr.Uninstall()
+	if err != nil {
+		t.Logf("Uninstall() returned error (expected on some platforms): %v", err)
+	}
+}
+
 func TestDefaultVNCPort(t *testing.T) {
 	if DefaultVNCPort != 5900 {
 		t.Errorf("DefaultVNCPort = %d, want 5900", DefaultVNCPort)

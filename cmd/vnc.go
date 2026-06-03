@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	vncPassword string
-	vncPort     int
+	vncPassword  string
+	vncPort      int
+	vncUninstall bool
 )
 
 var vncCmd = &cobra.Command{
@@ -42,8 +43,9 @@ and printed to stdout.`,
 var vncDisableCmd = &cobra.Command{
 	Use:   "disable",
 	Short: "Stop VNC server",
-	Long:  `Stops the VNC server service. Does not uninstall it.`,
-	RunE:  runVNCDisable,
+	Long: `Stops the VNC server service. Use --uninstall to also remove the
+VNC server software, firewall rules, and registry keys.`,
+	RunE: runVNCDisable,
 }
 
 var vncStatusCmd = &cobra.Command{
@@ -61,6 +63,8 @@ func init() {
 
 	vncEnableCmd.Flags().StringVar(&vncPassword, "password", "", "VNC password (auto-generated if not specified)")
 	vncEnableCmd.Flags().IntVar(&vncPort, "port", platform.DefaultVNCPort, "VNC port number")
+
+	vncDisableCmd.Flags().BoolVar(&vncUninstall, "uninstall", false, "Also uninstall VNC server software")
 }
 
 func runVNCEnable(cmd *cobra.Command, args []string) error {
@@ -125,17 +129,28 @@ func runVNCEnable(cmd *cobra.Command, args []string) error {
 func runVNCDisable(cmd *cobra.Command, args []string) error {
 	mgr := platform.GetVNCManager()
 
-	if !mgr.IsRunning() {
+	if mgr.IsRunning() {
+		fmt.Println("Stopping VNC server...")
+		if err := mgr.Stop(); err != nil {
+			return fmt.Errorf("failed to stop VNC server: %w", err)
+		}
+		fmt.Println("VNC server stopped.")
+	} else {
 		fmt.Println("VNC server is not running.")
-		return nil
 	}
 
-	fmt.Println("Stopping VNC server...")
-	if err := mgr.Stop(); err != nil {
-		return fmt.Errorf("failed to stop VNC server: %w", err)
+	if vncUninstall {
+		if !mgr.IsInstalled() {
+			fmt.Println("VNC server is not installed, nothing to uninstall.")
+			return nil
+		}
+		fmt.Println("Uninstalling VNC server...")
+		if err := mgr.Uninstall(); err != nil {
+			return fmt.Errorf("failed to uninstall VNC server: %w", err)
+		}
+		fmt.Println("VNC server uninstalled.")
 	}
 
-	fmt.Println("VNC server stopped.")
 	return nil
 }
 

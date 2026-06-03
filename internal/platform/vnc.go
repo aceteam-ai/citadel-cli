@@ -25,6 +25,7 @@ var vncDESKey = []byte{0x17, 0x52, 0x6b, 0x06, 0x23, 0x4e, 0x58, 0x07}
 type VNCManager interface {
 	IsInstalled() bool
 	Install() error
+	Uninstall() error
 	Configure(password string, port int) error
 	Start() error
 	Stop() error
@@ -163,6 +164,58 @@ func (w *WindowsVNCManager) Install() error {
 	}
 
 	fmt.Println("TightVNC installed via MSI.")
+	return nil
+}
+
+func (w *WindowsVNCManager) Uninstall() error {
+	// Stop the service first (best-effort)
+	if err := w.Stop(); err != nil {
+		fmt.Printf("Warning: failed to stop VNC service: %v\n", err)
+	}
+
+	// Find the MSI product GUID for TightVNC
+	cmd := exec.Command("wmic", "product", "where", "name like '%TightVNC%'",
+		"get", "IdentifyingNumber", "/format:list")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("Warning: could not query TightVNC product GUID: %v\n", err)
+	}
+
+	// Parse GUID from "IdentifyingNumber={GUID}" output
+	guid := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if strings.HasPrefix(line, "IdentifyingNumber=") {
+			guid = strings.TrimPrefix(line, "IdentifyingNumber=")
+			guid = strings.TrimSpace(guid)
+			break
+		}
+	}
+
+	// Run msiexec to uninstall if we found a GUID
+	if guid != "" {
+		uninstallCmd := exec.Command("msiexec", "/x", guid, "/quiet", "/norestart")
+		if err := uninstallCmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall TightVNC (GUID %s): %w", guid, err)
+		}
+		fmt.Println("TightVNC uninstalled via MSI.")
+	} else {
+		fmt.Println("Warning: TightVNC MSI product not found, skipping MSI removal.")
+	}
+
+	// Delete firewall rule (best-effort)
+	fwCmd := exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
+		"name=TightVNC Server (Port 5900)")
+	if err := fwCmd.Run(); err != nil {
+		fmt.Printf("Warning: failed to remove firewall rule: %v\n", err)
+	}
+
+	// Clean registry (best-effort, may already be gone)
+	regCmd := exec.Command("reg", "delete", `HKLM\SOFTWARE\TightVNC`, "/f")
+	if err := regCmd.Run(); err != nil {
+		fmt.Printf("Warning: failed to clean TightVNC registry keys: %v\n", err)
+	}
+
 	return nil
 }
 
@@ -354,6 +407,11 @@ func (l *LinuxVNCManager) Install() error {
 	return fmt.Errorf("no supported package manager found (tried apt-get, yum, pacman)")
 }
 
+func (l *LinuxVNCManager) Uninstall() error {
+	fmt.Println("VNC server uninstall not yet supported on Linux.")
+	return nil
+}
+
 func (l *LinuxVNCManager) Configure(password string, port int) error {
 	if err := ValidateVNCPort(port); err != nil {
 		return err
@@ -477,6 +535,11 @@ func (d *DarwinVNCManager) IsInstalled() bool {
 
 func (d *DarwinVNCManager) Install() error {
 	fmt.Println("VNC server provisioning not yet supported on macOS (use built-in Screen Sharing)")
+	return nil
+}
+
+func (d *DarwinVNCManager) Uninstall() error {
+	fmt.Println("VNC server uninstall not yet supported on macOS.")
 	return nil
 }
 
