@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -306,67 +308,163 @@ func (w *WindowsVNCManager) Port() int {
 	return DefaultVNCPort
 }
 
-// --- Linux implementation (stub) ---
+// --- Linux implementation ---
 
-// LinuxVNCManager is a stub VNC manager for Linux.
-// Most Citadel Linux nodes are headless and don't need desktop VNC.
-type LinuxVNCManager struct{}
+// LinuxVNCManager manages x11vnc on Linux.
+type LinuxVNCManager struct {
+	port int // configured port; 0 means use DefaultVNCPort
+}
 
 func (l *LinuxVNCManager) IsInstalled() bool {
-	// Check if x11vnc or tigervnc exists in PATH
-	if _, err := exec.LookPath("x11vnc"); err == nil {
-		return true
-	}
-	if _, err := exec.LookPath("vncserver"); err == nil {
-		return true
-	}
-	return false
+	_, err := exec.LookPath("x11vnc")
+	return err == nil
 }
 
 func (l *LinuxVNCManager) Install() error {
-	fmt.Println("VNC server provisioning not yet supported on Linux")
-	return nil
+	if l.IsInstalled() {
+		return nil
+	}
+
+	fmt.Println("Installing x11vnc...")
+
+	// Detect package manager and install
+	if _, err := exec.LookPath("apt-get"); err == nil {
+		updateCmd := exec.Command("apt-get", "update", "-qq")
+		_ = updateCmd.Run() // best-effort; install may succeed from cache
+
+		installCmd := exec.Command("apt-get", "install", "-y", "-qq", "x11vnc")
+		installCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		if err := installCmd.Run(); err != nil {
+			return fmt.Errorf("failed to install x11vnc via apt: %w", err)
+		}
+		return nil
+	}
+	if _, err := exec.LookPath("yum"); err == nil {
+		cmd := exec.Command("yum", "install", "-y", "x11vnc")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to install x11vnc via yum: %w", err)
+		}
+		return nil
+	}
+	if _, err := exec.LookPath("pacman"); err == nil {
+		cmd := exec.Command("pacman", "-S", "--noconfirm", "x11vnc")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to install x11vnc via pacman: %w", err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("no supported package manager found (tried apt-get, yum, pacman)")
 }
 
 func (l *LinuxVNCManager) Configure(password string, port int) error {
-	fmt.Println("VNC server provisioning not yet supported on Linux")
+	if err := ValidateVNCPort(port); err != nil {
+		return err
+	}
+	l.port = port
+
+	// Truncate password to 8 chars (VNC DES limit)
+	if len(password) > 8 {
+		password = password[:8]
+	}
+
+	// Ensure ~/.vnc directory exists
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+	vncDir := filepath.Join(homeDir, ".vnc")
+	if err := os.MkdirAll(vncDir, 0700); err != nil {
+		return fmt.Errorf("failed to create .vnc directory: %w", err)
+	}
+
+	// Store password using x11vnc's password tool
+	passwdFile := filepath.Join(vncDir, "passwd")
+	cmd := exec.Command("x11vnc", "-storepasswd", password, passwdFile)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to store VNC password: %w", err)
+	}
+
+	// Restrict password file permissions
+	if err := os.Chmod(passwdFile, 0600); err != nil {
+		return fmt.Errorf("failed to set password file permissions: %w", err)
+	}
+
 	return nil
 }
 
 func (l *LinuxVNCManager) Start() error {
-	fmt.Println("VNC server provisioning not yet supported on Linux")
+	if l.IsRunning() {
+		return nil // Already running, idempotent
+	}
+
+	port := l.effectivePort()
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+	passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
+
+	// Start x11vnc in the background
+	cmd := exec.Command("x11vnc",
+		"-display", ":0",
+		"-auth", "guess",
+		"-rfbauth", passwdFile,
+		"-rfbport", strconv.Itoa(port),
+		"-forever",
+		"-bg",
+	)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to start x11vnc: %w", err)
+	}
+
 	return nil
 }
 
 func (l *LinuxVNCManager) Stop() error {
-	fmt.Println("VNC server provisioning not yet supported on Linux")
+	cmd := exec.Command("pkill", "x11vnc")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Exit code 1 means no processes matched -- not an error
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		return fmt.Errorf("failed to stop x11vnc: %w (output: %s)", err, string(output))
+	}
 	return nil
 }
 
 func (l *LinuxVNCManager) IsRunning() bool {
-	// Check if VNC is listening on common ports
-	cmd := exec.Command("ss", "-tlnp")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	outputStr := string(output)
-	return strings.Contains(outputStr, ":5900 ") || strings.Contains(outputStr, ":5901 ")
+	cmd := exec.Command("pgrep", "-x", "x11vnc")
+	return cmd.Run() == nil
 }
 
 func (l *LinuxVNCManager) Port() int {
+	port := l.effectivePort()
+	// Verify the port is actually listening
 	cmd := exec.Command("ss", "-tlnp")
 	output, err := cmd.Output()
 	if err != nil {
-		return 0
+		return port
 	}
-	outputStr := string(output)
-	for _, port := range []int{5900, 5901} {
-		if strings.Contains(outputStr, fmt.Sprintf(":%d ", port)) {
-			return port
+	if strings.Contains(string(output), fmt.Sprintf(":%d ", port)) {
+		return port
+	}
+	// Check common fallback ports
+	for _, p := range []int{5900, 5901} {
+		if strings.Contains(string(output), fmt.Sprintf(":%d ", p)) {
+			return p
 		}
 	}
-	return 0
+	return port
+}
+
+func (l *LinuxVNCManager) effectivePort() int {
+	if l.port > 0 {
+		return l.port
+	}
+	return DefaultVNCPort
 }
 
 // --- macOS implementation (stub) ---
