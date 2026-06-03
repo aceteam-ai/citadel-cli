@@ -129,6 +129,29 @@ This stops the worker service, removes the citadel binary and configuration. It 
 
 ---
 
+## Desktop and Computer Use
+
+Citadel can detect desktop capabilities and expose REST APIs for remote desktop automation. This powers **Agent Workspaces** — AI agents that operate GUIs on your machine.
+
+When running `citadel work`, the status server automatically detects:
+- Operating system and version
+- Display availability and screen resolution
+- VNC server (ports 5900-5901)
+
+If a token validator is configured (via `citadel init`), two authenticated endpoints become available:
+
+- `GET /api/screenshot` — Captures a PNG screenshot of the current display
+- `POST /api/actions` — Executes mouse/keyboard actions (click, type, key, scroll, move)
+
+**Linux prerequisites:**
+```bash
+sudo apt-get install xdotool imagemagick   # or: sudo apt-get install xdotool scrot
+```
+
+macOS and Windows support is in progress. See [docs/desktop-api.md](docs/desktop-api.md) for the full API reference.
+
+---
+
 ## Installation (CLI Only)
 
 The following methods install just the `citadel` binary -- useful for development, testing, or managing nodes remotely. For full node provisioning (NVIDIA + Docker + worker service), use the [Quick Start](#quick-start-spin-up-a-worker-node) one-liner instead.
