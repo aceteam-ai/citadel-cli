@@ -336,7 +336,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		source = redisSource
 		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
 		setNodeMeta = func(nodeID, nodeName string) {
-			redisSource.Client().SetNodeMeta(nodeID, nodeName)
+			if c := redisSource.Client(); c != nil {
+				c.SetNodeMeta(nodeID, nodeName)
+			}
 		}
 
 		fmt.Println("   - Mode: Direct Redis (legacy)")
