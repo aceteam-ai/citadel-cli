@@ -10,12 +10,17 @@ citadel-vnc-disable - Stop VNC server
 
 
 .SH DESCRIPTION
-Stops the VNC server service. Does not uninstall it.
+Stops the VNC server service. Use --uninstall to also remove the
+VNC server software, firewall rules, and registry keys.
 
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
 	help for disable
+
+.PP
+\fB--uninstall\fP[=false]
+	Also uninstall VNC server software
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
