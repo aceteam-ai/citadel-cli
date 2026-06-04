@@ -252,6 +252,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	} else {
 		// Legacy mode: direct Redis connection
+		fmt.Fprintln(os.Stderr, "WARNING: Direct Redis mode is deprecated. Run 'citadel init' to set up API mode.")
 		Debug("using direct Redis mode")
 
 		// Resolve Redis URL: flag > env > config
@@ -336,7 +337,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		source = redisSource
 		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
 		setNodeMeta = func(nodeID, nodeName string) {
-			redisSource.Client().SetNodeMeta(nodeID, nodeName)
+			if c := redisSource.Client(); c != nil {
+				c.SetNodeMeta(nodeID, nodeName)
+			}
 		}
 
 		fmt.Println("   - Mode: Direct Redis (legacy)")
