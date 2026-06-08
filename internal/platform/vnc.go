@@ -377,34 +377,56 @@ func (l *LinuxVNCManager) Install() error {
 
 	fmt.Println("Installing x11vnc...")
 
-	// Detect package manager and install
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		updateCmd := exec.Command("apt-get", "update", "-qq")
-		_ = updateCmd.Run() // best-effort; install may succeed from cache
+	needsSudo := os.Getuid() != 0
+	sudoPrefix := func(name string, args ...string) *exec.Cmd {
+		if needsSudo {
+			return exec.Command("sudo", append([]string{name}, args...)...)
+		}
+		return exec.Command(name, args...)
+	}
 
-		installCmd := exec.Command("apt-get", "install", "-y", "-qq", "x11vnc")
+	if _, err := exec.LookPath("apt-get"); err == nil {
+		updateCmd := sudoPrefix("apt-get", "update", "-qq")
+		_ = updateCmd.Run()
+
+		installCmd := sudoPrefix("apt-get", "install", "-y", "-qq", "x11vnc")
 		installCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		installCmd.Stdout = os.Stdout
+		installCmd.Stderr = os.Stderr
 		if err := installCmd.Run(); err != nil {
 			return fmt.Errorf("failed to install x11vnc via apt: %w", err)
 		}
 		return nil
 	}
+	if _, err := exec.LookPath("dnf"); err == nil {
+		cmd := sudoPrefix("dnf", "install", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to install x11vnc via dnf: %w", err)
+		}
+		return nil
+	}
 	if _, err := exec.LookPath("yum"); err == nil {
-		cmd := exec.Command("yum", "install", "-y", "x11vnc")
+		cmd := sudoPrefix("yum", "install", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to install x11vnc via yum: %w", err)
 		}
 		return nil
 	}
 	if _, err := exec.LookPath("pacman"); err == nil {
-		cmd := exec.Command("pacman", "-S", "--noconfirm", "x11vnc")
+		cmd := sudoPrefix("pacman", "-S", "--noconfirm", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to install x11vnc via pacman: %w", err)
 		}
 		return nil
 	}
 
-	return fmt.Errorf("no supported package manager found (tried apt-get, yum, pacman)")
+	return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman)")
 }
 
 func (l *LinuxVNCManager) Uninstall() error {
@@ -461,20 +483,71 @@ func (l *LinuxVNCManager) Start() error {
 	}
 	passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
 
-	// Start x11vnc in the background
-	cmd := exec.Command("x11vnc",
+	authFile := l.findXAuthFile()
+	needsSudo := authFile != "" && os.Getuid() != 0
+
+	args := []string{
 		"-display", ":0",
-		"-auth", "guess",
 		"-rfbauth", passwdFile,
 		"-rfbport", strconv.Itoa(port),
 		"-forever",
 		"-bg",
-	)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to start x11vnc: %w", err)
+	}
+	if authFile != "" {
+		args = append(args, "-auth", authFile)
+	} else {
+		args = append(args, "-auth", "guess")
+	}
+
+	var cmd *exec.Cmd
+	if needsSudo {
+		cmd = exec.Command("sudo", append([]string{"x11vnc"}, args...)...)
+	} else {
+		cmd = exec.Command("x11vnc", args...)
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to start x11vnc: %w\noutput: %s", err, string(output))
 	}
 
 	return nil
+}
+
+// findXAuthFile locates the X authority file for display :0.
+// Some auth files (e.g. lightdm) are only readable by root,
+// so this checks process presence rather than file stat.
+func (l *LinuxVNCManager) findXAuthFile() string {
+	// User's own .Xauthority (readable without sudo)
+	if home, err := os.UserHomeDir(); err == nil {
+		xauth := filepath.Join(home, ".Xauthority")
+		if _, err := os.Stat(xauth); err == nil {
+			return xauth
+		}
+	}
+
+	// LightDM: auth file is root-only, detect by process
+	if exec.Command("pgrep", "-x", "lightdm").Run() == nil {
+		return "/var/run/lightdm/root/:0"
+	}
+
+	// GDM: check for gdm process
+	if exec.Command("pgrep", "-x", "gdm-session-wor").Run() == nil {
+		// GDM stores auth in /run/user/<gdm-uid>/gdm/Xauthority
+		gdmAuth := "/run/user/120/gdm/Xauthority"
+		if _, err := os.Stat(gdmAuth); err == nil {
+			return gdmAuth
+		}
+	}
+
+	// SDDM
+	if exec.Command("pgrep", "-x", "sddm").Run() == nil {
+		sddmAuth := "/run/sddm/xauth"
+		if _, err := os.Stat(sddmAuth); err == nil {
+			return sddmAuth
+		}
+	}
+
+	return ""
 }
 
 func (l *LinuxVNCManager) Stop() error {
