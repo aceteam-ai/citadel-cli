@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -95,6 +96,10 @@ func runVNCEnable(cmd *cobra.Command, args []string) error {
 	if !mgr.IsInstalled() {
 		fmt.Println("VNC server not found, installing...")
 		if err := mgr.Install(); err != nil {
+			// Surface sudo-required errors directly without wrapping
+			if errors.Is(err, platform.ErrSudoRequired) {
+				return err
+			}
 			return fmt.Errorf("failed to install VNC server: %w", err)
 		}
 	} else {

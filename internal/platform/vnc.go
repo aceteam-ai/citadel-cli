@@ -358,6 +358,10 @@ func (w *WindowsVNCManager) Port() int {
 	return DefaultVNCPort
 }
 
+// ErrSudoRequired is returned when VNC installation needs elevated privileges.
+// The caller (cmd/vnc.go) should display an actionable message to the user.
+var ErrSudoRequired = fmt.Errorf("VNC server installation requires sudo. Run: sudo citadel vnc enable")
+
 // --- Linux implementation ---
 
 // LinuxVNCManager manages x11vnc on Linux.
@@ -378,6 +382,14 @@ func (l *LinuxVNCManager) Install() error {
 	fmt.Println("Installing x11vnc...")
 
 	needsSudo := os.Getuid() != 0
+
+	// Check that sudo is available when needed
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrSudoRequired
+		}
+	}
+
 	sudoPrefix := func(name string, args ...string) *exec.Cmd {
 		if needsSudo {
 			return exec.Command("sudo", append([]string{name}, args...)...)
@@ -425,8 +437,17 @@ func (l *LinuxVNCManager) Install() error {
 		}
 		return nil
 	}
+	if _, err := exec.LookPath("zypper"); err == nil {
+		cmd := sudoPrefix("zypper", "install", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to install x11vnc via zypper: %w", err)
+		}
+		return nil
+	}
 
-	return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman)")
+	return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
 }
 
 func (l *LinuxVNCManager) Uninstall() error {
@@ -483,24 +504,14 @@ func (l *LinuxVNCManager) Start() error {
 	}
 	passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
 
-	authFile := l.findXAuthFile()
-	needsSudo := authFile != "" && os.Getuid() != 0
+	authFile, authNeedsSudo := l.resolveXAuth()
+	needsSudo := authNeedsSudo && os.Getuid() != 0
 
-	args := []string{
-		"-display", ":0",
-		"-rfbauth", passwdFile,
-		"-rfbport", strconv.Itoa(port),
-		"-forever",
-		"-bg",
-	}
-	if authFile != "" {
-		args = append(args, "-auth", authFile)
-	} else {
-		args = append(args, "-auth", "guess")
-	}
+	args := buildX11VNCArgs(passwdFile, port, authFile)
 
 	var cmd *exec.Cmd
 	if needsSudo {
+		fmt.Println("Note: using display manager auth file, running x11vnc with sudo")
 		cmd = exec.Command("sudo", append([]string{"x11vnc"}, args...)...)
 	} else {
 		cmd = exec.Command("x11vnc", args...)
@@ -513,29 +524,67 @@ func (l *LinuxVNCManager) Start() error {
 	return nil
 }
 
-// findXAuthFile locates the X authority file for display :0.
-// Some auth files (e.g. lightdm) are only readable by root,
-// so this checks process presence rather than file stat.
-func (l *LinuxVNCManager) findXAuthFile() string {
-	// User's own .Xauthority (readable without sudo)
-	if home, err := os.UserHomeDir(); err == nil {
-		xauth := filepath.Join(home, ".Xauthority")
-		if _, err := os.Stat(xauth); err == nil {
-			return xauth
+// buildX11VNCArgs constructs the x11vnc command-line arguments.
+// This is a pure function extracted for testability.
+func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
+	args := []string{
+		"-rfbauth", passwdFile,
+		"-rfbport", strconv.Itoa(port),
+		"-forever",
+		"-bg",
+	}
+
+	if authFile != "" {
+		// An explicit auth file was found -- use it directly.
+		// Also specify -display :0 since we know the target display.
+		args = append([]string{"-display", ":0"}, args...)
+		args = append(args, "-auth", authFile)
+	} else {
+		// No auth file found -- let x11vnc auto-discover the display
+		// and auth cookie via -find, which probes /tmp/.X*-lock,
+		// XAUTHORITY, and running X sessions without needing sudo.
+		args = append([]string{"-find"}, args...)
+	}
+
+	return args
+}
+
+// resolveXAuth locates the X authority file and reports whether sudo
+// is needed to read it. Returns ("", false) when no auth file is found,
+// in which case Start() uses -find for auto-discovery.
+//
+// Priority order (first match wins):
+//  1. $XAUTHORITY env var (user-readable, no sudo)
+//  2. ~/.Xauthority (user-readable, no sudo)
+//  3. Display-manager auth files (root-only, sudo required)
+func (l *LinuxVNCManager) resolveXAuth() (authFile string, needsSudo bool) {
+	// 1. Check XAUTHORITY environment variable
+	if xauthEnv := os.Getenv("XAUTHORITY"); xauthEnv != "" {
+		if _, err := os.Stat(xauthEnv); err == nil {
+			return xauthEnv, false
 		}
 	}
 
-	// LightDM: auth file is root-only, detect by process
-	if exec.Command("pgrep", "-x", "lightdm").Run() == nil {
-		return "/var/run/lightdm/root/:0"
+	// 2. Check user's own ~/.Xauthority
+	if home, err := os.UserHomeDir(); err == nil {
+		xauth := filepath.Join(home, ".Xauthority")
+		if _, err := os.Stat(xauth); err == nil {
+			return xauth, false
+		}
 	}
 
-	// GDM: check for gdm process
+	// 3. Display-manager auth files (all require root)
+
+	// LightDM
+	if exec.Command("pgrep", "-x", "lightdm").Run() == nil {
+		return "/var/run/lightdm/root/:0", true
+	}
+
+	// GDM
 	if exec.Command("pgrep", "-x", "gdm-session-wor").Run() == nil {
-		// GDM stores auth in /run/user/<gdm-uid>/gdm/Xauthority
 		gdmAuth := "/run/user/120/gdm/Xauthority"
 		if _, err := os.Stat(gdmAuth); err == nil {
-			return gdmAuth
+			return gdmAuth, true
 		}
 	}
 
@@ -543,11 +592,12 @@ func (l *LinuxVNCManager) findXAuthFile() string {
 	if exec.Command("pgrep", "-x", "sddm").Run() == nil {
 		sddmAuth := "/run/sddm/xauth"
 		if _, err := os.Stat(sddmAuth); err == nil {
-			return sddmAuth
+			return sddmAuth, true
 		}
 	}
 
-	return ""
+	// No auth file found -- Start() will use -find for auto-discovery
+	return "", false
 }
 
 func (l *LinuxVNCManager) Stop() error {

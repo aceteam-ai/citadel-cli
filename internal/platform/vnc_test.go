@@ -2,6 +2,7 @@ package platform
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -207,5 +208,109 @@ func TestVNCManagerUninstallNoPanic(t *testing.T) {
 func TestDefaultVNCPort(t *testing.T) {
 	if DefaultVNCPort != 5900 {
 		t.Errorf("DefaultVNCPort = %d, want 5900", DefaultVNCPort)
+	}
+}
+
+func TestBuildX11VNCArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		passwdFile string
+		port       int
+		authFile   string
+		wantArgs   []string
+		notWant    []string
+	}{
+		{
+			name:       "with explicit auth file",
+			passwdFile: "/home/user/.vnc/passwd",
+			port:       5900,
+			authFile:   "/home/user/.Xauthority",
+			wantArgs:   []string{"-display", ":0", "-rfbauth", "/home/user/.vnc/passwd", "-rfbport", "5900", "-forever", "-bg", "-auth", "/home/user/.Xauthority"},
+			notWant:    []string{"-find"},
+		},
+		{
+			name:       "with DM auth file",
+			passwdFile: "/home/user/.vnc/passwd",
+			port:       5901,
+			authFile:   "/var/run/lightdm/root/:0",
+			wantArgs:   []string{"-display", ":0", "-auth", "/var/run/lightdm/root/:0", "-rfbport", "5901"},
+			notWant:    []string{"-find"},
+		},
+		{
+			name:       "auto-discover with -find when no auth file",
+			passwdFile: "/home/user/.vnc/passwd",
+			port:       5900,
+			authFile:   "",
+			wantArgs:   []string{"-find", "-rfbauth", "/home/user/.vnc/passwd", "-rfbport", "5900", "-forever", "-bg"},
+			notWant:    []string{"-display", "-auth"},
+		},
+		{
+			name:       "custom port",
+			passwdFile: "/root/.vnc/passwd",
+			port:       5910,
+			authFile:   "/root/.Xauthority",
+			wantArgs:   []string{"-rfbport", "5910"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := buildX11VNCArgs(tt.passwdFile, tt.port, tt.authFile)
+			argStr := strings.Join(args, " ")
+
+			for _, want := range tt.wantArgs {
+				found := false
+				for _, a := range args {
+					if a == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("buildX11VNCArgs() missing expected arg %q in %v", want, args)
+				}
+			}
+
+			for _, nw := range tt.notWant {
+				for _, a := range args {
+					if a == nw {
+						t.Errorf("buildX11VNCArgs() should not contain %q, got: %s", nw, argStr)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestBuildX11VNCArgsOrder(t *testing.T) {
+	// When using -find, it should be the first argument
+	args := buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "")
+	if len(args) == 0 {
+		t.Fatal("buildX11VNCArgs() returned empty args")
+	}
+	if args[0] != "-find" {
+		t.Errorf("buildX11VNCArgs() with no auth: first arg = %q, want -find", args[0])
+	}
+
+	// When using explicit auth, -display should come first
+	args = buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "/home/user/.Xauthority")
+	if len(args) == 0 {
+		t.Fatal("buildX11VNCArgs() returned empty args")
+	}
+	if args[0] != "-display" {
+		t.Errorf("buildX11VNCArgs() with auth: first arg = %q, want -display", args[0])
+	}
+}
+
+func TestErrSudoRequired(t *testing.T) {
+	if ErrSudoRequired == nil {
+		t.Fatal("ErrSudoRequired is nil")
+	}
+	msg := ErrSudoRequired.Error()
+	if !strings.Contains(msg, "sudo") {
+		t.Errorf("ErrSudoRequired message should mention sudo, got: %s", msg)
+	}
+	if !strings.Contains(msg, "sudo citadel vnc enable") {
+		t.Errorf("ErrSudoRequired message should include the fix command, got: %s", msg)
 	}
 }
