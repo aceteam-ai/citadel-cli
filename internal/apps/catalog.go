@@ -2,7 +2,30 @@
 // on Citadel nodes using Docker containers.
 package apps
 
-import "sort"
+import (
+	"crypto/rand"
+	"math/big"
+	"sort"
+)
+
+// GeneratePassword generates a random alphanumeric password.
+func GeneratePassword(length int) (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	result := make([]byte, length)
+	for i := range result {
+		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		result[i] = charset[idx.Int64()]
+	}
+	return string(result), nil
+}
+
+// NeedsPassword returns true if the app needs a generated password at install time.
+func NeedsPassword(name string) bool {
+	return name == "code-server" || name == "filebrowser"
+}
 
 // AppManifest describes a deployable application in the catalog.
 type AppManifest struct {

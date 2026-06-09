@@ -53,7 +53,7 @@ func Install(ctx context.Context, runner CommandRunner, manifest AppManifest, ho
 
 	// Port mapping: use a single host port mapped to the first container port.
 	for containerPort := range manifest.Ports {
-		args = append(args, "-p", fmt.Sprintf("%d:%d", hostPort, containerPort))
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort))
 		break // only map the first port
 	}
 

@@ -187,14 +187,33 @@ func runAppInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Generate and inject auth password for apps that need it.
+	generatedPassword := ""
+	if apps.NeedsPassword(appName) {
+		pw, err := apps.GeneratePassword(16)
+		if err != nil {
+			return fmt.Errorf("failed to generate password: %w", err)
+		}
+		generatedPassword = pw
+		switch appName {
+		case "code-server":
+			manifest.Env["PASSWORD"] = pw
+		case "filebrowser":
+			manifest.Env["FB_PASSWORD"] = pw
+			manifest.Env["FB_USERNAME"] = "admin"
+		}
+	}
+
 	fmt.Printf("Installing %s...\n", appName)
 	fmt.Printf("  Image: %s\n", manifest.Image)
 	fmt.Printf("  Port:  localhost:%d\n", hostPort)
 	fmt.Printf("  Data:  %s\n", dataDir)
 
-	// Pull image first for better UX (shows download progress).
+	// Pull image with a timeout.
 	fmt.Printf("  Pulling image...\n")
-	if _, err := runner.Run(ctx, "docker", "pull", manifest.Image); err != nil {
+	pullCtx, pullCancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer pullCancel()
+	if _, err := runner.Run(pullCtx, "docker", "pull", manifest.Image); err != nil {
 		return fmt.Errorf("failed to pull image %s: %w", manifest.Image, err)
 	}
 
@@ -204,7 +223,7 @@ func runAppInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Record in state.
+	// Record in state. On failure, clean up the orphaned container.
 	state.Set(apps.InstalledApp{
 		Name:        appName,
 		Image:       manifest.Image,
@@ -212,7 +231,9 @@ func runAppInstall(cmd *cobra.Command, args []string) error {
 		HostPort:    hostPort,
 	})
 	if err := state.Save(); err != nil {
-		return fmt.Errorf("failed to save state: %w", err)
+		_ = apps.Stop(ctx, runner, appName)
+		_, _ = runner.Run(ctx, "docker", "rm", "-f", apps.ContainerName(appName))
+		return fmt.Errorf("failed to save state (container cleaned up): %w", err)
 	}
 
 	// Wait for health check.
@@ -229,6 +250,9 @@ func runAppInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nApp %s is now available at http://localhost:%d\n", appName, hostPort)
+	if generatedPassword != "" {
+		fmt.Printf("  Password: %s\n", generatedPassword)
+	}
 	return nil
 }
 
