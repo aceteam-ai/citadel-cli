@@ -457,6 +457,17 @@ func runWork(cmd *cobra.Command, args []string) {
 			serverCfg.OrgID = statusOrgID
 		}
 
+		// Auto-register desktop endpoints when VNC is running and auth is available
+		statusVNC := platform.GetVNCManager()
+		if statusVNC.IsRunning() {
+			if serverCfg.TokenValidator != nil {
+				serverCfg.EnableDesktop = true
+				Debug("VNC detected (port %d), desktop API enabled", statusVNC.Port())
+			} else {
+				fmt.Fprintln(os.Stderr, "   - ⚠️ VNC is running but desktop API disabled (no org ID for auth)")
+			}
+		}
+
 		statusServer := status.NewServer(serverCfg, collector)
 
 		go func() {
@@ -466,7 +477,11 @@ func runWork(cmd *cobra.Command, args []string) {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ Desktop API token cache error: %v\n", err)
 					}
 				}
-				fmt.Printf("   - Status server: http://localhost:%d (desktop API enabled)\n", workStatusPort)
+				if serverCfg.EnableDesktop {
+					fmt.Printf("   - Status server: http://localhost:%d (desktop API enabled, VNC port %d)\n", workStatusPort, statusVNC.Port())
+				} else {
+					fmt.Printf("   - Status server: http://localhost:%d (auth enabled)\n", workStatusPort)
+				}
 			} else {
 				fmt.Printf("   - Status server: http://localhost:%d\n", workStatusPort)
 			}
@@ -524,6 +539,12 @@ func runWork(cmd *cobra.Command, args []string) {
 				Services:     nil,
 				Capabilities: statusCaps,
 			})
+		}
+
+		// Log VNC status for heartbeat visibility
+		heartbeatVNC := platform.GetVNCManager()
+		if heartbeatVNC.IsRunning() {
+			fmt.Printf("   - VNC detected: port %d (included in heartbeats)\n", heartbeatVNC.Port())
 		}
 
 		if useAPIMode && apiSource != nil {

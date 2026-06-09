@@ -3,11 +3,26 @@ package status
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 )
+
+// mockTokenValidator is a test double for terminal.TokenValidator.
+type mockTokenValidator struct {
+	validToken string
+}
+
+func (m *mockTokenValidator) ValidateToken(token string, orgID string) (*terminal.TokenInfo, error) {
+	if token == m.validToken {
+		return &terminal.TokenInfo{UserID: "test-user", OrgID: orgID}, nil
+	}
+	return nil, fmt.Errorf("invalid token")
+}
 
 func TestNewServer(t *testing.T) {
 	collector := NewCollector(CollectorConfig{
@@ -174,5 +189,161 @@ func TestServerStartAndShutdown(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Error("Server did not shut down in time")
+	}
+}
+
+func TestDesktopEndpointsRegisteredWhenEnabled(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test"})
+	validator := &mockTokenValidator{validToken: "valid-token"}
+
+	server := NewServer(ServerConfig{
+		Port:           0,
+		TokenValidator: validator,
+		OrgID:          "test-org",
+		EnableDesktop:  true,
+	}, collector)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go server.Start(ctx)
+	time.Sleep(50 * time.Millisecond) // Wait for server to start
+
+	// Screenshot endpoint should return 401 without token (registered but auth fails)
+	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("/api/screenshot without token: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+
+	// Actions endpoint should return 401 without token
+	req = httptest.NewRequest(http.MethodPost, "/api/actions", nil)
+	w = httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("/api/actions without token: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestDesktopEndpointsNotRegisteredWithoutEnableDesktop(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test"})
+	validator := &mockTokenValidator{validToken: "valid-token"}
+
+	// TokenValidator set but EnableDesktop is false -- endpoints should NOT be registered
+	server := NewServer(ServerConfig{
+		Port:           0,
+		TokenValidator: validator,
+		OrgID:          "test-org",
+		EnableDesktop:  false,
+	}, collector)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go server.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	// Screenshot endpoint should return 404 (not registered)
+	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("/api/screenshot with EnableDesktop=false: got %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestDesktopEndpointsNotRegisteredWithoutValidator(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test"})
+
+	// EnableDesktop is true but no TokenValidator -- endpoints should NOT be registered
+	server := NewServer(ServerConfig{
+		Port:          0,
+		EnableDesktop: true,
+	}, collector)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go server.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("/api/screenshot with no validator: got %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestDesktopEndpointRejectsInvalidToken(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test"})
+	validator := &mockTokenValidator{validToken: "good-token"}
+
+	server := NewServer(ServerConfig{
+		Port:           0,
+		TokenValidator: validator,
+		OrgID:          "test-org",
+		EnableDesktop:  true,
+	}, collector)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go server.Start(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	// Bad token should get 401
+	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
+	req.Header.Set("Authorization", "Bearer bad-token")
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("/api/screenshot with bad token: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestExistingEndpointsUnaffectedByDesktopConfig(t *testing.T) {
+	// Verify that /health, /status, /ping, /services continue to work
+	// regardless of EnableDesktop setting
+	collector := NewCollector(CollectorConfig{NodeName: "test"})
+
+	for _, enableDesktop := range []bool{true, false} {
+		t.Run(fmt.Sprintf("EnableDesktop=%v", enableDesktop), func(t *testing.T) {
+			server := NewServer(ServerConfig{
+				Port:          0,
+				Version:       "1.0.0",
+				EnableDesktop: enableDesktop,
+			}, collector)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			go server.Start(ctx)
+			time.Sleep(50 * time.Millisecond)
+
+			// Health endpoint should always work
+			req := httptest.NewRequest(http.MethodGet, "/health", nil)
+			w := httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("/health: got %d, want %d", w.Code, http.StatusOK)
+			}
+
+			// Ping endpoint should always work
+			req = httptest.NewRequest(http.MethodGet, "/ping", nil)
+			w = httptest.NewRecorder()
+			server.httpServer.Handler.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("/ping: got %d, want %d", w.Code, http.StatusOK)
+			}
+		})
 	}
 }
