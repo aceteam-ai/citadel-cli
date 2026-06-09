@@ -15,22 +15,17 @@ Unified Citadel worker that starts services and processes jobs.
 .PP
 This is the primary command for running a Citadel node. It:
   1. Auto-starts services from manifest (use --no-services to skip)
-  2. Connects to Redis and consumes jobs from the queue
-  3. Reports status via Redis pub/sub (enabled by default)
+  2. Connects to the AceTeam API and consumes jobs via secure proxy
+  3. Reports status via pub/sub (enabled by default)
   4. Subscribes to real-time config updates
 
 .PP
-Redis URL is obtained from local config (set by 'citadel init').
-Use REDIS_URL env var or --redis-url flag to override.
+Run 'citadel init' first to authenticate and configure the node.
 
 .PP
 Examples:
-  # Run after citadel init (uses config)
+  # Run after citadel init (recommended)
   citadel work
-
-.PP
-# Override Redis URL for development
-  citadel work --redis-url=redis://localhost:6379
 
 .PP
 # Disable status publishing
@@ -62,10 +57,6 @@ Examples:
 	Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)
 
 .PP
-\fB--force-direct-redis\fP[=false]
-	Force direct Redis mode instead of API mode
-
-.PP
 \fB--group\fP=""
 	Consumer group name (default: citadel-workers)
 
@@ -95,19 +86,11 @@ Examples:
 
 .PP
 \fB--queue\fP=""
-	Queue/stream name to consume from (default: jobs:v1:gpu-general)
-
-.PP
-\fB--redis-password\fP=""
-	Redis password (or set REDIS_PASSWORD env)
+	Queue/stream name to consume from (default: jobs:v1:cpu-general)
 
 .PP
 \fB--redis-status\fP[=true]
 	Enable Redis status publishing for real-time updates
-
-.PP
-\fB--redis-url\fP=""
-	Redis connection URL (or set REDIS_URL env)
 
 .PP
 \fB--ssh-sync\fP[=false]
