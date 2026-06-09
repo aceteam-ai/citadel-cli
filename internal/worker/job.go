@@ -111,4 +111,7 @@ const (
 	JobTypeFileEdit          = "FILE_EDIT"           // Edit (string replace) a file in the workspace
 	JobTypeFileList          = "FILE_LIST"           // List directory contents in the workspace
 	JobTypeFileSearch        = "FILE_SEARCH"         // Search for text across files in the workspace
+	JobTypeServiceStart      = "SERVICE_START"       // Start a service on the node
+	JobTypeServiceStop       = "SERVICE_STOP"        // Stop a service on the node
+	JobTypeServiceStatus     = "SERVICE_STATUS"      // Check if a service is running
 )

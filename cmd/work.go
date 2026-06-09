@@ -131,7 +131,7 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Resolve node capabilities early (used for queue routing and heartbeat)
 	var nodeCaps *capabilities.NodeCapabilities
-	workManifest, _, _ := findAndReadManifest()
+	workManifest, workConfigDir, _ := findAndReadManifest()
 	if workManifest != nil && workManifest.Capabilities != nil {
 		nodeCaps = manifestToNodeCapabilities(workManifest.Capabilities)
 		fmt.Println("   - Capabilities: loaded from manifest")
@@ -726,6 +726,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	wsDir := resolveWorkspaceDir()
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		WorkspaceDir: wsDir,
+		ConfigDir:    workConfigDir,
 	})
 
 	// Build job record function for usage tracking
