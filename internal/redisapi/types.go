@@ -143,3 +143,12 @@ type NodeMeta struct {
 	NodeID   string `json:"node_id"`
 	NodeName string `json:"node_name"`
 }
+
+// WorkerConfigResponse is the response from GET /api/fabric/worker-config.
+// This endpoint returns the queue and org information needed by the worker
+// without exposing direct Redis credentials.
+type WorkerConfigResponse struct {
+	Queue         string `json:"queue"`
+	ConsumerGroup string `json:"consumer_group,omitempty"`
+	OrgID         string `json:"org_id,omitempty"`
+}

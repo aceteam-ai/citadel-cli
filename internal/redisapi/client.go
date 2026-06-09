@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -140,6 +141,34 @@ func (c *Client) IsWebSocketConnected() bool {
 // SetNodeMeta sets the node identity metadata that will be included in all stream events.
 func (c *Client) SetNodeMeta(nodeID, nodeName string) {
 	c.nodeMeta = &NodeMeta{NodeID: nodeID, NodeName: nodeName}
+}
+
+// FetchWorkerConfig retrieves worker configuration from the AceTeam API.
+// Returns queue name, consumer group, and org ID for the authenticated device.
+// If the endpoint returns 404 (not yet deployed), returns nil without error
+// so callers can fall back to defaults.
+func (c *Client) FetchWorkerConfig(ctx context.Context) (*WorkerConfigResponse, error) {
+	var resp WorkerConfigResponse
+	err := c.doRequest(ctx, "GET", "/api/fabric/worker-config", nil, &resp)
+	if err != nil {
+		// Treat 404 as "endpoint not deployed yet" — return nil so the caller
+		// falls back to hardcoded defaults rather than failing.
+		if errStr := err.Error(); len(errStr) > 0 {
+			// Check for 404 in the error message (API error format)
+			if contains404(errStr) {
+				c.debug("worker-config endpoint not available (404), using defaults")
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to fetch worker config: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// contains404 checks if an error string indicates an HTTP 404 response.
+func contains404(s string) bool {
+	return len(s) > 0 && (strings.Contains(s, "status 404") || strings.Contains(s, "\"404\""))
 }
 
 // doRequest performs an HTTP request with authentication and JSON handling.

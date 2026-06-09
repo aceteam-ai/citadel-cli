@@ -381,24 +381,20 @@ The worker (`citadel worker`) is the high-performance job queue mode designed fo
 - **Citadel Worker**: High-performance router for AceTeam's private GPU infrastructure
 
 ```bash
-# Start worker with defaults (connects to redis.aceteam.ai)
+# Start worker after 'citadel init' (recommended - uses API mode)
 citadel work
 
-# Or with local Redis for development
-citadel work --redis-url=redis://localhost:6379
-
-# Environment variables can override defaults
-export REDIS_URL=redis://localhost:6379
-export WORKER_QUEUE=jobs:v1:gpu-general
-citadel work
+# For development/debugging with direct Redis (hidden flag)
+citadel work --debug-redis-url=redis://localhost:6379
 ```
 
 **Worker Architecture:**
-1. Connects to Redis Streams as a consumer in a consumer group
-2. Uses XREADGROUP to claim and process jobs (high-throughput)
-3. Routes jobs to private GPU cluster endpoints
-4. Streams responses back via Redis Pub/Sub (`stream:v1:{jobId}`)
-5. ACKs messages on success, moves to DLQ on repeated failure
+1. After `citadel init`, uses the secure Redis API proxy (API mode)
+2. Fetches worker config (queue, org) from AceTeam API
+3. Consumes jobs via XREADGROUP through the HTTP proxy
+4. Routes jobs to private GPU cluster endpoints
+5. Streams responses back via Pub/Sub (`stream:v1:{jobId}`)
+6. ACKs messages on success, moves to DLQ on repeated failure
 
 **Supported Job Types:**
 - `llm_inference` - Routes to private vLLM, Ollama, or llama.cpp clusters
