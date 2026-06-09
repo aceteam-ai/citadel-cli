@@ -2,25 +2,20 @@
 .TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-vnc - Manage VNC server on this node
+citadel-app-list - Show available apps with install status
 
 
 .SH SYNOPSIS
-\fBcitadel vnc [flags]\fP
+\fBcitadel app list [flags]\fP
 
 
 .SH DESCRIPTION
-Install, configure, and manage a VNC server for remote desktop access.
-
-.PP
-On Windows, this installs and configures TightVNC as a system service.
-On Linux, this installs and configures x11vnc to share the existing display.
-On macOS, use the built-in Screen Sharing (VNC provisioning is not yet supported).
+Show available apps with install status
 
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
-	help for vnc
+	help for list
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -45,4 +40,4 @@ On macOS, use the built-in Screen Sharing (VNC provisioning is not yet supported
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-vnc-disable(1)\fP, \fBcitadel-vnc-enable(1)\fP, \fBcitadel-vnc-status(1)\fP
+\fBcitadel-app(1)\fP

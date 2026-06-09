@@ -2,25 +2,24 @@
 .TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-vnc - Manage VNC server on this node
+citadel-app-uninstall - Remove an app, its container, and data
 
 
 .SH SYNOPSIS
-\fBcitadel vnc [flags]\fP
+\fBcitadel app uninstall  [flags]\fP
 
 
 .SH DESCRIPTION
-Install, configure, and manage a VNC server for remote desktop access.
-
-.PP
-On Windows, this installs and configures TightVNC as a system service.
-On Linux, this installs and configures x11vnc to share the existing display.
-On macOS, use the built-in Screen Sharing (VNC provisioning is not yet supported).
+Remove an app, its container, and data
 
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
-	help for vnc
+	help for uninstall
+
+.PP
+\fB--keep-data\fP[=false]
+	Preserve the app's data directory instead of deleting it
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -45,4 +44,4 @@ On macOS, use the built-in Screen Sharing (VNC provisioning is not yet supported
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-vnc-disable(1)\fP, \fBcitadel-vnc-enable(1)\fP, \fBcitadel-vnc-status(1)\fP
+\fBcitadel-app(1)\fP

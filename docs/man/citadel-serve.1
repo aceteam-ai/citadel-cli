@@ -1,0 +1,116 @@
+.nh
+.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-serve - Start the HTTPS gateway for this node
+
+
+.SH SYNOPSIS
+\fBcitadel serve [flags]\fP
+
+
+.SH DESCRIPTION
+Starts an HTTPS reverse proxy that consolidates all Citadel node services
+behind a single TLS endpoint.
+
+.PP
+The gateway proxies to the local status server (started by 'citadel work
+--status-port'), terminal server, and optionally a websockify instance
+for VNC WebSocket access.
+
+.PP
+Routes:
+  /health          -> Node health check
+  /status          -> Full node status
+  /ping            -> Lightweight ping
+  /services        -> List registered services
+  /api/screenshot  -> Desktop screenshot (auth required)
+  /api/actions     -> Desktop input actions (auth required)
+  /vnc/...         -> VNC WebSocket proxy (requires websockify on --vnc-port)
+  /terminal/...    -> Terminal WebSocket server
+
+.PP
+TLS certificates are self-signed and generated automatically on first run.
+They are stored in the Citadel config directory (typically ~/.citadel-cli/tls/).
+
+.PP
+If the node is connected to the AceTeam Network, the VPN IP (100.64.x.x) is
+included as a Subject Alternative Name in the certificate.
+
+.PP
+Note: Headscale (nexus.aceteam.ai) does not currently support the Tailscale
+certificate provisioning API, so automatic Let's Encrypt certs via the VPN
+are not available. The self-signed certificate approach is the default.
+When Headscale adds cert support, the gateway can be upgraded to use
+tsnet.ListenTLS for automatic public certs.
+
+
+.SH OPTIONS
+\fB--bind\fP="0.0.0.0"
+	Bind address for the gateway
+
+.PP
+\fB--cert-dir\fP=""
+	Custom directory for TLS certificates
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for serve
+
+.PP
+\fB--port\fP=8443
+	HTTPS gateway port
+
+.PP
+\fB--status-port\fP=8080
+	Port of the local status server (from 'citadel work --status-port')
+
+.PP
+\fB--terminal-port\fP=7860
+	Port of the local terminal server
+
+.PP
+\fB--vnc-port\fP=6080
+	Port of websockify (VNC WebSocket bridge)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Start gateway with default settings (HTTPS on port 8443)
+  citadel serve
+
+  # Start on a custom port
+  citadel serve --port 443
+
+  # Custom upstream ports
+  citadel serve --status-port 9090
+
+  # Combine with the work command (in separate terminals):
+  # Terminal 1: citadel work --status-port 8080
+  # Terminal 2: citadel serve
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP
