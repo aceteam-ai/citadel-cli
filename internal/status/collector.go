@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -78,6 +79,9 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 
 	// Collect service status
 	status.Services = c.collectServiceStatus()
+
+	// Collect installed app status
+	status.Apps = c.collectAppStatus()
 
 	// Include cached capabilities if available
 	status.Capabilities = c.capabilities
@@ -322,6 +326,33 @@ func InferServiceType(serviceName string) string {
 	}
 
 	return ServiceTypeOther
+}
+
+// collectAppStatus queries installed catalog apps for their Docker container status.
+func (c *Collector) collectAppStatus() []AppInfo {
+	state, err := apps.LoadState()
+	if err != nil {
+		return nil
+	}
+
+	if len(state.Apps) == 0 {
+		return nil
+	}
+
+	ctx := context.Background()
+	runner := apps.ExecRunner{}
+	result := make([]AppInfo, 0, len(state.Apps))
+
+	for _, installed := range state.Apps {
+		dockerStatus := apps.ContainerStatus(ctx, runner, installed.Name)
+		result = append(result, AppInfo{
+			Name:   installed.Name,
+			Status: dockerStatus,
+			Port:   installed.HostPort,
+		})
+	}
+
+	return result
 }
 
 // InferServicePort attempts to determine port from service name.
