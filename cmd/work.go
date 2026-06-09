@@ -403,15 +403,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Set node identity on the stream event publisher for operator attribution.
-	// Use Headscale numeric node ID when available so job results can be
-	// correlated with fabric_node_status (which is keyed by Headscale ID).
+	// Note: We keep using nodeName (hostname) here rather than the Headscale
+	// numeric ID, because the usage/earnings pipeline may key on hostname.
+	// The Headscale numeric ID is passed in the heartbeat payload via
+	// headscaleNodeId for the Python NodeStatusWorker to use directly.
 	if setNodeMeta != nil {
-		metaNodeID := nodeName
-		if headscaleNodeID != "" {
-			metaNodeID = headscaleNodeID
-		}
-		setNodeMeta(metaNodeID, nodeName)
-		Debug("node meta set: node_id=%s, node_name=%s", metaNodeID, nodeName)
+		setNodeMeta(nodeName, nodeName)
+		Debug("node meta set: node_id=%s, node_name=%s", nodeName, nodeName)
 	}
 
 	// Open usage store for per-job compute tracking
