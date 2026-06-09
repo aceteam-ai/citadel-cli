@@ -173,3 +173,40 @@ func TestCreateLegacyHandlers(t *testing.T) {
 func TestLegacyHandlerAdapterImplementsJobHandler(t *testing.T) {
 	var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 }
+
+func TestCreateLegacyHandlersWithOpts_FileHandlers(t *testing.T) {
+	dir := t.TempDir()
+
+	fileTypes := []string{
+		JobTypeFileRead,
+		JobTypeFileWrite,
+		JobTypeFileEdit,
+		JobTypeFileList,
+		JobTypeFileSearch,
+	}
+
+	// Without workspace: file handlers should NOT be registered.
+	noWS := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{})
+	for _, ft := range fileTypes {
+		for _, h := range noWS {
+			if h.CanHandle(ft) {
+				t.Errorf("file handler %s registered without WorkspaceDir", ft)
+			}
+		}
+	}
+
+	// With workspace: file handlers should be registered.
+	withWS := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{WorkspaceDir: dir})
+	for _, ft := range fileTypes {
+		found := false
+		for _, h := range withWS {
+			if h.CanHandle(ft) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("file handler %s not registered with WorkspaceDir", ft)
+		}
+	}
+}
