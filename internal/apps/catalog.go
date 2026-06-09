@@ -102,11 +102,12 @@ var builtinCatalog = map[string]AppManifest{
 		Ports:       map[int]int{80: 8102},
 		Volumes: []VolumeMount{
 			{HostPath: "data", ContainerPath: "/srv"},
-			{HostPath: "database", ContainerPath: "/database"},
 		},
-		Env: map[string]string{},
+		Env: map[string]string{
+			"FB_DATABASE": "/srv/filebrowser.db",
+		},
 		HealthCheck: &HealthCheck{
-			HTTPPath:        "/health",
+			HTTPPath:        "/",
 			IntervalSeconds: 2,
 			TimeoutSeconds:  30,
 		},
