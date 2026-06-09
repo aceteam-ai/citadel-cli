@@ -18,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
@@ -64,9 +65,6 @@ var (
 	// Update check flag
 	workNoUpdate bool
 
-	// API mode flag
-	workForceDirectRedis bool
-
 	// Capability detection flags
 	workCapabilities string
 	workAutoDetect   bool
@@ -85,19 +83,15 @@ var workCmd = &cobra.Command{
 
 This is the primary command for running a Citadel node. It:
   1. Auto-starts services from manifest (use --no-services to skip)
-  2. Connects to Redis and consumes jobs from the queue
-  3. Reports status via Redis pub/sub (enabled by default)
+  2. Connects to the AceTeam API and consumes jobs via secure proxy
+  3. Reports status via pub/sub (enabled by default)
   4. Subscribes to real-time config updates
 
-Redis URL is obtained from local config (set by 'citadel init').
-Use REDIS_URL env var or --redis-url flag to override.
+Run 'citadel init' first to authenticate and configure the node.
 
 Examples:
-  # Run after citadel init (uses config)
+  # Run after citadel init (recommended)
   citadel work
-
-  # Override Redis URL for development
-  citadel work --redis-url=redis://localhost:6379
 
   # Disable status publishing
   citadel work --redis-status=false
@@ -194,7 +188,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	var apiSource *worker.APISource // Keep reference for heartbeat
 	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
 
-	if !workForceDirectRedis && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
 		// NOTE: API mode currently uses a single queue. Capability-based multi-queue
 		// routing requires extending APISource (tracked separately). Capabilities are
@@ -208,11 +202,34 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 		Debug("API base URL: %s", apiBaseURL)
 
-		if workQueue == "" {
-			workQueue = os.Getenv("WORKER_QUEUE")
-		}
-		if workGroup == "" {
-			workGroup = os.Getenv("CONSUMER_GROUP")
+		// Fetch worker config from API (queue, consumer group, org).
+		// This replaces the need for WORKER_QUEUE / CONSUMER_GROUP env vars.
+		if workQueue == "" || workGroup == "" {
+			tempClient := redisapi.NewClient(redisapi.ClientConfig{
+				BaseURL:   apiBaseURL,
+				Token:     deviceConfig.DeviceAPIToken,
+				DebugFunc: Debug,
+			})
+			workerCfg, err := tempClient.FetchWorkerConfig(ctx)
+			if err != nil {
+				Debug("worker-config fetch failed: %v (using defaults)", err)
+			} else if workerCfg != nil {
+				Debug("worker-config: queue=%s, group=%s, org=%s",
+					workerCfg.Queue, workerCfg.ConsumerGroup, workerCfg.OrgID)
+				if workQueue == "" && workerCfg.Queue != "" {
+					workQueue = workerCfg.Queue
+				}
+				if workGroup == "" && workerCfg.ConsumerGroup != "" {
+					workGroup = workerCfg.ConsumerGroup
+				}
+				// Store org_id from API if not already in config
+				if deviceConfig.OrgID == "" && workerCfg.OrgID != "" {
+					deviceConfig.OrgID = workerCfg.OrgID
+				}
+			} else {
+				Debug("worker-config: endpoint not available, using defaults")
+			}
+			_ = tempClient.Close()
 		}
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
@@ -253,44 +270,16 @@ func runWork(cmd *cobra.Command, args []string) {
 				fmt.Printf("   - Account: %s\n", deviceConfig.UserEmail)
 			}
 		}
-	} else {
-		// Legacy mode: direct Redis connection
-		fmt.Fprintln(os.Stderr, "WARNING: Direct Redis mode is deprecated. Run 'citadel init' to set up API mode.")
-		Debug("using direct Redis mode")
-
-		// Resolve Redis URL: flag > env > config
-		Debug("resolving Redis URL...")
-		Debug("--redis-url flag: %q", workRedisURL)
-		Debug("REDIS_URL env: %q", os.Getenv("REDIS_URL"))
+	} else if workRedisURL != "" || (deviceConfig != nil && deviceConfig.RedisURL != "") {
+		// Direct Redis mode: either --debug-redis-url flag or legacy redis_url from config
 		if workRedisURL == "" {
-			workRedisURL = os.Getenv("REDIS_URL")
-		}
-		if workRedisURL == "" && deviceConfig != nil {
-			Debug("redis URL from config: %q", deviceConfig.RedisURL)
 			workRedisURL = deviceConfig.RedisURL
+			fmt.Fprintln(os.Stderr, "WARNING: Using legacy Redis URL from config. Run 'citadel init' again to upgrade to API mode.")
+		} else {
+			fmt.Fprintln(os.Stderr, "WARNING: Direct Redis mode is for debugging only. Run 'citadel init' for production use.")
 		}
-		if workRedisURL == "" {
-			// Fallback to old config reading for backwards compatibility
-			configURL := getRedisURLFromConfig()
-			Debug("redis URL from legacy config: %q", configURL)
-			workRedisURL = configURL
-		}
-		if workRedisURL == "" {
-			fmt.Fprintf(os.Stderr, "Error: Redis URL not configured.\n")
-			fmt.Fprintf(os.Stderr, "Run 'citadel init' to configure your node, or set REDIS_URL env var.\n")
-			os.Exit(1)
-		}
-		Debug("final Redis URL: %s", workRedisURL)
-
-		if workRedisPass == "" {
-			workRedisPass = os.Getenv("REDIS_PASSWORD")
-		}
-		if workQueue == "" {
-			workQueue = os.Getenv("WORKER_QUEUE")
-		}
-		if workGroup == "" {
-			workGroup = os.Getenv("CONSUMER_GROUP")
-		}
+		Debug("using direct Redis mode")
+		Debug("Redis URL: %s", workRedisURL)
 
 		// Resolve queue names: explicit --queue takes priority, otherwise use capabilities
 		var queueNames []string
@@ -345,7 +334,15 @@ func runWork(cmd *cobra.Command, args []string) {
 			}
 		}
 
-		fmt.Println("   - Mode: Direct Redis (legacy)")
+		fmt.Println("   - Mode: Direct Redis (debug)")
+	} else {
+		// Neither API token nor debug Redis URL available
+		fmt.Fprintf(os.Stderr, "Error: Node not initialized. Run 'citadel init' first.\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "  citadel init    Authenticate and connect to the AceTeam Network\n")
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "For development/debugging, use --debug-redis-url to connect directly.\n")
+		os.Exit(1)
 	}
 
 	// Log mode for debugging
@@ -1031,14 +1028,17 @@ func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 func init() {
 	rootCmd.AddCommand(workCmd)
 
-	// Redis flags
-	workCmd.Flags().StringVar(&workRedisURL, "redis-url", "", "Redis connection URL (or set REDIS_URL env)")
-	workCmd.Flags().StringVar(&workRedisPass, "redis-password", "", "Redis password (or set REDIS_PASSWORD env)")
-	workCmd.Flags().StringVar(&workQueue, "queue", "", "Queue/stream name to consume from (default: jobs:v1:gpu-general)")
+	// Queue flags
+	workCmd.Flags().StringVar(&workQueue, "queue", "", "Queue/stream name to consume from (default: jobs:v1:cpu-general)")
 	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
 	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
-	workCmd.Flags().BoolVar(&workForceDirectRedis, "force-direct-redis", false, "Force direct Redis mode instead of API mode")
+
+	// Debug flags (hidden) - direct Redis for development/debugging only
+	workCmd.Flags().StringVar(&workRedisURL, "debug-redis-url", "", "Direct Redis URL for debugging (bypasses API mode)")
+	workCmd.Flags().StringVar(&workRedisPass, "debug-redis-password", "", "Redis password for debugging")
+	workCmd.Flags().MarkHidden("debug-redis-url")
+	workCmd.Flags().MarkHidden("debug-redis-password")
 
 	// Status flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
