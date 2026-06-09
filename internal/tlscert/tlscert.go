@@ -63,6 +63,33 @@ func KeyPath(override string) string {
 	return filepath.Join(certDir(override), keyFileName)
 }
 
+// sansMatch checks that the cert's SANs cover all desired hostnames and IPs.
+func sansMatch(leaf *x509.Certificate, cfg Config) bool {
+	wantDNS := map[string]bool{"localhost": true}
+	if cfg.Hostname != "" {
+		wantDNS[cfg.Hostname] = true
+	}
+	haveDNS := map[string]bool{}
+	for _, name := range leaf.DNSNames {
+		haveDNS[name] = true
+	}
+	for name := range wantDNS {
+		if !haveDNS[name] {
+			return false
+		}
+	}
+	haveIP := map[string]bool{}
+	for _, ip := range leaf.IPAddresses {
+		haveIP[ip.String()] = true
+	}
+	for _, ip := range cfg.IPAddresses {
+		if !haveIP[ip.String()] {
+			return false
+		}
+	}
+	return true
+}
+
 // EnsureCert loads an existing cert+key pair, or generates a new self-signed
 // pair if none exists. Returns the tls.Certificate ready for use.
 func EnsureCert(cfg Config) (tls.Certificate, error) {
@@ -73,12 +100,10 @@ func EnsureCert(cfg Config) (tls.Certificate, error) {
 
 	// Try loading existing cert
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		// Verify it hasn't expired
 		if leaf, parseErr := x509.ParseCertificate(cert.Certificate[0]); parseErr == nil {
-			if time.Now().Before(leaf.NotAfter) {
+			if time.Now().Before(leaf.NotAfter) && sansMatch(leaf, cfg) {
 				return cert, nil
 			}
-			// Expired — regenerate
 		}
 	}
 

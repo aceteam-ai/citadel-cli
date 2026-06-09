@@ -260,7 +260,11 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 			path = "/"
 		}
 	}
-	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, path)
+	requestURI := path
+	if r.URL.RawQuery != "" {
+		requestURI = path + "?" + r.URL.RawQuery
+	}
+	reqLine := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, requestURI)
 	clientConn.SetDeadline(time.Time{})
 
 	// Forward the original request headers
