@@ -100,6 +100,9 @@ type LegacyHandlerOpts struct {
 	// WorkspaceDir is the sandbox root for file-operation handlers.
 	// If empty, file-operation handlers are not registered.
 	WorkspaceDir string
+	// ConfigDir is the path to the citadel.yaml manifest directory.
+	// If empty, service-management handlers are not registered.
+	ConfigDir string
 }
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
@@ -136,6 +139,16 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
+		)
+	}
+
+	// Register service-management handlers when a config directory is available.
+	if opts.ConfigDir != "" {
+		svcHandler := jobs.NewServiceHandler(opts.ConfigDir)
+		handlers = append(handlers,
+			NewLegacyHandlerAdapter(JobTypeServiceStart, svcHandler),
+			NewLegacyHandlerAdapter(JobTypeServiceStop, svcHandler),
+			NewLegacyHandlerAdapter(JobTypeServiceStatus, svcHandler),
 		)
 	}
 
