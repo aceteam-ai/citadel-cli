@@ -28,11 +28,12 @@ import (
 // APIPublisher publishes node status via the Redis API proxy.
 // This is the secure alternative to direct Redis connections.
 type APIPublisher struct {
-	client    *redisapi.Client
-	nodeID    string
-	orgID     string
-	interval  time.Duration
-	collector *status.Collector
+	client          *redisapi.Client
+	nodeID          string
+	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	orgID           string
+	interval        time.Duration
+	collector       *status.Collector
 
 	// Redis key names
 	pubSubChannel string // format: node:status:org:{orgId}:{hostname}
@@ -55,6 +56,11 @@ type APIPublisherConfig struct {
 
 	// NodeID is the node identifier (typically hostname or network node name)
 	NodeID string
+
+	// HeadscaleNodeID is the Headscale numeric node ID (e.g., "758").
+	// When set, included in heartbeat messages so the Python worker can skip
+	// the Headscale hostname-to-ID lookup.
+	HeadscaleNodeID string
 
 	// OrgID is the organization ID for channel scoping (required for API mode)
 	OrgID string
@@ -91,15 +97,16 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 	pubSubChannel := fmt.Sprintf("node:status:org:%s:%s", cfg.OrgID, cfg.NodeID)
 
 	return &APIPublisher{
-		client:        cfg.Client,
-		nodeID:        cfg.NodeID,
-		orgID:         cfg.OrgID,
-		interval:      cfg.Interval,
-		collector:     collector,
-		pubSubChannel: pubSubChannel,
-		streamName:    "node:status:stream",
-		debugFunc:     cfg.DebugFunc,
-		logFn:         cfg.LogFn,
+		client:          cfg.Client,
+		nodeID:          cfg.NodeID,
+		headscaleNodeID: cfg.HeadscaleNodeID,
+		orgID:           cfg.OrgID,
+		interval:        cfg.Interval,
+		collector:       collector,
+		pubSubChannel:   pubSubChannel,
+		streamName:      "node:status:stream",
+		debugFunc:       cfg.DebugFunc,
+		logFn:           cfg.LogFn,
 	}, nil
 }
 
@@ -170,14 +177,15 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 
 	// Build status message
 	msg := StatusMessage{
-		Version:   "1.0",
-		Timestamp: timestamp,
-		NodeID:    p.nodeID,
-		Status:    nodeStatus,
+		Version:         "1.0",
+		Timestamp:       timestamp,
+		NodeID:          p.nodeID,
+		HeadscaleNodeID: p.headscaleNodeID,
+		Status:          nodeStatus,
 	}
 
 	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
-	p.debug("heartbeat: nodeId=%s, timestamp=%s", msg.NodeID, msg.Timestamp)
+	p.debug("heartbeat: nodeId=%s, headscaleNodeId=%s, timestamp=%s", msg.NodeID, msg.HeadscaleNodeID, msg.Timestamp)
 
 	// 1. Publish to Pub/Sub for real-time UI updates
 	if err := p.client.Publish(ctx, p.pubSubChannel, msg); err != nil {

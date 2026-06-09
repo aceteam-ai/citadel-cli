@@ -2,6 +2,7 @@
 package network
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -119,6 +120,33 @@ func TestLogoutVsDisconnectBehavior(t *testing.T) {
 	//     }
 	//     return ClearState()
 	// }
+}
+
+// TestGetGlobalNodeIDWhenNotConnected verifies GetGlobalNodeID returns empty when not connected.
+func TestGetGlobalNodeIDWhenNotConnected(t *testing.T) {
+	// Ensure no global server is set
+	ClearGlobal()
+
+	ctx := context.Background()
+	nodeID := GetGlobalNodeID(ctx)
+	if nodeID != "" {
+		t.Errorf("GetGlobalNodeID() = %q, want empty string when not connected", nodeID)
+	}
+}
+
+// TestNetworkStatusNodeIDField verifies the NodeID field exists on NetworkStatus.
+func TestNetworkStatusNodeIDField(t *testing.T) {
+	status := NetworkStatus{
+		Connected:    true,
+		BackendState: "Running",
+		Hostname:     "ubuntu-gpu-8gluaaom",
+		NodeID:       "758",
+		IPv4:         "100.64.0.1",
+	}
+
+	if status.NodeID != "758" {
+		t.Errorf("NetworkStatus.NodeID = %q, want %q", status.NodeID, "758")
+	}
 }
 
 // TestHasStateWithEmptyDir verifies HasState returns false for empty directory.

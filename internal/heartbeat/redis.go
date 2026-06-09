@@ -33,20 +33,22 @@ var nodeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
 // StatusMessage is the payload published to Redis for status updates.
 type StatusMessage struct {
-	Version    string             `json:"version"`
-	Timestamp  string             `json:"timestamp"`
-	NodeID     string             `json:"nodeId"`
-	DeviceCode string             `json:"deviceCode,omitempty"`
-	Status     *status.NodeStatus `json:"status"`
+	Version          string             `json:"version"`
+	Timestamp        string             `json:"timestamp"`
+	NodeID           string             `json:"nodeId"`
+	HeadscaleNodeID  string             `json:"headscaleNodeId,omitempty"`
+	DeviceCode       string             `json:"deviceCode,omitempty"`
+	Status           *status.NodeStatus `json:"status"`
 }
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
 type RedisPublisher struct {
-	client    *redis.Client
-	redisURL  string // For debug logging
-	nodeID    string
-	interval  time.Duration
-	collector *status.Collector
+	client          *redis.Client
+	redisURL        string // For debug logging
+	nodeID          string
+	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	interval        time.Duration
+	collector       *status.Collector
 
 	// deviceCode is protected by mu since it can be updated after auth
 	mu         sync.RWMutex
@@ -76,6 +78,11 @@ type RedisPublisherConfig struct {
 
 	// NodeID is the node identifier (typically hostname or Headscale node name)
 	NodeID string
+
+	// HeadscaleNodeID is the Headscale numeric node ID (e.g., "758").
+	// When set, included in heartbeat messages so the Python worker can skip
+	// the Headscale hostname-to-ID lookup.
+	HeadscaleNodeID string
 
 	// DeviceCode is the device authorization code for config lookup (optional)
 	DeviceCode string
@@ -124,16 +131,17 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 	}
 
 	return &RedisPublisher{
-		client:        client,
-		redisURL:      cfg.RedisURL,
-		nodeID:        cfg.NodeID,
-		deviceCode:    cfg.DeviceCode,
-		interval:      cfg.Interval,
-		collector:     collector,
-		pubSubChannel: pubSubChannel,
-		streamName:    "node:status:stream",
-		debugFunc:     cfg.DebugFunc,
-		logFn:         cfg.LogFn,
+		client:          client,
+		redisURL:        cfg.RedisURL,
+		nodeID:          cfg.NodeID,
+		headscaleNodeID: cfg.HeadscaleNodeID,
+		deviceCode:      cfg.DeviceCode,
+		interval:        cfg.Interval,
+		collector:       collector,
+		pubSubChannel:   pubSubChannel,
+		streamName:      "node:status:stream",
+		debugFunc:       cfg.DebugFunc,
+		logFn:           cfg.LogFn,
 	}, nil
 }
 
@@ -213,11 +221,12 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 
 	// Build status message
 	msg := StatusMessage{
-		Version:    "1.0",
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		NodeID:     p.nodeID,
-		DeviceCode: deviceCode,
-		Status:     nodeStatus,
+		Version:         "1.0",
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		NodeID:          p.nodeID,
+		HeadscaleNodeID: p.headscaleNodeID,
+		DeviceCode:      deviceCode,
+		Status:          nodeStatus,
 	}
 
 	// Marshal to JSON
@@ -227,7 +236,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 	}
 
 	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
-	p.debug("heartbeat: nodeId=%s, deviceCode=%s, timestamp=%s", msg.NodeID, msg.DeviceCode, msg.Timestamp)
+	p.debug("heartbeat: nodeId=%s, headscaleNodeId=%s, deviceCode=%s, timestamp=%s", msg.NodeID, msg.HeadscaleNodeID, msg.DeviceCode, msg.Timestamp)
 	p.debug("heartbeat: payload (%d bytes): %s", len(jsonData), string(jsonData))
 
 	// Publish to Pub/Sub for real-time UI updates

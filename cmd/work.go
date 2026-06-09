@@ -365,8 +365,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("network not configured (no saved state)")
 	}
 
-	// Get node name - prefer the actual registered name from network (Headscale-assigned)
+	// Get node name and Headscale node ID from network status
 	nodeName := workNodeName
+	var headscaleNodeID string // Headscale numeric node ID (e.g., "758")
 	Debug("resolving node name...")
 	Debug("workNodeName flag: %q", workNodeName)
 	Debug("CITADEL_NODE_NAME env: %q", os.Getenv("CITADEL_NODE_NAME"))
@@ -379,19 +380,38 @@ func runWork(cmd *cobra.Command, args []string) {
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname
+			if netStatus.NodeID != "" {
+				headscaleNodeID = netStatus.NodeID
+				Debug("got Headscale node ID from network status: %s", headscaleNodeID)
+			}
 		} else {
 			// Fallback to local hostname
 			hostname, _ := os.Hostname()
 			Debug("using local hostname fallback: %s", hostname)
 			nodeName = hostname
 		}
+	} else {
+		// Even with an explicit node name, resolve the Headscale node ID
+		headscaleNodeID = network.GetGlobalNodeID(ctx)
+		if headscaleNodeID != "" {
+			Debug("got Headscale node ID: %s", headscaleNodeID)
+		}
 	}
 	Debug("final node name: %s", nodeName)
+	if headscaleNodeID != "" {
+		Debug("final Headscale node ID: %s", headscaleNodeID)
+	}
 
-	// Set node identity on the stream event publisher for operator attribution
+	// Set node identity on the stream event publisher for operator attribution.
+	// Use Headscale numeric node ID when available so job results can be
+	// correlated with fabric_node_status (which is keyed by Headscale ID).
 	if setNodeMeta != nil {
-		setNodeMeta(nodeName, nodeName)
-		Debug("node meta set: node_id=%s, node_name=%s", nodeName, nodeName)
+		metaNodeID := nodeName
+		if headscaleNodeID != "" {
+			metaNodeID = headscaleNodeID
+		}
+		setNodeMeta(metaNodeID, nodeName)
+		Debug("node meta set: node_id=%s, node_name=%s", metaNodeID, nodeName)
 	}
 
 	// Open usage store for per-job compute tracking
@@ -568,10 +588,11 @@ func runWork(cmd *cobra.Command, args []string) {
 				fmt.Fprintln(os.Stderr, "   - ⚠️ API status publisher requires org-id (run 'citadel init' first)")
 			} else {
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
-					Client:    apiSource.Client(),
-					NodeID:    nodeName,
-					OrgID:     orgID,
-					DebugFunc: Debug,
+					Client:          apiSource.Client(),
+					NodeID:          nodeName,
+					HeadscaleNodeID: headscaleNodeID,
+					OrgID:           orgID,
+					DebugFunc:       Debug,
 				}, collector)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
@@ -596,6 +617,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				RedisURL:        workRedisURL,
 				RedisPassword:   workRedisPass,
 				NodeID:          nodeName,
+				HeadscaleNodeID: headscaleNodeID,
 				DeviceCode:      deviceCode,
 				ChannelOverride: workStatusChannel,
 				DebugFunc:       Debug,

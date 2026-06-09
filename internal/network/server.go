@@ -354,10 +354,17 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 		}
 	}
 
+	// Extract Headscale numeric node ID from StableNodeID
+	var nodeID string
+	if status.Self != nil && !status.Self.ID.IsZero() {
+		nodeID = string(status.Self.ID)
+	}
+
 	return &NetworkStatus{
 		Connected:    status.BackendState == "Running",
 		BackendState: status.BackendState,
 		Hostname:     hostname,
+		NodeID:       nodeID,
 		IPv4:         ipv4,
 		IPv6:         ipv6,
 		ControlURL:   s.controlURL,
@@ -392,6 +399,7 @@ type NetworkStatus struct {
 	Connected    bool   `json:"connected"`
 	BackendState string `json:"backend_state"`
 	Hostname     string `json:"hostname"`
+	NodeID       string `json:"node_id,omitempty"` // Headscale numeric node ID (StableNodeID)
 	IPv4         string `json:"ipv4,omitempty"`
 	IPv6         string `json:"ipv6,omitempty"`
 	ControlURL   string `json:"control_url"`
