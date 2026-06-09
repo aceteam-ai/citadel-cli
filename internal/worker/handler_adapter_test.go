@@ -11,11 +11,13 @@ import (
 
 // TestLegacyHandler is a mock jobs.JobHandler for testing.
 type TestLegacyHandler struct {
-	shouldFail bool
-	output     string
+	shouldFail      bool
+	output          string
+	capturedPayload map[string]string // captures the payload for inspection
 }
 
 func (h *TestLegacyHandler) Execute(ctx jobs.JobContext, job *nexus.Job) ([]byte, error) {
+	h.capturedPayload = job.Payload
 	if h.shouldFail {
 		return []byte("error output"), errors.New("handler failed")
 	}
@@ -172,6 +174,56 @@ func TestCreateLegacyHandlers(t *testing.T) {
 
 func TestLegacyHandlerAdapterImplementsJobHandler(t *testing.T) {
 	var _ JobHandler = (*LegacyHandlerAdapter)(nil)
+}
+
+func TestLegacyHandlerAdapterPayloadCoercion(t *testing.T) {
+	handler := &TestLegacyHandler{output: "ok"}
+	adapter := NewLegacyHandlerAdapter("TEST_JOB", handler)
+
+	// Simulate a job payload as it arrives from json.Unmarshal (via Redis):
+	// numbers are float64, booleans are bool, strings are string.
+	job := &Job{
+		ID:   "job-coerce",
+		Type: "TEST_JOB",
+		Payload: map[string]any{
+			"path":        "/some/path",
+			"offset":      float64(10),
+			"limit":       float64(100),
+			"replace_all": true,
+			"nil_field":   nil,
+		},
+	}
+
+	ctx := context.Background()
+	stream := &NoOpStreamWriter{}
+
+	_, err := adapter.Execute(ctx, job, stream)
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+
+	// Verify all non-nil values were coerced to strings.
+	checks := map[string]string{
+		"path":        "/some/path",
+		"offset":      "10",
+		"limit":       "100",
+		"replace_all": "true",
+	}
+	for k, want := range checks {
+		got, ok := handler.capturedPayload[k]
+		if !ok {
+			t.Errorf("payload[%q] missing", k)
+			continue
+		}
+		if got != want {
+			t.Errorf("payload[%q] = %q, want %q", k, got, want)
+		}
+	}
+
+	// nil values should be skipped.
+	if _, ok := handler.capturedPayload["nil_field"]; ok {
+		t.Error("nil_field should be skipped in payload")
+	}
 }
 
 func TestCreateLegacyHandlersWithOpts_FileHandlers(t *testing.T) {

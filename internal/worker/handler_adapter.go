@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -44,12 +45,20 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 		Type: job.Type,
 	}
 
-	// Convert payload map[string]any to map[string]string for nexus.Job
+	// Convert payload map[string]any to map[string]string for nexus.Job.
+	// Redis payloads arrive via json.Unmarshal, so numbers are float64 and
+	// booleans are bool. Coerce all values to strings so handlers can parse
+	// them with strconv.
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
-			if strVal, ok := v.(string); ok {
-				nexusJob.Payload[k] = strVal
+			switch val := v.(type) {
+			case string:
+				nexusJob.Payload[k] = val
+			case nil:
+				// skip nil values
+			default:
+				nexusJob.Payload[k] = fmt.Sprint(val)
 			}
 		}
 	}
