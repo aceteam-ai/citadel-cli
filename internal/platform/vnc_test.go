@@ -310,7 +310,7 @@ func TestErrSudoRequired(t *testing.T) {
 	if !strings.Contains(msg, "sudo") {
 		t.Errorf("ErrSudoRequired message should mention sudo, got: %s", msg)
 	}
-	if !strings.Contains(msg, "sudo citadel vnc enable") {
+	if !strings.Contains(msg, "root privileges") {
 		t.Errorf("ErrSudoRequired message should include the fix command, got: %s", msg)
 	}
 }

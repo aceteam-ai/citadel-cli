@@ -360,7 +360,7 @@ func (w *WindowsVNCManager) Port() int {
 
 // ErrSudoRequired is returned when VNC installation needs elevated privileges.
 // The caller (cmd/vnc.go) should display an actionable message to the user.
-var ErrSudoRequired = fmt.Errorf("VNC server installation requires sudo. Run: sudo citadel vnc enable")
+var ErrSudoRequired = fmt.Errorf("VNC server installation requires root privileges. Install sudo and run: sudo citadel vnc enable — or run directly as root: su -c 'citadel vnc enable'")
 
 // --- Linux implementation ---
 
@@ -577,7 +577,10 @@ func (l *LinuxVNCManager) resolveXAuth() (authFile string, needsSudo bool) {
 
 	// LightDM
 	if exec.Command("pgrep", "-x", "lightdm").Run() == nil {
-		return "/var/run/lightdm/root/:0", true
+		ldmAuth := "/var/run/lightdm/root/:0"
+		if _, err := os.Stat(ldmAuth); err == nil {
+			return ldmAuth, true
+		}
 	}
 
 	// GDM
