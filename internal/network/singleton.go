@@ -151,6 +151,20 @@ func KeepAlive(ctx context.Context) error {
 	return s.KeepAlive(ctx)
 }
 
+// GetGlobalNodeID returns the Headscale numeric node ID of the global server.
+// Returns empty string if not connected or node ID is unavailable.
+func GetGlobalNodeID(ctx context.Context) string {
+	s := Global()
+	if s == nil {
+		return ""
+	}
+	status, err := s.Status(ctx)
+	if err != nil || !status.Connected {
+		return ""
+	}
+	return status.NodeID
+}
+
 // GetGlobalPeers returns the list of peers from the global server.
 func GetGlobalPeers(ctx context.Context) ([]PeerInfo, error) {
 	s := Global()

@@ -1,6 +1,8 @@
 package heartbeat
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,5 +176,111 @@ func TestStatusMessageJSON(t *testing.T) {
 	}
 	if msg.DeviceCode != "abc123" {
 		t.Errorf("DeviceCode = %v, want abc123", msg.DeviceCode)
+	}
+}
+
+func TestStatusMessageHeadscaleNodeID(t *testing.T) {
+	// Test that HeadscaleNodeID is included in StatusMessage when set
+	msg := StatusMessage{
+		Version:         "1.0",
+		Timestamp:       "2024-01-15T12:00:00Z",
+		NodeID:          "ubuntu-gpu-8gluaaom",
+		HeadscaleNodeID: "758",
+		Status: &status.NodeStatus{
+			Version: "1.0",
+			Node: status.NodeInfo{
+				Name: "ubuntu-gpu-8gluaaom",
+			},
+			VNCPort: 5900,
+		},
+	}
+
+	if msg.HeadscaleNodeID != "758" {
+		t.Errorf("HeadscaleNodeID = %v, want 758", msg.HeadscaleNodeID)
+	}
+	if msg.Status.VNCPort != 5900 {
+		t.Errorf("Status.VNCPort = %v, want 5900", msg.Status.VNCPort)
+	}
+}
+
+func TestStatusMessageHeadscaleNodeIDOmittedWhenEmpty(t *testing.T) {
+	// Test that HeadscaleNodeID is omitted from JSON when empty (omitempty tag)
+	msg := StatusMessage{
+		Version:   "1.0",
+		Timestamp: "2024-01-15T12:00:00Z",
+		NodeID:    "test-node",
+		Status:    &status.NodeStatus{Version: "1.0"},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Failed to marshal StatusMessage: %v", err)
+	}
+
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, "headscaleNodeId") {
+		t.Errorf("JSON should omit headscaleNodeId when empty, got: %s", jsonStr)
+	}
+}
+
+func TestStatusMessageHeadscaleNodeIDIncludedWhenSet(t *testing.T) {
+	// Test that HeadscaleNodeID IS included in JSON when set
+	msg := StatusMessage{
+		Version:         "1.0",
+		Timestamp:       "2024-01-15T12:00:00Z",
+		NodeID:          "ubuntu-gpu",
+		HeadscaleNodeID: "758",
+		Status:          &status.NodeStatus{Version: "1.0"},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Failed to marshal StatusMessage: %v", err)
+	}
+
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"headscaleNodeId":"758"`) {
+		t.Errorf("JSON should include headscaleNodeId when set, got: %s", jsonStr)
+	}
+}
+
+func TestStatusMessageVNCPortIncluded(t *testing.T) {
+	// Test that vnc_port is included in the status payload
+	msg := StatusMessage{
+		Version:   "1.0",
+		Timestamp: "2024-01-15T12:00:00Z",
+		NodeID:    "test-node",
+		Status: &status.NodeStatus{
+			Version: "1.0",
+			VNCPort: 5900,
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Failed to marshal StatusMessage: %v", err)
+	}
+
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, `"vnc_port":5900`) {
+		t.Errorf("JSON should include vnc_port in status, got: %s", jsonStr)
+	}
+}
+
+func TestRedisPublisherHeadscaleNodeID(t *testing.T) {
+	collector := status.NewCollector(status.CollectorConfig{NodeName: "test"})
+
+	pub, err := NewRedisPublisher(RedisPublisherConfig{
+		RedisURL:        "redis://localhost:6379",
+		NodeID:          "ubuntu-gpu",
+		HeadscaleNodeID: "758",
+	}, collector)
+	if err != nil {
+		t.Skipf("Skipping test, could not create publisher: %v", err)
+	}
+	defer pub.Close()
+
+	if pub.headscaleNodeID != "758" {
+		t.Errorf("headscaleNodeID = %v, want 758", pub.headscaleNodeID)
 	}
 }

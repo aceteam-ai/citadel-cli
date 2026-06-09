@@ -841,10 +841,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		return fmt.Errorf("no API token configured (complete device authorization first)")
 	}
 
-	// Get node name
+	// Get node name and Headscale node ID
 	nodeName := ""
+	headscaleNodeID := ""
 	if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 		nodeName = netStatus.Hostname
+		headscaleNodeID = netStatus.NodeID
 	} else {
 		nodeName, _ = os.Hostname()
 	}
@@ -868,11 +870,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		if orgID != "" {
 			if apiSource, ok := source.(*worker.APISource); ok {
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
-					Client:    apiSource.Client(),
-					NodeID:    nodeName,
-					OrgID:     orgID,
-					DebugFunc: nil,
-					LogFn:     activity, // Route logs through TUI
+					Client:          apiSource.Client(),
+					NodeID:          nodeName,
+					HeadscaleNodeID: headscaleNodeID,
+					OrgID:           orgID,
+					DebugFunc:       nil,
+					LogFn:           activity, // Route logs through TUI
 				}, collector)
 				if err == nil {
 					go func() {
