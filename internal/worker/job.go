@@ -105,5 +105,4 @@ const (
 	JobTypeEmbedding         = "embedding"           // Redis worker format
 	JobTypeApplyDeviceConfig = "APPLY_DEVICE_CONFIG" // Device config from onboarding
 	JobTypeExtraction        = "GLINER_EXTRACTION"   // Entity/relation extraction via GLiNER2
-	JobTypeHTTPProxy         = "HTTP_PROXY"          // Proxy HTTP requests through the local node
 )
