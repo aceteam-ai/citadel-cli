@@ -22,14 +22,16 @@ type Server struct {
 	version        string
 	tokenValidator terminal.TokenValidator
 	orgID          string
+	enableDesktop  bool
 }
 
 // ServerConfig holds configuration for the status server.
 type ServerConfig struct {
-	Port           int                      // HTTP server port (default: 8080)
-	Version        string                   // Citadel version string
-	TokenValidator terminal.TokenValidator   // Optional: enables authenticated desktop endpoints
-	OrgID          string                   // Required when TokenValidator is set
+	Port           int                    // HTTP server port (default: 8080)
+	Version        string                 // Citadel version string
+	TokenValidator terminal.TokenValidator // Optional: enables authenticated desktop endpoints
+	OrgID          string                 // Required when TokenValidator is set
+	EnableDesktop  bool                   // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
 }
 
 // NewServer creates a new status HTTP server.
@@ -43,6 +45,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		version:        cfg.Version,
 		tokenValidator: cfg.TokenValidator,
 		orgID:          cfg.OrgID,
+		enableDesktop:  cfg.EnableDesktop,
 	}
 }
 
@@ -55,7 +58,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
 
-	if s.tokenValidator != nil {
+	if s.tokenValidator != nil && s.enableDesktop {
 		mux.HandleFunc("/api/screenshot", s.requireAuth(s.handleScreenshot))
 		mux.HandleFunc("/api/actions", s.requireAuth(s.handleActions))
 	}
