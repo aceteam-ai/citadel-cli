@@ -19,7 +19,6 @@ import (
 var (
 	servePort       int
 	serveStatusPort int
-	serveFabricPort int
 	serveTermPort   int
 	serveVNCPort    int
 	serveNoTLS      bool
@@ -33,6 +32,10 @@ var serveCmd = &cobra.Command{
 	Long: `Starts an HTTPS reverse proxy that consolidates all Citadel node services
 behind a single TLS endpoint.
 
+The gateway proxies to the local status server (started by 'citadel work
+--status-port'), terminal server, and optionally a websockify instance
+for VNC WebSocket access.
+
 Routes:
   /health          -> Node health check
   /status          -> Full node status
@@ -40,7 +43,6 @@ Routes:
   /services        -> List registered services
   /api/screenshot  -> Desktop screenshot (auth required)
   /api/actions     -> Desktop input actions (auth required)
-  /api/...         -> Fabric server API
   /vnc/...         -> VNC WebSocket proxy (requires websockify on --vnc-port)
   /terminal/...    -> Terminal WebSocket server
 
@@ -61,15 +63,12 @@ tsnet.ListenTLS for automatic public certs.`,
   # Start on a custom port
   citadel serve --port 443
 
-  # Start without TLS (HTTP only, for testing)
-  citadel serve --no-tls
-
   # Custom upstream ports
-  citadel serve --status-port 9090 --fabric-port 8080
+  citadel serve --status-port 9090
 
   # Combine with the work command (in separate terminals):
-  # Terminal 1: citadel work --status-port 9090
-  # Terminal 2: citadel serve --status-port 9090`,
+  # Terminal 1: citadel work --status-port 8080
+  # Terminal 2: citadel serve`,
 	RunE: runServe,
 }
 
@@ -134,18 +133,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 			MinVersion:   tls.VersionTLS12,
 		}
 
-		certDir := serveCertDir
-		if certDir == "" {
-			certDir = tlscert.CertPath("")
-		}
 		fmt.Printf("   - TLS: self-signed (cert: %s)\n", tlscert.CertPath(serveCertDir))
 	} else {
 		fmt.Println("   - TLS: disabled (--no-tls)")
 	}
 
+	// Validate that gateway port does not collide with any upstream port
+	upstreamPorts := map[int]string{
+		serveStatusPort: "status-port",
+		serveTermPort:   "terminal-port",
+		serveVNCPort:    "vnc-port",
+	}
+	if name, collision := upstreamPorts[servePort]; collision {
+		return fmt.Errorf("gateway port %d collides with --%s; choose a different --port", servePort, name)
+	}
+
 	// Build upstream address strings
 	statusAddr := fmt.Sprintf("127.0.0.1:%d", serveStatusPort)
-	fabricAddr := fmt.Sprintf("127.0.0.1:%d", serveFabricPort)
 	termAddr := fmt.Sprintf("127.0.0.1:%d", serveTermPort)
 	vncAddr := fmt.Sprintf("127.0.0.1:%d", serveVNCPort)
 
@@ -158,15 +162,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	})
 
 	// Register upstreams — status server endpoints
+	// These route to the status server started by 'citadel work --status-port'
 	gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/status", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/ping", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/services", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
-
-	// Fabric server API (catch-all for /api/...)
-	gw.AddUpstream("/api", &gateway.Upstream{Address: fabricAddr})
 
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{
@@ -192,7 +194,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("   - Routes:")
 	fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
-	fmt.Printf("     /api/...                 -> %s (fabric server)\n", fabricAddr)
 	fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 	fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
@@ -221,9 +222,8 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveNoTLS, "no-tls", false, "Disable TLS (plain HTTP, for testing only)")
 	serveCmd.Flags().StringVar(&serveCertDir, "cert-dir", "", "Custom directory for TLS certificates")
 
-	// Upstream port defaults — these should match the ports used by 'citadel work'
-	serveCmd.Flags().IntVar(&serveStatusPort, "status-port", 8080, "Port of the local status server")
-	serveCmd.Flags().IntVar(&serveFabricPort, "fabric-port", 8443, "Port of the local fabric server")
+	// Upstream port defaults — these match the defaults in 'citadel work'
+	serveCmd.Flags().IntVar(&serveStatusPort, "status-port", 8080, "Port of the local status server (from 'citadel work --status-port')")
 	serveCmd.Flags().IntVar(&serveTermPort, "terminal-port", 7860, "Port of the local terminal server")
 	serveCmd.Flags().IntVar(&serveVNCPort, "vnc-port", 6080, "Port of websockify (VNC WebSocket bridge)")
 

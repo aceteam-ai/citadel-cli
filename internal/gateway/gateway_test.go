@@ -112,29 +112,39 @@ func TestIsWebSocketUpgrade(t *testing.T) {
 }
 
 func TestProxyRouting(t *testing.T) {
-	// Start a mock backend
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Two separate backends to verify route discrimination
+	statusBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"path":       r.URL.Path,
-			"x_node":     r.Header.Get("X-Citadel-Node"),
-			"x_fwd_for":  r.Header.Get("X-Forwarded-For"),
+			"backend":     "status",
+			"path":        r.URL.Path,
+			"x_node":      r.Header.Get("X-Citadel-Node"),
 			"x_fwd_proto": r.Header.Get("X-Forwarded-Proto"),
 		})
 	}))
-	defer backend.Close()
+	defer statusBackend.Close()
 
-	// Parse backend address
-	backendURL := backend.URL[len("http://"):] // "127.0.0.1:PORT"
+	vncBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"backend": "vnc",
+			"path":    r.URL.Path,
+		})
+	}))
+	defer vncBackend.Close()
 
-	// Create gateway with upstreams pointing to mock backend
+	statusAddr := statusBackend.URL[len("http://"):]
+	vncAddr := vncBackend.URL[len("http://"):]
+
+	// Create gateway with upstreams on separate backends
 	gw := NewServer(Config{
-		Port:     0, // Will use a random port
+		Port:     0,
 		NodeName: "test-node",
 	})
-	gw.AddUpstream("/health", &Upstream{Address: backendURL})
-	gw.AddUpstream("/api", &Upstream{Address: backendURL})
-	gw.AddUpstream("/vnc", &Upstream{Address: backendURL, StripPrefix: true, WebSocket: true})
+	gw.AddUpstream("/health", &Upstream{Address: statusAddr})
+	gw.AddUpstream("/api/screenshot", &Upstream{Address: statusAddr})
+	gw.AddUpstream("/api/actions", &Upstream{Address: statusAddr})
+	gw.AddUpstream("/vnc", &Upstream{Address: vncAddr, StripPrefix: true, WebSocket: true})
 
 	// Build routes
 	for prefix, upstream := range gw.config.Upstreams {
@@ -142,8 +152,8 @@ func TestProxyRouting(t *testing.T) {
 	}
 	gw.mux.HandleFunc("/", gw.handleRoot)
 
-	// Test health route
-	t.Run("health proxy", func(t *testing.T) {
+	// Test health goes to status backend
+	t.Run("health -> status backend", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/health", nil)
 		w := httptest.NewRecorder()
 		gw.mux.ServeHTTP(w, req)
@@ -154,6 +164,9 @@ func TestProxyRouting(t *testing.T) {
 
 		var resp map[string]string
 		json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["backend"] != "status" {
+			t.Errorf("routed to %q backend, want status", resp["backend"])
+		}
 		if resp["path"] != "/health" {
 			t.Errorf("proxied path = %q, want /health", resp["path"])
 		}
@@ -165,8 +178,8 @@ func TestProxyRouting(t *testing.T) {
 		}
 	})
 
-	// Test API route (no strip)
-	t.Run("api proxy", func(t *testing.T) {
+	// Test /api/screenshot goes to status backend
+	t.Run("api/screenshot -> status backend", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
 		w := httptest.NewRecorder()
 		gw.mux.ServeHTTP(w, req)
@@ -177,13 +190,13 @@ func TestProxyRouting(t *testing.T) {
 
 		var resp map[string]string
 		json.Unmarshal(w.Body.Bytes(), &resp)
-		if resp["path"] != "/api/screenshot" {
-			t.Errorf("proxied path = %q, want /api/screenshot", resp["path"])
+		if resp["backend"] != "status" {
+			t.Errorf("routed to %q backend, want status", resp["backend"])
 		}
 	})
 
-	// Test VNC route (strip prefix, non-WS)
-	t.Run("vnc proxy strip prefix", func(t *testing.T) {
+	// Test /vnc goes to vnc backend with strip prefix
+	t.Run("vnc -> vnc backend with strip", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/vnc/info", nil)
 		w := httptest.NewRecorder()
 		gw.mux.ServeHTTP(w, req)
@@ -194,12 +207,15 @@ func TestProxyRouting(t *testing.T) {
 
 		var resp map[string]string
 		json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["backend"] != "vnc" {
+			t.Errorf("routed to %q backend, want vnc", resp["backend"])
+		}
 		if resp["path"] != "/info" {
 			t.Errorf("proxied path = %q, want /info (strip prefix)", resp["path"])
 		}
 	})
 
-	// Test root returns gateway info
+	// Test root returns gateway info (not proxied)
 	t.Run("root info", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		w := httptest.NewRecorder()
@@ -208,9 +224,11 @@ func TestProxyRouting(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want 200", w.Code)
 		}
-		body := w.Body.String()
-		if body == "" {
-			t.Error("empty body for root")
+
+		var resp map[string]interface{}
+		json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp["gateway"] != "citadel" {
+			t.Errorf("gateway = %v, want citadel", resp["gateway"])
 		}
 	})
 }
