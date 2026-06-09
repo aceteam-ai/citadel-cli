@@ -24,9 +24,17 @@ type NodeStatus struct {
 	System       SystemMetrics         `json:"system"`
 	GPU          []GPUMetrics          `json:"gpu,omitempty"`
 	Services     []ServiceInfo         `json:"services,omitempty"`
+	Apps         []AppInfo             `json:"apps,omitempty"`
 	Capabilities *NodeCapabilities     `json:"capabilities,omitempty"`
 	Desktop      *desktop.Capabilities `json:"desktop,omitempty"`
 	VNCPort      int                   `json:"vnc_port"`
+}
+
+// AppInfo contains information about an installed catalog app.
+type AppInfo struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // "running", "stopped", "not_found"
+	Port   int    `json:"port,omitempty"`
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
