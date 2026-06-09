@@ -73,6 +73,9 @@ var (
 
 	// Concurrency flag
 	workMaxConcurrency int
+
+	// Workspace directory for file-operation handlers
+	workWorkspaceDir string
 )
 
 var workCmd = &cobra.Command{
@@ -719,8 +722,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create handlers (use legacy adapters for now)
-	handlers := worker.CreateLegacyHandlers()
+	// Create handlers with optional workspace for file-operation jobs.
+	wsDir := resolveWorkspaceDir()
+	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+		WorkspaceDir: wsDir,
+	})
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
@@ -830,6 +836,34 @@ func getRedisURLFromConfig() string {
 		return ""
 	}
 	return config.RedisURL
+}
+
+// resolveWorkspaceDir returns the sandbox directory for file-operation handlers.
+// Priority: --workspace flag > CITADEL_WORKSPACE env > ~/citadel-node/workspace default.
+// Returns empty string if the directory cannot be resolved or created.
+func resolveWorkspaceDir() string {
+	dir := workWorkspaceDir
+	if dir == "" {
+		dir = os.Getenv("CITADEL_WORKSPACE")
+	}
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, "citadel-node", "workspace")
+	}
+	// Ensure the directory exists.
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "   - Warning: cannot create workspace dir %s: %v\n", dir, err)
+		return ""
+	}
+	// Resolve to absolute path (handles relative flag values).
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+	return abs
 }
 
 // DeviceConfig holds device authentication configuration from the global config file.
@@ -1019,4 +1053,7 @@ func init() {
 
 	// Concurrency flags
 	workCmd.Flags().IntVar(&workMaxConcurrency, "max-concurrency", 0, "Maximum concurrent jobs (0 = auto-detect from GPU count)")
+
+	// Workspace flags
+	workCmd.Flags().StringVar(&workWorkspaceDir, "workspace", "", "Workspace directory for file-operation jobs (or set CITADEL_WORKSPACE env)")
 }

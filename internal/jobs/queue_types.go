@@ -11,6 +11,13 @@ const (
 
 	// JobTypeExtraction handles entity/relation extraction
 	JobTypeExtraction = "EXTRACTION"
+
+	// File operation job types for agent workspace access
+	JobTypeFileRead   = "FILE_READ"
+	JobTypeFileWrite  = "FILE_WRITE"
+	JobTypeFileEdit   = "FILE_EDIT"
+	JobTypeFileList   = "FILE_LIST"
+	JobTypeFileSearch = "FILE_SEARCH"
 )
 
 // Queue names following PR #1105 convention

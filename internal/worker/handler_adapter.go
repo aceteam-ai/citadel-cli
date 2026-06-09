@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -44,12 +45,20 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 		Type: job.Type,
 	}
 
-	// Convert payload map[string]any to map[string]string for nexus.Job
+	// Convert payload map[string]any to map[string]string for nexus.Job.
+	// Redis payloads arrive via json.Unmarshal, so numbers are float64 and
+	// booleans are bool. Coerce all values to strings so handlers can parse
+	// them with strconv.
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
-			if strVal, ok := v.(string); ok {
-				nexusJob.Payload[k] = strVal
+			switch val := v.(type) {
+			case string:
+				nexusJob.Payload[k] = val
+			case nil:
+				// skip nil values
+			default:
+				nexusJob.Payload[k] = fmt.Sprint(val)
 			}
 		}
 	}
@@ -84,6 +93,15 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 // Ensure LegacyHandlerAdapter implements JobHandler
 var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
+// LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
+type LegacyHandlerOpts struct {
+	// LogFn routes job log output through a callback instead of stdout.
+	LogFn func(level, msg string)
+	// WorkspaceDir is the sandbox root for file-operation handlers.
+	// If empty, file-operation handlers are not registered.
+	WorkspaceDir string
+}
+
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
 // If logFn is provided, job output will be routed through it instead of stdout.
 func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
@@ -91,7 +109,13 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 	if len(logFn) > 0 {
 		fn = logFn[0]
 	}
+	return CreateLegacyHandlersWithOpts(LegacyHandlerOpts{LogFn: fn})
+}
 
+// CreateLegacyHandlersWithOpts is like CreateLegacyHandlers but accepts a
+// structured options value for richer configuration (e.g. workspace directory
+// for file-operation handlers).
+func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeShellCommand, &jobs.ShellCommandHandler{}),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
@@ -104,14 +128,25 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
 	}
 
-	// Set log function on all handlers
-	if fn != nil {
+	// Register file-operation handlers when a workspace is configured.
+	if opts.WorkspaceDir != "" {
+		handlers = append(handlers,
+			NewLegacyHandlerAdapter(JobTypeFileRead, jobs.NewFileReadHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
+		)
+	}
+
+	// Set log function on all handlers.
+	if opts.LogFn != nil {
 		for _, h := range handlers {
-			h.SetLogFn(fn)
+			h.SetLogFn(opts.LogFn)
 		}
 	}
 
-	// Convert to []JobHandler
+	// Convert to []JobHandler.
 	result := make([]JobHandler, len(handlers))
 	for i, h := range handlers {
 		result[i] = h

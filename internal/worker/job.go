@@ -106,4 +106,9 @@ const (
 	JobTypeApplyDeviceConfig = "APPLY_DEVICE_CONFIG" // Device config from onboarding
 	JobTypeExtraction        = "GLINER_EXTRACTION"   // Entity/relation extraction via GLiNER2
 	JobTypeHTTPProxy         = "HTTP_PROXY"          // Proxy HTTP requests through the local node
+	JobTypeFileRead          = "FILE_READ"           // Read a file from the workspace
+	JobTypeFileWrite         = "FILE_WRITE"          // Write a file to the workspace
+	JobTypeFileEdit          = "FILE_EDIT"           // Edit (string replace) a file in the workspace
+	JobTypeFileList          = "FILE_LIST"           // List directory contents in the workspace
+	JobTypeFileSearch        = "FILE_SEARCH"         // Search for text across files in the workspace
 )

@@ -911,8 +911,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])
 
-	// Create handlers with activity callback to route job output through TUI
-	handlers := worker.CreateLegacyHandlers(activity)
+	// Create handlers with activity callback to route job output through TUI.
+	wsDir := resolveWorkspaceDir()
+	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+		LogFn:        activity,
+		WorkspaceDir: wsDir,
+	})
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
