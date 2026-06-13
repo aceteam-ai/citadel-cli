@@ -166,9 +166,6 @@ func (b *mcpBridge) run() error {
 		switch req.Method {
 		case "initialize":
 			b.handleInitialize(&req)
-		case "notifications/initialized":
-			// Client acknowledgment -- no response needed.
-			Debug("MCP: client initialized")
 		case "ping":
 			if !isNotification {
 				b.writeResult(req.ID, json.RawMessage(`{}`))
@@ -184,6 +181,11 @@ func (b *mcpBridge) run() error {
 			if err != nil {
 				Debug("MCP: backend error for %s: %v", req.Method, err)
 				b.writeError(req.ID, -32603, fmt.Sprintf("Backend error: %v", err))
+				continue
+			}
+			if resp == nil {
+				// No body (e.g. 202 Accepted) -- should not happen for requests.
+				Debug("MCP: empty response for %s", req.Method)
 				continue
 			}
 			// Write the raw response directly to stdout.
@@ -271,10 +273,16 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		Debug("MCP: session ID: %s", sid)
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
+	// 200 = success with body, 202 = accepted (notifications), both are OK.
+	if httpResp.StatusCode != http.StatusOK && httpResp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(httpResp.Body)
 		Debug("MCP: backend returned %d: %s", httpResp.StatusCode, string(body))
 		return nil, fmt.Errorf("backend returned HTTP %d: %s", httpResp.StatusCode, truncate(string(body), 200))
+	}
+
+	// 202 Accepted has no body (used for notifications).
+	if httpResp.StatusCode == http.StatusAccepted {
+		return nil, nil
 	}
 
 	contentType := httpResp.Header.Get("Content-Type")

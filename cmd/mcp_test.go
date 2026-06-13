@@ -384,6 +384,35 @@ func TestGetAPIKeyFromConfig(t *testing.T) {
 	_ = key
 }
 
+func TestMCPBridgeNotification202(t *testing.T) {
+	// Test that 202 Accepted (for notifications) returns nil body, no error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Mcp-Session-Id", "test-session-456")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	bridge := &mcpBridge{
+		apiKey:     "test-key",
+		apiURL:     server.URL,
+		mcpServer:  "aceteam",
+		httpClient: server.Client(),
+	}
+
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		Method:  "notifications/initialized",
+	}
+
+	resp, err := bridge.forwardToBackend(req)
+	if err != nil {
+		t.Fatalf("notification should not error: %v", err)
+	}
+	if resp != nil {
+		t.Errorf("notification should return nil body, got: %s", string(resp))
+	}
+}
+
 func TestParseSSEResponseEmpty(t *testing.T) {
 	bridge := &mcpBridge{}
 
