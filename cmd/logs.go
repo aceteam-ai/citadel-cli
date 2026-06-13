@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
@@ -202,12 +201,6 @@ func runRemoteLogs(serviceName, tailLines string) error {
 		apiBaseURL = authServiceURL
 	}
 
-	client := redisapi.NewClient(redisapi.ClientConfig{
-		BaseURL:   apiBaseURL,
-		Token:     deviceConfig.DeviceAPIToken,
-		DebugFunc: Debug,
-	})
-
 	// Build the request URL for the remote logs endpoint
 	endpoint := fmt.Sprintf("%s/api/machines/%s/manage/logs", apiBaseURL, logsNode)
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
@@ -227,10 +220,6 @@ func runRemoteLogs(serviceName, tailLines string) error {
 
 	req.Header.Set("Authorization", "Bearer "+deviceConfig.DeviceAPIToken)
 	req.Header.Set("X-Fabric-Source", "citadel-cli")
-
-	// Suppress unused variable — the client is created for future use when
-	// the remote logs endpoint supports WebSocket streaming.
-	_ = client
 
 	fmt.Printf("--- Fetching logs for service '%s' from node '%s' ---\n", serviceName, logsNode)
 

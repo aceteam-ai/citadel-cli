@@ -137,7 +137,8 @@ func runLocalDeploy(image, containerName string) error {
 	Debug("docker %s", strings.Join(runArgs, " "))
 
 	runCmd := exec.Command("docker", runArgs...)
-	output, err := runCmd.CombinedOutput()
+	runCmd.Stderr = os.Stderr // Show warnings (GPU, runtime) directly
+	output, err := runCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to start container: %s", strings.TrimSpace(string(output)))
 	}
