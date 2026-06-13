@@ -34,6 +34,10 @@ var debugMode bool
 var daemonMode bool
 var noColorGlobal bool
 
+// debugToStderr forces debug console output to stderr instead of stdout.
+// Set by commands that use stdout as a transport (e.g., MCP).
+var debugToStderr bool
+
 // deferredUpdateNotification stores update info when TUI will handle the display
 var deferredUpdateNotification string
 
@@ -95,7 +99,11 @@ func Log(format string, args ...interface{}) {
 
 	// Print to console only if debug mode is enabled
 	if debugMode {
-		fmt.Printf("[%s] [CITADEL] %s\n", timeStr, msg)
+		if debugToStderr {
+			fmt.Fprintf(os.Stderr, "[%s] [CITADEL] %s\n", timeStr, msg)
+		} else {
+			fmt.Printf("[%s] [CITADEL] %s\n", timeStr, msg)
+		}
 	}
 }
 
@@ -129,6 +137,13 @@ Use 'citadel help' to see all available commands.`,
 		}
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
+		// output there corrupts the stream. Redirect debug to stderr early,
+		// before the first Log() call.
+		if cmd.Name() == "mcp" {
+			debugToStderr = true
+		}
+
 		// Handle global --no-color flag and NO_COLOR env var
 		if noColorGlobal || os.Getenv("NO_COLOR") != "" {
 			color.NoColor = true
@@ -167,6 +182,11 @@ Use 'citadel help' to see all available commands.`,
 		// Detect if we're about to launch TUI control center
 		// In this case, suppress stdout printing and defer to TUI activity log
 		isTUIContext := cmdName == "citadel" && len(args) == 0 && !daemonMode && tui.IsTTY()
+
+		// MCP uses stdout as transport -- suppress update print to stdout.
+		if cmdName == "mcp" {
+			isTUIContext = true
+		}
 
 		if !skipUpdateCheck {
 			checkForUpdateOnStartup(isTUIContext)
