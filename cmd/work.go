@@ -229,7 +229,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			_ = tempClient.Close()
 		}
 
-		// Build queue list: primary queue + per-org shell queue
+		// Build queue list: primary queue + per-org shell queue.
+		// Ensure a base queue is always present so that appending
+		// the shell queue does not suppress the NewAPISource default.
 		var apiQueueNames []string
 		if workQueue != "" {
 			apiQueueNames = append(apiQueueNames, workQueue)
@@ -237,6 +239,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		orgID := deviceConfig.OrgID
 		if orgID != "" {
 			shellQueue := shellQueueName(orgID)
+			if len(apiQueueNames) == 0 {
+				apiQueueNames = []string{"jobs:v1:cpu-general"}
+			}
 			apiQueueNames = append(apiQueueNames, shellQueue)
 			Debug("shell queue: %s", shellQueue)
 		}
