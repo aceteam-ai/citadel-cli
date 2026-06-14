@@ -190,9 +190,6 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
-		// NOTE: API mode currently uses a single queue. Capability-based multi-queue
-		// routing requires extending APISource (tracked separately). Capabilities are
-		// still published in the heartbeat so the control plane can route upstream.
 		Debug("using API mode (device_api_token found)")
 		useAPIMode = true
 
@@ -232,10 +229,22 @@ func runWork(cmd *cobra.Command, args []string) {
 			_ = tempClient.Close()
 		}
 
+		// Build queue list: primary queue + per-org shell queue
+		var apiQueueNames []string
+		if workQueue != "" {
+			apiQueueNames = append(apiQueueNames, workQueue)
+		}
+		orgID := deviceConfig.OrgID
+		if orgID != "" {
+			shellQueue := shellQueueName(orgID)
+			apiQueueNames = append(apiQueueNames, shellQueue)
+			Debug("shell queue: %s", shellQueue)
+		}
+
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
 			BaseURL:       apiBaseURL,
 			Token:         deviceConfig.DeviceAPIToken,
-			QueueName:     workQueue,
+			QueueNames:    apiQueueNames,
 			ConsumerGroup: workGroup,
 			BlockMs:       workPollMs,
 			MaxAttempts:   workMaxRetries,
@@ -314,6 +323,23 @@ func runWork(cmd *cobra.Command, args []string) {
 				baseQueue := "jobs:v1:gpu-general"
 				queueNames = capabilities.ResolveQueues(allCaps, baseQueue)
 			}
+		}
+
+		// Add per-org shell queue if org_id is known.
+		// Ensure the default base queue is present when no explicit queue
+		// or capabilities were resolved (otherwise shell-only list would
+		// suppress the default fallback inside NewRedisSource).
+		orgID := ""
+		if deviceConfig != nil {
+			orgID = deviceConfig.OrgID
+		}
+		if orgID != "" {
+			shellQ := shellQueueName(orgID)
+			if len(queueNames) == 0 {
+				queueNames = []string{"jobs:v1:gpu-general"}
+			}
+			queueNames = append(queueNames, shellQ)
+			Debug("shell queue: %s", shellQ)
 		}
 
 		// Create Redis job source
@@ -836,6 +862,13 @@ func autoStartServices() error {
 
 	fmt.Println("--- Services started ---")
 	return nil
+}
+
+// shellQueueName returns the per-org shell command queue name.
+// Jobs dispatched by platform MCP tools (terminal_exec, code_read, etc.)
+// are enqueued to this queue using the pattern jobs:v1:shell:org_{org_id}.
+func shellQueueName(orgID string) string {
+	return fmt.Sprintf("jobs:v1:shell:org_%s", orgID)
 }
 
 // getRedisURLFromConfig reads Redis URL from global config file.

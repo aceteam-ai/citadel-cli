@@ -39,6 +39,7 @@ func parseStreamMessage(msg StreamMessage) (*Job, error) {
 	job := &Job{
 		MessageID: msg.ID,
 		JobID:     msg.Data.JobID,
+		Type:      msg.Data.Type, // Top-level stream field (e.g., SHELL_COMMAND)
 		RawData:   make(map[string]any),
 	}
 
@@ -58,9 +59,11 @@ func parseStreamMessage(msg StreamMessage) (*Job, error) {
 		}
 		job.Payload = payload
 
-		// Extract type from payload if present
-		if jobType, ok := payload["type"].(string); ok {
-			job.Type = jobType
+		// Fall back to type from payload if not at top level
+		if job.Type == "" {
+			if jobType, ok := payload["type"].(string); ok {
+				job.Type = jobType
+			}
 		}
 	}
 
