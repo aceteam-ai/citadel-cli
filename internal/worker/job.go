@@ -114,4 +114,6 @@ const (
 	JobTypeServiceStart      = "SERVICE_START"       // Start a service on the node
 	JobTypeServiceStop       = "SERVICE_STOP"        // Stop a service on the node
 	JobTypeServiceStatus     = "SERVICE_STATUS"      // Check if a service is running
+	JobTypeSandboxSuspend    = "SANDBOX_SUSPEND"     // Pause a Docker container (sandbox suspend)
+	JobTypeSandboxResume     = "SANDBOX_RESUME"      // Unpause a Docker container (sandbox resume)
 )

@@ -61,5 +61,7 @@ func init() {
 		"LLAMACPP_INFERENCE": &jobs.LlamaCppInferenceHandler{},
 		"VLLM_INFERENCE":     &jobs.VLLMInferenceHandler{},
 		"OLLAMA_INFERENCE":   &jobs.OllamaInferenceHandler{},
+		"SANDBOX_SUSPEND":    &jobs.SandboxSuspendHandler{},
+		"SANDBOX_RESUME":     &jobs.SandboxResumeHandler{},
 	}
 }
