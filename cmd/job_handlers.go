@@ -63,5 +63,7 @@ func init() {
 		"OLLAMA_INFERENCE":   &jobs.OllamaInferenceHandler{},
 		"SANDBOX_SUSPEND":    &jobs.SandboxSuspendHandler{},
 		"SANDBOX_RESUME":     &jobs.SandboxResumeHandler{},
+		"MODEL_CACHE_PULL":   &jobs.ModelCachePullHandler{},
+		"MODEL_CACHE_EVICT":  &jobs.ModelCacheEvictHandler{},
 	}
 }

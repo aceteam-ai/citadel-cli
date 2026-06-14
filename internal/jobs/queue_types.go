@@ -18,6 +18,10 @@ const (
 	JobTypeFileEdit   = "FILE_EDIT"
 	JobTypeFileList   = "FILE_LIST"
 	JobTypeFileSearch = "FILE_SEARCH"
+
+	// Model cache management job types
+	JobTypeModelCachePull  = "MODEL_CACHE_PULL"
+	JobTypeModelCacheEvict = "MODEL_CACHE_EVICT"
 )
 
 // Queue names following PR #1105 convention

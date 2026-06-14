@@ -116,4 +116,6 @@ const (
 	JobTypeServiceStatus     = "SERVICE_STATUS"      // Check if a service is running
 	JobTypeSandboxSuspend    = "SANDBOX_SUSPEND"     // Pause a Docker container (sandbox suspend)
 	JobTypeSandboxResume     = "SANDBOX_RESUME"      // Unpause a Docker container (sandbox resume)
+	JobTypeModelCachePull    = "MODEL_CACHE_PULL"    // Pull model weights into local cache
+	JobTypeModelCacheEvict   = "MODEL_CACHE_EVICT"   // Evict model weights from local cache
 )
