@@ -9,9 +9,12 @@ import (
 
 // APISource implements JobSource using the AceTeam Redis API proxy.
 // This is the secure alternative to direct Redis connections.
+// Supports consuming from multiple queues by round-robining across them.
 type APISource struct {
-	client *redisapi.Client
-	config APISourceConfig
+	client     *redisapi.Client
+	config     APISourceConfig
+	queueNames []string // resolved list of queues to consume from
+	queueIndex int      // round-robin index for multi-queue polling
 }
 
 // APISourceConfig holds configuration for APISource.
@@ -22,8 +25,12 @@ type APISourceConfig struct {
 	// Token is the device_api_token from device authentication
 	Token string
 
-	// QueueName is the Redis Stream to consume from
+	// QueueName is the Redis Stream to consume from (single queue, backwards compat)
 	QueueName string
+
+	// QueueNames is the list of Redis Streams to consume from (multi-queue mode).
+	// If set, QueueName is ignored.
+	QueueNames []string
 
 	// ConsumerGroup is the consumer group name (default: "citadel-workers")
 	ConsumerGroup string
@@ -43,9 +50,6 @@ type APISourceConfig struct {
 
 // NewAPISource creates a new API-backed job source.
 func NewAPISource(cfg APISourceConfig) *APISource {
-	if cfg.QueueName == "" {
-		cfg.QueueName = "jobs:v1:cpu-general"
-	}
 	if cfg.ConsumerGroup == "" {
 		cfg.ConsumerGroup = "citadel-workers"
 	}
@@ -56,8 +60,19 @@ func NewAPISource(cfg APISourceConfig) *APISource {
 		cfg.MaxAttempts = 3
 	}
 
+	// Resolve queue names: prefer QueueNames, fall back to QueueName
+	var queues []string
+	if len(cfg.QueueNames) > 0 {
+		queues = cfg.QueueNames
+	} else if cfg.QueueName != "" {
+		queues = []string{cfg.QueueName}
+	} else {
+		queues = []string{"jobs:v1:cpu-general"}
+	}
+
 	return &APISource{
-		config: cfg,
+		config:     cfg,
+		queueNames: queues,
 	}
 }
 
@@ -96,15 +111,32 @@ func (s *APISource) Connect(ctx context.Context) error {
 
 	s.log("info", "   - API: %s", s.config.BaseURL)
 	s.log("info", "   - Worker ID: %s", s.client.WorkerID())
-	s.log("info", "   - Queue: %s", s.config.QueueName)
+	if len(s.queueNames) == 1 {
+		s.log("info", "   - Queue: %s", s.queueNames[0])
+	} else {
+		s.log("info", "   - Queues (%d):", len(s.queueNames))
+		for _, q := range s.queueNames {
+			s.log("info", "     - %s", q)
+		}
+	}
 	s.log("info", "   - Consumer group: %s", s.config.ConsumerGroup)
 	return nil
 }
 
 // Next blocks until a job is available or context is cancelled.
+// When consuming from multiple queues, polls each queue in round-robin
+// with a short block timeout to avoid starving any queue.
 func (s *APISource) Next(ctx context.Context) (*Job, error) {
+	if len(s.queueNames) == 1 {
+		return s.nextSingle(ctx)
+	}
+	return s.nextMulti(ctx)
+}
+
+// nextSingle reads from a single queue (original behavior).
+func (s *APISource) nextSingle(ctx context.Context) (*Job, error) {
 	apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
-		Queue:    s.config.QueueName,
+		Queue:    s.queueNames[0],
 		Group:    s.config.ConsumerGroup,
 		Consumer: s.client.WorkerID(),
 		Count:    1,
@@ -115,11 +147,53 @@ func (s *APISource) Next(ctx context.Context) (*Job, error) {
 	}
 
 	if apiJob == nil {
-		return nil, nil // No job available
+		return nil, nil
 	}
 
-	// Convert to worker.Job
-	return s.convertJob(apiJob), nil
+	job := s.convertJob(apiJob)
+	job.SourceQueue = s.queueNames[0]
+	return job, nil
+}
+
+// nextMulti round-robins across queues with a shorter block timeout.
+// Each poll checks one queue; if empty, advances to the next.
+func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
+	// Use a shorter block per queue so we cycle through them all within
+	// roughly the configured block timeout.
+	perQueueBlockMs := s.config.BlockMs / len(s.queueNames)
+	if perQueueBlockMs < 500 {
+		perQueueBlockMs = 500
+	}
+
+	for i := 0; i < len(s.queueNames); i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		queue := s.queueNames[s.queueIndex]
+		s.queueIndex = (s.queueIndex + 1) % len(s.queueNames)
+
+		apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
+			Queue:    queue,
+			Group:    s.config.ConsumerGroup,
+			Consumer: s.client.WorkerID(),
+			Count:    1,
+			BlockMs:  perQueueBlockMs,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to consume job from API (%s): %w", queue, err)
+		}
+
+		if apiJob != nil {
+			job := s.convertJob(apiJob)
+			job.SourceQueue = queue
+			return job, nil
+		}
+	}
+
+	return nil, nil // No job available on any queue
 }
 
 // convertJob converts an API job to a worker.Job.
@@ -148,8 +222,12 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 // Ack acknowledges successful job completion.
 func (s *APISource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
+	queue := job.SourceQueue
+	if queue == "" {
+		queue = s.queueNames[0]
+	}
 	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
-		Queue:     s.config.QueueName,
+		Queue:     queue,
 		Group:     s.config.ConsumerGroup,
 		MessageID: job.MessageID,
 	})
@@ -176,6 +254,11 @@ func (s *APISource) Close() error {
 // Client returns the underlying API client for stream writing.
 func (s *APISource) Client() *redisapi.Client {
 	return s.client
+}
+
+// QueueNames returns the list of queues being consumed.
+func (s *APISource) QueueNames() []string {
+	return s.queueNames
 }
 
 // IsJobCancelled checks whether a job has been cancelled by the producer.

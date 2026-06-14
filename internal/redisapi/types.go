@@ -30,6 +30,7 @@ type StreamMessage struct {
 // StreamMessageData contains the job data within a stream message
 type StreamMessageData struct {
 	JobID      string `json:"jobId"`
+	Type       string `json:"type"`    // Job type (e.g., "SHELL_COMMAND"), top-level stream field
 	Payload    string `json:"payload"` // JSON-encoded job payload
 	EnqueuedAt string `json:"enqueuedAt"`
 	RayID      string `json:"rayId"`
@@ -148,7 +149,8 @@ type NodeMeta struct {
 // This endpoint returns the queue and org information needed by the worker
 // without exposing direct Redis credentials.
 type WorkerConfigResponse struct {
-	Queue         string `json:"queue"`
-	ConsumerGroup string `json:"consumer_group,omitempty"`
-	OrgID         string `json:"org_id,omitempty"`
+	Queue         string   `json:"queue"`
+	QueueNames    []string `json:"queue_names,omitempty"`
+	ConsumerGroup string   `json:"consumer_group,omitempty"`
+	OrgID         string   `json:"org_id,omitempty"`
 }

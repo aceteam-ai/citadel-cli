@@ -1,0 +1,24 @@
+[Unit]
+Description=Citadel Worker - AceTeam Sovereign Compute
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/citadel work
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/root
+WorkingDirectory=/root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=citadel-worker
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=65535
+
+[Install]
+WantedBy=multi-user.target
