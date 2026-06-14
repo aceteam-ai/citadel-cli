@@ -114,4 +114,6 @@ const (
 	JobTypeServiceStart      = "SERVICE_START"       // Start a service on the node
 	JobTypeServiceStop       = "SERVICE_STOP"        // Stop a service on the node
 	JobTypeServiceStatus     = "SERVICE_STATUS"      // Check if a service is running
+	JobTypeModelCachePull    = "MODEL_CACHE_PULL"    // Pull model weights into local cache
+	JobTypeModelCacheEvict   = "MODEL_CACHE_EVICT"   // Evict model weights from local cache
 )

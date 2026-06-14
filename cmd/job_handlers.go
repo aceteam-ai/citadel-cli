@@ -61,5 +61,7 @@ func init() {
 		"LLAMACPP_INFERENCE": &jobs.LlamaCppInferenceHandler{},
 		"VLLM_INFERENCE":     &jobs.VLLMInferenceHandler{},
 		"OLLAMA_INFERENCE":   &jobs.OllamaInferenceHandler{},
+		"MODEL_CACHE_PULL":   &jobs.ModelCachePullHandler{},
+		"MODEL_CACHE_EVICT":  &jobs.ModelCacheEvictHandler{},
 	}
 }
