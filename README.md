@@ -21,6 +21,18 @@ This single command:
 
 Get an authkey from [aceteam.ai/fabric](https://aceteam.ai/fabric). The script is idempotent and safe to run multiple times.
 
+## AI Tool Integration (MCP)
+
+Connect your GPU infrastructure to Claude Code, Cursor, or any MCP-compatible AI tool:
+
+```bash
+# One-time setup
+citadel init
+claude mcp add aceteam -- citadel mcp
+```
+
+Your AI agent can then manage nodes, deploy models, run inference, execute commands, and search documents on your own hardware. See [docs/mcp-server.md](docs/mcp-server.md) for the full tool reference (60+ tools).
+
 ## Documentation
 
 Full documentation is available at **[aceteam-ai.github.io/citadel-cli](https://aceteam-ai.github.io/citadel-cli/)** -- including architecture guides, tutorials, command reference, and development docs.
