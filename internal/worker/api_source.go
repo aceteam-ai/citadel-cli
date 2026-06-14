@@ -157,6 +157,9 @@ func (s *APISource) nextSingle(ctx context.Context) (*Job, error) {
 
 // nextMulti round-robins across queues with a shorter block timeout.
 // Each poll checks one queue; if empty, advances to the next.
+// Individual queue failures (e.g., rejected by server validation) are
+// logged and skipped rather than failing the entire poll cycle. Only
+// when all queues error does the caller see an error (triggering backoff).
 func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 	// Use a shorter block per queue so we cycle through them all within
 	// roughly the configured block timeout.
@@ -164,6 +167,9 @@ func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 	if perQueueBlockMs < 500 {
 		perQueueBlockMs = 500
 	}
+
+	var lastErr error
+	errCount := 0
 
 	for i := 0; i < len(s.queueNames); i++ {
 		select {
@@ -183,7 +189,11 @@ func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 			BlockMs:  perQueueBlockMs,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to consume job from API (%s): %w", queue, err)
+			// Log and skip -- one rejected queue must not block the others.
+			s.log("warning", "consume failed on %s: %v", queue, err)
+			lastErr = err
+			errCount++
+			continue
 		}
 
 		if apiJob != nil {
@@ -191,6 +201,11 @@ func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 			job.SourceQueue = queue
 			return job, nil
 		}
+	}
+
+	// Only propagate error (triggering backoff) if ALL queues failed.
+	if errCount == len(s.queueNames) {
+		return nil, fmt.Errorf("all queues failed: %w", lastErr)
 	}
 
 	return nil, nil // No job available on any queue

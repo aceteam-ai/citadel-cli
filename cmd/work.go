@@ -325,13 +325,19 @@ func runWork(cmd *cobra.Command, args []string) {
 			}
 		}
 
-		// Add per-org shell queue if org_id is known
+		// Add per-org shell queue if org_id is known.
+		// Ensure the default base queue is present when no explicit queue
+		// or capabilities were resolved (otherwise shell-only list would
+		// suppress the default fallback inside NewRedisSource).
 		orgID := ""
 		if deviceConfig != nil {
 			orgID = deviceConfig.OrgID
 		}
 		if orgID != "" {
 			shellQ := shellQueueName(orgID)
+			if len(queueNames) == 0 {
+				queueNames = []string{"jobs:v1:gpu-general"}
+			}
 			queueNames = append(queueNames, shellQ)
 			Debug("shell queue: %s", shellQ)
 		}
