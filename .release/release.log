@@ -1,0 +1,13 @@
+[2026-06-13T19:58:21-04:00] === Release started: bump=minor dry_run=true ===
+[2026-06-13T19:58:27-04:00] === Release started: bump=minor dry_run=true ===
+[2026-06-13T19:58:35-04:00] === Release started: bump=minor dry_run=true ===
+[2026-06-13T19:59:29-04:00] === Release started: bump=minor dry_run=true ===
+[2026-06-13T19:59:29-04:00] Validated: 2.11.0 -> 2.12.0
+[2026-06-13T20:13:52-04:00] === Release started: bump=minor dry_run=true ===
+[2026-06-13T20:13:52-04:00] Validated: 2.11.0 -> 2.12.0
+[2026-06-13T20:14:12-04:00] === Release started: bump=minor dry_run=false ===
+[2026-06-13T20:14:12-04:00] Pulling latest from origin...
+[2026-06-13T20:14:13-04:00] Validated: 2.11.0 -> 2.12.0
+[2026-06-13T20:14:13-04:00] Version bumped to 2.12.0
+[2026-06-13T20:14:13-04:00] Running tests...
+[2026-06-13T20:14:13-04:00] Tests passed

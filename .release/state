@@ -1,0 +1,8 @@
+current_version=2.11.0
+target_version=2.12.0
+bump_type=minor
+step_validate=done
+last_step=test
+last_step_time=2026-06-13T20:14:13-04:00
+step_bump=done
+step_test=done
