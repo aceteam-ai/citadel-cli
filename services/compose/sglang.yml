@@ -1,0 +1,24 @@
+# services/compose/sglang.yml
+
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    container_name: citadel-sglang
+    ports:
+      - "30000:30000"
+    volumes:
+      # Mount a user-accessible directory to cache Hugging Face models
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    # Use an environment variable for the command.
+    # The part after the colon is the default if the variable isn't set.
+    # Users MUST set SGLANG_MODEL to their desired model path.
+    command: ${SGLANG_COMMAND:-python3 -m sglang.launch_server --host 0.0.0.0 --port 30000}
+    ipc: host
+    shm_size: "32g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

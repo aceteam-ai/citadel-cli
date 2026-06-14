@@ -23,7 +23,7 @@ type Service struct {
 // If not declared, capabilities are auto-detected at startup.
 type ManifestCapabilities struct {
 	GPUs    []ManifestGPU `yaml:"gpus,omitempty"`
-	Engines []string      `yaml:"engines,omitempty"` // inference engines: vllm, ollama, llamacpp
+	Engines []string      `yaml:"engines,omitempty"` // inference engines: vllm, sglang, ollama, llamacpp
 }
 
 // ManifestGPU describes a GPU declared in the manifest.

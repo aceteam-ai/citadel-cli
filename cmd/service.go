@@ -33,6 +33,7 @@ func prepareCacheDirectories() error {
 		filepath.Join(cacheBase, "vllm"),
 		filepath.Join(cacheBase, "llamacpp"),
 		filepath.Join(cacheBase, "lmstudio"),
+		filepath.Join(cacheBase, "sglang"),
 		filepath.Join(cacheBase, "huggingface"),
 	}
 
@@ -176,6 +177,8 @@ func macServiceWarning(serviceName string) string {
 		return "LM Studio Docker image is Linux-only. Install the native macOS app from https://lmstudio.ai"
 	case "vllm":
 		return "vLLM requires NVIDIA GPU (Linux only). Consider using Ollama on macOS."
+	case "sglang":
+		return "SGLang requires NVIDIA GPU (Linux only). Consider using Ollama on macOS."
 	case "llamacpp":
 		return "llama.cpp Docker may have limited performance on macOS. Consider native installation."
 	default:
