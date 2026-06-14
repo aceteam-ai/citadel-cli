@@ -171,6 +171,62 @@ show_status() {
   return 0
 }
 
+# ── Release journal ────────────────────────────────────────────────────────
+
+append_release_journal() {
+  local version=$1
+  local tag_prefix="${RELEASE_TAG_PREFIX:-v}"
+  local date=$(date +%Y-%m-%d)
+  local latest_tag
+  latest_tag=$(git tag --list "${tag_prefix}*" --sort=-version:refname 2>/dev/null | head -1)
+
+  local journal_file="RELEASES.md"
+
+  if [[ ! -f "$journal_file" ]]; then
+    cat > "$journal_file" << HEADER
+# Release Journal — ${RELEASE_PROJECT_NAME:-unknown}
+
+Auto-generated log of every release.
+
+HEADER
+  fi
+
+  local commit_count=0
+  local lines_added=0
+  local files_changed=0
+  local commit_list=""
+
+  if [[ -n "$latest_tag" ]]; then
+    commit_count=$(git log "${latest_tag}..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' ')
+    local diffstat
+    diffstat=$(git diff --shortstat "$latest_tag"..HEAD 2>/dev/null || echo "")
+    files_changed=$(echo "$diffstat" | grep -o '[0-9]* file' | grep -o '[0-9]*' || echo 0)
+    lines_added=$(echo "$diffstat" | grep -o '[0-9]* insertion' | grep -o '[0-9]*' || echo 0)
+
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && commit_list="${commit_list}\n  - ${line}"
+    done < <(git log "${latest_tag}..HEAD" --oneline --format="%s" 2>/dev/null)
+  fi
+
+  local entry=""
+  entry+="---\n\n"
+  entry+="## ${tag_prefix}${version} — ${date}\n\n"
+  entry+="| Metric | Value |\n"
+  entry+="|--------|-------|\n"
+  entry+="| Commits | ${commit_count} |\n"
+  entry+="| Files changed | ${files_changed} |\n"
+  entry+="| Lines added | +${lines_added} |\n"
+
+  if [[ -n "$commit_list" ]]; then
+    entry+="\n**Changes:**\n${commit_list}\n"
+  fi
+
+  entry+="\n"
+
+  echo -e "$entry" >> "$journal_file"
+  log "Appended ${tag_prefix}${version} to $journal_file"
+}
+
 # ── Default hooks (overridden by release.config.sh) ────────────────────────
 
 hook_test()         { true; }
@@ -266,6 +322,13 @@ run_release() {
     fi
   else
     ok "Tests already passed."
+  fi
+
+  # ── Step 3b: Release journal ──────────────────────────────────────────
+  if ! step_done "journal"; then
+    step_msg "Updating release journal..."
+    append_release_journal "$new_version"
+    mark_step "journal"
   fi
 
   # ── Step 4: Commit ────────────────────────────────────────────────────

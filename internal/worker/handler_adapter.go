@@ -129,6 +129,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
+		NewLegacyHandlerAdapter(JobTypeSandboxSuspend, &jobs.SandboxSuspendHandler{}),
+		NewLegacyHandlerAdapter(JobTypeSandboxResume, &jobs.SandboxResumeHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCachePull, &jobs.ModelCachePullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCacheEvict, &jobs.ModelCacheEvictHandler{}),
 	}

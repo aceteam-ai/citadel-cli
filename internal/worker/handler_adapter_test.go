@@ -156,6 +156,8 @@ func TestCreateLegacyHandlers(t *testing.T) {
 		JobTypeLlamaCppInference,
 		JobTypeVLLMInference,
 		JobTypeOllamaInference,
+		JobTypeSandboxSuspend,
+		JobTypeSandboxResume,
 	}
 
 	for _, jobType := range expectedTypes {
