@@ -202,6 +202,7 @@ func matchEngines(names []string) []string {
 		}
 		rules := []rule{
 			{"vllm", "vllm"},
+			{"sglang", "sglang"},
 			{"ollama", "ollama"},
 			{"llamacpp", "llamacpp"},
 			{"lmstudio", "lmstudio"},

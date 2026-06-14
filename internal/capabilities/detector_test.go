@@ -249,9 +249,15 @@ func TestMatchEngines(t *testing.T) {
 			notWant:    nil,
 		},
 		{
+			name:       "sglang container detected",
+			containers: []string{"citadel-sglang"},
+			want:       []string{"sglang"},
+			notWant:    []string{"vllm", "ollama", "llamacpp"},
+		},
+		{
 			name:       "multiple engines detected independently",
-			containers: []string{"citadel-vllm", "citadel-ollama"},
-			want:       []string{"vllm", "ollama"},
+			containers: []string{"citadel-vllm", "citadel-ollama", "citadel-sglang"},
+			want:       []string{"vllm", "ollama", "sglang"},
 			notWant:    []string{"llamacpp"},
 		},
 		{

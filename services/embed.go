@@ -18,6 +18,9 @@ var LlamacppCompose string
 //go:embed compose/lmstudio.yml
 var LMStudioCompose string
 
+//go:embed compose/sglang.yml
+var SGLangCompose string
+
 //go:embed compose/extraction.yml
 var ExtractionCompose string
 
@@ -27,6 +30,7 @@ var ServiceMap = map[string]string{
 	"vllm":       VLLMCompose,
 	"llamacpp":   LlamacppCompose,
 	"lmstudio":   LMStudioCompose,
+	"sglang":     SGLangCompose,
 	"extraction": ExtractionCompose,
 }
 

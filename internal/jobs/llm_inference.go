@@ -38,6 +38,8 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, client *redisclient.C
 	switch payload.Backend {
 	case "vllm":
 		return h.executeVLLM(ctx, client, job.JobID, rayID, payload)
+	case "sglang":
+		return h.executeSGLang(ctx, client, job.JobID, rayID, payload)
 	case "ollama":
 		return h.executeOllama(ctx, client, job.JobID, rayID, payload)
 	case "llamacpp":
@@ -256,6 +258,85 @@ func (h *LLMInferenceHandler) waitForVLLMReady(ctx context.Context) error {
 		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("vLLM did not become ready within %v", maxWait)
+}
+
+// executeSGLang handles inference via SGLang's OpenAI-compatible API.
+// SGLang runs on port 30000 and exposes the same /v1/completions endpoint as vLLM.
+func (h *LLMInferenceHandler) executeSGLang(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
+	// Wait for SGLang to be ready
+	if err := h.waitForSGLangReady(ctx); err != nil {
+		return err
+	}
+
+	sglangURL := "http://localhost:30000/v1/completions"
+
+	reqPayload := map[string]any{
+		"model":       payload.Model,
+		"prompt":      payload.Prompt,
+		"max_tokens":  payload.MaxTokens,
+		"temperature": payload.Temperature,
+		"stream":      payload.Stream,
+	}
+
+	if payload.MaxTokens == 0 {
+		reqPayload["max_tokens"] = 512
+	}
+	if len(payload.Stop) > 0 {
+		reqPayload["stop"] = payload.Stop
+	}
+
+	reqBody, _ := json.Marshal(reqPayload)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", sglangURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to SGLang: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("SGLang returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// SGLang uses the same OpenAI-compatible response format as vLLM
+	if payload.Stream {
+		return h.handleVLLMStream(ctx, client, jobID, rayID, resp.Body)
+	}
+
+	return h.handleVLLMNonStream(ctx, client, jobID, rayID, resp.Body)
+}
+
+func (h *LLMInferenceHandler) waitForSGLangReady(ctx context.Context) error {
+	healthURL := "http://localhost:30000/health"
+	maxWait := 60 * time.Second
+	pollInterval := 1 * time.Second
+	startTime := time.Now()
+
+	for time.Since(startTime) < maxWait {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(pollInterval)
+	}
+	return fmt.Errorf("SGLang did not become ready within %v", maxWait)
 }
 
 // executeOllama handles inference via Ollama's API.
