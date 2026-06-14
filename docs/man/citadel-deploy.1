@@ -1,0 +1,93 @@
+.nh
+.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-deploy - Deploy a Docker container to a Citadel node
+
+
+.SH SYNOPSIS
+\fBcitadel deploy [image] [flags]\fP
+
+
+.SH DESCRIPTION
+Pull a Docker image and run it as a managed container on this node or a remote node.
+
+.PP
+Local mode (default):
+  1. Pulls the specified Docker image.
+  2. Stops and removes any existing container with the same name.
+  3. Starts a new container with the configured ports, env vars, and restart policy.
+
+.PP
+Remote mode (--node):
+  Dispatches the deploy request to a remote node via the AceTeam API.
+
+
+.SH OPTIONS
+\fB-e\fP, \fB--env\fP=[]
+	Environment variables (e.g. "KEY=value")
+
+.PP
+\fB--gpu\fP[=false]
+	Enable GPU access (--runtime=nvidia --gpus all)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for deploy
+
+.PP
+\fB--name\fP=""
+	Container name (default: derived from image)
+
+.PP
+\fB--node\fP=""
+	Deploy to a remote node (node ID or hostname)
+
+.PP
+\fB-p\fP, \fB--port\fP=[]
+	Port mappings (e.g. "8080:80")
+
+.PP
+\fB--restart\fP="unless-stopped"
+	Restart policy (no, always, unless-stopped, on-failure)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--auth-service\fP="https://aceteam.ai"
+	The URL of the authentication service
+
+.PP
+\fB--config\fP=""
+	config file (default is $HOME/.citadel-cli.yaml)
+
+.PP
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--nexus\fP="https://nexus.aceteam.ai"
+	The URL of the AceTeam Nexus server
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Deploy nginx locally
+  citadel deploy nginx:latest --port 8080:80
+
+  # Deploy with GPU access and environment variables
+  citadel deploy ghcr.io/my-org/my-model:v1 --gpu --env MODEL=llama3 --port 8000:8000
+
+  # Deploy with a custom container name
+  citadel deploy ollama/ollama --name my-ollama --port 11434:11434
+
+  # Deploy to a remote node
+  citadel deploy nginx:latest --node my-gpu-server --port 8080:80
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP
