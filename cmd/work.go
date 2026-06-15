@@ -60,6 +60,7 @@ var (
 
 	// Terminal server flags
 	workTerminal      bool
+	workNoTerminal    bool
 	workTerminalHost  string
 	workTerminalPort  int
 	workTerminalDebug bool
@@ -82,6 +83,7 @@ var (
 
 	// Gateway flags
 	workGateway        bool
+	workNoGateway      bool
 	workGatewayPort    int
 	workGatewayBind    string
 	workGatewayVNC     int
@@ -99,18 +101,23 @@ This is the primary command for running a Citadel node. It:
   2. Connects to the AceTeam API and consumes jobs via secure proxy
   3. Reports status via pub/sub (enabled by default)
   4. Subscribes to real-time config updates
+  5. Starts HTTPS gateway on port 8443 (use --no-gateway to skip)
+  6. Starts terminal server on port 7860 (use --no-terminal to skip)
 
 Run 'citadel init' first to authenticate and configure the node.
 
 Examples:
-  # Run after citadel init (recommended)
+  # Run after citadel init (recommended — gateway + terminal enabled)
   citadel work
 
-  # Run with HTTPS gateway (exposes all services on one port)
-  citadel work --gateway
+  # Disable the HTTPS gateway
+  citadel work --no-gateway
 
-  # Gateway with terminal access
-  citadel work --gateway --terminal
+  # Disable terminal access
+  citadel work --no-terminal
+
+  # Worker only (no gateway, no terminal)
+  citadel work --no-gateway --no-terminal
 
   # Disable status publishing
   citadel work --redis-status=false
@@ -123,6 +130,14 @@ Examples:
 func runWork(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Apply --no-gateway / --no-terminal overrides (take precedence over defaults)
+	if workNoGateway {
+		workGateway = false
+	}
+	if workNoTerminal {
+		workTerminal = false
+	}
 
 	// Setup signal handling
 	sigs := make(chan os.Signal, 1)
@@ -1373,7 +1388,8 @@ func init() {
 	workCmd.Flags().StringVar(&workStatusChannel, "status-channel", "", "Override Redis pub/sub channel for status (default: node:status:{node-name})")
 
 	// Terminal server flags
-	workCmd.Flags().BoolVar(&workTerminal, "terminal", false, "Enable terminal WebSocket server for remote access")
+	workCmd.Flags().BoolVar(&workTerminal, "terminal", true, "Enable terminal WebSocket server (enabled by default; use --no-terminal to disable)")
+	workCmd.Flags().BoolVar(&workNoTerminal, "no-terminal", false, "Disable the terminal WebSocket server")
 	workCmd.Flags().StringVar(&workTerminalHost, "terminal-host", "", "Terminal server bind address (default: 0.0.0.0)")
 	workCmd.Flags().IntVar(&workTerminalPort, "terminal-port", 7860, "Terminal server port (default: 7860)")
 	workCmd.Flags().BoolVar(&workTerminalDebug, "terminal-debug", false, "Enable verbose debug logging for terminal server")
@@ -1396,7 +1412,8 @@ func init() {
 	workCmd.Flags().StringVar(&workWorkspaceDir, "workspace", "", "Workspace directory for file-operation jobs (or set CITADEL_WORKSPACE env)")
 
 	// Gateway flags
-	workCmd.Flags().BoolVar(&workGateway, "gateway", false, "Start the HTTPS gateway in-process (replaces 'citadel serve')")
+	workCmd.Flags().BoolVar(&workGateway, "gateway", true, "Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)")
+	workCmd.Flags().BoolVar(&workNoGateway, "no-gateway", false, "Disable the HTTPS gateway")
 	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
 	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
 	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
