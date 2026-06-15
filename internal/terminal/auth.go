@@ -217,7 +217,7 @@ type TokenHashEntry struct {
 
 // fetchAndCacheTokens fetches token hashes from the API and updates the cache
 func (v *CachingTokenValidator) fetchAndCacheTokens() error {
-	url := fmt.Sprintf("%s/api/fabric/terminal/tokens/%s", v.baseURL, v.orgID)
+	url := fmt.Sprintf("%s/api/fabric/terminal/tokens/%s/hashes", v.baseURL, v.orgID)
 
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
