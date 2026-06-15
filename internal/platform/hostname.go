@@ -9,6 +9,9 @@ import (
 	"strings"
 )
 
+// machineIDPath is the path to the machine-id file. Overridable in tests.
+var machineIDPath = "/etc/machine-id"
+
 // GenerateCitadelHostname generates a hostname like "citadel-<short_id>" for use
 // during node initialization. The short_id is derived from /etc/machine-id (first
 // 8 characters) when available, or a random 8-character hex string as fallback.
@@ -26,17 +29,17 @@ func GenerateCitadelHostname() (string, error) {
 	return "citadel-" + shortID, nil
 }
 
-// getShortMachineID reads /etc/machine-id and returns its first 8 characters.
+// getShortMachineID reads the machine-id file and returns its first 8 characters.
 // Returns an error if the file is missing, empty, or shorter than 8 characters.
 func getShortMachineID() (string, error) {
-	data, err := os.ReadFile("/etc/machine-id")
+	data, err := os.ReadFile(machineIDPath)
 	if err != nil {
-		return "", fmt.Errorf("could not read /etc/machine-id: %w", err)
+		return "", fmt.Errorf("could not read %s: %w", machineIDPath, err)
 	}
 
 	id := strings.TrimSpace(string(data))
 	if len(id) < 8 {
-		return "", fmt.Errorf("/etc/machine-id too short: %q", id)
+		return "", fmt.Errorf("%s too short: %q", machineIDPath, id)
 	}
 
 	return id[:8], nil

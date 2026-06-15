@@ -547,16 +547,6 @@ func getSelectedService() (string, error) {
 	return strings.Fields(selection)[0], nil
 }
 
-// genericHostnames are OS default hostnames that provide no useful identity.
-// When the OS hostname matches one of these, we generate a citadel-<id> name instead.
-var genericHostnames = map[string]bool{
-	"debian":    true,
-	"ubuntu":    true,
-	"localhost": true,
-	"linux":     true,
-	"host":      true,
-}
-
 func getNodeName() (string, error) {
 	// 1. Explicit --node-name flag always wins
 	if initNodeName != "" {
@@ -569,14 +559,9 @@ func getNodeName() (string, error) {
 		return saved, nil
 	}
 
-	// 3. Use OS hostname if it's meaningful (not a generic live-ISO default)
-	hostname, err := os.Hostname()
-	if err == nil && hostname != "" && !genericHostnames[strings.ToLower(hostname)] {
-		return hostname, nil
-	}
-
-	// 4. Generate a citadel-<short_id> hostname
-	Debug("OS hostname %q is generic or unavailable, generating citadel hostname", hostname)
+	// 3. Always generate a citadel-<short_id> hostname instead of inheriting
+	//    the OS hostname, which is often useless on live ISOs (e.g., "debian").
+	//    Users who want a custom name can use --node-name.
 	generated, err := platform.GenerateCitadelHostname()
 	if err != nil {
 		return "", fmt.Errorf("could not generate hostname: %w", err)

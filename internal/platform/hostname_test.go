@@ -69,17 +69,81 @@ func TestGetShortMachineID(t *testing.T) {
 }
 
 func TestGetShortMachineIDTooShort(t *testing.T) {
-	// Create a temp file with content shorter than 8 chars
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "machine-id")
 	if err := os.WriteFile(tmpFile, []byte("abc\n"), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
 	}
 
-	// We can't easily test getShortMachineID with a custom path since it
-	// reads /etc/machine-id directly. This test documents the expected
-	// behavior: strings shorter than 8 chars should cause an error.
-	t.Log("getShortMachineID returns error for machine-id shorter than 8 chars")
+	// Override the machine-id path to test the too-short branch
+	old := machineIDPath
+	machineIDPath = tmpFile
+	defer func() { machineIDPath = old }()
+
+	_, err := getShortMachineID()
+	if err == nil {
+		t.Error("expected error for machine-id shorter than 8 chars, got nil")
+	}
+}
+
+func TestGetShortMachineIDMissing(t *testing.T) {
+	// Override to a non-existent path
+	old := machineIDPath
+	machineIDPath = "/tmp/does-not-exist-citadel-test"
+	defer func() { machineIDPath = old }()
+
+	_, err := getShortMachineID()
+	if err == nil {
+		t.Error("expected error for missing machine-id file, got nil")
+	}
+}
+
+func TestGenerateCitadelHostnameFallbackToRandom(t *testing.T) {
+	// Point machine-id to a non-existent file to force random fallback
+	old := machineIDPath
+	machineIDPath = "/tmp/does-not-exist-citadel-test"
+	defer func() { machineIDPath = old }()
+
+	hostname, err := GenerateCitadelHostname()
+	if err != nil {
+		t.Fatalf("GenerateCitadelHostname() with missing machine-id failed: %v", err)
+	}
+
+	if !strings.HasPrefix(hostname, "citadel-") {
+		t.Errorf("hostname %q does not have citadel- prefix", hostname)
+	}
+
+	if len(hostname) != 16 {
+		t.Errorf("hostname %q has length %d, want 16", hostname, len(hostname))
+	}
+
+	// Random fallback should produce different values each time
+	hostname2, _ := GenerateCitadelHostname()
+	if hostname == hostname2 {
+		t.Errorf("random fallback produced same hostname twice: %q", hostname)
+	}
+}
+
+func TestGenerateCitadelHostnameWithCustomMachineID(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "machine-id")
+	if err := os.WriteFile(tmpFile, []byte("deadbeef12345678abcdef\n"), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	old := machineIDPath
+	machineIDPath = tmpFile
+	defer func() { machineIDPath = old }()
+
+	hostname, err := GenerateCitadelHostname()
+	if err != nil {
+		t.Fatalf("GenerateCitadelHostname() failed: %v", err)
+	}
+
+	expected := "citadel-deadbeef"
+	if hostname != expected {
+		t.Errorf("hostname = %q, want %q", hostname, expected)
+	}
 }
 
 func TestGenerateRandomHexID(t *testing.T) {

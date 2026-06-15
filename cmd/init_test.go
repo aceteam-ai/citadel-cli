@@ -4,7 +4,6 @@ package cmd
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -163,35 +162,6 @@ func TestInitFlagDescriptions(t *testing.T) {
 
 	if newDeviceFlag.Usage == "" {
 		t.Error("--new-device flag should have a usage description")
-	}
-}
-
-// TestGenericHostnamesDetection verifies that common default hostnames are recognized.
-func TestGenericHostnamesDetection(t *testing.T) {
-	tests := []struct {
-		hostname string
-		generic  bool
-	}{
-		{"debian", true},
-		{"ubuntu", true},
-		{"localhost", true},
-		{"linux", true},
-		{"host", true},
-		{"Debian", true},  // case-insensitive
-		{"UBUNTU", true},  // case-insensitive
-		{"my-gpu-node", false},
-		{"citadel-ab12cd34", false},
-		{"jason-desktop", false},
-		{"", false}, // empty is handled separately
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.hostname, func(t *testing.T) {
-			got := genericHostnames[strings.ToLower(tt.hostname)]
-			if got != tt.generic {
-				t.Errorf("genericHostnames[%q] = %v, want %v", tt.hostname, got, tt.generic)
-			}
-		})
 	}
 }
 
