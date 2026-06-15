@@ -125,6 +125,12 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 		return err
 	}
 
+	// Fix state file ownership after tsnet has written its initial state.
+	// When login runs as root (sudo or systemd), tsnet creates state files
+	// owned by root. The worker process runs as a non-root user and needs
+	// to read these files. See issue #176.
+	FixStatePermissions()
+
 	s.connected = true
 	return nil
 }
@@ -172,6 +178,14 @@ func (s *NetworkServer) Disconnect() error {
 	err := s.srv.Close()
 	s.srv = nil
 	s.connected = false
+
+	// Fix state file ownership after tsnet has finished writing.
+	// tsnet rewrites tailscaled.state atomically (temp file + rename),
+	// so new root-owned files may have been created since Connect().
+	// This ensures the final on-disk state is accessible to the
+	// non-root worker process. See issue #176.
+	FixStatePermissions()
+
 	return err
 }
 
