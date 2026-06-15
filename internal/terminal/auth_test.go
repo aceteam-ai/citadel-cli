@@ -192,7 +192,7 @@ func TestCachingTokenValidator(t *testing.T) {
 	mock.AddValidToken(validToken, tokenInfo)
 
 	// Create caching validator
-	validator := NewCachingTokenValidator(mock.URL(), "org-456", time.Hour)
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
 
 	t.Run("initial fetch populates cache", func(t *testing.T) {
 		mock.ResetRequestCount()
@@ -260,7 +260,7 @@ func TestCachingTokenValidatorExpiredToken(t *testing.T) {
 		ExpiresAt: time.Now().Add(-time.Hour), // Expired
 	})
 
-	validator := NewCachingTokenValidator(mock.URL(), "org-456", time.Hour)
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
 	validator.Start()
 	defer validator.Stop()
 
@@ -302,7 +302,7 @@ func TestCachingTokenValidatorRateLimiting(t *testing.T) {
 	})
 
 	// Create validator with short rate limit for testing
-	validator := NewCachingTokenValidator(mock.URL(), "org-456", time.Hour)
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
 	validator.refreshRateLimit = 100 * time.Millisecond // Short for testing
 	validator.Start()
 	defer validator.Stop()
@@ -355,7 +355,7 @@ func TestCachingTokenValidatorOrgIsolation(t *testing.T) {
 	})
 
 	// Create validator for org-B
-	validator := NewCachingTokenValidator(mock.URL(), "org-B", time.Hour)
+	validator := NewCachingTokenValidator(mock.URL(), "org-B", "", time.Hour)
 	validator.Start()
 	defer validator.Stop()
 

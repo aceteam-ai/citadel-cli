@@ -487,6 +487,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	if baseURL == "" {
 		baseURL = os.Getenv("HEARTBEAT_URL") // backward compat
 	}
+	if baseURL == "" && deviceConfig != nil && deviceConfig.APIBaseURL != "" {
+		baseURL = deviceConfig.APIBaseURL
+	}
 	if baseURL == "" {
 		baseURL = "https://aceteam.ai"
 	}
@@ -528,7 +531,11 @@ func runWork(cmd *cobra.Command, args []string) {
 			}
 		}
 		if statusOrgID != "" && baseURL != "" {
-			serverCfg.TokenValidator = terminal.NewCachingTokenValidator(baseURL, statusOrgID, 30*time.Second)
+			statusAPIToken := ""
+			if deviceConfig != nil {
+				statusAPIToken = deviceConfig.DeviceAPIToken
+			}
+			serverCfg.TokenValidator = terminal.NewCachingTokenValidator(baseURL, statusOrgID, statusAPIToken, 30*time.Second)
 			serverCfg.OrgID = statusOrgID
 		}
 
@@ -773,9 +780,14 @@ func runWork(cmd *cobra.Command, args []string) {
 				}
 
 				// Use CachingTokenValidator for production
+				termAPIToken := ""
+				if deviceConfig != nil {
+					termAPIToken = deviceConfig.DeviceAPIToken
+				}
 				cachingAuth := terminal.NewCachingTokenValidator(
 					baseURL,
 					orgID,
+					termAPIToken,
 					termConfig.TokenRefreshInterval,
 				)
 

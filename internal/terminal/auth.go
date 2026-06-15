@@ -112,6 +112,7 @@ type CachedTokenEntry struct {
 type CachingTokenValidator struct {
 	baseURL         string
 	orgID           string
+	apiToken        string // Device API token (act_*) for authenticating with the platform
 	httpClient      *http.Client
 	cache           map[string]*CachedTokenEntry // SHA-256 hash -> entry
 	cacheMu         sync.RWMutex
@@ -131,10 +132,11 @@ type CachingTokenValidator struct {
 }
 
 // NewCachingTokenValidator creates a new caching token validator
-func NewCachingTokenValidator(baseURL, orgID string, refreshInterval time.Duration) *CachingTokenValidator {
+func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval time.Duration) *CachingTokenValidator {
 	return &CachingTokenValidator{
 		baseURL:          baseURL,
 		orgID:            orgID,
+		apiToken:         apiToken,
 		httpClient:       &http.Client{Timeout: 10 * time.Second},
 		cache:            make(map[string]*CachedTokenEntry),
 		refreshInterval:  refreshInterval,
@@ -224,6 +226,9 @@ func (v *CachingTokenValidator) fetchAndCacheTokens() error {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	if v.apiToken != "" {
+		req.Header.Set("Authorization", "Bearer "+v.apiToken)
+	}
 
 	resp, err := v.httpClient.Do(req)
 	if err != nil {
