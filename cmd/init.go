@@ -547,16 +547,90 @@ func getSelectedService() (string, error) {
 	return strings.Fields(selection)[0], nil
 }
 
+// genericHostnames are OS default hostnames that provide no useful identity.
+// When the OS hostname matches one of these, we generate a citadel-<id> name instead.
+var genericHostnames = map[string]bool{
+	"debian":    true,
+	"ubuntu":    true,
+	"localhost": true,
+	"linux":     true,
+	"host":      true,
+}
+
 func getNodeName() (string, error) {
+	// 1. Explicit --node-name flag always wins
 	if initNodeName != "" {
 		return initNodeName, nil
 	}
-	// Use hostname by default without prompting
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", fmt.Errorf("could not determine hostname: %w", err)
+
+	// 2. Check if a hostname was previously saved to config (for re-run stability)
+	if saved := getSavedHostname(); saved != "" {
+		Debug("using saved hostname from config: %s", saved)
+		return saved, nil
 	}
-	return hostname, nil
+
+	// 3. Use OS hostname if it's meaningful (not a generic live-ISO default)
+	hostname, err := os.Hostname()
+	if err == nil && hostname != "" && !genericHostnames[strings.ToLower(hostname)] {
+		return hostname, nil
+	}
+
+	// 4. Generate a citadel-<short_id> hostname
+	Debug("OS hostname %q is generic or unavailable, generating citadel hostname", hostname)
+	generated, err := platform.GenerateCitadelHostname()
+	if err != nil {
+		return "", fmt.Errorf("could not generate hostname: %w", err)
+	}
+
+	Debug("generated hostname: %s", generated)
+	return generated, nil
+}
+
+// getSavedHostname reads a previously saved hostname from the global config file.
+func getSavedHostname() string {
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return ""
+	}
+
+	var config struct {
+		Hostname string `yaml:"hostname"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	return config.Hostname
+}
+
+// saveHostnameToConfig persists the generated hostname to the global config file
+// so that re-runs of 'citadel init' produce the same name.
+func saveHostnameToConfig(hostname string) error {
+	globalConfigDir := platform.ConfigDir()
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+
+	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	var config map[string]interface{}
+	data, err := os.ReadFile(globalConfigFile)
+	if err == nil {
+		if unmarshalErr := yaml.Unmarshal(data, &config); unmarshalErr != nil {
+			config = nil
+		}
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	config["hostname"] = hostname
+
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(globalConfigFile, newData, 0600)
 }
 
 func checkForRunningServicesQuiet(serviceToStart string) error {
@@ -1229,7 +1303,23 @@ func configureNvidiaDocker() error {
 
 // connectToNetwork connects to the AceTeam Network using the embedded tsnet library.
 // No external Tailscale installation is required.
+//
+// Before registering with Headscale, it attempts to set the system hostname to
+// match the node name (best-effort, requires root). The node name is always used
+// for Headscale registration regardless of whether the OS hostname update succeeds.
 func connectToNetwork(nodeName, authKey string) error {
+	// Attempt to set the OS hostname to match (best-effort, needs root)
+	if err := platform.SetHostname(nodeName); err != nil {
+		Debug("could not set system hostname (expected without root): %v", err)
+	} else {
+		Debug("system hostname set to %s", nodeName)
+	}
+
+	// Persist the hostname to config so re-runs are stable
+	if err := saveHostnameToConfig(nodeName); err != nil {
+		Debug("warning: could not save hostname to config: %v", err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

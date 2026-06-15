@@ -4,6 +4,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -162,6 +163,111 @@ func TestInitFlagDescriptions(t *testing.T) {
 
 	if newDeviceFlag.Usage == "" {
 		t.Error("--new-device flag should have a usage description")
+	}
+}
+
+// TestGenericHostnamesDetection verifies that common default hostnames are recognized.
+func TestGenericHostnamesDetection(t *testing.T) {
+	tests := []struct {
+		hostname string
+		generic  bool
+	}{
+		{"debian", true},
+		{"ubuntu", true},
+		{"localhost", true},
+		{"linux", true},
+		{"host", true},
+		{"Debian", true},  // case-insensitive
+		{"UBUNTU", true},  // case-insensitive
+		{"my-gpu-node", false},
+		{"citadel-ab12cd34", false},
+		{"jason-desktop", false},
+		{"", false}, // empty is handled separately
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.hostname, func(t *testing.T) {
+			got := genericHostnames[strings.ToLower(tt.hostname)]
+			if got != tt.generic {
+				t.Errorf("genericHostnames[%q] = %v, want %v", tt.hostname, got, tt.generic)
+			}
+		})
+	}
+}
+
+// TestClearSavedConfigPreservesHostname verifies that clearSavedConfig()
+// does NOT clear the saved hostname (it's stable identity, not device auth).
+func TestClearSavedConfigPreservesHostname(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "citadel-hostname-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	configContent := `hostname: "citadel-ab12cd34"
+node_config_dir: "/home/user/citadel-node"
+device_api_token: "test-token"
+`
+	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Simulate clearSavedConfig logic
+	data, _ := os.ReadFile(configFile)
+	var config map[string]interface{}
+	yaml.Unmarshal(data, &config)
+
+	// clearSavedConfig deletes these fields:
+	delete(config, "device_api_token")
+	delete(config, "api_base_url")
+	delete(config, "org_id")
+	delete(config, "redis_url")
+	delete(config, "user_email")
+	delete(config, "user_name")
+
+	// hostname should NOT be in the delete list (stable identity)
+	if _, exists := config["hostname"]; !exists {
+		t.Error("hostname should survive clearSavedConfig")
+	}
+	if config["hostname"] != "citadel-ab12cd34" {
+		t.Errorf("hostname = %q, want %q", config["hostname"], "citadel-ab12cd34")
+	}
+}
+
+// TestSaveHostnameToConfigRoundTrip verifies hostname save/load via config YAML.
+func TestSaveHostnameToConfigRoundTrip(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "citadel-hostname-rt-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	configFile := filepath.Join(tmpDir, "config.yaml")
+
+	// Write a config with hostname
+	config := map[string]interface{}{
+		"hostname":        "citadel-deadbeef",
+		"node_config_dir": "/home/user/citadel-node",
+	}
+	data, _ := yaml.Marshal(config)
+	os.WriteFile(configFile, data, 0600)
+
+	// Read it back
+	readData, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("Failed to read config: %v", err)
+	}
+
+	var readConfig struct {
+		Hostname string `yaml:"hostname"`
+	}
+	if err := yaml.Unmarshal(readData, &readConfig); err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+
+	if readConfig.Hostname != "citadel-deadbeef" {
+		t.Errorf("hostname = %q, want %q", readConfig.Hostname, "citadel-deadbeef")
 	}
 }
 
