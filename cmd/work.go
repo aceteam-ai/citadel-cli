@@ -741,10 +741,18 @@ func runWork(cmd *cobra.Command, args []string) {
 		if runtime.GOOS == "windows" {
 			fmt.Fprintln(os.Stderr, "   - ⚠️ Terminal server is not supported on Windows")
 		} else {
-			// Get org ID from manifest
+			// Get org ID from device config (saved during init), fall back to manifest
 			orgID := ""
-			if manifest, _, err := findAndReadManifest(); err == nil {
-				orgID = manifest.Node.OrgID
+			if deviceConfig != nil {
+				orgID = deviceConfig.OrgID
+			}
+			if orgID == "" && workManifest != nil {
+				orgID = workManifest.Node.OrgID
+			}
+			if orgID == "" {
+				if manifest, _, err := findAndReadManifest(); err == nil {
+					orgID = manifest.Node.OrgID
+				}
 			}
 
 			if orgID == "" {

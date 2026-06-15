@@ -122,6 +122,10 @@ func ChownR(path, owner string) error {
 // Uses system-wide paths when running as root, user-local paths otherwise.
 // On Windows, always uses a user-local path (%LOCALAPPDATA%\Citadel) to
 // match the install location and avoid requiring admin privileges.
+//
+// When running under sudo (SUDO_USER is set), the invoking user's
+// ~/.citadel-cli is preferred over /etc/citadel so that configs written
+// by `citadel init` as the normal user are found by `sudo citadel work`.
 func ConfigDir() string {
 	// Windows: always use user-local path regardless of elevation.
 	// The installer places the binary in %LOCALAPPDATA%\Citadel, so config
@@ -145,6 +149,20 @@ func ConfigDir() string {
 		home, err := os.UserHomeDir()
 		if err == nil {
 			return filepath.Join(home, ".citadel-cli")
+		}
+	}
+
+	// Running as root — prefer the invoking user's config when under sudo.
+	// citadel init typically runs as the normal user and writes config to
+	// ~/.citadel-cli, but citadel work often runs with sudo for Docker
+	// access. Without this check, ConfigDir returns /etc/citadel and the
+	// config written by init is invisible.
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+		if home, err := HomeDir(sudoUser); err == nil {
+			candidate := filepath.Join(home, ".citadel-cli")
+			if _, err := os.Stat(filepath.Join(candidate, "config.yaml")); err == nil {
+				return candidate
+			}
 		}
 	}
 
