@@ -3,6 +3,8 @@ package terminal
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -206,6 +208,58 @@ func TestServerWithDebug(t *testing.T) {
 	// Config should have Debug enabled
 	if !config.Debug {
 		t.Error("expected Debug to be true after NewServerWithDebug")
+	}
+}
+
+func TestServerDualListen(t *testing.T) {
+	config := &Config{
+		Port:           17865,
+		MaxConnections: 10,
+		IdleTimeout:    30 * time.Minute,
+		OrgID:          "test-org",
+		Shell:          "/bin/sh",
+		RateLimitRPS:   1.0,
+		RateLimitBurst: 5,
+	}
+
+	auth := NewMockTokenValidator()
+	server := NewServer(config, auth)
+
+	// Create a second listener to simulate a VPN listener
+	extraLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create extra listener: %v", err)
+	}
+	extraAddr := extraLn.Addr().(*net.TCPAddr)
+	server.AddListener(extraLn)
+
+	err = server.Start()
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer server.Stop(context.Background())
+
+	// Give server time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Test health endpoint via the primary listener
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/health", config.Port))
+	if err != nil {
+		t.Fatalf("primary listener health check failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("primary listener: expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Test health endpoint via the extra (VPN) listener
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", extraAddr.Port))
+	if err != nil {
+		t.Fatalf("extra listener health check failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("extra listener: expected status 200, got %d", resp.StatusCode)
 	}
 }
 

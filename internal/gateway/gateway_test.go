@@ -258,6 +258,85 @@ func TestProxyUpstreamDown(t *testing.T) {
 	}
 }
 
+func TestStartAndShutdownDualListen(t *testing.T) {
+	// Find a free port for the primary listener
+	primaryLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := primaryLn.Addr().(*net.TCPAddr).Port
+	primaryLn.Close()
+
+	// Create a second listener to simulate a VPN listener
+	extraLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraPort := extraLn.Addr().(*net.TCPAddr).Port
+
+	gw := NewServer(Config{
+		Port:          port,
+		ListenAddress: fmt.Sprintf("127.0.0.1:%d", port),
+		NodeName:      "test-dual-node",
+	})
+	gw.AddListener(extraLn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- gw.Start(ctx)
+	}()
+
+	// Give it time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Primary listener should serve /
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("primary GET /: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("primary listener: status = %d, want 200", resp.StatusCode)
+	}
+
+	// Extra (VPN) listener should also serve /
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:%d/", extraPort))
+	if err != nil {
+		t.Fatalf("extra GET /: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("extra listener: status = %d, want 200, body: %s", resp.StatusCode, string(body))
+	}
+
+	// Verify the extra listener returns the gateway info
+	var gwResp map[string]interface{}
+	if err := json.Unmarshal(body, &gwResp); err != nil {
+		t.Fatalf("unmarshal extra listener response: %v", err)
+	}
+	if gwResp["gateway"] != "citadel" {
+		t.Errorf("extra listener gateway = %v, want citadel", gwResp["gateway"])
+	}
+	if gwResp["node"] != "test-dual-node" {
+		t.Errorf("extra listener node = %v, want test-dual-node", gwResp["node"])
+	}
+
+	// Shutdown
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Start() did not return after context cancel")
+	}
+}
+
 func TestStartAndShutdown(t *testing.T) {
 	// Find a free port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

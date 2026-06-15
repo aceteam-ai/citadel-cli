@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -305,6 +306,49 @@ func TestDesktopEndpointRejectsInvalidToken(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("/api/screenshot with bad token: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestServerDualListen(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test-dual"})
+
+	// Create an extra listener to simulate a VPN listener
+	extraLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create extra listener: %v", err)
+	}
+	extraAddr := extraLn.Addr().(*net.TCPAddr)
+
+	server := NewServer(ServerConfig{
+		Port:    0,
+		Version: "test-dual",
+	}, collector)
+	server.AddListener(extraLn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go server.Start(ctx)
+	time.Sleep(100 * time.Millisecond) // Wait for server to start
+
+	// The extra (VPN) listener should serve /health
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", extraAddr.Port))
+	if err != nil {
+		t.Fatalf("extra listener health check failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("extra listener: expected status 200, got %d", resp.StatusCode)
+	}
+
+	// The extra listener should serve /ping
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:%d/ping", extraAddr.Port))
+	if err != nil {
+		t.Fatalf("extra listener ping failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("extra listener: expected ping status 200, got %d", resp.StatusCode)
 	}
 }
 

@@ -69,6 +69,10 @@ type Server struct {
 	mux        *http.ServeMux
 	httpServer *http.Server
 	mu         sync.RWMutex
+
+	// extraListeners are additional net.Listeners the server will also serve on
+	// (e.g., a TLS-wrapped tsnet VPN listener). Added via AddListener before Start.
+	extraListeners []net.Listener
 }
 
 // NewServer creates a new gateway server.
@@ -86,6 +90,15 @@ func NewServer(cfg Config) *Server {
 	}
 
 	return s
+}
+
+// AddListener registers an additional net.Listener that the server will also
+// serve on when Start is called. For HTTPS gateways, the listener should
+// already be TLS-wrapped (e.g., via tls.NewListener). Must be called before Start.
+func (s *Server) AddListener(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.extraListeners = append(s.extraListeners, ln)
 }
 
 // AddUpstream registers a backend for the given path prefix.
@@ -138,6 +151,17 @@ func (s *Server) Start(ctx context.Context) error {
 			errCh <- err
 		}
 	}()
+
+	// Serve on any extra listeners (e.g., TLS-wrapped tsnet VPN listener)
+	for _, ln := range s.extraListeners {
+		ln := ln // capture loop variable
+		log.Printf("[Gateway] also listening on %s (VPN)", ln.Addr().String())
+		go func() {
+			if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("[Gateway] VPN listener error: %v", err)
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
