@@ -4,15 +4,27 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrStaleState is returned when network state exists but the connection
+// cannot be re-established (e.g. expired/revoked Headscale preauth key).
+// Callers should clear state and re-authenticate with a fresh authkey.
+var ErrStaleState = errors.New("network state is stale: connection cannot be re-established with existing keys")
+
+// reconnectTimeout is the maximum time to wait for a reconnection attempt
+// using existing state before declaring the state stale.
+const reconnectTimeout = 30 * time.Second
 
 var (
 	globalServer *NetworkServer
@@ -203,6 +215,10 @@ func Listen(network, addr string) (net.Listener, error) {
 
 // VerifyOrReconnect checks connection and reconnects if state exists but not connected.
 // Returns (connected, error). No error if simply not logged in.
+//
+// If state exists but the connection times out (e.g. expired/revoked Headscale key),
+// returns ErrStaleState. Callers should handle this by clearing state and
+// re-authenticating with a fresh authkey.
 func VerifyOrReconnect(ctx context.Context) (bool, error) {
 	if IsGlobalConnected() {
 		return true, nil
@@ -211,7 +227,13 @@ func VerifyOrReconnect(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Reconnect using saved state
+	// Reconnect using saved state with a bounded timeout.
+	// When the existing WireGuard keys are expired/revoked, tsnet will
+	// hang until the parent context deadline — cap it to reconnectTimeout
+	// so callers get a fast, actionable error.
+	reconnectCtx, cancel := context.WithTimeout(ctx, reconnectTimeout)
+	defer cancel()
+
 	hostname := getHostnameForReconnect()
 	config := ServerConfig{
 		Hostname:   hostname,
@@ -220,12 +242,61 @@ func VerifyOrReconnect(ctx context.Context) (bool, error) {
 	}
 
 	srv := NewServer(config)
-	if err := srv.Connect(ctx, ""); err != nil {
+	if err := srv.Connect(reconnectCtx, ""); err != nil {
+		if isStaleStateError(err) {
+			return false, ErrStaleState
+		}
 		return false, fmt.Errorf("failed to reconnect: %w", err)
 	}
 
 	SetGlobal(srv)
 	return true, nil
+}
+
+// ReconnectWithAuthKey attempts to connect using an existing state directory
+// and a fresh authkey. This preserves the machine key (and thus the node's
+// IP address) while re-authorizing with Headscale.
+//
+// If this fails, the caller should fall back to ClearState + fresh Connect.
+func ReconnectWithAuthKey(ctx context.Context, authKey string) (bool, error) {
+	hostname := getHostnameForReconnect()
+	config := ServerConfig{
+		Hostname:   hostname,
+		ControlURL: DefaultControlURL,
+		StateDir:   GetStateDir(),
+		AuthKey:    authKey,
+	}
+
+	srv := NewServer(config)
+	reconnectCtx, cancel := context.WithTimeout(ctx, reconnectTimeout)
+	defer cancel()
+
+	if err := srv.Connect(reconnectCtx, authKey); err != nil {
+		return false, fmt.Errorf("reconnect with fresh authkey failed: %w", err)
+	}
+
+	SetGlobal(srv)
+	return true, nil
+}
+
+// isStaleStateError returns true if the error indicates that the network
+// state is stale and cannot be used to reconnect. This happens when:
+//   - The connection timed out (context deadline exceeded)
+//   - The timeout message from waitForConnection was hit
+//   - The authkey/node key was explicitly rejected
+func isStaleStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "timeout waiting for network connection") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "not authorized") ||
+		strings.Contains(msg, "key expired") ||
+		strings.Contains(msg, "node key rejected")
 }
 
 // getHostnameForReconnect reads hostname from manifest or falls back to OS hostname.

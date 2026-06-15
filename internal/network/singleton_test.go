@@ -3,9 +3,12 @@ package network
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestDisconnectPreservesState verifies that Disconnect() does not clear network state.
@@ -186,5 +189,133 @@ func TestHasStateWithEmptyDir(t *testing.T) {
 	hasState = len(entries) > 0
 	if !hasState {
 		t.Error("Non-empty state directory should report has state")
+	}
+}
+
+// TestIsStaleStateError verifies detection of errors indicating stale network state.
+func TestIsStaleStateError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "context deadline exceeded",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "wrapped deadline exceeded",
+			err:  fmt.Errorf("failed to start network: %w", context.DeadlineExceeded),
+			want: true,
+		},
+		{
+			name: "timeout waiting for connection",
+			err:  fmt.Errorf("timeout waiting for network connection"),
+			want: true,
+		},
+		{
+			name: "wrapped timeout message",
+			err:  fmt.Errorf("failed to reconnect: %w", fmt.Errorf("timeout waiting for network connection")),
+			want: true,
+		},
+		{
+			name: "not authorized",
+			err:  fmt.Errorf("not authorized"),
+			want: true,
+		},
+		{
+			name: "key expired",
+			err:  fmt.Errorf("key expired"),
+			want: true,
+		},
+		{
+			name: "node key rejected",
+			err:  fmt.Errorf("node key rejected by server"),
+			want: true,
+		},
+		{
+			name: "unrelated error",
+			err:  fmt.Errorf("failed to create state directory: permission denied"),
+			want: false,
+		},
+		{
+			name: "generic connection refused",
+			err:  fmt.Errorf("connection refused"),
+			want: false,
+		},
+		{
+			name: "context canceled (not stale)",
+			err:  context.Canceled,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isStaleStateError(tt.err)
+			if got != tt.want {
+				t.Errorf("isStaleStateError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestErrStaleStateSentinel verifies the sentinel error can be detected with errors.Is.
+func TestErrStaleStateSentinel(t *testing.T) {
+	// Direct match
+	if !errors.Is(ErrStaleState, ErrStaleState) {
+		t.Error("errors.Is(ErrStaleState, ErrStaleState) should be true")
+	}
+
+	// Wrapped match
+	wrapped := fmt.Errorf("network issue: %w", ErrStaleState)
+	if !errors.Is(wrapped, ErrStaleState) {
+		t.Error("errors.Is(wrapped, ErrStaleState) should be true for wrapped error")
+	}
+
+	// Non-match
+	other := fmt.Errorf("some other error")
+	if errors.Is(other, ErrStaleState) {
+		t.Error("errors.Is should be false for unrelated error")
+	}
+}
+
+// TestVerifyOrReconnectNoState verifies VerifyOrReconnect returns (false, nil) when no state exists.
+func TestVerifyOrReconnectNoState(t *testing.T) {
+	// Ensure no global server and no state
+	ClearGlobal()
+
+	// Override state dir to a non-existent location for this test
+	// VerifyOrReconnect checks HasState() which reads from the actual state dir.
+	// Since we can't easily override GetStateDir, we just verify the path where
+	// there's already no state (most test environments won't have citadel state).
+	// If state does exist in the test env, skip this test.
+	if HasState() {
+		t.Skip("Skipping: network state exists in the test environment")
+	}
+
+	ctx := context.Background()
+	connected, err := VerifyOrReconnect(ctx)
+	if err != nil {
+		t.Errorf("VerifyOrReconnect() error = %v, want nil", err)
+	}
+	if connected {
+		t.Error("VerifyOrReconnect() connected = true, want false when no state exists")
+	}
+}
+
+// TestReconnectTimeoutConstant verifies the reconnect timeout is reasonable.
+func TestReconnectTimeoutConstant(t *testing.T) {
+	if reconnectTimeout < 10*time.Second {
+		t.Errorf("reconnectTimeout = %v, should be at least 10s to allow network handshake", reconnectTimeout)
+	}
+	if reconnectTimeout > 60*time.Second {
+		t.Errorf("reconnectTimeout = %v, should be under 60s to provide timely feedback", reconnectTimeout)
 	}
 }
