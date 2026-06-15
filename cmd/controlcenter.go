@@ -243,9 +243,14 @@ func startTerminalServer(orgID string) error {
 	config.Port = ccTerminalPort
 
 	// Create the caching token validator
+	ccAPIToken := ""
+	if cfg := getDeviceConfigFromFile(); cfg != nil {
+		ccAPIToken = cfg.DeviceAPIToken
+	}
 	ccTerminalAuth = terminal.NewCachingTokenValidator(
 		config.AuthServiceURL,
 		config.OrgID,
+		ccAPIToken,
 		config.TokenRefreshInterval,
 	)
 
