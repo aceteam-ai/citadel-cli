@@ -123,15 +123,18 @@ func ChownR(path, owner string) error {
 // On Windows, always uses a user-local path (%LOCALAPPDATA%\Citadel) to
 // match the install location and avoid requiring admin privileges.
 //
-// When running under sudo (SUDO_USER is set), the invoking user's
-// ~/.citadel-cli is preferred over /etc/citadel so that configs written
-// by `citadel init` as the normal user are found by `sudo citadel work`.
+// When running as root (e.g. via sudo), the invoking user's ~/.citadel-cli
+// is preferred over /etc/citadel so that configs written by `citadel init`
+// as the normal user are found by `sudo citadel work`.
 func ConfigDir() string {
+	return resolveConfigDir(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
+}
+
+// resolveConfigDir is the testable core of ConfigDir. Parameters are passed
+// in so unit tests can exercise the root/sudo code paths without privileges.
+func resolveConfigDir(isRoot, isWindows, isLinux, isDarwin bool) string {
 	// Windows: always use user-local path regardless of elevation.
-	// The installer places the binary in %LOCALAPPDATA%\Citadel, so config
-	// should live there too. Using ProgramData would silently fail without
-	// admin and diverge from the install path.
-	if IsWindows() {
+	if isWindows {
 		if v := os.Getenv("LOCALAPPDATA"); v != "" {
 			return filepath.Join(v, "Citadel")
 		}
@@ -145,18 +148,25 @@ func ConfigDir() string {
 	}
 
 	// Linux/macOS: use user-local config when not root
-	if !IsRoot() {
+	if !isRoot {
 		home, err := os.UserHomeDir()
 		if err == nil {
 			return filepath.Join(home, ".citadel-cli")
 		}
 	}
 
-	// Running as root — prefer the invoking user's config when under sudo.
-	// citadel init typically runs as the normal user and writes config to
-	// ~/.citadel-cli, but citadel work often runs with sudo for Docker
-	// access. Without this check, ConfigDir returns /etc/citadel and the
-	// config written by init is invisible.
+	// Running as root — check whether an explicitly-set HOME points at a
+	// user config directory. This covers `sudo -E HOME=/home/citadel ...`
+	// where SUDO_USER may be "root" or unset (e.g. systemd launching sudo).
+	if home := os.Getenv("HOME"); home != "" {
+		candidate := filepath.Join(home, ".citadel-cli")
+		if _, err := os.Stat(filepath.Join(candidate, "config.yaml")); err == nil {
+			return candidate
+		}
+	}
+
+	// Fallback: resolve the invoking user's home via SUDO_USER. This handles
+	// the case where HOME was not forwarded but sudo preserved SUDO_USER.
 	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
 		if home, err := HomeDir(sudoUser); err == nil {
 			candidate := filepath.Join(home, ".citadel-cli")
@@ -167,10 +177,10 @@ func ConfigDir() string {
 	}
 
 	// System-wide paths for root/admin
-	if IsLinux() {
+	if isLinux {
 		return "/etc/citadel"
 	}
-	if IsDarwin() {
+	if isDarwin {
 		// On macOS, use /usr/local/etc for consistency with Homebrew conventions
 		return "/usr/local/etc/citadel"
 	}
