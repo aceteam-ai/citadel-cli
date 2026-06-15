@@ -79,6 +79,12 @@ install -m 755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 echo "==> Citadel CLI installed: $(${INSTALL_DIR}/${BINARY_NAME} version)"
 
 # ---------------------------------------------------------------------------
+# Add citadel user to log-reading groups so journalctl returns entries
+# ---------------------------------------------------------------------------
+
+usermod -aG systemd-journal,adm citadel
+
+# ---------------------------------------------------------------------------
 # Create directories
 # ---------------------------------------------------------------------------
 
