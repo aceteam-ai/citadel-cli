@@ -86,6 +86,11 @@ func runNonInteractiveLogin() {
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
 	printNetworkSuccessInfo(nodeName, ip)
+
+	// Disconnect cleanly so tsnet flushes its state files, then the
+	// post-Close chown in Disconnect() fixes ownership for the non-root
+	// worker process. The work command re-establishes its own connection.
+	_ = network.Disconnect()
 }
 
 // runInteractiveLogin handles the interactive login flow
@@ -164,6 +169,11 @@ func runInteractiveLogin() {
 	ip, _ := srv.GetIPv4()
 	spinner.StopWithSuccess(fmt.Sprintf("Connected as '%s'", nodeName))
 	printNetworkSuccessInfo(nodeName, ip)
+
+	// Disconnect cleanly so tsnet flushes its state files, then the
+	// post-Close chown in Disconnect() fixes ownership for the non-root
+	// worker process. The work command re-establishes its own connection.
+	_ = network.Disconnect()
 }
 
 func init() {

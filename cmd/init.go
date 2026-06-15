@@ -1324,6 +1324,11 @@ func connectToNetwork(nodeName, authKey string) error {
 		fmt.Printf("   IP: %s\n", ip)
 	}
 
+	// Disconnect cleanly so tsnet flushes its state files, then the
+	// post-Close chown in Disconnect() fixes ownership for the non-root
+	// worker process. The work command re-establishes its own connection.
+	_ = network.Disconnect()
+
 	return nil
 }
 
