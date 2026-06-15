@@ -3,8 +3,10 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -22,6 +25,7 @@ import (
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
+	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
@@ -74,6 +78,14 @@ var (
 
 	// Workspace directory for file-operation handlers
 	workWorkspaceDir string
+
+	// Gateway flags
+	workGateway        bool
+	workGatewayPort    int
+	workGatewayBind    string
+	workGatewayVNC     int
+	workGatewayNoTLS   bool
+	workGatewayCertDir string
 )
 
 var workCmd = &cobra.Command{
@@ -92,6 +104,12 @@ Run 'citadel init' first to authenticate and configure the node.
 Examples:
   # Run after citadel init (recommended)
   citadel work
+
+  # Run with HTTPS gateway (exposes all services on one port)
+  citadel work --gateway
+
+  # Gateway with terminal access
+  citadel work --gateway --terminal
 
   # Disable status publishing
   citadel work --redis-status=false
@@ -185,7 +203,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	var source worker.JobSource
 	var streamFactory func(job *worker.Job) worker.StreamWriter
 	var useAPIMode bool
-	var apiSource *worker.APISource // Keep reference for heartbeat
+	var apiSource *worker.APISource               // Keep reference for heartbeat
 	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
 
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
@@ -471,6 +489,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if baseURL == "" {
 		baseURL = "https://aceteam.ai"
+	}
+
+	// When --gateway is set, auto-enable the status server on port 8080 so the
+	// gateway has a working upstream. This must happen before the status server
+	// block below so that the full status server (with token cache, VPN listener,
+	// desktop API, etc.) is started correctly.
+	if workGateway && workStatusPort == 0 {
+		workStatusPort = 8080
 	}
 
 	// Create status collector (used by status server and Redis status publisher)
@@ -771,6 +797,129 @@ func runWork(cmd *cobra.Command, args []string) {
 				}()
 			}
 		}
+	}
+
+	// Start in-process HTTPS gateway if enabled
+	if workGateway {
+		// Validate that gateway port does not collide with upstream ports
+		upstreamPorts := map[int]string{
+			workStatusPort:   "status-port",
+			workTerminalPort: "terminal-port",
+			workGatewayVNC:   "gateway-vnc-port",
+		}
+		if name, collision := upstreamPorts[workGatewayPort]; collision {
+			fmt.Fprintf(os.Stderr, "Error: gateway port %d collides with --%s; choose a different --gateway-port\n", workGatewayPort, name)
+			os.Exit(1)
+		}
+
+		// Fetch VPN IPs for TLS certificate SANs
+		var vpnIPs []net.IP
+		if network.IsGlobalConnected() {
+			if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected {
+				if netStatus.IPv4 != "" {
+					if ip := net.ParseIP(netStatus.IPv4); ip != nil {
+						vpnIPs = append(vpnIPs, ip)
+					}
+				}
+				if netStatus.IPv6 != "" {
+					if ip := net.ParseIP(netStatus.IPv6); ip != nil {
+						vpnIPs = append(vpnIPs, ip)
+					}
+				}
+			}
+		}
+
+		// Set up TLS (unless --gateway-no-tls)
+		var gwTLSConfig *tls.Config
+		if !workGatewayNoTLS {
+			cert, err := tlscert.EnsureCert(tlscert.Config{
+				Hostname:    nodeName,
+				IPAddresses: vpnIPs,
+				CertDir:     workGatewayCertDir,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: TLS certificate error: %v\n", err)
+				os.Exit(1)
+			}
+			gwTLSConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
+			}
+			fmt.Printf("   - Gateway TLS: self-signed (cert: %s)\n", tlscert.CertPath(workGatewayCertDir))
+		}
+
+		// Build upstream addresses
+		statusAddr := fmt.Sprintf("127.0.0.1:%d", workStatusPort)
+		termAddr := fmt.Sprintf("127.0.0.1:%d", workTerminalPort)
+		vncAddr := fmt.Sprintf("127.0.0.1:%d", workGatewayVNC)
+
+		// Create gateway server
+		gw := gateway.NewServer(gateway.Config{
+			Port:          workGatewayPort,
+			ListenAddress: fmt.Sprintf("%s:%d", workGatewayBind, workGatewayPort),
+			TLSConfig:     gwTLSConfig,
+			NodeName:      nodeName,
+		})
+
+		// Register upstreams (same routes as cmd/serve.go)
+		gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/status", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/ping", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/services", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
+
+		gw.AddUpstream("/vnc", &gateway.Upstream{
+			Address:     vncAddr,
+			StripPrefix: true,
+			WebSocket:   true,
+		})
+
+		gw.AddUpstream("/terminal", &gateway.Upstream{
+			Address:     termAddr,
+			StripPrefix: false,
+			WebSocket:   true,
+		})
+
+		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet
+		if network.IsGlobalConnected() {
+			vpnAddr := fmt.Sprintf(":%d", workGatewayPort)
+			rawLn, err := network.Listen("tcp", vpnAddr)
+			if err != nil {
+				Debug("gateway VPN listener failed (LAN-only): %v", err)
+			} else {
+				var vpnGwLn net.Listener
+				if gwTLSConfig != nil {
+					vpnGwLn = tls.NewListener(rawLn, gwTLSConfig)
+				} else {
+					vpnGwLn = rawLn
+				}
+				gw.AddListener(vpnGwLn)
+			}
+		}
+
+		// Print route table
+		scheme := "https"
+		if workGatewayNoTLS {
+			scheme = "http"
+		}
+		listenAddr := fmt.Sprintf("%s:%d", workGatewayBind, workGatewayPort)
+		fmt.Printf("   - Gateway: %s://%s\n", scheme, listenAddr)
+		fmt.Println("   - Routes:")
+		fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
+		fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
+		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
+		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
+
+		if len(vpnIPs) > 0 {
+			fmt.Printf("   - Gateway VPN: %s://%s:%d\n", scheme, vpnIPs[0], workGatewayPort)
+		}
+
+		go func() {
+			if err := gw.Start(ctx); err != nil && err != context.Canceled {
+				fmt.Fprintf(os.Stderr, "   - Warning: Gateway error: %v\n", err)
+			}
+		}()
 	}
 
 	// Start usage syncer if store is available
@@ -1137,4 +1286,13 @@ func init() {
 
 	// Workspace flags
 	workCmd.Flags().StringVar(&workWorkspaceDir, "workspace", "", "Workspace directory for file-operation jobs (or set CITADEL_WORKSPACE env)")
+
+	// Gateway flags
+	workCmd.Flags().BoolVar(&workGateway, "gateway", false, "Start the HTTPS gateway in-process (replaces 'citadel serve')")
+	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
+	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
+	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
+	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")
+	workCmd.Flags().StringVar(&workGatewayCertDir, "gateway-cert-dir", "", "Custom directory for gateway TLS certificates")
+	workCmd.Flags().MarkHidden("gateway-no-tls")
 }
