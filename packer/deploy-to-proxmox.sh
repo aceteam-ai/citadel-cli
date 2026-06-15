@@ -209,9 +209,9 @@ write_files:
     owner: root:root
     permissions: '0600'
 
-# Ensure the citadel user has docker group access
+# Ensure the citadel user has required group access
 runcmd:
-  - usermod -aG docker citadel || true
+  - usermod -aG docker,systemd-journal,adm citadel || true
 CIEOF
 )
 
