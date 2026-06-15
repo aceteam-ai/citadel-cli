@@ -32,8 +32,8 @@ var serveCmd = &cobra.Command{
 	Long: `Starts an HTTPS reverse proxy that consolidates all Citadel node services
 behind a single TLS endpoint.
 
-RECOMMENDED: Use 'citadel work --gateway' instead, which runs the gateway
-in-process alongside the worker. This avoids competing tsnet instances and
+RECOMMENDED: Use 'citadel work' instead, which runs the gateway in-process
+alongside the worker by default. This avoids competing tsnet instances and
 is the preferred way to expose the gateway on the VPN.
 
 This standalone command is still useful when you need to run the gateway
@@ -64,8 +64,8 @@ certificate provisioning API, so automatic Let's Encrypt certs via the VPN
 are not available. The self-signed certificate approach is the default.
 When Headscale adds cert support, the gateway can be upgraded to use
 tsnet.ListenTLS for automatic public certs.`,
-	Example: `  # PREFERRED: Run gateway in-process with the worker
-  citadel work --gateway
+	Example: `  # PREFERRED: Run gateway in-process with the worker (enabled by default)
+  citadel work
 
   # Start standalone gateway with default settings (HTTPS on port 8443)
   citadel serve
