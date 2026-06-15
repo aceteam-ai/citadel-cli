@@ -2,6 +2,7 @@ package platform
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -77,6 +78,96 @@ func TestConfigDir(t *testing.T) {
 		if dir != `C:\ProgramData\Citadel` {
 			t.Errorf("ConfigDir() on Windows as admin = %s, want C:\\ProgramData\\Citadel", dir)
 		}
+	}
+}
+
+func TestResolveConfigDir_RootWithHOME(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo paths not applicable on Windows")
+	}
+
+	// Create a temp dir simulating a user's home with a config file
+	tmpHome := t.TempDir()
+	configDir := filepath.Join(tmpHome, ".citadel-cli")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte("node_config_dir: /tmp\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate root process with HOME pointing at the user's home
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", tmpHome)
+	defer os.Setenv("HOME", origHome)
+
+	// isRoot=true: should find config via HOME
+	result := resolveConfigDir(true, false, true, false)
+	expected := filepath.Join(tmpHome, ".citadel-cli")
+	if result != expected {
+		t.Errorf("resolveConfigDir(root, HOME=%s) = %s, want %s", tmpHome, result, expected)
+	}
+}
+
+func TestResolveConfigDir_RootWithSUDO_USER(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo paths not applicable on Windows")
+	}
+
+	// When HOME doesn't have a config but SUDO_USER's home does,
+	// fall back to SUDO_USER's home. We can only test this when running
+	// as the current user (SUDO_USER lookup must resolve).
+	// For CI safety, just verify that without either signal, system paths win.
+
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", "/nonexistent-home-for-test")
+	defer os.Setenv("HOME", origHome)
+
+	t.Setenv("SUDO_USER", "")
+
+	result := resolveConfigDir(true, false, true, false)
+	if result != "/etc/citadel" {
+		t.Errorf("resolveConfigDir(root, no HOME config, no SUDO_USER) = %s, want /etc/citadel", result)
+	}
+}
+
+func TestResolveConfigDir_RootFallbackToSystemPath(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo paths not applicable on Windows")
+	}
+
+	// No config in HOME, no SUDO_USER — should fall back to system paths
+	t.Setenv("HOME", "/nonexistent-for-test")
+	t.Setenv("SUDO_USER", "")
+
+	if IsLinux() {
+		result := resolveConfigDir(true, false, true, false)
+		if result != "/etc/citadel" {
+			t.Errorf("resolveConfigDir(root, Linux) = %s, want /etc/citadel", result)
+		}
+	}
+	if IsDarwin() {
+		result := resolveConfigDir(true, false, false, true)
+		if result != "/usr/local/etc/citadel" {
+			t.Errorf("resolveConfigDir(root, macOS) = %s, want /usr/local/etc/citadel", result)
+		}
+	}
+}
+
+func TestResolveConfigDir_NotRoot(t *testing.T) {
+	if IsWindows() {
+		t.Skip("Different paths on Windows")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("Cannot determine home dir")
+	}
+
+	result := resolveConfigDir(false, false, true, false)
+	expected := filepath.Join(home, ".citadel-cli")
+	if result != expected {
+		t.Errorf("resolveConfigDir(non-root) = %s, want %s", result, expected)
 	}
 }
 
