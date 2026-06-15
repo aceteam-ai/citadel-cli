@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -23,6 +25,10 @@ type Server struct {
 	tokenValidator terminal.TokenValidator
 	orgID          string
 	enableDesktop  bool
+
+	// extraListeners are additional net.Listeners the server will also serve on
+	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
+	extraListeners []net.Listener
 }
 
 // ServerConfig holds configuration for the status server.
@@ -47,6 +53,13 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		orgID:          cfg.OrgID,
 		enableDesktop:  cfg.EnableDesktop,
 	}
+}
+
+// AddListener registers an additional net.Listener that the server will also
+// serve on when Start is called. This enables dual-listen on both LAN and VPN
+// interfaces. Must be called before Start.
+func (s *Server) AddListener(ln net.Listener) {
+	s.extraListeners = append(s.extraListeners, ln)
 }
 
 // Start begins listening for HTTP requests.
@@ -77,6 +90,17 @@ func (s *Server) Start(ctx context.Context) error {
 			errChan <- err
 		}
 	}()
+
+	// Serve on any extra listeners (e.g., tsnet VPN)
+	for _, ln := range s.extraListeners {
+		ln := ln // capture loop variable
+		log.Printf("[status] also listening on %s (VPN)", ln.Addr().String())
+		go func() {
+			if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("[status] VPN listener error: %v", err)
+			}
+		}()
+	}
 
 	// Wait for context cancellation or server error
 	select {

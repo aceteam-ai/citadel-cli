@@ -519,6 +519,17 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		statusServer := status.NewServer(serverCfg, collector)
 
+		// Add VPN listener so the status server is reachable over the tsnet VPN
+		if network.IsGlobalConnected() {
+			vpnAddr := fmt.Sprintf(":%d", workStatusPort)
+			if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+				Debug("status server VPN listener failed (LAN-only): %v", err)
+			} else {
+				statusServer.AddListener(vpnLn)
+				fmt.Printf("   - Status server VPN: http://<vpn-ip>:%d\n", workStatusPort)
+			}
+		}
+
 		go func() {
 			if serverCfg.TokenValidator != nil {
 				if cachingVal, ok := serverCfg.TokenValidator.(*terminal.CachingTokenValidator); ok {
@@ -735,6 +746,17 @@ func runWork(cmd *cobra.Command, args []string) {
 				)
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
+
+				// Add VPN listener so the terminal server is reachable over the tsnet VPN
+				if network.IsGlobalConnected() {
+					vpnAddr := fmt.Sprintf(":%d", termConfig.Port)
+					if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+						Debug("terminal server VPN listener failed (LAN-only): %v", err)
+					} else {
+						termServer.AddListener(vpnLn)
+						fmt.Printf("   - Terminal server VPN: ws://<vpn-ip>:%d/terminal\n", termConfig.Port)
+					}
+				}
 
 				go func() {
 					// Start the token cache

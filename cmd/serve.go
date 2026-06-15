@@ -153,6 +153,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 	termAddr := fmt.Sprintf("127.0.0.1:%d", serveTermPort)
 	vncAddr := fmt.Sprintf("127.0.0.1:%d", serveVNCPort)
 
+	// Add VPN listener so the gateway is reachable over the tsnet VPN.
+	// For HTTPS mode, the raw tsnet listener must be TLS-wrapped so that
+	// clients connecting over the VPN get the same TLS termination.
+	var vpnGatewayListener net.Listener
+	if network.IsGlobalConnected() {
+		vpnAddr := fmt.Sprintf(":%d", servePort)
+		rawLn, err := network.Listen("tcp", vpnAddr)
+		if err != nil {
+			Debug("gateway VPN listener failed (LAN-only): %v", err)
+		} else if tlsConfig != nil {
+			vpnGatewayListener = tls.NewListener(rawLn, tlsConfig)
+		} else {
+			vpnGatewayListener = rawLn
+		}
+	}
+
 	// Create gateway
 	gw := gateway.NewServer(gateway.Config{
 		Port:          servePort,
@@ -183,6 +199,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		StripPrefix: false,
 		WebSocket:   true,
 	})
+
+	// Attach VPN listener if available
+	if vpnGatewayListener != nil {
+		gw.AddListener(vpnGatewayListener)
+	}
 
 	// Print route table
 	scheme := "https"

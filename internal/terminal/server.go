@@ -65,6 +65,10 @@ type Server struct {
 	mu      sync.RWMutex
 	running bool
 
+	// extraListeners are additional net.Listeners the server will also serve on
+	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
+	extraListeners []net.Listener
+
 	// stopIdleChecker signals the idle checker to stop
 	stopIdleChecker chan struct{}
 
@@ -100,6 +104,15 @@ func NewServer(config *Config, auth TokenValidator) *Server {
 // Use this in TUI mode to prevent log messages from corrupting the display.
 func (s *Server) SetSilent() {
 	s.logger = &noOpLogger{}
+}
+
+// AddListener registers an additional net.Listener that the server will also
+// serve on when Start is called. This enables dual-listen on both LAN and VPN
+// interfaces. Must be called before Start.
+func (s *Server) AddListener(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.extraListeners = append(s.extraListeners, ln)
 }
 
 // NewServerWithDebug creates a new terminal server with debug logging enabled
@@ -180,6 +193,17 @@ func (s *Server) Start() error {
 			s.logger.Printf("server error: %v", err)
 		}
 	}()
+
+	// Serve on any extra listeners (e.g., tsnet VPN)
+	for _, ln := range s.extraListeners {
+		ln := ln // capture loop variable
+		s.logger.Printf("also listening on %s (VPN)", ln.Addr().String())
+		go func() {
+			if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				s.logger.Printf("VPN listener error: %v", err)
+			}
+		}()
+	}
 
 	return nil
 }
