@@ -48,9 +48,10 @@ Routes:
   /status          -> Full node status
   /ping            -> Lightweight ping
   /services        -> List registered services
-  /api/screenshot  -> Desktop screenshot (auth required)
-  /api/actions     -> Desktop input actions (auth required)
-  /vnc/...         -> VNC WebSocket proxy (requires websockify on --vnc-port)
+  /api/screenshot       -> Desktop screenshot (auth required)
+  /api/actions          -> Desktop input actions (auth required)
+  /ssh/authorized-keys  -> SSH key deployment (VPN or auth required)
+  /vnc/...              -> VNC WebSocket proxy (requires websockify on --vnc-port)
   /terminal/...    -> Terminal WebSocket server
 
 TLS certificates are self-signed and generated automatically on first run.
@@ -195,6 +196,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	gw.AddUpstream("/services", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
+	gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
 
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{
@@ -225,6 +227,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("   - Routes:")
 	fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
+	fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 	fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 	fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
