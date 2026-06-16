@@ -76,6 +76,11 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("/api/actions", s.requireAuth(s.handleActions))
 	}
 
+	// SSH key deployment: available on all nodes (headless or with desktop).
+	// Uses VPN-origin check OR token auth — the platform relay calls this
+	// from within the VPN mesh after validating org ownership.
+	mux.HandleFunc("/ssh/authorized-keys", s.requireVPNOrAuth(s.handleSSHAuthorizedKeys))
+
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      mux,

@@ -975,6 +975,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		gw.AddUpstream("/services", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
 
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
@@ -1015,6 +1016,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Println("   - Routes:")
 		fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
 		fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
+		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
