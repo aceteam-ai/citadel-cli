@@ -244,17 +244,10 @@ func deploySSHKeys(keys []string) (*sshAuthorizedKeysResponse, error) {
 		}
 	}
 
-	// Count total non-empty, non-comment lines in the final file
-	total := 0
-	for km := range existingSet {
-		_ = km
-		total++
-	}
-
 	return &sshAuthorizedKeysResponse{
 		Added:   added,
 		Skipped: skipped,
-		Total:   total,
+		Total:   len(existingSet),
 	}, nil
 }
 
