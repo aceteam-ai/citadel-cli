@@ -55,10 +55,8 @@ hook_test() {
 }
 
 hook_build() {
-  echo "[hook_build] ENTERED" >&2
   local version
   version=$(read_state "target_version")
-  echo "[hook_build] version=$version" >&2
   if [[ -z "$version" ]]; then
     fatal "No target version found in state."
   fi
