@@ -1,6 +1,7 @@
 package capabilities
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -201,6 +202,66 @@ func TestNodeCapabilities(t *testing.T) {
 	}
 	if len(nodeCaps.Tags) != 4 {
 		t.Errorf("len(Tags) = %d, want 4", len(nodeCaps.Tags))
+	}
+}
+
+func TestGPUCapabilities_DriverNotLoaded_NoRoutingTags(t *testing.T) {
+	// Simulate the scenario where lspci detects hardware but nvidia-smi fails.
+	// The device has Name set but Tag/VRAMTag empty, so DetectNodeCapabilities
+	// must NOT produce gpu: or vram: routing tags.
+	gpuCaps := &GPUCapabilities{
+		Devices: []GPUDevice{
+			{Name: "NVIDIA Corporation GA102 [GeForce RTX 3090]"},
+			// Tag and VRAMTag intentionally empty
+		},
+		Count:        1,
+		DriverStatus: "not_loaded",
+		DriverError:  "NVIDIA drivers not loaded. Install drivers with: sudo apt install nvidia-driver-<version>",
+	}
+
+	// Build tags using the same logic as DetectNodeCapabilities
+	caps := &NodeCapabilities{GPU: gpuCaps}
+	seen := make(map[string]bool)
+	for i, dev := range gpuCaps.Devices {
+		if dev.Tag != "" {
+			tag := "gpu:" + dev.Tag
+			if !seen[tag] {
+				seen[tag] = true
+				caps.Tags = append(caps.Tags, tag)
+			}
+		}
+		if dev.VRAMTag != "" {
+			tag := "vram:" + dev.VRAMTag
+			if !seen[tag] {
+				seen[tag] = true
+				caps.Tags = append(caps.Tags, tag)
+			}
+		}
+		if dev.Tag != "" && dev.VRAMTag != "" {
+			indexedTag := fmt.Sprintf("gpu:%d:%s:%s", i, dev.Tag, dev.VRAMTag)
+			if ValidateTag(indexedTag) {
+				caps.Tags = append(caps.Tags, indexedTag)
+			}
+		}
+	}
+	caps.Tags = append(caps.Tags, "cpu:general")
+
+	// Verify: only cpu:general should be present, no gpu: or vram: tags
+	for _, tag := range caps.Tags {
+		if tag != "cpu:general" {
+			t.Errorf("driver-down GPU should not produce routing tag %q", tag)
+		}
+	}
+
+	// Verify the GPU info is still present for display
+	if caps.GPU == nil || len(caps.GPU.Devices) == 0 {
+		t.Error("GPU devices should still be populated for display")
+	}
+	if caps.GPU.DriverStatus != "not_loaded" {
+		t.Errorf("DriverStatus = %q, want %q", caps.GPU.DriverStatus, "not_loaded")
+	}
+	if caps.GPU.DriverError == "" {
+		t.Error("DriverError should contain a helpful message")
 	}
 }
 

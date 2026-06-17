@@ -1,9 +1,11 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -25,9 +27,79 @@ type GPUDetector interface {
 	GetGPUCount() int
 }
 
+// NvidiaSMIExitHint translates a known nvidia-smi exit code into a
+// user-friendly message with remediation guidance. Returns an empty string
+// for unrecognized codes.
+func NvidiaSMIExitHint(code int) string {
+	switch code {
+	case 6:
+		return "No NVIDIA GPU detected by the driver"
+	case 9:
+		return "GPU hardware error — may need reseating or a power cycle"
+	case 15:
+		return "Driver version mismatch. Reboot required after driver update"
+	case 18:
+		return "NVIDIA drivers not loaded. Install drivers with: sudo apt install nvidia-driver-<version>"
+	default:
+		return ""
+	}
+}
+
+// NvidiaSMIErrorMessage returns a human-readable message for an nvidia-smi
+// execution error. It distinguishes between "binary not found" and known
+// exit codes, falling back to the raw error for anything else.
+func NvidiaSMIErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	// Binary not found on PATH
+	var pathErr *exec.Error
+	if errors.As(err, &pathErr) {
+		return "nvidia-smi not found — NVIDIA drivers are not installed"
+	}
+
+	// Binary ran but returned a non-zero exit code
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		if hint := NvidiaSMIExitHint(code); hint != "" {
+			return hint
+		}
+		return fmt.Sprintf("nvidia-smi exited with code %d", code)
+	}
+
+	return fmt.Sprintf("nvidia-smi error: %v", err)
+}
+
+// DetectNvidiaHardware checks via lspci whether any NVIDIA GPU hardware is
+// physically present, regardless of driver status. Returns the GPU name
+// (e.g. "NVIDIA Corporation GA102 [GeForce RTX 3090]") or an empty string.
+// This covers both VGA and 3D controller entries (headless/datacenter GPUs
+// like A100/H100 enumerate as "3D controller").
+func DetectNvidiaHardware() string {
+	cmd := exec.Command("sh", "-c", "lspci 2>/dev/null | grep -iE '(VGA compatible controller|3D controller).*NVIDIA'")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(output))
+	// lspci output example: "01:00.0 VGA compatible controller: NVIDIA Corporation GA104 [GeForce RTX 3060 Ti] (rev a1)"
+	// Extract the part after the controller type.
+	for _, prefix := range []string{"VGA compatible controller: ", "3D controller: "} {
+		if idx := strings.Index(line, prefix); idx >= 0 {
+			return strings.TrimSpace(line[idx+len(prefix):])
+		}
+	}
+	if line != "" {
+		return line
+	}
+	return ""
+}
+
 // GetGPUDetector returns the appropriate GPU detector for the current OS
 func GetGPUDetector() (GPUDetector, error) {
-	switch OS() {
+	switch runtime.GOOS {
 	case "linux":
 		return &LinuxGPUDetector{}, nil
 	case "darwin":
@@ -35,7 +107,7 @@ func GetGPUDetector() (GPUDetector, error) {
 	case "windows":
 		return &WindowsGPUDetector{}, nil
 	default:
-		return nil, fmt.Errorf("unsupported operating system: %s", OS())
+		return nil, fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
 }
 
@@ -43,8 +115,8 @@ func GetGPUDetector() (GPUDetector, error) {
 type LinuxGPUDetector struct{}
 
 func (l *LinuxGPUDetector) HasGPU() bool {
-	// Check using lspci
-	cmd := exec.Command("sh", "-c", "lspci | grep -i 'VGA compatible controller.*NVIDIA'")
+	// Check using lspci (matches both VGA and 3D controllers for headless/datacenter GPUs)
+	cmd := exec.Command("sh", "-c", "lspci 2>/dev/null | grep -iE '(VGA compatible controller|3D controller).*NVIDIA'")
 	if err := cmd.Run(); err == nil {
 		return true
 	}

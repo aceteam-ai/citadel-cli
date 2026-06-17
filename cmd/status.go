@@ -190,6 +190,16 @@ func gatherStatusData() (dashboard.StatusData, error) {
 				}
 				data.GPUs = append(data.GPUs, gpuInfo)
 			}
+		} else {
+			// nvidia-smi failed but hardware is present — show lspci info
+			hwName := platform.DetectNvidiaHardware()
+			if hwName != "" {
+				errMsg := platform.NvidiaSMIErrorMessage(err)
+				data.GPUs = append(data.GPUs, dashboard.GPUInfo{
+					Name:   hwName + " (drivers not loaded)",
+					Driver: errMsg,
+				})
+			}
 		}
 	}
 
@@ -377,7 +387,16 @@ func printGPUInfo(w *tabwriter.Writer) {
 
 	gpus, err := detector.GetGPUInfo()
 	if err != nil {
-		fmt.Fprintf(w, "  GPU:\t%s\n", warnColor.Sprintf("Hardware detected, but could not get details: %v", err))
+		// Hardware detected via lspci but nvidia-smi failed — show actionable message
+		hwName := platform.DetectNvidiaHardware()
+		if hwName != "" {
+			fmt.Fprintf(w, "  GPU:\t%s\n", warnColor.Sprintf("NVIDIA hardware detected (drivers not working)"))
+			fmt.Fprintf(w, "    %s:\t%s\n", labelColor.Sprint("Hardware"), hwName)
+		} else {
+			fmt.Fprintf(w, "  GPU:\t%s\n", warnColor.Sprint("Hardware detected, but could not get details"))
+		}
+		errMsg := platform.NvidiaSMIErrorMessage(err)
+		fmt.Fprintf(w, "    %s:\t%s\n", labelColor.Sprint("Issue"), warnColor.Sprint(errMsg))
 		return
 	}
 
@@ -415,13 +434,25 @@ func printCapabilities(w *tabwriter.Writer, manifest *CitadelManifest) {
 	nodeCaps := resolveCapabilities(manifest)
 
 	if nodeCaps.GPU != nil && len(nodeCaps.GPU.Devices) > 0 {
-		fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("GPU Count"), nodeCaps.GPU.Count)
-		for i, dev := range nodeCaps.GPU.Devices {
-			vramStr := ""
-			if dev.VRAMTag != "" {
-				vramStr = fmt.Sprintf(" (%s)", strings.ToUpper(dev.VRAMTag))
+		if nodeCaps.GPU.DriverStatus == "not_loaded" || nodeCaps.GPU.DriverStatus == "error" {
+			// Hardware present but drivers not working — show status without routing tags
+			fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("GPU Count"), nodeCaps.GPU.Count)
+			for i, dev := range nodeCaps.GPU.Devices {
+				fmt.Fprintf(w, "  %s %d:\t%s %s\n", labelColor.Sprint("GPU"), i, dev.Name,
+					warnColor.Sprint("(drivers not loaded)"))
 			}
-			fmt.Fprintf(w, "  %s %d:\t%s%s\n", labelColor.Sprint("GPU"), i, dev.Name, vramStr)
+			if nodeCaps.GPU.DriverError != "" {
+				fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Issue"), warnColor.Sprint(nodeCaps.GPU.DriverError))
+			}
+		} else {
+			fmt.Fprintf(w, "  %s:\t%d\n", labelColor.Sprint("GPU Count"), nodeCaps.GPU.Count)
+			for i, dev := range nodeCaps.GPU.Devices {
+				vramStr := ""
+				if dev.VRAMTag != "" {
+					vramStr = fmt.Sprintf(" (%s)", strings.ToUpper(dev.VRAMTag))
+				}
+				fmt.Fprintf(w, "  %s %d:\t%s%s\n", labelColor.Sprint("GPU"), i, dev.Name, vramStr)
+			}
 		}
 	} else {
 		fmt.Fprintln(w, "  GPU:\tNone detected")
