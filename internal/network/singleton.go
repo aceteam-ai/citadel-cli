@@ -23,8 +23,10 @@ import (
 var ErrStaleState = errors.New("network state is stale: connection cannot be re-established with existing keys")
 
 // reconnectTimeout is the maximum time to wait for a reconnection attempt
-// using existing state before declaring the state stale.
-const reconnectTimeout = 30 * time.Second
+// using existing state before declaring the state stale. A working WireGuard
+// handshake completes in under 5s; 10s gives margin for slow networks without
+// making interactive login feel stuck.
+const reconnectTimeout = 10 * time.Second
 
 var (
 	globalServer *NetworkServer

@@ -68,8 +68,8 @@ func GetNetworkChoice(authkey string) (choice NetworkChoice, key string, err err
 
 	if hasState {
 		fmt.Print("Reconnecting to AceTeam Network... ")
-		debug("attempting reconnect with 45s timeout...")
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		debug("attempting reconnect with 15s timeout...")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
 		connected, reconnectErr := network.VerifyOrReconnect(ctx)
