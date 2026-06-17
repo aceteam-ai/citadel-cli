@@ -314,12 +314,16 @@ run_release() {
   if ! step_done "test"; then
     step_msg "Running tests..."
     log "Running tests..."
-    # Run in subshell to preserve set -e behavior (if disables set -e)
-    local test_rc=0
-    (set -euo pipefail; hook_test) 2>&1 | tee -a "$LOG_FILE" || test_rc=$?
-    if [[ $test_rc -ne 0 ]]; then
-      fatal "Tests failed (exit $test_rc). Fix and re-run to resume."
+    local _test_ok
+    _test_ok=$(mktemp)
+    set +e
+    ( set -euo pipefail; hook_test; echo ok > "$_test_ok" ) 2>&1 | tee -a "$LOG_FILE"
+    set -e
+    if [[ ! -s "$_test_ok" ]]; then
+      rm -f "$_test_ok"
+      fatal "Tests failed. Fix and re-run to resume."
     fi
+    rm -f "$_test_ok"
     mark_step "test"
     log "Tests passed"
   else
@@ -358,12 +362,16 @@ run_release() {
   if ! step_done "build"; then
     step_msg "Building..."
     log "Build started"
-    # Run in subshell to preserve set -e behavior (if disables set -e)
-    local build_rc=0
-    (set -euo pipefail; hook_build) 2>&1 | tee -a "$LOG_FILE" || build_rc=$?
-    if [[ $build_rc -ne 0 ]]; then
-      fatal "Build failed (exit $build_rc). Fix and re-run to resume from build step."
+    local _build_ok
+    _build_ok=$(mktemp)
+    set +e
+    ( set -euo pipefail; hook_build; echo ok > "$_build_ok" ) 2>&1 | tee -a "$LOG_FILE"
+    set -e
+    if [[ ! -s "$_build_ok" ]]; then
+      rm -f "$_build_ok"
+      fatal "Build failed. Fix and re-run to resume from build step."
     fi
+    rm -f "$_build_ok"
     mark_step "build"
     log "Build completed"
   else
