@@ -1880,47 +1880,18 @@ func (cc *ControlCenter) showActivityFullScreen() {
 
 // copyActivityLogs copies recent log lines to clipboard
 func (cc *ControlCenter) copyActivityLogs() {
-	var content string
-	var lineCount int
+	// Use in-memory activity entries (same source as the 'c' key copy).
+	// This ensures what the user sees on screen is what gets copied.
+	cc.activityMu.Lock()
+	lineCount := len(cc.activities)
+	cc.activityMu.Unlock()
 
-	// Try to read from log file first
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		logPath := homeDir + "/.citadel-cli/logs/latest.log"
-		if data, err := os.ReadFile(logPath); err == nil && len(data) > 0 {
-			// Get last 50 lines
-			lines := strings.Split(string(data), "\n")
-			start := len(lines) - 50
-			if start < 0 {
-				start = 0
-			}
-			lineCount = len(lines) - start
-			content = strings.Join(lines[start:], "\n")
-		}
-	}
-
-	// Fall back to activity log if no log file
-	if content == "" {
-		cc.activityMu.Lock()
-		var sb strings.Builder
-		// Get up to 50 entries (activity log is already newest-first)
-		count := len(cc.activities)
-		if count > 50 {
-			count = 50
-		}
-		lineCount = count
-		for i := count - 1; i >= 0; i-- {
-			entry := cc.activities[i]
-			sb.WriteString(fmt.Sprintf("%s [%s] %s\n", entry.Time.Format("15:04:05"), entry.Level, entry.Message))
-		}
-		cc.activityMu.Unlock()
-		content = sb.String()
-	}
-
-	if content == "" {
+	if lineCount == 0 {
 		cc.AddActivity("info", "No logs to copy")
 		return
 	}
+
+	content := cc.getActivityText()
 
 	// Copy to clipboard
 	if err := cc.copyToClipboard(content); err != nil {
