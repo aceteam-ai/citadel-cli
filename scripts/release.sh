@@ -87,10 +87,10 @@ hook_build() {
     local build_dir
     build_dir=$(mktemp -d)
 
-    GOOS="$os" GOARCH="$arch" go build \
+    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
       -ldflags "$ldflags" \
       -o "$build_dir/citadel${ext}" \
-      .
+      ./cmd/citadel
 
     local archive_name="citadel_v${version}_${os}_${arch}"
     if [[ "$os" == "windows" ]]; then
