@@ -1705,6 +1705,107 @@ func (cc *ControlCenter) showPeerDetailModal() {
 	cc.app.SetFocus(table)
 }
 
+// showPermissionsModal displays the gateway permissions toggle panel (Action 7).
+// Each capability can be toggled on/off. Changes are saved immediately.
+func (cc *ControlCenter) showPermissionsModal() {
+	if cc.permissions.Load == nil || cc.permissions.Save == nil {
+		cc.AddActivity("warning", "Permissions not configured")
+		return
+	}
+
+	cc.inModal = true
+
+	perms := cc.permissions.Load()
+
+	// Capability definitions with descriptions
+	type capDef struct {
+		name    string
+		desc    string
+		enabled *bool
+	}
+	caps := []capDef{
+		{"Console", "Terminal WebSocket access (remote shell)", &perms.Console},
+		{"Desktop", "VNC, screenshots, and remote actions", &perms.Desktop},
+		{"Files", "File browser API", &perms.Files},
+		{"Services", "Service list and management", &perms.Services},
+		{"SSH", "SSH authorized_keys sync", &perms.SSH},
+	}
+
+	table := tview.NewTable().
+		SetBorders(false).
+		SetSelectable(true, false)
+	table.SetBorder(true).SetTitle(" Gateway Permissions ")
+	table.SetSelectedStyle(tcell.StyleDefault.
+		Background(tcell.ColorDarkBlue).
+		Foreground(tcell.ColorWhite))
+
+	renderRows := func() {
+		table.Clear()
+		for i, c := range caps {
+			checkbox := "[ ]"
+			stateColor := "[gray]"
+			if *c.enabled {
+				checkbox = "[x]"
+				stateColor = "[green]"
+			}
+			table.SetCell(i, 0, tview.NewTableCell(fmt.Sprintf(" %s%s[-]", stateColor, checkbox)).SetSelectable(true))
+			table.SetCell(i, 1, tview.NewTableCell(fmt.Sprintf(" [white::b]%s[-:-:-]", c.name)).SetSelectable(true).SetExpansion(1))
+			table.SetCell(i, 2, tview.NewTableCell(fmt.Sprintf(" [gray]%s[-]", c.desc)).SetSelectable(true).SetExpansion(2))
+		}
+		// Footer
+		footerRow := len(caps) + 1
+		table.SetCell(footerRow, 0, tview.NewTableCell("").SetSelectable(false))
+		table.SetCell(footerRow+1, 0, tview.NewTableCell("[gray]Space/Enter[-] toggle  [gray]Esc[-] close").
+			SetSelectable(false))
+	}
+	renderRows()
+	table.Select(0, 0)
+
+	toggle := func(row int) {
+		if row < 0 || row >= len(caps) {
+			return
+		}
+		*caps[row].enabled = !*caps[row].enabled
+		renderRows()
+		table.Select(row, 0)
+
+		// Save immediately (applies on next gateway restart)
+		if err := cc.permissions.Save(perms); err != nil {
+			cc.AddActivity("error", fmt.Sprintf("Failed to save permissions: %v", err))
+		} else {
+			state := "enabled"
+			if !*caps[row].enabled {
+				state = "disabled"
+			}
+			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on next gateway restart)", caps[row].name, state))
+		}
+	}
+
+	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			cc.inModal = false
+			cc.app.SetRoot(cc.mainFlex, true)
+			cc.updatePaneFocus()
+			return nil
+		case tcell.KeyEnter:
+			row, _ := table.GetSelection()
+			toggle(row)
+			return nil
+		case tcell.KeyRune:
+			if event.Rune() == ' ' {
+				row, _ := table.GetSelection()
+				toggle(row)
+				return nil
+			}
+		}
+		return event
+	})
+
+	cc.app.SetRoot(table, true)
+	cc.app.SetFocus(table)
+}
+
 // DetectSystemTailscale checks if system tailscale is running and on the same network
 func DetectSystemTailscale(nexusURL string) (running bool, ip, name string, sameNetwork bool) {
 	// Try to get tailscale status

@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
 // Config holds configuration for the gateway server.
@@ -70,6 +72,10 @@ type Server struct {
 	httpServer *http.Server
 	mu         sync.RWMutex
 
+	// permissions controls which capabilities are exposed. When nil, all
+	// routes are allowed (backwards-compatible with existing callers).
+	permissions *config.Permissions
+
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a TLS-wrapped tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
@@ -109,6 +115,77 @@ func (s *Server) AddUpstream(pathPrefix string, upstream *Upstream) {
 	s.config.Upstreams[pathPrefix] = upstream
 }
 
+// SetPermissions sets the capability permissions for route filtering.
+// When nil, all routes are allowed. Must be called before Start.
+func (s *Server) SetPermissions(p *config.Permissions) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.permissions = p
+}
+
+// categoryForPath returns the permission category for a request path, or ""
+// if the path should always be allowed (health, status, ping, root).
+func categoryForPath(path string) string {
+	// Terminal/console
+	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
+		return "console"
+	}
+	// Desktop: VNC, screenshots, actions
+	if path == "/vnc" || strings.HasPrefix(path, "/vnc/") {
+		return "desktop"
+	}
+	if path == "/api/screenshot" || strings.HasPrefix(path, "/api/screenshot/") {
+		return "desktop"
+	}
+	if path == "/api/actions" || strings.HasPrefix(path, "/api/actions/") {
+		return "desktop"
+	}
+	// Services
+	if path == "/services" || strings.HasPrefix(path, "/services/") {
+		return "services"
+	}
+	// SSH
+	if path == "/ssh" || strings.HasPrefix(path, "/ssh/") {
+		return "ssh"
+	}
+	// Everything else (health, status, ping, root, unknown) is always allowed
+	return ""
+}
+
+// permissionMiddleware checks permissions before passing requests to the next handler.
+// If permissions are nil, all requests pass through.
+func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		perms := s.permissions
+		s.mu.RUnlock()
+
+		if perms != nil {
+			category := categoryForPath(r.URL.Path)
+			blocked := false
+			switch category {
+			case "console":
+				blocked = !perms.Console
+			case "desktop":
+				blocked = !perms.Desktop
+			case "services":
+				blocked = !perms.Services
+			case "ssh":
+				blocked = !perms.SSH
+			// "files" is not currently routed through the gateway but is
+			// included in the permission model for future use.
+			}
+			if blocked {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"error":"capability disabled by node operator"}`)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Start begins listening for HTTPS connections. Blocks until context is cancelled.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
@@ -128,7 +205,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.httpServer = &http.Server{
 		Addr:         listenAddr,
-		Handler:      s.loggingMiddleware(s.mux),
+		Handler:      s.BuildHandler(),
 		TLSConfig:    s.config.TLSConfig,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 120 * time.Second, // Long for WebSocket/streaming
@@ -332,6 +409,12 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Connection"), "upgrade") &&
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+// BuildHandler constructs the full middleware chain (logging + permissions + mux)
+// without starting a server. Useful for testing the middleware stack.
+func (s *Server) BuildHandler() http.Handler {
+	return s.loggingMiddleware(s.permissionMiddleware(s.mux))
 }
 
 // loggingMiddleware logs all requests.

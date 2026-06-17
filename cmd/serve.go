@@ -10,8 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
 	"github.com/spf13/cobra"
 )
@@ -187,6 +189,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TLSConfig:     tlsConfig,
 		NodeName:      nodeName,
 	})
+
+	// Load and apply permissions
+	perms := config.LoadPermissions(platform.ConfigDir())
+	gw.SetPermissions(perms)
 
 	// Register upstreams — status server endpoints
 	// These route to the status server started by 'citadel work --status-port'

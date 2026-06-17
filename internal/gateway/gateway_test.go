@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
 func TestNewServer_Defaults(t *testing.T) {
@@ -385,5 +387,136 @@ func TestStartAndShutdown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("Start() did not return after context cancel")
+	}
+}
+
+func TestCategoryForPath(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/terminal", "console"},
+		{"/terminal/ws", "console"},
+		{"/vnc", "desktop"},
+		{"/vnc/websockify", "desktop"},
+		{"/api/screenshot", "desktop"},
+		{"/api/screenshot/", "desktop"},
+		{"/api/actions", "desktop"},
+		{"/api/actions/click", "desktop"},
+		{"/services", "services"},
+		{"/services/", "services"},
+		{"/ssh", "ssh"},
+		{"/ssh/authorized-keys", "ssh"},
+		// Always-allowed paths
+		{"/health", ""},
+		{"/status", ""},
+		{"/ping", ""},
+		{"/", ""},
+		{"/unknown", ""},
+		{"/api/other", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := categoryForPath(tt.path)
+			if got != tt.want {
+				t.Errorf("categoryForPath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPermissionMiddleware_BlocksDisabledRoutes(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"backend": "ok", "path": r.URL.Path})
+	}))
+	defer backend.Close()
+	backendAddr := backend.URL[len("http://"):]
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	gw.AddUpstream("/terminal", &Upstream{Address: backendAddr, WebSocket: true})
+	gw.AddUpstream("/vnc", &Upstream{Address: backendAddr, StripPrefix: true, WebSocket: true})
+	gw.AddUpstream("/api/screenshot", &Upstream{Address: backendAddr})
+	gw.AddUpstream("/services", &Upstream{Address: backendAddr})
+	gw.AddUpstream("/ssh/authorized-keys", &Upstream{Address: backendAddr})
+	gw.AddUpstream("/health", &Upstream{Address: backendAddr})
+
+	// Build routes
+	for prefix, upstream := range gw.config.Upstreams {
+		gw.registerProxy(prefix, upstream)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+
+	// Set permissions: disable console and desktop
+	perms := &config.Permissions{
+		Console:  false,
+		Desktop:  false,
+		Files:    true,
+		Services: true,
+		SSH:      true,
+	}
+	gw.SetPermissions(perms)
+
+	handler := gw.BuildHandler()
+
+	// Test blocked routes return 403
+	blockedPaths := []string{"/terminal", "/terminal/ws", "/vnc", "/vnc/info", "/api/screenshot"}
+	for _, path := range blockedPaths {
+		t.Run("blocked:"+path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Errorf("%s: status = %d, want 403", path, w.Code)
+			}
+
+			var resp map[string]string
+			json.Unmarshal(w.Body.Bytes(), &resp)
+			if resp["error"] != "capability disabled by node operator" {
+				t.Errorf("%s: unexpected error body: %s", path, w.Body.String())
+			}
+		})
+	}
+
+	// Test allowed routes pass through
+	allowedPaths := []string{"/health", "/services", "/ssh/authorized-keys"}
+	for _, path := range allowedPaths {
+		t.Run("allowed:"+path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code == http.StatusForbidden {
+				t.Errorf("%s: should not be blocked (status = %d)", path, w.Code)
+			}
+		})
+	}
+}
+
+func TestPermissionMiddleware_NilPermissionsAllowsAll(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendAddr := backend.URL[len("http://"):]
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	gw.AddUpstream("/terminal", &Upstream{Address: backendAddr, WebSocket: true})
+
+	for prefix, upstream := range gw.config.Upstreams {
+		gw.registerProxy(prefix, upstream)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+
+	// No permissions set (nil) -- all should pass
+	handler := gw.BuildHandler()
+
+	req := httptest.NewRequest(http.MethodGet, "/terminal", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden {
+		t.Error("nil permissions should not block any route")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -160,6 +161,7 @@ type ControlCenter struct {
 	getServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
 	deviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
 	worker             WorkerCallbacks             // Worker management callbacks
+	permissions        PermissionsCallbacks        // Gateway permissions callbacks
 	authServiceURL     string                      // URL for device auth service
 	nexusURL           string                      // URL for headscale/nexus coordination server
 
@@ -231,6 +233,12 @@ type WorkerCallbacks struct {
 	IsRunning   func() bool                                     // Check if worker is running
 }
 
+// PermissionsCallbacks holds callbacks for gateway permission management.
+type PermissionsCallbacks struct {
+	Load func() *config.Permissions                 // Load current permissions
+	Save func(p *config.Permissions) error           // Save updated permissions
+}
+
 // Config holds control center configuration
 type Config struct {
 	Version            string
@@ -247,6 +255,7 @@ type Config struct {
 	GetServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
 	DeviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
 	Worker             WorkerCallbacks             // Worker management callbacks
+	Permissions        PermissionsCallbacks        // Gateway permissions callbacks
 }
 
 // New creates a new control center
@@ -267,6 +276,7 @@ func New(cfg Config) *ControlCenter {
 		getServiceLogsFn:   cfg.GetServiceLogsFn,
 		deviceAuth:      cfg.DeviceAuth,
 		worker:          cfg.Worker,
+		permissions:     cfg.Permissions,
 		authServiceURL:  cfg.AuthServiceURL,
 		nexusURL:        cfg.NexusURL,
 	}
@@ -529,6 +539,9 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		case '6':
 			cc.showInstallServiceModal()
+			return nil
+		case '7':
+			cc.showPermissionsModal()
 			return nil
 		case '0':
 			cc.showNetworkModal()
@@ -978,7 +991,7 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]1[-:-:-]  Add Service      [white::b]2[-:-:-]  Expose Port
   [white::b]3[-:-:-]  Port Forwards    [white::b]4[-:-:-]  SSH Access
   [white::b]5[-:-:-]  Ping All Peers   [white::b]6[-:-:-]  Install Service
-  [white::b]0[-:-:-]  Connect/Disconnect
+  [white::b]7[-:-:-]  Permissions      [white::b]0[-:-:-]  Connect/Disconnect
 
 [yellow]General:[-]
   [white::b]r[-:-:-]             Refresh status
@@ -1039,6 +1052,7 @@ func (cc *ControlCenter) getActions() []actionDef {
 		{key: "4", name: "SSH Access", desc: "[gray]Enable inbound SSH[-]", fn: cc.showSSHAccessModal},
 		{key: "5", name: "Ping Peers", desc: "[gray]Test connectivity[-]", fn: cc.pingPeers},
 		{key: "6", name: "Install Service", desc: "[gray]Run as system svc[-]", fn: cc.showInstallServiceModal},
+		{key: "7", name: "Permissions", desc: "[gray]Toggle capabilities[-]", fn: cc.showPermissionsModal},
 		connectAction,
 	}
 }

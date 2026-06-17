@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -754,6 +755,8 @@ func runWork(cmd *cobra.Command, args []string) {
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
 				} else {
+					// Include current permissions in heartbeat
+					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
 					go func() {
 						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
@@ -782,6 +785,8 @@ func runWork(cmd *cobra.Command, args []string) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
 			} else {
+				// Include current permissions in heartbeat
+				redisPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
 				go func() {
 					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
 					if deviceCode != "" {
@@ -967,6 +972,10 @@ func runWork(cmd *cobra.Command, args []string) {
 			TLSConfig:     gwTLSConfig,
 			NodeName:      nodeName,
 		})
+
+		// Load and apply permissions
+		perms := config.LoadPermissions(platform.ConfigDir())
+		gw.SetPermissions(perms)
 
 		// Register upstreams (same routes as cmd/serve.go)
 		gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})
@@ -1356,6 +1365,20 @@ func usageRecordPayload(r usage.UsageRecord) usageRecordJSON {
 		TotalTokens:      r.TotalTokens,
 		RequestBytes:     r.RequestBytes,
 		ResponseBytes:    r.ResponseBytes,
+	}
+}
+
+// permissionsToHeartbeat converts config.Permissions to the heartbeat wire format.
+func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
+	if p == nil {
+		return nil
+	}
+	return &heartbeat.PermissionState{
+		Console:  p.Console,
+		Desktop:  p.Desktop,
+		Files:    p.Files,
+		Services: p.Services,
+		SSH:      p.SSH,
 	}
 }
 

@@ -39,6 +39,10 @@ type APIPublisher struct {
 	pubSubChannel string // format: node:status:org:{orgId}:{hostname}
 	streamName    string // format: node:status:stream
 
+	// permissions is included in heartbeats so the web UI knows which capabilities
+	// the operator has enabled. Set via SetPermissions.
+	permissions *PermissionState
+
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
 
@@ -182,6 +186,7 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		NodeID:          p.nodeID,
 		HeadscaleNodeID: p.headscaleNodeID,
 		Status:          nodeStatus,
+		Permissions:     p.permissions,
 	}
 
 	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
@@ -246,4 +251,9 @@ func (p *APIPublisher) PubSubChannel() string {
 // StreamName returns the Stream name.
 func (p *APIPublisher) StreamName() string {
 	return p.streamName
+}
+
+// SetPermissions updates the permission state included in heartbeats.
+func (p *APIPublisher) SetPermissions(perms *PermissionState) {
+	p.permissions = perms
 }

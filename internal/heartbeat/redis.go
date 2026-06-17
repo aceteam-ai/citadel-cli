@@ -39,6 +39,17 @@ type StatusMessage struct {
 	HeadscaleNodeID  string             `json:"headscaleNodeId,omitempty"`
 	DeviceCode       string             `json:"deviceCode,omitempty"`
 	Status           *status.NodeStatus `json:"status"`
+	Permissions      *PermissionState   `json:"permissions,omitempty"`
+}
+
+// PermissionState mirrors config.Permissions for the heartbeat payload.
+// Kept separate to avoid coupling the heartbeat wire format to the config package.
+type PermissionState struct {
+	Console  bool `json:"console"`
+	Desktop  bool `json:"desktop"`
+	Files    bool `json:"files"`
+	Services bool `json:"services"`
+	SSH      bool `json:"ssh"`
 }
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
@@ -63,6 +74,10 @@ type RedisPublisher struct {
 
 	// Log callback (optional, for TUI mode)
 	logFn func(level, msg string)
+
+	// permissions is included in heartbeats so the web UI knows which capabilities
+	// the operator has enabled. Set via SetPermissions.
+	permissions *PermissionState
 
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
@@ -227,6 +242,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		HeadscaleNodeID: p.headscaleNodeID,
 		DeviceCode:      deviceCode,
 		Status:          nodeStatus,
+		Permissions:     p.permissions,
 	}
 
 	// Marshal to JSON
@@ -315,4 +331,11 @@ func (p *RedisPublisher) PubSubChannel() string {
 // StreamName returns the Stream name.
 func (p *RedisPublisher) StreamName() string {
 	return p.streamName
+}
+
+// SetPermissions updates the permission state included in heartbeats.
+func (p *RedisPublisher) SetPermissions(perms *PermissionState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.permissions = perms
 }

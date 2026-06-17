@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -104,6 +105,14 @@ func runControlCenter() {
 			Start:     ccStartWorker,
 			Stop:      ccStopWorker,
 			IsRunning: ccWorkerIsRunning,
+		},
+		Permissions: controlcenter.PermissionsCallbacks{
+			Load: func() *config.Permissions {
+				return config.LoadPermissions(platform.ConfigDir())
+			},
+			Save: func(p *config.Permissions) error {
+				return config.SavePermissions(platform.ConfigDir(), p)
+			},
 		},
 	}
 
@@ -923,6 +932,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					LogFn:           activity, // Route logs through TUI
 				}, collector)
 				if err == nil {
+					// Include current permissions in heartbeat
+					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
 					go func() {
 						activity("info", "Heartbeat publishing started")
 
