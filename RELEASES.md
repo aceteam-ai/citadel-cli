@@ -19,3 +19,21 @@ Auto-generated log of every release.
   - docs: clarify release instructions — always use release.sh for checksums
 
 
+---
+
+## v2.26.0 — 2026-06-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 5 |
+| Lines added | +46 |
+
+**Changes:**
+
+  - chore(release): v2.26.0
+  - chore: gitignore .release state directory
+  - chore: clear stale release state
+  - docs: clarify release instructions — always use release.sh for checksums
+
+
