@@ -227,12 +227,12 @@ HEADER
   log "Appended ${tag_prefix}${version} to $journal_file"
 }
 
-# ── Default hooks (overridden by release.config.sh) ────────────────────────
+# ── Default hooks (only set if not already defined by the sourcing script) ──
 
-hook_test()         { true; }
-hook_build()        { true; }
-hook_artifact()     { true; }
-hook_post_release() { true; }
+declare -F hook_test         &>/dev/null || hook_test()         { true; }
+declare -F hook_build        &>/dev/null || hook_build()        { true; }
+declare -F hook_artifact     &>/dev/null || hook_artifact()     { true; }
+declare -F hook_post_release &>/dev/null || hook_post_release() { true; }
 
 # ── Main release flow ─────────────────────────────────────────────────────
 
