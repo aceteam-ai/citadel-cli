@@ -314,12 +314,14 @@ run_release() {
   if ! step_done "test"; then
     step_msg "Running tests..."
     log "Running tests..."
-    if hook_test 2>&1 | tee -a "$LOG_FILE"; then
-      mark_step "test"
-      log "Tests passed"
-    else
-      fatal "Tests failed. Fix and re-run to resume."
+    # Run in subshell to preserve set -e behavior (if disables set -e)
+    local test_rc=0
+    (set -euo pipefail; hook_test) 2>&1 | tee -a "$LOG_FILE" || test_rc=$?
+    if [[ $test_rc -ne 0 ]]; then
+      fatal "Tests failed (exit $test_rc). Fix and re-run to resume."
     fi
+    mark_step "test"
+    log "Tests passed"
   else
     ok "Tests already passed."
   fi
@@ -356,12 +358,14 @@ run_release() {
   if ! step_done "build"; then
     step_msg "Building..."
     log "Build started"
-    if hook_build 2>&1 | tee -a "$LOG_FILE"; then
-      mark_step "build"
-      log "Build completed"
-    else
-      fatal "Build failed. Fix and re-run to resume from build step."
+    # Run in subshell to preserve set -e behavior (if disables set -e)
+    local build_rc=0
+    (set -euo pipefail; hook_build) 2>&1 | tee -a "$LOG_FILE" || build_rc=$?
+    if [[ $build_rc -ne 0 ]]; then
+      fatal "Build failed (exit $build_rc). Fix and re-run to resume from build step."
     fi
+    mark_step "build"
+    log "Build completed"
   else
     ok "Already built."
   fi
