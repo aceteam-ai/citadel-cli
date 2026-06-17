@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -126,7 +127,46 @@ func runControlCenter() {
 		// Try to reconnect if we have saved state
 		if network.HasState() {
 			cc.AddActivity("info", "Reconnecting to network...")
-			if connected, err := network.VerifyOrReconnect(ctx); err != nil {
+			connected, err := network.VerifyOrReconnect(ctx)
+			if err != nil && errors.Is(err, network.ErrStaleState) {
+				// Stale VPN keys — try auto-recovery with device API token
+				deviceConfig := getDeviceConfigFromFile()
+				if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+					cc.AddActivity("info", "VPN keys expired, attempting auto-recovery...")
+					apiBaseURL := deviceConfig.APIBaseURL
+					if apiBaseURL == "" {
+						apiBaseURL = authServiceURL
+					}
+					if freshKey, fetchErr := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken); fetchErr != nil {
+						cc.AddActivity("warning", fmt.Sprintf("Auto-recovery failed: %v", fetchErr))
+					} else {
+						// Try reconnect with existing state (preserves IP)
+						if ok, reconnErr := network.ReconnectWithAuthKey(ctx, freshKey); reconnErr == nil && ok {
+							cc.AddActivity("success", "VPN reconnected (IP preserved)")
+							networkConnected = true
+						} else {
+							// Clear state and connect fresh (new IP)
+							_ = network.ClearState()
+							hostname, _ := os.Hostname()
+							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
+							config := network.ServerConfig{
+								Hostname:   hostname,
+								ControlURL: nexusURL,
+								AuthKey:    freshKey,
+							}
+							if _, connectErr := network.Connect(freshCtx, config); connectErr == nil {
+								cc.AddActivity("success", "VPN reconnected (fresh state)")
+								networkConnected = true
+							} else {
+								cc.AddActivity("warning", fmt.Sprintf("VPN recovery failed: %v", connectErr))
+							}
+							freshCancel()
+						}
+					}
+				} else {
+					cc.AddActivity("warning", "VPN keys expired, login required")
+				}
+			} else if err != nil {
 				cc.AddActivity("warning", fmt.Sprintf("Network reconnect failed: %v", err))
 			} else if connected {
 				cc.AddActivity("success", "Connected to AceTeam Network")
