@@ -144,6 +144,68 @@ func TestNvidiaSMIErrorMessage(t *testing.T) {
 	}
 }
 
+func TestNvidiaSMIErrorMessageStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows")
+	}
+
+	// Driver/library version mismatch in stderr → reboot message
+	t.Run("driver_library_mismatch", func(t *testing.T) {
+		_, err := exec.Command("sh", "-c",
+			"echo 'Failed to initialize NVML: Driver/library version mismatch' >&2; exit 18").Output()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := NvidiaSMIErrorMessage(err)
+		if !strings.Contains(msg, "Driver/library version mismatch") {
+			t.Errorf("want 'Driver/library version mismatch', got %q", msg)
+		}
+		if !strings.Contains(msg, "reboot required") {
+			t.Errorf("want 'reboot required', got %q", msg)
+		}
+	})
+
+	// NVML Shared Library Not Found → drivers not installed
+	t.Run("nvml_not_found", func(t *testing.T) {
+		_, err := exec.Command("sh", "-c",
+			"echo 'NVML Shared Library Not Found' >&2; exit 1").Output()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := NvidiaSMIErrorMessage(err)
+		if !strings.Contains(msg, "not installed") {
+			t.Errorf("want 'not installed', got %q", msg)
+		}
+	})
+
+	// Unknown stderr → surface stderr text
+	t.Run("unknown_stderr", func(t *testing.T) {
+		_, err := exec.Command("sh", "-c",
+			"echo 'Some unexpected NVML error' >&2; exit 42").Output()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := NvidiaSMIErrorMessage(err)
+		if !strings.Contains(msg, "Some unexpected NVML error") {
+			t.Errorf("want stderr text in message, got %q", msg)
+		}
+	})
+
+	// Wrapped error with stderr (simulates GetGPUInfo path)
+	t.Run("wrapped_with_stderr", func(t *testing.T) {
+		_, err := exec.Command("sh", "-c",
+			"echo 'Failed to initialize NVML: Driver/library version mismatch' >&2; exit 18").Output()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		wrapped := fmt.Errorf("failed to query NVIDIA GPUs: %w", err)
+		msg := NvidiaSMIErrorMessage(wrapped)
+		if !strings.Contains(msg, "reboot required") {
+			t.Errorf("want 'reboot required' through wrapper, got %q", msg)
+		}
+	})
+}
+
 func TestFormatGPUInfo(t *testing.T) {
 	// Test with empty slice
 	result := FormatGPUInfo([]GPUInfo{})

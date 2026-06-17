@@ -291,28 +291,33 @@ func (c *Client) fetchLatestRelease() (*Release, error) {
 	return &release, nil
 }
 
-// isNewerVersion compares versions
-func (c *Client) isNewerVersion(newVersion string) (bool, error) {
-	// Strip leading 'v' if present
-	currentStr := strings.TrimPrefix(c.CurrentVersion, "v")
-	newStr := strings.TrimPrefix(newVersion, "v")
+// IsNewerVersion reports whether candidate is a strictly newer semver than
+// current. Both values may optionally carry a leading "v" prefix. The "dev"
+// and empty current versions are always considered outdated (returns true).
+func IsNewerVersion(current, candidate string) (bool, error) {
+	currentStr := strings.TrimPrefix(current, "v")
+	newStr := strings.TrimPrefix(candidate, "v")
 
-	// Handle "dev" version
 	if currentStr == "dev" || currentStr == "" {
 		return true, nil
 	}
 
-	current, err := version.NewVersion(currentStr)
+	cur, err := version.NewVersion(currentStr)
 	if err != nil {
-		return false, fmt.Errorf("invalid current version %s: %w", c.CurrentVersion, err)
+		return false, fmt.Errorf("invalid current version %s: %w", current, err)
 	}
 
-	latest, err := version.NewVersion(newStr)
+	lat, err := version.NewVersion(newStr)
 	if err != nil {
-		return false, fmt.Errorf("invalid new version %s: %w", newVersion, err)
+		return false, fmt.Errorf("invalid new version %s: %w", candidate, err)
 	}
 
-	return latest.GreaterThan(current), nil
+	return lat.GreaterThan(cur), nil
+}
+
+// isNewerVersion compares the client's current version against newVersion.
+func (c *Client) isNewerVersion(newVersion string) (bool, error) {
+	return IsNewerVersion(c.CurrentVersion, newVersion)
 }
 
 // getDownloadURL constructs the download URL for the current platform

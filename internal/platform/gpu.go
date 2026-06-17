@@ -59,9 +59,22 @@ func NvidiaSMIErrorMessage(err error) string {
 		return "nvidia-smi not found — NVIDIA drivers are not installed"
 	}
 
-	// Binary ran but returned a non-zero exit code
+	// Binary ran but returned a non-zero exit code.
+	// Check stderr first — it is more specific than the exit code alone.
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
+		if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+			if strings.Contains(stderr, "Driver/library version mismatch") {
+				return "Driver/library version mismatch — reboot required after driver update"
+			}
+			if strings.Contains(stderr, "NVML Shared Library Not Found") {
+				return "nvidia-smi not found — NVIDIA drivers are not installed"
+			}
+			// Unknown stderr content — surface it directly
+			return fmt.Sprintf("nvidia-smi: %s", stderr)
+		}
+
+		// No stderr captured — fall back to exit-code heuristic
 		code := exitErr.ExitCode()
 		if hint := NvidiaSMIExitHint(code); hint != "" {
 			return hint
