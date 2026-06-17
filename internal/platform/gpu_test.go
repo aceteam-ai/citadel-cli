@@ -1,7 +1,11 @@
 package platform
 
 import (
+	"errors"
+	"fmt"
+	"os/exec"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +50,97 @@ func TestWindowsGPUDetectorGetGPUCount(t *testing.T) {
 	count := detector.GetGPUCount()
 	if count < 0 {
 		t.Errorf("WindowsGPUDetector.GetGPUCount() = %d, want >= 0", count)
+	}
+}
+
+func TestNvidiaSMIExitHint(t *testing.T) {
+	tests := []struct {
+		code     int
+		wantHint string
+	}{
+		{6, "No NVIDIA GPU detected by the driver"},
+		{9, "GPU hardware error"},
+		{15, "Driver version mismatch"},
+		{18, "NVIDIA drivers not loaded"},
+		{1, ""},  // unknown code
+		{0, ""},  // success (shouldn't be called, but safe)
+		{42, ""}, // arbitrary unknown code
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("exit_%d", tt.code), func(t *testing.T) {
+			hint := NvidiaSMIExitHint(tt.code)
+			if tt.wantHint == "" {
+				if hint != "" {
+					t.Errorf("NvidiaSMIExitHint(%d) = %q, want empty", tt.code, hint)
+				}
+			} else {
+				if !strings.Contains(hint, tt.wantHint) {
+					t.Errorf("NvidiaSMIExitHint(%d) = %q, want substring %q", tt.code, hint, tt.wantHint)
+				}
+			}
+		})
+	}
+}
+
+func TestNvidiaSMIErrorMessage(t *testing.T) {
+	// nil error
+	if msg := NvidiaSMIErrorMessage(nil); msg != "" {
+		t.Errorf("NvidiaSMIErrorMessage(nil) = %q, want empty", msg)
+	}
+
+	// Binary not found (exec.Error)
+	pathErr := &exec.Error{Name: "nvidia-smi", Err: exec.ErrNotFound}
+	msg := NvidiaSMIErrorMessage(pathErr)
+	if !strings.Contains(msg, "not found") && !strings.Contains(msg, "not installed") {
+		t.Errorf("NvidiaSMIErrorMessage(pathErr) = %q, want 'not found' or 'not installed'", msg)
+	}
+
+	// Known exit code — produce a real *exec.ExitError via sh
+	if runtime.GOOS != "windows" {
+		cmd := exec.Command("sh", "-c", "exit 18")
+		err := cmd.Run()
+		if err == nil {
+			t.Fatal("expected exit 18 to produce an error")
+		}
+		msg = NvidiaSMIErrorMessage(err)
+		if !strings.Contains(msg, "NVIDIA drivers not loaded") {
+			t.Errorf("NvidiaSMIErrorMessage(exit 18) = %q, want 'NVIDIA drivers not loaded'", msg)
+		}
+	}
+
+	// Unknown exit code
+	if runtime.GOOS != "windows" {
+		cmd := exec.Command("sh", "-c", "exit 99")
+		err := cmd.Run()
+		if err == nil {
+			t.Fatal("expected exit 99 to produce an error")
+		}
+		msg = NvidiaSMIErrorMessage(err)
+		if !strings.Contains(msg, "99") {
+			t.Errorf("NvidiaSMIErrorMessage(exit 99) = %q, want to contain '99'", msg)
+		}
+	}
+
+	// Wrapped error — simulates what GetGPUInfo returns: fmt.Errorf("failed to query...: %w", exitErr)
+	if runtime.GOOS != "windows" {
+		cmd := exec.Command("sh", "-c", "exit 18")
+		err := cmd.Run()
+		if err == nil {
+			t.Fatal("expected exit 18 to produce an error")
+		}
+		wrapped := fmt.Errorf("failed to query NVIDIA GPUs: %w", err)
+		msg = NvidiaSMIErrorMessage(wrapped)
+		if !strings.Contains(msg, "NVIDIA drivers not loaded") {
+			t.Errorf("NvidiaSMIErrorMessage(wrapped exit 18) = %q, want 'NVIDIA drivers not loaded'", msg)
+		}
+	}
+
+	// Arbitrary error (neither exec.Error nor exec.ExitError)
+	genericErr := errors.New("something went wrong")
+	msg = NvidiaSMIErrorMessage(genericErr)
+	if !strings.Contains(msg, "something went wrong") {
+		t.Errorf("NvidiaSMIErrorMessage(generic) = %q, want to contain original message", msg)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const detectionTimeout = 5 * time.Second
@@ -32,8 +34,10 @@ type GPUDevice struct {
 
 // GPUCapabilities holds the full GPU capability summary for a node.
 type GPUCapabilities struct {
-	Devices []GPUDevice `json:"devices,omitempty" yaml:"devices,omitempty"`
-	Count   int         `json:"count" yaml:"count"`
+	Devices      []GPUDevice `json:"devices,omitempty" yaml:"devices,omitempty"`
+	Count        int         `json:"count" yaml:"count"`
+	DriverStatus string      `json:"driver_status,omitempty" yaml:"driver_status,omitempty"` // "ok", "not_loaded", "error", or "" (unknown)
+	DriverError  string      `json:"driver_error,omitempty" yaml:"driver_error,omitempty"`   // human-readable error when drivers fail
 }
 
 // NodeCapabilities aggregates all detected capabilities for a node.
@@ -44,14 +48,31 @@ type NodeCapabilities struct {
 }
 
 // DetectGPUCapabilities runs nvidia-smi and returns structured GPU information.
-// Returns nil if no nvidia-smi or no GPUs detected.
+// When nvidia-smi fails but lspci detects NVIDIA hardware, a GPUCapabilities
+// is still returned with the hardware name but empty Tag/VRAMTag fields so
+// the GPU is visible in status displays without producing routing tags.
+// Returns nil only if no NVIDIA hardware is detected at all.
 func DetectGPUCapabilities() *GPUCapabilities {
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=name,memory.total,count", "--format=csv,noheader,nounits")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil
+		// nvidia-smi failed — check if hardware is physically present via lspci
+		hwName := platform.DetectNvidiaHardware()
+		if hwName == "" {
+			return nil // No NVIDIA hardware at all
+		}
+		// Hardware present but drivers not working — return display-only entry
+		// with empty Tag/VRAMTag so no routing tags are generated.
+		return &GPUCapabilities{
+			Devices: []GPUDevice{
+				{Name: hwName}, // Tag and VRAMTag intentionally empty
+			},
+			Count:        1,
+			DriverStatus: "not_loaded",
+			DriverError:  platform.NvidiaSMIErrorMessage(err),
+		}
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
@@ -107,8 +128,9 @@ func DetectGPUCapabilities() *GPUCapabilities {
 	}
 
 	return &GPUCapabilities{
-		Devices: devices,
-		Count:   totalCount,
+		Devices:      devices,
+		Count:        totalCount,
+		DriverStatus: "ok",
 	}
 }
 
