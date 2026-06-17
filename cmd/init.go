@@ -559,9 +559,14 @@ func getNodeName() (string, error) {
 		return saved, nil
 	}
 
-	// 3. Always generate a citadel-<short_id> hostname instead of inheriting
-	//    the OS hostname, which is often useless on live ISOs (e.g., "debian").
-	//    Users who want a custom name can use --node-name.
+	// 3. Use the current OS hostname if it's meaningful (user-chosen).
+	//    Skip generic names from live ISOs and fresh installs.
+	if current, err := os.Hostname(); err == nil && !platform.IsGenericHostname(current) {
+		Debug("preserving existing OS hostname: %s", current)
+		return current, nil
+	}
+
+	// 4. Generate a citadel-<short_id> hostname for generic/missing hostnames.
 	generated, err := platform.GenerateCitadelHostname()
 	if err != nil {
 		return "", fmt.Errorf("could not generate hostname: %w", err)
@@ -1289,15 +1294,19 @@ func configureNvidiaDocker() error {
 // connectToNetwork connects to the AceTeam Network using the embedded tsnet library.
 // No external Tailscale installation is required.
 //
-// Before registering with Headscale, it attempts to set the system hostname to
-// match the node name (best-effort, requires root). The node name is always used
-// for Headscale registration regardless of whether the OS hostname update succeeds.
+// Only overwrites the OS hostname when the current hostname is generic (live ISO,
+// fresh install). User-chosen hostnames are preserved.
 func connectToNetwork(nodeName, authKey string) error {
-	// Attempt to set the OS hostname to match (best-effort, needs root)
-	if err := platform.SetHostname(nodeName); err != nil {
-		Debug("could not set system hostname (expected without root): %v", err)
+	// Only overwrite the OS hostname if the current one is generic.
+	// Preserves user-chosen hostnames like "aceteamvm" or "gpu-server".
+	if current, err := os.Hostname(); err != nil || platform.IsGenericHostname(current) {
+		if err := platform.SetHostname(nodeName); err != nil {
+			Debug("could not set system hostname (expected without root): %v", err)
+		} else {
+			Debug("system hostname set to %s", nodeName)
+		}
 	} else {
-		Debug("system hostname set to %s", nodeName)
+		Debug("preserving existing OS hostname %q (registering as %q on network)", current, nodeName)
 	}
 
 	// Persist the hostname to config so re-runs are stable

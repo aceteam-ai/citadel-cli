@@ -9,6 +9,31 @@ import (
 	"strings"
 )
 
+// genericHostnames are OS hostnames that indicate a fresh install or live ISO
+// and should be replaced with a citadel-<id> name. Anything not in this list
+// is treated as a user-chosen hostname worth preserving.
+var genericHostnames = map[string]bool{
+	"":          true,
+	"localhost":  true,
+	"debian":     true,
+	"ubuntu":     true,
+	"fedora":     true,
+	"archlinux":  true,
+	"nixos":      true,
+	"raspberrypi": true,
+	"linux":      true,
+	"host":       true,
+	"changeme":   true,
+	"default":    true,
+}
+
+// IsGenericHostname returns true if the hostname looks like a default OS
+// hostname that should be replaced during Citadel registration.
+func IsGenericHostname(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	return genericHostnames[lower]
+}
+
 // machineIDPath is the path to the machine-id file. Overridable in tests.
 var machineIDPath = "/etc/machine-id"
 
