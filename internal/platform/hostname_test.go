@@ -176,6 +176,30 @@ func TestGenerateRandomHexIDUniqueness(t *testing.T) {
 	}
 }
 
+func TestIsGenericHostname(t *testing.T) {
+	generic := []string{
+		"", "localhost", "debian", "ubuntu", "fedora",
+		"archlinux", "nixos", "raspberrypi", "linux",
+		"host", "changeme", "default",
+		"DEBIAN", "Ubuntu", " debian ", // case/whitespace variants
+	}
+	for _, name := range generic {
+		if !IsGenericHostname(name) {
+			t.Errorf("IsGenericHostname(%q) = false, want true", name)
+		}
+	}
+
+	meaningful := []string{
+		"aceteamvm", "gpu-server", "jason-desktop",
+		"citadel-23bd5f21", "my-workstation", "prod-node-1",
+	}
+	for _, name := range meaningful {
+		if IsGenericHostname(name) {
+			t.Errorf("IsGenericHostname(%q) = true, want false", name)
+		}
+	}
+}
+
 func TestSetHostnameNonLinux(t *testing.T) {
 	// SetHostname is a no-op on non-Linux platforms
 	if IsLinux() {
