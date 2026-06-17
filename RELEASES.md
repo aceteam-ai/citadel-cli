@@ -56,3 +56,14 @@ Auto-generated log of every release.
   - docs: clarify release instructions — always use release.sh for checksums
 
 
+---
+
+## v2.27.0 — 2026-06-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 0 |
+| Files changed | 0 |
+| Lines added | +0 |
+
+
