@@ -113,6 +113,34 @@ func TestIsNewerVersion(t *testing.T) {
 	}
 }
 
+func TestIsNewerVersionExported(t *testing.T) {
+	tests := []struct {
+		name      string
+		current   string
+		candidate string
+		want      bool
+		wantErr   bool
+	}{
+		{"upgrade", "v2.21.0", "v2.22.0", true, false},
+		{"downgrade rejected", "v2.22.0", "v2.21.0", false, false},
+		{"same version", "v2.22.0", "v2.22.0", false, false},
+		{"dev always updates", "dev", "v1.0.0", true, false},
+		{"empty always updates", "", "v1.0.0", true, false},
+		{"without v prefix", "2.21.0", "2.22.0", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := IsNewerVersion(tt.current, tt.candidate)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("IsNewerVersion(%q, %q) error = %v, wantErr %v", tt.current, tt.candidate, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("IsNewerVersion(%q, %q) = %v, want %v", tt.current, tt.candidate, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetBinaryArchiveName(t *testing.T) {
 	client := NewClient("v1.0.0")
 	release := &Release{TagName: "v1.2.3"}

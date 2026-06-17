@@ -204,14 +204,17 @@ func checkForUpdateOnStartup(silent bool) {
 		return
 	}
 
-	// Show cached update notification immediately (no network call)
-	if state.AvailableUpdate != "" && state.AvailableUpdate != Version {
-		if silent {
-			// Store for TUI to display via activity log
-			deferredUpdateNotification = state.AvailableUpdate
-		} else {
-			// Print to stdout for non-TUI commands
-			fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
+	// Show cached update notification only if the cached version is strictly newer (semver).
+	// A simple != check would incorrectly suggest a downgrade when the cached value is older
+	// than the running binary (e.g. binary updated but cached state is stale).
+	if state.AvailableUpdate != "" {
+		newer, err := update.IsNewerVersion(Version, state.AvailableUpdate)
+		if err == nil && newer {
+			if silent {
+				deferredUpdateNotification = state.AvailableUpdate
+			} else {
+				fmt.Printf("\n📦 Update available: %s → %s (run 'citadel update install')\n\n", Version, state.AvailableUpdate)
+			}
 		}
 	}
 
