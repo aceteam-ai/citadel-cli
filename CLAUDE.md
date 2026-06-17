@@ -55,24 +55,37 @@ go build -o citadel .
 
 ### Releasing
 
-**Always use `release.sh` to create releases.** Do not manually create tags or GitHub releases.
+**ALWAYS use `scripts/release.sh` to create releases.** Never manually create tags, GitHub releases, or upload binaries. Manual releases break the auto-updater because they miss the `checksums.txt` asset.
 
 ```bash
-# Interactive release
-./release.sh
+# Standard minor bump release (most common)
+./scripts/release.sh
 
-# Non-interactive with version
-./release.sh -v v1.2.0 -y
+# Dry run to preview what will happen
+./scripts/release.sh --dry-run
 
-# Dry run to preview
-./release.sh --dry-run -v v1.2.0
+# Patch release
+./scripts/release.sh patch
+
+# Check state of an in-progress release
+./scripts/release.sh --status
+
+# Resume after a failure
+./scripts/release.sh --resume
+
+# Clear stale state and start fresh
+./scripts/release.sh --clean
 ```
 
 The release script handles:
-1. Creating and pushing the git tag
-2. Building artifacts for all platforms
-3. Creating the GitHub release with binaries
-4. **Updating the Homebrew tap** (aceteam-ai/homebrew-tap)
+1. Version bump (reads latest `v*` tag, increments minor)
+2. Running `go test ./...` and `go vet ./...`
+3. Cross-platform builds (linux/darwin/windows, amd64/arm64)
+4. **Generating `checksums.txt`** (sha256sum of all archives — required by auto-updater)
+5. Creating annotated git tag and pushing
+6. Creating GitHub Release with all binaries + checksums attached
+
+**Why this matters:** The `citadel update` auto-updater downloads `checksums.txt` to verify binary integrity. If checksums are missing, nodes see `checksum fetch failed with status: 404 Not Found` and can't update.
 
 ### Testing
 ```bash
