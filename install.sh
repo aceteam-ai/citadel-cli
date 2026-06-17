@@ -389,12 +389,12 @@ install_citadel_binary() {
     tmp_dir=$(mktemp -d)
 
     msg "Downloading ${archive}..."
-    if ! curl -sSL -o "${tmp_dir}/${archive}" "${base_url}/${archive}"; then
+    if ! curl -fsSL -o "${tmp_dir}/${archive}" "${base_url}/${archive}"; then
         rm -rf "$tmp_dir"
         die "Failed to download ${archive}"
     fi
 
-    if ! curl -sSL -o "${tmp_dir}/${checksum_file}" "${base_url}/${checksum_file}"; then
+    if ! curl -fsSL -o "${tmp_dir}/${checksum_file}" "${base_url}/${checksum_file}"; then
         rm -rf "$tmp_dir"
         die "Failed to download checksums"
     fi

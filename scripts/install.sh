@@ -196,15 +196,15 @@ install_citadel() {
 
   local tmp_dir
   tmp_dir=$(mktemp -d)
-  trap 'rm -rf "$tmp_dir"' EXIT # Ensure cleanup on exit/error
+  trap 'rm -rf "${tmp_dir:-}"' EXIT # Ensure cleanup on exit/error
 
   msg "Downloading Citadel CLI ${version} for ${arch}..."
 
   # Download the archive and checksums
-  if ! curl -sSL -o "${tmp_dir}/${binary_archive}" "${download_url_base}/${binary_archive}"; then
+  if ! curl -fsSL -o "${tmp_dir}/${binary_archive}" "${download_url_base}/${binary_archive}"; then
     err "Failed to download binary archive. Check version and architecture."
   fi
-  if ! curl -sSL -o "${tmp_dir}/${checksum_file}" "${download_url_base}/${checksum_file}"; then
+  if ! curl -fsSL -o "${tmp_dir}/${checksum_file}" "${download_url_base}/${checksum_file}"; then
     err "Failed to download checksums file."
   fi
 
