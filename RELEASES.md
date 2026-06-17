@@ -112,3 +112,28 @@ Auto-generated log of every release.
   - docs: clarify release instructions — always use release.sh for checksums
 
 
+---
+
+## v2.26.0 — 2026-06-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 11 |
+| Files changed | 7 |
+| Lines added | +155 |
+
+**Changes:**
+
+  - fix(release): preserve set -e in test/build hooks via subshell
+  - chore(release): v2.26.0
+  - chore(release): v2.26.0
+  - fix(release): use correct build target ./cmd/citadel and CGO_ENABLED=0
+  - chore(release): v2.27.0
+  - chore(release): v2.26.0
+  - chore(release): v2.26.0
+  - chore(release): v2.26.0
+  - chore: gitignore .release state directory
+  - chore: clear stale release state
+  - docs: clarify release instructions — always use release.sh for checksums
+
+
