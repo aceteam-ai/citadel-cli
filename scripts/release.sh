@@ -94,7 +94,8 @@ hook_build() {
 
     local archive_name="citadel_v${version}_${os}_${arch}"
     if [[ "$os" == "windows" ]]; then
-      (cd "$build_dir" && zip -q "$release_dir/${archive_name}.zip" "citadel${ext}")
+      cp "$REPO_ROOT/scripts/windows/citadel.bat" "$build_dir/"
+      (cd "$build_dir" && zip -q "$release_dir/${archive_name}.zip" "citadel${ext}" "citadel.bat")
     else
       tar -czf "$release_dir/${archive_name}.tar.gz" -C "$build_dir" "citadel${ext}"
     fi
