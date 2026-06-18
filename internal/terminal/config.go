@@ -10,7 +10,8 @@ import (
 
 // Config holds the terminal server configuration
 type Config struct {
-	// Host is the address the WebSocket server binds to (default: 0.0.0.0)
+	// Host is the address the WebSocket server binds to (default: 127.0.0.1)
+	// External access comes through the tsnet VPN listener, not the TCP bind.
 	Host string
 
 	// Port is the port the WebSocket server listens on
@@ -53,7 +54,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		Host:                 getEnvOrDefault("CITADEL_TERMINAL_HOST", "0.0.0.0"),
+		Host:                 getEnvOrDefault("CITADEL_TERMINAL_HOST", "127.0.0.1"),
 		Port:                 getEnvInt("CITADEL_TERMINAL_PORT", 7860),
 		Version:              "dev",
 		Enabled:              getEnvBool("CITADEL_TERMINAL_ENABLED", true),

@@ -319,6 +319,18 @@ func startTerminalServer(orgID string) error {
 	// Create and start the server
 	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
 
+	// Add VPN listener so the terminal server is reachable over the tsnet VPN.
+	// The TCP bind is localhost-only for security; external access comes through tsnet.
+	if network.IsGlobalConnected() {
+		vpnAddr := fmt.Sprintf(":%d", config.Port)
+		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+			Log("terminal server VPN listener failed (localhost-only): %v", err)
+		} else {
+			ccTerminalServer.AddListener(vpnLn)
+			Log("terminal server VPN listener on %s", vpnLn.Addr().String())
+		}
+	}
+
 	// Suppress terminal server logging in TUI mode to prevent display corruption
 	ccTerminalServer.SetSilent()
 
