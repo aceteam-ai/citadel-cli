@@ -356,3 +356,18 @@ Auto-generated log of every release.
   - fix: use LOCALAPPDATA for Windows state directory (#205)
 
 
+---
+
+## v2.28.0 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 1 |
+| Lines added | +7 |
+
+**Changes:**
+
+  - feat(capabilities): add OS and architecture auto-detection tags (#206)
+
+
