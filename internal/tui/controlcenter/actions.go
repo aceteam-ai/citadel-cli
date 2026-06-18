@@ -708,41 +708,30 @@ func (cc *ControlCenter) pingPeers() {
 	}()
 }
 
-// showInstallServiceModal shows system service installation options (Action 6)
-func (cc *ControlCenter) showInstallServiceModal() {
+// showSystemServiceModal shows system service install/uninstall options.
+func (cc *ControlCenter) showSystemServiceModal() {
 	cc.inModal = true
 
-	// Check if already installed
 	installed := isServiceInstalled()
 
 	if installed {
-		// Already installed - show status and management options
-		var sb strings.Builder
-		sb.WriteString("[green::b]Status: Citadel is installed as a system service[-:-:-]\n\n")
+		modal := tview.NewModal().
+			SetText("[green::b]Citadel is installed as a system service[-:-:-]\n\nIt will start automatically on boot and run in the background.\n\nWould you like to uninstall it?").
+			AddButtons([]string{"Close", "Uninstall"}).
+			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				cc.inModal = false
+				if buttonLabel == "Uninstall" {
+					go cc.executeServiceUninstall()
+				}
+				cc.app.SetRoot(cc.rootView, true)
+				cc.updatePaneFocus()
+			})
 
-		switch runtime.GOOS {
-		case "linux":
-			sb.WriteString("[yellow]Management commands:[-]\n")
-			sb.WriteString("  [gray]sudo systemctl status citadel[-]\n")
-			sb.WriteString("  [gray]sudo systemctl restart citadel[-]\n")
-			sb.WriteString("  [gray]sudo systemctl stop citadel[-]\n")
-			sb.WriteString("  [gray]sudo citadel service uninstall[-]\n")
-		case "darwin":
-			sb.WriteString("[yellow]Management commands:[-]\n")
-			sb.WriteString("  [gray]launchctl list | grep citadel[-]\n")
-			sb.WriteString("  [gray]citadel service uninstall[-]\n")
-		case "windows":
-			sb.WriteString("[yellow]Management commands:[-]\n")
-			sb.WriteString("  [gray]sc query citadel[-]\n")
-			sb.WriteString("  [gray]citadel service uninstall[-]  (Run as Administrator)\n")
-		}
-
-		sb.WriteString("\n[gray]Press any key to close[-]")
-		cc.showInfoModal("Install Service", sb.String())
+		cc.app.SetRoot(modal, true)
+		cc.app.SetFocus(modal)
 		return
 	}
 
-	// Not installed - show confirmation to install
 	var description string
 	switch runtime.GOOS {
 	case "linux":
@@ -771,6 +760,44 @@ func (cc *ControlCenter) showInstallServiceModal() {
 
 	cc.app.SetRoot(modal, true)
 	cc.app.SetFocus(modal)
+}
+
+// executeServiceUninstall runs the service uninstall command
+func (cc *ControlCenter) executeServiceUninstall() {
+	cc.AddActivity("info", "Uninstalling Citadel service...")
+
+	exePath, err := os.Executable()
+	if err != nil {
+		cc.AddActivity("error", fmt.Sprintf("Failed to find executable: %v", err))
+		return
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		cmd = exec.Command("sudo", exePath, "service", "uninstall")
+	case "darwin":
+		cmd = exec.Command(exePath, "service", "uninstall")
+	case "windows":
+		cmd = exec.Command(exePath, "service", "uninstall")
+	default:
+		cc.AddActivity("error", "Platform not supported")
+		return
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		cc.AddActivity("error", fmt.Sprintf("Uninstall failed: %v", err))
+		if len(output) > 0 {
+			lines := strings.Split(string(output), "\n")
+			if len(lines) > 0 && lines[0] != "" {
+				cc.AddActivity("error", lines[0])
+			}
+		}
+		return
+	}
+
+	cc.AddActivity("success", "Citadel service uninstalled")
 }
 
 // executeServiceInstall runs the service installation command
@@ -831,6 +858,139 @@ func isServiceInstalled() bool {
 	return false
 }
 
+
+// showNetworkingModal shows a combined panel for Expose Port, Port Forwards, and SSH Access.
+func (cc *ControlCenter) showNetworkingModal() {
+	cc.inModal = true
+
+	// Left: menu list
+	list := tview.NewList()
+	list.SetBorder(true).SetTitle(" Networking ")
+	list.SetHighlightFullLine(true)
+	list.SetSelectedBackgroundColor(tcell.ColorDarkCyan)
+
+	// Right: detail pane
+	detailView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true)
+	detailView.SetBorder(true).SetTitle(" Details ")
+
+	type menuItem struct {
+		name   string
+		desc   string
+		detail string
+		action func()
+	}
+
+	// SSH status
+	sshStatusStr := "[red]Not running[-]"
+	sshDetail := "SSH server is not running on this machine."
+	if isSSHServerRunning() {
+		sshStatusStr = "[green]Running[-]"
+		sshDetail = "SSH server is running on port 22."
+	}
+	if cc.data.Connected && cc.data.NodeIP != "" {
+		sshDetail += fmt.Sprintf("\nRemote access: ssh user@%s", cc.data.NodeIP)
+	}
+
+	// Port forwards count
+	fwdCount := len(cc.activeForwards)
+	fwdStatus := "[gray]None active[-]"
+	if fwdCount > 0 {
+		fwdStatus = fmt.Sprintf("[green]%d active[-]", fwdCount)
+	}
+
+	items := []menuItem{
+		{
+			name:   "Expose Port",
+			desc:   "Share a local port on the network",
+			detail: "Creates a listener on the AceTeam VPN mesh that forwards\ntraffic to a local port on this machine.\n\nOther nodes on the network can connect to the exposed port\nvia your node's VPN IP address.",
+			action: func() {
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.showExposePortModal()
+			},
+		},
+		{
+			name:   fmt.Sprintf("Port Forwards  %s", fwdStatus),
+			desc:   "View and manage active tunnels",
+			detail: fmt.Sprintf("Active port forwards: %d\n\nPort forwards expose local services to the AceTeam network.\nYou can close individual forwards from this panel.", fwdCount),
+			action: func() {
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.showPortForwardsModal()
+			},
+		},
+		{
+			name:   fmt.Sprintf("SSH Access  %s", sshStatusStr),
+			desc:   "SSH server status and setup",
+			detail: fmt.Sprintf("%s\n\n%s", sshDetail, cc.sshSetupInstructions()),
+			action: func() {
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.showSSHAccessModal()
+			},
+		},
+	}
+
+	// Update detail on selection change
+	updateDetail := func(idx int) {
+		if idx >= 0 && idx < len(items) {
+			detailView.SetText(fmt.Sprintf(
+				"[yellow::b]%s[-:-:-]\n[gray]%s[-]\n\n%s",
+				items[idx].name, items[idx].desc, items[idx].detail,
+			))
+		}
+	}
+	updateDetail(0)
+
+	for i, item := range items {
+		idx := i
+		itemCopy := item
+		list.AddItem(item.name, item.desc, 0, func() {
+			_ = idx
+			itemCopy.action()
+		})
+	}
+
+	list.SetChangedFunc(func(idx int, mainText, secondaryText string, shortcut rune) {
+		updateDetail(idx)
+	})
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			cc.inModal = false
+			cc.app.SetRoot(cc.rootView, true)
+			cc.updatePaneFocus()
+			return nil
+		}
+		return event
+	})
+
+	layout := tview.NewFlex().
+		AddItem(list, 0, 1, true).
+		AddItem(detailView, 0, 1, false)
+
+	cc.app.SetRoot(layout, true)
+	cc.app.SetFocus(list)
+}
+
+// sshSetupInstructions returns OS-specific SSH setup instructions.
+func (cc *ControlCenter) sshSetupInstructions() string {
+	if isSSHServerRunning() {
+		return "[green]SSH server is active and accepting connections.[-]"
+	}
+	switch runtime.GOOS {
+	case "linux":
+		return "To enable SSH:\n  sudo apt install openssh-server\n  sudo systemctl enable --now ssh"
+	case "darwin":
+		return "To enable SSH:\n  System Preferences > Sharing > Remote Login"
+	case "windows":
+		return "To enable SSH:\n  Settings > Apps > Optional Features > OpenSSH Server"
+	default:
+		return "Install and start an SSH server to enable remote access."
+	}
+}
 
 // showNetworkModal shows connect or disconnect options based on current state (Action 0)
 func (cc *ControlCenter) showNetworkModal() {
@@ -1705,9 +1865,18 @@ func (cc *ControlCenter) showPeerDetailModal() {
 	cc.app.SetFocus(table)
 }
 
-// showPermissionsModal displays the gateway permissions toggle panel (Action 7).
-// Each capability can be toggled on/off. Changes are saved immediately.
-func (cc *ControlCenter) showPermissionsModal() {
+// builtinServiceDef defines a built-in service with its permission toggle and detail info.
+type builtinServiceDef struct {
+	name    string
+	desc    string
+	detail  string
+	enabled *bool
+}
+
+// showBuiltinServicesModal displays the unified Built-in Services panel.
+// Combines the old permissions modal with per-service status and details.
+// Each service can be toggled on/off; a detail pane updates as you navigate.
+func (cc *ControlCenter) showBuiltinServicesModal() {
 	if cc.permissions.Load == nil || cc.permissions.Save == nil {
 		cc.AddActivity("warning", "Permissions not configured")
 		return
@@ -1717,67 +1886,117 @@ func (cc *ControlCenter) showPermissionsModal() {
 
 	perms := cc.permissions.Load()
 
-	// Capability definitions with descriptions
-	type capDef struct {
-		name    string
-		desc    string
-		enabled *bool
-	}
-	caps := []capDef{
-		{"Console", "Terminal WebSocket access (remote shell)", &perms.Console},
-		{"Desktop", "VNC, screenshots, and remote actions", &perms.Desktop},
-		{"Files", "File browser API", &perms.Files},
-		{"Services", "Service list and management", &perms.Services},
-		{"SSH", "SSH authorized_keys sync", &perms.SSH},
+	// SSH status for detail
+	sshStatus := "Not running"
+	if isSSHServerRunning() {
+		sshStatus = "Running on port 22"
 	}
 
+	// Build service definitions with details
+	services := []builtinServiceDef{
+		{
+			name:    "Console",
+			desc:    "Remote terminal access",
+			detail:  "Provides WebSocket-based terminal access to this machine.\nRemote users can open a shell session through the AceTeam web UI.\nGateway route: /terminal",
+			enabled: &perms.Console,
+		},
+		{
+			name:    "Desktop",
+			desc:    "VNC, screenshots, remote actions",
+			detail:  "Enables remote desktop access via VNC and screenshot capture.\nIncludes remote keyboard/mouse actions.\nGateway routes: /vnc, /api/screenshot, /api/actions",
+			enabled: &perms.Desktop,
+		},
+		{
+			name:    "Files",
+			desc:    "File browser API",
+			detail:  "Exposes a file browser API for remote file access.\nAllows reading, writing, and searching files on this machine.\nGateway routes: /api/files/*",
+			enabled: &perms.Files,
+		},
+		{
+			name:    "Services",
+			desc:    "Service list and management",
+			detail:  "Allows remote users to view and manage Docker services.\nIncludes start, stop, restart, and log access.\nGateway route: /services",
+			enabled: &perms.Services,
+		},
+		{
+			name:    "SSH",
+			desc:    "SSH authorized_keys sync",
+			detail:  fmt.Sprintf("Syncs SSH authorized keys from the AceTeam platform.\nLocal SSH server: %s\nGateway route: /ssh", sshStatus),
+			enabled: &perms.SSH,
+		},
+	}
+
+	// Left: service list table
 	table := tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false)
-	table.SetBorder(true).SetTitle(" Gateway Permissions ")
+	table.SetBorder(true).SetTitle(" Built-in Services ")
 	table.SetSelectedStyle(tcell.StyleDefault.
 		Background(tcell.ColorDarkBlue).
 		Foreground(tcell.ColorWhite))
 
+	// Right: detail pane
+	detailView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true)
+	detailView.SetBorder(true).SetTitle(" Details ")
+
 	renderRows := func() {
 		table.Clear()
-		for i, c := range caps {
-			checkbox := "[ ]"
-			stateColor := "[gray]"
-			if *c.enabled {
-				checkbox = "[x]"
+		for i, svc := range services {
+			checkbox := "✗"
+			stateColor := "[red]"
+			statusText := "disabled"
+			if *svc.enabled {
+				checkbox = "✓"
 				stateColor = "[green]"
+				statusText = "enabled"
 			}
 			table.SetCell(i, 0, tview.NewTableCell(fmt.Sprintf(" %s%s[-]", stateColor, checkbox)).SetSelectable(true))
-			table.SetCell(i, 1, tview.NewTableCell(fmt.Sprintf(" [white::b]%s[-:-:-]", c.name)).SetSelectable(true).SetExpansion(1))
-			table.SetCell(i, 2, tview.NewTableCell(fmt.Sprintf(" [gray]%s[-]", c.desc)).SetSelectable(true).SetExpansion(2))
+			table.SetCell(i, 1, tview.NewTableCell(fmt.Sprintf(" [white::b]%s[-:-:-]", svc.name)).SetSelectable(true).SetExpansion(1))
+			table.SetCell(i, 2, tview.NewTableCell(fmt.Sprintf(" %s%s[-]", stateColor, statusText)).SetSelectable(true))
 		}
-		// Footer
-		footerRow := len(caps) + 1
-		table.SetCell(footerRow, 0, tview.NewTableCell("").SetSelectable(false))
-		table.SetCell(footerRow+1, 0, tview.NewTableCell("[gray]Space/Enter[-] toggle  [gray]Esc[-] close").
-			SetSelectable(false))
 	}
 	renderRows()
 	table.Select(0, 0)
 
-	toggle := func(row int) {
-		if row < 0 || row >= len(caps) {
+	updateDetail := func(row int) {
+		if row < 0 || row >= len(services) {
 			return
 		}
-		*caps[row].enabled = !*caps[row].enabled
+		svc := services[row]
+		statusLine := "[red]DISABLED[-]"
+		if *svc.enabled {
+			statusLine = "[green]ENABLED[-]"
+		}
+		detailView.SetText(fmt.Sprintf(
+			"[yellow::b]%s[-:-:-]  %s\n\n[gray]%s[-]\n\n%s\n\n[gray]Space/Enter[-] toggle  [gray]+[-] add Docker service  [gray]Esc[-] close",
+			svc.name, statusLine, svc.desc, svc.detail,
+		))
+	}
+	updateDetail(0)
+
+	table.SetSelectionChangedFunc(func(row, col int) {
+		updateDetail(row)
+	})
+
+	toggle := func(row int) {
+		if row < 0 || row >= len(services) {
+			return
+		}
+		*services[row].enabled = !*services[row].enabled
 		renderRows()
 		table.Select(row, 0)
+		updateDetail(row)
 
-		// Save immediately (applies on next gateway restart)
 		if err := cc.permissions.Save(perms); err != nil {
 			cc.AddActivity("error", fmt.Sprintf("Failed to save permissions: %v", err))
 		} else {
 			state := "enabled"
-			if !*caps[row].enabled {
+			if !*services[row].enabled {
 				state = "disabled"
 			}
-			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on next gateway restart)", caps[row].name, state))
+			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on restart)", services[row].name, state))
 		}
 	}
 
@@ -1793,16 +2012,27 @@ func (cc *ControlCenter) showPermissionsModal() {
 			toggle(row)
 			return nil
 		case tcell.KeyRune:
-			if event.Rune() == ' ' {
+			switch event.Rune() {
+			case ' ':
 				row, _ := table.GetSelection()
 				toggle(row)
+				return nil
+			case '+':
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.showAddServiceModal()
 				return nil
 			}
 		}
 		return event
 	})
 
-	cc.app.SetRoot(table, true)
+	// Layout: table (left) + detail (right)
+	layout := tview.NewFlex().
+		AddItem(table, 0, 1, true).
+		AddItem(detailView, 0, 1, false)
+
+	cc.app.SetRoot(layout, true)
 	cc.app.SetFocus(table)
 }
 

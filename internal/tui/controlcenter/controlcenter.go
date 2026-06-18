@@ -704,34 +704,30 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 			// Vim-style up
 			cc.handleArrowUp()
 			return nil
-		// Action menu shortcuts (0-7)
+		// Action menu shortcuts (0-3)
 		case '1':
-			cc.showAddServiceModal()
+			cc.showBuiltinServicesModal()
 			return nil
 		case '2':
-			cc.showExposePortModal()
+			cc.showNetworkingModal()
 			return nil
 		case '3':
-			cc.showPortForwardsModal()
-			return nil
-		case '4':
-			cc.showSSHAccessModal()
-			return nil
-		case '5':
-			cc.pingPeers()
-			return nil
-		case '6':
-			cc.showInstallServiceModal()
-			return nil
-		case '7':
-			cc.showPermissionsModal()
+			cc.showSystemServiceModal()
 			return nil
 		case '0':
 			cc.showNetworkModal()
 			return nil
 		case 'p', 'P':
 			// Ping selected peer
-			cc.pingSelectedPeer()
+			if cc.focusedPane == panePeers {
+				cc.pingSelectedPeer()
+			}
+			return nil
+		case 'a', 'A':
+			// Ping all peers (from Peers pane)
+			if cc.focusedPane == panePeers {
+				cc.pingPeers()
+			}
 			return nil
 		case 'c':
 			// Copy focused panel to file
@@ -1146,7 +1142,18 @@ func (cc *ControlCenter) showServiceLogs(svcName string) {
 func (cc *ControlCenter) showQuitConfirm() {
 	cc.inModal = true
 
-	warningText := `⚠️  Are you sure you want to exit?
+	installed := isServiceInstalled()
+
+	var warningText string
+	var buttons []string
+
+	if installed {
+		warningText = `Are you sure you want to exit?
+
+Citadel is installed as a system service and will continue running in the background.`
+		buttons = []string{"Cancel", "Exit"}
+	} else {
+		warningText = `⚠️  Are you sure you want to exit?
 
 If you quit:
 • Your services will no longer be accessible on the network
@@ -1154,14 +1161,16 @@ If you quit:
 • Jobs won't be processed on this node
 
 To keep Citadel running in the background, install it as a system service.`
+		buttons = []string{"Cancel", "Install Service", "Exit Anyway"}
+	}
 
 	modal := tview.NewModal().
 		SetText(warningText).
-		AddButtons([]string{"Cancel", "Install Service", "Exit Anyway"}).
+		AddButtons(buttons).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			cc.inModal = false
 			switch buttonLabel {
-			case "Exit Anyway":
+			case "Exit Anyway", "Exit":
 				cc.Stop()
 			case "Install Service":
 				cc.app.SetRoot(cc.rootView, true)
@@ -1226,12 +1235,11 @@ func (cc *ControlCenter) showHelpModal() {
 
 [yellow]Peers Pane:[-]
   [white::b]p[-:-:-]             Ping selected peer
+  [white::b]a[-:-:-]             Ping all peers
 
 [yellow]Actions (number keys):[-]
-  [white::b]1[-:-:-]  Add Service      [white::b]2[-:-:-]  Expose Port
-  [white::b]3[-:-:-]  Port Forwards    [white::b]4[-:-:-]  SSH Access
-  [white::b]5[-:-:-]  Ping All Peers   [white::b]6[-:-:-]  Install Service
-  [white::b]7[-:-:-]  Permissions      [white::b]0[-:-:-]  Connect/Disconnect
+  [white::b]1[-:-:-]  Services         [white::b]2[-:-:-]  Networking
+  [white::b]3[-:-:-]  System Service   [white::b]0[-:-:-]  Connect/Disconnect
 
 [yellow]General:[-]
   [white::b]r[-:-:-]             Refresh status
@@ -1286,14 +1294,22 @@ func (cc *ControlCenter) getActions() []actionDef {
 		connectAction = actionDef{key: "0", name: "Disconnect", desc: "[green]● Connected[-]", fn: cc.showNetworkModal}
 	}
 
+	svcDesc := "[gray]Built-in + add[-]"
+	if cc.permissions.Load != nil {
+		perms := cc.permissions.Load()
+		enabled := 0
+		for _, e := range []bool{perms.Console, perms.Desktop, perms.Files, perms.Services, perms.SSH} {
+			if e {
+				enabled++
+			}
+		}
+		svcDesc = fmt.Sprintf("[gray]%d/5 enabled[-]", enabled)
+	}
+
 	return []actionDef{
-		{key: "1", name: "Add Service", desc: "[gray]vLLM, Ollama, etc.[-]", fn: cc.showAddServiceModal},
-		{key: "2", name: "Expose Port", desc: "[gray]Share local port[-]", fn: cc.showExposePortModal},
-		{key: "3", name: "Port Forwards", desc: "[gray]List active tunnels[-]", fn: cc.showPortForwardsModal},
-		{key: "4", name: "SSH Access", desc: "[gray]Enable inbound SSH[-]", fn: cc.showSSHAccessModal},
-		{key: "5", name: "Ping Peers", desc: "[gray]Test connectivity[-]", fn: cc.pingPeers},
-		{key: "6", name: "Install Service", desc: "[gray]Run as system svc[-]", fn: cc.showInstallServiceModal},
-		{key: "7", name: "Permissions", desc: "[gray]Toggle capabilities[-]", fn: cc.showPermissionsModal},
+		{key: "1", name: "Services", desc: svcDesc, fn: cc.showBuiltinServicesModal},
+		{key: "2", name: "Networking", desc: "[gray]Ports, forwards, SSH[-]", fn: cc.showNetworkingModal},
+		{key: "3", name: "System Service", desc: "[gray]Install / uninstall[-]", fn: cc.showSystemServiceModal},
 		connectAction,
 	}
 }
@@ -1710,10 +1726,10 @@ func (cc *ControlCenter) updateHelpBar() {
 				statusIcon = "[green]●[-]"
 				action = "stop"
 			}
-			cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-7[-:-:-] actions  [yellow::b]?[-:-:-] help",
+			cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
 				svcName, statusIcon, action))
 		} else {
-			cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-7[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActions:
 		row, _ := cc.actionsView.GetSelection()
@@ -1730,10 +1746,10 @@ func (cc *ControlCenter) updateHelpBar() {
 			row, _ := cc.peersView.GetSelection()
 			if row > 0 && row <= len(cc.data.Peers) {
 				peer := cc.data.Peers[row-1]
-				cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] quick ping  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help",
+				cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help",
 					peer.Hostname))
 			} else {
-				cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
+				cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
 			}
 		} else {
 			cc.helpBar.SetText("[yellow::b]Tab[-:-:-] switch pane  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
@@ -1796,7 +1812,7 @@ func (cc *ControlCenter) getContextualSuggestion() string {
 
 	// No services configured - suggest adding one
 	if len(cc.data.Services) == 0 {
-		return "Press [yellow::b]1[-:-:-] to add your first service (Ollama, vLLM, etc.)"
+		return "Press [yellow::b]1[-:-:-] to manage services, then [yellow::b]+[-:-:-] to add (Ollama, vLLM, etc.)"
 	}
 
 	// All services stopped - suggest starting one
