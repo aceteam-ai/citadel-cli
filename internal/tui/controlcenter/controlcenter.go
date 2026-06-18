@@ -144,6 +144,13 @@ type PortForward struct {
 	StartedAt   time.Time
 }
 
+// serviceStateOverride tracks transitional UI state for a service.
+type serviceStateOverride struct {
+	status   string    // "starting", "stopping", "failed"
+	since    time.Time
+	errorMsg string
+}
+
 // ControlCenter is the main TUI application
 type ControlCenter struct {
 	app  *tview.Application
@@ -195,6 +202,10 @@ type ControlCenter struct {
 	// Job tracking
 	recentJobs   []JobRecord
 	recentJobsMu sync.Mutex
+
+	// Service state overrides (transitional states: starting/stopping/failed)
+	serviceOverrides   map[string]*serviceStateOverride
+	serviceOverridesMu sync.Mutex
 }
 
 // Pane focus constants
@@ -264,6 +275,7 @@ func New(cfg Config) *ControlCenter {
 		stopChan:           make(chan struct{}),
 		activities:         make([]ActivityEntry, 0, 100),
 		activeForwards:     make([]PortForward, 0),
+		serviceOverrides:   make(map[string]*serviceStateOverride),
 		data:               StatusData{Version: cfg.Version},
 		refreshFn:          cfg.RefreshFn,
 		startServiceFn:     cfg.StartServiceFn,
@@ -789,11 +801,24 @@ func (cc *ControlCenter) startSelectedService() {
 		return
 	}
 
+	cc.serviceOverridesMu.Lock()
+	cc.serviceOverrides[svcName] = &serviceStateOverride{status: "starting", since: time.Now()}
+	cc.serviceOverridesMu.Unlock()
+	// Wrap in goroutine to avoid deadlock — handleInput runs on tview's event loop
+	go func() { cc.app.QueueUpdateDraw(func() { cc.updateServicesView() }) }()
+
 	go func() {
 		cc.AddActivity("info", fmt.Sprintf("Starting %s...", svcName))
 		if err := cc.startServiceFn(svcName); err != nil {
+			cc.serviceOverridesMu.Lock()
+			cc.serviceOverrides[svcName] = &serviceStateOverride{status: "failed", since: time.Now(), errorMsg: err.Error()}
+			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("error", fmt.Sprintf("Failed to start %s: %v", svcName, err))
+			cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
 		} else {
+			cc.serviceOverridesMu.Lock()
+			delete(cc.serviceOverrides, svcName)
+			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("success", fmt.Sprintf("%s started", svcName))
 			cc.refresh()
 		}
@@ -807,11 +832,23 @@ func (cc *ControlCenter) stopSelectedService() {
 		return
 	}
 
+	cc.serviceOverridesMu.Lock()
+	cc.serviceOverrides[svcName] = &serviceStateOverride{status: "stopping", since: time.Now()}
+	cc.serviceOverridesMu.Unlock()
+	go func() { cc.app.QueueUpdateDraw(func() { cc.updateServicesView() }) }()
+
 	go func() {
 		cc.AddActivity("info", fmt.Sprintf("Stopping %s...", svcName))
 		if err := cc.stopServiceFn(svcName); err != nil {
+			cc.serviceOverridesMu.Lock()
+			cc.serviceOverrides[svcName] = &serviceStateOverride{status: "failed", since: time.Now(), errorMsg: err.Error()}
+			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("error", fmt.Sprintf("Failed to stop %s: %v", svcName, err))
+			cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
 		} else {
+			cc.serviceOverridesMu.Lock()
+			delete(cc.serviceOverrides, svcName)
+			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("success", fmt.Sprintf("%s stopped", svcName))
 			cc.refresh()
 		}
@@ -825,13 +862,25 @@ func (cc *ControlCenter) restartSelectedService() {
 		return
 	}
 
+	cc.serviceOverridesMu.Lock()
+	cc.serviceOverrides[svcName] = &serviceStateOverride{status: "stopping", since: time.Now()}
+	cc.serviceOverridesMu.Unlock()
+	go func() { cc.app.QueueUpdateDraw(func() { cc.updateServicesView() }) }()
+
 	// Use dedicated restart if available, otherwise stop then start
 	if cc.restartServiceFn != nil {
 		go func() {
 			cc.AddActivity("info", fmt.Sprintf("Restarting %s...", svcName))
 			if err := cc.restartServiceFn(svcName); err != nil {
+				cc.serviceOverridesMu.Lock()
+				cc.serviceOverrides[svcName] = &serviceStateOverride{status: "failed", since: time.Now(), errorMsg: err.Error()}
+				cc.serviceOverridesMu.Unlock()
 				cc.AddActivity("error", fmt.Sprintf("Failed to restart %s: %v", svcName, err))
+				cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
 			} else {
+				cc.serviceOverridesMu.Lock()
+				delete(cc.serviceOverrides, svcName)
+				cc.serviceOverridesMu.Unlock()
 				cc.AddActivity("success", fmt.Sprintf("%s restarted", svcName))
 				cc.refresh()
 			}
@@ -840,12 +889,28 @@ func (cc *ControlCenter) restartSelectedService() {
 		go func() {
 			cc.AddActivity("info", fmt.Sprintf("Restarting %s...", svcName))
 			if err := cc.stopServiceFn(svcName); err != nil {
+				cc.serviceOverridesMu.Lock()
+				cc.serviceOverrides[svcName] = &serviceStateOverride{status: "failed", since: time.Now(), errorMsg: err.Error()}
+				cc.serviceOverridesMu.Unlock()
 				cc.AddActivity("error", fmt.Sprintf("Failed to stop %s: %v", svcName, err))
+				cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
 				return
 			}
+			cc.serviceOverridesMu.Lock()
+			cc.serviceOverrides[svcName] = &serviceStateOverride{status: "starting", since: time.Now()}
+			cc.serviceOverridesMu.Unlock()
+			cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
+
 			if err := cc.startServiceFn(svcName); err != nil {
+				cc.serviceOverridesMu.Lock()
+				cc.serviceOverrides[svcName] = &serviceStateOverride{status: "failed", since: time.Now(), errorMsg: err.Error()}
+				cc.serviceOverridesMu.Unlock()
 				cc.AddActivity("error", fmt.Sprintf("Failed to start %s: %v", svcName, err))
+				cc.app.QueueUpdateDraw(func() { cc.updateServicesView() })
 			} else {
+				cc.serviceOverridesMu.Lock()
+				delete(cc.serviceOverrides, svcName)
+				cc.serviceOverridesMu.Unlock()
 				cc.AddActivity("success", fmt.Sprintf("%s restarted", svcName))
 				cc.refresh()
 			}
@@ -1203,7 +1268,7 @@ func (cc *ControlCenter) updateServicesView() {
 		// Name
 		cc.servicesView.SetCell(row, 0, tview.NewTableCell(" "+svc.Name).SetSelectable(true))
 
-		// Status
+		// Status — start with docker state, then apply transitional overrides
 		var statusCell string
 		switch svc.Status {
 		case "running":
@@ -1215,6 +1280,34 @@ func (cc *ControlCenter) updateServicesView() {
 		default:
 			statusCell = "[yellow]? " + svc.Status + "[-]"
 		}
+
+		// Check for transitional state overrides
+		cc.serviceOverridesMu.Lock()
+		override, hasOverride := cc.serviceOverrides[svc.Name]
+		if hasOverride {
+			// If docker shows "running" but we have a "starting" override,
+			// the service started successfully between refreshes — clear it
+			if svc.Status == "running" && override.status == "starting" {
+				delete(cc.serviceOverrides, svc.Name)
+				hasOverride = false
+			} else if svc.Status == "stopped" && override.status == "stopping" {
+				delete(cc.serviceOverrides, svc.Name)
+				hasOverride = false
+			}
+		}
+		cc.serviceOverridesMu.Unlock()
+
+		if hasOverride {
+			switch override.status {
+			case "starting":
+				statusCell = "[yellow]● starting[-]"
+			case "stopping":
+				statusCell = "[yellow]○ stopping[-]"
+			case "failed":
+				statusCell = "[red]✗ failed[-]"
+			}
+		}
+
 		cc.servicesView.SetCell(row, 1, tview.NewTableCell(statusCell).SetSelectable(true))
 
 		// Uptime
@@ -1552,6 +1645,15 @@ func (cc *ControlCenter) refresh() {
 
 	cc.data = data
 	cc.lastRefresh = time.Now()
+
+	// Auto-clear stale "failed" overrides older than 60 seconds
+	cc.serviceOverridesMu.Lock()
+	for name, override := range cc.serviceOverrides {
+		if override.status == "failed" && time.Since(override.since) > 60*time.Second {
+			delete(cc.serviceOverrides, name)
+		}
+	}
+	cc.serviceOverridesMu.Unlock()
 
 	cc.app.QueueUpdateDraw(func() {
 		cc.updateAllPanels()
