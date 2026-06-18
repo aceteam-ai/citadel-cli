@@ -39,7 +39,7 @@ func (cc *ControlCenter) showListModal(title string, items []string, onSelect fu
 		itemCopy := item
 		list.AddItem(item, "", rune('a'+idx), func() {
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
 			if onSelect != nil {
 				onSelect(itemCopy)
@@ -50,7 +50,7 @@ func (cc *ControlCenter) showListModal(title string, items []string, onSelect fu
 	// Add cancel option
 	list.AddItem("Cancel", "", 'q', func() {
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.app.SetFocus(cc.servicesView)
 	})
 
@@ -58,7 +58,7 @@ func (cc *ControlCenter) showListModal(title string, items []string, onSelect fu
 	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
 			return nil
 		}
@@ -80,7 +80,7 @@ func (cc *ControlCenter) showInfoModal(title, content string) {
 
 	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.app.SetFocus(cc.servicesView)
 		return nil
 	})
@@ -174,7 +174,7 @@ func (cc *ControlCenter) showServiceDetailModal() {
 
 	closeModal := func() {
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.updatePaneFocus()
 	}
 
@@ -325,7 +325,7 @@ func (cc *ControlCenter) showServiceListModal(items []serviceItem, onSelect func
 		name := item.name // capture for closure
 		list.AddItem(label, secondary, 0, func() {
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			onSelect(name)
 		})
@@ -334,7 +334,7 @@ func (cc *ControlCenter) showServiceListModal(items []serviceItem, onSelect func
 	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		}
@@ -388,7 +388,7 @@ func (cc *ControlCenter) showExposePortModal() {
 
 	closeModal := func() {
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.updatePaneFocus()
 	}
 
@@ -564,7 +564,7 @@ func (cc *ControlCenter) showPortForwardsModal() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
 			return nil
 		case tcell.KeyRune:
@@ -586,7 +586,7 @@ func (cc *ControlCenter) showPortForwardsModal() {
 					// Refresh the modal or close if empty
 					if len(cc.activeForwards) == 0 {
 						cc.inModal = false
-						cc.app.SetRoot(cc.mainFlex, true)
+						cc.app.SetRoot(cc.rootView, true)
 						cc.app.SetFocus(cc.servicesView)
 					} else {
 						cc.showPortForwardsModal()
@@ -765,7 +765,7 @@ func (cc *ControlCenter) showInstallServiceModal() {
 			if buttonLabel == "Install Now" {
 				go cc.executeServiceInstall()
 			}
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 		})
 
@@ -887,7 +887,7 @@ Log in now?`).
 			if buttonLabel == "Log In" {
 				cc.startDeviceAuthFlow()
 			} else {
-				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetRoot(cc.rootView, true)
 				cc.updatePaneFocus()
 			}
 		})
@@ -966,7 +966,7 @@ Your system Tailscale is already connected to the same network:
 			if buttonLabel == "Connect Citadel Too" {
 				cc.startDeviceAuthFlow()
 			} else {
-				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetRoot(cc.rootView, true)
 				cc.updatePaneFocus()
 			}
 		})
@@ -1005,7 +1005,7 @@ Are you sure you want to disconnect?`, nodeInfo)
 			if buttonLabel == "Disconnect" {
 				go cc.disconnectFromNetwork()
 			}
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
 		})
 
@@ -1141,7 +1141,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 			}
 			close(doneChan)
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.app.SetFocus(cc.servicesView)
 			cc.AddActivity("info", "Authorization canceled")
 			return nil
@@ -1207,7 +1207,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				if time.Now().After(expiresAt) {
 					cc.app.QueueUpdateDraw(func() {
 						cc.inModal = false
-						cc.app.SetRoot(cc.mainFlex, true)
+						cc.app.SetRoot(cc.rootView, true)
 						cc.app.SetFocus(cc.servicesView)
 					})
 					cc.AddActivity("error", "Device authorization expired")
@@ -1232,7 +1232,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 					time.Sleep(2 * time.Second)
 					cc.app.QueueUpdateDraw(func() {
 						cc.inModal = false
-						cc.app.SetRoot(cc.mainFlex, true)
+						cc.app.SetRoot(cc.rootView, true)
 						cc.app.SetFocus(cc.servicesView)
 					})
 					cc.AddActivity("error", fmt.Sprintf("Authorization failed: %v", err))
@@ -1263,7 +1263,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 				time.Sleep(time.Second)
 				cc.app.QueueUpdateDraw(func() {
 					cc.inModal = false
-					cc.app.SetRoot(cc.mainFlex, true)
+					cc.app.SetRoot(cc.rootView, true)
 					cc.app.SetFocus(cc.servicesView)
 				})
 				return
@@ -1500,7 +1500,7 @@ func (cc *ControlCenter) showJobsDetailModal() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		case tcell.KeyRune:
@@ -1686,7 +1686,7 @@ func (cc *ControlCenter) showPeerDetailModal() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		case tcell.KeyEnter:
@@ -1785,7 +1785,7 @@ func (cc *ControlCenter) showPermissionsModal() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		case tcell.KeyEnter:
