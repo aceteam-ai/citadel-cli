@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1052,7 +1053,7 @@ func ccAutoUpdate() bool {
 	// Small delay to show the message
 	time.Sleep(500 * time.Millisecond)
 
-	// Restart by exec'ing the new binary
+	// Restart the binary
 	execPath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
@@ -1060,7 +1061,17 @@ func ccAutoUpdate() bool {
 		return true
 	}
 
-	// Re-exec with the same arguments
+	if runtime.GOOS == "windows" {
+		// Windows doesn't support syscall.Exec; start a new process and exit
+		cmd := exec.Command(execPath, os.Args[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Start()
+		os.Exit(0)
+	}
+
+	// Unix: replace the current process in-place
 	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
 		fmt.Println("Please restart citadel manually.")

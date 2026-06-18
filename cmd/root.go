@@ -117,11 +117,10 @@ func Debug(format string, args ...interface{}) {
 var rootCmd = &cobra.Command{
 	Use:   "citadel",
 	Short: "Citadel is the agent for the AceTeam Sovereign Compute Fabric",
-	Long: `A self-contained agent and CLI for connecting your hardware
-to the AceTeam control plane, making your resources available to your private workflows.
+	Long: `Connect your hardware to AceTeam with a single command.
 
-When run without a subcommand, Citadel starts interactive mode with slash commands.
-Use 'citadel help' to see all available commands.`,
+Just run 'citadel' — it handles login, network connection, and launches the
+control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Default behavior: launch control center if TTY, otherwise show help
@@ -239,6 +238,7 @@ func checkForUpdateOnStartup(silent bool) {
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
+	hideAdvancedCommands()
 	err := rootCmd.Execute()
 	if err != nil {
 		os.Exit(1)
@@ -262,7 +262,25 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
 	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	// rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// Hide persistent flags that are only for dev/scripting
+	rootCmd.PersistentFlags().MarkHidden("config")
+	rootCmd.PersistentFlags().MarkHidden("nexus")
+	rootCmd.PersistentFlags().MarkHidden("auth-service")
+}
+
+// hideAdvancedCommands marks dev/scripting commands as hidden from default help.
+// Call this after all init() functions have registered their commands.
+func hideAdvancedCommands() {
+	visible := map[string]bool{
+		"status":  true,
+		"update":  true,
+		"version": true,
+		"help":    true,
+		"mcp":     true,
+	}
+	for _, cmd := range rootCmd.Commands() {
+		if !visible[cmd.Name()] {
+			cmd.Hidden = true
+		}
+	}
 }
