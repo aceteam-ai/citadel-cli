@@ -162,7 +162,7 @@ type Page interface {
 	HandleInput(event *tcell.EventKey) *tcell.EventKey
 }
 
-// PageManager manages multiple pages with an F-key tab bar.
+// PageManager manages multiple pages with an Alt+N tab bar.
 type PageManager struct {
 	app           *tview.Application
 	pages         *tview.Pages
@@ -207,11 +207,11 @@ func (pm *PageManager) SwitchTo(idx int) {
 func (pm *PageManager) updateTabBar() {
 	var sb strings.Builder
 	for i, page := range pm.registered {
-		fKey := fmt.Sprintf("F%d", i+1)
+		key := fmt.Sprintf("Alt+%d", i+1)
 		if i == pm.activeIdx {
-			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", fKey, page.Title()))
+			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", key, page.Title()))
 		} else {
-			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", fKey, page.Title()))
+			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", key, page.Title()))
 		}
 		if i < len(pm.registered)-1 {
 			sb.WriteString(" ")
@@ -228,7 +228,8 @@ func (pm *PageManager) Build() *tview.Flex {
 	return pm.rootFlex
 }
 
-// HandleGlobalInput captures F1-F5 before delegating to the active page.
+// HandleGlobalInput captures Alt+1-5 before delegating to the active page.
+// F-keys are avoided because terminal emulators (Terminator, etc.) intercept them.
 func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	if pm.isModalActive != nil && pm.isModalActive() {
 		if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
@@ -237,22 +238,25 @@ func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey 
 		return event
 	}
 
-	switch event.Key() {
-	case tcell.KeyF1:
-		pm.SwitchTo(0)
-		return nil
-	case tcell.KeyF2:
-		pm.SwitchTo(1)
-		return nil
-	case tcell.KeyF3:
-		pm.SwitchTo(2)
-		return nil
-	case tcell.KeyF4:
-		pm.SwitchTo(3)
-		return nil
-	case tcell.KeyF5:
-		pm.SwitchTo(4)
-		return nil
+	// Alt+1 through Alt+5 to switch pages
+	if event.Modifiers()&tcell.ModAlt != 0 && event.Key() == tcell.KeyRune {
+		switch event.Rune() {
+		case '1':
+			pm.SwitchTo(0)
+			return nil
+		case '2':
+			pm.SwitchTo(1)
+			return nil
+		case '3':
+			pm.SwitchTo(2)
+			return nil
+		case '4':
+			pm.SwitchTo(3)
+			return nil
+		case '5':
+			pm.SwitchTo(4)
+			return nil
+		}
 	}
 
 	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
@@ -279,7 +283,7 @@ func (p *PlaceholderPage) Build(_ *tview.Application) tview.Primitive {
 	p.view = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	p.view.SetText(fmt.Sprintf("\n\n\n[yellow::b]%s[-:-:-]\n\n[gray]Coming soon — press F1 to return to Dashboard[-]", p.title))
+	p.view.SetText(fmt.Sprintf("\n\n\n[yellow::b]%s[-:-:-]\n\n[gray]Coming soon — press Alt+1 to return to Dashboard[-]", p.title))
 	return p.view
 }
 
@@ -489,7 +493,7 @@ func (cc *ControlCenter) Run() error {
 	// Create page manager
 	cc.pmgr = NewPageManager(cc.app, func() bool { return cc.inModal })
 
-	// Register pages: F1=Dashboard, F2-F5=placeholders
+	// Register pages: Alt+1=Dashboard, Alt+2-5=placeholders
 	cc.pmgr.Register(cc)
 	cc.pmgr.Register(NewPlaceholderPage("console", "Console"))
 	cc.pmgr.Register(NewPlaceholderPage("services", "Services"))
@@ -501,7 +505,7 @@ func (cc *ControlCenter) Run() error {
 
 	cc.updateAllPanels()
 
-	// Global input: PageManager captures F-keys, then delegates to active page
+	// Global input: PageManager captures Alt+N, then delegates to active page
 	cc.app.SetInputCapture(cc.pmgr.HandleGlobalInput)
 
 	cc.app.SetRoot(cc.rootView, true)
