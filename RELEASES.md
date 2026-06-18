@@ -416,3 +416,18 @@ Auto-generated log of every release.
   - feat(windows): bat launcher + Proxmox VM interaction docs (#213)
 
 
+---
+
+## v2.29.3 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +51 |
+
+**Changes:**
+
+  - fix(windows): reject SYSTEM profile paths in state directory resolution (#214)
+
+
