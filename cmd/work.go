@@ -956,6 +956,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			gwTLSConfig = &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				MinVersion:   tls.VersionTLS12,
+				NextProtos:   []string{"http/1.1"},
 			}
 			fmt.Printf("   - Gateway TLS: self-signed (cert: %s)\n", tlscert.CertPath(workGatewayCertDir))
 		}
