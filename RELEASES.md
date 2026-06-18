@@ -319,3 +319,25 @@ Auto-generated log of every release.
   - docs: clarify release instructions — always use release.sh for checksums
 
 
+---
+
+## v2.27.0 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 15 |
+| Lines added | +1358 |
+
+**Changes:**
+
+  - fix(gateway): restrict TLS ALPN to HTTP/1.1 only (#3831) (#204)
+  - fix(jobs): run shell commands via /bin/sh -c with workspace cwd (#203)
+  - feat(tui): multi-page architecture with F-key tab bar (#202)
+  - feat: add service catalog commands for browsing and installing marketplace services (#201)
+  - fix: service compose files + transitional service states (#200)
+  - fix(tui): org name display, refresh timestamp, zoom toggle (#199)
+  - fix(tui): activity log copy prefers in-memory entries over sparse log file (#198)
+  - chore: remove debug trace from hook_build
+
+
