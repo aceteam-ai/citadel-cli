@@ -6,6 +6,7 @@ import (
 	"math"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -183,6 +184,12 @@ func DetectNodeCapabilities() *NodeCapabilities {
 
 	// Always add cpu:general
 	caps.Tags = append(caps.Tags, "cpu:general")
+
+	// Add OS tag
+	caps.Tags = append(caps.Tags, "os:"+runtime.GOOS)
+
+	// Add architecture tag
+	caps.Tags = append(caps.Tags, "arch:"+runtime.GOARCH)
 
 	return caps
 }
