@@ -18,6 +18,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
+	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -62,6 +63,13 @@ var (
 	ccTerminalRunning bool
 )
 
+// VNC server state
+var (
+	ccVNCServer  *desktop.VNCServer
+	ccVNCPort    = 5900
+	ccVNCRunning bool
+)
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -82,6 +90,7 @@ func runControlCenter() {
 	startDemoServer()
 	defer stopDemoServer()
 	defer stopTerminalServer()
+	defer stopVNCServer()
 
 	cfg := controlcenter.Config{
 		Version:            Version,
@@ -199,6 +208,16 @@ func runControlCenter() {
 					cc.AddActivity("warning", fmt.Sprintf("Terminal server failed: %v", err))
 				} else {
 					cc.AddActivity("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+				}
+			}
+
+			// Start VNC server for remote desktop access
+			perms := config.LoadPermissions(platform.ConfigDir())
+			if perms.Desktop {
+				if err := startVNCServer(); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("VNC server failed: %v", err))
+				} else {
+					cc.AddActivity("info", fmt.Sprintf("VNC server listening on port %d", ccVNCPort))
 				}
 			}
 
@@ -360,6 +379,50 @@ func stopTerminalServer() {
 	}
 
 	ccTerminalRunning = false
+}
+
+// startVNCServer starts the embedded VNC server for remote desktop access
+func startVNCServer() error {
+	if ccVNCRunning {
+		return nil
+	}
+
+	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{
+		Host: "127.0.0.1",
+		Port: ccVNCPort,
+		FPS:  10,
+	})
+
+	// Add VPN listener so the VNC server is reachable over the tsnet VPN
+	if network.IsGlobalConnected() {
+		vpnAddr := fmt.Sprintf(":%d", ccVNCPort)
+		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+			Log("VNC server VPN listener failed (localhost-only): %v", err)
+		} else {
+			ccVNCServer.AddListener(vpnLn)
+			Log("VNC server VPN listener on %s", vpnLn.Addr().String())
+		}
+	}
+
+	ccVNCServer.SetSilent()
+
+	if err := ccVNCServer.Start(); err != nil {
+		return fmt.Errorf("failed to start VNC server: %w", err)
+	}
+
+	ccVNCRunning = true
+	return nil
+}
+
+// stopVNCServer stops the embedded VNC server
+func stopVNCServer() {
+	if !ccVNCRunning {
+		return
+	}
+	if ccVNCServer != nil {
+		ccVNCServer.Stop()
+	}
+	ccVNCRunning = false
 }
 
 // getOrgIDFromConfig gets the organization ID from manifest or device config
