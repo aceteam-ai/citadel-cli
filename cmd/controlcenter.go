@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
+	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -61,6 +63,13 @@ var (
 	ccTerminalRunning bool
 )
 
+// VNC server state
+var (
+	ccVNCServer  *desktop.VNCServer
+	ccVNCPort    = 5900
+	ccVNCRunning bool
+)
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -81,6 +90,7 @@ func runControlCenter() {
 	startDemoServer()
 	defer stopDemoServer()
 	defer stopTerminalServer()
+	defer stopVNCServer()
 
 	cfg := controlcenter.Config{
 		Version:            Version,
@@ -114,6 +124,7 @@ func runControlCenter() {
 				return config.SavePermissions(platform.ConfigDir(), p)
 			},
 		},
+		OnConnect: ccOnNetworkConnect,
 	}
 
 	cc := controlcenter.New(cfg)
@@ -190,32 +201,9 @@ func runControlCenter() {
 			networkConnected = data.Connected
 		}
 
-		// Auto-start worker and terminal server after network is connected
+		// Auto-start servers and worker after network is connected
 		if networkConnected {
-			// Start terminal server for remote SSH access
-			if orgID := getOrgIDFromConfig(); orgID != "" {
-				if err := startTerminalServer(orgID); err != nil {
-					cc.AddActivity("warning", fmt.Sprintf("Terminal server failed: %v", err))
-				} else {
-					cc.AddActivity("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
-				}
-			}
-
-			deviceConfig := getDeviceConfigFromFile()
-			if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
-				// Small delay to ensure network is fully ready
-				time.Sleep(500 * time.Millisecond)
-				cc.AddActivity("info", "Starting worker...")
-				if err := ccStartWorker(cc.AddActivity); err != nil {
-					cc.AddActivity("warning", fmt.Sprintf("Worker auto-start failed: %v", err))
-				} else {
-					// Refresh to update worker status in UI
-					time.Sleep(500 * time.Millisecond)
-					if data, err := gatherControlCenterData(); err == nil {
-						cc.UpdateData(data)
-					}
-				}
-			}
+			ccOnNetworkConnect(cc.AddActivity)
 		} else {
 			// Not connected - show login prompt after a short delay
 			// to allow the TUI to fully initialize
@@ -279,6 +267,36 @@ func stopDemoServer() {
 	}
 }
 
+// ccOnNetworkConnect starts terminal server, VNC server, and worker after VPN connects.
+// Called both on auto-reconnect at startup and after interactive login.
+func ccOnNetworkConnect(activityFn func(level, msg string)) {
+	if orgID := getOrgIDFromConfig(); orgID != "" {
+		if err := startTerminalServer(orgID); err != nil {
+			activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
+		} else {
+			activityFn("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+		}
+	}
+
+	perms := config.LoadPermissions(platform.ConfigDir())
+	if perms.Desktop {
+		if err := startVNCServer(); err != nil {
+			activityFn("warning", fmt.Sprintf("VNC server failed: %v", err))
+		} else {
+			activityFn("info", fmt.Sprintf("VNC server listening on port %d", ccVNCPort))
+		}
+	}
+
+	deviceConfig := getDeviceConfigFromFile()
+	if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		time.Sleep(500 * time.Millisecond)
+		activityFn("info", "Starting worker...")
+		if err := ccStartWorker(activityFn); err != nil {
+			activityFn("warning", fmt.Sprintf("Worker auto-start failed: %v", err))
+		}
+	}
+}
+
 // startTerminalServer starts the terminal server for remote SSH access
 func startTerminalServer(orgID string) error {
 	if ccTerminalRunning {
@@ -318,6 +336,18 @@ func startTerminalServer(orgID string) error {
 	// Create and start the server
 	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
 
+	// Add VPN listener so the terminal server is reachable over the tsnet VPN.
+	// The TCP bind is localhost-only for security; external access comes through tsnet.
+	if network.IsGlobalConnected() {
+		vpnAddr := fmt.Sprintf(":%d", config.Port)
+		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+			Log("terminal server VPN listener failed (localhost-only): %v", err)
+		} else {
+			ccTerminalServer.AddListener(vpnLn)
+			Log("terminal server VPN listener on %s", vpnLn.Addr().String())
+		}
+	}
+
 	// Suppress terminal server logging in TUI mode to prevent display corruption
 	ccTerminalServer.SetSilent()
 
@@ -347,6 +377,52 @@ func stopTerminalServer() {
 	}
 
 	ccTerminalRunning = false
+}
+
+// startVNCServer starts the embedded VNC server for remote desktop access
+func startVNCServer() error {
+	if ccVNCRunning {
+		return nil
+	}
+
+	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{
+		Host: "127.0.0.1",
+		Port: ccVNCPort,
+		FPS:  10,
+	})
+
+	// Add VPN listener so the VNC server is reachable over the tsnet VPN
+	if network.IsGlobalConnected() {
+		vpnAddr := fmt.Sprintf(":%d", ccVNCPort)
+		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+			Log("VNC server VPN listener failed (localhost-only): %v", err)
+		} else {
+			ccVNCServer.AddListener(vpnLn)
+			Log("VNC server VPN listener on %s", vpnLn.Addr().String())
+		}
+	}
+
+	ccVNCServer.SetSilent()
+
+	if err := ccVNCServer.Start(); err != nil {
+		return fmt.Errorf("failed to start VNC server: %w", err)
+	}
+
+	ccVNCRunning = true
+	platform.SetEmbeddedVNCPort(ccVNCPort)
+	return nil
+}
+
+// stopVNCServer stops the embedded VNC server
+func stopVNCServer() {
+	if !ccVNCRunning {
+		return
+	}
+	if ccVNCServer != nil {
+		ccVNCServer.Stop()
+	}
+	ccVNCRunning = false
+	platform.ClearEmbeddedVNCPort()
 }
 
 // getOrgIDFromConfig gets the organization ID from manifest or device config
@@ -1052,7 +1128,7 @@ func ccAutoUpdate() bool {
 	// Small delay to show the message
 	time.Sleep(500 * time.Millisecond)
 
-	// Restart by exec'ing the new binary
+	// Restart the binary
 	execPath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
@@ -1060,7 +1136,17 @@ func ccAutoUpdate() bool {
 		return true
 	}
 
-	// Re-exec with the same arguments
+	if runtime.GOOS == "windows" {
+		// Windows doesn't support syscall.Exec; start a new process and exit
+		cmd := exec.Command(execPath, os.Args[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Start()
+		os.Exit(0)
+	}
+
+	// Unix: replace the current process in-place
 	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to restart: %v\n", err)
 		fmt.Println("Please restart citadel manually.")
