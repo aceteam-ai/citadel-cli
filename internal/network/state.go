@@ -31,14 +31,21 @@ func GetStateDir() string {
 	return filepath.Join(getUserHomeDir(), "citadel-node", "network")
 }
 
-// getUserHomeDir returns the user's home directory
+// getUserHomeDir returns the user's home directory.
+// On Windows, uses LOCALAPPDATA/APPDATA to avoid resolving to
+// C:\Windows\System32\config\systemprofile when running as SYSTEM.
 func getUserHomeDir() string {
 	if runtime.GOOS == "windows" {
-		baseDir := os.Getenv("USERPROFILE")
-		if baseDir == "" {
-			baseDir = os.Getenv("HOME")
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			return v
 		}
-		return baseDir
+		if v := os.Getenv("APPDATA"); v != "" {
+			return v
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return os.Getenv("USERPROFILE")
 	}
 
 	baseDir, err := os.UserHomeDir()
