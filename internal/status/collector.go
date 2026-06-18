@@ -89,10 +89,15 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
 
-	// Detect VNC server status for top-level vnc_port field
-	vncMgr := platform.GetVNCManager()
-	if vncMgr.IsRunning() {
-		status.VNCPort = vncMgr.Port()
+	// Detect VNC server status for top-level vnc_port field.
+	// Check embedded VNC server first (TUI-managed), then external (TightVNC etc).
+	if port := platform.EmbeddedVNCPort(); port > 0 {
+		status.VNCPort = port
+	} else {
+		vncMgr := platform.GetVNCManager()
+		if vncMgr.IsRunning() {
+			status.VNCPort = vncMgr.Port()
+		}
 	}
 	return status, nil
 }

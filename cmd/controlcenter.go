@@ -124,6 +124,7 @@ func runControlCenter() {
 				return config.SavePermissions(platform.ConfigDir(), p)
 			},
 		},
+		OnConnect: ccOnNetworkConnect,
 	}
 
 	cc := controlcenter.New(cfg)
@@ -200,42 +201,9 @@ func runControlCenter() {
 			networkConnected = data.Connected
 		}
 
-		// Auto-start worker and terminal server after network is connected
+		// Auto-start servers and worker after network is connected
 		if networkConnected {
-			// Start terminal server for remote SSH access
-			if orgID := getOrgIDFromConfig(); orgID != "" {
-				if err := startTerminalServer(orgID); err != nil {
-					cc.AddActivity("warning", fmt.Sprintf("Terminal server failed: %v", err))
-				} else {
-					cc.AddActivity("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
-				}
-			}
-
-			// Start VNC server for remote desktop access
-			perms := config.LoadPermissions(platform.ConfigDir())
-			if perms.Desktop {
-				if err := startVNCServer(); err != nil {
-					cc.AddActivity("warning", fmt.Sprintf("VNC server failed: %v", err))
-				} else {
-					cc.AddActivity("info", fmt.Sprintf("VNC server listening on port %d", ccVNCPort))
-				}
-			}
-
-			deviceConfig := getDeviceConfigFromFile()
-			if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
-				// Small delay to ensure network is fully ready
-				time.Sleep(500 * time.Millisecond)
-				cc.AddActivity("info", "Starting worker...")
-				if err := ccStartWorker(cc.AddActivity); err != nil {
-					cc.AddActivity("warning", fmt.Sprintf("Worker auto-start failed: %v", err))
-				} else {
-					// Refresh to update worker status in UI
-					time.Sleep(500 * time.Millisecond)
-					if data, err := gatherControlCenterData(); err == nil {
-						cc.UpdateData(data)
-					}
-				}
-			}
+			ccOnNetworkConnect(cc.AddActivity)
 		} else {
 			// Not connected - show login prompt after a short delay
 			// to allow the TUI to fully initialize
@@ -296,6 +264,36 @@ func stopDemoServer() {
 	}
 	if ccDemoServer != nil {
 		_ = ccDemoServer.Stop()
+	}
+}
+
+// ccOnNetworkConnect starts terminal server, VNC server, and worker after VPN connects.
+// Called both on auto-reconnect at startup and after interactive login.
+func ccOnNetworkConnect(activityFn func(level, msg string)) {
+	if orgID := getOrgIDFromConfig(); orgID != "" {
+		if err := startTerminalServer(orgID); err != nil {
+			activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
+		} else {
+			activityFn("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+		}
+	}
+
+	perms := config.LoadPermissions(platform.ConfigDir())
+	if perms.Desktop {
+		if err := startVNCServer(); err != nil {
+			activityFn("warning", fmt.Sprintf("VNC server failed: %v", err))
+		} else {
+			activityFn("info", fmt.Sprintf("VNC server listening on port %d", ccVNCPort))
+		}
+	}
+
+	deviceConfig := getDeviceConfigFromFile()
+	if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
+		time.Sleep(500 * time.Millisecond)
+		activityFn("info", "Starting worker...")
+		if err := ccStartWorker(activityFn); err != nil {
+			activityFn("warning", fmt.Sprintf("Worker auto-start failed: %v", err))
+		}
 	}
 }
 
@@ -411,6 +409,7 @@ func startVNCServer() error {
 	}
 
 	ccVNCRunning = true
+	platform.SetEmbeddedVNCPort(ccVNCPort)
 	return nil
 }
 
@@ -423,6 +422,7 @@ func stopVNCServer() {
 		ccVNCServer.Stop()
 	}
 	ccVNCRunning = false
+	platform.ClearEmbeddedVNCPort()
 }
 
 // getOrgIDFromConfig gets the organization ID from manifest or device config

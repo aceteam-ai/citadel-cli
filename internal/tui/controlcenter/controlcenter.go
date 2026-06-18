@@ -311,6 +311,7 @@ type ControlCenter struct {
 	deviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
 	worker             WorkerCallbacks             // Worker management callbacks
 	permissions        PermissionsCallbacks        // Gateway permissions callbacks
+	onConnect          func(activityFn func(level, msg string)) // Post-VPN-connect hook
 	authServiceURL     string                      // URL for device auth service
 	nexusURL           string                      // URL for headscale/nexus coordination server
 
@@ -409,6 +410,7 @@ type Config struct {
 	DeviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
 	Worker             WorkerCallbacks             // Worker management callbacks
 	Permissions        PermissionsCallbacks        // Gateway permissions callbacks
+	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
 }
 
 // New creates a new control center
@@ -431,6 +433,7 @@ func New(cfg Config) *ControlCenter {
 		deviceAuth:      cfg.DeviceAuth,
 		worker:          cfg.Worker,
 		permissions:     cfg.Permissions,
+		onConnect:       cfg.OnConnect,
 		authServiceURL:  cfg.AuthServiceURL,
 		nexusURL:        cfg.NexusURL,
 	}

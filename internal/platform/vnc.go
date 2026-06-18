@@ -21,6 +21,19 @@ const DefaultVNCPort = 5900
 // it is hardcoded in every VNC implementation's source code.
 var vncDESKey = []byte{0x17, 0x52, 0x6b, 0x06, 0x23, 0x4e, 0x58, 0x07}
 
+// embeddedVNCPort is set by the TUI when the embedded VNC server starts.
+// The status collector reads this to report vnc_port in heartbeats.
+var embeddedVNCPort int
+
+// SetEmbeddedVNCPort records that the embedded VNC server is running on port.
+func SetEmbeddedVNCPort(port int) { embeddedVNCPort = port }
+
+// ClearEmbeddedVNCPort records that the embedded VNC server has stopped.
+func ClearEmbeddedVNCPort() { embeddedVNCPort = 0 }
+
+// EmbeddedVNCPort returns the port of the embedded VNC server, or 0 if not running.
+func EmbeddedVNCPort() int { return embeddedVNCPort }
+
 // VNCManager interface defines operations for VNC server management.
 type VNCManager interface {
 	IsInstalled() bool

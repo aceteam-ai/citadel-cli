@@ -1417,6 +1417,9 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 					} else {
 						cc.AddActivity("success", "Connected to AceTeam Network")
 						cc.refresh()
+						if cc.onConnect != nil {
+							cc.onConnect(cc.AddActivity)
+						}
 					}
 				}
 
