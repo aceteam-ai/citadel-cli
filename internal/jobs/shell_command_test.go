@@ -2,10 +2,22 @@ package jobs
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
+
+func runShell(t *testing.T, h *ShellCommandHandler, command string) ([]byte, error) {
+	t.Helper()
+	return h.Execute(JobContext{}, &nexus.Job{
+		ID:   "test",
+		Type: "SHELL_COMMAND",
+		Payload: map[string]string{
+			"command": command,
+		},
+	})
+}
 
 func TestShellCommand_MissingCommand(t *testing.T) {
 	h := &ShellCommandHandler{}
@@ -21,13 +33,8 @@ func TestShellCommand_MissingCommand(t *testing.T) {
 
 func TestShellCommand_EmptyCommand(t *testing.T) {
 	h := &ShellCommandHandler{}
-	_, err := h.Execute(JobContext{}, &nexus.Job{
-		ID:   "test-2",
-		Type: "SHELL_COMMAND",
-		Payload: map[string]string{
-			"command": "   ",
-		},
-	})
+	// Whitespace-only command must be rejected.
+	_, err := runShell(t, h, "   ")
 	if err == nil {
 		t.Fatal("expected error for empty command, got nil")
 	}
@@ -35,13 +42,7 @@ func TestShellCommand_EmptyCommand(t *testing.T) {
 
 func TestShellCommand_BasicExecution(t *testing.T) {
 	h := &ShellCommandHandler{}
-	out, err := h.Execute(JobContext{}, &nexus.Job{
-		ID:   "test-3",
-		Type: "SHELL_COMMAND",
-		Payload: map[string]string{
-			"command": "echo hello",
-		},
-	})
+	out, err := runShell(t, h, "echo hello")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -50,71 +51,87 @@ func TestShellCommand_BasicExecution(t *testing.T) {
 	}
 }
 
-func TestResolveExecutable_NormalPATH(t *testing.T) {
-	// "true" is a standard executable in /usr/bin or /bin.
-	p, err := resolveExecutable("true")
-	if err != nil {
-		t.Fatalf("resolveExecutable(true) failed: %v", err)
-	}
-	if p == "" {
-		t.Error("resolved path should not be empty")
-	}
-}
-
-func TestResolveExecutable_RestrictedPATH(t *testing.T) {
-	// Temporarily set PATH to something that excludes standard dirs.
-	origPATH := os.Getenv("PATH")
-	t.Cleanup(func() { os.Setenv("PATH", origPATH) })
-
-	os.Setenv("PATH", "/nonexistent_dir_only")
-
-	// "true" lives in /usr/bin or /bin, which are in standardPATHDirs.
-	p, err := resolveExecutable("true")
-	if err != nil {
-		t.Fatalf("resolveExecutable(true) with restricted PATH should still find it via fallback, got: %v", err)
-	}
-	if p != "/usr/bin/true" && p != "/bin/true" {
-		t.Errorf("expected /usr/bin/true or /bin/true, got %q", p)
-	}
-}
-
-func TestResolveExecutable_NotFound(t *testing.T) {
-	_, err := resolveExecutable("definitely_not_a_real_binary_xyz123")
-	if err == nil {
-		t.Fatal("expected error for nonexistent binary, got nil")
-	}
-}
-
-func TestResolveExecutable_WithSlash(t *testing.T) {
-	// If the name contains a slash, it should be returned as-is.
-	p, err := resolveExecutable("/some/absolute/path")
+func TestShellCommand_Pipe(t *testing.T) {
+	h := &ShellCommandHandler{}
+	out, err := runShell(t, h, "echo hello | cat")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if p != "/some/absolute/path" {
-		t.Errorf("expected /some/absolute/path, got %q", p)
+	if string(out) != "hello\n" {
+		t.Errorf("output = %q, want %q", string(out), "hello\n")
+	}
+}
+
+func TestShellCommand_AndAnd(t *testing.T) {
+	h := &ShellCommandHandler{}
+	out, err := runShell(t, h, "true && echo ok")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out) != "ok\n" {
+		t.Errorf("output = %q, want %q", string(out), "ok\n")
+	}
+}
+
+func TestShellCommand_QuotedArgs(t *testing.T) {
+	h := &ShellCommandHandler{}
+	out, err := runShell(t, h, `echo "a b c"`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out) != "a b c\n" {
+		t.Errorf("output = %q, want %q", string(out), "a b c\n")
+	}
+}
+
+func TestShellCommand_MultiLineScript(t *testing.T) {
+	h := &ShellCommandHandler{}
+	out, err := runShell(t, h, "set -e\necho one\necho two")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out) != "one\ntwo\n" {
+		t.Errorf("output = %q, want %q", string(out), "one\ntwo\n")
+	}
+}
+
+func TestShellCommand_NonZeroExit(t *testing.T) {
+	h := &ShellCommandHandler{}
+	_, err := runShell(t, h, "exit 3")
+	if err == nil {
+		t.Fatal("expected error for non-zero exit, got nil")
+	}
+}
+
+func TestShellCommand_WorkspaceCwd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "foo.txt"), []byte("bar"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	h := NewShellCommandHandler(dir)
+	// Relative path resolves against the configured workspace directory.
+	out, err := runShell(t, h, "cat foo.txt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(out) != "bar" {
+		t.Errorf("output = %q, want %q", string(out), "bar")
 	}
 }
 
 func TestShellCommand_RestrictedPATH(t *testing.T) {
-	// Verify the full handler works even with a restricted PATH.
+	// With a restricted inherited PATH, augmentedEnv must still let /bin/sh
+	// resolve a non-builtin external binary (uname) via standardPATHDirs.
 	origPATH := os.Getenv("PATH")
 	t.Cleanup(func() { os.Setenv("PATH", origPATH) })
-
 	os.Setenv("PATH", "/nonexistent_dir_only")
 
 	h := &ShellCommandHandler{}
-	out, err := h.Execute(JobContext{}, &nexus.Job{
-		ID:   "test-4",
-		Type: "SHELL_COMMAND",
-		Payload: map[string]string{
-			"command": "echo works",
-		},
-	})
+	out, err := runShell(t, h, "uname")
 	if err != nil {
-		t.Fatalf("shell command with restricted PATH should work via fallback: %v", err)
+		t.Fatalf("shell command with restricted PATH should work via augmented env: %v", err)
 	}
-	if string(out) != "works\n" {
-		t.Errorf("output = %q, want %q", string(out), "works\n")
+	if len(out) == 0 {
+		t.Error("expected uname output, got empty")
 	}
 }

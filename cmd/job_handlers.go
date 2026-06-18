@@ -55,7 +55,7 @@ func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 func init() {
 	// Register all job handlers for test command
 	jobHandlers = map[string]jobs.JobHandler{
-		"SHELL_COMMAND":      &jobs.ShellCommandHandler{},
+		"SHELL_COMMAND":      jobs.NewShellCommandHandler(""),
 		"DOWNLOAD_MODEL":     &jobs.DownloadModelHandler{},
 		"OLLAMA_PULL":        &jobs.OllamaPullHandler{},
 		"LLAMACPP_INFERENCE": &jobs.LlamaCppInferenceHandler{},
