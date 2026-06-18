@@ -120,7 +120,7 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 // for file-operation handlers).
 func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	handlers := []*LegacyHandlerAdapter{
-		NewLegacyHandlerAdapter(JobTypeShellCommand, &jobs.ShellCommandHandler{}),
+		NewLegacyHandlerAdapter(JobTypeShellCommand, jobs.NewShellCommandHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeLlamaCppInference, &jobs.LlamaCppInferenceHandler{}),
