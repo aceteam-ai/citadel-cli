@@ -341,3 +341,18 @@ Auto-generated log of every release.
   - chore: remove debug trace from hook_build
 
 
+---
+
+## v2.27.1 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +24 |
+
+**Changes:**
+
+  - fix: use LOCALAPPDATA for Windows state directory (#205)
+
+
