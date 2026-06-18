@@ -371,3 +371,18 @@ Auto-generated log of every release.
   - feat(capabilities): add OS and architecture auto-detection tags (#206)
 
 
+---
+
+## v2.29.0 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 17 |
+| Lines added | +1916 |
+
+**Changes:**
+
+  - feat(tui): services overhaul — ConPTY, VNC, UX defaults (#210)
+
+
