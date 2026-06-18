@@ -152,10 +152,147 @@ type serviceStateOverride struct {
 	errorMsg string
 }
 
-// ControlCenter is the main TUI application
+// Page is the interface for TUI pages that can be switched via the tab bar.
+type Page interface {
+	Name() string
+	Title() string
+	Build(app *tview.Application) tview.Primitive
+	OnActivate()
+	OnDeactivate()
+	HandleInput(event *tcell.EventKey) *tcell.EventKey
+}
+
+// PageManager manages multiple pages with an F-key tab bar.
+type PageManager struct {
+	app           *tview.Application
+	pages         *tview.Pages
+	tabBar        *tview.TextView
+	rootFlex      *tview.Flex
+	registered    []Page
+	activeIdx     int
+	isModalActive func() bool
+}
+
+// NewPageManager creates a new PageManager.
+func NewPageManager(app *tview.Application, isModalActive func() bool) *PageManager {
+	return &PageManager{
+		app:           app,
+		pages:         tview.NewPages(),
+		tabBar:        tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter),
+		isModalActive: isModalActive,
+	}
+}
+
+// Register adds a page to the PageManager.
+func (pm *PageManager) Register(page Page) {
+	pm.registered = append(pm.registered, page)
+	primitive := page.Build(pm.app)
+	pm.pages.AddPage(page.Name(), primitive, true, false)
+}
+
+// SwitchTo activates the page at the given index.
+func (pm *PageManager) SwitchTo(idx int) {
+	if idx < 0 || idx >= len(pm.registered) {
+		return
+	}
+	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
+		pm.registered[pm.activeIdx].OnDeactivate()
+	}
+	pm.activeIdx = idx
+	pm.pages.SwitchToPage(pm.registered[idx].Name())
+	pm.registered[idx].OnActivate()
+	pm.updateTabBar()
+}
+
+func (pm *PageManager) updateTabBar() {
+	var sb strings.Builder
+	for i, page := range pm.registered {
+		fKey := fmt.Sprintf("F%d", i+1)
+		if i == pm.activeIdx {
+			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", fKey, page.Title()))
+		} else {
+			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", fKey, page.Title()))
+		}
+		if i < len(pm.registered)-1 {
+			sb.WriteString(" ")
+		}
+	}
+	pm.tabBar.SetText(sb.String())
+}
+
+// Build returns the root layout: pages container + tab bar.
+func (pm *PageManager) Build() *tview.Flex {
+	pm.rootFlex = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(pm.pages, 0, 1, true).
+		AddItem(pm.tabBar, 1, 0, false)
+	return pm.rootFlex
+}
+
+// HandleGlobalInput captures F1-F5 before delegating to the active page.
+func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
+	if pm.isModalActive != nil && pm.isModalActive() {
+		if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
+			return pm.registered[pm.activeIdx].HandleInput(event)
+		}
+		return event
+	}
+
+	switch event.Key() {
+	case tcell.KeyF1:
+		pm.SwitchTo(0)
+		return nil
+	case tcell.KeyF2:
+		pm.SwitchTo(1)
+		return nil
+	case tcell.KeyF3:
+		pm.SwitchTo(2)
+		return nil
+	case tcell.KeyF4:
+		pm.SwitchTo(3)
+		return nil
+	case tcell.KeyF5:
+		pm.SwitchTo(4)
+		return nil
+	}
+
+	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
+		return pm.registered[pm.activeIdx].HandleInput(event)
+	}
+	return event
+}
+
+// PlaceholderPage is a stub page that shows a "Coming soon" message.
+type PlaceholderPage struct {
+	name  string
+	title string
+	view  *tview.TextView
+}
+
+func NewPlaceholderPage(name, title string) *PlaceholderPage {
+	return &PlaceholderPage{name: name, title: title}
+}
+
+func (p *PlaceholderPage) Name() string  { return p.name }
+func (p *PlaceholderPage) Title() string { return p.title }
+
+func (p *PlaceholderPage) Build(_ *tview.Application) tview.Primitive {
+	p.view = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+	p.view.SetText(fmt.Sprintf("\n\n\n[yellow::b]%s[-:-:-]\n\n[gray]Coming soon — press F1 to return to Dashboard[-]", p.title))
+	return p.view
+}
+
+func (p *PlaceholderPage) OnActivate()                                        {}
+func (p *PlaceholderPage) OnDeactivate()                                      {}
+func (p *PlaceholderPage) HandleInput(event *tcell.EventKey) *tcell.EventKey { return event }
+
+// ControlCenter is the main TUI application and the Dashboard page.
 type ControlCenter struct {
-	app  *tview.Application
-	data StatusData
+	app      *tview.Application
+	data     StatusData
+	pmgr     *PageManager
+	rootView tview.Primitive
 
 	// Callbacks
 	refreshFn          func() (StatusData, error)
@@ -326,13 +463,48 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 }
 
 // Run starts the control center
+// Page interface implementation for ControlCenter (Dashboard page).
+func (cc *ControlCenter) Name() string  { return "dashboard" }
+func (cc *ControlCenter) Title() string { return "Dashboard" }
+
+func (cc *ControlCenter) Build(app *tview.Application) tview.Primitive {
+	cc.app = app
+	cc.buildUI()
+	return cc.mainFlex
+}
+
+func (cc *ControlCenter) OnActivate() {
+	cc.updatePaneFocus()
+}
+
+func (cc *ControlCenter) OnDeactivate() {}
+
+func (cc *ControlCenter) HandleInput(event *tcell.EventKey) *tcell.EventKey {
+	return cc.handleInput(event)
+}
+
 func (cc *ControlCenter) Run() error {
 	cc.app = tview.NewApplication()
-	cc.buildUI()
+
+	// Create page manager
+	cc.pmgr = NewPageManager(cc.app, func() bool { return cc.inModal })
+
+	// Register pages: F1=Dashboard, F2-F5=placeholders
+	cc.pmgr.Register(cc)
+	cc.pmgr.Register(NewPlaceholderPage("console", "Console"))
+	cc.pmgr.Register(NewPlaceholderPage("services", "Services"))
+	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"))
+	cc.pmgr.Register(NewPlaceholderPage("network", "Network"))
+
+	cc.rootView = cc.pmgr.Build()
+	cc.pmgr.SwitchTo(0)
+
 	cc.updateAllPanels()
 
-	// Key bindings
-	cc.app.SetInputCapture(cc.handleInput)
+	// Global input: PageManager captures F-keys, then delegates to active page
+	cc.app.SetInputCapture(cc.pmgr.HandleGlobalInput)
+
+	cc.app.SetRoot(cc.rootView, true)
 
 	// Start background tasks after a brief delay to ensure event loop is running
 	go func() {
@@ -459,9 +631,7 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(cc.helpBar, 1, 0, false).
 		AddItem(cc.statusBar, 1, 0, false)
 
-	cc.app.SetRoot(cc.mainFlex, true)
 	cc.focusedPane = paneServices
-	cc.updatePaneFocus()
 }
 
 func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
@@ -962,7 +1132,7 @@ func (cc *ControlCenter) showServiceLogs(svcName string) {
 	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		}
@@ -994,11 +1164,11 @@ To keep Citadel running in the background, install it as a system service.`
 			case "Exit Anyway":
 				cc.Stop()
 			case "Install Service":
-				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetRoot(cc.rootView, true)
 				cc.app.SetFocus(cc.servicesView)
 				cc.showInstallServiceHelp()
 			default:
-				cc.app.SetRoot(cc.mainFlex, true)
+				cc.app.SetRoot(cc.rootView, true)
 				cc.app.SetFocus(cc.servicesView)
 			}
 		})
@@ -1082,7 +1252,7 @@ func (cc *ControlCenter) showHelpModal() {
 
 	helpView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.app.SetFocus(cc.servicesView)
 		return nil
 	})
@@ -1935,7 +2105,7 @@ func (cc *ControlCenter) toggleZoom() {
 	if cc.inModal {
 		// Already zoomed — unzoom
 		cc.inModal = false
-		cc.app.SetRoot(cc.mainFlex, true)
+		cc.app.SetRoot(cc.rootView, true)
 		cc.updatePaneFocus()
 		return
 	}
@@ -2047,7 +2217,7 @@ func (cc *ControlCenter) showActivityFullScreen() {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			cc.inModal = false
-			cc.app.SetRoot(cc.mainFlex, true)
+			cc.app.SetRoot(cc.rootView, true)
 			cc.updatePaneFocus()
 			return nil
 		case tcell.KeyRune:
