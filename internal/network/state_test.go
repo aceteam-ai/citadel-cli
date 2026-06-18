@@ -170,6 +170,26 @@ func TestEnsureStateDirCreatesDirectory(t *testing.T) {
 	}
 }
 
+// TestIsSystemProfilePath verifies detection of SYSTEM profile paths on Windows.
+func TestIsSystemProfilePath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{`C:\Windows\system32\config\systemprofile\citadel-node`, true},
+		{`C:\WINDOWS\System32\config\SystemProfile\data`, true},
+		{`C:\Users\acewin\citadel-node`, false},
+		{`C:\Users\acewin\AppData\Local\citadel-node`, false},
+		{`/home/citadel/citadel-node`, false},
+	}
+	for _, tt := range tests {
+		got := isSystemProfilePath(tt.path)
+		if got != tt.want {
+			t.Errorf("isSystemProfilePath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
 // TestFixStatePermissions_NoOpWhenNotRoot verifies FixStatePermissions is safe to call as non-root.
 func TestFixStatePermissions_NoOpWhenNotRoot(t *testing.T) {
 	if os.Getuid() == 0 {

@@ -9,8 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-
-	"gopkg.in/yaml.v3"
+	"strings"
 )
 
 // GetStateDir returns the state directory path for network state.
@@ -24,11 +23,24 @@ import (
 func GetStateDir() string {
 	// First, try to get state dir from global config (follows config location)
 	if nodeDir := getNodeConfigDirFromGlobalConfig(); nodeDir != "" {
-		return filepath.Join(nodeDir, "network")
+		// On Windows, reject paths under SYSTEM profile — these are written by a
+		// service running as LocalSystem and are inaccessible to interactive users.
+		if runtime.GOOS == "windows" && isSystemProfilePath(nodeDir) {
+			// Fall through to user home directory
+		} else {
+			return filepath.Join(nodeDir, "network")
+		}
 	}
 
 	// Fallback to user home directory
 	return filepath.Join(getUserHomeDir(), "citadel-node", "network")
+}
+
+// isSystemProfilePath returns true if the path is under the Windows SYSTEM
+// profile directory, which happens when a service running as LocalSystem
+// writes config with its own home directory.
+func isSystemProfilePath(p string) bool {
+	return strings.Contains(strings.ToLower(p), `\systemprofile`)
 }
 
 // getUserHomeDir returns the user's home directory.
@@ -55,23 +67,26 @@ func getUserHomeDir() string {
 	return baseDir
 }
 
-// getNodeConfigDirFromGlobalConfig reads node_config_dir from global config
+// getNodeConfigDirFromGlobalConfig reads node_config_dir from global config.
+// On Windows, checks both ProgramData (system-wide, written by services) and
+// LOCALAPPDATA (user-local, written by interactive init) locations.
 func getNodeConfigDirFromGlobalConfig() string {
-	globalConfigFile := filepath.Join(getGlobalConfigDirForState(), "config.yaml")
-
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return ""
+	candidates := []string{
+		filepath.Join(getGlobalConfigDirForState(), "config.yaml"),
+	}
+	// On Windows, platform.ConfigDir() writes to LOCALAPPDATA\Citadel — also check there.
+	if runtime.GOOS == "windows" {
+		if v := os.Getenv("LOCALAPPDATA"); v != "" {
+			candidates = append(candidates, filepath.Join(v, "Citadel", "config.yaml"))
+		}
 	}
 
-	var config struct {
-		NodeConfigDir string `yaml:"node_config_dir"`
+	for _, path := range candidates {
+		if dir := readNodeConfigDir(path); dir != "" {
+			return dir
+		}
 	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return ""
-	}
-
-	return config.NodeConfigDir
+	return ""
 }
 
 // getGlobalConfigDirForState returns the global config directory path
