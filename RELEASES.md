@@ -401,3 +401,18 @@ Auto-generated log of every release.
   - fix(tui): patch tcell Windows console input panic (#211)
 
 
+---
+
+## v2.29.2 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 4 |
+| Lines added | +207 |
+
+**Changes:**
+
+  - feat(windows): bat launcher + Proxmox VM interaction docs (#213)
+
+
