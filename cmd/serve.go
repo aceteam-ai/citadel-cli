@@ -144,6 +144,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"http/1.1"},
 		}
 
 		fmt.Printf("   - TLS: self-signed (cert: %s)\n", tlscert.CertPath(serveCertDir))
