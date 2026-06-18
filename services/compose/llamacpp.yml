@@ -2,16 +2,13 @@
 
 services:
   llamacpp:
-    image: ghcr.io/ggerganov/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: citadel-llamacpp
     ports:
       - "8080:8080"
     volumes:
-      # Mount a user-accessible directory for GGUF models
       - ~/citadel-cache/llamacpp:/models
-    # Use an environment variable for the command.
-    # The part after the colon is the default if the variable isn't set.
-    command: ${LLAMACPP_COMMAND:--host 0.0.0.0 --port 8080}
+    command: ["--host", "0.0.0.0", "--port", "8080"]
     deploy:
       resources:
         reservations:

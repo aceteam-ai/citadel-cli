@@ -51,7 +51,7 @@ var NativeServices = map[string]NativeService{
 		Name:        "vllm",
 		Binary:      "vllm",
 		AltBinaries: []string{"python -m vllm.entrypoints.openai.api_server"},
-		Port:        8000,
+		Port:        8100,
 		StartArgs:   []string{"serve"},
 		EnvVars:     map[string]string{},
 	},
