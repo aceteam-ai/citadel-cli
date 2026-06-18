@@ -386,3 +386,18 @@ Auto-generated log of every release.
   - feat(tui): services overhaul — ConPTY, VNC, UX defaults (#210)
 
 
+---
+
+## v2.29.1 — 2026-06-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 80 |
+| Lines added | +12668 |
+
+**Changes:**
+
+  - fix(tui): patch tcell Windows console input panic (#211)
+
+
