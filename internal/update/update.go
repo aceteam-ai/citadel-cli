@@ -405,29 +405,46 @@ func (c *Client) extractZip(archivePath, destPath string) error {
 	}
 	defer r.Close()
 
-	for _, f := range r.File {
-		// Look for the citadel.exe binary
-		if f.Name == "citadel.exe" || filepath.Base(f.Name) == "citadel.exe" {
-			rc, err := f.Open()
-			if err != nil {
-				return err
-			}
-			defer rc.Close()
+	var foundExe bool
+	destDir := filepath.Dir(destPath)
 
-			outFile, err := os.Create(destPath)
-			if err != nil {
+	for _, f := range r.File {
+		baseName := filepath.Base(f.Name)
+
+		if baseName == "citadel.exe" {
+			if err := extractZipFile(f, destPath); err != nil {
 				return err
 			}
-			if _, err := io.Copy(outFile, rc); err != nil {
-				outFile.Close()
-				return err
-			}
-			outFile.Close()
-			return nil
+			foundExe = true
+		} else if baseName == "citadel.bat" {
+			batPath := filepath.Join(destDir, "citadel.bat")
+			_ = extractZipFile(f, batPath)
 		}
 	}
 
-	return fmt.Errorf("citadel.exe not found in archive")
+	if !foundExe {
+		return fmt.Errorf("citadel.exe not found in archive")
+	}
+	return nil
+}
+
+func extractZipFile(f *zip.File, destPath string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	outFile, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(outFile, rc); err != nil {
+		outFile.Close()
+		return err
+	}
+	outFile.Close()
+	return nil
 }
 
 // verifyArchiveChecksum verifies the checksum of an archive file
