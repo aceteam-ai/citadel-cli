@@ -2,7 +2,7 @@
 .TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-update-enable - Enable automatic update checks
+citadel-update-enable - Enable automatic updates
 
 
 .SH SYNOPSIS
@@ -10,7 +10,10 @@ citadel-update-enable - Enable automatic update checks
 
 
 .SH DESCRIPTION
-Enables periodic update checks when running citadel work.
+Enables automatic updates. A running 'citadel work' agent periodically
+checks for a newer release and installs it (draining in-flight jobs first).
+The setting is persisted and re-read each cycle, so it takes effect on a
+running agent without a restart.
 
 
 .SH OPTIONS
