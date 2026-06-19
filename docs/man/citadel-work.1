@@ -18,14 +18,28 @@ This is the primary command for running a Citadel node. It:
   2. Connects to the AceTeam API and consumes jobs via secure proxy
   3. Reports status via pub/sub (enabled by default)
   4. Subscribes to real-time config updates
+  5. Starts HTTPS gateway on port 8443 (use --no-gateway to skip)
+  6. Starts terminal server on port 7860 (use --no-terminal to skip)
 
 .PP
 Run 'citadel init' first to authenticate and configure the node.
 
 .PP
 Examples:
-  # Run after citadel init (recommended)
+  # Run after citadel init (recommended — gateway + terminal enabled)
   citadel work
+
+.PP
+# Disable the HTTPS gateway
+  citadel work --no-gateway
+
+.PP
+# Disable terminal access
+  citadel work --no-terminal
+
+.PP
+# Worker only (no gateway, no terminal)
+  citadel work --no-gateway --no-terminal
 
 .PP
 # Disable status publishing
@@ -45,6 +59,14 @@ Examples:
 \[la]Deprecated\[ra] Capabilities are now always auto-detected unless declared in citadel.yaml
 
 .PP
+\fB--auto-update\fP[=false]
+	Periodically check for and install newer releases (or set CITADEL_AUTO_UPDATE=true)
+
+.PP
+\fB--auto-update-interval\fP=""
+	Interval between auto-update checks, e.g. 1h, 30m (default 1h; or set CITADEL_AUTO_UPDATE_INTERVAL)
+
+.PP
 \fB--base-url\fP=""
 	AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)
 
@@ -55,6 +77,26 @@ Examples:
 .PP
 \fB--device-code\fP=""
 	Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)
+
+.PP
+\fB--gateway\fP[=true]
+	Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)
+
+.PP
+\fB--gateway-bind\fP="0.0.0.0"
+	Gateway bind address
+
+.PP
+\fB--gateway-cert-dir\fP=""
+	Custom directory for gateway TLS certificates
+
+.PP
+\fB--gateway-port\fP=8443
+	HTTPS gateway port (default: 8443)
+
+.PP
+\fB--gateway-vnc-port\fP=6080
+	VNC websockify port for gateway proxy
 
 .PP
 \fB--group\fP=""
@@ -73,8 +115,16 @@ Examples:
 	Maximum retry attempts before DLQ
 
 .PP
+\fB--no-gateway\fP[=false]
+	Disable the HTTPS gateway
+
+.PP
 \fB--no-services\fP[=false]
 	Skip auto-starting services from manifest
+
+.PP
+\fB--no-terminal\fP[=false]
+	Disable the terminal WebSocket server
 
 .PP
 \fB--node-name\fP=""
@@ -109,8 +159,8 @@ Examples:
 	Enable status HTTP server on port (0 = disabled)
 
 .PP
-\fB--terminal\fP[=false]
-	Enable terminal WebSocket server for remote access
+\fB--terminal\fP[=true]
+	Enable terminal WebSocket server (enabled by default; use --no-terminal to disable)
 
 .PP
 \fB--terminal-debug\fP[=false]
@@ -130,20 +180,8 @@ Examples:
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
-\fB--auth-service\fP="https://aceteam.ai"
-	The URL of the authentication service
-
-.PP
-\fB--config\fP=""
-	config file (default is $HOME/.citadel-cli.yaml)
-
-.PP
 \fB--debug\fP[=false]
 	Enable debug output
-
-.PP
-\fB--nexus\fP="https://nexus.aceteam.ai"
-	The URL of the AceTeam Nexus server
 
 .PP
 \fB--no-color\fP[=false]

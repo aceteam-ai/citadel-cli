@@ -2,20 +2,24 @@
 .TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-version - Print the version number of Citadel CLI
+citadel-service-catalog-install - Install a service from the catalog onto this node
 
 
 .SH SYNOPSIS
-\fBcitadel version [flags]\fP
+\fBcitadel service catalog install  [flags]\fP
 
 
 .SH DESCRIPTION
-Print the version number of Citadel CLI
+Install a service from the catalog onto this node
 
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
-	help for version
+	help for install
+
+.PP
+\fB--set\fP=[]
+	Set a config value (e.g. --set MODEL=Qwen/Qwen3-8B)
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -28,4 +32,4 @@ Print the version number of Citadel CLI
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP
+\fBcitadel-service-catalog(1)\fP

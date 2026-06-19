@@ -2,7 +2,7 @@
 .TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-serve - Start the HTTPS gateway for this node
+citadel-serve - Start the HTTPS gateway for this node (standalone)
 
 
 .SH SYNOPSIS
@@ -12,6 +12,15 @@ citadel-serve - Start the HTTPS gateway for this node
 .SH DESCRIPTION
 Starts an HTTPS reverse proxy that consolidates all Citadel node services
 behind a single TLS endpoint.
+
+.PP
+RECOMMENDED: Use 'citadel work' instead, which runs the gateway in-process
+alongside the worker by default. This avoids competing tsnet instances and
+is the preferred way to expose the gateway on the VPN.
+
+.PP
+This standalone command is still useful when you need to run the gateway
+separately from the worker (e.g., on a different machine or for testing).
 
 .PP
 The gateway proxies to the local status server (started by 'citadel work
@@ -24,9 +33,10 @@ Routes:
   /status          -> Full node status
   /ping            -> Lightweight ping
   /services        -> List registered services
-  /api/screenshot  -> Desktop screenshot (auth required)
-  /api/actions     -> Desktop input actions (auth required)
-  /vnc/...         -> VNC WebSocket proxy (requires websockify on --vnc-port)
+  /api/screenshot       -> Desktop screenshot (auth required)
+  /api/actions          -> Desktop input actions (auth required)
+  /ssh/authorized-keys  -> SSH key deployment (VPN or auth required)
+  /vnc/...              -> VNC WebSocket proxy (requires websockify on --vnc-port)
   /terminal/...    -> Terminal WebSocket server
 
 .PP
@@ -75,20 +85,8 @@ tsnet.ListenTLS for automatic public certs.
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
-\fB--auth-service\fP="https://aceteam.ai"
-	The URL of the authentication service
-
-.PP
-\fB--config\fP=""
-	config file (default is $HOME/.citadel-cli.yaml)
-
-.PP
 \fB--debug\fP[=false]
 	Enable debug output
-
-.PP
-\fB--nexus\fP="https://nexus.aceteam.ai"
-	The URL of the AceTeam Nexus server
 
 .PP
 \fB--no-color\fP[=false]
@@ -97,7 +95,10 @@ tsnet.ListenTLS for automatic public certs.
 
 .SH EXAMPLE
 .EX
-  # Start gateway with default settings (HTTPS on port 8443)
+  # PREFERRED: Run gateway in-process with the worker (enabled by default)
+  citadel work
+
+  # Start standalone gateway with default settings (HTTPS on port 8443)
   citadel serve
 
   # Start on a custom port
