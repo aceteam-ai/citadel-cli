@@ -446,3 +446,20 @@ Auto-generated log of every release.
   - feat(tui): view device page shortcut (V key) after auth (#215)
 
 
+---
+
+## v2.31.0 — 2026-06-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 4 |
+| Lines added | +84 |
+
+**Changes:**
+
+  - test: update VNC pixel format tests for RGBX shift values
+  - fix: restart terminal server with fresh credentials after re-pairing (#218)
+  - fix(desktop): fix phantom right-clicks and color swap in VNC (#216)
+
+
