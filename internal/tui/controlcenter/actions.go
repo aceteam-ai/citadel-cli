@@ -2046,8 +2046,10 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 
 // DetectSystemTailscale checks if system tailscale is running and on the same network
 func DetectSystemTailscale(nexusURL string) (running bool, ip, name string, sameNetwork bool) {
-	// Try to get tailscale status
-	cmd := exec.Command("tailscale", "status", "--json")
+	// Try to get tailscale status with a short timeout to avoid blocking the UI
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "tailscale", "status", "--json")
 	output, err := cmd.Output()
 	if err != nil {
 		return false, "", "", false
