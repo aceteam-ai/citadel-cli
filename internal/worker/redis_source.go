@@ -265,6 +265,35 @@ func (s *RedisSource) QueueNames() []string {
 	return s.queueNames
 }
 
+// AddQueue appends an additional queue to consume from after Connect.
+//
+// Used to subscribe to the worker's per-node shell stream once the node's
+// Headscale ID is known (issue #3914), which happens after the source is built
+// and connected. The consumer group (and stream, via MKSTREAM) is created
+// immediately so the platform dispatcher's consumer-presence check can see the
+// stream; the consumer itself registers on the next multi-queue XREADGROUP.
+// Must be called before the run loop starts reading (single-threaded at that
+// point), so no locking is required. A blank or already-present queue is
+// ignored. Returns an error only if the consumer group cannot be created.
+func (s *RedisSource) AddQueue(ctx context.Context, queue string) error {
+	if queue == "" {
+		return nil
+	}
+	for _, q := range s.queueNames {
+		if q == queue {
+			return nil
+		}
+	}
+	if s.client != nil {
+		if err := s.client.EnsureConsumerGroups(ctx, []string{queue}); err != nil {
+			return fmt.Errorf("failed to create consumer group for %s: %w", queue, err)
+		}
+	}
+	s.queueNames = append(s.queueNames, queue)
+	s.log("info", "   - Added queue: %s", queue)
+	return nil
+}
+
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *RedisSource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)

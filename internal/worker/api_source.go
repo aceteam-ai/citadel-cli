@@ -276,6 +276,27 @@ func (s *APISource) QueueNames() []string {
 	return s.queueNames
 }
 
+// AddQueue appends an additional queue to consume from after construction.
+//
+// This is used to subscribe to the worker's per-node shell stream once the
+// node's Headscale ID is known (issue #3914), which happens after the source
+// is built. The Redis API proxy creates the consumer group lazily on the first
+// XREADGROUP, so no explicit group-creation call is needed here. Must be called
+// before the run loop starts reading (single-threaded at that point), so no
+// locking is required. A blank or already-present queue is ignored.
+func (s *APISource) AddQueue(queue string) {
+	if queue == "" {
+		return
+	}
+	for _, q := range s.queueNames {
+		if q == queue {
+			return
+		}
+	}
+	s.queueNames = append(s.queueNames, queue)
+	s.log("info", "   - Added queue: %s", queue)
+}
+
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *APISource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)

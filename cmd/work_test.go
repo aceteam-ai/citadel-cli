@@ -77,3 +77,33 @@ func TestShellQueueName(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeQueueName guards the per-node shell stream naming convention. This
+// string MUST match the Python build_node_queue helper byte-for-byte, otherwise
+// node-targeted jobs (issue #3914) silently fall back to the shared stream and
+// per-node routing never engages.
+func TestNodeQueueName(t *testing.T) {
+	tests := []struct {
+		orgID  string
+		nodeID string
+		want   string
+	}{
+		{
+			orgID:  "550e8400-e29b-41d4-a716-446655440000",
+			nodeID: "1008",
+			want:   "jobs:v1:shell:org_550e8400-e29b-41d4-a716-446655440000:node:1008",
+		},
+		{
+			orgID:  "test-org-id",
+			nodeID: "969",
+			want:   "jobs:v1:shell:org_test-org-id:node:969",
+		},
+	}
+
+	for _, tt := range tests {
+		got := nodeQueueName(tt.orgID, tt.nodeID)
+		if got != tt.want {
+			t.Errorf("nodeQueueName(%q, %q) = %q, want %q", tt.orgID, tt.nodeID, got, tt.want)
+		}
+	}
+}
