@@ -197,8 +197,16 @@ func runControlCenter() {
 		// Gather initial data after network check
 		if data, err := gatherControlCenterData(); err == nil {
 			cc.UpdateData(data)
-			// Update networkConnected based on actual status
 			networkConnected = data.Connected
+		}
+
+		// Set device URL for "V" key shortcut if connected
+		if networkConnected {
+			deviceURL := authServiceURL + "/fabric"
+			if d, err := gatherControlCenterData(); err == nil && d.HeadscaleNodeID != "" {
+				deviceURL = authServiceURL + "/fabric/machines/" + d.HeadscaleNodeID
+			}
+			cc.SetDeviceURL(deviceURL)
 		}
 
 		// Auto-start servers and worker after network is connected
@@ -509,6 +517,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if status, err := network.GetGlobalStatus(ctx); err == nil {
 				data.NodeIP = status.IPv4
+				data.HeadscaleNodeID = status.NodeID
 				if data.NodeName == "" {
 					data.NodeName = status.Hostname
 				}

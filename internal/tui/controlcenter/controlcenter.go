@@ -13,6 +13,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -53,12 +54,13 @@ type JobRecord struct {
 
 // StatusData holds all the data for the control center
 type StatusData struct {
-	NodeName   string
-	NodeIP     string
-	OrgID      string
-	OrgName    string // Human-readable org name (if available from API)
-	Connected  bool
-	Version    string
+	NodeName        string
+	NodeIP          string
+	HeadscaleNodeID string // Numeric Headscale node ID (for fabric URLs)
+	OrgID           string
+	OrgName         string // Human-readable org name (if available from API)
+	Connected       bool
+	Version         string
 
 	// User info (from device auth)
 	UserEmail string
@@ -349,6 +351,9 @@ type ControlCenter struct {
 	// Service state overrides (transitional states: starting/stopping/failed)
 	serviceOverrides   map[string]*serviceStateOverride
 	serviceOverridesMu sync.Mutex
+
+	// Device URL set after successful device auth + connect
+	deviceURL string
 }
 
 // Pane focus constants
@@ -467,6 +472,11 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 			})
 		}()
 	}
+}
+
+// SetDeviceURL sets the URL for the "V" key shortcut to open the device page.
+func (cc *ControlCenter) SetDeviceURL(url string) {
+	cc.deviceURL = url
 }
 
 // Run starts the control center
@@ -751,6 +761,16 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		case 'z', 'Z':
 			// Zoom toggle on focused pane
 			cc.toggleZoom()
+			return nil
+		case 'v', 'V':
+			// Open device page in browser (available after device auth)
+			if cc.deviceURL != "" {
+				if err := platform.OpenURL(cc.deviceURL); err != nil {
+					cc.AddActivity("warning", fmt.Sprintf("Failed to open browser: %v", err))
+				} else {
+					cc.AddActivity("info", "Opened device page in browser")
+				}
+			}
 			return nil
 		}
 	}
@@ -1250,6 +1270,7 @@ func (cc *ControlCenter) showHelpModal() {
 
 [yellow]General:[-]
   [white::b]r[-:-:-]             Refresh status
+  [white::b]v[-:-:-]             View device in browser (after auth)
   [white::b]z[-:-:-]             Zoom focused pane (full screen toggle)
   [white::b]c[-:-:-]             Copy focused panel to clipboard
   [white::b]C[-:-:-]             Copy all panels to clipboard

@@ -1420,6 +1420,11 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 						if cc.onConnect != nil {
 							cc.onConnect(cc.AddActivity)
 						}
+
+						// Set device URL for the "V" key shortcut
+						cc.deviceURL = cc.authServiceURL + "/fabric"
+						cc.AddActivity("info", fmt.Sprintf("View your device: %s", cc.deviceURL))
+						cc.AddActivity("info", "Press [V] to open in browser")
 					}
 				}
 
