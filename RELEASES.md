@@ -463,3 +463,18 @@ Auto-generated log of every release.
   - fix(desktop): fix phantom right-clicks and color swap in VNC (#216)
 
 
+---
+
+## v2.32.0 — 2026-06-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 1 |
+| Lines added | +4 |
+
+**Changes:**
+
+  - fix(tui): add 3s timeout to tailscale detection on connect
+
+
