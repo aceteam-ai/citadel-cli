@@ -13,11 +13,12 @@ const (
 	JobTypeExtraction = "EXTRACTION"
 
 	// File operation job types for agent workspace access
-	JobTypeFileRead   = "FILE_READ"
-	JobTypeFileWrite  = "FILE_WRITE"
-	JobTypeFileEdit   = "FILE_EDIT"
-	JobTypeFileList   = "FILE_LIST"
-	JobTypeFileSearch = "FILE_SEARCH"
+	JobTypeFileRead      = "FILE_READ"
+	JobTypeFileReadBytes = "FILE_READ_BYTES"
+	JobTypeFileWrite     = "FILE_WRITE"
+	JobTypeFileEdit      = "FILE_EDIT"
+	JobTypeFileList      = "FILE_LIST"
+	JobTypeFileSearch    = "FILE_SEARCH"
 
 	// Model cache management job types
 	JobTypeModelCachePull  = "MODEL_CACHE_PULL"
@@ -62,7 +63,7 @@ type LLMInferencePayload struct {
 
 // ChatMessage represents a message in chat-style APIs.
 type ChatMessage struct {
-	Role    string `json:"role"`    // "system", "user", "assistant"
+	Role    string `json:"role"` // "system", "user", "assistant"
 	Content string `json:"content"`
 }
 

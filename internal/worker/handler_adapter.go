@@ -139,6 +139,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if opts.WorkspaceDir != "" {
 		handlers = append(handlers,
 			NewLegacyHandlerAdapter(JobTypeFileRead, jobs.NewFileReadHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileReadBytes, jobs.NewFileReadBytesHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
