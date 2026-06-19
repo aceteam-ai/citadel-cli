@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,13 @@ type Runner struct {
 	// Concurrency support
 	maxConcurrency int
 	gpuTracker     *GPUTracker
+
+	// Lifecycle observability for safe self-update.
+	// activeJobs counts jobs currently executing in a handler.
+	// draining, when set, stops the run loop from fetching new jobs so
+	// in-flight work can finish before the process is replaced/restarted.
+	activeJobs int64
+	draining   int32
 }
 
 // RunnerConfig holds configuration for the runner.
@@ -84,6 +92,25 @@ func (r *Runner) recordJob(record usage.UsageRecord) {
 	if r.jobRecordFn != nil {
 		r.jobRecordFn(record)
 	}
+}
+
+// ActiveJobs returns the number of jobs currently executing in a handler.
+// It is safe to call concurrently and is used by the auto-updater to find an
+// idle moment before swapping the binary.
+func (r *Runner) ActiveJobs() int {
+	return int(atomic.LoadInt64(&r.activeJobs))
+}
+
+// Drain signals the run loop to stop fetching new jobs. In-flight jobs are
+// allowed to finish. This is used by the auto-updater so that no new work is
+// picked up once an update has been downloaded and is ready to apply.
+func (r *Runner) Drain() {
+	atomic.StoreInt32(&r.draining, 1)
+}
+
+// isDraining reports whether Drain has been called.
+func (r *Runner) isDraining() bool {
+	return atomic.LoadInt32(&r.draining) == 1
 }
 
 // WithStreamWriterFactory sets a factory for creating stream writers.
@@ -144,6 +171,17 @@ runLoop:
 		case <-ctx.Done():
 			break runLoop
 		default:
+			// Stop fetching new jobs once draining (e.g. an auto-update is
+			// ready to apply). In-flight jobs continue to completion below.
+			if r.isDraining() {
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-ctx.Done():
+					break runLoop
+				}
+				continue
+			}
+
 			// Fetch next job
 			job, err := r.source.Next(ctx)
 			if err != nil {
@@ -195,6 +233,9 @@ runLoop:
 
 // processJob dispatches a job to the appropriate handler.
 func (r *Runner) processJob(ctx context.Context, job *Job) {
+	atomic.AddInt64(&r.activeJobs, 1)
+	defer atomic.AddInt64(&r.activeJobs, -1)
+
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 	startTime := time.Now()
 

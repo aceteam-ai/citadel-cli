@@ -28,6 +28,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
@@ -71,6 +72,10 @@ var (
 
 	// Update check flag
 	workNoUpdate bool
+
+	// Auto-update (periodic self-update) flags
+	workAutoUpdate         bool
+	workAutoUpdateInterval string
 
 	// Capability detection flags
 	workCapabilities string
@@ -1106,6 +1111,28 @@ func runWork(cmd *cobra.Command, args []string) {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
+	// Start the opt-in periodic auto-updater. Disabled by default; enable with
+	// --auto-update or CITADEL_AUTO_UPDATE=true. It checks GitHub Releases on
+	// the configured interval and, when a newer version is found, drains
+	// in-flight jobs before atomically swapping the binary and restarting.
+	if resolveAutoUpdateEnabled() {
+		interval, err := update.ParseInterval(resolveAutoUpdateInterval())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: %v; auto-update disabled\n", err)
+		} else {
+			updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
+				Checker:    update.NewClientWithTimeout(Version, 30*time.Second),
+				Interval:   interval,
+				ActiveJobs: runner.ActiveJobs,
+				Drain:      func() { runner.Drain() },
+				Log: func(format string, args ...any) {
+					fmt.Printf("   - "+format+"\n", args...)
+				},
+			})
+			go updater.Run(ctx)
+		}
+	}
+
 	// Run the worker
 	if err := runner.Run(ctx); err != nil {
 		if err != context.Canceled {
@@ -1226,6 +1253,29 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// resolveAutoUpdateEnabled reports whether the periodic auto-updater should run.
+// Priority: --auto-update flag > CITADEL_AUTO_UPDATE env. Disabled by default.
+func resolveAutoUpdateEnabled() bool {
+	if workAutoUpdate {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_AUTO_UPDATE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// resolveAutoUpdateInterval returns the configured auto-update interval string.
+// Priority: --auto-update-interval flag > CITADEL_AUTO_UPDATE_INTERVAL env.
+// Empty means use the default (1h).
+func resolveAutoUpdateInterval() string {
+	if workAutoUpdateInterval != "" {
+		return workAutoUpdateInterval
+	}
+	return os.Getenv("CITADEL_AUTO_UPDATE_INTERVAL")
 }
 
 // DeviceConfig holds device authentication configuration from the global config file.
@@ -1426,6 +1476,10 @@ func init() {
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
+
+	// Auto-update (periodic self-update) flags
+	workCmd.Flags().BoolVar(&workAutoUpdate, "auto-update", false, "Periodically check for and install newer releases (or set CITADEL_AUTO_UPDATE=true)")
+	workCmd.Flags().StringVar(&workAutoUpdateInterval, "auto-update-interval", "", "Interval between auto-update checks, e.g. 1h, 30m (default 1h; or set CITADEL_AUTO_UPDATE_INTERVAL)")
 
 	// Capability detection flags
 	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Additional comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")
