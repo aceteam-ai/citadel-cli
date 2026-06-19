@@ -57,10 +57,12 @@ var (
 
 // Terminal server state
 var (
-	ccTerminalServer  *terminal.Server
-	ccTerminalAuth    *terminal.CachingTokenValidator
-	ccTerminalPort    = 7860
-	ccTerminalRunning bool
+	ccTerminalServer   *terminal.Server
+	ccTerminalAuth     *terminal.CachingTokenValidator
+	ccTerminalPort     = 7860
+	ccTerminalRunning  bool
+	ccTerminalOrgID    string // orgID the terminal server was started with
+	ccTerminalAPIToken string // device API token the terminal server was started with
 )
 
 // VNC server state
@@ -279,7 +281,19 @@ func stopDemoServer() {
 // Called both on auto-reconnect at startup and after interactive login.
 func ccOnNetworkConnect(activityFn func(level, msg string)) {
 	if orgID := getOrgIDFromConfig(); orgID != "" {
-		if err := startTerminalServer(orgID); err != nil {
+		// Detect if credentials changed (e.g., after re-pairing). If the terminal
+		// server is already running with stale credentials, restart it so the
+		// CachingTokenValidator fetches fresh token hashes from the platform API.
+		currentAPIToken := ""
+		if cfg := getDeviceConfigFromFile(); cfg != nil {
+			currentAPIToken = cfg.DeviceAPIToken
+		}
+		if ccTerminalRunning && (orgID != ccTerminalOrgID || currentAPIToken != ccTerminalAPIToken) {
+			activityFn("info", "Credentials changed, restarting terminal server...")
+			stopTerminalServer()
+		}
+
+		if err := startTerminalServer(orgID, activityFn); err != nil {
 			activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
 		} else {
 			activityFn("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
@@ -305,8 +319,10 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 	}
 }
 
-// startTerminalServer starts the terminal server for remote SSH access
-func startTerminalServer(orgID string) error {
+// startTerminalServer starts the terminal server for remote SSH access.
+// activityFn routes log messages through the TUI activity panel. It must
+// not be nil — callers always pass one from ccOnNetworkConnect.
+func startTerminalServer(orgID string, activityFn func(level, msg string)) error {
 	if ccTerminalRunning {
 		return nil // Already running
 	}
@@ -318,22 +334,22 @@ func startTerminalServer(orgID string) error {
 	config.Port = ccTerminalPort
 
 	// Create the caching token validator
-	ccAPIToken := ""
+	apiToken := ""
 	if cfg := getDeviceConfigFromFile(); cfg != nil {
-		ccAPIToken = cfg.DeviceAPIToken
+		apiToken = cfg.DeviceAPIToken
 	}
 	ccTerminalAuth = terminal.NewCachingTokenValidator(
 		config.AuthServiceURL,
 		config.OrgID,
-		ccAPIToken,
+		apiToken,
 		config.TokenRefreshInterval,
 	)
 
-	// Set log callback to suppress stdout output in TUI mode
-	// Warnings will be silently ignored to prevent TUI corruption
+	// Route validator log messages through the TUI activity log so token
+	// fetch failures are visible (previously swallowed silently, making
+	// 401 errors after re-pairing impossible to diagnose).
 	ccTerminalAuth.SetLogFn(func(level, msg string) {
-		// In TUI mode, terminal server warnings are suppressed
-		// since they would corrupt the display
+		activityFn(level, fmt.Sprintf("[terminal auth] %s", msg))
 	})
 
 	// Start the validator's background refresh
@@ -364,6 +380,10 @@ func startTerminalServer(orgID string) error {
 		return fmt.Errorf("failed to start terminal server: %w", err)
 	}
 
+	// Record which credentials the server was started with, so we can
+	// detect when they change (e.g., after re-pairing) and restart.
+	ccTerminalOrgID = orgID
+	ccTerminalAPIToken = apiToken
 	ccTerminalRunning = true
 	return nil
 }
@@ -385,6 +405,8 @@ func stopTerminalServer() {
 	}
 
 	ccTerminalRunning = false
+	ccTerminalOrgID = ""
+	ccTerminalAPIToken = ""
 }
 
 // startVNCServer starts the embedded VNC server for remote desktop access
