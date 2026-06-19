@@ -431,3 +431,18 @@ Auto-generated log of every release.
   - fix(windows): reject SYSTEM profile paths in state directory resolution (#214)
 
 
+---
+
+## v2.30.0 — 2026-06-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 3 |
+| Lines added | +42 |
+
+**Changes:**
+
+  - feat(tui): view device page shortcut (V key) after auth (#215)
+
+
