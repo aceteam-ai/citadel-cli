@@ -54,6 +54,13 @@ type AutoUpdaterConfig struct {
 	// up to the floor. Zero uses DefaultAutoUpdateInterval.
 	Interval time.Duration
 
+	// Enabled is consulted at the start of every tick. When it returns false the
+	// updater skips that cycle entirely (no release check, no swap), so the
+	// switch can be flipped on a *running* agent — e.g. `citadel update
+	// enable/disable` (or the web UI) writes the persisted state and the next
+	// tick honors it without a restart. If nil, the updater is always enabled.
+	Enabled func() bool
+
 	// ActiveJobs reports the number of in-flight jobs. When it returns 0 the
 	// updater considers the node idle and safe to restart. If nil, the node is
 	// always considered idle (best-effort).
@@ -129,7 +136,7 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 // interval. It never returns an error: failures are logged and retried on the
 // next tick so the agent keeps running regardless.
 func (a *AutoUpdater) Run(ctx context.Context) {
-	a.cfg.Log("auto-update: enabled (interval %s)", a.cfg.Interval)
+	a.cfg.Log("auto-update: monitoring (interval %s)", a.cfg.Interval)
 	ticker := time.NewTicker(a.cfg.Interval)
 	defer ticker.Stop()
 
@@ -138,6 +145,11 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Re-check the toggle every tick so it can be flipped on a running
+			// agent without a restart.
+			if a.cfg.Enabled != nil && !a.cfg.Enabled() {
+				continue
+			}
 			// runOnce never panics; guard anyway so a bug here can never take
 			// down the agent.
 			func() {

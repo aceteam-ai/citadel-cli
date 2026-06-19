@@ -76,8 +76,11 @@ var updateStatusCmd = &cobra.Command{
 
 var updateEnableCmd = &cobra.Command{
 	Use:   "enable",
-	Short: "Enable automatic update checks",
-	Long:  `Enables periodic update checks when running citadel work.`,
+	Short: "Enable automatic updates",
+	Long: `Enables automatic updates. A running 'citadel work' agent periodically
+checks for a newer release and installs it (draining in-flight jobs first).
+The setting is persisted and re-read each cycle, so it takes effect on a
+running agent without a restart.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		setAutoUpdate(true)
 	},
@@ -85,8 +88,9 @@ var updateEnableCmd = &cobra.Command{
 
 var updateDisableCmd = &cobra.Command{
 	Use:   "disable",
-	Short: "Disable automatic update checks",
-	Long:  `Disables automatic update checks.`,
+	Short: "Disable automatic updates",
+	Long: `Disables automatic updates. Takes effect on a running 'citadel work'
+agent within one check interval, without a restart.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		setAutoUpdate(false)
 	},
@@ -269,11 +273,11 @@ func setAutoUpdate(enabled bool) {
 	}
 
 	if enabled {
-		fmt.Println("Auto-update checks enabled.")
-		fmt.Println("Updates will be checked once per day when running 'citadel work'.")
+		fmt.Println("Automatic updates enabled.")
+		fmt.Println("A running 'citadel work' agent will periodically check for and install newer releases.")
 	} else {
-		fmt.Println("Auto-update checks disabled.")
-		fmt.Println("Run 'citadel update check' to manually check for updates.")
+		fmt.Println("Automatic updates disabled.")
+		fmt.Println("Run 'citadel update check' / 'citadel update install' to update manually.")
 	}
 }
 
