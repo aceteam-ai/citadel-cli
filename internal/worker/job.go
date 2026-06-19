@@ -107,6 +107,7 @@ const (
 	JobTypeExtraction        = "GLINER_EXTRACTION"   // Entity/relation extraction via GLiNER2
 	JobTypeHTTPProxy         = "HTTP_PROXY"          // Proxy HTTP requests through the local node
 	JobTypeFileRead          = "FILE_READ"           // Read a file from the workspace
+	JobTypeFileReadBytes     = "FILE_READ_BYTES"     // Read a file as raw base64-encoded bytes (binary-safe)
 	JobTypeFileWrite         = "FILE_WRITE"          // Write a file to the workspace
 	JobTypeFileEdit          = "FILE_EDIT"           // Edit (string replace) a file in the workspace
 	JobTypeFileList          = "FILE_LIST"           // List directory contents in the workspace
