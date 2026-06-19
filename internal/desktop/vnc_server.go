@@ -254,10 +254,11 @@ func (s *VNCServer) rfbHandshake(conn net.Conn) error {
 	return nil
 }
 
-// ServerInit pixel format: 32bpp BGRX, matching GDI/DXGI native byte order.
+// ServerInit pixel format: 32bpp RGBX, matching what noVNC requests.
+// GDI captures in BGRX, we swap B↔R before sending (see writeFramebufferUpdate).
 // bpp=32, depth=24, big-endian=0, true-color=1
 // red-max=255, green-max=255, blue-max=255
-// red-shift=16, green-shift=8, blue-shift=0
+// red-shift=0, green-shift=8, blue-shift=16
 var serverPixelFormat = [16]byte{
 	32,   // bits-per-pixel
 	24,   // depth
@@ -266,9 +267,9 @@ var serverPixelFormat = [16]byte{
 	0, 255, // red-max (big-endian u16)
 	0, 255, // green-max
 	0, 255, // blue-max
-	16,  // red-shift
+	0,   // red-shift
 	8,   // green-shift
-	0,   // blue-shift
+	16,  // blue-shift
 	0, 0, 0, // padding (3 bytes)
 }
 
@@ -458,8 +459,12 @@ func writeFramebufferUpdate(w io.Writer, frame *CaptureResult) error {
 		return err
 	}
 
-	// Pixel data (raw BGRX, matches our advertised pixel format)
-	if _, err := w.Write(frame.Pix); err != nil {
+	// Convert BGRX (GDI native) to RGBX (our advertised format) by swapping B↔R.
+	pix := frame.Pix
+	for i := 0; i < len(pix)-2; i += 4 {
+		pix[i], pix[i+2] = pix[i+2], pix[i]
+	}
+	if _, err := w.Write(pix); err != nil {
 		return err
 	}
 

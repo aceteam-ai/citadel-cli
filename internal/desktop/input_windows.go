@@ -78,33 +78,41 @@ func sendKeyEvent(keysym uint32, down bool) {
 	procSendInput.Call(1, uintptr(unsafe.Pointer(&input)), unsafe.Sizeof(input))
 }
 
+var lastButtonMask byte
+
 // sendPointerEvent sends a mouse move + optional button press via SendInput.
 // buttonMask follows the RFB spec: bit0=left, bit1=middle, bit2=right,
 // bit3=scroll-up, bit4=scroll-down.
 func sendPointerEvent(x, y int, buttonMask byte) {
-	// Move cursor to absolute position
 	procSetCursorPos.Call(uintptr(x), uintptr(y))
 
-	// Determine button events from mask
-	// We track last button state to generate down/up transitions.
-	// For simplicity in this minimal server, we send the current state directly.
+	// Only send button down/up on state transitions to avoid phantom clicks.
+	changed := buttonMask ^ lastButtonMask
+	lastButtonMask = buttonMask
+
 	var flags uint32
 	var mouseData uint32
 
-	if buttonMask&0x01 != 0 {
-		flags |= mouseEventFLeftDown
-	} else {
-		flags |= mouseEventFLeftUp
+	if changed&0x01 != 0 {
+		if buttonMask&0x01 != 0 {
+			flags |= mouseEventFLeftDown
+		} else {
+			flags |= mouseEventFLeftUp
+		}
 	}
-	if buttonMask&0x02 != 0 {
-		flags |= mouseEventFMiddleDown
-	} else {
-		flags |= mouseEventFMiddleUp
+	if changed&0x02 != 0 {
+		if buttonMask&0x02 != 0 {
+			flags |= mouseEventFMiddleDown
+		} else {
+			flags |= mouseEventFMiddleUp
+		}
 	}
-	if buttonMask&0x04 != 0 {
-		flags |= mouseEventFRightDown
-	} else {
-		flags |= mouseEventFRightUp
+	if changed&0x04 != 0 {
+		if buttonMask&0x04 != 0 {
+			flags |= mouseEventFRightDown
+		} else {
+			flags |= mouseEventFRightUp
+		}
 	}
 	if buttonMask&0x08 != 0 {
 		flags |= mouseEventFWheel
@@ -112,8 +120,7 @@ func sendPointerEvent(x, y int, buttonMask byte) {
 	}
 	if buttonMask&0x10 != 0 {
 		flags |= mouseEventFWheel
-		// -120 in two's complement uint32 = 0xFFFFFF88
-		mouseData = ^uint32(wheelDelta) + 1 // scroll down
+		mouseData = ^uint32(wheelDelta) + 1
 	}
 
 	if flags != 0 {
