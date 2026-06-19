@@ -43,14 +43,14 @@ func TestMarshalServerInit(t *testing.T) {
 	}
 
 	// Shifts
-	if pf[10] != 16 {
-		t.Errorf("red-shift = %d, want 16", pf[10])
+	if pf[10] != 0 {
+		t.Errorf("red-shift = %d, want 0", pf[10])
 	}
 	if pf[11] != 8 {
 		t.Errorf("green-shift = %d, want 8", pf[11])
 	}
-	if pf[12] != 0 {
-		t.Errorf("blue-shift = %d, want 0", pf[12])
+	if pf[12] != 16 {
+		t.Errorf("blue-shift = %d, want 16", pf[12])
 	}
 
 	// Name
@@ -144,18 +144,18 @@ func TestWriteFramebufferUpdate(t *testing.T) {
 	}
 }
 
-func TestPixelFormatBGRX(t *testing.T) {
-	// Verify the pixel format matches BGRX byte order (blue at offset 0, red at offset 2).
-	// With red-shift=16, green-shift=8, blue-shift=0:
-	// Byte 0 (shift 0) = Blue, Byte 1 (shift 8) = Green, Byte 2 (shift 16) = Red
-	if serverPixelFormat[10] != 16 { // red-shift
-		t.Errorf("red-shift = %d, want 16", serverPixelFormat[10])
+func TestPixelFormatRGBX(t *testing.T) {
+	// Verify the pixel format matches RGBX byte order after B↔R swap.
+	// With red-shift=0, green-shift=8, blue-shift=16:
+	// Byte 0 (shift 0) = Red, Byte 1 (shift 8) = Green, Byte 2 (shift 16) = Blue
+	if serverPixelFormat[10] != 0 { // red-shift
+		t.Errorf("red-shift = %d, want 0", serverPixelFormat[10])
 	}
 	if serverPixelFormat[11] != 8 { // green-shift
 		t.Errorf("green-shift = %d, want 8", serverPixelFormat[11])
 	}
-	if serverPixelFormat[12] != 0 { // blue-shift
-		t.Errorf("blue-shift = %d, want 0", serverPixelFormat[12])
+	if serverPixelFormat[12] != 16 { // blue-shift
+		t.Errorf("blue-shift = %d, want 16", serverPixelFormat[12])
 	}
 }
 
