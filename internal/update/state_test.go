@@ -11,8 +11,8 @@ import (
 func TestDefaultState(t *testing.T) {
 	state := defaultState()
 
-	if !state.AutoUpdate {
-		t.Error("AutoUpdate should be true by default")
+	if state.AutoUpdate {
+		t.Error("AutoUpdate should be false by default (auto-install is opt-in)")
 	}
 
 	if state.Channel != "stable" {
@@ -183,8 +183,8 @@ func TestLoadStateNotFound(t *testing.T) {
 		t.Fatalf("LoadState should not fail for missing file: %v", err)
 	}
 
-	if !state.AutoUpdate {
-		t.Error("Default state should have AutoUpdate enabled")
+	if state.AutoUpdate {
+		t.Error("Default state should have AutoUpdate disabled (opt-in)")
 	}
 
 	if state.Channel != "stable" {

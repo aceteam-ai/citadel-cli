@@ -1111,26 +1111,27 @@ func runWork(cmd *cobra.Command, args []string) {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
-	// Start the opt-in periodic auto-updater. Disabled by default; enable with
-	// --auto-update or CITADEL_AUTO_UPDATE=true. It checks GitHub Releases on
-	// the configured interval and, when a newer version is found, drains
+	// Start the periodic auto-updater. The goroutine always runs; whether it
+	// actually checks/installs on a given tick is decided per-tick by
+	// resolveAutoUpdateEnabled() so the switch can be flipped on a *running*
+	// agent — `citadel update enable/disable` (or the web UI, which dispatches
+	// those same commands) writes the persisted state and the next tick honors
+	// it without a restart. When enabled and a newer version is found, it drains
 	// in-flight jobs before atomically swapping the binary and restarting.
-	if resolveAutoUpdateEnabled() {
-		interval, err := update.ParseInterval(resolveAutoUpdateInterval())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "   - Warning: %v; auto-update disabled\n", err)
-		} else {
-			updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
-				Checker:    update.NewClientWithTimeout(Version, 30*time.Second),
-				Interval:   interval,
-				ActiveJobs: runner.ActiveJobs,
-				Drain:      func() { runner.Drain() },
-				Log: func(format string, args ...any) {
-					fmt.Printf("   - "+format+"\n", args...)
-				},
-			})
-			go updater.Run(ctx)
-		}
+	if interval, err := update.ParseInterval(resolveAutoUpdateInterval()); err != nil {
+		fmt.Fprintf(os.Stderr, "   - Warning: %v; auto-update disabled\n", err)
+	} else {
+		updater := update.NewAutoUpdater(update.AutoUpdaterConfig{
+			Checker:    update.NewClientWithTimeout(Version, 30*time.Second),
+			Interval:   interval,
+			Enabled:    resolveAutoUpdateEnabled,
+			ActiveJobs: runner.ActiveJobs,
+			Drain:      func() { runner.Drain() },
+			Log: func(format string, args ...any) {
+				fmt.Printf("   - "+format+"\n", args...)
+			},
+		})
+		go updater.Run(ctx)
 	}
 
 	// Run the worker
@@ -1255,8 +1256,11 @@ func resolveWorkspaceDir() string {
 	return abs
 }
 
-// resolveAutoUpdateEnabled reports whether the periodic auto-updater should run.
-// Priority: --auto-update flag > CITADEL_AUTO_UPDATE env. Disabled by default.
+// resolveAutoUpdateEnabled reports whether the periodic auto-updater should act
+// on the current tick. Priority: --auto-update flag > CITADEL_AUTO_UPDATE env
+// (explicit on/off) > the persisted `citadel update enable/disable` state.
+// Disabled by default. Evaluated every tick so the web UI (which dispatches
+// `citadel update enable/disable` to the node) can toggle a running agent.
 func resolveAutoUpdateEnabled() bool {
 	if workAutoUpdate {
 		return true
@@ -1264,8 +1268,14 @@ func resolveAutoUpdateEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_AUTO_UPDATE"))) {
 	case "1", "true", "yes", "on":
 		return true
+	case "0", "false", "no", "off":
+		return false
 	}
-	return false
+	state, err := update.LoadState()
+	if err != nil || state == nil {
+		return false
+	}
+	return state.AutoUpdate
 }
 
 // resolveAutoUpdateInterval returns the configured auto-update interval string.

@@ -112,10 +112,13 @@ func RecordUpdate(state *State, oldVersion, newVersion string) {
 	state.LastUpdate = time.Now()
 }
 
-// defaultState returns a new state with sensible defaults
+// defaultState returns a new state with sensible defaults.
+// AutoUpdate defaults to false: auto-installing a new binary on a node is
+// consequential, so it is opt-in (turned on explicitly via `citadel update
+// enable` or the web UI), never on by default.
 func defaultState() *State {
 	return &State{
-		AutoUpdate: true,
+		AutoUpdate: false,
 		Channel:    "stable",
 	}
 }
