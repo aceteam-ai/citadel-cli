@@ -518,3 +518,28 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.40.0 release
 
 
+---
+
+## v2.42.0 — 2026-06-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 11 |
+| Files changed | 46 |
+| Lines added | +7321 |
+
+**Changes:**
+
+  - fix(workflow): avoid copying sync.RWMutex in Execution.Snapshot (#266)
+  - feat(tui): add Proxmox VE hypervisor management page (#212) (#256)
+  - fix(tests): replace destructive uninstall test with pure function tests (#265)
+  - feat(vnc): implement Linux Uninstall + verify provisioning on aceteamvm (#122)
+  - fix(workflow): gate HTTP API behind requireVPNOrAuth (#259)
+  - fix: stabilize Citadel OS provisioning + login flow (#244)
+  - feat(workflow): DAG-based workflow execution on Fabric nodes (#105)
+  - feat(provision): Infrastructure Canvas provisioning API (#257)
+  - fix: prevent node ID churn on restart + log registration to file (#246) (#255)
+  - fix(vnc): lazy readiness detection + retry for VNC control startup (#243) (#254)
+  - fix: guard release.sh against dirty working tree (#245) (#253)
+
+
