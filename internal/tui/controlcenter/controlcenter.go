@@ -404,6 +404,9 @@ type ControlCenter struct {
 
 	// Device URL set after successful device auth + connect
 	deviceURL string
+
+	// Console page (nil on Windows)
+	consolePage *ConsolePage
 }
 
 // Pane focus constants
@@ -558,7 +561,12 @@ func (cc *ControlCenter) Run() error {
 
 	// Register pages: Alt+1=Dashboard, rest hidden until ready
 	cc.pmgr.Register(cc, true)
-	cc.pmgr.Register(NewPlaceholderPage("console", "Console"), false)
+	cc.consolePage = NewConsolePage(nil)
+	if runtime.GOOS != "windows" {
+		cc.pmgr.Register(cc.consolePage, true)
+	} else {
+		cc.pmgr.Register(NewPlaceholderPage("console", "Console"), false)
+	}
 	cc.pmgr.Register(NewPlaceholderPage("services", "Services"), false)
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
@@ -593,6 +601,9 @@ func (cc *ControlCenter) Run() error {
 // Stop stops the control center
 func (cc *ControlCenter) Stop() {
 	close(cc.stopChan)
+	if cc.consolePage != nil {
+		cc.consolePage.Close()
+	}
 	if cc.app != nil {
 		cc.app.Stop()
 	}
