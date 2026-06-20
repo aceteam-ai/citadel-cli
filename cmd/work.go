@@ -189,6 +189,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("capability tags: %v", nodeCaps.Tags)
 	}
 
+	// Detect Proxmox hypervisor (host fact, checked regardless of manifest vs auto-detect)
+	var proxmoxInfo *platform.ProxmoxInfo
+	if pveInfo, err := platform.DetectProxmox(); err == nil && pveInfo.IsInstalled {
+		proxmoxInfo = pveInfo
+		nodeCaps.Tags = append(nodeCaps.Tags, "hypervisor:proxmox")
+		fmt.Printf("   - Hypervisor: Proxmox VE")
+		if pveInfo.Version != "" {
+			fmt.Printf(" (%s)", pveInfo.Version)
+		}
+		fmt.Printf("\n")
+		if pveInfo.VMCount > 0 || pveInfo.CTCount > 0 {
+			fmt.Printf("   - Guests: %d VMs, %d containers\n", pveInfo.VMCount, pveInfo.CTCount)
+		}
+	}
+
 	// Convert capabilities to status types for heartbeat
 	var statusCaps *status.NodeCapabilities
 	if nodeCaps != nil {
@@ -204,6 +219,16 @@ func runWork(cmd *cobra.Command, args []string) {
 					Tag:     dev.Tag,
 					VRAMTag: dev.VRAMTag,
 				})
+			}
+		}
+		if proxmoxInfo != nil {
+			statusCaps.Hypervisor = &status.HypervisorInfo{
+				Type:      "proxmox",
+				Version:   proxmoxInfo.Version,
+				NodeName:  proxmoxInfo.NodeName,
+				NodeCount: proxmoxInfo.NodeCount,
+				VMCount:   proxmoxInfo.VMCount,
+				CTCount:   proxmoxInfo.CTCount,
 			}
 		}
 	}
