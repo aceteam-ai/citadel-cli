@@ -19,6 +19,20 @@ import (
 	"tailscale.com/tsnet"
 )
 
+// logf is a package-level settable logger for diagnostic output.
+// Defaults to no-op. Wire it from cmd via SetLogf to route messages
+// through the Debug/Log infrastructure (which respects --debug).
+var logf = func(format string, args ...any) {}
+
+// SetLogf sets the package-level diagnostic logger. Pass cmd.Debug or
+// cmd.Log to route network-layer messages through the CLI's log infra.
+// Must be called before any Connect / VerifyOrReconnect calls.
+func SetLogf(fn func(string, ...any)) {
+	if fn != nil {
+		logf = fn
+	}
+}
+
 // NetworkServer wraps tsnet.Server with AceTeam-specific functionality.
 type NetworkServer struct {
 	srv        *tsnet.Server
@@ -136,6 +150,8 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 }
 
 // waitForConnection waits for the network connection to be established.
+// Logs BackendState transitions via the package-level logf so callers
+// can diagnose hangs (e.g. stuck in "NeedsLogin" with stale keys).
 func (s *NetworkServer) waitForConnection(ctx context.Context) error {
 	// Create a timeout context if one isn't already set
 	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -150,14 +166,20 @@ func (s *NetworkServer) waitForConnection(ctx context.Context) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
+	lastState := ""
 	for {
 		select {
 		case <-timeoutCtx.Done():
+			logf("vpn: timed out waiting for connection (last state: %s)", lastState)
 			return fmt.Errorf("timeout waiting for network connection")
 		case <-ticker.C:
 			status, err := lc.Status(timeoutCtx)
 			if err != nil {
 				continue // Keep trying
+			}
+			if status.BackendState != lastState {
+				logf("vpn: state %s -> %s", lastState, status.BackendState)
+				lastState = status.BackendState
 			}
 			if status.BackendState == "Running" {
 				return nil
