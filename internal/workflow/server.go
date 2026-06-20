@@ -16,10 +16,10 @@ func NewServer(executor *Executor) *Server {
 	return &Server{executor: executor}
 }
 
-func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/workflow/run", s.handleRun)
-	mux.HandleFunc("/workflow/", s.handleWorkflowByID)
-	mux.HandleFunc("/workflow", s.handleList)
+func (s *Server) RegisterRoutes(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc) {
+	mux.HandleFunc("/workflow/run", authMiddleware(s.handleRun))
+	mux.HandleFunc("/workflow/", authMiddleware(s.handleWorkflowByID))
+	mux.HandleFunc("/workflow", authMiddleware(s.handleList))
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
