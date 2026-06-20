@@ -19,11 +19,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
-	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -33,6 +33,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -717,6 +718,15 @@ func runWork(cmd *cobra.Command, args []string) {
 		})
 	}
 
+	// Resolve workspace dir early — needed by both file-operation handlers and
+	// the workflow executor.
+	wsDir := resolveWorkspaceDir()
+
+	// Workflow executor for WORKFLOW_RUN jobs (#105).
+	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
+	})
+
 	// Build the agent introspection & control providers (issue #236). These
 	// back the status server's /agent/* endpoints, which the aceteam MCP server
 	// wraps as citadel_* tools. They read the shared workerState and act on the
@@ -1230,11 +1240,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Create handlers with optional workspace for file-operation jobs.
-	wsDir := resolveWorkspaceDir()
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		WorkspaceDir: wsDir,
 		ConfigDir:    workConfigDir,
 	})
+	handlers = append(handlers, workflow.NewHandler(wfExec))
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)

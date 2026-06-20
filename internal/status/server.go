@@ -38,7 +38,6 @@ type Server struct {
 	// routeRegistrars are callbacks registered via AddRouteRegistrar that
 	// install additional routes (e.g., provisioning API) during Start.
 	routeRegistrars []RouteRegistrar
-
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
@@ -56,6 +55,11 @@ type ServerConfig struct {
 	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
 	// listeners but gated by requireVPNOrAuth.
 	Agent *AgentProviders
+
+	// ExtraRoutes, when set, is called during Start() to register additional
+	// HTTP routes on the status server's mux. This allows external packages
+	// (e.g., workflow) to add endpoints without modifying the status package.
+	ExtraRoutes func(mux *http.ServeMux)
 }
 
 // NewServer creates a new status HTTP server.
@@ -116,7 +120,6 @@ func (s *Server) Start(ctx context.Context) error {
 	for _, reg := range s.routeRegistrars {
 		reg(mux, s.requireVPNOrAuth)
 	}
-
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      mux,
