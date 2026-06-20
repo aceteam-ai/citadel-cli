@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,6 +29,12 @@ type Client struct {
 
 	// Node identity metadata injected into stream events
 	nodeMeta *NodeMeta
+
+	// lastConsumeStatus is the HTTP status code of the most recent
+	// jobs/consume request. Exposed via LastConsumeStatus() so the worker
+	// introspection path can report it (issue #236). The pre-fix #3924 bug
+	// surfaced here as repeated 400s with no visible error in the log file.
+	lastConsumeStatus int32
 }
 
 // ClientConfig holds configuration for the API client.
@@ -72,6 +79,14 @@ func (c *Client) debug(format string, args ...any) {
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {
 	return c.workerID
+}
+
+// LastConsumeStatus returns the HTTP status code of the most recent
+// jobs/consume request, or 0 if no consume request has been made yet.
+// Used by the worker introspection path (issue #236) to report whether the
+// consume loop is succeeding (200) or being rejected (e.g. 400/401/403).
+func (c *Client) LastConsumeStatus() int {
+	return int(atomic.LoadInt32(&c.lastConsumeStatus))
 }
 
 // Ping verifies the API connection by making a simple request.
@@ -207,6 +222,13 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 	}
 
 	c.debug("response: %d - %s", resp.StatusCode, string(respBody))
+
+	// Record the consume HTTP status for worker introspection (issue #236).
+	// This is the single signal that would have surfaced the pre-fix #3924
+	// 400s, which otherwise only appeared as a generic "consume failed" error.
+	if strings.Contains(path, "/jobs/consume") {
+		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
+	}
 
 	// Handle error responses
 	if resp.StatusCode >= 400 {

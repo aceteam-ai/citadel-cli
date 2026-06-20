@@ -229,6 +229,12 @@ func runWork(cmd *cobra.Command, args []string) {
 	var apiSource *worker.APISource               // Keep reference for heartbeat
 	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
 
+	// Live worker introspection state for the out-of-band control path
+	// (issue #236). Created here so the same pointer is shared by the runner
+	// (job counts, poll time) and the status server's /agent/* endpoints, which
+	// answer over the tsnet mesh even when Redis job consumption is broken.
+	workerState := worker.NewWorkerState()
+
 	if workRedisURL == "" && deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
 		// API mode: use secure HTTP API instead of direct Redis.
 		Debug("using API mode (device_api_token found)")
@@ -623,6 +629,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					fmt.Fprintf(os.Stderr, "   - Warning: per-node stream subscribe failed: %v\n", err)
 				}
 			}
+			workerState.SetPerNodeQueue(perNodeQueue)
 			fmt.Printf("   - Per-node shell stream: %s\n", perNodeQueue)
 			Debug("per-node shell stream: %s", perNodeQueue)
 		} else {
@@ -634,6 +641,29 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - Warning: per-node shell stream skipped (Headscale node ID "+
 			"unavailable); node-targeted jobs will fall back to the shared org stream")
 		Debug("per-node shell stream skipped: Headscale node ID unavailable")
+	}
+
+	// Populate the worker introspection state with the resolved identity and
+	// the full subscribed queue list (issue #236). This drives /agent/worker-status
+	// and the doctor diagnosis below.
+	{
+		stateOrgID := ""
+		if deviceConfig != nil {
+			stateOrgID = deviceConfig.OrgID
+		}
+		consumerGroup := workGroup
+		if consumerGroup == "" {
+			consumerGroup = "citadel-workers"
+		}
+		var queues []string
+		switch src := source.(type) {
+		case *worker.APISource:
+			queues = src.QueueNames()
+		case *worker.RedisSource:
+			queues = src.QueueNames()
+		}
+		workerState.SetIdentity(workerID, source.Name(), consumerGroup, headscaleNodeID, stateOrgID)
+		workerState.SetQueues(queues)
 	}
 
 	// Open usage store for per-job compute tracking
@@ -691,11 +721,26 @@ func runWork(cmd *cobra.Command, args []string) {
 		})
 	}
 
+	// Build the agent introspection & control providers (issue #236). These
+	// back the status server's /agent/* endpoints, which the aceteam MCP server
+	// wraps as citadel_* tools. They read the shared workerState and act on the
+	// live source — never via the Redis job queue, so they work even when job
+	// consumption is broken.
+	agentProviders := buildAgentProviders(ctx, agentProviderDeps{
+		state:           workerState,
+		source:          source,
+		nodeName:        nodeName,
+		headscaleNodeID: headscaleNodeID,
+		baseURL:         baseURL,
+		deviceConfig:    deviceConfig,
+	})
+
 	// Start status server if enabled
 	if workStatusPort > 0 {
 		serverCfg := status.ServerConfig{
 			Port:    workStatusPort,
 			Version: Version,
+			Agent:   agentProviders,
 		}
 
 		// Wire up desktop API auth if org ID is available
@@ -1205,13 +1250,22 @@ func runWork(cmd *cobra.Command, args []string) {
 		maxConcurrency = 1 // Default: sequential
 	}
 
-	// Create runner
+	// Create runner.
+	//
+	// ActivityFn routes the runner's per-job and lifecycle log lines to the
+	// citadel log file instead of stdout (which the log file does not capture).
+	// Before this, those lines were lost during a live node-routing debug
+	// (issue #3924/#236); #234 already routed the source's LogFn the same way.
+	// State threads the shared introspection metrics so the /agent/* endpoints
+	// can report consume/job activity.
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
 		WorkerID:       workerID,
 		Verbose:        true,
+		ActivityFn:     func(_ string, msg string) { Log("%s", msg) },
 		JobRecordFn:    jobRecordFn,
 		MaxConcurrency: maxConcurrency,
 		GPUTracker:     gpuTracker,
+		State:          workerState,
 	})
 
 	// Add stream writer factory if available

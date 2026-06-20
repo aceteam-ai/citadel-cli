@@ -26,6 +26,10 @@ type Server struct {
 	orgID          string
 	enableDesktop  bool
 
+	// agent provides the data/actions backing the /agent/* introspection &
+	// control endpoints (issue #236). Nil disables those routes.
+	agent *AgentProviders
+
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
@@ -38,6 +42,11 @@ type ServerConfig struct {
 	TokenValidator terminal.TokenValidator // Optional: enables authenticated desktop endpoints
 	OrgID          string                 // Required when TokenValidator is set
 	EnableDesktop  bool                   // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
+
+	// Agent, when set, registers the /agent/* introspection & control
+	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
+	// listeners but gated by requireVPNOrAuth.
+	Agent *AgentProviders
 }
 
 // NewServer creates a new status HTTP server.
@@ -52,6 +61,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		tokenValidator: cfg.TokenValidator,
 		orgID:          cfg.OrgID,
 		enableDesktop:  cfg.EnableDesktop,
+		agent:          cfg.Agent,
 	}
 }
 
@@ -80,6 +90,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// Uses VPN-origin check OR token auth — the platform relay calls this
 	// from within the VPN mesh after validating org ownership.
 	mux.HandleFunc("/ssh/authorized-keys", s.requireVPNOrAuth(s.handleSSHAuthorizedKeys))
+
+	// Agent introspection & control endpoints (issue #236), gated the same way
+	// (VPN origin or valid org token). No-op when no providers were supplied.
+	s.registerAgentRoutes(mux)
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
