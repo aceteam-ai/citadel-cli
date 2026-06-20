@@ -30,6 +30,10 @@ type Runner struct {
 	maxConcurrency int
 	gpuTracker     *GPUTracker
 
+	// state, when set, records live introspection metrics (poll time, job
+	// counts) for the out-of-band status/control path (issue #236).
+	state *WorkerState
+
 	// Lifecycle observability for safe self-update.
 	// activeJobs counts jobs currently executing in a handler.
 	// draining, when set, stops the run loop from fetching new jobs so
@@ -63,6 +67,10 @@ type RunnerConfig struct {
 
 	// GPUTracker manages GPU slot allocation (optional, for GPU-aware jobs)
 	GPUTracker *GPUTracker
+
+	// State, when set, is updated with live introspection metrics so the
+	// status/control path can report consume/job activity (issue #236).
+	State *WorkerState
 }
 
 // NewRunner creates a new job runner.
@@ -75,6 +83,7 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 		jobRecordFn:    config.JobRecordFn,
 		maxConcurrency: config.MaxConcurrency,
 		gpuTracker:     config.GPUTracker,
+		state:          config.State,
 	}
 }
 
@@ -91,6 +100,30 @@ func (r *Runner) log(level, format string, args ...interface{}) {
 			fmt.Printf("%s\n", msg)
 		}
 	}
+}
+
+// consumeStatusReporter is implemented by sources that can report the HTTP
+// status of their most recent consume call (currently APISource via the
+// redisapi client). Used to surface the pre-fix #3924 400s (issue #236).
+type consumeStatusReporter interface {
+	LastConsumeStatus() int
+}
+
+// recordConsumeStatus copies the source's last consume HTTP status and error
+// into the introspection state after each poll cycle.
+func (r *Runner) recordConsumeStatus(pollErr error) {
+	if r.state == nil {
+		return
+	}
+	status := 0
+	if rep, ok := r.source.(consumeStatusReporter); ok {
+		status = rep.LastConsumeStatus()
+	}
+	errStr := ""
+	if pollErr != nil {
+		errStr = pollErr.Error()
+	}
+	r.state.RecordConsumeStatus(status, errStr)
 }
 
 // recordJob records a job completion for usage tracking
@@ -190,6 +223,11 @@ runLoop:
 
 			// Fetch next job
 			job, err := r.source.Next(ctx)
+			// Record the poll cycle for introspection regardless of outcome,
+			// so the status path can report "last successful poll time" and
+			// whether the worker is actively consuming (issue #236).
+			r.state.RecordPoll()
+			r.recordConsumeStatus(err)
 			if err != nil {
 				if ctx.Err() != nil {
 					break runLoop // Context cancelled
@@ -242,6 +280,13 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	atomic.AddInt64(&r.activeJobs, 1)
 	defer atomic.AddInt64(&r.activeJobs, -1)
 
+	// Track job in the introspection state. jobOK is flipped to true only on a
+	// clean success; the deferred RecordJobDone classifies the outcome (issue
+	// #236). Covers every return path of this function.
+	r.state.RecordJobReceived()
+	jobOK := false
+	defer func() { r.state.RecordJobDone(jobOK) }()
+
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 	startTime := time.Now()
 
@@ -272,6 +317,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, err)
 		}
 		r.recordJob(buildUsageRecord(job, "cancelled", startTime, time.Now(), nil, nil))
+		jobOK = true // cleanly acked, not a processing failure
 		r.source.Ack(ctx, job)
 		return
 	}
@@ -370,6 +416,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	}
 
 	// Success
+	jobOK = true
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
 	if result != nil {

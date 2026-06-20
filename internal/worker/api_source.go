@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
@@ -11,8 +12,13 @@ import (
 // This is the secure alternative to direct Redis connections.
 // Supports consuming from multiple queues by round-robining across them.
 type APISource struct {
-	client     *redisapi.Client
-	config     APISourceConfig
+	client *redisapi.Client
+	config APISourceConfig
+
+	// mu guards queueNames, which is read by the run loop (Next) and may be
+	// appended to at runtime by AddQueue (e.g. the /agent/resubscribe control
+	// endpoint, issue #236) from a different goroutine.
+	mu         sync.RWMutex
 	queueNames []string // resolved list of queues to consume from
 	queueIndex int      // round-robin index for multi-queue polling
 }
@@ -127,16 +133,25 @@ func (s *APISource) Connect(ctx context.Context) error {
 // When consuming from multiple queues, polls each queue in round-robin
 // with a short block timeout to avoid starving any queue.
 func (s *APISource) Next(ctx context.Context) (*Job, error) {
-	if len(s.queueNames) == 1 {
-		return s.nextSingle(ctx)
+	queues := s.snapshotQueues()
+	if len(queues) == 1 {
+		return s.nextSingle(ctx, queues[0])
 	}
-	return s.nextMulti(ctx)
+	return s.nextMulti(ctx, queues)
+}
+
+// snapshotQueues returns a stable copy of the queue list for one poll cycle,
+// so concurrent AddQueue calls (e.g. /agent/resubscribe) don't race the loop.
+func (s *APISource) snapshotQueues() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.queueNames...)
 }
 
 // nextSingle reads from a single queue (original behavior).
-func (s *APISource) nextSingle(ctx context.Context) (*Job, error) {
+func (s *APISource) nextSingle(ctx context.Context, queue string) (*Job, error) {
 	apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
-		Queue:    s.queueNames[0],
+		Queue:    queue,
 		Group:    s.config.ConsumerGroup,
 		Consumer: s.client.WorkerID(),
 		Count:    1,
@@ -151,7 +166,7 @@ func (s *APISource) nextSingle(ctx context.Context) (*Job, error) {
 	}
 
 	job := s.convertJob(apiJob)
-	job.SourceQueue = s.queueNames[0]
+	job.SourceQueue = queue
 	return job, nil
 }
 
@@ -160,10 +175,10 @@ func (s *APISource) nextSingle(ctx context.Context) (*Job, error) {
 // Individual queue failures (e.g., rejected by server validation) are
 // logged and skipped rather than failing the entire poll cycle. Only
 // when all queues error does the caller see an error (triggering backoff).
-func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
+func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error) {
 	// Use a shorter block per queue so we cycle through them all within
 	// roughly the configured block timeout.
-	perQueueBlockMs := s.config.BlockMs / len(s.queueNames)
+	perQueueBlockMs := s.config.BlockMs / len(queues)
 	if perQueueBlockMs < 500 {
 		perQueueBlockMs = 500
 	}
@@ -171,15 +186,15 @@ func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 	var lastErr error
 	errCount := 0
 
-	for i := 0; i < len(s.queueNames); i++ {
+	for i := 0; i < len(queues); i++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		queue := s.queueNames[s.queueIndex]
-		s.queueIndex = (s.queueIndex + 1) % len(s.queueNames)
+		queue := queues[s.queueIndex%len(queues)]
+		s.queueIndex = (s.queueIndex + 1) % len(queues)
 
 		apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
 			Queue:    queue,
@@ -204,7 +219,7 @@ func (s *APISource) nextMulti(ctx context.Context) (*Job, error) {
 	}
 
 	// Only propagate error (triggering backoff) if ALL queues failed.
-	if errCount == len(s.queueNames) {
+	if errCount == len(queues) {
 		return nil, fmt.Errorf("all queues failed: %w", lastErr)
 	}
 
@@ -239,7 +254,9 @@ func (s *APISource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
 	queue := job.SourceQueue
 	if queue == "" {
-		queue = s.queueNames[0]
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
 	}
 	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
 		Queue:     queue,
@@ -271,9 +288,19 @@ func (s *APISource) Client() *redisapi.Client {
 	return s.client
 }
 
+// LastConsumeStatus returns the HTTP status code of the most recent consume
+// request, or 0 if not yet connected/polled. Satisfies consumeStatusReporter
+// so the runner can surface it for worker introspection (issue #236).
+func (s *APISource) LastConsumeStatus() int {
+	if s.client == nil {
+		return 0
+	}
+	return s.client.LastConsumeStatus()
+}
+
 // QueueNames returns the list of queues being consumed.
 func (s *APISource) QueueNames() []string {
-	return s.queueNames
+	return s.snapshotQueues()
 }
 
 // AddQueue appends an additional queue to consume from after construction.
@@ -281,19 +308,23 @@ func (s *APISource) QueueNames() []string {
 // This is used to subscribe to the worker's per-node shell stream once the
 // node's Headscale ID is known (issue #3914), which happens after the source
 // is built. The Redis API proxy creates the consumer group lazily on the first
-// XREADGROUP, so no explicit group-creation call is needed here. Must be called
-// before the run loop starts reading (single-threaded at that point), so no
-// locking is required. A blank or already-present queue is ignored.
+// XREADGROUP, so no explicit group-creation call is needed here. A blank or
+// already-present queue is ignored. Guarded by mu so it is safe to call at
+// runtime (e.g. from the /agent/resubscribe control endpoint, issue #236)
+// concurrently with the run loop, which reads via snapshotQueues.
 func (s *APISource) AddQueue(queue string) {
 	if queue == "" {
 		return
 	}
+	s.mu.Lock()
 	for _, q := range s.queueNames {
 		if q == queue {
+			s.mu.Unlock()
 			return
 		}
 	}
 	s.queueNames = append(s.queueNames, queue)
+	s.mu.Unlock()
 	s.log("info", "   - Added queue: %s", queue)
 }
 

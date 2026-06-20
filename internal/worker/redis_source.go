@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
@@ -31,8 +32,12 @@ func maskRedisURL(redisURL string) string {
 // This is the job source for AceTeam's private GPU cloud infrastructure.
 // Supports consuming from multiple queues simultaneously for tag-based routing.
 type RedisSource struct {
-	client     *redisclient.Client
-	config     RedisSourceConfig
+	client *redisclient.Client
+	config RedisSourceConfig
+
+	// mu guards queueNames, which is read by the run loop (Next) and may be
+	// appended to at runtime by AddQueue (e.g. /agent/resubscribe, issue #236).
+	mu         sync.RWMutex
 	queueNames []string // resolved list of queues to consume from
 }
 
@@ -144,14 +149,23 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 
 // Next blocks until a job is available or context is cancelled.
 func (s *RedisSource) Next(ctx context.Context) (*Job, error) {
-	if len(s.queueNames) == 1 {
-		return s.nextSingle(ctx)
+	queues := s.snapshotQueues()
+	if len(queues) == 1 {
+		return s.nextSingle(ctx, queues[0])
 	}
-	return s.nextMulti(ctx)
+	return s.nextMulti(ctx, queues)
+}
+
+// snapshotQueues returns a stable copy of the queue list for one poll cycle,
+// so concurrent AddQueue calls (e.g. /agent/resubscribe) don't race the loop.
+func (s *RedisSource) snapshotQueues() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.queueNames...)
 }
 
 // nextSingle reads from a single queue (original behavior).
-func (s *RedisSource) nextSingle(ctx context.Context) (*Job, error) {
+func (s *RedisSource) nextSingle(ctx context.Context, queue string) (*Job, error) {
 	redisJob, err := s.client.ReadJob(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
@@ -160,8 +174,6 @@ func (s *RedisSource) nextSingle(ctx context.Context) (*Job, error) {
 	if redisJob == nil {
 		return nil, nil
 	}
-
-	queue := s.queueNames[0]
 
 	// Check delivery count for DLQ handling
 	deliveryCount, _ := s.client.GetDeliveryCount(ctx, redisJob.MessageID)
@@ -181,8 +193,8 @@ func (s *RedisSource) nextSingle(ctx context.Context) (*Job, error) {
 }
 
 // nextMulti reads from multiple queues simultaneously.
-func (s *RedisSource) nextMulti(ctx context.Context) (*Job, error) {
-	redisJob, sourceQueue, err := s.client.ReadJobMulti(ctx, s.queueNames)
+func (s *RedisSource) nextMulti(ctx context.Context, queues []string) (*Job, error) {
+	redisJob, sourceQueue, err := s.client.ReadJobMulti(ctx, queues)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 	}
@@ -262,7 +274,7 @@ func (s *RedisSource) Client() *redisclient.Client {
 
 // QueueNames returns the list of queues being consumed.
 func (s *RedisSource) QueueNames() []string {
-	return s.queueNames
+	return s.snapshotQueues()
 }
 
 // AddQueue appends an additional queue to consume from after Connect.
@@ -272,24 +284,30 @@ func (s *RedisSource) QueueNames() []string {
 // and connected. The consumer group (and stream, via MKSTREAM) is created
 // immediately so the platform dispatcher's consumer-presence check can see the
 // stream; the consumer itself registers on the next multi-queue XREADGROUP.
-// Must be called before the run loop starts reading (single-threaded at that
-// point), so no locking is required. A blank or already-present queue is
-// ignored. Returns an error only if the consumer group cannot be created.
+// Guarded by mu so it is safe to call at runtime (e.g. /agent/resubscribe,
+// issue #236) concurrently with the run loop, which reads via snapshotQueues.
+// A blank or already-present queue is ignored. Returns an error only if the
+// consumer group cannot be created.
 func (s *RedisSource) AddQueue(ctx context.Context, queue string) error {
 	if queue == "" {
 		return nil
 	}
+	s.mu.RLock()
 	for _, q := range s.queueNames {
 		if q == queue {
+			s.mu.RUnlock()
 			return nil
 		}
 	}
+	s.mu.RUnlock()
 	if s.client != nil {
 		if err := s.client.EnsureConsumerGroups(ctx, []string{queue}); err != nil {
 			return fmt.Errorf("failed to create consumer group for %s: %w", queue, err)
 		}
 	}
+	s.mu.Lock()
 	s.queueNames = append(s.queueNames, queue)
+	s.mu.Unlock()
 	s.log("info", "   - Added queue: %s", queue)
 	return nil
 }
