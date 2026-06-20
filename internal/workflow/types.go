@@ -204,8 +204,18 @@ func (e *Execution) AddNodeLog(log *NodeLog) {
 func (e *Execution) Snapshot() Execution {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	cp := *e
-	return cp
+	return Execution{
+		ID:        e.ID,
+		Status:    e.Status,
+		Graph:     e.Graph,
+		Input:     e.Input,
+		Output:    e.Output,
+		Error:     e.Error,
+		StartedAt: e.StartedAt,
+		EndedAt:   e.EndedAt,
+		NodeLogs:  e.NodeLogs,
+		Metrics:   e.Metrics,
+	}
 }
 
 func (e *Execution) MarshalJSON() ([]byte, error) {
