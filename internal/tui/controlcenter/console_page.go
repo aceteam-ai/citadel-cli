@@ -18,18 +18,17 @@ import (
 // Limitations (v1):
 //   - tview.TextView is line-oriented, not a terminal emulator.
 //     Full-screen programs (vim, htop, etc.) will render incorrectly.
-//   - Windows is not supported; the page returns an error on Build.
+//   - Windows is not supported; the page is hidden on that platform.
 type ConsolePage struct {
 	app      *tview.Application
 	view     *tview.TextView
-	pty      *console.PTYSession
 	streamer *console.Streamer
 
-	mu      sync.Mutex
-	active  bool
-	started bool
-
-	// stopRead signals the read loop to exit
+	mu       sync.Mutex
+	pty      *console.PTYSession
+	active   bool
+	started  bool
+	closed   bool // page-level closed flag (set by Close, prevents restart)
 	stopRead chan struct{}
 }
 
@@ -93,25 +92,31 @@ func (c *ConsolePage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 		return event
 	}
 
-	// Start the PTY on first keypress
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return event
+	}
+
+	// Start the PTY on first keypress (or restart after session ended)
 	if !c.started {
 		c.started = true
 		c.mu.Unlock()
 		c.startPTY()
-		// Don't forward the activation key to the shell
-		return nil
+		return nil // don't forward the activation key to the shell
 	}
+
+	pty := c.pty
 	c.mu.Unlock()
 
-	if c.pty == nil || c.pty.IsClosed() {
+	if pty == nil || pty.IsClosed() {
 		return event
 	}
 
 	// Convert tcell event to bytes for the PTY
 	data := keyToBytes(event)
 	if data != nil {
-		_, _ = c.pty.Write(data)
+		_, _ = pty.Write(data)
 		return nil // consumed
 	}
 
@@ -124,13 +129,30 @@ func (c *ConsolePage) Streamer() *console.Streamer {
 }
 
 // Close shuts down the PTY session and disconnects all stream clients.
+// Safe to call from any goroutine; does not re-enter the mutex during PTY teardown.
 func (c *ConsolePage) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
 
-	if c.pty != nil && !c.pty.IsClosed() {
+	pty := c.pty
+	c.pty = nil
+
+	// Signal the read loop to stop
+	select {
+	case <-c.stopRead:
+		// already closed
+	default:
 		close(c.stopRead)
-		_ = c.pty.Close()
+	}
+	c.mu.Unlock()
+
+	// Close the PTY outside the lock to avoid deadlock
+	if pty != nil && !pty.IsClosed() {
+		_ = pty.Close()
 	}
 	c.streamer.CloseAll()
 }
@@ -142,16 +164,6 @@ func (c *ConsolePage) startPTY() {
 	session, err := console.NewPTYSession(console.PTYConfig{
 		InitialCols: 80,
 		InitialRows: 24,
-		OnClose: func() {
-			c.app.QueueUpdateDraw(func() {
-				fmt.Fprintln(tview.ANSIWriter(c.view), "")
-				fmt.Fprintln(c.view, "[yellow]Session ended. Press any key to restart.[-]")
-			})
-			c.mu.Lock()
-			c.started = false
-			c.stopRead = make(chan struct{})
-			c.mu.Unlock()
-		},
 	})
 	if err != nil {
 		c.app.QueueUpdateDraw(func() {
@@ -163,18 +175,25 @@ func (c *ConsolePage) startPTY() {
 		return
 	}
 
+	c.mu.Lock()
 	c.pty = session
+	c.mu.Unlock()
 
-	// Background read loop: drains PTY output, writes to view + streamer.
-	go c.readLoop()
+	go c.readLoop(session)
 }
 
 // readLoop continuously reads PTY output and dispatches it to the
 // tview widget and the WebSocket streamer. It runs until the PTY
-// closes or stopRead is signaled.
-func (c *ConsolePage) readLoop() {
+// closes, stopRead is signaled, or the shell exits naturally.
+//
+// On natural shell exit (read returns EIO/EOF), readLoop handles
+// teardown: closes the PTY, resets state, and shows the restart prompt.
+// This avoids the need for an onClose callback that would re-enter the mutex.
+func (c *ConsolePage) readLoop(session *console.PTYSession) {
 	buf := make([]byte, 4096)
 	ansiW := tview.ANSIWriter(c.view)
+
+	defer c.onSessionEnd(session)
 
 	for {
 		select {
@@ -183,7 +202,7 @@ func (c *ConsolePage) readLoop() {
 		default:
 		}
 
-		n, err := c.pty.Read(buf)
+		n, err := session.Read(buf)
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
@@ -206,6 +225,32 @@ func (c *ConsolePage) readLoop() {
 			return
 		}
 	}
+}
+
+// onSessionEnd cleans up after a PTY session ends (natural exit or forced close).
+// It closes the PTY, resets state so a new session can start on keypress,
+// and shows the restart prompt (unless the page itself is being torn down).
+func (c *ConsolePage) onSessionEnd(session *console.PTYSession) {
+	// Close the PTY if it's still open (idempotent)
+	if !session.IsClosed() {
+		_ = session.Close()
+	}
+
+	c.mu.Lock()
+	// Only reset for restart if the page isn't being torn down
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.started = false
+	c.pty = nil
+	c.stopRead = make(chan struct{})
+	c.mu.Unlock()
+
+	c.app.QueueUpdateDraw(func() {
+		fmt.Fprintln(tview.ANSIWriter(c.view), "")
+		fmt.Fprintln(c.view, "[yellow]Session ended. Press any key to restart.[-]")
+	})
 }
 
 // keyToBytes converts a tcell key event to bytes suitable for a PTY.
