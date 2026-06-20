@@ -39,9 +39,20 @@ type AppInfo struct {
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
 type NodeCapabilities struct {
-	GPUs    []GPUCapability `json:"gpus,omitempty"`
-	Engines []string        `json:"engines,omitempty"`
-	Tags    []string        `json:"tags,omitempty"`
+	GPUs       []GPUCapability `json:"gpus,omitempty"`
+	Engines    []string        `json:"engines,omitempty"`
+	Tags       []string        `json:"tags,omitempty"`
+	Hypervisor *HypervisorInfo `json:"hypervisor,omitempty"`
+}
+
+// HypervisorInfo describes a detected hypervisor on the node.
+type HypervisorInfo struct {
+	Type      string `json:"type"`                 // e.g. "proxmox"
+	Version   string `json:"version,omitempty"`    // e.g. "pve-manager/8.2.4/..."
+	NodeName  string `json:"node_name,omitempty"`  // this hypervisor node's name
+	NodeCount int    `json:"node_count,omitempty"` // total nodes in cluster
+	VMCount   int    `json:"vm_count,omitempty"`   // VMs on this node
+	CTCount   int    `json:"ct_count,omitempty"`   // containers on this node
 }
 
 // GPUCapability describes a single GPU's identity for capability reporting.
