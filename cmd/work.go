@@ -433,79 +433,38 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-%s", uuid.New().String()[:8])
 
-	// Ensure network connection is established (reconnects if state exists)
-	// This is needed to get the actual Headscale-assigned hostname.
-	//
-	// When the VPN state is stale (expired/revoked Headscale key), the
-	// reconnect attempt times out and returns ErrStaleState. If the node
-	// has a device API token, we attempt automatic re-authentication:
-	//   1. Try reconnecting with existing state + fresh authkey (preserves IP)
-	//   2. If that fails, clear state and reconnect from scratch (new IP)
-	//   3. If no token is available, log a helpful error message
+	// Ensure network connection is established (reconnects if state exists).
+	// Uses attemptVPNRecovery (shared with 'citadel reconnect') to handle
+	// stale state: IP-preserving reconnect first, then clear + fresh connect.
+	network.SetLogf(Debug)
 	Debug("verifying network connection...")
 	connected, err := network.VerifyOrReconnect(ctx)
 	if err != nil && errors.Is(err, network.ErrStaleState) {
 		Debug("network state is stale, attempting auto-recovery...")
 		fmt.Println("   - VPN state is stale, attempting auto-recovery...")
 
-		connected = false // Reset for the recovery flow
-		recovered := false
-
-		// Only attempt auto-recovery if we have a device API token
-		if deviceConfig != nil && deviceConfig.DeviceAPIToken != "" {
-			apiBaseURL := deviceConfig.APIBaseURL
-			if apiBaseURL == "" {
-				apiBaseURL = authServiceURL
-			}
-
-			// Fetch a fresh authkey from the platform
-			Debug("requesting fresh authkey from %s", apiBaseURL)
-			freshKey, fetchErr := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
-			if fetchErr != nil {
-				Debug("failed to fetch fresh authkey: %v", fetchErr)
-				fmt.Fprintf(os.Stderr, "   - Warning: Could not fetch fresh authkey: %v\n", fetchErr)
-			} else {
-				Debug("got fresh authkey, attempting reconnect with existing state...")
-
-				// Attempt 1: reconnect with existing state + fresh key (preserves IP)
-				if ok, reconnErr := network.ReconnectWithAuthKey(ctx, freshKey); reconnErr == nil && ok {
-					Debug("reconnected with existing state (IP preserved)")
-					fmt.Println("   - VPN reconnected (IP preserved)")
-					connected = true
-					recovered = true
-				} else {
-					Debug("reconnect with existing state failed: %v, clearing state...", reconnErr)
-
-					// Attempt 2: clear state and connect from scratch (new IP/hostname)
-					if clearErr := network.ClearState(); clearErr != nil {
-						Debug("failed to clear network state: %v", clearErr)
-					}
-					freshCtx, freshCancel := context.WithTimeout(ctx, 30*time.Second)
-					config := network.ServerConfig{
-						Hostname:   getWorkHostname(),
-						ControlURL: network.DefaultControlURL,
-						StateDir:   network.GetStateDir(),
-						AuthKey:    freshKey,
-					}
-					srv, connectErr := network.Connect(freshCtx, config)
-					freshCancel()
-					if connectErr == nil {
-						_ = srv
-						Debug("reconnected with fresh state (new IP)")
-						fmt.Println("   - VPN reconnected (fresh state)")
-						connected = true
-						recovered = true
-					} else {
-						Debug("fresh connect also failed: %v", connectErr)
-						fmt.Fprintf(os.Stderr, "   - Warning: VPN auto-recovery failed: %v\n", connectErr)
-					}
-				}
-			}
+		apiBaseURL := ""
+		if deviceConfig != nil {
+			apiBaseURL = deviceConfig.APIBaseURL
+		}
+		if apiBaseURL == "" {
+			apiBaseURL = authServiceURL
 		}
 
-		if !recovered {
+		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+		connected = result.Connected
+		if result.Connected {
+			if result.IPPreserved {
+				fmt.Println("   - VPN reconnected (IP preserved)")
+			} else {
+				fmt.Println("   - VPN reconnected (fresh state)")
+			}
+		} else {
+			if result.Err != nil {
+				fmt.Fprintf(os.Stderr, "   - Warning: VPN auto-recovery failed: %v\n", result.Err)
+			}
 			fmt.Fprintln(os.Stderr, "   - Warning: VPN connection could not be restored automatically.")
-			fmt.Fprintln(os.Stderr, "     Run 'citadel login --authkey <key>' to re-authenticate manually.")
+			fmt.Fprintln(os.Stderr, "     Run 'citadel reconnect' or 'citadel login --authkey <key>' to fix.")
 		}
 	} else if err != nil {
 		Debug("network reconnect failed: %v", err)
