@@ -17,6 +17,16 @@ import (
 // this with errors.Is and prints provisioning guidance instead of a crash.
 var ErrNotInstallable = errors.New("service is not installable via the catalog (host-provisioned, no compose.yml)")
 
+// IsInstallable reports whether a catalog service can be installed/run as a
+// container by the CLI, i.e. whether it has a compose.yml. Host-provisioned
+// services (e.g. the Windows-only "wechat" microservice) return false. The cmd
+// layer uses this to print provisioning guidance before doing any work (such as
+// scaffolding node config), rather than after attempting an install.
+func IsInstallable(name string) bool {
+	_, err := GetComposeFile(name)
+	return err == nil
+}
+
 // InstallResult holds the artifacts produced by a catalog install so the caller
 // (cmd layer) can register the service in the node manifest.
 type InstallResult struct {
@@ -46,7 +56,7 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	// compose.yml (e.g. the Windows-only "wechat" microservice) is catalogued
 	// for discoverability only and cannot be installed/run as a container.
 	if _, err := GetComposeFile(name); err != nil {
-		return nil, fmt.Errorf("%w", ErrNotInstallable)
+		return nil, ErrNotInstallable
 	}
 
 	// 2. Check architecture compatibility.

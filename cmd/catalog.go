@@ -261,6 +261,17 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 		overrides[parts[0]] = parts[1]
 	}
 
+	// Reject host-provisioned services (no compose.yml, e.g. the Windows-only
+	// "wechat" microservice) before doing any work. Print provisioning guidance
+	// instead of scaffolding node config and a misleading "Installing..." line.
+	if !catalog.IsInstallable(name) {
+		// Confirm the service actually exists; if not, surface the load error.
+		if _, mErr := catalog.LoadServiceManifest(name); mErr != nil {
+			return mErr
+		}
+		return printNotInstallableGuidance(name)
+	}
+
 	// Find or create the node manifest to get the services directory.
 	manifest, configDir, err := findOrCreateManifest()
 	if err != nil {
@@ -279,9 +290,8 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 
 	result, err := catalog.Install(name, servicesDir, overrides)
 	if err != nil {
-		// Host-provisioned services (no compose.yml, e.g. the Windows-only
-		// "wechat" microservice) cannot be installed as a container; print
-		// provisioning guidance instead of a confusing error.
+		// Defense-in-depth: the up-front IsInstallable check above already
+		// diverts host-provisioned services, but Install also guards this.
 		if errors.Is(err, catalog.ErrNotInstallable) {
 			return printNotInstallableGuidance(name)
 		}
