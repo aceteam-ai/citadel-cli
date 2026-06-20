@@ -169,6 +169,10 @@ and system user configuration (requires sudo).`,
 				os.Exit(1)
 			}
 
+			// Reclaim stale node with the same hostname before registering.
+			// This prevents duplicate nodes in the dashboard after live ISO reboots.
+			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
@@ -189,6 +193,11 @@ and system user configuration (requires sudo).`,
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
 				os.Exit(1)
+			}
+
+			// Try to reclaim stale node using saved device config (if available)
+			if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
+				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
 			}
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
@@ -270,6 +279,11 @@ and system user configuration (requires sudo).`,
 			}
 
 			if authkeyToUse != "" {
+				// Reclaim stale node before registering (if we have a device API token)
+				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
+					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				}
+
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
 				if err := connectToNetwork(nodeName, authkeyToUse); err != nil {
 					fmt.Fprintf(os.Stderr, "❌ Failed to connect to network: %v\n", err)
@@ -450,6 +464,11 @@ and system user configuration (requires sudo).`,
 			}
 
 			if authKey != "" {
+				// Reclaim stale node before registering (if we have a device API token)
+				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
+					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+				}
+
 				fmt.Println("--- 🌐 Joining network ---")
 				loginArgs := []string{"login", "--authkey", authKey, "--node-name", nodeName}
 				loginCmdString := fmt.Sprintf("%s %s", executablePath, strings.Join(loginArgs, " "))
@@ -1445,6 +1464,33 @@ func connectToNetwork(nodeName, authKey string) error {
 	_ = network.Disconnect()
 
 	return nil
+}
+
+// reclaimStaleNodeByHostname removes a stale Headscale node with the same
+// hostname before registering a new one. This prevents duplicate nodes in the
+// fabric dashboard after live ISO reboots (issue #159).
+//
+// The call is best-effort: failures are logged but do not block init.
+func reclaimStaleNodeByHostname(apiToken, hostname string) {
+	if apiToken == "" || hostname == "" {
+		return
+	}
+
+	Debug("reclaiming stale node with hostname '%s'...", hostname)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	result, err := nexus.ReclaimStaleNode(ctx, authServiceURL, apiToken, hostname)
+	if err != nil {
+		Debug("stale node reclaim failed (non-fatal): %v", err)
+		return
+	}
+
+	if result.Reclaimed {
+		fmt.Printf("   Reclaimed stale node '%s' (previous registration cleaned up)\n", hostname)
+	}
+	Debug("reclaim result: %s", result.Message)
 }
 
 type DockerPsResult struct {
