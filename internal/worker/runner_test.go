@@ -664,3 +664,198 @@ func TestRunnerRecordJobWithoutCallback(t *testing.T) {
 	// This should not panic even without JobRecordFn
 	runner.recordJob(usage.UsageRecord{JobID: "test-id", JobType: "test-type", Status: "success"})
 }
+
+// --- target_node filter tests ---
+
+// TestRunnerTargetNodeMismatchSkipsJob verifies that a job with a target_node
+// that doesn't match this runner's NodeID is acknowledged and skipped without
+// executing the handler or writing to the stream.
+func TestRunnerTargetNodeMismatchSkipsJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"target_node": "999",
+			"command":     "hostname",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	mockStream := &MockStreamWriter{}
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "1008", // This node's ID -- doesn't match target_node "999"
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter {
+		return mockStream
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	// Handler should NOT have executed
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("Expected 0 executed jobs, got %d", len(handler.ExecutedJobs()))
+	}
+	// Job should be acked (removed from this consumer's pending entries)
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Expected 1 acked job, got %d", len(source.AckedJobs()))
+	}
+	// Stream should NOT have been written to (the correct node produces the result)
+	if mockStream.started || mockStream.ended || mockStream.errored || mockStream.cancelled {
+		t.Error("Stream writer should not be called for skipped jobs")
+	}
+}
+
+// TestRunnerTargetNodeMatchProcessesJob verifies that a job with a target_node
+// matching this runner's NodeID is processed normally.
+func TestRunnerTargetNodeMatchProcessesJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"target_node": "1008",
+			"command":     "hostname",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "1008", // Matches target_node
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	// Handler should have executed
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("Expected 1 executed job, got %d", len(handler.ExecutedJobs()))
+	}
+	// Job should be acked (successful)
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Expected 1 acked job, got %d", len(source.AckedJobs()))
+	}
+}
+
+// TestRunnerTargetNodeEmptyProcessesJob verifies that a job without a
+// target_node field (broadcast job) is processed normally.
+func TestRunnerTargetNodeEmptyProcessesJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"command": "hostname",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "1008",
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	// Handler should have executed (no target_node means broadcast)
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("Expected 1 executed job, got %d", len(handler.ExecutedJobs()))
+	}
+}
+
+// TestRunnerTargetNodeEmptyStringProcessesJob verifies that a job with
+// target_node set to an empty string is treated as a broadcast.
+func TestRunnerTargetNodeEmptyStringProcessesJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"target_node": "",
+			"command":     "hostname",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "1008",
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("Expected 1 executed job, got %d", len(handler.ExecutedJobs()))
+	}
+}
+
+// TestRunnerNodeIDEmptySkipsFilter verifies that when the runner's NodeID is
+// empty (Headscale ID unresolved), the target_node filter is disabled and
+// all jobs are processed -- including ones with a target_node set. This
+// preserves pre-filter behavior and avoids dropping jobs that might be ours.
+func TestRunnerNodeIDEmptySkipsFilter(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"target_node": "999",
+			"command":     "hostname",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "", // Empty -- Headscale ID not resolved
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	// Handler SHOULD have executed (filter disabled when NodeID is empty)
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("Expected 1 executed job (filter should be disabled), got %d", len(handler.ExecutedJobs()))
+	}
+}
+
+// TestRunnerTargetNodeMismatchNoUsageRecord verifies that skipped jobs do not
+// produce usage records (which would attribute work to the wrong node).
+func TestRunnerTargetNodeMismatchNoUsageRecord(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
+			"target_node": "999",
+		}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	var recordCount int
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "1008",
+		JobRecordFn: func(record usage.UsageRecord) {
+			recordCount++
+		},
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if recordCount != 0 {
+		t.Errorf("Expected 0 usage records for skipped job, got %d", recordCount)
+	}
+}

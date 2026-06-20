@@ -1167,6 +1167,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Create runner
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
 		WorkerID:       workerID,
+		NodeID:         headscaleNodeID,
 		Verbose:        true,
 		JobRecordFn:    jobRecordFn,
 		MaxConcurrency: maxConcurrency,
