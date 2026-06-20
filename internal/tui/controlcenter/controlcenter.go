@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -577,7 +578,10 @@ func (cc *ControlCenter) Run() error {
 	// Alt+3: Chat page (hidden until network is connected and org is known)
 	cc.chatPage = NewChatPage(cc.chatConfig)
 	cc.pmgr.Register(cc.chatPage, false)
-	cc.pmgr.Register(NewPlaceholderPage("services", "Services"), false)
+
+	// Alt+4: Gateway page (hidden until gateway ledger appears on disk)
+	gatewayBaseDir := filepath.Join(os.Getenv("HOME"), ".citadel-cli")
+	cc.pmgr.Register(NewGatewayPage(gatewayBaseDir), false)
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
 
@@ -597,6 +601,9 @@ func (cc *ControlCenter) Run() error {
 		cc.running = true
 		cc.AddActivity("info", "Control center started")
 		go cc.autoRefreshLoop()
+
+		// Show the Gateway tab if the ledger file exists (gateway is or was running)
+		go cc.gatewayVisibilityLoop(gatewayBaseDir)
 
 		// Show context-aware suggestion after startup
 		time.Sleep(500 * time.Millisecond)
@@ -1985,6 +1992,29 @@ func (cc *ControlCenter) autoRefreshLoop() {
 			return
 		case <-ticker.C:
 			cc.refresh()
+		}
+	}
+}
+
+// gatewayVisibilityLoop checks for the gateway ledger file and shows the
+// Gateway tab when it appears. Once shown, the loop exits — the tab stays
+// visible for the remainder of the session.
+func (cc *ControlCenter) gatewayVisibilityLoop(baseDir string) {
+	ledgerPath := filepath.Join(baseDir, "gateway", "transactions.jsonl")
+
+	// Check immediately, then poll every 5 seconds
+	for {
+		if _, err := os.Stat(ledgerPath); err == nil {
+			cc.app.QueueUpdateDraw(func() {
+				cc.pmgr.Show("gateway")
+			})
+			return
+		}
+
+		select {
+		case <-cc.stopChan:
+			return
+		case <-time.After(5 * time.Second):
 		}
 	}
 }
