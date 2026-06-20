@@ -127,6 +127,7 @@ func runControlCenter() {
 			},
 		},
 		OnConnect: ccOnNetworkConnect,
+		Chat:      buildChatConfig(),
 	}
 
 	cc := controlcenter.New(cfg)
@@ -214,6 +215,7 @@ func runControlCenter() {
 		// Auto-start servers and worker after network is connected
 		if networkConnected {
 			ccOnNetworkConnect(cc.AddActivity)
+			cc.ShowChat()
 		} else {
 			// Not connected - show login prompt after a short delay
 			// to allow the TUI to fully initialize
@@ -453,6 +455,47 @@ func stopVNCServer() {
 	}
 	ccVNCRunning = false
 	platform.ClearEmbeddedVNCPort()
+}
+
+// buildChatConfig constructs ChatPageConfig from device config and manifest.
+// Returns a zero-value config if credentials are not yet available — the
+// ChatPage handles this gracefully by showing an error on activation.
+func buildChatConfig() controlcenter.ChatPageConfig {
+	deviceConfig := getDeviceConfigFromFile()
+	if deviceConfig == nil || deviceConfig.DeviceAPIToken == "" {
+		return controlcenter.ChatPageConfig{}
+	}
+
+	apiBaseURL := deviceConfig.APIBaseURL
+	if apiBaseURL == "" {
+		apiBaseURL = authServiceURL
+	}
+
+	orgID := deviceConfig.OrgID
+	if orgID == "" {
+		if manifest, _, err := findAndReadManifest(); err == nil {
+			orgID = manifest.Node.OrgID
+		}
+	}
+
+	nodeName, _ := os.Hostname()
+	nodeID := nodeName
+	if netStatus, err := network.GetGlobalStatus(context.Background()); err == nil && netStatus.Connected {
+		if netStatus.Hostname != "" {
+			nodeName = netStatus.Hostname
+		}
+		if netStatus.NodeID != "" {
+			nodeID = netStatus.NodeID
+		}
+	}
+
+	return controlcenter.ChatPageConfig{
+		APIBaseURL: apiBaseURL,
+		APIToken:   deviceConfig.DeviceAPIToken,
+		OrgID:      orgID,
+		NodeID:     nodeID,
+		NodeName:   nodeName,
+	}
 }
 
 // getOrgIDFromConfig gets the organization ID from manifest or device config

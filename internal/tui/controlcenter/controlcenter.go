@@ -407,6 +407,10 @@ type ControlCenter struct {
 
 	// Console page (nil on Windows)
 	consolePage *ConsolePage
+
+	// Chat
+	chatConfig ChatPageConfig // stored from Config; used to lazily create ChatPage
+	chatPage   *ChatPage     // nil until registered in Run
 }
 
 // Pane focus constants
@@ -469,6 +473,7 @@ type Config struct {
 	Worker             WorkerCallbacks             // Worker management callbacks
 	Permissions        PermissionsCallbacks        // Gateway permissions callbacks
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
+	Chat               ChatPageConfig                          // Chat page configuration (empty = disabled)
 }
 
 // New creates a new control center
@@ -494,6 +499,7 @@ func New(cfg Config) *ControlCenter {
 		onConnect:       cfg.OnConnect,
 		authServiceURL:  cfg.AuthServiceURL,
 		nexusURL:        cfg.NexusURL,
+		chatConfig:      cfg.Chat,
 	}
 }
 
@@ -567,6 +573,10 @@ func (cc *ControlCenter) Run() error {
 	} else {
 		cc.pmgr.Register(NewPlaceholderPage("console", "Console"), false)
 	}
+
+	// Alt+3: Chat page (hidden until network is connected and org is known)
+	cc.chatPage = NewChatPage(cc.chatConfig)
+	cc.pmgr.Register(cc.chatPage, false)
 	cc.pmgr.Register(NewPlaceholderPage("services", "Services"), false)
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
@@ -598,11 +608,24 @@ func (cc *ControlCenter) Run() error {
 	return cc.app.Run()
 }
 
+// ShowChat makes the chat tab visible in the tab bar. Call this after the
+// network connects and org/token info is available. If the ChatPage was
+// created without valid config (empty token/org), it will show an error on
+// activation rather than crash.
+func (cc *ControlCenter) ShowChat() {
+	if cc.pmgr != nil {
+		cc.pmgr.Show("chat")
+	}
+}
+
 // Stop stops the control center
 func (cc *ControlCenter) Stop() {
 	close(cc.stopChan)
 	if cc.consolePage != nil {
 		cc.consolePage.Close()
+	}
+	if cc.chatPage != nil {
+		cc.chatPage.Close()
 	}
 	if cc.app != nil {
 		cc.app.Stop()

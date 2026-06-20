@@ -1420,6 +1420,7 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 						if cc.onConnect != nil {
 							cc.onConnect(cc.AddActivity)
 						}
+						cc.ShowChat()
 
 						// Set device URL for the "V" key shortcut
 						cc.deviceURL = cc.authServiceURL + "/fabric"
