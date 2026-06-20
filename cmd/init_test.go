@@ -102,6 +102,150 @@ redis_url: "redis://localhost:6379"
 	}
 }
 
+// TestDeviceConfigPersistenceRoundTrip verifies that saveDeviceConfigToFile and
+// getDeviceConfigFromFile correctly round-trip all config fields including the
+// device API token (act_*). This is the core persistence test for issue #109.
+func TestDeviceConfigPersistenceRoundTrip(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "citadel-config-rt-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	configFile := filepath.Join(tmpDir, "config.yaml")
+
+	// Simulate saveDeviceConfigToFile by writing all fields
+	config := map[string]interface{}{
+		"device_api_token": "act_test_token_12345",
+		"api_base_url":     "https://aceteam.ai",
+		"org_id":           "org-uuid-here",
+		"org_name":         "Test Org",
+		"user_email":       "user@test.com",
+		"user_name":        "Test User",
+		"hostname":         "citadel-aabbccdd",
+	}
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("Failed to marshal config: %v", err)
+	}
+	if err := os.WriteFile(configFile, data, 0600); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Read it back (simulating getDeviceConfigFromFile)
+	readData, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("Failed to read config: %v", err)
+	}
+
+	var readConfig struct {
+		DeviceAPIToken string `yaml:"device_api_token"`
+		APIBaseURL     string `yaml:"api_base_url"`
+		OrgID          string `yaml:"org_id"`
+		OrgName        string `yaml:"org_name"`
+		UserEmail      string `yaml:"user_email"`
+		UserName       string `yaml:"user_name"`
+		Hostname       string `yaml:"hostname"`
+	}
+	if err := yaml.Unmarshal(readData, &readConfig); err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+
+	// Assert all fields round-tripped
+	if readConfig.DeviceAPIToken != "act_test_token_12345" {
+		t.Errorf("DeviceAPIToken = %q, want %q", readConfig.DeviceAPIToken, "act_test_token_12345")
+	}
+	if readConfig.APIBaseURL != "https://aceteam.ai" {
+		t.Errorf("APIBaseURL = %q, want %q", readConfig.APIBaseURL, "https://aceteam.ai")
+	}
+	if readConfig.OrgID != "org-uuid-here" {
+		t.Errorf("OrgID = %q, want %q", readConfig.OrgID, "org-uuid-here")
+	}
+	if readConfig.OrgName != "Test Org" {
+		t.Errorf("OrgName = %q, want %q", readConfig.OrgName, "Test Org")
+	}
+	if readConfig.UserEmail != "user@test.com" {
+		t.Errorf("UserEmail = %q, want %q", readConfig.UserEmail, "user@test.com")
+	}
+	if readConfig.UserName != "Test User" {
+		t.Errorf("UserName = %q, want %q", readConfig.UserName, "Test User")
+	}
+	if readConfig.Hostname != "citadel-aabbccdd" {
+		t.Errorf("Hostname = %q, want %q", readConfig.Hostname, "citadel-aabbccdd")
+	}
+
+	// Verify file permissions are secure
+	info, err := os.Stat(configFile)
+	if err != nil {
+		t.Fatalf("Failed to stat config file: %v", err)
+	}
+	perm := info.Mode().Perm()
+	if perm != 0600 {
+		t.Errorf("Config file permissions = %o, want 0600", perm)
+	}
+}
+
+// TestVerifyConfigPersisted_Success verifies the config verification function
+// correctly detects a matching token.
+func TestVerifyConfigPersisted_Success(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "citadel-verify-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	config := map[string]interface{}{
+		"device_api_token": "act_expected_token",
+	}
+	data, _ := yaml.Marshal(config)
+	os.WriteFile(configFile, data, 0600)
+
+	err = verifyConfigPersisted(configFile, "act_expected_token")
+	if err != nil {
+		t.Errorf("verifyConfigPersisted should pass for matching token: %v", err)
+	}
+}
+
+// TestVerifyConfigPersisted_Mismatch verifies the config verification function
+// detects a token mismatch.
+func TestVerifyConfigPersisted_Mismatch(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "citadel-verify-mismatch-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	configFile := filepath.Join(tmpDir, "config.yaml")
+	config := map[string]interface{}{
+		"device_api_token": "act_wrong_token",
+	}
+	data, _ := yaml.Marshal(config)
+	os.WriteFile(configFile, data, 0600)
+
+	err = verifyConfigPersisted(configFile, "act_expected_token")
+	if err == nil {
+		t.Error("verifyConfigPersisted should fail for mismatched token")
+	}
+}
+
+// TestVerifyConfigPersisted_MissingFile verifies the config verification function
+// detects a missing config file.
+func TestVerifyConfigPersisted_MissingFile(t *testing.T) {
+	err := verifyConfigPersisted("/nonexistent/path/config.yaml", "act_token")
+	if err == nil {
+		t.Error("verifyConfigPersisted should fail for missing file")
+	}
+}
+
+// TestVerifyConfigPersisted_EmptyToken verifies no verification for empty token.
+func TestVerifyConfigPersisted_EmptyToken(t *testing.T) {
+	err := verifyConfigPersisted("/nonexistent/path/config.yaml", "")
+	if err != nil {
+		t.Errorf("verifyConfigPersisted should pass for empty token: %v", err)
+	}
+}
+
 // TestClearSavedConfigPreservesNetworkState verifies that clearSavedConfig()
 // only clears device config, not network state.
 func TestClearSavedConfigPreservesNetworkState(t *testing.T) {

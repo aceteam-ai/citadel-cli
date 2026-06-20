@@ -332,6 +332,70 @@ func TestReconnectAttemptsConstant(t *testing.T) {
 	}
 }
 
+// TestIsConnectivityError verifies detection of network connectivity errors in reauth.
+func TestIsConnectivityError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "DNS error",
+			err:  fmt.Errorf("dial tcp: lookup example.com: no such host"),
+			want: true,
+		},
+		{
+			name: "connection refused",
+			err:  fmt.Errorf("dial tcp 127.0.0.1:8000: connection refused"),
+			want: true,
+		},
+		{
+			name: "network unreachable",
+			err:  fmt.Errorf("dial tcp 10.0.0.1:443: network is unreachable"),
+			want: true,
+		},
+		{
+			name: "i/o timeout",
+			err:  fmt.Errorf("dial tcp 10.0.0.1:443: i/o timeout"),
+			want: true,
+		},
+		{
+			name: "context deadline exceeded",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "generic timeout",
+			err:  fmt.Errorf("request timeout after 15s"),
+			want: true,
+		},
+		{
+			name: "auth error (not connectivity)",
+			err:  fmt.Errorf("401 Unauthorized"),
+			want: false,
+		},
+		{
+			name: "generic error",
+			err:  fmt.Errorf("something went wrong"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isConnectivityError(tt.err)
+			if got != tt.want {
+				t.Errorf("isConnectivityError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReconnectRetryBackoffTiming verifies the total worst-case wait time
 // for the retry loop is bounded. With 3 attempts and 5s * attempt backoff
 // (0 + 10 + 15 = 25s backoff) plus 10s per attempt timeout (30s total),

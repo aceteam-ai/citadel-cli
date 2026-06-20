@@ -2,6 +2,12 @@
 package nexus
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -282,5 +288,185 @@ func TestDeviceAuthSendsForceNew(t *testing.T) {
 
 	if !mock.GetLastForceNew() {
 		t.Error("Expected force_new to be true when ForceNew option is set")
+	}
+}
+
+// --- Tests for API reachability and error classification ---
+
+func TestCheckAPIReachable_Success(t *testing.T) {
+	// Start a test server that responds to HEAD requests
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed) // HEAD on a POST endpoint
+	}))
+	defer srv.Close()
+
+	err := CheckAPIReachable(srv.URL)
+	if err != nil {
+		t.Errorf("CheckAPIReachable() returned error for reachable server: %v", err)
+	}
+}
+
+func TestCheckAPIReachable_EmptyURL(t *testing.T) {
+	err := CheckAPIReachable("")
+	if err == nil {
+		t.Fatal("CheckAPIReachable(\"\") should return error")
+	}
+	if !errors.Is(err, ErrAPIUnreachable) {
+		t.Errorf("expected ErrAPIUnreachable, got: %v", err)
+	}
+}
+
+func TestCheckAPIReachable_ConnectionRefused(t *testing.T) {
+	// Use a port that is almost certainly not listening
+	err := CheckAPIReachable("http://127.0.0.1:1")
+	if err == nil {
+		t.Fatal("CheckAPIReachable should fail for refused connection")
+	}
+	if !errors.Is(err, ErrAPIUnreachable) {
+		t.Errorf("expected ErrAPIUnreachable, got: %v", err)
+	}
+}
+
+func TestCheckAPIReachable_InvalidDNS(t *testing.T) {
+	err := CheckAPIReachable("http://this-host-does-not-exist-xyzzy-12345.invalid")
+	if err == nil {
+		t.Fatal("CheckAPIReachable should fail for unresolvable hostname")
+	}
+	if !errors.Is(err, ErrAPIUnreachable) {
+		t.Errorf("expected ErrAPIUnreachable, got: %v", err)
+	}
+}
+
+func TestClassifyNetworkError_Table(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantSentinel error
+	}{
+		{
+			name:       "nil error",
+			err:        nil,
+			wantSentinel: nil,
+		},
+		{
+			name:       "DNS error",
+			err:        &net.DNSError{Err: "no such host", Name: "example.com"},
+			wantSentinel: ErrAPIUnreachable,
+		},
+		{
+			name:       "connection refused",
+			err:        fmt.Errorf("dial tcp 127.0.0.1:8000: connection refused"),
+			wantSentinel: ErrAPIUnreachable,
+		},
+		{
+			name:       "context deadline exceeded",
+			err:        context.DeadlineExceeded,
+			wantSentinel: ErrAPIUnreachable,
+		},
+		{
+			name:       "timeout in message",
+			err:        fmt.Errorf("dial tcp 10.0.0.1:443: i/o timeout"),
+			wantSentinel: ErrAPIUnreachable,
+		},
+		{
+			name:       "TLS error",
+			err:        fmt.Errorf("x509: certificate signed by unknown authority"),
+			wantSentinel: ErrAPIUnreachable,
+		},
+		{
+			name:       "generic error",
+			err:        fmt.Errorf("something went wrong"),
+			wantSentinel: ErrAPIUnreachable, // catch-all still wraps ErrAPIUnreachable
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := classifyNetworkError(tt.err, "http://example.com")
+			if tt.wantSentinel == nil {
+				if result != nil {
+					t.Errorf("classifyNetworkError() = %v, want nil", result)
+				}
+				return
+			}
+			if !errors.Is(result, tt.wantSentinel) {
+				t.Errorf("classifyNetworkError() = %v, want sentinel %v", result, tt.wantSentinel)
+			}
+		})
+	}
+}
+
+func TestIsNetworkError(t *testing.T) {
+	if IsNetworkError(nil) {
+		t.Error("IsNetworkError(nil) should be false")
+	}
+	if IsNetworkError(fmt.Errorf("random error")) {
+		t.Error("IsNetworkError should be false for non-network errors")
+	}
+	if !IsNetworkError(fmt.Errorf("wrapped: %w", ErrAPIUnreachable)) {
+		t.Error("IsNetworkError should be true for wrapped ErrAPIUnreachable")
+	}
+}
+
+func TestIsAuthError(t *testing.T) {
+	if IsAuthError(nil) {
+		t.Error("IsAuthError(nil) should be false")
+	}
+	if IsAuthError(fmt.Errorf("random error")) {
+		t.Error("IsAuthError should be false for non-auth errors")
+	}
+	if !IsAuthError(fmt.Errorf("wrapped: %w", ErrTokenExpired)) {
+		t.Error("IsAuthError should be true for wrapped ErrTokenExpired")
+	}
+}
+
+func TestClassifyHTTPError_StatusCodes(t *testing.T) {
+	tests := []struct {
+		code     int
+		wantAuth bool
+	}{
+		{http.StatusUnauthorized, true},
+		{http.StatusForbidden, true},
+		{http.StatusServiceUnavailable, false},
+		{http.StatusBadGateway, false},
+		{http.StatusInternalServerError, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("HTTP_%d", tt.code), func(t *testing.T) {
+			err := ClassifyHTTPError(tt.code, "body")
+			if err == nil {
+				t.Fatal("ClassifyHTTPError should always return an error")
+			}
+			if tt.wantAuth && !errors.Is(err, ErrTokenExpired) {
+				t.Errorf("HTTP %d should wrap ErrTokenExpired, got: %v", tt.code, err)
+			}
+			if !tt.wantAuth && errors.Is(err, ErrTokenExpired) {
+				t.Errorf("HTTP %d should NOT wrap ErrTokenExpired, got: %v", tt.code, err)
+			}
+		})
+	}
+}
+
+func TestStartFlow_NetworkError_Classification(t *testing.T) {
+	// Create client pointing to a port that is not listening
+	client := NewDeviceAuthClient("http://127.0.0.1:1")
+	_, err := client.StartFlow(nil)
+	if err == nil {
+		t.Fatal("StartFlow should fail for unreachable server")
+	}
+	if !IsNetworkError(err) {
+		t.Errorf("StartFlow error should be classified as network error, got: %v", err)
+	}
+}
+
+func TestCheckToken_NetworkError_Classification(t *testing.T) {
+	client := NewDeviceAuthClient("http://127.0.0.1:1")
+	_, err := client.CheckToken("fake-device-code")
+	if err == nil {
+		t.Fatal("CheckToken should fail for unreachable server")
+	}
+	if !IsNetworkError(err) {
+		t.Errorf("CheckToken error should be classified as network error, got: %v", err)
 	}
 }

@@ -3,14 +3,118 @@ package nexus
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
+
+// ErrAPIUnreachable is returned when the AceTeam API cannot be reached.
+// Callers should check network connectivity and retry.
+var ErrAPIUnreachable = errors.New("cannot reach AceTeam API")
+
+// ErrTokenExpired is returned when the device API token has been revoked or expired.
+var ErrTokenExpired = errors.New("device API token expired or revoked")
+
+// CheckAPIReachable performs a fast connectivity check against the AceTeam API.
+// Returns nil if the API responds within the timeout, or a descriptive error
+// explaining why it cannot be reached (DNS failure, connection refused, timeout).
+func CheckAPIReachable(baseURL string) error {
+	if baseURL == "" {
+		return fmt.Errorf("%w: no API URL configured", ErrAPIUnreachable)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	url := baseURL + "/api/fabric/device-auth/start"
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAPIUnreachable, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return classifyNetworkError(err, baseURL)
+	}
+	defer resp.Body.Close()
+
+	// Any HTTP response (even 405 Method Not Allowed) means the server is reachable
+	return nil
+}
+
+// classifyNetworkError turns a raw HTTP client error into a user-friendly
+// message that distinguishes DNS failures, connection refused, and timeouts.
+func classifyNetworkError(err error, baseURL string) error {
+	if err == nil {
+		return nil
+	}
+
+	msg := err.Error()
+
+	// DNS resolution failure
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return fmt.Errorf("%w: DNS lookup failed for %s — check your internet connection", ErrAPIUnreachable, baseURL)
+	}
+
+	// Connection refused (server down or wrong port)
+	if strings.Contains(msg, "connection refused") {
+		return fmt.Errorf("%w: connection refused at %s — the API server may be down", ErrAPIUnreachable, baseURL)
+	}
+
+	// Timeout
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+		return fmt.Errorf("%w: connection timed out reaching %s — check your network", ErrAPIUnreachable, baseURL)
+	}
+
+	// TLS errors
+	if strings.Contains(msg, "certificate") || strings.Contains(msg, "tls") || strings.Contains(msg, "x509") {
+		return fmt.Errorf("%w: TLS error connecting to %s — %v", ErrAPIUnreachable, baseURL, err)
+	}
+
+	// Catch-all
+	return fmt.Errorf("%w: %v", ErrAPIUnreachable, err)
+}
+
+// IsNetworkError returns true if the error indicates a network connectivity
+// problem (as opposed to an authentication or server-side error).
+func IsNetworkError(err error) bool {
+	return errors.Is(err, ErrAPIUnreachable)
+}
+
+// IsAuthError returns true if the error indicates an authentication failure
+// (expired token, revoked access, etc).
+func IsAuthError(err error) bool {
+	return errors.Is(err, ErrTokenExpired)
+}
+
+// ClassifyHTTPError maps an HTTP status code and response body to a
+// descriptive error with appropriate sentinel wrapping.
+func ClassifyHTTPError(statusCode int, body string) error {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: server returned 401 Unauthorized — re-run 'citadel init' to re-authenticate", ErrTokenExpired)
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: server returned 403 Forbidden — your token may have been revoked", ErrTokenExpired)
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("service temporarily unavailable (503) — try again shortly")
+	case http.StatusBadGateway, http.StatusGatewayTimeout:
+		return fmt.Errorf("API gateway error (%d) — the service may be restarting", statusCode)
+	default:
+		if body != "" {
+			return fmt.Errorf("API returned HTTP %d: %s", statusCode, body)
+		}
+		return fmt.Errorf("API returned HTTP %d", statusCode)
+	}
+}
 
 // DeviceAuthClient handles OAuth 2.0 Device Authorization Grant flow (RFC 8628)
 type DeviceAuthClient struct {
@@ -118,13 +222,13 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to authentication service: %w", err)
+		return nil, classifyNetworkError(err, c.baseURL)
 	}
 	defer resp.Body.Close()
 
 	// Check status code
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return nil, fmt.Errorf("authentication service is temporarily unavailable")
+		return nil, fmt.Errorf("authentication service is temporarily unavailable (503)")
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -221,7 +325,7 @@ func (c *DeviceAuthClient) CheckToken(deviceCode string) (*TokenResponse, error)
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, classifyNetworkError(err, c.baseURL)
 	}
 	defer resp.Body.Close()
 

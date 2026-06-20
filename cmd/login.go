@@ -40,7 +40,7 @@ Use --authkey for non-interactive authentication (ideal for automation).`,
 			return
 		}
 
-		// Interactive mode (existing behavior)
+		// Interactive mode
 		runInteractiveLogin()
 	},
 }
@@ -53,8 +53,13 @@ func runNonInteractiveLogin() {
 		return
 	}
 
-	// Get node name (default to hostname)
+	// Get node name: prefer flag, then saved hostname, then OS hostname
 	nodeName := loginNodeName
+	if nodeName == "" {
+		if saved := getSavedHostname(); saved != "" {
+			nodeName = saved
+		}
+	}
 	if nodeName == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -62,6 +67,16 @@ func runNonInteractiveLogin() {
 			os.Exit(1)
 		}
 		nodeName = hostname
+	}
+
+	// Persist hostname for reboot stability
+	if err := saveHostnameToConfig(nodeName); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
+	}
+
+	// Try to reclaim stale node with the same hostname
+	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
+		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
 	}
 
 	// Connect to the network with animated spinner
@@ -112,11 +127,23 @@ func runInteractiveLogin() {
 		fmt.Println("Login skipped.")
 		return
 	case nexus.NetChoiceDevice:
+		// Preflight: verify API is reachable before starting interactive auth
+		if err := nexus.CheckAPIReachable(authServiceURL); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Cannot reach AceTeam API: %v\n", err)
+			fmt.Fprintln(os.Stderr, "\nCheck your internet connection and try again.")
+			os.Exit(1)
+		}
+
 		// Device authorization flow
 		authResult, err := runDeviceAuthFlow(authServiceURL, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-			fmt.Fprintln(os.Stderr, "\nAlternative: Use 'citadel login --authkey <key>' for non-interactive login")
+			if nexus.IsNetworkError(err) {
+				fmt.Fprintln(os.Stderr, "\nThe API became unreachable during authentication.")
+				fmt.Fprintln(os.Stderr, "Check your network connection and try again.")
+			} else {
+				fmt.Fprintln(os.Stderr, "\nAlternative: Use 'citadel login --authkey <key>' for non-interactive login")
+			}
 			os.Exit(1)
 		}
 		authKey = authResult.Token.Authkey
@@ -137,11 +164,23 @@ func runInteractiveLogin() {
 		authKey = key
 	}
 
-	// Use --node-name if provided, otherwise fall back to hostname
+	// Use --node-name if provided, then saved hostname, then OS hostname
 	if loginNodeName != "" {
 		nodeName = loginNodeName
+	} else if saved := getSavedHostname(); saved != "" {
+		nodeName = saved
 	} else {
 		nodeName, _ = os.Hostname()
+	}
+
+	// Persist hostname for reboot stability
+	if err := saveHostnameToConfig(nodeName); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
+	}
+
+	// Try to reclaim stale node with the same hostname
+	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
+		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
 	}
 
 	// Disconnect any existing connection first

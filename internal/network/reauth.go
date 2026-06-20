@@ -5,9 +5,12 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -52,6 +55,10 @@ func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		// Classify the network error for clearer diagnostics
+		if isConnectivityError(err) {
+			return "", fmt.Errorf("cannot reach API at %s — check network connectivity: %w", apiBaseURL, err)
+		}
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -59,6 +66,10 @@ func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", fmt.Errorf("device API token rejected (HTTP %d) — re-run 'citadel init' to re-authenticate: %s", resp.StatusCode, string(body))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -75,4 +86,23 @@ func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (
 	}
 
 	return result.Authkey, nil
+}
+
+// isConnectivityError returns true if the error indicates a network
+// connectivity problem (DNS failure, connection refused, timeout).
+func isConnectivityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "i/o timeout")
 }
