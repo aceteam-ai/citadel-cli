@@ -541,6 +541,36 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("final Headscale node ID: %s", headscaleNodeID)
 	}
 
+	// The Headscale numeric node ID is required to subscribe to this node's
+	// per-node shell stream (issues #3914/#3924). Right after a (re)connect the
+	// tsnet netmap may not be populated yet, so the single resolution above can
+	// return an empty ID even though the node is otherwise online and heartbeats
+	// fine (the platform re-resolves the heartbeat by hostname). An empty ID
+	// here permanently skips the per-node subscription for the worker's whole
+	// lifetime, silently downgrading node-targeted jobs (terminal_exec, code_*,
+	// file reads, node attachments) to the shared org stream where a peer node
+	// can claim them. Retry a few times with a short backoff to close that
+	// startup race before we build the queue list.
+	if headscaleNodeID == "" {
+		for attempt := 1; attempt <= 5; attempt++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+			if id := network.GetGlobalNodeID(ctx); id != "" {
+				headscaleNodeID = id
+				Debug("resolved Headscale node ID on retry %d: %s", attempt, headscaleNodeID)
+				break
+			}
+			Debug("Headscale node ID still empty on retry %d", attempt)
+		}
+		if headscaleNodeID == "" {
+			fmt.Fprintln(os.Stderr, "   - Warning: Headscale node ID unresolved after retries; "+
+				"node-targeted jobs will fall back to the shared org stream")
+		}
+	}
+
 	// Set node identity on the stream event publisher for operator attribution.
 	// Note: We keep using nodeName (hostname) here rather than the Headscale
 	// numeric ID, because the usage/earnings pipeline may key on hostname.
@@ -582,11 +612,16 @@ func runWork(cmd *cobra.Command, args []string) {
 					fmt.Fprintf(os.Stderr, "   - Warning: per-node stream subscribe failed: %v\n", err)
 				}
 			}
+			fmt.Printf("   - Per-node shell stream: %s\n", perNodeQueue)
 			Debug("per-node shell stream: %s", perNodeQueue)
 		} else {
+			fmt.Fprintln(os.Stderr, "   - Warning: per-node shell stream skipped (org id unknown); "+
+				"node-targeted jobs will fall back to the shared org stream")
 			Debug("per-node shell stream skipped: org id unknown")
 		}
 	} else {
+		fmt.Fprintln(os.Stderr, "   - Warning: per-node shell stream skipped (Headscale node ID "+
+			"unavailable); node-targeted jobs will fall back to the shared org stream")
 		Debug("per-node shell stream skipped: Headscale node ID unavailable")
 	}
 
