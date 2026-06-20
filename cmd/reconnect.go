@@ -181,7 +181,7 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	// doesn't accumulate duplicate entries on every restart (issue #246).
 	if deviceConfig.DeviceAPIToken != "" && hostname != "" {
 		Log("reclaiming stale node '%s' before fresh connect...", hostname)
-		reclaimStaleNodeByHostname(deviceConfig.DeviceAPIToken, hostname)
+		reclaimStaleNodeByHostname(deviceConfig.DeviceAPIToken, hostname, apiBaseURL)
 	}
 	Log("clearing state for fresh connect...")
 	if clearErr := network.ClearState(); clearErr != nil {

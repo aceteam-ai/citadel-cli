@@ -171,7 +171,7 @@ and system user configuration (requires sudo).`,
 
 			// Reclaim stale node with the same hostname before registering.
 			// This prevents duplicate nodes in the dashboard after live ISO reboots.
-			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+			reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName, authServiceURL)
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
 			if err := connectToNetwork(nodeName, deviceAuthResult.Token.Authkey); err != nil {
@@ -197,7 +197,7 @@ and system user configuration (requires sudo).`,
 
 			// Try to reclaim stale node using saved device config (if available)
 			if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
+				reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName, savedConfig.APIBaseURL)
 			}
 
 			fmt.Printf("Connecting as '%s'...\n", nodeName)
@@ -281,7 +281,7 @@ and system user configuration (requires sudo).`,
 			if authkeyToUse != "" {
 				// Reclaim stale node before registering (if we have a device API token)
 				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName, authServiceURL)
 				}
 
 				fmt.Printf("Connecting to AceTeam Network as '%s'...\n", nodeName)
@@ -466,7 +466,7 @@ and system user configuration (requires sudo).`,
 			if authKey != "" {
 				// Reclaim stale node before registering (if we have a device API token)
 				if deviceAuthResult != nil && deviceAuthResult.Token.DeviceAPIToken != "" {
-					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName)
+					reclaimStaleNodeByHostname(deviceAuthResult.Token.DeviceAPIToken, nodeName, authServiceURL)
 				}
 
 				fmt.Println("--- 🌐 Joining network ---")
@@ -1471,9 +1471,12 @@ func connectToNetwork(nodeName, authKey string) error {
 // fabric dashboard after live ISO reboots (issue #159).
 //
 // The call is best-effort: failures are logged but do not block init.
-func reclaimStaleNodeByHostname(apiToken, hostname string) {
+func reclaimStaleNodeByHostname(apiToken, hostname, apiBaseURL string) {
 	if apiToken == "" || hostname == "" {
 		return
+	}
+	if apiBaseURL == "" {
+		apiBaseURL = authServiceURL
 	}
 
 	Debug("reclaiming stale node with hostname '%s'...", hostname)
@@ -1481,7 +1484,7 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	result, err := nexus.ReclaimStaleNode(ctx, authServiceURL, apiToken, hostname)
+	result, err := nexus.ReclaimStaleNode(ctx, apiBaseURL, apiToken, hostname)
 	if err != nil {
 		Debug("stale node reclaim failed (non-fatal): %v", err)
 		return
