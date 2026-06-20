@@ -80,6 +80,22 @@ type Execution struct {
 	Metrics   *ExecutionMetrics `json:"metrics,omitempty"`
 }
 
+// ExecutionSnapshot is a read-only copy of an Execution's fields, safe to
+// use outside the Execution's lock. It does not contain the mutex or cancel
+// func, so it is safe to copy and return by value.
+type ExecutionSnapshot struct {
+	ID        string            `json:"id"`
+	Status    ExecutionStatus   `json:"status"`
+	Graph     *WorkflowGraph    `json:"graph"`
+	Input     map[string]any    `json:"input"`
+	Output    map[string]any    `json:"output,omitempty"`
+	Error     string            `json:"error,omitempty"`
+	StartedAt time.Time         `json:"started_at"`
+	EndedAt   *time.Time        `json:"ended_at,omitempty"`
+	NodeLogs  []*NodeLog        `json:"node_logs,omitempty"`
+	Metrics   *ExecutionMetrics `json:"metrics,omitempty"`
+}
+
 type NodeLog struct {
 	NodeID    string         `json:"node_id"`
 	NodeType  string         `json:"node_type"`
@@ -201,11 +217,21 @@ func (e *Execution) AddNodeLog(log *NodeLog) {
 	e.NodeLogs = append(e.NodeLogs, log)
 }
 
-func (e *Execution) Snapshot() Execution {
+func (e *Execution) Snapshot() ExecutionSnapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	cp := *e
-	return cp
+	return ExecutionSnapshot{
+		ID:        e.ID,
+		Status:    e.Status,
+		Graph:     e.Graph,
+		Input:     e.Input,
+		Output:    e.Output,
+		Error:     e.Error,
+		StartedAt: e.StartedAt,
+		EndedAt:   e.EndedAt,
+		NodeLogs:  e.NodeLogs,
+		Metrics:   e.Metrics,
+	}
 }
 
 func (e *Execution) MarshalJSON() ([]byte, error) {
