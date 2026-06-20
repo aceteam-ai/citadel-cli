@@ -164,13 +164,19 @@ type Page interface {
 	HandleInput(event *tcell.EventKey) *tcell.EventKey
 }
 
+// registeredPage pairs a Page with a visibility flag.
+type registeredPage struct {
+	page    Page
+	visible bool
+}
+
 // PageManager manages multiple pages with an Alt+N tab bar.
 type PageManager struct {
 	app           *tview.Application
 	pages         *tview.Pages
 	tabBar        *tview.TextView
 	rootFlex      *tview.Flex
-	registered    []Page
+	registered    []registeredPage
 	activeIdx     int
 	isModalActive func() bool
 }
@@ -186,8 +192,8 @@ func NewPageManager(app *tview.Application, isModalActive func() bool) *PageMana
 }
 
 // Register adds a page to the PageManager.
-func (pm *PageManager) Register(page Page) {
-	pm.registered = append(pm.registered, page)
+func (pm *PageManager) Register(page Page, visible bool) {
+	pm.registered = append(pm.registered, registeredPage{page: page, visible: visible})
 	primitive := page.Build(pm.app)
 	pm.pages.AddPage(page.Name(), primitive, true, false)
 }
@@ -198,26 +204,79 @@ func (pm *PageManager) SwitchTo(idx int) {
 		return
 	}
 	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
-		pm.registered[pm.activeIdx].OnDeactivate()
+		pm.registered[pm.activeIdx].page.OnDeactivate()
 	}
 	pm.activeIdx = idx
-	pm.pages.SwitchToPage(pm.registered[idx].Name())
-	pm.registered[idx].OnActivate()
+	pm.pages.SwitchToPage(pm.registered[idx].page.Name())
+	pm.registered[idx].page.OnActivate()
 	pm.updateTabBar()
+}
+
+// visibleIndices returns the real indices of visible pages.
+func (pm *PageManager) visibleIndices() []int {
+	var out []int
+	for i, rp := range pm.registered {
+		if rp.visible {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// Show makes a page visible by name.
+func (pm *PageManager) Show(name string) {
+	for i := range pm.registered {
+		if pm.registered[i].page.Name() == name {
+			pm.registered[i].visible = true
+			pm.updateTabBar()
+			return
+		}
+	}
+}
+
+// Hide hides a page by name.
+func (pm *PageManager) Hide(name string) {
+	for i := range pm.registered {
+		if pm.registered[i].page.Name() == name {
+			pm.registered[i].visible = false
+			// If hiding the active page, switch to the first visible page
+			if i == pm.activeIdx {
+				vis := pm.visibleIndices()
+				if len(vis) > 0 {
+					pm.SwitchTo(vis[0])
+				}
+			}
+			pm.updateTabBar()
+			return
+		}
+	}
+}
+
+// SwitchToName switches to a page by name (for programmatic switching).
+func (pm *PageManager) SwitchToName(name string) {
+	for i, rp := range pm.registered {
+		if rp.page.Name() == name {
+			pm.SwitchTo(i)
+			return
+		}
+	}
 }
 
 func (pm *PageManager) updateTabBar() {
 	var sb strings.Builder
-	for i, page := range pm.registered {
-		key := fmt.Sprintf("Alt+%d", i+1)
+	displayNum := 0
+	for i, rp := range pm.registered {
+		if !rp.visible {
+			continue
+		}
+		displayNum++
+		key := fmt.Sprintf("Alt+%d", displayNum)
 		if i == pm.activeIdx {
-			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", key, page.Title()))
+			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", key, rp.page.Title()))
 		} else {
-			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", key, page.Title()))
+			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", key, rp.page.Title()))
 		}
-		if i < len(pm.registered)-1 {
-			sb.WriteString(" ")
-		}
+		sb.WriteString(" ")
 	}
 	pm.tabBar.SetText(sb.String())
 }
@@ -230,39 +289,30 @@ func (pm *PageManager) Build() *tview.Flex {
 	return pm.rootFlex
 }
 
-// HandleGlobalInput captures Alt+1-5 before delegating to the active page.
+// HandleGlobalInput captures Alt+1-N before delegating to the active page.
 // F-keys are avoided because terminal emulators (Terminator, etc.) intercept them.
 func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	if pm.isModalActive != nil && pm.isModalActive() {
 		if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
-			return pm.registered[pm.activeIdx].HandleInput(event)
+			return pm.registered[pm.activeIdx].page.HandleInput(event)
 		}
 		return event
 	}
 
-	// Alt+1 through Alt+5 to switch pages
+	// Alt+1 through Alt+N to switch to Nth visible page
 	if event.Modifiers()&tcell.ModAlt != 0 && event.Key() == tcell.KeyRune {
-		switch event.Rune() {
-		case '1':
-			pm.SwitchTo(0)
-			return nil
-		case '2':
-			pm.SwitchTo(1)
-			return nil
-		case '3':
-			pm.SwitchTo(2)
-			return nil
-		case '4':
-			pm.SwitchTo(3)
-			return nil
-		case '5':
-			pm.SwitchTo(4)
-			return nil
+		digit := int(event.Rune() - '0')
+		if digit >= 1 && digit <= 9 {
+			vis := pm.visibleIndices()
+			if digit <= len(vis) {
+				pm.SwitchTo(vis[digit-1])
+				return nil
+			}
 		}
 	}
 
 	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
-		return pm.registered[pm.activeIdx].HandleInput(event)
+		return pm.registered[pm.activeIdx].page.HandleInput(event)
 	}
 	return event
 }
@@ -506,12 +556,12 @@ func (cc *ControlCenter) Run() error {
 	// Create page manager
 	cc.pmgr = NewPageManager(cc.app, func() bool { return cc.inModal })
 
-	// Register pages: Alt+1=Dashboard, Alt+2-5=placeholders
-	cc.pmgr.Register(cc)
-	cc.pmgr.Register(NewPlaceholderPage("console", "Console"))
-	cc.pmgr.Register(NewPlaceholderPage("services", "Services"))
-	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"))
-	cc.pmgr.Register(NewPlaceholderPage("network", "Network"))
+	// Register pages: Alt+1=Dashboard, rest hidden until ready
+	cc.pmgr.Register(cc, true)
+	cc.pmgr.Register(NewPlaceholderPage("console", "Console"), false)
+	cc.pmgr.Register(NewPlaceholderPage("services", "Services"), false)
+	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
+	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
 
 	cc.rootView = cc.pmgr.Build()
 	cc.pmgr.SwitchTo(0)

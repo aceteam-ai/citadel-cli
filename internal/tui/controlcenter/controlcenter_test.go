@@ -3,6 +3,8 @@ package controlcenter
 import (
 	"testing"
 	"time"
+
+	"github.com/rivo/tview"
 )
 
 // TestJobRecordStruct tests the JobRecord struct fields
@@ -550,5 +552,110 @@ func TestDeviceAuthConfig(t *testing.T) {
 	}
 	if cfg.Interval != 5 {
 		t.Errorf("DeviceAuthConfig.Interval = %d, want 5", cfg.Interval)
+	}
+}
+
+// TestVisibleIndices tests that visibleIndices returns only visible page indices
+func TestVisibleIndices(t *testing.T) {
+	pm := &PageManager{}
+	pm.registered = []registeredPage{
+		{page: NewPlaceholderPage("dashboard", "Dashboard"), visible: true},
+		{page: NewPlaceholderPage("console", "Console"), visible: false},
+		{page: NewPlaceholderPage("services", "Services"), visible: false},
+		{page: NewPlaceholderPage("jobs", "Jobs"), visible: false},
+		{page: NewPlaceholderPage("network", "Network"), visible: false},
+	}
+
+	vis := pm.visibleIndices()
+	if len(vis) != 1 {
+		t.Fatalf("visibleIndices() returned %d indices, want 1", len(vis))
+	}
+	if vis[0] != 0 {
+		t.Errorf("visibleIndices()[0] = %d, want 0", vis[0])
+	}
+}
+
+// TestShowHide tests Show and Hide methods
+func TestShowHide(t *testing.T) {
+	pm := &PageManager{
+		tabBar: tview.NewTextView().SetDynamicColors(true),
+	}
+	pm.registered = []registeredPage{
+		{page: NewPlaceholderPage("dashboard", "Dashboard"), visible: true},
+		{page: NewPlaceholderPage("console", "Console"), visible: false},
+		{page: NewPlaceholderPage("services", "Services"), visible: false},
+	}
+
+	// Show services
+	pm.Show("services")
+	vis := pm.visibleIndices()
+	if len(vis) != 2 {
+		t.Fatalf("after Show('services'), visibleIndices() = %d, want 2", len(vis))
+	}
+	if vis[1] != 2 {
+		t.Errorf("visibleIndices()[1] = %d, want 2", vis[1])
+	}
+
+	// Hide it back
+	pm.Hide("services")
+	vis = pm.visibleIndices()
+	if len(vis) != 1 {
+		t.Fatalf("after Hide('services'), visibleIndices() = %d, want 1", len(vis))
+	}
+}
+
+// TestSwitchToName tests switching to a page by name
+func TestSwitchToName(t *testing.T) {
+	pm := &PageManager{
+		pages:  tview.NewPages(),
+		tabBar: tview.NewTextView().SetDynamicColors(true),
+	}
+
+	// Build placeholder pages manually
+	p1 := NewPlaceholderPage("dashboard", "Dashboard")
+	p2 := NewPlaceholderPage("services", "Services")
+	p1.Build(nil)
+	p2.Build(nil)
+
+	pm.registered = []registeredPage{
+		{page: p1, visible: true},
+		{page: p2, visible: true},
+	}
+	pm.pages.AddPage("dashboard", p1.view, true, false)
+	pm.pages.AddPage("services", p2.view, true, false)
+	pm.activeIdx = 0
+
+	pm.SwitchToName("services")
+	if pm.activeIdx != 1 {
+		t.Errorf("after SwitchToName('services'), activeIdx = %d, want 1", pm.activeIdx)
+	}
+}
+
+// TestDenseAltMapping tests that Alt+N maps to the Nth visible page
+func TestDenseAltMapping(t *testing.T) {
+	pm := &PageManager{}
+	pm.registered = []registeredPage{
+		{page: NewPlaceholderPage("dashboard", "Dashboard"), visible: true},
+		{page: NewPlaceholderPage("console", "Console"), visible: false},
+		{page: NewPlaceholderPage("services", "Services"), visible: true},
+		{page: NewPlaceholderPage("jobs", "Jobs"), visible: false},
+		{page: NewPlaceholderPage("network", "Network"), visible: true},
+	}
+
+	vis := pm.visibleIndices()
+	if len(vis) != 3 {
+		t.Fatalf("visibleIndices() returned %d, want 3", len(vis))
+	}
+	// Alt+1 -> index 0 (dashboard)
+	if vis[0] != 0 {
+		t.Errorf("Alt+1 maps to index %d, want 0", vis[0])
+	}
+	// Alt+2 -> index 2 (services, skipping hidden console)
+	if vis[1] != 2 {
+		t.Errorf("Alt+2 maps to index %d, want 2", vis[1])
+	}
+	// Alt+3 -> index 4 (network, skipping hidden jobs)
+	if vis[2] != 4 {
+		t.Errorf("Alt+3 maps to index %d, want 4", vis[2])
 	}
 }
