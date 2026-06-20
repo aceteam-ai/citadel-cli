@@ -478,3 +478,24 @@ Auto-generated log of every release.
   - fix(tui): add 3s timeout to tailscale detection on connect
 
 
+---
+
+## v2.37.0 — 2026-06-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 7 |
+| Files changed | 20 |
+| Lines added | +1515 |
+
+**Changes:**
+
+  - fix: reclaim stale Headscale nodes before re-registration (#159) (#241)
+  - feat: detect Proxmox hypervisor and add capability tag (#212) (#239)
+  - feat(work): use node identity as default consumer group (#162)
+  - fix(work): add target_node filter to prevent duplicate job execution (#160) (#240)
+  - feat(network): add reconnect command and BackendState diagnostic logging (#235)
+  - docs: MCP server reference and README integration section (#144)
+  - chore: sync generated files after v2.36.0 release
+
+
