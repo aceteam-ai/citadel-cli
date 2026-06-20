@@ -1015,6 +1015,41 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		nodeName, _ = os.Hostname()
 	}
 
+	// Subscribe to this node's per-node shell stream so node-targeted MCP jobs
+	// (terminal_exec, code_*, file reads, node attachments) reach ONLY this node
+	// instead of being claimed by a greedy peer on the shared shell stream
+	// (issue #3914). The canonical `citadel` (TUI) path must do this too, not
+	// just `citadel work` -- otherwise node-targeted jobs are never consumed in
+	// the normal run mode. Mirrors the subscription in runWork(); purely additive
+	// (the shared shell stream is still consumed for untargeted work).
+	if headscaleNodeID == "" {
+		if id := network.GetGlobalNodeID(ctx); id != "" {
+			headscaleNodeID = id
+		}
+	}
+	if headscaleNodeID != "" {
+		perNodeOrgID := ""
+		if deviceConfig != nil {
+			perNodeOrgID = deviceConfig.OrgID
+		}
+		if perNodeOrgID == "" {
+			if manifest, _, mErr := findAndReadManifest(); mErr == nil && manifest != nil {
+				perNodeOrgID = manifest.Node.OrgID
+			}
+		}
+		if perNodeOrgID != "" {
+			perNodeQueue := nodeQueueName(perNodeOrgID, headscaleNodeID)
+			if apiSrc, ok := source.(*worker.APISource); ok {
+				apiSrc.AddQueue(perNodeQueue)
+			}
+			activity("info", fmt.Sprintf("Per-node shell stream: %s", perNodeQueue))
+		} else {
+			activity("warning", "Per-node shell stream skipped (org id unknown); node-targeted jobs fall back to the shared stream")
+		}
+	} else {
+		activity("warning", "Per-node shell stream skipped (node ID unavailable); node-targeted jobs fall back to the shared stream")
+	}
+
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
 		NodeName:  nodeName,
