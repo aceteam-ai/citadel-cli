@@ -16,10 +16,20 @@ func NewServer(executor *Executor) *Server {
 	return &Server{executor: executor}
 }
 
-func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/workflow/run", s.handleRun)
-	mux.HandleFunc("/workflow/", s.handleWorkflowByID)
-	mux.HandleFunc("/workflow", s.handleList)
+// RegisterRoutes registers workflow HTTP endpoints on the given mux.
+// The authMiddleware parameter gates all routes behind authentication
+// (e.g., requireVPNOrAuth from the status server). Pass nil to skip
+// auth gating (only safe in tests).
+func (s *Server) RegisterRoutes(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc) {
+	wrap := func(h http.HandlerFunc) http.HandlerFunc {
+		if authMiddleware != nil {
+			return authMiddleware(h)
+		}
+		return h
+	}
+	mux.HandleFunc("/workflow/run", wrap(s.handleRun))
+	mux.HandleFunc("/workflow/", wrap(s.handleWorkflowByID))
+	mux.HandleFunc("/workflow", wrap(s.handleList))
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
