@@ -15,6 +15,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 )
 
+// RouteRegistrar is a callback that registers HTTP routes on the status server's
+// mux with the given auth middleware. This avoids circular imports between the
+// status package and feature packages (e.g., provision).
+type RouteRegistrar func(mux *http.ServeMux, authMiddleware func(http.HandlerFunc) http.HandlerFunc)
+
 // Server provides an HTTP server for node status queries.
 // This enables on-demand queries from the AceTeam control plane.
 type Server struct {
@@ -29,6 +34,10 @@ type Server struct {
 	// agent provides the data/actions backing the /agent/* introspection &
 	// control endpoints (issue #236). Nil disables those routes.
 	agent *AgentProviders
+
+	// routeRegistrars are callbacks registered via AddRouteRegistrar that
+	// install additional routes (e.g., provisioning API) during Start.
+	routeRegistrars []RouteRegistrar
 
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
@@ -72,6 +81,14 @@ func (s *Server) AddListener(ln net.Listener) {
 	s.extraListeners = append(s.extraListeners, ln)
 }
 
+// AddRouteRegistrar registers a callback that will be invoked during Start to
+// install additional HTTP routes on the server's mux. The callback receives
+// the mux and the requireVPNOrAuth middleware for auth gating.
+// Must be called before Start.
+func (s *Server) AddRouteRegistrar(reg RouteRegistrar) {
+	s.routeRegistrars = append(s.routeRegistrars, reg)
+}
+
 // Start begins listening for HTTP requests.
 // This method blocks until the context is cancelled.
 func (s *Server) Start(ctx context.Context) error {
@@ -94,6 +111,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// Agent introspection & control endpoints (issue #236), gated the same way
 	// (VPN origin or valid org token). No-op when no providers were supplied.
 	s.registerAgentRoutes(mux)
+
+	// Invoke registered route registrars (e.g., provisioning API).
+	for _, reg := range s.routeRegistrars {
+		reg(mux, s.requireVPNOrAuth)
+	}
 
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),

@@ -19,6 +19,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
+	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -763,6 +764,11 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		statusServer := status.NewServer(serverCfg, collector)
 
+		// Register provisioning API routes on the status server
+		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
+			statusServer.AddRouteRegistrar(provisionHandler.RegisterRoutes)
+		}
+
 		// Add VPN listener so the status server is reachable over the tsnet VPN
 		if network.IsGlobalConnected() {
 			vpnAddr := fmt.Sprintf(":%d", workStatusPort)
@@ -1138,6 +1144,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/provision", &gateway.Upstream{Address: statusAddr})
 
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
@@ -1698,4 +1705,26 @@ func init() {
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")
 	workCmd.Flags().StringVar(&workGatewayCertDir, "gateway-cert-dir", "", "Custom directory for gateway TLS certificates")
 	workCmd.Flags().MarkHidden("gateway-no-tls")
+}
+
+// initProvisionHandler creates a provision.Handler backed by the Docker
+// backend with state persisted in the Citadel config directory.
+// Returns nil if initialization fails (provisioning API will be unavailable).
+func initProvisionHandler() *provision.Handler {
+	configDir := platform.ConfigDir()
+	store, err := provision.NewStore(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "   - provision store init failed: %v\n", err)
+		return nil
+	}
+	docker, err := provision.NewDockerBackend()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "   - provision docker backend init failed: %v\n", err)
+		return nil
+	}
+	backends := map[provision.ResourceType]provision.Backend{
+		provision.ResourceTypeDocker: docker,
+	}
+	mgr := provision.NewManager(store, backends)
+	return provision.NewHandler(mgr)
 }
