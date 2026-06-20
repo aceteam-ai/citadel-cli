@@ -37,11 +37,11 @@ type Server struct {
 
 // ServerConfig holds configuration for the status server.
 type ServerConfig struct {
-	Port           int                    // HTTP server port (default: 8080)
-	Version        string                 // Citadel version string
+	Port           int                     // HTTP server port (default: 8080)
+	Version        string                  // Citadel version string
 	TokenValidator terminal.TokenValidator // Optional: enables authenticated desktop endpoints
-	OrgID          string                 // Required when TokenValidator is set
-	EnableDesktop  bool                   // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
+	OrgID          string                  // Required when TokenValidator is set
+	EnableDesktop  bool                    // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
 
 	// Agent, when set, registers the /agent/* introspection & control
 	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
@@ -238,6 +238,25 @@ func (s *Server) handleScreenshot(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Per-request readiness check: verify the desktop environment is usable
+	// before attempting capture. Returns 503 with actionable diagnostics when
+	// the display or screenshot tools are unavailable.
+	if err := desktop.DiagnoseDesktopReadiness(); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if re, ok := err.(*desktop.VNCReadinessError); ok {
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":  re.Error(),
+				"reason": re.Reason,
+				"detail": re.Detail,
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		}
+		return
+	}
+
 	png, err := desktop.CaptureScreenshot(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -256,6 +275,24 @@ func (s *Server) handleActions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Per-request readiness check: verify the desktop environment is usable
+	// before attempting input actions.
+	if err := desktop.DiagnoseDesktopReadiness(); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if re, ok := err.(*desktop.VNCReadinessError); ok {
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":  re.Error(),
+				"reason": re.Reason,
+				"detail": re.Detail,
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		}
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")

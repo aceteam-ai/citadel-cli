@@ -40,19 +40,19 @@ import (
 
 // Worker state for TUI management
 var (
-	ccWorkerMu        sync.Mutex
-	ccWorkerRunning   bool
-	ccWorkerCancel    context.CancelFunc
-	ccWorkerQueue     string
-	ccActivityFn      func(level, msg string)
-	ccHeartbeatFn     func(active bool) // Callback when heartbeat publishes
+	ccWorkerMu      sync.Mutex
+	ccWorkerRunning bool
+	ccWorkerCancel  context.CancelFunc
+	ccWorkerQueue   string
+	ccActivityFn    func(level, msg string)
+	ccHeartbeatFn   func(active bool) // Callback when heartbeat publishes
 )
 
 // Demo server state
 var (
-	ccDemoServer  *demo.Server
-	ccDemoCancel  context.CancelFunc
-	ccDemoPort    = 7777
+	ccDemoServer *demo.Server
+	ccDemoCancel context.CancelFunc
+	ccDemoPort   = 7777
 )
 
 // Terminal server state
@@ -411,7 +411,9 @@ func stopTerminalServer() {
 	ccTerminalAPIToken = ""
 }
 
-// startVNCServer starts the embedded VNC server for remote desktop access
+// startVNCServer starts the embedded VNC server for remote desktop access.
+// It retries transient failures (e.g. screen capture init racing with display
+// server startup) up to 3 times with exponential backoff.
 func startVNCServer() error {
 	if ccVNCRunning {
 		return nil
@@ -436,8 +438,35 @@ func startVNCServer() error {
 
 	ccVNCServer.SetSilent()
 
-	if err := ccVNCServer.Start(); err != nil {
-		return fmt.Errorf("failed to start VNC server: %w", err)
+	// Retry with backoff for transient failures (display not ready yet).
+	// Permanent failures (unsupported platform) bail immediately.
+	const maxRetries = 3
+	interval := 500 * time.Millisecond
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ccVNCServer.Start(); err != nil {
+			lastErr = err
+			// Permanent failure: platform doesn't support screen capture
+			if strings.Contains(err.Error(), "not supported") {
+				return fmt.Errorf("failed to start VNC server: %w", err)
+			}
+			if attempt < maxRetries {
+				Log("VNC server start attempt %d/%d failed (retrying in %s): %v", attempt+1, maxRetries+1, interval, err)
+				time.Sleep(interval)
+				interval *= 2
+				// Re-create server for retry since Start() sets running=false on failure
+				ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{
+					Host: "127.0.0.1",
+					Port: ccVNCPort,
+					FPS:  10,
+				})
+				ccVNCServer.SetSilent()
+				continue
+			}
+			return fmt.Errorf("failed to start VNC server after %d attempts: %w", maxRetries+1, lastErr)
+		}
+		break
 	}
 
 	ccVNCRunning = true
@@ -1266,4 +1295,3 @@ func ccAutoUpdate() bool {
 
 	return true
 }
-
