@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -577,7 +578,10 @@ func (cc *ControlCenter) Run() error {
 	// Alt+3: Chat page (hidden until network is connected and org is known)
 	cc.chatPage = NewChatPage(cc.chatConfig)
 	cc.pmgr.Register(cc.chatPage, false)
-	cc.pmgr.Register(NewPlaceholderPage("services", "Services"), false)
+
+	// Alt+4: Gateway page (hidden until gateway ledger appears on disk)
+	gatewayBaseDir := filepath.Join(os.Getenv("HOME"), ".citadel-cli")
+	cc.pmgr.Register(NewGatewayPage(gatewayBaseDir), false)
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
 
