@@ -78,6 +78,61 @@ func TestShellQueueName(t *testing.T) {
 	}
 }
 
+func TestResolveConsumerGroup(t *testing.T) {
+	tests := []struct {
+		name            string
+		explicit        string
+		headscaleNodeID string
+		hostname        string
+		want            string
+	}{
+		{
+			name:            "explicit flag takes priority",
+			explicit:        "my-custom-group",
+			headscaleNodeID: "42",
+			hostname:        "gpu-rig",
+			want:            "my-custom-group",
+		},
+		{
+			name:            "headscale node ID used when no explicit flag",
+			headscaleNodeID: "42",
+			hostname:        "gpu-rig",
+			want:            "citadel-node-42",
+		},
+		{
+			name:     "hostname fallback when no headscale ID",
+			hostname: "gpu-rig",
+			want:     "citadel-gpu-rig",
+		},
+		{
+			name: "default fallback when nothing available",
+			want: "citadel-workers",
+		},
+		{
+			name:            "empty strings are not set",
+			explicit:        "",
+			headscaleNodeID: "",
+			hostname:        "",
+			want:            "citadel-workers",
+		},
+		{
+			name:     "explicit citadel-workers is respected",
+			explicit: "citadel-workers",
+			want:     "citadel-workers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveConsumerGroup(tt.explicit, tt.headscaleNodeID, tt.hostname)
+			if got != tt.want {
+				t.Errorf("resolveConsumerGroup(%q, %q, %q) = %q, want %q",
+					tt.explicit, tt.headscaleNodeID, tt.hostname, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestNodeQueueName guards the per-node shell stream naming convention. This
 // string MUST match the Python build_node_queue helper byte-for-byte, otherwise
 // node-targeted jobs (issue #3914) silently fall back to the shared stream and

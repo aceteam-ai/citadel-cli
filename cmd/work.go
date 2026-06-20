@@ -240,9 +240,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 		Debug("API base URL: %s", apiBaseURL)
 
-		// Fetch worker config from API (queue, consumer group, org).
-		// This replaces the need for WORKER_QUEUE / CONSUMER_GROUP env vars.
-		if workQueue == "" || workGroup == "" {
+		// Fetch worker config from API (queue, org).
+		// This replaces the need for WORKER_QUEUE env vars.
+		// Consumer group is resolved earlier from node identity.
+		if workQueue == "" || deviceConfig.OrgID == "" {
 			tempClient := redisapi.NewClient(redisapi.ClientConfig{
 				BaseURL:   apiBaseURL,
 				Token:     deviceConfig.DeviceAPIToken,
@@ -256,9 +257,6 @@ func runWork(cmd *cobra.Command, args []string) {
 					workerCfg.Queue, workerCfg.ConsumerGroup, workerCfg.OrgID)
 				if workQueue == "" && workerCfg.Queue != "" {
 					workQueue = workerCfg.Queue
-				}
-				if workGroup == "" && workerCfg.ConsumerGroup != "" {
-					workGroup = workerCfg.ConsumerGroup
 				}
 				// Store org_id from API if not already in config
 				if deviceConfig.OrgID == "" && workerCfg.OrgID != "" {
@@ -541,6 +539,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Default consumer group to node identity when --group is not explicitly set.
+	workGroup = resolveConsumerGroup(workGroup, headscaleNodeID, nodeName)
+	Debug("consumer group: %s", workGroup)
 	// Set node identity on the stream event publisher for operator attribution.
 	// Note: We keep using nodeName (hostname) here rather than the Headscale
 	// numeric ID, because the usage/earnings pipeline may key on hostname.
@@ -1339,6 +1340,21 @@ func resolveWorkspaceDir() string {
 	return abs
 }
 
+// resolveConsumerGroup returns the consumer group name to use.
+// Priority: explicit flag > Headscale node ID > hostname > fallback "citadel-workers".
+func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if headscaleNodeID != "" {
+		return fmt.Sprintf("citadel-node-%s", headscaleNodeID)
+	}
+	if hostname != "" {
+		return fmt.Sprintf("citadel-%s", hostname)
+	}
+	return "citadel-workers"
+}
+
 // resolveAutoUpdateEnabled reports whether the periodic auto-updater should act
 // on the current tick. Priority: --auto-update flag > CITADEL_AUTO_UPDATE env
 // (explicit on/off) > the persisted `citadel update enable/disable` state.
@@ -1532,7 +1548,7 @@ func init() {
 
 	// Queue flags
 	workCmd.Flags().StringVar(&workQueue, "queue", "", "Queue/stream name to consume from (default: jobs:v1:cpu-general)")
-	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-workers)")
+	workCmd.Flags().StringVar(&workGroup, "group", "", "Consumer group name (default: citadel-node-<id> or citadel-<hostname>)")
 	workCmd.Flags().IntVar(&workPollMs, "poll-ms", 5000, "Block timeout in milliseconds")
 	workCmd.Flags().IntVar(&workMaxRetries, "max-retries", 3, "Maximum retry attempts before DLQ")
 
