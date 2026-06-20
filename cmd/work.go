@@ -1726,5 +1726,9 @@ func initProvisionHandler() *provision.Handler {
 		provision.ResourceTypeDocker: docker,
 	}
 	mgr := provision.NewManager(store, backends)
+	// Reconcile persisted resources against actual Docker state on startup.
+	// This detects containers that crashed or were removed while the daemon
+	// was down and updates their status accordingly.
+	mgr.ReconcileAll(context.Background())
 	return provision.NewHandler(mgr)
 }
