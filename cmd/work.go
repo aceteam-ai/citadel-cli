@@ -721,11 +721,11 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Resolve workspace dir early — needed by both file-operation handlers and
 	// the workflow executor, and the workflow executor must be created before the
-	// status server config (which references it in the ExtraRoutes closure).
+	// status server starts (its AddRouteRegistrar closure references it).
 	wsDir := resolveWorkspaceDir()
 
 	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
-	// server's ExtraRoutes closure and the job handler share a single instance.
+	// server's AddRouteRegistrar closure and the job handler share a single instance.
 	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
 		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
 	})
@@ -750,10 +750,6 @@ func runWork(cmd *cobra.Command, args []string) {
 			Port:    workStatusPort,
 			Version: Version,
 			Agent:   agentProviders,
-			ExtraRoutes: func(mux *http.ServeMux) {
-				wfServer := workflow.NewServer(wfExec)
-				wfServer.RegisterRoutes(mux)
-			},
 		}
 
 		// Wire up desktop API auth if org ID is available
@@ -795,6 +791,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
 			statusServer.AddRouteRegistrar(provisionHandler.RegisterRoutes)
 		}
+
+		// Register workflow API routes, gated by requireVPNOrAuth (#259).
+		statusServer.AddRouteRegistrar(func(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
+			wfServer := workflow.NewServer(wfExec)
+			wfServer.RegisterRoutes(mux, auth)
+		})
 
 		// Add VPN listener so the status server is reachable over the tsnet VPN
 		if network.IsGlobalConnected() {
