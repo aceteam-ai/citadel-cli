@@ -81,9 +81,12 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 			// Found manifest in default location - auto-fix the config
 			globalConf.NodeConfigDir = defaultNodeDir
 
-			// Read existing config to preserve other fields
+			// Read existing config to preserve other fields. A successful
+			// unmarshal of an empty/whitespace/null file yields a nil map (e.g.
+			// when the config was truncated by a disk-full event), so guard
+			// against nil before writing or the assignment below panics.
 			var config map[string]interface{}
-			if err := yaml.Unmarshal(globalConfigData, &config); err != nil {
+			if err := yaml.Unmarshal(globalConfigData, &config); err != nil || config == nil {
 				config = make(map[string]interface{})
 			}
 			config["node_config_dir"] = defaultNodeDir
