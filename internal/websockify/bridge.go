@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -80,15 +81,24 @@ func NewBridge(cfg Config) *Bridge {
 // origins, and aceteam.ai origins. The browser noVNC client connects with an
 // Origin of the AceTeam web app, so the default gorilla same-origin policy
 // would reject it.
+//
+// The origin is parsed as a URL and the hostname is checked with an exact
+// match (or a subdomain suffix match) to prevent bypass via attacker-controlled
+// domains like "aceteam.ai.evil.com".
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
 	}
-	if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "127.0.0.1" {
 		return true
 	}
-	if strings.Contains(origin, "aceteam.ai") {
+	if host == "aceteam.ai" || strings.HasSuffix(host, ".aceteam.ai") {
 		return true
 	}
 	return false

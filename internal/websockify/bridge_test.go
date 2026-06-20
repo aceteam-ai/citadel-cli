@@ -239,12 +239,25 @@ func TestCheckOrigin(t *testing.T) {
 		origin string
 		want   bool
 	}{
+		// Allowed: no origin (same-origin / CLI)
 		{"", true},
+		// Allowed: localhost variants
 		{"http://localhost:3000", true},
 		{"http://127.0.0.1:8443", true},
+		// Allowed: exact aceteam.ai and subdomains
 		{"https://aceteam.ai", true},
 		{"https://app.aceteam.ai", true},
+		{"https://staging.app.aceteam.ai", true},
+		// Rejected: unrelated domains
 		{"https://evil.example.com", false},
+		// Rejected: bypass attempts — attacker-controlled domains
+		{"https://aceteam.ai.evil.com", false},
+		{"https://evil-aceteam.ai", false},
+		{"https://notaceteam.ai", false},
+		{"https://localhost.evil.com", false},
+		{"https://fake127.0.0.1.evil.com", false},
+		// Rejected: malformed origins
+		{"not-a-url", false},
 	}
 	for _, tc := range cases {
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
