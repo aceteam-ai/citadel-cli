@@ -163,6 +163,10 @@ func categoryForPath(path string) string {
 	if path == "/ssh" || strings.HasPrefix(path, "/ssh/") {
 		return "ssh"
 	}
+	// Provisioning
+	if path == "/provision" || strings.HasPrefix(path, "/provision/") {
+		return "provision"
+	}
 	// Everything else (health, status, ping, root, unknown) is always allowed
 	return ""
 }
@@ -187,6 +191,8 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 				blocked = !perms.Services
 			case "ssh":
 				blocked = !perms.SSH
+			case "provision":
+				blocked = !perms.Provision
 			// "files" is not currently routed through the gateway but is
 			// included in the permission model for future use.
 			}

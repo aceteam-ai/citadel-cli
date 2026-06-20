@@ -204,6 +204,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
+	gw.AddUpstream("/provision", &gateway.Upstream{Address: statusAddr})
 
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{

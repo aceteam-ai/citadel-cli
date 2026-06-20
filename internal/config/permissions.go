@@ -12,11 +12,12 @@ import (
 // Permissions controls which capabilities are exposed through the HTTPS gateway.
 // All fields default to true (opt-out model).
 type Permissions struct {
-	Console  bool `yaml:"console" json:"console"`   // Terminal WebSocket access
-	Desktop  bool `yaml:"desktop" json:"desktop"`   // VNC, screenshots, actions
-	Files    bool `yaml:"files" json:"files"`       // File browser API
-	Services bool `yaml:"services" json:"services"` // Service list/management
-	SSH      bool `yaml:"ssh" json:"ssh"`           // SSH authorized_keys sync
+	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access
+	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions
+	Files     bool `yaml:"files" json:"files"`         // File browser API
+	Services  bool `yaml:"services" json:"services"`   // Service list/management
+	SSH       bool `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync
+	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API
 }
 
 const permissionsFile = "permissions.yaml"
@@ -24,11 +25,12 @@ const permissionsFile = "permissions.yaml"
 // DefaultPermissions returns a Permissions struct with all capabilities enabled.
 func DefaultPermissions() *Permissions {
 	return &Permissions{
-		Console:  true,
-		Desktop:  true,
-		Files:    true,
-		Services: true,
-		SSH:      true,
+		Console:   true,
+		Desktop:   true,
+		Files:     true,
+		Services:  true,
+		SSH:       true,
+		Provision: true,
 	}
 }
 
