@@ -22,11 +22,18 @@ import (
 // Callers should clear state and re-authenticate with a fresh authkey.
 var ErrStaleState = errors.New("network state is stale: connection cannot be re-established with existing keys")
 
-// reconnectTimeout is the maximum time to wait for a reconnection attempt
-// using existing state before declaring the state stale. A working WireGuard
-// handshake completes in under 5s; 10s gives margin for slow networks without
-// making interactive login feel stuck.
+// reconnectTimeout is the maximum time to wait for a single reconnection
+// attempt using existing state before declaring it timed out. A working
+// WireGuard handshake completes in under 5s; 10s gives margin for slow
+// networks without making interactive login feel stuck.
 const reconnectTimeout = 10 * time.Second
+
+// reconnectAttempts is the number of times VerifyOrReconnect tries the
+// no-authkey reconnect before declaring the state stale. On boot the network
+// interface may not be ready within the first 10s timeout, so retrying avoids
+// a premature ClearState + fresh connect that mints a new Headscale node ID
+// (issue #246).
+const reconnectAttempts = 3
 
 var (
 	globalServer *NetworkServer
@@ -219,8 +226,8 @@ func Listen(network, addr string) (net.Listener, error) {
 // Returns (connected, error). No error if simply not logged in.
 //
 // If state exists but the connection times out (e.g. expired/revoked Headscale key),
-// returns ErrStaleState. Callers should handle this by clearing state and
-// re-authenticating with a fresh authkey.
+// returns ErrStaleState after reconnectAttempts failures. Callers should handle
+// this by clearing state and re-authenticating with a fresh authkey.
 func VerifyOrReconnect(ctx context.Context) (bool, error) {
 	if IsGlobalConnected() {
 		return true, nil
@@ -229,13 +236,6 @@ func VerifyOrReconnect(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Reconnect using saved state with a bounded timeout.
-	// When the existing WireGuard keys are expired/revoked, tsnet will
-	// hang until the parent context deadline — cap it to reconnectTimeout
-	// so callers get a fast, actionable error.
-	reconnectCtx, cancel := context.WithTimeout(ctx, reconnectTimeout)
-	defer cancel()
-
 	hostname := getHostnameForReconnect()
 	config := ServerConfig{
 		Hostname:   hostname,
@@ -243,16 +243,48 @@ func VerifyOrReconnect(ctx context.Context) (bool, error) {
 		StateDir:   GetStateDir(),
 	}
 
-	srv := NewServer(config)
-	if err := srv.Connect(reconnectCtx, ""); err != nil {
-		if isStaleStateError(err) {
-			return false, ErrStaleState
+	// Retry the no-authkey reconnect with backoff. The first attempt may
+	// fail simply because the network interface is not ready yet at boot.
+	// Retrying here is far cheaper than falling through to ClearState,
+	// which destroys the node's WireGuard keys and mints a new Headscale ID.
+	for attempt := 1; attempt <= reconnectAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := time.Duration(attempt) * 5 * time.Second
+			if logf != nil {
+				logf("reconnect attempt %d/%d in %s...", attempt, reconnectAttempts, backoff)
+			}
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(backoff):
+			}
 		}
-		return false, fmt.Errorf("failed to reconnect: %w", err)
+
+		reconnectCtx, cancel := context.WithTimeout(ctx, reconnectTimeout)
+		srv := NewServer(config)
+		connErr := srv.Connect(reconnectCtx, "")
+		cancel()
+
+		if connErr == nil {
+			SetGlobal(srv)
+			if logf != nil && attempt > 1 {
+				logf("reconnected on attempt %d", attempt)
+			}
+			return true, nil
+		}
+
+		// Non-stale errors (e.g. permission denied, state dir missing) won't
+		// improve on retry, so bail immediately.
+		if !isStaleStateError(connErr) {
+			return false, fmt.Errorf("failed to reconnect: %w", connErr)
+		}
+
+		if logf != nil {
+			logf("reconnect attempt %d/%d failed: %v", attempt, reconnectAttempts, connErr)
+		}
 	}
 
-	SetGlobal(srv)
-	return true, nil
+	return false, ErrStaleState
 }
 
 // ReconnectWithAuthKey attempts to connect using an existing state directory

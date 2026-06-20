@@ -147,37 +147,45 @@ func attemptVPNRecovery(ctx context.Context, deviceConfig *DeviceConfig, hostnam
 // 'citadel reconnect'). Also used by the --force path to avoid
 // duplicating fetch+connect logic.
 func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, apiBaseURL string) VPNRecoveryResult {
-	Debug("VPN state is stale, attempting recovery...")
+	Log("VPN state is stale, attempting recovery (state_dir=%s, has_state=%v)...",
+		network.GetStateDir(), network.HasState())
 
 	if deviceConfig == nil || deviceConfig.DeviceAPIToken == "" {
+		Log("no device API token available for auto-recovery")
 		return VPNRecoveryResult{
 			Err: fmt.Errorf("no device API token available for auto-recovery"),
 		}
 	}
 
 	// Fetch a fresh authkey from the platform
-	Debug("requesting fresh authkey from %s", apiBaseURL)
+	Log("requesting fresh authkey from %s", apiBaseURL)
 	freshKey, fetchErr := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
 	if fetchErr != nil {
-		Debug("failed to fetch fresh authkey: %v", fetchErr)
+		Log("failed to fetch fresh authkey: %v", fetchErr)
 		return VPNRecoveryResult{
 			Err: fmt.Errorf("could not fetch fresh authkey: %w", fetchErr),
 		}
 	}
 
 	// Attempt 1: reconnect with existing state + fresh key (preserves IP)
-	Debug("attempting reconnect with existing state (IP-preserving)...")
+	Log("attempting reconnect with existing state (IP-preserving)...")
 	if ok, reconnErr := network.ReconnectWithAuthKey(ctx, freshKey); reconnErr == nil && ok {
-		Debug("reconnected with existing state (IP preserved)")
+		Log("reconnected with existing state (IP preserved)")
 		return VPNRecoveryResult{Connected: true, IPPreserved: true}
 	} else {
-		Debug("IP-preserving reconnect failed: %v", reconnErr)
+		Log("IP-preserving reconnect failed: %v", reconnErr)
 	}
 
-	// Attempt 2: clear state and connect from scratch (new IP/hostname)
-	Debug("clearing state for fresh connect...")
+	// Attempt 2: clear state and connect from scratch (new IP/hostname).
+	// Before clearing, reclaim the stale Headscale node so the dashboard
+	// doesn't accumulate duplicate entries on every restart (issue #246).
+	if deviceConfig.DeviceAPIToken != "" && hostname != "" {
+		Log("reclaiming stale node '%s' before fresh connect...", hostname)
+		reclaimStaleNodeByHostname(deviceConfig.DeviceAPIToken, hostname)
+	}
+	Log("clearing state for fresh connect...")
 	if clearErr := network.ClearState(); clearErr != nil {
-		Debug("failed to clear network state: %v", clearErr)
+		Log("failed to clear network state: %v", clearErr)
 	}
 	freshCtx, freshCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer freshCancel()
@@ -189,11 +197,11 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	}
 	_, connectErr := network.Connect(freshCtx, config)
 	if connectErr == nil {
-		Debug("reconnected with fresh state (new IP)")
+		Log("reconnected with fresh state (new IP)")
 		return VPNRecoveryResult{Connected: true, IPPreserved: false}
 	}
 
-	Debug("fresh connect also failed: %v", connectErr)
+	Log("fresh connect also failed: %v", connectErr)
 	return VPNRecoveryResult{
 		Err: fmt.Errorf("all recovery attempts failed: %w", connectErr),
 	}

@@ -466,10 +466,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Uses attemptVPNRecovery (shared with 'citadel reconnect') to handle
 	// stale state: IP-preserving reconnect first, then clear + fresh connect.
 	network.SetLogf(Debug)
-	Debug("verifying network connection...")
+	Log("verifying network connection (state_dir=%s, has_state=%v)...",
+		network.GetStateDir(), network.HasState())
 	connected, err := network.VerifyOrReconnect(ctx)
 	if err != nil && errors.Is(err, network.ErrStaleState) {
-		Debug("network state is stale, attempting auto-recovery...")
+		Log("network state is stale after retries, attempting auto-recovery...")
 		fmt.Println("   - VPN state is stale, attempting auto-recovery...")
 
 		apiBaseURL := ""
@@ -484,29 +485,33 @@ func runWork(cmd *cobra.Command, args []string) {
 		connected = result.Connected
 		if result.Connected {
 			if result.IPPreserved {
+				Log("VPN reconnected (IP preserved)")
 				fmt.Println("   - VPN reconnected (IP preserved)")
 			} else {
+				Log("VPN reconnected (fresh state, new IP)")
 				fmt.Println("   - VPN reconnected (fresh state)")
 			}
 		} else {
 			if result.Err != nil {
+				Log("VPN auto-recovery failed: %v", result.Err)
 				fmt.Fprintf(os.Stderr, "   - Warning: VPN auto-recovery failed: %v\n", result.Err)
 			}
+			Log("VPN connection could not be restored automatically")
 			fmt.Fprintln(os.Stderr, "   - Warning: VPN connection could not be restored automatically.")
 			fmt.Fprintln(os.Stderr, "     Run 'citadel reconnect' or 'citadel login --authkey <key>' to fix.")
 		}
 	} else if err != nil {
-		Debug("network reconnect failed: %v", err)
+		Log("network reconnect failed: %v", err)
 	} else if connected {
-		Debug("network connected")
+		Log("network connected")
 	} else {
-		Debug("network not configured (no saved state)")
+		Log("network not configured (no saved state)")
 	}
 
 	// Get node name and Headscale node ID from network status
 	nodeName := workNodeName
 	var headscaleNodeID string // Headscale numeric node ID (e.g., "758")
-	Debug("resolving node name...")
+	Log("resolving node name...")
 	Debug("workNodeName flag: %q", workNodeName)
 	Debug("CITADEL_NODE_NAME env: %q", os.Getenv("CITADEL_NODE_NAME"))
 	if nodeName == "" {
@@ -565,10 +570,15 @@ func runWork(cmd *cobra.Command, args []string) {
 			Debug("Headscale node ID still empty on retry %d", attempt)
 		}
 		if headscaleNodeID == "" {
+			Log("Headscale node ID unresolved after retries; node-targeted jobs will fall back to the shared org stream")
 			fmt.Fprintln(os.Stderr, "   - Warning: Headscale node ID unresolved after retries; "+
 				"node-targeted jobs will fall back to the shared org stream")
 		}
 	}
+
+	// Log the final registration outcome for post-mortem diagnosis (issue #246).
+	Log("registered: online=%v node_name=%s headscale_id=%s state_dir=%s",
+		connected, nodeName, headscaleNodeID, network.GetStateDir())
 
 	// Default consumer group to node identity when --group is not explicitly set.
 	workGroup = resolveConsumerGroup(workGroup, headscaleNodeID, nodeName)

@@ -319,3 +319,37 @@ func TestReconnectTimeoutConstant(t *testing.T) {
 		t.Errorf("reconnectTimeout = %v, should be under 60s to provide timely feedback", reconnectTimeout)
 	}
 }
+
+// TestReconnectAttemptsConstant verifies the retry count for VerifyOrReconnect
+// is high enough to survive boot-time network delays without being so high
+// that a genuinely revoked key wastes minutes before failing (issue #246).
+func TestReconnectAttemptsConstant(t *testing.T) {
+	if reconnectAttempts < 2 {
+		t.Errorf("reconnectAttempts = %d, should be >= 2 to survive boot-time network delays", reconnectAttempts)
+	}
+	if reconnectAttempts > 5 {
+		t.Errorf("reconnectAttempts = %d, should be <= 5 to avoid excessive wait on revoked keys", reconnectAttempts)
+	}
+}
+
+// TestReconnectRetryBackoffTiming verifies the total worst-case wait time
+// for the retry loop is bounded. With 3 attempts and 5s * attempt backoff
+// (0 + 10 + 15 = 25s backoff) plus 10s per attempt timeout (30s total),
+// the worst case is ~55s. This must be under 2 minutes.
+func TestReconnectRetryBackoffTiming(t *testing.T) {
+	// Calculate worst-case total time
+	var totalBackoff time.Duration
+	for attempt := 2; attempt <= reconnectAttempts; attempt++ {
+		totalBackoff += time.Duration(attempt) * 5 * time.Second
+	}
+	totalTimeout := time.Duration(reconnectAttempts) * reconnectTimeout
+	worstCase := totalBackoff + totalTimeout
+
+	if worstCase > 2*time.Minute {
+		t.Errorf("worst-case retry time = %v, should be under 2 minutes", worstCase)
+	}
+	if worstCase < 20*time.Second {
+		t.Errorf("worst-case retry time = %v, seems too short to give the network a fair chance", worstCase)
+	}
+	t.Logf("worst-case retry time: %v (backoff: %v, timeouts: %v)", worstCase, totalBackoff, totalTimeout)
+}

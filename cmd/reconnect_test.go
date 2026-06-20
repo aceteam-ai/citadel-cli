@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,25 @@ func TestRecoverStaleVPNNoToken(t *testing.T) {
 	}
 	if r2.Err == nil || r2.Err.Error() != "no device API token available for auto-recovery" {
 		t.Errorf("expected token error, got: %v", r2.Err)
+	}
+}
+
+// TestRecoverStaleVPNFetchAuthkeyFails verifies that recoverStaleVPN returns
+// a clear error when FetchFreshAuthkey fails (e.g. network down, bad token).
+func TestRecoverStaleVPNFetchAuthkeyFails(t *testing.T) {
+	ctx := context.Background()
+
+	// Use a config with a token but pointing to a non-existent server.
+	// FetchFreshAuthkey will fail with a connection error.
+	cfg := &DeviceConfig{DeviceAPIToken: "act_test_token_12345"}
+	r := recoverStaleVPN(ctx, cfg, "test-node", "http://127.0.0.1:1")
+	if r.Connected {
+		t.Error("expected Connected=false when authkey fetch fails")
+	}
+	if r.Err == nil {
+		t.Fatal("expected error when authkey fetch fails")
+	}
+	if !strings.Contains(r.Err.Error(), "could not fetch fresh authkey") {
+		t.Errorf("expected authkey fetch error, got: %v", r.Err)
 	}
 }
