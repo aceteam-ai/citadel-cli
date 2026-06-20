@@ -187,9 +187,27 @@ func DetectNodeCapabilities() *NodeCapabilities {
 
 	// Add OS tag
 	caps.Tags = append(caps.Tags, "os:"+runtime.GOOS)
+	// Add a human-friendly os:macos alias on Darwin
+	if runtime.GOOS == "darwin" {
+		caps.Tags = append(caps.Tags, "os:macos")
+	}
 
 	// Add architecture tag
 	caps.Tags = append(caps.Tags, "arch:"+runtime.GOARCH)
+
+	// Detect macOS developer toolchains (Xcode, Android SDK)
+	for _, tool := range DetectMacOSToolchains() {
+		if ValidateTag(tool.Tag) {
+			caps.Tags = append(caps.Tags, tool.Tag)
+		}
+		// Add versioned tag if available (e.g. tool:xcode:15.4)
+		if tool.Version != "" {
+			versionedTag := tool.Tag + ":" + tool.Version
+			if ValidateTag(versionedTag) {
+				caps.Tags = append(caps.Tags, versionedTag)
+			}
+		}
+	}
 
 	return caps
 }

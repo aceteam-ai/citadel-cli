@@ -160,6 +160,10 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Note: Update check is now handled by root.go's PersistentPreRun
 
+	// Prevent macOS from sleeping while worker is active
+	stopCaffeinate := startCaffeinate(ctx)
+	defer stopCaffeinate()
+
 	// Auto-start services from manifest (unless --no-services is set)
 	if !workNoServices {
 		if err := autoStartServices(); err != nil {
@@ -204,6 +208,17 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("\n")
 		if pveInfo.VMCount > 0 || pveInfo.CTCount > 0 {
 			fmt.Printf("   - Guests: %d VMs, %d containers\n", pveInfo.VMCount, pveInfo.CTCount)
+		}
+	}
+
+	// Log macOS developer toolchains (detected by DetectNodeCapabilities above)
+	if macTools := capabilities.DetectMacOSToolchains(); len(macTools) > 0 {
+		for _, tool := range macTools {
+			desc := tool.Name
+			if tool.Version != "" {
+				desc += " " + tool.Version
+			}
+			fmt.Printf("   - Toolchain: %s (%s)\n", desc, tool.Path)
 		}
 	}
 
