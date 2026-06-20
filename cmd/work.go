@@ -551,6 +551,45 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("node meta set: node_id=%s, node_name=%s", nodeName, nodeName)
 	}
 
+	// Subscribe to this node's per-node shell stream so node-targeted MCP jobs
+	// (terminal_exec, code_*, file reads, node attachments) reach ONLY this node
+	// instead of being claimed by a greedy peer on the shared shell stream
+	// (issue #3914). Keyed by the Headscale numeric node ID, which matches the
+	// platform's fabric_node_status.node_id used for targeting. We still consume
+	// the shared shell stream for untargeted work, so this is purely additive and
+	// safe for older platform deployments that don't yet route per-node.
+	//
+	// AddQueue is a Redis-only concept, so it's accessed via an optional
+	// interface rather than the JobSource contract (the Nexus HTTP source does
+	// not implement it). Done before the run loop starts, so no locking needed.
+	if headscaleNodeID != "" {
+		perNodeOrgID := ""
+		if deviceConfig != nil {
+			perNodeOrgID = deviceConfig.OrgID
+		}
+		if perNodeOrgID == "" {
+			if manifest, _, mErr := findAndReadManifest(); mErr == nil && manifest != nil {
+				perNodeOrgID = manifest.Node.OrgID
+			}
+		}
+		if perNodeOrgID != "" {
+			perNodeQueue := nodeQueueName(perNodeOrgID, headscaleNodeID)
+			switch src := source.(type) {
+			case *worker.APISource:
+				src.AddQueue(perNodeQueue)
+			case *worker.RedisSource:
+				if err := src.AddQueue(ctx, perNodeQueue); err != nil {
+					fmt.Fprintf(os.Stderr, "   - Warning: per-node stream subscribe failed: %v\n", err)
+				}
+			}
+			Debug("per-node shell stream: %s", perNodeQueue)
+		} else {
+			Debug("per-node shell stream skipped: org id unknown")
+		}
+	} else {
+		Debug("per-node shell stream skipped: Headscale node ID unavailable")
+	}
+
 	// Open usage store for per-job compute tracking
 	var usageStore *usage.Store
 	if nodeDir, err := platform.DefaultNodeDir(""); err != nil {
@@ -1187,11 +1226,26 @@ func autoStartServices() error {
 	return nil
 }
 
-// shellQueueName returns the per-org shell command queue name.
-// Jobs dispatched by platform MCP tools (terminal_exec, code_read, etc.)
-// are enqueued to this queue using the pattern jobs:v1:shell:org_{org_id}.
+// shellQueueName returns the shared per-org shell command queue name.
+// Untargeted jobs dispatched by platform MCP tools (terminal_exec, code_read,
+// etc.) are enqueued to this queue using the pattern jobs:v1:shell:org_{org_id}.
+// Every online worker in the org consumes it, so any of them may claim a job.
 func shellQueueName(orgID string) string {
 	return fmt.Sprintf("jobs:v1:shell:org_%s", orgID)
+}
+
+// nodeQueueName returns the per-node shell stream name for node-targeted jobs.
+//
+// Node-targeted MCP jobs (terminal_exec, code_*, file reads, node attachments)
+// must run on a specific node, identified by its Headscale numeric node ID.
+// The platform dispatcher routes such jobs to this stream so only the intended
+// worker can claim them, instead of any greedy peer on the shared shell stream
+// (issue #3914). The name is namespaced under the org's shell stream and MUST
+// stay byte-for-byte identical to the Python build_node_queue helper:
+//
+//	jobs:v1:shell:org_{org_id}:node:{node_id}
+func nodeQueueName(orgID, nodeID string) string {
+	return fmt.Sprintf("jobs:v1:shell:org_%s:node:%s", orgID, nodeID)
 }
 
 // getWorkHostname returns the hostname to use for VPN reconnection.
