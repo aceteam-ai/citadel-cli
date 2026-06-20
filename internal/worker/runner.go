@@ -43,6 +43,12 @@ type RunnerConfig struct {
 	// WorkerID identifies this worker instance
 	WorkerID string
 
+	// NodeID is this node's Headscale numeric node ID (e.g. "758").
+	// Used to filter jobs with a target_node field: if set and the job's
+	// target_node doesn't match, the job is acknowledged and skipped.
+	// When empty, target_node filtering is disabled (all jobs are processed).
+	NodeID string
+
 	// Verbose enables detailed logging
 	Verbose bool
 
@@ -238,6 +244,20 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
 	startTime := time.Now()
+
+	// Target-node filter: when per-node consumer groups are used, every node
+	// sees every message on the shared org queue. If the job specifies a
+	// target_node that doesn't match this node's Headscale ID, acknowledge
+	// and skip it silently -- the correct node will process it from its own
+	// read position. When this node's ID is unknown (empty), skip filtering
+	// to preserve pre-filter behavior and avoid dropping jobs.
+	if r.config.NodeID != "" {
+		if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
+			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
+			r.source.Ack(ctx, job)
+			return
+		}
+	}
 
 	// JQS-Core Section 5.6: Check cancellation before processing
 	if r.source.IsJobCancelled(ctx, job.ID) {
