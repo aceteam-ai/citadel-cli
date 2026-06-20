@@ -488,6 +488,9 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 		if data.OrgID == "" && deviceConfig.OrgID != "" {
 			data.OrgID = deviceConfig.OrgID
 		}
+		if data.OrgName == "" && deviceConfig.OrgName != "" {
+			data.OrgName = deviceConfig.OrgName
+		}
 	}
 
 	// Get hostname if not in manifest

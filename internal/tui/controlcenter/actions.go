@@ -1453,7 +1453,13 @@ func (cc *ControlCenter) showNodeDetailModal() {
 
 	sb.WriteString(fmt.Sprintf("[yellow]Name:[-]    %s\n", nodeName))
 	if cc.data.OrgID != "" {
-		sb.WriteString(fmt.Sprintf("[yellow]Org:[-]     %s\n", cc.data.OrgID))
+		orgDisplay := cc.data.OrgID
+		if cc.data.OrgName != "" {
+			orgDisplay = cc.data.OrgName
+		} else if len(cc.data.OrgID) > 12 {
+			orgDisplay = cc.data.OrgID[:12] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("[yellow]Org:[-]     %s\n", orgDisplay))
 	}
 	if cc.data.UserEmail != "" {
 		sb.WriteString(fmt.Sprintf("[yellow]User:[-]    %s\n", cc.data.UserEmail))

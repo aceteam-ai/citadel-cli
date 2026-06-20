@@ -34,6 +34,7 @@ type TokenResponse struct {
 	ExpiresIn      int    `json:"expires_in"`
 	NexusURL       string `json:"nexus_url,omitempty"`
 	OrgID          string `json:"org_id,omitempty"`
+	OrgName        string `json:"org_name,omitempty"`         // Human-readable org name
 	RedisURL       string `json:"redis_url,omitempty"`        // Deprecated: use DeviceAPIToken
 	DeviceAPIToken string `json:"device_api_token,omitempty"` // New secure API token
 	APIBaseURL     string `json:"api_base_url,omitempty"`     // Base URL for API calls

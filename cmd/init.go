@@ -877,6 +877,9 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	if token.OrgID != "" {
 		config["org_id"] = token.OrgID
 	}
+	if token.OrgName != "" {
+		config["org_name"] = token.OrgName
+	}
 	if token.UserEmail != "" {
 		config["user_email"] = token.UserEmail
 	}
