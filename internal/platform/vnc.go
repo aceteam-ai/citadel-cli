@@ -464,7 +464,77 @@ func (l *LinuxVNCManager) Install() error {
 }
 
 func (l *LinuxVNCManager) Uninstall() error {
-	fmt.Println("VNC server uninstall not yet supported on Linux.")
+	// Stop any running x11vnc process first (best-effort)
+	if l.IsRunning() {
+		if err := l.Stop(); err != nil {
+			fmt.Printf("Warning: failed to stop x11vnc before uninstall: %v\n", err)
+		}
+	}
+
+	needsSudo := os.Getuid() != 0
+
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrSudoRequired
+		}
+	}
+
+	sudoPrefix := func(name string, args ...string) *exec.Cmd {
+		if needsSudo {
+			return exec.Command("sudo", append([]string{name}, args...)...)
+		}
+		return exec.Command(name, args...)
+	}
+
+	if _, err := exec.LookPath("apt-get"); err == nil {
+		cmd := sudoPrefix("apt-get", "remove", "-y", "-qq", "x11vnc")
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall x11vnc via apt: %w", err)
+		}
+	} else if _, err := exec.LookPath("dnf"); err == nil {
+		cmd := sudoPrefix("dnf", "remove", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall x11vnc via dnf: %w", err)
+		}
+	} else if _, err := exec.LookPath("yum"); err == nil {
+		cmd := sudoPrefix("yum", "remove", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall x11vnc via yum: %w", err)
+		}
+	} else if _, err := exec.LookPath("pacman"); err == nil {
+		cmd := sudoPrefix("pacman", "-R", "--noconfirm", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall x11vnc via pacman: %w", err)
+		}
+	} else if _, err := exec.LookPath("zypper"); err == nil {
+		cmd := sudoPrefix("zypper", "remove", "-y", "x11vnc")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to uninstall x11vnc via zypper: %w", err)
+		}
+	} else {
+		return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
+	}
+
+	// Clean up VNC password file (best-effort)
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
+		if err := os.Remove(passwdFile); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("Warning: failed to remove VNC password file: %v\n", err)
+		}
+	}
+
+	fmt.Println("x11vnc uninstalled.")
 	return nil
 }
 

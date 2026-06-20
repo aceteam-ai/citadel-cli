@@ -314,3 +314,116 @@ func TestErrSudoRequired(t *testing.T) {
 		t.Errorf("ErrSudoRequired message should include the fix command, got: %s", msg)
 	}
 }
+
+func TestLinuxVNCManagerEffectivePort(t *testing.T) {
+	mgr := &LinuxVNCManager{}
+
+	// Default port when none is configured
+	if mgr.effectivePort() != DefaultVNCPort {
+		t.Errorf("effectivePort() = %d, want %d (default)", mgr.effectivePort(), DefaultVNCPort)
+	}
+
+	// Custom port after Configure sets it
+	mgr.port = 5901
+	if mgr.effectivePort() != 5901 {
+		t.Errorf("effectivePort() = %d, want 5901", mgr.effectivePort())
+	}
+}
+
+func TestLinuxVNCManagerIsInstalled(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Skipping Linux-specific test")
+	}
+
+	mgr := &LinuxVNCManager{}
+	// Should not panic regardless of whether x11vnc is actually installed
+	_ = mgr.IsInstalled()
+}
+
+func TestLinuxVNCManagerStopIdempotent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Skipping Linux-specific test")
+	}
+
+	mgr := &LinuxVNCManager{}
+	// Stop when nothing is running should not error
+	err := mgr.Stop()
+	if err != nil {
+		t.Errorf("Stop() when nothing running should not error, got: %v", err)
+	}
+}
+
+func TestLinuxVNCManagerPortFallback(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Skipping Linux-specific test")
+	}
+
+	mgr := &LinuxVNCManager{}
+	// Port() should return a value without panicking
+	port := mgr.Port()
+	// When no VNC server is running, it should still return the default port
+	if port < 0 {
+		t.Errorf("Port() returned negative value: %d", port)
+	}
+}
+
+func TestLinuxVNCManagerConfigureValidation(t *testing.T) {
+	mgr := &LinuxVNCManager{}
+
+	// Invalid port should be rejected
+	err := mgr.Configure("testpass", 0)
+	if err == nil {
+		t.Error("Configure() with port 0 should return error")
+	}
+
+	err = mgr.Configure("testpass", -1)
+	if err == nil {
+		t.Error("Configure() with port -1 should return error")
+	}
+
+	err = mgr.Configure("testpass", 70000)
+	if err == nil {
+		t.Error("Configure() with port 70000 should return error")
+	}
+}
+
+func TestLinuxVNCManagerConfigureSetsPort(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Skipping Linux-specific test")
+	}
+
+	mgr := &LinuxVNCManager{}
+
+	// Configure with valid port sets the internal port field
+	// (even if x11vnc is not installed, the port validation + storage should work)
+	// On CI without x11vnc, this will fail at the storepasswd step
+	err := mgr.Configure("testpass", 5901)
+	if err != nil {
+		// Expected when x11vnc is not installed
+		t.Logf("Configure() returned error (expected without x11vnc): %v", err)
+	} else {
+		if mgr.port != 5901 {
+			t.Errorf("Configure() did not set port to 5901, got %d", mgr.port)
+		}
+	}
+}
+
+func TestEmbeddedVNCPort(t *testing.T) {
+	// Initial state: no embedded VNC
+	ClearEmbeddedVNCPort()
+	if EmbeddedVNCPort() != 0 {
+		t.Errorf("EmbeddedVNCPort() after clear = %d, want 0", EmbeddedVNCPort())
+	}
+
+	// Set embedded port
+	SetEmbeddedVNCPort(5900)
+	if EmbeddedVNCPort() != 5900 {
+		t.Errorf("EmbeddedVNCPort() after set = %d, want 5900", EmbeddedVNCPort())
+	}
+
+	// Clear again
+	ClearEmbeddedVNCPort()
+	if EmbeddedVNCPort() != 0 {
+		t.Errorf("EmbeddedVNCPort() after second clear = %d, want 0", EmbeddedVNCPort())
+	}
+}
