@@ -211,14 +211,25 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Log macOS developer toolchains (detected by DetectNodeCapabilities above)
-	if macTools := capabilities.DetectMacOSToolchains(); len(macTools) > 0 {
-		for _, tool := range macTools {
-			desc := tool.Name
-			if tool.Version != "" {
-				desc += " " + tool.Version
+	// Log macOS developer toolchains (tags already added by DetectNodeCapabilities)
+	for _, tag := range nodeCaps.Tags {
+		switch {
+		case strings.HasPrefix(tag, "tool:xcode:"):
+			fmt.Printf("   - Toolchain: Xcode %s\n", strings.TrimPrefix(tag, "tool:xcode:"))
+		case tag == "tool:xcode":
+			// Only log if there's no versioned tag (avoid duplicate)
+			hasVersion := false
+			for _, t := range nodeCaps.Tags {
+				if strings.HasPrefix(t, "tool:xcode:") {
+					hasVersion = true
+					break
+				}
 			}
-			fmt.Printf("   - Toolchain: %s (%s)\n", desc, tool.Path)
+			if !hasVersion {
+				fmt.Println("   - Toolchain: Xcode")
+			}
+		case tag == "tool:android-sdk":
+			fmt.Println("   - Toolchain: Android SDK")
 		}
 	}
 
