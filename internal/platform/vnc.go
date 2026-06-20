@@ -463,6 +463,37 @@ func (l *LinuxVNCManager) Install() error {
 	return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
 }
 
+// uninstallCmd returns the package manager command name and arguments for
+// uninstalling x11vnc on the given package manager. This is a pure function
+// extracted for testability -- it never executes anything.
+func uninstallCmd(pkgMgr string) (name string, args []string) {
+	switch pkgMgr {
+	case "apt-get":
+		return "apt-get", []string{"remove", "-y", "-qq", "x11vnc"}
+	case "dnf":
+		return "dnf", []string{"remove", "-y", "x11vnc"}
+	case "yum":
+		return "yum", []string{"remove", "-y", "x11vnc"}
+	case "pacman":
+		return "pacman", []string{"-R", "--noconfirm", "x11vnc"}
+	case "zypper":
+		return "zypper", []string{"remove", "-y", "x11vnc"}
+	default:
+		return "", nil
+	}
+}
+
+// detectPackageManager returns the name of the first available package
+// manager on the system, or "" if none is found.
+func detectPackageManager() string {
+	for _, pm := range []string{"apt-get", "dnf", "yum", "pacman", "zypper"} {
+		if _, err := exec.LookPath(pm); err == nil {
+			return pm
+		}
+	}
+	return ""
+}
+
 func (l *LinuxVNCManager) Uninstall() error {
 	// Stop any running x11vnc process first (best-effort)
 	if l.IsRunning() {
@@ -486,44 +517,20 @@ func (l *LinuxVNCManager) Uninstall() error {
 		return exec.Command(name, args...)
 	}
 
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		cmd := sudoPrefix("apt-get", "remove", "-y", "-qq", "x11vnc")
-		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to uninstall x11vnc via apt: %w", err)
-		}
-	} else if _, err := exec.LookPath("dnf"); err == nil {
-		cmd := sudoPrefix("dnf", "remove", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to uninstall x11vnc via dnf: %w", err)
-		}
-	} else if _, err := exec.LookPath("yum"); err == nil {
-		cmd := sudoPrefix("yum", "remove", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to uninstall x11vnc via yum: %w", err)
-		}
-	} else if _, err := exec.LookPath("pacman"); err == nil {
-		cmd := sudoPrefix("pacman", "-R", "--noconfirm", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to uninstall x11vnc via pacman: %w", err)
-		}
-	} else if _, err := exec.LookPath("zypper"); err == nil {
-		cmd := sudoPrefix("zypper", "remove", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to uninstall x11vnc via zypper: %w", err)
-		}
-	} else {
+	pkgMgr := detectPackageManager()
+	if pkgMgr == "" {
 		return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
+	}
+
+	cmdName, cmdArgs := uninstallCmd(pkgMgr)
+	cmd := sudoPrefix(cmdName, cmdArgs...)
+	if pkgMgr == "apt-get" {
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to uninstall x11vnc via %s: %w", pkgMgr, err)
 	}
 
 	// Clean up VNC password file (best-effort)
