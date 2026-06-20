@@ -23,6 +23,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
@@ -128,6 +129,7 @@ func runControlCenter() {
 		},
 		OnConnect: ccOnNetworkConnect,
 		Chat:      buildChatConfig(),
+		Proxmox:   buildProxmoxConfig(),
 	}
 
 	cc := controlcenter.New(cfg)
@@ -1294,4 +1296,32 @@ func ccAutoUpdate() bool {
 	}
 
 	return true
+}
+
+// buildProxmoxConfig checks for saved Proxmox configuration or auto-detects
+// a local Proxmox installation and returns a ProxmoxConfig for the TUI.
+func buildProxmoxConfig() controlcenter.ProxmoxConfig {
+	configDir := platform.ConfigDir()
+
+	// Try saved configuration first
+	if pmxCfg, err := pmx.LoadConfig(configDir); err == nil && pmxCfg != nil && pmxCfg.BaseURL != "" {
+		return controlcenter.ProxmoxConfig{
+			Enabled:  true,
+			BaseURL:  pmxCfg.BaseURL,
+			TokenID:  pmxCfg.TokenID,
+			Secret:   pmxCfg.TokenSecret,
+			NodeName: pmxCfg.NodeName,
+		}
+	}
+
+	// Try auto-detection (checks /etc/pve and pvesh)
+	if pveInfo, err := platform.DetectProxmox(); err == nil && pveInfo.IsInstalled {
+		return controlcenter.ProxmoxConfig{
+			Enabled:  true,
+			BaseURL:  "https://localhost:8006",
+			NodeName: pveInfo.NodeName,
+		}
+	}
+
+	return controlcenter.ProxmoxConfig{}
 }

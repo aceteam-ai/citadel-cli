@@ -15,6 +15,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -46,7 +47,7 @@ type QueueInfo struct {
 type JobRecord struct {
 	ID          string
 	Type        string
-	Status      string    // "success", "failed", "processing"
+	Status      string // "success", "failed", "processing"
 	StartedAt   time.Time
 	CompletedAt time.Time
 	Duration    time.Duration
@@ -106,8 +107,8 @@ type StatusData struct {
 	// Worker status
 	WorkerRunning bool
 	WorkerQueue   string
-	Queues        []QueueInfo  // All subscribed queues
-	RecentJobs    []JobRecord  // Last N jobs processed
+	Queues        []QueueInfo // All subscribed queues
+	RecentJobs    []JobRecord // Last N jobs processed
 
 	// Heartbeat status
 	HeartbeatActive bool
@@ -150,7 +151,7 @@ type PortForward struct {
 
 // serviceStateOverride tracks transitional UI state for a service.
 type serviceStateOverride struct {
-	status   string    // "starting", "stopping", "failed"
+	status   string // "starting", "stopping", "failed"
 	since    time.Time
 	errorMsg string
 }
@@ -340,8 +341,8 @@ func (p *PlaceholderPage) Build(_ *tview.Application) tview.Primitive {
 	return p.view
 }
 
-func (p *PlaceholderPage) OnActivate()                                        {}
-func (p *PlaceholderPage) OnDeactivate()                                      {}
+func (p *PlaceholderPage) OnActivate()                                       {}
+func (p *PlaceholderPage) OnDeactivate()                                     {}
 func (p *PlaceholderPage) HandleInput(event *tcell.EventKey) *tcell.EventKey { return event }
 
 // ControlCenter is the main TUI application and the Dashboard page.
@@ -355,18 +356,18 @@ type ControlCenter struct {
 	refreshFn          func() (StatusData, error)
 	startServiceFn     func(name string) error
 	stopServiceFn      func(name string) error
-	restartServiceFn   func(name string) error     // Restart a service
-	addServiceFn       func(name string) error     // Add a new service to manifest
-	getServicesFn      func() []string             // Get available services
-	getConfiguredFn    func() []string             // Get already configured services
-	getServiceDetailFn func(name string) *ServiceDetailInfo // Get detailed service info
-	getServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
-	deviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
-	worker             WorkerCallbacks             // Worker management callbacks
-	permissions        PermissionsCallbacks        // Gateway permissions callbacks
+	restartServiceFn   func(name string) error                  // Restart a service
+	addServiceFn       func(name string) error                  // Add a new service to manifest
+	getServicesFn      func() []string                          // Get available services
+	getConfiguredFn    func() []string                          // Get already configured services
+	getServiceDetailFn func(name string) *ServiceDetailInfo     // Get detailed service info
+	getServiceLogsFn   func(name string) ([]string, error)      // Get recent service logs
+	deviceAuth         DeviceAuthCallbacks                      // Device authorization callbacks
+	worker             WorkerCallbacks                          // Worker management callbacks
+	permissions        PermissionsCallbacks                     // Gateway permissions callbacks
 	onConnect          func(activityFn func(level, msg string)) // Post-VPN-connect hook
-	authServiceURL     string                      // URL for device auth service
-	nexusURL           string                      // URL for headscale/nexus coordination server
+	authServiceURL     string                                   // URL for device auth service
+	nexusURL           string                                   // URL for headscale/nexus coordination server
 
 	// UI components
 	mainFlex     *tview.Flex
@@ -410,8 +411,9 @@ type ControlCenter struct {
 	consolePage *ConsolePage
 
 	// Chat
-	chatConfig ChatPageConfig // stored from Config; used to lazily create ChatPage
-	chatPage   *ChatPage     // nil until registered in Run
+	chatConfig    ChatPageConfig // stored from Config; used to lazily create ChatPage
+	chatPage      *ChatPage      // nil until registered in Run
+	proxmoxConfig ProxmoxConfig  // Proxmox page config (zero = disabled)
 }
 
 // Pane focus constants
@@ -437,44 +439,54 @@ type DeviceAuthConfig struct {
 
 // DeviceAuthCallbacks holds callbacks for device authorization flow
 type DeviceAuthCallbacks struct {
-	StartFlow   func() (*DeviceAuthConfig, error)                       // Start device auth flow, returns codes
-	PollToken   func(deviceCode string, interval int) (authkey string, err error) // Poll for token
-	Connect     func(authkey string) error                              // Connect with authkey
-	Disconnect  func() error                                            // Disconnect from network
+	StartFlow  func() (*DeviceAuthConfig, error)                                 // Start device auth flow, returns codes
+	PollToken  func(deviceCode string, interval int) (authkey string, err error) // Poll for token
+	Connect    func(authkey string) error                                        // Connect with authkey
+	Disconnect func() error                                                      // Disconnect from network
 }
 
 // WorkerCallbacks holds callbacks for worker management
 type WorkerCallbacks struct {
-	Start       func(activityFn func(level, msg string)) error // Start worker with activity callback
-	Stop        func() error                                    // Stop worker
-	IsRunning   func() bool                                     // Check if worker is running
+	Start     func(activityFn func(level, msg string)) error // Start worker with activity callback
+	Stop      func() error                                   // Stop worker
+	IsRunning func() bool                                    // Check if worker is running
 }
 
 // PermissionsCallbacks holds callbacks for gateway permission management.
 type PermissionsCallbacks struct {
-	Load func() *config.Permissions                 // Load current permissions
-	Save func(p *config.Permissions) error           // Save updated permissions
+	Load func() *config.Permissions        // Load current permissions
+	Save func(p *config.Permissions) error // Save updated permissions
 }
 
 // Config holds control center configuration
 type Config struct {
 	Version            string
-	AuthServiceURL     string                  // URL for device auth service
-	NexusURL           string                  // URL for headscale/nexus coordination server
+	AuthServiceURL     string // URL for device auth service
+	NexusURL           string // URL for headscale/nexus coordination server
 	RefreshFn          func() (StatusData, error)
 	StartServiceFn     func(name string) error
 	StopServiceFn      func(name string) error
-	RestartServiceFn   func(name string) error     // Restart a service
-	AddServiceFn       func(name string) error     // Add a new service to manifest
-	GetServicesFn      func() []string             // Get available services
-	GetConfiguredFn    func() []string             // Get already configured services
-	GetServiceDetailFn func(name string) *ServiceDetailInfo // Get detailed service info
-	GetServiceLogsFn   func(name string) ([]string, error)  // Get recent service logs
-	DeviceAuth         DeviceAuthCallbacks         // Device authorization callbacks
-	Worker             WorkerCallbacks             // Worker management callbacks
-	Permissions        PermissionsCallbacks        // Gateway permissions callbacks
+	RestartServiceFn   func(name string) error                  // Restart a service
+	AddServiceFn       func(name string) error                  // Add a new service to manifest
+	GetServicesFn      func() []string                          // Get available services
+	GetConfiguredFn    func() []string                          // Get already configured services
+	GetServiceDetailFn func(name string) *ServiceDetailInfo     // Get detailed service info
+	GetServiceLogsFn   func(name string) ([]string, error)      // Get recent service logs
+	DeviceAuth         DeviceAuthCallbacks                      // Device authorization callbacks
+	Worker             WorkerCallbacks                          // Worker management callbacks
+	Permissions        PermissionsCallbacks                     // Gateway permissions callbacks
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
-	Chat               ChatPageConfig                          // Chat page configuration (empty = disabled)
+	Chat               ChatPageConfig                           // Chat page configuration (empty = disabled)
+	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
+}
+
+// ProxmoxConfig holds configuration for the Proxmox TUI page.
+type ProxmoxConfig struct {
+	Enabled  bool   // Whether Proxmox integration is enabled (auto-detected or configured)
+	BaseURL  string // Proxmox API URL
+	TokenID  string // API token ID
+	Secret   string // API token secret
+	NodeName string // Proxmox node name (auto-detected if empty)
 }
 
 // New creates a new control center
@@ -494,13 +506,14 @@ func New(cfg Config) *ControlCenter {
 		getConfiguredFn:    cfg.GetConfiguredFn,
 		getServiceDetailFn: cfg.GetServiceDetailFn,
 		getServiceLogsFn:   cfg.GetServiceLogsFn,
-		deviceAuth:      cfg.DeviceAuth,
-		worker:          cfg.Worker,
-		permissions:     cfg.Permissions,
-		onConnect:       cfg.OnConnect,
-		authServiceURL:  cfg.AuthServiceURL,
-		nexusURL:        cfg.NexusURL,
-		chatConfig:      cfg.Chat,
+		deviceAuth:         cfg.DeviceAuth,
+		worker:             cfg.Worker,
+		permissions:        cfg.Permissions,
+		onConnect:          cfg.OnConnect,
+		authServiceURL:     cfg.AuthServiceURL,
+		nexusURL:           cfg.NexusURL,
+		chatConfig:         cfg.Chat,
+		proxmoxConfig:      cfg.Proxmox,
 	}
 }
 
@@ -584,6 +597,20 @@ func (cc *ControlCenter) Run() error {
 	cc.pmgr.Register(NewGatewayPage(gatewayBaseDir), false)
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
+
+	// Proxmox page: conditional on detection or configuration
+	if cc.proxmoxConfig.Enabled {
+		pmxClient := proxmox.NewClient(proxmox.ClientConfig{
+			BaseURL:     cc.proxmoxConfig.BaseURL,
+			TokenID:     cc.proxmoxConfig.TokenID,
+			TokenSecret: cc.proxmoxConfig.Secret,
+		})
+		cc.pmgr.Register(NewProxmoxPage(ProxmoxPageConfig{
+			Client:     pmxClient,
+			NodeName:   cc.proxmoxConfig.NodeName,
+			ActivityFn: cc.AddActivity,
+		}), true)
+	}
 
 	cc.rootView = cc.pmgr.Build()
 	cc.pmgr.SwitchTo(0)
@@ -1401,10 +1428,10 @@ func (cc *ControlCenter) updateAllPanels() {
 
 // Action definitions for the actions table
 type actionDef struct {
-	key   string
-	name  string
-	desc  string
-	fn    func()
+	key  string
+	name string
+	desc string
+	fn   func()
 }
 
 func (cc *ControlCenter) getActions() []actionDef {
