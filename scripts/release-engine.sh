@@ -239,12 +239,23 @@ declare -F hook_post_release &>/dev/null || hook_post_release() { true; }
 run_release() {
   local bump_type="${1:-minor}"
   local dry_run="${DRY_RUN:-false}"
+  local allow_dirty="${ALLOW_DIRTY:-false}"
 
   log "=== Release started: bump=$bump_type dry_run=$dry_run ==="
 
   # ── Step 1: Validate ──────────────────────────────────────────────────
   if ! step_done "validate"; then
     step_msg "Validating prerequisites..."
+
+    # Clean-tree check: catches untracked, modified, and staged changes.
+    # Runs in all modes (including --dry-run) to prevent dirty releases.
+    if [[ "$allow_dirty" != "true" ]]; then
+      if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+        fatal "Working tree is not clean. Commit, stash, or remove untracked files first.\n       Use --allow-dirty to override."
+      fi
+    else
+      warn "Skipping clean-tree check (--allow-dirty)."
+    fi
 
     local current_branch
     current_branch=$(git branch --show-current)
@@ -257,10 +268,6 @@ run_release() {
     fi
 
     if [[ "$dry_run" != "true" ]]; then
-      if ! git diff --quiet HEAD -- 2>/dev/null || [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-        fatal "Working directory has uncommitted changes. Commit or stash first."
-      fi
-
       log_and_info "Pulling latest from origin..."
       git pull --ff-only origin main || fatal "Failed to pull. Resolve conflicts first."
     fi
@@ -458,10 +465,11 @@ engine_main() {
 
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --dry-run)   DRY_RUN=true; shift ;;
-      --status)    show_status; exit 0 ;;
-      --clean)     clear_state; exit 0 ;;
-      --resume)    shift ;; # resume is the default behavior
+      --dry-run)      DRY_RUN=true; shift ;;
+      --allow-dirty)  ALLOW_DIRTY=true; shift ;;
+      --status)       show_status; exit 0 ;;
+      --clean)        clear_state; exit 0 ;;
+      --resume)       shift ;; # resume is the default behavior
       -h|--help)
         echo "Usage: $0 [OPTIONS] [BUMP_TYPE]"
         echo ""
@@ -472,11 +480,12 @@ engine_main() {
         echo "  X.Y.Z      Explicit version"
         echo ""
         echo "Options:"
-        echo "  --dry-run   Preview changes without modifying anything"
-        echo "  --status    Show current release state and last run info"
-        echo "  --resume    Resume a failed release (default behavior)"
-        echo "  --clean     Clear release state and start fresh"
-        echo "  -h, --help  Show this help"
+        echo "  --dry-run       Preview changes without modifying anything"
+        echo "  --allow-dirty   Allow release from a dirty working tree"
+        echo "  --status        Show current release state and last run info"
+        echo "  --resume        Resume a failed release (default behavior)"
+        echo "  --clean         Clear release state and start fresh"
+        echo "  -h, --help      Show this help"
         echo ""
         echo "Project: ${RELEASE_PROJECT_NAME:-unknown}"
         echo "Tag prefix: ${RELEASE_TAG_PREFIX:-v}"
