@@ -39,6 +39,19 @@ func NewMeteringMiddleware(next http.Handler, ledger *Ledger, acet *ACETClient, 
 	}
 }
 
+// WrapHandler returns a new http.Handler that applies metering around the
+// given handler. This is useful when the MeteringMiddleware was created
+// without a next handler (e.g., for use with Server.SetMetering where the
+// handler is determined later by BuildHandler).
+func (m *MeteringMiddleware) WrapHandler(next http.Handler) http.Handler {
+	return &MeteringMiddleware{
+		next:   next,
+		ledger: m.ledger,
+		acet:   m.acet,
+		tier:   m.tier,
+	}
+}
+
 // InProcessStats returns stats accumulated in this process (not from disk).
 func (m *MeteringMiddleware) InProcessStats() (totalIn, totalOut, totalCost, requestCount int) {
 	m.mu.Lock()
@@ -64,8 +77,17 @@ func (m *MeteringMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Peek at the body to check for "stream": true
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err == nil {
-			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			isStream = detectStream(bodyBytes)
+			if isStream {
+				// Inject stream_options.include_usage=true so the upstream
+				// always returns a final chunk with token counts. Without
+				// this, OpenAI-compatible APIs only emit usage when the
+				// client explicitly opts in, leaving streaming requests
+				// un-billed.
+				bodyBytes = injectStreamUsageOption(bodyBytes)
+			}
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
 		}
 	}
 
@@ -231,6 +253,40 @@ func detectStream(body []byte) bool {
 	return req.Stream
 }
 
+// injectStreamUsageOption ensures stream_options.include_usage is true in the
+// request body. OpenAI-compatible APIs only return token usage in streaming
+// responses when the client sets this flag. We inject it so every streaming
+// request is billable.
+func injectStreamUsageOption(body []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+
+	streamOpts := map[string]bool{"include_usage": true}
+	// If the client already set stream_options, merge include_usage into it
+	if existing, ok := obj["stream_options"]; ok {
+		var opts map[string]json.RawMessage
+		if json.Unmarshal(existing, &opts) == nil {
+			val, _ := json.Marshal(true)
+			opts["include_usage"] = val
+			merged, _ := json.Marshal(opts)
+			obj["stream_options"] = merged
+			result, _ := json.Marshal(obj)
+			return result
+		}
+	}
+
+	// Set stream_options from scratch
+	soBytes, _ := json.Marshal(streamOpts)
+	obj["stream_options"] = soBytes
+	result, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
 func extractConsumerKey(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
@@ -265,22 +321,45 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 }
 
 // streamRecorder intercepts streaming responses to extract usage from SSE chunks.
+// It buffers a partial line remainder across Write calls to handle SSE lines
+// that are split across flush boundaries.
 type streamRecorder struct {
 	http.ResponseWriter
-	flusher http.Flusher
-	usage   openAIUsage
+	flusher   http.Flusher
+	usage     openAIUsage
+	remainder []byte // partial line carried across Write boundaries
 }
 
 func (s *streamRecorder) Write(b []byte) (int, error) {
+	// Prepend any remainder from the previous Write
+	data := b
+	if len(s.remainder) > 0 {
+		data = append(s.remainder, b...)
+		s.remainder = nil
+	}
+
 	// Parse SSE lines from the chunk
-	scanner := bufio.NewScanner(bytes.NewReader(b))
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		if usage, ok := extractUsageFromSSELine(scanner.Bytes()); ok {
 			s.usage = usage
 		}
 	}
 
-	// Always write through to the client
+	// If the data doesn't end with a newline, the last partial line was not
+	// scanned — save it as a remainder for the next Write.
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		// Find the last newline; everything after it is the remainder
+		lastNL := bytes.LastIndexByte(data, '\n')
+		if lastNL >= 0 {
+			s.remainder = append([]byte(nil), data[lastNL+1:]...)
+		} else {
+			// No newline at all — entire chunk is a partial line
+			s.remainder = append([]byte(nil), data...)
+		}
+	}
+
+	// Always write the original bytes through to the client
 	n, err := s.ResponseWriter.Write(b)
 	if s.flusher != nil {
 		s.flusher.Flush()

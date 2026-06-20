@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIsMeteredPath(t *testing.T) {
@@ -375,14 +376,87 @@ func TestMeteringMiddleware_WithACETSettlement(t *testing.T) {
 	select {
 	case <-settleCalled:
 		// success
-	case <-func() <-chan struct{} {
-		ch := make(chan struct{})
-		go func() {
-			// Give it a second
-			<-make(chan struct{})
-		}()
-		return ch
-	}():
-		// We don't wait forever, just check it was called
+	case <-time.After(2 * time.Second):
+		t.Error("timed out waiting for ACET settlement call")
+	}
+}
+
+func TestInjectStreamUsageOption(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantKey  bool
+		wantVal  bool
+	}{
+		{
+			name:    "adds stream_options when absent",
+			input:   `{"model":"gpt-4","stream":true}`,
+			wantKey: true,
+			wantVal: true,
+		},
+		{
+			name:    "preserves existing stream_options and adds include_usage",
+			input:   `{"model":"gpt-4","stream":true,"stream_options":{"other":true}}`,
+			wantKey: true,
+			wantVal: true,
+		},
+		{
+			name:    "preserves include_usage when already true",
+			input:   `{"model":"gpt-4","stream":true,"stream_options":{"include_usage":true}}`,
+			wantKey: true,
+			wantVal: true,
+		},
+		{
+			name:    "overrides include_usage when false",
+			input:   `{"model":"gpt-4","stream":true,"stream_options":{"include_usage":false}}`,
+			wantKey: true,
+			wantVal: true,
+		},
+		{
+			name:  "returns original on invalid JSON",
+			input: `not json`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := injectStreamUsageOption([]byte(tt.input))
+
+			if !tt.wantKey {
+				// Should be unchanged for invalid input
+				if string(result) != tt.input {
+					t.Errorf("expected unchanged input for invalid JSON")
+				}
+				return
+			}
+
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(result, &obj); err != nil {
+				t.Fatalf("result is not valid JSON: %v", err)
+			}
+
+			soRaw, ok := obj["stream_options"]
+			if !ok {
+				t.Fatal("stream_options key missing from result")
+			}
+
+			var so map[string]interface{}
+			if err := json.Unmarshal(soRaw, &so); err != nil {
+				t.Fatalf("stream_options is not a JSON object: %v", err)
+			}
+
+			includeUsage, ok := so["include_usage"]
+			if !ok {
+				t.Fatal("include_usage key missing from stream_options")
+			}
+			if includeUsage != true {
+				t.Errorf("include_usage = %v, want true", includeUsage)
+			}
+
+			// Verify model field is preserved
+			if _, ok := obj["model"]; !ok {
+				t.Error("model field lost during injection")
+			}
+		})
 	}
 }

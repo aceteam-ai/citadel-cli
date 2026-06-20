@@ -76,6 +76,12 @@ type Server struct {
 	// routes are allowed (backwards-compatible with existing callers).
 	permissions *config.Permissions
 
+	// metering optionally wraps the handler chain with ACET token metering.
+	// When non-nil, OpenAI-compatible API requests (/v1/chat/completions,
+	// /v1/completions, /v1/embeddings) are metered and billed. Set via
+	// SetMetering before Start.
+	metering *MeteringMiddleware
+
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a TLS-wrapped tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
@@ -121,6 +127,15 @@ func (s *Server) SetPermissions(p *config.Permissions) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.permissions = p
+}
+
+// SetMetering enables ACET token metering on the gateway. When set,
+// OpenAI-compatible API requests are intercepted to extract token usage
+// and record billing transactions. Must be called before Start.
+func (s *Server) SetMetering(m *MeteringMiddleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metering = m
 }
 
 // categoryForPath returns the permission category for a request path, or ""
@@ -411,10 +426,15 @@ func isWebSocketUpgrade(r *http.Request) bool {
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
-// BuildHandler constructs the full middleware chain (logging + permissions + mux)
-// without starting a server. Useful for testing the middleware stack.
+// BuildHandler constructs the full middleware chain (logging + permissions +
+// optional metering + mux) without starting a server. Useful for testing the
+// middleware stack.
 func (s *Server) BuildHandler() http.Handler {
-	return s.loggingMiddleware(s.permissionMiddleware(s.mux))
+	var handler http.Handler = s.mux
+	if s.metering != nil {
+		handler = s.metering.WrapHandler(handler)
+	}
+	return s.loggingMiddleware(s.permissionMiddleware(handler))
 }
 
 // loggingMiddleware logs all requests.
