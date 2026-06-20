@@ -499,3 +499,22 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.36.0 release
 
 
+---
+
+## v2.41.0 — 2026-06-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 31 |
+| Lines added | +5458 |
+
+**Changes:**
+
+  - feat(tui): Gateway tab with ACET metering proxy (#252)
+  - feat(tui): add Chat tab with Redis-backed messaging (#225) (#251)
+  - feat(tui): add Console tab with embedded PTY (#249)
+  - feat: add install-service/uninstall-service for managed background agent (#238) (#250)
+  - chore: sync generated files after v2.40.0 release
+
+
