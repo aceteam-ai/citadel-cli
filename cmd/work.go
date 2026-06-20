@@ -30,6 +30,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
+	"github.com/aceteam-ai/citadel-cli/internal/websockify"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
@@ -1054,6 +1055,29 @@ func runWork(cmd *cobra.Command, args []string) {
 		statusAddr := fmt.Sprintf("127.0.0.1:%d", workStatusPort)
 		termAddr := fmt.Sprintf("127.0.0.1:%d", workTerminalPort)
 		vncAddr := fmt.Sprintf("127.0.0.1:%d", workGatewayVNC)
+
+		// Start the in-process websockify bridge when a VNC server is detected.
+		// The gateway proxies "/vnc/..." to vncAddr (workGatewayVNC, e.g. 6080)
+		// as a raw byte pump, but x11vnc only speaks raw RFB over TCP on 5900.
+		// This bridge terminates the browser's WebSocket and forwards RFB bytes
+		// to the TCP VNC port, which is the role classic websockify plays.
+		//
+		// Detection happens once at startup: a VNC server launched after
+		// "citadel work" begins will not get a bridge until the next restart.
+		gatewayVNC := platform.GetVNCManager()
+		if gatewayVNC.IsRunning() {
+			bridge := websockify.NewBridge(websockify.Config{
+				ListenPort: workGatewayVNC,
+				VNCAddress: fmt.Sprintf("127.0.0.1:%d", gatewayVNC.Port()),
+				Logger:     Debug,
+			})
+			fmt.Printf("   - VNC bridge: ws://127.0.0.1:%d -> 127.0.0.1:%d (websockify)\n", workGatewayVNC, gatewayVNC.Port())
+			go func() {
+				if err := bridge.Start(ctx); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "   - Warning: VNC bridge error: %v\n", err)
+				}
+			}()
+		}
 
 		// Create gateway server
 		gw := gateway.NewServer(gateway.Config{
