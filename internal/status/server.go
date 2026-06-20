@@ -39,6 +39,8 @@ type Server struct {
 	// install additional routes (e.g., provisioning API) during Start.
 	routeRegistrars []RouteRegistrar
 
+	// extraRoutes is called during Start() to register additional HTTP routes.
+	extraRoutes func(mux *http.ServeMux)
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
@@ -56,6 +58,11 @@ type ServerConfig struct {
 	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
 	// listeners but gated by requireVPNOrAuth.
 	Agent *AgentProviders
+
+	// ExtraRoutes, when set, is called during Start() to register additional
+	// HTTP routes on the status server's mux. This allows external packages
+	// (e.g., workflow) to add endpoints without modifying the status package.
+	ExtraRoutes func(mux *http.ServeMux)
 }
 
 // NewServer creates a new status HTTP server.
@@ -71,6 +78,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		orgID:          cfg.OrgID,
 		enableDesktop:  cfg.EnableDesktop,
 		agent:          cfg.Agent,
+		extraRoutes:    cfg.ExtraRoutes,
 	}
 }
 
@@ -117,6 +125,10 @@ func (s *Server) Start(ctx context.Context) error {
 		reg(mux, s.requireVPNOrAuth)
 	}
 
+	// Allow external packages to register extra routes (e.g., workflow API).
+	if s.extraRoutes != nil {
+		s.extraRoutes(mux)
+	}
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      mux,

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -717,6 +719,17 @@ func runWork(cmd *cobra.Command, args []string) {
 		})
 	}
 
+	// Resolve workspace dir early — needed by both file-operation handlers and
+	// the workflow executor, and the workflow executor must be created before the
+	// status server config (which references it in the ExtraRoutes closure).
+	wsDir := resolveWorkspaceDir()
+
+	// Workflow executor for WORKFLOW_RUN jobs (#105). Created here so the status
+	// server's ExtraRoutes closure and the job handler share a single instance.
+	wfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
+	})
+
 	// Build the agent introspection & control providers (issue #236). These
 	// back the status server's /agent/* endpoints, which the aceteam MCP server
 	// wraps as citadel_* tools. They read the shared workerState and act on the
@@ -737,6 +750,10 @@ func runWork(cmd *cobra.Command, args []string) {
 			Port:    workStatusPort,
 			Version: Version,
 			Agent:   agentProviders,
+			ExtraRoutes: func(mux *http.ServeMux) {
+				wfServer := workflow.NewServer(wfExec)
+				wfServer.RegisterRoutes(mux)
+			},
 		}
 
 		// Wire up desktop API auth if org ID is available
@@ -1155,6 +1172,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		gw.AddUpstream("/api/actions", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/provision", &gateway.Upstream{Address: statusAddr})
+		gw.AddUpstream("/workflow", &gateway.Upstream{Address: statusAddr})
 
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
@@ -1196,6 +1214,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
 		fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
+		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
@@ -1230,11 +1249,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Create handlers with optional workspace for file-operation jobs.
-	wsDir := resolveWorkspaceDir()
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		WorkspaceDir: wsDir,
 		ConfigDir:    workConfigDir,
 	})
+	handlers = append(handlers, workflow.NewHandler(wfExec))
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
