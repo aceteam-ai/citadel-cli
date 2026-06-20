@@ -234,6 +234,102 @@ func TestBridgeStartAndShutdown(t *testing.T) {
 	}
 }
 
+func TestDialVNCWithRetry_AlreadyListening(t *testing.T) {
+	vncAddr, cleanup := startEchoTCPServer(t)
+	defer cleanup()
+
+	b := NewBridge(Config{VNCAddress: vncAddr})
+	conn, err := b.dialVNCWithRetry(context.Background())
+	if err != nil {
+		t.Fatalf("expected successful dial, got: %v", err)
+	}
+	conn.Close()
+}
+
+func TestDialVNCWithRetry_BecomesAvailable(t *testing.T) {
+	// Allocate a port, close it, then re-listen after a delay
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		newLn, err := net.Listen("tcp", addr)
+		if err != nil {
+			return
+		}
+		defer newLn.Close()
+		for {
+			conn, err := newLn.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	b := NewBridge(Config{VNCAddress: addr})
+	conn, err := b.dialVNCWithRetry(context.Background())
+	if err != nil {
+		t.Fatalf("expected successful dial after retry, got: %v", err)
+	}
+	conn.Close()
+}
+
+func TestDialVNCWithRetry_Timeout(t *testing.T) {
+	// Port that nothing will ever listen on
+	b := NewBridge(Config{VNCAddress: "127.0.0.1:59995"})
+	start := time.Now()
+	_, err := b.dialVNCWithRetry(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	// Should take approximately 5 seconds (the maxWait constant)
+	if elapsed < 4*time.Second || elapsed > 10*time.Second {
+		t.Errorf("retry took %v, expected ~5s", elapsed)
+	}
+}
+
+func TestDialVNCWithRetry_ContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	b := NewBridge(Config{VNCAddress: "127.0.0.1:59994"})
+	_, err := b.dialVNCWithRetry(ctx)
+	if err == nil {
+		t.Fatal("expected error on cancelled context")
+	}
+}
+
+func TestBridgeDialFailureWithRetry(t *testing.T) {
+	// Point at a port nothing is listening on. With retry, the bridge
+	// tries for ~5s before closing the WebSocket.
+	b := NewBridge(Config{VNCAddress: "127.0.0.1:59993"})
+	srv := httptest.NewServer(b.Handler())
+	defer srv.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(srv.URL), nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+
+	// The bridge should close the connection after retries exhaust.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected connection to close after dial failure with retry")
+	}
+}
+
 func TestCheckOrigin(t *testing.T) {
 	cases := []struct {
 		origin string

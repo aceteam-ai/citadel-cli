@@ -129,12 +129,19 @@ func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	tcp, err := net.DialTimeout("tcp", b.cfg.VNCAddress, 10*time.Second)
+	// Retry VNC dial with exponential backoff. The VNC server may not be
+	// running yet when the browser connects (e.g. VNC started after
+	// "citadel work"), so we retry for up to ~5s before giving up.
+	tcp, err := b.dialVNCWithRetry(r.Context())
 	if err != nil {
-		b.logf("websockify: dial %s failed: %v", b.cfg.VNCAddress, err)
+		b.logf("websockify: dial %s failed after retries: %v", b.cfg.VNCAddress, err)
+		closeMsg := fmt.Sprintf("VNC server at %s not reachable: %v", b.cfg.VNCAddress, err)
+		if len(closeMsg) > 123 { // WebSocket close reason max is 123 bytes
+			closeMsg = closeMsg[:123]
+		}
 		_ = ws.WriteControl(
 			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "vnc dial failed"),
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, closeMsg),
 			time.Now().Add(time.Second),
 		)
 		return
@@ -143,6 +150,41 @@ func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	b.logf("websockify: bridging connection to %s", b.cfg.VNCAddress)
 	pump(ws, tcp, b.logf)
+}
+
+// dialVNCWithRetry attempts to connect to the VNC server with exponential
+// backoff. It retries up to 5 seconds with intervals starting at 200ms.
+func (b *Bridge) dialVNCWithRetry(ctx context.Context) (net.Conn, error) {
+	const maxWait = 5 * time.Second
+	deadline := time.Now().Add(maxWait)
+	interval := 200 * time.Millisecond
+	maxInterval := 1 * time.Second
+	var lastErr error
+
+	for {
+		conn, err := net.DialTimeout("tcp", b.cfg.VNCAddress, 2*time.Second)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			return nil, lastErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled while waiting for VNC: %w", lastErr)
+		case <-time.After(interval):
+		}
+
+		if interval < maxInterval {
+			interval *= 2
+			if interval > maxInterval {
+				interval = maxInterval
+			}
+		}
+	}
 }
 
 // pump copies bytes bidirectionally between a WebSocket connection and a TCP

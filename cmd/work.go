@@ -747,14 +747,17 @@ func runWork(cmd *cobra.Command, args []string) {
 			serverCfg.OrgID = statusOrgID
 		}
 
-		// Auto-register desktop endpoints when VNC is running and auth is available
-		statusVNC := platform.GetVNCManager()
-		if statusVNC.IsRunning() {
+		// Register desktop endpoints when permissions allow and auth is available.
+		// The handlers perform per-request readiness checks, so VNC does not need
+		// to be running at startup -- a VNC server started later will be picked up
+		// automatically without restarting citadel work.
+		permsForDesktop := config.LoadPermissions(platform.ConfigDir())
+		if permsForDesktop.Desktop {
 			if serverCfg.TokenValidator != nil {
 				serverCfg.EnableDesktop = true
-				Debug("VNC detected (port %d), desktop API enabled", statusVNC.Port())
+				Debug("desktop API enabled (per-request VNC readiness checks)")
 			} else {
-				fmt.Fprintln(os.Stderr, "   - ⚠️ VNC is running but desktop API disabled (no org ID for auth)")
+				fmt.Fprintln(os.Stderr, "   - desktop permission granted but API disabled (no org ID for auth)")
 			}
 		}
 
@@ -779,7 +782,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					}
 				}
 				if serverCfg.EnableDesktop {
-					fmt.Printf("   - Status server: http://localhost:%d (desktop API enabled, VNC port %d)\n", workStatusPort, statusVNC.Port())
+					fmt.Printf("   - Status server: http://localhost:%d (desktop API enabled)\n", workStatusPort)
 				} else {
 					fmt.Printf("   - Status server: http://localhost:%d (auth enabled)\n", workStatusPort)
 				}
@@ -1086,22 +1089,28 @@ func runWork(cmd *cobra.Command, args []string) {
 		termAddr := fmt.Sprintf("127.0.0.1:%d", workTerminalPort)
 		vncAddr := fmt.Sprintf("127.0.0.1:%d", workGatewayVNC)
 
-		// Start the in-process websockify bridge when a VNC server is detected.
+		// Start the in-process websockify bridge when desktop permissions allow.
 		// The gateway proxies "/vnc/..." to vncAddr (workGatewayVNC, e.g. 6080)
 		// as a raw byte pump, but x11vnc only speaks raw RFB over TCP on 5900.
 		// This bridge terminates the browser's WebSocket and forwards RFB bytes
 		// to the TCP VNC port, which is the role classic websockify plays.
 		//
-		// Detection happens once at startup: a VNC server launched after
-		// "citadel work" begins will not get a bridge until the next restart.
-		gatewayVNC := platform.GetVNCManager()
-		if gatewayVNC.IsRunning() {
+		// The bridge is started unconditionally when desktop is permitted.
+		// Per-connection VNC dial uses retry with backoff, so a VNC server
+		// started after "citadel work" is picked up automatically.
+		gatewayPerms := config.LoadPermissions(platform.ConfigDir())
+		if gatewayPerms.Desktop {
+			gatewayVNC := platform.GetVNCManager()
+			vncPort := gatewayVNC.Port()
+			if vncPort == 0 {
+				vncPort = platform.DefaultVNCPort
+			}
 			bridge := websockify.NewBridge(websockify.Config{
 				ListenPort: workGatewayVNC,
-				VNCAddress: fmt.Sprintf("127.0.0.1:%d", gatewayVNC.Port()),
+				VNCAddress: fmt.Sprintf("127.0.0.1:%d", vncPort),
 				Logger:     Debug,
 			})
-			fmt.Printf("   - VNC bridge: ws://127.0.0.1:%d -> 127.0.0.1:%d (websockify)\n", workGatewayVNC, gatewayVNC.Port())
+			fmt.Printf("   - VNC bridge: ws://127.0.0.1:%d -> 127.0.0.1:%d (websockify, lazy connect)\n", workGatewayVNC, vncPort)
 			go func() {
 				if err := bridge.Start(ctx); err != nil && err != context.Canceled {
 					fmt.Fprintf(os.Stderr, "   - Warning: VNC bridge error: %v\n", err)
