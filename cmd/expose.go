@@ -26,6 +26,9 @@ var servicePorts = map[string]int{
 	"ollama":   11434,
 	"llamacpp": 8080,
 	"lmstudio": 1234,
+	// wechat is the per-person WeChat REST API (WeChatFerry on a Windows VM).
+	// Shares :8000 with vllm; the map is keyed by name so both coexist.
+	"wechat": 8000,
 }
 
 var exposeCmd = &cobra.Command{
@@ -96,7 +99,7 @@ func getExposePort(args []string) int {
 		port, ok := servicePorts[exposeService]
 		if !ok {
 			fmt.Fprintf(os.Stderr, "Error: unknown service '%s'\n", exposeService)
-			fmt.Fprintln(os.Stderr, "Known services: vllm, ollama, llamacpp, lmstudio")
+			fmt.Fprintln(os.Stderr, "Known services: vllm, ollama, llamacpp, lmstudio, wechat")
 			os.Exit(1)
 		}
 		return port
@@ -318,7 +321,7 @@ func checkServicePort(ip string, port int, serviceName string) {
 
 func init() {
 	rootCmd.AddCommand(exposeCmd)
-	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Show access info for a known service (vllm, ollama, llamacpp, lmstudio)")
+	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Show access info for a known service (vllm, ollama, llamacpp, lmstudio, wechat)")
 	exposeCmd.Flags().BoolVar(&exposePeers, "peers", false, "Show services available on all network peers")
 	exposeCmd.Flags().BoolVar(&exposeCheck, "check", false, "Verify service reachability (can combine with --peers)")
 	exposeCmd.Flags().BoolVar(&exposeList, "list", false, "List currently exposed ports (deprecated)")

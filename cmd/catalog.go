@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -278,6 +279,12 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 
 	result, err := catalog.Install(name, servicesDir, overrides)
 	if err != nil {
+		// Host-provisioned services (no compose.yml, e.g. the Windows-only
+		// "wechat" microservice) cannot be installed as a container; print
+		// provisioning guidance instead of a confusing error.
+		if errors.Is(err, catalog.ErrNotInstallable) {
+			return printNotInstallableGuidance(name)
+		}
 		return fmt.Errorf("install failed: %w", err)
 	}
 
@@ -294,6 +301,37 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\nTo start the service:\n")
 	fmt.Printf("  citadel run %s\n", result.Name)
 
+	return nil
+}
+
+// printNotInstallableGuidance explains that a host-provisioned service (no
+// compose.yml) cannot be installed by the CLI and points the operator at its
+// provisioning steps and per-person enablement flow.
+func printNotInstallableGuidance(name string) error {
+	manifest, mErr := catalog.LoadServiceManifest(name)
+
+	bold := color.New(color.Bold)
+	fmt.Printf("\n'%s' is host-provisioned and is not installable via the catalog.\n", name)
+	fmt.Println("It is catalogued for discoverability only (no compose.yml / not a container).")
+
+	if mErr == nil && manifest.Homepage != "" {
+		fmt.Println()
+		bold.Print("Provision it from: ")
+		fmt.Println(manifest.Homepage)
+	}
+
+	if name == "wechat" {
+		fmt.Println()
+		bold.Println("Per-person enablement flow:")
+		fmt.Println("  1. Provision a Windows VM:  provision/bootstrap.ps1")
+		fmt.Println("  2. QR login to WeChat (scan on PVE console / RDP, confirm on phone)")
+		fmt.Println("  3. Start the service:       provision/start-service.ps1  (uvicorn :8000)")
+		fmt.Println("  4. The Citadel worker on this node already relays to the VM over the LAN")
+		fmt.Println("  5. Bind + route per person: wechat_connect(api_url, api_key, node_id)")
+		fmt.Println("     (node_id is this node's Headscale numeric ID from terminal_list_nodes)")
+	}
+
+	fmt.Printf("\nSee 'citadel service catalog info %s' for ports, health check, and config.\n", name)
 	return nil
 }
 
