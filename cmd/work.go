@@ -1347,6 +1347,7 @@ type DeviceConfig struct {
 	DeviceAPIToken string `yaml:"device_api_token"`
 	APIBaseURL     string `yaml:"api_base_url"`
 	OrgID          string `yaml:"org_id"`
+	OrgName        string `yaml:"org_name"`
 	RedisURL       string `yaml:"redis_url"`
 	UserEmail      string `yaml:"user_email"`
 	UserName       string `yaml:"user_name"`
