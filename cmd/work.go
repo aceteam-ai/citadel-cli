@@ -294,6 +294,12 @@ func runWork(cmd *cobra.Command, args []string) {
 			BlockMs:       workPollMs,
 			MaxAttempts:   workMaxRetries,
 			DebugFunc:     Debug,
+			// Route the source's info logs (subscribed queues, consumer group,
+			// per-node AddQueue) through Log() so they land in latest.log. The
+			// default sink is stdout, which the worker's log file does not
+			// capture -- masking whether the per-node shell stream was actually
+			// subscribed during a live node-routing test (issue #3924).
+			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
 
 		// Connect early so client is available for heartbeat
@@ -396,6 +402,10 @@ func runWork(cmd *cobra.Command, args []string) {
 			ConsumerGroup: workGroup,
 			BlockMs:       workPollMs,
 			MaxAttempts:   workMaxRetries,
+			// Route source info logs (queues, consumer group, per-node AddQueue)
+			// to latest.log instead of stdout so subscription activity is
+			// visible in the worker log (issue #3924).
+			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
 		source = redisSource
 		streamFactory = worker.CreateRedisStreamWriterFactory(ctx, redisSource)
