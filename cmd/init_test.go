@@ -241,6 +241,40 @@ func TestSaveHostnameToConfigRoundTrip(t *testing.T) {
 	}
 }
 
+// TestNodeReclaimBehavior documents the node reclamation behavior during init.
+func TestNodeReclaimBehavior(t *testing.T) {
+	t.Log("Node identity reclamation (issue #159):")
+	t.Log("")
+	t.Log("Problem:")
+	t.Log("  Every live ISO reboot registers a NEW Headscale node.")
+	t.Log("  Old nodes go stale, cluttering the fabric dashboard.")
+	t.Log("")
+	t.Log("Solution:")
+	t.Log("  Before connecting to the network, call the backend to deregister")
+	t.Log("  any existing node with the same hostname in the same org.")
+	t.Log("  The backend's /api/fabric/device-auth/deregister endpoint handles")
+	t.Log("  the Headscale lookup + deletion, scoped to the caller's org.")
+	t.Log("")
+	t.Log("Flow:")
+	t.Log("  1. Device auth succeeds -> we have device_api_token + hostname")
+	t.Log("  2. Call deregister with hostname -> removes stale node if exists")
+	t.Log("  3. Connect to network with new authkey -> registers fresh node")
+	t.Log("")
+	t.Log("Safety:")
+	t.Log("  - Best-effort: reclaim failure does not block init")
+	t.Log("  - Org-scoped: only affects nodes in the caller's organization")
+	t.Log("  - 404 is a no-op: if no stale node exists, nothing happens")
+	t.Log("  - Hostname collision: hostnames are derived from /etc/machine-id")
+	t.Log("    (first 8 chars), so different hardware gets different hostnames.")
+	t.Log("    Generic OS hostnames (debian, ubuntu, etc.) are never registered")
+	t.Log("    because getNodeName() replaces them with citadel-<id>.")
+	t.Log("  - Same hardware: when the same machine reboots, /etc/machine-id")
+	t.Log("    produces the same hostname, so the stale node is correctly")
+	t.Log("    reclaimed. If /etc/machine-id changes between boots (e.g. live")
+	t.Log("    ISO without persistence), the hostname differs and the old node")
+	t.Log("    is left untouched (404 no-op).")
+}
+
 // TestReloginVsNewDeviceFlags documents the difference between --relogin and --new-device.
 func TestReloginVsNewDeviceFlags(t *testing.T) {
 	t.Log("--relogin vs --new-device:")
