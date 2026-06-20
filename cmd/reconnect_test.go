@@ -57,14 +57,27 @@ type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
 
-// TestAttemptVPNRecoveryNoToken verifies recovery fails cleanly without a device token.
-func TestAttemptVPNRecoveryNoToken(t *testing.T) {
+// TestRecoverStaleVPNNoToken verifies recovery fails with a clear error
+// when no device API token is available. Uses recoverStaleVPN directly
+// to avoid live VerifyOrReconnect I/O.
+func TestRecoverStaleVPNNoToken(t *testing.T) {
 	ctx := context.Background()
-	// With nil config, recovery should not panic.
-	// Since there's no network state in the test env, VerifyOrReconnect
-	// returns (false, nil) which means "not logged in" -- the function
-	// will return Connected: false without error.
-	result := attemptVPNRecovery(ctx, nil, "test-node", "https://example.com")
-	// Either way, it should not panic.
-	_ = result
+
+	// nil config: should return error about missing token
+	r1 := recoverStaleVPN(ctx, nil, "test-node", "https://example.com")
+	if r1.Connected {
+		t.Error("expected Connected=false with nil config")
+	}
+	if r1.Err == nil || r1.Err.Error() != "no device API token available for auto-recovery" {
+		t.Errorf("expected token error, got: %v", r1.Err)
+	}
+
+	// empty token: same result
+	r2 := recoverStaleVPN(ctx, &DeviceConfig{DeviceAPIToken: ""}, "test-node", "https://example.com")
+	if r2.Connected {
+		t.Error("expected Connected=false with empty token")
+	}
+	if r2.Err == nil || r2.Err.Error() != "no device API token available for auto-recovery" {
+		t.Errorf("expected token error, got: %v", r2.Err)
+	}
 }

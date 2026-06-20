@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/spf13/cobra"
 )
 
@@ -73,45 +72,18 @@ func runReconnect() {
 	// Wire up diagnostic logging
 	network.SetLogf(Debug)
 
+	var result VPNRecoveryResult
 	if reconnectForce {
-		// Skip verify, go straight to clear + fresh connect
+		// Skip verify, clear state first, then use shared recovery
 		fmt.Println("Forcing VPN reconnect (clearing state)...")
-		spinner := whimsy.NewSimpleSpinner(whimsy.ConnectingMessages)
-		spinner.Start()
-
-		freshKey, err := network.FetchFreshAuthkey(ctx, apiBaseURL, deviceConfig.DeviceAPIToken)
-		if err != nil {
-			spinner.StopWithError(fmt.Sprintf("Failed to fetch authkey: %v", err))
-			os.Exit(1)
-		}
-
 		if err := network.ClearState(); err != nil {
 			Debug("failed to clear state: %v", err)
 		}
-
-		freshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		config := network.ServerConfig{
-			Hostname:   getWorkHostname(),
-			ControlURL: network.DefaultControlURL,
-			StateDir:   network.GetStateDir(),
-			AuthKey:    freshKey,
-		}
-		srv, err := network.Connect(freshCtx, config)
-		if err != nil {
-			spinner.StopWithError(fmt.Sprintf("Reconnect failed: %v", err))
-			os.Exit(1)
-		}
-
-		ip, _ := srv.GetIPv4()
-		spinner.StopWithSuccess("VPN reconnected (fresh state)")
-		fmt.Printf("  IP: %s\n", ip)
-		_ = network.Disconnect()
-		return
+		result = recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+	} else {
+		// Normal flow: verify first, then recover if stale
+		result = attemptVPNRecovery(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
 	}
-
-	// Normal flow: attempt recovery
-	result := attemptVPNRecovery(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
 
 	if result.Connected {
 		fmt.Println("VPN connection recovered successfully.")
@@ -148,15 +120,13 @@ type VPNRecoveryResult struct {
 	Err error
 }
 
-// attemptVPNRecovery tries to recover a stale VPN connection using the
-// device API token. It first verifies the connection is actually broken,
-// then attempts IP-preserving reconnect, and falls back to clear + fresh
-// connect.
-//
-// This is called by both 'citadel work' (automatic recovery) and
-// 'citadel reconnect' (manual recovery) to keep recovery logic in one place.
+// attemptVPNRecovery verifies VPN health first, then recovers if stale.
+// Use this when the caller has NOT already checked VPN state (e.g.
+// 'citadel reconnect'). If the caller has already called
+// VerifyOrReconnect and knows the state is stale, call recoverStaleVPN
+// directly to avoid a redundant ~10s timeout.
 func attemptVPNRecovery(ctx context.Context, deviceConfig *DeviceConfig, hostname, apiBaseURL string) VPNRecoveryResult {
-	// First, verify VPN is actually broken
+	// Verify VPN is actually broken
 	connected, err := network.VerifyOrReconnect(ctx)
 	if err == nil && connected {
 		return VPNRecoveryResult{Connected: true, IPPreserved: true}
@@ -165,6 +135,18 @@ func attemptVPNRecovery(ctx context.Context, deviceConfig *DeviceConfig, hostnam
 		return VPNRecoveryResult{Err: fmt.Errorf("unexpected network error: %w", err)}
 	}
 
+	// State is stale (or no state) -- delegate to core recovery
+	return recoverStaleVPN(ctx, deviceConfig, hostname, apiBaseURL)
+}
+
+// recoverStaleVPN performs the actual VPN recovery: fetch a fresh authkey,
+// try IP-preserving reconnect, fall back to clear + fresh connect.
+//
+// Called by 'citadel work' (which already verified via VerifyOrReconnect)
+// and by attemptVPNRecovery (which verifies first on behalf of
+// 'citadel reconnect'). Also used by the --force path to avoid
+// duplicating fetch+connect logic.
+func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, apiBaseURL string) VPNRecoveryResult {
 	Debug("VPN state is stale, attempting recovery...")
 
 	if deviceConfig == nil || deviceConfig.DeviceAPIToken == "" {

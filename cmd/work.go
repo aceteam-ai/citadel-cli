@@ -450,7 +450,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			apiBaseURL = authServiceURL
 		}
 
-		result := attemptVPNRecovery(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
+		result := recoverStaleVPN(ctx, deviceConfig, getWorkHostname(), apiBaseURL)
 		connected = result.Connected
 		if result.Connected {
 			if result.IPPreserved {
