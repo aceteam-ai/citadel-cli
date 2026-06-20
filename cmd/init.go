@@ -123,12 +123,29 @@ and system user configuration (requires sudo).`,
 		var nodeName string // Declare early for reuse throughout init
 
 		if choice == nexus.NetChoiceDevice {
+			// Preflight: verify API is reachable before starting interactive auth
+			Debug("checking API reachability at %s...", authServiceURL)
+			if err := nexus.CheckAPIReachable(authServiceURL); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Cannot reach AceTeam API: %v\n", err)
+				fmt.Fprintln(os.Stderr, "\nTroubleshooting:")
+				fmt.Fprintln(os.Stderr, "  1. Check your internet connection")
+				fmt.Fprintln(os.Stderr, "  2. Verify DNS resolution: ping aceteam.ai")
+				fmt.Fprintln(os.Stderr, "  3. If behind a proxy, set HTTP_PROXY/HTTPS_PROXY")
+				os.Exit(1)
+			}
+			Debug("API is reachable")
+
 			Debug("starting device authorization flow...")
 			deviceAuthResult, err = runDeviceAuthFlow(authServiceURL, initNewDevice)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
-				fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
-				fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
+				if nexus.IsNetworkError(err) {
+					fmt.Fprintln(os.Stderr, "\nThe API became unreachable during authentication.")
+					fmt.Fprintln(os.Stderr, "Check your network connection and try again.")
+				} else {
+					fmt.Fprintf(os.Stderr, "\nAlternative: Generate an authkey at %s/fabric\n", authServiceURL)
+					fmt.Fprintln(os.Stderr, "Then run: citadel init --authkey <your-key>")
+				}
 				os.Exit(1)
 			}
 
@@ -1010,6 +1027,40 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
+
+	// Verify the write survived by reading back and checking the token is present.
+	// This catches filesystem issues (read-only mounts, quota exhaustion) that
+	// WriteFile might not surface on some platforms.
+	if err := verifyConfigPersisted(globalConfigFile, token.DeviceAPIToken); err != nil {
+		return fmt.Errorf("config verification failed after write: %w", err)
+	}
+
+	return nil
+}
+
+// verifyConfigPersisted reads back the config file and verifies the token
+// is present. This catches silent write failures on read-only or full filesystems.
+func verifyConfigPersisted(configFile, expectedToken string) error {
+	if expectedToken == "" {
+		return nil // Nothing to verify
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return fmt.Errorf("cannot read back config file %s: %w", configFile, err)
+	}
+
+	var readBack struct {
+		DeviceAPIToken string `yaml:"device_api_token"`
+	}
+	if err := yaml.Unmarshal(data, &readBack); err != nil {
+		return fmt.Errorf("config file is corrupted: %w", err)
+	}
+
+	if readBack.DeviceAPIToken != expectedToken {
+		return fmt.Errorf("token mismatch: written token was not persisted (filesystem may be read-only)")
+	}
+
 	return nil
 }
 
