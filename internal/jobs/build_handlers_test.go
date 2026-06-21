@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -56,12 +57,12 @@ func TestBuildIOSArgs(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "scheme only defaults to build action",
+			name:    "scheme only defaults to build action (unsigned)",
 			payload: map[string]string{"scheme": "MyApp"},
-			want:    []string{"-scheme", "MyApp", "build"},
+			want:    []string{"-scheme", "MyApp", "build", "CODE_SIGNING_ALLOWED=NO"},
 		},
 		{
-			name: "full configuration",
+			name: "full configuration (unsigned)",
 			payload: map[string]string{
 				"workspace_file": "MyApp.xcworkspace",
 				"scheme":         "MyApp",
@@ -76,10 +77,11 @@ func TestBuildIOSArgs(t *testing.T) {
 				"-sdk", "iphonesimulator",
 				"-destination", "generic/platform=iOS",
 				"build",
+				"CODE_SIGNING_ALLOWED=NO",
 			},
 		},
 		{
-			name: "project and explicit clean+build action",
+			name: "project and explicit clean+build action (unsigned)",
 			payload: map[string]string{
 				"project": "MyApp.xcodeproj",
 				"scheme":  "MyApp",
@@ -89,15 +91,16 @@ func TestBuildIOSArgs(t *testing.T) {
 				"-project", "MyApp.xcodeproj",
 				"-scheme", "MyApp",
 				"clean", "build",
+				"CODE_SIGNING_ALLOWED=NO",
 			},
 		},
 		{
-			name: "derived data path",
+			name: "derived data path (unsigned)",
 			payload: map[string]string{
 				"scheme":            "MyApp",
 				"derived_data_path": "/tmp/dd",
 			},
-			want: []string{"-scheme", "MyApp", "-derivedDataPath", "/tmp/dd", "build"},
+			want: []string{"-scheme", "MyApp", "-derivedDataPath", "/tmp/dd", "build", "CODE_SIGNING_ALLOWED=NO"},
 		},
 	}
 	for _, tc := range tests {
@@ -117,6 +120,440 @@ func TestBuildIOSArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildIOSArgs_Signing(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:    "unsigned build appends CODE_SIGNING_ALLOWED=NO",
+			payload: map[string]string{"scheme": "MyApp", "sdk": "iphonesimulator"},
+			want: []string{
+				"-scheme", "MyApp",
+				"-sdk", "iphonesimulator",
+				"build",
+				"CODE_SIGNING_ALLOWED=NO",
+			},
+		},
+		{
+			name: "manual signing with all params",
+			payload: map[string]string{
+				"scheme":               "MyApp",
+				"configuration":        "Release",
+				"team_id":              "ABCDE12345",
+				"signing_identity":     "Apple Distribution",
+				"provisioning_profile": "MyApp Distribution",
+				"code_sign_style":      "manual",
+			},
+			want: []string{
+				"-scheme", "MyApp",
+				"-configuration", "Release",
+				"build",
+				"CODE_SIGN_STYLE=Manual",
+				"DEVELOPMENT_TEAM=ABCDE12345",
+				"CODE_SIGN_IDENTITY=Apple Distribution",
+				"PROVISIONING_PROFILE_SPECIFIER=MyApp Distribution",
+			},
+		},
+		{
+			name: "team_id only defaults to manual style",
+			payload: map[string]string{
+				"scheme":  "MyApp",
+				"team_id": "ABCDE12345",
+			},
+			want: []string{
+				"-scheme", "MyApp",
+				"build",
+				"CODE_SIGN_STYLE=Manual",
+				"DEVELOPMENT_TEAM=ABCDE12345",
+			},
+		},
+		{
+			name: "automatic style adds -allowProvisioningUpdates",
+			payload: map[string]string{
+				"scheme":          "MyApp",
+				"team_id":         "ABCDE12345",
+				"code_sign_style": "automatic",
+			},
+			want: []string{
+				"-scheme", "MyApp",
+				"-allowProvisioningUpdates",
+				"build",
+				"CODE_SIGN_STYLE=Automatic",
+				"DEVELOPMENT_TEAM=ABCDE12345",
+			},
+		},
+		{
+			name: "invalid code_sign_style rejected",
+			payload: map[string]string{
+				"scheme":          "MyApp",
+				"team_id":         "ABCDE12345",
+				"code_sign_style": "adhoc",
+			},
+			wantErr: true,
+		},
+		{
+			name: "manual signing without team_id rejected",
+			payload: map[string]string{
+				"scheme":           "MyApp",
+				"signing_identity": "Apple Distribution",
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildIOSArgs(tc.payload)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got args %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("args = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildIOSArchiveArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload map[string]string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:    "missing scheme",
+			payload: map[string]string{"archive_path": "/tmp/MyApp.xcarchive", "team_id": "ABCDE12345"},
+			wantErr: true,
+		},
+		{
+			name:    "missing archive_path",
+			payload: map[string]string{"scheme": "MyApp", "team_id": "ABCDE12345"},
+			wantErr: true,
+		},
+		{
+			name:    "archive requires signing params",
+			payload: map[string]string{"scheme": "MyApp", "archive_path": "/tmp/MyApp.xcarchive"},
+			wantErr: true,
+		},
+		{
+			name: "manual archive",
+			payload: map[string]string{
+				"workspace_file":       "MyApp.xcworkspace",
+				"scheme":               "MyApp",
+				"configuration":        "Release",
+				"archive_path":         "/tmp/MyApp.xcarchive",
+				"team_id":              "ABCDE12345",
+				"signing_identity":     "Apple Distribution",
+				"provisioning_profile": "MyApp Distribution",
+			},
+			want: []string{
+				"-workspace", "MyApp.xcworkspace",
+				"-scheme", "MyApp",
+				"-configuration", "Release",
+				"archive", "-archivePath", "/tmp/MyApp.xcarchive",
+				"CODE_SIGN_STYLE=Manual",
+				"DEVELOPMENT_TEAM=ABCDE12345",
+				"CODE_SIGN_IDENTITY=Apple Distribution",
+				"PROVISIONING_PROFILE_SPECIFIER=MyApp Distribution",
+			},
+		},
+		{
+			name: "automatic archive adds -allowProvisioningUpdates",
+			payload: map[string]string{
+				"scheme":          "MyApp",
+				"archive_path":    "/tmp/MyApp.xcarchive",
+				"team_id":         "ABCDE12345",
+				"code_sign_style": "automatic",
+			},
+			want: []string{
+				"-scheme", "MyApp",
+				"-allowProvisioningUpdates",
+				"archive", "-archivePath", "/tmp/MyApp.xcarchive",
+				"CODE_SIGN_STYLE=Automatic",
+				"DEVELOPMENT_TEAM=ABCDE12345",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildIOSArchiveArgs(tc.payload)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got args %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("args = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildIOSExportArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		payload   map[string]string
+		plistPath string
+		want      []string
+		wantErr   bool
+	}{
+		{
+			name:      "missing archive_path",
+			payload:   map[string]string{"export_path": "/tmp/out"},
+			plistPath: "/tmp/ExportOptions.plist",
+			wantErr:   true,
+		},
+		{
+			name:      "missing export_path",
+			payload:   map[string]string{"archive_path": "/tmp/MyApp.xcarchive"},
+			plistPath: "/tmp/ExportOptions.plist",
+			wantErr:   true,
+		},
+		{
+			name:      "missing plist path",
+			payload:   map[string]string{"archive_path": "/tmp/MyApp.xcarchive", "export_path": "/tmp/out"},
+			plistPath: "",
+			wantErr:   true,
+		},
+		{
+			name:      "valid export",
+			payload:   map[string]string{"archive_path": "/tmp/MyApp.xcarchive", "export_path": "/tmp/out"},
+			plistPath: "/tmp/ExportOptions.plist",
+			want: []string{
+				"-exportArchive",
+				"-archivePath", "/tmp/MyApp.xcarchive",
+				"-exportPath", "/tmp/out",
+				"-exportOptionsPlist", "/tmp/ExportOptions.plist",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildIOSExportArgs(tc.payload, tc.plistPath)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got args %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("args = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildExportOptionsPlist(t *testing.T) {
+	t.Run("invalid export_method rejected", func(t *testing.T) {
+		_, err := buildExportOptionsPlist(map[string]string{"export_method": "carrier", "team_id": "ABCDE12345"})
+		if err == nil {
+			t.Fatal("expected error for invalid export_method")
+		}
+	})
+
+	t.Run("default method development with manual style", func(t *testing.T) {
+		got, err := buildExportOptionsPlist(map[string]string{"team_id": "ABCDE12345"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, want := range []string{
+			"<key>method</key>",
+			"<string>development</string>",
+			"<key>signingStyle</key>",
+			"<string>manual</string>",
+			"<key>teamID</key>",
+			"<string>ABCDE12345</string>",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("plist missing %q\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "provisioningProfiles") {
+			t.Errorf("did not expect provisioningProfiles without bundle id\n%s", got)
+		}
+	})
+
+	t.Run("app-store with provisioning profile mapping", func(t *testing.T) {
+		got, err := buildExportOptionsPlist(map[string]string{
+			"export_method":                  "app-store",
+			"team_id":                        "ABCDE12345",
+			"provisioning_profile":           "MyApp AppStore",
+			"provisioning_profile_bundle_id": "com.example.MyApp",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, want := range []string{
+			"<string>app-store</string>",
+			"<key>provisioningProfiles</key>",
+			"<key>com.example.MyApp</key>",
+			"<string>MyApp AppStore</string>",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("plist missing %q\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("escapes XML metacharacters", func(t *testing.T) {
+		got, err := buildExportOptionsPlist(map[string]string{
+			"team_id":                        "ABCDE12345",
+			"provisioning_profile":           "Profile <A&B>",
+			"provisioning_profile_bundle_id": "com.example.app",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(got, "Profile &lt;A&amp;B&gt;") {
+			t.Errorf("expected escaped profile name\n%s", got)
+		}
+	})
+
+	t.Run("explicit export_signing_style overrides", func(t *testing.T) {
+		got, err := buildExportOptionsPlist(map[string]string{
+			"team_id":              "ABCDE12345",
+			"code_sign_style":      "manual",
+			"export_signing_style": "automatic",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(got, "<string>automatic</string>") {
+			t.Errorf("expected automatic signingStyle\n%s", got)
+		}
+	})
+
+	t.Run("invalid export_signing_style rejected", func(t *testing.T) {
+		_, err := buildExportOptionsPlist(map[string]string{
+			"team_id":              "ABCDE12345",
+			"export_signing_style": "bogus",
+		})
+		if err == nil {
+			t.Fatal("expected error for invalid export_signing_style")
+		}
+	})
+}
+
+func TestIOSBuildHandler_ArchiveExportFlow(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("IOS_BUILD only executes on darwin")
+	}
+
+	// Capture every xcodebuild invocation so we can assert the archive phase runs
+	// before the export phase.
+	var calls [][]string
+	orig := runBuildCommand
+	runBuildCommand = func(workspace, name string, args []string) ([]byte, error) {
+		calls = append(calls, args)
+		return []byte("** OK **"), nil
+	}
+	t.Cleanup(func() { runBuildCommand = orig })
+
+	// Stub the plist writer so no real temp file is needed and we can confirm the
+	// generated content reaches the export args.
+	origWriter := writeExportOptionsPlist
+	var wroteContent string
+	writeExportOptionsPlist = func(content string) (string, func(), error) {
+		wroteContent = content
+		return "/tmp/stub-ExportOptions.plist", func() {}, nil
+	}
+	t.Cleanup(func() { writeExportOptionsPlist = origWriter })
+
+	h := NewIOSBuildHandler("/work")
+	out, err := h.Execute(JobContext{}, jobWith("IOS_BUILD", map[string]string{
+		"scheme":               "MyApp",
+		"configuration":        "Release",
+		"archive_path":         "/tmp/MyApp.xcarchive",
+		"export_path":          "/tmp/out",
+		"export_method":        "app-store",
+		"team_id":              "ABCDE12345",
+		"signing_identity":     "Apple Distribution",
+		"provisioning_profile": "MyApp AppStore",
+		"artifact_path":        "/tmp/out/MyApp.ipa",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 xcodebuild calls (archive, export), got %d", len(calls))
+	}
+	if !containsArg(calls[0], "archive") {
+		t.Errorf("first call should be the archive phase: %v", calls[0])
+	}
+	if !containsArg(calls[1], "-exportArchive") {
+		t.Errorf("second call should be the export phase: %v", calls[1])
+	}
+	if !containsArg(calls[1], "-exportOptionsPlist") {
+		t.Errorf("export phase should reference the plist: %v", calls[1])
+	}
+	if !strings.Contains(wroteContent, "<string>app-store</string>") {
+		t.Errorf("plist content missing method: %s", wroteContent)
+	}
+
+	var res buildResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("output not JSON: %v", err)
+	}
+	if res.ArtifactPath != "/tmp/out/MyApp.ipa" {
+		t.Errorf("artifact_path = %q", res.ArtifactPath)
+	}
+}
+
+func TestIOSBuildHandler_ArchiveFailureStops(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("IOS_BUILD only executes on darwin")
+	}
+	var calls int
+	orig := runBuildCommand
+	runBuildCommand = func(workspace, name string, args []string) ([]byte, error) {
+		calls++
+		return []byte("** ARCHIVE FAILED **"), errors.New("exit status 65")
+	}
+	t.Cleanup(func() { runBuildCommand = orig })
+
+	h := NewIOSBuildHandler("/work")
+	out, err := h.Execute(JobContext{}, jobWith("IOS_BUILD", map[string]string{
+		"scheme":       "MyApp",
+		"archive_path": "/tmp/MyApp.xcarchive",
+		"export_path":  "/tmp/out",
+		"team_id":      "ABCDE12345",
+	}))
+	if err == nil {
+		t.Fatal("expected archive failure to propagate")
+	}
+	if calls != 1 {
+		t.Errorf("export phase must not run after archive failure; calls=%d", calls)
+	}
+	if string(out) != "** ARCHIVE FAILED **" {
+		t.Errorf("output = %q, want raw archive log", string(out))
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildAndroidArgs(t *testing.T) {
