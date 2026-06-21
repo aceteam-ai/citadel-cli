@@ -110,6 +110,7 @@ const (
 	JobTypeFileRead          = "FILE_READ"           // Read a file from the workspace
 	JobTypeFileReadBytes     = "FILE_READ_BYTES"     // Read a file as raw base64-encoded bytes (binary-safe)
 	JobTypeFileWrite         = "FILE_WRITE"          // Write a file to the workspace
+	JobTypeFileWriteBytes    = "FILE_WRITE_BYTES"    // Write a file from raw base64-encoded bytes (binary-safe)
 	JobTypeFileEdit          = "FILE_EDIT"           // Edit (string replace) a file in the workspace
 	JobTypeFileList          = "FILE_LIST"           // List directory contents in the workspace
 	JobTypeFileSearch        = "FILE_SEARCH"         // Search for text across files in the workspace
@@ -129,4 +130,5 @@ const (
 	JobTypeVNCKeys           = "VNC_KEYS"            // Send a key combo to the node's display (issue #4179)
 	JobTypeVNCActions        = "VNC_ACTIONS"         // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
 	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
+	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
 )

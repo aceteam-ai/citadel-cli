@@ -179,9 +179,16 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
 			NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
 			NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileList, listHandler),
 			NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
+			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
+			// Node-local meeting transcription (faster-whisper sidecar). Registered
+			// with the workspace so it can validate audio paths the same way the
+			// file handlers do.
+			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
 		)
 	}
 
