@@ -375,6 +375,11 @@ func (w *WindowsVNCManager) Port() int {
 // The caller (cmd/vnc.go) should display an actionable message to the user.
 var ErrSudoRequired = fmt.Errorf("VNC server installation requires root privileges. Install sudo and run: sudo citadel vnc enable — or run directly as root: su -c 'citadel vnc enable'")
 
+// ErrDarwinSudoRequired is returned when macOS Screen Sharing provisioning
+// needs elevated privileges but sudo is unavailable. The kickstart tool
+// always requires root to change Remote Management configuration.
+var ErrDarwinSudoRequired = fmt.Errorf("macOS Screen Sharing provisioning requires root privileges. Run: sudo citadel vnc enable")
+
 // --- Linux implementation ---
 
 // LinuxVNCManager manages x11vnc on Linux.
@@ -738,45 +743,202 @@ func (l *LinuxVNCManager) effectivePort() int {
 	return DefaultVNCPort
 }
 
-// --- macOS implementation (stub) ---
+// --- macOS implementation ---
 
-// DarwinVNCManager is a stub VNC manager for macOS.
-// macOS has built-in Screen Sharing that can be enabled via system preferences.
+// kickstartPath is the absolute path to Apple Remote Desktop's kickstart
+// tool, which activates and configures the built-in Remote Management /
+// Screen Sharing VNC server. It ships with every macOS install.
+const kickstartPath = "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+
+// DarwinVNCManager provisions the built-in macOS Screen Sharing / Apple
+// Remote Desktop VNC server via the kickstart tool. macOS ships a VNC
+// server as part of Remote Management, so there is nothing to install --
+// it only needs to be activated and configured (which requires root).
 type DarwinVNCManager struct{}
 
 func (d *DarwinVNCManager) IsInstalled() bool {
-	// macOS has built-in Screen Sharing (VNC)
-	return true
+	// The kickstart tool ships with every macOS install. Its presence
+	// means the built-in VNC server is available to be provisioned.
+	_, err := os.Stat(kickstartPath)
+	return err == nil
+}
+
+// kickstartActivateArgs returns the kickstart arguments that activate
+// Remote Management, grant full access privileges, enable VNC legacy mode,
+// set the VNC password, and restart the agent. Extracted as a pure function
+// for testability -- it never executes anything.
+//
+// The flags map to:
+//
+//	-activate              : turn on Remote Management
+//	-configure             : apply the following configuration
+//	-access -on            : enable access
+//	-clientopts -setvnclegacy -vnclegacy yes : allow legacy VNC clients
+//	-clientopts -setvncpw -vncpw <pw>        : set the VNC (RFB) password
+//	-privs -all            : grant all control privileges
+//	-restart -agent        : restart the ARD agent so changes take effect
+func kickstartActivateArgs(password string) []string {
+	return []string{
+		"-activate",
+		"-configure",
+		"-access", "-on",
+		"-clientopts", "-setvnclegacy", "-vnclegacy", "yes",
+		"-clientopts", "-setvncpw", "-vncpw", password,
+		"-restart", "-agent",
+		"-privs", "-all",
+	}
+}
+
+// kickstartDeactivateArgs returns the kickstart arguments that stop the
+// Remote Management agent and disable access. Pure function for testability.
+func kickstartDeactivateArgs() []string {
+	return []string{
+		"-deactivate",
+		"-configure",
+		"-access", "-off",
+	}
+}
+
+// kickstartRestartArgs returns the kickstart arguments that restart the
+// Remote Management agent without changing configuration. Pure function.
+func kickstartRestartArgs() []string {
+	return []string{"-restart", "-agent"}
+}
+
+// darwinCmd builds an *exec.Cmd for the given name+args, prefixing with
+// sudo when the current process is not root. macOS kickstart operations
+// require root; this mirrors the Linux sudoPrefix helper.
+func darwinCmd(needsSudo bool, name string, args ...string) *exec.Cmd {
+	if needsSudo {
+		return exec.Command("sudo", append([]string{name}, args...)...)
+	}
+	return exec.Command(name, args...)
 }
 
 func (d *DarwinVNCManager) Install() error {
-	fmt.Println("VNC server provisioning not yet supported on macOS (use built-in Screen Sharing)")
+	// macOS ships the VNC server (Remote Management); there is nothing to
+	// download or install. Activation/configuration happens in Configure,
+	// which is the step that actually enables Screen Sharing. We verify the
+	// kickstart tool is present so callers get a clear error on unusual
+	// systems where Remote Management has been removed.
+	if !d.IsInstalled() {
+		return fmt.Errorf("macOS Remote Management tool not found at %s", kickstartPath)
+	}
+	fmt.Println("macOS Screen Sharing is built in; no installation required.")
 	return nil
 }
 
 func (d *DarwinVNCManager) Uninstall() error {
-	fmt.Println("VNC server uninstall not yet supported on macOS.")
+	// We cannot uninstall a built-in macOS component, but we can disable it,
+	// which is the meaningful equivalent of "removing" the VNC server.
+	needsSudo := os.Getuid() != 0
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrDarwinSudoRequired
+		}
+	}
+
+	cmd := darwinCmd(needsSudo, kickstartPath, kickstartDeactivateArgs()...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to deactivate macOS Screen Sharing: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	fmt.Println("macOS Screen Sharing disabled.")
 	return nil
 }
 
 func (d *DarwinVNCManager) Configure(password string, port int) error {
-	fmt.Println("VNC server provisioning not yet supported on macOS (use built-in Screen Sharing)")
+	if err := ValidateVNCPort(port); err != nil {
+		return err
+	}
+
+	// macOS Screen Sharing only listens on the standard VNC port (5900).
+	// A custom port is not configurable via kickstart, so warn rather than
+	// silently pretend it took effect.
+	if port != DefaultVNCPort {
+		fmt.Printf("Note: macOS Screen Sharing only supports port %d; ignoring requested port %d.\n", DefaultVNCPort, port)
+	}
+
+	// The RFB password is limited to 8 bytes by the VNC DES scheme.
+	if len(password) > 8 {
+		password = password[:8]
+	}
+
+	needsSudo := os.Getuid() != 0
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrDarwinSudoRequired
+		}
+	}
+
+	// Activating + configuring is a single kickstart invocation. This both
+	// turns on Remote Management and sets the VNC password.
+	cmd := darwinCmd(needsSudo, kickstartPath, kickstartActivateArgs(password)...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to configure macOS Screen Sharing: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
 	return nil
 }
 
 func (d *DarwinVNCManager) Start() error {
-	fmt.Println("VNC server provisioning not yet supported on macOS (use built-in Screen Sharing)")
+	if d.IsRunning() {
+		return nil // Already running, idempotent
+	}
+
+	needsSudo := os.Getuid() != 0
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrDarwinSudoRequired
+		}
+	}
+
+	// Restart the ARD agent to ensure the service is up. Configure() already
+	// activates the service; this handles the case where it was deactivated
+	// or the agent needs to be (re)started.
+	cmd := darwinCmd(needsSudo, kickstartPath, kickstartRestartArgs()...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to start macOS Screen Sharing: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
 	return nil
 }
 
 func (d *DarwinVNCManager) Stop() error {
-	fmt.Println("VNC server provisioning not yet supported on macOS (use built-in Screen Sharing)")
+	needsSudo := os.Getuid() != 0
+	if needsSudo {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return ErrDarwinSudoRequired
+		}
+	}
+
+	cmd := darwinCmd(needsSudo, kickstartPath, kickstartDeactivateArgs()...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to stop macOS Screen Sharing: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
 	return nil
 }
 
 func (d *DarwinVNCManager) IsRunning() bool {
-	// Check if Screen Sharing is active
-	cmd := exec.Command("launchctl", "list", "com.apple.screensharing")
+	// The screensharing launchd service is loaded only when Screen Sharing
+	// is enabled. `launchctl list <label>` exits non-zero when the service
+	// is not present.
+	if exec.Command("launchctl", "list", "com.apple.screensharing").Run() == nil {
+		return true
+	}
+	// Fallback: a VNC server listening on the standard port is also a
+	// positive signal (e.g. a third-party server, or detection edge cases).
+	return darwinPortListening(DefaultVNCPort)
+}
+
+// darwinPortListening reports whether a TCP listener is bound to the given
+// port, using `lsof`. Best-effort: returns false on any error.
+func darwinPortListening(port int) bool {
+	cmd := exec.Command("lsof", "-nP", fmt.Sprintf("-iTCP:%d", port), "-sTCP:LISTEN")
 	return cmd.Run() == nil
 }
 

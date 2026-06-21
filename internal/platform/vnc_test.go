@@ -448,6 +448,178 @@ func TestLinuxVNCManagerConfigureSetsPort(t *testing.T) {
 	}
 }
 
+func TestKickstartActivateArgs(t *testing.T) {
+	args := kickstartActivateArgs("secret12")
+	argStr := strings.Join(args, " ")
+
+	// Core activation flags must be present
+	for _, want := range []string{"-activate", "-configure", "-access", "-on", "-restart", "-agent", "-privs", "-all"} {
+		found := false
+		for _, a := range args {
+			if a == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("kickstartActivateArgs() missing %q in %v", want, args)
+		}
+	}
+
+	// VNC legacy mode and password must be configured
+	if !strings.Contains(argStr, "-setvnclegacy -vnclegacy yes") {
+		t.Errorf("kickstartActivateArgs() should enable VNC legacy mode, got: %s", argStr)
+	}
+	if !strings.Contains(argStr, "-setvncpw -vncpw secret12") {
+		t.Errorf("kickstartActivateArgs() should set the VNC password, got: %s", argStr)
+	}
+
+	// The password must appear immediately after -vncpw
+	for i, a := range args {
+		if a == "-vncpw" {
+			if i+1 >= len(args) || args[i+1] != "secret12" {
+				t.Errorf("kickstartActivateArgs() -vncpw not followed by password, got: %v", args)
+			}
+		}
+	}
+}
+
+func TestKickstartActivateArgsPasswordPositioning(t *testing.T) {
+	// A different password must flow through to the right slot.
+	args := kickstartActivateArgs("abc")
+	idx := -1
+	for i, a := range args {
+		if a == "-vncpw" {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		t.Fatal("kickstartActivateArgs() missing -vncpw flag")
+	}
+	if args[idx+1] != "abc" {
+		t.Errorf("kickstartActivateArgs() password = %q, want %q", args[idx+1], "abc")
+	}
+}
+
+func TestKickstartDeactivateArgs(t *testing.T) {
+	args := kickstartDeactivateArgs()
+	for _, want := range []string{"-deactivate", "-configure", "-access", "-off"} {
+		found := false
+		for _, a := range args {
+			if a == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("kickstartDeactivateArgs() missing %q in %v", want, args)
+		}
+	}
+	// Must not contain activation flags
+	for _, nw := range []string{"-activate", "-on"} {
+		for _, a := range args {
+			if a == nw {
+				t.Errorf("kickstartDeactivateArgs() should not contain %q, got: %v", nw, args)
+			}
+		}
+	}
+}
+
+func TestKickstartRestartArgs(t *testing.T) {
+	args := kickstartRestartArgs()
+	want := []string{"-restart", "-agent"}
+	if len(args) != len(want) {
+		t.Fatalf("kickstartRestartArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("kickstartRestartArgs()[%d] = %q, want %q", i, args[i], want[i])
+		}
+	}
+}
+
+func TestDarwinCmdSudoPrefix(t *testing.T) {
+	// With sudo: the command should be "sudo" and the real command shifted
+	// into the argument list.
+	cmd := darwinCmd(true, kickstartPath, "-activate")
+	if !strings.HasSuffix(cmd.Path, "sudo") && cmd.Args[0] != "sudo" {
+		t.Errorf("darwinCmd(needsSudo=true) should invoke sudo, got args: %v", cmd.Args)
+	}
+	if cmd.Args[1] != kickstartPath {
+		t.Errorf("darwinCmd(needsSudo=true) args[1] = %q, want %q", cmd.Args[1], kickstartPath)
+	}
+	if cmd.Args[2] != "-activate" {
+		t.Errorf("darwinCmd(needsSudo=true) args[2] = %q, want -activate", cmd.Args[2])
+	}
+
+	// Without sudo: the command runs kickstart directly.
+	cmd = darwinCmd(false, kickstartPath, "-activate")
+	if cmd.Args[0] != kickstartPath {
+		t.Errorf("darwinCmd(needsSudo=false) args[0] = %q, want %q", cmd.Args[0], kickstartPath)
+	}
+	if cmd.Args[1] != "-activate" {
+		t.Errorf("darwinCmd(needsSudo=false) args[1] = %q, want -activate", cmd.Args[1])
+	}
+}
+
+func TestKickstartPath(t *testing.T) {
+	// Guard against accidental edits to the well-known ARD kickstart path.
+	const want = "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+	if kickstartPath != want {
+		t.Errorf("kickstartPath = %q, want %q", kickstartPath, want)
+	}
+}
+
+func TestErrDarwinSudoRequired(t *testing.T) {
+	if ErrDarwinSudoRequired == nil {
+		t.Fatal("ErrDarwinSudoRequired is nil")
+	}
+	msg := ErrDarwinSudoRequired.Error()
+	if !strings.Contains(msg, "sudo") {
+		t.Errorf("ErrDarwinSudoRequired should mention sudo, got: %s", msg)
+	}
+	if !strings.Contains(msg, "root privileges") {
+		t.Errorf("ErrDarwinSudoRequired should mention root privileges, got: %s", msg)
+	}
+}
+
+func TestDarwinVNCManagerDetection(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Skipping macOS-specific test")
+	}
+
+	mgr := &DarwinVNCManager{}
+	// Detection methods must not panic regardless of Screen Sharing state.
+	_ = mgr.IsInstalled()
+	_ = mgr.IsRunning()
+	_ = mgr.Port()
+
+	// kickstart ships with macOS, so IsInstalled should be true.
+	if !mgr.IsInstalled() {
+		t.Errorf("DarwinVNCManager.IsInstalled() = false on macOS; kickstart should be present at %s", kickstartPath)
+	}
+
+	// Port() must be consistent with IsRunning().
+	if mgr.IsRunning() {
+		if mgr.Port() != DefaultVNCPort {
+			t.Errorf("DarwinVNCManager.Port() = %d while running, want %d", mgr.Port(), DefaultVNCPort)
+		}
+	} else if mgr.Port() != 0 {
+		t.Errorf("DarwinVNCManager.Port() = %d while not running, want 0", mgr.Port())
+	}
+}
+
+func TestDarwinVNCManagerConfigureValidation(t *testing.T) {
+	mgr := &DarwinVNCManager{}
+	// Invalid ports must be rejected before any kickstart invocation.
+	for _, p := range []int{0, -1, 70000} {
+		if err := mgr.Configure("testpass", p); err == nil {
+			t.Errorf("Configure() with port %d should return error", p)
+		}
+	}
+}
+
 func TestEmbeddedVNCPort(t *testing.T) {
 	// Initial state: no embedded VNC
 	ClearEmbeddedVNCPort()
