@@ -2,12 +2,30 @@ package catalog
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
+
+// ErrNotInstallable is returned by Install when a catalog service has no
+// compose.yml. Such services are host-provisioned (e.g. the Windows-only
+// "wechat" microservice) and are catalogued for discoverability only -- they
+// cannot be installed/run as a container by the CLI. The cmd layer detects
+// this with errors.Is and prints provisioning guidance instead of a crash.
+var ErrNotInstallable = errors.New("service is not installable via the catalog (host-provisioned, no compose.yml)")
+
+// IsInstallable reports whether a catalog service can be installed/run as a
+// container by the CLI, i.e. whether it has a compose.yml. Host-provisioned
+// services (e.g. the Windows-only "wechat" microservice) return false. The cmd
+// layer uses this to print provisioning guidance before doing any work (such as
+// scaffolding node config), rather than after attempting an install.
+func IsInstallable(name string) bool {
+	_, err := GetComposeFile(name)
+	return err == nil
+}
 
 // InstallResult holds the artifacts produced by a catalog install so the caller
 // (cmd layer) can register the service in the node manifest.
@@ -32,6 +50,13 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	manifest, err := LoadServiceManifest(name)
 	if err != nil {
 		return nil, err
+	}
+
+	// 1b. Reject host-provisioned services up front. A service with no
+	// compose.yml (e.g. the Windows-only "wechat" microservice) is catalogued
+	// for discoverability only and cannot be installed/run as a container.
+	if _, err := GetComposeFile(name); err != nil {
+		return nil, ErrNotInstallable
 	}
 
 	// 2. Check architecture compatibility.

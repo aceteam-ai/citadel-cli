@@ -282,6 +282,7 @@ func setupProxyInteractive() (localPort int, peer string, remotePort string, err
 	serviceChoices := []string{
 		"Ollama (11434)",
 		"vLLM (8000)",
+		"WeChat (8000)",
 		"llama.cpp (8080)",
 		"PostgreSQL (5432)",
 		"Redis (6379)",
@@ -296,6 +297,7 @@ func setupProxyInteractive() (localPort int, peer string, remotePort string, err
 	servicePorts := map[string]string{
 		"Ollama (11434)":    "11434",
 		"vLLM (8000)":       "8000",
+		"WeChat (8000)":     "8000",
 		"llama.cpp (8080)":  "8080",
 		"PostgreSQL (5432)": "5432",
 		"Redis (6379)":      "6379",
