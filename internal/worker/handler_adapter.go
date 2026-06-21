@@ -133,6 +133,9 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeSandboxResume, &jobs.SandboxResumeHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCachePull, &jobs.ModelCachePullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCacheEvict, &jobs.ModelCacheEvictHandler{}),
+		NewLegacyHandlerAdapter(JobTypeIOSBuild, jobs.NewIOSBuildHandler(opts.WorkspaceDir)),
+		NewLegacyHandlerAdapter(JobTypeAndroidBuild, jobs.NewAndroidBuildHandler(opts.WorkspaceDir)),
+		NewLegacyHandlerAdapter(JobTypeGomobileBuild, jobs.NewGomobileBuildHandler(opts.WorkspaceDir)),
 	}
 
 	// Register file-operation handlers when a workspace is configured.

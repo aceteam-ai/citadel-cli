@@ -119,4 +119,7 @@ const (
 	JobTypeSandboxResume     = "SANDBOX_RESUME"      // Unpause a Docker container (sandbox resume)
 	JobTypeModelCachePull    = "MODEL_CACHE_PULL"    // Pull model weights into local cache
 	JobTypeModelCacheEvict   = "MODEL_CACHE_EVICT"   // Evict model weights from local cache
+	JobTypeIOSBuild          = "IOS_BUILD"           // Build an iOS app via xcodebuild (macOS only)
+	JobTypeAndroidBuild      = "ANDROID_BUILD"       // Build an Android app via the Gradle wrapper
+	JobTypeGomobileBuild     = "GOMOBILE_BUILD"      // Cross-compile a Go package via gomobile bind
 )

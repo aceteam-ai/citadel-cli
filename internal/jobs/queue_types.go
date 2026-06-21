@@ -23,6 +23,12 @@ const (
 	// Model cache management job types
 	JobTypeModelCachePull  = "MODEL_CACHE_PULL"
 	JobTypeModelCacheEvict = "MODEL_CACHE_EVICT"
+
+	// Mobile build job types (issue #140 Phase 2). iOS and gomobile-iOS builds
+	// require a macOS node with Xcode; Android builds require an Android SDK.
+	JobTypeIOSBuild      = "IOS_BUILD"
+	JobTypeAndroidBuild  = "ANDROID_BUILD"
+	JobTypeGomobileBuild = "GOMOBILE_BUILD"
 )
 
 // Queue names following PR #1105 convention

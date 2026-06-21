@@ -65,5 +65,8 @@ func init() {
 		"SANDBOX_RESUME":     &jobs.SandboxResumeHandler{},
 		"MODEL_CACHE_PULL":   &jobs.ModelCachePullHandler{},
 		"MODEL_CACHE_EVICT":  &jobs.ModelCacheEvictHandler{},
+		"IOS_BUILD":          jobs.NewIOSBuildHandler(""),
+		"ANDROID_BUILD":      jobs.NewAndroidBuildHandler(""),
+		"GOMOBILE_BUILD":     jobs.NewGomobileBuildHandler(""),
 	}
 }
