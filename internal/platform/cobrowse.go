@@ -174,6 +174,17 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	}
 
 	cmd := exec.Command(chrome, args...)
+	// The browser must render on the SAME X display the node's VNC server
+	// (x11vnc) exposes, so the existing /vnc/... stream shows it to the cockpit.
+	// citadel may run under systemd with no DISPLAY in its env; default to :0
+	// (the conventional x11vnc target) so headed Chromium lands on the streamed
+	// display rather than failing to find one. detectLinuxDisplay() reads the
+	// same DISPLAY var, so this keeps the browser and the VNC view in sync.
+	env := os.Environ()
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		env = append(env, "DISPLAY=:0")
+	}
+	cmd.Env = env
 	// Detach stdio; the browser is long-lived and headed on the node display.
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -299,9 +310,13 @@ type cdpTarget struct {
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
 
+// cdpHTTPClient bounds the CDP HTTP probe so a hung DevTools endpoint cannot
+// block the manager mutex (and thus every subsequent co-browse job) forever.
+var cdpHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
 // pickTarget returns the first "page" target's WebSocket URL from /json.
 func pickTarget(debugPort int) (cdpTarget, error) {
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
+	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", debugPort))
 	if err != nil {
 		return cdpTarget{}, err
 	}
