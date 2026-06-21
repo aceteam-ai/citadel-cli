@@ -128,4 +128,5 @@ const (
 	JobTypeVNCType           = "VNC_TYPE"            // Type text on the node's display (issue #4179)
 	JobTypeVNCKeys           = "VNC_KEYS"            // Send a key combo to the node's display (issue #4179)
 	JobTypeVNCActions        = "VNC_ACTIONS"         // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
+	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
 )
