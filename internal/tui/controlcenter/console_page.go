@@ -2,8 +2,8 @@ package controlcenter
 
 import (
 	"fmt"
-	"io"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/console"
@@ -11,9 +11,19 @@ import (
 	"github.com/rivo/tview"
 )
 
-// ConsolePage provides an embedded terminal (PTY) in the TUI.
-// PTY output is rendered through tview's ANSIWriter for basic color
-// support and streamed to web viewers via the Streamer.
+// ConsolePage provides an embedded terminal (PTY) in the TUI with a
+// built-in session multiplexer. Multiple shell sessions can be created
+// and switched between using a Ctrl+B prefix key (like tmux).
+//
+// Key bindings (after Ctrl+B prefix):
+//
+//	c       - Create new session
+//	n       - Next session
+//	p       - Previous session
+//	1-9     - Jump to session N
+//	d       - Close current session
+//	Ctrl+B  - Send literal Ctrl+B to shell
+//	?       - Show help
 //
 // Limitations (v1):
 //   - tview.TextView is line-oriented, not a terminal emulator.
@@ -21,15 +31,16 @@ import (
 //   - Windows is not supported; the page is hidden on that platform.
 type ConsolePage struct {
 	app      *tview.Application
-	view     *tview.TextView
+	rootFlex *tview.Flex
+	tabView  *tview.TextView
+	sessions *sessionManager
 	streamer *console.Streamer
 
-	mu       sync.Mutex
-	pty      *console.PTYSession
-	active   bool
-	started  bool
-	closed   bool // page-level closed flag (set by Close, prevents restart)
-	stopRead chan struct{}
+	mu          sync.Mutex
+	active      bool
+	closed      bool
+	prefixOn    bool // true when Ctrl+B was just pressed, awaiting command key
+	currentView tview.Primitive
 }
 
 // NewConsolePage creates a ConsolePage with an optional Streamer for
@@ -41,7 +52,6 @@ func NewConsolePage(streamer *console.Streamer) *ConsolePage {
 	}
 	return &ConsolePage{
 		streamer: streamer,
-		stopRead: make(chan struct{}),
 	}
 }
 
@@ -50,43 +60,60 @@ func (c *ConsolePage) Title() string { return "Console" }
 
 func (c *ConsolePage) Build(app *tview.Application) tview.Primitive {
 	c.app = app
+	c.sessions = newSessionManager(app)
 
-	c.view = tview.NewTextView().
+	c.tabView = tview.NewTextView().
 		SetDynamicColors(true).
-		SetScrollable(true).
-		SetWordWrap(false).
-		SetChangedFunc(func() {
-			app.Draw()
-		})
-	c.view.SetBorder(true).
-		SetTitle(" Console ").
-		SetTitleAlign(tview.AlignLeft)
+		SetTextAlign(tview.AlignLeft)
+
+	c.rootFlex = tview.NewFlex().SetDirection(tview.FlexRow)
 
 	if runtime.GOOS == "windows" {
-		c.view.SetText("[red]Embedded console is not supported on Windows.[-]")
+		view := tview.NewTextView().SetDynamicColors(true)
+		view.SetBorder(true).SetTitle(" Console ").SetTitleAlign(tview.AlignLeft)
+		view.SetText("[red]Embedded console is not supported on Windows.[-]")
+		c.rootFlex.AddItem(view, 0, 1, true)
 	} else {
-		c.view.SetText("[gray]Press any key to start the console...[-]")
+		// Create the first session automatically
+		idx := c.sessions.createSession(c.streamer)
+		s := c.sessions.getSession(idx)
+		s.view.SetBorder(true).
+			SetTitle(" Console ").
+			SetTitleAlign(tview.AlignLeft)
+
+		c.currentView = s.view
+		c.rootFlex.AddItem(c.tabView, 1, 0, false)
+		c.rootFlex.AddItem(s.view, 0, 1, true)
 	}
 
-	return c.view
+	c.updateTabBar()
+	return c.rootFlex
 }
 
 // OnActivate is called when the Console tab gains focus.
+// Auto-starts the first shell on first activation.
 func (c *ConsolePage) OnActivate() {
 	c.mu.Lock()
 	c.active = true
 	c.mu.Unlock()
+
+	// Auto-start the first session if not yet started
+	s := c.sessions.activeSession()
+	if s != nil && !s.started && !s.closed {
+		_ = c.sessions.startSession(c.sessions.activeIndex())
+	}
 }
 
 // OnDeactivate is called when the Console tab loses focus.
-// The PTY read loop keeps running to avoid blocking the shell.
 func (c *ConsolePage) OnDeactivate() {
 	c.mu.Lock()
 	c.active = false
+	c.prefixOn = false
 	c.mu.Unlock()
 }
 
-// HandleInput captures keystrokes and writes them to the PTY.
+// HandleInput captures keystrokes and routes them through the
+// prefix-key state machine or directly to the active PTY.
 func (c *ConsolePage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	if runtime.GOOS == "windows" {
 		return event
@@ -98,29 +125,192 @@ func (c *ConsolePage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 		return event
 	}
 
-	// Start the PTY on first keypress (or restart after session ended)
-	if !c.started {
-		c.started = true
+	// Prefix key state machine
+	if c.prefixOn {
+		c.prefixOn = false
 		c.mu.Unlock()
-		c.startPTY()
-		return nil // don't forward the activation key to the shell
+		return c.handlePrefixCommand(event)
 	}
 
-	pty := c.pty
+	// Detect Ctrl+B (prefix key)
+	if event.Key() == tcell.KeyCtrlB {
+		c.prefixOn = true
+		c.mu.Unlock()
+		c.showPrefixIndicator()
+		return nil
+	}
 	c.mu.Unlock()
 
-	if pty == nil || pty.IsClosed() {
+	s := c.sessions.activeSession()
+	if s == nil {
 		return event
 	}
 
-	// Convert tcell event to bytes for the PTY
+	// Start session on first keypress if needed (restart after ended)
+	if !s.started {
+		idx := c.sessions.activeIndex()
+		_ = c.sessions.startSession(idx)
+		return nil
+	}
+
+	if s.pty == nil || s.pty.IsClosed() {
+		return event
+	}
+
 	data := keyToBytes(event)
 	if data != nil {
-		_, _ = pty.Write(data)
-		return nil // consumed
+		_, _ = s.pty.Write(data)
+		return nil
 	}
 
 	return event
+}
+
+// handlePrefixCommand processes the key after Ctrl+B.
+func (c *ConsolePage) handlePrefixCommand(event *tcell.EventKey) *tcell.EventKey {
+	// Ctrl+B again: send literal Ctrl+B to shell
+	if event.Key() == tcell.KeyCtrlB {
+		s := c.sessions.activeSession()
+		if s != nil && s.pty != nil && !s.pty.IsClosed() {
+			s.pty.Write([]byte{0x02})
+		}
+		c.clearPrefixIndicator()
+		return nil
+	}
+
+	if event.Key() == tcell.KeyRune {
+		switch event.Rune() {
+		case 'c': // Create new session
+			c.createNewSession()
+			return nil
+		case 'n': // Next session
+			c.sessions.next()
+			c.switchView()
+			return nil
+		case 'p': // Previous session
+			c.sessions.prev()
+			c.switchView()
+			return nil
+		case 'd': // Close current session
+			c.closeCurrentSession()
+			return nil
+		case '?': // Help
+			c.showHelp()
+			return nil
+		}
+
+		// 1-9: jump to session
+		digit := int(event.Rune() - '0')
+		if digit >= 1 && digit <= 9 && digit <= c.sessions.count() {
+			c.sessions.switchTo(digit - 1)
+			c.switchView()
+			return nil
+		}
+	}
+
+	c.clearPrefixIndicator()
+	return nil
+}
+
+// createNewSession adds and starts a new shell session.
+func (c *ConsolePage) createNewSession() {
+	idx := c.sessions.createSession(c.streamer)
+	s := c.sessions.getSession(idx)
+	s.view.SetBorder(true).
+		SetTitle(" Console ").
+		SetTitleAlign(tview.AlignLeft)
+
+	c.sessions.switchTo(idx)
+	_ = c.sessions.startSession(idx)
+	c.switchView()
+}
+
+// closeCurrentSession closes the active session.
+func (c *ConsolePage) closeCurrentSession() {
+	idx := c.sessions.activeIndex()
+	if idx < 0 {
+		return
+	}
+
+	c.sessions.closeSession(idx)
+
+	if c.sessions.count() == 0 {
+		// Create a new session to replace
+		c.createNewSession()
+		return
+	}
+
+	c.switchView()
+}
+
+// switchView replaces the displayed view with the active session's view.
+func (c *ConsolePage) switchView() {
+	s := c.sessions.activeSession()
+	if s == nil {
+		return
+	}
+
+	c.app.QueueUpdateDraw(func() {
+		if c.currentView != nil {
+			c.rootFlex.RemoveItem(c.currentView)
+		}
+		c.currentView = s.view
+		c.rootFlex.AddItem(s.view, 0, 1, true)
+		c.updateTabBar()
+	})
+}
+
+func (c *ConsolePage) updateTabBar() {
+	bar := c.sessions.tabBar()
+	if bar == "" {
+		c.tabView.SetText("")
+	} else {
+		c.tabView.SetText(bar)
+	}
+}
+
+func (c *ConsolePage) showPrefixIndicator() {
+	c.app.QueueUpdateDraw(func() {
+		s := c.sessions.activeSession()
+		if s != nil {
+			s.view.SetTitle(" Console [yellow](Ctrl+B)[-] ")
+		}
+	})
+}
+
+func (c *ConsolePage) clearPrefixIndicator() {
+	c.app.QueueUpdateDraw(func() {
+		s := c.sessions.activeSession()
+		if s != nil {
+			s.view.SetTitle(" Console ")
+		}
+		c.updateTabBar()
+	})
+}
+
+func (c *ConsolePage) showHelp() {
+	c.app.QueueUpdateDraw(func() {
+		s := c.sessions.activeSession()
+		if s == nil {
+			return
+		}
+		help := strings.Join([]string{
+			"",
+			"[yellow::b]Session multiplexer (Ctrl+B prefix)[-:-:-]",
+			"",
+			"  [white]Ctrl+B, c[-]  Create new session",
+			"  [white]Ctrl+B, n[-]  Next session",
+			"  [white]Ctrl+B, p[-]  Previous session",
+			"  [white]Ctrl+B, 1-9[-] Jump to session N",
+			"  [white]Ctrl+B, d[-]  Close current session",
+			"  [white]Ctrl+B, Ctrl+B[-] Send literal Ctrl+B",
+			"  [white]Ctrl+B, ?[-]  This help",
+			"",
+			"[gray]Press any key to dismiss[-]",
+		}, "\n")
+		fmt.Fprintln(tview.ANSIWriter(s.view), help)
+		s.view.SetTitle(" Console ")
+	})
 }
 
 // Streamer returns the Streamer for external access (e.g. wiring into an HTTP handler).
@@ -128,8 +318,7 @@ func (c *ConsolePage) Streamer() *console.Streamer {
 	return c.streamer
 }
 
-// Close shuts down the PTY session and disconnects all stream clients.
-// Safe to call from any goroutine; does not re-enter the mutex during PTY teardown.
+// Close shuts down all PTY sessions and disconnects all stream clients.
 func (c *ConsolePage) Close() {
 	c.mu.Lock()
 	if c.closed {
@@ -137,120 +326,12 @@ func (c *ConsolePage) Close() {
 		return
 	}
 	c.closed = true
-
-	pty := c.pty
-	c.pty = nil
-
-	// Signal the read loop to stop
-	select {
-	case <-c.stopRead:
-		// already closed
-	default:
-		close(c.stopRead)
-	}
 	c.mu.Unlock()
 
-	// Close the PTY outside the lock to avoid deadlock
-	if pty != nil && !pty.IsClosed() {
-		_ = pty.Close()
+	if c.sessions != nil {
+		c.sessions.closeAll()
 	}
 	c.streamer.CloseAll()
-}
-
-// startPTY spawns the shell and starts the read loop.
-func (c *ConsolePage) startPTY() {
-	c.view.Clear()
-
-	session, err := console.NewPTYSession(console.PTYConfig{
-		InitialCols: 80,
-		InitialRows: 24,
-	})
-	if err != nil {
-		c.app.QueueUpdateDraw(func() {
-			c.view.SetText(fmt.Sprintf("[red]Failed to start console: %s[-]", err))
-		})
-		c.mu.Lock()
-		c.started = false
-		c.mu.Unlock()
-		return
-	}
-
-	c.mu.Lock()
-	c.pty = session
-	c.mu.Unlock()
-
-	go c.readLoop(session)
-}
-
-// readLoop continuously reads PTY output and dispatches it to the
-// tview widget and the WebSocket streamer. It runs until the PTY
-// closes, stopRead is signaled, or the shell exits naturally.
-//
-// On natural shell exit (read returns EIO/EOF), readLoop handles
-// teardown: closes the PTY, resets state, and shows the restart prompt.
-// This avoids the need for an onClose callback that would re-enter the mutex.
-func (c *ConsolePage) readLoop(session *console.PTYSession) {
-	buf := make([]byte, 4096)
-	ansiW := tview.ANSIWriter(c.view)
-
-	defer c.onSessionEnd(session)
-
-	for {
-		select {
-		case <-c.stopRead:
-			return
-		default:
-		}
-
-		n, err := session.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-
-			// Stream to WebSocket viewers (always, even when tab is inactive)
-			c.streamer.Broadcast(chunk)
-
-			// Render in the TUI view
-			c.app.QueueUpdate(func() {
-				_, _ = ansiW.Write(chunk)
-				c.view.ScrollToEnd()
-			})
-		}
-		if err != nil {
-			if err != io.EOF {
-				c.app.QueueUpdateDraw(func() {
-					fmt.Fprintf(c.view, "\n[red]Read error: %s[-]", err)
-				})
-			}
-			return
-		}
-	}
-}
-
-// onSessionEnd cleans up after a PTY session ends (natural exit or forced close).
-// It closes the PTY, resets state so a new session can start on keypress,
-// and shows the restart prompt (unless the page itself is being torn down).
-func (c *ConsolePage) onSessionEnd(session *console.PTYSession) {
-	// Close the PTY if it's still open (idempotent)
-	if !session.IsClosed() {
-		_ = session.Close()
-	}
-
-	c.mu.Lock()
-	// Only reset for restart if the page isn't being torn down
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	c.started = false
-	c.pty = nil
-	c.stopRead = make(chan struct{})
-	c.mu.Unlock()
-
-	c.app.QueueUpdateDraw(func() {
-		fmt.Fprintln(tview.ANSIWriter(c.view), "")
-		fmt.Fprintln(c.view, "[yellow]Session ended. Press any key to restart.[-]")
-	})
 }
 
 // keyToBytes converts a tcell key event to bytes suitable for a PTY.
@@ -259,7 +340,6 @@ func keyToBytes(ev *tcell.EventKey) []byte {
 	if ev.Key() == tcell.KeyRune {
 		r := ev.Rune()
 		if ev.Modifiers()&tcell.ModAlt != 0 {
-			// Alt+key: ESC prefix
 			return []byte{0x1b, byte(r)}
 		}
 		buf := make([]byte, 4)

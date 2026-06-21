@@ -20,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/instance"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -80,6 +81,16 @@ func runControlCenter() {
 		os.Exit(1)
 	}
 
+	// Single-instance detection: if another TUI is running, attach to it
+	configDir := platform.ConfigDir()
+	if instance.IsRunning(configDir) {
+		if err := instance.Attach(configDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Attach failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Auto-update on startup
 	if updated := ccAutoUpdate(); updated {
 		// Binary was updated, restart
@@ -88,6 +99,16 @@ func runControlCenter() {
 
 	// Suppress tsnet/tailscale logs to prevent TUI corruption
 	network.SuppressLogs()
+
+	// Start the instance server for attach support
+	instanceServer, _ := instance.Listen(configDir)
+	if instanceServer != nil {
+		_ = instance.WritePID(configDir)
+		defer func() {
+			instanceServer.Close()
+			instance.RemovePID(configDir)
+		}()
+	}
 
 	// Start the demo server in the background
 	startDemoServer()
