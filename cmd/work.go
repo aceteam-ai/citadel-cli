@@ -160,6 +160,10 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Note: Update check is now handled by root.go's PersistentPreRun
 
+	// Prevent macOS from sleeping while worker is active
+	stopCaffeinate := startCaffeinate(ctx)
+	defer stopCaffeinate()
+
 	// Auto-start services from manifest (unless --no-services is set)
 	if !workNoServices {
 		if err := autoStartServices(); err != nil {
@@ -204,6 +208,28 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("\n")
 		if pveInfo.VMCount > 0 || pveInfo.CTCount > 0 {
 			fmt.Printf("   - Guests: %d VMs, %d containers\n", pveInfo.VMCount, pveInfo.CTCount)
+		}
+	}
+
+	// Log macOS developer toolchains (tags already added by DetectNodeCapabilities)
+	for _, tag := range nodeCaps.Tags {
+		switch {
+		case strings.HasPrefix(tag, "tool:xcode:"):
+			fmt.Printf("   - Toolchain: Xcode %s\n", strings.TrimPrefix(tag, "tool:xcode:"))
+		case tag == "tool:xcode":
+			// Only log if there's no versioned tag (avoid duplicate)
+			hasVersion := false
+			for _, t := range nodeCaps.Tags {
+				if strings.HasPrefix(t, "tool:xcode:") {
+					hasVersion = true
+					break
+				}
+			}
+			if !hasVersion {
+				fmt.Println("   - Toolchain: Xcode")
+			}
+		case tag == "tool:android-sdk":
+			fmt.Println("   - Toolchain: Android SDK")
 		}
 	}
 
