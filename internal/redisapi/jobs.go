@@ -31,11 +31,11 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 
 	// Convert the first StreamMessage to a Job
 	msg := resp.Messages[0]
-	return parseStreamMessage(msg)
+	return ParseStreamMessage(msg)
 }
 
-// parseStreamMessage converts a StreamMessage to a Job.
-func parseStreamMessage(msg StreamMessage) (*Job, error) {
+// ParseStreamMessage converts a StreamMessage to a Job.
+func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 	job := &Job{
 		MessageID: msg.ID,
 		JobID:     msg.Data.JobID,

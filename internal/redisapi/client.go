@@ -76,6 +76,11 @@ func (c *Client) debug(format string, args ...any) {
 	}
 }
 
+// BaseURL returns the API base URL.
+func (c *Client) BaseURL() string {
+	return c.baseURL
+}
+
 // WorkerID returns the unique worker identifier.
 func (c *Client) WorkerID() string {
 	return c.workerID

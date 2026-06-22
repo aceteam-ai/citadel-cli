@@ -17,9 +17,9 @@ func TestParseStreamMessage_TopLevelType(t *testing.T) {
 		},
 	}
 
-	job, err := parseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
 	if err != nil {
-		t.Fatalf("parseStreamMessage error: %v", err)
+		t.Fatalf("ParseStreamMessage error: %v", err)
 	}
 	if job.Type != "SHELL_COMMAND" {
 		t.Errorf("Type = %q, want %q", job.Type, "SHELL_COMMAND")
@@ -46,9 +46,9 @@ func TestParseStreamMessage_PayloadFallbackType(t *testing.T) {
 		},
 	}
 
-	job, err := parseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
 	if err != nil {
-		t.Fatalf("parseStreamMessage error: %v", err)
+		t.Fatalf("ParseStreamMessage error: %v", err)
 	}
 	if job.Type != "llm_inference" {
 		t.Errorf("Type = %q, want %q", job.Type, "llm_inference")
@@ -69,9 +69,9 @@ func TestParseStreamMessage_TopLevelTypeWins(t *testing.T) {
 		},
 	}
 
-	job, err := parseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
 	if err != nil {
-		t.Fatalf("parseStreamMessage error: %v", err)
+		t.Fatalf("ParseStreamMessage error: %v", err)
 	}
 	if job.Type != "FILE_READ" {
 		t.Errorf("Type = %q, want %q (top-level should win)", job.Type, "FILE_READ")
@@ -89,9 +89,9 @@ func TestParseStreamMessage_RayID(t *testing.T) {
 		},
 	}
 
-	job, err := parseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
 	if err != nil {
-		t.Fatalf("parseStreamMessage error: %v", err)
+		t.Fatalf("ParseStreamMessage error: %v", err)
 	}
 	if job.RawData["rayId"] != "ray-test-123" {
 		t.Errorf("RawData[rayId] = %v, want %q", job.RawData["rayId"], "ray-test-123")
@@ -108,9 +108,9 @@ func TestParseStreamMessage_InvalidPayload(t *testing.T) {
 		},
 	}
 
-	_, err := parseStreamMessage(msg)
+	_, err := ParseStreamMessage(msg)
 	if err == nil {
-		t.Error("parseStreamMessage should error on invalid JSON payload")
+		t.Error("ParseStreamMessage should error on invalid JSON payload")
 	}
 }
 
@@ -123,9 +123,9 @@ func TestParseStreamMessage_EmptyPayload(t *testing.T) {
 		},
 	}
 
-	job, err := parseStreamMessage(msg)
+	job, err := ParseStreamMessage(msg)
 	if err != nil {
-		t.Fatalf("parseStreamMessage error: %v", err)
+		t.Fatalf("ParseStreamMessage error: %v", err)
 	}
 	if job.Type != "SHELL_COMMAND" {
 		t.Errorf("Type = %q, want %q", job.Type, "SHELL_COMMAND")
