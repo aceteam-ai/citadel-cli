@@ -392,6 +392,27 @@ func (l *LinuxVNCManager) IsInstalled() bool {
 	return err == nil
 }
 
+// installCmd returns the package manager command name and arguments for
+// installing x11vnc on the given package manager. This is a pure function
+// extracted for testability -- it never executes anything. It mirrors
+// uninstallCmd so the install and uninstall paths stay symmetric.
+func installCmd(pkgMgr string) (name string, args []string) {
+	switch pkgMgr {
+	case "apt-get":
+		return "apt-get", []string{"install", "-y", "-qq", "x11vnc"}
+	case "dnf":
+		return "dnf", []string{"install", "-y", "x11vnc"}
+	case "yum":
+		return "yum", []string{"install", "-y", "x11vnc"}
+	case "pacman":
+		return "pacman", []string{"-S", "--noconfirm", "x11vnc"}
+	case "zypper":
+		return "zypper", []string{"install", "-y", "x11vnc"}
+	default:
+		return "", nil
+	}
+}
+
 func (l *LinuxVNCManager) Install() error {
 	if l.IsInstalled() {
 		return nil
@@ -415,57 +436,30 @@ func (l *LinuxVNCManager) Install() error {
 		return exec.Command(name, args...)
 	}
 
-	if _, err := exec.LookPath("apt-get"); err == nil {
+	pkgMgr := detectPackageManager()
+	if pkgMgr == "" {
+		return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
+	}
+
+	// Refresh the package index for apt before installing; other managers
+	// resolve the package without a separate update step.
+	if pkgMgr == "apt-get" {
 		updateCmd := sudoPrefix("apt-get", "update", "-qq")
 		_ = updateCmd.Run()
-
-		installCmd := sudoPrefix("apt-get", "install", "-y", "-qq", "x11vnc")
-		installCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-		installCmd.Stdout = os.Stdout
-		installCmd.Stderr = os.Stderr
-		if err := installCmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via apt: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("dnf"); err == nil {
-		cmd := sudoPrefix("dnf", "install", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via dnf: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("yum"); err == nil {
-		cmd := sudoPrefix("yum", "install", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via yum: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("pacman"); err == nil {
-		cmd := sudoPrefix("pacman", "-S", "--noconfirm", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via pacman: %w", err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("zypper"); err == nil {
-		cmd := sudoPrefix("zypper", "install", "-y", "x11vnc")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to install x11vnc via zypper: %w", err)
-		}
-		return nil
 	}
 
-	return fmt.Errorf("no supported package manager found (tried apt-get, dnf, yum, pacman, zypper)")
+	cmdName, cmdArgs := installCmd(pkgMgr)
+	cmd := sudoPrefix(cmdName, cmdArgs...)
+	if pkgMgr == "apt-get" {
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to install x11vnc via %s: %w", pkgMgr, err)
+	}
+
+	return nil
 }
 
 // uninstallCmd returns the package manager command name and arguments for

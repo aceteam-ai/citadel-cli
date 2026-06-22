@@ -237,6 +237,73 @@ func TestUninstallCmdUnknown(t *testing.T) {
 	}
 }
 
+func TestInstallCmd(t *testing.T) {
+	// Pure function test: verifies the correct install command + args for each
+	// package manager without executing anything (no real apt/x11vnc needed).
+	tests := []struct {
+		pkgMgr   string
+		wantName string
+		wantArgs []string
+	}{
+		{"apt-get", "apt-get", []string{"install", "-y", "-qq", "x11vnc"}},
+		{"dnf", "dnf", []string{"install", "-y", "x11vnc"}},
+		{"yum", "yum", []string{"install", "-y", "x11vnc"}},
+		{"pacman", "pacman", []string{"-S", "--noconfirm", "x11vnc"}},
+		{"zypper", "zypper", []string{"install", "-y", "x11vnc"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.pkgMgr, func(t *testing.T) {
+			name, args := installCmd(tt.pkgMgr)
+			if name != tt.wantName {
+				t.Errorf("installCmd(%q) name = %q, want %q", tt.pkgMgr, name, tt.wantName)
+			}
+			if len(args) != len(tt.wantArgs) {
+				t.Fatalf("installCmd(%q) args count = %d, want %d", tt.pkgMgr, len(args), len(tt.wantArgs))
+			}
+			for i, arg := range args {
+				if arg != tt.wantArgs[i] {
+					t.Errorf("installCmd(%q) args[%d] = %q, want %q", tt.pkgMgr, i, arg, tt.wantArgs[i])
+				}
+			}
+			// Every install command must reference the x11vnc package as the
+			// final argument so we never accidentally install the wrong thing.
+			if len(args) == 0 || args[len(args)-1] != "x11vnc" {
+				t.Errorf("installCmd(%q) last arg = %v, want trailing \"x11vnc\"", tt.pkgMgr, args)
+			}
+		})
+	}
+}
+
+func TestInstallCmdUnknown(t *testing.T) {
+	// Unknown package manager returns empty name and nil args, matching
+	// uninstallCmd's contract so Install() can detect the unsupported case.
+	name, args := installCmd("brew")
+	if name != "" {
+		t.Errorf("installCmd(\"brew\") name = %q, want empty", name)
+	}
+	if args != nil {
+		t.Errorf("installCmd(\"brew\") args = %v, want nil", args)
+	}
+}
+
+func TestInstallUninstallCmdSymmetry(t *testing.T) {
+	// The install and uninstall paths must support exactly the same set of
+	// package managers; a mismatch would mean one path silently fails.
+	for _, pm := range []string{"apt-get", "dnf", "yum", "pacman", "zypper"} {
+		t.Run(pm, func(t *testing.T) {
+			iName, _ := installCmd(pm)
+			uName, _ := uninstallCmd(pm)
+			if iName == "" {
+				t.Errorf("installCmd(%q) returned empty name; uninstall supports it", pm)
+			}
+			if uName == "" {
+				t.Errorf("uninstallCmd(%q) returned empty name; install supports it", pm)
+			}
+		})
+	}
+}
+
 func TestDetectPackageManager(t *testing.T) {
 	// detectPackageManager should return a non-empty string on any Linux CI
 	// or dev machine. We can't know which one, but it should not panic.
