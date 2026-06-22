@@ -44,6 +44,10 @@ type Step struct {
 	// SecretArgs lists indices into Args whose values are sensitive (e.g. a
 	// keychain or certificate password) and must be redacted in dry-run output.
 	SecretArgs []int
+	// AllowedExitCodes lists non-zero exit codes that the runner should treat
+	// as success for this step. For example, `security create-keychain` returns
+	// exit code 48 when the keychain already exists.
+	AllowedExitCodes []int
 	// SrcPath and DstPath apply to StepCopyFile.
 	SrcPath string
 	DstPath string
@@ -129,6 +133,10 @@ func DefaultProfilesDir(home string) string {
 // securityBin is the macOS keychain management binary.
 const securityBin = "security"
 
+// exitCodeKeychainExists is the exit code returned by `security create-keychain`
+// when the keychain file already exists on disk.
+const exitCodeKeychainExists = 48
+
 // BuildIOSSteps turns IOSOptions into an ordered provisioning plan. It performs
 // validation of required fields and existence checks for supplied paths, but it
 // does not execute anything. Returns an error for invalid input.
@@ -169,11 +177,12 @@ func BuildIOSSteps(opts IOSOptions) ([]Step, error) {
 
 	steps := []Step{
 		{
-			Kind:       StepExec,
-			Desc:       fmt.Sprintf("Create build keychain %q (ignored if it already exists)", kc),
-			Name:       securityBin,
-			Args:       []string{"create-keychain", "-p", pw, kc},
-			SecretArgs: []int{2}, // password
+			Kind:             StepExec,
+			Desc:             fmt.Sprintf("Create build keychain %q (ignored if it already exists)", kc),
+			Name:             securityBin,
+			Args:             []string{"create-keychain", "-p", pw, kc},
+			SecretArgs:       []int{2}, // password
+			AllowedExitCodes: []int{exitCodeKeychainExists},
 		},
 		{
 			Kind:       StepExec,

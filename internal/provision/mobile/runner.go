@@ -2,13 +2,19 @@ package mobile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"time"
 )
+
+// exitCoder is satisfied by *exec.ExitError and test fakes, allowing the runner
+// to extract exit codes without depending on concrete exec types.
+type exitCoder interface{ ExitCode() int }
 
 // stepTimeout caps a single provisioning step. sdkmanager --licenses and
 // keychain imports are quick; the cap guards against a hung interactive prompt.
@@ -73,6 +79,11 @@ func (r *Runner) runExec(step Step) error {
 		fmt.Fprintf(r.Out, "%s", out)
 	}
 	if err != nil {
+		var ec exitCoder
+		if errors.As(err, &ec) && len(step.AllowedExitCodes) > 0 && slices.Contains(step.AllowedExitCodes, ec.ExitCode()) {
+			fmt.Fprintf(r.Out, "      (exit code %d tolerated)\n", ec.ExitCode())
+			return nil
+		}
 		return fmt.Errorf("%s failed: %w", step.Name, err)
 	}
 	return nil
