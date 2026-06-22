@@ -21,7 +21,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/recommend"
 )
 
-
 // showListModal displays a modal with a list of items and calls onSelect when one is chosen.
 func (cc *ControlCenter) showListModal(title string, items []string, onSelect func(selected string)) {
 	if len(items) == 0 {
@@ -447,13 +446,15 @@ func (cc *ControlCenter) showExposePortModal() {
 func (cc *ControlCenter) exposePort(port int, description string) {
 	cc.AddActivity("info", fmt.Sprintf("Exposing port %d...", port))
 
-	// Create a listener on the network
-	addr := fmt.Sprintf(":%d", port)
-	listener, err := network.Listen("tcp", addr)
+	// Create a listener on the network, bound to the explicit assigned VPN IP
+	// (not ":port") so peers dialing <vpn_ip>:port are matched by tsnet.
+	// See network.ListenVPN and issue #286.
+	listener, vpnIP, err := network.ListenVPN("tcp", fmt.Sprintf("%d", port))
 	if err != nil {
 		cc.AddActivity("error", fmt.Sprintf("Failed to expose port %d: %v", port, err))
 		return
 	}
+	cc.AddActivity("info", fmt.Sprintf("Port %d exposed on %s", port, vpnIP))
 
 	// Track the forward
 	forward := PortForward{
@@ -857,7 +858,6 @@ func isServiceInstalled() bool {
 	}
 	return false
 }
-
 
 // showNetworkingModal shows a combined panel for Expose Port, Port Forwards, and SSH Access.
 func (cc *ControlCenter) showNetworkingModal() {

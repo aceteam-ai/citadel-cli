@@ -20,11 +20,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
-	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -824,14 +824,18 @@ func runWork(cmd *cobra.Command, args []string) {
 			wfServer.RegisterRoutes(mux, auth)
 		})
 
-		// Add VPN listener so the status server is reachable over the tsnet VPN
+		// Add VPN listener so the status server is reachable over the tsnet VPN.
+		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
+		// and issue #286.
 		if network.IsGlobalConnected() {
-			vpnAddr := fmt.Sprintf(":%d", workStatusPort)
-			if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
-				Debug("status server VPN listener failed (LAN-only): %v", err)
+			vpnPort := fmt.Sprintf("%d", workStatusPort)
+			if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
+				Log("status server VPN listener failed (LAN-only): %v", err)
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Status server VPN listener failed (LAN-only): %v\n", err)
 			} else {
 				statusServer.AddListener(vpnLn)
-				fmt.Printf("   - Status server VPN: http://<vpn-ip>:%d\n", workStatusPort)
+				Log("status server VPN listener on %s:%s", vpnIP, vpnPort)
+				fmt.Printf("   - Status server VPN: http://%s:%d\n", vpnIP, workStatusPort)
 			}
 		}
 
@@ -1069,14 +1073,22 @@ func runWork(cmd *cobra.Command, args []string) {
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
 
-				// Add VPN listener so the terminal server is reachable over the tsnet VPN
+				// Add VPN listener so the terminal server is reachable over the tsnet VPN.
+				// Bind to the explicit assigned VPN IP (not ":port") so inbound
+				// connections from the platform relay (which dials ws://<vpn_ip>:7860)
+				// are matched by tsnet. See network.ListenVPN and issue #286.
 				if network.IsGlobalConnected() {
-					vpnAddr := fmt.Sprintf(":%d", termConfig.Port)
-					if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
-						Debug("terminal server VPN listener failed (LAN-only): %v", err)
+					vpnPort := fmt.Sprintf("%d", termConfig.Port)
+					if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
+						// Loud (not Debug): if the terminal server cannot bind to the
+						// VPN IP it is unreachable for the mobile/relay terminal even
+						// though localhost works, which is hard to diagnose otherwise.
+						Log("terminal server VPN listener failed (LAN-only): %v", err)
+						fmt.Fprintf(os.Stderr, "   - ⚠️ Terminal server VPN listener failed (LAN-only): %v\n", err)
 					} else {
 						termServer.AddListener(vpnLn)
-						fmt.Printf("   - Terminal server VPN: ws://<vpn-ip>:%d/terminal\n", termConfig.Port)
+						Log("terminal server VPN listener on %s:%s", vpnIP, vpnPort)
+						fmt.Printf("   - Terminal server VPN: ws://%s:%d/terminal\n", vpnIP, termConfig.Port)
 					}
 				}
 
@@ -1214,12 +1226,15 @@ func runWork(cmd *cobra.Command, args []string) {
 			WebSocket:   true,
 		})
 
-		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet
+		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet.
+		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
+		// and issue #286.
 		if network.IsGlobalConnected() {
-			vpnAddr := fmt.Sprintf(":%d", workGatewayPort)
-			rawLn, err := network.Listen("tcp", vpnAddr)
+			vpnPort := fmt.Sprintf("%d", workGatewayPort)
+			rawLn, vpnIP, err := network.ListenVPN("tcp", vpnPort)
 			if err != nil {
-				Debug("gateway VPN listener failed (LAN-only): %v", err)
+				Log("gateway VPN listener failed (LAN-only): %v", err)
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Gateway VPN listener failed (LAN-only): %v\n", err)
 			} else {
 				var vpnGwLn net.Listener
 				if gwTLSConfig != nil {
@@ -1228,6 +1243,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					vpnGwLn = rawLn
 				}
 				gw.AddListener(vpnGwLn)
+				Log("gateway VPN listener on %s:%s", vpnIP, vpnPort)
 			}
 		}
 

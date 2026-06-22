@@ -137,6 +137,27 @@ func TestGetGlobalNodeIDWhenNotConnected(t *testing.T) {
 	}
 }
 
+// TestListenVPNWhenNotConnected verifies ListenVPN fails cleanly (no panic,
+// no nil-pointer deref) when there is no global network server. This is the
+// guarded path callers rely on before adding the VPN listener.
+func TestListenVPNWhenNotConnected(t *testing.T) {
+	ClearGlobal()
+
+	ln, ip, err := ListenVPN("tcp", "7860")
+	if err == nil {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		t.Fatal("ListenVPN() = nil error, want error when not connected to network")
+	}
+	if ln != nil {
+		t.Errorf("ListenVPN() listener = %v, want nil on error", ln)
+	}
+	if ip != "" {
+		t.Errorf("ListenVPN() ip = %q, want empty string on error", ip)
+	}
+}
+
 // TestNetworkStatusNodeIDField verifies the NodeID field exists on NetworkStatus.
 func TestNetworkStatusNodeIDField(t *testing.T) {
 	status := NetworkStatus{
