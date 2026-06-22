@@ -614,7 +614,8 @@ func (l *LinuxVNCManager) Start() error {
 }
 
 // buildX11VNCArgs constructs the x11vnc command-line arguments.
-// This is a pure function extracted for testability.
+// Reads $DISPLAY from the environment when an auth file is provided;
+// falls back to ":0" when $DISPLAY is unset.
 func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
 	args := []string{
 		"-rfbauth", passwdFile,
@@ -625,8 +626,13 @@ func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
 
 	if authFile != "" {
 		// An explicit auth file was found -- use it directly.
-		// Also specify -display :0 since we know the target display.
-		args = append([]string{"-display", ":0"}, args...)
+		// Use the DISPLAY env var so we target the correct X11
+		// display (e.g. :1 on GDM3 systems) instead of assuming :0.
+		display := os.Getenv("DISPLAY")
+		if display == "" {
+			display = ":0"
+		}
+		args = append([]string{"-display", display}, args...)
 		args = append(args, "-auth", authFile)
 	} else {
 		// No auth file found -- let x11vnc auto-discover the display
