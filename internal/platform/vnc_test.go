@@ -323,6 +323,7 @@ func TestDefaultVNCPort(t *testing.T) {
 func TestBuildX11VNCArgs(t *testing.T) {
 	tests := []struct {
 		name       string
+		display    string // value to set for $DISPLAY (empty string clears it)
 		passwdFile string
 		port       int
 		authFile   string
@@ -330,7 +331,8 @@ func TestBuildX11VNCArgs(t *testing.T) {
 		notWant    []string
 	}{
 		{
-			name:       "with explicit auth file",
+			name:       "with explicit auth file and DISPLAY :0",
+			display:    ":0",
 			passwdFile: "/home/user/.vnc/passwd",
 			port:       5900,
 			authFile:   "/home/user/.Xauthority",
@@ -338,15 +340,26 @@ func TestBuildX11VNCArgs(t *testing.T) {
 			notWant:    []string{"-find"},
 		},
 		{
-			name:       "with DM auth file",
+			name:       "with DM auth file uses DISPLAY from env (#287)",
+			display:    ":1",
 			passwdFile: "/home/user/.vnc/passwd",
 			port:       5901,
+			authFile:   "/run/user/120/gdm/Xauthority",
+			wantArgs:   []string{"-display", ":1", "-auth", "/run/user/120/gdm/Xauthority", "-rfbport", "5901"},
+			notWant:    []string{"-find"},
+		},
+		{
+			name:       "falls back to :0 when DISPLAY is unset",
+			display:    "",
+			passwdFile: "/home/user/.vnc/passwd",
+			port:       5900,
 			authFile:   "/var/run/lightdm/root/:0",
-			wantArgs:   []string{"-display", ":0", "-auth", "/var/run/lightdm/root/:0", "-rfbport", "5901"},
+			wantArgs:   []string{"-display", ":0", "-auth", "/var/run/lightdm/root/:0"},
 			notWant:    []string{"-find"},
 		},
 		{
 			name:       "auto-discover with -find when no auth file",
+			display:    ":0",
 			passwdFile: "/home/user/.vnc/passwd",
 			port:       5900,
 			authFile:   "",
@@ -355,6 +368,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 		},
 		{
 			name:       "custom port",
+			display:    ":0",
 			passwdFile: "/root/.vnc/passwd",
 			port:       5910,
 			authFile:   "/root/.Xauthority",
@@ -364,6 +378,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DISPLAY", tt.display)
 			args := buildX11VNCArgs(tt.passwdFile, tt.port, tt.authFile)
 			argStr := strings.Join(args, " ")
 
@@ -393,6 +408,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 
 func TestBuildX11VNCArgsOrder(t *testing.T) {
 	// When using -find, it should be the first argument
+	t.Setenv("DISPLAY", ":0")
 	args := buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "")
 	if len(args) == 0 {
 		t.Fatal("buildX11VNCArgs() returned empty args")
