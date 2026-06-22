@@ -39,6 +39,10 @@ type WSClient struct {
 	reconnectBackoff time.Duration
 	maxBackoff       time.Duration
 
+	// Reconnect callbacks fired after a successful reconnection
+	reconnectCallbacks   []func()
+	reconnectCallbacksMu sync.RWMutex
+
 	// Debug callback
 	debugFunc func(format string, args ...any)
 }
@@ -65,6 +69,17 @@ type WSMessage struct {
 	Channels []string       `json:"channels,omitempty"`
 	Message  map[string]any `json:"message,omitempty"`
 	Error    string         `json:"error,omitempty"`
+
+	// Consume-related fields (job delivery protocol)
+	Queue     string            `json:"queue,omitempty"`
+	Queues    []string          `json:"queues,omitempty"`
+	Group     string            `json:"group,omitempty"`
+	Consumer  string            `json:"consumer,omitempty"`
+	Count     int               `json:"count,omitempty"`
+	BlockMs   int               `json:"blockMs,omitempty"`
+	ID        string            `json:"id,omitempty"`        // Stream message ID (job delivery)
+	MessageID string            `json:"messageId,omitempty"` // Ack message ID
+	Data      map[string]string `json:"data,omitempty"`      // Job data fields from stream
 }
 
 // NewWSClient creates a new WebSocket client.
@@ -297,6 +312,18 @@ func (c *WSClient) reconnect() {
 		}
 
 		c.debug("ws: reconnected successfully")
+
+		// Fire reconnect callbacks AFTER releasing connMu to avoid
+		// deadlock (callbacks may call sendMessage which takes RLock).
+		c.reconnectCallbacksMu.RLock()
+		cbs := make([]func(), len(c.reconnectCallbacks))
+		copy(cbs, c.reconnectCallbacks)
+		c.reconnectCallbacksMu.RUnlock()
+
+		for _, cb := range cbs {
+			cb()
+		}
+
 		return
 	}
 }
@@ -401,6 +428,48 @@ func (c *WSClient) OnMessage(msgType string, handler func(WSMessage)) {
 	c.handlersMu.Lock()
 	c.handlers[msgType] = handler
 	c.handlersMu.Unlock()
+}
+
+// OnReconnect registers a callback that fires after a successful reconnection.
+// The callback is NOT called on the initial Connect -- only on reconnects.
+// Callbacks run outside of the connection lock so it is safe to call sendMessage.
+func (c *WSClient) OnReconnect(callback func()) {
+	c.reconnectCallbacksMu.Lock()
+	c.reconnectCallbacks = append(c.reconnectCallbacks, callback)
+	c.reconnectCallbacksMu.Unlock()
+}
+
+// StartConsume sends a consume message to begin receiving jobs from the server.
+// The server will start a persistent XREADGROUP BLOCK loop and push job messages.
+func (c *WSClient) StartConsume(queues []string, group, consumer string, count, blockMs int) error {
+	msg := WSMessage{
+		Type:     "consume",
+		Queues:   queues,
+		Group:    group,
+		Consumer: consumer,
+		Count:    count,
+		BlockMs:  blockMs,
+	}
+	return c.sendMessage(context.Background(), msg)
+}
+
+// StopConsume sends a stop_consume message to halt the server-side consume loop.
+func (c *WSClient) StopConsume() error {
+	msg := WSMessage{
+		Type: "stop_consume",
+	}
+	return c.sendMessage(context.Background(), msg)
+}
+
+// AckJob sends an ack message to acknowledge a processed job.
+func (c *WSClient) AckJob(queue, group, messageID string) error {
+	msg := WSMessage{
+		Type:      "ack",
+		Queue:     queue,
+		Group:     group,
+		MessageID: messageID,
+	}
+	return c.sendMessage(context.Background(), msg)
 }
 
 // IsConnected returns whether the WebSocket is currently connected.
