@@ -589,3 +589,21 @@ Auto-generated log of every release.
   - WeChat per-person enablement: catalog guard, advertise surface, docs (#4028) (#264)
 
 
+---
+
+## v2.44.0 — 2026-06-22
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 18 |
+| Lines added | +1056 |
+
+**Changes:**
+
+  - fix: read $DISPLAY env for VNC instead of hardcoding :0 (#287) (#290)
+  - fix: make keychain creation idempotent on re-run (#285) (#289)
+  - fix: bind tsnet VPN listeners to explicit node IP, not ":port" (#286) (#288)
+  - feat: WebSocket-based job delivery source (#4112) (#283)
+
+
