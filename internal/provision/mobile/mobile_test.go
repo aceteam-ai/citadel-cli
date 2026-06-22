@@ -153,6 +153,27 @@ func TestBuildIOSSteps_NoCertNoProfile(t *testing.T) {
 	}
 }
 
+func TestBuildIOSSteps_CreateKeychainToleratesExitCode48(t *testing.T) {
+	steps, err := BuildIOSSteps(IOSOptions{KeychainName: "kc", KeychainPassword: "pw"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// First step is always create-keychain.
+	create := steps[0]
+	if create.Args[0] != "create-keychain" {
+		t.Fatalf("step 0 is %q, want create-keychain", create.Args[0])
+	}
+	if len(create.AllowedExitCodes) != 1 || create.AllowedExitCodes[0] != exitCodeKeychainExists {
+		t.Errorf("create-keychain AllowedExitCodes = %v, want [%d]", create.AllowedExitCodes, exitCodeKeychainExists)
+	}
+	// Other steps must not have AllowedExitCodes.
+	for i, s := range steps[1:] {
+		if len(s.AllowedExitCodes) != 0 {
+			t.Errorf("step %d (%s) has unexpected AllowedExitCodes: %v", i+1, s.Args[0], s.AllowedExitCodes)
+		}
+	}
+}
+
 func TestIOSSteps_RedactsSecrets(t *testing.T) {
 	cert := writeTemp(t, "dist.p12")
 	steps, err := BuildIOSSteps(IOSOptions{
