@@ -222,6 +222,59 @@ func Listen(network, addr string) (net.Listener, error) {
 	return s.Listen(network, addr)
 }
 
+// ListenVPN creates a tsnet listener bound to this node's assigned VPN (tailnet)
+// IPv4 address on the given port, returning both the listener and the IP it bound
+// to so callers can log it.
+//
+// It must be used instead of Listen(":port") for services that need to be
+// reachable at the node's VPN IP (e.g. the terminal, status, and gateway servers
+// that the platform relay dials at ws://<vpn_ip>:<port>).
+//
+// Root cause this addresses (see issue #286): tsnet matches an inbound connection
+// to a listener by destination address. A listener opened with an empty host
+// (":port") registers under listenKey{addr: <zero>} and is only matched when the
+// connection's destination equals one of s.TailscaleIPs() *at connect time*
+// (tsnet's listenerForDstAddr conditional fallback). A listener opened with the
+// explicit assigned IP registers under listenKey{addr: <ip>} and is matched
+// unconditionally on the first lookup. tsnet's own docs instruct callers to
+// "explicitly specify the listening address." Binding explicitly makes the VPN
+// listener reliably reachable at the node's VPN IP.
+//
+// Because the tailnet IP may not be assigned the instant the backend reports
+// "Running", this waits up to a bounded timeout for GetIPv4() to return a valid
+// address before binding.
+func ListenVPN(network, port string) (net.Listener, string, error) {
+	s := Global()
+	if s == nil {
+		return nil, "", fmt.Errorf("not connected to AceTeam Network")
+	}
+
+	// Wait (bounded) for the tailnet IPv4 to be assigned. A working connection
+	// assigns the IP within a second or two; the timeout guards against a node
+	// that reported Running but has not yet received its netmap.
+	const ipWaitTimeout = 15 * time.Second
+	deadline := time.Now().Add(ipWaitTimeout)
+	var ip4 string
+	for {
+		v, err := s.GetIPv4()
+		if err == nil && v != "" {
+			ip4 = v
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, "", fmt.Errorf("timed out waiting for VPN IPv4 assignment: %w", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	bindAddr := net.JoinHostPort(ip4, port)
+	ln, err := s.Listen(network, bindAddr)
+	if err != nil {
+		return nil, ip4, fmt.Errorf("listen on %s: %w", bindAddr, err)
+	}
+	return ln, ip4, nil
+}
+
 // VerifyOrReconnect checks connection and reconnects if state exists but not connected.
 // Returns (connected, error). No error if simply not logged in.
 //

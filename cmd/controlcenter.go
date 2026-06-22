@@ -387,13 +387,15 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 
 	// Add VPN listener so the terminal server is reachable over the tsnet VPN.
 	// The TCP bind is localhost-only for security; external access comes through tsnet.
+	// Bind to the explicit assigned VPN IP (not ":port") so inbound connections from
+	// the platform relay are matched by tsnet. See network.ListenVPN and issue #286.
 	if network.IsGlobalConnected() {
-		vpnAddr := fmt.Sprintf(":%d", config.Port)
-		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+		vpnPort := fmt.Sprintf("%d", config.Port)
+		if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
 			Log("terminal server VPN listener failed (localhost-only): %v", err)
 		} else {
 			ccTerminalServer.AddListener(vpnLn)
-			Log("terminal server VPN listener on %s", vpnLn.Addr().String())
+			Log("terminal server VPN listener on %s:%s", vpnIP, vpnPort)
 		}
 	}
 
@@ -448,14 +450,16 @@ func startVNCServer() error {
 		FPS:  10,
 	})
 
-	// Add VPN listener so the VNC server is reachable over the tsnet VPN
+	// Add VPN listener so the VNC server is reachable over the tsnet VPN.
+	// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
+	// and issue #286.
 	if network.IsGlobalConnected() {
-		vpnAddr := fmt.Sprintf(":%d", ccVNCPort)
-		if vpnLn, err := network.Listen("tcp", vpnAddr); err != nil {
+		vpnPort := fmt.Sprintf("%d", ccVNCPort)
+		if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
 			Log("VNC server VPN listener failed (localhost-only): %v", err)
 		} else {
 			ccVNCServer.AddListener(vpnLn)
-			Log("VNC server VPN listener on %s", vpnLn.Addr().String())
+			Log("VNC server VPN listener on %s:%s", vpnIP, vpnPort)
 		}
 	}
 

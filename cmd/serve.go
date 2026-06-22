@@ -172,14 +172,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// clients connecting over the VPN get the same TLS termination.
 	var vpnGatewayListener net.Listener
 	if network.IsGlobalConnected() {
-		vpnAddr := fmt.Sprintf(":%d", servePort)
-		rawLn, err := network.Listen("tcp", vpnAddr)
+		vpnPort := fmt.Sprintf("%d", servePort)
+		rawLn, vpnIP, err := network.ListenVPN("tcp", vpnPort)
 		if err != nil {
-			Debug("gateway VPN listener failed (LAN-only): %v", err)
-		} else if tlsConfig != nil {
-			vpnGatewayListener = tls.NewListener(rawLn, tlsConfig)
+			Log("gateway VPN listener failed (LAN-only): %v", err)
+			fmt.Fprintf(os.Stderr, "   - ⚠️ Gateway VPN listener failed (LAN-only): %v\n", err)
 		} else {
-			vpnGatewayListener = rawLn
+			if tlsConfig != nil {
+				vpnGatewayListener = tls.NewListener(rawLn, tlsConfig)
+			} else {
+				vpnGatewayListener = rawLn
+			}
+			Log("gateway VPN listener on %s:%s", vpnIP, vpnPort)
 		}
 	}
 
