@@ -543,3 +543,25 @@ Auto-generated log of every release.
   - fix: guard release.sh against dirty working tree (#245) (#253)
 
 
+---
+
+## v2.43.0 — 2026-06-21
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 36 |
+| Lines added | +5004 |
+
+**Changes:**
+
+  - feat: real code signing for IOS_BUILD (#270) (#281)
+  - feat: citadel provision ios|android subcommand (#140 Phase 3) (#282)
+  - feat: macOS build job handlers (#140 Phase 2) (#269)
+  - feat(vnc): testable Linux install path + macOS VNC E2E runbook (#122) (#277)
+  - feat: macOS VNC provisioner (#122) (#267)
+  - feat: macOS build server support (#140) (#263)
+  - feat(tui): single-instance mode + console session multiplexer (#274, #275) (#276)
+  - WeChat per-person enablement: catalog guard, advertise surface, docs (#4028) (#264)
+
+
