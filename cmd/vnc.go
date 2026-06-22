@@ -110,6 +110,10 @@ func runVNCEnable(cmd *cobra.Command, args []string) error {
 	// Configure
 	fmt.Printf("Configuring VNC on port %d...\n", vncPort)
 	if err := mgr.Configure(password, vncPort); err != nil {
+		// Surface sudo-required errors directly without wrapping
+		if errors.Is(err, platform.ErrSudoRequired) || errors.Is(err, platform.ErrDarwinSudoRequired) {
+			return err
+		}
 		return fmt.Errorf("failed to configure VNC server: %w", err)
 	}
 
