@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
+	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -539,6 +540,12 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 		cc.activities = cc.activities[:100]
 	}
 	cc.activityMu.Unlock()
+
+	// Stream the activity entry to the control plane for remote debugging.
+	// Emit is fire-and-forget, crash-safe, and gated by the anon_telemetry_enabled
+	// flag + a configured emitter, so this is a no-op until telemetry is wired up
+	// (in ccStartWorker) and never blocks or panics the TUI.
+	telemetry.Emit(level, message)
 
 	// Update UI if running
 	// Use goroutine to avoid blocking when called from input handlers
