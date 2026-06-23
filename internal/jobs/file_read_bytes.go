@@ -22,6 +22,9 @@ const defaultMaxReadBytes int64 = 50 * 1024 * 1024
 // faithful bytes of PDFs/xlsx/CSV-with-NULs must cross the VPN mesh intact.
 type FileReadBytesHandler struct {
 	WorkspaceDir string
+	// AllowOutsideWorkspace, when true, permits reading files outside the
+	// workspace sandbox. Bounded by OS file permissions and size caps.
+	AllowOutsideWorkspace bool
 }
 
 // NewFileReadBytesHandler creates a new FileReadBytesHandler rooted at workspace.
@@ -45,7 +48,7 @@ func (h *FileReadBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 		return nil, fmt.Errorf("job payload missing 'path' field")
 	}
 
-	validated, err := ValidatePath(h.WorkspaceDir, path)
+	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}

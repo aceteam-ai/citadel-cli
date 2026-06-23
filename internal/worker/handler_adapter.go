@@ -103,6 +103,10 @@ type LegacyHandlerOpts struct {
 	// ConfigDir is the path to the citadel.yaml manifest directory.
 	// If empty, service-management handlers are not registered.
 	ConfigDir string
+	// AllowReadOutsideWorkspace, when true, lets read-only file handlers
+	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
+	// outside the workspace sandbox. Write handlers are unaffected.
+	AllowReadOutsideWorkspace bool
 }
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
@@ -141,13 +145,25 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
+		readHandler := jobs.NewFileReadHandler(opts.WorkspaceDir)
+		readHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+
+		readBytesHandler := jobs.NewFileReadBytesHandler(opts.WorkspaceDir)
+		readBytesHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+
+		listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
+		listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+
+		searchHandler := jobs.NewFileSearchHandler(opts.WorkspaceDir)
+		searchHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeFileRead, jobs.NewFileReadHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileReadBytes, jobs.NewFileReadBytesHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
+			NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
 			NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileList, listHandler),
+			NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
 		)
 	}
 
