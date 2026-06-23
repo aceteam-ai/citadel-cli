@@ -108,6 +108,13 @@ func (sm *sessionManager) startSession(idx int) error {
 func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSession) {
 	buf := make([]byte, 4096)
 	ansiW := tview.ANSIWriter(s.view)
+	// filter strips charset-designation escapes (ESC(B etc.) and carriage
+	// returns that tview's line-oriented ANSIWriter would otherwise render
+	// as literal text. It is stateful across reads so sequences split over
+	// a chunk boundary are handled correctly. The raw bytes are still
+	// broadcast unfiltered to WebSocket viewers, which use a full terminal
+	// emulator.
+	var filter consoleFilter
 
 	defer sm.onSessionEnd(s, session)
 
@@ -131,8 +138,9 @@ func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSessio
 				s.streamer.Broadcast(chunk)
 			}
 
+			cleaned := filter.filter(chunk)
 			sm.app.QueueUpdate(func() {
-				_, _ = ansiW.Write(chunk)
+				_, _ = ansiW.Write(cleaned)
 				s.view.ScrollToEnd()
 			})
 		}
