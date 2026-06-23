@@ -607,3 +607,23 @@ Auto-generated log of every release.
   - feat: WebSocket-based job delivery source (#4112) (#283)
 
 
+---
+
+## v2.45.0 — 2026-06-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 40 |
+| Lines added | +2883 |
+
+**Changes:**
+
+  - feat: gated read-only file access outside workspace sandbox (#284) (#308)
+  - fix: upgrade tailscale.com v1.96.5 → v1.100.0 (fixes logtail filch panic #305) (#306)
+  - feat(terminal): built-in tmux-backed persistent named sessions (#302) (#303)
+  - feat(tui): Settings pane + chat connection status + activity telemetry (Closes #293 #294 #295) (#301)
+  - fix: bump tailscale v1.94.0 -> v1.96.5 to fix logtail/filch panic (#291) (#299)
+  - fix: render charset-designation escapes and CR correctly in Console (#296)
+
+
