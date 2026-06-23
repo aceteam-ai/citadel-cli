@@ -64,6 +64,13 @@ type SessionConfig struct {
 	// Shell is the shell command to run
 	Shell string
 
+	// Command, when non-empty, overrides Shell: the session runs Command[0]
+	// with Command[1:] as arguments instead of spawning a bare shell. This is
+	// how a tmux-backed persistent session is started (e.g.
+	// `tmux new-session -A -s <name>`). When set, Shell is ignored for the
+	// process but its existence check is skipped in favour of Command[0].
+	Command []string
+
 	// InitialCols is the initial number of columns (default 80)
 	InitialCols uint16
 
@@ -87,13 +94,24 @@ func NewSession(config SessionConfig) (*Session, error) {
 		config.InitialRows = 24
 	}
 
-	// Check if the shell exists
-	if _, err := exec.LookPath(config.Shell); err != nil {
+	// Determine the program to run: an explicit Command (e.g. a tmux
+	// attach-or-create invocation) takes precedence over a bare shell.
+	var name string
+	var args []string
+	if len(config.Command) > 0 {
+		name = config.Command[0]
+		args = config.Command[1:]
+	} else {
+		name = config.Shell
+	}
+
+	// Check the program exists before spawning a PTY.
+	if _, err := exec.LookPath(name); err != nil {
 		return nil, ErrShellNotFound
 	}
 
 	// Create the command
-	cmd := exec.Command(config.Shell)
+	cmd := exec.Command(name, args...)
 
 	// Set up environment
 	cmd.Env = append(os.Environ(), config.Env...)

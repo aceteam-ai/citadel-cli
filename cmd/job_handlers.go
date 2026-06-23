@@ -56,6 +56,7 @@ func init() {
 	// Register all job handlers for test command
 	jobHandlers = map[string]jobs.JobHandler{
 		"SHELL_COMMAND":      jobs.NewShellCommandHandler(""),
+		"TMUX_SESSION":       jobs.NewTmuxSessionHandler(""),
 		"DOWNLOAD_MODEL":     &jobs.DownloadModelHandler{},
 		"OLLAMA_PULL":        &jobs.OllamaPullHandler{},
 		"LLAMACPP_INFERENCE": &jobs.LlamaCppInferenceHandler{},

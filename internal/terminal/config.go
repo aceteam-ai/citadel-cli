@@ -32,6 +32,15 @@ type Config struct {
 	// Shell is the shell to spawn for terminal sessions
 	Shell string
 
+	// SessionName, when non-empty, makes the server back every connection with
+	// a persistent named tmux session (`tmux new-session -A -s <name>`) instead
+	// of a fresh bare shell. The tmux server keeps the session alive after a
+	// client disconnects, so reconnecting re-attaches to the same session and
+	// the terminal state survives. Requires a resolvable tmux binary; when tmux
+	// is unavailable the server falls back to a bare shell. Configured via
+	// CITADEL_TERMINAL_SESSION.
+	SessionName string
+
 	// AuthServiceURL is the URL of the AceTeam auth service for token validation
 	AuthServiceURL string
 
@@ -61,6 +70,7 @@ func DefaultConfig() *Config {
 		IdleTimeout:          time.Duration(getEnvInt("CITADEL_TERMINAL_IDLE_TIMEOUT", 30)) * time.Minute,
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
+		SessionName:          os.Getenv("CITADEL_TERMINAL_SESSION"),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
 		RateLimitBurst:       5,   // Allow bursts of 5

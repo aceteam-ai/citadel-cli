@@ -121,6 +121,7 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeShellCommand, jobs.NewShellCommandHandler(opts.WorkspaceDir)),
+		NewLegacyHandlerAdapter(JobTypeTmuxSession, jobs.NewTmuxSessionHandler("")),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeLlamaCppInference, &jobs.LlamaCppInferenceHandler{}),
