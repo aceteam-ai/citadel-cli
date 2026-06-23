@@ -7,8 +7,32 @@ package chat
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"time"
 )
+
+// SanitizeEndpoint derives a user-facing real-time endpoint label from the API
+// base URL. It returns scheme + host only (https -> wss, http -> ws) and
+// deliberately omits the internal transport path, so the underlying transport
+// (e.g. the Redis pub/sub proxy path) is never surfaced to the user.
+func SanitizeEndpoint(apiBaseURL string) string {
+	if apiBaseURL == "" {
+		return ""
+	}
+	u, err := url.Parse(apiBaseURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	switch u.Scheme {
+	case "https", "wss":
+		u.Scheme = "wss"
+	case "http", "ws":
+		u.Scheme = "ws"
+	default:
+		u.Scheme = "wss"
+	}
+	return u.Scheme + "://" + u.Host
+}
 
 // Message represents a chat message exchanged between nodes.
 type Message struct {

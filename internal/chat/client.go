@@ -20,14 +20,16 @@ import (
 // messages received while the client is subscribed are displayed. A future
 // backend endpoint will enable loading the last N messages on connect.
 type Client struct {
-	api      *redisapi.Client
-	orgID    string
-	nodeID   string
-	nodeName string
+	api        *redisapi.Client
+	apiBaseURL string
+	orgID      string
+	nodeID     string
+	nodeName   string
 
 	// Callbacks
 	onMessage  func(Message)
 	onPresence func(PresenceInfo)
+	onConnect  func()
 	mu         sync.RWMutex
 
 	// Presence tracking
@@ -62,12 +64,13 @@ func NewClient(cfg ClientConfig) *Client {
 	})
 
 	return &Client{
-		api:      apiClient,
-		orgID:    cfg.OrgID,
-		nodeID:   cfg.NodeID,
-		nodeName: cfg.NodeName,
-		peers:    make(map[string]PresenceInfo),
-		done:     make(chan struct{}),
+		api:        apiClient,
+		apiBaseURL: cfg.APIBaseURL,
+		orgID:      cfg.OrgID,
+		nodeID:     cfg.NodeID,
+		nodeName:   cfg.NodeName,
+		peers:      make(map[string]PresenceInfo),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -83,6 +86,28 @@ func (c *Client) OnPresence(fn func(PresenceInfo)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onPresence = fn
+}
+
+// OnConnect sets the callback invoked once the underlying WebSocket
+// subscription is established. Used by the UI to flip a status line from
+// "connecting" to "connected" only after the real handshake succeeds.
+func (c *Client) OnConnect(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onConnect = fn
+}
+
+// IsConnected reports whether the underlying real-time transport is currently
+// connected. It is a read-only passthrough to the transport client.
+func (c *Client) IsConnected() bool {
+	return c.api != nil && c.api.IsWebSocketConnected()
+}
+
+// EndpointURL returns a user-facing, sanitized address of the real-time
+// endpoint (scheme + host only, never the internal transport path). Returns
+// an empty string if no base URL is configured.
+func (c *Client) EndpointURL() string {
+	return SanitizeEndpoint(c.apiBaseURL)
 }
 
 // Connect establishes the WebSocket subscription for real-time messages
@@ -116,6 +141,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err := ws.Subscribe(ctx, chatCh, presCh); err != nil {
 		cancel()
 		return fmt.Errorf("subscribe: %w", err)
+	}
+
+	// Real-time transport is now live: notify the UI to flip its status.
+	c.mu.RLock()
+	onConnect := c.onConnect
+	c.mu.RUnlock()
+	if onConnect != nil {
+		onConnect()
 	}
 
 	// Start presence heartbeat
@@ -154,6 +187,11 @@ func (c *Client) Send(ctx context.Context, body string) error {
 	}
 
 	return nil
+}
+
+// IsConnected reports whether the realtime WebSocket subscription is active.
+func (c *Client) IsConnected() bool {
+	return c.api != nil && c.api.IsWebSocketConnected()
 }
 
 // Peers returns a snapshot of currently tracked peers.

@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
+	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -414,6 +415,9 @@ type ControlCenter struct {
 	chatConfig    ChatPageConfig // stored from Config; used to lazily create ChatPage
 	chatPage      *ChatPage      // nil until registered in Run
 	proxmoxConfig ProxmoxConfig  // Proxmox page config (zero = disabled)
+
+	// Settings
+	settingsConfig SettingsCallbacks // Settings page hooks (telemetry load/save)
 }
 
 // Pane focus constants
@@ -478,6 +482,7 @@ type Config struct {
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
 	Chat               ChatPageConfig                           // Chat page configuration (empty = disabled)
 	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
+	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
 }
 
 // ProxmoxConfig holds configuration for the Proxmox TUI page.
@@ -514,6 +519,7 @@ func New(cfg Config) *ControlCenter {
 		nexusURL:           cfg.NexusURL,
 		chatConfig:         cfg.Chat,
 		proxmoxConfig:      cfg.Proxmox,
+		settingsConfig:     cfg.Settings,
 	}
 }
 
@@ -534,6 +540,12 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 		cc.activities = cc.activities[:100]
 	}
 	cc.activityMu.Unlock()
+
+	// Stream the activity entry to the control plane for remote debugging.
+	// Emit is fire-and-forget, crash-safe, and gated by the anon_telemetry_enabled
+	// flag + a configured emitter, so this is a no-op until telemetry is wired up
+	// (in ccStartWorker) and never blocks or panics the TUI.
+	telemetry.Emit(level, message)
 
 	// Update UI if running
 	// Use goroutine to avoid blocking when called from input handlers
@@ -611,6 +623,9 @@ func (cc *ControlCenter) Run() error {
 			ActivityFn: cc.AddActivity,
 		}), true)
 	}
+
+	// Settings page (Alt+5): telemetry opt-out + read-only connection status.
+	cc.pmgr.Register(NewSettingsPage(cc.settingsConfig, cc.chatPage), true)
 
 	cc.rootView = cc.pmgr.Build()
 	cc.pmgr.SwitchTo(0)

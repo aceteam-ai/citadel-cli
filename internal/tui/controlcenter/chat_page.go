@@ -16,6 +16,15 @@ import (
 // presenceTimeout is how long since last heartbeat before a node is considered offline.
 const presenceTimeout = 90 * time.Second
 
+// connState describes the chat transport connection lifecycle.
+type connState int
+
+const (
+	connConnecting connState = iota
+	connConnected
+	connError
+)
+
 // ChatPage implements the Page interface for the Chat tab.
 // It provides org-scoped node-to-node messaging over the Redis API proxy.
 type ChatPage struct {
@@ -34,6 +43,7 @@ type ChatPage struct {
 	channelBox *tview.TextView
 	peersBox   *tview.TextView
 	msgView    *tview.TextView
+	statusBar  *tview.TextView
 	input      *tview.InputField
 
 	// Chat client
@@ -54,6 +64,7 @@ type ChatPage struct {
 
 	// Lifecycle
 	connected bool
+	state     connState
 	cancel    context.CancelFunc
 }
 
@@ -120,6 +131,11 @@ func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
 	p.msgView.SetTitleAlign(tview.AlignLeft)
 	p.msgView.SetText(" [gray]Connecting to chat...[white]\n")
 
+	// Status bar: shows which WSS endpoint the chat is connected to + health.
+	p.statusBar = tview.NewTextView()
+	p.statusBar.SetDynamicColors(true)
+	p.statusBar.SetTextAlign(tview.AlignLeft)
+
 	p.input = tview.NewInputField()
 	p.input.SetLabel("> ")
 	p.input.SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
@@ -134,7 +150,11 @@ func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
 
 	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(p.msgView, 0, 1, false).
+		AddItem(p.statusBar, 1, 0, false).
 		AddItem(p.input, 1, 0, true)
+
+	// Render the initial "connecting" status line.
+	p.renderStatusBar(connConnecting, "")
 
 	// -- Root layout --
 
@@ -208,6 +228,11 @@ func (p *ChatPage) connect() {
 	p.client = client
 	p.clientMu.Unlock()
 
+	// Show the (sanitized) endpoint we are dialing while connecting.
+	p.app.QueueUpdateDraw(func() {
+		p.renderStatusBar(connConnecting, "")
+	})
+
 	// Wire up callbacks
 	client.OnMessage(func(msg chat.Message) {
 		// Suppress echo of own messages (already rendered via local echo)
@@ -245,17 +270,46 @@ func (p *ChatPage) connect() {
 		})
 	})
 
-	p.setStatus("[green]Connected[white] to #general")
+	// OnConnect fires only after the real-time transport handshake + subscribe
+	// succeed. Until then the UI stays in the "connecting" state, so a failed
+	// handshake no longer renders as a false "Connected".
+	client.OnConnect(func() {
+		p.clientMu.Lock()
+		p.connected = true
+		p.clientMu.Unlock()
 
-	p.clientMu.Lock()
-	p.connected = true
-	p.clientMu.Unlock()
+		p.app.QueueUpdateDraw(func() {
+			p.renderStatusBar(connConnected, "")
+			p.setStatus("[green]Connected[white] to #general")
+			// Clear the "connecting..." placeholder in the peers sidebar.
+			p.updatePeersView()
+		})
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 
-	// This blocks until ctx is cancelled
-	_ = client.Connect(ctx)
+	// Connect blocks until ctx is cancelled on success, or returns quickly with
+	// an error if the handshake/subscribe fails. Surface the real error instead
+	// of leaving the UI stuck on "connecting...".
+	if err := client.Connect(ctx); err != nil {
+		p.clientMu.Lock()
+		wasConnected := p.connected
+		p.connected = false
+		p.clientMu.Unlock()
+
+		// A nil-cancel context error (context.Canceled) on a clean shutdown is
+		// not a real failure — only report errors that occurred before/without
+		// a successful connect.
+		if !wasConnected && ctx.Err() == nil {
+			errMsg := err.Error()
+			p.app.QueueUpdateDraw(func() {
+				p.renderStatusBar(connError, errMsg)
+				p.setStatus(fmt.Sprintf("[red]Connection failed[white]: %s", errMsg))
+				p.peersBox.SetText(" [red]offline[white]")
+			})
+		}
+	}
 }
 
 // sendMessage sends the current input as a chat message.
@@ -337,6 +391,35 @@ func (p *ChatPage) appendMessage(msg chat.Message) {
 	p.msgView.ScrollToEnd()
 }
 
+// renderStatusBar updates the one-line connection status indicator beneath the
+// message view. It surfaces which WSS endpoint the chat is using and its health
+// (connecting / connected / error). The endpoint is sanitized to scheme + host
+// so the underlying transport path is never exposed to the user.
+func (p *ChatPage) renderStatusBar(state connState, detail string) {
+	if p.statusBar == nil {
+		return
+	}
+
+	p.state = state
+	endpoint := chat.SanitizeEndpoint(p.apiBaseURL)
+	if endpoint == "" {
+		endpoint = "not configured"
+	}
+
+	switch state {
+	case connConnected:
+		p.statusBar.SetText(fmt.Sprintf(" [green]●[white] connected  [gray]%s[white]", tview.Escape(endpoint)))
+	case connError:
+		msg := fmt.Sprintf(" [red]●[white] error  [gray]%s[white]", tview.Escape(endpoint))
+		if detail != "" {
+			msg += fmt.Sprintf("  [red]%s[white]", tview.Escape(detail))
+		}
+		p.statusBar.SetText(msg)
+	default:
+		p.statusBar.SetText(fmt.Sprintf(" [yellow]●[white] connecting…  [gray]%s[white]", tview.Escape(endpoint)))
+	}
+}
+
 // setStatus updates the message view with a status line.
 func (p *ChatPage) setStatus(text string) {
 	p.app.QueueUpdateDraw(func() {
@@ -379,6 +462,37 @@ func (p *ChatPage) updatePeersView() {
 	}
 
 	p.peersBox.SetText(sb.String())
+}
+
+// ConnState describes the high-level connection state of the chat/control link.
+type ConnState string
+
+const (
+	ConnDisconnected ConnState = "disconnected"
+	ConnConnecting   ConnState = "connecting"
+	ConnConnected    ConnState = "connected"
+)
+
+// ConnectionStatus reports the user-facing connection status of the realtime
+// link: the WSS endpoint host and whether it is connected. The underlying
+// transport detail (Redis pub/sub) is intentionally not surfaced — callers
+// (e.g. the Settings page) should present this as a generic "connection".
+func (p *ChatPage) ConnectionStatus() (endpoint string, state ConnState) {
+	endpoint = wssEndpoint(p.apiBaseURL)
+
+	p.clientMu.Lock()
+	client := p.client
+	connecting := p.connected
+	p.clientMu.Unlock()
+
+	switch {
+	case client != nil && client.IsConnected():
+		return endpoint, ConnConnected
+	case connecting:
+		return endpoint, ConnConnecting
+	default:
+		return endpoint, ConnDisconnected
+	}
 }
 
 // Close shuts down the chat page and its client.
