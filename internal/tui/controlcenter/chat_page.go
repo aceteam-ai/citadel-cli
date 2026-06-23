@@ -381,6 +381,37 @@ func (p *ChatPage) updatePeersView() {
 	p.peersBox.SetText(sb.String())
 }
 
+// ConnState describes the high-level connection state of the chat/control link.
+type ConnState string
+
+const (
+	ConnDisconnected ConnState = "disconnected"
+	ConnConnecting   ConnState = "connecting"
+	ConnConnected    ConnState = "connected"
+)
+
+// ConnectionStatus reports the user-facing connection status of the realtime
+// link: the WSS endpoint host and whether it is connected. The underlying
+// transport detail (Redis pub/sub) is intentionally not surfaced — callers
+// (e.g. the Settings page) should present this as a generic "connection".
+func (p *ChatPage) ConnectionStatus() (endpoint string, state ConnState) {
+	endpoint = wssEndpoint(p.apiBaseURL)
+
+	p.clientMu.Lock()
+	client := p.client
+	connecting := p.connected
+	p.clientMu.Unlock()
+
+	switch {
+	case client != nil && client.IsConnected():
+		return endpoint, ConnConnected
+	case connecting:
+		return endpoint, ConnConnecting
+	default:
+		return endpoint, ConnDisconnected
+	}
+}
+
 // Close shuts down the chat page and its client.
 func (p *ChatPage) Close() {
 	if p.cancel != nil {

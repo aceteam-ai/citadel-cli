@@ -151,6 +151,14 @@ func runControlCenter() {
 		OnConnect: ccOnNetworkConnect,
 		Chat:      buildChatConfig(),
 		Proxmox:   buildProxmoxConfig(),
+		Settings: controlcenter.SettingsCallbacks{
+			LoadTelemetry: func() *config.Telemetry {
+				return config.LoadTelemetry(platform.ConfigDir())
+			},
+			SaveTelemetry: func(t *config.Telemetry) error {
+				return config.SaveTelemetry(platform.ConfigDir(), t)
+			},
+		},
 	}
 
 	cc := controlcenter.New(cfg)
