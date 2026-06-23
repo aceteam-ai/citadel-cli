@@ -96,6 +96,7 @@ const (
 // Common job types used across sources.
 const (
 	JobTypeShellCommand      = "SHELL_COMMAND"
+	JobTypeTmuxSession       = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
 	JobTypeDownloadModel     = "DOWNLOAD_MODEL"
 	JobTypeOllamaPull        = "OLLAMA_PULL"
 	JobTypeLlamaCppInference = "LLAMACPP_INFERENCE"

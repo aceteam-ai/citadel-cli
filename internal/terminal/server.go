@@ -354,12 +354,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Printf("creating session %s for user %s from %s", sessionID, tokenInfo.UserID, ip)
 
+	// When a persistent named session is configured and tmux is available, back
+	// the PTY with `tmux new-session -A -s <name>` so the session survives
+	// reconnects; otherwise fall back to a bare shell.
+	tmuxCommand := sessionCommand(s.config.SessionName, s.config.Shell)
+	if tmuxCommand != nil {
+		s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, s.config.SessionName)
+	}
+
 	// Create PTY session
 	session, err := NewSession(SessionConfig{
 		ID:          sessionID,
 		UserID:      tokenInfo.UserID,
 		OrgID:       tokenInfo.OrgID,
 		Shell:       s.config.Shell,
+		Command:     tmuxCommand,
 		InitialCols: 80,
 		InitialRows: 24,
 		OnClose: func() {

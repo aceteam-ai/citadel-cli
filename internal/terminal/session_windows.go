@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,12 @@ type SessionConfig struct {
 	// Shell is the shell command to run
 	Shell string
 
+	// Command, when non-empty, overrides Shell: the session runs this argv
+	// (joined into a ConPTY command line) instead of a bare shell. Used to back
+	// a connection with a persistent tmux session on platforms where tmux is
+	// available.
+	Command []string
+
 	// InitialCols is the initial number of columns (default 80)
 	InitialCols uint16
 
@@ -83,8 +90,17 @@ func NewSession(config SessionConfig) (*Session, error) {
 		config.InitialRows = 24
 	}
 
-	// Check if the shell exists
-	if _, err := exec.LookPath(config.Shell); err != nil {
+	// Determine the program to run: an explicit Command takes precedence over a
+	// bare shell. ConPTY accepts a single command line string, so join argv.
+	commandLine := config.Shell
+	checkProg := config.Shell
+	if len(config.Command) > 0 {
+		commandLine = strings.Join(config.Command, " ")
+		checkProg = config.Command[0]
+	}
+
+	// Check the program exists.
+	if _, err := exec.LookPath(checkProg); err != nil {
 		return nil, ErrShellNotFound
 	}
 
@@ -96,7 +112,7 @@ func NewSession(config SessionConfig) (*Session, error) {
 	)
 
 	// Start the ConPTY process
-	cpty, err := conpty.Start(config.Shell,
+	cpty, err := conpty.Start(commandLine,
 		conpty.ConPtyDimensions(int(config.InitialCols), int(config.InitialRows)),
 		conpty.ConPtyEnv(env),
 	)
