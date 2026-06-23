@@ -189,11 +189,6 @@ func (c *Client) Send(ctx context.Context, body string) error {
 	return nil
 }
 
-// IsConnected reports whether the realtime WebSocket subscription is active.
-func (c *Client) IsConnected() bool {
-	return c.api != nil && c.api.IsWebSocketConnected()
-}
-
 // Peers returns a snapshot of currently tracked peers.
 func (c *Client) Peers() []PresenceInfo {
 	c.peersMu.RLock()
