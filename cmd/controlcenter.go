@@ -26,6 +26,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
@@ -1167,6 +1168,19 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 		if orgID != "" {
 			if apiSource, ok := source.(*worker.APISource); ok {
+				// Wire anonymous activity telemetry through the same
+				// authenticated Redis API client the heartbeat uses. Gated
+				// at emit time by the anon_telemetry_enabled flag; payloads
+				// carry only node/debug context, never user PII.
+				telemetry.Configure(
+					apiSource.Client(),
+					platform.ConfigDir(),
+					nodeName,
+					headscaleNodeID,
+					orgID,
+					Version,
+				)
+
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
 					Client:          apiSource.Client(),
 					NodeID:          nodeName,
