@@ -91,6 +91,9 @@ var (
 	// Workspace directory for file-operation handlers
 	workWorkspaceDir string
 
+	// Allow read-only file handlers to access paths outside the workspace
+	workAllowReadOutsideWorkspace bool
+
 	// Gateway flags
 	workGateway        bool
 	workNoGateway      bool
@@ -1294,8 +1297,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Create handlers with optional workspace for file-operation jobs.
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
-		WorkspaceDir: wsDir,
-		ConfigDir:    workConfigDir,
+		WorkspaceDir:              wsDir,
+		ConfigDir:                 workConfigDir,
+		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 	})
 	handlers = append(handlers, workflow.NewHandler(wfExec))
 
@@ -1506,6 +1510,17 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// resolveAllowReadOutsideWorkspace returns whether read-only file handlers may
+// access paths outside the workspace sandbox.
+// Priority: --allow-read-outside-workspace flag > CITADEL_ALLOW_READ_OUTSIDE_WORKSPACE env.
+func resolveAllowReadOutsideWorkspace() bool {
+	if workAllowReadOutsideWorkspace {
+		return true
+	}
+	v := os.Getenv("CITADEL_ALLOW_READ_OUTSIDE_WORKSPACE")
+	return v == "true" || v == "1"
 }
 
 // resolveConsumerGroup returns the consumer group name to use.
@@ -1768,6 +1783,7 @@ func init() {
 
 	// Workspace flags
 	workCmd.Flags().StringVar(&workWorkspaceDir, "workspace", "", "Workspace directory for file-operation jobs (or set CITADEL_WORKSPACE env)")
+	workCmd.Flags().BoolVar(&workAllowReadOutsideWorkspace, "allow-read-outside-workspace", false, "Allow read-only file ops to access paths outside the workspace sandbox (or set CITADEL_ALLOW_READ_OUTSIDE_WORKSPACE=true)")
 
 	// Gateway flags
 	workCmd.Flags().BoolVar(&workGateway, "gateway", true, "Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)")

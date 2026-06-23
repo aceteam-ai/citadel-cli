@@ -15,6 +15,9 @@ import (
 // filtering by a glob pattern.
 type FileListHandler struct {
 	WorkspaceDir string
+	// AllowOutsideWorkspace, when true, permits listing directories outside
+	// the workspace sandbox. Bounded by OS file permissions.
+	AllowOutsideWorkspace bool
 }
 
 // NewFileListHandler creates a new FileListHandler rooted at workspace.
@@ -46,7 +49,7 @@ func (h *FileListHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 
 	pattern := job.Payload["pattern"] // May be empty.
 
-	validated, err := ValidatePath(h.WorkspaceDir, path)
+	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}

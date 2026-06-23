@@ -17,6 +17,9 @@ import (
 // matches with line numbers and context.
 type FileSearchHandler struct {
 	WorkspaceDir string
+	// AllowOutsideWorkspace, when true, permits searching files outside the
+	// workspace sandbox. Bounded by OS file permissions and size caps.
+	AllowOutsideWorkspace bool
 }
 
 // NewFileSearchHandler creates a new FileSearchHandler rooted at workspace.
@@ -56,7 +59,7 @@ func (h *FileSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 
 	filePattern := job.Payload["file_pattern"] // May be empty.
 
-	validated, err := ValidatePath(h.WorkspaceDir, path)
+	validated, err := ValidateReadPath(h.WorkspaceDir, path, h.AllowOutsideWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}
@@ -132,8 +135,10 @@ func (h *FileSearchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 			line := scanner.Text()
 			if strings.Contains(line, query) {
 				// Use workspace-relative path for cleaner output.
+				// When searching outside the workspace, fall back to the
+				// absolute path instead of emitting "../../../..." strings.
 				relPath, err := filepath.Rel(h.WorkspaceDir, p)
-				if err != nil {
+				if err != nil || strings.HasPrefix(relPath, "..") {
 					relPath = p
 				}
 				matches = append(matches, searchMatch{

@@ -112,6 +112,36 @@ func resolveNearestAncestor(target string) (string, error) {
 	}
 }
 
+// ValidateReadPath resolves requestedPath for read-only operations. When
+// allowOutside is false it delegates to ValidatePath (full workspace sandbox).
+// When allowOutside is true it performs basic cleaning and returns the absolute
+// path without a workspace boundary check, relying on OS file permissions and
+// the handler's own size caps for safety.
+func ValidateReadPath(workspace, requestedPath string, allowOutside bool) (string, error) {
+	if !allowOutside {
+		return ValidatePath(workspace, requestedPath)
+	}
+
+	if requestedPath == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+
+	// If relative, anchor to workspace (when available) so relative paths
+	// still work in relaxed mode.
+	target := requestedPath
+	if !filepath.IsAbs(target) {
+		if workspace == "" {
+			return "", fmt.Errorf("workspace directory is not configured and path is relative")
+		}
+		resolvedWorkspace, err := filepath.EvalSymlinks(workspace)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve workspace %q: %w", workspace, err)
+		}
+		target = filepath.Join(resolvedWorkspace, target)
+	}
+	return filepath.Clean(target), nil
+}
+
 // isBinaryContent checks the first n bytes for NUL bytes, which indicate
 // binary content.
 func isBinaryContent(data []byte) bool {
