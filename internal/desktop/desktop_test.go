@@ -122,6 +122,11 @@ func TestParseActions(t *testing.T) {
 		{"type", `[{"type":"type","text":"hello world"}]`, 1, false},
 		{"key", `[{"type":"key","key":"Return"}]`, 1, false},
 		{"scroll", `[{"type":"scroll","delta":-3}]`, 1, false},
+		{"mousedown", `[{"type":"mousedown","button":1}]`, 1, false},
+		{"mouseup", `[{"type":"mouseup","button":1}]`, 1, false},
+		{"mousedown no button", `[{"type":"mousedown"}]`, 1, false},
+		{"drag sequence", `[{"type":"move","x":10,"y":20},{"type":"mousedown","button":1},{"type":"move","x":90,"y":80},{"type":"mouseup","button":1}]`, 4, false},
+		{"mousedown invalid button", `[{"type":"mousedown","button":9}]`, 0, true},
 		{"multiple", `[{"type":"move","x":10,"y":20},{"type":"click","x":10,"y":20},{"type":"type","text":"hi"}]`, 3, false},
 		{"empty array", `[]`, 0, true},
 		{"invalid json", `not json`, 0, true},
@@ -206,6 +211,24 @@ func TestActionToXdotoolArgs(t *testing.T) {
 			action:   Action{Type: "scroll", Delta: intPtr(2)},
 			wantCmd:  "click",
 			wantArgs: []string{"4", "4"},
+		},
+		{
+			name:     "mousedown default button",
+			action:   Action{Type: "mousedown"},
+			wantCmd:  "mousedown",
+			wantArgs: []string{"1"},
+		},
+		{
+			name:     "mousedown explicit button",
+			action:   Action{Type: "mousedown", Button: intPtr(3)},
+			wantCmd:  "mousedown",
+			wantArgs: []string{"3"},
+		},
+		{
+			name:     "mouseup default button",
+			action:   Action{Type: "mouseup"},
+			wantCmd:  "mouseup",
+			wantArgs: []string{"1"},
 		},
 	}
 

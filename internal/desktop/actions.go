@@ -25,11 +25,13 @@ type Action struct {
 }
 
 var allowedActionTypes = map[string]bool{
-	"move":   true,
-	"click":  true,
-	"type":   true,
-	"key":    true,
-	"scroll": true,
+	"move":      true,
+	"click":     true,
+	"type":      true,
+	"key":       true,
+	"scroll":    true,
+	"mousedown": true, // press a button without releasing (drag start; issue #4180)
+	"mouseup":   true, // release a held button (drag end; issue #4180)
 }
 
 var safeKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9_+\- ]+$`)
@@ -57,7 +59,7 @@ func ParseActions(data []byte) ([]Action, error) {
 
 func validateAction(a Action) error {
 	if !allowedActionTypes[a.Type] {
-		return fmt.Errorf("unknown action type %q (allowed: move, click, type, key, scroll)", a.Type)
+		return fmt.Errorf("unknown action type %q (allowed: move, click, type, key, scroll, mousedown, mouseup)", a.Type)
 	}
 
 	switch a.Type {
@@ -98,6 +100,13 @@ func validateAction(a Action) error {
 		if !safeKeyPattern.MatchString(a.Key) {
 			return fmt.Errorf("key name contains invalid characters")
 		}
+	case "mousedown", "mouseup":
+		// Press/release a button at the current pointer position. Coordinates
+		// are not required: drag sequences emit a preceding "move" action to
+		// position the pointer (see python translate_action left_click_drag).
+		if a.Button != nil && (*a.Button < 1 || *a.Button > 5) {
+			return fmt.Errorf("button must be 1-5")
+		}
 	case "scroll":
 		if a.Delta == nil {
 			return fmt.Errorf("scroll requires delta")
@@ -124,6 +133,12 @@ func ActionToXdotoolArgs(a Action) (string, []string, error) {
 			"--", strconv.Itoa(*a.X), strconv.Itoa(*a.Y),
 			"click", strconv.Itoa(button),
 		}, nil
+	case "mousedown":
+		// Press and hold a button at the current pointer position (drag start).
+		return "mousedown", []string{strconv.Itoa(buttonOrDefault(a.Button, 1))}, nil
+	case "mouseup":
+		// Release a held button at the current pointer position (drag end).
+		return "mouseup", []string{strconv.Itoa(buttonOrDefault(a.Button, 1))}, nil
 	case "type":
 		return "type", []string{"--clearmodifiers", "--", a.Text}, nil
 	case "key":

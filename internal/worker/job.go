@@ -123,4 +123,8 @@ const (
 	JobTypeIOSBuild          = "IOS_BUILD"           // Build an iOS app via xcodebuild (macOS only)
 	JobTypeAndroidBuild      = "ANDROID_BUILD"       // Build an Android app via the Gradle wrapper
 	JobTypeGomobileBuild     = "GOMOBILE_BUILD"      // Cross-compile a Go package via gomobile bind
+	JobTypeFileScreenshot    = "FILE_SCREENSHOT"     // Capture the node's display, return base64 PNG (issue #4179)
+	JobTypeVNCScreenshot     = "VNC_SCREENSHOT"      // Capture the node's display via the VNC tool path (issue #4179)
+	JobTypeVNCType           = "VNC_TYPE"            // Type text on the node's display (issue #4179)
+	JobTypeVNCKeys           = "VNC_KEYS"            // Send a key combo to the node's display (issue #4179)
 )
