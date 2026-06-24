@@ -426,6 +426,9 @@ type ControlCenter struct {
 
 	// Settings
 	settingsConfig SettingsCallbacks // Settings page hooks (telemetry load/save)
+
+	// WhatsApp
+	whatsappConfig WhatsAppCallbacks // WhatsApp bridge page hooks (deploy/stop/status/QR)
 }
 
 // Pane focus constants
@@ -491,6 +494,7 @@ type Config struct {
 	Chat               ChatPageConfig                           // Chat page configuration (empty = disabled)
 	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
 	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
+	WhatsApp           WhatsAppCallbacks                        // WhatsApp bridge page hooks (deploy/stop/status/QR)
 }
 
 // ProxmoxConfig holds configuration for the Proxmox TUI page.
@@ -528,6 +532,7 @@ func New(cfg Config) *ControlCenter {
 		chatConfig:         cfg.Chat,
 		proxmoxConfig:      cfg.Proxmox,
 		settingsConfig:     cfg.Settings,
+		whatsappConfig:     cfg.WhatsApp,
 	}
 }
 
@@ -630,6 +635,12 @@ func (cc *ControlCenter) Run() error {
 			NodeName:   cc.proxmoxConfig.NodeName,
 			ActivityFn: cc.AddActivity,
 		}), true)
+	}
+
+	// WhatsApp bridge page: deploy/start/stop the community module and show the
+	// pairing QR. Visible only when the host wired the lifecycle callbacks.
+	if cc.whatsappConfig.Status != nil {
+		cc.pmgr.Register(NewWhatsAppPage(cc.whatsappConfig), true)
 	}
 
 	// Settings page (Alt+5): telemetry opt-out + read-only connection status.

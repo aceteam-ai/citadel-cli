@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
@@ -376,6 +377,89 @@ func printConnectDetails(port int, apiKey string) {
 	fmt.Println(color.YellowString("  Note: the bridge is on the private mesh, so the AceTeam backend must run with"))
 	fmt.Println(color.YellowString("        WHATSAPP_ALLOW_PRIVATE_NETWORK=true to dial it. If you expose the bridge"))
 	fmt.Println(color.YellowString("        on a public hostname instead, that backend flag is not needed."))
+}
+
+// buildWhatsAppCallbacks wires the WhatsApp page's lifecycle hooks to the same
+// node-config + bridge-client logic the CLI uses, so the TUI and CLI stay in
+// lockstep. All hooks are best-effort and never panic.
+func buildWhatsAppCallbacks() controlcenter.WhatsAppCallbacks {
+	return controlcenter.WhatsAppCallbacks{
+		Status: func() controlcenter.WhatsAppStatus {
+			st := controlcenter.WhatsAppStatus{}
+			servicesDir, err := servicesDirForNode()
+			if err != nil {
+				st.Err = err.Error()
+				return st
+			}
+			st.Deployed = whatsapp.IsDeployed(servicesDir)
+			if !st.Deployed {
+				return st
+			}
+			env, _ := whatsapp.LoadEnv(servicesDir)
+			port := portFromEnv(env)
+			st.APIKey = env["TENANT_API_KEY"]
+			st.APIURL = meshAPIURL(port)
+			st.Running = containerRunning("citadel-whatsapp-bridge")
+			if !st.Running {
+				return st
+			}
+			client := whatsapp.NewClient(bridgeBaseURL(port), env["ADMIN_API_KEY"])
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			if err := client.Root(ctx); err != nil {
+				return st
+			}
+			st.Reachable = true
+			if st.APIKey != "" {
+				if h, err := client.Health(ctx, st.APIKey); err == nil {
+					st.LoggedIn = h.LoggedIn
+				}
+			}
+			return st
+		},
+		Deploy: func() (string, string, error) {
+			// Reset deploy flags to their declared defaults so a TUI-driven
+			// deploy is deterministic regardless of any prior CLI invocation.
+			waAPIKeyFlag = ""
+			waPortFlag = whatsapp.DefaultPort
+			waProxyFlag = ""
+			waTenantFlag = "default"
+			waPublicURLFlag = ""
+
+			if err := runWhatsAppUp(whatsappUpCmd, nil); err != nil {
+				return "", "", err
+			}
+			servicesDir, err := servicesDirForNode()
+			if err != nil {
+				return "", "", err
+			}
+			env, _ := whatsapp.LoadEnv(servicesDir)
+			return meshAPIURL(portFromEnv(env)), env["TENANT_API_KEY"], nil
+		},
+		Stop: func() error {
+			return runWhatsAppDown(whatsappDownCmd, nil)
+		},
+		QRBlocks: func() (string, error) {
+			servicesDir, err := servicesDirForNode()
+			if err != nil {
+				return "", err
+			}
+			env, _ := whatsapp.LoadEnv(servicesDir)
+			key := env["TENANT_API_KEY"]
+			if key == "" {
+				return "", fmt.Errorf("no provisioned tenant")
+			}
+			port := portFromEnv(env)
+			client := whatsapp.NewClient(bridgeBaseURL(port), env["ADMIN_API_KEY"])
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			payload, err := client.QRString(ctx, key)
+			if err != nil {
+				return "", err
+			}
+			return whatsapp.RenderQRBlocks(payload), nil
+		},
+	}
 }
 
 // printQR fetches and renders the pairing QR for a tenant.
