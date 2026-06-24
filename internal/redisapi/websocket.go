@@ -490,6 +490,12 @@ func (c *WSClient) Close() error {
 
 	c.connected = false
 	if c.conn != nil {
+		// Bound the close-handshake write: WriteMessage has no deadline by
+		// default, so on a half-dead connection (e.g. after macOS sleep or a
+		// network change) it can block indefinitely. That stalls shutdown via
+		// chat.Client.Close() (issue #312). A short deadline makes the write
+		// fail fast; we then close the underlying TCP conn regardless.
+		_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		err := c.conn.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),

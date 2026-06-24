@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -167,17 +168,10 @@ func runControlCenter() {
 	instanceServer, _ := instance.Listen(configDir)
 	if instanceServer != nil {
 		_ = instance.WritePID(configDir)
-		defer func() {
-			instanceServer.Close()
-			instance.RemovePID(configDir)
-		}()
 	}
 
 	// Start the demo server in the background
 	startDemoServer()
-	defer stopDemoServer()
-	defer stopTerminalServer()
-	defer stopVNCServer()
 
 	cfg := controlcenter.Config{
 		Version:            Version,
@@ -241,6 +235,20 @@ func runControlCenter() {
 	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
 	defer supervisorCancel()
 	go ccSuperviseVPNListeners(supervisorCtx, cc.AddActivity)
+
+	// Handle OS signals (SIGINT/SIGTERM) so the TUI exits cleanly even when
+	// Ctrl+C is delivered as a signal rather than a tcell key event, or when
+	// the process is sent SIGTERM by a service manager. cc.Stop() is guarded by
+	// sync.Once and stops the tview event loop first, so calling it from this
+	// goroutine unblocks cc.Run() and triggers the teardown path below. Without
+	// this, a real SIGINT had no handler at all and the process hung forever
+	// (issue #312).
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		cc.Stop()
+	}()
 
 	// Auto-connect to network and start worker
 	go func() {
@@ -326,8 +334,32 @@ func runControlCenter() {
 		}
 	}()
 
-	if err := cc.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Control center error: %v\n", err)
+	runErr := cc.Run()
+
+	// Tear down all long-lived subsystems once the TUI event loop has exited.
+	// Each step is bounded internally, but we run them through gracefulShutdown
+	// so that a regression in any one teardown can never hang the process: after
+	// a short grace period the watchdog force-exits, logging what was still
+	// pending (issue #312). The background worker started by ccOnNetworkConnect
+	// uses its own context.Background()-derived context and is NOT tied to the
+	// TUI, so it must be cancelled explicitly here or its goroutines (Redis API
+	// poll, heartbeat) would leak past exit.
+	gracefulShutdown([]shutdownStep{
+		{name: "tui-cleanup", fn: cc.Cleanup},
+		{name: "worker", fn: func() { _ = ccStopWorker() }},
+		{name: "terminal-server", fn: stopTerminalServer},
+		{name: "vnc-server", fn: stopVNCServer},
+		{name: "demo-server", fn: stopDemoServer},
+		{name: "instance-server", fn: func() {
+			if instanceServer != nil {
+				instanceServer.Close()
+				instance.RemovePID(configDir)
+			}
+		}},
+	})
+
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Control center error: %v\n", runErr)
 		os.Exit(1)
 	}
 }
