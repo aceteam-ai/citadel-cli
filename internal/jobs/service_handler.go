@@ -34,11 +34,22 @@ type manifestService struct {
 type ServiceHandler struct {
 	// ConfigDir is the absolute path to the directory containing citadel.yaml.
 	ConfigDir string
+	// WorkspaceDir is the absolute node workspace root. It is exported to
+	// docker compose as CITADEL_WORKSPACE so compose files that bind-mount the
+	// workspace (e.g. the transcribe sidecar) resolve to an absolute path even
+	// when the worker was started without CITADEL_WORKSPACE in its environment.
+	WorkspaceDir string
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
 func NewServiceHandler(configDir string) *ServiceHandler {
 	return &ServiceHandler{ConfigDir: configDir}
+}
+
+// NewServiceHandlerWithWorkspace creates a ServiceHandler that also knows the
+// node workspace, so workspace-mounting compose services can be started.
+func NewServiceHandlerWithWorkspace(configDir, workspaceDir string) *ServiceHandler {
+	return &ServiceHandler{ConfigDir: configDir, WorkspaceDir: workspaceDir}
 }
 
 // serviceResult is the JSON structure returned for all service operations.
@@ -134,6 +145,7 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 			return nil, pathErr
 		}
 		cmd := exec.Command("docker", "compose", "-f", composePath, "up", "-d")
+		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
 			err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
@@ -180,6 +192,7 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 			return nil, pathErr
 		}
 		cmd := exec.Command("docker", "compose", "-f", composePath, "down")
+		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
 			err = fmt.Errorf("docker compose down failed: %s", strings.TrimSpace(string(out)))
@@ -256,6 +269,21 @@ func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) == "running"
+}
+
+// composeEnv returns the environment for docker compose invocations. It starts
+// from the worker's own environment and guarantees CITADEL_WORKSPACE is set to
+// the absolute workspace path. Compose files that bind-mount the workspace use
+// ${CITADEL_WORKSPACE:?...}; without this, a worker started via --workspace (or
+// the default path) has no CITADEL_WORKSPACE in its env and compose would fail.
+func (h *ServiceHandler) composeEnv() []string {
+	env := os.Environ()
+	if h.WorkspaceDir != "" {
+		// Override any inherited value so it always matches the workspace this
+		// node actually writes job files into.
+		env = append(env, "CITADEL_WORKSPACE="+h.WorkspaceDir)
+	}
+	return env
 }
 
 func (h *ServiceHandler) resolveComposePath(svc manifestService) (string, error) {

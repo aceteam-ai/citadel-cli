@@ -127,3 +127,60 @@ func TestTranscribeAudio_ServiceError(t *testing.T) {
 		t.Fatal("expected error for non-200 service response")
 	}
 }
+
+// TestTranscribeAudio_SymlinkedWorkspace guards the workspace-relative path
+// computation when the workspace root itself is a symlink. ValidatePath
+// resolves the audio path under the SYMLINK-RESOLVED root, so the handler must
+// compute the relative path against the resolved root too. A naive
+// filepath.Rel(rawWorkspace, validated) would yield spurious "../" prefixes and
+// the sidecar would reject the path.
+func TestTranscribeAudio_SymlinkedWorkspace(t *testing.T) {
+	realDir := t.TempDir()
+	// A sibling symlink that points at the real workspace.
+	linkDir := filepath.Join(t.TempDir(), "ws-link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatalf("setup symlink: %v", err)
+	}
+
+	audioRel := filepath.Join("recordings", "meeting.webm")
+	if err := os.MkdirAll(filepath.Join(realDir, "recordings"), 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, audioRel), []byte("fakeaudio"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		gotPath, _ = req["audio_path"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"ok","language":"en","segments":[]}`))
+	}))
+	defer srv.Close()
+
+	// Root the handler at the SYMLINKED path, as a real worker would when its
+	// workspace is under a symlinked directory.
+	h := NewTranscribeAudioHandler(linkDir)
+	h.ServiceURL = srv.URL
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "t5",
+		Type:    "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{"audio_path": audioRel},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The forwarded path must be clean and workspace-relative, with no "../".
+	if gotPath != audioRel {
+		t.Errorf("forwarded audio_path = %q, want %q (no leading ../)", gotPath, audioRel)
+	}
+}

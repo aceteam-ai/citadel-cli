@@ -99,7 +99,17 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	// The whisper sidecar mounts the workspace at /workspace, so send the path
 	// RELATIVE to the workspace root. The service joins it under its own mount;
 	// it never sees (or can escape to) the host filesystem.
-	rel, err := filepath.Rel(h.WorkspaceDir, validated)
+	//
+	// ValidatePath resolves relative inputs against the SYMLINK-RESOLVED
+	// workspace root, so compute the relative path against the resolved root
+	// too. Using the raw WorkspaceDir here would emit spurious "../" prefixes
+	// when the workspace contains a symlinked component (e.g. a symlinked
+	// tmpdir, or /var -> /private/var on macOS), which the sidecar would reject.
+	resolvedWorkspace, err := filepath.EvalSymlinks(h.WorkspaceDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve workspace %q: %w", h.WorkspaceDir, err)
+	}
+	rel, err := filepath.Rel(resolvedWorkspace, validated)
 	if err != nil {
 		return nil, fmt.Errorf("cannot compute workspace-relative path: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -60,8 +61,9 @@ func (h *FileWriteBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 
 	maxBytes := defaultMaxWriteBytes
 	if v, ok := job.Payload["max_bytes"]; ok && v != "" {
-		parsed, perr := parsePositiveInt64(v)
-		if perr != nil {
+		// Mirror FILE_READ_BYTES: strconv.ParseInt with a positive-value check.
+		parsed, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil || parsed <= 0 {
 			return nil, fmt.Errorf("invalid max_bytes: %q", v)
 		}
 		maxBytes = parsed
@@ -92,21 +94,6 @@ func (h *FileWriteBytesHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 		"bytes_written": len(data),
 	}
 	return json.Marshal(result)
-}
-
-// parsePositiveInt64 parses a positive decimal integer string.
-func parsePositiveInt64(s string) (int64, error) {
-	var n int64
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("not a number")
-		}
-		n = n*10 + int64(c-'0')
-	}
-	if n <= 0 {
-		return 0, fmt.Errorf("must be positive")
-	}
-	return n, nil
 }
 
 // Ensure FileWriteBytesHandler implements JobHandler.

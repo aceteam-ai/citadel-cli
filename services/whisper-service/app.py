@@ -1,9 +1,10 @@
 """Node-local speech-to-text sidecar for Citadel.
 
-Mirrors the proven WeChat microservice pattern (faster-whisper on CPU): a tiny
-FastAPI service that loads a faster-whisper model once and transcribes audio
-files placed in the node workspace. Used by the citadel-cli TRANSCRIBE_AUDIO
-job handler, which POSTs a workspace-relative audio path here.
+A tiny FastAPI service (faster-whisper on CPU) that loads a model once and
+transcribes audio files placed in the node workspace, reusing the proven
+node-local faster-whisper STT pattern already shipped elsewhere in Citadel.
+Used by the citadel-cli TRANSCRIBE_AUDIO job handler, which POSTs a
+workspace-relative audio path here.
 
 Audio never leaves the node: the workspace is mounted read-only at /workspace
 and the resulting transcript is returned to the local Go worker, which relays
@@ -11,8 +12,8 @@ it back over the VPN mesh to the user's own AceTeam org.
 
 Diarization (Phase 1): BASIC. faster-whisper produces timestamped segments but
 no speaker identities. We label segments heuristically (a new speaker after a
-silence gap) so distinct speakers read better than Otter's `[None]` imports.
-Full diarization (pyannote/whisperx) is deferred to a later phase.
+silence gap) so distinct speakers read better than unlabelled imports. Full
+diarization (pyannote/whisperx) is deferred to a later phase.
 """
 
 import os
@@ -38,7 +39,7 @@ _model = None
 
 
 def _get_model():
-    """Lazy-load the faster-whisper model once (same as the WeChat service)."""
+    """Lazy-load the faster-whisper model once on first transcription."""
     global _model
     if _model is None:
         from faster_whisper import WhisperModel
@@ -64,7 +65,7 @@ class TranscribeRequest(BaseModel):
 def _resolve_audio_path(audio_path: str) -> str:
     """Resolve an audio path safely under the workspace mount.
 
-    Rejects paths that escape WORKSPACE_ROOT (defense in depth — the Go handler
+    Rejects paths that escape WORKSPACE_ROOT (defense in depth: the Go handler
     already validates, but the service must not trust the wire blindly).
     """
     candidate = os.path.normpath(os.path.join(WORKSPACE_ROOT, audio_path))

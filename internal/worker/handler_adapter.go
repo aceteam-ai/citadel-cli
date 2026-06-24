@@ -194,7 +194,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 
 	// Register service-management handlers when a config directory is available.
 	if opts.ConfigDir != "" {
-		svcHandler := jobs.NewServiceHandler(opts.ConfigDir)
+		svcHandler := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
 		handlers = append(handlers,
 			NewLegacyHandlerAdapter(JobTypeServiceStart, svcHandler),
 			NewLegacyHandlerAdapter(JobTypeServiceStop, svcHandler),

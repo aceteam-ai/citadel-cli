@@ -9,15 +9,16 @@ services:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
       # Mount the node workspace read-only so the service can read audio files
       # that FILE_WRITE_BYTES placed there.
-      # IMPORTANT: CITADEL_WORKSPACE must be an ABSOLUTE path. Docker Compose
-      # does NOT expand "~", so the default below is only correct when the env
-      # var is set (citadel-cli resolves the workspace to an absolute path and
-      # should export it before `docker compose up`). Set e.g.
+      # CITADEL_WORKSPACE must be an ABSOLUTE path (Docker Compose does NOT
+      # expand "~"). When this service is started via SERVICE_START, the
+      # citadel-cli worker exports CITADEL_WORKSPACE automatically, set to the
+      # same absolute workspace it writes job files into. The :? guard makes a
+      # manual `docker compose up` without the var fail loudly rather than
+      # silently mounting the wrong path. To run by hand set e.g.
       #   CITADEL_WORKSPACE=/home/<user>/citadel-node/workspace
       - ${CITADEL_WORKSPACE:?set CITADEL_WORKSPACE to an absolute workspace path}:/workspace:ro
     environment:
-      # faster-whisper model size: base = good CPU speed/accuracy tradeoff,
-      # matching the proven WeChat microservice configuration.
+      # faster-whisper model size: base = good CPU speed/accuracy tradeoff.
       - WHISPER_MODEL=base
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
