@@ -44,11 +44,31 @@ type AppInfo struct {
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
+//
+// The four boolean flags (Console/Desktop/Files/GPU) report what the node
+// ACTUALLY supports right now, so the AceTeam Fabric UI can show true
+// availability instead of guessing (citadel-cli#324). They are ingested by the
+// backend exactly as the keys "console"/"desktop"/"files"/"gpu" inside this
+// "capabilities" block (aceteam#4223, PR #4231 — CitadelStatus.capabilityFlags).
+//
+// They are *bool (pointers) so the field is omitted entirely when never set:
+// the backend treats an absent flag as "unknown" (tri-state) rather than false,
+// keeping legacy nodes that report no flags backward-compatible. The status
+// collector always populates all four on every heartbeat, so live nodes always
+// emit concrete true/false values.
 type NodeCapabilities struct {
 	GPUs       []GPUCapability `json:"gpus,omitempty"`
 	Engines    []string        `json:"engines,omitempty"`
 	Tags       []string        `json:"tags,omitempty"`
 	Hypervisor *HypervisorInfo `json:"hypervisor,omitempty"`
+
+	// Real node capability flags (citadel-cli#324). Console = shell/SSH
+	// available, Desktop = VNC reachable, Files = node-files filesystem access,
+	// GPU = GPU present / inference-capable.
+	Console *bool `json:"console,omitempty"`
+	Desktop *bool `json:"desktop,omitempty"`
+	Files   *bool `json:"files,omitempty"`
+	GPU     *bool `json:"gpu,omitempty"`
 }
 
 // HypervisorInfo describes a detected hypervisor on the node.

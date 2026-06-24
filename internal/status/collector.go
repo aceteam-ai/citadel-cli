@@ -83,8 +83,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Collect installed app status
 	status.Apps = c.collectAppStatus()
 
-	// Include cached capabilities if available
-	status.Capabilities = c.capabilities
+	// Include cached capabilities if available. Copy the cached struct rather
+	// than aliasing it, so populating the per-heartbeat capability flags below
+	// does not mutate the shared cached value (Collect may run concurrently for
+	// the status server and the heartbeat publisher).
+	if c.capabilities != nil {
+		capsCopy := *c.capabilities
+		status.Capabilities = &capsCopy
+	}
 
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
@@ -105,6 +111,17 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 			status.VNCPort = vncMgr.Port()
 		}
 	}
+
+	// Report the four real node-capability flags (console/desktop/files/gpu) so
+	// the AceTeam Fabric UI shows true availability (citadel-cli#324). Ensure a
+	// capabilities block exists even when no pre-detected NodeCapabilities was
+	// supplied, then populate the flags. Desktop is derived from the VNCPort
+	// already computed above to avoid a redundant probe.
+	if status.Capabilities == nil {
+		status.Capabilities = &NodeCapabilities{}
+	}
+	populateCapabilityFlags(status.Capabilities, status.VNCPort)
+
 	return status, nil
 }
 
