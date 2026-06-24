@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/session"
 )
 
 const detectionTimeout = 5 * time.Second
@@ -20,11 +22,19 @@ type Capabilities struct {
 	Display          string `json:"display"`
 	ScreenResolution string `json:"screen_resolution,omitempty"`
 	VNCPort          int    `json:"vnc_port,omitempty"`
+
+	// Session reports whether this process has an interactive desktop session
+	// and which desktop-dependent sub-capabilities (vnc/screenshot/input/
+	// terminal) are usable. Populated by the per-OS session probe. The server
+	// and frontend gate desktop affordances on this so a headless node does not
+	// advertise (or get asked to perform) VNC/screenshot/input actions.
+	Session *session.DesktopInfo `json:"session,omitempty"`
 }
 
 func DetectCapabilities() *Capabilities {
 	caps := &Capabilities{
-		OS: runtime.GOOS,
+		OS:      runtime.GOOS,
+		Session: session.DetectDesktop(),
 	}
 
 	switch runtime.GOOS {
@@ -39,15 +49,26 @@ func DetectCapabilities() *Capabilities {
 		// TODO: sw_vers for version, system_profiler SPDisplaysDataType for resolution
 		// screencapture for screenshots, cliclick for input actions
 		caps.OSVersion = "unknown"
-		caps.Display = "available"
+		caps.Display = displayFromSession(caps.Session)
 	case "windows":
 		// TODO: PowerShell Get-CimInstance Win32_OperatingSystem for version
 		// Get-CimInstance Win32_VideoController for display
 		caps.OSVersion = "unknown"
-		caps.Display = "available"
+		caps.Display = displayFromSession(caps.Session)
 	}
 
 	return caps
+}
+
+// displayFromSession derives the legacy Display string from the session probe
+// on platforms where we have no richer display detection yet. Returns
+// "available" only when an interactive desktop is present, otherwise "".
+// This makes the previously-unconditional "available" honest on headless nodes.
+func displayFromSession(s *session.DesktopInfo) string {
+	if s != nil && s.HasDesktop {
+		return "available"
+	}
+	return ""
 }
 
 func detectLinuxVersion() string {

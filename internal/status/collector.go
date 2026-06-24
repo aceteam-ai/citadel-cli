@@ -89,6 +89,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
 
+	// Advertise a flat desktop capability map in the handshake so the server can
+	// gate desktop affordances per node (headless nodes report desktop=false).
+	if status.Desktop != nil && status.Desktop.Session != nil {
+		status.DesktopCapabilities = status.Desktop.Session.CapabilityMap()
+	}
+
 	// Detect VNC server status for top-level vnc_port field.
 	// Check embedded VNC server first (TUI-managed), then external (TightVNC etc).
 	if port := platform.EmbeddedVNCPort(); port > 0 {

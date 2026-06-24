@@ -27,7 +27,13 @@ type NodeStatus struct {
 	Apps         []AppInfo             `json:"apps,omitempty"`
 	Capabilities *NodeCapabilities     `json:"capabilities,omitempty"`
 	Desktop      *desktop.Capabilities `json:"desktop,omitempty"`
-	VNCPort      int                   `json:"vnc_port"`
+	// DesktopCapabilities is a flat capability map advertised to the control
+	// plane so the server can persist it and the frontend can gate desktop
+	// affordances (VNC/screenshot/input/terminal buttons) on a per-node basis.
+	// Keys: desktop, vnc, screenshot, input_injection, terminal. Additive and
+	// backward-compatible: legacy nodes omit it and are treated as "unknown".
+	DesktopCapabilities map[string]bool `json:"desktop_capabilities,omitempty"`
+	VNCPort             int             `json:"vnc_port"`
 }
 
 // AppInfo contains information about an installed catalog app.
@@ -66,20 +72,20 @@ type GPUCapability struct {
 // NodeInfo contains basic node identification.
 type NodeInfo struct {
 	Name          string `json:"name"`
-	NetworkIP     string `json:"network_ip,omitempty"`     // Preferred: AceTeam Network IP
-	TailscaleIP   string `json:"tailscale_ip,omitempty"`   // Kept for backwards compatibility
+	NetworkIP     string `json:"network_ip,omitempty"`   // Preferred: AceTeam Network IP
+	TailscaleIP   string `json:"tailscale_ip,omitempty"` // Kept for backwards compatibility
 	UptimeSeconds int64  `json:"uptime_seconds"`
 }
 
 // SystemMetrics contains system resource utilization.
 type SystemMetrics struct {
-	CPUPercent      float64 `json:"cpu_percent"`
-	MemoryUsedGB    float64 `json:"memory_used_gb"`
-	MemoryTotalGB   float64 `json:"memory_total_gb"`
-	MemoryPercent   float64 `json:"memory_percent"`
-	DiskUsedGB      float64 `json:"disk_used_gb"`
-	DiskTotalGB     float64 `json:"disk_total_gb"`
-	DiskPercent     float64 `json:"disk_percent"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	MemoryUsedGB  float64 `json:"memory_used_gb"`
+	MemoryTotalGB float64 `json:"memory_total_gb"`
+	MemoryPercent float64 `json:"memory_percent"`
+	DiskUsedGB    float64 `json:"disk_used_gb"`
+	DiskTotalGB   float64 `json:"disk_total_gb"`
+	DiskPercent   float64 `json:"disk_percent"`
 }
 
 // GPUMetrics contains GPU utilization information.
@@ -96,7 +102,7 @@ type GPUMetrics struct {
 // ServiceInfo contains information about a running service.
 type ServiceInfo struct {
 	Name   string   `json:"name"`
-	Type   string   `json:"type"` // "llm", "database", "other"
+	Type   string   `json:"type"`   // "llm", "database", "other"
 	Status string   `json:"status"` // "running", "stopped", "error"
 	Port   int      `json:"port,omitempty"`
 	Health string   `json:"health,omitempty"` // "healthy", "unhealthy", "unknown"
