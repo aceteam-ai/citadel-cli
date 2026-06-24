@@ -40,8 +40,12 @@ func runDeviceAuthFlow(authServiceURL string, forceNew bool) (*DeviceAuthResult,
 		completeURL := resp.VerificationURI + "?code=" + resp.UserCode
 		fmt.Println()
 		fmt.Println("Device authorization required.")
-		fmt.Printf("Open this URL to sign in: %s\n", completeURL)
-		fmt.Printf("Or enter code manually:   %s\n", resp.UserCode)
+		fmt.Println("Scan this QR with the AceTeam app to add this node to your Fabric:")
+		fmt.Println()
+		fmt.Print(ui.RenderEnrollQR(resp.VerificationURI, resp.UserCode))
+		fmt.Println()
+		fmt.Printf("Or open this URL to sign in: %s\n", completeURL)
+		fmt.Printf("Or enter code manually:      %s\n", resp.UserCode)
 		fmt.Println()
 		fmt.Println("Waiting for authorization...")
 

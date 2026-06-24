@@ -23,6 +23,7 @@ type DeviceCodeModel struct {
 	startTime       time.Time
 	copyMessage     string    // temporary message when something is copied
 	copyMessageTime time.Time // when the copy message was set
+	showQR          bool      // whether to render the scannable enrollment QR
 }
 
 type tickMsg time.Time
@@ -36,6 +37,7 @@ func NewDeviceCodeModel(userCode, verificationURI string, expiresIn int) DeviceC
 		expiresAt:       now.Add(time.Duration(expiresIn) * time.Second),
 		status:          "waiting",
 		startTime:       now,
+		showQR:          true, // QR is the primary enrollment affordance (issue #325)
 	}
 }
 
@@ -79,6 +81,10 @@ func (m DeviceCodeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.copyMessage = "✓ Opening browser..."
 			}
 			m.copyMessageTime = time.Now()
+			return m, nil
+		case "s", "S":
+			// Toggle the scannable enrollment QR code
+			m.showQR = !m.showQR
 			return m, nil
 		}
 	case tickMsg:
@@ -124,6 +130,15 @@ func (m DeviceCodeModel) View() string {
 
 	completeURL := m.verificationURI + "?code=" + m.userCode
 
+	// Scannable enrollment QR (rendered above the box; QR + quiet zone is
+	// wider than the box). Scanning binds this node to your org's Fabric.
+	if m.showQR && m.status == "waiting" {
+		sb.WriteString("\n")
+		sb.WriteString(centerText("📱 Scan to add this node to your Fabric", boxWidth+2) + "\n")
+		sb.WriteString(RenderEnrollQR(m.verificationURI, m.userCode))
+		sb.WriteString("\n")
+	}
+
 	// Top border
 	sb.WriteString("┌" + strings.Repeat("─", boxWidth) + "┐\n")
 	sb.WriteString("│" + strings.Repeat(" ", boxWidth) + "│\n")
@@ -159,8 +174,12 @@ func (m DeviceCodeModel) View() string {
 	// Hotkeys - prominent, inside a visual separator
 	if m.status == "waiting" {
 		sb.WriteString("│" + strings.Repeat("─", boxWidth) + "│\n")
+		qrLabel := "[S] Show QR"
+		if m.showQR {
+			qrLabel = "[S] Hide QR"
+		}
 		sb.WriteString(padLine("KEYBOARD SHORTCUTS:", 2))
-		sb.WriteString(padLine("  [B] Open in browser    [C] Copy link    [Q] Quit", 2))
+		sb.WriteString(padLine("  [B] Browser   [C] Copy   "+qrLabel+"   [Q] Quit", 2))
 		sb.WriteString("│" + strings.Repeat("─", boxWidth) + "│\n")
 	}
 
