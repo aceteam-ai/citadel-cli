@@ -627,3 +627,29 @@ Auto-generated log of every release.
   - fix: render charset-designation escapes and CR correctly in Console (#296)
 
 
+---
+
+## v2.46.0 — 2026-06-24
+
+| Metric | Value |
+|--------|-------|
+| Commits | 12 |
+| Files changed | 53 |
+| Lines added | +3871 |
+
+**Changes:**
+
+  - test(e2e): skip TestDeviceAuthExpiry when AceTeam API is unreachable (#327)
+  - fix(status): eliminate test-only data race in status server tests (#321) (#322)
+  - fix(controlcenter): make VPN listener globals race-free (#319) (#320)
+  - fix(tui): answer terminal Device Attributes queries in the Console pane (#307)
+  - feat: detect headless/no-desktop sessions + advertise desktop capability map (#311) (#315)
+  - feat: keep laptop awake while it's a Fabric node (AC-aware sleep inhibition, opt-in) (#316)
+  - fix(tui): bound control-center shutdown so SIGINT/Ctrl+C exits cleanly (#318)
+  - fix: self-heal VNC/terminal VPN listeners across tsnet reconnects (#317) (#319)
+  - Merge pull request #314 from aceteam-ai/gap/4179-4180-computeruse
+  - Merge pull request #313 from aceteam-ai/gap/4181-persistent-terminal
+  - feat(worker): node-side screenshot + VNC handlers (#4179), drag actions (#4180)
+  - feat(terminal): persistent tmux sessions by default + per-user reconnect
+
+
