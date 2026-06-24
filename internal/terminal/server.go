@@ -107,12 +107,42 @@ func (s *Server) SetSilent() {
 }
 
 // AddListener registers an additional net.Listener that the server will also
-// serve on when Start is called. This enables dual-listen on both LAN and VPN
-// interfaces. Must be called before Start.
+// serve on. This enables dual-listen on both LAN and VPN interfaces.
+//
+// If the server is already running, the listener begins serving immediately.
+// This lets callers re-attach a VPN listener after a tsnet reconnect without
+// restarting the server (see issue #317). If the server is not yet running,
+// the listener is queued and served when Start is called.
 func (s *Server) AddListener(ln net.Listener) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.extraListeners = append(s.extraListeners, ln)
+	running := s.running
+	httpServer := s.httpServer
+	s.mu.Unlock()
+
+	if running && httpServer != nil {
+		s.logger.Printf("also listening on %s (VPN, hot-attached)", ln.Addr().String())
+		go func() {
+			if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+				s.logger.Printf("VPN listener error: %v", err)
+			}
+		}()
+	}
+}
+
+// RemoveListener drops a previously added extra listener from the server's
+// tracking slice so a long-lived session that re-attaches a VPN listener across
+// many reconnects does not accumulate dead listener references (issue #317).
+// It does not close the listener; the caller owns its lifecycle.
+func (s *Server) RemoveListener(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, l := range s.extraListeners {
+		if l == ln {
+			s.extraListeners = append(s.extraListeners[:i], s.extraListeners[i+1:]...)
+			return
+		}
+	}
 }
 
 // NewServerWithDebug creates a new terminal server with debug logging enabled

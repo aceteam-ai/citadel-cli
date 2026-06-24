@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,6 +75,66 @@ var (
 	ccVNCServer  *desktop.VNCServer
 	ccVNCPort    = 5900
 	ccVNCRunning bool
+)
+
+// vpnListener wraps a tsnet VPN listener with a liveness flag. tsnet does not
+// expose an explicit "listener torn down on reconnect" event, so we detect
+// death the only reliable way available: when the server's accept loop calls
+// Accept() and it returns a non-recoverable error (the listener was closed by
+// the tsnet teardown). The flag is set from inside Accept, so it works
+// regardless of whether the tailnet IP changed — covering the issue #317
+// same-IP blip where the node returns to the *same* address with a dead
+// listener (machine key preserved → same IP). See issue #317.
+type vpnListener struct {
+	net.Listener
+	dead   atomic.Bool
+	closed atomic.Bool // set when we deliberately Close() it (re-attach/shutdown)
+}
+
+func (l *vpnListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil && !l.closed.Load() {
+		// The accept loop saw an error we did not cause by closing the
+		// listener ourselves: treat the VPN listener as dead so the supervisor
+		// re-attaches it. (When we close it on purpose, closed is already set.)
+		l.dead.Store(true)
+	}
+	return conn, err
+}
+
+func (l *vpnListener) Close() error {
+	l.closed.Store(true)
+	return l.Listener.Close()
+}
+
+func (l *vpnListener) isDead() bool { return l.dead.Load() }
+
+// VPN-listener attachment state (issue #317).
+//
+// The VPN listener lifecycle is deliberately tracked separately from the
+// server "running" flags above. A tsnet drop+recover tears down the listener
+// bound to the tailnet IP while the localhost server keeps running, so the
+// supervisor must be able to (re)attach a VPN listener even when the server
+// object is already running. ccVPNMu guards all of the fields below and
+// serializes attach attempts so the supervisor and the startup/login paths
+// never race.
+var (
+	ccVPNMu sync.Mutex
+
+	ccVNCVPNListener *vpnListener // nil when no VNC VPN listener is attached
+	ccVNCVPNIP       string       // tailnet IP the current VNC VPN listener is bound to
+
+	ccTerminalVPNListener *vpnListener // nil when no terminal VPN listener is attached
+	ccTerminalVPNIP       string       // tailnet IP the current terminal VPN listener is bound to
+)
+
+// listenVPNFn / isConnectedFn / currentVPNIPFn are indirection points for the
+// network layer so the VPN-listener supervisor can be unit-tested without a
+// live tailnet. Production wiring uses the real network package functions.
+var (
+	listenVPNFn    = network.ListenVPN
+	isConnectedFn  = network.IsGlobalConnected
+	currentVPNIPFn = network.GetGlobalIPv4
 )
 
 // runControlCenter launches the unified control center TUI
@@ -171,6 +233,14 @@ func runControlCenter() {
 
 	// Set heartbeat callback so worker can update TUI
 	ccHeartbeatFn = cc.UpdateHeartbeat
+
+	// Supervise the VNC + terminal VPN listeners for the lifetime of the TUI so
+	// they self-heal across tsnet reconnects without relaunching citadel (issue
+	// #317). Runs independently of the one-shot auto-connect goroutine below,
+	// which only fires at startup/login.
+	supervisorCtx, supervisorCancel := context.WithCancel(context.Background())
+	defer supervisorCancel()
+	go ccSuperviseVPNListeners(supervisorCtx, cc.AddActivity)
 
 	// Auto-connect to network and start worker
 	go func() {
@@ -394,20 +464,6 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	// Create and start the server
 	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
 
-	// Add VPN listener so the terminal server is reachable over the tsnet VPN.
-	// The TCP bind is localhost-only for security; external access comes through tsnet.
-	// Bind to the explicit assigned VPN IP (not ":port") so inbound connections from
-	// the platform relay are matched by tsnet. See network.ListenVPN and issue #286.
-	if network.IsGlobalConnected() {
-		vpnPort := fmt.Sprintf("%d", config.Port)
-		if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
-			Log("terminal server VPN listener failed (localhost-only): %v", err)
-		} else {
-			ccTerminalServer.AddListener(vpnLn)
-			Log("terminal server VPN listener on %s:%s", vpnIP, vpnPort)
-		}
-	}
-
 	// Suppress terminal server logging in TUI mode to prevent display corruption
 	ccTerminalServer.SetSilent()
 
@@ -421,6 +477,11 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	ccTerminalOrgID = orgID
 	ccTerminalAPIToken = apiToken
 	ccTerminalRunning = true
+
+	// Attach the VPN listener so the terminal server is reachable over the
+	// tsnet VPN. This is decoupled from the server lifecycle (issue #317): the
+	// supervisor re-attaches it idempotently across tsnet reconnects.
+	attachTerminalVPNListener()
 	return nil
 }
 
@@ -443,6 +504,16 @@ func stopTerminalServer() {
 	ccTerminalRunning = false
 	ccTerminalOrgID = ""
 	ccTerminalAPIToken = ""
+
+	// Closing the server closes its listeners; reset the VPN-attach tracking
+	// so a subsequent start re-attaches cleanly (issue #317).
+	ccVPNMu.Lock()
+	if ccTerminalVPNListener != nil {
+		_ = ccTerminalVPNListener.Close()
+	}
+	ccTerminalVPNListener = nil
+	ccTerminalVPNIP = ""
+	ccVPNMu.Unlock()
 }
 
 // startVNCServer starts the embedded VNC server for remote desktop access.
@@ -458,19 +529,6 @@ func startVNCServer() error {
 		Port: ccVNCPort,
 		FPS:  10,
 	})
-
-	// Add VPN listener so the VNC server is reachable over the tsnet VPN.
-	// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
-	// and issue #286.
-	if network.IsGlobalConnected() {
-		vpnPort := fmt.Sprintf("%d", ccVNCPort)
-		if vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort); err != nil {
-			Log("VNC server VPN listener failed (localhost-only): %v", err)
-		} else {
-			ccVNCServer.AddListener(vpnLn)
-			Log("VNC server VPN listener on %s:%s", vpnIP, vpnPort)
-		}
-	}
 
 	ccVNCServer.SetSilent()
 
@@ -506,7 +564,12 @@ func startVNCServer() error {
 	}
 
 	ccVNCRunning = true
-	platform.SetEmbeddedVNCPort(ccVNCPort)
+
+	// Attach the VPN listener so the VNC server is reachable over the tsnet
+	// VPN. The heartbeat's vnc_port is set from inside the attach helper so it
+	// reflects actual VPN-listener reachability, not just localhost server
+	// state (issue #317).
+	attachVNCVPNListener()
 	return nil
 }
 
@@ -520,6 +583,201 @@ func stopVNCServer() {
 	}
 	ccVNCRunning = false
 	platform.ClearEmbeddedVNCPort()
+
+	// Closing the server closes its listeners; reset the VPN-attach tracking
+	// so a subsequent start re-attaches cleanly (issue #317).
+	ccVPNMu.Lock()
+	if ccVNCVPNListener != nil {
+		_ = ccVNCVPNListener.Close()
+	}
+	ccVNCVPNListener = nil
+	ccVNCVPNIP = ""
+	ccVPNMu.Unlock()
+}
+
+// vncVPNHealthyLocked reports whether the VNC VPN listener is currently
+// attached and live. Caller must hold ccVPNMu.
+func vncVPNHealthyLocked() bool {
+	return ccVNCVPNListener != nil && !ccVNCVPNListener.isDead()
+}
+
+// terminalVPNHealthyLocked reports whether the terminal VPN listener is
+// currently attached and live. Caller must hold ccVPNMu.
+func terminalVPNHealthyLocked() bool {
+	return ccTerminalVPNListener != nil && !ccTerminalVPNListener.isDead()
+}
+
+// attachVNCVPNListener (re)binds the VNC server's tsnet VPN listener,
+// idempotently. It is safe to call repeatedly: it no-ops when a live listener
+// is already attached, and it tears down and replaces a dead one (e.g. a
+// listener whose tsnet binding was torn down by a reconnect — including the
+// same-IP blip where the node returns to the same tailnet address). See issue
+// #317.
+//
+// The VNC server is only managed when desktop permission is enabled, so callers
+// gate on perms.Desktop before starting the server; this helper assumes the
+// server object exists (ccVNCServer != nil && ccVNCRunning).
+func attachVNCVPNListener() {
+	ccVPNMu.Lock()
+	defer ccVPNMu.Unlock()
+
+	if !ccVNCRunning || ccVNCServer == nil {
+		return
+	}
+
+	// A live listener is already attached — make sure the heartbeat reflects
+	// reachability and return.
+	if vncVPNHealthyLocked() {
+		platform.SetEmbeddedVNCPort(ccVNCPort)
+		return
+	}
+
+	// No live VPN listener: the desktop is unreachable over the tailnet, so the
+	// heartbeat's vnc_port must report 0 (issue #317 requirement). Clear it now
+	// even if we cannot rebind yet (e.g. still disconnected); a successful
+	// re-attach below sets it back.
+	platform.ClearEmbeddedVNCPort()
+
+	if !isConnectedFn() {
+		return
+	}
+
+	// Replace any dead listener before rebinding (don't leak it).
+	if ccVNCVPNListener != nil {
+		_ = ccVNCVPNListener.Close()
+		ccVNCServer.RemoveListener(ccVNCVPNListener)
+		ccVNCVPNListener = nil
+		ccVNCVPNIP = ""
+	}
+
+	vpnPort := fmt.Sprintf("%d", ccVNCPort)
+	rawLn, vpnIP, err := listenVPNFn("tcp", vpnPort)
+	if err != nil {
+		Log("VNC server VPN listener failed (localhost-only): %v", err)
+		platform.ClearEmbeddedVNCPort()
+		return
+	}
+
+	vpnLn := &vpnListener{Listener: rawLn}
+	ccVNCServer.AddListener(vpnLn)
+	ccVNCVPNListener = vpnLn
+	ccVNCVPNIP = vpnIP
+	platform.SetEmbeddedVNCPort(ccVNCPort)
+	Log("VNC server VPN listener on %s:%s", vpnIP, vpnPort)
+}
+
+// attachTerminalVPNListener (re)binds the terminal server's tsnet VPN listener,
+// idempotently. See attachVNCVPNListener for the contract. Issue #317.
+func attachTerminalVPNListener() {
+	ccVPNMu.Lock()
+	defer ccVPNMu.Unlock()
+
+	if !ccTerminalRunning || ccTerminalServer == nil {
+		return
+	}
+
+	if terminalVPNHealthyLocked() {
+		return
+	}
+
+	if !isConnectedFn() {
+		return
+	}
+
+	if ccTerminalVPNListener != nil {
+		_ = ccTerminalVPNListener.Close()
+		ccTerminalServer.RemoveListener(ccTerminalVPNListener)
+		ccTerminalVPNListener = nil
+		ccTerminalVPNIP = ""
+	}
+
+	vpnPort := fmt.Sprintf("%d", ccTerminalPort)
+	rawLn, vpnIP, err := listenVPNFn("tcp", vpnPort)
+	if err != nil {
+		Log("terminal server VPN listener failed (localhost-only): %v", err)
+		return
+	}
+
+	vpnLn := &vpnListener{Listener: rawLn}
+	ccTerminalServer.AddListener(vpnLn)
+	ccTerminalVPNListener = vpnLn
+	ccTerminalVPNIP = vpnIP
+	Log("terminal server VPN listener on %s:%s", vpnIP, vpnPort)
+}
+
+// vpnListenersHealthy reports whether the VPN listeners that should be attached
+// (given the running servers) are currently attached and live. The supervisor
+// uses it to decide whether a re-attach is needed. A listener is unhealthy if
+// it is missing or its accept loop saw the underlying tsnet listener get torn
+// down (issue #317). VNC is only considered when its server is running (which
+// itself is gated on desktop permission at start time).
+func vpnListenersHealthy() bool {
+	ccVPNMu.Lock()
+	defer ccVPNMu.Unlock()
+
+	if ccTerminalRunning && !terminalVPNHealthyLocked() {
+		return false
+	}
+	if ccVNCRunning && !vncVPNHealthyLocked() {
+		return false
+	}
+	return true
+}
+
+// ccSuperviseVPNListeners runs for the lifetime of the control center and
+// self-heals the VNC + terminal VPN listeners across tsnet reconnects (issue
+// #317).
+//
+// tsnet does not expose an explicit reconnect event: network.IsGlobalConnected
+// polls the backend state, and on the "context deadline exceeded" blip the
+// listener bound to the old tailnet IP is silently torn down while the server
+// keeps running. So instead of hooking an event, this supervisor polls and
+// reacts to the transition to connected, plus a steady-state health check that
+// also covers the issue's "display==available && vnc_port==0" self-heal
+// trigger (a VNC server that is running but has no reachable VPN listener).
+//
+// Re-attach is idempotent (see attach* helpers): a healthy listener is left
+// alone, a dead one is replaced.
+func ccSuperviseVPNListeners(ctx context.Context, activityFn func(level, msg string)) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	wasConnected := isConnectedFn()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		connected := isConnectedFn()
+
+		// Nothing to manage while disconnected. Listeners bound to the old IP
+		// are already dead; we re-attach on the transition back to connected.
+		if !connected {
+			wasConnected = false
+			continue
+		}
+
+		// React to a transition into connected (startup reconnect or a
+		// mid-session tsnet recovery), or to a steady-state where a running
+		// server's VPN listener has gone unreachable (display available but
+		// vnc_port effectively 0).
+		if !wasConnected || !vpnListenersHealthy() {
+			if ccTerminalRunning {
+				attachTerminalVPNListener()
+			}
+			if ccVNCRunning {
+				before := platform.EmbeddedVNCPort()
+				attachVNCVPNListener()
+				if activityFn != nil && before == 0 && platform.EmbeddedVNCPort() != 0 {
+					activityFn("info", "Desktop VPN listener re-established after network reconnect")
+				}
+			}
+		}
+
+		wasConnected = true
+	}
 }
 
 // buildChatConfig constructs ChatPageConfig from device config and manifest.

@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -81,11 +82,37 @@ func NewVNCServer(cfg VNCServerConfig) *VNCServer {
 func (s *VNCServer) SetSilent() { s.logger = &noOpLogger{} }
 
 // AddListener registers an additional net.Listener (e.g. VPN) that the server
-// will accept connections on when Start is called. Must be called before Start.
+// will accept connections on.
+//
+// If the server is already running, the listener begins accepting connections
+// immediately. This lets callers re-attach a VPN listener after a tsnet
+// reconnect without restarting the server (see issue #317). If the server is
+// not yet running, the listener is queued and served when Start is called.
 func (s *VNCServer) AddListener(ln net.Listener) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.extraListeners = append(s.extraListeners, ln)
+	running := s.running
+	s.mu.Unlock()
+
+	if running {
+		s.logger.Printf("VNC server also listening on %s (VPN, hot-attached)", ln.Addr())
+		go s.acceptLoop(ln)
+	}
+}
+
+// RemoveListener drops a previously added extra listener from the server's
+// tracking slice so a long-lived session that re-attaches a VPN listener across
+// many reconnects does not accumulate dead listener references (issue #317).
+// It does not close the listener; the caller owns its lifecycle.
+func (s *VNCServer) RemoveListener(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, l := range s.extraListeners {
+		if l == ln {
+			s.extraListeners = append(s.extraListeners[:i], s.extraListeners[i+1:]...)
+			return
+		}
+	}
 }
 
 // Start initializes the screen capturer and begins accepting VNC connections.
@@ -175,9 +202,17 @@ func (s *VNCServer) acceptLoop(ln net.Listener) {
 			case <-s.stopCh:
 				return
 			default:
-				s.logger.Printf("accept error: %v", err)
-				continue
 			}
+			// A closed listener (e.g. a tsnet VPN listener torn down on
+			// reconnect) returns a permanent error. Exiting the loop avoids a
+			// busy-spin and lets the supervisor re-attach a fresh listener
+			// (issue #317). Transient errors are retried.
+			if errors.Is(err, net.ErrClosed) {
+				s.logger.Printf("listener closed (%s), stopping accept loop", ln.Addr())
+				return
+			}
+			s.logger.Printf("accept error: %v", err)
+			continue
 		}
 		atomic.AddInt64(&s.totalConns, 1)
 		go s.handleConn(conn)
