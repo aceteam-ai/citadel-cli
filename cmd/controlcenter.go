@@ -242,6 +242,7 @@ func runControlCenter() {
 				return config.SaveKeepAwake(platform.ConfigDir(), k)
 			},
 		},
+		WhatsApp: buildWhatsAppCallbacks(),
 	}
 
 	cc := controlcenter.New(cfg)

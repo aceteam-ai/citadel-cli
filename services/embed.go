@@ -24,14 +24,18 @@ var SGLangCompose string
 //go:embed compose/extraction.yml
 var ExtractionCompose string
 
+//go:embed compose/whatsapp-bridge.yml
+var WhatsAppBridgeCompose string
+
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
-	"ollama":     OllamaCompose,
-	"vllm":       VLLMCompose,
-	"llamacpp":   LlamacppCompose,
-	"lmstudio":   LMStudioCompose,
-	"sglang":     SGLangCompose,
-	"extraction": ExtractionCompose,
+	"ollama":          OllamaCompose,
+	"vllm":            VLLMCompose,
+	"llamacpp":        LlamacppCompose,
+	"lmstudio":        LMStudioCompose,
+	"sglang":          SGLangCompose,
+	"extraction":      ExtractionCompose,
+	"whatsapp-bridge": WhatsAppBridgeCompose,
 }
 
 // GetAvailableServices returns a sorted list of service names.
