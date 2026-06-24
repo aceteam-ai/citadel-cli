@@ -47,6 +47,115 @@ import (
 // existing tunnels, never bound to a public interface.
 const DefaultCobrowseDebugPort = 9222
 
+// EnvCobrowseStealth toggles the anti-bot-detection ("stealth") launch flags.
+// Stealth is ON by default for co-browse; set this env var to "0" / "false" /
+// "off" to launch a plain automation-flavored Chromium instead (useful for
+// debugging or for parity with the pre-stealth behavior).
+const EnvCobrowseStealth = "CITADEL_COBROWSE_STEALTH"
+
+// EnvCobrowseUserAgent optionally overrides the browser User-Agent. By default
+// we leave the UA UNSET so real headed Chrome reports its own (correct, current)
+// UA -- a hardcoded UA pins a Chrome version that drifts out of sync with the
+// actual binary, and that mismatch is itself a bot-detection signal. Only set
+// this when you deliberately want to spoof a specific UA.
+const EnvCobrowseUserAgent = "CITADEL_COBROWSE_USER_AGENT"
+
+// cobrowseLaunchOptions is the full input to buildChromeArgs. Keeping it a plain
+// struct (rather than an interface/registry) is deliberate: a future full
+// CloakBrowser launcher swaps in by constructing different options or by calling
+// a different builder, without any plugin abstraction to maintain here.
+type cobrowseLaunchOptions struct {
+	debugPort  int
+	profileDir string
+	startURL   string
+	// stealth enables the anti-bot-detection launch flags (see buildChromeArgs).
+	stealth bool
+	// lang is the UI/Accept-Language locale (e.g. "en-US"). Defaults applied by
+	// buildChromeArgs when empty.
+	lang string
+	// userAgent, when non-empty, overrides the browser User-Agent. Empty means
+	// "use real Chrome's own UA" (recommended -- see EnvCobrowseUserAgent).
+	userAgent string
+}
+
+// stealthEnabled resolves whether stealth launch flags should be applied,
+// reading EnvCobrowseStealth. Stealth is ON unless explicitly disabled.
+func stealthEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvCobrowseStealth))) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+// buildChromeArgs constructs the Chromium command-line for a co-browse launch.
+// It is a pure function (no I/O, no globals beyond its inputs) so the flag set
+// is unit-testable without launching a browser or touching a display.
+//
+// Stealth (anti-bot-detection) notes -- this is the citadel-side, launch-flag
+// layer of the team's stealth-Chromium approach (CloakBrowser), which is the
+// intended long-term replacement for this plain launch:
+//   - --disable-blink-features=AutomationControlled removes the headless/automation
+//     Blink feature so navigator.webdriver is not forced true. This is the single
+//     most load-bearing stealth flag.
+//   - We deliberately NEVER pass --enable-automation. Launching raw via exec means
+//     Chrome does not add the automation switches or the "Chrome is being controlled
+//     by automated test software" infobar unless we ask for them -- so simply not
+//     emitting that flag satisfies the "no infobar / exclude enable-automation"
+//     requirement. (--exclude-switches / excludeSwitches is a chromedriver
+//     capability, not a Chrome CLI flag, so there is intentionally no such arg.
+//     --disable-infobars was removed from modern Chrome and is intentionally
+//     omitted too.)
+//   - --lang pins a realistic locale.
+//   - --user-data-dir gives a persistent stealth profile so cookies, history, and
+//     the resulting fingerprint stay consistent across jobs.
+//
+// What stealth flags CANNOT do (and therefore needs the full CloakBrowser
+// wrapper, tracked as follow-up): CDP-level
+// Page.addScriptToEvaluateOnNewDocument fingerprint patches (navigator.webdriver /
+// plugins / languages, window.chrome.runtime, permissions.query, WebGL
+// vendor/renderer, canvas/audio noise), per-identity consistent fingerprints,
+// and proxy/TLS (JA3) alignment.
+func buildChromeArgs(opts cobrowseLaunchOptions) []string {
+	// disableFeatures is built as a single slice and emitted as ONE
+	// --disable-features flag. Chrome only honors the last --disable-features
+	// occurrence, so appending a second flag would silently drop earlier values
+	// (e.g. Translate). Future stealth additions go in this slice, not a new flag.
+	disableFeatures := []string{"Translate"}
+
+	args := []string{
+		fmt.Sprintf("--remote-debugging-port=%d", opts.debugPort),
+		"--remote-debugging-address=127.0.0.1",
+		"--user-data-dir=" + opts.profileDir,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--start-maximized",
+	}
+
+	if opts.stealth {
+		// Core anti-automation signal: drop the AutomationControlled Blink
+		// feature so navigator.webdriver is not forced true.
+		args = append(args, "--disable-blink-features=AutomationControlled")
+		lang := opts.lang
+		if lang == "" {
+			lang = "en-US"
+		}
+		args = append(args, "--lang="+lang)
+		if opts.userAgent != "" {
+			args = append(args, "--user-agent="+opts.userAgent)
+		}
+	}
+
+	// Emit the merged disable-features exactly once (see note above).
+	args = append(args, "--disable-features="+strings.Join(disableFeatures, ","))
+
+	if opts.startURL != "" {
+		args = append(args, opts.startURL)
+	}
+	return args
+}
+
 // CobrowseDriver identifies who currently controls the session.
 type CobrowseDriver string
 
@@ -181,18 +290,16 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 		return CobrowseStatus{}, err
 	}
 
-	args := []string{
-		fmt.Sprintf("--remote-debugging-port=%d", debugPort),
-		"--remote-debugging-address=127.0.0.1",
-		"--user-data-dir=" + profileDir,
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-features=Translate",
-		"--start-maximized",
-	}
-	if startURL != "" {
-		args = append(args, startURL)
-	}
+	// Stealth (anti-bot-detection) is ON by default for co-browse; this is the
+	// first citadel-side step toward the full CloakBrowser launch replacing this
+	// plain Chromium launch. Disable via EnvCobrowseStealth for plain behavior.
+	args := buildChromeArgs(cobrowseLaunchOptions{
+		debugPort:  debugPort,
+		profileDir: profileDir,
+		startURL:   startURL,
+		stealth:    stealthEnabled(),
+		userAgent:  os.Getenv(EnvCobrowseUserAgent),
+	})
 
 	cmd := exec.Command(chrome, args...)
 	// The browser must render on the SAME X display the node's VNC server
