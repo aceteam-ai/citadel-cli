@@ -127,4 +127,5 @@ const (
 	JobTypeVNCScreenshot     = "VNC_SCREENSHOT"      // Capture the node's display via the VNC tool path (issue #4179)
 	JobTypeVNCType           = "VNC_TYPE"            // Type text on the node's display (issue #4179)
 	JobTypeVNCKeys           = "VNC_KEYS"            // Send a key combo to the node's display (issue #4179)
+	JobTypeVNCActions        = "VNC_ACTIONS"         // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
 )

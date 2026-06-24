@@ -152,6 +152,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}),
 		NewLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}),
 		NewLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}),
+		// VNC_ACTIONS exposes the pointer/keyboard primitives shipped in #314
+		// (move/click/mousedown/mouseup/scroll, including the drag sequence) over
+		// the fabric Redis transport so the aceteam desktop_click / desktop_drag
+		// MCP tools can drive a node end to end (issue #4180). Same unconditional
+		// registration rationale as the screenshot/type/keys handlers above.
+		NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
 	}
 
 	// Register file-operation handlers when a workspace is configured.

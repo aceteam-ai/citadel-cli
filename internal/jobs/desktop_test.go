@@ -57,6 +57,46 @@ func TestBuildKeyActions(t *testing.T) {
 	}
 }
 
+func TestBuildActions(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantLen int
+		wantErr bool
+	}{
+		{"single click", `[{"type":"click","x":100,"y":200,"button":1}]`, 1, false},
+		{
+			"drag sequence",
+			`[{"type":"move","x":10,"y":20},{"type":"mousedown","button":1},{"type":"move","x":90,"y":80},{"type":"mouseup","button":1}]`,
+			4,
+			false,
+		},
+		{"empty payload", "", 0, true},
+		{"whitespace payload", "   ", 0, true},
+		{"empty array", `[]`, 0, true},
+		{"invalid json", `not json`, 0, true},
+		{"unknown action rejected", `[{"type":"exec","text":"rm -rf /"}]`, 0, true},
+		{"click out of range rejected", `[{"type":"click","x":-1,"y":100}]`, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actions, err := buildActions(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (got %d actions)", len(actions))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(actions) != tt.wantLen {
+				t.Errorf("got %d actions, want %d", len(actions), tt.wantLen)
+			}
+		})
+	}
+}
+
 func TestBuildTypeActions(t *testing.T) {
 	actions, err := buildTypeActions("hello world")
 	if err != nil {

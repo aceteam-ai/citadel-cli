@@ -143,6 +143,55 @@ func (h *KeysHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 // Ensure KeysHandler implements JobHandler.
 var _ JobHandler = (*KeysHandler)(nil)
 
+// ActionsHandler executes a sequence of pointer/keyboard actions (move, click,
+// mousedown, mouseup, scroll, type, key) on the node's display. It backs the
+// VNC_ACTIONS job type behind the aceteam `desktop_click` / `desktop_drag` MCP
+// tools (issue #4180), reusing the existing internal/desktop input path -- the
+// same path the HTTP /api/actions endpoint uses. This is what makes the
+// computer_use click and drag primitives reachable over the fabric transport.
+type ActionsHandler struct{}
+
+// Execute runs the payload's `actions` array on the display.
+//
+// Payload fields:
+//   - actions: a JSON array of action objects (required, non-empty), e.g.
+//     `[{"type":"move","x":10,"y":20},{"type":"mousedown","button":1},
+//     {"type":"move","x":90,"y":80},{"type":"mouseup","button":1}]`.
+//     The aceteam side builds this with python_tools.computer_use.translate_action,
+//     so the wire format matches desktop.ParseActions exactly.
+//
+// Response JSON: {"ok": true, "count": <number-of-actions>}.
+func (h *ActionsHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	actions, err := buildActions(job.Payload["actions"])
+	if err != nil {
+		return nil, err
+	}
+
+	ctx.Log("info", "     - [Job %s] VNC_ACTIONS executing %d action(s)", job.ID, len(actions))
+
+	if err := desktop.ExecuteActions(context.Background(), actions); err != nil {
+		return nil, fmt.Errorf("actions failed: %w", err)
+	}
+
+	return json.Marshal(map[string]any{"ok": true, "count": len(actions)})
+}
+
+// Ensure ActionsHandler implements JobHandler.
+var _ JobHandler = (*ActionsHandler)(nil)
+
+// buildActions parses and validates the `actions` JSON array from a VNC_ACTIONS
+// payload. Pure function: unit-testable without a live display.
+func buildActions(raw string) ([]desktop.Action, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("job payload missing 'actions' field")
+	}
+	actions, err := desktop.ParseActions([]byte(raw))
+	if err != nil {
+		return nil, fmt.Errorf("invalid actions: %w", err)
+	}
+	return actions, nil
+}
+
 // buildTypeActions translates literal text into a validated type action.
 // Kept as a pure function so it can be unit-tested without a live display.
 func buildTypeActions(text string) ([]desktop.Action, error) {
