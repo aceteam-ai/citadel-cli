@@ -15,6 +15,7 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/hashicorp/go-version v1.8.0
 	github.com/mattn/go-runewidth v0.0.19
+	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/redis/go-redis/v9 v9.17.2
 	github.com/rivo/tview v0.42.0
 	github.com/shirou/gopsutil/v3 v3.24.5
@@ -64,7 +65,7 @@ require (
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
-	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
@@ -107,6 +108,7 @@ require (
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )
 
 replace github.com/gdamore/tcell/v2 => ./patches/tcell/v2
