@@ -72,10 +72,10 @@ func resetVPNState(t *testing.T) {
 		ccTerminalVPNIP = ""
 		ccVPNMu.Unlock()
 
-		ccVNCRunning = false
-		ccVNCServer = nil
-		ccTerminalRunning = false
-		ccTerminalServer = nil
+		ccVNCRunning.Store(false)
+		ccVNCServer.Store(nil)
+		ccTerminalRunning.Store(false)
+		ccTerminalServer.Store(nil)
 		platform.ClearEmbeddedVNCPort()
 	}
 
@@ -104,8 +104,8 @@ func TestAttachVNCVPNListenerIdempotent(t *testing.T) {
 		return &fakeListener{addr: currentIP + ":" + port}, currentIP, nil
 	}
 
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
-	ccVNCRunning = true
+	ccVNCServer.Store(desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort}))
+	ccVNCRunning.Store(true)
 
 	attachVNCVPNListener()
 	attachVNCVPNListener() // idempotent: listener still live → no rebind
@@ -152,10 +152,10 @@ func TestVPNListenerReattachAfterSameIPReconnect(t *testing.T) {
 	}
 
 	// Both servers running (desktop permission assumed enabled by caller).
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
-	ccVNCRunning = true
-	ccTerminalServer = terminal.NewServer(terminal.DefaultConfig(), nil)
-	ccTerminalRunning = true
+	ccVNCServer.Store(desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort}))
+	ccVNCRunning.Store(true)
+	ccTerminalServer.Store(terminal.NewServer(terminal.DefaultConfig(), nil))
+	ccTerminalRunning.Store(true)
 
 	// 1. Initial attach while connected.
 	attachVNCVPNListener()
@@ -228,8 +228,8 @@ func TestVPNSupervisorReattachOnHealthLoss(t *testing.T) {
 		return ln, sameIP, nil
 	}
 
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
-	ccVNCRunning = true
+	ccVNCServer.Store(desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort}))
+	ccVNCRunning.Store(true)
 
 	attachVNCVPNListener()
 	if platform.EmbeddedVNCPort() != ccVNCPort {
@@ -283,8 +283,8 @@ func TestVNCPortDropsWhileListenerDeadAndDisconnected(t *testing.T) {
 		return ln, sameIP, nil
 	}
 
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
-	ccVNCRunning = true
+	ccVNCServer.Store(desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort}))
+	ccVNCRunning.Store(true)
 
 	attachVNCVPNListener()
 	if platform.EmbeddedVNCPort() != ccVNCPort {
@@ -318,8 +318,8 @@ func TestAttachVNCVPNListenerSkippedWhenDisconnected(t *testing.T) {
 		return nil, "", nil
 	}
 
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
-	ccVNCRunning = true
+	ccVNCServer.Store(desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort}))
+	ccVNCRunning.Store(true)
 
 	attachVNCVPNListener()
 
@@ -329,4 +329,78 @@ func TestAttachVNCVPNListenerSkippedWhenDisconnected(t *testing.T) {
 	if platform.EmbeddedVNCPort() != 0 {
 		t.Errorf("EmbeddedVNCPort() = %d while disconnected, want 0", platform.EmbeddedVNCPort())
 	}
+}
+
+// TestVPNListenerSupervisorRaceWithStartStop exercises the issue #319 data race:
+// the VPN-listener supervisor (vpnListenersHealthy + the attach* helpers it
+// calls) reads ccVNCRunning/ccTerminalRunning/ccVNCServer/ccTerminalServer
+// concurrently with the start/stop paths that write them. Before these globals
+// were made atomic, those reads/writes were unsynchronized — a genuine data
+// race under the Go memory model — and `go test -race` flags it. Run with
+// -race; with the fix it is clean.
+//
+// The writer goroutines mirror startVNCServer/stopVNCServer and
+// startTerminalServer/stopTerminalServer: they publish a real (non-nil) server
+// pointer and flip the running flag on, then flip it off (production stop*
+// never nils the server pointer, so neither do we — that would manufacture a
+// nil-deref that cannot happen in prod). The reader goroutine drives the exact
+// supervisor decision path. The network indirection hooks are stubbed so attach
+// never touches a real tailnet.
+func TestVPNListenerSupervisorRaceWithStartStop(t *testing.T) {
+	resetVPNState(t)
+
+	const ip = "100.64.0.30"
+	isConnectedFn = func() bool { return true }
+	currentVPNIPFn = func() (string, error) { return ip, nil }
+	listenVPNFn = func(network, port string) (net.Listener, string, error) {
+		return &fakeListener{addr: ip + ":" + port}, ip, nil
+	}
+
+	// Pre-create real, non-nil servers the writers publish (mirrors what
+	// startVNCServer/startTerminalServer Store after a successful Start).
+	vncSrv := desktop.NewVNCServer(desktop.VNCServerConfig{Host: "127.0.0.1", Port: ccVNCPort})
+	termSrv := terminal.NewServer(terminal.DefaultConfig(), nil)
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+
+	// Writer 1: start/stop the VNC server globals.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			ccVNCServer.Store(vncSrv)
+			ccVNCRunning.Store(true)
+			ccVNCRunning.Store(false)
+		}
+	}()
+
+	// Writer 2: start/stop the terminal server globals.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			ccTerminalServer.Store(termSrv)
+			ccTerminalRunning.Store(true)
+			ccTerminalRunning.Store(false)
+		}
+	}()
+
+	// Reader: the supervisor's steady-state decision path — health check plus
+	// both idempotent re-attaches.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = vpnListenersHealthy()
+			if ccTerminalRunning.Load() {
+				attachTerminalVPNListener()
+			}
+			if ccVNCRunning.Load() {
+				attachVNCVPNListener()
+			}
+		}
+	}()
+
+	wg.Wait()
 }

@@ -61,21 +61,32 @@ var (
 	ccDemoPort   = 7777
 )
 
-// Terminal server state
+// Terminal server state.
+//
+// ccTerminalServer and ccTerminalRunning are accessed concurrently by the VPN
+// listener supervisor (ccSuperviseVPNListeners and the attach* helpers it
+// calls) and the start/stop paths, so they are atomics. They must NOT be
+// guarded by ccVPNMu: startTerminalServer sets the running flag and then calls
+// attachTerminalVPNListener, which locks ccVPNMu — a plain mutex around the
+// flag would re-enter and deadlock (issue #319). ccTerminalOrgID/APIToken are
+// only touched on the start/stop paths (never by the supervisor) so they stay
+// plain.
 var (
-	ccTerminalServer   *terminal.Server
+	ccTerminalServer   atomic.Pointer[terminal.Server]
 	ccTerminalAuth     *terminal.CachingTokenValidator
 	ccTerminalPort     = 7860
-	ccTerminalRunning  bool
+	ccTerminalRunning  atomic.Bool
 	ccTerminalOrgID    string // orgID the terminal server was started with
 	ccTerminalAPIToken string // device API token the terminal server was started with
 )
 
-// VNC server state
+// VNC server state. ccVNCServer/ccVNCRunning are atomics for the same reason as
+// the terminal globals above (concurrent supervisor access; ccVPNMu must not
+// guard them or attachVNCVPNListener would re-enter it). See issue #319.
 var (
-	ccVNCServer  *desktop.VNCServer
+	ccVNCServer  atomic.Pointer[desktop.VNCServer]
 	ccVNCPort    = 5900
-	ccVNCRunning bool
+	ccVNCRunning atomic.Bool
 )
 
 // vpnListener wraps a tsnet VPN listener with a liveness flag. tsnet does not
@@ -94,10 +105,12 @@ type vpnListener struct {
 
 func (l *vpnListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
-	if err != nil && !l.closed.Load() {
-		// The accept loop saw an error we did not cause by closing the
-		// listener ourselves: treat the VPN listener as dead so the supervisor
-		// re-attaches it. (When we close it on purpose, closed is already set.)
+	if err != nil && !l.closed.Load() && errors.Is(err, net.ErrClosed) {
+		// Only a closed/torn-down listener is terminal — mark it dead so the
+		// supervisor re-attaches it. This mirrors the server accept loops, which
+		// treat only net.ErrClosed as terminal and continue on transient errors
+		// (issue #319): a transient Accept error must NOT trigger a needless
+		// tear-down/rebind. (When we close it on purpose, closed is already set.)
 		l.dead.Store(true)
 	}
 	return conn, err
@@ -424,7 +437,7 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 		if cfg := getDeviceConfigFromFile(); cfg != nil {
 			currentAPIToken = cfg.DeviceAPIToken
 		}
-		if ccTerminalRunning && (orgID != ccTerminalOrgID || currentAPIToken != ccTerminalAPIToken) {
+		if ccTerminalRunning.Load() && (orgID != ccTerminalOrgID || currentAPIToken != ccTerminalAPIToken) {
 			activityFn("info", "Credentials changed, restarting terminal server...")
 			stopTerminalServer()
 		}
@@ -459,7 +472,7 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 // activityFn routes log messages through the TUI activity panel. It must
 // not be nil — callers always pass one from ccOnNetworkConnect.
 func startTerminalServer(orgID string, activityFn func(level, msg string)) error {
-	if ccTerminalRunning {
+	if ccTerminalRunning.Load() {
 		return nil // Already running
 	}
 
@@ -493,22 +506,25 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 		return fmt.Errorf("failed to start token cache: %w", err)
 	}
 
-	// Create and start the server
-	ccTerminalServer = terminal.NewServer(config, ccTerminalAuth)
+	// Create and start the server. Operate on a local until fully started, then
+	// publish the pointer atomically so concurrent readers (the supervisor)
+	// never observe a half-initialized server.
+	srv := terminal.NewServer(config, ccTerminalAuth)
 
 	// Suppress terminal server logging in TUI mode to prevent display corruption
-	ccTerminalServer.SetSilent()
+	srv.SetSilent()
 
-	if err := ccTerminalServer.Start(); err != nil {
+	if err := srv.Start(); err != nil {
 		ccTerminalAuth.Stop()
 		return fmt.Errorf("failed to start terminal server: %w", err)
 	}
+	ccTerminalServer.Store(srv)
 
 	// Record which credentials the server was started with, so we can
 	// detect when they change (e.g., after re-pairing) and restart.
 	ccTerminalOrgID = orgID
 	ccTerminalAPIToken = apiToken
-	ccTerminalRunning = true
+	ccTerminalRunning.Store(true)
 
 	// Attach the VPN listener so the terminal server is reachable over the
 	// tsnet VPN. This is decoupled from the server lifecycle (issue #317): the
@@ -519,7 +535,7 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 
 // stopTerminalServer stops the terminal server
 func stopTerminalServer() {
-	if !ccTerminalRunning {
+	if !ccTerminalRunning.Load() {
 		return
 	}
 
@@ -527,13 +543,13 @@ func stopTerminalServer() {
 		ccTerminalAuth.Stop()
 	}
 
-	if ccTerminalServer != nil {
+	if srv := ccTerminalServer.Load(); srv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = ccTerminalServer.Stop(ctx)
+		_ = srv.Stop(ctx)
 	}
 
-	ccTerminalRunning = false
+	ccTerminalRunning.Store(false)
 	ccTerminalOrgID = ""
 	ccTerminalAPIToken = ""
 
@@ -552,17 +568,19 @@ func stopTerminalServer() {
 // It retries transient failures (e.g. screen capture init racing with display
 // server startup) up to 3 times with exponential backoff.
 func startVNCServer() error {
-	if ccVNCRunning {
+	if ccVNCRunning.Load() {
 		return nil
 	}
 
-	ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{
+	// Operate on a local until the server is fully started, then publish the
+	// pointer atomically so the supervisor never observes a half-built server.
+	srv := desktop.NewVNCServer(desktop.VNCServerConfig{
 		Host: "127.0.0.1",
 		Port: ccVNCPort,
 		FPS:  10,
 	})
 
-	ccVNCServer.SetSilent()
+	srv.SetSilent()
 
 	// Retry with backoff for transient failures (display not ready yet).
 	// Permanent failures (unsupported platform) bail immediately.
@@ -571,7 +589,7 @@ func startVNCServer() error {
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ccVNCServer.Start(); err != nil {
+		if err := srv.Start(); err != nil {
 			lastErr = err
 			// Permanent failure: platform doesn't support screen capture
 			if strings.Contains(err.Error(), "not supported") {
@@ -582,12 +600,12 @@ func startVNCServer() error {
 				time.Sleep(interval)
 				interval *= 2
 				// Re-create server for retry since Start() sets running=false on failure
-				ccVNCServer = desktop.NewVNCServer(desktop.VNCServerConfig{
+				srv = desktop.NewVNCServer(desktop.VNCServerConfig{
 					Host: "127.0.0.1",
 					Port: ccVNCPort,
 					FPS:  10,
 				})
-				ccVNCServer.SetSilent()
+				srv.SetSilent()
 				continue
 			}
 			return fmt.Errorf("failed to start VNC server after %d attempts: %w", maxRetries+1, lastErr)
@@ -595,7 +613,8 @@ func startVNCServer() error {
 		break
 	}
 
-	ccVNCRunning = true
+	ccVNCServer.Store(srv)
+	ccVNCRunning.Store(true)
 
 	// Attach the VPN listener so the VNC server is reachable over the tsnet
 	// VPN. The heartbeat's vnc_port is set from inside the attach helper so it
@@ -607,13 +626,13 @@ func startVNCServer() error {
 
 // stopVNCServer stops the embedded VNC server
 func stopVNCServer() {
-	if !ccVNCRunning {
+	if !ccVNCRunning.Load() {
 		return
 	}
-	if ccVNCServer != nil {
-		ccVNCServer.Stop()
+	if srv := ccVNCServer.Load(); srv != nil {
+		srv.Stop()
 	}
-	ccVNCRunning = false
+	ccVNCRunning.Store(false)
 	platform.ClearEmbeddedVNCPort()
 
 	// Closing the server closes its listeners; reset the VPN-attach tracking
@@ -648,12 +667,16 @@ func terminalVPNHealthyLocked() bool {
 //
 // The VNC server is only managed when desktop permission is enabled, so callers
 // gate on perms.Desktop before starting the server; this helper assumes the
-// server object exists (ccVNCServer != nil && ccVNCRunning).
+// server object exists (ccVNCServer.Load() != nil && ccVNCRunning.Load()).
 func attachVNCVPNListener() {
 	ccVPNMu.Lock()
 	defer ccVPNMu.Unlock()
 
-	if !ccVNCRunning || ccVNCServer == nil {
+	// Load the server pointer once and use the local for every method call: a
+	// concurrent stopVNCServer could otherwise swap it between the nil-check and
+	// AddListener (issue #319 data race).
+	srv := ccVNCServer.Load()
+	if !ccVNCRunning.Load() || srv == nil {
 		return
 	}
 
@@ -677,7 +700,7 @@ func attachVNCVPNListener() {
 	// Replace any dead listener before rebinding (don't leak it).
 	if ccVNCVPNListener != nil {
 		_ = ccVNCVPNListener.Close()
-		ccVNCServer.RemoveListener(ccVNCVPNListener)
+		srv.RemoveListener(ccVNCVPNListener)
 		ccVNCVPNListener = nil
 		ccVNCVPNIP = ""
 	}
@@ -691,7 +714,7 @@ func attachVNCVPNListener() {
 	}
 
 	vpnLn := &vpnListener{Listener: rawLn}
-	ccVNCServer.AddListener(vpnLn)
+	srv.AddListener(vpnLn)
 	ccVNCVPNListener = vpnLn
 	ccVNCVPNIP = vpnIP
 	platform.SetEmbeddedVNCPort(ccVNCPort)
@@ -704,7 +727,9 @@ func attachTerminalVPNListener() {
 	ccVPNMu.Lock()
 	defer ccVPNMu.Unlock()
 
-	if !ccTerminalRunning || ccTerminalServer == nil {
+	// Load the server pointer once; see attachVNCVPNListener for why (issue #319).
+	srv := ccTerminalServer.Load()
+	if !ccTerminalRunning.Load() || srv == nil {
 		return
 	}
 
@@ -718,7 +743,7 @@ func attachTerminalVPNListener() {
 
 	if ccTerminalVPNListener != nil {
 		_ = ccTerminalVPNListener.Close()
-		ccTerminalServer.RemoveListener(ccTerminalVPNListener)
+		srv.RemoveListener(ccTerminalVPNListener)
 		ccTerminalVPNListener = nil
 		ccTerminalVPNIP = ""
 	}
@@ -731,7 +756,7 @@ func attachTerminalVPNListener() {
 	}
 
 	vpnLn := &vpnListener{Listener: rawLn}
-	ccTerminalServer.AddListener(vpnLn)
+	srv.AddListener(vpnLn)
 	ccTerminalVPNListener = vpnLn
 	ccTerminalVPNIP = vpnIP
 	Log("terminal server VPN listener on %s:%s", vpnIP, vpnPort)
@@ -747,10 +772,10 @@ func vpnListenersHealthy() bool {
 	ccVPNMu.Lock()
 	defer ccVPNMu.Unlock()
 
-	if ccTerminalRunning && !terminalVPNHealthyLocked() {
+	if ccTerminalRunning.Load() && !terminalVPNHealthyLocked() {
 		return false
 	}
-	if ccVNCRunning && !vncVPNHealthyLocked() {
+	if ccVNCRunning.Load() && !vncVPNHealthyLocked() {
 		return false
 	}
 	return true
@@ -796,10 +821,10 @@ func ccSuperviseVPNListeners(ctx context.Context, activityFn func(level, msg str
 		// server's VPN listener has gone unreachable (display available but
 		// vnc_port effectively 0).
 		if !wasConnected || !vpnListenersHealthy() {
-			if ccTerminalRunning {
+			if ccTerminalRunning.Load() {
 				attachTerminalVPNListener()
 			}
-			if ccVNCRunning {
+			if ccVNCRunning.Load() {
 				before := platform.EmbeddedVNCPort()
 				attachVNCVPNListener()
 				if activityFn != nil && before == 0 && platform.EmbeddedVNCPort() != 0 {
@@ -1032,7 +1057,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	data.DemoServerURL = fmt.Sprintf("http://localhost:%d", ccDemoPort)
 
 	// Terminal server URL (only shown when running and connected)
-	if ccTerminalRunning {
+	if ccTerminalRunning.Load() {
 		data.TerminalServerURL = fmt.Sprintf("ws://localhost:%d/terminal", ccTerminalPort)
 	}
 
