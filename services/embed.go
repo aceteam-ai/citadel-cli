@@ -27,6 +27,9 @@ var ExtractionCompose string
 //go:embed compose/whatsapp-bridge.yml
 var WhatsAppBridgeCompose string
 
+//go:embed compose/transcribe.yml
+var TranscribeCompose string
+
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
 	"ollama":          OllamaCompose,
@@ -36,6 +39,7 @@ var ServiceMap = map[string]string{
 	"sglang":          SGLangCompose,
 	"extraction":      ExtractionCompose,
 	"whatsapp-bridge": WhatsAppBridgeCompose,
+	"transcribe":      TranscribeCompose,
 }
 
 // GetAvailableServices returns a sorted list of service names.
