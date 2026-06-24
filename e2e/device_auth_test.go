@@ -121,6 +121,13 @@ func TestDeviceAuthExpiry(t *testing.T) {
 
 	aceteam := harness.NewAceTeamHarness(aceteamURL)
 
+	// Skip when the AceTeam API isn't reachable (e.g. running the suite without
+	// the platform up — including release.sh's `go test ./...` gate), matching
+	// TestDeviceAuthFlow above rather than hard-failing on connection refused.
+	if err := aceteam.WaitForReady(ctx, 10*time.Second); err != nil {
+		t.Skipf("AceTeam API not ready: %v", err)
+	}
+
 	// Poll with a fake/expired device code
 	tokenResp, tokenErr, err := aceteam.PollForToken(ctx, "fake-expired-code-12345")
 	if err != nil {
