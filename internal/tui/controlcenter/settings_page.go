@@ -17,6 +17,16 @@ type SettingsCallbacks struct {
 	LoadTelemetry func() *config.Telemetry
 	// SaveTelemetry persists an updated telemetry setting.
 	SaveTelemetry func(*config.Telemetry) error
+
+	// LoadKeepAwake returns the current persisted keep-awake setting.
+	LoadKeepAwake func() *config.KeepAwake
+	// SaveKeepAwake persists an updated keep-awake setting.
+	SaveKeepAwake func(*config.KeepAwake) error
+	// KeepAwakeState reports the live runtime state of the keep-awake monitor
+	// (whether an assertion is currently held and the detected power source).
+	// May be nil if the monitor is not running. The string is a short,
+	// already-formatted label like "on (AC)" or "off (battery)".
+	KeepAwakeState func() string
 }
 
 // connStatusProvider exposes the user-facing connection status. The ChatPage
@@ -38,6 +48,7 @@ type SettingsPage struct {
 
 	// State
 	telemetry *config.Telemetry
+	keepAwake *config.KeepAwake
 
 	// UI
 	root *tview.Flex
@@ -80,6 +91,7 @@ func (p *SettingsPage) Build(app *tview.Application) tview.Primitive {
 // OnActivate implements Page. Reloads persisted settings and re-renders.
 func (p *SettingsPage) OnActivate() {
 	p.reloadTelemetry()
+	p.reloadKeepAwake()
 	p.render()
 	if p.app != nil && p.view != nil {
 		p.app.SetFocus(p.view)
@@ -89,9 +101,13 @@ func (p *SettingsPage) OnActivate() {
 // OnDeactivate implements Page.
 func (p *SettingsPage) OnDeactivate() {}
 
-// HandleInput implements Page. Space or 't' toggles the telemetry opt-out.
+// HandleInput implements Page. Space/Enter/'t' toggles the telemetry opt-out;
+// 'k' toggles the keep-awake-on-AC opt-in.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
+	case event.Key() == tcell.KeyRune && (event.Rune() == 'k' || event.Rune() == 'K'):
+		p.toggleKeepAwake()
+		return nil
 	case event.Key() == tcell.KeyRune && (event.Rune() == ' ' || event.Rune() == 't' || event.Rune() == 'T'):
 		p.toggleTelemetry()
 		return nil
@@ -131,6 +147,35 @@ func (p *SettingsPage) toggleTelemetry() {
 	p.render()
 }
 
+// reloadKeepAwake refreshes the in-memory keep-awake setting from disk.
+func (p *SettingsPage) reloadKeepAwake() {
+	if p.cb.LoadKeepAwake != nil {
+		p.keepAwake = p.cb.LoadKeepAwake()
+	}
+	if p.keepAwake == nil {
+		p.keepAwake = config.DefaultKeepAwake()
+	}
+}
+
+// toggleKeepAwake flips the keep-awake-on-AC opt-in and persists it.
+func (p *SettingsPage) toggleKeepAwake() {
+	if p.keepAwake == nil {
+		p.reloadKeepAwake()
+	}
+
+	next := &config.KeepAwake{KeepAwakeOnAC: !p.keepAwake.KeepAwakeOnAC}
+
+	if p.cb.SaveKeepAwake != nil {
+		if err := p.cb.SaveKeepAwake(next); err != nil {
+			p.keepAwake = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.keepAwake = next
+	p.render()
+}
+
 // render redraws the settings view from current state.
 func (p *SettingsPage) render() {
 	p.renderWithError("")
@@ -158,6 +203,24 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   [white]Why:[-] it helps us debug problems remotely and improve\n")
 	sb.WriteString("   Citadel. Opting out stops [white::b]all[-:-:-] anonymous collection.\n\n")
 	sb.WriteString("   [yellow::b]Space[-:-:-]/[yellow::b]Enter[-:-:-] toggle collection\n")
+
+	// -- Keep-awake on AC --
+	keepEnabled := p.keepAwake != nil && p.keepAwake.KeepAwakeOnAC
+	sb.WriteString("\n [yellow::b]Keep Awake on AC[-:-:-]\n\n")
+	if keepEnabled {
+		sb.WriteString("   Status:  [green::b]ON[-:-:-]  [gray](opted in)[-]\n")
+	} else {
+		sb.WriteString("   Status:  [red::b]OFF[-:-:-]  [gray](default)[-]\n")
+	}
+	if p.cb.KeepAwakeState != nil {
+		if live := p.cb.KeepAwakeState(); live != "" {
+			sb.WriteString(fmt.Sprintf("   Keep-awake:  [white]%s[-]\n", live))
+		}
+	}
+	sb.WriteString("\n   [white]What it does:[-] holds a system idle-sleep assertion while\n")
+	sb.WriteString("   this node is plugged in, so the laptop stays reachable on the\n")
+	sb.WriteString("   mesh. Released on battery and on exit. Display may still sleep.\n\n")
+	sb.WriteString("   [yellow::b]k[-:-:-] toggle keep-awake\n")
 
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")

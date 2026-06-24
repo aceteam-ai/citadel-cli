@@ -215,6 +215,12 @@ func runControlCenter() {
 			SaveTelemetry: func(t *config.Telemetry) error {
 				return config.SaveTelemetry(platform.ConfigDir(), t)
 			},
+			LoadKeepAwake: func() *config.KeepAwake {
+				return config.LoadKeepAwake(platform.ConfigDir())
+			},
+			SaveKeepAwake: func(k *config.KeepAwake) error {
+				return config.SaveKeepAwake(platform.ConfigDir(), k)
+			},
 		},
 	}
 

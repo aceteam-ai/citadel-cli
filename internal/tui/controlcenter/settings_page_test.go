@@ -89,6 +89,44 @@ func TestSettingsToggle_SaveErrorKeepsState(t *testing.T) {
 	}
 }
 
+func TestSettingsToggleKeepAwake_PersistsOptIn(t *testing.T) {
+	store := config.DefaultKeepAwake()
+	cb := SettingsCallbacks{
+		LoadKeepAwake: func() *config.KeepAwake {
+			cp := *store
+			return &cp
+		},
+		SaveKeepAwake: func(k *config.KeepAwake) error {
+			store.KeepAwakeOnAC = k.KeepAwakeOnAC
+			return nil
+		},
+	}
+	p := NewSettingsPage(cb, nil)
+	p.reloadKeepAwake()
+
+	if p.keepAwake.KeepAwakeOnAC {
+		t.Fatalf("expected default disabled (opt-in), got %+v", p.keepAwake)
+	}
+
+	// Opt in.
+	p.toggleKeepAwake()
+	if !p.keepAwake.KeepAwakeOnAC {
+		t.Error("in-memory state should be enabled after toggle")
+	}
+	if !store.KeepAwakeOnAC {
+		t.Error("persisted store should be enabled after opt-in")
+	}
+
+	// Opt back out.
+	p.toggleKeepAwake()
+	if p.keepAwake.KeepAwakeOnAC {
+		t.Error("in-memory state should be disabled after second toggle")
+	}
+	if store.KeepAwakeOnAC {
+		t.Error("persisted store should be disabled after opt-out")
+	}
+}
+
 func TestWSSEndpoint_HidesRedisTransport(t *testing.T) {
 	cases := map[string]string{
 		"https://aceteam.ai":          "wss://aceteam.ai",
