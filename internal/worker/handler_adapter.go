@@ -141,6 +141,17 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeIOSBuild, jobs.NewIOSBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeAndroidBuild, jobs.NewAndroidBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeGomobileBuild, jobs.NewGomobileBuildHandler(opts.WorkspaceDir)),
+		// Desktop capture/input handlers (issue #4179). Registered
+		// unconditionally: screenshot/type/keys need no workspace sandbox, and
+		// gating them behind WorkspaceDir would leave the desktop_screenshot /
+		// vnc_* MCP tools timing out on any node without a configured workspace.
+		// FILE_SCREENSHOT and VNC_SCREENSHOT share one capture path (the
+		// existing internal/desktop X11 capture); there is no separate VNC
+		// framebuffer source.
+		NewLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}),
+		NewLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}),
+		NewLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}),
+		NewLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}),
 	}
 
 	// Register file-operation handlers when a workspace is configured.
