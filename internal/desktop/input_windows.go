@@ -147,7 +147,12 @@ func keysymToVK(keysym uint32) (uint16, bool) {
 	case 0xff0d: return 0x0D, true  // Return -> VK_RETURN
 	case 0xff1b: return 0x1B, true  // Escape -> VK_ESCAPE
 	case 0xff63: return 0x2D, true  // Insert -> VK_INSERT
-	case 0xffff: return 0x2E, true  // Delete -> VK_DELETE
+	case 0xffff: return 0x2E, true  // Delete -> VK_DELETE (Ctrl+Alt+Del when combined)
+	case 0xff61: return 0x2C, true  // Print -> VK_SNAPSHOT (PrintScreen)
+	case 0xff14: return 0x91, true  // Scroll_Lock -> VK_SCROLL
+	case 0xff13: return 0x13, true  // Pause -> VK_PAUSE
+	case 0xff67: return 0x5D, true  // Menu -> VK_APPS (context menu)
+	case 0xff7f: return 0x90, true  // Num_Lock -> VK_NUMLOCK
 	case 0xff50: return 0x24, true  // Home -> VK_HOME
 	case 0xff57: return 0x23, true  // End -> VK_END
 	case 0xff55: return 0x21, true  // Page_Up -> VK_PRIOR

@@ -22,7 +22,18 @@ type Action struct {
 	Text   string `json:"text,omitempty"`
 	Key    string `json:"key,omitempty"`
 	Delta  *int   `json:"delta,omitempty"`
+	// Mode selects absolute (default, empty) or "relative" pointer movement for
+	// the "move" action. Relative moves use Dx/Dy instead of X/Y. Issue #334.
+	Mode string `json:"mode,omitempty"`
+	// Dx/Dy are signed pixel offsets for a relative "move". Negative values move
+	// left/up. Only used when Mode == "relative".
+	Dx *int `json:"dx,omitempty"`
+	Dy *int `json:"dy,omitempty"`
 }
+
+// relMoveBound caps the magnitude of a single relative move offset. Matches the
+// absolute coordinate ceiling but allows negative offsets for left/up motion.
+const relMoveBound = 32767
 
 var allowedActionTypes = map[string]bool{
 	"move":      true,
@@ -64,11 +75,23 @@ func validateAction(a Action) error {
 
 	switch a.Type {
 	case "move":
-		if a.X == nil || a.Y == nil {
-			return fmt.Errorf("move requires x and y coordinates")
-		}
-		if *a.X < 0 || *a.Y < 0 || *a.X > 32767 || *a.Y > 32767 {
-			return fmt.Errorf("coordinates out of range (0-32767)")
+		switch a.Mode {
+		case "", "absolute":
+			if a.X == nil || a.Y == nil {
+				return fmt.Errorf("absolute move requires x and y coordinates")
+			}
+			if *a.X < 0 || *a.Y < 0 || *a.X > 32767 || *a.Y > 32767 {
+				return fmt.Errorf("coordinates out of range (0-32767)")
+			}
+		case "relative":
+			if a.Dx == nil || a.Dy == nil {
+				return fmt.Errorf("relative move requires dx and dy offsets")
+			}
+			if *a.Dx < -relMoveBound || *a.Dx > relMoveBound || *a.Dy < -relMoveBound || *a.Dy > relMoveBound {
+				return fmt.Errorf("relative offsets out of range (-%d to %d)", relMoveBound, relMoveBound)
+			}
+		default:
+			return fmt.Errorf("unknown move mode %q (allowed: absolute, relative)", a.Mode)
 		}
 	case "click":
 		if a.X == nil || a.Y == nil {
@@ -126,6 +149,12 @@ func validateAction(a Action) error {
 func ActionToXdotoolArgs(a Action) (string, []string, error) {
 	switch a.Type {
 	case "move":
+		if a.Mode == "relative" {
+			// mousemove_relative shifts the pointer by a signed offset from its
+			// current position. The "--" guard lets negative dx/dy through as
+			// operands rather than being parsed as flags. Issue #334.
+			return "mousemove_relative", []string{"--", strconv.Itoa(*a.Dx), strconv.Itoa(*a.Dy)}, nil
+		}
 		return "mousemove", []string{"--", strconv.Itoa(*a.X), strconv.Itoa(*a.Y)}, nil
 	case "click":
 		button := buttonOrDefault(a.Button, 1)

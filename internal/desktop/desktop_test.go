@@ -118,6 +118,16 @@ func TestParseActions(t *testing.T) {
 		wantErr bool
 	}{
 		{"move", `[{"type":"move","x":100,"y":200}]`, 1, false},
+		{"move absolute explicit mode", `[{"type":"move","mode":"absolute","x":100,"y":200}]`, 1, false},
+		{"move relative", `[{"type":"move","mode":"relative","dx":10,"dy":-20}]`, 1, false},
+		{"move relative negative both", `[{"type":"move","mode":"relative","dx":-5,"dy":-5}]`, 1, false},
+		{"move relative zero offset", `[{"type":"move","mode":"relative","dx":0,"dy":0}]`, 1, false},
+		{"move relative missing dx", `[{"type":"move","mode":"relative","dy":10}]`, 0, true},
+		{"move relative missing dy", `[{"type":"move","mode":"relative","dx":10}]`, 0, true},
+		{"move relative dx out of range", `[{"type":"move","mode":"relative","dx":40000,"dy":0}]`, 0, true},
+		{"move relative dy out of range", `[{"type":"move","mode":"relative","dx":0,"dy":-40000}]`, 0, true},
+		{"move unknown mode", `[{"type":"move","mode":"warp","x":1,"y":2}]`, 0, true},
+		{"move absolute missing coords", `[{"type":"move","mode":"absolute"}]`, 0, true},
 		{"click", `[{"type":"click","x":100,"y":200,"button":1}]`, 1, false},
 		{"type", `[{"type":"type","text":"hello world"}]`, 1, false},
 		{"key", `[{"type":"key","key":"Return"}]`, 1, false},
@@ -173,6 +183,24 @@ func TestActionToXdotoolArgs(t *testing.T) {
 		{
 			name:     "move",
 			action:   Action{Type: "move", X: intPtr(100), Y: intPtr(200)},
+			wantCmd:  "mousemove",
+			wantArgs: []string{"--", "100", "200"},
+		},
+		{
+			name:     "move relative",
+			action:   Action{Type: "move", Mode: "relative", Dx: intPtr(15), Dy: intPtr(-25)},
+			wantCmd:  "mousemove_relative",
+			wantArgs: []string{"--", "15", "-25"},
+		},
+		{
+			name:     "move relative negative both",
+			action:   Action{Type: "move", Mode: "relative", Dx: intPtr(-30), Dy: intPtr(-40)},
+			wantCmd:  "mousemove_relative",
+			wantArgs: []string{"--", "-30", "-40"},
+		},
+		{
+			name:     "move absolute explicit mode",
+			action:   Action{Type: "move", Mode: "absolute", X: intPtr(100), Y: intPtr(200)},
 			wantCmd:  "mousemove",
 			wantArgs: []string{"--", "100", "200"},
 		},
@@ -252,6 +280,45 @@ func TestActionToXdotoolArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestKeyCoverage verifies that the "key" action accepts the full iPKVM-grade
+// keysym set the web/iOS viewers may send (issue #334). On linux these names
+// are passed verbatim to xdotool, which resolves them to X11 keysyms, so the
+// only gate is safeKeyPattern. This test pins the documented set: modifier
+// combos, F1-F12, and special keys (Ctrl+Alt+Del, PrintScreen, ScrollLock,
+// Pause, Menu, arrows, Home/End, etc.).
+func TestKeyCoverage(t *testing.T) {
+	supported := []string{
+		// Modifier combos
+		"ctrl+c", "ctrl+v", "ctrl+alt+Delete", "shift+Tab", "super+l", "alt+F4",
+		// Function keys
+		"F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+		// Special keys
+		"Print", "Scroll_Lock", "Pause", "Menu", "Num_Lock", "Caps_Lock",
+		"Insert", "Delete", "Home", "End", "Page_Up", "Page_Down",
+		"Up", "Down", "Left", "Right",
+		"Return", "Escape", "BackSpace", "Tab", "space",
+	}
+	for _, k := range supported {
+		input := `[{"type":"key","key":"` + k + `"}]`
+		actions, err := ParseActions([]byte(input))
+		if err != nil {
+			t.Errorf("key %q rejected: %v", k, err)
+			continue
+		}
+		cmd, args, err := ActionToXdotoolArgs(actions[0])
+		if err != nil {
+			t.Errorf("key %q arg-gen failed: %v", k, err)
+			continue
+		}
+		if cmd != "key" {
+			t.Errorf("key %q produced cmd %q, want \"key\"", k, cmd)
+		}
+		if len(args) != 2 || args[0] != "--clearmodifiers" || args[1] != k {
+			t.Errorf("key %q produced args %v, want [--clearmodifiers %s]", k, args, k)
+		}
 	}
 }
 
