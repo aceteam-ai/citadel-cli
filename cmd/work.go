@@ -197,6 +197,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		}),
 	)
 	go keepAwakeMonitor.Run(ctx)
+	// Release the assertion synchronously on shutdown, before runWork returns,
+	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
+	defer keepAwakeMonitor.Stop()
 
 	// Auto-start services from manifest (unless --no-services is set)
 	if !workNoServices {

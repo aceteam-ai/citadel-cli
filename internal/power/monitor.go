@@ -121,6 +121,16 @@ func (m *Monitor) reconcile() {
 	}
 }
 
+// Stop releases any held assertion immediately. It is safe to call when the
+// monitor is disabled, never started, or already stopped (the underlying
+// inhibitor is idempotent). Callers should `defer monitor.Stop()` in the work
+// loop so the assertion is released synchronously before the process exits,
+// rather than relying on the Run goroutine's deferred cleanup (which races
+// process exit).
+func (m *Monitor) Stop() {
+	_ = m.inhibitor.Stop()
+}
+
 // Status reports the current asserted state and last-detected source for the
 // TUI ("Keep-awake: on (AC)"). It is a live read and does not change state.
 func (m *Monitor) Status() (enabled, active bool, src Source) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
+	"syscall"
 )
 
 // procInhibitor holds a sleep-inhibition assertion as a long-lived child
@@ -42,6 +43,10 @@ func (p *procInhibitor) Start() error {
 	}
 
 	cmd := exec.Command(path, p.args...)
+	// Run the inhibitor in its own process group so we can signal the whole
+	// group on Stop. systemd-inhibit spawns a `sleep infinity` grandchild;
+	// killing only the parent would orphan it, so we kill the group instead.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", p.name, err)
 	}
@@ -49,8 +54,8 @@ func (p *procInhibitor) Start() error {
 	return nil
 }
 
-// Stop kills the inhibitor process and releases the assertion. Safe to call
-// when not started.
+// Stop kills the inhibitor process group and releases the assertion. Safe to
+// call when not started.
 func (p *procInhibitor) Stop() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -60,10 +65,16 @@ func (p *procInhibitor) Stop() error {
 		return nil
 	}
 
-	err := p.cmd.Process.Kill()
+	pid := p.cmd.Process.Pid
+	// Kill the entire process group (negative pid). This reaps any children
+	// the inhibitor spawned (e.g. `sleep infinity`) along with the parent.
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		// Fall back to killing just the parent if the group signal failed.
+		_ = p.cmd.Process.Kill()
+	}
 	_ = p.cmd.Wait()
 	p.cmd = nil
-	return err
+	return nil
 }
 
 // Active reports whether the inhibitor process is currently running.

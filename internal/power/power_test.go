@@ -189,6 +189,30 @@ func TestMonitor_ReleasesOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestMonitor_StopReleasesSynchronously(t *testing.T) {
+	stub := &stubInhibitor{}
+	m := NewMonitor(true,
+		WithInhibitor(stub),
+		WithDetector(func() Source { return SourceAC }),
+	)
+	m.reconcile()
+	if !stub.Active() {
+		t.Fatal("expected active before Stop")
+	}
+	m.Stop()
+	if stub.Active() {
+		t.Error("Stop should release the assertion")
+	}
+	// Idempotent: a second Stop is safe.
+	m.Stop()
+}
+
+func TestMonitor_StopWhenDisabledIsSafe(t *testing.T) {
+	stub := &stubInhibitor{}
+	m := NewMonitor(false, WithInhibitor(stub))
+	m.Stop() // must not panic; calling Stop on an idle inhibitor is fine
+}
+
 func TestMonitor_Status(t *testing.T) {
 	stub := &stubInhibitor{}
 	m := NewMonitor(true,
