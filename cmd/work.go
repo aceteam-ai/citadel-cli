@@ -152,13 +152,29 @@ func runWork(cmd *cobra.Command, args []string) {
 		workTerminal = false
 	}
 
-	// Setup signal handling
+	// Setup signal handling. The first signal cancels the root context so every
+	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
+	// auto-updater, usage syncer) observes cancellation and unwinds. As a
+	// bounded safety net (issue #312), a watchdog force-exits if graceful
+	// shutdown does not complete within the grace period, and a second signal
+	// force-exits immediately — so a misbehaving goroutine can never leave an
+	// orphaned node holding the VPN identity or the terminal-server port.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigs
 		fmt.Println("\n   - Received shutdown signal...")
 		cancel()
+		go func() {
+			select {
+			case <-sigs:
+				fmt.Fprintln(os.Stderr, "   - Second signal received; force-exiting")
+				os.Exit(1)
+			case <-time.After(shutdownGracePeriod):
+				fmt.Fprintf(os.Stderr, "   - Shutdown did not complete within %s; force-exiting\n", shutdownGracePeriod)
+				os.Exit(1)
+			}
+		}()
 	}()
 
 	// Note: Update check is now handled by root.go's PersistentPreRun

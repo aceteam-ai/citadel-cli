@@ -386,6 +386,7 @@ type ControlCenter struct {
 	activities     []ActivityEntry
 	activityMu     sync.Mutex
 	stopChan       chan struct{}
+	stopOnce       sync.Once
 	running        bool
 	lastRefresh    time.Time
 	inModal        bool          // Track if we're in a modal (help, quit, etc.)
@@ -667,17 +668,46 @@ func (cc *ControlCenter) ShowChat() {
 	}
 }
 
-// Stop stops the control center
+// Stop signals the control center to exit.
+//
+// It does ONLY two things — close stopChan (to halt background loops) and call
+// tview's Application.Stop() — because Stop() is invoked from the tview
+// event-loop goroutine (the Ctrl+C key handler at HandleGlobalInput, and the
+// quit-confirm modal). Any blocking teardown done here would wedge the event
+// loop: a PTY read-loop's app.QueueUpdate() could never drain, and a chat
+// WebSocket Close() does a synchronous network write with no deadline that can
+// block forever on a half-dead connection (the macOS sleep/network-change case
+// in issue #312). Either one leaves Run() blocked and the process hung on exit.
+//
+// The actual subsystem teardown (console PTYs, chat client) is performed by
+// Cleanup() AFTER Run() returns, under the cmd-layer watchdog, so it can never
+// block the event loop and can never block indefinitely.
+//
+// Guarded by sync.Once so it is safe to call from multiple paths (the Ctrl+C
+// handler, the quit-confirm modal, and the OS signal handler) without
+// double-closing stopChan.
 func (cc *ControlCenter) Stop() {
-	close(cc.stopChan)
+	cc.stopOnce.Do(func() {
+		close(cc.stopChan)
+		if cc.app != nil {
+			cc.app.Stop()
+		}
+	})
+}
+
+// Cleanup tears down the control center's owned subsystems (console PTY
+// sessions and the chat client). It MUST be called only after Run() has
+// returned — once the tview event loop has exited, page Close()s no longer
+// race app.QueueUpdate() callers, and each page's internal closed-mutex makes
+// the call safe and idempotent. The cmd layer runs this under a bounded
+// shutdown watchdog so a blocking Close (e.g. a stuck WebSocket write) cannot
+// hang exit (issue #312).
+func (cc *ControlCenter) Cleanup() {
 	if cc.consolePage != nil {
 		cc.consolePage.Close()
 	}
 	if cc.chatPage != nil {
 		cc.chatPage.Close()
-	}
-	if cc.app != nil {
-		cc.app.Stop()
 	}
 }
 
