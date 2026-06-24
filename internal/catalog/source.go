@@ -292,7 +292,7 @@ func loadModuleManifest(dir string) (*ServiceManifest, string, error) {
 		filepath.Join(dir, "service.yaml"),
 	)
 	if manifestPath == "" {
-		return nil, "", fmt.Errorf("no service.yaml found in module repo (looked in citadel/ and repo root); "+
+		return nil, "", fmt.Errorf("no service.yaml found in module repo (looked in citadel/ and repo root); " +
 			"a Citadel module must self-describe via citadel/service.yaml + citadel/compose.yml")
 	}
 
