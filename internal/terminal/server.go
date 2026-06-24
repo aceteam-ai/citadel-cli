@@ -356,10 +356,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// When a persistent named session is configured and tmux is available, back
 	// the PTY with `tmux new-session -A -s <name>` so the session survives
-	// reconnects; otherwise fall back to a bare shell.
-	tmuxCommand := sessionCommand(s.config.SessionName, s.config.Shell)
-	if tmuxCommand != nil {
-		s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, s.config.SessionName)
+	// reconnects; otherwise fall back to a bare shell. The tmux session name is
+	// derived per-user from the configured base name so a reconnecting client
+	// re-attaches to its own live session (running command, scrollback, cwd all
+	// preserved by the tmux server) while staying isolated from other users.
+	var tmuxCommand []string
+	if !sessionDisabled(s.config.SessionName) {
+		tmuxSessionName := sessionNameForUser(s.config.SessionName, tokenInfo.UserID)
+		tmuxCommand = sessionCommand(tmuxSessionName, s.config.Shell)
+		if tmuxCommand != nil {
+			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		}
 	}
 
 	// Create PTY session

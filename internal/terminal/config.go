@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+// DefaultSessionName is the base tmux session name used when
+// CITADEL_TERMINAL_SESSION is not set. Its presence is what makes terminals
+// tmux-backed (and therefore reconnect-resilient) by default. It is a valid
+// tmux session name per tmux.ValidateSessionName.
+const DefaultSessionName = "citadel"
+
 // Config holds the terminal server configuration
 type Config struct {
 	// Host is the address the WebSocket server binds to (default: 127.0.0.1)
@@ -39,6 +45,14 @@ type Config struct {
 	// the terminal state survives. Requires a resolvable tmux binary; when tmux
 	// is unavailable the server falls back to a bare shell. Configured via
 	// CITADEL_TERMINAL_SESSION.
+	//
+	// SessionName is treated as a base name. The server derives a stable,
+	// per-user session name from it (base + sanitized user ID) so each user
+	// re-attaches to their own persistent terminal across reconnects while
+	// staying isolated from other users. It defaults to DefaultSessionName so
+	// terminals are tmux-backed (and reconnect-resilient) out of the box. Set
+	// CITADEL_TERMINAL_SESSION to the disable sentinel ("none"/"off"/
+	// "disabled") to force a bare, non-persistent shell.
 	SessionName string
 
 	// AuthServiceURL is the URL of the AceTeam auth service for token validation
@@ -70,7 +84,7 @@ func DefaultConfig() *Config {
 		IdleTimeout:          time.Duration(getEnvInt("CITADEL_TERMINAL_IDLE_TIMEOUT", 30)) * time.Minute,
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
-		SessionName:          os.Getenv("CITADEL_TERMINAL_SESSION"),
+		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
 		RateLimitBurst:       5,   // Allow bursts of 5
