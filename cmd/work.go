@@ -24,6 +24,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -179,9 +180,26 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	// Note: Update check is now handled by root.go's PersistentPreRun
 
-	// Prevent macOS from sleeping while worker is active
-	stopCaffeinate := startCaffeinate(ctx)
-	defer stopCaffeinate()
+	// Keep the machine awake while serving the Fabric, but only when the
+	// operator has opted in (keep_awake_on_ac) and only on AC power. The
+	// monitor holds a process-scoped OS sleep assertion that is released on
+	// battery and on exit, so we never override the user's power policy without
+	// consent or leave the machine permanently un-sleepable. Default is OFF.
+	keepAwake := config.LoadKeepAwake(platform.ConfigDir())
+	keepAwakeMonitor := power.NewMonitor(
+		keepAwake.KeepAwakeOnAC,
+		power.WithTransitionHook(func(active bool, src power.Source) {
+			if active {
+				fmt.Printf("   - Keep-awake: on (%s)\n", src)
+			} else {
+				fmt.Printf("   - Keep-awake: off (%s)\n", src)
+			}
+		}),
+	)
+	go keepAwakeMonitor.Run(ctx)
+	// Release the assertion synchronously on shutdown, before runWork returns,
+	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
+	defer keepAwakeMonitor.Stop()
 
 	// Auto-start services from manifest (unless --no-services is set)
 	if !workNoServices {
