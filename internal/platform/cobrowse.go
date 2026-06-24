@@ -78,6 +78,13 @@ type CobrowseStatus struct {
 
 // CobrowseManager owns the single managed browser process and its driver state.
 // It is safe for concurrent use; each Redis job touches it under the mutex.
+//
+// Concurrency note: every action holds the manager mutex across its CDP network
+// I/O (HTTP probe + WebSocket round-trip). This serializes co-browse jobs on the
+// node, which is intentional -- co-browse is single-session-per-node, so there is
+// never more than one browser to drive and serializing keeps the driver-state
+// machine race-free. The bounded cdpHTTPClient / per-call WebSocket deadlines
+// ensure a hung DevTools endpoint cannot hold the mutex indefinitely.
 type CobrowseManager struct {
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -86,6 +93,10 @@ type CobrowseManager struct {
 	profile    string
 	startedAt  time.Time
 	chromePath string
+	// exited is closed by the reaper goroutine when the managed browser process
+	// terminates (whether killed by Stop or crashed on its own). isRunningLocked
+	// consults it so a dead browser is not reported as running.
+	exited chan struct{}
 }
 
 var (
@@ -125,7 +136,17 @@ func (m *CobrowseManager) IsRunning() bool {
 }
 
 func (m *CobrowseManager) isRunningLocked() bool {
-	return m.cmd != nil && m.cmd.Process != nil
+	if m.cmd == nil || m.cmd.Process == nil {
+		return false
+	}
+	// cmd.Process stays non-nil for the life of the struct even after the
+	// browser dies, so consult the reaper's exited channel to detect a crash.
+	select {
+	case <-m.exited:
+		return false
+	default:
+		return true
+	}
 }
 
 // Start launches the headed Chromium with a persistent profile and CDP port.
@@ -199,6 +220,17 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	m.chromePath = chrome
 	m.startedAt = time.Now()
 
+	// Reaper: own the single Wait() for this process. When Chromium exits (killed
+	// by Stop or crashed on its own), close exited so isRunningLocked stops
+	// reporting it as running and the OS process is reaped (no zombie). Stop must
+	// NOT call Wait() itself -- that would double-Wait and race this goroutine.
+	exited := make(chan struct{})
+	m.exited = exited
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+
 	// Wait for the CDP endpoint to come up so the first navigate/screenshot
 	// does not race the browser launch.
 	if err := m.waitForCDP(debugPort, 15*time.Second); err != nil {
@@ -208,16 +240,29 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	return m.statusLocked(), nil
 }
 
-// Stop terminates the managed browser. Safe to call when not running.
+// Stop terminates the managed browser. Safe to call when not running and safe
+// to call twice. The reaper goroutine owns Wait(); Stop only signals the kill
+// and waits for the reaper to confirm the process is gone before clearing state.
 func (m *CobrowseManager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.isRunningLocked() {
+	if m.cmd == nil || m.cmd.Process == nil {
+		m.cmd = nil
+		m.exited = nil
+		m.driver = DriverAI
 		return nil
 	}
 	err := m.cmd.Process.Kill()
-	_, _ = m.cmd.Process.Wait()
+	if m.exited != nil {
+		// Wait for the reaper to reap the process (bounded) so we never leave a
+		// zombie. The reaper closes exited after cmd.Wait() returns.
+		select {
+		case <-m.exited:
+		case <-time.After(5 * time.Second):
+		}
+	}
 	m.cmd = nil
+	m.exited = nil
 	m.driver = DriverAI
 	return err
 }

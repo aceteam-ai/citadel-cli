@@ -167,6 +167,12 @@ func runWork(cmd *cobra.Command, args []string) {
 	go func() {
 		<-sigs
 		fmt.Println("\n   - Received shutdown signal...")
+		// Kill any managed co-browse Chromium so a headed browser does not orphan
+		// across worker restarts (the persistent profile keeps logins; only the
+		// live process is torn down). No-op when no session was ever started.
+		if err := platform.GetCobrowseManager().Stop(); err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: co-browse browser stop: %v\n", err)
+		}
 		cancel()
 		go func() {
 			select {
