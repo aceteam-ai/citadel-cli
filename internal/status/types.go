@@ -69,6 +69,12 @@ type NodeCapabilities struct {
 	Desktop *bool `json:"desktop,omitempty"`
 	Files   *bool `json:"files,omitempty"`
 	GPU     *bool `json:"gpu,omitempty"`
+
+	// H264 reports whether the node can serve an H.264 desktop video stream over
+	// the mesh (citadel-cli#338): ffmpeg + an H.264 encoder + an X display are
+	// available. Clients use it to choose H.264 streaming and fall back to noVNC
+	// when absent. Additive to the four flags above (aceteam#4250).
+	H264 *bool `json:"h264,omitempty"`
 }
 
 // HypervisorInfo describes a detected hypervisor on the node.
