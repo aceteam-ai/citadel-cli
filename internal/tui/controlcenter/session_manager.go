@@ -115,6 +115,11 @@ func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSessio
 	// broadcast unfiltered to WebSocket viewers, which use a full terminal
 	// emulator.
 	var filter consoleFilter
+	// daResponder answers terminal Device Attributes queries (e.g. fish's
+	// startup probe) that our line-oriented renderer would otherwise leave
+	// unanswered, causing the shell to block for ~2s. See
+	// device_attr_responder.go.
+	var daResponder deviceAttrResponder
 
 	defer sm.onSessionEnd(s, session)
 
@@ -136,6 +141,12 @@ func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSessio
 			sm.mu.Unlock()
 			if isActive && s.streamer != nil {
 				s.streamer.Broadcast(chunk)
+			}
+
+			// Reply to any Device Attributes query in this chunk by writing
+			// back to the PTY (the shell's stdin), as a real terminal would.
+			if reply := daResponder.scan(chunk); len(reply) > 0 {
+				_, _ = session.Write(reply)
 			}
 
 			cleaned := filter.filter(chunk)
