@@ -4,10 +4,18 @@
 // shelling out to OS utilities (caffeinate, systemd-inhibit) or calling pure-Go
 // syscalls (SetThreadExecutionState on Windows).
 //
-// The inhibition assertion is always scoped to the holding process: on macOS
-// and Linux it is a child process that the OS reaps if Citadel crashes, and on
-// Windows it is cleared on the calling thread / process exit. This means we can
-// never leave a machine permanently un-sleepable.
+// The inhibition assertion is always scoped to the holding process so we never
+// leave a machine permanently un-sleepable, even if Citadel exits via os.Exit,
+// SIGKILL, or a crash without running cleanup:
+//   - macOS: a `caffeinate -s -w <pid>` child that watches the Citadel PID and
+//     exits (releasing the assertion) the moment Citadel does.
+//   - Linux: a `systemd-inhibit` child started with Pdeathsig=SIGKILL so the
+//     kernel kills it — releasing the logind lock — if Citadel dies.
+//   - Windows: SetThreadExecutionState state cleared on process exit.
+//
+// An orphaned child process is reparented to init rather than reaped, so the
+// Setpgid process group alone is not enough; the per-OS watch above is what
+// guarantees the assertion cannot outlive Citadel.
 package power
 
 // Source identifies the current power source of the machine.

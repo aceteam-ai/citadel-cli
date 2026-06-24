@@ -9,6 +9,13 @@ import (
 	"syscall"
 )
 
+// procSysProcAttr returns the per-OS SysProcAttr used when spawning the
+// inhibitor child. Both platforms set Setpgid so Stop can signal the whole
+// group; Linux additionally sets Pdeathsig (defined in proc_attr_linux.go) so
+// the child is killed if Citadel dies without running cleanup. macOS has no
+// Pdeathsig equivalent in syscall.SysProcAttr, so the darwin inhibitor relies on
+// caffeinate's `-w <pid>` watch instead (see power_darwin.go).
+
 // procInhibitor holds a sleep-inhibition assertion as a long-lived child
 // process (macOS `caffeinate -s`, Linux `systemd-inhibit ... sleep infinity`).
 // Killing the process releases the assertion, and the OS reaps the child if
@@ -46,7 +53,7 @@ func (p *procInhibitor) Start() error {
 	// Run the inhibitor in its own process group so we can signal the whole
 	// group on Stop. systemd-inhibit spawns a `sleep infinity` grandchild;
 	// killing only the parent would orphan it, so we kill the group instead.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = procSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", p.name, err)
 	}
