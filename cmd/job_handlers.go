@@ -69,5 +69,6 @@ func init() {
 		"IOS_BUILD":          jobs.NewIOSBuildHandler(""),
 		"ANDROID_BUILD":      jobs.NewAndroidBuildHandler(""),
 		"GOMOBILE_BUILD":     jobs.NewGomobileBuildHandler(""),
+		"COBROWSE":           jobs.NewCobrowseHandler(),
 	}
 }
