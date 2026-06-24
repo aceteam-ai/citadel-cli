@@ -31,6 +31,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
+	"github.com/aceteam-ai/citadel-cli/internal/tmuxinstall"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
@@ -1086,6 +1088,13 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
 				termConfig.Version = Version
+
+				// Best-effort: provision a Citadel-managed tmux binary so persistent
+				// terminal sessions "just work" on nodes without a system tmux. This
+				// is non-fatal — if it fails or the platform is gated, the terminal
+				// server falls back to a bare (non-persistent) shell. Skip when tmux
+				// is already resolvable or when explicitly disabled.
+				ensureManagedTmux()
 				if workTerminalHost != "" {
 					termConfig.Host = workTerminalHost
 				}
@@ -1758,6 +1767,36 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 		Services: p.Services,
 		SSH:      p.SSH,
 	}
+}
+
+// ensureManagedTmux best-effort provisions a Citadel-managed tmux binary so the
+// terminal server can back sessions with persistent tmux on nodes that lack a
+// system tmux. It is intentionally non-fatal and quiet:
+//   - if tmux is already resolvable (CITADEL_TMUX_BIN / PATH / managed), do
+//     nothing;
+//   - if the platform is gated/unsupported or the download/verify fails, log at
+//     debug level and return — the terminal server already falls back to a bare,
+//     non-persistent shell.
+//
+// Set CITADEL_TMUX_NO_INSTALL=1 (or true) to skip provisioning entirely.
+func ensureManagedTmux() {
+	if v := os.Getenv("CITADEL_TMUX_NO_INSTALL"); v == "1" || strings.EqualFold(v, "true") {
+		Debug("managed tmux install disabled via CITADEL_TMUX_NO_INSTALL")
+		return
+	}
+	if tmux.IsAvailable() {
+		return
+	}
+	if !tmuxinstall.Available() {
+		Debug("no managed tmux artifact for this platform; terminals use a bare shell")
+		return
+	}
+	inst := tmuxinstall.New()
+	if _, err := inst.Ensure(); err != nil {
+		Debug("managed tmux install failed (falling back to bare shell): %v", err)
+		return
+	}
+	Log("Installed Citadel-managed tmux at %s", inst.DestPath())
 }
 
 func init() {
