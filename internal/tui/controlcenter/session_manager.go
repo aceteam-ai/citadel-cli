@@ -108,13 +108,18 @@ func (sm *sessionManager) startSession(idx int) error {
 func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSession) {
 	buf := make([]byte, 4096)
 	ansiW := tview.ANSIWriter(s.view)
-	// filter strips charset-designation escapes (ESC(B etc.) and carriage
-	// returns that tview's line-oriented ANSIWriter would otherwise render
-	// as literal text. It is stateful across reads so sequences split over
-	// a chunk boundary are handled correctly. The raw bytes are still
-	// broadcast unfiltered to WebSocket viewers, which use a full terminal
-	// emulator.
-	var filter consoleFilter
+	// emu is a minimal single-line terminal emulator. tview's TextView is
+	// line-oriented and has no cursor, so it cannot honour the in-place line
+	// repaints that interactive shells (notably fish) emit on every keystroke
+	// via CR + backspace + cursor-forward (CSI nC) + erase (CSI K). Feeding
+	// those straight to an append-only view accumulates each repaint, so
+	// typing `ls` renders as `llss`. The emulator interprets those cursor ops
+	// and produces the correctly overwritten lines; it also subsumes the
+	// charset-escape stripping that the old consoleFilter did (#296). It is
+	// stateful across reads so sequences split over a 4096-byte chunk boundary
+	// are handled correctly. The raw bytes are still broadcast UNFILTERED to
+	// WebSocket viewers, which use a full terminal emulator.
+	var emu lineEmulator
 	// daResponder answers terminal Device Attributes queries (e.g. fish's
 	// startup probe) that our line-oriented renderer would otherwise leave
 	// unanswered, causing the shell to block for ~2s. See
@@ -149,9 +154,14 @@ func (sm *sessionManager) readLoop(s *consoleSession, session *console.PTYSessio
 				_, _ = session.Write(reply)
 			}
 
-			cleaned := filter.filter(chunk)
+			// Feed the chunk to the single-line emulator and re-render the
+			// whole (bounded) buffer. The emulator returns the full rendered
+			// output, so we replace the view contents rather than append; this
+			// is what lets an in-place repaint overwrite instead of accumulate.
+			rendered := emu.feed(chunk)
 			sm.app.QueueUpdate(func() {
-				_, _ = ansiW.Write(cleaned)
+				s.view.Clear()
+				_, _ = ansiW.Write([]byte(rendered))
 				s.view.ScrollToEnd()
 			})
 		}
