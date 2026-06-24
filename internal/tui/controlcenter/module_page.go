@@ -119,10 +119,10 @@ func (p *ModulePage) OnActivate() {
 // OnDeactivate implements Page.
 func (p *ModulePage) OnDeactivate() {}
 
-// HandleInput implements Page. The form consumes most keys; 'r' resets the flow.
+// HandleInput implements Page. The page does not steal keys: the form's text
+// inputs and buttons (Resolve / Install / Reset / Back) handle everything, so the
+// user can type a source and config values freely.
 func (p *ModulePage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
-	// Let the form (text inputs, buttons) handle everything; the page does not
-	// steal keys so the user can type a source/config freely.
 	return event
 }
 

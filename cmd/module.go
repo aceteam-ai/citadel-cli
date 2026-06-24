@@ -429,9 +429,14 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 				}
 			}
 
-			_, configDir, err := findOrCreateManifest()
+			nodeManifest, configDir, err := findOrCreateManifest()
 			if err != nil {
 				return "", err
+			}
+			// Parity with the CLI: report an already-installed module cleanly
+			// instead of letting it surface as a confusing port conflict.
+			if hasService(nodeManifest, manifest.Name) {
+				return "", fmt.Errorf("module '%s' is already in the node manifest", manifest.Name)
 			}
 			servicesDir := filepath.Join(configDir, "services")
 
