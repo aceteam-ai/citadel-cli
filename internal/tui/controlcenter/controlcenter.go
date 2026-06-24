@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
+	"github.com/aceteam-ai/citadel-cli/internal/session"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -408,6 +409,12 @@ type ControlCenter struct {
 
 	// Device URL set after successful device auth + connect
 	deviceURL string
+
+	// desktopSession caches the interactive-desktop probe result. Lazily filled
+	// on first render via desktopInfo(); the session state is effectively static
+	// for a process lifetime, so caching avoids re-probing every refresh.
+	desktopSession   *session.DesktopInfo
+	desktopSessionMu sync.Once
 
 	// Console page (nil on Windows)
 	consolePage *ConsolePage
@@ -1518,6 +1525,15 @@ func (cc *ControlCenter) updateActionsPanel() {
 	cc.actionsView.Select(0, 0)
 }
 
+// desktopInfo returns the cached interactive-desktop probe result, running the
+// per-OS probe once on first call. Safe for repeated calls from the render loop.
+func (cc *ControlCenter) desktopInfo() *session.DesktopInfo {
+	cc.desktopSessionMu.Do(func() {
+		cc.desktopSession = session.DetectDesktop()
+	})
+	return cc.desktopSession
+}
+
 func (cc *ControlCenter) updateNodePanel() {
 	var sb strings.Builder
 
@@ -1567,6 +1583,16 @@ func (cc *ControlCenter) updateNodePanel() {
 	}
 
 	sb.WriteString(fmt.Sprintf(" [yellow]Status:[-] %s %s\n", statusIcon, statusText))
+
+	// Desktop session availability: explains up front why VNC/screenshot/input
+	// affordances may be unavailable on this node (e.g. headless/SSH session).
+	if d := cc.desktopInfo(); d != nil {
+		if d.HasDesktop {
+			sb.WriteString(" [yellow]Desktop:[-] [green]●[-] available\n")
+		} else {
+			sb.WriteString(fmt.Sprintf(" [yellow]Desktop:[-] [gray]○ unavailable (%s) — VNC/screenshot disabled[-]\n", d.Reason))
+		}
+	}
 
 	// Demo server URL
 	if cc.data.DemoServerURL != "" {
