@@ -46,16 +46,37 @@ type InstallResult struct {
 // (e.g. ~/citadel-node/services). configOverrides are key=value pairs that
 // override config defaults.
 func Install(name string, servicesDir string, configOverrides map[string]string) (*InstallResult, error) {
-	// 1. Load service manifest from catalog.
+	// Load service manifest from catalog.
 	manifest, err := LoadServiceManifest(name)
 	if err != nil {
 		return nil, err
 	}
 
-	// 1b. Reject host-provisioned services up front. A service with no
-	// compose.yml (e.g. the Windows-only "wechat" microservice) is catalogued
-	// for discoverability only and cannot be installed/run as a container.
-	if _, err := GetComposeFile(name); err != nil {
+	// Resolve the compose source. A service with no compose.yml (e.g. the
+	// Windows-only "wechat" microservice) is host-provisioned and not
+	// installable; pass an empty composeSrcPath so InstallFromManifest returns
+	// ErrNotInstallable.
+	composeSrc, _ := GetComposeFile(name)
+
+	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true)
+}
+
+// InstallFromManifest installs a service from an already-loaded manifest and a
+// compose source path. It is the shared core behind both the catalog install
+// (Install) and external "module source" installs. It checks arch/GPU/port
+// requirements, resolves config, copies the compose file, and writes an .env.
+//
+// interactive controls config resolution: when true, required config vars with
+// no override and no default are prompted on os.Stdin; when false (the TUI
+// path), such a var is a returned error and stdin is never read.
+//
+// An empty composeSrcPath means the service is host-provisioned (no container)
+// and InstallFromManifest returns ErrNotInstallable.
+func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive bool) (*InstallResult, error) {
+	name := manifest.Name
+
+	// 1. Reject host-provisioned services up front (no compose.yml).
+	if composeSrcPath == "" {
 		return nil, ErrNotInstallable
 	}
 
@@ -91,24 +112,20 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 		return nil, fmt.Errorf("port conflict: port(s) %v already in use", conflicts)
 	}
 
-	// 5. Resolve config values (prompt for required ones without defaults).
-	configValues, err := resolveConfig(manifest.Config, configOverrides)
+	// 5. Resolve config values (prompt for required ones without defaults only
+	//    when interactive).
+	configValues, err := resolveConfig(manifest.Config, configOverrides, interactive)
 	if err != nil {
 		return nil, err
 	}
 
 	// 6. Copy compose.yml to services directory.
-	composeSrc, err := GetComposeFile(name)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create services directory: %w", err)
 	}
 
 	composeDest := filepath.Join(servicesDir, name+".yml")
-	if err := copyFile(composeSrc, composeDest); err != nil {
+	if err := copyFile(composeSrcPath, composeDest); err != nil {
 		return nil, fmt.Errorf("failed to copy compose file: %w", err)
 	}
 
@@ -129,9 +146,11 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	return result, nil
 }
 
-// resolveConfig merges overrides with defaults, prompting the user for any
-// required config vars that have no default and no override.
-func resolveConfig(configVars []ConfigVar, overrides map[string]string) (map[string]string, error) {
+// resolveConfig merges overrides with defaults. When interactive is true it
+// prompts the user (os.Stdin) for any required config vars that have no default
+// and no override. When interactive is false, such a var is a returned error and
+// stdin is never read (the TUI path collects all config up front as overrides).
+func resolveConfig(configVars []ConfigVar, overrides map[string]string, interactive bool) (map[string]string, error) {
 	values := make(map[string]string)
 
 	for _, cv := range configVars {
@@ -147,8 +166,15 @@ func resolveConfig(configVars []ConfigVar, overrides map[string]string) (map[str
 			continue
 		}
 
-		// Required without default -- prompt the user.
+		// Required without default.
 		if cv.Required {
+			// Non-interactive (TUI) path: never read stdin. The caller must
+			// supply every required value as an override.
+			if !interactive {
+				return nil, fmt.Errorf("required config '%s' has no value (provide it via --set %s=...)", cv.Name, cv.Name)
+			}
+
+			// Interactive: prompt the user.
 			fmt.Printf("  %s", cv.Name)
 			if cv.Description != "" {
 				fmt.Printf(" (%s)", cv.Description)
