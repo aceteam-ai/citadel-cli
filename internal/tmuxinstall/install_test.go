@@ -96,8 +96,9 @@ func TestInstallFrom_ChecksumMismatchRejected(t *testing.T) {
 
 func TestInstallFrom_TarGzExtraction(t *testing.T) {
 	content := []byte("tmux-binary-contents")
-	// On non-windows the wanted entry is "tmux"; include it plus a decoy.
-	archive := makeTarGz(t, "tmux", content)
+	// Use the platform's expected entry name so the test is valid on Windows
+	// runners too (where extractTarGz looks for "tmux.exe").
+	archive := makeTarGz(t, tmuxBinaryName(), content)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(archive)
 	}))
