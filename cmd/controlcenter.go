@@ -21,6 +21,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
+	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/instance"
@@ -89,6 +90,15 @@ var (
 	ccVNCRunning atomic.Bool
 )
 
+// H.264 desktop stream server state (citadel-cli#338). Mirrors the VNC state
+// above: atomics for concurrent supervisor access, exposed over the tsnet mesh
+// via attachH264VPNListener. Gated on the same desktop permission as VNC.
+var (
+	ccH264Server  atomic.Pointer[deskstream.Server]
+	ccH264Port    = deskstream.DefaultPort
+	ccH264Running atomic.Bool
+)
+
 // vpnListener wraps a tsnet VPN listener with a liveness flag. tsnet does not
 // expose an explicit "listener torn down on reconnect" event, so we detect
 // death the only reliable way available: when the server's accept loop calls
@@ -137,6 +147,9 @@ var (
 
 	ccVNCVPNListener *vpnListener // nil when no VNC VPN listener is attached
 	ccVNCVPNIP       string       // tailnet IP the current VNC VPN listener is bound to
+
+	ccH264VPNListener *vpnListener // nil when no H.264 VPN listener is attached
+	ccH264VPNIP       string       // tailnet IP the current H.264 VPN listener is bound to
 
 	ccTerminalVPNListener *vpnListener // nil when no terminal VPN listener is attached
 	ccTerminalVPNIP       string       // tailnet IP the current terminal VPN listener is bound to
@@ -376,6 +389,7 @@ func runControlCenter() {
 		{name: "worker", fn: func() { _ = ccStopWorker() }},
 		{name: "terminal-server", fn: stopTerminalServer},
 		{name: "vnc-server", fn: stopVNCServer},
+		{name: "h264-server", fn: stopH264Server},
 		{name: "demo-server", fn: stopDemoServer},
 		{name: "instance-server", fn: func() {
 			if instanceServer != nil {
@@ -469,6 +483,16 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 			activityFn("warning", fmt.Sprintf("VNC server failed: %v", err))
 		} else {
 			activityFn("info", fmt.Sprintf("VNC server listening on port %d", ccVNCPort))
+		}
+
+		// Start the H.264 desktop stream server alongside VNC when the node can
+		// encode (ffmpeg + X). Clients that support H.264 use it; others fall
+		// back to noVNC. A node without ffmpeg/X simply logs and stays on VNC
+		// only (citadel-cli#338).
+		if err := startH264Server(); err != nil {
+			activityFn("info", fmt.Sprintf("H.264 stream unavailable (using VNC only): %v", err))
+		} else {
+			activityFn("info", fmt.Sprintf("H.264 stream server listening on port %d", ccH264Port))
 		}
 	}
 
@@ -660,6 +684,102 @@ func stopVNCServer() {
 	ccVPNMu.Unlock()
 }
 
+// startH264Server starts the embedded H.264 desktop stream server for remote
+// desktop video over the mesh (citadel-cli#338). It returns an error (and does
+// not mark itself running) when the node cannot encode H.264 (no ffmpeg or X),
+// so the caller leaves the node on VNC only and clients fall back to noVNC.
+func startH264Server() error {
+	if ccH264Running.Load() {
+		return nil
+	}
+
+	srv := deskstream.NewServer(deskstream.Config{
+		Host: "127.0.0.1",
+		Port: ccH264Port,
+		FPS:  15,
+	})
+	srv.SetSilent()
+
+	if err := srv.Start(); err != nil {
+		return fmt.Errorf("failed to start H.264 server: %w", err)
+	}
+
+	ccH264Server.Store(srv)
+	ccH264Running.Store(true)
+
+	// Attach the VPN listener so the stream is reachable over the tsnet mesh,
+	// mirroring the VNC exposure (issue #317 self-healing semantics).
+	attachH264VPNListener()
+	return nil
+}
+
+// stopH264Server stops the embedded H.264 stream server.
+func stopH264Server() {
+	if !ccH264Running.Load() {
+		return
+	}
+	if srv := ccH264Server.Load(); srv != nil {
+		srv.Stop()
+	}
+	ccH264Running.Store(false)
+
+	ccVPNMu.Lock()
+	if ccH264VPNListener != nil {
+		_ = ccH264VPNListener.Close()
+	}
+	ccH264VPNListener = nil
+	ccH264VPNIP = ""
+	ccVPNMu.Unlock()
+}
+
+// h264VPNHealthyLocked reports whether the H.264 VPN listener is currently
+// attached and live. Caller must hold ccVPNMu.
+func h264VPNHealthyLocked() bool {
+	return ccH264VPNListener != nil && !ccH264VPNListener.isDead()
+}
+
+// attachH264VPNListener (re)binds the H.264 server's tsnet VPN listener
+// idempotently, mirroring attachVNCVPNListener (issue #317). Safe to call
+// repeatedly: it no-ops when a live listener is attached and replaces a dead
+// one.
+func attachH264VPNListener() {
+	ccVPNMu.Lock()
+	defer ccVPNMu.Unlock()
+
+	srv := ccH264Server.Load()
+	if !ccH264Running.Load() || srv == nil {
+		return
+	}
+
+	if h264VPNHealthyLocked() {
+		return
+	}
+
+	if !isConnectedFn() {
+		return
+	}
+
+	if ccH264VPNListener != nil {
+		_ = ccH264VPNListener.Close()
+		srv.RemoveListener(ccH264VPNListener)
+		ccH264VPNListener = nil
+		ccH264VPNIP = ""
+	}
+
+	vpnPort := fmt.Sprintf("%d", ccH264Port)
+	rawLn, vpnIP, err := listenVPNFn("tcp", vpnPort)
+	if err != nil {
+		Log("H.264 server VPN listener failed (localhost-only): %v", err)
+		return
+	}
+
+	vpnLn := &vpnListener{Listener: rawLn}
+	srv.AddListener(vpnLn)
+	ccH264VPNListener = vpnLn
+	ccH264VPNIP = vpnIP
+	Log("H.264 server VPN listener on %s:%s", vpnIP, vpnPort)
+}
+
 // vncVPNHealthyLocked reports whether the VNC VPN listener is currently
 // attached and live. Caller must hold ccVPNMu.
 func vncVPNHealthyLocked() bool {
@@ -792,6 +912,9 @@ func vpnListenersHealthy() bool {
 	if ccVNCRunning.Load() && !vncVPNHealthyLocked() {
 		return false
 	}
+	if ccH264Running.Load() && !h264VPNHealthyLocked() {
+		return false
+	}
 	return true
 }
 
@@ -844,6 +967,9 @@ func ccSuperviseVPNListeners(ctx context.Context, activityFn func(level, msg str
 				if activityFn != nil && before == 0 && platform.EmbeddedVNCPort() != 0 {
 					activityFn("info", "Desktop VPN listener re-established after network reconnect")
 				}
+			}
+			if ccH264Running.Load() {
+				attachH264VPNListener()
 			}
 		}
 
