@@ -39,10 +39,12 @@ func newNALFramer() *nalFramer { return &nalFramer{} }
 func (f *nalFramer) Push(chunk []byte) [][]byte {
 	f.buf = append(f.buf, chunk...)
 	units, remainder := splitNALUnits(f.buf)
-	// Retain the unconsumed tail (a partial NAL) for the next Push.
-	if remainder > 0 {
-		f.buf = append(f.buf[:0], f.buf[remainder:]...)
-	}
+	// Retain the unconsumed tail (a partial NAL) for the next Push. The NAL
+	// slices in units alias f.buf, so we must NOT compact f.buf in place here
+	// (that would overwrite bytes the pending units still point at). Snapshot
+	// the tail into a fresh backing array and replace f.buf with it.
+	tail := append([]byte(nil), f.buf[remainder:]...)
+	f.buf = tail
 
 	var out [][]byte
 	// pending accumulates the NAL units of the access unit being assembled, so

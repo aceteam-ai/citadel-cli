@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// TestPopulateCapabilityFlagsAlwaysSetsAllFour verifies that all four capability
-// flags are non-nil after population, so every heartbeat emits concrete
-// true/false values rather than omitting keys (citadel-cli#324).
-func TestPopulateCapabilityFlagsAlwaysSetsAllFour(t *testing.T) {
+// TestPopulateCapabilityFlagsAlwaysSetsAll verifies that every capability flag
+// is non-nil after population, so every heartbeat emits concrete true/false
+// values rather than omitting keys (citadel-cli#324, plus h264 in #338).
+func TestPopulateCapabilityFlagsAlwaysSetsAll(t *testing.T) {
 	caps := &NodeCapabilities{}
 	populateCapabilityFlags(caps, 0)
 
@@ -25,6 +25,9 @@ func TestPopulateCapabilityFlagsAlwaysSetsAllFour(t *testing.T) {
 	if caps.GPU == nil {
 		t.Error("GPU flag should be populated, got nil")
 	}
+	if caps.H264 == nil {
+		t.Error("H264 flag should be populated, got nil")
+	}
 }
 
 // TestCapabilityFlagsDesktopDerivedFromVNCPort verifies the desktop flag is true
@@ -38,8 +41,8 @@ func TestCapabilityFlagsDesktopDerivedFromVNCPort(t *testing.T) {
 }
 
 // TestCapabilityFlagsJSONContract verifies the wire format matches the backend
-// contract exactly: keys console/desktop/files/gpu, boolean values, inside the
-// capabilities object (aceteam#4223, PR #4231).
+// contract exactly: keys console/desktop/files/gpu/h264, boolean values, inside
+// the capabilities object (aceteam#4223, PR #4231; h264 in citadel-cli#338).
 func TestCapabilityFlagsJSONContract(t *testing.T) {
 	tr := true
 	fa := false
@@ -48,6 +51,7 @@ func TestCapabilityFlagsJSONContract(t *testing.T) {
 		Desktop: &fa,
 		Files:   &tr,
 		GPU:     &fa,
+		H264:    &tr,
 	}
 	b, err := json.Marshal(caps)
 	if err != nil {
@@ -60,6 +64,7 @@ func TestCapabilityFlagsJSONContract(t *testing.T) {
 		`"desktop":false`,
 		`"files":true`,
 		`"gpu":false`,
+		`"h264":true`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("capabilities JSON missing %q; got %s", want, got)

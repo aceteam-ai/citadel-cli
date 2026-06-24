@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
@@ -30,13 +31,15 @@ var (
 	staticCapsOnce sync.Once
 	cachedConsole  bool
 	cachedGPU      bool
+	cachedH264     bool
 )
 
-// detectStaticCaps computes the console and gpu flags exactly once.
+// detectStaticCaps computes the console, gpu, and h264 flags exactly once.
 func detectStaticCaps() {
 	staticCapsOnce.Do(func() {
 		cachedConsole = detectConsole()
 		cachedGPU = detectGPU()
+		cachedH264 = deskstream.H264Available()
 	})
 }
 
@@ -49,6 +52,7 @@ func populateCapabilityFlags(caps *NodeCapabilities, vncPort int) {
 
 	console := cachedConsole
 	gpu := cachedGPU
+	h264 := cachedH264
 	desktop := vncPort > 0 || probeVNCPort(platform.DefaultVNCPort)
 	files := detectFiles()
 
@@ -56,6 +60,7 @@ func populateCapabilityFlags(caps *NodeCapabilities, vncPort int) {
 	caps.Desktop = &desktop
 	caps.Files = &files
 	caps.GPU = &gpu
+	caps.H264 = &h264
 }
 
 // detectConsole reports whether the node can offer a remote shell: a shell
