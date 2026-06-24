@@ -47,7 +47,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	display := resolveDisplay()
-	enc, err := selectEncoder(ffmpegHasEncoder)
+	enc, err := s.encoder()
 	if err != nil {
 		s.logger.Printf("no encoder available: %v", err)
 		return
@@ -96,7 +96,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		s.logger.Printf("encoder start failed: %v", err)
 		return
 	}
-	defer runner.Stop()
+	// Stop the CURRENT runner at return. The closure captures the runner
+	// VARIABLE (evaluated at return time), not the value bound here, so it
+	// correctly stops whichever runner is live after a requestKeyframe restart
+	// reassigned it — otherwise the restarted ffmpeg would never be reaped.
+	defer func() { runner.Stop() }()
 
 	// Reader goroutine: handles client TEXT frames (requestKeyframe) and detects
 	// disconnects. It never writes to the socket.
@@ -131,7 +135,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-restart:
 			// On-demand keyframe: restart the encoder so the next frames begin
 			// with SPS+PPS+IDR. Drain any stale queued payloads first so the
-			// client does not briefly receive pre-restart P-frames.
+			// client does not briefly receive pre-restart P-frames. A late
+			// onPayload from the old runner's read goroutine can still slip one
+			// stale P-frame past drain before the new keyframe arrives; the
+			// decoder self-corrects within a frame, which is acceptable here.
 			runner.Stop()
 			drain(payloads)
 			runner = newEncoderRunner(cfg, enc, func(p []byte) {

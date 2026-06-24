@@ -38,6 +38,21 @@ type Server struct {
 
 	activeConns int64
 	totalConns  int64
+
+	// encoderOnce/selectedEncoder memoize the chosen H.264 encoder so the
+	// `ffmpeg -encoders` probe runs once per server rather than on every
+	// connection.
+	encoderOnce     sync.Once
+	selectedEncoder EncoderKind
+	encoderErr      error
+}
+
+// encoder returns the memoized H.264 encoder selection for this server.
+func (s *Server) encoder() (EncoderKind, error) {
+	s.encoderOnce.Do(func() {
+		s.selectedEncoder, s.encoderErr = selectEncoder(ffmpegHasEncoder)
+	})
+	return s.selectedEncoder, s.encoderErr
 }
 
 // Logger matches the VNC/terminal server logger interface.
@@ -146,8 +161,9 @@ func (s *Server) Start() error {
 	}
 
 	// Verify an encoder is available before claiming to be up, so a node without
-	// ffmpeg/X reports a clear error and clients fall back to noVNC.
-	if _, err := selectEncoder(ffmpegHasEncoder); err != nil {
+	// ffmpeg/X reports a clear error and clients fall back to noVNC. The result
+	// is memoized for reuse by every connection.
+	if _, err := s.encoder(); err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("H.264 unavailable: %w", err)
 	}
