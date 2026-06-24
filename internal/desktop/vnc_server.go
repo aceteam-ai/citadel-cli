@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net"
@@ -338,8 +339,17 @@ func (s *VNCServer) writeServerInit(w io.Writer, width, height int) error {
 // rfbSession runs the main client message loop and frame-sending goroutine.
 func (s *VNCServer) rfbSession(conn net.Conn) {
 	var writeMu sync.Mutex
-	updateRequested := make(chan struct{}, 1)
+	// updateRequested carries the incremental flag of a FramebufferUpdateRequest
+	// (true = incremental, false = full). Buffered to 1; a pending full request
+	// wins over a later incremental one.
+	updateRequested := make(chan bool, 1)
 	done := make(chan struct{})
+
+	// Per-connection encoding negotiation state. zrleEnabled is set when the
+	// client advertises ZRLE (16) via SetEncodings. Protected by encMu because
+	// it is written by the reader loop and read by the sender goroutine.
+	var encMu sync.Mutex
+	zrleEnabled := false
 
 	// Frame sender goroutine
 	go func() {
@@ -348,30 +358,61 @@ func (s *VNCServer) rfbSession(conn net.Conn) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// Per-connection state: the previous captured frame (native BGRX) for
+		// dirty-rectangle diffing, and the continuous ZRLE zlib stream.
+		var prevFrame []byte
+		var zEnc *zrleEncoder
+		defer func() {
+			if zEnc != nil {
+				zEnc.Close()
+			}
+		}()
+
 		for {
 			select {
 			case <-s.stopCh:
 				return
-			case <-ticker.C:
-				// Only send a frame if the client has requested one.
-				select {
-				case <-updateRequested:
-				default:
-					continue
-				}
-
+			case incremental := <-updateRequested:
 				frame, err := s.capturer.Capture()
 				if err != nil {
 					s.logger.Printf("capture error: %v", err)
 					continue
 				}
 
+				encMu.Lock()
+				useZRLE := zrleEnabled
+				encMu.Unlock()
+
+				if useZRLE && zEnc == nil {
+					zEnc = newZRLEEncoder()
+				}
+
+				// Determine the rectangles to send. A non-incremental request,
+				// or the first frame of a connection, sends the full frame.
+				// Otherwise diff against the previous frame on a 64x64 tile grid.
+				frameW, frameH := frame.Width(), frame.Height()
+				var rects []image.Rectangle
+				if !incremental || prevFrame == nil {
+					rects = []image.Rectangle{image.Rect(0, 0, frameW, frameH)}
+				} else {
+					rects = dirtyTiles(prevFrame, frame.Pix, frameW, frameH)
+				}
+
+				activeEnc := zEnc
+				if !useZRLE {
+					activeEnc = nil
+				}
+
 				writeMu.Lock()
-				err = writeFramebufferUpdate(conn, frame)
+				err = writeFramebufferUpdateRects(conn, frame.Pix, frameW, rects, activeEnc)
 				writeMu.Unlock()
 				if err != nil {
 					return // connection dead
 				}
+
+				// Stash a copy of this frame as the diff baseline. Capture
+				// returns a fresh buffer each call, so we can retain it.
+				prevFrame = frame.Pix
 			}
 		}
 	}()
@@ -415,7 +456,14 @@ func (s *VNCServer) rfbSession(conn net.Conn) {
 			if _, err := io.ReadFull(conn, encodings); err != nil {
 				return
 			}
-			// We only support Raw encoding (0), ignore the rest.
+			// Negotiate ZRLE (16) if the client advertises it; otherwise we
+			// fall back to Raw (0), which every client supports.
+			if clientSupportsZRLE(encodings) {
+				encMu.Lock()
+				zrleEnabled = true
+				encMu.Unlock()
+				s.logger.Printf("client negotiated ZRLE encoding")
+			}
 
 		case 3: // FramebufferUpdateRequest
 			// type(1) + incremental(1) + x(2) + y(2) + w(2) + h(2) = 10, already read 1
@@ -423,10 +471,25 @@ func (s *VNCServer) rfbSession(conn net.Conn) {
 			if _, err := io.ReadFull(conn, buf[:]); err != nil {
 				return
 			}
-			// Signal the frame sender that the client wants a frame.
+			incremental := buf[0] != 0
+			// Signal the frame sender that the client wants a frame, passing
+			// the incremental flag. A pending full request (false) is not
+			// downgraded by a later incremental one.
 			select {
-			case updateRequested <- struct{}{}:
+			case updateRequested <- incremental:
 			default:
+				if !incremental {
+					// Ensure a full-update request is not lost behind a queued
+					// incremental one: drain and re-send as full.
+					select {
+					case <-updateRequested:
+					default:
+					}
+					select {
+					case updateRequested <- false:
+					default:
+					}
+				}
 			}
 
 		case 4: // KeyEvent
