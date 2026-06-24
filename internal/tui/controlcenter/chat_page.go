@@ -30,12 +30,28 @@ const (
 type ChatPage struct {
 	app *tview.Application
 
-	// Config (set at construction, read-only after)
+	// Config. The five fields below are seeded at construction from the initial
+	// snapshot, but are NOT necessarily final: a node that completes device
+	// authorization *after* the control center starts (the in-TUI device-auth
+	// flow, or a re-pair) writes its credentials to disk only then. To match the
+	// terminal/desktop/worker pages — which resolve their token+org lazily at
+	// network-connect time via getDeviceConfigFromFile() rather than freezing a
+	// startup snapshot — connect() re-resolves these fields through provider just
+	// before dialing whenever the credentials are still incomplete. Guarded by
+	// configMu because connect() runs on a background goroutine.
+	configMu   sync.Mutex
 	apiBaseURL string
 	apiToken   string
 	orgID      string
 	nodeID     string
 	nodeName   string
+
+	// provider, when non-nil, returns the freshest chat credentials resolved
+	// from the node's on-disk config/manifest/network state. It is consulted by
+	// connect() when the seeded snapshot is missing any required field so that a
+	// node authed after startup no longer shows a permanent "device
+	// authorization required" status.
+	provider func() ChatPageConfig
 
 	// UI components
 	root       *tview.Flex
@@ -75,6 +91,15 @@ type ChatPageConfig struct {
 	OrgID      string
 	NodeID     string
 	NodeName   string
+
+	// Provider, when set, is a lazy re-resolver for the credentials above. The
+	// control center constructs the ChatPage at startup — before the in-TUI
+	// device-auth flow can write credentials to disk — so the snapshot embedded
+	// in the fields above may be empty on a node that authorizes after launch.
+	// connect() calls Provider to pick up the freshly-written credentials,
+	// mirroring how the terminal/desktop/worker pages resolve their token+org
+	// at network-connect time. Optional: when nil, only the snapshot is used.
+	Provider func() ChatPageConfig
 }
 
 // NewChatPage creates a new chat page. The page connects lazily on first activation.
@@ -85,10 +110,58 @@ func NewChatPage(cfg ChatPageConfig) *ChatPage {
 		orgID:       cfg.OrgID,
 		nodeID:      cfg.NodeID,
 		nodeName:    cfg.NodeName,
+		provider:    cfg.Provider,
 		messages:    make([]chat.Message, 0, 200),
 		peers:       make(map[string]chat.PresenceInfo),
 		recentSends: make(map[string]time.Time),
 	}
+}
+
+// resolveConfig returns the current chat credentials, lazily re-resolving them
+// through the provider when the seeded snapshot is missing any required field.
+// A node that completes device authorization after the control center starts
+// only persists its token/org at that point; without this re-resolution the
+// ChatPage would keep the empty startup snapshot forever and show "device
+// authorization required" even though the node is fully authed.
+//
+// It is safe to call from the connect() goroutine: the read/refresh of the
+// config fields is serialized by configMu.
+func (p *ChatPage) resolveConfig() (apiBaseURL, apiToken, orgID, nodeID, nodeName string) {
+	p.configMu.Lock()
+	defer p.configMu.Unlock()
+
+	incomplete := p.apiBaseURL == "" || p.apiToken == "" || p.orgID == ""
+	if incomplete && p.provider != nil {
+		fresh := p.provider()
+		// Only overwrite a field when the provider has a non-empty value, so a
+		// transient resolution miss never clobbers a credential we already had.
+		if fresh.APIBaseURL != "" {
+			p.apiBaseURL = fresh.APIBaseURL
+		}
+		if fresh.APIToken != "" {
+			p.apiToken = fresh.APIToken
+		}
+		if fresh.OrgID != "" {
+			p.orgID = fresh.OrgID
+		}
+		if fresh.NodeID != "" {
+			p.nodeID = fresh.NodeID
+		}
+		if fresh.NodeName != "" {
+			p.nodeName = fresh.NodeName
+		}
+	}
+
+	return p.apiBaseURL, p.apiToken, p.orgID, p.nodeID, p.nodeName
+}
+
+// currentAPIBaseURL returns the currently-known API base URL under configMu,
+// for the status-bar / settings readouts. It does not trigger a provider
+// re-resolution — that happens only at connect() time.
+func (p *ChatPage) currentAPIBaseURL() string {
+	p.configMu.Lock()
+	defer p.configMu.Unlock()
+	return p.apiBaseURL
 }
 
 // Name implements Page.
@@ -212,18 +285,24 @@ func (p *ChatPage) connect() {
 		return
 	}
 
-	if p.apiBaseURL == "" || p.apiToken == "" || p.orgID == "" {
+	// Re-resolve credentials before dialing. On a node that device-authed after
+	// the control center launched, the snapshot captured at construction is
+	// empty; resolveConfig picks up the credentials device-auth wrote to disk,
+	// matching the lazy resolution the terminal/desktop/worker pages already do.
+	apiBaseURL, apiToken, orgID, nodeID, nodeName := p.resolveConfig()
+
+	if apiBaseURL == "" || apiToken == "" || orgID == "" {
 		p.clientMu.Unlock()
 		p.setStatus("[red]Not configured[white] — device authorization required")
 		return
 	}
 
 	client := chat.NewClient(chat.ClientConfig{
-		APIBaseURL: p.apiBaseURL,
-		Token:      p.apiToken,
-		OrgID:      p.orgID,
-		NodeID:     p.nodeID,
-		NodeName:   p.nodeName,
+		APIBaseURL: apiBaseURL,
+		Token:      apiToken,
+		OrgID:      orgID,
+		NodeID:     nodeID,
+		NodeName:   nodeName,
 	})
 	p.client = client
 	p.clientMu.Unlock()
@@ -401,7 +480,7 @@ func (p *ChatPage) renderStatusBar(state connState, detail string) {
 	}
 
 	p.state = state
-	endpoint := chat.SanitizeEndpoint(p.apiBaseURL)
+	endpoint := chat.SanitizeEndpoint(p.currentAPIBaseURL())
 	if endpoint == "" {
 		endpoint = "not configured"
 	}
@@ -478,7 +557,7 @@ const (
 // transport detail (Redis pub/sub) is intentionally not surfaced — callers
 // (e.g. the Settings page) should present this as a generic "connection".
 func (p *ChatPage) ConnectionStatus() (endpoint string, state ConnState) {
-	endpoint = wssEndpoint(p.apiBaseURL)
+	endpoint = wssEndpoint(p.currentAPIBaseURL())
 
 	p.clientMu.Lock()
 	client := p.client

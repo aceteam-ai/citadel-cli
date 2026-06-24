@@ -219,7 +219,14 @@ func runControlCenter() {
 			},
 		},
 		OnConnect: ccOnNetworkConnect,
-		Chat:      buildChatConfig(),
+		// Chat is seeded with the snapshot resolvable at startup, but a node that
+		// completes device authorization in-TUI persists its credentials only
+		// afterward. ChatConfigProvider lets the ChatPage re-resolve them lazily
+		// at connect() time — the same way the terminal/desktop/worker paths
+		// resolve token+org at network-connect time — so a freshly-authed node no
+		// longer shows a permanent "device authorization required" status.
+		Chat:               buildChatConfig(),
+		ChatConfigProvider: buildChatConfig,
 		Proxmox:   buildProxmoxConfig(),
 		Settings: controlcenter.SettingsCallbacks{
 			LoadTelemetry: func() *config.Telemetry {

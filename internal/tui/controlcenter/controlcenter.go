@@ -420,8 +420,9 @@ type ControlCenter struct {
 	consolePage *ConsolePage
 
 	// Chat
-	chatConfig    ChatPageConfig // stored from Config; used to lazily create ChatPage
-	chatPage      *ChatPage      // nil until registered in Run
+	chatConfig     ChatPageConfig        // stored from Config; used to lazily create ChatPage
+	chatConfigProv func() ChatPageConfig // lazy re-resolver for chat credentials (post-startup device auth)
+	chatPage       *ChatPage             // nil until registered in Run
 	proxmoxConfig ProxmoxConfig  // Proxmox page config (zero = disabled)
 
 	// Settings
@@ -488,7 +489,8 @@ type Config struct {
 	Worker             WorkerCallbacks                          // Worker management callbacks
 	Permissions        PermissionsCallbacks                     // Gateway permissions callbacks
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
-	Chat               ChatPageConfig                           // Chat page configuration (empty = disabled)
+	Chat               ChatPageConfig                           // Chat page configuration (initial snapshot; may be empty pre-auth)
+	ChatConfigProvider func() ChatPageConfig                    // Lazy re-resolver for chat credentials (picks up post-startup device auth)
 	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
 	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
 }
@@ -526,6 +528,7 @@ func New(cfg Config) *ControlCenter {
 		authServiceURL:     cfg.AuthServiceURL,
 		nexusURL:           cfg.NexusURL,
 		chatConfig:         cfg.Chat,
+		chatConfigProv:     cfg.ChatConfigProvider,
 		proxmoxConfig:      cfg.Proxmox,
 		settingsConfig:     cfg.Settings,
 	}
@@ -608,7 +611,11 @@ func (cc *ControlCenter) Run() error {
 		cc.pmgr.Register(NewPlaceholderPage("console", "Console"), false)
 	}
 
-	// Alt+3: Chat page (hidden until network is connected and org is known)
+	// Alt+3: Chat page (hidden until network is connected and org is known).
+	// Pass the lazy provider so that a node which completes device
+	// authorization *after* startup re-resolves its credentials at connect()
+	// time instead of being stuck on the empty startup snapshot.
+	cc.chatConfig.Provider = cc.chatConfigProv
 	cc.chatPage = NewChatPage(cc.chatConfig)
 	cc.pmgr.Register(cc.chatPage, false)
 
