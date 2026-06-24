@@ -40,6 +40,7 @@ var (
 	waProxyFlag     string // optional per-tenant egress proxy
 	waTenantFlag    string // tenant name (display only)
 	waPublicURLFlag string // optional public URL for QR links
+	waImageFlag     string // optional override for the bridge container image
 )
 
 var whatsappCmd = &cobra.Command{
@@ -104,6 +105,8 @@ func init() {
 	whatsappUpCmd.Flags().StringVar(&waTenantFlag, "tenant", "default", "Tenant name (label only).")
 	whatsappUpCmd.Flags().StringVar(&waPublicURLFlag, "public-url", "",
 		"Optional public base URL of the bridge, used only for copy-pasteable QR links.")
+	whatsappUpCmd.Flags().StringVar(&waImageFlag, "image", "",
+		"Override the bridge container image (default: ghcr.io/aceteam-ai/whatsapp-bridge:latest).")
 }
 
 // servicesDirForNode resolves the node's services directory, creating the node
@@ -123,12 +126,27 @@ func bridgeBaseURL(port int) string {
 }
 
 // meshAPIURL returns the api_url the aceteam backend should use: the node's
-// network (mesh) IP and the published port. Falls back to a placeholder hint
-// if the node is not connected to the network.
+// network (mesh) IP and the published port. Returns "" if the node is not
+// connected to the network. It primes the network singleton first (mirroring
+// status.go) so it works from a fresh process where the global server has not
+// yet been initialized.
 func meshAPIURL(port int) string {
+	if !network.HasState() {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// VerifyOrReconnect initializes the global server if needed.
+	network.VerifyOrReconnect(ctx)
+
 	ip, err := network.GetGlobalIPv4()
 	if err != nil || ip == "" {
-		return ""
+		// Fall back to the status snapshot, which also primes the singleton.
+		if st, serr := network.GetGlobalStatus(ctx); serr == nil && st.IPv4 != "" {
+			ip = st.IPv4
+		} else {
+			return ""
+		}
 	}
 	return fmt.Sprintf("http://%s:%d", ip, port)
 }
@@ -168,6 +186,9 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	}
 	env["ADMIN_API_KEY"] = adminKey
 	env["BRIDGE_PORT"] = fmt.Sprintf("%d", waPortFlag)
+	if waImageFlag != "" {
+		env["BRIDGE_IMAGE"] = waImageFlag
+	}
 	if waProxyFlag != "" {
 		env["DEFAULT_PROXY_URL"] = waProxyFlag
 	}
@@ -186,11 +207,13 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 4. Register the service in the node manifest for tracking/lifecycle.
-	if err := addServiceToManifest(filepath.Dir(servicesDir), whatsapp.ServiceName); err != nil {
-		// Non-fatal: the container is up regardless of manifest bookkeeping.
-		fmt.Fprintf(os.Stderr, "   ⚠️ Could not record service in manifest: %v\n", err)
-	}
+	// The bridge is deliberately NOT added to the node manifest. The generic
+	// `citadel run`/`citadel work` start path runs `docker compose up` without
+	// an --env-file, but this stack hard-requires ADMIN_API_KEY (and docker
+	// compose only auto-loads a file literally named ".env"). Registering it
+	// would make those commands fail. The bridge has its own lifecycle via
+	// `citadel whatsapp up/down`; status discovery uses the compose-file
+	// presence + container state, not the manifest.
 
 	// 5. Wait for the bridge to answer.
 	client := whatsapp.NewClient(bridgeBaseURL(waPortFlag), adminKey)
@@ -203,23 +226,31 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println(" ready.")
 
-	// 6. Mint a tenant (the data-plane api key for whatsapp_connect).
-	tenant, err := client.CreateTenant(ctx, waTenantFlag, waProxyFlag)
-	if err != nil {
-		return fmt.Errorf("provision tenant: %w", err)
-	}
-	// Persist the tenant key locally so `status`/`qr`/`connect` can reuse it.
-	env["TENANT_API_KEY"] = tenant.APIKey
-	env["TENANT_ID"] = tenant.ID
-	env["TENANT_NAME"] = tenant.Name
-	if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
-		fmt.Fprintf(os.Stderr, "   ⚠️ Could not save tenant key locally: %v\n", err)
+	// 6. Provision a tenant (the data-plane api key for whatsapp_connect). If
+	//    one was already minted on a previous `up`, reuse it -- minting a fresh
+	//    tenant would orphan the already-linked WhatsApp session and rotate the
+	//    api_key the user already registered.
+	tenantKey := env["TENANT_API_KEY"]
+	if tenantKey == "" {
+		tenant, err := client.CreateTenant(ctx, waTenantFlag, waProxyFlag)
+		if err != nil {
+			return fmt.Errorf("provision tenant: %w", err)
+		}
+		tenantKey = tenant.APIKey
+		env["TENANT_API_KEY"] = tenant.APIKey
+		env["TENANT_ID"] = tenant.ID
+		env["TENANT_NAME"] = tenant.Name
+		if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
+			fmt.Fprintf(os.Stderr, "   ⚠️ Could not save tenant key locally: %v\n", err)
+		}
+	} else {
+		fmt.Println("   ℹ️  Reusing the existing tenant (its linked session and api_key are preserved).")
 	}
 
 	// 7. Show the connect details + pairing QR.
-	printConnectDetails(waPortFlag, tenant.APIKey)
+	printConnectDetails(waPortFlag, tenantKey)
 	fmt.Println()
-	if err := printQR(ctx, client, tenant.APIKey); err != nil {
+	if err := printQR(ctx, client, tenantKey); err != nil {
 		fmt.Fprintf(os.Stderr, "   ⚠️ Could not fetch pairing QR yet: %v\n", err)
 		fmt.Println("   Run 'citadel whatsapp qr' in a moment to retry.")
 	}

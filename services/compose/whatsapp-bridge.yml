@@ -14,7 +14,10 @@
 # the app, matching the convention used by the other catalog services.
 services:
   bridge:
-    image: ghcr.io/sunapi386/whatsapp-bridge:latest
+    # Image is parameterized so it can point at whichever registry publishes the
+    # community module image. The default is the aceteam-ai GHCR location; set
+    # BRIDGE_IMAGE in the env file to override (e.g. a fork's GHCR or a local tag).
+    image: ${BRIDGE_IMAGE:-ghcr.io/aceteam-ai/whatsapp-bridge:latest}
     container_name: citadel-whatsapp-bridge
     restart: unless-stopped
     ports:
