@@ -227,19 +227,26 @@ func tileChanged(prev, cur []byte, frameW, tx, ty, tw, th int) bool {
 func writeFramebufferUpdateRects(w io.Writer, pix []byte, frameW int, rects []image.Rectangle, zEnc *zrleEncoder) error {
 	var buf bytes.Buffer
 
+	// Drop any degenerate rectangles up front so the number-of-rects header
+	// always matches the rectangles actually written (a mismatch desyncs the
+	// RFB stream).
+	valid := rects[:0:0]
+	for _, r := range rects {
+		if r.Dx() > 0 && r.Dy() > 0 {
+			valid = append(valid, r)
+		}
+	}
+
 	// FramebufferUpdate header: type(0) + padding(1) + number-of-rects(u16).
 	buf.WriteByte(0)
 	buf.WriteByte(0)
 	var nrects [2]byte
-	binary.BigEndian.PutUint16(nrects[:], uint16(len(rects)))
+	binary.BigEndian.PutUint16(nrects[:], uint16(len(valid)))
 	buf.Write(nrects[:])
 
-	for _, r := range rects {
+	for _, r := range valid {
 		x, y := r.Min.X, r.Min.Y
 		rw, rh := r.Dx(), r.Dy()
-		if rw <= 0 || rh <= 0 {
-			continue
-		}
 		if zEnc != nil {
 			if err := zEnc.encodeZRLERect(&buf, pix, frameW, x, y, rw, rh); err != nil {
 				return err
