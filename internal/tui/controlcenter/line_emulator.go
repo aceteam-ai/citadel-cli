@@ -2,6 +2,10 @@ package controlcenter
 
 import "strconv"
 
+// escByte is the ASCII escape control byte (ESC, 0x1b) that introduces terminal
+// escape sequences.
+const escByte = 0x1b
+
 // lineEmulator is a minimal, single-line terminal emulator for the TUI Console.
 //
 // The Console renders PTY output into a line-oriented tview.TextView, which is
@@ -270,11 +274,21 @@ func (e *lineEmulator) writeRune(r []byte) {
 	e.col++
 }
 
+// maxCommittedLines bounds the scrollback the emulator retains. The full
+// rendered buffer is reparsed by tview on every update, so this caps both
+// memory and per-chunk render cost. Scrollback beyond this is dropped (v1
+// limitation; the Console is for interactive use, not long-term log capture).
+const maxCommittedLines = 5000
+
 // lineFeed commits the current line and starts a fresh one. Any pending
 // attributes carry to the new line (colour persists across lines, as on a real
 // terminal).
 func (e *lineEmulator) lineFeed() {
 	e.committed = append(e.committed, e.renderCells(e.cells))
+	if len(e.committed) > maxCommittedLines {
+		// Drop the oldest lines, keeping the most recent maxCommittedLines.
+		e.committed = append([]string(nil), e.committed[len(e.committed)-maxCommittedLines:]...)
+	}
 	e.cells = nil
 	e.col = 0
 }
