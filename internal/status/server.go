@@ -97,9 +97,11 @@ func (s *Server) AddRouteRegistrar(reg RouteRegistrar) {
 	s.routeRegistrars = append(s.routeRegistrars, reg)
 }
 
-// Start begins listening for HTTP requests.
-// This method blocks until the context is cancelled.
-func (s *Server) Start(ctx context.Context) error {
+// buildMux constructs the HTTP route multiplexer for the server, registering
+// all enabled endpoints based on the server's configuration. It reads config
+// fields but mutates no shared Server state, so it can be invoked synchronously
+// from both Start and tests without introducing data races.
+func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/status", s.handleStatus)
@@ -129,6 +131,14 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.extraRoutes != nil {
 		s.extraRoutes(mux)
 	}
+
+	return mux
+}
+
+// Start begins listening for HTTP requests.
+// This method blocks until the context is cancelled.
+func (s *Server) Start(ctx context.Context) error {
+	mux := s.buildMux()
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf(":%d", s.port),
 		Handler:      mux,

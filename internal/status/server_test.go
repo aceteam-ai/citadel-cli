@@ -204,16 +204,15 @@ func TestDesktopEndpointsRegisteredWhenEnabled(t *testing.T) {
 		EnableDesktop:  true,
 	}, collector)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	go server.Start(ctx)
-	time.Sleep(50 * time.Millisecond) // Wait for server to start
+	// Build the mux synchronously rather than starting the server in a
+	// goroutine; this exercises the real route registration without racing
+	// the server's startup goroutine over server.httpServer (issue #321).
+	handler := server.buildMux()
 
 	// Screenshot endpoint should return 401 without token (registered but auth fails)
 	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
 	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("/api/screenshot without token: got %d, want %d", w.Code, http.StatusUnauthorized)
@@ -222,7 +221,7 @@ func TestDesktopEndpointsRegisteredWhenEnabled(t *testing.T) {
 	// Actions endpoint should return 401 without token
 	req = httptest.NewRequest(http.MethodPost, "/api/actions", nil)
 	w = httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("/api/actions without token: got %d, want %d", w.Code, http.StatusUnauthorized)
@@ -241,16 +240,14 @@ func TestDesktopEndpointsNotRegisteredWithoutEnableDesktop(t *testing.T) {
 		EnableDesktop:  false,
 	}, collector)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	go server.Start(ctx)
-	time.Sleep(50 * time.Millisecond)
+	// Build the mux synchronously to avoid racing the server startup
+	// goroutine over server.httpServer (issue #321).
+	handler := server.buildMux()
 
 	// Screenshot endpoint should return 404 (not registered)
 	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
 	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("/api/screenshot with EnableDesktop=false: got %d, want %d", w.Code, http.StatusNotFound)
@@ -266,15 +263,13 @@ func TestDesktopEndpointsNotRegisteredWithoutValidator(t *testing.T) {
 		EnableDesktop: true,
 	}, collector)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	go server.Start(ctx)
-	time.Sleep(50 * time.Millisecond)
+	// Build the mux synchronously to avoid racing the server startup
+	// goroutine over server.httpServer (issue #321).
+	handler := server.buildMux()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
 	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("/api/screenshot with no validator: got %d, want %d", w.Code, http.StatusNotFound)
@@ -292,17 +287,15 @@ func TestDesktopEndpointRejectsInvalidToken(t *testing.T) {
 		EnableDesktop:  true,
 	}, collector)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	go server.Start(ctx)
-	time.Sleep(50 * time.Millisecond)
+	// Build the mux synchronously to avoid racing the server startup
+	// goroutine over server.httpServer (issue #321).
+	handler := server.buildMux()
 
 	// Bad token should get 401
 	req := httptest.NewRequest(http.MethodGet, "/api/screenshot", nil)
 	req.Header.Set("Authorization", "Bearer bad-token")
 	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
+	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("/api/screenshot with bad token: got %d, want %d", w.Code, http.StatusUnauthorized)
@@ -365,16 +358,14 @@ func TestExistingEndpointsUnaffectedByDesktopConfig(t *testing.T) {
 				EnableDesktop: enableDesktop,
 			}, collector)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			defer cancel()
-
-			go server.Start(ctx)
-			time.Sleep(50 * time.Millisecond)
+			// Build the mux synchronously to avoid racing the server startup
+			// goroutine over server.httpServer (issue #321).
+			handler := server.buildMux()
 
 			// Health endpoint should always work
 			req := httptest.NewRequest(http.MethodGet, "/health", nil)
 			w := httptest.NewRecorder()
-			server.httpServer.Handler.ServeHTTP(w, req)
+			handler.ServeHTTP(w, req)
 
 			if w.Code != http.StatusOK {
 				t.Errorf("/health: got %d, want %d", w.Code, http.StatusOK)
@@ -383,7 +374,7 @@ func TestExistingEndpointsUnaffectedByDesktopConfig(t *testing.T) {
 			// Ping endpoint should always work
 			req = httptest.NewRequest(http.MethodGet, "/ping", nil)
 			w = httptest.NewRecorder()
-			server.httpServer.Handler.ServeHTTP(w, req)
+			handler.ServeHTTP(w, req)
 
 			if w.Code != http.StatusOK {
 				t.Errorf("/ping: got %d, want %d", w.Code, http.StatusOK)
