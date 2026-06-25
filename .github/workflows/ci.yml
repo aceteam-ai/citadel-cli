@@ -29,7 +29,7 @@ jobs:
     # Controller on the Proxmox lab; GitHub-hosted runners (ubuntu-latest) are
     # not used. The pods are bare, so the Go toolchain is provisioned per-run
     # by setup-go below.
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -78,7 +78,7 @@ jobs:
   # the compile to succeed, not the artifact.
   cross-compile:
     name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: arc-runner-set
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
