@@ -239,11 +239,12 @@ func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, imag
 		images = catalog.BuildLockImages(resolved.Images)
 	}
 	entry := catalog.LockEntry{
-		Name:   resolved.Manifest.Name,
-		Source: src.Raw,
-		Ref:    src.Ref,
-		Commit: resolved.Commit,
-		Images: images,
+		Name:        resolved.Manifest.Name,
+		Source:      src.Raw,
+		Ref:         src.Ref,
+		ResolvedRef: resolved.ResolvedRef,
+		Commit:      resolved.Commit,
+		Images:      images,
 	}
 	if err := catalog.UpsertLockEntry(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
