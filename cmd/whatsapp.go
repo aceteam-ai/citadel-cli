@@ -26,13 +26,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
-	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
+
+// defaultWhatsAppSource is the default module source for the WhatsApp bridge.
+// It points at the maintainer's PERSONAL repo, not an aceteam-ai-owned image:
+// the Baileys bridge is a reverse-engineered, ToS-gray integration, so the
+// aceteam-ai/citadel-cli binary deliberately does not embed or own its compose
+// or container image. The bridge ships from sunapi386/whatsapp-bridge and is
+// deployed here via the generic module-source mechanism (catalog.ResolveSource).
+const defaultWhatsAppSource = "sunapi386/whatsapp-bridge"
 
 var (
 	waAPIKeyFlag    string // user-supplied ADMIN_API_KEY override
@@ -41,6 +49,7 @@ var (
 	waTenantFlag    string // tenant name (display only)
 	waPublicURLFlag string // optional public URL for QR links
 	waImageFlag     string // optional override for the bridge container image
+	waSourceFlag    string // module source for the bridge compose (owner/repo[@ref] or git URL)
 )
 
 var whatsappCmd = &cobra.Command{
@@ -106,7 +115,11 @@ func init() {
 	whatsappUpCmd.Flags().StringVar(&waPublicURLFlag, "public-url", "",
 		"Optional public base URL of the bridge, used only for copy-pasteable QR links.")
 	whatsappUpCmd.Flags().StringVar(&waImageFlag, "image", "",
-		"Override the bridge container image (default: ghcr.io/aceteam-ai/whatsapp-bridge:latest).")
+		"Override the bridge container image (BRIDGE_IMAGE). Defaults to the image declared by the module source.")
+	whatsappUpCmd.Flags().StringVar(&waSourceFlag, "source", defaultWhatsAppSource,
+		"Module source for the bridge compose: owner/repo[@ref] or a git URL. "+
+			"The default (sunapi386/whatsapp-bridge) is a PRIVATE repo, so this node needs "+
+			"git credentials (GITHUB_TOKEN or an SSH key) to clone it and a docker login to pull its private image.")
 }
 
 // servicesDirForNode resolves the node's services directory, creating the node
@@ -157,12 +170,36 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// 1. Materialize the embedded compose file.
+	// 1. Resolve the bridge compose from its module source and materialize it
+	//    into the node's services dir. The bridge is a reverse-engineered,
+	//    ToS-gray integration, so its compose + image live in the maintainer's
+	//    personal repo (default sunapi386/whatsapp-bridge), NOT embedded in this
+	//    binary. ResolveSource clones/updates the module repo and returns the
+	//    path to its citadel/compose.yml.
+	source := waSourceFlag
+	if source == "" {
+		source = defaultWhatsAppSource
+	}
+	src, err := catalog.ParseSource(source)
+	if err != nil {
+		return fmt.Errorf("invalid --source %q: %w", source, err)
+	}
+	resolved, err := catalog.ResolveSource(src)
+	if err != nil {
+		// ResolveSource's clone error already explains the private-repo
+		// credential requirement (GITHUB_TOKEN / SSH / docker login).
+		return fmt.Errorf("resolve WhatsApp bridge module: %w", err)
+	}
+	composeBytes, err := os.ReadFile(resolved.ComposePath)
+	if err != nil {
+		return fmt.Errorf("read resolved bridge compose %s: %w", resolved.ComposePath, err)
+	}
+
 	composePath := whatsapp.ComposePath(servicesDir)
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return fmt.Errorf("create services dir: %w", err)
 	}
-	if err := os.WriteFile(composePath, []byte(services.WhatsAppBridgeCompose), 0600); err != nil {
+	if err := os.WriteFile(composePath, composeBytes, 0600); err != nil {
 		return fmt.Errorf("write compose file: %w", err)
 	}
 
@@ -456,6 +493,7 @@ func buildWhatsAppCallbacks() controlcenter.WhatsAppCallbacks {
 			waProxyFlag = ""
 			waTenantFlag = "default"
 			waPublicURLFlag = ""
+			waSourceFlag = defaultWhatsAppSource
 
 			if err := runWhatsAppUp(whatsappUpCmd, nil); err != nil {
 				return "", "", err
