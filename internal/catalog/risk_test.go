@@ -1,6 +1,10 @@
 package catalog
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // hasRisk reports whether risks contains a finding with the given severity whose
 // directive contains the substring.
@@ -171,5 +175,45 @@ func TestCriticalRisks(t *testing.T) {
 	dirs := criticalDirectives(risks)
 	if len(dirs) != 2 || dirs[0] != "privileged: true" {
 		t.Errorf("unexpected critical directives: %v", dirs)
+	}
+}
+
+func TestInstallFromManifest_PrivilegedGate(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yml")
+	// A compose with a Critical risk (privileged: true), no ports/container_name.
+	if err := os.WriteFile(composePath, []byte("services:\n  app:\n    image: ghcr.io/x/y:latest\n    privileged: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &ServiceManifest{Name: "risky"}
+	servicesDir := filepath.Join(dir, "services")
+
+	// allowPrivileged=false must REFUSE even though interactive=false.
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false); err == nil {
+		t.Fatal("expected refusal for Critical compose without allowPrivileged")
+	}
+
+	// allowPrivileged=true proceeds past the gate (install succeeds: no ports,
+	// no required config, compose copied).
+	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true)
+	if err != nil {
+		t.Fatalf("expected install to proceed with allowPrivileged=true, got %v", err)
+	}
+	if res == nil || res.Name != "risky" {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+func TestInstallFromManifest_CleanComposeNoGate(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  app:\n    image: ghcr.io/x/y:latest\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := &ServiceManifest{Name: "clean"}
+	servicesDir := filepath.Join(dir, "services")
+	// A clean compose installs fine even with allowPrivileged=false.
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false); err != nil {
+		t.Fatalf("clean compose should not be gated, got %v", err)
 	}
 }
