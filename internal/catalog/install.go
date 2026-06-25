@@ -231,7 +231,7 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		if gerr != nil {
 			return nil, fmt.Errorf("failed to generate sandbox override for '%s': %w", name, gerr)
 		}
-		overridePath := filepath.Join(servicesDir, name+".sandbox.yml")
+		overridePath := SandboxOverridePath(servicesDir, name)
 		if werr := os.WriteFile(overridePath, []byte(override), 0600); werr != nil {
 			return nil, fmt.Errorf("failed to write sandbox override: %w", werr)
 		}

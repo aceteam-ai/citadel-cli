@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -162,15 +163,13 @@ func composeFileArgs(origComposePath, actualComposePath string) []string {
 // sandboxOverridePathFor returns the path of the sandbox override that sits next
 // to a service's compose file (<dir>/<name>.sandbox.yml), or "" if it does not
 // exist. The compose file is "<name>.yml"; the override shares the same <name>.
+// Delegates to catalog.ExistingSandboxOverride (the single source of truth for
+// the override filename).
 func sandboxOverridePathFor(composePath string) string {
 	dir := filepath.Dir(composePath)
 	base := filepath.Base(composePath)
 	name := strings.TrimSuffix(base, filepath.Ext(base))
-	override := filepath.Join(dir, name+".sandbox.yml")
-	if _, err := os.Stat(override); err == nil {
-		return override
-	}
-	return ""
+	return catalog.ExistingSandboxOverride(dir, name)
 }
 
 // determineServiceType decides whether to use native or docker for a service.

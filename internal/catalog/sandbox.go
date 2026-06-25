@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -212,6 +213,25 @@ func dedupeStrings(in []string) []string {
 // within this directory unless --allow-privileged is set.
 func SandboxDataDir(servicesDir, name string) string {
 	return filepath.Join(servicesDir, name+"-data")
+}
+
+// SandboxOverridePath returns the path of a module's hardening override
+// (<servicesDir>/<name>.sandbox.yml). It is the single source of truth for the
+// override filename so every docker-compose start site (across packages) can
+// resolve and stat the same file. It does NOT check existence.
+func SandboxOverridePath(servicesDir, name string) string {
+	return filepath.Join(servicesDir, name+".sandbox.yml")
+}
+
+// ExistingSandboxOverride returns SandboxOverridePath if that file exists, else
+// "". Start sites append it as a second `-f` when non-empty -- a no-op for every
+// non-sandboxed (trusted/pre-sandbox) service.
+func ExistingSandboxOverride(servicesDir, name string) string {
+	p := SandboxOverridePath(servicesDir, name)
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
 }
 
 // BindMountViolations returns the host bind-mount paths in a compose that an
