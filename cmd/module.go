@@ -164,6 +164,22 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 			manifest.Name, strings.Join(crit, ", "))
 	}
 
+	// Signature gate: if the matched trust entry is a verified publisher that
+	// requires a signature, verify the image (by digest) with cosign BEFORE
+	// install. This is a hard gate -- not bypassable by --yes -- and a no-op when
+	// no signature is required (unsigned community modules still install under the
+	// risk/consent gate above). Build the same lock images we'd record so we
+	// verify exactly the digests we pin.
+	lockImages := catalog.BuildLockImages(resolved.Images)
+	verifyResult, err := catalog.VerifyModule(src, lockImages)
+	if err != nil {
+		return err
+	}
+	if verifyResult.Verified {
+		fmt.Printf("  %s %s\n", color.GreenString("✓ signature verified"), color.New(color.Faint).Sprint(verifyResult.Image))
+		lockImages = markLockImagesVerified(lockImages)
+	}
+
 	if !moduleInstallYes {
 		fmt.Print("\nProceed with install? [y/N]: ")
 		if !confirmYes() {
@@ -196,8 +212,9 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to update manifest: %w", err)
 	}
 
-	// Record provenance into the lockfile (best-effort: never fail the install).
-	recordModuleLock(src, resolved)
+	// Record provenance into the lockfile (best-effort: never fail the install),
+	// carrying the verified-signature flag computed above.
+	recordModuleLock(src, resolved, lockImages)
 
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
@@ -214,18 +231,34 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 
 // recordModuleLock upserts a provenance entry for a freshly resolved+installed
 // module into modules.lock. Best-effort: any failure is reported to stderr but
-// does not fail the install.
-func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule) {
+// does not fail the install. If images is nil it is built from the resolved
+// source; callers that already verified signatures pass the verified-flagged
+// images so the result is recorded.
+func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, images []catalog.LockImage) {
+	if images == nil {
+		images = catalog.BuildLockImages(resolved.Images)
+	}
 	entry := catalog.LockEntry{
 		Name:   resolved.Manifest.Name,
 		Source: src.Raw,
 		Ref:    src.Ref,
 		Commit: resolved.Commit,
-		Images: catalog.BuildLockImages(resolved.Images),
+		Images: images,
 	}
 	if err := catalog.UpsertLockEntry(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
 	}
+}
+
+// markLockImagesVerified returns a copy of images with Verified set on each entry
+// (used after a successful signature verification).
+func markLockImagesVerified(images []catalog.LockImage) []catalog.LockImage {
+	out := make([]catalog.LockImage, len(images))
+	for i, im := range images {
+		im.Verified = true
+		out[i] = im
+	}
+	return out
 }
 
 // runModuleList prints the modules registered in the node manifest, merged with
@@ -281,15 +314,18 @@ func formatLockImages(images []catalog.LockImage) string {
 	}
 	var parts []string
 	for _, im := range images {
+		part := im.Ref
 		if im.Digest != "" {
 			d := im.Digest
 			if len(d) > 19 { // "sha256:" + 12 hex
 				d = d[:19]
 			}
-			parts = append(parts, fmt.Sprintf("%s@%s", im.Ref, d))
-		} else {
-			parts = append(parts, im.Ref)
+			part = fmt.Sprintf("%s@%s", im.Ref, d)
 		}
+		if im.Verified {
+			part += " " + color.GreenString("✓verified")
+		}
+		parts = append(parts, part)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -614,6 +650,21 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			}
 			servicesDir := filepath.Join(configDir, "services")
 
+			// Signature gate (shared core): refuse before install if the matched
+			// trust entry is a verified publisher requiring a signature. No-op for
+			// sources without a signature requirement (incl. catalog/Tier 0).
+			var lockImages []catalog.LockImage
+			if resolved != nil {
+				lockImages = catalog.BuildLockImages(resolved.Images)
+			}
+			verifyResult, verr := catalog.VerifyModule(src, lockImages)
+			if verr != nil {
+				return "", verr
+			}
+			if verifyResult.Verified {
+				lockImages = markLockImagesVerified(lockImages)
+			}
+
 			// interactive=false: the TUI supplies all required config as
 			// overrides, so a missing required var is an error, never a stdin read.
 			// allowPrivileged is the user's explicit opt-in from the form; the
@@ -634,7 +685,7 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			}
 			// Record provenance for external sources (best-effort).
 			if resolved != nil {
-				recordModuleLock(src, resolved)
+				recordModuleLock(src, resolved, lockImages)
 			}
 			return result.Name, nil
 		},

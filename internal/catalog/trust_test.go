@@ -50,6 +50,72 @@ func TestMatchTrust_GitURLHost(t *testing.T) {
 	}
 }
 
+func TestMatchPublisher(t *testing.T) {
+	pubs := []VerifiedPublisher{
+		{Pattern: "acme/*", RequireSignature: true, Key: "/k"},
+		{Pattern: "exact/repo", Identity: "me@x", Issuer: "https://x"},
+	}
+	if pub, ok := matchPublisher(pubs, gh("acme", "widget")); !ok || !pub.RequireSignature {
+		t.Errorf("acme/widget should match acme/* publisher, got %+v ok=%v", pub, ok)
+	}
+	if _, ok := matchPublisher(pubs, gh("other", "thing")); ok {
+		t.Error("other/thing should not match any publisher")
+	}
+	// Catalog never matches a publisher.
+	if _, ok := MatchVerifiedPublisher(Source{Kind: KindCatalog, Name: "vllm"}); ok {
+		t.Error("catalog source must never match a verified publisher")
+	}
+}
+
+func TestVerifiedPublisherPersistence(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	pub := VerifiedPublisher{Pattern: "acme/*", RequireSignature: true, Key: "/k/cosign.pub"}
+	if err := SetVerifiedPublisher(pub); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	// A publisher entry is itself a trust grant.
+	if !IsTrusted(gh("acme", "widget")) {
+		t.Error("acme/widget should be trusted via the acme/* publisher entry")
+	}
+	// And it is matchable for the gate.
+	got, ok := MatchVerifiedPublisher(gh("acme", "widget"))
+	if !ok || !got.RequireSignature || got.Key != "/k/cosign.pub" {
+		t.Errorf("expected matching publisher, got %+v ok=%v", got, ok)
+	}
+
+	// Replace (same pattern) updates in place, no duplicate pattern row.
+	if err := SetVerifiedPublisher(VerifiedPublisher{Pattern: "acme/*", Identity: "me@x", Issuer: "https://x"}); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	ts, _ := LoadTrustedSources()
+	if len(ts.Publishers) != 1 {
+		t.Errorf("expected 1 publisher after replace, got %d", len(ts.Publishers))
+	}
+	count := 0
+	for _, p := range ts.Patterns {
+		if p == "acme/*" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected pattern acme/* once in Patterns, got %d", count)
+	}
+
+	// Untrust removes both the pattern and the publisher entry.
+	if err := RemoveTrustedSource("acme/*"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	ts, _ = LoadTrustedSources()
+	if len(ts.Publishers) != 0 || len(ts.Patterns) != 0 {
+		t.Errorf("after untrust expected empty, got patterns=%v publishers=%v", ts.Patterns, ts.Publishers)
+	}
+	if IsTrusted(gh("acme", "widget")) {
+		t.Error("acme/widget should no longer be trusted after untrust")
+	}
+}
+
 func TestIsTrusted_CatalogAlways(t *testing.T) {
 	// Catalog sources are Tier-0, always trusted, no IO needed.
 	if !IsTrusted(Source{Kind: KindCatalog, Name: "vllm"}) {
