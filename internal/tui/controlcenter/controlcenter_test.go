@@ -231,33 +231,33 @@ func TestDetectSystemTailscaleURLMatching(t *testing.T) {
 	// We can't test actual tailscale execution without the binary installed
 
 	tests := []struct {
-		name             string
-		controlURL       string
-		nexusURL         string
+		name               string
+		controlURL         string
+		nexusURL           string
 		shouldMatchNetwork bool
 	}{
 		{
-			name:             "exact match",
-			controlURL:       "https://nexus.aceteam.ai",
-			nexusURL:         "https://nexus.aceteam.ai",
+			name:               "exact match",
+			controlURL:         "https://nexus.aceteam.ai",
+			nexusURL:           "https://nexus.aceteam.ai",
 			shouldMatchNetwork: true,
 		},
 		{
-			name:             "with trailing slash",
-			controlURL:       "https://nexus.aceteam.ai/",
-			nexusURL:         "https://nexus.aceteam.ai",
+			name:               "with trailing slash",
+			controlURL:         "https://nexus.aceteam.ai/",
+			nexusURL:           "https://nexus.aceteam.ai",
 			shouldMatchNetwork: true,
 		},
 		{
-			name:             "different servers",
-			controlURL:       "https://login.tailscale.com",
-			nexusURL:         "https://nexus.aceteam.ai",
+			name:               "different servers",
+			controlURL:         "https://login.tailscale.com",
+			nexusURL:           "https://nexus.aceteam.ai",
 			shouldMatchNetwork: false,
 		},
 		{
-			name:             "localhost test server",
-			controlURL:       "http://localhost:8080",
-			nexusURL:         "http://localhost:8080",
+			name:               "localhost test server",
+			controlURL:         "http://localhost:8080",
+			nexusURL:           "http://localhost:8080",
 			shouldMatchNetwork: true,
 		},
 	}

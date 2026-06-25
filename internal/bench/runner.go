@@ -33,13 +33,13 @@ type BenchmarkResult struct {
 
 // TurnResult holds metrics for a single conversation turn.
 type TurnResult struct {
-	Turn            int           `json:"turn"`
-	TokensPerSec    float64       `json:"tokens_per_sec"`
-	Latency         time.Duration `json:"latency_ns"`
-	TTFT            time.Duration `json:"ttft_ns"`
-	CompletionTokens int          `json:"completion_tokens"`
-	Content         string        `json:"content"`
-	Error           string        `json:"error,omitempty"`
+	Turn             int           `json:"turn"`
+	TokensPerSec     float64       `json:"tokens_per_sec"`
+	Latency          time.Duration `json:"latency_ns"`
+	TTFT             time.Duration `json:"ttft_ns"`
+	CompletionTokens int           `json:"completion_tokens"`
+	Content          string        `json:"content"`
+	Error            string        `json:"error,omitempty"`
 }
 
 // chatMessage represents a message in the OpenAI chat format.

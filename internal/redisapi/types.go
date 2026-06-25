@@ -66,8 +66,8 @@ type PublishRequest struct {
 
 // PublishResponse is the response from POST /api/fabric/redis/pubsub/publish
 type PublishResponse struct {
-	Success    bool  `json:"success"`
-	Receivers  int64 `json:"receivers,omitempty"`
+	Success   bool  `json:"success"`
+	Receivers int64 `json:"receivers,omitempty"`
 }
 
 // StreamAddRequest is the request body for POST /api/fabric/redis/streams/add

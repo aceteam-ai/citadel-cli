@@ -9,18 +9,18 @@ import (
 
 func TestNewClient(t *testing.T) {
 	tests := []struct {
-		name          string
-		config        ClientConfig
-		wantGroup     string
-		wantBlockMs   int
-		wantMaxRetry  int
+		name         string
+		config       ClientConfig
+		wantGroup    string
+		wantBlockMs  int
+		wantMaxRetry int
 	}{
 		{
-			name:          "with defaults",
-			config:        ClientConfig{},
-			wantGroup:     "citadel-workers",
-			wantBlockMs:   5000,
-			wantMaxRetry:  3,
+			name:         "with defaults",
+			config:       ClientConfig{},
+			wantGroup:    "citadel-workers",
+			wantBlockMs:  5000,
+			wantMaxRetry: 3,
 		},
 		{
 			name: "with custom values",

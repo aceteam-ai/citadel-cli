@@ -98,10 +98,10 @@ var (
 	workAllowReadOutsideWorkspace bool
 
 	// Gateway flags
-	workGateway        bool
-	workNoGateway      bool
-	workGatewayPort    int
-	workGatewayBind    string
+	workGateway          bool
+	workNoGateway        bool
+	workGatewayPort      int
+	workGatewayBind      string
 	workGatewayVNC       int
 	workGatewayEmbedding int
 	workGatewayNoTLS     bool

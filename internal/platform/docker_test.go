@@ -71,11 +71,11 @@ func TestWindowsDockerManagerWSLDetection(t *testing.T) {
 	t.Logf("getWSLStatus() = %s", status)
 
 	validStatuses := map[string]bool{
-		"wsl_not_installed": true,
+		"wsl_not_installed":  true,
 		"wsl_command_failed": true,
-		"wsl1_only":         true,
-		"wsl2_installed":    true,
-		"no_distributions":  true,
+		"wsl1_only":          true,
+		"wsl2_installed":     true,
+		"no_distributions":   true,
 	}
 
 	if !validStatuses[status] {

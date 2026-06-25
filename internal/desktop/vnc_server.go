@@ -296,16 +296,16 @@ func (s *VNCServer) rfbHandshake(conn net.Conn) error {
 // red-max=255, green-max=255, blue-max=255
 // red-shift=0, green-shift=8, blue-shift=16
 var serverPixelFormat = [16]byte{
-	32,   // bits-per-pixel
-	24,   // depth
-	0,    // big-endian-flag (little-endian)
-	1,    // true-colour-flag
+	32,     // bits-per-pixel
+	24,     // depth
+	0,      // big-endian-flag (little-endian)
+	1,      // true-colour-flag
 	0, 255, // red-max (big-endian u16)
 	0, 255, // green-max
 	0, 255, // blue-max
-	0,   // red-shift
-	8,   // green-shift
-	16,  // blue-shift
+	0,       // red-shift
+	8,       // green-shift
+	16,      // blue-shift
 	0, 0, 0, // padding (3 bytes)
 }
 

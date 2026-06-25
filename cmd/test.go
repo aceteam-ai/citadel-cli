@@ -22,11 +22,11 @@ by 'init --test'.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// 1. Define which job types belong to which service test
 		serviceJobMap := map[string][]string{
-			"llamacpp": {"DOWNLOAD_MODEL", "LLAMACPP_INFERENCE"},
-			"ollama":   {"OLLAMA_PULL", "OLLAMA_INFERENCE"},
-			"vllm":     {"VLLM_INFERENCE"},
+			"llamacpp":   {"DOWNLOAD_MODEL", "LLAMACPP_INFERENCE"},
+			"ollama":     {"OLLAMA_PULL", "OLLAMA_INFERENCE"},
+			"vllm":       {"VLLM_INFERENCE"},
 			"extraction": {"EXTRACTION"},
-			"none":     {},
+			"none":       {},
 		}
 
 		requiredJobTypes, ok := serviceJobMap[testService]

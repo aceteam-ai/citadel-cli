@@ -69,8 +69,8 @@ func newMockMCPServer(useSSE bool) (*httptest.Server, *string, *string) {
 				"id":      json.RawMessage(req.ID),
 				"result": map[string]interface{}{
 					"protocolVersion": "2025-03-26",
-					"capabilities":   map[string]interface{}{"tools": map[string]interface{}{}},
-					"serverInfo":     map[string]interface{}{"name": "test", "version": "1.0"},
+					"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
+					"serverInfo":      map[string]interface{}{"name": "test", "version": "1.0"},
 				},
 			}
 			respJSON, _ = json.Marshal(resp)

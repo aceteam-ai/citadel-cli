@@ -6,8 +6,8 @@
 // command:
 //
 //   - up:      generate the admin secret (if unset), start the bridge + its
-//              Postgres sidecar via docker compose, wait for health, mint a
-//              tenant, then print the api_url / api_key / pairing QR.
+//     Postgres sidecar via docker compose, wait for health, mint a
+//     tenant, then print the api_url / api_key / pairing QR.
 //   - status:  show whether the bridge is running and reachable.
 //   - qr:      re-fetch and print the pairing QR for the provisioned tenant.
 //   - connect: print the api_url + api_key + the whatsapp_connect hint again.

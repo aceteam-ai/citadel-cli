@@ -26,12 +26,12 @@ type GatewayPage struct {
 	endpointView *tview.TextView
 
 	// Data
-	ledger  *gateway.Ledger
-	mu      sync.Mutex
-	stats   gateway.Stats
-	recent  []gateway.Transaction
-	active  bool
-	stopCh  chan struct{}
+	ledger *gateway.Ledger
+	mu     sync.Mutex
+	stats  gateway.Stats
+	recent []gateway.Transaction
+	active bool
+	stopCh chan struct{}
 }
 
 // NewGatewayPage creates a gateway page backed by a ledger at the given

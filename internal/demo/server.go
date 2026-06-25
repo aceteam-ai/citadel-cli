@@ -16,25 +16,25 @@ import (
 
 // NodeInfo represents the node's status for the demo page
 type NodeInfo struct {
-	Hostname     string   `json:"hostname"`
-	Platform     string   `json:"platform"`
-	Arch         string   `json:"arch"`
-	Version      string   `json:"version"`
-	Connected    bool     `json:"connected"`
-	NetworkIP    string   `json:"network_ip,omitempty"`
-	Services     []string `json:"services,omitempty"`
-	GPUName      string   `json:"gpu_name,omitempty"`
-	GPUMemory    string   `json:"gpu_memory,omitempty"`
-	StartedAt    string   `json:"started_at"`
+	Hostname  string   `json:"hostname"`
+	Platform  string   `json:"platform"`
+	Arch      string   `json:"arch"`
+	Version   string   `json:"version"`
+	Connected bool     `json:"connected"`
+	NetworkIP string   `json:"network_ip,omitempty"`
+	Services  []string `json:"services,omitempty"`
+	GPUName   string   `json:"gpu_name,omitempty"`
+	GPUMemory string   `json:"gpu_memory,omitempty"`
+	StartedAt string   `json:"started_at"`
 }
 
 // Server is the demo HTTP server
 type Server struct {
-	port       int
-	version    string
-	getInfo    func() NodeInfo
-	server     *http.Server
-	startedAt  time.Time
+	port      int
+	version   string
+	getInfo   func() NodeInfo
+	server    *http.Server
+	startedAt time.Time
 }
 
 // NewServer creates a new demo server

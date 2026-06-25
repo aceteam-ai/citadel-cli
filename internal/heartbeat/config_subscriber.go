@@ -27,7 +27,7 @@ const (
 
 // ConfigMessage represents a config update received via Pub/Sub.
 type ConfigMessage struct {
-	Type      string       `json:"type"`      // "config_updated"
+	Type      string       `json:"type"` // "config_updated"
 	NodeID    string       `json:"nodeId"`
 	Config    ConfigUpdate `json:"config"`
 	UpdatedAt string       `json:"updatedAt"`

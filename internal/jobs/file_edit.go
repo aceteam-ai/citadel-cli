@@ -95,9 +95,9 @@ func (h *FileEditHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 	}
 
 	result := map[string]any{
-		"path":          validated,
-		"replacements":  count,
-		"context":       sb.String(),
+		"path":         validated,
+		"replacements": count,
+		"context":      sb.String(),
 	}
 	return json.Marshal(result)
 }

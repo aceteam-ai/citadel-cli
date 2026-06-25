@@ -17,10 +17,10 @@ func TestValidateTag(t *testing.T) {
 		{"gpu:a100-sxm", true},
 		{"llm:mistral-7b.v0.1", true},
 		{"", false},
-		{"GPU:RTX4090", false},       // uppercase not allowed
-		{"../etc/passwd", false},      // path traversal
-		{" gpu:rtx4090", false},       // leading space
-		{"gpu rtx4090", false},        // space in middle
+		{"GPU:RTX4090", false},   // uppercase not allowed
+		{"../etc/passwd", false}, // path traversal
+		{" gpu:rtx4090", false},  // leading space
+		{"gpu rtx4090", false},   // space in middle
 	}
 	for _, tt := range tests {
 		t.Run(tt.tag, func(t *testing.T) {
@@ -364,10 +364,10 @@ func TestResolveQueuesWithEngines(t *testing.T) {
 	// Should have gpu:rtx3090 queue, vram:24gb queue, engine:vllm queue, and base queue
 	// cpu:general is excluded (handled by base queue)
 	expected := map[string]bool{
-		"jobs:v1:tag:gpu:rtx3090":  true,
-		"jobs:v1:tag:vram:24gb":    true,
-		"jobs:v1:tag:engine:vllm":  true,
-		"jobs:v1:gpu-general":      true,
+		"jobs:v1:tag:gpu:rtx3090": true,
+		"jobs:v1:tag:vram:24gb":   true,
+		"jobs:v1:tag:engine:vllm": true,
+		"jobs:v1:gpu-general":     true,
 	}
 	if len(queues) != len(expected) {
 		t.Fatalf("expected %d queues, got %d: %v", len(expected), len(queues), queues)

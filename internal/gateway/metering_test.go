@@ -383,10 +383,10 @@ func TestMeteringMiddleware_WithACETSettlement(t *testing.T) {
 
 func TestInjectStreamUsageOption(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantKey  bool
-		wantVal  bool
+		name    string
+		input   string
+		wantKey bool
+		wantVal bool
 	}{
 		{
 			name:    "adds stream_options when absent",

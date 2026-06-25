@@ -139,23 +139,23 @@ func (s *WorkerState) RecordJobDone(ok bool) {
 
 // WorkerSnapshot is a point-in-time, JSON-serializable view of WorkerState.
 type WorkerSnapshot struct {
-	WorkerID          string    `json:"worker_id"`
-	Source            string    `json:"source"`
-	ConsumerGroup     string    `json:"consumer_group"`
-	Queues            []string  `json:"queues"`
-	PerNodeQueue      string    `json:"per_node_queue,omitempty"`
-	HeadscaleNodeID   string    `json:"headscale_node_id,omitempty"`
-	OrgID             string    `json:"org_id,omitempty"`
-	Consuming         bool      `json:"consuming"`
-	StartedAt         time.Time `json:"started_at"`
-	UptimeSeconds     int64     `json:"uptime_seconds"`
+	WorkerID          string     `json:"worker_id"`
+	Source            string     `json:"source"`
+	ConsumerGroup     string     `json:"consumer_group"`
+	Queues            []string   `json:"queues"`
+	PerNodeQueue      string     `json:"per_node_queue,omitempty"`
+	HeadscaleNodeID   string     `json:"headscale_node_id,omitempty"`
+	OrgID             string     `json:"org_id,omitempty"`
+	Consuming         bool       `json:"consuming"`
+	StartedAt         time.Time  `json:"started_at"`
+	UptimeSeconds     int64      `json:"uptime_seconds"`
 	LastPollAt        *time.Time `json:"last_poll_at,omitempty"`
 	LastJobAt         *time.Time `json:"last_job_at,omitempty"`
-	LastConsumeStatus int       `json:"last_consume_status"`
-	LastConsumeError  string    `json:"last_consume_error,omitempty"`
-	InFlight          int64     `json:"in_flight"`
-	Processed         int64     `json:"processed"`
-	Failed            int64     `json:"failed"`
+	LastConsumeStatus int        `json:"last_consume_status"`
+	LastConsumeError  string     `json:"last_consume_error,omitempty"`
+	InFlight          int64      `json:"in_flight"`
+	Processed         int64      `json:"processed"`
+	Failed            int64      `json:"failed"`
 }
 
 // Snapshot returns a consistent copy of the current state. Safe for concurrent
