@@ -102,9 +102,10 @@ var (
 	workNoGateway      bool
 	workGatewayPort    int
 	workGatewayBind    string
-	workGatewayVNC     int
-	workGatewayNoTLS   bool
-	workGatewayCertDir string
+	workGatewayVNC       int
+	workGatewayEmbedding int
+	workGatewayNoTLS     bool
+	workGatewayCertDir   string
 )
 
 var workCmd = &cobra.Command{
@@ -1163,9 +1164,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	if workGateway {
 		// Validate that gateway port does not collide with upstream ports
 		upstreamPorts := map[int]string{
-			workStatusPort:   "status-port",
-			workTerminalPort: "terminal-port",
-			workGatewayVNC:   "gateway-vnc-port",
+			workStatusPort:       "status-port",
+			workTerminalPort:     "terminal-port",
+			workGatewayVNC:       "gateway-vnc-port",
+			workGatewayEmbedding: "gateway-embedding-port",
 		}
 		if name, collision := upstreamPorts[workGatewayPort]; collision {
 			fmt.Fprintf(os.Stderr, "Error: gateway port %d collides with --%s; choose a different --gateway-port\n", workGatewayPort, name)
@@ -1213,6 +1215,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		statusAddr := fmt.Sprintf("127.0.0.1:%d", workStatusPort)
 		termAddr := fmt.Sprintf("127.0.0.1:%d", workTerminalPort)
 		vncAddr := fmt.Sprintf("127.0.0.1:%d", workGatewayVNC)
+		embeddingAddr := fmt.Sprintf("127.0.0.1:%d", workGatewayEmbedding)
 
 		// Start the in-process websockify bridge when desktop permissions allow.
 		// The gateway proxies "/vnc/..." to vncAddr (workGatewayVNC, e.g. 6080)
@@ -1266,6 +1269,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		gw.AddUpstream("/provision", &gateway.Upstream{Address: statusAddr})
 		gw.AddUpstream("/workflow", &gateway.Upstream{Address: statusAddr})
 
+		// Embedding upstream (issue #351): route the already-metered
+		// /v1/embeddings path to the local TEI service (default 127.0.0.1:8102).
+		gw.AddUpstream("/v1/embeddings", &gateway.Upstream{Address: embeddingAddr})
+
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
 			StripPrefix: true,
@@ -1311,6 +1318,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)
+		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
@@ -1870,6 +1878,7 @@ func init() {
 	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
 	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
 	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
+	workCmd.Flags().IntVar(&workGatewayEmbedding, "gateway-embedding-port", 8102, "Local TEI embedding service port (/v1/embeddings upstream)")
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")
 	workCmd.Flags().StringVar(&workGatewayCertDir, "gateway-cert-dir", "", "Custom directory for gateway TLS certificates")
 	workCmd.Flags().MarkHidden("gateway-no-tls")

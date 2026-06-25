@@ -34,6 +34,7 @@ claude mcp add aceteam -e ACETEAM_API_KEY=act_xxx -- citadel mcp
 | `fabric_list_nodes` | List GPU nodes in your organization or the public marketplace |
 | `fabric_node_status` | Get detailed node status: GPUs, VRAM, running services, temperature |
 | `fabric_dispatch_job` | Submit an inference or compute job to the fabric |
+| `fabric_embed_text` | Embed `texts: []string` on a node's TEI service → vectors + token usage. Args: `node_id`, `texts`, optional `model_id`, optional `dimensions` (Matryoshka; defaults to native). Dispatches an `embedding` job handled node-side by the TEI `/v1/embeddings` route. |
 | `fabric_list_models` | Browse available models across all nodes |
 | `fabric_node_earnings` | View earnings for a specific node |
 | `fabric_earnings_summary` | Aggregate earnings across all nodes |

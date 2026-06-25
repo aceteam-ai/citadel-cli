@@ -62,6 +62,7 @@ func init() {
 		"LLAMACPP_INFERENCE": &jobs.LlamaCppInferenceHandler{},
 		"VLLM_INFERENCE":     &jobs.VLLMInferenceHandler{},
 		"OLLAMA_INFERENCE":   &jobs.OllamaInferenceHandler{},
+		"embedding":          &jobs.EmbeddingHandler{},
 		"SANDBOX_SUSPEND":    &jobs.SandboxSuspendHandler{},
 		"SANDBOX_RESUME":     &jobs.SandboxResumeHandler{},
 		"MODEL_CACHE_PULL":   &jobs.ModelCachePullHandler{},
