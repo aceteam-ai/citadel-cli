@@ -1224,7 +1224,13 @@ func ccStartService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "up", "-d")
+			// Include the least-privilege sandbox override when present so a
+			// TUI-installed untrusted module also starts hardened here (the
+			// override would otherwise be bypassed by this start site).
+			args := []string{"compose"}
+			args = append(args, composeFileArgs(fullComposePath, fullComposePath)...)
+			args = append(args, "-p", "citadel-"+name, "up", "-d")
+			cmd := exec.Command("docker", args...)
 			return cmd.Run()
 		}
 	}

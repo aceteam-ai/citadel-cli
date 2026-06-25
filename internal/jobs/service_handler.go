@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -56,7 +57,7 @@ func NewServiceHandlerWithWorkspace(configDir, workspaceDir string) *ServiceHand
 type serviceResult struct {
 	Name    string `json:"name"`
 	Running bool   `json:"running"`
-	Kind    string `json:"kind"`              // "docker" or "native"
+	Kind    string `json:"kind"` // "docker" or "native"
 	Error   string `json:"error,omitempty"`
 	Action  string `json:"action,omitempty"`  // "start", "stop", "status"
 	Message string `json:"message,omitempty"` // human-readable summary
@@ -144,7 +145,16 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		if pathErr != nil {
 			return nil, pathErr
 		}
-		cmd := exec.Command("docker", "compose", "-f", composePath, "up", "-d")
+		// Include the least-privilege sandbox override when present (untrusted/
+		// Tier-2 modules) so a remotely-started module also runs hardened -- the
+		// override would otherwise be bypassed by this start site.
+		composeArgs := []string{"compose", "-f", composePath}
+		if override := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
+			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
+			composeArgs = append(composeArgs, "-f", override)
+		}
+		composeArgs = append(composeArgs, "up", "-d")
+		cmd := exec.Command("docker", composeArgs...)
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {

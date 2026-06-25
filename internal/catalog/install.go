@@ -36,6 +36,13 @@ type InstallResult struct {
 	ComposeDestPath string
 	// EnvDestPath is the absolute path where the .env file was written, or empty.
 	EnvDestPath string
+	// Sandboxed is true when a least-privilege hardening override was generated
+	// and written (untrusted/Tier-2 installs only). When true,
+	// SandboxOverridePath points at the override file.
+	Sandboxed bool
+	// SandboxOverridePath is the absolute path of the <name>.sandbox.yml override,
+	// or empty when not sandboxed.
+	SandboxOverridePath string
 }
 
 // Install copies a catalog service's compose.yml (and optional .env) into the
@@ -60,9 +67,10 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 
 	// Catalog services are first-party (Tier 0) and have no --allow-privileged
 	// flag, so the privilege gate must not apply to them (it would be an
-	// un-overridable failure). Pass allowPrivileged=true. The module-source path
-	// passes the real flag value.
-	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true)
+	// un-overridable failure). Pass allowPrivileged=true. They are trusted, so
+	// untrusted=false: no sandbox hardening is applied. The module-source path
+	// passes the real flag + trust values.
+	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true, false)
 }
 
 // InstallFromManifest installs a service from an already-loaded manifest and a
@@ -81,9 +89,19 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 // the TUI non-interactive path are protected identically. Catalog (Tier-0)
 // installs pass allowPrivileged=true (they have no override flag).
 //
+// untrusted marks a Tier-2 (untrusted-source) install. When true, two extra
+// containment layers run in the shared core so BOTH the CLI and the TUI
+// non-interactive path are protected identically (mirroring the privilege gate):
+//   - bind-mount confinement: a host bind-mount outside the per-module sandbox
+//     data dir is REFUSED unless allowPrivileged is set.
+//   - a least-privilege hardening override (<name>.sandbox.yml) is generated and
+//     written next to the compose; the run path includes it automatically.
+//
+// Trusted (Tier 0/1) installs pass untrusted=false and are unaffected.
+//
 // An empty composeSrcPath means the service is host-provisioned (no container)
 // and InstallFromManifest returns ErrNotInstallable.
-func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged bool) (*InstallResult, error) {
+func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged, untrusted bool) (*InstallResult, error) {
 	name := manifest.Name
 
 	// 1. Reject host-provisioned services up front (no compose.yml).
@@ -160,6 +178,21 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 					name, strings.Join(criticalDirectives(crit), ", "))
 			}
 		}
+
+		// 4d. Bind-mount confinement (untrusted/Tier-2 only). Enforce the #342
+		// risk-scan warning: an untrusted module may only bind-mount host paths
+		// within its per-module sandbox data dir (<servicesDir>/<name>-data).
+		// Anything outside is refused unless the operator opted into privileged
+		// installs. Trusted (Tier 0/1) installs skip this entirely.
+		if untrusted && !allowPrivileged {
+			if v := BindMountViolations(composeText, servicesDir, name); len(v) > 0 {
+				return nil, fmt.Errorf("refusing to install untrusted module '%s': its compose bind-mounts host "+
+					"path(s) outside the module sandbox dir (%s): %s.\n   "+
+					"Untrusted modules may only mount within their sandbox data dir. "+
+					"If you trust this source, re-run with --allow-privileged to override.",
+					name, SandboxDataDir(servicesDir, name), strings.Join(v, ", "))
+			}
+		}
 	}
 
 	// 5. Resolve config values (prompt for required ones without defaults only
@@ -182,6 +215,32 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 	result := &InstallResult{
 		Name:            name,
 		ComposeDestPath: composeDest,
+	}
+
+	// 6b. Least-privilege sandbox (untrusted/Tier-2 only). Generate a hardening
+	// override from the manifest's declared needs and write it next to the
+	// compose as <name>.sandbox.yml; the run path includes it automatically when
+	// present. Also create the per-module sandbox data dir so the one allowed
+	// bind-mount root exists. Trusted (Tier 0/1) installs skip all of this.
+	if untrusted {
+		baseData, rerr := os.ReadFile(composeDest)
+		if rerr != nil {
+			return nil, fmt.Errorf("failed to read copied compose for sandbox hardening: %w", rerr)
+		}
+		override, gerr := GenerateHardeningOverride(string(baseData), manifest)
+		if gerr != nil {
+			return nil, fmt.Errorf("failed to generate sandbox override for '%s': %w", name, gerr)
+		}
+		overridePath := SandboxOverridePath(servicesDir, name)
+		if werr := os.WriteFile(overridePath, []byte(override), 0600); werr != nil {
+			return nil, fmt.Errorf("failed to write sandbox override: %w", werr)
+		}
+		// Best-effort: create the per-module sandbox data dir (the only host path
+		// an untrusted module is allowed to bind-mount). A failure here is not
+		// fatal -- the module may not use a bind mount at all.
+		_ = os.MkdirAll(SandboxDataDir(servicesDir, name), 0755)
+		result.Sandboxed = true
+		result.SandboxOverridePath = overridePath
 	}
 
 	// 7. Write .env file if there are config values.
