@@ -266,6 +266,12 @@ func markLockImagesVerified(images []catalog.LockImage) []catalog.LockImage {
 // provenance (source@commit, image[@digest]) from the lockfile when available.
 // Services without a lockfile entry (catalog/embedded) are still shown.
 func runModuleList(cmd *cobra.Command, args []string) error {
+	// --outdated (flag registered in cmd/module_update.go) checks each
+	// lifecycle-managed module against its source instead of the local listing.
+	if moduleListOutdated {
+		return printOutdated()
+	}
+
 	manifest, _, err := findAndReadManifest()
 	if err != nil {
 		fmt.Println("No node manifest found. Install a module with 'citadel module install <source>'.")
