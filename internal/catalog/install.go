@@ -124,8 +124,18 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 	}
 
 	// 4b/4c. Read the resolved compose once for the container-name collision
-	// check and the privilege gate.
-	if data, rerr := os.ReadFile(composeSrcPath); rerr == nil {
+	// check and the privilege gate. A read failure here is fatal when a gate
+	// could apply: a security gate must not fail open. (The compose is copied
+	// from this same path moments later, so a real read failure would fail the
+	// install anyway -- we just refuse earlier and explicitly.)
+	{
+		data, rerr := os.ReadFile(composeSrcPath)
+		if rerr != nil {
+			if !allowPrivileged {
+				return nil, fmt.Errorf("cannot read compose for '%s' to run the safety scan: %w", name, rerr)
+			}
+			return nil, fmt.Errorf("failed to read compose file for '%s': %w", name, rerr)
+		}
 		composeText := string(data)
 
 		// 4b. Container-name collision. A reinstall of the same module is already

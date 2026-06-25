@@ -572,17 +572,22 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 				})
 			}
 			// Trust state + compose risk findings for the form to surface.
+			// Catalog sources are first-party (Tier 0): always trusted and exempt
+			// from the privilege gate, so we don't scan/surface risks for them
+			// (matching the CLI catalog path) -- no scary checkbox for a built-in.
 			out.Trusted = catalog.IsTrusted(src)
-			if data, rerr := os.ReadFile(composeSrc); rerr == nil {
-				for _, r := range catalog.ScanComposeRisks(string(data)) {
-					crit := r.Severity == catalog.SeverityCritical
-					out.Risks = append(out.Risks, controlcenter.ModuleRisk{
-						Critical:  crit,
-						Directive: r.Directive,
-						Detail:    r.Detail,
-					})
-					if crit {
-						out.HasCriticalRisk = true
+			if src.Kind != catalog.KindCatalog {
+				if data, rerr := os.ReadFile(composeSrc); rerr == nil {
+					for _, r := range catalog.ScanComposeRisks(string(data)) {
+						crit := r.Severity == catalog.SeverityCritical
+						out.Risks = append(out.Risks, controlcenter.ModuleRisk{
+							Critical:  crit,
+							Directive: r.Directive,
+							Detail:    r.Detail,
+						})
+						if crit {
+							out.HasCriticalRisk = true
+						}
 					}
 				}
 			}
@@ -613,7 +618,13 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			// overrides, so a missing required var is an error, never a stdin read.
 			// allowPrivileged is the user's explicit opt-in from the form; the
 			// shared core still refuses a Critical compose if it is false.
-			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allowPrivileged)
+			// Catalog sources are first-party (Tier 0) and exempt from the gate,
+			// matching the CLI catalog path (catalog.Install passes true).
+			allow := allowPrivileged
+			if src.Kind == catalog.KindCatalog {
+				allow = true
+			}
+			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow)
 			if err != nil {
 				return "", err
 			}
