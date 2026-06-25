@@ -141,6 +141,17 @@ const (
 type InstalledModule struct {
 	Name string `json:"name"`
 	// Source is the normalized source string the module was installed from.
+	//
+	// CANONICAL-FORM CONTRACT (load-bearing for idempotency): the desired
+	// ModuleAssignment.Source and this actual Source MUST be expressed in the
+	// SAME canonical form, or the engine sees drift on every pass and re-updates
+	// forever. Specifically, both sides MUST use the REQUESTED ref form, not a
+	// resolved one. A constraint/channel (e.g. "owner/repo@^1.2") is stored in
+	// the lockfile alongside its ResolvedRef (e.g. "v1.4.0"); the actual Source
+	// reported here is the REQUESTED string ("owner/repo@^1.2"), and the control
+	// plane MUST assign the same requested string — NOT the resolved tag. The
+	// resolved commit/tag is reported separately via Commit (and Ref) for drift
+	// display, and is NOT part of the source-equality diff key.
 	Source string `json:"source"`
 	// Ref is the requested ref (tag/branch/sha/constraint), if any.
 	Ref string `json:"ref,omitempty"`

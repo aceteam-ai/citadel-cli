@@ -184,10 +184,15 @@ func transitionStep(want ModuleAssignment, cur InstalledModule) (Step, bool) {
 	return Step{}, false
 }
 
-// sameSource compares a desired source string against an installed module. The
-// installed module records the normalized source; the live adapter is
-// responsible for normalizing both sides identically. We compare the raw
-// desired Source against the recorded Source.
+// sameSource compares a desired source string against an installed module.
+//
+// It is a raw string equality on the REQUESTED source form (not a resolved
+// ref). The InstalledModule.Source canonical-form contract requires the control
+// plane and the node adapter to express Source identically (requested form) —
+// otherwise a constraint/channel like "owner/repo@^1.2" reported by the node
+// would never equal a resolved "owner/repo@v1.4.0" from the plane and the
+// engine would re-update every pass. Resolved refs live in Commit/Ref, which
+// are NOT part of this diff key.
 func sameSource(wantSource string, cur InstalledModule) bool {
 	return wantSource == cur.Source
 }
