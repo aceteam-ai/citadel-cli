@@ -3,6 +3,7 @@ module github.com/aceteam-ai/citadel-cli
 go 1.26.4
 
 require (
+	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/alicebob/miniredis/v2 v2.36.1
 	github.com/charmbracelet/bubbles v0.21.0
@@ -32,7 +33,6 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
