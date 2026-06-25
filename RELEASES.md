@@ -653,3 +653,41 @@ Auto-generated log of every release.
   - feat(terminal): persistent tmux sessions by default + per-user reconnect
 
 
+---
+
+## v2.47.0 — 2026-06-24
+
+| Metric | Value |
+|--------|-------|
+| Commits | 24 |
+| Files changed | 121 |
+| Lines added | +17741 |
+
+**Changes:**
+
+  - test(#351): live-TEI integration test for embedding handler (#364)
+  - feat(reconcile): node desired-state reconcile engine (first increment of #353) (#362)
+  - fix(run): accept module-installed services in `citadel run <name>` (#358) (#361)
+  - refactor(whatsapp): deploy via module mechanism, drop embedded aceteam-ai image (#360)
+  - feat(module): least-privilege sandbox for untrusted modules (#348) (#359)
+  - feat(fabric): embedding job handler + gateway route + MCP tool (#351) (#357)
+  - fix(catalog): read catalog services under services/<name>/ (#350) (#355)
+  - feat(module): semver version resolution + lifecycle (update/outdated/gc/rollback) (#356)
+  - feat(module): cosign signature verification + curated index/search (#349)
+  - feat(module): install service modules from any standardized git repo (#342)
+  - feat(desktop): Tier A — ZRLE + dirty-rect encoding for embedded RFB server (#341)
+  - feat(deskstream): Tier B node-side H.264 desktop stream over mesh WS (#338) (#339)
+  - feat(cobrowse): add stealth (anti-bot-detection) launch mode (#337)
+  - fix(tui): render fish in-place prompt repaints in Console (fixes keystroke doubling) (#336)
+  - feat(desktop): add relative mouse-move action and verify key coverage (#334) (#335)
+  - feat(transcribe): node-local STT handler + FILE_WRITE_BYTES (#3911 Phase 1) (#273)
+  - Co-browse: managed Chromium over CDP with human handoff (#4079) (#272)
+  - feat(whatsapp): deploy the WhatsApp bridge as a Citadel community module (CLI + TUI) (#333)
+  - feat(tmux): provision Citadel-managed tmux binary when absent (#304) (#332)
+  - feat(enroll): QR-based fabric enrollment (scan to bind a node to your org) (#325) (#331)
+  - feat(notify): send live notification from a Citadel node to a fabric phone (#323) (#330)
+  - fix(tui): re-resolve chat credentials lazily so post-startup device auth works (#329)
+  - feat(status): report real node capability flags on heartbeat (#328)
+  - feat(worker): VNC_ACTIONS job handler to drive desktop click/drag over fabric (#4180) (#326)
+
+
