@@ -20,6 +20,11 @@ const (
 	DefaultCatalogURL = "https://github.com/aceteam-ai/citadel-services.git"
 	// catalogSubdir is the subdirectory within the config dir for the catalog cache.
 	catalogSubdir = "catalog"
+	// servicesSubdir is the subdirectory within the catalog repo that holds the
+	// per-service directories (e.g. services/vllm/service.yaml). The catalog repo
+	// (aceteam-ai/citadel-services) stores services here, alongside a top-level
+	// registry.yaml index.
+	servicesSubdir = "services"
 )
 
 // Registry is the top-level index of available services (registry.yaml).
@@ -179,7 +184,7 @@ func LoadRegistry() (*Registry, error) {
 // LoadServiceManifest reads a specific service's service.yaml.
 func LoadServiceManifest(name string) (*ServiceManifest, error) {
 	catalogPath := GetCatalogPath()
-	manifestPath := filepath.Join(catalogPath, name, "service.yaml")
+	manifestPath := filepath.Join(catalogPath, servicesSubdir, name, "service.yaml")
 
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -199,7 +204,7 @@ func LoadServiceManifest(name string) (*ServiceManifest, error) {
 // GetComposeFile returns the path to a service's compose.yml inside the catalog.
 func GetComposeFile(name string) (string, error) {
 	catalogPath := GetCatalogPath()
-	composePath := filepath.Join(catalogPath, name, "compose.yml")
+	composePath := filepath.Join(catalogPath, servicesSubdir, name, "compose.yml")
 
 	if _, err := os.Stat(composePath); err != nil {
 		if os.IsNotExist(err) {
@@ -311,10 +316,12 @@ func matchesQuery(entry RegistryEntry, query string) bool {
 	return false
 }
 
-// scanForServices scans the catalog directory for service.yaml files when registry.yaml
-// is absent. Each immediate subdirectory containing a service.yaml becomes an entry.
+// scanForServices scans the catalog's services directory for service.yaml files
+// when registry.yaml is absent. Each immediate subdirectory of <catalog>/services
+// containing a service.yaml becomes an entry.
 func scanForServices(catalogPath string) (*Registry, error) {
-	entries, err := os.ReadDir(catalogPath)
+	servicesPath := filepath.Join(catalogPath, servicesSubdir)
+	entries, err := os.ReadDir(servicesPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan catalog directory: %w", err)
 	}
@@ -327,7 +334,7 @@ func scanForServices(catalogPath string) (*Registry, error) {
 			continue
 		}
 
-		manifestPath := filepath.Join(catalogPath, entry.Name(), "service.yaml")
+		manifestPath := filepath.Join(servicesPath, entry.Name(), "service.yaml")
 		data, err := os.ReadFile(manifestPath)
 		if err != nil {
 			continue // skip directories without service.yaml
