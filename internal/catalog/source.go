@@ -78,6 +78,9 @@ func ParseSource(s string) (Source, error) {
 		if url == "" {
 			return Source{}, fmt.Errorf("invalid git URL %q", raw)
 		}
+		if err := validateRef(ref); err != nil {
+			return Source{}, fmt.Errorf("invalid ref in %q: %w", raw, err)
+		}
 		return Source{Kind: KindGitURL, Raw: raw, CloneURL: url, Ref: ref}, nil
 	}
 	if isSCPForm(raw) {
@@ -94,6 +97,12 @@ func ParseSource(s string) (Source, error) {
 			return Source{}, fmt.Errorf("invalid owner/repo source %q (expected owner/repo[@ref])", raw)
 		}
 		owner, repo := parts[0], strings.TrimSuffix(parts[1], ".git")
+		if strings.HasPrefix(owner, "-") || strings.HasPrefix(repo, "-") {
+			return Source{}, fmt.Errorf("invalid owner/repo source %q: components cannot begin with '-'", raw)
+		}
+		if err := validateRef(ref); err != nil {
+			return Source{}, fmt.Errorf("invalid ref in %q: %w", raw, err)
+		}
 		return Source{
 			Kind:     KindGitHub,
 			Raw:      raw,
@@ -164,6 +173,27 @@ func splitAtRef(s string) (repoPart, ref string) {
 		}
 	}
 	return s, ""
+}
+
+// validateRef guards against git argument injection: a ref is passed as a
+// positional argument to `git clone --branch`/`git fetch origin <ref>`, so a
+// value beginning with '-' would be parsed by git as an option (e.g.
+// `--upload-pack=<cmd>` → arbitrary command execution). Real git refnames never
+// begin with '-', so reject that (and embedded whitespace/control characters).
+// An empty ref (default branch) is allowed.
+func validateRef(ref string) error {
+	if ref == "" {
+		return nil
+	}
+	if strings.HasPrefix(ref, "-") {
+		return fmt.Errorf("a git ref cannot begin with '-'")
+	}
+	for _, r := range ref {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r < 0x20 {
+			return fmt.Errorf("a git ref cannot contain whitespace or control characters")
+		}
+	}
+	return nil
 }
 
 // sanitizeCacheName turns a Source into a filesystem-safe cache directory name,

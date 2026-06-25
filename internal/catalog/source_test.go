@@ -111,6 +111,21 @@ func TestParseSource(t *testing.T) {
 			input:   "weird:name",
 			wantErr: true,
 		},
+		{
+			name:    "ref with leading dash rejected (git arg injection)",
+			input:   "owner/repo@--upload-pack=touch /tmp/pwned",
+			wantErr: true,
+		},
+		{
+			name:    "url ref with leading dash rejected (git arg injection)",
+			input:   "https://github.com/owner/repo.git#--upload-pack=evil",
+			wantErr: true,
+		},
+		{
+			name:    "owner with leading dash rejected",
+			input:   "-flag/repo",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
