@@ -355,6 +355,23 @@ func TestCloneErrorHost(t *testing.T) {
 	}
 }
 
+func TestSourceHost(t *testing.T) {
+	tests := []struct {
+		url  string
+		want string
+	}{
+		{"https://github.com/owner/repo.git", "github.com"},
+		{"git@github.com:owner/repo.git", "github.com"},
+		{"ssh://git@gitlab.com/owner/repo.git", "gitlab.com"},
+		{"", ""}, // a catalog source has no clone URL and so no host
+	}
+	for _, tt := range tests {
+		if got := SourceHost(Source{CloneURL: tt.url}); got != tt.want {
+			t.Errorf("SourceHost(%q) = %q, want %q", tt.url, got, tt.want)
+		}
+	}
+}
+
 func TestSchemaWarning(t *testing.T) {
 	if w := SchemaWarning(&ServiceManifest{SchemaVersion: 0}); w != "" {
 		t.Errorf("schema_version 0 should be OK, got %q", w)
