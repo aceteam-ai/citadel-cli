@@ -28,6 +28,10 @@ type LockEntry struct {
 type LockImage struct {
 	Ref    string `yaml:"ref"`
 	Digest string `yaml:"digest,omitempty"` // sha256:... if resolvable, else ""
+	// Verified records that this image's signature was verified by cosign at
+	// install time (against a verified-publisher trust entry). Absent/false means
+	// no signature was required or none was verified.
+	Verified bool `yaml:"verified,omitempty"`
 }
 
 // Lockfile is the top-level modules.lock structure.
