@@ -24,9 +24,6 @@ var SGLangCompose string
 //go:embed compose/extraction.yml
 var ExtractionCompose string
 
-//go:embed compose/whatsapp-bridge.yml
-var WhatsAppBridgeCompose string
-
 //go:embed compose/transcribe.yml
 var TranscribeCompose string
 
@@ -38,7 +35,6 @@ var ServiceMap = map[string]string{
 	"lmstudio":        LMStudioCompose,
 	"sglang":          SGLangCompose,
 	"extraction":      ExtractionCompose,
-	"whatsapp-bridge": WhatsAppBridgeCompose,
 	"transcribe":      TranscribeCompose,
 }
 
