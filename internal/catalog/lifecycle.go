@@ -146,6 +146,12 @@ func SourceFromLock(e LockEntry) (Source, error) {
 		return Source{}, err
 	}
 	if e.Ref != "" {
+		// Re-validate the ref reconstructed from the lockfile: it is fed to git as
+		// a positional argument, and a tampered lockfile must not be able to inject
+		// git options (the same guard ParseSource applies to user input).
+		if verr := validateRef(e.Ref); verr != nil {
+			return Source{}, fmt.Errorf("invalid ref %q in lockfile entry %q: %w", e.Ref, e.Name, verr)
+		}
 		src.Ref = e.Ref
 	}
 	return src, nil

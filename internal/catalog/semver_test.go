@@ -120,6 +120,44 @@ func TestResolveVersion(t *testing.T) {
 	}
 }
 
+// TestParseSourceConstraintRefs guards the END-TO-END entry path: a constraint
+// ref must survive ParseSource (which runs validateRef). In particular the
+// space-separated range form ">=1.0 <2.0" -- the task's headline example -- must
+// parse, since it is resolved to a concrete tag before any git call.
+func TestParseSourceConstraintRefs(t *testing.T) {
+	ok := []string{
+		"owner/repo@^1.2",
+		"owner/repo@~1.2.3",
+		"owner/repo@>=1.0 <2.0", // range with a space -- must be allowed
+		"owner/repo@>=1.0,<2.0", // comma form -- also allowed
+		"owner/repo@stable",
+		"owner/repo@latest",
+		"owner/repo@v1.2.3",
+	}
+	for _, in := range ok {
+		src, err := ParseSource(in)
+		if err != nil {
+			t.Errorf("ParseSource(%q) unexpected error: %v", in, err)
+			continue
+		}
+		if src.Kind != KindGitHub {
+			t.Errorf("ParseSource(%q) kind = %v, want KindGitHub", in, src.Kind)
+		}
+	}
+
+	// Injection / control-char refs must still be rejected, even though a
+	// constraint relaxes the whitespace rule.
+	bad := []string{
+		"owner/repo@-bad",                // leading dash
+		"owner/repo@>=1.0\t<2.0\n--evil", // control char
+	}
+	for _, in := range bad {
+		if _, err := ParseSource(in); err == nil {
+			t.Errorf("ParseSource(%q) = nil error, want rejection", in)
+		}
+	}
+}
+
 func TestParseLsRemoteTags(t *testing.T) {
 	out := "6333b7\trefs/tags/1.0.0\n" +
 		"513f3d\trefs/tags/1.0.1\n" +

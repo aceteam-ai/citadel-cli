@@ -181,6 +181,12 @@ func splitAtRef(s string) (repoPart, ref string) {
 // `--upload-pack=<cmd>` → arbitrary command execution). Real git refnames never
 // begin with '-', so reject that (and embedded whitespace/control characters).
 // An empty ref (default branch) is allowed.
+//
+// Exception: a semver-RANGE constraint (e.g. ">=1.0 <2.0") legitimately contains
+// a space. Such a ref is never passed to git verbatim -- ResolveSource resolves
+// it to a concrete tag first -- so the whitespace check is relaxed for
+// constraint/channel refs. The injection guard (no leading '-', no control
+// characters) still applies, since those would be dangerous even pre-resolution.
 func validateRef(ref string) error {
 	if ref == "" {
 		return nil
@@ -188,9 +194,13 @@ func validateRef(ref string) error {
 	if strings.HasPrefix(ref, "-") {
 		return fmt.Errorf("a git ref cannot begin with '-'")
 	}
+	allowSpace := IsVersionConstraint(ref)
 	for _, r := range ref {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r < 0x20 {
-			return fmt.Errorf("a git ref cannot contain whitespace or control characters")
+		if r == '\n' || r == '\r' || r < 0x20 {
+			return fmt.Errorf("a git ref cannot contain control characters")
+		}
+		if (r == ' ' || r == '\t') && !allowSpace {
+			return fmt.Errorf("a git ref cannot contain whitespace")
 		}
 	}
 	return nil

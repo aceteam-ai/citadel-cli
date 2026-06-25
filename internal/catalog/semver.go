@@ -106,8 +106,12 @@ func ResolveVersion(ref string, tags []string) (string, error) {
 		return "", fmt.Errorf("no semver tags available to resolve %q", ref)
 	}
 
-	// Sort descending by semver precedence.
+	// Sort descending by semver precedence, with a stable raw-string tie-break so
+	// equal-precedence tags (e.g. "v1.0.0" vs "1.0.0") resolve deterministically.
 	sort.Slice(parsed, func(i, j int) bool {
+		if parsed[i].ver.Equal(parsed[j].ver) {
+			return parsed[i].raw < parsed[j].raw
+		}
 		return parsed[i].ver.GreaterThan(parsed[j].ver)
 	})
 

@@ -180,12 +180,16 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 		fmt.Fprintf(os.Stderr, "  could not update lockfile for %s: %v\n", entry.Name, err)
 	}
 
-	// Health rollback: only if the module declares a health_check, was already
-	// running, and we are allowed to restart it (so the probe is meaningful).
-	if moduleUpdateRestart && wasRunning && catalog.HasHealthProbe(resolved.Manifest.HealthCheck) {
+	// Restart the container if it was running, so the on-disk compose/env change
+	// actually takes effect (InstallFromManifest only copies files; it does not
+	// recreate the container). Only then is a health probe meaningful.
+	if moduleUpdateRestart && wasRunning {
 		if err := composeUpDetached(entry.Name, filepath.Join(servicesDir, entry.Name+".yml")); err != nil {
 			fmt.Fprintf(os.Stderr, "  restart failed for %s: %v\n", entry.Name, err)
-		} else if catalog.ProbeHealth(resolved.Manifest.HealthCheck) == catalog.ProbeUnhealthy {
+		} else if catalog.HasHealthProbe(resolved.Manifest.HealthCheck) &&
+			catalog.ProbeHealth(resolved.Manifest.HealthCheck) == catalog.ProbeUnhealthy {
+			// Health rollback: only on a definitively-unhealthy probe (best-effort;
+			// a not-probeable result never triggers a rollback).
 			fmt.Printf("  %s\n", color.RedString("health check failed after update; rolling back"))
 			rollback(entry, servicesDir)
 			return false
