@@ -1,0 +1,110 @@
+name: CI
+
+# Build + test gate for citadel-cli. Before this, the only workflow was
+# deploy-docs.yml, so PRs and pushes to main merged with zero automated
+# build/test signal and a broken build could flow straight into a release via
+# build.sh/release.sh. This runs gofmt, vet, build, the unit tests, and a
+# cross-compile smoke for every release target on every PR and push to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR so a force-push or rapid pushes
+# don't leave stale jobs occupying the limited self-hosted ARC runner pool.
+# Push-to-main and each PR have distinct refs, so this only cancels true
+# supersessions (mirrors aceteam's tests.yml / android-release.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # gofmt + vet + build + unit tests. Single job: these are cheap and share the
+  # same toolchain setup, so splitting them would only multiply Go-install /
+  # cache-warm cost on the bare ARC pod for no real parallelism win.
+  build-test:
+    name: Build + Test
+    # Self-hosted ARC runners ONLY. The org moved all CI onto Actions Runner
+    # Controller on the Proxmox lab; GitHub-hosted runners (ubuntu-latest) are
+    # not used. The pods are bare, so the Go toolchain is provisioned per-run
+    # by setup-go below.
+    runs-on: arc-runner-set
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # go-version-file reads the version from go.mod (1.26.x) so CI tracks the
+      # repo's Go version automatically. Module + build cache is on by default
+      # in setup-go@v5, which matters on the bare pod (no warm GOMODCACHE).
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Fail if any tracked Go file isn't gofmt-clean. `gofmt -l .` lists the
+      # offenders; we print them and exit non-zero so the log names exactly
+      # which files need `gofmt -w`.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-clean. Run 'gofmt -w .':"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Build the main package by explicit path. The repo ROOT carries a
+      # '//go:build tools' constraint (build-time-only deps for man-page gen),
+      # so `go build ./...` would try to compile that tools file; the explicit
+      # ./cmd/citadel path is what build.sh ships.
+      - name: go build
+        run: go build ./cmd/citadel
+
+      # Unit tests. The live-TEI test is '//go:build integration'-gated and so
+      # excluded here. internal/provision/provision_test.go injects a mock
+      # Docker backend and never contacts a real daemon, so it passes on the
+      # bare ARC pod (which has no docker) — no skip/gate needed.
+      - name: go test
+        run: go test ./...
+
+  # Cross-compile smoke for every release target. Catches a target that builds
+  # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can
+  # never fail at build.sh time after the tag is cut. -o /dev/null: we only need
+  # the compile to succeed, not the artifact.
+  cross-compile:
+    name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: arc-runner-set
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # CGO_ENABLED=0 mirrors build.sh exactly (it cross-builds every target
+      # with cgo off), so no C cross-toolchain / build-essential is needed on
+      # the pod and the smoke matches what release actually does.
+      - name: go build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -o /dev/null ./cmd/citadel
