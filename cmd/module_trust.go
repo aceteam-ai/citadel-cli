@@ -72,7 +72,13 @@ func init() {
 
 // runModuleTrust adds a pattern to the allowlist, or lists patterns with --list.
 func runModuleTrust(cmd *cobra.Command, args []string) error {
+	sigFlagsSet := moduleTrustRequireSig || moduleTrustIdentity != "" || moduleTrustIssuer != "" || moduleTrustKey != ""
 	if moduleTrustList || len(args) == 0 {
+		// Don't silently swallow signature flags when the pattern is missing --
+		// for a security feature, a silent misconfig is the worst failure mode.
+		if sigFlagsSet {
+			return fmt.Errorf("a pattern is required to configure a verified publisher: citadel module trust <owner/repo | owner/* | host> [--require-signature] [--identity ... --issuer ... | --key ...]")
+		}
 		return runModuleTrustedList(cmd, nil)
 	}
 	pattern := args[0]
@@ -80,7 +86,7 @@ func runModuleTrust(cmd *cobra.Command, args []string) error {
 	// Verified-publisher path: when any signature-related flag is set, store a
 	// publisher entry (a key/identity, optionally requiring a signature) instead
 	// of (in addition to) a plain trust pattern.
-	if moduleTrustRequireSig || moduleTrustIdentity != "" || moduleTrustIssuer != "" || moduleTrustKey != "" {
+	if sigFlagsSet {
 		if moduleTrustKey == "" && moduleTrustIdentity == "" {
 			return fmt.Errorf("a verified publisher needs a signing identity or key: pass --identity (with --issuer) or --key")
 		}

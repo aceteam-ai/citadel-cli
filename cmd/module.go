@@ -314,15 +314,18 @@ func formatLockImages(images []catalog.LockImage) string {
 	}
 	var parts []string
 	for _, im := range images {
+		part := im.Ref
 		if im.Digest != "" {
 			d := im.Digest
 			if len(d) > 19 { // "sha256:" + 12 hex
 				d = d[:19]
 			}
-			parts = append(parts, fmt.Sprintf("%s@%s", im.Ref, d))
-		} else {
-			parts = append(parts, im.Ref)
+			part = fmt.Sprintf("%s@%s", im.Ref, d)
 		}
+		if im.Verified {
+			part += " " + color.GreenString("✓verified")
+		}
+		parts = append(parts, part)
 	}
 	return strings.Join(parts, ", ")
 }
