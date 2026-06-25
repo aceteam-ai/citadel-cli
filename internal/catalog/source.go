@@ -464,9 +464,15 @@ func gitHeadCommit(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// cloneErrorHost extracts a host label from a source's clone URL for the
-// credential hint (e.g. "github.com"). Pure -- table-tested.
-func cloneErrorHost(src Source) string {
+// SourceHost extracts the bare host (e.g. "github.com") from a parsed source's
+// clone URL. It handles scheme URLs, scp-form remotes, and userinfo ("git@host")
+// uniformly. It returns "" when no host can be determined (e.g. a KindCatalog
+// source, which has no CloneURL).
+//
+// This is the canonical host-parsing routine; callers that need a host to key
+// credentials by (see internal/source) MUST use this rather than re-deriving it,
+// so the scp/userinfo edge cases stay handled in exactly one place.
+func SourceHost(src Source) string {
 	url := src.CloneURL
 	// Strip scheme.
 	for _, scheme := range []string{"https://", "http://", "ssh://", "git://"} {
@@ -484,10 +490,17 @@ func cloneErrorHost(src Source) string {
 	if i := strings.IndexAny(url, "/:"); i >= 0 {
 		url = url[:i]
 	}
-	if url == "" {
-		return "the source host"
-	}
 	return url
+}
+
+// cloneErrorHost extracts a host label from a source's clone URL for the
+// credential hint (e.g. "github.com"), falling back to a friendly phrase when
+// the host is unknown. Pure -- table-tested.
+func cloneErrorHost(src Source) string {
+	if host := SourceHost(src); host != "" {
+		return host
+	}
+	return "the source host"
 }
 
 // cloneError wraps a git failure with guidance about credentials, since a vanilla
