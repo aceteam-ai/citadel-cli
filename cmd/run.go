@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
@@ -119,19 +120,55 @@ func runAllServices() {
 	syncSSHKeysIfConfigured(configDir)
 }
 
+// serviceIsKnown reports whether a service name is runnable: it is either an
+// embedded/catalog service (in services.ServiceMap) or a module-installed
+// service already tracked in the node manifest. The manifest is the source of
+// truth for installed/module services, so checking both lets `citadel run
+// <name>` accept services added via `citadel module install`.
+func serviceIsKnown(serviceName string, manifest *CitadelManifest) bool {
+	if _, ok := services.ServiceMap[serviceName]; ok {
+		return true
+	}
+	return hasService(manifest, serviceName)
+}
+
+// knownServiceNames returns a sorted, deduplicated list of runnable service
+// names: the embedded/catalog services plus any module-installed services from
+// the manifest. Used for the "Available services" hint on an unknown name.
+func knownServiceNames(manifest *CitadelManifest) []string {
+	names := services.GetAvailableServices() // already sorted
+	seen := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		seen[n] = struct{}{}
+	}
+	extra := make([]string, 0)
+	for _, s := range manifest.Services {
+		if _, ok := seen[s.Name]; ok {
+			continue
+		}
+		seen[s.Name] = struct{}{}
+		extra = append(extra, s.Name)
+	}
+	sort.Strings(extra)
+	return append(names, extra...)
+}
+
 // runSingleService adds a service to the manifest (if needed) and starts it.
 func runSingleService(serviceName string) {
-	// Validate service name
-	if _, ok := services.ServiceMap[serviceName]; !ok {
-		fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
-		fmt.Printf("Available services: %s\n", strings.Join(services.GetAvailableServices(), ", "))
-		os.Exit(1)
-	}
-
-	// Find or create manifest
+	// Find or create manifest first: the manifest is the source of truth for
+	// module-installed services, and it must be created on a fresh node so a
+	// valid embedded service can be started on first run.
 	manifest, configDir, err := findOrCreateManifest()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to initialize configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Validate service name against both the embedded catalog and the manifest
+	// (which tracks module-installed services).
+	if !serviceIsKnown(serviceName, manifest) {
+		fmt.Fprintf(os.Stderr, "❌ Unknown service '%s'.\n", serviceName)
+		fmt.Printf("Available services: %s\n", strings.Join(knownServiceNames(manifest), ", "))
 		os.Exit(1)
 	}
 
