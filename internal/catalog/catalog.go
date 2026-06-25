@@ -63,12 +63,57 @@ type ServiceManifest struct {
 	// node manifest's Node.Tags on install so third-party engines become
 	// routable without a CLI change. Distinct from the display Tags above.
 	NodeTags []string `yaml:"node_tags"`
+	// Sandbox declares the least-privilege needs of an untrusted (Tier 2) module.
+	// It is OPTIONAL: a module with no sandbox: block gets the strict defaults
+	// (all caps dropped, no-new-privileges, read-only rootfs, conservative
+	// resource limits). The installer grants exactly what is declared here and
+	// drops everything else. Trusted (Tier 0/1) modules ignore this entirely and
+	// run as-is. See internal/catalog/sandbox.go.
+	Sandbox SandboxSpec `yaml:"sandbox"`
 }
 
 // CurrentSchemaVersion is the highest service.yaml schema major version this CLI
 // understands. A manifest declaring a higher value is still loaded (best-effort)
 // but the operator is warned it may use fields this CLI ignores.
-const CurrentSchemaVersion = 1
+//
+// v2 adds the optional `sandbox:` block (declarative least-privilege needs for
+// untrusted modules). It is purely additive -- a v1 manifest is fully valid.
+const CurrentSchemaVersion = 2
+
+// SandboxSpec is the optional declarative least-privilege block of a module
+// manifest. Every field is optional; an absent field means "strict default".
+type SandboxSpec struct {
+	// Capabilities are the Linux capabilities to KEEP (added back via cap_add
+	// after cap_drop: ALL). Names may be given with or without the "CAP_" prefix
+	// (e.g. "NET_BIND_SERVICE" or "CAP_NET_BIND_SERVICE"); they are emitted
+	// verbatim. Empty means no capabilities are kept.
+	Capabilities []string `yaml:"capabilities"`
+	// Devices are host devices the module legitimately needs (compose `devices:`
+	// entries, e.g. "/dev/snd"). Empty means none.
+	Devices []string `yaml:"devices"`
+	// WritablePaths are in-container paths that must be writable. With a read-only
+	// rootfs, each becomes a tmpfs mount so the module can write there. "/tmp" is
+	// always writable regardless.
+	WritablePaths []string `yaml:"writable_paths"`
+	// HostNetwork opts the module into host networking. Default false: host
+	// networking is NOT granted unless explicitly declared (and it independently
+	// trips the #342 risk scan).
+	HostNetwork bool `yaml:"host_network"`
+	// Resources declares cgroup limits. Unset fields fall back to conservative
+	// defaults in GenerateHardeningOverride.
+	Resources SandboxResources `yaml:"resources"`
+}
+
+// SandboxResources declares per-module cgroup limits. Zero/empty values fall
+// back to conservative defaults.
+type SandboxResources struct {
+	// CPU is the cpus limit (compose `cpus:`, e.g. "2.0"). Empty -> default.
+	CPU string `yaml:"cpu"`
+	// Memory is the memory limit (compose `mem_limit:`, e.g. "2g"). Empty -> default.
+	Memory string `yaml:"memory"`
+	// PIDs is the pids_limit. Zero -> default.
+	PIDs int `yaml:"pids"`
+}
 
 // Requirements describes what a service needs from the host.
 type Requirements struct {

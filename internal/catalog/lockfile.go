@@ -23,6 +23,10 @@ type LockEntry struct {
 	ResolvedRef string      `yaml:"resolved_ref,omitempty"` // concrete tag a constraint/channel resolved to (e.g. "^1.2" -> "v1.4.0")
 	Commit      string      `yaml:"commit,omitempty"`       // resolved git HEAD commit
 	Images      []LockImage `yaml:"images,omitempty"`
+	// Sandboxed records that a least-privilege hardening override was generated
+	// for this (untrusted/Tier-2) module at install time. Absent/false means the
+	// module runs without an override (trusted/curated, or pre-sandbox installs).
+	Sandboxed bool `yaml:"sandboxed,omitempty"`
 }
 
 // LockImage is a single image reference plus an optional resolved digest.

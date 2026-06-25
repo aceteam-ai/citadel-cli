@@ -200,8 +200,16 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 
 	servicesDir := filepath.Join(configDir, "services")
 
+	// Untrusted (Tier-2) sources get the least-privilege sandbox: bind-mount
+	// confinement + a generated hardening override. Trusted (Tier 0/1) run as-is.
+	untrusted := !trusted
+	if untrusted {
+		fmt.Printf("\n%s\n", color.YellowString("Applying least-privilege sandbox (drop caps, no-new-privileges, "+
+			"read-only rootfs, resource limits)."))
+	}
+
 	fmt.Printf("\nInstalling %s ...\n", manifest.Name)
-	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged)
+	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged, untrusted)
 	if err != nil {
 		return fmt.Errorf("install failed: %w", err)
 	}
@@ -213,13 +221,17 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	// Record provenance into the lockfile (best-effort: never fail the install),
-	// carrying the verified-signature flag computed above.
-	recordModuleLock(src, resolved, lockImages)
+	// carrying the verified-signature flag computed above and whether a sandbox
+	// override was written.
+	recordModuleLock(src, resolved, lockImages, result.Sandboxed)
 
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
 	if result.EnvDestPath != "" {
 		fmt.Printf("  Config:  %s\n", result.EnvDestPath)
+	}
+	if result.Sandboxed {
+		fmt.Printf("  Sandbox: %s\n", result.SandboxOverridePath)
 	}
 	if len(manifest.NodeTags) > 0 {
 		fmt.Printf("  Routing tags: %s\n", strings.Join(manifest.NodeTags, ", "))
@@ -234,7 +246,7 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 // does not fail the install. If images is nil it is built from the resolved
 // source; callers that already verified signatures pass the verified-flagged
 // images so the result is recorded.
-func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, images []catalog.LockImage) {
+func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, images []catalog.LockImage, sandboxed bool) {
 	if images == nil {
 		images = catalog.BuildLockImages(resolved.Images)
 	}
@@ -245,6 +257,7 @@ func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, imag
 		ResolvedRef: resolved.ResolvedRef,
 		Commit:      resolved.Commit,
 		Images:      images,
+		Sandboxed:   sandboxed,
 	}
 	if err := catalog.UpsertLockEntry(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
@@ -287,10 +300,11 @@ func runModuleList(cmd *cobra.Command, args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer w.Flush()
 	bold := color.New(color.Bold)
-	bold.Fprintf(w, "MODULE\tSOURCE\tIMAGE\n")
+	bold.Fprintf(w, "MODULE\tSOURCE\tIMAGE\tSANDBOX\n")
 	for _, s := range manifest.Services {
 		source := color.New(color.FgWhite).Sprint("catalog/embedded")
 		image := "-"
+		sandbox := "-"
 		if lf != nil {
 			if e, ok := lf.LookupLock(s.Name); ok {
 				source = e.Source
@@ -298,9 +312,12 @@ func runModuleList(cmd *cobra.Command, args []string) error {
 					source = fmt.Sprintf("%s@%s", e.Source, shortCommit(e.Commit))
 				}
 				image = formatLockImages(e.Images)
+				if e.Sandboxed {
+					sandbox = color.GreenString("sandboxed")
+				}
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\n", s.Name, source, image)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Name, source, image, sandbox)
 	}
 	return nil
 }
@@ -682,7 +699,10 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			if src.Kind == catalog.KindCatalog {
 				allow = true
 			}
-			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow)
+			// Untrusted (Tier-2) sources get the least-privilege sandbox in the
+			// shared core, matching the CLI path. Catalog/trusted run as-is.
+			untrusted := !catalog.IsTrusted(src)
+			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow, untrusted)
 			if err != nil {
 				return "", err
 			}
@@ -692,7 +712,7 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			}
 			// Record provenance for external sources (best-effort).
 			if resolved != nil {
-				recordModuleLock(src, resolved, lockImages)
+				recordModuleLock(src, resolved, lockImages, result.Sandboxed)
 			}
 			return result.Name, nil
 		},

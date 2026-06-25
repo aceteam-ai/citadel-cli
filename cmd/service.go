@@ -127,12 +127,50 @@ func startService(serviceName, composeFilePath string) error {
 		}
 	}
 
-	composeCmd := exec.Command("docker", "compose", "-f", actualComposePath, "up", "-d")
+	// Include the per-module least-privilege sandbox override when a sibling
+	// <name>.sandbox.yml exists (written at install time for untrusted/Tier-2
+	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
+	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
+	// the latter may be a GPU-stripped temp file in a different directory.
+	args := []string{"compose"}
+	args = append(args, composeFileArgs(composeFilePath, actualComposePath)...)
+	args = append(args, "up", "-d")
+	composeCmd := exec.Command("docker", args...)
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker compose failed: %s", string(output))
 	}
 	return nil
+}
+
+// composeFileArgs returns the ordered "-f <file>" arguments for a docker compose
+// invocation: the base compose, followed by the per-module least-privilege
+// sandbox override (<name>.sandbox.yml) when that sibling file exists. The
+// sandbox sibling is resolved from origComposePath (the installed compose, whose
+// directory holds the override), while the base file passed to docker is
+// actualComposePath (which may be a platform-stripped temp copy). When no
+// override exists, only the base file is returned -- additive and a no-op for
+// every pre-sandbox service.
+func composeFileArgs(origComposePath, actualComposePath string) []string {
+	args := []string{"-f", actualComposePath}
+	if override := sandboxOverridePathFor(origComposePath); override != "" {
+		args = append(args, "-f", override)
+	}
+	return args
+}
+
+// sandboxOverridePathFor returns the path of the sandbox override that sits next
+// to a service's compose file (<dir>/<name>.sandbox.yml), or "" if it does not
+// exist. The compose file is "<name>.yml"; the override shares the same <name>.
+func sandboxOverridePathFor(composePath string) string {
+	dir := filepath.Dir(composePath)
+	base := filepath.Base(composePath)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	override := filepath.Join(dir, name+".sandbox.yml")
+	if _, err := os.Stat(override); err == nil {
+		return override
+	}
+	return ""
 }
 
 // determineServiceType decides whether to use native or docker for a service.

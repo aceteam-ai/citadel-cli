@@ -163,7 +163,11 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 	// still refuses a newly-introduced Critical compose unless allowed. We pass
 	// false so a module that *becomes* privileged on update is refused, which is
 	// the safe default; the operator can re-run `module install` with the flag.
-	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false); err != nil {
+	// Preserve the recorded sandbox posture across an update: if the module was
+	// installed as untrusted/sandboxed, regenerate its hardening override from the
+	// (possibly changed) new compose so the override never goes stale.
+	res, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false, entry.Sandboxed)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "  re-install failed for %s: %v\n", entry.Name, err)
 		return false
 	}
@@ -175,6 +179,7 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 		ResolvedRef: resolved.ResolvedRef,
 		Commit:      resolved.Commit,
 		Images:      catalog.BuildLockImages(resolved.Images),
+		Sandboxed:   res.Sandboxed,
 	}
 	if err := catalog.UpsertLockEntry(newEntry); err != nil {
 		fmt.Fprintf(os.Stderr, "  could not update lockfile for %s: %v\n", entry.Name, err)
@@ -214,7 +219,7 @@ func rollback(prev catalog.LockEntry, servicesDir string) {
 		fmt.Fprintf(os.Stderr, "  rollback failed to re-resolve previous version: %v\n", err)
 		return
 	}
-	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true); err != nil {
+	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true, prev.Sandboxed); err != nil {
 		fmt.Fprintf(os.Stderr, "  rollback re-install failed: %v\n", err)
 		return
 	}
@@ -270,7 +275,12 @@ func composeUpDetached(name, composePath string) error {
 	if _, err := os.Stat(composePath); err != nil {
 		return fmt.Errorf("compose file not found: %s", composePath)
 	}
-	c := exec.Command("docker", "compose", "-f", composePath, "-p", "citadel-"+name, "up", "-d")
+	// Include the least-privilege sandbox override when present (untrusted/Tier-2
+	// modules) so an updated/rolled-back sandboxed module restarts hardened.
+	args := []string{"compose"}
+	args = append(args, composeFileArgs(composePath, composePath)...)
+	args = append(args, "-p", "citadel-"+name, "up", "-d")
+	c := exec.Command("docker", args...)
 	if out, err := c.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
 	}
