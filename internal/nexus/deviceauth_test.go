@@ -339,43 +339,43 @@ func TestCheckAPIReachable_InvalidDNS(t *testing.T) {
 
 func TestClassifyNetworkError_Table(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
+		name         string
+		err          error
 		wantSentinel error
 	}{
 		{
-			name:       "nil error",
-			err:        nil,
+			name:         "nil error",
+			err:          nil,
 			wantSentinel: nil,
 		},
 		{
-			name:       "DNS error",
-			err:        &net.DNSError{Err: "no such host", Name: "example.com"},
+			name:         "DNS error",
+			err:          &net.DNSError{Err: "no such host", Name: "example.com"},
 			wantSentinel: ErrAPIUnreachable,
 		},
 		{
-			name:       "connection refused",
-			err:        fmt.Errorf("dial tcp 127.0.0.1:8000: connection refused"),
+			name:         "connection refused",
+			err:          fmt.Errorf("dial tcp 127.0.0.1:8000: connection refused"),
 			wantSentinel: ErrAPIUnreachable,
 		},
 		{
-			name:       "context deadline exceeded",
-			err:        context.DeadlineExceeded,
+			name:         "context deadline exceeded",
+			err:          context.DeadlineExceeded,
 			wantSentinel: ErrAPIUnreachable,
 		},
 		{
-			name:       "timeout in message",
-			err:        fmt.Errorf("dial tcp 10.0.0.1:443: i/o timeout"),
+			name:         "timeout in message",
+			err:          fmt.Errorf("dial tcp 10.0.0.1:443: i/o timeout"),
 			wantSentinel: ErrAPIUnreachable,
 		},
 		{
-			name:       "TLS error",
-			err:        fmt.Errorf("x509: certificate signed by unknown authority"),
+			name:         "TLS error",
+			err:          fmt.Errorf("x509: certificate signed by unknown authority"),
 			wantSentinel: ErrAPIUnreachable,
 		},
 		{
-			name:       "generic error",
-			err:        fmt.Errorf("something went wrong"),
+			name:         "generic error",
+			err:          fmt.Errorf("something went wrong"),
 			wantSentinel: ErrAPIUnreachable, // catch-all still wraps ErrAPIUnreachable
 		},
 	}

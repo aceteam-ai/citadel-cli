@@ -6,12 +6,12 @@ import (
 
 func TestNewRedisSource(t *testing.T) {
 	tests := []struct {
-		name          string
-		config        RedisSourceConfig
-		wantQueue     string
-		wantGroup     string
-		wantBlockMs   int
-		wantMaxRetry  int
+		name         string
+		config       RedisSourceConfig
+		wantQueue    string
+		wantGroup    string
+		wantBlockMs  int
+		wantMaxRetry int
 	}{
 		{
 			name: "with defaults",

@@ -27,10 +27,10 @@ func NewFileListHandler(workspace string) *FileListHandler {
 
 // fileEntry represents one item in a directory listing.
 type fileEntry struct {
-	Name  string `json:"name"`
-	Type  string `json:"type"` // "file", "dir", "symlink"
-	Size  int64  `json:"size"`
-	Mode  string `json:"mode"`
+	Name string `json:"name"`
+	Type string `json:"type"` // "file", "dir", "symlink"
+	Size int64  `json:"size"`
+	Mode string `json:"mode"`
 }
 
 // maxListResults caps directory listings to prevent huge responses.

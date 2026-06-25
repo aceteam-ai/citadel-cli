@@ -419,4 +419,3 @@ func (w *WindowsGPUDetector) hasGPUViaWMI() bool {
 	}
 	return strings.Contains(strings.ToLower(string(output)), "nvidia")
 }
-

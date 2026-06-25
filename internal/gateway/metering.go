@@ -15,10 +15,10 @@ import (
 // MeteringMiddleware intercepts OpenAI-compatible API responses to extract
 // token usage and record billing transactions.
 type MeteringMiddleware struct {
-	next    http.Handler
-	ledger  *Ledger
-	acet    *ACETClient // may be nil if settlement is disabled
-	tier    PricingTier
+	next   http.Handler
+	ledger *Ledger
+	acet   *ACETClient // may be nil if settlement is disabled
+	tier   PricingTier
 
 	// Accumulated stats (in-process, for the gateway's own use)
 	mu           sync.Mutex
@@ -304,8 +304,8 @@ func extractConsumerKey(r *http.Request) string {
 // while still writing to the underlying ResponseWriter.
 type responseRecorder struct {
 	http.ResponseWriter
-	body       *bytes.Buffer
-	statusCode int
+	body        *bytes.Buffer
+	statusCode  int
 	wroteHeader bool
 }
 

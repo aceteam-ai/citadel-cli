@@ -25,11 +25,11 @@ type Transaction struct {
 
 // Stats summarises gateway activity.
 type Stats struct {
-	TotalEarnings  int     `json:"total_earnings"`  // lifetime ACET earned (operator share)
-	TodayEarnings  int     `json:"today_earnings"`  // ACET earned today
-	TotalRequests  int     `json:"total_requests"`  // lifetime request count
-	TodayRequests  int     `json:"today_requests"`  // requests today
-	AvgLatency     float64 `json:"avg_latency_ms"`  // average latency in ms
+	TotalEarnings int     `json:"total_earnings"` // lifetime ACET earned (operator share)
+	TodayEarnings int     `json:"today_earnings"` // ACET earned today
+	TotalRequests int     `json:"total_requests"` // lifetime request count
+	TodayRequests int     `json:"today_requests"` // requests today
+	AvgLatency    float64 `json:"avg_latency_ms"` // average latency in ms
 }
 
 // Ledger records gateway transactions to an append-only JSONL file.

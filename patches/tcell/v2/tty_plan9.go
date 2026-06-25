@@ -40,11 +40,11 @@ import (
 // - vt(1): VT100 emulator typically used for TUI programs on Plan 9
 //
 // Limitations:
-// - We assume VT100-level capabilities (often no colors, no mouse).
-// - Window size is conservative: we return 80x24 unless overridden.
-//   Set LINES/COLUMNS (or TCELL_LINES/TCELL_COLS) to refine.
-// - Mouse and bracketed paste are not wired; terminfo/xterm queries
-//   are not attempted because vt(1) may not support them.
+//   - We assume VT100-level capabilities (often no colors, no mouse).
+//   - Window size is conservative: we return 80x24 unless overridden.
+//     Set LINES/COLUMNS (or TCELL_LINES/TCELL_COLS) to refine.
+//   - Mouse and bracketed paste are not wired; terminfo/xterm queries
+//     are not attempted because vt(1) may not support them.
 type p9Tty struct {
 	cons    *os.File // /dev/cons (read+write)
 	consctl *os.File // /dev/consctl (write "rawon"/"rawoff")

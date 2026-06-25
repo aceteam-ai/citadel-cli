@@ -111,7 +111,7 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 		ControlURL: s.controlURL,
 		Dir:        s.stateDir,
 		AuthKey:    authKey,
-		Ephemeral:  false, // We want persistent nodes
+		Ephemeral:  false,                               // We want persistent nodes
 		Logf:       func(format string, args ...any) {}, // Suppress verbose tsnet logs
 	}
 

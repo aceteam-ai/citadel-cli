@@ -193,8 +193,8 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 				blocked = !perms.SSH
 			case "provision":
 				blocked = !perms.Provision
-			// "files" is not currently routed through the gateway but is
-			// included in the permission model for future use.
+				// "files" is not currently routed through the gateway but is
+				// included in the permission model for future use.
 			}
 			if blocked {
 				w.Header().Set("Content-Type", "application/json")

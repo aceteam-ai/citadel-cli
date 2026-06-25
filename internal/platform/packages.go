@@ -227,4 +227,3 @@ func (w *WingetPackageManager) IsInstalled(pkg string) bool {
 	// Check if the package ID appears in the output (case-insensitive)
 	return strings.Contains(strings.ToLower(string(output)), strings.ToLower(pkg))
 }
-

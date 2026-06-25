@@ -365,7 +365,7 @@ outer:
 				switch Key(b[0]) {
 				case KeyESC, KeyEnter, KeyTAB:
 					s.postEvent(NewEventKey(Key(b[0]), 0, 0))
-					continue;
+					continue
 				default:
 					s.postEvent(NewEventKey(Key(b[0]), rune(b[0])+'\x60', ModCtrl))
 					continue

@@ -12,15 +12,15 @@ import (
 
 // MockJobSource is a test implementation of JobSource.
 type MockJobSource struct {
-	name           string
-	jobs           []*Job
-	jobIndex       int
-	acked          []*Job
-	nacked         []*Job
-	connected      bool
-	closed         bool
-	mu             sync.Mutex
-	cancelledJobs  map[string]bool
+	name          string
+	jobs          []*Job
+	jobIndex      int
+	acked         []*Job
+	nacked        []*Job
+	connected     bool
+	closed        bool
+	mu            sync.Mutex
+	cancelledJobs map[string]bool
 }
 
 func NewMockJobSource(name string, jobs []*Job) *MockJobSource {

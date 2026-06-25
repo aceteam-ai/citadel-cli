@@ -332,9 +332,9 @@ func (w *WindowsDockerManager) hasWSL2() bool {
 		outputStr := decodeWindowsOutput(output)
 		// Check for WSL 2 indicators
 		if strings.Contains(outputStr, "WSL 2") ||
-		   strings.Contains(outputStr, "Default Version: 2") ||
-		   strings.Contains(outputStr, "default version: 2") ||
-		   strings.Contains(outputStr, "version: 2") {
+			strings.Contains(outputStr, "Default Version: 2") ||
+			strings.Contains(outputStr, "default version: 2") ||
+			strings.Contains(outputStr, "version: 2") {
 			return true
 		}
 	}
@@ -458,4 +458,3 @@ func (w *WindowsDockerManager) getWSLStatus() string {
 	}
 	return "no_distributions"
 }
-

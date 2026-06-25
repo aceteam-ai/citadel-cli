@@ -12,10 +12,10 @@ import (
 
 // PricingTier defines ACET cost per 1K tokens for a model size range.
 type PricingTier struct {
-	Name        string // "small", "medium", "large", "xlarge"
-	MinParams   int    // billions, inclusive
-	MaxParams   int    // billions, exclusive (0 = unbounded)
-	ACETPer1K   int    // ACET tokens per 1,000 tokens
+	Name      string // "small", "medium", "large", "xlarge"
+	MinParams int    // billions, inclusive
+	MaxParams int    // billions, exclusive (0 = unbounded)
+	ACETPer1K int    // ACET tokens per 1,000 tokens
 }
 
 // DefaultPricingTiers returns the standard ACET pricing tiers.

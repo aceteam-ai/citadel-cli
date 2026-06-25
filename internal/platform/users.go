@@ -330,4 +330,3 @@ func generateRandomPassword(length int) (string, error) {
 
 	return string(password), nil
 }
-

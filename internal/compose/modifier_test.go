@@ -7,10 +7,10 @@ import (
 
 func TestStripGPUDevices(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantGPU  bool // whether output should contain GPU specifications
-		wantErr  bool
+		name    string
+		input   string
+		wantGPU bool // whether output should contain GPU specifications
+		wantErr bool
 	}{
 		{
 			name: "strips nvidia gpu devices",
@@ -59,8 +59,8 @@ func TestStripGPUDevices(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "handles invalid yaml",
-			input: `not: valid: yaml: here`,
+			name:    "handles invalid yaml",
+			input:   `not: valid: yaml: here`,
 			wantGPU: false,
 			wantErr: true,
 		},

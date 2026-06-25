@@ -51,11 +51,11 @@ func TestOperatorPlatformSplit(t *testing.T) {
 		wantOperator int
 		wantPlatform int
 	}{
-		{1, 1, 0},   // ceil(0.8) = 1
-		{2, 2, 0},   // ceil(1.6) = 2
-		{3, 3, 0},   // ceil(2.4) = 3
-		{5, 4, 1},   // ceil(4.0) = 4
-		{10, 8, 2},  // ceil(8.0) = 8
+		{1, 1, 0},  // ceil(0.8) = 1
+		{2, 2, 0},  // ceil(1.6) = 2
+		{3, 3, 0},  // ceil(2.4) = 3
+		{5, 4, 1},  // ceil(4.0) = 4
+		{10, 8, 2}, // ceil(8.0) = 8
 		{100, 80, 20},
 	}
 
@@ -203,8 +203,8 @@ func TestDefaultPricingTiers(t *testing.T) {
 
 	// Verify tiers are ordered by model size
 	expected := []struct {
-		name    string
-		per1K   int
+		name  string
+		per1K int
 	}{
 		{"small", 1},
 		{"medium", 5},

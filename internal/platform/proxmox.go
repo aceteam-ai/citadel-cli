@@ -15,11 +15,11 @@ const proxmoxDetectionTimeout = 5 * time.Second
 // ProxmoxInfo holds the result of Proxmox hypervisor detection.
 type ProxmoxInfo struct {
 	IsInstalled bool   `json:"is_installed"`
-	Version     string `json:"version,omitempty"`     // e.g. "pve-manager/8.2.4/..."
-	NodeName    string `json:"node_name,omitempty"`    // this PVE node's name
-	NodeCount   int    `json:"node_count,omitempty"`   // total nodes in cluster
-	VMCount     int    `json:"vm_count,omitempty"`     // QEMU VMs on this node
-	CTCount     int    `json:"ct_count,omitempty"`     // LXC containers on this node
+	Version     string `json:"version,omitempty"`    // e.g. "pve-manager/8.2.4/..."
+	NodeName    string `json:"node_name,omitempty"`  // this PVE node's name
+	NodeCount   int    `json:"node_count,omitempty"` // total nodes in cluster
+	VMCount     int    `json:"vm_count,omitempty"`   // QEMU VMs on this node
+	CTCount     int    `json:"ct_count,omitempty"`   // LXC containers on this node
 }
 
 // DetectProxmox checks whether the host is a Proxmox VE node.

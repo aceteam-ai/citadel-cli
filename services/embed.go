@@ -29,13 +29,13 @@ var TranscribeCompose string
 
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
-	"ollama":          OllamaCompose,
-	"vllm":            VLLMCompose,
-	"llamacpp":        LlamacppCompose,
-	"lmstudio":        LMStudioCompose,
-	"sglang":          SGLangCompose,
-	"extraction":      ExtractionCompose,
-	"transcribe":      TranscribeCompose,
+	"ollama":     OllamaCompose,
+	"vllm":       VLLMCompose,
+	"llamacpp":   LlamacppCompose,
+	"lmstudio":   LMStudioCompose,
+	"sglang":     SGLangCompose,
+	"extraction": ExtractionCompose,
+	"transcribe": TranscribeCompose,
 }
 
 // GetAvailableServices returns a sorted list of service names.

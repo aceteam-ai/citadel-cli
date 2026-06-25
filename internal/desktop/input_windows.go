@@ -7,9 +7,9 @@ import "unsafe"
 // Windows input injection via SendInput for VNC key/pointer events.
 
 var (
-	procSendInput      = user32.NewProc("SendInput")
-	procSetCursorPos   = user32.NewProc("SetCursorPos")
-	procMouseEvent     = user32.NewProc("mouse_event")
+	procSendInput    = user32.NewProc("SendInput")
+	procSetCursorPos = user32.NewProc("SetCursorPos")
+	procMouseEvent   = user32.NewProc("mouse_event")
 )
 
 const (
@@ -19,15 +19,15 @@ const (
 	keyEventFKeyUp   = 0x0002
 	keyEventFUnicode = 0x0004
 
-	mouseEventFAbsolute  = 0x8000
-	mouseEventFMove      = 0x0001
-	mouseEventFLeftDown  = 0x0002
-	mouseEventFLeftUp    = 0x0004
-	mouseEventFRightDown = 0x0008
-	mouseEventFRightUp   = 0x0010
+	mouseEventFAbsolute   = 0x8000
+	mouseEventFMove       = 0x0001
+	mouseEventFLeftDown   = 0x0002
+	mouseEventFLeftUp     = 0x0004
+	mouseEventFRightDown  = 0x0008
+	mouseEventFRightUp    = 0x0010
 	mouseEventFMiddleDown = 0x0020
 	mouseEventFMiddleUp   = 0x0040
-	mouseEventFWheel     = 0x0800
+	mouseEventFWheel      = 0x0800
 
 	wheelDelta = 120
 )
@@ -142,50 +142,90 @@ func keysymToVK(keysym uint32) (uint16, bool) {
 
 	switch keysym {
 	// Function keys
-	case 0xff08: return 0x08, true  // BackSpace -> VK_BACK
-	case 0xff09: return 0x09, true  // Tab -> VK_TAB
-	case 0xff0d: return 0x0D, true  // Return -> VK_RETURN
-	case 0xff1b: return 0x1B, true  // Escape -> VK_ESCAPE
-	case 0xff63: return 0x2D, true  // Insert -> VK_INSERT
-	case 0xffff: return 0x2E, true  // Delete -> VK_DELETE (Ctrl+Alt+Del when combined)
-	case 0xff61: return 0x2C, true  // Print -> VK_SNAPSHOT (PrintScreen)
-	case 0xff14: return 0x91, true  // Scroll_Lock -> VK_SCROLL
-	case 0xff13: return 0x13, true  // Pause -> VK_PAUSE
-	case 0xff67: return 0x5D, true  // Menu -> VK_APPS (context menu)
-	case 0xff7f: return 0x90, true  // Num_Lock -> VK_NUMLOCK
-	case 0xff50: return 0x24, true  // Home -> VK_HOME
-	case 0xff57: return 0x23, true  // End -> VK_END
-	case 0xff55: return 0x21, true  // Page_Up -> VK_PRIOR
-	case 0xff56: return 0x22, true  // Page_Down -> VK_NEXT
-	case 0xff51: return 0x25, true  // Left -> VK_LEFT
-	case 0xff52: return 0x26, true  // Up -> VK_UP
-	case 0xff53: return 0x27, true  // Right -> VK_RIGHT
-	case 0xff54: return 0x28, true  // Down -> VK_DOWN
+	case 0xff08:
+		return 0x08, true // BackSpace -> VK_BACK
+	case 0xff09:
+		return 0x09, true // Tab -> VK_TAB
+	case 0xff0d:
+		return 0x0D, true // Return -> VK_RETURN
+	case 0xff1b:
+		return 0x1B, true // Escape -> VK_ESCAPE
+	case 0xff63:
+		return 0x2D, true // Insert -> VK_INSERT
+	case 0xffff:
+		return 0x2E, true // Delete -> VK_DELETE (Ctrl+Alt+Del when combined)
+	case 0xff61:
+		return 0x2C, true // Print -> VK_SNAPSHOT (PrintScreen)
+	case 0xff14:
+		return 0x91, true // Scroll_Lock -> VK_SCROLL
+	case 0xff13:
+		return 0x13, true // Pause -> VK_PAUSE
+	case 0xff67:
+		return 0x5D, true // Menu -> VK_APPS (context menu)
+	case 0xff7f:
+		return 0x90, true // Num_Lock -> VK_NUMLOCK
+	case 0xff50:
+		return 0x24, true // Home -> VK_HOME
+	case 0xff57:
+		return 0x23, true // End -> VK_END
+	case 0xff55:
+		return 0x21, true // Page_Up -> VK_PRIOR
+	case 0xff56:
+		return 0x22, true // Page_Down -> VK_NEXT
+	case 0xff51:
+		return 0x25, true // Left -> VK_LEFT
+	case 0xff52:
+		return 0x26, true // Up -> VK_UP
+	case 0xff53:
+		return 0x27, true // Right -> VK_RIGHT
+	case 0xff54:
+		return 0x28, true // Down -> VK_DOWN
 
 	// Modifiers
-	case 0xffe1: return 0xA0, true  // Shift_L -> VK_LSHIFT
-	case 0xffe2: return 0xA1, true  // Shift_R -> VK_RSHIFT
-	case 0xffe3: return 0xA2, true  // Control_L -> VK_LCONTROL
-	case 0xffe4: return 0xA3, true  // Control_R -> VK_RCONTROL
-	case 0xffe9: return 0xA4, true  // Alt_L -> VK_LMENU
-	case 0xffea: return 0xA5, true  // Alt_R -> VK_RMENU
-	case 0xffeb: return 0x5B, true  // Super_L -> VK_LWIN
-	case 0xffec: return 0x5C, true  // Super_R -> VK_RWIN
-	case 0xffe5: return 0x14, true  // Caps_Lock -> VK_CAPITAL
+	case 0xffe1:
+		return 0xA0, true // Shift_L -> VK_LSHIFT
+	case 0xffe2:
+		return 0xA1, true // Shift_R -> VK_RSHIFT
+	case 0xffe3:
+		return 0xA2, true // Control_L -> VK_LCONTROL
+	case 0xffe4:
+		return 0xA3, true // Control_R -> VK_RCONTROL
+	case 0xffe9:
+		return 0xA4, true // Alt_L -> VK_LMENU
+	case 0xffea:
+		return 0xA5, true // Alt_R -> VK_RMENU
+	case 0xffeb:
+		return 0x5B, true // Super_L -> VK_LWIN
+	case 0xffec:
+		return 0x5C, true // Super_R -> VK_RWIN
+	case 0xffe5:
+		return 0x14, true // Caps_Lock -> VK_CAPITAL
 
 	// F-keys
-	case 0xffbe: return 0x70, true  // F1 -> VK_F1
-	case 0xffbf: return 0x71, true  // F2
-	case 0xffc0: return 0x72, true  // F3
-	case 0xffc1: return 0x73, true  // F4
-	case 0xffc2: return 0x74, true  // F5
-	case 0xffc3: return 0x75, true  // F6
-	case 0xffc4: return 0x76, true  // F7
-	case 0xffc5: return 0x77, true  // F8
-	case 0xffc6: return 0x78, true  // F9
-	case 0xffc7: return 0x79, true  // F10
-	case 0xffc8: return 0x7A, true  // F11
-	case 0xffc9: return 0x7B, true  // F12
+	case 0xffbe:
+		return 0x70, true // F1 -> VK_F1
+	case 0xffbf:
+		return 0x71, true // F2
+	case 0xffc0:
+		return 0x72, true // F3
+	case 0xffc1:
+		return 0x73, true // F4
+	case 0xffc2:
+		return 0x74, true // F5
+	case 0xffc3:
+		return 0x75, true // F6
+	case 0xffc4:
+		return 0x76, true // F7
+	case 0xffc5:
+		return 0x77, true // F8
+	case 0xffc6:
+		return 0x78, true // F9
+	case 0xffc7:
+		return 0x79, true // F10
+	case 0xffc8:
+		return 0x7A, true // F11
+	case 0xffc9:
+		return 0x7B, true // F12
 	}
 
 	return 0, false

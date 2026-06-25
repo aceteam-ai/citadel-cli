@@ -11,13 +11,13 @@ import (
 )
 
 var (
-	user32   = windows.NewLazySystemDLL("user32.dll")
-	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
-	shcore   = windows.NewLazySystemDLL("shcore.dll")
+	user32 = windows.NewLazySystemDLL("user32.dll")
+	gdi32  = windows.NewLazySystemDLL("gdi32.dll")
+	shcore = windows.NewLazySystemDLL("shcore.dll")
 
-	procGetDC             = user32.NewProc("GetDC")
-	procReleaseDC         = user32.NewProc("ReleaseDC")
-	procGetSystemMetrics  = user32.NewProc("GetSystemMetrics")
+	procGetDC                         = user32.NewProc("GetDC")
+	procReleaseDC                     = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics              = user32.NewProc("GetSystemMetrics")
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
@@ -32,10 +32,10 @@ var (
 )
 
 const (
-	smCxScreen = 0  // SM_CXSCREEN
-	smCyScreen = 1  // SM_CYSCREEN
-	srccopy    = 0x00CC0020
-	biRGB      = 0
+	smCxScreen   = 0 // SM_CXSCREEN
+	smCyScreen   = 1 // SM_CYSCREEN
+	srccopy      = 0x00CC0020
+	biRGB        = 0
 	dibRGBColors = 0
 )
 

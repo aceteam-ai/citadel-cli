@@ -15,9 +15,9 @@ func TestNewRedisPublisher(t *testing.T) {
 	})
 
 	tests := []struct {
-		name      string
-		config    RedisPublisherConfig
-		wantErr   bool
+		name       string
+		config     RedisPublisherConfig
+		wantErr    bool
 		wantPubSub string
 		wantStream string
 	}{

@@ -250,4 +250,3 @@ func itoa(n int) string {
 func ReadPIDFile(configDir string) int {
 	return PID(configDir)
 }
-

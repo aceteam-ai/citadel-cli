@@ -33,13 +33,13 @@ var nodeIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
 // StatusMessage is the payload published to Redis for status updates.
 type StatusMessage struct {
-	Version          string             `json:"version"`
-	Timestamp        string             `json:"timestamp"`
-	NodeID           string             `json:"nodeId"`
-	HeadscaleNodeID  string             `json:"headscaleNodeId,omitempty"`
-	DeviceCode       string             `json:"deviceCode,omitempty"`
-	Status           *status.NodeStatus `json:"status"`
-	Permissions      *PermissionState   `json:"permissions,omitempty"`
+	Version         string             `json:"version"`
+	Timestamp       string             `json:"timestamp"`
+	NodeID          string             `json:"nodeId"`
+	HeadscaleNodeID string             `json:"headscaleNodeId,omitempty"`
+	DeviceCode      string             `json:"deviceCode,omitempty"`
+	Status          *status.NodeStatus `json:"status"`
+	Permissions     *PermissionState   `json:"permissions,omitempty"`
 }
 
 // PermissionState mirrors config.Permissions for the heartbeat payload.

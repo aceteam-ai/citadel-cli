@@ -149,12 +149,12 @@ func TestConfigSubscriberChannel(t *testing.T) {
 
 func TestConfigMessageParsing(t *testing.T) {
 	tests := []struct {
-		name        string
-		payload     string
-		wantType    string
-		wantNodeID  string
-		wantDevice  string
-		wantErr     bool
+		name       string
+		payload    string
+		wantType   string
+		wantNodeID string
+		wantDevice string
+		wantErr    bool
 	}{
 		{
 			name: "valid config_updated message",
