@@ -14,7 +14,7 @@ import (
 // Service defines a single managed service.
 type Service struct {
 	Name        string `yaml:"name"`
-	Type        string `yaml:"type,omitempty"`        // "native" or "docker" (default: auto-detect)
+	Type        string `yaml:"type,omitempty"`         // "native" or "docker" (default: auto-detect)
 	ComposeFile string `yaml:"compose_file,omitempty"` // For docker services
 	Port        int    `yaml:"port,omitempty"`         // For native services
 }
@@ -28,7 +28,7 @@ type ManifestCapabilities struct {
 
 // ManifestGPU describes a GPU declared in the manifest.
 type ManifestGPU struct {
-	Name   string `yaml:"name"`             // e.g. "NVIDIA GeForce RTX 3090"
+	Name   string `yaml:"name"`              // e.g. "NVIDIA GeForce RTX 3090"
 	VRAMMb int    `yaml:"vram_mb,omitempty"` // e.g. 24576
 	Count  int    `yaml:"count,omitempty"`   // defaults to 1
 }
@@ -216,8 +216,18 @@ func hasService(manifest *CitadelManifest, serviceName string) bool {
 	return false
 }
 
-// addServiceToManifest adds a service to the manifest and writes it to disk.
+// addServiceToManifest adds a service to the manifest and writes it to disk,
+// honoring the hardcoded capability-tag map for embedded/catalog services.
 func addServiceToManifest(configDir, serviceName string) error {
+	return addServiceToManifestWithTags(configDir, serviceName, nil)
+}
+
+// addServiceToManifestWithTags adds a service to the manifest and writes it to
+// disk. In addition to the hardcoded capability-tag map (back-compat for
+// embedded/catalog services), it merges any module-declared routing tags
+// (service.yaml's node_tags) into Node.Tags, so third-party engines become
+// routable without a CLI change. Tags are deduped via containsTag.
+func addServiceToManifestWithTags(configDir, serviceName string, nodeTags []string) error {
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
 	// Read existing manifest
@@ -237,7 +247,7 @@ func addServiceToManifest(configDir, serviceName string) error {
 		ComposeFile: filepath.Join("./services", serviceName+".yml"),
 	})
 
-	// Auto-add capability tags for specific services
+	// Auto-add capability tags for specific embedded/catalog services (back-compat).
 	serviceTags := map[string][]string{
 		"extraction": {"extraction:gliner2", "model:gliner2-base-v1"},
 	}
@@ -246,6 +256,13 @@ func addServiceToManifest(configDir, serviceName string) error {
 			if !containsTag(manifest.Node.Tags, tag) {
 				manifest.Node.Tags = append(manifest.Node.Tags, tag)
 			}
+		}
+	}
+
+	// Merge module-declared routing tags (service.yaml node_tags).
+	for _, tag := range nodeTags {
+		if tag != "" && !containsTag(manifest.Node.Tags, tag) {
+			manifest.Node.Tags = append(manifest.Node.Tags, tag)
 		}
 	}
 

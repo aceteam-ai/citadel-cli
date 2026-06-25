@@ -423,13 +423,16 @@ type ControlCenter struct {
 	chatConfig     ChatPageConfig        // stored from Config; used to lazily create ChatPage
 	chatConfigProv func() ChatPageConfig // lazy re-resolver for chat credentials (post-startup device auth)
 	chatPage       *ChatPage             // nil until registered in Run
-	proxmoxConfig ProxmoxConfig  // Proxmox page config (zero = disabled)
+	proxmoxConfig  ProxmoxConfig         // Proxmox page config (zero = disabled)
 
 	// Settings
 	settingsConfig SettingsCallbacks // Settings page hooks (telemetry load/save)
 
 	// WhatsApp
 	whatsappConfig WhatsAppCallbacks // WhatsApp bridge page hooks (deploy/stop/status/QR)
+
+	// Module install (install a service module from any standardized repo)
+	moduleInstallConfig ModuleInstallCallbacks
 }
 
 // Pane focus constants
@@ -497,6 +500,7 @@ type Config struct {
 	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
 	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
 	WhatsApp           WhatsAppCallbacks                        // WhatsApp bridge page hooks (deploy/stop/status/QR)
+	ModuleInstall      ModuleInstallCallbacks                   // Install-module page hooks (resolve source + install)
 }
 
 // ProxmoxConfig holds configuration for the Proxmox TUI page.
@@ -511,31 +515,32 @@ type ProxmoxConfig struct {
 // New creates a new control center
 func New(cfg Config) *ControlCenter {
 	return &ControlCenter{
-		stopChan:           make(chan struct{}),
-		activities:         make([]ActivityEntry, 0, 100),
-		activeForwards:     make([]PortForward, 0),
-		serviceOverrides:   make(map[string]*serviceStateOverride),
-		data:               StatusData{Version: cfg.Version},
-		refreshFn:          cfg.RefreshFn,
-		startServiceFn:     cfg.StartServiceFn,
-		stopServiceFn:      cfg.StopServiceFn,
-		restartServiceFn:   cfg.RestartServiceFn,
-		addServiceFn:       cfg.AddServiceFn,
-		getServicesFn:      cfg.GetServicesFn,
-		getConfiguredFn:    cfg.GetConfiguredFn,
-		getServiceDetailFn: cfg.GetServiceDetailFn,
-		getServiceLogsFn:   cfg.GetServiceLogsFn,
-		deviceAuth:         cfg.DeviceAuth,
-		worker:             cfg.Worker,
-		permissions:        cfg.Permissions,
-		onConnect:          cfg.OnConnect,
-		authServiceURL:     cfg.AuthServiceURL,
-		nexusURL:           cfg.NexusURL,
-		chatConfig:         cfg.Chat,
-		chatConfigProv:     cfg.ChatConfigProvider,
-		proxmoxConfig:      cfg.Proxmox,
-		settingsConfig:     cfg.Settings,
-		whatsappConfig:     cfg.WhatsApp,
+		stopChan:            make(chan struct{}),
+		activities:          make([]ActivityEntry, 0, 100),
+		activeForwards:      make([]PortForward, 0),
+		serviceOverrides:    make(map[string]*serviceStateOverride),
+		data:                StatusData{Version: cfg.Version},
+		refreshFn:           cfg.RefreshFn,
+		startServiceFn:      cfg.StartServiceFn,
+		stopServiceFn:       cfg.StopServiceFn,
+		restartServiceFn:    cfg.RestartServiceFn,
+		addServiceFn:        cfg.AddServiceFn,
+		getServicesFn:       cfg.GetServicesFn,
+		getConfiguredFn:     cfg.GetConfiguredFn,
+		getServiceDetailFn:  cfg.GetServiceDetailFn,
+		getServiceLogsFn:    cfg.GetServiceLogsFn,
+		deviceAuth:          cfg.DeviceAuth,
+		worker:              cfg.Worker,
+		permissions:         cfg.Permissions,
+		onConnect:           cfg.OnConnect,
+		authServiceURL:      cfg.AuthServiceURL,
+		nexusURL:            cfg.NexusURL,
+		chatConfig:          cfg.Chat,
+		chatConfigProv:      cfg.ChatConfigProvider,
+		proxmoxConfig:       cfg.Proxmox,
+		settingsConfig:      cfg.Settings,
+		whatsappConfig:      cfg.WhatsApp,
+		moduleInstallConfig: cfg.ModuleInstall,
 	}
 }
 
@@ -648,6 +653,13 @@ func (cc *ControlCenter) Run() error {
 	// pairing QR. Visible only when the host wired the lifecycle callbacks.
 	if cc.whatsappConfig.Status != nil {
 		cc.pmgr.Register(NewWhatsAppPage(cc.whatsappConfig), true)
+	}
+
+	// Install-module page: install a service module from any standardized repo
+	// (catalog name, owner/repo, or git URL). Visible only when the host wired
+	// the resolve/install callbacks.
+	if cc.moduleInstallConfig.Resolve != nil {
+		cc.pmgr.Register(NewModulePage(cc.moduleInstallConfig), true)
 	}
 
 	// Settings page (Alt+5): telemetry opt-out + read-only connection status.

@@ -240,7 +240,7 @@ func runControlCenter() {
 		// longer shows a permanent "device authorization required" status.
 		Chat:               buildChatConfig(),
 		ChatConfigProvider: buildChatConfig,
-		Proxmox:   buildProxmoxConfig(),
+		Proxmox:            buildProxmoxConfig(),
 		Settings: controlcenter.SettingsCallbacks{
 			LoadTelemetry: func() *config.Telemetry {
 				return config.LoadTelemetry(platform.ConfigDir())
@@ -255,7 +255,8 @@ func runControlCenter() {
 				return config.SaveKeepAwake(platform.ConfigDir(), k)
 			},
 		},
-		WhatsApp: buildWhatsAppCallbacks(),
+		WhatsApp:      buildWhatsAppCallbacks(),
+		ModuleInstall: buildModuleInstallCallbacks(),
 	}
 
 	cc := controlcenter.New(cfg)

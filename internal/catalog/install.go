@@ -46,16 +46,48 @@ type InstallResult struct {
 // (e.g. ~/citadel-node/services). configOverrides are key=value pairs that
 // override config defaults.
 func Install(name string, servicesDir string, configOverrides map[string]string) (*InstallResult, error) {
-	// 1. Load service manifest from catalog.
+	// Load service manifest from catalog.
 	manifest, err := LoadServiceManifest(name)
 	if err != nil {
 		return nil, err
 	}
 
-	// 1b. Reject host-provisioned services up front. A service with no
-	// compose.yml (e.g. the Windows-only "wechat" microservice) is catalogued
-	// for discoverability only and cannot be installed/run as a container.
-	if _, err := GetComposeFile(name); err != nil {
+	// Resolve the compose source. A service with no compose.yml (e.g. the
+	// Windows-only "wechat" microservice) is host-provisioned and not
+	// installable; pass an empty composeSrcPath so InstallFromManifest returns
+	// ErrNotInstallable.
+	composeSrc, _ := GetComposeFile(name)
+
+	// Catalog services are first-party (Tier 0) and have no --allow-privileged
+	// flag, so the privilege gate must not apply to them (it would be an
+	// un-overridable failure). Pass allowPrivileged=true. The module-source path
+	// passes the real flag value.
+	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true)
+}
+
+// InstallFromManifest installs a service from an already-loaded manifest and a
+// compose source path. It is the shared core behind both the catalog install
+// (Install) and external "module source" installs. It checks arch/GPU/port
+// requirements, resolves config, copies the compose file, and writes an .env.
+//
+// interactive controls config resolution: when true, required config vars with
+// no override and no default are prompted on os.Stdin; when false (the TUI
+// path), such a var is a returned error and stdin is never read.
+//
+// allowPrivileged is the un-bypassable privilege gate: if the resolved compose
+// contains any Critical risk (privileged mode, docker-socket mount, cap_add
+// ALL/SYS_ADMIN) and allowPrivileged is false, the install is REFUSED regardless
+// of interactive/--yes. This guard lives in the shared core so both the CLI and
+// the TUI non-interactive path are protected identically. Catalog (Tier-0)
+// installs pass allowPrivileged=true (they have no override flag).
+//
+// An empty composeSrcPath means the service is host-provisioned (no container)
+// and InstallFromManifest returns ErrNotInstallable.
+func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged bool) (*InstallResult, error) {
+	name := manifest.Name
+
+	// 1. Reject host-provisioned services up front (no compose.yml).
+	if composeSrcPath == "" {
 		return nil, ErrNotInstallable
 	}
 
@@ -91,24 +123,59 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 		return nil, fmt.Errorf("port conflict: port(s) %v already in use", conflicts)
 	}
 
-	// 5. Resolve config values (prompt for required ones without defaults).
-	configValues, err := resolveConfig(manifest.Config, configOverrides)
+	// 4b/4c. Read the resolved compose once for the container-name collision
+	// check and the privilege gate. A read failure here is fatal when a gate
+	// could apply: a security gate must not fail open. (The compose is copied
+	// from this same path moments later, so a real read failure would fail the
+	// install anyway -- we just refuse earlier and explicitly.)
+	{
+		data, rerr := os.ReadFile(composeSrcPath)
+		if rerr != nil {
+			if !allowPrivileged {
+				return nil, fmt.Errorf("cannot read compose for '%s' to run the safety scan: %w", name, rerr)
+			}
+			return nil, fmt.Errorf("failed to read compose file for '%s': %w", name, rerr)
+		}
+		composeText := string(data)
+
+		// 4b. Container-name collision. A reinstall of the same module is already
+		// blocked upstream (by the manifest's hasService check), so any existing
+		// container matching this compose's container_name is a foreign collision
+		// -- refuse with a clear escape hatch. Best-effort (skipped if docker is
+		// unavailable).
+		if cn := parseComposeContainerName(composeText); cn != "" && ContainerNameConflict(cn) {
+			return nil, fmt.Errorf("container name '%s' is already in use by another container; "+
+				"remove it (docker rm -f %s) or override the name via the module's compose before installing '%s'",
+				cn, cn, name)
+		}
+
+		// 4c. Privilege gate (un-bypassable). Any Critical compose risk requires
+		// an explicit opt-in; without it, refuse -- even under --yes. This is the
+		// shared-core guard that protects the TUI non-interactive path too.
+		if !allowPrivileged {
+			if crit := criticalRisks(ScanComposeRisks(composeText)); len(crit) > 0 {
+				return nil, fmt.Errorf("refusing to install '%s': its compose contains privileged/root-equivalent "+
+					"directives (%s).\n   This grants the module Docker-level (host root) access on this node. "+
+					"If you trust this source, re-run with --allow-privileged to override.",
+					name, strings.Join(criticalDirectives(crit), ", "))
+			}
+		}
+	}
+
+	// 5. Resolve config values (prompt for required ones without defaults only
+	//    when interactive).
+	configValues, err := resolveConfig(manifest.Config, configOverrides, interactive)
 	if err != nil {
 		return nil, err
 	}
 
 	// 6. Copy compose.yml to services directory.
-	composeSrc, err := GetComposeFile(name)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create services directory: %w", err)
 	}
 
 	composeDest := filepath.Join(servicesDir, name+".yml")
-	if err := copyFile(composeSrc, composeDest); err != nil {
+	if err := copyFile(composeSrcPath, composeDest); err != nil {
 		return nil, fmt.Errorf("failed to copy compose file: %w", err)
 	}
 
@@ -129,9 +196,11 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	return result, nil
 }
 
-// resolveConfig merges overrides with defaults, prompting the user for any
-// required config vars that have no default and no override.
-func resolveConfig(configVars []ConfigVar, overrides map[string]string) (map[string]string, error) {
+// resolveConfig merges overrides with defaults. When interactive is true it
+// prompts the user (os.Stdin) for any required config vars that have no default
+// and no override. When interactive is false, such a var is a returned error and
+// stdin is never read (the TUI path collects all config up front as overrides).
+func resolveConfig(configVars []ConfigVar, overrides map[string]string, interactive bool) (map[string]string, error) {
 	values := make(map[string]string)
 
 	for _, cv := range configVars {
@@ -147,8 +216,15 @@ func resolveConfig(configVars []ConfigVar, overrides map[string]string) (map[str
 			continue
 		}
 
-		// Required without default -- prompt the user.
+		// Required without default.
 		if cv.Required {
+			// Non-interactive (TUI) path: never read stdin. The caller must
+			// supply every required value as an override.
+			if !interactive {
+				return nil, fmt.Errorf("required config '%s' has no value (provide it via --set %s=...)", cv.Name, cv.Name)
+			}
+
+			// Interactive: prompt the user.
 			fmt.Printf("  %s", cv.Name)
 			if cv.Description != "" {
 				fmt.Printf(" (%s)", cv.Description)
