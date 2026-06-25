@@ -239,11 +239,12 @@ func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule, imag
 		images = catalog.BuildLockImages(resolved.Images)
 	}
 	entry := catalog.LockEntry{
-		Name:   resolved.Manifest.Name,
-		Source: src.Raw,
-		Ref:    src.Ref,
-		Commit: resolved.Commit,
-		Images: images,
+		Name:        resolved.Manifest.Name,
+		Source:      src.Raw,
+		Ref:         src.Ref,
+		ResolvedRef: resolved.ResolvedRef,
+		Commit:      resolved.Commit,
+		Images:      images,
 	}
 	if err := catalog.UpsertLockEntry(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
@@ -265,6 +266,12 @@ func markLockImagesVerified(images []catalog.LockImage) []catalog.LockImage {
 // provenance (source@commit, image[@digest]) from the lockfile when available.
 // Services without a lockfile entry (catalog/embedded) are still shown.
 func runModuleList(cmd *cobra.Command, args []string) error {
+	// --outdated (flag registered in cmd/module_update.go) checks each
+	// lifecycle-managed module against its source instead of the local listing.
+	if moduleListOutdated {
+		return printOutdated()
+	}
+
 	manifest, _, err := findAndReadManifest()
 	if err != nil {
 		fmt.Println("No node manifest found. Install a module with 'citadel module install <source>'.")

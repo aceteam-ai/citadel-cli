@@ -17,11 +17,12 @@ import (
 // the resolved git commit, and the image reference(s) (with best-effort digest)
 // it deploys. This makes nodes reproducible and tamper-evident.
 type LockEntry struct {
-	Name   string      `yaml:"name"`
-	Source string      `yaml:"source"`           // normalized source string
-	Ref    string      `yaml:"ref,omitempty"`    // requested ref (tag/branch/sha), if any
-	Commit string      `yaml:"commit,omitempty"` // resolved git HEAD commit
-	Images []LockImage `yaml:"images,omitempty"`
+	Name        string      `yaml:"name"`
+	Source      string      `yaml:"source"`                 // normalized source string
+	Ref         string      `yaml:"ref,omitempty"`          // requested ref (tag/branch/sha/constraint/channel), if any
+	ResolvedRef string      `yaml:"resolved_ref,omitempty"` // concrete tag a constraint/channel resolved to (e.g. "^1.2" -> "v1.4.0")
+	Commit      string      `yaml:"commit,omitempty"`       // resolved git HEAD commit
+	Images      []LockImage `yaml:"images,omitempty"`
 }
 
 // LockImage is a single image reference plus an optional resolved digest.

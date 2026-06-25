@@ -181,6 +181,12 @@ func splitAtRef(s string) (repoPart, ref string) {
 // `--upload-pack=<cmd>` → arbitrary command execution). Real git refnames never
 // begin with '-', so reject that (and embedded whitespace/control characters).
 // An empty ref (default branch) is allowed.
+//
+// Exception: a semver-RANGE constraint (e.g. ">=1.0 <2.0") legitimately contains
+// a space. Such a ref is never passed to git verbatim -- ResolveSource resolves
+// it to a concrete tag first -- so the whitespace check is relaxed for
+// constraint/channel refs. The injection guard (no leading '-', no control
+// characters) still applies, since those would be dangerous even pre-resolution.
 func validateRef(ref string) error {
 	if ref == "" {
 		return nil
@@ -188,9 +194,13 @@ func validateRef(ref string) error {
 	if strings.HasPrefix(ref, "-") {
 		return fmt.Errorf("a git ref cannot begin with '-'")
 	}
+	allowSpace := IsVersionConstraint(ref)
 	for _, r := range ref {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r < 0x20 {
-			return fmt.Errorf("a git ref cannot contain whitespace or control characters")
+		if r == '\n' || r == '\r' || r < 0x20 {
+			return fmt.Errorf("a git ref cannot contain control characters")
+		}
+		if (r == ' ' || r == '\t') && !allowSpace {
+			return fmt.Errorf("a git ref cannot contain whitespace")
 		}
 	}
 	return nil
@@ -250,6 +260,10 @@ type ResolvedModule struct {
 	CacheDir    string
 	// Commit is the resolved git HEAD of the cache checkout (or "" if unknown).
 	Commit string
+	// ResolvedRef is the concrete tag a constraint/channel ref resolved to (e.g.
+	// "^1.2" -> "v1.4.0"). Empty when the ref was already exact (tag/branch/SHA)
+	// or unpinned. Recorded in the lockfile so an install is reproducible.
+	ResolvedRef string
 	// Images are the container image references parsed from the compose file.
 	Images []string
 }
@@ -262,6 +276,21 @@ type ResolvedModule struct {
 func ResolveSource(src Source) (*ResolvedModule, error) {
 	if src.Kind == KindCatalog {
 		return nil, fmt.Errorf("source %q is a catalog name; use the catalog path", src.Raw)
+	}
+
+	// If the ref is a semver constraint or a channel (stable/latest), resolve it
+	// to a concrete tag against the repo's remote tag list FIRST. This rewrites
+	// src.Ref to the resolved tag so the cache dir keys on the concrete tag and
+	// the existing branch-checkout path (strategyBranch) handles it unchanged.
+	// Exact tags/branches/SHAs are not constraints and are left untouched.
+	var resolvedRef string
+	if IsVersionConstraint(src.Ref) {
+		tag, err := resolveConstraintRef(src)
+		if err != nil {
+			return nil, err
+		}
+		resolvedRef = tag
+		src.Ref = tag
 	}
 
 	cacheDir := filepath.Join(ModulesCacheDir(), sanitizeCacheName(src))
@@ -283,6 +312,7 @@ func ResolveSource(src Source) (*ResolvedModule, error) {
 		ComposePath: composePath,
 		CacheDir:    cacheDir,
 		Commit:      gitHeadCommit(cacheDir),
+		ResolvedRef: resolvedRef,
 	}
 	if data, rerr := os.ReadFile(composePath); rerr == nil {
 		res.Images = parseComposeImages(string(data))
@@ -392,6 +422,36 @@ func fetchAndCheckout(src Source, dir string) error {
 		return cloneError(src, fmt.Sprintf("git checkout failed: %s", strings.TrimSpace(string(out))))
 	}
 	return nil
+}
+
+// resolveConstraintRef resolves a semver-constraint or channel src.Ref to a
+// concrete tag by enumerating the repo's tags with `git ls-remote --tags` (no
+// clone needed -- a shallow clone would not fetch the tag list) and picking the
+// best match via the pure ResolveVersion logic. Returns the matching tag name.
+func resolveConstraintRef(src Source) (string, error) {
+	tags, err := remoteTags(src.CloneURL)
+	if err != nil {
+		return "", err
+	}
+	if len(tags) == 0 {
+		return "", fmt.Errorf("could not resolve %q: source %q has no tags to match against", src.Ref, src.Raw)
+	}
+	resolved, err := ResolveVersion(src.Ref, tags)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve version %q for %q: %w", src.Ref, src.Raw, err)
+	}
+	return resolved, nil
+}
+
+// remoteTags lists the tags of a remote repo via `git ls-remote --tags <url>`,
+// returning de-duplicated tag names (annotated-tag deref entries normalized).
+func remoteTags(cloneURL string) ([]string, error) {
+	out, err := exec.Command("git", "ls-remote", "--tags", cloneURL).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-remote --tags failed for %s: %s",
+			cloneURL, strings.TrimSpace(string(out)))
+	}
+	return parseLsRemoteTags(string(out)), nil
 }
 
 // gitHeadCommit returns the resolved HEAD commit of dir, or "" if it can't be
