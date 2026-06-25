@@ -41,14 +41,14 @@ func TestBuildCosignArgs(t *testing.T) {
 			name: "keyful",
 			pub:  VerifiedPublisher{Key: "/k/cosign.pub"},
 			ref:  "ghcr.io/o/r@sha256:abc",
-			want: []string{"verify", "--key", "/k/cosign.pub", "ghcr.io/o/r@sha256:abc"},
+			want: []string{"verify", "--key", "/k/cosign.pub", "--", "ghcr.io/o/r@sha256:abc"},
 		},
 		{
 			name: "keyless",
 			pub:  VerifiedPublisher{Identity: "me@example.com", Issuer: "https://accounts.example.com"},
 			ref:  "ghcr.io/o/r@sha256:abc",
 			want: []string{"verify", "--certificate-identity", "me@example.com",
-				"--certificate-oidc-issuer", "https://accounts.example.com", "ghcr.io/o/r@sha256:abc"},
+				"--certificate-oidc-issuer", "https://accounts.example.com", "--", "ghcr.io/o/r@sha256:abc"},
 		},
 		{
 			name:    "keyless missing issuer",

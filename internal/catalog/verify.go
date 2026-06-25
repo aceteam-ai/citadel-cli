@@ -77,9 +77,11 @@ func publisherVerifyMode(pub VerifiedPublisher) cosignVerifyMode {
 //   - keyful : verify --key <key> <imageRef>
 //   - keyless: verify --certificate-identity <id> --certificate-oidc-issuer <iss> <imageRef>
 func buildCosignArgs(pub VerifiedPublisher, imageRef string) ([]string, error) {
+	// A "--" separates flags from the positional image so an image reference
+	// that begins with '-' can never be parsed by cosign as an option.
 	switch publisherVerifyMode(pub) {
 	case modeKeyful:
-		return []string{"verify", "--key", strings.TrimSpace(pub.Key), imageRef}, nil
+		return []string{"verify", "--key", strings.TrimSpace(pub.Key), "--", imageRef}, nil
 	case modeKeyless:
 		issuer := strings.TrimSpace(pub.Issuer)
 		if issuer == "" {
@@ -89,7 +91,7 @@ func buildCosignArgs(pub VerifiedPublisher, imageRef string) ([]string, error) {
 			"verify",
 			"--certificate-identity", strings.TrimSpace(pub.Identity),
 			"--certificate-oidc-issuer", issuer,
-			imageRef,
+			"--", imageRef,
 		}, nil
 	default:
 		return nil, fmt.Errorf("verified publisher %q declares no signing key or identity", pub.Pattern)
