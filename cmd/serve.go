@@ -19,13 +19,14 @@ import (
 )
 
 var (
-	servePort       int
-	serveStatusPort int
-	serveTermPort   int
-	serveVNCPort    int
-	serveNoTLS      bool
-	serveCertDir    string
-	serveBind       string
+	servePort          int
+	serveStatusPort    int
+	serveTermPort      int
+	serveVNCPort       int
+	serveEmbeddingPort int
+	serveNoTLS         bool
+	serveCertDir       string
+	serveBind          string
 )
 
 var serveCmd = &cobra.Command{
@@ -154,9 +155,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Validate that gateway port does not collide with any upstream port
 	upstreamPorts := map[int]string{
-		serveStatusPort: "status-port",
-		serveTermPort:   "terminal-port",
-		serveVNCPort:    "vnc-port",
+		serveStatusPort:    "status-port",
+		serveTermPort:      "terminal-port",
+		serveVNCPort:       "vnc-port",
+		serveEmbeddingPort: "embedding-port",
 	}
 	if name, collision := upstreamPorts[servePort]; collision {
 		return fmt.Errorf("gateway port %d collides with --%s; choose a different --port", servePort, name)
@@ -166,6 +168,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	statusAddr := fmt.Sprintf("127.0.0.1:%d", serveStatusPort)
 	termAddr := fmt.Sprintf("127.0.0.1:%d", serveTermPort)
 	vncAddr := fmt.Sprintf("127.0.0.1:%d", serveVNCPort)
+	embeddingAddr := fmt.Sprintf("127.0.0.1:%d", serveEmbeddingPort)
 
 	// Add VPN listener so the gateway is reachable over the tsnet VPN.
 	// For HTTPS mode, the raw tsnet listener must be TLS-wrapped so that
@@ -210,6 +213,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	gw.AddUpstream("/ssh/authorized-keys", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/provision", &gateway.Upstream{Address: statusAddr})
 
+	// Embedding upstream (issue #351): route the already-metered
+	// /v1/embeddings path to the local TEI service (default 127.0.0.1:8102).
+	// TEI exposes the OpenAI-compatible endpoint at the same path, so no prefix
+	// stripping is needed.
+	gw.AddUpstream("/v1/embeddings", &gateway.Upstream{Address: embeddingAddr})
+
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{
 		Address:     vncAddr,
@@ -240,6 +249,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 	fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
+	fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
 	fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 	fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 
@@ -272,6 +282,7 @@ func init() {
 	serveCmd.Flags().IntVar(&serveStatusPort, "status-port", 8080, "Port of the local status server (from 'citadel work --status-port')")
 	serveCmd.Flags().IntVar(&serveTermPort, "terminal-port", 7860, "Port of the local terminal server")
 	serveCmd.Flags().IntVar(&serveVNCPort, "vnc-port", 6080, "Port of websockify (VNC WebSocket bridge)")
+	serveCmd.Flags().IntVar(&serveEmbeddingPort, "embedding-port", 8102, "Port of the local TEI embedding service (/v1/embeddings upstream)")
 
 	// Mark --no-tls as hidden (not recommended for production)
 	serveCmd.Flags().MarkHidden("no-tls")

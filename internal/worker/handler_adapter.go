@@ -131,6 +131,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeLlamaCppInference, &jobs.LlamaCppInferenceHandler{}),
 		NewLegacyHandlerAdapter(JobTypeVLLMInference, &jobs.VLLMInferenceHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaInference, &jobs.OllamaInferenceHandler{}),
+		// Text-embedding jobs route to the local TEI service's OpenAI-compatible
+		// /v1/embeddings endpoint (issue #351). Registered unconditionally — like
+		// the other inference engines it needs no workspace sandbox; nodes that
+		// don't run TEI simply never receive `embedding` jobs (they only land on
+		// nodes carrying the task:embedding capability tag).
+		NewLegacyHandlerAdapter(JobTypeEmbedding, &jobs.EmbeddingHandler{}),
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
