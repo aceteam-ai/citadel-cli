@@ -58,7 +58,11 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	// ErrNotInstallable.
 	composeSrc, _ := GetComposeFile(name)
 
-	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true)
+	// Catalog services are first-party (Tier 0) and have no --allow-privileged
+	// flag, so the privilege gate must not apply to them (it would be an
+	// un-overridable failure). Pass allowPrivileged=true. The module-source path
+	// passes the real flag value.
+	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true)
 }
 
 // InstallFromManifest installs a service from an already-loaded manifest and a
@@ -70,9 +74,16 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 // no override and no default are prompted on os.Stdin; when false (the TUI
 // path), such a var is a returned error and stdin is never read.
 //
+// allowPrivileged is the un-bypassable privilege gate: if the resolved compose
+// contains any Critical risk (privileged mode, docker-socket mount, cap_add
+// ALL/SYS_ADMIN) and allowPrivileged is false, the install is REFUSED regardless
+// of interactive/--yes. This guard lives in the shared core so both the CLI and
+// the TUI non-interactive path are protected identically. Catalog (Tier-0)
+// installs pass allowPrivileged=true (they have no override flag).
+//
 // An empty composeSrcPath means the service is host-provisioned (no container)
 // and InstallFromManifest returns ErrNotInstallable.
-func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive bool) (*InstallResult, error) {
+func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged bool) (*InstallResult, error) {
 	name := manifest.Name
 
 	// 1. Reject host-provisioned services up front (no compose.yml).
@@ -112,16 +123,32 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		return nil, fmt.Errorf("port conflict: port(s) %v already in use", conflicts)
 	}
 
-	// 4b. Check container-name collision. A reinstall of the same module is
-	// already blocked upstream (by the manifest's hasService check), so any
-	// existing container matching this compose's container_name is a foreign
-	// collision -- refuse with a clear escape hatch. Best-effort (skipped if
-	// docker is unavailable).
+	// 4b/4c. Read the resolved compose once for the container-name collision
+	// check and the privilege gate.
 	if data, rerr := os.ReadFile(composeSrcPath); rerr == nil {
-		if cn := parseComposeContainerName(string(data)); cn != "" && ContainerNameConflict(cn) {
+		composeText := string(data)
+
+		// 4b. Container-name collision. A reinstall of the same module is already
+		// blocked upstream (by the manifest's hasService check), so any existing
+		// container matching this compose's container_name is a foreign collision
+		// -- refuse with a clear escape hatch. Best-effort (skipped if docker is
+		// unavailable).
+		if cn := parseComposeContainerName(composeText); cn != "" && ContainerNameConflict(cn) {
 			return nil, fmt.Errorf("container name '%s' is already in use by another container; "+
 				"remove it (docker rm -f %s) or override the name via the module's compose before installing '%s'",
 				cn, cn, name)
+		}
+
+		// 4c. Privilege gate (un-bypassable). Any Critical compose risk requires
+		// an explicit opt-in; without it, refuse -- even under --yes. This is the
+		// shared-core guard that protects the TUI non-interactive path too.
+		if !allowPrivileged {
+			if crit := criticalRisks(ScanComposeRisks(composeText)); len(crit) > 0 {
+				return nil, fmt.Errorf("refusing to install '%s': its compose contains privileged/root-equivalent "+
+					"directives (%s).\n   This grants the module Docker-level (host root) access on this node. "+
+					"If you trust this source, re-run with --allow-privileged to override.",
+					name, strings.Join(criticalDirectives(crit), ", "))
+			}
 		}
 	}
 

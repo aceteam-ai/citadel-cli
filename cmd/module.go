@@ -37,6 +37,7 @@ import (
 var (
 	moduleInstallConfigFlags []string
 	moduleInstallYes         bool
+	moduleAllowPrivileged    bool
 )
 
 var moduleCmd = &cobra.Command{
@@ -90,7 +91,9 @@ func init() {
 	moduleInstallCmd.Flags().StringArrayVar(&moduleInstallConfigFlags, "set", nil,
 		"Set a config value (e.g. --set KEY=VALUE). Repeatable.")
 	moduleInstallCmd.Flags().BoolVar(&moduleInstallYes, "yes", false,
-		"Skip the confirmation prompt for external (non-catalog) sources.")
+		"Skip the ordinary confirmation prompt (does NOT bypass the privileged-compose gate).")
+	moduleInstallCmd.Flags().BoolVar(&moduleAllowPrivileged, "allow-privileged", false,
+		"Allow installing a module whose compose requests privileged/root-equivalent access (required when Critical risks are present).")
 }
 
 // parseSetFlags converts repeated --set KEY=VALUE flags into an overrides map.
@@ -143,6 +146,24 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 	// what will be installed -- a real TOFU/provenance prompt.
 	printModuleSummary(src, resolved, overrides)
 
+	// Trust + risk surface: warn that this runs an arbitrary container with
+	// root-equivalent access on this node (unless the source is trusted), and
+	// list the compose risk findings.
+	trusted := catalog.IsTrusted(src)
+	risks := scanResolvedRisks(resolved)
+	printTrustAndRisks(src, trusted, risks)
+
+	// Hard gate: a Critical finding without --allow-privileged refuses the
+	// install BEFORE any confirmation (and even under --yes). This mirrors the
+	// shared-core guard in InstallFromManifest so the user sees a clear message
+	// here. Trust does NOT relax the privilege gate.
+	if crit := criticalDirectiveNames(risks); len(crit) > 0 && !moduleAllowPrivileged {
+		return fmt.Errorf("refusing to install '%s': compose requests privileged/root-equivalent access (%s).\n"+
+			"   This would grant the module Docker-level (host root) access on this node.\n"+
+			"   If you trust this source, re-run with --allow-privileged to override.",
+			manifest.Name, strings.Join(crit, ", "))
+	}
+
 	if !moduleInstallYes {
 		fmt.Print("\nProceed with install? [y/N]: ")
 		if !confirmYes() {
@@ -164,7 +185,7 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 	servicesDir := filepath.Join(configDir, "services")
 
 	fmt.Printf("\nInstalling %s ...\n", manifest.Name)
-	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true)
+	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged)
 	if err != nil {
 		return fmt.Errorf("install failed: %w", err)
 	}
@@ -454,6 +475,64 @@ func composeImage(composePath string) string {
 	return ""
 }
 
+// scanResolvedRisks reads the resolved compose and returns its risk findings.
+func scanResolvedRisks(resolved *catalog.ResolvedModule) []catalog.ComposeRisk {
+	data, err := os.ReadFile(resolved.ComposePath)
+	if err != nil {
+		return nil
+	}
+	return catalog.ScanComposeRisks(string(data))
+}
+
+// criticalDirectiveNames returns the directive names of the Critical findings.
+func criticalDirectiveNames(risks []catalog.ComposeRisk) []string {
+	var out []string
+	for _, r := range risks {
+		if r.Severity == catalog.SeverityCritical {
+			out = append(out, r.Directive)
+		}
+	}
+	return out
+}
+
+// printTrustAndRisks prints the trust banner and the risk findings for an
+// external module source. Untrusted sources get a prominent warning that this
+// installs and runs an arbitrary container with Docker-level (host root) access.
+func printTrustAndRisks(src catalog.Source, trusted bool, risks []catalog.ComposeRisk) {
+	bold := color.New(color.Bold)
+	fmt.Println()
+	if trusted {
+		fmt.Printf("  %s %s\n", color.GreenString("✓ trusted source"), color.New(color.Faint).Sprintf("(%s)", src.Raw))
+	} else {
+		bold.Println(color.YellowString("⚠ UNTRUSTED SOURCE"))
+		fmt.Println(color.YellowString("  Installing this module runs an arbitrary container on this node with"))
+		fmt.Println(color.YellowString("  Docker-level (host root-equivalent) access. Only proceed if you trust"))
+		fmt.Printf("%s\n", color.YellowString("  the source and have reviewed its compose. "))
+		fmt.Printf("  %s\n", color.New(color.Faint).Sprintf("Trust it for next time: citadel module trust %s", trustSuggestion(src)))
+	}
+
+	if len(risks) > 0 {
+		fmt.Println()
+		bold.Println("  Compose risk findings:")
+		for _, r := range risks {
+			switch r.Severity {
+			case catalog.SeverityCritical:
+				fmt.Printf("    %s  %s — %s\n", color.RedString("CRITICAL"), r.Directive, r.Detail)
+			default:
+				fmt.Printf("    %s      %s — %s\n", color.YellowString("HIGH"), r.Directive, r.Detail)
+			}
+		}
+	}
+}
+
+// trustSuggestion returns a sensible trust pattern to suggest for a source.
+func trustSuggestion(src catalog.Source) string {
+	if src.Kind == catalog.KindGitHub {
+		return src.Owner + "/" + src.Repo
+	}
+	return src.Raw
+}
+
 // confirmYes reads a single line from stdin and reports whether it is an
 // affirmative ("y"/"yes", case-insensitive).
 func confirmYes() bool {
@@ -492,9 +571,24 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 					Required:    cv.Required,
 				})
 			}
+			// Trust state + compose risk findings for the form to surface.
+			out.Trusted = catalog.IsTrusted(src)
+			if data, rerr := os.ReadFile(composeSrc); rerr == nil {
+				for _, r := range catalog.ScanComposeRisks(string(data)) {
+					crit := r.Severity == catalog.SeverityCritical
+					out.Risks = append(out.Risks, controlcenter.ModuleRisk{
+						Critical:  crit,
+						Directive: r.Directive,
+						Detail:    r.Detail,
+					})
+					if crit {
+						out.HasCriticalRisk = true
+					}
+				}
+			}
 			return out, nil
 		},
-		Install: func(source string, overrides map[string]string) (string, error) {
+		Install: func(source string, overrides map[string]string, allowPrivileged bool) (string, error) {
 			src, err := catalog.ParseSource(source)
 			if err != nil {
 				return "", err
@@ -517,7 +611,9 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 
 			// interactive=false: the TUI supplies all required config as
 			// overrides, so a missing required var is an error, never a stdin read.
-			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false)
+			// allowPrivileged is the user's explicit opt-in from the form; the
+			// shared core still refuses a Critical compose if it is false.
+			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allowPrivileged)
 			if err != nil {
 				return "", err
 			}

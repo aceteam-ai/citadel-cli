@@ -19,27 +19,43 @@ type ConfigField struct {
 	Required    bool
 }
 
+// ModuleRisk is a single compose risk finding surfaced to the TUI (mapped from
+// catalog.ComposeRisk in the cmd layer so this page imports no catalog internals).
+type ModuleRisk struct {
+	Critical  bool // true = Critical severity, false = High
+	Directive string
+	Detail    string
+}
+
 // ModuleResolveResult is what Resolve returns: the resolved module name, the
-// container image (from the module's own compose, display-only), and the list of
-// config fields the form should collect.
+// container image (display-only), the config fields the form should collect, the
+// trust state of the source, and the compose risk findings.
 type ModuleResolveResult struct {
-	Name   string
-	Image  string
-	Config []ConfigField
+	Name            string
+	Image           string
+	Config          []ConfigField
+	Trusted         bool
+	Risks           []ModuleRisk
+	HasCriticalRisk bool
 }
 
 // ModuleInstallCallbacks holds the hooks for the "Install module" page. They are
 // wired from cmd so the page stays free of catalog/network/docker imports.
 //
 // Resolve clones/updates the source repo (or loads a catalog name) and returns
-// the module name + required config; it may block on the network, so the page
-// calls it off the UI goroutine. Install performs the actual install with the
-// collected config passed as overrides (the non-interactive installer path, so
-// no stdin is read).
+// the module name + required config + trust/risk info; it may block on the
+// network, so the page calls it off the UI goroutine. Install performs the actual
+// install with the collected config passed as overrides (the non-interactive
+// installer path, so no stdin is read). allowPrivileged must be true for the
+// install to proceed when the compose has a Critical risk; the page only sets it
+// when the user explicitly opts in.
 type ModuleInstallCallbacks struct {
 	Resolve func(source string) (ModuleResolveResult, error)
-	Install func(source string, overrides map[string]string) (installedName string, err error)
+	Install func(source string, overrides map[string]string, allowPrivileged bool) (installedName string, err error)
 }
+
+// allowPrivilegedLabel is the form checkbox shown when a Critical risk is found.
+const allowPrivilegedLabel = "Allow privileged (root-equivalent) access"
 
 // modulePhase tracks the two-phase form flow.
 type modulePhase int
@@ -147,6 +163,11 @@ func (p *ModulePage) buildConfigForm() {
 			label += " *"
 		}
 		p.form.AddInputField(label, f.Default, 40, nil, nil)
+	}
+	// When the compose has a Critical risk, the user must explicitly opt in to a
+	// privileged install; this checkbox is the TUI equivalent of --allow-privileged.
+	if p.resolved.HasCriticalRisk {
+		p.form.AddCheckbox(allowPrivilegedLabel, false, nil)
 	}
 	p.form.AddButton("Install", func() { p.doInstall() })
 	p.form.AddButton("Back", func() {
@@ -259,6 +280,23 @@ func (p *ModulePage) doInstall() {
 		return
 	}
 
+	// Read the privileged opt-in checkbox (only present when HasCriticalRisk).
+	allowPrivileged := false
+	if p.resolved.HasCriticalRisk {
+		if cb, ok := p.form.GetFormItemByLabel(allowPrivilegedLabel).(*tview.Checkbox); ok {
+			allowPrivileged = cb.IsChecked()
+		}
+		// Pre-gate in the UI: a Critical risk without the opt-in must not even
+		// attempt the install (the core also refuses -- belt and suspenders).
+		if !allowPrivileged {
+			p.errMsg = "This module requests privileged/root-equivalent access. Check '" +
+				allowPrivilegedLabel + "' to proceed, or pick a different module."
+			p.mu.Unlock()
+			p.render()
+			return
+		}
+	}
+
 	p.busy = true
 	p.busyMsg = "Installing module..."
 	p.errMsg = ""
@@ -269,7 +307,7 @@ func (p *ModulePage) doInstall() {
 		var name string
 		var err error
 		if p.cb.Install != nil {
-			name, err = p.cb.Install(src, overrides)
+			name, err = p.cb.Install(src, overrides, allowPrivileged)
 		} else {
 			err = fmt.Errorf("module install is not available")
 		}
@@ -341,11 +379,36 @@ func (p *ModulePage) render() {
 		if res.Image != "" {
 			sb.WriteString(fmt.Sprintf("   Image: [aqua]%s[-]\n", res.Image))
 		}
+
+		// Trust banner.
+		if res.Trusted {
+			sb.WriteString("   Source: [green]✓ trusted[-]\n")
+		} else {
+			sb.WriteString("   Source: [yellow]⚠ UNTRUSTED[-]\n")
+			sb.WriteString("   [yellow]Installs & runs an arbitrary container with[-]\n")
+			sb.WriteString("   [yellow]Docker-level (host root) access on this node.[-]\n")
+		}
+
+		// Risk findings.
+		if len(res.Risks) > 0 {
+			sb.WriteString("\n   [white::b]Compose risks[-:-:-]\n")
+			for _, r := range res.Risks {
+				if r.Critical {
+					sb.WriteString(fmt.Sprintf("   [red]CRITICAL[-] %s\n", tview.Escape(r.Directive)))
+				} else {
+					sb.WriteString(fmt.Sprintf("   [yellow]HIGH[-] %s\n", tview.Escape(r.Directive)))
+				}
+			}
+			if res.HasCriticalRisk {
+				sb.WriteString(fmt.Sprintf("   [red]Check '%s' to proceed.[-]\n", allowPrivilegedLabel))
+			}
+		}
+
 		if len(res.Config) > 0 {
-			sb.WriteString("   [gray]Fill the config fields, then Install.[-]\n")
+			sb.WriteString("\n   [gray]Fill the config fields, then Install.[-]\n")
 			sb.WriteString("   [gray]* = required[-]\n")
 		} else {
-			sb.WriteString("   [gray]No config required. Press Install.[-]\n")
+			sb.WriteString("\n   [gray]No config required. Press Install.[-]\n")
 		}
 	}
 
