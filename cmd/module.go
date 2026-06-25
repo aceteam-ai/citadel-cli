@@ -128,14 +128,20 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 
 	// Resolve the external source: clone/update the repo and load its manifest.
 	fmt.Printf("Resolving module source %s ...\n", color.CyanString(src.Raw))
-	manifest, composeSrc, err := catalog.ResolveSource(src)
+	resolved, err := catalog.ResolveSource(src)
 	if err != nil {
 		return err
 	}
+	manifest := resolved.Manifest
 
-	// Print a summary so the operator can confirm what will be installed.
-	image := composeImage(composeSrc)
-	printModuleSummary(src, manifest, composeSrc, image, overrides)
+	// Forward-compat: warn (don't fail) on a newer manifest schema.
+	if w := catalog.SchemaWarning(manifest); w != "" {
+		fmt.Println(color.YellowString("  Warning: " + w))
+	}
+
+	// Print a summary (incl. resolved commit + image) so the operator can confirm
+	// what will be installed -- a real TOFU/provenance prompt.
+	printModuleSummary(src, resolved, overrides)
 
 	if !moduleInstallYes {
 		fmt.Print("\nProceed with install? [y/N]: ")
@@ -158,26 +164,52 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 	servicesDir := filepath.Join(configDir, "services")
 
 	fmt.Printf("\nInstalling %s ...\n", manifest.Name)
-	result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, true)
+	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true)
 	if err != nil {
 		return fmt.Errorf("install failed: %w", err)
 	}
 
-	if err := addServiceToManifest(configDir, result.Name); err != nil {
+	// Register in the node manifest, merging the module's declared routing tags
+	// so a third-party engine becomes routable without a CLI change.
+	if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
 		return fmt.Errorf("failed to update manifest: %w", err)
 	}
+
+	// Record provenance into the lockfile (best-effort: never fail the install).
+	recordModuleLock(src, resolved)
 
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
 	if result.EnvDestPath != "" {
 		fmt.Printf("  Config:  %s\n", result.EnvDestPath)
 	}
+	if len(manifest.NodeTags) > 0 {
+		fmt.Printf("  Routing tags: %s\n", strings.Join(manifest.NodeTags, ", "))
+	}
 	fmt.Printf("\nTo start the module:\n")
 	fmt.Printf("  citadel run %s\n", result.Name)
 	return nil
 }
 
-// runModuleList prints the modules currently registered in the node manifest.
+// recordModuleLock upserts a provenance entry for a freshly resolved+installed
+// module into modules.lock. Best-effort: any failure is reported to stderr but
+// does not fail the install.
+func recordModuleLock(src catalog.Source, resolved *catalog.ResolvedModule) {
+	entry := catalog.LockEntry{
+		Name:   resolved.Manifest.Name,
+		Source: src.Raw,
+		Ref:    src.Ref,
+		Commit: resolved.Commit,
+		Images: catalog.BuildLockImages(resolved.Images),
+	}
+	if err := catalog.UpsertLockEntry(entry); err != nil {
+		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
+	}
+}
+
+// runModuleList prints the modules registered in the node manifest, merged with
+// provenance (source@commit, image[@digest]) from the lockfile when available.
+// Services without a lockfile entry (catalog/embedded) are still shown.
 func runModuleList(cmd *cobra.Command, args []string) error {
 	manifest, _, err := findAndReadManifest()
 	if err != nil {
@@ -189,14 +221,56 @@ func runModuleList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	lf, _ := catalog.LoadLockfile() // best-effort; nil-safe below
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer w.Flush()
 	bold := color.New(color.Bold)
-	bold.Fprintf(w, "MODULE\tCOMPOSE\n")
+	bold.Fprintf(w, "MODULE\tSOURCE\tIMAGE\n")
 	for _, s := range manifest.Services {
-		fmt.Fprintf(w, "%s\t%s\n", s.Name, s.ComposeFile)
+		source := color.New(color.FgWhite).Sprint("catalog/embedded")
+		image := "-"
+		if lf != nil {
+			if e, ok := lf.LookupLock(s.Name); ok {
+				source = e.Source
+				if e.Commit != "" {
+					source = fmt.Sprintf("%s@%s", e.Source, shortCommit(e.Commit))
+				}
+				image = formatLockImages(e.Images)
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.Name, source, image)
 	}
 	return nil
+}
+
+// shortCommit abbreviates a git commit SHA for display.
+func shortCommit(commit string) string {
+	if len(commit) > 12 {
+		return commit[:12]
+	}
+	return commit
+}
+
+// formatLockImages renders lockfile images as "ref@digest" (digest abbreviated),
+// joined by commas, or "-" if none.
+func formatLockImages(images []catalog.LockImage) string {
+	if len(images) == 0 {
+		return "-"
+	}
+	var parts []string
+	for _, im := range images {
+		if im.Digest != "" {
+			d := im.Digest
+			if len(d) > 19 { // "sha256:" + 12 hex
+				d = d[:19]
+			}
+			parts = append(parts, fmt.Sprintf("%s@%s", im.Ref, d))
+		} else {
+			parts = append(parts, im.Ref)
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // runModuleInfo resolves a module source and prints its manifest details.
@@ -212,16 +286,22 @@ func runModuleInfo(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Resolving module source %s ...\n\n", color.CyanString(src.Raw))
-	manifest, composeSrc, err := catalog.ResolveSource(src)
+	resolved, err := catalog.ResolveSource(src)
 	if err != nil {
 		return err
 	}
-	renderManifest(manifest, src, composeSrc, composeImage(composeSrc))
+	if w := catalog.SchemaWarning(resolved.Manifest); w != "" {
+		fmt.Println(color.YellowString("Warning: " + w))
+		fmt.Println()
+	}
+	renderManifest(resolved, src)
 	return nil
 }
 
-// printModuleSummary prints a concise pre-install summary for an external module.
-func printModuleSummary(src catalog.Source, manifest *catalog.ServiceManifest, composePath, image string, overrides map[string]string) {
+// printModuleSummary prints a concise pre-install summary (incl. resolved commit
+// + image) for an external module -- a TOFU/provenance prompt.
+func printModuleSummary(src catalog.Source, resolved *catalog.ResolvedModule, overrides map[string]string) {
+	manifest := resolved.Manifest
 	bold := color.New(color.Bold)
 	fmt.Println()
 	bold.Println("Module to install:")
@@ -230,8 +310,14 @@ func printModuleSummary(src catalog.Source, manifest *catalog.ServiceManifest, c
 	if manifest.Version != "" {
 		fmt.Printf("  Version: %s\n", manifest.Version)
 	}
-	if image != "" {
-		fmt.Printf("  Image:   %s\n", image)
+	if resolved.Commit != "" {
+		fmt.Printf("  Commit:  %s\n", resolved.Commit)
+	}
+	for _, img := range resolved.Images {
+		fmt.Printf("  Image:   %s\n", img)
+	}
+	if len(manifest.NodeTags) > 0 {
+		fmt.Printf("  Routing tags: %s\n", strings.Join(manifest.NodeTags, ", "))
 	}
 	if len(manifest.Ports) > 0 {
 		var ports []string
@@ -256,15 +342,20 @@ func printModuleSummary(src catalog.Source, manifest *catalog.ServiceManifest, c
 }
 
 // renderManifest prints full manifest details, mirroring runCatalogInfo's style,
-// with the resolved source + image added at the top.
-func renderManifest(manifest *catalog.ServiceManifest, src catalog.Source, composePath, image string) {
+// with the resolved source + commit + image(s) added at the top.
+func renderManifest(resolved *catalog.ResolvedModule, src catalog.Source) {
+	manifest := resolved.Manifest
 	bold := color.New(color.Bold)
 
 	bold.Print("Source:      ")
 	fmt.Println(src.Raw)
-	if image != "" {
+	if resolved.Commit != "" {
+		bold.Print("Commit:      ")
+		fmt.Println(resolved.Commit)
+	}
+	for _, img := range resolved.Images {
 		bold.Print("Image:       ")
-		fmt.Println(image)
+		fmt.Println(img)
 	}
 	bold.Print("Name:        ")
 	fmt.Println(manifest.Name)
@@ -331,6 +422,12 @@ func renderManifest(manifest *catalog.ServiceManifest, src catalog.Source, compo
 		w.Flush()
 	}
 
+	if len(manifest.NodeTags) > 0 {
+		fmt.Println()
+		bold.Print("Routing tags (node_tags): ")
+		fmt.Println(strings.Join(manifest.NodeTags, ", "))
+	}
+
 	if len(manifest.Tags) > 0 {
 		fmt.Println()
 		bold.Print("Tags: ")
@@ -380,20 +477,9 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			if err != nil {
 				return out, err
 			}
-
-			var manifest *catalog.ServiceManifest
-			var composeSrc string
-			if src.Kind == catalog.KindCatalog {
-				manifest, err = catalog.LoadServiceManifest(src.Name)
-				if err != nil {
-					return out, err
-				}
-				composeSrc, _ = catalog.GetComposeFile(src.Name)
-			} else {
-				manifest, composeSrc, err = catalog.ResolveSource(src)
-				if err != nil {
-					return out, err
-				}
+			manifest, composeSrc, _, err := resolveModuleForTUI(src)
+			if err != nil {
+				return out, err
 			}
 
 			out.Name = manifest.Name
@@ -413,20 +499,9 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			if err != nil {
 				return "", err
 			}
-
-			var manifest *catalog.ServiceManifest
-			var composeSrc string
-			if src.Kind == catalog.KindCatalog {
-				manifest, err = catalog.LoadServiceManifest(src.Name)
-				if err != nil {
-					return "", err
-				}
-				composeSrc, _ = catalog.GetComposeFile(src.Name)
-			} else {
-				manifest, composeSrc, err = catalog.ResolveSource(src)
-				if err != nil {
-					return "", err
-				}
+			manifest, composeSrc, resolved, err := resolveModuleForTUI(src)
+			if err != nil {
+				return "", err
 			}
 
 			nodeManifest, configDir, err := findOrCreateManifest()
@@ -446,10 +521,34 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			if err != nil {
 				return "", err
 			}
-			if err := addServiceToManifest(configDir, result.Name); err != nil {
+			// Merge the module's declared routing tags so it becomes routable.
+			if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
 				return "", fmt.Errorf("failed to update manifest: %w", err)
+			}
+			// Record provenance for external sources (best-effort).
+			if resolved != nil {
+				recordModuleLock(src, resolved)
 			}
 			return result.Name, nil
 		},
 	}
+}
+
+// resolveModuleForTUI resolves a source for the TUI callbacks: for a catalog name
+// it loads from the catalog cache (resolved is nil, no provenance); for an
+// external source it clones/updates the repo and returns the full ResolvedModule.
+func resolveModuleForTUI(src catalog.Source) (manifest *catalog.ServiceManifest, composeSrc string, resolved *catalog.ResolvedModule, err error) {
+	if src.Kind == catalog.KindCatalog {
+		manifest, err = catalog.LoadServiceManifest(src.Name)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		composeSrc, _ = catalog.GetComposeFile(src.Name)
+		return manifest, composeSrc, nil, nil
+	}
+	resolved, err = catalog.ResolveSource(src)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return resolved.Manifest, resolved.ComposePath, resolved, nil
 }

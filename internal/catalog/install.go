@@ -112,6 +112,19 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		return nil, fmt.Errorf("port conflict: port(s) %v already in use", conflicts)
 	}
 
+	// 4b. Check container-name collision. A reinstall of the same module is
+	// already blocked upstream (by the manifest's hasService check), so any
+	// existing container matching this compose's container_name is a foreign
+	// collision -- refuse with a clear escape hatch. Best-effort (skipped if
+	// docker is unavailable).
+	if data, rerr := os.ReadFile(composeSrcPath); rerr == nil {
+		if cn := parseComposeContainerName(string(data)); cn != "" && ContainerNameConflict(cn) {
+			return nil, fmt.Errorf("container name '%s' is already in use by another container; "+
+				"remove it (docker rm -f %s) or override the name via the module's compose before installing '%s'",
+				cn, cn, name)
+		}
+	}
+
 	// 5. Resolve config values (prompt for required ones without defaults only
 	//    when interactive).
 	configValues, err := resolveConfig(manifest.Config, configOverrides, interactive)

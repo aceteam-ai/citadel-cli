@@ -40,20 +40,35 @@ type RegistryEntry struct {
 
 // ServiceManifest is the full definition of a service (service.yaml inside a service dir).
 type ServiceManifest struct {
-	Name        string        `yaml:"name"`
-	Version     string        `yaml:"version"`
-	Description string        `yaml:"description"`
-	Category    string        `yaml:"category"`
-	Author      string        `yaml:"author"`
-	License     string        `yaml:"license"`
-	Homepage    string        `yaml:"homepage"`
-	Requires    Requirements  `yaml:"requires"`
-	Ports       []PortMapping `yaml:"ports"`
-	Config      []ConfigVar   `yaml:"config"`
-	HealthCheck HealthCheck   `yaml:"health_check"`
-	Volumes     []VolumeMount `yaml:"volumes"`
-	Tags        []string      `yaml:"tags"`
+	// SchemaVersion is the manifest schema major version. A zero/absent value
+	// means schema v1. A value newer than CurrentSchemaVersion triggers a
+	// forward-compat warning (but never a hard failure).
+	SchemaVersion int           `yaml:"schema_version"`
+	Name          string        `yaml:"name"`
+	Version       string        `yaml:"version"`
+	Description   string        `yaml:"description"`
+	Category      string        `yaml:"category"`
+	Author        string        `yaml:"author"`
+	License       string        `yaml:"license"`
+	Homepage      string        `yaml:"homepage"`
+	Requires      Requirements  `yaml:"requires"`
+	Ports         []PortMapping `yaml:"ports"`
+	Config        []ConfigVar   `yaml:"config"`
+	HealthCheck   HealthCheck   `yaml:"health_check"`
+	Volumes       []VolumeMount `yaml:"volumes"`
+	// Tags are display/search tags (free-form), used by `catalog list/search`.
+	Tags []string `yaml:"tags"`
+	// NodeTags are namespaced key:value routing tags (e.g. "engine:tei",
+	// "task:embedding", "model:gte-multilingual-base") that are merged into the
+	// node manifest's Node.Tags on install so third-party engines become
+	// routable without a CLI change. Distinct from the display Tags above.
+	NodeTags []string `yaml:"node_tags"`
 }
+
+// CurrentSchemaVersion is the highest service.yaml schema major version this CLI
+// understands. A manifest declaring a higher value is still loaded (best-effort)
+// but the operator is warned it may use fields this CLI ignores.
+const CurrentSchemaVersion = 1
 
 // Requirements describes what a service needs from the host.
 type Requirements struct {

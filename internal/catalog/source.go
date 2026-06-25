@@ -210,43 +210,107 @@ func ModulesCacheDir() string {
 	return filepath.Join(platform.ConfigDir(), "modules")
 }
 
+// ResolvedModule is the result of resolving an external module source: the
+// parsed manifest, the compose path, plus provenance (cache dir, resolved git
+// commit, and the image references parsed from the compose) used for the
+// lockfile and the pre-install confirmation prompt.
+type ResolvedModule struct {
+	Manifest    *ServiceManifest
+	ComposePath string
+	CacheDir    string
+	// Commit is the resolved git HEAD of the cache checkout (or "" if unknown).
+	Commit string
+	// Images are the container image references parsed from the compose file.
+	Images []string
+}
+
 // ResolveSource clones (or updates) the module repo for src into a per-source
-// cache directory and loads its ServiceManifest + compose file path. For a
-// KindCatalog source it returns an error: the caller is expected to delegate
-// catalog names to the existing catalog install path.
-func ResolveSource(src Source) (manifest *ServiceManifest, composePath string, err error) {
+// cache directory and loads its ServiceManifest + compose file path along with
+// provenance (resolved commit + compose image refs). For a KindCatalog source it
+// returns an error: the caller is expected to delegate catalog names to the
+// existing catalog install path.
+func ResolveSource(src Source) (*ResolvedModule, error) {
 	if src.Kind == KindCatalog {
-		return nil, "", fmt.Errorf("source %q is a catalog name; use the catalog path", src.Raw)
+		return nil, fmt.Errorf("source %q is a catalog name; use the catalog path", src.Raw)
 	}
 
 	cacheDir := filepath.Join(ModulesCacheDir(), sanitizeCacheName(src))
 	if err := os.MkdirAll(filepath.Dir(cacheDir), 0755); err != nil {
-		return nil, "", fmt.Errorf("failed to create modules cache directory: %w", err)
+		return nil, fmt.Errorf("failed to create modules cache directory: %w", err)
 	}
 
 	if err := cloneOrUpdate(src, cacheDir); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
-	return loadModuleManifest(cacheDir)
+	manifest, composePath, err := loadModuleManifest(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &ResolvedModule{
+		Manifest:    manifest,
+		ComposePath: composePath,
+		CacheDir:    cacheDir,
+		Commit:      gitHeadCommit(cacheDir),
+	}
+	if data, rerr := os.ReadFile(composePath); rerr == nil {
+		res.Images = parseComposeImages(string(data))
+	}
+	return res, nil
 }
 
-// cloneOrUpdate performs a shallow clone of the source repo into dir, or updates
-// it if dir is already a git repo. Mirrors the style of catalog.Update().
+// cloneStrategy classifies how a source ref must be fetched. It is pure so the
+// decision can be unit-tested without touching git.
+type cloneStrategy int
+
+const (
+	// strategyPlain: no ref pinned -- shallow clone the default branch.
+	strategyPlain cloneStrategy = iota
+	// strategyBranch: a tag/branch ref -- shallow clone with --branch <ref>.
+	strategyBranch
+	// strategyFetchSHA: a raw commit SHA -- clone default branch, then fetch +
+	// checkout the SHA (git clone --branch cannot take a raw SHA).
+	strategyFetchSHA
+)
+
+// pickCloneStrategy returns the strategy for src's ref.
+func pickCloneStrategy(src Source) cloneStrategy {
+	if src.Ref == "" {
+		return strategyPlain
+	}
+	if looksLikeSHA(src.Ref) {
+		return strategyFetchSHA
+	}
+	return strategyBranch
+}
+
+// looksLikeSHA reports whether ref is a 7-40 char hex string (an abbreviated or
+// full git commit SHA). Pure -- table-tested.
+func looksLikeSHA(ref string) bool {
+	if len(ref) < 7 || len(ref) > 40 {
+		return false
+	}
+	for _, r := range ref {
+		isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
+// cloneOrUpdate performs a shallow clone of the source repo into dir (or updates
+// it if dir is already a git repo) and checks out the requested ref. Mirrors the
+// style of catalog.Update().
 func cloneOrUpdate(src Source, dir string) error {
+	strategy := pickCloneStrategy(src)
+
 	if isGitRepo(dir) {
-		// Existing checkout: fetch + reset to the requested ref (or fast-forward
-		// the current branch when no ref is pinned).
+		// Existing checkout: a pinned ref (branch/tag/SHA) is fetched + checked
+		// out; an unpinned source fast-forwards the current branch.
 		if src.Ref != "" {
-			fetch := exec.Command("git", "-C", dir, "fetch", "--depth", "1", "origin", src.Ref)
-			if out, err := fetch.CombinedOutput(); err != nil {
-				return cloneError(src, fmt.Sprintf("git fetch failed: %s", strings.TrimSpace(string(out))))
-			}
-			checkout := exec.Command("git", "-C", dir, "checkout", "FETCH_HEAD")
-			if out, err := checkout.CombinedOutput(); err != nil {
-				return cloneError(src, fmt.Sprintf("git checkout failed: %s", strings.TrimSpace(string(out))))
-			}
-			return nil
+			return fetchAndCheckout(src, dir)
 		}
 		pull := exec.Command("git", "-C", dir, "pull", "--ff-only")
 		if out, err := pull.CombinedOutput(); err != nil {
@@ -261,7 +325,7 @@ func cloneOrUpdate(src Source, dir string) error {
 	}
 
 	args := []string{"clone", "--depth", "1"}
-	if src.Ref != "" {
+	if strategy == strategyBranch {
 		// --branch accepts tags and branches (but not raw SHAs).
 		args = append(args, "--branch", src.Ref)
 	}
@@ -271,16 +335,127 @@ func cloneOrUpdate(src Source, dir string) error {
 	if out, err := clone.CombinedOutput(); err != nil {
 		return cloneError(src, fmt.Sprintf("git clone failed: %s", strings.TrimSpace(string(out))))
 	}
+
+	// A raw SHA cannot be selected at clone time; fetch + checkout it now.
+	if strategy == strategyFetchSHA {
+		return fetchAndCheckout(src, dir)
+	}
 	return nil
 }
 
+// fetchAndCheckout fetches src.Ref into an existing checkout at dir and checks it
+// out. It first tries a shallow fetch (works for branches/tags and, on most git
+// servers, for a SHA); if that fails it falls back to a full fetch (needed when a
+// server refuses to serve an arbitrary SHA shallowly).
+func fetchAndCheckout(src Source, dir string) error {
+	fetch := exec.Command("git", "-C", dir, "fetch", "--depth", "1", "origin", src.Ref)
+	if out, err := fetch.CombinedOutput(); err != nil {
+		// Fall back to a full fetch (drop --depth) before giving up.
+		full := exec.Command("git", "-C", dir, "fetch", "origin", src.Ref)
+		if out2, err2 := full.CombinedOutput(); err2 != nil {
+			return cloneError(src, fmt.Sprintf("git fetch failed: %s",
+				strings.TrimSpace(string(out))+"; "+strings.TrimSpace(string(out2))))
+		}
+	}
+	checkout := exec.Command("git", "-C", dir, "checkout", "FETCH_HEAD")
+	if out, err := checkout.CombinedOutput(); err != nil {
+		return cloneError(src, fmt.Sprintf("git checkout failed: %s", strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+// gitHeadCommit returns the resolved HEAD commit of dir, or "" if it can't be
+// determined (best-effort, for provenance).
+func gitHeadCommit(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// cloneErrorHost extracts a host label from a source's clone URL for the
+// credential hint (e.g. "github.com"). Pure -- table-tested.
+func cloneErrorHost(src Source) string {
+	url := src.CloneURL
+	// Strip scheme.
+	for _, scheme := range []string{"https://", "http://", "ssh://", "git://"} {
+		url = strings.TrimPrefix(url, scheme)
+	}
+	// Drop any userinfo ("git@" / "user@") that precedes the host. This covers
+	// both scp-form "git@host:owner/repo.git" and "ssh://git@host/owner/repo".
+	// Only strip an '@' that comes before the first path separator, so an '@' in
+	// a later path segment is not mistaken for userinfo.
+	sepAt := strings.IndexAny(url, "/:")
+	if at := strings.Index(url, "@"); at >= 0 && (sepAt < 0 || at < sepAt) {
+		url = url[at+1:]
+	}
+	// Take the host up to the first '/' or ':'.
+	if i := strings.IndexAny(url, "/:"); i >= 0 {
+		url = url[:i]
+	}
+	if url == "" {
+		return "the source host"
+	}
+	return url
+}
+
 // cloneError wraps a git failure with guidance about credentials, since a vanilla
-// node has no GitHub auth and cannot clone private source repos.
+// node has no auth and cannot clone private source repos.
 func cloneError(src Source, detail string) error {
+	host := cloneErrorHost(src)
 	return fmt.Errorf("could not fetch module source %q: %s\n"+
-		"   If this is a private repository, this node needs git credentials to clone it:\n"+
-		"   set a GITHUB_TOKEN, configure an SSH key, or set up a git credential helper.",
-		src.Raw, detail)
+		"   If this is a private repository, this node needs git credentials for %s.\n"+
+		"   Fix one of: set a GITHUB_TOKEN env var, configure an SSH key for %s, or\n"+
+		"   set up a git credential helper (e.g. `git credential-store` or `gh auth login`).",
+		src.Raw, detail, host, host)
+}
+
+// parseComposeImages extracts container image references from a compose file's
+// `image:` lines, in order, de-duplicated. Pure -- table-tested.
+func parseComposeImages(compose string) []string {
+	var images []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(compose, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "image:") {
+			continue
+		}
+		val := strings.TrimSpace(strings.TrimPrefix(trimmed, "image:"))
+		val = strings.Trim(val, `"'`)
+		if val == "" || seen[val] {
+			continue
+		}
+		seen[val] = true
+		images = append(images, val)
+	}
+	return images
+}
+
+// parseComposeContainerName extracts the first `container_name:` value from a
+// compose file, or "" if none. Pure -- table-tested.
+func parseComposeContainerName(compose string) string {
+	for _, line := range strings.Split(compose, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "container_name:") {
+			continue
+		}
+		val := strings.TrimSpace(strings.TrimPrefix(trimmed, "container_name:"))
+		return strings.Trim(val, `"'`)
+	}
+	return ""
+}
+
+// SchemaWarning returns a forward-compat warning string if the manifest declares
+// a schema_version newer than this CLI understands, or "" otherwise. Pure so the
+// catalog package stays import-clean; the cmd layer prints it.
+func SchemaWarning(manifest *ServiceManifest) string {
+	if manifest != nil && manifest.SchemaVersion > CurrentSchemaVersion {
+		return fmt.Sprintf("module declares schema_version %d but this CLI understands up to %d; "+
+			"some fields may be ignored -- consider updating citadel.",
+			manifest.SchemaVersion, CurrentSchemaVersion)
+	}
+	return ""
 }
 
 // loadModuleManifest locates and parses the module's service.yaml and resolves
