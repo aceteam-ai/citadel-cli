@@ -29,6 +29,18 @@ const (
 	JobTypeIOSBuild      = "IOS_BUILD"
 	JobTypeAndroidBuild  = "ANDROID_BUILD"
 	JobTypeGomobileBuild = "GOMOBILE_BUILD"
+
+	// JobTypeReconcile is the push-nudge for the node reconcile loop (issue
+	// #353, epic #352). A `reconcile` job on the node's queue triggers an
+	// immediate desired-state reconcile pass so /fabric actions feel instant
+	// (push accelerates; the periodic pull remains the source of truth).
+	//
+	// The handler is INERT unless the reconcile feature is explicitly enabled
+	// (reconcile.Config.Enabled, DISABLED BY DEFAULT) — an existing node that
+	// has not opted into remote management ignores this job. The worker dispatch
+	// is intentionally NOT wired in this increment to avoid touching the live
+	// worker path (see internal/reconcile.HandleReconcileJob).
+	JobTypeReconcile = "RECONCILE"
 )
 
 // Queue names following PR #1105 convention
