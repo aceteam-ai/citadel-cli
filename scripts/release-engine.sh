@@ -411,10 +411,23 @@ run_release() {
     if command -v gh &>/dev/null && [[ -n "${RELEASE_GITHUB_REPO:-}" ]]; then
       step_msg "Creating GitHub Release..."
 
+      # If the project defines a release-notes preamble hook (e.g. to stamp a
+      # wire-protocol compatibility line), write it to a file and prepend it to
+      # the auto-generated notes.
+      local notes_args=("--generate-notes")
+      if declare -F hook_release_notes_preamble &>/dev/null; then
+        local preamble_file
+        preamble_file="$(mktemp)"
+        hook_release_notes_preamble >"$preamble_file" 2>/dev/null || true
+        if [[ -s "$preamble_file" ]]; then
+          notes_args=("--notes-file" "$preamble_file" "--generate-notes")
+        fi
+      fi
+
       local release_args=(
         "--repo" "$RELEASE_GITHUB_REPO"
         "--title" "${RELEASE_TAG_PREFIX}${new_version}"
-        "--generate-notes"
+        "${notes_args[@]}"
       )
 
       # Collect artifacts (hook_artifact may return multiple lines)

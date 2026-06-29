@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime/debug"
 
+	"github.com/aceteam-ai/citadel-cli/internal/protocol"
 	"github.com/spf13/cobra"
 )
 
@@ -29,6 +30,7 @@ var versionCmd = &cobra.Command{
 	Short: "Print the version number of Citadel CLI",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("Citadel CLI version %s\n", Version)
+		fmt.Printf("Fabric protocol: v%d\n", protocol.FabricProtocolVersion)
 	},
 }
 
