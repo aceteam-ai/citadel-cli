@@ -109,6 +109,24 @@ type consumeStatusReporter interface {
 	LastConsumeStatus() int
 }
 
+// fetchErrLogLevel decides whether (and how loudly) a job-fetch failure on the
+// Nth consecutive cycle should be surfaced to the activity log. It returns
+// ("", false) to stay silent. The policy: announce the first blip quietly
+// (info), escalate to a single warning once failures are sustained (== threshold),
+// then re-warn sparingly (every `repeat` cycles) while it keeps failing.
+func fetchErrLogLevel(consecutive, threshold, repeat int) (level string, shouldLog bool) {
+	switch {
+	case consecutive == 1:
+		return "info", true
+	case consecutive == threshold:
+		return "warning", true
+	case consecutive > threshold && repeat > 0 && (consecutive-threshold)%repeat == 0:
+		return "warning", true
+	default:
+		return "", false
+	}
+}
+
 // recordConsumeStatus copies the source's last consume HTTP status and error
 // into the introspection state after each poll cycle.
 func (r *Runner) recordConsumeStatus(pollErr error) {
@@ -200,6 +218,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
 
+	// Job-fetch failures (consume timeouts, transient 5xx during a backend
+	// deploy/failover) are normal and self-healing: the loop just backs off and
+	// retries. Logging each one as a warning floods the activity panel and reads
+	// like the node is broken. Coalesce instead — stay quiet through brief blips,
+	// escalate to a single warning only once failures are sustained, then repeat
+	// sparingly with a running count, and announce recovery.
+	const (
+		sustainedFetchErrThreshold = 5  // cycles before a transient blip becomes a warning
+		sustainedFetchErrRepeat    = 10 // re-warn every N cycles while still failing
+	)
+	consecutiveFetchErrs := 0
+
 runLoop:
 	for {
 		select {
@@ -232,7 +262,16 @@ runLoop:
 				if ctx.Err() != nil {
 					break runLoop // Context cancelled
 				}
-				r.log("warning", "Error fetching job: %v (retry in %s)", err, backoff)
+				consecutiveFetchErrs++
+				if level, ok := fetchErrLogLevel(consecutiveFetchErrs, sustainedFetchErrThreshold, sustainedFetchErrRepeat); ok {
+					if consecutiveFetchErrs == 1 {
+						// First blip in a streak: record quietly (persisted to the
+						// log, info-level so it doesn't alarm) and let backoff retry.
+						r.log(level, "Job fetch retrying (backoff %s): %v", backoff, err)
+					} else {
+						r.log(level, "Job fetching has failed %d cycles in a row: %v", consecutiveFetchErrs, err)
+					}
+				}
 				select {
 				case <-time.After(backoff):
 				case <-ctx.Done():
@@ -246,7 +285,12 @@ runLoop:
 				continue
 			}
 
-			// Reset backoff on success
+			// Reset backoff on success, and announce recovery if we had
+			// previously escalated to a sustained-failure warning.
+			if consecutiveFetchErrs >= sustainedFetchErrThreshold {
+				r.log("success", "Job fetching recovered after %d failed cycles", consecutiveFetchErrs)
+			}
+			consecutiveFetchErrs = 0
 			backoff = time.Second
 
 			if job == nil {
