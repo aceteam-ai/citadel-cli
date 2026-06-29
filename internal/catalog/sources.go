@@ -137,6 +137,13 @@ func ValidateSourceName(name string) error {
 	if name == DefaultSourceName {
 		return fmt.Errorf("%q is reserved for the built-in official source", DefaultSourceName)
 	}
+	// Reject dot-only names ("." / ".." / "...") explicitly: they survive
+	// sanitizePathSegment unchanged (all chars are allowed) but are path-relative
+	// specials. Used as a directory segment, ".." escapes the cache dir, so a
+	// later RemoveSource(name) -> os.RemoveAll could target a parent directory.
+	if strings.Trim(name, ".") == "" {
+		return fmt.Errorf("source name %q is not allowed", name)
+	}
 	if sanitizePathSegment(name) != name {
 		return fmt.Errorf("source name %q contains unsafe characters (use letters, digits, '-', '_', '.')", name)
 	}

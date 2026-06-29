@@ -21,6 +21,9 @@ func TestValidateSourceName(t *testing.T) {
 		{"slash", "a/b", true},
 		{"space", "has space", true},
 		{"semicolon", "a;b", true},
+		{"dot", ".", true},
+		{"dotdot", "..", true},
+		{"triple-dot", "...", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
