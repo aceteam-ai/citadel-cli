@@ -20,30 +20,16 @@ const (
 	defaultSandboxPIDs   = 512
 )
 
-// minimalGPUCaps are the capabilities kept for a GPU module even when the
-// manifest declares none. cap_drop: ALL is generally safe for NVIDIA-runtime
-// containers (GPU access goes through the runtime, not Linux caps), so the
-// default GPU cap set is empty; the NVIDIA device reservation in the BASE
-// compose is what grants the GPU, and the override never touches it. This slice
-// is the documented hook for keeping a known-required cap should a GPU image
-// turn out to need one -- today it is empty by design.
-var minimalGPUCaps = []string{}
-
-// composeRoot is the minimal shape we parse from a base compose to enumerate its
-// service names. A compose may define several services (an app + a db sidecar);
-// the hardening override must target each by name.
-type composeRoot struct {
-	Services map[string]yaml.Node `yaml:"services"`
-}
-
-// GenerateHardeningOverride builds a docker-compose override (a second `-f`
-// file) that applies manifest-declared least-privilege to EVERY service defined
-// in the base compose. It is PURE (string in, string out) and table-tested.
+// GenerateHardeningOverride builds a docker/podman compose override (a second
+// `-f` file) that applies manifest-declared least-privilege to the services of
+// the base compose. It is PURE (string in, string out) and table-tested.
 //
-// Per compose service it sets:
+// Per NON-GPU compose service it sets ONLY the keys the base service does not
+// already declare (inject-only-where-absent, so a module's own explicit choice
+// such as `read_only: false` is preserved rather than clobbered by the `-f`
+// merge):
 //   - security_opt: ["no-new-privileges:true"]
 //   - cap_drop: ["ALL"] then cap_add: only the manifest-declared capabilities
-//     (plus a minimal set for GPU modules, currently empty by design)
 //   - read_only: true plus tmpfs: ["/tmp"] and a tmpfs entry per declared
 //     writable_path (so a read-only rootfs module can still write where it must)
 //   - pids_limit, mem_limit, cpus from sandbox.resources (or conservative
@@ -51,43 +37,54 @@ type composeRoot struct {
 //   - devices: only the manifest-declared host devices (omitted if none)
 //   - network_mode: "host" ONLY if sandbox.host_network is true (never otherwise)
 //
-// GPU safety: the override deliberately emits NO GPU/device-reservation block.
-// The base compose owns the NVIDIA `deploy.resources.reservations.devices`
-// reservation; the override only adds hardening keys, so a legit GPU module
-// (e.g. the TEI embedding service, #343) still starts. Note that docker-compose
-// list-merges sequences, so a base `cap_add` survives this override's
-// `cap_drop: ALL` -- the override mechanism cannot subtract a base directive.
-// That residual escalation is already covered by the #342 privilege gate
-// (cap_add ALL/SYS_ADMIN is Critical and refused without --allow-privileged).
+// GPU EXEMPTION (#348): a service that REQUESTS A GPU (an NVIDIA
+// deploy.resources.reservations.devices entry, a `gpus:` shorthand, or
+// `runtime: nvidia`) is omitted from the override ENTIRELY. The conservative
+// defaults -- a read-only rootfs, dropped capabilities, and especially the 2g
+// memory / 2cpu limits -- break inference/embedding services (vLLM, TEI); the
+// only safe containment for those is to leave them as the module authored them.
+// This per-service exemption is the reason runtime sandboxing of GPU modules was
+// deferred to #348. The base compose owns the GPU reservation regardless; the
+// override never emits a GPU/deploy block.
+//
+// Note that compose list-merges sequences, so a base `cap_add` survives this
+// override's `cap_drop: ALL` -- the override mechanism cannot subtract a base
+// directive. That residual escalation is already covered by the #342 privilege
+// gate (cap_add ALL/SYS_ADMIN is Critical and refused without --allow-privileged).
 func GenerateHardeningOverride(baseComposeYAML string, manifest *ServiceManifest) (string, error) {
-	var root composeRoot
-	if err := yaml.Unmarshal([]byte(baseComposeYAML), &root); err != nil {
+	services, err := decodeComposeServices(baseComposeYAML)
+	if err != nil {
 		return "", fmt.Errorf("failed to parse base compose to enumerate services: %w", err)
 	}
-	if len(root.Services) == 0 {
+	if len(services) == 0 {
 		return "", fmt.Errorf("base compose declares no services: cannot generate a hardening override")
 	}
 
 	spec := SandboxSpec{}
-	gpu := false
 	if manifest != nil {
 		spec = manifest.Sandbox
-		gpu = manifest.Requires.GPU
 	}
 
-	// Resolve the per-service hardening once (identical for every service).
-	svc := buildServiceHardening(spec, gpu)
-
 	// Stable, deterministic output: sort service names.
-	names := make([]string, 0, len(root.Services))
-	for name := range root.Services {
+	names := make([]string, 0, len(services))
+	for name := range services {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	out := map[string]map[string]any{}
 	for _, name := range names {
-		out[name] = svc
+		base := services[name]
+		// GPU/inference services are exempt: omit them from the override so the
+		// hardening defaults never break them. A POSITIVE GPU signal is required
+		// (fail-safe: an ambiguous service is hardened, not exempted).
+		if serviceRequestsGPU(base) {
+			continue
+		}
+		svc := buildServiceHardening(spec, base)
+		if len(svc) > 0 {
+			out[name] = svc
+		}
 	}
 
 	doc := map[string]any{"services": out}
@@ -98,30 +95,46 @@ func GenerateHardeningOverride(baseComposeYAML string, manifest *ServiceManifest
 
 	header := "# Citadel least-privilege sandbox override (auto-generated).\n" +
 		"# Applied to untrusted (Tier 2) modules on top of the base compose via\n" +
-		"#   docker compose -f <name>.yml -f <name>.sandbox.yml up\n" +
+		"#   <runtime> compose -f <name>.yml -f <name>.sandbox.yml up\n" +
 		"# Drops all Linux capabilities, forbids privilege escalation, makes the\n" +
-		"# root filesystem read-only, and caps resources. Edit the module manifest's\n" +
+		"# root filesystem read-only, and caps resources. GPU/inference services are\n" +
+		"# exempt (their defaults would break them). Edit the module manifest's\n" +
 		"# sandbox: block (then reinstall) to declare additional needs.\n"
 	return header + string(data), nil
 }
 
-// buildServiceHardening returns the per-service hardening map applied to every
-// compose service. Pure helper so GenerateHardeningOverride stays small.
-func buildServiceHardening(spec SandboxSpec, gpu bool) map[string]any {
+// buildServiceHardening returns the per-service hardening map for one NON-GPU
+// service. It injects each hardening key ONLY when the base service does not
+// already declare it (inject-only-where-absent), so an explicit base choice is
+// preserved. Pure helper so GenerateHardeningOverride stays small.
+func buildServiceHardening(spec SandboxSpec, base map[string]any) map[string]any {
+	full := buildFullServiceHardening(spec)
+	svc := map[string]any{}
+	for k, v := range full {
+		if _, set := base[k]; set {
+			continue // base already declares it -- preserve the module's choice
+		}
+		svc[k] = v
+	}
+	return svc
+}
+
+// buildFullServiceHardening returns the complete set of hardening keys for a
+// non-GPU service before the inject-only-where-absent filter. Splitting this out
+// keeps the "what hardening looks like" logic separate from the "what is already
+// set" filter.
+func buildFullServiceHardening(spec SandboxSpec) map[string]any {
 	svc := map[string]any{
 		"security_opt": []string{"no-new-privileges:true"},
 		"cap_drop":     []string{"ALL"},
 		"read_only":    true,
 	}
 
-	// Capabilities to keep: declared caps, plus the minimal GPU set for GPU
-	// modules. cap_add is only emitted when there is something to add (an empty
-	// cap_add list is meaningless and noisy).
-	caps := normalizeCaps(spec.Capabilities)
-	if gpu {
-		caps = append(caps, minimalGPUCaps...)
-	}
-	caps = dedupeStrings(caps)
+	// Capabilities to keep: only the manifest-declared caps (GPU services are
+	// exempt from hardening entirely, so no GPU cap set is needed here). cap_add
+	// is only emitted when there is something to add (an empty cap_add list is
+	// meaningless and noisy).
+	caps := dedupeStrings(normalizeCaps(spec.Capabilities))
 	if len(caps) > 0 {
 		svc["cap_add"] = caps
 	}
