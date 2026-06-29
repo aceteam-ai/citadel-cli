@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -567,6 +568,10 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 	// flag + a configured emitter, so this is a no-op until telemetry is wired up
 	// (in ccStartWorker) and never blocks or panics the TUI.
 	telemetry.Emit(level, message)
+
+	// Persist every activity entry to the dated, append-only log file so the
+	// node is always logging — not only when the operator presses a key.
+	clilog.Write(level, message)
 
 	// Update UI if running
 	// Use goroutine to avoid blocking when called from input handlers
@@ -2464,8 +2469,8 @@ func (cc *ControlCenter) showActivityFullScreen() {
 	cc.activityMu.Lock()
 	var sb strings.Builder
 	sb.WriteString("[yellow::b]Activity Log[-:-:-]\n\n")
-	sb.WriteString(fmt.Sprintf("[gray]Session logs are kept in memory (up to 100 entries)[-]\n"))
-	sb.WriteString(fmt.Sprintf("[gray]Press 'l' to copy logs to /tmp/citadel-activity.log[-]\n\n"))
+	sb.WriteString(fmt.Sprintf("[gray]All activity is logged to %s (append-only, one file per day).[-]\n", clilog.Path()))
+	sb.WriteString(fmt.Sprintf("[gray]Press 'l' to save a snapshot of the lines below; run '[white]citadel debug[gray]' for a copy-pasteable bundle.[-]\n\n"))
 
 	if len(cc.activities) == 0 {
 		sb.WriteString("[gray]No activity yet[-]\n")
@@ -2495,7 +2500,7 @@ func (cc *ControlCenter) showActivityFullScreen() {
 	}
 	cc.activityMu.Unlock()
 
-	sb.WriteString("\n[gray]Press Esc to close, 'l' to copy logs[-]")
+	sb.WriteString("\n[gray]Press Esc to close, 'l' to save a snapshot[-]")
 	textView.SetText(sb.String())
 	textView.SetBorder(true).SetTitle(" Activity Log (Full Screen) ")
 
@@ -2519,33 +2524,31 @@ func (cc *ControlCenter) showActivityFullScreen() {
 	cc.app.SetFocus(textView)
 }
 
-// copyActivityLogs copies recent log lines to clipboard
+// copyActivityLogs writes a snapshot of the on-screen activity to a file under
+// the log directory. It deliberately does NOT report "copied to clipboard":
+// on a headless node reached over SSH, the system clipboard (xclip/xsel)
+// writes to the node's X selection, which the operator can never reach. A file
+// path the operator can cat/scp is the only reliable handoff. The full
+// append-only log already lives next to it (see clilog).
 func (cc *ControlCenter) copyActivityLogs() {
-	// Use in-memory activity entries (same source as the 'c' key copy).
-	// This ensures what the user sees on screen is what gets copied.
 	cc.activityMu.Lock()
 	lineCount := len(cc.activities)
 	cc.activityMu.Unlock()
 
 	if lineCount == 0 {
-		cc.AddActivity("info", "No logs to copy")
+		cc.AddActivity("info", "No activity to save")
 		return
 	}
 
 	content := cc.getActivityText()
 
-	// Copy to clipboard
-	if err := cc.copyToClipboard(content); err != nil {
-		// Fall back to file
-		filePath := "/tmp/citadel-logs.txt"
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-			cc.AddActivity("error", fmt.Sprintf("Failed to copy logs: %v", err))
-			return
-		}
-		cc.AddActivity("success", fmt.Sprintf("%d lines saved to %s", lineCount, filePath))
-	} else {
-		cc.AddActivity("success", fmt.Sprintf("%d lines copied to clipboard", lineCount))
+	snapPath := filepath.Join(clilog.Dir(), "activity-snapshot.txt")
+	if err := os.WriteFile(snapPath, []byte(content), 0o644); err != nil {
+		cc.AddActivity("error", fmt.Sprintf("Failed to save activity: %v", err))
+		return
 	}
+
+	cc.AddActivity("success", fmt.Sprintf("Saved %d lines to %s (full log: %s)", lineCount, snapPath, clilog.Path()))
 }
 
 // getNodeText returns plain text representation of node info
