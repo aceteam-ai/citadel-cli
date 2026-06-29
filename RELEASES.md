@@ -691,3 +691,22 @@ Auto-generated log of every release.
   - feat(worker): VNC_ACTIONS job handler to drive desktop click/drag over fabric (#4180) (#326)
 
 
+---
+
+## v2.48.0 — 2026-06-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 65 |
+| Lines added | +2045 |
+
+**Changes:**
+
+  - fix(worker): coalesce self-healing consume failures instead of warning-spamming (#372)
+  - feat(logging): always-on date-based logs + reliable debug copy (#371)
+  - ci: build + vet + gofmt + test on self-hosted ARC runners (#366) (#367)
+  - chore: gofmt -w . (gofmt-clean under Go 1.26.4) (#368)
+  - feat(source): assigned-source resolution + private-source credentials (#354) (#365)
+
+
