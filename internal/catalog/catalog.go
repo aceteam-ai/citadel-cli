@@ -41,6 +41,10 @@ type RegistryEntry struct {
 	GPU         string   `yaml:"gpu"` // "required", "optional", "no"
 	Description string   `yaml:"description"`
 	Tags        []string `yaml:"tags,omitempty"`
+	// Source is the name of the catalog source this entry came from. It is not
+	// read from registry.yaml; the aggregation layer stamps it during a
+	// cross-source load so list/search/info can disambiguate collisions.
+	Source string `yaml:"-"`
 }
 
 // ServiceManifest is the full definition of a service (service.yaml inside a service dir).
@@ -166,24 +170,59 @@ func GetCatalogPath() string {
 	return filepath.Join(platform.ConfigDir(), catalogSubdir)
 }
 
-// IsAvailable returns true if the catalog has been cloned locally.
+// IsAvailable returns true if the default catalog has been cloned locally.
 func IsAvailable() bool {
-	info, err := os.Stat(GetCatalogPath())
+	return dirIsAvailable(GetCatalogPath())
+}
+
+// dirIsAvailable returns true if path exists and is a directory.
+func dirIsAvailable(path string) bool {
+	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }
 
-// Update clones or pulls the catalog repository into the local cache.
+// Update clones or pulls EVERY configured catalog source: the built-in default
+// plus any user-added sources. A failure to update one source does not abort the
+// others; the first error encountered is returned after all sources are tried,
+// so a single broken community repo never blocks refreshing the rest.
 func Update() error {
-	catalogPath := GetCatalogPath()
+	sources, err := resolvedSources()
+	if err != nil {
+		return err
+	}
+
+	var firstErr error
+	for _, src := range sources {
+		if err := updateSource(src); err != nil {
+			wrapped := fmt.Errorf("catalog source %q: %w", src.Name, err)
+			if firstErr == nil {
+				firstErr = wrapped
+			}
+		}
+	}
+	return firstErr
+}
+
+// updateSource clones or pulls a single source's git repo into its cache path.
+func updateSource(src resolvedSource) error {
+	// Resolve the clone URL (expands the owner/repo shorthand for added sources).
+	cloneURL := src.URL
+	if !src.Default {
+		resolved, err := resolveSourceURL(src.URL)
+		if err != nil {
+			return err
+		}
+		cloneURL = resolved
+	}
 
 	// Ensure parent directory exists.
-	if err := os.MkdirAll(filepath.Dir(catalogPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(src.Path), 0755); err != nil {
 		return fmt.Errorf("failed to create catalog parent directory: %w", err)
 	}
 
-	if isGitRepo(catalogPath) {
+	if isGitRepo(src.Path) {
 		// Pull latest changes.
-		cmd := exec.Command("git", "-C", catalogPath, "pull", "--ff-only")
+		cmd := exec.Command("git", "-C", src.Path, "pull", "--ff-only")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git pull failed: %s", strings.TrimSpace(string(output)))
@@ -192,11 +231,11 @@ func Update() error {
 	}
 
 	// Fresh clone. Remove any leftover non-git directory first.
-	if err := os.RemoveAll(catalogPath); err != nil {
+	if err := os.RemoveAll(src.Path); err != nil {
 		return fmt.Errorf("failed to clean catalog directory: %w", err)
 	}
 
-	cmd := exec.Command("git", "clone", "--depth", "1", DefaultCatalogURL, catalogPath)
+	cmd := exec.Command("git", "clone", "--depth", "1", cloneURL, src.Path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git clone failed: %s", strings.TrimSpace(string(output)))
@@ -204,14 +243,46 @@ func Update() error {
 	return nil
 }
 
-// LoadRegistry reads the registry.yaml index file.
-// If registry.yaml is absent, it falls back to scanning service subdirectories.
+// LoadRegistry returns the merged registry across every configured catalog
+// source (the built-in default plus any user-added sources). Each entry's Source
+// field is stamped with the owning source's name. On a name collision the source
+// listed first wins -- the default source, then user-added sources in
+// registration order. If no source has been cloned yet, it returns a
+// catalog-not-found error pointing the operator at `catalog update`.
 func LoadRegistry() (*Registry, error) {
-	catalogPath := GetCatalogPath()
-	if !IsAvailable() {
+	sources, err := resolvedSources()
+	if err != nil {
+		return nil, err
+	}
+
+	var regs []sourceRegistry
+	anyAvailable := false
+	for _, src := range sources {
+		if !dirIsAvailable(src.Path) {
+			continue
+		}
+		anyAvailable = true
+		reg, err := loadRegistryFromPath(src.Path)
+		if err != nil {
+			// A single malformed community source must not take down the whole
+			// catalog (incl. the default). Skip it and warn -- mirroring the
+			// per-source resilience of Update().
+			fmt.Fprintf(os.Stderr, "warning: skipping catalog source %q: %v\n", src.Name, err)
+			continue
+		}
+		regs = append(regs, sourceRegistry{Source: src.Name, Services: reg.Services})
+	}
+
+	if !anyAvailable {
 		return nil, fmt.Errorf("catalog not found. Run 'citadel service catalog update' first")
 	}
 
+	return &Registry{Version: 1, Services: mergeRegistries(regs)}, nil
+}
+
+// loadRegistryFromPath reads the registry.yaml index from a single source's
+// cache path, falling back to scanning service subdirectories when absent.
+func loadRegistryFromPath(catalogPath string) (*Registry, error) {
 	registryPath := filepath.Join(catalogPath, "registry.yaml")
 	data, err := os.ReadFile(registryPath)
 	if err == nil {
@@ -226,15 +297,35 @@ func LoadRegistry() (*Registry, error) {
 	return scanForServices(catalogPath)
 }
 
-// LoadServiceManifest reads a specific service's service.yaml.
+// LoadServiceManifest reads a specific service's service.yaml, searching across
+// every configured catalog source. On a name collision the default source wins,
+// then user-added sources in registration order (matching LoadRegistry).
 func LoadServiceManifest(name string) (*ServiceManifest, error) {
-	catalogPath := GetCatalogPath()
-	manifestPath := filepath.Join(catalogPath, servicesSubdir, name, "service.yaml")
+	sources, err := resolvedSources()
+	if err != nil {
+		return nil, err
+	}
+	for _, src := range sources {
+		manifest, err := loadManifestFromPath(src.Path, name)
+		if err == nil {
+			return manifest, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("service '%s' not found in catalog", name)
+}
 
+// loadManifestFromPath reads a service's service.yaml from a single source's
+// cache path. A missing manifest is reported as an os.IsNotExist error so the
+// cross-source loader can keep searching the next source.
+func loadManifestFromPath(catalogPath, name string) (*ServiceManifest, error) {
+	manifestPath := filepath.Join(catalogPath, servicesSubdir, name, "service.yaml")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("service '%s' not found in catalog", name)
+			return nil, err
 		}
 		return nil, fmt.Errorf("failed to read service manifest: %w", err)
 	}
@@ -246,22 +337,26 @@ func LoadServiceManifest(name string) (*ServiceManifest, error) {
 	return &manifest, nil
 }
 
-// GetComposeFile returns the path to a service's compose.yml inside the catalog.
+// GetComposeFile returns the path to a service's compose.yml, searching across
+// every configured catalog source with the same precedence as LoadRegistry.
 func GetComposeFile(name string) (string, error) {
-	catalogPath := GetCatalogPath()
-	composePath := filepath.Join(catalogPath, servicesSubdir, name, "compose.yml")
-
-	if _, err := os.Stat(composePath); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("compose.yml not found for service '%s'", name)
-		}
-		return "", fmt.Errorf("failed to access compose file: %w", err)
+	sources, err := resolvedSources()
+	if err != nil {
+		return "", err
 	}
-	return composePath, nil
+	for _, src := range sources {
+		composePath := filepath.Join(src.Path, servicesSubdir, name, "compose.yml")
+		if _, err := os.Stat(composePath); err == nil {
+			return composePath, nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to access compose file: %w", err)
+		}
+	}
+	return "", fmt.Errorf("compose.yml not found for service '%s'", name)
 }
 
 // Search filters services by a query string, matching against name, tags, category,
-// and description (case-insensitive).
+// and description (case-insensitive). It searches across all configured sources.
 func Search(query string) ([]RegistryEntry, error) {
 	reg, err := LoadRegistry()
 	if err != nil {

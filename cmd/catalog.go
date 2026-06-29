@@ -58,13 +58,44 @@ var catalogInfoCmd = &cobra.Command{
 	RunE:  runCatalogInfo,
 }
 
-var catalogInstallConfigFlags []string
+var (
+	catalogInstallConfigFlags     []string
+	catalogInstallAllowPrivileged bool
+)
 
 var catalogInstallCmd = &cobra.Command{
 	Use:   "install <name>",
 	Short: "Install a service from the catalog onto this node",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runCatalogInstall,
+}
+
+var catalogAddName string
+
+var catalogAddCmd = &cobra.Command{
+	Use:   "add <git-url>",
+	Short: "Register an additional community catalog source",
+	Long: `Register an additional catalog source -- a git repository laid out like the
+official catalog (a top-level registry.yaml and services/<name>/ subdirectories).
+After adding a source, run 'citadel service catalog update' to fetch it.
+
+The source name defaults to the repository name; override it with --name. The
+built-in official source is always present and is named "default".`,
+	Args: cobra.ExactArgs(1),
+	RunE: runCatalogAdd,
+}
+
+var catalogRemoveCmd = &cobra.Command{
+	Use:   "remove <name>",
+	Short: "Unregister a community catalog source",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runCatalogRemove,
+}
+
+var catalogListSourcesCmd = &cobra.Command{
+	Use:   "list-sources",
+	Short: "List configured catalog sources",
+	RunE:  runCatalogListSources,
 }
 
 func init() {
@@ -74,9 +105,16 @@ func init() {
 	catalogCmd.AddCommand(catalogSearchCmd)
 	catalogCmd.AddCommand(catalogInfoCmd)
 	catalogCmd.AddCommand(catalogInstallCmd)
+	catalogCmd.AddCommand(catalogAddCmd)
+	catalogCmd.AddCommand(catalogRemoveCmd)
+	catalogCmd.AddCommand(catalogListSourcesCmd)
 
 	catalogInstallCmd.Flags().StringArrayVar(&catalogInstallConfigFlags, "set", nil,
 		"Set a config value (e.g. --set MODEL=Qwen/Qwen3-8B)")
+	catalogInstallCmd.Flags().BoolVar(&catalogInstallAllowPrivileged, "allow-privileged", false,
+		"Allow a community-source service whose compose requests privileged/root-equivalent access")
+	catalogAddCmd.Flags().StringVar(&catalogAddName, "name", "",
+		"Name for the source (defaults to the repository name)")
 }
 
 // runCatalogList prints all catalog services in a table with install status.
@@ -98,7 +136,7 @@ func runCatalogList(cmd *cobra.Command, args []string) error {
 	defer w.Flush()
 
 	bold := color.New(color.Bold)
-	bold.Fprintf(w, "SERVICE\tVERSION\tCATEGORY\tGPU\tSTATUS\tDESCRIPTION\n")
+	bold.Fprintf(w, "SERVICE\tVERSION\tCATEGORY\tGPU\tSOURCE\tSTATUS\tDESCRIPTION\n")
 
 	for _, s := range reg.Services {
 		statusStr := color.New(color.FgWhite).Sprint("available")
@@ -106,10 +144,19 @@ func runCatalogList(cmd *cobra.Command, args []string) error {
 			statusStr = color.New(color.FgGreen).Sprint("installed")
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			s.Name, s.Version, s.Category, s.GPU, statusStr, truncate(s.Description, 50))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			s.Name, s.Version, s.Category, s.GPU, sourceLabel(s.Source), statusStr, truncate(s.Description, 50))
 	}
 	return nil
+}
+
+// sourceLabel renders a registry entry's source name for table output, defaulting
+// to the built-in default source name when unset (e.g. legacy single-source).
+func sourceLabel(source string) string {
+	if source == "" {
+		return catalog.DefaultSourceName
+	}
+	return source
 }
 
 // runCatalogSearch prints services matching the query.
@@ -130,7 +177,7 @@ func runCatalogSearch(cmd *cobra.Command, args []string) error {
 	defer w.Flush()
 
 	bold := color.New(color.Bold)
-	bold.Fprintf(w, "SERVICE\tVERSION\tCATEGORY\tGPU\tSTATUS\tDESCRIPTION\n")
+	bold.Fprintf(w, "SERVICE\tVERSION\tCATEGORY\tGPU\tSOURCE\tSTATUS\tDESCRIPTION\n")
 
 	for _, s := range results {
 		statusStr := color.New(color.FgWhite).Sprint("available")
@@ -138,8 +185,8 @@ func runCatalogSearch(cmd *cobra.Command, args []string) error {
 			statusStr = color.New(color.FgGreen).Sprint("installed")
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			s.Name, s.Version, s.Category, s.GPU, statusStr, truncate(s.Description, 50))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			s.Name, s.Version, s.Category, s.GPU, sourceLabel(s.Source), statusStr, truncate(s.Description, 50))
 	}
 	return nil
 }
@@ -155,6 +202,10 @@ func runCatalogInfo(cmd *cobra.Command, args []string) error {
 
 	bold.Print("Name:        ")
 	fmt.Println(manifest.Name)
+	if src := catalogSourceOf(manifest.Name); src != "" {
+		bold.Print("Source:      ")
+		fmt.Println(src)
+	}
 	bold.Print("Version:     ")
 	fmt.Println(manifest.Version)
 	bold.Print("Description: ")
@@ -261,14 +312,19 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 		overrides[parts[0]] = parts[1]
 	}
 
-	// Reject host-provisioned services (no compose.yml, e.g. the Windows-only
-	// "wechat" microservice) before doing any work. Print provisioning guidance
-	// instead of scaffolding node config and a misleading "Installing..." line.
-	if !catalog.IsInstallable(name) {
-		// Confirm the service actually exists; if not, surface the load error.
-		if _, mErr := catalog.LoadServiceManifest(name); mErr != nil {
-			return mErr
-		}
+	// Resolve manifest, compose, and owning source from a SINGLE source
+	// atomically. This is a security invariant: the trust decision must key the
+	// exact compose that gets installed, so a community source cannot shadow a
+	// default service's name to install its own compose under default privileges.
+	resolved, err := catalog.ResolveCatalogService(name)
+	if err != nil {
+		return err
+	}
+
+	// Reject host-provisioned services (no compose.yml in the owning source, e.g.
+	// the Windows-only "wechat" microservice). Print provisioning guidance instead
+	// of scaffolding node config and a misleading "Installing..." line.
+	if resolved.ComposePath == "" {
 		return printNotInstallableGuidance(name)
 	}
 
@@ -286,16 +342,36 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 
 	servicesDir := filepath.Join(configDir, "services")
 
-	fmt.Printf("Installing %s from catalog...\n", name)
+	// Trust level depends on the owning source. The built-in default source is
+	// first-party (Tier 0) and installs as-is. A community source is untrusted
+	// (Tier 2): the install runs through the least-privilege sandbox and the
+	// un-bypassable privilege gate (overridable only with --allow-privileged),
+	// mirroring `citadel module install` of an external git source.
+	untrusted := !catalog.IsDefaultSource(resolved.SourceName)
 
-	result, err := catalog.Install(name, servicesDir, overrides)
+	if untrusted {
+		fmt.Printf("Installing %s from community source '%s'...\n", name, resolved.SourceName)
+	} else {
+		fmt.Printf("Installing %s from catalog...\n", name)
+	}
+
+	// allowPrivileged: trusted (default) sources are exempt from the gate, as
+	// before. Community sources require an explicit --allow-privileged opt-in for
+	// any privileged/root-equivalent compose directive.
+	allowPrivileged := !untrusted || catalogInstallAllowPrivileged
+
+	result, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted)
 	if err != nil {
 		// Defense-in-depth: the up-front IsInstallable check above already
-		// diverts host-provisioned services, but Install also guards this.
+		// diverts host-provisioned services, but InstallFromManifest also guards.
 		if errors.Is(err, catalog.ErrNotInstallable) {
 			return printNotInstallableGuidance(name)
 		}
 		return fmt.Errorf("install failed: %w", err)
+	}
+
+	if result.Sandboxed {
+		fmt.Printf("  Applied least-privilege sandbox: %s\n", result.SandboxOverridePath)
 	}
 
 	// Register in the node manifest using existing helpers.
@@ -356,6 +432,74 @@ func installedServiceSet() map[string]bool {
 		installed[s.Name] = true
 	}
 	return installed
+}
+
+// catalogSourceOf returns the name of the source that owns service `name` (per
+// the merged registry's collision precedence), or "" if it can't be determined.
+func catalogSourceOf(name string) string {
+	reg, err := catalog.LoadRegistry()
+	if err != nil {
+		return ""
+	}
+	for _, e := range reg.Services {
+		if e.Name == name {
+			return sourceLabel(e.Source)
+		}
+	}
+	return ""
+}
+
+// runCatalogAdd registers a new community catalog source.
+func runCatalogAdd(cmd *cobra.Command, args []string) error {
+	url := args[0]
+	name := strings.TrimSpace(catalogAddName)
+	if name == "" {
+		name = catalog.DefaultSourceNameFromURL(url)
+		if name == "" {
+			return fmt.Errorf("could not derive a source name from %q; pass --name", url)
+		}
+	}
+
+	if err := catalog.AddSource(name, url); err != nil {
+		return err
+	}
+
+	fmt.Printf("Added catalog source '%s' (%s).\n", name, url)
+	fmt.Println("Run 'citadel service catalog update' to fetch it.")
+	return nil
+}
+
+// runCatalogRemove unregisters a community catalog source.
+func runCatalogRemove(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	if err := catalog.RemoveSource(name); err != nil {
+		return err
+	}
+	fmt.Printf("Removed catalog source '%s'.\n", name)
+	return nil
+}
+
+// runCatalogListSources lists every configured catalog source.
+func runCatalogListSources(cmd *cobra.Command, args []string) error {
+	sources, err := catalog.ListSources()
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+
+	bold := color.New(color.Bold)
+	bold.Fprintf(w, "NAME\tTYPE\tURL\n")
+
+	for _, s := range sources {
+		typ := "community"
+		if s.Name == catalog.DefaultSourceName {
+			typ = "default"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.Name, typ, s.URL)
+	}
+	return nil
 }
 
 // truncate is defined in mcp.go and reused here.
