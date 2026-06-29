@@ -47,6 +47,18 @@ hook_set_version() {
   true
 }
 
+hook_release_notes_preamble() {
+  # Stamp the fabric wire-protocol compatibility line into the release notes
+  # (issue #363). Read the integer straight from the Go constant so it is never
+  # hand-maintained.
+  local proto
+  proto=$(grep -oE 'FabricProtocolVersion[[:space:]]*=[[:space:]]*[0-9]+' \
+    "$REPO_ROOT/internal/protocol/protocol.go" 2>/dev/null | grep -oE '[0-9]+$')
+  [[ -z "$proto" ]] && return 0
+  echo "**Fabric protocol: v${proto}** — the citadel-cli ↔ aceteam node/control-plane wire-contract version (#363). Bumped only on breaking wire changes, independent of this release version."
+  echo
+}
+
 hook_test() {
   info "Running Go tests..."
   go test ./...
