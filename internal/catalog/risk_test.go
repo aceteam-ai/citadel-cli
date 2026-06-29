@@ -189,13 +189,13 @@ func TestInstallFromManifest_PrivilegedGate(t *testing.T) {
 	servicesDir := filepath.Join(dir, "services")
 
 	// allowPrivileged=false must REFUSE even though interactive=false.
-	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, false); err == nil {
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, false, false); err == nil {
 		t.Fatal("expected refusal for Critical compose without allowPrivileged")
 	}
 
 	// allowPrivileged=true proceeds past the gate (install succeeds: no ports,
 	// no required config, compose copied).
-	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, false)
+	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, false, false)
 	if err != nil {
 		t.Fatalf("expected install to proceed with allowPrivileged=true, got %v", err)
 	}
@@ -213,7 +213,7 @@ func TestInstallFromManifest_CleanComposeNoGate(t *testing.T) {
 	manifest := &ServiceManifest{Name: "clean"}
 	servicesDir := filepath.Join(dir, "services")
 	// A clean compose installs fine even with allowPrivileged=false.
-	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, false); err != nil {
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, false, false); err != nil {
 		t.Fatalf("clean compose should not be gated, got %v", err)
 	}
 }
