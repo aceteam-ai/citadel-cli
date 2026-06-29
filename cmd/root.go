@@ -7,11 +7,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/fatih/color"
@@ -41,64 +40,18 @@ var debugToStderr bool
 // deferredUpdateNotification stores update info when TUI will handle the display
 var deferredUpdateNotification string
 
-// logFile is the file handle for logging
-var logFile *os.File
-var logMu sync.Mutex
-var logInitOnce sync.Once
-var logDir string
-
-// initLogFile initializes the log file with timestamp naming and symlink
-func initLogFile() {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-
-	logDir = filepath.Join(homeDir, ".citadel-cli", "logs")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return
-	}
-
-	// Create timestamped log file: citadel-2026-01-22T11-04-47.log
-	timestamp := time.Now().Format("2006-01-02T15-04-05")
-	logFileName := fmt.Sprintf("citadel-%s.log", timestamp)
-	logPath := filepath.Join(logDir, logFileName)
-
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-
-	logFile = f
-
-	// Create/update symlink to latest log
-	latestLink := filepath.Join(logDir, "latest.log")
-	// Remove existing symlink if present
-	os.Remove(latestLink)
-	// Create new symlink (use relative path for portability)
-	os.Symlink(logFileName, latestLink)
-
-	// Write session header
-	sessionTime := time.Now().Format("15:04:05")
-	fmt.Fprintf(logFile, "[%s] [CITADEL] === Session started ===\n", sessionTime)
-}
-
-// Log writes a message to the log file and optionally to console if debug mode is enabled.
-// This function always writes to the log file, but only prints to console with --debug.
+// Log writes a message to the date-based log file and optionally to the console
+// if debug mode is enabled. It always persists to file (see internal/clilog),
+// but only prints to console with --debug.
 func Log(format string, args ...interface{}) {
-	timeStr := time.Now().Format("15:04:05")
 	msg := fmt.Sprintf(format, args...)
 
-	// Always write to file
-	logMu.Lock()
-	logInitOnce.Do(initLogFile)
-	if logFile != nil {
-		fmt.Fprintf(logFile, "[%s] [CITADEL] %s\n", timeStr, msg)
-	}
-	logMu.Unlock()
+	// Always persist to the dated, append-only log file.
+	clilog.Write("", msg)
 
-	// Print to console only if debug mode is enabled
+	// Print to console only if debug mode is enabled.
 	if debugMode {
+		timeStr := time.Now().Format("15:04:05")
 		if debugToStderr {
 			fmt.Fprintf(os.Stderr, "[%s] [CITADEL] %s\n", timeStr, msg)
 		} else {
