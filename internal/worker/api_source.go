@@ -184,6 +184,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error
 	}
 
 	var lastErr error
+	var lastQueue string
 	errCount := 0
 
 	for i := 0; i < len(queues); i++ {
@@ -204,9 +205,13 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error
 			BlockMs:  perQueueBlockMs,
 		})
 		if err != nil {
-			// Log and skip -- one rejected queue must not block the others.
-			s.log("warning", "consume failed on %s: %v", queue, err)
+			// Skip this queue so one rejected queue can't block the others.
+			// We deliberately do NOT log per-queue here: a transient consume
+			// failure is self-healing and logging it every poll floods the
+			// activity panel. The cycle-level outcome is coalesced by the
+			// runner instead (the queue name is carried in the wrapped error).
 			lastErr = err
+			lastQueue = queue
 			errCount++
 			continue
 		}
@@ -220,7 +225,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error
 
 	// Only propagate error (triggering backoff) if ALL queues failed.
 	if errCount == len(queues) {
-		return nil, fmt.Errorf("all queues failed: %w", lastErr)
+		return nil, fmt.Errorf("all %d queues failed (last: %s): %w", len(queues), lastQueue, lastErr)
 	}
 
 	return nil, nil // No job available on any queue
