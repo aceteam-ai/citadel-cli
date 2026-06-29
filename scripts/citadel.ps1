@@ -1,11 +1,10 @@
 # Citadel CLI Installer for Windows
+#
 # Usage: irm https://get.aceteam.ai/citadel.ps1 | iex
 #
 # Or download and run:
 #   Invoke-WebRequest -Uri https://get.aceteam.ai/citadel.ps1 -OutFile citadel.ps1
 #   .\citadel.ps1
-#
-# Canonical source: scripts/citadel.ps1 (this root copy is kept for backwards compatibility)
 
 param(
     [string]$Version = "latest",
@@ -65,7 +64,7 @@ if ($existingCitadel -and -not $Force) {
     Write-Warning "Citadel is already installed at: $($existingCitadel.Source)"
     Write-Host ""
     Write-Host "To reinstall, run with -Force flag:"
-    Write-Host "  iwr -useb <url> | iex -Force"
+    Write-Host "  irm https://get.aceteam.ai/citadel.ps1 | iex -Force"
     Write-Host ""
     $continue = Read-Host "Continue anyway? (y/N)"
     if ($continue -ne 'y' -and $continue -ne 'Y') {
