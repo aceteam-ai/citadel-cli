@@ -70,7 +70,7 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 	// un-overridable failure). Pass allowPrivileged=true. They are trusted, so
 	// untrusted=false: no sandbox hardening is applied. The module-source path
 	// passes the real flag + trust values.
-	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true, false)
+	return InstallFromManifest(manifest, composeSrc, servicesDir, configOverrides, true, true, false, false)
 }
 
 // InstallFromManifest installs a service from an already-loaded manifest and a
@@ -99,9 +99,16 @@ func Install(name string, servicesDir string, configOverrides map[string]string)
 //
 // Trusted (Tier 0/1) installs pass untrusted=false and are unaffected.
 //
+// skipHardening is the explicit --no-harden opt-out. When true, the hardening
+// override is NOT generated even for an untrusted install -- but bind-mount
+// confinement still applies. This keeps the two containment layers independent:
+// opting out of the override does not silently disable bind-mount confinement
+// (the operator must use --allow-privileged for that). skipHardening is ignored
+// for trusted installs (which never generate an override anyway).
+//
 // An empty composeSrcPath means the service is host-provisioned (no container)
 // and InstallFromManifest returns ErrNotInstallable.
-func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged, untrusted bool) (*InstallResult, error) {
+func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir string, configOverrides map[string]string, interactive, allowPrivileged, untrusted, skipHardening bool) (*InstallResult, error) {
 	name := manifest.Name
 
 	// 1. Reject host-provisioned services up front (no compose.yml).
@@ -217,12 +224,14 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		ComposeDestPath: composeDest,
 	}
 
-	// 6b. Least-privilege sandbox (untrusted/Tier-2 only). Generate a hardening
-	// override from the manifest's declared needs and write it next to the
-	// compose as <name>.sandbox.yml; the run path includes it automatically when
-	// present. Also create the per-module sandbox data dir so the one allowed
-	// bind-mount root exists. Trusted (Tier 0/1) installs skip all of this.
-	if untrusted {
+	// 6b. Least-privilege sandbox (untrusted/Tier-2 only, unless --no-harden).
+	// Generate a hardening override from the manifest's declared needs and write
+	// it next to the compose as <name>.sandbox.yml; the run path includes it
+	// automatically when present. Also create the per-module sandbox data dir so
+	// the one allowed bind-mount root exists. Trusted (Tier 0/1) installs skip all
+	// of this; skipHardening opts an untrusted install out of the override only
+	// (bind-mount confinement above still ran).
+	if untrusted && !skipHardening {
 		baseData, rerr := os.ReadFile(composeDest)
 		if rerr != nil {
 			return nil, fmt.Errorf("failed to read copied compose for sandbox hardening: %w", rerr)

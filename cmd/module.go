@@ -38,6 +38,7 @@ var (
 	moduleInstallConfigFlags []string
 	moduleInstallYes         bool
 	moduleAllowPrivileged    bool
+	moduleNoHarden           bool
 )
 
 var moduleCmd = &cobra.Command{
@@ -94,6 +95,8 @@ func init() {
 		"Skip the ordinary confirmation prompt (does NOT bypass the privileged-compose gate).")
 	moduleInstallCmd.Flags().BoolVar(&moduleAllowPrivileged, "allow-privileged", false,
 		"Allow installing a module whose compose requests privileged/root-equivalent access (required when Critical risks are present).")
+	moduleInstallCmd.Flags().BoolVar(&moduleNoHarden, "no-harden", false,
+		"Skip generating the least-privilege sandbox override for an untrusted module (bind-mount confinement still applies). Use only if the hardening defaults break the module.")
 }
 
 // parseSetFlags converts repeated --set KEY=VALUE flags into an overrides map.
@@ -202,14 +205,20 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 
 	// Untrusted (Tier-2) sources get the least-privilege sandbox: bind-mount
 	// confinement + a generated hardening override. Trusted (Tier 0/1) run as-is.
+	// --no-harden opts out of the override (not the bind-mount confinement).
 	untrusted := !trusted
 	if untrusted {
-		fmt.Printf("\n%s\n", color.YellowString("Applying least-privilege sandbox (drop caps, no-new-privileges, "+
-			"read-only rootfs, resource limits)."))
+		if moduleNoHarden {
+			fmt.Printf("\n%s\n", color.YellowString("--no-harden: skipping the least-privilege sandbox override "+
+				"(bind-mount confinement still applies). GPU/inference services are exempt regardless."))
+		} else {
+			fmt.Printf("\n%s\n", color.YellowString("Applying least-privilege sandbox (drop caps, no-new-privileges, "+
+				"read-only rootfs, resource limits). GPU/inference services are exempt."))
+		}
 	}
 
 	fmt.Printf("\nInstalling %s ...\n", manifest.Name)
-	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged, untrusted)
+	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged, untrusted, moduleNoHarden)
 	if err != nil {
 		return fmt.Errorf("install failed: %w", err)
 	}
@@ -702,7 +711,7 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			// Untrusted (Tier-2) sources get the least-privilege sandbox in the
 			// shared core, matching the CLI path. Catalog/trusted run as-is.
 			untrusted := !catalog.IsTrusted(src)
-			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow, untrusted)
+			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow, untrusted, false)
 			if err != nil {
 				return "", err
 			}

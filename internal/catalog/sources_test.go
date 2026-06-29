@@ -435,13 +435,13 @@ func TestCommunityPrivilegedInstallRefused(t *testing.T) {
 	servicesDir := filepath.Join(t.TempDir(), "services")
 
 	// Untrusted install with allowPrivileged=false must refuse.
-	_, err := InstallFromManifest(manifest, composeSrc, servicesDir, nil, false, false, true)
+	_, err := InstallFromManifest(manifest, composeSrc, servicesDir, nil, false, false, true, false)
 	if err == nil {
 		t.Fatal("expected refusal installing a privileged community compose, got nil")
 	}
 
 	// Same compose as a trusted (default) install is allowed (allowPrivileged=true).
-	if _, err := InstallFromManifest(manifest, composeSrc, servicesDir, nil, false, true, false); err != nil {
+	if _, err := InstallFromManifest(manifest, composeSrc, servicesDir, nil, false, true, false, false); err != nil {
 		t.Errorf("trusted install of privileged compose should succeed, got %v", err)
 	}
 }

@@ -360,7 +360,10 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// any privileged/root-equivalent compose directive.
 	allowPrivileged := !untrusted || catalogInstallAllowPrivileged
 
-	result, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted)
+	// skipHardening is always false here: the catalog-install path has no
+	// --no-harden escape hatch, so untrusted community installs are always
+	// hardened (the safe default for the primary untrusted surface).
+	result, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted, false)
 	if err != nil {
 		// Defense-in-depth: the up-front IsInstallable check above already
 		// diverts host-provisioned services, but InstallFromManifest also guards.

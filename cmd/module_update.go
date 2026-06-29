@@ -166,7 +166,7 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 	// Preserve the recorded sandbox posture across an update: if the module was
 	// installed as untrusted/sandboxed, regenerate its hardening override from the
 	// (possibly changed) new compose so the override never goes stale.
-	res, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false, entry.Sandboxed)
+	res, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, false, entry.Sandboxed, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  re-install failed for %s: %v\n", entry.Name, err)
 		return false
@@ -219,7 +219,7 @@ func rollback(prev catalog.LockEntry, servicesDir string) {
 		fmt.Fprintf(os.Stderr, "  rollback failed to re-resolve previous version: %v\n", err)
 		return
 	}
-	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true, prev.Sandboxed); err != nil {
+	if _, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, nil, false, true, prev.Sandboxed, false); err != nil {
 		fmt.Fprintf(os.Stderr, "  rollback re-install failed: %v\n", err)
 		return
 	}

@@ -211,11 +211,13 @@ func TestGenerateHardeningOverride_HostNetworkOptIn(t *testing.T) {
 	}
 }
 
-// TestGenerateHardeningOverride_GPU encodes the TEI (#343) shape: a GPU module
-// with a NVIDIA device reservation, a model-cache writable path, and a declared
-// device. The override must still be valid, must NOT emit any GPU/deploy block,
-// and must keep cap_drop ALL with an empty (or empty-by-design) cap set.
-func TestGenerateHardeningOverride_GPU(t *testing.T) {
+// TestGenerateHardeningOverride_GPUExempt encodes the TEI (#343) shape: a GPU
+// service with a NVIDIA device reservation. Under #348 a GPU/inference service
+// is EXEMPT from hardening -- the read-only rootfs, cap-drops, and (especially)
+// the 2g/2cpu resource limits break inference. So the override must omit the GPU
+// service entirely (no entry for it at all) and must never emit a GPU/deploy
+// block.
+func TestGenerateHardeningOverride_GPUExempt(t *testing.T) {
 	base := `services:
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:latest
@@ -242,17 +244,126 @@ func TestGenerateHardeningOverride_GPU(t *testing.T) {
 	if strings.Contains(out, "deploy:") || strings.Contains(out, "reservations") || strings.Contains(out, "nvidia") {
 		t.Errorf("override must not emit a GPU/deploy block:\n%s", out)
 	}
-	tei := parseOverride(t, out)["tei"]
-	if cd := strSlice(t, tei["cap_drop"]); !contains2(cd, "ALL") {
-		t.Errorf("GPU module should still cap_drop ALL: %v", cd)
+	// The GPU service must be exempt: no override entry for it.
+	if _, present := parseOverride(t, out)["tei"]; present {
+		t.Errorf("GPU service 'tei' must be exempt (omitted from override):\n%s", out)
 	}
-	// minimalGPUCaps is empty by design -> no cap_add for a GPU module with no
-	// declared caps.
-	if _, present := tei["cap_add"]; present {
-		t.Errorf("GPU module with no declared caps should have no cap_add: %v", tei["cap_add"])
+}
+
+// TestGenerateHardeningOverride_GPUSignals exercises each per-service GPU signal
+// in isolation: each must exempt its service from the override.
+func TestGenerateHardeningOverride_GPUSignals(t *testing.T) {
+	cases := map[string]string{
+		"gpus shorthand": `services:
+  svc:
+    image: x
+    gpus: all
+`,
+		"runtime nvidia": `services:
+  svc:
+    image: x
+    runtime: nvidia
+`,
+		"deploy reservation driver nvidia": `services:
+  svc:
+    image: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+`,
+		"deploy reservation gpu capability": `services:
+  svc:
+    image: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+`,
 	}
-	if tm := strSlice(t, tei["tmpfs"]); !contains2(tm, "/data") {
-		t.Errorf("GPU module writable path /data missing from tmpfs: %v", tm)
+	for name, base := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if _, present := parseOverride(t, out)["svc"]; present {
+				t.Errorf("GPU-signalled service must be exempt:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestGenerateHardeningOverride_MixedGPUAndSidecar is the discriminating case:
+// an untrusted compose with a GPU inference service AND a non-GPU sidecar. The
+// sidecar must be hardened; the GPU service must be untouched (exempt).
+func TestGenerateHardeningOverride_MixedGPUAndSidecar(t *testing.T) {
+	base := `services:
+  inference:
+    image: vllm/vllm-openai:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  proxy:
+    image: nginx:latest
+`
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	svcs := parseOverride(t, out)
+	if _, present := svcs["inference"]; present {
+		t.Errorf("GPU service 'inference' must be exempt (omitted):\n%s", out)
+	}
+	proxy, ok := svcs["proxy"]
+	if !ok {
+		t.Fatalf("non-GPU sidecar 'proxy' must be hardened (present in override):\n%s", out)
+	}
+	if cd := strSlice(t, proxy["cap_drop"]); !contains2(cd, "ALL") {
+		t.Errorf("sidecar should cap_drop ALL: %v", cd)
+	}
+	if ro, _ := proxy["read_only"].(bool); !ro {
+		t.Errorf("sidecar should have read_only true")
+	}
+}
+
+// TestGenerateHardeningOverride_PreservesBaseOverrides verifies the
+// inject-only-where-absent rule: a hardening key the base service already
+// declares is NOT clobbered by the override (so a module's explicit
+// read_only:false / security_opt survives the `-f` merge).
+func TestGenerateHardeningOverride_PreservesBaseOverrides(t *testing.T) {
+	base := `services:
+  app:
+    image: x
+    read_only: false
+    mem_limit: 6g
+    security_opt:
+      - label=disable
+`
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	app := parseOverride(t, out)["app"]
+	// Keys the base set must be absent from the override (not re-injected).
+	if _, present := app["read_only"]; present {
+		t.Errorf("read_only declared in base must not be injected by the override: %v", app["read_only"])
+	}
+	if _, present := app["mem_limit"]; present {
+		t.Errorf("mem_limit declared in base must not be injected: %v", app["mem_limit"])
+	}
+	if _, present := app["security_opt"]; present {
+		t.Errorf("security_opt declared in base must not be injected: %v", app["security_opt"])
+	}
+	// Keys the base did NOT set are still injected.
+	if cd := strSlice(t, app["cap_drop"]); !contains2(cd, "ALL") {
+		t.Errorf("cap_drop (not in base) should still be injected: %v", cd)
 	}
 }
 
@@ -393,7 +504,7 @@ func TestInstallFromManifest_UntrustedWritesSandboxOverride(t *testing.T) {
 	manifest := &ServiceManifest{Name: "mod"}
 
 	// untrusted=true must generate the override and flag the result.
-	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, true)
+	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, true, false)
 	if err != nil {
 		t.Fatalf("install failed: %v", err)
 	}
@@ -423,7 +534,7 @@ func TestInstallFromManifest_TrustedNoSandboxOverride(t *testing.T) {
 	manifest := &ServiceManifest{Name: "mod"}
 
 	// untrusted=false (Tier 0/1): no override, not flagged.
-	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, false)
+	res, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, false, false)
 	if err != nil {
 		t.Fatalf("install failed: %v", err)
 	}
@@ -447,12 +558,12 @@ func TestInstallFromManifest_BindMountConfinement(t *testing.T) {
 	manifest := &ServiceManifest{Name: "mod"}
 
 	// untrusted + !allowPrivileged: must REFUSE.
-	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, true); err == nil {
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, false, true, false); err == nil {
 		t.Fatal("expected refusal for untrusted module bind-mounting outside sandbox dir")
 	}
 
 	// allowPrivileged overrides the confinement.
-	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, true); err != nil {
+	if _, err := InstallFromManifest(manifest, composePath, servicesDir, nil, false, true, true, false); err != nil {
 		t.Fatalf("allow-privileged should bypass bind-mount confinement, got %v", err)
 	}
 
@@ -462,7 +573,7 @@ func TestInstallFromManifest_BindMountConfinement(t *testing.T) {
 	if err := writeFileTest(t, composePath2, body); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := InstallFromManifest(manifest, composePath2, filepath.Join(dir2, "services"), nil, false, true, false); err != nil {
+	if _, err := InstallFromManifest(manifest, composePath2, filepath.Join(dir2, "services"), nil, false, true, false, false); err != nil {
 		t.Fatalf("trusted install should not be bind-confined, got %v", err)
 	}
 }

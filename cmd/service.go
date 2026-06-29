@@ -70,8 +70,17 @@ func startService(serviceName, composeFilePath string) error {
 
 	containerName := "citadel-" + serviceName
 
+	// Resolve the container runtime once (podman rootless preferred over docker;
+	// see catalog.SelectContainerRuntime) and drive every sub-command below
+	// through it, so module containers run under the hardened runtime when
+	// available and fall back to docker otherwise (#348). Engine sub-commands
+	// (inspect/rm) use rt.EngineBin (never the podman-compose wrapper); the
+	// compose-up below uses rt.Bin + rt.ComposePrefix.
+	rt := catalog.SelectContainerRuntime()
+	fmt.Printf("   Container runtime: %s\n", rt.Label())
+
 	// Check if container already exists and its state
-	inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+	inspectCmd := exec.Command(rt.EngineBin, "inspect", "--format", "{{.State.Status}}", containerName)
 	output, err := inspectCmd.Output()
 
 	if err == nil {
@@ -87,7 +96,7 @@ func startService(serviceName, composeFilePath string) error {
 		if forceRecreate {
 			// Force mode: remove the old container and recreate
 			fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-			rmCmd := exec.Command("docker", "rm", "-f", containerName)
+			rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
 			rmCmd.Run() // Ignore errors - container might already be gone
 		} else {
 			// Interactive mode: prompt user
@@ -103,7 +112,7 @@ func startService(serviceName, composeFilePath string) error {
 
 			// Remove the old container before recreating
 			fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-			rmCmd := exec.Command("docker", "rm", "-f", containerName)
+			rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
 			rmCmd.Run() // Ignore errors
 		}
 	}
@@ -133,13 +142,13 @@ func startService(serviceName, composeFilePath string) error {
 	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
 	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
 	// the latter may be a GPU-stripped temp file in a different directory.
-	args := []string{"compose"}
-	args = append(args, composeFileArgs(composeFilePath, actualComposePath)...)
-	args = append(args, "up", "-d")
-	composeCmd := exec.Command("docker", args...)
+	composeArgs := composeFileArgs(composeFilePath, actualComposePath)
+	composeArgs = append(composeArgs, "up", "-d")
+	args := rt.ComposeArgs(composeArgs...)
+	composeCmd := exec.Command(rt.Bin, args...)
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker compose failed: %s", string(output))
+		return fmt.Errorf("%s compose failed: %s", rt.Bin, string(output))
 	}
 	return nil
 }
