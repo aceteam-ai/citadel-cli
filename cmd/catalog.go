@@ -312,14 +312,19 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 		overrides[parts[0]] = parts[1]
 	}
 
-	// Reject host-provisioned services (no compose.yml, e.g. the Windows-only
-	// "wechat" microservice) before doing any work. Print provisioning guidance
-	// instead of scaffolding node config and a misleading "Installing..." line.
-	if !catalog.IsInstallable(name) {
-		// Confirm the service actually exists; if not, surface the load error.
-		if _, mErr := catalog.LoadServiceManifest(name); mErr != nil {
-			return mErr
-		}
+	// Resolve manifest, compose, and owning source from a SINGLE source
+	// atomically. This is a security invariant: the trust decision must key the
+	// exact compose that gets installed, so a community source cannot shadow a
+	// default service's name to install its own compose under default privileges.
+	resolved, err := catalog.ResolveCatalogService(name)
+	if err != nil {
+		return err
+	}
+
+	// Reject host-provisioned services (no compose.yml in the owning source, e.g.
+	// the Windows-only "wechat" microservice). Print provisioning guidance instead
+	// of scaffolding node config and a misleading "Installing..." line.
+	if resolved.ComposePath == "" {
 		return printNotInstallableGuidance(name)
 	}
 
@@ -342,27 +347,20 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// (Tier 2): the install runs through the least-privilege sandbox and the
 	// un-bypassable privilege gate (overridable only with --allow-privileged),
 	// mirroring `citadel module install` of an external git source.
-	source := catalog.SourceOf(name)
-	untrusted := !catalog.IsDefaultSource(source)
+	untrusted := !catalog.IsDefaultSource(resolved.SourceName)
 
 	if untrusted {
-		fmt.Printf("Installing %s from community source '%s'...\n", name, source)
+		fmt.Printf("Installing %s from community source '%s'...\n", name, resolved.SourceName)
 	} else {
 		fmt.Printf("Installing %s from catalog...\n", name)
 	}
-
-	svcManifest, err := catalog.LoadServiceManifest(name)
-	if err != nil {
-		return err
-	}
-	composeSrc, _ := catalog.GetComposeFile(name)
 
 	// allowPrivileged: trusted (default) sources are exempt from the gate, as
 	// before. Community sources require an explicit --allow-privileged opt-in for
 	// any privileged/root-equivalent compose directive.
 	allowPrivileged := !untrusted || catalogInstallAllowPrivileged
 
-	result, err := catalog.InstallFromManifest(svcManifest, composeSrc, servicesDir, overrides, true, allowPrivileged, untrusted)
+	result, err := catalog.InstallFromManifest(resolved.Manifest, resolved.ComposePath, servicesDir, overrides, true, allowPrivileged, untrusted)
 	if err != nil {
 		// Defense-in-depth: the up-front IsInstallable check above already
 		// diverts host-provisioned services, but InstallFromManifest also guards.

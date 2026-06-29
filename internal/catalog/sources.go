@@ -292,6 +292,61 @@ func resolvedSources() ([]resolvedSource, error) {
 	return out, nil
 }
 
+// ResolvedCatalogService is the atomic resolution of a catalog service name to a
+// single owning source: its manifest, compose path, and source name all come
+// from the SAME source. Resolving these together (rather than via three
+// independent cross-source searches) is a security invariant: the trust decision
+// (SourceName) must key the very compose that gets installed, so a community
+// source cannot shadow a default service's name to install its own compose under
+// the default's trusted privileges.
+type ResolvedCatalogService struct {
+	// Manifest is the parsed service.yaml from the owning source.
+	Manifest *ServiceManifest
+	// ComposePath is the compose.yml path in the owning source, or "" when the
+	// service is host-provisioned (no compose.yml) in that source.
+	ComposePath string
+	// SourceName is the owning source (drives the trust decision).
+	SourceName string
+}
+
+// ResolveCatalogService resolves a service name to a single owning source,
+// following the standard precedence (default first, then user-added sources in
+// registration order). The FIRST source that contains the service's service.yaml
+// wins; the manifest AND compose are read from that same source so trust and
+// compose can never come from different sources. A source whose service.yaml is
+// present but unparseable is a hard error (it is the winner -- we do not silently
+// fall through to a lower-precedence source, which would reintroduce the shadow).
+func ResolveCatalogService(name string) (*ResolvedCatalogService, error) {
+	sources, err := resolvedSources()
+	if err != nil {
+		return nil, err
+	}
+	for _, src := range sources {
+		manifestPath := filepath.Join(src.Path, servicesSubdir, name, "service.yaml")
+		if _, statErr := os.Stat(manifestPath); statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to access service manifest for '%s': %w", name, statErr)
+		}
+		manifest, mErr := loadManifestFromPath(src.Path, name)
+		if mErr != nil {
+			return nil, mErr
+		}
+		composePath := ""
+		cp := filepath.Join(src.Path, servicesSubdir, name, "compose.yml")
+		if _, cErr := os.Stat(cp); cErr == nil {
+			composePath = cp
+		}
+		return &ResolvedCatalogService{
+			Manifest:    manifest,
+			ComposePath: composePath,
+			SourceName:  src.Name,
+		}, nil
+	}
+	return nil, fmt.Errorf("service '%s' not found in catalog", name)
+}
+
 // SourceOf returns the name of the catalog source that owns service `name`,
 // following the same precedence the readers use (default first, then user-added
 // sources in registration order). It returns "" if the service is not found in

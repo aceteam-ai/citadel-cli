@@ -339,6 +339,85 @@ func TestSourceOfAndTrust(t *testing.T) {
 	}
 }
 
+// TestResolveCatalogServiceAtomic verifies that manifest, compose, and source
+// are resolved from the SAME source, including the shadow scenario where the
+// default source has the name as host-provisioned (service.yaml, no compose) and
+// a community source defines the same name WITH a compose. The owning source for
+// trust purposes must be the default (first by precedence), and its compose must
+// be empty -- so the install path treats it as host-provisioned and never
+// installs the community compose under default privileges.
+func TestResolveCatalogServiceAtomic(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// Default source: "wechat" host-provisioned (service.yaml only, no compose.yml).
+	hostProvDir := filepath.Join(GetCatalogPath(), servicesSubdir, "wechat")
+	if err := os.MkdirAll(hostProvDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hostProvDir, "service.yaml"), []byte("name: wechat\nversion: 1.0.0\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Community source: "wechat" WITH a privileged compose (the attack).
+	if err := AddSource("evilcat", "https://github.com/evil/cat.git"); err != nil {
+		t.Fatalf("AddSource: %v", err)
+	}
+	evilDir := filepath.Join(sourceCachePath("evilcat"), servicesSubdir, "wechat")
+	if err := os.MkdirAll(evilDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(evilDir, "service.yaml"), []byte("name: wechat\nversion: 9.9.9\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(evilDir, "compose.yml"), []byte("services:\n  wechat:\n    privileged: true\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	resolved, err := ResolveCatalogService("wechat")
+	if err != nil {
+		t.Fatalf("ResolveCatalogService: %v", err)
+	}
+	// Owning source must be the default (precedence), NOT the community source.
+	if resolved.SourceName != DefaultSourceName {
+		t.Errorf("resolved source = %q, want %q (default wins, no shadow)", resolved.SourceName, DefaultSourceName)
+	}
+	// Compose must come from the SAME (default) source, which has none -> empty,
+	// so the install path treats it as host-provisioned (not the evil compose).
+	if resolved.ComposePath != "" {
+		t.Errorf("resolved compose = %q, want empty (default has no compose for wechat)", resolved.ComposePath)
+	}
+	if resolved.Manifest.Version != "1.0.0" {
+		t.Errorf("resolved manifest version = %q, want default's 1.0.0", resolved.Manifest.Version)
+	}
+}
+
+// TestResolveCatalogServiceCommunityRoutesUntrusted verifies that a service
+// existing ONLY in a community source resolves to that source (so the install
+// path routes it as untrusted).
+func TestResolveCatalogServiceCommunityRoutesUntrusted(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	seedService(t, GetCatalogPath(), "official-only", "name: official-only\nversion: 1.0.0\n")
+	if err := AddSource("community", "https://github.com/foo/bar.git"); err != nil {
+		t.Fatalf("AddSource: %v", err)
+	}
+	seedService(t, sourceCachePath("community"), "community-only", "name: community-only\nversion: 2.0.0\n")
+
+	resolved, err := ResolveCatalogService("community-only")
+	if err != nil {
+		t.Fatalf("ResolveCatalogService: %v", err)
+	}
+	if resolved.SourceName != "community" {
+		t.Errorf("resolved source = %q, want community", resolved.SourceName)
+	}
+	if IsDefaultSource(resolved.SourceName) {
+		t.Error("community-only must NOT route as trusted")
+	}
+	if resolved.ComposePath == "" {
+		t.Error("expected a compose path for the community service")
+	}
+}
+
 // TestCommunityPrivilegedInstallRefused verifies that a community-source compose
 // requesting privileged access is refused when installed via the untrusted path
 // (allowPrivileged=false) -- the security routing this feature relies on.
