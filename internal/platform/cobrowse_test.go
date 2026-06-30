@@ -161,6 +161,65 @@ func TestStealthEnabled(t *testing.T) {
 	}
 }
 
+// TestBuildChromeArgs_SoftwareGL checks --disable-gpu is emitted only when the
+// browser runs on a managed (GPU-less) Xvfb virtual display.
+func TestBuildChromeArgs_SoftwareGL(t *testing.T) {
+	on := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, softwareGL: true})
+	if !containsArg(on, "--disable-gpu") {
+		t.Errorf("softwareGL on: missing --disable-gpu in %v", on)
+	}
+	off := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
+	if containsArg(off, "--disable-gpu") {
+		t.Errorf("softwareGL off: --disable-gpu must be absent in %v", off)
+	}
+}
+
+// TestResolveCobrowseDisplay checks the display-mode precedence: a dedicated
+// managed Xvfb by default, an operator-pinned display when EnvCobrowseDisplay is
+// set (trimmed).
+func TestResolveCobrowseDisplay(t *testing.T) {
+	t.Setenv(EnvCobrowseDisplay, "")
+	if mode, d := resolveCobrowseDisplay(); mode != displayManaged || d != "" {
+		t.Errorf("unset: want (managed, \"\"), got (%v, %q)", mode, d)
+	}
+	t.Setenv(EnvCobrowseDisplay, "  :0 ")
+	if mode, d := resolveCobrowseDisplay(); mode != displayExplicit || d != ":0" {
+		t.Errorf("set :0: want (explicit, \":0\"), got (%v, %q)", mode, d)
+	}
+}
+
+// TestXvfbResolution checks the geometry override falls back to the default.
+func TestXvfbResolution(t *testing.T) {
+	t.Setenv(EnvCobrowseResolution, "")
+	if got := xvfbResolution(); got != defaultXvfbResolution {
+		t.Errorf("unset: want %q, got %q", defaultXvfbResolution, got)
+	}
+	t.Setenv(EnvCobrowseResolution, "1280x720x24")
+	if got := xvfbResolution(); got != "1280x720x24" {
+		t.Errorf("set: want 1280x720x24, got %q", got)
+	}
+}
+
+// TestWithDisplay checks DISPLAY is pinned and any inherited DISPLAY /
+// WAYLAND_DISPLAY entries are stripped so the browser targets exactly one X
+// display.
+func TestWithDisplay(t *testing.T) {
+	in := []string{"PATH=/bin", "DISPLAY=:0", "WAYLAND_DISPLAY=wayland-0", "HOME=/home/x"}
+	out := withDisplay(in, ":99")
+	if countPrefixArg(out, "DISPLAY=") != 1 {
+		t.Errorf("want exactly one DISPLAY= entry, got %v", out)
+	}
+	if !containsArg(out, "DISPLAY=:99") {
+		t.Errorf("want DISPLAY=:99, got %v", out)
+	}
+	if hasPrefixArg(out, "WAYLAND_DISPLAY=") {
+		t.Errorf("WAYLAND_DISPLAY must be stripped, got %v", out)
+	}
+	if !containsArg(out, "PATH=/bin") || !containsArg(out, "HOME=/home/x") {
+		t.Errorf("non-display env must be preserved, got %v", out)
+	}
+}
+
 // TestCobrowse_StopWhenNotRunning verifies Stop is a safe no-op with no session
 // and that calling it twice does not panic. The shutdown hook in cmd/work.go
 // relies on this being safe to call unconditionally on every worker exit.

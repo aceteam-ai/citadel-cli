@@ -102,6 +102,7 @@ func statusResult(st platform.CobrowseStatus, err error) ([]byte, error) {
 		"url":        st.URL,
 		"debug_port": st.DebugPort,
 		"profile":    st.Profile,
+		"display":    st.Display,
 		"started_at": st.StartedAt,
 	})
 	if mErr != nil {

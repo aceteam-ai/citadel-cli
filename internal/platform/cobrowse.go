@@ -60,6 +60,29 @@ const EnvCobrowseStealth = "CITADEL_COBROWSE_STEALTH"
 // this when you deliberately want to spoof a specific UA.
 const EnvCobrowseUserAgent = "CITADEL_COBROWSE_USER_AGENT"
 
+// EnvCobrowseDisplay, when set, pins the X display the co-browse browser renders
+// on (e.g. ":0" to share the node's real desktop for a watch-along, or ":99" for
+// a pre-existing virtual display). When UNSET (the default), the manager starts
+// its OWN dedicated Xvfb virtual display. The dedicated display is the better
+// default on two axes:
+//   - Headless nodes (GPU/compute boxes with no monitor and no :0) can run
+//     co-browse at all -- a hardcoded :0 fails there.
+//   - Privacy/isolation: the live VNC view shows ONLY the co-browse browser, not
+//     whatever else is open on the operator's real desktop. Co-browse is meant to
+//     be a throwaway screen the agent drives, not a window onto the user's machine.
+//
+// Set this to ":0" (or the operator's real DISPLAY) to opt back into the legacy
+// shared-desktop behavior.
+const EnvCobrowseDisplay = "CITADEL_COBROWSE_DISPLAY"
+
+// EnvCobrowseResolution overrides the managed Xvfb virtual-display geometry as
+// WIDTHxHEIGHTxDEPTH. Defaults to defaultXvfbResolution.
+const EnvCobrowseResolution = "CITADEL_COBROWSE_RESOLUTION"
+
+// defaultXvfbResolution is the managed virtual-display geometry when
+// EnvCobrowseResolution is unset.
+const defaultXvfbResolution = "1920x1080x24"
+
 // cobrowseLaunchOptions is the full input to buildChromeArgs. Keeping it a plain
 // struct (rather than an interface/registry) is deliberate: a future full
 // CloakBrowser launcher swaps in by constructing different options or by calling
@@ -76,6 +99,11 @@ type cobrowseLaunchOptions struct {
 	// userAgent, when non-empty, overrides the browser User-Agent. Empty means
 	// "use real Chrome's own UA" (recommended -- see EnvCobrowseUserAgent).
 	userAgent string
+	// softwareGL forces software rendering (--disable-gpu). Set when the browser
+	// runs on a dedicated Xvfb virtual display, which has no GPU/GLX -- without it
+	// headed Chromium spawns a GPU process that fails to initialize on Xvfb and
+	// logs churn. Left false when sharing a real display that may have a GPU.
+	softwareGL bool
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -150,6 +178,13 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 	// Emit the merged disable-features exactly once (see note above).
 	args = append(args, "--disable-features="+strings.Join(disableFeatures, ","))
 
+	if opts.softwareGL {
+		// Dedicated Xvfb has no GPU/GLX; force the software path so the GPU
+		// process does not fail to initialize. Page.captureScreenshot still works
+		// via the software compositor.
+		args = append(args, "--disable-gpu")
+	}
+
 	if opts.startURL != "" {
 		args = append(args, opts.startURL)
 	}
@@ -182,6 +217,7 @@ type CobrowseStatus struct {
 	URL       string         `json:"url"`
 	DebugPort int            `json:"debug_port"`
 	Profile   string         `json:"profile"`
+	Display   string         `json:"display,omitempty"`
 	StartedAt string         `json:"started_at,omitempty"`
 }
 
@@ -206,6 +242,14 @@ type CobrowseManager struct {
 	// terminates (whether killed by Stop or crashed on its own). isRunningLocked
 	// consults it so a dead browser is not reported as running.
 	exited chan struct{}
+	// display is the X display the browser renders on (e.g. ":99" for the managed
+	// virtual display, or an operator-pinned ":0"). Reported in status.
+	display string
+	// xvfb is the dedicated Xvfb virtual-display process when one is managed (nil
+	// when an operator-pinned display is used). Owned by this manager: started in
+	// Start(), reaped by xvfbExited, and killed by Stop() AFTER the browser.
+	xvfb       *exec.Cmd
+	xvfbExited chan struct{}
 }
 
 var (
@@ -235,6 +279,101 @@ func findChromium() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no Chromium/Chrome binary found (install google-chrome or chromium)")
+}
+
+// displayMode is how the co-browse browser obtains an X display.
+type displayMode int
+
+const (
+	// displayManaged starts a dedicated Xvfb virtual display (the default).
+	// Headless-safe and isolates the session from the node's real desktop.
+	displayManaged displayMode = iota
+	// displayExplicit uses an operator-pinned DISPLAY verbatim (EnvCobrowseDisplay).
+	displayExplicit
+)
+
+// resolveCobrowseDisplay decides how the browser gets a display from the
+// environment alone. Pure (no I/O) so the precedence is unit-testable without
+// launching an X server: an explicit EnvCobrowseDisplay wins, otherwise a
+// dedicated Xvfb is managed.
+func resolveCobrowseDisplay() (displayMode, string) {
+	if d := strings.TrimSpace(os.Getenv(EnvCobrowseDisplay)); d != "" {
+		return displayExplicit, d
+	}
+	return displayManaged, ""
+}
+
+// xvfbResolution returns the managed virtual-display geometry, honoring
+// EnvCobrowseResolution and falling back to defaultXvfbResolution.
+func xvfbResolution() string {
+	if r := strings.TrimSpace(os.Getenv(EnvCobrowseResolution)); r != "" {
+		return r
+	}
+	return defaultXvfbResolution
+}
+
+// fileExists reports whether a path exists (used to detect live X sockets/locks).
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// findFreeDisplay returns the first display number >= 99 with no X socket or
+// lock file, so the managed Xvfb never collides with an existing server -- the
+// operator's real :0/:1, another node tool, or a prior co-browse Xvfb.
+func findFreeDisplay() int {
+	for n := 99; n < 99+128; n++ {
+		if !fileExists(fmt.Sprintf("/tmp/.X11-unix/X%d", n)) &&
+			!fileExists(fmt.Sprintf("/tmp/.X%d-lock", n)) {
+			return n
+		}
+	}
+	return 99
+}
+
+// startManagedXvfb launches a dedicated Xvfb virtual display and waits for its
+// socket so the browser launch does not race startup. Returns the running
+// command and the ":N" display string; the caller owns reaping (mirroring the
+// Chromium reaper). A missing Xvfb binary yields an actionable error rather than
+// a confusing downstream "CDP not ready" timeout.
+func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
+	if !isCommandAvailable("Xvfb") {
+		return nil, "", fmt.Errorf(
+			"Xvfb not found: install it (e.g. 'apt-get install xvfb') to run headless co-browse, "+
+				"or set %s to an existing X display (e.g. :0)", EnvCobrowseDisplay)
+	}
+	n := findFreeDisplay()
+	display := fmt.Sprintf(":%d", n)
+	cmd := exec.Command("Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return nil, "", fmt.Errorf("launch Xvfb on %s: %w", display, err)
+	}
+	sock := fmt.Sprintf("/tmp/.X11-unix/X%d", n)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if fileExists(sock) {
+			return cmd, display, nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	_ = cmd.Process.Kill()
+	return nil, "", fmt.Errorf("Xvfb on %s did not become ready within 8s", display)
+}
+
+// withDisplay returns env with DISPLAY set to the chosen value and any inherited
+// DISPLAY / WAYLAND_DISPLAY removed, so the headed browser targets exactly the
+// intended X display (and never silently falls onto a Wayland socket).
+func withDisplay(env []string, display string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "DISPLAY=") || strings.HasPrefix(kv, "WAYLAND_DISPLAY=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "DISPLAY="+display)
 }
 
 // IsRunning reports whether the managed browser process is alive.
@@ -290,6 +429,23 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 		return CobrowseStatus{}, err
 	}
 
+	// Resolve the X display the browser renders on. Default: a dedicated Xvfb
+	// virtual display, which (a) works on headless nodes with no :0 and (b)
+	// isolates the session from the operator's real desktop. Opt into a shared
+	// real display by setting EnvCobrowseDisplay (e.g. ":0"). A managed Xvfb runs
+	// without a GPU, so force software rendering for that case.
+	mode, explicitDisplay := resolveCobrowseDisplay()
+	var xvfb *exec.Cmd
+	display := explicitDisplay
+	softwareGL := false
+	if mode == displayManaged {
+		x, d, derr := startManagedXvfb(xvfbResolution())
+		if derr != nil {
+			return CobrowseStatus{}, derr
+		}
+		xvfb, display, softwareGL = x, d, true
+	}
+
 	// Stealth (anti-bot-detection) is ON by default for co-browse; this is the
 	// first citadel-side step toward the full CloakBrowser launch replacing this
 	// plain Chromium launch. Disable via EnvCobrowseStealth for plain behavior.
@@ -299,24 +455,24 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 		startURL:   startURL,
 		stealth:    stealthEnabled(),
 		userAgent:  os.Getenv(EnvCobrowseUserAgent),
+		softwareGL: softwareGL,
 	})
 
 	cmd := exec.Command(chrome, args...)
-	// The browser must render on the SAME X display the node's VNC server
-	// (x11vnc) exposes, so the existing /vnc/... stream shows it to the cockpit.
-	// citadel may run under systemd with no DISPLAY in its env; default to :0
-	// (the conventional x11vnc target) so headed Chromium lands on the streamed
-	// display rather than failing to find one. detectLinuxDisplay() reads the
-	// same DISPLAY var, so this keeps the browser and the VNC view in sync.
-	env := os.Environ()
-	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
-		env = append(env, "DISPLAY=:0")
-	}
-	cmd.Env = env
+	// Pin the browser to the resolved display (managed Xvfb or operator-set), so
+	// the live VNC/desktop view in the cockpit shows exactly this browser. The
+	// managed virtual display means that view is the co-browse browser ALONE,
+	// never the operator's other windows.
+	cmd.Env = withDisplay(os.Environ(), display)
 	// Detach stdio; the browser is long-lived and headed on the node display.
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
+		// Tear down the just-started Xvfb so a failed browser launch does not leak
+		// a virtual display.
+		if xvfb != nil && xvfb.Process != nil {
+			_ = xvfb.Process.Kill()
+		}
 		return CobrowseStatus{}, fmt.Errorf("launch chromium: %w", err)
 	}
 
@@ -326,6 +482,19 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	m.profile = profileDir
 	m.chromePath = chrome
 	m.startedAt = time.Now()
+	m.display = display
+
+	// Own the managed Xvfb lifecycle alongside the browser: reap it so a crash is
+	// observable and Stop() can tear it down without double-Wait.
+	m.xvfb = xvfb
+	if xvfb != nil {
+		xvfbExited := make(chan struct{})
+		m.xvfbExited = xvfbExited
+		go func() {
+			_ = xvfb.Wait()
+			close(xvfbExited)
+		}()
+	}
 
 	// Reaper: own the single Wait() for this process. When Chromium exits (killed
 	// by Stop or crashed on its own), close exited so isRunningLocked stops
@@ -357,6 +526,7 @@ func (m *CobrowseManager) Stop() error {
 		m.cmd = nil
 		m.exited = nil
 		m.driver = DriverAI
+		m.teardownXvfbLocked()
 		return nil
 	}
 	err := m.cmd.Process.Kill()
@@ -371,7 +541,28 @@ func (m *CobrowseManager) Stop() error {
 	m.cmd = nil
 	m.exited = nil
 	m.driver = DriverAI
+	// Tear down the virtual display AFTER the browser so the browser is never
+	// left without a display mid-shutdown.
+	m.teardownXvfbLocked()
 	return err
+}
+
+// teardownXvfbLocked kills the managed Xvfb (if any) and waits, bounded, for the
+// reaper to confirm it exited so no zombie or orphaned virtual display is left.
+// No-op when an operator-pinned display was used (m.xvfb == nil). Caller holds m.mu.
+func (m *CobrowseManager) teardownXvfbLocked() {
+	if m.xvfb != nil && m.xvfb.Process != nil {
+		_ = m.xvfb.Process.Kill()
+		if m.xvfbExited != nil {
+			select {
+			case <-m.xvfbExited:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+	m.xvfb = nil
+	m.xvfbExited = nil
+	m.display = ""
 }
 
 // Handoff transfers control to the human. Idempotent.
@@ -409,6 +600,7 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 		Driver:    m.driver,
 		DebugPort: m.debugPort,
 		Profile:   m.profile,
+		Display:   m.display,
 	}
 	if !m.startedAt.IsZero() {
 		st.StartedAt = m.startedAt.UTC().Format(time.RFC3339)
