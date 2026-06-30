@@ -710,3 +710,22 @@ Auto-generated log of every release.
   - feat(source): assigned-source resolution + private-source credentials (#354) (#365)
 
 
+---
+
+## v2.49.0 — 2026-06-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 36 |
+| Lines added | +3978 |
+
+**Changes:**
+
+  - feat(fabric): report node ActualState to control plane (#353, report-only v1) (#379)
+  - fix: add scripts/citadel.ps1 for get.aceteam.ai redirect (#373)
+  - feat(module): trust-tiered runtime sandboxing (podman-rootless preferred) (#348) (#376)
+  - feat(catalog): community git repos as named catalog sources (#309) (#375)
+  - feat(fabric): declare FABRIC_PROTOCOL_VERSION (#363 Phase 1) (#374)
+
+
