@@ -27,6 +27,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/instance"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -1650,6 +1651,22 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					orgID,
 					Version,
 				)
+
+				// Periodically report the node's ActualState (installed-module
+				// set + per-module health) to the control plane (#353,
+				// report-only v1). Same device-authed client, same opt-out gate
+				// as activity telemetry; node_id is the Headscale hostname so
+				// the server can re-derive org and ignore any payload org claim.
+				if emitter := nodestate.New(nodestate.Config{
+					Poster:    apiSource.Client(),
+					Inspector: nodestate.DockerInspector(),
+					ConfigDir: platform.ConfigDir(),
+					NodeID:    nodeName,
+					Version:   Version,
+				}); emitter != nil {
+					go emitter.Run(ctx)
+					activity("info", "Node-state reporting started")
+				}
 
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
 					Client:          apiSource.Client(),
