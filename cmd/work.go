@@ -23,6 +23,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
@@ -979,6 +980,22 @@ func runWork(cmd *cobra.Command, args []string) {
 			if orgID == "" {
 				fmt.Fprintln(os.Stderr, "   - ⚠️ API status publisher requires org-id (run 'citadel init' first)")
 			} else {
+				// Periodically report ActualState (installed modules + health)
+				// to the control plane (#353, report-only v1). Headless `citadel
+				// work` is the production node entrypoint, so it must report too
+				// — not just the TUI. Same device-authed client and opt-out gate
+				// as activity telemetry; node_id is the Headscale hostname.
+				if emitter := nodestate.New(nodestate.Config{
+					Poster:    apiSource.Client(),
+					Inspector: nodestate.DockerInspector(),
+					ConfigDir: platform.ConfigDir(),
+					NodeID:    nodeName,
+					Version:   Version,
+				}); emitter != nil {
+					go emitter.Run(ctx)
+					fmt.Printf("   - Node-state reporting: every %s\n", nodestate.DefaultInterval)
+				}
+
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
 					Client:          apiSource.Client(),
 					NodeID:          nodeName,
