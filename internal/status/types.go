@@ -41,6 +41,11 @@ type AppInfo struct {
 	Name   string `json:"name"`
 	Status string `json:"status"` // "running", "stopped", "not_found"
 	Port   int    `json:"port,omitempty"`
+
+	// Idle usage signal for LLM-serving apps (e.g. a vLLM catalog app holding
+	// GPU memory). Populated only for running inference apps whose metrics
+	// endpoint could be scraped; omitted otherwise. See IdleState.
+	*IdleState
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
@@ -150,6 +155,12 @@ type ServiceInfo struct {
 	Port   int      `json:"port,omitempty"`
 	Health string   `json:"health,omitempty"` // "healthy", "unhealthy", "unknown"
 	Models []string `json:"models,omitempty"` // For LLM services
+
+	// Idle usage signal for running LLM services. Populated only when the
+	// service is a running inference engine whose metrics endpoint could be
+	// scraped; omitted otherwise. Promotes idle/idle_seconds/last_request_at
+	// to the top level of the JSON object. See IdleState.
+	*IdleState
 }
 
 // HealthResponse is the response for /health endpoint.

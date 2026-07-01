@@ -27,6 +27,7 @@ type Collector struct {
 	startTime      time.Time
 	modelDiscovery *ModelDiscovery
 	capabilities   *NodeCapabilities // cached capabilities (set once at startup)
+	idleTracker    *IdleTracker      // per-service idle detection (aceteam#4472 / citadel #416)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -54,6 +55,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		startTime:      time.Now(),
 		modelDiscovery: NewModelDiscovery(),
 		capabilities:   cfg.Capabilities,
+		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 	}
 }
 
@@ -80,6 +82,23 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 
 	// Collect service status
 	status.Services = c.collectServiceStatus()
+
+	// Collect status for managed serving engines that are running but not
+	// present in the manifest-driven services list (the common case: c.services
+	// is nil in the heartbeat path). This is what surfaces the per-service idle
+	// signal for a running vLLM in the heartbeat (citadel #416). Skip any engine
+	// already reported by the manifest-driven path above to avoid a duplicate
+	// entry when both paths are active.
+	reported := make(map[string]struct{}, len(status.Services))
+	for _, svc := range status.Services {
+		reported[svc.Name] = struct{}{}
+	}
+	for _, eng := range c.collectManagedEngineStatus() {
+		if _, dup := reported[eng.Name]; dup {
+			continue
+		}
+		status.Services = append(status.Services, eng)
+	}
 
 	// Collect installed app status
 	status.Apps = c.collectAppStatus()
@@ -290,6 +309,10 @@ func (c *Collector) collectServiceStatus() []ServiceInfo {
 					info.Health = health
 				}
 			}
+			// Attach the per-service idle signal for engines we can scrape.
+			if idle := c.observeIdle(ctx, svc.Name, svc.Name, svc.Port); idle != nil {
+				info.IdleState = idle
+			}
 		}
 
 		services = append(services, info)
@@ -387,14 +410,56 @@ func (c *Collector) collectAppStatus() []AppInfo {
 
 	for _, installed := range state.Apps {
 		dockerStatus := apps.ContainerStatus(ctx, runner, installed.Name)
-		result = append(result, AppInfo{
+		info := AppInfo{
 			Name:   installed.Name,
 			Status: dockerStatus,
 			Port:   installed.HostPort,
-		})
+		}
+		// Attach the per-service idle signal for running inference apps (e.g. a
+		// vLLM catalog app holding GPU memory). This is the live heartbeat path:
+		// catalog apps are always collected, so the idle signal reaches every
+		// heartbeat without any manifest wiring. The engine is discriminated on
+		// both the app name and its image (e.g. "vllm/vllm-openai"), since a
+		// catalog slug like "llm-server" would not match on name alone.
+		if dockerStatus == "running" && installed.HostPort > 0 {
+			if idle := c.observeIdle(ctx, installed.Name, installed.Name+" "+installed.Image, installed.HostPort); idle != nil {
+				info.IdleState = idle
+			}
+		}
+		result = append(result, info)
 	}
 
 	return result
+}
+
+// observeIdle scrapes the idle signal for a serving engine on the given port.
+// key is the stable per-service identity used to accumulate idle_seconds across
+// calls; hint is a free-text discriminator (name and/or image) used to select
+// the metrics dialect. Returns nil when the hint does not map to a scrapeable
+// engine or the metrics endpoint could not be read, so callers omit the idle
+// fields rather than report a misleading value.
+func (c *Collector) observeIdle(ctx context.Context, key, hint string, port int) *IdleState {
+	engine := idleEngineType(hint)
+	if engine == "" || c.idleTracker == nil {
+		return nil
+	}
+	state, ok := c.idleTracker.Observe(ctx, key, engine, port)
+	if !ok {
+		return nil
+	}
+	return &state
+}
+
+// idleEngineType maps a service/app name-or-image hint to the metrics dialect
+// used for idle detection, or "" when the engine has no scrapeable request
+// signal. Only vLLM exposes the Prometheus request counters + running/waiting
+// gauges this feature relies on; other engines (ollama, llama.cpp) are skipped
+// for now.
+func idleEngineType(hint string) string {
+	if strings.Contains(strings.ToLower(hint), "vllm") {
+		return "vllm"
+	}
+	return ""
 }
 
 // InferServicePort attempts to determine port from service name.
