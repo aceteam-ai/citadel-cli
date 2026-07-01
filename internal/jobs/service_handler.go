@@ -13,6 +13,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
 
@@ -79,8 +80,26 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 
 	svc, ok := h.findService(manifest, svcName)
 	if !ok {
-		return nil, fmt.Errorf("service %q not found in manifest (known: %s)",
-			svcName, h.knownServiceNames(manifest))
+		// The manifest may predate a newly-embedded service (e.g. a node
+		// initialized before "diffusers" existed, then binary-upgraded). The
+		// heartbeat advertises every embedded ServiceMap key as available, so a
+		// deploy can legitimately target a service the runtime manifest never
+		// listed. Reconcile lazily: if the requested service is present in the
+		// embedded ServiceMap, materialize its compose file and additively
+		// register it in citadel.yaml, then proceed. This keeps
+		// advertised == runnable without auto-starting every embedded service at
+		// boot (which additively pre-populating the manifest would cause).
+		// See citadel-cli#413.
+		if _, embedded := embeddedservices.ServiceMap[svcName]; !embedded {
+			return nil, fmt.Errorf("service %q not found in manifest (known: %s)",
+				svcName, h.knownServiceNames(manifest))
+		}
+		var mErr error
+		svc, mErr = h.materializeEmbeddedService(svcName)
+		if mErr != nil {
+			return nil, fmt.Errorf("failed to reconcile embedded service %q: %w", svcName, mErr)
+		}
+		ctx.Log("info", "     - [Job %s] Reconciled embedded service %s into manifest", job.ID, svcName)
 	}
 
 	switch job.Type {
@@ -238,6 +257,127 @@ func (h *ServiceHandler) loadManifest() (*serviceManifest, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// materializeEmbeddedService makes a newly-embedded service (present in the
+// binary's ServiceMap but absent from citadel.yaml) startable on this node. It
+// writes the embedded compose file into ConfigDir/services/<name>.yml (if not
+// already present) and additively registers a service block in citadel.yaml.
+// It returns the resulting manifestService so the caller can proceed with the
+// requested operation. The persist is additive and idempotent: it never removes
+// or overwrites existing services, and preserves the rest of the manifest
+// (node:, capabilities:, comments) untouched.
+func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestService, error) {
+	svc := manifestService{
+		Name:        name,
+		ComposeFile: "services/" + name + ".yml",
+	}
+
+	if err := h.ensureEmbeddedComposeFile(name); err != nil {
+		return manifestService{}, err
+	}
+	if err := h.addServiceToManifestFile(svc); err != nil {
+		return manifestService{}, err
+	}
+	return svc, nil
+}
+
+// ensureEmbeddedComposeFile writes the embedded compose file for name into
+// ConfigDir/services/<name>.yml if it does not already exist. Mirrors
+// cmd.ensureComposeFile (kept here to avoid a jobs -> cmd import).
+func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
+	content, ok := embeddedservices.ServiceMap[name]
+	if !ok {
+		return fmt.Errorf("unknown embedded service: %s", name)
+	}
+	servicesDir := filepath.Join(h.ConfigDir, "services")
+	destPath := filepath.Join(servicesDir, name+".yml")
+	if _, err := os.Stat(destPath); err == nil {
+		return nil // already materialized
+	}
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		return fmt.Errorf("failed to create services directory: %w", err)
+	}
+	// 0600 to protect any sensitive env vars, matching cmd.ensureComposeFile.
+	if err := os.WriteFile(destPath, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write compose file: %w", err)
+	}
+	return nil
+}
+
+// addServiceToManifestFile appends a single service block to the citadel.yaml
+// services list without disturbing the rest of the document. It operates on the
+// raw yaml.Node tree (not the minimal serviceManifest struct) so that node:,
+// capabilities:, and any operator-defined services survive the rewrite -- a
+// struct round-trip would silently drop every field the minimal struct does not
+// model. The operation is idempotent: if a service with the same name already
+// exists, the file is left unchanged.
+func (h *ServiceHandler) addServiceToManifestFile(svc manifestService) error {
+	path := filepath.Join(h.ConfigDir, "citadel.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	// A well-formed citadel.yaml is a document node wrapping a mapping node.
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("unexpected manifest structure in %s", path)
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("manifest root is not a mapping in %s", path)
+	}
+
+	// Locate (or create) the top-level "services" sequence.
+	var servicesSeq *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "services" {
+			servicesSeq = root.Content[i+1]
+			break
+		}
+	}
+	if servicesSeq == nil {
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "services"}
+		servicesSeq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		root.Content = append(root.Content, keyNode, servicesSeq)
+	} else if servicesSeq.Kind != yaml.SequenceNode {
+		// services: present but empty/null -- normalize to an empty sequence.
+		servicesSeq.Kind = yaml.SequenceNode
+		servicesSeq.Tag = "!!seq"
+		servicesSeq.Value = ""
+		servicesSeq.Content = nil
+	}
+
+	// Idempotency: bail if a service with this name is already registered.
+	for _, item := range servicesSeq.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(item.Content); j += 2 {
+			if item.Content[j].Value == "name" && item.Content[j+1].Value == svc.Name {
+				return nil
+			}
+		}
+	}
+
+	entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	entry.Content = append(entry.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: svc.Name},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "compose_file"},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: svc.ComposeFile},
+	)
+	servicesSeq.Content = append(servicesSeq.Content, entry)
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0600)
 }
 
 func (h *ServiceHandler) findService(m *serviceManifest, name string) (manifestService, bool) {
