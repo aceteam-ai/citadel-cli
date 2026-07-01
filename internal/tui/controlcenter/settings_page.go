@@ -124,21 +124,24 @@ func (p *SettingsPage) OnActivate() {
 // OnDeactivate implements Page.
 func (p *SettingsPage) OnDeactivate() {}
 
-// HandleInput implements Page. 'm' toggles mouse control; 'f' toggles fullscreen
-// rendering (the two Mouse & Rendering checkboxes); 'k' toggles keep-awake-on-AC;
-// Space/Enter/'t' toggles the telemetry opt-out.
+// HandleInput implements Page. Numbered toggles (numbers + arrows convention, no
+// letter shortcuts): 1=mouse control, 2=fullscreen rendering, 3=anonymous
+// telemetry opt-out, 4=keep-awake-on-AC. Space/Enter also toggle telemetry.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
-	case event.Key() == tcell.KeyRune && (event.Rune() == 'm' || event.Rune() == 'M'):
+	case event.Key() == tcell.KeyRune && event.Rune() == '1':
 		p.toggleMouse()
 		return nil
-	case event.Key() == tcell.KeyRune && (event.Rune() == 'f' || event.Rune() == 'F'):
+	case event.Key() == tcell.KeyRune && event.Rune() == '2':
 		p.toggleFullscreen()
 		return nil
-	case event.Key() == tcell.KeyRune && (event.Rune() == 'k' || event.Rune() == 'K'):
+	case event.Key() == tcell.KeyRune && event.Rune() == '3':
+		p.toggleTelemetry()
+		return nil
+	case event.Key() == tcell.KeyRune && event.Rune() == '4':
 		p.toggleKeepAwake()
 		return nil
-	case event.Key() == tcell.KeyRune && (event.Rune() == ' ' || event.Rune() == 't' || event.Rune() == 'T'):
+	case event.Key() == tcell.KeyRune && event.Rune() == ' ':
 		p.toggleTelemetry()
 		return nil
 	case event.Key() == tcell.KeyEnter:
@@ -311,13 +314,13 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("                                  [white]• Shift[-]        (most terminals)\n")
 	sb.WriteString("                                  [white]• Fn[-]           (macOS Terminal.app)\n")
 	sb.WriteString("                                  [white]• Option[-]        (iTerm2)\n")
-	sb.WriteString("   [gray]press[-] [yellow::b]m[-:-:-] [gray]to toggle (applies immediately)[-]\n\n")
+	sb.WriteString("   [gray]press[-] [yellow::b]1[-:-:-] [gray]to toggle (applies immediately)[-]\n\n")
 
 	// Checkbox 2: Fullscreen rendering.
 	fullscreenEnabled := p.rendering != nil && p.rendering.Fullscreen
 	sb.WriteString(fmt.Sprintf("   %s [white::b]Fullscreen rendering[-:-:-]     Flicker-free, app-like. Off = output goes to normal\n", checkbox(fullscreenEnabled)))
 	sb.WriteString("                                scrollback (easier to scroll + copy long history).\n")
-	sb.WriteString("   [gray]press[-] [yellow::b]f[-:-:-] [gray]to toggle (saved; restart to apply)[-]\n")
+	sb.WriteString("   [gray]press[-] [yellow::b]2[-:-:-] [gray]to toggle (saved; restart to apply)[-]\n")
 
 	enabled := p.telemetry != nil && p.telemetry.AnonTelemetryEnabled
 
@@ -333,7 +336,7 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   no personal data.\n\n")
 	sb.WriteString("   [white]Why:[-] it helps us debug problems remotely and improve\n")
 	sb.WriteString("   Citadel. Opting out stops [white::b]all[-:-:-] anonymous collection.\n\n")
-	sb.WriteString("   [yellow::b]Space[-:-:-]/[yellow::b]Enter[-:-:-] toggle collection\n")
+	sb.WriteString("   [yellow::b]3[-:-:-] [gray](or[-] [yellow::b]Space[-:-:-]/[yellow::b]Enter[-:-:-][gray])[-] toggle collection\n")
 
 	// -- Keep-awake on AC --
 	keepEnabled := p.keepAwake != nil && p.keepAwake.KeepAwakeOnAC
@@ -351,7 +354,7 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("\n   [white]What it does:[-] holds a system idle-sleep assertion while\n")
 	sb.WriteString("   this node is plugged in, so the laptop stays reachable on the\n")
 	sb.WriteString("   mesh. Released on battery and on exit. Display may still sleep.\n\n")
-	sb.WriteString("   [yellow::b]k[-:-:-] toggle keep-awake\n")
+	sb.WriteString("   [yellow::b]4[-:-:-] toggle keep-awake\n")
 
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")
