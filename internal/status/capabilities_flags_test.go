@@ -72,6 +72,55 @@ func TestCapabilityFlagsJSONContract(t *testing.T) {
 	}
 }
 
+// TestPopulateServicesAdvertisesRunnableSet verifies that AvailableServices is
+// populated with the serving services this build can deploy (embedded
+// ServiceMap keys) so the fabric can schedule engine-specific deploys to
+// capable nodes (aceteam#4483). Asserts concrete known keys rather than
+// comparing to GetAvailableServices() (which would be circular).
+func TestPopulateServicesAdvertisesRunnableSet(t *testing.T) {
+	caps := &NodeCapabilities{}
+	populateServices(caps)
+
+	if len(caps.AvailableServices) == 0 {
+		t.Fatal("AvailableServices should be populated, got empty")
+	}
+
+	set := make(map[string]bool, len(caps.AvailableServices))
+	for _, s := range caps.AvailableServices {
+		set[s] = true
+	}
+	for _, want := range []string{"vllm", "ollama", "diffusers"} {
+		if !set[want] {
+			t.Errorf("AvailableServices missing %q; got %v", want, caps.AvailableServices)
+		}
+	}
+
+	// Sorted output keeps heartbeats deterministic.
+	for i := 1; i < len(caps.AvailableServices); i++ {
+		if caps.AvailableServices[i-1] > caps.AvailableServices[i] {
+			t.Errorf("AvailableServices not sorted: %v", caps.AvailableServices)
+			break
+		}
+	}
+}
+
+// TestAvailableServicesJSONContract verifies the wire format: an
+// "available_services" array nested inside the capabilities object, distinct
+// from the top-level NodeStatus.Services (aceteam#4483).
+func TestAvailableServicesJSONContract(t *testing.T) {
+	caps := &NodeCapabilities{
+		AvailableServices: []string{"diffusers", "ollama", "vllm"},
+	}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"available_services":["diffusers","ollama","vllm"]`) {
+		t.Errorf("capabilities JSON missing available_services array; got %s", got)
+	}
+}
+
 // TestNodeStatusCapabilitiesKeyPresent verifies the capabilities block is
 // emitted under the "capabilities" key on NodeStatus (the heartbeat payload),
 // matching CitadelStatus.capabilities on the backend.
