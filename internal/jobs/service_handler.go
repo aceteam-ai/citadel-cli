@@ -2,6 +2,7 @@
 package jobs
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -373,11 +374,18 @@ func (h *ServiceHandler) addServiceToManifestFile(svc manifestService) error {
 	)
 	servicesSeq.Content = append(servicesSeq.Content, entry)
 
-	out, err := yaml.Marshal(&doc)
-	if err != nil {
+	// Encode with 2-space indent to match the citadel.yaml written by
+	// `citadel init` (yaml.v3's default is 4), keeping the reconciled diff minimal.
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
 		return err
 	}
-	return os.WriteFile(path, out, 0600)
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0600)
 }
 
 func (h *ServiceHandler) findService(m *serviceManifest, name string) (manifestService, bool) {
