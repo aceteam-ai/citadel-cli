@@ -37,7 +37,7 @@ const (
 //   - devices: only the manifest-declared host devices (omitted if none)
 //   - network_mode: "host" ONLY if sandbox.host_network is true (never otherwise)
 //
-// GPU EXEMPTION (#348): a service that REQUESTS A GPU (an NVIDIA
+// GPU EXEMPTION (#348, gated by #377): a service that REQUESTS A GPU (an NVIDIA
 // deploy.resources.reservations.devices entry, a `gpus:` shorthand, or
 // `runtime: nvidia`) is omitted from the override ENTIRELY. The conservative
 // defaults -- a read-only rootfs, dropped capabilities, and especially the 2g
@@ -47,11 +47,19 @@ const (
 // deferred to #348. The base compose owns the GPU reservation regardless; the
 // override never emits a GPU/deploy block.
 //
+// The exemption additionally REQUIRES hostHasGPU (#377). The GPU signal is
+// author-controlled: an untrusted module can declare `gpus:`/`runtime: nvidia`/
+// deploy-devices in its compose to dodge hardening even on a node with NO GPU.
+// So the exemption only applies when the HOST actually has a GPU; on a GPU-less
+// node a "GPU" service is hardened like everything else (fail-safe). The caller
+// passes hostHasGPU from CheckGPU(), which reports false on any detection error
+// -- the safe direction (harden).
+//
 // Note that compose list-merges sequences, so a base `cap_add` survives this
 // override's `cap_drop: ALL` -- the override mechanism cannot subtract a base
 // directive. That residual escalation is already covered by the #342 privilege
 // gate (cap_add ALL/SYS_ADMIN is Critical and refused without --allow-privileged).
-func GenerateHardeningOverride(baseComposeYAML string, manifest *ServiceManifest) (string, error) {
+func GenerateHardeningOverride(baseComposeYAML string, manifest *ServiceManifest, hostHasGPU bool) (string, error) {
 	services, err := decodeComposeServices(baseComposeYAML)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse base compose to enumerate services: %w", err)
@@ -77,8 +85,11 @@ func GenerateHardeningOverride(baseComposeYAML string, manifest *ServiceManifest
 		base := services[name]
 		// GPU/inference services are exempt: omit them from the override so the
 		// hardening defaults never break them. A POSITIVE GPU signal is required
-		// (fail-safe: an ambiguous service is hardened, not exempted).
-		if serviceRequestsGPU(base) {
+		// AND the host must actually have a GPU (#377) -- the compose GPU signal is
+		// author-controlled, so it cannot be trusted to grant exemption on a
+		// GPU-less node. Fail-safe: an ambiguous service, or a "GPU" service on a
+		// GPU-less host, is hardened rather than exempted.
+		if serviceRequestsGPU(base) && hostHasGPU {
 			continue
 		}
 		svc := buildServiceHardening(spec, base)
