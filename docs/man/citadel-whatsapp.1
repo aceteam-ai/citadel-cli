@@ -1,0 +1,43 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-whatsapp - Deploy and manage the WhatsApp bridge community module
+
+
+.SH SYNOPSIS
+\fBcitadel whatsapp [flags]\fP
+
+
+.SH DESCRIPTION
+Deploy the multi-tenant WhatsApp (Baileys) bridge as a Citadel-managed
+community module and link a phone by scanning a pairing QR.
+
+.PP
+The bridge runs as a two-container stack (bridge + embedded Postgres for
+Baileys auth state) on this node and is reachable by the AceTeam backend over
+the secure mesh network at http://:\&.
+
+.PP
+Typical flow:
+  citadel whatsapp up           # deploy + start + mint a tenant + show QR
+  # scan the QR with WhatsApp -> Linked Devices -> Link a Device
+  # then register it from aceteam with the whatsapp_connect MCP tool
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for whatsapp
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-whatsapp-connect(1)\fP, \fBcitadel-whatsapp-down(1)\fP, \fBcitadel-whatsapp-qr(1)\fP, \fBcitadel-whatsapp-status(1)\fP, \fBcitadel-whatsapp-up(1)\fP

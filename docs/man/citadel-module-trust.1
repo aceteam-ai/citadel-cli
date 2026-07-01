@@ -1,0 +1,51 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module-trust - Trust a module source (owner/repo, owner/*, or a host), or list trusted sources with --list
+
+
+.SH SYNOPSIS
+\fBcitadel module trust [pattern] [flags]\fP
+
+
+.SH DESCRIPTION
+Trust a module source (owner/repo, owner/*, or a host), or list trusted sources with --list
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for trust
+
+.PP
+\fB--identity\fP=""
+	Expected keyless cosign signing identity (e.g. an email or GitHub Actions workflow URI).
+
+.PP
+\fB--issuer\fP=""
+	Expected keyless cosign OIDC issuer (e.g. https://token.actions.githubusercontent.com). Used with --identity.
+
+.PP
+\fB--key\fP=""
+	Path/URL/KMS URI to a cosign public key for keyful signature verification.
+
+.PP
+\fB--list\fP[=false]
+	List the trusted-source patterns instead of adding one.
+
+.PP
+\fB--require-signature\fP[=false]
+	Mark this source as a verified publisher and require a valid cosign image signature at install time.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-module(1)\fP

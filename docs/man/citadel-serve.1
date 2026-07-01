@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-serve - Start the HTTPS gateway for this node (standalone)
@@ -62,6 +62,10 @@ tsnet.ListenTLS for automatic public certs.
 .PP
 \fB--cert-dir\fP=""
 	Custom directory for TLS certificates
+
+.PP
+\fB--embedding-port\fP=8102
+	Port of the local TEI embedding service (/v1/embeddings upstream)
 
 .PP
 \fB-h\fP, \fB--help\fP[=false]

@@ -1,0 +1,59 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-whatsapp-up - Deploy, start, and provision the WhatsApp bridge
+
+
+.SH SYNOPSIS
+\fBcitadel whatsapp up [flags]\fP
+
+
+.SH DESCRIPTION
+Deploy, start, and provision the WhatsApp bridge
+
+
+.SH OPTIONS
+\fB--api-key\fP=""
+	Admin secret (ADMIN_API_KEY) for the bridge control plane. A strong one is generated if omitted.
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for up
+
+.PP
+\fB--image\fP=""
+	Override the bridge container image (BRIDGE_IMAGE). Defaults to the image declared by the module source.
+
+.PP
+\fB--port\fP=8080
+	Host port to publish the bridge on.
+
+.PP
+\fB--proxy\fP=""
+	Optional egress proxy for the tenant (socks5:// or http(s)://).
+
+.PP
+\fB--public-url\fP=""
+	Optional public base URL of the bridge, used only for copy-pasteable QR links.
+
+.PP
+\fB--source\fP="sunapi386/whatsapp-bridge"
+	Module source for the bridge compose: owner/repo[@ref] or a git URL. The default (sunapi386/whatsapp-bridge) is a PRIVATE repo, so this node needs git credentials (GITHUB_TOKEN or an SSH key) to clone it and a docker login to pull its private image.
+
+.PP
+\fB--tenant\fP="default"
+	Tenant name (label only).
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-whatsapp(1)\fP

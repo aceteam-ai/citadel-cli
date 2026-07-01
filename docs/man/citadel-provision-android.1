@@ -1,0 +1,67 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-provision-android - Prepare this node to run Android builds
+
+
+.SH SYNOPSIS
+\fBcitadel provision android [flags]\fP
+
+
+.SH DESCRIPTION
+Configure the Android SDK so this node can run ANDROID_BUILD jobs.
+
+.PP
+Steps performed:
+  - Resolve the SDK location (--sdk-root, else ANDROID_HOME).
+  - Accept SDK licenses via sdkmanager --licenses (with --accept-licenses).
+  - Install requested SDK packages via sdkmanager (with --package).
+
+.PP
+Use --dry-run to print every command without executing it.
+
+.PP
+Examples:
+  # Accept licenses and install build-tools/platform
+  citadel provision android --accept-licenses \\
+    --package "platform-tools" --package "platforms;android-34" \\
+    --package "build-tools;34.0.0"
+
+.PP
+# Print the plan only
+  citadel provision android --dry-run --sdk-root ~/Library/Android/sdk --accept-licenses
+
+
+.SH OPTIONS
+\fB--accept-licenses\fP[=false]
+	Accept Android SDK licenses via sdkmanager --licenses
+
+.PP
+\fB--dry-run\fP[=false]
+	Print the provisioning commands without executing them
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for android
+
+.PP
+\fB--package\fP=[]
+	SDK package to install, e.g. 'platform-tools' (repeatable)
+
+.PP
+\fB--sdk-root\fP=""
+	Android SDK location (defaults to ANDROID_HOME)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-provision(1)\fP

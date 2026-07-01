@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module-install - Install a service module from a catalog name, owner/repo, or git URL
+
+
+.SH SYNOPSIS
+\fBcitadel module install  [flags]\fP
+
+
+.SH DESCRIPTION
+Install a service module from a catalog name, owner/repo, or git URL
+
+
+.SH OPTIONS
+\fB--allow-privileged\fP[=false]
+	Allow installing a module whose compose requests privileged/root-equivalent access (required when Critical risks are present).
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for install
+
+.PP
+\fB--no-harden\fP[=false]
+	Skip generating the least-privilege sandbox override for an untrusted module (bind-mount confinement still applies). Use only if the hardening defaults break the module.
+
+.PP
+\fB--set\fP=[]
+	Set a config value (e.g. --set KEY=VALUE). Repeatable.
+
+.PP
+\fB--yes\fP[=false]
+	Skip the ordinary confirmation prompt (does NOT bypass the privileged-compose gate).
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-module(1)\fP

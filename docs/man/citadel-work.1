@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-work - Start services and run the job worker (primary node command)
@@ -51,6 +51,10 @@ Examples:
 
 
 .SH OPTIONS
+\fB--allow-read-outside-workspace\fP[=false]
+	Allow read-only file ops to access paths outside the workspace sandbox (or set CITADEL_ALLOW_READ_OUTSIDE_WORKSPACE=true)
+
+.PP
 \fB--api-key\fP=""
 	API key for authentication (or set CITADEL_API_KEY env)
 
@@ -89,6 +93,10 @@ Examples:
 .PP
 \fB--gateway-cert-dir\fP=""
 	Custom directory for gateway TLS certificates
+
+.PP
+\fB--gateway-embedding-port\fP=8102
+	Local TEI embedding service port (/v1/embeddings upstream)
 
 .PP
 \fB--gateway-port\fP=8443
@@ -173,6 +181,10 @@ Examples:
 .PP
 \fB--terminal-port\fP=7860
 	Terminal server port (default: 7860)
+
+.PP
+\fB--wait-services\fP[=false]
+	Block until all manifest services are up before subscribing to job streams (default: start services asynchronously)
 
 .PP
 \fB--workspace\fP=""

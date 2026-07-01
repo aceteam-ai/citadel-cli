@@ -7,27 +7,27 @@ class Citadel < Formula
   desc "CLI agent for the AceTeam Sovereign Compute Fabric"
   homepage "https://aceteam.ai"
   license "Apache-2.0"
-  version "2.40.0"
+  version "2.55.0"
 
   on_macos do
     on_arm do
       url "https://github.com/aceteam-ai/citadel-cli/releases/download/v#{version}/citadel_v#{version}_darwin_arm64.tar.gz"
-      sha256 "aac5a8878a91d4a6428103e06de26ac39954bf50b184db839029aca5cd6489f9"
+      sha256 "85d165955d89eff726d9c2a8b743d4800be14fd84acc45e795a21747a5b7d9bf"
     end
     on_intel do
       url "https://github.com/aceteam-ai/citadel-cli/releases/download/v#{version}/citadel_v#{version}_darwin_amd64.tar.gz"
-      sha256 "7920c313d5e4f2f2b0620624128f591b563c113bdf21c4dff9bdb3ff08ed601c"
+      sha256 "45527e6eed7b0ccf808615f02c6e86822c723b17687c2d522aece8858fcc470e"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/aceteam-ai/citadel-cli/releases/download/v#{version}/citadel_v#{version}_linux_arm64.tar.gz"
-      sha256 "a4b1ede9e66eadb5d2f0d0b91ff84c727ee3c60ab5e6b61e632276f801117493"
+      sha256 "82a54eb76d2a8d4a4d816250952cc309d29fbbe57f7be43ea0314b1170f10927"
     end
     on_intel do
       url "https://github.com/aceteam-ai/citadel-cli/releases/download/v#{version}/citadel_v#{version}_linux_amd64.tar.gz"
-      sha256 "afb6caa0fec7cfe761178f01cb6f7a67d602bef5b541653c8acb5fbd27179c33"
+      sha256 "b4ec4e7be88e4fac4d761ad47a0114d45bd94ed0f59b441e0e2cf5cf7dde70cb"
     end
   end
 

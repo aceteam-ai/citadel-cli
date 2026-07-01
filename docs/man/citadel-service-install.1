@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-service-install - Install Citadel as a system service
@@ -10,20 +10,28 @@ citadel-service-install - Install Citadel as a system service
 
 
 .SH DESCRIPTION
-Install Citadel as a system service that runs in the background.
+Install Citadel as a managed background service that runs on boot.
 
 .PP
-On Linux: Creates a systemd service unit
-On macOS: Creates a launchd plist
-On Windows: Creates a Windows Service
+By default installs as a user service (no root/admin required on Linux/macOS).
+Use --system to install as a system-wide service (requires root/admin).
 
 .PP
-The service will start automatically on boot and keep your node connected to the AceTeam Network.
+The service runs "citadel work" with the CITADEL_SERVICE=true environment
+variable set, enabling auto-restart on failure and boot-time startup.
 
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
 	help for install
+
+.PP
+\fB--system\fP[=false]
+	Install as a system-wide service (requires root/admin)
+
+.PP
+\fB--user\fP[=false]
+	Install as a user service (default on Linux/macOS)
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS

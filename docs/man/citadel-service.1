@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jun 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-service - Manage Citadel as a system service
@@ -14,6 +14,11 @@ Install, uninstall, start, stop, or check the status of Citadel as a system serv
 
 .PP
 This allows Citadel to run in the background and start automatically on boot.
+
+.PP
+On Linux:   Creates a systemd unit (user unit by default, --system for system-wide)
+On macOS:   Creates a launchd plist (user agent by default, --system for daemon)
+On Windows: Creates a Windows Service (always system-wide)
 
 
 .SH OPTIONS

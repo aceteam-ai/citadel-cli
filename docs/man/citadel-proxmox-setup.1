@@ -1,0 +1,67 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-proxmox-setup - Configure Proxmox VE connection
+
+
+.SH SYNOPSIS
+\fBcitadel proxmox setup [flags]\fP
+
+
+.SH DESCRIPTION
+Configure the connection to a Proxmox VE server.
+
+.PP
+The connection is tested before saving. API token authentication is recommended
+over password auth because tokens don't expire and can be scoped to specific
+permissions.
+
+.PP
+To create an API token in Proxmox:
+  1. Go to Datacenter > Permissions > API Tokens
+  2. Add a new token for your user (e.g., root@pam)
+  3. Uncheck "Privilege Separation" for full access
+  4. Copy the token ID and secret
+
+.PP
+Examples:
+  # Setup with API token (recommended)
+  citadel proxmox setup \\
+    --url https://192.168.2.4:8006 \\
+    --token-id "root@pam!citadel" \\
+    --token-secret "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+.PP
+# Just test connection with existing config
+  citadel proxmox setup
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for setup
+
+.PP
+\fB--token-id\fP=""
+	API token ID (e.g., root@pam!citadel)
+
+.PP
+\fB--token-secret\fP=""
+	API token secret (UUID)
+
+.PP
+\fB--url\fP=""
+	Proxmox VE URL (e.g., https://192.168.2.4:8006)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-proxmox(1)\fP

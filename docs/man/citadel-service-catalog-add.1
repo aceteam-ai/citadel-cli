@@ -1,0 +1,41 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-catalog-add - Register an additional community catalog source
+
+
+.SH SYNOPSIS
+\fBcitadel service catalog add  [flags]\fP
+
+
+.SH DESCRIPTION
+Register an additional catalog source -- a git repository laid out like the
+official catalog (a top-level registry.yaml and services// subdirectories).
+After adding a source, run 'citadel service catalog update' to fetch it.
+
+.PP
+The source name defaults to the repository name; override it with --name. The
+built-in official source is always present and is named "default".
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for add
+
+.PP
+\fB--name\fP=""
+	Name for the source (defaults to the repository name)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-service-catalog(1)\fP

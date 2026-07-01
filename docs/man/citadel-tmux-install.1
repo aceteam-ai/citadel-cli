@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-tmux-install - Download, verify, and install a Citadel-managed tmux binary
+
+
+.SH SYNOPSIS
+\fBcitadel tmux install [flags]\fP
+
+
+.SH DESCRIPTION
+Download a Citadel-managed static tmux build for this platform, verify its
+SHA-256 checksum, and install it to the Citadel-managed path so persistent
+terminal sessions work without a system tmux.
+
+.PP
+The downloaded artifact's checksum is always verified before install, and the
+binary is never executed as part of verification.
+
+.PP
+Not every platform has a vetted static tmux artifact yet (macOS and Windows in
+particular). On gated platforms this command reports that no artifact is
+available; install tmux via your package manager instead (e.g. on macOS:
+\&'brew install tmux').
+
+
+.SH OPTIONS
+\fB--force\fP[=false]
+	Reinstall even if a managed tmux binary already exists
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for install
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-tmux(1)\fP

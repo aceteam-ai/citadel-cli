@@ -1,0 +1,38 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-tmux - Manage the Citadel-managed tmux binary for persistent terminal sessions
+
+
+.SH SYNOPSIS
+\fBcitadel tmux [flags]\fP
+
+
+.SH DESCRIPTION
+Persistent, reconnect-resilient terminal sessions ("chat to a node") are
+backed by tmux. Citadel never assumes tmux is installed: it looks for tmux via
+CITADEL_TMUX_BIN, then PATH, then a Citadel-managed binary. These commands manage
+that Citadel-managed binary.
+
+.PP
+If no usable tmux is found, the terminal server falls back to a bare,
+non-persistent shell.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for tmux
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-tmux-install(1)\fP, \fBcitadel-tmux-status(1)\fP
