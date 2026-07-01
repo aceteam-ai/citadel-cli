@@ -256,3 +256,67 @@ func TestComposeEnv_NoWorkspaceLeavesEnvUntouched(t *testing.T) {
 		}
 	}
 }
+
+// TestFirstPublishedHostEndpoint covers the #415 port-binding parse: given the
+// JSON of a container's NetworkSettings.Ports, we return the reachable host
+// endpoint (or "" when nothing is published). This is the logic serviceStart
+// uses to prove the compose port mapping was actually applied. Pure parse, no
+// Docker, so it always runs in CI.
+func TestFirstPublishedHostEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			// The #415 failure mode: a container that came up with no published
+			// ports must yield "" so serviceStart reports no endpoint.
+			name: "no published ports",
+			in:   `{}`,
+			want: "",
+		},
+		{
+			// Container port declared but not bound to the host (null value).
+			name: "declared but unbound",
+			in:   `{"7860/tcp":null}`,
+			want: "",
+		},
+		{
+			// The fixed diffusers mapping: host 7861 -> container 7860.
+			name: "diffusers 7861",
+			in:   `{"7860/tcp":[{"HostIp":"0.0.0.0","HostPort":"7861"}]}`,
+			want: "127.0.0.1:7861",
+		},
+		{
+			// 0.0.0.0 / :: / empty host are normalized to loopback.
+			name: "ipv6 wildcard normalized to loopback",
+			in:   `{"7860/tcp":[{"HostIp":"::","HostPort":"7861"}]}`,
+			want: "127.0.0.1:7861",
+		},
+		{
+			// An explicit host IP is preserved.
+			name: "explicit host ip preserved",
+			in:   `{"7860/tcp":[{"HostIp":"192.168.1.5","HostPort":"7861"}]}`,
+			want: "192.168.1.5:7861",
+		},
+		{
+			// Multiple bindings: the lowest host port wins deterministically
+			// regardless of map iteration order.
+			name: "lowest host port wins",
+			in:   `{"7860/tcp":[{"HostIp":"0.0.0.0","HostPort":"9000"}],"9100/tcp":[{"HostIp":"0.0.0.0","HostPort":"8000"}]}`,
+			want: "127.0.0.1:8000",
+		},
+		{
+			name: "malformed json",
+			in:   `not json`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := firstPublishedHostEndpoint([]byte(tc.in)); got != tc.want {
+				t.Errorf("firstPublishedHostEndpoint(%s) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

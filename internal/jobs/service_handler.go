@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -63,6 +64,12 @@ type serviceResult struct {
 	Error   string `json:"error,omitempty"`
 	Action  string `json:"action,omitempty"`  // "start", "stop", "status"
 	Message string `json:"message,omitempty"` // human-readable summary
+	// Endpoint is the reachable host endpoint of a started docker service,
+	// e.g. "127.0.0.1:7861". It is derived from the container's published port
+	// bindings after `docker compose up` so the caller knows where to reach the
+	// provisioned service. Empty for native services or when no host port is
+	// published. See citadel-cli#415.
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -173,7 +180,13 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
 			composeArgs = append(composeArgs, "-f", override)
 		}
-		composeArgs = append(composeArgs, "up", "-d")
+		// --force-recreate so the compose port mapping is always applied to the
+		// running container. Without it, `up` will ADOPT an existing container
+		// with the same container_name (e.g. one left by a prior failed/portless
+		// attempt) and leave it untouched, so the newly-declared host port never
+		// gets published (the container comes up with NetworkSettings.Ports == {}).
+		// Same treatment as llamacpp_inference.go's restart path. See citadel-cli#415.
+		composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
 		cmd := exec.Command("docker", composeArgs...)
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
@@ -190,10 +203,22 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		})
 	}
 
-	return json.Marshal(serviceResult{
+	result := serviceResult{
 		Name: svc.Name, Running: true, Kind: kind,
 		Action: "start", Message: fmt.Sprintf("%s started successfully", svc.Name),
-	})
+	}
+	// For docker services, report the reachable host endpoint by inspecting the
+	// container's published port bindings. This confirms the compose port
+	// mapping was actually applied to the running container and tells the caller
+	// where to reach the provisioned service. A missing binding surfaces the
+	// #415 "no published ports" failure instead of silently reporting success.
+	if kind == "docker" {
+		if endpoint := h.dockerServiceEndpoint(svc.Name); endpoint != "" {
+			result.Endpoint = endpoint
+			result.Message = fmt.Sprintf("%s started successfully; reachable at %s", svc.Name, endpoint)
+		}
+	}
+	return json.Marshal(result)
 }
 
 func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byte, error) {
@@ -427,6 +452,73 @@ func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) == "running"
+}
+
+// dockerServiceEndpoint returns the reachable host endpoint (host:port) of a
+// started docker service by inspecting the container's published port bindings,
+// or "" if the container is absent or has no host port published. It reads
+// NetworkSettings.Ports via `docker inspect` and delegates the parse to
+// firstPublishedHostEndpoint so the mapping logic is unit-testable without
+// Docker. The empty return is what lets serviceStart detect the #415 failure
+// mode (a container that came up with NetworkSettings.Ports == {}).
+func (h *ServiceHandler) dockerServiceEndpoint(svcName string) string {
+	containerName := "citadel-" + svcName
+	cmd := exec.Command("docker", "inspect",
+		"--format", "{{json .NetworkSettings.Ports}}", containerName)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return firstPublishedHostEndpoint(out)
+}
+
+// dockerPortBinding mirrors an entry of docker inspect's
+// NetworkSettings.Ports["<cport>/<proto>"] array.
+type dockerPortBinding struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}
+
+// firstPublishedHostEndpoint parses the JSON of a container's
+// NetworkSettings.Ports map and returns the first published host endpoint as
+// "host:port". Container ports with no host binding (null value) are skipped,
+// so a container with NetworkSettings.Ports == {} (or all-null) yields "".
+// A "0.0.0.0"/"::"/empty HostIP is reported as 127.0.0.1 since the citadel
+// gateway reaches services on loopback. Pure (bytes in, string out) so the
+// #415 mapping assertion is testable without a live Docker daemon. To keep the
+// choice deterministic across inspect's map ordering, the lowest host port is
+// returned.
+func firstPublishedHostEndpoint(portsJSON []byte) string {
+	var ports map[string][]dockerPortBinding
+	if err := json.Unmarshal(portsJSON, &ports); err != nil {
+		return ""
+	}
+	bestHost := ""
+	bestPort := 0
+	for _, bindings := range ports {
+		for _, b := range bindings {
+			if b.HostPort == "" {
+				continue
+			}
+			p, err := strconv.Atoi(b.HostPort)
+			if err != nil || p <= 0 {
+				continue
+			}
+			if bestPort != 0 && p >= bestPort {
+				continue
+			}
+			host := b.HostIP
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = "127.0.0.1"
+			}
+			bestHost = host
+			bestPort = p
+		}
+	}
+	if bestPort == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", bestHost, bestPort)
 }
 
 // composeEnv returns the environment for docker compose invocations. It starts
