@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 // TestClassifyChatKey_ReleasesNavigationKeys is the keyboard-trap regression: the
@@ -254,4 +255,32 @@ func TestChatPageResolveConfig_NoProviderNoSnapshot(t *testing.T) {
 	if base != "" || tok != "" || org != "" {
 		t.Errorf("expected empty config, got base=%q tok=%q org=%q", base, tok, org)
 	}
+}
+
+// TestWriteStatus_DoesNotTouchAppQueue is the deadlock regression. writeStatus
+// is the DIRECT status writer meant to run on the main goroutine (inside an
+// existing QueueUpdateDraw callback), so it must render straight into msgView
+// WITHOUT calling p.app.QueueUpdateDraw. We construct the page with a real
+// msgView but a nil p.app: if writeStatus ever re-introduces QueueUpdateDraw
+// (which is exactly the nested-QueueUpdateDraw bug that froze the whole Control
+// Center on connect), it will dereference the nil app and panic here. A passing
+// run therefore mechanically forbids the regression — it proves writeStatus
+// never touches the app queue.
+func TestWriteStatus_DoesNotTouchAppQueue(t *testing.T) {
+	p := &ChatPage{msgView: tview.NewTextView()}
+	// p.app is deliberately nil: any QueueUpdateDraw path would panic.
+
+	p.writeStatus("hello-status-marker")
+
+	if got := p.msgView.GetText(true); !strings.Contains(got, "hello-status-marker") {
+		t.Errorf("writeStatus did not render into msgView: got %q", got)
+	}
+}
+
+// TestWriteStatus_NilMsgViewIsSafe documents that writeStatus is a no-op when
+// the view has not been built yet, mirroring renderStatusBar's nil guard, so a
+// status write racing page teardown never panics.
+func TestWriteStatus_NilMsgViewIsSafe(t *testing.T) {
+	p := &ChatPage{}
+	p.writeStatus("anything") // must not panic
 }

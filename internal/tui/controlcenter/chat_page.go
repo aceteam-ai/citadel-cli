@@ -566,7 +566,10 @@ func (p *ChatPage) connect() {
 
 		p.app.QueueUpdateDraw(func() {
 			p.renderStatusBar(connConnected, "")
-			p.setStatus("[green]Connected[white] to #general")
+			// Already on the main goroutine inside QueueUpdateDraw: use the
+			// direct writeStatus, NOT setStatus (which re-enters QueueUpdateDraw
+			// and deadlocks the event loop).
+			p.writeStatus("[green]Connected[white] to #general")
 			// Clear the "connecting..." placeholder in the peers sidebar.
 			p.updatePeersView()
 		})
@@ -595,7 +598,8 @@ func (p *ChatPage) connect() {
 		if !connected && ctx.Err() == nil {
 			p.app.QueueUpdateDraw(func() {
 				p.renderStatusBar(connError, "timed out")
-				p.setStatus("[red]Connection timed out[white] — chat is unavailable")
+				// Inside QueueUpdateDraw: use writeStatus, not setStatus.
+				p.writeStatus("[red]Connection timed out[white] — chat is unavailable")
 				p.peersBox.SetText(" [red]offline[white]")
 			})
 		}
@@ -617,7 +621,8 @@ func (p *ChatPage) connect() {
 			errMsg := err.Error()
 			p.app.QueueUpdateDraw(func() {
 				p.renderStatusBar(connError, errMsg)
-				p.setStatus(fmt.Sprintf("[red]Connection failed[white]: %s", errMsg))
+				// Inside QueueUpdateDraw: use writeStatus, not setStatus.
+				p.writeStatus(fmt.Sprintf("[red]Connection failed[white]: %s", errMsg))
 				p.peersBox.SetText(" [red]offline[white]")
 			})
 		}
@@ -739,12 +744,32 @@ func (p *ChatPage) renderStatusBar(state connState, detail string) {
 	p.statusBar.SetText(formatChatStatusBar(state, endpoint, detail))
 }
 
-// setStatus updates the message view with a status line.
+// writeStatus replaces the message view with a single status line. It touches
+// the tview primitive DIRECTLY (no QueueUpdateDraw) and therefore MUST only be
+// called from the main/event-loop goroutine — i.e. from inside an existing
+// QueueUpdateDraw callback. Background-goroutine callers must use setStatus.
+//
+// This split exists to prevent a nested-QueueUpdateDraw deadlock: setStatus
+// wraps the body in QueueUpdateDraw, so calling it from within another
+// QueueUpdateDraw callback (already on the main goroutine) re-enters
+// QueueUpdateDraw, whose synchronous channel receive waits for the very event
+// loop it is blocking — a permanent hang that freezes the entire Control Center.
+func (p *ChatPage) writeStatus(text string) {
+	if p.msgView == nil {
+		return
+	}
+	p.msgView.Clear()
+	fmt.Fprintf(p.msgView, " %s\n\n", text)
+	p.msgView.ScrollToEnd()
+}
+
+// setStatus updates the message view with a status line from a background
+// goroutine. It wraps writeStatus in QueueUpdateDraw to hop onto the main
+// goroutine, so it MUST NOT be called from within an existing QueueUpdateDraw
+// callback — use writeStatus directly in that case (see writeStatus).
 func (p *ChatPage) setStatus(text string) {
 	p.app.QueueUpdateDraw(func() {
-		p.msgView.Clear()
-		fmt.Fprintf(p.msgView, " %s\n\n", text)
-		p.msgView.ScrollToEnd()
+		p.writeStatus(text)
 	})
 }
 
