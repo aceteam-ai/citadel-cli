@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/footprint"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -83,6 +85,9 @@ var (
 
 	// Update check flag
 	workNoUpdate bool
+
+	// Footprint sampler flag
+	workNoFootprint bool
 
 	// Auto-update (periodic self-update) flags
 	workAutoUpdate         bool
@@ -710,6 +715,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Log the final registration outcome for post-mortem diagnosis (issue #246).
 	Log("registered: online=%v node_name=%s headscale_id=%s state_dir=%s",
 		connected, nodeName, headscaleNodeID, network.GetStateDir())
+
+	// Start the background resource-footprint sampler (issue #422). It appends a
+	// lightweight per-service + node-level time-series to rotated, DuckDB-queryable
+	// CSVs under ~/citadel-node/footprints/, so an idle service hoarding RSS/VRAM
+	// leaves a queryable trail (queryable via `citadel footprints`). Cheap by
+	// design: one container-stats exec + one GPU read per tick (default 60s), never
+	// per-service. Disabled by --no-footprint or CITADEL_FOOTPRINT_INTERVAL<=0.
+	startFootprintSampler(ctx, nodeName, workManifest)
 
 	// Default consumer group to node identity when --group is not explicitly set.
 	workGroup = resolveConsumerGroup(workGroup, headscaleNodeID, nodeName)
@@ -1626,6 +1639,49 @@ func startManagedServices(ctx context.Context) []startedService {
 	return started
 }
 
+// startFootprintSampler launches the background footprint sampler goroutine
+// (issue #422) unless it is disabled via --no-footprint or a non-positive
+// CITADEL_FOOTPRINT_INTERVAL. The service list is taken from the manifest (the
+// status collector is constructed with a nil service list, so it is not a usable
+// source here), and the container engine is the selected runtime's engine binary
+// so podman nodes sample podman, not a hardcoded docker.
+func startFootprintSampler(ctx context.Context, nodeName string, manifest *CitadelManifest) {
+	if workNoFootprint {
+		Debug("footprint sampler disabled (--no-footprint)")
+		return
+	}
+	interval, enabled := footprint.IntervalFromEnv()
+	if !enabled {
+		Debug("footprint sampler disabled (CITADEL_FOOTPRINT_INTERVAL<=0)")
+		return
+	}
+
+	nodeDir, err := platform.DefaultNodeDir("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "   - Warning: footprint sampler disabled (no node dir): %v\n", err)
+		return
+	}
+
+	var serviceNames []string
+	if manifest != nil {
+		for _, svc := range manifest.Services {
+			serviceNames = append(serviceNames, svc.Name)
+		}
+	}
+
+	cfg := footprint.Config{
+		NodeID:        nodeName,
+		Services:      serviceNames,
+		EngineBin:     catalog.SelectContainerRuntime().EngineBin,
+		Dir:           footprint.DefaultDir(nodeDir),
+		Interval:      interval,
+		RetentionDays: footprint.RetentionFromEnv(),
+		Logf:          func(format string, args ...any) { Log(format, args...) },
+	}
+	go footprint.Run(ctx, cfg)
+	fmt.Printf("   - Footprint sampler: every %s → %s\n", interval, cfg.Dir)
+}
+
 // stopManagedServices tears down services this worker started, mirroring the
 // co-browse manager teardown: it stops the containers/processes we launched but
 // preserves their data (docker compose down WITHOUT -v keeps model-cache
@@ -2023,6 +2079,7 @@ func init() {
 
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
+	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
 	// Auto-update (periodic self-update) flags
