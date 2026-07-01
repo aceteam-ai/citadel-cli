@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -76,7 +77,8 @@ var (
 	workTerminalDebug bool
 
 	// Service auto-start flags
-	workNoServices bool
+	workNoServices   bool
+	workWaitServices bool
 
 	// Update check flag
 	workNoUpdate bool
@@ -149,6 +151,31 @@ func runWork(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Managed services this worker started (populated by the async startup
+	// goroutine below, read by the shutdown hook). Guarded by a mutex because
+	// the signal handler may fire while the startup goroutine is still filling
+	// it in — we only ever want to tear down services we actually launched.
+	var (
+		startedServicesMu sync.Mutex
+		startedServices   []startedService
+	)
+	recordStartedServices := func(svcs []startedService) {
+		startedServicesMu.Lock()
+		startedServices = append(startedServices, svcs...)
+		startedServicesMu.Unlock()
+	}
+	teardownStartedServices := func() {
+		startedServicesMu.Lock()
+		svcs := startedServices
+		startedServices = nil
+		startedServicesMu.Unlock()
+		stopManagedServices(svcs)
+	}
+	// Tear down managed services on any exit path (signal handler below also
+	// invokes this before the watchdog fires; the second call is a no-op because
+	// the slice is drained on first use).
+	defer teardownStartedServices()
+
 	// Apply --no-gateway / --no-terminal overrides (take precedence over defaults)
 	if workNoGateway {
 		workGateway = false
@@ -175,7 +202,15 @@ func runWork(cmd *cobra.Command, args []string) {
 		if err := platform.GetCobrowseManager().Stop(); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: co-browse browser stop: %v\n", err)
 		}
+		// Cancel first so the async service-startup goroutine stops launching any
+		// further services.
 		cancel()
+		// Arm the watchdog BEFORE tearing down managed services. Service teardown
+		// shells out to `docker compose down` (potentially several times) and a
+		// wedged docker daemon could hang this handler; the watchdog (second
+		// signal + grace-period force-exit, issue #312) must already be running so
+		// a stuck teardown can never leave an orphaned node holding the VPN
+		// identity or the terminal-server port.
 		go func() {
 			select {
 			case <-sigs:
@@ -186,6 +221,10 @@ func runWork(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 		}()
+		// Tear down the services we started. Like co-browse, this stops the
+		// containers/processes we spawned but preserves their data (no `-v`), and
+		// only touches services this worker launched.
+		teardownStartedServices()
 	}()
 
 	// Note: Update check is now handled by root.go's PersistentPreRun
@@ -211,11 +250,26 @@ func runWork(cmd *cobra.Command, args []string) {
 	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
 	defer keepAwakeMonitor.Stop()
 
-	// Auto-start services from manifest (unless --no-services is set)
-	if !workNoServices {
-		if err := autoStartServices(); err != nil {
-			fmt.Fprintf(os.Stderr, "   - Warning: Service auto-start: %v\n", err)
-		}
+	// Start managed services from the manifest (unless --no-services is set).
+	//
+	// Job serving is the node's core reason to exist and must never be gated on
+	// optional heavy services (e.g. vLLM pulling an image or loading a model onto
+	// the GPU). By default we launch services in a background goroutine and press
+	// on to VPN connect + job-stream subscription immediately, so the node comes
+	// online and serves jobs while services are still warming up (issue #384).
+	// Per-service status is surfaced by the status collector, which polls actual
+	// container state, so a slow or failed service simply reports as not-running
+	// rather than blocking startup. Use --wait-services to restore the old
+	// blocking behavior (subscribe only after every service is up).
+	switch {
+	case workNoServices:
+		// Skip service startup entirely.
+	case workWaitServices:
+		recordStartedServices(startManagedServices(ctx))
+	default:
+		go func() {
+			recordStartedServices(startManagedServices(ctx))
+		}()
 	}
 
 	// Resolve node capabilities early (used for queue routing and heartbeat)
@@ -1459,9 +1513,32 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 }
 
-// autoStartServices starts all services defined in the manifest.
-// This is called automatically by the work command unless --no-services is set.
-func autoStartServices() error {
+// startedService records a managed service that this worker actually started
+// (as opposed to one that was already running when the worker booted). It is
+// used to tear down only what we launched on graceful shutdown, mirroring how
+// the co-browse manager stops only the Chromium process it spawned.
+type startedService struct {
+	name string
+	// composePath is set for docker/compose services; empty for native services.
+	composePath string
+	native      bool
+}
+
+// startManagedServices starts all services defined in the manifest and returns
+// the subset it actually started (so callers can tear those down on shutdown).
+//
+// It honors ctx cancellation: if the worker is shutting down mid-startup (e.g.
+// vLLM is still pulling an image), it stops launching the remaining services
+// instead of orphaning a long-running goroutine. Per-service failures are
+// logged as warnings and never abort the sequence — a heavy service that fails
+// to come up must not block the rest, and the status collector reports actual
+// container state regardless of start ordering.
+//
+// This function may block for a long time (image pulls, model loads). Callers
+// that must not gate job-stream subscription on service readiness should invoke
+// it from a background goroutine (see runWork). The old blocking behavior is
+// still available via --wait-services.
+func startManagedServices(ctx context.Context) []startedService {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		// No manifest found - this is fine, just skip service startup
@@ -1474,7 +1551,15 @@ func autoStartServices() error {
 
 	fmt.Printf("--- Starting %d service(s) ---\n", len(manifest.Services))
 
+	var started []startedService
 	for _, service := range manifest.Services {
+		// Stop launching further services once shutdown has been requested so a
+		// slow startup goroutine unwinds promptly instead of racing teardown.
+		if ctx.Err() != nil {
+			fmt.Println("   - Service startup interrupted by shutdown")
+			break
+		}
+
 		serviceType := determineServiceType(service)
 
 		if serviceType == internalServices.ServiceTypeNative {
@@ -1483,6 +1568,7 @@ func autoStartServices() error {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}
+			started = append(started, startedService{name: service.Name, native: true})
 		} else {
 			// Validate that compose file path stays within config directory (prevent path traversal)
 			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
@@ -1495,12 +1581,38 @@ func autoStartServices() error {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}
+			started = append(started, startedService{name: service.Name, composePath: fullComposePath})
 		}
 		fmt.Printf("   - %s is running\n", service.Name)
 	}
 
 	fmt.Println("--- Services started ---")
-	return nil
+	return started
+}
+
+// stopManagedServices tears down services this worker started, mirroring the
+// co-browse manager teardown: it stops the containers/processes we launched but
+// preserves their data (docker compose down WITHOUT -v keeps model-cache
+// volumes; native stops leave any on-disk state). Services that were already
+// running when the worker booted are not in the list and are left untouched.
+func stopManagedServices(started []startedService) {
+	if len(started) == 0 {
+		return
+	}
+	fmt.Printf("   - Stopping %d managed service(s)...\n", len(started))
+	// Reverse order for graceful shutdown, matching `citadel stop`.
+	for i := len(started) - 1; i >= 0; i-- {
+		svc := started[i]
+		if svc.native {
+			if err := internalServices.StopNativeService(svc.name); err != nil {
+				fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
+			}
+			continue
+		}
+		if err := stopServiceByCompose(svc.composePath, false); err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
+		}
+	}
 }
 
 // shellQueueName returns the shared per-org shell command queue name.
@@ -1870,6 +1982,7 @@ func init() {
 
 	// Service auto-start flags
 	workCmd.Flags().BoolVar(&workNoServices, "no-services", false, "Skip auto-starting services from manifest")
+	workCmd.Flags().BoolVar(&workWaitServices, "wait-services", false, "Block until all manifest services are up before subscribing to job streams (default: start services asynchronously)")
 
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
