@@ -1208,6 +1208,13 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 		}
 	}
 
+	// Enrich running services with their live resource footprint (CPU/RAM/VRAM/
+	// GPU) and a footprint-derived idle label, then roll up a one-line managed
+	// summary (citadel #421). This is what makes the services panel resource-
+	// aware: a heavy-and-idle container (the diffusers eviction candidate) is now
+	// visible and highlighted instead of a bare "running".
+	enrichServiceFootprints(&data)
+
 	// Detect system tailscale (dual connection)
 	running, ip, name, sameNetwork := controlcenter.DetectSystemTailscale(nexusURL)
 	data.SystemTailscaleRunning = running
@@ -1230,6 +1237,80 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	}
 
 	return data, nil
+}
+
+// ccFootprintIdleTracker is the long-lived footprint-derived idle tracker for
+// the Control Center refresh path (citadel #421). It MUST be a package-level
+// singleton: idle duration accumulates across refreshes from a container's
+// first-inactive timestamp, so a fresh tracker per refresh would never cross the
+// idle threshold and the heavy-and-idle warning would never fire.
+var ccFootprintIdleTracker = status.NewFootprintIdleTracker()
+
+// enrichServiceFootprints attaches a live resource footprint + idle label to
+// each running managed service in data, and computes the one-line managed
+// summary. It makes a single batched footprint collection for all running
+// services (one stats call + one nvidia-smi pair), then formats per-service.
+func enrichServiceFootprints(data *controlcenter.StatusData) {
+	// Collect candidate container names for running services only.
+	var names []string
+	nameToIdx := map[string]int{}
+	for i := range data.Services {
+		if data.Services[i].Status != "running" {
+			continue
+		}
+		for _, cn := range []string{"citadel-" + data.Services[i].Name, data.Services[i].Name} {
+			if _, dup := nameToIdx[cn]; dup {
+				continue
+			}
+			nameToIdx[cn] = i
+			names = append(names, cn)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	footprints := status.CollectFootprints(ctx, names)
+
+	var totalRAM, totalVRAM uint64
+	var anyGPU bool
+	for cn, fp := range footprints {
+		idx, ok := nameToIdx[cn]
+		if !ok {
+			continue
+		}
+		// Skip a candidate name that resolved to no container (bare name when
+		// the "citadel-" variant is the real one).
+		if fp.CPUPercent < 0 && fp.RAMBytes == 0 && fp.VRAMBytes == 0 {
+			continue
+		}
+		fpCopy := fp
+		idle := ccFootprintIdleTracker.Observe(cn, &fpCopy)
+		data.Services[idx].Footprint = status.FormatFootprint(&fpCopy)
+		data.Services[idx].IdleLabel = status.FormatIdleLabel(&idle)
+		data.Services[idx].HeavyAndIdle = status.IsHeavyAndIdle(&fpCopy, &idle)
+
+		totalRAM += fpCopy.RAMBytes
+		totalVRAM += fpCopy.VRAMBytes
+		if fpCopy.HasGPU {
+			anyGPU = true
+		}
+	}
+
+	// One-line node roll-up: "managed: RAM 13G/62G · VRAM 21G/24G".
+	summary := "managed: RAM " + status.FormatBytesGB(totalRAM)
+	if data.MemoryTotal != "" {
+		summary += "/" + data.MemoryTotal
+	}
+	if anyGPU {
+		summary += " · VRAM " + status.FormatBytesGB(totalVRAM)
+		if data.GPUMemory != "" {
+			summary += "/" + data.GPUMemory
+		}
+	}
+	data.ManagedSummary = summary
 }
 
 // extractUptime tries to extract uptime from docker status string like "Up 2 hours"

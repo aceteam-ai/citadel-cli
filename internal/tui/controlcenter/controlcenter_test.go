@@ -1,6 +1,7 @@
 package controlcenter
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -367,6 +368,70 @@ func TestServiceInfo(t *testing.T) {
 	}
 	if svc.Uptime != "2h30m" {
 		t.Errorf("ServiceInfo.Uptime = %s, want 2h30m", svc.Uptime)
+	}
+}
+
+// TestUpdateServicesViewRendersFootprint verifies the services panel renders
+// the per-service footprint + usage columns and highlights a heavy-and-idle
+// service (the #421 eviction candidate) in red.
+func TestUpdateServicesViewRendersFootprint(t *testing.T) {
+	cc := New(Config{Version: "1.0.0"})
+	// updateServicesView reads/writes cc.servicesView; the table is normally
+	// created during UI setup, which we don't run headless.
+	cc.servicesView = tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
+	cc.data = StatusData{
+		ManagedSummary: "managed: RAM 13G/62G · VRAM 21G/24G",
+		Services: []ServiceInfo{
+			{
+				Name:      "vllm",
+				Status:    "running",
+				Uptime:    "2h",
+				Footprint: "RAM 6.1G  VRAM 21.0G  GPU 74%",
+				IdleLabel: "busy",
+			},
+			{
+				Name:         "diffusers",
+				Status:       "running",
+				Uptime:       "1h",
+				Footprint:    "RAM 7.4G  VRAM 0.0G  GPU 0%",
+				IdleLabel:    "idle 38m",
+				HeavyAndIdle: true,
+			},
+		},
+	}
+
+	cc.updateServicesView()
+
+	// Header now has FOOTPRINT and USAGE columns.
+	if got := cc.servicesView.GetCell(0, 2).Text; !strings.Contains(got, "FOOTPRINT") {
+		t.Errorf("col 2 header = %q, want FOOTPRINT", got)
+	}
+	if got := cc.servicesView.GetCell(0, 3).Text; !strings.Contains(got, "USAGE") {
+		t.Errorf("col 3 header = %q, want USAGE", got)
+	}
+
+	// Row 1 = vllm: busy, gray footprint (no red highlight).
+	vllmFootprint := cc.servicesView.GetCell(1, 2).Text
+	if !strings.Contains(vllmFootprint, "VRAM 21.0G") {
+		t.Errorf("vllm footprint cell = %q", vllmFootprint)
+	}
+	if strings.Contains(vllmFootprint, "red") {
+		t.Errorf("busy vllm should not be red-highlighted: %q", vllmFootprint)
+	}
+
+	// Row 2 = diffusers: heavy AND idle -> red highlight on both footprint and usage.
+	diffFootprint := cc.servicesView.GetCell(2, 2).Text
+	if !strings.Contains(diffFootprint, "red") {
+		t.Errorf("heavy-and-idle diffusers footprint should be red: %q", diffFootprint)
+	}
+	diffUsage := cc.servicesView.GetCell(2, 3).Text
+	if !strings.Contains(diffUsage, "idle 38m") || !strings.Contains(diffUsage, "red") {
+		t.Errorf("heavy-and-idle diffusers usage cell = %q, want red 'idle 38m'", diffUsage)
+	}
+
+	// Uptime moved to column 4.
+	if got := cc.servicesView.GetCell(1, 4).Text; !strings.Contains(got, "2h") {
+		t.Errorf("vllm uptime cell (col 4) = %q, want 2h", got)
 	}
 }
 
