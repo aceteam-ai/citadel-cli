@@ -273,6 +273,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		}()
 	}
 
+	// Reconcile the on-disk manifest with the services this binary can deploy
+	// (citadel-cli#413). This runs AFTER startManagedServices on purpose: newly
+	// added embedded services (e.g. diffusers on a node whose citadel.yaml predates
+	// it) must NOT be auto-started here -- the manifest drives boot auto-start and
+	// we never gate startup on heavy GPU services (#384). The reconcile only makes
+	// an on-demand SERVICE_START able to find + materialize the service.
+	if _, reconcileConfigDir, mErr := findAndReadManifest(); mErr == nil && reconcileConfigDir != "" {
+		if added, rErr := reconcileManifestServices(reconcileConfigDir); rErr != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: manifest service reconcile: %v\n", rErr)
+		} else if len(added) > 0 {
+			fmt.Printf("   - Reconciled manifest with newly-embedded service(s): %s\n", strings.Join(added, ", "))
+		}
+	}
+
 	// Resolve node capabilities early (used for queue routing and heartbeat)
 	var nodeCaps *capabilities.NodeCapabilities
 	workManifest, workConfigDir, _ := findAndReadManifest()

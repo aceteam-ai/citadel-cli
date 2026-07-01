@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -268,6 +269,79 @@ func addServiceToManifestWithTags(configDir, serviceName string, nodeTags []stri
 
 	// Write back
 	return writeManifest(manifestPath, manifest)
+}
+
+// reconcileManifestServices makes the on-disk manifest consistent with the
+// services this binary can deploy. For every service embedded in the binary
+// (services.ServiceMap) that is missing from the manifest's services list, it
+// adds an additive service block and materializes the embedded compose file
+// into <configDir>/services/<name>.yml.
+//
+// This closes the "advertised-but-unstartable" gap (citadel-cli#413): when a
+// newer binary embeds a service (e.g. diffusers in v2.55.0) and advertises it in
+// the heartbeat, but the node's citadel.yaml was written at init time before that
+// service existed, a SERVICE_START would be rejected with "service not found in
+// manifest". A binary upgrade does not otherwise touch the manifest, so the node
+// keeps advertising a capability it cannot start until reconciled here.
+//
+// Guarantees:
+//   - Additive-only: never removes or overwrites operator-defined entries. An
+//     existing service (matched by name) is left untouched, including
+//     operator-authored compose files (ensureComposeFile is a no-op when the file
+//     already exists).
+//   - Preserves unknown entries: services in the manifest that are not embedded
+//     (e.g. a hand-added "tei") are retained as-is.
+//   - Idempotent: a second call is a no-op.
+//
+// It returns the names of services newly added (for logging). It never returns an
+// error that should abort startup; failures for a single service are collected
+// and surfaced, but the manifest write only includes services that materialized
+// cleanly.
+//
+// IMPORTANT ordering note for callers: this must run AFTER startManagedServices
+// so newly-reconciled embedded services are not auto-started on this boot. The
+// manifest lists only operator intent for the purposes of auto-start (#384: never
+// gate boot on heavy GPU services); reconciled entries exist so an on-demand
+// SERVICE_START can find them, not so they launch unbidden.
+func reconcileManifestServices(configDir string) (added []string, err error) {
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+
+	manifest, _, mErr := findAndReadManifest()
+	if mErr != nil {
+		return nil, fmt.Errorf("failed to read manifest for reconcile: %w", mErr)
+	}
+
+	// Iterate embedded services in a stable order so logs and writes are
+	// deterministic.
+	changed := false
+	for _, svcName := range services.GetAvailableServices() {
+		if hasService(manifest, svcName) {
+			continue // operator/prior-reconcile entry -- leave untouched
+		}
+
+		// Materialize the embedded compose file (no-op if it already exists).
+		if cErr := ensureComposeFile(configDir, svcName); cErr != nil {
+			err = errors.Join(err, fmt.Errorf("reconcile %s: %w", svcName, cErr))
+			continue
+		}
+
+		manifest.Services = append(manifest.Services, Service{
+			Name:        svcName,
+			ComposeFile: filepath.Join("./services", svcName+".yml"),
+		})
+		added = append(added, svcName)
+		changed = true
+	}
+
+	if !changed {
+		return added, err
+	}
+
+	if wErr := writeManifest(manifestPath, manifest); wErr != nil {
+		return added, errors.Join(err, fmt.Errorf("failed to write reconciled manifest: %w", wErr))
+	}
+
+	return added, err
 }
 
 // containsTag checks if a tag is already in the tags slice.
