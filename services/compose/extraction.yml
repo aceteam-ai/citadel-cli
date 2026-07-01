@@ -3,11 +3,11 @@ services:
     image: ghcr.io/aceteam-ai/gliner2-service:latest
     container_name: citadel-extraction
     # Host port is owned by citadel (services/ports.go), supplied via
-    # CITADEL_EXTRACTION_HOST_PORT. Bound to 127.0.0.1 because this service is
-    # only consumed host-locally (internal/jobs/extraction_handler.go). The
-    # container still serves on :8100 internally.
+    # CITADEL_EXTRACTION_HOST_PORT; the :? guard fails loudly if it is missing.
+    # Left on the default 0.0.0.0 bind for consistency with the other engines
+    # (peers may reach it over the mesh). The container still serves on :8100.
     ports:
-      - "127.0.0.1:${CITADEL_EXTRACTION_HOST_PORT}:8100"
+      - "${CITADEL_EXTRACTION_HOST_PORT:?citadel must supply CITADEL_EXTRACTION_HOST_PORT}:8100"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
     environment:

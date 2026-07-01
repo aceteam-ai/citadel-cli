@@ -122,7 +122,13 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 				continue
 			}
 			if strings.HasPrefix(hostPart, "${") && strings.HasSuffix(hostPart, "}") {
-				varName := strings.TrimSuffix(strings.TrimPrefix(hostPart, "${"), "}")
+				inner := strings.TrimSuffix(strings.TrimPrefix(hostPart, "${"), "}")
+				// Strip any compose default/required suffix, e.g. VAR:?msg or
+				// VAR:-default, leaving the bare variable name.
+				varName := inner
+				if idx := strings.Index(inner, ":"); idx >= 0 {
+					varName = inner[:idx]
+				}
 				port, ok := envValue[varName]
 				if !ok {
 					return nil, fmt.Errorf("compose publishes unknown host-port var %q; add it to the registry", hostPart)
@@ -145,8 +151,22 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 //
 //	"HOST:CONTAINER"
 //	"IP:HOST:CONTAINER"
-//	"CONTAINER"            (no host publish -> "")
+//	"CONTAINER"                        (no host publish -> "")
+//	"${VAR:?msg}:CONTAINER"            (env var host port whose default/required
+//	                                    suffix itself contains colons)
+//
+// The host field may be a `${...}` expansion that contains its own colons
+// (compose's `:?`/`:-` operators), so we peel off a leading `${...}` group
+// intact before splitting the remainder on ":".
 func hostPortField(spec string) string {
+	if strings.HasPrefix(spec, "${") {
+		if end := strings.Index(spec, "}"); end >= 0 {
+			// The `${...}` group is the host field. Anything after it is
+			// ":CONTAINER" (and possibly a bind-mode suffix we ignore).
+			return spec[:end+1]
+		}
+		return spec
+	}
 	parts := strings.Split(spec, ":")
 	switch len(parts) {
 	case 1:
