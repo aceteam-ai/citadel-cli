@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -151,12 +152,68 @@ func TestReconcileEmbeddedServiceIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestReconcileUnknownServiceStillErrors verifies that a service absent from
-// both the manifest AND the embedded ServiceMap (e.g. a typo) is not
-// materialized -- Execute keeps returning the "not found in manifest" error.
-func TestReconcileUnknownServiceStillErrors(t *testing.T) {
-	if _, ok := embeddedservices.ServiceMap["definitely-not-a-service"]; ok {
-		t.Skip("unexpected: test sentinel is a real embedded service")
+// TestExecuteReconcilesEmbeddedService drives the actual Execute() gate: a
+// SERVICE_STATUS job (the repro command) for diffusers on a pre-diffusers
+// manifest must succeed after reconciliation instead of erroring. This proves
+// the fallback wiring, not just the materialize helper.
+func TestExecuteReconcilesEmbeddedService(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "citadel.yaml"), []byte(preDiffusersManifest), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	h := NewServiceHandler(dir)
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "job-1",
+		Type:    "SERVICE_STATUS",
+		Payload: map[string]string{"service": "diffusers"},
+	})
+	if err != nil {
+		t.Fatalf("Execute SERVICE_STATUS diffusers: unexpected error: %v", err)
+	}
+	if !strings.Contains(string(out), "diffusers") {
+		t.Errorf("status result did not mention diffusers: %s", out)
+	}
+
+	// The service is now persisted and startable.
+	m, err := h.loadManifest()
+	if err != nil {
+		t.Fatalf("loadManifest: %v", err)
+	}
+	if _, ok := h.findService(m, "diffusers"); !ok {
+		t.Fatal("diffusers not registered in manifest after Execute")
+	}
+}
+
+// TestExecuteUnknownServiceStillErrors verifies that a service absent from both
+// the manifest AND the embedded ServiceMap (e.g. a typo) is not materialized:
+// Execute keeps returning the "not found in manifest" error.
+func TestExecuteUnknownServiceStillErrors(t *testing.T) {
+	const bogus = "definitely-not-a-service"
+	if _, ok := embeddedservices.ServiceMap[bogus]; ok {
+		t.Skipf("unexpected: %q is a real embedded service", bogus)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "citadel.yaml"), []byte(preDiffusersManifest), 0600); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	h := NewServiceHandler(dir)
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "job-2",
+		Type:    "SERVICE_START",
+		Payload: map[string]string{"service": bogus},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown service, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found in manifest") {
+		t.Errorf("error = %q, want it to contain 'not found in manifest'", err)
+	}
+	// It must not have been materialized.
+	if _, statErr := os.Stat(filepath.Join(dir, "services", bogus+".yml")); statErr == nil {
+		t.Errorf("unknown service was materialized to disk")
 	}
 }
 
