@@ -744,3 +744,20 @@ Auto-generated log of every release.
   - feat(cobrowse): dedicated Xvfb virtual display (headless support + privacy isolation) (#380)
 
 
+---
+
+## v2.51.0 — 2026-07-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 16 |
+| Lines added | +1196 |
+
+**Changes:**
+
+  - fix(work): start managed services asynchronously so job subscription isn't blocked (#384) (#386)
+  - fix(worker): NAK unsupported job types instead of silent no-op (#382) (#387)
+  - fix(network): canonical tsnet state dir to prevent duplicate node registration (#385)
+
+
