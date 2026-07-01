@@ -62,6 +62,23 @@ type NodeCapabilities struct {
 	Tags       []string        `json:"tags,omitempty"`
 	Hypervisor *HypervisorInfo `json:"hypervisor,omitempty"`
 
+	// AvailableServices lists the serving services/engines this build knows how
+	// to deploy: the keys of the embedded services.ServiceMap (vllm, ollama,
+	// whisper, diffusers, ...). The fabric scheduler uses it to route
+	// engine-specific deploys only to capable nodes (aceteam#4483).
+	//
+	// This is distinct from Engines above:
+	//   - AvailableServices = what this binary version CAN run (static per build,
+	//     from the embedded compose registry). Sorted for deterministic output.
+	//   - Engines = engines currently detected/running on the node.
+	// Both can overlap in value (e.g. "vllm"); they answer different questions.
+	// Emitted under the "available_services" key so it never collides with the
+	// top-level NodeStatus.Services (running service instances). The backend does
+	// tolerant matching against these keys (aceteam#4483), so advertising the full
+	// runnable set (rather than only configured/enabled ones) is the correct first
+	// cut. Omitted on legacy builds, which the backend treats as "unknown".
+	AvailableServices []string `json:"available_services,omitempty"`
+
 	// Real node capability flags (citadel-cli#324). Console = shell/SSH
 	// available, Desktop = VNC reachable, Files = node-files filesystem access,
 	// GPU = GPU present / inference-capable.
