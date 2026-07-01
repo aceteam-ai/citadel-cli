@@ -18,8 +18,9 @@ services:
   # Text-to-image (HuggingFace diffusers). Enable this to serve image models
   # (SDXL-Turbo by default; override with DIFFUSERS_MODEL, e.g. SD 3.5 Medium).
   # The server listens on the diffusers contract port 7860 with a /health check;
-  # the compose file maps host port 8102 to it (7860 is used by the terminal
-  # server). Started remotely via SERVICE_START "diffusers".
+  # the compose file maps host port 7861 to it (7860 is used by the terminal
+  # server, 8100-8199 by other services and installed apps). Started remotely
+  # via SERVICE_START "diffusers".
   # - name: diffusers
   #   compose_file: ./services/diffusers.yml
 

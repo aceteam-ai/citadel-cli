@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -85,5 +86,63 @@ func TestDiffusersComposeContract(t *testing.T) {
 	// Host port must not be 7860 (that would collide with the terminal server).
 	if strings.Contains(content, "\"7860:") {
 		t.Errorf("diffusers compose host port must not be 7860 (collides with terminal server); got:\n%s", content)
+	}
+}
+
+// composeHostPorts returns the host-side ports declared in a compose file's
+// `ports:` list entries ("HOST:CONTAINER"). Pure parse (no Docker) so the
+// host-port collision assertions run in ordinary CI.
+func composeHostPorts(t *testing.T, composeYAML string) []int {
+	t.Helper()
+	var doc struct {
+		Services map[string]struct {
+			Ports []string `yaml:"ports"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(composeYAML), &doc); err != nil {
+		t.Fatalf("compose is not valid YAML: %v", err)
+	}
+	var hosts []int
+	for _, svc := range doc.Services {
+		for _, mapping := range svc.Ports {
+			// "HOST:CONTAINER" (optionally "HOST:CONTAINER/proto"); the host side
+			// is everything before the first colon.
+			hostStr := mapping
+			if i := strings.IndexByte(mapping, ':'); i >= 0 {
+				hostStr = mapping[:i]
+			}
+			var p int
+			if _, err := fmt.Sscanf(hostStr, "%d", &p); err == nil && p > 0 {
+				hosts = append(hosts, p)
+			}
+		}
+	}
+	return hosts
+}
+
+// TestDiffusersHostPortNonColliding is the #415 regression guard: the diffusers
+// host port must not collide with any other host port a citadel node binds.
+// Concretely it must avoid:
+//   - 7860 (terminal server / diffusers contract port),
+//   - 8102 (TEI embeddings -- the exact collision reported in #415),
+//   - the vllm/transcribe/tei 8100-8102 sequence, and
+//   - the whole 8100-8199 range that internal/apps auto-allocates.
+//
+// It parses the actual `ports:` mapping rather than substring-matching so a
+// future edit that reintroduces a bad host port fails here.
+func TestDiffusersHostPortNonColliding(t *testing.T) {
+	hosts := composeHostPorts(t, ServiceMap["diffusers"])
+	if len(hosts) == 0 {
+		t.Fatalf("diffusers compose declares no host port mapping; a provisioned endpoint would be unreachable (#415)")
+	}
+	for _, p := range hosts {
+		switch {
+		case p == 7860:
+			t.Errorf("diffusers host port 7860 collides with the terminal server / contract port (#415)")
+		case p == 8102:
+			t.Errorf("diffusers host port 8102 collides with the TEI embedding service (#415)")
+		case p >= 8100 && p <= 8199:
+			t.Errorf("diffusers host port %d is inside the 8100-8199 range reserved by other services and internal/apps auto-allocation (#415)", p)
+		}
 	}
 }
