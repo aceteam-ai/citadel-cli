@@ -63,7 +63,7 @@ func TestGenerateHardeningOverride_Defaults(t *testing.T) {
   app:
     image: ghcr.io/x/y:latest
 `
-	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"})
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestGenerateHardeningOverride_MultiService(t *testing.T) {
   db:
     image: postgres:16
 `
-	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"})
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestGenerateHardeningOverride_DeclaredCapsAndWritablePaths(t *testing.T) {
 			Resources:     SandboxResources{CPU: "4.0", Memory: "8g", PIDs: 1024},
 		},
 	}
-	out, err := GenerateHardeningOverride(base, m)
+	out, err := GenerateHardeningOverride(base, m, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -198,14 +198,14 @@ func TestGenerateHardeningOverride_HostNetworkOptIn(t *testing.T) {
 	base := "services:\n  app:\n    image: x\n"
 
 	// Default: no host networking.
-	out, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"})
+	out, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"}, true)
 	if _, present := parseOverride(t, out)["app"]["network_mode"]; present {
 		t.Errorf("network_mode must be absent unless host_network declared")
 	}
 
 	// Opt-in.
 	m := &ServiceManifest{Name: "x", Sandbox: SandboxSpec{HostNetwork: true}}
-	out, _ = GenerateHardeningOverride(base, m)
+	out, _ = GenerateHardeningOverride(base, m, true)
 	if got := parseOverride(t, out)["app"]["network_mode"]; got != "host" {
 		t.Errorf("network_mode = %v, want host", got)
 	}
@@ -214,9 +214,9 @@ func TestGenerateHardeningOverride_HostNetworkOptIn(t *testing.T) {
 // TestGenerateHardeningOverride_GPUExempt encodes the TEI (#343) shape: a GPU
 // service with a NVIDIA device reservation. Under #348 a GPU/inference service
 // is EXEMPT from hardening -- the read-only rootfs, cap-drops, and (especially)
-// the 2g/2cpu resource limits break inference. So the override must omit the GPU
-// service entirely (no entry for it at all) and must never emit a GPU/deploy
-// block.
+// the 2g/2cpu resource limits break inference. So on a REAL GPU host the override
+// must omit the GPU service entirely (no entry for it at all) and must never emit
+// a GPU/deploy block.
 func TestGenerateHardeningOverride_GPUExempt(t *testing.T) {
 	base := `services:
   tei:
@@ -236,7 +236,7 @@ func TestGenerateHardeningOverride_GPUExempt(t *testing.T) {
 			WritablePaths: []string{"/data"},
 		},
 	}
-	out, err := GenerateHardeningOverride(base, m)
+	out, err := GenerateHardeningOverride(base, m, true /* hostHasGPU */)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -250,8 +250,52 @@ func TestGenerateHardeningOverride_GPUExempt(t *testing.T) {
 	}
 }
 
+// TestGenerateHardeningOverride_GPUExemptDeniedOnGPULessHost is the #377 gate:
+// the SAME GPU-signalling compose, but hostHasGPU=false (no GPU on this node).
+// The GPU signal is author-controlled, so on a GPU-less host it MUST NOT grant
+// the hardening exemption -- the service is hardened like everything else
+// (fail-safe). This is the discriminating proof that the host-GPU gate flips
+// behavior, not merely that a bool was threaded through.
+func TestGenerateHardeningOverride_GPUExemptDeniedOnGPULessHost(t *testing.T) {
+	base := `services:
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+`
+	m := &ServiceManifest{Name: "tei", Sandbox: SandboxSpec{WritablePaths: []string{"/data"}}}
+	out, err := GenerateHardeningOverride(base, m, false /* hostHasGPU */)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The override never emits a GPU/deploy block regardless of the gate.
+	if strings.Contains(out, "deploy:") || strings.Contains(out, "reservations") || strings.Contains(out, "nvidia") {
+		t.Errorf("override must not emit a GPU/deploy block:\n%s", out)
+	}
+	// On a GPU-less host the "GPU" service must be HARDENED (present, cap-dropped,
+	// read-only) -- the author-declared GPU signal cannot dodge hardening here.
+	tei, ok := parseOverride(t, out)["tei"]
+	if !ok {
+		t.Fatalf("on a GPU-less host, 'tei' must be hardened (present in override):\n%s", out)
+	}
+	if cd := strSlice(t, tei["cap_drop"]); !contains2(cd, "ALL") {
+		t.Errorf("hardened 'tei' should cap_drop ALL: %v", cd)
+	}
+	if ro, _ := tei["read_only"].(bool); !ro {
+		t.Errorf("hardened 'tei' should have read_only true")
+	}
+}
+
 // TestGenerateHardeningOverride_GPUSignals exercises each per-service GPU signal
-// in isolation: each must exempt its service from the override.
+// in isolation against BOTH host states: on a real GPU host each signal exempts
+// its service; on a GPU-less host (#377) the exemption is denied and the service
+// is hardened (fail-safe) -- the author-controlled signal cannot dodge hardening
+// on a node with no GPU.
 func TestGenerateHardeningOverride_GPUSignals(t *testing.T) {
 	cases := map[string]string{
 		"gpus shorthand": `services:
@@ -284,13 +328,26 @@ func TestGenerateHardeningOverride_GPUSignals(t *testing.T) {
 `,
 	}
 	for name, base := range cases {
-		t.Run(name, func(t *testing.T) {
-			out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+		t.Run(name+"/hostHasGPU=true exempt", func(t *testing.T) {
+			out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"}, true)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if _, present := parseOverride(t, out)["svc"]; present {
-				t.Errorf("GPU-signalled service must be exempt:\n%s", out)
+				t.Errorf("GPU-signalled service must be exempt on a GPU host:\n%s", out)
+			}
+		})
+		t.Run(name+"/hostHasGPU=false hardened", func(t *testing.T) {
+			out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"}, false)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			svc, present := parseOverride(t, out)["svc"]
+			if !present {
+				t.Fatalf("GPU-signalled service must be HARDENED on a GPU-less host:\n%s", out)
+			}
+			if cd := strSlice(t, svc["cap_drop"]); !contains2(cd, "ALL") {
+				t.Errorf("hardened service should cap_drop ALL: %v", cd)
 			}
 		})
 	}
@@ -313,7 +370,7 @@ func TestGenerateHardeningOverride_MixedGPUAndSidecar(t *testing.T) {
   proxy:
     image: nginx:latest
 `
-	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -346,7 +403,7 @@ func TestGenerateHardeningOverride_PreservesBaseOverrides(t *testing.T) {
     security_opt:
       - label=disable
 `
-	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"})
+	out, err := GenerateHardeningOverride(base, &ServiceManifest{Name: "m"}, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -368,18 +425,18 @@ func TestGenerateHardeningOverride_PreservesBaseOverrides(t *testing.T) {
 }
 
 func TestGenerateHardeningOverride_NoServicesError(t *testing.T) {
-	if _, err := GenerateHardeningOverride("name: not-a-compose\n", &ServiceManifest{Name: "x"}); err == nil {
+	if _, err := GenerateHardeningOverride("name: not-a-compose\n", &ServiceManifest{Name: "x"}, true); err == nil {
 		t.Error("expected an error for a compose with no services")
 	}
-	if _, err := GenerateHardeningOverride(":::not yaml:::", &ServiceManifest{Name: "x"}); err == nil {
+	if _, err := GenerateHardeningOverride(":::not yaml:::", &ServiceManifest{Name: "x"}, true); err == nil {
 		t.Error("expected an error for invalid YAML")
 	}
 }
 
 func TestGenerateHardeningOverride_Deterministic(t *testing.T) {
 	base := "services:\n  b:\n    image: x\n  a:\n    image: y\n"
-	a, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"})
-	b, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"})
+	a, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"}, true)
+	b, _ := GenerateHardeningOverride(base, &ServiceManifest{Name: "x"}, true)
 	if a != b {
 		t.Errorf("override generation should be deterministic:\n%s\n---\n%s", a, b)
 	}

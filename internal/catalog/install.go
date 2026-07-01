@@ -236,7 +236,16 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		if rerr != nil {
 			return nil, fmt.Errorf("failed to read copied compose for sandbox hardening: %w", rerr)
 		}
-		override, gerr := GenerateHardeningOverride(string(baseData), manifest)
+		// Detect real host GPU presence to gate the per-service GPU exemption
+		// (#377). This MUST be a fresh CheckGPU() here, not the step-3 result:
+		// step 3 only runs when manifest.Requires.GPU is set, but the exemption is
+		// driven by author-controlled compose GPU signals a module can declare with
+		// Requires.GPU=false. CheckGPU() reports hasGPU=false on any detection error
+		// (nvidia-smi missing/failing), which is the fail-safe direction (harden),
+		// so dropping the error here is intentional -- unlike step 3, this is not a
+		// hard requirement, just an exemption gate.
+		hostHasGPU, _, _ := CheckGPU()
+		override, gerr := GenerateHardeningOverride(string(baseData), manifest, hostHasGPU)
 		if gerr != nil {
 			return nil, fmt.Errorf("failed to generate sandbox override for '%s': %w", name, gerr)
 		}
