@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
+
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // ServiceType represents how a service is run
@@ -43,15 +46,17 @@ var NativeServices = map[string]NativeService{
 		Name:        "llamacpp",
 		Binary:      "llama-server",
 		AltBinaries: []string{"llama-cpp-server", "server"},
-		Port:        8080,
-		StartArgs:   []string{"--host", "0.0.0.0", "--port", "8080"},
-		EnvVars:     map[string]string{},
+		// Host port owned by citadel (services/ports.go) so the native path
+		// avoids colliding with the gateway/status server on 8080.
+		Port:      svcports.LlamacppHostPort,
+		StartArgs: []string{"--host", "0.0.0.0", "--port", strconv.Itoa(svcports.LlamacppHostPort)},
+		EnvVars:   map[string]string{},
 	},
 	"vllm": {
 		Name:        "vllm",
 		Binary:      "vllm",
 		AltBinaries: []string{"python -m vllm.entrypoints.openai.api_server"},
-		Port:        8100,
+		Port:        svcports.VLLMHostPort,
 		StartArgs:   []string{"serve"},
 		EnvVars:     map[string]string{},
 	},

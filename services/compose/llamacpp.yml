@@ -4,8 +4,14 @@ services:
   llamacpp:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: citadel-llamacpp
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_LLAMACPP_HOST_PORT. The :? guard makes a `docker compose up`
+    # without the var fail loudly (rather than binding a random host port and
+    # leaving the engine silently unreachable). Left on the default 0.0.0.0 bind
+    # because peers reach this engine directly over the mesh (see `citadel
+    # expose` / `citadel connect`). The container still serves on :8080.
     ports:
-      - "8080:8080"
+      - "${CITADEL_LLAMACPP_HOST_PORT:?citadel must supply CITADEL_LLAMACPP_HOST_PORT}:8080"
     volumes:
       - ~/citadel-cache/llamacpp:/models
     command: ["--host", "0.0.0.0", "--port", "8080"]

@@ -82,7 +82,10 @@ var builtinCatalog = map[string]AppManifest{
 		Name:        "jupyter",
 		Description: "Jupyter Notebook for Python development",
 		Image:       "jupyter/minimal-notebook:latest",
-		Ports:       map[int]int{8888: 8101},
+		// Suggested host port. Actual host port is dynamically allocated by
+		// State.AllocatePort; this value avoids the citadel-reserved in-range
+		// ports (transcribe 8101, TEI 8102).
+		Ports: map[int]int{8888: 8104},
 		Volumes: []VolumeMount{
 			{HostPath: "work", ContainerPath: "/home/jovyan/work"},
 		},
@@ -99,7 +102,9 @@ var builtinCatalog = map[string]AppManifest{
 		Name:        "filebrowser",
 		Description: "Web-based file manager",
 		Image:       "filebrowser/filebrowser:latest",
-		Ports:       map[int]int{80: 8102},
+		// Suggested host port; actual port is dynamically allocated. 8102 is
+		// reserved for the TEI embedding upstream, so this avoids it.
+		Ports: map[int]int{80: 8105},
 		Volumes: []VolumeMount{
 			{HostPath: "data", ContainerPath: "/srv"},
 		},

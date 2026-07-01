@@ -4,8 +4,12 @@ services:
   vllm:
     image: vllm/vllm-openai:latest
     container_name: citadel-vllm
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_VLLM_HOST_PORT; the :? guard fails loudly if citadel forgot to
+    # supply it. Left on the default 0.0.0.0 bind because peers reach this engine
+    # directly over the mesh. The container still serves the OpenAI API on :8000.
     ports:
-      - "8100:8000"
+      - "${CITADEL_VLLM_HOST_PORT:?citadel must supply CITADEL_VLLM_HOST_PORT}:8000"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
     command: >-

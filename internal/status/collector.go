@@ -466,11 +466,13 @@ func idleEngineType(hint string) string {
 func InferServicePort(serviceName string) int {
 	name := strings.ToLower(serviceName)
 
-	// Common default ports
+	// Common default ports. The citadel-owned host ports (services/ports.go)
+	// are used for the engines whose host publish citadel controls so status
+	// probes hit the actual published port.
 	portMap := map[string]int{
-		"vllm":          8000,
+		"vllm":          services.VLLMHostPort,
 		"ollama":        11434,
-		"llamacpp":      8080,
+		"llamacpp":      services.LlamacppHostPort,
 		"lmstudio":      1234,
 		"postgres":      5432,
 		"mysql":         3306,

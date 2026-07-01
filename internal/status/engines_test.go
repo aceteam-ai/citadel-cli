@@ -1,6 +1,10 @@
 package status
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/services"
+)
 
 func TestFirstComposeHostPort(t *testing.T) {
 	cases := []struct {
@@ -50,12 +54,14 @@ func TestFirstComposeHostPort(t *testing.T) {
 	}
 }
 
-// TestManagedEngineHostPort_VLLM confirms the embedded vLLM compose resolves to
-// its published host port. This guards against the compose file changing its
-// port mapping without the idle scraper following (it scrapes the host port).
+// TestManagedEngineHostPort_VLLM confirms vLLM resolves to its citadel-owned
+// published host port. vLLM's host publish is managed via
+// ${CITADEL_VLLM_HOST_PORT} (services/ports.go), so the port comes from the
+// registry rather than a literal in the compose file. This guards against the
+// registry and the idle scraper (which scrapes the host port) drifting apart.
 func TestManagedEngineHostPort_VLLM(t *testing.T) {
-	if got := managedEngineHostPort("vllm"); got != 8100 {
-		t.Fatalf("expected vllm host port 8100 from embedded compose, got %d", got)
+	if got := managedEngineHostPort("vllm"); got != services.VLLMHostPort {
+		t.Fatalf("expected vllm host port %d from registry, got %d", services.VLLMHostPort, got)
 	}
 	if got := managedEngineHostPort("does-not-exist"); got != 0 {
 		t.Fatalf("expected 0 for unknown engine, got %d", got)

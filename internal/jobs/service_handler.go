@@ -533,6 +533,9 @@ func (h *ServiceHandler) composeEnv() []string {
 		// node actually writes job files into.
 		env = append(env, "CITADEL_WORKSPACE="+h.WorkspaceDir)
 	}
+	// Supply the citadel-owned host ports so compose files that defer their host
+	// publish to ${CITADEL_*_HOST_PORT} (llamacpp/vllm/extraction) resolve.
+	env = append(env, embeddedservices.HostPortEnv()...)
 	return env
 }
 
