@@ -167,9 +167,24 @@ func TestServerServicesEndpoint(t *testing.T) {
 	}
 }
 
+// freeTCPPort returns a currently-free localhost TCP port. NewServer treats
+// Port==0 as "unset" and defaults it to 8080, so tests that actually Start() the
+// server must pass a real ephemeral port — otherwise they bind :8080 and flake
+// whenever anything else (e.g. the llamacpp container) holds it. See #405.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve an ephemeral port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
 func TestServerStartAndShutdown(t *testing.T) {
 	collector := NewCollector(CollectorConfig{NodeName: "test"})
-	server := NewServer(ServerConfig{Port: 0}, collector) // Port 0 for random available port
+	server := NewServer(ServerConfig{Port: freeTCPPort(t)}, collector)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -313,7 +328,7 @@ func TestServerDualListen(t *testing.T) {
 	extraAddr := extraLn.Addr().(*net.TCPAddr)
 
 	server := NewServer(ServerConfig{
-		Port:    0,
+		Port:    freeTCPPort(t),
 		Version: "test-dual",
 	}, collector)
 	server.AddListener(extraLn)
