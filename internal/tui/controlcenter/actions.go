@@ -1939,6 +1939,12 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 			detail:  fmt.Sprintf("Syncs SSH authorized keys from the AceTeam platform.\nLocal SSH server: %s\nGateway route: /ssh", sshStatus),
 			enabled: &perms.SSH,
 		},
+		{
+			name:    "Shell",
+			desc:    "Remote shell command execution",
+			detail:  "Allows dispatched SHELL_COMMAND jobs to run through /bin/sh on this node.\nDisable to make the node refuse all remote shell execution.\nInherited secrets are always scrubbed from the command environment.",
+			enabled: &perms.Shell,
+		},
 	}
 
 	// Left: service list table

@@ -8,8 +8,32 @@ import (
 
 func TestDefaultPermissions(t *testing.T) {
 	p := DefaultPermissions()
-	if !p.Console || !p.Desktop || !p.Files || !p.Services || !p.SSH {
+	if !p.Console || !p.Desktop || !p.Files || !p.Services || !p.SSH || !p.Shell {
 		t.Errorf("DefaultPermissions should have all fields true, got %+v", p)
+	}
+}
+
+func TestLoadPermissions_ShellDefaultsEnabled(t *testing.T) {
+	// A pre-existing permissions file that predates the shell field must still
+	// leave shell enabled (backward compatible: absent key keeps the default).
+	dir := t.TempDir()
+	data := []byte("console: true\nssh: false\n")
+	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), data, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	p := LoadPermissions(dir)
+	if !p.Shell {
+		t.Error("shell should default to enabled when absent from an older config file")
+	}
+
+	// Explicit opt-out must round-trip.
+	data = []byte("shell: false\n")
+	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), data, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	p = LoadPermissions(dir)
+	if p.Shell {
+		t.Error("shell should be false when explicitly disabled in config")
 	}
 }
 

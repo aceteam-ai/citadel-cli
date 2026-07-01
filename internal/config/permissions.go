@@ -18,6 +18,7 @@ type Permissions struct {
 	Services  bool `yaml:"services" json:"services"`   // Service list/management
 	SSH       bool `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync
 	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API
+	Shell     bool `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution
 }
 
 const permissionsFile = "permissions.yaml"
@@ -31,6 +32,7 @@ func DefaultPermissions() *Permissions {
 		Services:  true,
 		SSH:       true,
 		Provision: true,
+		Shell:     true,
 	}
 }
 
