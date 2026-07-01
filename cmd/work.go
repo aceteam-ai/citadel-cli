@@ -1413,6 +1413,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
 		WorkerID:       workerID,
 		NodeID:         headscaleNodeID,
+		AgentVersion:   Version,
 		Verbose:        true,
 		ActivityFn:     func(_ string, msg string) { Log("%s", msg) },
 		JobRecordFn:    jobRecordFn,

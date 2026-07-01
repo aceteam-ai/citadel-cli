@@ -259,6 +259,22 @@ func (s *RedisSource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+// Fail is a terminal failure: record "failed" status (with structured data) and
+// ACK the message so it is removed from the consumer group's PEL. Used for
+// failures that will never succeed on retry (e.g. an unsupported job type),
+// preventing the message from being redelivered and re-failing forever.
+func (s *RedisSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	status := map[string]any{"error": err.Error()}
+	for k, v := range data {
+		status[k] = v
+	}
+	s.client.SetJobStatus(ctx, job.ID, "failed", status)
+	if job.SourceQueue != "" {
+		return s.client.AckJobOnQueue(ctx, job.SourceQueue, job.MessageID)
+	}
+	return s.client.AckJob(ctx, job.MessageID)
+}
+
 // Close cleanly disconnects from Redis.
 func (s *RedisSource) Close() error {
 	if s.client != nil {

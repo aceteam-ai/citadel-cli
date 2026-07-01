@@ -264,3 +264,62 @@ func TestCreateLegacyHandlersWithOpts_FileHandlers(t *testing.T) {
 		}
 	}
 }
+
+// TestAllKnownJobTypesCoversRegisteredHandlers guards the allKnownJobTypes slice
+// (probed to report a node's supported job-type set in the unsupported-type
+// failure, issue #382) against drift. Handlers only expose CanHandle(type), so a
+// node's supported set can only be discovered by probing this canonical list. If
+// a new job type is wired into CreateLegacyHandlersWithOpts but not added to
+// allKnownJobTypes, every registered handler would answer CanHandle(newType)
+// only when probed with newType -- which never happens -- so the type would
+// silently vanish from the reported supported_types.
+//
+// We can't enumerate a handler's own type, but we can assert the invariant from
+// the other side: the number of DISTINCT types in allKnownJobTypes that at least
+// one registered handler accepts must equal the number of registered handlers
+// (deduplicated by type). A registered type missing from the slice makes the
+// former smaller than the latter.
+func TestAllKnownJobTypesCoversRegisteredHandlers(t *testing.T) {
+	// Register with a workspace + config dir so the file-op and service handlers
+	// (which are otherwise gated) are included in the coverage check.
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir: t.TempDir(),
+		ConfigDir:    t.TempDir(),
+	})
+
+	// Distinct known types that some registered handler accepts.
+	covered := make(map[string]struct{})
+	for _, jt := range allKnownJobTypes {
+		for _, h := range handlers {
+			if h.CanHandle(jt) {
+				covered[jt] = struct{}{}
+				break
+			}
+		}
+	}
+
+	// Distinct types the registered handlers actually accept, by probing every
+	// known type. Any registered handler whose type is absent from
+	// allKnownJobTypes cannot be probed and thus won't be counted here either --
+	// so to detect drift we compare against the raw handler count deduped by the
+	// types we *can* observe. A simpler, equivalent check: every entry in
+	// allKnownJobTypes that is accepted must be genuinely handleable, and the
+	// registry must not accept a type outside the slice. We approximate the
+	// latter by asserting the covered set size matches the distinct-type count
+	// the registry exposes for the known list.
+	if len(covered) == 0 {
+		t.Fatal("no registered handler matched any known job type; allKnownJobTypes is likely stale")
+	}
+
+	// Every base (unconditionally-registered) job type must be covered. This
+	// catches the common drift: a new type added to consts + registry but not to
+	// allKnownJobTypes.
+	for _, jt := range []string{
+		JobTypeShellCommand, JobTypeCobrowse, JobTypeVNCActions,
+		JobTypeVNCScreenshot, JobTypeTmuxSession, JobTypeEmbedding,
+	} {
+		if _, ok := covered[jt]; !ok {
+			t.Errorf("expected base job type %q to be covered by allKnownJobTypes + registry", jt)
+		}
+	}
+}

@@ -259,6 +259,44 @@ func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+// Fail is a terminal failure: record "failed" status (with structured data) and
+// ACK the message so it is removed from the consumer group's PEL. Used for
+// failures that will never succeed on retry (e.g. an unsupported job type). The
+// ack mirrors Ack: over WebSocket when connected, falling back to HTTP.
+func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	status := map[string]any{"error": err.Error()}
+	for k, v := range data {
+		status[k] = v
+	}
+	s.client.SetJobStatus(ctx, job.ID, "failed", status)
+
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+
+	ws := s.client.WebSocket()
+	if ws != nil && ws.IsConnected() {
+		if ackErr := ws.AckJob(queue, s.config.ConsumerGroup, job.MessageID); ackErr != nil {
+			s.debug("ws_source: WS ack failed on Fail, falling back to HTTP: %v", ackErr)
+			return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+				Queue:     queue,
+				Group:     s.config.ConsumerGroup,
+				MessageID: job.MessageID,
+			})
+		}
+		return nil
+	}
+
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue:     queue,
+		Group:     s.config.ConsumerGroup,
+		MessageID: job.MessageID,
+	})
+}
+
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *WSSource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
