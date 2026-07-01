@@ -29,6 +29,7 @@ require (
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.44.3
+	rsc.io/qr v0.2.0
 	tailscale.com v1.100.0
 )
 
@@ -110,7 +111,6 @@ require (
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	rsc.io/qr v0.2.0 // indirect
 )
 
 replace github.com/gdamore/tcell/v2 => ./patches/tcell/v2

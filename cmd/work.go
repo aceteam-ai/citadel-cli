@@ -38,6 +38,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/google/uuid"
@@ -1492,6 +1493,23 @@ func runWork(cmd *cobra.Command, args []string) {
 		Version:    Version,
 		Drain:      func() { runner.Drain() },
 		ActiveJobs: runner.ActiveJobs,
+		Log: func(format string, args ...any) {
+			Log(format, args...)
+		},
+	}))
+
+	// Register the WHATSAPP_PROVISION job handler (aceteam#4454), which lets the
+	// WhatsApp MCP remote-provision the Baileys bridge on the user's OWN node
+	// (sovereign / BYO-infra). It reuses the exact `citadel whatsapp up`
+	// orchestration (whatsapp.Provision) wired with this node's real docker / git
+	// / mesh edges, and is gated to the per-node stream only (deploying a
+	// container + minting creds is privileged, mirroring AGENT_UPDATE).
+	runner.RegisterHandler(worker.NewWhatsAppProvisionHandler(worker.WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			// Default module source/image (the CLI flags are not in scope for a
+			// remote job; the payload only carries tenant/proxy/public_url).
+			return whatsapp.Provision(ctx, req, whatsappProvisionDeps(defaultWhatsAppSource, ""))
+		},
 		Log: func(format string, args ...any) {
 			Log(format, args...)
 		},
