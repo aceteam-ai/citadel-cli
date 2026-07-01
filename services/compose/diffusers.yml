@@ -7,23 +7,19 @@
 #
 # NOTE: the container listens on 7860 (the aceteam `diffusers-text-to-image`
 # template's default_port), exactly as vllm listens on 8000. The HOST port is
-# mapped to 7861, chosen to clear every other host port a citadel node may bind:
-#   - the terminal server / diffusers contract port 7860,
-#   - the vllm (8100) / transcribe (8101) / TEI embeddings (8102) sequence, and
-#   - the 8100-8199 range that `internal/apps` auto-allocates for installed apps.
-# An earlier revision mapped host 8102, which collided with the TEI embedding
-# service already bound there on a GPU node (`docker compose up` failed with
-# "Bind for 0.0.0.0:8102 failed: port is already allocated"). See citadel-cli#415.
-# SERVICE_START starts this compose with `up -d --force-recreate` so the mapping
-# below is always applied to the running container, then inspects the container
-# and reports the reachable host endpoint (host:7861).
+# owned by citadel (services/ports.go) and supplied via
+# CITADEL_DIFFUSERS_HOST_PORT; the :? guard fails loudly if it is missing. It
+# must NOT be the container's own 7860 (that is the citadel terminal server's
+# host port) nor 8102 (the TEI embedding upstream). SERVICE_START does not pass
+# a port to the container; the port contract is satisfied by the server
+# listening on 7860 inside the container.
 
 services:
   diffusers:
     image: ghcr.io/aceteam-ai/diffusers-service:latest
     container_name: citadel-diffusers
     ports:
-      - "7861:7860"
+      - "${CITADEL_DIFFUSERS_HOST_PORT:?citadel must supply CITADEL_DIFFUSERS_HOST_PORT}:7860"
     volumes:
       # Share the HuggingFace model cache with the other HF-based services
       # (vllm, sglang, whisper) so weights are downloaded once per node.

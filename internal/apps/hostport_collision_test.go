@@ -112,6 +112,7 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 		services.EnvLlamacppHostPort:   services.LlamacppHostPort,
 		services.EnvVLLMHostPort:       services.VLLMHostPort,
 		services.EnvExtractionHostPort: services.ExtractionHostPort,
+		services.EnvDiffusersHostPort:  services.DiffusersHostPort,
 	}
 
 	var out []int

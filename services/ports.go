@@ -30,6 +30,7 @@ const (
 	EnvLlamacppHostPort   = "CITADEL_LLAMACPP_HOST_PORT"
 	EnvVLLMHostPort       = "CITADEL_VLLM_HOST_PORT"
 	EnvExtractionHostPort = "CITADEL_EXTRACTION_HOST_PORT"
+	EnvDiffusersHostPort  = "CITADEL_DIFFUSERS_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -48,6 +49,8 @@ const (
 	VLLMHostPort = 8201
 	// extraction: was host 8100 (collided with vllm and the apps range).
 	ExtractionHostPort = 8202
+	// diffusers: was host 8102 (collided with the TEI embedding upstream).
+	DiffusersHostPort = 8203
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port for every
@@ -58,6 +61,7 @@ var ServiceHostPorts = map[string]int{
 	"llamacpp":   LlamacppHostPort,
 	"vllm":       VLLMHostPort,
 	"extraction": ExtractionHostPort,
+	"diffusers":  DiffusersHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -66,6 +70,7 @@ var serviceHostPortEnv = map[string]string{
 	"llamacpp":   EnvLlamacppHostPort,
 	"vllm":       EnvVLLMHostPort,
 	"extraction": EnvExtractionHostPort,
+	"diffusers":  EnvDiffusersHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
@@ -119,6 +124,10 @@ const (
 	VNCPort = 5900
 	// DeskstreamPort is the H.264 desktop stream port (internal/deskstream).
 	DeskstreamPort = 5910
+	// TerminalPort is the local terminal server port (cmd/work.go
+	// --terminal-port, internal/terminal/config.go). The platform relay dials
+	// ws://<vpn_ip>:7860, so this is a live mesh port a module must not take.
+	TerminalPort = 7860
 )
 
 // ReservedCitadelPorts is the set of host ports owned by citadel's own
@@ -132,6 +141,7 @@ var ReservedCitadelPorts = map[int]string{
 	VNCWebsockifyPort: "vnc-websockify",
 	VNCPort:           "vnc-rfb",
 	DeskstreamPort:    "deskstream-h264",
+	TerminalPort:      "terminal-server",
 }
 
 // AppsPortRange is the inclusive range apps auto-allocate host ports from
