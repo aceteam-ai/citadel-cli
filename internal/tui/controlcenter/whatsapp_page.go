@@ -131,22 +131,27 @@ func (p *WhatsAppPage) OnDeactivate() {
 	p.mu.Unlock()
 }
 
-// HandleInput implements Page. u=deploy/start, d=stop, q=refresh QR, r=refresh.
+// HandleInput implements Page. Numbered actions: 1=deploy/start, 2=stop,
+// 3=refresh QR, 4=refresh. Every action runs off the tview event-loop goroutine
+// (via `go p.doX()`): each helper calls queueRender -> app.QueueUpdateDraw, and
+// calling QueueUpdateDraw from the event-loop goroutine deadlocks the whole TUI
+// (same class as the chat deadlock in #402). Dispatching to a goroutine keeps
+// this handler render-free and safe-by-construction.
 func (p *WhatsAppPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	if event.Key() != tcell.KeyRune {
 		return event
 	}
 	switch event.Rune() {
-	case 'u', 'U':
-		p.doDeploy()
+	case '1':
+		go p.doDeploy()
 		return nil
-	case 'd', 'D':
-		p.doStop()
+	case '2':
+		go p.doStop()
 		return nil
-	case 'q', 'Q':
+	case '3':
 		go p.refreshQR()
 		return nil
-	case 'r', 'R':
+	case '4':
 		go p.refresh()
 		return nil
 	}
@@ -334,11 +339,12 @@ func (p *WhatsAppPage) render() {
 		sb.WriteString(fmt.Sprintf("\n   [red]%s[-]\n", tview.Escape(st.Err)))
 	}
 
-	// Controls.
+	// Controls. Numbered actions only (numbers + arrows convention) so there is
+	// nothing obscure to hunt for and every module page reads the same way.
 	sb.WriteString("\n [gray]──────────────────────────────[-]\n")
-	sb.WriteString("   [yellow::b]u[-:-:-] deploy/start    [yellow::b]d[-:-:-] stop\n")
-	sb.WriteString("   [yellow::b]q[-:-:-] refresh QR       [yellow::b]r[-:-:-] refresh\n")
-	sb.WriteString("   [gray]Community module — opened from the Install Module[-]\n")
+	sb.WriteString("   [yellow::b][1][-:-:-] deploy/start    [yellow::b][2][-:-:-] stop\n")
+	sb.WriteString("   [yellow::b][3][-:-:-] refresh QR       [yellow::b][4][-:-:-] refresh\n")
+	sb.WriteString("   [gray]Community module — opened from the Modules[-]\n")
 	sb.WriteString("   [gray]tab. Press Tab to return to the tab bar.[-]\n")
 
 	p.statusBox.SetText(sb.String())
@@ -349,8 +355,8 @@ func (p *WhatsAppPage) render() {
 	} else if st.LoggedIn {
 		p.qrBox.SetText("\n  [linked] No QR needed -- this number is connected.")
 	} else if st.Deployed && st.Reachable {
-		p.qrBox.SetText("\n  Generating QR... press q to refresh.")
+		p.qrBox.SetText("\n  Generating QR... press [3] to refresh.")
 	} else {
-		p.qrBox.SetText("\n  Deploy the bridge (press u) to generate a pairing QR.")
+		p.qrBox.SetText("\n  Deploy the bridge (press [1]) to generate a pairing QR.")
 	}
 }

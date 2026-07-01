@@ -119,7 +119,7 @@ func (p *ProxmoxPage) Build(app *tview.Application) tview.Primitive {
 	p.helpBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
-	p.helpBar.SetText(" [yellow]s[-]=start  [yellow]S[-]=shutdown  [yellow]k[-]=force stop  [yellow]r[-]=reboot  [yellow]c[-]=console  [yellow]Enter[-]=details  [yellow]R[-]=refresh  [yellow]D[-]=forget")
+	p.helpBar.SetText(" [yellow]1[-]=start  [yellow]2[-]=shutdown  [yellow]3[-]=force stop  [yellow]4[-]=reboot  [yellow]5[-]=console  [yellow]Enter[-]=details  [yellow]6[-]=refresh  [yellow]7[-]=forget")
 
 	// Main layout: table on left, detail on right
 	contentFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -158,27 +158,29 @@ func (p *ProxmoxPage) OnDeactivate() {
 }
 
 func (p *ProxmoxPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
+	// Numbered actions (numbers + arrows convention, no letter shortcuts). Arrow
+	// keys / Enter select a guest; these act on the selected one.
 	if event.Key() == tcell.KeyRune {
 		switch event.Rune() {
-		case 's':
+		case '1':
 			p.actionOnSelected("start")
 			return nil
-		case 'S':
+		case '2':
 			p.actionOnSelected("shutdown")
 			return nil
-		case 'k':
+		case '3':
 			p.actionOnSelected("stop")
 			return nil
-		case 'r':
+		case '4':
 			p.actionOnSelected("reboot")
 			return nil
-		case 'c':
+		case '5':
 			p.openConsole()
 			return nil
-		case 'R':
+		case '6':
 			go p.refreshData()
 			return nil
-		case 'D':
+		case '7':
 			p.forgetConnection()
 			return nil
 		}
@@ -650,7 +652,7 @@ func proxmoxConfigLine(configDir string, hasSavedConfig bool) string {
 	if !hasSavedConfig {
 		return " [gray]Config: (auto-detected local Proxmox — no saved config file to forget)[-]"
 	}
-	return fmt.Sprintf(" [gray]Config: %s   ([yellow]D[-][gray]=forget)[-]", proxmox.ConfigPath(configDir))
+	return fmt.Sprintf(" [gray]Config: %s   ([yellow]7[-][gray]=forget)[-]", proxmox.ConfigPath(configDir))
 }
 
 // pmxColorizeStatus wraps a status string with tview color tags.

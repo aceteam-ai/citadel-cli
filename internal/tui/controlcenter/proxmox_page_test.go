@@ -16,8 +16,8 @@ func TestProxmoxConfigLine_SavedConfigShowsPathAndForget(t *testing.T) {
 		t.Fatalf("config line %q should contain the config path %q", line, wantPath)
 	}
 	// The forget affordance should be discoverable from this line.
-	if !strings.Contains(line, "D") {
-		t.Fatalf("config line %q should mention the [D]=forget key", line)
+	if !strings.Contains(line, "forget") {
+		t.Fatalf("config line %q should mention the forget affordance", line)
 	}
 }
 

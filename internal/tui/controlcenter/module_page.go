@@ -128,7 +128,7 @@ func NewModulePage(cb ModuleInstallCallbacks) *ModulePage {
 func (p *ModulePage) Name() string { return "module" }
 
 // Title implements Page.
-func (p *ModulePage) Title() string { return "Install Module" }
+func (p *ModulePage) Title() string { return "Modules" }
 
 // Build implements Page.
 func (p *ModulePage) Build(app *tview.Application) tview.Primitive {
@@ -555,7 +555,9 @@ func (p *ModulePage) render() {
 	sb.WriteString("   [aqua]owner/repo@v1.2.0[-]     [gray]pinned ref[-]\n")
 	sb.WriteString("   [aqua]https://git…/repo.git[-] [gray]full git URL[-]\n\n")
 	sb.WriteString(" [gray]Private repos need this node to have git[-]\n")
-	sb.WriteString(" [gray]credentials (GITHUB_TOKEN / SSH key / helper).[-]\n")
+	sb.WriteString(" [gray]credentials (GITHUB_TOKEN / SSH key / helper).[-]\n\n")
+	sb.WriteString(" [gray]Modules will also be manageable remotely from the[-]\n")
+	sb.WriteString(" [gray]AceTeam web dashboard [white](coming soon)[-][gray].[-]\n")
 
 	if phase == phaseConfig && res.Name != "" {
 		sb.WriteString("\n [white::b]Resolved[-:-:-]\n")
