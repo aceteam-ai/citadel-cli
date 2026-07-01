@@ -385,11 +385,20 @@ func (p *ChatPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 		}
 		return nil
 	case chatKeyNextPane:
-		p.focusNextPane()
-		return nil
+		// Cycle forward among chat panes; at the LAST pane focus doesn't move,
+		// so return the (unconsumed) event and let HandleGlobalInput switch to
+		// the next tab — that is how the user leaves the Chat tab by keyboard.
+		if p.focusNextPane() {
+			return nil
+		}
+		return event
 	case chatKeyPrevPane:
-		p.focusPrevPane()
-		return nil
+		// Cycle backward; at the FIRST pane bubble the event so HandleGlobalInput
+		// falls back to the previous tab.
+		if p.focusPrevPane() {
+			return nil
+		}
+		return event
 	default:
 		return event
 	}
@@ -403,8 +412,20 @@ func (p *ChatPage) chatPanes() []tview.Primitive {
 
 // nextChatPaneIndex computes the index of the pane to focus next, cycling
 // forward (delta=+1) or backward (delta=-1) from the currently focused pane.
+//
+// Unlike a wrapping cycle, this bubbles at the pane edge so the user can leave
+// the Chat tab with the same Tab/Shift+Tab that navigates within it (the shared
+// navigation convention in HandleGlobalInput): moving forward past the LAST pane
+// returns an out-of-range index (== count) and moving backward before the FIRST
+// pane returns -1. The caller treats any out-of-range result as "past the edge"
+// and returns the key event UNCONSUMED so HandleGlobalInput switches tabs. This
+// is what un-traps the Chat tab — the previous wrapping cycle (input->messages->
+// peers->channels->input forever) always consumed Tab and never bubbled.
+//
 // Pure and testable: `focused` is the index of the currently focused pane, or
-// -1 when focus is elsewhere (in which case we start at the input).
+// -1 when focus is elsewhere. When focus is elsewhere we do NOT bubble — we
+// enter the pane list at the input (forward) or the last pane (backward), so a
+// Tab from the off-list sendButton lands on a pane rather than leaving the tab.
 func nextChatPaneIndex(focused, count, delta int) int {
 	if count == 0 {
 		return -1
@@ -415,7 +436,9 @@ func nextChatPaneIndex(focused, count, delta int) int {
 		}
 		return count - 1
 	}
-	return ((focused+delta)%count + count) % count
+	// Deliberately no modulo wrap: forward-from-last yields count and
+	// backward-from-first yields -1, both out of range, signalling "bubble".
+	return focused + delta
 }
 
 // currentChatPaneIndex returns the index of the currently focused chat pane, or
@@ -433,19 +456,26 @@ func (p *ChatPage) currentChatPaneIndex() int {
 	return -1
 }
 
-func (p *ChatPage) cycleChatPane(delta int) {
+// cycleChatPane moves focus to the next/previous chat pane. It reports whether
+// focus actually moved: false means the target index is past the pane edge (or
+// there are no panes), i.e. the caller should bubble the key up for tab
+// switching rather than consuming it. Guarding BOTH ends is load-bearing — the
+// forward bubble sentinel is `len(panes)` (a positive, in-range-looking value),
+// so a lone `idx < 0` check would index panes[len(panes)] and panic.
+func (p *ChatPage) cycleChatPane(delta int) bool {
 	panes := p.chatPanes()
 	idx := nextChatPaneIndex(p.currentChatPaneIndex(), len(panes), delta)
-	if idx < 0 {
-		return
+	if idx < 0 || idx >= len(panes) {
+		return false
 	}
 	if p.app != nil {
 		p.app.SetFocus(panes[idx])
 	}
+	return true
 }
 
-func (p *ChatPage) focusNextPane() { p.cycleChatPane(1) }
-func (p *ChatPage) focusPrevPane() { p.cycleChatPane(-1) }
+func (p *ChatPage) focusNextPane() bool { return p.cycleChatPane(1) }
+func (p *ChatPage) focusPrevPane() bool { return p.cycleChatPane(-1) }
 
 // connect establishes the chat client connection.
 func (p *ChatPage) connect() {
