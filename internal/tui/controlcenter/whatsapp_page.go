@@ -338,6 +338,8 @@ func (p *WhatsAppPage) render() {
 	sb.WriteString("\n [gray]──────────────────────────────[-]\n")
 	sb.WriteString("   [yellow::b]u[-:-:-] deploy/start    [yellow::b]d[-:-:-] stop\n")
 	sb.WriteString("   [yellow::b]q[-:-:-] refresh QR       [yellow::b]r[-:-:-] refresh\n")
+	sb.WriteString("   [gray]Community module — opened from the Install Module[-]\n")
+	sb.WriteString("   [gray]tab. Press Tab to return to the tab bar.[-]\n")
 
 	p.statusBox.SetText(sb.String())
 

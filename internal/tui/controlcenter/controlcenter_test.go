@@ -659,3 +659,100 @@ func TestDenseAltMapping(t *testing.T) {
 		t.Errorf("Alt+3 maps to index %d, want 4", vis[2])
 	}
 }
+
+// TestNextVisibleIndex covers the Tab-forward tab-cycle order used by the shared
+// navigation convention: skip hidden pages, wrap at the end, and no-op when a
+// single or no page is visible.
+func TestNextVisibleIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		visibles []int
+		cur      int
+		want     int
+	}{
+		{"advance to next visible", []int{0, 2, 4}, 0, 2},
+		{"skip hidden between", []int{0, 2, 4}, 2, 4},
+		{"wrap to first", []int{0, 2, 4}, 4, 0},
+		{"cur not in set advances to next greater", []int{0, 2, 4}, 1, 2},
+		{"cur beyond last wraps", []int{0, 2, 4}, 5, 0},
+		{"single visible stays", []int{3}, 3, 3},
+		{"empty stays", nil, 2, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nextVisibleIndex(tc.visibles, tc.cur); got != tc.want {
+				t.Errorf("nextVisibleIndex(%v, %d) = %d, want %d", tc.visibles, tc.cur, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPrevVisibleIndex covers the Shift+Tab-backward tab-cycle order: skip hidden
+// pages, wrap at the start, and no-op for single/empty sets.
+func TestPrevVisibleIndex(t *testing.T) {
+	cases := []struct {
+		name     string
+		visibles []int
+		cur      int
+		want     int
+	}{
+		{"back to previous visible", []int{0, 2, 4}, 4, 2},
+		{"skip hidden between", []int{0, 2, 4}, 2, 0},
+		{"wrap to last", []int{0, 2, 4}, 0, 4},
+		{"cur not in set goes to next lower", []int{0, 2, 4}, 3, 2},
+		{"cur below first wraps to last", []int{0, 2, 4}, -1, 4},
+		{"single visible stays", []int{3}, 3, 3},
+		{"empty stays", nil, 2, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := prevVisibleIndex(tc.visibles, tc.cur); got != tc.want {
+				t.Errorf("prevVisibleIndex(%v, %d) = %d, want %d", tc.visibles, tc.cur, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVisibleCycleRoundTrip asserts nextVisibleIndex over all visible pages
+// returns to the start, i.e. Tab cycles through every visible tab exactly once.
+func TestVisibleCycleRoundTrip(t *testing.T) {
+	visibles := []int{0, 1, 3, 6}
+	cur := visibles[0]
+	seen := map[int]bool{cur: true}
+	for i := 0; i < len(visibles)-1; i++ {
+		cur = nextVisibleIndex(visibles, cur)
+		if seen[cur] {
+			t.Fatalf("cycle revisited index %d before covering all visibles", cur)
+		}
+		seen[cur] = true
+	}
+	// One more Tab wraps back to the first visible page.
+	if got := nextVisibleIndex(visibles, cur); got != visibles[0] {
+		t.Errorf("cycle did not wrap to first: got %d, want %d", got, visibles[0])
+	}
+	if len(seen) != len(visibles) {
+		t.Errorf("cycle covered %d of %d visible tabs", len(seen), len(visibles))
+	}
+}
+
+// TestProxmoxTabVisible asserts the Proxmox tab is gated on real detection: shown
+// only when Enabled AND a BaseURL is set (never folded into the module list).
+func TestProxmoxTabVisible(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ProxmoxConfig
+		want bool
+	}{
+		{"disabled (no detection)", ProxmoxConfig{}, false},
+		{"detected with URL", ProxmoxConfig{Enabled: true, BaseURL: "https://localhost:8006"}, true},
+		{"enabled but no URL (defensive)", ProxmoxConfig{Enabled: true}, false},
+		{"URL but not enabled", ProxmoxConfig{BaseURL: "https://localhost:8006"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := proxmoxTabVisible(tc.cfg); got != tc.want {
+				t.Errorf("proxmoxTabVisible(%+v) = %v, want %v", tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
