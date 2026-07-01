@@ -729,3 +729,18 @@ Auto-generated log of every release.
   - feat(fabric): declare FABRIC_PROTOCOL_VERSION (#363 Phase 1) (#374)
 
 
+---
+
+## v2.50.0 — 2026-06-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 3 |
+| Lines added | +269 |
+
+**Changes:**
+
+  - feat(cobrowse): dedicated Xvfb virtual display (headless support + privacy isolation) (#380)
+
+
