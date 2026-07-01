@@ -7,8 +7,9 @@
 // internal/reconcile package holds the deferred converge engine, which v2 will
 // migrate onto this same protobuf contract).
 //
-// The wire contract is protobuf (internal/fabricpb, vendored from
-// aceteam-ai/fabric-protocol). The report is serialized binary and POSTed to a
+// The wire contract is protobuf (the published
+// github.com/aceteam-ai/fabric-protocol Go module, imported here under the
+// fabricpb alias). The report is serialized binary and POSTed to a
 // new device-authed binary endpoint; a control-plane worker XADDs it to the
 // node:state:stream Redis stream and decodes it into relational columns.
 //
@@ -28,8 +29,8 @@ import (
 	"sort"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	fabricpb "github.com/aceteam-ai/citadel-cli/internal/fabricpb"
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
+	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
