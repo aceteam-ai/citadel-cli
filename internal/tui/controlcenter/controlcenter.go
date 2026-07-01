@@ -571,6 +571,13 @@ type ControlCenter struct {
 	// can be flipped live from the Settings pane. Keyboard navigation is fully
 	// preserved regardless of this value — mouse is purely additive.
 	mouseEnabled bool
+
+	// Fullscreen rendering. fullscreenEnabled is the resolved initial state
+	// (persisted Rendering preference). Unlike mouse, tview/tcell cannot swap the
+	// terminal's alternate-screen mode on a live screen, so this is consumed once
+	// in Run() before the screen is created; toggling it from Settings persists
+	// the choice and takes effect on the next launch (restart to apply).
+	fullscreenEnabled bool
 }
 
 // Pane focus constants
@@ -645,6 +652,13 @@ type Config struct {
 	// terminal mouse reporting so tabs/rows/Send are clickable. Keyboard
 	// navigation works either way.
 	MouseEnabled bool
+
+	// FullscreenEnabled is the resolved initial fullscreen-rendering state (the
+	// persisted Rendering preference, defaulting to true). When true, the TUI
+	// uses the terminal's alternate screen buffer for flicker-free, app-like
+	// rendering; when false, output goes to normal scrollback. Applied once at
+	// launch in Run() because tcell cannot swap the mode on a live screen.
+	FullscreenEnabled bool
 }
 
 // ProxmoxConfig holds configuration for the Proxmox TUI page.
@@ -695,6 +709,7 @@ func New(cfg Config) *ControlCenter {
 		whatsappConfig:      cfg.WhatsApp,
 		moduleInstallConfig: cfg.ModuleInstall,
 		mouseEnabled:        cfg.MouseEnabled,
+		fullscreenEnabled:   cfg.FullscreenEnabled,
 	}
 }
 
@@ -765,6 +780,13 @@ func (cc *ControlCenter) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 }
 
 func (cc *ControlCenter) Run() error {
+	// Apply the persisted fullscreen-rendering preference BEFORE creating the
+	// tview app: tcell reads TCELL_ALTSCREEN once, when Run() below inits the
+	// screen, so this is the launch-time consumer of the Rendering setting the
+	// Settings pane persists. tcell cannot swap alternate-screen mode on a live
+	// screen, so a mid-session toggle only takes effect on the next launch.
+	applyFullscreenRendering(cc.fullscreenEnabled)
+
 	cc.app = tview.NewApplication()
 
 	// Create page manager
