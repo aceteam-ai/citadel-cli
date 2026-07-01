@@ -280,6 +280,28 @@ func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+// Fail is a terminal failure: record "failed" status (with structured data) and
+// ACK the message so it is removed from the consumer group's PEL. Used for
+// failures that will never succeed on retry (e.g. an unsupported job type).
+func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	status := map[string]any{"error": err.Error()}
+	for k, v := range data {
+		status[k] = v
+	}
+	s.client.SetJobStatus(ctx, job.ID, "failed", status)
+	queue := job.SourceQueue
+	if queue == "" {
+		if qs := s.snapshotQueues(); len(qs) > 0 {
+			queue = qs[0]
+		}
+	}
+	return s.client.AcknowledgeJob(ctx, redisapi.AcknowledgeRequest{
+		Queue:     queue,
+		Group:     s.config.ConsumerGroup,
+		MessageID: job.MessageID,
+	})
+}
+
 // Close cleanly disconnects from the API.
 func (s *APISource) Close() error {
 	if s.client != nil {

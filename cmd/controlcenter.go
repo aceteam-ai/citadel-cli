@@ -1724,9 +1724,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
-		WorkerID:   workerID,
-		Verbose:    false,
-		ActivityFn: activity, // Route logs through TUI
+		WorkerID:     workerID,
+		AgentVersion: Version,
+		Verbose:      false,
+		ActivityFn:   activity, // Route logs through TUI
 		JobRecordFn: func(record usage.UsageRecord) {
 			// Job recording callback - could be extended to pass to TUI
 			// For now, the activity log covers job status

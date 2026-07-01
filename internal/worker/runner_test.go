@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,8 @@ type MockJobSource struct {
 	jobIndex      int
 	acked         []*Job
 	nacked        []*Job
+	failed        []*Job
+	failedData    []map[string]any
 	connected     bool
 	closed        bool
 	mu            sync.Mutex
@@ -72,6 +75,14 @@ func (m *MockJobSource) Nack(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
+func (m *MockJobSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failed = append(m.failed, job)
+	m.failedData = append(m.failedData, data)
+	return nil
+}
+
 func (m *MockJobSource) IsJobCancelled(ctx context.Context, jobID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,6 +107,18 @@ func (m *MockJobSource) NackedJobs() []*Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.nacked
+}
+
+func (m *MockJobSource) FailedJobs() []*Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failed
+}
+
+func (m *MockJobSource) FailedData() []map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failedData
 }
 
 // MockJobHandler is a test implementation of JobHandler.
@@ -144,11 +167,13 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 
 // MockStreamWriter is a test implementation of StreamWriter.
 type MockStreamWriter struct {
-	started   bool
-	chunks    []string
-	ended     bool
-	errored   bool
-	cancelled bool
+	started        bool
+	chunks         []string
+	ended          bool
+	errored        bool
+	erroredErr     error
+	erroredRecover bool
+	cancelled      bool
 }
 
 func (m *MockStreamWriter) WriteStart(message string) error {
@@ -168,6 +193,8 @@ func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 
 func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 	m.errored = true
+	m.erroredErr = err
+	m.erroredRecover = recoverable
 	return nil
 }
 
@@ -293,7 +320,12 @@ func TestRunnerNacksFailedJobs(t *testing.T) {
 	}
 }
 
-func TestRunnerNoHandler(t *testing.T) {
+// TestRunnerUnsupportedJobTypeFailsTerminally verifies that a job whose type has
+// no registered handler is terminally Failed (failed status + ACK) rather than
+// Nacked. A Nack would leave the message pending in the consumer group and it
+// would be redelivered by orphan recovery, re-failing forever, while the backend
+// only ever saw an opaque dispatch timeout (issue #382).
+func TestRunnerUnsupportedJobTypeFailsTerminally(t *testing.T) {
 	jobs := []*Job{
 		{ID: "job-1", Type: "UNKNOWN_JOB", Payload: map[string]any{}},
 	}
@@ -301,7 +333,7 @@ func TestRunnerNoHandler(t *testing.T) {
 	source := NewMockJobSource("test", jobs)
 	handler := NewMockJobHandler("OTHER_JOB", false) // Doesn't handle UNKNOWN_JOB
 	handlers := []JobHandler{handler}
-	config := RunnerConfig{WorkerID: "test-worker"}
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.46.0"}
 
 	runner := NewRunner(source, handlers, config)
 
@@ -310,16 +342,140 @@ func TestRunnerNoHandler(t *testing.T) {
 
 	runner.Run(ctx)
 
-	// Job should be nacked because no handler
-	nacked := source.NackedJobs()
-	if len(nacked) != 1 {
-		t.Errorf("Nacked jobs = %d, want 1", len(nacked))
+	// The unsupported job must be terminally Failed (removed from the PEL),
+	// NOT Nacked (which would leave it pending and retried forever).
+	failed := source.FailedJobs()
+	if len(failed) != 1 {
+		t.Fatalf("Failed jobs = %d, want 1", len(failed))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0 (should Fail, not Nack)", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 0 {
+		t.Errorf("Acked jobs = %d, want 0 (Fail carries its own ack, not a plain Ack)", len(source.AckedJobs()))
 	}
 
-	// Handler should not have executed anything
-	executed := handler.ExecutedJobs()
-	if len(executed) != 0 {
-		t.Errorf("Executed jobs = %d, want 0", len(executed))
+	// The structured failure must carry the marker, the offending job type, and
+	// the node's agent version -- this is what the backend surfaces as an
+	// actionable "node vX.Y.Z doesn't support TYPE" message.
+	data := source.FailedData()
+	if len(data) != 1 {
+		t.Fatalf("FailedData entries = %d, want 1", len(data))
+	}
+	d := data[0]
+	if d["unsupported_job_type"] != true {
+		t.Errorf("unsupported_job_type = %v, want true", d["unsupported_job_type"])
+	}
+	if d["job_type"] != "UNKNOWN_JOB" {
+		t.Errorf("job_type = %v, want UNKNOWN_JOB", d["job_type"])
+	}
+	if d["agent_version"] != "v2.46.0" {
+		t.Errorf("agent_version = %v, want v2.46.0", d["agent_version"])
+	}
+
+	// Handler should not have executed anything.
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("Executed jobs = %d, want 0", len(handler.ExecutedJobs()))
+	}
+}
+
+// TestRunnerUnsupportedJobTypePublishesTerminalError verifies that the
+// unsupported-type path publishes a non-recoverable terminal error event
+// through the stream writer. The streaming dispatch path waits on this event;
+// without it the backend times out after ~30s (issue #382).
+func TestRunnerUnsupportedJobTypePublishesTerminalError(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "COBROWSE", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handlers := []JobHandler{NewMockJobHandler("SHELL_COMMAND", false)}
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.46.0"}
+
+	runner := NewRunner(source, handlers, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	if !stream.errored {
+		t.Fatal("expected a terminal error event to be published for the unsupported type")
+	}
+	if stream.erroredRecover {
+		t.Error("unsupported-type error should be non-recoverable")
+	}
+	if stream.erroredErr == nil {
+		t.Fatal("expected a non-nil error on the published terminal event")
+	}
+	msg := stream.erroredErr.Error()
+	if !strings.Contains(msg, "COBROWSE") || !strings.Contains(msg, "v2.46.0") {
+		t.Errorf("error message = %q, want it to mention the job type and node version", msg)
+	}
+	if stream.ended {
+		t.Error("WriteEnd should not be called for an unsupported job type")
+	}
+}
+
+// TestRunnerKnownJobTypeStillDispatches guards against a regression: a job whose
+// type IS registered must still dispatch to its handler and be Acked, never
+// routed through the unsupported-type Fail path.
+func TestRunnerKnownJobTypeStillDispatches(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "SHELL_COMMAND", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("SHELL_COMMAND", false)
+	handlers := []JobHandler{handler}
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.46.0"}
+
+	runner := NewRunner(source, handlers, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("Executed jobs = %d, want 1", len(handler.ExecutedJobs()))
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+	if len(source.FailedJobs()) != 0 {
+		t.Errorf("Failed jobs = %d, want 0 for a known type", len(source.FailedJobs()))
+	}
+}
+
+// TestRunnerSupportedJobTypesReflectsRegistration verifies that the reported
+// supported-types set only includes types the node actually has a handler for.
+func TestRunnerSupportedJobTypesReflectsRegistration(t *testing.T) {
+	source := NewMockJobSource("test", nil)
+	handlers := []JobHandler{
+		NewMockJobHandler(JobTypeShellCommand, false),
+		NewMockJobHandler(JobTypeCobrowse, false),
+	}
+	runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test"})
+
+	got := runner.supportedJobTypes()
+	want := map[string]bool{JobTypeCobrowse: true, JobTypeShellCommand: true}
+	if len(got) != len(want) {
+		t.Fatalf("supportedJobTypes() = %v, want %d entries", got, len(want))
+	}
+	for _, jt := range got {
+		if !want[jt] {
+			t.Errorf("supportedJobTypes() included unexpected type %q", jt)
+		}
+	}
+	// Result must be sorted for stable reporting.
+	for i := 1; i < len(got); i++ {
+		if got[i-1] > got[i] {
+			t.Errorf("supportedJobTypes() not sorted: %v", got)
+		}
 	}
 }
 

@@ -94,6 +94,10 @@ const (
 )
 
 // Common job types used across sources.
+//
+// This const block is the source of truth for job types. When adding a new type
+// here, also add it to allKnownJobTypes below so it is reported in a node's
+// supported job-type set (issue #382).
 const (
 	JobTypeShellCommand      = "SHELL_COMMAND"
 	JobTypeTmuxSession       = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
@@ -132,3 +136,47 @@ const (
 	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
 	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
 )
+
+// allKnownJobTypes enumerates every job type this citadel build knows about.
+// It is probed against the runner's registered handlers to report the node's
+// supported job-type set in the unsupported-type failure (issue #382). Handlers
+// only answer CanHandle(type) for a single type each, so there is no way to
+// enumerate what a node supports without a canonical list to probe.
+var allKnownJobTypes = []string{
+	JobTypeShellCommand,
+	JobTypeTmuxSession,
+	JobTypeDownloadModel,
+	JobTypeOllamaPull,
+	JobTypeLlamaCppInference,
+	JobTypeVLLMInference,
+	JobTypeOllamaInference,
+	JobTypeLLMInference,
+	JobTypeEmbedding,
+	JobTypeApplyDeviceConfig,
+	JobTypeExtraction,
+	JobTypeHTTPProxy,
+	JobTypeFileRead,
+	JobTypeFileReadBytes,
+	JobTypeFileWrite,
+	JobTypeFileWriteBytes,
+	JobTypeFileEdit,
+	JobTypeFileList,
+	JobTypeFileSearch,
+	JobTypeServiceStart,
+	JobTypeServiceStop,
+	JobTypeServiceStatus,
+	JobTypeSandboxSuspend,
+	JobTypeSandboxResume,
+	JobTypeModelCachePull,
+	JobTypeModelCacheEvict,
+	JobTypeIOSBuild,
+	JobTypeAndroidBuild,
+	JobTypeGomobileBuild,
+	JobTypeFileScreenshot,
+	JobTypeVNCScreenshot,
+	JobTypeVNCType,
+	JobTypeVNCKeys,
+	JobTypeVNCActions,
+	JobTypeCobrowse,
+	JobTypeTranscribeAudio,
+}

@@ -25,6 +25,14 @@ type JobSource interface {
 	// Depending on implementation, job may be retried or moved to DLQ.
 	Nack(ctx context.Context, job *Job, err error) error
 
+	// Fail is a terminal failure: it records a "failed" job status (carrying the
+	// structured data) AND acknowledges the message so it is removed from the
+	// consumer group's pending entries list. Unlike Nack (which leaves the
+	// message pending for retry/DLQ), Fail is used for failures that will never
+	// succeed on retry -- e.g. an unsupported job type -- so the consumer group
+	// is not wedged by a message that is redelivered and re-fails forever.
+	Fail(ctx context.Context, job *Job, err error, data map[string]any) error
+
 	// IsJobCancelled checks whether a job has been cancelled by the producer.
 	// Returns true if the cancellation flag exists in the backing store.
 	// JQS-Core Section 5.6: checked after claiming and before processing.

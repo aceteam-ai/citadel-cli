@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,9 +18,10 @@ import (
 
 // Runner orchestrates job processing from a source through handlers.
 type Runner struct {
-	source   JobSource
-	handlers []JobHandler
-	config   RunnerConfig
+	source       JobSource
+	handlers     []JobHandler
+	config       RunnerConfig
+	agentVersion string
 
 	// Optional integrations (set via WithXxx methods)
 	streamWriterFactory func(job *Job) StreamWriter
@@ -53,6 +55,12 @@ type RunnerConfig struct {
 	// When empty, target_node filtering is disabled (all jobs are processed).
 	NodeID string
 
+	// AgentVersion is this node's citadel build version (e.g. "v2.46.0").
+	// It is surfaced in the structured failure for an unsupported job type so
+	// the backend can render an actionable "node on vX.Y.Z doesn't support TYPE
+	// -- update the node" message instead of an opaque dispatch timeout (#382).
+	AgentVersion string
+
 	// Verbose enables detailed logging
 	Verbose bool
 
@@ -79,6 +87,7 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 		source:         source,
 		handlers:       handlers,
 		config:         config,
+		agentVersion:   config.AgentVersion,
 		activityFn:     config.ActivityFn,
 		jobRecordFn:    config.JobRecordFn,
 		maxConcurrency: config.MaxConcurrency,
@@ -376,10 +385,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	}
 
 	if handler == nil {
-		err := fmt.Errorf("no handler for job type: %s", job.Type)
-		r.log("error", "No handler: %v", err)
-		r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
-		r.source.Nack(ctx, job, err)
+		r.failUnsupportedJobType(ctx, job, startTime)
 		return
 	}
 
@@ -469,6 +475,82 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		stream.WriteEnd(nil)
 	}
 	r.source.Ack(ctx, job)
+}
+
+// failUnsupportedJobType terminally fails a job whose type has no registered
+// handler on this node (issue #382).
+//
+// Historically this branch called Nack, which set the job status to "failed"
+// but never acknowledged the message and never published a terminal stream
+// event. For the streaming dispatch path the producer waits on the pub/sub
+// terminal event (PublishEnd/PublishError), so a job with no handler produced
+// no terminal event and the backend simply timed out after ~30s -- an opaque
+// symptom indistinguishable from "node offline/busy". Worse, the un-acked
+// message stayed in the consumer group's pending list and was redelivered by
+// orphan recovery, re-failing forever.
+//
+// Instead we (1) publish a structured error event immediately so the backend
+// surfaces an actionable "node <ver> doesn't support <TYPE> -- update the node"
+// message, and (2) Fail the job (failed status + ACK) so the unsupported
+// message is removed from the pending list rather than retried indefinitely.
+func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime time.Time) {
+	agentVersion := r.agentVersion
+	if agentVersion == "" {
+		agentVersion = "unknown"
+	}
+	err := fmt.Errorf(
+		"unsupported job type %q: node %s has no handler for it (update the node)",
+		job.Type, agentVersion,
+	)
+	r.log("error", "Unsupported job type: %v", err)
+
+	data := map[string]any{
+		"unsupported_job_type": true,
+		"job_type":             job.Type,
+		"agent_version":        agentVersion,
+		"supported_types":      r.supportedJobTypes(),
+	}
+
+	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
+
+	// Publish a terminal error event so the streaming dispatch path stops
+	// waiting on a terminal event that would otherwise never arrive. Marked
+	// non-recoverable: retrying an unsupported type on the same node is futile.
+	var stream StreamWriter
+	if r.streamWriterFactory != nil {
+		stream = r.streamWriterFactory(job)
+	} else {
+		stream = &NoOpStreamWriter{}
+	}
+	if werr := stream.WriteError(err, false); werr != nil {
+		r.log("warning", "Failed to publish unsupported-type error for job %s: %v", job.ID, werr)
+	}
+
+	// Fail (failed status + ACK) so the message is not redelivered forever.
+	if ferr := r.source.Fail(ctx, job, err, data); ferr != nil {
+		r.log("warning", "Failed to ack unsupported job %s: %v", job.ID, ferr)
+	}
+}
+
+// supportedJobTypes returns the sorted set of job types this node's registered
+// handlers can process. It is included in the unsupported-type failure so the
+// backend (and operators) can see exactly what the node build supports.
+func (r *Runner) supportedJobTypes() []string {
+	seen := make(map[string]struct{})
+	for _, jt := range allKnownJobTypes {
+		for _, h := range r.handlers {
+			if h.CanHandle(jt) {
+				seen[jt] = struct{}{}
+				break
+			}
+		}
+	}
+	types := make([]string, 0, len(seen))
+	for jt := range seen {
+		types = append(types, jt)
+	}
+	sort.Strings(types)
+	return types
 }
 
 // buildUsageRecord constructs a UsageRecord from job execution context.
