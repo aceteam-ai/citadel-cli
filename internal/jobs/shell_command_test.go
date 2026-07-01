@@ -188,7 +188,7 @@ func TestScrubEnv_JobProvidedVarsBypassLists(t *testing.T) {
 	// would otherwise trip the denylist, and they override inherited values.
 	base := []string{"PATH=/usr/bin", "HOME=/home/citadel"}
 	jobEnv := map[string]string{
-		"MY_TOKEN": "explicit",   // denylisted name, but explicitly provided
+		"MY_TOKEN": "explicit",    // denylisted name, but explicitly provided
 		"HOME":     "/tmp/custom", // override inherited HOME
 	}
 
