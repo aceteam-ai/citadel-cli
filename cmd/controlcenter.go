@@ -277,9 +277,13 @@ func runControlCenter() {
 		},
 		// Resolve the initial mouse state: persisted preference with the
 		// --no-mouse flag applied as a session override.
-		MouseEnabled:  controlcenter.ResolveMouseEnabled(noMouse, config.LoadMouse(platform.ConfigDir()).Enabled),
-		WhatsApp:      buildWhatsAppCallbacks(),
-		ModuleInstall: buildModuleInstallCallbacks(),
+		MouseEnabled: controlcenter.ResolveMouseEnabled(noMouse, config.LoadMouse(platform.ConfigDir()).Enabled),
+		// Resolve the initial fullscreen-rendering state from the persisted
+		// preference (defaults on). Consumed once at launch in Run(); a
+		// mid-session toggle only applies on the next start.
+		FullscreenEnabled: config.LoadRendering(platform.ConfigDir()).Fullscreen,
+		WhatsApp:          buildWhatsAppCallbacks(),
+		ModuleInstall:     buildModuleInstallCallbacks(),
 	}
 
 	cc := controlcenter.New(cfg)

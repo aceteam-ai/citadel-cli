@@ -254,10 +254,12 @@ func (p *SettingsPage) reloadRendering() {
 }
 
 // toggleFullscreen flips fullscreen rendering and persists it. tview cannot swap
-// the terminal's alternate-screen mode mid-run, so this only persists the choice
-// today — no live apply, and nothing consumes the pref at launch yet (the
-// screen-creation path is owned by controlcenter.go). SetFullscreenEnabled is the
-// nil-able seam a future launch-time consumer will fill; it is a no-op today.
+// the terminal's alternate-screen mode mid-run, so this persists the choice and
+// it takes effect on the next launch: the control center's Run() reads the saved
+// Rendering preference and stages TCELL_ALTSCREEN before creating the screen (see
+// applyFullscreenRendering). The inline hint tells the user to restart to apply.
+// SetFullscreenEnabled remains the nil-able live-apply seam; it is a no-op today
+// because a live screen cannot switch alternate-screen mode.
 func (p *SettingsPage) toggleFullscreen() {
 	if p.rendering == nil {
 		p.reloadRendering()
@@ -315,7 +317,7 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	fullscreenEnabled := p.rendering != nil && p.rendering.Fullscreen
 	sb.WriteString(fmt.Sprintf("   %s [white::b]Fullscreen rendering[-:-:-]     Flicker-free, app-like. Off = output goes to normal\n", checkbox(fullscreenEnabled)))
 	sb.WriteString("                                scrollback (easier to scroll + copy long history).\n")
-	sb.WriteString("   [gray]press[-] [yellow::b]f[-:-:-] [gray]to toggle (saved; full apply coming soon)[-]\n")
+	sb.WriteString("   [gray]press[-] [yellow::b]f[-:-:-] [gray]to toggle (saved; restart to apply)[-]\n")
 
 	enabled := p.telemetry != nil && p.telemetry.AnonTelemetryEnabled
 
