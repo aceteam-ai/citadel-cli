@@ -1427,6 +1427,22 @@ func runWork(cmd *cobra.Command, args []string) {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
+	// Register the AGENT_UPDATE job handler (issue aceteam#4427), which lets the
+	// control plane update this node's agent remotely — the fix for silent
+	// version skew (aceteam#4373). It is registered after the runner exists so it
+	// can borrow the runner's Drain/ActiveJobs for the "publish result, THEN
+	// restart" ordering, mirroring how the AutoUpdater is wired below. The handler
+	// self-restarts only when running as a managed service (CITADEL_SERVICE=true);
+	// in a foreground run it reports "restart required" instead.
+	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
+		Version:    Version,
+		Drain:      func() { runner.Drain() },
+		ActiveJobs: runner.ActiveJobs,
+		Log: func(format string, args ...any) {
+			Log(format, args...)
+		},
+	}))
+
 	// Start the periodic auto-updater. The goroutine always runs; whether it
 	// actually checks/installs on a given tick is decided per-tick by
 	// resolveAutoUpdateEnabled() so the switch can be flipped on a *running*

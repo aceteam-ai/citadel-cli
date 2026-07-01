@@ -104,6 +104,49 @@ func (c *Client) GetLatestRelease() (*Release, error) {
 	return c.fetchLatestRelease()
 }
 
+// GetReleaseByTag fetches a specific release by its tag name (e.g. "v2.47.0").
+// Used by the AGENT_UPDATE job handler to install a pinned target version
+// rather than only the latest release. The leading "v" is optional and is
+// normalized to match the release tag convention.
+func (c *Client) GetReleaseByTag(tag string) (*Release, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return nil, fmt.Errorf("release tag must not be empty")
+	}
+	if !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
+	}
+
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", GitHubAPIBase, GitHubRepo, tag)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "citadel-cli")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("release %s not found", tag)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned status: %s", resp.Status)
+	}
+
+	var release Release
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return nil, err
+	}
+
+	return &release, nil
+}
+
 // Download downloads the binary for the current OS/ARCH
 func (c *Client) Download(release *Release, destPath string) error {
 	downloadURL := c.getDownloadURL(release)

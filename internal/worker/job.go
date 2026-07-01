@@ -135,6 +135,7 @@ const (
 	JobTypeVNCActions        = "VNC_ACTIONS"         // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
 	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
 	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
+	JobTypeAgentUpdate       = "AGENT_UPDATE"        // Remotely update + restart this node's own citadel agent (aceteam#4427)
 )
 
 // allKnownJobTypes enumerates every job type this citadel build knows about.
@@ -179,4 +180,5 @@ var allKnownJobTypes = []string{
 	JobTypeVNCActions,
 	JobTypeCobrowse,
 	JobTypeTranscribeAudio,
+	JobTypeAgentUpdate,
 }
