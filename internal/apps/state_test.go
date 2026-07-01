@@ -4,7 +4,23 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+// nextFreeFrom returns the first port >= from within the apps range that is not
+// used by an already-allocated app and not citadel-reserved. It mirrors
+// AllocatePort's skip logic so the allocation tests don't hardcode ports that
+// shift when the reserved set changes.
+func nextFreeFrom(from int, used map[int]bool) int {
+	reserved := services.InRangeReservedHostPorts()
+	for p := from; p <= portRangeEnd; p++ {
+		if !used[p] && !reserved[p] {
+			return p
+		}
+	}
+	return 0
+}
 
 func TestStateRoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -100,23 +116,26 @@ func TestAllocatePort(t *testing.T) {
 		path: filepath.Join(t.TempDir(), "state.json"),
 	}
 
-	// First allocation should return portRangeStart.
+	// First allocation should return the first free, non-reserved port.
+	wantFirst := nextFreeFrom(portRangeStart, map[int]bool{})
 	port, err := s.AllocatePort()
 	if err != nil {
 		t.Fatalf("AllocatePort() error: %v", err)
 	}
-	if port != portRangeStart {
-		t.Errorf("AllocatePort() = %d, want %d", port, portRangeStart)
+	if port != wantFirst {
+		t.Errorf("AllocatePort() = %d, want %d", port, wantFirst)
 	}
 
-	// After setting an app on portRangeStart, next should be portRangeStart+1.
-	s.Set(InstalledApp{Name: "app1", HostPort: portRangeStart})
+	// After setting an app on the first port, the next allocation should skip
+	// it (and any citadel-reserved in-range ports).
+	s.Set(InstalledApp{Name: "app1", HostPort: port})
+	wantSecond := nextFreeFrom(portRangeStart, map[int]bool{port: true})
 	port, err = s.AllocatePort()
 	if err != nil {
 		t.Fatalf("AllocatePort() error: %v", err)
 	}
-	if port != portRangeStart+1 {
-		t.Errorf("AllocatePort() = %d, want %d", port, portRangeStart+1)
+	if port != wantSecond {
+		t.Errorf("AllocatePort() = %d, want %d", port, wantSecond)
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // InstalledApp records the runtime state of a deployed app.
@@ -155,7 +157,10 @@ const (
 
 // AllocatePort returns the next available port in the 8100-8199 range
 // that is not already used by an installed app. It returns an error
-// if the range is exhausted.
+// if the range is exhausted. Ports reserved by citadel's own services that
+// happen to fall inside this range (e.g. the TEI embedding upstream 8102 and
+// the transcribe sidecar 8101) are skipped so a dynamically allocated app can
+// never collide with them.
 func (s *State) AllocatePort() (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -164,9 +169,10 @@ func (s *State) AllocatePort() (int, error) {
 	for _, app := range s.Apps {
 		used[app.HostPort] = true
 	}
+	reserved := services.InRangeReservedHostPorts()
 
 	for port := portRangeStart; port <= portRangeEnd; port++ {
-		if !used[port] {
+		if !used[port] && !reserved[port] {
 			return port, nil
 		}
 	}
