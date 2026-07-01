@@ -27,6 +27,14 @@ type SettingsCallbacks struct {
 	// May be nil if the monitor is not running. The string is a short,
 	// already-formatted label like "on (AC)" or "off (battery)".
 	KeepAwakeState func() string
+
+	// LoadMouse returns the current persisted mouse-control setting.
+	LoadMouse func() *config.Mouse
+	// SaveMouse persists an updated mouse-control setting.
+	SaveMouse func(*config.Mouse) error
+	// SetMouseEnabled applies mouse capture live on the running app (no restart),
+	// mirroring tview's app.EnableMouse. May be nil in contexts without an app.
+	SetMouseEnabled func(bool)
 }
 
 // connStatusProvider exposes the user-facing connection status. The ChatPage
@@ -49,6 +57,7 @@ type SettingsPage struct {
 	// State
 	telemetry *config.Telemetry
 	keepAwake *config.KeepAwake
+	mouse     *config.Mouse
 
 	// UI
 	root *tview.Flex
@@ -92,6 +101,7 @@ func (p *SettingsPage) Build(app *tview.Application) tview.Primitive {
 func (p *SettingsPage) OnActivate() {
 	p.reloadTelemetry()
 	p.reloadKeepAwake()
+	p.reloadMouse()
 	p.render()
 	if p.app != nil && p.view != nil {
 		p.app.SetFocus(p.view)
@@ -102,9 +112,12 @@ func (p *SettingsPage) OnActivate() {
 func (p *SettingsPage) OnDeactivate() {}
 
 // HandleInput implements Page. Space/Enter/'t' toggles the telemetry opt-out;
-// 'k' toggles the keep-awake-on-AC opt-in.
+// 'k' toggles the keep-awake-on-AC opt-in; 'm' toggles mouse control.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
+	case event.Key() == tcell.KeyRune && (event.Rune() == 'm' || event.Rune() == 'M'):
+		p.toggleMouse()
+		return nil
 	case event.Key() == tcell.KeyRune && (event.Rune() == 'k' || event.Rune() == 'K'):
 		p.toggleKeepAwake()
 		return nil
@@ -176,6 +189,43 @@ func (p *SettingsPage) toggleKeepAwake() {
 	p.render()
 }
 
+// reloadMouse refreshes the in-memory mouse setting from disk.
+func (p *SettingsPage) reloadMouse() {
+	if p.cb.LoadMouse != nil {
+		p.mouse = p.cb.LoadMouse()
+	}
+	if p.mouse == nil {
+		p.mouse = config.DefaultMouse()
+	}
+}
+
+// toggleMouse flips mouse control, applies it live on the running app, and
+// persists it. The live apply (SetMouseEnabled) takes effect immediately with no
+// restart — strictly better than a setting that only applies next launch.
+func (p *SettingsPage) toggleMouse() {
+	if p.mouse == nil {
+		p.reloadMouse()
+	}
+
+	next := &config.Mouse{Enabled: !p.mouse.Enabled}
+
+	// Apply live first so the change is visible immediately even if persistence
+	// fails; the error line still surfaces a save failure.
+	if p.cb.SetMouseEnabled != nil {
+		p.cb.SetMouseEnabled(next.Enabled)
+	}
+
+	if p.cb.SaveMouse != nil {
+		if err := p.cb.SaveMouse(next); err != nil {
+			p.mouse = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.mouse = next
+	p.render()
+}
+
 // render redraws the settings view from current state.
 func (p *SettingsPage) render() {
 	p.renderWithError("")
@@ -221,6 +271,26 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   this node is plugged in, so the laptop stays reachable on the\n")
 	sb.WriteString("   mesh. Released on battery and on exit. Display may still sleep.\n\n")
 	sb.WriteString("   [yellow::b]k[-:-:-] toggle keep-awake\n")
+
+	// -- Mouse control --
+	// The value here is the copy, not just the switch: the real tradeoff is
+	// "GUI-feel vs. native terminal drag-to-copy", and a bare toggle just
+	// relocates the confusion. Name the tradeoff and the bypass keys inline.
+	mouseEnabled := p.mouse != nil && p.mouse.Enabled
+	sb.WriteString("\n [yellow::b]Mouse Control[-:-:-]\n\n")
+	if mouseEnabled {
+		sb.WriteString("   Status:  [green::b]ON[-:-:-]  [gray](click to drive)[-]\n")
+	} else {
+		sb.WriteString("   Status:  [red::b]OFF[-:-:-]  [gray](keyboard only)[-]\n")
+	}
+	sb.WriteString("\n   [white]What it does:[-] click tabs, peers, and Send instead of\n")
+	sb.WriteString("   memorizing keys. Keyboard shortcuts keep working either way.\n\n")
+	sb.WriteString("   [white]Tradeoff:[-] your terminal's drag-to-copy stops working while\n")
+	sb.WriteString("   this is on. To copy anyway, hold:\n")
+	sb.WriteString("     [white]• Shift[-]    (most terminals)\n")
+	sb.WriteString("     [white]• Fn[-]       (macOS Terminal.app)\n")
+	sb.WriteString("     [white]• Option[-]   (iTerm2)\n\n")
+	sb.WriteString("   [yellow::b]m[-:-:-] toggle mouse control [gray](applies immediately)[-]\n")
 
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")

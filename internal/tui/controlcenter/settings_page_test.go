@@ -127,6 +127,79 @@ func TestSettingsToggleKeepAwake_PersistsOptIn(t *testing.T) {
 	}
 }
 
+func TestSettingsToggleMouse_PersistsAndAppliesLive(t *testing.T) {
+	store := config.DefaultMouse() // Enabled: true by default
+	var liveState []bool
+	cb := SettingsCallbacks{
+		LoadMouse: func() *config.Mouse {
+			cp := *store
+			return &cp
+		},
+		SaveMouse: func(m *config.Mouse) error {
+			store.Enabled = m.Enabled
+			return nil
+		},
+		SetMouseEnabled: func(enabled bool) {
+			liveState = append(liveState, enabled)
+		},
+	}
+	p := NewSettingsPage(cb, nil)
+	p.reloadMouse()
+
+	if !p.mouse.Enabled {
+		t.Fatalf("expected default enabled, got %+v", p.mouse)
+	}
+
+	// Toggle off: persists false and applies live immediately.
+	p.toggleMouse()
+	if p.mouse.Enabled {
+		t.Error("in-memory state should be disabled after toggle")
+	}
+	if store.Enabled {
+		t.Error("persisted store should be disabled after toggle")
+	}
+	if len(liveState) != 1 || liveState[0] != false {
+		t.Errorf("SetMouseEnabled should have been called once with false, got %v", liveState)
+	}
+
+	// Toggle back on.
+	p.toggleMouse()
+	if !p.mouse.Enabled {
+		t.Error("in-memory state should be enabled after second toggle")
+	}
+	if !store.Enabled {
+		t.Error("persisted store should be enabled after second toggle")
+	}
+	if len(liveState) != 2 || liveState[1] != true {
+		t.Errorf("SetMouseEnabled should have been called with true, got %v", liveState)
+	}
+}
+
+func TestSettingsToggleMouse_SaveErrorStillAppliesLive(t *testing.T) {
+	var liveState []bool
+	cb := SettingsCallbacks{
+		LoadMouse: config.DefaultMouse,
+		SaveMouse: func(*config.Mouse) error {
+			return errTestSave
+		},
+		SetMouseEnabled: func(enabled bool) {
+			liveState = append(liveState, enabled)
+		},
+	}
+	p := NewSettingsPage(cb, nil)
+	p.Build(nil)
+	p.reloadMouse()
+
+	p.toggleMouse()
+	// Live apply must happen even when persistence fails, so the UX is not stuck.
+	if len(liveState) != 1 || liveState[0] != false {
+		t.Errorf("SetMouseEnabled should apply live even on save error, got %v", liveState)
+	}
+	if p.mouse.Enabled {
+		t.Error("in-memory state should reflect attempted toggle even on save error")
+	}
+}
+
 func TestWSSEndpoint_HidesRedisTransport(t *testing.T) {
 	cases := map[string]string{
 		"https://aceteam.ai":          "wss://aceteam.ai",

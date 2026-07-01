@@ -33,6 +33,11 @@ var debugMode bool
 var daemonMode bool
 var noColorGlobal bool
 
+// noMouse, when set, disables terminal mouse reporting in the control center for
+// the current session, overriding the persisted preference. Users set it to keep
+// their terminal's native drag-to-copy working.
+var noMouse bool
+
 // debugToStderr forces debug console output to stderr instead of stdout.
 // Set by commands that use stdout as a transport (e.g., MCP).
 var debugToStderr bool
@@ -214,6 +219,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
 	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
+	rootCmd.Flags().BoolVar(&noMouse, "no-mouse", false, "Disable control-center mouse control (keeps terminal drag-to-copy)")
 
 	// Hide persistent flags that are only for dev/scripting
 	rootCmd.PersistentFlags().MarkHidden("config")

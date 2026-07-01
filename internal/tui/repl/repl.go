@@ -370,7 +370,9 @@ func (m *Model) runExternalCommand(name string, args ...string) (string, error) 
 }
 
 func Run(cfg Config) error {
-	p := tea.NewProgram(New(cfg))
+	// Enable mouse cell motion so scroll/click work in the REPL, matching the
+	// control center's mouse-on-by-default behavior. Keyboard input is unaffected.
+	p := tea.NewProgram(New(cfg), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }

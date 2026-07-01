@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -257,6 +258,21 @@ func (pm *PageManager) Hide(name string) {
 	}
 }
 
+// activeName returns the name of the currently active page, or "" if none.
+func (pm *PageManager) activeName() string {
+	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
+		return pm.registered[pm.activeIdx].page.Name()
+	}
+	return ""
+}
+
+// isDashboardActive reports whether the Dashboard (control center) page is the
+// active one. The dashboard has its own focus/highlight model that the mouse
+// capture must keep in sync; other pages handle clicks natively.
+func (pm *PageManager) isDashboardActive() bool {
+	return pm.activeName() == "dashboard"
+}
+
 // SwitchToName switches to a page by name (for programmatic switching).
 func (pm *PageManager) SwitchToName(name string) {
 	for i, rp := range pm.registered {
@@ -276,18 +292,62 @@ func (pm *PageManager) updateTabBar() {
 		}
 		displayNum++
 		key := fmt.Sprintf("Alt+%d", displayNum)
+		// Wrap each tab in a TextView region keyed by its real registered index.
+		// Regions make the tab a native click target: tview resolves a click to
+		// the region under the cursor (correctly, even with center alignment), so
+		// clicking a tab switches to it. The keyboard path (Alt+N) is unchanged.
+		fmt.Fprintf(&sb, `["tab_%d"]`, i)
 		if i == pm.activeIdx {
 			sb.WriteString(fmt.Sprintf("[yellow::b][%s %s][-:-:-]", key, rp.page.Title()))
 		} else {
 			sb.WriteString(fmt.Sprintf("[gray] %s %s [-]", key, rp.page.Title()))
 		}
+		sb.WriteString(`[""]`)
 		sb.WriteString(" ")
 	}
 	pm.tabBar.SetText(sb.String())
 }
 
+// tabIndexFromRegion parses a tab region ID ("tab_<realIdx>") back to the real
+// registered index it encodes, returning (idx, true) on success. Extracted so
+// the region-ID parsing is unit-testable without a running app.
+func tabIndexFromRegion(regionID string) (int, bool) {
+	const prefix = "tab_"
+	if !strings.HasPrefix(regionID, prefix) {
+		return 0, false
+	}
+	idx, err := strconv.Atoi(strings.TrimPrefix(regionID, prefix))
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
+}
+
+// enableTabClicks wires click-to-switch on the tab bar. A click highlights the
+// tab's region; the highlight handler maps that region back to a page index and
+// switches to it, then clears the highlight so no tab stays visually "stuck"
+// (the active-tab styling is driven by updateTabBar, not by region highlight).
+func (pm *PageManager) enableTabClicks() {
+	pm.tabBar.SetRegions(true)
+	pm.tabBar.SetHighlightedFunc(func(added, removed, remaining []string) {
+		if len(added) == 0 {
+			return
+		}
+		idx, ok := tabIndexFromRegion(added[0])
+		if !ok || idx < 0 || idx >= len(pm.registered) || !pm.registered[idx].visible {
+			pm.tabBar.Highlight()
+			return
+		}
+		// Clear the transient highlight first; SwitchTo re-renders the tab bar and
+		// drives the active-tab styling itself.
+		pm.tabBar.Highlight()
+		pm.SwitchTo(idx)
+	})
+}
+
 // Build returns the root layout: pages container + tab bar.
 func (pm *PageManager) Build() *tview.Flex {
+	pm.enableTabClicks()
 	pm.rootFlex = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(pm.pages, 0, 1, true).
 		AddItem(pm.tabBar, 1, 0, false)
@@ -434,6 +494,12 @@ type ControlCenter struct {
 
 	// Module install (install a service module from any standardized repo)
 	moduleInstallConfig ModuleInstallCallbacks
+
+	// Mouse control. mouseEnabled is the resolved initial state (persisted config
+	// overridden by the --no-mouse flag); it is applied to the app in Run() and
+	// can be flipped live from the Settings pane. Keyboard navigation is fully
+	// preserved regardless of this value — mouse is purely additive.
+	mouseEnabled bool
 }
 
 // Pane focus constants
@@ -502,6 +568,12 @@ type Config struct {
 	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
 	WhatsApp           WhatsAppCallbacks                        // WhatsApp bridge page hooks (deploy/stop/status/QR)
 	ModuleInstall      ModuleInstallCallbacks                   // Install-module page hooks (resolve source + install)
+
+	// MouseEnabled is the resolved initial mouse state (persisted preference with
+	// the --no-mouse flag applied). When true, the control center opts into
+	// terminal mouse reporting so tabs/rows/Send are clickable. Keyboard
+	// navigation works either way.
+	MouseEnabled bool
 }
 
 // ProxmoxConfig holds configuration for the Proxmox TUI page.
@@ -542,6 +614,7 @@ func New(cfg Config) *ControlCenter {
 		settingsConfig:      cfg.Settings,
 		whatsappConfig:      cfg.WhatsApp,
 		moduleInstallConfig: cfg.ModuleInstall,
+		mouseEnabled:        cfg.MouseEnabled,
 	}
 }
 
@@ -668,6 +741,10 @@ func (cc *ControlCenter) Run() error {
 	}
 
 	// Settings page (Alt+5): telemetry opt-out + read-only connection status.
+	// Inject the live mouse-toggle hook here (not in cmd) because it needs a
+	// reference to the running app, which only exists once Run() has created it.
+	// The persistence hooks (LoadMouse/SaveMouse) are wired from cmd.
+	cc.settingsConfig.SetMouseEnabled = cc.SetMouseEnabled
 	cc.pmgr.Register(NewSettingsPage(cc.settingsConfig, cc.chatPage), true)
 
 	cc.rootView = cc.pmgr.Build()
@@ -679,6 +756,15 @@ func (cc *ControlCenter) Run() error {
 	cc.app.SetInputCapture(cc.pmgr.HandleGlobalInput)
 
 	cc.app.SetRoot(cc.rootView, true)
+
+	// Opt into terminal mouse reporting so tabs, list rows, and the chat Send
+	// button are clickable. This is purely additive: SetMouseCapture below syncs
+	// the control-center's own focus/highlight model with tview's native
+	// focus-on-click, and all keybindings remain wired through SetInputCapture.
+	// Gated by the resolved preference (persisted config with --no-mouse applied)
+	// so a user who wants native terminal drag-to-copy can turn it off.
+	cc.app.EnableMouse(cc.mouseEnabled)
+	cc.app.SetMouseCapture(cc.handleMouse)
 
 	// Start background tasks after a brief delay to ensure event loop is running
 	go func() {
@@ -852,6 +938,28 @@ func (cc *ControlCenter) buildUI() {
 		AddItem(bottomRow, 0, 1, false).
 		AddItem(cc.helpBar, 1, 0, false).
 		AddItem(cc.statusBar, 1, 0, false)
+
+	// Keep the help bar accurate when the selection changes by mouse click within
+	// an already-focused pane (a click that doesn't change the focused pane skips
+	// updatePaneFocus, which is what normally refreshes the help bar). The
+	// keyboard arrow path already calls updateHelpBar, so this only adds coverage
+	// for mouse row-selection; it never double-fires meaningfully because SetText
+	// is idempotent.
+	cc.servicesView.SetSelectionChangedFunc(func(row, column int) {
+		if cc.focusedPane == paneServices {
+			cc.updateHelpBar()
+		}
+	})
+	cc.peersView.SetSelectionChangedFunc(func(row, column int) {
+		if cc.focusedPane == panePeers {
+			cc.updateHelpBar()
+		}
+	})
+	cc.actionsView.SetSelectionChangedFunc(func(row, column int) {
+		if cc.focusedPane == paneActions {
+			cc.updateHelpBar()
+		}
+	})
 
 	cc.focusedPane = paneServices
 }
@@ -1482,6 +1590,13 @@ func (cc *ControlCenter) showHelpModal() {
   [white::b]?[-:-:-] or [white::b]h[-:-:-]       Show this help
   [white::b]q[-:-:-] / [white::b]Esc[-:-:-]      Quit (with confirmation)
 
+[yellow]Mouse:[-]
+  Click a pane to focus it, double-click for details, click an
+  Action to run it. In Chat, click Send or a message to type.
+  [gray]Mouse reporting disables terminal drag-to-copy — hold Shift
+  (Fn on macOS Terminal, Option in iTerm2) to select text, or
+  turn mouse off in Settings (Alt tab) / launch with --no-mouse.[-]
+
 [gray]Press any key to close[-]`
 
 	cc.inModal = true
@@ -1552,9 +1667,21 @@ func (cc *ControlCenter) updateActionsPanel() {
 
 	actions := cc.getActions()
 	for i, action := range actions {
-		cc.actionsView.SetCell(i, 0, tview.NewTableCell("[yellow::b]"+action.key+"[-:-:-]").SetSelectable(true))
-		cc.actionsView.SetCell(i, 1, tview.NewTableCell(action.name).SetSelectable(true).SetExpansion(1))
-		cc.actionsView.SetCell(i, 2, tview.NewTableCell(action.desc).SetSelectable(true))
+		// Single-click on any cell of an action row runs it — the same behavior as
+		// the 0-3 hotkeys. SetClickedFunc fires on MouseLeftClick; returning false
+		// lets the row also become selected so the highlight tracks the click.
+		// (tview's Table only invokes SetSelectedFunc on keyboard Enter, never on
+		// click, so this is the click path and cannot double-fire with Enter.)
+		fn := action.fn
+		run := func() bool {
+			if fn != nil {
+				fn()
+			}
+			return false
+		}
+		cc.actionsView.SetCell(i, 0, tview.NewTableCell("[yellow::b]"+action.key+"[-:-:-]").SetSelectable(true).SetClickedFunc(run))
+		cc.actionsView.SetCell(i, 1, tview.NewTableCell(action.name).SetSelectable(true).SetExpansion(1).SetClickedFunc(run))
+		cc.actionsView.SetCell(i, 2, tview.NewTableCell(action.desc).SetSelectable(true).SetClickedFunc(run))
 	}
 
 	cc.actionsView.Select(0, 0)
@@ -1961,13 +2088,16 @@ func (cc *ControlCenter) updateActivityView() {
 }
 
 func (cc *ControlCenter) updateHelpBar() {
+	var text string
+	set := func(s string) { text = s }
+
 	switch cc.focusedPane {
 	case paneNode:
-		cc.helpBar.SetText("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneSystem:
-		cc.helpBar.SetText("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneJobs:
-		cc.helpBar.SetText("[yellow::b]Enter[-:-:-] view details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] view details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneServices:
 		svcName := cc.getSelectedServiceName()
 		svcStatus := cc.getSelectedServiceStatus()
@@ -1978,37 +2108,48 @@ func (cc *ControlCenter) updateHelpBar() {
 				statusIcon = "[green]●[-]"
 				action = "stop"
 			}
-			cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
+			set(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
 				svcName, statusIcon, action))
 		} else {
-			cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			set("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActions:
 		row, _ := cc.actionsView.GetSelection()
 		actions := cc.getActions()
 		if row >= 0 && row < len(actions) {
 			action := actions[row]
-			cc.helpBar.SetText(fmt.Sprintf("[yellow::b]%s[-:-:-] [white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
+			set(fmt.Sprintf("[yellow::b]%s[-:-:-] [white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
 				action.key, action.name))
 		} else {
-			cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
+			set("[yellow::b]↑/↓[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
 		}
 	case panePeers:
 		if len(cc.data.Peers) > 0 {
 			row, _ := cc.peersView.GetSelection()
 			if row > 0 && row <= len(cc.data.Peers) {
 				peer := cc.data.Peers[row-1]
-				cc.helpBar.SetText(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help",
+				set(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help",
 					peer.Hostname))
 			} else {
-				cc.helpBar.SetText("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
+				set("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
 			}
 		} else {
-			cc.helpBar.SetText("[yellow::b]Tab[-:-:-] switch pane  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			set("[yellow::b]Tab[-:-:-] switch pane  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActivity:
-		cc.helpBar.SetText("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help")
+		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help")
 	}
+
+	// When mouse is on, advertise it so the click affordances are discoverable
+	// (and, by extension, so the drag-to-copy tradeoff is findable in help). The
+	// hint points at Settings, which is the actual off-switch — the mock's [S]
+	// key would collide with the existing 's' = start-service binding, so we do
+	// not bind a key here.
+	if cc.mouseEnabled {
+		text += "  [gray]│  mouse on[-]"
+	}
+
+	cc.helpBar.SetText(text)
 }
 
 func (cc *ControlCenter) updateStatusBar() {
