@@ -230,6 +230,19 @@ func TestCalculateSHA256FileNotFound(t *testing.T) {
 	}
 }
 
+// TestGetReleaseByTagEmpty asserts the empty-tag guard fires before any network
+// call, so an AGENT_UPDATE job with a blank target_version fails fast and
+// structurally rather than hitting GitHub with a malformed URL.
+func TestGetReleaseByTagEmpty(t *testing.T) {
+	client := NewClient("v1.0.0")
+	if _, err := client.GetReleaseByTag(""); err == nil {
+		t.Error("GetReleaseByTag(\"\") should return an error")
+	}
+	if _, err := client.GetReleaseByTag("   "); err == nil {
+		t.Error("GetReleaseByTag(whitespace) should return an error")
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
 }
