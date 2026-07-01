@@ -4,8 +4,13 @@ services:
   llamacpp:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: citadel-llamacpp
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_LLAMACPP_HOST_PORT. Bound to 127.0.0.1 because the only
+    # mesh-exposed surface is the gateway, which reaches this engine over
+    # localhost; publishing on 0.0.0.0 would needlessly widen the mesh attack
+    # surface. The container still serves on :8080 internally.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${CITADEL_LLAMACPP_HOST_PORT}:8080"
     volumes:
       - ~/citadel-cache/llamacpp:/models
     command: ["--host", "0.0.0.0", "--port", "8080"]
