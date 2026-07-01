@@ -799,3 +799,18 @@ Auto-generated log of every release.
   - fix(tui): apply the Fullscreen rendering pref at launch (#394) (#395)
 
 
+---
+
+## v2.54.0 — 2026-07-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +61 |
+
+**Changes:**
+
+  - fix(tui): chat deadlock — nested QueueUpdateDraw freezes the whole TUI on connect (#402)
+
+
