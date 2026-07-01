@@ -263,10 +263,15 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// Set working directory for relative paths in compose files
 		cmd.Dir = configDir
 
+		// Start from the process env and supply the citadel-owned host ports so
+		// compose files that defer their host publish to ${CITADEL_*_HOST_PORT}
+		// (llamacpp/vllm/extraction) resolve.
+		env := append(os.Environ(), services.HostPortEnv()...)
 		// Configure GPU runtime if on Linux
 		if platform.IsLinux() {
-			cmd.Env = append(os.Environ(), "DOCKER_DEFAULT_RUNTIME=nvidia")
+			env = append(env, "DOCKER_DEFAULT_RUNTIME=nvidia")
 		}
+		cmd.Env = env
 
 		output, err := cmd.CombinedOutput()
 		if err != nil {

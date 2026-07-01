@@ -14,9 +14,16 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 type LlamaCppInferenceHandler struct{}
+
+// llamacppBaseURL is the host-local base URL for the llama.cpp server, using the
+// citadel-owned host port (services/ports.go) rather than a hardcoded literal.
+func llamacppBaseURL() string {
+	return fmt.Sprintf("http://localhost:%d", services.LlamacppHostPort)
+}
 
 // NOTE (from Architect): The logic below still restarts the container for every job.
 // This is a direct port of the original logic for the refactoring. The next step
@@ -37,6 +44,9 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	newCommand := fmt.Sprintf("--model /models/%s --host 0.0.0.0 --port 8080 --n-gpu-layers -1", modelFile)
 	restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
 	restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))
+	// Supply the citadel-owned host port so the compose ports line
+	// (127.0.0.1:${CITADEL_LLAMACPP_HOST_PORT}:8080) resolves.
+	restartCmd.Env = append(restartCmd.Env, services.HostPortEnv()...)
 
 	if output, err := restartCmd.CombinedOutput(); err != nil {
 		return output, fmt.Errorf("failed to restart llama.cpp service with new model: %w", err)
@@ -54,7 +64,7 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 }
 
 func (h *LlamaCppInferenceHandler) waitForLlamaCppReady() error {
-	llamacppURL := "http://localhost:8080/completion"
+	llamacppURL := llamacppBaseURL() + "/completion"
 	maxWait := 120 * time.Second
 	pollInterval := 2 * time.Second
 	startTime := time.Now()
@@ -83,7 +93,7 @@ func (h *LlamaCppInferenceHandler) performInference(prompt string) ([]byte, erro
 		"temperature": 0.7,
 	}
 	reqBody, _ := json.Marshal(requestPayload)
-	resp, httpErr := http.Post("http://localhost:8080/completion", "application/json", bytes.NewBuffer(reqBody))
+	resp, httpErr := http.Post(llamacppBaseURL()+"/completion", "application/json", bytes.NewBuffer(reqBody))
 	if httpErr != nil {
 		return nil, fmt.Errorf("failed to connect to llama.cpp service: %w", httpErr)
 	}
