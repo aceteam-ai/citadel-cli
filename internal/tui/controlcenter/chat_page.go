@@ -16,6 +16,14 @@ import (
 // presenceTimeout is how long since last heartbeat before a node is considered offline.
 const presenceTimeout = 90 * time.Second
 
+// connectTimeout bounds how long the Chat tab shows "connecting…" before the
+// watchdog flips it to a real timeout error. It is longer than the underlying
+// WebSocket HandshakeTimeout (10s) so a dial failure surfaces its own specific
+// error first; the watchdog only catches the cases the dial itself can't (e.g. a
+// server that accepts the socket then closes on a scope mismatch, or a silently
+// rejected subscribe that never yields an OnConnect).
+const connectTimeout = 15 * time.Second
+
 // connState describes the chat transport connection lifecycle.
 type connState int
 
@@ -304,22 +312,140 @@ func (p *ChatPage) OnActivate() {
 // OnDeactivate implements Page.
 func (p *ChatPage) OnDeactivate() {}
 
-// HandleInput implements Page. Routes input to the input field or message view.
-func (p *ChatPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
-	// Page Up / Page Down scroll the message view
+// chatKeyAction classifies how the Chat page should treat a key event. It is the
+// escape hatch for the keyboard trap: when the input field is focused, tview's
+// InputField would otherwise *consume* Tab/Shift+Tab/Escape internally (its
+// SetDoneFunc path swallows them), leaving the user unable to leave the Chat tab.
+//
+// The Control Center routes every key through the active page's HandleInput
+// *before* it reaches the focused InputField (see PageManager.HandleGlobalInput),
+// so HandleInput returning nil consumes the key before the InputField ever sees
+// it — that is how we reclaim the navigation keys the InputField would trap.
+type chatKeyAction int
+
+const (
+	// chatKeyPassthrough returns the event unhandled so the focused primitive
+	// (usually the InputField: printable text, Enter=send, autocomplete) handles it.
+	chatKeyPassthrough chatKeyAction = iota
+	// chatKeyScrollUp / chatKeyScrollDown scroll the message history.
+	chatKeyScrollUp
+	chatKeyScrollDown
+	// chatKeyDefocus moves focus off the input back to the message view (Escape),
+	// so the user is no longer trapped typing.
+	chatKeyDefocus
+	// chatKeyNextPane / chatKeyPrevPane cycle focus among the Chat page's own
+	// panes (input -> messages -> peers -> channels -> input).
+	chatKeyNextPane
+	chatKeyPrevPane
+)
+
+// classifyChatKey maps a key event to a chatKeyAction. Pure and table-testable
+// without a running tview app. The rule (per the keyboard-trap fix): the chat
+// input only consumes printable text + Enter (send) + history/scroll keys;
+// everything navigational is reclaimed here so the user can always leave.
+func classifyChatKey(event *tcell.EventKey) chatKeyAction {
+	// Alt+<rune> is a global tab accelerator handled upstream in
+	// HandleGlobalInput before it ever reaches here; never treat it as text.
+	if event.Modifiers()&tcell.ModAlt != 0 {
+		return chatKeyPassthrough
+	}
 	switch event.Key() {
 	case tcell.KeyPgUp:
+		return chatKeyScrollUp
+	case tcell.KeyPgDn:
+		return chatKeyScrollDown
+	case tcell.KeyEscape:
+		return chatKeyDefocus
+	case tcell.KeyTab:
+		return chatKeyNextPane
+	case tcell.KeyBacktab:
+		return chatKeyPrevPane
+	default:
+		return chatKeyPassthrough
+	}
+}
+
+// HandleInput implements Page. It runs before the focused InputField sees the
+// event, so it is where we free the navigation keys the InputField would trap.
+func (p *ChatPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
+	switch classifyChatKey(event) {
+	case chatKeyScrollUp:
 		row, col := p.msgView.GetScrollOffset()
 		p.msgView.ScrollTo(row-10, col)
 		return nil
-	case tcell.KeyPgDn:
+	case chatKeyScrollDown:
 		row, col := p.msgView.GetScrollOffset()
 		p.msgView.ScrollTo(row+10, col)
 		return nil
+	case chatKeyDefocus:
+		// Escape releases the keyboard trap: move focus off the input to the
+		// message view so the user can navigate (Tab/Alt+N) freely.
+		if p.app != nil && p.msgView != nil {
+			p.app.SetFocus(p.msgView)
+		}
+		return nil
+	case chatKeyNextPane:
+		p.focusNextPane()
+		return nil
+	case chatKeyPrevPane:
+		p.focusPrevPane()
+		return nil
+	default:
+		return event
 	}
-
-	return event
 }
+
+// chatPanes returns the Chat page's focusable panes in tab order. Kept as a
+// helper so pane cycling and its tests share a single source of truth.
+func (p *ChatPage) chatPanes() []tview.Primitive {
+	return []tview.Primitive{p.input, p.msgView, p.peersBox, p.channelBox}
+}
+
+// nextChatPaneIndex computes the index of the pane to focus next, cycling
+// forward (delta=+1) or backward (delta=-1) from the currently focused pane.
+// Pure and testable: `focused` is the index of the currently focused pane, or
+// -1 when focus is elsewhere (in which case we start at the input).
+func nextChatPaneIndex(focused, count, delta int) int {
+	if count == 0 {
+		return -1
+	}
+	if focused < 0 {
+		if delta >= 0 {
+			return 0
+		}
+		return count - 1
+	}
+	return ((focused+delta)%count + count) % count
+}
+
+// currentChatPaneIndex returns the index of the currently focused chat pane, or
+// -1 if focus is not on any of them.
+func (p *ChatPage) currentChatPaneIndex() int {
+	if p.app == nil {
+		return -1
+	}
+	focused := p.app.GetFocus()
+	for i, pane := range p.chatPanes() {
+		if pane == focused {
+			return i
+		}
+	}
+	return -1
+}
+
+func (p *ChatPage) cycleChatPane(delta int) {
+	panes := p.chatPanes()
+	idx := nextChatPaneIndex(p.currentChatPaneIndex(), len(panes), delta)
+	if idx < 0 {
+		return
+	}
+	if p.app != nil {
+		p.app.SetFocus(panes[idx])
+	}
+}
+
+func (p *ChatPage) focusNextPane() { p.cycleChatPane(1) }
+func (p *ChatPage) focusPrevPane() { p.cycleChatPane(-1) }
 
 // connect establishes the chat client connection.
 func (p *ChatPage) connect() {
@@ -337,7 +463,14 @@ func (p *ChatPage) connect() {
 
 	if apiBaseURL == "" || apiToken == "" || orgID == "" {
 		p.clientMu.Unlock()
+		// Surface the failure in BOTH the message view AND the status bar. The
+		// status bar was seeded to connConnecting in Build(); without this it
+		// stays pinned on the "connecting…" spinner forever even though we never
+		// dial. Flip it to a real error state instead.
 		p.setStatus("[red]Not configured[white] — device authorization required")
+		p.app.QueueUpdateDraw(func() {
+			p.renderStatusBar(connError, "device authorization required")
+		})
 		return
 	}
 
@@ -411,6 +544,32 @@ func (p *ChatPage) connect() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+
+	// Watchdog: if OnConnect has not fired within connectTimeout of dialing, flip
+	// the status bar out of the "connecting…" spinner into a real timeout error.
+	// This guarantees the UI never spins forever, regardless of the failure mode
+	// (a hung dial, a server that closes on a scope mismatch, or a silently
+	// rejected subscribe). It races the successful-connect path, so it must
+	// re-check p.connected / ctx.Err() under the lock — mirroring the guard on the
+	// Connect() error branch below — and no-op if either indicates success or
+	// shutdown.
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(connectTimeout):
+		}
+		p.clientMu.Lock()
+		connected := p.connected
+		p.clientMu.Unlock()
+		if !connected && ctx.Err() == nil {
+			p.app.QueueUpdateDraw(func() {
+				p.renderStatusBar(connError, "timed out")
+				p.setStatus("[red]Connection timed out[white] — chat is unavailable")
+				p.peersBox.SetText(" [red]offline[white]")
+			})
+		}
+	}()
 
 	// Connect blocks until ctx is cancelled on success, or returns quickly with
 	// an error if the handshake/subscribe fails. Surface the real error instead
@@ -514,6 +673,28 @@ func (p *ChatPage) appendMessage(msg chat.Message) {
 	p.msgView.ScrollToEnd()
 }
 
+// formatChatStatusBar renders the one-line status text for a given connection
+// state, endpoint, and optional error detail. Pure (no tview app required) so
+// the connecting/connected/error transitions are unit-testable. The endpoint is
+// assumed already sanitized to scheme + host by the caller.
+func formatChatStatusBar(state connState, endpoint, detail string) string {
+	if endpoint == "" {
+		endpoint = "not configured"
+	}
+	switch state {
+	case connConnected:
+		return fmt.Sprintf(" [green]●[white] connected  [gray]%s[white]", tview.Escape(endpoint))
+	case connError:
+		msg := fmt.Sprintf(" [red]●[white] error  [gray]%s[white]", tview.Escape(endpoint))
+		if detail != "" {
+			msg += fmt.Sprintf("  [red]%s[white]", tview.Escape(detail))
+		}
+		return msg
+	default:
+		return fmt.Sprintf(" [yellow]●[white] connecting…  [gray]%s[white]", tview.Escape(endpoint))
+	}
+}
+
 // renderStatusBar updates the one-line connection status indicator beneath the
 // message view. It surfaces which WSS endpoint the chat is using and its health
 // (connecting / connected / error). The endpoint is sanitized to scheme + host
@@ -525,22 +706,7 @@ func (p *ChatPage) renderStatusBar(state connState, detail string) {
 
 	p.state = state
 	endpoint := chat.SanitizeEndpoint(p.currentAPIBaseURL())
-	if endpoint == "" {
-		endpoint = "not configured"
-	}
-
-	switch state {
-	case connConnected:
-		p.statusBar.SetText(fmt.Sprintf(" [green]●[white] connected  [gray]%s[white]", tview.Escape(endpoint)))
-	case connError:
-		msg := fmt.Sprintf(" [red]●[white] error  [gray]%s[white]", tview.Escape(endpoint))
-		if detail != "" {
-			msg += fmt.Sprintf("  [red]%s[white]", tview.Escape(detail))
-		}
-		p.statusBar.SetText(msg)
-	default:
-		p.statusBar.SetText(fmt.Sprintf(" [yellow]●[white] connecting…  [gray]%s[white]", tview.Escape(endpoint)))
-	}
+	p.statusBar.SetText(formatChatStatusBar(state, endpoint, detail))
 }
 
 // setStatus updates the message view with a status line.
