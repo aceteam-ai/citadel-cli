@@ -15,6 +15,14 @@ services:
   - name: vllm
     compose_file: ./services/vllm.yml
 
+  # Text-to-image (HuggingFace diffusers). Enable this to serve image models
+  # (SDXL-Turbo by default; override with DIFFUSERS_MODEL, e.g. SD 3.5 Medium).
+  # The server listens on the diffusers contract port 7860 with a /health check;
+  # the compose file maps host port 8102 to it (7860 is used by the terminal
+  # server). Started remotely via SERVICE_START "diffusers".
+  # - name: diffusers
+  #   compose_file: ./services/diffusers.yml
+
 # Optional: declare GPU capabilities explicitly.
 # If omitted, capabilities are auto-detected via nvidia-smi at startup.
 # capabilities:

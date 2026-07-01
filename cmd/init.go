@@ -575,6 +575,7 @@ func getSelectedService() (string, error) {
 			"ollama (General purpose, easy to use)",
 			"llamacpp (Versatile GGUF server)",
 			"extraction (Entity/relation extraction, CPU-only)",
+			"diffusers (Text-to-image generation, GPU)",
 		},
 	)
 	if err != nil {

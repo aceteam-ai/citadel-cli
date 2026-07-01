@@ -1,0 +1,50 @@
+# services/compose/diffusers.yml
+#
+# Node-local text-to-image serving via the HuggingFace diffusers library.
+# Launched on a node by SERVICE_START "diffusers" (aceteam #4468). The image is
+# our own diffusers sidecar (services/diffusers-service), which serves a
+# /generate endpoint and a /health check on the diffusers contract port 7860.
+#
+# NOTE: the container listens on 7860 (the aceteam `diffusers-text-to-image`
+# template's default_port), exactly as vllm listens on 8000. The HOST port is
+# remapped to 8102 to avoid colliding with the citadel terminal server, which
+# binds host port 7860 by default (following the vllm 8100 / transcribe 8101
+# host-port sequence). SERVICE_START does not pass a port to the container; the
+# port contract is satisfied by the server listening on 7860 inside the container.
+
+services:
+  diffusers:
+    image: ghcr.io/aceteam-ai/diffusers-service:latest
+    container_name: citadel-diffusers
+    ports:
+      - "8102:7860"
+    volumes:
+      # Share the HuggingFace model cache with the other HF-based services
+      # (vllm, sglang, whisper) so weights are downloaded once per node.
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    environment:
+      # Model repo id to serve. Override for SD 3.5 Medium / SDXL / etc.:
+      #   DIFFUSERS_MODEL=stabilityai/stable-diffusion-3.5-medium
+      - DIFFUSERS_MODEL=${DIFFUSERS_MODEL:-stabilityai/sdxl-turbo}
+      - PORT=7860
+      # Gated models (e.g. stabilityai/stable-diffusion-3.5-medium) require a
+      # HuggingFace token. Set HF_TOKEN in the node's environment before
+      # SERVICE_START; the default SDXL-Turbo is open and needs no token.
+      - HF_TOKEN=${HF_TOKEN:-}
+    healthcheck:
+      # Hits the /health endpoint on the contract port (inside the container).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Generous start_period: a large model download on first boot can take a
+      # while, and /health answers before the model finishes loading anyway.
+      start_period: 120s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

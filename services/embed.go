@@ -27,6 +27,9 @@ var ExtractionCompose string
 //go:embed compose/transcribe.yml
 var TranscribeCompose string
 
+//go:embed compose/diffusers.yml
+var DiffusersCompose string
+
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
 	"ollama":     OllamaCompose,
@@ -36,6 +39,7 @@ var ServiceMap = map[string]string{
 	"sglang":     SGLangCompose,
 	"extraction": ExtractionCompose,
 	"transcribe": TranscribeCompose,
+	"diffusers":  DiffusersCompose,
 }
 
 // GetAvailableServices returns a sorted list of service names.
