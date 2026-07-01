@@ -22,12 +22,18 @@ type ProxmoxPage struct {
 	app   *tview.Application
 
 	// Proxmox client
-	client   *proxmox.Client
-	nodeName string // Proxmox node to query
+	client    *proxmox.Client
+	nodeName  string // Proxmox node to query
+	configDir string // dir holding proxmox.json (drives this tab)
+
+	// confirmFn shows a modal yes/no dialog. Wired from the ControlCenter so the
+	// page can prompt for destructive actions (forget) without owning root/focus.
+	confirmFn func(prompt, confirmLabel string, onConfirm func())
 
 	// UI components
 	root       *tview.Flex
 	statusView *tview.TextView
+	configView *tview.TextView
 	guestTable *tview.Table
 	detailView *tview.TextView
 	helpBar    *tview.TextView
@@ -47,7 +53,11 @@ type ProxmoxPage struct {
 type ProxmoxPageConfig struct {
 	Client     *proxmox.Client
 	NodeName   string // Proxmox node name (auto-detected if empty)
+	ConfigDir  string // dir holding proxmox.json (for path display + forget)
 	ActivityFn func(level, msg string)
+	// ConfirmFn shows a modal yes/no dialog for destructive actions. Optional:
+	// when nil, the forget action logs guidance instead of prompting.
+	ConfirmFn func(prompt, confirmLabel string, onConfirm func())
 }
 
 // NewProxmoxPage creates a new Proxmox management page.
@@ -61,7 +71,9 @@ func NewProxmoxPage(cfg ProxmoxPageConfig) *ProxmoxPage {
 		title:      "Proxmox",
 		client:     cfg.Client,
 		nodeName:   cfg.NodeName,
+		configDir:  cfg.ConfigDir,
 		activityFn: activityFn,
+		confirmFn:  cfg.ConfirmFn,
 	}
 }
 
@@ -75,6 +87,14 @@ func (p *ProxmoxPage) Build(app *tview.Application) tview.Primitive {
 	p.statusView = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
+
+	// Config-path line: makes it obvious which file drives this tab and where to
+	// manage it. This is the "how is it detecting the VMs?" answer — a saved
+	// proxmox.json pointing at a (possibly remote) host.
+	p.configView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	p.configView.SetText(proxmoxConfigLine(p.configDir, proxmox.IsConfigured(p.configDir)))
 
 	// Guest table (main content)
 	p.guestTable = tview.NewTable().
@@ -99,7 +119,7 @@ func (p *ProxmoxPage) Build(app *tview.Application) tview.Primitive {
 	p.helpBar = tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignLeft)
-	p.helpBar.SetText(" [yellow]s[-]=start  [yellow]S[-]=shutdown  [yellow]k[-]=force stop  [yellow]r[-]=reboot  [yellow]c[-]=console  [yellow]Enter[-]=details  [yellow]R[-]=refresh")
+	p.helpBar.SetText(" [yellow]s[-]=start  [yellow]S[-]=shutdown  [yellow]k[-]=force stop  [yellow]r[-]=reboot  [yellow]c[-]=console  [yellow]Enter[-]=details  [yellow]R[-]=refresh  [yellow]D[-]=forget")
 
 	// Main layout: table on left, detail on right
 	contentFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -108,6 +128,7 @@ func (p *ProxmoxPage) Build(app *tview.Application) tview.Primitive {
 
 	p.root = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(p.statusView, 1, 0, false).
+		AddItem(p.configView, 1, 0, false).
 		AddItem(contentFlex, 0, 1, true).
 		AddItem(p.helpBar, 1, 0, false)
 
@@ -156,6 +177,9 @@ func (p *ProxmoxPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		case 'R':
 			go p.refreshData()
+			return nil
+		case 'D':
+			p.forgetConnection()
 			return nil
 		}
 	}
@@ -570,6 +594,63 @@ func (p *ProxmoxPage) openConsole() {
 	if err := platform.OpenURL(consoleURL); err != nil {
 		p.activityFn("error", fmt.Sprintf("Failed to open browser: %v", err))
 	}
+}
+
+// forgetConnection prompts to delete the saved Proxmox config and, on confirm,
+// removes proxmox.json. The tab is built once at startup from the saved config,
+// so it stays until the next restart — we tell the user that explicitly rather
+// than faking a live hide.
+func (p *ProxmoxPage) forgetConnection() {
+	path := proxmox.ConfigPath(p.configDir)
+
+	// The tab can also appear because this host is a detected Proxmox node with
+	// no saved file. There is nothing to forget in that case — deleting a
+	// nonexistent file would not hide the tab (detection still applies).
+	if !proxmox.IsConfigured(p.configDir) {
+		p.activityFn("info", "This host is a detected Proxmox node — there is no saved connection file to forget.")
+		return
+	}
+
+	baseURL := ""
+	if p.client != nil {
+		baseURL = p.client.BaseURL()
+	}
+	target := baseURL
+	if target == "" {
+		target = "this Proxmox host"
+	}
+
+	doForget := func() {
+		if err := proxmox.DeleteConfig(p.configDir); err != nil {
+			p.activityFn("error", fmt.Sprintf("Failed to forget Proxmox connection: %v", err))
+			return
+		}
+		p.activityFn("success", fmt.Sprintf("Forgot Proxmox connection to %s — deleted %s. Restart Citadel to hide the tab.", target, path))
+	}
+
+	if p.confirmFn == nil {
+		// No modal host wired (e.g. tests): fall back to guidance instead of
+		// silently deleting without confirmation.
+		p.activityFn("info", fmt.Sprintf("To forget this Proxmox connection, run: citadel proxmox forget  (config: %s)", path))
+		return
+	}
+
+	prompt := fmt.Sprintf(
+		"Forget the saved Proxmox connection to %s?\n\nThis deletes %s.\nThe tab is hidden after restart.",
+		target, path)
+	p.confirmFn(prompt, "Forget", doForget)
+}
+
+// proxmoxConfigLine renders the config-path header shown on the Proxmox page.
+// The tab appears either because a saved proxmox.json exists (hasSavedConfig) or
+// because this host is itself a detected Proxmox node with no saved file. Only
+// the saved-config case has a file to forget, so the [D]=forget affordance is
+// shown only then; the detected case explains why there is nothing to remove.
+func proxmoxConfigLine(configDir string, hasSavedConfig bool) string {
+	if !hasSavedConfig {
+		return " [gray]Config: (auto-detected local Proxmox — no saved config file to forget)[-]"
+	}
+	return fmt.Sprintf(" [gray]Config: %s   ([yellow]D[-][gray]=forget)[-]", proxmox.ConfigPath(configDir))
 }
 
 // pmxColorizeStatus wraps a status string with tview color tags.
