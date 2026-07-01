@@ -229,6 +229,47 @@ func (pm *PageManager) visibleIndices() []int {
 	return out
 }
 
+// nextVisibleIndex returns the real index of the visible page after cur, wrapping
+// to the first visible page. It is a pure function over the (index, visible)
+// projection of the registered pages so tab-cycle order is unit-testable without
+// a running app. Returns cur when nothing is visible or cur is the lone visible
+// page. visibles must be sorted ascending (as visibleIndices produces).
+func nextVisibleIndex(visibles []int, cur int) int {
+	if len(visibles) == 0 {
+		return cur
+	}
+	for _, idx := range visibles {
+		if idx > cur {
+			return idx
+		}
+	}
+	return visibles[0]
+}
+
+// prevVisibleIndex returns the real index of the visible page before cur,
+// wrapping to the last visible page. Pure counterpart to nextVisibleIndex.
+func prevVisibleIndex(visibles []int, cur int) int {
+	if len(visibles) == 0 {
+		return cur
+	}
+	for i := len(visibles) - 1; i >= 0; i-- {
+		if visibles[i] < cur {
+			return visibles[i]
+		}
+	}
+	return visibles[len(visibles)-1]
+}
+
+// switchToNextVisible advances to the next visible tab (wrapping).
+func (pm *PageManager) switchToNextVisible() {
+	pm.SwitchTo(nextVisibleIndex(pm.visibleIndices(), pm.activeIdx))
+}
+
+// switchToPrevVisible advances to the previous visible tab (wrapping).
+func (pm *PageManager) switchToPrevVisible() {
+	pm.SwitchTo(prevVisibleIndex(pm.visibleIndices(), pm.activeIdx))
+}
+
 // Show makes a page visible by name.
 func (pm *PageManager) Show(name string) {
 	for i := range pm.registered {
@@ -354,7 +395,23 @@ func (pm *PageManager) Build() *tview.Flex {
 	return pm.rootFlex
 }
 
-// HandleGlobalInput captures Alt+1-N before delegating to the active page.
+// HandleGlobalInput is the app-level input router. Navigation model (the shared
+// convention every page relies on — see #388 follow-up):
+//
+//   - Tab / Shift+Tab is the PRIMARY way to move between tabs. It is delivered to
+//     the active page FIRST; a page consumes it for its own internal focus
+//     movement (dashboard pane cycling, module list<->form) and returns it
+//     UNCONSUMED at its navigation boundary. When the page returns an unconsumed
+//     Tab/Backtab, we switch to the next/previous visible tab. A page that does
+//     nothing with Tab (the default) therefore gets tab-switching for free —
+//     that is what makes the default correct for parallel-owned pages.
+//   - Arrow keys move within a pane (each page's own concern).
+//   - Alt+1..N remain as optional accelerators to jump straight to a tab. They
+//     are captured before delegation so a focused input field never eats them.
+//   - Escape is NOT captured here: the dashboard's Esc=quit-confirm keybinding is
+//     preserved, and "Escape defocuses an input back to nav" is a per-page rule
+//     (e.g. the module page) that only fires when an input is focused.
+//
 // F-keys are avoided because terminal emulators (Terminator, etc.) intercept them.
 func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	if pm.isModalActive != nil && pm.isModalActive() {
@@ -364,7 +421,7 @@ func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey 
 		return event
 	}
 
-	// Alt+1 through Alt+N to switch to Nth visible page
+	// Alt+1 through Alt+N to switch to Nth visible page (optional accelerator).
 	if event.Modifiers()&tcell.ModAlt != 0 && event.Key() == tcell.KeyRune {
 		digit := int(event.Rune() - '0')
 		if digit >= 1 && digit <= 9 {
@@ -376,10 +433,24 @@ func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey 
 		}
 	}
 
+	// Delegate to the active page first, then bubble an unconsumed Tab/Backtab up
+	// to tab-switching. This lets a page keep Tab for its own intra-page focus and
+	// hand off only at its edges.
+	out := event
 	if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
-		return pm.registered[pm.activeIdx].page.HandleInput(event)
+		out = pm.registered[pm.activeIdx].page.HandleInput(event)
 	}
-	return event
+	if out != nil {
+		switch out.Key() {
+		case tcell.KeyTab:
+			pm.switchToNextVisible()
+			return nil
+		case tcell.KeyBacktab:
+			pm.switchToPrevVisible()
+			return nil
+		}
+	}
+	return out
 }
 
 // PlaceholderPage is a stub page that shows a "Coming soon" message.
@@ -585,6 +656,15 @@ type ProxmoxConfig struct {
 	NodeName string // Proxmox node name (auto-detected if empty)
 }
 
+// proxmoxTabVisible reports whether the Proxmox tab should be registered/shown.
+// Proxmox is host infrastructure, not an installable module, so its tab is gated
+// on actual detection: the cmd layer sets Enabled only when saved Proxmox config
+// exists OR a local Proxmox install is detected (/etc/pve + pvesh). Named as a
+// pure seam so the gate is unit-testable without the filesystem-coupled builder.
+func proxmoxTabVisible(cfg ProxmoxConfig) bool {
+	return cfg.Enabled && cfg.BaseURL != ""
+}
+
 // New creates a new control center
 func New(cfg Config) *ControlCenter {
 	return &ControlCenter{
@@ -713,8 +793,10 @@ func (cc *ControlCenter) Run() error {
 	cc.pmgr.Register(NewPlaceholderPage("jobs", "Jobs"), false)
 	cc.pmgr.Register(NewPlaceholderPage("network", "Network"), false)
 
-	// Proxmox page: conditional on detection or configuration
-	if cc.proxmoxConfig.Enabled {
+	// Proxmox page: gated on real detection (saved config or a detected local
+	// Proxmox host). Proxmox is host infra, not a module, so it stays a top-level
+	// tab but only appears when relevant — never folded into the module list.
+	if proxmoxTabVisible(cc.proxmoxConfig) {
 		pmxClient := proxmox.NewClient(proxmox.ClientConfig{
 			BaseURL:     cc.proxmoxConfig.BaseURL,
 			TokenID:     cc.proxmoxConfig.TokenID,
@@ -728,15 +810,49 @@ func (cc *ControlCenter) Run() error {
 	}
 
 	// WhatsApp bridge page: deploy/start/stop the community module and show the
-	// pairing QR. Visible only when the host wired the lifecycle callbacks.
-	if cc.whatsappConfig.Status != nil {
-		cc.pmgr.Register(NewWhatsAppPage(cc.whatsappConfig), true)
+	// pairing QR. WhatsApp is a community MODULE, so it no longer gets its own
+	// top-level tab (#388 feedback): it is registered HIDDEN and reached from the
+	// unified Install-module list, which surfaces a "WhatsApp" row that switches
+	// here. All bridge functionality (deploy/stop/QR) is preserved unchanged.
+	//
+	// Guard against orphaning: the module list is the only entry point to the
+	// hidden WhatsApp page, so if the module page is NOT wired we fall back to
+	// registering WhatsApp as its own visible tab (old behavior) rather than
+	// hiding a page nothing can reach.
+	whatsappAvailable := cc.whatsappConfig.Status != nil
+	moduleListAvailable := cc.moduleInstallConfig.Resolve != nil
+	if whatsappAvailable {
+		cc.pmgr.Register(NewWhatsAppPage(cc.whatsappConfig), !moduleListAvailable)
 	}
 
 	// Install-module page: install a service module from any standardized repo
-	// (catalog name, owner/repo, or git URL). Visible only when the host wired
-	// the resolve/install callbacks.
+	// (catalog name, owner/repo, or git URL) AND the single home for community
+	// modules (WhatsApp folds in here). Visible only when the host wired the
+	// resolve/install callbacks.
 	if cc.moduleInstallConfig.Resolve != nil {
+		// SelectSpecial lets a module-list row switch to an in-app module page
+		// (e.g. the hidden WhatsApp tab) without the page holding a PageManager ref.
+		cc.moduleInstallConfig.SelectSpecial = func(name string) {
+			if cc.pmgr != nil {
+				cc.pmgr.SwitchToName(name)
+			}
+		}
+		// Fold WhatsApp into the module list as a special row when it is available.
+		if whatsappAvailable {
+			baseList := cc.moduleInstallConfig.ListSources
+			cc.moduleInstallConfig.ListSources = func() []ModuleSource {
+				var srcs []ModuleSource
+				if baseList != nil {
+					srcs = baseList()
+				}
+				return append(srcs, ModuleSource{
+					Name:        "WhatsApp",
+					Description: "community bridge — deploy, link a phone, manage",
+					Trusted:     true,
+					Special:     "whatsapp",
+				})
+			}
+		}
 		cc.pmgr.Register(NewModulePage(cc.moduleInstallConfig), true)
 	}
 
@@ -983,11 +1099,19 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		cc.showQuitConfirm()
 		return nil
 	case tcell.KeyTab:
-		// Switch to next pane
+		// Move to the next pane; at the last pane, bubble the Tab up so the
+		// PageManager advances to the next TAB (shared navigation convention).
+		if cc.focusedPane >= paneCount-1 {
+			return event
+		}
 		cc.focusNextPane()
 		return nil
 	case tcell.KeyBacktab:
-		// Switch to previous pane
+		// Move to the previous pane; at the first pane, bubble Shift+Tab up so the
+		// PageManager falls back to the previous tab.
+		if cc.focusedPane <= 0 {
+			return event
+		}
 		cc.focusPrevPane()
 		return nil
 	case tcell.KeyEnter:
@@ -1564,10 +1688,11 @@ func isWindows() bool {
 func (cc *ControlCenter) showHelpModal() {
 	helpText := `[yellow::b]Citadel Control Center[-:-:-]
 
-[yellow]Navigation:[-]
-  [white::b]Tab[-:-:-]           Switch between Services/Peers panes
-  [white::b]↑/↓[-:-:-] or [white::b]j/k[-:-:-]   Navigate within focused pane
-  [white::b]Enter[-:-:-]         Toggle service / Ping peer
+[yellow]Navigation (nothing to memorize):[-]
+  [white::b]Tab[-:-:-] / [white::b]Shift+Tab[-:-:-]  Move through panes, then on to the next/prev tab
+  [white::b]↑/↓[-:-:-] or [white::b]j/k[-:-:-]   Navigate within the focused pane
+  [white::b]Enter[-:-:-]         Details / toggle service / ping peer
+  [white::b]Alt+1..N[-:-:-]      Jump straight to a tab (optional shortcut)
 
 [yellow]Services Pane:[-]
   [white::b]s[-:-:-]             Start selected service
@@ -2093,11 +2218,11 @@ func (cc *ControlCenter) updateHelpBar() {
 
 	switch cc.focusedPane {
 	case paneNode:
-		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneSystem:
-		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] details  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneJobs:
-		set("[yellow::b]Enter[-:-:-] view details  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+		set("[yellow::b]Enter[-:-:-] view details  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]c[-:-:-] copy  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 	case paneServices:
 		svcName := cc.getSelectedServiceName()
 		svcStatus := cc.getSelectedServiceStatus()
@@ -2108,36 +2233,36 @@ func (cc *ControlCenter) updateHelpBar() {
 				statusIcon = "[green]●[-]"
 				action = "stop"
 			}
-			set(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
+			set(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
 				svcName, statusIcon, action))
 		} else {
-			set("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			set("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActions:
 		row, _ := cc.actionsView.GetSelection()
 		actions := cc.getActions()
 		if row >= 0 && row < len(actions) {
 			action := actions[row]
-			set(fmt.Sprintf("[yellow::b]%s[-:-:-] [white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
+			set(fmt.Sprintf("[yellow::b]%s[-:-:-] [white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
 				action.key, action.name))
 		} else {
-			set("[yellow::b]↑/↓[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
+			set("[yellow::b]↑/↓[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
 		}
 	case panePeers:
 		if len(cc.data.Peers) > 0 {
 			row, _ := cc.peersView.GetSelection()
 			if row > 0 && row <= len(cc.data.Peers) {
 				peer := cc.data.Peers[row-1]
-				set(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help",
+				set(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help",
 					peer.Hostname))
 			} else {
-				set("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] switch pane  [yellow::b]?[-:-:-] help")
+				set("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
 			}
 		} else {
-			set("[yellow::b]Tab[-:-:-] switch pane  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			set("[yellow::b]Tab[-:-:-] pane/tab  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActivity:
-		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]Tab[-:-:-] switch  [yellow::b]?[-:-:-] help")
+		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
 	}
 
 	// When mouse is on, advertise it so the click affordances are discoverable

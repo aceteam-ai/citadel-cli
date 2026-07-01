@@ -613,12 +613,78 @@ func confirmYes() bool {
 	return resp == "y" || resp == "yes"
 }
 
+// fallbackModuleSources is the small curated set surfaced when the catalog has
+// not been cloned yet, so the TUI's module picker is never blank on a fresh node.
+// These are first-party catalog names (Tier 0, trusted) resolvable once the
+// catalog is fetched; the resolve step clones on demand.
+var fallbackModuleSources = []controlcenter.ModuleSource{
+	{Name: "vllm", Source: "vllm", Description: "vLLM GPU inference server", Trusted: true},
+	{Name: "ollama", Source: "ollama", Description: "Ollama local model runner", Trusted: true},
+	{Name: "comfyui", Source: "comfyui", Description: "ComfyUI image generation", Trusted: true},
+}
+
+// moduleSourcesFromCatalog maps the loaded catalog registry + curated module
+// index into the TUI's seeded picker rows. Pure over its inputs (no IO) so the
+// seeding logic is unit-testable. Catalog registry entries are first-party
+// (Tier 0) and marked trusted; index entries carry their source repo and are
+// left untrusted unless the index says otherwise (it currently doesn't, so they
+// render with the untrusted warning at resolve time). Duplicate names (registry
+// vs index) are de-duplicated, registry winning. When both inputs are empty the
+// caller substitutes the fallback set.
+func moduleSourcesFromCatalog(reg *catalog.Registry, idx *catalog.ModuleIndex) []controlcenter.ModuleSource {
+	var out []controlcenter.ModuleSource
+	seen := make(map[string]bool)
+	if reg != nil {
+		for _, e := range reg.Services {
+			if e.Name == "" || seen[e.Name] {
+				continue
+			}
+			seen[e.Name] = true
+			out = append(out, controlcenter.ModuleSource{
+				Name:        e.Name,
+				Source:      e.Name, // catalog name resolves via the central catalog
+				Description: e.Description,
+				Trusted:     true,
+			})
+		}
+	}
+	if idx != nil {
+		for _, e := range idx.Modules {
+			if e.Name == "" || seen[e.Name] {
+				continue
+			}
+			seen[e.Name] = true
+			out = append(out, controlcenter.ModuleSource{
+				Name:        e.Name,
+				Source:      e.Source, // owner/repo or git URL from the curated index
+				Description: e.Description,
+				Trusted:     false,
+			})
+		}
+	}
+	return out
+}
+
+// listModuleSources loads the catalog registry + curated index and maps them into
+// the TUI picker rows. Fail-soft: any load error (catalog not cloned, no index
+// published) falls back to the small curated set so the picker is never blank.
+func listModuleSources() []controlcenter.ModuleSource {
+	reg, _ := catalog.LoadRegistry()
+	idx, _ := catalog.LoadModuleIndex()
+	srcs := moduleSourcesFromCatalog(reg, idx)
+	if len(srcs) == 0 {
+		return fallbackModuleSources
+	}
+	return srcs
+}
+
 // buildModuleInstallCallbacks wires the control center's module-install page to
 // the same source-resolution + install logic the CLI uses. The TUI collects all
 // required config up front and passes it as overrides, so the non-interactive
 // installer path is used (no stdin reads). All hooks are best-effort.
 func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 	return controlcenter.ModuleInstallCallbacks{
+		ListSources: listModuleSources,
 		Resolve: func(source string) (controlcenter.ModuleResolveResult, error) {
 			var out controlcenter.ModuleResolveResult
 			src, err := catalog.ParseSource(source)

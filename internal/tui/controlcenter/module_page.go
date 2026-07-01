@@ -39,8 +39,32 @@ type ModuleResolveResult struct {
 	HasCriticalRisk bool
 }
 
+// ModuleSource is one selectable row in the known/approved sources list. It maps
+// a curated catalog/index entry (or a special in-app module like WhatsApp) into a
+// display row so the user picks from a seeded list instead of typing a source
+// blind. Mapped from catalog entries in the cmd layer so this page imports no
+// catalog internals.
+type ModuleSource struct {
+	// Name is the module's display/catalog name (e.g. "vllm").
+	Name string
+	// Source is the value fed to Resolve when the row is chosen (catalog name,
+	// owner/repo, or git URL). Empty for special rows.
+	Source string
+	// Description is a short human summary shown next to the name.
+	Description string
+	// Trusted marks a first-party/curated source (rendered with a check).
+	Trusted bool
+	// Special, when non-empty, names an in-app module page to switch to instead of
+	// running the install form (e.g. "whatsapp" folds the WhatsApp bridge tab in).
+	Special string
+}
+
 // ModuleInstallCallbacks holds the hooks for the "Install module" page. They are
 // wired from cmd so the page stays free of catalog/network/docker imports.
+//
+// ListSources returns the seeded known/approved sources to pre-populate the
+// picker (curated catalog/index entries + any special in-app modules). It is
+// fail-soft: an empty slice just yields a blank list, never an error.
 //
 // Resolve clones/updates the source repo (or loads a catalog name) and returns
 // the module name + required config + trust/risk info; it may block on the
@@ -50,8 +74,12 @@ type ModuleResolveResult struct {
 // install to proceed when the compose has a Critical risk; the page only sets it
 // when the user explicitly opts in.
 type ModuleInstallCallbacks struct {
-	Resolve func(source string) (ModuleResolveResult, error)
-	Install func(source string, overrides map[string]string, allowPrivileged bool) (installedName string, err error)
+	ListSources func() []ModuleSource
+	Resolve     func(source string) (ModuleResolveResult, error)
+	Install     func(source string, overrides map[string]string, allowPrivileged bool) (installedName string, err error)
+	// SelectSpecial switches the control center to the named in-app module page
+	// (e.g. "whatsapp"). Wired from Run() so the page needs no PageManager ref.
+	SelectSpecial func(name string)
 }
 
 // allowPrivilegedLabel is the form checkbox shown when a Critical risk is found.
@@ -74,9 +102,10 @@ type ModulePage struct {
 	cb  ModuleInstallCallbacks
 
 	// UI
-	root   *tview.Flex
-	form   *tview.Form
-	status *tview.TextView
+	root       *tview.Flex
+	sourceList *tview.List
+	form       *tview.Form
+	status     *tview.TextView
 
 	// State
 	mu       sync.Mutex
@@ -87,6 +116,7 @@ type ModulePage struct {
 	busyMsg  string
 	message  string // last success/info message
 	errMsg   string // last error message
+	sources  []ModuleSource
 }
 
 // NewModulePage creates an Install-module page wired to the given callbacks.
@@ -104,6 +134,13 @@ func (p *ModulePage) Title() string { return "Install Module" }
 func (p *ModulePage) Build(app *tview.Application) tview.Primitive {
 	p.app = app
 
+	// Known/approved sources list (left column). Pre-populated on activate so the
+	// user picks a module instead of typing a source into a blank input blind.
+	p.sourceList = tview.NewList().ShowSecondaryText(true)
+	p.sourceList.SetBorder(true)
+	p.sourceList.SetTitle(" Known modules ")
+	p.sourceList.SetTitleAlign(tview.AlignLeft)
+
 	p.form = tview.NewForm()
 	p.form.SetBorder(true)
 	p.form.SetTitle(" Install module ")
@@ -117,28 +154,173 @@ func (p *ModulePage) Build(app *tview.Application) tview.Primitive {
 	p.status.SetTitleAlign(tview.AlignLeft)
 
 	p.root = tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(p.form, 0, 1, true).
-		AddItem(p.status, 0, 1, false)
+		AddItem(p.sourceList, 0, 1, true).
+		AddItem(p.form, 0, 2, false).
+		AddItem(p.status, 0, 2, false)
 
 	p.buildSourceForm()
 	p.render()
 	return p.root
 }
 
-// OnActivate implements Page.
+// OnActivate implements Page. Seeds the sources list (fail-soft) and focuses it
+// so the user lands on the pre-populated picker, not a blank input.
 func (p *ModulePage) OnActivate() {
-	if p.app != nil && p.form != nil {
-		p.app.SetFocus(p.form)
+	p.loadSources()
+	if p.app != nil && p.sourceList != nil {
+		p.app.SetFocus(p.sourceList)
 	}
 }
 
 // OnDeactivate implements Page.
 func (p *ModulePage) OnDeactivate() {}
 
-// HandleInput implements Page. The page does not steal keys: the form's text
-// inputs and buttons (Resolve / Install / Reset / Back) handle everything, so the
-// user can type a source and config values freely.
+// loadSources fills the list from the ListSources hook. Each normal row, when
+// chosen, drops its source into the form input and focuses the form so the user
+// can Resolve/Install. A special row (e.g. WhatsApp) switches to that in-app
+// module page instead.
+func (p *ModulePage) loadSources() {
+	if p.sourceList == nil {
+		return
+	}
+	var srcs []ModuleSource
+	if p.cb.ListSources != nil {
+		srcs = p.cb.ListSources()
+	}
+	p.mu.Lock()
+	p.sources = srcs
+	p.mu.Unlock()
+
+	p.sourceList.Clear()
+	for _, s := range srcs {
+		primary := s.Name
+		if s.Trusted {
+			primary = "✓ " + primary
+		}
+		secondary := s.Description
+		sel := s // capture
+		p.sourceList.AddItem(primary, secondary, 0, func() { p.chooseSource(sel) })
+	}
+	if len(srcs) == 0 {
+		p.sourceList.AddItem("(no seeded modules)", "type a source in the form on the right", 0, nil)
+	}
+}
+
+// chooseSource applies a picked list row: a special row switches pages; a normal
+// row seeds the source input and moves focus to the form.
+func (p *ModulePage) chooseSource(s ModuleSource) {
+	if s.Special != "" {
+		if p.cb.SelectSpecial != nil {
+			p.cb.SelectSpecial(s.Special)
+		}
+		return
+	}
+	p.mu.Lock()
+	p.source = s.Source
+	p.mu.Unlock()
+	// Rebuild the source form so the seeded value shows in the input.
+	p.buildSourceForm()
+	if p.app != nil && p.form != nil {
+		p.app.SetFocus(p.form)
+	}
+	p.render()
+}
+
+// nextFormFocus computes the next focus index within a tview.Form's LINEAR focus
+// space (form items first, then buttons — matching Form.SetFocus). cur is the
+// current linear index, total is itemCount+buttonCount, and forward selects Tab
+// (true) vs Shift+Tab (false). It returns (nextIndex, atBoundary): atBoundary is
+// true when moving off the first (backward) or last (forward) element, which is
+// the signal to hand Tab off to the PageManager for tab-switching.
+//
+// Pure function so the actual reported bug — Tab wrongly leaving the form mid-way
+// vs correctly cycling fields — is unit-testable without a running app.
+func nextFormFocus(cur, total int, forward bool) (int, bool) {
+	if total <= 0 {
+		return cur, true
+	}
+	if forward {
+		if cur >= total-1 {
+			return cur, true
+		}
+		return cur + 1, false
+	}
+	if cur <= 0 {
+		return cur, true
+	}
+	return cur - 1, false
+}
+
+// currentFormFocus returns the current linear focus index of the form (items
+// first, then buttons), or 0 when nothing is focused yet.
+func (p *ModulePage) currentFormFocus() int {
+	if p.form == nil {
+		return 0
+	}
+	idx, btn := p.form.GetFocusedItemIndex()
+	if btn >= 0 {
+		return p.form.GetFormItemCount() + btn
+	}
+	if idx < 0 {
+		return 0
+	}
+	return idx
+}
+
+// formTotal returns the count of focusable form elements (fields + buttons).
+func (p *ModulePage) formTotal() int {
+	if p.form == nil {
+		return 0
+	}
+	return p.form.GetFormItemCount() + p.form.GetButtonCount()
+}
+
+// HandleInput implements Page. It OWNS intra-page Tab navigation (it must — a
+// SetInputCapture handler that returns the event to let the form cycle fields
+// natively would be intercepted by the PageManager's bubble check first, so the
+// page advances form focus itself and returns the event ONLY at the true
+// first/last boundary). Tab/Shift+Tab cycle sources list ↔ form fields ↔ tabs;
+// Escape defocuses the form back to the list so an input never traps the user.
 func (p *ModulePage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
+	if p.app == nil {
+		return event
+	}
+	onList := p.app.GetFocus() == p.sourceList
+
+	switch event.Key() {
+	case tcell.KeyTab:
+		if onList {
+			// List → first form element.
+			p.app.SetFocus(p.form)
+			return nil
+		}
+		next, boundary := nextFormFocus(p.currentFormFocus(), p.formTotal(), true)
+		if boundary {
+			return event // hand off: PageManager switches to the next tab
+		}
+		p.form.SetFocus(next)
+		p.app.SetFocus(p.form)
+		return nil
+	case tcell.KeyBacktab:
+		if onList {
+			return event // hand off: PageManager switches to the previous tab
+		}
+		next, boundary := nextFormFocus(p.currentFormFocus(), p.formTotal(), false)
+		if boundary {
+			// Off the first form element → back to the sources list.
+			p.app.SetFocus(p.sourceList)
+			return nil
+		}
+		p.form.SetFocus(next)
+		p.app.SetFocus(p.form)
+		return nil
+	case tcell.KeyEsc:
+		if !onList {
+			p.app.SetFocus(p.sourceList)
+			return nil
+		}
+		return event
+	}
 	return event
 }
 
@@ -363,6 +545,8 @@ func (p *ModulePage) render() {
 
 	var sb strings.Builder
 	sb.WriteString("\n [yellow::b]Install a service module[-:-:-]\n\n")
+	sb.WriteString(" [gray]Pick a known module on the left (Enter), or type a[-]\n")
+	sb.WriteString(" [gray]source in the form. Tab moves list ↔ form ↔ tabs.[-]\n\n")
 	sb.WriteString(" Install a module from any standardized repo.\n")
 	sb.WriteString(" [gray]A module repo self-describes via citadel/service.yaml[-]\n")
 	sb.WriteString(" [gray]+ citadel/compose.yml. Sources:[-]\n")
