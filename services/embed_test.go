@@ -102,9 +102,34 @@ func composeHostPorts(t *testing.T, composeYAML string) []int {
 	if err := yaml.Unmarshal([]byte(composeYAML), &doc); err != nil {
 		t.Fatalf("compose is not valid YAML: %v", err)
 	}
+	// A citadel-managed host publish defers to ${CITADEL_*_HOST_PORT}; resolve
+	// those tokens to the registry value so the collision assertions validate the
+	// port citadel actually injects (services/ports.go).
+	envVarHostPort := map[string]int{
+		EnvLlamacppHostPort:   LlamacppHostPort,
+		EnvVLLMHostPort:       VLLMHostPort,
+		EnvExtractionHostPort: ExtractionHostPort,
+		EnvDiffusersHostPort:  DiffusersHostPort,
+	}
 	var hosts []int
 	for _, svc := range doc.Services {
 		for _, mapping := range svc.Ports {
+			// The host side is everything before the container colon, but a
+			// ${CITADEL_*_HOST_PORT:?...} expansion carries its own colons, so
+			// peel a leading ${...} group intact and resolve it via the registry.
+			if strings.HasPrefix(mapping, "${") {
+				if end := strings.IndexByte(mapping, '}'); end >= 0 {
+					inner := mapping[2:end]
+					varName := inner
+					if c := strings.IndexByte(inner, ':'); c >= 0 {
+						varName = inner[:c]
+					}
+					if port, ok := envVarHostPort[varName]; ok {
+						hosts = append(hosts, port)
+					}
+				}
+				continue
+			}
 			// "HOST:CONTAINER" (optionally "HOST:CONTAINER/proto"); the host side
 			// is everything before the first colon.
 			hostStr := mapping

@@ -105,10 +105,17 @@ func containerRunning(engineBin, containerName string) bool {
 // e.g. "8100:8000" or "127.0.0.1:8100:8000" -> host port 8100.
 var composePortRe = regexp.MustCompile(`(?:\d+\.\d+\.\d+\.\d+:)?(\d+):\d+`)
 
-// managedEngineHostPort resolves the published host port for a managed engine by
-// parsing the first port mapping of its embedded compose file. Returns 0 when
-// the compose file is absent or has no parseable port mapping.
+// managedEngineHostPort resolves the published host port for a managed engine.
+// For engines whose host publish citadel owns via ${CITADEL_*_HOST_PORT}
+// substitution (llamacpp/vllm/extraction/diffusers), the compose file no longer
+// carries a literal host port, so the port comes from the registry
+// (services/ports.go). For any other engine it falls back to parsing the first
+// port mapping of its embedded compose file. Returns 0 when neither yields a
+// port.
 func managedEngineHostPort(name string) int {
+	if port, ok := services.ManagedServiceHostPort(name); ok {
+		return port
+	}
 	compose, ok := services.ServiceMap[name]
 	if !ok {
 		return 0
