@@ -780,3 +780,22 @@ Auto-generated log of every release.
   - fix(worker): AGENT_UPDATE job handler for remote node updates (aceteam#4427) (#389)
 
 
+---
+
+## v2.53.0 — 2026-07-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 23 |
+| Lines added | +1903 |
+
+**Changes:**
+
+  - feat(tui/proxmox): show config path + in-app "forget Proxmox" (disconnect a stale saved connection) (#400)
+  - fix(tui): Chat Tab bubbles at pane edge so the user can leave (fixes the #392/#393 trap) (#399)
+  - feat(whatsapp): WHATSAPP_PROVISION job — remote-host the bridge on a node (aceteam#4454) (#398)
+  - fix(cobrowse): reclaim stale :9222 + reliable teardown (#396) (#397)
+  - fix(tui): apply the Fullscreen rendering pref at launch (#394) (#395)
+
+
