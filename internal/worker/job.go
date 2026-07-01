@@ -136,6 +136,7 @@ const (
 	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
 	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
 	JobTypeAgentUpdate       = "AGENT_UPDATE"        // Remotely update + restart this node's own citadel agent (aceteam#4427)
+	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION"  // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
 )
 
 // allKnownJobTypes enumerates every job type this citadel build knows about.
@@ -181,4 +182,5 @@ var allKnownJobTypes = []string{
 	JobTypeCobrowse,
 	JobTypeTranscribeAudio,
 	JobTypeAgentUpdate,
+	JobTypeWhatsAppProvision,
 }

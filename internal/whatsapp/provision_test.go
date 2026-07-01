@@ -1,0 +1,228 @@
+package whatsapp
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fakeBridge is an in-memory BridgeClient for provision tests.
+type fakeBridge struct {
+	ready       error
+	created     *Tenant
+	createErr   error
+	createCalls int
+	health      *Health
+	healthErr   error
+	qr          string
+	qrErr       error
+}
+
+func (f *fakeBridge) WaitReady(ctx context.Context, timeout time.Duration) error { return f.ready }
+func (f *fakeBridge) CreateTenant(ctx context.Context, name, proxyURL string) (*Tenant, error) {
+	f.createCalls++
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.created != nil {
+		return f.created, nil
+	}
+	return &Tenant{ID: "t_1", Name: name, APIKey: "wab_minted"}, nil
+}
+func (f *fakeBridge) Health(ctx context.Context, apiKey string) (*Health, error) {
+	return f.health, f.healthErr
+}
+func (f *fakeBridge) QRString(ctx context.Context, apiKey string) (string, error) {
+	return f.qr, f.qrErr
+}
+
+// baseDeps builds ProvisionDeps wired to the given fake bridge and a temp
+// services dir, with a reachable mesh URL and a no-op deploy. Individual tests
+// override fields.
+func baseDeps(t *testing.T, bridge *fakeBridge) (ProvisionDeps, *bool) {
+	t.Helper()
+	dir := t.TempDir()
+	deployed := false
+	deps := ProvisionDeps{
+		ServicesDir:   func() (string, error) { return dir, nil },
+		DeployCompose: func(servicesDir string, env map[string]string) error { deployed = true; return nil },
+		NewBridgeClient: func(port int, adminKey string) BridgeClient {
+			return bridge
+		},
+		MeshAPIURL: func(port int) string { return "http://100.64.0.7:8080" },
+	}
+	return deps, &deployed
+}
+
+func TestProvisionHappyPath(t *testing.T) {
+	bridge := &fakeBridge{
+		health: &Health{LoggedIn: false},
+		qr:     "2@qr-payload",
+	}
+	deps, deployed := baseDeps(t, bridge)
+
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !*deployed {
+		t.Error("expected DeployCompose to be called")
+	}
+	if res.APIURL != "http://100.64.0.7:8080" {
+		t.Errorf("api_url = %q, want mesh IP url", res.APIURL)
+	}
+	if res.APIKey != "wab_minted" {
+		t.Errorf("api_key = %q, want minted key", res.APIKey)
+	}
+	if res.Tenant != "default" {
+		t.Errorf("tenant = %q, want default", res.Tenant)
+	}
+	if res.QR != "2@qr-payload" {
+		t.Errorf("qr = %q, want payload", res.QR)
+	}
+	if res.AlreadyLinked {
+		t.Error("AlreadyLinked = true, want false")
+	}
+	if bridge.createCalls != 1 {
+		t.Errorf("CreateTenant calls = %d, want 1", bridge.createCalls)
+	}
+}
+
+func TestProvisionDefaultsTenant(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{}, qr: "x"}
+	deps, _ := baseDeps(t, bridge)
+	res, err := Provision(context.Background(), ProvisionRequest{Tenant: ""}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if res.Tenant != "default" {
+		t.Errorf("tenant defaulted to %q, want default", res.Tenant)
+	}
+}
+
+func TestProvisionAlreadyLinkedViaHealth(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}, qr: "should-not-be-returned"}
+	deps, _ := baseDeps(t, bridge)
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !res.AlreadyLinked {
+		t.Error("AlreadyLinked = false, want true (health says logged in)")
+	}
+	if res.QR != "" {
+		t.Errorf("qr = %q, want empty for already-linked tenant", res.QR)
+	}
+	if res.APIKey == "" || res.APIURL == "" {
+		t.Error("already-linked result must still carry api_url + api_key")
+	}
+}
+
+func TestProvisionAlreadyLinkedViaEmptyQR(t *testing.T) {
+	// health not logged-in, but the bridge returns an empty QR -> also linked.
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: ""}
+	deps, _ := baseDeps(t, bridge)
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !res.AlreadyLinked {
+		t.Error("empty QR should be treated as already-linked")
+	}
+}
+
+func TestProvisionOffMeshFails(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{}, qr: "x"}
+	deps, deployed := baseDeps(t, bridge)
+	deps.MeshAPIURL = func(port int) string { return "" } // off-mesh
+
+	_, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err == nil {
+		t.Fatal("expected an error when off-mesh, got nil")
+	}
+	if !strings.Contains(err.Error(), "mesh") {
+		t.Errorf("error = %q, want it to mention the mesh", err.Error())
+	}
+	if *deployed {
+		t.Error("must not deploy the bridge when the node is off-mesh")
+	}
+}
+
+func TestProvisionDeployErrorPropagates(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{}, qr: "x"}
+	deps, _ := baseDeps(t, bridge)
+	deps.DeployCompose = func(string, map[string]string) error {
+		return errors.New("docker daemon not running")
+	}
+	_, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err == nil || !strings.Contains(err.Error(), "docker daemon") {
+		t.Fatalf("expected docker error to propagate, got %v", err)
+	}
+}
+
+func TestProvisionReusesExistingTenant(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "q"}
+	deps, _ := baseDeps(t, bridge)
+	dir, _ := deps.ServicesDir()
+	// Seed a stored tenant key so Provision reuses it and never mints anew.
+	if err := SaveEnv(dir, map[string]string{"ADMIN_API_KEY": "adm", "TENANT_API_KEY": "wab_existing"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if bridge.createCalls != 0 {
+		t.Errorf("CreateTenant called %d times, want 0 (should reuse)", bridge.createCalls)
+	}
+	if res.APIKey != "wab_existing" {
+		t.Errorf("api_key = %q, want the reused key", res.APIKey)
+	}
+}
+
+func TestProvisionQRFetchErrorIsNonFatal(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qrErr: errors.New("transient")}
+	deps, _ := baseDeps(t, bridge)
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("a QR-fetch error must not fail the provision, got %v", err)
+	}
+	if res.QR != "" {
+		t.Errorf("qr = %q, want empty after fetch error", res.QR)
+	}
+	if res.APIKey == "" {
+		t.Error("result must still carry the minted api_key")
+	}
+}
+
+func TestProvisionRequiresDeps(t *testing.T) {
+	_, err := Provision(context.Background(), ProvisionRequest{}, ProvisionDeps{})
+	if err == nil {
+		t.Fatal("expected an error when required deps are missing")
+	}
+}
+
+func TestQRDataURL(t *testing.T) {
+	if got, err := QRDataURL(""); err != nil || got != "" {
+		t.Errorf("QRDataURL(\"\") = %q, %v; want empty, nil", got, err)
+	}
+	got, err := QRDataURL("2@some-payload")
+	if err != nil {
+		t.Fatalf("QRDataURL() error = %v", err)
+	}
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(got, prefix) {
+		t.Fatalf("QRDataURL() = %q, want %s prefix", got, prefix)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, prefix))
+	if err != nil {
+		t.Fatalf("payload is not valid base64: %v", err)
+	}
+	// PNG magic number.
+	if len(raw) < 8 || string(raw[1:4]) != "PNG" {
+		t.Errorf("decoded bytes are not a PNG (magic = %x)", raw[:min(8, len(raw))])
+	}
+}

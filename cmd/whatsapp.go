@@ -164,86 +164,75 @@ func meshAPIURL(port int) string {
 	return fmt.Sprintf("http://%s:%d", ip, port)
 }
 
-func runWhatsAppUp(cmd *cobra.Command, args []string) error {
-	servicesDir, err := servicesDirForNode()
-	if err != nil {
-		return err
-	}
-
-	// 1. Resolve the bridge compose from its module source and materialize it
-	//    into the node's services dir. The bridge is a reverse-engineered,
-	//    ToS-gray integration, so its compose + image live in the maintainer's
-	//    personal repo (default sunapi386/whatsapp-bridge), NOT embedded in this
-	//    binary. ResolveSource clones/updates the module repo and returns the
-	//    path to its citadel/compose.yml.
-	source := waSourceFlag
-	if source == "" {
-		source = defaultWhatsAppSource
-	}
-	src, err := catalog.ParseSource(source)
-	if err != nil {
-		return fmt.Errorf("invalid --source %q: %w", source, err)
-	}
-	resolved, err := catalog.ResolveSource(src)
-	if err != nil {
-		// ResolveSource's clone error already explains the private-repo
-		// credential requirement (GITHUB_TOKEN / SSH / docker login).
-		return fmt.Errorf("resolve WhatsApp bridge module: %w", err)
-	}
-	composeBytes, err := os.ReadFile(resolved.ComposePath)
-	if err != nil {
-		return fmt.Errorf("read resolved bridge compose %s: %w", resolved.ComposePath, err)
-	}
-
-	composePath := whatsapp.ComposePath(servicesDir)
-	if err := os.MkdirAll(servicesDir, 0755); err != nil {
-		return fmt.Errorf("create services dir: %w", err)
-	}
-	if err := os.WriteFile(composePath, composeBytes, 0600); err != nil {
-		return fmt.Errorf("write compose file: %w", err)
-	}
-
-	// 2. Load existing env (preserves a previously generated admin key) and fill
-	//    in defaults / overrides.
-	env, err := whatsapp.LoadEnv(servicesDir)
-	if err != nil {
-		return fmt.Errorf("read bridge config: %w", err)
-	}
-
-	adminKey := waAPIKeyFlag
-	if adminKey == "" {
-		adminKey = env["ADMIN_API_KEY"]
-	}
-	if adminKey == "" {
-		adminKey, err = whatsapp.GenerateAdminKey()
+// deployWhatsAppCompose resolves the bridge module source (git clone of the
+// private repo), materializes its compose into the node's services dir, and
+// starts the stack with `docker compose up -d --env-file`. It is the effectful
+// deployment edge injected into whatsapp.Provision. source/image are captured
+// from the caller (the CLI flags or the handler's defaults).
+//
+// GIT_TERMINAL_PROMPT=0 is set so a private-repo clone with missing credentials
+// fails fast with a clear error instead of blocking on an interactive prompt
+// (which would hang a headless node job).
+func deployWhatsAppCompose(source, image string) func(servicesDir string, env map[string]string) error {
+	return func(servicesDir string, env map[string]string) error {
+		if os.Getenv("GIT_TERMINAL_PROMPT") == "" {
+			_ = os.Setenv("GIT_TERMINAL_PROMPT", "0")
+		}
+		if source == "" {
+			source = defaultWhatsAppSource
+		}
+		src, err := catalog.ParseSource(source)
 		if err != nil {
+			return fmt.Errorf("invalid module source %q: %w", source, err)
+		}
+		resolved, err := catalog.ResolveSource(src)
+		if err != nil {
+			// ResolveSource's clone error already explains the private-repo
+			// credential requirement (GITHUB_TOKEN / SSH / docker login).
+			return fmt.Errorf("resolve WhatsApp bridge module (needs Docker + private-repo git credentials): %w", err)
+		}
+		composeBytes, err := os.ReadFile(resolved.ComposePath)
+		if err != nil {
+			return fmt.Errorf("read resolved bridge compose %s: %w", resolved.ComposePath, err)
+		}
+		if err := os.MkdirAll(servicesDir, 0755); err != nil {
+			return fmt.Errorf("create services dir: %w", err)
+		}
+		composePath := whatsapp.ComposePath(servicesDir)
+		if err := os.WriteFile(composePath, composeBytes, 0600); err != nil {
+			return fmt.Errorf("write compose file: %w", err)
+		}
+		if image != "" {
+			env["BRIDGE_IMAGE"] = image
+		}
+		// Persist env before compose up so --env-file sees the admin key + port.
+		if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
+			return fmt.Errorf("write bridge config: %w", err)
+		}
+		if err := composeUp(composePath, whatsapp.EnvPath(servicesDir)); err != nil {
 			return err
 		}
-		fmt.Println("🔑 Generated a new admin secret for the bridge control plane.")
+		return nil
 	}
-	env["ADMIN_API_KEY"] = adminKey
-	env["BRIDGE_PORT"] = fmt.Sprintf("%d", waPortFlag)
-	if waImageFlag != "" {
-		env["BRIDGE_IMAGE"] = waImageFlag
-	}
-	if waProxyFlag != "" {
-		env["DEFAULT_PROXY_URL"] = waProxyFlag
-	}
-	if waPublicURLFlag != "" {
-		env["PUBLIC_URL"] = waPublicURLFlag
-	}
-	if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
-		return fmt.Errorf("write bridge config: %w", err)
-	}
+}
 
-	// 3. Start the stack. We invoke compose directly with --env-file so the
-	//    generated secret and port are sourced (docker compose does not
-	//    auto-load a service-named env file).
-	fmt.Printf("--- 🚀 Starting WhatsApp bridge on port %d ---\n", waPortFlag)
-	if err := composeUp(composePath, whatsapp.EnvPath(servicesDir)); err != nil {
-		return err
+// whatsappProvisionDeps builds the ProvisionDeps for the local CLI, wiring the
+// real catalog / docker / network edges. source/image are the CLI flag values.
+func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
+	return whatsapp.ProvisionDeps{
+		ServicesDir:   servicesDirForNode,
+		DeployCompose: deployWhatsAppCompose(source, image),
+		NewBridgeClient: func(port int, adminKey string) whatsapp.BridgeClient {
+			return whatsapp.NewClient(bridgeBaseURL(port), adminKey)
+		},
+		MeshAPIURL: meshAPIURL,
+		Log: func(format string, args ...any) {
+			fmt.Printf("   - "+format+"\n", args...)
+		},
 	}
+}
 
+func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	// The bridge is deliberately NOT added to the node manifest. The generic
 	// `citadel run`/`citadel work` start path runs `docker compose up` without
 	// an --env-file, but this stack hard-requires ADMIN_API_KEY (and docker
@@ -251,46 +240,47 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	// would make those commands fail. The bridge has its own lifecycle via
 	// `citadel whatsapp up/down`; status discovery uses the compose-file
 	// presence + container state, not the manifest.
+	fmt.Printf("--- 🚀 Provisioning WhatsApp bridge on port %d ---\n", waPortFlag)
 
-	// 5. Wait for the bridge to answer.
-	client := whatsapp.NewClient(bridgeBaseURL(waPortFlag), adminKey)
-	fmt.Print("   ⏳ Waiting for the bridge to become ready...")
-	ctx, cancel := context.WithTimeout(cmd.Context(), 90*time.Second)
-	defer cancel()
-	if err := client.WaitReady(ctx, 90*time.Second); err != nil {
-		fmt.Println()
-		return fmt.Errorf("bridge did not become ready: %w\n   Hint: check logs with 'docker logs citadel-whatsapp-bridge'", err)
-	}
-	fmt.Println(" ready.")
-
-	// 6. Provision a tenant (the data-plane api key for whatsapp_connect). If
-	//    one was already minted on a previous `up`, reuse it -- minting a fresh
-	//    tenant would orphan the already-linked WhatsApp session and rotate the
-	//    api_key the user already registered.
-	tenantKey := env["TENANT_API_KEY"]
-	if tenantKey == "" {
-		tenant, err := client.CreateTenant(ctx, waTenantFlag, waProxyFlag)
-		if err != nil {
-			return fmt.Errorf("provision tenant: %w", err)
+	deps := whatsappProvisionDeps(waSourceFlag, waImageFlag)
+	// The CLI also honors an explicit --api-key admin override. Provision reads
+	// the stored/admin key itself, so seed it into the env file first if the
+	// operator supplied one.
+	if waAPIKeyFlag != "" {
+		if servicesDir, err := servicesDirForNode(); err == nil {
+			env, _ := whatsapp.LoadEnv(servicesDir)
+			env["ADMIN_API_KEY"] = waAPIKeyFlag
+			_ = whatsapp.SaveEnv(servicesDir, env)
 		}
-		tenantKey = tenant.APIKey
-		env["TENANT_API_KEY"] = tenant.APIKey
-		env["TENANT_ID"] = tenant.ID
-		env["TENANT_NAME"] = tenant.Name
-		if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
-			fmt.Fprintf(os.Stderr, "   ⚠️ Could not save tenant key locally: %v\n", err)
-		}
-	} else {
-		fmt.Println("   ℹ️  Reusing the existing tenant (its linked session and api_key are preserved).")
 	}
 
-	// 7. Show the connect details + pairing QR.
-	printConnectDetails(waPortFlag, tenantKey)
+	res, err := whatsapp.Provision(cmd.Context(), whatsapp.ProvisionRequest{
+		Tenant:    waTenantFlag,
+		Proxy:     waProxyFlag,
+		PublicURL: waPublicURLFlag,
+		Port:      waPortFlag,
+	}, deps)
+	if err != nil {
+		return err
+	}
+
+	// Show the connect details + pairing QR.
+	printConnectDetails(waPortFlag, res.APIKey)
 	fmt.Println()
-	if err := printQR(ctx, client, tenantKey); err != nil {
-		fmt.Fprintf(os.Stderr, "   ⚠️ Could not fetch pairing QR yet: %v\n", err)
-		fmt.Println("   Run 'citadel whatsapp qr' in a moment to retry.")
+	if res.AlreadyLinked {
+		fmt.Println("✅ This tenant is already linked to WhatsApp -- no QR needed.")
+		return nil
 	}
+	if res.QR == "" {
+		fmt.Fprintln(os.Stderr, "   ⚠️ Could not fetch the pairing QR yet.")
+		fmt.Println("   Run 'citadel whatsapp qr' in a moment to retry.")
+		return nil
+	}
+	bold := color.New(color.Bold)
+	bold.Println("Scan this QR to link WhatsApp:")
+	fmt.Println("  (WhatsApp -> Settings -> Linked Devices -> Link a Device)")
+	fmt.Println()
+	fmt.Println(whatsapp.RenderQRANSI(res.QR))
 	return nil
 }
 
