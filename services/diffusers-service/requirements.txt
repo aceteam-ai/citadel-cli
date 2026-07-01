@@ -2,7 +2,11 @@ diffusers==0.31.0
 transformers==4.46.3
 accelerate==1.1.1
 safetensors==0.4.5
+# sentencepiece + protobuf are needed by the T5 text encoder used by SD 3.5 /
+# other transformer-encoder diffusion models (the default SDXL-Turbo does not
+# need them, but the documented DIFFUSERS_MODEL alternatives do).
 sentencepiece==0.2.0
+protobuf==5.28.3
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4

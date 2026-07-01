@@ -27,6 +27,10 @@ services:
       #   DIFFUSERS_MODEL=stabilityai/stable-diffusion-3.5-medium
       - DIFFUSERS_MODEL=${DIFFUSERS_MODEL:-stabilityai/sdxl-turbo}
       - PORT=7860
+      # Gated models (e.g. stabilityai/stable-diffusion-3.5-medium) require a
+      # HuggingFace token. Set HF_TOKEN in the node's environment before
+      # SERVICE_START; the default SDXL-Turbo is open and needs no token.
+      - HF_TOKEN=${HF_TOKEN:-}
     healthcheck:
       # Hits the /health endpoint on the contract port (inside the container).
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7860/health')"]
