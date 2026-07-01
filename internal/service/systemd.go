@@ -84,6 +84,12 @@ func generateSystemUnit(cfg ServiceConfig, execLine string) (string, error) {
 
 	group := username
 	citadelDir := filepath.Join(homeDir, ".citadel-cli")
+	// The tsnet state (machine key) lives under <home>/citadel-node/network by
+	// default. With ProtectHome=read-only, that path is NOT writable unless it is
+	// listed in ReadWritePaths — otherwise the service cannot persist the machine
+	// key, so on every restart tsnet mints a fresh one and Headscale registers a
+	// duplicate node (aceteam-ai/citadel-cli#383). Grant write access to it.
+	nodeStateDir := filepath.Join(homeDir, "citadel-node")
 
 	return fmt.Sprintf(`[Unit]
 Description=%s
@@ -108,11 +114,11 @@ SyslogIdentifier=citadel
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%s
+ReadWritePaths=%s %s
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.Description, execLine, username, group, homeDir, citadelDir), nil
+`, cfg.Description, execLine, username, group, homeDir, citadelDir, nodeStateDir), nil
 }
 
 func resolveHomeDir(username string) (string, error) {

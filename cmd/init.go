@@ -874,6 +874,19 @@ func createGlobalConfig(nodeConfigDir string) error {
 		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
 	}
 
+	// Record the canonical node_config_dir in the machine-global, world-readable
+	// pointer file so EVERY invocation context on this machine (root-run service,
+	// `sudo citadel login`, a distinct service user) resolves the same tsnet state
+	// dir and reattaches to the existing node instead of registering a duplicate
+	// (aceteam-ai/citadel-cli#383). Best-effort: this write targets the machine-
+	// wide dir (e.g. /etc/citadel) which typically requires root; when init runs
+	// non-root it is skipped and owner-home resolution covers the single-user case.
+	if err := network.WriteMachineStatePointer(nodeConfigDir); err != nil {
+		if initVerbose {
+			fmt.Fprintf(os.Stderr, "note: could not write machine state pointer: %v\n", err)
+		}
+	}
+
 	if initVerbose {
 		fmt.Printf("✅ Configuration registered at %s\n", globalConfigFile)
 	}

@@ -93,6 +93,26 @@ func TestGenerateUnitFile_SystemMode(t *testing.T) {
 			t.Errorf("system unit missing %q:\n%s", s, content)
 		}
 	}
+
+	// With ProtectHome=read-only, the tsnet state dir (<home>/citadel-node) MUST
+	// be granted write access, else the machine key cannot persist and the node
+	// re-registers as a duplicate on every restart (aceteam-ai/citadel-cli#383).
+	rwLine := ""
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "ReadWritePaths=") {
+			rwLine = line
+			break
+		}
+	}
+	if rwLine == "" {
+		t.Fatalf("system unit missing ReadWritePaths directive:\n%s", content)
+	}
+	if !strings.Contains(rwLine, "citadel-node") {
+		t.Errorf("ReadWritePaths must include the citadel-node state dir, got %q", rwLine)
+	}
+	if !strings.Contains(rwLine, ".citadel-cli") {
+		t.Errorf("ReadWritePaths must still include the .citadel-cli config dir, got %q", rwLine)
+	}
 }
 
 func TestGenerateUnitFile_DefaultDescription(t *testing.T) {
