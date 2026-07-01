@@ -435,6 +435,21 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	// Xvfb is stale and must be reaped before starting a fresh one, or it leaks.
 	m.teardownXvfbLocked()
 
+	// Reclaim a stale CDP port before launching (issue #396). We reach here only
+	// when NOT running, so anything currently listening on the debug port is an
+	// ORPHAN Chromium from a prior worker that was SIGKILLed / crashed before its
+	// Stop() ran. Without this, waitForCDP below would connect to that ghost and
+	// this manager would report running:true for a browser it never launched --
+	// while m.cmd stays nil, so every later action fails ErrNotStarted. Killing
+	// the port owner guarantees the browser we launch is the one m.cmd tracks.
+	if reclaimed, rerr := reclaimStalePort(debugPort); rerr != nil {
+		return CobrowseStatus{}, fmt.Errorf("stale co-browse browser on CDP port %d: %w", debugPort, rerr)
+	} else if reclaimed {
+		// The killed orphan may still be releasing the socket; a short settle
+		// avoids the fresh Chromium racing a closing listener on the port.
+		time.Sleep(300 * time.Millisecond)
+	}
+
 	// Resolve the X display the browser renders on. Default: a dedicated Xvfb
 	// virtual display, which (a) works on headless nodes with no :0 and (b)
 	// isolates the session from the operator's real desktop. Opt into a shared
@@ -536,6 +551,13 @@ func (m *CobrowseManager) Stop() error {
 		return nil
 	}
 	err := m.cmd.Process.Kill()
+	// A browser that already exited on its own (crash, or the reaper saw it die)
+	// is the goal state, not a failure. Swallow "process already finished" so
+	// shutdown does not log a spurious "co-browse browser stop" warning and so
+	// teardown always proceeds to reap the Xvfb (issue #396).
+	if isProcessGoneErr(err) {
+		err = nil
+	}
 	if m.exited != nil {
 		// Wait for the reaper to reap the process (bounded) so we never leave a
 		// zombie. The reaper closes exited after cmd.Wait() returns.
