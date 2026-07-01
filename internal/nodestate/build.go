@@ -29,8 +29,8 @@ import (
 	"sort"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
+	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
