@@ -12,6 +12,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
@@ -122,7 +123,20 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	}
 	populateCapabilityFlags(status.Capabilities, status.VNCPort)
 
+	// Advertise the serving services this build can deploy (embedded ServiceMap
+	// keys) so the fabric can schedule engine-specific deploys only to capable
+	// nodes (aceteam#4483).
+	populateServices(status.Capabilities)
+
 	return status, nil
+}
+
+// populateServices sets AvailableServices to the sorted list of serving
+// services this build knows how to deploy (the embedded services.ServiceMap
+// keys). It advertises what the binary CAN run, not what is currently
+// configured/running, matching the backend's tolerant matching (aceteam#4483).
+func populateServices(caps *NodeCapabilities) {
+	caps.AvailableServices = services.GetAvailableServices()
 }
 
 // CollectCompact returns a minimal status suitable for heartbeats.
