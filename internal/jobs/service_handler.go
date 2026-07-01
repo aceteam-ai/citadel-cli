@@ -10,9 +10,11 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	embedded "github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
 
@@ -61,6 +63,10 @@ type serviceResult struct {
 	Error   string `json:"error,omitempty"`
 	Action  string `json:"action,omitempty"`  // "start", "stop", "status"
 	Message string `json:"message,omitempty"` // human-readable summary
+	// HostPorts are the published host ports declared by the started service's
+	// compose file. Populated on a successful docker SERVICE_START so the caller
+	// knows where the service is reachable on the node (citadel-cli#415).
+	HostPorts []int `json:"host_ports,omitempty"`
 }
 
 func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -79,8 +85,26 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 
 	svc, ok := h.findService(manifest, svcName)
 	if !ok {
-		return nil, fmt.Errorf("service %q not found in manifest (known: %s)",
-			svcName, h.knownServiceNames(manifest))
+		// The service is not in the manifest. This is the common failure after a
+		// binary upgrade adds a new embedded service (e.g. diffusers in v2.55.0):
+		// the node advertises the capability in its heartbeat but its citadel.yaml,
+		// written at init time, predates the service (citadel-cli#413). If the
+		// requested service is one this binary embeds, materialize its compose from
+		// the embedded template, persist an additive manifest block, and proceed --
+		// so an on-demand SERVICE_START self-heals instead of being rejected. This
+		// is the belt-and-suspenders companion to the startup manifest reconcile.
+		reconciled, rErr := h.materializeEmbeddedService(svcName)
+		if rErr != nil {
+			return nil, fmt.Errorf("service %q not found in manifest (known: %s); "+
+				"failed to materialize embedded service: %w",
+				svcName, h.knownServiceNames(manifest), rErr)
+		}
+		if reconciled == nil {
+			return nil, fmt.Errorf("service %q not found in manifest (known: %s)",
+				svcName, h.knownServiceNames(manifest))
+		}
+		svc = *reconciled
+		ctx.Log("info", "     - [Job %s] Materialized embedded service %s into manifest", job.ID, svcName)
 	}
 
 	switch job.Type {
@@ -153,7 +177,14 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
 			composeArgs = append(composeArgs, "-f", override)
 		}
-		composeArgs = append(composeArgs, "up", "-d")
+		// --force-recreate guarantees the container is (re)created from THIS compose
+		// definition. Without it, a stale citadel-<svc> container left from a prior
+		// run with a different (or no) port mapping is reused, and the container
+		// comes up with NetworkSettings.Ports == {} -- a healthy server on its
+		// internal contract port is then unreachable on the host (citadel-cli#415).
+		// We only reach here when the service is not already running (checked
+		// above), so recreating is safe.
+		composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
 		cmd := exec.Command("docker", composeArgs...)
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
@@ -170,10 +201,32 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		})
 	}
 
-	return json.Marshal(serviceResult{
+	result := serviceResult{
 		Name: svc.Name, Running: true, Kind: kind,
 		Action: "start", Message: fmt.Sprintf("%s started successfully", svc.Name),
-	})
+	}
+	// Surface the compose-declared host ports so the caller knows where the
+	// service is reachable on the node (citadel-cli#415). Docker-kind only; native
+	// services manage their own listen port.
+	if kind == "docker" {
+		result.HostPorts = h.composeHostPorts(svc)
+	}
+	return json.Marshal(result)
+}
+
+// composeHostPorts returns the published host ports declared in a service's
+// compose file, or nil if the file cannot be read/parsed. Used to report the
+// reachable endpoint after a successful SERVICE_START (citadel-cli#415).
+func (h *ServiceHandler) composeHostPorts(svc manifestService) []int {
+	composePath, err := h.resolveComposePath(svc)
+	if err != nil {
+		return nil
+	}
+	content, err := os.ReadFile(composePath)
+	if err != nil {
+		return nil
+	}
+	return compose.HostPorts(content)
 }
 
 func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byte, error) {
@@ -238,6 +291,108 @@ func (h *ServiceHandler) loadManifest() (*serviceManifest, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// serviceNameOK guards against path traversal via the service name before it is
+// used to build a compose file path. It mirrors the config handler's allowlist:
+// lowercase alphanumerics and hyphens only.
+func serviceNameOK(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// materializeEmbeddedService self-heals a manifest that predates an embedded
+// service (citadel-cli#413). If svcName is one this binary embeds
+// (embedded.ServiceMap), it writes the embedded compose to
+// <ConfigDir>/services/<name>.yml (without overwriting an existing file),
+// persists an additive service block into citadel.yaml (preserving all other
+// manifest content), and returns the resolved manifestService. If svcName is not
+// an embedded service it returns (nil, nil) so the caller emits the normal
+// "not found in manifest" error.
+func (h *ServiceHandler) materializeEmbeddedService(svcName string) (*manifestService, error) {
+	if !serviceNameOK(svcName) {
+		return nil, nil
+	}
+	content, ok := embedded.ServiceMap[svcName]
+	if !ok {
+		return nil, nil // not an embedded service -- caller emits normal error
+	}
+
+	// Write the embedded compose file if it is not already present. An existing
+	// (operator-authored) file is left untouched.
+	servicesDir := filepath.Join(h.ConfigDir, "services")
+	composeFile := filepath.Join(servicesDir, svcName+".yml")
+	if _, err := os.Stat(composeFile); os.IsNotExist(err) {
+		if err := os.MkdirAll(servicesDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create services dir: %w", err)
+		}
+		// 0600 to protect any sensitive env vars, matching the config handler.
+		if err := os.WriteFile(composeFile, []byte(content), 0o600); err != nil {
+			return nil, fmt.Errorf("write compose file: %w", err)
+		}
+	}
+
+	relCompose := filepath.Join("./services", svcName+".yml")
+	svc := manifestService{Name: svcName, ComposeFile: relCompose}
+
+	// Persist the additive manifest block, preserving every other field.
+	if err := h.appendManifestService(svc); err != nil {
+		return nil, fmt.Errorf("persist manifest block: %w", err)
+	}
+	return &svc, nil
+}
+
+// appendManifestService adds a service block to citadel.yaml without disturbing
+// any other content (node, capabilities, config, other services). It performs a
+// generic YAML read-modify-write so unknown top-level keys survive. It is a no-op
+// when the service is already present.
+func (h *ServiceHandler) appendManifestService(svc manifestService) error {
+	path := filepath.Join(h.ConfigDir, "citadel.yaml")
+
+	var doc map[string]any
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			return fmt.Errorf("parse manifest: %w", err)
+		}
+	}
+	if doc == nil {
+		doc = make(map[string]any)
+	}
+
+	var svcList []any
+	if existing, ok := doc["services"].([]any); ok {
+		svcList = existing
+	}
+	// Idempotency: bail if a service with this name already exists.
+	for _, entry := range svcList {
+		if m, ok := entry.(map[string]any); ok {
+			if name, _ := m["name"].(string); name == svc.Name {
+				return nil
+			}
+		}
+	}
+
+	svcList = append(svcList, map[string]any{
+		"name":         svc.Name,
+		"compose_file": svc.ComposeFile,
+	})
+	doc["services"] = svcList
+
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	return nil
 }
 
 func (h *ServiceHandler) findService(m *serviceManifest, name string) (manifestService, bool) {
