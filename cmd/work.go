@@ -203,11 +203,14 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "   - Warning: co-browse browser stop: %v\n", err)
 		}
 		// Cancel first so the async service-startup goroutine stops launching any
-		// further services, then tear down the ones we already started. Like
-		// co-browse, this stops the containers/processes we spawned but preserves
-		// their data (no `-v`), and only touches services this worker launched.
+		// further services.
 		cancel()
-		teardownStartedServices()
+		// Arm the watchdog BEFORE tearing down managed services. Service teardown
+		// shells out to `docker compose down` (potentially several times) and a
+		// wedged docker daemon could hang this handler; the watchdog (second
+		// signal + grace-period force-exit, issue #312) must already be running so
+		// a stuck teardown can never leave an orphaned node holding the VPN
+		// identity or the terminal-server port.
 		go func() {
 			select {
 			case <-sigs:
@@ -218,6 +221,10 @@ func runWork(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 		}()
+		// Tear down the services we started. Like co-browse, this stops the
+		// containers/processes we spawned but preserves their data (no `-v`), and
+		// only touches services this worker launched.
+		teardownStartedServices()
 	}()
 
 	// Note: Update check is now handled by root.go's PersistentPreRun
