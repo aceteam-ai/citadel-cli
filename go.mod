@@ -5,6 +5,7 @@ go 1.26.4
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/UserExistsError/conpty v0.1.4
+	github.com/aceteam-ai/fabric-protocol v0.0.0-20260701210857-52c114248cea
 	github.com/alicebob/miniredis/v2 v2.36.1
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10

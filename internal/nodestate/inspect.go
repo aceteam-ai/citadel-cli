@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	fabricpb "github.com/aceteam-ai/citadel-cli/internal/fabricpb"
+	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 )
 
 // dockerInspector observes module run-state via `docker inspect` on the

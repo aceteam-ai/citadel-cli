@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	fabricpb "github.com/aceteam-ai/citadel-cli/internal/fabricpb"
+	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
 	"google.golang.org/protobuf/proto"
 )
