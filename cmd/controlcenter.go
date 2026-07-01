@@ -263,6 +263,17 @@ func runControlCenter() {
 			},
 			// SetMouseEnabled is injected by the control center itself in Run(),
 			// where the running tview app exists to receive EnableMouse.
+			LoadRendering: func() *config.Rendering {
+				return config.LoadRendering(platform.ConfigDir())
+			},
+			SaveRendering: func(r *config.Rendering) error {
+				return config.SaveRendering(platform.ConfigDir(), r)
+			},
+			// SetFullscreenEnabled is intentionally left nil: tview cannot swap the
+			// terminal's alternate-screen mode on a running app. Today the toggle only
+			// persists the preference; wiring a launch-time consumer that reads it at
+			// screen creation lives in the control center's Run() path and is a
+			// follow-up.
 		},
 		// Resolve the initial mouse state: persisted preference with the
 		// --no-mouse flag applied as a session override.
