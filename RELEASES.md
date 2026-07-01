@@ -761,3 +761,22 @@ Auto-generated log of every release.
   - fix(network): canonical tsnet state dir to prevent duplicate node registration (#385)
 
 
+---
+
+## v2.52.0 — 2026-07-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 28 |
+| Lines added | +2967 |
+
+**Changes:**
+
+  - feat(tui): smooth Tab/arrow navigation + unify modules (WhatsApp/Proxmox) + seed sources (#388 follow-up) (#393)
+  - fix(tui): escape the Chat keyboard trap + surface real chat connection state (#388 follow-up) (#392)
+  - feat(tui): Mouse & Rendering settings panel (#388 follow-up) (#391)
+  - feat(tui): mouse-clickable Control Center, Chat tab first (#388) (#390)
+  - fix(worker): AGENT_UPDATE job handler for remote node updates (aceteam#4427) (#389)
+
+
