@@ -415,9 +415,11 @@ func (pm *PageManager) Build() *tview.Flex {
 // F-keys are avoided because terminal emulators (Terminator, etc.) intercept them.
 func (pm *PageManager) HandleGlobalInput(event *tcell.EventKey) *tcell.EventKey {
 	if pm.isModalActive != nil && pm.isModalActive() {
-		if pm.activeIdx >= 0 && pm.activeIdx < len(pm.registered) {
-			return pm.registered[pm.activeIdx].page.HandleInput(event)
-		}
+		// A modal owns the screen: pass the event straight through to the focused
+		// modal primitive instead of the active page. Pages that trigger a modal
+		// (e.g. the Proxmox tab's [D]=forget confirm) must not keep eating keys, or
+		// the modal buttons never receive Enter/arrows. The dashboard page's own
+		// HandleInput already bails while inModal, so this is equivalent for it.
 		return event
 	}
 
@@ -827,7 +829,9 @@ func (cc *ControlCenter) Run() error {
 		cc.pmgr.Register(NewProxmoxPage(ProxmoxPageConfig{
 			Client:     pmxClient,
 			NodeName:   cc.proxmoxConfig.NodeName,
+			ConfigDir:  platform.ConfigDir(),
 			ActivityFn: cc.AddActivity,
+			ConfirmFn:  cc.showConfirm,
 		}), true)
 	}
 
@@ -1573,6 +1577,39 @@ func (cc *ControlCenter) restartSelectedService() {
 			}
 		}()
 	}
+}
+
+// showConfirm displays a modal yes/no confirmation dialog. It captures the
+// currently-focused primitive before taking over the root, and restores both
+// the root view and that focus when the user answers — so callers on a
+// PageManager page (e.g. the Proxmox tab) return to their page rather than the
+// dashboard. onConfirm runs only if the user picks the affirmative button.
+func (cc *ControlCenter) showConfirm(prompt, confirmLabel string, onConfirm func()) {
+	cc.inModal = true
+	prevFocus := cc.app.GetFocus()
+
+	restore := func() {
+		cc.inModal = false
+		cc.app.SetRoot(cc.rootView, true)
+		if prevFocus != nil {
+			cc.app.SetFocus(prevFocus)
+		} else {
+			cc.updatePaneFocus()
+		}
+	}
+
+	modal := tview.NewModal().
+		SetText(prompt).
+		AddButtons([]string{"Cancel", confirmLabel}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			restore()
+			if buttonLabel == confirmLabel {
+				onConfirm()
+			}
+		})
+
+	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
 }
 
 // showServiceLogs shows recent logs for the selected service

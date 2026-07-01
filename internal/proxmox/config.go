@@ -17,14 +17,17 @@ type Config struct {
 	NodeName    string `json:"node_name,omitempty"`
 }
 
-func configPath(configDir string) string {
+// ConfigPath returns the absolute path of the Proxmox config file for the
+// given config directory. This is the file that drives the Proxmox tab in the
+// Control Center: when it exists (and has a base URL), the tab is shown.
+func ConfigPath(configDir string) string {
 	return filepath.Join(configDir, configFileName)
 }
 
 // LoadConfig reads the Proxmox config from the given config directory.
 // Returns nil, nil if the file does not exist.
 func LoadConfig(configDir string) (*Config, error) {
-	path := configPath(configDir)
+	path := ConfigPath(configDir)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -51,9 +54,24 @@ func SaveConfig(configDir string, cfg *Config) error {
 		return fmt.Errorf("marshalling proxmox config: %w", err)
 	}
 
-	path := configPath(configDir)
+	path := ConfigPath(configDir)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing proxmox config: %w", err)
+	}
+	return nil
+}
+
+// DeleteConfig removes the saved Proxmox config file from the given config
+// directory. A missing file is treated as success (the connection is already
+// forgotten). This is what powers the "forget Proxmox" affordance: it deletes
+// the file that drives the Proxmox tab so it no longer appears on restart.
+func DeleteConfig(configDir string) error {
+	path := ConfigPath(configDir)
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("removing proxmox config: %w", err)
 	}
 	return nil
 }

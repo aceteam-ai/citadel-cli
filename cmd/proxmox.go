@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -16,6 +18,7 @@ var (
 	proxmoxURL         string
 	proxmoxTokenID     string
 	proxmoxTokenSecret string
+	proxmoxForgetYes   bool
 )
 
 var proxmoxCmd = &cobra.Command{
@@ -58,13 +61,29 @@ var proxmoxStatusCmd = &cobra.Command{
 	RunE:  runProxmoxStatus,
 }
 
+var proxmoxForgetCmd = &cobra.Command{
+	Use:   "forget",
+	Short: "Forget the saved Proxmox connection",
+	Long: `Delete the saved Proxmox configuration file (proxmox.json).
+
+The Control Center shows a Proxmox tab whenever a saved config exists, even if
+this machine isn't a Proxmox host — the config may point at a remote server.
+Forgetting the connection removes that file so the tab no longer appears.
+
+The config file path is printed before deletion. Use --yes to skip the prompt.`,
+	RunE: runProxmoxForget,
+}
+
 func init() {
 	proxmoxSetupCmd.Flags().StringVar(&proxmoxURL, "url", "", "Proxmox VE URL (e.g., https://192.168.2.4:8006)")
 	proxmoxSetupCmd.Flags().StringVar(&proxmoxTokenID, "token-id", "", "API token ID (e.g., root@pam!citadel)")
 	proxmoxSetupCmd.Flags().StringVar(&proxmoxTokenSecret, "token-secret", "", "API token secret (UUID)")
 
+	proxmoxForgetCmd.Flags().BoolVar(&proxmoxForgetYes, "yes", false, "Skip the confirmation prompt.")
+
 	proxmoxCmd.AddCommand(proxmoxSetupCmd)
 	proxmoxCmd.AddCommand(proxmoxStatusCmd)
+	proxmoxCmd.AddCommand(proxmoxForgetCmd)
 	rootCmd.AddCommand(proxmoxCmd)
 }
 
@@ -172,6 +191,8 @@ func runProxmoxSetup(cmd *cobra.Command, args []string) error {
 func runProxmoxStatus(cmd *cobra.Command, args []string) error {
 	configDir := platform.ConfigDir()
 
+	fmt.Printf("Config: %s\n", pmx.ConfigPath(configDir))
+
 	client, err := pmx.ClientFromConfig(configDir)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -258,6 +279,47 @@ func runProxmoxStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runProxmoxForget(cmd *cobra.Command, args []string) error {
+	configDir := platform.ConfigDir()
+	path := pmx.ConfigPath(configDir)
+
+	bold := color.New(color.Bold)
+	green := color.New(color.FgGreen)
+
+	cfg, _ := pmx.LoadConfig(configDir)
+	if cfg == nil || cfg.BaseURL == "" {
+		fmt.Printf("No saved Proxmox connection to forget (looked for %s).\n", path)
+		return nil
+	}
+
+	bold.Println("Forget saved Proxmox connection")
+	fmt.Printf("  Base URL: %s\n", cfg.BaseURL)
+	fmt.Printf("  Config:   %s\n", path)
+
+	if !proxmoxForgetYes && !proxmoxConfirm(fmt.Sprintf("\nDelete %s?", path)) {
+		fmt.Println("Aborted.")
+		return nil
+	}
+
+	if err := pmx.DeleteConfig(configDir); err != nil {
+		return fmt.Errorf("forgetting proxmox connection: %w", err)
+	}
+
+	green.Printf("Forgot Proxmox connection. Deleted %s\n", path)
+	fmt.Println("The Control Center Proxmox tab will no longer appear (unless this host is itself a Proxmox node).")
+	return nil
+}
+
+// proxmoxConfirm reads a single yes/no line from stdin and reports whether it
+// is affirmative. The default is no.
+func proxmoxConfirm(question string) bool {
+	fmt.Printf("%s (y/N) ", question)
+	reader := bufio.NewReader(os.Stdin)
+	resp, _ := reader.ReadString('\n')
+	resp = strings.TrimSpace(strings.ToLower(resp))
+	return resp == "y" || resp == "yes"
 }
 
 func pmxFormatDuration(seconds int64) string {
