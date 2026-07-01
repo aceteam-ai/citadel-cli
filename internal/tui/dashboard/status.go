@@ -487,7 +487,9 @@ func visibleLength(s string) int {
 // RunDashboard runs the interactive status dashboard
 func RunDashboard(data StatusData, refreshFn func() (StatusData, error)) error {
 	model := NewStatusModel(data, refreshFn)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	// WithMouseCellMotion enables scroll/click in the status dashboard, matching
+	// the control center's mouse-on default. Keyboard bindings are unaffected.
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }

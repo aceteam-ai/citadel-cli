@@ -255,7 +255,18 @@ func runControlCenter() {
 			SaveKeepAwake: func(k *config.KeepAwake) error {
 				return config.SaveKeepAwake(platform.ConfigDir(), k)
 			},
+			LoadMouse: func() *config.Mouse {
+				return config.LoadMouse(platform.ConfigDir())
+			},
+			SaveMouse: func(m *config.Mouse) error {
+				return config.SaveMouse(platform.ConfigDir(), m)
+			},
+			// SetMouseEnabled is injected by the control center itself in Run(),
+			// where the running tview app exists to receive EnableMouse.
 		},
+		// Resolve the initial mouse state: persisted preference with the
+		// --no-mouse flag applied as a session override.
+		MouseEnabled:  controlcenter.ResolveMouseEnabled(noMouse, config.LoadMouse(platform.ConfigDir()).Enabled),
 		WhatsApp:      buildWhatsAppCallbacks(),
 		ModuleInstall: buildModuleInstallCallbacks(),
 	}

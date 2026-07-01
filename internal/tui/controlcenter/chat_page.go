@@ -61,6 +61,7 @@ type ChatPage struct {
 	msgView    *tview.TextView
 	statusBar  *tview.TextView
 	input      *tview.InputField
+	sendButton *tview.Button
 
 	// Chat client
 	client   *chat.Client
@@ -213,7 +214,7 @@ func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
 	p.input.SetLabel("> ")
 	p.input.SetFieldBackgroundColor(tcell.ColorDarkSlateGray)
 	p.input.SetLabelColor(tcell.ColorGreen)
-	p.input.SetPlaceholder("Type a message and press Enter")
+	p.input.SetPlaceholder("Type a message and press Enter (or click Send)")
 	p.input.SetPlaceholderTextColor(tcell.ColorDimGray)
 	p.input.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
@@ -221,10 +222,28 @@ func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
 		}
 	})
 
+	// Visible, clickable Send affordance so mouse users aren't forced to know
+	// that Enter submits. Button.SetSelectedFunc fires on both keyboard Enter
+	// (when focused) and MouseLeftClick, so it works either way. After sending,
+	// focus returns to the input so the user can keep typing.
+	p.sendButton = tview.NewButton("Send")
+	p.sendButton.SetSelectedFunc(func() {
+		p.sendMessage()
+		if p.app != nil && p.input != nil {
+			p.app.SetFocus(p.input)
+		}
+	})
+
+	// Input row: the text field expands, the Send button is a fixed-width click
+	// target on the right.
+	inputRow := tview.NewFlex().
+		AddItem(p.input, 0, 1, true).
+		AddItem(p.sendButton, 8, 0, false)
+
 	rightPanel := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(p.msgView, 0, 1, false).
 		AddItem(p.statusBar, 1, 0, false).
-		AddItem(p.input, 1, 0, true)
+		AddItem(inputRow, 1, 0, true)
 
 	// Render the initial "connecting" status line.
 	p.renderStatusBar(connConnecting, "")
@@ -234,6 +253,31 @@ func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
 	p.root = tview.NewFlex().
 		AddItem(p.sidebar, 24, 0, false).
 		AddItem(rightPanel, 0, 1, true)
+
+	// Mouse: clicking the message history, a channel, or a peer focuses the input
+	// so a mouse user can immediately start typing (rather than the clicked pane
+	// stealing focus). The scroll wheel still scrolls the message history because
+	// scroll actions are passed through unchanged; only left-clicks redirect
+	// focus. Keyboard navigation is unaffected — this is a mouse-only hook.
+	focusInputOnClick := func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		switch action {
+		case tview.MouseLeftClick, tview.MouseLeftDown:
+			if p.app != nil && p.input != nil {
+				p.app.SetFocus(p.input)
+			}
+			// Consume the click so the clicked TextView does not immediately grab
+			// focus back on MouseLeftDown. Returning a nil event with the
+			// MouseConsumed action skips the primitive's default handler.
+			return tview.MouseConsumed, nil
+		default:
+			// Pass scroll (and everything else) through so wheel-scrolling the
+			// message history keeps working.
+			return action, event
+		}
+	}
+	p.msgView.SetMouseCapture(focusInputOnClick)
+	p.channelBox.SetMouseCapture(focusInputOnClick)
+	p.peersBox.SetMouseCapture(focusInputOnClick)
 
 	return p.root
 }

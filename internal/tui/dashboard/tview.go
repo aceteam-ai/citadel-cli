@@ -40,6 +40,10 @@ func NewTviewDashboard(data StatusData, refreshFn func() (StatusData, error)) *T
 // Run starts the tview dashboard
 func (d *TviewDashboard) Run() error {
 	d.app = tview.NewApplication()
+	// Opt into mouse reporting so tables/rows are clickable and scrollable. tview
+	// primitives handle clicks/scroll natively once enabled; keyboard bindings
+	// (below) are untouched.
+	d.app.EnableMouse(true)
 	d.buildUI()
 	d.updateUI()
 
