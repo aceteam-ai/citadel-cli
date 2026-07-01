@@ -13,10 +13,19 @@ import (
 	"time"
 
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // LLMInferenceHandler handles llm_inference jobs from the Redis queue.
 type LLMInferenceHandler struct{}
+
+// vllmBaseURL and llamacppBaseURL2 return host-local base URLs for the vLLM and
+// llama.cpp engines using the citadel-owned host ports (services/ports.go)
+// rather than hardcoded literals. (llamacppBaseURL is already defined in
+// llamacpp_inference.go within this package; this file reuses that helper.)
+func vllmBaseURL() string {
+	return fmt.Sprintf("http://localhost:%d", services.VLLMHostPort)
+}
 
 // CanHandle returns true if this handler can process the given job type.
 func (h *LLMInferenceHandler) CanHandle(jobType string) bool {
@@ -95,7 +104,7 @@ func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, client *redisclie
 		return err
 	}
 
-	vllmURL := "http://localhost:8000/v1/completions"
+	vllmURL := vllmBaseURL() + "/v1/completions"
 
 	reqPayload := map[string]any{
 		"model":       payload.Model,
@@ -234,7 +243,7 @@ func (h *LLMInferenceHandler) handleVLLMNonStream(ctx context.Context, client *r
 }
 
 func (h *LLMInferenceHandler) waitForVLLMReady(ctx context.Context) error {
-	healthURL := "http://localhost:8000/health"
+	healthURL := vllmBaseURL() + "/health"
 	maxWait := 60 * time.Second
 	pollInterval := 1 * time.Second
 	startTime := time.Now()
@@ -445,7 +454,7 @@ func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client 
 
 // executeLlamaCpp handles inference via llama.cpp server API.
 func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
-	llamaCppURL := "http://localhost:8080/completion"
+	llamaCppURL := llamacppBaseURL() + "/completion"
 
 	reqPayload := map[string]any{
 		"prompt":      payload.Prompt,

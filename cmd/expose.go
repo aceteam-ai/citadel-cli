@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
 
@@ -20,14 +21,16 @@ var (
 	exposeCheck   bool
 )
 
-// Known service ports
+// Known service ports. vllm/llamacpp use the citadel-owned host ports
+// (services/ports.go) so the URLs shown to the operator match what the
+// containers actually publish.
 var servicePorts = map[string]int{
-	"vllm":     8000,
+	"vllm":     services.VLLMHostPort,
 	"ollama":   11434,
-	"llamacpp": 8080,
+	"llamacpp": services.LlamacppHostPort,
 	"lmstudio": 1234,
-	// wechat is the per-person WeChat REST API (WeChatFerry on a Windows VM).
-	// Shares :8000 with vllm; the map is keyed by name so both coexist.
+	// wechat is the per-person WeChat REST API (WeChatFerry on a Windows VM) on
+	// its own :8000; the map is keyed by name so it coexists with the others.
 	"wechat": 8000,
 }
 

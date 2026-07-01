@@ -10,10 +10,18 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // ExtractionHandler proxies extraction requests to the local extraction service.
 type ExtractionHandler struct{}
+
+// extractionBaseURL is the host-local base URL for the extraction service, using
+// the citadel-owned host port (services/ports.go) rather than a hardcoded
+// literal.
+func extractionBaseURL() string {
+	return fmt.Sprintf("http://localhost:%d", services.ExtractionHostPort)
+}
 
 func (h *ExtractionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	text, textOk := job.Payload["text"]
@@ -46,7 +54,7 @@ func (h *ExtractionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := http.Post("http://localhost:8100/extract", "application/json", bytes.NewBuffer(reqBody))
+	resp, err := http.Post(extractionBaseURL()+"/extract", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to extraction service: %w", err)
 	}
@@ -61,7 +69,7 @@ func (h *ExtractionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 }
 
 func (h *ExtractionHandler) waitForReady() error {
-	healthURL := "http://localhost:8100/health"
+	healthURL := extractionBaseURL() + "/health"
 	maxWait := 60 * time.Second
 	pollInterval := 1 * time.Second
 	startTime := time.Now()
