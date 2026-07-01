@@ -39,19 +39,29 @@ func TestClassifyChatKey_ReleasesNavigationKeys(t *testing.T) {
 	}
 }
 
-// TestNextChatPaneIndex covers forward/backward cycling and the "focus not on a
-// chat pane yet" (-1) start case.
+// TestNextChatPaneIndex covers the edge-bubble navigation: Tab cycles panes in
+// the MIDDLE of the list but, instead of wrapping, returns an out-of-range index
+// at the edges (count forward-past-last, -1 backward-before-first) so the caller
+// bubbles the key up and the user leaves the Chat tab. It also covers the
+// "focus not on a chat pane yet" start case (which enters the list, never
+// bubbles) and the empty-panes guard.
 func TestNextChatPaneIndex(t *testing.T) {
-	const count = 4
+	const count = 4 // panes: input, messages, peers, channels
 	tests := []struct {
 		name           string
 		focused, delta int
 		want           int
 	}{
-		{"forward from input", 0, 1, 1},
-		{"forward wraps to input", count - 1, 1, 0},
-		{"backward from input wraps to last", 0, -1, count - 1},
-		{"backward from second", 1, -1, 0},
+		// Middle-of-list cycling (focus moves, stays in range).
+		{"forward from input to messages", 0, 1, 1},
+		{"forward from messages to peers", 1, 1, 2},
+		{"forward from peers to channels", 2, 1, 3},
+		{"backward from channels to peers", 3, -1, 2},
+		{"backward from messages to input", 1, -1, 0},
+		// Edge bubbles: out-of-range signals "leave the tab".
+		{"forward at last pane bubbles (== count)", count - 1, 1, count},
+		{"backward at first pane bubbles (== -1)", 0, -1, -1},
+		// Focus not yet on a chat pane: enter the list, do NOT bubble.
 		{"no focus forward starts at input", -1, 1, 0},
 		{"no focus backward starts at last", -1, -1, count - 1},
 	}
@@ -65,6 +75,20 @@ func TestNextChatPaneIndex(t *testing.T) {
 	}
 	if got := nextChatPaneIndex(0, 0, 1); got != -1 {
 		t.Errorf("nextChatPaneIndex with zero panes = %d, want -1", got)
+	}
+}
+
+// TestNextChatPaneIndex_EdgeResultsAreBubbles asserts the contract the caller
+// relies on: at a pane edge the returned index is out of [0, count), which
+// cycleChatPane treats as "past the edge -> bubble" (and, critically, guards so
+// the positive forward sentinel `count` never indexes panes[count] and panics).
+func TestNextChatPaneIndex_EdgeResultsAreBubbles(t *testing.T) {
+	const count = 4
+	if idx := nextChatPaneIndex(count-1, count, 1); idx >= 0 && idx < count {
+		t.Errorf("forward-at-last idx = %d, want out of [0,%d) to bubble", idx, count)
+	}
+	if idx := nextChatPaneIndex(0, count, -1); idx >= 0 && idx < count {
+		t.Errorf("backward-at-first idx = %d, want out of [0,%d) to bubble", idx, count)
 	}
 }
 
