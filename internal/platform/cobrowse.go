@@ -429,6 +429,12 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 		return CobrowseStatus{}, err
 	}
 
+	// Clear any Xvfb left over from a prior launch that started the virtual
+	// display but then failed (e.g. CDP never came up) and whose browser has
+	// since died. We are not running (checked above), so any lingering managed
+	// Xvfb is stale and must be reaped before starting a fresh one, or it leaks.
+	m.teardownXvfbLocked()
+
 	// Resolve the X display the browser renders on. Default: a dedicated Xvfb
 	// virtual display, which (a) works on headless nodes with no :0 and (b)
 	// isolates the session from the operator's real desktop. Opt into a shared
