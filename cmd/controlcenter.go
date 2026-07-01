@@ -1743,9 +1743,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create handlers with activity callback to route job output through TUI.
 	wsDir := resolveWorkspaceDir()
+	ccPerms := config.LoadPermissions(platform.ConfigDir())
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
-		LogFn:        activity,
-		WorkspaceDir: wsDir,
+		LogFn:         activity,
+		WorkspaceDir:  wsDir,
+		ShellDisabled: !ccPerms.Shell,
 	})
 
 	// Create runner with TUI callbacks

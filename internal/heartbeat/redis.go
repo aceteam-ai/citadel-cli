@@ -50,6 +50,7 @@ type PermissionState struct {
 	Files    bool `json:"files"`
 	Services bool `json:"services"`
 	SSH      bool `json:"ssh"`
+	Shell    bool `json:"shell"`
 }
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.

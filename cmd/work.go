@@ -1425,10 +1425,12 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Create handlers with optional workspace for file-operation jobs.
+	workPerms := config.LoadPermissions(platform.ConfigDir())
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
+		ShellDisabled:             !workPerms.Shell,
 	})
 	handlers = append(handlers, workflow.NewHandler(wfExec))
 
@@ -1944,6 +1946,7 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 		Files:    p.Files,
 		Services: p.Services,
 		SSH:      p.SSH,
+		Shell:    p.Shell,
 	}
 }
 

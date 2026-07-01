@@ -107,6 +107,11 @@ type LegacyHandlerOpts struct {
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
 	AllowReadOutsideWorkspace bool
+	// ShellDisabled, when true, registers the SHELL_COMMAND handler in a
+	// refusing state: it is still dispatchable (so the node returns the
+	// "disabled" error rather than "unsupported job type"), but every command
+	// is rejected. Wired from the persisted `shell` node permission.
+	ShellDisabled bool
 }
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
@@ -123,8 +128,11 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 // structured options value for richer configuration (e.g. workspace directory
 // for file-operation handlers).
 func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
+	shellHandler := jobs.NewShellCommandHandler(opts.WorkspaceDir)
+	shellHandler.Disabled = opts.ShellDisabled
+
 	handlers := []*LegacyHandlerAdapter{
-		NewLegacyHandlerAdapter(JobTypeShellCommand, jobs.NewShellCommandHandler(opts.WorkspaceDir)),
+		NewLegacyHandlerAdapter(JobTypeShellCommand, shellHandler),
 		NewLegacyHandlerAdapter(JobTypeTmuxSession, jobs.NewTmuxSessionHandler("")),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),

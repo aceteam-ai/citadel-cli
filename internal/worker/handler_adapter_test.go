@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
@@ -176,6 +177,72 @@ func TestCreateLegacyHandlers(t *testing.T) {
 
 func TestLegacyHandlerAdapterImplementsJobHandler(t *testing.T) {
 	var _ JobHandler = (*LegacyHandlerAdapter)(nil)
+}
+
+// TestCreateLegacyHandlers_ShellDisabled verifies that ShellDisabled still
+// registers a SHELL_COMMAND handler (so the node returns the "disabled" refusal
+// rather than "unsupported job type"), but that handler refuses execution.
+func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{ShellDisabled: true})
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must remain registered even when disabled")
+	}
+
+	job := &Job{
+		ID:      "job-shell-disabled",
+		Type:    JobTypeShellCommand,
+		Payload: map[string]any{"command": "echo should-not-run"},
+	}
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err == nil {
+		t.Fatal("disabled SHELL_COMMAND handler should return an error")
+	}
+	if !strings.Contains(err.Error(), jobs.ShellDisabledError) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), jobs.ShellDisabledError)
+	}
+	// The adapter surfaces failures via the returned error; result should not
+	// report success.
+	if result != nil && result.Status == JobStatusSuccess {
+		t.Error("disabled shell handler must not report success")
+	}
+}
+
+// TestCreateLegacyHandlers_ShellEnabledByDefault confirms the default opt
+// (ShellDisabled=false) leaves shell execution working.
+func TestCreateLegacyHandlers_ShellEnabledByDefault(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{})
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must be registered by default")
+	}
+
+	job := &Job{
+		ID:      "job-shell-enabled",
+		Type:    JobTypeShellCommand,
+		Payload: map[string]any{"command": "echo ok"},
+	}
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("enabled shell handler should run: %v", err)
+	}
+	if result.Status != JobStatusSuccess {
+		t.Errorf("result.Status = %v, want success", result.Status)
+	}
 }
 
 func TestLegacyHandlerAdapterPayloadCoercion(t *testing.T) {
