@@ -35,6 +35,17 @@ type SettingsCallbacks struct {
 	// SetMouseEnabled applies mouse capture live on the running app (no restart),
 	// mirroring tview's app.EnableMouse. May be nil in contexts without an app.
 	SetMouseEnabled func(bool)
+
+	// LoadRendering returns the current persisted fullscreen-rendering setting.
+	LoadRendering func() *config.Rendering
+	// SaveRendering persists an updated fullscreen-rendering setting.
+	SaveRendering func(*config.Rendering) error
+	// SetFullscreenEnabled is the injection seam for applying the fullscreen
+	// preference on the running app. Unlike mouse capture, tview cannot swap the
+	// terminal's alternate-screen mode mid-run, so today this is a no-op seam that
+	// a launch-time consumer in the control center's Run() path will fill (the
+	// screen path is owned by controlcenter.go). May be nil.
+	SetFullscreenEnabled func(bool)
 }
 
 // connStatusProvider exposes the user-facing connection status. The ChatPage
@@ -58,6 +69,7 @@ type SettingsPage struct {
 	telemetry *config.Telemetry
 	keepAwake *config.KeepAwake
 	mouse     *config.Mouse
+	rendering *config.Rendering
 
 	// UI
 	root *tview.Flex
@@ -102,6 +114,7 @@ func (p *SettingsPage) OnActivate() {
 	p.reloadTelemetry()
 	p.reloadKeepAwake()
 	p.reloadMouse()
+	p.reloadRendering()
 	p.render()
 	if p.app != nil && p.view != nil {
 		p.app.SetFocus(p.view)
@@ -111,12 +124,16 @@ func (p *SettingsPage) OnActivate() {
 // OnDeactivate implements Page.
 func (p *SettingsPage) OnDeactivate() {}
 
-// HandleInput implements Page. Space/Enter/'t' toggles the telemetry opt-out;
-// 'k' toggles the keep-awake-on-AC opt-in; 'm' toggles mouse control.
+// HandleInput implements Page. 'm' toggles mouse control; 'f' toggles fullscreen
+// rendering (the two Mouse & Rendering checkboxes); 'k' toggles keep-awake-on-AC;
+// Space/Enter/'t' toggles the telemetry opt-out.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
 	case event.Key() == tcell.KeyRune && (event.Rune() == 'm' || event.Rune() == 'M'):
 		p.toggleMouse()
+		return nil
+	case event.Key() == tcell.KeyRune && (event.Rune() == 'f' || event.Rune() == 'F'):
+		p.toggleFullscreen()
 		return nil
 	case event.Key() == tcell.KeyRune && (event.Rune() == 'k' || event.Rune() == 'K'):
 		p.toggleKeepAwake()
@@ -226,6 +243,43 @@ func (p *SettingsPage) toggleMouse() {
 	p.render()
 }
 
+// reloadRendering refreshes the in-memory fullscreen-rendering setting from disk.
+func (p *SettingsPage) reloadRendering() {
+	if p.cb.LoadRendering != nil {
+		p.rendering = p.cb.LoadRendering()
+	}
+	if p.rendering == nil {
+		p.rendering = config.DefaultRendering()
+	}
+}
+
+// toggleFullscreen flips fullscreen rendering and persists it. tview cannot swap
+// the terminal's alternate-screen mode mid-run, so this only persists the choice
+// today — no live apply, and nothing consumes the pref at launch yet (the
+// screen-creation path is owned by controlcenter.go). SetFullscreenEnabled is the
+// nil-able seam a future launch-time consumer will fill; it is a no-op today.
+func (p *SettingsPage) toggleFullscreen() {
+	if p.rendering == nil {
+		p.reloadRendering()
+	}
+
+	next := &config.Rendering{Fullscreen: !p.rendering.Fullscreen}
+
+	if p.cb.SetFullscreenEnabled != nil {
+		p.cb.SetFullscreenEnabled(next.Fullscreen)
+	}
+
+	if p.cb.SaveRendering != nil {
+		if err := p.cb.SaveRendering(next); err != nil {
+			p.rendering = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.rendering = next
+	p.render()
+}
+
 // render redraws the settings view from current state.
 func (p *SettingsPage) render() {
 	p.renderWithError("")
@@ -236,9 +290,34 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 		return
 	}
 
-	enabled := p.telemetry != nil && p.telemetry.AnonTelemetryEnabled
-
 	var sb strings.Builder
+
+	// -- Mouse & Rendering (headline section) --
+	// Two checkboxes, each carrying its own tradeoff copy. The value here is the
+	// copy, not just the switch: mouse control trades native drag-to-copy for
+	// GUI-feel, and fullscreen rendering trades scrollback for a flicker-free app
+	// screen. A bare toggle would just relocate the confusion, so name the
+	// tradeoff and the bypass/consequence inline.
+	sb.WriteString("\n [yellow::b]Mouse & Rendering[-:-:-]\n")
+	sb.WriteString(" [gray]─────────────────[-]\n\n")
+
+	// Checkbox 1: Mouse control.
+	mouseEnabled := p.mouse != nil && p.mouse.Enabled
+	sb.WriteString(fmt.Sprintf("   %s [white::b]Mouse control[-:-:-]            Click tabs, peers, and Send instead of memorizing keys.\n", checkbox(mouseEnabled)))
+	sb.WriteString("                                Tradeoff: your terminal's drag-to-copy stops working while\n")
+	sb.WriteString("                                this is on. To copy anyway, hold:\n")
+	sb.WriteString("                                  [white]• Shift[-]        (most terminals)\n")
+	sb.WriteString("                                  [white]• Fn[-]           (macOS Terminal.app)\n")
+	sb.WriteString("                                  [white]• Option[-]        (iTerm2)\n")
+	sb.WriteString("   [gray]press[-] [yellow::b]m[-:-:-] [gray]to toggle (applies immediately)[-]\n\n")
+
+	// Checkbox 2: Fullscreen rendering.
+	fullscreenEnabled := p.rendering != nil && p.rendering.Fullscreen
+	sb.WriteString(fmt.Sprintf("   %s [white::b]Fullscreen rendering[-:-:-]     Flicker-free, app-like. Off = output goes to normal\n", checkbox(fullscreenEnabled)))
+	sb.WriteString("                                scrollback (easier to scroll + copy long history).\n")
+	sb.WriteString("   [gray]press[-] [yellow::b]f[-:-:-] [gray]to toggle (saved; full apply coming soon)[-]\n")
+
+	enabled := p.telemetry != nil && p.telemetry.AnonTelemetryEnabled
 
 	// -- Anonymous data collection --
 	sb.WriteString("\n [yellow::b]Anonymous Data Collection[-:-:-]\n\n")
@@ -272,26 +351,6 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   mesh. Released on battery and on exit. Display may still sleep.\n\n")
 	sb.WriteString("   [yellow::b]k[-:-:-] toggle keep-awake\n")
 
-	// -- Mouse control --
-	// The value here is the copy, not just the switch: the real tradeoff is
-	// "GUI-feel vs. native terminal drag-to-copy", and a bare toggle just
-	// relocates the confusion. Name the tradeoff and the bypass keys inline.
-	mouseEnabled := p.mouse != nil && p.mouse.Enabled
-	sb.WriteString("\n [yellow::b]Mouse Control[-:-:-]\n\n")
-	if mouseEnabled {
-		sb.WriteString("   Status:  [green::b]ON[-:-:-]  [gray](click to drive)[-]\n")
-	} else {
-		sb.WriteString("   Status:  [red::b]OFF[-:-:-]  [gray](keyboard only)[-]\n")
-	}
-	sb.WriteString("\n   [white]What it does:[-] click tabs, peers, and Send instead of\n")
-	sb.WriteString("   memorizing keys. Keyboard shortcuts keep working either way.\n\n")
-	sb.WriteString("   [white]Tradeoff:[-] your terminal's drag-to-copy stops working while\n")
-	sb.WriteString("   this is on. To copy anyway, hold:\n")
-	sb.WriteString("     [white]• Shift[-]    (most terminals)\n")
-	sb.WriteString("     [white]• Fn[-]       (macOS Terminal.app)\n")
-	sb.WriteString("     [white]• Option[-]   (iTerm2)\n\n")
-	sb.WriteString("   [yellow::b]m[-:-:-] toggle mouse control [gray](applies immediately)[-]\n")
-
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")
 	endpoint, state := p.connectionStatus()
@@ -315,6 +374,15 @@ func (p *SettingsPage) connectionStatus() (string, ConnState) {
 		return "", ConnDisconnected
 	}
 	return p.connStatus.ConnectionStatus()
+}
+
+// checkbox renders a colored checkbox glyph for a boolean setting: a green
+// checkmark when on, a dim empty box when off.
+func checkbox(on bool) string {
+	if on {
+		return "[green::b][✓][-:-:-]"
+	}
+	return "[gray][ ][-]"
 }
 
 // connStateLabel renders a colored health label for a connection state.
