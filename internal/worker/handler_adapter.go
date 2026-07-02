@@ -173,6 +173,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// registration rationale as the screenshot/type/keys handlers above.
 		NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
 		NewLegacyHandlerAdapter(JobTypeCobrowse, jobs.NewCobrowseHandler()),
+		// Resource snapshot (issue #427): returns the node's full GPU/host
+		// resource-consumer picture over the fabric. Registered unconditionally
+		// like the inference handlers — it needs no workspace sandbox, and gating
+		// it would leave the backend's node-resource pull timing out on nodes
+		// without a configured workspace.
+		NewLegacyHandlerAdapter(JobTypeResourceSnapshot, &jobs.ResourceSnapshotHandler{}),
 	}
 
 	// Register file-operation handlers when a workspace is configured.
