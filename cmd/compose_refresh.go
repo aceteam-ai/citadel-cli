@@ -10,18 +10,25 @@
 // that were provisioned by an older binary and would otherwise keep stale,
 // hardcoded-port composes forever.
 //
-// Recreate-on-boot policy (see PR for rationale): the default is conservative --
-// refresh the FILE only and log a hint telling the operator to restart affected
-// services. Force-recreating a live container on boot interrupts inference
-// (e.g. a vLLM model reload), so auto-recreate is opt-in via
-// CITADEL_COMPOSE_RECREATE_ON_UPGRADE=1|true|yes. When enabled, a port-managed
-// service is recreated only if its running published host port actually moved.
+// Recreate-on-boot policy (see PR for rationale): the primary upgrade path is a
+// hands-off auto-update that re-execs the binary in place (syscall.Exec) WITHOUT
+// tearing down service containers, so the prior container keeps running on its
+// old host port and startManagedServices no-ops on it (it's already running).
+// Refreshing only the FILE would therefore never self-heal an auto-updated node
+// -- exactly the population #426 targets. So auto force-recreate on a *port
+// change* is the DEFAULT: it fires only when a managed service is running AND
+// its published host port actually differs from the new template (i.e. the
+// broken/colliding state, not healthy inference). Operators who prefer to move
+// live containers by hand can opt out with
+// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE=1|true|yes, which downgrades to
+// file-refresh + a remediation hint.
 package cmd
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -38,20 +45,21 @@ func refreshManagedComposeFiles(configDir string) {
 	if configDir == "" {
 		return
 	}
-	servicesDir := configDir + "/services"
+	servicesDir := filepath.Join(configDir, "services")
 
 	var recreator composerefresh.PortRecreator
 	if recreateOnUpgradeEnabled() {
-		recreator = dockerPortRecreator
+		recreator = enginePortRecreator
 	}
 
 	res, err := composerefresh.Sweep(composerefresh.Options{
-		ServicesDir: servicesDir,
-		Version:     Version,
-		Embedded:    services.ServiceMap,
-		PortManaged: services.ServiceHostPorts,
-		Recreator:   recreator,
-		Log:         func(format string, args ...any) { Log(format, args...) },
+		ServicesDir:           servicesDir,
+		Version:               Version,
+		Embedded:              services.ServiceMap,
+		PortManaged:           services.ServiceHostPorts,
+		KnownHistoricalHashes: services.KnownComposeHashes,
+		Recreator:             recreator,
+		Log:                   func(format string, args ...any) { Log(format, args...) },
 	})
 	if err != nil {
 		Log("compose-refresh: sweep error: %v", err)
@@ -72,23 +80,26 @@ func refreshManagedComposeFiles(configDir string) {
 	}
 }
 
-// recreateOnUpgradeEnabled reports whether the operator opted into auto
-// force-recreate of a port-moved service on boot. Default is off.
+// recreateOnUpgradeEnabled reports whether boot-time auto force-recreate of a
+// port-moved service is active. It is ON by default because the primary upgrade
+// path (auto-update re-exec) leaves prior containers running on their old host
+// port, so file-refresh alone would never self-heal the collision #426 targets.
+// Operators can opt out with CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE.
 func recreateOnUpgradeEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_COMPOSE_RECREATE_ON_UPGRADE"))) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE"))) {
 	case "1", "true", "yes", "on":
-		return true
-	default:
 		return false
+	default:
+		return true
 	}
 }
 
-// dockerPortRecreator inspects the running container's published host port and,
+// enginePortRecreator inspects the running container's published host port and,
 // if it differs from wantHostPort, force-recreates the service from composePath
 // with the citadel host-port env injected. Returns (recreated, err). When the
 // container is not running or already publishes the wanted port, it is left
 // untouched (recreated=false).
-func dockerPortRecreator(service, composePath string, wantHostPort int) (bool, error) {
+func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
 	rt := catalog.SelectContainerRuntime()
 	containerName := "citadel-" + service
 
@@ -107,7 +118,7 @@ func dockerPortRecreator(service, composePath string, wantHostPort int) (bool, e
 	composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
 	args := rt.ComposeArgs(composeArgs...)
 	cmd := exec.Command(rt.Bin, args...)
-	cmd.Env = append(os.Environ(), services.HostPortEnv()...)
+	cmd.Env = composeEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return false, fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}

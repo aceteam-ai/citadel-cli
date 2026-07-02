@@ -126,11 +126,11 @@ func TestSweep_PreservesHandEditedFile(t *testing.T) {
 	if string(got) != handEdited {
 		t.Fatal("hand-edited file content changed")
 	}
-	// The recorded hash for the edited file is retained so future boots keep
-	// detecting the edit.
+	// The recorded hash tracks the CURRENT on-disk (edited) content, so a future
+	// clean upgrade can re-adopt the file if the operator restores a template.
 	stamp := readStampFile(t, dir)
-	if stamp.Hashes["llamacpp"] != sha(embeddedV1) {
-		t.Fatal("recorded hash for hand-edited file was not retained")
+	if stamp.Hashes["llamacpp"] != sha(handEdited) {
+		t.Fatal("recorded hash for hand-edited file should track on-disk content")
 	}
 }
 
@@ -159,6 +159,47 @@ func TestSweep_BootstrapNoStampRefreshes(t *testing.T) {
 	// A stamp is now written so subsequent upgrades use precise hash matching.
 	if _, existed := readStamp(dir); !existed {
 		t.Fatal("expected a stamp to be written after bootstrap refresh")
+	}
+}
+
+// (b”) Bootstrap with a known-historical-hash allowlist: a no-stamp file that
+// matches a prior shipped template is refreshed; one that matches nothing is
+// preserved as an operator edit.
+func TestSweep_BootstrapKnownHashAllowlist(t *testing.T) {
+	dir := t.TempDir()
+
+	// llamacpp: stale but byte-identical to a known prior template -> refresh.
+	managedPath := filepath.Join(dir, "llamacpp.yml")
+	writeFile(t, managedPath, embeddedV1)
+	// vllm: hand-edited, matches no known template -> preserve.
+	handEdited := "services:\n  vllm:\n    image: acme/pinned\n"
+	vllmPath := filepath.Join(dir, "vllm.yml")
+	writeFile(t, vllmPath, handEdited)
+
+	res, err := Sweep(Options{
+		ServicesDir: dir,
+		Version:     "v2.57.0",
+		Embedded: map[string]string{
+			"llamacpp": embeddedV2,
+			"vllm":     "services:\n  vllm:\n    image: new\n",
+		},
+		PortManaged: map[string]int{"llamacpp": 8200, "vllm": 8201},
+		KnownHistoricalHashes: map[string]map[string]bool{
+			"llamacpp": {sha(embeddedV1): true},
+			// vllm: only the current template is "known"; handEdited is not.
+		},
+	})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !contains(res.Refreshed, "llamacpp") {
+		t.Fatalf("known-hash stale file must be refreshed, got %+v", res)
+	}
+	if !contains(res.Preserved, "vllm") {
+		t.Fatalf("unknown-hash edited file must be preserved, got %+v", res)
+	}
+	if got, _ := os.ReadFile(vllmPath); string(got) != handEdited {
+		t.Fatal("hand-edited vllm was clobbered under known-hash bootstrap")
 	}
 }
 
@@ -289,3 +330,37 @@ func TestSweep_RecreateOnlyOnPortManagedRefresh(t *testing.T) {
 		t.Fatal("non-port-managed ollama must never be recreated")
 	}
 }
+
+// A failed force-recreate rolls the compose file back to its prior content so a
+// bad template can't brick the service AND destroy the working file.
+func TestSweep_RecreateFailureRollsBackFile(t *testing.T) {
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "llamacpp.yml")
+	writeFile(t, composePath, embeddedV1)
+
+	opts := baseOpts(dir, "v2.57.0")
+	opts.Recreator = func(service, composePath string, wantHostPort int) (bool, error) {
+		return false, errThrow("compose up failed: boom")
+	}
+
+	res, err := Sweep(opts)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if contains(res.Refreshed, "llamacpp") {
+		t.Fatal("a rolled-back refresh must not be reported as Refreshed")
+	}
+	// File restored to the prior content.
+	if got, _ := os.ReadFile(composePath); string(got) != embeddedV1 {
+		t.Fatalf("file not rolled back after recreate failure:\n%s", got)
+	}
+	// Stamp records the restored (prior) content's hash so the next boot retries.
+	stamp := readStampFile(t, dir)
+	if stamp.Hashes["llamacpp"] != sha(embeddedV1) {
+		t.Fatal("stamp hash should track the rolled-back content")
+	}
+}
+
+type errThrow string
+
+func (e errThrow) Error() string { return string(e) }

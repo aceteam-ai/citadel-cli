@@ -74,6 +74,15 @@ type Options struct {
 	// Recreator, when non-nil, may force-recreate a port-managed service whose
 	// running host port moved. Nil => file-refresh only.
 	Recreator PortRecreator
+	// KnownHistoricalHashes maps service name -> set of sha256 hex hashes of
+	// compose content that a PRIOR citadel binary is known to have shipped for
+	// that service. It is the bootstrap safety net for pre-#426 nodes that have
+	// no stamp: an on-disk file matching one of these hashes is provably a
+	// citadel-written (unedited) old template, so it is safe to overwrite; a file
+	// matching none is treated as operator-edited and preserved. When empty, the
+	// bootstrap falls back to refreshing all citadel-owned files (issue-sanctioned
+	// for these env-parameterized templates) with a loud warning.
+	KnownHistoricalHashes map[string]map[string]bool
 	// Log receives warnings/hints. May be nil.
 	Log Logf
 }
@@ -196,19 +205,45 @@ func Sweep(opts Options) (Result, error) {
 		}
 
 		recordedHash, haveRecord := stamp.Hashes[name]
-		citadelWroteIt := (haveRecord && onDiskHash == recordedHash) || !stampExisted
+
+		// Decide whether the on-disk file was written by citadel (safe to
+		// overwrite) or hand-edited by the operator (must be preserved):
+		//   - stamp present: citadel wrote it iff its content matches the recorded
+		//     hash. A mismatch is a definitive hand-edit.
+		//   - no stamp (pre-#426 node): use the known-historical-hash allowlist.
+		//     A file byte-identical to a prior shipped template is citadel's; one
+		//     matching nothing is treated as operator-edited and preserved. When
+		//     no allowlist is supplied, fall back to refreshing (these templates
+		//     are citadel-owned and env-parameterized) with a loud warning.
+		var citadelWroteIt bool
+		switch {
+		case haveRecord:
+			citadelWroteIt = onDiskHash == recordedHash
+		case opts.KnownHistoricalHashes != nil:
+			// Allowlist bootstrap: a known prior template is citadel's; anything
+			// else is treated as an operator edit and preserved.
+			citadelWroteIt = opts.KnownHistoricalHashes[name][onDiskHash]
+		default:
+			// No stamp and no allowlist: refresh (these templates are
+			// citadel-owned and env-parameterized); the loud warning above already
+			// told the operator hand-edits would be reset.
+			citadelWroteIt = true
+		}
 
 		if !citadelWroteIt {
-			// Hand-edited by the operator: leave it, warn, and keep the recorded
-			// hash so we keep detecting the edit on future boots.
+			// Hand-edited by the operator: leave it, warn, and record the CURRENT
+			// on-disk hash so a future clean upgrade can re-adopt it if the
+			// operator later restores an unedited template.
 			res.Preserved = append(res.Preserved, name)
 			opts.log("compose-refresh: %s: on-disk compose was hand-edited; leaving it untouched (delete it to accept the new citadel template)", name)
-			if haveRecord {
-				newHashes[name] = recordedHash
-			}
+			newHashes[name] = onDiskHash
 			continue
 		}
 
+		// Keep the prior on-disk content so we can roll back if a subsequent
+		// force-recreate `up` fails on the new template -- a bad template must not
+		// brick the service AND destroy the previously-working file.
+		prevContent := onDisk
 		if err := writeCompose(destPath, content); err != nil {
 			opts.log("compose-refresh: %s: write failed: %v", name, err)
 			continue
@@ -220,13 +255,24 @@ func Sweep(opts Options) (Result, error) {
 		wantPort, portManaged := opts.PortManaged[name]
 		if !portManaged || opts.Recreator == nil {
 			if portManaged {
-				opts.log("compose-refresh: %s: compose file refreshed; restart the service to apply (host port -> %d)", name, wantPort)
+				// A plain citadel restart will NOT move a running container: the
+				// start path no-ops on an already-running container. The operator
+				// must recreate it (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE).
+				opts.log("compose-refresh: %s: compose file refreshed to host port %d, but a running container is not moved automatically; run `citadel stop %s && citadel start %s` to apply (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE)", name, wantPort, name, name)
 			}
 			continue
 		}
 		recreated, err := opts.Recreator(name, destPath, wantPort)
 		if err != nil {
-			opts.log("compose-refresh: %s: recreate check failed: %v", name, err)
+			// The recreate `up` failed on the new template. Restore the prior file
+			// and its recorded hash so the service is not left with a template that
+			// can't come up, and so the next boot retries.
+			opts.log("compose-refresh: %s: recreate failed, rolling back compose file: %v", name, err)
+			if rbErr := writeCompose(destPath, string(prevContent)); rbErr != nil {
+				opts.log("compose-refresh: %s: rollback write failed: %v", name, rbErr)
+			}
+			res.Refreshed = res.Refreshed[:len(res.Refreshed)-1]
+			newHashes[name] = hashContent(string(prevContent))
 			continue
 		}
 		if recreated {
@@ -247,11 +293,30 @@ func hashContent(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// writeCompose writes compose content with 0600 perms to protect any sensitive
-// env vars, matching the existing materialize paths (cmd.ensureComposeFile /
-// ServiceHandler.ensureEmbeddedComposeFile).
+// writeCompose atomically writes compose content with 0600 perms (to protect
+// any sensitive env vars, matching the existing materialize paths). It writes to
+// a temp file in the same directory and renames into place so a crash mid-write
+// can never leave a truncated compose file that would fail to parse.
 func writeCompose(path, content string) error {
-	return os.WriteFile(path, []byte(content), 0o600)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".compose-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // readStamp loads StampFileName from dir. The second return is false when the
