@@ -833,3 +833,18 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.56.0 release
 
 
+---
+
+## v2.58.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 11 |
+| Lines added | +1061 |
+
+**Changes:**
+
+  - fix(services): re-materialize citadel-owned composes on version change (#426) (#430)
+
+
