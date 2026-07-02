@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,6 +30,50 @@ import (
 
 // ServiceName is the canonical catalog/service name for the bridge module.
 const ServiceName = "whatsapp-bridge"
+
+// BridgeService is the compose service name of the bridge app (the one whose
+// health the status check probes). It matches the `services.bridge` key in the
+// module compose file.
+const BridgeService = "bridge"
+
+// ProjectName returns the docker compose project the bridge stack is deployed
+// under (`docker compose -p <project> ...`), derived from the node's services
+// directory. It is deliberately EXPLICIT rather than left to compose's default so
+// that up/down and the status check all agree on one project, but its VALUE is
+// exactly what compose would derive on its own today -- the sanitized services-dir
+// basename -- so upgrading an already-deployed node keeps its existing containers
+// and, critically, its existing `<project>_whatsapp_pgdata` volume (the Baileys
+// auth state / linked WhatsApp session). Changing this to a fresh literal would
+// orphan that volume and silently unlink the user's phone on the next `up`.
+//
+// The container-name collision fix comes from the module compose no longer
+// hardcoding `container_name`: with names now derived as `<project>-<service>-N`,
+// a citadel-managed stack coexists with any other bridge on the node (a dev
+// `watest` stack, a second tenant) instead of colliding on the global name
+// `citadel-whatsapp-bridge`. The CLI resolves the running container via
+// `docker compose -p <project> ps`, so this is the CLI half of the coupled
+// contract (aceteam-ai/citadel-cli#436 / sunapi386/whatsapp-bridge#4).
+func ProjectName(servicesDir string) string {
+	base := filepath.Base(servicesDir)
+	// Mirror docker compose's project-name sanitization: lowercase, and keep only
+	// [a-z0-9_-], collapsing anything else to '-'. An empty/degenerate result
+	// falls back to the conventional "services" (the basename used by every node
+	// today), so the value never regresses to something compose would reject.
+	var b strings.Builder
+	for _, r := range strings.ToLower(base) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	name := strings.Trim(b.String(), "-_")
+	if name == "" {
+		return "services"
+	}
+	return name
+}
 
 // DefaultPort is the bridge's published REST port.
 const DefaultPort = 8080

@@ -1,0 +1,68 @@
+# Citadel service module: whatsapp-bridge (app + Postgres sidecar).
+# Started by `citadel service start whatsapp-bridge` -> `docker compose -f <this> up -d`.
+#
+# Container names are intentionally NOT hardcoded. Docker container names are
+# GLOBAL, so a fixed `container_name` collides ("The container name ... is already
+# in use") on any node that already runs a bridge stack -- a dev stack, a second
+# tenant, or a half-succeeded provision -- and wedges provisioning. Instead we let
+# compose derive `<project>-<service>-<index>` from the `-p <project>` flag, so
+# multiple stacks coexist. citadel-cli deploys this under a stable project
+# (`docker compose -p citadel-whatsapp up`) and resolves the running container via
+# `docker compose -p citadel-whatsapp ps` rather than a hardcoded name. See
+# aceteam-ai/citadel-cli#436 and sunapi386/whatsapp-bridge#4 -- the compose change
+# and the CLI status-check change are a coupled contract and must land together.
+services:
+  bridge:
+    image: ghcr.io/sunapi386/whatsapp-bridge:latest
+    restart: unless-stopped
+    ports:
+      - "${BRIDGE_PORT:-8080}:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_URL: postgres://whatsapp:${POSTGRES_PASSWORD:-whatsapp}@db:5432/whatsapp
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY is required}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      # Optional per-node default egress proxy (socks5:// or http(s)://). Each
+      # Citadel node already egresses from its own mesh IP, so this is optional
+      # fine-tuning rather than required.
+      DEFAULT_PROXY_URL: ${DEFAULT_PROXY_URL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BAILEYS_LOG_LEVEL: ${BAILEYS_LOG_LEVEL:-warn}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # GET / is unauthenticated and returns {ok:true}; /health requires an API key.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://localhost:8080/',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: whatsapp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-whatsapp}
+      POSTGRES_DB: whatsapp
+    volumes:
+      # Named volume — Docker creates it automatically, so this needs no
+      # pre-created host directory (citadel-cli only pre-creates dirs for the
+      # built-in inference services).
+      - whatsapp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  whatsapp_pgdata:

@@ -149,3 +149,36 @@ func TestQRStringAndHealth(t *testing.T) {
 		t.Error("expected logged_in true")
 	}
 }
+
+// TestProjectNamePreservesExistingVolume is the regression guard for the
+// container-name collision fix (aceteam-ai/citadel-cli#436): the pinned compose
+// project MUST equal what compose derived implicitly before the fix (the
+// services-dir basename, "services"), otherwise upgrading an already-deployed
+// node would move its `<project>_whatsapp_pgdata` volume and silently unlink the
+// user's WhatsApp session.
+func TestProjectNamePreservesExistingVolume(t *testing.T) {
+	// Every node's bridge lives in <configDir>/services, so the project -- and
+	// thus the auth-state volume prefix -- must remain "services".
+	if got := ProjectName(filepath.Join("/home/user/citadel-node", "services")); got != "services" {
+		t.Errorf("ProjectName(...services) = %q, want %q (must match the pre-fix implicit project so the pgdata volume is preserved)", got, "services")
+	}
+}
+
+// TestProjectNameSanitizes checks the derived project is always a value docker
+// compose accepts (lowercase [a-z0-9_-], non-empty).
+func TestProjectNameSanitizes(t *testing.T) {
+	cases := map[string]string{
+		"services":        "services",
+		"Services":        "services",
+		"My Services":     "my-services",
+		"svc.dir":         "svc-dir",
+		"---":             "services", // degenerate -> fallback
+		"":                "services",
+		"node_1-services": "node_1-services",
+	}
+	for in, want := range cases {
+		if got := ProjectName(in); got != want {
+			t.Errorf("ProjectName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
