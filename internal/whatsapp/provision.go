@@ -176,7 +176,7 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	waitCtx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
 	if err := client.WaitReady(waitCtx, readyTimeout); err != nil {
-		return nil, fmt.Errorf("bridge did not become ready: %w (check `docker logs citadel-whatsapp-bridge`)", err)
+		return nil, fmt.Errorf("bridge did not become ready: %w (check `docker compose -p %s logs %s`)", err, ProjectName(servicesDir), BridgeService)
 	}
 
 	// Mint (or reuse) the tenant. Reusing a previously minted tenant preserves an
