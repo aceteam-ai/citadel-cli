@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
@@ -1335,10 +1336,14 @@ func ccStartService(name string) error {
 			// Include the least-privilege sandbox override when present so a
 			// TUI-installed untrusted module also starts hardened here (the
 			// override would otherwise be bypassed by this start site).
-			args := []string{"compose"}
-			args = append(args, composeFileArgs(fullComposePath, fullComposePath)...)
-			args = append(args, "-p", "citadel-"+name, "up", "-d")
-			cmd := exec.Command("docker", args...)
+			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
+			composeArgs = append(composeArgs, "-p", "citadel-"+name, "up", "-d")
+			rt := catalog.SelectContainerRuntime()
+			cmd := exec.Command(rt.Bin, rt.ComposeArgs(composeArgs...)...)
+			// Inject the citadel-owned host ports so the ${CITADEL_*_HOST_PORT:?...}
+			// guard resolves; without this the TUI start button dies for
+			// llamacpp/vllm/extraction/diffusers on v2.57.0 (#426).
+			cmd.Env = composeEnv()
 			return cmd.Run()
 		}
 	}

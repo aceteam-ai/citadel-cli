@@ -15,10 +15,26 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // forceRecreate controls whether to prompt user when containers exist
 var forceRecreate bool
+
+// composeEnv returns the process environment for a `docker compose` invocation
+// in the cmd/ (CLI + TUI) tree, guaranteeing the citadel-owned host-port vars
+// are present so compose templates that defer their host publish to the guarded
+// ${CITADEL_*_HOST_PORT:?...} form (llamacpp/vllm/extraction/diffusers, #410)
+// resolve.
+//
+// Before this helper, only the job-driven paths (internal/jobs) injected these
+// vars; every cmd/ compose-up site (startService, ccStartService, `citadel run`)
+// inherited a bare os.Environ() and so failed the :? guard on v2.57.0 for those
+// four services. Every compose-up site in this tree MUST build its command
+// environment from this helper. Mirrors internal/jobs.ServiceHandler.composeEnv.
+func composeEnv() []string {
+	return append(os.Environ(), svcports.HostPortEnv()...)
+}
 
 // prepareCacheDirectories creates the cache directories for all services.
 func prepareCacheDirectories() error {
@@ -146,6 +162,12 @@ func startService(serviceName, composeFilePath string) error {
 	composeArgs = append(composeArgs, "up", "-d")
 	args := rt.ComposeArgs(composeArgs...)
 	composeCmd := exec.Command(rt.Bin, args...)
+	// Supply the citadel-owned host ports so compose files that defer their host
+	// publish to ${CITADEL_*_HOST_PORT:?...} (llamacpp/vllm/extraction/diffusers)
+	// resolve. Without this, the :? guard added in #410 makes `docker compose up`
+	// fail at this boot-path site (only the SERVICE_START job handler injected it
+	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426).
+	composeCmd.Env = composeEnv()
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, string(output))
