@@ -1,0 +1,34 @@
+# Module compose for the headless Claude Code runtime (citadel-cli#432).
+#
+# This is the MODULE-install variant of services/compose/claudecode.yml. The two
+# differ in ONE way: the standalone file defers the host port to citadel via
+# ${CITADEL_CLAUDECODE_HOST_PORT:?...}; this module file publishes the LITERAL
+# host port 8204 declared in service.yaml, because the module-install path does
+# not inject that env var (only the four built-in ports.go services get it).
+# Everything else is identical.
+services:
+  claudecode:
+    image: ghcr.io/aceteam-ai/claudecode-service:latest
+    container_name: citadel-claudecode
+    ports:
+      - "8204:8787"
+    volumes:
+      - ~/citadel-cache/claudecode:/home/claude/.claude
+    environment:
+      - ACETEAM_INSTANCE_ID=${ACETEAM_INSTANCE_ID:?set ACETEAM_INSTANCE_ID}
+      - ACETEAM_PLATFORM_URL=${ACETEAM_PLATFORM_URL:?set ACETEAM_PLATFORM_URL}
+      - ACETEAM_GATEWAY_KEY=${ACETEAM_GATEWAY_KEY:?set ACETEAM_GATEWAY_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the fabric proxy}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:?set ANTHROPIC_AUTH_TOKEN for the proxy}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:?set ANTHROPIC_MODEL}
+      - ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-}
+      - PORT=8787
+      - CLAUDE_CONFIG_DIR=/home/claude/.claude
+      - CLAUDECODE_TURN_TIMEOUT=${CLAUDECODE_TURN_TIMEOUT:-600}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
