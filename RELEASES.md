@@ -848,3 +848,18 @@ Auto-generated log of every release.
   - fix(services): re-materialize citadel-owned composes on version change (#426) (#430)
 
 
+---
+
+## v2.59.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +379 |
+
+**Changes:**
+
+  - fix(whatsapp): resolve bridge container by compose project, not hardcoded name (#437)
+
+
