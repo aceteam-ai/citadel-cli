@@ -46,6 +46,12 @@ type AppInfo struct {
 	// GPU memory). Populated only for running inference apps whose metrics
 	// endpoint could be scraped; omitted otherwise. See IdleState.
 	*IdleState
+
+	// Footprint is the live resource footprint (CPU/RAM/VRAM/GPU) of the app's
+	// container, populated for running managed apps (citadel #421). Omitted for
+	// stopped apps or when stats could not be read. Rides the heartbeat so the
+	// platform can spot idle GPU hogs.
+	Footprint *ServiceFootprint `json:"footprint,omitempty"`
 }
 
 // NodeCapabilities describes the GPU and inference engine capabilities of a node.
@@ -161,6 +167,12 @@ type ServiceInfo struct {
 	// scraped; omitted otherwise. Promotes idle/idle_seconds/last_request_at
 	// to the top level of the JSON object. See IdleState.
 	*IdleState
+
+	// Footprint is the live resource footprint (CPU/RAM/VRAM/GPU) of the
+	// service's container, populated for running managed services (citadel
+	// #421). Omitted when stats could not be read. Rides the heartbeat so the
+	// platform can spot a heavy-and-idle eviction candidate.
+	Footprint *ServiceFootprint `json:"footprint,omitempty"`
 }
 
 // HealthResponse is the response for /health endpoint.

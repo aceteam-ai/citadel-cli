@@ -96,6 +96,11 @@ type StatusData struct {
 	// Services
 	Services []ServiceInfo
 
+	// ManagedSummary is a one-line footprint roll-up for citadel-managed
+	// services, e.g. "managed: RAM 13G/62G · VRAM 21G/24G" (citadel #421).
+	// Empty when no managed service is running.
+	ManagedSummary string
+
 	// Peers
 	Peers []PeerInfo
 
@@ -124,6 +129,15 @@ type ServiceInfo struct {
 	Name   string
 	Status string // "running", "stopped", "error"
 	Uptime string
+
+	// Live resource footprint for a running managed service (citadel #421).
+	// Footprint is a compact pre-formatted string like "RAM 6.1G  VRAM 21.0G
+	// GPU 74%" (empty when unavailable). IdleLabel is a short usage label like
+	// "busy" or "idle 38m" (empty when no idle signal). HeavyAndIdle marks the
+	// eviction candidate (heavy + idle) so the row can be highlighted.
+	Footprint    string
+	IdleLabel    string
+	HeavyAndIdle bool
 }
 
 // ServiceDetailInfo holds detailed service information for the modal
@@ -2015,12 +2029,18 @@ func (cc *ControlCenter) updateServicesView() {
 	cc.servicesView.Clear()
 
 	// Header
-	headers := []string{"SERVICE", "STATUS", "UPTIME"}
+	headers := []string{"SERVICE", "STATUS", "FOOTPRINT", "USAGE", "UPTIME"}
 	for i, h := range headers {
 		cell := tview.NewTableCell("[yellow::b]" + h + "[-:-:-]").
 			SetSelectable(false).
 			SetAlign(tview.AlignLeft)
 		cc.servicesView.SetCell(0, i, cell)
+	}
+
+	// One-line managed footprint roll-up above the rows (citadel #421).
+	if cc.data.ManagedSummary != "" {
+		cc.servicesView.SetCell(0, len(headers), tview.NewTableCell(
+			"[gray]"+cc.data.ManagedSummary+"[-]").SetSelectable(false))
 	}
 
 	row := 1
@@ -2076,12 +2096,39 @@ func (cc *ControlCenter) updateServicesView() {
 
 		cc.servicesView.SetCell(row, 1, tview.NewTableCell(statusCell).SetSelectable(true))
 
+		// Footprint (RAM/VRAM/GPU) — highlight in red when heavy AND idle, the
+		// eviction candidate the #421 incident would have surfaced.
+		footprint := svc.Footprint
+		if footprint == "" {
+			footprint = "-"
+		}
+		footprintColor := "gray"
+		if svc.HeavyAndIdle {
+			footprintColor = "red::b"
+		}
+		cc.servicesView.SetCell(row, 2, tview.NewTableCell(
+			"["+footprintColor+"]"+footprint+"[-:-:-]").SetSelectable(true))
+
+		// Usage label (busy / idle 38m). Heavy-and-idle rows show it in red too.
+		usage := svc.IdleLabel
+		if usage == "" {
+			usage = "-"
+		}
+		usageColor := "gray"
+		if svc.HeavyAndIdle {
+			usageColor = "red::b"
+		} else if strings.HasPrefix(usage, "idle") {
+			usageColor = "yellow"
+		}
+		cc.servicesView.SetCell(row, 3, tview.NewTableCell(
+			"["+usageColor+"]"+usage+"[-:-:-]").SetSelectable(true))
+
 		// Uptime
 		uptime := svc.Uptime
 		if uptime == "" {
 			uptime = "-"
 		}
-		cc.servicesView.SetCell(row, 2, tview.NewTableCell("[gray]"+uptime+"[-]").SetSelectable(true))
+		cc.servicesView.SetCell(row, 4, tview.NewTableCell("[gray]"+uptime+"[-]").SetSelectable(true))
 		row++
 	}
 
@@ -2089,8 +2136,9 @@ func (cc *ControlCenter) updateServicesView() {
 	if len(cc.activeForwards) > 0 {
 		// Separator
 		cc.servicesView.SetCell(row, 0, tview.NewTableCell("[yellow::b]─── EXPOSED ───[-:-:-]").SetSelectable(false))
-		cc.servicesView.SetCell(row, 1, tview.NewTableCell("").SetSelectable(false))
-		cc.servicesView.SetCell(row, 2, tview.NewTableCell("").SetSelectable(false))
+		for col := 1; col <= 4; col++ {
+			cc.servicesView.SetCell(row, col, tview.NewTableCell("").SetSelectable(false))
+		}
 		row++
 
 		for _, fwd := range cc.activeForwards {
@@ -2100,7 +2148,9 @@ func (cc *ControlCenter) updateServicesView() {
 			}
 			cc.servicesView.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf(" :%d", fwd.LocalPort)).SetSelectable(true))
 			cc.servicesView.SetCell(row, 1, tview.NewTableCell("[cyan]● exposed[-]").SetSelectable(true))
-			cc.servicesView.SetCell(row, 2, tview.NewTableCell("[gray]"+desc+"[-]").SetSelectable(true))
+			cc.servicesView.SetCell(row, 2, tview.NewTableCell("").SetSelectable(true))
+			cc.servicesView.SetCell(row, 3, tview.NewTableCell("").SetSelectable(true))
+			cc.servicesView.SetCell(row, 4, tview.NewTableCell("[gray]"+desc+"[-]").SetSelectable(true))
 			row++
 		}
 	}

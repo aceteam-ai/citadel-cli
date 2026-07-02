@@ -26,8 +26,9 @@ type Collector struct {
 	services       []ServiceConfig
 	startTime      time.Time
 	modelDiscovery *ModelDiscovery
-	capabilities   *NodeCapabilities // cached capabilities (set once at startup)
-	idleTracker    *IdleTracker      // per-service idle detection (aceteam#4472 / citadel #416)
+	capabilities   *NodeCapabilities     // cached capabilities (set once at startup)
+	idleTracker    *IdleTracker          // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker  *FootprintIdleTracker // footprint-derived idle for engines #416 can't scrape (citadel #421)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -56,6 +57,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		modelDiscovery: NewModelDiscovery(),
 		capabilities:   cfg.Capabilities,
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
+		fpIdleTracker:  NewFootprintIdleTracker(),
 	}
 }
 
@@ -102,6 +104,13 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 
 	// Collect installed app status
 	status.Apps = c.collectAppStatus()
+
+	// Attach live resource footprints (CPU/RAM/VRAM/GPU) to running managed
+	// services and apps in one batched pass (citadel #421). This is what makes
+	// the heartbeat and TUI resource-aware: a running-but-idle vLLM/diffusers
+	// holding GPU/RAM is now visible instead of a bare "running" with no
+	// footprint. One stats call + one nvidia-smi pair for the whole set.
+	c.attachFootprints(status)
 
 	// Include cached capabilities if available. Copy the cached struct rather
 	// than aliasing it, so populating the per-heartbeat capability flags below
