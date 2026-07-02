@@ -137,6 +137,7 @@ const (
 	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
 	JobTypeAgentUpdate       = "AGENT_UPDATE"        // Remotely update + restart this node's own citadel agent (aceteam#4427)
 	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION"  // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
+	JobTypeResourceSnapshot  = "RESOURCE_SNAPSHOT"   // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
 )
 
 // allKnownJobTypes enumerates every job type this citadel build knows about.
@@ -183,4 +184,5 @@ var allKnownJobTypes = []string{
 	JobTypeTranscribeAudio,
 	JobTypeAgentUpdate,
 	JobTypeWhatsAppProvision,
+	JobTypeResourceSnapshot,
 }
