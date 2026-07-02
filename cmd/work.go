@@ -18,9 +18,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/footprint"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
@@ -1031,6 +1033,12 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Printf("   - VNC detected: port %d (included in heartbeats)\n", heartbeatVNC.Port())
 		}
 
+		// Optional, config-gated (default OFF) auto-stop-when-idle reconciler
+		// (citadel #416). Built once and registered on whichever publisher runs so
+		// it acts on the status the heartbeat already collected (no extra
+		// stats/nvidia-smi sweep). nil when the operator has not opted in.
+		autoStop := newAutoStopReconciler()
+
 		if useAPIMode && apiSource != nil {
 			// API mode: use secure API publisher
 			// Get org ID from device config (saved during init)
@@ -1076,6 +1084,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				} else {
 					// Include current permissions in heartbeat
 					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+					if autoStop != nil {
+						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+					}
 					go func() {
 						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
@@ -1106,6 +1117,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			} else {
 				// Include current permissions in heartbeat
 				redisPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+				if autoStop != nil {
+					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+				}
 				go func() {
 					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
 					if deviceCode != "" {
@@ -1789,6 +1803,43 @@ func resolveWorkspaceDir() string {
 		return dir
 	}
 	return abs
+}
+
+// newAutoStopReconciler builds the config-gated auto-stop-when-idle reconciler
+// (citadel #416), or returns nil when the operator has not opted in
+// (SERVICE_AUTO_STOP_WHEN_IDLE unset/false) so the feature adds zero cost by
+// default. When enabled, it wires a stop dispatcher that routes each idle
+// candidate to the correct lifecycle: manifest/embedded services via the same
+// compose "down" a SERVICE_STOP job takes, and catalog apps via the apps
+// package's docker-stop. Covering both is deliberate: the idle GPU hog is often
+// a catalog app (the #421 diffusers case), which a service-only path would
+// silently fail to evict.
+func newAutoStopReconciler() *status.AutoStopReconciler {
+	if !status.AutoStopEnabled() {
+		return nil
+	}
+	configDir := platform.ConfigDir()
+	wsDir := resolveWorkspaceDir()
+	svcHandler := jobs.NewServiceHandlerWithWorkspace(configDir, wsDir)
+
+	stop := func(c status.IdleCandidate) error {
+		switch c.Kind {
+		case status.EntityApp:
+			return apps.Stop(context.Background(), apps.ExecRunner{}, c.Name)
+		default:
+			return svcHandler.StopServiceByName(c.Name)
+		}
+	}
+	logFn := func(level, format string, args ...any) {
+		if level == "warning" {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		} else {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+	r := status.NewAutoStopReconciler(true, status.AutoStopThresholdSeconds(), stop, logFn)
+	fmt.Printf("   - Auto-stop-when-idle: ENABLED (threshold %ds)\n", status.AutoStopThresholdSeconds())
+	return r
 }
 
 // resolveAllowReadOutsideWorkspace returns whether read-only file handlers may

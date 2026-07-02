@@ -51,6 +51,20 @@ type APIPublisher struct {
 
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
+
+	// onStatus, when set, is invoked with each freshly collected status after a
+	// successful publish. It lets an auto-stop reconciler act on the exact state
+	// that was just published without triggering a second (expensive) collection
+	// pass on an already-loaded node. Optional; nil by default. See citadel #416.
+	onStatus func(*status.NodeStatus)
+}
+
+// SetOnStatus registers a callback invoked with each collected status. Used to
+// drive the config-gated auto-stop-when-idle reconciler (citadel #416) off the
+// heartbeat's existing collection, so enabling it adds no extra docker/nvidia-smi
+// execs.
+func (p *APIPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
+	p.onStatus = fn
 }
 
 // APIPublisherConfig holds configuration for the API status publisher.
@@ -175,6 +189,13 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 	nodeStatus, err := p.collector.CollectCompact()
 	if err != nil {
 		return fmt.Errorf("failed to collect status: %w", err)
+	}
+
+	// Feed the collected status to any registered observer (the auto-stop
+	// reconciler) before publishing. Reusing this collection avoids a second
+	// docker stats / nvidia-smi sweep on a contended node.
+	if p.onStatus != nil {
+		p.onStatus(nodeStatus)
 	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
