@@ -30,7 +30,9 @@ services:
     volumes:
       # The "permanent home": Claude Code config, sessions, and projects persist
       # on the node disk across restarts. Path matches CLAUDE_CONFIG_DIR and the
-      # non-root claude user's home in the image.
+      # non-root claude user's home in the image. The container's entrypoint runs
+      # as root, chowns this mount to the claude user (uid 10001), then drops
+      # privileges -- so a fresh host-owned dir "just works" with no pre-create.
       - ~/citadel-cache/claudecode:/home/claude/.claude
     environment:
       # --- AceTeam routing-seam contract (aceteam #4593) ---

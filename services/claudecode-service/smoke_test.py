@@ -26,6 +26,7 @@ Requires: docker, python3 (stdlib only).
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -207,6 +208,15 @@ def main() -> int:
 
     cleanup()
 
+    # Mount a HOST-OWNED state dir onto the container's CLAUDE_CONFIG_DIR, exactly
+    # as the compose file does on a node. The host dir is owned by the test
+    # runner's uid, NOT the container's claude user (uid 10001) -- this reproduces
+    # the live-deploy bind-mount permission path, so the entrypoint's chown fixup
+    # is actually exercised (a no-volume run would silently use the image's own
+    # claude-owned dir and never catch the EACCES landmine).
+    state_dir = tempfile.mkdtemp(prefix="cc-smoke-state-")
+    print(f"host-owned state dir: {state_dir}", flush=True)
+
     # The container reaches host services via host.docker.internal (mapped to the
     # host gateway). Works on Docker Desktop natively and on Linux via the
     # host-gateway alias we add below.
@@ -218,6 +228,7 @@ def main() -> int:
         "docker", "run", "-d", "--name", CONTAINER,
         "--add-host", "host.docker.internal:host-gateway",
         "-p", f"{HOST_PORT}:8787",
+        "-v", f"{state_dir}:/home/claude/.claude",
         "-e", f"ACETEAM_INSTANCE_ID={INSTANCE_ID}",
         "-e", f"ACETEAM_PLATFORM_URL={platform_url}",
         "-e", f"ACETEAM_GATEWAY_KEY={GATEWAY_KEY}",
@@ -348,12 +359,28 @@ def main() -> int:
         else:
             print("PASS: canned fabric-proxy text flowed end-to-end", flush=True)
 
+        # (d) State persistence: the turn ran as non-root against a host-owned
+        # mount, so the entrypoint chown fixup worked -- confirm Claude Code
+        # actually wrote state into the mounted "permanent home".
+        state_entries = list(Path(state_dir).rglob("*"))
+        if not state_entries:
+            print(f"WARN: no state written under the mounted dir {state_dir} "
+                  "(permanent-home persistence unverified)", flush=True)
+        else:
+            sample = ", ".join(
+                sorted(p.name for p in Path(state_dir).iterdir())[:6]
+            )
+            print(f"PASS: Claude Code wrote state to the mounted dir ({sample})",
+                  flush=True)
+
         print("\nSMOKE TEST PASSED", flush=True)
         return 0
     finally:
         proxy_srv.shutdown()
         recv_srv.shutdown()
         cleanup()
+        subprocess.run(["rm", "-rf", state_dir],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

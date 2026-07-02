@@ -17,9 +17,11 @@ FROM node:22-bookworm-slim
 #   git                 -> Claude Code shells out to git for repo-aware turns
 #   ca-certificates     -> TLS to the fabric proxy and the platform callback
 #   tini                -> proper PID 1 / signal handling for the long-lived server
+#   gosu                -> drop from root to the claude user in the entrypoint,
+#                          after fixing ownership of the bind-mounted state dir
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip git ca-certificates tini \
+        python3 python3-venv python3-pip git ca-certificates tini gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the Claude Code CLI globally. Pin via CLAUDE_CODE_VERSION build-arg for
@@ -39,14 +41,17 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY wrapper.py /app/wrapper.py
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Non-root runtime user with a real home. Claude Code state lives under
 # $HOME/.claude (redirected explicitly via CLAUDE_CONFIG_DIR so it always matches
 # the mounted volume regardless of $HOME resolution). The compose file bind-mounts
-# a node-disk dir here so config/sessions persist across restarts.
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin claude \
+# a node-disk dir here so config/sessions persist across restarts; the entrypoint
+# chowns that mount to `claude` at boot (a host bind-mount is not owned by 10001).
+RUN useradd --create-home --uid 10001 --shell /bin/sh claude \
     && mkdir -p /home/claude/.claude \
-    && chown -R claude:claude /home/claude /app
+    && chown -R claude:claude /home/claude /app \
+    && chmod +x /usr/local/bin/entrypoint.sh
 ENV HOME=/home/claude
 ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
 
@@ -60,10 +65,14 @@ ENV PORT=8787
 ENV DISABLE_AUTOUPDATER=1
 ENV CLAUDE_CODE_ENABLE_TELEMETRY=0
 
-USER claude
+# NB: we deliberately do NOT set `USER claude` here. The container starts as root
+# so entrypoint.sh can chown the bind-mounted state dir; it then drops to the
+# claude user via gosu before exec'ing the server (so `claude` never runs as
+# root, which it refuses to do under --dangerously-skip-permissions anyway).
 WORKDIR /app
 EXPOSE 8787
 
-# tini as PID 1 for clean signal handling of the long-lived uvicorn server.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# tini as PID 1 for clean signal handling of the long-lived uvicorn server;
+# entrypoint.sh fixes the mount ownership and drops privileges.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["sh", "-c", "uvicorn wrapper:app --host 0.0.0.0 --port ${PORT}"]

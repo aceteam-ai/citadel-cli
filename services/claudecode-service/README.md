@@ -53,6 +53,11 @@ Claude Code state (config, sessions, projects) lives at
 bind-mounted from `~/citadel-cache/claudecode` on the node, so it accumulates
 across restarts.
 
+The container starts as root, its entrypoint chowns this mount to the non-root
+`claude` user (uid 10001), then drops privileges via `gosu` -- so a fresh
+host-owned mount "just works" with no manual pre-create. `claude` never runs as
+root (which it refuses under `--dangerously-skip-permissions` anyway).
+
 ## Run it (standalone / live-proof)
 
 ```sh

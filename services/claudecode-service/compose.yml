@@ -13,6 +13,8 @@ services:
     ports:
       - "8204:8787"
     volumes:
+      # Entrypoint (root) chowns this mount to the claude user, then drops
+      # privileges -- a fresh host-owned dir "just works" with no pre-create.
       - ~/citadel-cache/claudecode:/home/claude/.claude
     environment:
       - ACETEAM_INSTANCE_ID=${ACETEAM_INSTANCE_ID:?set ACETEAM_INSTANCE_ID}
