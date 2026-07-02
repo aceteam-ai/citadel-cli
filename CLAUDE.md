@@ -546,9 +546,9 @@ Services are started with `docker compose -f <path> -p citadel-<name> up -d`. Th
 Managed services carry a per-service usage/idle signal so a node can tell whether an engine is actually being used or is pinning VRAM/RAM while idle. This is surfaced on the heartbeat and to operators, and can optionally drive auto-eviction.
 
 **Signal sources** (`internal/status/`):
-- `idle.go` — `IdleTracker` scrapes the engine's own Prometheus `/metrics` (vLLM request counters + running/waiting gauges) for a precise `last_request_at` / `idle_seconds`. When it cannot scrape, it reports NO signal rather than a misleading "idle since startup".
-- `footprint.go` — `FootprintIdleTracker` derives idle from CPU/GPU utilization for engines with no request counters (diffusers, ollama), plus `ServiceFootprint` (CPU/RAM/VRAM) and the `IsHeavyAndIdle` eviction-candidate predicate.
-- Both attach an `*IdleState` inline to each `ServiceInfo`/`AppInfo` in the heartbeat (`idle` / `idle_seconds` / `last_request_at`). Additive and back-compatible: absent when unknown. The platform reads these per-service fields directly — there is deliberately no separate `service_usage` map.
+- `idle.go`: `IdleTracker` scrapes the engine's own Prometheus `/metrics` (vLLM request counters + running/waiting gauges) for a precise `last_request_at` / `idle_seconds`. When it cannot scrape, it reports NO signal rather than a misleading "idle since startup".
+- `footprint.go`: `FootprintIdleTracker` derives idle from CPU/GPU utilization for engines with no request counters (diffusers, ollama), plus `ServiceFootprint` (CPU/RAM/VRAM) and the `IsHeavyAndIdle` eviction-candidate predicate. Note: for these non-vLLM engines the idle signal is utilization-based (coarser than "no requests"), which is why auto-stop stays opt-in.
+- Both attach an `*IdleState` inline to each `ServiceInfo`/`AppInfo` in the heartbeat (`idle` / `idle_seconds` / `last_request_at`). Additive and back-compatible: absent when unknown. The platform reads these per-service fields directly; there is deliberately no separate `service_usage` map.
 
 **Operator view:** `citadel services` runs one collection and prints each managed service/app with usage (busy / idle `<dur>` / unknown), footprint, and eviction-candidate notes. Distinct from `citadel service` (alias `svc`), which manages Citadel itself as a system service.
 
@@ -558,6 +558,7 @@ Managed services carry a per-service usage/idle signal so a node can tell whethe
 - Threshold: `SERVICE_AUTO_STOP_IDLE_SECONDS` (falls back to `SERVICE_IDLE_THRESHOLD_SECONDS`, default 300s; a zero/invalid value is clamped to the positive default).
 - The reconciler runs off the heartbeat's existing collection (an `OnStatus` callback on the publisher), so enabling it adds no extra `docker stats` / `nvidia-smi` sweeps on an already-contended node.
 - Routes stops by entity kind: manifest/embedded services via the compose `down` path (`ServiceHandler.StopServiceByName`), catalog apps via `apps.Stop`. Both are covered so the common idle-GPU-hog case (a catalog app) is not silently skipped. Every stop is logged.
+- Runtime assumption: the stop calls use the `docker` runtime (matching the existing SERVICE_STOP job path and the docker-only `apps` package). On a podman-preferred node the engine idle *detection* is podman-aware but the auto-stop call would fail safe (logged warning, no eviction). Making the shared stop path runtime-aware is a documented follow-up.
 
 Environment variables:
 

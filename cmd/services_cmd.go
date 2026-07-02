@@ -1,5 +1,5 @@
 // cmd/services_cmd.go
-// "citadel services" — operator view of managed inference engines and their
+// "citadel services" is the operator view of managed inference engines and their
 // usage/idle status (citadel #416). This is distinct from "citadel service"
 // (alias "svc"), which manages Citadel itself as a system/systemd service.
 package cmd
