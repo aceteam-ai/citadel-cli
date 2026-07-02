@@ -814,3 +814,22 @@ Auto-generated log of every release.
   - fix(tui): chat deadlock — nested QueueUpdateDraw freezes the whole TUI on connect (#402)
 
 
+---
+
+## v2.57.0 — 2026-07-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 43 |
+| Lines added | +4616 |
+
+**Changes:**
+
+  - feat(tui): per-managed-service resource footprint (CPU/RAM/VRAM) + heavy-and-idle warning (#421) (#424)
+  - feat(footprint): sample per-service resource footprints to rotated, DuckDB-queryable CSV + citadel footprints query (#422) (#423)
+  - feat(services): citadel owns host-port allocation — no more compose port collisions (#405) (#410)
+  - feat(services): per-service idle detection (last-request + idle_seconds in heartbeat) (#416) (#420)
+  - chore: sync generated files after v2.56.0 release
+
+
