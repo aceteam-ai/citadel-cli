@@ -4,12 +4,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -178,18 +176,12 @@ func runSingleService(serviceName string) {
 		os.Exit(1)
 	}
 
-	// Strip GPU device reservations on non-Linux platforms
+	// GPU device reservations are stripped for non-Linux hosts by startService,
+	// which writes the CPU-only variant to a TEMP file rather than mutating the
+	// materialized compose in place. Mutating it here would permanently diverge
+	// the on-disk file from the embedded template, causing the version-change
+	// re-materialization sweep to mis-flag it as operator-edited on macOS (#426).
 	composePath := filepath.Join(configDir, "services", serviceName+".yml")
-	if !platform.IsLinux() {
-		content, err := os.ReadFile(composePath)
-		if err == nil {
-			filtered, err := compose.StripGPUDevices(content)
-			if err == nil {
-				os.WriteFile(composePath, filtered, 0600)
-				fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
-			}
-		}
-	}
 
 	// Add to manifest if not present
 	if !hasService(manifest, serviceName) {
@@ -239,7 +231,7 @@ func restartAllServices() {
 		}
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
-		composeCmd := exec.Command("docker", "compose", "-f", fullComposePath, "restart")
+		composeCmd := composeCommand("-f", fullComposePath, "restart")
 		output, err := composeCmd.CombinedOutput()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))

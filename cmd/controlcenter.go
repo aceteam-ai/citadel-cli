@@ -1171,7 +1171,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			if _, err := os.Stat(fullComposePath); err == nil {
-				psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "ps", "--format", "json")
+				psCmd := composeCommand("-f", fullComposePath, "ps", "--format", "json")
 				if output, err := psCmd.Output(); err == nil {
 					var containers []struct {
 						State  string `json:"State"`
@@ -1335,11 +1335,13 @@ func ccStartService(name string) error {
 			// Include the least-privilege sandbox override when present so a
 			// TUI-installed untrusted module also starts hardened here (the
 			// override would otherwise be bypassed by this start site).
-			args := []string{"compose"}
-			args = append(args, composeFileArgs(fullComposePath, fullComposePath)...)
-			args = append(args, "-p", "citadel-"+name, "up", "-d")
-			cmd := exec.Command("docker", args...)
-			return cmd.Run()
+			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
+			composeArgs = append(composeArgs, "-p", "citadel-"+name, "up", "-d")
+			// composeCommand injects the citadel-owned host ports so the
+			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
+			// start button dies for llamacpp/vllm/extraction/diffusers on
+			// v2.57.0 (#426).
+			return composeCommand(composeArgs...).Run()
 		}
 	}
 
@@ -1356,7 +1358,7 @@ func ccStopService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "down")
+			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "down")
 			return cmd.Run()
 		}
 	}
@@ -1374,7 +1376,7 @@ func ccRestartService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "restart")
+			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "restart")
 			return cmd.Run()
 		}
 	}
@@ -1397,7 +1399,7 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 			}
 
 			// Get container info via docker compose ps
-			psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "ps", "--format", "json")
+			psCmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "ps", "--format", "json")
 			if output, err := psCmd.Output(); err == nil {
 				var container struct {
 					ID      string `json:"ID"`
@@ -1438,7 +1440,7 @@ func ccGetServiceLogs(name string) ([]string, error) {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
 			output, err := cmd.Output()
 			if err != nil {
 				return nil, err

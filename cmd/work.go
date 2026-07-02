@@ -256,6 +256,17 @@ func runWork(cmd *cobra.Command, args []string) {
 	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
 	defer keepAwakeMonitor.Stop()
 
+	// Refresh citadel-owned embedded compose files from the binary's templates
+	// when the version changed since this node last materialized them (#426).
+	// Must run BEFORE startManagedServices so the fresh templates (host-port fix
+	// etc.) are what compose brings up. Version-gated => a cheap no-op on an
+	// unchanged boot. Skipped entirely with --no-services.
+	if !workNoServices {
+		if _, configDir, err := findAndReadManifest(); err == nil {
+			refreshManagedComposeFiles(configDir)
+		}
+	}
+
 	// Start managed services from the manifest (unless --no-services is set).
 	//
 	// Job serving is the node's core reason to exist and must never be gated on
