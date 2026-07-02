@@ -15,6 +15,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
 // forceRecreate controls whether to prompt user when containers exist
@@ -146,6 +147,12 @@ func startService(serviceName, composeFilePath string) error {
 	composeArgs = append(composeArgs, "up", "-d")
 	args := rt.ComposeArgs(composeArgs...)
 	composeCmd := exec.Command(rt.Bin, args...)
+	// Supply the citadel-owned host ports so compose files that defer their host
+	// publish to ${CITADEL_*_HOST_PORT:?...} (llamacpp/vllm/extraction/diffusers)
+	// resolve. Without this, the :? guard added in #410 makes `docker compose up`
+	// fail at this boot-path site (only the SERVICE_START job handler injected it
+	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426).
+	composeCmd.Env = append(os.Environ(), svcports.HostPortEnv()...)
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, string(output))
