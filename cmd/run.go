@@ -4,7 +4,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -232,7 +231,7 @@ func restartAllServices() {
 		}
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
-		composeCmd := exec.Command("docker", "compose", "-f", fullComposePath, "restart")
+		composeCmd := composeCommand("-f", fullComposePath, "restart")
 		output, err := composeCmd.CombinedOutput()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))

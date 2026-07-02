@@ -36,6 +36,31 @@ func composeEnv() []string {
 	return append(os.Environ(), svcports.HostPortEnv()...)
 }
 
+// composeCommand builds an *exec.Cmd for a `docker/podman compose` invocation
+// against a citadel-owned compose file, guaranteeing the two invariants every
+// cmd/ (CLI + TUI) compose call site needs:
+//
+//  1. The correct container runtime: it resolves catalog.SelectContainerRuntime()
+//     (rootless podman preferred over docker, #348) and drives the invocation
+//     through rt.Bin + rt.ComposeArgs(...), never a hardcoded "docker".
+//  2. The citadel-owned host-port env (composeEnv -> services.HostPortEnv), so
+//     compose templates that defer their host publish to the guarded
+//     ${CITADEL_*_HOST_PORT:?...} form (llamacpp/vllm/extraction/diffusers, #410)
+//     resolve instead of dying on the :? guard.
+//
+// Callers pass their compose args verbatim (e.g. "-f", path, "restart" or
+// "-f", path, "-p", "citadel-"+name, "ps", "--format", "json") and invoke
+// .Run()/.Output()/.CombinedOutput() on the result. Every cmd/ compose call site
+// that interpolates a citadel compose file MUST route through this; a bare
+// exec.Command("docker", "compose", ...) reintroduces the v2.57.0 regression
+// where `citadel run --restart` and `citadel status` failed the :? guard (#426).
+func composeCommand(args ...string) *exec.Cmd {
+	rt := catalog.SelectContainerRuntime()
+	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
+	cmd.Env = composeEnv()
+	return cmd
+}
+
 // prepareCacheDirectories creates the cache directories for all services.
 func prepareCacheDirectories() error {
 	homeDir, err := os.UserHomeDir()
