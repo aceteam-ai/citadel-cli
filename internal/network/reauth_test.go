@@ -57,6 +57,43 @@ func TestFetchFreshAuthkey_Unauthorized(t *testing.T) {
 	t.Logf("Got expected error: %v", err)
 }
 
+func TestFetchFreshAuthkey_ForbiddenIsScopeError(t *testing.T) {
+	// A 403 means the device token lacks device_authkey:write (an old token
+	// minted before aceteam #4432). It must be classified as ErrAuthkeyScope so
+	// the online renewer can surface the "re-run citadel init" remedy instead of
+	// treating a recoverable node as broken.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"Missing required scope 'device_authkey:write'"}`))
+	}))
+	defer server.Close()
+
+	_, err := FetchFreshAuthkey(context.Background(), server.URL, "act_old_token")
+	if err == nil {
+		t.Fatal("FetchFreshAuthkey() expected error for 403 response")
+	}
+	if !IsAuthkeyScopeError(err) {
+		t.Errorf("expected ErrAuthkeyScope for 403, got %v", err)
+	}
+}
+
+func TestIsAuthkeyScopeError_False(t *testing.T) {
+	// A 401 (bad token) is NOT a scope error — it should not be misclassified.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"Invalid API key"}`))
+	}))
+	defer server.Close()
+
+	_, err := FetchFreshAuthkey(context.Background(), server.URL, "act_bad_token")
+	if err == nil {
+		t.Fatal("expected error for 401 response")
+	}
+	if IsAuthkeyScopeError(err) {
+		t.Errorf("401 should not be classified as a scope error: %v", err)
+	}
+}
+
 func TestFetchFreshAuthkey_EmptyAuthkey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -89,6 +89,10 @@ var (
 	// Footprint sampler flag
 	workNoFootprint bool
 
+	// Node-key renewer flag (epic #4583): disable the background loop that
+	// refreshes the Headscale node key before expiry while online.
+	workNoKeyRenew bool
+
 	// Auto-update (periodic self-update) flags
 	workAutoUpdate         bool
 	workAutoUpdateInterval string
@@ -734,6 +738,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// design: one container-stats exec + one GPU read per tick (default 60s), never
 	// per-service. Disabled by --no-footprint or CITADEL_FOOTPRINT_INTERVAL<=0.
 	startFootprintSampler(ctx, nodeName, workManifest)
+
+	// Start the background node-key renewer (epic #4583). While the node is
+	// healthy and online, it refreshes the Headscale node key before it expires,
+	// re-authorizing in place with the node's own device token — so a long-lived
+	// session never lapses and an ordinary restart re-establishes via the
+	// no-authkey reconnect, never hitting the offline authkey-mint 403 path.
+	// No-op in direct-Redis mode (no device token) or when disabled.
+	startNodeKeyRenewer(ctx, deviceConfig)
 
 	// Default consumer group to node identity when --group is not explicitly set.
 	workGroup = resolveConsumerGroup(workGroup, headscaleNodeID, nodeName)
@@ -2091,6 +2103,7 @@ func init() {
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
+	workCmd.Flags().BoolVar(&workNoKeyRenew, "no-key-renew", false, "Disable the background Headscale node-key renewer (renews the key before expiry while online)")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
 	// Auto-update (periodic self-update) flags

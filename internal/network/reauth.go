@@ -21,16 +21,36 @@ type authkeyResponse struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// ErrAuthkeyScope is returned when the platform rejects a fresh-authkey request
+// because the device token lacks the device_authkey:write scope. A token minted
+// before that scope was granted (aceteam #4432) hits this. It is a recoverable,
+// operator-actionable condition (re-run 'citadel init'), NOT a broken node — a
+// persistent (non-ephemeral, backend PR #4584) node still self-heals via the
+// no-authkey reconnect on restart. Callers should surface the remedy rather than
+// treat it as fatal. Wrapped so errors.Is works.
+var ErrAuthkeyScope = errors.New("device token lacks device_authkey:write scope")
+
+// IsAuthkeyScopeError reports whether err is (or wraps) the authkey-scope
+// rejection, so callers (e.g. the online node-key renewer) can distinguish the
+// "old token, re-init to enable self-renewal" case from generic failures.
+func IsAuthkeyScopeError(err error) bool {
+	return errors.Is(err, ErrAuthkeyScope)
+}
+
 // FetchFreshAuthkey requests a new Headscale preauth key from the platform
 // using the device API token (act_*). The token authenticates the device
 // and the platform generates a single-use key scoped to the device's org.
 //
-// PREREQUISITE: The device API token must have /api/fabric/authkey/generate
-// in its allowedEndpoints list. Current device tokens (created by the
-// device-auth approve flow) are scoped to /api/fabric/redis/** and
-// /api/fabric/worker-config only — this endpoint must be added to the
-// allowlist in utils/deviceApiKeys.ts for auto-heal to work.
-// See: https://github.com/aceteam-ai/aceteam/issues/175
+// PREREQUISITE: The device API token must carry the device_authkey:write scope
+// and have /api/fabric/authkey/generate in its allowedEndpoints list. Tokens
+// minted by the device-auth approve flow have carried both since aceteam #4432.
+// A token minted BEFORE that grant is rejected with HTTP 403; the token is not
+// regenerated on citadel upgrade, only by re-running 'citadel init'. That case
+// is returned as ErrAuthkeyScope so callers can surface the exact remedy rather
+// than treat a recoverable old-token node as broken.
+// See: https://github.com/aceteam-ai/aceteam/issues/175 (original grant),
+//
+//	https://github.com/aceteam-ai/aceteam/pull/4584 (durable-key baseline).
 //
 // Returns the preauth key string or an error.
 func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (string, error) {
@@ -69,6 +89,15 @@ func FetchFreshAuthkey(ctx context.Context, apiBaseURL, deviceAPIToken string) (
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// A 403 here is most often the missing device_authkey:write scope on an
+		// old device token (minted before aceteam #4432). Classify it so callers
+		// (the online node-key renewer, reconnect) can tell the operator the exact
+		// remedy: re-run 'citadel init'. A persistent node still self-heals on
+		// restart via the no-authkey reconnect, so this is not a broken node.
+		if resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("%w (HTTP 403) — re-run 'citadel init' to re-authenticate with the "+
+				"self-renewal scope; this node still reconnects on restart: %s", ErrAuthkeyScope, string(body))
+		}
 		return "", fmt.Errorf("device API token rejected (HTTP %d) — re-run 'citadel init' to re-authenticate: %s", resp.StatusCode, string(body))
 	}
 
