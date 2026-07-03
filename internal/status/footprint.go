@@ -47,6 +47,21 @@ type ServiceFootprint struct {
 	// HasGPU reports whether GPU stats were available at all, so a "0.0G / 0%"
 	// footprint can be rendered as "n/a" instead of a misleading zero.
 	HasGPU bool `json:"has_gpu"`
+	// NetBytes is the container's cumulative network I/O (rx + tx) in bytes as
+	// reported by `docker/podman stats` NetIO. It is a monotonic counter (reset
+	// only on container restart) and is the request-agnostic activity signal the
+	// generic idle path uses for services that expose no vLLM-style request
+	// metrics (Claude Code, OpenClaw, Hermes, ...). 0 when the stats read did not
+	// include a NetIO column. See citadel-cli#433.
+	NetBytes uint64 `json:"net_bytes"`
+	// HasNet reports whether NetBytes came from an actual NetIO reading (as
+	// opposed to a runtime/format that omitted the column). This is the fail-safe
+	// discriminator for the generic idle path: a genuinely-zero NetBytes with
+	// HasNet=true is a real "no traffic" signal, but NetBytes=0 with HasNet=false
+	// means "unknown" and MUST NOT be fed to the idle tracker (an unread counter
+	// would look flat forever and false-idle a busy container). Not serialized;
+	// it is an internal collection detail.
+	HasNet bool `json:"-"`
 }
 
 // heavyRAMBytes is the RSS threshold above which an idle managed service is
@@ -118,6 +133,8 @@ func CollectFootprints(ctx context.Context, containerNames []string) map[string]
 		if s, ok := stats[name]; ok {
 			fp.CPUPercent = s.cpuPercent
 			fp.RAMBytes = s.ramBytes
+			fp.NetBytes = s.netBytes
+			fp.HasNet = s.hasNet
 		}
 		if hasGPU {
 			fp.GPUUtilPercent = gpuUtil
@@ -130,15 +147,20 @@ func CollectFootprints(ctx context.Context, containerNames []string) map[string]
 	return out
 }
 
-// containerStats holds the CPU% and RAM parsed from one `stats` row.
+// containerStats holds the CPU%, RAM, and cumulative network I/O parsed from
+// one `stats` row.
 type containerStats struct {
 	cpuPercent float64
 	ramBytes   uint64
+	netBytes   uint64
+	hasNet     bool
 }
 
 // statsFormat is the Go-template format string passed to `stats --format`. Tab
-// separated so a container name with a space can't break parsing.
-const statsFormat = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+// separated so a container name with a space can't break parsing. NetIO (rx/tx)
+// is included for the generic, request-agnostic idle signal (citadel-cli#433);
+// both docker and podman expose the {{.NetIO}} field.
+const statsFormat = "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
 
 // collectContainerStats runs one `<engine> stats --no-stream` over ALL running
 // containers and returns a name -> {cpu%, ram} map. No container names are
@@ -155,9 +177,12 @@ func collectContainerStats(ctx context.Context, engineBin string) map[string]con
 }
 
 // parseStatsOutput parses the tab-separated `stats --format` output into a
-// name -> {cpu%, ram} map. Lines that don't parse are skipped. Exported field
-// units follow docker/podman conventions: CPUPerc like "74.31%", MemUsage like
-// "6.1GiB / 62.0GiB" (we take the used side).
+// name -> {cpu%, ram, net} map. Lines that don't parse are skipped. Exported
+// field units follow docker/podman conventions: CPUPerc like "74.31%", MemUsage
+// like "6.1GiB / 62.0GiB" (we take the used side), NetIO like "1.2kB / 3.4MB"
+// (rx / tx, summed). The NetIO column is optional: a 3-field row (older format
+// or a runtime that omits NetIO) still parses with netBytes=0, so this stays
+// backward compatible with the pre-#433 statsFormat.
 func parseStatsOutput(out string) map[string]containerStats {
 	res := map[string]containerStats{}
 	sc := bufio.NewScanner(strings.NewReader(out))
@@ -181,9 +206,28 @@ func parseStatsOutput(out string) map[string]containerStats {
 			usedStr = usedStr[:idx]
 		}
 		cs.ramBytes = parseMemBytes(usedStr)
+		// NetIO is "<rx> / <tx>"; sum both sides. Optional field: when present we
+		// mark hasNet so the generic idle path can distinguish a real "zero
+		// traffic" reading from an absent column.
+		if len(fields) >= 4 {
+			cs.netBytes = parseNetIO(fields[3])
+			cs.hasNet = true
+		}
 		res[name] = cs
 	}
 	return res
+}
+
+// parseNetIO parses a docker/podman NetIO cell like "1.2kB / 3.4MB" (received /
+// transmitted) into the summed byte total. Either side missing or unparseable
+// contributes 0, so a malformed cell yields 0 rather than a panic.
+func parseNetIO(s string) uint64 {
+	rx, tx := s, ""
+	if idx := strings.Index(s, "/"); idx >= 0 {
+		rx = s[:idx]
+		tx = s[idx+1:]
+	}
+	return parseMemBytes(strings.TrimSpace(rx)) + parseMemBytes(strings.TrimSpace(tx))
 }
 
 // parsePercent parses a value like "74.31%" or "74.31" into a float. Returns
@@ -618,22 +662,56 @@ func (c *Collector) attachFootprints(status *NodeStatus) {
 	}
 }
 
-// attachDerivedIdle fills in a footprint-derived idle signal when the
-// metrics-based path (#420) left one absent. This is what surfaces idleness for
-// engines with no scrapeable request counters (diffusers, ollama) — the exact
-// #421 blind spot. When #420 already attached an IdleState (e.g. for vLLM), it
-// is authoritative and left untouched. The tracker is always fed so its
-// per-container idle clock stays warm regardless of which signal wins.
+// attachDerivedIdle fills in a per-service idle signal when the metrics-based
+// path (#420, vLLM request counters) left one absent. There are two generic
+// fallbacks, in precedence order:
+//
+//  1. vLLM request-counter idle (#420): authoritative when present, left
+//     untouched here.
+//  2. Network-activity idle (#433): a request-agnostic signal derived from the
+//     container's cumulative NetIO, folded through the shared IdleTracker so it
+//     honors SERVICE_IDLE_THRESHOLD_SECONDS. This is the auto-stop parity path
+//     for agent-app containers (Claude Code, OpenClaw, Hermes) that emit no
+//     vLLM metrics — a Node process idling above the CPU floor would never be
+//     caught by the CPU/GPU heuristic below.
+//  3. Footprint (CPU/GPU) idle (#421): the last-resort heuristic, on a fixed
+//     60s clock, that powers the TUI "heavy AND idle" eviction warning.
+//
+// The footprint tracker is ALWAYS fed (its per-container 60s clock must stay
+// warm so the #421 heavy-and-idle warning keeps working) but its state is only
+// EMITTED when neither the vLLM nor the network-activity signal produced one.
+// The network signal is preferred over CPU/GPU for auto-stop because it does
+// not false-idle a busy-but-low-CPU agent process, and because it respects the
+// operator-configured threshold rather than a hardcoded 60s.
 func (c *Collector) attachDerivedIdle(containerName string, fp *ServiceFootprint, dst **IdleState) {
-	if c.fpIdleTracker == nil {
+	// Feed the footprint tracker unconditionally so its heavy-and-idle clock
+	// keeps advancing regardless of which signal is emitted.
+	var footprintIdle *IdleState
+	if c.fpIdleTracker != nil {
+		f := c.fpIdleTracker.Observe(containerName, fp)
+		footprintIdle = &f
+	}
+
+	if *dst != nil {
+		return // vLLM request-counter idle is authoritative
+	}
+
+	// Network-activity idle: preferred generic signal (#433). Fed ONLY when the
+	// stats read actually produced a NetIO reading for this container. If NetIO
+	// was absent (older format / runtime without the column), fp.HasNet is false
+	// and we do NOT feed the tracker: an unread, permanently-flat counter would
+	// otherwise look idle after the threshold and could auto-stop a busy
+	// container. Fail-safe = fall through to the footprint heuristic (or emit
+	// nothing), never fabricate an idle signal from an unknown reading.
+	if c.netIdleTracker != nil && fp.HasNet {
+		n := c.netIdleTracker.RecordActivityCounter(containerName, fp.NetBytes)
+		*dst = &n
 		return
 	}
-	derived := c.fpIdleTracker.Observe(containerName, fp)
-	if *dst != nil {
-		return // metrics-based idle signal is authoritative
+
+	if footprintIdle != nil {
+		*dst = footprintIdle
 	}
-	d := derived
-	*dst = &d
 }
 
 // FormatFootprint renders a one-line footprint summary for the TUI, e.g.
