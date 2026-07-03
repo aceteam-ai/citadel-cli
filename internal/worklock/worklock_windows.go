@@ -66,6 +66,47 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 	return &Lock{f: f, path: path}, nil
 }
 
+// IsHeld reports whether a live citadel worker currently holds the single-instance
+// lock for the node keyed to stateDir, WITHOUT acquiring, reclaiming, or otherwise
+// disturbing it. It is the read-only counterpart to Acquire (see the Unix build for
+// the full contract): a non-blocking exclusive LockFileEx probe on a separate handle
+// detects contention, the probe is unlocked immediately, and only a live citadel
+// holder PID is reported as held. A missing/stale/reused lock reports not held.
+func IsHeld(stateDir string) (held bool, holderPID int) {
+	path := LockPathForStateDir(stateDir)
+
+	f, err := os.OpenFile(path, os.O_RDONLY, 0o600)
+	if err != nil {
+		return false, 0
+	}
+	defer func() { _ = f.Close() }()
+
+	rec := readRecord(f)
+
+	handle := windows.Handle(f.Fd())
+	var overlapped windows.Overlapped
+	lockErr := windows.LockFileEx(
+		handle,
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
+		0, 1, 0, &overlapped,
+	)
+	if lockErr == nil {
+		// Acquired the probe lock: no one else holds it. Release immediately.
+		var unlockOverlapped windows.Overlapped
+		_ = windows.UnlockFileEx(handle, 0, 1, 0, &unlockOverlapped)
+		return false, 0
+	}
+	if lockErr != windows.ERROR_LOCK_VIOLATION {
+		// Unexpected error: fail open (report not held).
+		return false, 0
+	}
+
+	if rec.PID > 0 && processAlive(rec.PID) && processIsCitadel(rec.PID) {
+		return true, rec.PID
+	}
+	return false, 0
+}
+
 // startTime converts a record's start timestamp to a time.Time, or the zero value
 // when unknown (e.g. a legacy bare-PID lock file with no timestamp).
 func startTime(rec lockRecord) time.Time {
