@@ -58,6 +58,26 @@ type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
 
+// TestWarnIdentityChurnDoesNotPanic verifies the churn warning helper runs
+// cleanly with any hostname (including empty). It is called on the destructive
+// ClearState path so it must never itself fail.
+func TestWarnIdentityChurnDoesNotPanic(t *testing.T) {
+	warnIdentityChurn("test-node")
+	warnIdentityChurn("")
+}
+
+// TestWorkNoSingleInstanceFlag verifies the single-instance guard opt-out flag is
+// registered on the work command and defaults to enforcing the guard (false).
+func TestWorkNoSingleInstanceFlag(t *testing.T) {
+	flag := workCmd.Flags().Lookup("no-single-instance")
+	if flag == nil {
+		t.Fatal("--no-single-instance flag not registered on work command")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--no-single-instance default = %q, want %q (guard on by default)", flag.DefValue, "false")
+	}
+}
+
 // TestRecoverStaleVPNNoToken verifies recovery fails with a clear error
 // when no device API token is available. Uses recoverStaleVPN directly
 // to avoid live VerifyOrReconnect I/O.

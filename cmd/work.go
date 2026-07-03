@@ -44,6 +44,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -89,6 +90,11 @@ var (
 
 	// Footprint sampler flag
 	workNoFootprint bool
+
+	// Single-instance guard flag (issues #443 / #435): when true, skip the
+	// per-node worker lock so a second worker may run intentionally (e.g. a debug
+	// direct-Redis worker alongside the API-mode one in development).
+	workNoSingleInstance bool
 
 	// Node-key renewer flag (epic #4583): disable the background loop that
 	// refreshes the Headscale node key before expiry while online.
@@ -289,6 +295,36 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func runWork(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Single-instance guard (issues #443 / #435). Refuse to start a second worker
+	// for the same node so a stale duplicate can never run beside the systemd unit.
+	// Duplicate workers split job routing non-deterministically, double the
+	// control-plane request volume (contributing to the 429 self-DoS in #443), and
+	// race on the shared tsnet state dir — the amplifier behind the identity churn.
+	// Keyed to the resolved network state dir, so every invocation on this box that
+	// converges on the same node identity also converges on the same lock. The lock
+	// is an OS advisory lock, released by the kernel on process death, so a crashed
+	// worker never blocks its own restart. Skipped with --no-single-instance for
+	// intentional side-by-side runs (e.g. a second debug-redis worker in dev).
+	if !workNoSingleInstance {
+		lock, lockErr := worklock.Acquire(network.GetStateDir(), Log)
+		if lockErr != nil {
+			var running *worklock.ErrAlreadyRunning
+			if errors.As(lockErr, &running) {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", running)
+				fmt.Fprintln(os.Stderr, "\nAnother 'citadel work' is already serving this node.")
+				fmt.Fprintln(os.Stderr, "Stop it first (e.g. 'systemctl --user stop citadel' or kill the PID above),")
+				fmt.Fprintln(os.Stderr, "or pass --no-single-instance to run a second worker intentionally.")
+				os.Exit(1)
+			}
+			// Non-contention lock error (e.g. unwritable dir): warn but do not block
+			// the worker — the guard is defense in depth, not a hard prerequisite.
+			fmt.Fprintf(os.Stderr, "   - Warning: could not acquire single-instance lock: %v\n", lockErr)
+		} else {
+			Log("acquired single-instance worker lock (%s)", lock.Path())
+			defer lock.Release()
+		}
+	}
 
 	// Managed services this worker started (populated by the async startup
 	// goroutine below, read by the shutdown hook). Guarded by a mutex because
@@ -2243,6 +2279,7 @@ func init() {
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
+	workCmd.Flags().BoolVar(&workNoSingleInstance, "no-single-instance", false, "Allow a second worker to run for this node (skips the single-instance lock)")
 	workCmd.Flags().BoolVar(&workNoKeyRenew, "no-key-renew", false, "Disable the background Headscale node-key renewer (renews the key before expiry while online)")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
