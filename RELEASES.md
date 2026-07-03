@@ -863,3 +863,19 @@ Auto-generated log of every release.
   - fix(whatsapp): resolve bridge container by compose project, not hardcoded name (#437)
 
 
+---
+
+## v2.60.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 14 |
+| Lines added | +1094 |
+
+**Changes:**
+
+  - fix(whatsapp): auto-select a free host port for the bridge (#438) (#440)
+  - feat(node): renew Headscale node key while online + harden no-authkey reconnect (#4583) (#435)
+
+
