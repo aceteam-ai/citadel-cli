@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -65,6 +66,14 @@ type ServiceManifest struct {
 	Config        []ConfigVar   `yaml:"config"`
 	HealthCheck   HealthCheck   `yaml:"health_check"`
 	Volumes       []VolumeMount `yaml:"volumes"`
+	// Gateway is the OPTIONAL declaration that this module should be exposed on
+	// the node's tsnet gateway under /modules/<prefix>/. It is what generalizes
+	// provisioned-service exposure: a module that binds an auto-selected free host
+	// port (unreachable on the tsnet stack) declares its prefix + which env var
+	// holds its chosen port + which capability gates the route, and the gateway
+	// wires it with ZERO gateway source changes. Absent block means the module is
+	// not exposed on the gateway.
+	Gateway *GatewaySpec `yaml:"gateway"`
 	// Tags are display/search tags (free-form), used by `catalog list/search`.
 	Tags []string `yaml:"tags"`
 	// NodeTags are namespaced key:value routing tags (e.g. "engine:tei",
@@ -122,6 +131,88 @@ type SandboxResources struct {
 	Memory string `yaml:"memory"`
 	// PIDs is the pids_limit. Zero -> default.
 	PIDs int `yaml:"pids"`
+}
+
+// GatewaySpec is the optional gateway-exposure block of a module manifest. It
+// declares that the module should be reachable on the node's tsnet gateway under
+// /modules/<Prefix>/. All three fields are data the gateway consumes without any
+// per-module code:
+//
+//	gateway:
+//	  prefix: whatsapp        # route slug; served under /modules/whatsapp/
+//	  port_env: BRIDGE_PORT   # persisted env var holding the module's host port
+//	  capability: provision   # existing permission that gates the route
+type GatewaySpec struct {
+	// Prefix is the route slug. The gateway serves the module under
+	// /modules/<Prefix>/ (StripPrefix), so the module's own paths (/health,
+	// /qr.txt, ...) map through unchanged. Validated: lowercase alphanumeric +
+	// dash, non-empty, no slashes or "..".
+	Prefix string `yaml:"prefix"`
+	// PortEnv is the name of the persisted env var (in the module's env file) that
+	// holds the module's chosen host port. The provision flow reads this to learn
+	// which loopback port to wire the route to.
+	PortEnv string `yaml:"port_env"`
+	// Capability is the existing permission (one of the config.Permissions fields:
+	// console/desktop/files/services/ssh/provision/shell) that gates the route.
+	// Empty defaults to "provision" (provisioning is what deploys a module).
+	Capability string `yaml:"capability"`
+}
+
+// GatewayCapabilities is the set of permission names a GatewaySpec.Capability may
+// name. It mirrors the config.Permissions fields. Kept here (not importing
+// config) to avoid a catalog->config dependency; validated against this set.
+var GatewayCapabilities = map[string]bool{
+	"console":   true,
+	"desktop":   true,
+	"files":     true,
+	"services":  true,
+	"ssh":       true,
+	"provision": true,
+	"shell":     true,
+}
+
+// DefaultGatewayCapability is the capability a GatewaySpec falls back to when its
+// manifest omits one.
+const DefaultGatewayCapability = "provision"
+
+// prefixPattern matches a valid gateway prefix: lowercase alphanumeric plus dash,
+// at least one char, no leading/trailing dash required but no slashes or dots so
+// it can never inject a path segment or traverse (".." / "a/b").
+var prefixPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// Validate checks the gateway block and returns the effective (defaulted)
+// capability. It rejects a prefix that could inject a path segment or traverse,
+// and a capability outside the known permission set. A nil spec is valid (the
+// module is simply not exposed) and returns ("", nil) -- callers check for nil
+// before Validate when they need the not-exposed distinction.
+func (g *GatewaySpec) Validate() error {
+	if g == nil {
+		return nil
+	}
+	if g.Prefix == "" {
+		return fmt.Errorf("gateway.prefix is required when a gateway block is present")
+	}
+	// Reject anything that is not a clean slug BEFORE the regex, so the error names
+	// the exact injection risk (defense in depth with prefixPattern).
+	if strings.ContainsAny(g.Prefix, "/\\") || strings.Contains(g.Prefix, "..") {
+		return fmt.Errorf("gateway.prefix %q must not contain slashes or '..' (path injection)", g.Prefix)
+	}
+	if !prefixPattern.MatchString(g.Prefix) {
+		return fmt.Errorf("gateway.prefix %q must be lowercase alphanumeric and dashes only", g.Prefix)
+	}
+	if g.Capability != "" && !GatewayCapabilities[g.Capability] {
+		return fmt.Errorf("gateway.capability %q is not a known permission (want one of console/desktop/files/services/ssh/provision/shell)", g.Capability)
+	}
+	return nil
+}
+
+// EffectiveCapability returns the capability that gates the route, applying the
+// provision default for an empty value. Call Validate first.
+func (g *GatewaySpec) EffectiveCapability() string {
+	if g == nil || g.Capability == "" {
+		return DefaultGatewayCapability
+	}
+	return g.Capability
 }
 
 // Requirements describes what a service needs from the host.
