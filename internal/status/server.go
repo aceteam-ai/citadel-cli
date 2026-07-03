@@ -296,7 +296,9 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 // regenerates it in place when the mesh IP changes) is always served fresh.
 //
 // Returns 204 No Content when the gateway has no TLS cert (--gateway-no-tls),
-// signaling the backend to reach the node over plain http instead.
+// signaling the backend to reach the node over plain http instead. Returns 503
+// when TLS is configured but the cert is not yet on disk (a cold-start race) so
+// the backend retries rather than mis-downgrading to http.
 func (s *Server) handleGatewayCert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -310,11 +312,13 @@ func (s *Server) handleGatewayCert(w http.ResponseWriter, r *http.Request) {
 	}
 	pem, err := os.ReadFile(s.gatewayCertPath)
 	if err != nil {
-		// The gateway is configured for TLS but its cert is not (yet) on disk.
-		// Surface it as a 204 so the backend falls back to plain http rather than
-		// erroring; the caller can re-fetch from cert_refresh_url once the gateway
-		// has written the cert.
-		w.WriteHeader(http.StatusNoContent)
+		// TLS IS configured (path is set) but the cert is not on disk yet -- a
+		// brief cold-start race before the gateway writes it. Do NOT return 204
+		// here: 204 means "TLS off, use plain http", and downgrading to http
+		// against a TLS gateway would fail. Return 503 so the backend RETRIES
+		// (from cert_refresh_url) once the cert exists, instead of mis-detecting
+		// the node as no-TLS.
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-pem-file")

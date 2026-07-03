@@ -60,8 +60,9 @@ func TestHandleGatewayCert_NoTLS(t *testing.T) {
 }
 
 // TestHandleGatewayCert_MissingFile verifies that a configured-but-missing cert
-// file returns 204 (TLS configured but cert not yet on disk) rather than 500, so
-// the backend can retry from cert_refresh_url once the gateway writes the cert.
+// file (TLS on, cert not yet written -- a cold-start race) returns 503, NOT 204,
+// so the backend retries from cert_refresh_url rather than mis-downgrading to
+// plain http against a TLS gateway.
 func TestHandleGatewayCert_MissingFile(t *testing.T) {
 	server := NewServer(ServerConfig{GatewayCertPath: filepath.Join(t.TempDir(), "absent.pem")}, NewCollector(CollectorConfig{}))
 	mux := server.buildMux()
@@ -70,8 +71,8 @@ func TestHandleGatewayCert_MissingFile(t *testing.T) {
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
 	}
 }
 
