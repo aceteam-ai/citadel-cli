@@ -29,6 +29,7 @@ type Collector struct {
 	capabilities   *NodeCapabilities     // cached capabilities (set once at startup)
 	idleTracker    *IdleTracker          // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker *IdleTracker          // network-activity idle for non-vLLM services (citadel #433)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -58,6 +59,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		capabilities:   cfg.Capabilities,
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
+		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
 	}
 }
 
