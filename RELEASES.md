@@ -911,3 +911,18 @@ Auto-generated log of every release.
   - fix(update): re-materialize managed systemd units on upgrade (#444/#426) (#445)
 
 
+---
+
+## v2.64.0 — 2026-07-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 16 |
+| Lines added | +2288 |
+
+**Changes:**
+
+  - fix(gateway): registry-driven exposure of provisioned modules on the tsnet mesh (#447) (#448)
+
+
