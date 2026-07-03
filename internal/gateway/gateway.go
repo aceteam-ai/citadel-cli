@@ -31,15 +31,32 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
-// WhatsAppRoutePrefix is the gateway path prefix under which the provisioned
-// WhatsApp bridge is exposed on the mesh. The backend reaches the bridge at
-// https://<node-vpn-ip>:<gateway-port><WhatsAppRoutePrefix> and the gateway
-// strips the prefix before forwarding to the bridge's loopback port, so the
-// bridge's own paths (/health, /qr.txt, /admin/tenants, ...) map through
-// unchanged. This is the first consumer of the generic provisioned-service
-// exposure; new provisioned services follow the same pattern with their own
-// prefix.
-const WhatsAppRoutePrefix = "/whatsapp"
+// ModuleRoutePrefix is the namespace under which EVERY provisioned module is
+// exposed on the mesh: the gateway serves a module declaring gateway.prefix=<p>
+// at /modules/<p>/ and strips the /modules/<p> prefix before forwarding to the
+// module's loopback port, so the module's own paths (/health, /qr.txt, ...) map
+// through unchanged. Namespacing under /modules/ prevents collision with builtin
+// routes (/terminal, /vnc, /provision, ...) and between modules. Which prefixes
+// exist, at which port, and under which capability is DATA in the
+// provisioned-service registry -- not code here.
+const ModuleRoutePrefix = "/modules/"
+
+// ModuleRoutePath returns the gateway route path for a module prefix:
+// "/modules/<prefix>". Used by both the gateway (route registration) and the
+// out-of-process URL builder so the convention lives in one place.
+func ModuleRoutePath(prefix string) string {
+	return ModuleRoutePrefix + prefix
+}
+
+// CapabilityResolver reports which capability gates the module served under the
+// given gateway prefix (the <p> in /modules/<p>/...), and whether such a module
+// is registered. The gateway holds one (backed by the provisioned-service
+// registry) so categoryForPath can gate module routes from declared data instead
+// of a hardcoded switch. A nil resolver (or unknown prefix) falls back to the
+// provision capability, so a module route is never accidentally left ungated.
+type CapabilityResolver interface {
+	CapabilityForPrefix(prefix string) (capability string, found bool)
+}
 
 // Config holds configuration for the gateway server.
 type Config struct {
@@ -66,8 +83,8 @@ type Upstream struct {
 	// Address is the backend address (e.g., "127.0.0.1:8080").
 	//
 	// For most upstreams the address is fixed at registration time. For a
-	// dynamically-provisioned service (e.g. the WhatsApp bridge, which binds an
-	// auto-selected free host port AFTER the gateway has already started), the
+	// dynamically-provisioned module (which binds an auto-selected free host port
+	// AFTER the gateway has already started), the
 	// address is not known when the route is registered. Such a route is
 	// registered up front with an empty Address and its target is set later via
 	// Server.SetUpstreamAddress; reads go through addr() so a live proxy always
@@ -128,6 +145,12 @@ type Server struct {
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a TLS-wrapped tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
+
+	// provisionedResolver maps a /modules/<prefix>/ request to the capability the
+	// owning module declared (via the provisioned-service registry). When nil, a
+	// module route falls back to the provision capability. Set via
+	// SetProvisionedRegistry.
+	provisionedResolver CapabilityResolver
 }
 
 // NewServer creates a new gateway server.
@@ -165,10 +188,10 @@ func (s *Server) AddUpstream(pathPrefix string, upstream *Upstream) {
 }
 
 // SetUpstreamAddress updates the backend address of an already-registered
-// upstream. It is the mechanism a dynamically-provisioned service uses to point
+// upstream. It is the mechanism a dynamically-provisioned module uses to point
 // a route (registered up front with an empty Address) at its real host port once
-// that port is known -- e.g. the WhatsApp bridge binds an auto-selected free
-// port after the gateway has started. Returns an error if no upstream is
+// that port is known -- a module binds an auto-selected free host port after the
+// gateway has started. Returns an error if no upstream is
 // registered for the given prefix. Safe to call after Start (reads go through
 // the per-request resolveTarget in registerProxy).
 func (s *Server) SetUpstreamAddress(prefix, address string) error {
@@ -190,6 +213,18 @@ func (s *Server) SetPermissions(p *config.Permissions) {
 	s.permissions = p
 }
 
+// SetProvisionedRegistry wires the resolver the permission layer uses to gate
+// /modules/<prefix>/ requests by the capability the owning module declared.
+// Passing nil clears it (module routes then fall back to the provision
+// capability). Safe to call after Start (the permission check reads it under the
+// lock), so the running gateway can adopt a registry that gains entries over
+// time. Typically the caller passes a *provisionedservice.Registry.
+func (s *Server) SetProvisionedRegistry(r CapabilityResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.provisionedResolver = r
+}
+
 // SetMetering enables ACET token metering on the gateway. When set,
 // OpenAI-compatible API requests are intercepted to extract token usage
 // and record billing transactions. Must be called before Start.
@@ -199,8 +234,50 @@ func (s *Server) SetMetering(m *MeteringMiddleware) {
 	s.metering = m
 }
 
-// categoryForPath returns the permission category for a request path, or ""
-// if the path should always be allowed (health, status, ping, root).
+// modulePrefixFromPath extracts the module prefix from a /modules/<prefix>/...
+// (or exact /modules/<prefix>) request path, or "" if the path is not a module
+// route. It is the inverse of ModuleRoutePath.
+func modulePrefixFromPath(path string) string {
+	if !strings.HasPrefix(path, ModuleRoutePrefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(path, ModuleRoutePrefix)
+	if rest == "" {
+		return ""
+	}
+	// The prefix is the first path segment; anything after the next slash is the
+	// module's own path.
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+// categoryForRequest returns the permission category gating a request path. For
+// builtin routes it uses the stable hardcoded mapping (categoryForPath). For a
+// /modules/<prefix>/ route it consults the provisioned-service registry (via
+// resolver) for the capability the owning module DECLARED, defaulting to
+// "provision" when the resolver is nil or the prefix is unknown -- so a module
+// route is never left ungated. This is the registry-driven replacement for the
+// old hardcoded per-module switch.
+func categoryForRequest(path string, resolver CapabilityResolver) string {
+	if prefix := modulePrefixFromPath(path); prefix != "" {
+		if resolver != nil {
+			if capability, found := resolver.CapabilityForPrefix(prefix); found && capability != "" {
+				return capability
+			}
+		}
+		// Unknown/registry-less module route: fall back to provision rather than
+		// leaving it open (fail closed).
+		return "provision"
+	}
+	return categoryForPath(path)
+}
+
+// categoryForPath returns the permission category for a BUILTIN request path, or
+// "" if the path should always be allowed (health, status, ping, root). Module
+// routes (/modules/<prefix>/) are handled by categoryForRequest, which layers a
+// registry lookup on top of this.
 func categoryForPath(path string) string {
 	// Terminal/console
 	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
@@ -228,14 +305,9 @@ func categoryForPath(path string) string {
 	if path == "/provision" || strings.HasPrefix(path, "/provision/") {
 		return "provision"
 	}
-	// Provisioned services (e.g. the WhatsApp bridge) are reached by the backend
-	// through a gateway route registered by the provision flow. Gate them behind
-	// the same Provision capability that deployed them: if the operator disables
-	// provisioning, the provisioned service is no longer reachable either.
-	if path == "/whatsapp" || strings.HasPrefix(path, "/whatsapp/") {
-		return "provision"
-	}
-	// Everything else (health, status, ping, root, unknown) is always allowed
+	// Everything else (health, status, ping, root, unknown) is always allowed.
+	// Provisioned-module routes (/modules/<prefix>/) are gated by
+	// categoryForRequest via the registry, not here.
 	return ""
 }
 
@@ -245,24 +317,27 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		perms := s.permissions
+		resolver := s.provisionedResolver
 		s.mu.RUnlock()
 
 		if perms != nil {
-			category := categoryForPath(r.URL.Path)
+			category := categoryForRequest(r.URL.Path, resolver)
 			blocked := false
 			switch category {
 			case "console":
 				blocked = !perms.Console
 			case "desktop":
 				blocked = !perms.Desktop
+			case "files":
+				blocked = !perms.Files
 			case "services":
 				blocked = !perms.Services
 			case "ssh":
 				blocked = !perms.SSH
 			case "provision":
 				blocked = !perms.Provision
-				// "files" is not currently routed through the gateway but is
-				// included in the permission model for future use.
+			case "shell":
+				blocked = !perms.Shell
 			}
 			if blocked {
 				w.Header().Set("Content-Type", "application/json")
