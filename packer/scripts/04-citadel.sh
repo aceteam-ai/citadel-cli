@@ -108,11 +108,20 @@ Requires=docker.service
 # Only start if citadel init has been run (manifest exists)
 ConditionPathExists=/etc/citadel/citadel.yaml
 
+# Defense in depth against a crash-loop self-DoS (#443): if the process keeps
+# failing fast, enter a cooldown instead of a 10s restart storm.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/citadel work
 Restart=always
+# Exponential restart backoff (10s -> 5m). The worker also backs off in-process
+# on a failed control-plane connect, so this is a secondary safety net (#443).
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
 User=citadel
 Group=docker
 Environment=HOME=/home/citadel

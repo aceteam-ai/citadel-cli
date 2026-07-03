@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -155,6 +156,134 @@ Examples:
   # Run without auto-starting services
   citadel work --no-services`,
 	Run: runWork,
+}
+
+// Connect-retry backoff bounds. A failed control-plane connect is recoverable,
+// so we retry in-process rather than exiting and letting systemd storm.
+// These are vars (not consts) so tests can shrink them without real-time sleeps.
+var (
+	connectBackoffInitial = 2 * time.Second
+	connectBackoffMax     = 2 * time.Minute
+	// connectRateLimitChunk bounds a SINGLE sleep even when the server asks for
+	// a very long wait (e.g. retry_after: 86400). We sleep in chunks and re-check
+	// ctx between them so a 24h reset never blocks shutdown -- but we keep
+	// sleeping until the full server-requested interval has elapsed before
+	// retrying, so we never poll tighter than retry_after (no hammering, #443).
+	connectRateLimitChunk = 90 * time.Second
+)
+
+// apiConnector is the subset of APISource that connectWithBackoff needs.
+// Kept as an interface so tests can exercise the backoff loop without a live API.
+type apiConnector interface {
+	Connect(ctx context.Context) error
+}
+
+// connectWithBackoff retries source.Connect until it succeeds or ctx is
+// cancelled. Transient failures use exponential backoff with jitter; a 429
+// rate-limit response is honored via its retry_after/reset_at hint (capped per
+// sleep so shutdown stays responsive). Returns a non-nil error only when the
+// context is cancelled (clean shutdown), never on a connect failure -- the
+// process stays up and keeps retrying rather than dying into a restart storm.
+func connectWithBackoff(ctx context.Context, source apiConnector) error {
+	backoff := connectBackoffInitial
+	attempt := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		attempt++
+		err := source.Connect(ctx)
+		if err == nil {
+			if attempt > 1 {
+				Log("connected to Redis API after %d attempt(s)", attempt)
+			}
+			return nil
+		}
+
+		// If the context was cancelled mid-connect, this is a clean shutdown.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Decide how long to wait before the next attempt.
+		if rle, ok := redisapi.AsRateLimitError(err); ok {
+			// Honor the server's backoff IN FULL: sleep the whole requested
+			// interval before retrying so we never poll tighter than retry_after
+			// (that tight-loop is exactly what burned the daily quota, #443). The
+			// sleep is chunked and ctx-aware so a 24h reset still yields instantly
+			// to shutdown. Reset the generic backoff -- the server is the
+			// authority here.
+			wait := rle.Wait(time.Now())
+			if wait <= 0 {
+				wait = backoff
+			}
+			backoff = connectBackoffInitial
+			Log("Redis API rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
+				rle.Limit, rle.Window, wait, err)
+			if !sleepUntilCtx(ctx, time.Now().Add(wait)) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		// Generic transient failure: exponential backoff with jitter.
+		sleep := jitter(backoff)
+		Log("Redis API connect failed (attempt %d), retrying in %s: %v", attempt, sleep, err)
+		backoff *= 2
+		if backoff > connectBackoffMax {
+			backoff = connectBackoffMax
+		}
+		if !sleepCtx(ctx, sleep) {
+			return ctx.Err()
+		}
+	}
+}
+
+// sleepUntilCtx sleeps until deadline, waking in bounded chunks so it stays
+// responsive to ctx cancellation even for very long waits (e.g. a 24h 429
+// reset). Returns true if the deadline was reached, false if ctx was cancelled.
+func sleepUntilCtx(ctx context.Context, deadline time.Time) bool {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ctx.Err() == nil
+		}
+		chunk := remaining
+		if chunk > connectRateLimitChunk {
+			chunk = connectRateLimitChunk
+		}
+		if !sleepCtx(ctx, chunk) {
+			return false
+		}
+	}
+}
+
+// jitter returns d perturbed by +/-20% to avoid a thundering herd of nodes
+// retrying in lockstep after a shared backend blip.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	delta := float64(d) * 0.2
+	return time.Duration(float64(d) - delta + rand.Float64()*2*delta)
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled. Returns true if the full
+// sleep elapsed, false if the context was cancelled first (so backoff loops
+// stay immediately responsive to SIGTERM / graceful shutdown).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func runWork(cmd *cobra.Command, args []string) {
@@ -483,10 +612,21 @@ func runWork(cmd *cobra.Command, args []string) {
 			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
 
-		// Connect early so client is available for heartbeat
-		if err := apiSource.Connect(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: Failed to connect to Redis API: %v\n", err)
-			os.Exit(1)
+		// Connect early so client is available for heartbeat.
+		//
+		// A failed control-plane connect is expected and recoverable (auth blip,
+		// mesh churn, backend deploy, rate limit), NOT fatal. Exiting here would
+		// let systemd relaunch us every ~10s; each restart re-pings the same
+		// endpoint, and if it is rate limited (HTTP 429) that restart storm burns
+		// the node's daily Redis-API quota and hard-locks it for ~24h -- the node
+		// self-DoSes (issue #443). Instead retry IN-PROCESS with exponential
+		// backoff + jitter, honoring any 429 retry_after/reset_at, and stay
+		// responsive to shutdown via ctx.
+		if err := connectWithBackoff(ctx, apiSource); err != nil {
+			// The only way this returns an error is context cancellation
+			// (SIGTERM / graceful shutdown), which is a clean exit, not a crash.
+			Log("worker connect aborted: %v", err)
+			return
 		}
 
 		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)

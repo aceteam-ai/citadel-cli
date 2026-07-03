@@ -55,12 +55,21 @@ func generateUserUnit(description, execLine string) string {
 Description=%s
 After=network-online.target
 Wants=network-online.target
+# Defense in depth against a crash-loop self-DoS (#443): if the process keeps
+# failing fast, enter a cooldown instead of a 10s restart storm.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%s
 Restart=on-failure
+# Exponential restart backoff: start at 10s and grow to 5m so a genuinely
+# failing start does not hammer the control plane. The worker also backs off
+# in-process, so this is a secondary safety net.
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
 StandardOutput=journal+console
 StandardError=journal+console
 Environment=CITADEL_SERVICE=true
@@ -96,12 +105,21 @@ Description=%s
 Documentation=https://github.com/aceteam-ai/citadel-cli
 After=network-online.target docker.service
 Wants=network-online.target
+# Defense in depth against a crash-loop self-DoS (#443): if the process keeps
+# failing fast, enter a cooldown instead of a 10s restart storm.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%s
 Restart=on-failure
+# Exponential restart backoff: start at 10s and grow to 5m so a genuinely
+# failing start does not hammer the control plane. The worker also backs off
+# in-process, so this is a secondary safety net.
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
 User=%s
 Group=%s
 Environment=HOME=%s

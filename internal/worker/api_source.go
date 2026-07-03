@@ -98,22 +98,31 @@ func (s *APISource) log(level, format string, args ...interface{}) {
 }
 
 // Connect establishes connection to the API.
+//
+// This may be retried: the connect-with-backoff loop in cmd/work.go calls it
+// repeatedly until a ping succeeds (issue #443). So we must NOT retain a client
+// whose ping failed -- otherwise a subsequent call would short-circuit on the
+// "already connected" guard and report success without ever verifying the
+// endpoint. The client is only assigned to s.client once the ping succeeds, and
+// the ping error is wrapped with %w so callers can still type-assert a 429
+// (redisapi.RateLimitError) through the chain.
 func (s *APISource) Connect(ctx context.Context) error {
-	// Skip if already connected
+	// Skip if already connected and verified.
 	if s.client != nil {
 		return nil
 	}
 
-	s.client = redisapi.NewClient(redisapi.ClientConfig{
+	client := redisapi.NewClient(redisapi.ClientConfig{
 		BaseURL:   s.config.BaseURL,
 		Token:     s.config.Token,
 		DebugFunc: s.config.DebugFunc,
 	})
 
-	// Verify connection
-	if err := s.client.Ping(ctx); err != nil {
+	// Verify connection before retaining the client.
+	if err := client.Ping(ctx); err != nil {
 		return fmt.Errorf("failed to connect to Redis API: %w", err)
 	}
+	s.client = client
 
 	s.log("info", "   - API: %s", s.config.BaseURL)
 	s.log("info", "   - Worker ID: %s", s.client.WorkerID())
