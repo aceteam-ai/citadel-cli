@@ -879,3 +879,19 @@ Auto-generated log of every release.
   - feat(node): renew Headscale node key while online + harden no-authkey reconnect (#4583) (#435)
 
 
+---
+
+## v2.62.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 17 |
+| Lines added | +770 |
+
+**Changes:**
+
+  - fix(worker): in-process backoff on Redis-API connect, honor 429 (#443) (#444)
+  - chore: sync generated files after v2.61.0 release
+
+
