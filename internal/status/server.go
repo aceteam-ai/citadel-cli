@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +31,14 @@ type Server struct {
 	tokenValidator terminal.TokenValidator
 	orgID          string
 	enableDesktop  bool
+
+	// gatewayCertPath is the on-disk path to the gateway's self-signed leaf cert
+	// PEM. When set, the status server serves it unauthenticated at
+	// GET /gateway-cert.pem so the backend can fetch (and re-fetch on rotation)
+	// the cert it must trust to reach this node's TLS gateway. Empty means the
+	// gateway runs without TLS (--gateway-no-tls), in which case the endpoint
+	// returns 204 No Content to signal "use plain http".
+	gatewayCertPath string
 
 	// agent provides the data/actions backing the /agent/* introspection &
 	// control endpoints (issue #236). Nil disables those routes.
@@ -63,6 +72,14 @@ type ServerConfig struct {
 	// HTTP routes on the status server's mux. This allows external packages
 	// (e.g., workflow) to add endpoints without modifying the status package.
 	ExtraRoutes func(mux *http.ServeMux)
+
+	// GatewayCertPath is the on-disk path to the gateway's self-signed leaf cert
+	// PEM. When non-empty, GET /gateway-cert.pem serves that PEM unauthenticated
+	// (a public leaf cert is safe to hand out) so the backend can fetch the cert
+	// it must trust to reach this node's TLS gateway, and re-fetch it on rotation.
+	// Empty means the gateway has no TLS cert (--gateway-no-tls); the endpoint
+	// then returns 204 No Content to tell the backend to use plain http.
+	GatewayCertPath string
 }
 
 // NewServer creates a new status HTTP server.
@@ -71,14 +88,15 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		cfg.Port = 8080
 	}
 	return &Server{
-		collector:      collector,
-		port:           cfg.Port,
-		version:        cfg.Version,
-		tokenValidator: cfg.TokenValidator,
-		orgID:          cfg.OrgID,
-		enableDesktop:  cfg.EnableDesktop,
-		agent:          cfg.Agent,
-		extraRoutes:    cfg.ExtraRoutes,
+		collector:       collector,
+		port:            cfg.Port,
+		version:         cfg.Version,
+		tokenValidator:  cfg.TokenValidator,
+		orgID:           cfg.OrgID,
+		enableDesktop:   cfg.EnableDesktop,
+		agent:           cfg.Agent,
+		extraRoutes:     cfg.ExtraRoutes,
+		gatewayCertPath: cfg.GatewayCertPath,
 	}
 }
 
@@ -107,6 +125,13 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
+
+	// Publish the gateway's self-signed leaf cert so the backend can trust it
+	// out-of-band (and re-fetch on rotation). Served unauthenticated over the
+	// plaintext status server so it is a bootstrap channel that does not require
+	// already trusting the cert being fetched. A public leaf cert is safe to hand
+	// out. Returns 204 when the gateway runs without TLS.
+	mux.HandleFunc("/gateway-cert.pem", s.handleGatewayCert)
 
 	if s.tokenValidator != nil && s.enableDesktop {
 		mux.HandleFunc("/api/screenshot", s.requireAuth(s.handleScreenshot))
@@ -258,6 +283,47 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		"status":    "pong",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// handleGatewayCert serves the gateway's current self-signed leaf cert PEM so the
+// backend can trust it out-of-band and re-fetch it after a rotation.
+// GET /gateway-cert.pem
+//
+// Unauthenticated by design: the response is a PUBLIC leaf cert (safe to hand
+// out), and this is the bootstrap/refresh channel the backend uses BEFORE it
+// trusts the cert, so it must not require the very trust it establishes. It reads
+// the current PEM from disk on every request so a rotated cert (the gateway
+// regenerates it in place when the mesh IP changes) is always served fresh.
+//
+// Returns 204 No Content when the gateway has no TLS cert (--gateway-no-tls),
+// signaling the backend to reach the node over plain http instead. Returns 503
+// when TLS is configured but the cert is not yet on disk (a cold-start race) so
+// the backend retries rather than mis-downgrading to http.
+func (s *Server) handleGatewayCert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.gatewayCertPath == "" {
+		// No TLS cert configured: the gateway runs --gateway-no-tls. Tell the
+		// backend to use plain http.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	pem, err := os.ReadFile(s.gatewayCertPath)
+	if err != nil {
+		// TLS IS configured (path is set) but the cert is not on disk yet -- a
+		// brief cold-start race before the gateway writes it. Do NOT return 204
+		// here: 204 means "TLS off, use plain http", and downgrading to http
+		// against a TLS gateway would fail. Return 503 so the backend RETRIES
+		// (from cert_refresh_url) once the cert exists, instead of mis-detecting
+		// the node as no-TLS.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	w.Write(pem)
 }
 
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {

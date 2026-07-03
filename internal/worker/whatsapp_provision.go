@@ -23,7 +23,10 @@
 //	  "api_key": "<per-tenant wab_ key>",
 //	  "qr":      "data:image/png;base64,...",  // "" when already linked
 //	  "tenant":  "<name>",
-//	  "status":  "provisioned" | "already_linked"
+//	  "status":  "provisioned" | "already_linked",
+//	  // Optional cert-publish contract (#448), omitted when off-mesh / no-TLS:
+//	  "gateway_cert_pem": "-----BEGIN CERTIFICATE-----...", // trust to reach api_url
+//	  "cert_refresh_url": "http://<mesh-ip>:<status-port>/gateway-cert.pem"
 //	}
 //
 // # Privilege gating
@@ -139,6 +142,17 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 		"qr":      qrDataURL,
 		"tenant":  res.Tenant,
 		"status":  status,
+	}
+	// Optional cert-publish contract (aceteam-ai/citadel-cli#448): hand the backend
+	// the gateway leaf cert to trust (the api_url is an https gateway route) plus
+	// the plaintext URL to re-fetch it from on rotation. Omitted (omitempty) when
+	// the gateway runs --gateway-no-tls or the node is off-mesh, so older backends
+	// that ignore these keys are unaffected.
+	if res.GatewayCertPEM != "" {
+		doc["gateway_cert_pem"] = res.GatewayCertPEM
+	}
+	if res.CertRefreshURL != "" {
+		doc["cert_refresh_url"] = res.CertRefreshURL
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {

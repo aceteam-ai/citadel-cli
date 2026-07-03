@@ -520,3 +520,172 @@ func TestPermissionMiddleware_NilPermissionsAllowsAll(t *testing.T) {
 		t.Error("nil permissions should not block any route")
 	}
 }
+
+// TestSetUpstreamAddress_DynamicRoute verifies a route registered up front with
+// an empty upstream returns 502 until its address is set, then proxies to the
+// backend once SetUpstreamAddress wires it. This is the mechanism that exposes a
+// dynamically-provisioned service (the WhatsApp bridge) on the mesh gateway
+// (aceteam-ai/citadel-cli#447).
+func TestSetUpstreamAddress_DynamicRoute(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"backend": "bridge", "path": r.URL.Path})
+	}))
+	defer backend.Close()
+	backendAddr := backend.URL[len("http://"):]
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	// Registered up front with NO address (dynamic upstream), StripPrefix like a
+	// real module route under /modules/<prefix>.
+	routePrefix := ModuleRoutePath("whatsapp")
+	gw.AddUpstream(routePrefix, &Upstream{StripPrefix: true})
+	for prefix, upstream := range gw.config.Upstreams {
+		gw.registerProxy(prefix, upstream)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+	handler := gw.BuildHandler()
+
+	// Before wiring: a 502 (upstream unset), NOT a panic or a 200.
+	req := httptest.NewRequest(http.MethodGet, routePrefix+"/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("unwired route status = %d, want 502", w.Code)
+	}
+
+	// Wire the route to the backend.
+	if err := gw.SetUpstreamAddress(routePrefix, backendAddr); err != nil {
+		t.Fatalf("SetUpstreamAddress: %v", err)
+	}
+
+	// After wiring: proxies through, prefix stripped (module sees /health).
+	req = httptest.NewRequest(http.MethodGet, routePrefix+"/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("wired route status = %d, want 200", w.Code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["backend"] != "bridge" {
+		t.Errorf("backend = %q, want bridge", got["backend"])
+	}
+	if got["path"] != "/health" {
+		t.Errorf("forwarded path = %q, want /health (prefix stripped)", got["path"])
+	}
+}
+
+// TestSetUpstreamAddress_UnknownPrefix verifies setting an address on an
+// unregistered prefix errors rather than silently no-oping.
+func TestSetUpstreamAddress_UnknownPrefix(t *testing.T) {
+	gw := NewServer(Config{})
+	if err := gw.SetUpstreamAddress("/nope", "127.0.0.1:9999"); err == nil {
+		t.Fatal("expected an error for an unregistered prefix, got nil")
+	}
+}
+
+// stubResolver is a test CapabilityResolver: it maps declared prefixes to
+// capabilities and reports not-found for the rest.
+type stubResolver map[string]string
+
+func (s stubResolver) CapabilityForPrefix(prefix string) (string, bool) {
+	c, ok := s[prefix]
+	return c, ok
+}
+
+// TestModulePrefixFromPath covers extracting the module prefix from a route path.
+func TestModulePrefixFromPath(t *testing.T) {
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/modules/whatsapp", "whatsapp"},
+		{"/modules/whatsapp/health", "whatsapp"},
+		{"/modules/whatsapp/admin/tenants", "whatsapp"},
+		{"/modules/my-mod/x", "my-mod"},
+		{"/modules/", ""},
+		{"/modules", ""},
+		{"/terminal", ""},
+		{"/health", ""},
+	}
+	for _, tt := range tests {
+		if got := modulePrefixFromPath(tt.path); got != tt.want {
+			t.Errorf("modulePrefixFromPath(%q) = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+}
+
+// TestCategoryForRequest_ModuleRoute verifies a /modules/<prefix>/ request maps
+// to the capability the resolver (registry) records, defaults to provision for
+// an unknown prefix or nil resolver, and leaves builtin routes untouched.
+func TestCategoryForRequest_ModuleRoute(t *testing.T) {
+	resolver := stubResolver{"whatsapp": "provision", "readmod": "services"}
+
+	// Registered module -> its declared capability.
+	for _, p := range []string{"/modules/whatsapp", "/modules/whatsapp/health", "/modules/whatsapp/admin/tenants"} {
+		if got := categoryForRequest(p, resolver); got != "provision" {
+			t.Errorf("categoryForRequest(%q) = %q, want provision", p, got)
+		}
+	}
+	// A module that declares a DIFFERENT capability (data-plane decoupled from
+	// provision) is gated by that one.
+	if got := categoryForRequest("/modules/readmod/health", resolver); got != "services" {
+		t.Errorf("categoryForRequest(readmod) = %q, want services", got)
+	}
+	// Unknown prefix -> fail closed to provision.
+	if got := categoryForRequest("/modules/unknown/x", resolver); got != "provision" {
+		t.Errorf("categoryForRequest(unknown) = %q, want provision (fail closed)", got)
+	}
+	// Nil resolver -> module routes still gated (provision), builtin unchanged.
+	if got := categoryForRequest("/modules/whatsapp/health", nil); got != "provision" {
+		t.Errorf("categoryForRequest(nil resolver) = %q, want provision", got)
+	}
+	if got := categoryForRequest("/terminal", resolver); got != "console" {
+		t.Errorf("categoryForRequest(/terminal) = %q, want console", got)
+	}
+	if got := categoryForRequest("/health", resolver); got != "" {
+		t.Errorf("categoryForRequest(/health) = %q, want \"\"", got)
+	}
+}
+
+// TestPermissionMiddleware_ModuleCapabilityDecoupled verifies a module can
+// declare a capability OTHER than provision, so revoking provision does not kill
+// its route (landmine d). The read module is gated by services here.
+func TestPermissionMiddleware_ModuleCapabilityDecoupled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendAddr := backend.URL[len("http://"):]
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	waPrefix := ModuleRoutePath("whatsapp")
+	svcPrefix := ModuleRoutePath("readmod")
+	gw.AddUpstream(waPrefix, &Upstream{Address: backendAddr, StripPrefix: true})
+	gw.AddUpstream(svcPrefix, &Upstream{Address: backendAddr, StripPrefix: true})
+	for prefix, upstream := range gw.config.Upstreams {
+		gw.registerProxy(prefix, upstream)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+
+	gw.SetProvisionedRegistry(stubResolver{"whatsapp": "provision", "readmod": "services"})
+	// Provision OFF, services ON: the provision-gated module is blocked, the
+	// services-gated module still serves.
+	gw.SetPermissions(&config.Permissions{Provision: false, Services: true})
+	handler := gw.BuildHandler()
+
+	req := httptest.NewRequest(http.MethodGet, waPrefix+"/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("provision-gated module with provision off: status = %d, want 403", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, svcPrefix+"/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code == http.StatusForbidden {
+		t.Errorf("services-gated module with services on: status = %d, want not-403", w.Code)
+	}
+}

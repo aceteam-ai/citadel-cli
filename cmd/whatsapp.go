@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/controlcenter"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/fatih/color"
@@ -41,6 +41,22 @@ import (
 // or container image. The bridge ships from sunapi386/whatsapp-bridge and is
 // deployed here via the generic module-source mechanism (catalog.ResolveSource).
 const defaultWhatsAppSource = "sunapi386/whatsapp-bridge"
+
+// WhatsApp's gateway-exposure defaults. The WhatsApp bridge manifest lives in the
+// sunapi386/whatsapp-bridge repo (not editable here); once it declares a
+// gateway: block (prefix/port_env/capability) the registry-driven path uses that
+// verbatim. Until then -- and to keep existing deployments working across upgrade
+// -- citadel defaults WhatsApp to these values, which match the required manifest
+// block documented in the PR:
+//
+//	gateway:
+//	  prefix: whatsapp
+//	  port_env: BRIDGE_PORT
+//	  capability: provision
+const (
+	whatsappGatewayPrefix     = "whatsapp"
+	whatsappGatewayCapability = "provision"
+)
 
 // deployTimeout bounds the whole deploy edge (resolve module source via git clone
 // + `docker compose up`). Both underlying steps shell out to git/docker without
@@ -150,31 +166,10 @@ func bridgeBaseURL(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
-// meshAPIURL returns the api_url the aceteam backend should use: the node's
-// network (mesh) IP and the published port. Returns "" if the node is not
-// connected to the network. It primes the network singleton first (mirroring
-// status.go) so it works from a fresh process where the global server has not
-// yet been initialized.
-func meshAPIURL(port int) string {
-	if !network.HasState() {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// VerifyOrReconnect initializes the global server if needed.
-	network.VerifyOrReconnect(ctx)
-
-	ip, err := network.GetGlobalIPv4()
-	if err != nil || ip == "" {
-		// Fall back to the status snapshot, which also primes the singleton.
-		if st, serr := network.GetGlobalStatus(ctx); serr == nil && st.IPv4 != "" {
-			ip = st.IPv4
-		} else {
-			return ""
-		}
-	}
-	return fmt.Sprintf("http://%s:%d", ip, port)
-}
+// The api_url the aceteam backend uses to reach a provisioned bridge is now the
+// gateway-route mesh URL (whatsappMeshAPIURL in cmd/provisioned_gateway.go), not
+// a raw http://<vpn-ip>:<bridge-port> that nothing on the tsnet stack listens on
+// (aceteam-ai/citadel-cli#447).
 
 // deployWhatsAppCompose resolves the bridge module source (git clone of the
 // private repo), materializes its compose into the node's services dir, and
@@ -269,7 +264,19 @@ func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
 		NewBridgeClient: func(port int, adminKey string) whatsapp.BridgeClient {
 			return whatsapp.NewClient(bridgeBaseURL(port), adminKey)
 		},
-		MeshAPIURL: meshAPIURL,
+		// The bridge is reached by the backend through the gateway route on the
+		// mesh (not a raw host port nothing listens on) -- aceteam-ai/citadel-cli
+		// #447. whatsappMeshAPIURL returns the gateway-route URL,
+		// exposeWhatsAppGatewayRoute wires that route to the bridge's host port,
+		// and verifyBridgeReachable fails loud if the end-to-end mesh path is not
+		// actually reachable (instead of a false-green).
+		MeshAPIURL:         whatsappMeshAPIURL,
+		ExposeGatewayRoute: exposeWhatsAppGatewayRoute,
+		VerifyReachable:    verifyBridgeReachable,
+		// Hand the backend the gateway cert to trust (the api_url is an https
+		// gateway route) plus the plaintext URL to re-fetch it from on rotation.
+		GatewayCertPEM: gatewayCertPEM,
+		CertRefreshURL: certRefreshURL,
 		Log: func(format string, args ...any) {
 			fmt.Printf("   - "+format+"\n", args...)
 		},
@@ -377,7 +384,7 @@ func runWhatsAppStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if api := meshAPIURL(port); api != "" {
+	if api := whatsappMeshAPIURL(port); api != "" {
 		fmt.Printf("  api_url:   %s\n", api)
 	}
 	return nil
@@ -529,9 +536,15 @@ func printConnectDetails(port int, apiKey string) {
 	fmt.Println()
 	bold.Println("Register this bridge in AceTeam:")
 
-	apiURL := meshAPIURL(port)
+	apiURL := whatsappMeshAPIURL(port)
 	if apiURL == "" {
-		apiURL = fmt.Sprintf("http://<this-node-network-ip>:%d", port)
+		gf := gatewayFactsForURL()
+		gwPort := gf.Port
+		scheme := "https"
+		if !gf.UseTLS {
+			scheme = "http"
+		}
+		apiURL = fmt.Sprintf("%s://<this-node-network-ip>:%d%s", scheme, gwPort, gateway.ModuleRoutePath(whatsappGatewayPrefix))
 		fmt.Println(color.YellowString("  (node is not connected to the AceTeam Network -- substitute its mesh IP below)"))
 	}
 	fmt.Printf("  api_url:  %s\n", color.CyanString(apiURL))
@@ -564,7 +577,7 @@ func buildWhatsAppCallbacks() controlcenter.WhatsAppCallbacks {
 			env, _ := whatsapp.LoadEnv(servicesDir)
 			port := portFromEnv(env)
 			st.APIKey = env["TENANT_API_KEY"]
-			st.APIURL = meshAPIURL(port)
+			st.APIURL = whatsappMeshAPIURL(port)
 			st.Running = bridgeContainerRunning(whatsapp.ProjectName(servicesDir))
 			if !st.Running {
 				return st
@@ -601,7 +614,7 @@ func buildWhatsAppCallbacks() controlcenter.WhatsAppCallbacks {
 				return "", "", err
 			}
 			env, _ := whatsapp.LoadEnv(servicesDir)
-			return meshAPIURL(portFromEnv(env)), env["TENANT_API_KEY"], nil
+			return whatsappMeshAPIURL(portFromEnv(env)), env["TENANT_API_KEY"], nil
 		},
 		Stop: func() error {
 			return runWhatsAppDown(whatsappDownCmd, nil)

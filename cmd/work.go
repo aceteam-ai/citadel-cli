@@ -1109,6 +1109,14 @@ func runWork(cmd *cobra.Command, args []string) {
 			Agent:   agentProviders,
 		}
 
+		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
+		// the backend can trust it out-of-band and re-fetch on rotation. The path
+		// is the same one the gateway block below serves from; empty when the
+		// gateway runs --gateway-no-tls (endpoint then returns 204 = use http).
+		if workGateway && !workGatewayNoTLS {
+			serverCfg.GatewayCertPath = tlscert.CertPath(workGatewayCertDir)
+		}
+
 		// Wire up desktop API auth if org ID is available
 		statusOrgID := ""
 		if deviceConfig != nil {
@@ -1586,6 +1594,34 @@ func runWork(cmd *cobra.Command, args []string) {
 			WebSocket:   true,
 		})
 
+		// Expose provisioned MODULES on the mesh through the gateway
+		// (aceteam-ai/citadel-cli#447), driven entirely by the provisioned-service
+		// registry -- no per-module code here. Each module binds an auto-selected
+		// free host port that nothing on the tsnet stack listens on, so it is
+		// reached only via a /modules/<prefix> gateway route (StripPrefix so its own
+		// paths map through). Wire the registry so module routes are gated by the
+		// capability each module DECLARED, register every recorded module up front
+		// (wired to its persisted port when deployed), and publish the gateway so the
+		// in-process provision handler can wire a freshly-provisioned module live.
+		gwCertPath := ""
+		if !workGatewayNoTLS {
+			gwCertPath = tlscert.CertPath(workGatewayCertDir)
+		}
+		provReg := provisionedRegistry()
+		gw.SetProvisionedRegistry(provReg)
+		provisionedEntries := registerProvisionedModuleRoutes(gw)
+		setProvisionedServiceGateway(gw, workGatewayPort, !workGatewayNoTLS, gwCertPath, workStatusPort)
+		// Persist the live gateway facts so an out-of-process CLI/TUI builds a
+		// reachable mesh URL and verifies against the real cert (landmines a + b).
+		// StatusPort is persisted too so a separate process can build the plaintext
+		// cert_refresh_url (http://<ip>:<status-port>/gateway-cert.pem).
+		if err := writeGatewayFacts(gatewayFacts{Port: workGatewayPort, UseTLS: !workGatewayNoTLS, CertPath: gwCertPath, StatusPort: workStatusPort}); err != nil {
+			Log("could not persist gateway facts (out-of-process URL falls back to defaults): %v", err)
+		}
+		// Watch the registry so a module provisioned via the CLI while this gateway
+		// is already running gets wired without a restart (landmine c).
+		go watchProvisionedRegistry(ctx, gw)
+
 		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet.
 		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
 		// and issue #286.
@@ -1622,6 +1658,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
+		for _, e := range provisionedEntries {
+			target := "dynamic port (not yet deployed)"
+			if e.Port > 0 {
+				target = fmt.Sprintf("127.0.0.1:%d", e.Port)
+			}
+			fmt.Printf("     /modules/%s/...  -> %s (provisioned module %q, cap %q)\n", e.Prefix, target, e.Name, e.Capability)
+		}
 
 		if len(vpnIPs) > 0 {
 			fmt.Printf("   - Gateway VPN: %s://%s:%d\n", scheme, vpnIPs[0], workGatewayPort)
