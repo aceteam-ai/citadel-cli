@@ -206,12 +206,14 @@ func parseStatsOutput(out string) map[string]containerStats {
 			usedStr = usedStr[:idx]
 		}
 		cs.ramBytes = parseMemBytes(usedStr)
-		// NetIO is "<rx> / <tx>"; sum both sides. Optional field: when present we
-		// mark hasNet so the generic idle path can distinguish a real "zero
-		// traffic" reading from an absent column.
+		// NetIO is "<rx> / <tx>"; sum both sides. Optional field. hasNet is set
+		// ONLY when a real byte value parsed: a runtime that reports "--" / "-- /
+		// --" (host-networked or stats-unavailable containers) is an UNKNOWN
+		// reading, not a real zero, and must not drive the idle tracker toward a
+		// false idle. So an unparseable NetIO cell leaves hasNet=false and the
+		// generic idle path falls through to the footprint heuristic.
 		if len(fields) >= 4 {
-			cs.netBytes = parseNetIO(fields[3])
-			cs.hasNet = true
+			cs.netBytes, cs.hasNet = parseNetIO(fields[3])
 		}
 		res[name] = cs
 	}
@@ -219,15 +221,43 @@ func parseStatsOutput(out string) map[string]containerStats {
 }
 
 // parseNetIO parses a docker/podman NetIO cell like "1.2kB / 3.4MB" (received /
-// transmitted) into the summed byte total. Either side missing or unparseable
-// contributes 0, so a malformed cell yields 0 rather than a panic.
-func parseNetIO(s string) uint64 {
+// transmitted) into the summed byte total. The bool reports whether at least
+// one side parsed to a real byte value: a cell like "--", "-- / --", or empty
+// (host-networked or stats-unavailable containers) yields (0, false) so callers
+// treat it as UNKNOWN rather than a real "zero traffic" reading. This is the
+// fail-safe gate for the generic idle path -- an unknown reading must never
+// look like a flat zero counter that goes idle. A genuine "0B / 0B" reading
+// parses as (0, true): a real, quiet container.
+func parseNetIO(s string) (uint64, bool) {
 	rx, tx := s, ""
 	if idx := strings.Index(s, "/"); idx >= 0 {
 		rx = s[:idx]
 		tx = s[idx+1:]
 	}
-	return parseMemBytes(strings.TrimSpace(rx)) + parseMemBytes(strings.TrimSpace(tx))
+	rxB, rxOK := parseNetSide(strings.TrimSpace(rx))
+	txB, txOK := parseNetSide(strings.TrimSpace(tx))
+	if !rxOK && !txOK {
+		return 0, false
+	}
+	return rxB + txB, true
+}
+
+// parseNetSide parses one side of a NetIO cell into bytes, reporting whether it
+// was a real numeric value. An empty or non-numeric token (e.g. "--", the
+// placeholder docker/podman print when NetIO is unavailable) returns (0,false).
+// A real "0B" returns (0,true). It reuses parseMemBytes for the unit math but
+// distinguishes "parsed to zero" from "could not parse" by requiring a leading
+// digit, which parseMemBytes alone (which maps garbage to 0) cannot.
+func parseNetSide(s string) (uint64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	// A real value starts with a digit (optionally after a sign, though NetIO is
+	// never negative). "--" and other placeholders do not.
+	if s[0] < '0' || s[0] > '9' {
+		return 0, false
+	}
+	return parseMemBytes(s), true
 }
 
 // parsePercent parses a value like "74.31%" or "74.31" into a float. Returns
@@ -705,6 +735,16 @@ func (c *Collector) attachDerivedIdle(containerName string, fp *ServiceFootprint
 	// nothing), never fabricate an idle signal from an unknown reading.
 	if c.netIdleTracker != nil && fp.HasNet {
 		n := c.netIdleTracker.RecordActivityCounter(containerName, fp.NetBytes)
+		// GPU-busy override: a container can pin the GPU (a batch diffusers /
+		// fine-tune job) while sending no network traffic, so a network-silent
+		// verdict of "idle" would be a dangerous false idle on a node doing real
+		// work. If the GPU is actively utilized, the container is NOT idle
+		// regardless of the network counter. We deliberately do NOT fold CPU in
+		// here -- an agent process idling above the CPU floor is exactly the case
+		// #433 exists to catch, so only the unambiguous GPU-hot signal overrides.
+		if n.Idle && fp.HasGPU && fp.GPUUtilPercent > idleGPUThresholdPercent {
+			n.Idle = false
+		}
 		*dst = &n
 		return
 	}

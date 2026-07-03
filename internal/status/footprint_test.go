@@ -418,23 +418,30 @@ func TestStatsFilterByCandidateName(t *testing.T) {
 }
 
 // TestParseNetIO checks the "<rx> / <tx>" NetIO cell parses to the summed byte
-// total, and that garbage/partial cells degrade to 0 without panicking.
+// total, and -- critically for the fail-safe -- that a placeholder/unavailable
+// cell ("--", "-- / --", empty) is reported as UNKNOWN (ok=false), not a real
+// zero. A genuine "0B / 0B" is a real, quiet reading (ok=true).
 func TestParseNetIO(t *testing.T) {
 	cases := []struct {
-		in   string
-		want uint64
+		in     string
+		want   uint64
+		wantOK bool
 	}{
-		{"0B / 0B", 0},
-		{"1.0kB / 2.0kB", 3000},            // decimal kB, summed
-		{"1.5MB / 0B", 1_500_000},          // one side only
-		{"1.0MiB / 1.0MiB", 2 * (1 << 20)}, // binary MiB, summed
-		{"", 0},
-		{"garbage", 0},
-		{"5kB", 5000}, // no separator -> whole cell treated as rx
+		{"0B / 0B", 0, true},                     // real quiet container
+		{"1.0kB / 2.0kB", 3000, true},            // decimal kB, summed
+		{"1.5MB / 0B", 1_500_000, true},          // one side only
+		{"1.0MiB / 1.0MiB", 2 * (1 << 20), true}, // binary MiB, summed
+		{"5kB", 5000, true},                      // no separator -> rx only
+		{"", 0, false},                           // empty -> unknown
+		{"-- / --", 0, false},                    // docker placeholder -> unknown
+		{"--", 0, false},                         // half placeholder -> unknown
+		{"garbage", 0, false},                    // non-numeric -> unknown
+		{"1.0kB / --", 1000, true},               // one real side is enough
 	}
 	for _, c := range cases {
-		if got := parseNetIO(c.in); got != c.want {
-			t.Errorf("parseNetIO(%q) = %d, want %d", c.in, got, c.want)
+		got, ok := parseNetIO(c.in)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("parseNetIO(%q) = (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.wantOK)
 		}
 	}
 }
@@ -475,6 +482,25 @@ func TestParseStatsOutput_ThreeFieldStillParses(t *testing.T) {
 	}
 	if s.cpuPercent != 74.31 {
 		t.Errorf("cpu = %v, want 74.31 (3-field row must still parse)", s.cpuPercent)
+	}
+}
+
+// TestParseStatsOutput_PlaceholderNetIsUnknown is the fail-safe parser test: a
+// 4-field row whose NetIO is the docker/podman "--" placeholder (host-networked
+// or stats-unavailable container) must set hasNet=false, so the generic idle
+// path treats it as unknown and never as a real zero-traffic reading.
+func TestParseStatsOutput_PlaceholderNetIsUnknown(t *testing.T) {
+	out := "citadel-hostnet\t3.0%\t256MiB / 62.0GiB\t-- / --\n"
+	got := parseStatsOutput(out)
+	s, ok := got["citadel-hostnet"]
+	if !ok {
+		t.Fatalf("missing citadel-hostnet row: %v", got)
+	}
+	if s.hasNet {
+		t.Fatalf("expected hasNet false for a '-- / --' NetIO placeholder")
+	}
+	if s.cpuPercent != 3.0 {
+		t.Errorf("cpu = %v, want 3.0 (row must still parse for CPU/RAM)", s.cpuPercent)
 	}
 }
 
@@ -533,6 +559,57 @@ func TestAttachDerivedIdle_VLLMSignalIsAuthoritative(t *testing.T) {
 	c.attachDerivedIdle("citadel-vllm", fp, &dst)
 	if dst != existing {
 		t.Fatalf("expected the vLLM idle signal to be left untouched, got %+v", dst)
+	}
+}
+
+// TestAttachDerivedIdle_GPUHotOverridesNetworkIdle guards the dangerous false
+// idle: a container that pins the GPU (a batch diffusers / fine-tune job) but
+// sends no network traffic. The flat NetIO counter would otherwise report idle
+// after the threshold and make it an auto-stop candidate while it is doing real
+// GPU work. The GPU-hot override must keep it active.
+func TestAttachDerivedIdle_GPUHotOverridesNetworkIdle(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	c := newNetTestCollector(300, &now)
+
+	// Baseline: GPU already hot, flat network.
+	fp := &ServiceFootprint{CPUPercent: 1, RAMBytes: 8 << 30, NetBytes: 1000, HasNet: true, HasGPU: true, GPUUtilPercent: 95}
+	var dst *IdleState
+	c.attachDerivedIdle("citadel-diffusers", fp, &dst)
+	if dst == nil || dst.Idle {
+		t.Fatalf("expected not idle at baseline, got %+v", dst)
+	}
+
+	// 300s later, network still flat, GPU still hot -> the net signal alone would
+	// say idle, but the GPU override keeps it active.
+	now = now.Add(300 * time.Second)
+	fp2 := &ServiceFootprint{CPUPercent: 1, RAMBytes: 8 << 30, NetBytes: 1000, HasNet: true, HasGPU: true, GPUUtilPercent: 95}
+	dst = nil
+	c.attachDerivedIdle("citadel-diffusers", fp2, &dst)
+	if dst == nil {
+		t.Fatalf("expected a signal, got nil")
+	}
+	if dst.Idle {
+		t.Fatalf("GPU-busy container must not be reported idle despite flat NetIO, got %+v", dst)
+	}
+}
+
+// TestAttachDerivedIdle_NetworkIdleWhenGPUQuiet confirms the GPU override does
+// NOT suppress a legitimately idle service: flat network AND a quiet GPU means
+// truly idle, so the service should flip idle after the threshold.
+func TestAttachDerivedIdle_NetworkIdleWhenGPUQuiet(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	c := newNetTestCollector(300, &now)
+
+	fp := &ServiceFootprint{CPUPercent: 1, RAMBytes: 8 << 30, NetBytes: 1000, HasNet: true, HasGPU: true, GPUUtilPercent: 0}
+	var dst *IdleState
+	c.attachDerivedIdle("citadel-idle-gpu", fp, &dst) // baseline
+
+	now = now.Add(300 * time.Second)
+	fp2 := &ServiceFootprint{CPUPercent: 1, RAMBytes: 8 << 30, NetBytes: 1000, HasNet: true, HasGPU: true, GPUUtilPercent: 0}
+	dst = nil
+	c.attachDerivedIdle("citadel-idle-gpu", fp2, &dst)
+	if dst == nil || !dst.Idle {
+		t.Fatalf("expected idle when both network and GPU are quiet, got %+v", dst)
 	}
 }
 
