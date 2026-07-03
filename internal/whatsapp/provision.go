@@ -17,6 +17,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"rsc.io/qr"
@@ -164,6 +166,23 @@ type ProvisionResult struct {
 	CertRefreshURL string
 }
 
+// persistedBridgePort returns the bridge's previously-persisted BRIDGE_PORT from
+// the env map, or 0 when none is recorded or it is not a valid positive port. It
+// deliberately does NOT default to DefaultPort (8080 = citadel's own listener):
+// a re-provision must reuse only a port the deployment actually chose, never a
+// coincidental default that would misroute onto citadel's own services.
+func persistedBridgePort(env map[string]string) int {
+	v := env["BRIDGE_PORT"]
+	if v == "" {
+		return 0
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || p <= 0 {
+		return 0
+	}
+	return p
+}
+
 // Provision runs the full deploy -> mint -> wait -> fetch-QR flow and returns the
 // connection details. It is the single source of truth shared by the CLI
 // (`citadel whatsapp up`) and the WHATSAPP_PROVISION node job.
@@ -186,15 +205,40 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	if tenant == "" {
 		tenant = "default"
 	}
-	// Choose the host port. An explicit ProvisionRequest.Port is honored verbatim
-	// (operator override); otherwise auto-select a FREE host port so the bridge
-	// does not collide with citadel's own 8080 listener, which holds DefaultPort
-	// on every node running the agent (aceteam-ai/citadel-cli#438).
+	servicesDir, err := deps.ServicesDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve node services dir: %w", err)
+	}
+
+	env, err := LoadEnv(servicesDir)
+	if err != nil {
+		return nil, fmt.Errorf("read bridge config: %w", err)
+	}
+
+	// Choose the host port. Precedence:
+	//   1. An explicit ProvisionRequest.Port is honored verbatim (operator override).
+	//   2. Otherwise, on a RE-PROVISION, reuse the persisted BRIDGE_PORT so we do
+	//      not churn to a new host port every time (#449). The old bridge still
+	//      holds that port at probe time, so a free-port scan would skip it and
+	//      pick a new one -- and `compose up` on the same project rebinds the same
+	//      port cleanly (it recreates the container). Reusing it keeps the mesh
+	//      gateway route stable across re-provisions.
+	//   3. Otherwise auto-select a FREE host port so a first deploy does not collide
+	//      with citadel's own 8080 listener (aceteam-ai/citadel-cli#438).
+	// A bind collision on the reused port (e.g. a foreign process grabbed it while
+	// the bridge was down) still falls through to the auto-select retry below.
 	selectPort := deps.SelectHostPort
 	if selectPort == nil {
 		selectPort = func(preferred, floor int) (int, error) { return SelectHostPort(preferred, floor, nil) }
 	}
-	port, err := selectPort(req.Port, 0)
+	preferredPort := req.Port
+	if preferredPort <= 0 {
+		if persisted := persistedBridgePort(env); persisted > 0 {
+			preferredPort = persisted
+			log("reusing persisted bridge host port %d (idempotent re-provision)", persisted)
+		}
+	}
+	port, err := selectPort(preferredPort, 0)
 	if err != nil {
 		return nil, fmt.Errorf("select bridge host port: %w", err)
 	}
@@ -210,16 +254,6 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	// bind-collision retry picks a new one, so apiURL is recomputed after deploy.
 	if deps.MeshAPIURL(port) == "" {
 		return nil, fmt.Errorf("node is not connected to the AceTeam mesh network; cannot determine a reachable api_url (run `citadel login` / bring the node online first)")
-	}
-
-	servicesDir, err := deps.ServicesDir()
-	if err != nil {
-		return nil, fmt.Errorf("resolve node services dir: %w", err)
-	}
-
-	env, err := LoadEnv(servicesDir)
-	if err != nil {
-		return nil, fmt.Errorf("read bridge config: %w", err)
 	}
 
 	adminKey := env["ADMIN_API_KEY"]

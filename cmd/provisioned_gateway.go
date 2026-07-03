@@ -302,10 +302,12 @@ func exposeModuleGatewayRoute(name, prefix, capability string, bridgePort int) e
 	}
 	routePrefix := gateway.ModuleRoutePath(prefix)
 	addr := fmt.Sprintf("127.0.0.1:%d", bridgePort)
-	// The route may not exist yet if this gateway started before the module was
-	// declared; register it (empty) then wire it.
-	ref.gw.AddUpstream(routePrefix, &gateway.Upstream{StripPrefix: true})
-	if err := ref.gw.SetUpstreamAddress(routePrefix, addr); err != nil {
+	// Wire the live route. WireModuleRoute mutates the existing upstream (or
+	// registers a new live handler if the route did not exist at Start) rather
+	// than replacing the upstream object the running proxy handler closed over --
+	// replacing it would orphan the update and leave the route on the old port
+	// until a restart (#449).
+	if err := ref.gw.WireModuleRoute(routePrefix, addr, true); err != nil {
 		return fmt.Errorf("wire module gateway route %s -> %s: %w", routePrefix, addr, err)
 	}
 	return nil
@@ -431,10 +433,14 @@ func watchProvisionedRegistry(ctx context.Context, gw *gateway.Server) {
 				if seen && prev == e.Port {
 					continue
 				}
-				routePrefix := gateway.ModuleRoutePath(e.Prefix)
-				gw.AddUpstream(routePrefix, &gateway.Upstream{StripPrefix: true})
+				// A new module OR a port change on an existing one: wire it live.
+				// WireModuleRoute mutates the existing upstream (never replaces the
+				// object the proxy handler captured), so a port change actually takes
+				// effect without a restart -- the #449 landmine where the watcher
+				// swapped in a fresh upstream and the update was orphaned.
 				if e.Port > 0 {
-					if err := gw.SetUpstreamAddress(routePrefix, fmt.Sprintf("127.0.0.1:%d", e.Port)); err == nil {
+					routePrefix := gateway.ModuleRoutePath(e.Prefix)
+					if err := gw.WireModuleRoute(routePrefix, fmt.Sprintf("127.0.0.1:%d", e.Port), true); err == nil {
 						Log("gateway picked up provisioned module %q on /modules/%s -> 127.0.0.1:%d", e.Name, e.Prefix, e.Port)
 					}
 				}
