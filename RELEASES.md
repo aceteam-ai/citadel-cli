@@ -895,3 +895,19 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.61.0 release
 
 
+---
+
+## v2.63.0 — 2026-07-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1235 |
+
+**Changes:**
+
+  - fix(worker): single-instance guard + loud identity-churn warning (#443, #435) (#446)
+  - fix(update): re-materialize managed systemd units on upgrade (#444/#426) (#445)
+
+
