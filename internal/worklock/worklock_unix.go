@@ -91,6 +91,55 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 	return &Lock{f: f, path: path}, nil
 }
 
+// IsHeld reports whether a live citadel worker currently holds the single-instance
+// lock for the node keyed to stateDir, WITHOUT acquiring, reclaiming, or otherwise
+// disturbing it. It is the read-only counterpart to Acquire, used by the control
+// center to detect a running `citadel work` before deciding whether to run its own
+// embedded job worker (issue: control-center competes for per-node-stream jobs).
+//
+// Detection mirrors Acquire's refuse-vs-reclaim logic but never mutates the lock:
+//   - A non-blocking exclusive flock probe on a SEPARATE fd tests contention. The
+//     probe fd is unlocked and closed immediately, so a successful probe never
+//     leaves the caller holding the lock (it is not the persistent worker lock).
+//   - If the probe is contended (EWOULDBLOCK) AND the recorded holder PID is a live
+//     citadel process, the lock is reported held with that PID.
+//   - A missing file, unparseable record, dead holder, or PID reused by an
+//     unrelated program reports NOT held (holderPID 0) — the same conditions under
+//     which Acquire would reclaim rather than refuse.
+//
+// A false "not held" only degrades to the pre-fix behavior (the control center may
+// run its own worker); it never steals or breaks the real worker's lock.
+func IsHeld(stateDir string) (held bool, holderPID int) {
+	path := LockPathForStateDir(stateDir)
+
+	f, err := os.OpenFile(path, os.O_RDONLY, 0o600)
+	if err != nil {
+		// No lock file (or unreadable): no worker holds it.
+		return false, 0
+	}
+	defer func() { _ = f.Close() }()
+
+	rec := readRecord(f)
+
+	// Non-blocking exclusive probe. If it succeeds, no one holds the lock; unlock
+	// immediately so this transient probe is not mistaken for a real worker lock.
+	if lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return false, 0
+	} else if !errors.Is(lockErr, syscall.EWOULDBLOCK) {
+		// Unexpected flock error: fail open (report not held) so the control center
+		// stays functional rather than wedging on a probe error.
+		return false, 0
+	}
+
+	// Contended. Only a live citadel process counts as a real holder; a dead or
+	// reused PID reports not held (Acquire would reclaim it).
+	if rec.PID > 0 && processAlive(rec.PID) && processIsCitadel(rec.PID) {
+		return true, rec.PID
+	}
+	return false, 0
+}
+
 // startTime converts a record's start timestamp to a time.Time, or the zero value
 // when unknown (e.g. a legacy bare-PID lock file with no timestamp).
 func startTime(rec lockRecord) time.Time {

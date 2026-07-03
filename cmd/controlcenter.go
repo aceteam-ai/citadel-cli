@@ -39,6 +39,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -1647,6 +1649,28 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 
+	// Detect a dedicated `citadel work` worker already serving this node. If one
+	// holds the single-instance lock (issues #443/#435/#455), the control center
+	// MUST NOT compete for this node's jobs: two consumers in the same consumer
+	// group split the per-node stream non-deterministically, so node-targeted
+	// privileged jobs (WHATSAPP_PROVISION, AGENT_UPDATE) were randomly grabbed by
+	// the control-center worker and failed with "no handler" even though the real
+	// worker's binary handles them (the competing-consumer incident). When a worker
+	// is present the control center stays a read-only monitor (heartbeat/telemetry
+	// only) and lets the real worker own all job consumption.
+	//
+	// Detection is a one-shot at TUI-worker startup: the systemd worker is normally
+	// already running before the TUI opens. If a worker starts or stops later the
+	// mode is not re-evaluated until the TUI worker restarts, but that residual is
+	// benign — the "no handler" hazard is removed unconditionally by the shared
+	// handler set below (both modes register WHATSAPP_PROVISION / AGENT_UPDATE), so a
+	// transient double-consumer only reproduces the pre-existing split, never a job
+	// failure. A worker that later dies is systemd-restarted (re-taking the lock).
+	workerHeld, workerPID := worklock.IsHeld(network.GetStateDir())
+	if workerHeld {
+		activity("info", fmt.Sprintf("Dedicated worker detected (PID %d); control center runs in monitor-only mode (no job consumption)", workerPID))
+	}
+
 	// Determine job source mode
 	var source worker.JobSource
 	var streamFactory func(job *worker.Job) worker.StreamWriter
@@ -1713,7 +1737,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			headscaleNodeID = id
 		}
 	}
-	if headscaleNodeID != "" {
+	// Only subscribe to the per-node stream when NO dedicated worker holds the lock.
+	// If a worker is present it owns the per-node stream; a second subscriber here
+	// would re-introduce the competing-consumer split.
+	if workerHeld {
+		activity("info", "Per-node stream owned by the dedicated worker; control center does not subscribe")
+	} else if headscaleNodeID != "" {
 		perNodeOrgID := ""
 		if deviceConfig != nil {
 			perNodeOrgID = deviceConfig.OrgID
@@ -1827,21 +1856,50 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 
+	// If a dedicated worker holds the lock, the control center does NOT run a
+	// job-consuming runner (that is the whole point of the fix). Heartbeat and
+	// telemetry are already wired above; block here in monitor-only mode until the
+	// TUI context is cancelled, letting the real worker own all job consumption.
+	if workerHeld {
+		activity("success", "Monitor mode active (dedicated worker owns jobs)")
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	// No dedicated worker on this node: the control center IS the only worker, so it
+	// must handle the FULL node-job set (legacy + workflow + AGENT_UPDATE +
+	// WHATSAPP_PROVISION), not a subset. Build handlers via the shared helper so the
+	// registered set matches `citadel work` exactly and WHATSAPP_PROVISION /
+	// AGENT_UPDATE never fail with "no handler" in a control-center-only run.
+
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])
 
 	// Create handlers with activity callback to route job output through TUI.
 	wsDir := resolveWorkspaceDir()
 	ccPerms := config.LoadPermissions(platform.ConfigDir())
-	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
-		LogFn:         activity,
-		WorkspaceDir:  wsDir,
-		ShellDisabled: !ccPerms.Shell,
+
+	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
+	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
 	})
+
+	_, ccConfigDir, _ := findAndReadManifest()
+	nodeJobOpts := nodeJobHandlerOpts{
+		LogFn:                     activity,
+		WorkspaceDir:              wsDir,
+		ConfigDir:                 ccConfigDir,
+		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
+		ShellDisabled:             !ccPerms.Shell,
+		WorkflowExec:              ccWfExec,
+		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
+	}
+	handlers := buildNodeJobHandlers(nodeJobOpts)
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
 		WorkerID:     workerID,
+		NodeID:       headscaleNodeID,
 		AgentVersion: Version,
 		Verbose:      false,
 		ActivityFn:   activity, // Route logs through TUI
@@ -1855,6 +1913,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	if streamFactory != nil {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
+
+	// Register the node-targeted privileged handlers (AGENT_UPDATE, WHATSAPP_PROVISION)
+	// on the live runner, shared with runWork. This closes the "no handler" hazard for
+	// a control-center-only node.
+	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
 
 	activity("success", "Worker started, listening for jobs...")
 

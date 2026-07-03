@@ -42,7 +42,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
-	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
@@ -1696,15 +1695,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create handlers with optional workspace for file-operation jobs.
+	// Create handlers with optional workspace for file-operation jobs. The node-job
+	// handler set (legacy + workflow, plus the privileged AGENT_UPDATE /
+	// WHATSAPP_PROVISION registered on the runner below) is built via the shared
+	// helper so the control-center TUI registers the exact same set when it is the
+	// only worker on the node.
 	workPerms := config.LoadPermissions(platform.ConfigDir())
-	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+	nodeJobOpts := nodeJobHandlerOpts{
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
-	})
-	handlers = append(handlers, workflow.NewHandler(wfExec))
+		WorkflowExec:              wfExec,
+		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
+	}
+	handlers := buildNodeJobHandlers(nodeJobOpts)
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
@@ -1756,38 +1761,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
-	// Register the AGENT_UPDATE job handler (issue aceteam#4427), which lets the
-	// control plane update this node's agent remotely — the fix for silent
-	// version skew (aceteam#4373). It is registered after the runner exists so it
-	// can borrow the runner's Drain/ActiveJobs for the "publish result, THEN
-	// restart" ordering, mirroring how the AutoUpdater is wired below. The handler
-	// self-restarts only when running as a managed service (CITADEL_SERVICE=true);
-	// in a foreground run it reports "restart required" instead.
-	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
-		Version:    Version,
-		Drain:      func() { runner.Drain() },
-		ActiveJobs: runner.ActiveJobs,
-		Log: func(format string, args ...any) {
-			Log(format, args...)
-		},
-	}))
-
-	// Register the WHATSAPP_PROVISION job handler (aceteam#4454), which lets the
-	// WhatsApp MCP remote-provision the Baileys bridge on the user's OWN node
-	// (sovereign / BYO-infra). It reuses the exact `citadel whatsapp up`
-	// orchestration (whatsapp.Provision) wired with this node's real docker / git
-	// / mesh edges, and is gated to the per-node stream only (deploying a
-	// container + minting creds is privileged, mirroring AGENT_UPDATE).
-	runner.RegisterHandler(worker.NewWhatsAppProvisionHandler(worker.WhatsAppProvisionConfig{
-		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
-			// Default module source/image (the CLI flags are not in scope for a
-			// remote job; the payload only carries tenant/proxy/public_url).
-			return whatsapp.Provision(ctx, req, whatsappProvisionDeps(defaultWhatsAppSource, ""))
-		},
-		Log: func(format string, args ...any) {
-			Log(format, args...)
-		},
-	}))
+	// Register the node-targeted privileged job handlers (AGENT_UPDATE aceteam#4427,
+	// WHATSAPP_PROVISION aceteam#4454) on the live runner. They are registered after
+	// the runner exists so AGENT_UPDATE can borrow the runner's Drain/ActiveJobs for
+	// the "publish result, THEN restart" ordering (mirroring the AutoUpdater below).
+	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
+	// control-center-only node handles the same privileged set.
+	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
 
 	// Start the periodic auto-updater. The goroutine always runs; whether it
 	// actually checks/installs on a given tick is decided per-tick by
