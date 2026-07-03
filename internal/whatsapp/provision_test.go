@@ -311,3 +311,53 @@ func TestQRDataURL(t *testing.T) {
 		t.Errorf("decoded bytes are not a PNG (magic = %x)", raw[:min(8, len(raw))])
 	}
 }
+
+// TestProvisionPopulatesCertFields verifies the provision result carries the
+// gateway cert PEM + plaintext cert refresh URL from the injected deps (the
+// node half of the cert-publish contract, aceteam-ai/citadel-cli#448).
+func TestProvisionPopulatesCertFields(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{}, qr: "x"}
+	deps, _ := baseDeps(t, bridge)
+	deps.GatewayCertPEM = func() string { return "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n" }
+	deps.CertRefreshURL = func() string { return "http://100.64.0.7:8080/gateway-cert.pem" }
+
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if res.GatewayCertPEM != "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n" {
+		t.Errorf("GatewayCertPEM = %q, want the injected PEM", res.GatewayCertPEM)
+	}
+	if res.CertRefreshURL != "http://100.64.0.7:8080/gateway-cert.pem" {
+		t.Errorf("CertRefreshURL = %q, want the injected refresh URL", res.CertRefreshURL)
+	}
+}
+
+// TestProvisionCertFieldsEmptyOffMeshOrNoTLS verifies that when the cert deps
+// report no cert / off-mesh (empty strings) or are nil, the result fields stay
+// empty (older backends ignore them; omitempty on the wire keys).
+func TestProvisionCertFieldsEmptyOffMeshOrNoTLS(t *testing.T) {
+	// Case 1: deps present but return "" (gateway --gateway-no-tls / off-mesh).
+	bridge := &fakeBridge{health: &Health{}, qr: "x"}
+	deps, _ := baseDeps(t, bridge)
+	deps.GatewayCertPEM = func() string { return "" }
+	deps.CertRefreshURL = func() string { return "" }
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if res.GatewayCertPEM != "" || res.CertRefreshURL != "" {
+		t.Errorf("cert fields should be empty when deps return empty, got pem=%q url=%q", res.GatewayCertPEM, res.CertRefreshURL)
+	}
+
+	// Case 2: deps entirely absent (nil) -> fields remain empty, no panic.
+	bridge2 := &fakeBridge{health: &Health{}, qr: "x"}
+	deps2, _ := baseDeps(t, bridge2)
+	res2, err := Provision(context.Background(), ProvisionRequest{}, deps2)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if res2.GatewayCertPEM != "" || res2.CertRefreshURL != "" {
+		t.Errorf("cert fields should be empty when deps are nil, got pem=%q url=%q", res2.GatewayCertPEM, res2.CertRefreshURL)
+	}
+}

@@ -209,3 +209,57 @@ func TestWhatsAppProvisionCanHandle(t *testing.T) {
 		t.Error("CanHandle(AGENT_UPDATE) = true, want false")
 	}
 }
+
+// TestWhatsAppProvisionEmitsCertFields verifies the handler serializes the
+// gateway_cert_pem + cert_refresh_url keys when the provision result carries them
+// (the cert-publish contract, aceteam-ai/citadel-cli#448).
+func TestWhatsAppProvisionEmitsCertFields(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL:         "https://100.64.0.9:8443/modules/whatsapp",
+				APIKey:         "wab_key",
+				Tenant:         "default",
+				GatewayCertPEM: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n",
+				CertRefreshURL: "http://100.64.0.9:8080/gateway-cert.pem",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if doc["gateway_cert_pem"] != "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n" {
+		t.Errorf("gateway_cert_pem = %v, want the cert PEM", doc["gateway_cert_pem"])
+	}
+	if doc["cert_refresh_url"] != "http://100.64.0.9:8080/gateway-cert.pem" {
+		t.Errorf("cert_refresh_url = %v, want the refresh url", doc["cert_refresh_url"])
+	}
+}
+
+// TestWhatsAppProvisionOmitsEmptyCertFields verifies the two cert keys are
+// omitted entirely when the result carries no cert (off-mesh / --gateway-no-tls),
+// so older backends that never read them are unaffected.
+func TestWhatsAppProvisionOmitsEmptyCertFields(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "http://100.64.0.9:8080",
+				APIKey: "wab_key",
+				Tenant: "default",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if _, ok := doc["gateway_cert_pem"]; ok {
+		t.Errorf("gateway_cert_pem must be omitted when empty, got %v", doc["gateway_cert_pem"])
+	}
+	if _, ok := doc["cert_refresh_url"]; ok {
+		t.Errorf("cert_refresh_url must be omitted when empty, got %v", doc["cert_refresh_url"])
+	}
+}

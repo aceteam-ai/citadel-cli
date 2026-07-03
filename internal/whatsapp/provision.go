@@ -115,6 +115,18 @@ type ProvisionDeps struct {
 	// simulate an occupied port without touching the network stack.
 	SelectHostPort func(preferred, floor int) (int, error)
 
+	// GatewayCertPEM returns the current gateway self-signed leaf cert PEM the
+	// backend must trust to reach the https gateway-route api_url. It returns ""
+	// when the gateway runs without TLS or the cert is unavailable (the backend
+	// then uses plain http). Nil leaves ProvisionResult.GatewayCertPEM empty (so
+	// older wiring without this dep degrades gracefully to no-cert).
+	GatewayCertPEM func() string
+
+	// CertRefreshURL returns the plaintext URL the backend re-fetches the gateway
+	// cert from on rotation (http://<mesh-ip>:<status-port>/gateway-cert.pem), or
+	// "" when off-mesh / status port unknown. Nil leaves the field empty.
+	CertRefreshURL func() string
+
 	// ReadyTimeout bounds the WaitReady poll. Zero uses 90s.
 	ReadyTimeout time.Duration
 
@@ -141,6 +153,15 @@ type ProvisionResult struct {
 	// AlreadyLinked is true when the tenant already has a live WhatsApp session
 	// (no QR is needed).
 	AlreadyLinked bool
+	// GatewayCertPEM is the current gateway self-signed leaf cert PEM the backend
+	// must trust to reach APIURL (which is an https gateway route). Empty when the
+	// gateway runs without TLS (--gateway-no-tls) or the cert is unavailable, in
+	// which case the backend uses plain http. A public leaf cert, safe to serve.
+	GatewayCertPEM string
+	// CertRefreshURL is the plaintext URL the backend re-fetches the gateway cert
+	// from on rotation: http://<mesh-ip>:<status-port>/gateway-cert.pem. Empty when
+	// the node is off-mesh or the status server's port is unknown.
+	CertRefreshURL string
 }
 
 // Provision runs the full deploy -> mint -> wait -> fetch-QR flow and returns the
@@ -321,6 +342,16 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		APIKey: tenantKey,
 		Tenant: tenant,
 		Port:   port,
+	}
+	// Publish the gateway cert (so the backend can trust the https api_url) and the
+	// plaintext refresh URL (so it re-fetches on rotation). Both deps are optional:
+	// a nil dep leaves the corresponding field empty, which the backend treats as
+	// "no cert / use http" and "no refresh channel".
+	if deps.GatewayCertPEM != nil {
+		result.GatewayCertPEM = deps.GatewayCertPEM()
+	}
+	if deps.CertRefreshURL != nil {
+		result.CertRefreshURL = deps.CertRefreshURL()
 	}
 
 	// If the tenant is already linked, there is no QR to scan.

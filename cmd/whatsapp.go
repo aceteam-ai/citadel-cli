@@ -273,6 +273,10 @@ func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
 		MeshAPIURL:         whatsappMeshAPIURL,
 		ExposeGatewayRoute: exposeWhatsAppGatewayRoute,
 		VerifyReachable:    verifyBridgeReachable,
+		// Hand the backend the gateway cert to trust (the api_url is an https
+		// gateway route) plus the plaintext URL to re-fetch it from on rotation.
+		GatewayCertPEM: gatewayCertPEM,
+		CertRefreshURL: certRefreshURL,
 		Log: func(format string, args ...any) {
 			fmt.Printf("   - "+format+"\n", args...)
 		},

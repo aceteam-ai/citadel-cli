@@ -52,13 +52,17 @@ const DefaultGatewayPort = 8443
 // port + TLS posture + cert path instead of assuming 8443/https (landmine b).
 const gatewayFactsFileName = "gateway-facts.json"
 
-// gatewayFacts is the persisted {port, useTLS, certPath} the gateway serves.
-// certPath lets the reachability probe trust the gateway's own self-signed cert
-// (landmine a) rather than skipping verification.
+// gatewayFacts is the persisted {port, useTLS, certPath, statusPort} the gateway
+// serves. certPath lets the reachability probe trust the gateway's own
+// self-signed cert (landmine a) rather than skipping verification. statusPort is
+// the plaintext status server's port, used to build the cert_refresh_url the
+// backend re-fetches the gateway cert from on rotation (it is served
+// unauthenticated over the mesh by the status server, NOT the TLS gateway).
 type gatewayFacts struct {
-	Port     int    `json:"port"`
-	UseTLS   bool   `json:"use_tls"`
-	CertPath string `json:"cert_path"`
+	Port       int    `json:"port"`
+	UseTLS     bool   `json:"use_tls"`
+	CertPath   string `json:"cert_path"`
+	StatusPort int    `json:"status_port,omitempty"`
 }
 
 // provisionedStateDirOverride, when non-empty, replaces network.GetStateDir() as
@@ -130,10 +134,11 @@ func provisionedRegistry() *provisionedservice.Registry {
 // wiring) plus the facts needed to build the reachable mesh URL. It is set by
 // setProvisionedServiceGateway when runWork starts the in-process gateway.
 type provisionedGatewayRef struct {
-	gw       *gateway.Server
-	port     int    // the gateway's HTTPS/HTTP port (workGatewayPort)
-	useTLS   bool   // false only when --gateway-no-tls
-	certPath string // path to the gateway's self-signed cert (empty when no-TLS)
+	gw         *gateway.Server
+	port       int    // the gateway's HTTPS/HTTP port (workGatewayPort)
+	useTLS     bool   // false only when --gateway-no-tls
+	certPath   string // path to the gateway's self-signed cert (empty when no-TLS)
+	statusPort int    // the plaintext status server's port (cert_refresh_url source)
 }
 
 var (
@@ -144,14 +149,14 @@ var (
 // setProvisionedServiceGateway records the live gateway so provisioned-module
 // deps can wire routes and compute reachable mesh URLs. Called from runWork after
 // the gateway is created. Passing gw==nil clears it.
-func setProvisionedServiceGateway(gw *gateway.Server, port int, useTLS bool, certPath string) {
+func setProvisionedServiceGateway(gw *gateway.Server, port int, useTLS bool, certPath string, statusPort int) {
 	provisionedGatewayMu.Lock()
 	defer provisionedGatewayMu.Unlock()
 	if gw == nil {
 		provisionedGatewayCur = nil
 		return
 	}
-	provisionedGatewayCur = &provisionedGatewayRef{gw: gw, port: port, useTLS: useTLS, certPath: certPath}
+	provisionedGatewayCur = &provisionedGatewayRef{gw: gw, port: port, useTLS: useTLS, certPath: certPath, statusPort: statusPort}
 }
 
 // getProvisionedServiceGateway returns the current gateway ref, or nil.
@@ -168,7 +173,7 @@ func getProvisionedServiceGateway() *provisionedGatewayRef {
 // probe cannot verify and must skip).
 func gatewayFactsForURL() gatewayFacts {
 	if ref := getProvisionedServiceGateway(); ref != nil {
-		return gatewayFacts{Port: ref.port, UseTLS: ref.useTLS, CertPath: ref.certPath}
+		return gatewayFacts{Port: ref.port, UseTLS: ref.useTLS, CertPath: ref.certPath, StatusPort: ref.statusPort}
 	}
 	if f, ok := readGatewayFacts(); ok {
 		return f
@@ -206,6 +211,44 @@ func moduleMeshAPIURL(prefix string) string {
 // is kept to satisfy the MeshAPIURL(port) signature.
 func whatsappMeshAPIURL(_ int) string {
 	return moduleMeshAPIURL(whatsappGatewayPrefix)
+}
+
+// gatewayCertPEM reads the current gateway leaf cert PEM off disk (the same cert
+// the running `citadel work` gateway serves on the mesh) so the backend can trust
+// it out-of-band. It returns "" when the gateway runs --gateway-no-tls (no cert
+// on disk / CertPath unknown) or the cert cannot be read -- an empty value tells
+// the backend to fall back to plain http. The PEM is a PUBLIC leaf cert, safe to
+// hand out; it is regenerated in place whenever the mesh IP changes
+// (tlscert.sansMatch), so a read here always yields the current cert.
+func gatewayCertPEM() string {
+	f := gatewayFactsForURL()
+	if !f.UseTLS || f.CertPath == "" {
+		return ""
+	}
+	data, err := os.ReadFile(f.CertPath)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// certRefreshURL builds the plaintext refresh URL the backend re-fetches the
+// gateway cert from on rotation: http://<mesh-ip>:<status-port>/gateway-cert.pem.
+// It uses the SAME mesh IP as the module api_url and the persisted status port.
+// Returns "" when off-mesh or the status port is unknown (nothing to point at).
+// The refresh channel is deliberately the PLAINTEXT status server, not the TLS
+// gateway: the backend needs a bootstrap path that does not require already
+// trusting the cert it is fetching.
+func certRefreshURL() string {
+	ip := meshIPv4()
+	if ip == "" {
+		return ""
+	}
+	f := gatewayFactsForURL()
+	if f.StatusPort <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d/gateway-cert.pem", ip, f.StatusPort)
 }
 
 // meshIPv4 resolves this node's mesh IPv4, priming the network singleton the

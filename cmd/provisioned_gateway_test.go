@@ -54,7 +54,7 @@ func TestGatewayRouteURL(t *testing.T) {
 func TestGatewayFactsForURL_PersistedFile(t *testing.T) {
 	// Isolate the node state dir so we read/write a temp facts file.
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "") // no in-process gateway
+	setProvisionedServiceGateway(nil, 0, false, "", 0) // no in-process gateway
 
 	// Absent file -> compile-time fallback.
 	f := gatewayFactsForURL()
@@ -81,7 +81,7 @@ func TestGatewayFactsForURL_PersistedFile(t *testing.T) {
 // cert, with ServerName matching a SAN the test cert carries (127.0.0.1).
 func TestVerifyModuleReachable_TrustedCert(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -113,7 +113,7 @@ func TestVerifyModuleReachable_TrustedCert(t *testing.T) {
 // than the one the probe trusts fails verification (no false-green, landmine a).
 func TestVerifyModuleReachable_UntrustedCert(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -136,7 +136,7 @@ func TestVerifyModuleReachable_UntrustedCert(t *testing.T) {
 // gateway) still fail loud.
 func TestVerifyModuleReachable_502(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 	if err := writeGatewayFacts(gatewayFacts{Port: 8080, UseTLS: false}); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestVerifyModuleReachable_502(t *testing.T) {
 
 func TestVerifyModuleReachable_DialFail(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 	if err := writeGatewayFacts(gatewayFacts{Port: 8080, UseTLS: false}); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestVerifyModuleReachable_DialFail(t *testing.T) {
 // error rather than silently skip verification (the false-green we removed).
 func TestMeshVerifyingClient_TLSNoCertFailsLoud(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 	if err := writeGatewayFacts(gatewayFacts{Port: 8443, UseTLS: true, CertPath: ""}); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestMeshVerifyingClient_TLSNoCertFailsLoud(t *testing.T) {
 // (landmine c).
 func TestExposeModuleGatewayRoute_NoGatewayRecordsRegistry(t *testing.T) {
 	setProvisionedStateDir(t)
-	setProvisionedServiceGateway(nil, 0, false, "")
+	setProvisionedServiceGateway(nil, 0, false, "", 0)
 
 	if err := exposeModuleGatewayRoute("mymod", "mymod", "provision", 8137); err != nil {
 		t.Fatalf("exposeModuleGatewayRoute with no gateway = %v, want nil (soft no-op)", err)
