@@ -26,8 +26,8 @@ Deploy, start, and provision the WhatsApp bridge
 	Override the bridge container image (BRIDGE_IMAGE). Defaults to the image declared by the module source.
 
 .PP
-\fB--port\fP=8080
-	Host port to publish the bridge on.
+\fB--port\fP=0
+	Host port to publish the bridge on. Default 0 auto-selects a free port (8080 is held by the citadel agent on a live node). Pass a value to pin one.
 
 .PP
 \fB--proxy\fP=""

@@ -123,8 +123,16 @@ Examples:
 	Maximum retry attempts before DLQ
 
 .PP
+\fB--no-footprint\fP[=false]
+	Disable the background resource-footprint sampler
+
+.PP
 \fB--no-gateway\fP[=false]
 	Disable the HTTPS gateway
+
+.PP
+\fB--no-key-renew\fP[=false]
+	Disable the background Headscale node-key renewer (renews the key before expiry while online)
 
 .PP
 \fB--no-services\fP[=false]
