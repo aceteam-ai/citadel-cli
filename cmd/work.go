@@ -32,6 +32,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/service"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
@@ -388,6 +389,22 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Release the assertion synchronously on shutdown, before runWork returns,
 	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
 	defer keepAwakeMonitor.Stop()
+
+	// Re-materialize managed systemd unit files so unit-template changes in this
+	// binary (e.g. the #444 crash-restart-storm hardening) reach nodes deployed
+	// by an older binary. The primary upgrade path (auto-update re-exec) swaps
+	// the binary in place and never re-runs install.sh, so the on-disk unit would
+	// otherwise keep the old 10s-restart-storm policy forever. This is the unit
+	// analogue of the compose refresh below (#426). Idempotent: a unit already
+	// carrying the hardening is left untouched with no daemon-reload churn. We do
+	// NOT restart the worker here -- the new policy applies on the next restart.
+	if rewritten, err := service.RematerializeManagedUnits(func(format string, args ...any) {
+		Log(format, args...)
+	}); err != nil {
+		Log("unit-refresh: sweep error: %v", err)
+	} else if len(rewritten) > 0 {
+		Log("unit-refresh: refreshed managed units: %s", strings.Join(rewritten, ", "))
+	}
 
 	// Refresh citadel-owned embedded compose files from the binary's templates
 	// when the version changed since this node last materialized them (#426).
