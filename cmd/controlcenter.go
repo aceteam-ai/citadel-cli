@@ -346,9 +346,15 @@ func runControlCenter() {
 							cc.AddActivity("success", "VPN reconnected (IP preserved)")
 							networkConnected = true
 						} else {
-							// Clear state and connect fresh (new IP)
-							_ = network.ClearState()
+							// Clear state and connect fresh (new IP) — IDENTITY-CHURN
+							// path. Warn loudly (same reasoning as recoverStaleVPN): the
+							// persisted identity could not be re-authorized, so the node
+							// re-registers with a new id/IP/device key. Root cause is
+							// usually ephemeral registration; durable fix is #4584/#4583.
 							hostname, _ := os.Hostname()
+							warnIdentityChurn(hostname)
+							cc.AddActivity("warning", "Node identity reset (new id/IP); re-run 'citadel init' to stop churn")
+							_ = network.ClearState()
 							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
 							config := network.ServerConfig{
 								Hostname:   hostname,
