@@ -99,6 +99,10 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 		Tenant:    payloadString(job.Payload, "tenant"),
 		Proxy:     payloadString(job.Payload, "proxy"),
 		PublicURL: payloadString(job.Payload, "public_url"),
+		// Optional explicit host-port override. When absent/0, Provision
+		// auto-selects a free host port so the bridge does not collide with
+		// citadel's own 8080 listener (aceteam-ai/citadel-cli#438).
+		Port: payloadInt(job.Payload, "port"),
 	}
 	if req.Tenant == "" {
 		req.Tenant = "default"
