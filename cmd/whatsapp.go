@@ -118,7 +118,9 @@ func init() {
 
 	whatsappUpCmd.Flags().StringVar(&waAPIKeyFlag, "api-key", "",
 		"Admin secret (ADMIN_API_KEY) for the bridge control plane. A strong one is generated if omitted.")
-	whatsappUpCmd.Flags().IntVar(&waPortFlag, "port", whatsapp.DefaultPort, "Host port to publish the bridge on.")
+	whatsappUpCmd.Flags().IntVar(&waPortFlag, "port", 0,
+		"Host port to publish the bridge on. Default 0 auto-selects a free port "+
+			"(8080 is held by the citadel agent on a live node). Pass a value to pin one.")
 	whatsappUpCmd.Flags().StringVar(&waProxyFlag, "proxy", "",
 		"Optional egress proxy for the tenant (socks5:// or http(s)://).")
 	whatsappUpCmd.Flags().StringVar(&waTenantFlag, "tenant", "default", "Tenant name (label only).")
@@ -282,7 +284,11 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	// would make those commands fail. The bridge has its own lifecycle via
 	// `citadel whatsapp up/down`; status discovery uses the compose-file
 	// presence + container state, not the manifest.
-	fmt.Printf("--- 🚀 Provisioning WhatsApp bridge on port %d ---\n", waPortFlag)
+	if waPortFlag > 0 {
+		fmt.Printf("--- 🚀 Provisioning WhatsApp bridge on port %d ---\n", waPortFlag)
+	} else {
+		fmt.Println("--- 🚀 Provisioning WhatsApp bridge (auto-selecting a free host port) ---")
+	}
 
 	deps := whatsappProvisionDeps(waSourceFlag, waImageFlag)
 	// The CLI also honors an explicit --api-key admin override. Provision reads
@@ -306,8 +312,9 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Show the connect details + pairing QR.
-	printConnectDetails(waPortFlag, res.APIKey)
+	// Show the connect details + pairing QR. Use the port Provision actually
+	// published on (res.Port) -- with auto-selection waPortFlag is 0.
+	printConnectDetails(res.Port, res.APIKey)
 	fmt.Println()
 	if res.AlreadyLinked {
 		fmt.Println("✅ This tenant is already linked to WhatsApp -- no QR needed.")
@@ -580,7 +587,7 @@ func buildWhatsAppCallbacks() controlcenter.WhatsAppCallbacks {
 			// Reset deploy flags to their declared defaults so a TUI-driven
 			// deploy is deterministic regardless of any prior CLI invocation.
 			waAPIKeyFlag = ""
-			waPortFlag = whatsapp.DefaultPort
+			waPortFlag = 0 // auto-select a free host port (issue #438)
 			waProxyFlag = ""
 			waTenantFlag = "default"
 			waPublicURLFlag = ""

@@ -83,12 +83,35 @@ func TestWhatsAppProvisionParsesPayload(t *testing.T) {
 			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: req.Tenant, AlreadyLinked: true}, nil
 		},
 	})
-	payload := map[string]any{"tenant": "sales", "proxy": "socks5://p", "public_url": "https://pub"}
+	// "port" arrives as a JSON number (float64) and must coerce to the int
+	// override. When absent it stays 0 so Provision auto-selects (issue #438).
+	payload := map[string]any{"tenant": "sales", "proxy": "socks5://p", "public_url": "https://pub", "port": float64(8091)}
 	if _, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, payload), &NoOpStreamWriter{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotReq.Tenant != "sales" || gotReq.Proxy != "socks5://p" || gotReq.PublicURL != "https://pub" {
 		t.Errorf("payload not parsed into request: %+v", gotReq)
+	}
+	if gotReq.Port != 8091 {
+		t.Errorf("port not parsed into request: got %d, want 8091", gotReq.Port)
+	}
+}
+
+func TestWhatsAppProvisionDefaultsPortToAuto(t *testing.T) {
+	var gotReq whatsapp.ProvisionRequest
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			gotReq = req
+			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: "default"}, nil
+		},
+	})
+	// No "port" in the payload -> Port stays 0 so Provision auto-selects a free
+	// host port rather than colliding on 8080.
+	if _, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotReq.Port != 0 {
+		t.Errorf("Port = %d, want 0 (auto-select) when payload omits port", gotReq.Port)
 	}
 }
 

@@ -37,12 +37,16 @@ var _ BridgeClient = (*Client)(nil)
 
 // ProvisionRequest carries the caller-supplied knobs. All fields are optional;
 // zero values fall back to sensible defaults (Tenant -> "default",
-// Port -> DefaultPort).
+// Port -> auto-selected free host port).
 type ProvisionRequest struct {
 	Tenant    string // tenant label (default "default")
 	Proxy     string // optional per-tenant egress proxy
 	PublicURL string // optional public base URL for copy-pasteable QR links
-	Port      int    // host port to publish the bridge on (default DefaultPort)
+	// Port is the host port to publish the bridge on. When <= 0 (the common
+	// case), Provision auto-selects a FREE host port so it does not collide with
+	// citadel's own 8080 listener (aceteam-ai/citadel-cli#438). A positive value
+	// is an explicit operator override and is honored verbatim.
+	Port int
 }
 
 // ProvisionDeps injects the effectful, environment-specific edges so the core
@@ -74,6 +78,16 @@ type ProvisionDeps struct {
 	// Defaults to GenerateAdminKey.
 	GenerateAdminKey func() (string, error)
 
+	// SelectHostPort chooses the host port the bridge publishes on when the
+	// request does not pin one (ProvisionRequest.Port <= 0). It must return a
+	// port that can actually be bound on the host, so the bridge does not collide
+	// with citadel's own 8080 listener (aceteam-ai/citadel-cli#438). preferred is
+	// the explicit override (honored verbatim when > 0); floor is the minimum port
+	// to scan from, used so a bind-collision retry resumes above the failed port.
+	// Nil defaults to SelectHostPort (a live bind probe). Injectable so tests can
+	// simulate an occupied port without touching the network stack.
+	SelectHostPort func(preferred, floor int) (int, error)
+
 	// ReadyTimeout bounds the WaitReady poll. Zero uses 90s.
 	ReadyTimeout time.Duration
 
@@ -92,6 +106,11 @@ type ProvisionResult struct {
 	QR string
 	// Tenant is the tenant label.
 	Tenant string
+	// Port is the host port the bridge was published on. It is the auto-selected
+	// free port (or the explicit ProvisionRequest.Port override) and is the port
+	// embedded in APIURL, so callers that print connect details use the real
+	// port rather than assuming DefaultPort.
+	Port int
 	// AlreadyLinked is true when the tenant already has a live WhatsApp session
 	// (no QR is needed).
 	AlreadyLinked bool
@@ -119,20 +138,29 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	if tenant == "" {
 		tenant = "default"
 	}
-	port := req.Port
-	if port <= 0 {
-		port = DefaultPort
+	// Choose the host port. An explicit ProvisionRequest.Port is honored verbatim
+	// (operator override); otherwise auto-select a FREE host port so the bridge
+	// does not collide with citadel's own 8080 listener, which holds DefaultPort
+	// on every node running the agent (aceteam-ai/citadel-cli#438).
+	selectPort := deps.SelectHostPort
+	if selectPort == nil {
+		selectPort = func(preferred, floor int) (int, error) { return SelectHostPort(preferred, floor, nil) }
 	}
+	port, err := selectPort(req.Port, 0)
+	if err != nil {
+		return nil, fmt.Errorf("select bridge host port: %w", err)
+	}
+
 	readyTimeout := deps.ReadyTimeout
 	if readyTimeout <= 0 {
 		readyTimeout = 90 * time.Second
 	}
 
-	// Resolve the mesh api_url FIRST: the whole point of remote provisioning is
-	// to hand the shared backend a reachable address. An off-mesh node can't
-	// satisfy that contract, so fail before deploying anything.
-	apiURL := deps.MeshAPIURL(port)
-	if apiURL == "" {
+	// Resolve the mesh api_url FIRST (before deploying): the whole point of remote
+	// provisioning is to hand the shared backend a reachable address. An off-mesh
+	// node can't satisfy that contract. The port may still change below if a
+	// bind-collision retry picks a new one, so apiURL is recomputed after deploy.
+	if deps.MeshAPIURL(port) == "" {
 		return nil, fmt.Errorf("node is not connected to the AceTeam mesh network; cannot determine a reachable api_url (run `citadel login` / bring the node online first)")
 	}
 
@@ -155,7 +183,6 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		log("generated a new admin secret for the bridge control plane")
 	}
 	env["ADMIN_API_KEY"] = adminKey
-	env["BRIDGE_PORT"] = fmt.Sprintf("%d", port)
 	if req.Proxy != "" {
 		env["DEFAULT_PROXY_URL"] = req.Proxy
 	}
@@ -166,9 +193,41 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	// Deploy + start the stack. DeployCompose owns source resolution (git clone
 	// of the private module repo) and `docker compose up`; it must surface a
 	// clear error (not hang) when Docker or the repo credentials are missing.
-	log("deploying WhatsApp bridge on port %d", port)
-	if err := deps.DeployCompose(servicesDir, env); err != nil {
-		return nil, err
+	//
+	// SelectHostPort only *probed* the port; between probe and `compose up`
+	// another process can grab it (TOCTOU). When the port was auto-selected we
+	// treat a bind-collision as recoverable: re-select a fresh free port and
+	// retry a bounded number of times. An explicit operator override is never
+	// silently moved -- its bind error surfaces as-is.
+	const maxDeployAttempts = 4
+	autoSelected := req.Port <= 0
+	for attempt := 1; ; attempt++ {
+		env["BRIDGE_PORT"] = fmt.Sprintf("%d", port)
+		log("deploying WhatsApp bridge on port %d", port)
+		derr := deps.DeployCompose(servicesDir, env)
+		if derr == nil {
+			break
+		}
+		if !autoSelected || attempt >= maxDeployAttempts || !isHostPortCollision(derr) {
+			return nil, derr
+		}
+		// The just-tried port is now known-occupied; re-select from the next
+		// candidate above it (floor = port+1) so we don't immediately re-pick it.
+		log("port %d was taken between probe and bind; selecting another (%v)", port, derr)
+		next, serr := selectPort(0, port+1)
+		if serr != nil {
+			return nil, fmt.Errorf("retry after host-port collision on %d: %w", port, serr)
+		}
+		port = next
+	}
+
+	// Recompute the mesh api_url from the port we actually published on (a
+	// bind-collision retry may have moved it). The pre-deploy check above already
+	// proved the node is on the mesh; a now-empty result would be a transient
+	// network blip, so fall back to the same reachable IP with the final port.
+	apiURL := deps.MeshAPIURL(port)
+	if apiURL == "" {
+		return nil, fmt.Errorf("node left the AceTeam mesh network during provisioning; cannot determine a reachable api_url")
 	}
 
 	client := deps.NewBridgeClient(port, adminKey)
@@ -209,6 +268,7 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		APIURL: apiURL,
 		APIKey: tenantKey,
 		Tenant: tenant,
+		Port:   port,
 	}
 
 	// If the tenant is already linked, there is no QR to scan.
