@@ -42,6 +42,22 @@ import (
 // deployed here via the generic module-source mechanism (catalog.ResolveSource).
 const defaultWhatsAppSource = "sunapi386/whatsapp-bridge"
 
+// WhatsApp's gateway-exposure defaults. The WhatsApp bridge manifest lives in the
+// sunapi386/whatsapp-bridge repo (not editable here); once it declares a
+// gateway: block (prefix/port_env/capability) the registry-driven path uses that
+// verbatim. Until then -- and to keep existing deployments working across upgrade
+// -- citadel defaults WhatsApp to these values, which match the required manifest
+// block documented in the PR:
+//
+//	gateway:
+//	  prefix: whatsapp
+//	  port_env: BRIDGE_PORT
+//	  capability: provision
+const (
+	whatsappGatewayPrefix     = "whatsapp"
+	whatsappGatewayCapability = "provision"
+)
+
 // deployTimeout bounds the whole deploy edge (resolve module source via git clone
 // + `docker compose up`). Both underlying steps shell out to git/docker without
 // their own deadline, so an unreachable private repo or image registry could
@@ -518,12 +534,13 @@ func printConnectDetails(port int, apiKey string) {
 
 	apiURL := whatsappMeshAPIURL(port)
 	if apiURL == "" {
-		gwPort, useTLS := gatewayPortAndTLS()
+		gf := gatewayFactsForURL()
+		gwPort := gf.Port
 		scheme := "https"
-		if !useTLS {
+		if !gf.UseTLS {
 			scheme = "http"
 		}
-		apiURL = fmt.Sprintf("%s://<this-node-network-ip>:%d%s", scheme, gwPort, gateway.WhatsAppRoutePrefix)
+		apiURL = fmt.Sprintf("%s://<this-node-network-ip>:%d%s", scheme, gwPort, gateway.ModuleRoutePath(whatsappGatewayPrefix))
 		fmt.Println(color.YellowString("  (node is not connected to the AceTeam Network -- substitute its mesh IP below)"))
 	}
 	fmt.Printf("  api_url:  %s\n", color.CyanString(apiURL))
