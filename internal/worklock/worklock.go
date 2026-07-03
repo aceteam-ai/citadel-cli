@@ -27,8 +27,12 @@
 package worklock
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // LockFileName is the name of the lock file placed inside the node config dir.
@@ -60,18 +64,25 @@ const (
 )
 
 // decideStaleLock is the pure classifier for a pre-existing lock file. It never
-// touches the OS: callers pass the recorded holder PID, this process's PID, and
-// whether the holder is alive. Kept pure so the reclaim-vs-refuse policy is unit
-// tested without spawning processes.
+// touches the OS: callers pass the recorded holder PID, this process's PID,
+// whether the holder is alive, and whether the live holder is actually a citadel
+// process. Kept pure so the reclaim-vs-refuse policy is unit tested without
+// spawning processes.
 //
 //   - holderPID <= 0 (unreadable/empty lock file): reclaim — a garbage lock file
 //     must never permanently block a worker.
-//   - holderPID == selfPID: reclaim — our own stale record (e.g. same PID reused
-//     across a fast restart within this process's lifetime is not possible, but a
-//     re-run recording our PID is safe to overwrite).
+//   - holderPID == selfPID: reclaim — our own stale record is safe to overwrite.
 //   - holderAlive == false: reclaim — the recorded process is gone.
-//   - otherwise: refuse — a live process holds the node.
-func decideStaleLock(holderPID, selfPID int, holderAlive bool) staleLockAction {
+//   - holderAlive but holderIsCitadel == false: reclaim — the recorded PID was
+//     reused by an unrelated process (e.g. after a reboot the PID counter wrapped
+//     onto some other program). A reused PID must never be mistaken for a live
+//     worker and permanently wedge startup.
+//   - otherwise: refuse — a live citadel process holds the node.
+//
+// holderIsCitadel is only consulted when holderAlive is true; callers pass a
+// best-effort value (true on platforms where the cmdline cannot be inspected, so
+// the guard fails closed and still refuses).
+func decideStaleLock(holderPID, selfPID int, holderAlive, holderIsCitadel bool) staleLockAction {
 	if holderPID <= 0 {
 		return actionReclaim
 	}
@@ -81,21 +92,74 @@ func decideStaleLock(holderPID, selfPID int, holderAlive bool) staleLockAction {
 	if !holderAlive {
 		return actionReclaim
 	}
+	if !holderIsCitadel {
+		return actionReclaim
+	}
 	return actionRefuse
 }
 
+// lockRecord is the JSON payload written into the lock file. It carries enough
+// context to (a) print an actionable refusal naming the holder and when it
+// started, and (b) detect a reused PID (a rebooted box whose PID counter wrapped
+// onto some other process) by cross-checking liveness + cmdline at read time.
+type lockRecord struct {
+	PID       int    `json:"pid"`
+	StartUnix int64  `json:"start_unix"`
+	Version   string `json:"version,omitempty"`
+}
+
+// encodeRecord serializes a lock record to the bytes written into the lock file.
+func encodeRecord(rec lockRecord) []byte {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		// Marshalling a fixed struct of scalars cannot realistically fail; fall
+		// back to a bare PID line so the file is at least human-readable.
+		return []byte(strconv.Itoa(rec.PID) + "\n")
+	}
+	return append(b, '\n')
+}
+
+// decodeRecord parses lock file bytes. It accepts both the JSON record format and
+// a legacy bare-PID line (older workers wrote only the PID), so an in-place
+// upgrade never misreads a lock file written by a prior version.
+func decodeRecord(data []byte) lockRecord {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return lockRecord{}
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		var rec lockRecord
+		if err := json.Unmarshal([]byte(trimmed), &rec); err == nil {
+			return rec
+		}
+		return lockRecord{}
+	}
+	// Legacy bare-PID format.
+	if pid, err := strconv.Atoi(trimmed); err == nil && pid > 0 {
+		return lockRecord{PID: pid}
+	}
+	return lockRecord{}
+}
+
 // ErrAlreadyRunning is returned by Acquire when another live worker holds the
-// lock for the same node. It carries the holder PID for a clear operator message.
+// lock for the same node. It carries the holder PID and start time for a clear,
+// actionable operator message.
 type ErrAlreadyRunning struct {
 	// PID is the recorded holder PID, or 0 if it could not be read.
 	PID int
+	// StartTime is the recorded holder start time, or the zero value if unknown.
+	StartTime time.Time
 	// Path is the lock file path, for diagnostics.
 	Path string
 }
 
 func (e *ErrAlreadyRunning) Error() string {
 	if e.PID > 0 {
-		return fmt.Sprintf("another citadel worker is already running for this node (PID %d, lock %s)", e.PID, e.Path)
+		started := "unknown time"
+		if !e.StartTime.IsZero() {
+			started = e.StartTime.Format(time.RFC3339)
+		}
+		return fmt.Sprintf("citadel worker already running (PID %d, started %s); refusing to start a second instance", e.PID, started)
 	}
-	return fmt.Sprintf("another citadel worker is already running for this node (lock %s)", e.Path)
+	return "citadel worker already running; refusing to start a second instance"
 }

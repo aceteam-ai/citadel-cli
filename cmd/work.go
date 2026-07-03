@@ -308,7 +308,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// worker never blocks its own restart. Skipped with --no-single-instance for
 	// intentional side-by-side runs (e.g. a second debug-redis worker in dev).
 	if !workNoSingleInstance {
-		lock, lockErr := worklock.Acquire(network.GetStateDir(), Log)
+		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
 			if errors.As(lockErr, &running) {
