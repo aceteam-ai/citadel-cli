@@ -69,10 +69,37 @@ type ProvisionDeps struct {
 	NewBridgeClient func(port int, adminKey string) BridgeClient
 
 	// MeshAPIURL returns the api_url the shared backend must use to reach this
-	// bridge: the node's mesh (Headscale) IP and the published port. It returns
-	// "" when the node is not connected to the mesh, which Provision treats as a
+	// bridge over the mesh. It MUST return an actually-reachable URL -- the
+	// gateway route form (https://<node-vpn-ip>:<gateway-port>/whatsapp), NOT a
+	// raw http://<vpn-ip>:<bridge-port> that nothing on the tsnet stack listens
+	// on. Only the status/terminal/gateway servers bind a tsnet listener on the
+	// node VPN IP; a provisioned bridge on an auto-selected host port is reached
+	// only through the gateway route (aceteam-ai/citadel-cli#447).
+	//
+	// The port argument is the bridge's host port; the returned URL is the
+	// gateway route (independent of that port -- the gateway strips the prefix
+	// and forwards to the bridge port set via ExposeGatewayRoute). It returns ""
+	// when the node is not connected to the mesh, which Provision treats as a
 	// hard error (the backend cannot reach a loopback address).
 	MeshAPIURL func(port int) string
+
+	// ExposeGatewayRoute points the gateway's provisioned-service route at the
+	// bridge's loopback host port so the mesh URL returned by MeshAPIURL is
+	// actually reachable. It is the side effect that makes the bridge reachable
+	// on the tsnet mesh (the gateway already binds a tsnet listener on the node
+	// VPN IP; this just wires the /whatsapp route to 127.0.0.1:<bridgePort>).
+	// Nil means "no gateway to register with" -- Provision then relies purely on
+	// VerifyReachable to catch an unreachable bridge (fail loud, not false-green).
+	ExposeGatewayRoute func(bridgePort int) error
+
+	// VerifyReachable confirms the backend-facing api_url is actually reachable
+	// from the node's own mesh identity (e.g. GET the bridge root through the
+	// gateway route). Provision calls it after deploy + route-exposure and BEFORE
+	// computing already_linked / returning success, so an unexposed or wedged
+	// bridge fails loud with an actionable error instead of a structural
+	// false-green (aceteam-ai/citadel-cli#447). Nil skips the check (used by unit
+	// tests that stub the whole flow); real wiring always provides it.
+	VerifyReachable func(ctx context.Context, apiURL string) error
 
 	// GenerateAdminKey mints a fresh admin secret when none is stored yet.
 	// Defaults to GenerateAdminKey.
@@ -230,12 +257,37 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		return nil, fmt.Errorf("node left the AceTeam mesh network during provisioning; cannot determine a reachable api_url")
 	}
 
+	// Expose the bridge on the tsnet-reachable surface: point the gateway's
+	// provisioned-service route at the bridge's loopback host port. Without this
+	// the api_url above resolves to the gateway's VPN listener but the route has
+	// no upstream, so the backend gets a 502 -- the exact "bridge unreachable"
+	// this fixes (aceteam-ai/citadel-cli#447). A registration failure is fatal:
+	// returning success with an unreachable api_url is the false-green we are
+	// eliminating.
+	if deps.ExposeGatewayRoute != nil {
+		if err := deps.ExposeGatewayRoute(port); err != nil {
+			return nil, fmt.Errorf("expose bridge on the mesh gateway: %w", err)
+		}
+	}
+
 	client := deps.NewBridgeClient(port, adminKey)
 	log("waiting for the bridge to become ready")
 	waitCtx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
 	if err := client.WaitReady(waitCtx, readyTimeout); err != nil {
 		return nil, fmt.Errorf("bridge did not become ready: %w (check `docker compose -p %s logs %s`)", err, ProjectName(servicesDir), BridgeService)
+	}
+
+	// Verify the backend-facing api_url is actually reachable from the node's own
+	// mesh identity BEFORE returning success or computing already_linked. The
+	// loopback bridge being up (WaitReady, above) does NOT prove the mesh path
+	// works: the gateway route or the tsnet listener could be missing. This is
+	// the check that turns the old structural false-green (report success on an
+	// unreachable bridge) into a loud, actionable failure (#447).
+	if deps.VerifyReachable != nil {
+		if err := deps.VerifyReachable(waitCtx, apiURL); err != nil {
+			return nil, fmt.Errorf("bridge is up locally but its mesh api_url %s is NOT reachable: %w -- the backend would not be able to reach it. Ensure `citadel work` is running with the gateway enabled (it exposes provisioned services on the mesh)", apiURL, err)
+		}
 	}
 
 	// Mint (or reuse) the tenant. Reusing a previously minted tenant preserves an

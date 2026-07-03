@@ -31,6 +31,16 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
+// WhatsAppRoutePrefix is the gateway path prefix under which the provisioned
+// WhatsApp bridge is exposed on the mesh. The backend reaches the bridge at
+// https://<node-vpn-ip>:<gateway-port><WhatsAppRoutePrefix> and the gateway
+// strips the prefix before forwarding to the bridge's loopback port, so the
+// bridge's own paths (/health, /qr.txt, /admin/tenants, ...) map through
+// unchanged. This is the first consumer of the generic provisioned-service
+// exposure; new provisioned services follow the same pattern with their own
+// prefix.
+const WhatsAppRoutePrefix = "/whatsapp"
+
 // Config holds configuration for the gateway server.
 type Config struct {
 	// Port is the HTTPS port to listen on (default: 8443).
@@ -54,6 +64,15 @@ type Config struct {
 // Upstream describes a backend service to proxy to.
 type Upstream struct {
 	// Address is the backend address (e.g., "127.0.0.1:8080").
+	//
+	// For most upstreams the address is fixed at registration time. For a
+	// dynamically-provisioned service (e.g. the WhatsApp bridge, which binds an
+	// auto-selected free host port AFTER the gateway has already started), the
+	// address is not known when the route is registered. Such a route is
+	// registered up front with an empty Address and its target is set later via
+	// Server.SetUpstreamAddress; reads go through addr() so a live proxy always
+	// forwards to the current target. Direct field reads are avoided in the proxy
+	// hot path for exactly that reason.
 	Address string
 
 	// StripPrefix removes the matched prefix before forwarding.
@@ -63,6 +82,30 @@ type Upstream struct {
 
 	// WebSocket indicates this upstream handles WebSocket connections.
 	WebSocket bool
+
+	// mu guards dynAddr for upstreams whose target is set after registration.
+	mu sync.RWMutex
+	// dynAddr, when non-empty, overrides Address. It is set via
+	// Server.SetUpstreamAddress for dynamically-provisioned upstreams.
+	dynAddr string
+}
+
+// addr returns the current backend address, preferring a dynamically-set
+// address over the static one. Safe for concurrent use.
+func (u *Upstream) addr() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if u.dynAddr != "" {
+		return u.dynAddr
+	}
+	return u.Address
+}
+
+// setAddr updates the dynamic backend address. Safe for concurrent use.
+func (u *Upstream) setAddr(a string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.dynAddr = a
 }
 
 // Server is the HTTPS reverse proxy gateway.
@@ -121,6 +164,24 @@ func (s *Server) AddUpstream(pathPrefix string, upstream *Upstream) {
 	s.config.Upstreams[pathPrefix] = upstream
 }
 
+// SetUpstreamAddress updates the backend address of an already-registered
+// upstream. It is the mechanism a dynamically-provisioned service uses to point
+// a route (registered up front with an empty Address) at its real host port once
+// that port is known -- e.g. the WhatsApp bridge binds an auto-selected free
+// port after the gateway has started. Returns an error if no upstream is
+// registered for the given prefix. Safe to call after Start (reads go through
+// the per-request resolveTarget in registerProxy).
+func (s *Server) SetUpstreamAddress(prefix, address string) error {
+	s.mu.RLock()
+	upstream, ok := s.config.Upstreams[prefix]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("gateway: no upstream registered for prefix %q", prefix)
+	}
+	upstream.setAddr(address)
+	return nil
+}
+
 // SetPermissions sets the capability permissions for route filtering.
 // When nil, all routes are allowed. Must be called before Start.
 func (s *Server) SetPermissions(p *config.Permissions) {
@@ -165,6 +226,13 @@ func categoryForPath(path string) string {
 	}
 	// Provisioning
 	if path == "/provision" || strings.HasPrefix(path, "/provision/") {
+		return "provision"
+	}
+	// Provisioned services (e.g. the WhatsApp bridge) are reached by the backend
+	// through a gateway route registered by the provision flow. Gate them behind
+	// the same Provision capability that deployed them: if the operator disables
+	// provisioning, the provisioned service is no longer reachable either.
+	if path == "/whatsapp" || strings.HasPrefix(path, "/whatsapp/") {
 		return "provision"
 	}
 	// Everything else (health, status, ping, root, unknown) is always allowed
@@ -272,17 +340,38 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // registerProxy sets up the reverse proxy handler for a given path prefix.
+//
+// The upstream target is resolved per request (via upstream.addr()) rather than
+// captured once, so a dynamically-provisioned upstream whose address is set
+// after Start (see SetUpstreamAddress) is honored on the next request without
+// re-registering the route. An unset target yields a 502 rather than a panic.
 func (s *Server) registerProxy(prefix string, upstream *Upstream) {
-	target, err := url.Parse("http://" + upstream.Address)
-	if err != nil {
-		log.Printf("[Gateway] invalid upstream address %q for %s: %v", upstream.Address, prefix, err)
-		return
+	// resolveTarget returns the current upstream URL, or nil when the upstream
+	// has no address yet (dynamic upstream not provisioned).
+	resolveTarget := func() *url.URL {
+		addr := upstream.addr()
+		if addr == "" {
+			return nil
+		}
+		target, err := url.Parse("http://" + addr)
+		if err != nil {
+			log.Printf("[Gateway] invalid upstream address %q for %s: %v", addr, prefix, err)
+			return nil
+		}
+		return target
 	}
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
+			target := resolveTarget()
+			if target == nil {
+				// Signal unavailability to the transport so ErrorHandler runs.
+				req.URL.Scheme = "http"
+				req.URL.Host = "gateway-upstream-unset.invalid"
+			} else {
+				req.URL.Scheme = target.Scheme
+				req.URL.Host = target.Host
+			}
 			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
 			if s.config.NodeName != "" {
@@ -297,16 +386,24 @@ func (s *Server) registerProxy(prefix string, upstream *Upstream) {
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[Gateway] proxy error for %s -> %s: %v", r.URL.Path, upstream.Address, err)
+			log.Printf("[Gateway] proxy error for %s -> %s: %v", r.URL.Path, upstream.addr(), err)
 			http.Error(w, fmt.Sprintf(`{"error":"upstream unavailable","upstream":"%s"}`, prefix), http.StatusBadGateway)
 		},
 	}
 
 	// For WebSocket upstreams, we need to handle the Upgrade header
 	if upstream.WebSocket {
+		wsProxy := func(w http.ResponseWriter, r *http.Request) {
+			target := resolveTarget()
+			if target == nil {
+				http.Error(w, fmt.Sprintf(`{"error":"upstream unavailable","upstream":"%s"}`, prefix), http.StatusBadGateway)
+				return
+			}
+			s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+		}
 		s.mux.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 			if isWebSocketUpgrade(r) {
-				s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+				wsProxy(w, r)
 				return
 			}
 			proxy.ServeHTTP(w, r)
@@ -314,7 +411,7 @@ func (s *Server) registerProxy(prefix string, upstream *Upstream) {
 		// Also handle the exact prefix (no trailing slash)
 		s.mux.HandleFunc(prefix, func(w http.ResponseWriter, r *http.Request) {
 			if isWebSocketUpgrade(r) {
-				s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+				wsProxy(w, r)
 				return
 			}
 			proxy.ServeHTTP(w, r)

@@ -183,6 +183,91 @@ func TestProvisionReusesExistingTenant(t *testing.T) {
 	}
 }
 
+// TestProvisionExposesGatewayRouteWithBridgePort verifies Provision wires the
+// gateway route to the bridge's chosen host port (aceteam-ai/citadel-cli#447).
+func TestProvisionExposesGatewayRouteWithBridgePort(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "q"}
+	deps, _ := baseDeps(t, bridge)
+	// Pin an explicit port so the assertion is deterministic (operator override
+	// is honored verbatim).
+	var exposedPort int
+	exposeCalls := 0
+	deps.ExposeGatewayRoute = func(bridgePort int) error {
+		exposeCalls++
+		exposedPort = bridgePort
+		return nil
+	}
+	if _, err := Provision(context.Background(), ProvisionRequest{Port: 8137}, deps); err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if exposeCalls != 1 {
+		t.Fatalf("ExposeGatewayRoute calls = %d, want 1", exposeCalls)
+	}
+	if exposedPort != 8137 {
+		t.Errorf("exposed bridge port = %d, want 8137 (the published host port)", exposedPort)
+	}
+}
+
+// TestProvisionExposeGatewayRouteErrorIsFatal verifies a route-exposure failure
+// fails the provision loud rather than returning a false-green with an
+// unreachable api_url.
+func TestProvisionExposeGatewayRouteErrorIsFatal(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "q"}
+	deps, _ := baseDeps(t, bridge)
+	deps.ExposeGatewayRoute = func(int) error { return errors.New("no gateway running") }
+	_, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err == nil || !strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("expected a loud gateway-exposure error, got %v", err)
+	}
+}
+
+// TestProvisionVerifyReachableFailsBeforeAlreadyLinked is the core #447 guard:
+// when the mesh api_url is NOT reachable, Provision must fail loud EVEN IF the
+// tenant is already linked (the false-green we hit). The health probe says
+// logged-in, but the reachability check must run first and sink the provision.
+func TestProvisionVerifyReachableFailsBeforeAlreadyLinked(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}, qr: ""}
+	deps, _ := baseDeps(t, bridge)
+	verifyCalls := 0
+	deps.VerifyReachable = func(ctx context.Context, apiURL string) error {
+		verifyCalls++
+		return errors.New("HTTP 502 (bridge not exposed on the mesh)")
+	}
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err == nil {
+		t.Fatalf("expected a loud unreachable error, got success res=%+v", res)
+	}
+	if verifyCalls != 1 {
+		t.Errorf("VerifyReachable calls = %d, want 1 (must run before already_linked)", verifyCalls)
+	}
+	if !strings.Contains(err.Error(), "reachable") {
+		t.Errorf("error = %q, want it to explain the bridge is not reachable", err.Error())
+	}
+}
+
+// TestProvisionVerifyReachableReceivesMeshAPIURL asserts the reachability probe
+// is handed the same api_url the result advertises (so the check is meaningful).
+func TestProvisionVerifyReachableReceivesMeshAPIURL(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "q"}
+	deps, _ := baseDeps(t, bridge)
+	deps.MeshAPIURL = func(port int) string { return "https://100.64.0.7:8443/whatsapp" }
+	var gotURL string
+	deps.VerifyReachable = func(ctx context.Context, apiURL string) error {
+		gotURL = apiURL
+		return nil
+	}
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if gotURL != "https://100.64.0.7:8443/whatsapp" {
+		t.Errorf("VerifyReachable got api_url %q, want the gateway-route URL", gotURL)
+	}
+	if res.APIURL != "https://100.64.0.7:8443/whatsapp" {
+		t.Errorf("result api_url = %q, want the gateway-route URL", res.APIURL)
+	}
+}
+
 func TestProvisionQRFetchErrorIsNonFatal(t *testing.T) {
 	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qrErr: errors.New("transient")}
 	deps, _ := baseDeps(t, bridge)

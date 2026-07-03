@@ -520,3 +520,76 @@ func TestPermissionMiddleware_NilPermissionsAllowsAll(t *testing.T) {
 		t.Error("nil permissions should not block any route")
 	}
 }
+
+// TestSetUpstreamAddress_DynamicRoute verifies a route registered up front with
+// an empty upstream returns 502 until its address is set, then proxies to the
+// backend once SetUpstreamAddress wires it. This is the mechanism that exposes a
+// dynamically-provisioned service (the WhatsApp bridge) on the mesh gateway
+// (aceteam-ai/citadel-cli#447).
+func TestSetUpstreamAddress_DynamicRoute(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"backend": "bridge", "path": r.URL.Path})
+	}))
+	defer backend.Close()
+	backendAddr := backend.URL[len("http://"):]
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	// Registered up front with NO address (dynamic upstream), StripPrefix like the
+	// real WhatsApp route.
+	gw.AddUpstream(WhatsAppRoutePrefix, &Upstream{StripPrefix: true})
+	for prefix, upstream := range gw.config.Upstreams {
+		gw.registerProxy(prefix, upstream)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+	handler := gw.BuildHandler()
+
+	// Before wiring: a 502 (upstream unset), NOT a panic or a 200.
+	req := httptest.NewRequest(http.MethodGet, WhatsAppRoutePrefix+"/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("unwired route status = %d, want 502", w.Code)
+	}
+
+	// Wire the route to the backend.
+	if err := gw.SetUpstreamAddress(WhatsAppRoutePrefix, backendAddr); err != nil {
+		t.Fatalf("SetUpstreamAddress: %v", err)
+	}
+
+	// After wiring: proxies through, prefix stripped (bridge sees /health).
+	req = httptest.NewRequest(http.MethodGet, WhatsAppRoutePrefix+"/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("wired route status = %d, want 200", w.Code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["backend"] != "bridge" {
+		t.Errorf("backend = %q, want bridge", got["backend"])
+	}
+	if got["path"] != "/health" {
+		t.Errorf("forwarded path = %q, want /health (prefix stripped)", got["path"])
+	}
+}
+
+// TestSetUpstreamAddress_UnknownPrefix verifies setting an address on an
+// unregistered prefix errors rather than silently no-oping.
+func TestSetUpstreamAddress_UnknownPrefix(t *testing.T) {
+	gw := NewServer(Config{})
+	if err := gw.SetUpstreamAddress("/nope", "127.0.0.1:9999"); err == nil {
+		t.Fatal("expected an error for an unregistered prefix, got nil")
+	}
+}
+
+// TestCategoryForPath_WhatsApp verifies the WhatsApp route is gated by the
+// provision capability (so disabling provisioning also blocks the bridge).
+func TestCategoryForPath_WhatsApp(t *testing.T) {
+	for _, p := range []string{"/whatsapp", "/whatsapp/health", "/whatsapp/admin/tenants"} {
+		if got := categoryForPath(p); got != "provision" {
+			t.Errorf("categoryForPath(%q) = %q, want provision", p, got)
+		}
+	}
+}

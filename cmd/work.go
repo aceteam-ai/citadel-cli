@@ -1586,6 +1586,17 @@ func runWork(cmd *cobra.Command, args []string) {
 			WebSocket:   true,
 		})
 
+		// Expose provisioned services (WhatsApp bridge) on the mesh through the
+		// gateway (aceteam-ai/citadel-cli#447). The bridge binds an auto-selected
+		// free host port that nothing on the tsnet stack listens on, so it is
+		// reached only via this gateway route (StripPrefix so its own paths map
+		// through). Register it up front (wired to the persisted BRIDGE_PORT if a
+		// bridge is already deployed) and publish the gateway so the in-process
+		// WHATSAPP_PROVISION handler can point the route at a freshly-provisioned
+		// bridge live.
+		registerProvisionedWhatsAppRoute(gw)
+		setProvisionedServiceGateway(gw, workGatewayPort, !workGatewayNoTLS)
+
 		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet.
 		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
 		// and issue #286.
@@ -1622,6 +1633,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
+		fmt.Printf("     /whatsapp/...            -> provisioned WhatsApp bridge (dynamic port)\n")
 
 		if len(vpnIPs) > 0 {
 			fmt.Printf("   - Gateway VPN: %s://%s:%d\n", scheme, vpnIPs[0], workGatewayPort)
