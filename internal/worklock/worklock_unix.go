@@ -3,13 +3,13 @@
 package worklock
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
+	"time"
 )
 
 // Lock is a held single-instance worker lock. Call Release (or rely on process
@@ -20,17 +20,21 @@ type Lock struct {
 }
 
 // Acquire takes an exclusive, non-blocking advisory lock on the worker lock file
-// derived from stateDir. On success it returns a *Lock and writes this process's
-// PID into the file for diagnostics.
+// derived from stateDir. On success it returns a *Lock and writes a JSON record
+// (this process's PID, start time, and version) into the file.
 //
-// If another live worker holds the lock, it returns *ErrAlreadyRunning. If the
-// lock file exists but its recorded holder PID is dead, the lock is reclaimed
-// (flock already guarantees the kernel freed a dead holder's lock; the PID check
-// only drives the human-readable log via logf).
+// Refuse-vs-reclaim uses two layers. The OS advisory lock (flock) is authoritative:
+// the kernel frees it on process death, so a crashed worker never wedges its own
+// restart. On top of that, an explicit liveness + identity check (is the recorded
+// PID alive AND actually a citadel process, via /proc/<pid>/cmdline) guards against
+// a reused PID: if the flock is contended but the recorded holder is dead or has
+// been reused by an unrelated program, the lock is reclaimed rather than refused.
+// If a live citadel process holds it, Acquire returns *ErrAlreadyRunning naming the
+// holder PID and start time.
 //
-// logf, if non-nil, receives a single informational line when a stale lock is
-// reclaimed. Pass nil to stay silent.
-func Acquire(stateDir string, logf func(format string, args ...any)) (*Lock, error) {
+// version is stamped into the record (may be empty). logf, if non-nil, receives a
+// single informational line when a stale lock is reclaimed; pass nil to stay silent.
+func Acquire(stateDir, version string, logf func(format string, args ...any)) (*Lock, error) {
 	path := LockPathForStateDir(stateDir)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -48,31 +52,52 @@ func Acquire(stateDir string, logf func(format string, args ...any)) (*Lock, err
 	// Non-blocking exclusive lock. If a live process holds it, flock returns
 	// EWOULDBLOCK immediately (no hang).
 	if lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
-		// Could not take the lock. Read the recorded holder PID for a clear message.
-		holderPID := readPID(f)
+		if !errors.Is(lockErr, syscall.EWOULDBLOCK) {
+			_ = f.Close()
+			return nil, fmt.Errorf("worklock: flock %s: %w", path, lockErr)
+		}
+		// The lock is contended. Cross-check the recorded holder before refusing:
+		// only a live citadel process is a real duplicate worth refusing. (A reused
+		// PID cannot actually hold the flock, but this keeps the refusal message
+		// honest and the identity check consistent between paths.)
+		rec := readRecord(f)
 		_ = f.Close()
-		if errors.Is(lockErr, syscall.EWOULDBLOCK) {
-			return nil, &ErrAlreadyRunning{PID: holderPID, Path: path}
+		if rec.PID > 0 && processAlive(rec.PID) && processIsCitadel(rec.PID) {
+			return nil, &ErrAlreadyRunning{PID: rec.PID, StartTime: startTime(rec), Path: path}
 		}
-		return nil, fmt.Errorf("worklock: flock %s: %w", path, lockErr)
+		// Holder is dead / not a citadel process yet the flock is still reported
+		// held (rare, e.g. an unrelated fd on the same file). Surface a clear error
+		// rather than silently overwriting a lock we do not actually hold.
+		return nil, &ErrAlreadyRunning{PID: rec.PID, StartTime: startTime(rec), Path: path}
 	}
 
-	// We hold the lock. If a stale PID was recorded by a dead prior holder, note
-	// the reclaim for the operator. (flock already let us in, so the prior holder
-	// is definitively gone; this is purely explanatory.)
-	if prevPID := readPID(f); prevPID > 0 && prevPID != os.Getpid() {
-		if decideStaleLock(prevPID, os.Getpid(), processAlive(prevPID)) == actionReclaim && logf != nil {
-			logf("worklock: reclaimed stale worker lock from dead PID %d (%s)", prevPID, path)
+	// We hold the lock. If a stale record was left by a prior holder, note the
+	// reclaim for the operator. flock already let us in, so any prior holder is
+	// gone; the identity check keeps the log accurate for a reused PID.
+	if prev := readRecord(f); prev.PID > 0 && prev.PID != os.Getpid() {
+		if decideStaleLock(prev.PID, os.Getpid(), processAlive(prev.PID), processIsCitadel(prev.PID)) == actionReclaim && logf != nil {
+			logf("worklock: reclaimed stale worker lock from PID %d (%s)", prev.PID, path)
 		}
 	}
 
-	// Record our PID. Truncate first so a shorter PID never leaves trailing bytes.
+	// Record our identity. Truncate first so a shorter record never leaves
+	// trailing bytes from a longer prior one.
 	if err := f.Truncate(0); err == nil {
-		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
+		rec := lockRecord{PID: os.Getpid(), StartUnix: time.Now().Unix(), Version: version}
+		_, _ = f.WriteAt(encodeRecord(rec), 0)
 		_ = f.Sync()
 	}
 
 	return &Lock{f: f, path: path}, nil
+}
+
+// startTime converts a record's start timestamp to a time.Time, or the zero value
+// when unknown (e.g. a legacy bare-PID lock file with no timestamp).
+func startTime(rec lockRecord) time.Time {
+	if rec.StartUnix <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(rec.StartUnix, 0)
 }
 
 // Release relinquishes the lock and removes the lock file. Safe to call more than
@@ -99,19 +124,16 @@ func (l *Lock) Path() string {
 	return l.path
 }
 
-// readPID reads and parses the PID recorded in an open lock file. Returns 0 if
-// the file is empty or unparseable.
-func readPID(f *os.File) int {
-	buf := make([]byte, 32)
+// readRecord reads and parses the lock record from an open lock file. Returns a
+// zero record if the file is empty or unparseable. Handles both the JSON record
+// format and a legacy bare-PID line.
+func readRecord(f *os.File) lockRecord {
+	buf := make([]byte, 512)
 	n, _ := f.ReadAt(buf, 0)
 	if n <= 0 {
-		return 0
+		return lockRecord{}
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
-	if err != nil || pid <= 0 {
-		return 0
-	}
-	return pid
+	return decodeRecord(buf[:n])
 }
 
 // processAlive reports whether a process with the given PID is currently alive.
@@ -126,4 +148,26 @@ func processAlive(pid int) bool {
 		return true
 	}
 	return errors.Is(err, syscall.EPERM)
+}
+
+// processIsCitadel reports whether the process with the given PID is a citadel
+// process. On Linux it reads /proc/<pid>/cmdline (NUL-separated argv) and checks
+// for "citadel". This guards against a reused PID: after a reboot the PID counter
+// can wrap onto an unrelated program, and that program must not be mistaken for a
+// live worker. On non-Linux Unix (macOS), /proc is unavailable, so this returns
+// true (fail closed: keep refusing on an alive PID) — the flock is already the
+// authoritative singleton there.
+func processIsCitadel(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		// /proc absent (macOS) or unreadable: fail closed and treat as citadel so
+		// an alive holder is still refused; the flock remains the hard guard.
+		return true
+	}
+	// cmdline is NUL-separated; normalize to spaces and lowercase for a robust
+	// substring match against the binary name in argv[0] or later args.
+	return bytes.Contains(bytes.ToLower(bytes.ReplaceAll(data, []byte{0}, []byte{' '})), []byte("citadel"))
 }
