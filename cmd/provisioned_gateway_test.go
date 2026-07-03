@@ -279,6 +279,23 @@ func verifyingClientFor(t *testing.T, certPath, serverName string) *http.Client 
 	}
 }
 
+// TestExplicitBridgePort verifies the backfill port reader requires an explicit
+// BRIDGE_PORT and never falls back to 8080 (citadel's own status port).
+func TestExplicitBridgePort(t *testing.T) {
+	if got := explicitBridgePort(map[string]string{}); got != 0 {
+		t.Errorf("no BRIDGE_PORT -> %d, want 0 (must NOT default to 8080)", got)
+	}
+	if got := explicitBridgePort(map[string]string{"BRIDGE_PORT": "8137"}); got != 8137 {
+		t.Errorf("BRIDGE_PORT=8137 -> %d, want 8137", got)
+	}
+	if got := explicitBridgePort(map[string]string{"BRIDGE_PORT": "0"}); got != 0 {
+		t.Errorf("BRIDGE_PORT=0 -> %d, want 0", got)
+	}
+	if got := explicitBridgePort(map[string]string{"BRIDGE_PORT": "nope"}); got != 0 {
+		t.Errorf("BRIDGE_PORT=nope -> %d, want 0", got)
+	}
+}
+
 // TestGatewayRoutePathConvention pins the /modules/<prefix> convention shared with
 // the gateway package.
 func TestGatewayRoutePathConvention(t *testing.T) {

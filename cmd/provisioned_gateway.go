@@ -325,7 +325,11 @@ func backfillWhatsAppRegistryEntry() {
 	if err != nil {
 		return
 	}
-	port := portFromEnv(env)
+	// Require an EXPLICIT persisted BRIDGE_PORT. Do NOT fall back to
+	// whatsapp.DefaultPort (8080) here: 8080 is citadel's own status listener, so
+	// wiring a route to it on an old deployment that never persisted BRIDGE_PORT
+	// would misroute the module route into the status server.
+	port := explicitBridgePort(env)
 	if port <= 0 {
 		return
 	}
@@ -335,6 +339,22 @@ func backfillWhatsAppRegistryEntry() {
 		Port:       port,
 		Capability: whatsappGatewayCapability,
 	})
+}
+
+// explicitBridgePort returns the bridge's persisted BRIDGE_PORT, or 0 when the
+// env file does not carry one. Unlike portFromEnv it never defaults to
+// whatsapp.DefaultPort (8080 = citadel's own status port), so a route is only
+// wired to a port the deployment actually chose.
+func explicitBridgePort(env map[string]string) int {
+	v := env["BRIDGE_PORT"]
+	if v == "" {
+		return 0
+	}
+	var p int
+	if _, err := fmt.Sscanf(v, "%d", &p); err == nil && p > 0 {
+		return p
+	}
+	return 0
 }
 
 // watchProvisionedRegistry polls the registry file and registers/wires any module

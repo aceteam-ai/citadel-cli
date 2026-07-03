@@ -70,8 +70,8 @@ type ProvisionDeps struct {
 
 	// MeshAPIURL returns the api_url the shared backend must use to reach this
 	// bridge over the mesh. It MUST return an actually-reachable URL -- the
-	// gateway route form (https://<node-vpn-ip>:<gateway-port>/whatsapp), NOT a
-	// raw http://<vpn-ip>:<bridge-port> that nothing on the tsnet stack listens
+	// gateway route form (https://<node-vpn-ip>:<gateway-port>/modules/<prefix>),
+	// NOT a raw http://<vpn-ip>:<bridge-port> that nothing on the tsnet stack listens
 	// on. Only the status/terminal/gateway servers bind a tsnet listener on the
 	// node VPN IP; a provisioned bridge on an auto-selected host port is reached
 	// only through the gateway route (aceteam-ai/citadel-cli#447).
@@ -87,7 +87,7 @@ type ProvisionDeps struct {
 	// bridge's loopback host port so the mesh URL returned by MeshAPIURL is
 	// actually reachable. It is the side effect that makes the bridge reachable
 	// on the tsnet mesh (the gateway already binds a tsnet listener on the node
-	// VPN IP; this just wires the /whatsapp route to 127.0.0.1:<bridgePort>).
+	// VPN IP; this just wires the /modules/<prefix> route to 127.0.0.1:<bridgePort>).
 	// Nil means "no gateway to register with" -- Provision then relies purely on
 	// VerifyReachable to catch an unreachable bridge (fail loud, not false-green).
 	ExposeGatewayRoute func(bridgePort int) error
