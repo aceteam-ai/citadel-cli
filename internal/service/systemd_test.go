@@ -29,6 +29,11 @@ func TestGenerateUnitFile_UserMode(t *testing.T) {
 		{"exec start", "ExecStart=/usr/local/bin/citadel work --gateway"},
 		{"restart", "Restart=on-failure"},
 		{"restart sec", "RestartSec=10"},
+		// Crash-loop hardening (#443): exponential restart backoff + start-limit cooldown.
+		{"restart steps", "RestartSteps=5"},
+		{"restart max delay", "RestartMaxDelaySec=300"},
+		{"start limit interval", "StartLimitIntervalSec=300"},
+		{"start limit burst", "StartLimitBurst=5"},
 		{"env var", "Environment=CITADEL_SERVICE=true"},
 		{"wanted by", "WantedBy=default.target"},
 		{"output", "StandardOutput=journal+console"},

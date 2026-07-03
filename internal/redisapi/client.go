@@ -111,6 +111,12 @@ func (c *Client) Ping(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// A 429 carries a structured rate-limit hint (retry_after/reset_at).
+		// Return it as a typed error so the connect-retry loop can honor the
+		// server's backoff instead of hammering into the daily quota (#443).
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return parseRateLimitError(resp.StatusCode, string(body))
+		}
 		return fmt.Errorf("ping failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
