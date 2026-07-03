@@ -20,6 +20,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -553,9 +555,37 @@ func printConnectDetails(port int, apiKey string) {
 	fmt.Println("  In AceTeam, call the whatsapp_connect MCP tool with the values above:")
 	fmt.Printf("    whatsapp_connect(api_url=%q, api_key=%q)\n", apiURL, apiKey)
 	fmt.Println()
-	fmt.Println(color.YellowString("  Note: the bridge is on the private mesh, so the AceTeam backend must run with"))
-	fmt.Println(color.YellowString("        WHATSAPP_ALLOW_PRIVATE_NETWORK=true to dial it. If you expose the bridge"))
-	fmt.Println(color.YellowString("        on a public hostname instead, that backend flag is not needed."))
+	if whatsappNonMeshPrivateHost(apiURL) {
+		fmt.Println(color.YellowString("  Note: this api_url is a non-mesh private host, so the AceTeam backend must"))
+		fmt.Println(color.YellowString("        run with WHATSAPP_ALLOW_PRIVATE_NETWORK=true to dial it. The flag is"))
+		fmt.Println(color.YellowString("        only for non-mesh private hosts, not for the mesh."))
+	} else {
+		fmt.Println("  The bridge is reachable over the mesh by default; no backend flag is needed.")
+	}
+}
+
+// whatsappNonMeshPrivateHost reports whether the host in apiURL is a private
+// RFC1918 address that is NOT on the mesh (100.64.0.0/10, CGNAT). The aceteam
+// backend's SSRF guard allows the mesh range by default, so only a non-mesh
+// private host needs WHATSAPP_ALLOW_PRIVATE_NETWORK=true. Unparseable hosts
+// (empty, hostname, or the off-mesh placeholder) count as non-private, so no
+// flag note is shown.
+func whatsappNonMeshPrivateHost(apiURL string) bool {
+	if apiURL == "" {
+		return false
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil {
+		return false
+	}
+	if _, mesh, err := net.ParseCIDR("100.64.0.0/10"); err == nil && mesh.Contains(ip) {
+		return false
+	}
+	return ip.IsPrivate()
 }
 
 // buildWhatsAppCallbacks wires the WhatsApp page's lifecycle hooks to the same
