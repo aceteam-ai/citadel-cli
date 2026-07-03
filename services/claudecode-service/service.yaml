@@ -1,0 +1,88 @@
+# Citadel module manifest for the headless Claude Code agent-runtime
+# (aceteam-ai/citadel-cli#432). This is the module-install path: it mirrors the
+# schema consumed by internal/catalog (ServiceManifest). To ship as an
+# installable module, publish this dir as services/claudecode/{service.yaml,
+# compose.yml} in a catalog repo (e.g. aceteam-ai/citadel-services); citadel then
+# resolves it via `citadel service catalog` / module install.
+#
+# The standalone compose lives at services/compose/claudecode.yml and is what the
+# live-proof uses via `docker compose -f ... up`. This manifest declares a LITERAL
+# host port (8204) because the module path does NOT inject
+# CITADEL_CLAUDECODE_HOST_PORT the way the built-in ports.go registry does for the
+# four core services -- so the module compose (compose.yml alongside this file)
+# publishes a fixed host port instead of the ${...} guard.
+schema_version: 2
+name: claudecode
+version: 0.1.0
+description: >-
+  Headless Claude Code agent-runtime. Runs a full Claude Code turn on your own
+  node with the model pointed at the AceTeam fabric proxy -- agent AND model on
+  your metal, no external Anthropic API key.
+category: agent-runtime
+author: AceTeam
+license: Apache-2.0
+homepage: https://github.com/aceteam-ai/citadel-cli/issues/432
+
+requires:
+  # CPU-only: the model path is the remote fabric proxy, so no GPU is needed.
+  gpu: false
+  arch: [amd64, arm64]
+
+ports:
+  # The wrapper listens on the fixed internal contract port 8787; the module
+  # publishes it on host 8204 (next free slot in citadel's 8200+ module block,
+  # clear of the reserved ports and the 8100-8199 apps range).
+  - host: 8204
+    container: 8787
+    protocol: tcp
+    description: Claude Code runtime wrapper HTTP (/hooks/agent, /health)
+
+config:
+  - name: ACETEAM_INSTANCE_ID
+    description: Instance id used in the reply URL path.
+    required: true
+  - name: ACETEAM_PLATFORM_URL
+    description: Base URL to POST replies to (e.g. https://aceteam.ai).
+    required: true
+  - name: ACETEAM_GATEWAY_KEY
+    description: >-
+      Raw gateway key. Inbound /hooks/agent is validated against hooks_+key;
+      outbound replies auth with the raw key.
+    required: true
+  - name: ANTHROPIC_BASE_URL
+    description: Fabric proxy base URL (Anthropic-compatible).
+    required: true
+  - name: ANTHROPIC_AUTH_TOKEN
+    description: Bearer token for the fabric proxy.
+    required: true
+  - name: ANTHROPIC_MODEL
+    description: Model id served by the proxy.
+    required: true
+  - name: ANTHROPIC_SMALL_FAST_MODEL
+    description: Optional small/fast (haiku-tier) model for Claude Code sub-tasks.
+    required: false
+
+health_check:
+  endpoint: /health
+  port: 8787
+  interval: 10s
+  timeout: 5s
+  retries: 12
+
+volumes:
+  - name: claude-state
+    host: ~/citadel-cache/claudecode
+    container: /home/claude/.claude
+    description: >-
+      Claude Code config/sessions/projects -- the "permanent home". Persists
+      across restarts on the node disk.
+
+# Namespaced routing tag so this node becomes routable as a Claude Code runtime
+# without a CLI change.
+node_tags:
+  - runtime:claudecode
+
+tags:
+  - agent
+  - claude-code
+  - byoc

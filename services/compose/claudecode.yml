@@ -1,0 +1,64 @@
+# services/compose/claudecode.yml
+#
+# Headless Claude Code agent-runtime for a Citadel node (aceteam-ai/citadel-cli
+# #432, Child C of the BYOC agent-hosting epic aceteam-ai/aceteam#4588).
+#
+# This is the phase-1 flagship BYOC runtime: a Claude Code CLI turn driven
+# headlessly by a tiny HTTP wrapper (services/claudecode-service), with the model
+# pointed at the AceTeam fabric proxy via the ANTHROPIC_* env. A full turn runs
+# with NO external Anthropic API key -- agent AND model on your own metal.
+#
+# The wrapper listens on a FIXED internal port 8787 (its own contract port, like
+# diffusers' 7860). The HOST port is owned by citadel and supplied via
+# CITADEL_CLAUDECODE_HOST_PORT; the :? guard fails loudly if it is missing. This
+# is CPU-only -- the model path is the remote fabric proxy, so there is NO GPU
+# reservation (contrast diffusers/vllm).
+#
+# Standalone run (the live-proof path -- operator supplies the env):
+#   CITADEL_CLAUDECODE_HOST_PORT=8204 \
+#   ACETEAM_INSTANCE_ID=... ACETEAM_PLATFORM_URL=https://aceteam.ai \
+#   ACETEAM_GATEWAY_KEY=... \
+#   ANTHROPIC_BASE_URL=... ANTHROPIC_AUTH_TOKEN=... ANTHROPIC_MODEL=... \
+#   docker compose -f services/compose/claudecode.yml up
+
+services:
+  claudecode:
+    image: ghcr.io/aceteam-ai/claudecode-service:latest
+    container_name: citadel-claudecode
+    ports:
+      - "${CITADEL_CLAUDECODE_HOST_PORT:?citadel must supply CITADEL_CLAUDECODE_HOST_PORT}:8787"
+    volumes:
+      # The "permanent home": Claude Code config, sessions, and projects persist
+      # on the node disk across restarts. Path matches CLAUDE_CONFIG_DIR and the
+      # non-root claude user's home in the image. The container's entrypoint runs
+      # as root, chowns this mount to the claude user (uid 10001), then drops
+      # privileges -- so a fresh host-owned dir "just works" with no pre-create.
+      - ~/citadel-cache/claudecode:/home/claude/.claude
+    environment:
+      # --- AceTeam routing-seam contract (aceteam #4593) ---
+      # Instance id used in the reply URL path.
+      - ACETEAM_INSTANCE_ID=${ACETEAM_INSTANCE_ID:?set ACETEAM_INSTANCE_ID}
+      # Base URL to POST replies to (e.g. https://aceteam.ai).
+      - ACETEAM_PLATFORM_URL=${ACETEAM_PLATFORM_URL:?set ACETEAM_PLATFORM_URL}
+      # Raw gateway key: inbound validated against hooks_+key; outbound auths with key.
+      - ACETEAM_GATEWAY_KEY=${ACETEAM_GATEWAY_KEY:?set ACETEAM_GATEWAY_KEY}
+
+      # --- Model path: point Claude Code at the fabric proxy (Anthropic-compatible) ---
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the fabric proxy}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:?set ANTHROPIC_AUTH_TOKEN for the proxy}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:?set ANTHROPIC_MODEL}
+      # Optional: small/fast (haiku-tier) model for Claude Code's cheap sub-tasks.
+      - ANTHROPIC_SMALL_FAST_MODEL=${ANTHROPIC_SMALL_FAST_MODEL:-}
+
+      # --- Wrapper knobs (sane defaults; override only if needed) ---
+      - PORT=8787
+      - CLAUDE_CONFIG_DIR=/home/claude/.claude
+      - CLAUDECODE_TURN_TIMEOUT=${CLAUDECODE_TURN_TIMEOUT:-600}
+    healthcheck:
+      # Hits the wrapper /health on the fixed internal contract port.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
