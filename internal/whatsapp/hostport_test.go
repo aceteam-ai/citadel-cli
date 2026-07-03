@@ -221,3 +221,80 @@ func TestProvisionHonorsExplicitPort(t *testing.T) {
 		t.Errorf("api_url = %q, want it to carry the explicit port %d", res.APIURL, pinned)
 	}
 }
+
+// TestProvisionReusesPersistedPortOnReprovision is the regression guard for
+// aceteam-ai/citadel-cli#449 (root cause A): a re-provision (no explicit port)
+// must reuse the persisted BRIDGE_PORT instead of auto-selecting a new one. The
+// old bridge still holds that port at probe time, so a free-port scan would skip
+// it and churn to a new port -- which then broke the live gateway route. Here the
+// env already carries BRIDGE_PORT=8082; the provision must pass it as the
+// preferred port and redeploy on it.
+func TestProvisionReusesPersistedPortOnReprovision(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "2@qr"}
+	deps, _ := baseDeps(t, bridge)
+	deps.MeshAPIURL = func(port int) string { return fmt.Sprintf("http://100.64.0.7:%d", port) }
+
+	dir, err := deps.ServicesDir()
+	if err != nil {
+		t.Fatalf("ServicesDir: %v", err)
+	}
+	// Simulate an existing deployment that persisted its host port.
+	if err := SaveEnv(dir, map[string]string{"BRIDGE_PORT": "8082", "ADMIN_API_KEY": "existing"}); err != nil {
+		t.Fatalf("SaveEnv: %v", err)
+	}
+
+	var gotPreferred int
+	deps.SelectHostPort = func(preferred, floor int) (int, error) {
+		gotPreferred = preferred
+		if preferred > 0 {
+			return preferred, nil
+		}
+		return 9999, nil // a fresh port, which we must NOT end up using
+	}
+	var deployPort int
+	deps.DeployCompose = func(servicesDir string, env map[string]string) error {
+		deployPort = mustAtoi(t, env["BRIDGE_PORT"])
+		return nil
+	}
+
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if gotPreferred != 8082 {
+		t.Errorf("selectPort preferred = %d, want the persisted 8082 (idempotent reuse)", gotPreferred)
+	}
+	if deployPort != 8082 {
+		t.Errorf("redeployed on port %d, want the persisted 8082", deployPort)
+	}
+	if res.Port != 8082 {
+		t.Errorf("result Port = %d, want 8082 (reused, not churned to 9999)", res.Port)
+	}
+}
+
+// TestProvisionExplicitPortOverridesPersisted verifies an operator-pinned port
+// still wins over the persisted one on a re-provision (the override precedence is
+// unchanged by the #449 reuse logic).
+func TestProvisionExplicitPortOverridesPersisted(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "2@qr"}
+	deps, _ := baseDeps(t, bridge)
+	deps.MeshAPIURL = func(port int) string { return fmt.Sprintf("http://100.64.0.7:%d", port) }
+
+	dir, _ := deps.ServicesDir()
+	if err := SaveEnv(dir, map[string]string{"BRIDGE_PORT": "8082"}); err != nil {
+		t.Fatalf("SaveEnv: %v", err)
+	}
+	var gotPreferred int
+	deps.SelectHostPort = func(preferred, floor int) (int, error) { gotPreferred = preferred; return preferred, nil }
+
+	res, err := Provision(context.Background(), ProvisionRequest{Port: 8095}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if gotPreferred != 8095 {
+		t.Errorf("selectPort preferred = %d, want the explicit override 8095", gotPreferred)
+	}
+	if res.Port != 8095 {
+		t.Errorf("result Port = %d, want 8095", res.Port)
+	}
+}

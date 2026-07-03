@@ -151,6 +151,12 @@ type Server struct {
 	// module route falls back to the provision capability. Set via
 	// SetProvisionedRegistry.
 	provisionedResolver CapabilityResolver
+
+	// started is set once Start has registered the proxy handlers for the routes
+	// present at that moment. It gates WireModuleRoute: a route added AFTER Start
+	// must have its proxy handler registered live (Start's registration loop has
+	// already run), whereas a route added before Start is picked up by that loop.
+	started bool
 }
 
 // NewServer creates a new gateway server.
@@ -201,6 +207,51 @@ func (s *Server) SetUpstreamAddress(prefix, address string) error {
 	if !ok {
 		return fmt.Errorf("gateway: no upstream registered for prefix %q", prefix)
 	}
+	upstream.setAddr(address)
+	return nil
+}
+
+// WireModuleRoute points the /modules/<prefix> route at address for a LIVE
+// (post-Start) module exposure. It is the re-wire-safe counterpart to
+// AddUpstream+SetUpstreamAddress and exists to close the #449 landmine:
+//
+//   - If the route already exists, it MUTATES the existing *Upstream's address.
+//     It must not replace the map entry: registerProxy (run once at Start) closed
+//     over the original *Upstream pointer, so swapping in a new object would
+//     orphan the update -- the running proxy would keep reading the old object's
+//     address. That is exactly why a re-provision that moved the bridge port left
+//     the route dialing the dead port until a full restart re-captured it.
+//   - If the route is new and the server has already started, it creates the
+//     upstream AND registers its proxy handler live (registerProxy), so a module
+//     first exposed after Start is reachable without a restart. Before Start, it
+//     just records the route; Start's registration loop wires the handler.
+//
+// stripPrefix applies only when the route is created; for an existing route the
+// registration-time options are kept. Safe for concurrent use.
+func (s *Server) WireModuleRoute(prefix, address string, stripPrefix bool) error {
+	if prefix == "" {
+		return fmt.Errorf("gateway: WireModuleRoute requires a non-empty prefix")
+	}
+	s.mu.Lock()
+	upstream, ok := s.config.Upstreams[prefix]
+	if !ok {
+		upstream = &Upstream{StripPrefix: stripPrefix}
+		// Set the address BEFORE the handler can serve traffic so a brand-new route
+		// never has a window where its proxy is live but points nowhere (a spurious
+		// 502). registerProxy touches only the concurrency-safe mux and closes over
+		// this upstream pointer, so the per-request resolveTarget reads this address.
+		upstream.setAddr(address)
+		s.config.Upstreams[prefix] = upstream
+		// A route that appears after Start must have its handler registered here;
+		// before Start, the Start loop registers it.
+		if s.started {
+			s.registerProxy(prefix, upstream)
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	// Existing route: mutate the object the running proxy handler already captured.
 	upstream.setAddr(address)
 	return nil
 }
@@ -358,6 +409,9 @@ func (s *Server) Start(ctx context.Context) error {
 	for prefix, upstream := range s.config.Upstreams {
 		s.registerProxy(prefix, upstream)
 	}
+	// Any route added after this point (WireModuleRoute) must register its own
+	// proxy handler live, since this loop has already run.
+	s.started = true
 
 	// Root handler — returns 404 for unmatched paths or gateway info for "/"
 	s.mux.HandleFunc("/", s.handleRoot)

@@ -689,3 +689,110 @@ func TestPermissionMiddleware_ModuleCapabilityDecoupled(t *testing.T) {
 		t.Errorf("services-gated module with services on: status = %d, want not-403", w.Code)
 	}
 }
+
+// TestWireModuleRouteLiveRewire is the regression guard for aceteam-ai/citadel-cli#449.
+//
+// A provisioned module's gateway route is registered (and its proxy handler
+// captured) at Start. A re-provision that moves the module to a new host port
+// must be re-wired LIVE: the running proxy handler closed over the ORIGINAL
+// *Upstream pointer, so the re-wire has to mutate that same object. The pre-fix
+// code replaced the map entry with a fresh *Upstream and set the address on the
+// orphan, leaving the live route dialing the dead port until a restart. This
+// test proves WireModuleRoute takes effect on the very next request.
+func TestWireModuleRouteLiveRewire(t *testing.T) {
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"backend": "A", "path": r.URL.Path})
+	}))
+	defer backendA.Close()
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"backend": "B", "path": r.URL.Path})
+	}))
+	defer backendB.Close()
+	addrA := backendA.URL[len("http://"):]
+	addrB := backendB.URL[len("http://"):]
+
+	const prefix = "/modules/whatsapp"
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	// Simulate the startup registration: a route wired to backend A, its proxy
+	// handler captured, and the server marked started.
+	gw.AddUpstream(prefix, &Upstream{StripPrefix: true, Address: addrA})
+	for p, up := range gw.config.Upstreams {
+		gw.registerProxy(p, up)
+	}
+	gw.mux.HandleFunc("/", gw.handleRoot)
+	gw.started = true
+
+	route := func() map[string]string {
+		req := httptest.NewRequest(http.MethodGet, prefix+"/status", nil)
+		w := httptest.NewRecorder()
+		gw.mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %q)", w.Code, w.Body.String())
+		}
+		var resp map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (body %q)", err, w.Body.String())
+		}
+		return resp
+	}
+
+	if resp := route(); resp["backend"] != "A" {
+		t.Fatalf("before re-wire routed to %q, want A", resp["backend"])
+	}
+
+	// The re-provision moved the module to backend B. This must take effect live.
+	if err := gw.WireModuleRoute(prefix, addrB, true); err != nil {
+		t.Fatalf("WireModuleRoute: %v", err)
+	}
+	resp := route()
+	if resp["backend"] != "B" {
+		t.Fatalf("after re-wire routed to %q, want B (the #449 regression: re-wire orphaned)", resp["backend"])
+	}
+	// StripPrefix still holds: the module sees /status, not /modules/whatsapp/status.
+	if resp["path"] != "/status" {
+		t.Fatalf("forwarded path = %q, want /status", resp["path"])
+	}
+}
+
+// TestWireModuleRouteNewAfterStart proves a module first exposed AFTER Start
+// (e.g. provisioned via the CLI while `citadel work` is already running) gets a
+// live proxy handler without a restart -- the create-branch of WireModuleRoute.
+func TestWireModuleRouteNewAfterStart(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"backend": "new", "path": r.URL.Path})
+	}))
+	defer backend.Close()
+
+	gw := NewServer(Config{NodeName: "test-node"})
+	// Nothing registered at Start; the server is already running.
+	gw.mux.HandleFunc("/", gw.handleRoot)
+	gw.started = true
+
+	const prefix = "/modules/newmod"
+	if err := gw.WireModuleRoute(prefix, backend.URL[len("http://"):], true); err != nil {
+		t.Fatalf("WireModuleRoute: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, prefix+"/ping", nil)
+	w := httptest.NewRecorder()
+	gw.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["backend"] != "new" {
+		t.Fatalf("routed to %q, want new", resp["backend"])
+	}
+	if resp["path"] != "/ping" {
+		t.Fatalf("forwarded path = %q, want /ping", resp["path"])
+	}
+}
+
+// TestWireModuleRouteRejectsEmptyPrefix guards the input contract.
+func TestWireModuleRouteRejectsEmptyPrefix(t *testing.T) {
+	gw := NewServer(Config{})
+	if err := gw.WireModuleRoute("", "127.0.0.1:9", true); err == nil {
+		t.Fatal("expected error for empty prefix")
+	}
+}
