@@ -6,11 +6,15 @@
 # resolves it via `citadel service catalog` / module install.
 #
 # The standalone compose lives at services/compose/claudecode.yml and is what the
-# live-proof uses via `docker compose -f ... up`. This manifest declares a LITERAL
-# host port (8204) because the module path does NOT inject
-# CITADEL_CLAUDECODE_HOST_PORT the way the built-in ports.go registry does for the
-# four core services -- so the module compose (compose.yml alongside this file)
-# publishes a fixed host port instead of the ${...} guard.
+# live-proof uses via `docker compose -f ... up`. As of #458 claudecode is
+# registered in the services/ports.go host-port registry (CITADEL_CLAUDECODE_HOST_PORT
+# = 8204), so the module compose (compose.yml alongside this file) defers its host
+# publish to ${CITADEL_CLAUDECODE_HOST_PORT:?...} exactly like the built-in
+# services -- HostPortEnv() injects it on every citadel compose-up site. The
+# `host: 8204` below stays authoritative: it must equal the registry value (it is
+# what the install-time port-conflict pre-check and the collision-guard test read),
+# and keeping the next agent-runtime module out of 8204 is precisely the point of
+# the registry.
 schema_version: 2
 name: claudecode
 version: 0.1.0

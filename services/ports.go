@@ -31,6 +31,15 @@ const (
 	EnvVLLMHostPort       = "CITADEL_VLLM_HOST_PORT"
 	EnvExtractionHostPort = "CITADEL_EXTRACTION_HOST_PORT"
 	EnvDiffusersHostPort  = "CITADEL_DIFFUSERS_HOST_PORT"
+	// EnvClaudecodeHostPort carries the host port for the claudecode
+	// agent-runtime module (aceteam-ai/citadel-cli#458). Unlike the four inference
+	// services above, claudecode ships as an installable catalog MODULE (its
+	// compose lives in aceteam-ai/citadel-services, not the embedded ServiceMap),
+	// but it is registered here so its host port is injected by the same
+	// HostPortEnv() mechanism. That is what lets a second agent-runtime module
+	// (Hermes/OpenClaw, aceteam#4591) claim the next slot in the 8200 block instead
+	// of every module hardcoding a literal 8204 and colliding.
+	EnvClaudecodeHostPort = "CITADEL_CLAUDECODE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -51,6 +60,12 @@ const (
 	ExtractionHostPort = 8202
 	// diffusers: was host 8102 (collided with the TEI embedding upstream).
 	DiffusersHostPort = 8203
+	// claudecode: the first agent-runtime MODULE (#458). Next free slot in the
+	// 8200 block, above the apps 8100-8199 range. The wrapper's internal contract
+	// port is 8787; this is the host publish. Kept in this registry so the next
+	// agent-runtime module (Hermes/OpenClaw) is allocated 8205 rather than
+	// re-hardcoding 8204.
+	ClaudecodeHostPort = 8204
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port for every
@@ -62,6 +77,7 @@ var ServiceHostPorts = map[string]int{
 	"vllm":       VLLMHostPort,
 	"extraction": ExtractionHostPort,
 	"diffusers":  DiffusersHostPort,
+	"claudecode": ClaudecodeHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -71,6 +87,7 @@ var serviceHostPortEnv = map[string]string{
 	"vllm":       EnvVLLMHostPort,
 	"extraction": EnvExtractionHostPort,
 	"diffusers":  EnvDiffusersHostPort,
+	"claudecode": EnvClaudecodeHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
