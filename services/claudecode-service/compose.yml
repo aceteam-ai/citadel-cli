@@ -1,17 +1,19 @@
 # Module compose for the headless Claude Code runtime (citadel-cli#432).
 #
-# This is the MODULE-install variant of services/compose/claudecode.yml. The two
-# differ in ONE way: the standalone file defers the host port to citadel via
-# ${CITADEL_CLAUDECODE_HOST_PORT:?...}; this module file publishes the LITERAL
-# host port 8204 declared in service.yaml, because the module-install path does
-# not inject that env var (only the four built-in ports.go services get it).
-# Everything else is identical.
+# This is the MODULE-install variant of services/compose/claudecode.yml. As of
+# #458 the two are IDENTICAL in their port publish: both defer the host port to
+# citadel via ${CITADEL_CLAUDECODE_HOST_PORT:?...}. claudecode is now registered
+# in services/ports.go, so HostPortEnv() injects CITADEL_CLAUDECODE_HOST_PORT
+# (=8204) on every citadel compose-up site -- including `citadel run <module>`
+# via startService -> composeEnv. This removes the literal 8204 so a second
+# agent-runtime module (Hermes/OpenClaw, aceteam#4591) can take 8205 from the
+# registry instead of colliding on a hardcoded port.
 services:
   claudecode:
     image: ghcr.io/aceteam-ai/claudecode-service:latest
     container_name: citadel-claudecode
     ports:
-      - "8204:8787"
+      - "${CITADEL_CLAUDECODE_HOST_PORT:?citadel must supply CITADEL_CLAUDECODE_HOST_PORT}:8787"
     volumes:
       # Entrypoint (root) chowns this mount to the claude user, then drops
       # privileges -- a fresh host-owned dir "just works" with no pre-create.
