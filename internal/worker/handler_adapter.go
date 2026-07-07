@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -49,6 +50,13 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	// Redis payloads arrive via json.Unmarshal, so numbers are float64 and
 	// booleans are bool. Coerce all values to strings so handlers can parse
 	// them with strconv.
+	//
+	// Scalars keep their fmt.Sprint form (so existing handlers' strconv/bool
+	// parsing is unchanged). NESTED values (a JSON object or array -- e.g. the
+	// SERVICE_START "env" map, citadel-cli#462) are json-encoded instead of
+	// fmt.Sprint'd: fmt.Sprint on a map yields the unparseable Go form
+	// "map[K:v]", which loses the structure. This is a shared chokepoint for
+	// every legacy handler, so the change is deliberately limited to maps/slices.
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
@@ -57,6 +65,12 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 				nexusJob.Payload[k] = val
 			case nil:
 				// skip nil values
+			case map[string]any, []any:
+				if encoded, err := json.Marshal(val); err == nil {
+					nexusJob.Payload[k] = string(encoded)
+				} else {
+					nexusJob.Payload[k] = fmt.Sprint(val)
+				}
 			default:
 				nexusJob.Payload[k] = fmt.Sprint(val)
 			}
