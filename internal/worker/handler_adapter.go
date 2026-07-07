@@ -225,6 +225,11 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// with the workspace so it can validate audio paths the same way the
 			// file handlers do.
 			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
+			// Auto-join meeting notetaker (aceteam#5098): records the call into a
+			// per-meeting null sink, then transcribes it via the handler above.
+			// Needs the workspace both to write the recording and to validate the
+			// audio path for transcription, so it lives inside this gate.
+			NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
 		)
 	}
 

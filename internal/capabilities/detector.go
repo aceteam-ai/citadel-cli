@@ -182,6 +182,14 @@ func DetectNodeCapabilities() *NodeCapabilities {
 		}
 	}
 
+	// Advertise the meeting-notetaker capability only when this node can actually
+	// run one: a working audio-capture stack (PulseAudio + ffmpeg + pactl), a
+	// launchable Chromium, and Xvfb for the headless virtual display. Backend
+	// routes MEETING_JOIN jobs to nodes carrying this tag (aceteam#5098).
+	if detectMeetingCapability() {
+		caps.Tags = append(caps.Tags, "meeting")
+	}
+
 	// Always add cpu:general
 	caps.Tags = append(caps.Tags, "cpu:general")
 
@@ -431,6 +439,25 @@ func detectOllamaModels() []Capability {
 
 func detectCPU() []Capability {
 	return []Capability{{Tag: "cpu:general", Category: "cpu", Description: "General CPU compute"}}
+}
+
+// detectMeetingCapability reports whether this node can run the auto-join meeting
+// notetaker (aceteam#5098). It composes the three real dependency probes through
+// the pure meetingCapable predicate so the gating logic itself is unit-testable
+// without a live audio stack or browser.
+func detectMeetingCapability() bool {
+	return meetingCapable(
+		platform.AudioStackAvailable(),
+		platform.ChromiumAvailable(),
+		platform.XvfbAvailable(),
+	)
+}
+
+// meetingCapable is the pure gating predicate for the `meeting` tag: all three
+// dependencies (audio capture, Chromium, Xvfb) must be present. Extracted so the
+// AND-of-deps logic is testable in isolation from the shell-outs.
+func meetingCapable(audioOK, chromeOK, xvfbOK bool) bool {
+	return audioOK && chromeOK && xvfbOK
 }
 
 // NormalizeGPUName converts a full GPU name to a short tag-friendly identifier.

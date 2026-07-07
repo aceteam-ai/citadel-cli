@@ -139,6 +139,7 @@ const (
 	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION"  // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
 	JobTypeInstanceMessage   = "INSTANCE_MESSAGE"    // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet         = "MODULE_SET"          // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeMeetingJoin       = "MEETING_JOIN"        // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 )
 
 // allKnownJobTypes enumerates every job type this citadel build knows about.
@@ -187,4 +188,5 @@ var allKnownJobTypes = []string{
 	JobTypeWhatsAppProvision,
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
+	JobTypeMeetingJoin,
 }

@@ -378,3 +378,29 @@ func TestResolveQueuesWithEngines(t *testing.T) {
 		}
 	}
 }
+
+func TestMeetingCapable(t *testing.T) {
+	// The meeting tag requires ALL three deps: audio stack, Chromium, and Xvfb.
+	cases := []struct {
+		audio, chrome, xvfb bool
+		want                bool
+	}{
+		{true, true, true, true},
+		{false, true, true, false},
+		{true, false, true, false},
+		{true, true, false, false},
+		{false, false, false, false},
+	}
+	for _, c := range cases {
+		if got := meetingCapable(c.audio, c.chrome, c.xvfb); got != c.want {
+			t.Errorf("meetingCapable(audio=%v,chrome=%v,xvfb=%v) = %v, want %v",
+				c.audio, c.chrome, c.xvfb, got, c.want)
+		}
+	}
+
+	// The "meeting" tag itself must be a valid capability tag or the live
+	// aggregator would silently drop it.
+	if !ValidateTag("meeting") {
+		t.Error(`ValidateTag("meeting") = false; the meeting tag would be dropped`)
+	}
+}
