@@ -285,7 +285,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start the dedicated mTLS control listener for mutating endpoints (#5028).
 	// When it is not enabled, the mutating endpoints stay refused everywhere
 	// (fail closed) via the plaintext stub.
-	s.startControlServer(errChan)
+	s.startControlServer()
 
 	// Wait for context cancellation or server error
 	select {
@@ -308,7 +308,7 @@ func (s *Server) Start(ctx context.Context) error {
 // SAN identity. Serves on a local TCP port plus any listeners added via
 // AddControlListener (e.g., the tsnet VPN listener). No-op (fail closed) when the
 // control listener is not enabled.
-func (s *Server) startControlServer(errChan chan<- error) {
+func (s *Server) startControlServer() {
 	if !s.controlEnabled() {
 		log.Printf("[status] mTLS control listener DISABLED: SSH-key injection and other " +
 			"mutating control endpoints are refused (no fabric CA verifier / server cert configured)")
@@ -325,15 +325,14 @@ func (s *Server) startControlServer(errChan chan<- error) {
 	}
 
 	// Local TCP listener, TLS-wrapped. ServeTLS with empty cert/key paths uses the
-	// certificate already set in TLSConfig.
+	// certificate already set in TLSConfig. A failure here (e.g. the control port
+	// is occupied) must NOT tear down the read-only status server -- it only means
+	// the mutating endpoints stay refused (fail closed), so we log and move on
+	// rather than propagating to the status server's fatal error path.
 	go func() {
 		log.Printf("[status] mTLS control listener on :%d (coordinator client cert required)", s.controlPort)
 		if err := s.controlHTTPServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			select {
-			case errChan <- fmt.Errorf("control listener: %w", err):
-			default:
-				log.Printf("[status] control listener error: %v", err)
-			}
+			log.Printf("[status] mTLS control listener error (mutating endpoints refused): %v", err)
 		}
 	}()
 
