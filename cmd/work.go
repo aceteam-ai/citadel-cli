@@ -1157,8 +1157,29 @@ func runWork(cmd *cobra.Command, args []string) {
 		// control listener OFF -- the mutating endpoints then stay refused on the
 		// plaintext path (fail closed), never reverting to VPN-origin trust.
 		controlPortForVPN := 0
-		if caBundle := strings.TrimSpace(os.Getenv("CITADEL_FABRIC_CA_BUNDLE")); caBundle != "" {
+		caBundle := strings.TrimSpace(os.Getenv("CITADEL_FABRIC_CA_BUNDLE"))
+		if caBundle == "" {
+			// Provision the fabric CA trust root so the mTLS control listener has
+			// a trust anchor without manual env config (#5028). Fetched once at
+			// startup from the coordinator; a cached bundle is reused on fetch
+			// failure so a transient backend blip does not disable SSH-deploy on
+			// an already-provisioned node. A CA rotation requires a restart to
+			// re-fetch. Fails closed (listener stays off) only on a first-ever
+			// cold start with no cache and no reachable backend.
+			if bundlePath, berr := status.EnsureFabricCABundle(baseURL, platform.ConfigDir()); berr != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Fabric CA bundle unavailable (%v); mTLS control listener disabled, SSH-key injection refused\n", berr)
+			} else {
+				caBundle = bundlePath
+			}
+		}
+		if caBundle != "" {
 			coordinatorSANs := splitAndTrim(os.Getenv("CITADEL_COORDINATOR_SANS"))
+			if len(coordinatorSANs) == 0 {
+				// Default to the platform coordinator identity so upgraded nodes
+				// allowlist the relay out of the box (#5028). Without at least one
+				// SAN the verifier refuses to construct and the listener stays off.
+				coordinatorSANs = []string{status.DefaultCoordinatorSAN}
+			}
 			verifier, verr := status.NewFabricCAVerifier(caBundle, coordinatorSANs)
 			if verr != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (%v); SSH-key injection stays refused\n", verr)

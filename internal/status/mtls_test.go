@@ -310,3 +310,34 @@ func TestSSHInjectionOverMTLS(t *testing.T) {
 		}
 	})
 }
+
+// --- default coordinator SAN: cross-repo contract pin (#5028) --------------
+
+// TestDefaultCoordinatorSANContract pins the exact SAN literal that the backend
+// fabric CA (python-backend profile.COORDINATOR_URI) mints into the relay's
+// client cert. A drift on either side silently breaks SSH-deploy fleetwide, so
+// this asserts the literal string AND that a leaf carrying it is authorized when
+// the verifier is built with the default, while a node identity is not.
+func TestDefaultCoordinatorSANContract(t *testing.T) {
+	if DefaultCoordinatorSAN != "aceteam:coordinator" {
+		t.Fatalf("DefaultCoordinatorSAN = %q, want %q (must match backend COORDINATOR_URI)",
+			DefaultCoordinatorSAN, "aceteam:coordinator")
+	}
+
+	ca := newTestCA(t, "fabric-ca")
+	bundle := writeBundle(t, ca.certPEM)
+	v, err := NewFabricCAVerifier(bundle, []string{DefaultCoordinatorSAN})
+	if err != nil {
+		t.Fatalf("verifier with default SAN: %v", err)
+	}
+
+	coordLeaf := ca.issueLeaf(t, "coordinator", DefaultCoordinatorSAN)
+	if !v.isCoordinator(coordLeaf.Leaf) {
+		t.Error("a leaf carrying the default coordinator SAN must be authorized")
+	}
+
+	nodeLeaf := ca.issueLeaf(t, "some-node", "aceteam:node:abc", "aceteam:org:some-org")
+	if v.isCoordinator(nodeLeaf.Leaf) {
+		t.Error("a node identity must NOT be authorized as the coordinator")
+	}
+}
