@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1149,6 +1150,48 @@ func runWork(cmd *cobra.Command, args []string) {
 			}
 		}
 
+		// Gate the MUTATING control endpoints (SSH-key injection) behind a
+		// coordinator mTLS client certificate on a dedicated control listener
+		// (issue #5028). Enabled only when a fabric CA bundle AND coordinator
+		// identities are configured. If construction fails, we log and leave the
+		// control listener OFF -- the mutating endpoints then stay refused on the
+		// plaintext path (fail closed), never reverting to VPN-origin trust.
+		controlPortForVPN := 0
+		if caBundle := strings.TrimSpace(os.Getenv("CITADEL_FABRIC_CA_BUNDLE")); caBundle != "" {
+			coordinatorSANs := splitAndTrim(os.Getenv("CITADEL_COORDINATOR_SANS"))
+			verifier, verr := status.NewFabricCAVerifier(caBundle, coordinatorSANs)
+			if verr != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (%v); SSH-key injection stays refused\n", verr)
+			} else {
+				var ctrlIPs []net.IP
+				if ip4, _ := network.GetGlobalIPv4(); ip4 != "" {
+					if ip := net.ParseIP(ip4); ip != nil {
+						ctrlIPs = append(ctrlIPs, ip)
+					}
+				}
+				ctrlCert, certErr := tlscert.EnsureCert(tlscert.Config{
+					Hostname:    nodeName,
+					IPAddresses: ctrlIPs,
+					CertDir:     filepath.Join(platform.ConfigDir(), "control-tls"),
+				})
+				if certErr != nil {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
+				} else {
+					controlPort := status.DefaultControlPort
+					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
+						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
+							controlPort = parsed
+						}
+					}
+					serverCfg.CAVerifier = verifier
+					serverCfg.ControlServerCert = &ctrlCert
+					serverCfg.ControlPort = controlPort
+					controlPortForVPN = controlPort
+					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints (#5028)\n", controlPort)
+				}
+			}
+		}
+
 		statusServer := status.NewServer(serverCfg, collector)
 
 		// Register provisioning API routes on the status server
@@ -1174,6 +1217,20 @@ func runWork(cmd *cobra.Command, args []string) {
 				statusServer.AddListener(vpnLn)
 				Log("status server VPN listener on %s:%s", vpnIP, vpnPort)
 				fmt.Printf("   - Status server VPN: http://%s:%d\n", vpnIP, workStatusPort)
+			}
+
+			// Also expose the mTLS control listener over the mesh so the
+			// coordinator can reach the mutating endpoints via the VPN (#5028).
+			if controlPortForVPN > 0 {
+				ctrlPort := fmt.Sprintf("%d", controlPortForVPN)
+				if ctrlLn, ctrlIP, err := network.ListenVPN("tcp", ctrlPort); err != nil {
+					Log("control server VPN listener failed (LAN-only): %v", err)
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Control server VPN listener failed (LAN-only): %v\n", err)
+				} else {
+					statusServer.AddControlListener(ctrlLn)
+					Log("control server VPN listener on %s:%s", ctrlIP, ctrlPort)
+					fmt.Printf("   - Control server VPN (mTLS): https://%s:%d\n", ctrlIP, controlPortForVPN)
+				}
 			}
 		}
 
@@ -2374,4 +2431,17 @@ func initProvisionHandler() *provision.Handler {
 	// was down and updates their status accordingly.
 	mgr.ReconcileAll(context.Background())
 	return provision.NewHandler(mgr)
+}
+
+// splitAndTrim splits a comma-separated env value into non-empty, trimmed items.
+// Used for CITADEL_COORDINATOR_SANS (the allowlist of coordinator SAN URIs that
+// may invoke mutating control endpoints -- issue #5028).
+func splitAndTrim(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
