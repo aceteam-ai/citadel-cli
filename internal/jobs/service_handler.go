@@ -43,6 +43,10 @@ type ServiceHandler struct {
 	// workspace (e.g. the transcribe sidecar) resolve to an absolute path even
 	// when the worker was started without CITADEL_WORKSPACE in its environment.
 	WorkspaceDir string
+	// instances is the registry of payload-launched agent-runtime instances
+	// (BYOC, citadel-cli#462), lazily initialized. These live outside
+	// citadel.yaml, so SERVICE_STOP / SERVICE_STATUS find them here.
+	instances *instanceStore
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
@@ -79,6 +83,31 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 	}
 
 	ctx.Log("info", "     - [Job %s] Service %s: %s", job.ID, job.Type, svcName)
+
+	// Extended-payload launch path (BYOC agent runtimes, citadel-cli#462). A
+	// SERVICE_START that carries an inline spec (image/env/host_port/volume) is
+	// launched from the payload; it does not exist in citadel.yaml or the
+	// embedded ServiceMap. The name-based manifest path below is left untouched
+	// for embedded services.
+	if job.Type == "SERVICE_START" && payloadHasInlineSpec(job.Payload) {
+		return h.serviceStartPayload(ctx, job)
+	}
+
+	// SERVICE_STOP / SERVICE_STATUS for a previously payload-launched instance:
+	// it is in neither the manifest nor the embedded map, so resolve it from the
+	// instance store before falling through to the manifest path.
+	if job.Type == "SERVICE_STOP" || job.Type == "SERVICE_STATUS" {
+		if rec, ok, sErr := h.instanceStore().Get(svcName); sErr != nil {
+			ctx.Log("warning", "     - [Job %s] instance store read failed: %v", job.ID, sErr)
+		} else if ok {
+			switch job.Type {
+			case "SERVICE_STATUS":
+				return h.serviceStatusPayload(rec)
+			case "SERVICE_STOP":
+				return h.serviceStopPayload(ctx, rec)
+			}
+		}
+	}
 
 	// Load manifest and validate service name against it.
 	manifest, err := h.loadManifest()

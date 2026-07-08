@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -140,6 +141,66 @@ func TestLegacyHandlerAdapterPayloadConversion(t *testing.T) {
 	}
 
 	_ = capturedJob // silence unused variable
+}
+
+// TestLegacyHandlerAdapterPayloadEncoding verifies the map[string]any ->
+// map[string]string down-conversion: scalars keep their fmt.Sprint form
+// (unchanged behavior for existing handlers), while nested objects/arrays are
+// json-encoded so their structure survives (the SERVICE_START "env" map,
+// citadel-cli#462). Without this, fmt.Sprint on a map yields the unparseable Go
+// "map[K:v]" form.
+func TestLegacyHandlerAdapterPayloadEncoding(t *testing.T) {
+	handler := &TestLegacyHandler{output: "ok"}
+	adapter := NewLegacyHandlerAdapter("SERVICE_START", handler)
+
+	job := &Job{
+		ID:   "job-enc",
+		Type: "SERVICE_START",
+		Payload: map[string]any{
+			"service":   "ac-x",                             // scalar string
+			"host_port": float64(18789),                     // JSON number -> "18789"
+			"flag":      true,                               // bool -> "true"
+			"env":       map[string]any{"K": "v", "A": "b"}, // nested object -> JSON
+			"ports":     []any{float64(1), float64(2)},      // nested array -> JSON
+			"skip":      nil,                                // dropped
+		},
+	}
+
+	if _, err := adapter.Execute(context.Background(), job, &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := handler.capturedPayload
+
+	// Scalars unchanged.
+	if got["service"] != "ac-x" {
+		t.Errorf("service = %q, want ac-x", got["service"])
+	}
+	if got["host_port"] != "18789" {
+		t.Errorf("host_port = %q, want 18789 (scalar untouched)", got["host_port"])
+	}
+	if got["flag"] != "true" {
+		t.Errorf("flag = %q, want true (scalar untouched)", got["flag"])
+	}
+	// nil dropped.
+	if _, ok := got["skip"]; ok {
+		t.Errorf("nil value should be dropped, got %q", got["skip"])
+	}
+	// Nested object -> parseable JSON (round-trips to the same map).
+	var env map[string]string
+	if err := json.Unmarshal([]byte(got["env"]), &env); err != nil {
+		t.Fatalf("env is not JSON: %q (%v)", got["env"], err)
+	}
+	if env["K"] != "v" || env["A"] != "b" {
+		t.Errorf("env round-trip = %v, want map[A:b K:v]", env)
+	}
+	// Nested array -> parseable JSON.
+	var ports []int
+	if err := json.Unmarshal([]byte(got["ports"]), &ports); err != nil {
+		t.Fatalf("ports is not JSON: %q (%v)", got["ports"], err)
+	}
+	if len(ports) != 2 || ports[0] != 1 || ports[1] != 2 {
+		t.Errorf("ports round-trip = %v, want [1 2]", ports)
+	}
 }
 
 func TestCreateLegacyHandlers(t *testing.T) {
