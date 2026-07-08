@@ -926,3 +926,28 @@ Auto-generated log of every release.
   - fix(gateway): registry-driven exposure of provisioned modules on the tsnet mesh (#447) (#448)
 
 
+---
+
+## v2.66.0 — 2026-07-07
+
+| Metric | Value |
+|--------|-------|
+| Commits | 11 |
+| Files changed | 34 |
+| Lines added | +3197 |
+
+**Changes:**
+
+  - fix(services): launch SERVICE_START extended instance payloads (#462) (#463)
+  - node: provision fabric CA bundle for mTLS control listener (#5028)
+  - control-listener failure must not tear down the read-only status server (#5028)
+  - tests: coordinator mTLS gate + fail-closed plaintext SSH path (#5028)
+  - gate SSH-key injection behind coordinator mTLS control listener (#5028)
+  - fix: route claudecode module host port through the host-port registry (#460)
+  - ci: build+push claudecode-service image to GHCR (#459)
+  - fix: stop control center competing for per-node jobs (#456) (#457)
+  - fix(worklock): reused-PID liveness check + richer lock record (#455)
+  - fix: only warn about WHATSAPP_ALLOW_PRIVATE_NETWORK for non-mesh private hosts (#451)
+  - chore: sync generated files after v2.65.0 release
+
+
