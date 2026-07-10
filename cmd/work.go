@@ -1145,6 +1145,12 @@ func runWork(cmd *cobra.Command, args []string) {
 			if serverCfg.TokenValidator != nil {
 				serverCfg.EnableDesktop = true
 				Debug("desktop API enabled (per-request VNC readiness checks)")
+				// Bundle VNC startup so the shared desktop works with zero
+				// manual `citadel vnc enable` (#483). Idempotent, headless-safe,
+				// loopback-bound; non-fatal so a missing x11vnc never blocks the worker.
+				if verr := platform.EnsureGatewayVNC(platform.DefaultVNCPort); verr != nil {
+					fmt.Fprintf(os.Stderr, "   - desktop VNC not auto-started: %v\n", verr)
+				}
 			} else {
 				fmt.Fprintln(os.Stderr, "   - desktop permission granted but API disabled (no org ID for auth)")
 			}
