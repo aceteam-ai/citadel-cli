@@ -116,6 +116,11 @@ func TestParseInstanceSpec_Rejects(t *testing.T) {
 		{"empty env key", func(p map[string]string) { p["env"] = `{"":"v"}` }, "empty key"},
 		{"host_port not a number", func(p map[string]string) { p["host_port"] = "abc" }, "invalid host_port"},
 		{"host_port reserved", func(p map[string]string) { p["host_port"] = reservedPort }, "reserved for citadel"},
+		{"host_network not boolean", func(p map[string]string) { p["host_network"] = "maybe" }, "invalid host_network"},
+		{"host_network port out of range", func(p map[string]string) {
+			p["host_network"] = "true"
+			p["host_port"] = "70000"
+		}, "out of range"},
 		{"volume outside data dir", func(p map[string]string) { p["state_volume_path"] = "/etc" }, "outside the citadel data dir"},
 		{"volume traversal via ~", func(p map[string]string) { p["state_volume_path"] = "~/../../etc/passwd" }, "outside the citadel data dir"},
 		{"relative mount path", func(p map[string]string) { p["state_mount_path"] = "state" }, "must be an absolute container path"},
@@ -135,6 +140,45 @@ func TestParseInstanceSpec_Rejects(t *testing.T) {
 				t.Errorf("error = %q, want substring %q", err.Error(), tt.errSub)
 			}
 		})
+	}
+}
+
+func TestParseInstanceSpec_HostNetwork(t *testing.T) {
+	// The livekit shape: host networking, and a host_port that IS in the
+	// reserved set (7880 is reserved FOR livekit). Without a -p publish the
+	// reserved-port guard must not apply.
+	p := basePayload()
+	p["host_network"] = "true"
+	p["host_port"] = itoa(embeddedservices.LiveKitWSPort)
+	p["env"] = `{"PORT":"7880","LIVEKIT_CONFIG":"port: 7880"}`
+
+	spec, err := parseInstanceSpec(p, testHome)
+	if err != nil {
+		t.Fatalf("parseInstanceSpec: %v", err)
+	}
+	if !spec.HostNetwork {
+		t.Error("HostNetwork = false, want true")
+	}
+	if spec.HostPort != embeddedservices.LiveKitWSPort {
+		t.Errorf("HostPort = %d, want %d", spec.HostPort, embeddedservices.LiveKitWSPort)
+	}
+	if spec.ContainerPort != 7880 {
+		t.Errorf("ContainerPort = %d, want 7880 (from env PORT)", spec.ContainerPort)
+	}
+
+	// Omitted / explicit-false keeps the publish path and its reserved guard.
+	for _, raw := range []string{"", "false"} {
+		p := basePayload()
+		if raw != "" {
+			p["host_network"] = raw
+		}
+		spec, err := parseInstanceSpec(p, testHome)
+		if err != nil {
+			t.Fatalf("host_network=%q: %v", raw, err)
+		}
+		if spec.HostNetwork {
+			t.Errorf("host_network=%q: HostNetwork = true, want false", raw)
+		}
 	}
 }
 
@@ -224,6 +268,34 @@ func TestBuildDockerRunArgs(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("docker run args missing %q\n got: %s", want, joined)
 		}
+	}
+}
+
+func TestBuildDockerRunArgs_HostNetwork(t *testing.T) {
+	spec := &instanceSpec{
+		ServiceName:     "livekit",
+		ContainerName:   "citadel-livekit",
+		Image:           "ghcr.io/aceteam-ai/livekit-server:v1.13.3",
+		Env:             map[string]string{"LIVEKIT_CONFIG": "port: 7880", "PORT": "7880"},
+		HostPort:        7880,
+		ContainerPort:   7880,
+		StateVolumePath: "/home/citadel/citadel-cache/livekit",
+		StateMountPath:  "/state",
+		HostNetwork:     true,
+	}
+	args := buildDockerRunArgs(spec)
+	joined := strings.Join(args, " ")
+
+	if !strings.Contains(joined, "--network host") {
+		t.Errorf("docker run args missing --network host: %s", joined)
+	}
+	for i, a := range args {
+		if a == "-p" {
+			t.Errorf("host-network launch must not publish ports, found -p %s", args[i+1])
+		}
+	}
+	if args[len(args)-1] != spec.Image {
+		t.Errorf("image is not the last arg: %v", args)
 	}
 }
 
