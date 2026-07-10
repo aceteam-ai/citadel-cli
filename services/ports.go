@@ -66,18 +66,29 @@ const (
 	// agent-runtime module (Hermes/OpenClaw) is allocated 8205 rather than
 	// re-hardcoding 8204.
 	ClaudecodeHostPort = 8204
+	// storage: the on-node S3-compatible object store (VersityGW, #469). It is
+	// NOT a compose service and has no ${CITADEL_*_HOST_PORT} env var -- the
+	// `citadel storage` command constructs its `docker run` publish directly from
+	// this constant (internal/storage). It sits above the earmarked 8205
+	// Hermes/OpenClaw slot so a fixed, reboot-stable port is signed into S3
+	// presigned URLs without a persisted-port crash-loop risk. Kept in the
+	// registry so future allocations skip it and the collision guard covers it.
+	StorageHostPort = 8206
 )
 
-// ServiceHostPorts maps service name -> citadel-assigned host port for every
-// service whose host publish citadel owns via env-var substitution. The
-// collision guard test unions this with the apps catalog and the parsed compose
-// files to prove no two host ports clash.
+// ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
+// are compose services whose host publish citadel owns via env-var substitution;
+// "storage" is the exception -- it has no compose file and is consumed directly
+// by the storage command's `docker run` construction. The collision guard test
+// unions this with the apps catalog and the parsed compose files to prove no two
+// host ports clash.
 var ServiceHostPorts = map[string]int{
 	"llamacpp":   LlamacppHostPort,
 	"vllm":       VLLMHostPort,
 	"extraction": ExtractionHostPort,
 	"diffusers":  DiffusersHostPort,
 	"claudecode": ClaudecodeHostPort,
+	"storage":    StorageHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
