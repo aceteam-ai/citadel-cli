@@ -625,13 +625,12 @@ func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
 	}
 
 	if authFile != "" {
-		// An explicit auth file was found -- use it directly.
-		// Use the DISPLAY env var so we target the correct X11
-		// display (e.g. :1 on GDM3 systems) instead of assuming :0.
-		display := os.Getenv("DISPLAY")
-		if display == "" {
-			display = ":0"
-		}
+		// An explicit auth file was found -- use it directly. Resolve the
+		// active display (e.g. :1 on GDM3) rather than assuming :0; a
+		// systemd --user service has no DISPLAY in its env, so the old
+		// os.Getenv+":0" fallback targeted the wrong (or a nonexistent)
+		// server. See ResolveX11Env / aceteam-ai/citadel-cli#287.
+		display, _ := ResolveX11Env()
 		args = append([]string{"-display", display}, args...)
 		args = append(args, "-auth", authFile)
 	} else {
@@ -663,6 +662,16 @@ func (l *LinuxVNCManager) resolveXAuth() (authFile string, needsSudo bool) {
 	// 2. Check user's own ~/.Xauthority
 	if home, err := os.UserHomeDir(); err == nil {
 		xauth := filepath.Join(home, ".Xauthority")
+		if _, err := os.Stat(xauth); err == nil {
+			return xauth, false
+		}
+	}
+
+	// 2b. The active X server's own cookie (e.g. GDM's per-user
+	// /run/user/<uid>/gdm/Xauthority, owned by this user so no sudo needed).
+	// This is the common case for a systemd --user service on a GDM desktop,
+	// where neither XAUTHORITY nor ~/.Xauthority is set.
+	if _, xauth := ResolveX11Env(); xauth != "" {
 		if _, err := os.Stat(xauth); err == nil {
 			return xauth, false
 		}
