@@ -2,11 +2,12 @@ package deskstream
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // EncoderKind identifies which H.264 encoder ffmpeg will use.
@@ -28,7 +29,8 @@ type EncoderProbe func(name string) bool
 
 // EncodeConfig describes a capture+encode session.
 type EncodeConfig struct {
-	Display          string // X display, e.g. ":0"
+	Display          string // X display, e.g. ":1"
+	XAuthority       string // X cookie file; empty means none needed
 	Width            int    // capture width in pixels
 	Height           int    // capture height in pixels
 	FPS              int    // target frame rate
@@ -158,13 +160,18 @@ func buildFFmpegArgs(cfg EncodeConfig, enc EncoderKind) []string {
 	return args
 }
 
-// resolveDisplay returns the X display to capture: the DISPLAY env var, or ":0"
-// as a fallback (matching internal/desktop's screenshot path).
+// resolveX11 returns the X display and Xauthority to capture. It shares the
+// resolver used by the screenshot path so a systemd --user service (no DISPLAY
+// in its env) still finds the active session's display + cookie instead of the
+// old hardcoded ":0" with no auth (aceteam-ai/citadel-cli#287 family).
+func resolveX11() (display, xauthority string) {
+	return platform.ResolveX11Env()
+}
+
+// resolveDisplay returns just the X display (for capability checks).
 func resolveDisplay() string {
-	if d := os.Getenv("DISPLAY"); d != "" {
-		return d
-	}
-	return ":0"
+	d, _ := resolveX11()
+	return d
 }
 
 // H264Available reports whether this node can serve an H.264 desktop stream:

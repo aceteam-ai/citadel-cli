@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const actionTimeout = 5 * time.Second
@@ -213,12 +215,12 @@ func ExecuteActions(ctx context.Context, actions []Action) error {
 }
 
 func executeLinuxActions(ctx context.Context, actions []Action) error {
-	display := os.Getenv("DISPLAY")
-	if display == "" {
-		display = ":0"
-	}
+	display, xauthority := platform.ResolveX11Env()
 
 	env := append(os.Environ(), "DISPLAY="+display)
+	if xauthority != "" {
+		env = append(env, "XAUTHORITY="+xauthority)
+	}
 
 	xdotoolPath, err := exec.LookPath("xdotool")
 	if err != nil {
