@@ -1,4 +1,9 @@
 faster-whisper==1.0.3
+# faster-whisper 1.0.3 imports `requests` at module load (faster_whisper/utils.py)
+# but does not declare it, and recent huggingface_hub no longer pulls it in
+# transitively -- so it must be pinned explicitly or the first /transcribe call
+# 500s with ModuleNotFoundError while /health still passes (model is lazy-loaded).
+requests==2.32.3
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4
