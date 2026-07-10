@@ -973,3 +973,21 @@ Auto-generated log of every release.
   - ci(whisper-service): build + publish image to GHCR (#465) (#467)
 
 
+---
+
+## v2.68.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 12 |
+| Lines added | +322 |
+
+**Changes:**
+
+  - feat(desktop): auto-start loopback VNC when desktop enabled (#483) (#484)
+  - Merge pull request #479 from aceteam-ai/feat/livekit-support
+  - fix: pass install-time <name>.env to every service compose invocation
+  - feat: reserve livekit ports + host-network payload launches
+
+
