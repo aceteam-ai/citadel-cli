@@ -231,7 +231,8 @@ func restartAllServices() {
 		}
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
-		composeCmd := composeCommand("-f", fullComposePath, "restart")
+		restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "restart")
+		composeCmd := composeCommand(restartArgs...)
 		output, err := composeCmd.CombinedOutput()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))

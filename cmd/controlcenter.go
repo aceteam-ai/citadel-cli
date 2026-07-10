@@ -1179,7 +1179,8 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			if _, err := os.Stat(fullComposePath); err == nil {
-				psCmd := composeCommand("-f", fullComposePath, "ps", "--format", "json")
+				psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
+				psCmd := composeCommand(psArgs...)
 				if output, err := psCmd.Output(); err == nil {
 					var containers []struct {
 						State  string `json:"State"`
@@ -1366,7 +1367,8 @@ func ccStopService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "down")
+			downArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "down")
+			cmd := composeCommand(downArgs...)
 			return cmd.Run()
 		}
 	}
@@ -1384,7 +1386,8 @@ func ccRestartService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "restart")
+			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "restart")
+			cmd := composeCommand(restartArgs...)
 			return cmd.Run()
 		}
 	}
@@ -1407,7 +1410,8 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 			}
 
 			// Get container info via docker compose ps
-			psCmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "ps", "--format", "json")
+			psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "ps", "--format", "json")
+			psCmd := composeCommand(psArgs...)
 			if output, err := psCmd.Output(); err == nil {
 				var container struct {
 					ID      string `json:"ID"`
@@ -1448,7 +1452,8 @@ func ccGetServiceLogs(name string) ([]string, error) {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := composeCommand("-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			logArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			cmd := composeCommand(logArgs...)
 			output, err := cmd.Output()
 			if err != nil {
 				return nil, err
