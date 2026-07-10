@@ -147,6 +147,60 @@ func TestResolveConsumerGroup(t *testing.T) {
 	}
 }
 
+// TestMeetingQueueName guards the org-scoped meeting-notetaker tag queue naming
+// convention. This string MUST match the Python dispatch helper byte-for-byte,
+// otherwise MEETING_JOIN auto-join dispatch (aceteam-ai/aceteam#5098) never
+// reaches the node. The bare jobs:v1:tag:meeting queue is rejected server-side.
+func TestMeetingQueueName(t *testing.T) {
+	tests := []struct {
+		orgID string
+		want  string
+	}{
+		{
+			orgID: "550e8400-e29b-41d4-a716-446655440000",
+			want:  "jobs:v1:tag:meeting:org_550e8400-e29b-41d4-a716-446655440000",
+		},
+		{
+			orgID: "test-org-id",
+			want:  "jobs:v1:tag:meeting:org_test-org-id",
+		},
+	}
+
+	for _, tt := range tests {
+		got := meetingQueueName(tt.orgID)
+		if got != tt.want {
+			t.Errorf("meetingQueueName(%q) = %q, want %q", tt.orgID, got, tt.want)
+		}
+	}
+}
+
+// TestHasCapabilityTag verifies the gate that decides whether a node subscribes
+// to the meeting queue: only nodes advertising the "meeting" capability tag do,
+// so a node without the audio/Chromium/Xvfb stack never claims a job it cannot
+// run.
+func TestHasCapabilityTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tags []string
+		tag  string
+		want bool
+	}{
+		{"present", []string{"cpu:general", "meeting", "os:linux"}, "meeting", true},
+		{"absent", []string{"cpu:general", "os:linux"}, "meeting", false},
+		{"nil tags", nil, "meeting", false},
+		{"empty tags", []string{}, "meeting", false},
+		{"no partial match", []string{"meeting:room"}, "meeting", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasCapabilityTag(tt.tags, tt.tag); got != tt.want {
+				t.Errorf("hasCapabilityTag(%v, %q) = %v, want %v", tt.tags, tt.tag, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestNodeQueueName guards the per-node shell stream naming convention. This
 // string MUST match the Python build_node_queue helper byte-for-byte, otherwise
 // node-targeted jobs (issue #3914) silently fall back to the shared stream and

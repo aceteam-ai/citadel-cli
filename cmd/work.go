@@ -999,6 +999,47 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("per-node shell stream skipped: Headscale node ID unavailable")
 	}
 
+	// Subscribe to the org-scoped meeting-notetaker queue when this node can
+	// actually run a meeting bot. The backend routes MEETING_JOIN jobs to the
+	// per-org tag queue jobs:v1:tag:meeting:org_{org_id} (a security fix rejected
+	// the bare cross-org queue), so a node has to consume that exact stream for
+	// auto-join dispatch to reach it (aceteam-ai/aceteam#5098).
+	//
+	// Gated on the node advertising the "meeting" capability tag rather than
+	// subscribed unconditionally like the shell stream: a node lacking the
+	// audio-capture stack, Chromium, or Xvfb cannot run a meeting bot, so
+	// claiming the job would only fail it. The capability detector adds this tag
+	// only when that stack is present, and the MEETING_JOIN handler ships behind
+	// the same gate, so subscription, capability, and handler activate together.
+	if nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
+		meetingOrgID := ""
+		if deviceConfig != nil {
+			meetingOrgID = deviceConfig.OrgID
+		}
+		if meetingOrgID == "" {
+			if manifest, _, mErr := findAndReadManifest(); mErr == nil && manifest != nil {
+				meetingOrgID = manifest.Node.OrgID
+			}
+		}
+		if meetingOrgID != "" {
+			meetingQueue := meetingQueueName(meetingOrgID)
+			switch src := source.(type) {
+			case *worker.APISource:
+				src.AddQueue(meetingQueue)
+			case *worker.RedisSource:
+				if err := src.AddQueue(ctx, meetingQueue); err != nil {
+					fmt.Fprintf(os.Stderr, "   - Warning: meeting queue subscribe failed: %v\n", err)
+				}
+			}
+			fmt.Printf("   - Meeting notetaker queue: %s\n", meetingQueue)
+			Debug("meeting queue: %s", meetingQueue)
+		} else {
+			fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
+				"meeting auto-join dispatch will not reach this node")
+			Debug("meeting queue skipped: org id unknown")
+		}
+	}
+
 	// Populate the worker introspection state with the resolved identity and
 	// the full subscribed queue list (issue #236). This drives /agent/worker-status
 	// and the doctor diagnosis below.
@@ -2059,6 +2100,27 @@ func stopManagedServices(started []startedService) {
 // Every online worker in the org consumes it, so any of them may claim a job.
 func shellQueueName(orgID string) string {
 	return fmt.Sprintf("jobs:v1:shell:org_%s", orgID)
+}
+
+// meetingQueueName returns the org-scoped meeting-notetaker tag queue name.
+// The backend dispatches MEETING_JOIN jobs to this per-org tag queue; the bare
+// jobs:v1:tag:meeting queue is rejected server-side to prevent cross-org meeting
+// dispatch (aceteam-ai/aceteam#5098). The string MUST stay byte-for-byte
+// identical to the Python dispatch helper.
+func meetingQueueName(orgID string) string {
+	return fmt.Sprintf("jobs:v1:tag:meeting:org_%s", orgID)
+}
+
+// hasCapabilityTag reports whether the resolved capability tags contain the
+// given tag. Used to gate optional queue subscriptions on the node actually
+// advertising the matching capability.
+func hasCapabilityTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeQueueName returns the per-node shell stream name for node-targeted jobs.
