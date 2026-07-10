@@ -261,7 +261,8 @@ func gatherStatusData() (dashboard.StatusData, error) {
 			if configDir != "" {
 				fullComposePath := filepath.Join(configDir, service.ComposeFile)
 				if _, err := os.Stat(fullComposePath); err == nil {
-					psCmd := composeCommand("-f", fullComposePath, "ps", "--format", "json")
+					psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
+					psCmd := composeCommand(psArgs...)
 					if output, err := psCmd.Output(); err == nil {
 						var containers []struct {
 							State string `json:"State"`
@@ -787,7 +788,8 @@ func printServiceInfo(w *tabwriter.Writer) {
 			continue
 		}
 
-		psCmd := composeCommand("-f", fullComposePath, "ps", "--format", "json")
+		psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
+		psCmd := composeCommand(psArgs...)
 		output, err := psCmd.CombinedOutput() // Use CombinedOutput to get stderr
 		if err != nil {
 			errMsg := string(output)

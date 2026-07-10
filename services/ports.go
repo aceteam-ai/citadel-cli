@@ -156,6 +156,17 @@ const (
 	// --terminal-port, internal/terminal/config.go). The platform relay dials
 	// ws://<vpn_ip>:7860, so this is a live mesh port a module must not take.
 	TerminalPort = 7860
+	// LiveKit SFU ports (voice huddles). The livekit catalog module
+	// (aceteam-ai/citadel-services services/livekit) runs with
+	// `network_mode: host`, so it binds these on the host directly — outside
+	// Docker's publish bookkeeping and outside this registry's env-var
+	// substitution. They are reserved here so no app allocation or module/
+	// payload publish can claim a port the SFU's own config will bind. The
+	// platform relay dials ws://<vpn_ip>:7880 for signaling, so 7880 is a live
+	// mesh port just like TerminalPort.
+	LiveKitWSPort     = 7880
+	LiveKitICETCPPort = 7881
+	LiveKitUDPMuxPort = 7882
 )
 
 // ReservedCitadelPorts is the set of host ports owned by citadel's own
@@ -170,6 +181,9 @@ var ReservedCitadelPorts = map[int]string{
 	VNCPort:           "vnc-rfb",
 	DeskstreamPort:    "deskstream-h264",
 	TerminalPort:      "terminal-server",
+	LiveKitWSPort:     "livekit-signaling",
+	LiveKitICETCPPort: "livekit-ice-tcp",
+	LiveKitUDPMuxPort: "livekit-udp-mux",
 }
 
 // AppsPortRange is the inclusive range apps auto-allocate host ports from

@@ -213,6 +213,11 @@ func composeFileArgs(origComposePath, actualComposePath string) []string {
 	if override := sandboxOverridePathFor(origComposePath); override != "" {
 		args = append(args, "-f", override)
 	}
+	// Pass the install-time config env (<name>.env) explicitly: docker compose
+	// only auto-loads a file literally named ".env", so without this every
+	// ${VAR:?...}-guarded catalog service (claudecode, livekit) fails compose
+	// interpolation despite its config sitting right next to the compose file.
+	args = append(args, compose.EnvFileArgs(origComposePath)...)
 	return args
 }
 

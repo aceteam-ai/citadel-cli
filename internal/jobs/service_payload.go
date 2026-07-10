@@ -16,8 +16,18 @@
 //	  "env":               {"ANTHROPIC_BASE_URL": "...", ...},  // JSON object
 //	  "host_port":         18789,                        // constant today (NOT per-instance)
 //	  "state_volume_path": "~/citadel-cache/instances/<id>",   // literal ~, node-expanded
-//	  "state_mount_path":  "/state"
+//	  "state_mount_path":  "/state",
+//	  "host_network":      "true"                        // optional; omit for the default port publish
 //	}
+//
+// host_network launches the container with `--network host` instead of a
+// `-p 127.0.0.1:<host_port>:<ctr_port>` publish — required for services whose
+// media plane needs real host sockets (the livekit SFU's UDP mux). The
+// container then binds whatever its own config binds; host_port remains
+// required and is used for endpoint reporting/health, so the platform should
+// set env PORT to the same value (e.g. 7880 for livekit) to keep the recorded
+// container port truthful. The grant is gated by the image allowlist below,
+// same as every payload launch.
 //
 // The platform does NOT read back the launched endpoint; it reaches the
 // container at host_port over the mesh. So the host port is published VERBATIM,
@@ -84,6 +94,8 @@ type instanceSpec struct {
 	// (runc). Set so an untrusted BYOC workload can run under a stronger runtime
 	// (aceteam#5028 / substrate spike #468).
 	Runtime string
+	// HostNetwork launches with `--network host` instead of a -p publish.
+	HostNetwork bool
 }
 
 // allowedRuntimes is the strict allowlist of docker `--runtime` values a payload
@@ -128,11 +140,25 @@ func parseInstanceSpec(payload map[string]string, homeDir string) (*instanceSpec
 		return nil, err
 	}
 
+	hostNetwork := false
+	if raw := strings.TrimSpace(payload["host_network"]); raw != "" {
+		parsed, perr := strconv.ParseBool(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid host_network %q: expected a boolean", raw)
+		}
+		hostNetwork = parsed
+	}
+
 	hostPort, err := parsePort(payload["host_port"])
 	if err != nil {
 		return nil, fmt.Errorf("invalid host_port: %w", err)
 	}
-	if err := validateHostPort(hostPort); err != nil {
+	// Under host networking there is no -p publish: the container binds what
+	// its own config binds (for livekit, exactly the ports reserved for it in
+	// services/ports.go), and host_port is informational (endpoint reporting).
+	// The reserved-port guard exists to protect docker publishes, so it only
+	// applies to the publish path.
+	if err := validateHostPort(hostPort, !hostNetwork); err != nil {
 		return nil, err
 	}
 
@@ -176,6 +202,7 @@ func parseInstanceSpec(payload map[string]string, homeDir string) (*instanceSpec
 		StateVolumePath: volPath,
 		StateMountPath:  mountPath,
 		Runtime:         runtime,
+		HostNetwork:     hostNetwork,
 	}, nil
 }
 
@@ -236,10 +263,15 @@ func validateImageRef(image string) error {
 // listeners own (gateway, status server, VNC, terminal, ...). The host-port
 // registry (services/ports.go) is used here for VALIDATION only -- the port is
 // assigned by the platform, not re-allocated -- so a payload can never collide
-// with a citadel-internal listener.
-func validateHostPort(port int) error {
+// with a citadel-internal listener. publish=false (host networking) keeps only
+// the range check: there is no -p, so the reserved-port guard has nothing to
+// protect and would wrongly reject e.g. livekit's own reserved 7880.
+func validateHostPort(port int, publish bool) error {
 	if port < 1 || port > 65535 {
 		return fmt.Errorf("host_port %d out of range", port)
+	}
+	if !publish {
+		return nil
 	}
 	if name, reserved := embeddedservices.ReservedCitadelPorts[port]; reserved {
 		return fmt.Errorf("host_port %d is reserved for citadel's %s listener", port, name)
@@ -337,11 +369,20 @@ func buildDockerRunArgs(spec *instanceSpec) []string {
 		// auto-starts these). STOP does an explicit `docker rm`, so this does
 		// not resurrect a deliberately stopped instance.
 		"--restart", "unless-stopped",
+	}
+	if spec.HostNetwork {
+		// Real host sockets for services whose media plane can't live behind
+		// docker's userland proxy (livekit's UDP mux). The container binds per
+		// its own config; there is no publish.
+		args = append(args, "--network", "host")
+	} else {
 		// Publish on loopback only: the citadel gateway/mesh reaches services on
 		// 127.0.0.1, matching the manifest services' host publish.
-		"-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.HostPort, spec.ContainerPort),
-		"-v", fmt.Sprintf("%s:%s", spec.StateVolumePath, spec.StateMountPath),
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d", spec.HostPort, spec.ContainerPort))
 	}
+	args = append(args,
+		"-v", fmt.Sprintf("%s:%s", spec.StateVolumePath, spec.StateMountPath),
+	)
 
 	// Run under an alternative container runtime when one is requested (Kata,
 	// gVisor). Omitted entirely when empty so the daemon default (runc) is used.
