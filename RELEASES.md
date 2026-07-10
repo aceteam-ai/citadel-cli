@@ -991,3 +991,22 @@ Auto-generated log of every release.
   - feat: reserve livekit ports + host-network payload launches
 
 
+---
+
+## v2.71.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 125 |
+| Lines added | +3123 |
+
+**Changes:**
+
+  - fix(meeting): gate browser-launch integration test behind opt-in env (#494)
+  - fix(meeting): subscribe nodes to org-scoped meeting queue (aceteam#5098) (#485)
+  - feat(meeting-bot): persistent signed-in Chrome profile for the meeting bot (#5122) (#478)
+  - feat(meeting-bot): MEETING_JOIN handler + audio capture + meeting capability (#5098) (#464)
+  - chore: sync generated files after v2.70.0 release
+
+
