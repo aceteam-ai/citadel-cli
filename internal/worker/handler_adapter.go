@@ -187,6 +187,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// registration rationale as the screenshot/type/keys handlers above.
 		NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
 		NewLegacyHandlerAdapter(JobTypeCobrowse, jobs.NewCobrowseHandler()),
+		// Turn delivery to a payload-launched BYOC instance (aceteam#5241).
+		// Registered unconditionally: it resolves the target from its own
+		// on-disk instance store (~/.citadel/instances/state.json, shared with
+		// the service handler) rather than the citadel.yaml manifest, so it
+		// needs neither a workspace nor a config dir. On a node that never
+		// launched an instance the store lookup misses and the handler fails
+		// closed rather than mis-delivering.
+		NewLegacyHandlerAdapter(JobTypeInstanceMessage, jobs.NewInstanceMessageHandler()),
 	}
 
 	// Register file-operation handlers when a workspace is configured.
