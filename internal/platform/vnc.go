@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -959,4 +960,66 @@ func (d *DarwinVNCManager) Port() int {
 		return DefaultVNCPort
 	}
 	return 0
+}
+
+// EnsureGatewayVNC makes sure an x11vnc server is running for the local desktop
+// so the on-node gateway's /vnc route has an upstream -- WITHOUT any manual
+// `citadel vnc enable`. It is idempotent and safe to call on every `citadel work`
+// startup: a headless node or an already-running server is a no-op.
+//
+// The server is bound to loopback (`-localhost`) and passwordless (`-nopw`):
+// the ONLY path to it is the local gateway, which is itself reached over the
+// authenticated mesh and gated by the desktop token. Binding loopback also
+// fixes the manual path's regression of exposing raw RFB on 0.0.0.0. The active
+// display + Xauthority are resolved via ResolveX11Env (citadel-cli#287), so this
+// works from a systemd --user service whose env has no DISPLAY.
+func EnsureGatewayVNC(port int) error {
+	if runtime.GOOS != "linux" {
+		// Windows/macOS desktop sharing is managed by their own VNC providers.
+		return nil
+	}
+	if !hasActiveXServer() {
+		return nil // headless: nothing to share
+	}
+	if isX11VNCRunning() {
+		return nil // idempotent
+	}
+	if _, err := exec.LookPath("x11vnc"); err != nil {
+		return fmt.Errorf("x11vnc not installed; desktop sharing unavailable (install x11vnc)")
+	}
+
+	display, xauthority := ResolveX11Env()
+	args := []string{
+		"-display", display,
+		"-rfbport", strconv.Itoa(port),
+		"-localhost", // only the local gateway may connect
+		"-nopw",      // auth boundary is the gateway + mesh, not an RFB password
+		"-forever",   // survive client disconnects
+		"-bg",        // daemonize
+		"-quiet",
+	}
+	if xauthority != "" {
+		args = append(args, "-auth", xauthority)
+	}
+	if out, err := exec.Command("x11vnc", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to start x11vnc on %s: %w: %s", display, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// hasActiveXServer reports whether a local X/Xwayland server is running (i.e.
+// this node has a graphical session to share). Used to skip VNC startup on
+// headless nodes.
+func hasActiveXServer() bool {
+	for _, bin := range []string{"Xorg", "X", "Xwayland"} {
+		if exec.Command("pgrep", "-x", bin).Run() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isX11VNCRunning reports whether an x11vnc process is already running.
+func isX11VNCRunning() bool {
+	return exec.Command("pgrep", "-x", "x11vnc").Run() == nil
 }
