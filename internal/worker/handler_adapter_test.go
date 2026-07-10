@@ -393,6 +393,32 @@ func TestCreateLegacyHandlersWithOpts_FileHandlers(t *testing.T) {
 	}
 }
 
+// TestNewMeetingJoinHandler_ThreadsProfileDirOverride covers the worker-config
+// half of the persistent bot profile plumbing (issue #5122): a node operator
+// pinning LegacyHandlerOpts.MeetingProfileDir (e.g. to a dedicated data
+// volume) must reach jobs.MeetingJoinHandler.ProfileDir, not just the
+// platform.EnvMeetingProfileDir env var.
+func TestNewMeetingJoinHandler_ThreadsProfileDirOverride(t *testing.T) {
+	h := newMeetingJoinHandler(LegacyHandlerOpts{
+		WorkspaceDir:      t.TempDir(),
+		MeetingProfileDir: "/custom/meeting-profile",
+	})
+	if h.ProfileDir != "/custom/meeting-profile" {
+		t.Errorf("ProfileDir = %q, want %q", h.ProfileDir, "/custom/meeting-profile")
+	}
+}
+
+// TestNewMeetingJoinHandler_DefaultsProfileDirEmpty checks the common case: an
+// unset MeetingProfileDir leaves ProfileDir empty so the handler falls back to
+// its own env-var-then-ConfigDir()-default resolution, rather than the worker
+// wiring accidentally forcing an empty-but-non-empty override.
+func TestNewMeetingJoinHandler_DefaultsProfileDirEmpty(t *testing.T) {
+	h := newMeetingJoinHandler(LegacyHandlerOpts{WorkspaceDir: t.TempDir()})
+	if h.ProfileDir != "" {
+		t.Errorf("expected empty ProfileDir when MeetingProfileDir is unset, got %q", h.ProfileDir)
+	}
+}
+
 // TestAllKnownJobTypesCoversRegisteredHandlers guards the allKnownJobTypes slice
 // (probed to report a node's supported job-type set in the unsupported-type
 // failure, issue #382) against drift. Handlers only expose CanHandle(type), so a

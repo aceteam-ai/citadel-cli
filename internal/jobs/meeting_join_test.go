@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -180,6 +182,23 @@ func TestToInt(t *testing.T) {
 		if ok != c.ok || got != c.want {
 			t.Errorf("toInt(%v) = (%d,%v), want (%d,%v)", c.in, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+// TestErrMeetingBotSignedOut_ErrorsIsDetectable exercises the whole point of
+// exporting a sentinel (issue #5122): a caller several layers up (the worker
+// adapter, an alerting hook) must be able to errors.Is-detect "the bot needs
+// re-seeding" specifically, distinct from a generic join-flow failure like a
+// stale selector or an admission timeout.
+func TestErrMeetingBotSignedOut_ErrorsIsDetectable(t *testing.T) {
+	wrapped := fmt.Errorf("%w: redirected to %s — re-seed docs/meeting-bot-profile-seeding.md",
+		ErrMeetingBotSignedOut, "https://accounts.google.com/signin")
+	if !errors.Is(wrapped, ErrMeetingBotSignedOut) {
+		t.Fatalf("errors.Is(wrapped, ErrMeetingBotSignedOut) = false, want true; wrapped=%v", wrapped)
+	}
+	genericErr := fmt.Errorf("click join button: selector not found")
+	if errors.Is(genericErr, ErrMeetingBotSignedOut) {
+		t.Fatalf("a generic join-flow error must NOT match ErrMeetingBotSignedOut")
 	}
 }
 

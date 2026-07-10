@@ -128,6 +128,12 @@ type LegacyHandlerOpts struct {
 	// "disabled" error rather than "unsupported job type"), but every command
 	// is rejected. Wired from the persisted `shell` node permission.
 	ShellDisabled bool
+	// MeetingProfileDir overrides the persistent, signed-in bot Chrome profile
+	// directory used by MEETING_JOIN (issue #5122). If empty, the handler falls
+	// back to platform.EnvMeetingProfileDir, then platform's ConfigDir()-rooted
+	// default — see jobs.MeetingJoinHandler.ProfileDir and
+	// docs/meeting-bot-profile-seeding.md.
+	MeetingProfileDir string
 }
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
@@ -239,7 +245,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// internal/capabilities.
 		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
 			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
+				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
 			)
 		}
 	}
@@ -267,4 +273,15 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		result[i] = h
 	}
 	return result
+}
+
+// newMeetingJoinHandler wires opts.MeetingProfileDir into the handler so a
+// node's startup config can pin the persistent, signed-in bot Chrome profile
+// (issue #5122) without relying solely on the platform.EnvMeetingProfileDir
+// env var. Leaving it unset (the common case) preserves the handler's own
+// env-var-then-ConfigDir()-default resolution.
+func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
+	h := jobs.NewMeetingJoinHandler(opts.WorkspaceDir)
+	h.ProfileDir = opts.MeetingProfileDir
+	return h
 }

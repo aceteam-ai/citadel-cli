@@ -6,25 +6,111 @@
 //
 // This is a deliberate SIBLING of CobrowseManager, not a reuse of it. The
 // co-browse manager is a process-wide singleton owning ONE long-lived browser
-// that a human logs into and the AI keeps steering. A meeting bot needs the
-// opposite: a short-lived, disposable browser per meeting, isolated from the
-// co-browse session so the two never fight over one Chromium (Chrome locks a
-// --user-data-dir to a single process, so they cannot share a profile anyway).
-// MeetingBrowser therefore owns its OWN Xvfb display, CDP debug port, and
-// throwaway profile dir, and reuses only the package-level, side-effect-free
-// launch helpers (buildChromeArgs, startManagedXvfb, withDisplay, findChromium,
-// pickTarget, cdpCommand) so there is no duplicated browser-launch logic.
+// that a human logs into and the AI keeps steering. A meeting bot needs a
+// short-lived browser PROCESS per meeting, isolated from the co-browse session
+// so the two never fight over one Chromium — but (issue #5122) it now shares
+// co-browse's other trait: a PERSISTENT profile, not a throwaway one. Google
+// policy-rejects anonymous meeting participants in many orgs, so the bot needs
+// a real, signed-in Google identity (notetaker@aceteam.ai) whose session
+// cookies survive across meetings; a human seeds that session once by hand
+// (docs/meeting-bot-profile-seeding.md — Google blocks automated login) and
+// every MEETING_JOIN thereafter reuses it. Chrome still locks a
+// --user-data-dir to one process, so co-browse and the meeting bot still
+// cannot share a profile with EACH OTHER, and only one meeting can use the bot
+// profile at a time. MeetingBrowser therefore owns its OWN Xvfb display, CDP
+// debug port, and persistent profile dir, and reuses only the package-level,
+// side-effect-free launch helpers (buildChromeArgs, startManagedXvfb,
+// withDisplay, findChromium, pickTarget, cdpCommand) so there is no duplicated
+// browser-launch logic.
 package platform
 
 import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
+
+// EnvMeetingProfileDir overrides the default persistent Chrome profile
+// directory for the meeting bot's signed-in Google account (issue #5122).
+// Unlike co-browse's throwaway-friendly profile, this one is deliberately
+// reused across every meeting: a human seeds it ONCE with a manual, real
+// sign-in to the bot's Google account (see docs/meeting-bot-profile-seeding.md
+// — automated Google login is detection-blocked, so this cannot be scripted),
+// and every subsequent MEETING_JOIN reuses the same cookies/session rather
+// than joining as an anonymous, easily-rejected participant. Set this when a
+// node's persistent state should live somewhere other than the default
+// (e.g. a dedicated data volume).
+const EnvMeetingProfileDir = "CITADEL_MEETING_PROFILE_DIR"
+
+// defaultMeetingProfileDirName is the directory name under ConfigDir() that
+// holds the persistent meeting-bot Chrome profile when EnvMeetingProfileDir is
+// unset.
+const defaultMeetingProfileDirName = "meeting-profile"
+
+// defaultMeetingProfileDir resolves the default persistent profile path,
+// following the same node-local persistent-state convention as the rest of
+// citadel (ConfigDir() also backs ~/.citadel-cli/tls, /logs, /gateway).
+func defaultMeetingProfileDir() string {
+	return filepath.Join(ConfigDir(), defaultMeetingProfileDirName)
+}
+
+// resolveMeetingProfileDir picks the effective profile directory: an explicit
+// per-browser override wins (set via NewMeetingBrowser), then
+// EnvMeetingProfileDir, then the default under ConfigDir(). Pure aside from
+// reading the environment, so precedence is unit-testable without touching
+// the filesystem.
+func resolveMeetingProfileDir(override string) string {
+	if override != "" {
+		return override
+	}
+	if v := strings.TrimSpace(os.Getenv(EnvMeetingProfileDir)); v != "" {
+		return v
+	}
+	return defaultMeetingProfileDir()
+}
+
+// preparePersistentProfileDir resolves the effective meeting-bot profile
+// directory and ensures it exists, locked down to owner-only permissions —
+// it holds real Google session cookies for the bot account (issue #5122).
+// Idempotent and safe to call every Start(): an already-seeded profile is
+// reused as-is (its contents are untouched), and a pre-existing directory
+// with looser permissions (e.g. created by an older citadel-cli build, or by
+// hand during seeding with a stray umask) is tightened rather than trusted.
+// Extracted from Start so the resolution + permission-lock logic is testable
+// without launching a real browser.
+func preparePersistentProfileDir(override string) (string, error) {
+	dir := resolveMeetingProfileDir(override)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create meeting profile dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("lock down meeting profile dir permissions: %w", err)
+	}
+	return dir, nil
+}
+
+// IsGoogleSignInURL reports whether rawURL is a Google account authentication
+// page (accounts.google.com), the reliable, deterministic signal that the
+// meeting bot's persistent Chrome profile has lost its signed-in session and
+// Meet has redirected it to log in. Used by the join flow to fail loudly with
+// an actionable "re-seed the profile" error instead of continuing the join as
+// an unauthenticated (and often policy-rejected) anonymous participant. A
+// malformed URL is treated as "not a sign-in page" (returns false) so a
+// transient CDP read glitch never masquerades as a signed-out profile.
+func IsGoogleSignInURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "accounts.google.com")
+}
 
 // ChromiumAvailable reports whether a Chromium/Chrome binary is on PATH. Exported
 // so capability detection can gate the `meeting` tag on a launchable browser
@@ -164,27 +250,41 @@ func describeCDPException(exc any) string {
 }
 
 // MeetingBrowser owns one disposable headed Chromium for a single meeting, its
-// dedicated Xvfb display, and its throwaway profile. Safe for concurrent use; the
-// reaper goroutines own the single Wait() for each child process, mirroring
-// CobrowseManager's process handling.
+// dedicated Xvfb display, and the notetaker's PERSISTENT, signed-in Chrome
+// profile (issue #5122). Only the browser process and its Xvfb display are
+// disposable now — the profile directory deliberately survives Close() so the
+// bot's Google session (seeded once, by hand; see
+// docs/meeting-bot-profile-seeding.md) carries over to the next meeting. Chrome
+// locks a --user-data-dir to one process, so two MeetingBrowsers sharing the
+// same profile cannot run concurrently: the bot account can be in at most one
+// meeting at a time. Safe for concurrent use; the reaper goroutines own the
+// single Wait() for each child process, mirroring CobrowseManager's process
+// handling.
 type MeetingBrowser struct {
-	mu         sync.Mutex
-	sinkName   string
-	debugPort  int
-	profileDir string
-	display    string
-	chromePath string
-	cmd        *exec.Cmd
-	exited     chan struct{}
-	xvfb       *exec.Cmd
-	xvfbExited chan struct{}
+	mu                 sync.Mutex
+	sinkName           string
+	profileDirOverride string
+	debugPort          int
+	profileDir         string
+	display            string
+	chromePath         string
+	cmd                *exec.Cmd
+	exited             chan struct{}
+	xvfb               *exec.Cmd
+	xvfbExited         chan struct{}
 }
 
 // NewMeetingBrowser creates a meeting browser whose audio will route into the
 // given PulseAudio sink (from a NullSinkRecorder). The sink must be loaded before
 // Start so the browser's PULSE_SINK target exists at launch.
-func NewMeetingBrowser(sinkName string) *MeetingBrowser {
-	return &MeetingBrowser{sinkName: sinkName}
+//
+// profileDirOverride pins the persistent Chrome profile directory for this
+// browser, taking precedence over EnvMeetingProfileDir and the ConfigDir()
+// default (see resolveMeetingProfileDir). Pass "" to use the default
+// resolution — the normal case; a caller only needs this for tests or to
+// point at a non-default data volume.
+func NewMeetingBrowser(sinkName, profileDirOverride string) *MeetingBrowser {
+	return &MeetingBrowser{sinkName: sinkName, profileDirOverride: profileDirOverride}
 }
 
 // DebugPort returns the CDP port the browser listens on (0 before Start).
@@ -199,6 +299,31 @@ func (b *MeetingBrowser) Display() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.display
+}
+
+// ProfileDir returns the resolved persistent Chrome profile directory ("" before
+// Start).
+func (b *MeetingBrowser) ProfileDir() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.profileDir
+}
+
+// CurrentURL returns the browser's current page URL over CDP. Used by the join
+// flow's signed-out detection (see IsGoogleSignInURL): a persistent profile
+// whose Google session expired gets redirected to accounts.google.com instead
+// of landing on the Meet pre-join page.
+func (b *MeetingBrowser) CurrentURL() (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cmd == nil {
+		return "", fmt.Errorf("meeting browser not started")
+	}
+	t, err := pickTarget(b.debugPort)
+	if err != nil {
+		return "", err
+	}
+	return t.URL, nil
 }
 
 // Start launches the headed Chromium on a fresh Xvfb display with a throwaway
@@ -220,17 +345,18 @@ func (b *MeetingBrowser) Start() error {
 		return err
 	}
 
-	// Fresh, unique profile per meeting: Chrome locks a --user-data-dir to one
-	// process, so a disposable dir both avoids colliding with the co-browse
-	// profile and lets parallel meetings run without stomping each other.
-	profileDir, err := os.MkdirTemp("", "citadel-meeting-profile-")
+	// Persistent, signed-in profile (issue #5122): resolve the same directory
+	// every run — override, then EnvMeetingProfileDir, then the ConfigDir()
+	// default — so a human's one-time manual Google sign-in (see
+	// docs/meeting-bot-profile-seeding.md) survives across meetings instead of
+	// being thrown away with the old MkdirTemp profile.
+	profileDir, err := preparePersistentProfileDir(b.profileDirOverride)
 	if err != nil {
-		return fmt.Errorf("create meeting profile dir: %w", err)
+		return err
 	}
 
 	debugPort, err := findFreeDebugPort()
 	if err != nil {
-		_ = os.RemoveAll(profileDir)
 		return err
 	}
 
@@ -239,7 +365,6 @@ func (b *MeetingBrowser) Start() error {
 	// Xvfb has no GPU, so force software rendering.
 	xvfb, display, err := startManagedXvfb(xvfbResolution())
 	if err != nil {
-		_ = os.RemoveAll(profileDir)
 		return err
 	}
 
@@ -262,7 +387,8 @@ func (b *MeetingBrowser) Start() error {
 		if xvfb.Process != nil {
 			_ = xvfb.Process.Kill()
 		}
-		_ = os.RemoveAll(profileDir)
+		// profileDir is intentionally left in place: it is the persistent,
+		// signed-in bot profile, not a throwaway launch artifact.
 		return fmt.Errorf("launch meeting chromium: %w", err)
 	}
 
@@ -384,11 +510,11 @@ func (b *MeetingBrowser) closeLocked() error {
 	b.xvfbExited = nil
 	b.display = ""
 
-	if b.profileDir != "" {
-		if err := os.RemoveAll(b.profileDir); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("remove meeting profile dir: %w", err)
-		}
-		b.profileDir = ""
-	}
+	// Deliberately NOT removed (issue #5122): b.profileDir is the persistent,
+	// signed-in bot profile, not a throwaway per-run artifact. Deleting it here
+	// would silently wipe the human's one-time manual Google sign-in on every
+	// meeting teardown, forcing a re-seed before the bot could ever join again.
+	// Only clear the in-memory field; the directory on disk stays.
+	b.profileDir = ""
 	return firstErr
 }
