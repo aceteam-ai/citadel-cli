@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -20,8 +21,21 @@ const defaultTranscribeServiceURL = "http://localhost:8101"
 
 // transcribeReadyTimeout bounds how long we wait for the whisper sidecar to
 // load its model and report healthy. Model load (faster-whisper "base", int8)
-// is a one-time cost on first job; subsequent jobs hit a warm service.
+// is a one-time cost on first job; subsequent jobs hit a warm service. This
+// budget only applies once the sidecar is actually answering connections —
+// see transcribeUnreachableTimeout for the case where nothing is listening.
 const transcribeReadyTimeout = 120 * time.Second
+
+// transcribeUnreachableTimeout bounds how long waitForReady tolerates a
+// connection-refused health check, i.e. nothing listening on the sidecar's
+// port at all. A refused connection means the sidecar container was never
+// started (or crashed before it could bind its port) — not that it is warming
+// up — so there is nothing worth waiting the full transcribeReadyTimeout for.
+// Keeping this short ensures the handler fails well under the backend's
+// ~100s request-gateway budget, so the backend can fall back to cloud
+// transcription instead of the client eventually seeing a bare "Failed to
+// fetch" once the gateway times out first.
+const transcribeUnreachableTimeout = 8 * time.Second
 
 // transcribeRequestTimeout bounds a single transcription. Whisper on CPU is
 // roughly real-time-ish for the "base" model, so a long meeting needs headroom.
@@ -158,18 +172,36 @@ func (h *TranscribeAudioHandler) waitForReady() error {
 	pollInterval := 1 * time.Second
 	startTime := time.Now()
 
-	for time.Since(startTime) < transcribeReadyTimeout {
-		resp, err := http.Get(healthURL)
-		if err == nil && resp.StatusCode == http.StatusOK {
+	for {
+		resp, err := h.client().Get(healthURL)
+		if err == nil {
+			ready := resp.StatusCode == http.StatusOK
 			resp.Body.Close()
-			return nil
+			if ready {
+				return nil
+			}
+			// Reachable, just not ready yet (e.g. model still loading) —
+			// fall through to the patient transcribeReadyTimeout budget below.
+		} else if isConnectionRefused(err) && time.Since(startTime) >= transcribeUnreachableTimeout {
+			// Nothing has ever answered on this port within the fast-fail
+			// budget: treat the sidecar as absent rather than warming up, and
+			// give up now instead of burning the full model-load timeout.
+			return fmt.Errorf("transcription service unreachable at %s: %w", h.serviceURL(), err)
 		}
-		if resp != nil {
-			resp.Body.Close()
+
+		if time.Since(startTime) >= transcribeReadyTimeout {
+			break
 		}
 		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("transcription service did not become ready within %v", transcribeReadyTimeout)
+}
+
+// isConnectionRefused reports whether err indicates nothing is listening on
+// the target port at all, as distinct from a service that answered but isn't
+// ready yet (e.g. still loading its model).
+func isConnectionRefused(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "connection refused")
 }
 
 // Ensure TranscribeAudioHandler implements JobHandler.
