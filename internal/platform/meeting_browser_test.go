@@ -94,6 +94,15 @@ func TestMeetingBrowser_Launch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping meeting-browser launch test in -short mode")
 	}
+	// Launching a real headed browser under Xvfb is unreliable in CI containers
+	// even when the chrome/Xvfb *binaries* are present: the DinD runners have no
+	// working display/sandbox, so Start() fails rather than the binary-presence
+	// guard below skipping. Binary presence is therefore not a safe trigger.
+	// Require an explicit opt-in so `go test ./...` in CI always skips this; run
+	// it deliberately on a real node with CITADEL_BROWSER_INTEGRATION=1.
+	if os.Getenv("CITADEL_BROWSER_INTEGRATION") == "" {
+		t.Skip("set CITADEL_BROWSER_INTEGRATION=1 to run the meeting-browser launch integration test")
+	}
 	if !ChromiumAvailable() || !XvfbAvailable() {
 		t.Skip("no Chromium or Xvfb on this host; skipping meeting-browser launch test")
 	}
