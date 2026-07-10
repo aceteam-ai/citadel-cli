@@ -86,6 +86,14 @@ func runAllServices() {
 	fmt.Printf("--- 🚀 Starting %d service(s) ---\n", len(manifest.Services))
 
 	for _, service := range manifest.Services {
+		// Honor a durable "stopped" marker: a service a remote MODULE_SET set to
+		// stopped stays installed but must NOT be composed up on boot, or the stop
+		// would silently come back on the next restart (aceteam#5280).
+		if serviceStartDisabled(service) {
+			fmt.Printf("⏸️  Skipping stopped service: %s (desired_status: stopped)\n", service.Name)
+			continue
+		}
+
 		serviceType := determineServiceType(service)
 
 		if serviceType == internalServices.ServiceTypeNative {

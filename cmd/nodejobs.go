@@ -80,4 +80,13 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		},
 		Log: opts.HandlerLog,
 	}))
+
+	// MODULE_SET (aceteam#5280, interim): imperatively apply a single module's
+	// desired state (running/stopped/absent) on this node, reusing the tested
+	// reconcile engine scoped to one module and the live catalog/compose/lockfile
+	// adapter. Converges into the durable pull-based desired-state loop (#4273).
+	runner.RegisterHandler(worker.NewModuleSetHandler(worker.ModuleSetConfig{
+		Ops: newLiveModuleOps(opts.HandlerLog),
+		Log: opts.HandlerLog,
+	}))
 }

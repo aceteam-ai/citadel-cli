@@ -23,6 +23,12 @@ type LockEntry struct {
 	ResolvedRef string      `yaml:"resolved_ref,omitempty"` // concrete tag a constraint/channel resolved to (e.g. "^1.2" -> "v1.4.0")
 	Commit      string      `yaml:"commit,omitempty"`       // resolved git HEAD commit
 	Images      []LockImage `yaml:"images,omitempty"`
+	// Config records the config-var overrides the module was installed with. It
+	// lets the desired-state reconciler detect config drift without re-resolving
+	// the source (an installed module with no recorded config diffs as "no config"
+	// against a desired assignment with no config, so a converged node does not
+	// churn re-updates every pass). Absent for pre-config-tracking installs.
+	Config map[string]string `yaml:"config,omitempty"`
 	// Sandboxed records that a least-privilege hardening override was generated
 	// for this (untrusted/Tier-2) module at install time. Absent/false means the
 	// module runs without an override (trusted/curated, or pre-sandbox installs).
@@ -101,6 +107,43 @@ func UpsertLockEntry(entry LockEntry) error {
 	if !replaced {
 		lf.Modules = append(lf.Modules, entry)
 	}
+
+	path := LockfilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create lockfile directory: %w", err)
+	}
+	data, err := yaml.Marshal(lf)
+	if err != nil {
+		return fmt.Errorf("failed to marshal lockfile: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("failed to write lockfile %s: %w", path, err)
+	}
+	return nil
+}
+
+// DeleteLockEntry removes a module's provenance entry from the lockfile by name
+// and writes it back. It is the uninstall counterpart to UpsertLockEntry, and is
+// idempotent: deleting an entry that is not present (or a lockfile that does not
+// yet exist) is a no-op success. Other entries are preserved.
+func DeleteLockEntry(name string) error {
+	lf, err := LoadLockfile()
+	if err != nil {
+		return err
+	}
+	kept := lf.Modules[:0]
+	removed := false
+	for _, e := range lf.Modules {
+		if e.Name == name {
+			removed = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if !removed {
+		return nil // idempotent: nothing to delete
+	}
+	lf.Modules = kept
 
 	path := LockfilePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
