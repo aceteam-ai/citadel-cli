@@ -271,6 +271,12 @@ func runControlCenter() {
 			SaveRendering: func(r *config.Rendering) error {
 				return config.SaveRendering(platform.ConfigDir(), r)
 			},
+			LoadMeeting: func() *config.Meeting {
+				return config.LoadMeeting(platform.ConfigDir())
+			},
+			SaveMeeting: func(m *config.Meeting) error {
+				return config.SaveMeeting(platform.ConfigDir(), m)
+			},
 			// SetFullscreenEnabled is intentionally left nil: tview cannot swap the
 			// terminal's alternate-screen mode on a running app. Today the toggle only
 			// persists the preference; wiring a launch-time consumer that reads it at

@@ -4,21 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
-	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
-
-// meetingEnabled reports whether the operator has opted into the meeting-join
-// capability via CITADEL_MEETING_ENABLED (truthy: 1/true/yes/on, case-insensitive).
-// Defaults to disabled when unset. Gates handler registration to match the
-// `meeting` capability advertisement gate in internal/capabilities.
-func meetingEnabled() bool {
-	return update.IsTruthy(os.Getenv("CITADEL_MEETING_ENABLED"))
-}
 
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.
 // This allows existing handlers to work with the new worker abstraction.
@@ -240,11 +232,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// Auto-join meeting notetaker (aceteam#5098): records the call into a
 		// per-meeting null sink, then transcribes it via the handler above. Needs
 		// the workspace both to write the recording and to validate the audio path
-		// for transcription, so it lives inside this workspace gate. The join flow
-		// is unverified, so the handler only registers when an operator opts in via
-		// CITADEL_MEETING_ENABLED (matching the `meeting` capability gate); the PR
-		// merges dormant until then.
-		if meetingEnabled() {
+		// for transcription, so it lives inside this workspace gate. Gated on the
+		// persisted meeting toggle (default-on, the house opt-out convention) so
+		// the handler registers unless the operator has explicitly opted out —
+		// matching the `meeting` capability advertisement gate in
+		// internal/capabilities.
+		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
 			handlers = append(handlers,
 				NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
 			)

@@ -406,28 +406,26 @@ func TestMeetingCapable(t *testing.T) {
 }
 
 func TestMeetingTagEnabled(t *testing.T) {
-	// The meeting-join flow is unverified, so the tag is gated behind the
-	// CITADEL_MEETING_ENABLED operator opt-in AND the node deps. Even with deps
-	// present, an unset/falsey toggle must keep the node dormant (no advertise).
+	// The `meeting` tag advertises only when the persisted toggle is enabled AND
+	// the node deps are present. The toggle defaults on (config.DefaultMeeting),
+	// so the default+deps case advertises; an explicit opt-out keeps it off even
+	// with deps present.
 	cases := []struct {
-		name   string
-		toggle string
-		depsOK bool
-		want   bool
+		name    string
+		enabled bool
+		depsOK  bool
+		want    bool
 	}{
-		{"toggle on, deps present -> advertise", "true", true, true},
-		{"toggle 1, deps present -> advertise", "1", true, true},
-		{"toggle yes uppercase, deps present -> advertise", "YES", true, true},
-		{"toggle on, deps missing -> no advertise", "true", false, false},
-		{"toggle off, deps present -> no advertise", "false", true, false},
-		{"toggle empty, deps present -> no advertise", "", true, false},
+		{"enabled (default), deps present -> advertise", true, true, true},
+		{"enabled, deps missing -> no advertise", true, false, false},
+		{"opted out, deps present -> no advertise", false, true, false},
+		{"opted out, deps missing -> no advertise", false, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			t.Setenv("CITADEL_MEETING_ENABLED", c.toggle)
-			if got := meetingTagEnabled(c.depsOK); got != c.want {
-				t.Errorf("meetingTagEnabled(depsOK=%v) with CITADEL_MEETING_ENABLED=%q = %v, want %v",
-					c.depsOK, c.toggle, got, c.want)
+			if got := meetingTagEnabled(c.enabled, c.depsOK); got != c.want {
+				t.Errorf("meetingTagEnabled(enabled=%v, depsOK=%v) = %v, want %v",
+					c.enabled, c.depsOK, got, c.want)
 			}
 		})
 	}

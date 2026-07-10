@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -12,8 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
-	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
 const detectionTimeout = 5 * time.Second
@@ -444,11 +443,13 @@ func detectCPU() []Capability {
 }
 
 // detectMeetingCapability reports whether this node can run the auto-join meeting
-// notetaker (aceteam#5098). It composes the three real dependency probes through
-// the pure meetingCapable predicate so the gating logic itself is unit-testable
-// without a live audio stack or browser.
+// notetaker (aceteam#5098). It ANDs the persisted config toggle (default-on, the
+// house opt-out convention) with the three real dependency probes, composed
+// through the pure meetingTagEnabled predicate so the gating logic itself is
+// unit-testable without a live audio stack, browser, or config file.
 func detectMeetingCapability() bool {
-	return meetingTagEnabled(meetingCapable(
+	enabled := config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+	return meetingTagEnabled(enabled, meetingCapable(
 		platform.AudioStackAvailable(),
 		platform.ChromiumAvailable(),
 		platform.XvfbAvailable(),
@@ -456,18 +457,12 @@ func detectMeetingCapability() bool {
 }
 
 // meetingTagEnabled reports whether the `meeting` tag should be advertised: the
-// operator opt-in (CITADEL_MEETING_ENABLED) must be set AND the node's deps must
-// be present. The meeting-join flow is unverified, so nodes stay dormant (never
-// advertise, never subscribe to the org meeting queue) until an operator opts in.
-func meetingTagEnabled(depsOK bool) bool {
-	return meetingEnabled() && depsOK
-}
-
-// meetingEnabled reports whether the operator has opted into the meeting-join
-// capability via CITADEL_MEETING_ENABLED (truthy: 1/true/yes/on, case-insensitive).
-// Defaults to disabled when unset.
-func meetingEnabled() bool {
-	return update.IsTruthy(os.Getenv("CITADEL_MEETING_ENABLED"))
+// persisted meeting toggle must be enabled AND the node's deps must be present.
+// The toggle defaults on (see config.DefaultMeeting), so a dep-capable node
+// advertises unless the operator has explicitly opted out (via the Control
+// Center or an APPLY_DEVICE_CONFIG push).
+func meetingTagEnabled(enabled, depsOK bool) bool {
+	return enabled && depsOK
 }
 
 // meetingCapable is the pure gating predicate for the `meeting` tag deps: all
