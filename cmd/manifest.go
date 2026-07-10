@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -17,6 +18,22 @@ type Service struct {
 	Type        string `yaml:"type,omitempty"`         // "native" or "docker" (default: auto-detect)
 	ComposeFile string `yaml:"compose_file,omitempty"` // For docker services
 	Port        int    `yaml:"port,omitempty"`         // For native services
+	// DesiredStatus is the operator-assigned run-state for boot. Empty means the
+	// service is started on boot (the historical behavior). "stopped" makes a
+	// remote MODULE_SET "stopped" DURABLE: the service stays installed but the
+	// boot paths (citadel run / citadel work) SKIP composing it up, so a stop
+	// survives a reboot instead of silently coming back. This is a per-service
+	// marker; it is NOT the same as uninstalling (which removes the service).
+	DesiredStatus string `yaml:"desired_status,omitempty"`
+}
+
+// serviceStartDisabled reports whether a service is marked "stopped" and must be
+// SKIPPED by the boot-time service-start paths (runAllServices in cmd/run.go and
+// startManagedServices in cmd/work.go). This is the single predicate both boot
+// paths consult so a remote-assigned "stopped" state is honored consistently and
+// does not restart on reboot.
+func serviceStartDisabled(s Service) bool {
+	return strings.EqualFold(strings.TrimSpace(s.DesiredStatus), "stopped")
 }
 
 // ManifestCapabilities defines the optional capabilities section in citadel.yaml.
@@ -267,6 +284,53 @@ func addServiceToManifestWithTags(configDir, serviceName string, nodeTags []stri
 	}
 
 	// Write back
+	return writeManifest(manifestPath, manifest)
+}
+
+// removeServiceFromManifest removes a service from the node manifest by name and
+// writes it back. It is the de-registration half of an uninstall (the compose
+// teardown + lockfile/lock-file cleanup are the caller's responsibility). It is
+// idempotent: removing a service that is not present rewrites the manifest
+// unchanged and returns nil, so a re-run of an uninstall converges cleanly.
+func removeServiceFromManifest(configDir, serviceName string) error {
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	manifest, _, err := findAndReadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to read manifest: %w", err)
+	}
+	kept := make([]Service, 0, len(manifest.Services))
+	for _, s := range manifest.Services {
+		if s.Name == serviceName {
+			continue
+		}
+		kept = append(kept, s)
+	}
+	manifest.Services = kept
+	return writeManifest(manifestPath, manifest)
+}
+
+// setServiceDesiredStatus sets (or clears, when status is "") the per-service
+// boot marker used to make a remote "stopped" durable. Setting "stopped" makes
+// the boot-time service-start paths skip the service (serviceStartDisabled);
+// clearing it (status == "") restores start-on-boot. Returns an error if the
+// service is not present so a caller does not silently no-op on a typo'd name.
+func setServiceDesiredStatus(configDir, serviceName, status string) error {
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	manifest, _, err := findAndReadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to read manifest: %w", err)
+	}
+	found := false
+	for i := range manifest.Services {
+		if manifest.Services[i].Name == serviceName {
+			manifest.Services[i].DesiredStatus = status
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("service %q not found in manifest", serviceName)
+	}
 	return writeManifest(manifestPath, manifest)
 }
 
