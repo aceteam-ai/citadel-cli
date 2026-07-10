@@ -45,9 +45,9 @@ func newLiveModuleOps(log func(format string, args ...any)) *liveModuleOps {
 	}
 	return &liveModuleOps{
 		log:         log,
-		startFn:     startService,          // cmd/service.go: docker compose up -d
-		composeDown: stopServiceByCompose,  // cmd/stop.go: docker compose down
-		isRunning:   containerIsRunning,    // docker inspect state
+		startFn:     startService,         // cmd/service.go: docker compose up -d
+		composeDown: stopServiceByCompose, // cmd/stop.go: docker compose down
+		isRunning:   containerIsRunning,   // docker inspect state
 	}
 }
 
