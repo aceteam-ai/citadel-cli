@@ -95,13 +95,13 @@ const (
 		`})()`
 )
 
-// errMeetingBotSignedOut is a sentinel wrapped into the runJoinFlow error when
+// ErrMeetingBotSignedOut is a sentinel wrapped into the runJoinFlow error when
 // the persistent bot profile's Google session has expired (issue #5122). A
 // distinct sentinel (rather than a bare fmt.Errorf) lets a caller
 // errors.Is-detect "needs re-seed" specifically, e.g. to raise a
 // higher-urgency alert than a generic join failure (stale selector, host never
 // admitted the bot, etc.).
-var errMeetingBotSignedOut = fmt.Errorf("meeting bot Chrome profile is signed out of its Google account")
+var ErrMeetingBotSignedOut = fmt.Errorf("meeting bot Chrome profile is signed out of its Google account")
 
 // meetJoinButtonLabels are the visible button texts Meet uses for the join
 // action, in priority order. "Ask to join" appears when the bot needs host
@@ -366,7 +366,7 @@ func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBro
 	if curURL, err := br.CurrentURL(); err != nil {
 		ctx.Log("warn", "     - could not read current URL for signed-out check (non-fatal): %v", err)
 	} else if platform.IsGoogleSignInURL(curURL) {
-		return fmt.Errorf("%w: redirected to %s — re-seed docs/meeting-bot-profile-seeding.md", errMeetingBotSignedOut, curURL)
+		return fmt.Errorf("%w: redirected to %s — re-seed docs/meeting-bot-profile-seeding.md", ErrMeetingBotSignedOut, curURL)
 	}
 	// Secondary, best-effort corroborating signal (see meetAccountChipPresentJS
 	// doc comment); logged only, not fatal.
