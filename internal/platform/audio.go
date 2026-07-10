@@ -6,15 +6,15 @@
 //
 // The mechanism is the standard meeting-bot audio path, proven on a real node
 // before this code was written:
-//   1. Create a dedicated PulseAudio *null sink* (`pactl load-module
-//      module-null-sink`). A null sink is a virtual output that plays to nowhere
-//      but exposes a `.monitor` source carrying whatever was written to it.
-//   2. Launch the browser with `PULSE_SINK=<sinkName>` in its environment so
-//      libpulse routes THAT process's audio to our sink (per-process routing —
-//      other node audio is untouched). See withPulseSink.
-//   3. Record the sink's `.monitor` with ffmpeg to a WAV file in the node
-//      workspace, where the whisper sidecar (read-only /workspace mount) can
-//      then transcribe it.
+//  1. Create a dedicated PulseAudio *null sink* (`pactl load-module
+//     module-null-sink`). A null sink is a virtual output that plays to nowhere
+//     but exposes a `.monitor` source carrying whatever was written to it.
+//  2. Launch the browser with `PULSE_SINK=<sinkName>` in its environment so
+//     libpulse routes THAT process's audio to our sink (per-process routing —
+//     other node audio is untouched). See withPulseSink.
+//  3. Record the sink's `.monitor` with ffmpeg to a WAV file in the node
+//     workspace, where the whisper sidecar (read-only /workspace mount) can
+//     then transcribe it.
 //
 // Why PulseAudio+ffmpeg and not in-browser capture: OS-level capture isolates
 // the call audio from any other sound on the node, yields a clean on-disk file,

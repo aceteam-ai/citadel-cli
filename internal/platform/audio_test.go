@@ -54,11 +54,11 @@ func TestBuildAudioFFmpegArgs(t *testing.T) {
 
 func TestSanitizeSinkSuffix(t *testing.T) {
 	cases := map[string]string{
-		"abc123":                      "abc123",
-		"meeting-2026-07-07":          "meeting_2026_07_07",
-		"a/b\\c":                      "a_b_c",
-		"":                            "session",
-		"550e8400-e29b-41d4-a716":     "550e8400_e29b_41d4_a716",
+		"abc123":                  "abc123",
+		"meeting-2026-07-07":      "meeting_2026_07_07",
+		"a/b\\c":                  "a_b_c",
+		"":                        "session",
+		"550e8400-e29b-41d4-a716": "550e8400_e29b_41d4_a716",
 	}
 	for in, want := range cases {
 		if got := sanitizeSinkSuffix(in); got != want {

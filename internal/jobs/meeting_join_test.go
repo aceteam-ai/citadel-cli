@@ -97,12 +97,12 @@ func TestParseMeetingJoinParams_MaxDuration(t *testing.T) {
 
 func TestSanitizeMeetingFilename(t *testing.T) {
 	cases := map[string]string{
-		"mtg-123":                 "mtg-123",
-		"abc_DEF":                 "abc_DEF",
-		"../../etc/passwd":        "______etc_passwd",
-		"a/b\\c":                  "a_b_c",
-		"":                        "meeting",
-		"550e8400-e29b-41d4":      "550e8400-e29b-41d4",
+		"mtg-123":            "mtg-123",
+		"abc_DEF":            "abc_DEF",
+		"../../etc/passwd":   "______etc_passwd",
+		"a/b\\c":             "a_b_c",
+		"":                   "meeting",
+		"550e8400-e29b-41d4": "550e8400-e29b-41d4",
 	}
 	for in, want := range cases {
 		if got := sanitizeMeetingFilename(in); got != want {

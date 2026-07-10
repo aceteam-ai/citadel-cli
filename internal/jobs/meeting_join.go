@@ -55,7 +55,9 @@ const (
 // been verified against a live call. A human must confirm/replace each selector,
 // button label, and heuristic during the live-Meet session. Kept together so
 // that tuning is a one-place edit.
-//   verified against real Google Meet on: <NOT YET VERIFIED>
+//
+//	verified against real Google Meet on: <NOT YET VERIFIED>
+//
 // ---------------------------------------------------------------------------
 const (
 	// meetNameInputSelector: the pre-join "Your name" text field shown to
