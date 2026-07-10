@@ -951,3 +951,25 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.65.0 release
 
 
+---
+
+## v2.67.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 34 |
+| Lines added | +2244 |
+
+**Changes:**
+
+  - fix(desktop): resolve active X display + XAUTHORITY for computer-use (screenshot/input/H.264) (#481)
+  - feat(jobs): INSTANCE_MESSAGE handler for BYOC turn delivery (#480)
+  - fix: auto-update opt-out + dev binary no longer self-installs (#473) (#477)
+  - fix(transcribe): fail fast when whisper sidecar is unreachable (#476)
+  - fix(whisper-service): add missing requests dependency (#475)
+  - feat(storage): citadel storage start|status|stop backed by VersityGW (#474)
+  - feat(jobs): optional runtime field in inline SERVICE_START spec (#471)
+  - ci(whisper-service): build + publish image to GHCR (#465) (#467)
+
+
