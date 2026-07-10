@@ -62,25 +62,19 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 		return fmt.Errorf("parse source %q: %w", m.Source, err)
 	}
 
-	// Update-in-place: if this source is already installed, uninstall it first so
-	// the fresh install does not trip the port-conflict / already-in-manifest
-	// guards. Reconcile drives ActionUpdate through Install for source/config
-	// drift; this makes that a clean down+up.
-	if existing := o.installedNameForSource(m.Source); existing != "" {
-		o.log("MODULE_SET: %q already installed; updating in place", existing)
-		if err := o.Uninstall(ctx, existing); err != nil {
-			return fmt.Errorf("update %q: uninstall existing: %w", existing, err)
-		}
-	}
-
-	// Resolve the module (catalog name or external git source) into a manifest +
-	// compose path (+ provenance for external sources).
+	// Resolve + verify BEFORE any teardown. The network-dependent work (git clone
+	// / cosign verify) is exactly what can fail transiently, so it must happen
+	// while any existing module is still installed and running -- otherwise a
+	// transient failure during a routine config update would delete a running
+	// module and (on retry) leave it uninstalled. See the update-in-place teardown
+	// below, which is keyed on the RESOLVED manifest.Name (stable across
+	// source-ref/basename differences) and runs only after resolve+verify succeed.
 	manifest, composeSrc, resolved, err := resolveModuleForTUI(src)
 	if err != nil {
 		return fmt.Errorf("resolve %q: %w", m.Source, err)
 	}
 
-	_, configDir, err := findOrCreateManifest()
+	nodeManifest, configDir, err := findOrCreateManifest()
 	if err != nil {
 		return fmt.Errorf("initialize node config: %w", err)
 	}
@@ -108,6 +102,22 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 	}
 	if verifyResult.Verified {
 		lockImages = markLockImagesVerified(lockImages)
+	}
+
+	// Update-in-place: reconcile drives ActionUpdate (source/config drift) through
+	// Install. If the RESOLVED module name is already installed, uninstall it now
+	// -- AFTER the fallible resolve+verify -- so the fresh install does not trip
+	// the port-conflict / already-in-manifest guards. Keying on the resolved
+	// manifest.Name (not a source basename) makes this correct even when the
+	// service name differs from the source basename or changes across refs.
+	// Residual (interim, acceptable): if this Uninstall succeeds but the
+	// InstallFromManifest below then fails, the module is left down until the
+	// job retries and reinstalls it.
+	if hasService(nodeManifest, manifest.Name) {
+		o.log("MODULE_SET: %q already installed; updating in place", manifest.Name)
+		if err := o.Uninstall(ctx, manifest.Name); err != nil {
+			return fmt.Errorf("update %q: uninstall existing: %w", manifest.Name, err)
+		}
 	}
 
 	// Non-interactive install: m.Config supplies the overrides; a missing REQUIRED
@@ -277,30 +287,6 @@ func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.Installe
 		out = append(out, im)
 	}
 	return out, nil
-}
-
-// installedNameForSource returns the manifest service name currently installed
-// from the given (canonical, requested-form) source, or "" if none. It matches
-// on the lockfile Source first (external modules), then falls back to a catalog/
-// basename match (NameFromSource) for services without a lockfile entry.
-func (o *liveModuleOps) installedNameForSource(source string) string {
-	manifest, _, err := findAndReadManifest()
-	if err != nil {
-		return ""
-	}
-	lf, _ := catalog.LoadLockfile()
-	basename := reconcile.NameFromSource(source)
-	for _, s := range manifest.Services {
-		if lf != nil {
-			if e, ok := lf.LookupLock(s.Name); ok && e.Source == source {
-				return s.Name
-			}
-		}
-		if s.Name == basename {
-			return s.Name
-		}
-	}
-	return ""
 }
 
 // recordLock upserts provenance for a freshly installed/updated module, carrying
