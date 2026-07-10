@@ -596,7 +596,8 @@ func (l *LinuxVNCManager) Start() error {
 	authFile, authNeedsSudo := l.resolveXAuth()
 	needsSudo := authNeedsSudo && os.Getuid() != 0
 
-	args := buildX11VNCArgs(passwdFile, port, authFile)
+	display, _ := ResolveX11Env()
+	args := buildX11VNCArgs(passwdFile, port, authFile, display)
 
 	var cmd *exec.Cmd
 	if needsSudo {
@@ -614,9 +615,10 @@ func (l *LinuxVNCManager) Start() error {
 }
 
 // buildX11VNCArgs constructs the x11vnc command-line arguments.
-// Reads $DISPLAY from the environment when an auth file is provided;
-// falls back to ":0" when $DISPLAY is unset.
-func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
+// The caller resolves and passes the target display (via ResolveX11Env), so
+// this stays a pure, testable arg-builder. An empty display is coerced to ":0"
+// so a caller that could not resolve one still produces valid args.
+func buildX11VNCArgs(passwdFile string, port int, authFile, display string) []string {
 	args := []string{
 		"-rfbauth", passwdFile,
 		"-rfbport", strconv.Itoa(port),
@@ -625,12 +627,13 @@ func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
 	}
 
 	if authFile != "" {
-		// An explicit auth file was found -- use it directly. Resolve the
-		// active display (e.g. :1 on GDM3) rather than assuming :0; a
-		// systemd --user service has no DISPLAY in its env, so the old
-		// os.Getenv+":0" fallback targeted the wrong (or a nonexistent)
-		// server. See ResolveX11Env / aceteam-ai/citadel-cli#287.
-		display, _ := ResolveX11Env()
+		// An explicit auth file was found -- use it directly with the resolved
+		// display (e.g. :1 on GDM3) rather than assuming :0. A systemd --user
+		// service has no DISPLAY in its env, so the old os.Getenv+":0" fallback
+		// targeted the wrong (or a nonexistent) server (citadel-cli#287).
+		if display == "" {
+			display = ":0"
+		}
 		args = append([]string{"-display", display}, args...)
 		args = append(args, "-auth", authFile)
 	} else {

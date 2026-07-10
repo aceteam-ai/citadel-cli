@@ -349,7 +349,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 			notWant:    []string{"-find"},
 		},
 		{
-			name:       "falls back to :0 when DISPLAY is unset",
+			name:       "coerces empty display to :0",
 			display:    "",
 			passwdFile: "/home/user/.vnc/passwd",
 			port:       5900,
@@ -378,8 +378,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("DISPLAY", tt.display)
-			args := buildX11VNCArgs(tt.passwdFile, tt.port, tt.authFile)
+			args := buildX11VNCArgs(tt.passwdFile, tt.port, tt.authFile, tt.display)
 			argStr := strings.Join(args, " ")
 
 			for _, want := range tt.wantArgs {
@@ -408,8 +407,7 @@ func TestBuildX11VNCArgs(t *testing.T) {
 
 func TestBuildX11VNCArgsOrder(t *testing.T) {
 	// When using -find, it should be the first argument
-	t.Setenv("DISPLAY", ":0")
-	args := buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "")
+	args := buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "", ":0")
 	if len(args) == 0 {
 		t.Fatal("buildX11VNCArgs() returned empty args")
 	}
@@ -418,7 +416,7 @@ func TestBuildX11VNCArgsOrder(t *testing.T) {
 	}
 
 	// When using explicit auth, -display should come first
-	args = buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "/home/user/.Xauthority")
+	args = buildX11VNCArgs("/home/user/.vnc/passwd", 5900, "/home/user/.Xauthority", ":0")
 	if len(args) == 0 {
 		t.Fatal("buildX11VNCArgs() returned empty args")
 	}
