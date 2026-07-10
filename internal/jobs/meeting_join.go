@@ -82,7 +82,26 @@ const (
 		`var el=document.querySelector('[aria-label*="participant" i] , [data-participant-count]');` +
 		`if(!el)return -1;var m=(el.getAttribute('data-participant-count')||el.innerText||"").match(/\d+/);` +
 		`return m?parseInt(m[0],10):-1;})()`
+	// meetAccountChipPresentJS returns true if a signed-in Google account chip
+	// (the avatar/initial in the top-right corner) is present on the pre-join
+	// page. Secondary, best-effort signed-out signal alongside the deterministic
+	// accounts.google.com URL redirect (platform.IsGoogleSignInURL) — the URL
+	// check is what actually fails the join; this is logged only, since a
+	// missing chip while ON the correct meet.google.com URL could just mean the
+	// selector is stale. TODO(live-tuning): confirm selector against a real,
+	// signed-in Meet pre-join page and consider promoting to fatal once trusted.
+	meetAccountChipPresentJS = `(function(){` +
+		`return !!document.querySelector('[aria-label*="Google Account" i],a[aria-label*="account" i] img,header img[alt*="account" i]');` +
+		`})()`
 )
+
+// errMeetingBotSignedOut is a sentinel wrapped into the runJoinFlow error when
+// the persistent bot profile's Google session has expired (issue #5122). A
+// distinct sentinel (rather than a bare fmt.Errorf) lets a caller
+// errors.Is-detect "needs re-seed" specifically, e.g. to raise a
+// higher-urgency alert than a generic join failure (stale selector, host never
+// admitted the bot, etc.).
+var errMeetingBotSignedOut = fmt.Errorf("meeting bot Chrome profile is signed out of its Google account")
 
 // meetJoinButtonLabels are the visible button texts Meet uses for the join
 // action, in priority order. "Ask to join" appears when the bot needs host
@@ -224,7 +243,13 @@ func meetingWavPath(workspaceDir, meetingID string) string {
 // (same workspace) to turn the recording into a transcript node-locally.
 type MeetingJoinHandler struct {
 	WorkspaceDir string
-	transcriber  *TranscribeAudioHandler
+	// ProfileDir overrides the persistent, signed-in bot Chrome profile
+	// directory (issue #5122). Empty means "use platform's default
+	// resolution" — EnvMeetingProfileDir, then ConfigDir()/meeting-profile.
+	// Exposed here (rather than only via the env var) so the worker's
+	// startup config can pin it explicitly, e.g. to a dedicated data volume.
+	ProfileDir  string
+	transcriber *TranscribeAudioHandler
 }
 
 // NewMeetingJoinHandler constructs a handler rooted at the node workspace.
@@ -257,8 +282,10 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	}
 	defer func() { _, _ = rec.Stop() }()
 
-	// Launch the sibling meeting browser routed into the sink.
-	br := platform.NewMeetingBrowser(rec.SinkName())
+	// Launch the sibling meeting browser routed into the sink, reusing the
+	// persistent, signed-in bot Chrome profile (issue #5122) rather than a
+	// throwaway one.
+	br := platform.NewMeetingBrowser(rec.SinkName(), h.ProfileDir)
 	if err := br.Start(); err != nil {
 		return nil, fmt.Errorf("start meeting browser: %w", err)
 	}
@@ -328,6 +355,26 @@ func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBro
 		return fmt.Errorf("navigate to meeting url: %w", err)
 	}
 	time.Sleep(meetPageSettle)
+
+	// Fatal: the persistent bot profile's Google session may have expired
+	// (cookie expiry, revoked session, forced re-auth). Rather than silently
+	// falling back to an anonymous join — which many orgs policy-reject anyway,
+	// the whole reason this profile exists — detect the accounts.google.com
+	// sign-in redirect and fail with a clear, actionable error pointing at the
+	// re-seed doc instead of limping on and failing confusingly at the join
+	// button or admission step.
+	if curURL, err := br.CurrentURL(); err != nil {
+		ctx.Log("warn", "     - could not read current URL for signed-out check (non-fatal): %v", err)
+	} else if platform.IsGoogleSignInURL(curURL) {
+		return fmt.Errorf("%w: redirected to %s — re-seed docs/meeting-bot-profile-seeding.md", errMeetingBotSignedOut, curURL)
+	}
+	// Secondary, best-effort corroborating signal (see meetAccountChipPresentJS
+	// doc comment); logged only, not fatal.
+	if v, err := br.Evaluate(meetAccountChipPresentJS); err == nil {
+		if present, ok := v.(bool); ok && !present {
+			ctx.Log("warn", "     - no signed-in account chip detected on pre-join page (non-fatal secondary signal; profile may need re-seeding)")
+		}
+	}
 
 	// Best-effort: dismiss any camera/mic permission or "continue without …"
 	// prompts. A missing prompt is normal, so this never fails the flow.
