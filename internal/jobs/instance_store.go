@@ -45,6 +45,10 @@ type InstanceRecord struct {
 	StateVolumePath string `json:"state_volume_path"`
 	// StateMountPath is the container path StateVolumePath is mounted at.
 	StateMountPath string `json:"state_mount_path"`
+	// Runtime is the allowlist-validated docker runtime the instance runs under
+	// (e.g. "kata", "runsc"). Empty means the daemon default (runc). Recorded so
+	// SERVICE_STATUS can report the runtime a BYOC instance is isolated by.
+	Runtime string `json:"runtime,omitempty"`
 }
 
 // instanceStore persists the set of payload-launched instances to a JSON file.

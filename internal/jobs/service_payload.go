@@ -79,7 +79,19 @@ type instanceSpec struct {
 	// StateVolumePath is the absolute, ~-expanded, validated host path.
 	StateVolumePath string
 	StateMountPath  string
+	// Runtime is the optional, allowlist-validated docker container runtime the
+	// instance runs under (e.g. "kata", "runsc"). Empty means the daemon default
+	// (runc). Set so an untrusted BYOC workload can run under a stronger runtime
+	// (aceteam#5028 / substrate spike #468).
+	Runtime string
 }
+
+// allowedRuntimes is the strict allowlist of docker `--runtime` values a payload
+// may request. The value is passed to `docker run --runtime=<value>`, so it is a
+// code-execution surface: an unvalidated string would let a payload select an
+// arbitrary runtime binary. Only these exact spellings are accepted; the daemon
+// preflight (preflightRuntime) then confirms the requested one is registered.
+var allowedRuntimes = []string{"kata", "kata-runtime", "runsc"}
 
 // payloadHasInlineSpec reports whether a job payload is the extended,
 // self-contained launch form (carries an "image") rather than the legacy
@@ -137,6 +149,11 @@ func parseInstanceSpec(payload map[string]string, homeDir string) (*instanceSpec
 		return nil, err
 	}
 
+	runtime := strings.TrimSpace(payload["runtime"])
+	if err := validateRuntime(runtime); err != nil {
+		return nil, err
+	}
+
 	// Container port: honor an explicit PORT in the payload env, else the
 	// wrapper's default. The host port is published to this in-container port.
 	containerPort := defaultContainerPort
@@ -158,7 +175,25 @@ func parseInstanceSpec(payload map[string]string, homeDir string) (*instanceSpec
 		ContainerPort:   containerPort,
 		StateVolumePath: volPath,
 		StateMountPath:  mountPath,
+		Runtime:         runtime,
 	}, nil
+}
+
+// validateRuntime enforces the strict runtime allowlist. An empty value is
+// valid (the daemon default runtime is used and no `--runtime` flag is passed).
+// Any other value must match an allowed spelling exactly; this is what keeps an
+// arbitrary string from reaching `docker run --runtime=`.
+func validateRuntime(runtime string) error {
+	if runtime == "" {
+		return nil
+	}
+	for _, allowed := range allowedRuntimes {
+		if runtime == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid runtime %q: allowed runtimes are %s",
+		runtime, strings.Join(allowedRuntimes, ", "))
 }
 
 // validateServiceName rejects names that could break out of the "citadel-<name>"
@@ -308,6 +343,14 @@ func buildDockerRunArgs(spec *instanceSpec) []string {
 		"-v", fmt.Sprintf("%s:%s", spec.StateVolumePath, spec.StateMountPath),
 	}
 
+	// Run under an alternative container runtime when one is requested (Kata,
+	// gVisor). Omitted entirely when empty so the daemon default (runc) is used.
+	// The value is allowlist-validated at parse time (validateRuntime), so it is
+	// never an arbitrary `--runtime` argument.
+	if spec.Runtime != "" {
+		args = append(args, "--runtime="+spec.Runtime)
+	}
+
 	// Inject the durability + port env unless the payload already set them, so
 	// the runtime writes into the mounted volume and listens on the published
 	// port. Explicit payload values win.
@@ -375,6 +418,13 @@ func (h *ServiceHandler) serviceStartPayload(ctx JobContext, job *nexus.Job) ([]
 		return h.instanceResult(spec, "start", true, "")
 	}
 
+	// Preflight the requested runtime against the local Docker daemon so a node
+	// without Kata/gVisor installed fails the job with an actionable message
+	// rather than letting `docker run --runtime=...` fail cryptically.
+	if err := preflightRuntime(spec.Runtime); err != nil {
+		return nil, err
+	}
+
 	// Ensure the state volume dir exists on the host before mounting. The
 	// container entrypoint chowns it to the runtime user, so host ownership is
 	// fine; it just has to exist.
@@ -413,6 +463,7 @@ func (h *ServiceHandler) serviceStatusPayload(rec InstanceRecord) ([]byte, error
 		Running: running,
 		Kind:    "docker",
 		Action:  "status",
+		Runtime: rec.Runtime,
 		Message: fmt.Sprintf("%s is %s (docker)", rec.ServiceName, boolToStatus(running)),
 	})
 }
@@ -445,7 +496,7 @@ func (h *ServiceHandler) serviceStopPayload(ctx JobContext, rec InstanceRecord) 
 func (h *ServiceHandler) instanceResult(spec *instanceSpec, action string, running bool, errMsg string) ([]byte, error) {
 	res := serviceResult{
 		Name: spec.ServiceName, Running: running, Kind: "docker",
-		Action: action, Error: errMsg,
+		Action: action, Error: errMsg, Runtime: spec.Runtime,
 	}
 	endpoint := fmt.Sprintf("127.0.0.1:%d", spec.HostPort)
 	res.Endpoint = endpoint
@@ -468,6 +519,7 @@ func (h *ServiceHandler) recordInstance(spec *instanceSpec) error {
 		ContainerPort:   spec.ContainerPort,
 		StateVolumePath: spec.StateVolumePath,
 		StateMountPath:  spec.StateMountPath,
+		Runtime:         spec.Runtime,
 	})
 }
 
@@ -493,4 +545,66 @@ func (h *ServiceHandler) instanceStore() *instanceStore {
 func (h *ServiceHandler) dockerContainerExists(containerName string) bool {
 	cmd := exec.Command("docker", "inspect", "--format", "{{.Name}}", containerName)
 	return cmd.Run() == nil
+}
+
+// dockerRuntimesFunc returns the set of container runtimes registered with the
+// local Docker daemon (the keys of `docker info`'s .Runtimes map). It is a
+// package var so the preflight is testable without a running daemon.
+var dockerRuntimesFunc = defaultDockerRuntimes
+
+// defaultDockerRuntimes queries the local Docker daemon for its configured
+// runtimes. `docker info --format '{{json .Runtimes}}'` prints a JSON object
+// keyed by runtime name (runc plus any operator-registered runtime such as
+// kata-runtime or runsc).
+func defaultDockerRuntimes() (map[string]bool, error) {
+	cmd := exec.Command("docker", "info", "--format", "{{json .Runtimes}}")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to query docker runtimes: %w", err)
+	}
+	var runtimes map[string]json.RawMessage
+	if err := json.Unmarshal(out, &runtimes); err != nil {
+		return nil, fmt.Errorf("failed to parse docker runtimes: %w", err)
+	}
+	set := make(map[string]bool, len(runtimes))
+	for name := range runtimes {
+		set[name] = true
+	}
+	return set, nil
+}
+
+// preflightRuntime verifies the requested runtime is actually registered with
+// the local Docker daemon before launch, so a node missing Kata/gVisor fails
+// with an actionable message instead of a cryptic `docker run` error. An empty
+// runtime (the daemon default) needs no daemon round-trip. The requested value
+// is checked verbatim -- a "kata" request is NOT satisfied by a daemon that
+// registered the runtime as "kata-runtime"; that mismatch must surface here.
+func preflightRuntime(runtime string) error {
+	if runtime == "" {
+		return nil
+	}
+	runtimes, err := dockerRuntimesFunc()
+	if err != nil {
+		return fmt.Errorf("cannot verify runtime %s: %w", runtime, err)
+	}
+	if !runtimes[runtime] {
+		return fmt.Errorf("runtime %s requested but not installed on this node (registered runtimes: %s)",
+			runtime, strings.Join(sortedBoolKeys(runtimes), ", "))
+	}
+	return nil
+}
+
+// sortedBoolKeys returns the keys of a set in ascending order for a stable
+// error message.
+func sortedBoolKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+	return keys
 }

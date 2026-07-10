@@ -74,6 +74,10 @@ type serviceResult struct {
 	// provisioned service. Empty for native services or when no host port is
 	// published. See citadel-cli#415.
 	Endpoint string `json:"endpoint,omitempty"`
+	// Runtime is the docker container runtime a payload-launched instance runs
+	// under (e.g. "kata", "runsc"). Empty for the daemon default (runc) and for
+	// manifest/native services. See citadel-cli#470.
+	Runtime string `json:"runtime,omitempty"`
 }
 
 func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
