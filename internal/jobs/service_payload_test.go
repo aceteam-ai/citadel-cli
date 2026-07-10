@@ -119,6 +119,9 @@ func TestParseInstanceSpec_Rejects(t *testing.T) {
 		{"volume outside data dir", func(p map[string]string) { p["state_volume_path"] = "/etc" }, "outside the citadel data dir"},
 		{"volume traversal via ~", func(p map[string]string) { p["state_volume_path"] = "~/../../etc/passwd" }, "outside the citadel data dir"},
 		{"relative mount path", func(p map[string]string) { p["state_mount_path"] = "state" }, "must be an absolute container path"},
+		{"runtime not allowed", func(p map[string]string) { p["runtime"] = "runsc-evil" }, "invalid runtime"},
+		{"runtime shell injection", func(p map[string]string) { p["runtime"] = "kata; rm -rf /" }, "invalid runtime"},
+		{"runtime flag injection", func(p map[string]string) { p["runtime"] = "--privileged" }, "invalid runtime"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -250,6 +253,142 @@ func TestBuildDockerRunArgs_PayloadEnvWins(t *testing.T) {
 		t.Errorf("expected exactly one CLAUDE_CONFIG_DIR env, got %d", n)
 	}
 }
+
+func TestValidateRuntime(t *testing.T) {
+	tests := []struct {
+		runtime string
+		wantErr bool
+	}{
+		{"", false},             // empty -> daemon default, no flag
+		{"kata", false},         // allowed
+		{"kata-runtime", false}, // allowed
+		{"runsc", false},        // allowed
+		{"runc", true},          // not on the allowlist (default is the empty string, not "runc")
+		{"nvidia", true},        // not on the allowlist
+		{"runsc-evil", true},    // near-miss must not pass
+		{"kata; rm -rf /", true},
+		{"--privileged", true},
+		{"kata runsc", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.runtime, func(t *testing.T) {
+			err := validateRuntime(tt.runtime)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateRuntime(%q) err = %v, wantErr %v", tt.runtime, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseInstanceSpec_Runtime(t *testing.T) {
+	p := basePayload()
+	p["runtime"] = "kata"
+	spec, err := parseInstanceSpec(p, testHome)
+	if err != nil {
+		t.Fatalf("parseInstanceSpec: %v", err)
+	}
+	if spec.Runtime != "kata" {
+		t.Errorf("Runtime = %q, want kata", spec.Runtime)
+	}
+
+	// Omitted runtime -> empty (daemon default).
+	spec2, err := parseInstanceSpec(basePayload(), testHome)
+	if err != nil {
+		t.Fatalf("parseInstanceSpec: %v", err)
+	}
+	if spec2.Runtime != "" {
+		t.Errorf("Runtime = %q, want empty", spec2.Runtime)
+	}
+}
+
+func TestBuildDockerRunArgs_Runtime(t *testing.T) {
+	base := func() *instanceSpec {
+		return &instanceSpec{
+			ServiceName:     "ac-x",
+			ContainerName:   "citadel-ac-x",
+			Image:           "ghcr.io/aceteam-ai/claudecode-service:latest",
+			Env:             map[string]string{},
+			HostPort:        18789,
+			ContainerPort:   8787,
+			StateVolumePath: "/home/citadel/citadel-cache/instances/i-1",
+			StateMountPath:  "/state",
+		}
+	}
+
+	// With runtime: exactly one --runtime=<value> flag, image still last.
+	withRT := base()
+	withRT.Runtime = "runsc"
+	args := buildDockerRunArgs(withRT)
+	if args[len(args)-1] != withRT.Image {
+		t.Errorf("image is not the last arg: %v", args)
+	}
+	n := 0
+	for _, a := range args {
+		if a == "--runtime=runsc" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("expected exactly one --runtime=runsc arg, got %d in %v", n, args)
+	}
+
+	// Without runtime: no --runtime flag at all.
+	noRT := base()
+	got := strings.Join(buildDockerRunArgs(noRT), " ")
+	if strings.Contains(got, "--runtime") {
+		t.Errorf("did not expect a --runtime flag, got: %s", got)
+	}
+}
+
+func TestPreflightRuntime(t *testing.T) {
+	// Empty runtime never touches the daemon and always passes.
+	orig := dockerRuntimesFunc
+	defer func() { dockerRuntimesFunc = orig }()
+
+	dockerRuntimesFunc = func() (map[string]bool, error) {
+		t.Fatal("preflightRuntime queried the daemon for an empty runtime")
+		return nil, nil
+	}
+	if err := preflightRuntime(""); err != nil {
+		t.Errorf("preflightRuntime(\"\") = %v, want nil", err)
+	}
+
+	// Requested runtime registered with the daemon -> pass.
+	dockerRuntimesFunc = func() (map[string]bool, error) {
+		return map[string]bool{"runc": true, "kata-runtime": true}, nil
+	}
+	if err := preflightRuntime("kata-runtime"); err != nil {
+		t.Errorf("preflightRuntime(kata-runtime) = %v, want nil", err)
+	}
+
+	// Requested runtime absent -> actionable failure. A "kata" request is NOT
+	// satisfied by a daemon that only registered "kata-runtime" (verbatim check).
+	dockerRuntimesFunc = func() (map[string]bool, error) {
+		return map[string]bool{"runc": true, "kata-runtime": true}, nil
+	}
+	err := preflightRuntime("kata")
+	if err == nil {
+		t.Fatal("expected preflight failure for absent runtime, got nil")
+	}
+	if !strings.Contains(err.Error(), "not installed on this node") {
+		t.Errorf("error = %q, want 'not installed on this node'", err.Error())
+	}
+
+	// Daemon query error propagates.
+	dockerRuntimesFunc = func() (map[string]bool, error) {
+		return nil, errStub
+	}
+	if err := preflightRuntime("runsc"); err == nil {
+		t.Error("expected preflight to propagate daemon query error, got nil")
+	}
+}
+
+// errStub is a sentinel error for the daemon-query failure path.
+var errStub = stubErr("docker daemon unreachable")
+
+type stubErr string
+
+func (e stubErr) Error() string { return string(e) }
 
 // itoa avoids importing strconv just for the reserved-port table above.
 func itoa(n int) string {
