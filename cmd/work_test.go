@@ -22,6 +22,9 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 		flag     bool
 		env      string // "" means unset
 		state    *bool  // nil means no state file
+		version  string // "" means a real release tag (v2.45.0)
+		noAuto   bool   // --no-auto-update flag
+		noAutoEn string // CITADEL_NO_AUTO_UPDATE env
 		expected bool
 	}{
 		{name: "default off when nothing set", expected: false},
@@ -30,15 +33,26 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 		{name: "env true overrides disabled state", env: "true", state: boolPtr(false), expected: true},
 		{name: "env off overrides enabled state", env: "off", state: boolPtr(true), expected: false},
 		{name: "flag wins over env and state", flag: true, env: "off", state: boolPtr(false), expected: true},
+		// #473: a dev binary never auto-installs, even with an enable signal.
+		{name: "dev binary vetoes auto-update flag", flag: true, version: "dev", expected: false},
+		{name: "dev binary vetoes enabled state", state: boolPtr(true), version: "dev", expected: false},
+		// #473: opt-out (flag / env) wins over every enable signal.
+		{name: "no-auto-update flag vetoes auto-update flag", flag: true, noAuto: true, expected: false},
+		{name: "CITADEL_NO_AUTO_UPDATE env vetoes enabled state", state: boolPtr(true), noAutoEn: "1", expected: false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir()) // isolate the on-disk update state
 			t.Setenv("CITADEL_AUTO_UPDATE", tc.env)
-			orig := workAutoUpdate
-			workAutoUpdate = tc.flag
-			t.Cleanup(func() { workAutoUpdate = orig })
+			t.Setenv("CITADEL_NO_AUTO_UPDATE", tc.noAutoEn)
+			ver := tc.version
+			if ver == "" {
+				ver = "v2.45.0"
+			}
+			origVer, origFlag, origNoAuto := Version, workAutoUpdate, noAutoUpdate
+			Version, workAutoUpdate, noAutoUpdate = ver, tc.flag, tc.noAuto
+			t.Cleanup(func() { Version, workAutoUpdate, noAutoUpdate = origVer, origFlag, origNoAuto })
 			if tc.state != nil {
 				writeState(t, *tc.state)
 			}

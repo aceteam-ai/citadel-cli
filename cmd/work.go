@@ -2140,6 +2140,13 @@ func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
 // Disabled by default. Evaluated every tick so the web UI (which dispatches
 // `citadel update enable/disable` to the node) can toggle a running agent.
 func resolveAutoUpdateEnabled() bool {
+	// The opt-out (--no-auto-update / CITADEL_NO_AUTO_UPDATE) and a dev build
+	// both veto auto-INSTALL, ahead of any enable signal: a safety/"don't touch
+	// my binary" signal must win over --auto-update / CITADEL_AUTO_UPDATE.
+	// Explicit `citadel update` remains the escape hatch for a dev binary.
+	if !autoUpdateAllowed() {
+		return false
+	}
 	if workAutoUpdate {
 		return true
 	}

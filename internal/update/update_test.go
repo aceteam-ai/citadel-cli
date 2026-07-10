@@ -141,6 +141,83 @@ func TestIsNewerVersionExported(t *testing.T) {
 	}
 }
 
+func TestIsTruthy(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"1", true},
+		{"true", true},
+		{"yes", true},
+		{"on", true},
+		{"TRUE", true},
+		{"  Yes  ", true},
+		{"0", false},
+		{"false", false},
+		{"no", false},
+		{"", false},
+		{"maybe", false},
+	}
+	for _, tt := range tests {
+		if got := IsTruthy(tt.in); got != tt.want {
+			t.Errorf("IsTruthy(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestIsReleaseVersion(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"v2.45.0", true},
+		{"2.45.0", true},
+		{"v1.0.0", true},
+		{"dev", false},
+		{"", false},
+		{"  ", false},
+		{"garbage", false},
+	}
+	for _, tt := range tests {
+		if got := IsReleaseVersion(tt.in); got != tt.want {
+			t.Errorf("IsReleaseVersion(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestShouldAutoInstall covers the single decision shared by the startup and
+// periodic auto-update paths (#473): a dev binary must not auto-install a
+// release over itself, and either opt-out (flag or truthy env) suppresses the
+// install for a real release. The explicit `citadel update` command does not
+// call this and is verified separately by TestIsNewerVersion ("dev" -> release
+// still returns true).
+func TestShouldAutoInstall(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		flag    bool
+		env     string
+		want    bool
+	}{
+		{"real release, not opted out, installs", "v2.45.0", false, "", true},
+		{"dev never auto-installs", "dev", false, "", false},
+		{"empty version never auto-installs", "", false, "", false},
+		{"env opt-out suppresses install", "v2.45.0", false, "1", false},
+		{"env opt-out (true) suppresses install", "v2.45.0", false, "true", false},
+		{"env opt-out (yes) suppresses install", "v2.45.0", false, "yes", false},
+		{"flag opt-out suppresses install", "v2.45.0", true, "", false},
+		{"opt-out wins over release", "v2.45.0", true, "", false},
+		{"falsey env does not opt out", "v2.45.0", false, "0", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShouldAutoInstall(tt.version, tt.flag, tt.env); got != tt.want {
+				t.Errorf("ShouldAutoInstall(%q, %v, %q) = %v, want %v", tt.version, tt.flag, tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGetBinaryArchiveName(t *testing.T) {
 	client := NewClient("v1.0.0")
 	release := &Release{TagName: "v1.2.3"}

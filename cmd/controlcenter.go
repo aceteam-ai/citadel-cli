@@ -1928,6 +1928,14 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 // ccAutoUpdate checks for updates and auto-updates if available.
 // Returns true if the binary was updated (caller should restart).
 func ccAutoUpdate() bool {
+	// Never auto-install when the user opted out (--no-auto-update /
+	// CITADEL_NO_AUTO_UPDATE) or when this is a locally-built dev binary: a
+	// hand-copied dev/test binary must not silently replace itself with a
+	// release before it can be exercised. Explicit `citadel update` still works.
+	if !autoUpdateAllowed() {
+		return false
+	}
+
 	// Check for updates
 	spinner := whimsy.NewSimpleSpinner([]string{"Checking for updates..."})
 	spinner.Start()
