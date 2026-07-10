@@ -77,7 +77,7 @@ var xdpyResolutionRe = regexp.MustCompile(`dimensions:\s+(\d+)x(\d+)`)
 // a stream can still start (ffmpeg's x11grab will grab the real size; the init
 // message just advertises a best-effort guess that clients can correct from the
 // decoded SPS).
-func detectGeometry(display string) Geometry {
+func detectGeometry(display, xauthority string) Geometry {
 	path, err := exec.LookPath("xdpyinfo")
 	if err != nil {
 		return defaultGeometry
@@ -86,6 +86,9 @@ func detectGeometry(display string) Geometry {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path)
 	cmd.Env = append(os.Environ(), "DISPLAY="+display)
+	if xauthority != "" {
+		cmd.Env = append(cmd.Env, "XAUTHORITY="+xauthority)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return defaultGeometry

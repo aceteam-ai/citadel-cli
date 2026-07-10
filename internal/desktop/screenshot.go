@@ -1,12 +1,16 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 const screenshotTimeout = 10 * time.Second
@@ -28,33 +32,62 @@ func CaptureScreenshot(ctx context.Context) ([]byte, error) {
 }
 
 func captureLinux(ctx context.Context) ([]byte, error) {
-	display := os.Getenv("DISPLAY")
-	if display == "" {
-		display = ":0"
-	}
+	display, xauthority := platform.ResolveX11Env()
 
 	captureCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
 
 	env := append(os.Environ(), "DISPLAY="+display)
-
-	if path, err := exec.LookPath("import"); err == nil {
-		cmd := exec.CommandContext(captureCtx, path, "-window", "root", "png:-")
-		cmd.Env = env
-		output, err := cmd.Output()
-		if err == nil && len(output) > 0 {
-			return output, nil
-		}
+	if xauthority != "" {
+		env = append(env, "XAUTHORITY="+xauthority)
 	}
 
-	if path, err := exec.LookPath("scrot"); err == nil {
-		cmd := exec.CommandContext(captureCtx, path, "-o", "-")
-		cmd.Env = env
-		output, err := cmd.Output()
-		if err == nil && len(output) > 0 {
-			return output, nil
-		}
+	// Capture candidates in priority order. We try each that resolves and, if a
+	// tool is present but FAILS (a non-X11 ImageMagick build, or a display it
+	// cannot open), we fall through and keep the real error -- so the final
+	// message is actionable instead of the old misleading "no tool available".
+	//
+	// /usr/bin/import is tried before a bare "import" because a source-built
+	// /usr/local/bin/import (no X11 delegate) commonly shadows the apt one on
+	// PATH and would otherwise be picked and silently fail.
+	candidates := []struct {
+		name string
+		args []string
+	}{
+		{"scrot", []string{"-o", "-"}},
+		{"/usr/bin/import", []string{"-window", "root", "png:-"}},
+		{"import", []string{"-window", "root", "png:-"}},
 	}
 
-	return nil, fmt.Errorf("no screenshot tool available (install imagemagick or scrot)")
+	var lastErr error
+	triedAny := false
+	for _, c := range candidates {
+		path, err := exec.LookPath(c.name)
+		if err != nil {
+			continue
+		}
+		triedAny = true
+		cmd := exec.CommandContext(captureCtx, path, c.args...)
+		cmd.Env = env
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		output, runErr := cmd.Output()
+		if runErr == nil && len(output) > 0 {
+			return output, nil
+		}
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			if runErr != nil {
+				detail = runErr.Error()
+			} else {
+				detail = "produced no output"
+			}
+		}
+		lastErr = fmt.Errorf("%s: %s", c.name, detail)
+	}
+
+	if !triedAny {
+		return nil, fmt.Errorf("no screenshot tool found on PATH (install scrot or imagemagick with X11 support)")
+	}
+	return nil, fmt.Errorf("screenshot capture failed on display %s (XAUTHORITY=%q): %w", display, xauthority, lastErr)
 }

@@ -58,6 +58,9 @@ func (r *encoderRunner) Start(ctx context.Context) error {
 	args := buildFFmpegArgs(r.cfg, r.encoder)
 	cmd := exec.CommandContext(runCtx, path, args...)
 	cmd.Env = append(os.Environ(), "DISPLAY="+r.cfg.Display)
+	if r.cfg.XAuthority != "" {
+		cmd.Env = append(cmd.Env, "XAUTHORITY="+r.cfg.XAuthority)
+	}
 	cmd.Stderr = os.Stderr
 
 	stdout, err := cmd.StdoutPipe()
