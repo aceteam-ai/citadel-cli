@@ -4,11 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
+
+// meetingEnabled reports whether the operator has opted into the meeting-join
+// capability via CITADEL_MEETING_ENABLED (truthy: 1/true/yes/on, case-insensitive).
+// Defaults to disabled when unset. Gates handler registration to match the
+// `meeting` capability advertisement gate in internal/capabilities.
+func meetingEnabled() bool {
+	return update.IsTruthy(os.Getenv("CITADEL_MEETING_ENABLED"))
+}
 
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.
 // This allows existing handlers to work with the new worker abstraction.
@@ -225,12 +235,20 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// with the workspace so it can validate audio paths the same way the
 			// file handlers do.
 			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
-			// Auto-join meeting notetaker (aceteam#5098): records the call into a
-			// per-meeting null sink, then transcribes it via the handler above.
-			// Needs the workspace both to write the recording and to validate the
-			// audio path for transcription, so it lives inside this gate.
-			NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
 		)
+
+		// Auto-join meeting notetaker (aceteam#5098): records the call into a
+		// per-meeting null sink, then transcribes it via the handler above. Needs
+		// the workspace both to write the recording and to validate the audio path
+		// for transcription, so it lives inside this workspace gate. The join flow
+		// is unverified, so the handler only registers when an operator opts in via
+		// CITADEL_MEETING_ENABLED (matching the `meeting` capability gate); the PR
+		// merges dormant until then.
+		if meetingEnabled() {
+			handlers = append(handlers,
+				NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
+			)
+		}
 	}
 
 	// Register service-management handlers when a config directory is available.

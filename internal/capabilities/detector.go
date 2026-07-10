@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
 const detectionTimeout = 5 * time.Second
@@ -446,16 +448,31 @@ func detectCPU() []Capability {
 // the pure meetingCapable predicate so the gating logic itself is unit-testable
 // without a live audio stack or browser.
 func detectMeetingCapability() bool {
-	return meetingCapable(
+	return meetingTagEnabled(meetingCapable(
 		platform.AudioStackAvailable(),
 		platform.ChromiumAvailable(),
 		platform.XvfbAvailable(),
-	)
+	))
 }
 
-// meetingCapable is the pure gating predicate for the `meeting` tag: all three
-// dependencies (audio capture, Chromium, Xvfb) must be present. Extracted so the
-// AND-of-deps logic is testable in isolation from the shell-outs.
+// meetingTagEnabled reports whether the `meeting` tag should be advertised: the
+// operator opt-in (CITADEL_MEETING_ENABLED) must be set AND the node's deps must
+// be present. The meeting-join flow is unverified, so nodes stay dormant (never
+// advertise, never subscribe to the org meeting queue) until an operator opts in.
+func meetingTagEnabled(depsOK bool) bool {
+	return meetingEnabled() && depsOK
+}
+
+// meetingEnabled reports whether the operator has opted into the meeting-join
+// capability via CITADEL_MEETING_ENABLED (truthy: 1/true/yes/on, case-insensitive).
+// Defaults to disabled when unset.
+func meetingEnabled() bool {
+	return update.IsTruthy(os.Getenv("CITADEL_MEETING_ENABLED"))
+}
+
+// meetingCapable is the pure gating predicate for the `meeting` tag deps: all
+// three dependencies (audio capture, Chromium, Xvfb) must be present. Extracted
+// so the AND-of-deps logic is testable in isolation from the shell-outs.
 func meetingCapable(audioOK, chromeOK, xvfbOK bool) bool {
 	return audioOK && chromeOK && xvfbOK
 }
