@@ -378,3 +378,55 @@ func TestResolveQueuesWithEngines(t *testing.T) {
 		}
 	}
 }
+
+func TestMeetingCapable(t *testing.T) {
+	// The meeting tag requires ALL three deps: audio stack, Chromium, and Xvfb.
+	cases := []struct {
+		audio, chrome, xvfb bool
+		want                bool
+	}{
+		{true, true, true, true},
+		{false, true, true, false},
+		{true, false, true, false},
+		{true, true, false, false},
+		{false, false, false, false},
+	}
+	for _, c := range cases {
+		if got := meetingCapable(c.audio, c.chrome, c.xvfb); got != c.want {
+			t.Errorf("meetingCapable(audio=%v,chrome=%v,xvfb=%v) = %v, want %v",
+				c.audio, c.chrome, c.xvfb, got, c.want)
+		}
+	}
+
+	// The "meeting" tag itself must be a valid capability tag or the live
+	// aggregator would silently drop it.
+	if !ValidateTag("meeting") {
+		t.Error(`ValidateTag("meeting") = false; the meeting tag would be dropped`)
+	}
+}
+
+func TestMeetingTagEnabled(t *testing.T) {
+	// The `meeting` tag advertises only when the persisted toggle is enabled AND
+	// the node deps are present. The toggle defaults on (config.DefaultMeeting),
+	// so the default+deps case advertises; an explicit opt-out keeps it off even
+	// with deps present.
+	cases := []struct {
+		name    string
+		enabled bool
+		depsOK  bool
+		want    bool
+	}{
+		{"enabled (default), deps present -> advertise", true, true, true},
+		{"enabled, deps missing -> no advertise", true, false, false},
+		{"opted out, deps present -> no advertise", false, true, false},
+		{"opted out, deps missing -> no advertise", false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := meetingTagEnabled(c.enabled, c.depsOK); got != c.want {
+				t.Errorf("meetingTagEnabled(enabled=%v, depsOK=%v) = %v, want %v",
+					c.enabled, c.depsOK, got, c.want)
+			}
+		})
+	}
+}

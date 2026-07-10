@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
@@ -180,6 +181,14 @@ func DetectNodeCapabilities() *NodeCapabilities {
 		if ValidateTag(tag) {
 			caps.Tags = append(caps.Tags, tag)
 		}
+	}
+
+	// Advertise the meeting-notetaker capability only when this node can actually
+	// run one: a working audio-capture stack (PulseAudio + ffmpeg + pactl), a
+	// launchable Chromium, and Xvfb for the headless virtual display. Backend
+	// routes MEETING_JOIN jobs to nodes carrying this tag (aceteam#5098).
+	if detectMeetingCapability() {
+		caps.Tags = append(caps.Tags, "meeting")
 	}
 
 	// Always add cpu:general
@@ -431,6 +440,36 @@ func detectOllamaModels() []Capability {
 
 func detectCPU() []Capability {
 	return []Capability{{Tag: "cpu:general", Category: "cpu", Description: "General CPU compute"}}
+}
+
+// detectMeetingCapability reports whether this node can run the auto-join meeting
+// notetaker (aceteam#5098). It ANDs the persisted config toggle (default-on, the
+// house opt-out convention) with the three real dependency probes, composed
+// through the pure meetingTagEnabled predicate so the gating logic itself is
+// unit-testable without a live audio stack, browser, or config file.
+func detectMeetingCapability() bool {
+	enabled := config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+	return meetingTagEnabled(enabled, meetingCapable(
+		platform.AudioStackAvailable(),
+		platform.ChromiumAvailable(),
+		platform.XvfbAvailable(),
+	))
+}
+
+// meetingTagEnabled reports whether the `meeting` tag should be advertised: the
+// persisted meeting toggle must be enabled AND the node's deps must be present.
+// The toggle defaults on (see config.DefaultMeeting), so a dep-capable node
+// advertises unless the operator has explicitly opted out (via the Control
+// Center or an APPLY_DEVICE_CONFIG push).
+func meetingTagEnabled(enabled, depsOK bool) bool {
+	return enabled && depsOK
+}
+
+// meetingCapable is the pure gating predicate for the `meeting` tag deps: all
+// three dependencies (audio capture, Chromium, Xvfb) must be present. Extracted
+// so the AND-of-deps logic is testable in isolation from the shell-outs.
+func meetingCapable(audioOK, chromeOK, xvfbOK bool) bool {
+	return audioOK && chromeOK && xvfbOK
 }
 
 // NormalizeGPUName converts a full GPU name to a short tag-friendly identifier.

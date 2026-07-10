@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.
@@ -226,6 +228,20 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// file handlers do.
 			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
 		)
+
+		// Auto-join meeting notetaker (aceteam#5098): records the call into a
+		// per-meeting null sink, then transcribes it via the handler above. Needs
+		// the workspace both to write the recording and to validate the audio path
+		// for transcription, so it lives inside this workspace gate. Gated on the
+		// persisted meeting toggle (default-on, the house opt-out convention) so
+		// the handler registers unless the operator has explicitly opted out —
+		// matching the `meeting` capability advertisement gate in
+		// internal/capabilities.
+		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
+			handlers = append(handlers,
+				NewLegacyHandlerAdapter(JobTypeMeetingJoin, jobs.NewMeetingJoinHandler(opts.WorkspaceDir)),
+			)
+		}
 	}
 
 	// Register service-management handlers when a config directory is available.

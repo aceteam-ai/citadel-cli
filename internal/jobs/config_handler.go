@@ -12,11 +12,20 @@ import (
 	"path/filepath"
 	"regexp"
 
+	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
+
+// enabledLabel renders a human-readable enabled/disabled label for result lines.
+func enabledLabel(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
 
 // serviceNamePattern validates service names to prevent path traversal.
 // Only allows lowercase alphanumeric characters and hyphens.
@@ -34,6 +43,12 @@ type DeviceConfig struct {
 	AlertOnHighTemp         bool     `json:"alertOnHighTemp"`
 	VNCEnabled              bool     `json:"vncEnabled"`
 	VNCPassword             string   `json:"vncPassword,omitempty"`
+	// MeetingEnabled is the programmatic path for the `meeting` capability opt-out
+	// (aceteam#5098). It is a pointer so an omitted field (nil) leaves the node's
+	// persisted toggle untouched — a plain bool would default to false and silently
+	// opt every node out the moment any device config is applied. A non-nil value
+	// writes the same meeting.yaml the Control Center toggle and detector use.
+	MeetingEnabled *bool `json:"meetingEnabled,omitempty"`
 }
 
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
@@ -81,6 +96,20 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	}
 
 	result := fmt.Sprintf("Manifest updated successfully for device '%s'", config.DeviceName)
+
+	// Apply the meeting-capability opt-out (aceteam#5098) when the platform pushed
+	// an explicit value. This writes the same persisted meeting.yaml the Control
+	// Center toggle and the capability detector read, so the device-config path and
+	// the local toggle converge on one effective value (default-on when neither
+	// wrote it). Written to platform.ConfigDir() — the per-concern config location,
+	// which the detector reads — not h.ConfigDir (the manifest dir).
+	if config.MeetingEnabled != nil {
+		if err := citadelconfig.SaveMeeting(platform.ConfigDir(), &citadelconfig.Meeting{MeetingEnabled: *config.MeetingEnabled}); err != nil {
+			result += fmt.Sprintf("\nWarning: failed to persist meeting toggle: %v", err)
+		} else {
+			result += fmt.Sprintf("\nMeeting capability %s", enabledLabel(*config.MeetingEnabled))
+		}
+	}
 
 	// Start services if autoStartServices is enabled
 	if config.AutoStartServices && len(config.Services) > 0 {
