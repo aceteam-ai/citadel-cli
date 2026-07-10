@@ -46,6 +46,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -1258,6 +1259,28 @@ func runWork(cmd *cobra.Command, args []string) {
 					Log("control server VPN listener on %s:%s", ctrlIP, ctrlPort)
 					fmt.Printf("   - Control server VPN (mTLS): https://%s:%d\n", ctrlIP, controlPortForVPN)
 				}
+			}
+
+			// LiveKit signaling rides the mesh as a raw TCP pipe: the SFU
+			// container binds host port 7880 (docker host networking), which
+			// tsnet's userspace stack does NOT expose at the VPN IP on its
+			// own. The platform relay dials ws://<vpn_ip>:7880/rtc
+			// (services/ports.go LiveKitWSPort), so pipe that port to the
+			// host. Lazy per-connection dial: harmless when the livekit
+			// service isn't installed, picks it up the moment it starts.
+			lkPort := fmt.Sprintf("%d", services.LiveKitWSPort)
+			if lkLn, lkIP, err := network.ListenVPN("tcp", lkPort); err != nil {
+				Log("livekit signaling VPN listener failed: %v", err)
+				fmt.Fprintf(os.Stderr, "   - ⚠️ LiveKit signaling VPN listener failed: %v\n", err)
+			} else {
+				lkTarget := fmt.Sprintf("127.0.0.1:%d", services.LiveKitWSPort)
+				go func() {
+					if err := network.RunTCPProxy(ctx, lkLn, lkTarget); err != nil && err != context.Canceled {
+						Log("livekit signaling VPN proxy stopped: %v", err)
+					}
+				}()
+				Log("livekit signaling VPN proxy on %s:%s -> %s", lkIP, lkPort, lkTarget)
+				fmt.Printf("   - LiveKit signaling VPN: %s:%d -> %s\n", lkIP, services.LiveKitWSPort, lkTarget)
 			}
 		}
 
