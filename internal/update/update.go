@@ -501,7 +501,18 @@ func (c *Client) extractZip(archivePath, destPath string) error {
 				return err
 			}
 			foundExe = true
+		} else if baseName == "citadel-start.exe" {
+			// The double-click launcher ships next to citadel.exe (#508).
+			// Keep it in sync on update; best-effort so a missing/locked
+			// launcher never fails the update of the CLI itself.
+			startPath := filepath.Join(destDir, "citadel-start.exe")
+			_ = extractZipFile(f, startPath)
 		} else if baseName == "citadel.bat" {
+			// Backward compatibility: pre-#508 archives shipped a citadel.bat
+			// wrapper. Newer archives no longer contain it, but keep extracting
+			// it when present so a mixed-version update still lands a working
+			// file. Existing installs may retain a stale citadel.bat on disk;
+			// it is harmless and intentionally left in place.
 			batPath := filepath.Join(destDir, "citadel.bat")
 			_ = extractZipFile(f, batPath)
 		}

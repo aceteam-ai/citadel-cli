@@ -106,8 +106,14 @@ hook_build() {
 
     local archive_name="citadel_v${version}_${os}_${arch}"
     if [[ "$os" == "windows" ]]; then
-      cp "$REPO_ROOT/scripts/windows/citadel.bat" "$build_dir/"
-      (cd "$build_dir" && zip -q "$release_dir/${archive_name}.zip" "citadel${ext}" "citadel.bat")
+      # Ship the double-click launcher (citadel-start.exe) alongside the CLI
+      # (citadel.exe). The launcher is the obvious clickable "start the node"
+      # entrypoint; citadel.exe remains the CLI for terminal use. This replaces
+      # the old citadel.bat wrapper (#508).
+      CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+        -o "$build_dir/citadel-start${ext}" \
+        ./cmd/citadel-start
+      (cd "$build_dir" && zip -q "$release_dir/${archive_name}.zip" "citadel${ext}" "citadel-start${ext}")
     else
       tar -czf "$release_dir/${archive_name}.tar.gz" -C "$build_dir" "citadel${ext}"
     fi
