@@ -2258,6 +2258,10 @@ type DeviceConfig struct {
 	RedisURL       string `yaml:"redis_url"`
 	UserEmail      string `yaml:"user_email"`
 	UserName       string `yaml:"user_name"`
+	// AceteamAPIKey is an optional user act_ API key for surfaces the
+	// device token cannot reach (Team Chat, MCP). Set manually by the user;
+	// device auth never writes it. See aceteam-ai/citadel-cli#495.
+	AceteamAPIKey string `yaml:"aceteam_api_key"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from global config file.
