@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -123,6 +124,17 @@ const (
 	meetAccountChipPresentJS = `(function(){` +
 		`return !!document.querySelector('[aria-label*="Google Account" i],a[aria-label*="account" i] img,header img[alt*="account" i]');` +
 		`})()`
+	// meetLeaveCallJS clicks the in-call "Leave call" button so the bot exits the
+	// meeting gracefully in response to an `/ace leave` command (issue #5435). It
+	// reuses the SAME "Leave call" aria-label selector as meetIsAdmittedJS, which
+	// is CONFIRMED live 2026-07-11 (host auto-admit path) — so this is the LEAST
+	// uncertain interactive selector. Returns true if a button was clicked, false
+	// if none matched (best-effort: the browser Close() teardown is the backstop,
+	// so a missed click only means a slightly less graceful exit, never a stuck
+	// bot). Intentionally does NOT throw on no-match, unlike platform.clickJS.
+	meetLeaveCallJS = `(function(){` +
+		`var b=document.querySelector('button[aria-label*="Leave call" i],button[aria-label*="Leave" i][data-tooltip*="Leave" i]');` +
+		`if(!b)return false;b.click();return true;})()`
 )
 
 // ErrMeetingBotSignedOut is a sentinel wrapped into the runJoinFlow error when
@@ -269,6 +281,27 @@ type MeetingJoinHandler struct {
 	// startup config can pin it explicitly, e.g. to a dedicated data volume.
 	ProfileDir  string
 	transcriber *TranscribeAudioHandler
+
+	// StreamingEnabled turns on the DURING-call interactive layer (issue #5435):
+	// rolling transcription, the in-call `/ace` command monitor, chat capture,
+	// and the self-announcement. Default false (zero value) so the plain
+	// NewMeetingJoinHandler constructor and the existing batch pipeline are
+	// unchanged; the worker sets it from the persisted meeting config
+	// (config.Meeting.StreamingEnabled, default-on). The whole interactive layer
+	// degrades gracefully (log + continue), so a stale live selector can never
+	// regress the batch record→transcribe path.
+	StreamingEnabled bool
+	// StreamingInterval / StreamingWindow are the rolling-transcription cadence
+	// and trailing stability margin (see meeting_transcribe_rolling.go). Zero
+	// values fall back to the package defaults at use.
+	StreamingInterval time.Duration
+	StreamingWindow   time.Duration
+
+	// transcribeMu serializes whisper-sidecar access so a during-call rolling
+	// pass (meeting_interactive.go) never overlaps the end-of-call batch
+	// transcribe — they would otherwise hit the sidecar and read the growing WAV
+	// concurrently.
+	transcribeMu sync.Mutex
 }
 
 // NewMeetingJoinHandler constructs a handler rooted at the node workspace.
@@ -326,8 +359,13 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	}
 	ctx.Log("info", "     - [Job %s] recording meeting to %s", job.ID, wavPath)
 
-	// Stay in the call until it ends or the hard cap trips.
-	endStatus := h.waitForMeetingEnd(ctx, br, p)
+	// Stay in the call until it ends or the hard cap trips. When the interactive
+	// layer is enabled (issue #5435) this additionally announces the bot, runs
+	// rolling transcription + the in-call `/ace` command monitor, and captures
+	// Meet chat — all best-effort, so a stale live selector degrades to the batch
+	// behavior rather than regressing the recording. Otherwise the plain
+	// record-until-end loop runs exactly as the shipped batch notetaker.
+	outcome := h.runMeetingLoop(ctx, br, p, wavPath)
 
 	// Finalize the recording (also unloads the sink; the deferred Stop is then a
 	// harmless no-op). Take the path from Stop so we transcribe exactly what was
@@ -340,30 +378,63 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		recordedPath = wavPath
 	}
 
-	// Transcribe node-locally by reusing the transcribe handler in-process.
+	// Transcribe node-locally by reusing the transcribe handler in-process. This
+	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored
+	// transcript; rolling transcription during the call was additive.
 	transcript, tErr := h.transcribe(ctx, job, recordedPath)
 	if tErr != nil {
 		// Return a structured partial result rather than failing outright: the
 		// recording succeeded and is on disk; transcription can be retried.
 		out, _ := json.Marshal(map[string]any{
-			"status":         "recorded_transcription_failed",
-			"meeting_id":     p.MeetingID,
-			"audio_path":     recordedPath,
-			"end_reason":     endStatus,
-			"transcript":     nil,
-			"transcript_err": tErr.Error(),
+			"status":              "recorded_transcription_failed",
+			"meeting_id":          p.MeetingID,
+			"audio_path":          recordedPath,
+			"end_reason":          outcome.endReason,
+			"transcript":          nil,
+			"transcript_err":      tErr.Error(),
+			"chat":                chatForResult(outcome.chat),
+			"recognized_commands": commandsForResult(outcome.recognized),
+			"streamed_segments":   outcome.streamedSegments,
 		})
 		return out, nil
 	}
 
 	out, _ := json.Marshal(map[string]any{
-		"status":     "completed",
-		"meeting_id": p.MeetingID,
-		"audio_path": recordedPath,
-		"end_reason": endStatus,
-		"transcript": json.RawMessage(transcript),
+		"status":              "completed",
+		"meeting_id":          p.MeetingID,
+		"audio_path":          recordedPath,
+		"end_reason":          outcome.endReason,
+		"transcript":          json.RawMessage(transcript),
+		"chat":                chatForResult(outcome.chat),
+		"recognized_commands": commandsForResult(outcome.recognized),
+		"streamed_segments":   outcome.streamedSegments,
 	})
 	return out, nil
+}
+
+// runMeetingLoop chooses the interactive during-call loop (issue #5435) when
+// streaming is enabled, else the plain record-until-end loop. In both cases it
+// returns an interactiveOutcome; the plain path fills only endReason so the
+// result shape is uniform (chat/recognized_commands come back empty). Splitting
+// here keeps Execute's happy path readable and the streaming gate in one place.
+func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams, wavPath string) interactiveOutcome {
+	if !h.StreamingEnabled {
+		return interactiveOutcome{endReason: h.waitForMeetingEnd(ctx, br, p)}
+	}
+
+	// botMessages tracks the normalized text of messages the bot itself posts, so
+	// the poll loop never scans its own echoed chat for commands (the
+	// announcement contains "/ace leave"). Seeded by announceOnAdmission.
+	botMessages := make(map[string]struct{})
+
+	// Capability 4: announce on admittance (best-effort, never fatal).
+	h.announceOnAdmission(ctx, br, botMessages)
+
+	// Build the production rolling-transcription pass over the growing wav.
+	transcribe := func() ([]TranscriptSegment, error) {
+		return h.transcribeSegments(ctx, p.MeetingID, wavPath)
+	}
+	return h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages)
 }
 
 // runJoinFlow drives the Google Meet pre-join sequence (partially verified —
@@ -491,16 +562,8 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br *platform.Meet
 func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams) string {
 	deadline := time.Now().Add(p.maxDuration())
 	for time.Now().Before(deadline) {
-		if v, err := br.Evaluate(meetIsEndedJS); err == nil {
-			if b, ok := v.(bool); ok && b {
-				return "call_ended"
-			}
-		}
-		// Secondary signal: everyone else left and the bot is alone.
-		if v, err := br.Evaluate(meetParticipantCountJS); err == nil {
-			if n, ok := toInt(v); ok && n >= 0 && n <= 1 {
-				return "alone_in_call"
-			}
+		if reason, ended := checkMeetingEnded(br); ended {
+			return reason
 		}
 		time.Sleep(meetingPollInterval)
 	}
@@ -508,17 +571,44 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br *platform.Meet
 	return "max_duration_reached"
 }
 
-// transcribe reuses the TRANSCRIBE_AUDIO handler in-process by handing it a
-// synthetic job whose audio_path points at the recording under the workspace.
-func (h *MeetingJoinHandler) transcribe(ctx JobContext, job *nexus.Job, wavPath string) ([]byte, error) {
-	synthetic := &nexus.Job{
-		ID:   job.ID + "-transcribe",
+// syntheticTranscribeJob builds the in-process TRANSCRIBE_AUDIO job used to reuse
+// the transcribe handler for both the end-of-call batch pass and each rolling
+// pass, keyed by a caller-supplied id so the two are distinguishable in logs.
+func syntheticTranscribeJob(id, wavPath string) *nexus.Job {
+	return &nexus.Job{
+		ID:   id,
 		Type: JobTypeTranscribeAudioType,
 		Payload: map[string]string{
 			"audio_path": wavPath,
 		},
 	}
-	return h.transcriber.Execute(ctx, synthetic)
+}
+
+// transcribe reuses the TRANSCRIBE_AUDIO handler in-process for the end-of-call
+// batch pass (the stored transcript's source of truth). It serializes on
+// transcribeMu with any in-flight rolling pass so the two never hit the whisper
+// sidecar or read the recording concurrently.
+func (h *MeetingJoinHandler) transcribe(ctx JobContext, job *nexus.Job, wavPath string) ([]byte, error) {
+	h.transcribeMu.Lock()
+	defer h.transcribeMu.Unlock()
+	return h.transcriber.Execute(ctx, syntheticTranscribeJob(job.ID+"-transcribe", wavPath))
+}
+
+// chatForResult and commandsForResult normalize nil slices to empty arrays so
+// the additive MEETING_JOIN result fields serialize as [] rather than null,
+// keeping the schema stable for consumers whether or not streaming ran.
+func chatForResult(msgs []MeetChatMessage) []MeetChatMessage {
+	if msgs == nil {
+		return []MeetChatMessage{}
+	}
+	return msgs
+}
+
+func commandsForResult(cmds []RecognizedCommand) []RecognizedCommand {
+	if cmds == nil {
+		return []RecognizedCommand{}
+	}
+	return cmds
 }
 
 // JobTypeTranscribeAudioType is the wire type string for the transcription job,
