@@ -1010,3 +1010,20 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.70.0 release
 
 
+---
+
+## v2.71.1 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 17 |
+| Lines added | +1978 |
+
+**Changes:**
+
+  - feat(tui): Team Chat tab — real AceTeam org channels in the Control Center (#498)
+  - fix(meeting): pin meeting browser to --password-store=basic for stable cookie crypto (#496)
+  - revert: remove orphaned mirror-livekit-image workflow (#492) (#493)
+
+
