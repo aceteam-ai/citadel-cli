@@ -107,6 +107,17 @@ func TestBuildMeetingChromeArgs_PasswordStoreBasic(t *testing.T) {
 	}
 }
 
+// TestBuildMeetingChromeArgs_AutoplayNoUserGesture locks in the audio-capture fix
+// (issue #5098): an automated browser has no user gesture, so without this flag
+// Chrome keeps the AudioContext suspended and blocks remote (WebRTC) audio, and
+// the bot records pure silence. The meeting launch MUST relax the autoplay policy.
+func TestBuildMeetingChromeArgs_AutoplayNoUserGesture(t *testing.T) {
+	args := buildMeetingChromeArgs(9222, "/tmp/meeting-profile")
+	if !containsArg(args, "--autoplay-policy=no-user-gesture-required") {
+		t.Errorf("meeting launch must include --autoplay-policy=no-user-gesture-required, got %v", args)
+	}
+}
+
 func TestMeetingBrowser_Launch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping meeting-browser launch test in -short mode")

@@ -110,6 +110,15 @@ type cobrowseLaunchOptions struct {
 	// environment-independent, which a persistent, externally-seeded profile
 	// requires. Left false for co-browse (keeps keyring-backed persistent logins).
 	passwordStoreBasic bool
+	// autoplayNoUserGesture relaxes Chrome's autoplay policy
+	// (--autoplay-policy=no-user-gesture-required). An automated browser has no
+	// user gesture, so by default Chrome refuses to start an AudioContext / play
+	// incoming <audio> (remote WebRTC) audio — a meeting bot then joins the call
+	// but renders SILENCE, and the null-sink recorder captures a flat -91 dB
+	// track (issue #5098). Set for the meeting bot, whose whole job is to hear
+	// and record the other participants. Left false for co-browse (a human drives
+	// it and supplies the gesture).
+	autoplayNoUserGesture bool
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -208,6 +217,15 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		// -- but it REQUIRES that whoever seeds the profile also launches Chrome
 		// with --password-store=basic, or the seeded cookies won't decrypt here.
 		args = append(args, "--password-store=basic")
+	}
+
+	if opts.autoplayNoUserGesture {
+		// An automated browser never produces a user gesture, so Chrome's default
+		// autoplay policy leaves the AudioContext suspended and blocks remote
+		// (WebRTC) audio playback — the meeting bot joins but hears nothing and
+		// records pure silence. Relax the policy so incoming call audio plays and
+		// reaches the PULSE_SINK the recorder captures (issue #5098).
+		args = append(args, "--autoplay-policy=no-user-gesture-required")
 	}
 
 	if opts.startURL != "" {
