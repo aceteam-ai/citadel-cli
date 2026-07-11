@@ -1072,3 +1072,22 @@ Auto-generated log of every release.
   - fix(meeting): play remote call audio by relaxing Chrome autoplay policy (#5098) (#503)
 
 
+---
+
+## v2.72.0 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 43 |
+| Lines added | +5077 |
+
+**Changes:**
+
+  - fix(work): move mTLS control listener off mesh :8443; fail loud on gateway mesh-bind loss (#504) (#505)
+  - feat(resmon): track ALL GPU/host resource consumers, not just managed (#427) (#431)
+  - feat(meeting): live interactive layer for the Meet notetaker (#5435) (#506)
+  - feat: service idle detection auto-stop + operator view (#416) (#425)
+  - feat(node): node identity store — keypair + CSR + leaf storage (#4583 P2 PR-0) (#441)
+
+
