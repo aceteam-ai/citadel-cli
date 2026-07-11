@@ -341,10 +341,10 @@ func (b *MeetingBrowser) CurrentURL() (string, error) {
 // set — especially the password-store choice — is unit-testable without launching.
 func buildMeetingChromeArgs(debugPort int, profileDir string) []string {
 	return buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:          debugPort,
-		profileDir:         profileDir,
-		stealth:            stealthEnabled(),
-		userAgent:          os.Getenv(EnvCobrowseUserAgent),
+		debugPort:             debugPort,
+		profileDir:            profileDir,
+		stealth:               stealthEnabled(),
+		userAgent:             os.Getenv(EnvCobrowseUserAgent),
 		softwareGL:            true,
 		passwordStoreBasic:    true,
 		autoplayNoUserGesture: true,
