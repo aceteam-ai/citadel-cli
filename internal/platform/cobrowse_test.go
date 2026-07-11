@@ -174,6 +174,27 @@ func TestBuildChromeArgs_SoftwareGL(t *testing.T) {
 	}
 }
 
+// TestBuildChromeArgs_PasswordStoreBasic checks --password-store=basic is emitted
+// only when passwordStoreBasic is set. The meeting bot sets it so its persistent,
+// externally-seeded profile uses Chromium's build-independent os_crypt key
+// instead of a keyring secret; co-browse leaves it off to keep keyring-backed
+// persistent logins.
+func TestBuildChromeArgs_PasswordStoreBasic(t *testing.T) {
+	on := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, passwordStoreBasic: true})
+	if !containsArg(on, "--password-store=basic") {
+		t.Errorf("passwordStoreBasic on: missing --password-store=basic in %v", on)
+	}
+	off := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
+	if containsArg(off, "--password-store=basic") {
+		t.Errorf("passwordStoreBasic off: --password-store=basic must be absent in %v", off)
+	}
+	// Default co-browse launch options (as constructed in Start) must NOT enable it.
+	cobrowseLike := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, softwareGL: true})
+	if containsArg(cobrowseLike, "--password-store=basic") {
+		t.Errorf("co-browse default: --password-store=basic must be absent in %v", cobrowseLike)
+	}
+}
+
 // TestResolveCobrowseDisplay checks the display-mode precedence: a dedicated
 // managed Xvfb by default, an operator-pinned display when EnvCobrowseDisplay is
 // set (trimmed).

@@ -104,6 +104,12 @@ type cobrowseLaunchOptions struct {
 	// headed Chromium spawns a GPU process that fails to initialize on Xvfb and
 	// logs churn. Left false when sharing a real display that may have a GPU.
 	softwareGL bool
+	// passwordStoreBasic forces Chromium's built-in "basic" os_crypt backend
+	// (--password-store=basic) instead of the OS keyring. See buildChromeArgs for
+	// the full rationale: it makes cookie encryption binary- and
+	// environment-independent, which a persistent, externally-seeded profile
+	// requires. Left false for co-browse (keeps keyring-backed persistent logins).
+	passwordStoreBasic bool
 }
 
 // stealthEnabled resolves whether stealth launch flags should be applied,
@@ -183,6 +189,25 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		// process does not fail to initialize. Page.captureScreenshot still works
 		// via the software compositor.
 		args = append(args, "--disable-gpu")
+	}
+
+	if opts.passwordStoreBasic {
+		// Force Chromium's built-in "basic" os_crypt backend instead of the OS
+		// keyring (gnome-keyring / kwallet). Chrome encrypts its cookie store with
+		// an "os_crypt" key; with the keyring backend that key is derived from a
+		// "Safe Storage" secret tied to the specific Chrome/Chromium BINARY and
+		// keyring LABEL, and it only exists when a desktop session + keyring +
+		// dbus are reachable. That makes a persistent profile non-portable: a
+		// profile seeded by any other browser build (or with the keyring
+		// unavailable) yields cookies THIS binary cannot decrypt, so it sees no
+		// auth cookies and the site treats the profile as signed out. The "basic"
+		// backend uses Chromium's hardcoded, build-independent key ("peanuts") with
+		// no keyring/dbus/desktop-session dependency, so cookie crypto is identical
+		// across every Chrome/Chromium build and environment. This is the right
+		// choice for a headless, server-side bot whose profile is seeded out-of-band
+		// -- but it REQUIRES that whoever seeds the profile also launches Chrome
+		// with --password-store=basic, or the seeded cookies won't decrypt here.
+		args = append(args, "--password-store=basic")
 	}
 
 	if opts.startURL != "" {

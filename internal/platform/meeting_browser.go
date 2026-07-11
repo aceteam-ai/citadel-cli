@@ -326,6 +326,30 @@ func (b *MeetingBrowser) CurrentURL() (string, error) {
 	return t.URL, nil
 }
 
+// buildMeetingChromeArgs constructs the Chromium command line for a meeting-bot
+// launch: the shared co-browse launch flags PLUS the meeting-only choices —
+// software rendering (managed Xvfb has no GPU) and, load-bearingly,
+// --password-store=basic. The basic os_crypt backend uses Chromium's fixed,
+// build-independent key instead of a keyring secret tied to a specific binary
+// and desktop session, so the persistent profile's cookies stay decryptable no
+// matter which Chrome build seeded it or whether a keyring/dbus is present
+// (issue #5122). Without it the bot reads no auth cookies and Google redirects
+// to the account chooser, which the join flow correctly reports as "signed out".
+// The seed procedure MUST match this flag (see docs/meeting-bot-profile-seeding.md).
+//
+// Split out from Start (which needs a real browser + display) so the exact flag
+// set — especially the password-store choice — is unit-testable without launching.
+func buildMeetingChromeArgs(debugPort int, profileDir string) []string {
+	return buildChromeArgs(cobrowseLaunchOptions{
+		debugPort:          debugPort,
+		profileDir:         profileDir,
+		stealth:            stealthEnabled(),
+		userAgent:          os.Getenv(EnvCobrowseUserAgent),
+		softwareGL:         true,
+		passwordStoreBasic: true,
+	})
+}
+
 // Start launches the headed Chromium on a fresh Xvfb display with a throwaway
 // profile, routing its audio into the meeting's null sink. It blocks until the
 // CDP endpoint is ready so the first Navigate does not race the launch.
@@ -368,13 +392,7 @@ func (b *MeetingBrowser) Start() error {
 		return err
 	}
 
-	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  debugPort,
-		profileDir: profileDir,
-		stealth:    stealthEnabled(),
-		userAgent:  os.Getenv(EnvCobrowseUserAgent),
-		softwareGL: true,
-	})
+	args := buildMeetingChromeArgs(debugPort, profileDir)
 
 	cmd := exec.Command(chrome, args...)
 	// Compose BOTH env transforms: DISPLAY pins the virtual display, PULSE_SINK

@@ -90,6 +90,23 @@ func TestFindFreeDebugPort(t *testing.T) {
 // on a real Xvfb display and drives one CDP round-trip. It skips under -short and
 // wherever the browser/display deps are missing, mirroring audio_test.go's
 // hardware-gated convention.
+// TestBuildMeetingChromeArgs_PasswordStoreBasic locks in the actual fix (issue
+// #5122 os_crypt mismatch): the meeting bot's launch MUST pass
+// --password-store=basic so its persistent, externally-seeded profile uses
+// Chromium's build-independent cookie-encryption key instead of a keyring secret.
+// This covers the load-bearing Start() choice, which the buildChromeArgs-level
+// test cannot (that only proves the flag is emitted WHEN the option is set).
+func TestBuildMeetingChromeArgs_PasswordStoreBasic(t *testing.T) {
+	args := buildMeetingChromeArgs(9222, "/tmp/meeting-profile")
+	if !containsArg(args, "--password-store=basic") {
+		t.Errorf("meeting launch must include --password-store=basic, got %v", args)
+	}
+	// The persistent profile dir must still be wired through.
+	if !containsArg(args, "--user-data-dir=/tmp/meeting-profile") {
+		t.Errorf("meeting launch missing --user-data-dir, got %v", args)
+	}
+}
+
 func TestMeetingBrowser_Launch(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping meeting-browser launch test in -short mode")
