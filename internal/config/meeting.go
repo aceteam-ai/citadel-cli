@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -23,16 +24,73 @@ type Meeting struct {
 	// nodes work out of the box; the Control Center settings pane discloses the
 	// default-on behavior and offers the toggle.
 	MeetingEnabled bool `yaml:"meeting_enabled" json:"meeting_enabled"`
+
+	// StreamingEnabled gates the DURING-CALL rolling transcription + in-call
+	// command monitor (issue #5435). When false, the bot behaves exactly like
+	// the shipped batch notetaker: join, record, transcribe once at the end.
+	// When true, the recording is additionally transcribed in a rolling window
+	// as the call runs so the bot can react to spoken/typed `/ace` commands
+	// live. Default-on (opt-out), same house convention as MeetingEnabled; the
+	// interactive layer is built to degrade gracefully (log + continue) so a
+	// stale live selector can never regress the batch pipeline.
+	StreamingEnabled bool `yaml:"streaming_enabled" json:"streaming_enabled"`
+
+	// StreamingIntervalSeconds is how often (during the call) the growing
+	// recording is re-transcribed to surface new transcript segments. Smaller
+	// values lower command-detection latency at the cost of more whisper passes;
+	// the v1 strategy re-transcribes the whole wav-so-far, so passes get slower
+	// as a long call grows (see meeting_transcribe_rolling.go). Must be positive.
+	StreamingIntervalSeconds int `yaml:"streaming_interval_seconds" json:"streaming_interval_seconds"`
+
+	// StreamingWindowSeconds is the trailing "not yet stable" margin. Whole-file
+	// re-transcription revises the most recent audio (segment text and start
+	// times shift as more context arrives), so a segment is only emitted
+	// downstream once its end is older than (current tail - window). This holds
+	// back the churning tail to avoid emitting — and acting on — a partial or
+	// hallucinated segment that the next pass rewrites. Must be positive.
+	StreamingWindowSeconds int `yaml:"streaming_window_seconds" json:"streaming_window_seconds"`
+}
+
+// StreamingInterval returns the rolling-transcription cadence as a Duration,
+// falling back to the default when a persisted config carries a non-positive
+// value (e.g. a hand-edited or truncated meeting.yaml). Keeping the clamp here
+// means the consumer never has to defend against a zero ticker interval.
+func (m *Meeting) StreamingInterval() time.Duration {
+	if m.StreamingIntervalSeconds <= 0 {
+		return time.Duration(defaultStreamingIntervalSeconds) * time.Second
+	}
+	return time.Duration(m.StreamingIntervalSeconds) * time.Second
+}
+
+// StreamingWindow returns the trailing stability margin as a Duration, with the
+// same non-positive fallback rationale as StreamingInterval.
+func (m *Meeting) StreamingWindow() time.Duration {
+	if m.StreamingWindowSeconds <= 0 {
+		return time.Duration(defaultStreamingWindowSeconds) * time.Second
+	}
+	return time.Duration(m.StreamingWindowSeconds) * time.Second
 }
 
 const meetingFile = "meeting.yaml"
+
+// Streaming defaults. Interval trades command latency against whisper load;
+// 15s is a middle ground on CPU "base". Window must comfortably exceed a
+// typical whisper segment (~5-10s) so the churning tail stabilizes before we
+// emit it.
+const (
+	defaultStreamingIntervalSeconds = 15
+	defaultStreamingWindowSeconds   = 10
+)
 
 // DefaultMeeting returns a Meeting struct with the capability enabled.
 // Default-on is intentional: it matches the house convention that capabilities
 // are opt-out, so a dep-capable node joins meetings without extra setup.
 func DefaultMeeting() *Meeting {
 	return &Meeting{
-		MeetingEnabled: true,
+		MeetingEnabled:           true,
+		StreamingEnabled:         true,
+		StreamingIntervalSeconds: defaultStreamingIntervalSeconds,
+		StreamingWindowSeconds:   defaultStreamingWindowSeconds,
 	}
 }
 

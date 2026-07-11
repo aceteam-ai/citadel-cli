@@ -15,3 +15,6 @@ docs-site/build/
 docs-site/.docusaurus/
 .claude/
 .release/
+
+# git worktrees created for isolated feature work
+.worktrees/

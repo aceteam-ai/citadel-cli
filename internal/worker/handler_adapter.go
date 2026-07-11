@@ -283,5 +283,13 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	h := jobs.NewMeetingJoinHandler(opts.WorkspaceDir)
 	h.ProfileDir = opts.MeetingProfileDir
+	// Wire the during-call interactive layer (issue #5435) from the persisted
+	// meeting config (default-on, opt-out — same house convention as the meeting
+	// capability itself). The config accessors clamp non-positive cadence values
+	// to sane defaults.
+	m := config.LoadMeeting(platform.ConfigDir())
+	h.StreamingEnabled = m.StreamingEnabled
+	h.StreamingInterval = m.StreamingInterval()
+	h.StreamingWindow = m.StreamingWindow()
 	return h
 }
