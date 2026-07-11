@@ -70,13 +70,22 @@ const (
 //   - The "Join now"/"Ask to join" pre-join page renders only AFTER that
 //     interstitial is dismissed (plus a few more seconds) — hence the
 //     joinButtonTimeout poll loop in runJoinFlow.
+//   - HOST AUTO-ADMIT: when the bot creates its OWN meeting via
+//     meet.google.com/new (signed in), Google redirects to meet.google.com/<code>
+//     and drops it straight into the call ~8s after navigation — the in-call
+//     toolbar is present (buttons "Leave call", "Chat with everyone", "Meeting
+//     details", "Host controls", participant count 1) and NO "Join now"/"Ask to
+//     join"/"Join" button EVER renders. meetIsAdmittedJS's "Leave call" selector
+//     is therefore CONFIRMED for the host path, and pollForJoinClick treats
+//     admission as join success.
 //
-// Everything else (join-button labels, name input, admission/end heuristics)
-// remains UNVERIFIED — the live session never got past the interstitial. A human
-// must confirm/replace those during the next live-Meet session. Kept together so
-// that tuning is a one-place edit.
+// Everything else (guest-join button labels, name input, end heuristics)
+// remains UNVERIFIED — we've only exercised the host/auto-admit path live. A
+// human must confirm/replace those during the next live-Meet guest session.
+// Kept together so that tuning is a one-place edit.
 //
-//	verified against real Google Meet on: 2026-07-11 (interstitial only)
+//	verified against real Google Meet on: 2026-07-11 (interstitial + host
+//	auto-admit / in-call toolbar)
 //
 // ---------------------------------------------------------------------------
 const (
@@ -84,7 +93,8 @@ const (
 	// not-signed-in participants. Best-guess aria-label match.
 	meetNameInputSelector = `input[type="text"][aria-label*="name" i]`
 	// meetIsAdmittedJS returns true once the in-call toolbar is present and the
-	// pre-join / lobby UI is gone. Best-guess: presence of the leave-call button.
+	// pre-join / lobby UI is gone. The "Leave call" aria-label selector is
+	// CONFIRMED live 2026-07-11 on the host (auto-admit) path.
 	meetIsAdmittedJS = `(function(){` +
 		`return !!document.querySelector('button[aria-label*="Leave call" i],button[aria-label*="Leave" i][data-tooltip*="Leave" i]');` +
 		`})()`
@@ -385,10 +395,11 @@ func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBro
 		}
 	}
 
-	// Fatal: poll dismiss-interstitial → name → join until the join button is
-	// clicked or joinButtonTimeout elapses. A single-shot sequence races the
-	// page load (observed live 2026-07-11: the mic/camera interstitial renders
-	// ~9s after navigation, and the pre-join page a few seconds after that).
+	// Fatal: poll admitted-check → dismiss-interstitial → name → join until the
+	// bot is in-call (host auto-admit) or the join button is clicked, or
+	// joinButtonTimeout elapses. A single-shot sequence races the page load
+	// (observed live 2026-07-11: the mic/camera interstitial renders ~9s after
+	// navigation, and the pre-join page a few seconds after that).
 	if err := pollForJoinClick(ctx, br, p.BotDisplayName, joinButtonTimeout, meetingPollInterval); err != nil {
 		return err
 	}
@@ -404,15 +415,31 @@ type joinPage interface {
 	Type(selector, text string) error
 }
 
-// pollForJoinClick repeatedly (1) best-effort dismisses the mic/camera
-// interstitial, (2) best-effort types the bot display name, and (3) tries the
-// join/ask-to-join button, until the join button is clicked or timeout elapses.
-// Steps 1 and 2 are non-fatal on every pass; only never finding the join button
-// is fatal. Production callers pass joinButtonTimeout/meetingPollInterval; they
-// are parameters so tests can run the loop in milliseconds.
+// pollForJoinClick repeatedly (1) checks whether the bot is already in-call,
+// (2) best-effort dismisses the mic/camera interstitial, (3) best-effort types
+// the bot display name, and (4) tries the join/ask-to-join button, until the
+// bot is admitted or the join button is clicked, or timeout elapses. When the
+// bot hosts its own meeting (meet.google.com/new), Google auto-admits it
+// straight into the call and NO join button ever renders (confirmed live
+// 2026-07-11) — the admitted check is what lets that path succeed instead of
+// false-timing-out. Steps 2 and 3 are non-fatal on every pass; only reaching
+// the timeout with neither admission nor a join click is fatal. Production
+// callers pass joinButtonTimeout/meetingPollInterval; they are parameters so
+// tests can run the loop in milliseconds.
 func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// Already in the call (host auto-admit path): success, no join button
+		// needed. runJoinFlow's waitUntilAdmitted re-checks this idempotently.
+		if v, err := page.Evaluate(meetIsAdmittedJS); err == nil {
+			if b, ok := v.(bool); ok && b {
+				ctx.Log("info", "     - already in call (host auto-admit), no join button needed")
+				return nil
+			}
+		} else {
+			ctx.Log("warn", "     - already-admitted probe errored (non-fatal): %v", err)
+		}
+
 		// Best-effort: dismiss the camera/mic interstitial or any "continue
 		// without …" prompt. A missing prompt is normal on any given pass.
 		if _, err := page.Evaluate(clickButtonByTextOptionalJS(meetDismissButtonLabels)); err != nil {

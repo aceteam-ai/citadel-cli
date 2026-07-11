@@ -195,10 +195,14 @@ type fakeJoinPage struct {
 	joinResults []any
 	// dismissResults likewise for dismiss-label probes.
 	dismissResults []any
-	typeErr        error
+	// admitResults likewise for meetIsAdmittedJS probes; when exhausted, false
+	// (not yet in-call) is returned.
+	admitResults []any
+	typeErr      error
 
 	joinProbes    int
 	dismissProbes int
+	admitProbes   int
 	typedNames    []string
 }
 
@@ -206,6 +210,17 @@ func (f *fakeJoinPage) Evaluate(expression string) (any, error) {
 	joinArr, _ := json.Marshal(meetJoinButtonLabels)
 	dismissArr, _ := json.Marshal(meetDismissButtonLabels)
 	switch {
+	case expression == meetIsAdmittedJS:
+		f.admitProbes++
+		if len(f.admitResults) > 0 {
+			v := f.admitResults[0]
+			f.admitResults = f.admitResults[1:]
+			if err, ok := v.(error); ok {
+				return nil, err
+			}
+			return v, nil
+		}
+		return false, nil
 	case strings.Contains(expression, string(joinArr)):
 		f.joinProbes++
 		if len(f.joinResults) > 0 {
@@ -267,6 +282,36 @@ func TestPollForJoinClick_InterstitialThenJoin(t *testing.T) {
 	}
 	if page.joinProbes != 2 {
 		t.Errorf("joinProbes = %d, want 2", page.joinProbes)
+	}
+}
+
+func TestPollForJoinClick_HostAutoAdmit(t *testing.T) {
+	// Host path (meet.google.com/new): Google drops the bot straight into the
+	// call — the in-call toolbar is present and NO join button ever renders.
+	// The loop must return success on the admitted check alone.
+	page := &fakeJoinPage{admitResults: []any{true}}
+	if err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if page.admitProbes != 1 {
+		t.Errorf("admitProbes = %d, want 1 (return on first admitted pass)", page.admitProbes)
+	}
+	if page.joinProbes != 0 {
+		t.Errorf("joinProbes = %d, want 0 (no join-button probe once admitted)", page.joinProbes)
+	}
+}
+
+func TestPollForJoinClick_AdmitAfterRetries(t *testing.T) {
+	// Admission renders a couple of polls after navigation (observed ~8s live);
+	// an errored admitted probe on one pass must be retried, not fatal.
+	page := &fakeJoinPage{
+		admitResults: []any{false, fmt.Errorf("javascript exception"), true},
+	}
+	if err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if page.admitProbes != 3 {
+		t.Errorf("admitProbes = %d, want 3", page.admitProbes)
 	}
 }
 
