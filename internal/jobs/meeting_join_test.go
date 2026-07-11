@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -145,23 +146,156 @@ func TestParsePositiveSeconds(t *testing.T) {
 	}
 }
 
-func TestClickButtonByTextJS(t *testing.T) {
-	labels := []string{"Ask to join", "Join now"}
-	js := clickButtonByTextJS(labels)
-	arr, _ := json.Marshal(labels)
-	if !strings.Contains(js, string(arr)) {
-		t.Errorf("clickButtonByTextJS did not embed labels array; got: %s", js)
+func TestClickButtonByTextOptionalJS(t *testing.T) {
+	// Both label sets used by the poll loop must be embedded correctly.
+	for name, labels := range map[string][]string{
+		"join":    meetJoinButtonLabels,
+		"dismiss": meetDismissButtonLabels,
+	} {
+		t.Run(name, func(t *testing.T) {
+			js := clickButtonByTextOptionalJS(labels)
+			arr, _ := json.Marshal(labels)
+			if !strings.Contains(js, string(arr)) {
+				t.Errorf("clickButtonByTextOptionalJS did not embed labels array; got: %s", js)
+			}
+			// The optional variant returns "" instead of throwing, so the poll
+			// loop can retry a not-yet-rendered button without an error.
+			if strings.Contains(js, "throw new Error") {
+				t.Errorf("optional variant must not throw; got: %s", js)
+			}
+			if !strings.Contains(js, `return "";`) {
+				t.Errorf("optional variant must return empty string on no match; got: %s", js)
+			}
+		})
 	}
-	if !strings.Contains(js, "throw new Error") {
-		t.Errorf("clickButtonByTextJS must throw when no button matches; got: %s", js)
+}
+
+func TestJoinButtonTimeout_Sane(t *testing.T) {
+	// The interstitial renders ~9s after navigation (observed live 2026-07-11)
+	// and the pre-join page a few seconds after dismissal, so the poll window
+	// must comfortably exceed that; it must also stay well under admitTimeout
+	// so a stale-label failure surfaces before a lobby-length wait.
+	if joinButtonTimeout < 20*time.Second {
+		t.Errorf("joinButtonTimeout = %v, too short to outlast the ~9s interstitial + pre-join render", joinButtonTimeout)
 	}
-	// Optional variant returns "" instead of throwing.
-	opt := clickButtonByTextOptionalJS(labels)
-	if strings.Contains(opt, "throw new Error") {
-		t.Errorf("optional variant must not throw; got: %s", opt)
+	if joinButtonTimeout >= admitTimeout {
+		t.Errorf("joinButtonTimeout = %v must be shorter than admitTimeout %v", joinButtonTimeout, admitTimeout)
 	}
-	if !strings.Contains(opt, `return "";`) {
-		t.Errorf("optional variant must return empty string on no match; got: %s", opt)
+	if meetingPollInterval >= joinButtonTimeout {
+		t.Errorf("meetingPollInterval %v must be shorter than joinButtonTimeout %v", meetingPollInterval, joinButtonTimeout)
+	}
+}
+
+// fakeJoinPage simulates the Meet pre-join DOM for pollForJoinClick: Evaluate
+// answers each clickButtonByTextOptionalJS probe from a scripted queue keyed by
+// which label set the JS embeds.
+type fakeJoinPage struct {
+	// joinResults are returned (then consumed) for successive join-label
+	// probes; when exhausted, "" (no match) is returned.
+	joinResults []any
+	// dismissResults likewise for dismiss-label probes.
+	dismissResults []any
+	typeErr        error
+
+	joinProbes    int
+	dismissProbes int
+	typedNames    []string
+}
+
+func (f *fakeJoinPage) Evaluate(expression string) (any, error) {
+	joinArr, _ := json.Marshal(meetJoinButtonLabels)
+	dismissArr, _ := json.Marshal(meetDismissButtonLabels)
+	switch {
+	case strings.Contains(expression, string(joinArr)):
+		f.joinProbes++
+		if len(f.joinResults) > 0 {
+			v := f.joinResults[0]
+			f.joinResults = f.joinResults[1:]
+			if err, ok := v.(error); ok {
+				return nil, err
+			}
+			return v, nil
+		}
+		return "", nil
+	case strings.Contains(expression, string(dismissArr)):
+		f.dismissProbes++
+		if len(f.dismissResults) > 0 {
+			v := f.dismissResults[0]
+			f.dismissResults = f.dismissResults[1:]
+			if err, ok := v.(error); ok {
+				return nil, err
+			}
+			return v, nil
+		}
+		return "", nil
+	}
+	return nil, fmt.Errorf("fakeJoinPage: unexpected expression: %s", expression)
+}
+
+func (f *fakeJoinPage) Type(selector, text string) error {
+	f.typedNames = append(f.typedNames, text)
+	return f.typeErr
+}
+
+func TestPollForJoinClick_FirstPassSuccess(t *testing.T) {
+	page := &fakeJoinPage{joinResults: []any{"ask to join"}}
+	if err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if page.joinProbes != 1 {
+		t.Errorf("joinProbes = %d, want 1", page.joinProbes)
+	}
+	if page.dismissProbes != 1 {
+		t.Errorf("dismissProbes = %d, want 1 (dismiss must run before the join probe)", page.dismissProbes)
+	}
+	if len(page.typedNames) != 1 || page.typedNames[0] != "Bot" {
+		t.Errorf("typedNames = %v, want [Bot]", page.typedNames)
+	}
+}
+
+func TestPollForJoinClick_InterstitialThenJoin(t *testing.T) {
+	// Pass 1: interstitial dismissed, join button not rendered yet.
+	// Pass 2: join button appears. Non-fatal dismiss misses and a Type error
+	// must not abort the loop.
+	page := &fakeJoinPage{
+		dismissResults: []any{"continue without microphone", ""},
+		joinResults:    []any{"", "join now"},
+		typeErr:        fmt.Errorf("no name field (signed in)"),
+	}
+	if err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if page.joinProbes != 2 {
+		t.Errorf("joinProbes = %d, want 2", page.joinProbes)
+	}
+}
+
+func TestPollForJoinClick_EvaluateErrorRetries(t *testing.T) {
+	// A JS exception on one pass (page mid-render) is retried, not fatal.
+	page := &fakeJoinPage{
+		joinResults: []any{fmt.Errorf("javascript exception"), "join now"},
+	}
+	if err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if page.joinProbes != 2 {
+		t.Errorf("joinProbes = %d, want 2", page.joinProbes)
+	}
+}
+
+func TestPollForJoinClick_TimeoutError(t *testing.T) {
+	page := &fakeJoinPage{} // join button never appears
+	err := pollForJoinClick(JobContext{}, page, "Bot", 200*time.Millisecond, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	// The backend (routes/meeting_bot.py) greps error strings; the prefix must
+	// be preserved.
+	if !strings.HasPrefix(err.Error(), "click join button:") {
+		t.Errorf("error must keep the 'click join button:' prefix for backend error mapping; got: %v", err)
+	}
+	if page.joinProbes < 2 {
+		t.Errorf("joinProbes = %d, want multiple passes before timing out", page.joinProbes)
 	}
 }
 
