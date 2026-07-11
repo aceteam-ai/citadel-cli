@@ -1027,3 +1027,18 @@ Auto-generated log of every release.
   - revert: remove orphaned mirror-livekit-image workflow (#492) (#493)
 
 
+---
+
+## v2.71.2 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +239 |
+
+**Changes:**
+
+  - fix(meeting): poll for interstitial dismissal + join button instead of single-shot click (#499)
+
+
