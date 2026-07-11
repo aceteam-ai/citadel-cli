@@ -8,6 +8,8 @@ The `MEETING_JOIN` handler (`internal/jobs/meeting_join.go`, [#5098](https://git
 
 So the meeting browser's `--user-data-dir` is no longer a throwaway `os.MkdirTemp` profile: it is a **persistent** directory that a human signs into **once, by hand**, and every subsequent `MEETING_JOIN` job reuses the same cookies/session. This document covers the one-time (and periodic re-seed) manual steps. Everything else — resolving the profile path, creating it with locked-down permissions, reusing it across runs, and detecting when it has gone stale — is handled by the code; see `internal/platform/meeting_browser.go`.
 
+The meeting browser launches Chromium with **`--password-store=basic`**, which pins how the profile's cookies are encrypted. **Any seed of this profile — the manual `google-chrome` step below, or any automated tool — MUST also launch Chrome with `--password-store=basic`**, or the seeded cookies will be encrypted with a key the bot can't read, and every join will fail as "signed out". See the "os_crypt / `--password-store=basic`" section for why.
+
 **Why this can't be automated:** Google actively detects and blocks scripted/automated sign-in (CAPTCHA challenges, "this browser may not be secure" blocks, account lockouts). Do not attempt to script the login form. The seed step below is a real human, with a real mouse and keyboard, typing into a real browser window.
 
 ## What's code vs. what's manual
@@ -49,10 +51,11 @@ The directory is created (if missing) and `chmod 0700`'d on every `MeetingBrowse
    chmod 700 ~/.citadel-cli/meeting-profile
    ```
 
-4. **Launch a real, headed Chrome with that exact `--user-data-dir`** on the node (over VNC/physical display/remote desktop — this must be a real interactive session, not a job dispatch):
+4. **Launch a real, headed Chrome with that exact `--user-data-dir`** on the node (over VNC/physical display/remote desktop — this must be a real interactive session, not a job dispatch). **You MUST pass `--password-store=basic`** so the cookies are encrypted with the same key the meeting bot uses (see "os_crypt / `--password-store=basic`" below — without it the seed silently won't be readable by the bot):
 
    ```bash
    google-chrome \
+     --password-store=basic \
      --user-data-dir="$HOME/.citadel-cli/meeting-profile" \
      --no-first-run --no-default-browser-check \
      https://accounts.google.com/
@@ -67,6 +70,19 @@ The directory is created (if missing) and `chmod 0700`'d on every `MeetingBrowse
 7. **Close Chrome normally** (not `kill -9`) so its session/cookie DB flushes cleanly to disk.
 
 8. **Restart the citadel worker.** The next `MEETING_JOIN` job will launch Chromium against this same, now-seeded, profile directory and reuse the signed-in session.
+
+## os_crypt / `--password-store=basic`
+
+Chrome encrypts its cookie store (and saved passwords) with an "os_crypt" key. On Linux, the default backend derives that key from a **"Safe Storage" secret held in the OS keyring** (gnome-keyring / kwallet), reachable only when a desktop session + keyring + dbus are present (`DBUS_SESSION_BUS_ADDRESS` set). That keyring secret is tied to the specific Chrome/Chromium **binary and keyring label**. Consequences for a persistent, out-of-band-seeded profile:
+
+- A profile seeded by **a different browser build** (or on a box where the keyring was reachable) produces cookies that **another binary cannot decrypt**. Chrome then sees *no* valid auth cookies, and Google redirects to the account chooser — which the join flow correctly reports as **"signed out"**, even though the Google session was never actually revoked.
+- Headless / server nodes often have **no keyring or dbus at all**, so keyring-backed encryption is unreliable to reproduce during automated seeding.
+
+`--password-store=basic` sidesteps all of this: Chromium's "basic" backend encrypts with a **hardcoded, build-independent key** (internally the passphrase is literally `"peanuts"`) — no keyring, no dbus, no desktop session. Every Chrome/Chromium build, on any box, derives the *same* os_crypt key, so a profile seeded with `--password-store=basic` is readable by the meeting bot (which also launches with `--password-store=basic`) regardless of which binary seeded it or whether a keyring was present.
+
+The trade-off — weaker at-rest cookie encryption (a fixed key vs. an OS-guarded secret) — is acceptable here: the profile dir is already `chmod 0700` and holds a single dedicated bot identity on a server, not a human's personal browser. This is why the change is scoped to the **meeting browser only**; co-browse keeps the keyring-backed default for its human-facing persistent logins.
+
+**The one rule to remember:** the encryption key must match between seed and use. The bot always uses `--password-store=basic`, so **the seed must too**. If you seed WITHOUT it (keyring key) and then let the bot read it (basic key), or vice-versa, the cookies won't decrypt and the bot will look signed out. Switching an already-seeded profile onto `--password-store=basic` therefore requires a **re-seed** (steps 2–8) under the flag.
 
 ## Cookie expiry and periodic re-seeding
 
