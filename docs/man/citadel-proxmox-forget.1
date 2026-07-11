@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-proxmox-forget - Forget the saved Proxmox connection
+
+
+.SH SYNOPSIS
+\fBcitadel proxmox forget [flags]\fP
+
+
+.SH DESCRIPTION
+Delete the saved Proxmox configuration file (proxmox.json).
+
+.PP
+The Control Center shows a Proxmox tab whenever a saved config exists, even if
+this machine isn't a Proxmox host — the config may point at a remote server.
+Forgetting the connection removes that file so the tab no longer appears.
+
+.PP
+The config file path is printed before deletion. Use --yes to skip the prompt.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for forget
+
+.PP
+\fB--yes\fP[=false]
+	Skip the confirmation prompt.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-proxmox(1)\fP

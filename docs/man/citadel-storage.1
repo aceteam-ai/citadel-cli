@@ -1,0 +1,41 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-storage - Manage on-node S3-compatible object storage
+
+
+.SH SYNOPSIS
+\fBcitadel storage [flags]\fP
+
+
+.SH DESCRIPTION
+Run an S3-compatible object store on this node, backed by VersityGW.
+
+.PP
+Objects are stored under ~/.citadel/storage/data and survive restarts. The
+gateway is published on 127.0.0.1 only (never 0.0.0.0). Root credentials are
+minted once on first start and reused on every restart, so stored objects and
+presigned URLs remain valid.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for storage
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-storage-start(1)\fP, \fBcitadel-storage-status(1)\fP, \fBcitadel-storage-stop(1)\fP

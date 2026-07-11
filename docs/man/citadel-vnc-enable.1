@@ -1,0 +1,58 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-vnc-enable - Install and start VNC server
+
+
+.SH SYNOPSIS
+\fBcitadel vnc enable [flags]\fP
+
+
+.SH DESCRIPTION
+Installs a VNC server if not already present, configures the password
+and port, and starts the service. This command is idempotent.
+
+.PP
+If no password is specified, a random 8-character password is generated
+and printed to stdout.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for enable
+
+.PP
+\fB--password\fP=""
+	VNC password (auto-generated if not specified)
+
+.PP
+\fB--port\fP=5900
+	VNC port number
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Enable with auto-generated password
+  citadel vnc enable
+
+  # Enable with specific password and port
+  citadel vnc enable --password mypass --port 5900
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-vnc(1)\fP

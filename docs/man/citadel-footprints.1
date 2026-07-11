@@ -1,0 +1,79 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-footprints - Summarize logged per-service resource footprints
+
+
+.SH SYNOPSIS
+\fBcitadel footprints [flags]\fP
+
+
+.SH DESCRIPTION
+Summarize the per-service resource footprint history recorded by the
+background sampler (\fBcitadel work\fR writes one sample per minute).
+
+.PP
+For each managed service it reports average/peak RAM, average/peak VRAM,
+average/peak CPU, the fraction of samples that were idle, the longest idle
+stretch, and the sample count + time window.
+
+.PP
+The raw rows live in rotated daily CSVs under ~/citadel-node/footprints/
+(footprints-YYYY-MM-DD.csv) and are directly DuckDB/pandas-queryable for
+ad-hoc analysis, e.g.:
+
+.PP
+duckdb -c "SELECT service, avg(rss_mb), max(rss_mb) \\
+    FROM '~/citadel-node/footprints/*.csv' GROUP BY 1 ORDER BY 2 DESC"
+
+.PP
+The node-level row is recorded under the service name "_node" and carries
+host CPU/RAM plus total GPU utilisation and VRAM used.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for footprints
+
+.PP
+\fB--idle-only\fP[=false]
+	Only include samples where the node was idle
+
+.PP
+\fB--service\fP=""
+	Restrict to a single service name
+
+.PP
+\fB--since\fP=""
+	Only include samples newer than this duration (e.g. 30m, 1h, 6h)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Summarize all services over the last hour
+  citadel footprints --since 1h
+
+  # One service only
+  citadel footprints --service vllm --since 6h
+
+  # Only samples where the node was idle
+  citadel footprints --idle-only --since 24h
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

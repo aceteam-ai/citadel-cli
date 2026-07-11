@@ -1,0 +1,87 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-provision-ios - Prepare this macOS node to run iOS builds
+
+
+.SH SYNOPSIS
+\fBcitadel provision ios [flags]\fP
+
+
+.SH DESCRIPTION
+Configure code-signing and tooling so this node can run IOS_BUILD jobs.
+
+.PP
+Steps performed:
+  - Create/unlock a dedicated build keychain and set its partition list.
+  - Import a distribution certificate (.p12) when --cert is given.
+  - Install provisioning profiles into the user's Provisioning Profiles dir.
+  - Verify Xcode command-line tools are installed (hint to install if missing).
+
+.PP
+Sensitive material is supplied as paths/params and never hardcoded. Use
+--dry-run to print every command without touching the keychain.
+
+.PP
+Examples:
+  # Print the plan without executing anything (no certs needed)
+  citadel provision ios --dry-run \\
+    --keychain citadel-build.keychain-db --keychain-password "$KC_PW"
+
+.PP
+# Real run: import a cert and install a profile
+  citadel provision ios \\
+    --keychain citadel-build.keychain-db --keychain-password "$KC_PW" \\
+    --cert ./dist.p12 --cert-password "$CERT_PW" \\
+    --profile ./app.mobileprovision
+
+
+.SH OPTIONS
+\fB--cert\fP=""
+	Path to a distribution certificate (.p12) to import
+
+.PP
+\fB--cert-password\fP=""
+	Export password for the .p12 certificate
+
+.PP
+\fB--dry-run\fP[=false]
+	Print the provisioning commands without executing them
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for ios
+
+.PP
+\fB--keychain\fP="citadel-build.keychain-db"
+	Dedicated build keychain to create/unlock
+
+.PP
+\fB--keychain-password\fP=""
+	Password for the build keychain (required)
+
+.PP
+\fB--profile\fP=[]
+	Path to a .mobileprovision profile to install (repeatable)
+
+.PP
+\fB--profiles-dir\fP=""
+	Override the provisioning profiles install directory
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-provision(1)\fP

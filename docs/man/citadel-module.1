@@ -1,0 +1,55 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module - Install service modules from any standardized git repo
+
+
+.SH SYNOPSIS
+\fBcitadel module [flags]\fP
+
+
+.SH DESCRIPTION
+Install and inspect Citadel service modules from any standardized git repo,
+not just the central catalog.
+
+.PP
+A module repo self-describes via a top-level 'citadel/' directory containing
+service.yaml + compose.yml, with the compose 'image:' pointing at that repo's own
+container registry. The CLI never hardcodes a module's image.
+
+.PP
+Sources can be a catalog name (e.g. vllm), an 'owner/repo' shorthand
+(optionally 'owner/repo@ref'), or a full git URL.
+
+.PP
+citadel module install owner/repo            # install from GitHub
+  citadel module install owner/repo@v1.2.0     # pin a tag/branch
+  citadel module install https://git.example/m # full git URL
+  citadel module install vllm                  # delegate to the central catalog
+
+.PP
+Private source repos require this node to have git credentials (a GITHUB_TOKEN,
+an SSH key, or a configured git credential helper).
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for module
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-module-gc(1)\fP, \fBcitadel-module-info(1)\fP, \fBcitadel-module-install(1)\fP, \fBcitadel-module-list(1)\fP, \fBcitadel-module-search(1)\fP, \fBcitadel-module-trust(1)\fP, \fBcitadel-module-trusted(1)\fP, \fBcitadel-module-untrust(1)\fP, \fBcitadel-module-update(1)\fP

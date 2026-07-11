@@ -1,0 +1,74 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-mcp - Start a local MCP server for AI tool integration
+
+
+.SH SYNOPSIS
+\fBcitadel mcp [flags]\fP
+
+
+.SH DESCRIPTION
+Starts a Model Context Protocol (MCP) server that exposes AceTeam tools
+to Claude Code, Cursor, and other AI development tools.
+
+.PP
+The MCP server reads JSON-RPC messages from stdin and writes responses to
+stdout, bridging your local AI tools to the AceTeam platform.
+
+.PP
+Authentication uses an AceTeam API key. Generate one at:
+  https://aceteam.ai/settings/api-keys
+
+.PP
+The API key is read from (in priority order):
+  1. --api-key flag
+  2. ACETEAM_API_KEY environment variable
+  3. ~/.citadel-cli/config.yaml (device_api_token from 'citadel init')
+
+.PP
+Usage with Claude Code:
+  claude mcp add aceteam -- citadel mcp
+
+.PP
+Usage with Cursor (add to .cursor/mcp.json):
+  {"mcpServers": {"aceteam": {"command": "citadel", "args": ["mcp"]}}}
+
+.PP
+Usage with environment variable:
+  ACETEAM_API_KEY=act_xxx claude mcp add aceteam -- citadel mcp
+
+
+.SH OPTIONS
+\fB--api-key\fP=""
+	AceTeam API key (or set ACETEAM_API_KEY env)
+
+.PP
+\fB--api-url\fP=""
+	AceTeam API URL (default: https://aceteam.ai)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for mcp
+
+.PP
+\fB--server\fP="aceteam"
+	MCP server name to proxy (default: aceteam)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

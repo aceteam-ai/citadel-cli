@@ -1,0 +1,66 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-enroll - Bind this node to your org's Fabric by scanning a QR code
+
+
+.SH SYNOPSIS
+\fBcitadel enroll [flags]\fP
+
+
+.SH DESCRIPTION
+Enroll connects this node to your AceTeam organization's Fabric.
+
+.PP
+It displays a QR code that you scan with the AceTeam app (or a phone camera).
+Once you approve the device, the node joins your org's private mesh
+(Headscale user org_), authenticated and scoped to your organization, and
+appears in the Fabric dashboard.
+
+.PP
+This is the easiest way to add a freshly installed or booted Citadel node:
+just run 'citadel enroll' and scan.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for enroll
+
+.PP
+\fB--new-device\fP[=false]
+	Force fresh registration, ignoring any existing machine mapping
+
+.PP
+\fB--node-name\fP=""
+	Set the node name (defaults to hostname)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Scan-to-enroll this node into your org's Fabric
+  citadel enroll
+
+  # Enroll with a specific node name
+  citadel enroll --node-name gpu-rig-01
+
+  # Force a fresh device registration (ignore any prior machine mapping)
+  citadel enroll --new-device
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

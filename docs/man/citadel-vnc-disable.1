@@ -1,0 +1,40 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-vnc-disable - Stop VNC server
+
+
+.SH SYNOPSIS
+\fBcitadel vnc disable [flags]\fP
+
+
+.SH DESCRIPTION
+Stops the VNC server service. Use --uninstall to also remove the
+VNC server software, firewall rules, and registry keys.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for disable
+
+.PP
+\fB--uninstall\fP[=false]
+	Also uninstall VNC server software
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-vnc(1)\fP

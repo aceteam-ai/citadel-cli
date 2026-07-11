@@ -1,0 +1,49 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-debug - Print a copy-pasteable debug bundle (version, host, recent logs)
+
+
+.SH SYNOPSIS
+\fBcitadel debug [flags]\fP
+
+
+.SH DESCRIPTION
+Print a debug bundle to stdout: citadel version, host/OS, the path to the
+date-based append-only log, and the last N lines of activity.
+
+.PP
+Designed for headless nodes over SSH where the TUI clipboard does not reach
+your machine. Pipe or redirect it to share:
+
+.PP
+citadel debug                # print to terminal
+  citadel debug > debug.txt    # save to a file you can scp
+  citadel debug -n 500         # include more log lines
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for debug
+
+.PP
+\fB-n\fP, \fB--lines\fP=200
+	Number of recent log lines to include
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

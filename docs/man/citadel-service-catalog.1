@@ -1,0 +1,40 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-catalog - Browse and install services from the catalog
+
+
+.SH SYNOPSIS
+\fBcitadel service catalog [flags]\fP
+
+
+.SH DESCRIPTION
+Manage the service catalog — a curated repository of containerized services
+that can be installed on your Citadel node.
+
+.PP
+Run 'citadel service catalog update' to download or refresh the catalog,
+then use list, search, and info to discover services.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for catalog
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-service(1)\fP, \fBcitadel-service-catalog-add(1)\fP, \fBcitadel-service-catalog-info(1)\fP, \fBcitadel-service-catalog-install(1)\fP, \fBcitadel-service-catalog-list(1)\fP, \fBcitadel-service-catalog-list-sources(1)\fP, \fBcitadel-service-catalog-remove(1)\fP, \fBcitadel-service-catalog-search(1)\fP, \fBcitadel-service-catalog-update(1)\fP

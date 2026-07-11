@@ -1,0 +1,50 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-dashboard - Launch the interactive TUI dashboard
+
+
+.SH SYNOPSIS
+\fBcitadel dashboard [flags]\fP
+
+
+.SH DESCRIPTION
+Launches a full-screen interactive dashboard showing real-time node status,
+system resources, GPU utilization, network peers, and managed services.
+
+.PP
+The dashboard auto-refreshes every 5 seconds. Press 'r' to refresh manually,
+\&'a' to toggle auto-refresh, or 'q' to quit.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for dashboard
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Launch the dashboard
+  citadel dashboard
+
+  # Short alias
+  citadel dash
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

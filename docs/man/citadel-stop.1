@@ -1,0 +1,73 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-stop - Stop services (all if no service specified, or a specific one)
+
+
+.SH SYNOPSIS
+\fBcitadel stop [service] [flags]\fP
+
+
+.SH DESCRIPTION
+Stops running services.
+
+.PP
+When a service name is provided, that specific service is stopped.
+When no service is specified, all services in the manifest are stopped.
+
+.PP
+Available services: diffusers, extraction, llamacpp, lmstudio, ollama, sglang, transcribe, vllm
+
+
+.SH OPTIONS
+\fB--dry-run\fP[=false]
+	Show what would be stopped without doing it.
+
+.PP
+\fB-f\fP, \fB--force\fP[=false]
+	Skip confirmation prompts.
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for stop
+
+.PP
+\fB--rm\fP[=false]
+	Remove the container/volumes after stopping.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH EXAMPLE
+.EX
+  # Stop a specific service
+  citadel stop vllm
+
+  # Stop all services in the manifest
+  citadel stop
+
+  # Stop and remove the container and volumes
+  citadel stop ollama --rm
+
+  # Skip confirmation prompts (for scripts)
+  citadel stop --force
+
+  # Preview what would be stopped
+  citadel stop --dry-run
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP
