@@ -1057,3 +1057,18 @@ Auto-generated log of every release.
   - fix(meeting): treat host auto-admit (in-call toolbar) as join success (#500)
 
 
+---
+
+## v2.71.4 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 4 |
+| Lines added | +53 |
+
+**Changes:**
+
+  - fix(meeting): play remote call audio by relaxing Chrome autoplay policy (#5098) (#503)
+
+
