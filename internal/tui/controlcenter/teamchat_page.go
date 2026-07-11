@@ -55,6 +55,7 @@ type TeamChatPage struct {
 	messages      []teamchat.Message
 	lastMessageID string // newest rendered message; drives re-render + mark-read
 	loadedOnce    bool   // first successful channel-list load happened
+	authGuidance  bool   // credential guidance is on screen (avoid 5s re-render flicker)
 
 	// Poll lifecycle. pollCancel is non-nil while the page is active.
 	pollMu     sync.Mutex
@@ -364,6 +365,7 @@ func (p *TeamChatPage) loadChannels(ctx context.Context, client *teamchat.Client
 	p.dataMu.Lock()
 	p.channels = channels
 	p.loadedOnce = true
+	p.authGuidance = false // credentials work; clear the sticky guidance state
 	active := p.activeChannel
 	if active == "" && len(channels) > 0 {
 		active = channels[0].ID
@@ -608,7 +610,16 @@ func (p *TeamChatPage) runSearch(query string) {
 // for auth errors, a transient status-bar error otherwise.
 func (p *TeamChatPage) handleFetchError(err error) {
 	if teamchat.IsAuthError(err) {
-		p.showAuthGuidance(err.Error())
+		// Render the guidance once, not on every 5s poll tick — a device-token-
+		// only node hits this on every fetch until the #495 backend lands, and
+		// re-clearing the view each tick would flicker while the user reads.
+		p.dataMu.Lock()
+		alreadyShown := p.authGuidance
+		p.authGuidance = true
+		p.dataMu.Unlock()
+		if !alreadyShown {
+			p.showAuthGuidance(err.Error())
+		}
 		return
 	}
 	errMsg := err.Error()
