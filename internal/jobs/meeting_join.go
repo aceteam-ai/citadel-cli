@@ -8,11 +8,13 @@
 // the end, transcribe node-locally, and return a structured result. Every byte
 // (audio + transcript) stays on the user's machine.
 //
-// IMPORTANT (unverified): the Google Meet join flow and end-detection below are
-// BEST-GUESS DOM interactions. They are NOT verified end-to-end — a human must
-// run this against a live meet.google.com call and confirm/swap the selectors and
-// heuristics in the LIVE-TUNING block before this can be trusted. Everything is
-// isolated so tuning is a single-file edit.
+// IMPORTANT (partially verified): the Google Meet join flow and end-detection
+// below are mostly BEST-GUESS DOM interactions. The mic/camera interstitial and
+// its dismiss-button text were confirmed against a live signed-in session on
+// 2026-07-11; the join-button labels and everything downstream are NOT verified
+// end-to-end — a human must run this against a live meet.google.com call and
+// confirm/swap the selectors and heuristics in the LIVE-TUNING block before this
+// can be trusted. Everything is isolated so tuning is a single-file edit.
 package jobs
 
 import (
@@ -41,6 +43,12 @@ const (
 	// admitTimeout bounds how long we wait in the "asking to join" lobby for a
 	// host to admit the bot before giving up.
 	admitTimeout = 3 * time.Minute
+	// joinButtonTimeout bounds the dismiss-interstitial → join-button poll loop.
+	// Observed live (2026-07-11): the mic/camera interstitial renders ~9s after
+	// navigation, and the "Join now"/"Ask to join" pre-join page only appears a
+	// few seconds after the interstitial is dismissed — a single-shot click
+	// races the page load, so we poll well past both renders.
+	joinButtonTimeout = 45 * time.Second
 	// meetingPollInterval is how often we re-check admission / meeting-end state.
 	meetingPollInterval = 5 * time.Second
 	// defaultMeetingMaxDuration is the absolute safety cap when a job omits
@@ -49,14 +57,26 @@ const (
 )
 
 // ---------------------------------------------------------------------------
-// LIVE-TUNING REQUIRED
+// LIVE-TUNING REQUIRED (partially verified)
 //
-// Everything in this block is a best-guess against Google Meet's DOM and has NOT
-// been verified against a live call. A human must confirm/replace each selector,
-// button label, and heuristic during the live-Meet session. Kept together so
+// Most of this block is a best-guess against Google Meet's DOM. Confirmed live
+// on 2026-07-11 (signed-in session at meet.google.com/new):
+//
+//   - ~9s after navigation Meet shows a mic/camera interstitial ("Do you want
+//     people to see and hear you in the meeting?") with exactly two visible
+//     buttons: "Continue without microphone and camera" (no aria-label) and an
+//     expand_more "More options" button. meetDismissButtonLabels substring-matches
+//     it via "Continue without microphone".
+//   - The "Join now"/"Ask to join" pre-join page renders only AFTER that
+//     interstitial is dismissed (plus a few more seconds) — hence the
+//     joinButtonTimeout poll loop in runJoinFlow.
+//
+// Everything else (join-button labels, name input, admission/end heuristics)
+// remains UNVERIFIED — the live session never got past the interstitial. A human
+// must confirm/replace those during the next live-Meet session. Kept together so
 // that tuning is a one-place edit.
 //
-//	verified against real Google Meet on: <NOT YET VERIFIED>
+//	verified against real Google Meet on: 2026-07-11 (interstitial only)
 //
 // ---------------------------------------------------------------------------
 const (
@@ -109,9 +129,11 @@ var ErrMeetingBotSignedOut = fmt.Errorf("meeting bot Chrome profile is signed ou
 // exact casing/locale against a real call.
 var meetJoinButtonLabels = []string{"Ask to join", "Join now", "Join"}
 
-// meetDismissButtonLabels are best-guess labels for the permission / "continue
-// without microphone|camera" prompts Meet shows before the join button. Clicking
-// them is best-effort (non-fatal). LIVE-TUNING: confirm against a real call.
+// meetDismissButtonLabels are labels for the permission / "continue without
+// microphone|camera" prompts Meet shows before the join button. Clicking them is
+// best-effort (non-fatal). CONFIRMED live 2026-07-11: the interstitial's button
+// text is "Continue without microphone and camera", which "Continue without
+// microphone" substring-matches (the matcher uses indexOf).
 var meetDismissButtonLabels = []string{
 	"Continue without microphone",
 	"Continue without camera",
@@ -120,25 +142,12 @@ var meetDismissButtonLabels = []string{
 	"Dismiss",
 }
 
-// clickButtonByTextJS builds a JS expression that clicks the FIRST visible
-// button/[role=button] whose trimmed text matches (case-insensitively) any of the
-// given labels, returning the matched label or throwing when none is found. The
-// throw lets the caller distinguish "clicked" from "no such button" (cdpEvaluate
-// maps a JS throw to a Go error). labels are json.Marshal-escaped.
-func clickButtonByTextJS(labels []string) string {
-	arr, _ := json.Marshal(labels)
-	return `(function(){var labels=` + string(arr) + `.map(function(s){return s.toLowerCase();});` +
-		`var btns=Array.prototype.slice.call(document.querySelectorAll('button,[role="button"]'));` +
-		`for(var i=0;i<btns.length;i++){var b=btns[i];` +
-		`var txt=(b.innerText||b.textContent||"").trim().toLowerCase();` +
-		`if(!txt)continue;` +
-		`for(var j=0;j<labels.length;j++){if(txt===labels[j]||txt.indexOf(labels[j])!==-1){b.click();return labels[j];}}}` +
-		`throw new Error("no button matched labels");})()`
-}
-
-// clickButtonByTextOptionalJS is like clickButtonByTextJS but returns "" instead
-// of throwing when nothing matches — for best-effort dismissals where a missing
-// prompt is normal.
+// clickButtonByTextOptionalJS builds a JS expression that clicks the FIRST
+// visible button/[role=button] whose trimmed text matches (case-insensitively,
+// substring via indexOf) any of the given labels, returning the matched label or
+// "" when nothing matches. The empty-string miss (instead of a throw) lets the
+// poll loop in runJoinFlow retry without treating "not rendered yet" as an
+// error. labels are json.Marshal-escaped.
 func clickButtonByTextOptionalJS(labels []string) string {
 	arr, _ := json.Marshal(labels)
 	return `(function(){var labels=` + string(arr) + `.map(function(s){return s.toLowerCase();});` +
@@ -347,8 +356,8 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	return out, nil
 }
 
-// runJoinFlow drives the best-guess Google Meet pre-join sequence. UNVERIFIED —
-// see the LIVE-TUNING block. Non-fatal steps (permission dismissals, name entry
+// runJoinFlow drives the Google Meet pre-join sequence (partially verified —
+// see the LIVE-TUNING block). Non-fatal steps (permission dismissals, name entry
 // when signed in) log and continue; the join click and admission are fatal.
 func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams) error {
 	if err := br.Navigate(p.MeetingURL); err != nil {
@@ -376,25 +385,58 @@ func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBro
 		}
 	}
 
-	// Best-effort: dismiss any camera/mic permission or "continue without …"
-	// prompts. A missing prompt is normal, so this never fails the flow.
-	if _, err := br.Evaluate(clickButtonByTextOptionalJS(meetDismissButtonLabels)); err != nil {
-		ctx.Log("warn", "     - permission-prompt dismissal errored (non-fatal): %v", err)
-	}
-
-	// Best-effort: type the bot's display name into the pre-join name field. A
-	// signed-in session has no name field, so a miss here is non-fatal.
-	if err := br.Type(meetNameInputSelector, p.BotDisplayName); err != nil {
-		ctx.Log("warn", "     - could not set bot name (non-fatal, may be signed in): %v", err)
-	}
-
-	// Fatal: click the join/ask-to-join button.
-	if _, err := br.Evaluate(clickButtonByTextJS(meetJoinButtonLabels)); err != nil {
-		return fmt.Errorf("click join button: %w", err)
+	// Fatal: poll dismiss-interstitial → name → join until the join button is
+	// clicked or joinButtonTimeout elapses. A single-shot sequence races the
+	// page load (observed live 2026-07-11: the mic/camera interstitial renders
+	// ~9s after navigation, and the pre-join page a few seconds after that).
+	if err := pollForJoinClick(ctx, br, p.BotDisplayName, joinButtonTimeout, meetingPollInterval); err != nil {
+		return err
 	}
 
 	// Fatal: wait until admitted (in-call toolbar appears) or timeout.
 	return h.waitUntilAdmitted(ctx, br, p)
+}
+
+// joinPage is the slice of platform.MeetingBrowser that pollForJoinClick needs,
+// so the loop is unit-testable without a real browser.
+type joinPage interface {
+	Evaluate(expression string) (any, error)
+	Type(selector, text string) error
+}
+
+// pollForJoinClick repeatedly (1) best-effort dismisses the mic/camera
+// interstitial, (2) best-effort types the bot display name, and (3) tries the
+// join/ask-to-join button, until the join button is clicked or timeout elapses.
+// Steps 1 and 2 are non-fatal on every pass; only never finding the join button
+// is fatal. Production callers pass joinButtonTimeout/meetingPollInterval; they
+// are parameters so tests can run the loop in milliseconds.
+func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// Best-effort: dismiss the camera/mic interstitial or any "continue
+		// without …" prompt. A missing prompt is normal on any given pass.
+		if _, err := page.Evaluate(clickButtonByTextOptionalJS(meetDismissButtonLabels)); err != nil {
+			ctx.Log("warn", "     - permission-prompt dismissal errored (non-fatal): %v", err)
+		}
+
+		// Best-effort: type the bot's display name into the pre-join name
+		// field. A signed-in session has no name field, so a miss is non-fatal.
+		if err := page.Type(meetNameInputSelector, botDisplayName); err != nil {
+			ctx.Log("warn", "     - could not set bot name (non-fatal, may be signed in): %v", err)
+		}
+
+		// Try the join/ask-to-join button; a non-empty return means it was
+		// clicked.
+		if v, err := page.Evaluate(clickButtonByTextOptionalJS(meetJoinButtonLabels)); err != nil {
+			ctx.Log("warn", "     - join-button probe errored (retrying): %v", err)
+		} else if label, ok := v.(string); ok && label != "" {
+			ctx.Log("info", "     - clicked join button (matched label %q)", label)
+			return nil
+		}
+
+		time.Sleep(interval)
+	}
+	return fmt.Errorf("click join button: no button matched labels %v within %s (interstitial/pre-join page may have changed — re-tune meeting_join.go labels)", meetJoinButtonLabels, timeout)
 }
 
 // waitUntilAdmitted polls the admission heuristic until the bot is in-call or the
