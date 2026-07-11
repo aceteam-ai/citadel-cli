@@ -1753,8 +1753,15 @@ func runWork(cmd *cobra.Command, args []string) {
 			vpnPort := fmt.Sprintf("%d", workGatewayPort)
 			rawLn, vpnIP, err := network.ListenVPN("tcp", vpnPort)
 			if err != nil {
-				Log("gateway VPN listener failed (LAN-only): %v", err)
-				fmt.Fprintf(os.Stderr, "   - ⚠️ Gateway VPN listener failed (LAN-only): %v\n", err)
+				// A lost mesh bind takes /vnc, /terminal, and /modules/* off the
+				// mesh while the node keeps heartbeating healthy — the silent
+				// degradation that hid the control-listener port collision on
+				// every node in the fleet (#504). Escalate to an unmissable
+				// startup error; keep booting because the LAN listener still
+				// works.
+				bindErr := gatewayVPNBindErrorMessage(workGatewayPort, err)
+				Log("%s", bindErr)
+				fmt.Fprintln(os.Stderr, bindErr)
 			} else {
 				var vpnGwLn net.Listener
 				if gwTLSConfig != nil {

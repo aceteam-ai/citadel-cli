@@ -10,7 +10,7 @@
 // CRITICAL zero-break property (advisor / #5028): the fetch must NOT be a hard
 // dependency for an already-provisioned node. #461 turns the plaintext
 // /ssh/authorized-keys path into a 403 stub, so if a transient backend blip made
-// startup unable to bring up the :8443 listener, SSH-deploy would be dead until
+// startup unable to bring up the control listener, SSH-deploy would be dead until
 // the backend recovered AND the node restarted. To avoid that, a fetch failure
 // falls back to any previously-cached bundle on disk; only a first-ever cold
 // start with no cache leaves the node without a trust root (and it fails closed:
