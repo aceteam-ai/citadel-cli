@@ -345,8 +345,9 @@ func buildMeetingChromeArgs(debugPort int, profileDir string) []string {
 		profileDir:         profileDir,
 		stealth:            stealthEnabled(),
 		userAgent:          os.Getenv(EnvCobrowseUserAgent),
-		softwareGL:         true,
-		passwordStoreBasic: true,
+		softwareGL:            true,
+		passwordStoreBasic:    true,
+		autoplayNoUserGesture: true,
 	})
 }
 
