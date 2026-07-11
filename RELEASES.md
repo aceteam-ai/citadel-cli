@@ -1091,3 +1091,23 @@ Auto-generated log of every release.
   - feat(node): node identity store — keypair + CSR + leaf storage (#4583 P2 PR-0) (#441)
 
 
+---
+
+## v2.72.0 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 44 |
+| Lines added | +5096 |
+
+**Changes:**
+
+  - chore(release): v2.72.0
+  - fix(work): move mTLS control listener off mesh :8443; fail loud on gateway mesh-bind loss (#504) (#505)
+  - feat(resmon): track ALL GPU/host resource consumers, not just managed (#427) (#431)
+  - feat(meeting): live interactive layer for the Meet notetaker (#5435) (#506)
+  - feat: service idle detection auto-stop + operator view (#416) (#425)
+  - feat(node): node identity store — keypair + CSR + leaf storage (#4583 P2 PR-0) (#441)
+
+
