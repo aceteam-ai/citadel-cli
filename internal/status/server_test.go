@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // mockTokenValidator is a test double for terminal.TokenValidator.
@@ -60,6 +61,28 @@ func TestNewServer(t *testing.T) {
 				t.Errorf("Port() = %v, want %v", server.Port(), tt.wantPort)
 			}
 		})
+	}
+}
+
+// TestControlPortDefaultsOffGatewayHTTPS is the #504 regression guard: the
+// mTLS control listener and the HTTPS gateway both bind the mesh IP, so their
+// defaults must never coincide. When both sat on 8443 the control listener won
+// the bind and the gateway silently dropped to LAN-only, taking /vnc,
+// /terminal, and /modules/* off the mesh fleet-wide.
+func TestControlPortDefaultsOffGatewayHTTPS(t *testing.T) {
+	collector := NewCollector(CollectorConfig{NodeName: "test-node"})
+
+	server := NewServer(ServerConfig{}, collector)
+	if server.controlPort != DefaultControlPort {
+		t.Errorf("default controlPort = %d, want DefaultControlPort (%d)", server.controlPort, DefaultControlPort)
+	}
+	if server.controlPort == services.GatewayHTTPSPort {
+		t.Errorf("default control port %d collides with the HTTPS gateway default (services.GatewayHTTPSPort); see #504", server.controlPort)
+	}
+
+	custom := NewServer(ServerConfig{ControlPort: 9443}, collector)
+	if custom.controlPort != 9443 {
+		t.Errorf("explicit ControlPort not respected: got %d, want 9443", custom.controlPort)
 	}
 }
 

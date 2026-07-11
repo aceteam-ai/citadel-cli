@@ -135,6 +135,15 @@ const (
 	GatewayPort = 8080
 	// GatewayHTTPSPort is the default HTTPS gateway port (cmd/serve.go).
 	GatewayHTTPSPort = 8443
+	// ControlMTLSPort is the coordinator mTLS control listener
+	// (internal/status.DefaultControlPort, overridable via CITADEL_CONTROL_PORT).
+	// It originally defaulted to 8443 and collided with GatewayHTTPSPort on the
+	// mesh IP (#504): the control listener bound first, the gateway's tsnet bind
+	// failed ("listener already open"), and every mesh gateway route (/vnc,
+	// /terminal, /modules/*) silently went dark fleet-wide. The coordinator
+	// (aceteam python-backend routes/fabric_relay.py) dials this port first and
+	// falls back to legacy 8443 for nodes that predate the move.
+	ControlMTLSPort = 8444
 	// TEIEmbeddingPort is the local TEI embedding service, wired as the
 	// gateway's /v1/embeddings upstream (cmd/serve.go --embedding-port,
 	// internal/jobs/embedding_handler.go). It sits INSIDE the apps
@@ -176,6 +185,7 @@ const (
 var ReservedCitadelPorts = map[int]string{
 	GatewayPort:       "gateway/status-server",
 	GatewayHTTPSPort:  "gateway-https",
+	ControlMTLSPort:   "control-mtls",
 	TEIEmbeddingPort:  "tei-embeddings",
 	VNCWebsockifyPort: "vnc-websockify",
 	VNCPort:           "vnc-rfb",

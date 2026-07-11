@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/resmon"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // RouteRegistrar is a callback that registers HTTP routes on the status server's
@@ -111,16 +112,23 @@ type ServerConfig struct {
 	// fabric-CA-signed coordinator client certificate (issue #5028). When nil,
 	// those endpoints are refused everywhere (fail closed).
 	CAVerifier *FabricCAVerifier
-	// ControlPort is the port for the mTLS control listener (default: 8443). Only
-	// used when CAVerifier and ControlServerCert are both set.
+	// ControlPort is the port for the mTLS control listener (default:
+	// DefaultControlPort). Only used when CAVerifier and ControlServerCert are
+	// both set.
 	ControlPort int
 	// ControlServerCert is the TLS server certificate the control listener
 	// presents. Required (together with CAVerifier) to start the control listener.
 	ControlServerCert *tls.Certificate
 }
 
-// DefaultControlPort is the default port for the mTLS control listener.
-const DefaultControlPort = 8443
+// DefaultControlPort is the default port for the mTLS control listener. It is
+// defined in the services port registry (a port owned by a citadel-internal
+// process must never be hardcoded here) and deliberately distinct from the
+// HTTPS gateway's 8443: both listeners bind the same mesh IP, and when they
+// shared 8443 the control listener won the bind and the gateway silently
+// degraded to LAN-only, taking /vnc, /terminal, and /modules/* off the mesh
+// fleet-wide (#504).
+const DefaultControlPort = services.ControlMTLSPort
 
 // NewServer creates a new status HTTP server.
 func NewServer(cfg ServerConfig, collector *Collector) *Server {
