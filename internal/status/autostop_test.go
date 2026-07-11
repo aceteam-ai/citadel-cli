@@ -77,8 +77,8 @@ func TestReconcileNeverActsOnAbsentSignal(t *testing.T) {
 	r := NewAutoStopReconciler(true, 60, func(c IdleCandidate) error { stopped = append(stopped, c); return nil }, nil)
 	st := &NodeStatus{
 		Services: []ServiceInfo{
-			{Name: "unknown-idle", Status: ServiceStatusRunning, IdleState: nil},        // absent signal -> never
-			{Name: "not-idle", Status: ServiceStatusRunning, IdleState: idlePtr(false, 0)}, // busy -> never
+			{Name: "unknown-idle", Status: ServiceStatusRunning, IdleState: nil},             // absent signal -> never
+			{Name: "not-idle", Status: ServiceStatusRunning, IdleState: idlePtr(false, 0)},   // busy -> never
 			{Name: "idle-below", Status: ServiceStatusRunning, IdleState: idlePtr(true, 30)}, // below threshold -> never
 		},
 	}
