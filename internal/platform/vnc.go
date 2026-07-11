@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -596,7 +597,8 @@ func (l *LinuxVNCManager) Start() error {
 	authFile, authNeedsSudo := l.resolveXAuth()
 	needsSudo := authNeedsSudo && os.Getuid() != 0
 
-	args := buildX11VNCArgs(passwdFile, port, authFile)
+	display, _ := ResolveX11Env()
+	args := buildX11VNCArgs(passwdFile, port, authFile, display)
 
 	var cmd *exec.Cmd
 	if needsSudo {
@@ -614,9 +616,10 @@ func (l *LinuxVNCManager) Start() error {
 }
 
 // buildX11VNCArgs constructs the x11vnc command-line arguments.
-// Reads $DISPLAY from the environment when an auth file is provided;
-// falls back to ":0" when $DISPLAY is unset.
-func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
+// The caller resolves and passes the target display (via ResolveX11Env), so
+// this stays a pure, testable arg-builder. An empty display is coerced to ":0"
+// so a caller that could not resolve one still produces valid args.
+func buildX11VNCArgs(passwdFile string, port int, authFile, display string) []string {
 	args := []string{
 		"-rfbauth", passwdFile,
 		"-rfbport", strconv.Itoa(port),
@@ -625,10 +628,10 @@ func buildX11VNCArgs(passwdFile string, port int, authFile string) []string {
 	}
 
 	if authFile != "" {
-		// An explicit auth file was found -- use it directly.
-		// Use the DISPLAY env var so we target the correct X11
-		// display (e.g. :1 on GDM3 systems) instead of assuming :0.
-		display := os.Getenv("DISPLAY")
+		// An explicit auth file was found -- use it directly with the resolved
+		// display (e.g. :1 on GDM3) rather than assuming :0. A systemd --user
+		// service has no DISPLAY in its env, so the old os.Getenv+":0" fallback
+		// targeted the wrong (or a nonexistent) server (citadel-cli#287).
 		if display == "" {
 			display = ":0"
 		}
@@ -663,6 +666,16 @@ func (l *LinuxVNCManager) resolveXAuth() (authFile string, needsSudo bool) {
 	// 2. Check user's own ~/.Xauthority
 	if home, err := os.UserHomeDir(); err == nil {
 		xauth := filepath.Join(home, ".Xauthority")
+		if _, err := os.Stat(xauth); err == nil {
+			return xauth, false
+		}
+	}
+
+	// 2b. The active X server's own cookie (e.g. GDM's per-user
+	// /run/user/<uid>/gdm/Xauthority, owned by this user so no sudo needed).
+	// This is the common case for a systemd --user service on a GDM desktop,
+	// where neither XAUTHORITY nor ~/.Xauthority is set.
+	if _, xauth := ResolveX11Env(); xauth != "" {
 		if _, err := os.Stat(xauth); err == nil {
 			return xauth, false
 		}
@@ -947,4 +960,66 @@ func (d *DarwinVNCManager) Port() int {
 		return DefaultVNCPort
 	}
 	return 0
+}
+
+// EnsureGatewayVNC makes sure an x11vnc server is running for the local desktop
+// so the on-node gateway's /vnc route has an upstream -- WITHOUT any manual
+// `citadel vnc enable`. It is idempotent and safe to call on every `citadel work`
+// startup: a headless node or an already-running server is a no-op.
+//
+// The server is bound to loopback (`-localhost`) and passwordless (`-nopw`):
+// the ONLY path to it is the local gateway, which is itself reached over the
+// authenticated mesh and gated by the desktop token. Binding loopback also
+// fixes the manual path's regression of exposing raw RFB on 0.0.0.0. The active
+// display + Xauthority are resolved via ResolveX11Env (citadel-cli#287), so this
+// works from a systemd --user service whose env has no DISPLAY.
+func EnsureGatewayVNC(port int) error {
+	if runtime.GOOS != "linux" {
+		// Windows/macOS desktop sharing is managed by their own VNC providers.
+		return nil
+	}
+	if !hasActiveXServer() {
+		return nil // headless: nothing to share
+	}
+	if isX11VNCRunning() {
+		return nil // idempotent
+	}
+	if _, err := exec.LookPath("x11vnc"); err != nil {
+		return fmt.Errorf("x11vnc not installed; desktop sharing unavailable (install x11vnc)")
+	}
+
+	display, xauthority := ResolveX11Env()
+	args := []string{
+		"-display", display,
+		"-rfbport", strconv.Itoa(port),
+		"-localhost", // only the local gateway may connect
+		"-nopw",      // auth boundary is the gateway + mesh, not an RFB password
+		"-forever",   // survive client disconnects
+		"-bg",        // daemonize
+		"-quiet",
+	}
+	if xauthority != "" {
+		args = append(args, "-auth", xauthority)
+	}
+	if out, err := exec.Command("x11vnc", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to start x11vnc on %s: %w: %s", display, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// hasActiveXServer reports whether a local X/Xwayland server is running (i.e.
+// this node has a graphical session to share). Used to skip VNC startup on
+// headless nodes.
+func hasActiveXServer() bool {
+	for _, bin := range []string{"Xorg", "X", "Xwayland"} {
+		if exec.Command("pgrep", "-x", bin).Run() == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isX11VNCRunning reports whether an x11vnc process is already running.
+func isX11VNCRunning() bool {
+	return exec.Command("pgrep", "-x", "x11vnc").Run() == nil
 }

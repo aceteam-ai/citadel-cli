@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/service"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/whimsy"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
@@ -182,6 +183,22 @@ func installUpdate() {
 
 	installSpinner.StopWithSuccess(fmt.Sprintf("Successfully updated to %s", release.TagName))
 	fmt.Println("Previous version saved for rollback.")
+
+	// Re-materialize managed systemd unit files so template/hardening changes in
+	// the new binary (e.g. the #444 crash-restart-storm hardening) actually reach
+	// this already-deployed node. The binary swap above replaces only the binary;
+	// the on-disk unit was written once at install time and is otherwise never
+	// refreshed on a version change (#426 does the same for compose files).
+	// Idempotent: a unit already carrying the hardening is left untouched.
+	if rewritten, err := service.RematerializeManagedUnits(func(format string, args ...any) {
+		fmt.Printf("   - "+format+"\n", args...)
+	}); err != nil {
+		fmt.Printf("Warning: could not refresh managed service unit(s): %v\n", err)
+	} else if len(rewritten) > 0 {
+		fmt.Printf("Refreshed managed service unit(s): %s\n", strings.Join(rewritten, ", "))
+		fmt.Println("The new restart policy applies on the next service restart.")
+	}
+
 	fmt.Println("\nRun 'citadel version' to verify.")
 }
 

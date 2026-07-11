@@ -2,11 +2,14 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // LegacyHandlerAdapter wraps a jobs.JobHandler to implement worker.JobHandler.
@@ -49,6 +52,13 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 	// Redis payloads arrive via json.Unmarshal, so numbers are float64 and
 	// booleans are bool. Coerce all values to strings so handlers can parse
 	// them with strconv.
+	//
+	// Scalars keep their fmt.Sprint form (so existing handlers' strconv/bool
+	// parsing is unchanged). NESTED values (a JSON object or array -- e.g. the
+	// SERVICE_START "env" map, citadel-cli#462) are json-encoded instead of
+	// fmt.Sprint'd: fmt.Sprint on a map yields the unparseable Go form
+	// "map[K:v]", which loses the structure. This is a shared chokepoint for
+	// every legacy handler, so the change is deliberately limited to maps/slices.
 	if job.Payload != nil {
 		nexusJob.Payload = make(map[string]string)
 		for k, v := range job.Payload {
@@ -57,6 +67,12 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 				nexusJob.Payload[k] = val
 			case nil:
 				// skip nil values
+			case map[string]any, []any:
+				if encoded, err := json.Marshal(val); err == nil {
+					nexusJob.Payload[k] = string(encoded)
+				} else {
+					nexusJob.Payload[k] = fmt.Sprint(val)
+				}
 			default:
 				nexusJob.Payload[k] = fmt.Sprint(val)
 			}
@@ -112,6 +128,12 @@ type LegacyHandlerOpts struct {
 	// "disabled" error rather than "unsupported job type"), but every command
 	// is rejected. Wired from the persisted `shell` node permission.
 	ShellDisabled bool
+	// MeetingProfileDir overrides the persistent, signed-in bot Chrome profile
+	// directory used by MEETING_JOIN (issue #5122). If empty, the handler falls
+	// back to platform.EnvMeetingProfileDir, then platform's ConfigDir()-rooted
+	// default — see jobs.MeetingJoinHandler.ProfileDir and
+	// docs/meeting-bot-profile-seeding.md.
+	MeetingProfileDir string
 }
 
 // CreateLegacyHandlers creates JobHandler adapters for all existing Nexus job handlers.
@@ -179,6 +201,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// it would leave the backend's node-resource pull timing out on nodes
 		// without a configured workspace.
 		NewLegacyHandlerAdapter(JobTypeResourceSnapshot, &jobs.ResourceSnapshotHandler{}),
+		// Turn delivery to a payload-launched BYOC instance (aceteam#5241).
+		// Registered unconditionally: it resolves the target from its own
+		// on-disk instance store (~/.citadel/instances/state.json, shared with
+		// the service handler) rather than the citadel.yaml manifest, so it
+		// needs neither a workspace nor a config dir. On a node that never
+		// launched an instance the store lookup misses and the handler fails
+		// closed rather than mis-delivering.
+		NewLegacyHandlerAdapter(JobTypeInstanceMessage, jobs.NewInstanceMessageHandler()),
 	}
 
 	// Register file-operation handlers when a workspace is configured.
@@ -210,6 +240,20 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			// file handlers do.
 			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
 		)
+
+		// Auto-join meeting notetaker (aceteam#5098): records the call into a
+		// per-meeting null sink, then transcribes it via the handler above. Needs
+		// the workspace both to write the recording and to validate the audio path
+		// for transcription, so it lives inside this workspace gate. Gated on the
+		// persisted meeting toggle (default-on, the house opt-out convention) so
+		// the handler registers unless the operator has explicitly opted out —
+		// matching the `meeting` capability advertisement gate in
+		// internal/capabilities.
+		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
+			handlers = append(handlers,
+				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
+			)
+		}
 	}
 
 	// Register service-management handlers when a config directory is available.
@@ -235,4 +279,23 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		result[i] = h
 	}
 	return result
+}
+
+// newMeetingJoinHandler wires opts.MeetingProfileDir into the handler so a
+// node's startup config can pin the persistent, signed-in bot Chrome profile
+// (issue #5122) without relying solely on the platform.EnvMeetingProfileDir
+// env var. Leaving it unset (the common case) preserves the handler's own
+// env-var-then-ConfigDir()-default resolution.
+func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
+	h := jobs.NewMeetingJoinHandler(opts.WorkspaceDir)
+	h.ProfileDir = opts.MeetingProfileDir
+	// Wire the during-call interactive layer (issue #5435) from the persisted
+	// meeting config (default-on, opt-out — same house convention as the meeting
+	// capability itself). The config accessors clamp non-positive cadence values
+	// to sane defaults.
+	m := config.LoadMeeting(platform.ConfigDir())
+	h.StreamingEnabled = m.StreamingEnabled
+	h.StreamingInterval = m.StreamingInterval()
+	h.StreamingWindow = m.StreamingWindow()
+	return h
 }

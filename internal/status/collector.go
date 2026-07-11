@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -29,6 +30,7 @@ type Collector struct {
 	capabilities   *NodeCapabilities     // cached capabilities (set once at startup)
 	idleTracker    *IdleTracker          // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker *IdleTracker          // network-activity idle for non-vLLM services (citadel #433)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -58,6 +60,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		capabilities:   cfg.Capabilities,
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
+		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
 	}
 }
 
@@ -344,7 +347,13 @@ func (c *Collector) detectLLMServiceType(serviceName string) string {
 
 // getDockerComposeStatus checks if a docker compose service is running.
 func (c *Collector) getDockerComposeStatus(composeFile string) string {
-	cmd := exec.Command("docker", "compose", "-f", composeFile, "ps", "--format", "json")
+	// Pass the install-time config env (<name>.env) explicitly: compose
+	// interpolates the file even for `ps`, so a ${VAR:?...}-guarded service
+	// (claudecode, livekit) would report a false ServiceStatusError on every
+	// heartbeat without it.
+	args := append([]string{"compose", "-f", composeFile}, compose.EnvFileArgs(composeFile)...)
+	args = append(args, "ps", "--format", "json")
+	cmd := exec.Command("docker", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return ServiceStatusError

@@ -3,11 +3,14 @@ package jobs
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -125,6 +128,96 @@ func TestTranscribeAudio_ServiceError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for non-200 service response")
+	}
+}
+
+// TestTranscribeAudio_WaitForReady_UnreachableFailsFast covers the cold-start
+// hang: a sidecar that was never started (nothing listening on its port) must
+// not make waitForReady block anywhere near the full 120s model-load budget.
+// It should give up within the short transcribeUnreachableTimeout window so
+// the backend's node-local request fails well inside its own ~100s gateway
+// timeout, allowing a fall back to cloud transcription.
+func TestTranscribeAudio_WaitForReady_UnreachableFailsFast(t *testing.T) {
+	// Bind an ephemeral port, then release it immediately: nothing is
+	// listening on the resulting address, so dials to it get an immediate
+	// connection-refused, mirroring an absent whisper sidecar.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.ServiceURL = "http://" + addr
+
+	start := time.Now()
+	err = h.waitForReady()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error for an unreachable sidecar")
+	}
+	// Generous slack over the fast-fail budget for scheduler jitter, but this
+	// must land nowhere near the 120s patient timeout — that's the bug.
+	if elapsed > transcribeUnreachableTimeout+10*time.Second {
+		t.Fatalf("waitForReady took %v, want close to the %v fast-fail budget (not the %v patient budget)", elapsed, transcribeUnreachableTimeout, transcribeReadyTimeout)
+	}
+}
+
+// TestTranscribeAudio_WaitForReady_PatientWhileLoading proves the fast-fail
+// path for unreachable sidecars does not regress the legitimate warm-up case:
+// a sidecar that answers health checks (just not with 200 yet, because its
+// model is still loading) must be given the full patient budget, even past
+// the point where an unreachable sidecar would have already failed fast.
+func TestTranscribeAudio_WaitForReady_PatientWhileLoading(t *testing.T) {
+	var mu sync.Mutex
+	ready := false
+	calls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		calls++
+		isReady := ready
+		mu.Unlock()
+		if isReady {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.ServiceURL = srv.URL
+
+	// Flip to ready after longer than transcribeUnreachableTimeout, so a pass
+	// here proves the "reachable but loading" path survives past the window
+	// that would have killed an actually-unreachable sidecar.
+	loadDelay := transcribeUnreachableTimeout + 1*time.Second
+	go func() {
+		time.Sleep(loadDelay)
+		mu.Lock()
+		ready = true
+		mu.Unlock()
+	}()
+
+	start := time.Now()
+	if err := h.waitForReady(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < loadDelay {
+		t.Fatalf("waitForReady returned after %v, want at least %v (it should have kept polling until ready)", elapsed, loadDelay)
+	}
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n < 2 {
+		t.Fatalf("expected multiple health polls while loading, got %d", n)
 	}
 }
 

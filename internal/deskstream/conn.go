@@ -46,17 +46,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		s.logger.Printf("client disconnected: %s", remote)
 	}()
 
-	display := resolveDisplay()
+	display, xauthority := resolveX11()
 	enc, err := s.encoder()
 	if err != nil {
 		s.logger.Printf("no encoder available: %v", err)
 		return
 	}
-	geom := detectGeometry(display)
+	geom := detectGeometry(display, xauthority)
 	gop := s.fps * 2
 
 	cfg := EncodeConfig{
 		Display:          display,
+		XAuthority:       xauthority,
 		Width:            geom.Width,
 		Height:           geom.Height,
 		FPS:              s.fps,

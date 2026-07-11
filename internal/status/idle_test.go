@@ -173,6 +173,117 @@ func TestIdleTracker_SeparateKeysTrackedIndependently(t *testing.T) {
 	}
 }
 
+func TestRecordActivityCounter_FirstSampleSeedsBaseline(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+
+	// First observation of a generic (non-vLLM) service: unknown history, so
+	// idle_seconds is 0 and no request is proven yet. This is the fail-safe seed:
+	// a service we just started tracking is never immediately "idle".
+	st := tr.RecordActivityCounter("claude-code", 1000)
+	if st.Idle {
+		t.Fatalf("expected not idle on first activity sample")
+	}
+	if st.IdleSeconds != 0 {
+		t.Fatalf("expected idle_seconds 0 on first sample, got %d", st.IdleSeconds)
+	}
+	if st.LastRequestAt != nil {
+		t.Fatalf("expected no last_request_at before any activity is proven, got %v", st.LastRequestAt)
+	}
+}
+
+func TestRecordActivityCounter_AdvanceResetsIdleClock(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+
+	tr.RecordActivityCounter("openclaw", 1000) // baseline
+	now = now.Add(200 * time.Second)
+	// Net bytes climbed: the container did work, so the idle clock resets and
+	// last_request_at is now.
+	st := tr.RecordActivityCounter("openclaw", 5000)
+	if st.Idle {
+		t.Fatalf("expected not idle right after network activity")
+	}
+	if st.IdleSeconds != 0 {
+		t.Fatalf("expected idle_seconds 0 after activity, got %d", st.IdleSeconds)
+	}
+	if st.LastRequestAt == nil || !st.LastRequestAt.Equal(now) {
+		t.Fatalf("expected last_request_at %v after activity, got %v", now, st.LastRequestAt)
+	}
+}
+
+func TestRecordActivityCounter_GoesIdleAfterThreshold(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+
+	tr.RecordActivityCounter("hermes", 1000) // baseline at t=0
+	now = now.Add(30 * time.Second)
+	tr.RecordActivityCounter("hermes", 2000) // activity at t=30s
+
+	// 299s of a flat counter: still under the 300s threshold.
+	now = now.Add(299 * time.Second)
+	st := tr.RecordActivityCounter("hermes", 2000)
+	if st.Idle {
+		t.Fatalf("expected not idle at 299s (< threshold)")
+	}
+	if st.IdleSeconds != 299 {
+		t.Fatalf("expected idle_seconds 299, got %d", st.IdleSeconds)
+	}
+
+	// One more second at a flat counter: exactly at threshold -> idle.
+	now = now.Add(1 * time.Second)
+	st = tr.RecordActivityCounter("hermes", 2000)
+	if !st.Idle {
+		t.Fatalf("expected idle at 300s (>= threshold), idle_seconds=%d", st.IdleSeconds)
+	}
+	if st.IdleSeconds != 300 {
+		t.Fatalf("expected idle_seconds 300, got %d", st.IdleSeconds)
+	}
+}
+
+func TestRecordActivityCounter_RestartResetIsActiveNotIdle(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+
+	tr.RecordActivityCounter("agent", 1_000_000) // baseline: a long-lived container
+	now = now.Add(1000 * time.Second)            // long idle gap
+
+	// The container restarted: its cumulative NetIO counter dropped to a small
+	// value. Unlike the vLLM request-counter path (where a reset is NOT a
+	// request), a network-counter reset means the container itself is brand new
+	// and busy. It MUST reset the idle clock, otherwise a just-restarted service
+	// would report a stale multi-minute idle age and be auto-stopped immediately.
+	st := tr.RecordActivityCounter("agent", 500)
+	if st.Idle {
+		t.Fatalf("expected a just-restarted container to be active, not idle")
+	}
+	if st.IdleSeconds != 0 {
+		t.Fatalf("expected idle_seconds 0 after a restart, got %d", st.IdleSeconds)
+	}
+	if st.LastRequestAt == nil || !st.LastRequestAt.Equal(now) {
+		t.Fatalf("expected last_request_at %v after restart, got %v", now, st.LastRequestAt)
+	}
+}
+
+func TestRecordActivityCounter_FlatFromStartGoesIdle(t *testing.T) {
+	// A service that never transmits after tracking begins accumulates idle from
+	// the tracking-start baseline and eventually flips idle -- this is the
+	// intended auto-stop trigger for a genuinely-quiet agent app.
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	tr := newTestTracker(300, &now)
+
+	tr.RecordActivityCounter("idle-agent", 42) // baseline
+	now = now.Add(300 * time.Second)
+	st := tr.RecordActivityCounter("idle-agent", 42) // still 42: no traffic at all
+	if !st.Idle {
+		t.Fatalf("expected idle after threshold with a flat counter, idle_seconds=%d", st.IdleSeconds)
+	}
+	// No request was ever proven, so last_request_at stays absent.
+	if st.LastRequestAt != nil {
+		t.Fatalf("expected no last_request_at when no activity was ever seen, got %v", st.LastRequestAt)
+	}
+}
+
 func TestParsePrometheusMetrics_VLLM(t *testing.T) {
 	body := strings.Join([]string{
 		"# HELP vllm:request_success_total Count of successful requests.",

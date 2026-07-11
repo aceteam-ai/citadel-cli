@@ -123,12 +123,24 @@ Examples:
 	Maximum retry attempts before DLQ
 
 .PP
+\fB--no-footprint\fP[=false]
+	Disable the background resource-footprint sampler
+
+.PP
 \fB--no-gateway\fP[=false]
 	Disable the HTTPS gateway
 
 .PP
+\fB--no-key-renew\fP[=false]
+	Disable the background Headscale node-key renewer (renews the key before expiry while online)
+
+.PP
 \fB--no-services\fP[=false]
 	Skip auto-starting services from manifest
+
+.PP
+\fB--no-single-instance\fP[=false]
+	Allow a second worker to run for this node (skips the single-instance lock)
 
 .PP
 \fB--no-terminal\fP[=false]
@@ -194,6 +206,10 @@ Examples:
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
 \fB--debug\fP[=false]
 	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
 
 .PP
 \fB--no-color\fP[=false]

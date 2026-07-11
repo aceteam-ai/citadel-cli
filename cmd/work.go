@@ -7,23 +7,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/footprint"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
@@ -31,6 +35,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/service"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
@@ -40,9 +45,9 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/websockify"
-	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -88,6 +93,15 @@ var (
 
 	// Footprint sampler flag
 	workNoFootprint bool
+
+	// Single-instance guard flag (issues #443 / #435): when true, skip the
+	// per-node worker lock so a second worker may run intentionally (e.g. a debug
+	// direct-Redis worker alongside the API-mode one in development).
+	workNoSingleInstance bool
+
+	// Node-key renewer flag (epic #4583): disable the background loop that
+	// refreshes the Headscale node key before expiry while online.
+	workNoKeyRenew bool
 
 	// Auto-update (periodic self-update) flags
 	workAutoUpdate         bool
@@ -153,9 +167,167 @@ Examples:
 	Run: runWork,
 }
 
+// Connect-retry backoff bounds. A failed control-plane connect is recoverable,
+// so we retry in-process rather than exiting and letting systemd storm.
+// These are vars (not consts) so tests can shrink them without real-time sleeps.
+var (
+	connectBackoffInitial = 2 * time.Second
+	connectBackoffMax     = 2 * time.Minute
+	// connectRateLimitChunk bounds a SINGLE sleep even when the server asks for
+	// a very long wait (e.g. retry_after: 86400). We sleep in chunks and re-check
+	// ctx between them so a 24h reset never blocks shutdown -- but we keep
+	// sleeping until the full server-requested interval has elapsed before
+	// retrying, so we never poll tighter than retry_after (no hammering, #443).
+	connectRateLimitChunk = 90 * time.Second
+)
+
+// apiConnector is the subset of APISource that connectWithBackoff needs.
+// Kept as an interface so tests can exercise the backoff loop without a live API.
+type apiConnector interface {
+	Connect(ctx context.Context) error
+}
+
+// connectWithBackoff retries source.Connect until it succeeds or ctx is
+// cancelled. Transient failures use exponential backoff with jitter; a 429
+// rate-limit response is honored via its retry_after/reset_at hint (capped per
+// sleep so shutdown stays responsive). Returns a non-nil error only when the
+// context is cancelled (clean shutdown), never on a connect failure -- the
+// process stays up and keeps retrying rather than dying into a restart storm.
+func connectWithBackoff(ctx context.Context, source apiConnector) error {
+	backoff := connectBackoffInitial
+	attempt := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		attempt++
+		err := source.Connect(ctx)
+		if err == nil {
+			if attempt > 1 {
+				Log("connected to Redis API after %d attempt(s)", attempt)
+			}
+			return nil
+		}
+
+		// If the context was cancelled mid-connect, this is a clean shutdown.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Decide how long to wait before the next attempt.
+		if rle, ok := redisapi.AsRateLimitError(err); ok {
+			// Honor the server's backoff IN FULL: sleep the whole requested
+			// interval before retrying so we never poll tighter than retry_after
+			// (that tight-loop is exactly what burned the daily quota, #443). The
+			// sleep is chunked and ctx-aware so a 24h reset still yields instantly
+			// to shutdown. Reset the generic backoff -- the server is the
+			// authority here.
+			wait := rle.Wait(time.Now())
+			if wait <= 0 {
+				wait = backoff
+			}
+			backoff = connectBackoffInitial
+			Log("Redis API rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
+				rle.Limit, rle.Window, wait, err)
+			if !sleepUntilCtx(ctx, time.Now().Add(wait)) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		// Generic transient failure: exponential backoff with jitter.
+		sleep := jitter(backoff)
+		Log("Redis API connect failed (attempt %d), retrying in %s: %v", attempt, sleep, err)
+		backoff *= 2
+		if backoff > connectBackoffMax {
+			backoff = connectBackoffMax
+		}
+		if !sleepCtx(ctx, sleep) {
+			return ctx.Err()
+		}
+	}
+}
+
+// sleepUntilCtx sleeps until deadline, waking in bounded chunks so it stays
+// responsive to ctx cancellation even for very long waits (e.g. a 24h 429
+// reset). Returns true if the deadline was reached, false if ctx was cancelled.
+func sleepUntilCtx(ctx context.Context, deadline time.Time) bool {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ctx.Err() == nil
+		}
+		chunk := remaining
+		if chunk > connectRateLimitChunk {
+			chunk = connectRateLimitChunk
+		}
+		if !sleepCtx(ctx, chunk) {
+			return false
+		}
+	}
+}
+
+// jitter returns d perturbed by +/-20% to avoid a thundering herd of nodes
+// retrying in lockstep after a shared backend blip.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	delta := float64(d) * 0.2
+	return time.Duration(float64(d) - delta + rand.Float64()*2*delta)
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled. Returns true if the full
+// sleep elapsed, false if the context was cancelled first (so backoff loops
+// stay immediately responsive to SIGTERM / graceful shutdown).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func runWork(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Single-instance guard (issues #443 / #435). Refuse to start a second worker
+	// for the same node so a stale duplicate can never run beside the systemd unit.
+	// Duplicate workers split job routing non-deterministically, double the
+	// control-plane request volume (contributing to the 429 self-DoS in #443), and
+	// race on the shared tsnet state dir — the amplifier behind the identity churn.
+	// Keyed to the resolved network state dir, so every invocation on this box that
+	// converges on the same node identity also converges on the same lock. The lock
+	// is an OS advisory lock, released by the kernel on process death, so a crashed
+	// worker never blocks its own restart. Skipped with --no-single-instance for
+	// intentional side-by-side runs (e.g. a second debug-redis worker in dev).
+	if !workNoSingleInstance {
+		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
+		if lockErr != nil {
+			var running *worklock.ErrAlreadyRunning
+			if errors.As(lockErr, &running) {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", running)
+				fmt.Fprintln(os.Stderr, "\nAnother 'citadel work' is already serving this node.")
+				fmt.Fprintln(os.Stderr, "Stop it first (e.g. 'systemctl --user stop citadel' or kill the PID above),")
+				fmt.Fprintln(os.Stderr, "or pass --no-single-instance to run a second worker intentionally.")
+				os.Exit(1)
+			}
+			// Non-contention lock error (e.g. unwritable dir): warn but do not block
+			// the worker — the guard is defense in depth, not a hard prerequisite.
+			fmt.Fprintf(os.Stderr, "   - Warning: could not acquire single-instance lock: %v\n", lockErr)
+		} else {
+			Log("acquired single-instance worker lock (%s)", lock.Path())
+			defer lock.Release()
+		}
+	}
 
 	// Managed services this worker started (populated by the async startup
 	// goroutine below, read by the shutdown hook). Guarded by a mutex because
@@ -255,6 +427,33 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Release the assertion synchronously on shutdown, before runWork returns,
 	// so the OS inhibitor process is never orphaned past Citadel's lifetime.
 	defer keepAwakeMonitor.Stop()
+
+	// Re-materialize managed systemd unit files so unit-template changes in this
+	// binary (e.g. the #444 crash-restart-storm hardening) reach nodes deployed
+	// by an older binary. The primary upgrade path (auto-update re-exec) swaps
+	// the binary in place and never re-runs install.sh, so the on-disk unit would
+	// otherwise keep the old 10s-restart-storm policy forever. This is the unit
+	// analogue of the compose refresh below (#426). Idempotent: a unit already
+	// carrying the hardening is left untouched with no daemon-reload churn. We do
+	// NOT restart the worker here -- the new policy applies on the next restart.
+	if rewritten, err := service.RematerializeManagedUnits(func(format string, args ...any) {
+		Log(format, args...)
+	}); err != nil {
+		Log("unit-refresh: sweep error: %v", err)
+	} else if len(rewritten) > 0 {
+		Log("unit-refresh: refreshed managed units: %s", strings.Join(rewritten, ", "))
+	}
+
+	// Refresh citadel-owned embedded compose files from the binary's templates
+	// when the version changed since this node last materialized them (#426).
+	// Must run BEFORE startManagedServices so the fresh templates (host-port fix
+	// etc.) are what compose brings up. Version-gated => a cheap no-op on an
+	// unchanged boot. Skipped entirely with --no-services.
+	if !workNoServices {
+		if _, configDir, err := findAndReadManifest(); err == nil {
+			refreshManagedComposeFiles(configDir)
+		}
+	}
 
 	// Start managed services from the manifest (unless --no-services is set).
 	//
@@ -468,10 +667,21 @@ func runWork(cmd *cobra.Command, args []string) {
 			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
 
-		// Connect early so client is available for heartbeat
-		if err := apiSource.Connect(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: Failed to connect to Redis API: %v\n", err)
-			os.Exit(1)
+		// Connect early so client is available for heartbeat.
+		//
+		// A failed control-plane connect is expected and recoverable (auth blip,
+		// mesh churn, backend deploy, rate limit), NOT fatal. Exiting here would
+		// let systemd relaunch us every ~10s; each restart re-pings the same
+		// endpoint, and if it is rate limited (HTTP 429) that restart storm burns
+		// the node's daily Redis-API quota and hard-locks it for ~24h -- the node
+		// self-DoSes (issue #443). Instead retry IN-PROCESS with exponential
+		// backoff + jitter, honoring any 429 retry_after/reset_at, and stay
+		// responsive to shutdown via ctx.
+		if err := connectWithBackoff(ctx, apiSource); err != nil {
+			// The only way this returns an error is context cancellation
+			// (SIGTERM / graceful shutdown), which is a clean exit, not a crash.
+			Log("worker connect aborted: %v", err)
+			return
 		}
 
 		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)
@@ -724,6 +934,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// per-service. Disabled by --no-footprint or CITADEL_FOOTPRINT_INTERVAL<=0.
 	startFootprintSampler(ctx, nodeName, workManifest)
 
+	// Start the background node-key renewer (epic #4583). While the node is
+	// healthy and online, it refreshes the Headscale node key before it expires,
+	// re-authorizing in place with the node's own device token — so a long-lived
+	// session never lapses and an ordinary restart re-establishes via the
+	// no-authkey reconnect, never hitting the offline authkey-mint 403 path.
+	// No-op in direct-Redis mode (no device token) or when disabled.
+	startNodeKeyRenewer(ctx, deviceConfig)
+
 	// Default consumer group to node identity when --group is not explicitly set.
 	workGroup = resolveConsumerGroup(workGroup, headscaleNodeID, nodeName)
 	Debug("consumer group: %s", workGroup)
@@ -780,6 +998,47 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - Warning: per-node shell stream skipped (Headscale node ID "+
 			"unavailable); node-targeted jobs will fall back to the shared org stream")
 		Debug("per-node shell stream skipped: Headscale node ID unavailable")
+	}
+
+	// Subscribe to the org-scoped meeting-notetaker queue when this node can
+	// actually run a meeting bot. The backend routes MEETING_JOIN jobs to the
+	// per-org tag queue jobs:v1:tag:meeting:org_{org_id} (a security fix rejected
+	// the bare cross-org queue), so a node has to consume that exact stream for
+	// auto-join dispatch to reach it (aceteam-ai/aceteam#5098).
+	//
+	// Gated on the node advertising the "meeting" capability tag rather than
+	// subscribed unconditionally like the shell stream: a node lacking the
+	// audio-capture stack, Chromium, or Xvfb cannot run a meeting bot, so
+	// claiming the job would only fail it. The capability detector adds this tag
+	// only when that stack is present, and the MEETING_JOIN handler ships behind
+	// the same gate, so subscription, capability, and handler activate together.
+	if nodeCaps != nil && hasCapabilityTag(nodeCaps.Tags, "meeting") {
+		meetingOrgID := ""
+		if deviceConfig != nil {
+			meetingOrgID = deviceConfig.OrgID
+		}
+		if meetingOrgID == "" {
+			if manifest, _, mErr := findAndReadManifest(); mErr == nil && manifest != nil {
+				meetingOrgID = manifest.Node.OrgID
+			}
+		}
+		if meetingOrgID != "" {
+			meetingQueue := meetingQueueName(meetingOrgID)
+			switch src := source.(type) {
+			case *worker.APISource:
+				src.AddQueue(meetingQueue)
+			case *worker.RedisSource:
+				if err := src.AddQueue(ctx, meetingQueue); err != nil {
+					fmt.Fprintf(os.Stderr, "   - Warning: meeting queue subscribe failed: %v\n", err)
+				}
+			}
+			fmt.Printf("   - Meeting notetaker queue: %s\n", meetingQueue)
+			Debug("meeting queue: %s", meetingQueue)
+		} else {
+			fmt.Fprintln(os.Stderr, "   - Warning: meeting queue skipped (org id unknown); "+
+				"meeting auto-join dispatch will not reach this node")
+			Debug("meeting queue skipped: org id unknown")
+		}
 	}
 
 	// Populate the worker introspection state with the resolved identity and
@@ -893,6 +1152,14 @@ func runWork(cmd *cobra.Command, args []string) {
 			Agent:   agentProviders,
 		}
 
+		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
+		// the backend can trust it out-of-band and re-fetch on rotation. The path
+		// is the same one the gateway block below serves from; empty when the
+		// gateway runs --gateway-no-tls (endpoint then returns 204 = use http).
+		if workGateway && !workGatewayNoTLS {
+			serverCfg.GatewayCertPath = tlscert.CertPath(workGatewayCertDir)
+		}
+
 		// Wire up desktop API auth if org ID is available
 		statusOrgID := ""
 		if deviceConfig != nil {
@@ -921,8 +1188,77 @@ func runWork(cmd *cobra.Command, args []string) {
 			if serverCfg.TokenValidator != nil {
 				serverCfg.EnableDesktop = true
 				Debug("desktop API enabled (per-request VNC readiness checks)")
+				// Bundle VNC startup so the shared desktop works with zero
+				// manual `citadel vnc enable` (#483). Idempotent, headless-safe,
+				// loopback-bound; non-fatal so a missing x11vnc never blocks the worker.
+				if verr := platform.EnsureGatewayVNC(platform.DefaultVNCPort); verr != nil {
+					fmt.Fprintf(os.Stderr, "   - desktop VNC not auto-started: %v\n", verr)
+				}
 			} else {
 				fmt.Fprintln(os.Stderr, "   - desktop permission granted but API disabled (no org ID for auth)")
+			}
+		}
+
+		// Gate the MUTATING control endpoints (SSH-key injection) behind a
+		// coordinator mTLS client certificate on a dedicated control listener
+		// (issue #5028). Enabled only when a fabric CA bundle AND coordinator
+		// identities are configured. If construction fails, we log and leave the
+		// control listener OFF -- the mutating endpoints then stay refused on the
+		// plaintext path (fail closed), never reverting to VPN-origin trust.
+		controlPortForVPN := 0
+		caBundle := strings.TrimSpace(os.Getenv("CITADEL_FABRIC_CA_BUNDLE"))
+		if caBundle == "" {
+			// Provision the fabric CA trust root so the mTLS control listener has
+			// a trust anchor without manual env config (#5028). Fetched once at
+			// startup from the coordinator; a cached bundle is reused on fetch
+			// failure so a transient backend blip does not disable SSH-deploy on
+			// an already-provisioned node. A CA rotation requires a restart to
+			// re-fetch. Fails closed (listener stays off) only on a first-ever
+			// cold start with no cache and no reachable backend.
+			if bundlePath, berr := status.EnsureFabricCABundle(baseURL, platform.ConfigDir()); berr != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Fabric CA bundle unavailable (%v); mTLS control listener disabled, SSH-key injection refused\n", berr)
+			} else {
+				caBundle = bundlePath
+			}
+		}
+		if caBundle != "" {
+			coordinatorSANs := splitAndTrim(os.Getenv("CITADEL_COORDINATOR_SANS"))
+			if len(coordinatorSANs) == 0 {
+				// Default to the platform coordinator identity so upgraded nodes
+				// allowlist the relay out of the box (#5028). Without at least one
+				// SAN the verifier refuses to construct and the listener stays off.
+				coordinatorSANs = []string{status.DefaultCoordinatorSAN}
+			}
+			verifier, verr := status.NewFabricCAVerifier(caBundle, coordinatorSANs)
+			if verr != nil {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (%v); SSH-key injection stays refused\n", verr)
+			} else {
+				var ctrlIPs []net.IP
+				if ip4, _ := network.GetGlobalIPv4(); ip4 != "" {
+					if ip := net.ParseIP(ip4); ip != nil {
+						ctrlIPs = append(ctrlIPs, ip)
+					}
+				}
+				ctrlCert, certErr := tlscert.EnsureCert(tlscert.Config{
+					Hostname:    nodeName,
+					IPAddresses: ctrlIPs,
+					CertDir:     filepath.Join(platform.ConfigDir(), "control-tls"),
+				})
+				if certErr != nil {
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
+				} else {
+					controlPort := status.DefaultControlPort
+					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
+						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
+							controlPort = parsed
+						}
+					}
+					serverCfg.CAVerifier = verifier
+					serverCfg.ControlServerCert = &ctrlCert
+					serverCfg.ControlPort = controlPort
+					controlPortForVPN = controlPort
+					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints (#5028)\n", controlPort)
+				}
 			}
 		}
 
@@ -951,6 +1287,20 @@ func runWork(cmd *cobra.Command, args []string) {
 				statusServer.AddListener(vpnLn)
 				Log("status server VPN listener on %s:%s", vpnIP, vpnPort)
 				fmt.Printf("   - Status server VPN: http://%s:%d\n", vpnIP, workStatusPort)
+			}
+
+			// Also expose the mTLS control listener over the mesh so the
+			// coordinator can reach the mutating endpoints via the VPN (#5028).
+			if controlPortForVPN > 0 {
+				ctrlPort := fmt.Sprintf("%d", controlPortForVPN)
+				if ctrlLn, ctrlIP, err := network.ListenVPN("tcp", ctrlPort); err != nil {
+					Log("control server VPN listener failed (LAN-only): %v", err)
+					fmt.Fprintf(os.Stderr, "   - ⚠️ Control server VPN listener failed (LAN-only): %v\n", err)
+				} else {
+					statusServer.AddControlListener(ctrlLn)
+					Log("control server VPN listener on %s:%s", ctrlIP, ctrlPort)
+					fmt.Printf("   - Control server VPN (mTLS): https://%s:%d\n", ctrlIP, controlPortForVPN)
+				}
 			}
 		}
 
@@ -1031,6 +1381,12 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Printf("   - VNC detected: port %d (included in heartbeats)\n", heartbeatVNC.Port())
 		}
 
+		// Optional, config-gated (default OFF) auto-stop-when-idle reconciler
+		// (citadel #416). Built once and registered on whichever publisher runs so
+		// it acts on the status the heartbeat already collected (no extra
+		// stats/nvidia-smi sweep). nil when the operator has not opted in.
+		autoStop := newAutoStopReconciler()
+
 		if useAPIMode && apiSource != nil {
 			// API mode: use secure API publisher
 			// Get org ID from device config (saved during init)
@@ -1076,6 +1432,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				} else {
 					// Include current permissions in heartbeat
 					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+					if autoStop != nil {
+						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+					}
 					go func() {
 						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
@@ -1106,6 +1465,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			} else {
 				// Include current permissions in heartbeat
 				redisPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+				if autoStop != nil {
+					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+				}
 				go func() {
 					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
 					if deviceCode != "" {
@@ -1370,6 +1732,34 @@ func runWork(cmd *cobra.Command, args []string) {
 			WebSocket:   true,
 		})
 
+		// Expose provisioned MODULES on the mesh through the gateway
+		// (aceteam-ai/citadel-cli#447), driven entirely by the provisioned-service
+		// registry -- no per-module code here. Each module binds an auto-selected
+		// free host port that nothing on the tsnet stack listens on, so it is
+		// reached only via a /modules/<prefix> gateway route (StripPrefix so its own
+		// paths map through). Wire the registry so module routes are gated by the
+		// capability each module DECLARED, register every recorded module up front
+		// (wired to its persisted port when deployed), and publish the gateway so the
+		// in-process provision handler can wire a freshly-provisioned module live.
+		gwCertPath := ""
+		if !workGatewayNoTLS {
+			gwCertPath = tlscert.CertPath(workGatewayCertDir)
+		}
+		provReg := provisionedRegistry()
+		gw.SetProvisionedRegistry(provReg)
+		provisionedEntries := registerProvisionedModuleRoutes(gw)
+		setProvisionedServiceGateway(gw, workGatewayPort, !workGatewayNoTLS, gwCertPath, workStatusPort)
+		// Persist the live gateway facts so an out-of-process CLI/TUI builds a
+		// reachable mesh URL and verifies against the real cert (landmines a + b).
+		// StatusPort is persisted too so a separate process can build the plaintext
+		// cert_refresh_url (http://<ip>:<status-port>/gateway-cert.pem).
+		if err := writeGatewayFacts(gatewayFacts{Port: workGatewayPort, UseTLS: !workGatewayNoTLS, CertPath: gwCertPath, StatusPort: workStatusPort}); err != nil {
+			Log("could not persist gateway facts (out-of-process URL falls back to defaults): %v", err)
+		}
+		// Watch the registry so a module provisioned via the CLI while this gateway
+		// is already running gets wired without a restart (landmine c).
+		go watchProvisionedRegistry(ctx, gw)
+
 		// Add VPN listener (TLS-wrapped) so the gateway is reachable over tsnet.
 		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
 		// and issue #286.
@@ -1406,6 +1796,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
+		for _, e := range provisionedEntries {
+			target := "dynamic port (not yet deployed)"
+			if e.Port > 0 {
+				target = fmt.Sprintf("127.0.0.1:%d", e.Port)
+			}
+			fmt.Printf("     /modules/%s/...  -> %s (provisioned module %q, cap %q)\n", e.Prefix, target, e.Name, e.Capability)
+		}
 
 		if len(vpnIPs) > 0 {
 			fmt.Printf("   - Gateway VPN: %s://%s:%d\n", scheme, vpnIPs[0], workGatewayPort)
@@ -1437,15 +1834,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Create handlers with optional workspace for file-operation jobs.
+	// Create handlers with optional workspace for file-operation jobs. The node-job
+	// handler set (legacy + workflow, plus the privileged AGENT_UPDATE /
+	// WHATSAPP_PROVISION registered on the runner below) is built via the shared
+	// helper so the control-center TUI registers the exact same set when it is the
+	// only worker on the node.
 	workPerms := config.LoadPermissions(platform.ConfigDir())
-	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+	nodeJobOpts := nodeJobHandlerOpts{
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
-	})
-	handlers = append(handlers, workflow.NewHandler(wfExec))
+		WorkflowExec:              wfExec,
+		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
+	}
+	handlers := buildNodeJobHandlers(nodeJobOpts)
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
@@ -1497,38 +1900,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
-	// Register the AGENT_UPDATE job handler (issue aceteam#4427), which lets the
-	// control plane update this node's agent remotely — the fix for silent
-	// version skew (aceteam#4373). It is registered after the runner exists so it
-	// can borrow the runner's Drain/ActiveJobs for the "publish result, THEN
-	// restart" ordering, mirroring how the AutoUpdater is wired below. The handler
-	// self-restarts only when running as a managed service (CITADEL_SERVICE=true);
-	// in a foreground run it reports "restart required" instead.
-	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
-		Version:    Version,
-		Drain:      func() { runner.Drain() },
-		ActiveJobs: runner.ActiveJobs,
-		Log: func(format string, args ...any) {
-			Log(format, args...)
-		},
-	}))
-
-	// Register the WHATSAPP_PROVISION job handler (aceteam#4454), which lets the
-	// WhatsApp MCP remote-provision the Baileys bridge on the user's OWN node
-	// (sovereign / BYO-infra). It reuses the exact `citadel whatsapp up`
-	// orchestration (whatsapp.Provision) wired with this node's real docker / git
-	// / mesh edges, and is gated to the per-node stream only (deploying a
-	// container + minting creds is privileged, mirroring AGENT_UPDATE).
-	runner.RegisterHandler(worker.NewWhatsAppProvisionHandler(worker.WhatsAppProvisionConfig{
-		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
-			// Default module source/image (the CLI flags are not in scope for a
-			// remote job; the payload only carries tenant/proxy/public_url).
-			return whatsapp.Provision(ctx, req, whatsappProvisionDeps(defaultWhatsAppSource, ""))
-		},
-		Log: func(format string, args ...any) {
-			Log(format, args...)
-		},
-	}))
+	// Register the node-targeted privileged job handlers (AGENT_UPDATE aceteam#4427,
+	// WHATSAPP_PROVISION aceteam#4454) on the live runner. They are registered after
+	// the runner exists so AGENT_UPDATE can borrow the runner's Drain/ActiveJobs for
+	// the "publish result, THEN restart" ordering (mirroring the AutoUpdater below).
+	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
+	// control-center-only node handles the same privileged set.
+	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
 
 	// Start the periodic auto-updater. The goroutine always runs; whether it
 	// actually checks/installs on a given tick is decided per-tick by
@@ -1607,6 +1985,14 @@ func startManagedServices(ctx context.Context) []startedService {
 		if ctx.Err() != nil {
 			fmt.Println("   - Service startup interrupted by shutdown")
 			break
+		}
+
+		// Honor a durable "stopped" marker: a service a remote MODULE_SET set to
+		// stopped stays installed but must NOT be composed up on boot, or the stop
+		// would silently come back on the next `citadel work` restart (aceteam#5280).
+		if serviceStartDisabled(service) {
+			fmt.Printf("   - Skipping stopped service: %s (desired_status: stopped)\n", service.Name)
+			continue
 		}
 
 		serviceType := determineServiceType(service)
@@ -1715,6 +2101,27 @@ func shellQueueName(orgID string) string {
 	return fmt.Sprintf("jobs:v1:shell:org_%s", orgID)
 }
 
+// meetingQueueName returns the org-scoped meeting-notetaker tag queue name.
+// The backend dispatches MEETING_JOIN jobs to this per-org tag queue; the bare
+// jobs:v1:tag:meeting queue is rejected server-side to prevent cross-org meeting
+// dispatch (aceteam-ai/aceteam#5098). The string MUST stay byte-for-byte
+// identical to the Python dispatch helper.
+func meetingQueueName(orgID string) string {
+	return fmt.Sprintf("jobs:v1:tag:meeting:org_%s", orgID)
+}
+
+// hasCapabilityTag reports whether the resolved capability tags contain the
+// given tag. Used to gate optional queue subscriptions on the node actually
+// advertising the matching capability.
+func hasCapabilityTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
 // nodeQueueName returns the per-node shell stream name for node-targeted jobs.
 //
 // Node-targeted MCP jobs (terminal_exec, code_*, file reads, node attachments)
@@ -1791,6 +2198,43 @@ func resolveWorkspaceDir() string {
 	return abs
 }
 
+// newAutoStopReconciler builds the config-gated auto-stop-when-idle reconciler
+// (citadel #416), or returns nil when the operator has not opted in
+// (SERVICE_AUTO_STOP_WHEN_IDLE unset/false) so the feature adds zero cost by
+// default. When enabled, it wires a stop dispatcher that routes each idle
+// candidate to the correct lifecycle: manifest/embedded services via the same
+// compose "down" a SERVICE_STOP job takes, and catalog apps via the apps
+// package's docker-stop. Covering both is deliberate: the idle GPU hog is often
+// a catalog app (the #421 diffusers case), which a service-only path would
+// silently fail to evict.
+func newAutoStopReconciler() *status.AutoStopReconciler {
+	if !status.AutoStopEnabled() {
+		return nil
+	}
+	configDir := platform.ConfigDir()
+	wsDir := resolveWorkspaceDir()
+	svcHandler := jobs.NewServiceHandlerWithWorkspace(configDir, wsDir)
+
+	stop := func(c status.IdleCandidate) error {
+		switch c.Kind {
+		case status.EntityApp:
+			return apps.Stop(context.Background(), apps.ExecRunner{}, c.Name)
+		default:
+			return svcHandler.StopServiceByName(c.Name)
+		}
+	}
+	logFn := func(level, format string, args ...any) {
+		if level == "warning" {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		} else {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+	r := status.NewAutoStopReconciler(true, status.AutoStopThresholdSeconds(), stop, logFn)
+	fmt.Printf("   - Auto-stop-when-idle: ENABLED (threshold %ds)\n", status.AutoStopThresholdSeconds())
+	return r
+}
+
 // resolveAllowReadOutsideWorkspace returns whether read-only file handlers may
 // access paths outside the workspace sandbox.
 // Priority: --allow-read-outside-workspace flag > CITADEL_ALLOW_READ_OUTSIDE_WORKSPACE env.
@@ -1823,6 +2267,13 @@ func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
 // Disabled by default. Evaluated every tick so the web UI (which dispatches
 // `citadel update enable/disable` to the node) can toggle a running agent.
 func resolveAutoUpdateEnabled() bool {
+	// The opt-out (--no-auto-update / CITADEL_NO_AUTO_UPDATE) and a dev build
+	// both veto auto-INSTALL, ahead of any enable signal: a safety/"don't touch
+	// my binary" signal must win over --auto-update / CITADEL_AUTO_UPDATE.
+	// Explicit `citadel update` remains the escape hatch for a dev binary.
+	if !autoUpdateAllowed() {
+		return false
+	}
 	if workAutoUpdate {
 		return true
 	}
@@ -1858,6 +2309,10 @@ type DeviceConfig struct {
 	RedisURL       string `yaml:"redis_url"`
 	UserEmail      string `yaml:"user_email"`
 	UserName       string `yaml:"user_name"`
+	// AceteamAPIKey is an optional user act_ API key for surfaces the
+	// device token cannot reach (Team Chat, MCP). Set manually by the user;
+	// device auth never writes it. See aceteam-ai/citadel-cli#495.
+	AceteamAPIKey string `yaml:"aceteam_api_key"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from global config file.
@@ -2080,6 +2535,8 @@ func init() {
 	// Update check flags (deprecated - update check now runs on all commands via root.go)
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
+	workCmd.Flags().BoolVar(&workNoSingleInstance, "no-single-instance", false, "Allow a second worker to run for this node (skips the single-instance lock)")
+	workCmd.Flags().BoolVar(&workNoKeyRenew, "no-key-renew", false, "Disable the background Headscale node-key renewer (renews the key before expiry while online)")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
 	// Auto-update (periodic self-update) flags
@@ -2133,4 +2590,17 @@ func initProvisionHandler() *provision.Handler {
 	// was down and updates their status accordingly.
 	mgr.ReconcileAll(context.Background())
 	return provision.NewHandler(mgr)
+}
+
+// splitAndTrim splits a comma-separated env value into non-empty, trimmed items.
+// Used for CITADEL_COORDINATOR_SANS (the allowlist of coordinator SAN URIs that
+// may invoke mutating control endpoints -- issue #5028).
+func splitAndTrim(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

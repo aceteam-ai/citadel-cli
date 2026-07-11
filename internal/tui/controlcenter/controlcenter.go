@@ -573,6 +573,11 @@ type ControlCenter struct {
 	chatPage       *ChatPage             // nil until registered in Run
 	proxmoxConfig  ProxmoxConfig         // Proxmox page config (zero = disabled)
 
+	// Team Chat (AceTeam org channels — distinct from the node-to-node chatPage)
+	teamChatConfig     TeamChatPageConfig        // stored from Config; used to lazily create TeamChatPage
+	teamChatConfigProv func() TeamChatPageConfig // lazy re-resolver for Team Chat credentials
+	teamChatPage       *TeamChatPage             // nil until registered in Run
+
 	// Settings
 	settingsConfig SettingsCallbacks // Settings page hooks (telemetry load/save)
 
@@ -658,10 +663,16 @@ type Config struct {
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
 	Chat               ChatPageConfig                           // Chat page configuration (initial snapshot; may be empty pre-auth)
 	ChatConfigProvider func() ChatPageConfig                    // Lazy re-resolver for chat credentials (picks up post-startup device auth)
-	Proxmox            ProxmoxConfig                            // Proxmox page configuration (empty = disabled)
-	Settings           SettingsCallbacks                        // Settings page hooks (telemetry load/save)
-	WhatsApp           WhatsAppCallbacks                        // WhatsApp bridge page hooks (deploy/stop/status/QR)
-	ModuleInstall      ModuleInstallCallbacks                   // Install-module page hooks (resolve source + install)
+
+	// Team Chat page configuration (AceTeam org channels; initial snapshot may
+	// be empty pre-auth) and its lazy credential re-resolver.
+	TeamChat               TeamChatPageConfig
+	TeamChatConfigProvider func() TeamChatPageConfig
+
+	Proxmox       ProxmoxConfig          // Proxmox page configuration (empty = disabled)
+	Settings      SettingsCallbacks      // Settings page hooks (telemetry load/save)
+	WhatsApp      WhatsAppCallbacks      // WhatsApp bridge page hooks (deploy/stop/status/QR)
+	ModuleInstall ModuleInstallCallbacks // Install-module page hooks (resolve source + install)
 
 	// MouseEnabled is the resolved initial mouse state (persisted preference with
 	// the --no-mouse flag applied). When true, the control center opts into
@@ -720,6 +731,8 @@ func New(cfg Config) *ControlCenter {
 		nexusURL:            cfg.NexusURL,
 		chatConfig:          cfg.Chat,
 		chatConfigProv:      cfg.ChatConfigProvider,
+		teamChatConfig:      cfg.TeamChat,
+		teamChatConfigProv:  cfg.TeamChatConfigProvider,
 		proxmoxConfig:       cfg.Proxmox,
 		settingsConfig:      cfg.Settings,
 		whatsappConfig:      cfg.WhatsApp,
@@ -824,6 +837,13 @@ func (cc *ControlCenter) Run() error {
 	cc.chatConfig.Provider = cc.chatConfigProv
 	cc.chatPage = NewChatPage(cc.chatConfig)
 	cc.pmgr.Register(cc.chatPage, false)
+
+	// Team Chat page (hidden until network is connected): the AceTeam org
+	// channels surface (parity with web/iOS/Android), distinct from the
+	// node-to-node Node Chat above. Same lazy-provider pattern.
+	cc.teamChatConfig.Provider = cc.teamChatConfigProv
+	cc.teamChatPage = NewTeamChatPage(cc.teamChatConfig)
+	cc.pmgr.Register(cc.teamChatPage, false)
 
 	// Alt+4: Gateway page (hidden until gateway ledger appears on disk)
 	gatewayBaseDir := filepath.Join(os.Getenv("HOME"), ".citadel-cli")
@@ -949,6 +969,7 @@ func (cc *ControlCenter) Run() error {
 func (cc *ControlCenter) ShowChat() {
 	if cc.pmgr != nil {
 		cc.pmgr.Show("chat")
+		cc.pmgr.Show("teamchat")
 	}
 }
 
@@ -992,6 +1013,9 @@ func (cc *ControlCenter) Cleanup() {
 	}
 	if cc.chatPage != nil {
 		cc.chatPage.Close()
+	}
+	if cc.teamChatPage != nil {
+		cc.teamChatPage.Close()
 	}
 }
 

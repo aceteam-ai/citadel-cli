@@ -22,6 +22,9 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 		flag     bool
 		env      string // "" means unset
 		state    *bool  // nil means no state file
+		version  string // "" means a real release tag (v2.45.0)
+		noAuto   bool   // --no-auto-update flag
+		noAutoEn string // CITADEL_NO_AUTO_UPDATE env
 		expected bool
 	}{
 		{name: "default off when nothing set", expected: false},
@@ -30,15 +33,26 @@ func TestResolveAutoUpdateEnabled(t *testing.T) {
 		{name: "env true overrides disabled state", env: "true", state: boolPtr(false), expected: true},
 		{name: "env off overrides enabled state", env: "off", state: boolPtr(true), expected: false},
 		{name: "flag wins over env and state", flag: true, env: "off", state: boolPtr(false), expected: true},
+		// #473: a dev binary never auto-installs, even with an enable signal.
+		{name: "dev binary vetoes auto-update flag", flag: true, version: "dev", expected: false},
+		{name: "dev binary vetoes enabled state", state: boolPtr(true), version: "dev", expected: false},
+		// #473: opt-out (flag / env) wins over every enable signal.
+		{name: "no-auto-update flag vetoes auto-update flag", flag: true, noAuto: true, expected: false},
+		{name: "CITADEL_NO_AUTO_UPDATE env vetoes enabled state", state: boolPtr(true), noAutoEn: "1", expected: false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir()) // isolate the on-disk update state
 			t.Setenv("CITADEL_AUTO_UPDATE", tc.env)
-			orig := workAutoUpdate
-			workAutoUpdate = tc.flag
-			t.Cleanup(func() { workAutoUpdate = orig })
+			t.Setenv("CITADEL_NO_AUTO_UPDATE", tc.noAutoEn)
+			ver := tc.version
+			if ver == "" {
+				ver = "v2.45.0"
+			}
+			origVer, origFlag, origNoAuto := Version, workAutoUpdate, noAutoUpdate
+			Version, workAutoUpdate, noAutoUpdate = ver, tc.flag, tc.noAuto
+			t.Cleanup(func() { Version, workAutoUpdate, noAutoUpdate = origVer, origFlag, origNoAuto })
 			if tc.state != nil {
 				writeState(t, *tc.state)
 			}
@@ -128,6 +142,60 @@ func TestResolveConsumerGroup(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("resolveConsumerGroup(%q, %q, %q) = %q, want %q",
 					tt.explicit, tt.headscaleNodeID, tt.hostname, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMeetingQueueName guards the org-scoped meeting-notetaker tag queue naming
+// convention. This string MUST match the Python dispatch helper byte-for-byte,
+// otherwise MEETING_JOIN auto-join dispatch (aceteam-ai/aceteam#5098) never
+// reaches the node. The bare jobs:v1:tag:meeting queue is rejected server-side.
+func TestMeetingQueueName(t *testing.T) {
+	tests := []struct {
+		orgID string
+		want  string
+	}{
+		{
+			orgID: "550e8400-e29b-41d4-a716-446655440000",
+			want:  "jobs:v1:tag:meeting:org_550e8400-e29b-41d4-a716-446655440000",
+		},
+		{
+			orgID: "test-org-id",
+			want:  "jobs:v1:tag:meeting:org_test-org-id",
+		},
+	}
+
+	for _, tt := range tests {
+		got := meetingQueueName(tt.orgID)
+		if got != tt.want {
+			t.Errorf("meetingQueueName(%q) = %q, want %q", tt.orgID, got, tt.want)
+		}
+	}
+}
+
+// TestHasCapabilityTag verifies the gate that decides whether a node subscribes
+// to the meeting queue: only nodes advertising the "meeting" capability tag do,
+// so a node without the audio/Chromium/Xvfb stack never claims a job it cannot
+// run.
+func TestHasCapabilityTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tags []string
+		tag  string
+		want bool
+	}{
+		{"present", []string{"cpu:general", "meeting", "os:linux"}, "meeting", true},
+		{"absent", []string{"cpu:general", "os:linux"}, "meeting", false},
+		{"nil tags", nil, "meeting", false},
+		{"empty tags", []string{}, "meeting", false},
+		{"no partial match", []string{"meeting:room"}, "meeting", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasCapabilityTag(tt.tags, tt.tag); got != tt.want {
+				t.Errorf("hasCapabilityTag(%v, %q) = %v, want %v", tt.tags, tt.tag, got, tt.want)
 			}
 		})
 	}

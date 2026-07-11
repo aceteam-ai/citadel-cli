@@ -154,6 +154,50 @@ func (t *IdleTracker) RecordSample(key string, total, active float64, hasTotal b
 	return t.record(key, engineMetrics{total: total, active: active, hasTotal: hasTotal})
 }
 
+// RecordActivityCounter folds a monotonic activity counter (e.g. a container's
+// cumulative network I/O in bytes) into the tracked idle state for key. It is
+// the generic, request-agnostic idle path for services that expose no
+// vLLM-style request metrics (Claude Code, OpenClaw, Hermes, ...): any increase
+// in the counter since the last sample is treated as a request, refreshing
+// last_request_at; a flat counter accumulates idle_seconds until the configured
+// threshold flips Idle=true. See citadel-cli#433.
+//
+// Reset semantics differ deliberately from the vLLM request-counter path. For
+// vLLM, a counter DROP means an engine restart with the model already resident,
+// so record() does NOT refresh last_request_at (the drop is not a real request).
+// For a container network counter, a DROP means the container itself just
+// restarted, which is fresh activity (a brand-new, busy container). Treating
+// that as idle would let a just-restarted service be auto-stopped immediately on
+// a stale idle age. So a drop here refreshes last_request_at: restart == active.
+func (t *IdleTracker) RecordActivityCounter(key string, counter uint64) IdleState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.now()
+	e, ok := t.entries[key]
+	if !ok {
+		// First observation: seed the baseline. We cannot know when the last
+		// activity happened before tracking began, so treat "now" as the
+		// reference point for idle_seconds and prove no request yet.
+		e = &idleEntry{startedAt: now, lastRequestAt: now}
+		t.entries[key] = e
+	}
+
+	c := float64(counter)
+	// Any change from the prior sample is activity: an increase is new traffic,
+	// a decrease means the container restarted (its counter reset) which is
+	// itself fresh activity. Only a byte-for-byte identical counter is "quiet".
+	changed := e.haveLastTotal && c != e.lastTotal
+	if changed {
+		e.lastRequestAt = now
+		e.haveRequest = true
+	}
+	e.lastTotal = c
+	e.haveLastTotal = true
+
+	return t.stateLocked(e, now)
+}
+
 // stateLocked computes the IdleState for an entry. Caller must hold t.mu.
 func (t *IdleTracker) stateLocked(e *idleEntry, now time.Time) IdleState {
 	idleFor := now.Sub(e.lastRequestAt)

@@ -31,6 +31,33 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 )
 
+// ModuleRoutePrefix is the namespace under which EVERY provisioned module is
+// exposed on the mesh: the gateway serves a module declaring gateway.prefix=<p>
+// at /modules/<p>/ and strips the /modules/<p> prefix before forwarding to the
+// module's loopback port, so the module's own paths (/health, /qr.txt, ...) map
+// through unchanged. Namespacing under /modules/ prevents collision with builtin
+// routes (/terminal, /vnc, /provision, ...) and between modules. Which prefixes
+// exist, at which port, and under which capability is DATA in the
+// provisioned-service registry -- not code here.
+const ModuleRoutePrefix = "/modules/"
+
+// ModuleRoutePath returns the gateway route path for a module prefix:
+// "/modules/<prefix>". Used by both the gateway (route registration) and the
+// out-of-process URL builder so the convention lives in one place.
+func ModuleRoutePath(prefix string) string {
+	return ModuleRoutePrefix + prefix
+}
+
+// CapabilityResolver reports which capability gates the module served under the
+// given gateway prefix (the <p> in /modules/<p>/...), and whether such a module
+// is registered. The gateway holds one (backed by the provisioned-service
+// registry) so categoryForPath can gate module routes from declared data instead
+// of a hardcoded switch. A nil resolver (or unknown prefix) falls back to the
+// provision capability, so a module route is never accidentally left ungated.
+type CapabilityResolver interface {
+	CapabilityForPrefix(prefix string) (capability string, found bool)
+}
+
 // Config holds configuration for the gateway server.
 type Config struct {
 	// Port is the HTTPS port to listen on (default: 8443).
@@ -54,6 +81,15 @@ type Config struct {
 // Upstream describes a backend service to proxy to.
 type Upstream struct {
 	// Address is the backend address (e.g., "127.0.0.1:8080").
+	//
+	// For most upstreams the address is fixed at registration time. For a
+	// dynamically-provisioned module (which binds an auto-selected free host port
+	// AFTER the gateway has already started), the
+	// address is not known when the route is registered. Such a route is
+	// registered up front with an empty Address and its target is set later via
+	// Server.SetUpstreamAddress; reads go through addr() so a live proxy always
+	// forwards to the current target. Direct field reads are avoided in the proxy
+	// hot path for exactly that reason.
 	Address string
 
 	// StripPrefix removes the matched prefix before forwarding.
@@ -63,6 +99,30 @@ type Upstream struct {
 
 	// WebSocket indicates this upstream handles WebSocket connections.
 	WebSocket bool
+
+	// mu guards dynAddr for upstreams whose target is set after registration.
+	mu sync.RWMutex
+	// dynAddr, when non-empty, overrides Address. It is set via
+	// Server.SetUpstreamAddress for dynamically-provisioned upstreams.
+	dynAddr string
+}
+
+// addr returns the current backend address, preferring a dynamically-set
+// address over the static one. Safe for concurrent use.
+func (u *Upstream) addr() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	if u.dynAddr != "" {
+		return u.dynAddr
+	}
+	return u.Address
+}
+
+// setAddr updates the dynamic backend address. Safe for concurrent use.
+func (u *Upstream) setAddr(a string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.dynAddr = a
 }
 
 // Server is the HTTPS reverse proxy gateway.
@@ -85,6 +145,18 @@ type Server struct {
 	// extraListeners are additional net.Listeners the server will also serve on
 	// (e.g., a TLS-wrapped tsnet VPN listener). Added via AddListener before Start.
 	extraListeners []net.Listener
+
+	// provisionedResolver maps a /modules/<prefix>/ request to the capability the
+	// owning module declared (via the provisioned-service registry). When nil, a
+	// module route falls back to the provision capability. Set via
+	// SetProvisionedRegistry.
+	provisionedResolver CapabilityResolver
+
+	// started is set once Start has registered the proxy handlers for the routes
+	// present at that moment. It gates WireModuleRoute: a route added AFTER Start
+	// must have its proxy handler registered live (Start's registration loop has
+	// already run), whereas a route added before Start is picked up by that loop.
+	started bool
 }
 
 // NewServer creates a new gateway server.
@@ -121,12 +193,87 @@ func (s *Server) AddUpstream(pathPrefix string, upstream *Upstream) {
 	s.config.Upstreams[pathPrefix] = upstream
 }
 
+// SetUpstreamAddress updates the backend address of an already-registered
+// upstream. It is the mechanism a dynamically-provisioned module uses to point
+// a route (registered up front with an empty Address) at its real host port once
+// that port is known -- a module binds an auto-selected free host port after the
+// gateway has started. Returns an error if no upstream is
+// registered for the given prefix. Safe to call after Start (reads go through
+// the per-request resolveTarget in registerProxy).
+func (s *Server) SetUpstreamAddress(prefix, address string) error {
+	s.mu.RLock()
+	upstream, ok := s.config.Upstreams[prefix]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("gateway: no upstream registered for prefix %q", prefix)
+	}
+	upstream.setAddr(address)
+	return nil
+}
+
+// WireModuleRoute points the /modules/<prefix> route at address for a LIVE
+// (post-Start) module exposure. It is the re-wire-safe counterpart to
+// AddUpstream+SetUpstreamAddress and exists to close the #449 landmine:
+//
+//   - If the route already exists, it MUTATES the existing *Upstream's address.
+//     It must not replace the map entry: registerProxy (run once at Start) closed
+//     over the original *Upstream pointer, so swapping in a new object would
+//     orphan the update -- the running proxy would keep reading the old object's
+//     address. That is exactly why a re-provision that moved the bridge port left
+//     the route dialing the dead port until a full restart re-captured it.
+//   - If the route is new and the server has already started, it creates the
+//     upstream AND registers its proxy handler live (registerProxy), so a module
+//     first exposed after Start is reachable without a restart. Before Start, it
+//     just records the route; Start's registration loop wires the handler.
+//
+// stripPrefix applies only when the route is created; for an existing route the
+// registration-time options are kept. Safe for concurrent use.
+func (s *Server) WireModuleRoute(prefix, address string, stripPrefix bool) error {
+	if prefix == "" {
+		return fmt.Errorf("gateway: WireModuleRoute requires a non-empty prefix")
+	}
+	s.mu.Lock()
+	upstream, ok := s.config.Upstreams[prefix]
+	if !ok {
+		upstream = &Upstream{StripPrefix: stripPrefix}
+		// Set the address BEFORE the handler can serve traffic so a brand-new route
+		// never has a window where its proxy is live but points nowhere (a spurious
+		// 502). registerProxy touches only the concurrency-safe mux and closes over
+		// this upstream pointer, so the per-request resolveTarget reads this address.
+		upstream.setAddr(address)
+		s.config.Upstreams[prefix] = upstream
+		// A route that appears after Start must have its handler registered here;
+		// before Start, the Start loop registers it.
+		if s.started {
+			s.registerProxy(prefix, upstream)
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	// Existing route: mutate the object the running proxy handler already captured.
+	upstream.setAddr(address)
+	return nil
+}
+
 // SetPermissions sets the capability permissions for route filtering.
 // When nil, all routes are allowed. Must be called before Start.
 func (s *Server) SetPermissions(p *config.Permissions) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.permissions = p
+}
+
+// SetProvisionedRegistry wires the resolver the permission layer uses to gate
+// /modules/<prefix>/ requests by the capability the owning module declared.
+// Passing nil clears it (module routes then fall back to the provision
+// capability). Safe to call after Start (the permission check reads it under the
+// lock), so the running gateway can adopt a registry that gains entries over
+// time. Typically the caller passes a *provisionedservice.Registry.
+func (s *Server) SetProvisionedRegistry(r CapabilityResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.provisionedResolver = r
 }
 
 // SetMetering enables ACET token metering on the gateway. When set,
@@ -138,8 +285,50 @@ func (s *Server) SetMetering(m *MeteringMiddleware) {
 	s.metering = m
 }
 
-// categoryForPath returns the permission category for a request path, or ""
-// if the path should always be allowed (health, status, ping, root).
+// modulePrefixFromPath extracts the module prefix from a /modules/<prefix>/...
+// (or exact /modules/<prefix>) request path, or "" if the path is not a module
+// route. It is the inverse of ModuleRoutePath.
+func modulePrefixFromPath(path string) string {
+	if !strings.HasPrefix(path, ModuleRoutePrefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(path, ModuleRoutePrefix)
+	if rest == "" {
+		return ""
+	}
+	// The prefix is the first path segment; anything after the next slash is the
+	// module's own path.
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+// categoryForRequest returns the permission category gating a request path. For
+// builtin routes it uses the stable hardcoded mapping (categoryForPath). For a
+// /modules/<prefix>/ route it consults the provisioned-service registry (via
+// resolver) for the capability the owning module DECLARED, defaulting to
+// "provision" when the resolver is nil or the prefix is unknown -- so a module
+// route is never left ungated. This is the registry-driven replacement for the
+// old hardcoded per-module switch.
+func categoryForRequest(path string, resolver CapabilityResolver) string {
+	if prefix := modulePrefixFromPath(path); prefix != "" {
+		if resolver != nil {
+			if capability, found := resolver.CapabilityForPrefix(prefix); found && capability != "" {
+				return capability
+			}
+		}
+		// Unknown/registry-less module route: fall back to provision rather than
+		// leaving it open (fail closed).
+		return "provision"
+	}
+	return categoryForPath(path)
+}
+
+// categoryForPath returns the permission category for a BUILTIN request path, or
+// "" if the path should always be allowed (health, status, ping, root). Module
+// routes (/modules/<prefix>/) are handled by categoryForRequest, which layers a
+// registry lookup on top of this.
 func categoryForPath(path string) string {
 	// Terminal/console
 	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
@@ -167,7 +356,9 @@ func categoryForPath(path string) string {
 	if path == "/provision" || strings.HasPrefix(path, "/provision/") {
 		return "provision"
 	}
-	// Everything else (health, status, ping, root, unknown) is always allowed
+	// Everything else (health, status, ping, root, unknown) is always allowed.
+	// Provisioned-module routes (/modules/<prefix>/) are gated by
+	// categoryForRequest via the registry, not here.
 	return ""
 }
 
@@ -177,24 +368,27 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		perms := s.permissions
+		resolver := s.provisionedResolver
 		s.mu.RUnlock()
 
 		if perms != nil {
-			category := categoryForPath(r.URL.Path)
+			category := categoryForRequest(r.URL.Path, resolver)
 			blocked := false
 			switch category {
 			case "console":
 				blocked = !perms.Console
 			case "desktop":
 				blocked = !perms.Desktop
+			case "files":
+				blocked = !perms.Files
 			case "services":
 				blocked = !perms.Services
 			case "ssh":
 				blocked = !perms.SSH
 			case "provision":
 				blocked = !perms.Provision
-				// "files" is not currently routed through the gateway but is
-				// included in the permission model for future use.
+			case "shell":
+				blocked = !perms.Shell
 			}
 			if blocked {
 				w.Header().Set("Content-Type", "application/json")
@@ -215,6 +409,9 @@ func (s *Server) Start(ctx context.Context) error {
 	for prefix, upstream := range s.config.Upstreams {
 		s.registerProxy(prefix, upstream)
 	}
+	// Any route added after this point (WireModuleRoute) must register its own
+	// proxy handler live, since this loop has already run.
+	s.started = true
 
 	// Root handler — returns 404 for unmatched paths or gateway info for "/"
 	s.mux.HandleFunc("/", s.handleRoot)
@@ -272,17 +469,38 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // registerProxy sets up the reverse proxy handler for a given path prefix.
+//
+// The upstream target is resolved per request (via upstream.addr()) rather than
+// captured once, so a dynamically-provisioned upstream whose address is set
+// after Start (see SetUpstreamAddress) is honored on the next request without
+// re-registering the route. An unset target yields a 502 rather than a panic.
 func (s *Server) registerProxy(prefix string, upstream *Upstream) {
-	target, err := url.Parse("http://" + upstream.Address)
-	if err != nil {
-		log.Printf("[Gateway] invalid upstream address %q for %s: %v", upstream.Address, prefix, err)
-		return
+	// resolveTarget returns the current upstream URL, or nil when the upstream
+	// has no address yet (dynamic upstream not provisioned).
+	resolveTarget := func() *url.URL {
+		addr := upstream.addr()
+		if addr == "" {
+			return nil
+		}
+		target, err := url.Parse("http://" + addr)
+		if err != nil {
+			log.Printf("[Gateway] invalid upstream address %q for %s: %v", addr, prefix, err)
+			return nil
+		}
+		return target
 	}
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
+			target := resolveTarget()
+			if target == nil {
+				// Signal unavailability to the transport so ErrorHandler runs.
+				req.URL.Scheme = "http"
+				req.URL.Host = "gateway-upstream-unset.invalid"
+			} else {
+				req.URL.Scheme = target.Scheme
+				req.URL.Host = target.Host
+			}
 			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
 			if s.config.NodeName != "" {
@@ -297,16 +515,24 @@ func (s *Server) registerProxy(prefix string, upstream *Upstream) {
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[Gateway] proxy error for %s -> %s: %v", r.URL.Path, upstream.Address, err)
+			log.Printf("[Gateway] proxy error for %s -> %s: %v", r.URL.Path, upstream.addr(), err)
 			http.Error(w, fmt.Sprintf(`{"error":"upstream unavailable","upstream":"%s"}`, prefix), http.StatusBadGateway)
 		},
 	}
 
 	// For WebSocket upstreams, we need to handle the Upgrade header
 	if upstream.WebSocket {
+		wsProxy := func(w http.ResponseWriter, r *http.Request) {
+			target := resolveTarget()
+			if target == nil {
+				http.Error(w, fmt.Sprintf(`{"error":"upstream unavailable","upstream":"%s"}`, prefix), http.StatusBadGateway)
+				return
+			}
+			s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+		}
 		s.mux.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 			if isWebSocketUpgrade(r) {
-				s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+				wsProxy(w, r)
 				return
 			}
 			proxy.ServeHTTP(w, r)
@@ -314,7 +540,7 @@ func (s *Server) registerProxy(prefix string, upstream *Upstream) {
 		// Also handle the exact prefix (no trailing slash)
 		s.mux.HandleFunc(prefix, func(w http.ResponseWriter, r *http.Request) {
 			if isWebSocketUpgrade(r) {
-				s.proxyWebSocket(w, r, target, prefix, upstream.StripPrefix)
+				wsProxy(w, r)
 				return
 			}
 			proxy.ServeHTTP(w, r)

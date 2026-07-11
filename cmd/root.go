@@ -33,6 +33,13 @@ var debugMode bool
 var daemonMode bool
 var noColorGlobal bool
 
+// noAutoUpdate, when set via the --no-auto-update persistent flag (or the
+// CITADEL_NO_AUTO_UPDATE env var), opts this invocation out of every automatic
+// update check and install. It exists so a hand-copied dev/test binary is not
+// silently replaced by a release before it can be exercised. Explicit
+// `citadel update` is unaffected.
+var noAutoUpdate bool
+
 // noMouse, when set, disables terminal mouse reporting in the control center for
 // the current session, overriding the persisted preference. Users set it to keep
 // their terminal's native drag-to-copy working.
@@ -134,7 +141,8 @@ control center. All other subcommands are for scripting and advanced use.`,
 			parentName = cmd.Parent().Name()
 		}
 		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
-			cmdName == "version" || cmdName == "help"
+			cmdName == "version" || cmdName == "help" ||
+			autoUpdateOptedOut()
 
 		// Detect if we're about to launch TUI control center
 		// In this case, suppress stdout printing and defer to TUI activity log
@@ -149,6 +157,22 @@ control center. All other subcommands are for scripting and advanced use.`,
 			checkForUpdateOnStartup(isTUIContext)
 		}
 	},
+}
+
+// autoUpdateOptedOut reports whether the user has opted out of automatic update
+// checks/installs for this invocation, via the --no-auto-update persistent flag
+// or a truthy CITADEL_NO_AUTO_UPDATE env var. It gates the notify-only startup
+// check (skipUpdateCheck) as well as the auto-install paths.
+func autoUpdateOptedOut() bool {
+	return noAutoUpdate || update.IsTruthy(os.Getenv("CITADEL_NO_AUTO_UPDATE"))
+}
+
+// autoUpdateAllowed reports whether an automatic update *install* should run for
+// this process: false when the user opted out (--no-auto-update /
+// CITADEL_NO_AUTO_UPDATE) or when the running binary is a locally-built dev
+// build rather than a real release tag. Explicit `citadel update` bypasses this.
+func autoUpdateAllowed() bool {
+	return update.ShouldAutoInstall(Version, noAutoUpdate, os.Getenv("CITADEL_NO_AUTO_UPDATE"))
 }
 
 // checkForUpdateOnStartup shows cached update notification and triggers background check.
@@ -218,6 +242,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
+	rootCmd.PersistentFlags().BoolVar(&noAutoUpdate, "no-auto-update", false, "Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)")
 	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 	rootCmd.Flags().BoolVar(&noMouse, "no-mouse", false, "Disable control-center mouse control (keeps terminal drag-to-copy)")
 

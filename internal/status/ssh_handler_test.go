@@ -284,96 +284,70 @@ func TestIsVPNOrigin(t *testing.T) {
 	}
 }
 
-func TestHandleSSHAuthorizedKeysEndpoint(t *testing.T) {
-	// Override HOME for file operations
+func TestSSHPlaintextPathFailsClosed(t *testing.T) {
 	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
+	t.Setenv("HOME", tmpHome)
+	authKeysPath := filepath.Join(tmpHome, ".ssh", "authorized_keys")
 
 	collector := NewCollector(CollectorConfig{NodeName: "test-node"})
 	srv := NewServer(ServerConfig{
 		TokenValidator: &mockTokenValidator{validToken: "valid-token"},
 		OrgID:          "test-org",
 	}, collector)
+	mux := srv.buildMux()
 
 	key1 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test@example.com"
 
-	t.Run("valid request with VPN origin", func(t *testing.T) {
+	// A VPN-origin POST (the exact attack the flat mesh allowed) must be refused
+	// and write nothing. SSH-key injection now lives only on the mTLS control
+	// listener (see TestSSHInjectionOverMTLS).
+	t.Run("VPN origin no longer deploys keys", func(t *testing.T) {
 		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key1}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
 		req.RemoteAddr = "100.64.0.5:12345"
 		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
 
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
 		}
-
-		var resp sshAuthorizedKeysResponse
-		json.Unmarshal(w.Body.Bytes(), &resp)
-		if resp.Added != 1 {
-			t.Errorf("added = %d, want 1", resp.Added)
+		if _, err := os.Stat(authKeysPath); !os.IsNotExist(err) {
+			t.Error("authorized_keys must not be created via the plaintext path")
 		}
 	})
 
-	t.Run("valid request with token auth", func(t *testing.T) {
-		// Deploy a second key via token auth (not VPN origin)
-		key2 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPwFRoSvVFDe4FjpGgUHjBfcS20B3pjxFDfKFYB4z3KN test2@example.com"
-		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key2}})
+	// Even a valid org token on the plaintext path must not deploy keys now.
+	t.Run("token on plaintext path no longer deploys keys", func(t *testing.T) {
+		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key1}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
-		req.RemoteAddr = "192.168.1.1:12345" // NOT VPN
+		req.RemoteAddr = "192.168.1.1:12345"
 		req.Header.Set("Authorization", "Bearer valid-token")
 		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
 
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Errorf("status = %d, want 200, body: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", w.Code)
+		}
+		if _, err := os.Stat(authKeysPath); !os.IsNotExist(err) {
+			t.Error("authorized_keys must not be created via the plaintext path")
 		}
 	})
+}
 
-	t.Run("rejected without VPN or token", func(t *testing.T) {
-		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key1}})
-		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
-		req.RemoteAddr = "192.168.1.1:12345"
-		w := httptest.NewRecorder()
+// TestHandleSSHAuthorizedKeysValidation covers request validation directly;
+// auth/identity gating is covered by the mTLS tests (TestSSHInjectionOverMTLS).
+func TestHandleSSHAuthorizedKeysValidation(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
 
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", w.Code)
-		}
-	})
-
-	t.Run("rejected with invalid token", func(t *testing.T) {
-		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key1}})
-		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
-		req.RemoteAddr = "192.168.1.1:12345"
-		req.Header.Set("Authorization", "Bearer wrong-token")
-		w := httptest.NewRecorder()
-
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", w.Code)
-		}
-	})
+	collector := NewCollector(CollectorConfig{NodeName: "test-node"})
+	srv := NewServer(ServerConfig{}, collector)
 
 	t.Run("invalid key format returns 400", func(t *testing.T) {
 		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{"not-a-valid-key"}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
-		req.RemoteAddr = "100.64.0.5:12345"
 		w := httptest.NewRecorder()
-
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
+		srv.handleSSHAuthorizedKeys(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want 400, body: %s", w.Code, w.Body.String())
 		}
@@ -382,12 +356,8 @@ func TestHandleSSHAuthorizedKeysEndpoint(t *testing.T) {
 	t.Run("empty keys list returns 400", func(t *testing.T) {
 		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))
-		req.RemoteAddr = "100.64.0.5:12345"
 		w := httptest.NewRecorder()
-
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
+		srv.handleSSHAuthorizedKeys(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want 400", w.Code)
 		}
@@ -395,12 +365,8 @@ func TestHandleSSHAuthorizedKeysEndpoint(t *testing.T) {
 
 	t.Run("method not allowed for GET", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/ssh/authorized-keys", nil)
-		req.RemoteAddr = "100.64.0.5:12345"
 		w := httptest.NewRecorder()
-
-		handler := srv.requireVPNOrAuth(srv.handleSSHAuthorizedKeys)
-		handler(w, req)
-
+		srv.handleSSHAuthorizedKeys(w, req)
 		if w.Code != http.StatusMethodNotAllowed {
 			t.Errorf("status = %d, want 405", w.Code)
 		}

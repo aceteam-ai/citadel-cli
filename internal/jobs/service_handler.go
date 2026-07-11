@@ -43,6 +43,10 @@ type ServiceHandler struct {
 	// workspace (e.g. the transcribe sidecar) resolve to an absolute path even
 	// when the worker was started without CITADEL_WORKSPACE in its environment.
 	WorkspaceDir string
+	// instances is the registry of payload-launched agent-runtime instances
+	// (BYOC, citadel-cli#462), lazily initialized. These live outside
+	// citadel.yaml, so SERVICE_STOP / SERVICE_STATUS find them here.
+	instances *instanceStore
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
@@ -70,6 +74,10 @@ type serviceResult struct {
 	// provisioned service. Empty for native services or when no host port is
 	// published. See citadel-cli#415.
 	Endpoint string `json:"endpoint,omitempty"`
+	// Runtime is the docker container runtime a payload-launched instance runs
+	// under (e.g. "kata", "runsc"). Empty for the daemon default (runc) and for
+	// manifest/native services. See citadel-cli#470.
+	Runtime string `json:"runtime,omitempty"`
 }
 
 func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -79,6 +87,31 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 	}
 
 	ctx.Log("info", "     - [Job %s] Service %s: %s", job.ID, job.Type, svcName)
+
+	// Extended-payload launch path (BYOC agent runtimes, citadel-cli#462). A
+	// SERVICE_START that carries an inline spec (image/env/host_port/volume) is
+	// launched from the payload; it does not exist in citadel.yaml or the
+	// embedded ServiceMap. The name-based manifest path below is left untouched
+	// for embedded services.
+	if job.Type == "SERVICE_START" && payloadHasInlineSpec(job.Payload) {
+		return h.serviceStartPayload(ctx, job)
+	}
+
+	// SERVICE_STOP / SERVICE_STATUS for a previously payload-launched instance:
+	// it is in neither the manifest nor the embedded map, so resolve it from the
+	// instance store before falling through to the manifest path.
+	if job.Type == "SERVICE_STOP" || job.Type == "SERVICE_STATUS" {
+		if rec, ok, sErr := h.instanceStore().Get(svcName); sErr != nil {
+			ctx.Log("warning", "     - [Job %s] instance store read failed: %v", job.ID, sErr)
+		} else if ok {
+			switch job.Type {
+			case "SERVICE_STATUS":
+				return h.serviceStatusPayload(rec)
+			case "SERVICE_STOP":
+				return h.serviceStopPayload(ctx, rec)
+			}
+		}
+	}
 
 	// Load manifest and validate service name against it.
 	manifest, err := h.loadManifest()
@@ -266,6 +299,40 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		Name: svc.Name, Running: false, Kind: kind,
 		Action: "stop", Message: fmt.Sprintf("%s stopped successfully", svc.Name),
 	})
+}
+
+// StopServiceByName stops a manifest-declared or embedded managed service by
+// its logical name, without a remote job. It is the programmatic entry point
+// used by the config-gated auto-stop-when-idle reconciler (citadel #416): the
+// reconciler decides WHAT to evict; this reuses the same compose "down" path a
+// SERVICE_STOP job would take so there is one stop implementation. A service
+// absent from the manifest and not embedded is reported as an error (the
+// reconciler logs and moves on). A service that is already stopped is a no-op.
+func (h *ServiceHandler) StopServiceByName(name string) error {
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to load manifest: %w", err)
+	}
+	svc, ok := h.findService(manifest, name)
+	if !ok {
+		if _, embedded := embeddedservices.ServiceMap[name]; !embedded {
+			return fmt.Errorf("service %q not found in manifest", name)
+		}
+		svc, err = h.materializeEmbeddedService(name)
+		if err != nil {
+			return fmt.Errorf("failed to reconcile embedded service %q: %w", name, err)
+		}
+	}
+	// Silent JobContext: there is no remote job to report progress against.
+	res, err := h.serviceStop(JobContext{LogFn: func(string, string) {}}, svc)
+	if err != nil {
+		return err
+	}
+	var parsed serviceResult
+	if json.Unmarshal(res, &parsed) == nil && parsed.Error != "" {
+		return fmt.Errorf("%s", parsed.Error)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

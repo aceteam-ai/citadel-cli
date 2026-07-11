@@ -471,12 +471,20 @@ setup_systemd_service() {
 Description=Citadel Worker - AceTeam Sovereign Compute
 After=network-online.target docker.service
 Wants=network-online.target docker.service
+# Defense in depth against a crash-loop self-DoS (#443): if the process keeps
+# failing fast, enter a cooldown instead of a 10s restart storm.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=${INSTALL_DIR}/${BINARY_NAME} work
 Restart=on-failure
+# Exponential restart backoff (10s -> 5m). The worker also backs off in-process
+# on a failed control-plane connect, so this is a secondary safety net (#443).
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
 Environment=HOME=/root
 WorkingDirectory=/root
 

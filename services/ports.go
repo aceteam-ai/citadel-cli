@@ -31,6 +31,15 @@ const (
 	EnvVLLMHostPort       = "CITADEL_VLLM_HOST_PORT"
 	EnvExtractionHostPort = "CITADEL_EXTRACTION_HOST_PORT"
 	EnvDiffusersHostPort  = "CITADEL_DIFFUSERS_HOST_PORT"
+	// EnvClaudecodeHostPort carries the host port for the claudecode
+	// agent-runtime module (aceteam-ai/citadel-cli#458). Unlike the four inference
+	// services above, claudecode ships as an installable catalog MODULE (its
+	// compose lives in aceteam-ai/citadel-services, not the embedded ServiceMap),
+	// but it is registered here so its host port is injected by the same
+	// HostPortEnv() mechanism. That is what lets a second agent-runtime module
+	// (Hermes/OpenClaw, aceteam#4591) claim the next slot in the 8200 block instead
+	// of every module hardcoding a literal 8204 and colliding.
+	EnvClaudecodeHostPort = "CITADEL_CLAUDECODE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -51,17 +60,35 @@ const (
 	ExtractionHostPort = 8202
 	// diffusers: was host 8102 (collided with the TEI embedding upstream).
 	DiffusersHostPort = 8203
+	// claudecode: the first agent-runtime MODULE (#458). Next free slot in the
+	// 8200 block, above the apps 8100-8199 range. The wrapper's internal contract
+	// port is 8787; this is the host publish. Kept in this registry so the next
+	// agent-runtime module (Hermes/OpenClaw) is allocated 8205 rather than
+	// re-hardcoding 8204.
+	ClaudecodeHostPort = 8204
+	// storage: the on-node S3-compatible object store (VersityGW, #469). It is
+	// NOT a compose service and has no ${CITADEL_*_HOST_PORT} env var -- the
+	// `citadel storage` command constructs its `docker run` publish directly from
+	// this constant (internal/storage). It sits above the earmarked 8205
+	// Hermes/OpenClaw slot so a fixed, reboot-stable port is signed into S3
+	// presigned URLs without a persisted-port crash-loop risk. Kept in the
+	// registry so future allocations skip it and the collision guard covers it.
+	StorageHostPort = 8206
 )
 
-// ServiceHostPorts maps service name -> citadel-assigned host port for every
-// service whose host publish citadel owns via env-var substitution. The
-// collision guard test unions this with the apps catalog and the parsed compose
-// files to prove no two host ports clash.
+// ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
+// are compose services whose host publish citadel owns via env-var substitution;
+// "storage" is the exception -- it has no compose file and is consumed directly
+// by the storage command's `docker run` construction. The collision guard test
+// unions this with the apps catalog and the parsed compose files to prove no two
+// host ports clash.
 var ServiceHostPorts = map[string]int{
 	"llamacpp":   LlamacppHostPort,
 	"vllm":       VLLMHostPort,
 	"extraction": ExtractionHostPort,
 	"diffusers":  DiffusersHostPort,
+	"claudecode": ClaudecodeHostPort,
+	"storage":    StorageHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -71,6 +98,7 @@ var serviceHostPortEnv = map[string]string{
 	"vllm":       EnvVLLMHostPort,
 	"extraction": EnvExtractionHostPort,
 	"diffusers":  EnvDiffusersHostPort,
+	"claudecode": EnvClaudecodeHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
@@ -128,6 +156,17 @@ const (
 	// --terminal-port, internal/terminal/config.go). The platform relay dials
 	// ws://<vpn_ip>:7860, so this is a live mesh port a module must not take.
 	TerminalPort = 7860
+	// LiveKit SFU ports (voice huddles). The livekit catalog module
+	// (aceteam-ai/citadel-services services/livekit) runs with
+	// `network_mode: host`, so it binds these on the host directly — outside
+	// Docker's publish bookkeeping and outside this registry's env-var
+	// substitution. They are reserved here so no app allocation or module/
+	// payload publish can claim a port the SFU's own config will bind. The
+	// platform relay dials ws://<vpn_ip>:7880 for signaling, so 7880 is a live
+	// mesh port just like TerminalPort.
+	LiveKitWSPort     = 7880
+	LiveKitICETCPPort = 7881
+	LiveKitUDPMuxPort = 7882
 )
 
 // ReservedCitadelPorts is the set of host ports owned by citadel's own
@@ -142,6 +181,9 @@ var ReservedCitadelPorts = map[int]string{
 	VNCPort:           "vnc-rfb",
 	DeskstreamPort:    "deskstream-h264",
 	TerminalPort:      "terminal-server",
+	LiveKitWSPort:     "livekit-signaling",
+	LiveKitICETCPPort: "livekit-ice-tcp",
+	LiveKitUDPMuxPort: "livekit-udp-mux",
 }
 
 // AppsPortRange is the inclusive range apps auto-allocate host ports from

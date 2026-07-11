@@ -2,6 +2,8 @@ package controlcenter
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -9,6 +11,35 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+// meshCGNAT is the Headscale mesh range (CGNAT 100.64.0.0/10). The aceteam
+// backend's SSRF guard allows this range by default, so a bridge advertised on a
+// mesh host is reachable with NO extra backend flag.
+var _, meshCGNAT, _ = net.ParseCIDR("100.64.0.0/10")
+
+// isNonMeshPrivateHost reports whether the host in apiURL is a private RFC1918
+// address that is NOT on the mesh (100.64.0.0/10). Only such hosts need the
+// backend WHATSAPP_ALLOW_PRIVATE_NETWORK flag; mesh and public hosts do not.
+// A host that cannot be parsed as an IP (empty URL, hostname, placeholder) is
+// treated as non-private so no flag hint is shown.
+func isNonMeshPrivateHost(apiURL string) bool {
+	if apiURL == "" {
+		return false
+	}
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if meshCGNAT != nil && meshCGNAT.Contains(ip) {
+		return false
+	}
+	return ip.IsPrivate()
+}
 
 // WhatsAppStatus is a snapshot of the bridge module state, produced by the
 // WhatsAppCallbacks.Status hook (wired from cmd so this page never imports
@@ -327,8 +358,12 @@ func (p *WhatsAppPage) render() {
 			sb.WriteString(fmt.Sprintf("   api_key:  [aqua]%s[-]\n", st.APIKey))
 		}
 		sb.WriteString("   [gray]Call whatsapp_connect(api_url, api_key) in AceTeam.[-]\n")
-		sb.WriteString("   [yellow]Backend needs WHATSAPP_ALLOW_PRIVATE_NETWORK=true[-]\n")
-		sb.WriteString("   [yellow]to reach the bridge over the private mesh.[-]\n")
+		if isNonMeshPrivateHost(st.APIURL) {
+			sb.WriteString("   [yellow]This is a non-mesh private host, so the backend[-]\n")
+			sb.WriteString("   [yellow]needs WHATSAPP_ALLOW_PRIVATE_NETWORK=true to dial it.[-]\n")
+		} else {
+			sb.WriteString("   [gray]Reachable over the mesh by default -- no backend flag needed.[-]\n")
+		}
 	}
 
 	// Busy / error.

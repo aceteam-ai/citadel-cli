@@ -353,6 +353,30 @@ func payloadString(payload map[string]any, key string) string {
 	return fmt.Sprint(v)
 }
 
+// payloadInt reads an integer value from a job payload, coercing the common
+// JSON-decoded numeric type (float64) and a numeric string. Missing, nil, or
+// unparseable yields 0.
+func payloadInt(payload map[string]any, key string) int {
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case string:
+		var p int
+		if _, err := fmt.Sscanf(strings.TrimSpace(n), "%d", &p); err == nil {
+			return p
+		}
+	}
+	return 0
+}
+
 // defaultIsService reports whether we are running under a managed service
 // supervisor. The service unit/plist/SCM all set CITADEL_SERVICE=true (see
 // internal/service).

@@ -83,12 +83,35 @@ func TestWhatsAppProvisionParsesPayload(t *testing.T) {
 			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: req.Tenant, AlreadyLinked: true}, nil
 		},
 	})
-	payload := map[string]any{"tenant": "sales", "proxy": "socks5://p", "public_url": "https://pub"}
+	// "port" arrives as a JSON number (float64) and must coerce to the int
+	// override. When absent it stays 0 so Provision auto-selects (issue #438).
+	payload := map[string]any{"tenant": "sales", "proxy": "socks5://p", "public_url": "https://pub", "port": float64(8091)}
 	if _, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, payload), &NoOpStreamWriter{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotReq.Tenant != "sales" || gotReq.Proxy != "socks5://p" || gotReq.PublicURL != "https://pub" {
 		t.Errorf("payload not parsed into request: %+v", gotReq)
+	}
+	if gotReq.Port != 8091 {
+		t.Errorf("port not parsed into request: got %d, want 8091", gotReq.Port)
+	}
+}
+
+func TestWhatsAppProvisionDefaultsPortToAuto(t *testing.T) {
+	var gotReq whatsapp.ProvisionRequest
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			gotReq = req
+			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: "default"}, nil
+		},
+	})
+	// No "port" in the payload -> Port stays 0 so Provision auto-selects a free
+	// host port rather than colliding on 8080.
+	if _, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotReq.Port != 0 {
+		t.Errorf("Port = %d, want 0 (auto-select) when payload omits port", gotReq.Port)
 	}
 }
 
@@ -184,5 +207,59 @@ func TestWhatsAppProvisionCanHandle(t *testing.T) {
 	}
 	if h.CanHandle(JobTypeAgentUpdate) {
 		t.Error("CanHandle(AGENT_UPDATE) = true, want false")
+	}
+}
+
+// TestWhatsAppProvisionEmitsCertFields verifies the handler serializes the
+// gateway_cert_pem + cert_refresh_url keys when the provision result carries them
+// (the cert-publish contract, aceteam-ai/citadel-cli#448).
+func TestWhatsAppProvisionEmitsCertFields(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL:         "https://100.64.0.9:8443/modules/whatsapp",
+				APIKey:         "wab_key",
+				Tenant:         "default",
+				GatewayCertPEM: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n",
+				CertRefreshURL: "http://100.64.0.9:8080/gateway-cert.pem",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if doc["gateway_cert_pem"] != "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n" {
+		t.Errorf("gateway_cert_pem = %v, want the cert PEM", doc["gateway_cert_pem"])
+	}
+	if doc["cert_refresh_url"] != "http://100.64.0.9:8080/gateway-cert.pem" {
+		t.Errorf("cert_refresh_url = %v, want the refresh url", doc["cert_refresh_url"])
+	}
+}
+
+// TestWhatsAppProvisionOmitsEmptyCertFields verifies the two cert keys are
+// omitted entirely when the result carries no cert (off-mesh / --gateway-no-tls),
+// so older backends that never read them are unaffected.
+func TestWhatsAppProvisionOmitsEmptyCertFields(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "http://100.64.0.9:8080",
+				APIKey: "wab_key",
+				Tenant: "default",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if _, ok := doc["gateway_cert_pem"]; ok {
+		t.Errorf("gateway_cert_pem must be omitted when empty, got %v", doc["gateway_cert_pem"])
+	}
+	if _, ok := doc["cert_refresh_url"]; ok {
+		t.Errorf("cert_refresh_url must be omitted when empty, got %v", doc["cert_refresh_url"])
 	}
 }

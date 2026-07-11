@@ -40,6 +40,11 @@ type SettingsCallbacks struct {
 	LoadRendering func() *config.Rendering
 	// SaveRendering persists an updated fullscreen-rendering setting.
 	SaveRendering func(*config.Rendering) error
+
+	// LoadMeeting returns the current persisted meeting-capability setting.
+	LoadMeeting func() *config.Meeting
+	// SaveMeeting persists an updated meeting-capability setting.
+	SaveMeeting func(*config.Meeting) error
 	// SetFullscreenEnabled is the injection seam for applying the fullscreen
 	// preference on the running app. Unlike mouse capture, tview cannot swap the
 	// terminal's alternate-screen mode mid-run, so today this is a no-op seam that
@@ -70,6 +75,7 @@ type SettingsPage struct {
 	keepAwake *config.KeepAwake
 	mouse     *config.Mouse
 	rendering *config.Rendering
+	meeting   *config.Meeting
 
 	// UI
 	root *tview.Flex
@@ -115,6 +121,7 @@ func (p *SettingsPage) OnActivate() {
 	p.reloadKeepAwake()
 	p.reloadMouse()
 	p.reloadRendering()
+	p.reloadMeeting()
 	p.render()
 	if p.app != nil && p.view != nil {
 		p.app.SetFocus(p.view)
@@ -126,7 +133,8 @@ func (p *SettingsPage) OnDeactivate() {}
 
 // HandleInput implements Page. Numbered toggles (numbers + arrows convention, no
 // letter shortcuts): 1=mouse control, 2=fullscreen rendering, 3=anonymous
-// telemetry opt-out, 4=keep-awake-on-AC. Space/Enter also toggle telemetry.
+// telemetry opt-out, 4=keep-awake-on-AC, 5=meeting capability opt-out.
+// Space/Enter also toggle telemetry.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
 	case event.Key() == tcell.KeyRune && event.Rune() == '1':
@@ -140,6 +148,9 @@ func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case event.Key() == tcell.KeyRune && event.Rune() == '4':
 		p.toggleKeepAwake()
+		return nil
+	case event.Key() == tcell.KeyRune && event.Rune() == '5':
+		p.toggleMeeting()
 		return nil
 	case event.Key() == tcell.KeyRune && event.Rune() == ' ':
 		p.toggleTelemetry()
@@ -206,6 +217,37 @@ func (p *SettingsPage) toggleKeepAwake() {
 		}
 	}
 	p.keepAwake = next
+	p.render()
+}
+
+// reloadMeeting refreshes the in-memory meeting setting from disk.
+func (p *SettingsPage) reloadMeeting() {
+	if p.cb.LoadMeeting != nil {
+		p.meeting = p.cb.LoadMeeting()
+	}
+	if p.meeting == nil {
+		p.meeting = config.DefaultMeeting()
+	}
+}
+
+// toggleMeeting flips the meeting-capability opt-out and persists it. The change
+// takes effect on the next capability detection / worker start (the node
+// re-advertises the `meeting` tag or drops it); the inline hint says so.
+func (p *SettingsPage) toggleMeeting() {
+	if p.meeting == nil {
+		p.reloadMeeting()
+	}
+
+	next := &config.Meeting{MeetingEnabled: !p.meeting.MeetingEnabled}
+
+	if p.cb.SaveMeeting != nil {
+		if err := p.cb.SaveMeeting(next); err != nil {
+			p.meeting = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.meeting = next
 	p.render()
 }
 
@@ -355,6 +397,20 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   this node is plugged in, so the laptop stays reachable on the\n")
 	sb.WriteString("   mesh. Released on battery and on exit. Display may still sleep.\n\n")
 	sb.WriteString("   [yellow::b]4[-:-:-] toggle keep-awake\n")
+
+	// -- Meeting capability --
+	meetingEnabled := p.meeting == nil || p.meeting.MeetingEnabled
+	sb.WriteString("\n [yellow::b]Meeting Notetaker[-:-:-]\n\n")
+	if meetingEnabled {
+		sb.WriteString("   Status:  [green::b]ON[-:-:-]  [gray](default)[-]\n")
+	} else {
+		sb.WriteString("   Status:  [red::b]OFF[-:-:-]  [gray](opted out)[-]\n")
+	}
+	sb.WriteString("\n   [white]What it does:[-] lets this node auto-join meetings to record\n")
+	sb.WriteString("   and transcribe them. Advertises the [white]meeting[-] capability when\n")
+	sb.WriteString("   the audio + browser deps are present. Opting out drops the tag so\n")
+	sb.WriteString("   the node stops receiving meeting jobs.\n\n")
+	sb.WriteString("   [yellow::b]5[-:-:-] [gray]toggle meeting capability (applies on next worker start)[-]\n")
 
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")

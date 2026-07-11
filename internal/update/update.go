@@ -363,6 +363,48 @@ func (c *Client) isNewerVersion(newVersion string) (bool, error) {
 	return IsNewerVersion(c.CurrentVersion, newVersion)
 }
 
+// IsTruthy reports whether an environment-variable value should be treated as
+// "on". It mirrors the truthy set already used by resolveAutoUpdateEnabled
+// ("1"/"true"/"yes"/"on") and is case- and whitespace-insensitive. Used by the
+// CITADEL_NO_AUTO_UPDATE opt-out.
+func IsTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// IsReleaseVersion reports whether v is a real, installable release version
+// (a parseable semver, with or without a leading "v"), as opposed to a
+// locally-built "dev" binary or an unset/empty version. The automatic update
+// *install* paths use this to avoid clobbering a hand-copied dev binary that a
+// developer is actively testing. It deliberately does NOT gate the explicit
+// `citadel update` command, which is an intentional user action and must be
+// able to update any binary.
+func IsReleaseVersion(v string) bool {
+	s := strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if s == "" || s == "dev" {
+		return false
+	}
+	_, err := version.NewVersion(s)
+	return err == nil
+}
+
+// ShouldAutoInstall reports whether an automatic update *install* should
+// proceed for a process running currentVersion, given the --no-auto-update
+// flag state and the raw CITADEL_NO_AUTO_UPDATE environment value. It returns
+// false when the user has opted out (flag set or truthy env) OR when
+// currentVersion is not a real release tag (e.g. a locally-built "dev"
+// binary). This is the single decision the startup and periodic auto-update
+// paths share; the explicit `citadel update` command does not consult it.
+func ShouldAutoInstall(currentVersion string, noAutoUpdateFlag bool, noAutoUpdateEnv string) bool {
+	if noAutoUpdateFlag || IsTruthy(noAutoUpdateEnv) {
+		return false
+	}
+	return IsReleaseVersion(currentVersion)
+}
+
 // getDownloadURL constructs the download URL for the current platform
 func (c *Client) getDownloadURL(release *Release) string {
 	binaryName := c.getBinaryArchiveName(release)

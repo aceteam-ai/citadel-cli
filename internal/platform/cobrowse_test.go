@@ -174,6 +174,48 @@ func TestBuildChromeArgs_SoftwareGL(t *testing.T) {
 	}
 }
 
+// TestBuildChromeArgs_PasswordStoreBasic checks --password-store=basic is emitted
+// only when passwordStoreBasic is set. The meeting bot sets it so its persistent,
+// externally-seeded profile uses Chromium's build-independent os_crypt key
+// instead of a keyring secret; co-browse leaves it off to keep keyring-backed
+// persistent logins.
+func TestBuildChromeArgs_PasswordStoreBasic(t *testing.T) {
+	on := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, passwordStoreBasic: true})
+	if !containsArg(on, "--password-store=basic") {
+		t.Errorf("passwordStoreBasic on: missing --password-store=basic in %v", on)
+	}
+	off := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
+	if containsArg(off, "--password-store=basic") {
+		t.Errorf("passwordStoreBasic off: --password-store=basic must be absent in %v", off)
+	}
+	// Default co-browse launch options (as constructed in Start) must NOT enable it.
+	cobrowseLike := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, softwareGL: true})
+	if containsArg(cobrowseLike, "--password-store=basic") {
+		t.Errorf("co-browse default: --password-store=basic must be absent in %v", cobrowseLike)
+	}
+}
+
+// TestBuildChromeArgs_AutoplayNoUserGesture checks
+// --autoplay-policy=no-user-gesture-required is emitted only when the option is
+// set. The meeting bot sets it so Chrome plays incoming (WebRTC) call audio into
+// the recorder's sink instead of recording silence (issue #5098); co-browse
+// leaves it off since a human drives it and supplies the gesture.
+func TestBuildChromeArgs_AutoplayNoUserGesture(t *testing.T) {
+	on := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, autoplayNoUserGesture: true})
+	if !containsArg(on, "--autoplay-policy=no-user-gesture-required") {
+		t.Errorf("autoplayNoUserGesture on: missing --autoplay-policy=no-user-gesture-required in %v", on)
+	}
+	off := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
+	if containsArg(off, "--autoplay-policy=no-user-gesture-required") {
+		t.Errorf("autoplayNoUserGesture off: --autoplay-policy must be absent in %v", off)
+	}
+	// Default co-browse launch options must NOT enable it.
+	cobrowseLike := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, softwareGL: true})
+	if containsArg(cobrowseLike, "--autoplay-policy=no-user-gesture-required") {
+		t.Errorf("co-browse default: --autoplay-policy must be absent in %v", cobrowseLike)
+	}
+}
+
 // TestResolveCobrowseDisplay checks the display-mode precedence: a dedicated
 // managed Xvfb by default, an operator-pinned display when EnvCobrowseDisplay is
 // set (trimmed).

@@ -1,0 +1,4 @@
+# HTTP wrapper deps for the headless Claude Code runtime. CPU-only, tiny: the
+# model runs remotely via the fabric proxy, so there is no ML stack here.
+fastapi==0.115.6
+uvicorn==0.34.0

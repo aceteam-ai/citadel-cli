@@ -1,6 +1,8 @@
 package services
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -168,6 +170,22 @@ func TestDiffusersHostPortNonColliding(t *testing.T) {
 			t.Errorf("diffusers host port 8102 collides with the TEI embedding service (#415)")
 		case p >= 8100 && p <= 8199:
 			t.Errorf("diffusers host port %d is inside the 8100-8199 range reserved by other services and internal/apps auto-allocation (#415)", p)
+		}
+	}
+}
+
+// TestKnownComposeHashesCoverCurrentTemplates verifies the generated
+// KnownComposeHashes allowlist includes the sha256 of every CURRENT embedded
+// template. This is the bootstrap safety net for pre-#426 nodes: a node freshly
+// materialized by this binary but carrying no .citadel-managed.json stamp must
+// be recognized as citadel-written (so the re-materialization sweep does not
+// mis-flag it as operator-edited). If this fails, regenerate known_hashes.go.
+func TestKnownComposeHashesCoverCurrentTemplates(t *testing.T) {
+	for name, content := range ServiceMap {
+		sum := sha256.Sum256([]byte(content))
+		h := hex.EncodeToString(sum[:])
+		if !KnownComposeHashes[name][h] {
+			t.Errorf("KnownComposeHashes[%q] is missing the current template hash %s; regenerate services/known_hashes.go", name, h)
 		}
 	}
 }

@@ -177,6 +177,19 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	}
 
 	// Attempt 2: clear state and connect from scratch (new IP/hostname).
+	//
+	// THIS IS THE IDENTITY-CHURN PATH. Reaching here means the persisted machine
+	// identity in tailscaled.state could not be re-authorized even with a fresh
+	// authkey — so we are about to discard it and register as a brand-new node.
+	// That mints a new fabric/Headscale node id, a new mesh IP, and (on the
+	// backend) a new device key. The usual root cause is an EPHEMERAL Headscale
+	// registration: when the node went offline, Headscale removed the ephemeral
+	// node, so the persisted machine key no longer maps to any node and only a
+	// fresh registration succeeds. The durable fix is backend PR #4584 (register
+	// non-ephemerally) so an offline node is never removed; see aceteam #4583.
+	// Warn loudly so this is diagnosable in the field rather than silent.
+	warnIdentityChurn(hostname)
+
 	// Before clearing, reclaim the stale Headscale node so the dashboard
 	// doesn't accumulate duplicate entries on every restart (issue #246).
 	if deviceConfig.DeviceAPIToken != "" && hostname != "" {
@@ -205,6 +218,24 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	return VPNRecoveryResult{
 		Err: fmt.Errorf("all recovery attempts failed: %w", connectErr),
 	}
+}
+
+// warnIdentityChurn emits a prominent, structured warning that the node is about
+// to lose its persisted identity and re-register as a new node. This is the
+// symptom of an ephemeral Headscale registration (the node was removed while
+// offline); the durable fix is non-ephemeral registration (backend #4584 /
+// aceteam #4583). Surfacing it loudly makes the churn diagnosable in the field
+// instead of a silent id/IP/device-key change.
+func warnIdentityChurn(hostname string) {
+	Log("IDENTITY CHURN: reusing persisted identity failed; re-registering '%s' as a NEW node "+
+		"(new fabric id + new mesh IP + new device key). Likely cause: ephemeral Headscale "+
+		"registration removed the node while offline. Durable fix: non-ephemeral registration "+
+		"(aceteam #4583 / backend #4584). One-time migration: re-run 'citadel init' so this node "+
+		"re-registers with a persistent key.", hostname)
+	fmt.Fprintln(os.Stderr, "   - WARNING: node identity is being reset (new node id, new IP, new device key).")
+	fmt.Fprintln(os.Stderr, "     Cause: the persisted identity could not be re-authorized (likely an ephemeral")
+	fmt.Fprintln(os.Stderr, "     registration removed while offline). This node will keep working but appears as a")
+	fmt.Fprintln(os.Stderr, "     new node. To stop recurring churn, re-run 'citadel init' to re-register persistently.")
 }
 
 func init() {

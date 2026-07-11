@@ -31,6 +31,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/teamchat"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
@@ -39,6 +40,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/internal/workflow"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -241,7 +244,10 @@ func runControlCenter() {
 		// longer shows a permanent "device authorization required" status.
 		Chat:               buildChatConfig(),
 		ChatConfigProvider: buildChatConfig,
-		Proxmox:            buildProxmoxConfig(),
+
+		TeamChat:               buildTeamChatConfig(),
+		TeamChatConfigProvider: buildTeamChatConfig,
+		Proxmox:                buildProxmoxConfig(),
 		Settings: controlcenter.SettingsCallbacks{
 			LoadTelemetry: func() *config.Telemetry {
 				return config.LoadTelemetry(platform.ConfigDir())
@@ -268,6 +274,12 @@ func runControlCenter() {
 			},
 			SaveRendering: func(r *config.Rendering) error {
 				return config.SaveRendering(platform.ConfigDir(), r)
+			},
+			LoadMeeting: func() *config.Meeting {
+				return config.LoadMeeting(platform.ConfigDir())
+			},
+			SaveMeeting: func(m *config.Meeting) error {
+				return config.SaveMeeting(platform.ConfigDir(), m)
 			},
 			// SetFullscreenEnabled is intentionally left nil: tview cannot swap the
 			// terminal's alternate-screen mode on a running app. Today the toggle only
@@ -346,9 +358,15 @@ func runControlCenter() {
 							cc.AddActivity("success", "VPN reconnected (IP preserved)")
 							networkConnected = true
 						} else {
-							// Clear state and connect fresh (new IP)
-							_ = network.ClearState()
+							// Clear state and connect fresh (new IP) — IDENTITY-CHURN
+							// path. Warn loudly (same reasoning as recoverStaleVPN): the
+							// persisted identity could not be re-authorized, so the node
+							// re-registers with a new id/IP/device key. Root cause is
+							// usually ephemeral registration; durable fix is #4584/#4583.
 							hostname, _ := os.Hostname()
+							warnIdentityChurn(hostname)
+							cc.AddActivity("warning", "Node identity reset (new id/IP); re-run 'citadel init' to stop churn")
+							_ = network.ClearState()
 							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
 							config := network.ServerConfig{
 								Hostname:   hostname,
@@ -1046,6 +1064,30 @@ func buildChatConfig() controlcenter.ChatPageConfig {
 	}
 }
 
+// buildTeamChatConfig constructs TeamChatPageConfig for the Team Chat page.
+// The credential chain mirrors `citadel mcp`: ACETEAM_API_KEY env var, then
+// the aceteam_api_key config.yaml field, then the device token. The device
+// token is currently scope-denied on Team Chat routes (the page renders
+// setup guidance in that case) — see aceteam-ai/citadel-cli#495.
+func buildTeamChatConfig() controlcenter.TeamChatPageConfig {
+	apiBaseURL := authServiceURL
+	var configKey, deviceToken string
+	if deviceConfig := getDeviceConfigFromFile(); deviceConfig != nil {
+		if deviceConfig.APIBaseURL != "" {
+			apiBaseURL = deviceConfig.APIBaseURL
+		}
+		configKey = deviceConfig.AceteamAPIKey
+		deviceToken = deviceConfig.DeviceAPIToken
+	}
+
+	token, source := teamchat.ResolveToken(os.Getenv("ACETEAM_API_KEY"), configKey, deviceToken)
+	return controlcenter.TeamChatPageConfig{
+		APIBaseURL:  apiBaseURL,
+		Token:       token,
+		TokenSource: source,
+	}
+}
+
 // getOrgIDFromConfig gets the organization ID from manifest or device config
 func getOrgIDFromConfig() string {
 	// Try manifest first
@@ -1171,7 +1213,8 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			if _, err := os.Stat(fullComposePath); err == nil {
-				psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "ps", "--format", "json")
+				psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
+				psCmd := composeCommand(psArgs...)
 				if output, err := psCmd.Output(); err == nil {
 					var containers []struct {
 						State  string `json:"State"`
@@ -1335,11 +1378,13 @@ func ccStartService(name string) error {
 			// Include the least-privilege sandbox override when present so a
 			// TUI-installed untrusted module also starts hardened here (the
 			// override would otherwise be bypassed by this start site).
-			args := []string{"compose"}
-			args = append(args, composeFileArgs(fullComposePath, fullComposePath)...)
-			args = append(args, "-p", "citadel-"+name, "up", "-d")
-			cmd := exec.Command("docker", args...)
-			return cmd.Run()
+			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
+			composeArgs = append(composeArgs, "-p", "citadel-"+name, "up", "-d")
+			// composeCommand injects the citadel-owned host ports so the
+			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
+			// start button dies for llamacpp/vllm/extraction/diffusers on
+			// v2.57.0 (#426).
+			return composeCommand(composeArgs...).Run()
 		}
 	}
 
@@ -1356,7 +1401,8 @@ func ccStopService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "down")
+			downArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "down")
+			cmd := composeCommand(downArgs...)
 			return cmd.Run()
 		}
 	}
@@ -1374,7 +1420,8 @@ func ccRestartService(name string) error {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "restart")
+			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "restart")
+			cmd := composeCommand(restartArgs...)
 			return cmd.Run()
 		}
 	}
@@ -1397,7 +1444,8 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 			}
 
 			// Get container info via docker compose ps
-			psCmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "ps", "--format", "json")
+			psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "ps", "--format", "json")
+			psCmd := composeCommand(psArgs...)
 			if output, err := psCmd.Output(); err == nil {
 				var container struct {
 					ID      string `json:"ID"`
@@ -1438,7 +1486,8 @@ func ccGetServiceLogs(name string) ([]string, error) {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			cmd := exec.Command("docker", "compose", "-f", fullComposePath, "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			logArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			cmd := composeCommand(logArgs...)
 			output, err := cmd.Output()
 			if err != nil {
 				return nil, err
@@ -1639,6 +1688,28 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 
+	// Detect a dedicated `citadel work` worker already serving this node. If one
+	// holds the single-instance lock (issues #443/#435/#455), the control center
+	// MUST NOT compete for this node's jobs: two consumers in the same consumer
+	// group split the per-node stream non-deterministically, so node-targeted
+	// privileged jobs (WHATSAPP_PROVISION, AGENT_UPDATE) were randomly grabbed by
+	// the control-center worker and failed with "no handler" even though the real
+	// worker's binary handles them (the competing-consumer incident). When a worker
+	// is present the control center stays a read-only monitor (heartbeat/telemetry
+	// only) and lets the real worker own all job consumption.
+	//
+	// Detection is a one-shot at TUI-worker startup: the systemd worker is normally
+	// already running before the TUI opens. If a worker starts or stops later the
+	// mode is not re-evaluated until the TUI worker restarts, but that residual is
+	// benign — the "no handler" hazard is removed unconditionally by the shared
+	// handler set below (both modes register WHATSAPP_PROVISION / AGENT_UPDATE), so a
+	// transient double-consumer only reproduces the pre-existing split, never a job
+	// failure. A worker that later dies is systemd-restarted (re-taking the lock).
+	workerHeld, workerPID := worklock.IsHeld(network.GetStateDir())
+	if workerHeld {
+		activity("info", fmt.Sprintf("Dedicated worker detected (PID %d); control center runs in monitor-only mode (no job consumption)", workerPID))
+	}
+
 	// Determine job source mode
 	var source worker.JobSource
 	var streamFactory func(job *worker.Job) worker.StreamWriter
@@ -1705,7 +1776,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			headscaleNodeID = id
 		}
 	}
-	if headscaleNodeID != "" {
+	// Only subscribe to the per-node stream when NO dedicated worker holds the lock.
+	// If a worker is present it owns the per-node stream; a second subscriber here
+	// would re-introduce the competing-consumer split.
+	if workerHeld {
+		activity("info", "Per-node stream owned by the dedicated worker; control center does not subscribe")
+	} else if headscaleNodeID != "" {
 		perNodeOrgID := ""
 		if deviceConfig != nil {
 			perNodeOrgID = deviceConfig.OrgID
@@ -1819,21 +1895,50 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 
+	// If a dedicated worker holds the lock, the control center does NOT run a
+	// job-consuming runner (that is the whole point of the fix). Heartbeat and
+	// telemetry are already wired above; block here in monitor-only mode until the
+	// TUI context is cancelled, letting the real worker own all job consumption.
+	if workerHeld {
+		activity("success", "Monitor mode active (dedicated worker owns jobs)")
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	// No dedicated worker on this node: the control center IS the only worker, so it
+	// must handle the FULL node-job set (legacy + workflow + AGENT_UPDATE +
+	// WHATSAPP_PROVISION), not a subset. Build handlers via the shared helper so the
+	// registered set matches `citadel work` exactly and WHATSAPP_PROVISION /
+	// AGENT_UPDATE never fail with "no handler" in a control-center-only run.
+
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])
 
 	// Create handlers with activity callback to route job output through TUI.
 	wsDir := resolveWorkspaceDir()
 	ccPerms := config.LoadPermissions(platform.ConfigDir())
-	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
-		LogFn:         activity,
-		WorkspaceDir:  wsDir,
-		ShellDisabled: !ccPerms.Shell,
+
+	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
+	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
+		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
 	})
+
+	_, ccConfigDir, _ := findAndReadManifest()
+	nodeJobOpts := nodeJobHandlerOpts{
+		LogFn:                     activity,
+		WorkspaceDir:              wsDir,
+		ConfigDir:                 ccConfigDir,
+		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
+		ShellDisabled:             !ccPerms.Shell,
+		WorkflowExec:              ccWfExec,
+		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
+	}
+	handlers := buildNodeJobHandlers(nodeJobOpts)
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{
 		WorkerID:     workerID,
+		NodeID:       headscaleNodeID,
 		AgentVersion: Version,
 		Verbose:      false,
 		ActivityFn:   activity, // Route logs through TUI
@@ -1848,6 +1953,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		runner.WithStreamWriterFactory(streamFactory)
 	}
 
+	// Register the node-targeted privileged handlers (AGENT_UPDATE, WHATSAPP_PROVISION)
+	// on the live runner, shared with runWork. This closes the "no handler" hazard for
+	// a control-center-only node.
+	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+
 	activity("success", "Worker started, listening for jobs...")
 
 	// Run the worker (blocks until context is cancelled)
@@ -1857,6 +1967,14 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 // ccAutoUpdate checks for updates and auto-updates if available.
 // Returns true if the binary was updated (caller should restart).
 func ccAutoUpdate() bool {
+	// Never auto-install when the user opted out (--no-auto-update /
+	// CITADEL_NO_AUTO_UPDATE) or when this is a locally-built dev binary: a
+	// hand-copied dev/test binary must not silently replace itself with a
+	// release before it can be exercised. Explicit `citadel update` still works.
+	if !autoUpdateAllowed() {
+		return false
+	}
+
 	// Check for updates
 	spinner := whimsy.NewSimpleSpinner([]string{"Checking for updates..."})
 	spinner.Start()

@@ -833,3 +833,242 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.56.0 release
 
 
+---
+
+## v2.58.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 11 |
+| Lines added | +1061 |
+
+**Changes:**
+
+  - fix(services): re-materialize citadel-owned composes on version change (#426) (#430)
+
+
+---
+
+## v2.59.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +379 |
+
+**Changes:**
+
+  - fix(whatsapp): resolve bridge container by compose project, not hardcoded name (#437)
+
+
+---
+
+## v2.60.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 14 |
+| Lines added | +1094 |
+
+**Changes:**
+
+  - fix(whatsapp): auto-select a free host port for the bridge (#438) (#440)
+  - feat(node): renew Headscale node key while online + harden no-authkey reconnect (#4583) (#435)
+
+
+---
+
+## v2.62.0 — 2026-07-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 17 |
+| Lines added | +770 |
+
+**Changes:**
+
+  - fix(worker): in-process backoff on Redis-API connect, honor 429 (#443) (#444)
+  - chore: sync generated files after v2.61.0 release
+
+
+---
+
+## v2.63.0 — 2026-07-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1235 |
+
+**Changes:**
+
+  - fix(worker): single-instance guard + loud identity-churn warning (#443, #435) (#446)
+  - fix(update): re-materialize managed systemd units on upgrade (#444/#426) (#445)
+
+
+---
+
+## v2.64.0 — 2026-07-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 16 |
+| Lines added | +2288 |
+
+**Changes:**
+
+  - fix(gateway): registry-driven exposure of provisioned modules on the tsnet mesh (#447) (#448)
+
+
+---
+
+## v2.66.0 — 2026-07-07
+
+| Metric | Value |
+|--------|-------|
+| Commits | 11 |
+| Files changed | 34 |
+| Lines added | +3197 |
+
+**Changes:**
+
+  - fix(services): launch SERVICE_START extended instance payloads (#462) (#463)
+  - node: provision fabric CA bundle for mTLS control listener (#5028)
+  - control-listener failure must not tear down the read-only status server (#5028)
+  - tests: coordinator mTLS gate + fail-closed plaintext SSH path (#5028)
+  - gate SSH-key injection behind coordinator mTLS control listener (#5028)
+  - fix: route claudecode module host port through the host-port registry (#460)
+  - ci: build+push claudecode-service image to GHCR (#459)
+  - fix: stop control center competing for per-node jobs (#456) (#457)
+  - fix(worklock): reused-PID liveness check + richer lock record (#455)
+  - fix: only warn about WHATSAPP_ALLOW_PRIVATE_NETWORK for non-mesh private hosts (#451)
+  - chore: sync generated files after v2.65.0 release
+
+
+---
+
+## v2.67.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 34 |
+| Lines added | +2244 |
+
+**Changes:**
+
+  - fix(desktop): resolve active X display + XAUTHORITY for computer-use (screenshot/input/H.264) (#481)
+  - feat(jobs): INSTANCE_MESSAGE handler for BYOC turn delivery (#480)
+  - fix: auto-update opt-out + dev binary no longer self-installs (#473) (#477)
+  - fix(transcribe): fail fast when whisper sidecar is unreachable (#476)
+  - fix(whisper-service): add missing requests dependency (#475)
+  - feat(storage): citadel storage start|status|stop backed by VersityGW (#474)
+  - feat(jobs): optional runtime field in inline SERVICE_START spec (#471)
+  - ci(whisper-service): build + publish image to GHCR (#465) (#467)
+
+
+---
+
+## v2.68.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 12 |
+| Lines added | +322 |
+
+**Changes:**
+
+  - feat(desktop): auto-start loopback VNC when desktop enabled (#483) (#484)
+  - Merge pull request #479 from aceteam-ai/feat/livekit-support
+  - fix: pass install-time <name>.env to every service compose invocation
+  - feat: reserve livekit ports + host-network payload launches
+
+
+---
+
+## v2.71.0 — 2026-07-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 125 |
+| Lines added | +3123 |
+
+**Changes:**
+
+  - fix(meeting): gate browser-launch integration test behind opt-in env (#494)
+  - fix(meeting): subscribe nodes to org-scoped meeting queue (aceteam#5098) (#485)
+  - feat(meeting-bot): persistent signed-in Chrome profile for the meeting bot (#5122) (#478)
+  - feat(meeting-bot): MEETING_JOIN handler + audio capture + meeting capability (#5098) (#464)
+  - chore: sync generated files after v2.70.0 release
+
+
+---
+
+## v2.71.1 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 17 |
+| Lines added | +1978 |
+
+**Changes:**
+
+  - feat(tui): Team Chat tab — real AceTeam org channels in the Control Center (#498)
+  - fix(meeting): pin meeting browser to --password-store=basic for stable cookie crypto (#496)
+  - revert: remove orphaned mirror-livekit-image workflow (#492) (#493)
+
+
+---
+
+## v2.71.2 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +239 |
+
+**Changes:**
+
+  - fix(meeting): poll for interstitial dismissal + join button instead of single-shot click (#499)
+
+
+---
+
+## v2.71.3 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +89 |
+
+**Changes:**
+
+  - fix(meeting): treat host auto-admit (in-call toolbar) as join success (#500)
+
+
+---
+
+## v2.71.4 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 4 |
+| Lines added | +53 |
+
+**Changes:**
+
+  - fix(meeting): play remote call audio by relaxing Chrome autoplay policy (#5098) (#503)
+
+

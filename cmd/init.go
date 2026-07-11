@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -85,6 +87,13 @@ and system user configuration (requires sudo).`,
 		Debug("auth-service: %s", authServiceURL)
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())
+
+		// Establish the node's cryptographic identity (EC P-256 keypair) and
+		// best-effort cache the fabric CA trust chain. Prerequisite for mTLS
+		// self-reenrollment (P2, #4583). Fully fail-open: any error here is
+		// logged at debug and init proceeds exactly as before — a node with no
+		// CA/cert must pair and run identically to today.
+		ensureNodeIdentity(authServiceURL)
 
 		// Handle --relogin: force fresh authentication while preserving network identity
 		// We disconnect but keep tsnet state (machine key) to preserve IP address
@@ -1556,6 +1565,41 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 		fmt.Printf("   Reclaimed stale node '%s' (previous registration cleaned up)\n", hostname)
 	}
 	Debug("reclaim result: %s", result.Message)
+}
+
+// ensureNodeIdentity establishes the node's cryptographic identity (PR-0 of P2,
+// #4583): it ensures an EC P-256 keypair exists on disk (0600, never
+// transmitted) and best-effort caches the public fabric CA trust chain.
+//
+// Idempotent: on re-run it loads the existing key rather than rotating it, so a
+// node keeps a stable identity across `citadel init` invocations.
+//
+// Fully fail-open. The backend fabric CA is not activated fleet-wide yet, so
+// every failure path here is logged at debug and swallowed — a node with no
+// key, no CA, or a hung CA endpoint pairs and runs exactly as it does today.
+// The stored key + chain only become load-bearing once P2's mTLS self-reenroll
+// lands and consumes them.
+func ensureNodeIdentity(baseURL string) {
+	store := nodeidentity.Default()
+
+	if _, err := store.GetOrCreateKey(); err != nil {
+		// Non-fatal: a node without an identity key simply pairs with an authkey
+		// as before. Do NOT os.Exit — this must never block init.
+		Debug("node identity keypair unavailable (non-fatal): %v", err)
+		return
+	}
+	Debug("node identity key ready at %s", store.KeyPath())
+
+	// Fetch the public CA chain with a short timeout so a hung endpoint never
+	// stalls the init happy path. 503 (CA not activated) degrades silently.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 5 * time.Second}
+	if err := store.FetchCAChain(ctx, baseURL, client); err != nil {
+		Debug("fabric CA chain fetch skipped (non-fatal): %v", err)
+		return
+	}
+	Debug("fabric CA chain cached at %s", store.CAChainPath())
 }
 
 type DockerPsResult struct {

@@ -624,3 +624,17 @@ func intFromOutput(m map[string]any, key string) int64 {
 func (r *Runner) RegisterHandler(handler JobHandler) {
 	r.handlers = append(r.handlers, handler)
 }
+
+// CanHandle reports whether any registered handler can process jobType. It is the
+// runner-level view of dispatchability, used by callers and tests to assert the
+// registered handler set covers a given job type (e.g. WHATSAPP_PROVISION /
+// AGENT_UPDATE must be present on both the dedicated worker and a control-center-only
+// worker).
+func (r *Runner) CanHandle(jobType string) bool {
+	for _, h := range r.handlers {
+		if h.CanHandle(jobType) {
+			return true
+		}
+	}
+	return false
+}
