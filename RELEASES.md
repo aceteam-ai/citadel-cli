@@ -1042,3 +1042,18 @@ Auto-generated log of every release.
   - fix(meeting): poll for interstitial dismissal + join button instead of single-shot click (#499)
 
 
+---
+
+## v2.71.3 — 2026-07-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +89 |
+
+**Changes:**
+
+  - fix(meeting): treat host auto-admit (in-call toolbar) as join success (#500)
+
+
