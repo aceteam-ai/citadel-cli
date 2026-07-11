@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
+	"github.com/aceteam-ai/citadel-cli/internal/resmon"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 )
 
@@ -213,6 +214,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
+	mux.HandleFunc("/resources", s.handleResources)
 
 	// Publish the gateway's self-signed leaf cert so the backend can trust it
 	// out-of-band (and re-fetch on rotation). Served unauthenticated over the
@@ -415,6 +417,27 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"services": status.Services,
 	})
+}
+
+// handleResources returns the full resource-consumer snapshot: every GPU
+// compute process (managed and unmanaged), attributed VRAM/RSS, and a
+// reclaimable flag for heavy-idle unmanaged consumers (issue #427). This is
+// what lets the fabric answer "is this node's GPU actually free?" without SSH,
+// including the leftover test/dev services (#421's tei-gte leftover) that
+// citadel doesn't own and previously couldn't see.
+// GET /resources
+func (s *Server) handleResources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+	defer cancel()
+	snapshot := resmon.Collect(ctx)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snapshot)
 }
 
 // handlePing returns a lightweight pong response for health checks.

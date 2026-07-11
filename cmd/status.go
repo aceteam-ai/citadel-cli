@@ -16,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/resmon"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/dashboard"
 	"github.com/fatih/color"
@@ -104,6 +105,9 @@ func runStandardStatus() {
 
 	headerColor.Fprintln(w, "\n💎 GPU STATUS")
 	printGPUInfo(w)
+
+	headerColor.Fprintln(w, "\n🧮 RESOURCE CONSUMERS")
+	printResourcesInfo(w)
 
 	headerColor.Fprintln(w, "\n🔧 CAPABILITIES")
 	printCapabilities(w, manifest)
@@ -427,6 +431,57 @@ func printGPUInfo(w *tabwriter.Writer) {
 		if gpu.Driver != "" {
 			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Driver"), gpu.Driver)
 		}
+	}
+}
+
+// printResourcesInfo lists every GPU compute consumer on the node — managed and
+// unmanaged alike — with its owner and a reclaimable flag (issue #427). This is
+// the operator-facing view of the same snapshot the fabric pulls via /resources
+// and the RESOURCE_SNAPSHOT job: leftover test/dev services that silently pin
+// the GPU (the tei-gte leftover found on node 1054) show up here labeled "not
+// managed by citadel", so an operator can free them by hand.
+func printResourcesInfo(w *tabwriter.Writer) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	// Pass manifest-declared service names so a managed service running under a
+	// bare (non-"citadel-"-prefixed) name is classified as managed, not flagged
+	// reclaimable. The CLI has the manifest in hand; the server/job paths don't.
+	var managedNames []string
+	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
+		for _, svc := range manifest.Services {
+			managedNames = append(managedNames, svc.Name)
+		}
+	}
+	snap := resmon.CollectWithManaged(ctx, managedNames)
+
+	if !snap.HasGPU {
+		fmt.Fprintln(w, "  GPU:\tNo GPU / nvidia-smi unavailable — no GPU consumers to report.")
+		return
+	}
+
+	fmt.Fprintf(w, "  %s:\t%s / %s used\n", labelColor.Sprint("GPU Memory"),
+		formatBytes(snap.GPU.UsedBytes), formatBytes(snap.GPU.TotalBytes))
+
+	if len(snap.Consumers) == 0 {
+		fmt.Fprintf(w, "  %s\n", goodColor.Sprint("No GPU compute processes — GPU is free."))
+		return
+	}
+
+	for _, c := range snap.Consumers {
+		ownerStr := c.Owner
+		switch c.Kind {
+		case resmon.OwnerCitadelManaged:
+			ownerStr = goodColor.Sprint(c.Owner)
+		case resmon.OwnerContainer, resmon.OwnerHost:
+			ownerStr = warnColor.Sprint(c.Owner)
+		}
+		line := fmt.Sprintf("  - PID %d (%s):\tVRAM %s  RAM %s", c.PID, ownerStr,
+			formatBytes(c.VRAMBytes), formatBytes(c.RSSBytes))
+		if c.Reclaimable {
+			line += "  " + badColor.Sprintf("⚠️ reclaimable — %s", c.Reason)
+		}
+		fmt.Fprintln(w, line)
 	}
 }
 

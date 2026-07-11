@@ -137,6 +137,7 @@ const (
 	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
 	JobTypeAgentUpdate       = "AGENT_UPDATE"        // Remotely update + restart this node's own citadel agent (aceteam#4427)
 	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION"  // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
+	JobTypeResourceSnapshot  = "RESOURCE_SNAPSHOT"   // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
 	JobTypeInstanceMessage   = "INSTANCE_MESSAGE"    // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet         = "MODULE_SET"          // Set the desired state of a single module on this node (interim, aceteam#5280)
 	JobTypeMeetingJoin       = "MEETING_JOIN"        // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
@@ -186,6 +187,7 @@ var allKnownJobTypes = []string{
 	JobTypeTranscribeAudio,
 	JobTypeAgentUpdate,
 	JobTypeWhatsAppProvision,
+	JobTypeResourceSnapshot,
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
 	JobTypeMeetingJoin,
