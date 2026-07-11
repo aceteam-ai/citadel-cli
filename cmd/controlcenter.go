@@ -31,6 +31,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/teamchat"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
 	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
@@ -243,7 +244,10 @@ func runControlCenter() {
 		// longer shows a permanent "device authorization required" status.
 		Chat:               buildChatConfig(),
 		ChatConfigProvider: buildChatConfig,
-		Proxmox:            buildProxmoxConfig(),
+
+		TeamChat:               buildTeamChatConfig(),
+		TeamChatConfigProvider: buildTeamChatConfig,
+		Proxmox:                buildProxmoxConfig(),
 		Settings: controlcenter.SettingsCallbacks{
 			LoadTelemetry: func() *config.Telemetry {
 				return config.LoadTelemetry(platform.ConfigDir())
@@ -1057,6 +1061,30 @@ func buildChatConfig() controlcenter.ChatPageConfig {
 		OrgID:      orgID,
 		NodeID:     nodeID,
 		NodeName:   nodeName,
+	}
+}
+
+// buildTeamChatConfig constructs TeamChatPageConfig for the Team Chat page.
+// The credential chain mirrors `citadel mcp`: ACETEAM_API_KEY env var, then
+// the aceteam_api_key config.yaml field, then the device token. The device
+// token is currently scope-denied on Team Chat routes (the page renders
+// setup guidance in that case) — see aceteam-ai/citadel-cli#495.
+func buildTeamChatConfig() controlcenter.TeamChatPageConfig {
+	apiBaseURL := authServiceURL
+	var configKey, deviceToken string
+	if deviceConfig := getDeviceConfigFromFile(); deviceConfig != nil {
+		if deviceConfig.APIBaseURL != "" {
+			apiBaseURL = deviceConfig.APIBaseURL
+		}
+		configKey = deviceConfig.AceteamAPIKey
+		deviceToken = deviceConfig.DeviceAPIToken
+	}
+
+	token, source := teamchat.ResolveToken(os.Getenv("ACETEAM_API_KEY"), configKey, deviceToken)
+	return controlcenter.TeamChatPageConfig{
+		APIBaseURL:  apiBaseURL,
+		Token:       token,
+		TokenSource: source,
 	}
 }
 

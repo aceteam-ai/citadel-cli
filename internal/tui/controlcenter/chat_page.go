@@ -176,8 +176,10 @@ func (p *ChatPage) currentAPIBaseURL() string {
 // Name implements Page.
 func (p *ChatPage) Name() string { return "chat" }
 
-// Title implements Page.
-func (p *ChatPage) Title() string { return "Chat" }
+// Title implements Page. "Node Chat" distinguishes this ephemeral
+// node-to-node pub/sub chat from the TeamChatPage, which mirrors the AceTeam
+// Team Chat product surface (issue #495).
+func (p *ChatPage) Title() string { return "Node Chat" }
 
 // Build implements Page. Constructs the split-pane chat layout.
 func (p *ChatPage) Build(app *tview.Application) tview.Primitive {
