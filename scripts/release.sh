@@ -129,9 +129,17 @@ hook_artifact() {
 }
 
 hook_post_release() {
+  local new_version
+  new_version="$(read_state "target_version" 2>/dev/null || true)"
   info "Next steps:"
   echo "  1. Update Homebrew tap with new version + checksums"
   echo "  2. Citadel OS will pick up the new CLI version on next ISO build"
+  echo "  3. ACTION REQUIRED - bump the fleet 'latest' marker or 'outdated'"
+  echo "     detection goes stale. fleet_node_versions compares each node against"
+  echo "     CITADEL_LATEST_VERSION, an env var on the aceteam.ai 'python-mcp'"
+  echo "     Railway service (NOT auto-derived). Until you bump it, nodes behind"
+  echo "     ${RELEASE_TAG_PREFIX}${new_version} are not flagged. From the aceteam repo (railway-linked):"
+  echo "       railway variables --service python-mcp --set \"CITADEL_LATEST_VERSION=${RELEASE_TAG_PREFIX}${new_version}\""
 }
 
 # ── Load engine and run ────────────────────────────────────────────────────

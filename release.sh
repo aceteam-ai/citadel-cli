@@ -420,4 +420,9 @@ else
     echo "Next steps:"
     echo "  1. Review the release notes and edit if needed"
     echo "  2. Announce the release to your team"
+    echo "  3. ACTION REQUIRED - bump the fleet 'latest' marker or fleet_node_versions"
+    echo "     'outdated' detection goes stale. CITADEL_LATEST_VERSION is an env var on"
+    echo "     the aceteam.ai 'python-mcp' Railway service (NOT auto-derived). Until you"
+    echo "     bump it, nodes behind $VERSION are not flagged. From the aceteam repo:"
+    echo "       railway variables --service python-mcp --set \"CITADEL_LATEST_VERSION=$VERSION\""
 fi
