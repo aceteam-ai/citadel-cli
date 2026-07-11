@@ -301,6 +301,40 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 	})
 }
 
+// StopServiceByName stops a manifest-declared or embedded managed service by
+// its logical name, without a remote job. It is the programmatic entry point
+// used by the config-gated auto-stop-when-idle reconciler (citadel #416): the
+// reconciler decides WHAT to evict; this reuses the same compose "down" path a
+// SERVICE_STOP job would take so there is one stop implementation. A service
+// absent from the manifest and not embedded is reported as an error (the
+// reconciler logs and moves on). A service that is already stopped is a no-op.
+func (h *ServiceHandler) StopServiceByName(name string) error {
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to load manifest: %w", err)
+	}
+	svc, ok := h.findService(manifest, name)
+	if !ok {
+		if _, embedded := embeddedservices.ServiceMap[name]; !embedded {
+			return fmt.Errorf("service %q not found in manifest", name)
+		}
+		svc, err = h.materializeEmbeddedService(name)
+		if err != nil {
+			return fmt.Errorf("failed to reconcile embedded service %q: %w", name, err)
+		}
+	}
+	// Silent JobContext: there is no remote job to report progress against.
+	res, err := h.serviceStop(JobContext{LogFn: func(string, string) {}}, svc)
+	if err != nil {
+		return err
+	}
+	var parsed serviceResult
+	if json.Unmarshal(res, &parsed) == nil && parsed.Error != "" {
+		return fmt.Errorf("%s", parsed.Error)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

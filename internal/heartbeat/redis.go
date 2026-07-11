@@ -82,6 +82,17 @@ type RedisPublisher struct {
 
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
+
+	// onStatus, when set, is invoked with each freshly collected status after a
+	// successful publish, driving the config-gated auto-stop reconciler off the
+	// heartbeat's existing collection (citadel #416). Optional; nil by default.
+	onStatus func(*status.NodeStatus)
+}
+
+// SetOnStatus registers a callback invoked with each collected status. Used to
+// drive the config-gated auto-stop-when-idle reconciler (citadel #416).
+func (p *RedisPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
+	p.onStatus = fn
 }
 
 // RedisPublisherConfig holds configuration for the Redis status publisher.
@@ -230,6 +241,13 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 	nodeStatus, err := p.collector.CollectCompact()
 	if err != nil {
 		return fmt.Errorf("failed to collect status: %w", err)
+	}
+
+	// Feed the collected status to any registered observer (the auto-stop
+	// reconciler) before publishing, reusing this collection rather than
+	// triggering a second stats/nvidia-smi sweep.
+	if p.onStatus != nil {
+		p.onStatus(nodeStatus)
 	}
 
 	// Get device code (thread-safe)
