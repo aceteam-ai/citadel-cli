@@ -3,6 +3,7 @@ package terminal
 
 import (
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -64,6 +65,48 @@ func TestConfigFromEnv(t *testing.T) {
 
 	if config.MaxConnections != 20 {
 		t.Errorf("expected max connections 20 from env, got %d", config.MaxConnections)
+	}
+}
+
+// TestDefaultConfig_TmuxOffByDefault pins the off-by-default contract: with no
+// CITADEL_TERMINAL_SESSION set, no tmux session is configured, so the server
+// runs a bare shell (sessionCommand returns nil and sessionDisabled is true).
+func TestDefaultConfig_TmuxOffByDefault(t *testing.T) {
+	// Empty simulates "unset": getEnvOrDefault treats "" as absent and falls
+	// back to DefaultSessionName, which is now empty.
+	t.Setenv("CITADEL_TERMINAL_SESSION", "")
+
+	config := DefaultConfig()
+	if config.SessionName != "" {
+		t.Errorf("expected empty SessionName by default, got %q", config.SessionName)
+	}
+	if !sessionDisabled(config.SessionName) {
+		t.Error("expected tmux backing to be disabled by default")
+	}
+	// Even with a real tmux binary available, no command is produced.
+	makeFakeTmux(t)
+	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
+		t.Errorf("expected nil session command by default, got %v", got)
+	}
+}
+
+// TestDefaultConfig_TmuxOptIn verifies operators restore persistent tmux by
+// setting CITADEL_TERMINAL_SESSION to a session name.
+func TestDefaultConfig_TmuxOptIn(t *testing.T) {
+	t.Setenv("CITADEL_TERMINAL_SESSION", "citadel")
+	bin := makeFakeTmux(t)
+
+	config := DefaultConfig()
+	if config.SessionName != "citadel" {
+		t.Errorf("expected SessionName %q from env, got %q", "citadel", config.SessionName)
+	}
+	if sessionDisabled(config.SessionName) {
+		t.Error("expected tmux backing to be enabled when opted in")
+	}
+	got := sessionCommand(config.SessionName, "/bin/bash")
+	want := []string{bin, "new-session", "-A", "-s", "citadel", "/bin/bash"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}
 }
 

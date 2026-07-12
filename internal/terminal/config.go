@@ -9,10 +9,12 @@ import (
 )
 
 // DefaultSessionName is the base tmux session name used when
-// CITADEL_TERMINAL_SESSION is not set. Its presence is what makes terminals
-// tmux-backed (and therefore reconnect-resilient) by default. It is a valid
-// tmux session name per tmux.ValidateSessionName.
-const DefaultSessionName = "citadel"
+// CITADEL_TERMINAL_SESSION is not set. It defaults to empty, which turns tmux
+// backing OFF so terminals run a fresh bare shell. Operators opt in to
+// persistent tmux by setting CITADEL_TERMINAL_SESSION to a session name (e.g.
+// "citadel"), which must be a valid tmux session name per
+// tmux.ValidateSessionName.
+const DefaultSessionName = ""
 
 // Config holds the terminal server configuration
 type Config struct {
@@ -49,10 +51,16 @@ type Config struct {
 	// SessionName is treated as a base name. The server derives a stable,
 	// per-user session name from it (base + sanitized user ID) so each user
 	// re-attaches to their own persistent terminal across reconnects while
-	// staying isolated from other users. It defaults to DefaultSessionName so
-	// terminals are tmux-backed (and reconnect-resilient) out of the box. Set
-	// CITADEL_TERMINAL_SESSION to the disable sentinel ("none"/"off"/
-	// "disabled") to force a bare, non-persistent shell.
+	// staying isolated from other users.
+	//
+	// It defaults to DefaultSessionName (empty), so tmux backing is OFF by
+	// default and terminals run a fresh, non-persistent bare shell. This keeps
+	// scripted/automated terminal use predictable (no state bleed across
+	// connections, consistent PTY/terminfo). To opt in to the persistent,
+	// reconnect-resilient tmux behavior, set CITADEL_TERMINAL_SESSION to a
+	// session name (e.g. "citadel"). The disable sentinels ("none"/"off"/
+	// "disabled"/"false"/"0") also force a bare shell and remain supported for
+	// explicit opt-out.
 	SessionName string
 
 	// AuthServiceURL is the URL of the AceTeam auth service for token validation
