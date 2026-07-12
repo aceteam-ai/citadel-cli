@@ -1111,3 +1111,19 @@ Auto-generated log of every release.
   - feat(node): node identity store — keypair + CSR + leaf storage (#4583 P2 PR-0) (#441)
 
 
+---
+
+## v2.73.0 — 2026-07-12
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 10 |
+| Lines added | +477 |
+
+**Changes:**
+
+  - fix(terminal): make tmux session opt-in, off by default (#511) (#512)
+  - feat(windows): citadel-start.exe launcher, replace citadel.bat (#508) (#509)
+
+
