@@ -559,8 +559,11 @@ The script will:
    - Display the release URL
 
 5. **Update Homebrew Tap**
-   - Automatically updates the `aceteam-ai/homebrew-tap` formula
-   - Commits new version and SHA256 checksums
+   - Automatically updates the `aceteam-ai/homebrew-tap` formula via
+     `scripts/update-homebrew-tap.sh` (bumps the version + the four per-platform
+     SHA256s, then commits and pushes)
+   - Failures here are non-fatal: the release still completes and prints the
+     manual `update-homebrew-tap.sh` fallback
 
 ### Version Numbering
 
@@ -572,7 +575,10 @@ Follow semantic versioning (semver):
 
 ### Manual Release Process
 
-> **Note:** Manual releases will NOT update the Homebrew tap. Always prefer `release.sh`.
+> **Note:** Prefer `release.sh` — it updates the Homebrew tap for you. If you
+> release by hand, sync the tap yourself afterward with
+> `./scripts/update-homebrew-tap.sh <version>` (it fetches the release's
+> checksums from GitHub and pushes the formula bump).
 
 If you absolutely must release manually:
 
@@ -592,5 +598,6 @@ gh release create v1.2.0 \
   release/citadel_v1.2.0_*.zip \
   release/checksums.txt
 
-# 4. Manually update Homebrew tap (aceteam-ai/homebrew-tap)
+# 4. Sync the Homebrew tap (aceteam-ai/homebrew-tap)
+./scripts/update-homebrew-tap.sh 1.2.0
 ```
