@@ -21,9 +21,13 @@ var disableSentinels = map[string]bool{
 }
 
 // sessionDisabled reports whether the configured session base name asks for
-// tmux backing to be turned off.
+// tmux backing to be turned off. An empty (or whitespace-only) name means no
+// session was configured, which is the off-by-default case, so it is treated as
+// disabled. The explicit sentinels ("none"/"off"/...) remain supported for
+// operators who opt out after setting a name.
 func sessionDisabled(sessionName string) bool {
-	return disableSentinels[strings.ToLower(strings.TrimSpace(sessionName))]
+	trimmed := strings.ToLower(strings.TrimSpace(sessionName))
+	return trimmed == "" || disableSentinels[trimmed]
 }
 
 // sessionNameForUser derives a stable, validated tmux session name from a base

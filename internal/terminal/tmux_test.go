@@ -62,8 +62,9 @@ func TestSessionCommand_DisableSentinel(t *testing.T) {
 }
 
 func TestSessionDisabled(t *testing.T) {
-	on := []string{"", "citadel", "agent", "my-session", "nonexistent"}
-	off := []string{"none", "off", "OFF", "Disabled", "false", "0", "  off  "}
+	on := []string{"citadel", "agent", "my-session", "nonexistent"}
+	// Empty/whitespace-only means no session configured -> off by default.
+	off := []string{"", "  ", "none", "off", "OFF", "Disabled", "false", "0", "  off  "}
 	for _, s := range on {
 		if sessionDisabled(s) {
 			t.Errorf("sessionDisabled(%q) = true, want false", s)
