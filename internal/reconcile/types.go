@@ -22,14 +22,20 @@
 package reconcile
 
 // ----------------------------------------------------------------------------
-// WIRE CONTRACT  (load-bearing across repos — keep in sync with aceteam#4273)
+// INTERNAL ENGINE TYPES  (the on-the-wire contract is PROTOBUF, not this JSON)
 //
-// These types define the JSON contract between the node reconciler and the
-// control plane (/fabric backend). The control plane MUST serve DesiredState
-// from `GET <plane>/nodes/{id}/desired-state` and accept ActualState at
-// `POST <plane>/nodes/{id}/actual-state`, both authenticated by the node's
-// existing device identity. The exact routes are owned by aceteam#4273; the
-// SHAPES below are owned jointly and must not drift silently.
+// The load-bearing cross-repo wire contract is the fabric v1 protobuf
+// (github.com/aceteam-ai/fabric-protocol DesiredState/DesiredModule/ActualState).
+// proto_provider.go decodes that proto into the internal types below and reports
+// the internal ActualState back as proto. The control plane MUST serve the proto
+// DesiredState from `GET redisapi.DesiredStatePathFormat`
+// (/api/fabric/nodes/{id}/desired-state) and consume the proto ActualState at the
+// existing node-state endpoint (/api/fabric/node-state), both device-authed
+// (aceteam#4273; the serve endpoint is the paired follow-up).
+//
+// The JSON tags below are NOT the control-plane contract — they serve the
+// MODULE_SET job payload (aceteam#5280), which carries ONE ModuleAssignment as
+// JSON on the per-node stream. Keep them; they are independent of the proto pull.
 // ----------------------------------------------------------------------------
 
 // DesiredStatus is the operator-assigned target run-state of a module.
@@ -75,6 +81,15 @@ type ModuleAssignment struct {
 
 	// DesiredStatus is the target run-state. Empty defaults to StatusRunning.
 	DesiredStatus DesiredStatus `json:"desired_status,omitempty"`
+
+	// AllowPrivileged carries the control plane's privileged-install grant flag
+	// (proto DesiredModule.allow_privileged). It is CARRIED here so the wire
+	// contract is complete and drift-comparable, but the live ModuleOps adapter
+	// does NOT honor a node-supplied privilege bit on its own: privileged install
+	// stays gated on the node's own trust rules (catalog/first-party) plus a
+	// signed capability grant (the #4313 epic). Honoring a bare node-supplied
+	// flag without a signed grant would be a privilege-escalation hole.
+	AllowPrivileged bool `json:"allow_privileged,omitempty"`
 }
 
 // EffectiveStatus returns DesiredStatus, defaulting an empty value to running.
@@ -102,6 +117,13 @@ func (m ModuleAssignment) Key() string {
 //
 //	{ "modules": [ <ModuleAssignment>, ... ] }
 type DesiredState struct {
+	// Revision is the control plane's monotonic revision for this desired state
+	// (proto DesiredState.revision). The node echoes it back in the actual-state
+	// report's AppliedRevision after it converges, so the control plane can tell
+	// which revision the node has applied (the revision handshake). It is opaque
+	// to the engine and does not participate in the module diff.
+	Revision string `json:"revision,omitempty"`
+
 	Modules []ModuleAssignment `json:"modules"`
 }
 
@@ -180,6 +202,13 @@ type ActualState struct {
 	// Node is the reporting node's identifier (device identity). It may be left
 	// empty by the engine and filled in by the transport layer.
 	Node string `json:"node,omitempty"`
+	// AppliedRevision is the DesiredState.Revision the node converged to in this
+	// pass (the revision handshake). It is stamped by the reconcile loop after a
+	// converge — set even on partial per-module failure, because the node HAS
+	// processed that revision; per-module failures surface individually via
+	// Health == HealthError. The transport maps it onto the proto report's
+	// applied_revision field.
+	AppliedRevision string `json:"applied_revision,omitempty"`
 	// Modules is the observed set of installed modules.
 	Modules []InstalledModule `json:"modules"`
 }
