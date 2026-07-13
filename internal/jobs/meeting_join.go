@@ -296,6 +296,10 @@ type MeetingJoinHandler struct {
 	// values fall back to the package defaults at use.
 	StreamingInterval time.Duration
 	StreamingWindow   time.Duration
+	// StreamingMaxWindow caps how much trailing audio each rolling pass
+	// re-transcribes (see meeting_transcribe_window.go), keeping per-pass cost
+	// bounded regardless of call length. Zero falls back to the package default.
+	StreamingMaxWindow time.Duration
 
 	// transcribeMu serializes whisper-sidecar access so a during-call rolling
 	// pass (meeting_interactive.go) never overlaps the end-of-call batch
@@ -354,6 +358,9 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	if err := os.MkdirAll(filepath.Dir(wavPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create meetings dir: %w", err)
 	}
+	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
+	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
+	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
 	if err := rec.Start(wavPath); err != nil {
 		return nil, fmt.Errorf("start recording: %w", err)
 	}
@@ -395,6 +402,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 			"chat":                chatForResult(outcome.chat),
 			"recognized_commands": commandsForResult(outcome.recognized),
 			"streamed_segments":   outcome.streamedSegments,
+			"notes":               notesForResult(outcome.notes),
 		})
 		return out, nil
 	}
@@ -408,6 +416,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		"chat":                chatForResult(outcome.chat),
 		"recognized_commands": commandsForResult(outcome.recognized),
 		"streamed_segments":   outcome.streamedSegments,
+		"notes":               notesForResult(outcome.notes),
 	})
 	return out, nil
 }
@@ -609,6 +618,15 @@ func commandsForResult(cmds []RecognizedCommand) []RecognizedCommand {
 		return []RecognizedCommand{}
 	}
 	return cmds
+}
+
+// notesForResult normalizes the in-call NOTE/ACTION entries to an empty array so
+// the additive `notes` field serializes as [] rather than null.
+func notesForResult(notes []string) []string {
+	if notes == nil {
+		return []string{}
+	}
+	return notes
 }
 
 // JobTypeTranscribeAudioType is the wire type string for the transcription job,

@@ -231,6 +231,79 @@ func TestAnnounceOnAdmission_SeedsOwnMessageGuard(t *testing.T) {
 	}
 }
 
+// TestInteractive_HelpCommandDoesNotSelfLeaveOnEcho is the self-echo regression
+// guard for the new verbs. A participant types `/ace help`; the bot posts the
+// help text, which literally contains "/ace leave". Meet echoes the bot's own
+// message back into the chat panel. If the loop scanned that echo it would parse
+// the embedded "/ace leave" and end the call. The post-time seed of botMessages
+// (done by the loop's postChat wrapper) must suppress command parsing for the
+// echoed line while still capturing it for the audit trail.
+func TestInteractive_HelpCommandDoesNotSelfLeaveOnEcho(t *testing.T) {
+	h := newTestInteractiveHandler()
+
+	helpJSON, _ := json.Marshal(meetingHelpText)
+	page := &fakeMeetPage{chatReads: []string{
+		// Poll 1: a participant asks for help (triggers the bot's help post).
+		`[{"index":0,"sender":"Bob","text":"/ace help"}]`,
+		// Poll 2: the bot's own help output is echoed back by Meet.
+		`[{"index":0,"sender":"Bob","text":"/ace help"},{"index":1,"sender":"You","text":` + string(helpJSON) + `}]`,
+	}}
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		page.mu.Lock()
+		page.ended = true
+		page.mu.Unlock()
+	}()
+	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
+
+	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+
+	if out.endReason == "ace_command_leave" || page.leaveHit {
+		t.Fatal("bot self-triggered a leave from its own /ace help echo")
+	}
+	// Exactly one command recognized: Bob's /ace help. The echoed help line
+	// (which contains "/ace leave") must be suppressed by the own-message guard.
+	if len(out.recognized) != 1 || out.recognized[0].Kind != CommandHelp {
+		t.Errorf("recognized = %+v, want exactly one help command", out.recognized)
+	}
+	// The bot must have actually posted the help text (recorded by the fake).
+	var postedHelp bool
+	for _, js := range page.posted {
+		if strings.Contains(js, "AceTeam commands") {
+			postedHelp = true
+		}
+	}
+	if !postedHelp {
+		t.Error("expected the bot to post the help text to chat")
+	}
+}
+
+// TestInteractive_NoteCommandRecordsToOutcome verifies an in-call `/ace note`
+// flows through the loop into the outcome's notes buffer (surfaced in the
+// MEETING_JOIN result) and does not trigger a leave.
+func TestInteractive_NoteCommandRecordsToOutcome(t *testing.T) {
+	h := newTestInteractiveHandler()
+	page := &fakeMeetPage{chatReads: []string{
+		`[{"index":0,"sender":"Ann","text":"/ace note ship the release"}]`,
+	}}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		page.mu.Lock()
+		page.ended = true
+		page.mu.Unlock()
+	}()
+	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
+
+	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+
+	if page.leaveHit {
+		t.Error("/ace note must not trigger a leave")
+	}
+	if len(out.notes) != 1 || !strings.Contains(out.notes[0], "ship the release") {
+		t.Errorf("outcome notes = %v, want the noted text", out.notes)
+	}
+}
+
 // TestInteractive_DoesNotSelfTriggerOnAnnouncementEcho is the regression guard
 // for the self-echo landmine: the bot posts an announcement that literally
 // contains "/ace leave", and Meet renders the bot's own message back in the chat
