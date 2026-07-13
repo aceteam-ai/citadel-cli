@@ -34,6 +34,11 @@ import (
 const (
 	defaultStreamingInterval = 15 * time.Second
 	defaultStreamingWindow   = 10 * time.Second
+	// defaultStreamingMaxWindow caps the trailing audio each rolling pass
+	// re-transcribes (see meeting_transcribe_window.go). Far larger than
+	// defaultStreamingWindow + defaultStreamingInterval so a segment always
+	// stabilizes and is emitted before it slides out of the re-fed window.
+	defaultStreamingMaxWindow = 90 * time.Second
 )
 
 // meetPage is the browser surface the interactive session drives via page JS:
@@ -54,6 +59,9 @@ type interactiveOutcome struct {
 	chat             []MeetChatMessage
 	streamedSegments int
 	recognized       []RecognizedCommand
+	// notes are timestamped NOTE/ACTION entries appended by the in-call `/ace
+	// note` and `/ace action` commands, surfaced in the MEETING_JOIN result.
+	notes []string
 }
 
 func (h *MeetingJoinHandler) streamingInterval() time.Duration {
@@ -143,9 +151,34 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	seenChat := make(map[int]struct{})
 	var leaveRequested bool
 
+	// transcript accumulates stabilized segments so `/ace status` and `/ace
+	// summary` can read the live conversation. Written only in drainSegments.
+	transcript := &meetingTranscriptBuffer{}
+
+	// exec runs the non-destructive `/ace` verbs (help/status/note/action/
+	// summary). postChat SEEDS botMessages before every post so the loop never
+	// re-parses the bot's own output (the #1 self-echo bug). startTime is the loop
+	// entry, i.e. the moment recording is under way.
+	exec := &meetingCommandExecutor{
+		log: ctx.Log,
+		postChat: func(text string) {
+			botMessages[normalizeChatText(text)] = struct{}{}
+			if err := postMeetChat(page, text); err != nil {
+				ctx.Log("warn", "     - could not post `/ace` reply to chat (non-fatal, selector may be stale): %v", err)
+			}
+		},
+		startTime:  time.Now(),
+		now:        time.Now,
+		transcript: transcript,
+		summarize:  localVLLMSummarize,
+		out:        &out,
+	}
+
 	// handleLine parses one transcript/chat line for an invocation and records
-	// it. Only a literal `/ace leave` is auto-executed (below); generic commands
-	// and wake-phrase instructions are captured/surfaced for the agent layer.
+	// it. `/ace leave` is auto-executed by the loop below (it must break the
+	// loop); the other registered verbs are executed here (non-destructive: they
+	// only read state, append to a buffer, or post chat). Generic commands and
+	// wake-phrase instructions are captured/surfaced for the agent layer.
 	handleLine := func(line string, source CommandSource) {
 		cmd, ok := ParseCommand(line, source)
 		if !ok {
@@ -155,13 +188,15 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 		out.recognized = append(out.recognized, cmd)
 		if cmd.Kind == CommandLeave {
 			leaveRequested = true
+			return
 		}
+		exec.dispatch(cmd)
 	}
 
 	deadline := time.Now().Add(p.maxDuration())
 	for time.Now().Before(deadline) {
 		// 1. Drain newly-stabilized transcript segments (non-blocking).
-		h.drainSegments(segCh, &out, handleLine)
+		h.drainSegments(segCh, &out, transcript, handleLine)
 
 		// 2. Read chat; feed new lines (dedup by append-only index).
 		if msgs, err := readMeetChat(page); err != nil {
@@ -206,13 +241,15 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 }
 
 // drainSegments pulls all currently-buffered transcript segments without
-// blocking, updating the outcome's streamed count and feeding each to
+// blocking, updating the outcome's streamed count, accumulating each into the
+// live transcript buffer (for `/ace status`/`/ace summary`), and feeding each to
 // handleLine. Extracted so the non-blocking drain is readable and reusable.
-func (h *MeetingJoinHandler) drainSegments(segCh <-chan TranscriptSegment, out *interactiveOutcome, handleLine func(string, CommandSource)) {
+func (h *MeetingJoinHandler) drainSegments(segCh <-chan TranscriptSegment, out *interactiveOutcome, transcript *meetingTranscriptBuffer, handleLine func(string, CommandSource)) {
 	for {
 		select {
 		case s := <-segCh:
 			out.streamedSegments++
+			transcript.add(s)
 			handleLine(s.Text, SourceTranscript)
 		default:
 			return
@@ -239,17 +276,40 @@ func checkMeetingEnded(page meetPage) (string, bool) {
 	return "", false
 }
 
-// transcribeSegments re-transcribes the growing recording and returns its
-// segments, for one rolling pass. It serializes sidecar access via
-// h.transcribeMu so a rolling pass never overlaps the final batch transcribe (or
-// another pass) — they would otherwise hit the whisper sidecar and read the
-// in-progress WAV concurrently. An error is returned (not fatal) so the rolling
-// driver logs and retries on the next tick.
+// transcribeSegments transcribes the recent TAIL of the growing recording and
+// returns its segments (on the ABSOLUTE recording timeline) for one rolling pass.
+// It serializes sidecar access via h.transcribeMu so a rolling pass never
+// overlaps the final batch transcribe (or another pass) — they would otherwise
+// hit the whisper sidecar and read the in-progress WAV concurrently. An error is
+// returned (not fatal) so the rolling driver logs and retries on the next tick.
+//
+// WINDOWING (the latency fix): the whisper sidecar transcribes a whole file with
+// no offset/streaming API, so re-transcribing the entire wav-so-far every pass
+// makes each pass slower as the call grows. Instead this clips only the trailing
+// h.streamingMaxWindow() of audio into a workspace-local scratch WAV
+// (meeting_transcribe_window.go) and transcribes THAT, then shifts the returned
+// segment times by the clip's start offset back onto the absolute timeline so the
+// rolling driver's absolute-start dedup/stabilization contract is preserved. The
+// tradeoff — segments older than the window are never re-fed — is safe because
+// the window (default 90s) is far larger than the stability margin + cadence, so
+// a segment always stabilizes and is emitted before it slides out of the window.
+// If clipping fails (e.g. the header is not fully written yet early in a call),
+// it falls back to whole-file transcription: correctness over latency.
 func (h *MeetingJoinHandler) transcribeSegments(ctx JobContext, meetingID, wavPath string) ([]TranscriptSegment, error) {
 	h.transcribeMu.Lock()
 	defer h.transcribeMu.Unlock()
 
-	synthetic := syntheticTranscribeJob(meetingID+"-rolling", wavPath)
+	transcribePath := wavPath
+	var offset float64
+	clipPath := meetingWindowWavPath(h.WorkspaceDir, meetingID)
+	if off, err := clipWavTail(wavPath, clipPath, h.streamingMaxWindow()); err != nil {
+		ctx.Log("warn", "     - rolling window clip failed, falling back to whole-file transcribe (non-fatal): %v", err)
+	} else {
+		transcribePath = clipPath
+		offset = off
+	}
+
+	synthetic := syntheticTranscribeJob(meetingID+"-rolling", transcribePath)
 	raw, err := h.transcriber.Execute(ctx, synthetic)
 	if err != nil {
 		return nil, err
@@ -260,5 +320,20 @@ func (h *MeetingJoinHandler) transcribeSegments(ctx JobContext, meetingID, wavPa
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return nil, fmt.Errorf("decode rolling transcript segments: %w", err)
 	}
+	if offset > 0 {
+		for i := range decoded.Segments {
+			decoded.Segments[i].Start += offset
+			decoded.Segments[i].End += offset
+		}
+	}
 	return decoded.Segments, nil
+}
+
+// streamingMaxWindow resolves the trailing-audio cap for a rolling pass, falling
+// back to the package default when unset.
+func (h *MeetingJoinHandler) streamingMaxWindow() time.Duration {
+	if h.StreamingMaxWindow > 0 {
+		return h.StreamingMaxWindow
+	}
+	return defaultStreamingMaxWindow
 }

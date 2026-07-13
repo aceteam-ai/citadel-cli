@@ -52,8 +52,22 @@ var aceSpokenCommandPrefixes = []string{"slash ace", "slash-ace"}
 type CommandKind string
 
 const (
-	// CommandLeave is the one auto-executed action: end the bot's participation.
+	// CommandLeave is an auto-executed action: end the bot's participation. It is
+	// the one DESTRUCTIVE registry command (it ends the recording), which is why
+	// the safety property still requires the literal `/ace ` token for it.
 	CommandLeave CommandKind = "leave"
+	// CommandHelp posts the list of available `/ace` commands to the Meet chat.
+	CommandHelp CommandKind = "help"
+	// CommandStatus posts recording state, elapsed duration, and live-transcript
+	// health (segment count) to the Meet chat.
+	CommandStatus CommandKind = "status"
+	// CommandNote appends a timestamped NOTE to the meeting output buffer.
+	CommandNote CommandKind = "note"
+	// CommandAction appends a timestamped ACTION ITEM to the meeting output buffer.
+	CommandAction CommandKind = "action"
+	// CommandSummary summarizes the live transcript via the node-local vLLM and
+	// posts the result to the Meet chat.
+	CommandSummary CommandKind = "summary"
 	// CommandGeneric is a `/ace <command>` whose command word is not in the
 	// registry. It is captured and surfaced for the agent layer, not executed.
 	CommandGeneric CommandKind = "generic"
@@ -87,11 +101,22 @@ type RecognizedCommand struct {
 }
 
 // commandRegistry maps a `/ace <word>` command keyword to its kind. It is the
-// small, extensible surface for adding node-executed commands: today only
-// "leave" is auto-executed; a new entry here (plus wiring in meeting_join.go)
-// adds another. A word absent from the registry parses as CommandGeneric.
+// small, extensible surface for node-executed commands: a new entry here (plus a
+// case in the interactive dispatcher, meeting_commands_exec.go) adds another. A
+// word absent from the registry parses as CommandGeneric (captured, not executed).
+//
+// Every registered command EXCEPT leave is non-destructive (it only reads state
+// or appends to an in-memory buffer / posts chat), so the interactive layer
+// auto-executes them the same way it auto-executes leave. Only leave ends the
+// recording, so the safety property (literal `/ace ` token required) exists for
+// its sake; a stray auto-executed `/ace summary` from ambient speech is harmless.
 var commandRegistry = map[string]CommandKind{
-	"leave": CommandLeave,
+	"leave":   CommandLeave,
+	"help":    CommandHelp,
+	"status":  CommandStatus,
+	"note":    CommandNote,
+	"action":  CommandAction,
+	"summary": CommandSummary,
 }
 
 // ParseCommand scans one line of text (a transcript segment or a chat line) for

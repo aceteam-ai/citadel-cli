@@ -139,13 +139,25 @@ func TestParseCommand_PickFirst(t *testing.T) {
 }
 
 func TestParseCommand_RegistryExtensible(t *testing.T) {
-	// Guard the registry contract: "leave" is the only auto-executed command
-	// today. If this changes, the wiring in meeting_join.go must be reviewed for
-	// what new destructive actions become auto-executable.
-	if len(commandRegistry) != 1 {
-		t.Fatalf("commandRegistry has %d entries; adding auto-executed commands requires reviewing meeting_join.go wiring", len(commandRegistry))
+	// Guard the registry contract: this is the exact reviewed set of auto-executed
+	// commands. "leave" is the only DESTRUCTIVE one (it ends the recording); the
+	// rest are non-destructive (read state / append a buffer / post chat). Adding
+	// an entry here requires wiring a dispatch case (meeting_commands_exec.go or
+	// the interactive loop for leave) and re-reviewing the safety property.
+	want := map[string]CommandKind{
+		"leave":   CommandLeave,
+		"help":    CommandHelp,
+		"status":  CommandStatus,
+		"note":    CommandNote,
+		"action":  CommandAction,
+		"summary": CommandSummary,
 	}
-	if commandRegistry["leave"] != CommandLeave {
-		t.Errorf("registry[leave] = %q, want %q", commandRegistry["leave"], CommandLeave)
+	if len(commandRegistry) != len(want) {
+		t.Fatalf("commandRegistry has %d entries, want %d; adding auto-executed commands requires reviewing the dispatch wiring", len(commandRegistry), len(want))
+	}
+	for word, kind := range want {
+		if commandRegistry[word] != kind {
+			t.Errorf("registry[%q] = %q, want %q", word, commandRegistry[word], kind)
+		}
 	}
 }
