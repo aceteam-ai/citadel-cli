@@ -295,6 +295,14 @@ func checkMeetingEnded(page meetPage) (string, bool) {
 // a segment always stabilizes and is emitted before it slides out of the window.
 // If clipping fails (e.g. the header is not fully written yet early in a call),
 // it falls back to whole-file transcription: correctness over latency.
+//
+// Known quality wrinkle (live-verification item): each clip's LEADING edge
+// starts mid-utterance ~window seconds back, so whisper may occasionally emit a
+// short garbled fragment there. Absolute-start bucket dedup drops the common case
+// (that audio was already emitted with full context in a prior pass), but a
+// fragment landing in a never-before-started bucket can slip into the streamed
+// buffer. This is cosmetic — the STORED transcript is the untouched end-of-call
+// batch pass, and garbled text won't match an `/ace` token.
 func (h *MeetingJoinHandler) transcribeSegments(ctx JobContext, meetingID, wavPath string) ([]TranscriptSegment, error) {
 	h.transcribeMu.Lock()
 	defer h.transcribeMu.Unlock()

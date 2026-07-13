@@ -28,11 +28,16 @@ import (
 	"time"
 )
 
-// localVLLMBaseURL is the node-local vLLM OpenAI-compatible endpoint. It mirrors
-// VLLMInferenceHandler (vllm_inference.go), which targets localhost:8000 for the
-// meeting/inference node's vLLM. Kept as a single const so a port change is a
-// one-place edit.
-const localVLLMBaseURL = "http://localhost:8000"
+// localVLLMBaseURL returns the node-local vLLM OpenAI-compatible base URL. It
+// uses the shared vllmBaseURL() helper (llm_inference.go) rather than a literal
+// so the port comes from the citadel port registry (services.VLLMHostPort) AND
+// honors the CITADEL_VLLM_HOST_PORT override — the same source the newer
+// LLMInferenceHandler resolves. (The legacy VLLMInferenceHandler still hardcodes
+// :8000, a pre-registry literal; a per-node port change belongs in the registry/
+// env, not here.)
+func localVLLMBaseURL() string {
+	return vllmBaseURL()
+}
 
 // localVLLMTimeout bounds the WHOLE summary round-trip (model discovery + the
 // completion). It is deliberately tight: the call runs on the meeting loop
@@ -81,7 +86,7 @@ func localVLLMSummarize(ctx context.Context, transcript string) (string, error) 
 		"stop":        []string{"\n\n"},
 	})
 
-	req, err := http.NewRequestWithContext(cctx, http.MethodPost, localVLLMBaseURL+"/v1/completions", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, localVLLMBaseURL()+"/v1/completions", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return "", err
 	}
@@ -121,7 +126,7 @@ func localVLLMSummarize(ctx context.Context, transcript string) (string, error) 
 // so the summary cannot hardcode a name — it must ask. Any failure (unreachable
 // or no models) is an error that aborts the summary.
 func discoverLocalVLLMModel(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, localVLLMBaseURL+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, localVLLMBaseURL()+"/v1/models", nil)
 	if err != nil {
 		return "", err
 	}
