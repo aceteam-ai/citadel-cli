@@ -1127,3 +1127,19 @@ Auto-generated log of every release.
   - feat(windows): citadel-start.exe launcher, replace citadel.bat (#508) (#509)
 
 
+---
+
+## v2.74.0 — 2026-07-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 13 |
+| Lines added | +1250 |
+
+**Changes:**
+
+  - feat(meeting): /ace control verbs, sync vLLM summary, windowed transcription (#5435) (#515)
+  - feat(release): auto-update Homebrew tap on release (#513)
+
+
