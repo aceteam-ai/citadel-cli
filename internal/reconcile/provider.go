@@ -6,11 +6,13 @@ import "context"
 // assigned desired state and reports actual state back. It is authenticated by
 // the node's existing device identity in the live implementation.
 //
-// The LIVE HTTP implementation (talking to the /fabric control plane) is a
-// SEPARATE, LATER issue and depends on the control-plane endpoints that DO NOT
-// EXIST YET (aceteam-ai/aceteam#4273). This package provides ONLY the interface
-// and an in-memory FakeProvider for tests. A thin HTTP stub is provided in
-// http_stub.go but is explicitly NOT wired to anything live.
+// The LIVE implementation is ProtoProvider (proto_provider.go): it pulls the
+// control-plane-assigned DesiredState as binary protobuf over the device-authed
+// HTTP transport and reports ActualState back with the applied revision. The
+// paired backend serve endpoint (GET redisapi.DesiredStatePathFormat) does NOT
+// exist yet (aceteam-ai/aceteam#4273); until it does, the wired loop's fetches
+// return an error and the loop applies nothing. This file provides the interface
+// and an in-memory FakeProvider for tests.
 type DesiredStateProvider interface {
 	// Fetch returns the node's control-plane-assigned desired state.
 	Fetch(ctx context.Context) (DesiredState, error)

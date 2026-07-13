@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
+	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -1418,6 +1419,29 @@ func runWork(cmd *cobra.Command, args []string) {
 				}); emitter != nil {
 					go emitter.Run(ctx)
 					fmt.Printf("   - Node-state reporting: every %s\n", nodestate.DefaultInterval)
+				}
+
+				// Optional, config-gated (default OFF) desired-state PULL reconcile
+				// loop (aceteam#4273). When the operator opts in via
+				// CITADEL_RECONCILE_PULL, the node periodically pulls its
+				// control-plane-assigned DesiredState (protobuf) and converges via the
+				// SAME reconcile engine + live ModuleOps adapter MODULE_SET uses. Wired
+				// in the worker path ONLY (never the control center) so a node runs
+				// exactly one converge loop. The backend serve endpoint is the paired
+				// follow-up; until it exists the loop's fetches error and it applies
+				// nothing.
+				if loop := newReconcileLoop(apiSource.Client(), nodeName); loop != nil {
+					go func() {
+						runErr := loop.Run(ctx, func(_ reconcile.Plan, _ reconcile.ApplyResult, passErr error) {
+							if passErr != nil {
+								fmt.Fprintf(os.Stderr, "   - ⚠️ reconcile pass error: %v\n", passErr)
+							}
+						})
+						if runErr != nil && runErr != context.Canceled {
+							fmt.Fprintf(os.Stderr, "   - ⚠️ reconcile loop error: %v\n", runErr)
+						}
+					}()
+					fmt.Printf("   - Desired-state pull: ENABLED (reconcile every %s)\n", reconcile.DefaultInterval)
 				}
 
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{

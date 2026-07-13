@@ -25,7 +25,37 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
+
+// newReconcileLoop builds the config-gated desired-state PULL reconcile loop
+// (aceteam#4273), or returns nil when the operator has not opted in
+// (CITADEL_RECONCILE_PULL unset/false) so the feature adds zero cost by default.
+//
+// When enabled it wires the ProtoProvider (fetch DesiredState + report
+// ActualState as protobuf over the device-authed client) onto the SAME live
+// ModuleOps adapter and reconcile engine the MODULE_SET handler uses, so a pulled
+// desired state converges through exactly the tested install/uninstall/start/stop
+// machinery. RefuseFullWipe is set so an empty/misconfigured control plane cannot
+// uninstall every module on the node.
+//
+// It must be wired in the WORKER path only (never also the control center): the
+// converge loop is not idempotent telemetry, and two loops on one node would
+// double-apply install/uninstall. The backend serve endpoint does not exist yet,
+// so even when enabled the loop's fetches error until that paired follow-up ships.
+func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
+	if !reconcile.PullEnabled() {
+		return nil
+	}
+	if client == nil || nodeID == "" {
+		return nil
+	}
+	log := func(format string, args ...any) { fmt.Printf(format+"\n", args...) }
+	provider := reconcile.NewProtoProvider(client, client, nodeID, Version)
+	rec := reconcile.NewReconciler(provider, newLiveModuleOps(log), nodeID)
+	rec.RefuseFullWipe = true
+	return reconcile.NewLoop(reconcile.Config{Enabled: true, Node: nodeID}, rec)
+}
 
 // liveModuleOps implements reconcile.ModuleOps against the real node.
 type liveModuleOps struct {

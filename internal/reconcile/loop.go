@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -56,6 +57,16 @@ type Reconciler struct {
 	Provider DesiredStateProvider
 	Ops      ModuleOps
 	Node     string
+
+	// RefuseFullWipe is a safety belt against an empty/misconfigured control
+	// plane. When true, a SUCCESSFUL fetch that yields ZERO desired modules while
+	// the node still has installed modules is REFUSED (the pass errors and applies
+	// nothing) instead of letting the authoritative engine uninstall every module.
+	// A fetch FAILURE is already safe (it aborts before the diff); this guards the
+	// distinct "empty backend storage returns 200 with no modules" foot-gun. The
+	// live wiring sets it true; it is off in the zero value so existing engine
+	// tests keep the raw authoritative semantics.
+	RefuseFullWipe bool
 }
 
 // NewReconciler builds a Reconciler.
@@ -78,6 +89,14 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 		return Plan{}, ApplyResult{}, err
 	}
 
+	// Full-wipe guard: refuse to converge to an empty desired set while modules
+	// are installed (likely an empty/misconfigured control plane), rather than
+	// uninstalling everything the node runs.
+	if r.RefuseFullWipe && len(desired.Modules) == 0 && len(actual) > 0 {
+		return Plan{}, ApplyResult{}, fmt.Errorf(
+			"reconcile: refusing empty desired state with %d module(s) installed (possible control-plane misconfiguration)", len(actual))
+	}
+
 	plan, err := Reconcile(ctx, desired, actual)
 	if err != nil {
 		return Plan{}, ApplyResult{}, err
@@ -94,6 +113,10 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	if err != nil {
 		return plan, applyRes, err
 	}
+	// Revision handshake: echo the desired revision the node just converged to.
+	// Set unconditionally (even on partial per-module failure) — the node HAS
+	// processed this revision; failures surface per-module as Health == HealthError.
+	report.AppliedRevision = desired.Revision
 	if err := r.Provider.Report(ctx, report); err != nil {
 		return plan, applyRes, err
 	}
