@@ -135,9 +135,22 @@ hook_artifact() {
 }
 
 hook_post_release() {
-  info "Next steps:"
-  echo "  1. Update Homebrew tap with new version + checksums"
-  echo "  2. Citadel OS will pick up the new CLI version on next ISO build"
+  local version
+  version=$(read_state "target_version")
+  [[ -z "$version" ]] && version=$(hook_get_version)
+
+  info "Updating Homebrew tap (aceteam-ai/homebrew-tap)..."
+  # Feed the freshly built checksums.txt so the tap update doesn't have to wait
+  # for GitHub to finish processing the just-created release assets.
+  if CHECKSUMS_FILE="$REPO_ROOT/release/checksums.txt" \
+       bash "$SCRIPT_DIR/update-homebrew-tap.sh" "$version"; then
+    ok "Homebrew tap updated to ${version}."
+  else
+    warn "Homebrew tap update failed — run it manually once the release is up:"
+    warn "  ./scripts/update-homebrew-tap.sh ${version}"
+  fi
+
+  info "Citadel OS will pick up the new CLI version on next ISO build."
 }
 
 # ── Load engine and run ────────────────────────────────────────────────────
