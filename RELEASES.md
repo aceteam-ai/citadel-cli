@@ -1143,3 +1143,19 @@ Auto-generated log of every release.
   - feat(release): auto-update Homebrew tap on release (#513)
 
 
+---
+
+## v2.75.0 — 2026-07-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 32 |
+| Lines added | +2547 |
+
+**Changes:**
+
+  - feat(meeting): package meeting media stack as an installable module (#514) (#517)
+  - feat(reconcile): pull protobuf desired-state and converge (node-side, aceteam#4273) (#516)
+
+
