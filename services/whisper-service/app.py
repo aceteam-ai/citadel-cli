@@ -14,12 +14,20 @@ via whisperx = faster-whisper transcription + wav2vec2 forced alignment (tight
 word/segment timestamps) + pyannote speaker diarization (true voice identities,
 labelled "SPEAKER_00", "SPEAKER_01", ...).
 
-Fail-soft tiers, so TRANSCRIBE_AUDIO never breaks:
-  1. pyannote  -- real diarization. Requires HF_TOKEN (pyannote's model is
-     gated). Segments carry true "SPEAKER_NN" identities.
-  2. basic     -- silence-gap heuristic ("Speaker 1/2..."). Used when the
-     HF token or the pyannote model is unavailable. It can't actually tell
-     voices apart; it just beats a single unlabelled speaker.
+Fail-soft tiers, reported in the response `diarization` field so an
+orchestrator can tell a genuine result from a fallback (never breaks
+TRANSCRIBE_AUDIO):
+  - "speaker" -- real pyannote diarization. Requires HF_TOKEN (pyannote's
+     model is gated) and a `speaker` request. Segments carry true
+     "SPEAKER_NN" identities.
+  - "basic"   -- silence-gap heuristic ("Speaker 1/2..."). Used for the quick
+     path, or when a `speaker` request can't reach pyannote (no token/model).
+     It can't actually tell voices apart; it just beats a single unlabelled
+     speaker.
+  - "none"    -- plain transcription, no speaker labels requested.
+
+Request modes: `diarize` = basic labelling (quick path); `speaker` = attempt
+real pyannote (reprocess path), falling back to basic and reporting it.
 
 Alignment (wav2vec2) is ungated and runs whenever the align model is available;
 it only tightens timestamps and is skipped silently if it can't load.
@@ -195,8 +203,13 @@ class TranscribeRequest(BaseModel):
     audio_path: str
     # Optional ISO language hint (e.g. "en"); None = auto-detect.
     language: str | None = None
-    # Enable speaker labelling (real pyannote when available, else basic).
+    # Produce speaker labels at all. The quick path sets this for BASIC
+    # (silence-gap) labelling.
     diarize: bool = False
+    # Request REAL pyannote diarization (implies diarize). The reprocess path
+    # sets this. Falls back to basic labelling when the token/model is
+    # unavailable, which the response reports so callers can stay retryable.
+    speaker: bool = False
 
 
 def _resolve_audio_path(audio_path: str) -> str:
@@ -319,7 +332,8 @@ def health():
         "status": "ok",
         "model": WHISPER_MODEL,
         "device": WHISPER_DEVICE,
-        "diarization": "pyannote" if HF_TOKEN else "basic",
+        # Best tier a "speaker" request could achieve given current config.
+        "diarization": "speaker" if HF_TOKEN else "basic",
     }
 
 
@@ -353,10 +367,17 @@ def transcribe(req: TranscribeRequest):
         except Exception as exc:  # noqa: BLE001 - alignment is best-effort.
             logger.warning("alignment failed (%s); using unaligned timestamps", exc)
 
+    # Diarization tier reported to callers so an orchestrator can distinguish a
+    # genuine diarized result (safe to REPLACE the quick transcript) from a
+    # fallback (keep the quick transcript, stay retryable):
+    #   "speaker" - real pyannote ran, segments carry true SPEAKER_NN ids.
+    #   "basic"   - silence-gap fallback (no token/model, or basic requested).
+    #   "none"    - plain transcription, no speaker labels.
+    want_labels = req.diarize or req.speaker
     diarization_tier = "none"
-    if req.diarize:
-        if _diarize_pyannote(audio, result):
-            diarization_tier = "pyannote"
+    if want_labels:
+        if req.speaker and _diarize_pyannote(audio, result):
+            diarization_tier = "speaker"
         else:
             _label_speakers_basic(result["segments"])
             diarization_tier = "basic"
@@ -373,7 +394,7 @@ def transcribe(req: TranscribeRequest):
         segments.append(seg)
 
     text = " ".join(s["text"] for s in segments).strip()
-    speakers = _summarize_speakers(segments) if req.diarize else []
+    speakers = _summarize_speakers(segments) if want_labels else []
 
     return {
         "text": text,

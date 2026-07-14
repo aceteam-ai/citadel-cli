@@ -85,7 +85,9 @@ func (h *TranscribeAudioHandler) client() *http.Client {
 // Payload fields (all strings via nexus.Job):
 //   - audio_path: workspace-relative or absolute path to the recorded audio.
 //   - language:   optional ISO language hint (e.g. "en"); empty = auto-detect.
-//   - diarize:    optional "true"/"false"; basic per-segment speaker labels.
+//   - diarize:    optional speaker-labelling mode. "speaker" = real pyannote
+//                 diarization (reprocess path); "true" = basic silence-gap
+//                 labelling (quick path); anything else = no labels.
 //
 // Response JSON (relayed verbatim from the sidecar). Fields are additive: old
 // callers reading text/language/segments still work. When diarize is set, each
@@ -149,7 +151,16 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	if lang, ok := job.Payload["language"]; ok && lang != "" {
 		requestPayload["language"] = lang
 	}
-	if diarize, ok := job.Payload["diarize"]; ok && diarize == "true" {
+	// diarize modes: "speaker" requests REAL pyannote diarization (reprocess
+	// path); "true" requests BASIC silence-gap labelling (quick path). The
+	// sidecar reports which tier actually ran in its `diarization` response
+	// field ("speaker"/"basic"/"none") so the backend can decide whether to
+	// replace the stored transcript or keep retrying.
+	switch job.Payload["diarize"] {
+	case "speaker":
+		requestPayload["diarize"] = true
+		requestPayload["speaker"] = true
+	case "true":
 		requestPayload["diarize"] = true
 	}
 
