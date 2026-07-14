@@ -86,14 +86,15 @@ func (h *TranscribeAudioHandler) client() *http.Client {
 //   - audio_path: workspace-relative or absolute path to the recorded audio.
 //   - language:   optional ISO language hint (e.g. "en"); empty = auto-detect.
 //   - diarize:    optional speaker-labelling mode. "speaker" = real pyannote
-//                 diarization (reprocess path); "true" = basic silence-gap
-//                 labelling (quick path); anything else = no labels.
+//     diarization (reprocess path); "true" = basic silence-gap
+//     labelling (quick path); anything else = no labels.
 //
 // Response JSON (relayed verbatim from the sidecar). Fields are additive: old
 // callers reading text/language/segments still work. When diarize is set, each
-// segment carries a raw speaker label and a speakers[] roster is included; with
-// a HuggingFace token the labels are real pyannote identities ("SPEAKER_NN"),
-// otherwise a silence-gap fallback ("Speaker N"). speakers[].id equals the
+// segment carries a raw speaker label and a speakers[] roster is included. The
+// `diarization` field reports the tier that actually ran: "speaker" (real
+// pyannote identities "SPEAKER_NN"; needs a HuggingFace token), "basic"
+// (silence-gap fallback "Speaker N"), or "none". speakers[].id equals the
 // segment's speaker label verbatim (the join key between a segment and the
 // roster); speakers[].label is a human-friendly name. start/end are seconds.
 //
@@ -106,7 +107,7 @@ func (h *TranscribeAudioHandler) client() *http.Client {
 //	  "speakers": [
 //	    {"id": "SPEAKER_00", "label": "Speaker 1", "talkTimePct": 62.5}
 //	  ],
-//	  "diarization": "pyannote"
+//	  "diarization": "speaker"
 //	}
 func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	audioPath, ok := job.Payload["audio_path"]
