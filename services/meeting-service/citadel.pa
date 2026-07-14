@@ -1,0 +1,10 @@
+# Minimal PulseAudio startup config for the Citadel meeting module
+# (aceteam-ai/citadel-cli#514). The container is HEADLESS with no sound hardware,
+# so we deliberately load NOTHING that touches /dev/snd, udev, dbus, X11, or a
+# login session. Only the native protocol (so pactl/paplay/ffmpeg can reach the
+# server over the per-user socket) and a default null sink (so the server always
+# has a sink even before a meeting session loads its own). Per-meeting null sinks
+# are loaded at runtime by meetingd via `pactl load-module module-null-sink`.
+load-module module-native-protocol-unix
+load-module module-null-sink sink_name=citadel_default sink_properties=device.description=citadel_default
+set-default-sink citadel_default

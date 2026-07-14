@@ -1,0 +1,50 @@
+# Module compose for the Citadel meeting media stack (aceteam-ai/citadel-cli#514).
+#
+# Both published ports are bound to 127.0.0.1 ONLY: the sole consumer is the
+# co-located citadel process (the MEETING_JOIN handler, wired in a later PR),
+# nothing should reach this over the mesh. The host ports come from citadel's
+# host-port registry (services/ports.go): 8207 for the meetingd control API, 8208
+# for the Chromium CDP endpoint -- both in the 8200+ module block, clear of the
+# reserved ports and the 8100-8199 apps range. The container-internal ports (8102
+# meetingd, 9223 CDP) are fixed by the image.
+services:
+  meeting:
+    image: ghcr.io/aceteam-ai/meeting-service:latest
+    container_name: citadel-meeting
+    # shm_size: chromium crashes on Docker's 64MB default /dev/shm.
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:8207:8102"
+      - "127.0.0.1:8208:9223"
+    volumes:
+      # Persistent signed-in Google profile. A HOST dir (never a compose-managed
+      # named volume) so it survives container restart, module upgrade, and
+      # uninstall/reinstall -- losing it costs a human re-seed. The entrypoint
+      # chowns it to the bot user at boot.
+      - ~/.citadel-cli/meeting-profile:/profile
+      # WAV output: the SAME mount the whisper/transcribe sidecar reads, so the
+      # MEETING_JOIN -> TRANSCRIBE_AUDIO hand-off needs no new plumbing.
+      # CITADEL_WORKSPACE must be an ABSOLUTE path (compose does not expand "~").
+      - ${CITADEL_WORKSPACE:?set CITADEL_WORKSPACE to an absolute workspace path}:/workspace
+    environment:
+      - MEETINGD_PORT=8102
+      - MEETING_CDP_PORT=9223
+      - XVFB_RESOLUTION=${XVFB_RESOLUTION:-1280x720x24}
+      - MEETING_PROFILE_DIR=/profile
+      - CITADEL_WORKSPACE=/workspace
+    healthcheck:
+      # Hits meetingd's /health INSIDE the container (container port 8102), which
+      # runs the canary-tone audio probe -- so "container healthy" means "can
+      # actually capture non-silent audio", not merely "process is up".
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8102/health').status==200 else 1)",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

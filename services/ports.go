@@ -40,6 +40,17 @@ const (
 	// (Hermes/OpenClaw, aceteam#4591) claim the next slot in the 8200 block instead
 	// of every module hardcoding a literal 8204 and colliding.
 	EnvClaudecodeHostPort = "CITADEL_CLAUDECODE_HOST_PORT"
+	// EnvMeetingdHostPort / EnvMeetingCDPHostPort carry the two host ports for the
+	// meeting media-stack MODULE (aceteam-ai/citadel-cli#514). Like claudecode, the
+	// meeting module's compose lives in aceteam-ai/citadel-services (not the
+	// embedded ServiceMap), but both ports are registered here so the module's two
+	// loopback listeners -- the meetingd control API and the Chromium CDP endpoint
+	// -- claim fixed slots in the 8200 block and no future module hardcodes over
+	// them. Fable's design named 8102/9223, but 8102 is already TEIEmbeddingPort;
+	// the container-internal ports stay 8102/9223 while the HOST publish moves into
+	// the 8200 registry block below.
+	EnvMeetingdHostPort   = "CITADEL_MEETINGD_HOST_PORT"
+	EnvMeetingCDPHostPort = "CITADEL_MEETING_CDP_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -74,6 +85,14 @@ const (
 	// presigned URLs without a persisted-port crash-loop risk. Kept in the
 	// registry so future allocations skip it and the collision guard covers it.
 	StorageHostPort = 8206
+	// meeting: the meeting media-stack module (#514) publishes TWO loopback
+	// listeners, so it takes the next two free slots after the earmarked 8205
+	// Hermes/OpenClaw slot and storage's 8206. The container-internal ports are
+	// 8102 (meetingd) and 9223 (CDP); these are the HOST publish. Both are bound to
+	// 127.0.0.1 by the compose -- the only consumer is the co-located citadel
+	// process.
+	MeetingdHostPort   = 8207
+	MeetingCDPHostPort = 8208
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
@@ -83,22 +102,26 @@ const (
 // unions this with the apps catalog and the parsed compose files to prove no two
 // host ports clash.
 var ServiceHostPorts = map[string]int{
-	"llamacpp":   LlamacppHostPort,
-	"vllm":       VLLMHostPort,
-	"extraction": ExtractionHostPort,
-	"diffusers":  DiffusersHostPort,
-	"claudecode": ClaudecodeHostPort,
-	"storage":    StorageHostPort,
+	"llamacpp":    LlamacppHostPort,
+	"vllm":        VLLMHostPort,
+	"extraction":  ExtractionHostPort,
+	"diffusers":   DiffusersHostPort,
+	"claudecode":  ClaudecodeHostPort,
+	"storage":     StorageHostPort,
+	"meeting":     MeetingdHostPort,
+	"meeting-cdp": MeetingCDPHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
 // carries its host port.
 var serviceHostPortEnv = map[string]string{
-	"llamacpp":   EnvLlamacppHostPort,
-	"vllm":       EnvVLLMHostPort,
-	"extraction": EnvExtractionHostPort,
-	"diffusers":  EnvDiffusersHostPort,
-	"claudecode": EnvClaudecodeHostPort,
+	"llamacpp":    EnvLlamacppHostPort,
+	"vllm":        EnvVLLMHostPort,
+	"extraction":  EnvExtractionHostPort,
+	"diffusers":   EnvDiffusersHostPort,
+	"claudecode":  EnvClaudecodeHostPort,
+	"meeting":     EnvMeetingdHostPort,
+	"meeting-cdp": EnvMeetingCDPHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,

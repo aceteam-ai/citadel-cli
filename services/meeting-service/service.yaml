@@ -1,0 +1,105 @@
+# Citadel module manifest for the meeting media stack (aceteam-ai/citadel-cli#514).
+# Mirrors internal/catalog.ServiceManifest (schema v2). This is the module-install
+# path: to ship as an installable module, publish this dir as
+# services/meeting/{service.yaml,compose.yml} in the catalog repo
+# (aceteam-ai/citadel-services); citadel then resolves it via
+# `citadel module install meeting`.
+#
+# The standalone image source (Dockerfile, meetingd, supervisor/pulse config) lives
+# here in citadel-cli so CI builds+publishes ghcr.io/aceteam-ai/meeting-service, and
+# the ports below are registered in services/ports.go so no other module can claim
+# 8207/8208.
+schema_version: 2
+name: meeting
+version: "0.1.0"
+description: >-
+  Meeting notetaker media stack: Chromium + Xvfb + PulseAudio null sink + ffmpeg
+  + a session supervisor (meetingd). Captures meeting audio entirely in-container
+  (no host audio/display/browser needed) and exposes a loopback CDP port the
+  MEETING_JOIN handler drives.
+category: media
+author: AceTeam
+license: Apache-2.0
+homepage: https://github.com/aceteam-ai/citadel-cli/issues/514
+
+requires:
+  # softwareGL under Xvfb; this stack never wants a GPU.
+  gpu: false
+  # v1 image is built for amd64 only (see build-meeting-service.yml). arm64 is a
+  # follow-up: chromium arm64 exists, but the multi-arch build + audio validation
+  # on arm is out of scope for the vertical-slice PR.
+  arch: [amd64]
+
+ports:
+  # meetingd session/control API. host 8207 (registry) -> container 8102. Loopback
+  # only (the compose binds 127.0.0.1). The consumer is the co-located citadel
+  # process, so this is never exposed on the gateway (no gateway: block).
+  - host: 8207
+    container: 8102
+    protocol: tcp
+    description: meetingd session/control API (loopback only)
+  # Chromium CDP for the active meeting session. host 8208 -> container 9223.
+  - host: 8208
+    container: 9223
+    protocol: tcp
+    description: CDP for the active meeting session (loopback only)
+
+config:
+  - name: MEETINGD_PORT
+    description: In-container meetingd control API port.
+    default: "8102"
+  - name: MEETING_CDP_PORT
+    description: In-container Chromium CDP port for the active session.
+    default: "9223"
+  - name: MEETING_PROFILE_DIR
+    description: Host dir holding the persistent signed-in bot Chrome profile.
+    default: ~/.citadel-cli/meeting-profile
+  - name: XVFB_RESOLUTION
+    description: Virtual display geometry for the meeting browser.
+    default: 1280x720x24
+
+health_check:
+  # catalog.ProbeHealth GETs http://127.0.0.1:<port><endpoint> ON THE HOST, so the
+  # port here is the PUBLISHED HOST port (8207), not the container port. /health
+  # runs the canary-tone audio probe and returns 5xx when capture is silent, so a
+  # green probe means "this node can actually record a meeting".
+  endpoint: /health
+  port: 8207
+  interval: 30s
+  timeout: 15s
+  retries: 3
+
+volumes:
+  - name: profile
+    host: ~/.citadel-cli/meeting-profile
+    container: /profile
+    description: persistent signed-in Google profile (must survive reinstall)
+  - name: workspace
+    host: ${CITADEL_WORKSPACE}
+    container: /workspace
+    description: WAV output; same mount as the transcribe sidecar
+
+# Namespaced routing tag: install advertises the node as meeting-capable. The
+# worker's capability detector is the source of truth (a later PR makes it
+# module-aware); this tag drives `citadel status` display and generic routing.
+node_tags:
+  - meeting
+
+tags:
+  - meeting
+  - notetaker
+  - media
+
+sandbox:
+  # Least-privilege: the null sink is pure software, so NO devices (no /dev/snd)
+  # and NO host networking. Chromium needs a writable profile + /run + /tmp + its
+  # home; everything else stays read-only.
+  writable_paths:
+    - /profile
+    - /run
+    - /tmp
+    - /home/bot
+  resources:
+    cpu: "2.0"
+    memory: 3g
+    pids: 1024
