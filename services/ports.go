@@ -51,6 +51,13 @@ const (
 	// the 8200 registry block below.
 	EnvMeetingdHostPort   = "CITADEL_MEETINGD_HOST_PORT"
 	EnvMeetingCDPHostPort = "CITADEL_MEETING_CDP_HOST_PORT"
+	// EnvGotenbergHostPort carries the host port for the gotenberg
+	// document-conversion module (aceteam-ai/citadel-services#10). Like
+	// claudecode and meeting, gotenberg's compose lives in
+	// aceteam-ai/citadel-services (not the embedded ServiceMap), but it is
+	// registered here so `citadel module install gotenberg` injects the port via
+	// the same HostPortEnv() mechanism.
+	EnvGotenbergHostPort = "CITADEL_GOTENBERG_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -93,6 +100,13 @@ const (
 	// process.
 	MeetingdHostPort   = 8207
 	MeetingCDPHostPort = 8208
+	// gotenberg: the document-conversion module (LibreOffice + Chromium -> PDF,
+	// citadel-services#10) that unblocks Sovereign Sign P2 (aceteam#5793) --
+	// sovereign DOCX->PDF conversion on the customer's own node. Next free slot
+	// in the 8200 block after meeting's 8207/8208. The container-internal port
+	// is 3000; this is the HOST publish, bound to 127.0.0.1 only (Gotenberg has
+	// no auth of its own).
+	GotenbergHostPort = 8209
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
@@ -110,6 +124,7 @@ var ServiceHostPorts = map[string]int{
 	"storage":     StorageHostPort,
 	"meeting":     MeetingdHostPort,
 	"meeting-cdp": MeetingCDPHostPort,
+	"gotenberg":   GotenbergHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -122,6 +137,7 @@ var serviceHostPortEnv = map[string]string{
 	"claudecode":  EnvClaudecodeHostPort,
 	"meeting":     EnvMeetingdHostPort,
 	"meeting-cdp": EnvMeetingCDPHostPort,
+	"gotenberg":   EnvGotenbergHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
