@@ -1449,6 +1449,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					NodeID:          nodeName,
 					HeadscaleNodeID: headscaleNodeID,
 					OrgID:           orgID,
+					AgentVersion:    Version,
 					DebugFunc:       Debug,
 				}, collector)
 				if err != nil {
@@ -1481,6 +1482,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				NodeID:          nodeName,
 				HeadscaleNodeID: headscaleNodeID,
 				DeviceCode:      deviceCode,
+				AgentVersion:    Version,
 				ChannelOverride: workStatusChannel,
 				DebugFunc:       Debug,
 			}, collector)
