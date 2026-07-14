@@ -316,7 +316,7 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// atomically. This is a security invariant: the trust decision must key the
 	// exact compose that gets installed, so a community source cannot shadow a
 	// default service's name to install its own compose under default privileges.
-	resolved, err := catalog.ResolveCatalogService(name)
+	resolved, err := catalog.ResolveCatalogServiceSelfHealing(name)
 	if err != nil {
 		return err
 	}
