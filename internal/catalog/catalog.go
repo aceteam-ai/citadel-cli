@@ -405,7 +405,7 @@ func LoadServiceManifest(name string) (*ServiceManifest, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("service '%s' not found in catalog", name)
+	return nil, fmt.Errorf("service '%s' not found in catalog: %w", name, ErrServiceNotFound)
 }
 
 // loadManifestFromPath reads a service's service.yaml from a single source's
