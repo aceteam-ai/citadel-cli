@@ -87,15 +87,24 @@ func (h *TranscribeAudioHandler) client() *http.Client {
 //   - language:   optional ISO language hint (e.g. "en"); empty = auto-detect.
 //   - diarize:    optional "true"/"false"; basic per-segment speaker labels.
 //
-// Response JSON (relayed verbatim from the sidecar):
+// Response JSON (relayed verbatim from the sidecar). Fields are additive: old
+// callers reading text/language/segments still work. When diarize is set, each
+// segment carries a raw speaker label and a speakers[] roster is included; with
+// a HuggingFace token the labels are real pyannote identities ("SPEAKER_NN"),
+// otherwise a silence-gap fallback ("Speaker N"). speakers[].id equals the
+// segment's speaker label verbatim (the join key between a segment and the
+// roster); speakers[].label is a human-friendly name. start/end are seconds.
 //
 //	{
 //	  "text": "full transcript",
 //	  "language": "en",
-//	  "language_probability": 0.98,
 //	  "segments": [
-//	    {"start": 0.0, "end": 3.2, "text": "...", "speaker": "Speaker 1"}
-//	  ]
+//	    {"start": 0.0, "end": 3.2, "text": "...", "speaker": "SPEAKER_00"}
+//	  ],
+//	  "speakers": [
+//	    {"id": "SPEAKER_00", "label": "Speaker 1", "talkTimePct": 62.5}
+//	  ],
+//	  "diarization": "pyannote"
 //	}
 func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	audioPath, ok := job.Payload["audio_path"]
