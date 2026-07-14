@@ -46,6 +46,17 @@ type StatusMessage struct {
 	// legacy nodes omit it. Read from the pulse collector's cache via
 	// SetStatsProvider — never collected inline on the heartbeat path.
 	Stats *pulse.StatsBlock `json:"stats,omitempty"`
+
+	// AgentVersion is the citadel-cli binary version (e.g. "v2.75.0"), reported
+	// so the backend can persist fabric_node_status.agent_version on every
+	// heartbeat. This is the reliable version telemetry path: the separate
+	// node-state (ActualState) report also carries the version but lands
+	// unreliably (aceteam#5819), whereas the heartbeat writes the node status
+	// row unconditionally every 30s. Omitted (empty) on builds/paths that do
+	// not wire it, which the backend treats as "unknown" and never overwrites a
+	// known-good value with. Distinct from Version above, which is the wire
+	// protocol version ("1.0").
+	AgentVersion string `json:"agentVersion,omitempty"`
 }
 
 // PermissionState mirrors config.Permissions for the heartbeat payload.
@@ -75,6 +86,7 @@ type RedisPublisher struct {
 	redisURL        string // For debug logging
 	nodeID          string
 	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
+	agentVersion    string // citadel-cli binary version, reported as agent_version
 	interval        time.Duration
 	collector       *status.Collector
 
@@ -164,6 +176,12 @@ type RedisPublisherConfig struct {
 	// DeviceCode is the device authorization code for config lookup (optional)
 	DeviceCode string
 
+	// AgentVersion is the citadel-cli binary version (e.g. "v2.75.0"), included
+	// in every heartbeat so the backend can persist the node's agent_version.
+	// Optional: empty means "unknown" and the backend never overwrites a
+	// known-good value with it.
+	AgentVersion string
+
 	// Interval is the time between status publishes (default: 30s)
 	Interval time.Duration
 
@@ -218,6 +236,7 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 		redisURL:        cfg.RedisURL,
 		nodeID:          cfg.NodeID,
 		headscaleNodeID: cfg.HeadscaleNodeID,
+		agentVersion:    cfg.AgentVersion,
 		deviceCode:      cfg.DeviceCode,
 		interval:        cfg.Interval,
 		collector:       collector,
@@ -319,6 +338,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		DeviceCode:      deviceCode,
 		Status:          nodeStatus,
 		Permissions:     p.currentPermissions(),
+		AgentVersion:    p.agentVersion,
 	}
 	if p.statsFn != nil {
 		msg.Stats = p.statsFn()
