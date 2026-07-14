@@ -2,6 +2,61 @@ package services
 
 import "testing"
 
+// TestMeetingHostPortsRegistered pins the meeting media-stack module's two
+// loopback host ports (aceteam-ai/citadel-cli#514): they must be registered,
+// distinct from each other and from every other managed/reserved port, and above
+// the apps auto-allocation range. The module compose lives in citadel-services
+// (not the embedded ServiceMap), so this registry is the only thing that stops a
+// future module from hardcoding over 8207/8208.
+func TestMeetingHostPortsRegistered(t *testing.T) {
+	if MeetingdHostPort == MeetingCDPHostPort {
+		t.Fatalf("meetingd (%d) and CDP (%d) host ports must differ", MeetingdHostPort, MeetingCDPHostPort)
+	}
+	for name, want := range map[string]int{"meeting": MeetingdHostPort, "meeting-cdp": MeetingCDPHostPort} {
+		got, ok := ServiceHostPorts[name]
+		if !ok || got != want {
+			t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", name, got, ok, want)
+		}
+		if _, ok := serviceHostPortEnv[name]; !ok {
+			t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", name)
+		}
+	}
+	for _, port := range []int{MeetingdHostPort, MeetingCDPHostPort} {
+		if port >= AppsPortRangeStart && port <= AppsPortRangeEnd {
+			t.Errorf("meeting host port %d sits inside the apps auto-allocation range %d-%d", port, AppsPortRangeStart, AppsPortRangeEnd)
+		}
+		if name, taken := ReservedCitadelPorts[port]; taken {
+			t.Errorf("meeting host port %d collides with reserved citadel port %q", port, name)
+		}
+	}
+	// Pairwise-unique against every other managed service.
+	for svc, port := range ServiceHostPorts {
+		if svc == "meeting" || svc == "meeting-cdp" {
+			continue
+		}
+		if port == MeetingdHostPort || port == MeetingCDPHostPort {
+			t.Errorf("meeting host port collides with managed service %q (%d)", svc, port)
+		}
+	}
+	// HostPortEnv must emit both meeting vars so a compose that defers to them
+	// resolves.
+	env := HostPortEnv()
+	wantVars := map[string]bool{
+		EnvMeetingdHostPort + "=8207":   false,
+		EnvMeetingCDPHostPort + "=8208": false,
+	}
+	for _, kv := range env {
+		if _, ok := wantVars[kv]; ok {
+			wantVars[kv] = true
+		}
+	}
+	for kv, seen := range wantVars {
+		if !seen {
+			t.Errorf("HostPortEnv() did not emit %q", kv)
+		}
+	}
+}
+
 // TestReservedCitadelPortsPairwiseDistinct asserts that no two DISTINCT
 // citadel-owned listeners are registered on the same port. Reserved ports are
 // a set-to-avoid for modules/apps (covered by the apps collision guard), but

@@ -1,0 +1,66 @@
+name: Build meeting-service image
+
+# Builds and publishes the Citadel meeting media stack sidecar to GHCR as
+# ghcr.io/aceteam-ai/meeting-service. The module compose
+# (services/meeting-service/compose.yml, and the catalog copy in
+# aceteam-ai/citadel-services) pulls this image when a node runs
+# `citadel module install meeting` (aceteam-ai/citadel-cli#514), so the image MUST
+# exist in the registry -- the exact failure mode that bit whisper-service (image
+# never published) is what this workflow prevents.
+#
+# Triggers only when the service source changes on main (or manually), so ordinary
+# Go PRs don't rebuild the image. We intentionally do NOT build on pull_request:
+# gating an unmerged PR on an image build adds no signal -- the first real build
+# runs post-merge on main where it can be watched. Use workflow_dispatch to build a
+# branch on demand.
+# Tags: `latest` on main plus the commit SHA for pinning/rollback.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/meeting-service/**"
+      - ".github/workflows/build-meeting-service.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/aceteam-ai/meeting-service
+
+jobs:
+  build:
+    name: Build + push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/meeting-service
+          file: services/meeting-service/Dockerfile
+          # v1 is amd64-only; the service.yaml declares arch: [amd64] to match.
+          # arm64 (multi-arch chromium + audio validation on arm) is a follow-up.
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
