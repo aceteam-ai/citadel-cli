@@ -12,10 +12,14 @@ services:
       - "${CITADEL_VLLM_HOST_PORT:?citadel must supply CITADEL_VLLM_HOST_PORT}:8000"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    # The served model is interpolated from VLLM_MODEL so a SERVICE_START job
+    # carrying a "model" payload can swap it (#530). Citadel persists the choice
+    # to a sibling vllm.env passed via --env-file (see internal/compose/envfile.go);
+    # the :- default keeps standalone `docker compose up` working unchanged.
     command: >-
       --host 0.0.0.0
       --port 8000
-      --model Qwen/Qwen3-8B
+      --model ${VLLM_MODEL:-Qwen/Qwen3-8B}
       --enable-auto-tool-choice
       --tool-call-parser hermes
       --max-model-len 16384

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -160,7 +161,11 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		if err := h.setDesiredStatusInManifestFile(svc.Name, ""); err != nil {
 			ctx.Log("warning", "     - [Job %s] could not clear stopped marker for %s: %v", job.ID, svc.Name, err)
 		}
-		return h.serviceStart(ctx, svc)
+		// Optional model selection (#530): the backend's model-deploy contract
+		// dispatches MODEL_CACHE_PULL (weights) then SERVICE_START
+		// {service, model}. The model, when present, is persisted per-service
+		// and injected into the engine's compose interpolation env.
+		return h.serviceStart(ctx, svc, job.Payload["model"])
 	case "SERVICE_STOP":
 		// A remote SERVICE_STOP is operator/cloud intent: mark the service
 		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
@@ -201,12 +206,23 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 	})
 }
 
-func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]byte, error) {
+// serviceStart starts a manifest service. model is the optional model id a
+// SERVICE_START job selected (#530): when non-empty and the engine supports a
+// serve-time model (serviceModelEnvVar), it is persisted to the sibling
+// <name>.env BEFORE the already-running short-circuit, so a model change on a
+// running engine falls through to `up -d --force-recreate` and reloads it.
+func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
+	// appliedModel is the model this start serves via compose env interpolation;
+	// empty when no model was requested or the engine takes none.
+	appliedModel := ""
 
 	switch kind {
 	case "native":
+		if model != "" {
+			ctx.Log("info", "     - Service %s runs natively; model %q ignored (no compose env to inject)", svc.Name, model)
+		}
 		if services.IsNativeServiceRunning(svc.Name) {
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: true, Kind: kind,
@@ -217,10 +233,27 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		_, err = services.StartNativeService(svc.Name, logDir)
 
 	case "docker":
-		if h.isDockerServiceRunning(svc.Name) {
+		modelChanged := false
+		if model != "" {
+			envVar, changed, mErr := h.persistServiceModel(ctx, svc, model)
+			if mErr != nil {
+				return nil, fmt.Errorf("failed to persist model for %s: %w", svc.Name, mErr)
+			}
+			if envVar != "" {
+				appliedModel = model
+				modelChanged = changed
+			}
+		}
+		// Already-running short-circuit, UNLESS the persisted model just changed:
+		// then the running container serves the old model and must be recreated.
+		if !modelChanged && h.isDockerServiceRunning(svc.Name) {
+			msg := svc.Name + " is already running"
+			if appliedModel != "" {
+				msg = fmt.Sprintf("%s is already running serving %s", svc.Name, appliedModel)
+			}
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: true, Kind: kind,
-				Action: "start", Message: svc.Name + " is already running",
+				Action: "start", Message: msg,
 			})
 		}
 		composePath, pathErr := h.resolveComposePath(svc)
@@ -241,6 +274,13 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
 			composeArgs = append(composeArgs, "-f", override)
 		}
+		// Pass the sibling config env (<name>.env) explicitly: docker compose
+		// only auto-loads a file literally named ".env", so without --env-file
+		// the persisted model selection (#530) and any catalog install-time
+		// config would be invisible to interpolation. Mirrors cmd/service.go
+		// composeFileArgs, so a model set via job is also served after a plain
+		// `citadel work` boot and vice versa.
+		composeArgs = append(composeArgs, compose.EnvFileArgs(composePath)...)
 		// --force-recreate so the compose port mapping is always applied to the
 		// running container. Without it, `up` will ADOPT an existing container
 		// with the same container_name (e.g. one left by a prior failed/portless
@@ -264,9 +304,13 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		})
 	}
 
+	msg := fmt.Sprintf("%s started successfully", svc.Name)
+	if appliedModel != "" {
+		msg = fmt.Sprintf("%s started successfully serving %s", svc.Name, appliedModel)
+	}
 	result := serviceResult{
 		Name: svc.Name, Running: true, Kind: kind,
-		Action: "start", Message: fmt.Sprintf("%s started successfully", svc.Name),
+		Action: "start", Message: msg,
 	}
 	// For docker services, report the reachable host endpoint by inspecting the
 	// container's published port bindings. This confirms the compose port
@@ -276,7 +320,7 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 	if kind == "docker" {
 		if endpoint := h.dockerServiceEndpoint(svc.Name); endpoint != "" {
 			result.Endpoint = endpoint
-			result.Message = fmt.Sprintf("%s started successfully; reachable at %s", svc.Name, endpoint)
+			result.Message = fmt.Sprintf("%s; reachable at %s", msg, endpoint)
 		}
 	}
 	return json.Marshal(result)
@@ -307,7 +351,13 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		if pathErr != nil {
 			return nil, pathErr
 		}
-		cmd := exec.Command("docker", "compose", "-f", composePath, "down")
+		// The sibling env is passed on down too (mirrors composeFileArgs) so a
+		// compose file whose interpolation hard-requires a config var still
+		// resolves; a no-op when no <name>.env exists.
+		downArgs := []string{"compose", "-f", composePath}
+		downArgs = append(downArgs, compose.EnvFileArgs(composePath)...)
+		downArgs = append(downArgs, "down")
+		cmd := exec.Command("docker", downArgs...)
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
@@ -365,6 +415,63 @@ func (h *ServiceHandler) StopServiceByName(name string) error {
 		return fmt.Errorf("%s", parsed.Error)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Model selection (#530)
+// ---------------------------------------------------------------------------
+
+// serviceModelEnvVar maps a managed engine to the compose interpolation
+// variable that selects its served model (#530). Engines absent from this map
+// take no serve-time model parameter: ollama loads models on demand at request
+// time (nothing to configure at serve time), and llamacpp/sglang are driven by
+// a whole command line (LLAMACPP_COMMAND / SGLANG_COMMAND) rather than a bare
+// model id — wiring a model into those is deliberately out of scope here.
+var serviceModelEnvVar = map[string]string{
+	"vllm": "VLLM_MODEL",
+}
+
+// modelIDPattern is the conservative allowlist for model identifiers persisted
+// to the sibling env file: broad enough for HuggingFace ids (org/name with
+// dots, dashes, underscores, optional :revision) while rejecting whitespace,
+// quotes, '#', '$' and control characters that could corrupt the env file or
+// leak into compose interpolation. The model is backend-controlled input, but
+// it is written to a file compose parses — validate anyway.
+var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*$`)
+
+// persistServiceModel records the model a SERVICE_START job selected for a
+// service, writing <envVar>=<model> into the sibling <name>.env next to the
+// service's compose file. That file is passed to compose via --env-file on
+// BOTH start paths — this handler and the cmd/ boot path (composeFileArgs) —
+// and both derive the compose path the same way (ConfigDir + manifest
+// compose_file via ValidatePathWithinDir), so a model set via job is still
+// served after a plain `citadel work` boot. Returns the env var used (empty
+// when the engine has no serve-time model parameter — logged, not an error)
+// and whether the persisted value actually changed (callers skip the engine
+// reload when it did not, so a re-dispatched identical SERVICE_START does not
+// thrash a running engine with a multi-minute model reload).
+func (h *ServiceHandler) persistServiceModel(ctx JobContext, svc manifestService, model string) (string, bool, error) {
+	envVar, ok := serviceModelEnvVar[svc.Name]
+	if !ok {
+		ctx.Log("info", "     - Service %s has no serve-time model parameter; model %q not applied (ollama loads on demand; llamacpp/sglang use command-line env)", svc.Name, model)
+		return "", false, nil
+	}
+	if !modelIDPattern.MatchString(model) {
+		return "", false, fmt.Errorf("invalid model identifier %q", model)
+	}
+	composePath, err := h.resolveComposePath(svc)
+	if err != nil {
+		return "", false, err
+	}
+	envPath := compose.SiblingEnvPath(composePath)
+	if current, present := compose.ReadEnvVar(envPath, envVar); present && current == model {
+		return envVar, false, nil
+	}
+	if err := compose.UpsertEnvVar(envPath, envVar, model); err != nil {
+		return "", false, err
+	}
+	ctx.Log("info", "     - Persisted %s=%s to %s", envVar, model, envPath)
+	return envVar, true, nil
 }
 
 // ---------------------------------------------------------------------------
