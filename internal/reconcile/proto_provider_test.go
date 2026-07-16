@@ -169,3 +169,52 @@ func TestProtoProviderRevisionHandshakeThroughReconcileOnce(t *testing.T) {
 		t.Fatalf("handshake broken: applied_revision = %q, want rev-100", got.GetAppliedRevision())
 	}
 }
+
+// TestReconcileUsesHeadscaleNodeIDNotHostname is the regression guard for
+// aceteam#535: the pull loop must fetch desired-state AND report actual-state
+// under the Headscale numeric node ID, not the hostname. The desired-state serve
+// endpoint matches rows by a raw `.eq("node_id", <path param>)` against
+// `fabric_node_status.node_id` (keyed by the Headscale numeric ID), so fetching
+// by hostname never matches any desired row and the loop applies nothing.
+//
+// It drives a full ReconcileOnce with the numeric ID threaded exactly as
+// newReconcileLoop wires it (ProtoProvider.NodeID + Reconciler.Node), then
+// asserts the fetch path param and the reported envelope both carry the numeric
+// ID — never a hostname.
+func TestReconcileUsesHeadscaleNodeIDNotHostname(t *testing.T) {
+	const headscaleNodeID = "1084" // fabric_node_status.node_id — Headscale numeric ID
+	const hostname = "ubuntu-gpu"  // the WRONG key the loop used before #535
+
+	tr := &fakeTransport{desired: &fabricpb.DesiredState{
+		Revision: "rev-535",
+		Modules: []*fabricpb.DesiredModule{
+			{Source: "embedding", DesiredStatus: fabricpb.ModuleStatus_MODULE_STATUS_RUNNING},
+		},
+	}}
+	provider := NewProtoProvider(tr, tr, headscaleNodeID, "v1")
+	rec := NewReconciler(provider, newFakeOps(), headscaleNodeID)
+
+	if _, _, err := rec.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("ReconcileOnce: %v", err)
+	}
+
+	// Fetch must request the numeric ID, so the serve endpoint's raw node_id match hits.
+	if tr.fetchNodeID != headscaleNodeID {
+		t.Errorf("fetch keyed by %q, want Headscale numeric ID %q", tr.fetchNodeID, headscaleNodeID)
+	}
+	if tr.fetchNodeID == hostname {
+		t.Errorf("fetch keyed by hostname %q — this is the #535 bug", hostname)
+	}
+
+	// Report must stamp the same numeric ID so node_module_state keys correctly.
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(tr.postBody, &got); err != nil {
+		t.Fatalf("decode posted report: %v", err)
+	}
+	if got.GetNodeId() != headscaleNodeID {
+		t.Errorf("report node_id = %q, want Headscale numeric ID %q", got.GetNodeId(), headscaleNodeID)
+	}
+	if got.GetNodeId() == hostname {
+		t.Errorf("report node_id = hostname %q — fetch/report identity must match the desired-row key", hostname)
+	}
+}

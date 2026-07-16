@@ -28,11 +28,13 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
-// newReconcileLoop builds the config-gated desired-state PULL reconcile loop
-// (aceteam#4273), or returns nil when the operator has not opted in
-// (CITADEL_RECONCILE_PULL unset/false) so the feature adds zero cost by default.
+// newReconcileLoop builds the desired-state PULL reconcile loop (aceteam#4273).
+// The loop is ON by default; it returns nil only when the operator has hit the
+// CITADEL_RECONCILE_PULL kill switch, or when there is no client / node ID to
+// key it by. A node with no desired-state rows converges to a no-op (see
+// RefuseFullWipe below), so default-on adds no churn for unmanaged nodes.
 //
-// When enabled it wires the ProtoProvider (fetch DesiredState + report
+// It wires the ProtoProvider (fetch DesiredState + report
 // ActualState as protobuf over the device-authed client) onto the SAME live
 // ModuleOps adapter and reconcile engine the MODULE_SET handler uses, so a pulled
 // desired state converges through exactly the tested install/uninstall/start/stop
@@ -41,10 +43,16 @@ import (
 //
 // It must be wired in the WORKER path only (never also the control center): the
 // converge loop is not idempotent telemetry, and two loops on one node would
-// double-apply install/uninstall. The backend serve endpoint does not exist yet,
-// so even when enabled the loop's fetches error until that paired follow-up ships.
+// double-apply install/uninstall.
+//
+// nodeID MUST be the Headscale numeric node ID (e.g. "1084"), NOT the hostname
+// (aceteam#535). The desired-state serve endpoint matches rows by a raw
+// `.eq("node_id", <path param>)` against `fabric_node_status.node_id` (the
+// Headscale numeric ID the backend upserts from heartbeats); a hostname never
+// matches, leaving the loop non-functional. Returns nil when nodeID is empty so
+// the loop is skipped rather than started under a wrong key.
 func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
-	if !reconcile.PullEnabled() {
+	if reconcile.PullDisabled() {
 		return nil
 	}
 	if client == nil || nodeID == "" {
