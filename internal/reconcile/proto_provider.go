@@ -39,8 +39,12 @@ type ActualStateReporter interface {
 type ProtoProvider struct {
 	Fetcher  DesiredStateFetcher
 	Reporter ActualStateReporter
-	// NodeID is the Headscale hostname: the fetch path parameter and the identity
-	// stamped into the report envelope.
+	// NodeID is the Headscale numeric node ID (e.g. "1084"): the fetch path
+	// parameter AND the identity stamped into the report envelope. It must match
+	// `fabric_node_status.node_id`, which the backend keys by the Headscale
+	// numeric ID — the desired-state serve endpoint matches rows by a raw
+	// `.eq("node_id", NodeID)` with no hostname resolution, so a hostname here
+	// never matches any desired row (aceteam#535).
 	NodeID string
 	// Version is the citadel-cli version, reported as agent_version.
 	Version string

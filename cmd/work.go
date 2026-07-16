@@ -1442,10 +1442,18 @@ func runWork(cmd *cobra.Command, args []string) {
 				// control-plane-assigned DesiredState (protobuf) and converges via the
 				// SAME reconcile engine + live ModuleOps adapter MODULE_SET uses. Wired
 				// in the worker path ONLY (never the control center) so a node runs
-				// exactly one converge loop. The backend serve endpoint is the paired
-				// follow-up; until it exists the loop's fetches error and it applies
-				// nothing.
-				if loop := newReconcileLoop(apiSource.Client(), nodeName); loop != nil {
+				// exactly one converge loop.
+				//
+				// The loop is keyed by the Headscale numeric node ID, NOT the hostname
+				// (aceteam#535). The desired-state serve endpoint matches rows by a raw
+				// `.eq("node_id", <path param>)` against `fabric_node_status.node_id`,
+				// which the backend upserts as the Headscale numeric ID (see
+				// python-backend/worker/node_status/worker.py). Fetching by hostname
+				// never matches any desired row, so the loop is non-functional. The
+				// report path is symmetric: the node-state worker re-resolves the
+				// reported id via `get_node_info`, which accepts the numeric ID, so
+				// reporting the numeric ID keys `node_module_state` correctly too.
+				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID); loop != nil {
 					go func() {
 						runErr := loop.Run(ctx, func(_ reconcile.Plan, _ reconcile.ApplyResult, passErr error) {
 							if passErr != nil {
@@ -1457,6 +1465,11 @@ func runWork(cmd *cobra.Command, args []string) {
 						}
 					}()
 					fmt.Printf("   - Desired-state pull: ENABLED (reconcile every %s)\n", reconcile.DefaultInterval)
+				} else if reconcile.PullEnabled() && headscaleNodeID == "" {
+					// Opted in but the Headscale ID never resolved: skip rather than
+					// fetch/report under the wrong key. Log why — a silent skip here is
+					// exactly the non-functional-loop failure aceteam#535 describes.
+					fmt.Fprintln(os.Stderr, "   - ⚠️ Desired-state pull requested (CITADEL_RECONCILE_PULL) but Headscale node ID is unresolved; skipping (fetching by the wrong key would never match desired rows)")
 				}
 
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
