@@ -210,11 +210,24 @@ func typeJS(selector, text string) string {
 //     on a missing selector would masquerade as success — the worst outcome for
 //     the human tuning selectors against a live Meet.
 func cdpEvaluate(debugPort int, expression string) (any, error) {
-	res, err := cdpCommand(debugPort, "Runtime.evaluate", map[string]any{
+	return cdpEvalValue(cdpCommand(debugPort, "Runtime.evaluate", runtimeEvalParams(expression)))
+}
+
+// runtimeEvalParams is the Runtime.evaluate parameter set shared by the host and
+// container (published-port) evaluate paths.
+func runtimeEvalParams(expression string) map[string]any {
+	return map[string]any{
 		"expression":    expression,
 		"returnByValue": true,
 		"awaitPromise":  true,
-	})
+	}
+}
+
+// cdpEvalValue extracts the by-value result of a Runtime.evaluate response,
+// surfacing a JS throw as a Go error (see cdpEvaluate's contract). Takes the raw
+// (res, err) of a CDP command so both the host and published-port evaluate
+// helpers share the exception handling verbatim.
+func cdpEvalValue(res map[string]any, err error) (any, error) {
 	if err != nil {
 		return nil, err
 	}

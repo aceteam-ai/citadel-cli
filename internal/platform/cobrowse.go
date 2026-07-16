@@ -759,9 +759,19 @@ func cdpCommand(debugPort int, method string, params map[string]any) (map[string
 	if err != nil {
 		return nil, err
 	}
+	return cdpDialAndSend(target.WebSocketDebuggerURL, method, params)
+}
+
+// cdpDialAndSend opens a WebSocket to wsURL, sends one CDP method, and returns
+// the "result" object. Split out from cdpCommand so a caller that must first
+// REWRITE the target's advertised WebSocket URL — a containerized Chrome
+// advertises its container-internal debug port, which is unreachable from the
+// host, see cdpCommandPublished — shares the exact same request/response
+// handling.
+func cdpDialAndSend(wsURL, method string, params map[string]any) (map[string]any, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, target.WebSocketDebuggerURL, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CDP dial: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
@@ -306,7 +307,38 @@ func removeServiceFromManifest(configDir, serviceName string) error {
 		kept = append(kept, s)
 	}
 	manifest.Services = kept
+
+	// Symmetric tag cleanup (#514). Install adds a module's node_tags to
+	// Node.Tags (addServiceToManifestWithTags), but uninstall historically left
+	// them behind, so a node kept advertising a capability tag (e.g. `meeting`)
+	// for a module it no longer runs. Best-effort: strip the removed module's
+	// declared node_tags. The capability DETECTOR is the worker's source of truth
+	// (it re-derives tags at startup), so this mainly keeps `citadel status` and
+	// generic routing honest; a missing catalog manifest just skips the cleanup.
+	if mod, mErr := catalog.LoadServiceManifest(serviceName); mErr == nil && len(mod.NodeTags) > 0 {
+		manifest.Node.Tags = stripTags(manifest.Node.Tags, mod.NodeTags)
+	}
 	return writeManifest(manifestPath, manifest)
+}
+
+// stripTags returns tags with every entry in remove filtered out, preserving
+// order. Pure so the uninstall tag cleanup is unit-testable.
+func stripTags(tags, remove []string) []string {
+	if len(remove) == 0 {
+		return tags
+	}
+	drop := make(map[string]struct{}, len(remove))
+	for _, t := range remove {
+		drop[t] = struct{}{}
+	}
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if _, ok := drop[t]; ok {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // setServiceDesiredStatus sets (or clears, when status is "") the per-service
