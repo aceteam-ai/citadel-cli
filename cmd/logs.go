@@ -134,6 +134,9 @@ func runDockerComposeLogs(serviceName, composePath, tailLines string) error {
 	}
 
 	logCmd := exec.Command("docker", dockerArgs...)
+	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
+	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
+	logCmd.Env = composeEnv()
 	logCmd.Stdout = os.Stdout
 	logCmd.Stderr = os.Stderr
 
