@@ -175,3 +175,53 @@ func TestAddServiceToManifest(t *testing.T) {
 	// For now, we'll skip this specific test and rely on integration tests.
 	t.Skip("Skipping addServiceToManifest test - requires platform.ConfigDir() mock")
 }
+
+// TestStripTags covers the uninstall tag-symmetry cleanup (#514): removing a
+// module must drop the node_tags it declared, preserving order and any tags it
+// did not contribute.
+func TestStripTags(t *testing.T) {
+	cases := []struct {
+		name   string
+		tags   []string
+		remove []string
+		want   []string
+	}{
+		{
+			name:   "removes the module's declared tag",
+			tags:   []string{"cpu:general", "meeting", "os:linux"},
+			remove: []string{"meeting"},
+			want:   []string{"cpu:general", "os:linux"},
+		},
+		{
+			name:   "no-op when nothing to remove",
+			tags:   []string{"cpu:general", "meeting"},
+			remove: nil,
+			want:   []string{"cpu:general", "meeting"},
+		},
+		{
+			name:   "removes multiple declared tags",
+			tags:   []string{"a", "meeting", "notetaker", "b"},
+			remove: []string{"meeting", "notetaker"},
+			want:   []string{"a", "b"},
+		},
+		{
+			name:   "tag not present is a no-op",
+			tags:   []string{"cpu:general"},
+			remove: []string{"meeting"},
+			want:   []string{"cpu:general"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stripTags(c.tags, c.remove)
+			if len(got) != len(c.want) {
+				t.Fatalf("stripTags = %v, want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("stripTags = %v, want %v", got, c.want)
+				}
+			}
+		})
+	}
+}

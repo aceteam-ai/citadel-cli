@@ -20,6 +20,7 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -270,6 +271,53 @@ func meetingWavPath(workspaceDir, meetingID string) string {
 	return filepath.Join(workspaceDir, "meetings", sanitizeMeetingFilename(meetingID)+".wav")
 }
 
+// meetingWavRelPath is the workspace-RELATIVE form of meetingWavPath: the path
+// the container's meetingd writes under its /workspace mount, which is bound to
+// ${CITADEL_WORKSPACE} == the handler's WorkspaceDir (the SAME mount the
+// whisper/transcribe sidecar reads). filepath.Join(WorkspaceDir, this) equals
+// meetingWavPath, so the container's WAV lands exactly where the transcriber
+// looks — no new hand-off plumbing. Kept adjacent to meetingWavPath so the two
+// can never drift (guarded by a test).
+func meetingWavRelPath(meetingID string) string {
+	return "meetings/" + sanitizeMeetingFilename(meetingID) + ".wav"
+}
+
+// selectMedia returns the media backend for a run, honoring an injected override
+// (tests) and otherwise delegating to defaultSelectMedia.
+func (h *MeetingJoinHandler) selectMedia(p meetingJoinParams) MeetingMedia {
+	if h.newMedia != nil {
+		return h.newMedia(p)
+	}
+	return h.defaultSelectMedia(p)
+}
+
+// defaultSelectMedia picks the containerized meeting module when it is healthy on
+// this node, else the in-process host stack (backwards compat: pre-provisioned
+// host-stack nodes keep working). The container is preferred because its /health
+// is a stronger signal (it proves non-silent audio capture via the canary tone)
+// and it needs no host chrome/pulse/Xvfb/ffmpeg.
+func (h *MeetingJoinHandler) defaultSelectMedia(p meetingJoinParams) MeetingMedia {
+	if h.containerMediaHealthy() {
+		return newContainerMedia(
+			p.MeetingID,
+			meetingWavRelPath(p.MeetingID),
+			meetingWavPath(h.WorkspaceDir, p.MeetingID),
+			p.maxDuration(),
+		)
+	}
+	return newHostMedia(p.MeetingID, h.ProfileDir, meetingWavPath(h.WorkspaceDir, p.MeetingID))
+}
+
+// containerMediaHealthy reports whether the containerized meeting module is up
+// and healthy on this node, honoring an injected probe (tests) and otherwise
+// hitting meetingd's /health on the loopback.
+func (h *MeetingJoinHandler) containerMediaHealthy() bool {
+	if h.containerHealthProbe != nil {
+		return h.containerHealthProbe()
+	}
+	return meetingdHealthy(&http.Client{Timeout: meetingContainerHealthTimeout}, meetingdBaseURL())
+}
+
 // MeetingJoinHandler handles MEETING_JOIN jobs. It reuses the transcribe handler
 // (same workspace) to turn the recording into a transcript node-locally.
 type MeetingJoinHandler struct {
@@ -306,6 +354,16 @@ type MeetingJoinHandler struct {
 	// transcribe — they would otherwise hit the sidecar and read the growing WAV
 	// concurrently.
 	transcribeMu sync.Mutex
+
+	// newMedia selects the media backend for a run (#514). Non-nil overrides the
+	// default selector (container when the meeting module is healthy on this node,
+	// else the in-process host stack); tests inject a fake here. Leaving it nil —
+	// the normal case — uses defaultSelectMedia.
+	newMedia func(p meetingJoinParams) MeetingMedia
+	// containerHealthProbe overrides how the default selector decides the meeting
+	// module is healthy (#514). Non-nil is used by tests to force a backend
+	// without a live meetingd; nil probes meetingd's /health on the loopback.
+	containerHealthProbe func() bool
 }
 
 // NewMeetingJoinHandler constructs a handler rooted at the node workspace.
@@ -329,31 +387,26 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	}
 	ctx.Log("info", "     - [Job %s] MEETING_JOIN %s (id=%s, bot=%q)", job.ID, p.MeetingURL, p.MeetingID, p.BotDisplayName)
 
-	// Create the per-meeting null sink FIRST so the browser's PULSE_SINK target
-	// exists at launch. rec.Stop unloads the sink even if we never Start it, so
-	// deferring it here covers a browser-launch failure after LoadSink.
-	rec := platform.NewNullSinkRecorder(p.MeetingID)
-	if err := rec.LoadSink(); err != nil {
-		return nil, fmt.Errorf("load meeting audio sink: %w", err)
+	// Pick the media backend for this run: the containerized meeting module when
+	// it is installed and healthy on this node, else the in-process host stack
+	// (#514). media.Start brings up the browser + audio capture and returns the
+	// CDP-driven browser; on failure it cleans up what it partially started, so
+	// Close is deferred only after Start succeeds.
+	media := h.selectMedia(p)
+	br, err := media.Start()
+	if err != nil {
+		return nil, err
 	}
-	defer func() { _, _ = rec.Stop() }()
-
-	// Launch the sibling meeting browser routed into the sink, reusing the
-	// persistent, signed-in bot Chrome profile (issue #5122) rather than a
-	// throwaway one.
-	br := platform.NewMeetingBrowser(rec.SinkName(), h.ProfileDir)
-	if err := br.Start(); err != nil {
-		return nil, fmt.Errorf("start meeting browser: %w", err)
-	}
-	defer func() { _ = br.Close() }()
+	defer func() { _ = media.Close() }()
 
 	// Run the (unverified) Meet join flow.
 	if err := h.runJoinFlow(ctx, br, p); err != nil {
 		return nil, fmt.Errorf("meeting join flow: %w", err)
 	}
 
-	// Admitted: begin recording. Ensure the meetings/ dir exists first — ffmpeg's
-	// -y does NOT create parent directories.
+	// Admitted: begin recording. Ensure the meetings/ dir exists first — the host
+	// ffmpeg's -y does NOT create parent directories (the container's meetingd
+	// makedirs its own, but the dir is on the shared workspace mount either way).
 	wavPath := meetingWavPath(h.WorkspaceDir, p.MeetingID)
 	if err := os.MkdirAll(filepath.Dir(wavPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create meetings dir: %w", err)
@@ -361,7 +414,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.
 	defer func() { _ = os.Remove(meetingWindowWavPath(h.WorkspaceDir, p.MeetingID)) }()
-	if err := rec.Start(wavPath); err != nil {
+	if err := media.StartRecording(); err != nil {
 		return nil, fmt.Errorf("start recording: %w", err)
 	}
 	ctx.Log("info", "     - [Job %s] recording meeting to %s", job.ID, wavPath)
@@ -374,10 +427,10 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// record-until-end loop runs exactly as the shipped batch notetaker.
 	outcome := h.runMeetingLoop(ctx, br, p, wavPath)
 
-	// Finalize the recording (also unloads the sink; the deferred Stop is then a
-	// harmless no-op). Take the path from Stop so we transcribe exactly what was
-	// written.
-	recordedPath, stopErr := rec.Stop()
+	// Finalize the recording (host: SIGINT ffmpeg + unload the sink; container:
+	// POST /record/stop). media.Close (deferred) then tears the browser down. Take
+	// the path from StopRecording so we transcribe exactly what was written.
+	recordedPath, stopErr := media.StopRecording()
 	if stopErr != nil {
 		ctx.Log("warn", "     - [Job %s] recorder stop reported: %v", job.ID, stopErr)
 	}
@@ -426,7 +479,7 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 // returns an interactiveOutcome; the plain path fills only endReason so the
 // result shape is uniform (chat/recognized_commands come back empty). Splitting
 // here keeps Execute's happy path readable and the streaming gate in one place.
-func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams, wavPath string) interactiveOutcome {
+func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string) interactiveOutcome {
 	if !h.StreamingEnabled {
 		return interactiveOutcome{endReason: h.waitForMeetingEnd(ctx, br, p)}
 	}
@@ -449,7 +502,7 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br *platform.Meeting
 // runJoinFlow drives the Google Meet pre-join sequence (partially verified —
 // see the LIVE-TUNING block). Non-fatal steps (permission dismissals, name entry
 // when signed in) log and continue; the join click and admission are fatal.
-func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams) error {
+func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	if err := br.Navigate(p.MeetingURL); err != nil {
 		return fmt.Errorf("navigate to meeting url: %w", err)
 	}
@@ -548,7 +601,7 @@ func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, time
 
 // waitUntilAdmitted polls the admission heuristic until the bot is in-call or the
 // lobby timeout elapses.
-func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams) error {
+func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	deadline := time.Now().Add(admitTimeout)
 	for time.Now().Before(deadline) {
 		if v, err := br.Evaluate(meetIsAdmittedJS); err == nil {
@@ -568,7 +621,7 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br *platform.Meet
 // left alone), or until the hard duration cap trips. Returns a short reason
 // string for the result. It never errors: reaching the cap or an unreadable DOM
 // still yields a valid recording to transcribe.
-func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br *platform.MeetingBrowser, p meetingJoinParams) string {
+func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams) string {
 	deadline := time.Now().Add(p.maxDuration())
 	for time.Now().Before(deadline) {
 		if reason, ended := checkMeetingEnded(br); ended {

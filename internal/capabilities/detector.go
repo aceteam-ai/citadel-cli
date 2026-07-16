@@ -4,15 +4,19 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 const detectionTimeout = 5 * time.Second
@@ -443,17 +447,69 @@ func detectCPU() []Capability {
 }
 
 // detectMeetingCapability reports whether this node can run the auto-join meeting
-// notetaker (aceteam#5098). It ANDs the persisted config toggle (default-on, the
-// house opt-out convention) with the three real dependency probes, composed
-// through the pure meetingTagEnabled predicate so the gating logic itself is
-// unit-testable without a live audio stack, browser, or config file.
+// notetaker (aceteam#5098, module packaging #514). It ANDs the persisted config
+// toggle (default-on, the house opt-out convention) with the capability SIGNAL:
+// the containerized meeting module being installed & healthy, OR the legacy host
+// stack being present. The module path is preferred because "healthy" there means
+// meetingd's canary-tone probe passed — proof the node can actually capture
+// non-silent audio — a strictly stronger signal than the three host-binary
+// existence probes. The host stack is kept as a fallback so pre-provisioned nodes
+// (#5097) don't lose capability on upgrade (backwards-compat house rule). The
+// gating is composed through pure predicates so it is unit-testable without a live
+// audio stack, browser, container, or config file.
 func detectMeetingCapability() bool {
 	enabled := config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
-	return meetingTagEnabled(enabled, meetingCapable(
+	return meetingTagEnabled(enabled, meetingCapabilitySignal(
+		meetingModuleHealthy(),
+		legacyHostStack(),
+	))
+}
+
+// meetingCapabilitySignal is the pure "can this node run a meeting" predicate: the
+// containerized module is healthy OR the legacy host stack is present. Extracted
+// so the OR-of-sources logic is testable in isolation from the probes.
+func meetingCapabilitySignal(moduleHealthy, legacyHostOK bool) bool {
+	return moduleHealthy || legacyHostOK
+}
+
+// legacyHostStack reports whether the in-process host meeting stack is present:
+// a working audio-capture stack (PulseAudio + ffmpeg + pactl), a launchable
+// Chromium, and Xvfb for the headless virtual display.
+func legacyHostStack() bool {
+	return meetingCapable(
 		platform.AudioStackAvailable(),
 		platform.ChromiumAvailable(),
 		platform.XvfbAvailable(),
-	))
+	)
+}
+
+// meetingModuleHealthy reports whether the installable meeting module (#514) is
+// present on this node AND its /health probe is green. Presence is the installed
+// compose marker (<ConfigDir>/services/meeting.yml); health is catalog.ProbeHealth
+// against the module's PUBLISHED host control port (services.MeetingdHostPort),
+// whose /health runs the canary-tone audio probe. The presence gate avoids
+// treating a coincidental listener on the port as the module, and short-circuits
+// the probe when the module isn't installed.
+func meetingModuleHealthy() bool {
+	if !meetingModuleInstalled(platform.ConfigDir()) {
+		return false
+	}
+	hc := catalog.HealthCheck{
+		Endpoint: "/health",
+		Port:     services.MeetingdHostPort,
+		Timeout:  detectionTimeout.String(),
+	}
+	return catalog.ProbeHealth(hc) == catalog.ProbeHealthy
+}
+
+// meetingModuleInstalled reports whether the meeting module's compose has been
+// installed on this node. `citadel module install` copies the resolved compose to
+// <configDir>/services/<name>.yml (cmd/module_ops.go), so its presence is the
+// on-disk install marker — checkable without the cmd-package manifest reader
+// (which capabilities cannot import).
+func meetingModuleInstalled(configDir string) bool {
+	_, err := os.Stat(filepath.Join(configDir, "services", "meeting.yml"))
+	return err == nil
 }
 
 // meetingTagEnabled reports whether the `meeting` tag should be advertised: the

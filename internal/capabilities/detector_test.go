@@ -2,6 +2,8 @@ package capabilities
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -428,5 +430,50 @@ func TestMeetingTagEnabled(t *testing.T) {
 					c.enabled, c.depsOK, got, c.want)
 			}
 		})
+	}
+}
+
+func TestMeetingCapabilitySignal(t *testing.T) {
+	// A node is meeting-capable via EITHER the containerized module (healthy) OR
+	// the legacy host stack. Container is preferred, but the host fallback keeps
+	// pre-provisioned nodes working (#514 backwards-compat house rule).
+	cases := []struct {
+		name          string
+		moduleHealthy bool
+		legacyHostOK  bool
+		want          bool
+	}{
+		{"module healthy -> capable", true, false, true},
+		{"legacy host stack only -> capable (fallback)", false, true, true},
+		{"both present -> capable", true, true, true},
+		{"neither -> not capable", false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := meetingCapabilitySignal(c.moduleHealthy, c.legacyHostOK); got != c.want {
+				t.Errorf("meetingCapabilitySignal(module=%v, legacy=%v) = %v, want %v",
+					c.moduleHealthy, c.legacyHostOK, got, c.want)
+			}
+		})
+	}
+}
+
+func TestMeetingModuleInstalled(t *testing.T) {
+	dir := t.TempDir()
+	// Not installed: no services/meeting.yml marker.
+	if meetingModuleInstalled(dir) {
+		t.Error("meetingModuleInstalled = true for a clean config dir, want false")
+	}
+	// Install marker: `citadel module install` copies the compose to
+	// <configDir>/services/meeting.yml.
+	svcDir := filepath.Join(dir, "services")
+	if err := os.MkdirAll(svcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(svcDir, "meeting.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !meetingModuleInstalled(dir) {
+		t.Error("meetingModuleInstalled = false after writing the install marker, want true")
 	}
 }
