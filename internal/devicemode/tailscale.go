@@ -101,29 +101,11 @@ func ParseStatusJSON(out []byte) (*TailscaleStatus, error) {
 // with a fresh org authkey. forceReauth rotates the node key in place, which
 // is required both to recover a broken session and to extend an expiring one.
 //
-// The authkey is passed via TS_AUTHKEY in the environment, not argv, so it
-// never shows up in `ps` output.
+// The authkey travels on argv, which every tailscale CLI version accepts
+// (file:/env: indirections are version-dependent and fail as a LITERAL key on
+// older CLIs — a silent server-side rejection, worse than brief ps
+// visibility of a single-use key that expires within the hour).
 func Up(ctx context.Context, bin, loginServer string, authkey string, forceReauth bool) error {
-	args := []string{"up", "--login-server=" + loginServer, "--authkey=env:TS_AUTHKEY"}
-	if forceReauth {
-		args = append(args, "--force-reauth")
-	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = append(os.Environ(), "TS_AUTHKEY="+authkey)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if strings.Contains(msg, "env:TS_AUTHKEY") || strings.Contains(msg, "unknown value") {
-			// Older tailscale CLIs (< 1.40) lack env: authkey indirection;
-			// fall back to argv (slightly weaker: key visible to local ps).
-			return upArgvFallback(ctx, bin, loginServer, authkey, forceReauth)
-		}
-		return fmt.Errorf("tailscale up failed: %w: %s", err, msg)
-	}
-	return nil
-}
-
-func upArgvFallback(ctx context.Context, bin, loginServer, authkey string, forceReauth bool) error {
 	args := []string{"up", "--login-server=" + loginServer, "--authkey=" + authkey}
 	if forceReauth {
 		args = append(args, "--force-reauth")
