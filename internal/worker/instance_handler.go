@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
 )
@@ -52,6 +53,15 @@ type InstanceHandlerConfig struct {
 // InstanceHandler processes INSTANCE_* jobs.
 type InstanceHandler struct {
 	cfg InstanceHandlerConfig
+
+	// provisionAttempted dedupes INSTANCE_PROVISION by instance_id. The runner
+	// Nacks failed jobs (redelivered up to MaxAttempts on this same per-node
+	// stream), but provisioning is NOT idempotent: a redelivered attempt after
+	// a partial failure could clone a second VM the platform never hears about
+	// (its waiter already consumed the first error event). First attempt wins;
+	// redeliveries fail terminally with a pointer to inspect hypervisor state.
+	mu                 sync.Mutex
+	provisionAttempted map[string]bool
 }
 
 // NewInstanceHandler constructs an INSTANCE_* handler.
@@ -59,7 +69,7 @@ func NewInstanceHandler(cfg InstanceHandlerConfig) *InstanceHandler {
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
 	}
-	return &InstanceHandler{cfg: cfg}
+	return &InstanceHandler{cfg: cfg, provisionAttempted: map[string]bool{}}
 }
 
 // CanHandle reports whether this handler processes the given job type.
@@ -120,6 +130,18 @@ func (h *InstanceHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 }
 
 func (h *InstanceHandler) provision(ctx context.Context, provider InstanceProvider, p instancePayload) (*JobResult, error) {
+	if p.InstanceID != "" {
+		h.mu.Lock()
+		attempted := h.provisionAttempted[p.InstanceID]
+		h.provisionAttempted[p.InstanceID] = true
+		h.mu.Unlock()
+		if attempted {
+			return h.failure(fmt.Errorf(
+				"INSTANCE_PROVISION refused: instance %s was already attempted on this node "+
+					"(likely a redelivered failed job); inspect the hypervisor before re-provisioning",
+				p.InstanceID)), nil
+		}
+	}
 	h.cfg.Log("INSTANCE_PROVISION: instance=%s org=%s type=%s", p.InstanceID, p.OrgID, p.InstanceType)
 	res, err := provider.Provision(ctx, proxmox.ProvisionRequest{
 		InstanceID:        p.InstanceID,

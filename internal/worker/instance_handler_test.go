@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
@@ -140,6 +141,36 @@ func TestInstanceHandlerProvision(t *testing.T) {
 	}
 	if len(fake.calls) != 1 || fake.calls[0] != "provision:i-1" {
 		t.Errorf("unexpected calls: %v", fake.calls)
+	}
+}
+
+func TestInstanceHandlerProvisionDedupesRedelivery(t *testing.T) {
+	// The runner Nacks failed jobs, so a failed provision is redelivered on the
+	// same per-node stream. A second attempt must be refused without touching
+	// the provider (it could clone a second VM the platform never hears about).
+	fake := &fakeInstanceProvider{failWith: errors.New("resize failed")}
+	h := newTestInstanceHandler(fake, nil)
+	payload := map[string]any{
+		"instance_id": "i-dup", "instance_type": "small", "org_id": "o", "authkey": "k",
+	}
+
+	res, _ := h.Execute(context.Background(), instanceJob(JobTypeInstanceProvision, hypervisorQueue, payload), &NoOpStreamWriter{})
+	if res.Status != JobStatusFailure {
+		t.Fatalf("expected first attempt to fail, got %s", res.Status)
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("expected one provider call, got %v", fake.calls)
+	}
+
+	res, _ = h.Execute(context.Background(), instanceJob(JobTypeInstanceProvision, hypervisorQueue, payload), &NoOpStreamWriter{})
+	if res.Status != JobStatusFailure {
+		t.Fatalf("expected redelivery to fail terminally, got %s", res.Status)
+	}
+	if len(fake.calls) != 1 {
+		t.Errorf("provider must not run again on redelivery: %v", fake.calls)
+	}
+	if !strings.Contains(res.Error.Error(), "already attempted") {
+		t.Errorf("expected already-attempted error, got %v", res.Error)
 	}
 }
 
