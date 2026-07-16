@@ -5,12 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
+
+// ModelDiscoveryTimeout bounds a single model-discovery probe. Discovery runs
+// on the heartbeat's collection cycle (~30s) and inside `citadel status`, so a
+// slow/hung engine must never stall the whole collection — callers wrap their
+// context with this deadline and treat failure as "no models reported".
+const ModelDiscoveryTimeout = 2 * time.Second
 
 // ModelDiscovery provides model discovery for LLM services.
 type ModelDiscovery struct {
 	httpClient *http.Client
+	// host is the hostname used to reach the engine's local API. Defaults to
+	// "localhost"; tests override it to pin the httptest listener address.
+	host string
 }
 
 // NewModelDiscovery creates a new model discovery instance.
@@ -19,15 +29,40 @@ func NewModelDiscovery() *ModelDiscovery {
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		host: "localhost",
 	}
 }
 
-// DiscoverModels queries an LLM service for loaded models.
-// It automatically detects the service type and uses the appropriate API.
+// EngineTypeFromName maps a service/app name to a model-discovery engine type
+// ("vllm", "ollama", "llamacpp"), or "" when the name is not a known serving
+// engine. Order matters: "ollama" contains "llama", so it must be checked
+// before the llama.cpp patterns.
+func EngineTypeFromName(name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "vllm"):
+		return "vllm"
+	case strings.Contains(n, "ollama"):
+		return "ollama"
+	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
+		return "llamacpp"
+	}
+	return ""
+}
+
+// DiscoverModels queries an LLM service for LOADED models (the model(s)
+// currently being served, not merely downloaded). It automatically detects the
+// service type and uses the appropriate API. A running engine with no model
+// loaded returns an empty slice and nil error.
 func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string, port int) ([]string, error) {
 	switch serviceType {
 	case "vllm":
-		return m.discoverVLLMModels(ctx, port)
+		return m.discoverOpenAIModels(ctx, "vLLM", port)
+	case "llamacpp":
+		// llama.cpp's server exposes the same OpenAI-compatible /v1/models list.
+		// It can be up with NO model loaded (router mode / deferred load): that is
+		// an empty list, not an error.
+		return m.discoverOpenAIModels(ctx, "llama.cpp", port)
 	case "ollama":
 		return m.discoverOllamaModels(ctx, port)
 	default:
@@ -35,10 +70,10 @@ func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string,
 	}
 }
 
-// discoverVLLMModels queries vLLM's OpenAI-compatible API for loaded models.
-// vLLM exposes: GET /v1/models
-func (m *ModelDiscovery) discoverVLLMModels(ctx context.Context, port int) ([]string, error) {
-	url := fmt.Sprintf("http://localhost:%d/v1/models", port)
+// discoverOpenAIModels queries an OpenAI-compatible API for loaded models.
+// Used for vLLM and llama.cpp, both of which expose: GET /v1/models
+func (m *ModelDiscovery) discoverOpenAIModels(ctx context.Context, engineLabel string, port int) ([]string, error) {
+	url := fmt.Sprintf("http://%s:%d/v1/models", m.host, port)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -47,38 +82,39 @@ func (m *ModelDiscovery) discoverVLLMModels(ctx context.Context, port int) ([]st
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query vLLM models: %w", err)
+		return nil, fmt.Errorf("failed to query %s models: %w", engineLabel, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("vLLM returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("%s returned status %d", engineLabel, resp.StatusCode)
 	}
 
-	// vLLM returns OpenAI-compatible format:
+	// OpenAI-compatible format:
 	// { "data": [{ "id": "model-name", "object": "model" }] }
-	var vllmResp struct {
+	var listResp struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&vllmResp); err != nil {
-		return nil, fmt.Errorf("failed to parse vLLM response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		return nil, fmt.Errorf("failed to parse %s response: %w", engineLabel, err)
 	}
 
-	models := make([]string, 0, len(vllmResp.Data))
-	for _, model := range vllmResp.Data {
+	models := make([]string, 0, len(listResp.Data))
+	for _, model := range listResp.Data {
 		models = append(models, model.ID)
 	}
 
 	return models, nil
 }
 
-// discoverOllamaModels queries Ollama's API for available models.
-// Ollama exposes: GET /api/tags
+// discoverOllamaModels queries Ollama's API for LOADED (running) models.
+// Ollama exposes: GET /api/ps — the models currently loaded into memory.
+// (/api/tags lists DOWNLOADED models, which is not what the heartbeat needs.)
 func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]string, error) {
-	url := fmt.Sprintf("http://localhost:%d/api/tags", port)
+	url := fmt.Sprintf("http://%s:%d/api/ps", m.host, port)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -96,7 +132,7 @@ func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]
 	}
 
 	// Ollama returns:
-	// { "models": [{ "name": "llama2:latest", "size": 123456 }] }
+	// { "models": [{ "name": "llama2:latest", "model": "llama2:latest", ... }] }
 	var ollamaResp struct {
 		Models []struct {
 			Name string `json:"name"`
@@ -118,8 +154,9 @@ func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]
 // CheckServiceHealth performs a health check on an LLM service.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
 	switch serviceType {
-	case "vllm":
-		return m.checkVLLMHealth(ctx, port)
+	case "vllm", "llamacpp":
+		// Both vLLM and llama.cpp's server expose GET /health.
+		return m.checkHTTPHealth(ctx, port)
 	case "ollama":
 		return m.checkOllamaHealth(ctx, port)
 	default:
@@ -127,9 +164,10 @@ func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType str
 	}
 }
 
-// checkVLLMHealth checks vLLM health via the /health endpoint.
-func (m *ModelDiscovery) checkVLLMHealth(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://localhost:%d/health", port)
+// checkHTTPHealth checks engine health via the /health endpoint (vLLM,
+// llama.cpp).
+func (m *ModelDiscovery) checkHTTPHealth(ctx context.Context, port int) (string, error) {
+	url := fmt.Sprintf("http://%s:%d/health", m.host, port)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -151,7 +189,7 @@ func (m *ModelDiscovery) checkVLLMHealth(ctx context.Context, port int) (string,
 
 // checkOllamaHealth checks Ollama health via the root endpoint.
 func (m *ModelDiscovery) checkOllamaHealth(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://localhost:%d/", port)
+	url := fmt.Sprintf("http://%s:%d/", m.host, port)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

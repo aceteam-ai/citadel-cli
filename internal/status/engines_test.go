@@ -68,6 +68,25 @@ func TestManagedEngineHostPort_VLLM(t *testing.T) {
 	}
 }
 
+// TestManagedProbeEnginesSupersetOfIdleCapable guards against the drift where
+// an engine added to the idle list is silently dropped from the heartbeat's
+// managed-engine sweep (which now iterates managedProbeEngines, #529).
+func TestManagedProbeEnginesSupersetOfIdleCapable(t *testing.T) {
+	for _, name := range idleCapableEngines {
+		if !engineInList(managedProbeEngines, name) {
+			t.Errorf("idle-capable engine %q missing from managedProbeEngines; it would vanish from the heartbeat", name)
+		}
+	}
+	// Every probed engine must be a type DiscoverModels understands, so the
+	// discovery call in collectManagedEngineStatus can never hit the
+	// "unsupported service type" branch.
+	for _, name := range managedProbeEngines {
+		if got := EngineTypeFromName(name); got != name {
+			t.Errorf("EngineTypeFromName(%q) = %q; managedProbeEngines entries must map to themselves", name, got)
+		}
+	}
+}
+
 func TestIdleEngineType_MatchesImage(t *testing.T) {
 	// A catalog slug that doesn't contain "vllm" in the name but whose image does.
 	if got := idleEngineType("llm-server vllm/vllm-openai:latest"); got != "vllm" {
