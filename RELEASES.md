@@ -1175,3 +1175,20 @@ Auto-generated log of every release.
   - Register gotenberg host port 8209 in the module registry (#523)
 
 
+---
+
+## v2.77.0 — 2026-07-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 27 |
+| Lines added | +2370 |
+
+**Changes:**
+
+  - fix(services): unify compose project name, make stops durable (#528) (#532)
+  - feat(meeting): drive containerized meeting module over CDP in MEETING_JOIN (#514) (#531)
+  - feat(cli): discover-and-attach when a worker is already running (#524) (#527)
+
+
