@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -30,6 +31,11 @@ type manifestService struct {
 	Type        string `yaml:"type,omitempty"`
 	ComposeFile string `yaml:"compose_file,omitempty"`
 	Port        int    `yaml:"port,omitempty"`
+	// DesiredStatus mirrors cmd/manifest.go Service.DesiredStatus: "stopped"
+	// makes an operator stop durable (the boot-time start paths skip the
+	// service). Read here so handlers can reason about it; written via
+	// setDesiredStatusInManifestFile (yaml.Node surgery, not this struct).
+	DesiredStatus string `yaml:"desired_status,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -147,8 +153,24 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 	case "SERVICE_STATUS":
 		return h.serviceStatus(svc)
 	case "SERVICE_START":
+		// An explicit remote start clears the durable stopped marker (mirrors
+		// liveModuleOps.Start) so the service also starts on the next boot.
+		// Cleared FIRST so a transiently-failed start still records the
+		// operator's run intent. Best-effort: never blocks the start.
+		if err := h.setDesiredStatusInManifestFile(svc.Name, ""); err != nil {
+			ctx.Log("warning", "     - [Job %s] could not clear stopped marker for %s: %v", job.ID, svc.Name, err)
+		}
 		return h.serviceStart(ctx, svc)
 	case "SERVICE_STOP":
+		// A remote SERVICE_STOP is operator/cloud intent: mark the service
+		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
+		// survives a worker restart / reboot even if the compose down below is
+		// interrupted (#528). Deliberately NOT done in StopServiceByName: the
+		// auto-stop-when-idle reconciler (#416) evicts actual state, not desired
+		// state, and must not prevent an evicted service from starting on boot.
+		if err := h.setDesiredStatusInManifestFile(svc.Name, "stopped"); err != nil {
+			ctx.Log("warning", "     - [Job %s] could not set stopped marker for %s: %v", job.ID, svc.Name, err)
+		}
 		return h.serviceStop(ctx, svc)
 	default:
 		return nil, fmt.Errorf("unknown service job type: %s", job.Type)
@@ -205,6 +227,12 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService) ([]by
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		// Transitional (#528): remove any container still under the legacy
+		// "citadel-<name>" compose project (created by pre-fix TUI/config-apply
+		// starts that passed `-p citadel-<name>`). The no-`-p` up below would
+		// otherwise conflict on the pinned container_name -- a cross-project name
+		// conflict that --force-recreate does NOT resolve.
+		compose.RemoveLegacyProjectContainers("docker", svc.Name)
 		// Include the least-privilege sandbox override when present (untrusted/
 		// Tier-2 modules) so a remotely-started module also runs hardened -- the
 		// override would otherwise be bypassed by this start site.
@@ -285,6 +313,10 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		if cmdErr != nil {
 			err = fmt.Errorf("docker compose down failed: %s", strings.TrimSpace(string(out)))
 		}
+		// Transitional (#528): also remove containers a pre-fix start left under
+		// the legacy "citadel-<name>" compose project, which the no-`-p` down
+		// above cannot see (that mismatch was the silent stop no-op of #528).
+		compose.RemoveLegacyProjectContainers("docker", svc.Name)
 	}
 
 	if err != nil {
@@ -468,6 +500,96 @@ func (h *ServiceHandler) addServiceToManifestFile(svc manifestService) error {
 
 	// Encode with 2-space indent to match the citadel.yaml written by
 	// `citadel init` (yaml.v3's default is 4), keeping the reconciled diff minimal.
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0600)
+}
+
+// setDesiredStatusInManifestFile sets (status == "stopped") or clears
+// (status == "") the durable desired_status marker on a named service in
+// citadel.yaml. It is the jobs-package counterpart of cmd/manifest.go's
+// setServiceDesiredStatus (the jobs package cannot import cmd), implemented as
+// yaml.Node surgery like addServiceToManifestFile so node:, capabilities:, and
+// every field the minimal serviceManifest struct does not model survive the
+// rewrite. Returns an error if the service is not present, so a caller does not
+// silently no-op on a typo'd name.
+func (h *ServiceHandler) setDesiredStatusInManifestFile(name, status string) error {
+	path := filepath.Join(h.ConfigDir, "citadel.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("unexpected manifest structure in %s", path)
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("manifest root is not a mapping in %s", path)
+	}
+
+	var servicesSeq *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "services" {
+			servicesSeq = root.Content[i+1]
+			break
+		}
+	}
+	if servicesSeq == nil || servicesSeq.Kind != yaml.SequenceNode {
+		return fmt.Errorf("service %q not found in manifest", name)
+	}
+
+	found := false
+	for _, item := range servicesSeq.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		isTarget := false
+		statusIdx := -1
+		for j := 0; j+1 < len(item.Content); j += 2 {
+			switch item.Content[j].Value {
+			case "name":
+				if item.Content[j+1].Value == name {
+					isTarget = true
+				}
+			case "desired_status":
+				statusIdx = j
+			}
+		}
+		if !isTarget {
+			continue
+		}
+		found = true
+		switch {
+		case status == "" && statusIdx >= 0:
+			// Clear: drop the key/value pair.
+			item.Content = append(item.Content[:statusIdx], item.Content[statusIdx+2:]...)
+		case status != "" && statusIdx >= 0:
+			item.Content[statusIdx+1].Value = status
+			item.Content[statusIdx+1].Tag = "!!str"
+		case status != "":
+			item.Content = append(item.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "desired_status"},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: status},
+			)
+		}
+		break
+	}
+	if !found {
+		return fmt.Errorf("service %q not found in manifest", name)
+	}
+
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)

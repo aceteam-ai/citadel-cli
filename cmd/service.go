@@ -61,7 +61,7 @@ func composeEnv() []string {
 //     resolve instead of dying on the :? guard.
 //
 // Callers pass their compose args verbatim (e.g. "-f", path, "restart" or
-// "-f", path, "-p", "citadel-"+name, "ps", "--format", "json") and invoke
+// "-f", path, "ps", "--format", "json") and invoke
 // .Run()/.Output()/.CombinedOutput() on the result. Every cmd/ compose call site
 // that interpolates a citadel compose file MUST route through this; a bare
 // exec.Command("docker", "compose", ...) reintroduces the v2.57.0 regression
@@ -71,6 +71,20 @@ func composeCommand(args ...string) *exec.Cmd {
 	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
 	cmd.Env = composeEnv()
 	return cmd
+}
+
+// removeLegacyCitadelProject is the cmd/-tree wrapper around the transitional
+// cleanup for the compose project-name unification (#528): it force-removes any
+// containers still living under the legacy per-service project
+// "citadel-<name>" so the no-`-p` compose invocations (the standardized
+// convention; default project = compose dir basename, "services") neither miss
+// them on `down` nor conflict with them on `up` (a pinned container_name owned
+// by another compose project makes `up` fail; --force-recreate does not clear a
+// cross-project name conflict). Resolves the engine binary through the same
+// runtime selection composeCommand uses. Best-effort: no error surface.
+func removeLegacyCitadelProject(name string) {
+	rt := catalog.SelectContainerRuntime()
+	compose.RemoveLegacyProjectContainers(rt.EngineBin, name)
 }
 
 // prepareCacheDirectories creates the cache directories for all services.

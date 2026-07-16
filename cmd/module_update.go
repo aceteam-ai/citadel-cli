@@ -275,11 +275,17 @@ func composeUpDetached(name, composePath string) error {
 	if _, err := os.Stat(composePath); err != nil {
 		return fmt.Errorf("compose file not found: %s", composePath)
 	}
+	// Transitional (#528): remove any container still under the legacy
+	// "citadel-<name>" project so the no-`-p` up below does not conflict on the
+	// pinned container_name.
+	removeLegacyCitadelProject(name)
 	// Include the least-privilege sandbox override when present (untrusted/Tier-2
 	// modules) so an updated/rolled-back sandboxed module restarts hardened.
+	// No -p: default compose project (dir basename), the standardized convention
+	// production containers run under (#528).
 	args := []string{"compose"}
 	args = append(args, composeFileArgs(composePath, composePath)...)
-	args = append(args, "-p", "citadel-"+name, "up", "-d")
+	args = append(args, "up", "-d")
 	c := exec.Command("docker", args...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
