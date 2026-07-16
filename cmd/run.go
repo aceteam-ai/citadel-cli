@@ -200,6 +200,14 @@ func runSingleService(serviceName string) {
 		fmt.Printf("✅ Added '%s' to manifest\n", serviceName)
 	}
 
+	// An explicit `citadel run <service>` clears the durable stopped marker
+	// (mirrors liveModuleOps.Start, #528) so the service starts on the next boot
+	// again. Cleared FIRST so a transiently-failed start still records the
+	// operator's run intent. Best-effort: the service is in the manifest by now.
+	if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
+	}
+
 	// Start the service
 	fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
 

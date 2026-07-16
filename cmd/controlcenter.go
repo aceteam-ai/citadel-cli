@@ -1374,12 +1374,25 @@ func ccStartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Clear the durable stopped marker FIRST (mirrors liveModuleOps.Start):
+			// an explicit start restores start-on-boot even if the compose up below
+			// fails transiently. Best-effort: the service is in the manifest (we
+			// just found it), so a failure here is unexpected but must not block
+			// the start.
+			_ = setServiceDesiredStatus(configDir, name, "")
+			// Transitional (#528): drop any container still under the legacy
+			// "citadel-<name>" project so the no-`-p` up below does not conflict
+			// on the pinned container_name.
+			removeLegacyCitadelProject(name)
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			// Include the least-privilege sandbox override when present so a
 			// TUI-installed untrusted module also starts hardened here (the
 			// override would otherwise be bypassed by this start site).
+			// No -p: the default compose project (dir basename, "services") is the
+			// standardized convention shared with the boot/run/stop/job paths and
+			// the no-`-p` status reads (#528).
 			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
-			composeArgs = append(composeArgs, "-p", "citadel-"+name, "up", "-d")
+			composeArgs = append(composeArgs, "up", "-d")
 			// composeCommand injects the citadel-owned host ports so the
 			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
 			// start button dies for llamacpp/vllm/extraction/diffusers on
@@ -1400,10 +1413,26 @@ func ccStopService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Mark durably stopped FIRST (mirrors liveModuleOps.Stop): even if the
+			// compose down below is interrupted, a worker restart / reboot will not
+			// resurrect the service (cmd/work.go and cmd/run.go skip services with
+			// desired_status: stopped). This is also what makes the TUI stop
+			// survive `citadel work` restarting managed services (#528).
+			if err := setServiceDesiredStatus(configDir, name, "stopped"); err != nil {
+				return err
+			}
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			downArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "down")
+			// No -p: production containers run under the default compose project
+			// (dir basename, "services"). The old `-p citadel-<name>` down matched
+			// zero containers and exited 0 -- the silent no-op of #528.
+			downArgs := append(composeFileArgs(fullComposePath, fullComposePath), "down")
 			cmd := composeCommand(downArgs...)
-			return cmd.Run()
+			runErr := cmd.Run()
+			// Transitional (#528): also remove containers a pre-fix start left
+			// under the legacy "citadel-<name>" project, which the no-`-p` down
+			// above cannot see.
+			removeLegacyCitadelProject(name)
+			return runErr
 		}
 	}
 
@@ -1419,8 +1448,19 @@ func ccRestartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// A restart expresses "keep this running": clear any durable stopped
+			// marker so the service also starts on the next boot. Best-effort.
+			_ = setServiceDesiredStatus(configDir, name, "")
+			// Transitional (#528): a container still under the legacy
+			// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
+			// (silent no-op) AND conflicts with a no-`-p` up on the pinned
+			// container_name. Remove it, then converge with `up -d
+			// --force-recreate`, which restarts a default-project container and
+			// (re)creates one when the legacy container was just removed --
+			// `restart` alone would no-op in that case.
+			removeLegacyCitadelProject(name)
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "restart")
+			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
 			cmd := composeCommand(restartArgs...)
 			return cmd.Run()
 		}
@@ -1443,8 +1483,9 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 				ComposePath: service.ComposeFile,
 			}
 
-			// Get container info via docker compose ps
-			psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "ps", "--format", "json")
+			// Get container info via docker compose ps (no -p: default project,
+			// matching where production containers actually run, #528)
+			psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
 			psCmd := composeCommand(psArgs...)
 			if output, err := psCmd.Output(); err == nil {
 				var container struct {
@@ -1486,7 +1527,9 @@ func ccGetServiceLogs(name string) ([]string, error) {
 	for _, service := range manifest.Services {
 		if service.Name == name {
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
-			logArgs := append(composeFileArgs(fullComposePath, fullComposePath), "-p", "citadel-"+name, "logs", "--tail", "50", "--no-color")
+			// No -p: read logs from the default compose project, where production
+			// containers actually run (#528).
+			logArgs := append(composeFileArgs(fullComposePath, fullComposePath), "logs", "--tail", "50", "--no-color")
 			cmd := composeCommand(logArgs...)
 			output, err := cmd.Output()
 			if err != nil {

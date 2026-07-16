@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -164,19 +165,36 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 }
 
 // CitadelManifest represents the citadel.yaml configuration file.
+//
+// It mirrors every field cmd/manifest.go's CitadelManifest models (org_id,
+// capabilities, per-service type/port/desired_status): updateManifest
+// round-trips the whole document through this struct, so any field missing
+// here would be silently DROPPED from citadel.yaml on every
+// APPLY_DEVICE_CONFIG (#528). Capabilities is kept as a raw yaml.Node so its
+// structure survives without duplicating cmd's types (a VALUE node, not
+// *yaml.Node: yaml.v3 does not populate pointer-to-Node fields on decode, so a
+// pointer would silently drop the section again).
 type CitadelManifest struct {
 	Node struct {
-		Name string   `yaml:"name"`
-		Tags []string `yaml:"tags"`
+		Name  string   `yaml:"name"`
+		Tags  []string `yaml:"tags"`
+		OrgID string   `yaml:"org_id,omitempty"`
 	} `yaml:"node"`
-	Services []ManifestService `yaml:"services,omitempty"`
-	Config   ManifestConfig    `yaml:"config,omitempty"`
+	Services     []ManifestService `yaml:"services,omitempty"`
+	Config       ManifestConfig    `yaml:"config,omitempty"`
+	Capabilities yaml.Node         `yaml:"capabilities,omitempty"`
 }
 
-// ManifestService represents a service entry in the manifest.
+// ManifestService represents a service entry in the manifest. DesiredStatus is
+// the durable stop marker (see cmd/manifest.go Service.DesiredStatus): it must
+// round-trip through APPLY_DEVICE_CONFIG or a dashboard config save would
+// silently resurrect stopped services on the next boot (#528).
 type ManifestService struct {
-	Name        string `yaml:"name"`
-	ComposeFile string `yaml:"compose_file"`
+	Name          string `yaml:"name"`
+	Type          string `yaml:"type,omitempty"`
+	ComposeFile   string `yaml:"compose_file"`
+	Port          int    `yaml:"port,omitempty"`
+	DesiredStatus string `yaml:"desired_status,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.
@@ -212,11 +230,24 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 		manifest.Node.Tags = append(baseTags, config.CustomTags...)
 	}
 
-	// Update services
+	// Update services: MERGE the config's service list into the existing one
+	// (#528). The previous implementation did `manifest.Services = nil` and
+	// rebuilt from config.Services alone, which (a) wiped every durable
+	// desired_status stop marker and (b) dropped every service the onboarding
+	// wizard doesn't know about -- most importantly module-installed services
+	// (registered via MODULE_SET / `citadel module install`), which would be
+	// silently de-registered by any dashboard config save. The wizard config is
+	// therefore treated as ADDITIVE for the service list: listed services are
+	// materialized and registered if missing, existing entries (and their
+	// DesiredStatus/Type/Port) are preserved untouched, and removal remains the
+	// job of the explicit uninstall paths (MODULE_SET, `citadel module remove`).
 	servicesDir := filepath.Join(configDir, "services")
 	os.MkdirAll(servicesDir, 0755)
 
-	manifest.Services = nil
+	existing := make(map[string]bool, len(manifest.Services))
+	for _, s := range manifest.Services {
+		existing[s.Name] = true
+	}
 	for _, svcName := range config.Services {
 		// Validate service name to prevent path traversal
 		if !serviceNamePattern.MatchString(svcName) {
@@ -236,10 +267,14 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 			}
 		}
 
+		if existing[svcName] {
+			continue // Already registered: preserve the entry as-is.
+		}
 		manifest.Services = append(manifest.Services, ManifestService{
 			Name:        svcName,
 			ComposeFile: filepath.Join("./services", svcName+".yml"),
 		})
+		existing[svcName] = true
 	}
 
 	// Update config options
@@ -281,11 +316,18 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 			continue
 		}
 
-		// Start the service
-		projectName := fmt.Sprintf("citadel-%s", svcName)
+		// Transitional (#528): remove any container still under the legacy
+		// "citadel-<svcName>" project so the no-`-p` up below does not conflict
+		// on the pinned container_name.
+		compose.RemoveLegacyProjectContainers("docker", svcName)
+
+		// Start the service. No -p: the default compose project (dir basename,
+		// "services") is the standardized convention shared with the boot/run/
+		// stop/job paths and the no-`-p` status reads (#528). The old
+		// `-p citadel-<name>` here created containers the stop paths could not
+		// see.
 		cmd := exec.Command("docker", "compose",
 			"-f", composeFile,
-			"-p", projectName,
 			"up", "-d",
 		)
 

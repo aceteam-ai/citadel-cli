@@ -128,14 +128,27 @@ func stopAllServices() {
 		fullComposePath := filepath.Join(configDir, service.ComposeFile)
 		fmt.Printf("🔻 Stopping service: %s\n", service.Name)
 
+		// Mark durably stopped FIRST (mirrors liveModuleOps.Stop, #528): the stop
+		// must survive a `citadel work` restart / reboot, whose boot paths skip
+		// services with desired_status: stopped. `citadel run [service]` clears
+		// the marker again.
+		if err := setServiceDesiredStatus(configDir, service.Name, "stopped"); err != nil {
+			fmt.Fprintf(os.Stderr, "   ⚠️  Could not record stopped state for %s: %v\n", service.Name, err)
+		}
+
 		if err := stopServiceByCompose(fullComposePath, removeContainer); err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to stop service %s: %v\n", service.Name, err)
 		} else {
 			fmt.Printf("   ✅ Service %s is stopped.\n", service.Name)
 		}
+		// Transitional (#528): also remove containers a pre-fix start left under
+		// the legacy "citadel-<name>" compose project, invisible to the no-`-p`
+		// down above.
+		removeLegacyCitadelProject(service.Name)
 	}
 
 	fmt.Println("\n🎉 All services stopped.")
+	fmt.Println("   Services stay stopped across restarts. Use 'citadel run <service>' to start one again.")
 }
 
 // stopSingleService stops a specific service.
@@ -188,11 +201,22 @@ func stopSingleService(serviceName string) {
 	fmt.Printf("--- 🛑 Stopping service: %s ---\n", serviceName)
 
 	if composePath != "" {
+		// Mark durably stopped FIRST (mirrors liveModuleOps.Stop, #528): the stop
+		// must survive a `citadel work` restart / reboot, whose boot paths skip
+		// services with desired_status: stopped. `citadel run <service>` clears
+		// the marker again.
+		if err := setServiceDesiredStatus(configDir, serviceName, "stopped"); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️  Could not record stopped state for %s: %v\n", serviceName, err)
+		}
 		// Use docker compose down if we have the compose file
 		if err := stopServiceByCompose(composePath, removeContainer); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to stop service '%s': %v\n", serviceName, err)
 			os.Exit(1)
 		}
+		// Transitional (#528): also remove containers a pre-fix start left under
+		// the legacy "citadel-<name>" compose project, invisible to the no-`-p`
+		// down above.
+		removeLegacyCitadelProject(serviceName)
 	} else {
 		// Fallback to direct container stop
 		if err := stopServiceByContainer(serviceName); err != nil {
