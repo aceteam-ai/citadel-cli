@@ -141,6 +141,15 @@ const (
 	JobTypeInstanceMessage   = "INSTANCE_MESSAGE"    // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet         = "MODULE_SET"          // Set the desired state of a single module on this node (interim, aceteam#5280)
 	JobTypeMeetingJoin       = "MEETING_JOIN"        // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+
+	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
+	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
+	// and addresses hosted agent instances, not VMs.
+	JobTypeInstanceProvision = "INSTANCE_PROVISION" // Clone + size + mesh-enroll + start a new instance VM
+	JobTypeInstanceStart     = "INSTANCE_START"     // Start an existing instance VM
+	JobTypeInstanceStop      = "INSTANCE_STOP"      // Stop an existing instance VM
+	JobTypeInstanceDestroy   = "INSTANCE_DESTROY"   // Destroy an instance VM and its resources
+	JobTypeInstanceStatus    = "INSTANCE_STATUS"    // Report an instance VM's live status
 )
 
 // allKnownJobTypes enumerates every job type this citadel build knows about.
@@ -191,4 +200,9 @@ var allKnownJobTypes = []string{
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
 	JobTypeMeetingJoin,
+	JobTypeInstanceProvision,
+	JobTypeInstanceStart,
+	JobTypeInstanceStop,
+	JobTypeInstanceDestroy,
+	JobTypeInstanceStatus,
 }

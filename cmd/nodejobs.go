@@ -89,4 +89,13 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Ops: newLiveModuleOps(opts.HandlerLog),
 		Log: opts.HandlerLog,
 	}))
+
+	// INSTANCE_* (aceteam#5963): fabric instance provisioning on this node's
+	// Proxmox hypervisor. Registered unconditionally so nodes without a proxmox
+	// provisioning config fail these jobs with a clear message; the lazy factory
+	// gates on proxmox.json's provisioning.enabled.
+	runner.RegisterHandler(worker.NewInstanceHandler(worker.InstanceHandlerConfig{
+		Provider: newInstanceProviderFactory(opts.ConfigDir, opts.HandlerLog),
+		Log:      opts.HandlerLog,
+	}))
 }
