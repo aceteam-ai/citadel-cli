@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
@@ -220,17 +221,43 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 
 	switch kind {
 	case "native":
+		// Native ollama has no compose env to inject, but its model contract is
+		// pull-based: SERVICE_START {service: ollama, model: X} must ensure X is
+		// pulled (idempotent, fast when cached) so the deploy contract holds even
+		// when the preceding MODEL_CACHE_PULL failed or was missed (#543). Other
+		// native engines have no pull mechanism; their model param stays ignored.
+		pullModel := ""
 		if model != "" {
-			ctx.Log("info", "     - Service %s runs natively; model %q ignored (no compose env to inject)", svc.Name, model)
+			if svc.Name == "ollama" {
+				pullModel = model
+			} else {
+				ctx.Log("info", "     - Service %s runs natively; model %q ignored (no pull mechanism for this engine)", svc.Name, model)
+			}
 		}
-		if services.IsNativeServiceRunning(svc.Name) {
+		alreadyRunning := services.IsNativeServiceRunning(svc.Name)
+		if !alreadyRunning {
+			logDir := filepath.Join(h.ConfigDir, "logs")
+			_, err = services.StartNativeService(svc.Name, logDir)
+		}
+		if err == nil && pullModel != "" {
+			// Hard error on pull failure (job FAILURE), deliberately unlike the
+			// soft serviceResult.Error path below: a deploy that could not make
+			// the model available must not report success (#543).
+			if pullErr := ensureOllamaModel(ctx, pullModel, !alreadyRunning); pullErr != nil {
+				return nil, pullErr
+			}
+			appliedModel = pullModel
+		}
+		if alreadyRunning {
+			msg := svc.Name + " is already running"
+			if appliedModel != "" {
+				msg = fmt.Sprintf("%s is already running; model %s pulled and available", svc.Name, appliedModel)
+			}
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: true, Kind: kind,
-				Action: "start", Message: svc.Name + " is already running",
+				Action: "start", Message: msg,
 			})
 		}
-		logDir := filepath.Join(h.ConfigDir, "logs")
-		_, err = services.StartNativeService(svc.Name, logDir)
 
 	case "docker":
 		modelChanged := false
@@ -472,6 +499,47 @@ func (h *ServiceHandler) persistServiceModel(ctx JobContext, svc manifestService
 	}
 	ctx.Log("info", "     - Persisted %s=%s to %s", envVar, model, envPath)
 	return envVar, true, nil
+}
+
+// ollamaServerWaitTimeout bounds the readiness poll before pulling on a
+// freshly-started native ollama: `ollama pull` needs the server up.
+const ollamaServerWaitTimeout = 30 * time.Second
+
+// ensureOllamaModel makes a model available on a natively-running ollama by
+// running `ollama pull <model>` (#543). The pull is idempotent and fast when
+// the model is already cached, so it is safe to run on every SERVICE_START —
+// it is the node-side guarantee that the deploy contract (MODEL_CACHE_PULL
+// then SERVICE_START {service, model}) holds even when the weights pull was
+// missed or dispatched to the wrong engine. Failures are returned as errors so
+// the job reports FAILURE instead of silently serving nothing. When
+// waitForServer is set (service just started), the server is polled via
+// `ollama list` before pulling; on poll timeout the pull still runs and
+// surfaces the real connection error.
+func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
+	// The model is backend-controlled input passed to exec: validate with the
+	// same allowlist the compose env persistence uses.
+	if !modelIDPattern.MatchString(model) {
+		return fmt.Errorf("invalid model identifier %q", model)
+	}
+	if _, err := exec.LookPath("ollama"); err != nil {
+		return fmt.Errorf("cannot pull model %q: ollama binary not found in PATH", model)
+	}
+	if waitForServer {
+		deadline := time.Now().Add(ollamaServerWaitTimeout)
+		for time.Now().Before(deadline) {
+			if exec.Command("ollama", "list").Run() == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	}
+	ctx.Log("info", "     - Ensuring ollama model %q is pulled (idempotent; fast when cached)", model)
+	out, err := runOllamaPull(model)
+	if err != nil {
+		return fmt.Errorf("ollama pull %s failed: %w: %s", model, err, strings.TrimSpace(string(out)))
+	}
+	ctx.Log("info", "     - Model %q pulled and available on ollama", model)
+	return nil
 }
 
 // ---------------------------------------------------------------------------

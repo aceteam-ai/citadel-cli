@@ -2,15 +2,32 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
+
+// ollamaPullTimeout bounds a foreground `ollama pull`. Pulls of large models
+// on slow links can legitimately take a long time, so this is generous — the
+// bound exists only so a wedged pull cannot pin a job slot forever.
+const ollamaPullTimeout = 2 * time.Hour
+
+// runOllamaPull runs `ollama pull <model>` bounded by ollamaPullTimeout.
+// Shared by MODEL_CACHE_PULL (pullOllama) and the SERVICE_START native-ollama
+// path (ensureOllamaModel, #543) so both pull with the same bounds.
+func runOllamaPull(modelName string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(context.Background(), ollamaPullTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "ollama", "pull", modelName)
+	return cmd.CombinedOutput()
+}
 
 // ModelCachePullHandler handles MODEL_CACHE_PULL jobs.
 // It pulls model weights into the local cache for the specified engine.
@@ -50,8 +67,7 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 func (h *ModelCachePullHandler) pullOllama(ctx JobContext, jobID, modelName string) ([]byte, error) {
 	ctx.Log("info", "     - [Job %s] Pulling model '%s' via ollama", jobID, modelName)
 
-	cmd := exec.Command("ollama", "pull", modelName)
-	output, err := cmd.CombinedOutput()
+	output, err := runOllamaPull(modelName)
 	if err != nil {
 		return output, fmt.Errorf("ollama pull failed: %w", err)
 	}
