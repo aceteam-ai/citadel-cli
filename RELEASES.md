@@ -1209,3 +1209,18 @@ Auto-generated log of every release.
   - feat(status): surface loaded models per engine in heartbeat and citadel status (#529) (#536)
 
 
+---
+
+## v2.79.0 — 2026-07-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +124 |
+
+**Changes:**
+
+  - fix(reconcile): fetch desired-state by Headscale node_id + default pull ON (#535) (#539)
+
+
