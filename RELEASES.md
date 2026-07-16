@@ -1192,3 +1192,20 @@ Auto-generated log of every release.
   - feat(cli): discover-and-attach when a worker is already running (#524) (#527)
 
 
+---
+
+## v2.78.0 — 2026-07-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 13 |
+| Lines added | +880 |
+
+**Changes:**
+
+  - chore(release): v2.77.0
+  - feat(jobs): SERVICE_START honors payload model for vllm (#530) (#537)
+  - feat(status): surface loaded models per engine in heartbeat and citadel status (#529) (#536)
+
+
