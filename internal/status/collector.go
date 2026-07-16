@@ -335,14 +335,7 @@ func (c *Collector) collectServiceStatus() []ServiceInfo {
 
 // detectLLMServiceType determines the LLM service type from the service name.
 func (c *Collector) detectLLMServiceType(serviceName string) string {
-	name := strings.ToLower(serviceName)
-	if strings.Contains(name, "vllm") {
-		return "vllm"
-	}
-	if strings.Contains(name, "ollama") {
-		return "ollama"
-	}
-	return ""
+	return EngineTypeFromName(serviceName)
 }
 
 // getDockerComposeStatus checks if a docker compose service is running.
