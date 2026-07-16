@@ -57,6 +57,55 @@ func TestMeetingHostPortsRegistered(t *testing.T) {
 	}
 }
 
+// TestGotenbergHostPortRegistered pins the gotenberg document-conversion
+// module's host port (aceteam-ai/citadel-services#10, unblocking Sovereign
+// Sign P2 / aceteam#5793): it must be registered, distinct from every other
+// managed/reserved port, and above the apps auto-allocation range. Like
+// claudecode and meeting, gotenberg's compose lives in citadel-services (not
+// the embedded ServiceMap), so this registry -- and this test -- is the only
+// thing that stops a future module from hardcoding over 8209. The union guard
+// in internal/apps/hostport_collision_test.go does NOT cover this port: it
+// only claims ports from the apps catalog and services.ServiceMap compose
+// files, neither of which gotenberg is part of.
+func TestGotenbergHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["gotenberg"]
+	if !ok || got != GotenbergHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "gotenberg", got, ok, GotenbergHostPort)
+	}
+	if _, ok := serviceHostPortEnv["gotenberg"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "gotenberg")
+	}
+	if GotenbergHostPort >= AppsPortRangeStart && GotenbergHostPort <= AppsPortRangeEnd {
+		t.Errorf("gotenberg host port %d sits inside the apps auto-allocation range %d-%d", GotenbergHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[GotenbergHostPort]; taken {
+		t.Errorf("gotenberg host port %d collides with reserved citadel port %q", GotenbergHostPort, name)
+	}
+	// Pairwise-unique against every other managed service.
+	for svc, port := range ServiceHostPorts {
+		if svc == "gotenberg" {
+			continue
+		}
+		if port == GotenbergHostPort {
+			t.Errorf("gotenberg host port collides with managed service %q (%d)", svc, port)
+		}
+	}
+	// HostPortEnv must emit the gotenberg var so a compose that defers to it
+	// resolves.
+	env := HostPortEnv()
+	want := EnvGotenbergHostPort + "=8209"
+	found := false
+	for _, kv := range env {
+		if kv == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}
+
 // TestReservedCitadelPortsPairwiseDistinct asserts that no two DISTINCT
 // citadel-owned listeners are registered on the same port. Reserved ports are
 // a set-to-avoid for modules/apps (covered by the apps collision guard), but
