@@ -32,8 +32,20 @@ var forceRecreate bool
 // inherited a bare os.Environ() and so failed the :? guard on v2.57.0 for those
 // four services. Every compose-up site in this tree MUST build its command
 // environment from this helper. Mirrors internal/jobs.ServiceHandler.composeEnv.
+//
+// It also guarantees CITADEL_WORKSPACE is set to an absolute workspace path so
+// compose files that bind-mount the node workspace via the guarded
+// ${CITADEL_WORKSPACE:?...} form (transcribe, meeting) interpolate on read-only
+// invocations too (`citadel status` ps, logs, down) instead of dying on the :?
+// guard (#525). Resolution mirrors the worker (env > ~/citadel-node/workspace
+// default via resolveWorkspaceDir); an empty value is never injected -- if the
+// path cannot be resolved the :? guard still fails loudly.
 func composeEnv() []string {
-	return append(os.Environ(), svcports.HostPortEnv()...)
+	env := os.Environ()
+	if ws := resolveWorkspaceDir(); ws != "" {
+		env = append(env, "CITADEL_WORKSPACE="+ws)
+	}
+	return append(env, svcports.HostPortEnv()...)
 }
 
 // composeCommand builds an *exec.Cmd for a `docker/podman compose` invocation

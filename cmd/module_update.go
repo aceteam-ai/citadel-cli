@@ -281,6 +281,9 @@ func composeUpDetached(name, composePath string) error {
 	args = append(args, composeFileArgs(composePath, composePath)...)
 	args = append(args, "-p", "citadel-"+name, "up", "-d")
 	c := exec.Command("docker", args...)
+	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
+	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
+	c.Env = composeEnv()
 	if out, err := c.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
 	}

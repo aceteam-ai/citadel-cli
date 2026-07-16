@@ -216,6 +216,9 @@ func stopServiceByCompose(composePath string, remove bool) error {
 	}
 
 	cmd := exec.Command("docker", args...)
+	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
+	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
+	cmd.Env = composeEnv()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker compose down failed:\n%s\n   Hint: Is Docker running? Check with 'docker info'", strings.TrimSpace(string(output)))
