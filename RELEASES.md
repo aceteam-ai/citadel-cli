@@ -1159,3 +1159,19 @@ Auto-generated log of every release.
   - feat(reconcile): pull protobuf desired-state and converge (node-side, aceteam#4273) (#516)
 
 
+---
+
+## v2.76.0 — 2026-07-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 7 |
+| Lines added | +147 |
+
+**Changes:**
+
+  - fix(status): inject CITADEL_WORKSPACE into compose env (#525) (#526)
+  - Register gotenberg host port 8209 in the module registry (#523)
+
+
