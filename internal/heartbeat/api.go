@@ -32,6 +32,7 @@ type APIPublisher struct {
 	nodeID          string
 	headscaleNodeID string // Headscale numeric node ID (e.g., "758")
 	orgID           string
+	agentVersion    string // citadel-cli binary version, reported as agent_version
 	interval        time.Duration
 	collector       *status.Collector
 
@@ -83,6 +84,12 @@ type APIPublisherConfig struct {
 	// OrgID is the organization ID for channel scoping (required for API mode)
 	OrgID string
 
+	// AgentVersion is the citadel-cli binary version (e.g. "v2.75.0"), included
+	// in every heartbeat so the backend can persist the node's agent_version.
+	// Optional: empty means "unknown" and the backend never overwrites a
+	// known-good value with it.
+	AgentVersion string
+
 	// Interval is the time between status publishes (default: 30s)
 	Interval time.Duration
 
@@ -119,6 +126,7 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 		nodeID:          cfg.NodeID,
 		headscaleNodeID: cfg.HeadscaleNodeID,
 		orgID:           cfg.OrgID,
+		agentVersion:    cfg.AgentVersion,
 		interval:        cfg.Interval,
 		collector:       collector,
 		pubSubChannel:   pubSubChannel,
@@ -208,6 +216,7 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		HeadscaleNodeID: p.headscaleNodeID,
 		Status:          nodeStatus,
 		Permissions:     p.permissions,
+		AgentVersion:    p.agentVersion,
 	}
 
 	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
