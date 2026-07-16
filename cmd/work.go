@@ -1436,13 +1436,12 @@ func runWork(cmd *cobra.Command, args []string) {
 					fmt.Printf("   - Node-state reporting: every %s\n", nodestate.DefaultInterval)
 				}
 
-				// Optional, config-gated (default OFF) desired-state PULL reconcile
-				// loop (aceteam#4273). When the operator opts in via
-				// CITADEL_RECONCILE_PULL, the node periodically pulls its
-				// control-plane-assigned DesiredState (protobuf) and converges via the
-				// SAME reconcile engine + live ModuleOps adapter MODULE_SET uses. Wired
-				// in the worker path ONLY (never the control center) so a node runs
-				// exactly one converge loop.
+				// Desired-state PULL reconcile loop (aceteam#4273), ON by default.
+				// The node periodically pulls its control-plane-assigned DesiredState
+				// (protobuf) and converges via the SAME reconcile engine + live
+				// ModuleOps adapter MODULE_SET uses. Wired in the worker path ONLY
+				// (never the control center) so a node runs exactly one converge loop.
+				// Disable fleet-wide with the CITADEL_RECONCILE_PULL kill switch.
 				//
 				// The loop is keyed by the Headscale numeric node ID, NOT the hostname
 				// (aceteam#535). The desired-state serve endpoint matches rows by a raw
@@ -1465,11 +1464,12 @@ func runWork(cmd *cobra.Command, args []string) {
 						}
 					}()
 					fmt.Printf("   - Desired-state pull: ENABLED (reconcile every %s)\n", reconcile.DefaultInterval)
-				} else if reconcile.PullEnabled() && headscaleNodeID == "" {
-					// Opted in but the Headscale ID never resolved: skip rather than
-					// fetch/report under the wrong key. Log why — a silent skip here is
-					// exactly the non-functional-loop failure aceteam#535 describes.
-					fmt.Fprintln(os.Stderr, "   - ⚠️ Desired-state pull requested (CITADEL_RECONCILE_PULL) but Headscale node ID is unresolved; skipping (fetching by the wrong key would never match desired rows)")
+				} else if !reconcile.PullDisabled() && headscaleNodeID == "" {
+					// Pull is on (not killed) but the Headscale ID never resolved: skip
+					// rather than fetch/report under the wrong key. Log why — a silent
+					// skip here is exactly the non-functional-loop failure aceteam#535
+					// describes.
+					fmt.Fprintln(os.Stderr, "   - ⚠️ Desired-state pull enabled but Headscale node ID is unresolved; skipping (fetching by the wrong key would never match desired rows)")
 				}
 
 				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{

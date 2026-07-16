@@ -28,11 +28,13 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
-// newReconcileLoop builds the config-gated desired-state PULL reconcile loop
-// (aceteam#4273), or returns nil when the operator has not opted in
-// (CITADEL_RECONCILE_PULL unset/false) so the feature adds zero cost by default.
+// newReconcileLoop builds the desired-state PULL reconcile loop (aceteam#4273).
+// The loop is ON by default; it returns nil only when the operator has hit the
+// CITADEL_RECONCILE_PULL kill switch, or when there is no client / node ID to
+// key it by. A node with no desired-state rows converges to a no-op (see
+// RefuseFullWipe below), so default-on adds no churn for unmanaged nodes.
 //
-// When enabled it wires the ProtoProvider (fetch DesiredState + report
+// It wires the ProtoProvider (fetch DesiredState + report
 // ActualState as protobuf over the device-authed client) onto the SAME live
 // ModuleOps adapter and reconcile engine the MODULE_SET handler uses, so a pulled
 // desired state converges through exactly the tested install/uninstall/start/stop
@@ -50,7 +52,7 @@ import (
 // matches, leaving the loop non-functional. Returns nil when nodeID is empty so
 // the loop is skipped rather than started under a wrong key.
 func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
-	if !reconcile.PullEnabled() {
+	if reconcile.PullDisabled() {
 		return nil
 	}
 	if client == nil || nodeID == "" {
