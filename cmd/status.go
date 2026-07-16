@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/resmon"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/dashboard"
+	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/fatih/color"
 	"github.com/redis/go-redis/v9"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -95,6 +97,9 @@ func runStandardStatus() {
 
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
+	headerColor.Fprintln(w, "\n🛠️ WORKER")
+	printWorkerInfo(w)
+
 	headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
 	printMemInfo(w)
 	printCPUInfo(w)
@@ -124,6 +129,30 @@ func runStandardStatus() {
 
 	headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 	printServiceInfo(w)
+}
+
+// printWorkerInfo reports whether a `citadel work` worker currently holds the
+// single-instance lock for this node (issue #524). It mirrors the control-center
+// precedent (cmd/controlcenter.go) which uses worklock.IsHeld to detect a live
+// worker, and enriches the line with the recorded PID / version. Read-only: it
+// never touches the lock (IsHeld probes on a separate fd and unlocks immediately).
+func printWorkerInfo(w io.Writer) {
+	stateDir := network.GetStateDir()
+	held, pid := worklock.IsHeld(stateDir)
+	if !held {
+		fmt.Fprintf(w, "  %s\t%s\n", labelColor.Sprint("Status:"), warnColor.Sprint("not running"))
+		return
+	}
+	detail := fmt.Sprintf("PID %d", pid)
+	if holder, ok := worklock.ReadHolder(stateDir); ok {
+		if holder.Version != "" {
+			detail += ", v" + holder.Version
+		}
+		if !holder.StartTime.IsZero() {
+			detail += ", uptime " + humanizeUptime(time.Since(holder.StartTime))
+		}
+	}
+	fmt.Fprintf(w, "  %s\t%s (%s)\n", labelColor.Sprint("Status:"), goodColor.Sprint("running"), detail)
 }
 
 // runInteractiveDashboard runs the interactive TUI dashboard

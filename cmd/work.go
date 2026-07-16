@@ -100,6 +100,12 @@ var (
 	// direct-Redis worker alongside the API-mode one in development).
 	workNoSingleInstance bool
 
+	// Discover-and-attach overrides (issue #524): when a worker is already
+	// running, --attach forces the friendly status banner (even off a TTY) and
+	// --no-attach forces the legacy exit-1 refusal. Default is TTY-gated.
+	workAttach   bool
+	workNoAttach bool
+
 	// Node-key renewer flag (epic #4583): disable the background loop that
 	// refreshes the Headscale node key before expiry while online.
 	workNoKeyRenew bool
@@ -315,6 +321,15 @@ func runWork(cmd *cobra.Command, args []string) {
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
 			if errors.As(lockErr, &running) {
+				// Discover-and-attach (issue #524, increment 1): on an interactive
+				// TTY, print the running worker's status instead of a bare error
+				// (docker-daemon style). Non-TTY (systemd, scripts) keeps today's
+				// exit-1 refusal UNCHANGED so a misconfigured double systemd unit
+				// still fails visibly. --attach / --no-attach override the heuristic.
+				if decideAttach(stdoutIsTTY(), workAttach, workNoAttach) {
+					renderWorkAttach(network.GetStateDir(), running)
+					os.Exit(0)
+				}
 				fmt.Fprintf(os.Stderr, "Error: %v\n", running)
 				fmt.Fprintln(os.Stderr, "\nAnother 'citadel work' is already serving this node.")
 				fmt.Fprintln(os.Stderr, "Stop it first (e.g. 'systemctl --user stop citadel' or kill the PID above),")
@@ -2567,6 +2582,8 @@ func init() {
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
 	workCmd.Flags().BoolVar(&workNoSingleInstance, "no-single-instance", false, "Allow a second worker to run for this node (skips the single-instance lock)")
+	workCmd.Flags().BoolVar(&workAttach, "attach", false, "When a worker is already running, print its status banner instead of refusing (default: only on an interactive terminal)")
+	workCmd.Flags().BoolVar(&workNoAttach, "no-attach", false, "When a worker is already running, refuse with exit 1 instead of printing the status banner")
 	workCmd.Flags().BoolVar(&workNoKeyRenew, "no-key-renew", false, "Disable the background Headscale node-key renewer (renews the key before expiry while online)")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
