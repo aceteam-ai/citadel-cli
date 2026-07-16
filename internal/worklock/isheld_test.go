@@ -1,10 +1,15 @@
 package worklock
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -92,31 +97,51 @@ func TestIsHeldLiveWorker(t *testing.T) {
 		"WORKLOCK_HELPER=1",
 		"WORKLOCK_HELPER_STATEDIR="+stateDir,
 	)
+	// The helper keeps itself alive by blocking on stdin (see TestLockHolderHelper
+	// for why: a bare `select {}` gets the helper killed by Go's runtime deadlock
+	// detector — issue #538). Hold the write end open for the whole test so the
+	// helper stays alive until we kill it.
+	stdin, err := helper.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	defer func() { _ = stdin.Close() }()
 	stdout, err := helper.StdoutPipe()
 	if err != nil {
 		t.Fatalf("stdout pipe: %v", err)
 	}
+	var stderr bytes.Buffer
+	helper.Stderr = &stderr
 	if err := helper.Start(); err != nil {
 		t.Fatalf("start helper: %v", err)
 	}
 	defer func() { _ = helper.Process.Kill(); _, _ = helper.Process.Wait() }()
 
-	// Wait for the helper to signal it has acquired the lock.
-	buf := make([]byte, 16)
-	waitReady := make(chan struct{})
+	// Wait for the helper to signal it has acquired the lock. The signal must be
+	// the literal "ready" line: anything else (EOF from a crashed helper, testing
+	// framework output) means the helper is NOT holding the lock, and treating it
+	// as ready would surface later as a baffling "not held" failure.
+	type readResult struct {
+		line string
+		err  error
+	}
+	readCh := make(chan readResult, 1)
 	go func() {
-		_, _ = stdout.Read(buf)
-		close(waitReady)
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		readCh <- readResult{line, err}
 	}()
 	select {
-	case <-waitReady:
+	case r := <-readCh:
+		if r.err != nil || strings.TrimSpace(r.line) != "ready" {
+			t.Fatalf("helper did not signal readiness: read %q (err %v); helper stderr:\n%s", r.line, r.err, stderr.String())
+		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("helper did not acquire the lock within 10s")
+		t.Fatalf("helper did not acquire the lock within 10s; helper stderr:\n%s", stderr.String())
 	}
 
 	held, pid := IsHeld(stateDir)
 	if !held {
-		t.Fatalf("IsHeld while a live citadel worker holds the lock = not held, want held")
+		t.Fatalf("IsHeld while a live citadel worker holds the lock = not held, want held; helper stderr:\n%s", stderr.String())
 	}
 	if pid != helper.Process.Pid {
 		t.Errorf("IsHeld holder PID = %d, want helper PID %d", pid, helper.Process.Pid)
@@ -137,8 +162,17 @@ func TestIsHeldLiveWorker(t *testing.T) {
 
 // TestLockHolderHelper is not a real test: it is the subprocess entrypoint spawned
 // by TestIsHeldLiveWorker. Gated by WORKLOCK_HELPER so it is inert during a normal
-// test run. It acquires the worker lock, prints a readiness byte, and blocks so the
-// parent can observe a live holder.
+// test run. It acquires the worker lock, self-verifies IsHeld sees the lock, prints
+// a readiness line, and blocks on stdin so the parent can observe a live holder.
+//
+// The keep-alive MUST block in a syscall (reading stdin), not in the Go scheduler.
+// An earlier version used `select {}`, which blocked every goroutine in the helper
+// and tripped Go's runtime deadlock detector ("all goroutines are asleep"), killing
+// the helper (and releasing the flock) milliseconds after "ready" was written. The
+// parent usually won the race to IsHeld, but on a loaded machine it was descheduled
+// first and observed a genuinely dead holder — the flake in issue #538. A goroutine
+// blocked reading a pipe is invisible to the deadlock detector, and stdin EOF also
+// gives the helper a clean exit if the parent dies without killing it.
 func TestLockHolderHelper(t *testing.T) {
 	if os.Getenv("WORKLOCK_HELPER") != "1" {
 		return
@@ -146,12 +180,20 @@ func TestLockHolderHelper(t *testing.T) {
 	stateDir := os.Getenv("WORKLOCK_HELPER_STATEDIR")
 	l, err := Acquire(stateDir, "vHELPER", nil)
 	if err != nil {
-		// Signal failure by exiting non-zero.
+		fmt.Fprintf(os.Stderr, "helper: Acquire failed: %v\n", err)
 		os.Exit(2)
 	}
 	defer l.Release()
-	// Signal readiness to the parent, then block until killed.
+	// Self-verify before signaling: "ready" must mean "a probe from any process
+	// would observe the lock held by this PID". The flock and the on-disk record
+	// are kernel/filesystem state, so if this process sees them, the parent will.
+	if held, pid := IsHeld(stateDir); !held || pid != os.Getpid() {
+		fmt.Fprintf(os.Stderr, "helper: self-check IsHeld = (%v, %d), want (true, %d)\n", held, pid, os.Getpid())
+		os.Exit(2)
+	}
+	// Signal readiness to the parent, then block until stdin closes (parent exit)
+	// or we are killed.
 	_, _ = os.Stdout.WriteString("ready\n")
 	_ = os.Stdout.Sync()
-	select {}
+	_, _ = io.Copy(io.Discard, os.Stdin)
 }
