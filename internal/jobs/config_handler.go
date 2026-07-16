@@ -326,10 +326,13 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// stop/job paths and the no-`-p` status reads (#528). The old
 		// `-p citadel-<name>` here created containers the stop paths could not
 		// see.
-		cmd := exec.Command("docker", "compose",
-			"-f", composeFile,
-			"up", "-d",
-		)
+		// Pass the sibling config env (<name>.env) explicitly so a previously
+		// persisted model selection (#530) and any install-time config resolve;
+		// docker compose only auto-loads a file literally named ".env".
+		composeArgs := []string{"compose", "-f", composeFile}
+		composeArgs = append(composeArgs, compose.EnvFileArgs(composeFile)...)
+		composeArgs = append(composeArgs, "up", "-d")
+		cmd := exec.Command("docker", composeArgs...)
 
 		// Set working directory for relative paths in compose files
 		cmd.Dir = configDir
