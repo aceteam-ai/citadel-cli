@@ -15,6 +15,10 @@ type Config struct {
 	TokenID     string `json:"token_id,omitempty"`
 	TokenSecret string `json:"token_secret,omitempty"`
 	NodeName    string `json:"node_name,omitempty"`
+
+	// Provisioning enables and configures fabric instance provisioning
+	// (INSTANCE_* jobs, aceteam#5963) on this node. Nil means disabled.
+	Provisioning *ProvisioningConfig `json:"provisioning,omitempty"`
 }
 
 // ConfigPath returns the absolute path of the Proxmox config file for the
