@@ -18,9 +18,11 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/resmon"
+	statuspkg "github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/tui/dashboard"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
+	svcports "github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
 	"github.com/redis/go-redis/v9"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -909,6 +911,13 @@ func printServiceInfo(w *tabwriter.Writer) {
 			var statusStr string
 			if strings.Contains(state, "RUNNING") || strings.Contains(state, "UP") {
 				statusStr = goodColor.Sprintf("🟢 %s", state)
+				// For running serving engines, show the model(s) actually loaded,
+				// e.g. "🟢 RUNNING (Qwen/Qwen3-8B)" (#529). Non-engine services and
+				// engines that don't answer within the short probe window print
+				// unchanged.
+				if models := discoverServiceModels(service.Name); len(models) > 0 {
+					statusStr += fmt.Sprintf(" (%s)", strings.Join(models, ", "))
+				}
 			} else if strings.Contains(state, "EXITED") || strings.Contains(state, "DEAD") {
 				statusStr = badColor.Sprintf("🔴 %s", state)
 			} else {
@@ -917,6 +926,34 @@ func printServiceInfo(w *tabwriter.Writer) {
 			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
 		}
 	}
+}
+
+// discoverServiceModels returns the LOADED model(s) for a running serving
+// engine service (vllm/ollama/llamacpp), or nil for non-engine services and
+// for engines that fail to answer quickly (#529). The port comes from the
+// citadel-owned host-port registry (services.ManagedServiceHostPort), falling
+// back to the engine's well-known native port (e.g. ollama 11434). Failures
+// are silent: status rendering must never stall or error on a slow engine, so
+// the probe is bounded by a short timeout.
+func discoverServiceModels(serviceName string) []string {
+	engine := statuspkg.EngineTypeFromName(serviceName)
+	if engine == "" {
+		return nil
+	}
+	port, ok := svcports.ManagedServiceHostPort(engine)
+	if !ok {
+		port = statuspkg.InferServicePort(engine)
+	}
+	if port <= 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), statuspkg.ModelDiscoveryTimeout)
+	defer cancel()
+	models, err := statuspkg.NewModelDiscovery().DiscoverModels(ctx, engine, port)
+	if err != nil {
+		return nil
+	}
+	return models
 }
 
 func colorizePercent(p float64) string {

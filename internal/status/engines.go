@@ -19,21 +19,33 @@ import (
 // other engines (sglang, llama.cpp) grow comparable metrics.
 var idleCapableEngines = []string{"vllm"}
 
+// managedProbeEngines lists the managed serving engines the heartbeat path
+// probes for a live signal: an idle signal (idleCapableEngines) and/or the
+// loaded model(s) over the engine's local HTTP API (#529). It must remain a
+// superset of idleCapableEngines (guarded by a test) so extending the idle
+// list never silently drops an engine from the heartbeat.
+var managedProbeEngines = []string{"vllm", "ollama", "llamacpp"}
+
 // collectManagedEngineStatus reports running managed serving engines (from the
-// embedded services.ServiceMap) that carry an idle signal, so the per-service
-// idle telemetry reaches the heartbeat even when no manifest-driven service
-// config was passed to the collector (the common heartbeat case, where
-// c.services is nil).
+// embedded services.ServiceMap) so their telemetry reaches the heartbeat even
+// when no manifest-driven service config was passed to the collector (the
+// common heartbeat case, where c.services is nil). Each entry carries the
+// per-service idle signal when the engine's metrics are scrapeable (citadel
+// #416) and the currently LOADED model(s) discovered from the engine's local
+// API (citadel #529) — e.g. vLLM/llama.cpp `GET /v1/models`, ollama
+// `GET /api/ps`.
 //
-// It only emits an entry for an engine that is actually running AND whose
-// metrics endpoint could be scraped. A running-but-unscrapeable engine (e.g.
-// still loading its model, /metrics not yet up) is skipped rather than reported
-// with a misleading "idle since startup" — the existing manifest-driven
-// collectServiceStatus still reports its up/down state when configured.
+// It only emits an entry for an engine that is actually running AND answered
+// at least one probe (idle scrape or model discovery). An engine that answers
+// model discovery with an empty list (llama.cpp up with no model loaded,
+// ollama with nothing resident) IS emitted — running with no models is real,
+// reportable state. A running-but-unresponsive engine (e.g. still loading its
+// model, HTTP not yet up) is skipped rather than reported with a misleading
+// "idle since startup" — the existing manifest-driven collectServiceStatus
+// still reports its up/down state when configured. Probe failures never fail
+// the collection: each probe is bounded by ModelDiscoveryTimeout and a failure
+// simply leaves the corresponding field empty.
 func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
-	if c.idleTracker == nil {
-		return nil
-	}
 	ctx := context.Background()
 	var out []ServiceInfo
 
@@ -44,26 +56,55 @@ func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
 	// idle signal would never fire on exactly the nodes this feature targets.
 	engineBin := catalog.SelectContainerRuntime().EngineBin
 
-	for _, name := range idleCapableEngines {
+	for _, name := range managedProbeEngines {
 		port, running := managedEnginePortIfRunning(engineBin, name)
 		if !running || port <= 0 {
 			continue
 		}
-		state, ok := c.idleTracker.Observe(ctx, name, name, port)
-		if !ok {
+
+		info := ServiceInfo{
+			Name:   name,
+			Type:   ServiceTypeLLM,
+			Status: ServiceStatusRunning,
+			Port:   port,
+			Health: HealthStatusOK,
+		}
+		responded := false
+
+		if c.idleTracker != nil && engineInList(idleCapableEngines, name) {
+			if state, ok := c.idleTracker.Observe(ctx, name, name, port); ok {
+				idle := state
+				info.IdleState = &idle
+				responded = true
+			}
+		}
+
+		if c.modelDiscovery != nil {
+			mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
+			models, err := c.modelDiscovery.DiscoverModels(mctx, name, port)
+			cancel()
+			if err == nil {
+				info.Models = models
+				responded = true
+			}
+		}
+
+		if !responded {
 			continue
 		}
-		idle := state
-		out = append(out, ServiceInfo{
-			Name:      name,
-			Type:      ServiceTypeLLM,
-			Status:    ServiceStatusRunning,
-			Port:      port,
-			Health:    HealthStatusOK,
-			IdleState: &idle,
-		})
+		out = append(out, info)
 	}
 	return out
+}
+
+// engineInList reports whether name is present in the given engine list.
+func engineInList(list []string, name string) bool {
+	for _, e := range list {
+		if e == name {
+			return true
+		}
+	}
+	return false
 }
 
 // managedEnginePortIfRunning reports whether a managed engine is running and,
