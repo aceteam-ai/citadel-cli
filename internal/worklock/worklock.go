@@ -29,6 +29,7 @@ package worklock
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -162,4 +163,38 @@ func (e *ErrAlreadyRunning) Error() string {
 		return fmt.Sprintf("citadel worker already running (PID %d, started %s); refusing to start a second instance", e.PID, started)
 	}
 	return "citadel worker already running; refusing to start a second instance"
+}
+
+// HolderRecord is the read-only public view of the recorded lock holder. It
+// carries the identity metadata the lock file persists so discover-and-attach
+// callers can name the running worker without acquiring or probing the lock.
+type HolderRecord struct {
+	// PID is the recorded holder PID (> 0 when ok is true).
+	PID int
+	// StartTime is the recorded holder start time, or the zero value for a legacy
+	// bare-PID lock file that carried no timestamp.
+	StartTime time.Time
+	// Version is the recorded holder's citadel version, or "" when unknown.
+	Version string
+}
+
+// ReadHolder reads the recorded holder metadata (PID / start time / version) from
+// the lock file for the node keyed to stateDir, WITHOUT taking or probing the OS
+// lock. It is the metadata companion to IsHeld: IsHeld answers "is a live worker
+// holding the lock" (with a flock probe + liveness check), while ReadHolder just
+// reports what the holder recorded about itself. Because it does not check
+// liveness, callers that need "alive" should pair it with IsHeld.
+//
+// Returns ok=false when the lock file is absent, unreadable, or carries no usable
+// PID (an empty/garbage record), so a missing worker never yields a bogus holder.
+func ReadHolder(stateDir string) (HolderRecord, bool) {
+	data, err := os.ReadFile(LockPathForStateDir(stateDir))
+	if err != nil {
+		return HolderRecord{}, false
+	}
+	rec := decodeRecord(data)
+	if rec.PID <= 0 {
+		return HolderRecord{}, false
+	}
+	return HolderRecord{PID: rec.PID, StartTime: startTime(rec), Version: rec.Version}, true
 }
