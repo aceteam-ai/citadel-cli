@@ -1224,3 +1224,31 @@ Auto-generated log of every release.
   - fix(reconcile): fetch desired-state by Headscale node_id + default pull ON (#535) (#539)
 
 
+---
+
+## v2.80.0 — 2026-07-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 14 |
+| Files changed | 71 |
+| Lines added | +7694 |
+
+**Changes:**
+
+  - feat(meeting): sovereign audio backup — node Opus transcode + upload + retention (#555)
+  - fix(worker): watchdog + self-heal + liveness for consumption-wedged worker (#548) (#556)
+  - feat(controlcenter): show scannable QR in device-auth modal (#553) (#554)
+  - feat(device): automatic leaf renewal + grace-aware self-heal in the device daemon
+  - fix(meeting): host-UID container mapping + guaranteed terminal transcribe/lifecycle (#549)
+  - Add opt-in per-job execution timeout to the worker (#552)
+  - fix(logs): don't fail /agent/logs read on over-long log lines (#546)
+  - feat(jobs): pull model on SERVICE_START for natively-running ollama (#543) (#544)
+  - fix(worker): dedupe redelivered INSTANCE_PROVISION jobs
+  - feat(worker): INSTANCE_* job family with Proxmox provisioner
+  - pass authkey via argv for tailscale CLI compatibility
+  - feat(device): device mode - enroll, self-heal daemon, service install
+  - chore(release): v2.79.0
+  - fix(worklock): deflake TestIsHeldLiveWorker — helper died to Go's deadlock detector (#538) (#540)
+
+
