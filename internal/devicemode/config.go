@@ -40,6 +40,11 @@ const (
 	// DefaultNexusURL is the mesh coordination server handed to
 	// `tailscale up --login-server`.
 	DefaultNexusURL = "https://nexus.aceteam.ai"
+
+	// DefaultAPIBaseURL is the platform base URL (pairing, CA chain, leaf
+	// renewal). Filled in for configs written before leaf renewal existed so
+	// the daemon can renew without a re-enrollment.
+	DefaultAPIBaseURL = "https://aceteam.ai"
 )
 
 // Config is the persisted device-mode state written by `citadel device enroll`
@@ -85,6 +90,9 @@ func loadConfigFrom(path string) (*Config, error) {
 	}
 	if cfg.ReenrollURL == "" {
 		cfg.ReenrollURL = DefaultReenrollURL
+	}
+	if cfg.APIBaseURL == "" {
+		cfg.APIBaseURL = DefaultAPIBaseURL
 	}
 	return &cfg, nil
 }
