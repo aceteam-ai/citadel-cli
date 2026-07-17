@@ -19,6 +19,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/recommend"
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // showListModal displays a modal with a list of items and calls onSelect when one is chosen.
@@ -1223,6 +1224,48 @@ func (cc *ControlCenter) startDeviceAuthFlow() {
 	}()
 }
 
+// buildDeviceAuthContent renders the text body of the device-auth modal (the URL
+// fallback, the manual-code box, the countdown/status line, and the hotkey row).
+// It is a pure function of its inputs so it can be unit-tested; the QR code is
+// rendered separately into its own TextView by showDeviceAuthModal.
+func buildDeviceAuthContent(config *DeviceAuthConfig, completeURL, status string, expiresAt time.Time) string {
+	codeLen := len(config.UserCode)
+	boxWidth := codeLen + 6 // 3 spaces padding on each side
+	topBottom := strings.Repeat("═", boxWidth)
+
+	var sb strings.Builder
+	sb.WriteString("\n[yellow::b]Device Authorization[-:-:-]\n\n")
+	sb.WriteString("Scan the QR code above, or open this URL in your browser:\n\n")
+	sb.WriteString(fmt.Sprintf("[white::b]%s[-:-:-]\n\n", completeURL))
+	sb.WriteString("Or enter this code manually:\n\n")
+	sb.WriteString(fmt.Sprintf("   [cyan::b]╔%s╗[-:-:-]\n", topBottom))
+	sb.WriteString(fmt.Sprintf("   [cyan::b]║   %s   ║[-:-:-]\n", config.UserCode))
+	sb.WriteString(fmt.Sprintf("   [cyan::b]╚%s╝[-:-:-]\n\n", topBottom))
+
+	if status == "waiting" {
+		remaining := time.Until(expiresAt)
+		if remaining < 0 {
+			remaining = 0
+		}
+		minutes := int(remaining.Minutes())
+		seconds := int(remaining.Seconds()) % 60
+		sb.WriteString(fmt.Sprintf("[gray]Waiting for authorization... (%d:%02d remaining)[-]\n", minutes, seconds))
+	} else if status == "success" {
+		sb.WriteString("[green::b]Authorization successful![-:-:-]\n")
+	} else if strings.HasPrefix(status, "error:") {
+		errMsg := strings.TrimPrefix(status, "error:")
+		sb.WriteString(fmt.Sprintf("[red]%s[-]\n", errMsg))
+	}
+
+	// macOS firewall warning
+	if runtime.GOOS == "darwin" {
+		sb.WriteString("\n[gray]Note: macOS may ask to allow network access. Click 'Allow'.[-]\n")
+	}
+
+	sb.WriteString("\n[yellow]B[-] open browser  [yellow]C[-] copy link  [gray]Esc[-] cancel")
+	return sb.String()
+}
+
 // showDeviceAuthModal displays the device authorization code and polls for completion
 func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	cc.inModal = true
@@ -1238,56 +1281,46 @@ func (cc *ControlCenter) showDeviceAuthModal(config *DeviceAuthConfig) {
 	// Calculate expiry
 	expiresAt := time.Now().Add(time.Duration(config.ExpiresIn) * time.Second)
 
-	// Build complete URL with code
-	completeURL := config.VerificationURI
-	if !strings.Contains(completeURL, "?") {
-		completeURL += "?code=" + config.UserCode
+	// Build the complete verification URL. This is the exact enrollment payload
+	// encoded in the QR code (verification_uri_complete + &v=1), so the QR, the
+	// shown URL, and the B/copy-link actions all point to the identical target.
+	// The web approval page ignores the extra v= param (see ui.BuildEnrollPayload).
+	completeURL := ui.BuildEnrollPayload(config.VerificationURI, config.UserCode)
+
+	// Render the scannable QR once (not per countdown tick). It reaches parity
+	// with the CLI login flow so a phone can scan instead of typing the code.
+	// Uses the plain full-block renderer (no ANSI) that displays correctly inside
+	// a tview.TextView; see ui.RenderQRCodeBlocks and whatsapp_page.go for the
+	// same proven pattern.
+	qrStr := ui.RenderEnrollQRBlocks(config.VerificationURI, config.UserCode)
+	if qrStr != "" {
+		qrView := tview.NewTextView()
+		qrView.SetDynamicColors(false) // block chars must not be parsed as color tags
+		qrView.SetWrap(false)          // narrow terminals clip the QR rather than garbling it
+		qrView.SetText(qrStr)
+		qrView.SetBorder(true).SetTitle(" Scan to Connect ")
+		// QR gets the flexible (proportional) top region; the URL + manual-code
+		// fallback below is FIXED-height so it is ALWAYS visible, even on an
+		// 80x24 SSH session where the full-block QR (~33 rows) cannot fit. If the
+		// QR were the fixed item it would reserve all rows and push the fallback
+		// (and the cancel hotkey) off-screen — the opposite of the requirement.
+		flex.AddItem(qrView, 0, 1, false)
 	}
 
-	// Calculate box width based on code length
-	codeLen := len(config.UserCode)
-	boxWidth := codeLen + 6 // 3 spaces padding on each side
-	topBottom := strings.Repeat("═", boxWidth)
-
-	// Update function for countdown
+	// Update function for countdown (touches only the content view; the QR is
+	// rendered once above).
 	updateContent := func(status string) {
-		var sb strings.Builder
-		sb.WriteString("\n[yellow::b]Device Authorization[-:-:-]\n\n")
-		sb.WriteString("Open this URL in your browser:\n\n")
-		sb.WriteString(fmt.Sprintf("[white::b]%s[-:-:-]\n\n", completeURL))
-		sb.WriteString("Or enter this code manually:\n\n")
-		sb.WriteString(fmt.Sprintf("   [cyan::b]╔%s╗[-:-:-]\n", topBottom))
-		sb.WriteString(fmt.Sprintf("   [cyan::b]║   %s   ║[-:-:-]\n", config.UserCode))
-		sb.WriteString(fmt.Sprintf("   [cyan::b]╚%s╝[-:-:-]\n\n", topBottom))
-
-		if status == "waiting" {
-			remaining := time.Until(expiresAt)
-			if remaining < 0 {
-				remaining = 0
-			}
-			minutes := int(remaining.Minutes())
-			seconds := int(remaining.Seconds()) % 60
-			sb.WriteString(fmt.Sprintf("[gray]Waiting for authorization... (%d:%02d remaining)[-]\n", minutes, seconds))
-		} else if status == "success" {
-			sb.WriteString("[green::b]Authorization successful![-:-:-]\n")
-		} else if strings.HasPrefix(status, "error:") {
-			errMsg := strings.TrimPrefix(status, "error:")
-			sb.WriteString(fmt.Sprintf("[red]%s[-]\n", errMsg))
-		}
-
-		// macOS firewall warning
-		if runtime.GOOS == "darwin" {
-			sb.WriteString("\n[gray]Note: macOS may ask to allow network access. Click 'Allow'.[-]\n")
-		}
-
-		sb.WriteString("\n[yellow]B[-] open browser  [yellow]C[-] copy link  [gray]Esc[-] cancel")
-		contentView.SetText(sb.String())
+		contentView.SetText(buildDeviceAuthContent(config, completeURL, status, expiresAt))
 	}
 
 	updateContent("waiting")
 	contentView.SetBorder(true).SetTitle(" Connect to AceTeam Network ")
+	contentView.SetScrollable(true) // never truncate the URL/code/hotkeys if body grows
 
-	flex.AddItem(contentView, 0, 1, true)
+	// Fixed height sized to the actual rendered body (+2 for the border) so the
+	// fallback always fits and the QR takes the remaining space above it.
+	bodyLines := len(strings.Split(buildDeviceAuthContent(config, completeURL, "waiting", expiresAt), "\n"))
+	flex.AddItem(contentView, bodyLines+2, 0, true)
 
 	// Channel to signal completion
 	doneChan := make(chan struct{})

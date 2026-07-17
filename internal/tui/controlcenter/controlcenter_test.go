@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/rivo/tview"
+
+	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
 // TestJobRecordStruct tests the JobRecord struct fields
@@ -617,6 +619,63 @@ func TestDeviceAuthConfig(t *testing.T) {
 	}
 	if cfg.Interval != 5 {
 		t.Errorf("DeviceAuthConfig.Interval = %d, want 5", cfg.Interval)
+	}
+}
+
+// TestDeviceAuthModalContentIncludesEnrollPayload asserts the device-auth modal
+// body shows the exact enrollment payload (verification_uri_complete + &v=1) —
+// the same string encoded into the scannable QR — so the URL, copy-link, and QR
+// all point to an identical target. Mirrors qrcode_test.go's payload assertion.
+func TestDeviceAuthModalContentIncludesEnrollPayload(t *testing.T) {
+	cfg := &DeviceAuthConfig{
+		UserCode:        "ABCD-1234",
+		VerificationURI: "https://aceteam.ai/device",
+		DeviceCode:      "device-secret-should-never-appear",
+		ExpiresIn:       900,
+		Interval:        5,
+	}
+	payload := ui.BuildEnrollPayload(cfg.VerificationURI, cfg.UserCode)
+	if payload != "https://aceteam.ai/device?code=ABCD-1234&v=1" {
+		t.Fatalf("unexpected enroll payload: %q", payload)
+	}
+
+	content := buildDeviceAuthContent(cfg, payload, "waiting", time.Now().Add(15*time.Minute))
+
+	if !strings.Contains(content, payload) {
+		t.Errorf("modal content missing enroll payload %q:\n%s", payload, content)
+	}
+	if !strings.Contains(content, cfg.UserCode) {
+		t.Errorf("modal content missing manual user code %q", cfg.UserCode)
+	}
+	// The hotkey row must be preserved.
+	if !strings.Contains(content, "open browser") || !strings.Contains(content, "copy link") {
+		t.Errorf("modal content missing hotkey row:\n%s", content)
+	}
+	// Security guardrail: the device_code polling secret must never be shown.
+	if strings.Contains(content, cfg.DeviceCode) {
+		t.Errorf("modal content leaked device_code secret")
+	}
+}
+
+// TestDeviceAuthQRMatchesPayload asserts the modal's QR renders the exact
+// enrollment payload via the tview-safe full-block renderer.
+func TestDeviceAuthQRMatchesPayload(t *testing.T) {
+	cfg := &DeviceAuthConfig{UserCode: "WXYZ-5678", VerificationURI: "https://aceteam.ai/device"}
+
+	qr := ui.RenderEnrollQRBlocks(cfg.VerificationURI, cfg.UserCode)
+	if strings.TrimSpace(qr) == "" {
+		t.Fatal("device-auth QR is empty")
+	}
+	want := ui.RenderQRCodeBlocks(ui.BuildEnrollPayload(cfg.VerificationURI, cfg.UserCode))
+	if qr != want {
+		t.Error("device-auth QR does not match the exact BuildEnrollPayload rendering")
+	}
+	// tview-safe: no ANSI escapes, full blocks present (see ui.RenderQRCodeBlocks).
+	if strings.Contains(qr, "\x1b[") {
+		t.Error("device-auth QR leaked ANSI escapes (would corrupt in tview)")
+	}
+	if !strings.Contains(qr, "██") {
+		t.Error("device-auth QR missing full-block glyphs")
 	}
 }
 

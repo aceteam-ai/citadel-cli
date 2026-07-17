@@ -79,3 +79,51 @@ func TestRenderEnrollQR(t *testing.T) {
 		t.Fatal("RenderEnrollQR produced empty output")
 	}
 }
+
+func TestRenderQRCodeBlocksScannable(t *testing.T) {
+	out := RenderQRCodeBlocks("https://aceteam.ai/device?code=ABCD-1234&v=1")
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("RenderQRCodeBlocks produced empty output")
+	}
+	// Plain full-block renderer must NOT emit half-block runes or ANSI escapes
+	// (those corrupt inside a tview.TextView). It uses "██" for light modules
+	// and spaces for dark modules.
+	if strings.ContainsAny(out, "▀▄") {
+		t.Errorf("block renderer leaked half-block runes: %q", out)
+	}
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("block renderer leaked ANSI escape sequences: %q", out)
+	}
+	if !strings.Contains(out, "██") {
+		t.Errorf("output does not look like a full-block QR: %q", out)
+	}
+
+	// Quiet-zone check: the QR must be wrapped by an all-block border (QuietZone
+	// of 2 light modules). The first and last non-empty rows must be entirely
+	// blocks/spaces (no other glyphs), which is the required white border.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) < 10 {
+		t.Fatalf("QR output suspiciously short: %d lines", len(lines))
+	}
+	for _, idx := range []int{0, len(lines) - 1} {
+		row := lines[idx]
+		if strings.TrimSpace(row) == "" {
+			continue // a blank spacer row is still a valid quiet-zone edge
+		}
+		if strings.Trim(row, "█ ") != "" {
+			t.Errorf("quiet-zone row %d contains non-block glyphs (border missing): %q", idx, row)
+		}
+	}
+}
+
+func TestRenderEnrollQRBlocks(t *testing.T) {
+	out := RenderEnrollQRBlocks("https://aceteam.ai/device", "ABCD-1234")
+	if strings.TrimSpace(out) == "" {
+		t.Fatal("RenderEnrollQRBlocks produced empty output")
+	}
+	// Must equal rendering the exact BuildEnrollPayload output.
+	want := RenderQRCodeBlocks(BuildEnrollPayload("https://aceteam.ai/device", "ABCD-1234"))
+	if out != want {
+		t.Error("RenderEnrollQRBlocks does not match RenderQRCodeBlocks(BuildEnrollPayload(...))")
+	}
+}
