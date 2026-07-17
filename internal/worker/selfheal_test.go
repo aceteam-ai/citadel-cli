@@ -13,9 +13,12 @@ func newTestMonitor(state *WorkerState, draining bool) *LivenessMonitor {
 		stallTimeout: 10 * time.Minute,
 		stuckTimeout: 5 * time.Hour,
 		graceStart:   2 * time.Minute,
-		isDraining:   func() bool { return draining },
-		log:          func(string, string) {},
-		onWedge:      func(string) {},
+		// Default: monitor started long ago so grace has passed. The startup-grace
+		// case overrides this to a recent value.
+		startedAt:  time.Now().Add(-time.Hour),
+		isDraining: func() bool { return draining },
+		log:        func(string, string) {},
+		onWedge:    func(string) {},
 	}
 }
 
@@ -75,10 +78,12 @@ func TestLivenessMonitorCheck(t *testing.T) {
 		}
 	})
 
-	t.Run("startup grace: a just-booted worker with no poll yet is not wedged", func(t *testing.T) {
+	t.Run("startup grace: a just-started monitor with no poll yet is not wedged", func(t *testing.T) {
 		s := stateWith(now.Add(-30*time.Second), time.Time{}, time.Time{}, 0)
-		if _, wedged := newTestMonitor(s, false).check(now); wedged {
-			t.Fatal("worker inside startup grace flagged wedged")
+		m := newTestMonitor(s, false)
+		m.startedAt = now.Add(-30 * time.Second) // monitor within its 2min grace
+		if _, wedged := m.check(now); wedged {
+			t.Fatal("monitor inside startup grace flagged wedged")
 		}
 	})
 

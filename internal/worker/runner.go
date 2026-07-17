@@ -487,6 +487,15 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		// removed from the pending list rather than retried into a repeated
 		// wedge (issue #548). Every other failure keeps the existing Nack/retry
 		// semantics.
+		// Accepted tradeoff on abandon: like the orphaned handler goroutine, any
+		// GPU slot this job holds is released when processJob returns (the
+		// deferred gpuTracker.Release), so a still-running orphan and the next job
+		// can briefly share a slot. In practice the tracker schedules routing
+		// fairness rather than exclusive CUDA ownership (inference is an HTTP call
+		// into the engine container, which batches concurrent requests), and the
+		// orphan self-terminates when its own client/handler timeout fires, so the
+		// overlap window is bounded. We prefer this to permanently leaking the slot
+		// (which would slowly exhaust GPU capacity across repeated abandons).
 		var deadlineErr *deadlineExceededError
 		if errors.As(actualErr, &deadlineErr) {
 			r.source.Fail(ctx, job, actualErr, map[string]any{

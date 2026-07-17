@@ -35,7 +35,12 @@ type LivenessMonitor struct {
 	stallTimeout  time.Duration // max no-poll gap while in_flight==0
 	stuckTimeout  time.Duration // max single-job in-flight duration (0 = disabled)
 	checkInterval time.Duration
-	graceStart    time.Duration // don't act until the worker has been up this long
+	graceStart    time.Duration // don't act until the monitor has run this long
+	// startedAt is stamped when Run begins (NOT WorkerState.startedAt, which is
+	// created early in startup). Grace is measured from here so the slow startup
+	// BEFORE the consume loop (network verify, identity, queue setup) can never
+	// be misread as "never polled" and trigger a restart loop (issue #548).
+	startedAt time.Time
 
 	isDraining func() bool
 	onWedge    func(reason string) // default: log + os.Exit(1)
@@ -87,6 +92,7 @@ func NewLivenessMonitor(state *WorkerState, isDraining func() bool, log func(lev
 	}
 	return &LivenessMonitor{
 		state:         state,
+		startedAt:     time.Now(), // re-stamped when Run begins
 		stallTimeout:  envSecondsOrDefault(selfHealStallEnvVar, defaultSelfHealStallSeconds),
 		stuckTimeout:  envSecondsOrDefault(selfHealStuckEnvVar, defaultSelfHealStuckSeconds),
 		checkInterval: defaultSelfHealCheckInterval,
@@ -123,6 +129,9 @@ func (m *LivenessMonitor) Run(ctx context.Context) {
 	if m == nil {
 		return
 	}
+	// Stamp grace from the moment the monitor (and thus the consume loop) starts,
+	// so pre-loop startup time is never counted against the "never polled" check.
+	m.startedAt = time.Now()
 	m.log("info", "Self-heal monitor active (stall="+m.stallTimeout.String()+")")
 	ticker := time.NewTicker(m.checkInterval)
 	defer ticker.Stop()
@@ -149,9 +158,10 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 	}
 	snap := m.state.Snapshot()
 
-	// Respect a startup grace period so a just-launched worker (no poll yet) is
-	// never mistaken for a wedge.
-	if time.Duration(snap.UptimeSeconds)*time.Second < m.graceStart {
+	// Respect a startup grace period, measured from when the MONITOR started (see
+	// startedAt), so the slow work before the consume loop begins is never
+	// mistaken for a wedge and cannot trigger a restart loop.
+	if now.Sub(m.startedAt) < m.graceStart {
 		return "", false
 	}
 
