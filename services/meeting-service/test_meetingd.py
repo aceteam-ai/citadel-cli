@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import struct
+import subprocess
 import tempfile
 import wave
 
@@ -80,41 +81,28 @@ def test_safe_workspace_path(rel, ok, monkeypatch):
             meetingd._safe_workspace_path(rel)
 
 
-def test_ensure_node_accessible_dir_makes_shared_dir_world_accessible():
-    """Bug A (live-prod node 1084, 2026-07-16): the WAV output dir is created by
-    meetingd (bot UID 10001) but READ by the node owner (a different UID). Under
-    bot's umask it lands 0700, which the node cannot even traverse. The helper must
-    force 0o777 so the node can read the recording for the end-of-call transcribe,
-    and must relax a PRE-EXISTING 0700 dir (exist_ok makedirs does not)."""
-    with tempfile.TemporaryDirectory() as d:
-        target = os.path.join(d, "meetings")
+def test_entrypoint_maps_to_host_uid_and_migrates_profile():
+    """Bug A (host-UID mapping). The entrypoint must (1) remap the `bot` account to
+    the node owner's UID/GID -- explicit PUID/PGID, else the /workspace mount owner
+    -- so the recorded WAV is written node-owned (no cross-UID perms fixup), and
+    (2) chown the bind-mounted PROFILE across on existing nodes where it was created
+    by the old bot (uid 10001, mode 700); without that migration the signed-in
+    Google session becomes unreadable after the remap. These are root/docker
+    behaviors not unit-runnable in CI, so syntax-check the script and pin the
+    load-bearing lines against accidental deletion."""
+    script = os.path.join(os.path.dirname(__file__), "entrypoint.sh")
+    subprocess.run(["sh", "-n", script], check=True)
+    body = open(script).read()
 
-        # Fresh create.
-        meetingd._ensure_node_accessible_dir(target)
-        assert os.path.isdir(target)
-        assert (os.stat(target).st_mode & 0o777) == 0o777
-
-        # Pre-existing 0700 dir (an older meetingd left it restrictive) must be
-        # relaxed, not left as-is.
-        os.chmod(target, 0o700)
-        meetingd._ensure_node_accessible_dir(target)
-        assert (os.stat(target).st_mode & 0o777) == 0o777
-
-
-def test_ensure_node_accessible_dir_chmod_failure_is_non_fatal(monkeypatch):
-    """When the node created the dir first it OWNS it and meetingd's chmod is
-    EPERM -- that must be swallowed (the node relaxed the mode itself), never
-    crash the record start."""
-    with tempfile.TemporaryDirectory() as d:
-        target = os.path.join(d, "meetings")
-
-        def _raise(*_a, **_k):
-            raise PermissionError("not the owner")
-
-        monkeypatch.setattr(meetingd.os, "chmod", _raise)
-        # Must not raise despite chmod failing.
-        meetingd._ensure_node_accessible_dir(target)
-        assert os.path.isdir(target)
+    # Remap the bot account to the target UID/GID.
+    assert "usermod -o -u" in body
+    assert "groupmod -o -g" in body
+    # Explicit PUID/PGID honored, with a fallback derived from the workspace owner.
+    assert "PUID" in body and "PGID" in body
+    assert "stat -c '%u'" in body and "WORKSPACE_DIR" in body
+    # Migration: chown the bind mounts (incl. the persisted profile) to the target.
+    assert "PROFILE_DIR" in body
+    assert "chown -R bot:bot" in body
 
 
 def _write_wav(path: str, samples: list[int]):

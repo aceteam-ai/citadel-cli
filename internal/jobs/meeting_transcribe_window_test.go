@@ -51,17 +51,16 @@ func writeTestWav(t *testing.T, path string, seconds int, placeholderSizes bool)
 	return byteRate, dataBytes
 }
 
-func TestMeetingWindowWavPath_UsesNodeOwnedScratchDir(t *testing.T) {
-	// Bug A (live-prod node 1084, 2026-07-16): the rolling-window scratch clip must
-	// NOT live inside the container-owned meetings/ dir — the node cannot write
-	// there when meetings/ is owned by the container's bot user. It must sit in a
-	// distinct node-owned scratch subdir, still inside the workspace so the
-	// transcribe handler's ValidatePath accepts it.
+func TestMeetingWindowWavPath_UsesSeparateScratchDir(t *testing.T) {
+	// The rolling-window scratch clip is a churny per-pass temp; it must live in a
+	// separate scratch subdir, NOT alongside the durable recordings in meetings/,
+	// and still inside the workspace so the transcribe handler's ValidatePath
+	// accepts it.
 	got := meetingWindowWavPath("/ws", "mtg-1")
 
 	meetingsDir := filepath.Join("/ws", "meetings") + string(filepath.Separator)
 	if strings.HasPrefix(got, meetingsDir) {
-		t.Errorf("window scratch clip %q must NOT live under the container-owned meetings/ dir", got)
+		t.Errorf("window scratch clip %q must NOT live under the meetings/ recordings dir", got)
 	}
 	want := filepath.Join("/ws", meetingScratchDirName, "mtg-1-window.wav")
 	if got != want {

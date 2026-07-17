@@ -407,22 +407,12 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// Admitted: begin recording. Ensure the meetings/ dir exists first — the host
 	// ffmpeg's -y does NOT create parent directories (the container's meetingd
 	// makedirs its own, but the dir is on the shared workspace mount either way).
+	// The container writes the WAV as the node's own UID/GID (the meeting image's
+	// PUID/PGID mapping — see services/meeting-service/entrypoint.sh), so the node
+	// and container share ownership and no cross-UID perms fixup is needed here.
 	wavPath := meetingWavPath(h.WorkspaceDir, p.MeetingID)
-	wavDir := filepath.Dir(wavPath)
-	if err := os.MkdirAll(wavDir, 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Dir(wavPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create meetings dir: %w", err)
-	}
-	// meetings/ is SHARED with the container's meetingd (user bot, UID 10001),
-	// which is the WAV writer in the container media path; this node handler and
-	// the whisper sidecar are the READERS. Whichever side created the dir first
-	// owns it and the OTHER needs access, so it must be world-traversable/
-	// readable/writable. os.MkdirAll is umask-masked and won't relax a PRE-EXISTING
-	// dir (a meetings/ left 0700 by an older meetingd persists on the workspace
-	// mount), so chmod explicitly. Best-effort: if the node does not own a
-	// container-created dir this chmod is EPERM and meetingd's own chmod (which
-	// does own it) relaxes it instead — see services/meeting-service/meetingd.py.
-	if err := os.Chmod(wavDir, 0o777); err != nil {
-		ctx.Log("warn", "     - could not chmod meetings dir world-accessible (non-fatal; meetingd relaxes it on its side): %v", err)
 	}
 	// The rolling-window transcription scratch clip (meeting_transcribe_window.go)
 	// is a per-pass temp; remove it on exit so it does not linger in the workspace.

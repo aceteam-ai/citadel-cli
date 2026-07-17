@@ -32,6 +32,13 @@ services:
       - XVFB_RESOLUTION=${XVFB_RESOLUTION:-1280x720x24}
       - MEETING_PROFILE_DIR=/profile
       - CITADEL_WORKSPACE=/workspace
+      # Run the in-container `bot` user as the NODE OWNER's UID/GID so the recorded
+      # WAV (written into the /workspace mount) is owned by the node process that
+      # reads it back for transcription — no cross-UID perms fixup. citadel injects
+      # PUID/PGID = its own uid/gid (see internal/jobs/service_handler.go); when
+      # unset the entrypoint auto-derives them from the /workspace mount owner.
+      - PUID=${PUID:-}
+      - PGID=${PGID:-}
     healthcheck:
       # Hits meetingd's /health INSIDE the container (container port 8102), which
       # runs the canary-tone audio probe -- so "container healthy" means "can
