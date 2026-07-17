@@ -238,7 +238,12 @@ func (p *SettingsPage) toggleMeeting() {
 		p.reloadMeeting()
 	}
 
-	next := &config.Meeting{MeetingEnabled: !p.meeting.MeetingEnabled}
+	// Copy the loaded config and flip only MeetingEnabled — a fresh
+	// &config.Meeting{MeetingEnabled: …} would zero every other field on save
+	// (no omitempty), silently disabling streaming + audio backup.
+	nextVal := *p.meeting
+	nextVal.MeetingEnabled = !p.meeting.MeetingEnabled
+	next := &nextVal
 
 	if p.cb.SaveMeeting != nil {
 		if err := p.cb.SaveMeeting(next); err != nil {

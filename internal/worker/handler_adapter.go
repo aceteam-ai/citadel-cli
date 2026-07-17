@@ -299,5 +299,14 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	h.StreamingEnabled = m.StreamingEnabled
 	h.StreamingInterval = m.StreamingInterval()
 	h.StreamingWindow = m.StreamingWindow()
+
+	// Sovereign audio backup (aceteam#5097): default-on Opus upload + local
+	// retention. Creds (device token + API base) are loaded FRESH on each upload
+	// via the closure so a token rotated by the worker's in-place reauth is
+	// honored — not frozen at handler construction.
+	h.SetAudioBackup(m.AudioBackupEnabled, m.RetentionAge(), func() (string, string) {
+		creds := config.LoadDeviceCreds(platform.ConfigDir())
+		return creds.APIBaseURL, creds.Token
+	})
 	return h
 }

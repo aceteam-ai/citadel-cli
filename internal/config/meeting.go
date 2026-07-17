@@ -49,6 +49,23 @@ type Meeting struct {
 	// back the churning tail to avoid emitting — and acting on — a partial or
 	// hallucinated segment that the next pass rewrites. Must be positive.
 	StreamingWindowSeconds int `yaml:"streaming_window_seconds" json:"streaming_window_seconds"`
+
+	// AudioBackupEnabled gates the sovereign audio-backup path (aceteam#5097):
+	// after a call is recorded, the lossless WAV is kept on the node AND an
+	// Opus-compressed copy is uploaded to the AceTeam backend as a default-on
+	// dual copy. Default-on (opt-out), same house convention as MeetingEnabled;
+	// the upload is best-effort so a failure never fails the meeting job (the
+	// transcript is already stored). When false, the node keeps the WAV locally
+	// and never transcodes or uploads — the transcript path is unaffected.
+	AudioBackupEnabled bool `yaml:"audio_backup_enabled" json:"audio_backup_enabled"`
+
+	// AudioRetentionDays is the disk-safety retention window for local meeting
+	// recordings. Meeting WAVs (and stray .opus artifacts) older than this are
+	// pruned at meeting-end, and everything prunable is swept under disk
+	// pressure regardless of age. The lossless WAV is otherwise kept. Must be
+	// positive; the accessor clamps a non-positive persisted value to the
+	// default.
+	AudioRetentionDays int `yaml:"audio_retention_days" json:"audio_retention_days"`
 }
 
 // StreamingInterval returns the rolling-transcription cadence as a Duration,
@@ -71,6 +88,18 @@ func (m *Meeting) StreamingWindow() time.Duration {
 	return time.Duration(m.StreamingWindowSeconds) * time.Second
 }
 
+// RetentionAge returns the local-recording retention window as a Duration,
+// clamping a non-positive persisted value (hand-edited or truncated
+// meeting.yaml) to the default so the prune sweep can never use a zero/negative
+// age that would delete freshly recorded WAVs.
+func (m *Meeting) RetentionAge() time.Duration {
+	days := m.AudioRetentionDays
+	if days <= 0 {
+		days = defaultAudioRetentionDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
 const meetingFile = "meeting.yaml"
 
 // Streaming defaults. Interval trades command latency against whisper load;
@@ -82,6 +111,11 @@ const (
 	defaultStreamingWindowSeconds   = 10
 )
 
+// defaultAudioRetentionDays is how long local meeting recordings are kept before
+// the disk-safety sweep prunes them. 30 days comfortably outlasts any realistic
+// best-effort upload retry window while bounding disk growth on a busy node.
+const defaultAudioRetentionDays = 30
+
 // DefaultMeeting returns a Meeting struct with the capability enabled.
 // Default-on is intentional: it matches the house convention that capabilities
 // are opt-out, so a dep-capable node joins meetings without extra setup.
@@ -91,6 +125,8 @@ func DefaultMeeting() *Meeting {
 		StreamingEnabled:         true,
 		StreamingIntervalSeconds: defaultStreamingIntervalSeconds,
 		StreamingWindowSeconds:   defaultStreamingWindowSeconds,
+		AudioBackupEnabled:       true,
+		AudioRetentionDays:       defaultAudioRetentionDays,
 	}
 }
 

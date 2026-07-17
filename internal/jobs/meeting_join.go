@@ -18,6 +18,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -364,6 +365,28 @@ type MeetingJoinHandler struct {
 	// module is healthy (#514). Non-nil is used by tests to force a backend
 	// without a live meetingd; nil probes meetingd's /health on the loopback.
 	containerHealthProbe func() bool
+
+	// AudioBackupEnabled gates the sovereign audio-backup path (aceteam#5097):
+	// after the recording is finalized, transcode the WAV to Opus in the meeting
+	// container and upload a default-on compressed copy to the AceTeam backend
+	// (the lossless WAV stays node-local). Default-on, opt-out — the worker sets
+	// it from config.Meeting.AudioBackupEnabled. The whole path is best-effort so
+	// a failure never fails the meeting job (the transcript is already stored).
+	AudioBackupEnabled bool
+	// AudioRetentionAge is the local-recording prune window; the worker sets it
+	// from config.Meeting.RetentionAge(). Zero falls back to a safe default at
+	// use (see backupAndPrune).
+	AudioRetentionAge time.Duration
+	// backupCreds returns the backend base URL + device bearer token, read FRESH
+	// at upload time so a token rotated by the worker's in-place reauth is
+	// honored. nil (or an empty token) disables the upload leg.
+	backupCreds func() (baseURL, token string)
+	// runDockerExec / backupHTTPClient / diskPressureFn are test seams; nil uses
+	// the real docker-exec, HTTP, and gopsutil implementations respectively.
+	// runDockerExec receives the full `docker` argv (i.e. args[0] == "exec").
+	runDockerExec    func(ctx context.Context, args ...string) ([]byte, error)
+	backupHTTPClient *http.Client
+	diskPressureFn   func(dir string) bool
 }
 
 // NewMeetingJoinHandler constructs a handler rooted at the node workspace.
@@ -440,6 +463,13 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	if recordedPath == "" {
 		recordedPath = wavPath
 	}
+
+	// Sovereign audio backup + retention (aceteam#5097). Runs HERE — after the
+	// WAV is finalized but BEFORE transcription — so the backend still receives
+	// the audio even when transcription fails (the failure path returns early
+	// below, and the backup is MOST valuable exactly then). Fully best-effort:
+	// it never returns an error and never touches the meeting result.
+	h.backupAndPrune(ctx, job, p, recordedPath)
 
 	// Transcribe node-locally by reusing the transcribe handler in-process. This
 	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored

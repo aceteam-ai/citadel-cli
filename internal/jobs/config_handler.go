@@ -50,6 +50,14 @@ type DeviceConfig struct {
 	// opt every node out the moment any device config is applied. A non-nil value
 	// writes the same meeting.yaml the Control Center toggle and detector use.
 	MeetingEnabled *bool `json:"meetingEnabled,omitempty"`
+	// AudioBackupEnabled is the programmatic path for the sovereign audio-backup
+	// opt-out (aceteam#5097). Pointer for the same reason as MeetingEnabled: nil
+	// leaves the persisted value untouched.
+	AudioBackupEnabled *bool `json:"audioBackupEnabled,omitempty"`
+	// MeetingRetentionDays sets the local-recording retention window
+	// (aceteam#5097). Pointer so nil leaves the persisted value untouched; a
+	// non-positive value is clamped to the default by the config accessor.
+	MeetingRetentionDays *int `json:"meetingRetentionDays,omitempty"`
 }
 
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
@@ -104,11 +112,33 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// the local toggle converge on one effective value (default-on when neither
 	// wrote it). Written to platform.ConfigDir() — the per-concern config location,
 	// which the detector reads — not h.ConfigDir (the manifest dir).
-	if config.MeetingEnabled != nil {
-		if err := citadelconfig.SaveMeeting(platform.ConfigDir(), &citadelconfig.Meeting{MeetingEnabled: *config.MeetingEnabled}); err != nil {
-			result += fmt.Sprintf("\nWarning: failed to persist meeting toggle: %v", err)
+	if config.MeetingEnabled != nil || config.AudioBackupEnabled != nil || config.MeetingRetentionDays != nil {
+		// Load-modify-save: read the current persisted meeting config and set only
+		// the fields the platform pushed. A fresh &Meeting{...} would zero every
+		// unset field on marshal (no omitempty) — silently disabling streaming and
+		// audio backup the moment any device config touched the meeting toggle.
+		meeting := citadelconfig.LoadMeeting(platform.ConfigDir())
+		if config.MeetingEnabled != nil {
+			meeting.MeetingEnabled = *config.MeetingEnabled
+		}
+		if config.AudioBackupEnabled != nil {
+			meeting.AudioBackupEnabled = *config.AudioBackupEnabled
+		}
+		if config.MeetingRetentionDays != nil {
+			meeting.AudioRetentionDays = *config.MeetingRetentionDays
+		}
+		if err := citadelconfig.SaveMeeting(platform.ConfigDir(), meeting); err != nil {
+			result += fmt.Sprintf("\nWarning: failed to persist meeting config: %v", err)
 		} else {
-			result += fmt.Sprintf("\nMeeting capability %s", enabledLabel(*config.MeetingEnabled))
+			if config.MeetingEnabled != nil {
+				result += fmt.Sprintf("\nMeeting capability %s", enabledLabel(*config.MeetingEnabled))
+			}
+			if config.AudioBackupEnabled != nil {
+				result += fmt.Sprintf("\nMeeting audio backup %s", enabledLabel(*config.AudioBackupEnabled))
+			}
+			if config.MeetingRetentionDays != nil {
+				result += fmt.Sprintf("\nMeeting recording retention set to %d days", *config.MeetingRetentionDays)
+			}
 		}
 	}
 
