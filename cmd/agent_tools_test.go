@@ -124,6 +124,56 @@ func TestAgentTailLogsFilters(t *testing.T) {
 	}
 }
 
+// TestAgentTailLogsLongLine reproduces the bug where a single log line longer
+// than bufio.Scanner's buffer aborted the whole read with "bufio.Scanner: token
+// too long", surfacing as `citadel_logs failed: ... 500: error reading log`.
+// The reader must return the (truncated) long line without error, and must not
+// drop a following final line that has no trailing newline.
+func TestAgentTailLogsLongLine(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	logDir := filepath.Join(tmp, ".citadel-cli", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// ~2 MiB single line: exceeds both bufio.Scanner's 64 KiB default and the
+	// former 1 MiB Buffer cap, so the old code would have hard-failed here.
+	longLine := "[00:00:00] [CITADEL] error: " + strings.Repeat("X", 2<<20)
+	// A trailing line WITHOUT a newline verifies ReadString's final-token handling.
+	content := longLine + "\n[00:00:01] [CITADEL] info: last line no newline"
+	if err := os.WriteFile(filepath.Join(logDir, "latest.log"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := struct {
+		Lines int
+		Level string
+		Grep  string
+		Since string
+	}{Lines: 100}
+
+	out, err := agentTailLogs(opts)
+	if err != nil {
+		t.Fatalf("long line must not error, got: %v", err)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(lines))
+	}
+	// Long line is truncated to the display cap plus marker, not returned whole.
+	if !strings.Contains(lines[0], "…[truncated]") {
+		t.Fatalf("expected truncation marker on long line")
+	}
+	if len(lines[0]) > maxLogLineBytes+len("…[truncated]") {
+		t.Fatalf("long line not truncated to cap: len=%d", len(lines[0]))
+	}
+	// Final newline-less line must be preserved (not dropped by EOF handling).
+	if lines[1] != "[00:00:01] [CITADEL] info: last line no newline" {
+		t.Fatalf("final newline-less line lost or altered: %q", lines[1])
+	}
+}
+
 func TestAgentNodeInfoFields(t *testing.T) {
 	info := agentNodeInfo("node-1", "1008", "org-x", time.Now().Add(-time.Minute))
 	if info["node_name"] != "node-1" {

@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,12 @@ func agentNodeInfo(nodeName, headscaleNodeID, orgID string, startedAt time.Time)
 	return info
 }
 
+// maxLogLineBytes caps the length of any single log line returned to the caller.
+// A line longer than this is truncated with a marker rather than dropped, so one
+// pathological line (e.g. a giant single-line JSON blob) can neither abort the
+// read nor bloat the HTTP response.
+const maxLogLineBytes = 1 << 20 // 1 MiB
+
 // agentTailLogs reads up to opts.Lines lines from ~/.citadel-cli/logs/latest.log,
 // applying optional level/grep/since filters. This is where the previously-lost
 // worker stdout now lives, because #234 routed the source LogFn and we now wire
@@ -202,25 +209,47 @@ func agentTailLogs(opts struct {
 	levelFilter := strings.ToLower(strings.TrimSpace(opts.Level))
 	grep := strings.ToLower(opts.Grep)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Read line-by-line with bufio.Reader.ReadString instead of bufio.Scanner.
+	// Scanner hard-fails (bufio.Scanner: token too long) on any line exceeding its
+	// buffer cap, which aborted the whole read — precisely when a node is
+	// misbehaving and emitting long JSON/stacktrace lines (the case an agent most
+	// needs to inspect). ReadString has no token-size limit, so a single long line
+	// can never cause the log read to 500. We still truncate any individual line
+	// to a sane display cap so one pathological line can't bloat the HTTP response.
+	reader := bufio.NewReader(f)
 	var matched []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		lower := strings.ToLower(line)
-		if grep != "" && !strings.Contains(lower, grep) {
-			continue
+	for {
+		line, readErr := reader.ReadString('\n')
+		// Process the line before handling the error: ReadString returns the final
+		// newline-less line together with io.EOF, so checking the error first would
+		// silently drop it.
+		if len(line) > 0 {
+			// Match previous scanner.Text() semantics (no trailing newline).
+			line = strings.TrimRight(line, "\r\n")
+			if len(line) > maxLogLineBytes {
+				line = line[:maxLogLineBytes] + "…[truncated]"
+			}
+			lower := strings.ToLower(line)
+			keep := true
+			if grep != "" && !strings.Contains(lower, grep) {
+				keep = false
+			}
+			if keep && levelFilter != "" && !strings.Contains(lower, levelFilter) {
+				keep = false
+			}
+			if keep && !since.IsZero() && !logLineAfter(line, since) {
+				keep = false
+			}
+			if keep {
+				matched = append(matched, line)
+			}
 		}
-		if levelFilter != "" && !strings.Contains(lower, levelFilter) {
-			continue
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return "", fmt.Errorf("error reading log: %w", readErr)
 		}
-		if !since.IsZero() && !logLineAfter(line, since) {
-			continue
-		}
-		matched = append(matched, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("error reading log: %w", err)
 	}
 
 	// Keep only the last N lines.
