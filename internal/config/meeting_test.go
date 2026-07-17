@@ -108,6 +108,86 @@ func TestLoadMeeting_InvalidYAML(t *testing.T) {
 	}
 }
 
+func TestDefaultMeeting_AudioBackup(t *testing.T) {
+	m := DefaultMeeting()
+	if !m.AudioBackupEnabled {
+		t.Errorf("DefaultMeeting should have audio backup enabled (opt-out), got %+v", m)
+	}
+	if m.AudioRetentionDays != defaultAudioRetentionDays {
+		t.Errorf("AudioRetentionDays = %d, want %d", m.AudioRetentionDays, defaultAudioRetentionDays)
+	}
+	if m.RetentionAge() != defaultAudioRetentionDays*24*time.Hour {
+		t.Errorf("RetentionAge = %v, want %v", m.RetentionAge(), defaultAudioRetentionDays*24*time.Hour)
+	}
+}
+
+func TestRetentionAgeFallback(t *testing.T) {
+	// Non-positive persisted values clamp to the default (never a zero window
+	// that would delete a freshly recorded WAV).
+	for _, days := range []int{0, -1, -30} {
+		m := &Meeting{AudioRetentionDays: days}
+		if m.RetentionAge() != defaultAudioRetentionDays*24*time.Hour {
+			t.Errorf("RetentionAge(%d) = %v, want default", days, m.RetentionAge())
+		}
+	}
+	// Explicit positive values are honored.
+	m := &Meeting{AudioRetentionDays: 7}
+	if m.RetentionAge() != 7*24*time.Hour {
+		t.Errorf("RetentionAge(7) = %v, want 168h", m.RetentionAge())
+	}
+}
+
+func TestLoadMeeting_AudioBackupDefaultsPreservedOnPartialFile(t *testing.T) {
+	// A file that only sets meeting_enabled must keep the audio-backup defaults.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "meeting.yaml"), []byte("meeting_enabled: false\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	m := LoadMeeting(dir)
+	if !m.AudioBackupEnabled {
+		t.Errorf("partial file should preserve AudioBackupEnabled default (true), got %+v", m)
+	}
+	if m.AudioRetentionDays != defaultAudioRetentionDays {
+		t.Errorf("partial file should preserve retention default, got %d", m.AudioRetentionDays)
+	}
+}
+
+// TestMeetingLoadModifySavePreservesFields is the regression guard for the
+// clobber bug: the SaveMeeting callers (APPLY_DEVICE_CONFIG + Control Center
+// toggle) must load-modify-save, not construct a fresh partial struct. Flipping
+// one field through a load-modify-save round trip must leave every other field
+// intact.
+func TestMeetingLoadModifySavePreservesFields(t *testing.T) {
+	dir := t.TempDir()
+	if err := SaveMeeting(dir, DefaultMeeting()); err != nil {
+		t.Fatalf("seed SaveMeeting: %v", err)
+	}
+
+	// Load-modify-save: flip only MeetingEnabled.
+	m := LoadMeeting(dir)
+	m.MeetingEnabled = false
+	if err := SaveMeeting(dir, m); err != nil {
+		t.Fatalf("SaveMeeting: %v", err)
+	}
+
+	got := LoadMeeting(dir)
+	if got.MeetingEnabled {
+		t.Errorf("MeetingEnabled should be false after modify, got true")
+	}
+	if !got.StreamingEnabled {
+		t.Errorf("StreamingEnabled must survive a MeetingEnabled flip, got %+v", got)
+	}
+	if !got.AudioBackupEnabled {
+		t.Errorf("AudioBackupEnabled must survive a MeetingEnabled flip, got %+v", got)
+	}
+	if got.AudioRetentionDays != defaultAudioRetentionDays {
+		t.Errorf("AudioRetentionDays must survive, got %d", got.AudioRetentionDays)
+	}
+	if got.StreamingIntervalSeconds != defaultStreamingIntervalSeconds {
+		t.Errorf("StreamingIntervalSeconds must survive, got %d", got.StreamingIntervalSeconds)
+	}
+}
+
 func TestSaveMeeting_CreatesDir(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "dir")
 	if err := SaveMeeting(dir, DefaultMeeting()); err != nil {
