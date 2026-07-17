@@ -99,48 +99,50 @@ const (
 // here, also add it to allKnownJobTypes below so it is reported in a node's
 // supported job-type set (issue #382).
 const (
-	JobTypeShellCommand      = "SHELL_COMMAND"
-	JobTypeTmuxSession       = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
-	JobTypeDownloadModel     = "DOWNLOAD_MODEL"
-	JobTypeOllamaPull        = "OLLAMA_PULL"
-	JobTypeLlamaCppInference = "LLAMACPP_INFERENCE"
-	JobTypeVLLMInference     = "VLLM_INFERENCE"
-	JobTypeOllamaInference   = "OLLAMA_INFERENCE"
-	JobTypeLLMInference      = "llm_inference"       // Redis worker format
-	JobTypeEmbedding         = "embedding"           // Redis worker format
-	JobTypeApplyDeviceConfig = "APPLY_DEVICE_CONFIG" // Device config from onboarding
-	JobTypeExtraction        = "GLINER_EXTRACTION"   // Entity/relation extraction via GLiNER2
-	JobTypeHTTPProxy         = "HTTP_PROXY"          // Proxy HTTP requests through the local node
-	JobTypeFileRead          = "FILE_READ"           // Read a file from the workspace
-	JobTypeFileReadBytes     = "FILE_READ_BYTES"     // Read a file as raw base64-encoded bytes (binary-safe)
-	JobTypeFileWrite         = "FILE_WRITE"          // Write a file to the workspace
-	JobTypeFileWriteBytes    = "FILE_WRITE_BYTES"    // Write a file from raw base64-encoded bytes (binary-safe)
-	JobTypeFileEdit          = "FILE_EDIT"           // Edit (string replace) a file in the workspace
-	JobTypeFileList          = "FILE_LIST"           // List directory contents in the workspace
-	JobTypeFileSearch        = "FILE_SEARCH"         // Search for text across files in the workspace
-	JobTypeServiceStart      = "SERVICE_START"       // Start a service on the node
-	JobTypeServiceStop       = "SERVICE_STOP"        // Stop a service on the node
-	JobTypeServiceStatus     = "SERVICE_STATUS"      // Check if a service is running
-	JobTypeSandboxSuspend    = "SANDBOX_SUSPEND"     // Pause a Docker container (sandbox suspend)
-	JobTypeSandboxResume     = "SANDBOX_RESUME"      // Unpause a Docker container (sandbox resume)
-	JobTypeModelCachePull    = "MODEL_CACHE_PULL"    // Pull model weights into local cache
-	JobTypeModelCacheEvict   = "MODEL_CACHE_EVICT"   // Evict model weights from local cache
-	JobTypeIOSBuild          = "IOS_BUILD"           // Build an iOS app via xcodebuild (macOS only)
-	JobTypeAndroidBuild      = "ANDROID_BUILD"       // Build an Android app via the Gradle wrapper
-	JobTypeGomobileBuild     = "GOMOBILE_BUILD"      // Cross-compile a Go package via gomobile bind
-	JobTypeFileScreenshot    = "FILE_SCREENSHOT"     // Capture the node's display, return base64 PNG (issue #4179)
-	JobTypeVNCScreenshot     = "VNC_SCREENSHOT"      // Capture the node's display via the VNC tool path (issue #4179)
-	JobTypeVNCType           = "VNC_TYPE"            // Type text on the node's display (issue #4179)
-	JobTypeVNCKeys           = "VNC_KEYS"            // Send a key combo to the node's display (issue #4179)
-	JobTypeVNCActions        = "VNC_ACTIONS"         // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
-	JobTypeCobrowse          = "COBROWSE"            // Human-in-the-loop co-browse over CDP (#4079)
-	JobTypeTranscribeAudio   = "TRANSCRIBE_AUDIO"    // Transcribe workspace audio node-locally via the faster-whisper sidecar
-	JobTypeAgentUpdate       = "AGENT_UPDATE"        // Remotely update + restart this node's own citadel agent (aceteam#4427)
-	JobTypeWhatsAppProvision = "WHATSAPP_PROVISION"  // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
-	JobTypeResourceSnapshot  = "RESOURCE_SNAPSHOT"   // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
-	JobTypeInstanceMessage   = "INSTANCE_MESSAGE"    // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
-	JobTypeModuleSet         = "MODULE_SET"          // Set the desired state of a single module on this node (interim, aceteam#5280)
-	JobTypeMeetingJoin       = "MEETING_JOIN"        // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+	JobTypeShellCommand       = "SHELL_COMMAND"
+	JobTypeTmuxSession        = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
+	JobTypeDownloadModel      = "DOWNLOAD_MODEL"
+	JobTypeOllamaPull         = "OLLAMA_PULL"
+	JobTypeLlamaCppInference  = "LLAMACPP_INFERENCE"
+	JobTypeVLLMInference      = "VLLM_INFERENCE"
+	JobTypeOllamaInference    = "OLLAMA_INFERENCE"
+	JobTypeLLMInference       = "llm_inference"        // Redis worker format
+	JobTypeEmbedding          = "embedding"            // Redis worker format
+	JobTypeApplyDeviceConfig  = "APPLY_DEVICE_CONFIG"  // Device config from onboarding
+	JobTypeExtraction         = "GLINER_EXTRACTION"    // Entity/relation extraction via GLiNER2
+	JobTypeHTTPProxy          = "HTTP_PROXY"           // Proxy HTTP requests through the local node
+	JobTypeFileRead           = "FILE_READ"            // Read a file from the workspace
+	JobTypeFileReadBytes      = "FILE_READ_BYTES"      // Read a file as raw base64-encoded bytes (binary-safe)
+	JobTypeFileWrite          = "FILE_WRITE"           // Write a file to the workspace
+	JobTypeFileWriteBytes     = "FILE_WRITE_BYTES"     // Write a file from raw base64-encoded bytes (binary-safe)
+	JobTypeFileEdit           = "FILE_EDIT"            // Edit (string replace) a file in the workspace
+	JobTypeFileList           = "FILE_LIST"            // List directory contents in the workspace
+	JobTypeFileSearch         = "FILE_SEARCH"          // Search for text across files in the workspace
+	JobTypeFileIndex          = "FILE_INDEX"           // (Re)build the node-local semantic index over workspace files (aceteam#6087)
+	JobTypeFileSemanticSearch = "FILE_SEMANTIC_SEARCH" // KNN over the node-local semantic index (aceteam#6087)
+	JobTypeServiceStart       = "SERVICE_START"        // Start a service on the node
+	JobTypeServiceStop        = "SERVICE_STOP"         // Stop a service on the node
+	JobTypeServiceStatus      = "SERVICE_STATUS"       // Check if a service is running
+	JobTypeSandboxSuspend     = "SANDBOX_SUSPEND"      // Pause a Docker container (sandbox suspend)
+	JobTypeSandboxResume      = "SANDBOX_RESUME"       // Unpause a Docker container (sandbox resume)
+	JobTypeModelCachePull     = "MODEL_CACHE_PULL"     // Pull model weights into local cache
+	JobTypeModelCacheEvict    = "MODEL_CACHE_EVICT"    // Evict model weights from local cache
+	JobTypeIOSBuild           = "IOS_BUILD"            // Build an iOS app via xcodebuild (macOS only)
+	JobTypeAndroidBuild       = "ANDROID_BUILD"        // Build an Android app via the Gradle wrapper
+	JobTypeGomobileBuild      = "GOMOBILE_BUILD"       // Cross-compile a Go package via gomobile bind
+	JobTypeFileScreenshot     = "FILE_SCREENSHOT"      // Capture the node's display, return base64 PNG (issue #4179)
+	JobTypeVNCScreenshot      = "VNC_SCREENSHOT"       // Capture the node's display via the VNC tool path (issue #4179)
+	JobTypeVNCType            = "VNC_TYPE"             // Type text on the node's display (issue #4179)
+	JobTypeVNCKeys            = "VNC_KEYS"             // Send a key combo to the node's display (issue #4179)
+	JobTypeVNCActions         = "VNC_ACTIONS"          // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
+	JobTypeCobrowse           = "COBROWSE"             // Human-in-the-loop co-browse over CDP (#4079)
+	JobTypeTranscribeAudio    = "TRANSCRIBE_AUDIO"     // Transcribe workspace audio node-locally via the faster-whisper sidecar
+	JobTypeAgentUpdate        = "AGENT_UPDATE"         // Remotely update + restart this node's own citadel agent (aceteam#4427)
+	JobTypeWhatsAppProvision  = "WHATSAPP_PROVISION"   // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
+	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
+	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
+	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
 	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
@@ -177,6 +179,8 @@ var allKnownJobTypes = []string{
 	JobTypeFileEdit,
 	JobTypeFileList,
 	JobTypeFileSearch,
+	JobTypeFileIndex,
+	JobTypeFileSemanticSearch,
 	JobTypeServiceStart,
 	JobTypeServiceStop,
 	JobTypeServiceStatus,

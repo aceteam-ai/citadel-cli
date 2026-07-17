@@ -227,6 +227,15 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		searchHandler := jobs.NewFileSearchHandler(opts.WorkspaceDir)
 		searchHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
+		// Node-local semantic index (aceteam#6087). FILE_INDEX walks the
+		// workspace and (re)embeds changed files via the node's TEI service;
+		// FILE_SEMANTIC_SEARCH runs a KNN over that index. The DB path is
+		// resolved by the handler (CITADEL_INDEX_DB or index.db beside the
+		// workspace). FILE_INDEX honors the read-outside-workspace relaxation
+		// like the other read handlers.
+		indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
+		indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+
 		handlers = append(handlers,
 			NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
 			NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
@@ -237,6 +246,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
 			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
 			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeFileIndex, indexHandler),
+			NewLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")),
 			// Node-local meeting transcription (faster-whisper sidecar). Registered
 			// with the workspace so it can validate audio paths the same way the
 			// file handlers do.
