@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -114,6 +115,49 @@ func TestInteractive_LeaveViaSpokenTranscript(t *testing.T) {
 	}
 	if out.streamedSegments == 0 {
 		t.Error("expected at least one streamed segment to have been processed")
+	}
+}
+
+// TestInteractive_RollingStopsWhenCallEnds is the Bug B lifecycle guard at the
+// loop level (live-prod node 1084, 2026-07-16). Even when EVERY rolling pass
+// fails (simulating the Bug A perms cascade where the scratch clip + whole-file
+// read were both denied), the interactive loop must (1) return promptly with a
+// terminal endReason, and (2) fully stop the rolling goroutine before returning
+// — so Execute proceeds to the batch transcribe and no pass keeps firing after
+// the call ended.
+func TestInteractive_RollingStopsWhenCallEnds(t *testing.T) {
+	h := newTestInteractiveHandler()
+	page := &fakeMeetPage{ended: true} // ends on the first end-check
+	var calls int32
+	failingTranscribe := func() ([]TranscriptSegment, error) {
+		atomic.AddInt32(&calls, 1)
+		return nil, errors.New("whisper unreachable (simulated Bug A cascade)")
+	}
+
+	done := make(chan interactiveOutcome, 1)
+	go func() {
+		done <- h.waitForMeetingEndInteractive(
+			JobContext{}, page, testParams(), failingTranscribe, time.Millisecond, map[string]struct{}{},
+		)
+	}()
+
+	var out interactiveOutcome
+	select {
+	case out = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForMeetingEndInteractive did not return; rolling loop likely still firing after the call ended")
+	}
+	if out.endReason != "call_ended" {
+		t.Errorf("endReason = %q, want call_ended (terminal outcome despite all rolling passes failing)", out.endReason)
+	}
+
+	// The deferred stopRolling joined the goroutine before the function returned,
+	// so no further rolling passes may run. Snapshot, wait past many tick
+	// intervals (StreamingInterval is 1ms), and re-check the count is frozen.
+	before := atomic.LoadInt32(&calls)
+	time.Sleep(50 * time.Millisecond)
+	if after := atomic.LoadInt32(&calls); after != before {
+		t.Errorf("rolling passes fired AFTER the loop returned: before=%d after=%d (goroutine not stopped)", before, after)
 	}
 }
 

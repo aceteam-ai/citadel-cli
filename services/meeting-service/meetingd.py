@@ -368,6 +368,37 @@ def _safe_workspace_path(rel: str) -> str:
     return full
 
 
+def _ensure_node_accessible_dir(path: str) -> None:
+    """Create a workspace-shared output dir and make it traversable/readable/
+    writable by the host node user.
+
+    meetingd runs as the unprivileged ``bot`` user (UID 10001) while the Citadel
+    node process -- the end-of-call WAV reader AND the rolling-window
+    transcriber -- runs as the node owner (a different UID). Under bot's umask a
+    freshly-created dir lands at ``0700``, which the node cannot even TRAVERSE,
+    so it can neither read the recorded WAV nor (before the node moved its
+    scratch clip out) write into ``meetings/``.
+
+    We ``chmod 0o777`` UNCONDITIONALLY because ``exist_ok=True`` does not relax a
+    PRE-EXISTING ``0700`` dir -- and ``meetings/`` lives on the persistent
+    workspace mount, so a dir left ``0700`` by an older meetingd survives restart,
+    upgrade, and reinstall. World-write (not merely 0755) is required because
+    whichever side created the shared dir OWNS it and the OTHER side needs
+    write: if the node created it, the container must still write the WAV here.
+
+    The chmod is best-effort: when the node created the dir first it owns it and
+    this call is ``EPERM`` -- harmless, because the node relaxed the mode on its
+    own side. This is safe on a single-tenant sovereign node (the whole node
+    belongs to one operator); it is NOT a general multi-tenant-safe mode.
+    """
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o777)
+    except OSError:
+        # Not the owner (the node created the dir) -- it relaxed the mode itself.
+        pass
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     chromium = _chromium_binary()
@@ -422,6 +453,10 @@ def start_session(req: StartSessionRequest) -> JSONResponse:
         sid = req.session_id or uuid.uuid4().hex[:12]
         sink = f"citadel_meeting_{sid}"
         module_id = _load_null_sink(sink)
+        # PROFILE_DIR holds the bot's signed-in Google session cookies. Unlike the
+        # meetings/ output dir, NOTHING node-side reads it, so it is deliberately
+        # left at the bot's default (owner-only) mode -- it must NOT be world-opened
+        # (that would expose live auth cookies). The entrypoint chowns it to bot.
         os.makedirs(PROFILE_DIR, exist_ok=True)
         env = dict(os.environ)
         env["DISPLAY"] = DISPLAY
@@ -489,7 +524,9 @@ def start_record(session_id: str, req: RecordRequest) -> JSONResponse:
     with s.lock:
         if s.recorder is not None and s.recorder.poll() is None:
             return JSONResponse(status_code=409, content={"error": "already recording"})
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        # Shared output dir must be node-readable (see helper): the node reads
+        # this WAV for the end-of-call transcribe.
+        _ensure_node_accessible_dir(os.path.dirname(out_path))
         rec = subprocess.Popen(
             build_record_ffmpeg_args(f"{s.sink_name}.monitor", out_path),
             env=_pactl_env(),
@@ -518,6 +555,14 @@ def stop_record(session_id: str) -> JSONResponse:
                 rec.kill()
         path = s.record_path
         s.recorder = None
+    # ffmpeg writes the WAV under bot's umask; force group/other-readable so the
+    # node owner (a different UID) can read it for the end-of-call transcribe,
+    # regardless of the container's umask.
+    if path and os.path.exists(path):
+        try:
+            os.chmod(path, 0o644)
+        except OSError:
+            pass
     return JSONResponse(content={"recording": False, "path": path})
 
 

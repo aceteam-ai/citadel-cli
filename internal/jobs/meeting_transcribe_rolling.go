@@ -130,6 +130,20 @@ func (r *RollingTranscriber) Run(stop <-chan struct{}) {
 			r.runPass()
 			return
 		case <-ticker.C:
+			// PRIORITIZE stop over the ticker: Go's select picks a uniformly
+			// random ready case, so once stop is closed a fired ticker could win
+			// repeatedly and keep the loop transcribing long after the meeting
+			// ended (observed live on node 1084, 2026-07-16: rolling passes still
+			// firing 68s after "leaving", starving the end-of-call batch pass).
+			// Re-check stop non-blocking so at most the in-flight pass completes,
+			// then we do the single final pass and return — never another periodic
+			// pass after stop.
+			select {
+			case <-stop:
+				r.runPass()
+				return
+			default:
+			}
 			r.runPass()
 		}
 	}

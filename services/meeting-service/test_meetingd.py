@@ -80,6 +80,43 @@ def test_safe_workspace_path(rel, ok, monkeypatch):
             meetingd._safe_workspace_path(rel)
 
 
+def test_ensure_node_accessible_dir_makes_shared_dir_world_accessible():
+    """Bug A (live-prod node 1084, 2026-07-16): the WAV output dir is created by
+    meetingd (bot UID 10001) but READ by the node owner (a different UID). Under
+    bot's umask it lands 0700, which the node cannot even traverse. The helper must
+    force 0o777 so the node can read the recording for the end-of-call transcribe,
+    and must relax a PRE-EXISTING 0700 dir (exist_ok makedirs does not)."""
+    with tempfile.TemporaryDirectory() as d:
+        target = os.path.join(d, "meetings")
+
+        # Fresh create.
+        meetingd._ensure_node_accessible_dir(target)
+        assert os.path.isdir(target)
+        assert (os.stat(target).st_mode & 0o777) == 0o777
+
+        # Pre-existing 0700 dir (an older meetingd left it restrictive) must be
+        # relaxed, not left as-is.
+        os.chmod(target, 0o700)
+        meetingd._ensure_node_accessible_dir(target)
+        assert (os.stat(target).st_mode & 0o777) == 0o777
+
+
+def test_ensure_node_accessible_dir_chmod_failure_is_non_fatal(monkeypatch):
+    """When the node created the dir first it OWNS it and meetingd's chmod is
+    EPERM -- that must be swallowed (the node relaxed the mode itself), never
+    crash the record start."""
+    with tempfile.TemporaryDirectory() as d:
+        target = os.path.join(d, "meetings")
+
+        def _raise(*_a, **_k):
+            raise PermissionError("not the owner")
+
+        monkeypatch.setattr(meetingd.os, "chmod", _raise)
+        # Must not raise despite chmod failing.
+        meetingd._ensure_node_accessible_dir(target)
+        assert os.path.isdir(target)
+
+
 def _write_wav(path: str, samples: list[int]):
     with wave.open(path, "wb") as w:
         w.setnchannels(1)

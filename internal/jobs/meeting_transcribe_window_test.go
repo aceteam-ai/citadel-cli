@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +49,35 @@ func writeTestWav(t *testing.T, path string, seconds int, placeholderSizes bool)
 		t.Fatalf("write test wav: %v", err)
 	}
 	return byteRate, dataBytes
+}
+
+func TestMeetingWindowWavPath_UsesNodeOwnedScratchDir(t *testing.T) {
+	// Bug A (live-prod node 1084, 2026-07-16): the rolling-window scratch clip must
+	// NOT live inside the container-owned meetings/ dir — the node cannot write
+	// there when meetings/ is owned by the container's bot user. It must sit in a
+	// distinct node-owned scratch subdir, still inside the workspace so the
+	// transcribe handler's ValidatePath accepts it.
+	got := meetingWindowWavPath("/ws", "mtg-1")
+
+	meetingsDir := filepath.Join("/ws", "meetings") + string(filepath.Separator)
+	if strings.HasPrefix(got, meetingsDir) {
+		t.Errorf("window scratch clip %q must NOT live under the container-owned meetings/ dir", got)
+	}
+	want := filepath.Join("/ws", meetingScratchDirName, "mtg-1-window.wav")
+	if got != want {
+		t.Errorf("meetingWindowWavPath = %q, want %q", got, want)
+	}
+	// The recording itself stays under meetings/ (the shared, node-readable dir).
+	if recDir := filepath.Dir(meetingWavPath("/ws", "mtg-1")); recDir != filepath.Join("/ws", "meetings") {
+		t.Errorf("recording dir = %q, want it to remain under meetings/", recDir)
+	}
+	// The scratch clip must still resolve inside the workspace (ValidatePath, so
+	// the transcribe handler accepts it). Use a real temp workspace since
+	// ValidatePath resolves symlinks on the workspace root.
+	ws := t.TempDir()
+	if _, err := ValidatePath(ws, meetingWindowWavPath(ws, "mtg-1")); err != nil {
+		t.Errorf("scratch clip path must validate inside the workspace: %v", err)
+	}
 }
 
 func TestClipWavTail_ClipsTrailingWindow(t *testing.T) {
