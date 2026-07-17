@@ -44,6 +44,22 @@ const deviceCheckIntervalEnv = "CITADEL_DEVICE_CHECK_INTERVAL"
 
 const defaultDeviceCheckInterval = 15 * time.Minute
 
+// leafRenewDaysEnv overrides how many days of remaining leaf life trigger an
+// automatic renewal (default devicemode.DefaultLeafRenewThreshold, 30d).
+// Non-positive values fall back to the default — renewal cannot be disabled by
+// env; a device that never renews is a device that eventually bricks.
+const leafRenewDaysEnv = "CITADEL_DEVICE_LEAF_RENEW_DAYS"
+
+// leafRenewThreshold resolves the renewal window from env or default.
+func leafRenewThreshold() time.Duration {
+	if raw := os.Getenv(leafRenewDaysEnv); raw != "" {
+		if days, err := strconv.Atoi(raw); err == nil && days > 0 {
+			return time.Duration(days) * 24 * time.Hour
+		}
+	}
+	return devicemode.DefaultLeafRenewThreshold
+}
+
 var deviceCmd = &cobra.Command{
 	Use:   "device",
 	Short: "Enroll and maintain this machine as a personal device on your org's network",
@@ -248,16 +264,25 @@ func deviceTick(ctx context.Context, cfg *devicemode.Config, store *nodeidentity
 		return
 	}
 
-	decision := devicemode.Decide(st.BackendState, st.Self.KeyExpiry, leaf.NotAfter, now)
+	decision := devicemode.Decide(st.BackendState, st.Self.KeyExpiry, leaf.NotAfter, now, leafRenewThreshold())
 	logDevice("state=%s leaf_expires=%s: %s",
 		st.BackendState, leaf.NotAfter.Format("2006-01-02"), decision.Reason)
 
 	if decision.LeafExpired {
 		return
 	}
-	if decision.LeafExpiresSoon {
-		logDevice("WARNING: identity certificate expires %s — re-run 'citadel device enroll' before then",
-			leaf.NotAfter.Format("2006-01-02"))
+	if decision.RenewLeaf {
+		// Renewal failure never blocks session self-heal: log and keep going;
+		// the window is ~30d of 15m ticks, so transient failures are cheap.
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		notAfter, err := devicemode.RenewLeaf(tickCtx, httpClient, cfg.APIBaseURL, store)
+		if err != nil {
+			logDevice("leaf renewal failed (will retry next tick): %v", err)
+			logDevice("WARNING: identity certificate expires %s — if renewal keeps failing, re-run 'citadel device enroll' before then",
+				leaf.NotAfter.Format("2006-01-02"))
+		} else {
+			logDevice("identity certificate renewed; now valid until %s", notAfter.Format("2006-01-02"))
+		}
 	}
 	if !decision.Reenroll {
 		return
@@ -319,7 +344,7 @@ func runDeviceStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if !leafNotAfter.IsZero() {
-		decision := devicemode.Decide(st.BackendState, st.Self.KeyExpiry, leafNotAfter, now)
+		decision := devicemode.Decide(st.BackendState, st.Self.KeyExpiry, leafNotAfter, now, leafRenewThreshold())
 		fmt.Printf("Health:      %s\n", decision.Reason)
 	}
 	return nil
