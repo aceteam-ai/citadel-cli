@@ -64,9 +64,12 @@ COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY citadel.pa /etc/pulse/citadel.pa
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# Non-root runtime user with a real home + a pulse runtime dir. The compose file
-# bind-mounts host dirs onto /profile and /workspace; the entrypoint chowns them to
-# `bot` at boot so a fresh host-owned mount "just works" with no manual pre-create.
+# Non-root runtime user with a real home + a pulse runtime dir. 10001 is only the
+# DEFAULT uid: the entrypoint remaps `bot` to the node owner's UID/GID (PUID/PGID,
+# or the /workspace mount owner) at boot so files written into the bind mounts are
+# node-owned. The compose file bind-mounts host dirs onto /profile and /workspace;
+# the entrypoint chowns them to the remapped `bot` so a host-owned mount "just
+# works" with no manual pre-create.
 RUN useradd --create-home --uid 10001 --shell /bin/bash bot \
     && mkdir -p /workspace /profile /run/user/10001/pulse /home/bot/.config/pulse \
     && chown -R bot:bot /home/bot /run/user/10001 /workspace /profile /app \

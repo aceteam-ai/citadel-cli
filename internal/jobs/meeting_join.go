@@ -407,6 +407,9 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// Admitted: begin recording. Ensure the meetings/ dir exists first — the host
 	// ffmpeg's -y does NOT create parent directories (the container's meetingd
 	// makedirs its own, but the dir is on the shared workspace mount either way).
+	// The container writes the WAV as the node's own UID/GID (the meeting image's
+	// PUID/PGID mapping — see services/meeting-service/entrypoint.sh), so the node
+	// and container share ownership and no cross-UID perms fixup is needed here.
 	wavPath := meetingWavPath(h.WorkspaceDir, p.MeetingID)
 	if err := os.MkdirAll(filepath.Dir(wavPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create meetings dir: %w", err)

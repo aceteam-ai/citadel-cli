@@ -25,6 +25,8 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -39,7 +41,27 @@ const (
 	// defaultStreamingWindow + defaultStreamingInterval so a segment always
 	// stabilizes and is emitted before it slides out of the re-fed window.
 	defaultStreamingMaxWindow = 90 * time.Second
+	// rollingShutdownGrace bounds how long the interactive loop waits for the
+	// rolling-transcription goroutine to finish after signalling stop. Passes are
+	// windowed (bounded per pass), so this is generous headroom; it exists only so
+	// a pathologically slow final pass can never wedge the terminal result. If it
+	// trips, transcribeMu still serializes the end-of-call batch transcribe.
+	rollingShutdownGrace = 30 * time.Second
 )
+
+// stopRolling signals the rolling-transcription goroutine to stop and waits
+// (bounded) for it to finish, so the caller returns with the goroutine already
+// stopped. Deferred on every interactive-loop exit path. Bounded because the
+// caller's next step (the end-of-call batch transcribe) must always run — a stuck
+// final pass is contained by transcribeMu, not by blocking Execute forever here.
+func (h *MeetingJoinHandler) stopRolling(ctx JobContext, stop chan struct{}, done <-chan struct{}) {
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(rollingShutdownGrace):
+		ctx.Log("warn", "     - rolling transcriber did not stop within %s; proceeding to batch transcribe (transcribeMu still serializes)", rollingShutdownGrace)
+	}
+}
 
 // meetPage is the browser surface the interactive session drives via page JS:
 // chat read/post, end heuristics, and the leave click. *platform.MeetingBrowser
@@ -120,7 +142,7 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 ) interactiveOutcome {
 	segCh := make(chan TranscriptSegment, 64)
 	stop := make(chan struct{})
-	defer close(stop)
+	rollingDone := make(chan struct{})
 
 	// Rolling transcription on its own goroutine. recover() is load-bearing: a
 	// panic in the injected transcribe (or decoding) must not crash the process
@@ -139,6 +161,7 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 		Log: func(level, msg string) { ctx.Log(level, "%s", msg) },
 	}
 	go func() {
+		defer close(rollingDone)
 		defer func() {
 			if r := recover(); r != nil {
 				ctx.Log("warn", "     - rolling transcription goroutine panicked (recovered, recording unaffected): %v", r)
@@ -146,6 +169,17 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 		}()
 		rt.Run(stop)
 	}()
+
+	// On EVERY exit path (leave, call-ended, or duration cap) signal the rolling
+	// transcriber to stop and WAIT (bounded) for it to actually finish before
+	// returning. This is the Bug B lifecycle fix: Execute must then proceed to the
+	// end-of-call batch transcribe with the rolling goroutine already stopped, so
+	// no pass keeps "firing after leaving" and the terminal result is always
+	// produced (found live on node 1084, 2026-07-16). The wait is bounded so a
+	// pathologically slow final pass can never wedge the terminal outcome —
+	// transcribeMu still serializes the batch transcribe for correctness if the
+	// grace trips.
+	defer h.stopRolling(ctx, stop, rollingDone)
 
 	out := interactiveOutcome{endReason: "max_duration_reached"}
 	seenChat := make(map[int]struct{})
@@ -310,7 +344,13 @@ func (h *MeetingJoinHandler) transcribeSegments(ctx JobContext, meetingID, wavPa
 	transcribePath := wavPath
 	var offset float64
 	clipPath := meetingWindowWavPath(h.WorkspaceDir, meetingID)
-	if off, err := clipWavTail(wavPath, clipPath, h.streamingMaxWindow()); err != nil {
+	// Create the node-owned scratch dir (meetingScratchDirName) up front: it is
+	// distinct from the container-owned meetings/ dir so clipping never depends on
+	// write access there. MkdirAll on a dir this handler owns is cheap and
+	// idempotent; a failure here just degrades this pass to whole-file transcribe.
+	if err := os.MkdirAll(filepath.Dir(clipPath), 0o700); err != nil {
+		ctx.Log("warn", "     - could not create node-owned rolling scratch dir, falling back to whole-file transcribe (non-fatal): %v", err)
+	} else if off, err := clipWavTail(wavPath, clipPath, h.streamingMaxWindow()); err != nil {
 		ctx.Log("warn", "     - rolling window clip failed, falling back to whole-file transcribe (non-fatal): %v", err)
 	} else {
 		transcribePath = clipPath

@@ -900,6 +900,15 @@ func (h *ServiceHandler) composeEnv() []string {
 	// Supply the citadel-owned host ports so compose files that defer their host
 	// publish to ${CITADEL_*_HOST_PORT} (llamacpp/vllm/extraction) resolve.
 	env = append(env, embeddedservices.HostPortEnv()...)
+	// Supply PUID/PGID = this node process's own uid/gid so PUID/PGID-aware module
+	// containers (the meeting media stack) run as the node owner and write files
+	// into bind-mounted workspace dirs owned by the node — no cross-UID perms
+	// fixup. Harmless for compose files that don't reference them; guarded on
+	// os.Getuid()>=0 so a non-POSIX host (Windows returns -1) never emits a bogus
+	// PUID=-1 (the meeting stack is Linux-container-only anyway).
+	if uid := os.Getuid(); uid >= 0 {
+		env = append(env, fmt.Sprintf("PUID=%d", uid), fmt.Sprintf("PGID=%d", os.Getgid()))
+	}
 	return env
 }
 

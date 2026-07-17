@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,6 +156,57 @@ func TestRollingTranscriber_Run_EmitsAcrossPassesAndFinalizes(t *testing.T) {
 	// exactly once, in order.
 	if want := []float64{0, 5, 12}; !reflect.DeepEqual(startsOf(emitted), want) {
 		t.Fatalf("emitted starts = %v, want %v", startsOf(emitted), want)
+	}
+}
+
+// TestRollingTranscriber_Run_NoPeriodicPassAfterStop is the Bug B lifecycle
+// guard (live-prod node 1084, 2026-07-16: rolling passes still firing 68s after
+// "leaving"). Go's select picks a uniformly random ready case, so once stop is
+// closed a still-firing ticker could keep winning and run more periodic passes.
+// The priority re-check of stop must ensure that after stop closes, at most the
+// in-flight pass completes plus exactly ONE final pass — never another periodic
+// pass. We pin exactly one pass in flight when stop closes, then assert the total
+// is 2 (in-flight + final), which fails on the old random-select behavior.
+func TestRollingTranscriber_Run_NoPeriodicPassAfterStop(t *testing.T) {
+	started := make(chan struct{}) // closed when the first pass begins
+	release := make(chan struct{}) // gates the in-flight pass until we say go
+	var passes int32
+	var once sync.Once
+
+	transcribe := func() ([]TranscriptSegment, error) {
+		n := atomic.AddInt32(&passes, 1)
+		if n == 1 {
+			once.Do(func() { close(started) })
+			<-release // hold the first pass in flight across close(stop)
+		}
+		return nil, nil
+	}
+
+	rt := &RollingTranscriber{
+		Interval:   time.Millisecond, // ticker fires rapidly while pass 1 is held
+		Window:     0,
+		Transcribe: transcribe,
+		Emit:       func(TranscriptSegment) {},
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { rt.Run(stop); close(done) }()
+
+	<-started   // pass 1 is in flight (blocked in runPass)
+	close(stop) // stop while a pass is in flight and ticks have queued
+	// Give a buggy random-select a chance to fire extra passes. It can't, because
+	// Run is still blocked inside pass 1 — but this also lets the ticker buffer a
+	// pending tick so the post-release select genuinely races stop vs ticker.
+	time.Sleep(20 * time.Millisecond)
+	close(release) // let pass 1 finish; Run must now do exactly one final pass
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after stop")
+	}
+	if got := atomic.LoadInt32(&passes); got != 2 {
+		t.Errorf("passes = %d, want 2 (one in-flight + one final; no periodic pass after stop)", got)
 	}
 }
 

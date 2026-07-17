@@ -341,6 +341,13 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// compose files that defer their host publish to ${CITADEL_*_HOST_PORT}
 		// (llamacpp/vllm/extraction) resolve.
 		env := append(os.Environ(), services.HostPortEnv()...)
+		// PUID/PGID = this node process's uid/gid, so the meeting media stack runs
+		// as the node owner and writes node-owned files into bind-mounted dirs
+		// (see composeEnv in service_handler.go). Guarded so a non-POSIX host never
+		// emits PUID=-1.
+		if uid := os.Getuid(); uid >= 0 {
+			env = append(env, fmt.Sprintf("PUID=%d", uid), fmt.Sprintf("PGID=%d", os.Getgid()))
+		}
 		// Configure GPU runtime if on Linux
 		if platform.IsLinux() {
 			env = append(env, "DOCKER_DEFAULT_RUNTIME=nvidia")

@@ -2,6 +2,7 @@
 package jobs
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -239,6 +240,36 @@ func TestComposeEnv_InjectsWorkspace(t *testing.T) {
 	}
 	if got != "/home/u/citadel-node/workspace" {
 		t.Errorf("CITADEL_WORKSPACE = %q, want the workspace dir", got)
+	}
+}
+
+// TestComposeEnv_InjectsHostUIDGID verifies SERVICE_START exports PUID/PGID =
+// this node process's own uid/gid, so a PUID/PGID-aware module (the meeting media
+// stack) runs as the node owner and writes node-owned files into bind-mounted
+// workspace dirs — no cross-UID perms fixup for the recorded WAV.
+func TestComposeEnv_InjectsHostUIDGID(t *testing.T) {
+	if os.Getuid() < 0 {
+		t.Skip("non-POSIX host: PUID/PGID intentionally not injected")
+	}
+	h := NewServiceHandlerWithWorkspace("/etc/citadel", "/home/u/citadel-node/workspace")
+	env := h.composeEnv()
+
+	wantUID := fmt.Sprintf("PUID=%d", os.Getuid())
+	wantGID := fmt.Sprintf("PGID=%d", os.Getgid())
+	var sawUID, sawGID bool
+	for _, kv := range env {
+		if kv == wantUID {
+			sawUID = true
+		}
+		if kv == wantGID {
+			sawGID = true
+		}
+	}
+	if !sawUID {
+		t.Errorf("composeEnv did not export %q", wantUID)
+	}
+	if !sawGID {
+		t.Errorf("composeEnv did not export %q", wantGID)
 	}
 }
 

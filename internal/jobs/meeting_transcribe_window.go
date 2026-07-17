@@ -32,13 +32,23 @@ import (
 	"time"
 )
 
-// meetingWindowWavPath is the workspace-local scratch file each rolling pass
-// clips the trailing window into. It sits beside the recording under meetings/
-// (so it passes the transcribe handler's workspace ValidatePath) and is
-// overwritten every pass (passes are serialized under transcribeMu), keyed by
-// the sanitized meeting id.
+// meetingScratchDirName is a scratch subdir under the workspace, distinct from
+// the meetings/ output dir, for the rolling-window transcriber's per-pass clips.
+// Keeping the transient scratch clip out of meetings/ (which holds the durable
+// recordings) is hygiene: it isolates a churny, overwritten-every-pass temp from
+// the artifact the node stores, and keeps the scratch decoupled from the shared
+// mount the meeting container writes into. (The meeting container now writes the
+// WAV as the node's own UID/GID via the image's PUID/PGID mapping, so this is no
+// longer a perms workaround — see services/meeting-service/entrypoint.sh.)
+const meetingScratchDirName = "meeting-scratch"
+
+// meetingWindowWavPath is the scratch file each rolling pass clips the trailing
+// window into. It lives under meetingScratchDirName (still inside the workspace,
+// so it passes the transcribe handler's workspace ValidatePath) and is overwritten
+// every pass (passes are serialized under transcribeMu), keyed by the sanitized
+// meeting id.
 func meetingWindowWavPath(workspaceDir, meetingID string) string {
-	return filepath.Join(workspaceDir, "meetings", sanitizeMeetingFilename(meetingID)+"-window.wav")
+	return filepath.Join(workspaceDir, meetingScratchDirName, sanitizeMeetingFilename(meetingID)+"-window.wav")
 }
 
 // wavFormat holds the parsed, size-independent fields of a WAV's fmt chunk plus
