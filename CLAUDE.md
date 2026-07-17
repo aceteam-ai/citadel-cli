@@ -585,9 +585,23 @@ in sync (guarded by a test).
 llama-server exposes the identical llama.cpp-server API). See
 `internal/jobs/llm_inference.go`. Direct mesh HTTP to `:8210` also works.
 
-**Known limitation:** `MODEL_CACHE_EVICT` (`internal/jobs/model_cache_evict.go`)
-does not yet handle engine `bonsai` (only vllm/llamacpp/ollama), so a bonsai GGUF
-must be removed manually from `~/citadel-cache/bonsai`. Low-priority follow-up.
+**First start builds inline (~7min on Ampere):** because bonsai is build-based,
+the first `SERVICE_START` (or `citadel run --service bonsai`) runs `docker
+compose up -d`, which builds the image before returning. This is safe on the
+deploy path: `SERVICE_START` is in the worker watchdog's *unbounded* tier (see
+Consume-Loop Watchdog above) and the compose-up exec carries no context deadline,
+so the inline build is not killed. Subsequent starts reuse the cached image.
+
+**Known limitations:**
+- **Ampere-only image (compute 8.6).** The Dockerfile defaults
+  `CUDA_ARCHITECTURES=86` (RTX 3090, citadel's target node) — this also cuts
+  build time. On a different GPU (4090=89, A100=80, ...) the built image starts
+  but fails at inference with "no kernel image available for execution on the
+  device". Override via the build ARG (`--build-arg CUDA_ARCHITECTURES=89` or a
+  `;`-list) for other hardware.
+- `MODEL_CACHE_EVICT` (`internal/jobs/model_cache_evict.go`) does not yet handle
+  engine `bonsai` (only vllm/llamacpp/ollama), so a bonsai GGUF must be removed
+  manually from `~/citadel-cache/bonsai`. Low-priority follow-up.
 
 **Optional long-context KV tuning:** the compose default mirrors the card
 (`-ngl 99`, no KV-quant flags). For long context, add
