@@ -2,6 +2,7 @@
 package jobs
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -11,6 +12,23 @@ import (
 type JobContext struct {
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
+
+	// Ctx is the per-job execution context threaded from the worker runner.
+	// Handlers that shell out or perform cancellable I/O should honor it (e.g.
+	// exec.CommandContext) so a per-job deadline or cancellation actually
+	// terminates in-flight work (aceteam#6000). It may be nil for callers that
+	// predate deadline propagation; use Context() to read it safely.
+	Ctx context.Context
+}
+
+// Context returns the job's execution context, falling back to
+// context.Background() when unset so handlers can pass it to exec.CommandContext
+// unconditionally.
+func (c *JobContext) Context() context.Context {
+	if c.Ctx != nil {
+		return c.Ctx
+	}
+	return context.Background()
 }
 
 // Log outputs a message - uses LogFn callback if set, otherwise prints to stdout.

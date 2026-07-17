@@ -79,8 +79,10 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 		}
 	}
 
-	// Execute the legacy handler with log callback
-	jobCtx := jobs.JobContext{LogFn: a.logFn}
+	// Execute the legacy handler with log callback. Thread the worker context so
+	// handlers that shell out (e.g. SHELL_COMMAND) honor a per-job deadline or
+	// cancellation and actually terminate their child process (aceteam#6000).
+	jobCtx := jobs.JobContext{LogFn: a.logFn, Ctx: ctx}
 	output, err := a.handler.Execute(jobCtx, nexusJob)
 
 	duration := time.Since(start)

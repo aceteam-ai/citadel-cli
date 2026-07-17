@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -226,7 +227,13 @@ func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, e
 	}
 	ctx.Log("info", "     - [Job %s] Running shell command: '%s'", job.ID, cmdString)
 
-	cmd := exec.Command("/bin/sh", "-c", cmdString)
+	// Bind the command to the job context so a per-job deadline / cancellation
+	// terminates the child process instead of leaking it (aceteam#6000).
+	// CommandContext sends Kill when ctx is done; WaitDelay bounds how long
+	// CombinedOutput waits on inherited stdio pipes afterwards, so a backgrounded
+	// grandchild holding the pipe can't keep the handler blocked indefinitely.
+	cmd := exec.CommandContext(ctx.Context(), "/bin/sh", "-c", cmdString)
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Env = scrubEnv(os.Environ(), parseJobEnv(job))
 	if h.WorkspaceDir != "" {
 		cmd.Dir = h.WorkspaceDir
