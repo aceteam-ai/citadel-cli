@@ -441,7 +441,23 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 
 	// Execute handler
 	stream.WriteStart("Job processing started")
-	result, err := handler.Execute(ctx, job, stream)
+
+	// Per-job execution deadline (aceteam#6000). When the payload carries a
+	// positive timeout budget, run the handler under a bounded context plus a
+	// watchdog so a single hung/blocked handler cannot wedge this node's whole
+	// sequential job loop: on expiry executeWithDeadline returns a deadline
+	// error and the failure path below publishes the terminal error + Nacks on
+	// the live parent ctx, letting the loop advance to the next job. With no
+	// budget present (older backend, or a legitimately unbounded job type like
+	// model download / build / provision) the call stays exactly as before --
+	// synchronous, no timeout, no watchdog goroutine.
+	var result *JobResult
+	var err error
+	if timeout, ok := jobExecTimeout(job); ok {
+		result, err = r.executeWithDeadline(ctx, handler, job, stream, timeout)
+	} else {
+		result, err = handler.Execute(ctx, job, stream)
+	}
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
