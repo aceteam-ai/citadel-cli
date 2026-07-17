@@ -27,11 +27,11 @@ type Collector struct {
 	services       []ServiceConfig
 	startTime      time.Time
 	modelDiscovery *ModelDiscovery
-	capabilities   *NodeCapabilities     // cached capabilities (set once at startup)
+	capabilities   *NodeCapabilities      // cached capabilities (set once at startup)
 	workerLiveness func() *WorkerLiveness // live worker consume-loop liveness (issue #548), optional
-	idleTracker    *IdleTracker          // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
-	fpIdleTracker  *FootprintIdleTracker // footprint-derived idle for engines #416 can't scrape (citadel #421)
-	netIdleTracker *IdleTracker          // network-activity idle for non-vLLM services (citadel #433)
+	idleTracker    *IdleTracker           // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.

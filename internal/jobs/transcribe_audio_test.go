@@ -131,6 +131,118 @@ func TestTranscribeAudio_ServiceError(t *testing.T) {
 	}
 }
 
+// TestTranscribeTimeoutForAudioBytes covers the size -> timeout mapping that
+// replaced the fixed 30-minute client cap. The field bug was a 43-minute /
+// ~83 MB WAV whose transcription ran past 30 minutes; the budget must now scale
+// with the audio's real length, floored for tiny clips and ceilinged for
+// absurdly large inputs.
+func TestTranscribeTimeoutForAudioBytes(t *testing.T) {
+	const bytesPerMinute = transcribeBytesPerSecond * 60 // 32000 * 60 = 1.92 MB/min
+
+	cases := []struct {
+		name string
+		size int64
+		want time.Duration
+	}{
+		{
+			// Zero/unknown size falls back to the generous ceiling, never a
+			// small default — under-timing is the exact regression being fixed.
+			name: "unknown size uses ceiling",
+			size: 0,
+			want: transcribeMaxRequestTimeout,
+		},
+		{
+			// A short rolling-window clip (~90s of audio) stays at the floor:
+			// 90s * 3 = 4.5min > 2min floor, so it is the raw budget here.
+			name: "90s rolling clip",
+			size: 90 * transcribeBytesPerSecond,
+			want: 90 * transcribeSecondsPerAudioSecond * time.Second,
+		},
+		{
+			// A tiny clip is floored so warm-up/jitter never trips it.
+			name: "tiny clip floored",
+			size: 5 * transcribeBytesPerSecond,
+			want: transcribeMinRequestTimeout,
+		},
+		{
+			// The field case: 43 minutes of audio -> ~2h15m budget, comfortably
+			// past the 30-minute cap that failed.
+			name: "43 minute meeting",
+			size: 43 * bytesPerMinute,
+			want: 43 * 60 * transcribeSecondsPerAudioSecond * time.Second,
+		},
+		{
+			// A 4-hour meeting (the MEETING_JOIN hard cap) sits right at the
+			// ceiling and must NOT be clamped below its real need.
+			name: "four hour meeting at ceiling",
+			size: 4 * 60 * bytesPerMinute,
+			want: transcribeMaxRequestTimeout,
+		},
+		{
+			// Absurdly large input is bounded so a corrupt file can't wedge a
+			// worker slot forever.
+			name: "oversized input clamped to ceiling",
+			size: 100 * 60 * bytesPerMinute,
+			want: transcribeMaxRequestTimeout,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transcribeTimeoutForAudioBytes(tc.size)
+			if got != tc.want {
+				t.Errorf("transcribeTimeoutForAudioBytes(%d) = %v, want %v", tc.size, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTranscribeTimeout_BatchLongerThanRolling proves requirement 4: the
+// end-of-call batch pass over the full recording gets a far longer budget than a
+// short rolling-window clip, since both flow through the same handler and are
+// discriminated purely by the file size. This is the client-side selector the
+// wire test cannot observe (the context deadline never crosses the wire).
+func TestTranscribeTimeout_BatchLongerThanRolling(t *testing.T) {
+	dir := t.TempDir()
+
+	// A short rolling clip (~90s) vs a long batch recording (~43min), sized so
+	// their byte lengths mirror the real recorder format.
+	rollingPath := filepath.Join(dir, "rolling.wav")
+	if err := os.WriteFile(rollingPath, make([]byte, 90*transcribeBytesPerSecond), 0o644); err != nil {
+		t.Fatalf("setup rolling: %v", err)
+	}
+	batchPath := filepath.Join(dir, "batch.wav")
+	if err := os.WriteFile(batchPath, make([]byte, 43*60*transcribeBytesPerSecond), 0o644); err != nil {
+		t.Fatalf("setup batch: %v", err)
+	}
+
+	h := NewTranscribeAudioHandler(dir)
+	rolling := h.requestTimeout(rollingPath)
+	batch := h.requestTimeout(batchPath)
+
+	if batch <= rolling {
+		t.Fatalf("batch budget %v should exceed rolling budget %v", batch, rolling)
+	}
+	// The batch pass must clear the fixed 30-minute cap that failed in the field.
+	if batch <= 30*time.Minute {
+		t.Errorf("batch budget %v does not exceed the old 30m cap", batch)
+	}
+	// The rolling clip must stay short — the long budget is only for the full file.
+	if rolling > 10*time.Minute {
+		t.Errorf("rolling budget %v is unexpectedly large", rolling)
+	}
+}
+
+// TestTranscribeTimeout_MissingFileUsesCeiling verifies the stat-failure
+// direction: a missing file yields the generous ceiling, not a small default.
+func TestTranscribeTimeout_MissingFileUsesCeiling(t *testing.T) {
+	h := NewTranscribeAudioHandler(t.TempDir())
+	got := h.requestTimeout(filepath.Join(t.TempDir(), "does-not-exist.wav"))
+	if got != transcribeMaxRequestTimeout {
+		t.Errorf("requestTimeout(missing) = %v, want ceiling %v", got, transcribeMaxRequestTimeout)
+	}
+}
+
 // TestTranscribeAudio_WaitForReady_UnreachableFailsFast covers the cold-start
 // hang: a sidecar that was never started (nothing listening on its port) must
 // not make waitForReady block anywhere near the full 120s model-load budget.
