@@ -186,3 +186,51 @@ func TestAgentNodeInfoFields(t *testing.T) {
 		t.Fatalf("uptime should be ~60s, got %d", up)
 	}
 }
+
+// TestAgentWorkerRestartServiceManaged verifies that when the process is
+// service-managed (systemd sets INVOCATION_ID), a remote restart schedules a
+// non-zero process exit and returns a restarting acknowledgement (issue #548).
+func TestAgentWorkerRestartServiceManaged(t *testing.T) {
+	t.Setenv("INVOCATION_ID", "test-unit-123")
+	exited := make(chan int, 1)
+	origExit, origDelay := processExiter, serviceRestartDelay
+	processExiter = func(code int) { exited <- code }
+	serviceRestartDelay = 1 * time.Millisecond
+	defer func() { processExiter, serviceRestartDelay = origExit, origDelay }()
+
+	res, err := agentWorkerRestart()
+	if err != nil {
+		t.Fatalf("agentWorkerRestart() error = %v", err)
+	}
+	m := res.(map[string]any)
+	if m["ok"] != true || m["restarting"] != true {
+		t.Errorf("result = %+v, want ok=true restarting=true", m)
+	}
+	select {
+	case code := <-exited:
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("process exit was never scheduled")
+	}
+}
+
+// TestAgentWorkerRestartNotServiceManaged verifies the safety guard: when
+// nothing will restart the process, a remote restart must NOT exit -- it returns
+// guidance instead, so it can never leave the node dead.
+func TestAgentWorkerRestartNotServiceManaged(t *testing.T) {
+	t.Setenv("INVOCATION_ID", "")
+	origExit := processExiter
+	processExiter = func(int) { t.Fatal("must not exit when not service-managed") }
+	defer func() { processExiter = origExit }()
+
+	res, err := agentWorkerRestart()
+	if err != nil {
+		t.Fatalf("agentWorkerRestart() error = %v", err)
+	}
+	if m := res.(map[string]any); m["ok"] != false {
+		t.Errorf("result = %+v, want ok=false (guidance, no exit)", m)
+	}
+	time.Sleep(5 * time.Millisecond) // give any errant goroutine a chance to fire
+}

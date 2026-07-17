@@ -28,6 +28,7 @@ type Collector struct {
 	startTime      time.Time
 	modelDiscovery *ModelDiscovery
 	capabilities   *NodeCapabilities     // cached capabilities (set once at startup)
+	workerLiveness func() *WorkerLiveness // live worker consume-loop liveness (issue #548), optional
 	idleTracker    *IdleTracker          // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker // footprint-derived idle for engines #416 can't scrape (citadel #421)
 	netIdleTracker *IdleTracker          // network-activity idle for non-vLLM services (citadel #433)
@@ -47,6 +48,10 @@ type CollectorConfig struct {
 	ConfigDir    string
 	Services     []ServiceConfig
 	Capabilities *NodeCapabilities // pre-detected capabilities (optional)
+	// WorkerLiveness, when set, returns the live consume-loop liveness attached
+	// to each heartbeat so the platform can flag "green but wedged" nodes
+	// (issue #548). Optional: nil on nodes with no worker loop.
+	WorkerLiveness func() *WorkerLiveness
 }
 
 // NewCollector creates a new status collector.
@@ -58,6 +63,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		startTime:      time.Now(),
 		modelDiscovery: NewModelDiscovery(),
 		capabilities:   cfg.Capabilities,
+		workerLiveness: cfg.WorkerLiveness,
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
 		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
@@ -158,6 +164,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// keys) so the fabric can schedule engine-specific deploys only to capable
 	// nodes (aceteam#4483).
 	populateServices(status.Capabilities)
+
+	// Attach live worker consume-loop liveness so the platform can distinguish a
+	// heartbeating-but-wedged node from one actually draining jobs (issue #548).
+	if c.workerLiveness != nil {
+		status.Worker = c.workerLiveness()
+	}
 
 	return status, nil
 }

@@ -162,12 +162,20 @@ func TestExecuteWithDeadlineUnblocksHungHandler(t *testing.T) {
 		t.Error("deadline error should be published as non-recoverable")
 	}
 
-	// job-1 was nacked; job-2 acked.
-	if n := source.NackedJobs(); len(n) != 1 || n[0].ID != "job-1" {
-		t.Errorf("nacked = %v, want [job-1]", n)
+	// job-1 was Failed (terminal DLQ, NOT Nacked): a watchdog abandon must not
+	// be retried into a repeated wedge (issue #548). job-2 acked.
+	if f := source.FailedJobs(); len(f) != 1 || f[0].ID != "job-1" {
+		t.Errorf("failed = %v, want [job-1]", f)
+	}
+	if n := source.NackedJobs(); len(n) != 0 {
+		t.Errorf("nacked = %v, want [] (deadline abandon should Fail, not Nack)", n)
 	}
 	if a := source.AckedJobs(); len(a) != 1 || a[0].ID != "job-2" {
 		t.Errorf("acked = %v, want [job-2]", a)
+	}
+	// The failure data marks it as an agent-side deadline abandon.
+	if d := source.FailedData(); len(d) != 1 || d[0]["deadline_exceeded"] != true {
+		t.Errorf("failed data = %v, want deadline_exceeded=true", d)
 	}
 }
 
@@ -229,4 +237,71 @@ func TestJobExecTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveJobTimeout covers the #548 fallback tiers: an explicit payload
+// budget always wins; otherwise a generous per-class default applies; unbounded
+// classes (model pulls, builds, provision) get no fallback cap; and either tier
+// can be tuned or disabled by env.
+func TestResolveJobTimeout(t *testing.T) {
+	r := &Runner{}
+
+	t.Run("explicit payload wins over fallback", func(t *testing.T) {
+		job := &Job{Type: JobTypeLLMInference, Payload: map[string]any{"timeout_ms": float64(1234)}}
+		d, ok := r.resolveJobTimeout(job)
+		if !ok || d != 1234*time.Millisecond {
+			t.Fatalf("got (%s, %v), want (1.234s, true)", d, ok)
+		}
+	})
+
+	t.Run("default tier for an ordinary job type", func(t *testing.T) {
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeLLMInference})
+		if !ok || d != defaultJobTimeoutSeconds*time.Second {
+			t.Fatalf("got (%s, %v), want (%ds, true)", d, ok, defaultJobTimeoutSeconds)
+		}
+	})
+
+	t.Run("transcribe uses the default tier and exceeds its own 32min self-bound", func(t *testing.T) {
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeTranscribeAudio})
+		if !ok || d <= 33*time.Minute {
+			t.Fatalf("got (%s, %v), want a bound comfortably above ~32min", d, ok)
+		}
+	})
+
+	t.Run("long tier for a session job type", func(t *testing.T) {
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeMeetingJoin})
+		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
+			t.Fatalf("got (%s, %v), want (%ds, true)", d, ok, defaultLongJobTimeoutSeconds)
+		}
+	})
+
+	t.Run("unbounded types get no fallback cap (must not kill model pulls)", func(t *testing.T) {
+		for _, jt := range []string{JobTypeModelCachePull, JobTypeDownloadModel, JobTypeOllamaPull, JobTypeServiceStart, JobTypeAndroidBuild, JobTypeInstanceProvision} {
+			if _, ok := r.resolveJobTimeout(&Job{Type: jt}); ok {
+				t.Errorf("%s got a fallback cap; want unbounded (ok=false)", jt)
+			}
+		}
+	})
+
+	t.Run("unbounded type still honors an explicit payload budget", func(t *testing.T) {
+		job := &Job{Type: JobTypeModelCachePull, Payload: map[string]any{"timeout_ms": float64(5000)}}
+		if d, ok := r.resolveJobTimeout(job); !ok || d != 5*time.Second {
+			t.Fatalf("got (%s, %v), want (5s, true)", d, ok)
+		}
+	})
+
+	t.Run("env override tunes the default tier", func(t *testing.T) {
+		t.Setenv(jobTimeoutDefaultEnvVar, "120")
+		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeLLMInference})
+		if !ok || d != 120*time.Second {
+			t.Fatalf("got (%s, %v), want (2m, true)", d, ok)
+		}
+	})
+
+	t.Run("env 0 disables the default tier (unbounded)", func(t *testing.T) {
+		t.Setenv(jobTimeoutDefaultEnvVar, "0")
+		if _, ok := r.resolveJobTimeout(&Job{Type: JobTypeLLMInference}); ok {
+			t.Fatal("default tier set to 0 should be unbounded (ok=false)")
+		}
+	})
 }

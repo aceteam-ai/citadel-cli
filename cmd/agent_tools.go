@@ -73,17 +73,56 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			return agentResubscribe(ctx, d, orgID)
 		},
 		WorkerRestart: func() (any, error) {
-			// A safe in-place run-loop restart (Drain + reconnect + re-AddQueue)
-			// is non-trivial because Runner.Run blocks and owns the source. Rather
-			// than ship a half-working goroutine swap, return an actionable result
-			// pointing the agent at the supported recovery paths. Tracked as
-			// future work in #236.
-			return map[string]any{
-				"ok":      false,
-				"message": "in-place worker restart is not yet supported; use /agent/resubscribe to recover a dead consume loop, or restart the citadel systemd service (sudo systemctl restart citadel)",
-			}, nil
+			return agentWorkerRestart()
 		},
 	}
+}
+
+// processExiter is swappable in tests so agentWorkerRestart can be exercised
+// without actually terminating the test binary.
+var processExiter = func(code int) { os.Exit(code) }
+
+// serviceRestartDelay is the grace window between returning the HTTP result and
+// exiting, so the restart acknowledgement flushes to the caller first.
+var serviceRestartDelay = 500 * time.Millisecond
+
+// managedByServiceManager reports whether THIS process was launched by a service
+// manager that will restart it after a non-zero exit. systemd sets INVOCATION_ID
+// on the processes of the units it starts; this is the signal that an exit is a
+// restart, not a suicide. Deliberately conservative: if we cannot prove we are
+// under such a manager we do NOT exit (that would leave the node dead), and fall
+// back to guidance instead.
+func managedByServiceManager() bool {
+	return strings.TrimSpace(os.Getenv("INVOCATION_ID")) != ""
+}
+
+// agentWorkerRestart is the break-glass remote restart behind
+// /agent/worker-restart (issue #548). The prior implementation was a no-op that
+// only returned guidance, so a consumption-wedged headless node could only be
+// recovered by an operator with shell access. A safe in-place run-loop swap is
+// non-trivial (Runner.Run blocks and owns the source), so we instead do the
+// thing an operator's `systemctl restart` does: exit non-zero and let the
+// service manager restart the process clean -- clearing any leaked/wedged
+// handler goroutines. Gated on managedByServiceManager() so we never exit into a
+// dead node when nothing will bring us back.
+func agentWorkerRestart() (any, error) {
+	if !managedByServiceManager() {
+		return map[string]any{
+			"ok":      false,
+			"message": "remote worker restart requires the agent to run under a service manager (systemd) that will restart it; this process is not service-managed. Use /agent/resubscribe to recover a lost subscription, or restart the citadel service manually.",
+		}, nil
+	}
+	Log("agent: remote worker-restart requested; exiting for service-manager restart in %s", serviceRestartDelay)
+	go func() {
+		time.Sleep(serviceRestartDelay) // let the HTTP acknowledgement flush first
+		processExiter(1)
+	}()
+	return map[string]any{
+		"ok":         true,
+		"restarting": true,
+		"method":     "process-exit",
+		"message":    "worker is restarting via the service manager; it will reconnect and resume consuming shortly",
+	}, nil
 }
 
 // agentResubscribe re-establishes the per-node shell stream subscription on the

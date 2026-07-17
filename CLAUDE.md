@@ -568,6 +568,72 @@ Environment variables:
 | `SERVICE_AUTO_STOP_WHEN_IDLE` | unset (OFF) | Opt-in to auto-stop idle services. Truthy: `1`/`true`/`yes`/`on`. |
 | `SERVICE_AUTO_STOP_IDLE_SECONDS` | idle threshold | Idle seconds before auto-stop acts. |
 
+### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
+
+A hung job handler must never silently stall the whole node. The wedge that
+motivated this: a meeting/transcribe handler stuck in a `permission denied` +
+"waiting for service to become ready" retry loop blocked the sequential consume
+goroutine for 4+ hours. Heartbeats kept flowing from a separate goroutine, so the
+node showed green while executing nothing. Three defenses (`internal/worker/`):
+
+1. **Per-job watchdog (root fix, `deadline.go` + `runner.go`).** Every handler
+   dispatch runs in its own goroutine bounded by a deadline (`executeWithDeadline`).
+   On timeout the loop abandons the job and advances. CRITICAL: legacy handlers do
+   NOT receive the context (`LegacyHandlerAdapter.Execute` builds a bare
+   `jobs.JobContext`), so a context-cancel alone can't unblock them — the
+   goroutine+select is what keeps the loop alive; the orphaned handler goroutine
+   leaks until it finishes on its own (accepted tradeoff; threading ctx into
+   legacy handlers is the follow-up that lets the leak be fixed). Timeout
+   precedence: an explicit payload `timeout_ms` (backend budget, PR #552) wins;
+   otherwise a **generous per-class fallback** applies so the wedge is bounded even
+   when the backend sends no budget (the exact wedge condition). Classes:
+   - Default 60min (`WORKER_JOB_TIMEOUT_SECONDS`): inference, shell, file, VNC,
+     transcribe (its own single-shot self-bound is ~32min, comfortably under).
+   - Long 4h (`WORKER_JOB_TIMEOUT_LONG_SECONDS`): `MEETING_JOIN`, `COBROWSE` —
+     real human-session length; 4h catches a wedge without killing a live meeting.
+   - Unbounded (no fallback cap): model pulls/downloads, builds, `SERVICE_START`,
+     `INSTANCE_PROVISION`, `AGENT_UPDATE`, `WHATSAPP_PROVISION` — opaque long
+     progress; a blanket cap would risk killing a legit job. Set either env to `0`
+     to make that tier unbounded. A watchdog abandon is terminal: it routes to
+     `source.Fail` (DLQ), not `Nack`, so a hung job isn't retried into a repeat
+     wedge (esp. important in sequential mode).
+
+2. **Self-heal monitor (`selfheal.go`, default ON).** Backstop for a wedge the
+   per-job watchdog can't catch (outside a handler, or watchdog disabled). Reads
+   the shared `WorkerState` and exits non-zero (systemd `Restart=on-failure`
+   restarts clean) only on a clear loss of progress: no poll for
+   `WORKER_SELF_HEAL_STALL_SECONDS` (default 600) **while `in_flight==0`** (a busy
+   long job legitimately stops polling, so in-flight gates it), or a single job
+   in flight past `WORKER_SELF_HEAL_STUCK_SECONDS` (default 18000/5h, above the
+   long cap). Skips while draining (auto-update) and during a startup grace.
+   Disable with `WORKER_SELF_HEAL=false`.
+
+3. **Heartbeat liveness (`internal/status/` `WorkerLiveness`).** The heartbeat's
+   `NodeStatus.worker` now carries `consuming`, `last_job_consumed_at`,
+   `last_poll_at`, `in_flight` so the platform can flag a "green but wedged" node.
+   Read them together: `consuming==false && in_flight==0` ⇒ wedged;
+   `consuming==false && in_flight>0` ⇒ possibly a legit long job. `consuming`
+   (poll freshness) is the alarm; `last_job_consumed_at` alone is ambiguous
+   (stale on an idle node). Additive/omitempty; the same `WorkerState` pointer
+   feeds both the runner and the collector.
+
+**Remote restart break-glass (`cmd/agent_tools.go`).** `/agent/worker-restart`
+(the `citadel_worker_restart` MCP tool) now performs a real restart — it exits
+non-zero for the service manager to restart, but **only when
+`managedByServiceManager()` is true** (systemd sets `INVOCATION_ID`); otherwise it
+degrades to guidance so it can never exit into a node nothing will bring back. The
+aceteam MCP side already POSTs to this endpoint (no wiring change needed); it
+should render the new `{ok:true, restarting:true}` response instead of the old
+"not yet supported" guidance.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WORKER_JOB_TIMEOUT_SECONDS` | `3600` | Fallback per-job deadline for ordinary job types. `0` = unbounded. |
+| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE). `0` = unbounded. |
+| `WORKER_SELF_HEAL` | on | Set falsey (`0`/`false`/`no`/`off`) to disable the self-heal monitor. |
+| `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
+| `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json

@@ -34,6 +34,40 @@ type NodeStatus struct {
 	// backward-compatible: legacy nodes omit it and are treated as "unknown".
 	DesktopCapabilities map[string]bool `json:"desktop_capabilities,omitempty"`
 	VNCPort             int             `json:"vnc_port"`
+	// Worker carries live job-consumption liveness so the platform can tell a
+	// process that is alive & heartbeating from one that is actually draining
+	// jobs (issue #548). Additive and back-compatible: omitted on nodes that run
+	// no worker loop (pure status/desktop nodes) and on legacy builds.
+	Worker *WorkerLiveness `json:"worker,omitempty"`
+}
+
+// WorkerLiveness is the heartbeat-facing view of the job consume loop. It is the
+// signal the platform uses to flag a "green but wedged" node -- one whose
+// heartbeat keeps flowing from a separate goroutine while the consume loop is
+// blocked and draining nothing (issue #548).
+//
+// Interpreting the fields together (the platform must qualify, not read one in
+// isolation):
+//   - Consuming==false && InFlight==0  -> WEDGED: the loop stopped polling and
+//     nothing is running. Alert.
+//   - Consuming==false && InFlight>0   -> possibly a legitimate long job holding
+//     the sequential loop; not necessarily wedged.
+//   - Consuming==true                  -> healthy; polling recently.
+//
+// LastJobConsumedAt alone is intentionally ambiguous (naturally stale on an idle
+// node with no work), so it is context, not the alarm.
+type WorkerLiveness struct {
+	// Consuming is true when a poll cycle completed recently (freshness bound).
+	Consuming bool `json:"consuming"`
+	// LastJobConsumedAt is when a job was most recently pulled off the queue.
+	LastJobConsumedAt *time.Time `json:"last_job_consumed_at,omitempty"`
+	// LastPollAt is when the consume loop last completed a poll (job or empty).
+	LastPollAt *time.Time `json:"last_poll_at,omitempty"`
+	// InFlight is the number of jobs currently executing in a handler.
+	InFlight int64 `json:"in_flight"`
+	// Processed / Failed are cumulative since worker start (diagnostic context).
+	Processed int64 `json:"processed,omitempty"`
+	Failed    int64 `json:"failed,omitempty"`
 }
 
 // AppInfo contains information about an installed catalog app.
