@@ -1,0 +1,54 @@
+# services/compose/bonsai.yml
+#
+# Serves PrismML's Bonsai-27B (1-bit quantized Qwen3.6-27B) via an
+# OpenAI-compatible llama-server built from the PrismML fork of llama.cpp
+# (see services/compose/bonsai/Dockerfile). The 1-bit GGUF is ~3.8GB and fits an
+# RTX 3090 (24GB) easily (~5-12GB VRAM incl. KV cache by context length).
+#
+# UNLIKE every other embedded service (llamacpp, vllm, diffusers, ...), which
+# pull a prebuilt `image:`, bonsai BUILDS its image from a Dockerfile because no
+# prebuilt image for the fork is published. The `build.context: ./bonsai` is
+# relative to this compose file's directory; citadel materializes the Dockerfile
+# to <config>/services/bonsai/Dockerfile via services.WriteAuxFiles so the build
+# resolves on the node.
+#
+# Model file: MODEL_CACHE_PULL for engine "bonsai" downloads exactly
+# Bonsai-27B-Q1_0.gguf from prism-ml/Bonsai-27B-gguf into ~/citadel-cache/bonsai
+# (huggingface-cli ... --local-dir), which is mounted below at /models. Override
+# the served file with BONSAI_MODEL (e.g. a different quant) the same way vllm
+# uses VLLM_MODEL.
+
+services:
+  bonsai:
+    build:
+      context: ./bonsai
+      dockerfile: Dockerfile
+    image: citadel-bonsai:local
+    container_name: citadel-bonsai
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_BONSAI_HOST_PORT; the :? guard fails loudly if citadel forgot to
+    # supply it. Left on the default 0.0.0.0 bind because peers reach this engine
+    # directly over the mesh. The container serves the OpenAI API on :8080.
+    ports:
+      - "${CITADEL_BONSAI_HOST_PORT:?citadel must supply CITADEL_BONSAI_HOST_PORT}:8080"
+    volumes:
+      # MODEL_CACHE_PULL (engine=bonsai) drops Bonsai-27B-Q1_0.gguf here.
+      - ~/citadel-cache/bonsai:/models
+    # -ngl 99 offloads all layers to the GPU (the card's recommended command).
+    # Optional long-context tuning (NOT default-on: quantized V-cache requires
+    # flash attention and can fail startup on some builds, which we cannot
+    # validate here without GPU inference):
+    #   --flash-attn --cache-type-k q4_0 --cache-type-v q4_0
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      --model /models/${BONSAI_MODEL:-Bonsai-27B-Q1_0.gguf}
+      -ngl 99
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

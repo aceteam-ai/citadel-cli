@@ -593,7 +593,9 @@ func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	servicesDir := filepath.Join(h.ConfigDir, "services")
 	destPath := filepath.Join(servicesDir, name+".yml")
 	if _, err := os.Stat(destPath); err == nil {
-		return nil // already materialized
+		// Ensure build-context aux files exist even if the .yml was written by
+		// an older binary (idempotent no-op for image-based services).
+		return embeddedservices.WriteAuxFiles(servicesDir, name)
 	}
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return fmt.Errorf("failed to create services directory: %w", err)
@@ -602,7 +604,9 @@ func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	if err := os.WriteFile(destPath, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write compose file: %w", err)
 	}
-	return nil
+	// Materialize any build-context files (e.g. bonsai's Dockerfile) so the
+	// compose `build:` resolves on the node.
+	return embeddedservices.WriteAuxFiles(servicesDir, name)
 }
 
 // addServiceToManifestFile appends a single service block to the citadel.yaml
