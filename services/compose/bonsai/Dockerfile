@@ -47,7 +47,8 @@ WORKDIR /opt/llama.cpp
 # build/bin/llama-server.
 RUN cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
-        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -lcuda" \
     && cmake --build build --config Release -j "$(nproc)" --target llama-server \
     && cp build/bin/llama-server /usr/local/bin/llama-server
 
