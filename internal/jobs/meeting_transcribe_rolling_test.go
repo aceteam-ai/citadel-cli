@@ -192,8 +192,8 @@ func TestRollingTranscriber_Run_NoPeriodicPassAfterStop(t *testing.T) {
 	done := make(chan struct{})
 	go func() { rt.Run(stop); close(done) }()
 
-	<-started    // pass 1 is in flight (blocked in runPass)
-	close(stop)  // stop while a pass is in flight and ticks have queued
+	<-started   // pass 1 is in flight (blocked in runPass)
+	close(stop) // stop while a pass is in flight and ticks have queued
 	// Give a buggy random-select a chance to fire extra passes. It can't, because
 	// Run is still blocked inside pass 1 — but this also lets the ticker buffer a
 	// pending tick so the post-release select genuinely races stop vs ticker.
