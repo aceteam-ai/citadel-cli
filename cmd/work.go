@@ -1124,14 +1124,31 @@ func runWork(cmd *cobra.Command, args []string) {
 		workStatusPort = 8080
 	}
 
+	// Live worker consume-loop liveness for the heartbeat (issue #548). Reads the
+	// same *WorkerState the runner updates, so the heartbeat can surface a
+	// "green but wedged" node (heartbeating from a separate goroutine while the
+	// consume loop is blocked and draining nothing).
+	workerLivenessFn := func() *status.WorkerLiveness {
+		snap := workerState.Snapshot()
+		return &status.WorkerLiveness{
+			Consuming:         snap.Consuming,
+			LastJobConsumedAt: snap.LastJobAt,
+			LastPollAt:        snap.LastPollAt,
+			InFlight:          snap.InFlight,
+			Processed:         snap.Processed,
+			Failed:            snap.Failed,
+		}
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
-			NodeName:     nodeName,
-			ConfigDir:    "",
-			Services:     nil,
-			Capabilities: statusCaps,
+			NodeName:       nodeName,
+			ConfigDir:      "",
+			Services:       nil,
+			Capabilities:   statusCaps,
+			WorkerLiveness: workerLivenessFn,
 		})
 	}
 
@@ -1384,10 +1401,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
-				NodeName:     nodeName,
-				ConfigDir:    "",
-				Services:     nil,
-				Capabilities: statusCaps,
+				NodeName:       nodeName,
+				ConfigDir:      "",
+				Services:       nil,
+				Capabilities:   statusCaps,
+				WorkerLiveness: workerLivenessFn,
 			})
 		}
 
@@ -1988,6 +2006,15 @@ func runWork(cmd *cobra.Command, args []string) {
 			},
 		})
 		go updater.Run(ctx)
+	}
+
+	// Start the self-heal liveness monitor (issue #548). It is the backstop for a
+	// consumption-wedged worker that the per-job watchdog can't catch (a wedge
+	// outside a handler, or a build with the watchdog disabled): it watches the
+	// shared workerState and, on a clear loss of forward progress, exits non-zero
+	// so systemd restarts the process clean. No-op if disabled (WORKER_SELF_HEAL).
+	if monitor := worker.NewLivenessMonitor(workerState, runner.IsDraining, func(level, msg string) { Log("%s", msg) }); monitor != nil {
+		go monitor.Run(ctx)
 	}
 
 	// Run the worker

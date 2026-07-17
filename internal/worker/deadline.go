@@ -5,9 +5,105 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// Fallback per-job execution budgets (issue #548). PR #552 added an OPT-IN
+// per-job timeout carried in the payload (timeout_ms). But the wedge that
+// motivated #548 -- a meeting/transcribe handler stuck in a permission-denied
+// retry loop that silently blocked the whole sequential consume loop for 4+
+// hours -- happened precisely BECAUSE no backend budget was present: with no
+// timeout_ms the handler ran synchronously and unbounded. So the worker now
+// applies a GENEROUS default deadline even when the backend sends none, chosen
+// per job-type so a legitimately long job (a huge model pull, a long recording)
+// is never killed while a genuinely wedged handler is bounded and abandoned.
+//
+// Precedence: an explicit payload timeout_ms always wins; otherwise the default
+// for the job's class applies; a class configured to 0 seconds is unbounded.
+const (
+	// defaultJobTimeoutSeconds bounds ordinary jobs (inference, shell, file ops,
+	// VNC, transcribe, ...). 60min comfortably exceeds every legitimate case --
+	// e.g. a single CPU whisper transcription self-bounds at ~32min -- so a job
+	// that blows past it is wedged, not merely slow.
+	defaultJobTimeoutSeconds = 3600
+	// defaultLongJobTimeoutSeconds bounds long-SESSION jobs whose real-world
+	// duration is naturally large but finite (a recorded meeting, an
+	// interactive co-browse). 4h catches a wedge while not killing a real
+	// long meeting.
+	defaultLongJobTimeoutSeconds = 14400
+)
+
+// jobTimeoutDefaultEnvVar / jobTimeoutLongEnvVar tune the two fallback tiers.
+// Following the SERVICE_* env convention already used in the repo. Set either to
+// 0 to make that tier unbounded (restore the pre-#548 no-cap behavior).
+const (
+	jobTimeoutDefaultEnvVar = "WORKER_JOB_TIMEOUT_SECONDS"
+	jobTimeoutLongEnvVar    = "WORKER_JOB_TIMEOUT_LONG_SECONDS"
+)
+
+// longSessionJobTypes get the generous long-tier fallback. These legitimately
+// run for the length of a human session but are still bounded in the real world.
+var longSessionJobTypes = map[string]struct{}{
+	JobTypeMeetingJoin: {},
+	JobTypeCobrowse:    {},
+}
+
+// unboundedJobTypes get NO fallback deadline: their duration is dominated by
+// external factors (download size / build time / VM clone) with opaque progress,
+// so any blanket cap risks killing a legitimate job. They are still bounded when
+// the backend sends an explicit timeout_ms, and the self-heal monitor (#548) is
+// the backstop if one of these ever truly wedges.
+var unboundedJobTypes = map[string]struct{}{
+	JobTypeDownloadModel:     {},
+	JobTypeOllamaPull:        {},
+	JobTypeModelCachePull:    {},
+	JobTypeServiceStart:      {},
+	JobTypeIOSBuild:          {},
+	JobTypeAndroidBuild:      {},
+	JobTypeGomobileBuild:     {},
+	JobTypeInstanceProvision: {},
+	JobTypeAgentUpdate:       {},
+	JobTypeWhatsAppProvision: {},
+}
+
+// resolveJobTimeout returns the execution budget the runner should apply to a
+// job. An explicit payload timeout_ms wins; otherwise the per-class fallback
+// applies. ok=false means "run unbounded" (no watchdog), preserving the exact
+// prior behavior for that path.
+func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
+	if d, ok := jobExecTimeout(job); ok {
+		return d, true // explicit backend budget always wins
+	}
+	if job == nil {
+		return 0, false
+	}
+	if _, unbounded := unboundedJobTypes[job.Type]; unbounded {
+		return 0, false
+	}
+	if _, long := longSessionJobTypes[job.Type]; long {
+		return envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
+	}
+	return envTimeoutSeconds(jobTimeoutDefaultEnvVar, defaultJobTimeoutSeconds)
+}
+
+// envTimeoutSeconds reads a seconds-valued env var, falling back to def. A value
+// of 0 (or a negative/garbage value that we clamp) means "unbounded" and returns
+// ok=false. A positive value returns that many seconds as a duration.
+func envTimeoutSeconds(envVar string, def int) (time.Duration, bool) {
+	secs := def
+	if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			secs = n
+		}
+	}
+	if secs <= 0 {
+		return 0, false
+	}
+	return time.Duration(secs) * time.Second, true
+}
 
 // jobTimeoutPayloadKey is the wire field the backend dispatcher injects to give
 // a job a per-execution budget (aceteam#6000). It is a RELATIVE duration in

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -177,6 +178,13 @@ func (r *Runner) Drain() {
 // isDraining reports whether Drain has been called.
 func (r *Runner) isDraining() bool {
 	return atomic.LoadInt32(&r.draining) == 1
+}
+
+// IsDraining is the exported view of isDraining, used by the self-heal monitor
+// to skip a wedge check while the loop is intentionally paused for an
+// auto-update drain (issue #548).
+func (r *Runner) IsDraining() bool {
+	return r.isDraining()
 }
 
 // WithStreamWriterFactory sets a factory for creating stream writers.
@@ -453,7 +461,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	// synchronous, no timeout, no watchdog goroutine.
 	var result *JobResult
 	var err error
-	if timeout, ok := jobExecTimeout(job); ok {
+	if timeout, ok := r.resolveJobTimeout(job); ok {
 		result, err = r.executeWithDeadline(ctx, handler, job, stream, timeout)
 	} else {
 		result, err = handler.Execute(ctx, job, stream)
@@ -470,6 +478,25 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
 		stream.WriteError(actualErr, false)
+
+		// A watchdog abandon (deadline exceeded) is terminal, not a transient
+		// failure: the handler goroutine is orphaned and still running, so
+		// Nack -> redeliver -> re-execute would just re-wedge the slot for
+		// another full budget (and, in sequential mode, block every other job
+		// again). Fail (record failed + ACK -> DLQ) instead so a hung job is
+		// removed from the pending list rather than retried into a repeated
+		// wedge (issue #548). Every other failure keeps the existing Nack/retry
+		// semantics.
+		var deadlineErr *deadlineExceededError
+		if errors.As(actualErr, &deadlineErr) {
+			r.source.Fail(ctx, job, actualErr, map[string]any{
+				"deadline_exceeded":  true,
+				"deadline_seconds":   deadlineErr.timeout.Seconds(),
+				"abandoned_by_agent": true,
+			})
+			return
+		}
+
 		r.source.Nack(ctx, job, actualErr)
 		return
 	}

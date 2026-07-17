@@ -143,3 +143,40 @@ func TestCollectorConfig(t *testing.T) {
 		t.Errorf("Services count = %v, want 2", len(cfg.Services))
 	}
 }
+
+// TestCollectorWorkerLiveness verifies the #548 heartbeat liveness attachment:
+// when a WorkerLiveness provider is set, Collect() attaches it; when it is not,
+// the field is omitted so the payload stays back-compatible for non-worker nodes.
+func TestCollectorWorkerLiveness(t *testing.T) {
+	consumedAt := time.Now().Add(-time.Minute)
+
+	withFn := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		WorkerLiveness: func() *WorkerLiveness {
+			return &WorkerLiveness{
+				Consuming:         true,
+				LastJobConsumedAt: &consumedAt,
+				InFlight:          2,
+			}
+		},
+	})
+	st, err := withFn.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st.Worker == nil {
+		t.Fatal("Worker liveness not attached when provider was set")
+	}
+	if !st.Worker.Consuming || st.Worker.InFlight != 2 || st.Worker.LastJobConsumedAt == nil {
+		t.Errorf("Worker = %+v, want consuming=true in_flight=2 with a consumed-at time", st.Worker)
+	}
+
+	without := NewCollector(CollectorConfig{NodeName: "test-node"})
+	st2, err := without.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st2.Worker != nil {
+		t.Errorf("Worker = %+v, want nil (omitted) when no provider set", st2.Worker)
+	}
+}
