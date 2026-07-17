@@ -58,9 +58,65 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 		return h.pullOllama(ctx, job.ID, modelName)
 	case "vllm", "llamacpp":
 		return h.pullHuggingFace(ctx, job.ID, modelName, engine)
+	case "bonsai":
+		return h.pullBonsai(ctx, job.ID)
 	default:
-		return nil, fmt.Errorf("unsupported engine %q: must be ollama, vllm, or llamacpp", engine)
+		return nil, fmt.Errorf("unsupported engine %q: must be ollama, vllm, llamacpp, or bonsai", engine)
 	}
+}
+
+// Bonsai-27B GGUF coordinates. The MODEL_CACHE_PULL for engine "bonsai" pulls
+// exactly this one file (NOT the whole repo, which also carries a ~53GB F16 and
+// a drafter GGUF) into a fixed local dir the bonsai compose mounts at /models.
+const (
+	bonsaiRepo     = "prism-ml/Bonsai-27B-gguf"
+	bonsaiGGUFFile = "Bonsai-27B-Q1_0.gguf"
+)
+
+// bonsaiCacheDir is the fixed local dir the bonsai GGUF is downloaded into. It
+// MUST match services/compose/bonsai.yml's `~/citadel-cache/bonsai:/models`
+// mount, or the served path (/models/Bonsai-27B-Q1_0.gguf) will not exist.
+func bonsaiCacheDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("citadel-cache", "bonsai")
+	}
+	return filepath.Join(home, "citadel-cache", "bonsai")
+}
+
+// pullBonsai downloads the single Bonsai-27B-Q1_0.gguf file via huggingface-cli
+// into bonsaiCacheDir(). Deviates from the task's bare command by adding
+// --local-dir so the file lands at a predictable path the compose mount can
+// serve (the HF hub cache path carries an unpredictable snapshot hash).
+func (h *ModelCachePullHandler) pullBonsai(ctx JobContext, jobID string) ([]byte, error) {
+	localDir := bonsaiCacheDir()
+	ctx.Log("info", "     - [Job %s] Pulling Bonsai GGUF '%s' from %s into %s via huggingface-cli", jobID, bonsaiGGUFFile, bonsaiRepo, localDir)
+
+	cmd := BuildBonsaiDownloadCommand(localDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("huggingface-cli download failed: %w", err)
+	}
+
+	var sizeBytes int64
+	if fi, statErr := os.Stat(filepath.Join(localDir, bonsaiGGUFFile)); statErr == nil {
+		sizeBytes = fi.Size()
+	}
+
+	result := modelCachePullResult{
+		Status:    "cached",
+		ModelName: bonsaiGGUFFile,
+		SizeBytes: sizeBytes,
+		Engine:    "bonsai",
+	}
+	return json.Marshal(result)
+}
+
+// BuildBonsaiDownloadCommand returns the exec.Cmd that downloads the single
+// Bonsai-27B-Q1_0.gguf file into localDir. Exported for testing command
+// construction.
+func BuildBonsaiDownloadCommand(localDir string) *exec.Cmd {
+	return exec.Command("huggingface-cli", "download", bonsaiRepo, bonsaiGGUFFile, "--local-dir", localDir)
 }
 
 // pullOllama runs `ollama pull <model>` to cache the model locally.

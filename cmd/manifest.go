@@ -384,7 +384,10 @@ func ensureComposeFile(configDir, serviceName string) error {
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
-		return nil // Already exists
+		// Still ensure any build-context aux files exist (idempotent), so a
+		// build-based service like bonsai is startable even if its .yml was
+		// materialized by an older binary that predated WriteAuxFiles.
+		return services.WriteAuxFiles(servicesDir, serviceName)
 	}
 
 	// Get content from embedded services
@@ -403,5 +406,7 @@ func ensureComposeFile(configDir, serviceName string) error {
 		return fmt.Errorf("failed to write compose file: %w", err)
 	}
 
-	return nil
+	// Materialize any build-context files the service needs (e.g. bonsai's
+	// Dockerfile), so `docker compose build` resolves on the node.
+	return services.WriteAuxFiles(servicesDir, serviceName)
 }

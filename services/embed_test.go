@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -91,6 +93,73 @@ func TestDiffusersComposeContract(t *testing.T) {
 	}
 }
 
+// TestBonsaiComposeRegistered ensures the bonsai service (PrismML Bonsai-27B via
+// the llama.cpp fork) is in the ServiceMap so `citadel run --service bonsai`,
+// the manifest, and SERVICE_START can find it.
+func TestBonsaiComposeRegistered(t *testing.T) {
+	if _, ok := ServiceMap["bonsai"]; !ok {
+		t.Fatal("bonsai not found in ServiceMap")
+	}
+	found := false
+	for _, s := range GetAvailableServices() {
+		if s == "bonsai" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("GetAvailableServices() does not include bonsai")
+	}
+}
+
+// TestBonsaiComposeContract verifies bonsai is the one embedded service that
+// BUILDS its image (not a prebuilt image:), so its build context Dockerfile must
+// be materializable via WriteAuxFiles, and its host publish must defer to the
+// citadel-owned env var.
+func TestBonsaiComposeContract(t *testing.T) {
+	content := ServiceMap["bonsai"]
+	if !strings.Contains(content, "build:") {
+		t.Errorf("bonsai compose should use a build: section (no prebuilt image is published)")
+	}
+	if !strings.Contains(content, "${CITADEL_BONSAI_HOST_PORT") {
+		t.Errorf("bonsai compose must defer its host port to CITADEL_BONSAI_HOST_PORT")
+	}
+	// The build-context Dockerfile must be registered so it lands on the node.
+	aux, ok := ServiceAuxFiles["bonsai"]
+	if !ok {
+		t.Fatal("ServiceAuxFiles missing bonsai; the build context Dockerfile would never materialize")
+	}
+	if _, ok := aux[filepath.Join("bonsai", "Dockerfile")]; !ok {
+		t.Errorf("ServiceAuxFiles[bonsai] missing bonsai/Dockerfile")
+	}
+}
+
+// TestWriteAuxFilesMaterializesBonsaiDockerfile proves WriteAuxFiles writes the
+// build-context Dockerfile to disk (the fix for bonsai being the first
+// build-based embedded service; a .yml-only materialization would fail
+// `docker compose build`).
+func TestWriteAuxFilesMaterializesBonsaiDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteAuxFiles(dir, "bonsai"); err != nil {
+		t.Fatalf("WriteAuxFiles(bonsai): %v", err)
+	}
+	dockerfile := filepath.Join(dir, "bonsai", "Dockerfile")
+	data, err := os.ReadFile(dockerfile)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", dockerfile, err)
+	}
+	if !strings.Contains(string(data), "PrismML-Eng/llama.cpp") {
+		t.Errorf("materialized Dockerfile does not reference the PrismML fork")
+	}
+	// No-op for an image-based service.
+	if err := WriteAuxFiles(dir, "vllm"); err != nil {
+		t.Fatalf("WriteAuxFiles(vllm) should be a no-op, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "vllm")); !os.IsNotExist(err) {
+		t.Errorf("WriteAuxFiles(vllm) should not create any files")
+	}
+}
+
 // composeHostPorts returns the host-side ports declared in a compose file's
 // `ports:` list entries ("HOST:CONTAINER"). Pure parse (no Docker) so the
 // host-port collision assertions run in ordinary CI.
@@ -112,6 +181,7 @@ func composeHostPorts(t *testing.T, composeYAML string) []int {
 		EnvVLLMHostPort:       VLLMHostPort,
 		EnvExtractionHostPort: ExtractionHostPort,
 		EnvDiffusersHostPort:  DiffusersHostPort,
+		EnvBonsaiHostPort:     BonsaiHostPort,
 	}
 	var hosts []int
 	for _, svc := range doc.Services {

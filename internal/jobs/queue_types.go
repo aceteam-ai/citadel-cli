@@ -73,7 +73,7 @@ type LLMInferencePayload struct {
 	Stream bool `json:"stream"`
 
 	// Backend specifies which inference engine to use
-	Backend string `json:"backend"` // "vllm", "sglang", "ollama", "llamacpp"
+	Backend string `json:"backend"` // "vllm", "sglang", "ollama", "llamacpp", "bonsai"
 
 	// Stop sequences to end generation
 	Stop []string `json:"stop,omitempty"`
