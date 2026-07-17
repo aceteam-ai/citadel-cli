@@ -91,3 +91,34 @@ func RenderQRCode(content string) string {
 func RenderEnrollQR(verificationURI, userCode string) string {
 	return RenderQRCode(BuildEnrollPayload(verificationURI, userCode))
 }
+
+// RenderQRCodeBlocks renders the given content as a scannable QR code using
+// plain full-block characters with NO ANSI escape sequences, so it displays
+// correctly inside a tview.TextView (which mangles the half-block/ANSI output
+// of RenderQRCode when SetDynamicColors is involved).
+//
+// It mirrors the proven rendering used by the control center's WhatsApp pairing
+// page (internal/whatsapp.RenderQRBlocks): each QR module is two cells wide and
+// one row tall, light modules render as filled blocks ("██") and dark modules
+// as spaces. On the tview default (dark) background this yields correct-polarity
+// output that scans; on a light-background terminal the polarity inverts and it
+// may not scan (a known limitation shared with the WhatsApp page). The quiet
+// zone (white border) is always included — omitting it is the most common reason
+// terminal QR codes fail to scan.
+func RenderQRCodeBlocks(content string) string {
+	var buf bytes.Buffer
+	qrterminal.GenerateWithConfig(content, qrterminal.Config{
+		Writer:    &buf,
+		Level:     qrterminal.L, // matches the proven WhatsApp-page rendering
+		BlackChar: "  ",         // QR dark module -> two spaces (terminal background)
+		WhiteChar: "██",         // QR light/quiet module -> filled blocks
+		QuietZone: 2,
+	})
+	return buf.String()
+}
+
+// RenderEnrollQRBlocks is a convenience wrapper that builds the enrollment
+// payload and renders it with the plain full-block renderer for tview.
+func RenderEnrollQRBlocks(verificationURI, userCode string) string {
+	return RenderQRCodeBlocks(BuildEnrollPayload(verificationURI, userCode))
+}
