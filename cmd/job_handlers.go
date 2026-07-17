@@ -71,5 +71,7 @@ func init() {
 		"ANDROID_BUILD":      jobs.NewAndroidBuildHandler(""),
 		"GOMOBILE_BUILD":     jobs.NewGomobileBuildHandler(""),
 		"COBROWSE":           jobs.NewCobrowseHandler(),
+		"HTTP_PROXY":         &jobs.HTTPProxyHandler{},
+		"WEB_FETCH":          &jobs.WebFetchHandler{},
 	}
 }
