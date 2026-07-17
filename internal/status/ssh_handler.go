@@ -30,9 +30,30 @@ type sshAuthorizedKeysResponse struct {
 	Total   int `json:"total"`
 }
 
-// vpnCIDR is the Headscale CGNAT range. Requests from this range are trusted
-// because only nodes on the Headscale VPN mesh can originate from it.
+// vpnCIDR is the Headscale CGNAT range. On a flat mesh this range is NOT an
+// identity (any org's node can originate from it), which is why the mesh-origin
+// bypass is being retired behind RequireControlTokenEnvVar (issue #5028).
 const vpnCIDR = "100.64.0.0/10"
+
+// RequireControlTokenEnvVar gates the interim :8080 control-token enforcement
+// (issue #5028 lever B). It is OFF unless explicitly set to a truthy value
+// ("1", "true", "yes", "on"). When on, requireVPNOrAuth drops the VPN-origin
+// bypass and demands the per-org terminal token even from mesh peers. Kept OFF
+// by default so the change is a deliberate, reversible flip (a code-free
+// rollback is just unsetting the env) rather than a hard break for older relays
+// that still dial the mesh without a bearer.
+const RequireControlTokenEnvVar = "CITADEL_REQUIRE_CONTROL_TOKEN"
+
+// RequireControlTokenEnabled reports whether the control-token flip is on,
+// reading RequireControlTokenEnvVar with the same truthy set used elsewhere.
+func RequireControlTokenEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(RequireControlTokenEnvVar))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // isVPNOrigin checks if the request originates from the Headscale VPN mesh.
 func isVPNOrigin(r *http.Request) bool {
@@ -55,19 +76,36 @@ func isVPNOrigin(r *http.Request) bool {
 	return cidr.Contains(ip)
 }
 
-// requireVPNOrAuth allows the request if it comes from the VPN mesh OR if
-// a valid terminal token is presented. SSH key deployment from the platform
-// relay will use VPN-origin auth (the relay runs on the VPN). Direct API
-// callers can use token-based auth.
+// requireVPNOrAuth gates the control endpoints (/agent/*, provisioning, workflow)
+// on the plaintext status listener.
+//
+// Historically it accepted ANY request whose source IP is in the Headscale CGNAT
+// range without a token, on the assumption that only trusted mesh peers can
+// originate from it. On a FLAT mesh that assumption is false (issue #5028): every
+// org's nodes share the same tailnet, so a mesh IP is not an identity and a
+// cross-org peer gets a free pass. Lever B closes that hole by requiring the
+// per-org terminal token (the same server-decryptable token already validated on
+// the :7860 terminal listener) for mesh origins too.
+//
+// The mesh-origin bypass is dropped only when requireControlToken is set (the
+// deliberate flip, wired from CITADEL_REQUIRE_CONTROL_TOKEN in cmd/work.go).
+// Default keeps the legacy VPN-origin trust so older relays that dial over the
+// mesh without presenting a token do not break at merge; the flip is thrown in a
+// planned window after the relay is updated to send the bearer. See issue #5028
+// section 8 and mtls.go for the durable per-caller identity (#5959) that
+// supersedes this interim bearer.
 func (s *Server) requireVPNOrAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Accept VPN-origin requests without a token
-		if isVPNOrigin(r) {
+		// Accept VPN-origin requests without a token UNLESS the control-token flip
+		// is on, in which case mesh origin no longer auto-trusts (#5028 lever B).
+		if !s.requireControlToken && isVPNOrigin(r) {
 			next(w, r)
 			return
 		}
 
-		// Fall back to token-based auth if available
+		// Require a valid per-org terminal token. This is the only accepted path
+		// once requireControlToken is set, and the fallback for non-mesh callers
+		// otherwise.
 		if s.tokenValidator != nil {
 			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if token != "" && token != r.Header.Get("Authorization") {
@@ -79,7 +117,7 @@ func (s *Server) requireVPNOrAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"authorization required: VPN origin or valid token"}`, http.StatusUnauthorized)
+		http.Error(w, `{"error":"authorization required: valid org token"}`, http.StatusUnauthorized)
 	}
 }
 

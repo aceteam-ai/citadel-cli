@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 )
 
 func TestValidateSSHPublicKey(t *testing.T) {
@@ -403,6 +405,101 @@ func TestRequireVPNOrAuthNoValidator(t *testing.T) {
 
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("status = %d, want 401", w.Code)
+		}
+	})
+}
+
+// TestRequireControlTokenEnforcement is the #5028 lever B contract: with the
+// control-token flip on, a mesh (VPN-origin) request must present a valid token
+// for THIS node's org. An unauthenticated, wrong-token, or cross-org-token mesh
+// request is rejected; the correct org token passes. It also pins the default:
+// with the flip off, a mesh origin still gets the legacy no-token pass so older
+// relays are not broken at merge.
+func TestRequireControlTokenEnforcement(t *testing.T) {
+	const nodeOrg = "org-a"
+
+	// terminal.MockTokenValidator enforces org matching (returns ErrUnauthorized
+	// when the token's org != the node's org), so it models the cross-org case
+	// that the local mockTokenValidator (which echoes the org back) cannot.
+	validator := terminal.NewMockTokenValidator()
+	validator.AddValidToken("org-a-token", &terminal.TokenInfo{UserID: "u1", OrgID: nodeOrg})
+	validator.AddValidToken("org-b-token", &terminal.TokenInfo{UserID: "u2", OrgID: "org-b"})
+
+	collector := NewCollector(CollectorConfig{NodeName: "test-node"})
+
+	newHandler := func(requireControlToken bool) http.HandlerFunc {
+		srv := NewServer(ServerConfig{
+			TokenValidator:      validator,
+			OrgID:               nodeOrg,
+			RequireControlToken: requireControlToken,
+		}, collector)
+		return srv.requireVPNOrAuth(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "ok")
+		})
+	}
+
+	// The mesh CGNAT source IP an attacking cross-org peer (or the legit relay)
+	// dials from. Under the flip, presence in this range no longer grants access.
+	const meshAddr = "100.64.0.5:12345"
+
+	t.Run("enforcement on", func(t *testing.T) {
+		handler := newHandler(true)
+
+		t.Run("unauthenticated mesh request rejected", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
+			req.RemoteAddr = meshAddr // no Authorization header
+			w := httptest.NewRecorder()
+			handler(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401 (mesh origin must no longer auto-pass)", w.Code)
+			}
+		})
+
+		t.Run("wrong token from mesh rejected", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
+			req.RemoteAddr = meshAddr
+			req.Header.Set("Authorization", "Bearer not-a-real-token")
+			w := httptest.NewRecorder()
+			handler(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", w.Code)
+			}
+		})
+
+		t.Run("cross-org token from mesh rejected", func(t *testing.T) {
+			// A token valid for org-b, presented to an org-a node over the mesh.
+			req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
+			req.RemoteAddr = meshAddr
+			req.Header.Set("Authorization", "Bearer org-b-token")
+			w := httptest.NewRecorder()
+			handler(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401 (cross-org token must not pass)", w.Code)
+			}
+		})
+
+		t.Run("correct org token from mesh accepted", func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
+			req.RemoteAddr = meshAddr
+			req.Header.Set("Authorization", "Bearer org-a-token")
+			w := httptest.NewRecorder()
+			handler(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200 (valid org token must pass)", w.Code)
+			}
+		})
+	})
+
+	t.Run("enforcement off preserves legacy mesh trust", func(t *testing.T) {
+		handler := newHandler(false)
+
+		req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
+		req.RemoteAddr = meshAddr // no token
+		w := httptest.NewRecorder()
+		handler(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200 (default must keep VPN-origin trust for older relays)", w.Code)
 		}
 	})
 }

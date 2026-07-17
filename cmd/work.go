@@ -1183,6 +1183,13 @@ func runWork(cmd *cobra.Command, args []string) {
 			Port:    workStatusPort,
 			Version: Version,
 			Agent:   agentProviders,
+			// Interim bearer-token enforcement on the :8080 control endpoints
+			// (#5028 lever B). When set, the mesh-origin bypass in requireVPNOrAuth
+			// is dropped and the per-org terminal token is mandatory even for mesh
+			// peers, closing cross-org control access on the flat mesh. Default OFF
+			// so older relays that dial over the mesh without a bearer keep working;
+			// flip it on in a planned window once the relay presents the token.
+			RequireControlToken: status.RequireControlTokenEnabled(),
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1210,6 +1217,18 @@ func runWork(cmd *cobra.Command, args []string) {
 			}
 			serverCfg.TokenValidator = terminal.NewCachingTokenValidator(baseURL, statusOrgID, statusAPIToken, 30*time.Second)
 			serverCfg.OrgID = statusOrgID
+		}
+
+		// Surface the control-token posture so an operator is not surprised (#5028).
+		// With the flip on but no validator (no org ID / base URL), every control
+		// endpoint fails closed -- safe, but worth flagging so it is not mistaken
+		// for a bug.
+		if serverCfg.RequireControlToken {
+			if serverCfg.TokenValidator != nil {
+				fmt.Printf("   - Control-token enforcement ON (%s): mesh peers must present the org terminal token on :%d (#5028)\n", status.RequireControlTokenEnvVar, workStatusPort)
+			} else {
+				fmt.Fprintf(os.Stderr, "   - ⚠️ %s is set but no org token validator is configured (no org ID/base URL); ALL control endpoints on :%d fail closed\n", status.RequireControlTokenEnvVar, workStatusPort)
+			}
 		}
 
 		// Register desktop endpoints when permissions allow and auth is available.

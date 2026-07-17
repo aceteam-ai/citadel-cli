@@ -35,6 +35,14 @@ type Server struct {
 	orgID          string
 	enableDesktop  bool
 
+	// requireControlToken, when true, drops the isVPNOrigin mesh-origin bypass in
+	// requireVPNOrAuth so the per-org terminal token becomes mandatory on every
+	// control endpoint even for callers on the Headscale mesh (issue #5028 lever
+	// B). Default false preserves the legacy VPN-origin trust so the change is a
+	// deliberate, flippable enforcement rather than a hard break at merge. Wired
+	// from CITADEL_REQUIRE_CONTROL_TOKEN.
+	requireControlToken bool
+
 	// gatewayCertPath is the on-disk path to the gateway's self-signed leaf cert
 	// PEM. When set, the status server serves it unauthenticated at
 	// GET /gateway-cert.pem so the backend can fetch (and re-fetch on rotation)
@@ -89,6 +97,12 @@ type ServerConfig struct {
 	OrgID          string                  // Required when TokenValidator is set
 	EnableDesktop  bool                    // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
 
+	// RequireControlToken drops the VPN-origin bypass on the control endpoints so
+	// the per-org terminal token is mandatory even for mesh callers (issue #5028
+	// lever B). Default false keeps legacy VPN-origin trust; set to true (via
+	// CITADEL_REQUIRE_CONTROL_TOKEN) only after the relay presents the bearer.
+	RequireControlToken bool
+
 	// Agent, when set, registers the /agent/* introspection & control
 	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
 	// listeners but gated by requireVPNOrAuth.
@@ -139,18 +153,19 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		cfg.ControlPort = DefaultControlPort
 	}
 	return &Server{
-		collector:         collector,
-		port:              cfg.Port,
-		version:           cfg.Version,
-		tokenValidator:    cfg.TokenValidator,
-		orgID:             cfg.OrgID,
-		enableDesktop:     cfg.EnableDesktop,
-		agent:             cfg.Agent,
-		extraRoutes:       cfg.ExtraRoutes,
-		gatewayCertPath:   cfg.GatewayCertPath,
-		caVerifier:        cfg.CAVerifier,
-		controlPort:       cfg.ControlPort,
-		controlServerCert: cfg.ControlServerCert,
+		collector:           collector,
+		port:                cfg.Port,
+		version:             cfg.Version,
+		tokenValidator:      cfg.TokenValidator,
+		orgID:               cfg.OrgID,
+		enableDesktop:       cfg.EnableDesktop,
+		requireControlToken: cfg.RequireControlToken,
+		agent:               cfg.Agent,
+		extraRoutes:         cfg.ExtraRoutes,
+		gatewayCertPath:     cfg.GatewayCertPath,
+		caVerifier:          cfg.CAVerifier,
+		controlPort:         cfg.ControlPort,
+		controlServerCert:   cfg.ControlServerCert,
 	}
 }
 
