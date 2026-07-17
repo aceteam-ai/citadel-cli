@@ -30,9 +30,9 @@ type sshAuthorizedKeysResponse struct {
 	Total   int `json:"total"`
 }
 
-// vpnCIDR is the Headscale CGNAT range. On a flat mesh this range is NOT an
-// identity (any org's node can originate from it), which is why the mesh-origin
-// bypass is being retired behind RequireControlTokenEnvVar (issue #5028).
+// vpnCIDR is the Headscale CGNAT range. Source IP in this range is a coarse
+// network signal, not a caller identity, so mesh-origin trust is being retired
+// in favor of a per-org token behind RequireControlTokenEnvVar (issue #5028).
 const vpnCIDR = "100.64.0.0/10"
 
 // RequireControlTokenEnvVar gates the interim :8080 control-token enforcement
@@ -79,13 +79,12 @@ func isVPNOrigin(r *http.Request) bool {
 // requireVPNOrAuth gates the control endpoints (/agent/*, provisioning, workflow)
 // on the plaintext status listener.
 //
-// Historically it accepted ANY request whose source IP is in the Headscale CGNAT
-// range without a token, on the assumption that only trusted mesh peers can
-// originate from it. On a FLAT mesh that assumption is false (issue #5028): every
-// org's nodes share the same tailnet, so a mesh IP is not an identity and a
-// cross-org peer gets a free pass. Lever B closes that hole by requiring the
-// per-org terminal token (the same server-decryptable token already validated on
-// the :7860 terminal listener) for mesh origins too.
+// Historically it accepted a request whose source IP is in the Headscale CGNAT
+// range without a token, treating mesh origin as sufficient trust. Source IP is
+// a coarse network signal rather than a caller identity (issue #5028), so this
+// tightens the check to require the per-org terminal token (the same
+// server-decryptable token already validated on the :7860 terminal listener)
+// for mesh origins too.
 //
 // The mesh-origin bypass is dropped only when requireControlToken is set (the
 // deliberate flip, wired from CITADEL_REQUIRE_CONTROL_TOKEN in cmd/work.go).

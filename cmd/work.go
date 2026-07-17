@@ -1186,9 +1186,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			// Interim bearer-token enforcement on the :8080 control endpoints
 			// (#5028 lever B). When set, the mesh-origin bypass in requireVPNOrAuth
 			// is dropped and the per-org terminal token is mandatory even for mesh
-			// peers, closing cross-org control access on the flat mesh. Default OFF
-			// so older relays that dial over the mesh without a bearer keep working;
-			// flip it on in a planned window once the relay presents the token.
+			// peers. Default OFF so older relays that dial over the mesh without a
+			// bearer keep working; flip it on in a planned window once the relay
+			// presents the token.
 			RequireControlToken: status.RequireControlTokenEnabled(),
 		}
 

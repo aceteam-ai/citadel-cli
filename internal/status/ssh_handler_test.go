@@ -300,9 +300,8 @@ func TestSSHPlaintextPathFailsClosed(t *testing.T) {
 
 	key1 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test@example.com"
 
-	// A VPN-origin POST (the exact attack the flat mesh allowed) must be refused
-	// and write nothing. SSH-key injection now lives only on the mTLS control
-	// listener (see TestSSHInjectionOverMTLS).
+	// A VPN-origin POST must be refused and write nothing. SSH-key injection now
+	// lives only on the mTLS control listener (see TestSSHInjectionOverMTLS).
 	t.Run("VPN origin no longer deploys keys", func(t *testing.T) {
 		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key1}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))

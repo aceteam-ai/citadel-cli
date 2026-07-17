@@ -214,7 +214,7 @@ func (s *Server) buildControlMux() *http.ServeMux {
 	// Liveness probe (still requires the mTLS handshake to reach, but no identity
 	// check) so a coordinator can confirm the control listener is up.
 	mux.HandleFunc("/ping", s.handlePing)
-	// SSH-key injection: the host-takeover crown jewel. Coordinator identity only.
+	// SSH key deployment is mutating and host-sensitive: coordinator identity only.
 	mux.HandleFunc("/ssh/authorized-keys", s.caVerifier.requireCoordinator(s.handleSSHAuthorizedKeys))
 	return mux
 }
@@ -251,13 +251,13 @@ func (s *Server) buildMux() *http.ServeMux {
 		mux.HandleFunc("/api/actions", s.requireAuth(s.handleActions))
 	}
 
-	// SSH key deployment is a MUTATING, host-takeover-capable endpoint. It is no
-	// longer served over this plaintext, VPN-origin-trusting listener (issue
-	// #5028): mesh origin is not an identity, so any node on the flat mesh could
-	// inject a key. It now lives ONLY on the dedicated mTLS control listener,
-	// gated by a coordinator client certificate (see buildControlMux). Here we
-	// register a fail-closed stub so the old path refuses with a clear signal
-	// instead of silently 404ing or, worse, still writing keys.
+	// SSH key deployment is a mutating, host-sensitive endpoint. It is no longer
+	// served over this plaintext, VPN-origin-trusting listener (issue #5028):
+	// mesh origin is a coarse network signal, not a caller identity. It now lives
+	// ONLY on the dedicated mTLS control listener, gated by a coordinator client
+	// certificate (see buildControlMux). Here we register a fail-closed stub so
+	// the old path refuses with a clear signal instead of silently 404ing or,
+	// worse, still writing keys.
 	mux.HandleFunc("/ssh/authorized-keys", s.handleSSHMovedToControl)
 
 	// Agent introspection & control endpoints (issue #236), gated the same way
