@@ -8,22 +8,38 @@ import (
 
 func TestDefaultPermissions(t *testing.T) {
 	p := DefaultPermissions()
-	if !p.Console || !p.Desktop || !p.Files || !p.Services || !p.SSH || !p.Shell {
-		t.Errorf("DefaultPermissions should have all fields true, got %+v", p)
+	if !p.Console || !p.Desktop || !p.Files || !p.Services || !p.SSH || !p.Provision {
+		t.Errorf("DefaultPermissions should enable non-shell capabilities, got %+v", p)
+	}
+	// Shell is default-deny (opt-in): a fresh node must not accept SHELL_COMMAND
+	// until an operator explicitly enables it (aceteam #6149, Phase 0).
+	if p.Shell {
+		t.Errorf("DefaultPermissions should leave Shell disabled (default-deny), got %+v", p)
 	}
 }
 
-func TestLoadPermissions_ShellDefaultsEnabled(t *testing.T) {
-	// A pre-existing permissions file that predates the shell field must still
-	// leave shell enabled (backward compatible: absent key keeps the default).
+func TestLoadPermissions_ShellDefaultsDisabled(t *testing.T) {
+	// Shell is default-deny (opt-in). A config that omits the `shell` key (e.g.
+	// one written before the field existed) must leave shell DISABLED so the
+	// kill-switch fails closed (aceteam #6149, Phase 0).
 	dir := t.TempDir()
 	data := []byte("console: true\nssh: false\n")
 	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), data, 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	p := LoadPermissions(dir)
+	if p.Shell {
+		t.Error("shell should default to DISABLED when absent from a config file")
+	}
+
+	// Explicit opt-in must round-trip.
+	data = []byte("shell: true\n")
+	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), data, 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	p = LoadPermissions(dir)
 	if !p.Shell {
-		t.Error("shell should default to enabled when absent from an older config file")
+		t.Error("shell should be true when explicitly enabled in config")
 	}
 
 	// Explicit opt-out must round-trip.
