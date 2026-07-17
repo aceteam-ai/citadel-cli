@@ -52,3 +52,15 @@ func TestBonsaiCacheDirMatchesComposeMount(t *testing.T) {
 		t.Errorf("bonsaiCacheDir() = %q, want it to end with citadel-cache/bonsai (the compose mount)", dir)
 	}
 }
+
+// TestBonsaiBaseURLUsesRegisteredPort pins the worker inference routing for the
+// bonsai backend to the citadel-owned host port (services.BonsaiHostPort),
+// mirroring the llamacpp routing. The bonsai llama-server exposes the identical
+// llama.cpp-server API, so it reuses executeLlamaCppAt against this URL.
+func TestBonsaiBaseURLUsesRegisteredPort(t *testing.T) {
+	got := bonsaiBaseURL()
+	want := "http://localhost:8210"
+	if got != want {
+		t.Errorf("bonsaiBaseURL() = %q, want %q (services.BonsaiHostPort)", got, want)
+	}
+}

@@ -580,6 +580,15 @@ a predictable path the compose mount serves (the HF hub cache path carries an
 unpredictable snapshot hash). `bonsaiCacheDir()` and the compose mount must stay
 in sync (guarded by a test).
 
+**Worker inference routing:** the Redis `llm_inference` handler routes
+`backend: "bonsai"` to the bonsai host port via `executeLlamaCppAt` (the bonsai
+llama-server exposes the identical llama.cpp-server API). See
+`internal/jobs/llm_inference.go`. Direct mesh HTTP to `:8210` also works.
+
+**Known limitation:** `MODEL_CACHE_EVICT` (`internal/jobs/model_cache_evict.go`)
+does not yet handle engine `bonsai` (only vllm/llamacpp/ollama), so a bonsai GGUF
+must be removed manually from `~/citadel-cache/bonsai`. Low-priority follow-up.
+
 **Optional long-context KV tuning:** the compose default mirrors the card
 (`-ngl 99`, no KV-quant flags). For long context, add
 `--flash-attn --cache-type-k q4_0 --cache-type-v q4_0` (quantized V-cache needs
