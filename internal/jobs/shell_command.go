@@ -14,10 +14,13 @@ import (
 )
 
 // ShellDisabledError is the exact message returned when SHELL_COMMAND execution
-// has been disabled on this node via the persisted `shell: false` permission
-// (the `--no-shell`-style opt-out). The wording is part of the handler's
-// contract and is asserted in tests, so keep it stable.
-const ShellDisabledError = "shell command execution is disabled on this node"
+// is not enabled on this node. Shell is default-deny (opt-in) as of aceteam #6149
+// Phase 0: a node accepts remote commands only after an operator explicitly
+// enables the `shell` permission (set `shell: true` in the node's
+// permissions.yaml, or toggle Shell in the AceTeam control center, then restart
+// the worker). The wording is part of the handler's contract and is asserted in
+// tests, so keep it stable.
+const ShellDisabledError = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center, then restart the worker)"
 
 // standardPATHDirs are directories ensured on PATH when the inherited process
 // environment is restricted (e.g. citadel running via systemd or nohup with a
@@ -202,7 +205,8 @@ type ShellCommandHandler struct {
 	WorkspaceDir string
 	// Disabled, when true, makes Execute refuse every command with
 	// ShellDisabledError instead of running it. Wired from the persisted
-	// `shell` node permission (default: enabled).
+	// `shell` node permission, which is default-deny (opt-in): unless a node
+	// explicitly enables Shell, callers set Disabled=true (aceteam #6149).
 	Disabled bool
 }
 

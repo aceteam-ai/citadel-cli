@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // A map to hold all our registered job handlers.
@@ -53,9 +55,16 @@ func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 }
 
 func init() {
+	// Honor the same default-deny kill-switch as the worker path: SHELL_COMMAND
+	// is refused unless the node has explicitly opted in via the persisted
+	// `shell` permission. Without this the legacy Nexus/diagnostic path would
+	// run commands as root regardless of the permission (aceteam #6149, Phase 0).
+	shellHandler := jobs.NewShellCommandHandler("")
+	shellHandler.Disabled = !config.LoadPermissions(platform.ConfigDir()).Shell
+
 	// Register all job handlers for test command
 	jobHandlers = map[string]jobs.JobHandler{
-		"SHELL_COMMAND":        jobs.NewShellCommandHandler(""),
+		"SHELL_COMMAND":        shellHandler,
 		"TMUX_SESSION":         jobs.NewTmuxSessionHandler(""),
 		"DOWNLOAD_MODEL":       &jobs.DownloadModelHandler{},
 		"OLLAMA_PULL":          &jobs.OllamaPullHandler{},
