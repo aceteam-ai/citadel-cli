@@ -11,14 +11,14 @@ import (
 // F16 and a drafter GGUF) into the fixed --local-dir the compose mounts.
 func TestBuildBonsaiDownloadCommand(t *testing.T) {
 	localDir := "/home/tester/citadel-cache/bonsai"
-	cmd := BuildBonsaiDownloadCommand(localDir)
+	cmd := BuildBonsaiDownloadCommand("hf", localDir)
 
 	args := cmd.Args
 	if len(args) < 6 {
-		t.Fatalf("expected huggingface-cli download command with local-dir, got %v", args)
+		t.Fatalf("expected hf download command with local-dir, got %v", args)
 	}
-	if !strings.Contains(args[0], "huggingface-cli") {
-		t.Errorf("expected huggingface-cli, got %q", args[0])
+	if args[0] != "hf" {
+		t.Errorf("expected binary %q, got %q", "hf", args[0])
 	}
 	joined := strings.Join(args, " ")
 	for _, want := range []string{"download", "prism-ml/Bonsai-27B-gguf", "Bonsai-27B-Q1_0.gguf", "--local-dir", localDir} {

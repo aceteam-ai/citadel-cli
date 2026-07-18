@@ -53,6 +53,28 @@ func TestGetAvailableServicesIncludesSGLang(t *testing.T) {
 	}
 }
 
+// TestBonsaiComposeVRAMTuning guards the VRAM-bounding flags (citadel #567):
+// without --ctx-size llama-server allocates Bonsai's full 262K context and pins
+// ~21GB VRAM. The bounded context plus 4-bit KV cache (which requires flash
+// attention) keep it near ~5-6GB. If these drift out of the command, VRAM usage
+// silently regresses, so pin them here.
+func TestBonsaiComposeVRAMTuning(t *testing.T) {
+	content, ok := ServiceMap["bonsai"]
+	if !ok {
+		t.Fatal("bonsai not found in ServiceMap")
+	}
+	for _, flag := range []string{
+		"--ctx-size",
+		"--flash-attn on",
+		"--cache-type-k q4_0",
+		"--cache-type-v q4_0",
+	} {
+		if !strings.Contains(content, flag) {
+			t.Errorf("bonsai compose command missing VRAM-tuning flag %q", flag)
+		}
+	}
+}
+
 // TestDiffusersComposeRegistered ensures the diffusers service is in the
 // ServiceMap so `citadel init` writes services/diffusers.yml and a node can
 // enable it (aceteam #4468).
