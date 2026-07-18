@@ -541,6 +541,97 @@ Status command detects NVIDIA GPUs using:
 ### Service Management
 Services are started with `docker compose -f <path> -p citadel-<name> up -d`. The `-p` flag ensures consistent naming: `citadel-vllm`, `citadel-ollama`, etc.
 
+### Bonsai service (PrismML Bonsai-27B, 1-bit)
+
+Bonsai-27B is PrismML's 1-bit quantized Qwen3.6-27B. The `bonsai` service serves
+`Bonsai-27B-Q1_0.gguf` (~3.8GB) via an OpenAI-compatible `llama-server`, fitting
+an RTX 3090 (24GB) easily (~5-12GB VRAM by context length).
+
+**Why it needs its own service (not `llamacpp`):** stock llama.cpp lacks the
+`Q1_0_g128` hybrid-attention kernels the GGUF requires. Bonsai builds the
+**PrismML fork** (`https://github.com/PrismML-Eng/llama.cpp`, default branch
+`prism`) with `-DGGML_CUDA=ON`.
+
+**Files:**
+- `services/compose/bonsai.yml` — embedded compose (in `services.ServiceMap`).
+  Serves on container `:8080`, host port `8210` (`services/ports.go`
+  `BonsaiHostPort` / `CITADEL_BONSAI_HOST_PORT`). Mounts `~/citadel-cache/bonsai`
+  at `/models` and serves `/models/${BONSAI_MODEL:-Bonsai-27B-Q1_0.gguf}` with
+  `-ngl 99`.
+- `services/compose/bonsai/Dockerfile` — self-contained; clones the fork and
+  builds `llama-server`. Base `nvidia/cuda:12.4.0-devel-ubuntu22.04`.
+
+**First build-based embedded service (important):** every other `ServiceMap`
+entry uses a prebuilt `image:`; bonsai uses `build: {context: ./bonsai}`. On-node
+materialization historically wrote only `<name>.yml`, so a `build:` context would
+be missing its Dockerfile and `docker compose build` would fail. `services.
+ServiceAuxFiles` + `services.WriteAuxFiles()` fix this: both materialization
+sites (`cmd.ensureComposeFile`, `ServiceHandler.ensureEmbeddedComposeFile`)
+now also write `services/bonsai/Dockerfile`. Any future build-based embedded
+service should register its context files the same way.
+
+**Model pull:** `MODEL_CACHE_PULL` with `engine: "bonsai"` (see
+`internal/jobs/model_cache_pull.go`) runs
+`huggingface-cli download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf
+--local-dir ~/citadel-cache/bonsai` — the SINGLE GGUF file, not the whole repo
+(which also carries a ~53GB F16 and a drafter). The `--local-dir` is a
+deliberate deviation from a bare `huggingface-cli download` so the file lands at
+a predictable path the compose mount serves (the HF hub cache path carries an
+unpredictable snapshot hash). `bonsaiCacheDir()` and the compose mount must stay
+in sync (guarded by a test).
+
+**Worker inference routing:** the Redis `llm_inference` handler routes
+`backend: "bonsai"` to the bonsai host port via `executeLlamaCppAt` (the bonsai
+llama-server exposes the identical llama.cpp-server API). See
+`internal/jobs/llm_inference.go`. Direct mesh HTTP to `:8210` also works.
+
+**First start builds inline (~7min on Ampere):** because bonsai is build-based,
+the first `SERVICE_START` (or `citadel run --service bonsai`) runs `docker
+compose up -d`, which builds the image before returning. This is safe on the
+deploy path: `SERVICE_START` is in the worker watchdog's *unbounded* tier (see
+Consume-Loop Watchdog above) and the compose-up exec carries no context deadline,
+so the inline build is not killed. Subsequent starts reuse the cached image.
+
+**Known limitations:**
+- **Ampere-only image (compute 8.6).** The Dockerfile defaults
+  `CUDA_ARCHITECTURES=86` (RTX 3090, citadel's target node) — this also cuts
+  build time. On a different GPU (4090=89, A100=80, ...) the built image starts
+  but fails at inference with "no kernel image available for execution on the
+  device". Override via the build ARG (`--build-arg CUDA_ARCHITECTURES=89` or a
+  `;`-list) for other hardware.
+- `MODEL_CACHE_EVICT` (`internal/jobs/model_cache_evict.go`) does not yet handle
+  engine `bonsai` (only vllm/llamacpp/ollama), so a bonsai GGUF must be removed
+  manually from `~/citadel-cache/bonsai`. Low-priority follow-up.
+
+**Optional long-context KV tuning:** the compose default mirrors the card
+(`-ngl 99`, no KV-quant flags). For long context, add
+`--flash-attn --cache-type-k q4_0 --cache-type-v q4_0` (quantized V-cache needs
+flash attention; not default-on because it can't be validated without GPU
+inference).
+
+**Live inference is a documented human step:** node 1084's GPU is VRAM-contended
+(vLLM holds ~21GB); do NOT stop vLLM to validate. Bonsai fits alongside once VRAM
+is free.
+
+**AceTeam-side follow-up (different repo, NOT done here):** to make Bonsai
+deployable from `/fabric/models` (`fabric_catalog_models`), add a catalog entry
+in `aceteam` `data/model_catalog.json` (and the `fabric_catalog_models` source)
+shaped like:
+```json
+{
+  "id": "bonsai-27b",
+  "name": "Bonsai-27B (1-bit)",
+  "engine": "bonsai",
+  "source": "prism-ml/Bonsai-27B-gguf",
+  "gguf_file": "Bonsai-27B-Q1_0.gguf",
+  "vram_gb": { "min": 5, "recommended": 8, "max_context": 12 },
+  "context_length": 262144,
+  "tags": ["gguf", "1-bit", "qwen3.6", "cuda", "llamacpp-fork"]
+}
+```
+The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
+single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
+
 ### Service Idle Detection and Auto-Stop (citadel #416)
 
 Managed services carry a per-service usage/idle signal so a node can tell whether an engine is actually being used or is pinning VRAM/RAM while idle. This is surfaced on the heartbeat and to operators, and can optionally drive auto-eviction.

@@ -59,4 +59,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"81bac6f3c78623c1c08761b1fb99718717e84891459cc50d012d02e88cdd32f7": true,
 		"83842c7faf86de64d7728e0178690f69a0819354d0f290edbcf3d40ea5f01807": true,
 	},
+	"bonsai": {
+		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,
+	},
 }

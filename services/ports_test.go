@@ -161,3 +161,39 @@ func TestControlMTLSPortAvoidsKnownSurfaces(t *testing.T) {
 		}
 	}
 }
+
+// TestBonsaiHostPortRegistered pins the bonsai inference service's host port
+// (PrismML Bonsai-27B via the llama.cpp fork). Unlike claudecode/meeting/
+// gotenberg, bonsai IS an embedded ServiceMap compose, so its .yml defers the
+// host publish to CITADEL_BONSAI_HOST_PORT and this registry must resolve it.
+func TestBonsaiHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["bonsai"]
+	if !ok || got != BonsaiHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "bonsai", got, ok, BonsaiHostPort)
+	}
+	if _, ok := serviceHostPortEnv["bonsai"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "bonsai")
+	}
+	if BonsaiHostPort >= AppsPortRangeStart && BonsaiHostPort <= AppsPortRangeEnd {
+		t.Errorf("bonsai host port %d sits inside the apps auto-allocation range %d-%d", BonsaiHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[BonsaiHostPort]; taken {
+		t.Errorf("bonsai host port %d collides with reserved citadel port %q", BonsaiHostPort, name)
+	}
+	for svc, port := range ServiceHostPorts {
+		if svc != "bonsai" && port == BonsaiHostPort {
+			t.Errorf("bonsai host port %d collides with managed service %q", BonsaiHostPort, svc)
+		}
+	}
+	// HostPortEnv must emit the bonsai var so its compose resolves.
+	want := EnvBonsaiHostPort + "=8210"
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}

@@ -58,6 +58,12 @@ const (
 	// registered here so `citadel module install gotenberg` injects the port via
 	// the same HostPortEnv() mechanism.
 	EnvGotenbergHostPort = "CITADEL_GOTENBERG_HOST_PORT"
+	// EnvBonsaiHostPort carries the host port for the bonsai inference service
+	// (PrismML Bonsai-27B via the llama.cpp fork). Unlike claudecode/meeting/
+	// gotenberg, bonsai is an EMBEDDED ServiceMap compose (services/compose/
+	// bonsai.yml), so its compose defers the host publish to this var exactly
+	// like llamacpp/vllm.
+	EnvBonsaiHostPort = "CITADEL_BONSAI_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -107,6 +113,13 @@ const (
 	// is 3000; this is the HOST publish, bound to 127.0.0.1 only (Gotenberg has
 	// no auth of its own).
 	GotenbergHostPort = 8209
+	// bonsai: PrismML Bonsai-27B (1-bit Qwen3.6-27B) served by an
+	// OpenAI-compatible llama-server built from the PrismML llama.cpp fork
+	// (services/compose/bonsai.yml). Next free slot in the 8200 block after
+	// gotenberg's 8209 (8205 stays earmarked for Hermes/OpenClaw). It is an
+	// embedded ServiceMap compose, so its container serves on :8080 and this is
+	// the HOST publish.
+	BonsaiHostPort = 8210
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
@@ -125,6 +138,7 @@ var ServiceHostPorts = map[string]int{
 	"meeting":     MeetingdHostPort,
 	"meeting-cdp": MeetingCDPHostPort,
 	"gotenberg":   GotenbergHostPort,
+	"bonsai":      BonsaiHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -138,6 +152,7 @@ var serviceHostPortEnv = map[string]string{
 	"meeting":     EnvMeetingdHostPort,
 	"meeting-cdp": EnvMeetingCDPHostPort,
 	"gotenberg":   EnvGotenbergHostPort,
+	"bonsai":      EnvBonsaiHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,

@@ -53,9 +53,20 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, client *redisclient.C
 		return h.executeOllama(ctx, client, job.JobID, rayID, payload)
 	case "llamacpp":
 		return h.executeLlamaCpp(ctx, client, job.JobID, rayID, payload)
+	case "bonsai":
+		// Bonsai serves the same llama.cpp-server API as llamacpp, just on the
+		// bonsai host port (built from the PrismML fork). Reuse the llama.cpp
+		// request/stream path pointed at the bonsai endpoint.
+		return h.executeLlamaCppAt(ctx, client, job.JobID, rayID, payload, bonsaiBaseURL())
 	default:
 		return fmt.Errorf("unsupported backend: %s", payload.Backend)
 	}
+}
+
+// bonsaiBaseURL returns the host-local base URL for the bonsai engine using the
+// citadel-owned host port (services/ports.go).
+func bonsaiBaseURL() string {
+	return fmt.Sprintf("http://localhost:%d", services.BonsaiHostPort)
 }
 
 // extractRayID gets the rayId from a redis.Job's RawData or Payload.
@@ -454,7 +465,14 @@ func (h *LLMInferenceHandler) handleOllamaNonStream(ctx context.Context, client 
 
 // executeLlamaCpp handles inference via llama.cpp server API.
 func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
-	llamaCppURL := llamacppBaseURL() + "/completion"
+	return h.executeLlamaCppAt(ctx, client, jobID, rayID, payload, llamacppBaseURL())
+}
+
+// executeLlamaCppAt runs a llama.cpp-server inference against an explicit base
+// URL. Shared by the llamacpp and bonsai backends (bonsai is the PrismML
+// llama.cpp fork serving the identical API on its own host port).
+func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload, baseURL string) error {
+	llamaCppURL := baseURL + "/completion"
 
 	reqPayload := map[string]any{
 		"prompt":      payload.Prompt,

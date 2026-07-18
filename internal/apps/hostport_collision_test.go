@@ -114,6 +114,7 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 		services.EnvExtractionHostPort: services.ExtractionHostPort,
 		services.EnvDiffusersHostPort:  services.DiffusersHostPort,
 		services.EnvClaudecodeHostPort: services.ClaudecodeHostPort,
+		services.EnvBonsaiHostPort:     services.BonsaiHostPort,
 	}
 
 	var out []int

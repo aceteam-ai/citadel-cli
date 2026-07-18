@@ -1252,3 +1252,19 @@ Auto-generated log of every release.
   - fix(worklock): deflake TestIsHeldLiveWorker — helper died to Go's deadlock detector (#538) (#540)
 
 
+---
+
+## v2.81.0 — 2026-07-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 24 |
+| Lines added | +1816 |
+
+**Changes:**
+
+  - feat(nodeindex): node-local semantic index (FILE_INDEX + FILE_SEMANTIC_SEARCH) (#564)
+  - feat(services): first-class Bonsai-27B (1-bit) inference service (#562)
+
+
