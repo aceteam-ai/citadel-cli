@@ -82,5 +82,7 @@ func init() {
 		"COBROWSE":             jobs.NewCobrowseHandler(),
 		"FILE_INDEX":           jobs.NewFileIndexHandler("", ""),
 		"FILE_SEMANTIC_SEARCH": jobs.NewFileSemanticSearchHandler("", ""),
+		"HTTP_PROXY":           &jobs.HTTPProxyHandler{},
+		"WEB_FETCH":            &jobs.WebFetchHandler{},
 	}
 }

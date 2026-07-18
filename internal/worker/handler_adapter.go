@@ -172,6 +172,10 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
+		// WEB_FETCH is the SSRF-guarded successor to HTTP_PROXY (aceteam#5995).
+		// HTTP_PROXY stays registered for WeChat provisioning + fleet back-compat;
+		// new consumers (youtube egress, web tools) use WEB_FETCH.
+		NewLegacyHandlerAdapter(JobTypeWebFetch, &jobs.WebFetchHandler{}),
 		NewLegacyHandlerAdapter(JobTypeSandboxSuspend, &jobs.SandboxSuspendHandler{}),
 		NewLegacyHandlerAdapter(JobTypeSandboxResume, &jobs.SandboxResumeHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCachePull, &jobs.ModelCachePullHandler{}),
