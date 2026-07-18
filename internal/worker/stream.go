@@ -26,6 +26,12 @@ func NewRedisStreamWriter(ctx context.Context, client *redisclient.Client, jobID
 	}
 }
 
+// WriteClaimed signals that this worker has claimed the job (read it off the
+// queue, before handler execution). See StreamWriter.WriteClaimed.
+func (w *RedisStreamWriter) WriteClaimed(agentVersion string) error {
+	return w.client.PublishClaimed(w.ctx, w.jobID, w.rayID, agentVersion)
+}
+
 // WriteStart signals the beginning of job processing.
 func (w *RedisStreamWriter) WriteStart(message string) error {
 	w.client.SetJobStatus(w.ctx, w.jobID, "processing", nil)
@@ -81,6 +87,12 @@ func NewAPIStreamWriter(ctx context.Context, client *redisapi.Client, jobID, ray
 		rayID:  rayID,
 		ctx:    ctx,
 	}
+}
+
+// WriteClaimed signals that this worker has claimed the job (read it off the
+// queue, before handler execution). See StreamWriter.WriteClaimed.
+func (w *APIStreamWriter) WriteClaimed(agentVersion string) error {
+	return w.client.PublishClaimed(w.ctx, w.jobID, w.rayID, agentVersion)
 }
 
 // WriteStart signals the beginning of job processing.

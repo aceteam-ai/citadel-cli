@@ -412,6 +412,16 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 	return c.client.Publish(ctx, streamName, eventJSON).Err()
 }
 
+// PublishClaimed publishes a "claimed" event for a job, emitted the moment the
+// worker reads it off the queue (before handler execution). The backend
+// dispatcher (aceteam#6000) uses it to fast-fail a wedged/dead node that never
+// claims, instead of waiting the full result budget.
+func (c *Client) PublishClaimed(ctx context.Context, jobID, rayID, agentVersion string) error {
+	return c.PublishStreamEvent(ctx, jobID, rayID, "claimed", map[string]interface{}{
+		"agent_version": agentVersion,
+	})
+}
+
 // PublishStart publishes a "start" event for a job.
 func (c *Client) PublishStart(ctx context.Context, jobID, rayID, message string) error {
 	return c.PublishStreamEvent(ctx, jobID, rayID, "start", map[string]interface{}{
