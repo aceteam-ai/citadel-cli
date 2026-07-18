@@ -1268,3 +1268,20 @@ Auto-generated log of every release.
   - feat(services): first-class Bonsai-27B (1-bit) inference service (#562)
 
 
+---
+
+## v2.82.0 — 2026-07-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 17 |
+| Lines added | +1074 |
+
+**Changes:**
+
+  - fix(jobs): use 'hf download' + detect no-op pulls (#566); bound Bonsai context/VRAM (#567) (#569)
+  - feat(jobs): native WEB_FETCH handler with SSRF guards (aceteam#5995 phase 2) (#560)
+  - fix: default-deny SHELL_COMMAND kill-switch (aceteam #6149 Phase 0) (#565)
+
+
