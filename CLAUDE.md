@@ -603,11 +603,15 @@ so the inline build is not killed. Subsequent starts reuse the cached image.
   engine `bonsai` (only vllm/llamacpp/ollama), so a bonsai GGUF must be removed
   manually from `~/citadel-cache/bonsai`. Low-priority follow-up.
 
-**Optional long-context KV tuning:** the compose default mirrors the card
-(`-ngl 99`, no KV-quant flags). For long context, add
-`--flash-attn --cache-type-k q4_0 --cache-type-v q4_0` (quantized V-cache needs
-flash attention; not default-on because it can't be validated without GPU
-inference).
+**VRAM tuning (default-on, citadel #567):** the compose now bounds context and
+quantizes the KV cache: `--ctx-size ${BONSAI_CTX:-8192} --flash-attn on
+--cache-type-k q4_0 --cache-type-v q4_0`. Without `--ctx-size`, llama-server
+allocates Bonsai's full 262K training context, whose KV cache alone is ~17GB — the
+3.9GB model then pins ~21GB VRAM. Bounding context to 8192 (32x smaller) is what
+does ~all the VRAM work (~5-6GB total); the 4-bit KV quant trims a little more.
+Quantized V-cache requires flash attention, so `--flash-attn on` is mandatory here.
+Flag names verified against the PrismML fork's `common/arg.cpp` (`-fa` takes an
+`[on|off|auto]` value). Override the context via the `BONSAI_CTX` env var.
 
 **Live inference is a documented human step:** node 1084's GPU is VRAM-contended
 (vLLM holds ~21GB); do NOT stop vLLM to validate. Bonsai fits alongside once VRAM
