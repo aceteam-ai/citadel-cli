@@ -35,15 +35,24 @@ services:
       # MODEL_CACHE_PULL (engine=bonsai) drops Bonsai-27B-Q1_0.gguf here.
       - ~/citadel-cache/bonsai:/models
     # -ngl 99 offloads all layers to the GPU (the card's recommended command).
-    # Optional long-context tuning (NOT default-on: quantized V-cache requires
-    # flash attention and can fail startup on some builds, which we cannot
-    # validate here without GPU inference):
-    #   --flash-attn --cache-type-k q4_0 --cache-type-v q4_0
+    #
+    # VRAM tuning (citadel #567): without --ctx-size, llama-server allocates the
+    # model's full training context (Bonsai = 262144 tokens), whose KV cache alone
+    # is ~17GB — the 3.9GB model then pins ~21GB VRAM. --ctx-size ${BONSAI_CTX:-8192}
+    # bounds context (32x smaller → ~0.5GB KV), and 4-bit KV quant trims it further.
+    # Quantized V-cache (--cache-type-v q4_0) requires flash attention, so
+    # --flash-attn on is mandatory here (verified: the PrismML fork's llama-server
+    # accepts -fa/-ctk/-ctv, and -fa takes an [on|off|auto] value). Net: ~5-6GB VRAM
+    # at the default 8192 context. Override the context with BONSAI_CTX.
     command: >-
       --host 0.0.0.0
       --port 8080
       --model /models/${BONSAI_MODEL:-Bonsai-27B-Q1_0.gguf}
       -ngl 99
+      --ctx-size ${BONSAI_CTX:-8192}
+      --flash-attn on
+      --cache-type-k q4_0
+      --cache-type-v q4_0
     restart: unless-stopped
     deploy:
       resources:

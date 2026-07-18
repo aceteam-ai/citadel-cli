@@ -84,23 +84,32 @@ func bonsaiCacheDir() string {
 	return filepath.Join(home, "citadel-cache", "bonsai")
 }
 
-// pullBonsai downloads the single Bonsai-27B-Q1_0.gguf file via huggingface-cli
-// into bonsaiCacheDir(). Deviates from the task's bare command by adding
-// --local-dir so the file lands at a predictable path the compose mount can
-// serve (the HF hub cache path carries an unpredictable snapshot hash).
+// pullBonsai downloads the single Bonsai-27B-Q1_0.gguf file via the HuggingFace
+// CLI into bonsaiCacheDir(). Deviates from a bare download by adding --local-dir
+// so the file lands at a predictable path the compose mount can serve (the HF
+// hub cache path carries an unpredictable snapshot hash).
 func (h *ModelCachePullHandler) pullBonsai(ctx JobContext, jobID string) ([]byte, error) {
 	localDir := bonsaiCacheDir()
-	ctx.Log("info", "     - [Job %s] Pulling Bonsai GGUF '%s' from %s into %s via huggingface-cli", jobID, bonsaiGGUFFile, bonsaiRepo, localDir)
 
-	cmd := BuildBonsaiDownloadCommand(localDir)
+	bin, err := resolveHFDownloader()
+	if err != nil {
+		return nil, err
+	}
+	ctx.Log("info", "     - [Job %s] Pulling Bonsai GGUF '%s' from %s into %s via %s", jobID, bonsaiGGUFFile, bonsaiRepo, localDir, bin)
+
+	cmd := BuildBonsaiDownloadCommand(bin, localDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return output, fmt.Errorf("huggingface-cli download failed: %w", err)
+		return output, fmt.Errorf("hf download failed: %w", err)
 	}
 
-	var sizeBytes int64
-	if fi, statErr := os.Stat(filepath.Join(localDir, bonsaiGGUFFile)); statErr == nil {
-		sizeBytes = fi.Size()
+	// No-op detection (citadel #566): the deprecated `huggingface-cli` no-ops on
+	// huggingface_hub >= 1.x — it prints a warning, creates --local-dir, and exits
+	// 0 WITHOUT downloading. A zero-exit is therefore NOT proof of success; the
+	// only reliable signal is the file actually existing with non-zero size.
+	sizeBytes, err := verifyDownloadedFile(filepath.Join(localDir, bonsaiGGUFFile))
+	if err != nil {
+		return output, fmt.Errorf("bonsai pull reported success but produced no file (%w); output: %s", err, strings.TrimSpace(string(output)))
 	}
 
 	result := modelCachePullResult{
@@ -113,10 +122,88 @@ func (h *ModelCachePullHandler) pullBonsai(ctx JobContext, jobID string) ([]byte
 }
 
 // BuildBonsaiDownloadCommand returns the exec.Cmd that downloads the single
-// Bonsai-27B-Q1_0.gguf file into localDir. Exported for testing command
+// Bonsai-27B-Q1_0.gguf file into localDir using the given HuggingFace CLI binary
+// (bin, resolved via resolveHFDownloader). Exported for testing command
 // construction.
-func BuildBonsaiDownloadCommand(localDir string) *exec.Cmd {
-	return exec.Command("huggingface-cli", "download", bonsaiRepo, bonsaiGGUFFile, "--local-dir", localDir)
+func BuildBonsaiDownloadCommand(bin, localDir string) *exec.Cmd {
+	return exec.Command(bin, hfDownloadArgs(bonsaiRepo, bonsaiGGUFFile, localDir)...)
+}
+
+// hfDownloadArgs builds the argument list for a HuggingFace CLI download. Both
+// the modern `hf` and the deprecated `huggingface-cli` share the identical
+// `download <repo> [file] [--local-dir <dir>]` grammar, so only the binary name
+// differs. A non-empty file pulls that single file; an empty file pulls the repo.
+// A non-empty localDir materializes into a predictable path (vs the hub cache).
+func hfDownloadArgs(repo, file, localDir string) []string {
+	args := []string{"download", repo}
+	if file != "" {
+		args = append(args, file)
+	}
+	if localDir != "" {
+		args = append(args, "--local-dir", localDir)
+	}
+	return args
+}
+
+// resolveHFDownloader locates the HuggingFace download CLI, preferring the modern
+// `hf` binary and falling back to the deprecated `huggingface-cli` only if `hf`
+// is absent (older envs). CRITICAL (citadel #566): `huggingface-cli` is a no-op
+// on huggingface_hub >= 1.x, so `hf` must win whenever it exists.
+//
+// PATH first (exec.LookPath), then common install locations, because the systemd
+// worker's PATH often omits the user's pip/uv bin dirs where huggingface_hub
+// installs the CLI (on node 1084 it lives under ~/.uv/python/*/bin). Returns a
+// clear error if neither binary can be found anywhere.
+func resolveHFDownloader() (string, error) {
+	for _, name := range []string{"hf", "huggingface-cli"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+		for _, dir := range hfBinDirs() {
+			cand := filepath.Join(dir, name)
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+				return cand, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no HuggingFace CLI found: install the `hf` command (pip install -U huggingface_hub) — neither `hf` nor `huggingface-cli` is on PATH or in a known location")
+}
+
+// hfBinDirs returns candidate directories to search for the HuggingFace CLI when
+// it is not on PATH. Includes a glob for uv's per-interpreter layout
+// (~/.uv/python/*/bin) since that dir has no single stable name.
+func hfBinDirs() []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return []string{"/usr/local/bin"}
+	}
+	dirs := []string{
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, ".uv", "python", "bin"),
+		filepath.Join(home, "bin"),
+		"/usr/local/bin",
+	}
+	if matches, err := filepath.Glob(filepath.Join(home, ".uv", "python", "*", "bin")); err == nil {
+		dirs = append(dirs, matches...)
+	}
+	return dirs
+}
+
+// verifyDownloadedFile returns the size of path if it is a regular, non-empty
+// file, or an error otherwise. Used to distinguish a real single-file pull from
+// the huggingface-cli no-op (which leaves the --local-dir empty).
+func verifyDownloadedFile(path string) (int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, fmt.Errorf("expected file %s not found: %w", path, err)
+	}
+	if fi.IsDir() {
+		return 0, fmt.Errorf("expected file %s is a directory", path)
+	}
+	if fi.Size() == 0 {
+		return 0, fmt.Errorf("expected file %s is empty", path)
+	}
+	return fi.Size(), nil
 }
 
 // pullOllama runs `ollama pull <model>` to cache the model locally.
@@ -190,18 +277,29 @@ func parseHumanSize(numStr, unit string) int64 {
 	}
 }
 
-// pullHuggingFace runs `huggingface-cli download <model>` for vllm/llamacpp engines.
+// pullHuggingFace runs `hf download <model>` (falling back to the deprecated
+// `huggingface-cli download <model>`) for vllm/llamacpp engines. The repo lands
+// in the HF hub cache (no --local-dir).
 func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName, engine string) ([]byte, error) {
-	ctx.Log("info", "     - [Job %s] Pulling model '%s' via huggingface-cli for %s", jobID, modelName, engine)
+	bin, err := resolveHFDownloader()
+	if err != nil {
+		return nil, err
+	}
+	ctx.Log("info", "     - [Job %s] Pulling model '%s' via %s for %s", jobID, modelName, bin, engine)
 
-	cmd := exec.Command("huggingface-cli", "download", modelName)
+	cmd := BuildHuggingFaceDownloadCommand(bin, modelName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return output, fmt.Errorf("huggingface-cli download failed: %w", err)
+		return output, fmt.Errorf("hf download failed: %w", err)
 	}
 
-	// Attempt to determine cache size from HuggingFace cache directory.
+	// No-op detection (citadel #566): a zero exit does not prove the download
+	// happened — the deprecated huggingface-cli exits 0 without pulling anything.
+	// A repo snapshot with zero total bytes means nothing landed, so fail the job.
 	sizeBytes := hfCacheModelSize(modelName)
+	if sizeBytes == 0 {
+		return output, fmt.Errorf("hf download reported success but the model cache for %q is empty — the CLI likely no-oped (deprecated huggingface-cli on huggingface_hub >= 1.x); output: %s", modelName, strings.TrimSpace(string(output)))
+	}
 
 	result := modelCachePullResult{
 		Status:    "cached",
@@ -260,7 +358,8 @@ func BuildOllamaPullCommand(modelName string) *exec.Cmd {
 }
 
 // BuildHuggingFaceDownloadCommand returns the exec.Cmd for downloading a model
-// via huggingface-cli. Exported for testing command construction.
-func BuildHuggingFaceDownloadCommand(modelName string) *exec.Cmd {
-	return exec.Command("huggingface-cli", "download", modelName)
+// repo via the given HuggingFace CLI binary (bin, resolved via
+// resolveHFDownloader). Exported for testing command construction.
+func BuildHuggingFaceDownloadCommand(bin, modelName string) *exec.Cmd {
+	return exec.Command(bin, hfDownloadArgs(modelName, "", "")...)
 }

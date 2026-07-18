@@ -214,16 +214,25 @@ func TestBuildOllamaRmCommand(t *testing.T) {
 }
 
 func TestBuildHuggingFaceDownloadCommand(t *testing.T) {
-	cmd := BuildHuggingFaceDownloadCommand("meta-llama/Llama-2-7b-chat-hf")
+	cmd := BuildHuggingFaceDownloadCommand("hf", "meta-llama/Llama-2-7b-chat-hf")
 	args := cmd.Args
 	if len(args) != 3 {
 		t.Fatalf("expected 3 args, got %d: %v", len(args), args)
+	}
+	if args[0] != "hf" {
+		t.Errorf("args[0] = %q, want 'hf'", args[0])
 	}
 	if args[1] != "download" {
 		t.Errorf("args[1] = %q, want 'download'", args[1])
 	}
 	if args[2] != "meta-llama/Llama-2-7b-chat-hf" {
 		t.Errorf("args[2] = %q, want 'meta-llama/Llama-2-7b-chat-hf'", args[2])
+	}
+	// A repo pull must NOT pass --local-dir (it lands in the HF hub cache).
+	for _, a := range args {
+		if a == "--local-dir" {
+			t.Errorf("repo pull should not use --local-dir, got %v", args)
+		}
 	}
 }
 
