@@ -115,6 +115,13 @@ func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, client *redisclie
 		return err
 	}
 
+	// Chat-style requests (gateway `messages`) use the OpenAI-compatible
+	// /v1/chat/completions so vLLM applies the served model's chat template;
+	// the legacy /v1/completions prompt path is kept for prompt-style jobs.
+	if len(payload.Messages) > 0 {
+		return h.executeChatCompletionsAt(ctx, client, jobID, rayID, payload, vllmBaseURL())
+	}
+
 	vllmURL := vllmBaseURL() + "/v1/completions"
 
 	reqPayload := map[string]any{
@@ -472,6 +479,16 @@ func (h *LLMInferenceHandler) executeLlamaCpp(ctx context.Context, client *redis
 // URL. Shared by the llamacpp and bonsai backends (bonsai is the PrismML
 // llama.cpp fork serving the identical API on its own host port).
 func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload, baseURL string) error {
+	// Chat-style requests (the OpenAI gateway sends `messages`, not `prompt`)
+	// go to the server's OpenAI-compatible /v1/chat/completions so the engine
+	// applies the model's chat template. This is required for chat/instruct
+	// models — and essential for thinking models like Bonsai whose template
+	// emits the reasoning/answer split. The legacy /completion path below is
+	// kept for prompt-style jobs.
+	if len(payload.Messages) > 0 {
+		return h.executeChatCompletionsAt(ctx, client, jobID, rayID, payload, baseURL)
+	}
+
 	llamaCppURL := baseURL + "/completion"
 
 	reqPayload := map[string]any{
@@ -578,4 +595,197 @@ func (h *LLMInferenceHandler) handleLlamaCppNonStream(ctx context.Context, clien
 	})
 
 	return nil
+}
+
+// executeChatCompletionsAt runs a chat-style inference against an OpenAI-
+// compatible /v1/chat/completions endpoint. vLLM, llama.cpp, and the bonsai
+// llama.cpp fork all expose it identically. Sending `messages` (rather than a
+// flattened prompt) lets the engine apply the served model's chat template,
+// which is required for instruct/chat models and essential for thinking models
+// like Bonsai. Used whenever an llm_inference job carries `messages` (the shape
+// the OpenAI inference gateway dispatches).
+func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload, baseURL string) error {
+	chatURL := baseURL + "/v1/chat/completions"
+
+	messages := make([]map[string]string, 0, len(payload.Messages))
+	for _, m := range payload.Messages {
+		messages = append(messages, map[string]string{"role": m.Role, "content": m.Content})
+	}
+
+	reqPayload := map[string]any{
+		"model":       payload.Model,
+		"messages":    messages,
+		"max_tokens":  payload.MaxTokens,
+		"temperature": payload.Temperature,
+		"stream":      payload.Stream,
+	}
+	if payload.MaxTokens == 0 {
+		reqPayload["max_tokens"] = 512
+	}
+	if payload.TopP > 0 {
+		reqPayload["top_p"] = payload.TopP
+	}
+	if len(payload.Stop) > 0 {
+		reqPayload["stop"] = payload.Stop
+	}
+
+	reqBody, _ := json.Marshal(reqPayload)
+	req, err := http.NewRequestWithContext(ctx, "POST", chatURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to chat endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("chat endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if payload.Stream {
+		return h.handleChatCompletionsStream(ctx, client, jobID, rayID, resp.Body)
+	}
+	return h.handleChatCompletionsNonStream(ctx, client, jobID, rayID, resp.Body)
+}
+
+// handleChatCompletionsNonStream parses a buffered OpenAI chat-completions
+// response and publishes the assistant's message content.
+func (h *LLMInferenceHandler) handleChatCompletionsNonStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+
+	content, finishReason, usage, err := parseChatCompletionResponse(bodyBytes)
+	if err != nil {
+		return err
+	}
+
+	client.PublishChunk(ctx, jobID, rayID, content, 0)
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
+		"content":       content,
+		"finish_reason": finishReason,
+		"usage":         usage,
+	})
+	return nil
+}
+
+// parseChatCompletionResponse extracts the assistant content, finish reason,
+// and usage from a buffered OpenAI chat-completions body. Content falls back to
+// reasoning_content when the answer field is empty (thinking models like Bonsai
+// whose token budget was spent mid-reasoning), so a caller never gets a blank
+// reply while tokens were clearly generated.
+func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string, usage map[string]any, err error) {
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(bodyBytes, &response); err != nil {
+		return "", "", nil, fmt.Errorf("failed to parse chat completions response: %w", err)
+	}
+
+	finishReason = "stop"
+	if len(response.Choices) > 0 {
+		content = response.Choices[0].Message.Content
+		if content == "" {
+			content = response.Choices[0].Message.ReasoningContent
+		}
+		if response.Choices[0].FinishReason != "" {
+			finishReason = response.Choices[0].FinishReason
+		}
+	}
+
+	usage = map[string]any{
+		"prompt_tokens":     response.Usage.PromptTokens,
+		"completion_tokens": response.Usage.CompletionTokens,
+		"total_tokens":      response.Usage.TotalTokens,
+	}
+	return content, finishReason, usage, nil
+}
+
+// handleChatCompletionsStream translates an OpenAI chat-completions SSE stream
+// into Redis chunks. Each `data:` frame carries a choices[].delta. The answer
+// is streamed from delta.content (matching the buffered path and standard
+// OpenAI clients). Thinking models like Bonsai emit the chain-of-thought in
+// delta.reasoning_content and the answer in delta.content; the reasoning is
+// accumulated but only surfaced if the stream ends with NO answer (token budget
+// spent mid-reasoning), so a reply is never silently blank while staying
+// consistent with the non-stream content-only result.
+func (h *LLMInferenceHandler) handleChatCompletionsStream(ctx context.Context, client *redisclient.Client, jobID, rayID string, body io.Reader) error {
+	scanner := bufio.NewScanner(body)
+	// Allow long SSE lines (large deltas) beyond bufio's default 64KiB cap.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	chunkIndex := 0
+	var answer strings.Builder
+	var reasoning strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if text := chunk.Choices[0].Delta.Content; text != "" {
+			answer.WriteString(text)
+			client.PublishChunk(ctx, jobID, rayID, text, chunkIndex)
+			chunkIndex++
+		} else if rc := chunk.Choices[0].Delta.ReasoningContent; rc != "" {
+			reasoning.WriteString(rc)
+		}
+
+		if chunk.Choices[0].FinishReason != "" {
+			break
+		}
+	}
+
+	final := answer.String()
+	if final == "" {
+		// No answer was produced (thinking model ran out of budget mid-reason);
+		// surface the reasoning so the reply is not blank, mirroring the
+		// buffered path's reasoning_content fallback.
+		if final = reasoning.String(); final != "" {
+			client.PublishChunk(ctx, jobID, rayID, final, chunkIndex)
+		}
+	}
+
+	client.PublishEnd(ctx, jobID, rayID, map[string]any{
+		"content":       final,
+		"finish_reason": "stop",
+	})
+	return scanner.Err()
 }
