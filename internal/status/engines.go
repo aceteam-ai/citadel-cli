@@ -24,7 +24,12 @@ var idleCapableEngines = []string{"vllm"}
 // loaded model(s) over the engine's local HTTP API (#529). It must remain a
 // superset of idleCapableEngines (guarded by a test) so extending the idle
 // list never silently drops an engine from the heartbeat.
-var managedProbeEngines = []string{"vllm", "ollama", "llamacpp"}
+//
+// bonsai (PrismML Bonsai-27B on the llama.cpp fork, host port 8210) exposes the
+// same OpenAI-compatible /v1/models API as llama.cpp, so probing it surfaces the
+// served GGUF in the heartbeat's services[].models — which is how the inference
+// gateway learns a node is serving Bonsai and can route to it (backend=bonsai).
+var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai"}
 
 // collectManagedEngineStatus reports running managed serving engines (from the
 // embedded services.ServiceMap) so their telemetry reaches the heartbeat even
