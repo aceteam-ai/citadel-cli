@@ -1,0 +1,58 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-services - List managed inference engines and their idle/usage status
+
+
+.SH SYNOPSIS
+\fBcitadel services [flags]\fP
+
+
+.SH DESCRIPTION
+Show the managed serving engines and catalog apps running on this node,
+with a per-service usage signal: whether each is actively serving requests or
+sitting idle (holding CPU/RAM/VRAM with no recent activity), how long it has
+been idle, and its live resource footprint.
+
+.PP
+This is the operator-facing view of the idle-detection telemetry that rides the
+node heartbeat (citadel #416). It answers "is anyone actually using this engine,
+or is it pinning VRAM for nothing?" so you can safely reclaim a contended GPU.
+
+.PP
+Idle signal sources:
+  - vLLM exposes Prometheus request counters, giving a precise last-request /
+    idle-seconds signal.
+  - Other engines (diffusers, ollama, ...) fall back to a CPU/GPU-utilization
+    heuristic: quiet for long enough is reported as idle.
+  - A service with no derivable signal is shown as "unknown" and is NEVER a
+    candidate for auto-stop.
+
+.PP
+Auto-stop: OFF by default. Set SERVICE_AUTO_STOP_WHEN_IDLE=true (optionally
+SERVICE_AUTO_STOP_IDLE_SECONDS=) on the node so 'citadel work' auto-stops a
+service confirmed idle past the threshold. Candidates that WOULD be stopped are
+flagged below.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for services
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

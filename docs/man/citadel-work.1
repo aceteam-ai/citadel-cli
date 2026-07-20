@@ -59,6 +59,10 @@ Examples:
 	API key for authentication (or set CITADEL_API_KEY env)
 
 .PP
+\fB--attach\fP[=false]
+	When a worker is already running, print its status banner instead of refusing (default: only on an interactive terminal)
+
+.PP
 \fB--auto-detect\fP=false
 \[la]Deprecated\[ra] Capabilities are now always auto-detected unless declared in citadel.yaml
 
@@ -121,6 +125,10 @@ Examples:
 .PP
 \fB--max-retries\fP=3
 	Maximum retry attempts before DLQ
+
+.PP
+\fB--no-attach\fP[=false]
+	When a worker is already running, refuse with exit 1 instead of printing the status banner
 
 .PP
 \fB--no-footprint\fP[=false]

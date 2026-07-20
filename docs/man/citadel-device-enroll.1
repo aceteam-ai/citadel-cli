@@ -1,0 +1,45 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-device-enroll - Enroll this machine as a device (one-time browser approval)
+
+
+.SH SYNOPSIS
+\fBcitadel device enroll [flags]\fP
+
+
+.SH DESCRIPTION
+Enroll generates this machine's identity keypair, opens an approval
+request, and prints a link (and QR code) for you to approve in your browser
+while signed in to AceTeam. On approval the machine receives:
+.IP \(bu 2
+an identity certificate (issued by your org's fabric CA, ~1 year), and
+.IP \(bu 2
+a one-time key to join your org's network,
+
+.PP
+then joins the network via the system Tailscale client. Run
+\&'citadel device install' afterwards to keep the membership self-healing.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for enroll
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-device(1)\fP

@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-device - Enroll and maintain this machine as a personal device on your org's network
+
+
+.SH SYNOPSIS
+\fBcitadel device [flags]\fP
+
+
+.SH DESCRIPTION
+Device mode connects a personal machine (laptop, workstation) to your
+organization's AceTeam Network with a durable, self-healing identity.
+
+.PP
+Unlike 'citadel init' (which provisions a compute node), device mode runs no
+workloads. It enrolls this machine once via a browser approval, then keeps its
+network membership alive automatically: when the session breaks or its key
+nears expiry, the device proves its identity with a certificate and rejoins
+without any human involvement.
+
+.PP
+Requires the Tailscale client to be installed (device mode drives it; it does
+not replace it).
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for device
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-device-enroll(1)\fP, \fBcitadel-device-install(1)\fP, \fBcitadel-device-run(1)\fP, \fBcitadel-device-status(1)\fP, \fBcitadel-device-uninstall(1)\fP
