@@ -1894,15 +1894,26 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					activity("info", "Node-state reporting started")
 				}
 
-				apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
+				// Only the control center publishes heartbeat when NO dedicated
+				// worker owns this node. A `citadel work` daemon holding the lock
+				// already publishes heartbeat for this nodeId (see runWork); a
+				// second publisher here would double the control-plane heartbeat
+				// volume (the 429 self-DoS class the worklock work targeted) and
+				// flap node status between two competing publishers. The monitor-only
+				// gate below stops job consumption but not heartbeat publishing, so
+				// gating the publisher start here is what closes #571 (Phase 0).
+				// When skipped, the heartbeat indicator (ccHeartbeatFn) is left unset
+				// so the TUI never falsely claims "Heartbeat publishing started".
+				if workerHeld {
+					activity("info", fmt.Sprintf("Dedicated worker holds this node (PID %d); control center will NOT publish a second heartbeat (monitor-only)", workerPID))
+				} else if apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
 					Client:          apiSource.Client(),
 					NodeID:          nodeName,
 					HeadscaleNodeID: headscaleNodeID,
 					OrgID:           orgID,
 					DebugFunc:       nil,
 					LogFn:           activity, // Route logs through TUI
-				}, collector)
-				if err == nil {
+				}, collector); err == nil {
 					// Include current permissions in heartbeat
 					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
 					go func() {
