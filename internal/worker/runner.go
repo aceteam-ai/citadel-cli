@@ -336,6 +336,15 @@ runLoop:
 	return nil
 }
 
+// newStreamWriter builds the per-job stream writer, falling back to a no-op
+// writer when no factory is configured (e.g. Nexus HTTP source).
+func (r *Runner) newStreamWriter(job *Job) StreamWriter {
+	if r.streamWriterFactory != nil {
+		return r.streamWriterFactory(job)
+	}
+	return &NoOpStreamWriter{}
+}
+
 // processJob dispatches a job to the appropriate handler.
 func (r *Runner) processJob(ctx context.Context, job *Job) {
 	atomic.AddInt64(&r.activeJobs, 1)
@@ -365,15 +374,21 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		}
 	}
 
+	// Claim-ack (aceteam#6000): publish a lightweight "claimed" event the moment
+	// this node takes ownership of the job -- after the target-node filter (so
+	// only the owning node claims a shared-stream message) and before any
+	// handler work. The backend dispatcher waits a short window for this event;
+	// a wedged or dead-but-heartbeating node never reaches this line, so the
+	// dispatcher fast-fails in ~3s instead of burning the full result budget.
+	// Best-effort: a publish failure must not block execution.
+	stream := r.newStreamWriter(job)
+	if err := stream.WriteClaimed(r.agentVersion); err != nil {
+		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
+	}
+
 	// JQS-Core Section 5.6: Check cancellation before processing
 	if r.source.IsJobCancelled(ctx, job.ID) {
 		r.log("info", "Job %s was cancelled before processing", job.ID)
-		var stream StreamWriter
-		if r.streamWriterFactory != nil {
-			stream = r.streamWriterFactory(job)
-		} else {
-			stream = &NoOpStreamWriter{}
-		}
 		if err := stream.WriteCancelled("Job cancelled before processing"); err != nil {
 			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, err)
 		}
@@ -408,12 +423,6 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 					err := fmt.Errorf("requested GPU %d is unavailable", gpuIdx)
 					r.log("error", "GPU unavailable: %v", err)
 					r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
-					var stream StreamWriter
-					if r.streamWriterFactory != nil {
-						stream = r.streamWriterFactory(job)
-					} else {
-						stream = &NoOpStreamWriter{}
-					}
 					stream.WriteError(err, false)
 					r.source.Nack(ctx, job, err)
 					return
@@ -439,15 +448,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		job.Payload["_gpuIndex"] = gpuIndex
 	}
 
-	// Create stream writer
-	var stream StreamWriter
-	if r.streamWriterFactory != nil {
-		stream = r.streamWriterFactory(job)
-	} else {
-		stream = &NoOpStreamWriter{}
-	}
-
-	// Execute handler
+	// Execute handler (stream writer created above, at claim time)
 	stream.WriteStart("Job processing started")
 
 	// Per-job execution deadline (aceteam#6000). When the payload carries a

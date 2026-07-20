@@ -167,6 +167,8 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 
 // MockStreamWriter is a test implementation of StreamWriter.
 type MockStreamWriter struct {
+	claimed        bool
+	claimedVersion string
 	started        bool
 	chunks         []string
 	ended          bool
@@ -174,6 +176,12 @@ type MockStreamWriter struct {
 	erroredErr     error
 	erroredRecover bool
 	cancelled      bool
+}
+
+func (m *MockStreamWriter) WriteClaimed(agentVersion string) error {
+	m.claimed = true
+	m.claimedVersion = agentVersion
+	return nil
 }
 
 func (m *MockStreamWriter) WriteStart(message string) error {
@@ -448,6 +456,72 @@ func TestRunnerKnownJobTypeStillDispatches(t *testing.T) {
 	}
 	if len(source.FailedJobs()) != 0 {
 		t.Errorf("Failed jobs = %d, want 0 for a known type", len(source.FailedJobs()))
+	}
+}
+
+// TestRunnerPublishesClaimedBeforeExecution verifies the claim-ack contract
+// (aceteam#6000): when a job is read off the queue the runner publishes a
+// "claimed" event carrying the node's agent version BEFORE any handler work, so
+// the backend dispatcher can distinguish a live worker from a wedged/dead one
+// within a short window.
+func TestRunnerPublishesClaimedBeforeExecution(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "SHELL_COMMAND", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("SHELL_COMMAND", false)
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.81.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	if !stream.claimed {
+		t.Fatal("expected a claimed event to be published when the job was read")
+	}
+	if stream.claimedVersion != "v2.81.0" {
+		t.Errorf("claimed agent_version = %q, want v2.81.0", stream.claimedVersion)
+	}
+	if !stream.started {
+		t.Error("expected the job to also proceed to WriteStart after claiming")
+	}
+}
+
+// TestRunnerDoesNotClaimForeignTargetedJob verifies that a shared-stream message
+// addressed to a different node (target_node mismatch) is skipped WITHOUT
+// publishing a claim. Only the owning node claims; otherwise the dispatcher
+// would see a false claim from a node that never runs the job.
+func TestRunnerDoesNotClaimForeignTargetedJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "SHELL_COMMAND", Payload: map[string]any{"target_node": "other-node"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("SHELL_COMMAND", false)
+	config := RunnerConfig{WorkerID: "test-worker", NodeID: "this-node", AgentVersion: "v2.81.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	runner.Run(ctx)
+
+	if stream.claimed {
+		t.Error("a job targeted at another node must not be claimed by this node")
+	}
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("Executed jobs = %d, want 0 for a foreign-targeted job", len(handler.ExecutedJobs()))
 	}
 }
 

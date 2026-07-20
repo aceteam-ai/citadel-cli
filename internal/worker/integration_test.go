@@ -18,10 +18,20 @@ type recordingStreamWriter struct {
 	endResult       map[string]any
 	cancelledReason string
 	errMessage      string
+	claimedVersion  string
+	claimed         bool
 	started         bool
 	ended           bool
 	cancelled       bool
 	errored         bool
+}
+
+func (w *recordingStreamWriter) WriteClaimed(agentVersion string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.claimed = true
+	w.claimedVersion = agentVersion
+	return nil
 }
 
 func (w *recordingStreamWriter) WriteStart(message string) error {

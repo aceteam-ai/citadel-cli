@@ -18,6 +18,14 @@ type JobHandler interface {
 // For Redis sources, this publishes to Redis Pub/Sub.
 // For Nexus sources, this may be a no-op.
 type StreamWriter interface {
+	// WriteClaimed signals that this worker has read the job off the queue and
+	// committed to running it, published BEFORE handler execution. The backend
+	// dispatcher (aceteam#6000) waits a short window for this event before
+	// committing the full result budget: a wedged/dead-but-heartbeating node
+	// never emits it, so the dispatcher fast-fails in ~3s instead of burning the
+	// whole deadline. agentVersion lets the backend attribute the claim.
+	WriteClaimed(agentVersion string) error
+
 	// WriteStart signals the beginning of job processing.
 	WriteStart(message string) error
 
@@ -38,6 +46,7 @@ type StreamWriter interface {
 // Used when streaming is not supported or needed.
 type NoOpStreamWriter struct{}
 
+func (n *NoOpStreamWriter) WriteClaimed(agentVersion string) error       { return nil }
 func (n *NoOpStreamWriter) WriteStart(message string) error              { return nil }
 func (n *NoOpStreamWriter) WriteChunk(content string, index int) error   { return nil }
 func (n *NoOpStreamWriter) WriteEnd(result map[string]any) error         { return nil }
