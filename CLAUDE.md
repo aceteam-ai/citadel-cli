@@ -524,6 +524,62 @@ info, err := auth.ValidateToken(token, orgID)
 - Linux/macOS: Full PTY support via `creack/pty`
 - Windows: Not yet supported (requires ConPTY implementation)
 
+### Mesh Model Discovery & Remote Chat (citadel #576, Phase 2)
+
+`citadel mesh` discovers the models served by OTHER citadel nodes on the mesh and
+routes chat to them node-to-node. Node->node mesh traffic is DIRECT (the Railway
+SOCKS relay caveat only affects backend->node), so a node can probe peers itself.
+
+**Discovery route (`internal/mesh`):** each node already exposes its full
+heartbeat (`services[].models`, `services[].port`) at `GET /status` on its mesh
+VPN listener. `mesh.Discover` enumerates online peers (`network.GetGlobalPeers`),
+probes each peer's `/status` over the mesh (dialing via `network.Dial`), and
+aggregates a fabric-wide `model -> (node, engine, port)` view. Unreachable peers
+are skipped and recorded with their error (a probe never fails the whole call).
+
+**Standalone by design:** `internal/mesh` does NOT import `internal/network` or
+`internal/status`. Callers inject a `Dialer` and a `PeerLister`, and the payload
+subset is decoded into a local struct — this keeps the aggregation pure and
+unit-testable without a live mesh (`discover()` takes a mock `statusFetchFunc`;
+the HTTP + chat paths are tested via `httptest` + an injected dialer). Phase 1's
+local chat REPL (#575) can import the same `Inventory`/`Client` to add a
+remote/peer selection mode. The CLI is deliberately `citadel mesh` (not
+`citadel chat`) to avoid colliding with #575.
+
+**Routing:** all engines (vLLM, llama.cpp, bonsai, Ollama's OpenAI shim) expose
+`/v1/chat/completions`, so `mesh.Client.ChatCompletion(ip, port, body)` routes on
+`(ip, port)` alone; the `engine` field is informational. The function is generic
+and reusable (by #575's REPL too); it lights up the moment a node exposes a
+mesh-reachable chat endpoint.
+
+**Discovery reachability caveat:** a plain `citadel work` (default
+`--status-port 0`) does NOT serve `/status` on the mesh — only `--gateway` (or the
+provisioned gateway, which forces `:8080` + a VPN listener) does. Discovery
+therefore sees only gateway-enabled peers; the probe port is configurable via
+`--port` (`mesh.Options.Port`, default `services.GatewayPort` = 8080).
+
+**Chat reachability gap (KNOWN, tracked in #581):** `mesh chat` is wired but
+routing does NOT work end-to-end yet, because on **embedded-tsnet nodes the
+engine's host port is not reachable over the mesh**. Verified by self-dialing this
+node's own mesh IP:8210 via `network.Dial` while bonsai served fine on
+`localhost:8210` → `connection refused`: embedded tsnet's userspace netstack does
+not forward inbound mesh traffic to a host-bound port lacking a `srv.Listen()`
+(only ports citadel explicitly `ListenVPN`s — status 8080, gateway 8443, terminal,
+vnc, modules — answer over the mesh). The engine compose files bind `0.0.0.0` and
+carry a "peers reach this engine directly over the mesh" comment, but that
+reflects a full-Tailscale/kernel-TUN node, not embedded tsnet. Neither
+`citadel work --gateway` nor `citadel serve` proxies `/v1/chat/completions` (they
+proxy `/v1/embeddings` and control routes only). The node-side gateway chat route
+(model→engine, the complement of aceteam #6236) is the follow-up (#581); until
+then `mesh chat` fails gracefully with a message pointing there.
+
+```bash
+citadel mesh models                 # list model -> node/engine/addr across the mesh
+citadel mesh models --json          # includes unreachable nodes + their errors
+citadel mesh chat --model M "hi"    # one-shot chat to a uniquely-named model
+citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicitly
+```
+
 ## Important Implementation Notes
 
 ### Manifest Loading
