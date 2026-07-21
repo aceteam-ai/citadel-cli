@@ -663,6 +663,74 @@ Environment variables:
 | `SERVICE_AUTO_STOP_WHEN_IDLE` | unset (OFF) | Opt-in to auto-stop idle services. Truthy: `1`/`true`/`yes`/`on`. |
 | `SERVICE_AUTO_STOP_IDLE_SECONDS` | idle threshold | Idle seconds before auto-stop acts. |
 
+### Service Preemption and Node Pinning (citadel #577)
+
+A `SERVICE_START` that declares a VRAM budget on a full GPU auto-evicts
+(preempts) other services to make room — UNLESS they are pinned. Generalizes the
+#416 idle signal + #6018 VRAM-fit + durable `desired_status: stopped`.
+
+**Manifest field — `pinned_services` (node-wide allowlist):**
+```yaml
+# citadel.yaml
+pinned_services:
+  - bonsai          # never preempted
+services:
+  - name: bonsai
+  - name: vllm      # preemptible (the default for anything not pinned)
+```
+Modeled on both `CitadelManifest.PinnedServices` (`cmd/manifest.go`) and the
+minimal `serviceManifest.PinnedServices` (`internal/jobs/service_handler.go`).
+Empty/absent ⇒ every service is preemptible.
+
+**Pure decision (`internal/status/preempt.go`, unit-tested):**
+`PlanPreemption(candidates, requiredVRAM, availableVRAM) PreemptPlan` decides
+which non-pinned services to stop. Contract:
+- `requiredVRAM==0` (no declared budget) ⇒ Fits, no preemption. Never evict on an
+  absent signal.
+- Already fits (`availableVRAM >= requiredVRAM`) ⇒ Fits, no preemption.
+- **Pinned candidates are NEVER stopped.** If the deploy can't fit after stopping
+  every non-pinned service, `Fits=false` and `Blocked` names the pinned VRAM
+  holders → the deploy is REJECTED (job FAILURE).
+- Ordering is **idle-first** (stop idle before busy) then **largest-VRAM-first**,
+  name-ascending tie-break. Busy non-pinned services ARE preemptible — idle is
+  ordering, not a gate.
+
+**Executor (`ServiceHandler.preemptForVRAM`):** runs inside the docker
+`serviceStart` branch, gated on the target **not already running** (an
+already-running / model-recreate start already holds its VRAM). Collects live
+node status once (free VRAM from `GPUMetrics`, per-service `Footprint.VRAMBytes`,
+instantaneous idle via `status.FootprintActive` — NOT the debounced
+`FootprintIdleTracker`, which reads non-idle on a fresh collector), builds
+candidates, and executes the plan. Each eviction is **durable**: it sets
+`desired_status: stopped` THEN compose-downs (the SERVICE_STOP path), so the
+manifest reconcile does not restart it out from under the incoming deploy (the
+#528 VRAM-cascade gotcha). Preemption is therefore **sticky** — an evicted
+service stays down across reboots until an explicit `SERVICE_START` (which clears
+the marker) brings it back.
+
+**VRAM budget is a NEW payload contract, currently INERT.** `preemptForVRAM`
+reads `vram_mb` (preferred) or `vram_gb` from the `SERVICE_START` payload
+(`parseRequiredVRAMBytes`). The aceteam backend does **not** yet forward it
+(`fabric_provision` dispatches only `{service, model}`; DeployModel's
+`vram_budget_gb` is explicitly "not yet forwarded to Citadel"), so preemption is
+a no-op until the backend sends one of these keys. **AceTeam-side follow-up (different
+repo):** forward #6018's VRAM-fit budget as `vram_mb` on the model-deploy
+`SERVICE_START` dispatch.
+
+**Surfacing:** `ServiceInfo.Pinned` rides the heartbeat (`pinned`, omitempty);
+`citadel services` shows a `PIN` column (`pinned` / `preemptible`; `-` for apps,
+which are not pinnable via this service-level allowlist). Collectors are fed the
+allowlist via `CollectorConfig.PinnedServices` (the `citadel work` heartbeat path
+and `citadel services`).
+
+**Known limitations / follow-ups:**
+- The decision dimension is VRAM only; RAM preemption is a documented follow-up.
+- Catalog apps are not pinnable and are excluded from preemption candidates here
+  (the eviction path is the service compose-down); the #416 auto-stop reconciler
+  still handles idle catalog apps separately.
+- The TUI control center collector is not yet fed `PinnedServices` (heartbeat and
+  `citadel services` are); low-priority follow-up.
+
 ### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
 
 A hung job handler must never silently stall the whole node. The wedge that

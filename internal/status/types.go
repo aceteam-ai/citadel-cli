@@ -207,6 +207,12 @@ type ServiceInfo struct {
 	// #421). Omitted when stats could not be read. Rides the heartbeat so the
 	// platform can spot a heavy-and-idle eviction candidate.
 	Footprint *ServiceFootprint `json:"footprint,omitempty"`
+
+	// Pinned reports whether this service is in the node's pinned_services
+	// allowlist and therefore NEVER preemptible to make room for another deploy
+	// (citadel-cli#577). Omitted (false) for preemptible services — the default.
+	// The platform reads this to show pinned vs preemptible per node.
+	Pinned bool `json:"pinned,omitempty"`
 }
 
 // HealthResponse is the response for /health endpoint.
