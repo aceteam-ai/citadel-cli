@@ -1285,3 +1285,19 @@ Auto-generated log of every release.
   - fix: default-deny SHELL_COMMAND kill-switch (aceteam #6149 Phase 0) (#565)
 
 
+---
+
+## v2.84.0 — 2026-07-21
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 18 |
+| Lines added | +599 |
+
+**Changes:**
+
+  - feat: serve Bonsai (& non-vLLM engines) via api.aceteam.ai — heartbeat + worker chat path (#572)
+  - chore: sync generated files after v2.83.0 release
+
+
