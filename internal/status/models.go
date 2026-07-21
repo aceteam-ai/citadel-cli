@@ -34,9 +34,11 @@ func NewModelDiscovery() *ModelDiscovery {
 }
 
 // EngineTypeFromName maps a service/app name to a model-discovery engine type
-// ("vllm", "ollama", "llamacpp"), or "" when the name is not a known serving
-// engine. Order matters: "ollama" contains "llama", so it must be checked
-// before the llama.cpp patterns.
+// ("vllm", "ollama", "llamacpp", "bonsai"), or "" when the name is not a known
+// serving engine. Order matters: "ollama" contains "llama", so it must be
+// checked before the llama.cpp patterns. "bonsai" is kept as its own type (it
+// serves the llama.cpp /v1/models API but the heartbeat reports it under its own
+// engine name so the gateway can route with backend=bonsai).
 func EngineTypeFromName(name string) string {
 	n := strings.ToLower(name)
 	switch {
@@ -44,6 +46,8 @@ func EngineTypeFromName(name string) string {
 		return "vllm"
 	case strings.Contains(n, "ollama"):
 		return "ollama"
+	case strings.Contains(n, "bonsai"):
+		return "bonsai"
 	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
 		return "llamacpp"
 	}
@@ -63,6 +67,10 @@ func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string,
 		// It can be up with NO model loaded (router mode / deferred load): that is
 		// an empty list, not an error.
 		return m.discoverOpenAIModels(ctx, "llama.cpp", port)
+	case "bonsai":
+		// bonsai (PrismML Bonsai-27B) is served by the llama.cpp fork, so it
+		// exposes the identical OpenAI-compatible /v1/models endpoint.
+		return m.discoverOpenAIModels(ctx, "bonsai", port)
 	case "ollama":
 		return m.discoverOllamaModels(ctx, port)
 	default:
@@ -154,8 +162,8 @@ func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]
 // CheckServiceHealth performs a health check on an LLM service.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
 	switch serviceType {
-	case "vllm", "llamacpp":
-		// Both vLLM and llama.cpp's server expose GET /health.
+	case "vllm", "llamacpp", "bonsai":
+		// vLLM, llama.cpp, and the bonsai llama.cpp fork all expose GET /health.
 		return m.checkHTTPHealth(ctx, port)
 	case "ollama":
 		return m.checkOllamaHealth(ctx, port)

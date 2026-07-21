@@ -207,6 +207,8 @@ func TestEngineTypeFromName(t *testing.T) {
 		"llamacpp":       "llamacpp",
 		"llama.cpp":      "llamacpp",
 		"llama-cpp":      "llamacpp",
+		"bonsai":         "bonsai",
+		"citadel-bonsai": "bonsai",
 		"transcribe":     "",
 		"gotenberg":      "",
 		"postgres":       "",
