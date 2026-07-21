@@ -1149,6 +1149,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			Services:       nil,
 			Capabilities:   statusCaps,
 			WorkerLiveness: workerLivenessFn,
+			PinnedServices: manifestPinnedServices(workManifest),
 		})
 	}
 
@@ -1406,6 +1407,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				Services:       nil,
 				Capabilities:   statusCaps,
 				WorkerLiveness: workerLivenessFn,
+				PinnedServices: manifestPinnedServices(workManifest),
 			})
 		}
 

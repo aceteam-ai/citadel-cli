@@ -24,6 +24,13 @@ services:
   # - name: diffusers
   #   compose_file: ./services/diffusers.yml
 
+# Optional: node-wide preemption allowlist (citadel-cli#577). Services listed
+# here are NEVER auto-stopped to make room for another deploy. Everything else is
+# preemptible: a SERVICE_START that declares a VRAM budget may durably stop
+# non-pinned services to fit. Omit for the default (all services preemptible).
+# pinned_services:
+#   - bonsai
+
 # Optional: declare GPU capabilities explicitly.
 # If omitted, capabilities are auto-detected via nvidia-smi at startup.
 # capabilities:

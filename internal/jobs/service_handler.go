@@ -18,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
@@ -26,6 +27,22 @@ import (
 // the service handler.  It lives here (not in cmd/) to avoid import cycles.
 type serviceManifest struct {
 	Services []manifestService `yaml:"services"`
+	// PinnedServices is the node-wide allowlist of services that must NEVER be
+	// preempted to make room for another deploy (citadel-cli#577). Mirrors
+	// cmd/manifest.go CitadelManifest.PinnedServices.
+	PinnedServices []string `yaml:"pinned_services,omitempty"`
+}
+
+// pinnedSet returns the pinned_services allowlist as a set for O(1) lookup,
+// trimming blank entries.
+func (m *serviceManifest) pinnedSet() map[string]bool {
+	set := make(map[string]bool, len(m.PinnedServices))
+	for _, n := range m.PinnedServices {
+		if n = strings.TrimSpace(n); n != "" {
+			set[n] = true
+		}
+	}
+	return set
 }
 
 type manifestService struct {
@@ -166,7 +183,12 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		// dispatches MODEL_CACHE_PULL (weights) then SERVICE_START
 		// {service, model}. The model, when present, is persisted per-service
 		// and injected into the engine's compose interpolation env.
-		return h.serviceStart(ctx, svc, job.Payload["model"])
+		//
+		// Optional VRAM budget (#577): a SERVICE_START that declares vram_mb /
+		// vram_gb triggers node-side preemption of non-pinned services to make
+		// room when the GPU lacks free VRAM. Absent => no preemption (the current
+		// backend does not yet forward it; see parseRequiredVRAMBytes).
+		return h.serviceStart(ctx, svc, job.Payload["model"], parseRequiredVRAMBytes(job.Payload))
 	case "SERVICE_STOP":
 		// A remote SERVICE_STOP is operator/cloud intent: mark the service
 		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
@@ -212,7 +234,7 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 // serve-time model (serviceModelEnvVar), it is persisted to the sibling
 // <name>.env BEFORE the already-running short-circuit, so a model change on a
 // running engine falls through to `up -d --force-recreate` and reloads it.
-func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string) ([]byte, error) {
+func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes uint64) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
 	// appliedModel is the model this start serves via compose env interpolation;
@@ -282,6 +304,17 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				Name: svc.Name, Running: true, Kind: kind,
 				Action: "start", Message: msg,
 			})
+		}
+		// Preempt non-pinned services to free VRAM for this deploy (#577). Gated
+		// on the target NOT already running: an already-running start (including
+		// the model-change --force-recreate path below, which reached here with
+		// modelChanged==true) already holds its own VRAM, so evicting peers for it
+		// would be a needless disruption. Returns an error — failing the deploy —
+		// when the requirement cannot be met without evicting a pinned service.
+		if !h.isDockerServiceRunning(svc.Name) {
+			if err := h.preemptForVRAM(ctx, svc, requiredVRAMBytes); err != nil {
+				return nil, err
+			}
 		}
 		composePath, pathErr := h.resolveComposePath(svc)
 		if pathErr != nil {
@@ -442,6 +475,149 @@ func (h *ServiceHandler) StopServiceByName(name string) error {
 		return fmt.Errorf("%s", parsed.Error)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// VRAM preemption + node pinning (#577)
+// ---------------------------------------------------------------------------
+
+// parseRequiredVRAMBytes reads the optional VRAM budget a SERVICE_START job
+// declares, in bytes. It accepts vram_mb (preferred) or vram_gb; a missing,
+// blank, non-numeric, or non-positive value yields 0 (= "no requirement", which
+// disables preemption). NOTE: the current aceteam backend does NOT yet forward a
+// VRAM field on SERVICE_START (fabric_provision dispatches only {service, model};
+// the DeployModel API's vram_budget_gb is explicitly "not yet forwarded to
+// Citadel"). So preemption is INERT until the backend sends one of these keys —
+// wiring that up (forward #6018's VRAM-fit budget as vram_mb) is the aceteam-side
+// follow-up.
+func parseRequiredVRAMBytes(payload map[string]string) uint64 {
+	if v := strings.TrimSpace(payload["vram_mb"]); v != "" {
+		if mb, err := strconv.ParseFloat(v, 64); err == nil && mb > 0 {
+			return uint64(mb * 1024 * 1024)
+		}
+	}
+	if v := strings.TrimSpace(payload["vram_gb"]); v != "" {
+		if gb, err := strconv.ParseFloat(v, 64); err == nil && gb > 0 {
+			return uint64(gb * 1024 * 1024 * 1024)
+		}
+	}
+	return 0
+}
+
+// preemptForVRAM makes room for a deploy that declares a VRAM budget by durably
+// stopping non-pinned services until it fits. It is a no-op when the requirement
+// is unknown (requiredVRAMBytes==0), when free VRAM already suffices, or when the
+// node's free VRAM cannot be determined (fail-safe: never evict on an absent
+// signal). It returns an error — FAILING the deploy — when the requirement cannot
+// be met without evicting a pinned service (pinned_services allowlist, #577).
+//
+// Durability: each preempted service is stopped via the SERVICE_STOP path
+// (desired_status: stopped, then compose down), NOT a bare docker stop, so the
+// boot/manifest-reconcile paths do not restart it out from under the incoming
+// deploy — the VRAM-cascade gotcha from #528. This means preemption is STICKY: an
+// evicted service stays down across reboots until an explicit SERVICE_START (which
+// clears the marker) brings it back.
+func (h *ServiceHandler) preemptForVRAM(ctx JobContext, svc manifestService, requiredVRAMBytes uint64) error {
+	if requiredVRAMBytes == 0 {
+		return nil // no declared budget => nothing to enforce
+	}
+
+	// Collect live node status once: free VRAM + per-service VRAM footprints. A
+	// fresh collector's debounced IdleState is unreliable here (no history), so
+	// the idle ORDERING signal is derived instantaneously from the footprint.
+	collector := status.NewCollector(status.CollectorConfig{ConfigDir: h.ConfigDir})
+	st, err := collector.Collect()
+	if err != nil {
+		ctx.Log("warning", "     - [preempt] could not collect node status: %v; skipping VRAM fit check", err)
+		return nil
+	}
+	freeVRAM, ok := freeVRAMBytes(st.GPU)
+	if !ok {
+		ctx.Log("info", "     - [preempt] GPU free VRAM unknown; skipping VRAM fit check for %s", svc.Name)
+		return nil
+	}
+
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to load manifest for preemption: %w", err)
+	}
+	pinned := manifest.pinnedSet()
+
+	candidates := buildPreemptCandidates(st, svc.Name, pinned)
+	plan := status.PlanPreemption(candidates, requiredVRAMBytes, freeVRAM)
+	if !plan.Fits {
+		// Cannot fit without evicting a pinned service: reject the deploy.
+		return fmt.Errorf("cannot start %s: %s", svc.Name, plan.Reason)
+	}
+	if len(plan.Stop) == 0 {
+		return nil // already fits; no eviction needed
+	}
+
+	ctx.Log("info", "     - [preempt] %s", plan.Reason)
+	for _, name := range plan.Stop {
+		ctx.Log("info", "     - [preempt] durably stopping %s to free VRAM for %s", name, svc.Name)
+		// Durable FIRST (mirrors the SERVICE_STOP job path): mark stopped so the
+		// manifest reconcile does not restart it, then compose down.
+		if err := h.setDesiredStatusInManifestFile(name, "stopped"); err != nil {
+			ctx.Log("warning", "     - [preempt] could not mark %s stopped: %v", name, err)
+		}
+		if err := h.StopServiceByName(name); err != nil {
+			// A failed eviction leaves VRAM unfreed: fail the deploy rather than
+			// start into insufficient VRAM.
+			return fmt.Errorf("cannot start %s: failed to preempt %s: %w", svc.Name, name, err)
+		}
+	}
+	return nil
+}
+
+// freeVRAMBytes sums the currently-free VRAM (total - used) across all GPUs that
+// report a total, in bytes. The bool is false when NO GPU reports a memory total
+// (no GPU / nvidia-smi absent), so callers skip the VRAM fit check rather than
+// treat "unknown" as "zero free".
+func freeVRAMBytes(gpus []status.GPUMetrics) (uint64, bool) {
+	var free uint64
+	found := false
+	for _, g := range gpus {
+		if g.MemoryTotalMB <= 0 {
+			continue
+		}
+		found = true
+		f := g.MemoryTotalMB - g.MemoryUsedMB
+		if f < 0 {
+			f = 0
+		}
+		free += uint64(f) * 1024 * 1024
+	}
+	return free, found
+}
+
+// buildPreemptCandidates turns the live node status into the pure inputs for
+// status.PlanPreemption: every RUNNING managed service except the deploy target,
+// tagged with its VRAM footprint, an instantaneous idle signal (for ordering),
+// and whether it is pinned. Catalog apps are intentionally excluded — pinning is
+// a service-level allowlist and the eviction path here is the service compose
+// down.
+func buildPreemptCandidates(st *status.NodeStatus, exclude string, pinned map[string]bool) []status.PreemptCandidate {
+	out := make([]status.PreemptCandidate, 0, len(st.Services))
+	for i := range st.Services {
+		s := &st.Services[i]
+		if s.Name == exclude || s.Status != status.ServiceStatusRunning {
+			continue
+		}
+		var vram uint64
+		if s.Footprint != nil {
+			vram = s.Footprint.VRAMBytes
+		}
+		out = append(out, status.PreemptCandidate{
+			Name:      s.Name,
+			VRAMBytes: vram,
+			// Instantaneous (not debounced) idle: a fresh collector has no idle
+			// history, so use the footprint's CPU/GPU activity directly.
+			Idle:   !status.FootprintActive(s.Footprint),
+			Pinned: pinned[s.Name],
+		})
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

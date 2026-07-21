@@ -60,6 +60,22 @@ type CitadelManifest struct {
 	} `yaml:"node"`
 	Services     []Service             `yaml:"services"`
 	Capabilities *ManifestCapabilities `yaml:"capabilities,omitempty"`
+	// PinnedServices is a node-wide allowlist of service names that must NEVER be
+	// preempted (auto-stopped) to make room for another deploy (citadel-cli#577).
+	// Everything not listed is preemptible: a SERVICE_START that declares a VRAM
+	// budget may durably stop non-pinned services to fit. Empty/absent =>
+	// preemption allowed for all services (the default).
+	PinnedServices []string `yaml:"pinned_services,omitempty"`
+}
+
+// manifestPinnedServices returns the pinned_services allowlist for a manifest,
+// nil-safe so heartbeat/collector wiring can pass a possibly-nil manifest
+// (citadel-cli#577).
+func manifestPinnedServices(m *CitadelManifest) []string {
+	if m == nil {
+		return nil
+	}
+	return m.PinnedServices
 }
 
 // findAndReadManifest locates and parses the node's manifest file.

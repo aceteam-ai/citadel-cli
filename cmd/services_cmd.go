@@ -47,14 +47,17 @@ func init() {
 
 func runServices(_ *cobra.Command, _ []string) error {
 	nodeName := ""
+	var pinned []string
 	if manifest, _, err := findAndReadManifest(); err == nil && manifest != nil {
 		nodeName = manifest.Node.Name
+		pinned = manifest.PinnedServices
 	}
 
 	collector := status.NewCollector(status.CollectorConfig{
-		NodeName:  nodeName,
-		ConfigDir: "",
-		Services:  nil,
+		NodeName:       nodeName,
+		ConfigDir:      "",
+		Services:       nil,
+		PinnedServices: pinned,
 	})
 	nodeStatus, err := collector.Collect()
 	if err != nil {
@@ -82,9 +85,9 @@ func runServices(_ *cobra.Command, _ []string) error {
 
 	fmt.Printf("Managed services on %s:\n\n", displayNodeName(nodeName))
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tKIND\tSTATUS\tUSAGE\tFOOTPRINT\tNOTE")
+	fmt.Fprintln(w, "NAME\tKIND\tSTATUS\tPIN\tUSAGE\tFOOTPRINT\tNOTE")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.name, r.kind, r.statusStr, r.usage, r.footprint, r.note)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r.name, r.kind, r.statusStr, r.pin, r.usage, r.footprint, r.note)
 	}
 	w.Flush()
 
@@ -98,15 +101,15 @@ func runServices(_ *cobra.Command, _ []string) error {
 
 // serviceRow is one rendered line of the services table.
 type serviceRow struct {
-	name, kind, statusStr, usage, footprint, note string
+	name, kind, statusStr, pin, usage, footprint, note string
 }
 
 // collectServiceRows flattens the status services and apps into sorted display
-// rows, annotating each with its usage label, footprint, and an eviction-candidate
-// note when it qualifies.
+// rows, annotating each with its usage label, footprint, pin state, and an
+// eviction-candidate note when it qualifies.
 func collectServiceRows(st *status.NodeStatus, candidates map[string]bool) []serviceRow {
 	var rows []serviceRow
-	add := func(kind, name, statusStr string, idle *status.IdleState, fp *status.ServiceFootprint) {
+	add := func(kind, name, statusStr string, pinned bool, idle *status.IdleState, fp *status.ServiceFootprint) {
 		note := ""
 		if status.IsHeavyAndIdle(fp, idle) {
 			note = "heavy+idle"
@@ -121,6 +124,7 @@ func collectServiceRows(st *status.NodeStatus, candidates map[string]bool) []ser
 			name:      name,
 			kind:      kind,
 			statusStr: statusStr,
+			pin:       pinLabel(kind, pinned),
 			usage:     usageLabel(statusStr, idle),
 			footprint: footprintLabel(fp),
 			note:      note,
@@ -128,11 +132,12 @@ func collectServiceRows(st *status.NodeStatus, candidates map[string]bool) []ser
 	}
 	for i := range st.Services {
 		s := &st.Services[i]
-		add(string(status.EntityService), s.Name, s.Status, s.IdleState, s.Footprint)
+		add(string(status.EntityService), s.Name, s.Status, s.Pinned, s.IdleState, s.Footprint)
 	}
 	for i := range st.Apps {
 		a := &st.Apps[i]
-		add(string(status.EntityApp), a.Name, a.Status, a.IdleState, a.Footprint)
+		// Apps are not pinnable (pinned_services is a service-level allowlist).
+		add(string(status.EntityApp), a.Name, a.Status, false, a.IdleState, a.Footprint)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].kind != rows[j].kind {
@@ -141,6 +146,19 @@ func collectServiceRows(st *status.NodeStatus, candidates map[string]bool) []ser
 		return rows[i].name < rows[j].name
 	})
 	return rows
+}
+
+// pinLabel renders the PIN column (citadel #577): "pinned" for a pinned service,
+// "preemptible" for any other service, and "-" for apps (pinning is a
+// service-level allowlist, so apps are not pinnable via pinned_services).
+func pinLabel(kind string, pinned bool) string {
+	if kind == string(status.EntityApp) {
+		return "-"
+	}
+	if pinned {
+		return "pinned"
+	}
+	return "preemptible"
 }
 
 // usageLabel renders the usage column: "busy"/"idle <dur>" for a running

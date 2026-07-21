@@ -79,7 +79,7 @@ func TestServiceStartPublishesHostPort(t *testing.T) {
 		ComposeFile: "services/" + svcName + ".yml",
 	}
 
-	out, err := h.serviceStart(JobContext{}, svc)
+	out, err := h.serviceStart(JobContext{}, svc, "", 0)
 	if err != nil {
 		t.Fatalf("serviceStart returned error: %v", err)
 	}

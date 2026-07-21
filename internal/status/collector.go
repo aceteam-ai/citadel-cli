@@ -32,6 +32,7 @@ type Collector struct {
 	idleTracker    *IdleTracker           // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
 	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
+	pinnedServices map[string]bool        // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -52,6 +53,10 @@ type CollectorConfig struct {
 	// to each heartbeat so the platform can flag "green but wedged" nodes
 	// (issue #548). Optional: nil on nodes with no worker loop.
 	WorkerLiveness func() *WorkerLiveness
+	// PinnedServices is the node's pinned_services allowlist (citadel #577). Each
+	// running service whose name is listed is marked ServiceInfo.Pinned=true so
+	// the heartbeat and `citadel services` show pinned vs preemptible. Optional.
+	PinnedServices []string
 }
 
 // NewCollector creates a new status collector.
@@ -67,7 +72,23 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
 		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
+		pinnedServices: toStringSet(cfg.PinnedServices),
 	}
+}
+
+// toStringSet builds a lookup set from a slice, trimming blanks. Returns nil for
+// an empty input so a caller can cheaply test len()==0.
+func toStringSet(items []string) map[string]bool {
+	if len(items) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(items))
+	for _, it := range items {
+		if it = strings.TrimSpace(it); it != "" {
+			set[it] = true
+		}
+	}
+	return set
 }
 
 // SetCapabilities sets the cached capabilities for heartbeat publishing.
@@ -109,6 +130,17 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 			continue
 		}
 		status.Services = append(status.Services, eng)
+	}
+
+	// Mark pinned services (citadel #577) so the heartbeat and `citadel services`
+	// can show pinned vs preemptible. A pinned service is never auto-evicted to
+	// make room for another deploy.
+	if len(c.pinnedServices) > 0 {
+		for i := range status.Services {
+			if c.pinnedServices[status.Services[i].Name] {
+				status.Services[i].Pinned = true
+			}
+		}
 	}
 
 	// Collect installed app status

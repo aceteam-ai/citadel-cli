@@ -563,6 +563,17 @@ func footprintActive(fp *ServiceFootprint) bool {
 	return false
 }
 
+// FootprintActive reports whether a footprint indicates the container is doing
+// work (CPU or GPU above the idle thresholds). Exported wrapper over the internal
+// heuristic so callers outside this package (the #577 preemption ordering) can
+// derive an INSTANTANEOUS idle signal (idle == !FootprintActive) without the
+// debounced FootprintIdleTracker, which needs accumulated history to cross its
+// threshold and so reads non-idle for every service on a fresh collector. A nil
+// footprint is not active.
+func FootprintActive(fp *ServiceFootprint) bool {
+	return footprintActive(fp)
+}
+
 // Observe updates the tracker for a container's current footprint and returns
 // its derived idle state. Active containers reset the idle clock and report
 // idle=false with idle_seconds=0. Inactive containers accumulate idle_seconds
