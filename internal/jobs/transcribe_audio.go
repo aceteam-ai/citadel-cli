@@ -3,10 +3,12 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -37,9 +39,56 @@ const transcribeReadyTimeout = 120 * time.Second
 // fetch" once the gateway times out first.
 const transcribeUnreachableTimeout = 8 * time.Second
 
-// transcribeRequestTimeout bounds a single transcription. Whisper on CPU is
-// roughly real-time-ish for the "base" model, so a long meeting needs headroom.
-const transcribeRequestTimeout = 30 * time.Minute
+// The transcribe request timeout is sized PER REQUEST from the audio file's
+// byte length rather than a single fixed cap. A fixed 30-minute cap was too
+// short in the field: a real 43-minute meeting recorded an ~83 MB WAV whose
+// end-of-call batch transcription ran past 30 minutes on CPU whisper and the
+// client aborted mid-request ("Client.Timeout exceeded while awaiting
+// headers"). The sidecar responds only once the WHOLE file is transcribed
+// (there is no streaming/offset API), so the client must tolerate a budget
+// proportional to the audio's real duration.
+//
+// Sizing by bytes also makes the rolling/windowed passes cheap for free: those
+// transcribe only a short trailing clip (small file -> short budget), while the
+// end-of-call batch pass over the full recording (large file -> long budget)
+// gets the headroom it needs. Both flow through the same handler.
+const (
+	// transcribeBytesPerSecond estimates recorded audio duration from a WAV
+	// file's size. The meeting recorder captures mono 16 kHz signed-16-bit PCM
+	// (platform.buildAudioFFmpegArgs: "-ac 1 -ar 16000"), i.e.
+	// 16000 * 2 bytes = 32000 bytes per second of audio. This is used ONLY to
+	// size the request timeout, so an approximate rate is fine — the generous
+	// per-second multiplier below absorbs the WAV header and any format slack.
+	// NOTE: this is coupled to the recorder's uncompressed WAV format. The batch
+	// pass transcribes the WAV (not the Opus backup added in #555); if the
+	// transcribed input ever becomes compressed, revisit this constant so the
+	// budget does not silently under-time.
+	transcribeBytesPerSecond = 32000
+
+	// transcribeSecondsPerAudioSecond is the wall-clock budget allowed per
+	// second of recorded audio. faster-whisper "base" (int8) on CPU runs near
+	// real time but can be slower on a loaded or modest node, so we budget a
+	// generous multiple of the audio's own duration.
+	transcribeSecondsPerAudioSecond = 3
+
+	// transcribeMinRequestTimeout floors the per-request budget so tiny inputs
+	// (short rolling clips, model warm-up, scheduling jitter) always get a
+	// workable window even when the size-derived estimate is small.
+	transcribeMinRequestTimeout = 2 * time.Minute
+
+	// transcribeMaxRequestTimeout caps the per-request budget. At the
+	// transcribeSecondsPerAudioSecond multiple, a full-length recording at the
+	// defaultMeetingMaxDuration hard cap (4h) needs ~12h of budget, so this
+	// ceiling is sized to cover it while still bounding a corrupt or absurdly
+	// large file from wedging a worker slot indefinitely.
+	transcribeMaxRequestTimeout = 12 * time.Hour
+
+	// transcribeHealthTimeout bounds a single health-check GET. The readiness
+	// loop's own budgets (transcribeReadyTimeout / transcribeUnreachableTimeout)
+	// govern total wait; this just stops one poll from hanging if the sidecar
+	// accepts the connection but never answers.
+	transcribeHealthTimeout = 10 * time.Second
+)
 
 // TranscribeAudioHandler handles TRANSCRIBE_AUDIO jobs node-locally.
 //
@@ -73,11 +122,51 @@ func (h *TranscribeAudioHandler) serviceURL() string {
 	return defaultTranscribeServiceURL
 }
 
+// client returns the HTTP client used for both the health poll and the
+// transcribe POST. It deliberately carries NO fixed Timeout: the whole-request
+// budget is governed by a per-request context deadline sized to the input (see
+// requestTimeout / transcribeTimeoutForAudioBytes), so a long meeting's batch
+// pass is not capped by a one-size-fits-all client timeout while a short rolling
+// clip is not made to wait needlessly.
 func (h *TranscribeAudioHandler) client() *http.Client {
 	if h.HTTPClient != nil {
 		return h.HTTPClient
 	}
-	return &http.Client{Timeout: transcribeRequestTimeout}
+	return &http.Client{}
+}
+
+// transcribeTimeoutForAudioBytes maps an audio file's byte length to a
+// generous request timeout. It estimates the audio's real duration from the
+// byte count (uncompressed 16 kHz mono PCM WAV) and multiplies it by
+// transcribeSecondsPerAudioSecond, clamped to [min, max]. Pure and
+// table-testable; callers stat the file and pass its size.
+func transcribeTimeoutForAudioBytes(sizeBytes int64) time.Duration {
+	if sizeBytes <= 0 {
+		// Unknown/empty size: prefer the generous ceiling over under-timing,
+		// since a premature client timeout is the exact bug being fixed.
+		return transcribeMaxRequestTimeout
+	}
+	estSeconds := sizeBytes / transcribeBytesPerSecond
+	budget := time.Duration(estSeconds*transcribeSecondsPerAudioSecond) * time.Second
+	if budget < transcribeMinRequestTimeout {
+		return transcribeMinRequestTimeout
+	}
+	if budget > transcribeMaxRequestTimeout {
+		return transcribeMaxRequestTimeout
+	}
+	return budget
+}
+
+// requestTimeout sizes the transcribe request budget from the file at
+// validatedPath. On stat failure it returns the generous ceiling rather than a
+// small default: under-timing is precisely the failure mode being fixed, and a
+// missing file surfaces as a transcribe error anyway.
+func (h *TranscribeAudioHandler) requestTimeout(validatedPath string) time.Duration {
+	info, err := os.Stat(validatedPath)
+	if err != nil {
+		return transcribeMaxRequestTimeout
+	}
+	return transcribeTimeoutForAudioBytes(info.Size())
 }
 
 // Execute transcribes a workspace-local audio file via the whisper sidecar.
@@ -149,11 +238,21 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := h.client().Post(
-		h.serviceURL()+"/transcribe",
-		"application/json",
-		bytes.NewBuffer(reqBody),
-	)
+	// Size the whole-request budget from the audio's byte length so a long
+	// meeting's full-file transcription is not cut off mid-flight. The context
+	// governs the entire request including the body read below, so cancel only
+	// after Execute is done with the response.
+	reqTimeout := h.requestTimeout(validated)
+	reqCtx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.serviceURL()+"/transcribe", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build transcription request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to transcription service: %w", err)
 	}
@@ -173,7 +272,7 @@ func (h *TranscribeAudioHandler) waitForReady() error {
 	startTime := time.Now()
 
 	for {
-		resp, err := h.client().Get(healthURL)
+		resp, err := h.healthCheck(healthURL)
 		if err == nil {
 			ready := resp.StatusCode == http.StatusOK
 			resp.Body.Close()
@@ -195,6 +294,20 @@ func (h *TranscribeAudioHandler) waitForReady() error {
 		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("transcription service did not become ready within %v", transcribeReadyTimeout)
+}
+
+// healthCheck performs a single readiness GET bounded by transcribeHealthTimeout
+// so one poll cannot hang now that the shared client carries no fixed timeout.
+// A dead port still returns connection-refused immediately (before the
+// deadline), preserving the fast-fail path in waitForReady.
+func (h *TranscribeAudioHandler) healthCheck(healthURL string) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), transcribeHealthTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	return h.client().Do(req)
 }
 
 // isConnectionRefused reports whether err indicates nothing is listening on
