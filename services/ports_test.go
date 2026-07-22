@@ -203,7 +203,7 @@ func TestBonsaiHostPortRegistered(t *testing.T) {
 // is an embedded ServiceMap compose, so its .yml defers the host publish to
 // CITADEL_TTS_HOST_PORT and this registry must resolve it. The registry KEY is
 // "kokoro" (the implementation name / ServiceMap key), while the env var is
-// spelled for the generic engine (tts) -- the same key/env split as meeting.
+// spelled for the generic engine (tts): the same key/env split as meeting.
 func TestTTSHostPortRegistered(t *testing.T) {
 	got, ok := ServiceHostPorts["kokoro"]
 	if !ok || got != TTSHostPort {

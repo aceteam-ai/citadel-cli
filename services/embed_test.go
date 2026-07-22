@@ -222,7 +222,7 @@ func TestKokoroComposeContract(t *testing.T) {
 		t.Errorf("kokoro compose must defer its host port to a bare ${CITADEL_TTS_HOST_PORT} (no :?/:- guard, which breaks the loopback host-port parser)")
 	}
 	if !strings.Contains(content, "127.0.0.1:${CITADEL_TTS_HOST_PORT}:8080") {
-		t.Errorf("kokoro compose must bind loopback only (127.0.0.1) -- the service has no auth of its own")
+		t.Errorf("kokoro compose must bind loopback only (127.0.0.1); the service has no auth of its own")
 	}
 	// kokoro must NOT need aux build-context files (it is image-based).
 	if _, ok := ServiceAuxFiles["kokoro"]; ok {

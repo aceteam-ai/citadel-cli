@@ -13,10 +13,10 @@
 # engine:tts / tts:kokoro / model:kokoro-82m). The compose ALSO ships as a
 # citadel-services catalog module (services/kokoro); this embedded copy
 # self-contains the capability the same way transcribe/bonsai do. The two copies
-# can drift -- known_hashes only guards this embedded one.
+# can drift; known_hashes only guards this embedded one.
 #
 # Host port: the container serves :8080. citadel owns the host publish via
-# CITADEL_TTS_HOST_PORT (services/ports.go, 8211 -- the next free slot after
+# CITADEL_TTS_HOST_PORT (services/ports.go, 8211, the next free slot after
 # gotenberg's 8209 and bonsai's 8210). Unlike bonsai's `${VAR:?msg}` guard, the
 # loopback `127.0.0.1:` prefix means this port spec no longer starts with `${`,
 # so a `:?`/`:-` suffix would smear across the host-port test parser's colon

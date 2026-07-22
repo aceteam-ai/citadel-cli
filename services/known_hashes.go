@@ -64,6 +64,6 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"50132811ec60f1d628599cd0c971cb2732087ee11bca58a3bda1312a8ef13ff0": true,
 	},
 	"kokoro": {
-		"1f55d8d932042e8935444ab616ce4836a0dca478199c39d47ba8a015cbfac875": true,
+		"3ce764e232b286c75f776872bb3554e15b2e03b229863abce271324a815ab777": true,
 	},
 }

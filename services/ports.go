@@ -138,7 +138,7 @@ const (
 	// consumer is the co-located citadel worker).
 	//
 	// NOTE: the citadel-services kokoro module (README, service.yaml ports.host
-	// and health_check.port) still names 8210 for this service -- written before
+	// and health_check.port) still names 8210 for this service, written before
 	// bonsai claimed 8210 here. citadel-cli's registry is authoritative for the
 	// injected host port; aligning citadel-services to 8211 is a follow-up in
 	// that repo.

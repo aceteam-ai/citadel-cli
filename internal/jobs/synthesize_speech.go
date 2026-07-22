@@ -18,7 +18,7 @@ import (
 
 // synthesizeServiceURL is the local kokoro TTS sidecar base URL. The host port
 // is owned by citadel (services/ports.go, CITADEL_TTS_HOST_PORT) and reached
-// over loopback -- the compose publishes 127.0.0.1 ONLY, since the service has
+// over loopback: the compose publishes 127.0.0.1 ONLY, since the service has
 // no auth of its own and its sole consumer is this co-located worker. Built from
 // the registry constant rather than a literal so it tracks the port citadel
 // actually injects (the transcribe handler's hardcoded 8101 is the anti-pattern
@@ -41,7 +41,7 @@ const (
 	// synthesizeReadyTimeout bounds how long we wait for the kokoro sidecar to
 	// load its model (Kokoro-82M, ~350 MB) and report healthy. Model load is a
 	// one-time cost on first job; subsequent jobs hit a warm service. This budget
-	// only applies once the sidecar is actually answering connections -- see
+	// only applies once the sidecar is actually answering connections; see
 	// synthesizeUnreachableTimeout for the case where nothing is listening.
 	synthesizeReadyTimeout = 120 * time.Second
 
@@ -113,7 +113,7 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //     to opus (`format` accepted as an alias).
 //
 // Response JSON (this handler DEFINES the envelope; nothing on the aceteam side
-// parses it yet -- the fabric may also call the endpoint directly):
+// parses it yet; the fabric may also call the endpoint directly):
 //
 //	{
 //	  "encoding": "base64",          // the marker the coordinator checks
@@ -231,12 +231,12 @@ func (h *SynthesizeSpeechHandler) waitForReady() error {
 	for {
 		resp, err := h.healthCheck(healthURL)
 		if err == nil {
-			ready := resp.StatusCode == http.StatusOK
+			ready := synthesizeHealthReady(resp)
 			resp.Body.Close()
 			if ready {
 				return nil
 			}
-			// Reachable, just not ready yet (model still loading) -- fall through
+			// Reachable, just not ready yet (model still loading): fall through
 			// to the patient synthesizeReadyTimeout budget below.
 		} else if isConnectionRefused(err) && time.Since(startTime) >= synthesizeUnreachableTimeout {
 			return fmt.Errorf("TTS service unreachable at %s: %w", h.serviceURL(), err)
@@ -248,6 +248,30 @@ func (h *SynthesizeSpeechHandler) waitForReady() error {
 		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("TTS service did not become ready within %v", synthesizeReadyTimeout)
+}
+
+// synthesizeHealthReady reports whether a /health response means the kokoro
+// sidecar is actually ready to synthesize. Unlike the whisper sidecar (which
+// returns non-200 until its model loads), kokoro's /health ALWAYS returns 200
+// and carries readiness in the body: {"status":"up"|"loading","model_loaded":
+// true|false}. Gating on the status code alone would let a cold node POST before
+// Kokoro-82M has loaded, so parse model_loaded. A 200 whose body cannot be
+// parsed is treated as not-ready (fail closed) rather than assuming readiness.
+func synthesizeHealthReady(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return false
+	}
+	var health struct {
+		ModelLoaded bool `json:"model_loaded"`
+	}
+	if err := json.Unmarshal(body, &health); err != nil {
+		return false
+	}
+	return health.ModelLoaded
 }
 
 // healthCheck performs a single readiness GET bounded by synthesizeHealthTimeout.

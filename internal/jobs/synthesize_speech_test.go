@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,7 +36,8 @@ func TestSynthesizeSpeech_Success(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
 			return
 		}
 		if r.URL.Path == "/v1/audio/speech" {
@@ -132,7 +134,8 @@ func TestSynthesizeSpeech_Success(t *testing.T) {
 func TestSynthesizeSpeech_InputAlias(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -156,7 +159,8 @@ func TestSynthesizeSpeech_InputAlias(t *testing.T) {
 func TestSynthesizeSpeech_ServiceError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
 			return
 		}
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -174,6 +178,47 @@ func TestSynthesizeSpeech_ServiceError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for non-200 service response")
+	}
+}
+
+// TestSynthesizeSpeech_WaitForReady_LoadingBodyNotReady pins the cold-start
+// gate: kokoro's /health ALWAYS returns 200 and carries readiness in the body
+// (model_loaded), so a 200 with model_loaded:false must NOT count as ready. The
+// stub flips to loaded after a short delay; waitForReady must keep polling past
+// the first (loading) 200 and only return once the body says loaded.
+func TestSynthesizeSpeech_WaitForReady_LoadingBodyNotReady(t *testing.T) {
+	var mu sync.Mutex
+	loaded := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		isLoaded := loaded
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if isLoaded {
+			_, _ = w.Write([]byte(`{"status":"up","model_loaded":true}`))
+			return
+		}
+		// Always 200, but not ready yet: readiness is in the body, not the code.
+		_, _ = w.Write([]byte(`{"status":"loading","model_loaded":false}`))
+	}))
+	defer srv.Close()
+
+	go func() {
+		time.Sleep(2 * time.Second)
+		mu.Lock()
+		loaded = true
+		mu.Unlock()
+	}()
+
+	h := NewSynthesizeSpeechHandler()
+	h.ServiceURL = srv.URL
+
+	start := time.Now()
+	if err := h.waitForReady(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 2*time.Second {
+		t.Fatalf("waitForReady returned after %v; it must keep polling past the loading 200 until model_loaded is true", elapsed)
 	}
 }
 
