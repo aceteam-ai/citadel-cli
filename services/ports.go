@@ -179,6 +179,26 @@ func ManagedServiceHostPort(name string) (int, bool) {
 	return port, ok
 }
 
+// SGLangHostPort is sglang's native host port (services/compose/sglang.yml).
+// It never collided with anything, so it is not env-var-managed like the 8200
+// block; the constant exists so consumers (the heartbeat stats scraper,
+// internal/jobs/llm_inference.go) share one spelling instead of hardcoding
+// 30000.
+const SGLangHostPort = 30000
+
+// InferenceMetricsPorts maps the inference engines that expose a Prometheus
+// /metrics endpoint on their serving port to the host port citadel publishes
+// them on. This is the discovery source for the heartbeat stats scraper
+// (internal/pulse, citadel-cli#587): scrape targets come from this registry,
+// never from hardcoded literals. Engines without a Prometheus endpoint
+// (ollama, llamacpp, lmstudio) are deliberately absent.
+func InferenceMetricsPorts() map[string]int {
+	return map[string]int{
+		"vllm":   VLLMHostPort,
+		"sglang": SGLangHostPort,
+	}
+}
+
 // Citadel's own listeners. These are NOT module ports; they belong to
 // citadel-internal processes and must never be handed to a module compose file
 // or dynamically allocated to an app.
