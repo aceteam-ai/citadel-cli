@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/pulse"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/redis/go-redis/v9"
 )
@@ -40,6 +41,11 @@ type StatusMessage struct {
 	DeviceCode      string             `json:"deviceCode,omitempty"`
 	Status          *status.NodeStatus `json:"status"`
 	Permissions     *PermissionState   `json:"permissions,omitempty"`
+	// Stats is the compact Fabric Pulse block (GPU + inference internals,
+	// citadel-cli#587). Optional and versioned: legacy backends ignore it,
+	// legacy nodes omit it. Read from the pulse collector's cache via
+	// SetStatsProvider — never collected inline on the heartbeat path.
+	Stats *pulse.StatsBlock `json:"stats,omitempty"`
 }
 
 // PermissionState mirrors config.Permissions for the heartbeat payload.
@@ -87,6 +93,19 @@ type RedisPublisher struct {
 	// successful publish, driving the config-gated auto-stop reconciler off the
 	// heartbeat's existing collection (citadel #416). Optional; nil by default.
 	onStatus func(*status.NodeStatus)
+
+	// statsFn, when set, returns the latest cached Fabric Pulse stats block
+	// (citadel-cli#587). It is a cache read — it must never block or error —
+	// and may return nil (no stats field on that heartbeat). Optional.
+	statsFn func() *pulse.StatsBlock
+}
+
+// SetStatsProvider registers the Fabric Pulse cached-stats reader
+// (pulse.Collector.Latest). The heartbeat attaches whatever the cache holds;
+// it never triggers collection itself, so a wedged collector degrades to a
+// heartbeat without stats, not a late heartbeat.
+func (p *RedisPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
+	p.statsFn = fn
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
@@ -262,6 +281,9 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		DeviceCode:      deviceCode,
 		Status:          nodeStatus,
 		Permissions:     p.permissions,
+	}
+	if p.statsFn != nil {
+		msg.Stats = p.statsFn()
 	}
 
 	// Marshal to JSON

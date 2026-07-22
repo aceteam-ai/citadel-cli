@@ -288,14 +288,14 @@ func (h *LLMInferenceHandler) waitForVLLMReady(ctx context.Context) error {
 }
 
 // executeSGLang handles inference via SGLang's OpenAI-compatible API.
-// SGLang runs on port 30000 and exposes the same /v1/completions endpoint as vLLM.
+// SGLang runs on services.SGLangHostPort and exposes the same /v1/completions endpoint as vLLM.
 func (h *LLMInferenceHandler) executeSGLang(ctx context.Context, client *redisclient.Client, jobID, rayID string, payload *LLMInferencePayload) error {
 	// Wait for SGLang to be ready
 	if err := h.waitForSGLangReady(ctx); err != nil {
 		return err
 	}
 
-	sglangURL := "http://localhost:30000/v1/completions"
+	sglangURL := fmt.Sprintf("http://localhost:%d/v1/completions", services.SGLangHostPort)
 
 	reqPayload := map[string]any{
 		"model":       payload.Model,
@@ -340,7 +340,7 @@ func (h *LLMInferenceHandler) executeSGLang(ctx context.Context, client *rediscl
 }
 
 func (h *LLMInferenceHandler) waitForSGLangReady(ctx context.Context) error {
-	healthURL := "http://localhost:30000/health"
+	healthURL := fmt.Sprintf("http://localhost:%d/health", services.SGLangHostPort)
 	maxWait := 60 * time.Second
 	pollInterval := 1 * time.Second
 	startTime := time.Now()

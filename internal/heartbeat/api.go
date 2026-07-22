@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/pulse"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
@@ -57,6 +58,19 @@ type APIPublisher struct {
 	// that was just published without triggering a second (expensive) collection
 	// pass on an already-loaded node. Optional; nil by default. See citadel #416.
 	onStatus func(*status.NodeStatus)
+
+	// statsFn, when set, returns the latest cached Fabric Pulse stats block
+	// (citadel-cli#587). It is a cache read — it must never block or error —
+	// and may return nil (no stats field on that heartbeat). Optional.
+	statsFn func() *pulse.StatsBlock
+}
+
+// SetStatsProvider registers the Fabric Pulse cached-stats reader
+// (pulse.Collector.Latest). The heartbeat attaches whatever the cache holds;
+// it never triggers collection itself, so a wedged collector degrades to a
+// heartbeat without stats, not a late heartbeat.
+func (p *APIPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
+	p.statsFn = fn
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
@@ -208,6 +222,9 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		HeadscaleNodeID: p.headscaleNodeID,
 		Status:          nodeStatus,
 		Permissions:     p.permissions,
+	}
+	if p.statsFn != nil {
+		msg.Stats = p.statsFn()
 	}
 
 	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)

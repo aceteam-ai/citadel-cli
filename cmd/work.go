@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
+	"github.com/aceteam-ai/citadel-cli/internal/pulse"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
@@ -113,6 +114,11 @@ var (
 	// Auto-update (periodic self-update) flags
 	workAutoUpdate         bool
 	workAutoUpdateInterval string
+
+	// Heartbeat stats (Fabric Pulse, citadel-cli#587) interval flag. The
+	// feature itself is ON by default with the CITADEL_HEARTBEAT_STATS env
+	// kill switch (see internal/pulse).
+	workHeartbeatStatsInterval string
 
 	// Capability detection flags
 	workCapabilities string
@@ -1435,6 +1441,23 @@ func runWork(cmd *cobra.Command, args []string) {
 		// stats/nvidia-smi sweep). nil when the operator has not opted in.
 		autoStop := newAutoStopReconciler()
 
+		// Fabric Pulse stats collector (citadel-cli#587): GPU + inference-engine
+		// internals scraped node-locally on a short interval into a cached block
+		// the heartbeat attaches as the optional "stats" field. Runs on its own
+		// goroutine; the heartbeat only reads the cache and never blocks on
+		// collection. ON by default; CITADEL_HEARTBEAT_STATS=false is the kill
+		// switch.
+		var pulseStats *pulse.Collector
+		if pulse.Disabled() {
+			fmt.Printf("   - Heartbeat stats: DISABLED (%s)\n", pulse.EnvVar)
+		} else {
+			pulseStats = pulse.NewCollector(pulse.CollectorConfig{
+				Interval: pulse.ResolveInterval(workHeartbeatStatsInterval),
+			})
+			go pulseStats.Run(ctx)
+			fmt.Printf("   - Heartbeat stats: GPU + inference metrics every %s\n", pulseStats.Interval())
+		}
+
 		if useAPIMode && apiSource != nil {
 			// API mode: use secure API publisher
 			// Get org ID from device config (saved during init)
@@ -1519,6 +1542,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 					}
+					if pulseStats != nil {
+						apiPublisher.SetStatsProvider(pulseStats.Latest)
+					}
 					go func() {
 						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
 						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
@@ -1551,6 +1577,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				redisPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
 				if autoStop != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+				}
+				if pulseStats != nil {
+					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
 				go func() {
 					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
@@ -2662,6 +2691,10 @@ func init() {
 	// Auto-update (periodic self-update) flags
 	workCmd.Flags().BoolVar(&workAutoUpdate, "auto-update", false, "Periodically check for and install newer releases (or set CITADEL_AUTO_UPDATE=true)")
 	workCmd.Flags().StringVar(&workAutoUpdateInterval, "auto-update-interval", "", "Interval between auto-update checks, e.g. 1h, 30m (default 1h; or set CITADEL_AUTO_UPDATE_INTERVAL)")
+
+	// Heartbeat stats (Fabric Pulse) flags. Collection is on by default; the
+	// kill switch is CITADEL_HEARTBEAT_STATS=false.
+	workCmd.Flags().StringVar(&workHeartbeatStatsInterval, "heartbeat-stats-interval", "", "Interval between GPU/inference stats collections for the heartbeat stats block, e.g. 10s, 30s (default 10s; or set CITADEL_HEARTBEAT_STATS_INTERVAL; disable stats with CITADEL_HEARTBEAT_STATS=false)")
 
 	// Capability detection flags
 	workCmd.Flags().StringVar(&workCapabilities, "capabilities", "", "Additional comma-separated capability tags (e.g., gpu:rtx4090,llm:llama3)")

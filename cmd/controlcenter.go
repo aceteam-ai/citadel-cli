@@ -30,6 +30,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
+	"github.com/aceteam-ai/citadel-cli/internal/pulse"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/teamchat"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
@@ -1916,6 +1917,21 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				}, collector); err == nil {
 					// Include current permissions in heartbeat
 					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+
+					// Fabric Pulse stats collector (citadel-cli#587), same wiring
+					// as runWork: cached GPU + inference internals attached to
+					// the heartbeat as the optional "stats" block. Started only
+					// when this control center is the node's heartbeat publisher
+					// (workerHeld is false here), so a node never runs two
+					// collectors. CITADEL_HEARTBEAT_STATS=false is the kill
+					// switch.
+					if !pulse.Disabled() {
+						pulseStats := pulse.NewCollector(pulse.CollectorConfig{
+							Interval: pulse.ResolveInterval(""),
+						})
+						go pulseStats.Run(ctx)
+						apiPublisher.SetStatsProvider(pulseStats.Latest)
+					}
 					go func() {
 						activity("info", "Heartbeat publishing started")
 
