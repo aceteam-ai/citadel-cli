@@ -207,6 +207,15 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// it would leave the backend's node-resource pull timing out on nodes
 		// without a configured workspace.
 		NewLegacyHandlerAdapter(JobTypeResourceSnapshot, &jobs.ResourceSnapshotHandler{}),
+		// Node-local speech synthesis (kokoro TTS sidecar, aceteam#6104). The
+		// synthesis counterpart to TRANSCRIBE_AUDIO, but registered
+		// UNCONDITIONALLY like the other inference handlers: it takes text inline
+		// and returns audio inline (base64), touching no workspace file, so
+		// gating it behind WorkspaceDir would needlessly bar workspace-less nodes
+		// from TTS. Nodes that don't run the kokoro sidecar simply never receive
+		// SYNTHESIZE_SPEECH jobs (they only land on nodes carrying the engine:tts
+		// tag).
+		NewLegacyHandlerAdapter(JobTypeSynthesizeSpeech, jobs.NewSynthesizeSpeechHandler()),
 		// Turn delivery to a payload-launched BYOC instance (aceteam#5241).
 		// Registered unconditionally: it resolves the target from its own
 		// on-disk instance store (~/.citadel/instances/state.json, shared with

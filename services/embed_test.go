@@ -182,6 +182,59 @@ func TestWriteAuxFilesMaterializesBonsaiDockerfile(t *testing.T) {
 	}
 }
 
+// TestKokoroComposeRegistered ensures the kokoro TTS service is in the
+// ServiceMap so `citadel run --service kokoro`, the manifest, and SERVICE_START
+// can find it (aceteam#6104).
+func TestKokoroComposeRegistered(t *testing.T) {
+	if _, ok := ServiceMap["kokoro"]; !ok {
+		t.Fatal("kokoro not found in ServiceMap")
+	}
+	found := false
+	for _, s := range GetAvailableServices() {
+		if s == "kokoro" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("GetAvailableServices() does not include kokoro")
+	}
+}
+
+// TestKokoroComposeContract verifies the embedded kokoro compose satisfies its
+// contract: it uses the prebuilt image (no build context to materialize, unlike
+// bonsai), defers its host publish to the citadel-owned CITADEL_TTS_HOST_PORT,
+// and binds loopback only (the service has no auth of its own). The loopback
+// prefix means the host token must NOT carry bonsai's `${VAR:?msg}` guard, since
+// that smears across the host-port test parser's colon split.
+func TestKokoroComposeContract(t *testing.T) {
+	content, ok := ServiceMap["kokoro"]
+	if !ok {
+		t.Fatal("kokoro not found in ServiceMap")
+	}
+	if !strings.Contains(content, "ghcr.io/aceteam-ai/kokoro-service") {
+		t.Errorf("kokoro compose should use the prebuilt kokoro-service image")
+	}
+	if strings.Contains(content, "build:") {
+		t.Errorf("kokoro compose should NOT declare a build: section (it uses a prebuilt image)")
+	}
+	if !strings.Contains(content, "${CITADEL_TTS_HOST_PORT}") {
+		t.Errorf("kokoro compose must defer its host port to a bare ${CITADEL_TTS_HOST_PORT} (no :?/:- guard, which breaks the loopback host-port parser)")
+	}
+	if !strings.Contains(content, "127.0.0.1:${CITADEL_TTS_HOST_PORT}:8080") {
+		t.Errorf("kokoro compose must bind loopback only (127.0.0.1); the service has no auth of its own")
+	}
+	// kokoro must NOT need aux build-context files (it is image-based).
+	if _, ok := ServiceAuxFiles["kokoro"]; ok {
+		t.Errorf("ServiceAuxFiles should not contain kokoro; it uses a prebuilt image, not a build context")
+	}
+}
+
+// NOTE: the embedded kokoro compose publishes exactly the citadel-assigned host
+// port (services.TTSHostPort); that registry-vs-compose agreement is proven by
+// internal/apps/hostport_collision_test.go, which resolves the loopback
+// ${CITADEL_TTS_HOST_PORT} publish against the registry and cross-checks it.
+
 // composeHostPorts returns the host-side ports declared in a compose file's
 // `ports:` list entries ("HOST:CONTAINER"). Pure parse (no Docker) so the
 // host-port collision assertions run in ordinary CI.
@@ -204,6 +257,7 @@ func composeHostPorts(t *testing.T, composeYAML string) []int {
 		EnvExtractionHostPort: ExtractionHostPort,
 		EnvDiffusersHostPort:  DiffusersHostPort,
 		EnvBonsaiHostPort:     BonsaiHostPort,
+		EnvTTSHostPort:        TTSHostPort,
 	}
 	var hosts []int
 	for _, svc := range doc.Services {

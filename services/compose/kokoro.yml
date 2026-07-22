@@ -1,0 +1,59 @@
+# services/compose/kokoro.yml
+#
+# Serves Kokoro-82M (Apache-2.0) text-to-speech via an OpenAI-compatible HTTP
+# API (POST /v1/audio/speech). This is the SYNTHESIS counterpart to the whisper
+# transcribe sidecar (services/compose/transcribe.yml): transcribe backs the
+# fabric `transcribe` engine, kokoro backs the fabric `tts` engine. The node-side
+# handler is internal/jobs/synthesize_speech.go (SYNTHESIZE_SPEECH), the
+# symmetric analog of TranscribeAudioHandler.
+#
+# The generic engine the node advertises for routing is `tts`; this embedded
+# service is named for its implementation (kokoro), the same split the
+# citadel-services catalog module uses (module name kokoro, node_tags
+# engine:tts / tts:kokoro / model:kokoro-82m). The compose ALSO ships as a
+# citadel-services catalog module (services/kokoro); this embedded copy
+# self-contains the capability the same way transcribe/bonsai do. The two copies
+# can drift; known_hashes only guards this embedded one.
+#
+# Host port: the container serves :8080. citadel owns the host publish via
+# CITADEL_TTS_HOST_PORT (services/ports.go, 8211, the next free slot after
+# gotenberg's 8209 and bonsai's 8210). Unlike bonsai's `${VAR:?msg}` guard, the
+# loopback `127.0.0.1:` prefix means this port spec no longer starts with `${`,
+# so a `:?`/`:-` suffix would smear across the host-port test parser's colon
+# split; the bare `${CITADEL_TTS_HOST_PORT}` is deliberate. citadel ALWAYS
+# injects the var (services.HostPortEnv) at every `docker compose up` site, so it
+# resolves; do not add a default/guard back.
+#
+# Loopback-only publish (127.0.0.1), deliberately: the only consumer is the
+# co-located citadel worker dispatching synthesis on this same node, and the
+# service has no auth of its own, so it must not be reachable off-host. The
+# handler's health probe always dials 127.0.0.1, so this does not affect probing.
+services:
+  kokoro:
+    image: ghcr.io/aceteam-ai/kokoro-service:latest
+    container_name: citadel-kokoro
+    ports:
+      - "127.0.0.1:${CITADEL_TTS_HOST_PORT}:8080"
+    environment:
+      - PORT=8080
+      # Inference device: auto (GPU when present, else CPU), cpu, or cuda.
+      # Kokoro-82M is small and roughly real-time on CPU, so no GPU is required.
+      - KOKORO_DEVICE=${KOKORO_DEVICE:-auto}
+      # Concurrent synthesis slots (advertised for fabric backpressure); requests
+      # beyond this queue rather than OOMing the node.
+      - TTS_SLOTS=${TTS_SLOTS:-2}
+      # Max characters per synthesized item; over-cap requests get a 413.
+      - KOKORO_MAX_INPUT_CHARS=${KOKORO_MAX_INPUT_CHARS:-5000}
+      - KOKORO_DEFAULT_VOICE=${KOKORO_DEFAULT_VOICE:-am_michael}
+      - KOKORO_DEFAULT_FORMAT=${KOKORO_DEFAULT_FORMAT:-opus}
+      # LRU cap (GB) for the node-local content-addressed audio cache.
+      - KOKORO_CACHE_MAX_GB=${KOKORO_CACHE_MAX_GB:-5}
+      - KOKORO_OPUS_BITRATE=${KOKORO_OPUS_BITRATE:-32k}
+      - KOKORO_MP3_BITRATE=${KOKORO_MP3_BITRATE:-64k}
+    volumes:
+      # HuggingFace cache: the Kokoro-82M weights + voices download here once and
+      # persist across restarts (shared with other HF-based services).
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+      # Content-addressed audio cache (node-local, LRU-capped).
+      - ~/citadel-cache/kokoro:/data
+    restart: unless-stopped
