@@ -197,3 +197,45 @@ func TestBonsaiHostPortRegistered(t *testing.T) {
 		t.Errorf("HostPortEnv() did not emit %q", want)
 	}
 }
+
+// TestTTSHostPortRegistered pins the kokoro TTS service's host port (Kokoro-82M,
+// the synthesis counterpart to the whisper transcribe sidecar). Like bonsai it
+// is an embedded ServiceMap compose, so its .yml defers the host publish to
+// CITADEL_TTS_HOST_PORT and this registry must resolve it. The registry KEY is
+// "kokoro" (the implementation name / ServiceMap key), while the env var is
+// spelled for the generic engine (tts) -- the same key/env split as meeting.
+func TestTTSHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["kokoro"]
+	if !ok || got != TTSHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "kokoro", got, ok, TTSHostPort)
+	}
+	if _, ok := serviceHostPortEnv["kokoro"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "kokoro")
+	}
+	// 8210 is bonsai's; kokoro must be the distinct next slot, not a re-use.
+	if TTSHostPort == BonsaiHostPort {
+		t.Errorf("TTSHostPort %d collides with BonsaiHostPort; 8210 is taken, kokoro must be the next free slot", TTSHostPort)
+	}
+	if TTSHostPort >= AppsPortRangeStart && TTSHostPort <= AppsPortRangeEnd {
+		t.Errorf("kokoro host port %d sits inside the apps auto-allocation range %d-%d", TTSHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[TTSHostPort]; taken {
+		t.Errorf("kokoro host port %d collides with reserved citadel port %q", TTSHostPort, name)
+	}
+	for svc, port := range ServiceHostPorts {
+		if svc != "kokoro" && port == TTSHostPort {
+			t.Errorf("kokoro host port %d collides with managed service %q", TTSHostPort, svc)
+		}
+	}
+	// HostPortEnv must emit the tts var so its compose resolves.
+	want := EnvTTSHostPort + "=8211"
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}

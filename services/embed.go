@@ -36,6 +36,9 @@ var DiffusersCompose string
 //go:embed compose/bonsai.yml
 var BonsaiCompose string
 
+//go:embed compose/kokoro.yml
+var KokoroCompose string
+
 // BonsaiDockerfile is the build-context Dockerfile for the bonsai service. It is
 // materialized to <config>/services/bonsai/Dockerfile (see WriteAuxFiles) so the
 // compose `build.context: ./bonsai` resolves on the node.
@@ -54,6 +57,7 @@ var ServiceMap = map[string]string{
 	"transcribe": TranscribeCompose,
 	"diffusers":  DiffusersCompose,
 	"bonsai":     BonsaiCompose,
+	"kokoro":     KokoroCompose,
 }
 
 // ServiceAuxFiles maps a service name to auxiliary build-context files

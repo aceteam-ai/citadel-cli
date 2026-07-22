@@ -138,6 +138,7 @@ const (
 	JobTypeVNCActions         = "VNC_ACTIONS"          // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
 	JobTypeCobrowse           = "COBROWSE"             // Human-in-the-loop co-browse over CDP (#4079)
 	JobTypeTranscribeAudio    = "TRANSCRIBE_AUDIO"     // Transcribe workspace audio node-locally via the faster-whisper sidecar
+	JobTypeSynthesizeSpeech   = "SYNTHESIZE_SPEECH"    // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
 	JobTypeAgentUpdate        = "AGENT_UPDATE"         // Remotely update + restart this node's own citadel agent (aceteam#4427)
 	JobTypeWhatsAppProvision  = "WHATSAPP_PROVISION"   // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
 	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
@@ -200,6 +201,7 @@ var allKnownJobTypes = []string{
 	JobTypeVNCActions,
 	JobTypeCobrowse,
 	JobTypeTranscribeAudio,
+	JobTypeSynthesizeSpeech,
 	JobTypeAgentUpdate,
 	JobTypeWhatsAppProvision,
 	JobTypeResourceSnapshot,

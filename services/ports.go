@@ -64,6 +64,15 @@ const (
 	// bonsai.yml), so its compose defers the host publish to this var exactly
 	// like llamacpp/vllm.
 	EnvBonsaiHostPort = "CITADEL_BONSAI_HOST_PORT"
+	// EnvTTSHostPort carries the host port for the kokoro text-to-speech service
+	// (Kokoro-82M via an OpenAI-compatible HTTP API). Like bonsai it is an
+	// EMBEDDED ServiceMap compose (services/compose/kokoro.yml), so its compose
+	// defers the host publish to this var. The var is spelled CITADEL_TTS_HOST_PORT
+	// (the generic engine name, `tts`) rather than CITADEL_KOKORO_HOST_PORT because
+	// the citadel-services catalog module's compose already reads it under that
+	// name; the registry KEY stays "kokoro" (the implementation name), mirroring
+	// meeting's key/env-var split (key "meeting" / EnvMeetingdHostPort).
+	EnvTTSHostPort = "CITADEL_TTS_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -120,6 +129,20 @@ const (
 	// embedded ServiceMap compose, so its container serves on :8080 and this is
 	// the HOST publish.
 	BonsaiHostPort = 8210
+	// kokoro: Kokoro-82M text-to-speech served over an OpenAI-compatible HTTP API
+	// (services/compose/kokoro.yml), the synthesis counterpart to the whisper
+	// transcribe sidecar. Next free slot in the 8200 block after bonsai's 8210
+	// (8205 stays earmarked for Hermes/OpenClaw). It is an embedded ServiceMap
+	// compose, so its container serves on :8080 and this is the HOST publish,
+	// bound to 127.0.0.1 only (the service has no auth of its own and its sole
+	// consumer is the co-located citadel worker).
+	//
+	// NOTE: the citadel-services kokoro module (README, service.yaml ports.host
+	// and health_check.port) still names 8210 for this service -- written before
+	// bonsai claimed 8210 here. citadel-cli's registry is authoritative for the
+	// injected host port; aligning citadel-services to 8211 is a follow-up in
+	// that repo.
+	TTSHostPort = 8211
 )
 
 // ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
@@ -139,6 +162,7 @@ var ServiceHostPorts = map[string]int{
 	"meeting-cdp": MeetingCDPHostPort,
 	"gotenberg":   GotenbergHostPort,
 	"bonsai":      BonsaiHostPort,
+	"kokoro":      TTSHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -153,6 +177,7 @@ var serviceHostPortEnv = map[string]string{
 	"meeting-cdp": EnvMeetingCDPHostPort,
 	"gotenberg":   EnvGotenbergHostPort,
 	"bonsai":      EnvBonsaiHostPort,
+	"kokoro":      EnvTTSHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
