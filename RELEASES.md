@@ -1301,3 +1301,25 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.83.0 release
 
 
+---
+
+## v2.85.0 — 2026-07-22
+
+| Metric | Value |
+|--------|-------|
+| Commits | 8 |
+| Files changed | 60 |
+| Lines added | +6095 |
+
+**Changes:**
+
+  - Add SYNTHESIZE_SPEECH handler and kokoro TTS service (#584)
+  - feat(heartbeat): compact stats block with node-local inference + GPU metrics for Fabric Pulse (#587) (#588)
+  - feat(cli): `citadel connect <name|ip>` — mesh-native remote shell (#582) (#586)
+  - fix(work): API-mode GPU nodes subscribe to gpu-general (#6315) (#583)
+  - feat(preemption): service preemption + node pinning via pinned_services (#577) (#580)
+  - feat(mesh): discover models on other nodes over the mesh; scaffold remote chat (#576) (#579)
+  - feat(chat): add `citadel chat` to chat with the model hosted locally on this node (#578)
+  - fix(meeting): transcribe timeout scales for long meetings (43-min WAV timed out) (#563)
+
+
