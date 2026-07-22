@@ -363,6 +363,31 @@ func ResolveQueues(caps []Capability, baseQueue string) []string {
 	return queues
 }
 
+// GPUInferenceQueues returns the GPU inference queues a node should consume when
+// it has at least one GPU: the gpu-general base queue plus every gpu/engine/vram
+// capability tag queue. It returns nil for a node with no GPU, which must NOT
+// join the gpu-general base queue.
+//
+// This lets an API-mode worker self-subscribe to the GPU queues from its own
+// locally-detected hardware. In API mode the server's worker-config currently
+// returns only the CPU base queue, so gateway inference dispatched to
+// jobs:v1:gpu-general (+ gpu tag queues) with a target_node would otherwise never
+// reach a GPU node (issue #6315).
+func GPUInferenceQueues(caps *NodeCapabilities) []string {
+	if caps == nil || caps.GPU == nil || len(caps.GPU.Devices) == 0 {
+		return nil
+	}
+	tagCaps := make([]Capability, 0, len(caps.Tags))
+	for _, tag := range caps.Tags {
+		category := tag
+		if idx := strings.Index(tag, ":"); idx > 0 {
+			category = tag[:idx]
+		}
+		tagCaps = append(tagCaps, Capability{Tag: tag, Category: category})
+	}
+	return ResolveQueues(tagCaps, "jobs:v1:gpu-general")
+}
+
 func detectGPU() []Capability {
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()

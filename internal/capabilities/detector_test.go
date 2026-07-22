@@ -131,6 +131,42 @@ func TestResolveQueues(t *testing.T) {
 	}
 }
 
+func TestGPUInferenceQueues(t *testing.T) {
+	// GPU node: gets gpu-general base + gpu/vram tag queues, never cpu-general.
+	gpu := &NodeCapabilities{
+		GPU:  &GPUCapabilities{Count: 1, Devices: []GPUDevice{{Name: "NVIDIA GeForce RTX 3090", Tag: "rtx3090", VRAMTag: "24gb"}}},
+		Tags: []string{"gpu:rtx3090", "vram:24gb", "cpu:general"},
+	}
+	queues := GPUInferenceQueues(gpu)
+	got := make(map[string]bool, len(queues))
+	for _, q := range queues {
+		got[q] = true
+	}
+	if !got["jobs:v1:gpu-general"] {
+		t.Errorf("GPU node must consume jobs:v1:gpu-general; got %v", queues)
+	}
+	if !got["jobs:v1:tag:gpu:rtx3090"] {
+		t.Errorf("GPU node must consume its gpu tag queue; got %v", queues)
+	}
+	for _, q := range queues {
+		if q == "jobs:v1:cpu-general" || q == "jobs:v1:tag:cpu:general" {
+			t.Errorf("cpu tag must not produce a queue; got %v", queues)
+		}
+	}
+
+	// No-GPU node: must NOT join the gpu-general base queue.
+	if q := GPUInferenceQueues(&NodeCapabilities{Tags: []string{"cpu:general"}}); q != nil {
+		t.Errorf("CPU-only node must not subscribe to any GPU queue; got %v", q)
+	}
+	// GPU present but zero devices, and nil caps: also nil.
+	if q := GPUInferenceQueues(&NodeCapabilities{GPU: &GPUCapabilities{}}); q != nil {
+		t.Errorf("GPU with no devices must return nil; got %v", q)
+	}
+	if q := GPUInferenceQueues(nil); q != nil {
+		t.Errorf("nil caps must return nil; got %v", q)
+	}
+}
+
 func TestTagsHelper(t *testing.T) {
 	caps := []Capability{
 		{Tag: "gpu:rtx4090"},

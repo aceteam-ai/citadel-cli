@@ -667,6 +667,18 @@ func runWork(cmd *cobra.Command, args []string) {
 			Debug("shell queue: %s", shellQueue)
 		}
 
+		// GPU nodes must also consume the GPU inference queues. In API mode the
+		// server's worker-config returns only the CPU base queue today (#6315),
+		// so gateway inference dispatched to jobs:v1:gpu-general (+ gpu tag
+		// queues) with a target_node would never reach this node. Self-subscribe
+		// from locally-detected GPU capabilities, mirroring direct-Redis mode.
+		// Additive to whatever worker-config returned; a CPU-only node adds
+		// nothing (GPUInferenceQueues returns nil without a GPU).
+		if gpuQueues := capabilities.GPUInferenceQueues(nodeCaps); len(gpuQueues) > 0 {
+			apiQueueNames = appendUniqueQueues(apiQueueNames, gpuQueues)
+			Debug("gpu node: also subscribing to GPU inference queues %v", gpuQueues)
+		}
+
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
 			BaseURL:       apiBaseURL,
 			Token:         deviceConfig.DeviceAPIToken,
@@ -2187,6 +2199,24 @@ func stopManagedServices(started []startedService) {
 // Every online worker in the org consumes it, so any of them may claim a job.
 func shellQueueName(orgID string) string {
 	return fmt.Sprintf("jobs:v1:shell:org_%s", orgID)
+}
+
+// appendUniqueQueues appends each queue in extra to base, skipping any already
+// present, and returns the combined slice preserving order. Used to merge the
+// GPU inference queues into the API-mode queue list without duplicating whatever
+// worker-config already returned.
+func appendUniqueQueues(base, extra []string) []string {
+	seen := make(map[string]bool, len(base))
+	for _, q := range base {
+		seen[q] = true
+	}
+	for _, q := range extra {
+		if !seen[q] {
+			seen[q] = true
+			base = append(base, q)
+		}
+	}
+	return base
 }
 
 // meetingQueueName returns the org-scoped meeting-notetaker tag queue name.
