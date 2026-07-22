@@ -16,44 +16,69 @@ import (
 )
 
 var (
-	connectTimeout int
+	connectTimeout      int
+	connectTerminalPort int
+	connectToken        string
 )
 
 var connectCmd = &cobra.Command{
-	Use:   "connect [peer:port]",
-	Short: "Connect to a service on another node",
-	Long: `Establishes a raw TCP connection to a service on another node and pipes
-stdin/stdout to it.
+	Use:   "connect [peer|peer:port]",
+	Short: "Open a remote shell on another node, or pipe a raw TCP service",
+	Long: `Two modes, selected by whether you give a port:
 
-This is useful for:
-  - Testing connectivity to services
-  - Piping data through the network
-  - Using as SSH ProxyCommand (used internally by 'citadel ssh')
+  citadel connect <node-name | ip>          Open an interactive remote shell
+  citadel connect <node-name | ip>:<port>   Pipe a raw TCP service (stdin/stdout)
 
-PEER IDENTIFICATION:
-  You can specify the peer in multiple ways:
-  - By hostname:  citadel connect gpu-node-1:5432
-  - By IP:        citadel connect 100.64.0.25:5432
-  - Interactive:  citadel connect  (prompts for peer and port)
+REMOTE SHELL (no port):
+  Drops you into an interactive shell on the target node over the AceTeam
+  Network mesh — collapsing the old multi-hop SSH chain
+  (ssh a -> ssh b -> tmux) into a single command from any machine on the mesh.
+  No host SSH config, no '.local' mDNS, no manual hops.
+
+  The target node must be running its terminal endpoint, which 'citadel work'
+  starts by default (disable with --no-terminal). Authentication uses a terminal
+  token: pass --token or set CITADEL_TERMINAL_TOKEN.
+
+RAW TCP (with port):
+  Establishes a raw TCP connection to a service on the target and pipes
+  stdin/stdout to it. Used internally by 'citadel ssh' as a ProxyCommand,
+  and useful for testing connectivity or piping data through the network.
+
+PEER IDENTIFICATION (both modes):
+  - By hostname:  citadel connect gpu-node-1
+  - By IP:        citadel connect 100.64.0.25
+  - Interactive:  citadel connect  (prompts for peer and port, raw TCP)
 
 The connection uses the tsnet userspace network, so it can reach peers
 that system networking cannot.`,
-	Example: `  # Interactive mode - select peer and port
-  citadel connect
+	Example: `  # Open an interactive remote shell (by name or mesh IP)
+  citadel connect gpu-node-1
+  citadel connect 100.64.0.25
 
-  # Connect to a PostgreSQL server
+  # Remote shell with an explicit terminal token / port
+  citadel connect gpu-node-1 --token tok_... --terminal-port 7860
+
+  # Raw TCP: connect to a PostgreSQL server
   citadel connect gpu-node-1:5432
 
-  # Connect to Redis
-  citadel connect gpu-node-1:6379
-
-  # Connect by IP address
+  # Raw TCP by IP address
   citadel connect 100.64.0.25:11434
 
-  # Connect with timeout
-  citadel connect gpu-node-1:11434 --timeout 30`,
+  # Interactive mode - select peer and port (raw TCP)
+  citadel connect`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		// Remote-shell mode: a single bare target (name or IP) with no :port.
+		// A port (host:port) always routes to the existing raw-TCP path, which
+		// keeps 'citadel ssh's ProxyCommand (always ip:port) unchanged.
+		if len(args) == 1 && connectIsShellTarget(args[0]) {
+			if err := runRemoteShell(args[0]); err != nil {
+				badColor.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
 		// Ensure network connection
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := ensureNetworkConnected(ctx); err != nil {
@@ -233,7 +258,28 @@ func setupConnectInteractive() (peer string, port string, err error) {
 	return peer, port, nil
 }
 
+// connectIsShellTarget reports whether a single positional argument should be
+// treated as a remote-shell target (a bare node name or mesh/LAN IP) rather
+// than a raw-TCP "host:port". The ordering matters because tsnet also assigns
+// IPv6 addresses (all-colons), which must not be misread as host:port:
+//
+//  1. A valid IP (v4 or v6) -> shell.
+//  2. Otherwise, a well-formed host:port -> raw TCP (unchanged).
+//  3. Otherwise (bare name, no port) -> shell.
+func connectIsShellTarget(arg string) bool {
+	if isValidIP(arg) {
+		return true
+	}
+	_, port, err := parsePeerPort(arg)
+	if err != nil || port == "" {
+		return true
+	}
+	return false
+}
+
 func init() {
 	rootCmd.AddCommand(connectCmd)
-	connectCmd.Flags().IntVar(&connectTimeout, "timeout", 0, "Connection timeout in seconds (0 = no timeout)")
+	connectCmd.Flags().IntVar(&connectTimeout, "timeout", 0, "Connection timeout in seconds (0 = no timeout, raw-TCP mode)")
+	connectCmd.Flags().IntVar(&connectTerminalPort, "terminal-port", 7860, "Terminal endpoint port on the target (remote-shell mode)")
+	connectCmd.Flags().StringVar(&connectToken, "token", "", "Terminal auth token (remote-shell mode; or set CITADEL_TERMINAL_TOKEN)")
 }
