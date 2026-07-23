@@ -1,0 +1,52 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-rag-index - Index a directory (or file) into the node-local semantic index
+
+
+.SH SYNOPSIS
+\fBcitadel rag index  [flags]\fP
+
+
+.SH DESCRIPTION
+Chunk, embed, and store the text files under  into the node-local index.
+
+.PP
+Incremental and idempotent: unchanged files are skipped by content hash, and
+files deleted on disk are pruned on re-index. Binary files and noise dirs
+(.git, node_modules, .venv, ...) are skipped automatically.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for index
+
+.PP
+\fB--pattern\fP=""
+	Restrict indexed filenames (glob, e.g. "*.md")
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--json\fP[=false]
+	Emit machine-readable JSON
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-rag(1)\fP

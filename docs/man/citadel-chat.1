@@ -1,0 +1,64 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-chat - Chat with a model hosted locally on this node
+
+
+.SH SYNOPSIS
+\fBcitadel chat [flags]\fP
+
+
+.SH DESCRIPTION
+Chat with an AI model served locally on THIS node.
+
+.PP
+Discovers the inference engine(s) running on this machine (vLLM, Ollama,
+llama.cpp, or Bonsai), lets you pick a model if more than one is available,
+and opens an interactive streaming chat against its local API.
+
+.PP
+Thinking models (e.g. Bonsai) stream their reasoning separately from the
+answer; the reasoning is shown dimmed and the answer in normal text.
+
+.PP
+Type your message and press Enter. Ctrl-C interrupts a streaming reply;
+type /exit (or Ctrl-D) to quit.
+
+
+.SH OPTIONS
+\fB--engine\fP=""
+	Pre-select an engine by name (vllm, ollama, llamacpp, bonsai)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for chat
+
+.PP
+\fB--max-tokens\fP=1024
+	Max tokens to generate per reply
+
+.PP
+\fB--model\fP=""
+	Pre-select a model by id
+
+.PP
+\fB--no-reasoning\fP[=false]
+	Hide the model's chain-of-thought (thinking models only)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

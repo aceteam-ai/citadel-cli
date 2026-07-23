@@ -1,0 +1,43 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-rag-status - Show node-local index status (doc/chunk counts, model, last indexed)
+
+
+.SH SYNOPSIS
+\fBcitadel rag status [flags]\fP
+
+
+.SH DESCRIPTION
+Show node-local index status (doc/chunk counts, model, last indexed)
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for status
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--json\fP[=false]
+	Emit machine-readable JSON
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-rag(1)\fP

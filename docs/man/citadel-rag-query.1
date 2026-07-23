@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-rag-query - Semantic-search the node-local index and show results with provenance
+
+
+.SH SYNOPSIS
+\fBcitadel rag query  [flags]\fP
+
+
+.SH DESCRIPTION
+Semantic-search the node-local index and show results with provenance
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for query
+
+.PP
+\fB--top-k\fP=10
+	Max results to return
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--json\fP[=false]
+	Emit machine-readable JSON
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel-rag(1)\fP

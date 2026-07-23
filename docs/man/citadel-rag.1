@@ -1,0 +1,59 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-rag - Node-local RAG: index this node's documents and query them locally
+
+
+.SH SYNOPSIS
+\fBcitadel rag [flags]\fP
+
+
+.SH DESCRIPTION
+Build and search a private semantic index over the documents THIS node holds,
+entirely on-box, using the node's self-hosted embedding model (the local TEI
+service, gte-multilingual-base, on :8102).
+
+.PP
+No cloud, no backend round-trip: chunks are embedded locally and stored in a
+node-local SQLite index (~/citadel-node/index.db by default). The same index a
+running 'citadel work' populates over the fabric is the one these commands read.
+
+.PP
+citadel rag index ~/citadel-node/workspace   # index a docs directory
+  citadel rag query "how do refunds work?"     # semantic search, local results
+  citadel rag status                           # doc/chunk counts + model
+
+.PP
+Indexing and querying require the local TEI embedding service to be running.
+Start it with 'citadel module install tei' if it is not yet up.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for rag
+
+.PP
+\fB--json\fP[=false]
+	Emit machine-readable JSON
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-rag-index(1)\fP, \fBcitadel-rag-query(1)\fP, \fBcitadel-rag-status(1)\fP

@@ -1,0 +1,62 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-mesh-models - List models served across reachable mesh nodes
+
+
+.SH SYNOPSIS
+\fBcitadel mesh models [flags]\fP
+
+
+.SH DESCRIPTION
+Enumerates online peers, probes each node's /status over the mesh, and lists
+every served model as a model -> node/engine/port row.
+
+.PP
+Only OTHER nodes are shown (this node is excluded). Nodes that do not serve the
+status endpoint on the mesh (e.g. plain \fBcitadel work\fR without --gateway) are
+skipped.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for models
+
+.PP
+\fB--json\fP[=false]
+	Output in JSON format (includes unreachable nodes)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--port\fP=8080
+	Peer status endpoint port to probe over the mesh
+
+
+.SH EXAMPLE
+.EX
+  # List all models served across the mesh
+  citadel mesh models
+
+  # JSON output (includes unreachable nodes and their errors)
+  citadel mesh models --json
+
+  # Probe a non-default status port
+  citadel mesh models --port 8080
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-mesh(1)\fP

@@ -1,0 +1,47 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-mesh - Discover and chat with models on other nodes over the mesh
+
+
+.SH SYNOPSIS
+\fBcitadel mesh [flags]\fP
+
+
+.SH DESCRIPTION
+Discover the models served by OTHER citadel nodes on the AceTeam Network
+(the mesh) and route chat requests to them directly, node-to-node.
+
+.PP
+Each node publishes its served models at its /status endpoint over the mesh
+(served by \fBcitadel work --gateway\fR). \fBcitadel mesh\fR enumerates online peers,
+probes each one's /status, and aggregates a fabric-wide model -> node/engine/port
+view. Peers that are unreachable (not serving the status endpoint on the mesh)
+are skipped gracefully.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for mesh
+
+.PP
+\fB--port\fP=8080
+	Peer status endpoint port to probe over the mesh
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-mesh-chat(1)\fP, \fBcitadel-mesh-models(1)\fP

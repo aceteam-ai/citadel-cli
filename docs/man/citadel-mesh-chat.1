@@ -1,0 +1,81 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-mesh-chat - Send a one-shot chat request to a model on another node
+
+
+.SH SYNOPSIS
+\fBcitadel mesh chat [prompt] [flags]\fP
+
+
+.SH DESCRIPTION
+Discovers models across the mesh, selects one by --node and/or --model, and
+sends a single OpenAI chat-completion request to that node's engine over the
+mesh, printing the assistant's reply.
+
+.PP
+This is a minimal, non-interactive surface (the interactive REPL is Phase 1,
+#575). Selection rules:
+  - If --model uniquely identifies one served model, --node is optional.
+  - If a model is served on multiple nodes, use --node (hostname or IP) to pick.
+  - If a node serves exactly one model, --model is optional.
+
+.PP
+REACHABILITY: discovery works today, but routing the chat request requires the
+target node to expose a chat endpoint on the mesh. On embedded-tsnet nodes the
+engine's host port is NOT reachable over the mesh (only ports citadel binds a VPN
+listener for answer), and no node gateway yet proxies /v1/chat/completions to the
+local engine, so this command currently fails with connection-refused against
+such nodes. Adding the node-side gateway chat route is tracked in #581.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for chat
+
+.PP
+\fB--model\fP=""
+	Model to chat with
+
+.PP
+\fB--node\fP=""
+	Target node hostname or mesh IP
+
+.PP
+\fB--timeout\fP=120
+	Chat generation timeout in seconds
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--port\fP=8080
+	Peer status endpoint port to probe over the mesh
+
+
+.SH EXAMPLE
+.EX
+  # Chat with a uniquely-named model anywhere on the mesh
+  citadel mesh chat --model Qwen/Qwen2.5-7B "Explain WireGuard in one line"
+
+  # Pick a specific node when a model is served in several places
+  citadel mesh chat --node gpu-node-1 --model llama3 "hello"
+
+  # Node serves a single model
+  citadel mesh chat --node gpu-node-1 "hello"
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-mesh(1)\fP
