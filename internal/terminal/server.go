@@ -3,6 +3,7 @@ package terminal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -51,11 +52,43 @@ type noOpLogger struct{}
 func (l *noOpLogger) Printf(format string, v ...interface{}) {}
 func (l *noOpLogger) Debugf(format string, v ...interface{}) {}
 
+// ctxKey is the private type for request-context keys set by this server.
+type ctxKey int
+
+// vpnConnKey marks a request whose underlying connection arrived on a VPN
+// (mesh) listener rather than the localhost/LAN bind. It is the signal that
+// gates mesh-peer identity trust (citadel #585): only VPN connections may be
+// authorized by mesh identity; localhost and any public exposure still require
+// a token. It is set by the ConnContext hook installed in Start.
+const vpnConnKey ctxKey = iota
+
+// meshTaggedListener wraps a net.Listener whose accepted connections should be
+// treated as arriving over the mesh/VPN. Every listener registered via
+// AddListener is a tsnet VPN listener (the primary localhost bind in Start is
+// created separately and left unwrapped), so AddListener wraps them here. The
+// wrapping is what lets the ConnContext hook distinguish a mesh peer (eligible
+// for identity trust) from a localhost/LAN client (token required).
+type meshTaggedListener struct{ net.Listener }
+
+// Accept tags each accepted connection as mesh-originated.
+func (l *meshTaggedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &meshConn{Conn: c}, nil
+}
+
+// meshConn marks a connection accepted from a meshTaggedListener so the
+// ConnContext hook can flag its request context as mesh-originated.
+type meshConn struct{ net.Conn }
+
 // Server is the WebSocket terminal server
 type Server struct {
 	config   *Config
 	sessions *SessionManager
 	auth     TokenValidator
+	meshAuth MeshIdentityResolver // optional; gates mesh-identity trust (#585)
 	limiter  *RateLimiter
 	logger   Logger
 
@@ -106,6 +139,19 @@ func (s *Server) SetSilent() {
 	s.logger = &noOpLogger{}
 }
 
+// SetMeshResolver wires the mesh-peer identity resolver used to authorize
+// tokenless connections that arrive over the VPN listener (citadel #585). It is
+// optional and additive: when nil (the default), the server requires a token on
+// every listener exactly as before. When set AND config.TrustMeshPeers is true,
+// a tokenless VPN connection whose source resolves to a verified same-owner
+// tailnet peer is authorized without a platform-minted token. It never weakens
+// the localhost/LAN or token paths. Safe to call before Start.
+func (s *Server) SetMeshResolver(r MeshIdentityResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.meshAuth = r
+}
+
 // AddListener registers an additional net.Listener that the server will also
 // serve on. This enables dual-listen on both LAN and VPN interfaces.
 //
@@ -114,16 +160,21 @@ func (s *Server) SetSilent() {
 // restarting the server (see issue #317). If the server is not yet running,
 // the listener is queued and served when Start is called.
 func (s *Server) AddListener(ln net.Listener) {
+	// Wrap so connections accepted here are tagged as mesh/VPN-originated, which
+	// is what makes them eligible for mesh-peer identity trust (citadel #585).
+	// The raw localhost bind in Start is intentionally NOT wrapped.
+	wrapped := &meshTaggedListener{Listener: ln}
+
 	s.mu.Lock()
-	s.extraListeners = append(s.extraListeners, ln)
+	s.extraListeners = append(s.extraListeners, wrapped)
 	running := s.running
 	httpServer := s.httpServer
 	s.mu.Unlock()
 
 	if running && httpServer != nil {
-		s.logger.Printf("also listening on %s (VPN, hot-attached)", ln.Addr().String())
+		s.logger.Printf("also listening on %s (VPN, hot-attached)", wrapped.Addr().String())
 		go func() {
-			if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := httpServer.Serve(wrapped); err != nil && err != http.ErrServerClosed {
 				s.logger.Printf("VPN listener error: %v", err)
 			}
 		}()
@@ -138,7 +189,14 @@ func (s *Server) RemoveListener(ln net.Listener) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, l := range s.extraListeners {
-		if l == ln {
+		// AddListener stores a meshTaggedListener wrapper, but callers pass the
+		// original (unwrapped) listener to RemoveListener, so match either the
+		// stored wrapper or its inner listener.
+		inner := l
+		if mt, ok := l.(*meshTaggedListener); ok {
+			inner = mt.Listener
+		}
+		if l == ln || inner == ln {
 			s.extraListeners = append(s.extraListeners[:i], s.extraListeners[i+1:]...)
 			return
 		}
@@ -199,6 +257,17 @@ func (s *Server) Start() error {
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		// Tag requests whose connection arrived on a VPN (mesh) listener. The
+		// same mux serves both the localhost bind and every AddListener'd VPN
+		// listener; this hook is the single, reliable place to distinguish them
+		// so handleWebSocket can gate mesh-peer identity trust to VPN
+		// connections only (citadel #585).
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if _, ok := c.(*meshConn); ok {
+				return context.WithValue(ctx, vpnConnKey, true)
+			}
+			return ctx
+		},
 	}
 
 	// Start idle session checker
@@ -309,6 +378,71 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		s.limiter.Count())
 }
 
+// resolveAuth decides whether a connection is authorized WITHOUT touching the
+// ResponseWriter, so the decision is unit-testable with an injected mock mesh
+// resolver (no live mesh needed). It implements the citadel #585 auth order:
+//
+//  1. Token present -> validate it; its result GOVERNS. Valid -> authorize with
+//     the token's own UserID; invalid -> reject. This keeps the existing
+//     platform/token path completely unchanged, including on the VPN listener
+//     where the platform relay dials ws://<vpn_ip>:7860?token=... . Token-FIRST
+//     (not mesh-first) is essential: otherwise a relayed per-user token would be
+//     discarded in favor of the relay's single mesh login and every user would
+//     collapse onto one shared tmux session.
+//
+//  2. Token absent, connection arrived on the VPN listener, mesh trust is
+//     enabled (config.TrustMeshPeers) AND a resolver is wired -> authorize by
+//     verified mesh-peer identity, with NO token. This is what makes
+//     `citadel connect <name>` work tokenlessly: dialing <vpn_ip>:7860 already
+//     proves org tailnet membership. The peer must resolve and be same-owner.
+//
+//  3. Otherwise -> reject. Fail-safe: a connection is NEVER accepted merely
+//     because it looked like it arrived over the VPN (unresolved peer, wrong
+//     owner, mesh disabled, no resolver, or token-less on localhost/LAN all
+//     fall through to here).
+//
+// Security posture: mesh-identity trust is gated to the VPN listener; the
+// localhost/LAN bind and any public exposure still require a token. authVia is
+// "token" or "mesh" on success (for the audit log); on failure the returned
+// error is a sentinel suitable for HTTP status mapping.
+func (s *Server) resolveAuth(ctx context.Context, token string, overVPN bool, remoteAddr string) (*TokenInfo, string, error) {
+	// 1. Token path — preserved, and takes precedence on every listener.
+	if token != "" {
+		info, err := s.auth.ValidateToken(token, s.config.OrgID)
+		if err != nil {
+			return nil, "", err
+		}
+		return info, "token", nil
+	}
+
+	// 2. Mesh-identity path — tokenless, VPN-only, opt-outable, resolver-gated.
+	s.mu.RLock()
+	resolver := s.meshAuth
+	s.mu.RUnlock()
+	if overVPN && s.config.TrustMeshPeers && resolver != nil {
+		id, err := resolver.ResolvePeer(ctx, remoteAddr)
+		switch {
+		case err != nil:
+			// Fail-safe: an unverifiable peer falls through to rejection (it does
+			// NOT get an unauthenticated session). Logged at debug — a tokenless
+			// probe from a non-peer is expected noise.
+			s.logger.Debugf("mesh identity unverified for %s (rejecting tokenless): %v", remoteAddr, err)
+		case id == nil || !id.SameOwner:
+			s.logger.Printf("mesh peer %s rejected: not a same-owner tailnet member", remoteAddr)
+		default:
+			// Auditable: this connection was authorized purely on verified mesh
+			// identity, with no platform token. Log the peer at Printf so the
+			// mesh-trust path is always visible in node logs (citadel #585).
+			s.logger.Printf("authorized terminal via mesh-peer identity: node=%q login=%q addr=%s (no token; VPN listener, same-owner)",
+				id.NodeName, id.UserID, remoteAddr)
+			return &TokenInfo{UserID: id.UserID, OrgID: s.config.OrgID}, "mesh", nil
+		}
+	}
+
+	// 3. No valid credential — reject.
+	return nil, "", ErrInvalidToken
+}
+
 // handleWebSocket handles WebSocket upgrade and terminal session
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Get client IP for rate limiting
@@ -325,28 +459,26 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get and validate token
+	// Authorize the connection. resolveAuth implements the citadel #585 order:
+	// token first (preserves the platform/token path unchanged on every
+	// listener), then — only for a tokenless connection that arrived on the VPN
+	// listener — verified mesh-peer identity. See resolveAuth for the full
+	// contract and security posture.
 	token := r.URL.Query().Get("token")
-	if token == "" {
-		s.logger.Printf("missing token from %s", ip)
-		atomic.AddInt64(&s.failedConnections, 1)
-		writeJSONError(w, "missing token parameter", http.StatusUnauthorized)
-		return
-	}
+	overVPN, _ := r.Context().Value(vpnConnKey).(bool)
+	s.logger.Debugf("authorizing connection from %s (overVPN=%v, token=%v) for org %s",
+		ip, overVPN, token != "", s.config.OrgID)
 
-	// Log token validation attempt (don't log the actual token for security)
-	s.logger.Debugf("validating token for org %s from %s", s.config.OrgID, ip)
-
-	tokenInfo, err := s.auth.ValidateToken(token, s.config.OrgID)
+	tokenInfo, authVia, err := s.resolveAuth(r.Context(), token, overVPN, r.RemoteAddr)
 	if err != nil {
-		s.logger.Printf("token validation failed from %s: %v", ip, err)
+		s.logger.Printf("auth failed from %s (overVPN=%v): %v", ip, overVPN, err)
 		atomic.AddInt64(&s.failedConnections, 1)
-		switch err {
-		case ErrInvalidToken, ErrTokenExpired:
+		switch {
+		case errors.Is(err, ErrInvalidToken), errors.Is(err, ErrTokenExpired):
 			writeJSONError(w, err.Error(), http.StatusUnauthorized)
-		case ErrUnauthorized:
+		case errors.Is(err, ErrUnauthorized):
 			writeJSONError(w, err.Error(), http.StatusForbidden)
-		case ErrAuthServiceUnavailable:
+		case errors.Is(err, ErrAuthServiceUnavailable):
 			writeJSONError(w, err.Error(), http.StatusServiceUnavailable)
 		default:
 			writeJSONError(w, "authentication failed", http.StatusUnauthorized)
@@ -354,7 +486,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Debugf("token validated for user %s from %s", tokenInfo.UserID, ip)
+	s.logger.Debugf("authorized user %s from %s via %s", tokenInfo.UserID, ip, authVia)
 
 	// Check connection limit
 	if s.sessions.Count() >= s.config.MaxConnections {
@@ -396,6 +528,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		tmuxCommand = sessionCommand(tmuxSessionName, s.config.Shell)
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		} else {
+			// tmux backing is wanted (citadel #585 defaults it ON) but no usable
+			// tmux binary resolved. Fall back to a bare, non-persistent shell:
+			// the connection still succeeds, it just won't survive a reconnect.
+			// Warn (not silent) so the missing re-attach is diagnosable.
+			s.logger.Printf("tmux unavailable; session %s falls back to a bare (non-persistent) shell — reconnect re-attach disabled (install tmux, or set CITADEL_TERMINAL_SESSION=none to silence)", sessionID)
 		}
 	}
 

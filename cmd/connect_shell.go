@@ -27,16 +27,21 @@ import (
 
 // runRemoteShell opens an interactive shell on the target node over the mesh.
 //
+// Auth (citadel #585): no --token is required. The node authorizes a connection
+// arriving over its VPN listener by our verified mesh-peer identity, so dialing
+// <vpn_ip>:7860 over the mesh is sufficient. A token is still accepted for the
+// platform terminal path or when the target disables mesh trust.
+//
 // Idempotency (issue #582 / coordinate with #571): this client publishes no
 // heartbeat and holds no worklock, so repeated `citadel connect <target>` never
 // creates duplicate node state — each invocation is an independent view, and on
 // exit the terminal is always restored and the socket closed cleanly. Stateful
 // re-attach (reconnecting to the *same* live shell with its running command and
-// scrollback after a dropped connection) is provided by the node-side terminal
-// server when it backs sessions with a persistent per-user tmux session
-// (CITADEL_TERMINAL_SESSION). With the default (bare-shell) node config each
-// connection is a fresh shell. See the PR / follow-up for making tmux-backed
-// sessions the default so `connect` re-attach is seamless out of the box.
+// scrollback after a dropped connection) is now the default: the node-side
+// terminal server backs sessions with a persistent per-user tmux session by
+// default (citadel #585, DefaultSessionName="citadel"), so a repeated connect —
+// or a reconnect after a drop — re-attaches to the same live shell. Operators
+// can force a bare shell with CITADEL_TERMINAL_SESSION=none.
 func runRemoteShell(target string) error {
 	// Ensure the mesh is up before resolving/dialing.
 	netCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -52,25 +57,27 @@ func runRemoteShell(target string) error {
 		return fmt.Errorf("could not resolve '%s': %w", target, err)
 	}
 
-	// Auth token: --token flag or CITADEL_TERMINAL_TOKEN env.
+	// Auth token: OPTIONAL as of citadel #585. When we omit it, the target node
+	// authorizes this connection by our verified mesh-peer identity — dialing its
+	// <vpn_ip>:7860 over the mesh already proves we are an authenticated member
+	// of the org tailnet (auth happened at the WireGuard layer). A token is still
+	// accepted (and takes precedence node-side) for the platform terminal path or
+	// when mesh trust is disabled on the target (CITADEL_TERMINAL_TRUST_MESH=false).
 	token := connectToken
 	if token == "" {
 		token = os.Getenv("CITADEL_TERMINAL_TOKEN")
 	}
-	if token == "" {
-		return fmt.Errorf("no terminal token provided\n"+
-			"  A terminal token authenticates the remote shell. Provide one with:\n"+
-			"    --token <token>            or\n"+
-			"    CITADEL_TERMINAL_TOKEN=<token> citadel connect %s\n"+
-			"  (Tokens are issued by the AceTeam platform terminal feature.)", target)
-	}
 
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", connectTerminalPort))
+	query := url.Values{}
+	if token != "" {
+		query.Set("token", token)
+	}
 	wsURL := url.URL{
 		Scheme:   "ws",
 		Host:     addr,
 		Path:     "/terminal",
-		RawQuery: url.Values{"token": {token}}.Encode(),
+		RawQuery: query.Encode(),
 	}
 
 	display := hostname
@@ -105,7 +112,7 @@ func remoteShellDialError(err error, resp *http.Response, display, addr string) 
 	if resp != nil {
 		switch resp.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
-			return fmt.Errorf("authentication rejected by %s (HTTP %d): the terminal token is invalid or not authorized for this node's org", display, resp.StatusCode)
+			return fmt.Errorf("authentication rejected by %s (HTTP %d): mesh-peer identity was not accepted (target may have mesh trust disabled, or we are not a same-owner tailnet peer) and no valid --token was supplied", display, resp.StatusCode)
 		case http.StatusServiceUnavailable:
 			return fmt.Errorf("%s is at capacity or its auth service is unavailable (HTTP %d)", display, resp.StatusCode)
 		default:

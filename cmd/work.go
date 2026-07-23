@@ -1695,6 +1695,12 @@ func runWork(cmd *cobra.Command, args []string) {
 
 				termServer := terminal.NewServer(termConfig, cachingAuth)
 
+				// Trust verified mesh peers on the VPN listener so `citadel connect
+				// <name>` works with no platform-minted token (citadel #585). This is
+				// additive: the token path is preserved and takes precedence, and the
+				// localhost/LAN bind still requires a token. See terminal.resolveAuth.
+				termServer.SetMeshResolver(meshIdentityResolver{})
+
 				// Add VPN listener so the terminal server is reachable over the tsnet VPN.
 				// Bind to the explicit assigned VPN IP (not ":port") so inbound
 				// connections from the platform relay (which dials ws://<vpn_ip>:7860)

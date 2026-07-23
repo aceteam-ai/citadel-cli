@@ -308,6 +308,74 @@ func (s *NetworkServer) LocalClient() (*tailscale.LocalClient, error) {
 	return s.srv.LocalClient()
 }
 
+// PeerIdentity is the verified mesh identity of a connecting peer, resolved via
+// the tsnet/Tailscale control plane (WhoIs). It is the trust primitive behind
+// mesh-native authorization for the terminal endpoint (citadel #585): a peer
+// that can dial this node over the WireGuard mesh is already an authenticated
+// member of the tailnet, and WhoIs turns its source address into the node and
+// user the coordination server vouches for.
+type PeerIdentity struct {
+	// NodeName is the peer's MagicDNS/computed node name, for the audit log.
+	NodeName string
+
+	// LoginName is the tailnet user login the peer belongs to (e.g. an email).
+	// Used both for the audit log and to derive a stable per-user terminal
+	// session so a reconnecting peer re-attaches to its own shell.
+	LoginName string
+
+	// SameOwner reports whether the peer belongs to the same tailnet user/org as
+	// this node. This mirrors GetPeers' `peer.UserID == selfUserID` filter and is
+	// cheap defense-in-depth: a shared-in node or a different tailnet user that
+	// happens to be reachable is not treated as same-owner.
+	SameOwner bool
+}
+
+// WhoIs resolves a remote address ("ip" or "ip:port", typically an inbound
+// connection's RemoteAddr) to the verified mesh identity the coordination server
+// vouches for. It returns an error when the address does not map to a known
+// tailnet peer.
+//
+// Fail-safe contract (citadel #585): callers MUST treat any error as
+// "unverified" and fall back to token auth — never authorize a session just
+// because a connection looked like it arrived over the mesh.
+func (s *NetworkServer) WhoIs(ctx context.Context, remoteAddr string) (*PeerIdentity, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.srv == nil {
+		return nil, fmt.Errorf("not connected to network")
+	}
+
+	lc, err := s.srv.LocalClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local client: %w", err)
+	}
+
+	who, err := lc.WhoIs(ctx, remoteAddr)
+	if err != nil {
+		return nil, fmt.Errorf("whois %s: %w", remoteAddr, err)
+	}
+	if who == nil || who.Node == nil {
+		return nil, fmt.Errorf("whois %s: no node in response", remoteAddr)
+	}
+
+	id := &PeerIdentity{
+		NodeName: who.Node.ComputedName,
+	}
+	if who.UserProfile != nil {
+		id.LoginName = who.UserProfile.LoginName
+	}
+
+	// Same-owner check mirrors GetPeers: compare the peer's owning user against
+	// self's, and require it is not a shared-in node (Sharer set). A best-effort
+	// Status() failure leaves SameOwner false (fail-closed on the extra check).
+	if status, serr := lc.Status(ctx); serr == nil && status.Self != nil {
+		id.SameOwner = who.Node.User == status.Self.UserID && who.Node.Sharer == 0
+	}
+
+	return id, nil
+}
+
 // Listen creates a listener on the network for the given address.
 // This allows exposing services to the AceTeam network.
 func (s *NetworkServer) Listen(network, addr string) (net.Listener, error) {

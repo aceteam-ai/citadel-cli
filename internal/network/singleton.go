@@ -195,6 +195,18 @@ func GetGlobalPeers(ctx context.Context) ([]PeerInfo, error) {
 	return s.GetPeers(ctx)
 }
 
+// WhoIsPeer resolves a remote address ("ip" or "ip:port") to its verified mesh
+// identity via the global server. See NetworkServer.WhoIs and citadel #585.
+// Returns an error when not connected or the peer cannot be verified; callers
+// must treat that as "unverified" and fall back to token auth.
+func WhoIsPeer(ctx context.Context, remoteAddr string) (*PeerIdentity, error) {
+	s := Global()
+	if s == nil {
+		return nil, fmt.Errorf("not connected to AceTeam Network")
+	}
+	return s.WhoIs(ctx, remoteAddr)
+}
+
 // PingPeer pings a peer via the global server.
 func PingPeer(ctx context.Context, ip string) (latencyMs float64, connType string, relay string, err error) {
 	s := Global()
