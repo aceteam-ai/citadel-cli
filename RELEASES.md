@@ -1323,3 +1323,21 @@ Auto-generated log of every release.
   - fix(meeting): transcribe timeout scales for long meetings (43-min WAV timed out) (#563)
 
 
+---
+
+## v2.86.0 — 2026-07-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 31 |
+| Lines added | +3209 |
+
+**Changes:**
+
+  - feat(node): trust mesh peer identity for the terminal endpoint + default tmux sessions (#585) (#593)
+  - feat(gateway): expose /v1/chat/completions on the node gateway with model→engine routing (#581) (#594)
+  - feat(rag): node-local RAG — index + query node documents locally (#589) (#591)
+  - fix(worker): register native llm_inference handler (#590) (#592)
+
+
