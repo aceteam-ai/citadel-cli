@@ -517,10 +517,20 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 			stopTerminalServer()
 		}
 
-		if err := startTerminalServer(orgID, activityFn); err != nil {
-			activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
+		// Console permission gate (aceteam#6524): the control-center node stands up
+		// its own terminal server with a VPN listener, so — exactly like `citadel
+		// work` — starting it must be gated on the operator opting `console` in, not
+		// just on being connected. A fresh node has `console` default-DENY, so no
+		// terminal listener goes on the org mesh. When enabled, the passcode
+		// verifier wired in startTerminalServer gates every connection.
+		if config.LoadPermissions(platform.ConfigDir()).Console {
+			if err := startTerminalServer(orgID, activityFn); err != nil {
+				activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
+			} else {
+				activityFn("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+			}
 		} else {
-			activityFn("info", fmt.Sprintf("Terminal server listening on port %d", ccTerminalPort))
+			activityFn("info", "Console (terminal) disabled — enable the 'console' permission + set a node passcode to allow remote terminal access")
 		}
 	}
 
@@ -562,10 +572,20 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	}
 
 	// Build configuration
-	config := terminal.DefaultConfig()
-	config.OrgID = orgID
-	config.AuthServiceURL = authServiceURL
-	config.Port = ccTerminalPort
+	termCfg := terminal.DefaultConfig()
+	termCfg.OrgID = orgID
+	termCfg.AuthServiceURL = authServiceURL
+	termCfg.Port = ccTerminalPort
+
+	// Per-node passcode gate (aceteam#6524), same as the `citadel work` terminal
+	// server: even after a valid token or same-owner mesh identity, a connection
+	// must present the node passcode. Loaded fresh per connection so a rotated
+	// passcode is honored without restarting the control center; fails closed.
+	// (config is the internal/config package; the local terminal config is
+	// termCfg to avoid shadowing it here.)
+	termCfg.PasscodeVerifier = func(pin string) bool {
+		return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+	}
 
 	// Create the caching token validator
 	apiToken := ""
@@ -573,10 +593,10 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 		apiToken = cfg.DeviceAPIToken
 	}
 	ccTerminalAuth = terminal.NewCachingTokenValidator(
-		config.AuthServiceURL,
-		config.OrgID,
+		termCfg.AuthServiceURL,
+		termCfg.OrgID,
 		apiToken,
-		config.TokenRefreshInterval,
+		termCfg.TokenRefreshInterval,
 	)
 
 	// Route validator log messages through the TUI activity log so token
@@ -594,7 +614,7 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	// Create and start the server. Operate on a local until fully started, then
 	// publish the pointer atomically so concurrent readers (the supervisor)
 	// never observe a half-initialized server.
-	srv := terminal.NewServer(config, ccTerminalAuth)
+	srv := terminal.NewServer(termCfg, ccTerminalAuth)
 
 	// Trust verified mesh peers on the VPN listener so `citadel connect <name>`
 	// works with no platform-minted token (citadel #585). Additive: token path
