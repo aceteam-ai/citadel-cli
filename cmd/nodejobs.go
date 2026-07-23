@@ -49,6 +49,14 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 	if opts.WorkflowExec != nil {
 		handlers = append(handlers, workflow.NewHandler(opts.WorkflowExec))
 	}
+	// llm_inference (issue #590): the aceteam python-backend dispatches
+	// job_type="llm_inference" for ALL fabric inference (OpenAI gateway, /fabric
+	// model deploys, mesh chat). Registered unconditionally — like the workflow
+	// handler it needs no workspace/config — so both `citadel work` and the
+	// control-center worker route it to the node-local engine (vllm/sglang/
+	// ollama/llamacpp/bonsai). Without it every inference job failed with
+	// "unsupported job type \"llm_inference\": node X has no handler for it".
+	handlers = append(handlers, worker.NewLLMInferenceHandler())
 	return handlers
 }
 
