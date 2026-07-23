@@ -152,6 +152,13 @@ type Server struct {
 	// SetProvisionedRegistry.
 	provisionedResolver CapabilityResolver
 
+	// chatLister, when non-nil, enables the model->engine chat-routing handlers
+	// (/v1/chat/completions, /v1/completions, /v1/models). It reports the local
+	// serving engines and their models so an incoming chat request is routed to
+	// whichever engine serves the requested model. Set via SetChatRouter; see
+	// chat_route.go (issue #581, node-side complement of aceteam #6236).
+	chatLister ChatModelLister
+
 	// started is set once Start has registered the proxy handlers for the routes
 	// present at that moment. It gates WireModuleRoute: a route added AFTER Start
 	// must have its proxy handler registered live (Start's registration loop has
@@ -408,6 +415,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// Build the route table
 	for prefix, upstream := range s.config.Upstreams {
 		s.registerProxy(prefix, upstream)
+	}
+	// Model->engine chat routing (#581): unlike the static upstreams above, the
+	// chat routes resolve their backend per request from the requested model, so
+	// they are registered by a dedicated method rather than the upstream loop.
+	// Same mux, so they are reachable on both the LAN and the VPN listener.
+	if s.chatLister != nil {
+		s.registerChatRoutes()
 	}
 	// Any route added after this point (WireModuleRoute) must register its own
 	// proxy handler live, since this loop has already run.

@@ -1833,6 +1833,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// /v1/embeddings path to the local TEI service (default 127.0.0.1:8102).
 		gw.AddUpstream("/v1/embeddings", &gateway.Upstream{Address: embeddingAddr})
 
+		// Chat routing (issue #581): expose /v1/chat/completions (+ /v1/completions
+		// and /v1/models) with model->engine resolution so mesh-direct chat to this
+		// node reaches whichever local engine serves the requested model.
+		gw.SetChatRouter(newLocalChatLister())
+
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
 			StripPrefix: true,
@@ -1914,6 +1919,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
+		fmt.Printf("     /v1/chat/completions     -> local engine by model (#581)\n")
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 		for _, e := range provisionedEntries {
