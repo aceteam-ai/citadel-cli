@@ -3,6 +3,7 @@ package terminal
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -68,45 +69,77 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 }
 
-// TestDefaultConfig_TmuxOffByDefault pins the off-by-default contract: with no
-// CITADEL_TERMINAL_SESSION set, no tmux session is configured, so the server
-// runs a bare shell (sessionCommand returns nil and sessionDisabled is true).
-func TestDefaultConfig_TmuxOffByDefault(t *testing.T) {
+// TestDefaultConfig_TmuxOnByDefault pins the on-by-default contract flipped by
+// citadel #585: with no CITADEL_TERMINAL_SESSION set the default is "citadel",
+// tmux backing is enabled, and (when a tmux binary is available) a persistent
+// attach-or-create command is produced so `citadel connect` re-attach works out
+// of the box.
+func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 	// Empty simulates "unset": getEnvOrDefault treats "" as absent and falls
-	// back to DefaultSessionName, which is now empty.
+	// back to DefaultSessionName, which is now "citadel".
 	t.Setenv("CITADEL_TERMINAL_SESSION", "")
-
-	config := DefaultConfig()
-	if config.SessionName != "" {
-		t.Errorf("expected empty SessionName by default, got %q", config.SessionName)
-	}
-	if !sessionDisabled(config.SessionName) {
-		t.Error("expected tmux backing to be disabled by default")
-	}
-	// Even with a real tmux binary available, no command is produced.
-	makeFakeTmux(t)
-	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
-		t.Errorf("expected nil session command by default, got %v", got)
-	}
-}
-
-// TestDefaultConfig_TmuxOptIn verifies operators restore persistent tmux by
-// setting CITADEL_TERMINAL_SESSION to a session name.
-func TestDefaultConfig_TmuxOptIn(t *testing.T) {
-	t.Setenv("CITADEL_TERMINAL_SESSION", "citadel")
 	bin := makeFakeTmux(t)
 
 	config := DefaultConfig()
 	if config.SessionName != "citadel" {
-		t.Errorf("expected SessionName %q from env, got %q", "citadel", config.SessionName)
+		t.Errorf("expected default SessionName %q, got %q", "citadel", config.SessionName)
 	}
 	if sessionDisabled(config.SessionName) {
-		t.Error("expected tmux backing to be enabled when opted in")
+		t.Error("expected tmux backing to be ENABLED by default (citadel #585)")
 	}
 	got := sessionCommand(config.SessionName, "/bin/bash")
 	want := []string{bin, "new-session", "-A", "-s", "citadel", "/bin/bash"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
+	}
+}
+
+// TestDefaultConfig_TmuxOptOut verifies operators can force a bare, non-persistent
+// shell by setting CITADEL_TERMINAL_SESSION to a disable sentinel.
+func TestDefaultConfig_TmuxOptOut(t *testing.T) {
+	t.Setenv("CITADEL_TERMINAL_SESSION", "none")
+	makeFakeTmux(t) // even with tmux available, opt-out wins
+
+	config := DefaultConfig()
+	if config.SessionName != "none" {
+		t.Errorf("expected SessionName %q from env, got %q", "none", config.SessionName)
+	}
+	if !sessionDisabled(config.SessionName) {
+		t.Error("expected tmux backing to be disabled when opted out")
+	}
+	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
+		t.Errorf("expected nil session command when opted out, got %v", got)
+	}
+}
+
+// TestDefaultConfig_TmuxMissingFallsBackToBareShell verifies the graceful
+// fallback: with tmux enabled (default) but no resolvable tmux binary,
+// sessionCommand returns nil so the server runs a bare shell (it logs a warning
+// and never fails the connection). The missing binary is mocked via
+// CITADEL_TMUX_BIN pointing at a nonexistent path.
+func TestDefaultConfig_TmuxMissingFallsBackToBareShell(t *testing.T) {
+	t.Setenv("CITADEL_TERMINAL_SESSION", "") // default -> "citadel" (enabled)
+	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "no-such-tmux"))
+
+	config := DefaultConfig()
+	if sessionDisabled(config.SessionName) {
+		t.Fatal("precondition: tmux should be enabled by default")
+	}
+	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
+		t.Errorf("expected nil session command (bare-shell fallback) when tmux is missing, got %v", got)
+	}
+}
+
+// TestDefaultConfig_TrustMeshDefault pins the mesh-trust default (citadel #585):
+// on by default, opt-outable via CITADEL_TERMINAL_TRUST_MESH.
+func TestDefaultConfig_TrustMeshDefault(t *testing.T) {
+	t.Setenv("CITADEL_TERMINAL_TRUST_MESH", "")
+	if !DefaultConfig().TrustMeshPeers {
+		t.Error("expected TrustMeshPeers to default to true")
+	}
+	t.Setenv("CITADEL_TERMINAL_TRUST_MESH", "false")
+	if DefaultConfig().TrustMeshPeers {
+		t.Error("expected TrustMeshPeers=false from env opt-out")
 	}
 }
 

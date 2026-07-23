@@ -36,8 +36,11 @@ REMOTE SHELL (no port):
   No host SSH config, no '.local' mDNS, no manual hops.
 
   The target node must be running its terminal endpoint, which 'citadel work'
-  starts by default (disable with --no-terminal). Authentication uses a terminal
-  token: pass --token or set CITADEL_TERMINAL_TOKEN.
+  starts by default (disable with --no-terminal). No token is needed: the node
+  trusts your verified mesh-peer identity over the VPN (citadel #585). Repeated
+  connects re-attach to the same live tmux-backed shell. A --token (or
+  CITADEL_TERMINAL_TOKEN) is still accepted for the platform terminal path or
+  when the target disables mesh trust.
 
 RAW TCP (with port):
   Establishes a raw TCP connection to a service on the target and pipes
@@ -281,5 +284,5 @@ func init() {
 	rootCmd.AddCommand(connectCmd)
 	connectCmd.Flags().IntVar(&connectTimeout, "timeout", 0, "Connection timeout in seconds (0 = no timeout, raw-TCP mode)")
 	connectCmd.Flags().IntVar(&connectTerminalPort, "terminal-port", 7860, "Terminal endpoint port on the target (remote-shell mode)")
-	connectCmd.Flags().StringVar(&connectToken, "token", "", "Terminal auth token (remote-shell mode; or set CITADEL_TERMINAL_TOKEN)")
+	connectCmd.Flags().StringVar(&connectToken, "token", "", "Terminal auth token (remote-shell mode; OPTIONAL — mesh identity is trusted by default; or set CITADEL_TERMINAL_TOKEN)")
 }

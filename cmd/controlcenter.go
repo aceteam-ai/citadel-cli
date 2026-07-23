@@ -596,6 +596,11 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	// never observe a half-initialized server.
 	srv := terminal.NewServer(config, ccTerminalAuth)
 
+	// Trust verified mesh peers on the VPN listener so `citadel connect <name>`
+	// works with no platform-minted token (citadel #585). Additive: token path
+	// preserved and takes precedence; localhost/LAN still requires a token.
+	srv.SetMeshResolver(meshIdentityResolver{})
+
 	// Suppress terminal server logging in TUI mode to prevent display corruption
 	srv.SetSilent()
 

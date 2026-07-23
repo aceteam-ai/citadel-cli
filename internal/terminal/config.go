@@ -9,12 +9,21 @@ import (
 )
 
 // DefaultSessionName is the base tmux session name used when
-// CITADEL_TERMINAL_SESSION is not set. It defaults to empty, which turns tmux
-// backing OFF so terminals run a fresh bare shell. Operators opt in to
-// persistent tmux by setting CITADEL_TERMINAL_SESSION to a session name (e.g.
-// "citadel"), which must be a valid tmux session name per
-// tmux.ValidateSessionName.
-const DefaultSessionName = ""
+// CITADEL_TERMINAL_SESSION is not set.
+//
+// It defaults to "citadel", which turns persistent tmux backing ON by default
+// (citadel #585, Gap 2): each connection attaches to (or creates) a per-user
+// `tmux new-session -A -s <name>` session, so a repeated `citadel connect
+// <node>` — and a reconnect after a drop — re-attaches to the SAME live shell
+// (running command, scrollback, cwd preserved) instead of spawning a duplicate.
+//
+// This is a deliberate behavior change from the previous empty (tmux-off)
+// default: platform/token terminals that used to get a fresh bare shell now get
+// a resumable tmux session too. It stays safe because (a) when no tmux binary is
+// resolvable the server logs a warning and falls back to a bare shell, and
+// (b) operators can force a bare shell by setting CITADEL_TERMINAL_SESSION to a
+// disable sentinel ("none"/"off"/"disabled"/"false"/"0").
+const DefaultSessionName = "citadel"
 
 // Config holds the terminal server configuration
 type Config struct {
@@ -53,15 +62,22 @@ type Config struct {
 	// re-attaches to their own persistent terminal across reconnects while
 	// staying isolated from other users.
 	//
-	// It defaults to DefaultSessionName (empty), so tmux backing is OFF by
-	// default and terminals run a fresh, non-persistent bare shell. This keeps
-	// scripted/automated terminal use predictable (no state bleed across
-	// connections, consistent PTY/terminfo). To opt in to the persistent,
-	// reconnect-resilient tmux behavior, set CITADEL_TERMINAL_SESSION to a
-	// session name (e.g. "citadel"). The disable sentinels ("none"/"off"/
-	// "disabled"/"false"/"0") also force a bare shell and remain supported for
-	// explicit opt-out.
+	// It defaults to DefaultSessionName ("citadel"), so tmux backing is ON by
+	// default (citadel #585): terminals get a persistent, reconnect-resilient,
+	// per-user session so `citadel connect` re-attaches seamlessly. To force a
+	// fresh, non-persistent bare shell (e.g. for scripted/automated terminal use
+	// that wants no state bleed across connections), set CITADEL_TERMINAL_SESSION
+	// to a disable sentinel ("none"/"off"/"disabled"/"false"/"0").
 	SessionName string
+
+	// TrustMeshPeers enables mesh-peer identity trust for connections that
+	// arrive over the VPN listener (citadel #585). When true AND a
+	// MeshIdentityResolver is wired (SetMeshResolver), a tokenless VPN
+	// connection whose source resolves to a verified same-owner tailnet peer is
+	// authorized without a platform-minted token. It has NO effect on the
+	// localhost/LAN bind, which always requires a token. Defaults to true
+	// (CITADEL_TERMINAL_TRUST_MESH); set false to force tokens even on the mesh.
+	TrustMeshPeers bool
 
 	// AuthServiceURL is the URL of the AceTeam auth service for token validation
 	AuthServiceURL string
@@ -93,6 +109,7 @@ func DefaultConfig() *Config {
 		MaxConnections:       getEnvInt("CITADEL_TERMINAL_MAX_CONNECTIONS", 10),
 		Shell:                getEnvOrDefault("CITADEL_TERMINAL_SHELL", defaultShell()),
 		SessionName:          getEnvOrDefault("CITADEL_TERMINAL_SESSION", DefaultSessionName),
+		TrustMeshPeers:       getEnvBool("CITADEL_TERMINAL_TRUST_MESH", true),
 		AuthServiceURL:       getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"),
 		RateLimitRPS:         1.0, // 1 connection attempt per second per IP
 		RateLimitBurst:       5,   // Allow bursts of 5
