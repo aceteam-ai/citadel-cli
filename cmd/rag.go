@@ -84,7 +84,9 @@ func init() {
 // newRAGService constructs the local RAG service rooted at the node's workspace,
 // resolving the same index.db a running worker uses.
 func newRAGService() *rag.Service {
-	return rag.New(resolveWorkspaceDir(), ragModel)
+	// Local CLI operator is trusted (has shell access), so allow indexing docs
+	// dirs outside the workspace.
+	return rag.NewLocal(resolveWorkspaceDir(), ragModel)
 }
 
 func runRAGIndex(cmd *cobra.Command, args []string) error {

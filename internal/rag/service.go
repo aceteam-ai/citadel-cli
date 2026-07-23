@@ -35,24 +35,35 @@ type Service struct {
 	// model is the resolved embedding model (never empty after New), used for
 	// provenance and passed to the handlers so search matches the index.
 	model string
-	// allowOutsideWorkspace lets a trusted local operator index a docs directory
-	// that lives outside the sandbox workspace (e.g. a configured CITADEL_RAG_DOCS
-	// path). The node operator running `citadel rag` is trusted; the backend
-	// dispatch path keeps its stricter default.
+	// allowOutsideWorkspace lets Index walk a docs directory that lives outside
+	// the sandbox workspace. It is opt-in per call site and defaults OFF: the
+	// mesh-reachable HTTP surface keeps the same stricter workspace boundary the
+	// FILE_INDEX dispatch handler enforces, so a remote caller cannot index
+	// arbitrary node paths. The local `citadel rag` operator (who already has
+	// shell access) opts in so pointing at a docs dir outside the workspace works.
 	allowOutsideWorkspace bool
 }
 
-// New constructs a Service. workspaceDir is the node's workspace root (used to
-// validate index paths); modelOverride is optional (empty => the same default
-// the job handlers use). The index db path is resolved from CITADEL_INDEX_DB or
-// the default beside the workspace, matching a running worker.
+// New constructs a Service with the mesh-safe default (index paths confined to
+// the workspace). workspaceDir is the node's workspace root; modelOverride is
+// optional (empty => the same default the job handlers use). The index db path
+// is resolved from CITADEL_INDEX_DB or the default beside the workspace,
+// matching a running worker.
 func New(workspaceDir, modelOverride string) *Service {
 	return &Service{
-		workspaceDir:          workspaceDir,
-		dbPath:                jobs.ResolveIndexDBPath("", workspaceDir),
-		model:                 jobs.ResolveEmbeddingModel(modelOverride),
-		allowOutsideWorkspace: true,
+		workspaceDir: workspaceDir,
+		dbPath:       jobs.ResolveIndexDBPath("", workspaceDir),
+		model:        jobs.ResolveEmbeddingModel(modelOverride),
 	}
+}
+
+// NewLocal is New for a trusted local operator (the `citadel rag` CLI): it
+// additionally permits indexing paths outside the workspace. Never use this for
+// a network-reachable surface.
+func NewLocal(workspaceDir, modelOverride string) *Service {
+	s := New(workspaceDir, modelOverride)
+	s.allowOutsideWorkspace = true
+	return s
 }
 
 // Model returns the effective embedding model (for provenance reporting).

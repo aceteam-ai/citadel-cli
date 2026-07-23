@@ -178,6 +178,33 @@ func TestServiceQueryEmptyRejected(t *testing.T) {
 	}
 }
 
+func TestServiceWorkspaceBoundary(t *testing.T) {
+	tei := fakeTEI(t)
+	t.Setenv("CITADEL_TEI_URL", tei.URL)
+	t.Setenv("CITADEL_INDEX_DB", filepath.Join(t.TempDir(), "index.db"))
+	t.Setenv("CITADEL_EMBEDDING_MODEL", "")
+
+	ws := t.TempDir()
+	outside := t.TempDir() // a sibling dir outside the workspace
+	writeFile(t, outside, "secret.md", "A database of secrets.")
+
+	// Mesh-safe default (New): indexing a path outside the workspace is refused.
+	safe := New(ws, "")
+	if _, err := safe.Index(context.Background(), outside, ""); err == nil {
+		t.Fatal("expected New() to refuse indexing a path outside the workspace")
+	}
+
+	// Local operator (NewLocal): the same outside path is permitted.
+	local := NewLocal(ws, "")
+	res, err := local.Index(context.Background(), outside, "")
+	if err != nil {
+		t.Fatalf("NewLocal should permit outside path: %v", err)
+	}
+	if res.FilesIndexed != 1 {
+		t.Fatalf("expected 1 file indexed via NewLocal, got %d", res.FilesIndexed)
+	}
+}
+
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
