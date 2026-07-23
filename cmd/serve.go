@@ -219,6 +219,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// stripping is needed.
 	gw.AddUpstream("/v1/embeddings", &gateway.Upstream{Address: embeddingAddr})
 
+	// Chat routing (issue #581): expose /v1/chat/completions (+ /v1/completions
+	// and /v1/models) with model->engine resolution so mesh-direct chat to this
+	// node reaches whichever local engine serves the requested model.
+	gw.SetChatRouter(newLocalChatLister())
+
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{
 		Address:     vncAddr,
@@ -250,6 +255,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 	fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 	fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
+	fmt.Printf("     /v1/chat/completions     -> local engine by model (#581)\n")
 	fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 	fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 

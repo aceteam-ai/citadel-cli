@@ -558,20 +558,35 @@ provisioned gateway, which forces `:8080` + a VPN listener) does. Discovery
 therefore sees only gateway-enabled peers; the probe port is configurable via
 `--port` (`mesh.Options.Port`, default `services.GatewayPort` = 8080).
 
-**Chat reachability gap (KNOWN, tracked in #581):** `mesh chat` is wired but
-routing does NOT work end-to-end yet, because on **embedded-tsnet nodes the
-engine's host port is not reachable over the mesh**. Verified by self-dialing this
-node's own mesh IP:8210 via `network.Dial` while bonsai served fine on
-`localhost:8210` → `connection refused`: embedded tsnet's userspace netstack does
-not forward inbound mesh traffic to a host-bound port lacking a `srv.Listen()`
-(only ports citadel explicitly `ListenVPN`s — status 8080, gateway 8443, terminal,
-vnc, modules — answer over the mesh). The engine compose files bind `0.0.0.0` and
-carry a "peers reach this engine directly over the mesh" comment, but that
-reflects a full-Tailscale/kernel-TUN node, not embedded tsnet. Neither
-`citadel work --gateway` nor `citadel serve` proxies `/v1/chat/completions` (they
-proxy `/v1/embeddings` and control routes only). The node-side gateway chat route
-(model→engine, the complement of aceteam #6236) is the follow-up (#581); until
-then `mesh chat` fails gracefully with a message pointing there.
+**Chat reachability (was the #581 gap, now IMPLEMENTED):** on **embedded-tsnet
+nodes the engine's host port is not reachable over the mesh** — verified by
+self-dialing this node's own mesh IP:8210 via `network.Dial` while bonsai served
+fine on `localhost:8210` → `connection refused`: embedded tsnet's userspace
+netstack does not forward inbound mesh traffic to a host-bound port lacking a
+`srv.Listen()` (only ports citadel explicitly `ListenVPN`s — status 8080, gateway
+8443, terminal, vnc, modules — answer over the mesh). The engine compose files
+bind `0.0.0.0` and carry a "peers reach this engine directly over the mesh"
+comment, but that reflects a full-Tailscale/kernel-TUN node, not embedded tsnet.
+
+**Fix (#581, node-side complement of aceteam #6236):** the gateway now routes
+`/v1/chat/completions` (plus `/v1/completions` and `/v1/models`) by model. Both
+`citadel work --gateway` and `citadel serve` register a dynamic chat handler
+(`internal/gateway/chat_route.go`) that reads the request body's `model`,
+resolves it to the LOCAL serving engine's citadel-owned host port via
+`status.DiscoverLocalEngines` (behind a short TTL cache in `cmd/gateway_chat.go`),
+and reverse-proxies to `http://127.0.0.1:<port>/v1/chat/completions` — streaming
+SSE included (`ReverseProxy.FlushInterval=-1`). Model matching mirrors
+`mesh.FindModel` (exact case-insensitive → substring); an unknown model returns a
+404 OpenAI-shaped `model_not_found`. Because these routes sit on the same gateway
+mux, they ride the LAN listener AND the tsnet VPN listener, so `mesh.Client.
+ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
+now works end-to-end (target the node's gateway port, not the engine port).
+
+Auth posture: `categoryForPath` returns `""` for `/v1/chat/completions`, so it is
+always-allowed — same as `/v1/embeddings`. TLS + mesh membership are the only
+gate; the gateway does NOT currently wire `SetMetering`, so chat is neither
+metered nor authenticated per-request. A single chat response is bounded by the
+gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
 
 ```bash
 citadel mesh models                 # list model -> node/engine/addr across the mesh
