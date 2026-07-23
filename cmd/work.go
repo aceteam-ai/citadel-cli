@@ -35,6 +35,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
 	"github.com/aceteam-ai/citadel-cli/internal/pulse"
+	"github.com/aceteam-ai/citadel-cli/internal/rag"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
@@ -1325,6 +1326,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		statusServer.AddRouteRegistrar(func(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
 			wfServer := workflow.NewServer(wfExec)
 			wfServer.RegisterRoutes(mux, auth)
+		})
+
+		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
+		// /rag/status. Same requireVPNOrAuth posture and workspace root as the
+		// file handlers, so a locally-populated index is queryable over the mesh.
+		statusServer.AddRouteRegistrar(func(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
+			ragServer := rag.NewServer(rag.New(wsDir, ""))
+			ragServer.RegisterRoutes(mux, auth)
 		})
 
 		// Add VPN listener so the status server is reachable over the tsnet VPN.

@@ -318,6 +318,34 @@ func resolveIndexDBPath(dbPath, workspace string) string {
 	return "index.db"
 }
 
+// DefaultEmbeddingModel is the TEI model used for node-local indexing/search
+// when none is specified. Exported so local surfaces (the rag package, the
+// `citadel rag` CLI) report the same model the job handlers embed with.
+const DefaultEmbeddingModel = defaultEmbeddingModel
+
+// ResolveIndexDBPath exposes the node-local index db-path resolution so callers
+// outside this package (the rag service, CLI) land on the SAME index.db a
+// running worker's FILE_INDEX writes to. Precedence: explicit dbPath >
+// CITADEL_INDEX_DB > "index.db" beside the workspace's parent.
+func ResolveIndexDBPath(dbPath, workspace string) string {
+	return resolveIndexDBPath(dbPath, workspace)
+}
+
+// ResolveEmbeddingModel returns the effective embedding model for a given
+// (optional) override, applying the same defaulting the FILE_INDEX /
+// FILE_SEMANTIC_SEARCH handlers use: override > CITADEL_EMBEDDING_MODEL >
+// DefaultEmbeddingModel. Keeping this in one place stops the local surface from
+// drifting from the model the handlers actually embed with.
+func ResolveEmbeddingModel(override string) string {
+	if override != "" {
+		return override
+	}
+	if env := os.Getenv("CITADEL_EMBEDDING_MODEL"); env != "" {
+		return env
+	}
+	return defaultEmbeddingModel
+}
+
 // atoiDefault parses s as an int, returning def on any error or empty input.
 func atoiDefault(s string, def int) int {
 	if s == "" {

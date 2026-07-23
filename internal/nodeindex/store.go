@@ -257,6 +257,39 @@ func (s *Store) Stats() (files, chunks int, err error) {
 	return files, chunks, nil
 }
 
+// Status is a human-facing summary of the node-local index: how much is indexed
+// and with which model. Model, Dim, and LastIndexed are taken from the most
+// recently indexed file so the caller can report accurate provenance; they are
+// zero-valued for an empty index.
+type Status struct {
+	Files       int    `json:"files"`
+	Chunks      int    `json:"chunks"`
+	Model       string `json:"model"`
+	Dim         int    `json:"dim"`
+	LastIndexed string `json:"last_indexed"`
+}
+
+// Status returns the index summary (file/chunk counts plus the model, dim, and
+// timestamp of the most recently indexed file).
+func (s *Store) Status() (Status, error) {
+	var st Status
+	files, chunks, err := s.Stats()
+	if err != nil {
+		return Status{}, err
+	}
+	st.Files, st.Chunks = files, chunks
+
+	// Model/dim/last-indexed come from the newest file row. On an empty index
+	// there is no row, so leave the zero values.
+	row := s.db.QueryRow(`SELECT model, dim, indexed_at FROM indexed_files ORDER BY indexed_at DESC LIMIT 1`)
+	switch err := row.Scan(&st.Model, &st.Dim, &st.LastIndexed); err {
+	case nil, sql.ErrNoRows:
+		return st, nil
+	default:
+		return Status{}, fmt.Errorf("query index status: %w", err)
+	}
+}
+
 // encodeVector serializes a float32 vector to a little-endian byte blob.
 func encodeVector(v []float32) []byte {
 	buf := make([]byte, 4*len(v))
