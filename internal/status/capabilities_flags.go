@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -47,14 +48,27 @@ func detectStaticCaps() {
 // flag is derived from vncPort (already computed by Collect, so we avoid a
 // second VNC probe). console/gpu come from the cached static detection; files
 // is a cheap stat of the workspace directory.
+//
+// Sensitive-surface gate (aceteam#6524): console/desktop/files report as
+// available ONLY when the node has BOTH the underlying capability AND the
+// operator has opted the matching permission in. This is what stops the Fabric
+// web console from presenting a live terminal/screen/file browser for a freshly
+// joined node that never opted in (the White Whale landmine) — a fresh node has
+// these permissions default-DENY, so the flags read false. The operator's
+// enable/disable choice remains separately visible on the heartbeat via the
+// PermissionState block (permissionsToHeartbeat), so the web can still render an
+// "enable + set passcode" call to action from that signal. GPU/H264 are
+// hardware-only and never gated (inference must advertise regardless).
 func populateCapabilityFlags(caps *NodeCapabilities, vncPort int) {
 	detectStaticCaps()
 
-	console := cachedConsole
+	perms := config.LoadPermissions(platform.ConfigDir())
+
+	console := cachedConsole && perms.Console
 	gpu := cachedGPU
 	h264 := cachedH264
-	desktop := vncPort > 0 || probeVNCPort(platform.DefaultVNCPort)
-	files := detectFiles()
+	desktop := (vncPort > 0 || probeVNCPort(platform.DefaultVNCPort)) && perms.Desktop
+	files := detectFiles() && perms.Files
 
 	caps.Console = &console
 	caps.Desktop = &desktop

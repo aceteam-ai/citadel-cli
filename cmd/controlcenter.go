@@ -2005,6 +2005,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:                 ccConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
+		DesktopDisabled:           !ccPerms.Desktop,
+		FilesDisabled:             !ccPerms.Files,
 		WorkflowExec:              ccWfExec,
 		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 	}

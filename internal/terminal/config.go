@@ -96,6 +96,16 @@ type Config struct {
 
 	// Debug enables verbose debug logging
 	Debug bool
+
+	// PasscodeVerifier, when non-nil, adds the per-node passcode gate on top of
+	// the existing auth (aceteam#6524). After a connection authenticates (token
+	// or same-owner mesh identity), it must ALSO present the node passcode, which
+	// is checked here. This is what makes "console enabled" different from "any
+	// org mesh peer can open a shell" — a valid org device token or a same-owner
+	// mesh peer is not enough; the caller must also hold the node passcode. When
+	// nil (e.g. the localhost test server), no passcode is required and behavior
+	// is unchanged. The verifier fails closed (see config.Permissions.VerifyPasscode).
+	PasscodeVerifier func(pin string) bool
 }
 
 // DefaultConfig returns a Config with sensible defaults

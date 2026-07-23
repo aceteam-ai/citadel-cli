@@ -488,6 +488,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Debugf("authorized user %s from %s via %s", tokenInfo.UserID, ip, authVia)
 
+	// Passcode gate (aceteam#6524): even after a valid token or same-owner mesh
+	// identity, the caller must present the per-node passcode to open a shell.
+	// This is the owner-consent factor that makes "console enabled" different
+	// from "any org mesh peer can dial :7860 and get a shell". Presented via the
+	// ?passcode= query param (a browser WebSocket cannot set request headers on
+	// the upgrade), with the X-Citadel-Passcode header honored for non-browser
+	// clients. Fails closed. Skipped only when no verifier is wired (e.g. the
+	// localhost test server), preserving existing behavior there.
+	if s.config.PasscodeVerifier != nil {
+		passcode := r.URL.Query().Get("passcode")
+		if passcode == "" {
+			passcode = r.Header.Get("X-Citadel-Passcode")
+		}
+		if !s.config.PasscodeVerifier(passcode) {
+			s.logger.Printf("passcode gate rejected connection from %s (user %s, via %s)", ip, tokenInfo.UserID, authVia)
+			atomic.AddInt64(&s.failedConnections, 1)
+			writeJSONError(w, "node passcode required", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	// Check connection limit
 	if s.sessions.Count() >= s.config.MaxConnections {
 		s.logger.Printf("max connections reached (%d), rejecting %s", s.config.MaxConnections, ip)

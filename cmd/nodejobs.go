@@ -23,6 +23,14 @@ type nodeJobHandlerOpts struct {
 	AllowReadOutsideWorkspace bool
 	// ShellDisabled registers SHELL_COMMAND in a refusing state (still dispatchable).
 	ShellDisabled bool
+	// DesktopDisabled skips registration of the screen/VNC/desktop handlers
+	// (aceteam#6524). Wired from the persisted `desktop` node permission
+	// (default-DENY on a fresh node).
+	DesktopDisabled bool
+	// FilesDisabled skips registration of the file browse/host handlers
+	// (aceteam#6524). Wired from the persisted `files` node permission
+	// (default-DENY on a fresh node).
+	FilesDisabled bool
 	// LogFn routes legacy handler job output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkflowExec backs the WORKFLOW_RUN handler. Required.
@@ -45,6 +53,8 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 		ConfigDir:                 opts.ConfigDir,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
 		ShellDisabled:             opts.ShellDisabled,
+		DesktopDisabled:           opts.DesktopDisabled,
+		FilesDisabled:             opts.FilesDisabled,
 	})
 	if opts.WorkflowExec != nil {
 		handlers = append(handlers, workflow.NewHandler(opts.WorkflowExec))

@@ -1240,6 +1240,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		if permsForDesktop.Desktop {
 			if serverCfg.TokenValidator != nil {
 				serverCfg.EnableDesktop = true
+				// Per-node passcode gate for the direct-mesh desktop endpoints
+				// (aceteam#6524). Loaded fresh per request so a rotated passcode is
+				// honored without a worker restart; fails closed when unset.
+				serverCfg.PasscodeVerifier = func(pin string) bool {
+					return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+				}
 				Debug("desktop API enabled (per-request VNC readiness checks)")
 				// Bundle VNC startup so the shared desktop works with zero
 				// manual `citadel vnc enable` (#483). Idempotent, headless-safe,
@@ -1638,6 +1644,17 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Start terminal server if enabled
+	// Console permission gate (aceteam#6524): the terminal server's own VPN
+	// listener is directly dialable by any mesh peer, so starting it must be
+	// gated on the operator opting the `console` permission in — not just the
+	// --terminal flag. A fresh node has `console` default-DENY, so it does NOT
+	// stand up a terminal listener on the org mesh. When enabled, the passcode
+	// verifier below additionally gates every connection.
+	terminalPerms := config.LoadPermissions(platform.ConfigDir())
+	if workTerminal && !terminalPerms.Console {
+		fmt.Fprintln(os.Stderr, "   - Terminal (console) disabled: enable the 'console' permission + set a node passcode to allow remote terminal access")
+		workTerminal = false
+	}
 	if workTerminal {
 		// Check platform support
 		if runtime.GOOS == "windows" {
@@ -1664,6 +1681,14 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
 				termConfig.Version = Version
+
+				// Per-node passcode gate (aceteam#6524). Loaded fresh via the
+				// closure on each connection so a passcode rotated at runtime (via
+				// APPLY_DEVICE_CONFIG or the Control Center) is honored without a
+				// worker restart. Fails closed when no passcode is set.
+				termConfig.PasscodeVerifier = func(pin string) bool {
+					return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+				}
 
 				// Best-effort: provision a Citadel-managed tmux binary so persistent
 				// terminal sessions "just work" on nodes without a system tmux. This
@@ -1986,6 +2011,8 @@ func runWork(cmd *cobra.Command, args []string) {
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
+		DesktopDisabled:           !workPerms.Desktop,
+		FilesDisabled:             !workPerms.Files,
 		WorkflowExec:              wfExec,
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 	}
