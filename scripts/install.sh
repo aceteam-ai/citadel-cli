@@ -285,23 +285,42 @@ main() {
 
   # Handle PATH configuration for user-local installs
   if [ "$INSTALL_MODE" = "user" ]; then
+    echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
+
     if is_in_path "$INSTALL_DIR"; then
-      echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
+      # Already on PATH: the bare `citadel` command works immediately.
+      echo "" >&2
+      echo "  Run 'citadel --help' to get started." >&2
+      echo "  To provision this node, run: citadel init" >&2
     else
-      # Add to PATH in shell profile
-      if add_to_path; then
-        echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
+      # Not on PATH. Persist to the shell profile for future terminals, but the
+      # CURRENT shell won't pick that up until it is reloaded — so also show the
+      # exact copy-pasteable command to fix this session, plus absolute-path
+      # invocations that work RIGHT NOW (before PATH is fixed). This is the
+      # "command not found in the first 30 seconds" onboarding trap (#6522).
+      add_to_path || true
+
+      local profile_file
+      profile_file=$(detect_shell_profile)
+      local shell_name
+      shell_name=$(basename "$SHELL")
+
+      echo "" >&2
+      warn "${INSTALL_DIR} is not on your PATH."
+      echo "  Added it to ${profile_file} for new terminals." >&2
+      echo "" >&2
+      echo "  To use 'citadel' in THIS terminal, run:" >&2
+      if [ "$shell_name" = "fish" ]; then
+        echo "      fish_add_path ${INSTALL_DIR}" >&2
       else
-        local profile_file
-        profile_file=$(detect_shell_profile)
-        echo "" >&2
-        warn "To use citadel, restart your terminal or run:"
-        echo "  source ${profile_file}" >&2
+        echo "      export PATH=\"${INSTALL_DIR}:\$PATH\"" >&2
       fi
+      echo "" >&2
+      echo "  Or run citadel now by its full path:" >&2
+      echo "      ${INSTALL_DIR}/citadel --help" >&2
+      echo "      ${INSTALL_DIR}/citadel init" >&2
     fi
-    echo "" >&2
-    echo "  Run 'citadel --help' to get started." >&2
-    echo "  To provision this node, run: citadel init" >&2
+
     echo "" >&2
     echo "  Note: Full provisioning (Docker, GPU toolkit) requires sudo." >&2
     echo "  You can run 'citadel init --network-only' for network setup without sudo." >&2
