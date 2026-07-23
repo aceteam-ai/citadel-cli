@@ -58,6 +58,26 @@ type DeviceConfig struct {
 	// (aceteam#5097). Pointer so nil leaves the persisted value untouched; a
 	// non-positive value is clamped to the default by the config accessor.
 	MeetingRetentionDays *int `json:"meetingRetentionDays,omitempty"`
+
+	// ConsoleEnabled/DesktopEnabled/FilesEnabled are the programmatic opt-IN path
+	// for the sensitive remote-access surfaces (aceteam#6524). They are pointers
+	// so an omitted field (nil) leaves the node's persisted permission untouched —
+	// a plain bool would default to false and silently disable a surface the
+	// moment any device config is applied. A non-nil value writes the same
+	// permissions.yaml the Control Center toggle and the gateway/listener gates
+	// read. These are default-DENY on a fresh node, so the platform must send
+	// `true` here (together with a NodePasscode) to actually enable a surface.
+	ConsoleEnabled *bool `json:"consoleEnabled,omitempty"`
+	DesktopEnabled *bool `json:"desktopEnabled,omitempty"`
+	FilesEnabled   *bool `json:"filesEnabled,omitempty"`
+
+	// NodePasscode sets (or, when empty, clears) the per-node passcode that gates
+	// the sensitive surfaces (aceteam#6524). Pointer so nil leaves the stored
+	// passcode untouched; a non-nil value is bcrypt-hashed before it is persisted
+	// (the plaintext PIN is never written to disk). Enabling a surface without a
+	// passcode leaves it fail-closed, so the platform should set this alongside
+	// the *Enabled flags.
+	NodePasscode *string `json:"nodePasscode,omitempty"`
 }
 
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
@@ -138,6 +158,57 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			}
 			if config.MeetingRetentionDays != nil {
 				result += fmt.Sprintf("\nMeeting recording retention set to %d days", *config.MeetingRetentionDays)
+			}
+		}
+	}
+
+	// Apply the sensitive-surface permissions + passcode (aceteam#6524) when the
+	// platform pushed any of them. Load-modify-save the same permissions.yaml the
+	// gateway, terminal/desktop listeners, and Redis handlers read, so the
+	// programmatic path and the Control Center converge on one persisted value.
+	// Written to platform.ConfigDir() (the per-concern config location the gates
+	// read), not h.ConfigDir (the manifest dir). Only the fields the platform set
+	// are touched; nil pointers leave the persisted value intact.
+	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.FilesEnabled != nil || config.NodePasscode != nil {
+		perms := citadelconfig.LoadPermissions(platform.ConfigDir())
+		if config.ConsoleEnabled != nil {
+			perms.Console = *config.ConsoleEnabled
+		}
+		if config.DesktopEnabled != nil {
+			perms.Desktop = *config.DesktopEnabled
+		}
+		if config.FilesEnabled != nil {
+			perms.Files = *config.FilesEnabled
+		}
+		if config.NodePasscode != nil {
+			if err := perms.SetPasscode(*config.NodePasscode); err != nil {
+				result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
+			}
+		}
+		if err := citadelconfig.SavePermissions(platform.ConfigDir(), perms); err != nil {
+			result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
+		} else {
+			if config.ConsoleEnabled != nil {
+				result += fmt.Sprintf("\nConsole (terminal) access %s", enabledLabel(*config.ConsoleEnabled))
+			}
+			if config.DesktopEnabled != nil {
+				result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+			}
+			if config.FilesEnabled != nil {
+				result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
+			}
+			if config.NodePasscode != nil {
+				if perms.HasPasscode() {
+					result += "\nNode passcode set"
+				} else {
+					result += "\nNode passcode cleared (sensitive surfaces re-locked)"
+				}
+			}
+			// Guardrail: an enabled surface with no passcode fails closed. Surface
+			// that in the job result so an operator who enabled without a passcode
+			// understands why access is still denied.
+			if (perms.Console || perms.Desktop || perms.Files) && !perms.HasPasscode() {
+				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
 			}
 		}
 	}

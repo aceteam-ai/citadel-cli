@@ -34,6 +34,12 @@ type Server struct {
 	tokenValidator terminal.TokenValidator
 	orgID          string
 	enableDesktop  bool
+	// passcodeVerifier, when non-nil, adds the per-node passcode gate on top of
+	// the token check for the desktop endpoints (/api/screenshot, /api/actions)
+	// (aceteam#6524). These serve the operator's screen/input directly over the
+	// mesh, so a valid org token is not sufficient: the caller must also hold the
+	// node passcode. Nil leaves behavior unchanged (token-only). Fails closed.
+	passcodeVerifier func(pin string) bool
 
 	// gatewayCertPath is the on-disk path to the gateway's self-signed leaf cert
 	// PEM. When set, the status server serves it unauthenticated at
@@ -88,6 +94,11 @@ type ServerConfig struct {
 	TokenValidator terminal.TokenValidator // Optional: enables authenticated desktop endpoints
 	OrgID          string                  // Required when TokenValidator is set
 	EnableDesktop  bool                    // When true AND TokenValidator is set, registers /api/screenshot and /api/actions
+
+	// PasscodeVerifier, when non-nil, adds the per-node passcode gate to the
+	// desktop endpoints on top of the token check (aceteam#6524). See the
+	// Server.passcodeVerifier field. Nil leaves behavior token-only.
+	PasscodeVerifier func(pin string) bool
 
 	// Agent, when set, registers the /agent/* introspection & control
 	// endpoints (issue #236). These are served over the same dual (LAN+VPN)
@@ -145,6 +156,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		tokenValidator:    cfg.TokenValidator,
 		orgID:             cfg.OrgID,
 		enableDesktop:     cfg.EnableDesktop,
+		passcodeVerifier:  cfg.PasscodeVerifier,
 		agent:             cfg.Agent,
 		extraRoutes:       cfg.ExtraRoutes,
 		gatewayCertPath:   cfg.GatewayCertPath,
@@ -515,6 +527,21 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if _, err := s.tokenValidator.ValidateToken(token, s.orgID); err != nil {
 			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
+		}
+		// Per-node passcode gate (aceteam#6524): the desktop endpoints expose the
+		// operator's screen/input directly over the mesh, so a valid org token is
+		// not sufficient — the caller must also present the node passcode via the
+		// X-Citadel-Passcode header (or ?passcode= for parity with the WS paths).
+		// Fails closed. Skipped only when no verifier is wired.
+		if s.passcodeVerifier != nil {
+			passcode := r.Header.Get("X-Citadel-Passcode")
+			if passcode == "" {
+				passcode = r.URL.Query().Get("passcode")
+			}
+			if !s.passcodeVerifier(passcode) {
+				http.Error(w, `{"error":"node passcode required"}`, http.StatusUnauthorized)
+				return
+			}
 		}
 		next(w, r)
 	}

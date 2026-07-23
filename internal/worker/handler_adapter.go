@@ -130,6 +130,21 @@ type LegacyHandlerOpts struct {
 	// "disabled" error rather than "unsupported job type"), but every command
 	// is rejected. Wired from the persisted `shell` node permission.
 	ShellDisabled bool
+	// DesktopDisabled, when true, SKIPS registration of the screen/VNC/desktop
+	// job handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
+	// VNC_ACTIONS). A fresh node has `desktop` default-DENY (aceteam#6524), so it
+	// does not serve these — a dispatched desktop job is refused ("unsupported
+	// job type") until the operator opts in. Wired from the persisted `desktop`
+	// node permission.
+	DesktopDisabled bool
+	// FilesDisabled, when true, SKIPS registration of the file browse/host job
+	// handlers (FILE_READ/READ_BYTES/WRITE/WRITE_BYTES/EDIT/LIST/SEARCH/INDEX/
+	// SEMANTIC_SEARCH). A fresh node has `files` default-DENY (aceteam#6524).
+	// Note this gates ONLY the file-browser surface: TRANSCRIBE_AUDIO and
+	// MEETING_JOIN share the workspace but belong to the default-ON meeting
+	// capability and are NOT gated here. Wired from the persisted `files`
+	// node permission.
+	FilesDisabled bool
 	// MeetingProfileDir overrides the persistent, signed-in bot Chrome profile
 	// directory used by MEETING_JOIN (issue #5122). If empty, the handler falls
 	// back to platform.EnvMeetingProfileDir, then platform's ConfigDir()-rooted
@@ -183,23 +198,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeIOSBuild, jobs.NewIOSBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeAndroidBuild, jobs.NewAndroidBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeGomobileBuild, jobs.NewGomobileBuildHandler(opts.WorkspaceDir)),
-		// Desktop capture/input handlers (issue #4179). Registered
-		// unconditionally: screenshot/type/keys need no workspace sandbox, and
-		// gating them behind WorkspaceDir would leave the desktop_screenshot /
-		// vnc_* MCP tools timing out on any node without a configured workspace.
-		// FILE_SCREENSHOT and VNC_SCREENSHOT share one capture path (the
-		// existing internal/desktop X11 capture); there is no separate VNC
-		// framebuffer source.
-		NewLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}),
-		NewLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}),
-		NewLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}),
-		NewLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}),
-		// VNC_ACTIONS exposes the pointer/keyboard primitives shipped in #314
-		// (move/click/mousedown/mouseup/scroll, including the drag sequence) over
-		// the fabric Redis transport so the aceteam desktop_click / desktop_drag
-		// MCP tools can drive a node end to end (issue #4180). Same unconditional
-		// registration rationale as the screenshot/type/keys handlers above.
-		NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
 		NewLegacyHandlerAdapter(JobTypeCobrowse, jobs.NewCobrowseHandler()),
 		// Resource snapshot (issue #427): returns the node's full GPU/host
 		// resource-consumer picture over the fabric. Registered unconditionally
@@ -226,44 +224,73 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeInstanceMessage, jobs.NewInstanceMessageHandler()),
 	}
 
+	// Screen/VNC/desktop handlers (issue #4179, #4180) — the screen-share
+	// surface. Default-DENY (aceteam#6524): registered ONLY when the operator has
+	// opted the node's `desktop` permission in. A fresh node does not register
+	// them, so a dispatched desktop_screenshot / vnc_* / desktop_click fabric job
+	// is refused ("unsupported job type") rather than silently capturing the
+	// operator's screen. FILE_SCREENSHOT and VNC_SCREENSHOT share one capture
+	// path (the internal/desktop X11 capture); there is no separate VNC
+	// framebuffer source.
+	if !opts.DesktopDisabled {
+		handlers = append(handlers,
+			NewLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}),
+			NewLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}),
+			NewLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}),
+			NewLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}),
+			NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
+		)
+	}
+
 	// Register file-operation handlers when a workspace is configured.
 	if opts.WorkspaceDir != "" {
-		readHandler := jobs.NewFileReadHandler(opts.WorkspaceDir)
-		readHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+		// File browse/host handlers — the node-filesystem surface. Default-DENY
+		// (aceteam#6524): registered ONLY when the operator has opted the node's
+		// `files` permission in. A fresh node does not register them, so a
+		// dispatched FILE_* fabric job is refused rather than serving the
+		// operator's filesystem. NOTE: TRANSCRIBE_AUDIO and MEETING_JOIN below
+		// also use the workspace but belong to the default-ON meeting capability,
+		// so they are deliberately OUTSIDE this gate.
+		if !opts.FilesDisabled {
+			readHandler := jobs.NewFileReadHandler(opts.WorkspaceDir)
+			readHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
-		readBytesHandler := jobs.NewFileReadBytesHandler(opts.WorkspaceDir)
-		readBytesHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			readBytesHandler := jobs.NewFileReadBytesHandler(opts.WorkspaceDir)
+			readBytesHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
-		listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
-		listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			listHandler := jobs.NewFileListHandler(opts.WorkspaceDir)
+			listHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
-		searchHandler := jobs.NewFileSearchHandler(opts.WorkspaceDir)
-		searchHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			searchHandler := jobs.NewFileSearchHandler(opts.WorkspaceDir)
+			searchHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
-		// Node-local semantic index (aceteam#6087). FILE_INDEX walks the
-		// workspace and (re)embeds changed files via the node's TEI service;
-		// FILE_SEMANTIC_SEARCH runs a KNN over that index. The DB path is
-		// resolved by the handler (CITADEL_INDEX_DB or index.db beside the
-		// workspace). FILE_INDEX honors the read-outside-workspace relaxation
-		// like the other read handlers.
-		indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
-		indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
+			// Node-local semantic index (aceteam#6087). FILE_INDEX walks the
+			// workspace and (re)embeds changed files via the node's TEI service;
+			// FILE_SEMANTIC_SEARCH runs a KNN over that index. The DB path is
+			// resolved by the handler (CITADEL_INDEX_DB or index.db beside the
+			// workspace). FILE_INDEX honors the read-outside-workspace relaxation
+			// like the other read handlers.
+			indexHandler := jobs.NewFileIndexHandler(opts.WorkspaceDir, "")
+			indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
+			handlers = append(handlers,
+				NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
+				NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
+				NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
+				NewLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)),
+				NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
+				NewLegacyHandlerAdapter(JobTypeFileList, listHandler),
+				NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
+				NewLegacyHandlerAdapter(JobTypeFileIndex, indexHandler),
+				NewLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")),
+			)
+		}
+
+		// Node-local meeting transcription (faster-whisper sidecar). Part of the
+		// default-ON meeting capability, NOT the files surface — registered with
+		// the workspace (so it can validate audio paths the way file handlers do)
+		// but OUTSIDE the FilesDisabled gate.
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
-			NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
-			NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileList, listHandler),
-			NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
-			NewLegacyHandlerAdapter(JobTypeFileList, jobs.NewFileListHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileSearch, jobs.NewFileSearchHandler(opts.WorkspaceDir)),
-			NewLegacyHandlerAdapter(JobTypeFileIndex, indexHandler),
-			NewLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")),
-			// Node-local meeting transcription (faster-whisper sidecar). Registered
-			// with the workspace so it can validate audio paths the same way the
-			// file handlers do.
 			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
 		)
 

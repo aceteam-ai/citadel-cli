@@ -369,6 +369,17 @@ func categoryForPath(path string) string {
 	return ""
 }
 
+// passcodeFromRequest extracts the per-node passcode a caller presents for a
+// sensitive surface. The header is the primary channel; the query parameter is
+// the fallback for WebSocket clients (e.g. the browser terminal/VNC), which
+// cannot set custom headers on the upgrade request.
+func passcodeFromRequest(r *http.Request) string {
+	if h := r.Header.Get("X-Citadel-Passcode"); h != "" {
+		return h
+	}
+	return r.URL.Query().Get("passcode")
+}
+
 // permissionMiddleware checks permissions before passing requests to the next handler.
 // If permissions are nil, all requests pass through.
 func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
@@ -402,6 +413,22 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 				w.WriteHeader(http.StatusForbidden)
 				fmt.Fprint(w, `{"error":"capability disabled by node operator"}`)
 				return
+			}
+
+			// Passcode gate (aceteam#6524): an ENABLED sensitive surface
+			// (console/desktop/files) additionally requires the per-node passcode,
+			// so "enabled" is not "open to anyone on the org mesh". The caller
+			// presents it via the X-Citadel-Passcode header (or ?passcode= for
+			// WebSocket clients that cannot set headers). Fails CLOSED: a node with
+			// no passcode set, or a wrong/absent passcode, is denied — enabling a
+			// surface without a passcode never silently opens it.
+			if config.IsSensitiveCategory(category) {
+				if !perms.VerifyPasscode(passcodeFromRequest(r)) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnauthorized)
+					fmt.Fprint(w, `{"error":"node passcode required"}`)
+					return
+				}
 			}
 		}
 		next.ServeHTTP(w, r)

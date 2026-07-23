@@ -1944,20 +1944,20 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 	services := []builtinServiceDef{
 		{
 			name:    "Console",
-			desc:    "Remote terminal access",
-			detail:  "Provides WebSocket-based terminal access to this machine.\nRemote users can open a shell session through the AceTeam web UI.\nGateway route: /terminal",
+			desc:    "Remote terminal access (default OFF)",
+			detail:  "Provides WebSocket-based terminal access to this machine.\nRemote users can open a shell session through the AceTeam web UI.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose a terminal. When enabled it still requires the node\npasscode, so enabling is not the same as opening it to the org mesh.\nGateway route: /terminal",
 			enabled: &perms.Console,
 		},
 		{
 			name:    "Desktop",
-			desc:    "VNC, screenshots, remote actions",
-			detail:  "Enables remote desktop access via VNC and screenshot capture.\nIncludes remote keyboard/mouse actions.\nGateway routes: /vnc, /api/screenshot, /api/actions",
+			desc:    "VNC, screenshots, remote actions (default OFF)",
+			detail:  "Enables remote desktop access via VNC and screenshot capture.\nIncludes remote keyboard/mouse actions.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose its screen. When enabled it still requires the node\npasscode.\nGateway routes: /vnc, /api/screenshot, /api/actions",
 			enabled: &perms.Desktop,
 		},
 		{
 			name:    "Files",
-			desc:    "File browser API",
-			detail:  "Exposes a file browser API for remote file access.\nAllows reading, writing, and searching files on this machine.\nGateway routes: /api/files/*",
+			desc:    "File browser API (default OFF)",
+			detail:  "Exposes a file browser API for remote file access.\nAllows reading, writing, and searching files on this machine.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose its filesystem. When enabled it still requires the\nnode passcode.\nGateway routes: /api/files/*",
 			enabled: &perms.Files,
 		},
 		{
@@ -2051,6 +2051,16 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 				state = "disabled"
 			}
 			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on restart)", services[row].name, state))
+
+			// Passcode reminder (aceteam#6524): a sensitive surface
+			// (Console/Desktop/Files) that is enabled without a node passcode
+			// fails CLOSED — enabling it does not open it. Warn so the operator
+			// knows to set a passcode (via the web console / APPLY_DEVICE_CONFIG)
+			// before the surface is actually reachable.
+			name := services[row].name
+			if *services[row].enabled && (name == "Console" || name == "Desktop" || name == "Files") && !perms.HasPasscode() {
+				cc.AddActivity("warning", fmt.Sprintf("%s enabled but no node passcode is set — access stays denied until you set a passcode", name))
+			}
 		}
 	}
 
