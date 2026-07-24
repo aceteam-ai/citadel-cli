@@ -37,7 +37,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/instance"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/spf13/cobra"
 )
@@ -54,7 +56,10 @@ client of it. 'citadel attach' names the running instance (PID, version, uptime)
 and shows its live node identity, health, and managed services, read from the
 worker's local status server.
 
-If no worker is running, it says so and points you at 'citadel work'.`,
+If no worker is running, it says so and points you at 'citadel work'.
+
+Use --shell to instead open an interactive shell on the running control center
+(the TUI you launched with 'citadel'). Ctrl+] detaches; Ctrl-D exits the shell.`,
 	RunE:         runAttach,
 	SilenceUsage: true,
 	// The no-worker path prints its own friendly guidance and returns
@@ -68,13 +73,39 @@ If no worker is running, it says so and points you at 'citadel work'.`,
 // scripts while keeping the message clean.
 var errNoRunningWorker = fmt.Errorf("no citadel worker is running on this node")
 
+// errNoRunningInstance is the --shell counterpart: returned (exit 1) when no
+// control-center TUI (the citadel.sock instance) is running to open a shell on.
+var errNoRunningInstance = fmt.Errorf("no citadel control center is running on this node")
+
+// attachShell, when set, opens an interactive shell on the running control-center
+// instance (the citadel.sock/instance mechanism) instead of printing the worker
+// status banner. NOTE: this targets the INSTANCE (TUI) mechanism, distinct from
+// the default banner which reads the WORKER lock — two independent "is citadel
+// running?" surfaces on a node.
+var attachShell bool
+
 func init() {
+	attachCmd.Flags().BoolVar(&attachShell, "shell", false,
+		"Open an interactive shell on the running control center (instead of printing status). Ctrl+] detaches; Ctrl-D exits the shell.")
 	rootCmd.AddCommand(attachCmd)
 }
 
 // runAttach discovers the running worker via the single-instance lock and prints
 // the attach view, or a "nothing to attach to" message when none is running.
 func runAttach(_ *cobra.Command, _ []string) error {
+	// --shell: open an interactive shell on the running control-center instance
+	// (the citadel.sock mechanism, distinct from the worker lock below). This is
+	// the explicit opt-in escape hatch for the behavior bare `citadel` used to do
+	// by default — now bare `citadel` just names the running TUI and exits.
+	if attachShell {
+		configDir := platform.ConfigDir()
+		if !instance.IsRunning(configDir) {
+			fmt.Fprintln(os.Stdout, "No Citadel control center is running on this node. Start one with:  citadel")
+			return errNoRunningInstance
+		}
+		return instance.Attach(configDir)
+	}
+
 	stateDir := network.GetStateDir()
 
 	// IsHeld is the authoritative liveness check (flock probe + PID liveness +
