@@ -130,6 +130,13 @@ type LegacyHandlerOpts struct {
 	// "disabled" error rather than "unsupported job type"), but every command
 	// is rejected. Wired from the persisted `shell` node permission.
 	ShellDisabled bool
+	// ShellVerifyPasscode gates an ENABLED SHELL_COMMAND handler on the per-node
+	// passcode (aceteam#6524), mirroring the console/desktop/files gate. Wired from
+	// config.LoadPermissions(...).VerifyPasscode so an enabled shell still refuses
+	// a command that does not present the correct node passcode. REQUIRED whenever
+	// ShellDisabled is false: a nil verifier makes the handler fail closed (refuse
+	// every command). See jobs.ShellCommandHandler.VerifyPasscode.
+	ShellVerifyPasscode func(pin string) bool
 	// DesktopDisabled, when true, SKIPS registration of the screen/VNC/desktop
 	// job handlers (FILE_SCREENSHOT, VNC_SCREENSHOT, VNC_TYPE, VNC_KEYS,
 	// VNC_ACTIONS). A fresh node has `desktop` default-DENY (aceteam#6524), so it
@@ -169,6 +176,7 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler := jobs.NewShellCommandHandler(opts.WorkspaceDir)
 	shellHandler.Disabled = opts.ShellDisabled
+	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
 
 	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeShellCommand, shellHandler),

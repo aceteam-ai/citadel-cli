@@ -2032,6 +2032,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:                 ccConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
+		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
 		FilesDisabled:             !ccPerms.Files,
 		WorkflowExec:              ccWfExec,

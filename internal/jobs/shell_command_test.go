@@ -9,6 +9,12 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
+// allowPasscode is a test verifier that accepts any presented passcode. It lets
+// the pre-existing shell tests exercise the ENABLED execution path without
+// threading a real node passcode through each case; the passcode gate itself is
+// covered by the dedicated TestShellCommand_Passcode* cases below.
+func allowPasscode(string) bool { return true }
+
 func runShell(t *testing.T, h *ShellCommandHandler, command string) ([]byte, error) {
 	t.Helper()
 	return h.Execute(JobContext{}, &nexus.Job{
@@ -21,7 +27,7 @@ func runShell(t *testing.T, h *ShellCommandHandler, command string) ([]byte, err
 }
 
 func TestShellCommand_MissingCommand(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	_, err := h.Execute(JobContext{}, &nexus.Job{
 		ID:      "test-1",
 		Type:    "SHELL_COMMAND",
@@ -33,7 +39,7 @@ func TestShellCommand_MissingCommand(t *testing.T) {
 }
 
 func TestShellCommand_EmptyCommand(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	// Whitespace-only command must be rejected.
 	_, err := runShell(t, h, "   ")
 	if err == nil {
@@ -42,7 +48,7 @@ func TestShellCommand_EmptyCommand(t *testing.T) {
 }
 
 func TestShellCommand_BasicExecution(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "echo hello")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -53,7 +59,7 @@ func TestShellCommand_BasicExecution(t *testing.T) {
 }
 
 func TestShellCommand_Pipe(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "echo hello | cat")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -64,7 +70,7 @@ func TestShellCommand_Pipe(t *testing.T) {
 }
 
 func TestShellCommand_AndAnd(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "true && echo ok")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -75,7 +81,7 @@ func TestShellCommand_AndAnd(t *testing.T) {
 }
 
 func TestShellCommand_QuotedArgs(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, `echo "a b c"`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -86,7 +92,7 @@ func TestShellCommand_QuotedArgs(t *testing.T) {
 }
 
 func TestShellCommand_MultiLineScript(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "set -e\necho one\necho two")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -97,7 +103,7 @@ func TestShellCommand_MultiLineScript(t *testing.T) {
 }
 
 func TestShellCommand_NonZeroExit(t *testing.T) {
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	_, err := runShell(t, h, "exit 3")
 	if err == nil {
 		t.Fatal("expected error for non-zero exit, got nil")
@@ -110,6 +116,7 @@ func TestShellCommand_WorkspaceCwd(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	h := NewShellCommandHandler(dir)
+	h.VerifyPasscode = allowPasscode
 	// Relative path resolves against the configured workspace directory.
 	out, err := runShell(t, h, "cat foo.txt")
 	if err != nil {
@@ -231,8 +238,9 @@ func TestShellCommand_DisabledRefusesAndDoesNotExec(t *testing.T) {
 }
 
 func TestShellCommand_EnabledByDefault(t *testing.T) {
-	// A zero-value handler (Disabled=false) must still execute normally.
-	h := &ShellCommandHandler{}
+	// An enabled handler (Disabled=false) with a satisfied passcode gate executes
+	// normally.
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "echo ok")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -248,13 +256,116 @@ func TestShellCommand_ScrubsSecretsFromChildEnv(t *testing.T) {
 	t.Setenv("FOO_TOKEN", "leak-me")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "leak-me-too")
 
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "echo \"[$FOO_TOKEN][$AWS_SECRET_ACCESS_KEY]\"")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.TrimSpace(string(out)) != "[][]" {
 		t.Errorf("secrets leaked into child env: output = %q", string(out))
+	}
+}
+
+// runShellWithPasscode dispatches a SHELL_COMMAND carrying a passcode payload
+// field, exercising the aceteam#6524 per-job passcode gate.
+func runShellWithPasscode(t *testing.T, h *ShellCommandHandler, command, passcode string) ([]byte, error) {
+	t.Helper()
+	return h.Execute(JobContext{}, &nexus.Job{
+		ID:   "test",
+		Type: "SHELL_COMMAND",
+		Payload: map[string]string{
+			"command":               command,
+			ShellPasscodePayloadKey: passcode,
+		},
+	})
+}
+
+// TestShellCommand_EnabledNilVerifierFailsClosed proves the fail-closed contract
+// at the type level: an ENABLED handler (Disabled=false) whose passcode verifier
+// was never wired refuses every command, so a forgotten gate never silently opens
+// root shell.
+func TestShellCommand_EnabledNilVerifierFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "executed.marker")
+
+	h := &ShellCommandHandler{} // enabled, VerifyPasscode nil
+	out, err := runShell(t, h, "touch "+sentinel)
+
+	if err == nil {
+		t.Fatal("expected refusal when the passcode gate is not wired, got nil")
+	}
+	if err.Error() != ShellPasscodeRequiredError {
+		t.Errorf("error = %q, want %q", err.Error(), ShellPasscodeRequiredError)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected no output, got %q", string(out))
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Error("command executed despite a nil passcode verifier")
+	}
+}
+
+// TestShellCommand_EnabledWrongPasscodeRefused proves that an enabled handler
+// with a real verifier still refuses a command that presents the wrong (or no)
+// passcode, and does not execute it.
+func TestShellCommand_EnabledWrongPasscodeRefused(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "executed.marker")
+
+	// Verifier that only accepts the correct PIN.
+	h := &ShellCommandHandler{VerifyPasscode: func(pin string) bool { return pin == "2468" }}
+
+	// Wrong passcode.
+	out, err := runShellWithPasscode(t, h, "touch "+sentinel, "0000")
+	if err == nil || err.Error() != ShellPasscodeRequiredError {
+		t.Fatalf("wrong passcode: err = %v, want %q", err, ShellPasscodeRequiredError)
+	}
+	// Absent passcode.
+	if _, err := runShell(t, h, "touch "+sentinel); err == nil || err.Error() != ShellPasscodeRequiredError {
+		t.Fatalf("absent passcode: err = %v, want %q", err, ShellPasscodeRequiredError)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected no output, got %q", string(out))
+	}
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Error("command executed despite a wrong/absent passcode")
+	}
+}
+
+// TestShellCommand_EnabledCorrectPasscodeRuns proves the allow path: an enabled
+// handler runs the command when the correct passcode is presented.
+func TestShellCommand_EnabledCorrectPasscodeRuns(t *testing.T) {
+	h := &ShellCommandHandler{VerifyPasscode: func(pin string) bool { return pin == "2468" }}
+	out, err := runShellWithPasscode(t, h, "echo ok", "2468")
+	if err != nil {
+		t.Fatalf("correct passcode should run: %v", err)
+	}
+	if string(out) != "ok\n" {
+		t.Errorf("output = %q, want %q", string(out), "ok\n")
+	}
+}
+
+// TestShellCommand_DisabledBeatsPasscode confirms the Disabled kill-switch is
+// checked first: a disabled handler refuses with ShellDisabledError even when a
+// correct passcode is presented.
+func TestShellCommand_DisabledBeatsPasscode(t *testing.T) {
+	h := &ShellCommandHandler{Disabled: true, VerifyPasscode: allowPasscode}
+	_, err := runShellWithPasscode(t, h, "echo ok", "2468")
+	if err == nil || err.Error() != ShellDisabledError {
+		t.Fatalf("disabled handler: err = %v, want %q", err, ShellDisabledError)
+	}
+}
+
+// TestShellCommand_PasscodeNotForwardedToChildEnv confirms the passcode payload
+// field never leaks into the executed command's environment.
+func TestShellCommand_PasscodeNotForwardedToChildEnv(t *testing.T) {
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
+	out, err := runShellWithPasscode(t, h, "env", "super-secret-pin")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(string(out), "super-secret-pin") {
+		t.Errorf("passcode leaked into child environment: %q", string(out))
 	}
 }
 
@@ -265,7 +376,7 @@ func TestShellCommand_RestrictedPATH(t *testing.T) {
 	t.Cleanup(func() { os.Setenv("PATH", origPATH) })
 	os.Setenv("PATH", "/nonexistent_dir_only")
 
-	h := &ShellCommandHandler{}
+	h := &ShellCommandHandler{VerifyPasscode: allowPasscode}
 	out, err := runShell(t, h, "uname")
 	if err != nil {
 		t.Fatalf("shell command with restricted PATH should work via augmented env: %v", err)

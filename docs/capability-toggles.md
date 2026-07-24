@@ -124,6 +124,16 @@ actual access:
    `FilesDisabled` opts). A fresh node refuses those jobs. `TRANSCRIBE_AUDIO` and
    `MEETING_JOIN` share the workspace but belong to the default-ON meeting
    capability and are deliberately **not** gated.
+   - **Shell** (`SHELL_COMMAND`) is the odd one out: it has **no gateway/HTTP
+     route** (`categoryForPath` never returns `shell`), so it is gated entirely on
+     the Redis job path. The handler is always registered (so a disabled node
+     returns the "disabled" refusal rather than "unsupported job type"), but it
+     refuses unless `shell` is enabled **and** the job presents the correct node
+     passcode. The passcode travels in the `SHELL_COMMAND` payload's `passcode`
+     field (there is no header, unlike console/desktop/files). Fail-closed: an
+     enabled handler whose passcode verifier was never wired, or a wrong/absent
+     payload passcode, refuses every command. This governs the platform's
+     node-management tabs (logs/services/docker), which run shell commands.
 3. **HTTPS gateway** (`internal/gateway/gateway.go`): `permissionMiddleware`
    blocks a disabled category, and for an enabled sensitive category additionally
    requires the passcode (`X-Citadel-Passcode` header, or `?passcode=` for
@@ -139,19 +149,28 @@ actual access:
 
 ### Enabling a surface
 
-- **Control Center:** the Built-in Services modal toggles console/desktop/files.
-  Enabling one with no passcode set warns that access stays denied until a
-  passcode is set.
+- **Control Center:** the Built-in Services modal toggles
+  console/desktop/files/shell. Enabling one with no passcode set warns that
+  access stays denied until a passcode is set.
 - **Programmatic (`APPLY_DEVICE_CONFIG`):** `DeviceConfig` carries
-  `consoleEnabled` / `desktopEnabled` / `filesEnabled` (`*bool`, nil = untouched)
-  and `nodePasscode` (`*string`, bcrypt-hashed before persist; empty clears it).
-  This writes the same `permissions.yaml` the gates read.
+  `consoleEnabled` / `desktopEnabled` / `filesEnabled` / `shellEnabled` (`*bool`,
+  nil = untouched) and `nodePasscode` (`*string`, bcrypt-hashed before persist;
+  empty clears it). This writes the same `permissions.yaml` the gates read. To
+  enable remote shell for the node-management tabs, send
+  `{"shellEnabled": true, "nodePasscode": "<pin>"}`; the tabs must then present
+  that same `<pin>` in each `SHELL_COMMAND` payload's `passcode` field.
 
 ### Cross-repo follow-up (aceteam web console, not in this repo)
 
-The web console should render console/desktop/files as **opt-in** (an "enable +
-set passcode" call to action) rather than presenting a live console for a node
-that has not enabled the surface, and must send the passcode on the
-`X-Citadel-Passcode` header (or `?passcode=` for the WebSocket terminal/VNC).
-Track alongside the mesh-ACL / cross-org work ([[citadel-mesh-security]] #5028):
-that work is about cross-org exposure, this is per-node owner consent.
+The web console should render console/desktop/files/shell as **opt-in** (an
+"enable + set passcode" call to action) rather than presenting a live surface for
+a node that has not enabled it, and must send the passcode on the
+`X-Citadel-Passcode` header (or `?passcode=` for the WebSocket terminal/VNC). For
+**shell** specifically (the node-management logs/services/docker tabs, aceteam
+#6559), the enable call is `APPLY_DEVICE_CONFIG {"shellEnabled": true,
+"nodePasscode": "<pin>"}` and each dispatched `SHELL_COMMAND` must carry the pin
+in its `passcode` payload field (shell has no HTTP header path). How the web
+attaches that pin per dispatch (human-entered once vs stored for the session) is
+the web side's decision. Track alongside the mesh-ACL / cross-org work
+([[citadel-mesh-security]] #5028): that work is about cross-org exposure, this is
+per-node owner consent.

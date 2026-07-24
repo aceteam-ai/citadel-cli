@@ -22,6 +22,22 @@ import (
 // tests, so keep it stable.
 const ShellDisabledError = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center, then restart the worker)"
 
+// ShellPasscodeRequiredError is the exact message returned when SHELL_COMMAND
+// execution is enabled but the job did not present the correct per-node
+// passcode. Shell is a sensitive surface (aceteam#6524): enabling it is not the
+// same as opening it to anyone who can dispatch a job, so an enabled node
+// additionally requires the node passcode (the SAME bcrypt passcode that gates
+// console/desktop/files). Fails CLOSED: a node with no passcode set, a passcode
+// gate that was never wired, or a wrong/absent payload passcode is refused. The
+// wording is part of the handler's contract and is asserted in tests, so keep it
+// stable.
+const ShellPasscodeRequiredError = "shell command execution requires the node passcode; set a node passcode and present it in the SHELL_COMMAND payload `passcode` field"
+
+// ShellPasscodePayloadKey is the SHELL_COMMAND payload field carrying the
+// per-node passcode. The platform (aceteam#6559) must set this on every shell
+// dispatch once the node has Shell enabled, or the command is refused.
+const ShellPasscodePayloadKey = "passcode"
+
 // standardPATHDirs are directories ensured on PATH when the inherited process
 // environment is restricted (e.g. citadel running via systemd or nohup with a
 // minimal PATH). They are merged into the command environment so /bin/sh can
@@ -208,6 +224,16 @@ type ShellCommandHandler struct {
 	// `shell` node permission, which is default-deny (opt-in): unless a node
 	// explicitly enables Shell, callers set Disabled=true (aceteam #6149).
 	Disabled bool
+	// VerifyPasscode gates an ENABLED shell handler on the per-node passcode
+	// (aceteam#6524), mirroring how the gateway gates console/desktop/files: it
+	// checks the passcode presented in the SHELL_COMMAND payload (see
+	// ShellPasscodePayloadKey) against the node's bcrypt passcode. Fail-CLOSED
+	// contract: whenever the handler is enabled (Disabled==false) this MUST be
+	// wired; a nil verifier refuses every command, so a forgotten gate never
+	// silently opens root shell to anyone who can dispatch a job. The construction
+	// sites (worker.CreateLegacyHandlersWithOpts and the legacy cmd/job_handlers
+	// map) wire it from config.LoadPermissions(...).VerifyPasscode.
+	VerifyPasscode func(pin string) bool
 }
 
 // NewShellCommandHandler constructs a handler bound to a workspace directory.
@@ -220,6 +246,16 @@ func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, e
 	if h.Disabled {
 		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, ShellDisabledError)
 		return nil, fmt.Errorf("%s", ShellDisabledError)
+	}
+
+	// Passcode gate (aceteam#6524): an ENABLED shell surface additionally requires
+	// the per-node passcode, so "enabled" is not "open to anyone who can dispatch a
+	// job". Fail CLOSED: a nil verifier (gate not wired) or a wrong/absent payload
+	// passcode refuses before any command runs. The passcode is read from a
+	// dedicated payload field and is never forwarded into the command environment.
+	if h.VerifyPasscode == nil || !h.VerifyPasscode(job.Payload[ShellPasscodePayloadKey]) {
+		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, ShellPasscodeRequiredError)
+		return nil, fmt.Errorf("%s", ShellPasscodeRequiredError)
 	}
 
 	cmdString, ok := job.Payload["command"]
