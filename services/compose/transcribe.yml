@@ -5,7 +5,8 @@ services:
     ports:
       - "8101:8101"
     volumes:
-      # faster-whisper model cache (shared with other HF-based services).
+      # HF model cache: faster-whisper + wav2vec2 alignment + pyannote models.
+      # Shared with other HF-based services so downloads are paid once.
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
       # Mount the node workspace read-only so the service can read audio files
       # that FILE_WRITE_BYTES placed there.
@@ -18,9 +19,38 @@ services:
       #   CITADEL_WORKSPACE=/home/<user>/citadel-node/workspace
       - ${CITADEL_WORKSPACE:?set CITADEL_WORKSPACE to an absolute workspace path}:/workspace:ro
     environment:
-      # faster-whisper model size: base = good CPU speed/accuracy tradeoff.
-      - WHISPER_MODEL=base
-      - WHISPER_DEVICE=cpu
-      - WHISPER_COMPUTE_TYPE=int8
+      # faster-whisper model size. "base" is the CPU-friendly default; bump to
+      # "large-v3" (fits a 24GB GPU) or "medium" for higher accuracy when a GPU
+      # is available and free.
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      # Device: "auto" uses CUDA when visible, else CPU. The published image is
+      # a CPU build, so this resolves to cpu until a CUDA image + GPU
+      # reservation are added (see the deploy.resources block below).
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-auto}
+      # HuggingFace token for pyannote speaker diarization. pyannote's model is
+      # GATED: without a token the service falls back to silence-gap labelling
+      # ("basic" tier) and never breaks. To enable REAL diarization:
+      #   1. Create a token at https://hf.co/settings/tokens
+      #   2. Accept the terms on
+      #      https://hf.co/pyannote/speaker-diarization-community-1
+      #      (whisperx's default model). To use the classic 3.1 pipeline
+      #      instead, set DIARIZE_MODEL=pyannote/speaker-diarization-3.1 and
+      #      accept that model plus https://hf.co/pyannote/segmentation-3.0.
+      #   3. Export HF_TOKEN in the node environment before SERVICE_START.
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Optional: pin a specific pyannote diarization model (see above).
+      - DIARIZE_MODEL=${DIARIZE_MODEL:-}
       - PORT=8101
     restart: unless-stopped
+    # GPU enablement (commented until a CUDA image is published): uncomment to
+    # run large-v3 + pyannote on the GPU. Requires the nvidia container runtime
+    # (default on fabric GPU nodes) and enough free VRAM (~5GB for large-v3
+    # float16 + wav2vec2 + pyannote). Note: a busy GPU (e.g. vLLM holding most
+    # of the card) will OOM the model load, so keep WHISPER_DEVICE=cpu there.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
