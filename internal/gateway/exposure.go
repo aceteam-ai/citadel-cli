@@ -224,22 +224,78 @@ func (s *Server) Expose(name, address string, policy *ExposePolicy) error {
 		return fmt.Errorf("gateway: Expose requires a valid visibility (private|org|link)")
 	}
 	// StripPrefix so the exposed app's own paths (/, /assets, ...) map through
-	// unchanged, exactly like a module route.
-	if err := s.WireModuleRoute(ExposeRoutePath(name), address, true); err != nil {
-		return err
-	}
+	// unchanged, exactly like a module route. WebSocket is enabled because a real
+	// web app (Frigate live view, dashboards) upgrades to WS; registerProxy routes
+	// plain HTTP and WS upgrades through the same handler.
+	//
+	// NOTE (subpath constraint): because the route is served under /expose/<name>/
+	// with StripPrefix, an exposed app that emits ABSOLUTE asset paths (<script
+	// src="/assets/...">) will have the browser resolve them at the gateway root
+	// (no /expose/<name> prefix) and 404 — for EVERY visibility level, this is not
+	// an auth issue. Such an app must be configured to serve under a base path
+	// matching the expose prefix (e.g. Frigate's base-path config, handled by the
+	// #597 nvr module). Apps that use relative paths work unchanged.
+	s.wireExposeRoute(ExposeRoutePath(name), address)
 	s.SetExposure(name, policy)
 	return nil
 }
 
-// accessTokenFromRequest extracts a `link` access token. The header is primary;
-// the query parameter is the fallback for plain browser navigation (a shared
-// link is opened in a browser, which cannot set a custom header).
-func accessTokenFromRequest(r *http.Request) string {
+// wireExposeRoute registers (or re-points) the /expose/<name> reverse-proxy
+// route with StripPrefix + WebSocket enabled. It mirrors WireModuleRoute's
+// re-wire-safe semantics (#449): a new route created after Start registers its
+// handler live; an existing route has its address mutated in place (never
+// replaced) so the running proxy keeps reading the current target.
+func (s *Server) wireExposeRoute(prefix, address string) {
+	s.mu.Lock()
+	up, ok := s.config.Upstreams[prefix]
+	if !ok {
+		up = &Upstream{StripPrefix: true, WebSocket: true}
+		up.setAddr(address)
+		s.config.Upstreams[prefix] = up
+		if s.started {
+			s.registerProxy(prefix, up)
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	up.setAddr(address)
+}
+
+// explicitLinkToken extracts a `link` access token presented EXPLICITLY (header
+// or query) — the shareable-link entry point. The header is primary; the query
+// parameter is the fallback for plain browser navigation (a shared link is
+// opened in a browser, which cannot set a custom header). The cookie fallback is
+// handled separately so the middleware can set the cookie on an explicit hit.
+func explicitLinkToken(r *http.Request) string {
 	if h := r.Header.Get("X-Citadel-Access"); h != "" {
 		return h
 	}
 	return r.URL.Query().Get("access_token")
+}
+
+// exposeCookieName is the per-exposure cookie that carries a validated link
+// token forward to sub-resource requests. It is per-name so one exposure's
+// session cannot authorize another, and it is path-scoped to /expose/<name>/.
+func exposeCookieName(name string) string {
+	return "citadel_expose_" + name
+}
+
+// setLinkCookie plants the validated token as a path-scoped session cookie so a
+// browser's subsequent sub-resource fetches (which carry no ?access_token=) stay
+// authorized. The cookie VALUE is the same signed token, so every subsequent
+// request is re-verified (including the token's own expiry) — the cookie widens
+// nothing. Secure + HttpOnly + SameSite=Lax; no Max-Age (session cookie), since
+// the token's embedded expiry is the real bound.
+func setLinkCookie(w http.ResponseWriter, name, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     exposeCookieName(name),
+		Value:    token,
+		Path:     ExposeRoutePath(name) + "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // MintLinkToken produces a signed access token for a `link` exposure that is
@@ -336,9 +392,28 @@ func (s *Server) exposureMiddleware(next http.Handler) http.Handler {
 
 		switch policy.Visibility {
 		case VisibilityLink:
-			if verifyLinkToken(key, name, policy.TokenEpoch, accessTokenFromRequest(r), time.Now()) {
-				next.ServeHTTP(w, r)
+			now := time.Now()
+			// 1. Explicit token (shareable link entry). On success, plant a
+			// path-scoped cookie so the browser's sub-resource fetches — which do
+			// NOT carry ?access_token= — stay authorized. Without this, the HTML
+			// loads but every /assets/* fetch 401s and the app is unusable in a
+			// browser (works only for curl).
+			if tok := explicitLinkToken(r); tok != "" {
+				if verifyLinkToken(key, name, policy.TokenEpoch, tok, now) {
+					setLinkCookie(w, name, tok)
+					next.ServeHTTP(w, r)
+					return
+				}
+				exposeDeny(w, http.StatusUnauthorized, "a valid access token is required")
 				return
+			}
+			// 2. Cookie (sub-resource requests after the first). Re-verified every
+			// time, so an expired/revoked token in the cookie still fails closed.
+			if c, err := r.Cookie(exposeCookieName(name)); err == nil {
+				if verifyLinkToken(key, name, policy.TokenEpoch, c.Value, now) {
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 			exposeDeny(w, http.StatusUnauthorized, "a valid access token is required")
 			return

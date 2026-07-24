@@ -96,6 +96,70 @@ func TestExposure_LinkReachesUpstreamThroughFullChain(t *testing.T) {
 	}
 }
 
+func TestExposure_LinkCookieCarriesSession(t *testing.T) {
+	key := []byte("cookie-key")
+	h, _ := buildExposedGateway(t, "frigate", &ExposePolicy{Visibility: VisibilityLink, TokenEpoch: 1}, nil, key)
+	tok := MintLinkToken(key, "frigate", 1, time.Now().Add(time.Hour))
+
+	// First request with the explicit token: 200 AND a Set-Cookie carrying the
+	// session forward.
+	req := httptest.NewRequest(http.MethodGet, "/expose/frigate/?access_token="+tok, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first (token) request: got %d, want 200", w.Code)
+	}
+	var session *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == exposeCookieName("frigate") {
+			session = c
+		}
+	}
+	if session == nil {
+		t.Fatal("no session cookie was set on the token'd request")
+	}
+	if session.Path != "/expose/frigate/" {
+		t.Errorf("cookie path: got %q, want /expose/frigate/", session.Path)
+	}
+
+	// Sub-resource fetch carrying ONLY the cookie (no ?access_token=, as a browser
+	// would do for /assets/app.js): must be authorized. This is the case a
+	// per-request-only design silently 401s.
+	sub := httptest.NewRequest(http.MethodGet, "/expose/frigate/assets/app.js", nil)
+	sub.AddCookie(session)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, sub)
+	if w2.Code != http.StatusOK {
+		t.Errorf("cookie-only sub-resource: got %d, want 200", w2.Code)
+	}
+
+	// A tampered cookie must fail closed.
+	sub2 := httptest.NewRequest(http.MethodGet, "/expose/frigate/assets/app.js", nil)
+	sub2.AddCookie(&http.Cookie{Name: exposeCookieName("frigate"), Value: tok + "x"})
+	w3 := httptest.NewRecorder()
+	h.ServeHTTP(w3, sub2)
+	if w3.Code != http.StatusUnauthorized {
+		t.Errorf("tampered cookie: got %d, want 401", w3.Code)
+	}
+}
+
+func TestExpose_EnablesWebSocketAndStripPrefix(t *testing.T) {
+	gw := NewServer(Config{Port: 0})
+	if err := gw.Expose("frigate", "127.0.0.1:5000", &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatal(err)
+	}
+	up := gw.config.Upstreams[ExposeRoutePath("frigate")]
+	if up == nil {
+		t.Fatal("no upstream registered for the exposed route")
+	}
+	if !up.WebSocket {
+		t.Error("exposed upstream must have WebSocket enabled (live view / event streams)")
+	}
+	if !up.StripPrefix {
+		t.Error("exposed upstream must strip the /expose/<name> prefix")
+	}
+}
+
 func TestExposure_LinkTokenViaHeader(t *testing.T) {
 	key := []byte("hdr-key")
 	h, _ := buildExposedGateway(t, "svc", &ExposePolicy{Visibility: VisibilityLink, TokenEpoch: 3}, nil, key)

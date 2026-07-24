@@ -79,6 +79,18 @@ the exposure's current `TokenEpoch`, and `exp` is in the future. Revocation is
 every prior token then fails the epoch check. Per-token (`jti`) revocation is a
 follow-up.
 
+**Shareable URL:** the MCP verb composes it as `url + "?access_token=" + token`.
+The bare `url` is not usable for a `link` exposure without the token.
+
+**Browser sessions (why one token works for a whole SPA):** a browser opens the
+shareable URL (token in the query), then fetches sub-resources (`/assets/app.js`,
+`/api/config`) that carry NO `?access_token=`. On a valid explicit token the
+middleware plants a path-scoped (`/expose/<name>/`), `Secure`, `HttpOnly`,
+`SameSite=Lax` session cookie whose value is the same signed token, so every
+subsequent request is re-verified (expiry included) and stays authorized. Without
+this, only the first request (curl) would work and the web UI would 401 on its
+first asset.
+
 ## Known scope / assumptions (v1)
 
 - **`private` is inert end-to-end until aceteam passes a `Creator`.** A locally
@@ -88,6 +100,21 @@ follow-up.
 - **`org` == same tailnet owner.** Mesh membership is treated as org membership,
   consistent with the #585 "TLS + mesh membership" posture. A finer org-membership
   check (beyond the tailnet owner) is a backend concern.
+- **`link` widens authorization, not network reachability.** The managed URL is a
+  `100.64.x` mesh address, reachable only by someone already on the mesh/LAN. A
+  link removes the org-identity requirement for that reachable audience; it does
+  not make the service publicly reachable.
+- **Subpath serving constraint (applies to ALL visibility levels).** The route is
+  served under `/expose/<name>/` with `StripPrefix`. An app that emits ABSOLUTE
+  asset paths (`<script src="/assets/...">`) will have the browser resolve them at
+  the gateway root → 404 — this is not auth, org/private hit it too. The exposed
+  app must be configured to serve under a base path matching the prefix (e.g.
+  Frigate's base-path config — the #597 nvr module is responsible for setting it
+  to `/expose/<name>/`). Apps using relative paths work unchanged. A generic
+  path-rewriting or per-service-subdomain answer is a follow-up if base-path
+  config is not available for a given app.
+- **WebSocket is enabled** on exposed routes, so live view / event streams
+  (Frigate) upgrade through the gateway.
 - **No tailnet HTTPS certs.** The gateway's own TLS on 8443 is the edge; nothing
   here depends on `tailscale cert` (which is disabled on the tailnet).
 - **On-ramp requires the in-process gateway.** `EXPOSE_SET` needs `citadel work
