@@ -1,0 +1,109 @@
+# Module compose for the Citadel nvr camera-NVR stack (aceteam-ai/citadel-cli#597).
+#
+# Three services:
+#   - wyze-bridge:  Wyze TUTK P2P -> RTSP. MUST use host networking (see below).
+#   - nvr-config:   init container (runs to completion first) that GENERATES
+#                   /config/config.yml and VERIFIES a nas /media mount.
+#   - frigate:      continuous recording + local object detection.
+#
+# Frigate's /config/config.yml is NOT static: its detector block, retention, and
+# camera list are assignment/runtime inputs. The nvr-config init container
+# (ghcr.io/aceteam-ai/nvr-config, built from cmd/nvrconfig via
+# services/nvr-service/Dockerfile) generates it with the SAME tested Go logic
+# citadel uses (internal/nvr.GenerateFrigateConfig), baking in every scar: the
+# explicit openvino model: path (Frigate 0.17 crashes without it), ffmpeg
+# preset-vaapi, the MIGRATED record.continuous.days key, and no transcode.
+#
+# Host ports come from citadel's registry (services/ports.go): 8212 (host) -> 5000
+# (Frigate's native web port), injected as CITADEL_FRIGATE_HOST_PORT. The config +
+# media host paths are FIXED at ~/.citadel-cli/nvr/{config,media} (compose expands
+# a leading ~). /config is ALWAYS local — SQLite corrupts over NFS. For
+# storage.mode=nas the operator/reconcile NFS-mounts the surveillance share ONTO
+# ~/.citadel-cli/nvr/media BEFORE assigning the module; nvr-config then statfs-
+# verifies /media is a real, root-writable network mount and REFUSES to start
+# otherwise, so recordings never silently land on the local disk.
+services:
+  wyze-bridge:
+    image: idisposablegithub365/wyze-bridge:latest
+    container_name: citadel-nvr-wyze-bridge
+    # HOST NETWORKING IS MANDATORY AND NON-NEGOTIABLE. TUTK P2P needs LAN broadcast
+    # + UDP hole-punching; Docker bridge NAT breaks camera discovery and EVERY
+    # camera fails with "wyze: connect failed: discovery timeout". With host net,
+    # wyze-bridge binds its RTSP server on the host at :8554 (reserved in
+    # services/ports.go as WyzeBridgeRTSPPort); frigate pulls from there via the
+    # host-gateway alias. Because of host networking there is NO `ports:` block
+    # (host networking + published ports is a compose error).
+    network_mode: host
+    environment:
+      # Wyze credentials come from the assignment (SECRETS; never logged). Only
+      # this container ever sees them.
+      - WYZE_EMAIL=${WYZE_EMAIL:?nvr requires WYZE_EMAIL}
+      - WYZE_PASSWORD=${WYZE_PASSWORD:?nvr requires WYZE_PASSWORD}
+      - API_ID=${API_ID:?nvr requires API_ID}
+      - API_KEY=${API_KEY:?nvr requires API_KEY}
+      # Keep streams always-on so continuous recording never misses frames.
+      - ON_DEMAND=False
+      # Record raw H.264 — do NOT transcode. The cameras already emit ~1 Mbit/s
+      # H.264; re-encoding (even cheap iGPU HEVC) produces LARGER files.
+      - WB_FFMPEG=False
+    volumes:
+      - ~/.citadel-cli/nvr/wyze-tokens:/tokens
+    restart: unless-stopped
+
+  nvr-config:
+    image: ghcr.io/aceteam-ai/nvr-config:latest
+    container_name: citadel-nvr-config
+    # An init step, not a long-running service: it writes config.yml + verifies the
+    # nas mount, then exits. frigate waits for it to complete successfully.
+    restart: "no"
+    environment:
+      - NVR_DETECTOR=${NVR_DETECTOR:-openvino}
+      - NVR_RETENTION_DAYS=${NVR_RETENTION_DAYS:-12}
+      - NVR_STORAGE_MODE=${NVR_STORAGE_MODE:-local}
+      - NVR_STORAGE_TARGET=${NVR_STORAGE_TARGET:-}
+      - NVR_CAMERAS=${NVR_CAMERAS:?nvr requires NVR_CAMERAS (comma-separated camera stream names)}
+    volumes:
+      - ~/.citadel-cli/nvr/config:/config
+      - ~/.citadel-cli/nvr/media:/media
+
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: citadel-nvr-frigate
+    depends_on:
+      wyze-bridge:
+        condition: service_started
+      nvr-config:
+        # Frigate must not start until config.yml exists and the nas mount (if any)
+        # is verified.
+        condition: service_completed_successfully
+    # Frigate decodes frames into /dev/shm; the 64MB default is too small.
+    shm_size: 256mb
+    devices:
+      # Intel iGPU render node for hardware decode (preset-vaapi) + OpenVINO
+      # detection. Matches sandbox.devices in service.yaml.
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    extra_hosts:
+      # Lets frigate (bridge network) reach the host-networked wyze-bridge RTSP
+      # server at host.docker.internal:8554.
+      - "host.docker.internal:host-gateway"
+    ports:
+      # host 8212 -> container 5000 (Frigate web UI/API). Host port owned by citadel
+      # (services/ports.go); the :? guard fails loudly if it was not injected.
+      - "${CITADEL_FRIGATE_HOST_PORT:?citadel must supply CITADEL_FRIGATE_HOST_PORT}:5000"
+    volumes:
+      # /config (config.yml + SQLite DB) is ALWAYS local disk — SQLite corrupts
+      # over NFS. nvr-config wrote config.yml here before start.
+      - ~/.citadel-cli/nvr/config:/config
+      # /media follows the storage target. FIXED bind source; for nas mode the
+      # share is mounted onto this host path and nvr-config already verified it.
+      - ~/.citadel-cli/nvr/media:/media
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped

@@ -73,6 +73,15 @@ const (
 	// name; the registry KEY stays "kokoro" (the implementation name), mirroring
 	// meeting's key/env-var split (key "meeting" / EnvMeetingdHostPort).
 	EnvTTSHostPort = "CITADEL_TTS_HOST_PORT"
+	// EnvFrigateHostPort carries the host port for Frigate's web UI/API in the nvr
+	// camera-NVR module (aceteam-ai/citadel-cli#597). Like claudecode/meeting/
+	// gotenberg, the nvr module's compose lives in the catalog repo
+	// (aceteam-ai/citadel-services), NOT the embedded ServiceMap, but the port is
+	// registered here so no other module can hardcode over it and so
+	// `citadel module install nvr` injects it via the same HostPortEnv() mechanism.
+	// The registry KEY is the module name "nvr" while the env var is spelled for the
+	// container it maps to (frigate) — the same key/env split as meeting.
+	EnvFrigateHostPort = "CITADEL_FRIGATE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -143,7 +152,23 @@ const (
 	// injected host port; aligning citadel-services to 8211 is a follow-up in
 	// that repo.
 	TTSHostPort = 8211
+	// frigate: the Frigate web UI/API for the nvr camera-NVR module (#597). Next
+	// free slot in the 8200 block after kokoro's 8211. host 8212 -> container 5000
+	// (Frigate's native web port); this is the HOST publish. The nvr module's
+	// compose lives in citadel-services (like meeting/gotenberg), so this registry
+	// is the only thing stopping a future module from hardcoding over 8212.
+	FrigateHostPort = 8212
 )
+
+// WyzeBridgeRTSPPort is docker-wyze-bridge's RTSP server port in the nvr module
+// (#597). wyze-bridge MUST run with host networking (TUTK P2P needs LAN broadcast
+// + UDP hole-punching; Docker bridge NAT breaks camera discovery), so it binds
+// this port directly ON THE HOST — outside Docker's publish bookkeeping and
+// outside the env-var-substitution registry above, exactly like the LiveKit SFU.
+// It is reserved below (ReservedCitadelPorts) so no app allocation or module
+// publish can claim the port wyze-bridge will bind and that Frigate pulls RTSP
+// from (via host.docker.internal:8554).
+const WyzeBridgeRTSPPort = 8554
 
 // ServiceHostPorts maps service name -> citadel-assigned host port. Most entries
 // are compose services whose host publish citadel owns via env-var substitution;
@@ -163,6 +188,7 @@ var ServiceHostPorts = map[string]int{
 	"gotenberg":   GotenbergHostPort,
 	"bonsai":      BonsaiHostPort,
 	"kokoro":      TTSHostPort,
+	"nvr":         FrigateHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -178,6 +204,7 @@ var serviceHostPortEnv = map[string]string{
 	"gotenberg":   EnvGotenbergHostPort,
 	"bonsai":      EnvBonsaiHostPort,
 	"kokoro":      EnvTTSHostPort,
+	"nvr":         EnvFrigateHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
@@ -282,17 +309,18 @@ const (
 // any of these. The collision guard test asserts the module registry, the apps
 // catalog, and the parsed compose files all avoid this set.
 var ReservedCitadelPorts = map[int]string{
-	GatewayPort:       "gateway/status-server",
-	GatewayHTTPSPort:  "gateway-https",
-	ControlMTLSPort:   "control-mtls",
-	TEIEmbeddingPort:  "tei-embeddings",
-	VNCWebsockifyPort: "vnc-websockify",
-	VNCPort:           "vnc-rfb",
-	DeskstreamPort:    "deskstream-h264",
-	TerminalPort:      "terminal-server",
-	LiveKitWSPort:     "livekit-signaling",
-	LiveKitICETCPPort: "livekit-ice-tcp",
-	LiveKitUDPMuxPort: "livekit-udp-mux",
+	GatewayPort:        "gateway/status-server",
+	GatewayHTTPSPort:   "gateway-https",
+	ControlMTLSPort:    "control-mtls",
+	TEIEmbeddingPort:   "tei-embeddings",
+	VNCWebsockifyPort:  "vnc-websockify",
+	VNCPort:            "vnc-rfb",
+	DeskstreamPort:     "deskstream-h264",
+	TerminalPort:       "terminal-server",
+	LiveKitWSPort:      "livekit-signaling",
+	LiveKitICETCPPort:  "livekit-ice-tcp",
+	LiveKitUDPMuxPort:  "livekit-udp-mux",
+	WyzeBridgeRTSPPort: "wyze-bridge-rtsp",
 }
 
 // AppsPortRange is the inclusive range apps auto-allocate host ports from

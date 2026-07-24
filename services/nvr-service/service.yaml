@@ -1,0 +1,182 @@
+# Citadel module manifest for the nvr camera-NVR stack (aceteam-ai/citadel-cli#597).
+# Mirrors internal/catalog.ServiceManifest (schema v2). This is the module-install
+# path: `fabric_node_module_set node=<id> module=nvr` dispatches a MODULE_SET job
+# that resolves the module through the catalog (internal/catalog Source), NOT the
+# embedded services.ServiceMap (that is the SERVICE_START/inference-engine path:
+# vllm, bonsai, ollama). nvr is a MODULE, exactly like `meeting` and `gotenberg`.
+#
+# To ship as an installable module the fabric can resolve, this dir must be
+# published as services/nvr/{service.yaml,compose.yml} + a registry.yaml entry in
+# the SEPARATE catalog repo (aceteam-ai/citadel-services) — mirror how gotenberg
+# was added there (citadel-services#10). This citadel-cli copy is the source of
+# truth for the manifest/compose and registers the host ports in services/ports.go
+# so no other module can claim 8212 (Frigate UI) or the host-net 8554 (wyze RTSP).
+schema_version: 2
+name: nvr
+version: "0.1.0"
+description: >-
+  Self-hosted camera NVR: docker-wyze-bridge (Wyze TUTK P2P -> RTSP) + Frigate
+  (continuous recording + local object detection). One bridge per node/site.
+  Records raw H.264 to a configurable local / NAS / volume target; retention is
+  sized by days.
+category: media
+author: AceTeam
+license: Apache-2.0
+homepage: https://github.com/aceteam-ai/citadel-cli/issues/597
+
+requires:
+  # Frigate object detection runs on the INTEL iGPU via OpenVINO (device: GPU),
+  # reached through /dev/dri — NOT an NVIDIA GPU reservation. gpu: false keeps the
+  # NVIDIA-runtime requirement off; the iGPU device is granted via sandbox.devices.
+  # The cpu detector fallback needs no GPU at all.
+  gpu: false
+  # wyze-bridge + frigate:stable + the openvino runtime are amd64; the target is
+  # the SJC `mini` node (Intel iGPU, amd64).
+  arch: [amd64]
+
+ports:
+  # Frigate web UI + HTTP API. host 8212 (services/ports.go registry) -> container
+  # 5000 (Frigate's native web port). wyze-bridge publishes NO compose port — it
+  # runs with host networking and binds its RTSP/HLS/WebUI ports directly on the
+  # host (RTSP 8554 is reserved in services/ports.go). Frigate pulls camera RTSP
+  # from host.docker.internal:8554.
+  - host: 8212
+    container: 5000
+    protocol: tcp
+    description: Frigate web UI / HTTP API
+
+config:
+  # --- Wyze account credentials (SECRETS: supplied by the assignment, NEVER
+  # logged). Only docker-wyze-bridge consumes these; Frigate never sees them and
+  # the citadel-side config generator does not receive them. No defaults — an
+  # unset value must fail the assignment, not fall back.
+  - name: WYZE_EMAIL
+    description: "Wyze account email (SECRET; never logged)."
+    required: true
+  - name: WYZE_PASSWORD
+    description: "Wyze account password (SECRET; never logged)."
+    required: true
+  - name: API_ID
+    description: "Wyze developer API ID (SECRET; never logged)."
+    required: true
+  - name: API_KEY
+    description: "Wyze developer API key (SECRET; never logged)."
+    required: true
+  # --- NVR behavior (non-secret) ---
+  - name: NVR_RETENTION_DAYS
+    description: >-
+      Days of continuous recording to retain. Sized by DAYS, never by free space:
+      a Synology NFS quota is invisible to `df` on the client. Written to Frigate
+      as the migrated record.continuous.days key (0.17).
+    default: "12"
+  - name: NVR_DETECTOR
+    description: >-
+      Object detector: `openvino` (Intel iGPU, device GPU — the default) or `cpu`
+      (fallback for hardware without OpenVINO, e.g. an AMD Vega iGPU). openvino
+      emits an explicit model: path (bundled ssdlite_mobilenet_v2) so Frigate 0.17
+      does not crash.
+    default: openvino
+  - name: NVR_STORAGE_MODE
+    description: >-
+      Where recordings (/media) live: local | nas | volume. For nas, the operator/
+      reconcile NFS-mounts the export onto the fixed media path (~/.citadel-cli/nvr/
+      media) BEFORE assignment; the nvr-config init container then statfs-verifies
+      /media is a real, root-writable network mount and refuses to start otherwise
+      (so a failed mount never silently writes to the local disk).
+    default: local
+  - name: NVR_STORAGE_TARGET
+    description: >-
+      Informational per NVR_STORAGE_MODE: a node path (local), a host:/export
+      (nas — the export needs no_root_squash since Frigate runs as root), or a
+      volume id (volume). The compose binds a FIXED local media path; the reconcile
+      uses this target to mount/retarget. NOTE: /config (Frigate's SQLite DB)
+      ALWAYS stays on local disk regardless of this value — SQLite corrupts over
+      NFS; only /media follows the target.
+  - name: NVR_CAMERAS
+    description: >-
+      Comma-separated camera stream names (e.g. "front-door,garage=garage-cam";
+      `name` or `name=stream-path`). Frigate 0.17 refuses to start with an empty
+      cameras: block, so this is required and the nvr-config init container fails
+      loudly if it is empty. Auto-discovery from docker-wyze-bridge's API is a
+      runtime enhancement validated at node-1314 acceptance, not the default.
+    required: true
+
+health_check:
+  # catalog.ProbeHealth GETs http://127.0.0.1:<port><endpoint> ON THE HOST, so the
+  # port here is the PUBLISHED HOST port (8212), not the container port. Frigate's
+  # /api/version returns 200 once it has loaded config.yml and the detector.
+  endpoint: /api/version
+  port: 8212
+  interval: 30s
+  timeout: 10s
+  retries: 5
+
+volumes:
+  # Frigate config + SQLite DB. LOCAL disk always (SQLite corrupts over NFS), even
+  # in nas mode. Only /media follows the storage target.
+  - name: config
+    host: ~/.citadel-cli/nvr/config
+    container: /config
+    description: Frigate config.yml + SQLite DB (must stay on local disk)
+  # Recordings. FIXED local bind source; for nas mode the export is mounted onto
+  # this same host path before assignment (nvr-config verifies it is a network fs).
+  - name: media
+    host: ~/.citadel-cli/nvr/media
+    container: /media
+    description: recordings (raw H.264); for nas the share is mounted onto this path
+  # docker-wyze-bridge token/cache dir so re-auth is not needed on every restart.
+  - name: wyze-tokens
+    host: ~/.citadel-cli/nvr/wyze-tokens
+    container: /tokens
+    description: wyze-bridge auth token cache
+
+# Gateway exposure DECLARATION (data only). Actually wiring Frigate's UI onto the
+# node gateway under /modules/nvr/ is the companion issue #598 — this block just
+# names the port env + gating capability so #598 needs zero manifest changes. No
+# exposure logic is implemented in #597.
+gateway:
+  prefix: nvr
+  port_env: CITADEL_FRIGATE_HOST_PORT
+  capability: console
+
+# Namespaced routing tag: install advertises the node as nvr-capable.
+node_tags:
+  - nvr
+
+tags:
+  - nvr
+  - camera
+  - frigate
+  - wyze
+  - surveillance
+  - media
+
+sandbox:
+  # wyze-bridge MANDATES host networking: TUTK P2P needs LAN broadcast + UDP
+  # hole-punching, and Docker bridge NAT breaks camera discovery (every camera
+  # then fails with "wyze: connect failed: discovery timeout"). This is the #1
+  # gotcha and is non-negotiable. It independently trips the #342 host-network
+  # risk scan (expected).
+  #
+  # INSTALL-AS-TRUSTED ONLY: nvr must be installed from the first-party catalog
+  # (a trusted Tier-0 source), so this sandbox block is IGNORED and the compose is
+  # authoritative — wyze-bridge on host net, frigate on bridge net (it needs the
+  # extra_hosts host-gateway alias + a published :5000, both broken under host
+  # net). The sandbox model is module-level (one network_mode for ALL services),
+  # so an UNTRUSTED install would wrongly force host networking onto frigate and
+  # break it. Per-service sandbox scoping is a documented follow-up; until then
+  # nvr is a trusted-catalog module only.
+  host_network: true
+  # Intel iGPU render node for Frigate hardware decode (preset-vaapi) + OpenVINO
+  # detection.
+  devices:
+    - /dev/dri/renderD128
+  writable_paths:
+    - /config
+    - /media
+    - /tokens
+    - /tmp
+  resources:
+    cpu: "4.0"
+    memory: 4g
+    pids: 4096

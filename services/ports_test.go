@@ -119,17 +119,18 @@ func TestGotenbergHostPortRegistered(t *testing.T) {
 // two entries into one).
 func TestReservedCitadelPortsPairwiseDistinct(t *testing.T) {
 	wantEntries := map[int]string{
-		GatewayPort:       "gateway/status-server",
-		GatewayHTTPSPort:  "gateway-https",
-		ControlMTLSPort:   "control-mtls",
-		TEIEmbeddingPort:  "tei-embeddings",
-		VNCWebsockifyPort: "vnc-websockify",
-		VNCPort:           "vnc-rfb",
-		DeskstreamPort:    "deskstream-h264",
-		TerminalPort:      "terminal-server",
-		LiveKitWSPort:     "livekit-signaling",
-		LiveKitICETCPPort: "livekit-ice-tcp",
-		LiveKitUDPMuxPort: "livekit-udp-mux",
+		GatewayPort:        "gateway/status-server",
+		GatewayHTTPSPort:   "gateway-https",
+		ControlMTLSPort:    "control-mtls",
+		TEIEmbeddingPort:   "tei-embeddings",
+		VNCWebsockifyPort:  "vnc-websockify",
+		VNCPort:            "vnc-rfb",
+		DeskstreamPort:     "deskstream-h264",
+		TerminalPort:       "terminal-server",
+		LiveKitWSPort:      "livekit-signaling",
+		LiveKitICETCPPort:  "livekit-ice-tcp",
+		LiveKitUDPMuxPort:  "livekit-udp-mux",
+		WyzeBridgeRTSPPort: "wyze-bridge-rtsp",
 	}
 	if len(ReservedCitadelPorts) != len(wantEntries) {
 		t.Errorf("ReservedCitadelPorts has %d entries, want %d — a port constant collision collapses two listeners onto one port (see #504)",
@@ -195,6 +196,54 @@ func TestBonsaiHostPortRegistered(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}
+
+// TestFrigateHostPortRegistered pins the nvr camera-NVR module's Frigate web
+// UI/API host port (aceteam-ai/citadel-cli#597). Like claudecode/meeting/
+// gotenberg, the nvr module's compose lives in citadel-services (not the embedded
+// ServiceMap), so this registry -- and this test -- is the only thing that stops
+// a future module from hardcoding over 8212. The registry KEY is the module name
+// "nvr" while the env var is spelled CITADEL_FRIGATE_HOST_PORT (the container it
+// maps to), the same key/env split as meeting.
+func TestFrigateHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["nvr"]
+	if !ok || got != FrigateHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "nvr", got, ok, FrigateHostPort)
+	}
+	if _, ok := serviceHostPortEnv["nvr"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "nvr")
+	}
+	if FrigateHostPort >= AppsPortRangeStart && FrigateHostPort <= AppsPortRangeEnd {
+		t.Errorf("frigate host port %d sits inside the apps auto-allocation range %d-%d", FrigateHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[FrigateHostPort]; taken {
+		t.Errorf("frigate host port %d collides with reserved citadel port %q", FrigateHostPort, name)
+	}
+	// 8211 is kokoro's; frigate must be the distinct next slot.
+	if FrigateHostPort == TTSHostPort {
+		t.Errorf("FrigateHostPort %d collides with TTSHostPort; 8211 is taken, frigate must be the next free slot", FrigateHostPort)
+	}
+	for svc, port := range ServiceHostPorts {
+		if svc != "nvr" && port == FrigateHostPort {
+			t.Errorf("frigate host port %d collides with managed service %q", FrigateHostPort, svc)
+		}
+	}
+	// HostPortEnv must emit the frigate var so the module compose resolves.
+	want := EnvFrigateHostPort + "=8212"
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+	// The wyze-bridge host-net RTSP port must be reserved (frigate depends on it,
+	// and it is bound directly on the host like the LiveKit SFU ports).
+	if name, ok := ReservedCitadelPorts[WyzeBridgeRTSPPort]; !ok || name != "wyze-bridge-rtsp" {
+		t.Errorf("ReservedCitadelPorts[%d] = %q (present=%v), want wyze-bridge-rtsp", WyzeBridgeRTSPPort, name, ok)
 	}
 }
 
