@@ -1975,7 +1975,7 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 		{
 			name:    "Shell",
 			desc:    "Remote shell command execution",
-			detail:  "Allows dispatched SHELL_COMMAND jobs to run through /bin/sh on this node.\nDisable to make the node refuse all remote shell execution.\nInherited secrets are always scrubbed from the command environment.",
+			detail:  "Allows dispatched SHELL_COMMAND jobs to run through /bin/sh on this node.\nGoverns the platform node-management tabs (logs/services/docker).\nDisable to make the node refuse all remote shell execution.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\nrefuses shell. When enabled it still requires the node passcode\npresented per command, so enabling alone does not open it.\nInherited secrets are always scrubbed from the command environment.",
 			enabled: &perms.Shell,
 		},
 	}

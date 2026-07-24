@@ -71,6 +71,17 @@ type DeviceConfig struct {
 	DesktopEnabled *bool `json:"desktopEnabled,omitempty"`
 	FilesEnabled   *bool `json:"filesEnabled,omitempty"`
 
+	// ShellEnabled is the programmatic opt-IN for remote shell command execution
+	// (SHELL_COMMAND jobs) — the surface behind the platform's node-management tabs
+	// (logs/services/docker), which run shell commands. Pointer for the same
+	// absent(nil)-vs-explicit reason as the other *Enabled flags: an omitted field
+	// leaves the node's persisted `shell` permission untouched. Default-DENY on a
+	// fresh node (aceteam#6524 / #6149), so the platform must send `true` here
+	// (together with a NodePasscode) to enable it. Even enabled, shell stays
+	// fail-closed until a passcode is set AND presented per SHELL_COMMAND, exactly
+	// like console/desktop/files.
+	ShellEnabled *bool `json:"shellEnabled,omitempty"`
+
 	// NodePasscode sets (or, when empty, clears) the per-node passcode that gates
 	// the sensitive surfaces (aceteam#6524). Pointer so nil leaves the stored
 	// passcode untouched; a non-nil value is bcrypt-hashed before it is persisted
@@ -169,7 +180,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// Written to platform.ConfigDir() (the per-concern config location the gates
 	// read), not h.ConfigDir (the manifest dir). Only the fields the platform set
 	// are touched; nil pointers leave the persisted value intact.
-	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.FilesEnabled != nil || config.NodePasscode != nil {
+	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.FilesEnabled != nil || config.ShellEnabled != nil || config.NodePasscode != nil {
 		perms := citadelconfig.LoadPermissions(platform.ConfigDir())
 		if config.ConsoleEnabled != nil {
 			perms.Console = *config.ConsoleEnabled
@@ -179,6 +190,9 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		}
 		if config.FilesEnabled != nil {
 			perms.Files = *config.FilesEnabled
+		}
+		if config.ShellEnabled != nil {
+			perms.Shell = *config.ShellEnabled
 		}
 		if config.NodePasscode != nil {
 			if err := perms.SetPasscode(*config.NodePasscode); err != nil {
@@ -197,6 +211,9 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			if config.FilesEnabled != nil {
 				result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
 			}
+			if config.ShellEnabled != nil {
+				result += fmt.Sprintf("\nShell (remote command) access %s", enabledLabel(*config.ShellEnabled))
+			}
 			if config.NodePasscode != nil {
 				if perms.HasPasscode() {
 					result += "\nNode passcode set"
@@ -207,7 +224,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			// Guardrail: an enabled surface with no passcode fails closed. Surface
 			// that in the job result so an operator who enabled without a passcode
 			// understands why access is still denied.
-			if (perms.Console || perms.Desktop || perms.Files) && !perms.HasPasscode() {
+			if (perms.Console || perms.Desktop || perms.Files || perms.Shell) && !perms.HasPasscode() {
 				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
 			}
 		}

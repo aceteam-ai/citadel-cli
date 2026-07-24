@@ -15,6 +15,17 @@ import (
 // A map to hold all our registered job handlers.
 var jobHandlers map[string]jobs.JobHandler
 
+// nodePasscodeVerifier verifies a presented passcode against the node's persisted
+// bcrypt passcode (aceteam#6524). It reloads permissions on every call so a
+// passcode set/rotated via APPLY_DEVICE_CONFIG or the control center takes effect
+// without a worker restart, mirroring the gateway's per-request passcode gate.
+// Wired into the SHELL_COMMAND handler so an ENABLED shell still fails closed
+// unless the correct node passcode is presented. VerifyPasscode itself fails
+// closed (no passcode set, or empty/wrong pin, returns false).
+func nodePasscodeVerifier(pin string) bool {
+	return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+}
+
 // executeJob finds the right handler and runs a job.
 func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	var output []byte
@@ -61,6 +72,10 @@ func init() {
 	// run commands as root regardless of the permission (aceteam #6149, Phase 0).
 	shellHandler := jobs.NewShellCommandHandler("")
 	shellHandler.Disabled = !config.LoadPermissions(platform.ConfigDir()).Shell
+	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
+	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
+	// verifier nil here would run enabled shell with no passcode. Fail closed.
+	shellHandler.VerifyPasscode = nodePasscodeVerifier
 
 	// Register all job handlers for test command
 	jobHandlers = map[string]jobs.JobHandler{
