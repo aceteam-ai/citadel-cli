@@ -157,6 +157,15 @@ sandbox:
   # then fails with "wyze: connect failed: discovery timeout"). This is the #1
   # gotcha and is non-negotiable. It independently trips the #342 host-network
   # risk scan (expected).
+  #
+  # INSTALL-AS-TRUSTED ONLY: nvr must be installed from the first-party catalog
+  # (a trusted Tier-0 source), so this sandbox block is IGNORED and the compose is
+  # authoritative — wyze-bridge on host net, frigate on bridge net (it needs the
+  # extra_hosts host-gateway alias + a published :5000, both broken under host
+  # net). The sandbox model is module-level (one network_mode for ALL services),
+  # so an UNTRUSTED install would wrongly force host networking onto frigate and
+  # break it. Per-service sandbox scoping is a documented follow-up; until then
+  # nvr is a trusted-catalog module only.
   host_network: true
   # Intel iGPU render node for Frigate hardware decode (preset-vaapi) + OpenVINO
   # detection.
