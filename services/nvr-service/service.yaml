@@ -77,15 +77,28 @@ config:
       does not crash.
     default: openvino
   - name: NVR_STORAGE_MODE
-    description: "Where recordings (/media) live: local | nas | volume."
+    description: >-
+      Where recordings (/media) live: local | nas | volume. For nas, the operator/
+      reconcile NFS-mounts the export onto the fixed media path (~/.citadel-cli/nvr/
+      media) BEFORE assignment; the nvr-config init container then statfs-verifies
+      /media is a real, root-writable network mount and refuses to start otherwise
+      (so a failed mount never silently writes to the local disk).
     default: local
   - name: NVR_STORAGE_TARGET
     description: >-
-      Interpreted per NVR_STORAGE_MODE: a node path (local), a host:/export
-      (nas — NFS/SMB, mounted + fstab-persisted + verified writable before Frigate
-      starts; the export needs no_root_squash), or a volume id (volume). NOTE:
-      /config (Frigate's SQLite DB) ALWAYS stays on local disk regardless of this
-      value — SQLite corrupts over NFS; only /media follows the target.
+      Informational per NVR_STORAGE_MODE: a node path (local), a host:/export
+      (nas — the export needs no_root_squash since Frigate runs as root), or a
+      volume id (volume). The compose binds a FIXED local media path; the reconcile
+      uses this target to mount/retarget. NOTE: /config (Frigate's SQLite DB)
+      ALWAYS stays on local disk regardless of this value — SQLite corrupts over
+      NFS; only /media follows the target.
+  - name: NVR_CAMERAS
+    description: >-
+      Comma-separated camera stream names (e.g. "front-door,garage=garage-cam";
+      `name` or `name=stream-path`). Frigate 0.17 refuses to start with an empty
+      cameras: block, so this is required and the nvr-config init container fails
+      loudly if it is empty. Auto-discovery from docker-wyze-bridge's API is a
+      runtime enhancement validated at node-1314 acceptance, not the default.
     required: true
 
 health_check:
@@ -105,12 +118,12 @@ volumes:
     host: ~/.citadel-cli/nvr/config
     container: /config
     description: Frigate config.yml + SQLite DB (must stay on local disk)
-  # Recordings. Host path resolved from NVR_STORAGE_MODE/TARGET (local path, the
-  # NAS mountpoint, or a volume path). Passed to compose via NVR_MEDIA_DIR.
+  # Recordings. FIXED local bind source; for nas mode the export is mounted onto
+  # this same host path before assignment (nvr-config verifies it is a network fs).
   - name: media
-    host: ${NVR_MEDIA_DIR}
+    host: ~/.citadel-cli/nvr/media
     container: /media
-    description: recordings (raw H.264); follows the storage target
+    description: recordings (raw H.264); for nas the share is mounted onto this path
   # docker-wyze-bridge token/cache dir so re-auth is not needed on every restart.
   - name: wyze-tokens
     host: ~/.citadel-cli/nvr/wyze-tokens

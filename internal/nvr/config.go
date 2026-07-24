@@ -257,6 +257,33 @@ func GenerateFrigateConfig(cfg Config, cameras []Camera) (string, error) {
 	return header + string(out), nil
 }
 
+// ParseCameras parses the NVR_CAMERAS env value into a camera list. The format is
+// a comma-separated list of `name` or `name=stream-path` entries (stream-path
+// defaults to name), e.g. "front-door,garage=garage-cam". This is the explicit,
+// deterministic camera source the init container ships with; auto-discovery from
+// docker-wyze-bridge's API is a runtime enhancement validated at the node-1314
+// human acceptance step, not the shipped default.
+func ParseCameras(raw string) []Camera {
+	var out []Camera
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, stream, found := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		cam := Camera{Name: name}
+		if found {
+			cam.StreamPath = strings.TrimSpace(stream)
+		}
+		out = append(out, cam)
+	}
+	return out
+}
+
 // CameraNames returns the sorted camera names, for stable logging/tests.
 func CameraNames(cameras []Camera) []string {
 	names := make([]string, 0, len(cameras))

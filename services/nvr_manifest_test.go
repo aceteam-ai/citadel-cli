@@ -75,7 +75,7 @@ func TestNVRServiceManifest(t *testing.T) {
 			t.Errorf("secret %q must not carry a default value", secret)
 		}
 	}
-	for _, name := range []string{"NVR_RETENTION_DAYS", "NVR_DETECTOR", "NVR_STORAGE_MODE", "NVR_STORAGE_TARGET"} {
+	for _, name := range []string{"NVR_RETENTION_DAYS", "NVR_DETECTOR", "NVR_STORAGE_MODE", "NVR_STORAGE_TARGET", "NVR_CAMERAS"} {
 		if _, ok := cfg[name]; !ok {
 			t.Errorf("config is missing %q", name)
 		}
@@ -115,10 +115,14 @@ func TestNVRServiceManifest(t *testing.T) {
 // composeShape captures the compose fields the nvr invariants assert on.
 type composeShape struct {
 	Services map[string]struct {
+		Image       string   `yaml:"image"`
 		NetworkMode string   `yaml:"network_mode"`
 		Ports       []string `yaml:"ports"`
 		Devices     []string `yaml:"devices"`
 		Volumes     []string `yaml:"volumes"`
+		DependsOn   map[string]struct {
+			Condition string `yaml:"condition"`
+		} `yaml:"depends_on"`
 	} `yaml:"services"`
 }
 
@@ -167,10 +171,9 @@ func TestNVRComposeInvariants(t *testing.T) {
 		t.Errorf("frigate must publish ${%s}:5000; got %v", EnvFrigateHostPort, frigate.Ports)
 	}
 
-	// /config must be a LOCAL path (the nvr config dir), never the media target;
-	// /media must be the resolved media dir. This is the SQLite-stays-local scar.
-	// Match by container-mount suffix: the HOST side may be a ${VAR:?msg}
-	// expansion that itself contains colons, so a naive split on ":" is wrong.
+	// /config must be a LOCAL path (the nvr config dir), never the media dir;
+	// /media is a separate local bind. This is the SQLite-stays-local scar.
+	// Match by container-mount suffix (the host side may contain colons).
 	var configHost, mediaHost string
 	for _, v := range frigate.Volumes {
 		if h, ok := strings.CutSuffix(v, ":/config"); ok {
@@ -183,10 +186,24 @@ func TestNVRComposeInvariants(t *testing.T) {
 	if !strings.Contains(configHost, "nvr/config") {
 		t.Errorf("/config host mount = %q, want the local nvr/config dir (SQLite must stay local)", configHost)
 	}
-	if strings.Contains(configHost, "NVR_MEDIA_DIR") {
-		t.Errorf("/config must NOT be on the media target (%q) — SQLite corrupts over NFS", configHost)
+	if !strings.Contains(mediaHost, "nvr/media") {
+		t.Errorf("/media host mount = %q, want the local nvr/media dir", mediaHost)
 	}
-	if !strings.Contains(mediaHost, "NVR_MEDIA_DIR") {
-		t.Errorf("/media host mount = %q, want the resolved ${NVR_MEDIA_DIR}", mediaHost)
+	if configHost == mediaHost {
+		t.Errorf("/config and /media must be distinct paths; both = %q", configHost)
+	}
+
+	// The nvr-config init container must exist and frigate must wait for it to
+	// complete successfully (config.yml generation + nas verify gate).
+	initSvc, ok := c.Services["nvr-config"]
+	if !ok {
+		t.Fatalf("compose is missing the nvr-config init container")
+	}
+	if !strings.Contains(initSvc.Image, "nvr-config") {
+		t.Errorf("nvr-config image = %q, want the ghcr nvr-config image", initSvc.Image)
+	}
+	dep, ok := frigate.DependsOn["nvr-config"]
+	if !ok || dep.Condition != "service_completed_successfully" {
+		t.Errorf("frigate must depend_on nvr-config with condition service_completed_successfully; got %+v", frigate.DependsOn)
 	}
 }

@@ -226,8 +226,8 @@ func TestVerifyMediaMountPropagatesProbeError(t *testing.T) {
 }
 
 // TestResolveMediaSource covers the three storage modes and the /config-stays-local
-// invariant (ResolveMediaSource only ever returns a MEDIA path; /config is a
-// separate constant that never follows the target).
+// invariant (ResolveMediaSource only ever returns a MEDIA path; ConfigDir is a
+// separate local path that never follows the target).
 func TestResolveMediaSource(t *testing.T) {
 	// local: path is the target, no mount needed.
 	p, needsMount, err := ResolveMediaSource(StorageSpec{Mode: StorageLocal, Target: "/srv/nvr"})
@@ -235,10 +235,14 @@ func TestResolveMediaSource(t *testing.T) {
 		t.Errorf("local: got (%q, %v, %v), want (/srv/nvr, false, nil)", p, needsMount, err)
 	}
 
-	// nas: media path is the citadel mountpoint and needsMount is true.
+	// nas: media path is the citadel MediaDir() and needsMount is true.
+	mediaDir, err := MediaDir()
+	if err != nil {
+		t.Fatalf("MediaDir: %v", err)
+	}
 	p, needsMount, err = ResolveMediaSource(StorageSpec{Mode: StorageNAS, Target: "nas.local:/volume2/surveillance"})
-	if err != nil || !needsMount || p != DefaultNASMountpoint {
-		t.Errorf("nas: got (%q, %v, %v), want (%s, true, nil)", p, needsMount, err, DefaultNASMountpoint)
+	if err != nil || !needsMount || p != mediaDir {
+		t.Errorf("nas: got (%q, %v, %v), want (%s, true, nil)", p, needsMount, err, mediaDir)
 	}
 
 	// nas without host:/export is rejected.
@@ -253,26 +257,85 @@ func TestResolveMediaSource(t *testing.T) {
 	}
 
 	// /config must NEVER equal the media source — SQLite stays local.
-	if LocalConfigDir == "" || strings.Contains(LocalConfigDir, DefaultNASMountpoint) {
-		t.Errorf("LocalConfigDir %q must be a local path independent of the NAS media mount", LocalConfigDir)
+	configDir, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir: %v", err)
+	}
+	if configDir == "" || configDir == mediaDir {
+		t.Errorf("ConfigDir %q must be a local path independent of the media dir %q", configDir, mediaDir)
 	}
 }
 
 // TestFstabEntry pins the persisted NFSv3 mount line (Synology target has no v4).
 func TestFstabEntry(t *testing.T) {
-	line, err := FstabEntry("nas.local:/volume2/surveillance", DefaultNASMountpoint)
+	line, err := FstabEntry("nas.local:/volume2/surveillance", "/mnt/nvr-media")
 	if err != nil {
 		t.Fatalf("FstabEntry: %v", err)
 	}
-	for _, want := range []string{"nas.local:/volume2/surveillance", DefaultNASMountpoint, "nfs", "vers=3", "_netdev"} {
+	for _, want := range []string{"nas.local:/volume2/surveillance", "/mnt/nvr-media", "nfs", "vers=3", "_netdev"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("fstab line %q missing %q", line, want)
 		}
 	}
-	if _, err := FstabEntry("/no-export", DefaultNASMountpoint); err == nil {
+	if _, err := FstabEntry("/no-export", "/mnt/nvr-media"); err == nil {
 		t.Errorf("expected error for export without host:")
 	}
 	if _, err := FstabEntry("nas:/x", "relative/mount"); err == nil {
 		t.Errorf("expected error for relative mountpoint")
+	}
+}
+
+// TestVerifyMediaIsNetworkFS is the SHIPPED in-container guard: inside frigate
+// /media is always a bind mount, so mountedness is a false pass — the check must
+// use the filesystem TYPE. A local fs (ext4) in nas mode must FAIL (the silent
+// local-disk leak); a real NFS/SMB mount that is root-writable passes.
+func TestVerifyMediaIsNetworkFS(t *testing.T) {
+	const magicEXT4 int64 = 0xEF53
+	cases := []struct {
+		name      string
+		fsType    int64
+		writable  bool
+		wantErr   bool
+		errSubstr string
+	}{
+		{"nfs+writable", MagicNFS, true, false, ""},
+		{"cifs+writable", MagicCIFS, true, false, ""},
+		{"local ext4 (the leak)", magicEXT4, true, true, "NOT a network filesystem"},
+		{"nfs but squashed", MagicNFS, false, true, "no_root_squash"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := NetFSProbe{
+				FSType:   func(string) (int64, error) { return tc.fsType, nil },
+				Writable: func(string, int) (bool, error) { return tc.writable, nil },
+			}
+			err := VerifyMediaIsNetworkFS("/media", 0, probe)
+			if tc.wantErr && (err == nil || !strings.Contains(err.Error(), tc.errSubstr)) {
+				t.Fatalf("want error containing %q, got %v", tc.errSubstr, err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want no error, got %v", err)
+			}
+		})
+	}
+	if !IsNetworkFSMagic(MagicNFS) || IsNetworkFSMagic(magicEXT4) {
+		t.Errorf("IsNetworkFSMagic misclassified NFS/ext4")
+	}
+}
+
+// TestParseCameras covers the explicit NVR_CAMERAS format (name and name=stream).
+func TestParseCameras(t *testing.T) {
+	cams := ParseCameras("front-door, garage=garage-cam ,, back-yard")
+	if len(cams) != 3 {
+		t.Fatalf("want 3 cameras, got %d: %+v", len(cams), cams)
+	}
+	if cams[0].Name != "front-door" || cams[0].StreamPath != "" {
+		t.Errorf("cam0 = %+v", cams[0])
+	}
+	if cams[1].Name != "garage" || cams[1].StreamPath != "garage-cam" {
+		t.Errorf("cam1 = %+v (want garage=garage-cam)", cams[1])
+	}
+	if got := ParseCameras("   "); got != nil {
+		t.Errorf("blank NVR_CAMERAS should yield no cameras, got %+v", got)
 	}
 }
