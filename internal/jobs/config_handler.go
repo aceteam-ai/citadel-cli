@@ -72,7 +72,7 @@ type DeviceConfig struct {
 	FilesEnabled   *bool `json:"filesEnabled,omitempty"`
 
 	// ShellEnabled is the programmatic opt-IN for remote shell command execution
-	// (SHELL_COMMAND jobs) — the surface behind the platform's node-management tabs
+	// (SHELL_COMMAND jobs), the surface behind the platform's node-management tabs
 	// (logs/services/docker), which run shell commands. Pointer for the same
 	// absent(nil)-vs-explicit reason as the other *Enabled flags: an omitted field
 	// leaves the node's persisted `shell` permission untouched. Default-DENY on a

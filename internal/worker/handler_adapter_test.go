@@ -276,10 +276,13 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	}
 }
 
-// TestCreateLegacyHandlers_ShellEnabledByDefault confirms the default opt
-// (ShellDisabled=false) leaves shell execution working.
-func TestCreateLegacyHandlers_ShellEnabledByDefault(t *testing.T) {
-	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{})
+// TestCreateLegacyHandlers_ShellEnabledWithPasscode confirms that an enabled
+// shell (ShellDisabled=false) whose passcode verifier is wired runs a command
+// that presents the correct passcode.
+func TestCreateLegacyHandlers_ShellEnabledWithPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
+	})
 
 	var shell JobHandler
 	for _, h := range handlers {
@@ -295,14 +298,49 @@ func TestCreateLegacyHandlers_ShellEnabledByDefault(t *testing.T) {
 	job := &Job{
 		ID:      "job-shell-enabled",
 		Type:    JobTypeShellCommand,
-		Payload: map[string]any{"command": "echo ok"},
+		Payload: map[string]any{"command": "echo ok", "passcode": "2468"},
 	}
 	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
 	if err != nil {
-		t.Fatalf("enabled shell handler should run: %v", err)
+		t.Fatalf("enabled shell handler with correct passcode should run: %v", err)
 	}
 	if result.Status != JobStatusSuccess {
 		t.Errorf("result.Status = %v, want success", result.Status)
+	}
+}
+
+// TestCreateLegacyHandlers_ShellEnabledNoVerifierFailsClosed proves the
+// fail-closed contract at the construction layer: an enabled shell with no
+// passcode verifier wired refuses execution (a forgotten gate never opens root
+// shell).
+func TestCreateLegacyHandlers_ShellEnabledNoVerifierFailsClosed(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{}) // enabled, no verifier
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must be registered")
+	}
+
+	job := &Job{
+		ID:      "job-shell-no-verifier",
+		Type:    JobTypeShellCommand,
+		Payload: map[string]any{"command": "echo should-not-run"},
+	}
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err == nil {
+		t.Fatal("enabled shell with no passcode verifier should refuse")
+	}
+	if !strings.Contains(err.Error(), jobs.ShellPasscodeRequiredError) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), jobs.ShellPasscodeRequiredError)
+	}
+	if result != nil && result.Status == JobStatusSuccess {
+		t.Error("shell handler without a passcode verifier must not report success")
 	}
 }
 
