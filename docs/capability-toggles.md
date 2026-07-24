@@ -131,9 +131,35 @@ actual access:
      refuses unless `shell` is enabled **and** the job presents the correct node
      passcode. The passcode travels in the `SHELL_COMMAND` payload's `passcode`
      field (there is no header, unlike console/desktop/files). Fail-closed: an
-     enabled handler whose passcode verifier was never wired, or a wrong/absent
-     payload passcode, refuses every command. This governs the platform's
-     node-management tabs (logs/services/docker), which run shell commands.
+     enabled handler whose passcode signals were never wired, a node with no
+     passcode set, or a wrong/absent payload passcode, refuses every command. This
+     governs the platform's node-management tabs (logs/services/docker), which run
+     shell commands.
+
+     **Machine-readable refusal (aceteam#6559/#6597/#6598).** A refused
+     `SHELL_COMMAND` returns a typed error (`jobs.ShellRefusal`) whose message is a
+     JSON object so the platform frontend can prompt the operator precisely instead
+     of surfacing a raw string:
+
+     ```json
+     {"reason":"<code>","message":"<human readable>"}
+     ```
+
+     `reason` is exactly one of three codes, checked in this order:
+
+     | `reason` | When | Frontend prompt |
+     |----------|------|-----------------|
+     | `shell_disabled` | The shell surface is off (`shell: false`). | Offer "enable Shell". |
+     | `passcode_not_set` | Shell is enabled but **no** node passcode is configured, so there is nothing to check against. | Offer "set a node passcode". |
+     | `passcode_invalid` | A passcode **is** configured but the payload passcode is absent or wrong. | Re-prompt for the correct passcode. |
+
+     The node distinguishes `passcode_not_set` from `passcode_invalid` via a
+     `HasPasscode` signal (reports only whether a passcode exists, never the hash)
+     alongside `VerifyPasscode`. Both are wired from `permissions.yaml` at every
+     construction site (`worker.CreateLegacyHandlersWithOpts`, the `citadel work`
+     and control-center worker builds, and the legacy `cmd/job_handlers` map). The
+     JSON is produced with `encoding/json` (not string concatenation), so a
+     `message` containing quotes stays valid JSON.
 3. **HTTPS gateway** (`internal/gateway/gateway.go`): `permissionMiddleware`
    blocks a disabled category, and for an enabled sensitive category additionally
    requires the passcode (`X-Citadel-Passcode` header, or `?passcode=` for

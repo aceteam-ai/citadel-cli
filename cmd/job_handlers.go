@@ -26,6 +26,15 @@ func nodePasscodeVerifier(pin string) bool {
 	return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
 }
 
+// nodeHasPasscode reports whether a node passcode is configured (aceteam#6524).
+// It reloads permissions on every call, mirroring nodePasscodeVerifier, so the
+// SHELL_COMMAND handler can distinguish "no passcode set" (passcode_not_set)
+// from "wrong passcode presented" (passcode_invalid) without a worker restart.
+// HasPasscode reports only presence, never the hash.
+func nodeHasPasscode() bool {
+	return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+}
+
 // executeJob finds the right handler and runs a job.
 func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	var output []byte
@@ -75,6 +84,8 @@ func init() {
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
 	// verifier nil here would run enabled shell with no passcode. Fail closed.
+	// HasPasscode lets the handler distinguish passcode_not_set from passcode_invalid.
+	shellHandler.HasPasscode = nodeHasPasscode
 	shellHandler.VerifyPasscode = nodePasscodeVerifier
 
 	// Register all job handlers for test command

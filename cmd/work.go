@@ -2022,6 +2022,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
+		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
 		FilesDisabled:             !workPerms.Files,

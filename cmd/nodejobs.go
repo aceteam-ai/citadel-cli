@@ -23,6 +23,11 @@ type nodeJobHandlerOpts struct {
 	AllowReadOutsideWorkspace bool
 	// ShellDisabled registers SHELL_COMMAND in a refusing state (still dispatchable).
 	ShellDisabled bool
+	// ShellHasPasscode reports whether a node passcode is configured, so an enabled
+	// shell can distinguish passcode_not_set from passcode_invalid. Required whenever
+	// ShellDisabled is false: a nil signal makes shell fail closed. Wired from the
+	// persisted node passcode.
+	ShellHasPasscode func() bool
 	// ShellVerifyPasscode gates an ENABLED SHELL_COMMAND handler on the per-node
 	// passcode (aceteam#6524). Required whenever ShellDisabled is false: a nil
 	// verifier makes shell fail closed. Wired from the persisted node passcode.
@@ -57,6 +62,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 		ConfigDir:                 opts.ConfigDir,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
 		ShellDisabled:             opts.ShellDisabled,
+		ShellHasPasscode:          opts.ShellHasPasscode,
 		ShellVerifyPasscode:       opts.ShellVerifyPasscode,
 		DesktopDisabled:           opts.DesktopDisabled,
 		FilesDisabled:             opts.FilesDisabled,

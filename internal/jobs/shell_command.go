@@ -13,25 +13,57 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
-// ShellDisabledError is the exact message returned when SHELL_COMMAND execution
-// is not enabled on this node. Shell is default-deny (opt-in) as of aceteam #6149
-// Phase 0: a node accepts remote commands only after an operator explicitly
-// enables the `shell` permission (set `shell: true` in the node's
-// permissions.yaml, or toggle Shell in the AceTeam control center, then restart
-// the worker). The wording is part of the handler's contract and is asserted in
-// tests, so keep it stable.
-const ShellDisabledError = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center, then restart the worker)"
+// Shell refusal reason codes. A SHELL_COMMAND refusal returns a *ShellRefusal
+// whose Error() is a JSON object {"reason":"<code>","message":"<human>"} so the
+// platform frontend (aceteam#6559/#6597/#6598) can prompt the operator precisely
+// (enable shell, set a passcode, or fix the presented passcode) instead of
+// surfacing a raw error string. The codes are part of the handler's contract and
+// are asserted in tests, so keep them stable.
+const (
+	// ReasonShellDisabled means the shell surface is turned off entirely
+	// (h.Disabled==true). Shell is default-deny (opt-in) as of aceteam #6149
+	// Phase 0: a node accepts remote commands only after an operator explicitly
+	// enables the `shell` permission.
+	ReasonShellDisabled = "shell_disabled"
+	// ReasonPasscodeNotSet means shell is ENABLED but no node passcode is
+	// configured, so there is nothing to check the presented passcode against.
+	// Fails CLOSED: the operator must set a passcode before shell can run.
+	ReasonPasscodeNotSet = "passcode_not_set"
+	// ReasonPasscodeInvalid means a passcode IS configured but the presented
+	// payload passcode is absent or wrong.
+	ReasonPasscodeInvalid = "passcode_invalid"
+)
 
-// ShellPasscodeRequiredError is the exact message returned when SHELL_COMMAND
-// execution is enabled but the job did not present the correct per-node
-// passcode. Shell is a sensitive surface (aceteam#6524): enabling it is not the
-// same as opening it to anyone who can dispatch a job, so an enabled node
-// additionally requires the node passcode (the SAME bcrypt passcode that gates
-// console/desktop/files). Fails CLOSED: a node with no passcode set, a passcode
-// gate that was never wired, or a wrong/absent payload passcode is refused. The
-// wording is part of the handler's contract and is asserted in tests, so keep it
-// stable.
-const ShellPasscodeRequiredError = "shell command execution requires the node passcode; set a node passcode and present it in the SHELL_COMMAND payload `passcode` field"
+// Human-readable messages carried in a ShellRefusal.Message. Kept as constants
+// so the handler and its tests agree on the wording without duplicating the
+// literals.
+const (
+	msgShellDisabled   = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center, then restart the worker)"
+	msgPasscodeNotSet  = "shell command execution requires a node passcode, but none is set; set a node passcode (APPLY_DEVICE_CONFIG `nodePasscode` or the AceTeam control center) before dispatching shell commands"
+	msgPasscodeInvalid = "shell command execution requires the node passcode; present the correct passcode in the SHELL_COMMAND payload `passcode` field"
+)
+
+// ShellRefusal is the typed error returned when a SHELL_COMMAND is refused. Its
+// Error() renders a machine-readable JSON object
+// {"reason":"<code>","message":"<human>"} (marshaled via encoding/json, never
+// hand-concatenated, so a message containing quotes stays valid JSON). Reason is
+// one of the Reason* codes above. Callers should inspect the typed error via
+// errors.As and switch on Reason rather than string-matching the message.
+type ShellRefusal struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// Error renders the refusal as a JSON object. Reason and Message are plain
+// strings so json.Marshal cannot fail here; the concatenated fallback exists
+// only to satisfy the error contract defensively and is never expected to run.
+func (e *ShellRefusal) Error() string {
+	b, err := json.Marshal(e)
+	if err != nil {
+		return `{"reason":"` + e.Reason + `","message":"shell command refused"}`
+	}
+	return string(b)
+}
 
 // ShellPasscodePayloadKey is the SHELL_COMMAND payload field carrying the
 // per-node passcode. The platform (aceteam#6559) must set this on every shell
@@ -219,11 +251,20 @@ type ShellCommandHandler struct {
 	// WorkspaceDir, when non-empty, is set as the command's working directory so
 	// relative paths resolve consistently with the file-operation handlers.
 	WorkspaceDir string
-	// Disabled, when true, makes Execute refuse every command with
-	// ShellDisabledError instead of running it. Wired from the persisted
+	// Disabled, when true, makes Execute refuse every command with a
+	// ReasonShellDisabled refusal instead of running it. Wired from the persisted
 	// `shell` node permission, which is default-deny (opt-in): unless a node
 	// explicitly enables Shell, callers set Disabled=true (aceteam #6149).
 	Disabled bool
+	// HasPasscode reports whether a node passcode is configured at all, WITHOUT
+	// leaking the hash. It lets Execute distinguish "no passcode set"
+	// (ReasonPasscodeNotSet: the operator must set one) from "wrong passcode
+	// presented" (ReasonPasscodeInvalid), which VerifyPasscode alone cannot do
+	// (both cases make VerifyPasscode return false). Fail-CLOSED contract: a nil
+	// HasPasscode, or HasPasscode()==false, is treated as "no passcode set" and
+	// refuses every command. The construction sites wire it from
+	// config.LoadPermissions(...).HasPasscode.
+	HasPasscode func() bool
 	// VerifyPasscode gates an ENABLED shell handler on the per-node passcode
 	// (aceteam#6524), mirroring how the gateway gates console/desktop/files: it
 	// checks the passcode presented in the SHELL_COMMAND payload (see
@@ -243,19 +284,34 @@ func NewShellCommandHandler(workspace string) *ShellCommandHandler {
 }
 
 func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	// Refusal decision order (aceteam#6524, #6559): shell_disabled beats
+	// passcode_not_set beats passcode_invalid. Each returns a typed *ShellRefusal
+	// carrying a machine-readable reason code so the platform can prompt the
+	// operator precisely. Fail CLOSED throughout: a nil HasPasscode or a nil
+	// VerifyPasscode still refuses, so a forgotten gate never silently opens root
+	// shell to anyone who can dispatch a job.
 	if h.Disabled {
-		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, ShellDisabledError)
-		return nil, fmt.Errorf("%s", ShellDisabledError)
+		refusal := &ShellRefusal{Reason: ReasonShellDisabled, Message: msgShellDisabled}
+		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
+		return nil, refusal
 	}
 
-	// Passcode gate (aceteam#6524): an ENABLED shell surface additionally requires
-	// the per-node passcode, so "enabled" is not "open to anyone who can dispatch a
-	// job". Fail CLOSED: a nil verifier (gate not wired) or a wrong/absent payload
-	// passcode refuses before any command runs. The passcode is read from a
-	// dedicated payload field and is never forwarded into the command environment.
+	// No passcode configured: nothing to check against, so the operator must set
+	// one before shell can run. A nil HasPasscode is treated as "not set".
+	if h.HasPasscode == nil || !h.HasPasscode() {
+		refusal := &ShellRefusal{Reason: ReasonPasscodeNotSet, Message: msgPasscodeNotSet}
+		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
+		return nil, refusal
+	}
+
+	// A passcode IS configured: the job must present the correct one. The passcode
+	// is read from a dedicated payload field and is never forwarded into the
+	// command environment. A nil verifier (gate not wired) or a wrong/absent
+	// payload passcode refuses before any command runs.
 	if h.VerifyPasscode == nil || !h.VerifyPasscode(job.Payload[ShellPasscodePayloadKey]) {
-		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, ShellPasscodeRequiredError)
-		return nil, fmt.Errorf("%s", ShellPasscodeRequiredError)
+		refusal := &ShellRefusal{Reason: ReasonPasscodeInvalid, Message: msgPasscodeInvalid}
+		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
+		return nil, refusal
 	}
 
 	cmdString, ok := job.Payload["command"]
