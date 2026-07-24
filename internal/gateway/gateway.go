@@ -164,6 +164,22 @@ type Server struct {
 	// must have its proxy handler registered live (Start's registration loop has
 	// already run), whereas a route added before Start is picked up by that loop.
 	started bool
+
+	// exposures maps an exposed-service name (the <name> in /expose/<name>/) to
+	// its visibility policy. It is the SOLE gate for /expose/ routes
+	// (exposureMiddleware); an unregistered name fails closed (404). See
+	// exposure.go (issue #598). Set via SetExposure/Expose/RemoveExposure.
+	exposures map[string]*ExposePolicy
+
+	// exposeSigningKey is the per-node secret that signs/verifies `link` access
+	// tokens. Empty means no link token can verify (fail closed). Set via
+	// SetExposeSigningKey.
+	exposeSigningKey []byte
+
+	// meshResolver verifies a caller's mesh identity (tailnet login + same-owner)
+	// for private/org exposures. Nil makes private/org fail closed. Set via
+	// SetMeshResolver; the cmd layer wires network.WhoIsPeer.
+	meshResolver MeshIdentityResolver
 }
 
 // NewServer creates a new gateway server.
@@ -337,6 +353,16 @@ func categoryForRequest(path string, resolver CapabilityResolver) string {
 // routes (/modules/<prefix>/) are handled by categoryForRequest, which layers a
 // registry lookup on top of this.
 func categoryForPath(path string) string {
+	// Exposed-service routes (/expose/<name>/) are gated SOLELY by
+	// exposureMiddleware (identity/token visibility), never by the capability
+	// switch. Always-allow them here so a `link` recipient — who has no capability
+	// and no node passcode — is not rejected by the capability/passcode gate
+	// before the visibility middleware runs. exposureMiddleware fails closed for
+	// any unregistered /expose/<name>, so this is not an open door. See
+	// exposure.go (issue #598).
+	if strings.HasPrefix(path, ExposeRoutePrefix) {
+		return ""
+	}
 	// Terminal/console
 	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
 		return "console"
@@ -704,6 +730,13 @@ func isWebSocketUpgrade(r *http.Request) bool {
 // middleware stack.
 func (s *Server) BuildHandler() http.Handler {
 	var handler http.Handler = s.mux
+	// exposureMiddleware wraps CLOSEST to the mux so it is the last gate before a
+	// request reaches the proxy. It gates ONLY /expose/<name>/ routes (identity/
+	// token visibility) and passes everything else through untouched. It sits
+	// inside the capability layer on purpose: categoryForPath always-allows
+	// /expose/, so the capability gate never rejects a link/org caller before this
+	// runs — this middleware is the sole authority for exposed routes.
+	handler = s.exposureMiddleware(handler)
 	if s.metering != nil {
 		handler = s.metering.WrapHandler(handler)
 	}

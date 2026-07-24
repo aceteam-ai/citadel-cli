@@ -144,6 +144,7 @@ const (
 	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
 	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
@@ -207,6 +208,7 @@ var allKnownJobTypes = []string{
 	JobTypeResourceSnapshot,
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
+	JobTypeExposeSet,
 	JobTypeMeetingJoin,
 	JobTypeInstanceProvision,
 	JobTypeInstanceStart,
