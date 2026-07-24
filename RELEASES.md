@@ -1341,3 +1341,22 @@ Auto-generated log of every release.
   - fix(worker): register native llm_inference handler (#590) (#592)
 
 
+---
+
+## v2.88.0 — 2026-07-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 44 |
+| Lines added | +4221 |
+
+**Changes:**
+
+  - fix(instance): reattach to running TUI cleanly — no surprise shell, no Ctrl-D freeze (#602)
+  - feat(gateway): expose node services with private/org/link visibility (#598) (#599)
+  - feat(nvr): package wyze-bridge + Frigate camera NVR as a catalog module (#597) (#600)
+  - feat(attach): discover-and-attach client for the running worker (#571) (#601)
+  - chore: sync generated files after v2.87.0 release
+
+
