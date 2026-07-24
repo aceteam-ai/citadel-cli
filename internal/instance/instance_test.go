@@ -3,12 +3,117 @@
 package instance
 
 import (
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
+
+// fakePTY is a ptyIO whose Read blocks until released, so relaySession's
+// teardown can be tested deterministically without a real PTY/shell. Releasing
+// it (or closing the conn) simulates the shell exiting.
+type fakePTY struct {
+	mu        sync.Mutex
+	writes    [][]byte
+	resizedTo [2]uint16
+	release   chan struct{} // Read returns io.EOF once closed (shell "exits")
+}
+
+func newFakePTY() *fakePTY { return &fakePTY{release: make(chan struct{})} }
+
+func (f *fakePTY) Read(p []byte) (int, error) {
+	<-f.release
+	return 0, io.EOF
+}
+
+func (f *fakePTY) exit() { close(f.release) }
+
+func (f *fakePTY) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = append(f.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func (f *fakePTY) Resize(cols, rows uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resizedTo = [2]uint16{cols, rows}
+	return nil
+}
+
+// TestRelaySession_ShellExitClosesConn is the regression test for the reported
+// freeze: when the shell exits (session.Read returns EOF), relaySession must
+// close the conn so BOTH the relay loop and the attached client detach, instead
+// of hanging on their respective conn.Read.
+func TestRelaySession_ShellExitClosesConn(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	session := newFakePTY()
+
+	done := make(chan struct{})
+	go func() {
+		relaySession(serverConn, session)
+		close(done)
+	}()
+
+	session.exit() // the shell exits
+
+	// The attached client must observe the connection close (EOF), not hang.
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	if _, err := clientConn.Read(buf); err == nil {
+		t.Fatal("client Read returned nil error after shell exit; expected the conn to be closed")
+	}
+
+	// relaySession itself must return (its client->PTY loop unblocked by the close).
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relaySession did not return after shell exit — teardown hung (the freeze regression)")
+	}
+	_ = clientConn.Close()
+}
+
+// TestRelaySession_ResizeMessage verifies a 5-byte resize frame is applied to
+// the session and not forwarded as shell input.
+func TestRelaySession_ResizeMessage(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	session := newFakePTY() // Read blocks (shell alive) so the relay stays up
+	defer session.exit()    // release the PTY->client goroutine at the end
+
+	done := make(chan struct{})
+	go func() {
+		relaySession(serverConn, session)
+		close(done)
+	}()
+
+	// Send a resize frame: 0x00, cols=120 (LE), rows=40 (LE).
+	frame := []byte{0x00, 120, 0, 40, 0}
+	_ = clientConn.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := clientConn.Write(frame); err != nil {
+		t.Fatalf("write resize frame: %v", err)
+	}
+	_ = clientConn.Close() // ends the relay's client->PTY loop
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relaySession did not return after client close")
+	}
+
+	session.mu.Lock()
+	got := session.resizedTo
+	sawWrite := len(session.writes)
+	session.mu.Unlock()
+	if got != [2]uint16{120, 40} {
+		t.Errorf("resize not applied: got %v, want [120 40]", got)
+	}
+	if sawWrite != 0 {
+		t.Errorf("resize frame must not be written to the shell as input, got %d writes", sawWrite)
+	}
+}
 
 func TestListenAndIsRunning(t *testing.T) {
 	dir := t.TempDir()

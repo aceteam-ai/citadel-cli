@@ -176,13 +176,20 @@ func runControlCenter() {
 		os.Exit(1)
 	}
 
-	// Single-instance detection: if another TUI is running, attach to it
+	// Single-instance detection: a control-center TUI is already running (it holds
+	// citadel.sock) in another terminal. Two terminals cannot share one bubbletea
+	// TUI, so name the running instance and exit cleanly rather than silently
+	// dropping the user into a surprise shell on the node (the reported confusion:
+	// "this should've reattached to the TUI but went to a console"). An explicit
+	// shell into the node remains available via `citadel attach --shell`.
 	configDir := platform.ConfigDir()
 	if instance.IsRunning(configDir) {
-		if err := instance.Attach(configDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Attach failed: %v\n", err)
-			os.Exit(1)
+		if pid := instance.PID(configDir); pid > 0 {
+			fmt.Fprintf(os.Stderr, "Citadel control center is already running (PID %d) in another terminal.\n", pid)
+		} else {
+			fmt.Fprintln(os.Stderr, "Citadel control center is already running in another terminal.")
 		}
+		fmt.Fprintln(os.Stderr, "Switch to that terminal to use it, or run `citadel attach --shell` for a shell on this node.")
 		return
 	}
 

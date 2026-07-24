@@ -151,8 +151,31 @@ func (s *Server) handleClient(conn net.Conn) {
 	}
 	defer session.Close()
 
-	// PTY → client
+	relaySession(conn, session)
+}
+
+// ptyIO is the subset of *console.PTYSession that relaySession needs. It exists
+// so the relay teardown (the part that had the Ctrl-D-hang bug) is unit-testable
+// with a fake session and a net.Pipe, without spawning a real shell/PTY.
+type ptyIO interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+	Resize(cols, rows uint16) error
+}
+
+// relaySession pipes conn<->session bidirectionally until either side ends.
+//
+// CRITICAL teardown invariant: when the shell exits (session.Read returns EOF),
+// the PTY->client goroutine MUST close conn. The client->PTY loop below is
+// blocked on conn.Read, and the attached client is blocked on its own conn.Read;
+// nothing else closes conn. Without this, a Ctrl-D that exits the shell left the
+// attach session hung forever (the reported freeze). Closing conn unblocks both
+// this loop and the client, so both detach cleanly. Double-close is harmless.
+func relaySession(conn net.Conn, session ptyIO) {
+	// PTY -> client. On exit (shell died / PTY EOF, or a write to a detached
+	// client), close conn so the client->PTY loop and the remote client tear down.
 	go func() {
+		defer conn.Close()
 		buf := make([]byte, 4096)
 		for {
 			n, err := session.Read(buf)
@@ -167,7 +190,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 	}()
 
-	// client → PTY (with resize detection)
+	// client -> PTY (with resize detection).
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
