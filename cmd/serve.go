@@ -202,6 +202,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	perms := config.LoadPermissions(platform.ConfigDir())
 	gw.SetPermissions(perms)
 
+	// Service ingress / exposure (issue #598): wire the identity resolver
+	// (private/org visibility) and the per-node link-token signing key so an
+	// exposed service under /expose/<name>/ can be gated by mesh identity or a
+	// signed link token. Harmless when nothing is exposed.
+	gw.SetMeshResolver(gatewayMeshResolver{})
+	if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
+		Log("warning: gateway link-token signing disabled: %v", err)
+	} else {
+		gw.SetExposeSigningKey(key)
+	}
+
 	// Register upstreams — status server endpoints
 	// These route to the status server started by 'citadel work --status-port'
 	gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})

@@ -108,6 +108,15 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
+	// EXPOSE_SET (issue #598): expose a local node service on the gateway with
+	// private/org/link visibility and return the managed mesh URL. The live ops
+	// adapter programs the in-process gateway; the node half of the `expose` MCP
+	// verb's contract.
+	runner.RegisterHandler(worker.NewExposeSetHandler(worker.ExposeSetConfig{
+		Ops: liveExposeOps{},
+		Log: opts.HandlerLog,
+	}))
+
 	// INSTANCE_* (aceteam#5963): fabric instance provisioning on this node's
 	// Proxmox hypervisor. Registered unconditionally so nodes without a proxmox
 	// provisioning config fail these jobs with a clear message; the lazy factory
