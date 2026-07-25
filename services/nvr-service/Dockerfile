@@ -10,9 +10,10 @@
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY patches/ ./patches/
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/nvrconfig ./cmd/nvrconfig
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -o /out/nvrconfig ./cmd/nvrconfig
 
 FROM alpine:3.20
 RUN adduser -D -u 10001 nvr
