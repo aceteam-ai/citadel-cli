@@ -114,6 +114,14 @@ func runAttach(_ *cobra.Command, _ []string) error {
 	// ghost.
 	held, _ := worklock.IsHeld(stateDir)
 	if !held {
+		// No WORKER holds the lock — but a control-center TUI may still be running.
+		// That is a SEPARATE "is citadel running?" surface (the instance socket, not
+		// the worklock), so don't claim nothing is running when a TUI is up.
+		configDir := platform.ConfigDir()
+		if instance.IsRunning(configDir) {
+			fmt.Fprint(os.Stdout, tuiRunningNoWorkerMessage(instance.PID(configDir)))
+			return nil // something IS running; this is not the "nothing to attach to" error
+		}
 		fmt.Fprint(os.Stdout, noWorkerMessage())
 		return errNoRunningWorker
 	}
@@ -142,6 +150,23 @@ func noWorkerMessage() string {
 	var b strings.Builder
 	b.WriteString("No citadel worker is running on this node.\n\n")
 	b.WriteString("Start one with:  citadel work\n")
+	return b.String()
+}
+
+// tuiRunningNoWorkerMessage is shown when no WORKER holds the lock but a
+// control-center TUI (the instance socket — a separate "is citadel running?"
+// surface) IS running, so `citadel attach` never claims nothing is running when
+// a TUI is up. Pure so the copy is unit tested.
+func tuiRunningNoWorkerMessage(pid int) string {
+	var b strings.Builder
+	if pid > 0 {
+		fmt.Fprintf(&b, "Citadel control center is running (PID %d) — the TUI you launched with `citadel`.\n", pid)
+	} else {
+		b.WriteString("Citadel control center is running — the TUI you launched with `citadel`.\n")
+	}
+	b.WriteString("No worker is running yet.\n\n")
+	b.WriteString("  • open a shell on the running node:   citadel attach --shell\n")
+	b.WriteString("  • start a worker:                     citadel work\n")
 	return b.String()
 }
 
