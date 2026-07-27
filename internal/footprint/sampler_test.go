@@ -103,6 +103,7 @@ func TestSamplerNodeRowCarriesMeasuredPower(t *testing.T) {
 		nodeID:    "n",
 		services:  []string{"vllm"},
 		engineBin: "docker",
+		energy:    true,
 		interval:  60 * time.Second,
 		powerCfg:  PowerConfig{CPUTDPWatts: 65},
 		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
@@ -147,6 +148,7 @@ func TestSamplerNodeRowEstimatesFromUtilWhenNoDraw(t *testing.T) {
 		nodeID:    "n",
 		services:  nil,
 		engineBin: "docker",
+		energy:    true,
 		interval:  60 * time.Second,
 		powerCfg:  PowerConfig{CPUTDPWatts: 65},
 		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
@@ -166,6 +168,79 @@ func TestSamplerNodeRowEstimatesFromUtilWhenNoDraw(t *testing.T) {
 	}
 	if node.PowerW == nil || math.Abs(*node.PowerW-140) > 1e-6 { // 40% of 350
 		t.Errorf("power_w = %v, want 140", node.PowerW)
+	}
+}
+
+// TestSamplerEnergyDisabledSkipsProbeAndColumns verifies the default-OFF contract:
+// with energy off, the GPU power probe is never invoked and the node row carries
+// no power_w / energy_wh / power_source, even though a GPU with power is present.
+func TestSamplerEnergyDisabledSkipsProbeAndColumns(t *testing.T) {
+	probeCalled := false
+	s := &Sampler{
+		nodeID:    "n",
+		services:  []string{"vllm"},
+		engineBin: "docker",
+		energy:    false, // disabled
+		interval:  60 * time.Second,
+		powerCfg:  PowerConfig{CPUTDPWatts: 65},
+		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
+		gpu: func() GPUSnapshot {
+			return GPUSnapshot{HasGPU: true, VRAMUsedMB: 8000, GPUUtilPercent: 55}
+		},
+		gpuPower: func() (float64, bool, float64) {
+			probeCalled = true
+			return 210, true, 350
+		},
+		idle: func() (int, bool) { return 0, false },
+	}
+	rows := s.Sample(context.Background(), time.Now())
+	if probeCalled {
+		t.Error("GPU power probe must NOT be invoked when energy sampling is disabled")
+	}
+	node := rows[len(rows)-1]
+	if node.Service != NodeService {
+		t.Fatalf("last row should be node, got %q", node.Service)
+	}
+	// VRAM/util still recorded (unchanged behavior); power columns stay blank.
+	if node.VRAMMB == nil || *node.VRAMMB != 8000 {
+		t.Errorf("VRAM should still be recorded when energy off, got %v", node.VRAMMB)
+	}
+	if node.PowerW != nil || node.EnergyWh != nil || node.PowerSource != PowerSourceUnknown {
+		t.Errorf("no power fields when energy off, got power_w=%v energy_wh=%v source=%q", node.PowerW, node.EnergyWh, node.PowerSource)
+	}
+}
+
+// TestSamplerEnergyEnabledInvokesProbe verifies the enabled path calls the
+// injected power probe and stamps the resulting measured figure.
+func TestSamplerEnergyEnabledInvokesProbe(t *testing.T) {
+	probeCalled := false
+	s := &Sampler{
+		nodeID:    "n",
+		engineBin: "docker",
+		energy:    true,
+		interval:  time.Hour,
+		powerCfg:  PowerConfig{CPUTDPWatts: 65},
+		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
+		gpu: func() GPUSnapshot {
+			return GPUSnapshot{HasGPU: true, GPUUtilPercent: 50}
+		},
+		gpuPower: func() (float64, bool, float64) {
+			probeCalled = true
+			return 300, true, 350
+		},
+		idle: func() (int, bool) { return 0, false },
+	}
+	rows := s.Sample(context.Background(), time.Now())
+	if !probeCalled {
+		t.Error("GPU power probe should be invoked when energy sampling is enabled")
+	}
+	node := rows[len(rows)-1]
+	if node.PowerW == nil || *node.PowerW != 300 || node.PowerSource != PowerSourceMeasured {
+		t.Errorf("expected measured 300W from probe, got power_w=%v source=%q", node.PowerW, node.PowerSource)
+	}
+	// 300W for 1h = 300 Wh.
+	if node.EnergyWh == nil || math.Abs(*node.EnergyWh-300) > 1e-6 {
+		t.Errorf("energy_wh = %v, want 300", node.EnergyWh)
 	}
 }
 

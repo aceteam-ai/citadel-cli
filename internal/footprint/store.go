@@ -36,17 +36,33 @@ var dailyFilePattern = regexp.MustCompile(`^footprints-\d{4}-\d{2}-\d{2}\.csv$`)
 // is only ever one sampler per node).
 type Store struct {
 	dir string
+	// energy controls whether the three energy columns are written. When false
+	// (energy sampling off) the store writes the original core schema only, so a
+	// node with energy disabled produces byte-identical CSVs to the pre-energy
+	// build.
+	energy bool
 }
 
-// NewStore returns a Store writing to dir, creating the directory if needed.
-func NewStore(dir string) (*Store, error) {
+// NewStore returns a Store writing to dir, creating the directory if needed. When
+// energy is false the store omits the power_w / energy_wh / power_source columns
+// entirely (header and rows).
+func NewStore(dir string, energy bool) (*Store, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("footprint: empty store dir")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("footprint: create store dir: %w", err)
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, energy: energy}, nil
+}
+
+// header returns the CSV header for this store: the core (pre-energy) columns,
+// plus the energy columns when energy sampling is enabled.
+func (s *Store) header() []string {
+	if s.energy {
+		return csvHeader
+	}
+	return csvHeader[:coreColumns]
 }
 
 // Dir returns the store's directory (the footprints/ path).
@@ -89,12 +105,12 @@ func (s *Store) Append(samples []Sample) error {
 
 	w := csv.NewWriter(f)
 	if needHeader {
-		if err := w.Write(csvHeader); err != nil {
+		if err := w.Write(s.header()); err != nil {
 			return fmt.Errorf("footprint: write header: %w", err)
 		}
 	}
 	for _, sm := range samples {
-		if err := w.Write(sm.toRecord()); err != nil {
+		if err := w.Write(sm.toRecord(s.energy)); err != nil {
 			return fmt.Errorf("footprint: write row: %w", err)
 		}
 	}
@@ -107,9 +123,11 @@ func (s *Store) Append(samples []Sample) error {
 
 // toRecord renders a sample as a CSV record in csvHeader column order. Unset
 // optional metrics render as the empty string, so DuckDB reads them as NULL and
-// a human greps them as blank — distinct from a measured zero.
-func (sm Sample) toRecord() []string {
-	return []string{
+// a human greps them as blank, distinct from a measured zero. The three energy
+// columns are appended only when energy is true; when false the record is the
+// original core schema.
+func (sm Sample) toRecord(energy bool) []string {
+	rec := []string{
 		sm.Timestamp.UTC().Format(time.RFC3339),
 		sm.NodeID,
 		sm.Service,
@@ -119,10 +137,15 @@ func (sm Sample) toRecord() []string {
 		intField(sm.VRAMMB),
 		floatField(sm.GPUUtilPercent),
 		intField(sm.IdleSeconds),
-		floatField(sm.PowerW),
-		floatField(sm.EnergyWh),
-		string(sm.PowerSource),
 	}
+	if energy {
+		rec = append(rec,
+			floatField(sm.PowerW),
+			floatField(sm.EnergyWh),
+			string(sm.PowerSource),
+		)
+	}
+	return rec
 }
 
 func floatField(v *float64) string {

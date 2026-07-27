@@ -36,6 +36,11 @@ type Config struct {
 	// RetentionDays prunes files older than this many days. Zero uses
 	// DefaultRetentionDays; negative disables pruning.
 	RetentionDays int
+	// EnergySampling turns the per-interval energy estimate on. Default false
+	// (opt-in): the caller resolves it from CITADEL_ENERGY_SAMPLING or the node's
+	// persisted energy config. When false, no power probe runs and no energy
+	// columns are written.
+	EnergySampling bool
 	// Logf is an optional structured log sink (e.g. cmd.Log). May be nil.
 	Logf func(format string, args ...any)
 }
@@ -93,13 +98,13 @@ func Run(ctx context.Context, cfg Config) {
 		logf = func(string, ...any) {}
 	}
 
-	store, err := NewStore(cfg.Dir)
+	store, err := NewStore(cfg.Dir, cfg.EnergySampling)
 	if err != nil {
 		logf("footprint: sampler disabled: %v", err)
 		return
 	}
 
-	sampler := NewSampler(cfg.NodeID, cfg.Services, cfg.EngineBin, interval, PowerConfigFromEnv())
+	sampler := NewSampler(cfg.NodeID, cfg.Services, cfg.EngineBin, interval, PowerConfigFromEnv(), cfg.EnergySampling)
 
 	// Prune once at startup so a node that was offline past the retention window
 	// cleans up immediately rather than after the first tick.

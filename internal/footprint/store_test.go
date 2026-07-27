@@ -13,7 +13,7 @@ func ip(v int) *int          { return &v }
 
 func TestAppendWritesHeaderOnce(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir)
+	store, err := NewStore(dir, false)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestAppendWritesHeaderOnce(t *testing.T) {
 
 func TestAppendWritesEnergyColumns(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, true)
 
 	day := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
 	node := Sample{
@@ -80,7 +80,7 @@ func TestAppendWritesEnergyColumns(t *testing.T) {
 
 func TestAppendRotatesByDay(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 
 	d1 := time.Date(2026, 7, 1, 23, 59, 0, 0, time.UTC)
 	d2 := time.Date(2026, 7, 2, 0, 1, 0, 0, time.UTC)
@@ -100,7 +100,7 @@ func TestAppendRotatesByDay(t *testing.T) {
 
 func TestAppendEmptyIsNoop(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 	if err := store.Append(nil); err != nil {
 		t.Fatalf("Append(nil): %v", err)
 	}
@@ -112,7 +112,7 @@ func TestAppendEmptyIsNoop(t *testing.T) {
 
 func TestPruneRemovesOldKeepsRecent(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	// Create files spanning old and recent days plus an unrelated file.
@@ -163,7 +163,7 @@ func TestPruneRemovesOldKeepsRecent(t *testing.T) {
 
 func TestPruneDisabledWhenRetentionNonPositive(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 	now := time.Now()
 	if err := store.Append([]Sample{{Timestamp: now.AddDate(0, 0, -100), NodeID: "n", Service: "svc"}}); err != nil {
 		t.Fatal(err)

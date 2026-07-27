@@ -2245,17 +2245,35 @@ func startFootprintSampler(ctx context.Context, nodeName string, manifest *Citad
 		}
 	}
 
+	energy := resolveEnergySampling()
 	cfg := footprint.Config{
-		NodeID:        nodeName,
-		Services:      serviceNames,
-		EngineBin:     catalog.SelectContainerRuntime().EngineBin,
-		Dir:           footprint.DefaultDir(nodeDir),
-		Interval:      interval,
-		RetentionDays: footprint.RetentionFromEnv(),
-		Logf:          func(format string, args ...any) { Log(format, args...) },
+		NodeID:         nodeName,
+		Services:       serviceNames,
+		EngineBin:      catalog.SelectContainerRuntime().EngineBin,
+		Dir:            footprint.DefaultDir(nodeDir),
+		Interval:       interval,
+		RetentionDays:  footprint.RetentionFromEnv(),
+		EnergySampling: energy,
+		Logf:           func(format string, args ...any) { Log(format, args...) },
 	}
 	go footprint.Run(ctx, cfg)
-	fmt.Printf("   - Footprint sampler: every %s → %s\n", interval, cfg.Dir)
+	energyLabel := "off"
+	if energy {
+		energyLabel = "on"
+	}
+	fmt.Printf("   - Footprint sampler: every %s (energy %s) → %s\n", interval, energyLabel, cfg.Dir)
+}
+
+// resolveEnergySampling decides whether the footprint sampler records the
+// per-request energy estimate (aceteam#6635). Default OFF. Precedence: the
+// CITADEL_ENERGY_SAMPLING env var wins when set (truthy enables, anything else
+// disables); otherwise the node's persisted energy.yaml toggle applies, which the
+// platform can set via APPLY_DEVICE_CONFIG.
+func resolveEnergySampling() bool {
+	if raw := strings.TrimSpace(os.Getenv("CITADEL_ENERGY_SAMPLING")); raw != "" {
+		return update.IsTruthy(raw)
+	}
+	return config.LoadEnergy(platform.ConfigDir()).SamplingEnabled
 }
 
 // stopManagedServices tears down services this worker started, mirroring the
