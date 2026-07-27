@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,6 +196,172 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("ollama messages route to /api/chat", func(t *testing.T) {
+		// Regression for issue #6641: a chat request (messages, no prompt) to the
+		// ollama backend previously hit /api/generate with an empty prompt, so
+		// Ollama loaded the model and returned an empty response -> "No response
+		// content" on the platform. It must route to /api/chat and return
+		// message.content instead.
+		body := `{"model":"llama3.2:1b","message":{"role":"assistant","content":"OK"},` +
+			`"done":true,"prompt_eval_count":15,"eval_count":3}`
+		var gotPath, gotPrompt string
+		var sawMessages bool
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			var req map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if _, ok := req["messages"]; ok {
+				sawMessages = true
+			}
+			if p, ok := req["prompt"].(string); ok {
+				gotPrompt = p
+			}
+			if r.URL.Path != "/api/chat" {
+				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+
+		h := NewLLMInferenceHandler()
+		h.baseURLs["ollama"] = ts.URL
+
+		job := &Job{
+			ID:   "job-ollama-chat",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":    "llama3.2:1b",
+				"backend":  "ollama",
+				"messages": []map[string]any{{"role": "user", "content": "Reply with exactly: OK"}},
+			},
+		}
+		stream := &MockStreamWriter{}
+		result, err := h.Execute(context.Background(), job, stream)
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		if gotPath != "/api/chat" {
+			t.Errorf("routed to %q, want /api/chat", gotPath)
+		}
+		if !sawMessages {
+			t.Errorf("request did not carry messages")
+		}
+		if gotPrompt != "" {
+			t.Errorf("request carried a prompt %q, want none", gotPrompt)
+		}
+		if got, _ := result.Output["content"].(string); got != "OK" {
+			t.Errorf("content = %q, want OK", got)
+		}
+		if len(stream.chunks) != 1 || stream.chunks[0] != "OK" {
+			t.Errorf("chunks = %v, want [OK]", stream.chunks)
+		}
+		usage, _ := result.Output["usage"].(map[string]any)
+		if usage == nil {
+			t.Fatalf("usage missing, want token counts")
+		}
+		if usage["prompt_tokens"] != 15 || usage["completion_tokens"] != 3 || usage["total_tokens"] != 18 {
+			t.Errorf("usage = %v, want prompt=15 completion=3 total=18", usage)
+		}
+	})
+
+	t.Run("ollama streaming chat routes to /api/chat", func(t *testing.T) {
+		frames := []string{
+			`{"message":{"role":"assistant","content":"Hel"},"done":false}`,
+			`{"message":{"role":"assistant","content":"lo"},"done":false}`,
+			`{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":9,"eval_count":2}`,
+		}
+		var gotPath string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			if r.URL.Path != "/api/chat" {
+				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			for _, f := range frames {
+				_, _ = w.Write([]byte(f + "\n"))
+			}
+		}))
+		defer ts.Close()
+
+		h := NewLLMInferenceHandler()
+		h.baseURLs["ollama"] = ts.URL
+
+		job := &Job{
+			ID:   "job-ollama-chat-stream",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":    "llama3.2:1b",
+				"backend":  "ollama",
+				"stream":   true,
+				"messages": []map[string]any{{"role": "user", "content": "hi"}},
+			},
+		}
+		stream := &MockStreamWriter{}
+		result, err := h.Execute(context.Background(), job, stream)
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		if gotPath != "/api/chat" {
+			t.Errorf("routed to %q, want /api/chat", gotPath)
+		}
+		if strings.Join(stream.chunks, "|") != "Hel|lo" {
+			t.Errorf("chunks = %v, want [Hel lo]", stream.chunks)
+		}
+		if got, _ := result.Output["content"].(string); got != "Hello" {
+			t.Errorf("content = %q, want Hello", got)
+		}
+		usage, _ := result.Output["usage"].(map[string]any)
+		if usage == nil || usage["prompt_tokens"] != 9 || usage["completion_tokens"] != 2 {
+			t.Errorf("usage = %v, want prompt=9 completion=2", usage)
+		}
+	})
+
+	t.Run("ollama prompt still routes to /api/generate", func(t *testing.T) {
+		var gotPath string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			if r.URL.Path != "/api/generate" {
+				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(`{"response":"generated"}`))
+		}))
+		defer ts.Close()
+
+		h := NewLLMInferenceHandler()
+		h.baseURLs["ollama"] = ts.URL
+
+		job := &Job{
+			ID:   "job-ollama-generate",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":   "llama3.2:1b",
+				"backend": "ollama",
+				"prompt":  "hi",
+			},
+		}
+		result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		if gotPath != "/api/generate" {
+			t.Errorf("routed to %q, want /api/generate", gotPath)
+		}
+		if got, _ := result.Output["content"].(string); got != "generated" {
+			t.Errorf("content = %q, want generated", got)
+		}
+	})
 
 	t.Run("unknown backend fails", func(t *testing.T) {
 		h := NewLLMInferenceHandler()

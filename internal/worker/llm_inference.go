@@ -278,6 +278,18 @@ func (h *LLMInferenceHandler) bufferedCompletions(stream StreamWriter, body io.R
 
 // executeOllama handles inference via Ollama's native /api/generate API.
 func (h *LLMInferenceHandler) executeOllama(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
+	// Chat-style requests (the OpenAI gateway and MCP inference_chat send
+	// `messages`, not `prompt`) route to Ollama's native /api/chat, which applies
+	// the model's chat template and returns the reply in message.content.
+	// /api/generate has no messages support: sending it an empty prompt made
+	// Ollama merely load the model and return an empty `response`
+	// (done_reason "load"), which surfaced as "No response content returned from
+	// the inference node" on the platform (issue #6641). The /api/generate prompt
+	// path is preserved for prompt-style jobs.
+	if len(payload.Messages) > 0 {
+		return h.executeOllamaChat(ctx, stream, payload)
+	}
+
 	reqPayload := map[string]any{
 		"model":  payload.Model,
 		"prompt": payload.Prompt,
@@ -357,6 +369,146 @@ func (h *LLMInferenceHandler) bufferedOllama(stream StreamWriter, body io.Reader
 		"content":       response.Response,
 		"finish_reason": "stop",
 	}), nil
+}
+
+// executeOllamaChat handles chat-style inference via Ollama's native /api/chat
+// API. Unlike /api/generate (prompt in, `response` out), /api/chat takes
+// `messages` and returns the assistant turn in `message.content`, applying the
+// served model's chat template. Used whenever an llm_inference job carries
+// `messages` (the shape the OpenAI gateway and MCP inference_chat dispatch).
+func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
+	messages := make([]map[string]string, 0, len(payload.Messages))
+	for _, m := range payload.Messages {
+		messages = append(messages, map[string]string{"role": m.Role, "content": m.Content})
+	}
+
+	reqPayload := map[string]any{
+		"model":    payload.Model,
+		"messages": messages,
+		"stream":   payload.Stream,
+	}
+	// Ollama takes sampling controls under `options` (not top-level like the
+	// OpenAI shape). Only send the ones the job set so an unset field keeps the
+	// model default rather than pinning greedy/zero.
+	options := map[string]any{}
+	if payload.MaxTokens > 0 {
+		options["num_predict"] = payload.MaxTokens
+	}
+	if payload.Temperature > 0 {
+		options["temperature"] = payload.Temperature
+	}
+	if payload.TopP > 0 {
+		options["top_p"] = payload.TopP
+	}
+	if len(payload.Stop) > 0 {
+		options["stop"] = payload.Stop
+	}
+	if len(options) > 0 {
+		reqPayload["options"] = options
+	}
+
+	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/chat", reqPayload)
+	if err != nil {
+		return h.failure(fmt.Errorf("failed to connect to Ollama: %w", err)), nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return h.failure(fmt.Errorf("Ollama returned status %d: %s", resp.StatusCode, string(body))), nil
+	}
+
+	if payload.Stream {
+		return h.streamOllamaChat(stream, resp.Body)
+	}
+	return h.bufferedOllamaChat(stream, resp.Body)
+}
+
+// streamOllamaChat forwards Ollama's /api/chat newline-delimited JSON stream as
+// chunks. Each frame carries an incremental message.content; the final frame has
+// done=true plus token counts.
+func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Reader) (*JobResult, error) {
+	scanner := bufio.NewScanner(body)
+	// Allow long JSON lines (large deltas) beyond bufio's default 64KiB cap.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	chunkIndex := 0
+	var fullContent strings.Builder
+	var promptTokens, completionTokens int
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var chunk struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done            bool `json:"done"`
+			PromptEvalCount int  `json:"prompt_eval_count"`
+			EvalCount       int  `json:"eval_count"`
+		}
+		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+			continue
+		}
+		if chunk.Message.Content != "" {
+			fullContent.WriteString(chunk.Message.Content)
+			stream.WriteChunk(chunk.Message.Content, chunkIndex)
+			chunkIndex++
+		}
+		if chunk.PromptEvalCount > 0 {
+			promptTokens = chunk.PromptEvalCount
+		}
+		if chunk.EvalCount > 0 {
+			completionTokens = chunk.EvalCount
+		}
+		if chunk.Done {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return h.failure(err), nil
+	}
+	return h.success(map[string]any{
+		"content":       fullContent.String(),
+		"finish_reason": "stop",
+		"usage":         ollamaUsage(promptTokens, completionTokens),
+	}), nil
+}
+
+// bufferedOllamaChat parses a non-streamed Ollama /api/chat response.
+func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Reader) (*JobResult, error) {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return h.failure(err), nil
+	}
+	var response struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		PromptEvalCount int `json:"prompt_eval_count"`
+		EvalCount       int `json:"eval_count"`
+	}
+	if err := json.Unmarshal(bodyBytes, &response); err != nil {
+		return h.failure(fmt.Errorf("failed to parse Ollama response: %w", err)), nil
+	}
+	writeSingleChunk(stream, response.Message.Content)
+	return h.success(map[string]any{
+		"content":       response.Message.Content,
+		"finish_reason": "stop",
+		"usage":         ollamaUsage(response.PromptEvalCount, response.EvalCount),
+	}), nil
+}
+
+// ollamaUsage maps Ollama's prompt_eval_count/eval_count onto the platform's
+// usage shape (prompt_tokens/completion_tokens/total_tokens) so the token footer
+// works for the ollama chat path like the vLLM/llama.cpp chat path.
+func ollamaUsage(promptTokens, completionTokens int) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+	}
 }
 
 // executeLlamaCppAt runs a llama.cpp-server inference against an explicit base
