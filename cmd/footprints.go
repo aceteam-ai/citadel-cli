@@ -37,7 +37,11 @@ ad-hoc analysis, e.g.:
     FROM '~/citadel-node/footprints/*.csv' GROUP BY 1 ORDER BY 2 DESC"
 
 The node-level row is recorded under the service name "_node" and carries
-host CPU/RAM plus total GPU utilisation and VRAM used.`,
+host CPU/RAM plus total GPU utilisation and VRAM used. When energy sampling is
+enabled (CITADEL_ENERGY_SAMPLING=1 or energy.yaml; default off), the node row
+also carries a per-interval energy estimate: power_w, energy_wh, and
+power_source (measured when read from a GPU power sensor, else estimated from
+utilisation and a TDP budget).`,
 	Example: `  # Summarize all services over the last hour
   citadel footprints --since 1h
 

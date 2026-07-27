@@ -2,6 +2,7 @@ package footprint
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,17 @@ type GPUSnapshot struct {
 	// HasGPU is false on nodes without an NVIDIA/Metal GPU, in which case the
 	// node-level row leaves vram_mb / gpu_util_pct empty.
 	HasGPU bool
+
+	// PowerWatts is the summed measured board power across GPUs (nvidia-smi
+	// power.draw). Valid only when PowerMeasured is true.
+	PowerWatts float64
+	// PowerMeasured is true when at least one GPU reported a real power.draw
+	// reading (not "[N/A]" / "[Not Supported]").
+	PowerMeasured bool
+	// PowerLimitWatts is the summed enforced power cap across GPUs (nvidia-smi
+	// power.limit). Used as the TDP for the utilisation-based power estimate when
+	// power.draw is unavailable. Zero when unknown.
+	PowerLimitWatts float64
 }
 
 // statsFunc runs the single container-stats exec for a tick. Injected so the
@@ -24,8 +36,16 @@ type GPUSnapshot struct {
 type statsFunc func(ctx context.Context, engineBin string) ([]containerStat, error)
 
 // gpuFunc reads the node-level GPU snapshot for a tick. Injected so the sampler
-// is testable without a GPU.
+// is testable without a GPU. It carries VRAM/util only; power is read separately
+// (gpuPowerFunc) and ONLY when energy sampling is enabled, so a plain footprint
+// tick runs no extra probe.
 type gpuFunc func() GPUSnapshot
+
+// gpuPowerFunc reads GPU board power draw and the enforced power limit for a
+// tick, summed across GPUs. Injected so the sampler is testable, and called ONLY
+// when energy sampling is enabled and a GPU is present (so the default footprint
+// path runs zero nvidia-smi power probes).
+type gpuPowerFunc func() (watts float64, measured bool, limitWatts float64)
 
 // idleFunc returns the node's current idle-seconds signal and whether it is
 // available. Injected; the default returns (0, false) because #420's idle signal
@@ -34,25 +54,43 @@ type gpuFunc func() GPUSnapshot
 type idleFunc func() (int, bool)
 
 // Sampler builds one batch of footprint samples per tick: one row per managed
-// service (from stats) plus one node-level row (host CPU/RSS + GPU).
+// service (from stats) plus one node-level row (host CPU/RSS + GPU + energy).
 type Sampler struct {
 	nodeID    string
 	services  []string
 	engineBin string
 
-	stats statsFunc
-	gpu   gpuFunc
-	idle  idleFunc
+	// energy gates the whole energy estimate. When false (the default), no power
+	// probe runs and the node row carries no power_w / energy_wh / power_source.
+	energy bool
+	// powerCfg holds the resolved power-estimation knobs (TDP overrides). Resolved
+	// once so no env parsing happens per tick.
+	powerCfg PowerConfig
+	// interval is the sampling cadence, used to convert instantaneous power_w into
+	// per-interval energy_wh. Zero leaves energy_wh blank.
+	interval time.Duration
+
+	stats    statsFunc
+	gpu      gpuFunc
+	gpuPower gpuPowerFunc
+	idle     idleFunc
 }
 
-// NewSampler wires a Sampler to the real host probes.
-func NewSampler(nodeID string, services []string, engineBin string) *Sampler {
+// NewSampler wires a Sampler to the real host probes. interval is the sampling
+// cadence (used for energy_wh); powerCfg carries the resolved TDP knobs; energy
+// turns the power estimate (and its nvidia-smi power probe) on. When energy is
+// false the sampler behaves exactly as before the energy feature existed.
+func NewSampler(nodeID string, services []string, engineBin string, interval time.Duration, powerCfg PowerConfig, energy bool) *Sampler {
 	return &Sampler{
 		nodeID:    nodeID,
 		services:  services,
 		engineBin: engineBin,
+		energy:    energy,
+		powerCfg:  powerCfg,
+		interval:  interval,
 		stats:     sampleContainerStats,
 		gpu:       sampleGPU,
+		gpuPower:  readGPUPowerReading,
 		idle:      func() (int, bool) { return 0, false },
 	}
 }
@@ -109,20 +147,66 @@ func (s *Sampler) Sample(ctx context.Context, ts time.Time) []Sample {
 		Running:     true,
 		IdleSeconds: idlePtr,
 	}
-	if cpu, ok := hostCPUPercent(); ok {
-		node.CPUPercent = &cpu
+	cpuPct, cpuOK := hostCPUPercent()
+	if cpuOK {
+		node.CPUPercent = &cpuPct
 	}
 	if rss, ok := hostRSSMB(); ok {
 		node.RSSMB = &rss
 	}
-	if snap := s.gpu(); snap.HasGPU {
+	snap := s.gpu()
+	if snap.HasGPU {
 		vram := snap.VRAMUsedMB
 		util := snap.GPUUtilPercent
 		node.VRAMMB = &vram
 		node.GPUUtilPercent = &util
 	}
+
+	// Node-level energy estimate: opt-in (default OFF). Only when enabled do we run
+	// the GPU power probe and stamp power_w / energy_wh / power_source. When off,
+	// this is a no-op so the tick is byte-identical to the pre-energy footprint.
+	if s.energy {
+		if snap.HasGPU && s.gpuPower != nil {
+			watts, measured, limit := s.gpuPower()
+			snap.PowerWatts = watts
+			snap.PowerMeasured = measured
+			snap.PowerLimitWatts = limit
+		}
+		s.fillNodePower(&node, snap, cpuPct, cpuOK)
+	}
+
 	rows = append(rows, node)
 	return rows
+}
+
+// fillNodePower runs the power waterfall for the node row and, when a figure is
+// available, sets power_w / energy_wh / power_source. It never fails: an absent
+// signal simply leaves the fields blank.
+func (s *Sampler) fillNodePower(node *Sample, snap GPUSnapshot, cpuPct float64, cpuOK bool) {
+	gpuTDP := s.powerCfg.GPUTDPWattsOverride
+	if gpuTDP <= 0 {
+		gpuTDP = snap.PowerLimitWatts
+	}
+	est := EstimateNodePower(PowerInputs{
+		HasGPU:           snap.HasGPU,
+		GPUPowerWatts:    snap.PowerWatts,
+		GPUPowerMeasured: snap.PowerMeasured,
+		GPUUtilKnown:     snap.HasGPU,
+		GPUUtilPercent:   snap.GPUUtilPercent,
+		GPUTDPWatts:      gpuTDP,
+		CPUKnown:         cpuOK,
+		CPUPercent:       cpuPct,
+		CPUTDPWatts:      s.powerCfg.CPUTDPWatts,
+	})
+	if !est.Known {
+		return
+	}
+	watts := est.Watts
+	node.PowerW = &watts
+	node.PowerSource = est.Source
+	if wh := energyWh(watts, s.interval); wh > 0 {
+		node.EnergyWh = &wh
+	}
 }
 
 // matchContainer returns the first stats row whose container name contains the
@@ -161,6 +245,55 @@ func sampleGPU() GPUSnapshot {
 		}
 	}
 	return snap
+}
+
+// readGPUPowerReading runs a single read-only nvidia-smi query for board power
+// draw and the enforced power limit, summed across GPUs. It is intentionally
+// footprint-local (not a change to the shared internal/platform GPU detector) so
+// this package stays self-contained per its package doc. Any failure is silent:
+// it returns measured=false and zero watts, so the estimator falls through to a
+// util or CPU model. This never prompts for privileges. It is called ONLY when
+// energy sampling is enabled.
+func readGPUPowerReading() (watts float64, measured bool, limitWatts float64) {
+	cmd := exec.Command(
+		"nvidia-smi",
+		"--query-gpu=power.draw,power.limit",
+		"--format=csv,noheader,nounits",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, false, 0
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 {
+			continue
+		}
+		if w, ok := parseWattsField(parts[0]); ok {
+			watts += w
+			measured = true
+		}
+		if l, ok := parseWattsField(parts[1]); ok {
+			limitWatts += l
+		}
+	}
+	return watts, measured, limitWatts
+}
+
+// parseWattsField parses an nvidia-smi power field (already "nounits", e.g.
+// "142.35"). It rejects the sentinel values nvidia-smi emits when a sensor is
+// absent ("[N/A]", "[Not Supported]", "[Insufficient Permissions]"), returning
+// ok=false so the caller falls through to an estimate.
+func parseWattsField(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "[") {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 // parseMBField parses a platform GPUInfo memory string like "8192 MB" into MB.

@@ -2,6 +2,8 @@ package footprint
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,7 +12,7 @@ import (
 // CSVs (exercising header-skipping + parsing), not in-memory structs.
 func writeSyntheticCSV(t *testing.T, dir string, samples []Sample) {
 	t.Helper()
-	store, err := NewStore(dir)
+	store, err := NewStore(dir, false)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -162,5 +164,62 @@ func TestSummarizeMissingDirIsEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected empty result, got %+v", got)
+	}
+}
+
+// TestSummarizeReadsLegacyNineColumnCSV guards the backward-compat contract: a
+// footprints CSV written by an older node (9 columns, before the energy columns
+// existed) must still be summarized after an upgrade, not silently dropped.
+func TestSummarizeReadsLegacyNineColumnCSV(t *testing.T) {
+	dir := t.TempDir()
+	legacy := "ts,node_id,service,running,cpu_pct,rss_mb,vram_mb,gpu_util_pct,idle_seconds\n" +
+		"2026-07-01T12:00:00Z,n,vllm,true,10.00,1000.00,,,\n" +
+		"2026-07-01T12:01:00Z,n,vllm,true,20.00,2000.00,,,\n"
+	if err := os.WriteFile(filepath.Join(dir, "footprints-2026-07-01.csv"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy csv: %v", err)
+	}
+	summaries, err := Summarize(dir, QueryOptions{Now: time.Date(2026, 7, 1, 12, 5, 0, 0, time.UTC)}, time.Minute)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].Service != "vllm" {
+		t.Fatalf("legacy rows dropped: got %+v", summaries)
+	}
+	if summaries[0].Samples != 2 || math.Abs(summaries[0].AvgRSSMB-1500) > 1e-6 {
+		t.Errorf("legacy summary = %+v, want 2 samples avg RSS 1500", summaries[0])
+	}
+}
+
+// TestSummarizeReadsTwelveColumnEnergyCSV verifies the other backward-compat
+// direction: a CSV written WITH the energy columns (energy sampling on) is parsed
+// by the same reader, so a fleet mixing energy-on and energy-off nodes summarizes
+// cleanly. parseRecord reads only the core columns; the energy tail is ignored.
+func TestSummarizeReadsTwelveColumnEnergyCSV(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir, true) // energy on -> 12-column output
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	day := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	batch := []Sample{
+		{Timestamp: day, NodeID: "n", Service: "vllm", Running: true, RSSMB: f64(1000), CPUPercent: f64(10)},
+		{Timestamp: day.Add(time.Minute), NodeID: "n", Service: "vllm", Running: true, RSSMB: f64(2000), CPUPercent: f64(20)},
+		{Timestamp: day, NodeID: "n", Service: NodeService, Running: true,
+			PowerW: f64(210), EnergyWh: f64(3.5), PowerSource: PowerSourceMeasured},
+	}
+	if err := store.Append(batch); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	summaries, err := Summarize(dir, QueryOptions{Now: day.Add(5 * time.Minute)}, time.Minute)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	byService := map[string]ServiceSummary{}
+	for _, s := range summaries {
+		byService[s.Service] = s
+	}
+	vllm, ok := byService["vllm"]
+	if !ok || vllm.Samples != 2 || vllm.AvgRSSMB != 1500 {
+		t.Fatalf("12-column CSV not parsed correctly: %+v", byService)
 	}
 }

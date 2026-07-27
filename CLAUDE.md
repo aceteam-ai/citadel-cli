@@ -707,6 +707,51 @@ shaped like:
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
 
+### Per-request Energy Receipt (footprint energy, aceteam#6635)
+
+The footprint sampler can record a per-interval node energy estimate so the
+sovereignty pitch has an auditable watt-hours signal. It is **opt-in, default
+OFF**: when off, the sampler runs exactly as before (no power probe, no energy
+columns), so a node with energy disabled produces byte-identical footprint CSVs.
+
+**Columns (appended AFTER the core schema, only when enabled):** `power_w`,
+`energy_wh`, `power_source`. Written on the node-level (`_node`) row only;
+per-service/per-request attribution is a deliberate next increment.
+
+**Estimation waterfall (`internal/footprint/energy.go`, pure + unit-tested).**
+Tiers are never combined, so a `measured` label always means a real sensor:
+1. GPU board power (`nvidia-smi power.draw`, summed) -> `measured`
+2. GPU `util% x TDP` (TDP = `nvidia-smi power.limit`, or `CITADEL_GPU_TDP_WATTS`) -> `estimated`
+3. CPU `util% x CPU_TDP` (`CITADEL_CPU_TDP_WATTS`, default 65W) -> `estimated`
+4. nothing usable -> blank
+
+`energy_wh = power_w x interval_hours`. Apple Silicon and CPU-only nodes fall to
+tier 3 (powermetrics needs sudo and is never invoked). The `nvidia-smi` power
+probe runs ONLY when energy is enabled and a GPU is present.
+
+**Enabling (per node, three ways):**
+- Env var: `CITADEL_ENERGY_SAMPLING=1` (truthy `1`/`true`/`yes`/`on`; wins when set).
+- Node config file: `energy.yaml` (`sampling_enabled: true`) in `platform.ConfigDir()`,
+  via `config.LoadEnergy` / `config.SaveEnergy` (mirrors telemetry.yaml).
+- Platform: `APPLY_DEVICE_CONFIG` with `DeviceConfig.EnergySampling *bool`
+  (`energySampling` in the JSON), which load-modify-saves the same energy.yaml
+  (default-DENY pointer semantics, like ShellEnabled).
+
+Resolution precedence (`cmd/work.go:resolveEnergySampling`): env var if set,
+else energy.yaml, else OFF.
+
+**Backward-compat:** `query.go` gates parsing on the core (pre-energy) column
+count, so both 9-column (energy-off) and 12-column (energy-on) CSVs read cleanly.
+A daily file can mix schemas if energy is toggled mid-day; the Go query path is
+index-based and fine. A direct DuckDB glob over both schemas needs
+`union_by_name=true`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_ENERGY_SAMPLING` | unset (OFF) | Enable the energy estimate. Truthy: `1`/`true`/`yes`/`on`. Overrides energy.yaml when set. |
+| `CITADEL_GPU_TDP_WATTS` | unset (use `power.limit`) | Override TDP for the GPU util estimate (tier 2). |
+| `CITADEL_CPU_TDP_WATTS` | `65` | CPU package TDP for the coarse CPU floor (tier 3). Apple Silicon runs lower than 65W. |
+
 ### Service Idle Detection and Auto-Stop (citadel #416)
 
 Managed services carry a per-service usage/idle signal so a node can tell whether an engine is actually being used or is pinning VRAM/RAM while idle. This is surfaced on the heartbeat and to operators, and can optionally drive auto-eviction.

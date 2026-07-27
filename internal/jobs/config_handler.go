@@ -82,6 +82,15 @@ type DeviceConfig struct {
 	// like console/desktop/files.
 	ShellEnabled *bool `json:"shellEnabled,omitempty"`
 
+	// EnergySampling is the programmatic opt-IN for the per-request energy receipt
+	// (aceteam#6635). Pointer for the same absent(nil)-vs-explicit reason as the
+	// other *Enabled flags: an omitted field leaves the node's persisted energy
+	// toggle untouched. A non-nil value writes the same energy.yaml the operator's
+	// env var / settings and the footprint sampler read. Default-OFF on a fresh
+	// node (it adds an nvidia-smi power probe per tick), so the platform must send
+	// `true` here to turn it on.
+	EnergySampling *bool `json:"energySampling,omitempty"`
+
 	// NodePasscode sets (or, when empty, clears) the per-node passcode that gates
 	// the sensitive surfaces (aceteam#6524). Pointer so nil leaves the stored
 	// passcode untouched; a non-nil value is bcrypt-hashed before it is persisted
@@ -170,6 +179,21 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			if config.MeetingRetentionDays != nil {
 				result += fmt.Sprintf("\nMeeting recording retention set to %d days", *config.MeetingRetentionDays)
 			}
+		}
+	}
+
+	// Apply the energy-sampling opt-in (aceteam#6635) when the platform pushed an
+	// explicit value. Load-modify-save the same energy.yaml the footprint sampler
+	// and the CITADEL_ENERGY_SAMPLING resolution read, so the device-config path
+	// and the local toggle converge on one persisted value (default-off when
+	// neither wrote it). Written to platform.ConfigDir(), not h.ConfigDir.
+	if config.EnergySampling != nil {
+		energy := citadelconfig.LoadEnergy(platform.ConfigDir())
+		energy.SamplingEnabled = *config.EnergySampling
+		if err := citadelconfig.SaveEnergy(platform.ConfigDir(), energy); err != nil {
+			result += fmt.Sprintf("\nWarning: failed to persist energy config: %v", err)
+		} else {
+			result += fmt.Sprintf("\nEnergy sampling %s (takes effect on next worker start)", enabledLabel(*config.EnergySampling))
 		}
 	}
 

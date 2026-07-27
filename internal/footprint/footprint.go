@@ -42,9 +42,21 @@ type Sample struct {
 	// GPUUtilPercent is aggregate GPU utilisation. Only set on the node-level row.
 	GPUUtilPercent *float64
 	// IdleSeconds is how long the node has been idle, when a readily-available
-	// idle signal is wired in (#420). Left empty otherwise — this package does
+	// idle signal is wired in (#420). Left empty otherwise: this package does
 	// NOT reimplement idle detection.
 	IdleSeconds *int
+
+	// PowerW is the estimated instantaneous node power in watts. Set only on the
+	// node-level row (per-service attribution is a deliberate next increment).
+	// Left empty when no defensible figure is available.
+	PowerW *float64
+	// EnergyWh is the energy attributed to this sample's interval in watt-hours
+	// (PowerW times the sampling interval). Summing this column across node rows
+	// over a window yields the auditable energy total. Set only on the node row.
+	EnergyWh *float64
+	// PowerSource labels PowerW as measured (a real power sensor) or estimated (a
+	// modeled figure). Empty when no power figure was recorded.
+	PowerSource PowerSource
 }
 
 // NodeService is the reserved Service value for the synthetic node-level row that

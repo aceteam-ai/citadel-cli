@@ -13,7 +13,7 @@ func ip(v int) *int          { return &v }
 
 func TestAppendWritesHeaderOnce(t *testing.T) {
 	dir := t.TempDir()
-	store, err := NewStore(dir)
+	store, err := NewStore(dir, false)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -52,9 +52,35 @@ func TestAppendWritesHeaderOnce(t *testing.T) {
 	}
 }
 
+func TestAppendWritesEnergyColumns(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewStore(dir, true)
+
+	day := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+	node := Sample{
+		Timestamp: day, NodeID: "n", Service: NodeService, Running: true,
+		VRAMMB: ip(8000), GPUUtilPercent: f64(55),
+		PowerW: f64(210), EnergyWh: f64(3.5), PowerSource: PowerSourceMeasured,
+	}
+	if err := store.Append([]Sample{node}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "footprints-2026-07-03.csv"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if !strings.HasSuffix(lines[0], "power_w,energy_wh,power_source") {
+		t.Fatalf("header missing energy columns: %q", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], "210.00,3.50,measured") {
+		t.Fatalf("node row missing energy values: %q", lines[1])
+	}
+}
+
 func TestAppendRotatesByDay(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 
 	d1 := time.Date(2026, 7, 1, 23, 59, 0, 0, time.UTC)
 	d2 := time.Date(2026, 7, 2, 0, 1, 0, 0, time.UTC)
@@ -74,7 +100,7 @@ func TestAppendRotatesByDay(t *testing.T) {
 
 func TestAppendEmptyIsNoop(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 	if err := store.Append(nil); err != nil {
 		t.Fatalf("Append(nil): %v", err)
 	}
@@ -86,7 +112,7 @@ func TestAppendEmptyIsNoop(t *testing.T) {
 
 func TestPruneRemovesOldKeepsRecent(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	// Create files spanning old and recent days plus an unrelated file.
@@ -137,7 +163,7 @@ func TestPruneRemovesOldKeepsRecent(t *testing.T) {
 
 func TestPruneDisabledWhenRetentionNonPositive(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := NewStore(dir)
+	store, _ := NewStore(dir, false)
 	now := time.Now()
 	if err := store.Append([]Sample{{Timestamp: now.AddDate(0, 0, -100), NodeID: "n", Service: "svc"}}); err != nil {
 		t.Fatal(err)
