@@ -4,12 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
+
+// shellRefusalReason asserts err carries a *jobs.ShellRefusal and returns its
+// reason code. The legacy adapter returns the handler's typed error unwrapped, so
+// errors.As reaches it.
+func shellRefusalReason(t *testing.T, err error) string {
+	t.Helper()
+	var r *jobs.ShellRefusal
+	if !errors.As(err, &r) {
+		t.Fatalf("error %v (%T) is not a *jobs.ShellRefusal", err, err)
+	}
+	return r.Reason
+}
 
 // TestLegacyHandler is a mock jobs.JobHandler for testing.
 type TestLegacyHandler struct {
@@ -266,8 +277,8 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("disabled SHELL_COMMAND handler should return an error")
 	}
-	if !strings.Contains(err.Error(), jobs.ShellDisabledError) {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), jobs.ShellDisabledError)
+	if reason := shellRefusalReason(t, err); reason != jobs.ReasonShellDisabled {
+		t.Errorf("reason = %q, want %q", reason, jobs.ReasonShellDisabled)
 	}
 	// The adapter surfaces failures via the returned error; result should not
 	// report success.
@@ -276,10 +287,14 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	}
 }
 
-// TestCreateLegacyHandlers_ShellEnabledByDefault confirms the default opt
-// (ShellDisabled=false) leaves shell execution working.
-func TestCreateLegacyHandlers_ShellEnabledByDefault(t *testing.T) {
-	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{})
+// TestCreateLegacyHandlers_ShellEnabledWithPasscode confirms that an enabled
+// shell (ShellDisabled=false) whose HasPasscode + passcode verifier are wired
+// runs a command that presents the correct passcode.
+func TestCreateLegacyHandlers_ShellEnabledWithPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellHasPasscode:    func() bool { return true },
+		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
+	})
 
 	var shell JobHandler
 	for _, h := range handlers {
@@ -295,14 +310,86 @@ func TestCreateLegacyHandlers_ShellEnabledByDefault(t *testing.T) {
 	job := &Job{
 		ID:      "job-shell-enabled",
 		Type:    JobTypeShellCommand,
-		Payload: map[string]any{"command": "echo ok"},
+		Payload: map[string]any{"command": "echo ok", "passcode": "2468"},
 	}
 	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
 	if err != nil {
-		t.Fatalf("enabled shell handler should run: %v", err)
+		t.Fatalf("enabled shell handler with correct passcode should run: %v", err)
 	}
 	if result.Status != JobStatusSuccess {
 		t.Errorf("result.Status = %v, want success", result.Status)
+	}
+}
+
+// TestCreateLegacyHandlers_ShellEnabledNoPasscodeFailsClosed proves the
+// fail-closed contract at the construction layer: an enabled shell with no
+// HasPasscode signal wired refuses execution with reason passcode_not_set (a
+// forgotten gate never opens root shell).
+func TestCreateLegacyHandlers_ShellEnabledNoPasscodeFailsClosed(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{}) // enabled, no signals
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must be registered")
+	}
+
+	job := &Job{
+		ID:      "job-shell-no-passcode",
+		Type:    JobTypeShellCommand,
+		Payload: map[string]any{"command": "echo should-not-run"},
+	}
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err == nil {
+		t.Fatal("enabled shell with no passcode signal should refuse")
+	}
+	if reason := shellRefusalReason(t, err); reason != jobs.ReasonPasscodeNotSet {
+		t.Errorf("reason = %q, want %q", reason, jobs.ReasonPasscodeNotSet)
+	}
+	if result != nil && result.Status == JobStatusSuccess {
+		t.Error("shell handler without a passcode must not report success")
+	}
+}
+
+// TestCreateLegacyHandlers_ShellEnabledWrongPasscode proves the distinct
+// passcode_invalid code at the construction layer: a passcode IS configured
+// (HasPasscode true) but the presented payload passcode is wrong.
+func TestCreateLegacyHandlers_ShellEnabledWrongPasscode(t *testing.T) {
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellHasPasscode:    func() bool { return true },
+		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
+	})
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must be registered")
+	}
+
+	job := &Job{
+		ID:      "job-shell-wrong-passcode",
+		Type:    JobTypeShellCommand,
+		Payload: map[string]any{"command": "echo should-not-run", "passcode": "0000"},
+	}
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err == nil {
+		t.Fatal("enabled shell with a wrong passcode should refuse")
+	}
+	if reason := shellRefusalReason(t, err); reason != jobs.ReasonPasscodeInvalid {
+		t.Errorf("reason = %q, want %q", reason, jobs.ReasonPasscodeInvalid)
+	}
+	if result != nil && result.Status == JobStatusSuccess {
+		t.Error("shell handler with a wrong passcode must not report success")
 	}
 }
 

@@ -31,6 +31,17 @@ func TestLegacyShellHandlerHonorsKillSwitch(t *testing.T) {
 		t.Errorf("legacy SHELL_COMMAND handler Disabled=%v, want %v (from persisted shell permission)",
 			shell.Disabled, wantDisabled)
 	}
+
+	// Both passcode signals must be wired so an ENABLED shell fails closed and can
+	// distinguish passcode_not_set from passcode_invalid (aceteam#6524). A nil
+	// HasPasscode would refuse every command as passcode_not_set even when the
+	// operator set a correct passcode (a silent functional regression).
+	if shell.HasPasscode == nil {
+		t.Error("legacy SHELL_COMMAND handler HasPasscode is nil; must be wired from the persisted node passcode")
+	}
+	if shell.VerifyPasscode == nil {
+		t.Error("legacy SHELL_COMMAND handler VerifyPasscode is nil; must be wired from the persisted node passcode")
+	}
 }
 
 // TestLegacyShellHandlerDefaultDeny confirms that, absent an explicit opt-in
