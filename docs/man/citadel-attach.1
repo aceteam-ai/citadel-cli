@@ -1,0 +1,53 @@
+.nh
+.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-attach - Attach to the running citadel worker on this node
+
+
+.SH SYNOPSIS
+\fBcitadel attach [flags]\fP
+
+
+.SH DESCRIPTION
+Discover the citadel worker already running on this node and show its
+status, rather than starting a competing second process.
+
+.PP
+Docker-daemon style: a node runs exactly one worker, and everything else is a
+client of it. 'citadel attach' names the running instance (PID, version, uptime)
+and shows its live node identity, health, and managed services, read from the
+worker's local status server.
+
+.PP
+If no worker is running, it says so and points you at 'citadel work'.
+
+.PP
+Use --shell to instead open an interactive shell on the running control center
+(the TUI you launched with 'citadel'). Ctrl+] detaches; Ctrl-D exits the shell.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for attach
+
+.PP
+\fB--shell\fP[=false]
+	Open an interactive shell on the running control center (instead of printing status). Ctrl+] detaches; Ctrl-D exits the shell.
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP
