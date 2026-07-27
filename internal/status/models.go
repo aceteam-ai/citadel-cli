@@ -54,10 +54,20 @@ func EngineTypeFromName(name string) string {
 	return ""
 }
 
-// DiscoverModels queries an LLM service for LOADED models (the model(s)
-// currently being served, not merely downloaded). It automatically detects the
-// service type and uses the appropriate API. A running engine with no model
-// loaded returns an empty slice and nil error.
+// DiscoverModels queries an LLM service for the model(s) it can serve right
+// now. It automatically detects the service type and uses the appropriate API.
+// A running engine with nothing to serve returns an empty slice and nil error.
+//
+// "Can serve right now" differs by engine. vLLM, llama.cpp, and bonsai each
+// serve exactly the one model they were started with, so their loaded model
+// (GET /v1/models) IS the servable set. Ollama is different: it auto-loads any
+// pulled model on first request, so every pulled/cached model is immediately
+// servable. Ollama therefore reports its available models (GET /api/tags, the
+// same set `ollama list` shows), not just the models resident in memory
+// (GET /api/ps). Reporting only resident models left a node that had pulled a
+// model but not yet served a request advertising an empty model set, so the
+// platform registry stayed empty and inference could not route to it
+// (citadel-cli#606 / aceteam#6634).
 func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string, port int) ([]string, error) {
 	switch serviceType {
 	case "vllm":
@@ -118,11 +128,16 @@ func (m *ModelDiscovery) discoverOpenAIModels(ctx context.Context, engineLabel s
 	return models, nil
 }
 
-// discoverOllamaModels queries Ollama's API for LOADED (running) models.
-// Ollama exposes: GET /api/ps — the models currently loaded into memory.
-// (/api/tags lists DOWNLOADED models, which is not what the heartbeat needs.)
+// discoverOllamaModels queries Ollama's API for AVAILABLE (pulled) models.
+// Ollama exposes: GET /api/tags, every model pulled to the node, which is the
+// same set `ollama list` shows. Because Ollama auto-loads a pulled model on the
+// first request, every pulled model is immediately servable, so /api/tags is the
+// correct notion of "what this node can serve" for routing. (GET /api/ps lists
+// only models currently resident in memory, which is empty right after a pull
+// and before the first request: the gap that made a freshly deployed model
+// unroutable, citadel-cli#606.)
 func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]string, error) {
-	url := fmt.Sprintf("http://%s:%d/api/ps", m.host, port)
+	url := fmt.Sprintf("http://%s:%d/api/tags", m.host, port)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

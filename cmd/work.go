@@ -674,16 +674,25 @@ func runWork(cmd *cobra.Command, args []string) {
 			Debug("shell queue: %s", shellQueue)
 		}
 
-		// GPU nodes must also consume the GPU inference queues. In API mode the
-		// server's worker-config returns only the CPU base queue today (#6315),
-		// so gateway inference dispatched to jobs:v1:gpu-general (+ gpu tag
-		// queues) with a target_node would never reach this node. Self-subscribe
-		// from locally-detected GPU capabilities, mirroring direct-Redis mode.
-		// Additive to whatever worker-config returned; a CPU-only node adds
-		// nothing (GPUInferenceQueues returns nil without a GPU).
-		if gpuQueues := capabilities.GPUInferenceQueues(nodeCaps); len(gpuQueues) > 0 {
-			apiQueueNames = appendUniqueQueues(apiQueueNames, gpuQueues)
-			Debug("gpu node: also subscribing to GPU inference queues %v", gpuQueues)
+		// Inference-capable nodes must also consume the GPU inference queues. In
+		// API mode the server's worker-config returns only the CPU base queue
+		// today (#6315), so platform inference dispatched to jobs:v1:gpu-general
+		// (+ gpu tag queues) with a target_node would never reach this node.
+		// Self-subscribe from locally-detected capabilities, mirroring
+		// direct-Redis mode. Additive to whatever worker-config returned.
+		//
+		// A GPU node subscribes to gpu-general + its tag queues. A node with NO
+		// discrete GPU but a running serving engine (the Apple Silicon + native
+		// ollama case) also subscribes to gpu-general so a target_node-pinned
+		// inference job arrives instead of timing out (citadel-cli#606 /
+		// aceteam#6634). Serving is detected live (native + docker engines) so it
+		// works for a natively run ollama, which the docker-only Engines snapshot
+		// misses. A node serving nothing adds nothing.
+		serving := nodeIsServingModels(ctx)
+		if infQueues := capabilities.InferenceQueues(nodeCaps, serving); len(infQueues) > 0 {
+			apiQueueNames = appendUniqueQueues(apiQueueNames, infQueues)
+			Debug("inference node (gpu=%t serving=%t): also subscribing to inference queues %v",
+				nodeCaps != nil && nodeCaps.GPU != nil && len(nodeCaps.GPU.Devices) > 0, serving, infQueues)
 		}
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
@@ -2468,6 +2477,20 @@ func resolveAllowReadOutsideWorkspace() bool {
 
 // resolveConsumerGroup returns the consumer group name to use.
 // Priority: explicit flag > Headscale node ID > hostname > fallback "citadel-workers".
+// nodeIsServingModels reports whether this node is currently running a managed
+// serving engine (vllm / ollama / llamacpp / bonsai), including a natively run
+// ollama. It drives the non-GPU inference-queue subscription (citadel-cli#606):
+// an Apple Silicon node running ollama has no discrete GPU but CAN serve, so it
+// must consume jobs:v1:gpu-general. status.DiscoverLocalEngines does the same
+// docker + native running-check the heartbeat uses, so this sees exactly what
+// the fabric sees. Bounded so a slow/hung engine can never stall worker startup;
+// on timeout it reports false (fail-safe: no extra queue subscription).
+func nodeIsServingModels(ctx context.Context) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return len(status.DiscoverLocalEngines(probeCtx)) > 0
+}
+
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
 	if explicit != "" {
 		return explicit

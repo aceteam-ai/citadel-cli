@@ -167,6 +167,46 @@ func TestGPUInferenceQueues(t *testing.T) {
 	}
 }
 
+func TestInferenceQueues(t *testing.T) {
+	// GPU node: same as GPUInferenceQueues regardless of the serving flag.
+	gpu := &NodeCapabilities{
+		GPU:  &GPUCapabilities{Count: 1, Devices: []GPUDevice{{Name: "NVIDIA GeForce RTX 3090", Tag: "rtx3090", VRAMTag: "24gb"}}},
+		Tags: []string{"gpu:rtx3090", "vram:24gb"},
+	}
+	for _, serving := range []bool{false, true} {
+		q := InferenceQueues(gpu, serving)
+		found := false
+		for _, name := range q {
+			if name == "jobs:v1:gpu-general" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("GPU node (serving=%t) must consume jobs:v1:gpu-general; got %v", serving, q)
+		}
+	}
+
+	// No-GPU node that IS serving (Apple Silicon + native ollama): must join the
+	// gpu-general base queue so a target_node-pinned inference job arrives.
+	noGPU := &NodeCapabilities{Tags: []string{"cpu:general"}}
+	if q := InferenceQueues(noGPU, true); len(q) != 1 || q[0] != "jobs:v1:gpu-general" {
+		t.Errorf("non-GPU serving node must subscribe to exactly [jobs:v1:gpu-general]; got %v", q)
+	}
+
+	// No-GPU node serving nothing: no inference queue.
+	if q := InferenceQueues(noGPU, false); q != nil {
+		t.Errorf("non-GPU non-serving node must not subscribe to any inference queue; got %v", q)
+	}
+
+	// nil caps: serving still governs the base-queue subscription.
+	if q := InferenceQueues(nil, true); len(q) != 1 || q[0] != "jobs:v1:gpu-general" {
+		t.Errorf("nil caps serving node must subscribe to [jobs:v1:gpu-general]; got %v", q)
+	}
+	if q := InferenceQueues(nil, false); q != nil {
+		t.Errorf("nil caps non-serving node must return nil; got %v", q)
+	}
+}
+
 func TestTagsHelper(t *testing.T) {
 	caps := []Capability{
 		{Tag: "gpu:rtx4090"},
