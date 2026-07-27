@@ -2187,6 +2187,18 @@ func startManagedServices(ctx context.Context) []startedService {
 
 		serviceType := determineServiceType(service)
 
+		// On macOS, skip NVIDIA/docker-only engines (vLLM, SGLang, llama.cpp-CUDA)
+		// instead of surfacing a "Cannot connect to the Docker daemon" error that
+		// reads like a broken node (issue #608). Gated on the service resolving to
+		// the docker runtime, so a native engine install is unaffected: only the
+		// unsupported CUDA-image docker fallback is suppressed. Native ollama is the
+		// supported local-inference path on macOS.
+		if serviceType == internalServices.ServiceTypeDocker &&
+			skipEngineOnDarwin(runtime.GOOS, service.Name, forceGPUEngines()) {
+			fmt.Printf("   - Skipping %s on macOS: needs an NVIDIA GPU and Docker (use native ollama for local inference)\n", service.Name)
+			continue
+		}
+
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
 			if err := startNativeService(service.Name, configDir); err != nil {

@@ -30,7 +30,6 @@ var cfgFile string
 var nexusURL string
 var authServiceURL string
 var debugMode bool
-var daemonMode bool
 var noColorGlobal bool
 
 // noAutoUpdate, when set via the --no-auto-update persistent flag (or the
@@ -88,12 +87,9 @@ Just run 'citadel' — it handles login, network connection, and launches the
 control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Default behavior: launch control center if TTY, otherwise show help
-		if daemonMode {
-			// TODO: Run in daemon mode (background worker)
-			fmt.Println("Daemon mode not yet implemented. Use 'citadel work' for now.")
-			return
-		}
+		// Default behavior: launch control center if TTY, otherwise show help.
+		// Headless/background operation is provided by 'citadel work' (run under
+		// systemd or another supervisor); there is deliberately no --daemon flag.
 		if tui.IsTTY() {
 			runControlCenter()
 		} else {
@@ -146,7 +142,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 
 		// Detect if we're about to launch TUI control center
 		// In this case, suppress stdout printing and defer to TUI activity log
-		isTUIContext := cmdName == "citadel" && len(args) == 0 && !daemonMode && tui.IsTTY()
+		isTUIContext := cmdName == "citadel" && len(args) == 0 && tui.IsTTY()
 
 		// MCP uses stdout as transport -- suppress update print to stdout.
 		if cmdName == "mcp" {
@@ -243,7 +239,6 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
 	rootCmd.PersistentFlags().BoolVar(&noAutoUpdate, "no-auto-update", false, "Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)")
-	rootCmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in background daemon mode (no TUI)")
 	rootCmd.Flags().BoolVar(&noMouse, "no-mouse", false, "Disable control-center mouse control (keeps terminal drag-to-copy)")
 
 	// Hide persistent flags that are only for dev/scripting
