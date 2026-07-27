@@ -99,7 +99,7 @@ func Run(ctx context.Context, cfg Config) {
 		return
 	}
 
-	sampler := NewSampler(cfg.NodeID, cfg.Services, cfg.EngineBin)
+	sampler := NewSampler(cfg.NodeID, cfg.Services, cfg.EngineBin, interval, PowerConfigFromEnv())
 
 	// Prune once at startup so a node that was offline past the retention window
 	// cleans up immediately rather than after the first tick.

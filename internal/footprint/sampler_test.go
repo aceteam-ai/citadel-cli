@@ -98,6 +98,77 @@ func TestSamplerStatsErrorStillEmitsNodeRow(t *testing.T) {
 	}
 }
 
+func TestSamplerNodeRowCarriesMeasuredPower(t *testing.T) {
+	s := &Sampler{
+		nodeID:    "n",
+		services:  []string{"vllm"},
+		engineBin: "docker",
+		interval:  60 * time.Second,
+		powerCfg:  PowerConfig{CPUTDPWatts: 65},
+		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
+		gpu: func() GPUSnapshot {
+			return GPUSnapshot{
+				HasGPU: true, VRAMUsedMB: 8000, GPUUtilPercent: 55,
+				PowerWatts: 210, PowerMeasured: true, PowerLimitWatts: 350,
+			}
+		},
+		idle: func() (int, bool) { return 0, false },
+	}
+	rows := s.Sample(context.Background(), time.Now())
+	var node *Sample
+	for i := range rows {
+		if rows[i].Service == NodeService {
+			node = &rows[i]
+		}
+		if rows[i].Service == "vllm" {
+			// Per-service rows never carry power in this increment.
+			if rows[i].PowerW != nil || rows[i].EnergyWh != nil || rows[i].PowerSource != PowerSourceUnknown {
+				t.Errorf("service row must not carry power, got %+v", rows[i])
+			}
+		}
+	}
+	if node == nil {
+		t.Fatal("no node row")
+	}
+	if node.PowerW == nil || *node.PowerW != 210 {
+		t.Errorf("node power_w = %v, want 210 (measured draw wins)", node.PowerW)
+	}
+	if node.PowerSource != PowerSourceMeasured {
+		t.Errorf("node power_source = %q, want measured", node.PowerSource)
+	}
+	// 210W for 60s = 210/60 Wh.
+	if node.EnergyWh == nil || math.Abs(*node.EnergyWh-210.0/60.0) > 1e-6 {
+		t.Errorf("node energy_wh = %v, want %v", node.EnergyWh, 210.0/60.0)
+	}
+}
+
+func TestSamplerNodeRowEstimatesFromUtilWhenNoDraw(t *testing.T) {
+	s := &Sampler{
+		nodeID:    "n",
+		services:  nil,
+		engineBin: "docker",
+		interval:  60 * time.Second,
+		powerCfg:  PowerConfig{CPUTDPWatts: 65},
+		stats:     func(ctx context.Context, _ string) ([]containerStat, error) { return nil, nil },
+		gpu: func() GPUSnapshot {
+			// No measured draw, but a power.limit is known -> tier 2 estimate.
+			return GPUSnapshot{HasGPU: true, GPUUtilPercent: 40, PowerLimitWatts: 350}
+		},
+		idle: func() (int, bool) { return 0, false },
+	}
+	rows := s.Sample(context.Background(), time.Now())
+	node := rows[len(rows)-1]
+	if node.Service != NodeService {
+		t.Fatalf("last row should be node, got %q", node.Service)
+	}
+	if node.PowerSource != PowerSourceEstimated {
+		t.Errorf("power_source = %q, want estimated", node.PowerSource)
+	}
+	if node.PowerW == nil || math.Abs(*node.PowerW-140) > 1e-6 { // 40% of 350
+		t.Errorf("power_w = %v, want 140", node.PowerW)
+	}
+}
+
 func TestSamplerIdleSignalWiredThrough(t *testing.T) {
 	s := &Sampler{
 		nodeID:    "n",

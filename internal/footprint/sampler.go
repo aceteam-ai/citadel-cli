@@ -2,6 +2,7 @@ package footprint
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,17 @@ type GPUSnapshot struct {
 	// HasGPU is false on nodes without an NVIDIA/Metal GPU, in which case the
 	// node-level row leaves vram_mb / gpu_util_pct empty.
 	HasGPU bool
+
+	// PowerWatts is the summed measured board power across GPUs (nvidia-smi
+	// power.draw). Valid only when PowerMeasured is true.
+	PowerWatts float64
+	// PowerMeasured is true when at least one GPU reported a real power.draw
+	// reading (not "[N/A]" / "[Not Supported]").
+	PowerMeasured bool
+	// PowerLimitWatts is the summed enforced power cap across GPUs (nvidia-smi
+	// power.limit). Used as the TDP for the utilisation-based power estimate when
+	// power.draw is unavailable. Zero when unknown.
+	PowerLimitWatts float64
 }
 
 // statsFunc runs the single container-stats exec for a tick. Injected so the
@@ -34,23 +46,33 @@ type gpuFunc func() GPUSnapshot
 type idleFunc func() (int, bool)
 
 // Sampler builds one batch of footprint samples per tick: one row per managed
-// service (from stats) plus one node-level row (host CPU/RSS + GPU).
+// service (from stats) plus one node-level row (host CPU/RSS + GPU + energy).
 type Sampler struct {
 	nodeID    string
 	services  []string
 	engineBin string
+
+	// powerCfg holds the resolved power-estimation knobs (TDP overrides). Resolved
+	// once so no env parsing happens per tick.
+	powerCfg PowerConfig
+	// interval is the sampling cadence, used to convert instantaneous power_w into
+	// per-interval energy_wh. Zero leaves energy_wh blank.
+	interval time.Duration
 
 	stats statsFunc
 	gpu   gpuFunc
 	idle  idleFunc
 }
 
-// NewSampler wires a Sampler to the real host probes.
-func NewSampler(nodeID string, services []string, engineBin string) *Sampler {
+// NewSampler wires a Sampler to the real host probes. interval is the sampling
+// cadence (used for energy_wh); powerCfg carries the resolved TDP knobs.
+func NewSampler(nodeID string, services []string, engineBin string, interval time.Duration, powerCfg PowerConfig) *Sampler {
 	return &Sampler{
 		nodeID:    nodeID,
 		services:  services,
 		engineBin: engineBin,
+		powerCfg:  powerCfg,
+		interval:  interval,
 		stats:     sampleContainerStats,
 		gpu:       sampleGPU,
 		idle:      func() (int, bool) { return 0, false },
@@ -109,20 +131,59 @@ func (s *Sampler) Sample(ctx context.Context, ts time.Time) []Sample {
 		Running:     true,
 		IdleSeconds: idlePtr,
 	}
-	if cpu, ok := hostCPUPercent(); ok {
-		node.CPUPercent = &cpu
+	cpuPct, cpuOK := hostCPUPercent()
+	if cpuOK {
+		node.CPUPercent = &cpuPct
 	}
 	if rss, ok := hostRSSMB(); ok {
 		node.RSSMB = &rss
 	}
-	if snap := s.gpu(); snap.HasGPU {
+	snap := s.gpu()
+	if snap.HasGPU {
 		vram := snap.VRAMUsedMB
 		util := snap.GPUUtilPercent
 		node.VRAMMB = &vram
 		node.GPUUtilPercent = &util
 	}
+
+	// Node-level energy estimate: the auditable per-request receipt starts here as
+	// a per-interval node figure. Prefer a measured GPU sensor, fall back to a
+	// clearly-labeled model. This is the only row that carries power; per-service
+	// attribution is a deliberate next increment.
+	s.fillNodePower(&node, snap, cpuPct, cpuOK)
+
 	rows = append(rows, node)
 	return rows
+}
+
+// fillNodePower runs the power waterfall for the node row and, when a figure is
+// available, sets power_w / energy_wh / power_source. It never fails: an absent
+// signal simply leaves the fields blank.
+func (s *Sampler) fillNodePower(node *Sample, snap GPUSnapshot, cpuPct float64, cpuOK bool) {
+	gpuTDP := s.powerCfg.GPUTDPWattsOverride
+	if gpuTDP <= 0 {
+		gpuTDP = snap.PowerLimitWatts
+	}
+	est := EstimateNodePower(PowerInputs{
+		HasGPU:           snap.HasGPU,
+		GPUPowerWatts:    snap.PowerWatts,
+		GPUPowerMeasured: snap.PowerMeasured,
+		GPUUtilKnown:     snap.HasGPU,
+		GPUUtilPercent:   snap.GPUUtilPercent,
+		GPUTDPWatts:      gpuTDP,
+		CPUKnown:         cpuOK,
+		CPUPercent:       cpuPct,
+		CPUTDPWatts:      s.powerCfg.CPUTDPWatts,
+	})
+	if !est.Known {
+		return
+	}
+	watts := est.Watts
+	node.PowerW = &watts
+	node.PowerSource = est.Source
+	if wh := energyWh(watts, s.interval); wh > 0 {
+		node.EnergyWh = &wh
+	}
 }
 
 // matchContainer returns the first stats row whose container name contains the
@@ -160,7 +221,57 @@ func sampleGPU() GPUSnapshot {
 			snap.GPUUtilPercent = util
 		}
 	}
+	// Best-effort power read via nvidia-smi. On any error (macOS/Metal, no NVIDIA
+	// driver, older driver) the power fields stay zero and the estimator falls
+	// through to a util or CPU model. This never prompts for privileges.
+	readGPUPower(&snap)
 	return snap
+}
+
+// readGPUPower runs a single read-only nvidia-smi query for board power draw and
+// the enforced power limit, summing across GPUs into snap. It is intentionally
+// footprint-local (not a change to the shared internal/platform GPU detector) so
+// this package stays self-contained per its package doc. Any failure is silent:
+// power.draw / power.limit are simply left unset.
+func readGPUPower(snap *GPUSnapshot) {
+	cmd := exec.Command(
+		"nvidia-smi",
+		"--query-gpu=power.draw,power.limit",
+		"--format=csv,noheader,nounits",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 {
+			continue
+		}
+		if w, ok := parseWattsField(parts[0]); ok {
+			snap.PowerWatts += w
+			snap.PowerMeasured = true
+		}
+		if l, ok := parseWattsField(parts[1]); ok {
+			snap.PowerLimitWatts += l
+		}
+	}
+}
+
+// parseWattsField parses an nvidia-smi power field (already "nounits", e.g.
+// "142.35"). It rejects the sentinel values nvidia-smi emits when a sensor is
+// absent ("[N/A]", "[Not Supported]", "[Insufficient Permissions]"), returning
+// ok=false so the caller falls through to an estimate.
+func parseWattsField(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "[") {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 // parseMBField parses a platform GPUInfo memory string like "8192 MB" into MB.

@@ -13,10 +13,19 @@ import (
 // csvHeader is the fixed column order for footprint CSVs. It is written once as
 // the first line of each daily file. DuckDB / pandas read these headers directly
 // (e.g. `duckdb -c "SELECT service, avg(rss_mb) FROM 'footprints/*.csv' GROUP BY 1"`).
+// The first coreColumns are the original, pre-energy schema. The energy columns
+// (power_w, energy_wh, power_source) are appended AFTER them so a reader that
+// knows only the core schema still parses old and new files positionally.
 var csvHeader = []string{
 	"ts", "node_id", "service", "running",
 	"cpu_pct", "rss_mb", "vram_mb", "gpu_util_pct", "idle_seconds",
+	"power_w", "energy_wh", "power_source",
 }
+
+// coreColumns is the count of pre-energy columns. A row with at least this many
+// fields is parseable; the energy columns are optional so footprint CSVs written
+// by an older node (9 columns) remain readable after this schema grew.
+const coreColumns = 9
 
 // dailyFilePattern matches footprints-YYYY-MM-DD.csv so retention pruning only
 // ever touches this package's own rotated files.
@@ -110,6 +119,9 @@ func (sm Sample) toRecord() []string {
 		intField(sm.VRAMMB),
 		floatField(sm.GPUUtilPercent),
 		intField(sm.IdleSeconds),
+		floatField(sm.PowerW),
+		floatField(sm.EnergyWh),
+		string(sm.PowerSource),
 	}
 }
 

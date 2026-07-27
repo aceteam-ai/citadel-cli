@@ -125,7 +125,10 @@ func readFileRows(path string) ([]row, error) {
 				continue // header
 			}
 		}
-		if len(rec) < len(csvHeader) {
+		// Gate on the core (pre-energy) column count, not the full header, so a CSV
+		// written by an older node (before the energy columns existed) is still
+		// parsed rather than silently dropped after an upgrade.
+		if len(rec) < coreColumns {
 			continue
 		}
 		parsed, ok := parseRecord(rec)

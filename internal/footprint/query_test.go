@@ -2,6 +2,8 @@ package footprint
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -162,5 +164,28 @@ func TestSummarizeMissingDirIsEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected empty result, got %+v", got)
+	}
+}
+
+// TestSummarizeReadsLegacyNineColumnCSV guards the backward-compat contract: a
+// footprints CSV written by an older node (9 columns, before the energy columns
+// existed) must still be summarized after an upgrade, not silently dropped.
+func TestSummarizeReadsLegacyNineColumnCSV(t *testing.T) {
+	dir := t.TempDir()
+	legacy := "ts,node_id,service,running,cpu_pct,rss_mb,vram_mb,gpu_util_pct,idle_seconds\n" +
+		"2026-07-01T12:00:00Z,n,vllm,true,10.00,1000.00,,,\n" +
+		"2026-07-01T12:01:00Z,n,vllm,true,20.00,2000.00,,,\n"
+	if err := os.WriteFile(filepath.Join(dir, "footprints-2026-07-01.csv"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy csv: %v", err)
+	}
+	summaries, err := Summarize(dir, QueryOptions{Now: time.Date(2026, 7, 1, 12, 5, 0, 0, time.UTC)}, time.Minute)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].Service != "vllm" {
+		t.Fatalf("legacy rows dropped: got %+v", summaries)
+	}
+	if summaries[0].Samples != 2 || math.Abs(summaries[0].AvgRSSMB-1500) > 1e-6 {
+		t.Errorf("legacy summary = %+v, want 2 samples avg RSS 1500", summaries[0])
 	}
 }
