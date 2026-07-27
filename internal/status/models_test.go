@@ -83,20 +83,23 @@ func TestDiscoverModels_LlamacppNoModelLoaded(t *testing.T) {
 	}
 }
 
-// TestDiscoverModels_OllamaLoaded verifies ollama discovery uses /api/ps
-// (LOADED models), not /api/tags (downloaded models).
-func TestDiscoverModels_OllamaLoaded(t *testing.T) {
+// TestDiscoverModels_OllamaAvailable verifies ollama discovery reports the
+// AVAILABLE (pulled) models from /api/tags (the servable set, since ollama
+// auto-loads any pulled model on request) and does NOT depend on /api/ps
+// (resident models), which is empty right after a pull (citadel-cli#606).
+func TestDiscoverModels_OllamaAvailable(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"models": []map[string]any{
+				{"name": "phi3:mini", "model": "phi3:mini", "size": 2176178913},
 				{"name": "llama3:8b", "model": "llama3:8b", "size": 5137025024},
 			},
 		})
 	})
-	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
-		t.Error("discovery must query /api/ps (loaded), not /api/tags (downloaded)")
+	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("discovery must query /api/tags (available/servable), not /api/ps (resident)")
 		http.NotFound(w, r)
 	})
 	discovery, port := newTestDiscovery(t, mux)
@@ -105,16 +108,16 @@ func TestDiscoverModels_OllamaLoaded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !reflect.DeepEqual(models, []string{"llama3:8b"}) {
-		t.Fatalf("expected [llama3:8b], got %v", models)
+	if !reflect.DeepEqual(models, []string{"phi3:mini", "llama3:8b"}) {
+		t.Fatalf("expected [phi3:mini llama3:8b], got %v", models)
 	}
 }
 
-// TestDiscoverModels_OllamaNothingLoaded covers a running ollama with no
-// models resident in memory: empty result, no error.
-func TestDiscoverModels_OllamaNothingLoaded(t *testing.T) {
+// TestDiscoverModels_OllamaNothingPulled covers a running ollama with no
+// models pulled to the node: empty result, no error.
+func TestDiscoverModels_OllamaNothingPulled(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"models": []any{}})
 	})
@@ -122,7 +125,7 @@ func TestDiscoverModels_OllamaNothingLoaded(t *testing.T) {
 
 	models, err := discovery.DiscoverModels(context.Background(), "ollama", port)
 	if err != nil {
-		t.Fatalf("expected no error for empty /api/ps, got: %v", err)
+		t.Fatalf("expected no error for empty /api/tags, got: %v", err)
 	}
 	if len(models) != 0 {
 		t.Fatalf("expected no models, got %v", models)

@@ -36,14 +36,15 @@ var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai"}
 // when no manifest-driven service config was passed to the collector (the
 // common heartbeat case, where c.services is nil). Each entry carries the
 // per-service idle signal when the engine's metrics are scrapeable (citadel
-// #416) and the currently LOADED model(s) discovered from the engine's local
-// API (citadel #529) — e.g. vLLM/llama.cpp `GET /v1/models`, ollama
-// `GET /api/ps`.
+// #416) and the model(s) the engine can serve, discovered from the engine's
+// local API (citadel #529): e.g. vLLM/llama.cpp `GET /v1/models` (the loaded
+// model), ollama `GET /api/tags` (every pulled model, all auto-loadable on
+// request; citadel-cli#606).
 //
 // It only emits an entry for an engine that is actually running AND answered
 // at least one probe (idle scrape or model discovery). An engine that answers
 // model discovery with an empty list (llama.cpp up with no model loaded,
-// ollama with nothing resident) IS emitted — running with no models is real,
+// ollama with nothing pulled) IS emitted: running with no models is real,
 // reportable state. A running-but-unresponsive engine (e.g. still loading its
 // model, HTTP not yet up) is skipped rather than reported with a misleading
 // "idle since startup" — the existing manifest-driven collectServiceStatus

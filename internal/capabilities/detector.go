@@ -388,6 +388,36 @@ func GPUInferenceQueues(caps *NodeCapabilities) []string {
 	return ResolveQueues(tagCaps, "jobs:v1:gpu-general")
 }
 
+// InferenceQueues returns the inference queues an API-mode worker should
+// self-subscribe to so platform inference actually reaches it. Platform
+// inference (aceteam routes/inference.py) always dispatches an llm_inference
+// job to the shared jobs:v1:gpu-general queue with a target_node pin; a node
+// that does not consume that queue never receives the job (it times out at the
+// platform as a 504; see aceteam#6634).
+//
+//   - A node with a GPU returns GPUInferenceQueues (gpu-general + its
+//     gpu/engine/vram tag queues), unchanged from #6315.
+//   - A node with NO GPU but a running serving engine (serving == true) still
+//     returns the gpu-general base queue. This is the Apple Silicon case: a
+//     Mac runs ollama natively over unified memory and reports no discrete GPU,
+//     so GPUInferenceQueues is empty, yet it CAN serve inference and must
+//     consume the queue for a target_node-pinned job to arrive (citadel-cli#606).
+//   - Otherwise returns nil: a node that serves no models has no reason to join
+//     the inference queue.
+//
+// serving must reflect a live check that includes NATIVE engines (e.g.
+// status.DiscoverLocalEngines), not the docker-only detectRunningEngines()
+// snapshot in NodeCapabilities.Engines, which misses a natively run ollama.
+func InferenceQueues(caps *NodeCapabilities, serving bool) []string {
+	if q := GPUInferenceQueues(caps); len(q) > 0 {
+		return q
+	}
+	if serving {
+		return []string{"jobs:v1:gpu-general"}
+	}
+	return nil
+}
+
 func detectGPU() []Capability {
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
