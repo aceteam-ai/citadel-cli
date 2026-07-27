@@ -1524,6 +1524,21 @@ func (cc *ControlCenter) startSelectedService() {
 	}()
 }
 
+// isFabricManagedEngine reports whether name is an inference engine the fabric
+// control plane may re-assert (re-dispatch SERVICE_START) when a model is
+// deployed to it — so a node-side stop of it can be silently overruled. Used to
+// warn on stop. Substring match mirrors status.EngineTypeFromName (kept local to
+// avoid a heavy import for one predicate).
+func isFabricManagedEngine(name string) bool {
+	n := strings.ToLower(name)
+	for _, e := range []string{"vllm", "ollama", "llamacpp", "llama.cpp", "llama-cpp", "bonsai", "sglang", "lmstudio"} {
+		if strings.Contains(n, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // stopSelectedService stops the currently selected service
 func (cc *ControlCenter) stopSelectedService() {
 	svcName := cc.getSelectedServiceName()
@@ -1549,6 +1564,13 @@ func (cc *ControlCenter) stopSelectedService() {
 			delete(cc.serviceOverrides, svcName)
 			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("success", fmt.Sprintf("%s stopped", svcName))
+			// Inference engines are fabric-managed: if a model is deployed to one,
+			// the control plane re-asserts it (re-dispatches SERVICE_START), so a
+			// node-side stop can be overruled. Warn so the "I stopped it and it came
+			// right back" surprise is explained and the user knows where to manage it.
+			if isFabricManagedEngine(svcName) {
+				cc.AddActivity("warning", fmt.Sprintf("%s is a fabric-managed engine — if it comes back, a model is deployed to it. Manage it from the web console.", svcName))
+			}
 			cc.refresh()
 		}
 	}()

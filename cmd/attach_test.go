@@ -21,6 +21,24 @@ func TestNoWorkerMessage(t *testing.T) {
 	}
 }
 
+func TestTUIRunningNoWorkerMessage(t *testing.T) {
+	// With a PID: names the running control center and points at the shell + worker.
+	out := tuiRunningNoWorkerMessage(4242)
+	for _, want := range []string{"control center is running", "PID 4242", "citadel attach --shell", "citadel work"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("message missing %q\n---\n%s", want, out)
+		}
+	}
+	// Must NOT claim nothing is running (the papercut this fixes).
+	if strings.Contains(out, "No citadel worker is running on this node") {
+		t.Errorf("should not claim nothing is running when a TUI is up\n---\n%s", out)
+	}
+	// Without a PID: still coherent, no "PID 0".
+	if strings.Contains(tuiRunningNoWorkerMessage(0), "PID 0") {
+		t.Error("zero PID should be omitted")
+	}
+}
+
 func TestRenderServicesSection_Empty(t *testing.T) {
 	if got := renderServicesSection(nil); got != "" {
 		t.Errorf("renderServicesSection(nil) = %q, want empty", got)
