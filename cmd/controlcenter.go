@@ -172,7 +172,7 @@ var (
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
-		fmt.Fprintln(os.Stderr, "Control center requires a terminal. Use --daemon for background mode.")
+		fmt.Fprintln(os.Stderr, "Control center requires a terminal. Run 'citadel work' for headless/background operation.")
 		os.Exit(1)
 	}
 
