@@ -68,6 +68,24 @@ func TestManagedEngineHostPort_VLLM(t *testing.T) {
 	}
 }
 
+// TestEmbeddingProbeResolvesTEIPort guards that the embedding probe resolves
+// TEI's fixed host port (8102) from the embedded compose, so the advertised
+// ServiceInfo.Port matches the gateway's /v1/embeddings upstream. A drift here
+// would advertise a wrong port and break sovereign-embedding discovery.
+func TestEmbeddingProbeResolvesTEIPort(t *testing.T) {
+	if !engineInList(embeddingProbeServices, "tei") {
+		t.Fatal("tei missing from embeddingProbeServices; it would never advertise")
+	}
+	if got := managedEngineHostPort("tei"); got != services.TEIEmbeddingPort {
+		t.Fatalf("expected tei host port %d, got %d", services.TEIEmbeddingPort, got)
+	}
+	// TEI must be advertised as an embedding service, never as an LLM (which would
+	// wrongly feed the gateway chat router).
+	if ServiceTypeEmbedding == ServiceTypeLLM {
+		t.Fatal("ServiceTypeEmbedding must be distinct from ServiceTypeLLM")
+	}
+}
+
 // TestManagedProbeEnginesSupersetOfIdleCapable guards against the drift where
 // an engine added to the idle list is silently dropped from the heartbeat's
 // managed-engine sweep (which now iterates managedProbeEngines, #529).

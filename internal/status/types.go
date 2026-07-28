@@ -223,9 +223,10 @@ type HealthResponse struct {
 
 // ServiceType constants for service classification.
 const (
-	ServiceTypeLLM      = "llm"
-	ServiceTypeDatabase = "database"
-	ServiceTypeOther    = "other"
+	ServiceTypeLLM       = "llm"
+	ServiceTypeEmbedding = "embedding"
+	ServiceTypeDatabase  = "database"
+	ServiceTypeOther     = "other"
 )
 
 // ServiceStatus constants for service state.

@@ -1,0 +1,44 @@
+# services/compose/tei.yml
+#
+# HuggingFace Text Embeddings Inference (TEI) serving
+# Alibaba-NLP/gte-multilingual-base (768-dim, CLS pooling) over the
+# OpenAI-compatible endpoint POST /v1/embeddings. This is the SOVEREIGN EMBEDDING
+# service: the platform resolves an org's embedding model and, for a TEI model,
+# embeds on the org's OWN node (no OpenAI in the loop, model provenance stored
+# with every vector). The backend reaches this through the node's mesh-exposed
+# citadel gateway (/v1/embeddings upstream), never this host port directly.
+#
+# CPU by default: gte-multilingual-base is ~600MB and runs comfortably on CPU,
+# leaving GPU VRAM for inference engines on shared nodes. `--dtype float32` is
+# DELIBERATE and load-bearing -- float16 on CPU segfaults through Intel MKL
+# (aceteam-ai/citadel-services#14); the single-thread MKL/OMP/RAYON env is the
+# segfault-safe combination proven on the cpu-1.6 image. A GPU variant
+# (float16, no MKL pinning) can follow as a separate compose.
+#
+# Host port: the container serves :80, published to the fixed host port 8102
+# (services/ports.go TEIEmbeddingPort), which the gateway's /v1/embeddings
+# upstream reverse-proxies to (cmd/serve.go --embedding-port, cmd/work.go
+# --gateway-embedding-port both default 8102). Like transcribe (8101), this is a
+# fixed well-known port, not a ${CITADEL_*_HOST_PORT}-managed one. Loopback-only
+# (127.0.0.1): the sole consumer is the co-located citadel gateway and TEI has
+# no auth of its own, so it must not be reachable off-host; the mesh reaches
+# embeddings through the gateway (TLS), never this port.
+services:
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.6
+    container_name: citadel-tei
+    command: ["--model-id", "Alibaba-NLP/gte-multilingual-base", "--dtype", "float32"]
+    ports:
+      - "127.0.0.1:8102:80"
+    environment:
+      # Single-thread MKL/OMP/RAYON: float32-on-CPU is stable only when these are
+      # pinned to 1 (citadel-services#14). Do not remove.
+      - MKL_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+      - RAYON_NUM_THREADS=1
+      # HuggingFace cache: gte-multilingual-base (~600MB) downloads here once and
+      # persists across restarts (shared with other HF-based services).
+      - HUGGINGFACE_HUB_CACHE=/data
+    volumes:
+      - ~/citadel-cache/tei:/data
+    restart: unless-stopped

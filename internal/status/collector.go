@@ -129,7 +129,20 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 		if _, dup := reported[eng.Name]; dup {
 			continue
 		}
+		reported[eng.Name] = struct{}{}
 		status.Services = append(status.Services, eng)
+	}
+
+	// Advertise running embedding services (e.g. TEI) with Type=embedding. This
+	// is the discovery signal the sovereign-RAG backend matches on to embed on
+	// the org's own node; like the engine probe it runs in the heartbeat path
+	// where c.services is nil, so a manifest entry is not required.
+	for _, emb := range c.collectEmbeddingServiceStatus() {
+		if _, dup := reported[emb.Name]; dup {
+			continue
+		}
+		reported[emb.Name] = struct{}{}
+		status.Services = append(status.Services, emb)
 	}
 
 	// Mark pinned services (citadel #577) so the heartbeat and `citadel services`

@@ -2,10 +2,13 @@ package status
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -101,6 +104,62 @@ func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
 		out = append(out, info)
 	}
 	return out
+}
+
+// embeddingProbeServices lists the OpenAI-compatible embedding services the
+// heartbeat probes on this node. Unlike LLM engines (managedProbeEngines), they
+// are advertised with Type=embedding and are NEVER offered to the gateway chat
+// router: the sovereign RAG path (aceteam) discovers them via the "tei"/
+// "embedding" service marker and reaches them through the gateway's
+// /v1/embeddings upstream, not /v1/chat/completions.
+var embeddingProbeServices = []string{"tei"}
+
+// collectEmbeddingServiceStatus reports running embedding services (container
+// "citadel-<name>") that answer a health check, as ServiceInfo with
+// Type=embedding. This is the discovery signal the sovereign-embeddings backend
+// (_find_tei_node) matches on: a node advertising a "tei" service becomes
+// eligible to embed on its own model. Kept separate from
+// collectManagedEngineStatus so an embedding server is never mistaken for a chat
+// LLM (whose model-discovery/idle probes and chat-router listing do not apply).
+func (c *Collector) collectEmbeddingServiceStatus() []ServiceInfo {
+	engineBin := catalog.SelectContainerRuntime().EngineBin
+	var out []ServiceInfo
+	for _, name := range embeddingProbeServices {
+		if !containerRunning(engineBin, "citadel-"+name) {
+			continue
+		}
+		port := managedEngineHostPort(name)
+		if port <= 0 {
+			continue
+		}
+		// Advertise only once the model is loaded (TEI /health is 200 only then),
+		// so the backend never discovers a still-warming node and then fails the
+		// embed with a 503.
+		if !embeddingServiceHealthy(port) {
+			continue
+		}
+		out = append(out, ServiceInfo{
+			Name:   name,
+			Type:   ServiceTypeEmbedding,
+			Status: ServiceStatusRunning,
+			Port:   port,
+			Health: HealthStatusOK,
+		})
+	}
+	return out
+}
+
+// embeddingServiceHealthy reports whether the embedding server on the loopback
+// host port answers TEI's /health endpoint with 200 (returned only after the
+// model has loaded).
+func embeddingServiceHealthy(port int) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // engineInList reports whether name is present in the given engine list.

@@ -309,10 +309,14 @@ const (
 // any of these. The collision guard test asserts the module registry, the apps
 // catalog, and the parsed compose files all avoid this set.
 var ReservedCitadelPorts = map[int]string{
-	GatewayPort:        "gateway/status-server",
-	GatewayHTTPSPort:   "gateway-https",
-	ControlMTLSPort:    "control-mtls",
-	TEIEmbeddingPort:   "tei-embeddings",
+	GatewayPort:      "gateway/status-server",
+	GatewayHTTPSPort: "gateway-https",
+	ControlMTLSPort:  "control-mtls",
+	// TEIEmbeddingPort (8102) is intentionally NOT here: TEI is now a first-class
+	// embedded module (services/compose/tei.yml) that OWNS its host port via its
+	// compose, like the transcribe sidecar (8101). The collision guard forbids a
+	// module compose from publishing a ReservedCitadelPorts entry, so TEI's port
+	// protection lives in fixedComposeHostPorts / ClaimedHostPorts instead.
 	VNCWebsockifyPort:  "vnc-websockify",
 	VNCPort:            "vnc-rfb",
 	DeskstreamPort:     "deskstream-h264",
@@ -330,19 +334,44 @@ const (
 	AppsPortRangeEnd   = 8199
 )
 
-// InRangeReservedHostPorts returns the citadel-reserved host ports that fall
+// fixedComposeHostPorts are embedded compose services that publish a FIXED,
+// well-known host port NOT managed through the ${CITADEL_*_HOST_PORT} registry
+// and deliberately NOT listed in ReservedCitadelPorts -- they are owned by their
+// own compose file (which the collision guard validates), so listing them as
+// reserved would make the guard reject the very compose that publishes them.
+// They must nonetheless be treated as citadel-claimed so no dynamic host-port
+// allocator (apps, the whatsapp bridge) ever hands them out and races the
+// service for its port.
+var fixedComposeHostPorts = map[int]string{
+	TranscribePort:   "transcribe",
+	TEIEmbeddingPort: "tei",
+}
+
+// ClaimedHostPorts returns every host port citadel claims: its own process
+// listeners (ReservedCitadelPorts) plus fixed-port compose services
+// (fixedComposeHostPorts). Every dynamic host-port allocator must skip all of
+// these, whatever its scan range -- ReservedCitadelPorts alone is insufficient
+// because it deliberately omits compose-owned fixed ports like transcribe (8101)
+// and tei (8102).
+func ClaimedHostPorts() map[int]string {
+	out := make(map[int]string, len(ReservedCitadelPorts)+len(fixedComposeHostPorts))
+	for p, n := range ReservedCitadelPorts {
+		out[p] = n
+	}
+	for p, n := range fixedComposeHostPorts {
+		out[p] = n
+	}
+	return out
+}
+
+// InRangeReservedHostPorts returns the citadel-claimed host ports that fall
 // inside the apps auto-allocation range, so app allocation can skip them.
 func InRangeReservedHostPorts() map[int]bool {
 	reserved := make(map[int]bool)
-	for port := range ReservedCitadelPorts {
+	for port := range ClaimedHostPorts() {
 		if port >= AppsPortRangeStart && port <= AppsPortRangeEnd {
 			reserved[port] = true
 		}
-	}
-	// TranscribePort is a compose service (not in ReservedCitadelPorts) that
-	// nonetheless occupies a port inside the apps range.
-	if TranscribePort >= AppsPortRangeStart && TranscribePort <= AppsPortRangeEnd {
-		reserved[TranscribePort] = true
 	}
 	return reserved
 }
