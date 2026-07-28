@@ -1378,3 +1378,19 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.91.0 release
 
 
+---
+
+## v2.93.0 — 2026-07-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 13 |
+| Lines added | +270 |
+
+**Changes:**
+
+  - feat(embedding): ship TEI as a first-class module so sovereign embeddings route (#616) (#621)
+  - docs(claude): require an isolated worktree + open a PR after pushing (#622)
+
+
