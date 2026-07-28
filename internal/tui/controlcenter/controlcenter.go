@@ -1564,12 +1564,19 @@ func (cc *ControlCenter) stopSelectedService() {
 			delete(cc.serviceOverrides, svcName)
 			cc.serviceOverridesMu.Unlock()
 			cc.AddActivity("success", fmt.Sprintf("%s stopped", svcName))
-			// Inference engines are fabric-managed: if a model is deployed to one,
-			// the control plane re-asserts it (re-dispatches SERVICE_START), so a
-			// node-side stop can be overruled. Warn so the "I stopped it and it came
-			// right back" surprise is explained and the user knows where to manage it.
+			// This stop is durable: ccStopService persists desired_status: stopped,
+			// so the engine does NOT restart on its own. Nothing re-asserts a
+			// stopped engine: the desired-state reconcile is modules-only and does
+			// not manage engines, and inference traffic to a stopped engine is not a
+			// resume trigger (both verified by a live node trace). The pre-#528 "I
+			// stopped it and it came right back" surprise was a no-op stop (a
+			// `-p citadel-<name> down` that matched zero containers), fixed in #528.
+			// The real remaining caveat is routing, not restart: if a model was
+			// deployed to this engine from the platform, that model is now
+			// unavailable and the platform may keep routing to it until it
+			// reconciles the stop. Surface that so the user knows where to manage it.
 			if isFabricManagedEngine(svcName) {
-				cc.AddActivity("warning", fmt.Sprintf("%s is a fabric-managed engine — if it comes back, a model is deployed to it. Manage it from the web console.", svcName))
+				cc.AddActivity("warning", fmt.Sprintf("%s stopped durably (won't auto-restart). If a model was deployed to it, that model is now unavailable — redeploy or manage it from the web console.", svcName))
 			}
 			cc.refresh()
 		}
