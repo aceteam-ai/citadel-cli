@@ -25,19 +25,23 @@ When writing user-facing content (CLI help text, README, error messages), use th
 
 This keeps implementation details hidden from users while maintaining technical accuracy in code comments and internal documentation (like this file).
 
-## ⛔ CRITICAL: Git Branch Policy
+## ⛔ CRITICAL: Git Workflow Policy
 
-**NEVER commit directly to `main` branch.** This is a hard rule with no exceptions.
+**NEVER commit directly to `main`, and NEVER work in the shared main checkout.** Both are hard rules with no exceptions.
+
+**Always work in a dedicated git worktree.** This repo's main checkout is shared: a release (`./scripts/release.sh`) or another agent can `git checkout main`, pull, and tag *underneath you* at any time — orphaning your in-progress commit and silently moving your working tree onto `main`. (This happened on 2026-07-28: a concurrent `v2.92.0` release orphaned a commit and switched the tree to `main` mid-task.) A worktree isolates your branch from that churn.
 
 Always:
-1. Create a feature branch: `git checkout -b fix/description` or `git checkout -b feat/description`
-2. Make commits on the feature branch
+1. Create an isolated worktree on a feature branch off the latest `main`:
+   `git worktree add -b feat/description ../citadel-cli-wt-<name> main`
+   (use `fix/`, `docs/`, or `chore/` prefixes as appropriate)
+2. `cd` into the worktree and make all commits there — never in the shared main checkout.
 3. Push the branch: `git push -u origin <branch-name>`
-4. **WAIT for user to request a PR** - do NOT automatically create PRs
+4. **Open a PR right after pushing** with `gh pr create` (use `--draft` when the test plan still needs manual or deploy-gated steps), then inform the user.
 
-**Do NOT automatically create PRs.** Only create a PR when the user explicitly asks (e.g., "create a PR", "make a PR", "submit PR"). After pushing a branch, just inform the user and wait for instructions.
+If you are about to run `git push origin main`, STOP. If you are about to commit while in the main checkout (i.e. `git rev-parse --git-common-dir` equals `git rev-parse --git-dir` — you are NOT in a worktree), STOP and move to a worktree first.
 
-If you find yourself about to run `git push origin main`, STOP and create a branch instead.
+When the branch is done, remove the worktree with `git worktree remove <path>` (or leave it until the PR merges).
 
 ## Build and Development Commands
 
