@@ -1360,3 +1360,21 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.87.0 release
 
 
+---
+
+## v2.92.0 — 2026-07-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 6 |
+| Lines added | +105 |
+
+**Changes:**
+
+  - fix(controlcenter): correct the engine-stop warning to match reality (#620)
+  - fix(nvr): fix nvr-config image build so it publishes to GHCR (#597) (#615)
+  - feat(attach/tui): unify running-instance detection + warn on fabric-managed engine stops (#614)
+  - chore: sync generated files after v2.91.0 release
+
+
