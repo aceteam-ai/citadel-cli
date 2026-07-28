@@ -12,21 +12,21 @@ import (
 // accepts both embedded/catalog services (services.ServiceMap) and
 // module-installed services tracked in the manifest, while rejecting unknown
 // names. This is the regression guard for issue #358, where the gate only
-// consulted ServiceMap and rejected module-installed services like "tei".
+// consulted ServiceMap and rejected module-installed services not in the embedded ServiceMap.
 func TestServiceIsKnown(t *testing.T) {
-	// "tei" is a stand-in for a module-installed service: it is NOT in
+	// "custommod" is a stand-in for a module-installed service: it is NOT in
 	// services.ServiceMap but is present in the manifest after
-	// `citadel module install tei`.
+	// `citadel module install custommod`.
 	manifest := &CitadelManifest{
 		Services: []Service{
-			{Name: "tei", ComposeFile: "./services/tei.yml"},
+			{Name: "custommod", ComposeFile: "./services/custommod.yml"},
 		},
 	}
 
 	// Sanity check: the module-installed name must not be an embedded service,
 	// otherwise case (b) would not actually exercise the manifest fallback.
-	if _, ok := services.ServiceMap["tei"]; ok {
-		t.Fatal("test assumption broken: 'tei' should not be in services.ServiceMap")
+	if _, ok := services.ServiceMap["custommod"]; ok {
+		t.Fatal("test assumption broken: 'custommod' should not be in services.ServiceMap")
 	}
 
 	tests := []struct {
@@ -35,7 +35,7 @@ func TestServiceIsKnown(t *testing.T) {
 		want        bool
 	}{
 		{"embedded service only (ServiceMap)", "vllm", true},
-		{"module-installed service only (manifest)", "tei", true},
+		{"module-installed service only (manifest)", "custommod", true},
 		{"unknown service", "definitely-not-a-service", false},
 	}
 
@@ -54,7 +54,7 @@ func TestServiceIsKnown(t *testing.T) {
 func TestKnownServiceNames(t *testing.T) {
 	manifest := &CitadelManifest{
 		Services: []Service{
-			{Name: "tei", ComposeFile: "./services/tei.yml"},
+			{Name: "custommod", ComposeFile: "./services/custommod.yml"},
 			// vllm is also embedded; it must not be duplicated.
 			{Name: "vllm", ComposeFile: "./services/vllm.yml"},
 		},
@@ -65,7 +65,7 @@ func TestKnownServiceNames(t *testing.T) {
 	// Expect all embedded services (sorted) followed by the unique manifest-only
 	// names (sorted), with no duplicates.
 	want := append([]string{}, services.GetAvailableServices()...)
-	want = append(want, "tei")
+	want = append(want, "custommod")
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("knownServiceNames() = %v, want %v", got, want)
