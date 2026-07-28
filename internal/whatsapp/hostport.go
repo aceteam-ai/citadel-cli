@@ -81,7 +81,11 @@ func SelectHostPort(preferred, floor int, probe func(int) bool) (int, error) {
 		start = floor
 	}
 
-	reserved := services.ReservedCitadelPorts
+	// Every port citadel claims -- its own listeners (gateway 8080, etc.) AND
+	// fixed-port compose services (transcribe 8101, tei 8102) -- so the bridge
+	// never races one of them for a port. ReservedCitadelPorts alone omits the
+	// compose-owned fixed ports, which sit inside this 8080+ scan range.
+	reserved := services.ClaimedHostPorts()
 	// 65535 is the max valid TCP port; stop there even if the scan limit would
 	// otherwise carry us past it.
 	for offset := 0; offset < hostPortScanLimit; offset++ {

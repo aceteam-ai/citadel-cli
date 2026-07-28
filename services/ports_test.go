@@ -117,12 +117,34 @@ func TestGotenbergHostPortRegistered(t *testing.T) {
 // membership: every citadel-owned listener port must be present as its own
 // entry (an accidental re-merge onto an existing port would silently collapse
 // two entries into one).
+// TestClaimedHostPortsCoversFixedComposePorts guards that fixed-port compose
+// services (transcribe 8101, tei 8102) -- which are intentionally NOT in
+// ReservedCitadelPorts so the collision guard lets their compose own them -- are
+// still surfaced as citadel-claimed to every dynamic host-port allocator, and
+// that tei's in-range port stays off-limits to app allocation. Without this a
+// dynamically allocated app or the whatsapp bridge could race TEI for 8102.
+func TestClaimedHostPortsCoversFixedComposePorts(t *testing.T) {
+	claimed := ClaimedHostPorts()
+	for port, name := range map[int]string{TranscribePort: "transcribe", TEIEmbeddingPort: "tei"} {
+		if _, ok := claimed[port]; !ok {
+			t.Errorf("ClaimedHostPorts missing fixed compose port %d (%s)", port, name)
+		}
+	}
+	if !InRangeReservedHostPorts()[TEIEmbeddingPort] {
+		t.Errorf("InRangeReservedHostPorts missing TEIEmbeddingPort %d; apps could allocate it", TEIEmbeddingPort)
+	}
+	// tei must NOT be in ReservedCitadelPorts (else the collision guard rejects
+	// its compose); it belongs only in the claimed union.
+	if _, ok := ReservedCitadelPorts[TEIEmbeddingPort]; ok {
+		t.Error("TEIEmbeddingPort must not be in ReservedCitadelPorts (its compose owns it)")
+	}
+}
+
 func TestReservedCitadelPortsPairwiseDistinct(t *testing.T) {
 	wantEntries := map[int]string{
 		GatewayPort:        "gateway/status-server",
 		GatewayHTTPSPort:   "gateway-https",
 		ControlMTLSPort:    "control-mtls",
-		TEIEmbeddingPort:   "tei-embeddings",
 		VNCWebsockifyPort:  "vnc-websockify",
 		VNCPort:            "vnc-rfb",
 		DeskstreamPort:     "deskstream-h264",

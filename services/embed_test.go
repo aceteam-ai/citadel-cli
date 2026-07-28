@@ -75,6 +75,43 @@ func TestBonsaiComposeVRAMTuning(t *testing.T) {
 	}
 }
 
+// TestTEIComposeContract guards the sovereign-embedding TEI module. The
+// float32 + single-thread MKL/OMP/RAYON combination is load-bearing: float16 on
+// CPU segfaults through Intel MKL (citadel-services#14), so if these drift the
+// service crash-loops on start. The container serves :80 published to the fixed
+// host port 8102 (the gateway's /v1/embeddings upstream); a drift there silently
+// breaks discovery + the gateway proxy.
+func TestTEIComposeContract(t *testing.T) {
+	content, ok := ServiceMap["tei"]
+	if !ok {
+		t.Fatal("tei not found in ServiceMap")
+	}
+	for _, want := range []string{
+		"Alibaba-NLP/gte-multilingual-base",
+		"--dtype", "float32",
+		"MKL_NUM_THREADS=1",
+		"OMP_NUM_THREADS=1",
+		"RAYON_NUM_THREADS=1",
+		"127.0.0.1:8102:80",
+		"cpu-1.6",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("tei compose missing required contract fragment %q", want)
+		}
+	}
+}
+
+// TestGetAvailableServicesIncludesTEI ensures tei is advertised as a deployable
+// service so the fabric can schedule the sovereign-embedding module to a node.
+func TestGetAvailableServicesIncludesTEI(t *testing.T) {
+	for _, s := range GetAvailableServices() {
+		if s == "tei" {
+			return
+		}
+	}
+	t.Errorf("GetAvailableServices() = %v, want tei to be included", GetAvailableServices())
+}
+
 // TestDiffusersComposeRegistered ensures the diffusers service is in the
 // ServiceMap so `citadel init` writes services/diffusers.yml and a node can
 // enable it (aceteam #4468).
