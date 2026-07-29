@@ -69,4 +69,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 	"tei": {
 		"274a82d682918124ae2472413b3a2246cd99c706b225cd6c4806505a230d44ca": true,
 	},
+	"unlimited-ocr": {
+		"2f1e1f1ffae72db007b65d1b8d275f69c33c0c7e3207f8139ee8c2c1c8d2c9c0": true,
+	},
 }

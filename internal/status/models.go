@@ -48,6 +48,8 @@ func EngineTypeFromName(name string) string {
 		return "ollama"
 	case strings.Contains(n, "bonsai"):
 		return "bonsai"
+	case strings.Contains(n, "unlimited-ocr"):
+		return "unlimited-ocr"
 	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
 		return "llamacpp"
 	}

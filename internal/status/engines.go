@@ -32,7 +32,12 @@ var idleCapableEngines = []string{"vllm"}
 // same OpenAI-compatible /v1/models API as llama.cpp, so probing it surfaces the
 // served GGUF in the heartbeat's services[].models — which is how the inference
 // gateway learns a node is serving Bonsai and can route to it (backend=bonsai).
-var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai"}
+//
+// unlimited-ocr (Baidu Unlimited-OCR served by vLLM, host port 8213) is likewise
+// an OpenAI-compatible /v1 engine — it just takes image_url input on
+// /v1/chat/completions — so probing it surfaces baidu/Unlimited-OCR in the
+// heartbeat and lets the gateway/mesh route document-OCR requests to it by model.
+var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unlimited-ocr"}
 
 // collectManagedEngineStatus reports running managed serving engines (from the
 // embedded services.ServiceMap) so their telemetry reaches the heartbeat even

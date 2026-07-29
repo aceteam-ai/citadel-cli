@@ -42,6 +42,9 @@ var KokoroCompose string
 //go:embed compose/tei.yml
 var TEICompose string
 
+//go:embed compose/unlimited-ocr.yml
+var UnlimitedOCRCompose string
+
 // BonsaiDockerfile is the build-context Dockerfile for the bonsai service. It is
 // materialized to <config>/services/bonsai/Dockerfile (see WriteAuxFiles) so the
 // compose `build.context: ./bonsai` resolves on the node.
@@ -51,17 +54,18 @@ var BonsaiDockerfile string
 
 // ServiceMap provides a lookup for pre-packaged service compose files.
 var ServiceMap = map[string]string{
-	"ollama":     OllamaCompose,
-	"vllm":       VLLMCompose,
-	"llamacpp":   LlamacppCompose,
-	"lmstudio":   LMStudioCompose,
-	"sglang":     SGLangCompose,
-	"extraction": ExtractionCompose,
-	"transcribe": TranscribeCompose,
-	"diffusers":  DiffusersCompose,
-	"bonsai":     BonsaiCompose,
-	"kokoro":     KokoroCompose,
-	"tei":        TEICompose,
+	"ollama":        OllamaCompose,
+	"vllm":          VLLMCompose,
+	"llamacpp":      LlamacppCompose,
+	"lmstudio":      LMStudioCompose,
+	"sglang":        SGLangCompose,
+	"extraction":    ExtractionCompose,
+	"transcribe":    TranscribeCompose,
+	"diffusers":     DiffusersCompose,
+	"bonsai":        BonsaiCompose,
+	"kokoro":        KokoroCompose,
+	"tei":           TEICompose,
+	"unlimited-ocr": UnlimitedOCRCompose,
 }
 
 // ServiceAuxFiles maps a service name to auxiliary build-context files
