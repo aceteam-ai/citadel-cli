@@ -332,3 +332,65 @@ func TestRemoveExposure_FailsClosedAfterRevoke(t *testing.T) {
 		t.Errorf("after RemoveExposure: got %d, want 404", w.Code)
 	}
 }
+
+// TestExposeSendsIngressPath pins the subpath fix: an exposed route must tell
+// the upstream which external prefix it is mounted under, via the Home Assistant
+// X-Ingress-Path convention. Without it, an app that emits absolute asset paths
+// (Frigate: src="/assets/main.js") has the browser resolve them at the gateway
+// ROOT, so every asset 404s under /expose/<name>/ — at every visibility level.
+func TestExposeSendsIngressPath(t *testing.T) {
+	var gotHeader, gotPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Ingress-Path")
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	gw := NewServer(Config{Port: 0, NodeName: "test-node"})
+	gw.SetPermissions(&config.Permissions{})
+	if err := gw.Expose("frigate", backendAddr(t, backend), &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	gw.SetMeshResolver(&MockMeshResolver{Identity: &MeshPeerIdentity{SameOwner: true}})
+	for prefix, up := range gw.config.Upstreams {
+		gw.registerProxy(prefix, up)
+	}
+
+	// A CLIENT-SUPPLIED value must be overwritten: the header is the gateway's own
+	// statement about how it mounted this route, so it must never be steerable.
+	req := httptest.NewRequest(http.MethodGet, "/expose/frigate/assets/main.js", nil)
+	req.Header.Set("X-Ingress-Path", "/evil")
+	rec := httptest.NewRecorder()
+	gw.BuildHandler().ServeHTTP(rec, req)
+
+	if gotHeader != "/expose/frigate" {
+		t.Errorf("X-Ingress-Path = %q, want /expose/frigate (a client value must not survive)", gotHeader)
+	}
+	if gotPath != "/assets/main.js" {
+		t.Errorf("upstream path = %q, want /assets/main.js (prefix stripped)", gotPath)
+	}
+}
+
+// A route that is NOT subpath-mounted must not forward a client-supplied
+// X-Ingress-Path, or a caller could steer that upstream's generated URLs.
+func TestNonExposeRouteStripsClientIngressPath(t *testing.T) {
+	var got string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Ingress-Path")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	up := &Upstream{Address: backendAddr(t, backend)}
+	gw := NewServer(Config{Port: 0, Upstreams: map[string]*Upstream{"/plain": up}})
+	gw.registerProxy("/plain", up)
+
+	req := httptest.NewRequest(http.MethodGet, "/plain/x", nil)
+	req.Header.Set("X-Ingress-Path", "/evil")
+	gw.mux.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got != "" {
+		t.Errorf("X-Ingress-Path = %q, want it stripped on a non-subpath route", got)
+	}
+}
