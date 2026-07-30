@@ -1426,3 +1426,19 @@ Auto-generated log of every release.
   - fix(status,worker): route unlimited-ocr end-to-end (discovery + inference) (#631)
 
 
+---
+
+## v2.96.0 — 2026-07-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 14 |
+| Lines added | +1626 |
+
+**Changes:**
+
+  - feat(fabric): embeddings-on-fabric contract test + doc correction (#634)
+  - feat: model hotswap phase 1 (pilot, #632) (#635)
+
+
