@@ -34,11 +34,15 @@ const teiReadyTimeout = 60 * time.Second
 //
 // IMPORTANT — payload contract: the live dispatch path
 // (worker.LegacyHandlerAdapter) flattens the job payload map[string]any into
-// map[string]string via fmt.Sprint before the handler sees it. A raw []string
-// would be stringified to "[a b]" and become unrecoverable. The handler
-// therefore expects `input` to arrive as a JSON-encoded array string, e.g.
-// `["hello","world"]`, which it json.Unmarshals. A bare scalar string is also
-// accepted and treated as a single-element input for convenience.
+// map[string]string before the handler sees it. Since citadel-cli#462 the
+// adapter json.Marshals nested []any/map values (not fmt.Sprint), so a raw JSON
+// array of strings survives the flatten as `["a","b"]` too. The canonical,
+// version-safe wire form is therefore a JSON-encoded array string for `input`
+// (e.g. `["hello","world"]`), which the handler json.Unmarshals — the aceteam
+// dispatch (run_fabric_embeddings) sends exactly this via json.dumps(texts). A
+// bare scalar string is also accepted and treated as a single-element input for
+// convenience. (Older adapters that fmt.Sprint'd a []string would mangle it to
+// "[a b]"; sending a JSON string avoids that on every adapter version.)
 //
 // This differs from llm_inference.go's structure-preserving signature; that
 // handler is not wired into the live worker path (see PR notes). We mirror its
