@@ -1411,3 +1411,18 @@ Auto-generated log of every release.
   - chore: relicense to Elastic License 2.0 (#629)
 
 
+---
+
+## v2.95.0 — 2026-07-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 3 |
+| Lines added | +47 |
+
+**Changes:**
+
+  - fix(status,worker): route unlimited-ocr end-to-end (discovery + inference) (#631)
+
+
