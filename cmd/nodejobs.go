@@ -47,6 +47,10 @@ type nodeJobHandlerOpts struct {
 	// HandlerLog is the plain logger the privileged handlers (AGENT_UPDATE,
 	// WHATSAPP_PROVISION) use for their own progress lines. Required.
 	HandlerLog func(format string, args ...any)
+	// PinnedServices is the node's pinned_services allowlist (citadel #577). Used
+	// by the model-hotswap swap manager (#632) so a pinned engine is never
+	// evicted to swap in another. Optional.
+	PinnedServices []string
 }
 
 // buildNodeJobHandlers returns the base node-job handler set: the legacy Nexus
@@ -77,7 +81,15 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 	// control-center worker route it to the node-local engine (vllm/sglang/
 	// ollama/llamacpp/bonsai). Without it every inference job failed with
 	// "unsupported job type \"llm_inference\": node X has no handler for it".
-	handlers = append(handlers, worker.NewLLMInferenceHandler())
+	llmHandler := worker.NewLLMInferenceHandler()
+	// Model hotswap (citadel-cli#632, default OFF): when CITADEL_MODEL_HOTSWAP is
+	// on and this node has a config dir, attach a swap manager so an
+	// installed-but-not-resident target engine is swapped in on demand. Returns nil
+	// (no swapper) when disabled, so the handler is byte-for-byte the pre-#632 one.
+	if swapper := newModelSwapManager(opts.ConfigDir, opts.WorkspaceDir, opts.PinnedServices, opts.HandlerLog); swapper != nil {
+		llmHandler = llmHandler.WithSwapper(swapper)
+	}
+	handlers = append(handlers, llmHandler)
 	return handlers
 }
 

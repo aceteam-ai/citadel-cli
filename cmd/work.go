@@ -1172,12 +1172,16 @@ func runWork(cmd *cobra.Command, args []string) {
 	var collector *status.Collector
 	if workStatusPort > 0 {
 		collector = status.NewCollector(status.CollectorConfig{
-			NodeName:       nodeName,
-			ConfigDir:      "",
+			NodeName: nodeName,
+			// ConfigDir is normally "" on the heartbeat path (engines are probed,
+			// not read from the manifest). Model hotswap (#632) needs it to
+			// enumerate installed-but-stopped engines, so pass it only when enabled.
+			ConfigDir:      hotswapConfigDir(workConfigDir),
 			Services:       nil,
 			Capabilities:   statusCaps,
 			WorkerLiveness: workerLivenessFn,
 			PinnedServices: manifestPinnedServices(workManifest),
+			ModelHotswap:   status.ModelHotswapEnabled(),
 		})
 	}
 
@@ -1445,11 +1449,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
 				NodeName:       nodeName,
-				ConfigDir:      "",
+				ConfigDir:      hotswapConfigDir(workConfigDir),
 				Services:       nil,
 				Capabilities:   statusCaps,
 				WorkerLiveness: workerLivenessFn,
 				PinnedServices: manifestPinnedServices(workManifest),
+				ModelHotswap:   status.ModelHotswapEnabled(),
 			})
 		}
 
@@ -2037,6 +2042,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		FilesDisabled:             !workPerms.Files,
 		WorkflowExec:              wfExec,
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
+		PinnedServices:            manifestPinnedServices(workManifest),
 	}
 	handlers := buildNodeJobHandlers(nodeJobOpts)
 
