@@ -845,6 +845,11 @@ func (cc *ControlCenter) Run() error {
 	cc.teamChatPage = NewTeamChatPage(cc.teamChatConfig)
 	cc.pmgr.Register(cc.teamChatPage, false)
 
+	// Search page: local semantic search over the authorized-roots allowlist
+	// (citadel-cli#617-619). Always visible — it manages its own roots and
+	// degrades gracefully when none are authorized yet.
+	cc.pmgr.Register(NewSearchPage(), true)
+
 	// Alt+4: Gateway page (hidden until gateway ledger appears on disk)
 	gatewayBaseDir := filepath.Join(os.Getenv("HOME"), ".citadel-cli")
 	cc.pmgr.Register(NewGatewayPage(gatewayBaseDir), false)

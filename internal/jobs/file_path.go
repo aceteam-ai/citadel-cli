@@ -71,6 +71,36 @@ func ValidatePath(workspace, requestedPath string) (string, error) {
 	return cleanTarget, nil
 }
 
+// ValidateWithinRoots generalizes the single-root ValidatePath boundary to an
+// allowlist: requestedPath is valid iff it resolves under ANY authorized root.
+// It returns the cleaned absolute path on success. This is the security core of
+// the local semantic-search surface (citadel-cli#617-619): a path outside every
+// authorized root is REJECTED, and symlink escapes are caught because each
+// candidate is run through ValidatePath (which EvalSymlinks the target before
+// the boundary check).
+//
+// An empty allowlist is a hard error (nothing is authorized), so every caller
+// fails closed on a fresh node that has authorized no roots.
+func ValidateWithinRoots(roots []string, requestedPath string) (string, error) {
+	if len(roots) == 0 {
+		return "", fmt.Errorf("no authorized roots configured (authorize one with 'citadel search roots add <path>')")
+	}
+	if requestedPath == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		// Reuse the airtight single-root symlink boundary check per root. The
+		// first root the path validates under wins.
+		if cleaned, err := ValidatePath(root, requestedPath); err == nil {
+			return cleaned, nil
+		}
+	}
+	return "", fmt.Errorf("path %q resolves outside all authorized roots", requestedPath)
+}
+
 // resolveNearestAncestor walks up from target until it finds a directory that
 // exists, resolves it via EvalSymlinks, then re-appends the tail. Returns the
 // fully resolved path even though the leaf may not exist.

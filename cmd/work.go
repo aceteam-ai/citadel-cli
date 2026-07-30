@@ -1355,6 +1355,21 @@ func runWork(cmd *cobra.Command, args []string) {
 			ragServer.RegisterRoutes(mux, auth)
 		})
 
+		// Local semantic-search file watcher (citadel-cli#617-619): if the
+		// operator has authorized any search roots, watch them and keep the
+		// node-local index current (index-on-startup + incremental on change).
+		// Best-effort and roots-scoped — a watcher failure must never take down
+		// the worker, and it enforces the roots allowlist (NOT the mesh workspace
+		// boundary used by the /rag HTTP routes above), so it stays a LOCAL surface.
+		if searchRoots := config.LoadRoots(platform.ConfigDir()).Roots; len(searchRoots) > 0 {
+			if w, werr := rag.NewWatcher(searchRoots, wsDir, ""); werr != nil {
+				Log("search watcher init failed (auto-indexing disabled): %v", werr)
+			} else {
+				w.Start(ctx)
+				fmt.Printf("   - Local search watcher active over %d authorized root(s)\n", len(searchRoots))
+			}
+		}
+
 		// Add VPN listener so the status server is reachable over the tsnet VPN.
 		// Bind to the explicit assigned VPN IP (not ":port"); see network.ListenVPN
 		// and issue #286.
