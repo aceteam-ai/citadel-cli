@@ -62,9 +62,59 @@ services:
       - NVR_STORAGE_MODE=${NVR_STORAGE_MODE:-local}
       - NVR_STORAGE_TARGET=${NVR_STORAGE_TARGET:-}
       - NVR_CAMERAS=${NVR_CAMERAS:?nvr requires NVR_CAMERAS (comma-separated camera stream names)}
+      # MQTT is Frigate's only real-time event egress (it has no generic outbound
+      # webhook), so the module runs a broker and points Frigate at it by default.
+      # Set NVR_MQTT=false to opt out.
+      - NVR_MQTT=${NVR_MQTT:-true}
+      - NVR_MQTT_HOST=mosquitto
+      - NVR_MQTT_USER=${NVR_MQTT_USER:-frigate}
+      - NVR_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
     volumes:
       - ~/.citadel-cli/nvr/config:/config
       - ~/.citadel-cli/nvr/media:/media
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: citadel-nvr-mosquitto
+    # DELIBERATELY NO `ports:` BLOCK. The broker is reachable only on this
+    # module's compose network, never from the host, the LAN, or the fabric.
+    # Binding 127.0.0.1 would NOT be equivalent: wyze-bridge runs with host
+    # networking in this module, so a bound port would be LAN-reachable.
+    #
+    # Why node-local rather than one shared broker for the fabric (#637):
+    # Frigate publishes at QoS 0 (fire-and-forget), so a WAN broker blip drops
+    # events silently; a shared bus would be a second control plane to secure
+    # (TLS/credentials/ACLs) when the citadel worker already holds an
+    # authenticated outbound channel; and cross-tenant topic isolation would
+    # become security-critical on a tailnet that is currently flat across orgs.
+    entrypoint:
+      # Mosquitto allows ANONYMOUS access by default. Generate a password file
+      # from the assignment credentials at start, then run with it. Written to a
+      # tmpfs so the credential never lands on disk.
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mosquitto_passwd -c -b /mosquitto/secrets/passwd "$$NVR_MQTT_USER" "$$NVR_MQTT_PASSWORD"
+        cat > /mosquitto/config/mosquitto.conf <<CONF
+        listener 1883
+        allow_anonymous false
+        password_file /mosquitto/secrets/passwd
+        persistence false
+        CONF
+        # mosquitto drops to the unprivileged `mosquitto` user, so it cannot read
+        # the root-owned files we just wrote into the tmpfs -- without this it
+        # exits with 'Unable to open pwfile' and the module never starts.
+        chown -R mosquitto:mosquitto /mosquitto/secrets /mosquitto/config
+        chmod 0600 /mosquitto/secrets/passwd
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    environment:
+      - NVR_MQTT_USER=${NVR_MQTT_USER:-frigate}
+      - NVR_MQTT_PASSWORD=${NVR_MQTT_PASSWORD:?nvr requires NVR_MQTT_PASSWORD (mosquitto allows anonymous access by default)}
+    tmpfs:
+      - /mosquitto/secrets
+      - /mosquitto/config
+    restart: unless-stopped
 
   frigate:
     image: ghcr.io/blakeblackshear/frigate:stable
@@ -72,12 +122,21 @@ services:
     depends_on:
       wyze-bridge:
         condition: service_started
+      mosquitto:
+        condition: service_started
       nvr-config:
         # Frigate must not start until config.yml exists and the nas mount (if any)
         # is verified.
         condition: service_completed_successfully
-    # Frigate decodes frames into /dev/shm; the 64MB default is too small.
-    shm_size: 256mb
+    # Frigate decodes frames into /dev/shm; the 64MB default is far too small.
+    # /dev/shm carries RAW DECODED frames between the capture and detect
+    # processes (a 1080p YUV420 frame is ~3MB, buffered ~9 deep per camera), so
+    # it scales with cameras x resolution, NOT with the compressed bitrate.
+    # 256mb was too small for 3x1080p: Frigate warned it needed >=306MB and
+    # measured steady-state use was 322MB (#637). Undersizing causes frame-write
+    # failures and capture-process restart loops, not merely slowness. This is a
+    # tmpfs CAP, not a reservation: unused headroom costs no RAM.
+    shm_size: 512mb
     devices:
       # Intel iGPU render node for hardware decode (preset-vaapi) + OpenVINO
       # detection. Matches sandbox.devices in service.yaml.
