@@ -82,10 +82,11 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 	// ollama/llamacpp/bonsai). Without it every inference job failed with
 	// "unsupported job type \"llm_inference\": node X has no handler for it".
 	llmHandler := worker.NewLLMInferenceHandler()
-	// Model hotswap (citadel-cli#632, default OFF): when CITADEL_MODEL_HOTSWAP is
-	// on and this node has a config dir, attach a swap manager so an
-	// installed-but-not-resident target engine is swapped in on demand. Returns nil
-	// (no swapper) when disabled, so the handler is byte-for-byte the pre-#632 one.
+	// Model hotswap (citadel-cli#632, default ON): unless CITADEL_MODEL_HOTSWAP is
+	// explicitly disabled (0/false/no/off) and this node has a config dir, attach a
+	// swap manager so an installed-but-not-resident target engine is swapped in on
+	// demand. Returns nil (no swapper) only under the break-glass disable, in which
+	// case the handler is byte-for-byte the pre-#632 one.
 	if swapper := newModelSwapManager(opts.ConfigDir, opts.WorkspaceDir, opts.PinnedServices, opts.HandlerLog); swapper != nil {
 		llmHandler = llmHandler.WithSwapper(swapper)
 	}

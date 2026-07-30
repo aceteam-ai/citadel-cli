@@ -142,10 +142,16 @@ func TestServiceInfo_FlagOffOmitsResidentKey(t *testing.T) {
 	}
 }
 
-func TestModelHotswapEnabled_TruthyParsing(t *testing.T) {
+// TestModelHotswapEnabled_DefaultOnDisableParsing verifies hotswap is ON by
+// default (unset, empty, or any non-falsey value) and only an explicit falsey
+// CITADEL_MODEL_HOTSWAP acts as the break-glass disable. A garbage value ("nope")
+// stays ON so a typo can't silently kill the feature.
+func TestModelHotswapEnabled_DefaultOnDisableParsing(t *testing.T) {
 	cases := map[string]bool{
-		"1": true, "true": true, "YES": true, "on": true, "On": true,
-		"": false, "0": false, "false": false, "no": false, "off": false, "nope": false,
+		// default ON: unset/empty, truthy tokens, and unknown/garbage values.
+		"": true, "1": true, "true": true, "YES": true, "on": true, "On": true, "nope": true,
+		// break-glass disable: explicit falsey tokens only.
+		"0": false, "false": false, "no": false, "off": false, "OFF": false,
 	}
 	for v, want := range cases {
 		t.Setenv("CITADEL_MODEL_HOTSWAP", v)

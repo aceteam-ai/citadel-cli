@@ -10,28 +10,27 @@ import (
 )
 
 // hotswap.go — installed-vs-resident model advertising for VRAM-aware on-demand
-// model hotswap (citadel-cli#632, Phase 1 PILOT).
+// model hotswap (citadel-cli#632).
 //
-// Everything here is gated behind CITADEL_MODEL_HOTSWAP (default OFF). When the
-// flag is off, ModelHotswapEnabled() returns false and the collector never calls
-// applyModelHotswap, so the heartbeat output is byte-identical to today's.
+// Hotswap is ON by default. CITADEL_MODEL_HOTSWAP is retained ONLY as a
+// break-glass disable: set it to a falsey value (0/false/no/off) to turn the
+// swap path off on a node that misbehaves. When disabled, ModelHotswapEnabled()
+// returns false and the collector never calls applyModelHotswap, so the
+// heartbeat output is byte-identical to the pre-hotswap node.
 
 // ModelHotswapEnabled reports whether VRAM-aware on-demand model hotswap is
-// enabled on this node via the CITADEL_MODEL_HOTSWAP env var (truthy:
-// 1/true/yes/on). Default OFF — the pilot is enabled per-node (node 1297). Kept
-// in the leaf status package so both the collector and the worker's swap path can
-// read the same gate without an import cycle.
+// active on this node. Default ON; only an explicit falsey CITADEL_MODEL_HOTSWAP
+// (0/false/no/off) disables it (a garbage/unknown value stays ON, so a typo
+// can't silently kill the feature). Kept in the leaf status package so both the
+// collector and the worker's swap path read the same gate without an import
+// cycle.
 func ModelHotswapEnabled() bool {
-	return isTruthyEnv(os.Getenv("CITADEL_MODEL_HOTSWAP"))
-}
-
-// isTruthyEnv reports whether an env value is one of the accepted truthy tokens.
-func isTruthyEnv(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_MODEL_HOTSWAP"))) {
+	case "0", "false", "no", "off":
+		return false // break-glass disable
+	default:
+		return true // default ON (unset or any other value)
 	}
-	return false
 }
 
 // engineModelEnvVars maps a managed serving engine to the <name>.env variable(s)
