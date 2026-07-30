@@ -1,6 +1,18 @@
 package catalog
 
-import "os/exec"
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+)
+
+// RuntimeOverrideEnv is the environment variable that forces a container
+// runtime, bypassing auto-detection. Valid values: "docker", "podman". The
+// root command's --runtime flag sets it. An unrecognized value is ignored
+// (auto-detection proceeds) and reported via ContainerRuntime.FallbackReason.
+const RuntimeOverrideEnv = "CITADEL_CONTAINER_RUNTIME"
 
 // ContainerRuntime describes the container runtime (and its compose front-end)
 // that Citadel should drive for module containers. Module containment (#348)
@@ -29,6 +41,11 @@ type ContainerRuntime struct {
 	// Informational: callers may surface it; it does not change argument
 	// construction.
 	Rootless bool
+	// FallbackReason explains why selection could not honor the preferred
+	// runtime and downgraded to another one -- e.g. podman is installed but its
+	// API socket is not listening (#636). Empty when the preferred runtime was
+	// selected outright. SelectContainerRuntime logs it once per process.
+	FallbackReason string
 }
 
 // Label returns a short human-readable description of the selected runtime for
@@ -63,6 +80,15 @@ type runtimeProbes struct {
 	// podmanComposeSubcmd reports whether `podman compose` (the built-in compose
 	// subcommand) is usable, distinct from the separate `podman-compose` binary.
 	podmanComposeSubcmd func() bool
+	// podmanSocketLive reports whether podman's Docker-compatible API socket is
+	// actually listening. This is NOT implied by podmanComposeSubcmd: `podman
+	// compose version` succeeds by delegating to an external provider (usually
+	// docker-compose) that is present on PATH, even when the socket it would
+	// connect to is dead (#636).
+	podmanSocketLive func() bool
+	// override returns a forced runtime name ("docker"/"podman"), or "" to
+	// auto-detect.
+	override func() string
 }
 
 // defaultRuntimeProbes wires the probes to the real host.
@@ -73,6 +99,8 @@ func defaultRuntimeProbes() runtimeProbes {
 			return err == nil
 		},
 		podmanComposeSubcmd: hostPodmanComposeSubcmd,
+		podmanSocketLive:    hostPodmanSocketLive,
+		override:            func() string { return os.Getenv(RuntimeOverrideEnv) },
 	}
 }
 
@@ -89,43 +117,122 @@ func hostPodmanComposeSubcmd() bool {
 	return exec.Command("podman", "compose", "version").Run() == nil
 }
 
+// hostPodmanSocketLive reports whether podman's Docker-compatible API socket is
+// listening, which is what `podman compose` needs: it delegates to an external
+// compose provider that speaks the Docker API over that socket.
+//
+// podman itself reports this, so we do not depend on systemd being the thing
+// that manages the socket:
+//
+//	podman info --format {{.Host.RemoteSocket.Exists}}
+//
+// A node with podman installed but `podman.socket` inactive answers "false" --
+// exactly the state that made every module fail with "Cannot connect to the
+// Docker daemon at unix:///run/user/1000/podman/podman.sock" (#636).
+func hostPodmanSocketLive() bool {
+	if _, err := exec.LookPath("podman"); err != nil {
+		return false
+	}
+	out, err := exec.Command("podman", "info", "--format", "{{.Host.RemoteSocket.Exists}}").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
+}
+
+// warnOnce guards the fallback warning so repeatedly-called read paths (status,
+// resmon, footprint) do not spam it.
+var warnOnce sync.Once
+
 // SelectContainerRuntime resolves the container runtime to drive module
 // containers, preferring rootless podman over docker (#348). It uses the real
-// host probes.
+// host probes, and logs once if it had to fall back from the preferred runtime.
 func SelectContainerRuntime() ContainerRuntime {
-	return selectContainerRuntime(defaultRuntimeProbes())
+	rt := selectContainerRuntime(defaultRuntimeProbes())
+	if rt.FallbackReason != "" {
+		warnOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", rt.FallbackReason)
+		})
+	}
+	return rt
 }
 
 // selectContainerRuntime is the pure core (probes injected) so the selection
 // policy is table-testable without podman/docker installed.
 //
 // Policy, in order:
-//  1. podman present + `podman compose` subcommand usable -> podman with the
-//     "compose" prefix (rootless).
-//  2. podman present + `podman-compose` binary present     -> podman-compose
-//     (rootless), empty compose prefix.
-//  3. podman present, no compose front-end                 -> docker (podman
-//     alone cannot run a compose file; fall back rather than fail).
-//  4. podman absent                                        -> docker.
+//  0. An explicit override (--runtime / CITADEL_CONTAINER_RUNTIME) wins outright.
+//  1. podman present + `podman compose` usable + podman socket live -> podman
+//     with the "compose" prefix (rootless).
+//  2. podman present + `podman-compose` binary present -> podman-compose
+//     (rootless), empty compose prefix. This wrapper drives the podman CLI
+//     directly, so it does NOT need the API socket.
+//  3. podman present, no usable compose front-end (or a compose subcommand whose
+//     socket is dead) -> docker, with FallbackReason set.
+//  4. podman absent -> docker.
 //
 // When neither runtime is present we still return docker: the existing start
 // path already surfaces a clear docker-not-found error, and returning a concrete
 // runtime keeps callers simple. Selection never fails.
 func selectContainerRuntime(p runtimeProbes) ContainerRuntime {
 	docker := ContainerRuntime{EngineBin: "docker", Bin: "docker", ComposePrefix: []string{"compose"}}
+	podmanCompose := ContainerRuntime{EngineBin: "podman", Bin: "podman", ComposePrefix: []string{"compose"}, Rootless: true}
+	// Compose runs via the podman-compose wrapper, but engine sub-commands
+	// (inspect/rm) must still go to the podman CLI itself.
+	podmanWrapper := ContainerRuntime{EngineBin: "podman", Bin: "podman-compose", ComposePrefix: nil, Rootless: true}
+
+	var invalidOverride string
+	switch strings.ToLower(strings.TrimSpace(p.override())) {
+	case "docker":
+		return docker
+	case "podman":
+		// Forced: honor the operator's choice and pick the best available
+		// front-end. If neither is usable we still return podman so the failure
+		// is loud and attributable, rather than silently running docker.
+		if !p.podmanComposeSubcmd() && p.lookPath("podman-compose") {
+			return podmanWrapper
+		}
+		return podmanCompose
+	case "":
+		// auto-detect
+	default:
+		invalidOverride = fmt.Sprintf("ignoring unrecognized %s=%q (expected \"docker\" or \"podman\"); auto-detecting instead",
+			RuntimeOverrideEnv, p.override())
+	}
+
+	withReason := func(rt ContainerRuntime, reason string) ContainerRuntime {
+		switch {
+		case invalidOverride != "" && reason != "":
+			rt.FallbackReason = invalidOverride + "; " + reason
+		case invalidOverride != "":
+			rt.FallbackReason = invalidOverride
+		default:
+			rt.FallbackReason = reason
+		}
+		return rt
+	}
 
 	if !p.lookPath("podman") {
-		return docker
+		return withReason(docker, "")
 	}
 	if p.podmanComposeSubcmd() {
-		return ContainerRuntime{EngineBin: "podman", Bin: "podman", ComposePrefix: []string{"compose"}, Rootless: true}
+		if p.podmanSocketLive() {
+			return withReason(podmanCompose, "")
+		}
+		// `podman compose` exists but its API socket is dead, so every compose
+		// call would fail against a socket nobody is listening on. The
+		// podman-compose wrapper talks to the podman CLI directly and still
+		// works, so prefer it before giving up on podman entirely.
+		if p.lookPath("podman-compose") {
+			return withReason(podmanWrapper, "")
+		}
+		return withReason(docker, "podman is preferred on this node but its API socket is not responding "+
+			"(start podman.socket, or pass --runtime=podman to force it); falling back to docker")
 	}
 	if p.lookPath("podman-compose") {
-		// Compose runs via the podman-compose wrapper, but engine sub-commands
-		// (inspect/rm) must still go to the podman CLI itself.
-		return ContainerRuntime{EngineBin: "podman", Bin: "podman-compose", ComposePrefix: nil, Rootless: true}
+		return withReason(podmanWrapper, "")
 	}
 	// podman present but no compose front-end: docker can still drive the compose
 	// file, so prefer it over failing.
-	return docker
+	return withReason(docker, "")
 }

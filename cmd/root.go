@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
@@ -97,6 +98,12 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// --runtime overrides container-runtime auto-detection (#636). Export it
+		// so the catalog selector sees it without threading a flag through the
+		// 13 call sites that resolve a runtime.
+		if containerRuntimeFlag != "" {
+			os.Setenv(catalog.RuntimeOverrideEnv, containerRuntimeFlag)
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr early,
 		// before the first Log() call.
@@ -228,6 +235,8 @@ func GetRootCmd() *cobra.Command {
 	return rootCmd
 }
 
+var containerRuntimeFlag string
+
 func init() {
 	// Here you will define your flags and configuration settings.
 	// Cobra supports persistent flags, which, if defined here,
@@ -238,6 +247,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")
+	rootCmd.PersistentFlags().StringVar(&containerRuntimeFlag, "runtime", "", "Container runtime for module containers: docker or podman (default: auto-detect)")
 	rootCmd.PersistentFlags().BoolVar(&noAutoUpdate, "no-auto-update", false, "Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)")
 	rootCmd.Flags().BoolVar(&noMouse, "no-mouse", false, "Disable control-center mouse control (keeps terminal drag-to-copy)")
 
