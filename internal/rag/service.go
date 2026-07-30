@@ -17,6 +17,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -42,6 +44,15 @@ type Service struct {
 	// arbitrary node paths. The local `citadel rag` operator (who already has
 	// shell access) opts in so pointing at a docs dir outside the workspace works.
 	allowOutsideWorkspace bool
+	// roots, when rootsMode is set, replaces the single-workspace boundary with
+	// the authorized-roots allowlist (citadel-cli#617-619): Index validates the
+	// target against jobs.ValidateWithinRoots, and Query FILTERS returned hits to
+	// those under an authorized root so a de-authorized root's stale chunks never
+	// leak. This mode powers the LOCAL `citadel search` / TUI / watcher surfaces;
+	// the mesh HTTP surface deliberately keeps the stricter workspace confinement
+	// (cmd/work.go constructs the Service with New(), not NewWithRoots()).
+	roots     []string
+	rootsMode bool
 }
 
 // New constructs a Service with the mesh-safe default (index paths confined to
@@ -64,6 +75,44 @@ func NewLocal(workspaceDir, modelOverride string) *Service {
 	s := New(workspaceDir, modelOverride)
 	s.allowOutsideWorkspace = true
 	return s
+}
+
+// NewWithRoots constructs a Service whose index/search boundary is the
+// authorized-roots allowlist rather than a single workspace (citadel-cli#617-619).
+// It powers the local `citadel search` command, the TUI Search page, and the
+// file watcher. workspaceForDB is used ONLY to locate the node-local index.db
+// (the same file a running worker's FILE_INDEX writes) — NOT for authorization;
+// authorization is the roots allowlist. Never expose this over the mesh.
+func NewWithRoots(roots []string, workspaceForDB, modelOverride string) *Service {
+	return &Service{
+		workspaceDir:          workspaceForDB,
+		dbPath:                jobs.ResolveIndexDBPath("", workspaceForDB),
+		model:                 jobs.ResolveEmbeddingModel(modelOverride),
+		allowOutsideWorkspace: true, // roots validation replaces the workspace check
+		roots:                 roots,
+		rootsMode:             true,
+	}
+}
+
+// Roots returns the authorized roots this Service enforces (nil when not in
+// roots mode).
+func (s *Service) Roots() []string { return s.roots }
+
+// NodeWorkspaceDir resolves the node's workspace directory the same way the
+// worker's resolveWorkspaceDir does (CITADEL_WORKSPACE, else
+// ~/citadel-node/workspace) WITHOUT the --workspace flag or directory creation.
+// It exists so surfaces that cannot import the cmd package (the TUI Search page)
+// can locate the SAME index.db a running worker uses. Returns "" only when the
+// home directory cannot be resolved and no env override is set.
+func NodeWorkspaceDir() string {
+	if dir := os.Getenv("CITADEL_WORKSPACE"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "citadel-node", "workspace")
 }
 
 // Model returns the effective embedding model (for provenance reporting).
@@ -99,6 +148,16 @@ type IndexResult struct {
 func (s *Service) Index(ctx context.Context, path, filePattern string) (IndexResult, error) {
 	if path == "" {
 		return IndexResult{}, fmt.Errorf("index path is required")
+	}
+	// In roots mode the authorized-roots allowlist is the boundary: reject any
+	// path that does not resolve under an authorized root, then hand the handler
+	// the validated absolute path (allowOutsideWorkspace is already true).
+	if s.rootsMode {
+		validated, err := jobs.ValidateWithinRoots(s.roots, path)
+		if err != nil {
+			return IndexResult{}, err
+		}
+		path = validated
 	}
 	h := jobs.NewFileIndexHandler(s.workspaceDir, s.dbPath)
 	h.AllowOutsideWorkspace = s.allowOutsideWorkspace
@@ -142,8 +201,15 @@ func (s *Service) Query(ctx context.Context, query string, topK int) (QueryResul
 	}
 	h := jobs.NewFileSemanticSearchHandler(s.workspaceDir, s.dbPath)
 	payload := map[string]string{"query": query, "model": s.model}
-	if topK > 0 {
-		payload["top_k"] = fmt.Sprintf("%d", topK)
+	// In roots mode we filter returned hits to authorized roots, so over-fetch to
+	// compensate for hits dropped by the filter (result count may still be < topK
+	// when many hits fall outside the roots).
+	fetchK := topK
+	if s.rootsMode && topK > 0 {
+		fetchK = topK*4 + 20
+	}
+	if fetchK > 0 {
+		payload["top_k"] = fmt.Sprintf("%d", fetchK)
 	}
 	out, err := h.Execute(jobCtx(ctx), &nexus.Job{ID: "rag-query", Type: "FILE_SEMANTIC_SEARCH", Payload: payload})
 	if err != nil {
@@ -158,12 +224,34 @@ func (s *Service) Query(ctx context.Context, query string, topK int) (QueryResul
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return QueryResult{}, fmt.Errorf("decode query result: %w", err)
 	}
+	hits := raw.Hits
+	if s.rootsMode {
+		hits = s.filterHitsToRoots(hits, topK)
+	}
 	return QueryResult{
-		Hits:       raw.Hits,
-		Count:      raw.Count,
+		Hits:       hits,
+		Count:      len(hits),
 		Model:      raw.Model,
 		Provenance: s.Provenance(),
 	}, nil
+}
+
+// filterHitsToRoots drops any hit whose path does not resolve under an
+// authorized root and trims to topK. This keeps a de-authorized root's stale
+// index chunks from leaking through search: even though they remain in the DB
+// until pruned, the roots-mode surface never returns them.
+func (s *Service) filterHitsToRoots(hits []Hit, topK int) []Hit {
+	out := make([]Hit, 0, len(hits))
+	for _, h := range hits {
+		if _, err := jobs.ValidateWithinRoots(s.roots, h.Path); err != nil {
+			continue
+		}
+		out = append(out, h)
+		if topK > 0 && len(out) >= topK {
+			break
+		}
+	}
+	return out
 }
 
 // Status reports the node-local index summary plus local provenance. It reads

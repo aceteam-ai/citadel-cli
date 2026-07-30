@@ -10,10 +10,12 @@
 //
 // Why not sqlite-vec: sqlite-vec is a C loadable extension. Release builds are
 // CGO_ENABLED=0 (see build.sh) and the SQLite driver is the cgo-free modernc
-// engine, which cannot load C extensions. A node hosts thousands, not millions,
-// of chunks, so a brute-force cosine scan is adequate for the foundation. When a
-// node's chunk count justifies it, a sqlite-vec acceleration can be added behind
-// a build tag without changing this package's API (aceteam#6087, Phase 3).
+// engine, which cannot load C extensions. Instead, hnsw.go adds a pure-Go HNSW
+// (coder/hnsw) query accelerator that builds an in-memory ANN index from these
+// same SQLite rows — keeping CGO_ENABLED=0 intact — while SQLite stays the
+// durable source of truth. Search prefers the accelerator and falls back to the
+// brute-force cosine scan when it is empty, disabled, or dimension-mismatched
+// (aceteam#6087; citadel-cli#617-619).
 package nodeindex
 
 import (
@@ -51,9 +53,16 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 `
 
-// Store is a node-local semantic index backed by SQLite.
+// Store is a node-local semantic index backed by SQLite. A pure-Go HNSW query
+// accelerator (see hnsw.go) sits in front of the brute-force cosine scan when
+// enabled; SQLite remains the durable source of truth.
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	dbPath string
+	// accel is the process-global HNSW accelerator for dbPath, or nil when the
+	// accelerator is disabled via CITADEL_INDEX_HNSW. Shared across every Store
+	// opened against the same index so a long-running process builds it once.
+	accel *accelerator
 }
 
 // Chunk is one embedded unit of a file: a slice of text and its vector.
@@ -97,7 +106,11 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db, dbPath: dbPath}
+	if !accelDisabled() {
+		s.accel = getAccelerator(dbPath)
+	}
+	return s, nil
 }
 
 // Close releases the underlying database handle.
@@ -199,9 +212,12 @@ func (s *Store) DeleteFile(path string) error {
 	return tx.Commit()
 }
 
-// Search embeds are compared by cosine similarity against every stored chunk
-// (brute force) and the topK highest-scoring hits are returned, best first. A
-// query vector with zero magnitude, or an empty index, yields no hits.
+// Search returns the topK highest-scoring chunks for the query vector, best
+// first, by cosine similarity. When the HNSW accelerator is enabled and built it
+// serves the query as an approximate-nearest-neighbor descent (with exact cosine
+// scores recomputed from the returned vectors); otherwise it falls back to the
+// brute-force cosine scan. A query vector with zero magnitude, or an empty
+// index, yields no hits.
 func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
 	if topK <= 0 {
 		topK = 10
@@ -209,6 +225,26 @@ func (s *Store) Search(query []float32, topK int) ([]SearchHit, error) {
 	qNorm := norm(query)
 	if qNorm == 0 {
 		return nil, nil
+	}
+	if s.accel != nil {
+		hits, served, err := s.accel.search(s.db, query, qNorm, topK)
+		if err != nil {
+			return nil, err
+		}
+		if served {
+			return hits, nil
+		}
+	}
+	return s.searchBrute(query, qNorm, topK)
+}
+
+// searchBrute is the brute-force cosine KNN over every stored chunk. It is the
+// fallback path (empty/unbuilt accelerator, disabled accelerator, or a
+// dimension-mismatched query) and the parity reference the accelerator is tested
+// against.
+func (s *Store) searchBrute(query []float32, qNorm float64, topK int) ([]SearchHit, error) {
+	if topK <= 0 {
+		topK = 10
 	}
 	rows, err := s.db.Query(`SELECT path, chunk_index, text, embedding FROM chunks`)
 	if err != nil {
