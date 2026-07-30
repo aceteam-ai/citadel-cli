@@ -51,6 +51,18 @@ type LLMInferenceHandler struct {
 	// httpClient issues the outbound engine requests. Defaults to
 	// http.DefaultClient; overridable in tests.
 	httpClient *http.Client
+
+	// swapper, when non-nil, enables VRAM-aware on-demand model hotswap
+	// (citadel-cli#632): before routing to the engine, an installed-but-not-
+	// resident target is swapped in. Injected ONLY when CITADEL_MODEL_HOTSWAP is
+	// on (cmd/nodejobs.go), so a nil swapper == today's behavior exactly.
+	swapper modelSwapper
+}
+
+// modelSwapper is the swap surface the handler needs. Satisfied by *SwapManager;
+// an interface so the handler is unit-testable with a mock. See swap.go.
+type modelSwapper interface {
+	EnsureResident(ctx context.Context, backend, model string) (SwapOutcome, error)
 }
 
 // NewLLMInferenceHandler constructs the llm_inference handler with the default
@@ -79,6 +91,14 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 	}
 }
 
+// WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
+// cmd/nodejobs.go ONLY when CITADEL_MODEL_HOTSWAP is on; leaving it unset keeps
+// the handler's behavior identical to before hotswap.
+func (h *LLMInferenceHandler) WithSwapper(s modelSwapper) *LLMInferenceHandler {
+	h.swapper = s
+	return h
+}
+
 // CanHandle reports whether this handler processes the given job type.
 func (h *LLMInferenceHandler) CanHandle(jobType string) bool {
 	return jobType == JobTypeLLMInference
@@ -96,6 +116,22 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	payload, err := parseLLMInferencePayload(job.Payload)
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
+
+	// Model hotswap (citadel-cli#632): when enabled (swapper injected), an
+	// installed-but-not-resident target engine is swapped in before routing. If it
+	// becomes ready within the wait budget (≤15s) we fall through and serve
+	// normally; otherwise we return a structured model_warming result (a normal
+	// success JobResult carrying no content) for the platform to relay + retry. A
+	// nil swapper (flag off) skips this block entirely — unchanged behavior.
+	if h.swapper != nil {
+		outcome, swapErr := h.swapper.EnsureResident(ctx, payload.Backend, payload.Model)
+		if swapErr != nil {
+			return h.failure(fmt.Errorf("model hotswap failed: %w", swapErr)), nil
+		}
+		if !outcome.Ready {
+			return h.warming(payload.Model, outcome.ETASeconds), nil
+		}
 	}
 
 	switch payload.Backend {
@@ -872,6 +908,27 @@ func writeSingleChunk(stream StreamWriter, content string) {
 
 func (h *LLMInferenceHandler) success(output map[string]any) *JobResult {
 	return &JobResult{Status: JobStatusSuccess, Output: output}
+}
+
+// warming returns the structured model_warming result (citadel-cli#632) for a
+// swap that did not become ready within the wait budget. It is a SUCCESS result
+// (so the runner WriteEnds + Acks it) carrying a control payload rather than
+// assistant content — deliberately no WriteChunk, so the platform relays the
+// warming signal instead of streaming it as a reply. The platform inspects
+// output.status == "model_warming" and retries after retry_after seconds.
+func (h *LLMInferenceHandler) warming(model string, etaSeconds int) *JobResult {
+	if etaSeconds < 0 {
+		etaSeconds = 0
+	}
+	return &JobResult{
+		Status: JobStatusSuccess,
+		Output: map[string]any{
+			"status":      "model_warming",
+			"model":       model,
+			"eta_seconds": etaSeconds,
+			"retry_after": warmingRetryAfter,
+		},
+	}
 }
 
 func (h *LLMInferenceHandler) failure(err error) *JobResult {

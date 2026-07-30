@@ -2026,6 +2026,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	})
 
 	_, ccConfigDir, _ := findAndReadManifest()
+	var ccPinnedServices []string
+	if m, _, err := findAndReadManifest(); err == nil {
+		ccPinnedServices = manifestPinnedServices(m)
+	}
 	nodeJobOpts := nodeJobHandlerOpts{
 		LogFn:                     activity,
 		WorkspaceDir:              wsDir,
@@ -2038,6 +2042,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		FilesDisabled:             !ccPerms.Files,
 		WorkflowExec:              ccWfExec,
 		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
+		PinnedServices:            ccPinnedServices,
 	}
 	handlers := buildNodeJobHandlers(nodeJobOpts)
 

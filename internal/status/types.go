@@ -213,6 +213,22 @@ type ServiceInfo struct {
 	// (citadel-cli#577). Omitted (false) for preemptible services — the default.
 	// The platform reads this to show pinned vs preemptible per node.
 	Pinned bool `json:"pinned,omitempty"`
+
+	// Resident reports whether an installed serving engine's model is currently
+	// loaded and serving (container up) as opposed to merely installed-and-
+	// swappable (container stopped). Populated ONLY when model hotswap is enabled
+	// (CITADEL_MODEL_HOTSWAP, citadel-cli#632); nil otherwise, so the omitempty on
+	// this *bool keeps the flag-off heartbeat byte-identical. nil = residency not
+	// tracked; true = resident; false = installed but not resident (a swap-in
+	// candidate resolve_fabric_target may route to and let the node swap in).
+	Resident *bool `json:"resident,omitempty"`
+
+	// VRAMEstimateMB is the approximate GPU memory (MB) this engine's model
+	// occupies (running) or would occupy (stopped) when resident. Populated only
+	// under model hotswap (citadel-cli#632) so the platform can reason about swap
+	// fit: the live footprint VRAM for a running engine, else a coarse per-engine
+	// estimate. Omitted (0) when unknown or hotswap off.
+	VRAMEstimateMB int `json:"vram_estimate_mb,omitempty"`
 }
 
 // HealthResponse is the response for /health endpoint.

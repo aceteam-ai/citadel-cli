@@ -33,6 +33,7 @@ type Collector struct {
 	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
 	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
 	pinnedServices map[string]bool        // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
+	modelHotswap   bool                   // advertise installed-vs-resident models (citadel #632)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -57,6 +58,12 @@ type CollectorConfig struct {
 	// running service whose name is listed is marked ServiceInfo.Pinned=true so
 	// the heartbeat and `citadel services` show pinned vs preemptible. Optional.
 	PinnedServices []string
+	// ModelHotswap enables installed-vs-resident model advertising in the
+	// heartbeat (citadel #632): running engines are marked resident and installed-
+	// but-stopped engines are additively advertised as swap-in candidates. Off by
+	// default; wired from CITADEL_MODEL_HOTSWAP. Requires ConfigDir to enumerate
+	// installed engines. When false the heartbeat output is unchanged.
+	ModelHotswap bool
 }
 
 // NewCollector creates a new status collector.
@@ -73,6 +80,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		fpIdleTracker:  NewFootprintIdleTracker(),
 		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
 		pinnedServices: toStringSet(cfg.PinnedServices),
+		modelHotswap:   cfg.ModelHotswap,
 	}
 }
 
@@ -165,6 +173,16 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// holding GPU/RAM is now visible instead of a bare "running" with no
 	// footprint. One stats call + one nvidia-smi pair for the whole set.
 	c.attachFootprints(status)
+
+	// Model hotswap (#632, default OFF): mark running engines resident and
+	// additively advertise installed-but-stopped engines as swap-in candidates.
+	// Runs after footprints so a resident engine's VRAM estimate can use its live
+	// footprint. `reported` still holds the names already in status.Services, so a
+	// running engine is never duplicated by the installed-engine pass. Flag-off:
+	// never called, heartbeat unchanged.
+	if c.modelHotswap {
+		c.applyModelHotswap(status, reported)
+	}
 
 	// Include cached capabilities if available. Copy the cached struct rather
 	// than aliasing it, so populating the per-heartbeat capability flags below
