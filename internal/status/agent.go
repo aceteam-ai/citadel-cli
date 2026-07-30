@@ -2,6 +2,7 @@ package status
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 )
@@ -52,6 +53,34 @@ type AgentProviders struct {
 
 	// WorkerRestart restarts the worker run loop in place. Returns a result.
 	WorkerRestart func() (any, error)
+
+	// Expose programs the in-process gateway to serve a local port under
+	// /expose/<name>/ with the given visibility, returning the managed URL (and,
+	// for visibility=link, a signed token). It lives here because the gateway
+	// runs in THIS process: an out-of-process caller (the CLI, the aceteam MCP)
+	// cannot reach it any other way (#598).
+	Expose func(ExposeSpec) (any, error)
+}
+
+// ExposeSpec is the /agent/expose request body. It mirrors the EXPOSE_SET job
+// payload so the CLI and the MCP verb drive the same contract.
+type ExposeSpec struct {
+	// Name is the exposed-service slug (the <name> in /expose/<name>/).
+	Name string `json:"name"`
+	// Port is the service's loopback host port (e.g. 8212 for the nvr module's
+	// Frigate UI).
+	Port int `json:"port"`
+	// Visibility is "private", "org", or "link".
+	Visibility string `json:"visibility"`
+	// TTLSeconds bounds a `link` token's lifetime; ignored for private/org.
+	TTLSeconds int `json:"ttl_seconds"`
+	// Creator is the tailnet login authorized for a `private` exposure. Only a
+	// remote caller (the backend/MCP) knows this; a local CLI leaves it empty,
+	// which makes a private exposure fail closed at the gateway.
+	Creator string `json:"creator"`
+	// Epoch, when >0, is bound into a `link` token so all outstanding tokens can
+	// be revoked by bumping it.
+	Epoch int `json:"epoch"`
 }
 
 // LogQuery describes a log tail/grep request.
@@ -116,6 +145,33 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		}
 		return p.WorkerRestart()
 	})))
+	mux.HandleFunc("/agent/expose", s.requireVPNOrAuth(s.handleAgentExpose))
+}
+
+// handleAgentExpose programs an exposure on the in-process gateway. POST only,
+// with an ExposeSpec body. Same auth posture as the other control endpoints
+// (VPN origin or a valid org token), so a local operator drives it via the
+// node's own mesh IP and the backend drives it over the mesh.
+func (s *Server) handleAgentExpose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.agent == nil || s.agent.Expose == nil {
+		writeAgentError(w, errUnavailable)
+		return
+	}
+	var spec ExposeSpec
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&spec); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	res, err := s.agent.Expose(spec)
+	if err != nil {
+		writeAgentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // errUnavailable is returned by providers that are not wired in this process.
