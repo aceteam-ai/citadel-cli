@@ -83,6 +83,12 @@ func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string,
 		// bonsai (PrismML Bonsai-27B) is served by the llama.cpp fork, so it
 		// exposes the identical OpenAI-compatible /v1/models endpoint.
 		return m.discoverOpenAIModels(ctx, "bonsai", port)
+	case "unlimited-ocr":
+		// Baidu Unlimited-OCR is served by vLLM, exposing the identical
+		// OpenAI-compatible /v1/models endpoint. Without this case the heartbeat
+		// never surfaces the model (the engine is dropped from
+		// collectManagedEngineStatus), so the gateway/fabric can't route to it.
+		return m.discoverOpenAIModels(ctx, "Unlimited-OCR", port)
 	case "ollama":
 		return m.discoverOllamaModels(ctx, port)
 	default:
@@ -179,8 +185,9 @@ func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]
 // CheckServiceHealth performs a health check on an LLM service.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
 	switch serviceType {
-	case "vllm", "llamacpp", "bonsai":
-		// vLLM, llama.cpp, and the bonsai llama.cpp fork all expose GET /health.
+	case "vllm", "llamacpp", "bonsai", "unlimited-ocr":
+		// vLLM, llama.cpp, the bonsai fork, and the vLLM-served Unlimited-OCR all
+		// expose GET /health.
 		return m.checkHTTPHealth(ctx, port)
 	case "ollama":
 		return m.checkOllamaHealth(ctx, port)
