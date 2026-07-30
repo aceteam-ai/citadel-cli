@@ -66,6 +66,10 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 			"vllm":     fmt.Sprintf("http://localhost:%d", services.VLLMHostPort),
 			"llamacpp": fmt.Sprintf("http://localhost:%d", services.LlamacppHostPort),
 			"bonsai":   fmt.Sprintf("http://localhost:%d", services.BonsaiHostPort),
+			// unlimited-ocr (Baidu Unlimited-OCR) is served by vLLM on its own
+			// registry host port; route inference there (multimodal image content
+			// is carried by executeChatCompletionsAt via #625).
+			"unlimited-ocr": fmt.Sprintf("http://localhost:%d", services.UnlimitedOCRHostPort),
 			// sglang/ollama sit on their native, well-known host ports (not part of
 			// the collision-managed 8200 block — see services/ports.go).
 			"sglang": "http://localhost:30000",
@@ -107,6 +111,10 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 		// Bonsai serves the identical llama.cpp-server API on its own host port
 		// (PrismML fork). Reuse the llama.cpp request/stream path pointed at it.
 		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("bonsai"))
+	case "unlimited-ocr":
+		// Baidu Unlimited-OCR is a vLLM OpenAI engine on its own host port; use the
+		// chat-completions path so multimodal image_url content (#625) reaches it.
+		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("unlimited-ocr"))
 	default:
 		return h.failure(fmt.Errorf("unsupported backend: %s", payload.Backend)), nil
 	}
