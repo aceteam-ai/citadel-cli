@@ -72,10 +72,28 @@ func run() error {
 		}
 	}
 
+	// MQTT is on by default: the module ships a node-local broker, and Frigate
+	// has no other real-time event egress (#637). NVR_MQTT=false opts out.
+	mqttEnabled := strings.ToLower(strings.TrimSpace(getenvDefault("NVR_MQTT", "true"))) != "false"
+	mqttPort := nvr.DefaultMQTTPort
+	if raw := strings.TrimSpace(os.Getenv("NVR_MQTT_PORT")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			mqttPort = v
+		}
+	}
+
 	cfg := nvr.Config{
 		RetentionDays: retention,
 		Detector:      detector,
 		Storage:       nvr.StorageSpec{Mode: mode, Target: os.Getenv("NVR_STORAGE_TARGET")},
+		MQTT: nvr.MQTTSpec{
+			Enabled:     mqttEnabled,
+			Host:        getenvDefault("NVR_MQTT_HOST", "mosquitto"),
+			Port:        mqttPort,
+			User:        os.Getenv("NVR_MQTT_USER"),
+			Password:    os.Getenv("NVR_MQTT_PASSWORD"),
+			TopicPrefix: getenvDefault("NVR_MQTT_TOPIC_PREFIX", nvr.DefaultMQTTTopicPrefix),
+		},
 	}
 	yamlOut, err := nvr.GenerateFrigateConfig(cfg, cameras)
 	if err != nil {

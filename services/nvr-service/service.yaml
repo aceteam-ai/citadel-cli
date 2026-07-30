@@ -92,6 +92,25 @@ config:
       uses this target to mount/retarget. NOTE: /config (Frigate's SQLite DB)
       ALWAYS stays on local disk regardless of this value — SQLite corrupts over
       NFS; only /media follows the target.
+  - name: NVR_MQTT
+    description: >-
+      Run the node-local MQTT broker and point Frigate at it (default true).
+      Frigate 0.17 has NO generic outbound webhook -- its schema offers only
+      mqtt, web-push notifications, and alerts -- so MQTT is the only real-time
+      event egress; the alternative is polling /api/events. The broker publishes
+      no host port and is reachable only on the module's compose network. Set to
+      false to skip event egress entirely.
+    default: "true"
+  - name: NVR_MQTT_USER
+    description: "Username for the node-local MQTT broker."
+    default: frigate
+  - name: NVR_MQTT_PASSWORD
+    description: >-
+      Password for the node-local MQTT broker (SECRET; never logged). REQUIRED:
+      mosquitto permits anonymous connections by default, and wyze-bridge runs
+      host-networked in this module, so an unauthenticated broker must never be
+      started.
+    required: true
   - name: NVR_CAMERAS
     description: >-
       Comma-separated camera stream names (e.g. "front-door,garage=garage-cam";

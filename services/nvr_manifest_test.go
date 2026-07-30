@@ -2,6 +2,8 @@ package services
 
 import (
 	_ "embed"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -206,4 +208,75 @@ func TestNVRComposeInvariants(t *testing.T) {
 	if !ok || dep.Condition != "service_completed_successfully" {
 		t.Errorf("frigate must depend_on nvr-config with condition service_completed_successfully; got %+v", frigate.DependsOn)
 	}
+}
+
+// TestNVRComposeShmSize pins the /dev/shm cap. Frigate passes RAW DECODED frames
+// through /dev/shm (a 1080p YUV420 frame is ~3MB, buffered ~9 deep per camera),
+// so it scales with cameras x resolution, not with the compressed bitrate. At
+// 256mb with 3x1080p, Frigate warned it needed >=306MB and measured steady-state
+// use was 322MB (#637); undersizing causes frame-write failures and
+// capture-process restart loops.
+func TestNVRComposeShmSize(t *testing.T) {
+	body := readNVRCompose(t)
+	if strings.Contains(body, "shm_size: 256mb") {
+		t.Error("shm_size is back to 256mb, which is too small for 3x1080p cameras (#637)")
+	}
+	if !strings.Contains(body, "shm_size: 512mb") {
+		t.Error("expected frigate shm_size: 512mb")
+	}
+}
+
+// TestNVRMosquittoIsNotReachableOffTheComposeNetwork is the security-critical
+// property of the node-local broker: it must publish NO host port. Binding
+// 127.0.0.1 would NOT be equivalent, because wyze-bridge runs host-networked in
+// this module, which would make any bound port LAN-reachable.
+func TestNVRMosquittoIsNotReachableOffTheComposeNetwork(t *testing.T) {
+	var compose struct {
+		Services map[string]struct {
+			Ports       []any  `yaml:"ports"`
+			NetworkMode string `yaml:"network_mode"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(readNVRCompose(t)), &compose); err != nil {
+		t.Fatalf("parse compose: %v", err)
+	}
+	mosq, ok := compose.Services["mosquitto"]
+	if !ok {
+		t.Fatal("mosquitto service missing from the nvr module compose")
+	}
+	if len(mosq.Ports) != 0 {
+		t.Errorf("mosquitto must publish no host port, got %v", mosq.Ports)
+	}
+	if mosq.NetworkMode == "host" {
+		t.Error("mosquitto must not use host networking")
+	}
+}
+
+// TestNVRMosquittoRequiresCredentials pins that the broker never starts
+// anonymously: mosquitto permits anonymous connections BY DEFAULT, so the
+// config must disable that and the password must be a required input.
+func TestNVRMosquittoRequiresCredentials(t *testing.T) {
+	body := readNVRCompose(t)
+	if !strings.Contains(body, "allow_anonymous false") {
+		t.Error("mosquitto config must set allow_anonymous false")
+	}
+	// `:?` makes compose fail loudly when the password is unset, rather than
+	// starting a broker with an empty credential.
+	if !strings.Contains(body, "NVR_MQTT_PASSWORD:?") {
+		t.Error("NVR_MQTT_PASSWORD must be a required compose variable")
+	}
+	// mosquitto drops privileges; without this it cannot read its own pwfile.
+	if !strings.Contains(body, "chown -R mosquitto:mosquitto") {
+		t.Error("the generated password file must be chowned to the mosquitto user")
+	}
+}
+
+// readNVRCompose returns the nvr module compose file body.
+func readNVRCompose(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("nvr-service", "compose.yml"))
+	if err != nil {
+		t.Fatalf("read nvr compose: %v", err)
+	}
+	return string(b)
 }

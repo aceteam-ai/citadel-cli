@@ -64,6 +64,11 @@ const (
 const (
 	OpenVINOModelPath    = "/openvino-model/ssdlite_mobilenet_v2.xml"
 	OpenVINOLabelmapPath = "/openvino-model/coco_91cl_bkgr.txt"
+
+	// DefaultMQTTPort is the broker's in-network port. Not published to the host.
+	DefaultMQTTPort = 1883
+	// DefaultMQTTTopicPrefix matches Frigate's own default topic namespace.
+	DefaultMQTTTopicPrefix = "frigate"
 )
 
 // wyzeBridgeRTSPHost is the address Frigate uses to pull camera RTSP streams from
@@ -107,6 +112,36 @@ type Config struct {
 	RetentionDays int
 	Detector      Detector
 	Storage       StorageSpec
+	// MQTT configures Frigate's event egress. Frigate 0.17 has NO generic
+	// outbound webhook (its config schema offers only mqtt, web-push
+	// notifications, and alerts), so MQTT is the only real-time event channel;
+	// the alternative is polling /api/events. The module ships a node-local
+	// broker for this (#637).
+	MQTT MQTTSpec
+}
+
+// MQTTSpec points Frigate at the module's broker. The broker is node-local and
+// publishes NO host port: it is reachable only on the module's compose network.
+// Binding it to 127.0.0.1 would NOT be sufficient, because wyze-bridge runs with
+// host networking in this module, which would make a bound port LAN-reachable.
+type MQTTSpec struct {
+	// Enabled turns on Frigate's MQTT client. When false the generated config
+	// keeps the explicit `enabled: false` Frigate requires to treat MQTT as
+	// optional.
+	Enabled bool
+	// Host is the broker hostname on the compose network (the compose service
+	// name), not an IP or a host port.
+	Host string
+	// Port is the broker's in-network port (1883 by default).
+	Port int
+	// User and Password authenticate to the broker. Mosquitto allows anonymous
+	// connections by default, so the module always sets credentials rather than
+	// relying on network isolation alone.
+	User     string
+	Password string
+	// TopicPrefix namespaces this node's topics so a future multi-node consumer
+	// can tell publishers apart. Defaults to "frigate".
+	TopicPrefix string
 }
 
 // ---- Frigate config.yml shape (only the fields we set) ----
@@ -172,6 +207,36 @@ type detectToggle struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// mqttBlock renders the frigate `mqtt:` section. Disabled is the zero value, so
+// a caller that never sets MQTTSpec keeps the previous behavior.
+func mqttBlock(m MQTTSpec) map[string]any {
+	if !m.Enabled {
+		return map[string]any{"enabled": false}
+	}
+	port := m.Port
+	if port == 0 {
+		port = DefaultMQTTPort
+	}
+	prefix := m.TopicPrefix
+	if prefix == "" {
+		prefix = DefaultMQTTTopicPrefix
+	}
+	block := map[string]any{
+		"enabled":      true,
+		"host":         m.Host,
+		"port":         port,
+		"topic_prefix": prefix,
+	}
+	// Only emit credentials when set: Frigate rejects empty user/password keys.
+	if m.User != "" {
+		block["user"] = m.User
+	}
+	if m.Password != "" {
+		block["password"] = m.Password
+	}
+	return block
+}
+
 // GenerateFrigateConfig renders a Frigate 0.17 config.yml from the assignment
 // config and the runtime-discovered camera list. It bakes in every scar from the
 // live SJC build:
@@ -191,9 +256,9 @@ func GenerateFrigateConfig(cfg Config, cameras []Camera) (string, error) {
 	}
 
 	fc := frigateConfig{
-		// The reference build has no MQTT broker; Frigate makes MQTT optional only
-		// when explicitly disabled.
-		MQTT: map[string]any{"enabled": false},
+		// Frigate treats MQTT as optional only when explicitly disabled, so this
+		// key is always emitted.
+		MQTT: mqttBlock(cfg.MQTT),
 		FFmpeg: ffmpegSpec{
 			HwaccelArgs: "preset-vaapi",
 		},
