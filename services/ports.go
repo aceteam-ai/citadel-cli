@@ -82,6 +82,12 @@ const (
 	// The registry KEY is the module name "nvr" while the env var is spelled for the
 	// container it maps to (frigate) — the same key/env split as meeting.
 	EnvFrigateHostPort = "CITADEL_FRIGATE_HOST_PORT"
+	// EnvUnlimitedOCRHostPort carries the host port for the unlimited-ocr service
+	// (Baidu Unlimited-OCR served by vLLM). Like vllm/bonsai it is an embedded
+	// ServiceMap compose whose container serves the OpenAI API on :8000; this env
+	// var supplies the HOST publish so `${CITADEL_UNLIMITED_OCR_HOST_PORT}`
+	// resolves at `docker compose up`.
+	EnvUnlimitedOCRHostPort = "CITADEL_UNLIMITED_OCR_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -158,6 +164,12 @@ const (
 	// compose lives in citadel-services (like meeting/gotenberg), so this registry
 	// is the only thing stopping a future module from hardcoding over 8212.
 	FrigateHostPort = 8212
+	// unlimited-ocr: Baidu Unlimited-OCR (a 3B vision-language OCR model) served by
+	// an OpenAI-compatible vLLM server (services/compose/unlimited-ocr.yml). Next
+	// free slot in the 8200 block after frigate's 8212 (8205 stays earmarked for
+	// Hermes/OpenClaw). It is an embedded ServiceMap compose, so its container
+	// serves on :8000 and this is the HOST publish.
+	UnlimitedOCRHostPort = 8213
 )
 
 // WyzeBridgeRTSPPort is docker-wyze-bridge's RTSP server port in the nvr module
@@ -177,34 +189,36 @@ const WyzeBridgeRTSPPort = 8554
 // unions this with the apps catalog and the parsed compose files to prove no two
 // host ports clash.
 var ServiceHostPorts = map[string]int{
-	"llamacpp":    LlamacppHostPort,
-	"vllm":        VLLMHostPort,
-	"extraction":  ExtractionHostPort,
-	"diffusers":   DiffusersHostPort,
-	"claudecode":  ClaudecodeHostPort,
-	"storage":     StorageHostPort,
-	"meeting":     MeetingdHostPort,
-	"meeting-cdp": MeetingCDPHostPort,
-	"gotenberg":   GotenbergHostPort,
-	"bonsai":      BonsaiHostPort,
-	"kokoro":      TTSHostPort,
-	"nvr":         FrigateHostPort,
+	"llamacpp":      LlamacppHostPort,
+	"vllm":          VLLMHostPort,
+	"extraction":    ExtractionHostPort,
+	"diffusers":     DiffusersHostPort,
+	"claudecode":    ClaudecodeHostPort,
+	"storage":       StorageHostPort,
+	"meeting":       MeetingdHostPort,
+	"meeting-cdp":   MeetingCDPHostPort,
+	"gotenberg":     GotenbergHostPort,
+	"bonsai":        BonsaiHostPort,
+	"kokoro":        TTSHostPort,
+	"nvr":           FrigateHostPort,
+	"unlimited-ocr": UnlimitedOCRHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
 // carries its host port.
 var serviceHostPortEnv = map[string]string{
-	"llamacpp":    EnvLlamacppHostPort,
-	"vllm":        EnvVLLMHostPort,
-	"extraction":  EnvExtractionHostPort,
-	"diffusers":   EnvDiffusersHostPort,
-	"claudecode":  EnvClaudecodeHostPort,
-	"meeting":     EnvMeetingdHostPort,
-	"meeting-cdp": EnvMeetingCDPHostPort,
-	"gotenberg":   EnvGotenbergHostPort,
-	"bonsai":      EnvBonsaiHostPort,
-	"kokoro":      EnvTTSHostPort,
-	"nvr":         EnvFrigateHostPort,
+	"llamacpp":      EnvLlamacppHostPort,
+	"vllm":          EnvVLLMHostPort,
+	"extraction":    EnvExtractionHostPort,
+	"diffusers":     EnvDiffusersHostPort,
+	"claudecode":    EnvClaudecodeHostPort,
+	"meeting":       EnvMeetingdHostPort,
+	"meeting-cdp":   EnvMeetingCDPHostPort,
+	"gotenberg":     EnvGotenbergHostPort,
+	"bonsai":        EnvBonsaiHostPort,
+	"kokoro":        EnvTTSHostPort,
+	"nvr":           EnvFrigateHostPort,
+	"unlimited-ocr": EnvUnlimitedOCRHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,

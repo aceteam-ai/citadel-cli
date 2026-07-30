@@ -109,13 +109,14 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 
 	// Map each ${VAR} spelling to its registry value.
 	envValue := map[string]int{
-		services.EnvLlamacppHostPort:   services.LlamacppHostPort,
-		services.EnvVLLMHostPort:       services.VLLMHostPort,
-		services.EnvExtractionHostPort: services.ExtractionHostPort,
-		services.EnvDiffusersHostPort:  services.DiffusersHostPort,
-		services.EnvClaudecodeHostPort: services.ClaudecodeHostPort,
-		services.EnvBonsaiHostPort:     services.BonsaiHostPort,
-		services.EnvTTSHostPort:        services.TTSHostPort,
+		services.EnvLlamacppHostPort:     services.LlamacppHostPort,
+		services.EnvVLLMHostPort:         services.VLLMHostPort,
+		services.EnvExtractionHostPort:   services.ExtractionHostPort,
+		services.EnvDiffusersHostPort:    services.DiffusersHostPort,
+		services.EnvClaudecodeHostPort:   services.ClaudecodeHostPort,
+		services.EnvBonsaiHostPort:       services.BonsaiHostPort,
+		services.EnvTTSHostPort:          services.TTSHostPort,
+		services.EnvUnlimitedOCRHostPort: services.UnlimitedOCRHostPort,
 	}
 
 	var out []int

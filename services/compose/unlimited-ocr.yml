@@ -1,0 +1,71 @@
+# services/compose/unlimited-ocr.yml
+#
+# Serves Baidu's Unlimited-OCR (a 3B vision-language OCR/document-parsing model,
+# https://huggingface.co/baidu/Unlimited-OCR, MIT) via an OpenAI-compatible
+# vLLM server. It exposes /v1/chat/completions with base64 `image_url` input and
+# returns document text (with optional structure/bbox markers), so it routes
+# through the SAME OpenAI surface as every other citadel engine.
+#
+# UNLIKE the generic vllm.yml (which pulls stock vllm/vllm-openai:latest), this
+# service uses Baidu's PURPOSE-BUILT image tag `vllm/vllm-openai:unlimited-ocr`.
+# The model is `trust_remote_code` (custom modeling code + a no-repeat n-gram
+# logits processor that ships INSIDE this image as
+# vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor), so stock
+# vLLM cannot serve it and there is no GGUF (llama.cpp/bonsai path is out). The
+# `cu130` default tag runs on Ampere (RTX 3090, SM86); the `-cu129` variant is
+# only for Hopper.
+#
+# The model resolves from the mounted HF cache on first start (like vllm.yml /
+# extraction.yml) — the WHOLE repo is needed (safetensors + the custom
+# modeling_unlimitedocr.py / deepencoder.py / conversation.py), so there is
+# deliberately NO single-file MODEL_CACHE_PULL branch for this engine.
+
+services:
+  unlimited-ocr:
+    image: vllm/vllm-openai:unlimited-ocr
+    container_name: citadel-unlimited-ocr
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_UNLIMITED_OCR_HOST_PORT; the :? guard fails loudly if citadel forgot
+    # to supply it. Left on the default 0.0.0.0 bind because peers reach this
+    # engine directly over the mesh. The container serves the OpenAI API on :8000.
+    ports:
+      - "${CITADEL_UNLIMITED_OCR_HOST_PORT:?citadel must supply CITADEL_UNLIMITED_OCR_HOST_PORT}:8000"
+    volumes:
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+    # The served model is interpolated from OCR_MODEL so a SERVICE_START job
+    # carrying a "model" payload could swap it (#530); the :- default keeps a
+    # standalone `docker compose up` working unchanged. --served-model-name pins
+    # the OpenAI id clients pass as "model".
+    #
+    # The four OCR-specific flags mirror Baidu's published vLLM recipe verbatim
+    # and are MANDATORY:
+    #   --trust-remote-code                loads the custom modeling code
+    #   --logits_processors ...            the no-repeat n-gram sampler the model needs
+    #   --no-enable-prefix-caching         the recipe disables it for this model
+    #   --mm-processor-cache-gb 0          the recipe disables the mm cache
+    #
+    # VRAM tuning (mirrors the bonsai #567 / vllm.yml lesson): the model's full
+    # 32768 context is unnecessary for page OCR, so --max-model-len defaults to
+    # 16384 and --gpu-memory-utilization to 0.60 (~14.5GB cap of a 24GB card),
+    # leaving the 3.3GB model + vision encoder + KV comfortable headroom. Override
+    # via OCR_MAX_MODEL_LEN / OCR_GPU_UTIL. --enforce-eager skips CUDA-graph
+    # capture (lower VRAM, faster cold start), matching vllm.yml.
+    command: >-
+      --host 0.0.0.0
+      --port 8000
+      --model ${OCR_MODEL:-baidu/Unlimited-OCR}
+      --served-model-name ${OCR_SERVED_NAME:-baidu/Unlimited-OCR}
+      --trust-remote-code
+      --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
+      --no-enable-prefix-caching
+      --mm-processor-cache-gb 0
+      --max-model-len ${OCR_MAX_MODEL_LEN:-16384}
+      --gpu-memory-utilization ${OCR_GPU_UTIL:-0.60}
+      --enforce-eager
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
