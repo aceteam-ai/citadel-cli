@@ -1,6 +1,11 @@
 // Package jobs contains job type definitions and handlers for the Redis queue system.
 package jobs
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 // Job types that citadel can handle
 const (
 	// JobTypeLLMInference handles local LLM completion requests
@@ -80,9 +85,53 @@ type LLMInferencePayload struct {
 }
 
 // ChatMessage represents a message in chat-style APIs.
+//
+// Content is stored as raw JSON because the OpenAI chat schema allows it to be
+// EITHER a plain string (the common case) OR the multimodal "content parts"
+// array — e.g. `[{"type":"text",...},{"type":"image_url","image_url":{"url":
+// "data:image/png;base64,..."}}]` — which a vision/OCR model like
+// baidu/Unlimited-OCR needs (#625). Keeping it raw lets the node forward either
+// shape verbatim to an OpenAI-compatible engine without lossy re-encoding; use
+// Text() when a plain-text view is required.
 type ChatMessage struct {
-	Role    string `json:"role"` // "system", "user", "assistant"
-	Content string `json:"content"`
+	Role    string          `json:"role"` // "system", "user", "assistant"
+	Content json.RawMessage `json:"content,omitempty"`
+}
+
+// Text returns the message content as plain text. Content may be a JSON string
+// (returned as-is) or the OpenAI multimodal array (its "text" parts are
+// concatenated; non-text parts such as image_url are ignored). Empty or
+// unparseable content yields "".
+func (m ChatMessage) Text() string {
+	if len(m.Content) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(m.Content, &parts); err == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// ContentJSON returns the raw content for forwarding verbatim to an
+// OpenAI-compatible engine, preserving multimodal parts. Empty content becomes
+// an empty JSON string so the outgoing request is always valid.
+func (m ChatMessage) ContentJSON() json.RawMessage {
+	if len(m.Content) == 0 {
+		return json.RawMessage(`""`)
+	}
+	return m.Content
 }
 
 // LLMInferenceResult represents the result of an llm_inference job.

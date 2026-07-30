@@ -377,9 +377,13 @@ func (h *LLMInferenceHandler) bufferedOllama(stream StreamWriter, body io.Reader
 // served model's chat template. Used whenever an llm_inference job carries
 // `messages` (the shape the OpenAI gateway and MCP inference_chat dispatch).
 func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
+	// Ollama's /api/chat takes text content (images ride a separate `images`
+	// field we do not populate), so flatten any multimodal content to its text
+	// parts. OCR/vision fabric models run on vLLM (executeChatCompletionsAt), not
+	// this path.
 	messages := make([]map[string]string, 0, len(payload.Messages))
 	for _, m := range payload.Messages {
-		messages = append(messages, map[string]string{"role": m.Role, "content": m.Content})
+		messages = append(messages, map[string]string{"role": m.Role, "content": m.Text()})
 	}
 
 	reqPayload := map[string]any{
@@ -619,9 +623,13 @@ func (h *LLMInferenceHandler) bufferedLlamaCpp(stream StreamWriter, body io.Read
 // like Bonsai. Used whenever an llm_inference job carries `messages` (the shape
 // the OpenAI inference gateway dispatches).
 func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, baseURL string) (*JobResult, error) {
-	messages := make([]map[string]string, 0, len(payload.Messages))
+	// Forward content verbatim (map[string]any, not map[string]string) so the
+	// OpenAI multimodal "content parts" array — e.g. an image_url for a vision/OCR
+	// model like baidu/Unlimited-OCR (#625) — reaches the engine intact. A plain
+	// string content marshals back to a string unchanged.
+	messages := make([]map[string]any, 0, len(payload.Messages))
 	for _, m := range payload.Messages {
-		messages = append(messages, map[string]string{"role": m.Role, "content": m.Content})
+		messages = append(messages, map[string]any{"role": m.Role, "content": m.ContentJSON()})
 	}
 
 	reqPayload := map[string]any{
