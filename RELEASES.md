@@ -1394,3 +1394,20 @@ Auto-generated log of every release.
   - docs(claude): require an isolated worktree + open a PR after pushing (#622)
 
 
+---
+
+## v2.94.0 — 2026-07-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 14 |
+| Lines added | +552 |
+
+**Changes:**
+
+  - fix(worker): carry multimodal message content to the engine (#625) (#630)
+  - feat(services): add Baidu Unlimited-OCR as an on-node document-OCR engine (#623)
+  - chore: relicense to Elastic License 2.0 (#629)
+
+
