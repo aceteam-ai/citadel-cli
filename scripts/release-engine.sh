@@ -64,7 +64,15 @@ write_state() {
   local key=$1 value=$2
   ensure_state_dir
   if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$STATE_FILE"
+    # Rewrite through a temp file rather than `sed -i`. In-place sed is NOT
+    # portable: GNU takes `-i` with no argument, BSD/macOS requires a backup
+    # suffix and otherwise swallows the script as the suffix -- which made every
+    # release from a Mac die at the first state write with
+    # "sed: 1: ...: invalid command code j". Nothing here needs sed anyway.
+    local tmp="${STATE_FILE}.tmp.$$"
+    grep -v "^${key}=" "$STATE_FILE" > "$tmp" || true
+    echo "${key}=${value}" >> "$tmp"
+    mv "$tmp" "$STATE_FILE"
   else
     echo "${key}=${value}" >> "$STATE_FILE"
   fi
