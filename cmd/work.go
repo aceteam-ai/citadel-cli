@@ -1897,6 +1897,9 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			gw.SetExposeSigningKey(key)
 		}
+		// Re-wire exposures persisted by a previous run BEFORE the gateway serves,
+		// so there is no window in which a valid exposure 404s (#647).
+		restoreExposures(gw)
 
 		// Register upstreams (same routes as cmd/serve.go)
 		gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})
