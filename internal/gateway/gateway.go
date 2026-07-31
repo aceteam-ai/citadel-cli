@@ -100,6 +100,24 @@ type Upstream struct {
 	// WebSocket indicates this upstream handles WebSocket connections.
 	WebSocket bool
 
+	// IngressPath, when non-empty, is sent to the upstream as the X-Ingress-Path
+	// request header: the external prefix this app is served under.
+	//
+	// This is the Home Assistant "ingress" convention, and it is what makes a
+	// subpath-mounted web app work behind StripPrefix. Frigate (and every other
+	// HA-ingress-aware app) emits ABSOLUTE asset paths by default --
+	// `src="/assets/main.js"` -- which a browser resolves at the gateway ROOT,
+	// missing the /expose/<name> prefix entirely, so every asset 404s. Given the
+	// header, such an app rewrites its own emitted paths to
+	// `src="/expose/<name>/assets/main.js"` and the page loads.
+	//
+	// Verified against frigate:stable, whose nginx sub_filter rewrites on
+	// $http_x_ingress_path:
+	//
+	//	without header: src="/assets/main-CosNs8ey.js"
+	//	with header:    src="/expose/frigate/assets/main-CosNs8ey.js"
+	IngressPath string
+
 	// mu guards dynAddr for upstreams whose target is set after registration.
 	mu sync.RWMutex
 	// dynAddr, when non-empty, overrides Address. It is set via
@@ -570,6 +588,15 @@ func (s *Server) registerProxy(prefix string, upstream *Upstream) {
 			}
 			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
 			req.Header.Set("X-Forwarded-Proto", "https")
+			// Set for subpath-mounted upstreams, DELETED otherwise: the value is
+			// a trusted statement about how the gateway mounted this route, so a
+			// client must never be able to supply its own and steer an upstream's
+			// generated URLs.
+			if upstream.IngressPath != "" {
+				req.Header.Set("X-Ingress-Path", upstream.IngressPath)
+			} else {
+				req.Header.Del("X-Ingress-Path")
+			}
 			if s.config.NodeName != "" {
 				req.Header.Set("X-Citadel-Node", s.config.NodeName)
 			}

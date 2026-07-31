@@ -228,13 +228,15 @@ func (s *Server) Expose(name, address string, policy *ExposePolicy) error {
 	// web app (Frigate live view, dashboards) upgrades to WS; registerProxy routes
 	// plain HTTP and WS upgrades through the same handler.
 	//
-	// NOTE (subpath constraint): because the route is served under /expose/<name>/
-	// with StripPrefix, an exposed app that emits ABSOLUTE asset paths (<script
-	// src="/assets/...">) will have the browser resolve them at the gateway root
-	// (no /expose/<name> prefix) and 404 — for EVERY visibility level, this is not
-	// an auth issue. Such an app must be configured to serve under a base path
-	// matching the expose prefix (e.g. Frigate's base-path config, handled by the
-	// #597 nvr module). Apps that use relative paths work unchanged.
+	// NOTE (subpath): the route is served under /expose/<name>/ with StripPrefix,
+	// so an app that emits ABSOLUTE asset paths (<script src="/assets/...">) would
+	// have the browser resolve them at the gateway root and 404 — for EVERY
+	// visibility level; not an auth issue. wireExposeRoute therefore sends the
+	// external prefix as X-Ingress-Path (the Home Assistant ingress convention),
+	// which makes HA-ingress-aware apps (Frigate among them) rewrite their own
+	// emitted paths to include it. No app-side configuration is required. Apps
+	// that use relative paths work unchanged; an app that is neither
+	// ingress-aware nor relative still needs its own base-path setting.
 	s.wireExposeRoute(ExposeRoutePath(name), address)
 	s.SetExposure(name, policy)
 	return nil
@@ -249,7 +251,10 @@ func (s *Server) wireExposeRoute(prefix, address string) {
 	s.mu.Lock()
 	up, ok := s.config.Upstreams[prefix]
 	if !ok {
-		up = &Upstream{StripPrefix: true, WebSocket: true}
+		// IngressPath = the external prefix. Without it a subpath-mounted app's
+		// absolute asset URLs resolve at the gateway root and 404 (see
+		// Upstream.IngressPath).
+		up = &Upstream{StripPrefix: true, WebSocket: true, IngressPath: prefix}
 		up.setAddr(address)
 		s.config.Upstreams[prefix] = up
 		if s.started {

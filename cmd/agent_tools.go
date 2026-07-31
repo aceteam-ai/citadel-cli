@@ -75,6 +75,18 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 		WorkerRestart: func() (any, error) {
 			return agentWorkerRestart()
 		},
+		Expose: func(spec status.ExposeSpec) (any, error) {
+			// Delegates to the same live adapter the EXPOSE_SET job uses, so the
+			// CLI/MCP path and the job path cannot drift.
+			return liveExposeOps{}.Expose(ctx, worker.ExposeRequest{
+				Name:       spec.Name,
+				Port:       spec.Port,
+				Visibility: spec.Visibility,
+				TTLSeconds: spec.TTLSeconds,
+				Creator:    spec.Creator,
+				Epoch:      spec.Epoch,
+			})
+		},
 	}
 }
 

@@ -1951,7 +1951,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// reachable mesh URL and verifies against the real cert (landmines a + b).
 		// StatusPort is persisted too so a separate process can build the plaintext
 		// cert_refresh_url (http://<ip>:<status-port>/gateway-cert.pem).
-		if err := writeGatewayFacts(gatewayFacts{Port: workGatewayPort, UseTLS: !workGatewayNoTLS, CertPath: gwCertPath, StatusPort: workStatusPort}); err != nil {
+		if err := writeGatewayFacts(gatewayFacts{Port: workGatewayPort, UseTLS: !workGatewayNoTLS, CertPath: gwCertPath, StatusPort: workStatusPort, MeshIP: meshIPv4()}); err != nil {
 			Log("could not persist gateway facts (out-of-process URL falls back to defaults): %v", err)
 		}
 		// Watch the registry so a module provisioned via the CLI while this gateway

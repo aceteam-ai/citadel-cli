@@ -63,6 +63,12 @@ type gatewayFacts struct {
 	UseTLS     bool   `json:"use_tls"`
 	CertPath   string `json:"cert_path"`
 	StatusPort int    `json:"status_port,omitempty"`
+	// MeshIP is the node's AceTeam Network IPv4 that the gateway and status
+	// server bind. Persisted because an out-of-process CLI cannot ask the live
+	// tsnet for it: the network state is held by the running `citadel work`
+	// process, so meshIPv4() returns "" everywhere else. Without this a local
+	// command cannot address its own node's control surface (#598).
+	MeshIP string `json:"mesh_ip,omitempty"`
 }
 
 // provisionedStateDirOverride, when non-empty, replaces network.GetStateDir() as
