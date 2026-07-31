@@ -106,11 +106,17 @@ config:
     default: frigate
   - name: NVR_MQTT_PASSWORD
     description: >-
-      Password for the node-local MQTT broker (SECRET; never logged). REQUIRED:
-      mosquitto permits anonymous connections by default, and wyze-bridge runs
-      host-networked in this module, so an unauthenticated broker must never be
-      started.
+      Password for the node-local MQTT broker (SECRET; never logged). GENERATED
+      per node: this credential is used only BETWEEN this module's own containers
+      (frigate -> mosquitto, both on the module's private compose network), so no
+      operator ever needs to know or type it, and a shared default would ship the
+      same password to every node. Required as well as generated, so the compose
+      `:?` guard still fails closed -- mosquitto permits anonymous connections by
+      default and wyze-bridge runs host-networked here, so an unauthenticated
+      broker must never start. Set explicitly only to point Frigate at an
+      external broker.
     required: true
+    generate: secret
   - name: NVR_CAMERAS
     description: >-
       Comma-separated camera stream names (e.g. "front-door,garage=garage-cam";

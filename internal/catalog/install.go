@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -203,8 +205,12 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 	}
 
 	// 5. Resolve config values (prompt for required ones without defaults only
-	//    when interactive).
-	configValues, err := resolveConfig(manifest.Config, configOverrides, interactive)
+	//    when interactive). Any already-persisted values are passed in so a
+	//    `generate:` secret is minted ONCE and then reused: reconciles, module
+	//    updates and re-runs must not rotate a credential the module's running
+	//    containers were started with.
+	envDest := filepath.Join(servicesDir, name+".env")
+	configValues, err := resolveConfig(manifest.Config, configOverrides, readEnvFile(envDest), interactive)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +269,6 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 
 	// 7. Write .env file if there are config values.
 	if len(configValues) > 0 {
-		envDest := filepath.Join(servicesDir, name+".env")
 		if err := writeEnvFile(envDest, configValues); err != nil {
 			return nil, fmt.Errorf("failed to write env file: %w", err)
 		}
@@ -277,12 +282,33 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 // prompts the user (os.Stdin) for any required config vars that have no default
 // and no override. When interactive is false, such a var is a returned error and
 // stdin is never read (the TUI path collects all config up front as overrides).
-func resolveConfig(configVars []ConfigVar, overrides map[string]string, interactive bool) (map[string]string, error) {
+//
+// existing holds the values already persisted in the module's .env (nil on a
+// first install). It is consulted ONLY for `generate:` vars, so that a minted
+// secret survives reconciles/updates; every other var still resolves purely from
+// the override/default/prompt chain, keeping the operator's input authoritative.
+func resolveConfig(configVars []ConfigVar, overrides, existing map[string]string, interactive bool) (map[string]string, error) {
 	values := make(map[string]string)
 
 	for _, cv := range configVars {
 		// Check override first.
 		if v, ok := overrides[cv.Name]; ok {
+			values[cv.Name] = v
+			continue
+		}
+
+		// A generated var mints its own value rather than failing or prompting --
+		// but only after reusing what a previous install already persisted, so the
+		// credential a running container holds is never rotated underneath it.
+		if cv.Generate != "" {
+			if v := existing[cv.Name]; v != "" {
+				values[cv.Name] = v
+				continue
+			}
+			v, err := generateConfigValue(cv.Generate)
+			if err != nil {
+				return nil, fmt.Errorf("config '%s': %w", cv.Name, err)
+			}
 			values[cv.Name] = v
 			continue
 		}
@@ -321,6 +347,49 @@ func resolveConfig(configVars []ConfigVar, overrides map[string]string, interact
 	}
 
 	return values, nil
+}
+
+// generateConfigValue mints a value for a ConfigVar declaring `generate:`.
+// An unknown kind is an error, not a silent empty string: a typo in a manifest
+// must not hand a module a blank credential.
+func generateConfigValue(kind string) (string, error) {
+	switch kind {
+	case GenerateSecret:
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("generate secret: %w", err)
+		}
+		// URL-safe, unpadded: the value is interpolated into compose env and
+		// shell-quoted entrypoints, so it must contain no '=', quote or shell
+		// metacharacter.
+		return base64.RawURLEncoding.EncodeToString(buf), nil
+	default:
+		return "", fmt.Errorf("unknown generate kind %q (only %q is supported)", kind, GenerateSecret)
+	}
+}
+
+// readEnvFile parses a previously written module .env into a map. A missing or
+// unreadable file yields an empty map -- callers use it to REUSE prior values,
+// so "nothing persisted yet" and "cannot read it" both correctly mean "mint a
+// fresh one" rather than failing the install.
+func readEnvFile(path string) map[string]string {
+	values := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return values
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		values[strings.TrimSpace(k)] = v
+	}
+	return values
 }
 
 // copyFile copies src to dst, preserving content but using 0600 permissions.
