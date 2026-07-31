@@ -236,7 +236,27 @@ type ConfigVar struct {
 	Description string `yaml:"description"`
 	Default     string `yaml:"default"`
 	Required    bool   `yaml:"required"`
+	// Generate names a value the NODE mints for itself when the operator supplies
+	// none, instead of failing or prompting. The only kind is "secret": a random
+	// 256-bit URL-safe token.
+	//
+	// This exists for credentials that exist purely BETWEEN a module's own
+	// containers -- a broker password, an internal API key -- which nobody
+	// outside the node ever needs to know or type. Without it such a var has no
+	// good option: `required: true` hard-fails the non-interactive assignment and
+	// update paths (a fabric MODULE_SET carries no value for it), while a static
+	// `default:` would ship the same well-known credential to every node.
+	//
+	// A generated value is STICKY: install reuses whatever is already in the
+	// module's .env, so reconciles and updates do not rotate a secret out from
+	// under a running container. Combine with `required: true` -- generation
+	// satisfies the requirement, and the requirement keeps a mis-typed
+	// `generate:` from silently yielding an empty credential.
+	Generate string `yaml:"generate"`
 }
+
+// GenerateSecret is the ConfigVar.Generate kind that mints a random token.
+const GenerateSecret = "secret"
 
 // HealthCheck describes how to probe the service for readiness.
 type HealthCheck struct {

@@ -271,6 +271,42 @@ func TestNVRMosquittoRequiresCredentials(t *testing.T) {
 	}
 }
 
+// TestNVRMqttPasswordIsNodeGenerated pins that the broker credential the module
+// requires is one the NODE mints for itself. It is purely internal (frigate ->
+// mosquitto on the module's private network), so nothing upstream has a value to
+// send: a fabric MODULE_SET assignment and `citadel module update` both resolve
+// config non-interactively, and a required-but-ungenerated var makes BOTH paths
+// hard-fail — the module becomes undeployable. A static default is equally wrong
+// (same password on every node), which is why this asserts `generate:` and not
+// merely "has some value".
+func TestNVRMqttPasswordIsNodeGenerated(t *testing.T) {
+	var m catalog.ServiceManifest
+	if err := yaml.Unmarshal(nvrServiceYAML, &m); err != nil {
+		t.Fatalf("parse nvr service.yaml: %v", err)
+	}
+
+	var found bool
+	for _, cv := range m.Config {
+		if cv.Name != "NVR_MQTT_PASSWORD" {
+			continue
+		}
+		found = true
+		if cv.Generate != catalog.GenerateSecret {
+			t.Errorf("NVR_MQTT_PASSWORD generate = %q, want %q — otherwise assignment and update fail with "+
+				"'required config has no value'", cv.Generate, catalog.GenerateSecret)
+		}
+		if !cv.Required {
+			t.Error("NVR_MQTT_PASSWORD must stay required so the compose `:?` guard keeps failing closed")
+		}
+		if cv.Default != "" {
+			t.Errorf("NVR_MQTT_PASSWORD must have no default (%q) — a shared default ships one password to every node", cv.Default)
+		}
+	}
+	if !found {
+		t.Fatal("NVR_MQTT_PASSWORD missing from the nvr manifest config")
+	}
+}
+
 // readNVRCompose returns the nvr module compose file body.
 func readNVRCompose(t *testing.T) string {
 	t.Helper()
