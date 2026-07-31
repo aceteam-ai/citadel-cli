@@ -12,6 +12,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -49,6 +50,22 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		return nil, err
 	}
 
+	// Persist so the exposure survives a worker restart (#647). Every caller --
+	// the CLI, the MCP verb, the EXPOSE_SET job -- funnels through here, so this
+	// is the one place the durable set can be kept in step with the live one. A
+	// write failure is logged, not returned: the exposure IS live and the caller
+	// already has its URL, so failing the call would be a lie; the honest failure
+	// mode is "works now, gone after a restart", and it must be visible.
+	if err := config.SaveExposure(platform.ConfigDir(), config.ExposureRecord{
+		Name:       req.Name,
+		Port:       req.Port,
+		Visibility: req.Visibility,
+		Creator:    req.Creator,
+		TokenEpoch: req.Epoch,
+	}); err != nil {
+		Log("warning: exposure %q is live but was not persisted (it will not survive a restart): %v", req.Name, err)
+	}
+
 	res := &worker.ExposeResult{URL: exposeMeshURL(req.Name)}
 
 	if policy.Visibility == gateway.VisibilityLink {
@@ -65,6 +82,63 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		res.ExpiresAt = exp.UTC().Format(time.RFC3339)
 	}
 	return res, nil
+}
+
+// restoreExposures re-wires the persisted exposure set onto a gateway that has
+// not started serving yet (#647). It MUST be called before Start: restoring
+// after the listener is up leaves a window in which a valid exposure 404s, which
+// is exactly the symptom this fixes.
+//
+// Every failure here is non-fatal and logged. A node whose exposure store is
+// unreadable must still come up serving its builtin routes; refusing to start
+// would turn a lost side-feature into an outage.
+func restoreExposures(gw *gateway.Server) {
+	recs, err := config.LoadExposures(platform.ConfigDir())
+	if err != nil {
+		Log("warning: could not restore gateway exposures: %v", err)
+		return
+	}
+	if len(recs) == 0 {
+		return
+	}
+
+	restored := 0
+	for _, r := range recs {
+		policy := &gateway.ExposePolicy{
+			Visibility: gateway.Visibility(r.Visibility),
+			Creator:    r.Creator,
+			TokenEpoch: r.TokenEpoch,
+		}
+		addr := fmt.Sprintf("127.0.0.1:%d", r.Port)
+		if err := gw.Expose(r.Name, addr, policy); err != nil {
+			// A record the gateway rejects (unknown visibility, bad name) is data
+			// we cannot honor -- skip it loudly rather than dropping the whole set.
+			Log("warning: skipping persisted exposure %q: %v", r.Name, err)
+			continue
+		}
+		// The upstream may be gone after a reboot (module removed, port changed).
+		// Say so now: otherwise the route restores fine and every request 502s
+		// with nothing explaining why.
+		if !localPortListening(r.Port) {
+			Log("warning: exposure %q restored but nothing is listening on 127.0.0.1:%d yet", r.Name, r.Port)
+		}
+		restored++
+	}
+	if restored > 0 {
+		Log("Restored %d gateway exposure(s)", restored)
+	}
+}
+
+// localPortListening reports whether something accepts TCP on the loopback port.
+// Short timeout: this runs once per exposure on the startup path, and a slow or
+// filtered probe must never delay the gateway coming up.
+func localPortListening(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // exposeMeshURL builds the mesh URL an exposed service is reachable at:

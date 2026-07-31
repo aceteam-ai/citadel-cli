@@ -212,6 +212,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	} else {
 		gw.SetExposeSigningKey(key)
 	}
+	// Re-wire exposures persisted by a previous run BEFORE the gateway serves,
+	// so there is no window in which a valid exposure 404s (#647).
+	restoreExposures(gw)
 
 	// Register upstreams — status server endpoints
 	// These route to the status server started by 'citadel work --status-port'
