@@ -47,28 +47,47 @@ func ValidatePath(workspace, requestedPath string) (string, error) {
 		// This ensures that the non-existing suffix is still lexically clean.
 	}
 
-	// Boundary-safe prefix check: use filepath.Rel to avoid /workspace matching
-	// /workspaceEVIL. Rel returns a path starting with ".." if the target is
-	// outside the workspace.
-	rel, err := filepath.Rel(resolvedWorkspace, resolved)
-	if err != nil {
-		return "", fmt.Errorf("path %q is outside workspace: %w", requestedPath, err)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	// The real boundary: the fully symlink-resolved target must sit inside the
+	// symlink-resolved workspace. Both sides are in RESOLVED space, so this is the
+	// check that actually catches a symlink escape.
+	if !withinDir(resolvedWorkspace, resolved) {
 		return "", fmt.Errorf("path %q resolves outside workspace", requestedPath)
 	}
 
-	// Also verify the full (possibly non-existent) target lexically.
-	cleanTarget := filepath.Clean(target)
-	relTarget, err := filepath.Rel(resolvedWorkspace, cleanTarget)
-	if err != nil {
-		return "", fmt.Errorf("path %q is outside workspace: %w", requestedPath, err)
-	}
-	if relTarget == ".." || strings.HasPrefix(relTarget, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path %q resolves outside workspace", requestedPath)
-	}
+	// There used to be a SECOND, lexical check here comparing cleanTarget against
+	// resolvedWorkspace. It was removed because it was both WRONG and redundant:
+	//
+	//   Wrong: cleanTarget lives in UNRESOLVED space (built from the caller's
+	//   workspace argument, or given absolute by the caller) while
+	//   resolvedWorkspace has been through EvalSymlinks. Comparing the two
+	//   rejected a workspace's own contents whenever the workspace sat behind a
+	//   symlink. macOS puts /tmp and /var behind /private, so every temp-dir
+	//   workspace failed with "resolves outside workspace" -- which broke
+	//   `go test ./...` and therefore blocked cutting any release from a Mac. It
+	//   equally breaks a node whose authorized root is reached via a symlink.
+	//
+	//   Redundant: its stated job was catching ".." in a not-yet-existing leaf,
+	//   but resolveNearestAncestor rebuilds the full path INCLUDING that tail, and
+	//   filepath.Rel (inside withinDir) Cleans both operands -- so "ws/../../etc"
+	//   collapses to "/etc" and the check above already rejects it. Covered by
+	//   TestValidatePathRejectsDotDotInNonExistentTail.
+	//
+	// The returned value stays in the caller's spelling: cleanTarget and resolved
+	// denote the same file, and callers pass this straight back to os.* which
+	// follows symlinks anyway.
+	return filepath.Clean(target), nil
+}
 
-	return cleanTarget, nil
+// withinDir reports whether target is dir itself or lexically beneath it. It
+// uses filepath.Rel rather than a string prefix so /workspace does not match
+// /workspaceEVIL, and treats an un-relatable pair (different volumes on Windows)
+// as outside -- failing closed.
+func withinDir(dir, target string) bool {
+	rel, err := filepath.Rel(dir, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // ValidateWithinRoots generalizes the single-root ValidatePath boundary to an
