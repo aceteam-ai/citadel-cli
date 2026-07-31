@@ -349,6 +349,46 @@ func resolveConfig(configVars []ConfigVar, overrides, existing map[string]string
 	return values, nil
 }
 
+// CarryGeneratedConfig returns assigned augmented with any `generate:` values
+// already persisted in the module's .env, for callers that TEAR DOWN a module
+// before re-installing it.
+//
+// The fabric MODULE_SET update-in-place path uninstalls before it installs, and
+// uninstall deletes <name>.env -- so by the time InstallFromManifest reads the
+// persisted values they are gone, and the node would mint a NEW secret on every
+// re-assignment. That is not merely churn: compose recreates only the containers
+// whose env changed (the broker), leaving the consumer running with the OLD
+// credential in memory until someone restarts it by hand.
+//
+// Call this BEFORE the teardown. Values the caller already supplies win, so an
+// operator can still rotate a credential by assigning one explicitly.
+func CarryGeneratedConfig(manifest *ServiceManifest, servicesDir string, assigned map[string]string) map[string]string {
+	if manifest == nil {
+		return assigned
+	}
+	persisted := readEnvFile(filepath.Join(servicesDir, manifest.Name+".env"))
+	if len(persisted) == 0 {
+		return assigned
+	}
+
+	merged := make(map[string]string, len(assigned)+len(manifest.Config))
+	for k, v := range assigned {
+		merged[k] = v
+	}
+	for _, cv := range manifest.Config {
+		if cv.Generate == "" {
+			continue
+		}
+		if _, ok := merged[cv.Name]; ok {
+			continue
+		}
+		if v := persisted[cv.Name]; v != "" {
+			merged[cv.Name] = v
+		}
+	}
+	return merged
+}
+
 // generateConfigValue mints a value for a ConfigVar declaring `generate:`.
 // An unknown kind is an error, not a silent empty string: a typo in a manifest
 // must not hand a module a blank credential.

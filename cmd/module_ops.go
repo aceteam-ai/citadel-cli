@@ -151,16 +151,25 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 	// Residual (interim, acceptable): if this Uninstall succeeds but the
 	// InstallFromManifest below then fails, the module is left down until the
 	// job retries and reinstalls it.
+	// Node-generated secrets must survive the teardown below: Uninstall deletes
+	// <name>.env, so without carrying them forward here the re-install would mint
+	// a NEW value on every re-assignment -- and compose would then recreate only
+	// the container whose env changed, leaving its consumer running with the old
+	// credential in memory. Read BEFORE the uninstall; anything the assignment
+	// supplies still wins, so an explicit rotation is still possible.
+	installConfig := m.Config
 	if hasService(nodeManifest, manifest.Name) {
+		installConfig = catalog.CarryGeneratedConfig(manifest, servicesDir, m.Config)
 		o.log("MODULE_SET: %q already installed; updating in place", manifest.Name)
 		if err := o.Uninstall(ctx, manifest.Name); err != nil {
 			return fmt.Errorf("update %q: uninstall existing: %w", manifest.Name, err)
 		}
 	}
 
-	// Non-interactive install: m.Config supplies the overrides; a missing REQUIRED
-	// config var is a returned error (never a stdin prompt on a headless node).
-	result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, m.Config, false, allowPrivileged, untrusted, false)
+	// Non-interactive install: installConfig supplies the overrides; a missing
+	// REQUIRED config var is a returned error (never a stdin prompt on a headless
+	// node).
+	result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, installConfig, false, allowPrivileged, untrusted, false)
 	if err != nil {
 		return fmt.Errorf("install %q: %w", manifest.Name, err)
 	}
