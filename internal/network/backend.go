@@ -40,6 +40,11 @@ type Backend interface {
 	Close() error
 
 	// Status reports the current backend state, self node, and peers.
+	//
+	// Implementations should keep this cheap: waitForConnection polls it
+	// twice a second and treats any error as "not ready yet", so a Status
+	// that fails persistently costs the full 60s timeout and surfaces as
+	// "timeout waiting for network connection" rather than the real cause.
 	Status(ctx context.Context) (*ipnstate.Status, error)
 
 	// TailscaleIPs returns the node's assigned mesh addresses. Either may

@@ -76,6 +76,45 @@ var (
 	_ Backend = (*userspaceBackend)(nil)
 )
 
+// The authkey is the one field a status/reconnect check can never exercise:
+// both VerifyOrReconnect and EnsureConnected call Connect(ctx, ""), so a node
+// that reconnects from saved state goes green whether or not the key is
+// plumbed through. Drop it and only `citadel login`, `citadel init --authkey`
+// and ReconnectWithAuthKey break — silently. Pin the construction instead.
+func TestUserspaceBackendCarriesConfig(t *testing.T) {
+	b := newUserspaceBackend(ServerConfig{
+		Hostname:   "node-1",
+		ControlURL: "https://nexus.example",
+	}, "/tmp/citadel-state", "hskey-abc")
+
+	if got := b.srv.AuthKey; got != "hskey-abc" {
+		t.Errorf("AuthKey = %q, want hskey-abc", got)
+	}
+	if got := b.srv.Dir; got != "/tmp/citadel-state" {
+		t.Errorf("Dir = %q, want /tmp/citadel-state", got)
+	}
+	if got := b.srv.Hostname; got != "node-1" {
+		t.Errorf("Hostname = %q, want node-1", got)
+	}
+	if got := b.srv.ControlURL; got != "https://nexus.example" {
+		t.Errorf("ControlURL = %q, want https://nexus.example", got)
+	}
+	// Citadel nodes are persistent: an ephemeral node is removed from the
+	// coordination server on disconnect and comes back with a new identity.
+	if b.srv.Ephemeral {
+		t.Error("Ephemeral = true, want false")
+	}
+}
+
+// Interactive login passes no authkey and relies on the device auth flow.
+// An empty string must stay empty rather than becoming a sentinel.
+func TestUserspaceBackendEmptyAuthKey(t *testing.T) {
+	b := newUserspaceBackend(ServerConfig{Hostname: "node-1"}, "/tmp/citadel-state", "")
+	if b.srv.AuthKey != "" {
+		t.Errorf("AuthKey = %q, want empty", b.srv.AuthKey)
+	}
+}
+
 func serverWith(b Backend) *NetworkServer {
 	return &NetworkServer{backend: b, connected: true, controlURL: "https://nexus.example"}
 }
