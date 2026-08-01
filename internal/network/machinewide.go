@@ -98,3 +98,47 @@ func ConnectMachineWide(ctx context.Context, config ServerConfig, elevated bool)
 func MachineWideRunning() bool {
 	return localAPIReachable(LocalAPISocketPath(GetStateDir()))
 }
+
+// PreflightResult describes whether this machine can run machine-wide mode.
+type PreflightResult struct {
+	Elevated  bool   `json:"elevated"`
+	DeviceOK  bool   `json:"device_ok"`
+	Device    string `json:"device,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	AlreadyUp bool   `json:"already_up"`
+}
+
+// PreflightMachineWide answers "can this box do machine-wide mode?" without
+// changing any system state that outlives the call.
+//
+// It creates the network interface and immediately closes it again. It does
+// NOT start the engine, install routes, or touch DNS — so it is safe to run
+// on a machine already carrying other VPN software, and safe to kill (there
+// is nothing to leave behind).
+//
+// This exists because the failure that actually bites users is per-platform
+// and happens at exactly this step: a missing wintun.dll on Windows, no
+// /dev/net/tun on a container host, a Linux binary without CAP_NET_ADMIN.
+// Reporting that precisely beats a wall of engine output.
+func PreflightMachineWide(elevated bool) PreflightResult {
+	res := PreflightResult{
+		Elevated:  elevated,
+		AlreadyUp: MachineWideRunning(),
+	}
+	if !elevated {
+		res.Detail = ElevationHint()
+		return res
+	}
+
+	name := DefaultTUNName()
+	dev, devName, err := tstunNew(name)
+	if err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	dev.Close()
+
+	res.DeviceOK = true
+	res.Device = devName
+	return res
+}

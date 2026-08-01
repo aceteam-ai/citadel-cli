@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
@@ -117,9 +118,8 @@ func (b *tunBackend) Up(ctx context.Context) error {
 	// skips it routes itself in a circle the moment a route overlaps.
 	netns.SetEnabled(true)
 
-	dev, devName, err := tstun.New(logf, b.tunName)
+	dev, devName, err := tstunNew(b.tunName)
 	if err != nil {
-		tstun.Diagnose(logf, b.tunName, err)
 		return fmt.Errorf("create %s: %w", b.tunName, err)
 	}
 	b.devClose = func() { dev.Close() }
@@ -202,23 +202,15 @@ func (b *tunBackend) Up(ctx context.Context) error {
 		return fmt.Errorf("local api: %w", err)
 	}
 
-	// WantRunning drives the backend to Running; CorpDNS is MagicDNS, which
-	// is the whole point of machine-wide mode (`peer.internal` resolving in
-	// any program, not just citadel). RouteAll accepts subnet routes peers
+	// WantRunning drives the backend to Running. CorpDNS is MagicDNS, which is
+	// much of the point of machine-wide mode (`peer.internal` resolving in any
+	// program, not just citadel). RouteAll accepts subnet routes peers
 	// advertise.
-	wantTrue := true
-	prefs := ipn.NewPrefs()
-	prefs.ControlURL = b.cfg.ControlURL
-	prefs.WantRunning = true
-	prefs.CorpDNS = true
-	prefs.RouteAll = true
-	prefs.Hostname = b.cfg.Hostname
-
 	if err := lb.Start(ipn.Options{
 		AuthKey: b.authKey,
 		UpdatePrefs: &ipn.Prefs{
 			ControlURL:  b.cfg.ControlURL,
-			WantRunning: wantTrue,
+			WantRunning: true,
 			CorpDNS:     true,
 			RouteAll:    true,
 			Hostname:    b.cfg.Hostname,
@@ -377,6 +369,19 @@ func CleanUpSystemState() {
 	name := DefaultTUNName()
 	dns.CleanUp(l, netMon, nil, nil, name)
 	router.CleanUp(l, netMon, name)
+}
+
+// tstunNew creates the OS network interface, annotating the failure with
+// tstun's own platform diagnosis (which explains, for example, a missing
+// wintun.dll or an absent /dev/net/tun far better than the bare errno).
+func tstunNew(name string) (tun.Device, string, error) {
+	l := logger.Logf(func(format string, args ...any) { logf(format, args...) })
+	dev, devName, err := tstun.New(l, name)
+	if err != nil {
+		tstun.Diagnose(l, name, err)
+		return nil, "", err
+	}
+	return dev, devName, nil
 }
 
 func firstV4V6(addrs []netip.Addr) (v4, v6 netip.Addr) {

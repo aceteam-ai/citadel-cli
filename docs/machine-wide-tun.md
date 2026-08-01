@@ -126,6 +126,51 @@ because `100.64/10` is routable by the kernel. `ListenVPN` — and all the
 listener-matching subtlety behind #286 — collapses to a plain `net.Listen` on
 the assigned IP. The TUN backend is likely *smaller* than the userspace one.
 
+## Windows: citadel needs its own Wintun adapter identity
+
+Verified on the Windows 11 test VM (DESKTOP-6UKHJAN), which has Tailscale
+installed and running.
+
+`tailscale.com/net/tstun`'s init pins BOTH the Wintun tunnel type and the
+adapter GUID to Tailscale's own values:
+
+```go
+// net/tstun/tun_windows.go
+tun.WintunTunnelType = "Tailscale"
+tun.WintunStaticRequestedGUID = &{37217669-42da-4657-a55b-0d995d328250}
+```
+
+Wintun identifies an adapter by GUID, so **any** process using tstun asks for
+the same adapter. The interface name passed to `tstun.New` is irrelevant.
+First run of `citadel up --check` on that box:
+
+```
+Using existing driver 0.14
+Creating adapter
+Failed to initiate stub device creation: Cannot create a file when that file
+already exists. (Code 0x800700B7)
+```
+
+`internal/network/tun_windows.go` overrides both to citadel-owned values (the
+package's init runs after tstun's, so it overrides rather than races). The GUID
+is fixed, not random, so a restart re-attaches to citadel's existing adapter
+instead of leaking a new one per run. After the fix, on the same box with
+Tailscale still up:
+
+```
+Machine-wide network readiness:
+  Administrator:   yes
+  Network device:  yes ({C17ADE10-9C5B-4B8E-9F0D-7C3A1E5D6B21})
+```
+
+The adapter was gone afterwards and Tailscale was undisturbed, still on the
+mesh at 100.64.0.110.
+
+Note this also means the `wintun.dll` embed (slice 6) is the ONLY thing left
+between citadel and machine-wide mode on Windows — the driver loaded fine from
+the binary's own directory, which is exactly where a `go:embed` extraction
+would put it.
+
 ## Two identities on one machine — decided before slice 2
 
 A running `citadel work` (tsnet) and a `citadel up` (TUN) sharing
@@ -138,7 +183,8 @@ It also reintroduces #176: `citadel up` runs elevated, so root-owned state files
 reappear under a directory the non-root worker must read. `FixStatePermissions()`
 exists precisely because of that.
 
-Three options, to settle with Jason before the TUN backend lands:
+**DECIDED (Jason, 2026-07-31): option 3 below.** Implemented — see
+`backend_attached.go` and `SelectBackend`. The three options considered:
 
 1. **Separate state dir.** `citadel up` gets its own identity and shows up as a
    second node in the coordination server. Simple, honest, but clutters the
@@ -146,7 +192,7 @@ Three options, to settle with Jason before the TUN backend lands:
 2. **Mutual exclusion.** One identity; `citadel up` refuses while a worker holds
    the tsnet, and vice versa. Clean mesh view, but a node running the worker can
    never have machine-wide routing — which is most of the fleet.
-3. **`citadel up` becomes the only backend** *(preferred)*. With a TUN up,
+3. **`citadel up` becomes the only backend** *(chosen)*. With a TUN up,
    `citadel work` does not need its own tsnet at all: it dials and listens on
    `100.x` through the OS stack. The worker attaches to the running backend
    instead of starting a second one. One identity, one node, and the worker's
@@ -156,16 +202,19 @@ Three options, to settle with Jason before the TUN backend lands:
 
 ## Slices
 
-1. **Backend interface + `userspace` implementation** — this PR. No behavior
-   change; `citadel login` must be provably identical.
-2. **`tun` backend, macOS first** — `tstun.New("utun")` + `router.New` +
-   `dns.NewOSConfigurator`, own state dir pending the decision above.
-3. **`citadel up` / `citadel down`** — elevation check that errors rather than
-   downgrading; teardown that leaves no orphaned interface or stale route on
-   crash.
-4. **MagicDNS `*.internal`** — without name resolution this is half a feature.
-5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary).
-6. **Windows** — Wintun. `golang.zx2c4.com/wintun` is pure Go but is a *loader*
+1. **Backend interface + `userspace` implementation** — DONE. No behavior
+   change; `citadel login` verified identical against the live mesh.
+2. **`tun` backend + `attached` backend** — DONE. Shares one state dir, and
+   therefore one node identity, with `citadel login`.
+3. **`citadel up` / `citadel down` / `citadel up --check`** — DONE. Elevation
+   errors rather than downgrading; `--check` creates and removes the interface
+   without starting the engine, so it is safe on a box running other VPN
+   software.
+4. **MagicDNS `*.internal`** — prefs set `CorpDNS`; needs live verification.
+5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary) — needs a live
+   bring-up on a disposable host.
+6. **Windows** — adapter identity DONE (above); the remaining piece is
+   shipping the driver. `golang.zx2c4.com/wintun` is pure Go but is a *loader*
    (`newLazyDLL("wintun.dll")`); the driver DLL is a separate wireguard.com
    artifact. Decision (Jason, 2026-07-30): embed via `go:embed` and extract on
    first run **to an Administrator-only-writable directory, never

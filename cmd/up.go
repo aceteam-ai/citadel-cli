@@ -18,6 +18,7 @@ import (
 var (
 	upAuthkey  string
 	upNodeName string
+	upCheck    bool
 )
 
 var upCmd = &cobra.Command{
@@ -43,14 +44,54 @@ the network and restores routing and DNS.`,
   # First-time join with an authkey
   sudo citadel up --authkey tskey-auth-xxx
 
+  # Check whether this machine can do it, without changing anything
+  sudo citadel up --check
+
   # Take the machine back off the network
   sudo citadel down`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if upCheck {
+			if err := runUpCheck(); err != nil {
+				badColor.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		if err := runUp(); err != nil {
 			badColor.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 	},
+}
+
+// runUpCheck reports whether machine-wide mode can work here WITHOUT leaving
+// anything behind: it creates the network interface and immediately removes
+// it, never starting the engine, installing routes, or touching DNS.
+//
+// This is the safe way to answer "will 'citadel up' work on this box?" — and
+// it is safe to run on a machine already carrying other VPN software, or to
+// kill part-way, because there is no state to strand.
+func runUpCheck() error {
+	res := network.PreflightMachineWide(platform.IsRoot())
+
+	fmt.Println("Machine-wide network readiness:")
+	if res.AlreadyUp {
+		fmt.Println("  Already running: yes ('citadel up' is active on this machine)")
+	}
+
+	if !res.Elevated {
+		badColor.Printf("  Administrator:   NO — %s\n", res.Detail)
+		return fmt.Errorf("machine-wide mode is unavailable without administrator privileges")
+	}
+	goodColor.Println("  Administrator:   yes")
+
+	if !res.DeviceOK {
+		badColor.Printf("  Network device:  FAILED — %s\n", res.Detail)
+		return fmt.Errorf("this machine cannot create the network interface machine-wide mode needs")
+	}
+	goodColor.Printf("  Network device:  yes (%s)\n", res.Device)
+	fmt.Println("\nThis machine can run 'citadel up'.")
+	return nil
 }
 
 func runUp() error {
@@ -138,4 +179,5 @@ func init() {
 	rootCmd.AddCommand(downCmd)
 	upCmd.Flags().StringVar(&upAuthkey, "authkey", "", "Pre-generated authkey for non-interactive join")
 	upCmd.Flags().StringVar(&upNodeName, "node-name", "", "Override the node name (defaults to hostname)")
+	upCmd.Flags().BoolVar(&upCheck, "check", false, "Report whether this machine can run machine-wide mode, then exit (changes nothing)")
 }
