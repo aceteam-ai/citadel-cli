@@ -16,6 +16,8 @@ import (
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/control/controlclient"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
@@ -30,6 +32,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
@@ -123,7 +126,11 @@ func (b *tunBackend) Up(ctx context.Context) error {
 		return fmt.Errorf("create %s: %w", b.tunName, err)
 	}
 	b.devClose = func() { dev.Close() }
-	sys.Set(dev)
+	// NB: do NOT sys.Set(dev) here. tsd.System.Set's type switch accepts
+	// *tstun.Wrapper, not a raw tun.Device, and its default case panics.
+	// wgengine registers the wrapped device via SetSubsystem below, which is
+	// what makes sys.Tun.Get() (and its .Start()) valid. tailscaled does the
+	// same: it only ever puts the device in wgengine.Config.
 
 	rtr, err := router.New(logf, dev, netMon, sys.HealthTracker.Get(), sys.Bus.Get())
 	if err != nil {
@@ -184,7 +191,16 @@ func (b *tunBackend) Up(ctx context.Context) error {
 
 	sys.Tun.Get().Start()
 
-	lb, err := ipnlocal.NewLocalBackend(logf, logid.PublicID{}, sys, 0)
+	// LocalBackendStartKeyOSNeutral is REQUIRED, not optional: it is what
+	// tsnet passes (tsnet.go:930). Without it NewLocalBackend derives an
+	// OS-dependent StateStore start key, so `citadel up` would open the same
+	// tailscaled.state that `citadel login` wrote, find no profile under the
+	// key it looked for, and mint a fresh machine key — appearing as a SECOND
+	// node in the coordination server. That is silent: `citadel up` succeeds
+	// and prints an IP. It is exactly the split identity this design exists
+	// to prevent. See tailscale/tailscale#6973.
+	lb, err := ipnlocal.NewLocalBackend(logf, logid.PublicID{}, sys,
+		controlclient.LocalBackendStartKeyOSNeutral)
 	if err != nil {
 		eng.Close()
 		return fmt.Errorf("local backend: %w", err)
@@ -361,13 +377,25 @@ func (b *tunBackend) Reauth(ctx context.Context, authKey string) error {
 // to call as a non-root user (it simply fails to change anything).
 func CleanUpSystemState() {
 	l := logger.Logf(func(format string, args ...any) { logf(format, args...) })
-	netMon, err := netmon.New(nil, l)
+
+	// Real subsystems, not nils: netmon.New calls bus.Client() and
+	// dns.CleanUp threads the bus into a Manager, so a nil bus panics — and
+	// this function is both the first statement of tunBackend.Up and the
+	// entire body of `citadel down`, so a panic here would take out the
+	// recovery path along with the start path.
+	bus := eventbus.New()
+	defer bus.Close()
+	health := new(health.Tracker)
+
+	netMon, err := netmon.New(bus, l)
 	if err != nil {
+		logf("tun: cleanup: network monitor: %v", err)
 		return
 	}
 	defer netMon.Close()
+
 	name := DefaultTUNName()
-	dns.CleanUp(l, netMon, nil, nil, name)
+	dns.CleanUp(l, netMon, bus, health, name)
 	router.CleanUp(l, netMon, name)
 }
 

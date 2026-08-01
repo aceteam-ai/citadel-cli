@@ -166,10 +166,17 @@ Machine-wide network readiness:
 The adapter was gone afterwards and Tailscale was undisturbed, still on the
 mesh at 100.64.0.110.
 
-Note this also means the `wintun.dll` embed (slice 6) is the ONLY thing left
-between citadel and machine-wide mode on Windows — the driver loaded fine from
-the binary's own directory, which is exactly where a `go:embed` extraction
-would put it.
+**Scope of that result — it is narrower than "citadel and Tailscale coexist".**
+`--check` creates and destroys the adapter; it installs no routes. What is
+proven is that the two no longer collide on the Wintun *adapter GUID*. Both
+products want to route `100.64.0.0/10`, and that conflict lives in the routing
+table, which this test never touched. Expect a live `citadel up` on a box
+running Tailscale to fight it for routes; treat "runs alongside Tailscale" as
+untested until someone has done a real bring-up there.
+
+One thing the test does establish for slice 6: the driver loaded fine from the
+binary's own directory, which is exactly where a `go:embed` extraction would
+put it.
 
 ## Two identities on one machine — decided before slice 2
 

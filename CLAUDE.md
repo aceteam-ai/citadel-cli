@@ -370,7 +370,9 @@ so citadel collided with an installed Tailscale (`0x800700B7`, "file already
 exists") regardless of the interface name. `internal/network/tun_windows.go`
 overrides both (its init runs after tstun's). The GUID is fixed so restarts
 re-attach instead of leaking adapters. Verified on DESKTOP-6UKHJAN with
-Tailscale running and undisturbed.
+Tailscale running and undisturbed — but note that test (`--check`) installs no
+routes, so it proves only that the **adapter** no longer collides. Both
+products want to route `100.64.0.0/10`; route-level coexistence is untested.
 
 **`citadel up --check`** creates the interface and immediately removes it
 without starting the engine, installing routes, or touching DNS. It is the safe

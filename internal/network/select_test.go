@@ -170,3 +170,36 @@ func TestLocalAPISocketPathIsInsideStateDir(t *testing.T) {
 		t.Errorf("socket path %q is not inside the state dir %q", got, dir)
 	}
 }
+
+// CleanUpSystemState is the first statement of tunBackend.Up AND the entire
+// body of `citadel down`, so a panic in it takes out both the start path and
+// the recovery path. It ran with nil subsystems until this test existed:
+// netmon.New calls bus.Client() on its argument, and dns.CleanUp threads the
+// bus into a Manager, so nils were a guaranteed nil-pointer dereference on the
+// first real `citadel up` — invisible to `citadel up --check`, which does not
+// call it.
+//
+// Unprivileged, this changes nothing on the machine: it simply must not crash.
+func TestCleanUpSystemStateDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CleanUpSystemState panicked: %v", r)
+		}
+	}()
+	CleanUpSystemState()
+}
+
+// PreflightMachineWide must report the elevation requirement rather than
+// attempting the device, and must never claim readiness it did not verify.
+func TestPreflightWithoutElevation(t *testing.T) {
+	res := PreflightMachineWide(false)
+	if res.Elevated {
+		t.Error("Elevated = true when told otherwise")
+	}
+	if res.DeviceOK {
+		t.Error("DeviceOK = true without ever having tried the device")
+	}
+	if res.Detail == "" {
+		t.Error("Detail is empty; the user needs to be told how to elevate")
+	}
+}
