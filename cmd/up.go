@@ -104,6 +104,13 @@ func runUp() error {
 		}
 	}
 
+	// Route the network layer's diagnostics through --debug. Without this the
+	// package-level logf stays a no-op, so a failed bring-up reports only
+	// "timeout waiting for network connection" with no indication of WHY —
+	// the backend-state transitions (NeedsLogin, NoState, Starting) that
+	// actually identify the problem are discarded.
+	network.SetLogf(Debug)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

@@ -254,6 +254,25 @@ func (b *tunBackend) Up(ctx context.Context) error {
 		return fmt.Errorf("start backend: %w", err)
 	}
 
+	// lb.Start alone does NOT begin registration for a node that has never
+	// joined. It only calls cc.Login when it already has a node key or a
+	// config-file WantRunning (local.go: `if !loggedOut && (b.hasNodeKeyLocked()
+	// || confWantRunning)`), so a fresh machine parks in NeedsLogin with
+	// `authRoutine: loggedIn=false; goal=nil` — the authkey is held by the
+	// control client but nothing ever asks it to log in, and Up() then fails
+	// with the generic "timeout waiting for network connection".
+	//
+	// tsnet hits the same gate and handles it the same way (tsnet.go:960).
+	// StartLoginInteractive is a misleading name here: with an authkey already
+	// on the control client it completes non-interactively and never prompts.
+	if st := lb.State(); st == ipn.NeedsLogin {
+		logf("tun: backend needs login (state=%v); starting registration", st)
+		if err := lb.StartLoginInteractive(ctx); err != nil {
+			eng.Close()
+			return fmt.Errorf("start login: %w", err)
+		}
+	}
+
 	return nil
 }
 
