@@ -279,6 +279,40 @@ Two bugs surfaced only here, both invisible to `--check`:
   discarded. The bug above was one opaque line; with logging on it took one
   run to find. Wire `SetLogf` in any new command that brings up the network.
 
+## Verified on Linux (2026-08-01, ubuntu-gpu — a LIVE fabric node)
+
+Deliberately run on a node already carrying both `citadel work` (user systemd
+`citadel.service`) and a running `tailscaled` on `tailscale0`, because that is
+the configuration most likely to break.
+
+```
+unelevated `up --check`:  refuses, exit 1 (no silent downgrade)
+elevated   `up --check`:  Network device: yes (citadel0)
+
+citadel0 UNKNOWN 100.64.0.78/32 fd7a:115c:a1e0::4e/128
+DNS Servers: 100.100.100.100        DNS Domain: internal
+
+ping 100.64.0.97 (mini)  ->  3/3, avg 112ms
+getent hosts mini.internal -> 100.64.0.17
+ping mini.internal        ->  2/2
+```
+
+**It reused the node's existing identity** — `citadel up` came up as
+100.64.0.78, the address `ubuntu-gpu` already had, and the org node count
+stayed at **12** throughout (a `tun-linuxtest` row appeared under the existing
+node, not as a new one). This is the same-state-dir/one-node design working on
+a machine that was already a fabric member.
+
+**Coexistence with tailscaled: no interference.** `tailscale0` kept its own
+address (100.64.0.182) for the whole run, and survived citadel's teardown
+untouched. The two route `100.64.0.0/10` side by side. Note this works because
+citadel's router only removes what it installed; `CleanUpSystemState` targets
+citadel's own interface name.
+
+**Teardown** on SIGINT: "routing and DNS restored", `citadel0` removed, **0**
+leftover `100.x` routes, `tailscale0` intact, and `citadel.service` still
+active — the running worker was never disturbed.
+
 ## Slices
 
 1. **Backend interface + `userspace` implementation** — DONE. No behavior
@@ -290,9 +324,8 @@ Two bugs surfaced only here, both invisible to `--check`:
    without starting the engine, so it is safe on a box running other VPN
    software.
 4. **MagicDNS `*.internal`** — DONE, verified resolving on Windows.
-5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary) — code is
-   platform-agnostic and `osrouter` covers it; needs a live bring-up on a
-   disposable host.
+5. **Linux** (`/dev/net/tun`) — DONE, verified on a live fabric node
+   alongside a running tailscaled (see above).
 6. **Windows** — adapter identity, router registration and COM init all DONE
    and verified on a clean machine; the remaining piece is shipping the driver
    (see the loader constraint above). `golang.zx2c4.com/wintun` is pure Go but is a *loader*
