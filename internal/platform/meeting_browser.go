@@ -112,6 +112,39 @@ func IsGoogleSignInURL(rawURL string) bool {
 	return strings.EqualFold(u.Hostname(), "accounts.google.com")
 }
 
+// microsoftSignInHosts are the Microsoft identity-platform hosts Teams redirects
+// to when a meeting requires an authenticated (non-guest) sign-in. login.live.com
+// covers personal Microsoft accounts; login.microsoftonline.com covers work/school
+// (Entra ID) tenants.
+var microsoftSignInHosts = []string{
+	"login.microsoftonline.com",
+	"login.live.com",
+	"login.microsoft.com",
+}
+
+// IsMicrosoftSignInURL reports whether rawURL is a Microsoft account / Entra ID
+// authentication page (login.microsoftonline.com and friends) — the signal that
+// the Teams meeting is refusing an anonymous/guest web join and is demanding an
+// authenticated Microsoft profile the bot does not (and by design should not)
+// have. The Teams join flow (issue #7000) PREFERS anonymous/guest join precisely
+// to avoid needing an MS profile; when a meeting forces sign-in the flow fails
+// loudly with an actionable error instead of stalling at a login wall. A
+// malformed URL returns false (see IsGoogleSignInURL). Host match is exact or a
+// subdomain suffix so a lookalike path cannot spoof it.
+func IsMicrosoftSignInURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, base := range microsoftSignInHosts {
+		if host == base || strings.HasSuffix(host, "."+base) {
+			return true
+		}
+	}
+	return false
+}
+
 // ChromiumAvailable reports whether a Chromium/Chrome binary is on PATH. Exported
 // so capability detection can gate the `meeting` tag on a launchable browser
 // without reaching into this package's unexported findChromium.

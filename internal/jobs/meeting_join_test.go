@@ -395,3 +395,134 @@ func TestMeetingJoin_MissingWorkspace(t *testing.T) {
 		t.Fatal("expected error when workspace is unconfigured")
 	}
 }
+
+// --- Teams URL / platform detection scaffold (issue #7000) ----------------
+// These cover the PURE, statically-verifiable deliverables: URL → platform
+// classification and Teams passcode extraction. The join flow itself needs a
+// live Teams meeting and is not unit-tested.
+
+func TestDetectMeetingPlatform(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want meetingPlatform
+	}{
+		{"meet standard", "https://meet.google.com/abc-defg-hij", platformMeet},
+		{"meet case-insensitive host", "https://MEET.GOOGLE.COM/abc", platformMeet},
+		{"teams meet link", "https://teams.microsoft.com/meet/1234567890?p=AbCdEf", platformTeams},
+		{"teams meetup-join link", "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x/0?context=%7b%7d", platformTeams},
+		{"teams live personal", "https://teams.live.com/meet/9876543210", platformTeams},
+		{"teams gov cloud", "https://gov.teams.microsoft.us/l/meetup-join/xyz", platformTeams},
+		{"teams subdomain", "https://gov.teams.microsoft.com/meet/1", platformTeams},
+		{"scheme-less teams host", "teams.microsoft.com/meet/1?p=xyz", platformTeams},
+		{"scheme-less meet host", "meet.google.com/abc", platformMeet},
+		{"zoom is unsupported", "https://zoom.us/j/123456789", platformUnknown},
+		{"lookalike meet host not spoofable", "https://meet.google.com.attacker.test/abc", platformUnknown},
+		{"lookalike teams host not spoofable", "https://teams.microsoft.com.evil.test/meet/1", platformUnknown},
+		{"path spoof does not classify", "https://example.com/teams.microsoft.com/meet/1", platformUnknown},
+		{"empty", "", platformUnknown},
+		{"whitespace", "   ", platformUnknown},
+		{"unparseable", "http://[::1", platformUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectMeetingPlatform(tc.url); got != tc.want {
+				t.Errorf("detectMeetingPlatform(%q) = %q, want %q", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseTeamsPasscode(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"passcode present", "https://teams.microsoft.com/meet/1234567890?p=AbCdEf12", "AbCdEf12"},
+		{"passcode with other params", "https://teams.microsoft.com/meet/1?foo=bar&p=Secret9&x=1", "Secret9"},
+		{"no passcode param", "https://teams.microsoft.com/meet/1234567890", ""},
+		{"meetup-join has no p param", "https://teams.microsoft.com/l/meetup-join/19%3ax/0?context=%7b%7d", ""},
+		{"scheme-less still parses", "teams.microsoft.com/meet/1?p=xyz", "xyz"},
+		{"empty p is empty", "https://teams.microsoft.com/meet/1?p=", ""},
+		{"empty url", "", ""},
+		{"unparseable", "http://[::1?p=x", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseTeamsPasscode(tc.url); got != tc.want {
+				t.Errorf("parseTeamsPasscode(%q) = %q, want %q", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseMeetingURL(t *testing.T) {
+	cases := []struct {
+		name         string
+		url          string
+		wantPlatform meetingPlatform
+		wantPasscode string
+	}{
+		{"meet has no passcode", "https://meet.google.com/abc", platformMeet, ""},
+		{"teams meet with passcode", "https://teams.microsoft.com/meet/1?p=Zz99", platformTeams, "Zz99"},
+		{"teams meetup-join no passcode", "https://teams.microsoft.com/l/meetup-join/19%3ax", platformTeams, ""},
+		{"unknown yields no passcode even with p", "https://zoom.us/j/1?p=abc", platformUnknown, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseMeetingURL(tc.url)
+			if got.Platform != tc.wantPlatform {
+				t.Errorf("Platform = %q, want %q", got.Platform, tc.wantPlatform)
+			}
+			if got.Passcode != tc.wantPasscode {
+				t.Errorf("Passcode = %q, want %q", got.Passcode, tc.wantPasscode)
+			}
+		})
+	}
+}
+
+func TestParseMeetingJoinParams_TeamsSetsPlatformAndPasscode(t *testing.T) {
+	p, err := parseMeetingJoinParams(map[string]string{
+		"meeting_url": "https://teams.microsoft.com/meet/1234567890?p=Passw0rd",
+		"meeting_id":  "mtg-teams-1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Platform != platformTeams {
+		t.Errorf("Platform = %q, want %q", p.Platform, platformTeams)
+	}
+	if p.Passcode != "Passw0rd" {
+		t.Errorf("Passcode = %q, want %q", p.Passcode, "Passw0rd")
+	}
+}
+
+func TestParseMeetingJoinParams_MeetSetsPlatformNoPasscode(t *testing.T) {
+	p, err := parseMeetingJoinParams(map[string]string{
+		"meeting_url": "https://meet.google.com/abc-defg-hij",
+		"meeting_id":  "mtg-meet-1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Platform != platformMeet {
+		t.Errorf("Platform = %q, want %q", p.Platform, platformMeet)
+	}
+	if p.Passcode != "" {
+		t.Errorf("Passcode = %q, want empty", p.Passcode)
+	}
+}
+
+func TestParseMeetingJoinParams_RejectsUnsupportedPlatform(t *testing.T) {
+	_, err := parseMeetingJoinParams(map[string]string{
+		"meeting_url": "https://zoom.us/j/123456789",
+		"meeting_id":  "mtg-zoom-1",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported meeting platform, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported meeting_url") {
+		t.Errorf("error = %q, want it to mention 'unsupported meeting_url'", err)
+	}
+}

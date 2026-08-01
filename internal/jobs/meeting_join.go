@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -183,12 +184,129 @@ func clickButtonByTextOptionalJS(labels []string) string {
 		`return "";})()`
 }
 
+// meetingPlatform is the conferencing platform a meeting_url targets. It selects
+// which pre-join flow runJoinFlow drives (Meet vs Teams). Kept as a small string
+// enum so it can ride the result/logs legibly and so the aceteam backend's
+// meeting_platform column (issue #6997 owns the enum + gates) maps 1:1.
+type meetingPlatform string
+
+const (
+	// platformMeet is a meet.google.com meeting (the original, shipped flow).
+	platformMeet meetingPlatform = "meet"
+	// platformTeams is a Microsoft Teams web meeting (teams.microsoft.com /
+	// teams.live.com), both the /meet/<id>?p=<passcode> and /l/meetup-join/…
+	// link shapes. Handled by the Teams flow in meeting_join_teams.go.
+	platformTeams meetingPlatform = "teams"
+	// platformUnknown is any URL we do not recognize; parseMeetingJoinParams
+	// rejects it so an unsupported link fails fast with a clear error rather
+	// than launching a browser at a flow that cannot possibly work.
+	platformUnknown meetingPlatform = "unknown"
+)
+
+// parsedMeetingURL is the pure, statically-verifiable result of inspecting a
+// meeting_url: which platform it targets and (Teams /meet/<id>?p= links only)
+// the pre-join passcode. This is the main unit-tested deliverable of the Teams
+// scaffold — no browser, no network, just URL shape.
+type parsedMeetingURL struct {
+	Platform meetingPlatform
+	// Passcode is the Teams pre-join passcode extracted from the `p` query
+	// parameter of a teams.microsoft.com/meet/<id>?p=<passcode> link. Empty for
+	// Meet, for /l/meetup-join/… links (which embed auth in the path/query and
+	// need no separate passcode field), and when no `p` param is present.
+	Passcode string
+}
+
+// detectMeetingPlatform maps a meeting_url's host to a meetingPlatform. Pure and
+// host-based (not substring-based) so a lookalike path segment cannot spoof it:
+// it parses the URL and matches the hostname exactly or as a subdomain suffix.
+// A malformed URL or an unrecognized host returns platformUnknown. Case- and
+// scheme-insensitive; a bare host with no scheme is tolerated by prepending
+// https:// so operator-pasted "teams.microsoft.com/meet/…" still classifies.
+func detectMeetingPlatform(rawURL string) meetingPlatform {
+	host := meetingURLHost(rawURL)
+	if host == "" {
+		return platformUnknown
+	}
+	switch {
+	case hostMatches(host, "meet.google.com"):
+		return platformMeet
+	case hostMatches(host, "teams.microsoft.com"),
+		hostMatches(host, "teams.live.com"),
+		hostMatches(host, "teams.microsoft.us"): // GCC High / DoD cloud
+		return platformTeams
+	default:
+		return platformUnknown
+	}
+}
+
+// meetingURLHost extracts the lowercased hostname from rawURL, tolerating a
+// scheme-less host (prepends https://) so "teams.microsoft.com/meet/x" parses.
+// Returns "" for input that has no usable host.
+func meetingURLHost(rawURL string) string {
+	s := strings.TrimSpace(rawURL)
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// hostMatches reports whether host equals base or is a subdomain of base
+// (e.g. "gov.teams.microsoft.com" matches base "teams.microsoft.com"). Suffix
+// matching is anchored on a dot so "evilteams.microsoft.com" does NOT match
+// "teams.microsoft.com".
+func hostMatches(host, base string) bool {
+	return host == base || strings.HasSuffix(host, "."+base)
+}
+
+// parseTeamsPasscode returns the pre-join passcode from a Teams
+// /meet/<id>?p=<passcode> link (the `p` query parameter), or "" when the URL is
+// malformed or carries no `p` param. Pure and unit-tested.
+func parseTeamsPasscode(rawURL string) string {
+	s := strings.TrimSpace(rawURL)
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Query().Get("p"))
+}
+
+// parseMeetingURL is the pure classifier used by parseMeetingJoinParams: it
+// detects the platform and (Teams only) extracts the pre-join passcode. Split
+// out so the whole URL-shape contract is unit-testable without a job payload.
+func parseMeetingURL(rawURL string) parsedMeetingURL {
+	plat := detectMeetingPlatform(rawURL)
+	out := parsedMeetingURL{Platform: plat}
+	if plat == platformTeams {
+		out.Passcode = parseTeamsPasscode(rawURL)
+	}
+	return out
+}
+
 // meetingJoinParams is the typed, validated job payload.
 type meetingJoinParams struct {
 	MeetingURL         string
 	MeetingID          string
 	BotDisplayName     string
 	MaxDurationSeconds int // 0 means "unset"; the handler applies defaultMeetingMaxDuration
+	// Platform is the conferencing platform detected from MeetingURL. Selects
+	// the pre-join flow in runJoinFlow.
+	Platform meetingPlatform
+	// Passcode is the Teams pre-join passcode (from a /meet/<id>?p=<passcode>
+	// link); empty for Meet and for passcode-less Teams links.
+	Passcode string
 }
 
 // parseMeetingJoinParams validates and normalizes the raw string payload. Payload
@@ -206,6 +324,15 @@ func parseMeetingJoinParams(payload map[string]string) (meetingJoinParams, error
 	if p.MeetingID == "" {
 		return meetingJoinParams{}, fmt.Errorf("job payload missing required 'meeting_id' field")
 	}
+	// Detect the platform from the URL shape and reject anything we cannot
+	// drive, so an unsupported link fails fast here rather than at a stale
+	// selector after the browser is up.
+	parsed := parseMeetingURL(p.MeetingURL)
+	if parsed.Platform == platformUnknown {
+		return meetingJoinParams{}, fmt.Errorf("unsupported meeting_url %q: only Google Meet (meet.google.com) and Microsoft Teams (teams.microsoft.com) links are supported", p.MeetingURL)
+	}
+	p.Platform = parsed.Platform
+	p.Passcode = parsed.Passcode
 	if p.BotDisplayName == "" {
 		p.BotDisplayName = defaultBotDisplayName
 	}
@@ -513,7 +640,13 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 // result shape is uniform (chat/recognized_commands come back empty). Splitting
 // here keeps Execute's happy path readable and the streaming gate in one place.
 func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string) interactiveOutcome {
-	if !h.StreamingEnabled {
+	// The interactive during-call layer (announce / rolling `/ace` commands /
+	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
+	// MVP scope (#7000: join + record + transcribe, no in-call chat). Route Teams
+	// through the plain record-until-end loop, which uses the Teams-aware
+	// end-detection (checkMeetingEndedFor). Wiring the interactive layer for Teams
+	// is a documented follow-up once its DOM is live-tuned.
+	if !h.StreamingEnabled || p.Platform == platformTeams {
 		return interactiveOutcome{endReason: h.waitForMeetingEnd(ctx, br, p)}
 	}
 
@@ -532,10 +665,28 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	return h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages)
 }
 
-// runJoinFlow drives the Google Meet pre-join sequence (partially verified —
+// runJoinFlow dispatches to the platform-specific pre-join sequence based on the
+// platform detected from the meeting URL (parseMeetingJoinParams). Meet is the
+// original shipped flow; Teams (issue #7000) lives in meeting_join_teams.go and
+// is scaffolded/best-guess, pending live tuning. Both share the same downstream
+// record → transcribe path (nothing platform-specific past admission).
+func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
+	switch p.Platform {
+	case platformTeams:
+		return h.runTeamsJoinFlow(ctx, br, p)
+	case platformMeet:
+		return h.runMeetJoinFlow(ctx, br, p)
+	default:
+		// parseMeetingJoinParams rejects unknown platforms, so this is a
+		// defensive belt-and-braces for a caller that bypasses it.
+		return fmt.Errorf("cannot join meeting: unsupported platform %q for url %s", p.Platform, p.MeetingURL)
+	}
+}
+
+// runMeetJoinFlow drives the Google Meet pre-join sequence (partially verified —
 // see the LIVE-TUNING block). Non-fatal steps (permission dismissals, name entry
 // when signed in) log and continue; the join click and admission are fatal.
-func (h *MeetingJoinHandler) runJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
+func (h *MeetingJoinHandler) runMeetJoinFlow(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	if err := br.Navigate(p.MeetingURL); err != nil {
 		return fmt.Errorf("navigate to meeting url: %w", err)
 	}
@@ -657,13 +808,25 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams) string {
 	deadline := time.Now().Add(p.maxDuration())
 	for time.Now().Before(deadline) {
-		if reason, ended := checkMeetingEnded(br); ended {
+		if reason, ended := checkMeetingEndedFor(p.Platform, br); ended {
 			return reason
 		}
 		time.Sleep(meetingPollInterval)
 	}
 	ctx.Log("info", "     - max meeting duration (%s) reached; leaving", p.maxDuration())
 	return "max_duration_reached"
+}
+
+// checkMeetingEndedFor dispatches the end heuristic by platform so a Teams call
+// ends on its own end/removed signal (best-guess, see meeting_join_teams.go)
+// rather than always running to the max_duration cap. Meet keeps the shared
+// checkMeetingEnded. The interactive (streaming) loop remains Meet-coupled and
+// out of Teams MVP scope — Teams runs the plain record→transcribe path.
+func checkMeetingEndedFor(plat meetingPlatform, page meetPage) (string, bool) {
+	if plat == platformTeams {
+		return checkTeamsMeetingEnded(page)
+	}
+	return checkMeetingEnded(page)
 }
 
 // syntheticTranscribeJob builds the in-process TRANSCRIBE_AUDIO job used to reuse
