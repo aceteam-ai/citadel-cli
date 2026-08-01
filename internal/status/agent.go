@@ -60,6 +60,10 @@ type AgentProviders struct {
 	// runs in THIS process: an out-of-process caller (the CLI, the aceteam MCP)
 	// cannot reach it any other way (#598).
 	Expose func(ExposeSpec) (any, error)
+
+	// Unexpose revokes an exposure by name, the inverse of Expose. Same
+	// in-process reasoning: only this process holds the live gateway.
+	Unexpose func(name string) (any, error)
 }
 
 // ExposeSpec is the /agent/expose request body. It mirrors the EXPOSE_SET job
@@ -146,6 +150,40 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		return p.WorkerRestart()
 	})))
 	mux.HandleFunc("/agent/expose", s.requireVPNOrAuth(s.handleAgentExpose))
+	mux.HandleFunc("/agent/unexpose", s.requireVPNOrAuth(s.handleAgentUnexpose))
+}
+
+// handleAgentUnexpose revokes an exposure on the in-process gateway. POST with
+// {"name": "..."}; same auth posture as /agent/expose.
+//
+// POST rather than DELETE to match every other /agent/* control route (they are
+// all POST), so the aceteam backend and the CLI need no special-casing here.
+func (s *Server) handleAgentUnexpose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.agent == nil || s.agent.Unexpose == nil {
+		writeAgentError(w, errUnavailable)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	res, err := s.agent.Unexpose(req.Name)
+	if err != nil {
+		writeAgentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleAgentExpose programs an exposure on the in-process gateway. POST only,
