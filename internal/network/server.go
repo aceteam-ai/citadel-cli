@@ -35,12 +35,33 @@ func SetLogf(fn func(string, ...any)) {
 // NetworkServer wraps a mesh Backend with AceTeam-specific functionality.
 type NetworkServer struct {
 	backend    Backend
+	mode       BackendMode
 	controlURL string
 	hostname   string
 	stateDir   string
 
+	// releaseLock deregisters this process from the userspace holder set.
+	// Nil for the attached backend, which starts no endpoint of its own.
+	releaseLock func()
+
 	mu        sync.RWMutex
 	connected bool
+}
+
+// Mode reports which transport this server ended up on. Commands print it so
+// a user can tell machine-wide mode from userspace at a glance.
+func (s *NetworkServer) Mode() BackendMode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mode
+}
+
+// releaseStateLock is safe to call with no lock held. Callers must hold s.mu.
+func (s *NetworkServer) releaseStateLock() {
+	if s.releaseLock != nil {
+		s.releaseLock()
+		s.releaseLock = nil
+	}
 }
 
 // SuppressLogs disables all tsnet/tailscale log output.
@@ -104,15 +125,32 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(origOutput)
 
-	// Build the transport. Userspace (tsnet) is the only backend today and
-	// the only one `citadel login` may use — it needs no privileges.
-	s.backend = newUserspaceBackend(ServerConfig{
-		Hostname:   s.hostname,
-		ControlURL: s.controlURL,
-	}, s.stateDir, authKey)
+	// Pick the transport. On a host where `citadel up` already holds the mesh
+	// this attaches to it rather than starting a second WireGuard endpoint on
+	// the same node key; otherwise it takes the state-dir lock and runs
+	// unprivileged tsnet, exactly as before. See SelectBackend.
+	mode, err := SelectBackend(s.stateDir)
+	if err != nil {
+		return err
+	}
+
+	switch mode {
+	case ModeAttached:
+		s.backend = newAttachedBackend(LocalAPISocketPath(s.stateDir))
+	default:
+		// Record this process so `citadel up` can refuse to start alongside
+		// it. Purely advisory — it never blocks the userspace path.
+		s.releaseLock = registerUserspaceHolder(s.stateDir)
+		s.backend = newUserspaceBackend(ServerConfig{
+			Hostname:   s.hostname,
+			ControlURL: s.controlURL,
+		}, s.stateDir, authKey)
+	}
+	s.mode = mode
 
 	if err := s.backend.Up(ctx); err != nil {
 		s.backend = nil
+		s.releaseStateLock()
 		return err
 	}
 
@@ -120,6 +158,7 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	if err := s.waitForConnection(ctx); err != nil {
 		s.backend.Close()
 		s.backend = nil
+		s.releaseStateLock()
 		return err
 	}
 
@@ -179,6 +218,7 @@ func (s *NetworkServer) Disconnect() error {
 	err := s.backend.Close()
 	s.backend = nil
 	s.connected = false
+	s.releaseStateLock()
 
 	// Fix state file ownership after tsnet has finished writing.
 	// tsnet rewrites tailscaled.state atomically (temp file + rename),

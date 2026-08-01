@@ -74,6 +74,8 @@ func (f *fakeBackend) Reauth(_ context.Context, authKey string) error {
 var (
 	_ Backend = (*fakeBackend)(nil)
 	_ Backend = (*userspaceBackend)(nil)
+	_ Backend = (*tunBackend)(nil)
+	_ Backend = (*attachedBackend)(nil)
 )
 
 // The authkey is the one field a status/reconnect check can never exercise:
