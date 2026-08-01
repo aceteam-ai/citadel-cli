@@ -178,6 +178,44 @@ One thing the test does establish for slice 6: the driver loaded fine from the
 binary's own directory, which is exactly where a `go:embed` extraction would
 put it.
 
+### The Wintun embed can only extract to two places
+
+`golang.zx2c4.com/wintun`'s loader is not a general DLL search:
+
+```go
+// dll.go
+windows.LoadLibraryEx(d.Name, 0,
+    LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32)
+```
+
+Those two flags are the *entire* search path: the directory of the running
+executable, and `System32`. `PATH` is not consulted, nor the working
+directory, nor any path we could choose. So the plan of "extract the embedded
+DLL to an Administrator-only-writable directory" only works if that directory
+is one of those two.
+
+That is a happy accident for the security requirement rather than a conflict:
+- The **application directory** is where the citadel binary lives — on Windows
+  under `%LOCALAPPDATA%\Citadel` or `Program Files`, already
+  Administrator-only in the latter case.
+- **System32** is Administrator-only by definition, but writing there is
+  invasive and would collide with any other Wintun consumer.
+
+So: extract beside the binary, and verify the directory is not
+attacker-writable before loading (an unprivileged `%LOCALAPPDATA%` install is
+writable by that user — who is also the one running `citadel up` elevated, so
+a planted DLL would be a genuine privilege-escalation path). This is the one
+remaining design question for slice 6, and it is a permissions question, not a
+packaging one.
+
+Verified on a clean Windows machine (VM 109, no Tailscale, no wintun.dll):
+with the DLL beside the binary, citadel installed the Wintun driver from
+scratch — "Installing driver 0.14 / Extracting driver / Creating adapter" —
+and `citadel up` brought up `citadel0`. The license permits this: §3d allows
+redistribution "insofar as the Software is distributed alongside other
+software that uses the Software only via the Permitted API", which is exactly
+citadel's use.
+
 ## Two identities on one machine — decided before slice 2
 
 A running `citadel work` (tsnet) and a `citadel up` (TUN) sharing
@@ -220,8 +258,9 @@ exists precisely because of that.
 4. **MagicDNS `*.internal`** — prefs set `CorpDNS`; needs live verification.
 5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary) — needs a live
    bring-up on a disposable host.
-6. **Windows** — adapter identity DONE (above); the remaining piece is
-   shipping the driver. `golang.zx2c4.com/wintun` is pure Go but is a *loader*
+6. **Windows** — adapter identity, router registration and COM init all DONE
+   and verified on a clean machine; the remaining piece is shipping the driver
+   (see the loader constraint above). `golang.zx2c4.com/wintun` is pure Go but is a *loader*
    (`newLazyDLL("wintun.dll")`); the driver DLL is a separate wireguard.com
    artifact. Decision (Jason, 2026-07-30): embed via `go:embed` and extract on
    first run **to an Administrator-only-writable directory, never

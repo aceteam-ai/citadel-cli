@@ -381,6 +381,17 @@ running other VPN software — and the right thing to run under a remote exec
 that might be killed, since `citadel up` itself runs in the foreground until
 interrupted and a SIGKILL skips teardown.
 
+**Two imports that are load-bearing and invisible to the compiler.**
+`internal/network/backend_tun.go` blank-imports
+`tailscale.com/wgengine/router/osrouter` — `router.New` dispatches through a
+feature hook that ONLY that import populates, so without it machine-wide mode
+fails at runtime on EVERY platform with `unsupported OS "..."`. Do not
+"simplify" it to tailscaled's `feature/condregister`: that umbrella links the
+AWS SSM client and 76 aws/smithy packages into citadel. Separately, the Windows
+init calls `com.StartRuntime` because osrouter's `setPrivateNetwork` assumes
+COM is already initialized process-wide (tailscaled does it in its own init);
+without it the adapter is silently left in the Public firewall profile.
+
 Design doc: [docs/machine-wide-tun.md](docs/machine-wide-tun.md).
 
 ### Provisioning Flow (`citadel init`)
