@@ -15,6 +15,7 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/client/local"
+
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/health"
@@ -36,6 +37,23 @@ import (
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
+
+	// Registers the per-OS Router implementation. router.New dispatches
+	// through a feature hook (router.HookNewUserspaceRouter) that is ONLY
+	// populated by importing this package.
+	//
+	// Without it everything compiles and the TUN device is created — then
+	// router.New returns `unsupported OS "windows"` at runtime. Verified on
+	// the Windows 11 test VM: the adapter came up and the bring-up died
+	// there. It is a runtime-only failure on EVERY platform, which is why the
+	// type checker never caught it.
+	//
+	// tailscaled gets this via `_ "tailscale.com/feature/condregister"`, but
+	// that umbrella also registers Taildrive, TPM, and the Kubernetes and AWS
+	// state stores — measured: it links the AWS SSM client and 76 aws/smithy
+	// packages into citadel. Importing the one implementation package we
+	// actually need avoids all of it.
+	_ "tailscale.com/wgengine/router/osrouter"
 )
 
 // tunBackend builds the same stack tailscaled does, minus the parts citadel

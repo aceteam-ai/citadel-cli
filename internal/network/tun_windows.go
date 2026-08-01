@@ -5,6 +5,7 @@
 package network
 
 import (
+	"github.com/dblohm7/wingoes/com"
 	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/windows"
 )
@@ -37,4 +38,30 @@ func init() {
 		panic("citadel: invalid Wintun GUID: " + err.Error())
 	}
 	tun.WintunStaticRequestedGUID = &guid
+}
+
+// COM must be initialized process-wide before the Windows router runs.
+//
+// osrouter's setPrivateNetwork (which marks citadel's adapter as a Private
+// network, so Windows Firewall does not treat mesh peers as untrusted) builds
+// an `ole.Connection` with the comment "DO NOT call Initialize() ... We've
+// already handled that process-wide". tailscaled does that in its own init
+// (cmd/tailscaled/tailscaled_windows.go); nothing in the library does it for
+// you.
+//
+// Without this, every attempt fails with "CoInitialize has not been called"
+// and after 20 tries the router gives up:
+//
+//	setPrivateNetwork: adapter LUID ... not found after 20 tries, giving up
+//
+// Verified on the Windows 11 test VM. The bring-up survives it — the adapter
+// exists and the engine starts — so this is a silent misconfiguration rather
+// than a crash: the interface would be left in the Public firewall profile.
+//
+// ConsoleApp is the right process type: `citadel up` runs in the foreground.
+// A future Windows service wrapper should pass com.Service instead.
+func init() {
+	if err := com.StartRuntime(com.ConsoleApp); err != nil {
+		logf("windows: COM runtime init failed (adapter may stay in the Public firewall profile): %v", err)
+	}
 }
