@@ -87,6 +87,9 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 				Epoch:      spec.Epoch,
 			})
 		},
+		Unexpose: func(name string) (any, error) {
+			return liveExposeOps{}.Unexpose(ctx, name)
+		},
 	}
 }
 

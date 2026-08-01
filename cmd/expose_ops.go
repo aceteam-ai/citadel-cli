@@ -84,6 +84,49 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 	return res, nil
 }
 
+// UnexposeResult is what the unexpose path returns to its caller (the CLI, the
+// aceteam MCP verb).
+type UnexposeResult struct {
+	// Name is the exposed-service slug that was revoked.
+	Name string `json:"name"`
+	// WasExposed reports whether a live exposure actually existed. False means
+	// the call still succeeded (revoke is idempotent) but nothing was serving --
+	// surfaced so a caller can say "not exposed" instead of implying it tore
+	// something down.
+	WasExposed bool `json:"was_exposed"`
+}
+
+// Unexpose revokes an exposure: it drops the gateway's live route AND the
+// durable record, so the service stops being reachable now and does not come
+// back on the next restart (#647 made exposures survive restarts, which is
+// exactly why revoke must clear both halves).
+//
+// Order matters. The LIVE route is torn down first: if the durable delete fails,
+// the service is already unreachable and the residual failure is a stale record
+// that resurrects on the next restart -- noisy but not an exposure the operator
+// believes is gone. Deleting the record first would invert that into the unsafe
+// direction (record gone, service still serving, nothing left to reconcile it).
+func (liveExposeOps) Unexpose(_ context.Context, name string) (*UnexposeResult, error) {
+	if name == "" {
+		return nil, fmt.Errorf("unexpose requires a service name")
+	}
+	ref := getProvisionedServiceGateway()
+	if ref == nil {
+		return nil, fmt.Errorf("no in-process gateway (unexpose requires the node gateway to be running)")
+	}
+
+	wasExposed := ref.gw.Unexpose(name)
+
+	// Delete the durable record even when nothing was live: a record can outlive
+	// its route (restored for a port that no longer listens, or written by an
+	// older build), and revoke must be able to clear that too.
+	if err := config.DeleteExposure(platform.ConfigDir(), name); err != nil {
+		return nil, fmt.Errorf("exposure %q is no longer served, but its saved record could not be removed "+
+			"(it will return on the next restart): %w", name, err)
+	}
+	return &UnexposeResult{Name: name, WasExposed: wasExposed}, nil
+}
+
 // restoreExposures re-wires the persisted exposure set onto a gateway that has
 // not started serving yet (#647). It MUST be called before Start: restoring
 // after the listener is up leaves a window in which a valid exposure 404s, which

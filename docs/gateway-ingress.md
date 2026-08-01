@@ -47,7 +47,8 @@ is the reason the test drives the whole chain.
 ## Components
 
 - `internal/gateway/exposure.go` — the primitive: `Visibility`, `ExposePolicy`,
-  the per-Server exposure registry (`SetExposure`/`Expose`/`RemoveExposure`),
+  the per-Server exposure registry (`SetExposure`/`Expose`/`RemoveExposure`/
+  `Unexpose`),
   `exposureMiddleware`, the `MeshIdentityResolver` interface (mirrors the #585
   terminal resolver so the package stays standalone/testable), and the `link`
   token mint/verify (`MintLinkToken`/`verifyLinkToken`, HMAC-SHA256).
@@ -78,6 +79,20 @@ the exposure's current `TokenEpoch`, and `exp` is in the future. Revocation is
 **revoke-all-for-exposure** by bumping `TokenEpoch` (re-expose with `epoch+1`);
 every prior token then fails the epoch check. Per-token (`jti`) revocation is a
 follow-up.
+
+**Revoking the whole exposure** is `Server.Unexpose(name)` (driven by
+`citadel service unexpose <name>` / `POST /agent/unexpose`). It drops the policy
+AND clears the route's upstream address, then deletes the durable record so the
+exposure does not return on the next restart. Outstanding `link` tokens stop
+working immediately: `exposureMiddleware` 404s any `/expose/<name>` with no
+policy, whatever token the caller holds.
+
+Note `http.ServeMux` cannot deregister a handler, so the mux entry and its
+`Upstream` survive a revoke (with an empty address, which makes the stale route
+answer 502 rather than reach the revoked service). The `Upstream` is deliberately
+KEPT in `config.Upstreams` rather than deleted: `wireExposeRoute` re-points an
+existing entry in place, and that is what makes a later re-expose of the same
+name work.
 
 **Shareable URL:** the MCP verb composes it as `url + "?access_token=" + token`.
 The bare `url` is not usable for a `link` exposure without the token.

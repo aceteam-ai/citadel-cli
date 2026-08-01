@@ -201,6 +201,39 @@ func (s *Server) RemoveExposure(name string) {
 	delete(s.exposures, name)
 }
 
+// Unexpose revokes an exposure: it drops the visibility policy AND tears down
+// the route's proxy target, the inverse of Expose. Returns false if name was not
+// exposed, so a caller can report "not found" rather than a phantom success.
+//
+// Why both halves. Dropping the policy alone is already fail-closed --
+// exposureMiddleware 404s any /expose/<name> with no policy, and that middleware
+// is the SOLE gate for this namespace. But the registered mux handler and its
+// Upstream would survive, so a later Expose of the same name would inherit the
+// old target until it re-pointed it. Clearing the address makes the stale route
+// inert on its own terms: with no address, resolveTarget returns nil and the
+// proxy answers 502 instead of reaching a service the operator revoked.
+//
+// The mux entry itself CANNOT be removed -- http.ServeMux has no deregister --
+// so the Upstream is kept (with an empty address) rather than deleted from the
+// map. Deleting it would leave the registered handler closed over an orphan and
+// make a re-Expose silently no-op its re-wire (wireExposeRoute mutates the
+// EXISTING Upstream when the prefix is already present, which is what makes
+// re-exposing after an unexpose work).
+func (s *Server) Unexpose(name string) bool {
+	s.mu.Lock()
+	_, existed := s.exposures[name]
+	delete(s.exposures, name)
+	up := s.config.Upstreams[ExposeRoutePath(name)]
+	s.mu.Unlock()
+
+	// Outside the lock: setAddr takes the Upstream's own mutex.
+	if up != nil {
+		up.setAddr("")
+		up.Address = ""
+	}
+	return existed
+}
+
 // getExposure returns the policy for name, or nil if not exposed.
 func (s *Server) getExposure(name string) *ExposePolicy {
 	s.mu.RLock()
