@@ -245,6 +245,40 @@ exists precisely because of that.
    `network.Listen`, which the TUN backend implements as stdlib calls. Needs a
    third `attached` backend and a way to detect a live `citadel up`.
 
+## Verified end to end (2026-08-01, Windows VM 109 — clean, no Tailscale)
+
+```
+headscale:  tun-testvm109 | 100.64.0.46 | online
+interface:  citadel0 Up, 100.64.0.46
+routes:     full peer table + 100.100.100.100/32 (MagicDNS)
+firewall:   citadel0 = Private
+
+ping 100.64.0.78                     ->  3/3 replies, avg 3ms
+Resolve-DnsName ubuntu-gpu.internal  ->  100.64.0.78
+```
+
+`ping.exe` and `Resolve-DnsName` know nothing about citadel — that is machine-wide
+routing working, and it is what `tsnet` structurally cannot do.
+
+**One machine, one node**, the core claim: org node count went 12 → 13 on
+`citadel up` (+1), and stayed 13 when `citadel status` ran alongside it (+0).
+`citadel status` reported the same node and IP, i.e. it attached rather than
+starting a second endpoint.
+
+**Teardown** after `Stop-Process -Force` (the crash path, no graceful
+shutdown): adapter removed, zero leftover `100.x` routes, DNS restored.
+
+Two bugs surfaced only here, both invisible to `--check`:
+- `lb.Start` does not begin login for a node that has never joined — it calls
+  `cc.Login` only when a node key exists or a config file set WantRunning. A
+  fresh machine parked in `NeedsLogin` with `goal=nil` and failed with the
+  generic "timeout waiting for network connection". tsnet handles this by
+  calling `StartLoginInteractive` when the state lands on `NeedsLogin`
+  (tsnet.go:960); the TUN backend now does the same.
+- `citadel up` never called `network.SetLogf`, so every engine diagnostic was
+  discarded. The bug above was one opaque line; with logging on it took one
+  run to find. Wire `SetLogf` in any new command that brings up the network.
+
 ## Slices
 
 1. **Backend interface + `userspace` implementation** — DONE. No behavior
@@ -255,9 +289,10 @@ exists precisely because of that.
    errors rather than downgrading; `--check` creates and removes the interface
    without starting the engine, so it is safe on a box running other VPN
    software.
-4. **MagicDNS `*.internal`** — prefs set `CorpDNS`; needs live verification.
-5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary) — needs a live
-   bring-up on a disposable host.
+4. **MagicDNS `*.internal`** — DONE, verified resolving on Windows.
+5. **Linux** (`/dev/net/tun`, or `CAP_NET_ADMIN` on the binary) — code is
+   platform-agnostic and `osrouter` covers it; needs a live bring-up on a
+   disposable host.
 6. **Windows** — adapter identity, router registration and COM init all DONE
    and verified on a clean machine; the remaining piece is shipping the driver
    (see the loader constraint above). `golang.zx2c4.com/wintun` is pure Go but is a *loader*
