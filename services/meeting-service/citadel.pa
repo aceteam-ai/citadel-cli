@@ -8,3 +8,31 @@
 load-module module-native-protocol-unix
 load-module module-null-sink sink_name=citadel_default sink_properties=device.description=citadel_default
 set-default-sink citadel_default
+
+# Virtual microphone (bot -> room SPEAKING path, aceteam#7079). A null sink whose
+# monitor is REMAPPED to a real capture source; audio played into citadel_mic
+# (meetingd POST /mic/play) is published on citadel_virtmic, which Chromium selects
+# as its default input device and publishes as the tab's mic into the live meeting.
+#
+# Why remap the monitor instead of using citadel_mic.monitor directly: Chromium
+# filters monitor-class sources out of getUserMedia enumeration, so a monitor would
+# be invisible as a mic. device.class=sound on the remap overrides the monitor
+# class it would otherwise inherit from the master, so Chromium treats it as a real
+# input. (LIVE-VALIDATION #1: confirm `pactl list sources` shows citadel_virtmic
+# with no "Monitor of Sink:" line -- see README.)
+#
+# This is purely ADDITIVE: the per-meeting CAPTURE sinks and the /health canary both
+# name `<sink>.monitor` EXPLICITLY, so making citadel_virtmic the DEFAULT source
+# cannot reach them. A bot that never plays audio publishes silence, exactly as
+# before.
+#
+# `.nofail` is LOAD-BEARING: `pulseaudio -n -F` runs fail-fast by default, so a mic
+# line that fails to load (module missing on the slim image, arg rejected by this
+# PulseAudio version, master monitor not ready) would EXIT the daemon and take
+# down CAPTURE too. .nofail degrades a mic failure to "mic absent" (health reports
+# present=false) instead of "pulse dead". It is last in the file, so its only blast
+# radius is this mic block. Do NOT delete it.
+.nofail
+load-module module-null-sink sink_name=citadel_mic sink_properties=device.description=citadel_mic
+load-module module-remap-source master=citadel_mic.monitor source_name=citadel_virtmic source_properties=device.class=sound
+set-default-source citadel_virtmic
