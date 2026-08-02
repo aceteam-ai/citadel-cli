@@ -23,20 +23,21 @@
 // same browser surface (platform.CDPBrowser) MEETING_JOIN drives.
 //
 // --- aceteam-side contracts this file depends on (verified against the aceteam
-//     repo's #7081 commits, NOT re-implemented here) ---
 //
-//	Token mint  POST {api_base}/api/huddle-bot/token
-//	            Authorization: Bearer <internal secret>   (isInternalServiceRequest)
-//	            body   { "agentId": <id>, "channelId": <id> }
-//	            200 -> { token, expiresAt, selfUserId, channelId, access }
-//	            (channelId is the NORMALIZED id the page must join; access is
-//	             "member" => admitted directly, "read" => lobby-then-admit.)
+//	    repo's #7081 commits, NOT re-implemented here) ---
 //
-//	Bot page    {api_base}/huddle-bot/<channelId>#token=<token>
-//	            The token rides the URL FRAGMENT (never the server / never a log).
-//	            The page publishes window.__huddleBotState =
-//	              { state:"connecting"|"lobby"|"joined"|"left"|"error",
-//	                callId, selfId, peerCount, connectedPeerCount, error, updatedAt }
+//		Token mint  POST {api_base}/api/huddle-bot/token
+//		            Authorization: Bearer <internal secret>   (isInternalServiceRequest)
+//		            body   { "agentId": <id>, "channelId": <id> }
+//		            200 -> { token, expiresAt, selfUserId, channelId, access }
+//		            (channelId is the NORMALIZED id the page must join; access is
+//		             "member" => admitted directly, "read" => lobby-then-admit.)
+//
+//		Bot page    {api_base}/huddle-bot/<channelId>#token=<token>
+//		            The token rides the URL FRAGMENT (never the server / never a log).
+//		            The page publishes window.__huddleBotState =
+//		              { state:"connecting"|"lobby"|"joined"|"left"|"error",
+//		                callId, selfId, peerCount, connectedPeerCount, error, updatedAt }
 package jobs
 
 import (
@@ -70,6 +71,11 @@ const JobTypeHuddleJoinType = "HUDDLE_JOIN"
 const (
 	envHuddleBotSecret    = "CITADEL_HUDDLE_BOT_SECRET"
 	envInternalAuthSecret = "INTERNAL_AUTH_SECRET"
+	// envRealtimeToken is the fallback source for the realtime-engine auth token
+	// used by the converse bridge (payload realtime_token wins). It is an AceTeam
+	// API key (act_...) or user JWT the realtime WS server's authenticate() accepts
+	// — NOT the huddle-bot mint token (see huddle_realtime_conn.go).
+	envRealtimeToken = "CITADEL_REALTIME_TOKEN"
 )
 
 // defaultHuddleAPIBase is the AceTeam API base used when the payload omits
@@ -93,6 +99,15 @@ const (
 	// a same-node retry is never blocked by our own not-yet-reaped session; Close
 	// (DELETE /sessions) tears it down on the normal path well before this.
 	huddleSessionMaxDuration = 1 * time.Hour
+	// converseSessionMaxDuration is the reaper cap for a RESIDENT converse session:
+	// the bot stays in the call bridging audio for the meeting's whole length, so
+	// the 1h join+confirm cap would kill the bridge mid-meeting. Matches the worker
+	// long-session tier (4h) HUDDLE_JOIN now belongs to. Only used when converse is
+	// enabled, so the plain path keeps the tighter cap.
+	converseSessionMaxDuration = 4 * time.Hour
+	// converseStatePollInterval is how often the resident bridge re-samples
+	// window.__huddleBotState to notice the call ended (left/error).
+	converseStatePollInterval = 3 * time.Second
 )
 
 // huddleBrowser is the minimal CDP surface the huddle join drives — navigate to
@@ -112,14 +127,24 @@ type huddleJoinParams struct {
 	ChannelID string
 	AgentID   string
 	APIBase   string // optional; falls back to device creds base, then default
+	// Converse turns the join into a resident two-way voice bridge (aceteam#7079).
+	// Default false => exact #667 join+confirm behavior (no capture/WS/mic).
+	Converse bool
+	// RealtimeURL optionally overrides the realtime WS endpoint (else derived from
+	// APIBase). RealtimeToken is the engine auth token (else env CITADEL_REALTIME_TOKEN).
+	RealtimeURL   string
+	RealtimeToken string
 }
 
 // parseHuddleJoinParams validates + normalizes the raw string payload.
 func parseHuddleJoinParams(payload map[string]string) (huddleJoinParams, error) {
 	p := huddleJoinParams{
-		ChannelID: strings.TrimSpace(payload["channel_id"]),
-		AgentID:   strings.TrimSpace(payload["agent_id"]),
-		APIBase:   strings.TrimSpace(payload["api_base"]),
+		ChannelID:     strings.TrimSpace(payload["channel_id"]),
+		AgentID:       strings.TrimSpace(payload["agent_id"]),
+		APIBase:       strings.TrimSpace(payload["api_base"]),
+		Converse:      isTruthy(payload["converse"]),
+		RealtimeURL:   strings.TrimSpace(payload["realtime_url"]),
+		RealtimeToken: strings.TrimSpace(payload["realtime_token"]),
 	}
 	if p.ChannelID == "" {
 		return huddleJoinParams{}, fmt.Errorf("job payload missing required 'channel_id' field")
@@ -128,6 +153,16 @@ func parseHuddleJoinParams(payload map[string]string) (huddleJoinParams, error) 
 		return huddleJoinParams{}, fmt.Errorf("job payload missing required 'agent_id' field")
 	}
 	return p, nil
+}
+
+// isTruthy parses the common truthy string forms used across citadel payload flags.
+func isTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // huddleToken is the subset of the mint route's 200 response the node needs.
@@ -170,8 +205,16 @@ type HuddleJoinHandler struct {
 	mintToken func(ctx context.Context, apiBase, secret string, p huddleJoinParams) (huddleToken, error)
 	// newBrowser launches (or reuses) the container session and returns the
 	// CDP-driven browser plus a cleanup that tears the session down. nil uses the
-	// real container-session implementation; tests inject a fake browser.
-	newBrowser func(p huddleJoinParams) (br huddleBrowser, cleanup func() error, err error)
+	// real container-session implementation; tests inject a fake browser. The
+	// converse media (capture + speak on the same session) is returned separately
+	// for the resident bridge; it is nil when this seam is a test fake (the
+	// converse path is then exercised via the runConverse seam instead).
+	newBrowser func(p huddleJoinParams) (br huddleBrowser, media converseMedia, cleanup func() error, err error)
+
+	// runConverse runs the resident converse bridge after `joined`. nil uses the
+	// real implementation (dial the realtime WS, bridge audio). Tests inject a fake
+	// to assert it is invoked only when converse:true, without a live WS/engine.
+	runConverse func(ctx JobContext, br huddleBrowser, media converseMedia, tok huddleToken, p huddleJoinParams) (converseStats, error)
 
 	// Tunables (zero => package defaults at use). Tests set them to milliseconds.
 	connectTimeout time.Duration
@@ -217,8 +260,8 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	}
 	ctx.Log("info", "     - [Job %s] minted bot token (self=%s, access=%s, channel=%s)", job.ID, tok.SelfUserID, tok.Access, joinChannel)
 
-	// Launch (or reuse) the container session -> CDP browser.
-	br, cleanup, err := h.launchBrowser(p)
+	// Launch (or reuse) the container session -> CDP browser (+ converse media).
+	br, media, cleanup, err := h.launchBrowser(p)
 	if err != nil {
 		return nil, fmt.Errorf("launch huddle browser: %w", err)
 	}
@@ -255,7 +298,7 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 	ctx.Log("info", "     - [Job %s] JOINED huddle %s (self=%s, peers=%d, connected=%d)",
 		job.ID, joinChannel, selfID, final.PeerCount, final.ConnectedPeerCount)
 
-	out, _ := json.Marshal(map[string]any{
+	result := map[string]any{
 		"status":               "joined",
 		"channel_id":           joinChannel,
 		"agent_id":             p.AgentID,
@@ -265,8 +308,81 @@ func (h *HuddleJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 		"connected_peer_count": final.ConnectedPeerCount,
 		"access":               tok.Access,
 		"state":                final.State,
-	})
+	}
+
+	// Resident converse bridge (aceteam#7079). Additive: only when converse:true.
+	// It blocks (the session stays up, so `defer cleanup()` above tears it down
+	// after) until the call ends / the job context cancels.
+	if p.Converse {
+		ctx.Log("info", "     - [Job %s] converse enabled; starting resident voice bridge", job.ID)
+		stats, cErr := h.converse(ctx, br, media, tok, p)
+		result["converse"] = stats
+		if cErr != nil {
+			// A converse failure does not un-join: we DID join. Report it in the
+			// result but keep status joined so the backend sees a successful join.
+			ctx.Log("warn", "     - [Job %s] converse bridge ended with error: %v", job.ID, cErr)
+			result["converse_error"] = cErr.Error()
+		}
+		ctx.Log("info", "     - [Job %s] converse bridge ended (reason=%s, appended=%d, deltas=%d, spoken=%d)",
+			job.ID, stats.StopReason, stats.AppendedFrames, stats.AudioDeltas, stats.SpokenChunks)
+	}
+
+	out, _ := json.Marshal(result)
 	return out, nil
+}
+
+// converse runs (or delegates) the resident realtime bridge after the bot joined.
+// It resolves the realtime token, dials the engine, and bridges room audio <-> the
+// virtual mic until the call ends or ctx cancels.
+func (h *HuddleJoinHandler) converse(ctx JobContext, br huddleBrowser, media converseMedia, tok huddleToken, p huddleJoinParams) (converseStats, error) {
+	if h.runConverse != nil {
+		return h.runConverse(ctx, br, media, tok, p)
+	}
+	if media == nil {
+		return converseStats{StopReason: "no media"}, fmt.Errorf("converse requires a container media handle (meeting module)")
+	}
+	token := h.resolveRealtimeToken(p)
+	if token == "" {
+		return converseStats{StopReason: "no realtime token"}, fmt.Errorf(
+			"converse requires a realtime engine token; set payload 'realtime_token' or env %s", envRealtimeToken)
+	}
+	apiBase := h.resolveAPIBase(p)
+	conn, err := dialRealtime(apiBase, p.RealtimeURL, token, p.AgentID)
+	if err != nil {
+		return converseStats{StopReason: "ws dial failed"}, fmt.Errorf("dial realtime engine: %w", err)
+	}
+	defer conn.Close()
+
+	// stateCheck lets the bridge notice the call ended by re-reading the bot page's
+	// readiness signal (left/error) — the same signal the join poll used.
+	stateCheck := func() (bool, string) {
+		st, present, sErr := readHuddleBotState(br)
+		if sErr != nil || !present {
+			return false, "" // a transient probe miss is not "ended"
+		}
+		switch st.State {
+		case "left":
+			return true, "bot left the call"
+		case "error":
+			return true, "bot reported error: " + st.Error
+		default:
+			return false, ""
+		}
+	}
+
+	bridge := newConverseBridge(conn, media, stateCheck,
+		func(level, format string, args ...any) { ctx.Log(level, format, args...) },
+		converseConfig{StatePollInterval: converseStatePollInterval})
+	return bridge.Run(ctx.Context())
+}
+
+// resolveRealtimeToken returns the realtime-engine auth token: payload override
+// first, then env CITADEL_REALTIME_TOKEN.
+func (h *HuddleJoinHandler) resolveRealtimeToken(p huddleJoinParams) string {
+	if p.RealtimeToken != "" {
+		return p.RealtimeToken
+	}
+	return strings.TrimSpace(os.Getenv(envRealtimeToken))
 }
 
 // resolveSecret returns the internal service secret (seam-overridable).
@@ -341,8 +457,10 @@ func mintHuddleBotToken(ctx context.Context, client *http.Client, apiBase, secre
 }
 
 // launchBrowser delegates to the injected browser seam or the real container
-// session implementation.
-func (h *HuddleJoinHandler) launchBrowser(p huddleJoinParams) (huddleBrowser, func() error, error) {
+// session implementation. It returns the browser, the converse media handle (the
+// SAME container session, for the resident bridge; may be nil for a test fake or
+// the host path), and a session-teardown cleanup.
+func (h *HuddleJoinHandler) launchBrowser(p huddleJoinParams) (huddleBrowser, converseMedia, func() error, error) {
 	if h.newBrowser != nil {
 		return h.newBrowser(p)
 	}
@@ -351,21 +469,27 @@ func (h *HuddleJoinHandler) launchBrowser(p huddleJoinParams) (huddleBrowser, fu
 
 // defaultHuddleBrowser launches a meeting-service container session (reusing the
 // meeting media stack: this wires the in-container Chromium to the virtual mic +
-// capture sink) and returns its CDP browser plus a session-teardown cleanup. The
-// meeting module MUST be healthy on this node — huddle join is a WebRTC join that
-// needs the container's headless Chromium; there is no host fallback here.
-func defaultHuddleBrowser(p huddleJoinParams) (huddleBrowser, func() error, error) {
+// capture sink) and returns its CDP browser, the containerMedia (for the converse
+// bridge's capture+speak), plus a session-teardown cleanup. The meeting module MUST
+// be healthy on this node — huddle join is a WebRTC join that needs the container's
+// headless Chromium; there is no host fallback here.
+func defaultHuddleBrowser(p huddleJoinParams) (huddleBrowser, converseMedia, func() error, error) {
 	if !meetingdHealthy(&http.Client{Timeout: meetingContainerHealthTimeout}, meetingdBaseURL()) {
-		return nil, nil, fmt.Errorf("the meeting-service container is not healthy on this node; HUDDLE_JOIN requires it (install/enable the meeting module)")
+		return nil, nil, nil, fmt.Errorf("the meeting-service container is not healthy on this node; HUDDLE_JOIN requires it (install/enable the meeting module)")
+	}
+	// A resident converse session must outlive the 1h join+confirm reaper cap.
+	maxDur := huddleSessionMaxDuration
+	if p.Converse {
+		maxDur = converseSessionMaxDuration
 	}
 	// No recording for join+confirm, so the WAV paths are empty. Start() creates
 	// the session and returns the CDP browser; Close() (cleanup) deletes it.
-	media := newContainerMedia(p.ChannelID, "", "", huddleSessionMaxDuration)
+	media := newContainerMedia(p.ChannelID, "", "", maxDur)
 	br, err := media.Start()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return br, media.Close, nil
+	return br, media, media.Close, nil
 }
 
 // huddlePollOpts bundles the poll budgets + the token's access level (for a

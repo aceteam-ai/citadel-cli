@@ -49,6 +49,11 @@ const (
 var longSessionJobTypes = map[string]struct{}{
 	JobTypeMeetingJoin: {},
 	JobTypeCobrowse:    {},
+	// HUDDLE_JOIN with converse:true stays resident bridging audio for the whole
+	// meeting (aceteam#7079), so it needs the long-session tier like MEETING_JOIN
+	// rather than the default 60min cap. The plain join+confirm path returns in
+	// seconds, well under this, so the tier change is safe for both.
+	JobTypeHuddleJoin: {},
 }
 
 // unboundedJobTypes get NO fallback deadline: their duration is dominated by

@@ -246,6 +246,16 @@ def test_mic_arg_builders():
     assert "--rate=24000" in pc
     assert "--channels=1" in pc
 
+    # The room->bot HEAR path RECORDS the per-session monitor to stdout.
+    cap = meetingd.build_pacat_capture_args("citadel_meeting_abc.monitor", 24000, 1)
+    assert cap[0] == "pacat"
+    assert "--record" in cap
+    assert "--playback" not in cap
+    assert "--device=citadel_meeting_abc.monitor" in cap
+    assert "--format=s16le" in cap
+    assert "--rate=24000" in cap
+    assert "--channels=1" in cap
+
 
 def test_mic_play_503_when_mic_absent(monkeypatch):
     """The speaking endpoints refuse (503) when the virtual mic is not present, so a
