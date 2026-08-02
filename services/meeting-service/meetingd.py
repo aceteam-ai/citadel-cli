@@ -67,8 +67,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -120,6 +120,14 @@ MIC_PLAY_TIMEOUT = int(os.environ.get("MEETING_MIC_PLAY_TIMEOUT", "120"))
 # Default raw-PCM format for /mic/play/pcm when the caller omits the query params.
 MIC_PCM_RATE = int(os.environ.get("MEETING_MIC_PCM_RATE", "24000"))
 MIC_PCM_CHANNELS = int(os.environ.get("MEETING_MIC_PCM_CHANNELS", "1"))
+# Default raw-PCM format for GET /sessions/{id}/capture/pcm (the room->bot HEAR
+# path, aceteam#7079). 24 kHz mono matches the realtime engine's PCM16 format, so
+# the converse bridge can forward captured frames without resampling; PulseAudio
+# does the monitor->24 kHz resample inside pacat. Read size for one stream chunk
+# is kept small so the bridge sees low-latency frames.
+CAPTURE_PCM_RATE = int(os.environ.get("MEETING_CAPTURE_PCM_RATE", "24000"))
+CAPTURE_PCM_CHANNELS = int(os.environ.get("MEETING_CAPTURE_PCM_CHANNELS", "1"))
+CAPTURE_CHUNK_BYTES = int(os.environ.get("MEETING_CAPTURE_CHUNK_BYTES", "1920"))
 
 # Serializes injection so two overlapping clips never garble the mic. One clip at a
 # time; a second concurrent request gets 409 (no barge-in / mid-clip stop yet --
@@ -296,6 +304,24 @@ def build_pacat_mic_args(sink: str, rate: int, channels: int) -> list[str]:
         "--format=s16le",
         f"--rate={int(rate)}",
         f"--channels={int(channels)}",
+    ]
+
+
+def build_pacat_capture_args(source: str, rate: int, channels: int) -> list[str]:
+    """pacat args to RECORD a pulse source (a per-session `<sink>.monitor`, i.e. the
+    room's mixed audio) as raw signed-16-bit little-endian PCM to stdout, at the
+    requested rate/channels (PulseAudio resamples the monitor to `rate` for us). This
+    is the low-latency room->bot HEAR path the converse bridge streams from -- the
+    mirror of build_pacat_mic_args. `--latency-msec=20` keeps the stream tight.
+    Pure so the format flags are unit-testable."""
+    return [
+        "pacat",
+        "--record",
+        f"--device={source}",
+        "--format=s16le",
+        f"--rate={int(rate)}",
+        f"--channels={int(channels)}",
+        "--latency-msec=20",
     ]
 
 
@@ -477,6 +503,12 @@ class Session:
     max_duration_seconds: int
     recorder: subprocess.Popen[bytes] | None = None
     record_path: str | None = None
+    # capture_proc is the live pacat --record streaming the room monitor to an HTTP
+    # client (the converse bridge's HEAR path). At most one at a time per session;
+    # killed on client disconnect (the StreamingResponse generator's finally) and on
+    # teardown. Independent of `recorder` -- a pulse monitor supports many readers,
+    # so recording to a WAV and live-streaming can run at once.
+    capture_proc: subprocess.Popen[bytes] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -707,6 +739,74 @@ def stop_record(session_id: str) -> JSONResponse:
     return JSONResponse(content={"recording": False, "path": path})
 
 
+# --- listening path (room -> bot, aceteam#7079) --------------------------------
+#
+#   GET /sessions/{id}/capture/pcm?rate=<hz>&channels=<n>
+#       Streams the session's room audio (the per-session `<sink>.monitor`, which
+#       carries the OTHER participants -- NOT the bot's own virtual mic, a different
+#       sink) as raw signed-16-bit little-endian PCM. This is the HEAR source the
+#       converse bridge forwards to the realtime engine. Defaults 24000/1 to match
+#       the engine's PCM16 format. At most one live capture per session; a second
+#       concurrent GET returns 409. The pacat subprocess is killed when the client
+#       disconnects (generator finally) or the session is torn down.
+
+
+def _capture_pcm_stream(s: "Session", proc: subprocess.Popen[bytes]):
+    """Yield raw PCM chunks from `proc`'s stdout until it ends or the HTTP client
+    disconnects, then reap the pacat process and clear it off the session. FastAPI
+    closes this generator when the client goes away, so the finally is what prevents
+    a leaked pacat holding the monitor across reconnects."""
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(CAPTURE_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        with s.lock:
+            if s.capture_proc is proc:
+                s.capture_proc = None
+
+
+@app.get("/sessions/{session_id}/capture/pcm")
+def capture_pcm(
+    session_id: str,
+    rate: int = CAPTURE_PCM_RATE,
+    channels: int = CAPTURE_PCM_CHANNELS,
+    # Annotate the base Response (not a Union): FastAPI infers response_model from
+    # the return annotation, and a Union isn't a `type`, so it would try to build a
+    # Pydantic field from it and raise FastAPIError at route registration (the whole
+    # service would fail to start). A Response subclass is passed through as-is.
+) -> Response:
+    s = _get_session(session_id)
+    if s is None:
+        return JSONResponse(status_code=404, content={"error": "no such session"})
+    if rate <= 0 or channels <= 0:
+        return JSONResponse(status_code=400, content={"error": "rate and channels must be positive"})
+    if not pulse_ready():
+        return JSONResponse(status_code=503, content={"error": "pulse server not ready"})
+    with s.lock:
+        if s.capture_proc is not None and s.capture_proc.poll() is None:
+            return JSONResponse(status_code=409, content={"error": "already capturing"})
+        try:
+            proc = subprocess.Popen(
+                build_pacat_capture_args(f"{s.sink_name}.monitor", rate, channels),
+                env=_pactl_env(),
+                stdout=subprocess.PIPE,
+            )
+        except OSError as exc:
+            return JSONResponse(status_code=500, content={"error": f"start capture: {exc}"})
+        s.capture_proc = proc
+    return StreamingResponse(_capture_pcm_stream(s, proc), media_type="application/octet-stream")
+
+
 # --- speaking path (bot -> room, aceteam#7079) ---------------------------------
 #
 # Two operations, one body shape each (cleaner than content-type switching):
@@ -801,6 +901,15 @@ def end_session(session_id: str) -> JSONResponse:
 
 def _teardown(s: Session) -> None:
     with s.lock:
+        # Kill any live capture stream first so its pacat stops reading the monitor
+        # before we unload the sink module (otherwise it fights the unload).
+        if s.capture_proc is not None and s.capture_proc.poll() is None:
+            s.capture_proc.terminate()
+            try:
+                s.capture_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                s.capture_proc.kill()
+        s.capture_proc = None
         if s.recorder is not None and s.recorder.poll() is None:
             s.recorder.send_signal(signal.SIGINT)
             try:

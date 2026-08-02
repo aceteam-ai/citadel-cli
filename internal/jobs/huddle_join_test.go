@@ -74,10 +74,12 @@ func stateJSON(state, selfID string, peers, connected int) string {
 // injected mint, and an injected browser.
 func newTestHuddleHandler(secret string, mint func(ctx context.Context, apiBase, secret string, p huddleJoinParams) (huddleToken, error), br *fakeHuddleBrowser) *HuddleJoinHandler {
 	return &HuddleJoinHandler{
-		WorkspaceDir:   "/tmp",
-		secretFn:       func() string { return secret },
-		mintToken:      mint,
-		newBrowser:     func(p huddleJoinParams) (huddleBrowser, func() error, error) { return br, br.Close, nil },
+		WorkspaceDir: "/tmp",
+		secretFn:     func() string { return secret },
+		mintToken:    mint,
+		newBrowser: func(p huddleJoinParams) (huddleBrowser, converseMedia, func() error, error) {
+			return br, nil, br.Close, nil
+		},
 		connectTimeout: 200 * time.Millisecond,
 		admitTimeout:   400 * time.Millisecond,
 		pollInterval:   2 * time.Millisecond,
@@ -334,4 +336,63 @@ func TestHuddleBotURL_FragmentRedaction(t *testing.T) {
 	if strings.Contains(red, "act_supersecret") || !strings.Contains(red, "<redacted>") {
 		t.Errorf("redacted URL %q must not leak the token", red)
 	}
+}
+
+// TestHuddleJoin_ConverseGating asserts the resident converse bridge runs ONLY
+// when converse:true, that its stats fold into the (still "joined") result, and
+// that the default path never touches it (exact #667 behavior).
+func TestHuddleJoin_ConverseGating(t *testing.T) {
+	joined := []string{stateJSON("joined", "self-1", 1, 1)}
+	tok := huddleToken{Token: "tkn", ChannelID: "chan-norm", SelfUserID: "self-1", Access: "member"}
+
+	t.Run("converse false does not invoke bridge", func(t *testing.T) {
+		br := &fakeHuddleBrowser{states: joined}
+		h := newTestHuddleHandler("s3cr3t", okMint(tok), br)
+		called := false
+		h.runConverse = func(ctx JobContext, _ huddleBrowser, _ converseMedia, _ huddleToken, _ huddleJoinParams) (converseStats, error) {
+			called = true
+			return converseStats{}, nil
+		}
+		out, err := h.Execute(JobContext{}, huddleJob()) // no converse in payload
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if called {
+			t.Error("runConverse invoked though converse was not requested")
+		}
+		var res map[string]any
+		_ = json.Unmarshal(out, &res)
+		if _, ok := res["converse"]; ok {
+			t.Error("result carried converse stats on the plain path")
+		}
+	})
+
+	t.Run("converse true invokes bridge and folds stats", func(t *testing.T) {
+		br := &fakeHuddleBrowser{states: joined}
+		h := newTestHuddleHandler("s3cr3t", okMint(tok), br)
+		h.runConverse = func(ctx JobContext, _ huddleBrowser, _ converseMedia, _ huddleToken, p huddleJoinParams) (converseStats, error) {
+			if !p.Converse {
+				t.Error("params.Converse should be true inside the bridge")
+			}
+			return converseStats{AppendedFrames: 7, AudioDeltas: 3, SpokenChunks: 2, StopReason: "bot left the call"}, nil
+		}
+		job := huddleJob()
+		job.Payload["converse"] = "true"
+		out, err := h.Execute(JobContext{}, job)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		var res map[string]any
+		_ = json.Unmarshal(out, &res)
+		if res["status"] != "joined" {
+			t.Errorf("status = %v, want joined (converse must not change join status)", res["status"])
+		}
+		cv, ok := res["converse"].(map[string]any)
+		if !ok {
+			t.Fatalf("result missing converse stats: %v", res["converse"])
+		}
+		if cv["appended_frames"].(float64) != 7 || cv["spoken_chunks"].(float64) != 2 {
+			t.Errorf("converse stats not folded through: %v", cv)
+		}
+	})
 }
