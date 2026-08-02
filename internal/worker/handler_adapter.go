@@ -325,6 +325,18 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		}
 	}
 
+	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
+	// capability as MEETING_JOIN, but registered OUTSIDE the workspace gate above:
+	// HUDDLE_JOIN records nothing (join + presence confirmation only), so it needs
+	// no workspace — a meeting-enabled node without a configured workspace must
+	// still take it. It drives the meeting-service container's headless Chromium to
+	// the aceteam huddle-bot page over CDP.
+	if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
+		handlers = append(handlers,
+			NewLegacyHandlerAdapter(JobTypeHuddleJoin, jobs.NewHuddleJoinHandler(opts.WorkspaceDir)),
+		)
+	}
+
 	// Register service-management handlers when a config directory is available.
 	if opts.ConfigDir != "" {
 		svcHandler := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
