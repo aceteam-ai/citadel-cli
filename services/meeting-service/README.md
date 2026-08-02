@@ -54,6 +54,51 @@ merely "a process is up". The live meeting crash that motivated this work record
   host while still publishing the port. Both published ports bind `127.0.0.1` only
   (the sole consumer is the co-located citadel process).
 
+## Virtual microphone (bot -> room speaking, aceteam#7079)
+
+The capture path above is room -> bot (the bot HEARS). The speaking path is the
+mirror: `citadel.pa` boots a second null sink `citadel_mic` whose monitor is
+**remapped** to a real capture source `citadel_virtmic`, set as the container's
+default input device -- so the Chromium tab publishes `citadel_virtmic` as its mic
+into the live meeting. Audio played **into** `citadel_mic` is therefore heard by
+the meeting.
+
+```
+  meetingd POST /sessions/{id}/mic/play {"path": "<ws-rel WAV/MP3>"}
+  meetingd POST /sessions/{id}/mic/play/pcm  (raw s16le body, ?rate=&channels=)
+        |  paplay / pacat --device=citadel_mic
+        v
+  null sink citadel_mic ──monitor──> module-remap-source ──> source citadel_virtmic
+                                                             (default source; device.class=sound
+                                                              so Chromium does NOT filter it as a
+                                                              monitor)  ──getUserMedia──> the tab's mic
+```
+
+- **Why remap, not the raw monitor:** Chromium filters monitor-class sources out
+  of `getUserMedia` enumeration, so `citadel_mic.monitor` would be invisible as a
+  mic. `device.class=sound` on the remap overrides the inherited monitor class.
+- **Strictly additive:** the capture sinks and the `/health` canary both name
+  `<sink>.monitor` **explicitly**, so making `citadel_virtmic` the default *source*
+  cannot touch them. A bot that never calls `/mic/play` publishes silence, exactly
+  as before. `/health` **reports** `virtual_mic: {present, sink, source, required}`
+  but does **not** fail on an absent mic (a speaking node opts in with
+  `MEETING_MIC_REQUIRED=1`); capture-broken still 503s as before.
+- **Endpoints** (loopback, meetingd 8207/8102): `POST /sessions/{id}/mic/play` plays a
+  workspace-relative streamable audio file (such as WAV/MP3). It opens a stable,
+  no-follow regular-file descriptor and gives ffmpeg only the `pipe` protocol, so
+  a playlist cannot escape the workspace or fetch a URL; decoded WAV size and
+  duration are bounded before playback.
+  `POST /sessions/{id}/mic/play/pcm` streams bounded raw PCM16. The underlying mic
+  is node-wide, so playback is serialized (409 `already speaking`), but requests
+  are tied to the active session and teardown cancels its child process. Calls are
+  **synchronous** (return when the clip finishes); barge-in is a later realtime wave.
+- **Live validation** (cannot be unit-tested without pulse + a browser): the
+  `smoke_test.py` step 6 grants mic permission, confirms `citadel_virtmic`
+  enumerates as an `audioinput`, then asserts a `getUserMedia` analyser HEARS a
+  tone POSTed to `/sessions/{id}/mic/play`. Also confirm `pactl list sources` shows
+  `citadel_virtmic` with **no** `Monitor of Sink:` line (the #1 thing that would
+  silently break Chromium's mic selection).
+
 ## Ports
 
 Registered in `services/ports.go` (the host-port registry) so no other module can
