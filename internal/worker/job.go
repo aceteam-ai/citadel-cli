@@ -146,6 +146,7 @@ const (
 	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
 	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+	JobTypeHuddleJoin         = "HUDDLE_JOIN"          // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
 
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
 	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
@@ -210,6 +211,7 @@ var allKnownJobTypes = []string{
 	JobTypeModuleSet,
 	JobTypeExposeSet,
 	JobTypeMeetingJoin,
+	JobTypeHuddleJoin,
 	JobTypeInstanceProvision,
 	JobTypeInstanceStart,
 	JobTypeInstanceStop,
