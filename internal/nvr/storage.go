@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 // Fixed, citadel-owned LOCAL paths (relative to the node owner's home) that the
@@ -138,17 +137,6 @@ func DefaultMountProbe() MountProbe {
 	return MountProbe{IsMountpoint: isMountpoint, WritableAsUID: writableAsUID}
 }
 
-func isMountpoint(path string) (bool, error) {
-	var st, parent syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
-		return false, err
-	}
-	if err := syscall.Stat(filepath.Dir(path), &parent); err != nil {
-		return false, err
-	}
-	return st.Dev != parent.Dev, nil
-}
-
 func writableAsUID(dir string, uid int) (bool, error) {
 	_ = uid
 	f, err := os.CreateTemp(dir, ".citadel-nvr-writecheck-")
@@ -229,14 +217,5 @@ func VerifyMediaIsNetworkFS(path string, uid int, probe NetFSProbe) error {
 
 // DefaultNetFSProbe returns a NetFSProbe backed by real statfs + a probe write.
 func DefaultNetFSProbe() NetFSProbe {
-	return NetFSProbe{
-		FSType: func(path string) (int64, error) {
-			var st syscall.Statfs_t
-			if err := syscall.Statfs(path, &st); err != nil {
-				return 0, err
-			}
-			return int64(st.Type), nil
-		},
-		Writable: writableAsUID,
-	}
+	return NetFSProbe{FSType: fsType, Writable: writableAsUID}
 }
