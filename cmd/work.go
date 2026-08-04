@@ -1157,15 +1157,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// "green but wedged" node (heartbeating from a separate goroutine while the
 	// consume loop is blocked and draining nothing).
 	workerLivenessFn := func() *status.WorkerLiveness {
-		snap := workerState.Snapshot()
-		return &status.WorkerLiveness{
-			Consuming:         snap.Consuming,
-			LastJobConsumedAt: snap.LastJobAt,
-			LastPollAt:        snap.LastPollAt,
-			InFlight:          snap.InFlight,
-			Processed:         snap.Processed,
-			Failed:            snap.Failed,
-		}
+		return workerLivenessFrom(workerState.Snapshot())
 	}
 
 	// Create status collector (used by status server and Redis status publisher)
@@ -2531,6 +2523,23 @@ func nodeIsServingModels(ctx context.Context) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return len(status.DiscoverLocalEngines(probeCtx)) > 0
+}
+
+// workerLivenessFrom projects a WorkerSnapshot onto the heartbeat-facing
+// liveness payload. Extracted from the closure in runWork so the projection is
+// testable on its own: it is a hand-maintained field-by-field copy between two
+// structs that evolve independently, which is exactly the kind of mapping that
+// silently loses a field when one side gains one.
+func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
+	return &status.WorkerLiveness{
+		Consuming:          snap.Consuming,
+		LastJobConsumedAt:  snap.LastJobAt,
+		LastPollAt:         snap.LastPollAt,
+		InFlight:           snap.InFlight,
+		Processed:          snap.Processed,
+		Failed:             snap.Failed,
+		IdentityUnresolved: snap.IdentityUnresolved,
+	}
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
