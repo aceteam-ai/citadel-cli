@@ -113,7 +113,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// RecoverInterruptedSwap() below (citadel#934: it used to run before
 		// this check, so its Debug()/Log() calls could land on stdout and
 		// corrupt the JSON-RPC stream under `--debug citadel mcp`).
-		if cmd.Name() == "mcp" {
+		if cmd.Name() == "mcp" || isMemoryHookCommand(cmd) {
 			debugToStderr = true
 		}
 
@@ -191,6 +191,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		skipUpdateCheck := bareNonInteractive ||
 			cmdName == "update" || parentName == "update" ||
 			cmdName == "version" || cmdName == "help" ||
+			isMemoryHookCommand(cmd) ||
 			autoUpdateOptedOut()
 
 		// Detect if we're about to launch TUI control center
@@ -198,7 +199,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		isTUIContext := cmdName == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
 
 		// MCP uses stdout as transport -- suppress update print to stdout.
-		if cmdName == "mcp" {
+		if cmdName == "mcp" || isMemoryHookCommand(cmd) {
 			isTUIContext = true
 		}
 
@@ -206,6 +207,13 @@ control center. All other subcommands are for scripting and advanced use.`,
 			checkForUpdateOnStartupFn(isTUIContext)
 		}
 	},
+}
+
+func isMemoryHookCommand(cmd *cobra.Command) bool {
+	if cmd == nil || (cmd.Name() != "recall" && cmd.Name() != "capture") {
+		return false
+	}
+	return cmd.Parent() != nil && cmd.Parent().Name() == "memory"
 }
 
 // checkForUpdateOnStartupFn lets the root invocation path be tested without

@@ -181,11 +181,34 @@ type StartFlowRequest struct {
 	Hostname      string `json:"hostname,omitempty"`
 	MachineID     string `json:"machine_id,omitempty"`
 	ForceNew      bool   `json:"force_new,omitempty"`
+	// DeviceKind selects the backend authorization path. Absent (empty) reads
+	// as "citadel" server-side, so existing callers are unaffected. The memory
+	// onboarding installer (aceteam #7160) sends "memory" so the backend mints
+	// a scoped act_ API key instead of a Headscale preauthkey.
+	DeviceKind string `json:"device_kind,omitempty"`
 }
 
 // StartFlowOptions contains options for starting the device authorization flow
 type StartFlowOptions struct {
 	ForceNew bool // Force fresh registration, ignoring existing machine mapping
+	// DeviceKind, when set (e.g. "memory"), is forwarded to the /start endpoint
+	// to select a non-citadel authorization path. Empty = citadel (default).
+	DeviceKind string
+}
+
+// MemoryTokenResponse is the poll response for a device_kind:"memory" flow
+// (aceteam #7160). Unlike the citadel TokenResponse (which returns a Headscale
+// authkey and signals pending via an HTTP 400 authorization_pending error),
+// the memory endpoint always returns HTTP 200 and signals lifecycle via the
+// Status field. On approval it carries a scoped act_ API key in APIKey — the
+// same credential external MCP clients (like Claude Code) authenticate with.
+type MemoryTokenResponse struct {
+	Status    string   `json:"status"` // pending | approved | expired | denied
+	APIKey    string   `json:"api_key,omitempty"`
+	ExpiresIn *int     `json:"expires_in,omitempty"` // nullable; memory keys are minted without expiry
+	OrgID     string   `json:"org_id,omitempty"`
+	OrgName   string   `json:"org_name,omitempty"`
+	Scopes    []string `json:"scopes,omitempty"`
 }
 
 // TokenRequest represents the request body for /token endpoint
@@ -206,6 +229,11 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 		baseURL: baseURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
+			// Device codes authorize credential minting and must not be replayed
+			// to a redirect target. Endpoint changes must be explicit.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -232,6 +260,7 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	// Apply options if provided
 	if opts != nil {
 		reqBody.ForceNew = opts.ForceNew
+		reqBody.DeviceKind = opts.DeviceKind
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -452,6 +481,157 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 	}
 
 	return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+}
+
+// PollForMemoryToken polls the /token endpoint for a device_kind:"memory" flow
+// until the device is approved, denied, expires, or the client times out.
+//
+// The memory endpoint always returns HTTP 200 with a Status field (it does NOT
+// use the RFC 8628 authorization_pending error), so this method cannot reuse
+// PollForToken. The citadel PollForToken path is left untouched.
+func (c *DeviceAuthClient) PollForMemoryToken(deviceCode string, interval int) (*MemoryTokenResponse, error) {
+	return c.PollForMemoryTokenContext(context.Background(), deviceCode, interval)
+}
+
+const (
+	defaultMemoryPollInterval = 5 * time.Second
+	maxMemoryPollInterval     = 30 * time.Second
+	memoryPollTimeout         = 10 * time.Minute
+)
+
+// PollForMemoryTokenContext is PollForMemoryToken with caller cancellation.
+// The backend-provided interval is normalized to a finite safe range, and the
+// timer is always capped to the remaining authorization budget.
+func (c *DeviceAuthClient) PollForMemoryTokenContext(ctx context.Context, deviceCode string, interval int) (*MemoryTokenResponse, error) {
+	pollingInterval := normalizeMemoryPollInterval(interval)
+	return c.pollMemoryContext(ctx, deviceCode, pollingInterval, memoryPollTimeout)
+}
+
+func normalizeMemoryPollInterval(seconds int) time.Duration {
+	if seconds <= 0 {
+		return defaultMemoryPollInterval
+	}
+	if seconds > int(maxMemoryPollInterval/time.Second) {
+		return maxMemoryPollInterval
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// pollMemory is retained as the duration-parameterized test seam.
+func (c *DeviceAuthClient) pollMemory(deviceCode string, pollingInterval, timeout time.Duration) (*MemoryTokenResponse, error) {
+	return c.pollMemoryContext(context.Background(), deviceCode, pollingInterval, timeout)
+}
+
+func (c *DeviceAuthClient) pollMemoryContext(parent context.Context, deviceCode string, pollingInterval, timeout time.Duration) (*MemoryTokenResponse, error) {
+	if pollingInterval <= 0 {
+		return nil, fmt.Errorf("memory polling interval must be positive")
+	}
+	if pollingInterval > maxMemoryPollInterval {
+		pollingInterval = maxMemoryPollInterval
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	for {
+		resp, err := c.checkMemoryTokenContext(ctx, deviceCode)
+		if err != nil {
+			// classifyNetworkError intentionally presents friendly errors and does
+			// not retain the request error in its chain, so consult the governing
+			// context as well when the request ended at our poll deadline.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+
+		switch resp.Status {
+		case "approved":
+			if resp.APIKey == "" {
+				return nil, fmt.Errorf("device approved but no API key was returned")
+			}
+			return resp, nil
+		case "denied":
+			return nil, fmt.Errorf("authorization denied by user")
+		case "expired":
+			return nil, fmt.Errorf("device code expired, please run the command again")
+		case "pending":
+			// Keep polling within the context deadline below.
+		default:
+			return nil, fmt.Errorf("unexpected memory authorization status %q", resp.Status)
+		}
+
+		wait := pollingInterval
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			if wait > remaining {
+				wait = remaining
+			}
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("authentication timeout after %s", timeout)
+			}
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// checkMemoryToken makes a single /token request for a memory-kind device.
+func (c *DeviceAuthClient) checkMemoryToken(deviceCode string) (*MemoryTokenResponse, error) {
+	return c.checkMemoryTokenContext(context.Background(), deviceCode)
+}
+
+func (c *DeviceAuthClient) checkMemoryTokenContext(ctx context.Context, deviceCode string) (*MemoryTokenResponse, error) {
+	url := c.baseURL + "/api/fabric/device-auth/token"
+
+	reqBody := TokenRequest{
+		DeviceCode: deviceCode,
+		GrantType:  "urn:ietf:params:oauth:grant-type:device_code",
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, classifyNetworkError(err, c.baseURL)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, fmt.Errorf("authentication service unavailable")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var out MemoryTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	return &out, nil
 }
 
 // Error implements the error interface for TokenError

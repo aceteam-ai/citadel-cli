@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +195,162 @@ func TestMCPBridgeForwardToBackendJSON(t *testing.T) {
 	tools, ok := result["tools"].([]interface{})
 	if !ok || len(tools) != 1 {
 		t.Fatalf("expected 1 tool, got %v", result["tools"])
+	}
+}
+
+func TestMemoryBridgeAllowlistAndToolsListFiltering(t *testing.T) {
+	allow := map[string]struct{}{"memory_search": {}, "memory_write": {}}
+	for _, tc := range []struct {
+		method, params string
+		want           bool
+	}{
+		{"initialize", "", true}, {"ping", "", true}, {"tools/list", "", true},
+		{"notifications/initialized", "", true},
+		{"tools/call", `{"name":"memory_search"}`, true},
+		{"tools/call", `{"name":"memory_write"}`, true},
+		{"tools/call", `{"name":"list_agents"}`, false},
+		{"resources/list", "", false},
+	} {
+		b := &mcpBridge{remoteToolAllowlist: allow}
+		req := &jsonRPCRequest{Method: tc.method, Params: json.RawMessage(tc.params)}
+		if got := b.memoryMethodAllowed(req); got != tc.want {
+			t.Errorf("method=%s params=%s allowed=%v want=%v", tc.method, tc.params, got, tc.want)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"memory_search"},{"name":"list_agents"},{"name":"memory_write"}]}}`)
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	b := &mcpBridge{apiKey: "key", apiURL: srv.URL, mcpServer: "aceteam", httpClient: srv.Client(), stdout: &out, remoteToolAllowlist: allow}
+	b.handleToolsList(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/list"})
+	if strings.Contains(out.String(), "list_agents") || !strings.Contains(out.String(), "memory_search") || !strings.Contains(out.String(), "memory_write") {
+		t.Fatalf("memory tools/list was not filtered: %s", out.String())
+	}
+}
+
+func TestMemoryBridgeValidatesBackendJSONRPCAndSSEIDs(t *testing.T) {
+	for _, raw := range []string{
+		`{"jsonrpc":"1.0","id":4,"result":{}}`,
+		`{"jsonrpc":"2.0","result":{}}`,
+		`{"jsonrpc":"2.0","id":5,"result":{}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{},"error":{"code":-32000,"message":"ambiguous"}}`,
+	} {
+		if err := validateBackendRPCResponse(json.RawMessage(raw), json.RawMessage(`4`)); err == nil {
+			t.Fatalf("invalid response accepted: %s", raw)
+		}
+	}
+	b := &mcpBridge{}
+	sse := strings.NewReader(strings.Join([]string{
+		"event: message", `data: {"jsonrpc":"2.0","id":99,"result":{}}`, "",
+		"event: message", `data: {"jsonrpc":"2.0","id":4,"result":{"ok":true}}`, "",
+	}, "\n"))
+	got, err := b.parseSSEResponseExpected(sse, json.RawMessage(`4`), true)
+	if err != nil || !strings.Contains(string(got), `"ok":true`) {
+		t.Fatalf("matching SSE response not selected: got=%s err=%v", got, err)
+	}
+}
+
+func TestMemoryBridgeRejectsAmbiguousSSEBackendResponse(t *testing.T) {
+	b := &mcpBridge{}
+	sse := strings.NewReader("event: message\n" +
+		`data: {"jsonrpc":"2.0","id":4,"result":{},"error":{"code":-32000,"message":"ambiguous"}}` + "\n\n")
+	_, err := b.parseSSEResponseExpected(sse, json.RawMessage(`4`), true)
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected ambiguous SSE response rejection, got %v", err)
+	}
+}
+
+func TestClassifyJSONRPCRequestID(t *testing.T) {
+	for _, raw := range []string{`1`, `1.5`, `"request-1"`} {
+		isNotification, err := classifyJSONRPCRequestID(json.RawMessage(raw))
+		if err != nil || isNotification {
+			t.Errorf("valid id %s: notification=%v err=%v", raw, isNotification, err)
+		}
+	}
+	isNotification, err := classifyJSONRPCRequestID(nil)
+	if err != nil || !isNotification {
+		t.Fatalf("absent id: notification=%v err=%v", isNotification, err)
+	}
+	for _, raw := range []string{`null`, `true`, `{}`, `[]`} {
+		if _, err := classifyJSONRPCRequestID(json.RawMessage(raw)); err == nil {
+			t.Errorf("invalid id accepted: %s", raw)
+		}
+	}
+}
+
+func TestMCPBridgeSuppressesRequestMethodNotifications(t *testing.T) {
+	backendHits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendHits++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = r.Close()
+	})
+
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","method":"initialize"}`,
+		`{"jsonrpc":"2.0","method":"ping"}`,
+		`{"jsonrpc":"2.0","method":"tools/list"}`,
+		`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"memory_search"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+	} {
+		_, _ = io.WriteString(w, line+"\n")
+	}
+	_ = w.Close()
+
+	var out bytes.Buffer
+	b := &mcpBridge{
+		apiKey:              "scoped-key",
+		endpointURL:         server.URL,
+		httpClient:          server.Client(),
+		stdout:              &out,
+		remoteToolAllowlist: map[string]struct{}{"memory_search": {}, "memory_write": {}},
+	}
+	if err := b.run(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = oldStdin
+	if out.Len() != 0 {
+		t.Fatalf("notifications produced responses: %s", out.String())
+	}
+	if backendHits != 1 {
+		t.Fatalf("backend hits=%d, want only notifications/initialized forwarded", backendHits)
+	}
+}
+
+func TestMCPBridge_RefusesRedirectWithoutLeakingBearer(t *testing.T) {
+	var targetAuth string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	client := redirect.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	b := &mcpBridge{apiKey: "top-secret", apiURL: redirect.URL, mcpServer: "aceteam", httpClient: client}
+	_, err := b.forwardToBackend(&jsonRPCRequest{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/list"})
+	if err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("redirect not rejected: %v", err)
+	}
+	if targetAuth != "" {
+		t.Fatalf("bearer leaked to redirect target: %q", targetAuth)
 	}
 }
 
@@ -511,6 +668,47 @@ func TestMCPBridgeNotification202(t *testing.T) {
 	}
 	if resp != nil {
 		t.Errorf("notification should return nil body, got: %s", string(resp))
+	}
+}
+
+func TestMCPBridgeRequest202ProducesJSONRPCError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		_ = r.Close()
+	})
+	_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"memory_search","arguments":{}}}`+"\n")
+	_ = w.Close()
+
+	var out bytes.Buffer
+	bridge := &mcpBridge{
+		apiKey:              "scoped-key",
+		endpointURL:         server.URL,
+		httpClient:          server.Client(),
+		stdout:              &out,
+		remoteToolAllowlist: map[string]struct{}{"memory_search": {}, "memory_write": {}},
+	}
+	if err := bridge.run(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = oldStdin
+
+	var resp jsonRPCResponse
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+		t.Fatalf("response was not JSON-RPC: %q: %v", out.String(), err)
+	}
+	if string(resp.ID) != "7" || resp.Error == nil || resp.Result != nil {
+		t.Fatalf("request did not receive a correlated error: %s", out.String())
 	}
 }
 

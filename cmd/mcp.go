@@ -16,15 +16,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/memory"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 )
 
 var (
-	mcpAPIKey string
-	mcpAPIURL string
-	mcpServer string
+	mcpAPIKey       string
+	mcpAPIURL       string
+	mcpServer       string
+	mcpEndpointURL  string
+	mcpMemoryConfig bool
 )
 
 var mcpCmd = &cobra.Command{
@@ -79,16 +83,23 @@ type jsonRPCError struct {
 
 // mcpBridge holds the state for the stdio-to-HTTP MCP bridge.
 type mcpBridge struct {
-	apiKey     string
-	apiURL     string // e.g., "https://aceteam.ai"
-	mcpServer  string // e.g., "aceteam"
-	sessionID  string // Mcp-Session-Id from the backend
-	httpClient *http.Client
+	apiKey      string
+	apiURL      string // e.g., "https://aceteam.ai"
+	mcpServer   string // e.g., "aceteam"
+	endpointURL string // optional exact endpoint, otherwise derived from apiURL/server
+	sessionID   string // Mcp-Session-Id from the backend
+	httpClient  *http.Client
 
 	// localTools are node-local tools served WITHOUT a backend round-trip
 	// (aceteam #8249 v1: module control, local inference, workspace files --
 	// see cmd/mcp_local.go). Populated once at startup by runMCP.
 	localTools []localMCPTool
+
+	// remoteToolAllowlist restricts a credential-specific bridge to the exact
+	// backend tools it is allowed to expose and invoke. A nil map means the
+	// normal general-purpose bridge; a non-nil map is enforced locally before
+	// any authenticated request reaches the backend.
+	remoteToolAllowlist map[string]struct{}
 
 	// stdout is the JSON-RPC transport writer, captured ONCE at startup
 	// (runMCP) before any tool call can run. citadel#858: reading the live
@@ -134,6 +145,21 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	// Resolve API key
 	apiKey := mcpAPIKey
+	var memoryCfg *memory.Config
+	if mcpMemoryConfig {
+		var err error
+		memoryCfg, err = memory.Load(platform.ConfigDir())
+		if err != nil {
+			return fmt.Errorf("load memory credential: %w", err)
+		}
+		if memoryCfg == nil || memoryCfg.APIKey == "" {
+			return fmt.Errorf("memory credential is not installed; run 'citadel memory install'")
+		}
+		if err := memoryCfg.ValidateCredential(); err != nil {
+			return fmt.Errorf("refusing unsafe memory credential: %w", err)
+		}
+		apiKey = memoryCfg.APIKey
+	}
 	if apiKey == "" {
 		apiKey = os.Getenv("ACETEAM_API_KEY")
 	}
@@ -160,6 +186,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	// Resolve API URL
 	apiURL := mcpAPIURL
+	if apiURL == "" && memoryCfg != nil {
+		apiURL = memoryCfg.APIBaseURL
+	}
 	if apiURL == "" {
 		apiURL = os.Getenv("ACETEAM_URL")
 	}
@@ -171,15 +200,40 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	}
 	// Strip trailing slash
 	apiURL = strings.TrimRight(apiURL, "/")
+	localTools := newLocalMCPTools(realLocalMCPDeps())
+	var remoteToolAllowlist map[string]struct{}
+	if memoryCfg != nil {
+		// The memory MCP registration is deliberately remote-only. Do not make
+		// node-local execution/file tools appear under a credential whose
+		// advertised authority is memory:read/write.
+		localTools = nil
+		remoteToolAllowlist = map[string]struct{}{
+			"memory_search": {},
+			"memory_write":  {},
+		}
+	}
 
 	bridge := &mcpBridge{
 		apiKey:    apiKey,
 		apiURL:    apiURL,
 		mcpServer: mcpServer,
+		endpointURL: func() string {
+			if mcpEndpointURL != "" {
+				return mcpEndpointURL
+			}
+			if memoryCfg != nil {
+				return memoryCfg.EffectiveMCPURL()
+			}
+			return ""
+		}(),
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-		localTools: newLocalMCPTools(realLocalMCPDeps()),
+		localTools:          localTools,
+		remoteToolAllowlist: remoteToolAllowlist,
 		// Captured HERE, before bridge.run() ever dispatches a tool call, so
 		// this is always the real transport -- never a captureStdout pipe.
 		// See the stdout field's doc comment.
@@ -216,16 +270,43 @@ func (b *mcpBridge) run() error {
 
 		Debug("MCP: received method=%s id=%s", req.Method, string(req.ID))
 
-		// Notifications have no ID and must not receive a response.
-		isNotification := len(req.ID) == 0 || string(req.ID) == "null"
+		// A JSON-RPC notification omits id entirely. Null and compound IDs are
+		// refused: accepting them would make response correlation ambiguous and
+		// would permit objects/arrays to cross the credential-scoped bridge.
+		isNotification, err := classifyJSONRPCRequestID(req.ID)
+		if err != nil {
+			b.writeError(nil, -32600, "Invalid Request")
+			continue
+		}
+		if req.JSONRPC != "2.0" {
+			if !isNotification {
+				b.writeError(req.ID, -32600, "Invalid Request")
+			}
+			continue
+		}
+		if b.remoteToolAllowlist != nil {
+			if !b.memoryMethodAllowed(&req) {
+				if !isNotification {
+					b.writeError(req.ID, -32601, "Method or tool not available")
+				}
+				continue
+			}
+		}
+		if isNotification {
+			// MCP request methods require correlated results and are not executed
+			// in notification form. Protocol notifications are forwarded for
+			// backend session state, but their response (if any) is discarded.
+			if strings.HasPrefix(req.Method, "notifications/") && b.apiKey != "" {
+				_, _ = b.forwardToBackend(&req)
+			}
+			continue
+		}
 
 		switch req.Method {
 		case "initialize":
 			b.handleInitialize(&req)
 		case "ping":
-			if !isNotification {
-				b.writeResult(req.ID, json.RawMessage(`{}`))
-			}
+			b.writeResult(req.ID, json.RawMessage(`{}`))
 		case "tools/list":
 			// Always includes the local tool set (aceteam #8249), merged with
 			// the backend's remote tool set when a backend is reachable.
@@ -240,11 +321,6 @@ func (b *mcpBridge) run() error {
 			}
 			fallthrough
 		default:
-			if isNotification {
-				// Forward notifications to the backend but don't write a response.
-				_, _ = b.forwardToBackend(&req)
-				continue
-			}
 			// Forward all other requests to the backend.
 			resp, err := b.forwardToBackend(&req)
 			if err != nil {
@@ -267,6 +343,50 @@ func (b *mcpBridge) run() error {
 		return fmt.Errorf("stdin read error: %w", err)
 	}
 	return nil
+}
+
+// classifyJSONRPCRequestID returns true only when the id member is absent.
+// This bridge accepts the interoperable JSON-RPC ID forms used by MCP clients:
+// strings and numbers. Explicit null is rejected rather than conflated with an
+// absent notification ID.
+func classifyJSONRPCRequestID(raw json.RawMessage) (bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return true, nil
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return false, fmt.Errorf("null JSON-RPC id")
+	}
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return false, fmt.Errorf("decode JSON-RPC id: %w", err)
+	}
+	switch value.(type) {
+	case string, json.Number:
+		return false, nil
+	default:
+		return false, fmt.Errorf("JSON-RPC id must be a string or number")
+	}
+}
+
+func (b *mcpBridge) memoryMethodAllowed(req *jsonRPCRequest) bool {
+	switch req.Method {
+	case "initialize", "ping", "tools/list", "notifications/initialized":
+		return true
+	case "tools/call":
+		var params struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
+			return false
+		}
+		_, ok := b.remoteToolAllowlist[params.Name]
+		return ok
+	default:
+		return false
+	}
 }
 
 // handleInitialize handles the MCP initialize request.
@@ -358,6 +478,20 @@ func (b *mcpBridge) handleToolsList(req *jsonRPCRequest) {
 	var backendTools []json.RawMessage
 	if raw, ok := parsed.Result["tools"]; ok {
 		_ = json.Unmarshal(raw, &backendTools)
+	}
+	if b.remoteToolAllowlist != nil {
+		filtered := make([]json.RawMessage, 0, len(backendTools))
+		for _, raw := range backendTools {
+			var descriptor struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(raw, &descriptor) == nil {
+				if _, ok := b.remoteToolAllowlist[descriptor.Name]; ok {
+					filtered = append(filtered, raw)
+				}
+			}
+		}
+		backendTools = filtered
 	}
 	merged := append(backendTools, localRaw...)
 	mergedTools, err := json.Marshal(merged)
@@ -522,7 +656,10 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/mcp/%s/mcp", b.apiURL, b.mcpServer)
+	url := b.endpointURL
+	if url == "" {
+		url = fmt.Sprintf("%s/api/mcp/%s/mcp", b.apiURL, b.mcpServer)
+	}
 	Debug("MCP: POST %s (method=%s)", url, req.Method)
 
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
@@ -569,8 +706,14 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 		return nil, fmt.Errorf("backend returned HTTP %d: %s", httpResp.StatusCode, truncate(string(body), 200))
 	}
 
-	// 202 Accepted has no body (used for notifications).
+	// 202 Accepted is valid only for notifications. A correlated JSON-RPC
+	// request still requires a response carrying exactly one of result/error;
+	// accepting an empty 202 here would leave the stdio client waiting forever.
 	if httpResp.StatusCode == http.StatusAccepted {
+		isNotification, idErr := classifyJSONRPCRequestID(req.ID)
+		if idErr != nil || !isNotification {
+			return nil, fmt.Errorf("backend returned HTTP 202 for a JSON-RPC request")
+		}
 		return nil, nil
 	}
 
@@ -578,7 +721,7 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	Debug("MCP: response Content-Type: %s", contentType)
 
 	if strings.Contains(contentType, "text/event-stream") {
-		return b.parseSSEResponse(httpResp.Body)
+		return b.parseSSEResponseExpected(httpResp.Body, req.ID, b.remoteToolAllowlist != nil)
 	}
 
 	// Plain JSON response.
@@ -586,17 +729,51 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
+	if b.remoteToolAllowlist != nil && len(req.ID) > 0 && string(req.ID) != "null" {
+		if err := validateBackendRPCResponse(body, req.ID); err != nil {
+			return nil, err
+		}
+	}
 	return body, nil
+}
+
+func validateBackendRPCResponse(data, expectedID json.RawMessage) error {
+	var resp jsonRPCResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("decode JSON-RPC response: %w", err)
+	}
+	if resp.JSONRPC != "2.0" {
+		return fmt.Errorf("invalid backend JSON-RPC version %q", resp.JSONRPC)
+	}
+	gotID := bytes.TrimSpace(resp.ID)
+	wantID := bytes.TrimSpace(expectedID)
+	if len(gotID) == 0 || bytes.Equal(gotID, []byte("null")) {
+		return fmt.Errorf("backend JSON-RPC response omitted id")
+	}
+	if !bytes.Equal(gotID, wantID) {
+		return fmt.Errorf("backend JSON-RPC response id %s does not match request id %s", gotID, wantID)
+	}
+	hasResult := resp.Result != nil
+	hasError := resp.Error != nil
+	if hasResult == hasError {
+		return fmt.Errorf("backend JSON-RPC response must contain exactly one of result or error")
+	}
+	return nil
 }
 
 // parseSSEResponse reads an SSE stream and extracts JSON-RPC messages from
 // "data:" lines within "event: message" frames. Returns the last JSON-RPC
 // response or error message found (the final result for this request).
 func (b *mcpBridge) parseSSEResponse(body io.Reader) ([]byte, error) {
+	return b.parseSSEResponseExpected(body, nil, false)
+}
+
+func (b *mcpBridge) parseSSEResponseExpected(body io.Reader, expectedID json.RawMessage, strict bool) ([]byte, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	var lastResponse []byte
+	var lastValidationErr error
 	inMessageEvent := false
 
 	for scanner.Scan() {
@@ -616,7 +793,15 @@ func (b *mcpBridge) parseSSEResponse(body io.Reader) ([]byte, error) {
 			}
 
 			Debug("MCP: SSE data: %s", truncate(data, 200))
-			lastResponse = []byte(data)
+			candidate := []byte(data)
+			if strict {
+				if err := validateBackendRPCResponse(candidate, expectedID); err != nil {
+					lastValidationErr = err
+					continue
+				}
+				return candidate, nil
+			}
+			lastResponse = candidate
 		}
 
 		// Empty line marks end of an SSE event frame.
@@ -630,6 +815,9 @@ func (b *mcpBridge) parseSSEResponse(body io.Reader) ([]byte, error) {
 	}
 
 	if lastResponse == nil {
+		if lastValidationErr != nil {
+			return nil, lastValidationErr
+		}
 		return nil, fmt.Errorf("no JSON-RPC message found in SSE stream")
 	}
 
@@ -740,4 +928,6 @@ func init() {
 	mcpCmd.Flags().StringVar(&mcpAPIKey, "api-key", "", "AceTeam API key (or set ACETEAM_API_KEY env)")
 	mcpCmd.Flags().StringVar(&mcpAPIURL, "api-url", "", "AceTeam API URL (default: https://aceteam.ai)")
 	mcpCmd.Flags().StringVar(&mcpServer, "server", "aceteam", "MCP server name to proxy (default: aceteam)")
+	mcpCmd.Flags().StringVar(&mcpEndpointURL, "endpoint-url", "", "Exact MCP endpoint URL (overrides --api-url/--server)")
+	mcpCmd.Flags().BoolVar(&mcpMemoryConfig, "memory-config", false, "Read the scoped key and endpoint from memory.yaml")
 }
