@@ -108,3 +108,17 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: go build -o /dev/null ./cmd/citadel
+
+      # EVERY package, not just the shipped binary. ./cmd/citadel alone left a
+      # blind spot: internal/nvr used Unix-only syscalls and broke `go build ./...`
+      # for GOOS=windows for weeks (#663) while this matrix stayed green, because
+      # only ./cmd/nvrconfig imports it. Releases were unaffected, which is
+      # exactly what made it invisible -- the failure landed on whoever next
+      # checked their own Windows build and found a break that was not theirs.
+      # No -o: a multi-package build discards its output.
+      - name: go build ./... ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
