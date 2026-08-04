@@ -139,23 +139,31 @@ func (s *WorkerState) RecordJobDone(ok bool) {
 
 // WorkerSnapshot is a point-in-time, JSON-serializable view of WorkerState.
 type WorkerSnapshot struct {
-	WorkerID          string     `json:"worker_id"`
-	Source            string     `json:"source"`
-	ConsumerGroup     string     `json:"consumer_group"`
-	Queues            []string   `json:"queues"`
-	PerNodeQueue      string     `json:"per_node_queue,omitempty"`
-	HeadscaleNodeID   string     `json:"headscale_node_id,omitempty"`
-	OrgID             string     `json:"org_id,omitempty"`
-	Consuming         bool       `json:"consuming"`
-	StartedAt         time.Time  `json:"started_at"`
-	UptimeSeconds     int64      `json:"uptime_seconds"`
-	LastPollAt        *time.Time `json:"last_poll_at,omitempty"`
-	LastJobAt         *time.Time `json:"last_job_at,omitempty"`
-	LastConsumeStatus int        `json:"last_consume_status"`
-	LastConsumeError  string     `json:"last_consume_error,omitempty"`
-	InFlight          int64      `json:"in_flight"`
-	Processed         int64      `json:"processed"`
-	Failed            int64      `json:"failed"`
+	WorkerID        string   `json:"worker_id"`
+	Source          string   `json:"source"`
+	ConsumerGroup   string   `json:"consumer_group"`
+	Queues          []string `json:"queues"`
+	PerNodeQueue    string   `json:"per_node_queue,omitempty"`
+	HeadscaleNodeID string   `json:"headscale_node_id,omitempty"`
+	// IdentityUnresolved reports that this worker never resolved its Headscale
+	// node ID. It is stated POSITIVELY rather than left to the absence of
+	// HeadscaleNodeID (which is omitempty, so a degraded node was previously
+	// indistinguishable from an older payload) because it changes what the node
+	// will do: with no identity it declines every target_node-addressed job
+	// (citadel-cli#654). Untargeted work still runs, so the node looks healthy
+	// on every other signal -- this is the field that explains the timeouts.
+	IdentityUnresolved bool       `json:"identity_unresolved,omitempty"`
+	OrgID              string     `json:"org_id,omitempty"`
+	Consuming          bool       `json:"consuming"`
+	StartedAt          time.Time  `json:"started_at"`
+	UptimeSeconds      int64      `json:"uptime_seconds"`
+	LastPollAt         *time.Time `json:"last_poll_at,omitempty"`
+	LastJobAt          *time.Time `json:"last_job_at,omitempty"`
+	LastConsumeStatus  int        `json:"last_consume_status"`
+	LastConsumeError   string     `json:"last_consume_error,omitempty"`
+	InFlight           int64      `json:"in_flight"`
+	Processed          int64      `json:"processed"`
+	Failed             int64      `json:"failed"`
 }
 
 // Snapshot returns a consistent copy of the current state. Safe for concurrent
@@ -176,6 +184,7 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 		OrgID:           s.orgID,
 		StartedAt:       s.startedAt,
 	}
+	snap.IdentityUnresolved = s.headscaleID == ""
 	s.mu.RUnlock()
 
 	snap.UptimeSeconds = int64(time.Since(snap.StartedAt).Seconds())

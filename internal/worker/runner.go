@@ -50,10 +50,14 @@ type RunnerConfig struct {
 	// WorkerID identifies this worker instance
 	WorkerID string
 
-	// NodeID is this node's Headscale numeric node ID (e.g. "758").
-	// Used to filter jobs with a target_node field: if set and the job's
-	// target_node doesn't match, the job is acknowledged and skipped.
-	// When empty, target_node filtering is disabled (all jobs are processed).
+	// NodeID is this node's Headscale numeric node ID (e.g. "758"). It is the
+	// identity the target_node filter compares against: a job addressed to a
+	// different node is acknowledged and skipped.
+	//
+	// An empty NodeID means this node could not resolve its own identity. The
+	// filter stays ACTIVE in that case (citadel-cli#654) -- an unidentified node
+	// matches no target_node at all, so it declines every addressed job rather
+	// than claiming work meant for a peer. Untargeted jobs are unaffected.
 	NodeID string
 
 	// AgentVersion is this node's citadel build version (e.g. "v2.46.0").
@@ -363,15 +367,29 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	// Target-node filter: when per-node consumer groups are used, every node
 	// sees every message on the shared org queue. If the job specifies a
 	// target_node that doesn't match this node's Headscale ID, acknowledge
-	// and skip it silently -- the correct node will process it from its own
-	// read position. When this node's ID is unknown (empty), skip filtering
-	// to preserve pre-filter behavior and avoid dropping jobs.
-	if r.config.NodeID != "" {
-		if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
+	// and skip it -- the addressed node processes it from its own read
+	// position, and our Ack only clears OUR consumer group's pending list.
+	//
+	// The filter is UNCONDITIONAL, including when this node's own ID is unknown
+	// (citadel-cli#654). It used to be gated on NodeID != "", which made an
+	// identity failure fail OPEN: a node that could not resolve its Headscale ID
+	// matched nothing, so it claimed and executed every addressed job it saw off
+	// a shared stream -- including SHELL_COMMAND/terminal_exec work an operator
+	// aimed at a DIFFERENT machine -- while the real target sat waiting out its
+	// timeout. Failing closed costs a timeout on the addressed job and says so in
+	// the log; failing open ran it on the wrong host. The platform's per-node
+	// streams (aceteam#6889) remove most of the blast radius, but it still falls
+	// back to the shared stream during a mixed-version rollout, where this pin is
+	// the only thing routing the job.
+	if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
+		if r.config.NodeID == "" {
+			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
+				"so it cannot claim addressed work (citadel-cli#654)", job.ID, targetNode)
+		} else {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
-			r.source.Ack(ctx, job)
-			return
 		}
+		r.source.Ack(ctx, job)
+		return
 	}
 
 	// Claim-ack (aceteam#6000): publish a lightweight "claimed" event the moment

@@ -108,3 +108,24 @@ func TestWorkerStateConcurrent(t *testing.T) {
 		t.Fatalf("expected 50 processed, got %d", got)
 	}
 }
+
+// TestSnapshotIdentityUnresolved pins the operator-facing half of
+// citadel-cli#654. A node that never resolved its Headscale ID declines every
+// target_node-addressed job, yet stays green on every other signal (it polls,
+// it heartbeats, it serves untargeted work). IdentityUnresolved is the field
+// that explains the resulting timeouts, so it must be asserted POSITIVELY --
+// HeadscaleNodeID is omitempty, which makes a degraded node indistinguishable
+// from an older payload that simply never carried the field.
+func TestSnapshotIdentityUnresolved(t *testing.T) {
+	unidentified := NewWorkerState()
+	unidentified.SetIdentity("w", "redis", "citadel-somehost", "", "org-1")
+	if snap := unidentified.Snapshot(); !snap.IdentityUnresolved {
+		t.Error("expected IdentityUnresolved=true when the Headscale node ID is empty")
+	}
+
+	identified := NewWorkerState()
+	identified.SetIdentity("w", "redis", "citadel-node-758", "758", "org-1")
+	if snap := identified.Snapshot(); snap.IdentityUnresolved {
+		t.Error("expected IdentityUnresolved=false when the Headscale node ID resolved")
+	}
+}
