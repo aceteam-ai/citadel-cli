@@ -160,11 +160,34 @@ type StartFlowRequest struct {
 	Hostname      string `json:"hostname,omitempty"`
 	MachineID     string `json:"machine_id,omitempty"`
 	ForceNew      bool   `json:"force_new,omitempty"`
+	// DeviceKind selects the backend authorization path. Absent (empty) reads
+	// as "citadel" server-side, so existing callers are unaffected. The memory
+	// onboarding installer (aceteam #7160) sends "memory" so the backend mints
+	// a scoped act_ API key instead of a Headscale preauthkey.
+	DeviceKind string `json:"device_kind,omitempty"`
 }
 
 // StartFlowOptions contains options for starting the device authorization flow
 type StartFlowOptions struct {
 	ForceNew bool // Force fresh registration, ignoring existing machine mapping
+	// DeviceKind, when set (e.g. "memory"), is forwarded to the /start endpoint
+	// to select a non-citadel authorization path. Empty = citadel (default).
+	DeviceKind string
+}
+
+// MemoryTokenResponse is the poll response for a device_kind:"memory" flow
+// (aceteam #7160). Unlike the citadel TokenResponse (which returns a Headscale
+// authkey and signals pending via an HTTP 400 authorization_pending error),
+// the memory endpoint always returns HTTP 200 and signals lifecycle via the
+// Status field. On approval it carries a scoped act_ API key in APIKey — the
+// same credential external MCP clients (like Claude Code) authenticate with.
+type MemoryTokenResponse struct {
+	Status    string   `json:"status"` // pending | approved | expired | denied
+	APIKey    string   `json:"api_key,omitempty"`
+	ExpiresIn *int     `json:"expires_in,omitempty"` // nullable; memory keys are minted without expiry
+	OrgID     string   `json:"org_id,omitempty"`
+	OrgName   string   `json:"org_name,omitempty"`
+	Scopes    []string `json:"scopes,omitempty"`
 }
 
 // TokenRequest represents the request body for /token endpoint
@@ -205,6 +228,7 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	// Apply options if provided
 	if opts != nil {
 		reqBody.ForceNew = opts.ForceNew
+		reqBody.DeviceKind = opts.DeviceKind
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -353,6 +377,91 @@ func (c *DeviceAuthClient) CheckToken(deviceCode string) (*TokenResponse, error)
 	}
 
 	return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+}
+
+// PollForMemoryToken polls the /token endpoint for a device_kind:"memory" flow
+// until the device is approved, denied, expires, or the client times out.
+//
+// The memory endpoint always returns HTTP 200 with a Status field (it does NOT
+// use the RFC 8628 authorization_pending error), so this method cannot reuse
+// PollForToken. The citadel PollForToken path is left untouched.
+func (c *DeviceAuthClient) PollForMemoryToken(deviceCode string, interval int) (*MemoryTokenResponse, error) {
+	if interval <= 0 {
+		interval = 5
+	}
+	return c.pollMemory(deviceCode, time.Duration(interval)*time.Second, 10*time.Minute)
+}
+
+// pollMemory is the duration-parameterized core of PollForMemoryToken (tests
+// pass short durations to avoid real sleeps).
+func (c *DeviceAuthClient) pollMemory(deviceCode string, pollingInterval, timeout time.Duration) (*MemoryTokenResponse, error) {
+	startTime := time.Now()
+
+	for time.Since(startTime) < timeout {
+		resp, err := c.checkMemoryToken(deviceCode)
+		if err != nil {
+			return nil, err
+		}
+
+		switch resp.Status {
+		case "approved":
+			if resp.APIKey == "" {
+				return nil, fmt.Errorf("device approved but no API key was returned")
+			}
+			return resp, nil
+		case "denied":
+			return nil, fmt.Errorf("authorization denied by user")
+		case "expired":
+			return nil, fmt.Errorf("device code expired, please run the command again")
+		case "pending", "":
+			// keep polling
+		default:
+			// Unknown/future status: treat as pending rather than hard-failing.
+		}
+
+		time.Sleep(pollingInterval)
+	}
+
+	return nil, fmt.Errorf("authentication timeout after 10 minutes")
+}
+
+// checkMemoryToken makes a single /token request for a memory-kind device.
+func (c *DeviceAuthClient) checkMemoryToken(deviceCode string) (*MemoryTokenResponse, error) {
+	url := c.baseURL + "/api/fabric/device-auth/token"
+
+	reqBody := TokenRequest{
+		DeviceCode: deviceCode,
+		GrantType:  "urn:ietf:params:oauth:grant-type:device_code",
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, classifyNetworkError(err, c.baseURL)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, fmt.Errorf("authentication service unavailable")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	var out MemoryTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	return &out, nil
 }
 
 // Error implements the error interface for TokenError
