@@ -855,7 +855,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Ensure network connection is established (reconnects if state exists).
 	// Uses attemptVPNRecovery (shared with 'citadel reconnect') to handle
 	// stale state: IP-preserving reconnect first, then clear + fresh connect.
-	network.SetLogf(Debug)
+	// (network.SetLogf is wired once in root.go's PersistentPreRun -- #662.)
 	Log("verifying network connection (state_dir=%s, has_state=%v)...",
 		network.GetStateDir(), network.HasState())
 	connected, err := network.VerifyOrReconnect(ctx)

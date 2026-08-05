@@ -69,8 +69,8 @@ func runReconnect() {
 		apiBaseURL = authServiceURL
 	}
 
-	// Wire up diagnostic logging
-	network.SetLogf(Debug)
+	// Diagnostic logging is wired once in root.go's PersistentPreRun (#662),
+	// so every command gets it -- not just the ones that remembered.
 
 	var result VPNRecoveryResult
 	if reconnectForce {
