@@ -347,6 +347,29 @@ with open('$tmp', 'w') as f:
 }
 
 # ---------------------------------------------------------------------------
+# Node-local tools the agent shells out to
+# ---------------------------------------------------------------------------
+# poppler-utils provides pdftoppm, the renderer behind the document_rasterize
+# job (issue #675): a scanned PDF page has to be an image before an OCR model
+# will look at it. The agent detects its absence and fails that job with an
+# install instruction, so a node without it stays healthy for everything else.
+install_node_tools() {
+    step "Installing node tools"
+
+    if command -v pdftoppm >/dev/null 2>&1; then
+        ok "PDF renderer already installed ($(pdftoppm -v 2>&1 | head -1))"
+        return 0
+    fi
+
+    if ! apt-get install -y -qq poppler-utils >> "$LOG_FILE" 2>&1; then
+        warn "Failed to install poppler-utils - PDF rasterization jobs will report it as missing"
+        return 0
+    fi
+
+    ok "PDF renderer installed (poppler-utils)"
+}
+
+# ---------------------------------------------------------------------------
 # Download and install citadel binary
 # ---------------------------------------------------------------------------
 install_citadel_binary() {
@@ -628,6 +651,7 @@ main() {
     install_nvidia_drivers
     install_docker
     install_nvidia_toolkit
+    install_node_tools
     install_citadel_binary
     setup_citadel
     setup_systemd_service

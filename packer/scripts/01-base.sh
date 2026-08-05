@@ -24,6 +24,9 @@ wait_for_apt
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
+# poppler-utils provides pdftoppm, the renderer behind the document_rasterize
+# job (issue #675). The agent reports its absence as a capability error, so a
+# baked image should just have it.
 apt-get install -y --no-install-recommends \
     curl \
     wget \
@@ -44,7 +47,8 @@ apt-get install -y --no-install-recommends \
     net-tools \
     iotop \
     sysstat \
-    nvme-cli
+    nvme-cli \
+    poppler-utils
 
 # Clean apt cache to reduce image size
 apt-get clean

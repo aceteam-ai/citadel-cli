@@ -91,6 +91,14 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 		llmHandler = llmHandler.WithSwapper(swapper)
 	}
 	handlers = append(handlers, llmHandler)
+	// document_rasterize (issue #675): render selected PDF pages to images so a
+	// scanned document can reach an OCR model, which only accepts raster images.
+	// Registered unconditionally alongside llm_inference: it needs no workspace
+	// or config, and the caller renders and then OCRs on the SAME node, so a
+	// control-center-only node must answer both or the pair splits.
+	handlers = append(handlers, worker.NewDocumentRasterizeHandler(worker.DocumentRasterizeConfig{
+		Log: opts.HandlerLog,
+	}))
 	return handlers
 }
 
