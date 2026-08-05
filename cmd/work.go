@@ -1022,12 +1022,22 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 		if perNodeOrgID != "" {
 			perNodeQueue := nodeQueueName(perNodeOrgID, headscaleNodeID)
+			wakeChannel := nodeWakeChannel(headscaleNodeID)
 			switch src := source.(type) {
 			case *worker.APISource:
 				src.AddQueue(perNodeQueue)
+				// Push-wake (issue #7270): drain the per-node stream immediately on a
+				// backend nudge instead of on the next ~5s poll. Purely additive — a
+				// subscribe failure just leaves this node correctly poll-only.
+				if err := src.EnableWake(ctx, wakeChannel); err != nil {
+					Debug("per-node push-wake unavailable (poll-only): %v", err)
+				}
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, perNodeQueue); err != nil {
 					fmt.Fprintf(os.Stderr, "   - Warning: per-node stream subscribe failed: %v\n", err)
+				}
+				if err := src.EnableWake(ctx, wakeChannel); err != nil {
+					Debug("per-node push-wake unavailable (poll-only): %v", err)
 				}
 			}
 			workerState.SetPerNodeQueue(perNodeQueue)
@@ -2397,6 +2407,20 @@ func hasCapabilityTag(tags []string, tag string) bool {
 //	jobs:v1:shell:org_{org_id}:node:{node_id}
 func nodeQueueName(orgID, nodeID string) string {
 	return fmt.Sprintf("jobs:v1:shell:org_%s:node:%s", orgID, nodeID)
+}
+
+// nodeWakeChannel returns the per-node Pub/Sub wake channel for push-based
+// dispatch (issue #7270). The backend PUBLISHes a nudge here right after XADDing
+// a targeted job to this node's per-node stream, and the worker subscribes so it
+// drains that stream immediately instead of waiting out its ~5s poll block.
+//
+// Keyed by the Headscale numeric node ID alone (globally unique across the
+// fabric), so it is org-agnostic — this literal MUST match the backend's
+// utils.queue_names.build_node_wake_channel (guarded by TestNodeWakeChannel and
+// a sibling test in the aceteam repo, since the two repos cannot share a
+// constant).
+func nodeWakeChannel(nodeID string) string {
+	return fmt.Sprintf("wake:v1:node:%s", nodeID)
 }
 
 // getWorkHostname returns the hostname to use for VPN reconnection.

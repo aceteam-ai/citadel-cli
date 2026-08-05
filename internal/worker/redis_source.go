@@ -39,6 +39,11 @@ type RedisSource struct {
 	// appended to at runtime by AddQueue (e.g. /agent/resubscribe, issue #236).
 	mu         sync.RWMutex
 	queueNames []string // resolved list of queues to consume from
+
+	// wake, when set (via EnableWake), makes Next return immediately on a
+	// per-node Pub/Sub nudge instead of waiting out the blocking poll (issue
+	// #7270). Nil for the normal poll-only path.
+	wake *wakePump
 }
 
 // RedisSourceConfig holds configuration for RedisSource.
@@ -148,12 +153,64 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 }
 
 // Next blocks until a job is available or context is cancelled.
+//
+// With push-wake enabled (EnableWake), it delegates to the wakePump so a
+// per-node nudge triggers an immediate non-blocking drain; otherwise it does a
+// single blocking read at the configured BlockMs (the unchanged poll-only path).
 func (s *RedisSource) Next(ctx context.Context) (*Job, error) {
+	if w := s.getWake(); w != nil {
+		return w.next(ctx)
+	}
+	return s.readOnce(ctx, s.config.BlockMs)
+}
+
+// getWake reads the wake pump under mu. EnableWake may be called from a
+// different goroutine than the run loop (e.g. /agent/resubscribe), so the
+// pointer is guarded like queueNames rather than read racily.
+func (s *RedisSource) getWake() *wakePump {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wake
+}
+
+// readOnce performs exactly one read of the subscribed queue(s) with the given
+// block timeout (redisclient.NonBlockingMs for an immediate read). It is the
+// core used by both the poll-only path and the wakePump's blocking/non-blocking
+// closures.
+func (s *RedisSource) readOnce(ctx context.Context, blockMs int) (*Job, error) {
 	queues := s.snapshotQueues()
 	if len(queues) == 1 {
-		return s.nextSingle(ctx, queues[0])
+		return s.nextSingle(ctx, queues[0], blockMs)
 	}
-	return s.nextMulti(ctx, queues)
+	return s.nextMulti(ctx, queues, blockMs)
+}
+
+// EnableWake subscribes to the node's Pub/Sub wake channel and routes Next
+// through the wakePump so a targeted-dispatch nudge is consumed immediately
+// (issue #7270). Idempotent-ish: a second call is ignored. Best-effort — on a
+// subscribe failure it returns the error and leaves the source in its normal
+// poll-only mode (the ~5s poll remains the backstop).
+func (s *RedisSource) EnableWake(ctx context.Context, channel string) error {
+	if channel == "" || s.client == nil || s.getWake() != nil {
+		return nil
+	}
+	pump := newWakePump(
+		func(c context.Context) (*Job, error) { return s.readOnce(c, s.config.BlockMs) },
+		func(c context.Context) (*Job, error) { return s.readOnce(c, redisclient.NonBlockingMs) },
+	)
+	if err := s.client.WatchWake(ctx, channel, pump.signal); err != nil {
+		return err
+	}
+	pump.start(ctx)
+	s.mu.Lock()
+	if s.wake != nil { // lost a race with a concurrent EnableWake; keep the winner
+		s.mu.Unlock()
+		return nil
+	}
+	s.wake = pump
+	s.mu.Unlock()
+	s.log("info", "   - Push-wake enabled: %s", channel)
+	return nil
 }
 
 // snapshotQueues returns a stable copy of the queue list for one poll cycle,
@@ -165,8 +222,8 @@ func (s *RedisSource) snapshotQueues() []string {
 }
 
 // nextSingle reads from a single queue (original behavior).
-func (s *RedisSource) nextSingle(ctx context.Context, queue string) (*Job, error) {
-	redisJob, err := s.client.ReadJob(ctx)
+func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
+	redisJob, err := s.client.ReadJobBlock(ctx, blockMs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 	}
@@ -193,8 +250,8 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string) (*Job, error
 }
 
 // nextMulti reads from multiple queues simultaneously.
-func (s *RedisSource) nextMulti(ctx context.Context, queues []string) (*Job, error) {
-	redisJob, sourceQueue, err := s.client.ReadJobMulti(ctx, queues)
+func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
+	redisJob, sourceQueue, err := s.client.ReadJobMultiBlock(ctx, queues, blockMs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
 	}

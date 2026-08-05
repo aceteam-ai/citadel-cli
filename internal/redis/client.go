@@ -139,15 +139,28 @@ func (c *Client) EnsureConsumerGroups(ctx context.Context, queues []string) erro
 	return nil
 }
 
+// NonBlockingMs is the block value that makes a read return immediately (no
+// server-side XREADGROUP BLOCK). go-redis omits the BLOCK option when the block
+// duration is negative, so a negative millisecond count is a non-blocking read.
+// Used by the push-wake drain (issue #7270): on a wake nudge the worker reads
+// its per-node stream once, right now, instead of waiting out the poll block.
+const NonBlockingMs = -1
+
 // ReadJob reads the next available job from the stream using XREADGROUP.
 // Returns nil if no job is available within the block timeout.
 func (c *Client) ReadJob(ctx context.Context) (*Job, error) {
+	return c.ReadJobBlock(ctx, c.blockMs)
+}
+
+// ReadJobBlock is ReadJob with an explicit block timeout (ms). Pass
+// NonBlockingMs for an immediate, non-blocking read (issue #7270).
+func (c *Client) ReadJobBlock(ctx context.Context, blockMs int) (*Job, error) {
 	streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    c.consumerGroup,
 		Consumer: c.workerID,
 		Streams:  []string{c.queueName, ">"},
 		Count:    1,
-		Block:    time.Duration(c.blockMs) * time.Millisecond,
+		Block:    time.Duration(blockMs) * time.Millisecond,
 	}).Result()
 
 	if err != nil {
@@ -168,6 +181,12 @@ func (c *Client) ReadJob(ctx context.Context) (*Job, error) {
 // ReadJobMulti reads the next available job from multiple streams using XREADGROUP.
 // Returns the job and the queue it came from, or nil if no job is available.
 func (c *Client) ReadJobMulti(ctx context.Context, queues []string) (*Job, string, error) {
+	return c.ReadJobMultiBlock(ctx, queues, c.blockMs)
+}
+
+// ReadJobMultiBlock is ReadJobMulti with an explicit block timeout (ms). Pass
+// NonBlockingMs for an immediate, non-blocking read (issue #7270).
+func (c *Client) ReadJobMultiBlock(ctx context.Context, queues []string, blockMs int) (*Job, string, error) {
 	if len(queues) == 0 {
 		return nil, "", fmt.Errorf("no queues specified")
 	}
@@ -184,7 +203,7 @@ func (c *Client) ReadJobMulti(ctx context.Context, queues []string) (*Job, strin
 		Consumer: c.workerID,
 		Streams:  streamArgs,
 		Count:    1,
-		Block:    time.Duration(c.blockMs) * time.Millisecond,
+		Block:    time.Duration(blockMs) * time.Millisecond,
 	}).Result()
 
 	if err != nil {
@@ -485,6 +504,42 @@ func (c *Client) SetJobStatus(ctx context.Context, jobID, status string, data ma
 	}
 
 	return c.client.HSet(ctx, key, fields).Err()
+}
+
+// WatchWake subscribes to a Pub/Sub channel and invokes onWake for every
+// message received, until ctx is cancelled (issue #7270). It is the direct-Redis
+// half of push-based dispatch: the backend PUBLISHes a nudge on the node's wake
+// channel after a targeted XADD, and this fires onWake so the consume loop drains
+// its per-node stream immediately instead of waiting out its ~5s poll block.
+//
+// Best-effort by contract: the ~5s poll remains the correctness backstop, so a
+// dropped subscription only costs latency, never a job. The subscribe itself is
+// synchronous (so a bad channel surfaces immediately); message delivery then runs
+// in a background goroutine that exits on ctx cancellation.
+func (c *Client) WatchWake(ctx context.Context, channel string, onWake func()) error {
+	pubsub := c.client.Subscribe(ctx, channel)
+	// Wait for the subscribe to be confirmed so a failure is returned to the
+	// caller rather than swallowed in the goroutine.
+	if _, err := pubsub.Receive(ctx); err != nil {
+		_ = pubsub.Close()
+		return fmt.Errorf("failed to subscribe to wake channel %s: %w", channel, err)
+	}
+	ch := pubsub.Channel()
+	go func() {
+		defer pubsub.Close()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				onWake()
+			}
+		}
+	}()
+	return nil
 }
 
 // Close closes the Redis connection.
