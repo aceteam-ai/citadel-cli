@@ -182,6 +182,51 @@ func (m *ModelDiscovery) discoverOllamaModels(ctx context.Context, port int) ([]
 	return models, nil
 }
 
+// DiscoverEmbeddingModel queries an OpenAI-compatible embedding server for the
+// model it is actually serving (citadel-cli#690).
+//
+// Kept off DiscoverModels deliberately: an embedding server is not a chat
+// engine, and routing it through the LLM switch is exactly the mis-attribution
+// this fixes. Text Embeddings Inference exposes GET /info with a `model_id`
+// field naming the loaded model; it is the only model a TEI process serves, so
+// a single-element slice is the whole servable set.
+//
+// A server that answers but names no model returns an empty slice and nil
+// error: running with nothing to report is real, reportable state. Transport
+// or parse failures return an error so the caller leaves Models empty rather
+// than inventing one.
+func (m *ModelDiscovery) DiscoverEmbeddingModel(ctx context.Context, port int) ([]string, error) {
+	url := fmt.Sprintf("http://%s:%d/info", m.host, port)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query embedding server info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embedding server returned status %d", resp.StatusCode)
+	}
+
+	var infoResp struct {
+		ModelID string `json:"model_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&infoResp); err != nil {
+		return nil, fmt.Errorf("failed to parse embedding server info: %w", err)
+	}
+
+	id := strings.TrimSpace(infoResp.ModelID)
+	if id == "" {
+		return []string{}, nil
+	}
+	return []string{id}, nil
+}
+
 // CheckServiceHealth performs a health check on an LLM service.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
 	switch serviceType {
