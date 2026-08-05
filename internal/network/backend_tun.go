@@ -164,6 +164,10 @@ func (b *tunBackend) Up(ctx context.Context) error {
 		rtr.Close()
 		return fmt.Errorf("dns configurator: %w", err)
 	}
+	// No-op except on macOS, where the DNS manager hands down a
+	// global-resolver config that /etc/resolver cannot express, silently
+	// dropping the nameservers. See dns_darwin.go and issue #676.
+	dnsCfg = newSplitDNSConfigurator(dnsCfg)
 
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		Tun:           dev,

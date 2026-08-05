@@ -331,21 +331,51 @@ login` had already established on this Mac, with no authkey needed.
 **Teardown** on SIGINT: `utun` removed, 0 leftover `100.x` routes,
 `/etc/resolver` emptied, and `scutil` back to the LAN resolver.
 
-**Known gap — MagicDNS names do not resolve on macOS (issue #676).** The mesh is
-reachable by IP and `dig @100.100.100.100 ubuntu-gpu.internal` answers
-correctly, but `ping ubuntu-gpu.internal` fails. `darwinConfigurator.SetDNS`
-writes the `nameserver` file only for `cfg.MatchDomains`, and our OS config
-comes out in global mode with `MatchDomains` empty:
+**MagicDNS on macOS — was broken, now fixed (#676).**
+
+`darwinConfigurator.SetDNS` writes the `nameserver` file only inside
+`for _, d := range cfg.MatchDomains`, and `net/dns/manager.go` excludes Apple
+from the native split-DNS path, then repopulates `MatchDomains` only when the
+base config is unreadable or on iOS. macOS therefore arrived in global mode:
 
 ```
 dns: OScfg: {Nameservers:[100.100.100.100 ...] SearchDomains:[internal. home.] }
 ```
 
-so only `/etc/resolver/search.tailscale` is written and the nameservers are
-silently dropped. `/etc/resolver` can only express *split* DNS. Linux is
-unaffected. The likely fix is to pin split-DNS mode on macOS, which is the
-better posture for citadel anyway — answer for the fabric domain rather than
-becoming the machine's global resolver.
+`MatchDomains` empty means "be the global resolver", which `/etc/resolver`
+cannot express — so the loop never ran, only `search.tailscale` was written,
+and the nameservers were silently discarded. Routing worked and
+`dig @100.100.100.100 peer.internal` answered, but `ping peer.internal` could
+not resolve, so the failure read as "my DNS is broken", not "citadel is".
+
+`internal/network/dns_darwin.go` wraps the OS configurator: when
+`MatchDomains` is empty but nameservers were requested, it scopes them to the
+search domains the **tailnet** contributed — computed by subtracting the OS's
+own base config, so the machine's LAN domain (`home.`) is left on the LAN
+resolver instead of being routed through the mesh. If the base config cannot
+be read it changes nothing and says so, rather than guessing and risking
+capture of the LAN domain.
+
+This deliberately moves macOS from global to split DNS. That is the posture
+citadel wants regardless of the OS constraint: machine-wide *routing* does not
+require owning every DNS query, and a narrower claim makes a failed teardown
+far less consequential.
+
+Verified live on macOS after the fix:
+
+```
+/etc/resolver/internal  ->  nameserver 100.100.100.100
+                            nameserver fd7a:115c:a1e0::53
+ping ubuntu-gpu.internal   ->  2/2 replies
+scutil resolver #1         ->  nameserver 192.168.2.1   (LAN untouched)
+github.com                 ->  resolves normally
+log: "scoping to tailnet domains [internal.] so /etc/resolver can express it"
+```
+
+Known limitation: the ~65 reverse-DNS `.arpa` domains for `100.64/10` are not
+matched (that would mean ~65 files under `/etc/resolver`), so reverse lookups
+such as `host 100.64.0.78` still go to the LAN resolver. Forward names — the
+actual ask — work.
 
 ## Slices
 
@@ -357,8 +387,8 @@ becoming the machine's global resolver.
    errors rather than downgrading; `--check` creates and removes the interface
    without starting the engine, so it is safe on a box running other VPN
    software.
-4. **MagicDNS `*.internal`** — verified resolving on Windows and Linux; broken
-   on macOS (#676).
+4. **MagicDNS `*.internal`** — DONE, verified resolving on Windows, Linux and
+   macOS (macOS needed #676).
 5. **Linux** (`/dev/net/tun`) — DONE, verified on a live fabric node
    alongside a running tailscaled (see above).
 6. **Windows** — adapter identity, router registration and COM init all DONE
