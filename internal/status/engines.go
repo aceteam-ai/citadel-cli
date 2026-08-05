@@ -187,7 +187,11 @@ func managedEnginePortIfRunning(engineBin, name string) (port int, running bool)
 	if containerRunning(engineBin, "citadel-"+name) {
 		return managedEngineHostPort(name), true
 	}
-	if nativesvc.IsNativeServiceRunning(name) {
+	// Serving, not process-present (#649). This function decides what the node
+	// tells the fabric it can serve, so a `pgrep` match on a dead engine here
+	// became "keep routing inference to this node" -- every request then timed
+	// out. IsNativeServiceServing asks the only question routing depends on.
+	if nativesvc.IsNativeServiceServing(name) {
 		if p, ok := nativesvc.GetServicePort(name); ok {
 			return p, true
 		}

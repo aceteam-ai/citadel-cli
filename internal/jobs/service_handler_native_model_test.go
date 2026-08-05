@@ -8,6 +8,7 @@
 package jobs
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +16,55 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/services"
 )
+
+// serveNativeEngine makes the named native engine "already serving" for the
+// duration of the test by binding a real listener and pointing its
+// NativeServices entry at that port.
+//
+// Since #649 the already-running short-circuit asks whether the ENGINE ANSWERS,
+// not whether a process name matches, so a fake `pgrep` that exits 0 no longer
+// simulates a running engine -- which is the entire point of that fix. A real
+// listener on an ephemeral port is used rather than the engine's true port so
+// the suite never collides with an actual ollama on the developer's machine.
+// deadNativeEngine is the inverse of serveNativeEngine: it points the engine at
+// a port that is guaranteed closed (bound to claim it, then released).
+//
+// It exists so a test about a DEAD engine never depends on the engine's real
+// port being free on the machine running the suite -- a developer with ollama
+// listening on 11434 would otherwise see this test fail for the wrong reason,
+// and CI and laptop would disagree.
+func deadNativeEngine(t *testing.T, name string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	original := services.NativeServices[name]
+	patched := original
+	patched.Port = port
+	services.NativeServices[name] = patched
+	t.Cleanup(func() { services.NativeServices[name] = original })
+}
+
+func serveNativeEngine(t *testing.T, name string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	original := services.NativeServices[name]
+	patched := original
+	patched.Port = ln.Addr().(*net.TCPAddr).Port
+	services.NativeServices[name] = patched
+	t.Cleanup(func() { services.NativeServices[name] = original })
+}
 
 // fakeBinDir creates a temp dir set as the ONLY PATH entry, and returns it
 // together with a helper that writes an executable shell script into it.
@@ -113,7 +162,8 @@ exit 0`)
 func TestServiceStartNativeOllama_PullsModel(t *testing.T) {
 	dir, write := fakeBinDir(t)
 	argsFile := filepath.Join(dir, "args.log")
-	write("pgrep", "exit 0") // "already running"
+	write("pgrep", "exit 0") // a process matches -- no longer enough on its own (#649)
+	serveNativeEngine(t, "ollama")
 	write("ollama", `echo "$@" >> `+argsFile+`
 exit 0`)
 	h := newNativeOllamaHandler(t)
@@ -144,6 +194,7 @@ exit 0`)
 func TestServiceStartNativeOllama_PullFailureIsJobFailure(t *testing.T) {
 	_, write := fakeBinDir(t)
 	write("pgrep", "exit 0") // running, but no ollama binary on PATH
+	serveNativeEngine(t, "ollama")
 	h := newNativeOllamaHandler(t)
 
 	_, err := h.Execute(JobContext{}, &nexus.Job{
@@ -161,7 +212,8 @@ func TestServiceStartNativeOllama_PullFailureIsJobFailure(t *testing.T) {
 // ignored and the start succeeds without any pull attempt.
 func TestServiceStartNativeNonOllama_ModelStillIgnored(t *testing.T) {
 	_, write := fakeBinDir(t)
-	write("pgrep", "exit 0") // llamacpp "already running"
+	write("pgrep", "exit 0") // llamacpp process matches
+	serveNativeEngine(t, "llamacpp")
 	h := newNativeOllamaHandler(t)
 
 	var logs []string
@@ -179,5 +231,51 @@ func TestServiceStartNativeNonOllama_ModelStillIgnored(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(logs, "\n"), "ignored") {
 		t.Errorf("expected 'ignored' log for non-ollama native engine, logs: %v", logs)
+	}
+}
+
+// TestServiceStartNativeOllama_DeadEngineIsStartedNotShortCircuited is the
+// handler-level regression test for #649.
+//
+// On node 1297 a `pgrep -f ollama` match made SERVICE_START report "already
+// running" while the engine was dead and the API answered nothing; the platform
+// kept advertising the node as serving and every routed request timed out. The
+// short-circuit must now key on the engine ANSWERING, so a process match with a
+// dead port has to fall through and actually start it.
+//
+// deadNativeEngine pins a closed port rather than relying on the engine's real
+// port being free, so the result does not depend on whether the machine running
+// the suite happens to have ollama up. Asserting that `ollama serve` was invoked (rather
+// than just checking the message) is what distinguishes a real start from a
+// reworded short-circuit.
+func TestServiceStartNativeOllama_DeadEngineIsStartedNotShortCircuited(t *testing.T) {
+	dir, write := fakeBinDir(t)
+	argsFile := filepath.Join(dir, "args.log")
+	write("pgrep", "exit 0")      // a matching process exists...
+	deadNativeEngine(t, "ollama") // ...but nothing answers on its port
+	write("ollama", `echo "$@" >> `+argsFile+`
+exit 0`)
+	h := newNativeOllamaHandler(t)
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "job-649-1",
+		Type:    "SERVICE_START",
+		Payload: map[string]string{"service": "ollama"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Assert on WHICH BRANCH the handler took, via the result message, rather
+	// than on the fake binary's side effects. StartNativeService uses cmd.Start(),
+	// so the child runs concurrently and any file it writes is a race the test
+	// would lose under load -- observed failing only inside a full `go test ./...`
+	// while passing for the package alone. The branch is the actual subject here:
+	// "already running" is the #649 bug, "started" is the fix.
+	if strings.Contains(string(out), "already running") {
+		t.Errorf("dead engine was short-circuited as already running (#649): %s", out)
+	}
+	if !strings.Contains(string(out), "started") {
+		t.Errorf("expected the handler to start the dead engine, got: %s", out)
 	}
 }
