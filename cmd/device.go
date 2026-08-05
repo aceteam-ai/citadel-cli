@@ -72,8 +72,11 @@ network membership alive automatically: when the session breaks or its key
 nears expiry, the device proves its identity with a certificate and rejoins
 without any human involvement.
 
-Requires the Tailscale client to be installed (device mode drives it; it does
-not replace it).`,
+Device mode is the one Citadel command that needs the Tailscale client
+installed: it deliberately drives the machine's existing system client so a
+laptop keeps its own traffic policies. Joining a compute node to the AceTeam
+Network ('citadel login', 'citadel init') needs no external client at all --
+that path is built into this binary.`,
 }
 
 var deviceEnrollCmd = &cobra.Command{
