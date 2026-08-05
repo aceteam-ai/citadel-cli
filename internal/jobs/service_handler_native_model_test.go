@@ -100,6 +100,9 @@ services:
 	if err := os.WriteFile(filepath.Join(dir, "citadel.yaml"), []byte(manifest), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// A native start records the engine's pid (#696); keep that out of the
+	// developer's real ~/.citadel-cli/run.
+	t.Setenv("CITADEL_RUN_DIR", t.TempDir())
 	return NewServiceHandler(dir)
 }
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"time"
 
 	svcports "github.com/aceteam-ai/citadel-cli/services"
@@ -183,6 +182,19 @@ func StartNativeService(serviceName string, logDir string) (*NativeProcess, erro
 		return nil, fmt.Errorf("failed to start service: %w", err)
 	}
 
+	// Record the PID so a later stop can signal THIS process instead of
+	// pattern-matching command lines (#696). Every caller discards the returned
+	// NativeProcess, and the stop may arrive in a different citadel process
+	// entirely, so the PID has to outlive this one on disk.
+	//
+	// A pidfile that cannot be written is not a start failure: the engine is up,
+	// and stop still has its (narrow) name-matching fallback. Reported through
+	// the service's own log file, which is where anything else about this engine
+	// would be looked for.
+	if err := writeNativePidFile(serviceName, cmd.Process.Pid); err != nil {
+		fmt.Fprintf(logFile, "citadel: could not record pid for %s: %v\n", serviceName, err)
+	}
+
 	return &NativeProcess{
 		Name:    serviceName,
 		Cmd:     cmd,
@@ -261,25 +273,8 @@ func IsNativeServiceServing(serviceName string) bool {
 	return portAnswers(service.Port, nativeProbeTimeout)
 }
 
-// StopNativeService stops a running native service
-func StopNativeService(serviceName string) error {
-	service, ok := NativeServices[serviceName]
-	if !ok {
-		return fmt.Errorf("unknown service: %s", serviceName)
-	}
-
-	// Find and kill the process
-	cmd := exec.Command("pkill", "-f", service.Binary)
-	if err := cmd.Run(); err != nil {
-		// Check if it's just "no process found" which is OK
-		if strings.Contains(err.Error(), "no process") {
-			return nil
-		}
-		return fmt.Errorf("failed to stop service: %w", err)
-	}
-
-	return nil
-}
+// StopNativeService lives in native_stop.go: it targets the PID recorded at
+// start rather than pattern-matching command lines (#696).
 
 // WaitForServiceReady waits for a service to be ready by checking its port.
 //
