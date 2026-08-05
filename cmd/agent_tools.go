@@ -87,6 +87,9 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 				Epoch:      spec.Epoch,
 			})
 		},
+		Unexpose: func(name string) (any, error) {
+			return liveExposeOps{}.Unexpose(ctx, name)
+		},
 	}
 }
 
@@ -341,9 +344,15 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 		checks = append(checks, map[string]any{"name": name, "ok": ok, "detail": detail})
 	}
 
-	// 1. Network / identity
+	// 1. Network / identity. The empty-ID detail changed with citadel-cli#654:
+	// an unidentified node no longer claims addressed work off the shared
+	// stream, it DECLINES it. The old wording ("falls back to the shared org
+	// stream") described the fail-open this node no longer has, and would send
+	// an operator looking for a peer that stole the job when in fact nothing ran
+	// it.
 	netOK := snap.HeadscaleNodeID != ""
-	add("headscale_node_id_resolved", netOK, valueOrEmpty(snap.HeadscaleNodeID, "unresolved (node-targeted jobs fall back to shared org stream)"))
+	add("headscale_node_id_resolved", netOK, valueOrEmpty(snap.HeadscaleNodeID,
+		"unresolved — this node declines every target_node-addressed job (citadel-cli#654), so node-targeted work times out instead of running here"))
 
 	// 2. Org id known
 	orgOK := snap.OrgID != ""
@@ -369,7 +378,7 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 	diagnosis := "Node looks healthy for per-node job routing."
 	switch {
 	case !netOK:
-		diagnosis = "Headscale node ID is unresolved, so the per-node shell stream was never subscribed. Per-node jobs (terminal_exec, code_*, file reads) fall back to the shared org stream where a peer may claim them. Try /agent/resubscribe or restart the worker after the VPN is fully connected."
+		diagnosis = "Headscale node ID is unresolved, so the per-node shell stream was never subscribed AND this node declines every target_node-addressed job (citadel-cli#654 — it cannot prove a job is meant for it, and claiming one would run a peer's work here). Node-targeted jobs (terminal_exec, code_*, file reads) aimed at this node therefore time out rather than executing. Try /agent/resubscribe, or restart the worker once the VPN is fully connected."
 	case !orgOK:
 		diagnosis = "Org ID is unknown, so the per-node shell stream was skipped. Re-run 'citadel init' to repopulate device config."
 	case !perNodeOK:

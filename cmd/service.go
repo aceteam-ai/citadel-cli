@@ -312,8 +312,11 @@ func macServiceWarning(serviceName string) string {
 
 // startNativeService starts a service using its native binary.
 func startNativeService(serviceName, configDir string) error {
-	// Check if already running
-	if services.IsNativeServiceRunning(serviceName) {
+	// Check if it is already SERVING, not merely that a matching process exists
+	// (issue #649). A dead engine with a lingering process match used to take
+	// this branch and report success, leaving the node advertising an engine
+	// that answered nothing.
+	if services.IsNativeServiceServing(serviceName) {
 		fmt.Printf("   ✅ Service %s is already running.\n", serviceName)
 		return nil
 	}

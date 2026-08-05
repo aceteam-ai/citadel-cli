@@ -1442,3 +1442,26 @@ Auto-generated log of every release.
   - feat: model hotswap phase 1 (pilot, #632) (#635)
 
 
+---
+
+## v2.97.0 — 2026-07-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 49 |
+| Lines added | +4215 |
+
+**Changes:**
+
+  - fix(jobs): accept a workspace reached through a symlink (#652)
+  - fix(release): write release state without GNU-only `sed -i` (#651)
+  - fix(gateway): persist exposures so they survive a worker restart (#647) (#648)
+  - fix(catalog): node-generated module secrets — unbreak nvr assignment/update (#637) (#646)
+  - feat(gateway): make ingress usable end-to-end — X-Ingress-Path + an exposure driver (#598) (#644)
+  - feat(nvr): raise shm_size to 512mb and add a node-local MQTT broker (#637) (#639)
+  - fix(runtime): don't select podman when its API socket is dead (#636) (#638)
+  - chore(hotswap): default model hotswap ON (break-glass disable only) (#641)
+  - feat: local semantic search (authorized roots + HNSW + TUI Search + citadel search) (#640)
+
+

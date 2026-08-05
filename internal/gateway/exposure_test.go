@@ -394,3 +394,145 @@ func TestNonExposeRouteStripsClientIngressPath(t *testing.T) {
 		t.Errorf("X-Ingress-Path = %q, want it stripped on a non-subpath route", got)
 	}
 }
+
+// Unexpose must revoke at BOTH layers. The policy delete alone already 404s
+// (exposureMiddleware is the sole gate), so a test that only checks the status
+// code would pass even if the route still pointed at a live backend. This one
+// asserts the backend is never reached — the property that makes revoke real
+// rather than cosmetic.
+func TestUnexposeStopsReachingTheBackend(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(backend.Close)
+
+	gw := NewServer(Config{Port: 0, NodeName: "n"})
+	gw.SetPermissions(&config.Permissions{})
+	gw.SetMeshResolver(&MockMeshResolver{Identity: &MeshPeerIdentity{SameOwner: true}})
+	if err := gw.Expose("svc", backendAddr(t, backend), &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatal(err)
+	}
+	for prefix, up := range gw.config.Upstreams {
+		gw.registerProxy(prefix, up)
+	}
+	h := gw.BuildHandler()
+
+	if w := doGet(h, "/expose/svc/"); w.Code != http.StatusOK {
+		t.Fatalf("before revoke: got %d, want 200", w.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("backend hits before revoke = %d, want 1", hits)
+	}
+
+	if !gw.Unexpose("svc") {
+		t.Error("Unexpose reported the exposure did not exist")
+	}
+
+	if w := doGet(h, "/expose/svc/"); w.Code != http.StatusNotFound {
+		t.Errorf("after Unexpose: got %d, want 404", w.Code)
+	}
+	if hits != 1 {
+		t.Errorf("backend was reached %d times after revoke (want 1, i.e. never again)", hits)
+	}
+
+	// The upstream target must be cleared too, so a route that somehow outlives
+	// the policy cannot proxy to the revoked service.
+	if up := gw.config.Upstreams[ExposeRoutePath("svc")]; up != nil && up.addr() != "" {
+		t.Errorf("upstream address = %q after revoke, want empty", up.addr())
+	}
+}
+
+// Revoking is idempotent, and the false return lets a caller say "not exposed"
+// rather than implying it tore something down.
+func TestUnexposeIsIdempotent(t *testing.T) {
+	gw := NewServer(Config{Port: 0, NodeName: "n"})
+	gw.SetPermissions(&config.Permissions{})
+
+	if gw.Unexpose("never-existed") {
+		t.Error("Unexpose of an unknown name returned true")
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(backend.Close)
+	if err := gw.Expose("svc", backendAddr(t, backend), &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatal(err)
+	}
+	if !gw.Unexpose("svc") {
+		t.Error("first Unexpose returned false")
+	}
+	if gw.Unexpose("svc") {
+		t.Error("second Unexpose returned true; revoke must be idempotent")
+	}
+}
+
+// A link token must not survive revocation. This is the shareable-credential
+// case: the holder has a signed token and needs no mesh identity, so if revoke
+// missed them the link would keep working for a stranger.
+func TestUnexposeInvalidatesOutstandingLinkTokens(t *testing.T) {
+	key := []byte("k")
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(backend.Close)
+
+	gw := NewServer(Config{Port: 0, NodeName: "n"})
+	gw.SetPermissions(&config.Permissions{})
+	gw.SetExposeSigningKey(key)
+	if err := gw.Expose("svc", backendAddr(t, backend), &ExposePolicy{Visibility: VisibilityLink, TokenEpoch: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for prefix, up := range gw.config.Upstreams {
+		gw.registerProxy(prefix, up)
+	}
+	h := gw.BuildHandler()
+
+	tok := MintLinkToken(key, "svc", 1, time.Now().Add(time.Hour))
+	if w := doGet(h, "/expose/svc/?access_token="+tok); w.Code != http.StatusOK {
+		t.Fatalf("before revoke: got %d, want 200", w.Code)
+	}
+
+	gw.Unexpose("svc")
+	if w := doGet(h, "/expose/svc/?access_token="+tok); w.Code != http.StatusNotFound {
+		t.Errorf("link token still worked after revoke: got %d, want 404", w.Code)
+	}
+}
+
+// Re-exposing after a revoke must work and must land on the NEW target. This is
+// the case the kept-Upstream design exists for: http.ServeMux cannot deregister
+// a handler, so the route object is reused and re-pointed rather than replaced.
+func TestReExposeAfterUnexposeUsesTheNewBackend(t *testing.T) {
+	var oldHits, newHits int
+	oldBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { oldHits++ }))
+	t.Cleanup(oldBackend.Close)
+	newBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(newBackend.Close)
+
+	gw := NewServer(Config{Port: 0, NodeName: "n"})
+	gw.SetPermissions(&config.Permissions{})
+	gw.SetMeshResolver(&MockMeshResolver{Identity: &MeshPeerIdentity{SameOwner: true}})
+	if err := gw.Expose("svc", backendAddr(t, oldBackend), &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatal(err)
+	}
+	for prefix, up := range gw.config.Upstreams {
+		gw.registerProxy(prefix, up)
+	}
+	h := gw.BuildHandler()
+	doGet(h, "/expose/svc/")
+	gw.Unexpose("svc")
+
+	if err := gw.Expose("svc", backendAddr(t, newBackend), &ExposePolicy{Visibility: VisibilityOrg}); err != nil {
+		t.Fatalf("re-Expose after Unexpose: %v", err)
+	}
+	if w := doGet(h, "/expose/svc/"); w.Code != http.StatusOK {
+		t.Fatalf("after re-Expose: got %d, want 200", w.Code)
+	}
+	if newHits != 1 {
+		t.Errorf("new backend hits = %d, want 1", newHits)
+	}
+	if oldHits != 1 {
+		t.Errorf("old backend was reached again after re-Expose (hits=%d, want 1)", oldHits)
+	}
+}

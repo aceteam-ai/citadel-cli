@@ -68,6 +68,19 @@ type WorkerLiveness struct {
 	// Processed / Failed are cumulative since worker start (diagnostic context).
 	Processed int64 `json:"processed,omitempty"`
 	Failed    int64 `json:"failed,omitempty"`
+
+	// IdentityUnresolved reports that this worker never resolved its Headscale
+	// node ID. Such a node is NOT wedged -- it polls, it heartbeats, it serves
+	// untargeted work, so every field above reads healthy -- but it declines
+	// every target_node-addressed job (citadel-cli#654), which surfaces to the
+	// caller as an unexplained dispatch timeout far from the cause. This is the
+	// field that explains it, and it is the only one here describing a node that
+	// is degraded rather than stuck.
+	//
+	// Stated positively on purpose: the node's ID is not on this struct at all,
+	// and on the /agent snapshot it is `omitempty`, so its absence cannot
+	// distinguish a degraded node from an older payload.
+	IdentityUnresolved bool `json:"identity_unresolved,omitempty"`
 }
 
 // AppInfo contains information about an installed catalog app.

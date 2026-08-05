@@ -104,12 +104,10 @@ func runUp() error {
 		}
 	}
 
-	// Route the network layer's diagnostics through --debug. Without this the
-	// package-level logf stays a no-op, so a failed bring-up reports only
-	// "timeout waiting for network connection" with no indication of WHY —
-	// the backend-state transitions (NeedsLogin, NoState, Starting) that
-	// actually identify the problem are discarded.
-	network.SetLogf(Debug)
+	// (network.SetLogf is wired once in root.go's PersistentPreRun -- #662.
+	// It must stay wired: without it a failed bring-up reports only "timeout
+	// waiting for network connection" and the backend-state transitions that
+	// identify the real cause are silently discarded.)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

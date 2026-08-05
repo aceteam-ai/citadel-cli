@@ -1028,11 +1028,16 @@ func TestRunnerTargetNodeEmptyStringProcessesJob(t *testing.T) {
 	}
 }
 
-// TestRunnerNodeIDEmptySkipsFilter verifies that when the runner's NodeID is
-// empty (Headscale ID unresolved), the target_node filter is disabled and
-// all jobs are processed -- including ones with a target_node set. This
-// preserves pre-filter behavior and avoids dropping jobs that might be ours.
-func TestRunnerNodeIDEmptySkipsFilter(t *testing.T) {
+// TestRunnerNodeIDEmptyDeclinesAddressedJob is the regression test for
+// citadel-cli#654. A node that could not resolve its Headscale ID must NOT
+// execute a job addressed to some other node.
+//
+// The filter used to be gated on NodeID != "", so an unidentified node matched
+// nothing and ran every addressed job it read off a shared stream -- executing
+// on the wrong machine work the operator had aimed at a specific one. This
+// asserts on the HANDLER (the job never runs), not merely on the ack, because
+// acking a job we also executed would be the very bug.
+func TestRunnerNodeIDEmptyDeclinesAddressedJob(t *testing.T) {
 	jobs := []*Job{
 		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{
 			"target_node": "999",
@@ -1053,9 +1058,40 @@ func TestRunnerNodeIDEmptySkipsFilter(t *testing.T) {
 	defer cancel()
 	runner.Run(ctx)
 
-	// Handler SHOULD have executed (filter disabled when NodeID is empty)
-	if len(handler.ExecutedJobs()) != 1 {
-		t.Errorf("Expected 1 executed job (filter should be disabled), got %d", len(handler.ExecutedJobs()))
+	if got := len(handler.ExecutedJobs()); got != 0 {
+		t.Errorf("Expected 0 executed jobs (an unidentified node must not claim addressed work), got %d", got)
+	}
+	acked := source.AckedJobs()
+	if len(acked) != 1 || acked[0].ID != "job-1" {
+		t.Errorf("Expected the declined job to be acked so it leaves this node's pending list, got %d ack(s)", len(acked))
+	}
+}
+
+// TestRunnerNodeIDEmptyStillRunsUntargetedJob pins the other half of #654: the
+// fail-closed change must cost nothing for ORG-WIDE work. A job with no
+// target_node is addressed to nobody in particular, so an unidentified node is
+// still a legitimate server for it. Without this, "fail closed on identity"
+// would silently become "an unidentified node serves nothing at all".
+func TestRunnerNodeIDEmptyStillRunsUntargetedJob(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{"command": "hostname"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+
+	config := RunnerConfig{
+		WorkerID: "test-worker",
+		NodeID:   "", // Empty -- Headscale ID not resolved
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if got := len(handler.ExecutedJobs()); got != 1 {
+		t.Errorf("Expected 1 executed job (untargeted work is still ours to serve), got %d", got)
 	}
 }
 

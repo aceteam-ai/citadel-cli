@@ -234,3 +234,64 @@ func TestAgentWorkerRestartNotServiceManaged(t *testing.T) {
 	}
 	time.Sleep(5 * time.Millisecond) // give any errant goroutine a chance to fire
 }
+
+// TestAgentDoctorUnresolvedIDReportsDeclineNotFallback pins the WORDING, which
+// is the whole product of this diagnostic. Before citadel-cli#654 an
+// unidentified node claimed addressed jobs off the shared stream; now it
+// declines them. The doctor's old text ("fall back to the shared org stream
+// where a peer may claim them") described the removed fail-open and would send
+// an operator hunting for a peer that stole the job -- when in fact nothing ran
+// it at all. A test on `healthy` alone cannot catch a diagnosis that is
+// confidently wrong, so assert on the text.
+func TestAgentDoctorUnresolvedIDReportsDeclineNotFallback(t *testing.T) {
+	s := worker.NewWorkerState()
+	s.SetIdentity("w", "redis-api", "citadel-workers", "", "org-x")
+	s.SetPerNodeQueue("")
+	s.RecordConsumeStatus(200, "")
+	s.RecordPoll()
+
+	d := agentDoctor(s.Snapshot())
+	diag, _ := d["diagnosis"].(string)
+	if !strings.Contains(diag, "declines") {
+		t.Errorf("diagnosis must say the node DECLINES addressed jobs, got %q", diag)
+	}
+	if strings.Contains(diag, "fall back to the shared org stream where a peer may claim them") {
+		t.Errorf("diagnosis still describes the removed fail-open, got %q", diag)
+	}
+
+	// The per-check detail carries the same correction, since an agent reading
+	// the checks array may never render the prose diagnosis.
+	checks, _ := d["checks"].([]map[string]any)
+	var detail string
+	for _, c := range checks {
+		if c["name"] == "headscale_node_id_resolved" {
+			detail, _ = c["detail"].(string)
+		}
+	}
+	if !strings.Contains(detail, "declines") {
+		t.Errorf("headscale_node_id_resolved detail must say the node declines addressed jobs, got %q", detail)
+	}
+}
+
+// TestWorkerLivenessCarriesIdentityUnresolved pins the heartbeat half of
+// citadel-cli#654. Without it the signal exists only on the node's own /agent
+// snapshot, and the PLATFORM -- which is what actually notices a degraded node
+// across a fleet -- still sees nothing but a healthy-looking worker.
+//
+// The failure this guards against is not a wrong value but a DROPPED one:
+// workerLivenessFrom is a hand-maintained field-by-field copy, so a field added
+// to WorkerSnapshot and forgotten here vanishes silently with everything still
+// compiling and every other test passing.
+func TestWorkerLivenessCarriesIdentityUnresolved(t *testing.T) {
+	degraded := worker.NewWorkerState()
+	degraded.SetIdentity("w", "redis-api", "citadel-somehost", "", "org-x")
+	if !workerLivenessFrom(degraded.Snapshot()).IdentityUnresolved {
+		t.Error("heartbeat liveness must report identity_unresolved when the Headscale ID is empty")
+	}
+
+	healthy := worker.NewWorkerState()
+	healthy.SetIdentity("w", "redis-api", "citadel-node-1008", "1008", "org-x")
+	if workerLivenessFrom(healthy.Snapshot()).IdentityUnresolved {
+		t.Error("heartbeat liveness must not report identity_unresolved once the Headscale ID resolved")
+	}
+}

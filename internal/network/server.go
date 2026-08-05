@@ -23,14 +23,30 @@ import (
 // through the Debug/Log infrastructure (which respects --debug).
 var logf = func(format string, args ...any) {}
 
+// logfSet records whether SetLogf has installed a real logger. It exists so the
+// wiring can be asserted in a test: a no-op logf is indistinguishable from a
+// working one at every call site, which is precisely how #643 lost hours to
+// diagnostics that were being generated and discarded.
+var logfSet bool
+
 // SetLogf sets the package-level diagnostic logger. Pass cmd.Debug or
 // cmd.Log to route network-layer messages through the CLI's log infra.
 // Must be called before any Connect / VerifyOrReconnect calls.
+//
+// The CLI wires this ONCE, in rootCmd's PersistentPreRun (cmd/root.go), so
+// every command that brings up the network gets engine diagnostics without
+// having to remember. Do not add per-command calls -- see #662 for why the
+// per-command approach failed.
 func SetLogf(fn func(string, ...any)) {
 	if fn != nil {
 		logf = fn
+		logfSet = true
 	}
 }
+
+// LogfConfigured reports whether a real diagnostic logger has been installed.
+// Intended for wiring assertions, not for control flow.
+func LogfConfigured() bool { return logfSet }
 
 // NetworkServer wraps a mesh Backend with AceTeam-specific functionality.
 type NetworkServer struct {

@@ -204,6 +204,37 @@ func TestMeetingBrowser_IsGoogleSignInURL(t *testing.T) {
 	}
 }
 
+// TestMeetingBrowser_IsMicrosoftSignInURL checks the Teams anonymous-join gate
+// (issue #7000): a redirect to a Microsoft identity host means the meeting is
+// refusing a guest web join, everything else (a real Teams URL, other MS hosts,
+// unparseable input) is not.
+func TestMeetingBrowser_IsMicrosoftSignInURL(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"entra work/school login", "https://login.microsoftonline.com/common/oauth2/authorize?x=1", true},
+		{"personal MS account login", "https://login.live.com/login.srf", true},
+		{"login.microsoft.com", "https://login.microsoft.com/", true},
+		{"case-insensitive host", "https://LOGIN.MICROSOFTONLINE.COM/common", true},
+		{"tenant subdomain of login host", "https://foo.login.microsoftonline.com/x", true},
+		{"real teams meet url", "https://teams.microsoft.com/meet/1234567890?p=AbCdEf", false},
+		{"real teams meetup-join url", "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x", false},
+		{"lookalike host is not spoofable", "https://evil-login.microsoftonline.com.attacker.test/", false},
+		{"unrelated ms host", "https://outlook.office.com/mail/", false},
+		{"empty string", "", false},
+		{"unparseable url", "http://[::1", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsMicrosoftSignInURL(tc.url); got != tc.want {
+				t.Errorf("IsMicrosoftSignInURL(%q) = %v, want %v", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestMeetingProfileDir_CreatesWithOwnerOnlyPerms verifies a
 // freshly-created meeting profile dir is locked to 0700 — it will hold real
 // Google session cookies for the bot account (issue #5122).
