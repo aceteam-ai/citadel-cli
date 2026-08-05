@@ -1488,3 +1488,21 @@ Auto-generated log of every release.
   - feat(meetings): Teams join-flow scaffold for the Citadel bot (#7000) (#660)
 
 
+---
+
+## v2.99.0 — 2026-08-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 37 |
+| Lines added | +4991 |
+
+**Changes:**
+
+  - feat(status): embedding services report the model they serve (#690) (#699)
+  - feat(worker): render PDF pages to images with a document_rasterize job (#698)
+  - fix(services): stop the native engine citadel started, not every process whose argv mentions it (#696) (#701)
+  - feat(network): machine-wide mode (`citadel up`) — Backend split, TUN + attached backends (#643) (#650)
+
+
