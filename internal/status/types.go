@@ -271,6 +271,14 @@ const (
 	HealthStatusDegraded  = "degraded"
 	HealthStatusUnhealthy = "unhealthy"
 	HealthStatusUnknown   = "unknown"
+	// HealthStatusStarting means the service's container is UP but the service
+	// is not answering yet: a serving engine still loading weights, a TEI whose
+	// /health is not yet 200. Status is still "running" (the container really is
+	// running, which is what SERVICE_STATUS reports), so the node no longer
+	// under-reports a service it was just told to start (aceteam#7148). Consumers
+	// that need READINESS, for example the platform's TEI embedding-node resolver,
+	// must gate on this health value, not on Status alone.
+	HealthStatusStarting = "starting"
 )
 
 // StatusVersion is the current version of the status payload format.
