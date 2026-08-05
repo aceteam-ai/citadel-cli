@@ -4,6 +4,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -189,7 +190,48 @@ func StartNativeService(serviceName string, logDir string) (*NativeProcess, erro
 	}, nil
 }
 
-// IsNativeServiceRunning checks if a native service is already running
+// nativeProbeTimeout bounds the serving probe. It runs on the heartbeat's
+// collection path (every ~30s), so an engine socket that accepts a connection
+// and then goes silent must not stall the collector -- the exact "green but
+// wedged" shape issue #548 was about. Short and fail-closed: a timeout counts
+// as not serving.
+const nativeProbeTimeout = 1500 * time.Millisecond
+
+// portAnswers reports whether something accepts a TCP connection on the given
+// loopback port within timeout.
+//
+// net.DialTimeout rather than shelling out to `nc`: nc is absent on minimal
+// images (slim containers, LXC templates), where exec would fail on every
+// attempt and the probe would report "never ready" for a perfectly healthy
+// engine. This has no external dependency.
+func portAnswers(port int, timeout time.Duration) bool {
+	if port <= 0 {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// IsNativeServiceRunning reports whether a PROCESS matching the service's binary
+// exists. It answers "is there something to stop", NOT "is the engine usable" --
+// use IsNativeServiceServing for that (issue #649).
+//
+// The distinction is load-bearing in both directions, which is why there are two
+// functions rather than one:
+//
+//   - Health / advertise / start-short-circuit paths must NOT use this. `pgrep
+//     -f` is a substring match against the whole command line, so `ollama run`,
+//     an `ollama` mentioned in some other process's argv, or a `journalctl -u
+//     ollama` all satisfy it while the server is down. That is exactly how node
+//     1297 reported "Service ollama is already running" with `systemctl
+//     is-active ollama` saying `inactive` and the API answering nothing.
+//   - Stop / teardown paths must NOT use the serving probe. A wedged engine that
+//     has stopped answering is still a process holding VRAM; treating it as
+//     "not running" would report success and leave it alive forever.
 func IsNativeServiceRunning(serviceName string) bool {
 	service, ok := NativeServices[serviceName]
 	if !ok {
@@ -200,6 +242,23 @@ func IsNativeServiceRunning(serviceName string) bool {
 	// This is a simple check using pgrep
 	cmd := exec.Command("pgrep", "-f", service.Binary)
 	return cmd.Run() == nil
+}
+
+// IsNativeServiceServing reports whether a native service is actually answering
+// on its port. This is the predicate every health, advertise and
+// "already running, nothing to do" decision wants: routing depends on the engine
+// responding, not on a process existing (issue #649).
+//
+// It deliberately does not consult the process list at all. If the port answers
+// the engine is usable however it was started (systemd, a hand-run binary, a
+// supervisor) -- and if the port does not answer, the engine is not usable no
+// matter how many matching processes exist.
+func IsNativeServiceServing(serviceName string) bool {
+	service, ok := NativeServices[serviceName]
+	if !ok {
+		return false
+	}
+	return portAnswers(service.Port, nativeProbeTimeout)
 }
 
 // StopNativeService stops a running native service
@@ -222,7 +281,12 @@ func StopNativeService(serviceName string) error {
 	return nil
 }
 
-// WaitForServiceReady waits for a service to be ready by checking its port
+// WaitForServiceReady waits for a service to be ready by checking its port.
+//
+// The readiness test is the same portAnswers used by IsNativeServiceServing, so
+// "ready" and "serving" cannot drift apart. It previously shelled out to `nc -z`,
+// which silently never succeeds on an image without netcat -- every start would
+// then fail with a spurious timeout and kill the engine it had just launched.
 func WaitForServiceReady(serviceName string, timeout time.Duration) error {
 	service, ok := NativeServices[serviceName]
 	if !ok {
@@ -237,9 +301,7 @@ func WaitForServiceReady(serviceName string, timeout time.Duration) error {
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for service %s to be ready on port %d", serviceName, service.Port)
 		default:
-			// Try to connect to the port
-			cmd := exec.Command("nc", "-z", "localhost", fmt.Sprintf("%d", service.Port))
-			if cmd.Run() == nil {
+			if portAnswers(service.Port, nativeProbeTimeout) {
 				return nil
 			}
 			time.Sleep(500 * time.Millisecond)

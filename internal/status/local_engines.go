@@ -33,26 +33,48 @@ type LocalEngine struct {
 // ModelDiscoveryTimeout so a slow/hung engine never stalls discovery; a failed
 // probe simply leaves Models empty.
 func DiscoverLocalEngines(ctx context.Context) []LocalEngine {
-	engineBin := catalog.SelectContainerRuntime().EngineBin
-	md := NewModelDiscovery()
+	return discoverLocalEngines(ctx, catalog.SelectContainerRuntime().EngineBin, managedEnginePortIfRunning, NewModelDiscovery())
+}
 
+// modelLister is the slice of ModelDiscovery that discoverLocalEngines needs.
+// Narrow interface + injected running-check so the SELECTION logic (which engine
+// makes it into the list) is unit-testable without a live engine, docker, or a
+// bound port -- mirroring how internal/mesh injects its Dialer and PeerLister.
+type modelLister interface {
+	DiscoverModels(ctx context.Context, serviceType string, port int) ([]string, error)
+}
+
+func discoverLocalEngines(
+	ctx context.Context,
+	engineBin string,
+	portIfRunning func(engineBin, name string) (int, bool),
+	md modelLister,
+) []LocalEngine {
 	var out []LocalEngine
 	for _, name := range managedProbeEngines {
-		port, running := managedEnginePortIfRunning(engineBin, name)
+		port, running := portIfRunning(engineBin, name)
 		if !running || port <= 0 {
 			continue
 		}
 
-		eng := LocalEngine{Name: name, Port: port}
-
 		mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
 		models, err := md.DiscoverModels(mctx, name, port)
 		cancel()
-		if err == nil {
-			eng.Models = models
+		if err != nil {
+			// The engine did not answer -- drop it (#649). This list is not just
+			// informational: nodeIsServingModels gates the shared
+			// jobs:v1:gpu-general subscription on it being non-empty, so a
+			// non-answering engine here made the node claim inference jobs it
+			// could not serve, and every one of them timed out.
+			//
+			// This keys on the ERROR, not on len(models), so the documented
+			// "running but nothing pulled" case is preserved: a live ollama with
+			// no models returns an empty list with err == nil and is still
+			// reported as a real engine.
+			continue
 		}
 
-		out = append(out, eng)
+		out = append(out, LocalEngine{Name: name, Port: port, Models: models})
 	}
 	return out
 }

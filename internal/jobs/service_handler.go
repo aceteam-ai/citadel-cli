@@ -215,7 +215,10 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 
 	switch kind {
 	case "native":
-		running = services.IsNativeServiceRunning(svc.Name)
+		// Report what the engine can actually do, not whether a process name
+		// matched (#649): a status of "running" is what the platform trusts when
+		// it decides to keep routing inference here.
+		running = services.IsNativeServiceServing(svc.Name)
 	case "docker":
 		running = h.isDockerServiceRunning(svc.Name)
 	}
@@ -256,7 +259,10 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				ctx.Log("info", "     - Service %s runs natively; model %q ignored (no pull mechanism for this engine)", svc.Name, model)
 			}
 		}
-		alreadyRunning := services.IsNativeServiceRunning(svc.Name)
+		// Serving, not merely process-present (#649). A SERVICE_START against a
+		// dead-but-process-matching engine must actually start it; short-circuiting
+		// here was how a deploy reported success onto a node serving nothing.
+		alreadyRunning := services.IsNativeServiceServing(svc.Name)
 		if !alreadyRunning {
 			logDir := filepath.Join(h.ConfigDir, "logs")
 			_, err = services.StartNativeService(svc.Name, logDir)
@@ -392,6 +398,11 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 
 	switch kind {
 	case "native":
+		// Deliberately the PROCESS check, not IsNativeServiceServing (#649): a
+		// wedged engine that has stopped answering is still a live process
+		// holding VRAM, and stop must kill it. Using the serving probe here would
+		// report "not running" and leave it alive forever -- the one place where
+		// the loose predicate is the correct one.
 		if !services.IsNativeServiceRunning(svc.Name) {
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: false, Kind: kind,
