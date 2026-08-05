@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,66 @@ type modelCachePullResult struct {
 	ModelName string `json:"model_name"`
 	SizeBytes int64  `json:"size_bytes"`
 	Engine    string `json:"engine"`
+	// Message explains a non-"cached" status (currently only "skipped"). Additive
+	// and omitempty, so existing consumers of this JSON are unaffected.
+	Message string `json:"message,omitempty"`
+}
+
+// selfProvisioningEngines are engines whose compose file OWNS its weights: the
+// model id is pinned in the compose and the container downloads it into the
+// shared HuggingFace cache mount on first start. There is nothing for this
+// handler to fetch, so a MODEL_CACHE_PULL for one of them is a no-op success
+// rather than an error (#666).
+//
+// Why this matters: the platform's deploy path dispatches a MODEL_CACHE_PULL for
+// whatever engine it resolved, so every deploy of one of these engines used to
+// leave `unsupported engine "tei"` in the node log next to a perfectly
+// successful SERVICE_START. Nothing broke -- the pull job's id is not one the
+// deploy route subscribes to -- but an error that looks like a real failure
+// costs time on every triage that reads these logs.
+//
+// Membership is not a taste call: an engine belongs here iff its compose pins
+// the model AND mounts a cache for the container to download into. That is
+// asserted against the embedded compose files in
+// TestSelfProvisioningEnginesMatchTheirComposeFiles, so this list cannot drift
+// away from what the composes actually do.
+//
+// Unknown engines still error. This is an explicit allowlist, not a blanket
+// "anything unrecognised is fine" -- a typo in the engine name must still fail
+// loudly rather than silently report success.
+var selfProvisioningEngines = map[string]string{
+	"tei":           "the TEI compose pins --model-id and downloads into HUGGINGFACE_HUB_CACHE",
+	"diffusers":     "the diffusers compose pins DIFFUSERS_MODEL and downloads into the shared HuggingFace cache",
+	"kokoro":        "the kokoro image serves one fixed model and fetches its weights + voices into the mounted cache",
+	"transcribe":    "the transcribe compose pins WHISPER_MODEL and faster-whisper downloads it into the shared HuggingFace cache",
+	"unlimited-ocr": "the unlimited-ocr compose pins --model and vLLM resolves it from the mounted HuggingFace cache on first start",
+	"extraction":    "the extraction compose pins MODEL_NAME and downloads into the shared HuggingFace cache",
+}
+
+// sortedSelfProvisioningEngines returns the no-op engine names in a stable
+// order, so the unsupported-engine error reads the same on every node.
+func sortedSelfProvisioningEngines() []string {
+	names := make([]string, 0, len(selfProvisioningEngines))
+	for name := range selfProvisioningEngines {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// skipSelfProvisioned returns the success result for an engine that provisions
+// its own weights. It reports Status "skipped" with a Message naming the reason,
+// so an operator reading the job result sees "there was nothing to pull, by
+// design" instead of either an error or an unexplained success.
+func skipSelfProvisioned(ctx JobContext, jobID, engine, modelName string) ([]byte, error) {
+	reason := selfProvisioningEngines[engine]
+	ctx.Log("info", "     - [Job %s] MODEL_CACHE_PULL skipped for engine %q: %s", jobID, engine, reason)
+	return json.Marshal(modelCachePullResult{
+		Status:    "skipped",
+		ModelName: modelName,
+		Engine:    engine,
+		Message:   "nothing to pull: " + reason,
+	})
 }
 
 func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -61,7 +122,11 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 	case "bonsai":
 		return h.pullBonsai(ctx, job.ID)
 	default:
-		return nil, fmt.Errorf("unsupported engine %q: must be ollama, vllm, llamacpp, or bonsai", engine)
+		if _, selfProvisioned := selfProvisioningEngines[engine]; selfProvisioned {
+			return skipSelfProvisioned(ctx, job.ID, engine, modelName)
+		}
+		return nil, fmt.Errorf("unsupported engine %q: this handler pulls for ollama, vllm, llamacpp and bonsai; "+
+			"engines whose compose owns its weights (%s) are a no-op", engine, strings.Join(sortedSelfProvisioningEngines(), ", "))
 	}
 }
 
