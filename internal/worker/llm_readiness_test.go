@@ -38,7 +38,7 @@ func shortenReadinessBudget(t *testing.T, d time.Duration) {
 }
 
 // TestEnsureEngineReady_ServingEngineIsReady asserts the probe accepts an engine
-// whose API answers, for EVERY backend -- including the four that had no
+// whose API answers, for EVERY backend, including the four that had no
 // pre-flight probe at all before citadel-cli#680.
 func TestEnsureEngineReady_ServingEngineIsReady(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

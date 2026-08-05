@@ -22,7 +22,7 @@
 //  1. The probe asks "does the engine's HTTP API answer 200", NOT "does it list
 //     a model". llama.cpp and bonsai run in deferred-load / router mode where
 //     they answer /v1/models with an EMPTY list and still serve (they load on
-//     first request) -- see internal/status/local_engines.go and models.go, which
+//     first request). See internal/status/local_engines.go and models.go, which
 //     both document that case. Gating on a non-empty model list would make such
 //     an engine permanently "warming" and permanently unservable. The stricter
 //     model-count predicate stays where it already lives, in the swap manager's
