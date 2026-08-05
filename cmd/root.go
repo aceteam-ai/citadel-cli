@@ -12,6 +12,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/fatih/color"
@@ -110,6 +111,30 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if cmd.Name() == "mcp" {
 			debugToStderr = true
 		}
+
+		// Route the network engine's diagnostics into the CLI log for EVERY
+		// command, not just the two that remembered to ask (#662).
+		//
+		// internal/network's logf defaults to a no-op, so a command that skipped
+		// this discarded backend-state transitions, control-plane auth results
+		// and route/DNS reconfiguration -- the exact lines that turn "Error:
+		// timeout waiting for network connection" into a diagnosis. In #643 that
+		// opaque line was a node parked in NeedsLogin, and `Switching ipn state
+		// NoState -> NeedsLogin` had been generated and thrown away the whole
+		// time.
+		//
+		// Wired here rather than per-command because a checklist of 18 bring-up
+		// sites cannot hold: a missing call is invisible until someone is already
+		// debugging a production problem with no output to read. PersistentPreRun
+		// runs before any command's Run, so this precedes every Connect /
+		// EnsureConnected / VerifyOrReconnect. Note for future commands: if you
+		// ever give a subcommand its OWN PersistentPreRun, cobra runs only the
+		// closest one in the chain and this wiring is lost -- call
+		// rootCmd.PersistentPreRun from it.
+		//
+		// Debug routes to the dated log file always and to the console only under
+		// --debug, so this costs nothing at the terminal.
+		network.SetLogf(Debug)
 
 		// Handle global --no-color flag and NO_COLOR env var
 		if noColorGlobal || os.Getenv("NO_COLOR") != "" {
