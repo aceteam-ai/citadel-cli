@@ -21,7 +21,19 @@ type APISource struct {
 	mu         sync.RWMutex
 	queueNames []string // resolved list of queues to consume from
 	queueIndex int      // round-robin index for multi-queue polling
+
+	// wake, when set (via EnableWake), makes Next return immediately on a
+	// per-node Pub/Sub nudge delivered over the WebSocket, instead of waiting out
+	// the HTTP consume block (issue #7270). Nil for the normal poll-only path.
+	wake *wakePump
 }
+
+// apiWakeDrainBlockMs is the (short) block used for the wake-triggered drain in
+// api-proxy mode. The Redis API proxy runs a server-side XREADGROUP BLOCK, so a
+// truly non-blocking read is not exposed; a brief block is plenty since the
+// nudge is published AFTER the XADD, so the job is already on the stream. Still
+// ~10x faster than the 5s poll — the whole point of the wake.
+const apiWakeDrainBlockMs = 500
 
 // APISourceConfig holds configuration for APISource.
 type APISourceConfig struct {
@@ -143,11 +155,78 @@ func (s *APISource) Connect(ctx context.Context) error {
 // iteration and the fungible tag queues in round-robin, each with a short
 // block timeout so no queue is starved (see nextMulti).
 func (s *APISource) Next(ctx context.Context) (*Job, error) {
+	if w := s.getWake(); w != nil {
+		return w.next(ctx)
+	}
+	return s.readOnce(ctx, s.config.BlockMs)
+}
+
+// getWake reads the wake pump under mu. EnableWake may be called from a
+// different goroutine than the run loop (e.g. /agent/resubscribe), so the
+// pointer is guarded like queueNames rather than read racily.
+func (s *APISource) getWake() *wakePump {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wake
+}
+
+// readOnce performs one consume of the subscribed queue(s) with the given block
+// timeout. Core shared by the poll-only path and the wakePump closures.
+func (s *APISource) readOnce(ctx context.Context, blockMs int) (*Job, error) {
 	queues := s.snapshotQueues()
 	if len(queues) == 1 {
-		return s.nextSingle(ctx, queues[0])
+		return s.nextSingle(ctx, queues[0], blockMs)
 	}
-	return s.nextMulti(ctx, queues)
+	return s.nextMulti(ctx, queues, blockMs)
+}
+
+// EnableWake subscribes to the node's Pub/Sub wake channel over the WebSocket and
+// routes Next through the wakePump so a targeted-dispatch nudge is consumed
+// immediately (issue #7270). Requires the WebSocket to be enabled
+// (Client.EnableWebSocket, done in cmd/work.go); if it is not connected the wake
+// cannot be delivered and the node stays correctly poll-only. Best-effort: a
+// subscribe failure returns the error and leaves the source poll-only.
+func (s *APISource) EnableWake(ctx context.Context, channel string) error {
+	if channel == "" || s.client == nil || s.getWake() != nil {
+		return nil
+	}
+	ws := s.client.WebSocket()
+	if ws == nil || !ws.IsConnected() {
+		return fmt.Errorf("websocket not connected; wake unavailable (staying poll-only)")
+	}
+	pump := newWakePump(
+		func(c context.Context) (*Job, error) { return s.readOnce(c, s.config.BlockMs) },
+		func(c context.Context) (*Job, error) { return s.readOnce(c, apiWakeDrainBlockMs) },
+	)
+	// Incoming Pub/Sub messages arrive as WSMessage{Type:"message", Channel:...}.
+	// Filter to our wake channel and coalesce into the pump. NOTE: the WSClient
+	// keeps a single handler per message type; nothing else registers "message"
+	// in `citadel work` (the chat REPL is not co-resident with the worker), so
+	// this slot is free. If that ever changes, WSClient needs multi-handler fan-out.
+	ws.OnMessage("message", func(msg redisapi.WSMessage) {
+		if msg.Channel == channel {
+			pump.signal()
+		}
+	})
+	if err := ws.Subscribe(ctx, channel); err != nil {
+		return fmt.Errorf("failed to subscribe to wake channel %s: %w", channel, err)
+	}
+	// Re-subscribe after a WS reconnect so the wake survives connection churn.
+	ws.OnReconnect(func() {
+		if err := ws.Subscribe(context.Background(), channel); err != nil {
+			s.log("warning", "wake re-subscribe after reconnect failed: %v", err)
+		}
+	})
+	pump.start(ctx)
+	s.mu.Lock()
+	if s.wake != nil { // lost a race with a concurrent EnableWake; keep the winner
+		s.mu.Unlock()
+		return nil
+	}
+	s.wake = pump
+	s.mu.Unlock()
+	s.log("info", "   - Push-wake enabled: %s", channel)
+	return nil
 }
 
 // snapshotQueues returns a stable copy of the queue list for one poll cycle,
@@ -159,13 +238,13 @@ func (s *APISource) snapshotQueues() []string {
 }
 
 // nextSingle reads from a single queue (original behavior).
-func (s *APISource) nextSingle(ctx context.Context, queue string) (*Job, error) {
+func (s *APISource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
 	apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
 		Queue:    queue,
 		Group:    s.config.ConsumerGroup,
 		Consumer: s.client.WorkerID(),
 		Count:    1,
-		BlockMs:  s.config.BlockMs,
+		BlockMs:  blockMs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to consume job from API: %w", err)
@@ -256,7 +335,7 @@ func queueBlockBudget(totalBlockMs, rotatingCount, priorityCount int) (rotatingB
 // Individual queue failures (e.g., rejected by server validation) are skipped
 // rather than failing the entire poll cycle. Only when every distinct queue has
 // failed does the caller see an error (triggering backoff).
-func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error) {
+func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
 	if len(queues) == 0 {
 		return nil, nil
 	}
@@ -268,7 +347,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error
 		priority, rotating = nil, queues
 	}
 
-	rotatingBlockMs, priorityBlockMs := queueBlockBudget(s.config.BlockMs, len(rotating), len(priority))
+	rotatingBlockMs, priorityBlockMs := queueBlockBudget(blockMs, len(rotating), len(priority))
 
 	// Failure accounting is per distinct queue, not per poll: the priority
 	// queue is polled len(rotating) times per cycle, so counting polls would
