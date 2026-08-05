@@ -356,10 +356,21 @@ resolver instead of being routed through the mesh. If the base config cannot
 be read it changes nothing and says so, rather than guessing and risking
 capture of the LAN domain.
 
-This deliberately moves macOS from global to split DNS. That is the posture
-citadel wants regardless of the OS constraint: machine-wide *routing* does not
-require owning every DNS query, and a narrower claim makes a failed teardown
-far less consequential.
+This deliberately moves macOS from global to split DNS, and that is the
+intended posture, not a workaround (Jason, 2026-08-05): machine-wide *routing*
+does not require owning every DNS query. On a corporate network the machine may
+already have its own internal resolvers and internal TLDs, and a VPN client
+that installs itself as the global resolver silently sits in front of all of
+them. A narrower claim is both better behaved and makes a failed teardown far
+less consequential.
+
+**Known edge case this creates.** If a network already uses the same suffix the
+tailnet does, citadel will capture those queries — `/etc/resolver/<domain>` is
+claimed per-domain, so a corp `.internal` and a tailnet `.internal` collide, and
+the mesh resolver wins for every name under it. The tailnet suffix is
+configurable on the coordination server, so the mitigation is to pick one that
+does not collide. Worth knowing before deploying onto a network with an
+established internal TLD.
 
 Verified live on macOS after the fix:
 
