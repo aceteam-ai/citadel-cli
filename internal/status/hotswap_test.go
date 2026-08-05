@@ -31,7 +31,7 @@ func TestCollectInstalledEngines_AdvertisesStoppedWithDefaultModel(t *testing.T)
 	writeInstalledEngine(t, dir, "bonsai", "") // no env -> compose default model
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
 
 	var bonsai *ServiceInfo
 	for i := range engines {
@@ -61,7 +61,7 @@ func TestResolveInstalledModel_EnvOverrideWins(t *testing.T) {
 	writeInstalledEngine(t, dir, "vllm", "VLLM_MODEL=my-org/my-model\n# a comment\n")
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
 
 	var found bool
 	for _, e := range engines {
@@ -83,7 +83,7 @@ func TestCollectInstalledEngines_SkipsAlreadyReported(t *testing.T) {
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
 	// bonsai already reported (running) => must not be duplicated as stopped.
-	engines := c.collectInstalledEngines(map[string]struct{}{"bonsai": {}})
+	engines := c.collectInstalledEngines(map[string]struct{}{"bonsai": {}}, map[string]struct{}{})
 	for _, e := range engines {
 		if e.Name == "bonsai" {
 			t.Fatalf("bonsai should be skipped when already reported")
@@ -93,7 +93,7 @@ func TestCollectInstalledEngines_SkipsAlreadyReported(t *testing.T) {
 
 func TestCollectInstalledEngines_NoConfigDirReturnsNil(t *testing.T) {
 	c := NewCollector(CollectorConfig{ModelHotswap: true}) // ConfigDir empty
-	if got := c.collectInstalledEngines(map[string]struct{}{}); got != nil {
+	if got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}); got != nil {
 		t.Fatalf("expected nil with no configDir, got %v", got)
 	}
 }

@@ -113,8 +113,23 @@ func (c *Collector) applyModelHotswap(st *NodeStatus, reported map[string]struct
 		}
 	}
 
-	// 2. Advertise installed-but-stopped engines as swap-in candidates.
-	for _, eng := range c.collectInstalledEngines(reported) {
+	// 2. Advertise installed-but-stopped engines as swap-in candidates, minus any
+	// model a RUNNING service on this node already reports serving. Without that
+	// subtraction a stopped vllm's <name>.env default claimed the very model the
+	// live tei server was serving, so the platform credited the dead engine and
+	// the live one advertised nothing (citadel-cli#690).
+	claimed := make(map[string]struct{})
+	for i := range st.Services {
+		if st.Services[i].Status != ServiceStatusRunning {
+			continue
+		}
+		for _, m := range st.Services[i].Models {
+			if m = strings.TrimSpace(m); m != "" {
+				claimed[m] = struct{}{}
+			}
+		}
+	}
+	for _, eng := range c.collectInstalledEngines(reported, claimed) {
 		st.Services = append(st.Services, eng)
 	}
 }
@@ -126,7 +141,13 @@ func (c *Collector) applyModelHotswap(st *NodeStatus, reported map[string]struct
 // at least once — AND a served model id resolves (persisted <name>.env override
 // or the compose default). Engines already in reported (running) are skipped.
 // Returns nil when the collector has no configDir (the model source is unknown).
-func (c *Collector) collectInstalledEngines(reported map[string]struct{}) []ServiceInfo {
+//
+// claimed holds the models a RUNNING service on this node already reports. A
+// stopped engine whose only resolvable model is in that set is dropped: the
+// model is being served, just not by this engine, and advertising it twice let
+// the platform attribute it to the stopped one (citadel-cli#690). Pass an empty
+// map to advertise unconditionally.
+func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{}) []ServiceInfo {
 	if c.configDir == "" {
 		return nil
 	}
@@ -144,6 +165,9 @@ func (c *Collector) collectInstalledEngines(reported map[string]struct{}) []Serv
 		model := c.resolveInstalledModel(name)
 		if model == "" {
 			continue // no advertisable model (e.g. vllm with none persisted)
+		}
+		if _, taken := claimed[model]; taken {
+			continue // a running service on this node already serves it (#690)
 		}
 		notResident := false
 		out = append(out, ServiceInfo{

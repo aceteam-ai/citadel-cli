@@ -119,37 +119,80 @@ func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
 // /v1/embeddings upstream, not /v1/chat/completions.
 var embeddingProbeServices = []string{"tei"}
 
-// collectEmbeddingServiceStatus reports running embedding services (container
-// "citadel-<name>") that answer a health check, as ServiceInfo with
-// Type=embedding. This is the discovery signal the sovereign-embeddings backend
-// (_find_tei_node) matches on: a node advertising a "tei" service becomes
-// eligible to embed on its own model. Kept separate from
-// collectManagedEngineStatus so an embedding server is never mistaken for a chat
-// LLM (whose model-discovery/idle probes and chat-router listing do not apply).
+// collectEmbeddingServiceStatus reports running embedding services that answer a
+// health check, as ServiceInfo with Type=embedding. This is the discovery signal
+// the sovereign-embeddings backend (_find_tei_node) matches on: a node
+// advertising a "tei" service becomes eligible to embed on its own model. Kept
+// separate from collectManagedEngineStatus so an embedding server is never
+// mistaken for a chat LLM (whose idle probe and chat-router listing do not
+// apply).
+//
+// Each entry carries the model the server is ACTUALLY serving, read from the
+// engine's own /info (citadel-cli#690). Reporting no models let a stopped vllm's
+// <name>.env default claim the embedding model instead, so the platform credited
+// a dead engine and reasoned about the wrong VRAM cost and lifecycle for both.
+//
+// Running is decided by managedEnginePortIfRunning, not by a container check:
+// an embedding server installed natively (systemd unit, `serve` process) is
+// serving just as much as one in a container, and a docker-only test reports a
+// false negative on exactly the consumer-grade box this product targets.
 func (c *Collector) collectEmbeddingServiceStatus() []ServiceInfo {
-	engineBin := catalog.SelectContainerRuntime().EngineBin
+	var lister embeddingModelLister
+	if c.modelDiscovery != nil {
+		lister = c.modelDiscovery
+	}
+	return collectEmbeddingServices(
+		context.Background(),
+		catalog.SelectContainerRuntime().EngineBin,
+		managedEnginePortIfRunning,
+		embeddingServiceHealthy,
+		lister,
+	)
+}
+
+// embeddingModelLister is the slice of ModelDiscovery collectEmbeddingServices
+// needs. Narrow interface + injected running/health checks so the SELECTION and
+// ATTRIBUTION logic is unit-testable without docker, a native process, or a bound
+// port, the same pattern discoverLocalEngines uses.
+type embeddingModelLister interface {
+	DiscoverEmbeddingModel(ctx context.Context, port int) ([]string, error)
+}
+
+func collectEmbeddingServices(
+	ctx context.Context,
+	engineBin string,
+	portIfRunning func(engineBin, name string) (int, bool),
+	healthy func(port int) bool,
+	md embeddingModelLister,
+) []ServiceInfo {
 	var out []ServiceInfo
 	for _, name := range embeddingProbeServices {
-		if !containerRunning(engineBin, "citadel-"+name) {
-			continue
-		}
-		port := managedEngineHostPort(name)
-		if port <= 0 {
+		port, running := portIfRunning(engineBin, name)
+		if !running || port <= 0 {
 			continue
 		}
 		// Advertise only once the model is loaded (TEI /health is 200 only then),
 		// so the backend never discovers a still-warming node and then fails the
 		// embed with a 503.
-		if !embeddingServiceHealthy(port) {
+		if !healthy(port) {
 			continue
 		}
-		out = append(out, ServiceInfo{
+		info := ServiceInfo{
 			Name:   name,
 			Type:   ServiceTypeEmbedding,
 			Status: ServiceStatusRunning,
 			Port:   port,
 			Health: HealthStatusOK,
-		})
+		}
+		if md != nil {
+			mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
+			models, err := md.DiscoverEmbeddingModel(mctx, port)
+			cancel()
+			if err == nil {
+				info.Models = models
+			}
+		}
+		out = append(out, info)
 	}
 	return out
 }
