@@ -1465,3 +1465,26 @@ Auto-generated log of every release.
   - feat: local semantic search (authorized roots + HNSW + TUI Search + citadel search) (#640)
 
 
+---
+
+## v2.98.0 — 2026-08-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 39 |
+| Lines added | +2206 |
+
+**Changes:**
+
+  - fix(jobs): tell an absent extraction service apart from a slow one (#653 residual) (#695)
+  - fix(jobs): MODEL_CACHE_PULL is a no-op success for engines whose compose owns its weights (#666) (#694)
+  - fix(network): wire the engine's diagnostic logger once, for every command (#662) (#679)
+  - fix(services): health checks must ask whether the engine answers, not whether a process name matches (#649) (#677)
+  - fix(worker): surface an unresolved node identity on the heartbeat and correct the doctor's diagnosis (#654) (#674)
+  - fix(nvr): build internal/nvr on Windows; guard every package in the cross-compile matrix (#663) (#673)
+  - fix(worker): keep the target_node filter on when the node's identity is unresolved (#654) (#671)
+  - feat(gateway): add unexpose to revoke a gateway exposure (#661)
+  - feat(meetings): Teams join-flow scaffold for the Citadel bot (#7000) (#660)
+
+
