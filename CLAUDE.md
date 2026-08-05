@@ -319,6 +319,81 @@ Citadel uses embedded tsnet (Tailscale's Go library) to create a secure WireGuar
 
 Both can coexist on the same machine (separate state directories) and reach each other on the mesh network.
 
+### Machine-wide network mode (`citadel up`, citadel #643)
+
+`citadel login` connects the citadel **process** (userspace tsnet). `citadel up`
+puts the **whole machine** on the mesh via a real kernel TUN, so `ssh`, `curl`,
+a browser — anything on the box — reaches `100.64.x.x` directly. Root/admin
+only, and strictly opt-in.
+
+**Backends** (`internal/network`, all behind the `Backend` interface):
+
+| Mode | Device | Privilege | Dial/Listen |
+|---|---|---|---|
+| `userspace` | none (gVisor netstack) | none | tsnet netstack |
+| `tun` | real `utun` / `/dev/net/tun` / Wintun | root/admin | plain stdlib |
+| `attached` | none — rides a running `citadel up` | none | plain stdlib |
+
+**tsnet cannot do TUN, despite appearances.** `tsnet.Server` has a public
+`Tun tun.Device` field, but tsnet builds `wgengine.Config{Tun: ...}` with
+**neither `Router` nor `DNS`**, so wgengine substitutes `router.NewFake()` and
+a no-op DNS configurator: packets cross a real interface while the OS routing
+table is never touched and the resolver never configured. There is no hook to
+supply them, so `backend_tun.go` assembles the tailscaled-style stack itself
+(`tsd.System` → `netmon` → `tstun.New` → `router.New` →
+`dns.NewOSConfigurator` → `wgengine` → `netstack` → `ipnlocal.LocalBackend`).
+
+**Two non-obvious requirements in that stack** — omit either and the node
+breaks in a way that is hard to trace:
+- `netns.SetEnabled(true)`: binds outbound WireGuard packets to the physical
+  interface so they do not re-enter the tunnel. tsnet never needs it (always
+  netstack, so no tunnel to loop through).
+- `dns.CleanUp` + `router.CleanUp` on **every** `Up`, not just teardown. A
+  crash or reboot-without-shutdown strands routes and a rewritten resolver that
+  restarting would not otherwise undo. tailscaled does the same.
+
+**One machine is one node.** `citadel up` shares the state dir — and therefore
+the node identity — with `citadel login`. `SelectBackend` checks for a live
+`citadel up` FIRST, so `citadel work` on such a host **attaches** rather than
+starting a second WireGuard endpoint on the same node key. Callers need no
+changes: they already go through `network.Dial` / `network.Listen` /
+`network.GetGlobalPeers`.
+
+Selection deliberately does NOT refuse when another *userspace* citadel is
+connected — several processes running tsnet against one state dir (background
+`citadel work` + ad-hoc `citadel status`) is long-standing behavior. Only the
+new userspace/TUN collision is blocked, in `ConnectMachineWide`.
+
+**Windows needs citadel's own Wintun identity.** `tstun`'s init pins the tunnel
+type to `"Tailscale"` AND a static adapter GUID, and Wintun keys on the GUID —
+so citadel collided with an installed Tailscale (`0x800700B7`, "file already
+exists") regardless of the interface name. `internal/network/tun_windows.go`
+overrides both (its init runs after tstun's). The GUID is fixed so restarts
+re-attach instead of leaking adapters. Verified on DESKTOP-6UKHJAN with
+Tailscale running and undisturbed — but note that test (`--check`) installs no
+routes, so it proves only that the **adapter** no longer collides. Both
+products want to route `100.64.0.0/10`; route-level coexistence is untested.
+
+**`citadel up --check`** creates the interface and immediately removes it
+without starting the engine, installing routes, or touching DNS. It is the safe
+way to answer "will machine-wide mode work here?" — including on a box already
+running other VPN software — and the right thing to run under a remote exec
+that might be killed, since `citadel up` itself runs in the foreground until
+interrupted and a SIGKILL skips teardown.
+
+**Two imports that are load-bearing and invisible to the compiler.**
+`internal/network/backend_tun.go` blank-imports
+`tailscale.com/wgengine/router/osrouter` — `router.New` dispatches through a
+feature hook that ONLY that import populates, so without it machine-wide mode
+fails at runtime on EVERY platform with `unsupported OS "..."`. Do not
+"simplify" it to tailscaled's `feature/condregister`: that umbrella links the
+AWS SSM client and 76 aws/smithy packages into citadel. Separately, the Windows
+init calls `com.StartRuntime` because osrouter's `setPrivateNetwork` assumes
+COM is already initialized process-wide (tailscaled does it in its own init);
+without it the adapter is silently left in the Public firewall profile.
+
+Design doc: [docs/machine-wide-tun.md](docs/machine-wide-tun.md).
+
 ### Provisioning Flow (`citadel init`)
 
 By default, `citadel init` only joins the network (no sudo required). Use `--provision` for full system provisioning.

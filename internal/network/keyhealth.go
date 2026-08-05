@@ -17,8 +17,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"tailscale.com/ipn"
 )
 
 // KeyStatus classifies the health of the node's Headscale key relative to its
@@ -112,12 +110,7 @@ func InspectGlobalNodeKeyWithThreshold(ctx context.Context, threshold time.Durat
 		return nil, nil
 	}
 
-	lc, err := s.LocalClient()
-	if err != nil {
-		return nil, fmt.Errorf("local client: %w", err)
-	}
-
-	status, err := lc.Status(ctx)
+	status, err := s.BackendStatus(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("status: %w", err)
 	}
@@ -154,14 +147,7 @@ func RenewGlobalNodeKey(ctx context.Context, authKey string) error {
 	if s == nil {
 		return fmt.Errorf("not connected to AceTeam Network")
 	}
-	lc, err := s.LocalClient()
-	if err != nil {
-		return fmt.Errorf("local client: %w", err)
-	}
-	// Start applies the new AuthKey to the already-running state machine,
-	// re-authorizing the node key in place. UpdatePrefs is left nil so existing
-	// prefs (and Persist, i.e. the machine key) are preserved.
-	if err := lc.Start(ctx, ipn.Options{AuthKey: authKey}); err != nil {
+	if err := s.Reauth(ctx, authKey); err != nil {
 		return fmt.Errorf("in-place reauth: %w", err)
 	}
 	return nil

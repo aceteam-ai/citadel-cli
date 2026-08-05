@@ -12,6 +12,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coder/hnsw v0.6.1
 	github.com/creack/pty v1.1.24
+	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa
 	github.com/fatih/color v1.18.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gdamore/tcell/v2 v2.13.10
@@ -25,6 +26,7 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
+	github.com/tailscale/wireguard-go v0.0.0-20260527010701-b48af7099cad
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
@@ -50,9 +52,9 @@ require (
 	github.com/chewxy/math32 v1.10.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/coder/websocket v1.8.12 // indirect
+	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.6 // indirect
 	github.com/creachadair/msync v0.7.1 // indirect
-	github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
@@ -65,6 +67,7 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806 // indirect
 	github.com/google/renameio v1.0.1 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
@@ -93,11 +96,12 @@ require (
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
+	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7 // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260527010701-b48af7099cad // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/viterin/partial v1.1.0 // indirect
 	github.com/viterin/vek v0.4.2 // indirect
 	github.com/x448/float16 v0.8.4 // indirect

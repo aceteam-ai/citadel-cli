@@ -1,5 +1,6 @@
 // internal/network/server.go
-// Core tsnet wrapper for AceTeam Network connections
+// Core AceTeam Network connection wrapper, backed by a pluggable Backend
+// (userspace tsnet today; machine-wide TUN under issue #643).
 package network
 
 import (
@@ -9,14 +10,12 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
 )
 
 // logf is a package-level settable logger for diagnostic output.
@@ -49,15 +48,36 @@ func SetLogf(fn func(string, ...any)) {
 // Intended for wiring assertions, not for control flow.
 func LogfConfigured() bool { return logfSet }
 
-// NetworkServer wraps tsnet.Server with AceTeam-specific functionality.
+// NetworkServer wraps a mesh Backend with AceTeam-specific functionality.
 type NetworkServer struct {
-	srv        *tsnet.Server
+	backend    Backend
+	mode       BackendMode
 	controlURL string
 	hostname   string
 	stateDir   string
 
+	// releaseLock deregisters this process from the userspace holder set.
+	// Nil for the attached backend, which starts no endpoint of its own.
+	releaseLock func()
+
 	mu        sync.RWMutex
 	connected bool
+}
+
+// Mode reports which transport this server ended up on. Commands print it so
+// a user can tell machine-wide mode from userspace at a glance.
+func (s *NetworkServer) Mode() BackendMode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mode
+}
+
+// releaseStateLock is safe to call with no lock held. Callers must hold s.mu.
+func (s *NetworkServer) releaseStateLock() {
+	if s.releaseLock != nil {
+		s.releaseLock()
+		s.releaseLock = nil
+	}
 }
 
 // SuppressLogs disables all tsnet/tailscale log output.
@@ -107,7 +127,7 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.connected && s.srv != nil {
+	if s.connected && s.backend != nil {
 		return nil // Already connected
 	}
 
@@ -121,37 +141,40 @@ func (s *NetworkServer) Connect(ctx context.Context, authKey string) error {
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(origOutput)
 
-	// Create tsnet server
-	s.srv = &tsnet.Server{
-		Hostname:   s.hostname,
-		ControlURL: s.controlURL,
-		Dir:        s.stateDir,
-		AuthKey:    authKey,
-		Ephemeral:  false,                               // We want persistent nodes
-		Logf:       func(format string, args ...any) {}, // Suppress verbose tsnet logs
+	// Pick the transport. On a host where `citadel up` already holds the mesh
+	// this attaches to it rather than starting a second WireGuard endpoint on
+	// the same node key; otherwise it takes the state-dir lock and runs
+	// unprivileged tsnet, exactly as before. See SelectBackend.
+	mode, err := SelectBackend(s.stateDir)
+	if err != nil {
+		return err
 	}
 
-	// On Windows, restrict Group Policy locks to avoid ERROR_ACCESS_DENIED
-	// in non-interactive sessions (WinRM, services). No-op on other platforms.
-	removeRestriction := restrictPolicyLocks()
-
-	// Start the server (this initiates the connection)
-	if err := s.srv.Start(); err != nil {
-		removeRestriction()
-		// On Windows, wrap cryptic syspolicy errors with actionable guidance.
-		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "syspolicy") {
-			return fmt.Errorf("Windows requires SYSTEM privileges for network access.\n"+
-				"   Run via a scheduled task with /ru SYSTEM, or install as a service.\n"+
-				"   Original error: %w", err)
-		}
-		return fmt.Errorf("failed to start network: %w", err)
+	switch mode {
+	case ModeAttached:
+		s.backend = newAttachedBackend(LocalAPISocketPath(s.stateDir))
+	default:
+		// Record this process so `citadel up` can refuse to start alongside
+		// it. Purely advisory — it never blocks the userspace path.
+		s.releaseLock = registerUserspaceHolder(s.stateDir)
+		s.backend = newUserspaceBackend(ServerConfig{
+			Hostname:   s.hostname,
+			ControlURL: s.controlURL,
+		}, s.stateDir, authKey)
 	}
-	removeRestriction()
+	s.mode = mode
+
+	if err := s.backend.Up(ctx); err != nil {
+		s.backend = nil
+		s.releaseStateLock()
+		return err
+	}
 
 	// Wait for connection to be established
 	if err := s.waitForConnection(ctx); err != nil {
-		s.srv.Close()
-		s.srv = nil
+		s.backend.Close()
+		s.backend = nil
+		s.releaseStateLock()
 		return err
 	}
 
@@ -173,11 +196,6 @@ func (s *NetworkServer) waitForConnection(ctx context.Context) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return fmt.Errorf("failed to get local client: %w", err)
-	}
-
 	// Poll for connection status
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -189,7 +207,7 @@ func (s *NetworkServer) waitForConnection(ctx context.Context) error {
 			logf("vpn: timed out waiting for connection (last state: %s)", lastState)
 			return fmt.Errorf("timeout waiting for network connection")
 		case <-ticker.C:
-			status, err := lc.Status(timeoutCtx)
+			status, err := s.backend.Status(timeoutCtx)
 			if err != nil {
 				continue // Keep trying
 			}
@@ -209,13 +227,14 @@ func (s *NetworkServer) Disconnect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil
 	}
 
-	err := s.srv.Close()
-	s.srv = nil
+	err := s.backend.Close()
+	s.backend = nil
 	s.connected = false
+	s.releaseStateLock()
 
 	// Fix state file ownership after tsnet has finished writing.
 	// tsnet rewrites tailscaled.state atomically (temp file + rename),
@@ -232,20 +251,15 @@ func (s *NetworkServer) IsConnected() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.connected || s.srv == nil {
-		return false
-	}
-
-	// Verify actual connection status
-	lc, err := s.srv.LocalClient()
-	if err != nil {
+	if !s.connected || s.backend == nil {
 		return false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	status, err := lc.Status(ctx)
+	// Verify actual connection status
+	status, err := s.backend.Status(ctx)
 	if err != nil {
 		return false
 	}
@@ -258,11 +272,11 @@ func (s *NetworkServer) GetIPv4() (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return "", fmt.Errorf("not connected to network")
 	}
 
-	ip4, _ := s.srv.TailscaleIPs()
+	ip4, _ := s.backend.TailscaleIPs()
 	if !ip4.IsValid() {
 		return "", fmt.Errorf("no IPv4 address assigned")
 	}
@@ -275,11 +289,11 @@ func (s *NetworkServer) GetIPv6() (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return "", fmt.Errorf("not connected to network")
 	}
 
-	_, ip6 := s.srv.TailscaleIPs()
+	_, ip6 := s.backend.TailscaleIPs()
 	if !ip6.IsValid() {
 		return "", fmt.Errorf("no IPv6 address assigned")
 	}
@@ -292,11 +306,11 @@ func (s *NetworkServer) GetIPs() ([]netip.Addr, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	ip4, ip6 := s.srv.TailscaleIPs()
+	ip4, ip6 := s.backend.TailscaleIPs()
 	var ips []netip.Addr
 	if ip4.IsValid() {
 		ips = append(ips, ip4)
@@ -310,18 +324,6 @@ func (s *NetworkServer) GetIPs() ([]netip.Addr, error) {
 // Hostname returns the configured hostname.
 func (s *NetworkServer) Hostname() string {
 	return s.hostname
-}
-
-// LocalClient returns the tailscale LocalClient for advanced operations.
-func (s *NetworkServer) LocalClient() (*tailscale.LocalClient, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.srv == nil {
-		return nil, fmt.Errorf("not connected to network")
-	}
-
-	return s.srv.LocalClient()
 }
 
 // PeerIdentity is the verified mesh identity of a connecting peer, resolved via
@@ -358,16 +360,11 @@ func (s *NetworkServer) WhoIs(ctx context.Context, remoteAddr string) (*PeerIden
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get local client: %w", err)
-	}
-
-	who, err := lc.WhoIs(ctx, remoteAddr)
+	who, err := s.backend.WhoIs(ctx, remoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("whois %s: %w", remoteAddr, err)
 	}
@@ -385,7 +382,7 @@ func (s *NetworkServer) WhoIs(ctx context.Context, remoteAddr string) (*PeerIden
 	// Same-owner check mirrors GetPeers: compare the peer's owning user against
 	// self's, and require it is not a shared-in node (Sharer set). A best-effort
 	// Status() failure leaves SameOwner false (fail-closed on the extra check).
-	if status, serr := lc.Status(ctx); serr == nil && status.Self != nil {
+	if status, serr := s.backend.Status(ctx); serr == nil && status.Self != nil {
 		id.SameOwner = who.Node.User == status.Self.UserID && who.Node.Sharer == 0
 	}
 
@@ -398,11 +395,11 @@ func (s *NetworkServer) Listen(network, addr string) (net.Listener, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	return s.srv.Listen(network, addr)
+	return s.backend.Listen(network, addr)
 }
 
 // ListenTLS creates a TLS listener with automatic certificate management.
@@ -410,11 +407,11 @@ func (s *NetworkServer) ListenTLS(network, addr string) (net.Listener, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	return s.srv.ListenTLS(network, addr)
+	return s.backend.ListenTLS(network, addr)
 }
 
 // Dial connects to a remote address on the network.
@@ -422,11 +419,11 @@ func (s *NetworkServer) Dial(ctx context.Context, network, addr string) (net.Con
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	return s.srv.Dial(ctx, network, addr)
+	return s.backend.Dial(ctx, network, addr)
 }
 
 // Status returns the current network status.
@@ -434,23 +431,18 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return &NetworkStatus{
 			Connected: false,
 		}, nil
 	}
 
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get local client: %w", err)
-	}
-
-	status, err := lc.Status(ctx)
+	status, err := s.backend.Status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}
 
-	ip4, ip6 := s.srv.TailscaleIPs()
+	ip4, ip6 := s.backend.TailscaleIPs()
 	var ipv4, ipv6 string
 	if ip4.IsValid() {
 		ipv4 = ip4.String()
@@ -491,22 +483,42 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 	}, nil
 }
 
+// BackendStatus returns the raw backend status (self node, peers, backend
+// state) rather than the summarized NetworkStatus. Used where callers need
+// fields the summary drops — e.g. the node key's expiry, in keyhealth.go.
+func (s *NetworkServer) BackendStatus(ctx context.Context) (*ipnstate.Status, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.backend == nil {
+		return nil, fmt.Errorf("not connected to network")
+	}
+	return s.backend.Status(ctx)
+}
+
+// Reauth applies a fresh authkey to the running backend in place, preserving
+// the machine key (and therefore the node's IP) and every open listener.
+func (s *NetworkServer) Reauth(ctx context.Context, authKey string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.backend == nil {
+		return fmt.Errorf("not connected to network")
+	}
+	return s.backend.Reauth(ctx, authKey)
+}
+
 // KeepAlive triggers Tailscale control plane activity to keep Headscale's lastSeen fresh.
 // Should be called periodically (every 60s). Safe to call when not connected.
 func (s *NetworkServer) KeepAlive(ctx context.Context) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil // Not connected, nothing to do
 	}
 
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return fmt.Errorf("failed to get local client: %w", err)
-	}
-
-	_, err = lc.Status(ctx)
+	_, err := s.backend.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to refresh status: %w", err)
 	}
@@ -546,16 +558,11 @@ func (s *NetworkServer) GetPeers(ctx context.Context) ([]PeerInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return nil, fmt.Errorf("not connected to network")
 	}
 
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get local client: %w", err)
-	}
-
-	status, err := lc.Status(ctx)
+	status, err := s.backend.Status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status: %w", err)
 	}
@@ -615,13 +622,8 @@ func (s *NetworkServer) PingPeer(ctx context.Context, ip string) (latencyMs floa
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.srv == nil {
+	if s.backend == nil {
 		return 0, "", "", fmt.Errorf("not connected")
-	}
-
-	lc, err := s.srv.LocalClient()
-	if err != nil {
-		return 0, "", "", err
 	}
 
 	addr, err := netip.ParseAddr(ip)
@@ -629,7 +631,7 @@ func (s *NetworkServer) PingPeer(ctx context.Context, ip string) (latencyMs floa
 		return 0, "", "", err
 	}
 
-	result, err := lc.Ping(ctx, addr, tailcfg.PingDisco)
+	result, err := s.backend.Ping(ctx, addr, tailcfg.PingDisco)
 	if err != nil {
 		return 0, "", "", err
 	}
