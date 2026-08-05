@@ -163,12 +163,21 @@ func agentResubscribe(ctx context.Context, d agentProviderDeps, orgID string) (a
 	}
 
 	perNodeQueue := nodeQueueName(orgID, nodeID)
+	wakeChannel := nodeWakeChannel(nodeID)
 	switch src := d.source.(type) {
 	case *worker.APISource:
 		src.AddQueue(perNodeQueue)
+		// Re-establish the push-wake subscription alongside the stream (issue
+		// #7270). EnableWake is a no-op if already enabled; best-effort otherwise.
+		if err := src.EnableWake(ctx, wakeChannel); err != nil {
+			Debug("resubscribe: per-node push-wake unavailable (poll-only): %v", err)
+		}
 	case *worker.RedisSource:
 		if err := src.AddQueue(ctx, perNodeQueue); err != nil {
 			return nil, fmt.Errorf("failed to subscribe to %s: %w", perNodeQueue, err)
+		}
+		if err := src.EnableWake(ctx, wakeChannel); err != nil {
+			Debug("resubscribe: per-node push-wake unavailable (poll-only): %v", err)
 		}
 	default:
 		return map[string]any{"ok": false, "message": "source does not support resubscription"}, nil
