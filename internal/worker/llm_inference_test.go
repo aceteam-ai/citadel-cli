@@ -29,6 +29,11 @@ func TestLLMInferenceHandler_CanHandle(t *testing.T) {
 func newChatCompletionsServer(t *testing.T, frames []string, lastPath *string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A serving engine answers its readiness endpoint (citadel-cli#680); the
+		// handler now probes before proxying.
+		if serveReadinessProbe(w, r) {
+			return
+		}
 		if lastPath != nil {
 			*lastPath = r.URL.Path
 		}
@@ -153,6 +158,9 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 		t.Run(backend, func(t *testing.T) {
 			var gotPath string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
 				gotPath = r.URL.Path
 				if r.URL.Path != "/v1/chat/completions" {
 					http.Error(w, "unexpected path", http.StatusNotFound)
@@ -208,6 +216,9 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 		var gotPath, gotPrompt string
 		var sawMessages bool
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
 			gotPath = r.URL.Path
 			var req map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&req)
@@ -277,6 +288,9 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 		}
 		var gotPath string
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
 			gotPath = r.URL.Path
 			if r.URL.Path != "/api/chat" {
 				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
@@ -327,6 +341,9 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 	t.Run("ollama prompt still routes to /api/generate", func(t *testing.T) {
 		var gotPath string
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
 			gotPath = r.URL.Path
 			if r.URL.Path != "/api/generate" {
 				http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)

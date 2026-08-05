@@ -47,6 +47,7 @@ const (
 	swapBackgroundMaxDur = 15 * time.Minute
 	swapReadyPollEvery   = 1 * time.Second
 	warmingRetryAfter    = 10 // seconds; the platform's retry_after hint
+	warmingRetryAfterMax = 60 // seconds; ceiling on a paced retry hint
 )
 
 // SwapController abstracts the node side-effects a swap performs, so the swap
@@ -86,6 +87,11 @@ type SwapOutcome struct {
 	// ETASeconds is the estimated remaining seconds until the model is ready,
 	// surfaced in the model_warming result when Ready is false.
 	ETASeconds int
+	// RetryAfterSeconds is the hint the platform should wait before retrying.
+	// Zero means "use the standard hint". It is set above the default only when
+	// the node knows the caller's model is not being worked on yet, so a retry
+	// loop does not spin against a node doing nothing for it (citadel-cli#680).
+	RetryAfterSeconds int
 }
 
 // swapOp is a single in-flight background swap. done is closed when the swap
@@ -172,8 +178,19 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 
 	op := m.startOrJoin(backend, model)
 	if op == nil {
-		// A different swap is in flight — do not start a second one. Warm.
-		return SwapOutcome{Ready: false, ETASeconds: int(m.loadEstimate(backend).Seconds())}, nil
+		// A different model is being swapped in and single-flight refuses to start
+		// a second one, so THIS model's load has not begun. Reporting a bare
+		// cold-start estimate here would be a fabricated number: the real wait is
+		// the in-flight swap finishing PLUS this engine's own load. Quote that, and
+		// pace the retry hint to it, so a caller does not busy-retry a node that is
+		// not working on its request (citadel-cli#680). Telling the two cases apart
+		// on the wire ("loading yours" vs "busy with another") is citadel-cli#681.
+		eta := m.blockedETASeconds(backend)
+		return SwapOutcome{
+			Ready:             false,
+			ETASeconds:        eta,
+			RetryAfterSeconds: retryAfterFor(eta),
+		}, nil
 	}
 
 	// Observe the (possibly background) swap for the remaining wait budget.
@@ -381,4 +398,40 @@ func (m *SwapManager) etaSeconds(op *swapOp) int {
 		secs = warmingRetryAfter
 	}
 	return secs
+}
+
+// blockedETASeconds estimates the wait for a backend whose swap cannot start
+// because a DIFFERENT swap holds the single-flight slot: the in-flight swap's
+// remaining time plus this backend's own cold start. Without the first term the
+// node quotes a number that assumes work already underway that has not begun.
+func (m *SwapManager) blockedETASeconds(backend string) int {
+	own := int(m.loadEstimate(backend).Seconds())
+
+	m.mu.Lock()
+	op := m.inflight
+	m.mu.Unlock()
+	if op == nil {
+		// The blocking swap finished between startOrJoin and here. This backend
+		// still is not resident, so its own cold start is the honest estimate.
+		return own
+	}
+
+	remaining := int((op.loadEst - m.now().Sub(op.startedAt)).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining + own
+}
+
+// retryAfterFor paces the platform's retry to the quoted wait, so a long queue
+// behind another model is not polled every 10 seconds. Bounded so a caller is
+// never told to disappear for an unbounded stretch.
+func retryAfterFor(etaSeconds int) int {
+	if etaSeconds <= warmingRetryAfter {
+		return warmingRetryAfter
+	}
+	if etaSeconds > warmingRetryAfterMax {
+		return warmingRetryAfterMax
+	}
+	return etaSeconds
 }
