@@ -313,6 +313,40 @@ citadel's own interface name.
 leftover `100.x` routes, `tailscale0` intact, and `citadel.service` still
 active — the running worker was never disturbed.
 
+## Verified on macOS (2026-08-04, jmbp16-m1pro — with Tailscale.app removed)
+
+```
+utun9   100.64.0.21              <- reused the node's EXISTING citadel identity
+routes  100.64/10 -> utun9, 100.100.100.100/32 -> utun9
+ping 100.64.0.78 (ubuntu-gpu)  ->  3/3 replies
+```
+
+macOS installs a single aggregate `100.64/10` route rather than Windows' per-peer
+`/32`s (`shouldUseOneCGNATRoute: macOS automatic=true`).
+
+**One machine, one node** again held: org node count stayed at 12 and there was
+exactly one `jmbp16-m1pro` row — `citadel up` reused the identity `citadel
+login` had already established on this Mac, with no authkey needed.
+
+**Teardown** on SIGINT: `utun` removed, 0 leftover `100.x` routes,
+`/etc/resolver` emptied, and `scutil` back to the LAN resolver.
+
+**Known gap — MagicDNS names do not resolve on macOS (issue #676).** The mesh is
+reachable by IP and `dig @100.100.100.100 ubuntu-gpu.internal` answers
+correctly, but `ping ubuntu-gpu.internal` fails. `darwinConfigurator.SetDNS`
+writes the `nameserver` file only for `cfg.MatchDomains`, and our OS config
+comes out in global mode with `MatchDomains` empty:
+
+```
+dns: OScfg: {Nameservers:[100.100.100.100 ...] SearchDomains:[internal. home.] }
+```
+
+so only `/etc/resolver/search.tailscale` is written and the nameservers are
+silently dropped. `/etc/resolver` can only express *split* DNS. Linux is
+unaffected. The likely fix is to pin split-DNS mode on macOS, which is the
+better posture for citadel anyway — answer for the fabric domain rather than
+becoming the machine's global resolver.
+
 ## Slices
 
 1. **Backend interface + `userspace` implementation** — DONE. No behavior
@@ -323,7 +357,8 @@ active — the running worker was never disturbed.
    errors rather than downgrading; `--check` creates and removes the interface
    without starting the engine, so it is safe on a box running other VPN
    software.
-4. **MagicDNS `*.internal`** — DONE, verified resolving on Windows.
+4. **MagicDNS `*.internal`** — verified resolving on Windows and Linux; broken
+   on macOS (#676).
 5. **Linux** (`/dev/net/tun`) — DONE, verified on a live fabric node
    alongside a running tailscaled (see above).
 6. **Windows** — adapter identity, router registration and COM init all DONE
