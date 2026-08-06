@@ -161,11 +161,16 @@ func FilterPS(containers []PSContainer, declared map[string]bool) []PSContainer 
 //
 // Order of evidence:
 //  1. A declared container that is running wins, and is reported.
-//  2. Otherwise a declared container in any other state is reported as-is
-//     (exited, restarting, ...).
-//  3. Otherwise, if nativeServing is non-nil and reports true, the service is
-//     running natively (no container). This is what keeps a systemd ollama from
-//     being called stopped.
+//  2. Otherwise, if nativeServing is non-nil and reports true, the service is
+//     running natively. This is what keeps a systemd ollama from being called
+//     stopped, and it deliberately outranks a non-running container: a live
+//     socket is stronger evidence of serving than a stale container is of
+//     stopped. Nodes accumulate exited containers (see
+//     compose.RemoveLegacyProjectContainers), so an exited citadel-ollama
+//     sitting next to a serving systemd ollama is a real shape. Same ordering as
+//     internal/status.managedEnginePortIfRunning on the heartbeat path.
+//  3. Otherwise a declared container in a non-running state is reported, with
+//     its raw state kept on Container so a crash loop stays visible.
 //  4. Otherwise the service is stopped. This is the case #692 got wrong.
 func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServing func() bool) ServiceState {
 	mine := FilterPS(ParsePS(psOutput), declared)
@@ -181,16 +186,17 @@ func ResolveServiceState(psOutput []byte, declared map[string]bool, nativeServin
 			first = &c
 		}
 	}
+
+	if nativeServing != nil && nativeServing() {
+		return ServiceState{State: StateRunning, Running: true, Native: true}
+	}
+
 	if first != nil {
 		state := strings.ToLower(first.State)
 		if strings.Contains(state, "exited") || strings.Contains(state, "dead") || state == "" {
 			state = StateStopped
 		}
 		return ServiceState{State: state, Container: first}
-	}
-
-	if nativeServing != nil && nativeServing() {
-		return ServiceState{State: StateRunning, Running: true, Native: true}
 	}
 	return ServiceState{State: StateStopped}
 }

@@ -82,6 +82,24 @@ func TestResolveServiceStateNative(t *testing.T) {
 	}
 }
 
+// TestResolveServiceStateNativeBeatsStaleContainer: a node that once ran ollama
+// under compose keeps an exited citadel-ollama around (which is why
+// RemoveLegacyProjectContainers exists) while ollama actually serves from
+// systemd. A live socket outranks a stale container, or the fix regresses the
+// very case #692 must not break.
+func TestResolveServiceStateNativeBeatsStaleContainer(t *testing.T) {
+	out := `{"ID":"a","Name":"citadel-ollama","Service":"ollama","State":"exited","Status":"Exited (0) 3 days ago"}`
+	got := ResolveServiceState([]byte(out), map[string]bool{"ollama": true}, always)
+	if !got.Running || !got.Native {
+		t.Fatalf("got %+v, want running via the native probe", got)
+	}
+	// Same input with nothing serving must still read the stale container.
+	got = ResolveServiceState([]byte(out), map[string]bool{"ollama": true}, never)
+	if got.Running || got.Container == nil || got.Container.State != "exited" {
+		t.Fatalf("got %+v, want stopped with the exited container reported", got)
+	}
+}
+
 // TestResolveServiceStateAbsent is the #692 regression test: vllm is declared,
 // has no container, and is not serving natively. The project-wide output is full
 // of OTHER services' running containers, and none of them may promote vllm to
