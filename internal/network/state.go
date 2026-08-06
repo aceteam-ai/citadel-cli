@@ -155,8 +155,13 @@ func dirHasEntries(path string) bool {
 // Always the fixed machine-wide config dir (never a user-local one) so every
 // user on the box reads the same value.
 func machineStatePointerPath() string {
-	return filepath.Join(getGlobalConfigDirForState(), machineStatePointerFile)
+	return filepath.Join(globalConfigDirForState(), machineStatePointerFile)
 }
+
+// globalConfigDirForState is indirected so tests can point the machine-global
+// pointer file at a temp dir. Production always uses the real fixed path —
+// writing it requires root, which is exactly why it converges every user.
+var globalConfigDirForState = getGlobalConfigDirForState
 
 // readMachineStatePointer reads node_config_dir from the machine-global pointer
 // file, or returns "" if it is absent/unreadable. The file contains only a
@@ -180,12 +185,51 @@ func WriteMachineStatePointer(nodeConfigDir string) error {
 	if nodeConfigDir == "" {
 		return nil
 	}
-	dir := getGlobalConfigDirForState()
+	dir := globalConfigDirForState()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, machineStatePointerFile)
 	return os.WriteFile(path, []byte(nodeConfigDir+"\n"), 0644)
+}
+
+// EnsureMachineStatePointer records the state dir this process resolved, so a
+// later run in a context WITHOUT $SUDO_USER converges on the same node identity.
+//
+// Why this is needed. resolveStateDir's owner-consistent fallback depends on
+// $SUDO_USER to find the owning user's home. A daemon started by launchd or
+// systemd has no $SUDO_USER and $HOME=/var/root, so it falls through to root's
+// home, opens an EMPTY state dir, mints a fresh machine key, and registers as a
+// SECOND node — the exact duplicate-node failure #383 fixed for sudo, resurfacing
+// for services. `citadel up` is the first command that routinely runs both ways
+// (interactive sudo, then as a service), which is what exposes it.
+//
+// Only `citadel init` wrote the pointer before this, so anyone who onboarded via
+// `citadel login` had none.
+//
+// It deliberately does NOT write a guess. The pointer is recorded only when the
+// resolved directory already holds real state — i.e. when this process demonstrably
+// found the right one. Persisting a wrong path would convert a transient
+// misresolution into a permanent one for every future context on the machine,
+// which is strictly worse than having no pointer at all.
+//
+// Takes the already-resolved stateDir rather than re-deriving it, so the value
+// recorded is exactly the one the caller is using.
+//
+// Best-effort: writing under the machine-global config dir needs root, so an
+// unprivileged caller simply skips it.
+func EnsureMachineStatePointer(stateDir string) error {
+	if readMachineStatePointer() != "" {
+		return nil // already converged
+	}
+	if !dirHasEntries(stateDir) {
+		// Nothing here yet, so we cannot tell a correct resolution from a
+		// fallback. Recording it now risks pinning the wrong directory.
+		return nil
+	}
+
+	// stateDir is <nodeConfigDir>/network; the pointer stores the parent.
+	return WriteMachineStatePointer(filepath.Dir(stateDir))
 }
 
 // isSystemProfilePath returns true if the path is under the Windows SYSTEM

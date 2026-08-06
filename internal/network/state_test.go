@@ -199,3 +199,108 @@ func TestFixStatePermissions_NoOpWhenNotRoot(t *testing.T) {
 	// Should not panic or error
 	FixStatePermissions()
 }
+
+// The launchd/systemd case that motivated EnsureMachineStatePointer: a daemon
+// has no $SUDO_USER and $HOME=/var/root, so the owner-consistent fallback
+// resolves ROOT's home rather than the user's. Without a pointer file, that is
+// a different, empty state dir -> fresh machine key -> a SECOND node registered
+// for one machine.
+func TestResolveStateDirDivergesWithoutPointerUnderService(t *testing.T) {
+	const userHome = "/Users/jason"
+	const rootHome = "/var/root"
+
+	// Interactive `sudo citadel up`: SUDO_USER resolves the owner's home.
+	interactive := resolveStateDir(stateDirInputs{
+		ownerHome:         userHome,
+		legacyStateExists: func(h string) bool { return h == userHome },
+		goos:              "darwin",
+	})
+
+	// The same machine under launchd: no SUDO_USER, so ownerHome is root's.
+	service := resolveStateDir(stateDirInputs{
+		ownerHome:         rootHome,
+		legacyStateExists: func(h string) bool { return h == userHome },
+		goos:              "darwin",
+	})
+
+	if interactive == service {
+		t.Fatalf("expected divergence without a pointer, got %q for both", interactive)
+	}
+
+	// ...and that the pointer is what reconciles them. This is the property
+	// EnsureMachineStatePointer exists to establish.
+	pointer := "/Users/jason/citadel-node"
+	reconciled := resolveStateDir(stateDirInputs{
+		pointerDir:        pointer,
+		ownerHome:         rootHome, // still the service context
+		legacyStateExists: func(h string) bool { return h == userHome },
+		goos:              "darwin",
+	})
+	if reconciled != interactive {
+		t.Errorf("with a pointer, service resolved %q; want %q (same as interactive)", reconciled, interactive)
+	}
+}
+
+// The pointer must never be overwritten once set: a second writer with a
+// different (possibly wrong) view would re-introduce the divergence.
+func TestEnsureMachineStatePointerNoopWhenAlreadySet(t *testing.T) {
+	dir := t.TempDir()
+	orig := globalConfigDirForState
+	globalConfigDirForState = func() string { return dir }
+	t.Cleanup(func() { globalConfigDirForState = orig })
+
+	existing := "/already/recorded"
+	if err := WriteMachineStatePointer(existing); err != nil {
+		t.Fatalf("WriteMachineStatePointer() error = %v", err)
+	}
+
+	if err := EnsureMachineStatePointer(t.TempDir()); err != nil {
+		t.Fatalf("EnsureMachineStatePointer() error = %v", err)
+	}
+	if got := readMachineStatePointer(); got != existing {
+		t.Errorf("pointer = %q, want %q unchanged", got, existing)
+	}
+}
+
+// The guard that keeps a misresolution from becoming permanent: with no state
+// present, EnsureMachineStatePointer must record NOTHING rather than pin
+// whatever the fallback happened to produce.
+func TestEnsureMachineStatePointerDoesNotRecordAGuess(t *testing.T) {
+	dir := t.TempDir()
+	orig := globalConfigDirForState
+	globalConfigDirForState = func() string { return dir }
+	t.Cleanup(func() { globalConfigDirForState = orig })
+
+	// An empty state dir: we cannot tell a correct resolution from a fallback.
+	if err := EnsureMachineStatePointer(t.TempDir()); err != nil {
+		t.Fatalf("EnsureMachineStatePointer() error = %v", err)
+	}
+	if got := readMachineStatePointer(); got != "" {
+		t.Errorf("recorded %q with no state present; want nothing written", got)
+	}
+}
+
+// The path that actually converges a later service run: state IS present, so
+// the location is known-good and gets recorded (as the PARENT of network/).
+func TestEnsureMachineStatePointerRecordsResolvedDir(t *testing.T) {
+	cfgDir := t.TempDir()
+	orig := globalConfigDirForState
+	globalConfigDirForState = func() string { return cfgDir }
+	t.Cleanup(func() { globalConfigDirForState = orig })
+
+	nodeDir := t.TempDir()
+	stateDir := filepath.Join(nodeDir, "network")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tailscaled.state"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	if err := EnsureMachineStatePointer(stateDir); err != nil {
+		t.Fatalf("EnsureMachineStatePointer() error = %v", err)
+	}
+	if got := readMachineStatePointer(); got != nodeDir {
+		t.Errorf("pointer = %q, want %q (the parent of network/)", got, nodeDir)
+	}
+}
