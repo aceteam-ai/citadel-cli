@@ -1492,7 +1492,7 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 			// Get container info via docker compose ps (no -p: default project,
 			// matching where production containers actually run, #528). The output
 			// is project-wide, so it must be narrowed to this compose file's own
-			// services before reading a container off it -- decoding the first
+			// services before reading a container off it. Decoding the first
 			// record showed another service's container here (#692).
 			if state, err := composeServiceState(fullComposePath, service.Name); err == nil && state.Container != nil {
 				container := state.Container

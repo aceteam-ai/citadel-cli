@@ -11,8 +11,8 @@ import (
 // This file resolves the single question every operator surface asks about a
 // managed service: is it actually running?
 //
-// The naive answer -- shell `docker compose -f <file> ps --format json` and read
-// the first container -- is wrong on a citadel node, and citadel-cli#692 is what
+// The naive answer, shell `docker compose -f <file> ps --format json` and read
+// the first container, is wrong on a citadel node, and citadel-cli#692 is what
 // that wrongness looks like: all 11 declared services report running while three
 // of them have no container at all.
 //

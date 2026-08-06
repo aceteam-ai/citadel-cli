@@ -26,7 +26,7 @@ const livePSOutput = `
 {"ID":"cd3c5f192d7e","Name":"services-db-1","Image":"postgres:16-alpine","Service":"db","State":"running","Status":"Up 10 hours (healthy)","Ports":"5432/tcp"}
 `
 
-func never() bool { return false }
+func never() bool  { return false }
 func always() bool { return true }
 
 // TestResolveServiceStateContainerBacked covers the ordinary case: a service
@@ -49,7 +49,7 @@ func TestResolveServiceStateContainerBacked(t *testing.T) {
 
 // TestResolveServiceStateMultiContainerService covers whatsapp-bridge, whose
 // compose file declares two services (`bridge`, `db`) and pins no container_name
-// -- so its containers are named services-bridge-1 / services-db-1. This is the
+// so its containers are named services-bridge-1 / services-db-1. This is the
 // case that makes declared-service-name matching necessary: a lookup for a
 // container literally named "citadel-whatsapp-bridge" finds nothing and would
 // report a running service as stopped.
