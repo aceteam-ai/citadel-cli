@@ -88,6 +88,20 @@ func ConnectMachineWide(ctx context.Context, config ServerConfig, elevated bool)
 	}
 
 	FixStatePermissions()
+
+	// Record where this node's state actually lives. `citadel up` is elevated
+	// and typically run interactively first (where $SUDO_USER makes resolution
+	// correct), then later as a launchd/systemd service — which has no
+	// $SUDO_USER and would otherwise resolve root's home, open an empty state
+	// dir, and register a SECOND node for this machine. Writing the pointer
+	// here converges the service run on the identity established now.
+	if err := EnsureMachineStatePointer(stateDir); err != nil {
+		// Non-fatal: the node is up and correct for THIS process. Only the
+		// later service run would be at risk, and that is worth a warning
+		// rather than refusing a working connection.
+		logf("warning: could not record machine state pointer (a later service run may register a duplicate node): %v", err)
+	}
+
 	s.connected = true
 	SetGlobal(s)
 	return s, nil
