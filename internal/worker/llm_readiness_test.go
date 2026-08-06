@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // serveReadinessProbe answers the readiness endpoints a real serving engine
@@ -447,5 +449,30 @@ func TestRetryAfterFor(t *testing.T) {
 	}
 	if got := retryAfterFor(9999); got != warmingRetryAfterMax {
 		t.Errorf("retryAfterFor(9999) = %d, want %d", got, warmingRetryAfterMax)
+	}
+}
+
+// TestEngineRequestFailure_RefusedMidRequest covers the second-line defence: an
+// engine that goes away between the readiness probe and the request. That is
+// warming only while a start this node issued is still inside its load window;
+// otherwise nothing is listening and the caller gets a failure it can act on
+// (citadel-cli#705).
+func TestEngineRequestFailure_RefusedMidRequest(t *testing.T) {
+	payload := &jobs.LLMInferencePayload{Model: "baidu/Unlimited-OCR", Backend: "unlimited-ocr"}
+	refused := realRefusedError(t)
+
+	h := NewLLMInferenceHandler()
+	result := h.engineRequestFailure(payload, refused, "failed to connect to chat endpoint")
+	if result.Status != JobStatusFailure {
+		t.Fatalf("refused with no start on record = %v, want failure", result.Status)
+	}
+
+	h.swapper = &startTracker{startedAt: time.Now(), known: true}
+	result = h.engineRequestFailure(payload, refused, "failed to connect to chat endpoint")
+	if result.Status != JobStatusSuccess {
+		t.Fatalf("refused while a start is in flight = %v, want a warming success", result.Status)
+	}
+	if got, _ := result.Output["status"].(string); got != "model_warming" {
+		t.Errorf("status = %q, want model_warming", got)
 	}
 }
