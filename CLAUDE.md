@@ -4,6 +4,31 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## How to keep this file from lying
+
+Three entries here were found stale on 2026-08-05 — the `ConfigDir()` paths, the
+compose `-p` scheme (#693), and the manifest-loading algorithm — and each one had
+already cost someone real time, because a confidently wrong doc is worse than a
+missing one: it stops you looking at the code. The `ConfigDir()` entry nearly
+turned #696's fix into a silent no-op.
+
+All three failed the same way: **they restated a fact the code owns.** Restated
+facts drift the moment the code changes, and nothing fails when they do.
+
+So, when adding to this file:
+
+- **Name the function that owns the behaviour, and say what it decides** — not the
+  values it currently returns. `platform.resolveConfigDir` cannot go stale; a copied
+  list of paths can, and did.
+- **Exact values are worth writing down only when something else pins them** — a
+  test, a const, a compose file. Say what pins them, so a reader can check in one
+  step (see the port table in `services/ports.go`, guarded by the collision test).
+- **Prefer the consequence over the mechanism.** "A bare `docker compose ps` is
+  scoped to the shared project, so filter by container name" stays true across
+  refactors; "we pass `-p citadel-<name>`" did not.
+- **If you change behaviour this file describes, grep for the old value** — the
+  `-p` claim survived #528 because nobody did.
+
 ## Project Overview
 
 Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It connects self-hosted hardware (nodes) to the AceTeam cloud control plane, enabling users to run AI workloads (LLM inference via vLLM, Ollama, llama.cpp) on their own infrastructure while managing them through AceTeam's cloud platform.
@@ -677,10 +702,15 @@ citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicit
 ## Important Implementation Notes
 
 ### Manifest Loading
-`citadel.yaml` location discovery (in `cmd/up.go:findAndReadManifest()`):
-1. Checks current directory
-2. Checks `/etc/citadel/citadel.yaml` (global system config)
-3. Falls back to `~/citadel-node/citadel.yaml`
+`cmd/manifest.go:findAndReadManifest()` is the authority. It is an **indirection**,
+not a search path: it reads `<ConfigDir>/config.yaml` for a `node_config_dir` key
+and loads `citadel.yaml` from there, falling back to `~/citadel-node/citadel.yaml`
+(and self-healing the config) when the key is missing. It does NOT consult the
+current directory, and it does not look for `/etc/citadel/citadel.yaml` directly —
+`/etc/citadel` only enters via `ConfigDir()` (see below), and only for root.
+
+Read the function for the exact order; do not re-copy it here. A restated
+algorithm is what went stale before.
 
 ### GPU Detection
 Status command detects NVIDIA GPUs using:
@@ -689,7 +719,21 @@ Status command detects NVIDIA GPUs using:
 3. Displays "No GPU detected" if neither method succeeds
 
 ### Service Management
-Services are started with `docker compose -f <path> -p citadel-<name> up -d`. The `-p` flag ensures consistent naming: `citadel-vllm`, `citadel-ollama`, etc.
+Services are started with `docker compose -f <path> up -d` — **no `-p`**. Compose
+therefore derives the project name from the compose file's directory basename
+(`services`), so every service shares ONE project rather than getting its own.
+
+That is deliberate (#528): the per-service `-p citadel-<name>` form is legacy, and
+`removeLegacyCitadelProject` (`cmd/service.go`) exists solely to clean up
+containers left behind by it — a pinned `container_name` owned by another compose
+project makes `up` fail, and `--force-recreate` does not clear a cross-project
+name conflict.
+
+**The consequence that bites:** a bare `docker compose ps` in a service's
+directory is scoped to the shared project, not to that service, so it lists
+sibling services too. Anything reasoning about "is THIS service up" must filter by
+container name rather than trusting project scoping — see #692, which this stale
+doc helped hide.
 
 ### Bonsai service (PrismML Bonsai-27B, 1-bit)
 
@@ -1055,7 +1099,19 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 - `IsLinux()`, `IsDarwin()`, `IsWindows()` - OS detection
 - `IsRoot()` - Privilege checking (works on Linux, macOS, and Windows Administrator)
 - `HomeDir(username)` - Cross-platform home directory resolution
-- `ConfigDir()` - Returns `/etc/citadel` on Linux, `/usr/local/etc/citadel` on macOS, `C:\ProgramData\Citadel` on Windows
+- `ConfigDir()` - **User-local by default, system-wide only for root.** Not root
+  (the common case, including a `User=`-scoped systemd worker): `~/.citadel-cli`
+  on Linux/macOS. Windows: `%LOCALAPPDATA%\Citadel`, *regardless of elevation*.
+  Root on Linux/macOS: `/etc/citadel` or `/usr/local/etc/citadel`, but only after
+  trying to resolve the invoking user's `~/.citadel-cli` via `HOME` and
+  `SUDO_USER` (so `sudo citadel ...` keeps using the config `citadel init` wrote).
+  `platform.resolveConfigDir` is the authority — read it before assuming a path.
+
+  This entry previously claimed the root paths unconditionally. That is wrong for
+  almost every real invocation, and it is not a harmless docs nit: anything that
+  writes under `ConfigDir()` and reasons about writability from the doc will
+  conclude it needs root and quietly no-op. It nearly did exactly that to #696's
+  pidfile.
 
 **Package Management** (`internal/platform/packages.go`):
 - `GetPackageManager()` - Returns apt (Linux), brew (macOS), or winget (Windows) manager
@@ -1090,7 +1146,7 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 - GPU support handled automatically by Docker Desktop (especially on Apple Silicon)
 - No NVIDIA Container Toolkit (not applicable)
 - Creates users with dscl (Directory Service command line)
-- Uses `/usr/local/etc/citadel` for global config instead of `/etc/citadel`
+- Global config path differs (see `ConfigDir()` above) — but only when running as root; a normal invocation uses `~/.citadel-cli` like everywhere else
 
 ### GPU Support Notes
 
@@ -1156,7 +1212,7 @@ Citadel CLI has full Windows 10/11 support using Windows-specific platform imple
 - GPU support via WSL2 integration with NVIDIA drivers
 - No NVIDIA Container Toolkit (handled by Docker Desktop + WSL2)
 - No group management needed (ACL-based permissions)
-- Uses `C:\ProgramData\Citadel` for global config
+- Config lives under `%LOCALAPPDATA%\Citadel` — user-local even when elevated (see `ConfigDir()` above)
 - Uses `%USERPROFILE%\citadel-node` for user config
 - Administrator elevation required (no sudo equivalent)
 
