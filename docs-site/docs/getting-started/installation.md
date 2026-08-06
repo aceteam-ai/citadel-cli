@@ -103,6 +103,7 @@ citadel version v2.3.0
 | **Docker** | Required for running AI services. Installed automatically by `citadel init --provision`. |
 | **GPU** | Optional but recommended. NVIDIA GPUs supported on Linux and Windows (via WSL2). Apple Silicon supported on macOS via Metal. |
 | **Network** | Outbound HTTPS access to `aceteam.ai` and `nexus.aceteam.ai` |
+| **VPN client** | None. The AceTeam Network client is built into the `citadel` binary — there is no separate app, daemon, or driver to install, and no admin rights are needed to join. |
 
 ## Next steps
 

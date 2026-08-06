@@ -2,93 +2,94 @@
 
 ## Overview
 
-This change improves the `citadel init` flow by connecting to the network immediately after device authorization succeeds, rather than waiting for service selection and system provisioning to complete.
+`citadel init` connects to the AceTeam Network immediately after device
+authorization succeeds, rather than waiting for service selection and system
+provisioning to complete.
 
 ## Problem
 
-Previously, the `citadel init` flow would:
-1. Run device authorization (user approves at aceteam.ai/device)
-2. Prompt for service selection (vllm, ollama, etc.)
-3. Prompt for node name
-4. Run system provisioning (Docker, NVIDIA toolkit, Tailscale)
-5. Connect to network
-6. Start services
+An earlier version of the `citadel init` flow ran:
 
-This caused friction because:
-- Users had to wait through multiple prompts after authorization before seeing network connection
-- If Tailscale wasn't installed, the connection would fail late in the process
-- macOS users with App Store Tailscale installation couldn't use the CLI
+1. Device authorization (user approves at aceteam.ai/device)
+2. Service selection prompt (vllm, ollama, etc.)
+3. Node name prompt
+4. System provisioning (Docker, NVIDIA toolkit)
+5. Network connection
+6. Service startup
+
+Users had to sit through several prompts after approving the device before
+anything confirmed that the node had actually joined the network, and a
+connection failure surfaced late in a long-running flow.
 
 ## Solution
 
-The new flow connects immediately after authorization:
-1. Run device authorization
-2. **Get node name (hostname default)**
-3. **Install Tailscale if needed**
-4. **Connect to network immediately**
-5. Prompt for service selection
-6. Run system provisioning (Tailscale step skipped)
-7. Start services
+The flow connects as soon as the node has an authkey:
 
-## macOS Tailscale Detection
+1. Device authorization
+2. **Node name (hostname default)**
+3. **Connect to the network immediately**
+4. Service selection prompt
+5. System provisioning (Docker, NVIDIA toolkit)
+6. Service startup
 
-Added comprehensive Tailscale CLI detection for macOS:
+## No external network client
 
-```go
-// Check order:
-1. PATH lookup (exec.LookPath)
-2. /opt/homebrew/bin/tailscale     // Homebrew (Apple Silicon)
-3. /usr/local/bin/tailscale        // Homebrew (Intel)
-4. /Applications/Tailscale.app/Contents/MacOS/Tailscale  // App Store
-```
+Network connectivity is provided by the embedded `tsnet` library compiled into
+the `citadel` binary (`internal/network/`, see `connectToNetwork` in
+`cmd/init.go`). There is no daemon to install, no system VPN to configure, and
+no Tailscale/Tailscale.app prerequisite — `citadel login` (or `citadel init`) is
+the only step a user runs to put a node on the network. Because tsnet uses
+userspace networking, joining the network also needs no root/Administrator
+privileges.
 
-This allows users who installed Tailscale from the Mac App Store to use `citadel init` without needing to install via Homebrew.
+The connection is process-scoped: the mesh identity belongs to the `citadel`
+process, not to the whole host. Citadel's own subcommands (`citadel ssh`,
+`citadel call`, `citadel ping`, `citadel proxy`) route over the mesh, and
+`citadel proxy` is the documented way to reach a peer's service from an
+unrelated host tool (see `docs-site/docs/guides/networking.md`).
 
-## Files Changed
+## Behavior
 
-| File | Changes |
-|------|---------|
-| `cmd/login.go` | Added `getTailscalePath()` helper, updated all tailscale commands to use detected path |
-| `cmd/init.go` | Restructured flow for early network connection after device auth |
-| `internal/nexus/network_helpers.go` | Updated `getTailscaleCLI()` with macOS path detection |
+### Device authorization flow
 
-## Behavior Changes
+- After "Authorization Successful", the node connects to the network right away.
+- It no longer waits for the service selection prompt.
 
-### Device Authorization Flow
-- After "Authorization Successful", immediately connects to network
-- No longer waits for service selection prompt
+### Authkey flag (`--authkey`)
 
-### Authkey Flag (`--authkey`)
-- Also connects immediately when authkey is provided via flag
-- Consistent behavior with device auth flow
+- Also connects immediately when an authkey is supplied on the command line.
+- Consistent with the device auth flow.
 
-### Network-Only Mode (`--network-only`)
-- Now respects early connection state
-- If already connected via device auth, exits immediately
+### Network-only mode (default)
 
-### System Provisioning
-- Tailscale installation step is skipped if already installed during early connection
-- Other provisioning steps (Docker, NVIDIA) unchanged
+- Respects the early connection state: if the node connected during device auth,
+  `citadel init` exits once the manifest is written.
+
+### System provisioning (`--provision`)
+
+- Provisioning installs Docker and the NVIDIA Container Toolkit only. There is
+  no network-client installation step (`cmd/init.go`,
+  "Network connectivity is now handled via embedded tsnet library").
 
 ## Testing
 
-To test the changes:
+```bash
+# Interactive device auth: after "Authorization Successful" you should see
+# "Connecting to network" BEFORE the service selection prompt.
+citadel init
 
-1. **macOS with App Store Tailscale**:
-   ```bash
-   sudo citadel init
-   # Should detect /Applications/Tailscale.app/Contents/MacOS/Tailscale
-   ```
+# Non-interactive: connects immediately using the supplied key.
+citadel init --authkey <key>
 
-2. **macOS without Tailscale**:
-   ```bash
-   sudo citadel init
-   # Should install via Homebrew, then connect immediately after device auth
-   ```
+# Full provisioning (Docker + NVIDIA toolkit) on a fresh Linux box.
+sudo citadel init --provision
+```
 
-3. **Device auth flow**:
-   ```bash
-   sudo citadel init
-   # After "Authorization Successful", should see "Connecting to network"
-   # BEFORE service selection prompt
-   ```
+## Historical note
+
+Before the network client was embedded, this flow detected or installed the
+Tailscale CLI (Homebrew on macOS, with a fallback path for the Mac App Store
+app) and shelled out to `tailscale up`. Those helpers
+(`getTailscalePath`, `getTailscaleCLI`) and the Tailscale provisioning step were
+removed when `internal/network/` took over; nothing in the onboarding path
+depends on an external client any more.

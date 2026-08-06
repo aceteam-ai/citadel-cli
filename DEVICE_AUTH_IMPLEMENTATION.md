@@ -44,7 +44,8 @@ The OAuth 2.0 Device Authorization Grant flow (RFC 8628) has been successfully i
 4. **`cmd/login.go`**
    - Added device authorization case handler (~50 lines)
    - Similar flow to init but prompts for node name
-   - Uses received authkey with tailscale up
+   - Uses received authkey to join the AceTeam Network via the embedded
+     network client (`internal/network/`) — no external VPN client involved
 
 5. **`internal/nexus/deviceauth_test.go`** (NEW test file, ~145 lines)
    - 6 comprehensive unit tests

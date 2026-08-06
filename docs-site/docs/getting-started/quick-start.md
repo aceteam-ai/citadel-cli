@@ -16,7 +16,7 @@ citadel
 The interactive control center launches and walks you through everything:
 
 1. **Login** -- If this is your first time, Citadel displays a one-time code and prompts you to open [aceteam.ai/device](https://aceteam.ai/device) in your browser. Enter the code to authorize your node.
-2. **Connect** -- Once authorized, your node joins the AceTeam Network automatically. No sudo required -- the CLI uses userspace networking with no system-level VPN or driver installation.
+2. **Connect** -- Once authorized, your node joins the AceTeam Network automatically. No sudo required -- the CLI uses userspace networking with no system-level VPN or driver installation. You never install a separate VPN app: the network client ships inside the `citadel` binary.
 3. **Work** -- The worker starts automatically, accepting AI workloads from the job queue.
 
 The control center shows a live dashboard with system vitals, GPU status, network connectivity, running services, and worker activity -- all in one place.

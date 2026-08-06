@@ -64,8 +64,18 @@ This sends an HTTP-level ping through the mesh (not ICMP) and reports the round-
 Expose a local port to other nodes on the fabric:
 
 ```bash
-citadel expose --port 5432
+citadel expose 5432
 # Other nodes can now reach your PostgreSQL at <your-node-ip>:5432
+```
+
+Run it with no arguments to see this node's network IP and the URLs peers can
+use, `--peers` to see what other nodes are offering, and `--check` to verify
+that the services are actually reachable:
+
+```bash
+citadel expose            # this node's network IP and service URLs
+citadel expose --peers    # services offered by other nodes
+citadel expose --check    # verify reachability
 ```
 
 This makes the specified port on your node accessible to other fabric members through the mesh network. Any TCP service (databases, APIs, custom servers) can be exposed.
@@ -75,9 +85,13 @@ This makes the specified port on your node accessible to other fabric members th
 Proxy local traffic to a service on a remote node:
 
 ```bash
-citadel proxy gpu-server-01 --port 11434 --local-port 11434
+citadel proxy 11434 gpu-server-01:11434
 # Access remote Ollama as if it were local: http://localhost:11434
 ```
+
+The first argument is the local port, the second is `<peer>:<port>` (the peer
+can be a node name or a network IP). Run `citadel proxy` with no arguments for
+an interactive prompt. The proxy runs until interrupted with Ctrl+C.
 
 This sets up a local proxy that forwards requests to a remote node's services, allowing you to access them as if they were running locally.
 
@@ -89,6 +103,28 @@ This sets up a local proxy that forwards requests to a remote node's services, a
 | **Use when** | You run a service others need to reach | You need to access a service on another node |
 | **Port** | Listens on the mesh network interface | Listens on localhost |
 | **Example** | Expose a database for other nodes | Access a remote GPU node's inference API locally |
+
+## Reaching a Peer From Your Own Shell
+
+Citadel's own commands (`citadel ssh`, `citadel call`, `citadel ping`,
+`citadel proxy`) route over the mesh with no extra setup, because the network
+client is built into the binary. You do not need to install Tailscale or any
+other VPN app to use them.
+
+That membership is scoped to the Citadel process, not to your whole machine.
+So an unrelated host tool -- a plain `ssh`, `curl`, `psql`, or your browser --
+will not resolve a peer's network address on its own. Bring the port to
+localhost first:
+
+```bash
+# Make the peer's port 22 available at localhost:2222, then use plain ssh.
+citadel proxy 2222 gpu-server-01:22
+ssh -p 2222 user@localhost
+```
+
+`citadel proxy` is the supported answer whenever a non-Citadel program needs to
+talk to a peer service. (Machine-wide routing, which would let any program on
+the host address peers directly, is in development.)
 
 ## Security Model
 

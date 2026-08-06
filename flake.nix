@@ -31,9 +31,10 @@
             # Utilities used by build script
             tree
 
-            # Note: Tailscale is intentionally not included here as it's
-            # typically installed system-wide and runs as a daemon.
-            # Install via: brew install tailscale (macOS) or system package manager
+            # Note: no mesh/VPN client is needed here. Citadel embeds tsnet,
+            # so `citadel login` joins the network with no external daemon.
+            # (The system `tailscale` CLI is only required by `citadel device`,
+            # which deliberately drives the system client rather than tsnet.)
 
             # Documentation site (Docusaurus)
             nodejs_22

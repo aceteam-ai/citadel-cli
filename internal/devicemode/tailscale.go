@@ -54,8 +54,11 @@ func findTailscale(
 		}
 	}
 	return "", fmt.Errorf(
-		"tailscale CLI not found — install Tailscale (https://tailscale.com/download) " +
-			"or set " + tailscaleBinEnv)
+		"tailscale CLI not found — 'citadel device' drives the system Tailscale " +
+			"client, so install it (https://tailscale.com/download) or set " +
+			tailscaleBinEnv + ". " +
+			"Note this applies to device mode only: putting a compute node on the " +
+			"AceTeam Network with 'citadel login' needs no external client")
 }
 
 // TailscaleStatus is the subset of `tailscale status --json` device mode

@@ -56,7 +56,7 @@ cd /path/to/citadel-cli
 direnv allow
 ```
 
-That's it! The development environment with Go 1.24, Docker, Tailscale, and all build tools will be automatically loaded.
+That's it! The development environment with Go 1.24, Docker, and all build tools will be automatically loaded.
 
 ### What Gets Installed
 
@@ -64,8 +64,11 @@ The Nix flake provides:
 - **Go 1.24** - Exact version specified in go.mod
 - **Go tools** - gopls, go-tools, gotools for development
 - **Docker & Docker Compose** - Container management
-- **Tailscale** - Network mesh tooling
 - **Build utilities** - git, make, tree, curl, wget, jq
+
+No VPN or mesh client is provided (or needed): the mesh networking stack is the
+`tsnet` library compiled into the `citadel` binary, so a dev shell that can
+build the binary can also join the network with `citadel login`.
 
 ### Useful Commands
 
