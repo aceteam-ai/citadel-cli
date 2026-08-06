@@ -139,8 +139,9 @@ func (s *APISource) Connect(ctx context.Context) error {
 }
 
 // Next blocks until a job is available or context is cancelled.
-// When consuming from multiple queues, polls each queue in round-robin
-// with a short block timeout to avoid starving any queue.
+// When consuming from multiple queues, polls the per-node queue on every
+// iteration and the fungible tag queues in round-robin, each with a short
+// block timeout so no queue is starved (see nextMulti).
 func (s *APISource) Next(ctx context.Context) (*Job, error) {
 	queues := s.snapshotQueues()
 	if len(queues) == 1 {
@@ -179,39 +180,114 @@ func (s *APISource) nextSingle(ctx context.Context, queue string) (*Job, error) 
 	return job, nil
 }
 
-// nextMulti round-robins across queues with a shorter block timeout.
-// Each poll checks one queue; if empty, advances to the next.
-// Individual queue failures (e.g., rejected by server validation) are
-// logged and skipped rather than failing the entire poll cycle. Only
-// when all queues error does the caller see an error (triggering backoff).
+// Block-timeout tuning for the multi-queue rotation. Deliberately fixed: there
+// is no flag or config knob for these.
+const (
+	// minQueueBlockMs floors the per-queue block so a node with many queues
+	// does not turn the rotation into a request storm. Each consume request
+	// costs the server a duplicated Redis connection for the length of the
+	// block, so the floor is what bounds request rate per node.
+	minQueueBlockMs = 500
+
+	// priorityQueueBlockMs is the block used for the per-node queue, which is
+	// polled on every iteration of the rotation. It is deliberately short: a
+	// node-pinned job's wait is bounded by the block of the *rotating* queue
+	// being polled when it arrives, not by this one, so time spent blocking
+	// here only delays the rotating queues.
+	priorityQueueBlockMs = 100
+)
+
+// splitPriorityQueues separates the per-node queue(s) from the fungible ones.
+//
+// The per-node queue (jobs:v1:shell:org_<id>:node:<nodeid>, identified by the
+// ":node:" marker) has exactly one eligible consumer: this node. A job sitting
+// on it is picked up by nobody else, so its pickup latency is the node's alone.
+// Every other queue is a shared capability/tag pool served by every node
+// carrying that tag, so a round robin over those is fine.
+func splitPriorityQueues(queues []string) (priority, rotating []string) {
+	for _, q := range queues {
+		if isPerNodeStream(q) {
+			priority = append(priority, q)
+		} else {
+			rotating = append(rotating, q)
+		}
+	}
+	return priority, rotating
+}
+
+// queueBlockBudget splits the configured block timeout across one rotation so a
+// full cycle still takes roughly BlockMs, accounting for the priority queue
+// being polled once per iteration.
+//
+// With no priority queue this reduces exactly to the previous behavior:
+// BlockMs/len(queues), floored at minQueueBlockMs.
+func queueBlockBudget(totalBlockMs, rotatingCount, priorityCount int) (rotatingBlockMs, priorityBlockMs int) {
+	if rotatingCount < 1 {
+		rotatingCount = 1
+	}
+	// The priority queue is polled once per rotating queue, so it consumes
+	// rotatingCount*priorityCount*priorityQueueBlockMs of the cycle budget.
+	remaining := totalBlockMs - rotatingCount*priorityCount*priorityQueueBlockMs
+	rotatingBlockMs = remaining / rotatingCount
+	if rotatingBlockMs < minQueueBlockMs {
+		rotatingBlockMs = minQueueBlockMs
+	}
+	priorityBlockMs = priorityQueueBlockMs
+	if priorityBlockMs > rotatingBlockMs {
+		priorityBlockMs = rotatingBlockMs
+	}
+	if priorityBlockMs < 1 {
+		priorityBlockMs = 1 // the server rejects blockMs < 1
+	}
+	return rotatingBlockMs, priorityBlockMs
+}
+
+// nextMulti polls across queues within one call, returning the first job found.
+//
+// The per-node queue is polled on EVERY iteration of the rotation; the fungible
+// tag queues stay on a round robin (issue #704). Polls are serial because the
+// consume endpoint takes a single queue per request, so a plain round robin over
+// N queues meant a node-pinned job could wait a full cycle (N block timeouts
+// plus N round trips, roughly 9s on a 12-queue node) before the worker even
+// looked at its queue. Interleaving bounds that wait at one rotating block plus
+// a round trip, while a full sweep of the fungible queues still takes about the
+// configured BlockMs.
+//
+// Individual queue failures (e.g., rejected by server validation) are skipped
+// rather than failing the entire poll cycle. Only when every distinct queue has
+// failed does the caller see an error (triggering backoff).
 func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error) {
-	// Use a shorter block per queue so we cycle through them all within
-	// roughly the configured block timeout.
-	perQueueBlockMs := s.config.BlockMs / len(queues)
-	if perQueueBlockMs < 500 {
-		perQueueBlockMs = 500
+	if len(queues) == 0 {
+		return nil, nil
 	}
 
+	priority, rotating := splitPriorityQueues(queues)
+	if len(priority) == 0 || len(rotating) == 0 {
+		// No per-node queue (or nothing but per-node queues): fall back to the
+		// flat round robin over everything, which is the pre-#704 behavior.
+		priority, rotating = nil, queues
+	}
+
+	rotatingBlockMs, priorityBlockMs := queueBlockBudget(s.config.BlockMs, len(rotating), len(priority))
+
+	// Failure accounting is per distinct queue, not per poll: the priority
+	// queue is polled len(rotating) times per cycle, so counting polls would
+	// let a single failing queue masquerade as a total outage. A queue that
+	// succeeds at least once in the cycle is not counted as failed.
+	failed := make(map[string]struct{}, len(queues))
+	succeeded := make(map[string]struct{}, len(queues))
 	var lastErr error
 	var lastQueue string
-	errCount := 0
 
-	for i := 0; i < len(queues); i++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		queue := queues[s.queueIndex%len(queues)]
-		s.queueIndex = (s.queueIndex + 1) % len(queues)
-
+	// poll consumes one queue. Returns the job (nil when the queue is empty)
+	// and whether the caller should return it.
+	poll := func(queue string, blockMs int) (*Job, bool) {
 		apiJob, err := s.client.ConsumeJob(ctx, redisapi.ConsumeRequest{
 			Queue:    queue,
 			Group:    s.config.ConsumerGroup,
 			Consumer: s.client.WorkerID(),
 			Count:    1,
-			BlockMs:  perQueueBlockMs,
+			BlockMs:  blockMs,
 		})
 		if err != nil {
 			// Skip this queue so one rejected queue can't block the others.
@@ -219,21 +295,51 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string) (*Job, error
 			// failure is self-healing and logging it every poll floods the
 			// activity panel. The cycle-level outcome is coalesced by the
 			// runner instead (the queue name is carried in the wrapped error).
+			if _, ok := succeeded[queue]; !ok {
+				failed[queue] = struct{}{}
+			}
 			lastErr = err
 			lastQueue = queue
-			errCount++
-			continue
+			return nil, false
+		}
+		succeeded[queue] = struct{}{}
+		delete(failed, queue)
+		if apiJob == nil {
+			return nil, false
+		}
+		job := s.convertJob(apiJob)
+		job.SourceQueue = queue
+		return job, true
+	}
+
+	for i := 0; i < len(rotating); i++ {
+		// Per-node queue first, on every iteration.
+		for _, pq := range priority {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			if job, ok := poll(pq, priorityBlockMs); ok {
+				return job, nil
+			}
 		}
 
-		if apiJob != nil {
-			job := s.convertJob(apiJob)
-			job.SourceQueue = queue
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		queue := rotating[s.queueIndex%len(rotating)]
+		s.queueIndex = (s.queueIndex + 1) % len(rotating)
+		if job, ok := poll(queue, rotatingBlockMs); ok {
 			return job, nil
 		}
 	}
 
 	// Only propagate error (triggering backoff) if ALL queues failed.
-	if errCount == len(queues) {
+	if len(failed) == len(queues) {
 		return nil, fmt.Errorf("all %d queues failed (last: %s): %w", len(queues), lastQueue, lastErr)
 	}
 
