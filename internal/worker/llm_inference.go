@@ -933,6 +933,14 @@ func (h *LLMInferenceHandler) engineRequestFailure(
 	if isEngineNotServing(err) {
 		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
 	}
+	// A refused connection here means the engine went away between the readiness
+	// probe and the request. That is warming ONLY while a start this node issued
+	// is still inside its load window; otherwise nothing is listening and no
+	// amount of retrying will change that, so it stays a failure the caller can
+	// act on (citadel-cli#705).
+	if isConnectionRefused(err) && h.engineStartInFlight(payload.Backend) {
+		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
+	}
 	return h.failure(fmt.Errorf("%s: %w", wrap, err))
 }
 
