@@ -2,7 +2,6 @@ package status
 
 import (
 	"context"
-	"encoding/json"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
@@ -376,7 +376,7 @@ func (c *Collector) collectServiceStatus() []ServiceInfo {
 
 		// Check if service is running using docker compose
 		if svc.ComposeFile != "" {
-			status := c.getDockerComposeStatus(svc.ComposeFile)
+			status := c.getDockerComposeStatus(svc.ComposeFile, svc.Name)
 			info.Status = status
 			if status == ServiceStatusRunning {
 				info.Health = HealthStatusOK
@@ -413,8 +413,22 @@ func (c *Collector) detectLLMServiceType(serviceName string) string {
 	return EngineTypeFromName(serviceName)
 }
 
-// getDockerComposeStatus checks if a docker compose service is running.
-func (c *Collector) getDockerComposeStatus(composeFile string) string {
+// getDockerComposeStatus checks if a manifest-declared service is running.
+//
+// The `ps` output is PROJECT-wide, not file-wide: citadel passes no `-p` (#528)
+// and every service compose file shares the default project, so reading "is any
+// container up?" out of it reported every declared service as running once any
+// one of them ran (#692, observed on the operator CLI surface built on the same
+// mistake). compose.ResolveServiceState narrows the output to the services this
+// file declares, then falls back to a native-serving probe so a non-container
+// service (ollama under systemd) is not misreported as stopped instead.
+//
+// Note this path is currently unreachable in production: every collector is
+// constructed with Services: nil, so the heartbeat reports engines through
+// collectManagedEngineStatus (which has always done the narrow check) rather
+// than through here. Fixed as the same defect regardless, so passing Services
+// later does not silently reintroduce it.
+func (c *Collector) getDockerComposeStatus(composeFile, serviceName string) string {
 	// Pass the install-time config env (<name>.env) explicitly: compose
 	// interpolates the file even for `ps`, so a ${VAR:?...}-guarded service
 	// (claudecode, livekit) would report a false ServiceStatusError on every
@@ -427,23 +441,14 @@ func (c *Collector) getDockerComposeStatus(composeFile string) string {
 		return ServiceStatusError
 	}
 
-	// Parse JSON output (each line is a separate JSON object)
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		var container struct {
-			State string `json:"State"`
-		}
-		if err := json.Unmarshal([]byte(line), &container); err == nil {
-			state := strings.ToLower(container.State)
-			if strings.Contains(state, "running") || strings.Contains(state, "up") {
-				return ServiceStatusRunning
-			}
-		}
+	state := compose.ResolveServiceState(
+		output,
+		compose.DeclaredServices(composeFile),
+		func() bool { return nativesvc.IsNativeServiceServing(serviceName) },
+	)
+	if state.Running {
+		return ServiceStatusRunning
 	}
-
 	return ServiceStatusStopped
 }
 

@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1246,36 +1245,10 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			if _, err := os.Stat(fullComposePath); err == nil {
-				psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
-				psCmd := composeCommand(psArgs...)
-				if output, err := psCmd.Output(); err == nil {
-					var containers []struct {
-						State  string `json:"State"`
-						Status string `json:"Status"`
-					}
-					decoder := json.NewDecoder(strings.NewReader(string(output)))
-					for decoder.More() {
-						var c struct {
-							State  string `json:"State"`
-							Status string `json:"Status"`
-						}
-						if err := decoder.Decode(&c); err == nil {
-							containers = append(containers, c)
-						}
-					}
-					if len(containers) > 0 {
-						state := strings.ToLower(containers[0].State)
-						if strings.Contains(state, "running") || strings.Contains(state, "up") {
-							svcInfo.Status = "running"
-							// Try to extract uptime from Status field
-							if containers[0].Status != "" {
-								svcInfo.Uptime = extractUptime(containers[0].Status)
-							}
-						} else if strings.Contains(state, "exited") || strings.Contains(state, "dead") {
-							svcInfo.Status = "stopped"
-						} else {
-							svcInfo.Status = state
-						}
+				if state, err := composeServiceState(fullComposePath, service.Name); err == nil {
+					svcInfo.Status = state.State
+					if state.Running && state.Container != nil && state.Container.Status != "" {
+						svcInfo.Uptime = extractUptime(state.Container.Status)
 					}
 				}
 			}
@@ -1517,29 +1490,21 @@ func ccGetServiceDetail(name string) *controlcenter.ServiceDetailInfo {
 			}
 
 			// Get container info via docker compose ps (no -p: default project,
-			// matching where production containers actually run, #528)
-			psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
-			psCmd := composeCommand(psArgs...)
-			if output, err := psCmd.Output(); err == nil {
-				var container struct {
-					ID      string `json:"ID"`
-					Image   string `json:"Image"`
-					Service string `json:"Service"`
-					State   string `json:"State"`
-					Ports   string `json:"Ports"`
+			// matching where production containers actually run, #528). The output
+			// is project-wide, so it must be narrowed to this compose file's own
+			// services before reading a container off it. Decoding the first
+			// record showed another service's container here (#692).
+			if state, err := composeServiceState(fullComposePath, service.Name); err == nil && state.Container != nil {
+				container := state.Container
+				if len(container.ID) > 12 {
+					detail.ContainerID = container.ID[:12]
+				} else {
+					detail.ContainerID = container.ID
 				}
-				decoder := json.NewDecoder(strings.NewReader(string(output)))
-				if err := decoder.Decode(&container); err == nil {
-					if len(container.ID) > 12 {
-						detail.ContainerID = container.ID[:12]
-					} else {
-						detail.ContainerID = container.ID
-					}
-					detail.Image = container.Image
-					if container.Ports != "" {
-						// Parse ports string like "0.0.0.0:8000->8000/tcp"
-						detail.Ports = strings.Split(container.Ports, ", ")
-					}
+				detail.Image = container.Image
+				if container.Ports != "" {
+					// Parse ports string like "0.0.0.0:8000->8000/tcp"
+					detail.Ports = strings.Split(container.Ports, ", ")
 				}
 			}
 
