@@ -29,11 +29,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -130,8 +130,22 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 			return h.failure(fmt.Errorf("model hotswap failed: %w", swapErr)), nil
 		}
 		if !outcome.Ready {
-			return h.warming(payload.Model, outcome.ETASeconds), nil
+			return h.warming(payload.Model, outcome.ETASeconds, outcome.RetryAfterSeconds), nil
 		}
+	}
+
+	// Readiness gate (citadel-cli#680): residency is "the container is up", which
+	// is NOT the same as "the engine is serving". A container that has bound its
+	// port but is still loading weights used to be proxied into, and the caller
+	// got a raw socket string. Probe every backend and answer with the typed
+	// warming signal instead. See llm_readiness.go for why the probe asks "does
+	// the API answer" rather than "does it list a model", and why the budgets
+	// differ per engine.
+	if err := h.ensureEngineReady(ctx, payload.Backend); err != nil {
+		if errors.Is(err, errEngineWarming) {
+			return h.warming(payload.Model, engineWarmETA(payload.Backend), 0), nil
+		}
+		return h.failure(err), nil
 	}
 
 	switch payload.Backend {
@@ -182,10 +196,6 @@ func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, e
 
 // executeVLLM handles inference via vLLM's OpenAI-compatible API.
 func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
-	if err := h.waitForReady(ctx, h.baseURL("vllm")+"/health", "vLLM"); err != nil {
-		return h.failure(err), nil
-	}
-
 	// Chat-style requests (gateway `messages`) use /v1/chat/completions so vLLM
 	// applies the served model's chat template; the legacy /v1/completions prompt
 	// path is kept for prompt-style jobs.
@@ -198,9 +208,6 @@ func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, stream StreamWrit
 // executeSGLang handles inference via SGLang's OpenAI-compatible API. SGLang
 // exposes the same /v1/completions endpoint and response format as vLLM.
 func (h *LLMInferenceHandler) executeSGLang(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
-	if err := h.waitForReady(ctx, h.baseURL("sglang")+"/health", "SGLang"); err != nil {
-		return h.failure(err), nil
-	}
 	return h.executeCompletions(ctx, stream, payload, h.baseURL("sglang"), "SGLang")
 }
 
@@ -223,7 +230,7 @@ func (h *LLMInferenceHandler) executeCompletions(ctx context.Context, stream Str
 
 	resp, err := h.postJSON(ctx, baseURL+"/v1/completions", reqPayload)
 	if err != nil {
-		return h.failure(fmt.Errorf("failed to connect to %s: %w", engine, err)), nil
+		return h.engineRequestFailure(payload, err, "failed to connect to "+engine), nil
 	}
 	defer resp.Body.Close()
 
@@ -345,7 +352,7 @@ func (h *LLMInferenceHandler) executeOllama(ctx context.Context, stream StreamWr
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/generate", reqPayload)
 	if err != nil {
-		return h.failure(fmt.Errorf("failed to connect to Ollama: %w", err)), nil
+		return h.engineRequestFailure(payload, err, "failed to connect to Ollama"), nil
 	}
 	defer resp.Body.Close()
 
@@ -457,7 +464,7 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/chat", reqPayload)
 	if err != nil {
-		return h.failure(fmt.Errorf("failed to connect to Ollama: %w", err)), nil
+		return h.engineRequestFailure(payload, err, "failed to connect to Ollama"), nil
 	}
 	defer resp.Body.Close()
 
@@ -587,7 +594,7 @@ func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, stream Stre
 
 	resp, err := h.postJSON(ctx, baseURL+"/completion", reqPayload)
 	if err != nil {
-		return h.failure(fmt.Errorf("failed to connect to llama.cpp: %w", err)), nil
+		return h.engineRequestFailure(payload, err, "failed to connect to llama.cpp"), nil
 	}
 	defer resp.Body.Close()
 
@@ -695,7 +702,7 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 
 	resp, err := h.postJSON(ctx, baseURL+"/v1/chat/completions", reqPayload)
 	if err != nil {
-		return h.failure(fmt.Errorf("failed to connect to chat endpoint: %w", err)), nil
+		return h.engineRequestFailure(payload, err, "failed to connect to chat endpoint"), nil
 	}
 	defer resp.Body.Close()
 
@@ -861,34 +868,6 @@ func (h *LLMInferenceHandler) postJSON(ctx context.Context, url string, payload 
 	return h.client().Do(req)
 }
 
-// waitForReady polls an engine's health endpoint until it returns 200 or the
-// wait budget elapses. Honors ctx cancellation. Only the vLLM/SGLang paths use
-// it (llama.cpp/bonsai/ollama start fast and 404 /health).
-func (h *LLMInferenceHandler) waitForReady(ctx context.Context, healthURL, engine string) error {
-	maxWait := 60 * time.Second
-	pollInterval := 1 * time.Second
-	startTime := time.Now()
-
-	for time.Since(startTime) < maxWait {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-		resp, err := h.client().Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			return nil
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-		time.Sleep(pollInterval)
-	}
-	return fmt.Errorf("%s did not become ready within %v", engine, maxWait)
-}
-
 func (h *LLMInferenceHandler) client() *http.Client {
 	if h.httpClient != nil {
 		return h.httpClient
@@ -910,15 +889,25 @@ func (h *LLMInferenceHandler) success(output map[string]any) *JobResult {
 	return &JobResult{Status: JobStatusSuccess, Output: output}
 }
 
-// warming returns the structured model_warming result (citadel-cli#632) for a
-// swap that did not become ready within the wait budget. It is a SUCCESS result
-// (so the runner WriteEnds + Acks it) carrying a control payload rather than
-// assistant content — deliberately no WriteChunk, so the platform relays the
-// warming signal instead of streaming it as a reply. The platform inspects
+// warming returns the structured model_warming result (citadel-cli#632) for an
+// engine that is not serving yet: a swap that did not become ready within the
+// wait budget, an engine that is up but still loading (citadel-cli#680), or one
+// that dropped the connection mid-handshake. It is a SUCCESS result (so the
+// runner WriteEnds + Acks it) carrying a control payload rather than assistant
+// content — deliberately no WriteChunk, so the platform relays the warming
+// signal instead of streaming it as a reply. The platform inspects
 // output.status == "model_warming" and retries after retry_after seconds.
-func (h *LLMInferenceHandler) warming(model string, etaSeconds int) *JobResult {
+//
+// retryAfterSeconds <= 0 falls back to the standard hint. A caller that knows
+// better (e.g. a swap for a DIFFERENT model is holding the single-flight slot,
+// so this model's load has not even started) passes its own, so the platform
+// does not busy-retry against a node that is not working on its request.
+func (h *LLMInferenceHandler) warming(model string, etaSeconds, retryAfterSeconds int) *JobResult {
 	if etaSeconds < 0 {
 		etaSeconds = 0
+	}
+	if retryAfterSeconds <= 0 {
+		retryAfterSeconds = warmingRetryAfter
 	}
 	return &JobResult{
 		Status: JobStatusSuccess,
@@ -926,9 +915,33 @@ func (h *LLMInferenceHandler) warming(model string, etaSeconds int) *JobResult {
 			"status":      "model_warming",
 			"model":       model,
 			"eta_seconds": etaSeconds,
-			"retry_after": warmingRetryAfter,
+			"retry_after": retryAfterSeconds,
 		},
 	}
+}
+
+// engineRequestFailure maps an outbound engine request error to a job result. A
+// transport-level error means the engine was not listening or dropped the
+// connection, which on a loading engine is warming, not a fault: it is answered
+// with the typed signal so `use of closed network connection` never reaches a
+// caller (citadel-cli#680). Anything else stays a genuine failure.
+func (h *LLMInferenceHandler) engineRequestFailure(
+	payload *jobs.LLMInferencePayload,
+	err error,
+	wrap string,
+) *JobResult {
+	if isEngineNotServing(err) {
+		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
+	}
+	// A refused connection here means the engine went away between the readiness
+	// probe and the request. That is warming ONLY while a start this node issued
+	// is still inside its load window; otherwise nothing is listening and no
+	// amount of retrying will change that, so it stays a failure the caller can
+	// act on (citadel-cli#705).
+	if isConnectionRefused(err) && h.engineStartInFlight(payload.Backend) {
+		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
+	}
+	return h.failure(fmt.Errorf("%s: %w", wrap, err))
 }
 
 func (h *LLMInferenceHandler) failure(err error) *JobResult {
