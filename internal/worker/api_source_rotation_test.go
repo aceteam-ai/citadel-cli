@@ -418,6 +418,37 @@ func TestNextMulti_ErrorAccounting(t *testing.T) {
 		}
 	})
 
+	t.Run("per-node queue succeeds then fails mid-cycle", func(t *testing.T) {
+		// The per-node queue is polled once per iteration, so it can succeed
+		// early in a cycle and fail later. A queue that succeeded at least once
+		// this cycle is deliberately NOT counted as failed: the conservative
+		// direction is to under-report, since the next cycle catches a real
+		// outage and a spurious backoff would stall an otherwise healthy node.
+		var perNodePolls int
+		var mu sync.Mutex
+		srv := newFakeConsumeServer(t, func(call consumeCall, _ int) (*redisapi.StreamMessage, int) {
+			if call.Queue != testPerNodeQueue {
+				return nil, http.StatusInternalServerError
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			perNodePolls++
+			if perNodePolls == 1 {
+				return nil, http.StatusOK // healthy on the first poll only
+			}
+			return nil, http.StatusInternalServerError
+		})
+		s := newConnectedSource(t, srv, queues, 5000)
+
+		job, err := s.Next(context.Background())
+		if err != nil {
+			t.Fatalf("Next returned error %v, want nil (the per-node queue answered this cycle)", err)
+		}
+		if job != nil {
+			t.Fatalf("Next returned job %+v, want nil", job)
+		}
+	})
+
 	t.Run("every queue fails", func(t *testing.T) {
 		srv := newFakeConsumeServer(t, func(consumeCall, int) (*redisapi.StreamMessage, int) {
 			return nil, http.StatusInternalServerError
