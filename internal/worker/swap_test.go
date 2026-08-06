@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -280,4 +281,66 @@ func TestEnsureResident_BackgroundSwapSurvivesJobCancellation(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("background swap did not complete after job-context cancellation")
+}
+
+// TestSwap_EngineStartedAt_RecordsAttemptAndClearsOnFailure is the supervisor
+// half of citadel-cli#705. The readiness gate reads this record to tell a cold
+// start apart from an engine that is not running, so it must exist while a start
+// is in flight and must NOT survive a start that failed.
+func TestSwap_EngineStartedAt_RecordsAttemptAndClearsOnFailure(t *testing.T) {
+	ctrl := newMockController()
+	ctrl.readyAfterStart = true
+	m := newTestManager(ctrl)
+
+	if _, known := m.EngineStartedAt("bonsai"); known {
+		t.Fatal("no start should be on record before one is issued")
+	}
+
+	if _, err := m.EnsureResident(context.Background(), "bonsai", "Bonsai-27B"); err != nil {
+		t.Fatalf("EnsureResident: %v", err)
+	}
+	waitFor(t, func() bool {
+		_, known := m.EngineStartedAt("bonsai")
+		return known
+	}, "a start attempt must be recorded")
+
+	// A start that fails must not linger as evidence the engine is booting.
+	ctrl2 := newMockController()
+	ctrl2.startErr = errors.New("compose up failed")
+	m2 := newTestManager(ctrl2)
+	m2.waitBudget = 2 * time.Second // let the swap finish so the error surfaces
+	if _, err := m2.EnsureResident(context.Background(), "bonsai", "Bonsai-27B"); err == nil {
+		t.Fatal("expected a hard error from a failed start")
+	}
+	if _, known := m2.EngineStartedAt("bonsai"); known {
+		t.Error("a failed start must not stay on record")
+	}
+}
+
+// TestSwap_EngineStartedAt_ClearedOnEviction asserts an engine we just stopped
+// is no longer treated as booting.
+func TestSwap_EngineStartedAt_ClearedOnEviction(t *testing.T) {
+	ctrl := newMockController()
+	m := newTestManager(ctrl)
+	m.markStartAttempted("unlimited-ocr")
+	if _, known := m.EngineStartedAt("unlimited-ocr"); !known {
+		t.Fatal("start should be on record")
+	}
+	m.forget("unlimited-ocr")
+	if _, known := m.EngineStartedAt("unlimited-ocr"); known {
+		t.Error("an evicted engine must not stay on record as started")
+	}
+}
+
+// waitFor polls cond until it holds or the timeout elapses.
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal(msg)
 }

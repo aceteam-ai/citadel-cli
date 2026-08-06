@@ -129,6 +129,13 @@ type SwapManager struct {
 	inflight *swapOp              // the single in-flight swap, or nil
 	lastUsed map[string]time.Time // per-engine last request time (LRU)
 	readyAt  map[string]time.Time // per-engine last became-ready time (min-residency)
+	// startedAt records when this node last ISSUED a start for an engine, which
+	// is the only trustworthy evidence that an unbound port is a cold start
+	// rather than an engine that is simply not running (citadel-cli#705). The
+	// readiness gate reads it through EngineStartedAt; it is cleared when a start
+	// fails and when an engine is evicted, so a stale entry can never keep an
+	// absent engine reporting "warming".
+	startedAt map[string]time.Time
 }
 
 // NewSwapManager builds a swap manager with default timing and VRAM/load
@@ -146,6 +153,7 @@ func NewSwapManager(ctrl SwapController) *SwapManager {
 		readyPoll:     swapReadyPollEvery,
 		lastUsed:      map[string]time.Time{},
 		readyAt:       map[string]time.Time{},
+		startedAt:     map[string]time.Time{},
 	}
 }
 
@@ -275,7 +283,13 @@ func (m *SwapManager) runSwap(op *swapOp) {
 	}
 
 	// Start the target engine (SERVICE_START {service, model}; no vram_mb).
+	// Record the attempt BEFORE issuing it: an inline compose build can take
+	// minutes, and the readiness gate must already see the start as in flight
+	// while it runs (citadel-cli#705). A failed start clears the record so it
+	// cannot pass as evidence that the engine is on its way up.
+	m.markStartAttempted(op.backend)
 	if err := m.ctrl.Start(ctx, op.backend, op.model); err != nil {
+		m.clearStartAttempt(op.backend)
 		op.err = fmt.Errorf("failed to start %s for swap: %w", op.backend, err)
 		return
 	}
@@ -382,11 +396,40 @@ func (m *SwapManager) markReady(backend string) {
 	m.mu.Unlock()
 }
 
-// forget clears the residency window of an evicted engine.
+// forget clears the residency window of an evicted engine, and with it the
+// record that a start was ever issued: an engine we just stopped is not booting.
 func (m *SwapManager) forget(name string) {
 	m.mu.Lock()
 	delete(m.readyAt, name)
+	delete(m.startedAt, name)
 	m.mu.Unlock()
+}
+
+// markStartAttempted records that a start of backend was just issued.
+func (m *SwapManager) markStartAttempted(backend string) {
+	now := m.now()
+	m.mu.Lock()
+	m.startedAt[backend] = now
+	m.mu.Unlock()
+}
+
+// clearStartAttempt drops the start record for backend.
+func (m *SwapManager) clearStartAttempt(backend string) {
+	m.mu.Lock()
+	delete(m.startedAt, backend)
+	m.mu.Unlock()
+}
+
+// EngineStartedAt reports when this node last issued a start for backend, and
+// whether one is on record at all. It is the supervisor's answer to "was this
+// engine ever actually started", which the readiness gate needs to tell a cold
+// start apart from an engine that is not running (citadel-cli#705). Satisfies
+// engineStartTracker.
+func (m *SwapManager) EngineStartedAt(backend string) (time.Time, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.startedAt[backend]
+	return t, ok
 }
 
 // etaSeconds estimates remaining seconds until the in-flight swap is ready,
