@@ -145,27 +145,28 @@ go run . test --service vllm
 
 ### Git Workflow
 
-**See "⛔ CRITICAL: Git Branch Policy" section above. NEVER push to main.**
-
-**Additional rules:**
-1. **If on main** - Create a feature branch first
-2. **If already on a feature branch** - Commit and push directly to that branch (don't create new branches)
-3. **Never auto-create PRs** - Only create a PR when the user explicitly asks
+**See "⛔ CRITICAL: Git Workflow Policy" above — it is the authority. NEVER push to main, and never commit from the shared main checkout.**
 
 ```bash
-# If on main, create a branch first
-git checkout -b fix/description-of-change
+# Always: an isolated worktree on a branch off the latest main
+git fetch origin
+git worktree add -b fix/description ../citadel-cli-wt-<name> origin/main
+cd ../citadel-cli-wt-<name>
 
-# If already on a feature branch, just commit and push
 git add <files>
 git commit -m "message"
-git push
+git push -u origin fix/description
 
-# Only create PR when user explicitly requests it
+# Open the PR right after pushing; --draft while the test plan
+# still needs manual or deploy-gated steps.
 gh pr create --title "fix: description" --body "..."
 ```
 
-Even for "small fixes" or "quick changes" - always use a branch and PR.
+Even for "small fixes" or "quick changes" — always a worktree, a branch, and a PR.
+
+Already on a feature branch in your own worktree? Keep committing to it; do not
+branch again. Branch off `origin/main`, never off a local `main`, which is
+frequently stale.
 
 ### Future Work and TODOs
 
