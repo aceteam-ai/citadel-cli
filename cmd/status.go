@@ -296,31 +296,8 @@ func gatherStatusData() (dashboard.StatusData, error) {
 			if configDir != "" {
 				fullComposePath := filepath.Join(configDir, service.ComposeFile)
 				if _, err := os.Stat(fullComposePath); err == nil {
-					psArgs := append(composeFileArgs(fullComposePath, fullComposePath), "ps", "--format", "json")
-					psCmd := composeCommand(psArgs...)
-					if output, err := psCmd.Output(); err == nil {
-						var containers []struct {
-							State string `json:"State"`
-						}
-						decoder := json.NewDecoder(strings.NewReader(string(output)))
-						for decoder.More() {
-							var c struct {
-								State string `json:"State"`
-							}
-							if err := decoder.Decode(&c); err == nil {
-								containers = append(containers, c)
-							}
-						}
-						if len(containers) > 0 {
-							state := strings.ToLower(containers[0].State)
-							if strings.Contains(state, "running") || strings.Contains(state, "up") {
-								svcStatus.Status = "running"
-							} else if strings.Contains(state, "exited") || strings.Contains(state, "dead") {
-								svcStatus.Status = "stopped"
-							} else {
-								svcStatus.Status = state
-							}
-						}
+					if state, err := composeServiceState(fullComposePath, service.Name); err == nil {
+						svcStatus.Status = state.State
 					}
 				}
 			}
@@ -891,39 +868,32 @@ func printServiceInfo(w *tabwriter.Writer) {
 			continue
 		}
 
-		var containers []struct {
-			State string `json:"State"`
-		}
-		decoder := json.NewDecoder(strings.NewReader(string(output)))
-		for decoder.More() {
-			var c struct {
-				State string `json:"State"`
+		svcState := composeServiceStateFrom(output, fullComposePath, service.Name)
+		switch {
+		case svcState.Running:
+			statusStr := goodColor.Sprint("🟢 RUNNING")
+			if svcState.Native {
+				statusStr += labelColor.Sprint(" (native)")
 			}
-			if err := decoder.Decode(&c); err == nil {
-				containers = append(containers, c)
-			}
-		}
-
-		if len(containers) == 0 {
-			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
-		} else {
-			state := strings.ToUpper(containers[0].State)
-			var statusStr string
-			if strings.Contains(state, "RUNNING") || strings.Contains(state, "UP") {
-				statusStr = goodColor.Sprintf("🟢 %s", state)
-				// For running serving engines, show the model(s) actually loaded,
-				// e.g. "🟢 RUNNING (Qwen/Qwen3-8B)" (#529). Non-engine services and
-				// engines that don't answer within the short probe window print
-				// unchanged.
-				if models := discoverServiceModels(service.Name); len(models) > 0 {
-					statusStr += fmt.Sprintf(" (%s)", strings.Join(models, ", "))
-				}
-			} else if strings.Contains(state, "EXITED") || strings.Contains(state, "DEAD") {
-				statusStr = badColor.Sprintf("🔴 %s", state)
-			} else {
-				statusStr = warnColor.Sprintf("🟡 %s", state)
+			// For running serving engines, show the model(s) actually loaded,
+			// e.g. "🟢 RUNNING (Qwen/Qwen3-8B)" (#529). Non-engine services and
+			// engines that don't answer within the short probe window print
+			// unchanged.
+			if models := discoverServiceModels(service.Name); len(models) > 0 {
+				statusStr += fmt.Sprintf(" (%s)", strings.Join(models, ", "))
 			}
 			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, statusStr)
+		case svcState.Container != nil:
+			// A container exists for this service but is not up. Report its real
+			// state rather than a bare STOPPED so a crash loop is visible.
+			raw := strings.ToUpper(svcState.Container.State)
+			if strings.Contains(raw, "EXITED") || strings.Contains(raw, "DEAD") {
+				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprintf("🔴 %s", raw))
+			} else {
+				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprintf("🟡 %s", raw))
+			}
+		default:
+			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
 		}
 	}
 }

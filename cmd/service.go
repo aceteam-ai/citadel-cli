@@ -247,6 +247,38 @@ func composeFileArgs(origComposePath, actualComposePath string) []string {
 	return args
 }
 
+// composeServiceStateFrom resolves the run state of a manifest service from an
+// already-captured `docker compose ps --format json` output.
+//
+// The raw output is PROJECT-wide, not file-wide: citadel passes no `-p` (#528)
+// and every service compose file shares the default project (the services
+// directory basename), so `-f vllm.yml ps` also lists bonsai, kokoro and every
+// other citadel container. Reading containers[0] out of that is what made
+// `citadel status --json` report container-less services as running (#692).
+// internal/compose.ResolveServiceState narrows the output to the services this
+// compose file declares, and falls back to a native-serving probe so a service
+// running outside docker (ollama under systemd on port 11434) is not misreported
+// as stopped in the opposite direction.
+func composeServiceStateFrom(psOutput []byte, composePath, serviceName string) compose.ServiceState {
+	return compose.ResolveServiceState(
+		psOutput,
+		compose.DeclaredServices(composePath),
+		func() bool { return services.IsNativeServiceServing(serviceName) },
+	)
+}
+
+// composeServiceState runs `docker compose ps` for a manifest service and
+// resolves its run state. See composeServiceStateFrom for why the raw output
+// cannot be read directly.
+func composeServiceState(composePath, serviceName string) (compose.ServiceState, error) {
+	psArgs := append(composeFileArgs(composePath, composePath), "ps", "--format", "json")
+	output, err := composeCommand(psArgs...).Output()
+	if err != nil {
+		return compose.ServiceState{}, err
+	}
+	return composeServiceStateFrom(output, composePath, serviceName), nil
+}
+
 // sandboxOverridePathFor returns the path of the sandbox override that sits next
 // to a service's compose file (<dir>/<name>.sandbox.yml), or "" if it does not
 // exist. The compose file is "<name>.yml"; the override shares the same <name>.
