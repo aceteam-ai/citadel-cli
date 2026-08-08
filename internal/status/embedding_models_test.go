@@ -90,7 +90,7 @@ func TestCollectEmbeddingServices_NativeProcessCounts(t *testing.T) {
 	// portIfRunning stands in for managedEnginePortIfRunning, whose real
 	// implementation checks the container first and falls back to the native
 	// service probe. Here only the native branch answers.
-	nativeOnly := func(_, name string) (int, bool) {
+	nativeOnly := func(name string) (int, bool) {
 		if name == "tei" {
 			return 8102, true
 		}
@@ -98,7 +98,7 @@ func TestCollectEmbeddingServices_NativeProcessCounts(t *testing.T) {
 	}
 	md := stubEmbeddingLister{models: []string{"Alibaba-NLP/gte-multilingual-base"}}
 
-	got := collectEmbeddingServices(context.Background(), "docker", nativeOnly, alwaysHealthy, md)
+	got := collectEmbeddingServices(context.Background(), nativeOnly, alwaysHealthy, md)
 	if len(got) != 1 {
 		t.Fatalf("expected the native embedding server reported, got %+v", got)
 	}
@@ -151,10 +151,10 @@ func TestManagedEnginePortIfRunning_DetectsNativeWithoutAContainer(t *testing.T)
 // A server whose /info probe fails is still reported (running is real state),
 // but must not have a model invented for it.
 func TestCollectEmbeddingServices_ProbeFailureLeavesModelsEmpty(t *testing.T) {
-	running := func(_, name string) (int, bool) { return 8102, name == "tei" }
+	running := func(name string) (int, bool) { return 8102, name == "tei" }
 	md := stubEmbeddingLister{err: context.DeadlineExceeded}
 
-	got := collectEmbeddingServices(context.Background(), "docker", running, alwaysHealthy, md)
+	got := collectEmbeddingServices(context.Background(), running, alwaysHealthy, md)
 	if len(got) != 1 {
 		t.Fatalf("expected tei reported, got %+v", got)
 	}
