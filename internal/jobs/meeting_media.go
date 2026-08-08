@@ -152,6 +152,12 @@ const (
 	meetingContainerCDPTimeout = 30 * time.Second
 	// meetingContainerHTTPTimeout bounds a single meetingd control call.
 	meetingContainerHTTPTimeout = 30 * time.Second
+	// meetingSpeakTimeout bounds a blocking POST /mic/play. meetingd plays the clip
+	// SYNCHRONOUSLY (it returns when playback finishes), and a TTS clip can run tens
+	// of seconds — well past meetingContainerHTTPTimeout — so speaking uses its own
+	// generous client, else a legitimately long clip surfaces as a spurious timeout
+	// error mid-playback.
+	meetingSpeakTimeout = 3 * time.Minute
 )
 
 // meetingdBaseURL is the loopback base URL for the meeting module's control API.
@@ -301,6 +307,40 @@ func (m *containerMedia) Close() error {
 		m.browser = nil
 	}
 	return m.deleteSession()
+}
+
+// SpeakFile injects a workspace-relative audio file into the container's virtual
+// microphone (meetingd POST /mic/play), so the bot is HEARD in the live meeting —
+// the bot->room complement of the room->bot capture path (aceteam#7079). It is
+// strictly ADDITIVE: the join/record flow never calls it, so a bot that only
+// listens behaves exactly as before. Wiring it to a realtime TTS/agent engine is a
+// later wave; this is the tested, minimal transport.
+//
+// It blocks until meetingd finishes playing the clip (synchronous playback), so it
+// uses a dedicated long-timeout client rather than m.client (30s). A 409 means
+// another clip is already playing; a 503 means the virtual mic is not present on
+// this node.
+func (m *containerMedia) SpeakFile(wavRelPath string) error {
+	body, err := json.Marshal(map[string]any{"path": wavRelPath})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, m.base+"/mic/play", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: meetingSpeakTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("meetingd mic play: %w", err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("meetingd mic play returned status %d: %s", resp.StatusCode, string(out))
+	}
+	return nil
 }
 
 func (m *containerMedia) sessionPath(suffix string) string {

@@ -831,6 +831,35 @@ shaped like:
 The `engine` must be `bonsai` so the node routes `MODEL_CACHE_PULL` to the
 single-file GGUF pull and `SERVICE_START` to `services/compose/bonsai.yml`.
 
+### Meeting media stack — virtual mic / bot speaking path (aceteam#7079)
+
+The `meeting-service` module (`services/meeting-service/`) is a headed Chromium +
+Xvfb + PulseAudio container (`meetingd` control API on host 8207 / container 8102,
+CDP on host 8208) that lets the bot HEAR a meeting via a null sink whose monitor
+ffmpeg records. The bot->room SPEAKING path adds a **virtual microphone**:
+`citadel.pa` boots a `citadel_mic` null sink whose monitor is **remapped**
+(`module-remap-source`, `device.class=sound`) to a real source `citadel_virtmic`,
+set as the default input device so the Chromium tab publishes it as its mic.
+
+- **Inject audio** via meetingd: `POST /mic/play` (JSON `{"path": "<ws-rel file>"}`,
+  any ffmpeg format → `paplay`) or `POST /mic/play/pcm` (raw s16le body,
+  `?rate=&channels=` → `pacat`). Node-wide, serialized (409 `already speaking`),
+  synchronous (returns when the clip finishes); no barge-in yet. Go transport:
+  `containerMedia.SpeakFile` (own 3-min client, not the 30s control client).
+- **Strictly additive & gated:** capture sinks and the `/health` canary name
+  `<sink>.monitor` explicitly, so making `citadel_virtmic` the default *source*
+  can't touch capture. `/health` **reports** `virtual_mic:{present,sink,source,
+  required}` but only 503s on absence when `MEETING_MIC_REQUIRED=1` — a node that
+  never speaks behaves exactly as before.
+- **Load-bearing subtlety:** Chromium filters *monitor*-class sources out of
+  `getUserMedia`, which is why the monitor is remapped to a `device.class=sound`
+  source rather than used raw. Live-validation #1: `pactl list sources` must show
+  `citadel_virtmic` with **no** `Monitor of Sink:` line (see the meeting-service
+  README + `smoke_test.py` step 6).
+- **NOT done (next wave):** mic-permission grant (`build_chrome_args` has no
+  `--use-fake-ui-for-media-stream`; rely on the profile's prior grant or a CDP
+  `Browser.grantPermissions`), realtime-engine WS streaming, and barge-in.
+
 ### Per-request Energy Receipt (footprint energy, aceteam#6635)
 
 The footprint sampler can record a per-interval node energy estimate so the

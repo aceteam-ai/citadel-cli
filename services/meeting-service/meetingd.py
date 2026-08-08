@@ -67,9 +67,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+
+def _truthy(val: str | None) -> bool:
+    return (val or "").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- configuration (env, with the same defaults the service.yaml declares) ---
 
@@ -93,6 +97,34 @@ CANARY_FLOOR_DBFS = -50.0
 # buildAudioFFmpegArgs so the transcribe sidecar reads it unchanged.
 WAV_CHANNELS = "1"
 WAV_RATE = "16000"
+
+# --- virtual microphone (bot -> room speaking path, aceteam#7079) ---
+#
+# The container boots (citadel.pa) a null sink MIC_SINK whose monitor is remapped
+# to a real capture source MIC_SOURCE, set as the default source so the Chromium
+# tab publishes it as its mic. Audio played INTO MIC_SINK is therefore heard by the
+# meeting. This is strictly ADDITIVE to the capture path (the per-meeting sinks and
+# the canary both name `<sink>.monitor` EXPLICITLY, so making MIC_SOURCE the default
+# source cannot touch them): a bot that never calls /mic/play publishes silence,
+# exactly as before.
+MIC_SINK = os.environ.get("MEETING_MIC_SINK", "citadel_mic")
+MIC_SOURCE = os.environ.get("MEETING_MIC_SOURCE", "citadel_virtmic")
+# By default a missing virtual mic is REPORTED in /health (never fails it): a node
+# that pulls the new image but hits a remap-source hiccup must keep its existing
+# meeting-CAPTURE capability, which works today. Set MEETING_MIC_REQUIRED truthy on
+# a speaking node to make an absent mic a hard 503.
+MIC_REQUIRED = _truthy(os.environ.get("MEETING_MIC_REQUIRED"))
+# Upper bound on a single /mic/play or /mic/play/pcm playback. A TTS clip is
+# seconds-to-a-minute; this is a safety cap, not the expected duration.
+MIC_PLAY_TIMEOUT = int(os.environ.get("MEETING_MIC_PLAY_TIMEOUT", "120"))
+# Default raw-PCM format for /mic/play/pcm when the caller omits the query params.
+MIC_PCM_RATE = int(os.environ.get("MEETING_MIC_PCM_RATE", "24000"))
+MIC_PCM_CHANNELS = int(os.environ.get("MEETING_MIC_PCM_CHANNELS", "1"))
+
+# Serializes injection so two overlapping clips never garble the mic. One clip at a
+# time; a second concurrent request gets 409 (no barge-in / mid-clip stop yet --
+# that is the later realtime wave).
+_mic_lock = threading.Lock()
 
 
 def _chromium_binary() -> str | None:
@@ -191,6 +223,120 @@ def _unload_module(module_id: str) -> None:
         )
     except (subprocess.SubprocessError, OSError):
         pass
+
+
+def _pactl_short(kind: str) -> list[str]:
+    """Names of the pulse objects of `kind` ("sinks"/"sources") via `pactl list
+    short`. Column 1 is the object name (tab-separated). Returns [] on any failure
+    so a probe treats 'pactl unavailable' the same as 'object absent'."""
+    if not shutil.which("pactl"):
+        return []
+    try:
+        r = subprocess.run(
+            ["pactl", "list", "short", kind],
+            env=_pactl_env(),
+            capture_output=True,
+            timeout=5,
+            text=True,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    names: list[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            names.append(parts[1])
+    return names
+
+
+def virtual_mic_present() -> bool:
+    """True when BOTH the virtual-mic null sink and its remapped source exist, i.e.
+    citadel.pa's mic topology loaded. Cheap (two `pactl list short` calls), so it is
+    safe to call on every /health."""
+    return MIC_SINK in _pactl_short("sinks") and MIC_SOURCE in _pactl_short("sources")
+
+
+def build_mic_decode_ffmpeg_args(in_path: str, out_path: str) -> list[str]:
+    """ffmpeg args to decode ANY audio file the caller supplies into a plain WAV
+    that paplay streams into the virtual-mic sink. Format-agnostic on input; the
+    output is a mono 48 kHz WAV (a normal mic rate). Pure so it is unit-testable."""
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        in_path,
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-y",
+        out_path,
+    ]
+
+
+def build_paplay_mic_args(sink: str, wav_path: str) -> list[str]:
+    """paplay args to play a WAV into `sink` (the virtual-mic null sink). Mirrors the
+    canary's `paplay --device=<sink> <file>` invocation, which is proven to work."""
+    return ["paplay", f"--device={sink}", wav_path]
+
+
+def build_pacat_mic_args(sink: str, rate: int, channels: int) -> list[str]:
+    """pacat args to play raw signed-16-bit little-endian PCM (read from stdin) into
+    `sink`. This is the low-latency path a realtime TTS engine would stream to. Pure
+    so the format flags are unit-testable."""
+    return [
+        "pacat",
+        "--playback",
+        f"--device={sink}",
+        "--format=s16le",
+        f"--rate={int(rate)}",
+        f"--channels={int(channels)}",
+    ]
+
+
+def _play_file_into_mic(src_path: str) -> None:
+    """Decode `src_path` to a scratch WAV and play it into MIC_SINK, so it is
+    published on the virtual mic into the live meeting. Blocks until playback
+    finishes (pulse paces the null sink at wall-clock rate)."""
+    tmpdir = tempfile.mkdtemp(prefix="mic_")
+    wav = os.path.join(tmpdir, "play.wav")
+    # ONE budget shared across decode + playback (not MIC_PLAY_TIMEOUT each), so
+    # meetingd's total worst case stays under MIC_PLAY_TIMEOUT and never holds
+    # _mic_lock past the Go client's (larger) timeout -- otherwise the next call
+    # gets a confusing 409 while a runaway clip is still "playing".
+    start = time.monotonic()
+    try:
+        subprocess.run(
+            build_mic_decode_ffmpeg_args(src_path, wav),
+            env=_pactl_env(),
+            check=True,
+            timeout=MIC_PLAY_TIMEOUT,
+        )
+        remaining = max(1.0, MIC_PLAY_TIMEOUT - (time.monotonic() - start))
+        subprocess.run(
+            build_paplay_mic_args(MIC_SINK, wav),
+            env=_pactl_env(),
+            check=True,
+            timeout=remaining,
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _play_pcm_into_mic(pcm: bytes, rate: int, channels: int) -> None:
+    """Play raw s16le PCM bytes into MIC_SINK via pacat. Blocks until done."""
+    subprocess.run(
+        build_pacat_mic_args(MIC_SINK, rate, channels),
+        env=_pactl_env(),
+        input=pcm,
+        check=True,
+        timeout=MIC_PLAY_TIMEOUT,
+    )
 
 
 def build_record_ffmpeg_args(monitor_source: str, out_path: str) -> list[str]:
@@ -343,6 +489,13 @@ class RecordRequest(BaseModel):
     out: str
 
 
+class MicPlayRequest(BaseModel):
+    # path is a workspace-relative audio file (any format ffmpeg decodes). It is
+    # resolved through _safe_workspace_path, so it cannot escape the /workspace
+    # mount -- same guard the recorder uses for its output path.
+    path: str
+
+
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     threading.Thread(target=_reaper, name="session-reaper", daemon=True).start()
@@ -368,6 +521,21 @@ def _safe_workspace_path(rel: str) -> str:
     return full
 
 
+def _virtual_mic_health() -> dict[str, object]:
+    """The virtual-mic block attached to every /health body. Best-effort: a probe
+    failure reports present=False rather than raising."""
+    try:
+        present = virtual_mic_present()
+    except Exception:  # noqa: BLE001 -- report, never fail the whole probe
+        present = False
+    return {
+        "present": present,
+        "sink": MIC_SINK,
+        "source": MIC_SOURCE,
+        "required": MIC_REQUIRED,
+    }
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     chromium = _chromium_binary()
@@ -378,28 +546,46 @@ def health() -> JSONResponse:
         problems.append("ffmpeg not found")
     if not pulse_ready():
         problems.append("pulse server not ready")
+    mic = _virtual_mic_health()
+    # The virtual mic is the SPEAKING path; a missing one never breaks CAPTURE, so by
+    # default it is only reported. Only a node explicitly required to speak
+    # (MEETING_MIC_REQUIRED) treats its absence as unhealthy.
+    if MIC_REQUIRED and not mic["present"]:
+        problems.append(f"virtual mic not present (sink={MIC_SINK}, source={MIC_SOURCE})")
     if problems:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "problems": problems},
+            content={"status": "unhealthy", "problems": problems, "virtual_mic": mic},
         )
     try:
         canary = run_canary()
     except Exception as exc:  # noqa: BLE001 -- any canary failure is unhealthy
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "problems": [f"canary error: {exc}"]},
+            content={
+                "status": "unhealthy",
+                "problems": [f"canary error: {exc}"],
+                "virtual_mic": mic,
+            },
         )
     if not canary.ok:
         # 503 (5xx) so catalog.ProbeHealth classifies this as UNHEALTHY. A 4xx
         # would be read as healthy by that prober.
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "canary": canary.model_dump()},
+            content={
+                "status": "unhealthy",
+                "canary": canary.model_dump(),
+                "virtual_mic": mic,
+            },
         )
     return JSONResponse(
         status_code=200,
-        content={"status": "healthy", "canary": canary.model_dump()},
+        content={
+            "status": "healthy",
+            "canary": canary.model_dump(),
+            "virtual_mic": mic,
+        },
     )
 
 
@@ -519,6 +705,88 @@ def stop_record(session_id: str) -> JSONResponse:
         path = s.record_path
         s.recorder = None
     return JSONResponse(content={"recording": False, "path": path})
+
+
+# --- speaking path (bot -> room, aceteam#7079) ---------------------------------
+#
+# Two operations, one body shape each (cleaner than content-type switching):
+#   POST /mic/play        JSON {"path": "<workspace-relative audio file>"}
+#                         Decodes any ffmpeg-readable file and plays it into the
+#                         virtual mic. 200 {"played": true, "source": "file", ...}.
+#   POST /mic/play/pcm    raw body = signed-16-bit little-endian PCM
+#                         query: ?rate=<hz>&channels=<n> (default 24000/1)
+#                         Streams the bytes straight into the virtual mic via pacat.
+#                         200 {"played": true, "source": "pcm", "bytes": N}.
+#
+# Both are node-wide (the mic is one boot-level device, not per session): they are
+# serialized by _mic_lock and return 409 while a clip is already playing. Playback
+# is SYNCHRONOUS (the request returns when the clip finishes) and there is no
+# mid-clip stop / barge-in yet -- that is the later realtime wave.
+
+
+def _mic_not_ready() -> JSONResponse | None:
+    """Shared pre-flight for the speaking endpoints: pulse up and the virtual mic
+    present. Returns a 503 response when not ready, else None."""
+    if not pulse_ready():
+        return JSONResponse(status_code=503, content={"error": "pulse server not ready"})
+    if not virtual_mic_present():
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"virtual mic not present (sink={MIC_SINK}, source={MIC_SOURCE})"},
+        )
+    return None
+
+
+@app.post("/mic/play")
+def mic_play(req: MicPlayRequest) -> JSONResponse:
+    not_ready = _mic_not_ready()
+    if not_ready is not None:
+        return not_ready
+    try:
+        src = _safe_workspace_path(req.path)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if not os.path.isfile(src):
+        return JSONResponse(status_code=404, content={"error": f"no such file: {req.path}"})
+    if not _mic_lock.acquire(blocking=False):
+        return JSONResponse(status_code=409, content={"error": "already speaking"})
+    try:
+        _play_file_into_mic(src)
+    except subprocess.TimeoutExpired:
+        return JSONResponse(status_code=504, content={"error": "mic playback timed out"})
+    except subprocess.CalledProcessError as exc:
+        return JSONResponse(status_code=500, content={"error": f"mic playback failed: {exc}"})
+    finally:
+        _mic_lock.release()
+    return JSONResponse(content={"played": True, "source": "file", "path": src})
+
+
+@app.post("/mic/play/pcm")
+def mic_play_pcm(
+    # Default to empty (not required) so an empty body reaches the explicit 400
+    # below instead of FastAPI's generic 422 required-body error.
+    pcm: bytes = Body(b"", media_type="application/octet-stream"),
+    rate: int = MIC_PCM_RATE,
+    channels: int = MIC_PCM_CHANNELS,
+) -> JSONResponse:
+    not_ready = _mic_not_ready()
+    if not_ready is not None:
+        return not_ready
+    if not pcm:
+        return JSONResponse(status_code=400, content={"error": "empty PCM body"})
+    if rate <= 0 or channels <= 0:
+        return JSONResponse(status_code=400, content={"error": "rate and channels must be positive"})
+    if not _mic_lock.acquire(blocking=False):
+        return JSONResponse(status_code=409, content={"error": "already speaking"})
+    try:
+        _play_pcm_into_mic(pcm, rate, channels)
+    except subprocess.TimeoutExpired:
+        return JSONResponse(status_code=504, content={"error": "mic playback timed out"})
+    except subprocess.CalledProcessError as exc:
+        return JSONResponse(status_code=500, content={"error": f"mic playback failed: {exc}"})
+    finally:
+        _mic_lock.release()
+    return JSONResponse(content={"played": True, "source": "pcm", "bytes": len(pcm)})
 
 
 @app.delete("/sessions/{session_id}")
