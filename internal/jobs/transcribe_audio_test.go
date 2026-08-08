@@ -103,6 +103,69 @@ func TestTranscribeAudio_Success(t *testing.T) {
 	}
 }
 
+// TestTranscribeAudio_DiarizeModes covers the diarize payload mapping: the
+// "speaker" mode (reprocess path) must request REAL pyannote diarization
+// (diarize + speaker), "true" (quick path) must request BASIC labelling only,
+// and any other value must request no speaker labels at all.
+func TestTranscribeAudio_DiarizeModes(t *testing.T) {
+	cases := []struct {
+		name        string
+		diarize     string
+		wantDiarize bool
+		wantSpeaker bool
+	}{
+		{"speaker mode", "speaker", true, true},
+		{"basic mode", "true", true, false},
+		{"off", "false", false, false},
+		{"absent", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				b, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(b, &body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"text":"ok","language":"en","segments":[],"speakers":[],"diarization":"none"}`))
+			}))
+			defer srv.Close()
+
+			h := NewTranscribeAudioHandler(dir)
+			h.ServiceURL = srv.URL
+
+			payload := map[string]string{"audio_path": "a.webm"}
+			if tc.diarize != "" {
+				payload["diarize"] = tc.diarize
+			}
+			if _, err := h.Execute(JobContext{}, &nexus.Job{
+				ID:      "dm",
+				Type:    "TRANSCRIBE_AUDIO",
+				Payload: payload,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			gotDiarize, _ := body["diarize"].(bool)
+			gotSpeaker, _ := body["speaker"].(bool)
+			if gotDiarize != tc.wantDiarize {
+				t.Errorf("diarize forwarded = %v, want %v (body=%v)", gotDiarize, tc.wantDiarize, body)
+			}
+			if gotSpeaker != tc.wantSpeaker {
+				t.Errorf("speaker forwarded = %v, want %v (body=%v)", gotSpeaker, tc.wantSpeaker, body)
+			}
+		})
+	}
+}
+
 func TestTranscribeAudio_ServiceError(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
