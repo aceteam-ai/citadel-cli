@@ -799,7 +799,10 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 // external source it clones/updates the repo and returns the full ResolvedModule.
 func resolveModuleForTUI(src catalog.Source) (manifest *catalog.ServiceManifest, composeSrc string, resolved *catalog.ResolvedModule, err error) {
 	if src.Kind == catalog.KindCatalog {
-		manifest, err = catalog.LoadServiceManifest(src.Name)
+		// Self-healing: on a cold catalog cache this refreshes the configured
+		// source(s) once and retries, so a remote MODULE_SET / reconcile install
+		// (and the TUI install) succeeds on a node that never ran `catalog update`.
+		manifest, err = catalog.LoadServiceManifestSelfHealing(src.Name)
 		if err != nil {
 			return nil, "", nil, err
 		}
