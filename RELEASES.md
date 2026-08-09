@@ -1506,3 +1506,24 @@ Auto-generated log of every release.
   - feat(network): machine-wide mode (`citadel up`) — Backend split, TUN + attached backends (#643) (#650)
 
 
+---
+
+## v2.100.0 — 2026-08-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 7 |
+| Files changed | 28 |
+| Lines added | +2677 |
+
+**Changes:**
+
+  - fix(network): record the state-dir pointer on `citadel up` (#643 follow-up) (#713)
+  - docs: reconcile the Git workflow section with the worktree policy (#710)
+  - docs: stop presenting an external VPN client as part of node onboarding (#642) (#700)
+  - fix: scope compose ps output to the service's own compose file (#711)
+  - Gate serving on engine readiness and return typed warming, not a socket error (#697)
+  - fix(worker): poll the per-node queue on every rotation iteration (#704) (#706)
+  - docs: correct three stale CLAUDE.md claims, and the convention that let them rot (#693) (#708)
+
+
