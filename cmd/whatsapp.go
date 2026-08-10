@@ -512,8 +512,8 @@ func runWhatsAppDown(cmd *cobra.Command, args []string) error {
 	// Must use the SAME `-p` project the stack was brought up under, otherwise
 	// compose targets a different (empty) project and the containers survive.
 	// Left UNSCOPED (no service argument) on purpose: `down` should take the
-	// Postgres sidecar with it, and compose limits `down` to the services of the
-	// loaded -f file, so the sibling modules sharing this project are untouched.
+	// Postgres sidecar with it too. As everywhere in this file, `--remove-orphans`
+	// is never passed, so the sibling modules sharing this project survive.
 	out, err := runBridgeCompose(context.Background(),
 		bridgeComposeArgs(whatsapp.ProjectName(servicesDir), composePath, whatsapp.EnvPath(servicesDir), "down")...)
 	if err != nil {

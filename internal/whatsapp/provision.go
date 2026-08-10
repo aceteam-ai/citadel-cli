@@ -81,6 +81,12 @@ type ProvisionDeps struct {
 	// container still runs the old one until it is recreated, so a tag-derived
 	// value would report an upgrade that did not happen. Nil leaves the image
 	// fields empty and Upgraded false (never a fabricated "upgraded").
+	//
+	// A false "unknown" is possible and accepted: the post-deploy sample races a
+	// container that compose has only just started, so it can legitimately read
+	// "" on a real upgrade. That direction is safe (Upgraded stays false and the
+	// result says the image is unknown); the opposite -- claiming an upgrade that
+	// did not happen -- is the failure this whole field exists to prevent.
 	BridgeImageID func() string
 
 	// ImagePullError returns the error text of the image pull DeployCompose
