@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -182,7 +183,44 @@ func bridgeBaseURL(port int) string {
 // GIT_TERMINAL_PROMPT=0 is set so a private-repo clone with missing credentials
 // fails fast with a clear error instead of blocking on an interactive prompt
 // (which would hang a headless node job).
-func deployWhatsAppCompose(source, image string) func(servicesDir string, env map[string]string) error {
+// deployReport carries the NON-FATAL outcomes of a deploy back out to
+// whatsappProvisionDeps, which exposes them to whatsapp.Provision through the
+// optional ImagePullError dep (the DeployCompose dep itself returns only an
+// error, and its signature is shared with every existing caller and test stub).
+//
+// Today it carries one thing: the image-pull error. A pull failure must not fail
+// the provision -- a node that never ran `docker login` for the private registry
+// can still serve from its cached image, and failing would regress re-provisions
+// that work today -- but it must not vanish either, because "provisioned fine,
+// silently still on the old image" is exactly the false-green #718 is about.
+//
+// The mutex is load-bearing: deployWhatsAppCompose runs the deploy in a goroutine
+// and abandons it on deployTimeout, so the writer can still be running when the
+// reader looks.
+type deployReport struct {
+	mu      sync.Mutex
+	pullErr string
+}
+
+func (r *deployReport) setPullError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err == nil {
+		r.pullErr = ""
+		return
+	}
+	r.pullErr = err.Error()
+}
+
+// PullError returns the recorded pull error text ("" when the pull succeeded or
+// was never attempted). It is the whatsapp.ProvisionDeps.ImagePullError edge.
+func (r *deployReport) PullError() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pullErr
+}
+
+func deployWhatsAppCompose(source, image string, report *deployReport) func(servicesDir string, env map[string]string) error {
 	return func(servicesDir string, env map[string]string) error {
 		// Fail fast on a private-repo clone with missing credentials instead of
 		// blocking on an interactive git prompt (which would hang a headless job).
@@ -207,7 +245,9 @@ func deployWhatsAppCompose(source, image string) func(servicesDir string, env ma
 
 		type result struct{ err error }
 		done := make(chan result, 1)
-		go func() { done <- result{err: deployWhatsAppComposeOnce(ctx, source, image, servicesDir, env)} }()
+		go func() {
+			done <- result{err: deployWhatsAppComposeOnce(ctx, source, image, servicesDir, env, report)}
+		}()
 
 		select {
 		case r := <-done:
@@ -222,7 +262,7 @@ func deployWhatsAppCompose(source, image string) func(servicesDir string, env ma
 
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It
 // is split out so deployWhatsAppCompose can run it under a hard deadline.
-func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string) error {
+func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, report *deployReport) error {
 	if source == "" {
 		source = defaultWhatsAppSource
 	}
@@ -250,19 +290,50 @@ func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir s
 	if image != "" {
 		env["BRIDGE_IMAGE"] = image
 	}
-	// Persist env before compose up so --env-file sees the admin key + port.
+	// Persist env before compose pull/up so --env-file sees the admin key + port.
+	// The compose declares `ADMIN_API_KEY: ${ADMIN_API_KEY:?...}`, so even `pull`
+	// (which parses the file) fails without it.
 	if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
 		return fmt.Errorf("write bridge config: %w", err)
 	}
-	return composeUp(ctx, whatsapp.ProjectName(servicesDir), composePath, whatsapp.EnvPath(servicesDir))
+	return startBridgeStack(ctx, whatsapp.ProjectName(servicesDir), composePath, whatsapp.EnvPath(servicesDir), report)
+}
+
+// startBridgeStack refreshes the bridge image and then starts the stack. Pull
+// THEN up, in that order, is the fix for aceteam-ai/citadel-cli#718: the compose
+// pins the floating tag `ghcr.io/sunapi386/whatsapp-bridge:latest`, and when that
+// tag is already present locally a bare `up -d` sees an unchanged config and an
+// unchanged image ID and does nothing -- so a provisioned bridge could never be
+// upgraded through the API, while `Provision` still reported success.
+//
+// A pull failure is recorded and logged but NOT fatal (see deployReport): the
+// cached image still runs, and the caller learns the truth from
+// ProvisionResult.ImagePullError plus the unchanged image IDs.
+func startBridgeStack(ctx context.Context, project, composePath, envPath string, report *deployReport) error {
+	pullErr := bridgeComposePull(ctx, project, composePath, envPath)
+	if report != nil {
+		report.setPullError(pullErr)
+	}
+	if pullErr != nil {
+		// Loud, but not fatal. Provision surfaces this in its result too.
+		fmt.Fprintf(os.Stderr, "   ⚠️ could not refresh the bridge image; starting the locally cached one instead: %v\n", pullErr)
+	}
+	return bridgeComposeUp(ctx, project, composePath, envPath)
 }
 
 // whatsappProvisionDeps builds the ProvisionDeps for the local CLI, wiring the
 // real catalog / docker / network edges. source/image are the CLI flag values.
 func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
+	// One report per deps set, so the pull outcome recorded by DeployCompose is
+	// the one ImagePullError reads back for this provision.
+	report := &deployReport{}
 	return whatsapp.ProvisionDeps{
 		ServicesDir:   servicesDirForNode,
-		DeployCompose: deployWhatsAppCompose(source, image),
+		DeployCompose: deployWhatsAppCompose(source, image, report),
+		// Image identity before/after the deploy, so an `already_linked` result
+		// can be told apart from a real upgrade (#718).
+		BridgeImageID:  bridgeImageIDForNode,
+		ImagePullError: report.PullError,
 		NewBridgeClient: func(port int, adminKey string) whatsapp.BridgeClient {
 			return whatsapp.NewClient(bridgeBaseURL(port), adminKey)
 		},
@@ -320,6 +391,10 @@ func runWhatsAppUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Say what the deploy actually did to the image. A re-run that changed
+	// nothing must not look like an upgrade (#718).
+	printImageOutcome(res)
 
 	// Show the connect details + pairing QR. Use the port Provision actually
 	// published on (res.Port) -- with auto-selection waPortFlag is 0.
@@ -436,9 +511,11 @@ func runWhatsAppDown(cmd *cobra.Command, args []string) error {
 	fmt.Println("--- 🛑 Stopping WhatsApp bridge ---")
 	// Must use the SAME `-p` project the stack was brought up under, otherwise
 	// compose targets a different (empty) project and the containers survive.
-	dc := exec.Command("docker", "compose", "-p", whatsapp.ProjectName(servicesDir),
-		"-f", composePath, "--env-file", whatsapp.EnvPath(servicesDir), "down")
-	out, err := dc.CombinedOutput()
+	// Left UNSCOPED (no service argument) on purpose: `down` should take the
+	// Postgres sidecar with it too. As everywhere in this file, `--remove-orphans`
+	// is never passed, so the sibling modules sharing this project survive.
+	out, err := runBridgeCompose(context.Background(),
+		bridgeComposeArgs(whatsapp.ProjectName(servicesDir), composePath, whatsapp.EnvPath(servicesDir), "down")...)
 	if err != nil {
 		return fmt.Errorf("docker compose down failed:\n%s", strings.TrimSpace(string(out)))
 	}
@@ -446,7 +523,8 @@ func runWhatsAppDown(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// composeUp runs `docker compose -p <project> -f <compose> --env-file <env> up -d`.
+// bridgeComposeUp runs `docker compose -p <project> -f <compose> --env-file <env>
+// up -d bridge`.
 //
 // The explicit `-p <project>` (whatsapp.ProjectName(servicesDir)) is load-bearing:
 // the module compose no longer hardcodes `container_name`, so compose derives each
@@ -459,10 +537,13 @@ func runWhatsAppDown(cmd *cobra.Command, args []string) error {
 // It runs under ctx so a wedged `docker compose up` (e.g. pulling an image from an
 // unreachable registry) fails fast with a bounded, descriptive error instead of
 // hanging the caller (aceteam-ai/citadel-cli#436 Landmine 2).
-func composeUp(ctx context.Context, project, composePath, envPath string) error {
-	dc := exec.CommandContext(ctx, "docker", "compose", "-p", project,
-		"-f", composePath, "--env-file", envPath, "up", "-d")
-	out, err := dc.CombinedOutput()
+func bridgeComposeUp(ctx context.Context, project, composePath, envPath string) error {
+	// Scope to the bridge service. `db` still comes up: the compose declares
+	// `depends_on: db: {condition: service_healthy}`, so compose starts and waits
+	// on it. Naming the service keeps this invocation from ever acting on the
+	// sibling modules that share the `services` compose project.
+	out, err := runBridgeCompose(ctx, bridgeComposeArgs(project, composePath, envPath,
+		"up", "-d", whatsapp.BridgeService)...)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("docker compose up timed out after %s (is the image registry reachable and is Docker running? check with 'docker info'):\n%s",
@@ -471,6 +552,67 @@ func composeUp(ctx context.Context, project, composePath, envPath string) error 
 		return fmt.Errorf("docker compose up failed:\n%s\n   Hint: is Docker running? Check with 'docker info'", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// bridgeComposePull refreshes the bridge image from the registry (`docker compose
+// ... pull bridge`), the step whose absence made an upgrade impossible (#718).
+//
+// It is scoped to the `bridge` service and deliberately does NOT pass
+// `--include-deps`: an unscoped pull would also refresh `postgres:16-alpine`, and
+// if that tag has moved the following `up` recreates the Postgres sidecar that
+// holds the Baileys auth state. That is gratuitous risk for a bridge upgrade.
+//
+// `--ignore-pull-failures` is likewise deliberately NOT used: it makes compose
+// exit 0 on a failed pull, which would destroy the very signal this change
+// exists to surface. The failure is handled by the caller instead
+// (startBridgeStack), which records it and proceeds with the cached image.
+func bridgeComposePull(ctx context.Context, project, composePath, envPath string) error {
+	out, err := runBridgeCompose(ctx, bridgeComposeArgs(project, composePath, envPath,
+		"pull", whatsapp.BridgeService)...)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("docker compose pull timed out after %s (is the image registry reachable? check with 'docker info' and, for the private bridge image, 'docker login ghcr.io'):\n%s",
+				deployTimeout, strings.TrimSpace(string(out)))
+		}
+		return fmt.Errorf("docker compose pull failed (is the image registry reachable and is this node logged in? the bridge image is private -- try 'docker login ghcr.io'):\n%s",
+			strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// bridgeComposeArgs builds the argv for a docker compose invocation against the bridge
+// stack. Every bridge compose call must carry the same `-p <project> -f <compose>
+// --env-file <env>` triple: the project keeps up/pull/ps/down in agreement, and
+// the env file carries ADMIN_API_KEY, which the compose file interpolates with
+// `:?` (so even `pull` fails to parse without it).
+func bridgeComposeArgs(project, composePath, envPath string, rest ...string) []string {
+	args := []string{"compose", "-p", project, "-f", composePath, "--env-file", envPath}
+	return append(args, rest...)
+}
+
+// bridgeComposeEnv is the environment for bridge compose subprocesses. It does
+// NOT reuse cmd/service.go's composeEnv: that one injects the citadel-owned
+// host-port and workspace vars the embedded inference composes guard with `:?`,
+// none of which the bridge compose declares.
+//
+// COMPOSE_IGNORE_ORPHANS silences the orphan warning. The bridge shares the
+// `services` compose project with every other module on the node (citadel-tei,
+// citadel-unlimited-ocr, and friends, each from its own sibling .yml), and
+// compose computes orphans from the services of the LOADED file -- so naming the
+// `bridge` service on the command line does not suppress it. Never pass
+// `--remove-orphans` here: in this shared project it would delete those modules.
+func bridgeComposeEnv() []string {
+	return append(os.Environ(), "COMPOSE_IGNORE_ORPHANS=true")
+}
+
+// runBridgeCompose executes `docker <args...>` and returns its combined output.
+// It is a package-level var (the same seam as internal/catalog's
+// runCosignVerify) so tests can assert the exact argv -- including that a pull
+// precedes the up -- without a Docker daemon.
+var runBridgeCompose = func(ctx context.Context, args ...string) ([]byte, error) {
+	dc := exec.CommandContext(ctx, "docker", args...)
+	dc.Env = bridgeComposeEnv()
+	return dc.CombinedOutput()
 }
 
 // bridgeContainerRunning reports whether the bridge app container of the given
@@ -511,6 +653,46 @@ func bridgeContainerID(ctx context.Context, project string) (string, error) {
 	return "", nil
 }
 
+// bridgeImageIDForNode reports the docker image ID (sha256:...) the bridge
+// container is CURRENTLY running, or "" when the bridge is not running, Docker
+// is unavailable, or the node config cannot be resolved.
+//
+// It reads the RUNNING CONTAINER's image (`docker inspect {{.Image}}`), NOT the
+// local `:latest` tag. That distinction is the whole point: after a pull the tag
+// already resolves to the new image while the container keeps running the old one
+// until compose recreates it, so a tag-derived value would claim an upgrade that
+// never happened (aceteam-ai/citadel-cli#718).
+//
+// Best-effort by contract: every failure returns "", which Provision reads as
+// "unknown" and never as "upgraded".
+func bridgeImageIDForNode() string {
+	servicesDir, err := servicesDirForNode()
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	id, err := bridgeContainerID(ctx, whatsapp.ProjectName(servicesDir))
+	if err != nil || id == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.Image}}", id).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// shortImageID trims a docker image ID to the 12-hex-char form docker itself
+// prints, for human-facing output. Non-sha256 or short values pass through.
+func shortImageID(id string) string {
+	trimmed := strings.TrimPrefix(id, "sha256:")
+	if len(trimmed) > 12 {
+		return trimmed[:12]
+	}
+	return trimmed
+}
+
 // containerRunning reports whether a container (by name or ID) is in the running
 // state.
 func containerRunning(nameOrID string) bool {
@@ -530,6 +712,23 @@ func portFromEnv(env map[string]string) int {
 		}
 	}
 	return whatsapp.DefaultPort
+}
+
+// printImageOutcome reports whether the deploy actually moved the bridge onto a
+// new image. Before #718 a re-run on a stale image was indistinguishable from a
+// real upgrade -- both printed the same success -- so the no-op case is stated
+// explicitly rather than left silent.
+func printImageOutcome(res *whatsapp.ProvisionResult) {
+	switch {
+	case res.Upgraded:
+		fmt.Printf("   - bridge image upgraded: %s -> %s\n",
+			shortImageID(res.ImageIDBefore), shortImageID(res.ImageIDAfter))
+	case res.ImagePullError != "":
+		fmt.Fprintf(os.Stderr, "   ⚠️ bridge image NOT refreshed (%s); it is running the locally cached image %s\n",
+			res.ImagePullError, shortImageID(res.ImageIDAfter))
+	case res.ImageIDBefore != "" && res.ImageIDAfter != "":
+		fmt.Printf("   - bridge image unchanged (%s); already up to date\n", shortImageID(res.ImageIDAfter))
+	}
 }
 
 // printConnectDetails prints the api_url + api_key and the whatsapp_connect hint.

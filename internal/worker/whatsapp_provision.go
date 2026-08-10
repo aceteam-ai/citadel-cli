@@ -24,10 +24,25 @@
 //	  "qr":      "data:image/png;base64,...",  // "" when already linked
 //	  "tenant":  "<name>",
 //	  "status":  "provisioned" | "already_linked",
+//	  // Upgrade legibility (#718), always present:
+//	  "upgraded": true,                        // the deploy moved the bridge onto a new image
+//	  "image_id_before": "sha256:...",         // omitted when unknown (first deploy / unreadable)
+//	  "image_id_after":  "sha256:...",         // omitted when unknown
+//	  "image_pull_error": "...",               // omitted when the pull succeeded
 //	  // Optional cert-publish contract (#448), omitted when off-mesh / no-TLS:
 //	  "gateway_cert_pem": "-----BEGIN CERTIFICATE-----...", // trust to reach api_url
 //	  "cert_refresh_url": "http://<mesh-ip>:<status-port>/gateway-cert.pem"
 //	}
+//
+// # Upgrade vs. no-op (aceteam-ai/citadel-cli#718)
+//
+// `status` deliberately keeps its two original values. The aceteam backend
+// branches on `status == "already_linked"` by equality, so a third value would
+// silently fall through to the generic branch. The upgrade signal is carried
+// additively instead: read `upgraded` (and the two image IDs) alongside `status`.
+// A two-second `already_linked` with `upgraded: false` and identical image IDs is
+// a no-op re-provision, not an upgrade -- and `image_pull_error` says when the
+// node could not even reach the registry to try.
 //
 // # Privilege gating
 //
@@ -142,6 +157,23 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 		"qr":      qrDataURL,
 		"tenant":  res.Tenant,
 		"status":  status,
+		// Always present so a caller can tell an upgrade from a no-op without
+		// having to know whether the node is new enough to report image IDs.
+		"upgraded": res.Upgraded,
+	}
+	// Image identity is omitted when unknown (bridge not previously running, or
+	// Docker unreadable) rather than reported as an empty string that could be
+	// mistaken for "no image".
+	if res.ImageIDBefore != "" {
+		doc["image_id_before"] = res.ImageIDBefore
+	}
+	if res.ImageIDAfter != "" {
+		doc["image_id_after"] = res.ImageIDAfter
+	}
+	// A failed pull is not fatal (the cached image still runs), but it means this
+	// provision CANNOT have upgraded anything -- say so.
+	if res.ImagePullError != "" {
+		doc["image_pull_error"] = res.ImagePullError
 	}
 	// Optional cert-publish contract (aceteam-ai/citadel-cli#448): hand the backend
 	// the gateway leaf cert to trust (the api_url is an https gateway route) plus
