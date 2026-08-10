@@ -1527,3 +1527,19 @@ Auto-generated log of every release.
   - docs: correct three stale CLAUDE.md claims, and the convention that let them rot (#693) (#708)
 
 
+---
+
+## v2.101.0 — 2026-08-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 10 |
+| Lines added | +544 |
+
+**Changes:**
+
+  - feat(worker): push-based dispatch wake — consume targeted jobs immediately (#7270 P1) (#703)
+  - fix: drop the committed .wt/gate-5028 worktree gitlink, ignore .wt/ (#714)
+
+
