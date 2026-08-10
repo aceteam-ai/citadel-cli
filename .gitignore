@@ -18,3 +18,4 @@ docs-site/.docusaurus/
 
 # git worktrees created for isolated feature work
 .worktrees/
+.wt/
