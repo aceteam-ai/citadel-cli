@@ -36,6 +36,12 @@ type WSClient struct {
 	// releases connMu before taking writeMu; Close takes connMu then writeMu.
 	writeMu sync.Mutex
 
+	// writeTimeout bounds a single WriteMessage. Serializing writes means a
+	// blocked write no longer stalls just its own caller, it stalls every
+	// publisher queued behind writeMu, so the write has to be bounded.
+	// Overridden in tests; see defaultWriteTimeout for the value rationale.
+	writeTimeout time.Duration
+
 	// Message handlers
 	handlers   map[string]func(WSMessage)
 	handlersMu sync.RWMutex
@@ -113,6 +119,7 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		reconnectEnabled: reconnectEnabled,
 		reconnectBackoff: time.Second,
 		maxBackoff:       time.Minute,
+		writeTimeout:     defaultWriteTimeout,
 		debugFunc:        cfg.DebugFunc,
 	}
 }
@@ -240,7 +247,7 @@ func (c *WSClient) readLoop() {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			c.debug("ws: read error: %v", err)
-			c.handleDisconnect()
+			c.handleDisconnect(conn)
 			continue
 		}
 
@@ -272,9 +279,18 @@ func (c *WSClient) readLoop() {
 	}
 }
 
-// handleDisconnect handles WebSocket disconnection
-func (c *WSClient) handleDisconnect() {
+// handleDisconnect tears down conn and schedules a reconnect.
+//
+// conn is the connection the caller observed failing. If the client has already
+// moved on to a different connection the call is a no-op, so a slow failure
+// cannot close a healthy socket that reconnect established in the meantime.
+func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 	c.connMu.Lock()
+	if conn != nil && c.conn != conn {
+		// Already replaced; whoever swapped it owns the old connection.
+		c.connMu.Unlock()
+		return
+	}
 	c.connected = false
 	if c.conn != nil {
 		c.conn.Close()
@@ -433,11 +449,26 @@ func (c *WSClient) sendMessage(_ context.Context, msg WSMessage) error {
 	// heartbeat publisher ticks every 30s, job streaming publishes per chunk,
 	// the consume loop acks per job, and reconnect re-subscribes from its own
 	// goroutine. Without this lock they all enter WriteMessage at once.
+	//
+	// The deadline is set AND cleared inside the same critical section:
+	// SetWriteDeadline is one of gorilla's write methods (a bare field
+	// assignment on the Conn), so touching it outside writeMu would race an
+	// in-flight WriteMessage, which is the bug this fix found in Close.
 	c.writeMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	err = conn.WriteMessage(websocket.TextMessage, data)
+	_ = conn.SetWriteDeadline(time.Time{})
 	c.writeMu.Unlock()
 
 	if err != nil {
+		// gorilla latches the first write error (Conn.writeErr, set once by
+		// writeFatal) and returns it from every later write, so this
+		// connection can never carry another byte. Tear it down: that flips
+		// IsConnected to false so Client.Publish falls back to HTTP, and it
+		// kicks reconnect. Without it the socket stays "connected" while
+		// every publish fails forever, which is the silent stall shape this
+		// whole fix exists to avoid.
+		c.handleDisconnect(conn)
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 
@@ -447,6 +478,17 @@ func (c *WSClient) sendMessage(_ context.Context, msg WSMessage) error {
 // closeWriteWait bounds both the close-handshake write and how long Close
 // waits for an in-flight write to finish before giving up on the handshake.
 const closeWriteWait = 2 * time.Second
+
+// defaultWriteTimeout bounds a single WriteMessage.
+//
+// 15s is chosen against the slowest-cadence caller rather than against network
+// latency: the heartbeat publishes every 30s, so a 15s bound guarantees a
+// wedged socket surfaces as an error before the next tick can queue behind it,
+// and at most one heartbeat interval is ever affected. It is also far above any
+// plausible time to hand a few-KB frame to the kernel on a healthy connection,
+// so it should never fire in normal operation, and well under the worker
+// self-heal stall timer (600s) that would otherwise be the only backstop.
+const defaultWriteTimeout = 15 * time.Second
 
 // tryLockWrite acquires writeMu, giving up after d. Close must not block
 // forever behind a wedged writer (see the deadline note in Close), so it needs

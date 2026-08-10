@@ -146,3 +146,78 @@ func TestCloseDuringConcurrentWrites(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestWedgedWriteTimesOutInsteadOfParkingPublishers is the counterweight to the
+// write mutex. Serializing writes means a single blocked WriteMessage no longer
+// stalls only its own caller, it stalls every publisher queued behind writeMu:
+// heartbeat, stream chunks, acks, chat presence. Bounding the write with a
+// deadline is what keeps that from turning a panic into a silent stall.
+//
+// The server here completes the handshake and then never reads, so socket
+// buffers fill and writes block for real. Every publisher must come back with
+// an error rather than parking. Without the deadline they park forever and this
+// test fails on its own timeout.
+func TestWedgedWriteTimesOutInsteadOfParkingPublishers(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		<-release // never read: let the socket buffers fill
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
+	c.reconnectEnabled = false
+	// Production uses defaultWriteTimeout (15s). Scaled down so the test does
+	// not spend that long proving the bound exists.
+	c.writeTimeout = 250 * time.Millisecond
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	payload := map[string]any{"blob": strings.Repeat("w", 1<<18)} // 256KB per frame
+
+	const (
+		publishers    = 8
+		maxPerWriter  = 200
+		overallBudget = 30 * time.Second
+	)
+
+	results := make(chan error, publishers)
+	for i := range publishers {
+		go func(i int) {
+			var last error
+			for range maxPerWriter {
+				last = c.Publish(context.Background(), fmt.Sprintf("wedged-%d", i), payload)
+				if last != nil {
+					break
+				}
+			}
+			results <- last
+		}(i)
+	}
+
+	budget := time.After(overallBudget)
+	failed := 0
+	for range publishers {
+		select {
+		case err := <-results:
+			if err != nil {
+				failed++
+			}
+		case <-budget:
+			t.Fatal("publishers parked behind a wedged write: WriteMessage is not bounded by a write deadline")
+		}
+	}
+
+	if failed == 0 {
+		t.Fatal("expected the wedged socket to surface a write error, got none")
+	}
+}
