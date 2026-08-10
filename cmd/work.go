@@ -208,6 +208,15 @@ type apiConnector interface {
 // context is cancelled (clean shutdown), never on a connect failure -- the
 // process stays up and keeps retrying rather than dying into a restart storm.
 func connectWithBackoff(ctx context.Context, source apiConnector) error {
+	return connectWithBackoffLabeled(ctx, "Redis API", source)
+}
+
+// connectWithBackoffLabeled is connectWithBackoff with the subject named in the
+// log lines, so a second caller (the WebSocket pub/sub connect, issue #723) can
+// reuse the exact same retry policy -- exponential backoff with jitter, 429
+// retry_after honored in full, ctx-aware chunked sleeps -- without its failures
+// reading as control-plane failures in the journal. One scheme, one place.
+func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
 	backoff := connectBackoffInitial
 	attempt := 0
 	for {
@@ -219,7 +228,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 		err := source.Connect(ctx)
 		if err == nil {
 			if attempt > 1 {
-				Log("connected to Redis API after %d attempt(s)", attempt)
+				Log("connected to %s after %d attempt(s)", label, attempt)
 			}
 			return nil
 		}
@@ -242,8 +251,8 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 				wait = backoff
 			}
 			backoff = connectBackoffInitial
-			Log("Redis API rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
-				rle.Limit, rle.Window, wait, err)
+			Log("%s rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
+				label, rle.Limit, rle.Window, wait, err)
 			if !sleepUntilCtx(ctx, time.Now().Add(wait)) {
 				return ctx.Err()
 			}
@@ -252,12 +261,12 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 
 		// Generic transient failure: exponential backoff with jitter.
 		sleep := jitter(backoff)
-		Log("Redis API connect failed (attempt %d), retrying in %s: %v", attempt, sleep, err)
+		Log("%s connect failed (attempt %d), retrying in %s: %v", label, attempt, sleep, err)
 		backoff *= 2
 		if backoff > connectBackoffMax {
 			backoff = connectBackoffMax
 		}
-		if !sleepCtx(ctx, sleep) {
+		if !backoffSleep(ctx, sleep) {
 			return ctx.Err()
 		}
 	}
@@ -291,6 +300,13 @@ func jitter(d time.Duration) time.Duration {
 	delta := float64(d) * 0.2
 	return time.Duration(float64(d) - delta + rand.Float64()*2*delta)
 }
+
+// backoffSleep is the retry loop's sleep, indirected through a var so a test can
+// observe the durations the loop ASKS for instead of measuring wall-clock gaps.
+// Timing-based assertions on a loaded CI box are flaky in the direction that
+// hides a regression: an overloaded machine overshoots a short sleep enough to
+// look like a long one, so a hot loop can pass. Defaults to sleepCtx.
+var backoffSleep = sleepCtx
 
 // sleepCtx sleeps for d or until ctx is cancelled. Returns true if the full
 // sleep elapsed, false if the context was cancelled first (so backoff loops
@@ -611,6 +627,15 @@ func runWork(cmd *cobra.Command, args []string) {
 	var useAPIMode bool
 	var apiSource *worker.APISource               // Keep reference for heartbeat
 	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
+	// pubSubTransportFn reports the transport Publish is currently using
+	// ("websocket" or "http"). Set only in API mode; nil elsewhere (direct-Redis
+	// mode has no such split). Read by the worker-liveness payload so
+	// `citadel status` can show a node stuck on the HTTP fallback (issue #723).
+	var pubSubTransportFn func() string
+	// wsRetryDone closes when the background WebSocket connect retry finishes.
+	// Post-connect wiring that runs LATER in startup (push-wake) waits on it so a
+	// late connect still gets armed. nil outside API mode.
+	var wsRetryDone <-chan struct{}
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -728,13 +753,16 @@ func runWork(cmd *cobra.Command, args []string) {
 			return
 		}
 
-		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)
-		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
-			// WebSocket is optional - fall back to HTTP
-			Debug("WebSocket not available, using HTTP for pub/sub: %v", err)
-		} else {
-			Debug("WebSocket enabled for real-time pub/sub")
-		}
+		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses).
+		//
+		// A failed connect here is NOT terminal: it retries in the background
+		// with the same backoff/jitter/429 treatment as the control-plane
+		// connect above. Before that, one unlucky attempt during a control-plane
+		// blip left pub/sub on the (broken) HTTP fallback for the whole process
+		// lifetime, with only a Debug line to show for it (issue #723).
+		apiClient := apiSource.Client()
+		wsRetryDone = enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, workerWSLog)
+		pubSubTransportFn = apiClient.PubSubTransport
 
 		source = apiSource
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
@@ -1031,6 +1059,11 @@ func runWork(cmd *cobra.Command, args []string) {
 				// subscribe failure just leaves this node correctly poll-only.
 				if err := src.EnableWake(ctx, wakeChannel); err != nil {
 					Debug("per-node push-wake unavailable (poll-only): %v", err)
+					// The WebSocket may not be up YET -- its connect retries in
+					// the background (#723). Re-arm the wake when it lands;
+					// otherwise a node that started during a control-plane blip
+					// recovers its heartbeat but stays poll-only for good.
+					armWakeAfterWebSocket(ctx, wsRetryDone, src, wakeChannel, workerWSLog)
 				}
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, perNodeQueue); err != nil {
@@ -1167,7 +1200,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// "green but wedged" node (heartbeating from a separate goroutine while the
 	// consume loop is blocked and draining nothing).
 	workerLivenessFn := func() *status.WorkerLiveness {
-		return workerLivenessFrom(workerState.Snapshot())
+		live := workerLivenessFrom(workerState.Snapshot())
+		// Pub/sub transport is read live off the API client rather than mirrored
+		// through WorkerState: it can flip at any moment (background retry
+		// succeeds, connection drops) and a snapshot field would go stale.
+		if pubSubTransportFn != nil {
+			live.PubSubTransport = pubSubTransportFn()
+		}
+		return live
 	}
 
 	// Create status collector (used by status server and Redis status publisher)

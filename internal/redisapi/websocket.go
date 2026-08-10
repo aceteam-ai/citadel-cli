@@ -172,6 +172,14 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		if resp != nil {
+			// A rejected upgrade carries the same rate-limit hint the REST
+			// routes do. Return it TYPED so callers that retry (issue #723) can
+			// honor retry_after instead of falling into a generic 2s..2min
+			// backoff and polling tighter than the server asked -- the tight
+			// loop that burned the daily quota in #443.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return fmt.Errorf("WebSocket connection failed: %w", rateLimitFromUpgrade(resp))
+			}
 			return fmt.Errorf("WebSocket connection failed with status %d: %w", resp.StatusCode, err)
 		}
 		return fmt.Errorf("WebSocket connection failed: %w", err)

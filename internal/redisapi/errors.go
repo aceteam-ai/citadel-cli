@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -96,6 +100,56 @@ func parseRateLimitError(statusCode int, body string) *RateLimitError {
 	}
 
 	return e
+}
+
+// rateLimitFromUpgrade builds a RateLimitError from a rejected WebSocket
+// upgrade response (HTTP 429).
+//
+// The dial path is not doRequest, so without this a rate-limited handshake came
+// back as an untyped fmt.Errorf and AsRateLimitError could never match it --
+// meaning a retry loop would ignore retry_after and poll far tighter than the
+// server asked (issue #723, the #443 failure mode). It prefers the JSON body
+// (the shape the Redis-API routes emit) and falls back to the standard
+// Retry-After header, which an edge proxy may send with no body at all.
+func rateLimitFromUpgrade(resp *http.Response) *RateLimitError {
+	body := ""
+	if resp.Body != nil {
+		// Bounded read: an upgrade rejection body is small, and we must not
+		// block startup on a hostile/slow one.
+		if b, err := io.ReadAll(io.LimitReader(resp.Body, 8192)); err == nil {
+			body = string(b)
+		}
+		resp.Body.Close()
+	}
+
+	e := parseRateLimitError(resp.StatusCode, body)
+	if e.RetryAfter <= 0 && e.ResetAt.IsZero() {
+		if d, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()); ok {
+			e.RetryAfter = d
+		}
+	}
+	return e
+}
+
+// parseRetryAfterHeader parses an RFC 7231 Retry-After value, which is either
+// delta-seconds or an HTTP-date. Returns ok=false when absent or unparseable.
+func parseRetryAfterHeader(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d, true
+		}
+	}
+	return 0, false
 }
 
 // AsRateLimitError extracts a *RateLimitError from an error chain, if present.

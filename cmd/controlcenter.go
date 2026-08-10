@@ -1776,10 +1776,14 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			return fmt.Errorf("failed to connect to Redis API: %w", err)
 		}
 
-		// Enable WebSocket for real-time pub/sub
-		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
-			activity("warning", "WebSocket not available, using HTTP")
-		}
+		// Enable WebSocket for real-time pub/sub. Same defect and same fix as
+		// the worker path (issue #723): one failed connect used to disable
+		// real-time pub/sub for the life of the process. Retries in the
+		// background with backoff/jitter, honoring any 429 retry_after.
+		enableWebSocketWithRetry(ctx, wsConnector{client: apiSource.Client()},
+			func(level, format string, args ...any) {
+				activity(level, fmt.Sprintf(format, args...))
+			})
 
 		source = apiSource
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)

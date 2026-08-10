@@ -81,6 +81,17 @@ type WorkerLiveness struct {
 	// and on the /agent snapshot it is `omitempty`, so its absence cannot
 	// distinguish a degraded node from an older payload.
 	IdentityUnresolved bool `json:"identity_unresolved,omitempty"`
+
+	// PubSubTransport is the transport the node's pub/sub publishes currently
+	// use: "websocket" (real-time, healthy) or "http" (the fallback). Empty on
+	// nodes with no API-mode client and on legacy builds.
+	//
+	// It is here because "http" is a FAILURE, not a mode: the HTTP publish
+	// fallback misreads the route's ack and always reports failure
+	// (citadel-cli#721), so a node on it publishes no durable heartbeat and the
+	// platform reads it as offline while every other field above looks healthy.
+	// Nothing else distinguishes that node from a working one (issue #723).
+	PubSubTransport string `json:"pubsub_transport,omitempty"`
 }
 
 // AppInfo contains information about an installed catalog app.
