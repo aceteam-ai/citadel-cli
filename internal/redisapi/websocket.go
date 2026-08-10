@@ -22,6 +22,20 @@ type WSClient struct {
 	connMu    sync.RWMutex
 	connected bool
 
+	// writeMu serializes gorilla "write methods" (WriteMessage,
+	// SetWriteDeadline) on conn. gorilla supports exactly ONE concurrent
+	// writer and panics with "concurrent write to websocket connection"
+	// otherwise, which kills the whole worker process (#720).
+	//
+	// It is deliberately NOT connMu: connMu guards the conn POINTER, is taken
+	// shared (RLock) by every reader, and is released before any write
+	// happens, so it serializes nothing on the wire. Keeping them separate
+	// also keeps pointer reads cheap while a slow write is in flight.
+	//
+	// Lock order: never acquire connMu while holding writeMu. sendMessage
+	// releases connMu before taking writeMu; Close takes connMu then writeMu.
+	writeMu sync.Mutex
+
 	// Message handlers
 	handlers   map[string]func(WSMessage)
 	handlersMu sync.RWMutex
@@ -415,11 +429,39 @@ func (c *WSClient) sendMessage(_ context.Context, msg WSMessage) error {
 
 	c.debug("ws: sending message type=%s", msg.Type)
 
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	// Single-writer discipline (#720). Callers are genuinely concurrent: the
+	// heartbeat publisher ticks every 30s, job streaming publishes per chunk,
+	// the consume loop acks per job, and reconnect re-subscribes from its own
+	// goroutine. Without this lock they all enter WriteMessage at once.
+	c.writeMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	c.writeMu.Unlock()
+
+	if err != nil {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 
 	return nil
+}
+
+// closeWriteWait bounds both the close-handshake write and how long Close
+// waits for an in-flight write to finish before giving up on the handshake.
+const closeWriteWait = 2 * time.Second
+
+// tryLockWrite acquires writeMu, giving up after d. Close must not block
+// forever behind a wedged writer (see the deadline note in Close), so it needs
+// a bounded acquire rather than a plain Lock.
+func (c *WSClient) tryLockWrite(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if c.writeMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // OnMessage registers a handler for a specific message type.
@@ -495,13 +537,26 @@ func (c *WSClient) Close() error {
 		// network change) it can block indefinitely. That stalls shutdown via
 		// chat.Client.Close() (issue #312). A short deadline makes the write
 		// fail fast; we then close the underlying TCP conn regardless.
-		_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		err := c.conn.WriteMessage(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		)
-		if err != nil {
-			c.debug("ws: error sending close message: %v", err)
+		//
+		// SetWriteDeadline is itself one of gorilla's write methods (it is a
+		// bare field assignment on the Conn), so it and the close frame both
+		// have to run under writeMu, otherwise shutdown races an in-flight
+		// sendMessage. The acquire is bounded so a wedged writer cannot
+		// reintroduce the #312 stall; if we cannot get the lock we skip the
+		// courtesy close frame entirely. Closing the connection is documented
+		// safe alongside any other method, and it unblocks the stuck writer.
+		if c.tryLockWrite(closeWriteWait) {
+			_ = c.conn.SetWriteDeadline(time.Now().Add(closeWriteWait))
+			err := c.conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			)
+			c.writeMu.Unlock()
+			if err != nil {
+				c.debug("ws: error sending close message: %v", err)
+			}
+		} else {
+			c.debug("ws: write in flight, closing without close handshake")
 		}
 		return c.conn.Close()
 	}
