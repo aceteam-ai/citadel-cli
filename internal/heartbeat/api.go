@@ -280,14 +280,14 @@ func (p *APIPublisher) publishMessage(ctx context.Context, msg StatusMessage, ti
 	if pubErr := p.client.Publish(ctx, p.pubSubChannel, msg); pubErr != nil {
 		p.debug("heartbeat: pub/sub publish failed (non-fatal): %v", pubErr)
 		if report, escalate := p.pubSubHealth.recordFailure(time.Now()); escalate {
-			p.log("warning", "   - Warning: heartbeat pub/sub publish to %s failing for %s (%d consecutive): %v (live UI updates only; durable status stream unaffected)",
-				p.pubSubChannel, report.Duration.Round(time.Second), report.Failures, pubErr)
+			p.log("warning", "   - Warning: heartbeat pub/sub publish to %s failing (%s): %v (live UI updates only; durable status stream unaffected)",
+				p.pubSubChannel, report.describe(), pubErr)
 		}
 	} else {
 		p.debug("heartbeat: pub/sub publish successful")
 		if report, recovered := p.pubSubHealth.recordSuccess(time.Now()); recovered {
-			p.log("info", "   - heartbeat pub/sub publish to %s recovered after %d failures over %s",
-				p.pubSubChannel, report.Failures, report.Duration.Round(time.Second))
+			p.log("info", "   - heartbeat pub/sub publish to %s recovered after %s",
+				p.pubSubChannel, report.describe())
 		}
 	}
 

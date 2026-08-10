@@ -165,8 +165,8 @@ func TestPublishMessagePubSubFailureIsNotFatal(t *testing.T) {
 
 	// A sustained failure must be visible somewhere: the first failure of a run
 	// is always reported.
-	if !containsSubstring(*logs, "pub/sub publish to node:status:org:org-1:test-node failing") {
-		t.Errorf("first pub/sub failure must be surfaced, logs: %v", *logs)
+	if !containsSubstring(*logs, "pub/sub publish to node:status:org:org-1:test-node failing (1st consecutive failure)") {
+		t.Errorf("first pub/sub failure must be surfaced without a misleading 0s duration, logs: %v", *logs)
 	}
 }
 
@@ -260,7 +260,7 @@ func TestPublishMessageWarningIsRateLimitedThenRecovers(t *testing.T) {
 	if got := len(*logs); got != 2 {
 		t.Fatalf("recovery should be logged exactly once, got %d lines: %v", got, *logs)
 	}
-	if !strings.Contains((*logs)[1], "recovered after 20 failures") {
+	if !strings.Contains((*logs)[1], "recovered after 20 consecutive failures") {
 		t.Errorf("recovery line should carry the failure count, got: %s", (*logs)[1])
 	}
 

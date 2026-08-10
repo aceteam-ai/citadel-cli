@@ -1,6 +1,7 @@
 package heartbeat
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -40,6 +41,16 @@ type pubSubReport struct {
 	Failures int
 	// Duration is how long the channel has been failing.
 	Duration time.Duration
+}
+
+// describe renders the run for an operator. The first failure of a run has no
+// elapsed time worth printing: "failing for 0s" reads as a rounding artifact
+// and undercuts the one line an operator is most likely to act on.
+func (r pubSubReport) describe() string {
+	if r.Failures <= 1 {
+		return "1st consecutive failure"
+	}
+	return fmt.Sprintf("%d consecutive failures over %s", r.Failures, r.Duration.Round(time.Second))
 }
 
 // recordFailure notes a failed pub/sub publish. The second return value is
