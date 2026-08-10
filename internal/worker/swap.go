@@ -23,13 +23,18 @@
 //     carries only {service, model} (no vram_mb), so #577's DURABLE preemptForVRAM
 //     stays inert; the swap does its own non-durable PlanPreemption here.
 //   - Min-residency floor: an engine that became ready within minResidency is
-//     never evicted (filtered out of the candidate set before planning).
+//     never evicted (filtered out of the candidate set before planning). On top
+//     of that floor, an engine that has not yet had a request dispatched to it
+//     since becoming ready is protected until it has (citadel-cli#687) — a load
+//     that never served anything was pure waste, and a 60s floor under a 78s
+//     load meant a model could become evictable before it finished loading.
 //   - LRU: candidates are pre-sorted least-recently-used first so PlanPreemption's
 //     stable idle-then-largest-VRAM ordering breaks ties by LRU.
 package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -107,6 +112,16 @@ type swapOp struct {
 	ready     bool
 	transient bool
 	err       error
+
+	// evicted names the engines this swap stopped to make room. It is what the
+	// ledger's rate bound counts, so it must be appended to as stops succeed,
+	// not derived from the plan (a plan whose first stop failed evicted one
+	// engine, not all of them).
+	evicted []string
+	// started records whether a SERVICE_START was actually issued, which
+	// separates a swap that spent the box's time from one refused before it
+	// began.
+	started bool
 }
 
 // SwapManager serializes and observes model swaps on a node.
@@ -125,10 +140,29 @@ type SwapManager struct {
 	backgroundMax time.Duration // ceiling on a background swap (releases the lock)
 	readyPoll     time.Duration // readiness poll interval
 
+	// Swap rate bound (citadel-cli#687). See swap_ledger.go.
+	rateWindow           time.Duration
+	maxEvictingPerWindow int
+
 	mu       sync.Mutex
 	inflight *swapOp              // the single in-flight swap, or nil
 	lastUsed map[string]time.Time // per-engine last request time (LRU)
 	readyAt  map[string]time.Time // per-engine last became-ready time (min-residency)
+	// servedAt records when a request was last DISPATCHED to an engine — the
+	// moment EnsureResident hands it to the inference path. Compared against
+	// readyAt, it answers "has this engine done anything since it loaded?",
+	// which is the citadel-cli#687 eviction invariant. It is deliberately not
+	// lastUsed: lastUsed is touched on a MISS too, so an engine that was only
+	// ever asked for while absent would look served.
+	servedAt map[string]time.Time
+	// loadMeasured is the observed cold-start duration per engine, replacing the
+	// coarse table estimate once this node has actually timed one. It survives
+	// eviction on purpose: it measures the ENGINE, not the residency, and
+	// dropping it would send the next swap-in back to the table (the same defect
+	// citadel-cli#688 describes for lastUsed).
+	loadMeasured map[string]time.Duration
+	// swaps is the in-process swap ledger (swap_ledger.go).
+	swaps []SwapRecord
 	// startedAt records when this node last ISSUED a start for an engine, which
 	// is the only trustworthy evidence that an unbound port is a cold start
 	// rather than an engine that is simply not running (citadel-cli#705). The
@@ -143,17 +177,21 @@ type SwapManager struct {
 // side-effects.
 func NewSwapManager(ctrl SwapController) *SwapManager {
 	return &SwapManager{
-		ctrl:          ctrl,
-		requiredVRAM:  func(b string) uint64 { return uint64(status.EngineVRAMEstimateMB(b)) * 1024 * 1024 },
-		loadEstimate:  defaultLoadEstimate,
-		now:           time.Now,
-		waitBudget:    swapWaitBudget,
-		minResidency:  swapMinResidency,
-		backgroundMax: swapBackgroundMaxDur,
-		readyPoll:     swapReadyPollEvery,
-		lastUsed:      map[string]time.Time{},
-		readyAt:       map[string]time.Time{},
-		startedAt:     map[string]time.Time{},
+		ctrl:                 ctrl,
+		requiredVRAM:         func(b string) uint64 { return uint64(status.EngineVRAMEstimateMB(b)) * 1024 * 1024 },
+		loadEstimate:         defaultLoadEstimate,
+		now:                  time.Now,
+		waitBudget:           swapWaitBudget,
+		minResidency:         swapMinResidency,
+		backgroundMax:        swapBackgroundMaxDur,
+		readyPoll:            swapReadyPollEvery,
+		rateWindow:           swapRateWindow,
+		maxEvictingPerWindow: swapMaxEvictingPerWindow,
+		lastUsed:             map[string]time.Time{},
+		readyAt:              map[string]time.Time{},
+		startedAt:            map[string]time.Time{},
+		servedAt:             map[string]time.Time{},
+		loadMeasured:         map[string]time.Duration{},
 	}
 }
 
@@ -181,6 +219,7 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 
 	// Already resident: nothing to do (fast path, no lock contention with swaps).
 	if m.ctrl.Resident(ctx, backend) {
+		m.markServed(backend)
 		return SwapOutcome{Ready: true}, nil
 	}
 
@@ -217,6 +256,7 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 			return SwapOutcome{}, op.err
 		}
 		if op.ready {
+			m.markServed(backend)
 			return SwapOutcome{Ready: true}, nil
 		}
 		// Completed but not ready (transient block, e.g. min-residency): warm.
@@ -268,6 +308,7 @@ func (m *SwapManager) runSwap(op *swapOp) {
 			m.inflight = nil
 		}
 		m.mu.Unlock()
+		m.recordSwap(m.swapRecord(op))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), m.backgroundMax)
@@ -288,6 +329,7 @@ func (m *SwapManager) runSwap(op *swapOp) {
 	// while it runs (citadel-cli#705). A failed start clears the record so it
 	// cannot pass as evidence that the engine is on its way up.
 	m.markStartAttempted(op.backend)
+	op.started = true
 	if err := m.ctrl.Start(ctx, op.backend, op.model); err != nil {
 		m.clearStartAttempt(op.backend)
 		op.err = fmt.Errorf("failed to start %s for swap: %w", op.backend, err)
@@ -298,6 +340,11 @@ func (m *SwapManager) runSwap(op *swapOp) {
 	for {
 		if m.ctrl.Ready(ctx, op.backend) {
 			op.ready = true
+			// Time the load before marking ready: this is the only place the node
+			// learns how long THIS engine actually takes to come up, and that
+			// measurement is what raises the residency ceiling above the load
+			// (citadel-cli#687) instead of trusting the coarse table.
+			m.recordLoadDuration(op.backend, m.now().Sub(op.startedAt))
 			m.markReady(op.backend)
 			return
 		}
@@ -336,38 +383,155 @@ func (m *SwapManager) preempt(ctx context.Context, op *swapOp) error {
 		return fmt.Errorf("cannot swap in %s: %s", op.backend, fullPlan.Reason)
 	}
 
-	// Now apply the min-residency floor: an engine that became ready within the
-	// floor is not a candidate right now.
-	eligible := m.filterMinResidency(candidates)
+	// Now apply the residency protections: an engine inside its min-residency
+	// floor, or one that has not served anything since it loaded, is not a
+	// candidate right now.
+	eligible := m.filterResidencyProtected(candidates)
 	plan := status.PlanPreemption(eligible, required, freeVRAM)
 	if !plan.Fits {
-		op.transient = true // blocked only by min-residency; retry soon
+		op.transient = true // blocked only by residency protection; retry soon
 		return nil
+	}
+
+	// This swap needs to take VRAM away from a resident engine, so it is the kind
+	// the rate bound governs (citadel-cli#687). Checked HERE rather than before
+	// the swap starts, so a node with free VRAM is never refused for swaps it
+	// made earlier: only an eviction counts against the ceiling, and only an
+	// eviction is refused by it.
+	if len(plan.Stop) > 0 {
+		if err := m.checkSwapRate(op.backend); err != nil {
+			return err
+		}
 	}
 
 	for _, name := range plan.Stop {
 		if err := m.ctrl.StopNonDurable(name); err != nil {
 			return fmt.Errorf("cannot swap in %s: failed to evict %s: %w", op.backend, name, err)
 		}
+		op.evicted = append(op.evicted, name)
 		m.forget(name)
 	}
 	return nil
 }
 
-// filterMinResidency drops candidates that became ready within the min-residency
-// floor (they must not be evicted yet).
-func (m *SwapManager) filterMinResidency(candidates []status.PreemptCandidate) []status.PreemptCandidate {
+// checkSwapRate refuses an evicting swap once the node has spent its allowance
+// for the window. The error is hard on purpose — see SwapRateLimitedError.
+func (m *SwapManager) checkSwapRate(backend string) error {
+	m.mu.Lock()
+	m.pruneSwapsLocked(m.now())
+	n := m.evictingSwapsInWindowLocked(m.now())
+	max := m.maxEvictingPerWindow
+	window := m.rateWindow
+	m.mu.Unlock()
+
+	if max > 0 && n >= max {
+		return &SwapRateLimitedError{Backend: backend, Swaps: n, Max: max, Window: window}
+	}
+	return nil
+}
+
+// filterResidencyProtected drops candidates that must not be evicted yet. Two
+// protections, in increasing strength:
+//
+//   - The min-residency floor: an engine that became ready within minResidency
+//     is off limits (pre-existing behaviour).
+//   - The served-once invariant (citadel-cli#687): an engine that has had NO
+//     request dispatched to it since it became ready is off limits until it
+//     does. Without this, a model whose load takes 78s under a 60s floor could
+//     be evicted before it ever served anything, making the whole load waste.
+//     It is bounded by unservedResidencyCeiling so an engine nobody ends up
+//     asking for cannot pin VRAM indefinitely.
+//
+// An engine with no readyAt entry — one this node never swapped in, e.g. started
+// by an operator or resident since boot — is protected by NEITHER. That is
+// deliberate: it has been up for an unknown-but-long time, and treating "we have
+// no record" as "recently loaded" would make long-resident engines unevictable
+// after a worker restart.
+func (m *SwapManager) filterResidencyProtected(candidates []status.PreemptCandidate) []status.PreemptCandidate {
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]status.PreemptCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if t, ok := m.readyAt[c.Name]; ok && now.Sub(t) < m.minResidency {
+		ready, known := m.readyAt[c.Name]
+		if !known {
+			out = append(out, c)
+			continue
+		}
+		age := now.Sub(ready)
+		if age < m.minResidency {
+			continue
+		}
+		served, everServed := m.servedAt[c.Name]
+		if (!everServed || served.Before(ready)) && age < m.unservedResidencyCeilingLocked(c.Name) {
 			continue
 		}
 		out = append(out, c)
 	}
 	return out
+}
+
+// unservedResidencyCeilingLocked is how long an engine that has served nothing
+// since loading stays protected. It is the engine's own load time — measured if
+// this node has timed one, else the table estimate — floored at minResidency, so
+// the protection can never be shorter than the load it exists to justify. That
+// is the "raise the floor above the measured load time, per engine" half of
+// citadel-cli#687. Callers hold m.mu.
+func (m *SwapManager) unservedResidencyCeilingLocked(backend string) time.Duration {
+	load, ok := m.loadMeasured[backend]
+	if !ok {
+		load = m.loadEstimate(backend)
+	}
+	if load < m.minResidency {
+		return m.minResidency
+	}
+	return load
+}
+
+// recordLoadDuration remembers how long an engine actually took to become ready.
+func (m *SwapManager) recordLoadDuration(backend string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.loadMeasured[backend] = d
+	m.mu.Unlock()
+}
+
+// MeasuredLoad reports the last observed cold-start duration for backend, and
+// whether one has been observed at all.
+func (m *SwapManager) MeasuredLoad(backend string) (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.loadMeasured[backend]
+	return d, ok
+}
+
+// swapRecord builds the ledger entry for a finished swap. The outcome ordering
+// matters: a rate-limited or otherwise failed swap is reported as such even
+// though it also did not become ready.
+func (m *SwapManager) swapRecord(op *swapOp) SwapRecord {
+	outcome := swapOutcomeWarming
+	switch {
+	case op.err != nil:
+		outcome = swapOutcomeFailed
+		var rateErr *SwapRateLimitedError
+		if errors.As(op.err, &rateErr) {
+			outcome = swapOutcomeRateLimited
+		}
+	case op.ready:
+		outcome = swapOutcomeReady
+	case op.transient || !op.started:
+		outcome = swapOutcomeBlocked
+	}
+	return SwapRecord{
+		Backend:   op.backend,
+		Model:     op.model,
+		Evicted:   append([]string(nil), op.evicted...),
+		StartedAt: op.startedAt,
+		Wait:      m.now().Sub(op.startedAt),
+		Outcome:   outcome,
+	}
 }
 
 // sortByLRU orders candidates least-recently-used first (unknown = oldest).
@@ -396,12 +560,36 @@ func (m *SwapManager) markReady(backend string) {
 	m.mu.Unlock()
 }
 
+// markServed records that a request was just dispatched to backend — the moment
+// EnsureResident hands it to the inference path. Compared against readyAt it
+// answers "has this engine done anything since it loaded?" (citadel-cli#687).
+//
+// It means "a request was routed here", not "the engine produced a completion":
+// the swap manager hands off before the readiness gate runs and cannot observe
+// the result. That is the strongest honest signal available at this seam, and it
+// is the one the eviction invariant needs — a load followed by a dispatched
+// request was not wasted.
+func (m *SwapManager) markServed(backend string) {
+	now := m.now()
+	m.mu.Lock()
+	m.servedAt[backend] = now
+	m.mu.Unlock()
+}
+
 // forget clears the residency window of an evicted engine, and with it the
 // record that a start was ever issued: an engine we just stopped is not booting.
+// The served stamp goes too — it belongs to a residency that has ended.
+//
+// loadMeasured deliberately SURVIVES: it measures how long the engine takes to
+// load, which does not change because we stopped it, and dropping it would send
+// the next swap-in of this engine back to the coarse table estimate for its
+// residency ceiling. (This is exactly the defect citadel-cli#688 describes for
+// lastUsed, which is why it is called out here rather than left to be noticed.)
 func (m *SwapManager) forget(name string) {
 	m.mu.Lock()
 	delete(m.readyAt, name)
 	delete(m.startedAt, name)
+	delete(m.servedAt, name)
 	m.mu.Unlock()
 }
 

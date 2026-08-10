@@ -127,6 +127,16 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	if h.swapper != nil {
 		outcome, swapErr := h.swapper.EnsureResident(ctx, payload.Backend, payload.Model)
 		if swapErr != nil {
+			// A node at its swap limit is refusing, not malfunctioning
+			// (citadel-cli#687). It is still a job FAILURE — every consumer that
+			// exists today renders a failure as a failure, whereas a new
+			// success-shaped control status nothing parses would be relayed as an
+			// empty reply, which is the thrash traded for silence. The reason rides
+			// along machine-readably for a consumer that wants to special-case it.
+			var rateErr *SwapRateLimitedError
+			if errors.As(swapErr, &rateErr) {
+				return h.unavailable(payload.Model, "swap_rate_limited", swapErr), nil
+			}
 			return h.failure(fmt.Errorf("model hotswap failed: %w", swapErr)), nil
 		}
 		if !outcome.Ready {
@@ -942,6 +952,31 @@ func (h *LLMInferenceHandler) engineRequestFailure(
 		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
 	}
 	return h.failure(fmt.Errorf("%s: %w", wrap, err))
+}
+
+// unavailable reports that the node is deliberately declining to serve this
+// model right now, for a named reason — as opposed to warming (it is coming) or
+// a plain failure (something broke). It is a FAILURE result carrying
+// `status: "model_unavailable"` and a `reason` code alongside the human message.
+//
+// Why a failure and not a success-shaped control payload like warming: the
+// platform branches on `output.status == "model_warming"` and has no branch for
+// anything else, so an unrecognized control status returned as a success is
+// relayed as a successful empty reply — the user asks a question and gets
+// nothing, with no error recorded anywhere. A failure is legible to every
+// consumer that exists today; the structured `reason` is additive on top, for a
+// consumer that later wants to render "this node is at its swap limit" specially.
+func (h *LLMInferenceHandler) unavailable(model, reason string, err error) *JobResult {
+	return &JobResult{
+		Status: JobStatusFailure,
+		Error:  err,
+		Output: map[string]any{
+			"status": "model_unavailable",
+			"reason": reason,
+			"model":  model,
+			"error":  err.Error(),
+		},
+	}
 }
 
 func (h *LLMInferenceHandler) failure(err error) *JobResult {
