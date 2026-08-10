@@ -3,14 +3,14 @@
 // This file implements API-based status publishing for real-time UI updates
 // when using the secure Redis API proxy instead of direct Redis connections.
 //
-// Architecture:
+// Architecture (durable write first; see publishMessage for why):
 //
 //	Citadel Node                                  AceTeam API
-//	┌─────────────┐    POST /redis/pubsub/publish ┌─────────────┐
-//	│    API      │ ─────────────────────────────▶│  Redis API  │ → Redis Pub/Sub
+//	┌─────────────┐    POST /redis/streams/add    ┌─────────────┐
+//	│    API      │ ─────────────────────────────▶│  Redis API  │ → Redis Streams (durable)
 //	│  Publisher  │                               │   Proxy     │
-//	│   (30s)     │    POST /redis/streams/add    └─────────────┘
-//	│             │ ─────────────────────────────▶│  Redis API  │ → Redis Streams
+//	│   (30s)     │    POST /redis/pubsub/publish └─────────────┘
+//	│             │ ─────────────────────────────▶│  Redis API  │ → Redis Pub/Sub (best effort)
 //	└─────────────┘                               └─────────────┘
 package heartbeat
 
@@ -52,6 +52,10 @@ type APIPublisher struct {
 
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
+
+	// pubSubHealth rate-limits the log noise from a failing best-effort
+	// pub/sub publish while keeping a sustained outage visible (#722).
+	pubSubHealth pubSubHealth
 
 	// onStatus, when set, is invoked with each freshly collected status after a
 	// successful publish. It lets an auto-stop reconciler act on the exact state
@@ -227,17 +231,31 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		msg.Stats = p.statsFn()
 	}
 
-	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
-	p.debug("heartbeat: nodeId=%s, headscaleNodeId=%s, timestamp=%s", msg.NodeID, msg.HeadscaleNodeID, msg.Timestamp)
+	return p.publishMessage(ctx, msg, timestamp)
+}
 
-	// 1. Publish to Pub/Sub for real-time UI updates
-	if err := p.client.Publish(ctx, p.pubSubChannel, msg); err != nil {
-		return fmt.Errorf("failed to publish to pub/sub: %w", err)
-	}
-	p.debug("heartbeat: pub/sub publish successful")
-
-	// 2. Add to Stream for reliable processing by Python worker
-	// Marshal the full message as payload
+// publishMessage writes one heartbeat to both destinations. It is split out of
+// publishStatus so the write half is testable without a live status collector.
+//
+// The two writes are deliberately asymmetric in BOTH order and severity
+// (citadel-cli#722):
+//
+//   - The durable stream (`node:status:stream`) goes FIRST and owns the error.
+//     It is what the platform's NodeStatusWorker consumes to upsert
+//     fabric_node_status, which is the node's last-reported timestamp, which
+//     fail-closed per-node routing checks before dispatching to this node. If
+//     it does not land, the node leaves the fabric. Writing it first also means
+//     a kill between the two calls still leaves the durable record written.
+//
+//   - The pub/sub publish is best effort. It only feeds live dashboard
+//     freshness (and even that redundantly: the platform worker republishes to
+//     the same org-scoped channel after its DB upsert). A failure here is
+//     reported, never fatal.
+//
+// The previous order made the best-effort write a hard gate on the reliable
+// one: a pub/sub failure returned early, the XADD never ran, and a healthy node
+// read offline for 12 hours.
+func (p *APIPublisher) publishMessage(ctx context.Context, msg StatusMessage, timestamp string) error {
 	payloadJSON, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
@@ -249,14 +267,33 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		"payload":   string(payloadJSON),
 	}
 
-	if err := p.client.StreamAdd(ctx, p.streamName, streamFields, 10000); err != nil {
-		// Log but don't fail - pub/sub already succeeded
-		p.debug("heartbeat: stream add failed: %v", err)
-		p.log("warning", "   - Warning: Stream add failed: %v", err)
-	} else {
+	// 1. Durable stream for reliable processing by the platform worker.
+	// Attempted first; its failure is the only fatal one.
+	streamErr := p.client.StreamAdd(ctx, p.streamName, streamFields, 10000)
+	if streamErr == nil {
 		p.debug("heartbeat: stream add successful")
 	}
 
+	// 2. Best-effort pub/sub for real-time UI updates. Attempted even when the
+	// stream write failed, since the two paths fail independently in API mode.
+	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
+	if pubErr := p.client.Publish(ctx, p.pubSubChannel, msg); pubErr != nil {
+		p.debug("heartbeat: pub/sub publish failed (non-fatal): %v", pubErr)
+		if report, escalate := p.pubSubHealth.recordFailure(time.Now()); escalate {
+			p.log("warning", "   - Warning: heartbeat pub/sub publish to %s failing (%s): %v (live UI updates only; durable status stream unaffected)",
+				p.pubSubChannel, report.describe(), pubErr)
+		}
+	} else {
+		p.debug("heartbeat: pub/sub publish successful")
+		if report, recovered := p.pubSubHealth.recordSuccess(time.Now()); recovered {
+			p.log("info", "   - heartbeat pub/sub publish to %s recovered after %s",
+				p.pubSubChannel, report.describe())
+		}
+	}
+
+	if streamErr != nil {
+		return fmt.Errorf("failed to add to durable stream %s: %w", p.streamName, streamErr)
+	}
 	return nil
 }
 
