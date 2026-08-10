@@ -1543,3 +1543,19 @@ Auto-generated log of every release.
   - fix: drop the committed .wt/gate-5028 worktree gitlink, ignore .wt/ (#714)
 
 
+---
+
+## v2.102.0 — 2026-08-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1711 |
+
+**Changes:**
+
+  - fix(whatsapp): pull the bridge image before up, and report what changed (#718) (#719)
+  - fix(worker): bound the swap rate, and protect a loaded model until it serves (#687) (#716)
+
+
