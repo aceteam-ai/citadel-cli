@@ -266,7 +266,7 @@ func connectWithBackoffLabeled(ctx context.Context, label string, source apiConn
 		if backoff > connectBackoffMax {
 			backoff = connectBackoffMax
 		}
-		if !sleepCtx(ctx, sleep) {
+		if !backoffSleep(ctx, sleep) {
 			return ctx.Err()
 		}
 	}
@@ -300,6 +300,13 @@ func jitter(d time.Duration) time.Duration {
 	delta := float64(d) * 0.2
 	return time.Duration(float64(d) - delta + rand.Float64()*2*delta)
 }
+
+// backoffSleep is the retry loop's sleep, indirected through a var so a test can
+// observe the durations the loop ASKS for instead of measuring wall-clock gaps.
+// Timing-based assertions on a loaded CI box are flaky in the direction that
+// hides a regression: an overloaded machine overshoots a short sleep enough to
+// look like a long one, so a hot loop can pass. Defaults to sleepCtx.
+var backoffSleep = sleepCtx
 
 // sleepCtx sleeps for d or until ctx is cancelled. Returns true if the full
 // sleep elapsed, false if the context was cancelled first (so backoff loops
@@ -625,6 +632,10 @@ func runWork(cmd *cobra.Command, args []string) {
 	// mode has no such split). Read by the worker-liveness payload so
 	// `citadel status` can show a node stuck on the HTTP fallback (issue #723).
 	var pubSubTransportFn func() string
+	// wsRetryDone closes when the background WebSocket connect retry finishes.
+	// Post-connect wiring that runs LATER in startup (push-wake) waits on it so a
+	// late connect still gets armed. nil outside API mode.
+	var wsRetryDone <-chan struct{}
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -750,7 +761,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// blip left pub/sub on the (broken) HTTP fallback for the whole process
 		// lifetime, with only a Debug line to show for it (issue #723).
 		apiClient := apiSource.Client()
-		enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, Log)
+		wsRetryDone = enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, workerWSLog)
 		pubSubTransportFn = apiClient.PubSubTransport
 
 		source = apiSource
@@ -1048,6 +1059,11 @@ func runWork(cmd *cobra.Command, args []string) {
 				// subscribe failure just leaves this node correctly poll-only.
 				if err := src.EnableWake(ctx, wakeChannel); err != nil {
 					Debug("per-node push-wake unavailable (poll-only): %v", err)
+					// The WebSocket may not be up YET -- its connect retries in
+					// the background (#723). Re-arm the wake when it lands;
+					// otherwise a node that started during a control-plane blip
+					// recovers its heartbeat but stays poll-only for good.
+					armWakeAfterWebSocket(ctx, wsRetryDone, src, wakeChannel, workerWSLog)
 				}
 			case *worker.RedisSource:
 				if err := src.AddQueue(ctx, perNodeQueue); err != nil {

@@ -1781,8 +1781,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		// real-time pub/sub for the life of the process. Retries in the
 		// background with backoff/jitter, honoring any 429 retry_after.
 		enableWebSocketWithRetry(ctx, wsConnector{client: apiSource.Client()},
-			func(format string, args ...any) {
-				activity("warning", fmt.Sprintf(format, args...))
+			func(level, format string, args ...any) {
+				activity(level, fmt.Sprintf(format, args...))
 			})
 
 		source = apiSource

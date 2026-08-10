@@ -29,6 +29,12 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 )
 
+// wsLogFunc reports retry progress at a severity the caller's log sink
+// understands. Levels used: "warning" for the degrade, "info" for the recovery.
+// The worker's Log() ignores the level (it has one stream); the control center's
+// activity() renders it, so a recovery does not surface there as a warning.
+type wsLogFunc func(level, format string, args ...any)
+
 // wsConnector adapts a redisapi.Client's WebSocket enablement to the
 // apiConnector interface connectWithBackoff retries against.
 //
@@ -61,7 +67,7 @@ func (w wsConnector) Connect(ctx context.Context) error {
 // The returned channel closes when the retry loop has finished (immediately
 // when no loop was needed). Production callers ignore it; it exists so a test
 // can join the goroutine instead of sleeping and guessing.
-func enableWebSocketWithRetry(ctx context.Context, conn apiConnector, logf func(string, ...any)) <-chan struct{} {
+func enableWebSocketWithRetry(ctx context.Context, conn apiConnector, logf wsLogFunc) <-chan struct{} {
 	done := make(chan struct{})
 
 	err := conn.Connect(ctx)
@@ -70,7 +76,7 @@ func enableWebSocketWithRetry(ctx context.Context, conn apiConnector, logf func(
 		return done
 	}
 
-	logf("pub/sub WebSocket unavailable, falling back to HTTP and retrying in background: %v", err)
+	logf("warning", "pub/sub WebSocket unavailable, falling back to HTTP and retrying in background: %v", err)
 
 	go func() {
 		defer close(done)
@@ -78,8 +84,65 @@ func enableWebSocketWithRetry(ctx context.Context, conn apiConnector, logf func(
 			// The only non-nil return is context cancellation (clean shutdown).
 			return
 		}
-		logf("pub/sub WebSocket connected on retry; publishes are back on the real-time transport")
+		logf("info", "pub/sub WebSocket connected on retry; publishes are back on the real-time transport")
 	}()
 
 	return done
+}
+
+// wakeEnabler is the subset of worker.APISource armWakeAfterWebSocket needs.
+type wakeEnabler interface {
+	EnableWake(ctx context.Context, channel string) error
+}
+
+// armWakeAfterWebSocket re-arms per-node push-wake once a background WebSocket
+// connect finally lands.
+//
+// Push-wake (#7270) is one-shot post-connect setup: APISource.EnableWake
+// registers a "message" handler and subscribes to the node's wake channel, and
+// it refuses when the WebSocket is not connected. Before #723 that check could
+// only ever see the startup verdict, because the verdict was permanent. Now the
+// WebSocket can come up minutes later -- and because a late connect goes through
+// Connect rather than reconnect, WSClient's OnReconnect callbacks do NOT fire,
+// so nothing would re-run this wiring.
+//
+// Without this, a node that started during a control-plane blip would recover
+// its heartbeat (visible) but stay poll-only forever (invisible, and reported as
+// a healthy "websocket" transport) -- the same class of silent partial failure
+// #723 is about.
+//
+// No-op when the retry already finished: EnableWake was then called against the
+// final state and there is nothing further to wait for.
+func armWakeAfterWebSocket(ctx context.Context, wsRetryDone <-chan struct{}, src wakeEnabler, channel string, logf wsLogFunc) {
+	if wsRetryDone == nil || src == nil || channel == "" {
+		return
+	}
+	select {
+	case <-wsRetryDone:
+		return
+	default:
+	}
+
+	go func() {
+		select {
+		case <-wsRetryDone:
+		case <-ctx.Done():
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err := src.EnableWake(ctx, channel); err != nil {
+			logf("warning", "per-node push-wake still unavailable after the WebSocket retry (staying poll-only): %v", err)
+			return
+		}
+		logf("info", "per-node push-wake armed after WebSocket recovery: %s", channel)
+	}()
+}
+
+// workerWSLog adapts the worker's single-stream Log() to wsLogFunc. The level is
+// dropped deliberately: latest.log has no severity column, and the point of
+// #723 is that these lines appear AT ALL (they used to be Debug-only).
+func workerWSLog(_ string, format string, args ...any) {
+	Log(format, args...)
 }

@@ -60,10 +60,10 @@ type logCollector struct {
 	lines []string
 }
 
-func (l *logCollector) logf(format string, args ...any) {
+func (l *logCollector) logf(level, format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+	l.lines = append(l.lines, level+": "+fmt.Sprintf(format, args...))
 }
 
 func (l *logCollector) contains(sub string) bool {
@@ -160,50 +160,67 @@ func TestEnableWebSocketWithRetry_SucceedsFirstTry(t *testing.T) {
 // TestEnableWebSocketWithRetry_BacksOffRatherThanHotLooping is the #443 guard:
 // the retry must not become a tight dial loop that burns the node's daily
 // Redis-API quota and self-DoSes the node it is trying to reconnect.
+//
+// It asserts on the durations the loop REQUESTS rather than the gaps it
+// achieves. Wall-clock gaps are flaky in the dangerous direction: a loaded
+// machine overshoots a 20ms sleep to 87ms, which is indistinguishable from a
+// correct 80ms backoff, so a hot-loop regression would pass.
 func TestEnableWebSocketWithRetry_BacksOffRatherThanHotLooping(t *testing.T) {
-	// Deliberately NOT withFastBackoff: this test asserts on growth, so it needs
-	// bounds it controls precisely.
 	origInitial, origMax := connectBackoffInitial, connectBackoffMax
 	connectBackoffInitial = 20 * time.Millisecond
 	connectBackoffMax = time.Second
 	t.Cleanup(func() { connectBackoffInitial, connectBackoffMax = origInitial, origMax })
 
+	var mu sync.Mutex
+	var requested []time.Duration
+	origSleep := backoffSleep
+	backoffSleep = func(ctx context.Context, d time.Duration) bool {
+		mu.Lock()
+		requested = append(requested, d)
+		mu.Unlock()
+		return ctx.Err() == nil
+	}
+	t.Cleanup(func() { backoffSleep = origSleep })
+
+	requestedCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(requested)
+	}
+
 	conn := &recordingConnector{failures: 1 << 30} // never succeeds
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := enableWebSocketWithRetry(ctx, conn, func(string, ...any) {})
-	defer func() { <-done }()
+	done := enableWebSocketWithRetry(ctx, conn, func(string, string, ...any) {})
 
-	// Attempt 1 is the synchronous one; the background loop then attempts
-	// immediately and sleeps 20/40/80ms (+/-20% jitter) between its own tries.
-	// Five attempts is ~140ms of sleeping.
-	if !waitFor(t, 3*time.Second, func() bool { return conn.attempts() >= 5 }) {
-		t.Fatalf("only %d attempts; the retry loop is not running", conn.attempts())
+	if !waitFor(t, 3*time.Second, func() bool { return requestedCount() >= 4 }) {
+		t.Fatalf("loop requested %d sleeps; it is hot-looping or not running", requestedCount())
 	}
 	cancel()
+	<-done
 
-	gaps := conn.gaps()
-	if len(gaps) < 4 {
-		t.Fatalf("recorded %d gaps, want >= 4", len(gaps))
-	}
+	mu.Lock()
+	got := append([]time.Duration(nil), requested[:4]...)
+	mu.Unlock()
 
-	// gaps[0] spans the synchronous attempt to the loop's first attempt (no
-	// sleep by design). Every gap after that must be at least the jittered floor
-	// of its nominal backoff (jitter is +/-20%, so 0.8x). A hot loop shows gaps
-	// near zero throughout.
+	// Nominal 20/40/80/160ms, each jittered by +/-20%.
 	nominal := connectBackoffInitial
-	for i := 1; i <= 3; i++ {
-		floor := time.Duration(float64(nominal) * 0.8)
-		if gaps[i] < floor {
-			t.Errorf("gap %d = %s, want >= %s (hot loop: backoff is not being applied)", i, gaps[i], floor)
+	for i, d := range got {
+		lo := time.Duration(float64(nominal) * 0.8)
+		hi := time.Duration(float64(nominal) * 1.2)
+		if d < lo || d > hi {
+			t.Errorf("sleep %d = %s, want within [%s, %s] of the %s backoff step", i, d, lo, hi, nominal)
 		}
 		nominal *= 2
 	}
 
-	// And the backoff must actually GROW, not stay flat at the initial value.
-	if gaps[3] <= gaps[1] {
-		t.Errorf("backoff is not growing: gap 1 = %s, gap 3 = %s", gaps[1], gaps[3])
+	// Jitter is +/-20%, so consecutive doubling steps cannot overlap: growth
+	// must be strictly monotonic. A flat backoff (or none) fails here.
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Errorf("backoff is not growing: sleep %d = %s, sleep %d = %s", i-1, got[i-1], i, got[i])
+		}
 	}
 }
 
@@ -226,7 +243,7 @@ func TestEnableWebSocketWithRetry_HonorsRateLimitRetryAfter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := enableWebSocketWithRetry(ctx, conn, func(string, ...any) {})
+	done := enableWebSocketWithRetry(ctx, conn, func(string, string, ...any) {})
 	defer func() { <-done }()
 
 	// One attempt happens synchronously, one more from the loop's first pass;
@@ -246,7 +263,7 @@ func TestEnableWebSocketWithRetry_StopsOnContextCancel(t *testing.T) {
 	conn := &recordingConnector{failures: 1 << 30}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	done := enableWebSocketWithRetry(ctx, conn, func(string, ...any) {})
+	done := enableWebSocketWithRetry(ctx, conn, func(string, string, ...any) {})
 	waitFor(t, time.Second, func() bool { return conn.attempts() >= 2 })
 	cancel()
 
@@ -269,23 +286,103 @@ func TestEnableWebSocketWithRetry_StopsOnContextCancel(t *testing.T) {
 // direct-Redis mode, no worker at all) would invent an outage.
 func TestParsePubSubTransport(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
-		want string
-		ok   bool
+		name  string
+		body  string
+		want  string
+		state pubSubProbeState
 	}{
-		{"websocket", `{"worker":{"consuming":true,"pubsub_transport":"websocket"}}`, "websocket", true},
-		{"http fallback", `{"worker":{"consuming":true,"pubsub_transport":"http"}}`, "http", true},
-		{"no worker section", `{"version":"v1"}`, "", false},
-		{"older worker, field absent", `{"worker":{"consuming":true}}`, "", false},
-		{"malformed", `not json`, "", false},
+		{"websocket", `{"worker":{"consuming":true,"pubsub_transport":"websocket"}}`, "websocket", pubSubProbeOK},
+		{"http fallback", `{"worker":{"consuming":true,"pubsub_transport":"http"}}`, "http", pubSubProbeOK},
+		{"no worker section", `{"version":"v1"}`, "", pubSubProbeNotReported},
+		{"older worker, field absent", `{"worker":{"consuming":true}}`, "", pubSubProbeNotReported},
+		{"malformed", `not json`, "", pubSubProbeUnreachable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := parsePubSubTransport([]byte(tc.body))
-			if got != tc.want || ok != tc.ok {
-				t.Errorf("parsePubSubTransport(%s) = (%q, %v), want (%q, %v)", tc.body, got, ok, tc.want, tc.ok)
+			got, state := parsePubSubTransport([]byte(tc.body))
+			if got != tc.want || state != tc.state {
+				t.Errorf("parsePubSubTransport(%s) = (%q, %v), want (%q, %v)", tc.body, got, state, tc.want, tc.state)
 			}
 		})
+	}
+}
+
+// fakeWakeEnabler records EnableWake calls and fails until allowed to succeed.
+type fakeWakeEnabler struct {
+	mu       sync.Mutex
+	calls    []string
+	failWith error
+}
+
+func (f *fakeWakeEnabler) EnableWake(_ context.Context, channel string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, channel)
+	return f.failWith
+}
+
+func (f *fakeWakeEnabler) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// TestArmWakeAfterWebSocket_ArmsOnceTheRetryLands is the partial-fix guard: a
+// late WebSocket connect goes through Connect, not reconnect, so OnReconnect
+// callbacks never fire and push-wake would stay off forever on a node that
+// started during a control-plane blip -- while `citadel status` reported a
+// healthy "websocket" transport.
+func TestArmWakeAfterWebSocket_ArmsOnceTheRetryLands(t *testing.T) {
+	wsRetry := make(chan struct{})
+	src := &fakeWakeEnabler{}
+	logs := &logCollector{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armWakeAfterWebSocket(ctx, wsRetry, src, "node:wake:42", logs.logf)
+
+	if got := src.callCount(); got != 0 {
+		t.Fatalf("EnableWake called %d time(s) before the WebSocket landed, want 0", got)
+	}
+
+	close(wsRetry)
+
+	if !waitFor(t, 2*time.Second, func() bool { return src.callCount() == 1 }) {
+		t.Fatalf("push-wake was never re-armed after the WebSocket retry landed (calls=%d)", src.callCount())
+	}
+	if !waitFor(t, 2*time.Second, func() bool { return logs.contains("armed after WebSocket recovery") }) {
+		t.Error("re-arm was not logged")
+	}
+}
+
+// TestArmWakeAfterWebSocket_NoopWhenRetryAlreadyFinished: the caller already
+// invoked EnableWake against the final state, so there is nothing to wait for.
+func TestArmWakeAfterWebSocket_NoopWhenRetryAlreadyFinished(t *testing.T) {
+	wsRetry := make(chan struct{})
+	close(wsRetry)
+	src := &fakeWakeEnabler{}
+
+	armWakeAfterWebSocket(context.Background(), wsRetry, src, "node:wake:42", func(string, string, ...any) {})
+
+	time.Sleep(30 * time.Millisecond)
+	if got := src.callCount(); got != 0 {
+		t.Errorf("EnableWake called %d time(s), want 0 (retry had already finished)", got)
+	}
+}
+
+// TestArmWakeAfterWebSocket_StopsOnShutdown: a cancelled context must not leave
+// a goroutine waiting on a channel that will never close.
+func TestArmWakeAfterWebSocket_StopsOnShutdown(t *testing.T) {
+	wsRetry := make(chan struct{})
+	src := &fakeWakeEnabler{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	armWakeAfterWebSocket(ctx, wsRetry, src, "node:wake:42", func(string, string, ...any) {})
+	cancel()
+
+	time.Sleep(50 * time.Millisecond)
+	if got := src.callCount(); got != 0 {
+		t.Errorf("EnableWake called %d time(s) after shutdown, want 0", got)
 	}
 }

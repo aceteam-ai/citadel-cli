@@ -176,12 +176,16 @@ func printWorkerInfo(w io.Writer) {
 // reported as "unknown" rather than guessed at -- claiming "http" here when we
 // simply could not ask would be a worse lie than saying nothing.
 func printPubSubInfo(w io.Writer) {
-	transport, ok := probeWorkerPubSubTransport()
+	transport, state := probeWorkerPubSubTransport()
 	label := labelColor.Sprint("Pub/Sub:")
 	switch {
-	case !ok:
+	case state == pubSubProbeUnreachable:
 		fmt.Fprintf(w, "  %s\t%s\n", label,
-			faintColor.Sprint("unknown (worker status server not reachable on loopback)"))
+			faintColor.Sprint("unknown (worker status server not reachable on loopback; "+
+				"enable it with --status-port or --gateway)"))
+	case state == pubSubProbeNotReported:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (worker reports no pub/sub transport: not API mode, or an older build)"))
 	case transport == redisapi.PubSubTransportWebSocket:
 		fmt.Fprintf(w, "  %s\t%s\n", label, goodColor.Sprint("websocket (real-time)"))
 	case transport == redisapi.PubSubTransportHTTP:
@@ -192,18 +196,31 @@ func printPubSubInfo(w io.Writer) {
 	}
 }
 
+// pubSubProbeState distinguishes the two ways the transport can be unknown, so
+// the status line says WHY rather than implying a verdict it did not obtain.
+type pubSubProbeState int
+
+const (
+	pubSubProbeOK pubSubProbeState = iota
+	// pubSubProbeUnreachable: no answer on loopback. The worker's status server
+	// is opt-in (--status-port / --gateway), so this is the common case.
+	pubSubProbeUnreachable
+	// pubSubProbeNotReported: the server answered but carried no transport --
+	// direct-Redis mode (no WebSocket/HTTP split) or a pre-#723 build.
+	pubSubProbeNotReported
+)
+
 // probeWorkerPubSubTransport GETs the running worker's /status over loopback and
-// returns worker.pubsub_transport. ok=false when the server is unreachable or
-// the field is absent (older worker, or direct-Redis mode, which has no split).
-func probeWorkerPubSubTransport() (string, bool) {
+// returns worker.pubsub_transport.
+func probeWorkerPubSubTransport() (string, pubSubProbeState) {
 	port := resolveStatusPort()
 	if port <= 0 {
-		return "", false
+		return "", pubSubProbeUnreachable
 	}
 	body, ok := httpGetBody(&http.Client{Timeout: 2 * time.Second},
 		fmt.Sprintf("http://127.0.0.1:%d/status", port))
 	if !ok {
-		return "", false
+		return "", pubSubProbeUnreachable
 	}
 	return parsePubSubTransport(body)
 }
@@ -211,19 +228,19 @@ func probeWorkerPubSubTransport() (string, bool) {
 // parsePubSubTransport extracts worker.pubsub_transport from a /status payload.
 // Split out from the fetch so the "older worker / no worker / malformed" cases
 // are unit-testable without a live status server.
-func parsePubSubTransport(body []byte) (string, bool) {
+func parsePubSubTransport(body []byte) (string, pubSubProbeState) {
 	var payload struct {
 		Worker *struct {
 			PubSubTransport string `json:"pubsub_transport"`
 		} `json:"worker"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", false
+		return "", pubSubProbeUnreachable
 	}
 	if payload.Worker == nil || payload.Worker.PubSubTransport == "" {
-		return "", false
+		return "", pubSubProbeNotReported
 	}
-	return payload.Worker.PubSubTransport, true
+	return payload.Worker.PubSubTransport, pubSubProbeOK
 }
 
 // runInteractiveDashboard runs the interactive TUI dashboard
