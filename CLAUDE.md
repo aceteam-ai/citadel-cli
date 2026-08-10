@@ -736,6 +736,21 @@ sibling services too. Anything reasoning about "is THIS service up" must filter 
 container name rather than trusting project scoping — see #692, which this stale
 doc helped hide.
 
+### WhatsApp bridge deploys must pull (#718)
+
+The bridge compose pins a FLOATING tag, so `docker compose up -d` alone can never
+upgrade it: with that tag already present locally, compose sees an unchanged
+config and an unchanged image ID and does nothing — while `whatsapp.Provision`
+went on to report `already_linked` success on the stale image. `startBridgeStack`
+(`cmd/whatsapp.go`) owns the rule: pull the `bridge` service, then up. The pull is
+best-effort (a node without `docker login` still serves its cached image) but
+never silent — `whatsapp.ProvisionDeps.BridgeImageID` samples the RUNNING
+CONTAINER's image before and after the deploy, and `ProvisionResult` carries
+`Upgraded` + both IDs + `ImagePullError`. The `status` string deliberately still
+has only two values (`provisioned` / `already_linked`): the aceteam backend
+branches on `status == "already_linked"` by equality, so upgrade information is
+additive, never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
+
 ### Bonsai service (PrismML Bonsai-27B, 1-bit)
 
 Bonsai-27B is PrismML's 1-bit quantized Qwen3.6-27B. The `bonsai` service serves

@@ -263,3 +263,94 @@ func TestWhatsAppProvisionOmitsEmptyCertFields(t *testing.T) {
 		t.Errorf("cert_refresh_url must be omitted when empty, got %v", doc["cert_refresh_url"])
 	}
 }
+
+// TestWhatsAppProvisionReportsUpgrade verifies the #718 contract: an upgrade and
+// a no-op re-provision must be distinguishable in the returned document. `status`
+// keeps its original values (the aceteam backend branches on
+// `status == "already_linked"` by equality), so the signal rides on `upgraded`
+// plus the two image IDs.
+func TestWhatsAppProvisionReportsUpgrade(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "u", APIKey: "k", Tenant: "default", AlreadyLinked: true,
+				ImageIDBefore: "sha256:af88f094", ImageIDAfter: "sha256:8fc94272", Upgraded: true,
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if doc["status"] != "already_linked" {
+		t.Errorf("status = %v, want already_linked (the value the backend equality-checks)", doc["status"])
+	}
+	if doc["upgraded"] != true {
+		t.Errorf("upgraded = %v, want true", doc["upgraded"])
+	}
+	if doc["image_id_before"] != "sha256:af88f094" || doc["image_id_after"] != "sha256:8fc94272" {
+		t.Errorf("image ids = %v / %v, want the before/after pair", doc["image_id_before"], doc["image_id_after"])
+	}
+	if _, ok := doc["image_pull_error"]; ok {
+		t.Errorf("image_pull_error present on a successful pull: %v", doc["image_pull_error"])
+	}
+}
+
+// TestWhatsAppProvisionReportsNoOp is the other half: the exact scenario from the
+// issue -- a two-second already_linked on an unchanged image -- must now say so.
+func TestWhatsAppProvisionReportsNoOp(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "u", APIKey: "k", Tenant: "default", AlreadyLinked: true,
+				ImageIDBefore: "sha256:af88f094", ImageIDAfter: "sha256:af88f094",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if doc["upgraded"] != false {
+		t.Errorf("upgraded = %v, want false for an unchanged image", doc["upgraded"])
+	}
+	if doc["image_id_before"] != doc["image_id_after"] {
+		t.Errorf("image ids should match on a no-op, got %v / %v", doc["image_id_before"], doc["image_id_after"])
+	}
+}
+
+// TestWhatsAppProvisionSurfacesPullError verifies a failed image pull rides the
+// contract (non-fatal, but never invisible), and that unknown image IDs are
+// omitted rather than emitted as empty strings.
+func TestWhatsAppProvisionSurfacesPullError(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "u", APIKey: "k", Tenant: "default", QR: "2@payload",
+				ImagePullError: "docker compose pull failed: unauthorized",
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success: a pull failure must not fail the provision", res.Status)
+	}
+	doc := decodeOutput(t, res)
+	if doc["image_pull_error"] != "docker compose pull failed: unauthorized" {
+		t.Errorf("image_pull_error = %v, want the pull error", doc["image_pull_error"])
+	}
+	if doc["upgraded"] != false {
+		t.Errorf("upgraded = %v, want false", doc["upgraded"])
+	}
+	if _, ok := doc["image_id_before"]; ok {
+		t.Errorf("image_id_before should be omitted when unknown, got %v", doc["image_id_before"])
+	}
+	if _, ok := doc["image_id_after"]; ok {
+		t.Errorf("image_id_after should be omitted when unknown, got %v", doc["image_id_after"])
+	}
+}

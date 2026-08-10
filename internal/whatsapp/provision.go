@@ -60,11 +60,37 @@ type ProvisionDeps struct {
 	ServicesDir func() (string, error)
 
 	// DeployCompose ensures the bridge compose is materialized into servicesDir
-	// and started (docker compose up -d) with the given env. It mirrors the
-	// resolve-source + write-compose + composeUp steps of `citadel whatsapp up`.
-	// It must fail fast (never hang) when Docker is unavailable or the private
-	// module repo cannot be cloned for lack of credentials.
+	// and started (docker compose pull + up -d) with the given env. It mirrors the
+	// resolve-source + write-compose + composePull + composeUp steps of
+	// `citadel whatsapp up`. It must fail fast (never hang) when Docker is
+	// unavailable or the private module repo cannot be cloned for lack of
+	// credentials.
+	//
+	// It MUST refresh the bridge image before starting. The compose pins a
+	// floating `:latest` tag, so a bare `up -d` with that tag already present
+	// locally is a no-op and a provisioned bridge can never be upgraded
+	// (aceteam-ai/citadel-cli#718).
 	DeployCompose func(servicesDir string, env map[string]string) error
+
+	// BridgeImageID reports the docker image ID (sha256:...) the bridge container
+	// is CURRENTLY running, or "" when the bridge is not running or Docker is
+	// unavailable. Provision samples it immediately before and immediately after
+	// DeployCompose so the result can distinguish a real upgrade from a no-op
+	// re-provision (#718). It must read the RUNNING CONTAINER's image, not the
+	// local tag: after a pull the tag already points at the new image while the
+	// container still runs the old one until it is recreated, so a tag-derived
+	// value would report an upgrade that did not happen. Nil leaves the image
+	// fields empty and Upgraded false (never a fabricated "upgraded").
+	BridgeImageID func() string
+
+	// ImagePullError returns the error text of the image pull DeployCompose
+	// attempted, or "" when it succeeded (or was not attempted). A pull failure
+	// is deliberately NOT fatal -- a node without `docker login` for the private
+	// registry can still run its locally cached image, and failing would regress
+	// re-provisions that work today -- but it MUST be visible, because a pull
+	// that silently did nothing is exactly the false-green #718 is about. Nil
+	// leaves ProvisionResult.ImagePullError empty.
+	ImagePullError func() string
 
 	// NewBridgeClient builds a BridgeClient for the locally running bridge at the
 	// given loopback port using the admin key.
@@ -164,6 +190,26 @@ type ProvisionResult struct {
 	// from on rotation: http://<mesh-ip>:<status-port>/gateway-cert.pem. Empty when
 	// the node is off-mesh or the status server's port is unknown.
 	CertRefreshURL string
+	// ImageIDBefore is the docker image ID the bridge container was running before
+	// the deploy, or "" when the bridge was not running (a first deploy) or the
+	// image could not be read. Together with ImageIDAfter it makes the outcome
+	// legible: an `already_linked` result on an unchanged image is a no-op, not an
+	// upgrade (aceteam-ai/citadel-cli#718).
+	ImageIDBefore string
+	// ImageIDAfter is the docker image ID the bridge container is running after the
+	// deploy, or "" when it could not be read.
+	ImageIDAfter string
+	// Upgraded is true only when BOTH image IDs were readable AND they differ --
+	// i.e. the deploy actually moved the bridge onto a new image. A first deploy
+	// (no "before" container) and an unreadable image both report false: an
+	// unknown is never reported as an upgrade.
+	Upgraded bool
+	// ImagePullError is the error text of the pre-deploy image pull, or "" when it
+	// succeeded or was not attempted. Non-empty means the bridge is running the
+	// locally cached image and an upgrade could NOT have happened -- the provision
+	// still succeeds (the bridge is up and linked), but the caller must not read
+	// that success as "running the latest image".
+	ImagePullError string
 }
 
 // persistedBridgePort returns the bridge's previously-persisted BRIDGE_PORT from
@@ -281,6 +327,15 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	// treat a bind-collision as recoverable: re-select a fresh free port and
 	// retry a bounded number of times. An explicit operator override is never
 	// silently moved -- its bind error surfaces as-is.
+	// Sample the image the bridge is running BEFORE the deploy. Paired with the
+	// post-deploy sample below this is what lets a caller tell a real upgrade from
+	// a no-op `up -d` (aceteam-ai/citadel-cli#718). Best-effort: "" (bridge not
+	// running / Docker unreadable) simply means "unknown", never "upgraded".
+	imageIDBefore := ""
+	if deps.BridgeImageID != nil {
+		imageIDBefore = deps.BridgeImageID()
+	}
+
 	const maxDeployAttempts = 4
 	autoSelected := req.Port <= 0
 	for attempt := 1; ; attempt++ {
@@ -301,6 +356,27 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 			return nil, fmt.Errorf("retry after host-port collision on %d: %w", port, serr)
 		}
 		port = next
+	}
+
+	// Sample the image again now the deploy has returned. Compare on the CONTAINER's
+	// image, so "upgraded" means the container was actually recreated onto a new
+	// image -- not merely that a newer tag was pulled into the local store.
+	imageIDAfter := ""
+	if deps.BridgeImageID != nil {
+		imageIDAfter = deps.BridgeImageID()
+	}
+	upgraded := imageIDBefore != "" && imageIDAfter != "" && imageIDBefore != imageIDAfter
+	pullErr := ""
+	if deps.ImagePullError != nil {
+		pullErr = deps.ImagePullError()
+	}
+	switch {
+	case pullErr != "":
+		log("warning: could not refresh the bridge image (%s); the bridge is running its locally cached image, so this provision could NOT have upgraded it", pullErr)
+	case upgraded:
+		log("bridge image upgraded: %s -> %s", imageIDBefore, imageIDAfter)
+	case imageIDAfter != "" && imageIDBefore != "":
+		log("bridge image unchanged (%s); already up to date", imageIDAfter)
 	}
 
 	// Recompute the mesh api_url from the port we actually published on (a
@@ -372,10 +448,14 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 	}
 
 	result := &ProvisionResult{
-		APIURL: apiURL,
-		APIKey: tenantKey,
-		Tenant: tenant,
-		Port:   port,
+		APIURL:         apiURL,
+		APIKey:         tenantKey,
+		Tenant:         tenant,
+		Port:           port,
+		ImageIDBefore:  imageIDBefore,
+		ImageIDAfter:   imageIDAfter,
+		Upgraded:       upgraded,
+		ImagePullError: pullErr,
 	}
 	// Publish the gateway cert (so the backend can trust the https api_url) and the
 	// plaintext refresh URL (so it re-fetches on rotation). Both deps are optional:

@@ -361,3 +361,173 @@ func TestProvisionCertFieldsEmptyOffMeshOrNoTLS(t *testing.T) {
 		t.Errorf("cert fields should be empty when deps are nil, got pem=%q url=%q", res2.GatewayCertPEM, res2.CertRefreshURL)
 	}
 }
+
+// --- image upgrade legibility (aceteam-ai/citadel-cli#718) -------------------
+
+// scriptedImageID returns a BridgeImageID stub that yields the given values in
+// order (the first call is the pre-deploy sample, the second the post-deploy
+// one) and records how many times it was called.
+func scriptedImageID(values ...string) (func() string, *int) {
+	calls := 0
+	return func() string {
+		v := ""
+		if calls < len(values) {
+			v = values[calls]
+		}
+		calls++
+		return v
+	}, &calls
+}
+
+// TestProvisionImageUpgradeDetection pins the upgraded-vs-unchanged contract:
+// `already_linked` must stop being indistinguishable from a real upgrade. An
+// UNKNOWN image (bridge not previously running, Docker unreadable, dep absent)
+// must never be reported as an upgrade.
+func TestProvisionImageUpgradeDetection(t *testing.T) {
+	tests := []struct {
+		name         string
+		images       []string // successive BridgeImageID() results; nil = no dep
+		nilDep       bool
+		wantUpgraded bool
+		wantBefore   string
+		wantAfter    string
+	}{
+		{
+			name:         "recreated onto a new image",
+			images:       []string{"sha256:af88f094", "sha256:8fc94272"},
+			wantUpgraded: true,
+			wantBefore:   "sha256:af88f094",
+			wantAfter:    "sha256:8fc94272",
+		},
+		{
+			name:         "no-op re-provision on the same image",
+			images:       []string{"sha256:af88f094", "sha256:af88f094"},
+			wantUpgraded: false,
+			wantBefore:   "sha256:af88f094",
+			wantAfter:    "sha256:af88f094",
+		},
+		{
+			name:         "first deploy has no before image",
+			images:       []string{"", "sha256:8fc94272"},
+			wantUpgraded: false,
+			wantBefore:   "",
+			wantAfter:    "sha256:8fc94272",
+		},
+		{
+			name:         "unreadable after image is unknown, not an upgrade",
+			images:       []string{"sha256:af88f094", ""},
+			wantUpgraded: false,
+			wantBefore:   "sha256:af88f094",
+			wantAfter:    "",
+		},
+		{
+			name:         "nil dep degrades to unknown",
+			nilDep:       true,
+			wantUpgraded: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+			deps, _ := baseDeps(t, bridge)
+			var calls *int
+			if !tt.nilDep {
+				deps.BridgeImageID, calls = scriptedImageID(tt.images...)
+			}
+
+			res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+			if err != nil {
+				t.Fatalf("Provision() error = %v", err)
+			}
+			if res.Upgraded != tt.wantUpgraded {
+				t.Errorf("Upgraded = %v, want %v", res.Upgraded, tt.wantUpgraded)
+			}
+			if res.ImageIDBefore != tt.wantBefore {
+				t.Errorf("ImageIDBefore = %q, want %q", res.ImageIDBefore, tt.wantBefore)
+			}
+			if res.ImageIDAfter != tt.wantAfter {
+				t.Errorf("ImageIDAfter = %q, want %q", res.ImageIDAfter, tt.wantAfter)
+			}
+			// The already-linked path must still carry the image fields: that
+			// combination (already_linked + unchanged image) IS the false-green.
+			if !res.AlreadyLinked {
+				t.Error("AlreadyLinked = false, want true for this fixture")
+			}
+			if calls != nil && *calls != 2 {
+				t.Errorf("BridgeImageID called %d times, want exactly 2 (before + after deploy)", *calls)
+			}
+		})
+	}
+}
+
+// TestProvisionSamplesImageAroundDeploy pins the ORDER: the "before" sample must
+// be taken before DeployCompose runs and the "after" sample after it returns.
+// Sampling both afterwards would always report "unchanged" and re-hide the bug.
+func TestProvisionSamplesImageAroundDeploy(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, _ := baseDeps(t, bridge)
+
+	var order []string
+	deps.DeployCompose = func(servicesDir string, env map[string]string) error {
+		order = append(order, "deploy")
+		return nil
+	}
+	deps.BridgeImageID = func() string {
+		order = append(order, "image")
+		return ""
+	}
+
+	if _, err := Provision(context.Background(), ProvisionRequest{}, deps); err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	want := []string{"image", "deploy", "image"}
+	if len(order) != len(want) {
+		t.Fatalf("call order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("call order = %v, want %v", order, want)
+		}
+	}
+}
+
+// TestProvisionSurfacesImagePullError verifies a failed image pull does NOT fail
+// the provision (the cached image still serves) but IS reported, so a caller can
+// never read "provisioned" as "running the latest image".
+func TestProvisionSurfacesImagePullError(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, deployed := baseDeps(t, bridge)
+	deps.BridgeImageID = func() string { return "sha256:af88f094" }
+	deps.ImagePullError = func() string { return "docker compose pull failed: unauthorized" }
+
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v, want the provision to survive a pull failure", err)
+	}
+	if !*deployed {
+		t.Error("expected DeployCompose to still run after a pull failure")
+	}
+	if res.ImagePullError != "docker compose pull failed: unauthorized" {
+		t.Errorf("ImagePullError = %q, want the injected pull error", res.ImagePullError)
+	}
+	if res.Upgraded {
+		t.Error("Upgraded = true, want false: a failed pull cannot have upgraded anything")
+	}
+}
+
+// TestProvisionNoPullErrorWhenPullSucceeded is the negative half: an empty
+// ImagePullError must not be turned into a spurious warning field.
+func TestProvisionNoPullErrorWhenPullSucceeded(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, _ := baseDeps(t, bridge)
+	deps.ImagePullError = func() string { return "" }
+
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if res.ImagePullError != "" {
+		t.Errorf("ImagePullError = %q, want empty", res.ImagePullError)
+	}
+}
