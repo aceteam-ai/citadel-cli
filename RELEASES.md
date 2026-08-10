@@ -1559,3 +1559,21 @@ Auto-generated log of every release.
   - fix(worker): bound the swap rate, and protect a loaded model until it serves (#687) (#716)
 
 
+---
+
+## v2.103.0 — 2026-08-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 20 |
+| Lines added | +2512 |
+
+**Changes:**
+
+  - fix(heartbeat): write the durable status stream before the best-effort pub/sub (#731)
+  - fix(redisapi): decode the responses the fabric redis routes actually send (#727)
+  - fix(pubsub): retry the WebSocket connect instead of giving up after one try (#723) (#732)
+  - fix(redisapi): serialize websocket writes with a dedicated mutex (#725)
+
+
