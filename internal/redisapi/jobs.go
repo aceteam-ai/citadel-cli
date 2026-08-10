@@ -71,17 +71,19 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 }
 
 // AcknowledgeJob acknowledges a successfully processed job.
+//
+// A 2xx is the ack. The route's `acknowledged` field is XACK's return value, so
+// it is false whenever the message was already out of the consumer group's PEL
+// — a duplicate ack, which is a no-op and not an error. Treating it as failure
+// (the pre-#721 behaviour, which additionally read a `success` field the route
+// never sent) made every HTTP ack report failure.
 func (c *Client) AcknowledgeJob(ctx context.Context, req AcknowledgeRequest) error {
 	var resp AcknowledgeResponse
-	err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/jobs/acknowledge", req, &resp)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/jobs/acknowledge", req, &resp); err != nil {
 		return err
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("acknowledge failed: %s", resp.Message)
-	}
-
+	c.debug("acknowledge: message %s on %s (acknowledged=%v)", req.MessageID, req.Queue, resp.Acknowledged)
 	return nil
 }
 

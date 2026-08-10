@@ -241,22 +241,48 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
 	}
 
-	// Handle error responses
+	// Handle error responses.
+	//
+	// Every error here carries method, path, HTTP status and the (truncated)
+	// response body, because the callers of this package deliberately no longer
+	// second-guess a 2xx (see pubsub.go): this error string is the ONLY record of
+	// why a call failed. Issue #721 was slow to diagnose precisely because the
+	// old strings dropped the status and the path.
+	//
+	// The literal "status %d" substring is load-bearing: contains404 greps for it
+	// so FetchWorkerConfig can fall back to defaults on a 404. Keep it verbatim.
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
 		if err := json.Unmarshal(respBody, &apiErr); err == nil && apiErr.Error != "" {
 			apiErr.StatusCode = resp.StatusCode
-			return fmt.Errorf("API error: %s", apiErr.Err())
+			return fmt.Errorf("%s %s failed with status %d: API error: %s", method, path, resp.StatusCode, apiErr.Err())
 		}
-		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(respBody))
 	}
 
 	// Parse success response
 	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("failed to parse response: %w", err)
+			return fmt.Errorf("%s %s returned status %d with an unparseable body (%s): %w",
+				method, path, resp.StatusCode, truncateBody(respBody), err)
 		}
 	}
 
 	return nil
+}
+
+// maxErrorBodyBytes bounds how much of a response body is quoted into an error
+// string. Enough to carry a JSON error payload, small enough that a stray HTML
+// error page does not flood the log.
+const maxErrorBodyBytes = 512
+
+// truncateBody renders a response body for inclusion in an error message.
+func truncateBody(body []byte) string {
+	if len(body) == 0 {
+		return "<empty body>"
+	}
+	if len(body) > maxErrorBodyBytes {
+		return string(body[:maxErrorBodyBytes]) + fmt.Sprintf("... (%d bytes total)", len(body))
+	}
+	return string(body)
 }
