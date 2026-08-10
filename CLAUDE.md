@@ -740,11 +740,11 @@ doc helped hide.
 
 The bridge compose pins a FLOATING tag, so `docker compose up -d` alone can never
 upgrade it: with that tag already present locally, compose sees an unchanged
-config and an unchanged image ID and does nothing — while `whatsapp.Provision`
+config and an unchanged image ID and does nothing, while `whatsapp.Provision`
 went on to report `already_linked` success on the stale image. `startBridgeStack`
 (`cmd/whatsapp.go`) owns the rule: pull the `bridge` service, then up. The pull is
 best-effort (a node without `docker login` still serves its cached image) but
-never silent — `whatsapp.ProvisionDeps.BridgeImageID` samples the RUNNING
+never silent: `whatsapp.ProvisionDeps.BridgeImageID` samples the RUNNING
 CONTAINER's image before and after the deploy, and `ProvisionResult` carries
 `Upgraded` + both IDs + `ImagePullError`. The `status` string deliberately still
 has only two values (`provisioned` / `already_linked`): the aceteam backend
