@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,29 @@ func newDrainingWSServer(t *testing.T) *httptest.Server {
 		}
 	}))
 	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newWedgedWSServer returns an httptest server that completes the WebSocket
+// handshake and then never reads, so the client's socket buffers fill and its
+// writes block for real.
+func newWedgedWSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		<-release
+	}))
+	// Cleanups run LIFO, so the handler is released before the server is shut
+	// down; otherwise srv.Close() would block waiting on the parked handler.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
 	return srv
 }
 
@@ -158,18 +182,7 @@ func TestCloseDuringConcurrentWrites(t *testing.T) {
 // an error rather than parking. Without the deadline they park forever and this
 // test fails on its own timeout.
 func TestWedgedWriteTimesOutInsteadOfParkingPublishers(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		<-release // never read: let the socket buffers fill
-	}))
-	defer srv.Close()
-	defer close(release)
+	srv := newWedgedWSServer(t)
 
 	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
 	c.reconnectEnabled = false
@@ -220,4 +233,69 @@ func TestWedgedWriteTimesOutInsteadOfParkingPublishers(t *testing.T) {
 	if failed == 0 {
 		t.Fatal("expected the wedged socket to surface a write error, got none")
 	}
+}
+
+// TestCloseReturnsWhileWriterIsWedged exercises the tryLockWrite timeout branch,
+// which the other Close test never reaches (its writes complete in
+// microseconds, so Close always takes writeMu on the first try).
+//
+// Here a writer is genuinely stuck holding writeMu with a write timeout far
+// longer than the test. Close must give up on the close handshake and shut down
+// anyway rather than block behind it, which is the guarantee #312 established
+// and the one most at risk from making Close take the write lock at all.
+func TestCloseReturnsWhileWriterIsWedged(t *testing.T) {
+	srv := newWedgedWSServer(t)
+
+	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
+	c.reconnectEnabled = false
+	// Long enough that the wedged writer will not release writeMu on its own
+	// during this test: Close has to break the tie.
+	c.writeTimeout = 60 * time.Second
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	payload := map[string]any{"blob": strings.Repeat("v", 1<<18)}
+
+	var completed atomic.Int64
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			if err := c.Publish(context.Background(), "wedged", payload); err != nil {
+				return
+			}
+			completed.Add(1)
+		}
+	}()
+
+	// Wait for the writer to stop making progress, i.e. to be blocked inside
+	// WriteMessage holding writeMu.
+	prev := int64(-1)
+	for range 100 {
+		time.Sleep(50 * time.Millisecond)
+		cur := completed.Load()
+		if cur > 0 && cur == prev {
+			break
+		}
+		prev = cur
+	}
+	if completed.Load() == 0 {
+		t.Fatal("writer never completed a publish; the fixture is not wedging")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Errorf("close: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close blocked behind a wedged writer; the bounded acquire is not working (#312)")
+	}
+
+	<-writerDone
 }
