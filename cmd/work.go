@@ -208,6 +208,15 @@ type apiConnector interface {
 // context is cancelled (clean shutdown), never on a connect failure -- the
 // process stays up and keeps retrying rather than dying into a restart storm.
 func connectWithBackoff(ctx context.Context, source apiConnector) error {
+	return connectWithBackoffLabeled(ctx, "Redis API", source)
+}
+
+// connectWithBackoffLabeled is connectWithBackoff with the subject named in the
+// log lines, so a second caller (the WebSocket pub/sub connect, issue #723) can
+// reuse the exact same retry policy -- exponential backoff with jitter, 429
+// retry_after honored in full, ctx-aware chunked sleeps -- without its failures
+// reading as control-plane failures in the journal. One scheme, one place.
+func connectWithBackoffLabeled(ctx context.Context, label string, source apiConnector) error {
 	backoff := connectBackoffInitial
 	attempt := 0
 	for {
@@ -219,7 +228,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 		err := source.Connect(ctx)
 		if err == nil {
 			if attempt > 1 {
-				Log("connected to Redis API after %d attempt(s)", attempt)
+				Log("connected to %s after %d attempt(s)", label, attempt)
 			}
 			return nil
 		}
@@ -242,8 +251,8 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 				wait = backoff
 			}
 			backoff = connectBackoffInitial
-			Log("Redis API rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
-				rle.Limit, rle.Window, wait, err)
+			Log("%s rate limited (limit=%d window=%q); honoring server backoff of %s before retry: %v",
+				label, rle.Limit, rle.Window, wait, err)
 			if !sleepUntilCtx(ctx, time.Now().Add(wait)) {
 				return ctx.Err()
 			}
@@ -252,7 +261,7 @@ func connectWithBackoff(ctx context.Context, source apiConnector) error {
 
 		// Generic transient failure: exponential backoff with jitter.
 		sleep := jitter(backoff)
-		Log("Redis API connect failed (attempt %d), retrying in %s: %v", attempt, sleep, err)
+		Log("%s connect failed (attempt %d), retrying in %s: %v", label, attempt, sleep, err)
 		backoff *= 2
 		if backoff > connectBackoffMax {
 			backoff = connectBackoffMax
@@ -611,6 +620,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	var useAPIMode bool
 	var apiSource *worker.APISource               // Keep reference for heartbeat
 	var setNodeMeta func(nodeID, nodeName string) // Set after node identity is resolved
+	// pubSubTransportFn reports the transport Publish is currently using
+	// ("websocket" or "http"). Set only in API mode; nil elsewhere (direct-Redis
+	// mode has no such split). Read by the worker-liveness payload so
+	// `citadel status` can show a node stuck on the HTTP fallback (issue #723).
+	var pubSubTransportFn func() string
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -728,13 +742,16 @@ func runWork(cmd *cobra.Command, args []string) {
 			return
 		}
 
-		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses)
-		if err := apiSource.Client().EnableWebSocket(ctx); err != nil {
-			// WebSocket is optional - fall back to HTTP
-			Debug("WebSocket not available, using HTTP for pub/sub: %v", err)
-		} else {
-			Debug("WebSocket enabled for real-time pub/sub")
-		}
+		// Enable WebSocket for real-time pub/sub (heartbeat, streaming responses).
+		//
+		// A failed connect here is NOT terminal: it retries in the background
+		// with the same backoff/jitter/429 treatment as the control-plane
+		// connect above. Before that, one unlucky attempt during a control-plane
+		// blip left pub/sub on the (broken) HTTP fallback for the whole process
+		// lifetime, with only a Debug line to show for it (issue #723).
+		apiClient := apiSource.Client()
+		enableWebSocketWithRetry(ctx, wsConnector{client: apiClient}, Log)
+		pubSubTransportFn = apiClient.PubSubTransport
 
 		source = apiSource
 		streamFactory = worker.CreateAPIStreamWriterFactory(ctx, apiSource)
@@ -1167,7 +1184,14 @@ func runWork(cmd *cobra.Command, args []string) {
 	// "green but wedged" node (heartbeating from a separate goroutine while the
 	// consume loop is blocked and draining nothing).
 	workerLivenessFn := func() *status.WorkerLiveness {
-		return workerLivenessFrom(workerState.Snapshot())
+		live := workerLivenessFrom(workerState.Snapshot())
+		// Pub/sub transport is read live off the API client rather than mirrored
+		// through WorkerState: it can flip at any moment (background retry
+		// succeeds, connection drops) and a snapshot field would go stale.
+		if pubSubTransportFn != nil {
+			live.PubSubTransport = pubSubTransportFn()
+		}
+		return live
 	}
 
 	// Create status collector (used by status server and Redis status publisher)

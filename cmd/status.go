@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/resmon"
 	statuspkg "github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
@@ -36,6 +38,7 @@ var (
 	goodColor     = color.New(color.FgGreen)
 	warnColor     = color.New(color.FgYellow)
 	badColor      = color.New(color.FgRed)
+	faintColor    = color.New(color.Faint)
 	labelColor    = color.New(color.Bold)
 	interactiveUI bool // Flag to enable interactive TUI dashboard
 	statusJSON    bool // Flag to output JSON format
@@ -155,6 +158,72 @@ func printWorkerInfo(w io.Writer) {
 		}
 	}
 	fmt.Fprintf(w, "  %s\t%s (%s)\n", labelColor.Sprint("Status:"), goodColor.Sprint("running"), detail)
+	printPubSubInfo(w)
+}
+
+// printPubSubInfo reports which transport the running worker's pub/sub
+// publishes are using (issue #723).
+//
+// This is the line that would have ended a twelve-hour outage in seconds. A
+// worker whose startup WebSocket connect failed silently degraded to the HTTP
+// publish fallback -- which does not work (citadel-cli#721) -- and nothing
+// anywhere said so: the failure was logged at Debug, and every other status
+// signal read healthy.
+//
+// Read over loopback from the worker's own status server, so it reflects the
+// live process rather than a file written at startup. Best-effort: the status
+// server is opt-in (--status-port / --gateway), so an unreachable server is
+// reported as "unknown" rather than guessed at -- claiming "http" here when we
+// simply could not ask would be a worse lie than saying nothing.
+func printPubSubInfo(w io.Writer) {
+	transport, ok := probeWorkerPubSubTransport()
+	label := labelColor.Sprint("Pub/Sub:")
+	switch {
+	case !ok:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (worker status server not reachable on loopback)"))
+	case transport == redisapi.PubSubTransportWebSocket:
+		fmt.Fprintf(w, "  %s\t%s\n", label, goodColor.Sprint("websocket (real-time)"))
+	case transport == redisapi.PubSubTransportHTTP:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			warnColor.Sprint("HTTP fallback: real-time pub/sub is DOWN (heartbeat may not reach the platform)"))
+	default:
+		fmt.Fprintf(w, "  %s\t%s\n", label, transport)
+	}
+}
+
+// probeWorkerPubSubTransport GETs the running worker's /status over loopback and
+// returns worker.pubsub_transport. ok=false when the server is unreachable or
+// the field is absent (older worker, or direct-Redis mode, which has no split).
+func probeWorkerPubSubTransport() (string, bool) {
+	port := resolveStatusPort()
+	if port <= 0 {
+		return "", false
+	}
+	body, ok := httpGetBody(&http.Client{Timeout: 2 * time.Second},
+		fmt.Sprintf("http://127.0.0.1:%d/status", port))
+	if !ok {
+		return "", false
+	}
+	return parsePubSubTransport(body)
+}
+
+// parsePubSubTransport extracts worker.pubsub_transport from a /status payload.
+// Split out from the fetch so the "older worker / no worker / malformed" cases
+// are unit-testable without a live status server.
+func parsePubSubTransport(body []byte) (string, bool) {
+	var payload struct {
+		Worker *struct {
+			PubSubTransport string `json:"pubsub_transport"`
+		} `json:"worker"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", false
+	}
+	if payload.Worker == nil || payload.Worker.PubSubTransport == "" {
+		return "", false
+	}
+	return payload.Worker.PubSubTransport, true
 }
 
 // runInteractiveDashboard runs the interactive TUI dashboard

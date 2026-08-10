@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,8 +22,24 @@ type Client struct {
 	httpClient *http.Client
 	workerID   string
 
-	// WebSocket client for real-time pub/sub (optional)
+	// wsClient is the WebSocket client for real-time pub/sub. It is built once
+	// in NewClient and NEVER reassigned or nil'd afterwards.
+	//
+	// It used to be created lazily by EnableWebSocket and set back to nil when
+	// the connect failed, which is what made a single failed connect permanent:
+	// with no object left there was nothing to retry (issue #723). Owning it for
+	// the Client's whole life means EnableWebSocket is a safe, idempotent
+	// "connect if not connected" that a background retry loop can call, and the
+	// field is immutable so readers (Publish) need no lock.
+	//
+	// Connected-ness, not existence, is the gate everywhere: a non-nil wsClient
+	// that has never dialed reports IsConnected()==false and Publish falls back
+	// to HTTP exactly as before.
 	wsClient *WSClient
+
+	// closed is set by Close so a retry loop that is still in flight cannot
+	// resurrect the WebSocket after shutdown has begun.
+	closed atomic.Bool
 
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
@@ -58,7 +75,7 @@ func NewClient(cfg ClientConfig) *Client {
 		cfg.Timeout = 30 * time.Second
 	}
 
-	return &Client{
+	c := &Client{
 		baseURL: cfg.BaseURL,
 		token:   cfg.Token,
 		httpClient: &http.Client{
@@ -67,6 +84,18 @@ func NewClient(cfg ClientConfig) *Client {
 		workerID:  fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
 		debugFunc: cfg.DebugFunc,
 	}
+
+	// Build the WebSocket client up front (it does not dial until Connect).
+	// See the wsClient field comment: owning it for the Client's lifetime is
+	// what makes a failed connect retryable instead of terminal (issue #723).
+	c.wsClient = NewWSClient(WSClientConfig{
+		BaseURL:          cfg.BaseURL,
+		Token:            cfg.Token,
+		ReconnectEnabled: true,
+		DebugFunc:        cfg.DebugFunc,
+	})
+
+	return c
 }
 
 // debug logs a message if debug function is configured
@@ -125,33 +154,66 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Close closes the HTTP client and WebSocket if connected.
 func (c *Client) Close() error {
+	c.closed.Store(true)
 	if c.wsClient != nil {
 		return c.wsClient.Close()
 	}
 	return nil
 }
 
+// ErrClientClosed is returned by EnableWebSocket once Close has run, so a
+// background retry loop that outlives shutdown cannot re-dial a closed client.
+var ErrClientClosed = errors.New("redis API client is closed")
+
 // EnableWebSocket connects the WebSocket client for real-time pub/sub.
 // This allows Publish calls to use WebSocket instead of HTTP when connected.
+//
+// It is idempotent and safe to call repeatedly: when already connected it is a
+// no-op, and when not connected it makes exactly one dial attempt and reports
+// the outcome. That is deliberate -- the caller owns the retry policy (see
+// cmd/work.go's enableWebSocketWithRetry, issue #723) so a failed connect backs
+// off instead of hot-looping and never leaves the client permanently HTTP-only.
+//
+// On failure the WebSocket client is retained (not nil'd), so the very next
+// call can succeed.
 func (c *Client) EnableWebSocket(ctx context.Context) error {
-	if c.wsClient != nil && c.wsClient.IsConnected() {
+	if c.closed.Load() {
+		return ErrClientClosed
+	}
+	if c.wsClient == nil {
+		return fmt.Errorf("WebSocket client not initialized")
+	}
+	if c.wsClient.IsConnected() {
 		return nil
 	}
 
-	c.wsClient = NewWSClient(WSClientConfig{
-		BaseURL:          c.baseURL,
-		Token:            c.token,
-		ReconnectEnabled: true,
-		DebugFunc:        c.debugFunc,
-	})
-
 	if err := c.wsClient.Connect(ctx); err != nil {
-		c.wsClient = nil
 		return fmt.Errorf("failed to connect WebSocket: %w", err)
 	}
 
 	c.debug("WebSocket enabled for real-time pub/sub")
 	return nil
+}
+
+// Pub/sub transport names reported by PubSubTransport.
+const (
+	PubSubTransportWebSocket = "websocket"
+	PubSubTransportHTTP      = "http"
+)
+
+// PubSubTransport reports which transport Publish will currently use:
+// "websocket" when the real-time connection is up, "http" when it is not and
+// publishes fall back to the REST route.
+//
+// This exists so the degraded state is visible without a debugger: a node whose
+// startup WebSocket connect failed used to be indistinguishable from a healthy
+// one at default log level (issue #723). Surfaced through the worker liveness
+// payload and `citadel status`.
+func (c *Client) PubSubTransport() string {
+	if c.IsWebSocketConnected() {
+		return PubSubTransportWebSocket
+	}
+	return PubSubTransportHTTP
 }
 
 // WebSocket returns the WebSocket client if enabled, nil otherwise.
