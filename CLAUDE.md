@@ -971,6 +971,38 @@ and `citadel services`).
 - The TUI control center collector is not yet fed `PinnedServices` (heartbeat and
   `citadel services` are); low-priority follow-up.
 
+### Model Hotswap: residency invariant and swap rate bound (citadel #632, #687)
+
+With `CITADEL_MODEL_HOTSWAP` on, an inference request for an installed-but-absent
+engine triggers a swap (`internal/worker/swap.go`, `SwapManager`). Two rules
+decide whether a swap may take VRAM from a resident engine, both in
+`filterResidencyProtected`:
+
+- The min-residency floor, and on top of it the **served-once invariant**: an
+  engine that has had no request dispatched to it since it became ready is not
+  evictable yet. A load that served nothing was pure waste, and the floor alone
+  was shorter than a real load (a measured 78s load under a 60s floor), so a
+  model could become evictable before it finished loading.
+- The ceiling on that protection is the engine's **own load time** —
+  `unservedResidencyCeilingLocked` prefers a load this node has actually MEASURED
+  (`MeasuredLoad`) over the coarse table in `defaultLoadEstimate`.
+
+An engine with no `readyAt` record — operator-started, or resident since before
+the worker started — is protected by neither, deliberately: "we have no record"
+must not read as "recently loaded", or a worker restart would make every
+long-resident engine unevictable.
+
+**The rate bound** (`checkSwapRate`, ledger in `swap_ledger.go`) counts swaps that
+actually EVICTED something, so a node starting engines into its own free VRAM is
+never limited. At the ceiling the node REFUSES: `SwapRateLimitedError` becomes a
+job **failure** carrying `reason: "swap_rate_limited"`, not a `model_warming`
+success — refusing honestly beats thrashing politely, and a node that quietly
+warmed forever is indistinguishable from broken hardware.
+
+The knobs are package vars (so tests need not sleep an hour) with the shipped
+values pinned by `TestSwapAccountingDefaults` — change them there. The ledger is
+in-process: the bound resets on restart, so a crash-looping worker can exceed it.
+
 ### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
 
 A hung job handler must never silently stall the whole node. The wedge that

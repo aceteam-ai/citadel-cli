@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -142,6 +144,24 @@ func (c *swapController) Ready(ctx context.Context, backend string) bool {
 		}
 	}
 	return false
+}
+
+// ObserveSwap logs the per-swap record and the running counter that
+// citadel-cli#687 asks the node to emit. Before this, an alternating two-model
+// workload could spend most of its wall clock loading rather than serving and
+// nothing anywhere counted it — the operator saw only "everything is slow".
+//
+// The eviction ceiling is included on every line so the log says how close the
+// node is to refusing, not just what it has done.
+func (c *swapController) ObserveSwap(rec worker.SwapRecord, stats worker.SwapStats) {
+	evicted := "none"
+	if len(rec.Evicted) > 0 {
+		evicted = strings.Join(rec.Evicted, ",")
+	}
+	c.logf("[hotswap] swap %s model=%s outcome=%s evicted=%s wait=%s "+
+		"(swaps this hour: %d, evicting: %d/%d)",
+		rec.Backend, rec.Model, rec.Outcome, evicted, rec.Wait.Round(time.Second),
+		stats.SwapsPerHour, stats.EvictingSwapsPerHour, stats.MaxEvictingPerHour)
 }
 
 // freeVRAMBytesFromGPU sums currently-free VRAM (total-used) across all GPUs that
