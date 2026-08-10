@@ -173,6 +173,27 @@ func TestGetKeyHandlesEmptyStringValue(t *testing.T) {
 	}
 }
 
+func TestGetKeyNormalizesTTLWhenValueAndTTLDisagree(t *testing.T) {
+	// The route reads GET and TTL from a non-atomic Promise.all, so a key that
+	// expires between the two comes back with a real value and a TTL of -2.
+	// -2 is the callers' "absent" signal, so it must not be passed through
+	// alongside a value that is present.
+	srv, _ := newContractServer(t, http.StatusOK,
+		`{"key":"job:cancelled:abc","value":"1","ttl":-2}`)
+	client := newContractClient(srv.URL)
+
+	value, ttl, err := client.GetKey(context.Background(), "job:cancelled:abc")
+	if err != nil {
+		t.Fatalf("GetKey failed: %v", err)
+	}
+	if value != "1" {
+		t.Errorf("value = %q, want %q", value, "1")
+	}
+	if ttl != -1 {
+		t.Errorf("ttl = %d, want -1: a present value must not report the absent sentinel", ttl)
+	}
+}
+
 func TestIsJobCancelledReadsRouteBody(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		srv, _ := newContractServer(t, http.StatusOK,
