@@ -52,10 +52,15 @@ type AcknowledgeRequest struct {
 	MessageID string `json:"messageId"`
 }
 
-// AcknowledgeResponse is the response from POST /api/fabric/redis/jobs/acknowledge
+// AcknowledgeResponse is the response from POST /api/fabric/redis/jobs/acknowledge.
+//
+// The route returns `{ acknowledged: boolean }` where `acknowledged` is
+// `XACK > 0`. It is NOT a success flag: a re-ack of a message already out of the
+// consumer group's PEL is a legitimate 200 with `acknowledged: false`, which the
+// ws_source WS-ack-failed-then-HTTP-retry path produces routinely. Callers must
+// key off the HTTP status, not this field. See #721.
 type AcknowledgeResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
+	Acknowledged bool `json:"acknowledged"`
 }
 
 // PublishRequest is the request body for POST /api/fabric/redis/pubsub/publish
@@ -64,10 +69,14 @@ type PublishRequest struct {
 	Message string `json:"message"` // JSON-encoded payload
 }
 
-// PublishResponse is the response from POST /api/fabric/redis/pubsub/publish
+// PublishResponse is the response from POST /api/fabric/redis/pubsub/publish.
+//
+// The route returns `{ published: true }`. It never sent `success`, so the old
+// `Success` field decoded to false on every successful 200 and the client
+// reported "publish failed" for a publish the server had executed (#721).
+// The field is kept only for logging; success is decided by the HTTP status.
 type PublishResponse struct {
-	Success   bool  `json:"success"`
-	Receivers int64 `json:"receivers,omitempty"`
+	Published bool `json:"published"`
 }
 
 // StreamAddRequest is the request body for POST /api/fabric/redis/streams/add
@@ -78,7 +87,8 @@ type StreamAddRequest struct {
 	Approx bool              `json:"approx,omitempty"`
 }
 
-// StreamAddResponse is the response from POST /api/fabric/redis/streams/add
+// StreamAddResponse is the response from POST /api/fabric/redis/streams/add.
+// This route does send `success`, alongside the Redis stream message ID.
 type StreamAddResponse struct {
 	Success   bool   `json:"success"`
 	MessageID string `json:"messageId,omitempty"`
@@ -89,11 +99,20 @@ type KVGetRequest struct {
 	Key string `json:"key"`
 }
 
-// KVGetResponse is the response from GET /api/fabric/redis/kv
+// KVGetResponse is the response from GET /api/fabric/redis/kv.
+//
+// The route returns `{ key, value, ttl }` and has never sent an `exists` field.
+// The struct used to declare one, so it decoded to false on every response and
+// GetKey reported every key as missing (#721) — which silently disabled
+// mid-job cancellation on API-path nodes, since IsJobCancelled is the only
+// caller. Existence is now derived from `value`/`ttl` inside GetKey.
+//
+// Value is a pointer because the route sends JSON null for a missing key, which
+// is the only way to tell "absent" from "present and empty".
 type KVGetResponse struct {
-	Value  string `json:"value"`
-	TTL    int    `json:"ttl"` // -1 if no TTL, -2 if key doesn't exist
-	Exists bool   `json:"exists"`
+	Key   string  `json:"key"`
+	Value *string `json:"value"`
+	TTL   int     `json:"ttl"` // -1 if no TTL, -2 if key doesn't exist
 }
 
 // KVSetRequest is the request body for POST /api/fabric/redis/kv
@@ -103,16 +122,16 @@ type KVSetRequest struct {
 	TTL   int    `json:"ttl,omitempty"` // TTL in seconds, 0 for no expiry
 }
 
-// KVSetResponse is the response from POST /api/fabric/redis/kv
+// KVSetResponse is the response from POST /api/fabric/redis/kv.
+// This route does send `success`. It does not send a message field.
 type KVSetResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
+	Success bool `json:"success"`
 }
 
-// KVDeleteResponse is the response from DELETE /api/fabric/redis/kv
+// KVDeleteResponse is the response from DELETE /api/fabric/redis/kv.
+// `deleted` is DEL > 0, i.e. false when the key was already absent.
 type KVDeleteResponse struct {
-	Deleted bool   `json:"deleted"`
-	Message string `json:"message,omitempty"`
+	Deleted bool `json:"deleted"`
 }
 
 // APIError represents an error response from the API

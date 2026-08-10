@@ -32,16 +32,17 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 		Message: string(msgJSON),
 	}
 
+	// A 2xx from doRequest IS the ack. The route returns a non-2xx for every
+	// failure it has (403 missing scope, 400 bad channel pattern, 403 org
+	// mismatch), and doRequest turns those into an error carrying the status and
+	// body. Re-checking a body flag on top only creates a second contract that
+	// can drift out of sync with the route — which is exactly what #721 was.
 	var resp PublishResponse
-	err = c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/pubsub/publish", req, &resp)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/pubsub/publish", req, &resp); err != nil {
 		return err
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("publish failed")
-	}
-
+	c.debug("publish: channel %s acked (published=%v)", channel, resp.Published)
 	return nil
 }
 
@@ -128,6 +129,10 @@ func (c *Client) IsJobCancelled(ctx context.Context, jobID string) (bool, error)
 }
 
 // GetKey retrieves a value from Redis KV storage.
+//
+// The returned TTL follows Redis semantics and is the authoritative existence
+// signal for callers: -2 means the key does not exist, -1 means it exists with
+// no expiry, >= 0 is the remaining lifetime in seconds.
 func (c *Client) GetKey(ctx context.Context, key string) (string, int, error) {
 	path := fmt.Sprintf("/api/fabric/redis/kv?key=%s", url.QueryEscape(key))
 
@@ -137,11 +142,19 @@ func (c *Client) GetKey(ctx context.Context, key string) (string, int, error) {
 		return "", -2, err
 	}
 
-	if !resp.Exists {
+	// A JSON null value is the route's "key does not exist". Do not invent an
+	// empty string for it, and do not trust the TTL alone: the route serves GET
+	// and TTL from a non-atomic Promise.all, so a key that expires between the
+	// two reads comes back with a real value and a TTL of -2. Normalize that to
+	// -1 so the "-2 means absent" contract above holds for callers.
+	if resp.Value == nil {
 		return "", -2, nil
 	}
-
-	return resp.Value, resp.TTL, nil
+	ttl := resp.TTL
+	if ttl == -2 {
+		ttl = -1
+	}
+	return *resp.Value, ttl, nil
 }
 
 // SetKey stores a value in Redis KV storage.
@@ -165,14 +178,12 @@ func (c *Client) SetKey(ctx context.Context, key string, value any, ttl int) err
 		TTL:   ttl,
 	}
 
+	// 2xx is the ack; see Publish. This route does send `success: true`, so the
+	// old body check was correct here, but keeping one rule for the whole file
+	// is what stops the next route tweak from silently breaking a caller.
 	var resp KVSetResponse
-	err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/kv", req, &resp)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/kv", req, &resp); err != nil {
 		return err
-	}
-
-	if !resp.Success {
-		return fmt.Errorf("set key failed: %s", resp.Message)
 	}
 
 	return nil
@@ -200,15 +211,13 @@ func (c *Client) StreamAdd(ctx context.Context, stream string, values map[string
 		Approx: true,
 	}
 
+	// 2xx is the ack; see Publish. This route does send `success: true`, so the
+	// old body check was correct here too.
 	var resp StreamAddResponse
-	err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/streams/add", req, &resp)
-	if err != nil {
+	if err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/streams/add", req, &resp); err != nil {
 		return err
 	}
 
-	if !resp.Success {
-		return fmt.Errorf("stream add failed")
-	}
-
+	c.debug("stream add: %s acked (messageId=%s)", stream, resp.MessageID)
 	return nil
 }
