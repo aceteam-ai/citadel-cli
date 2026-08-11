@@ -361,6 +361,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					if action == actionBanner {
 						renderWorkAttach(network.GetStateDir(), running)
 					} else {
+						// stderr (not stdout like the banner): this path is the
+						// non-interactive/systemd default, and a diagnostic notice
+						// belongs on stderr so journald records it as a log line.
 						fmt.Fprintln(os.Stderr, noOpAlreadyRunningMessage(running))
 					}
 					os.Exit(0)
