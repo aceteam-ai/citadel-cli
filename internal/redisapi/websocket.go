@@ -192,10 +192,12 @@ const initialReconnectBackoff = time.Second
 // pongs, torn down every pongWait, reconnecting at one second, forever) has a
 // period dominated by pongWait, not by the backoff. One second of jitter per
 // 46-second cycle random-walks those phases apart far too slowly to matter. Two
-// things would actually address it, both filed rather than done here: not
-// resetting the schedule for a connection that never proved itself, and honoring
-// the typed rate-limit hint that connectLocked already builds and reconnect
-// currently discards.
+// things would actually address it, both filed rather than done here: #746, not
+// resetting the schedule for a connection that never proved itself, and #747,
+// honoring the typed rate-limit hint that connectLocked already builds and
+// reconnect currently discards. #747 outranks this jitter for a 429ing endpoint,
+// because it uses the interval the server actually sent rather than one we
+// invented.
 
 // NewWSClient creates a new WebSocket client.
 func NewWSClient(cfg WSClientConfig) *WSClient {

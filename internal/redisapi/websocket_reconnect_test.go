@@ -50,6 +50,13 @@ import (
 // used to sequence them would establish the happens-before edge that hides the
 // race being asserted. The test therefore asserts nothing itself; the race
 // detector is the assertion.
+//
+// It is ALSO the regression test for #740, which is why it is worth driving the
+// exported Connect rather than connectLocked. Restoring the pre-loopsOnce bare
+// `go c.readLoop()` in Connect makes this test report the exact trace #740 was
+// filed with: two readLoop goroutines inside gorilla's NextReader on the same
+// Conn. Without that, #740 would be closed here with no coverage at all, and a
+// later refactor that dropped loopsOnce would reintroduce it silently.
 func TestConnectRacesKeepaliveTeardownOnTheBackoffSchedule(t *testing.T) {
 	srv := newSilentWSServer(t)
 

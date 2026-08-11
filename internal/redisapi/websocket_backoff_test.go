@@ -28,12 +28,17 @@ import (
 // between them is single-goroutine.
 //
 // The racing goroutine calls connectLocked under connMu, which is exactly what
-// Connect does minus its `go c.readLoop()`. Calling the exported Connect here
-// instead would start a second read loop on the same gorilla Conn, and gorilla
-// permits one concurrent reader just as it permits one concurrent writer. That
-// is a real and separate bug (citadel-cli#740), reachable by the same
-// Connect-during-reconnect overlap; including it would make this test fail for
-// a reason #728 does not fix.
+// Connect does minus its loop startup. That was originally a workaround: on the
+// #728 branch alone, calling the exported Connect here would have started a
+// SECOND read loop on the same gorilla Conn (citadel-cli#740), and the test
+// would have failed for a reason #728 does not fix.
+//
+// #740 is fixed now (loopsOnce), so that constraint is gone and the exported
+// Connect is safe to race. This test is deliberately kept at the accessor level
+// anyway: it is the narrow, fast check that the read-modify-write itself is
+// guarded. TestConnectRacesKeepaliveTeardownOnTheBackoffSchedule in
+// websocket_reconnect_test.go is the wider one, driving the exported Connect
+// against a reconnect that a real read-deadline expiry started.
 func TestReconnectBackoffAccessIsSynchronized(t *testing.T) {
 	srv := newDrainingWSServer(t)
 
