@@ -4,8 +4,10 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -181,8 +183,19 @@ func printPubSubInfo(w io.Writer) {
 	switch {
 	case state == pubSubProbeUnreachable:
 		fmt.Fprintf(w, "  %s\t%s\n", label,
-			faintColor.Sprint("unknown (worker status server not reachable on loopback; "+
-				"enable it with --status-port or --gateway)"))
+			faintColor.Sprint("unknown (nothing is listening on the worker status server's loopback port; "+
+				"it is opt-in, so enable it with --status-port or --gateway)"))
+	case state == pubSubProbeTimedOut:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (the worker status server IS enabled but did not answer in time: "+
+				"the node is busy or the server is wedged, so re-running --status-port/--gateway will not help)"))
+	case state == pubSubProbeMalformed:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (the worker status server answered with a payload this build could not parse)"))
+	case state == pubSubProbeBadStatus:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (the worker status server answered with an error status: it IS running, "+
+				"so check its logs rather than the --status-port/--gateway setting)"))
 	case state == pubSubProbeNotReported:
 		fmt.Fprintf(w, "  %s\t%s\n", label,
 			faintColor.Sprint("unknown (worker reports no pub/sub transport: not API mode, or an older build)"))
@@ -202,27 +215,114 @@ type pubSubProbeState int
 
 const (
 	pubSubProbeOK pubSubProbeState = iota
-	// pubSubProbeUnreachable: no answer on loopback. The worker's status server
-	// is opt-in (--status-port / --gateway), so this is the common case.
+	// pubSubProbeUnreachable: nothing is listening (connection refused, no
+	// route to the port). The worker's status server is opt-in (--status-port /
+	// --gateway), so this is the common case, and the operator action is to
+	// enable it.
 	pubSubProbeUnreachable
+	// pubSubProbeTimedOut: something IS listening but did not answer inside the
+	// probe's bound. The operator action is the OPPOSITE of the above: the
+	// server is already enabled, so telling them to enable it sends them to fix
+	// a setting that is not the problem (citadel-cli#735).
+	pubSubProbeTimedOut
 	// pubSubProbeNotReported: the server answered but carried no transport --
 	// direct-Redis mode (no WebSocket/HTTP split) or a pre-#723 build.
 	pubSubProbeNotReported
+	// pubSubProbeMalformed: the server answered with a body we could not decode.
+	// Distinct from Unreachable: a reply we cannot parse is not an absent server,
+	// and reporting it as one would send the operator to enable something that is
+	// already running.
+	pubSubProbeMalformed
+	// pubSubProbeBadStatus: the server answered with a non-2xx we cannot use (and
+	// that is not the 404 meaning "no such route"). Same reason as the two above
+	// for not folding it into Unreachable: an HTTP status is proof something
+	// answered, so "enable --status-port/--gateway" would be advice to change a
+	// setting that is not the problem.
+	pubSubProbeBadStatus
 )
 
-// probeWorkerPubSubTransport GETs the running worker's /status over loopback and
-// returns worker.pubsub_transport.
+// Probe bounds. Package vars so tests can shrink them rather than sleep.
+var (
+	// pubSubProbeCheapTimeout bounds the /worker probe. /worker reads a cached
+	// field and shells out to nothing, so anything slower than this is a wedged
+	// server, not a busy one.
+	pubSubProbeCheapTimeout = 2 * time.Second
+	// pubSubProbeFullTimeout bounds the /status fallback used against a worker
+	// too old to serve /worker. /status runs a full collection (docker stats per
+	// running service plus nvidia-smi), measured at 1.98-2.67s on a gateway node,
+	// so this must sit well above a realistic sweep. It is a compatibility path:
+	// on a worker that serves /worker it is never reached.
+	pubSubProbeFullTimeout = 10 * time.Second
+)
+
+// probeWorkerPubSubTransport reads worker.pubsub_transport off the running
+// worker over loopback.
+//
+// It asks /worker first. The transport is a single cached field, and coupling it
+// to /status's full collection made the answer a coin flip on exactly the busy
+// gateway nodes the line was written for (citadel-cli#735). /status remains the
+// fallback for a worker predating /worker. Version skew is normal here, since
+// the probing binary is whatever `citadel status` the operator just ran while
+// the serving binary is a long-lived `citadel work` nobody has restarted.
 func probeWorkerPubSubTransport() (string, pubSubProbeState) {
 	port := resolveStatusPort()
 	if port <= 0 {
 		return "", pubSubProbeUnreachable
 	}
-	body, ok := httpGetBody(&http.Client{Timeout: 2 * time.Second},
+
+	body, err := httpGetBodyErr(&http.Client{Timeout: pubSubProbeCheapTimeout},
+		fmt.Sprintf("http://127.0.0.1:%d/worker", port))
+	if err == nil {
+		return parsePubSubTransport(body)
+	}
+	// Only a 404 earns the fallback. 404 is the one status that means "this build
+	// has no /worker route": internal/status.Server.buildMux registers no "/"
+	// catch-all, so an unregistered path is answered by net/http itself. Every
+	// other outcome is either a transport failure that will repeat on /status, or
+	// a server that answered and simply could not serve this. Paying for a full
+	// collection on either buys nothing but the sweep's latency, which is the
+	// cost this whole change exists to avoid.
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
+		return "", classifyProbeError(err)
+	}
+
+	// The server answered but has no /worker route: an older worker. Pay for the
+	// full collection, with a bound above a realistic sweep this time.
+	body, err = httpGetBodyErr(&http.Client{Timeout: pubSubProbeFullTimeout},
 		fmt.Sprintf("http://127.0.0.1:%d/status", port))
-	if !ok {
-		return "", pubSubProbeUnreachable
+	if err != nil {
+		return "", classifyProbeError(err)
 	}
 	return parsePubSubTransport(body)
+}
+
+// classifyProbeError maps a probe failure onto the state whose message names the
+// right operator action. Only a failure to reach anything at all may return
+// Unreachable: that is the one state whose message says "enable the status
+// server", and saying it to someone whose server just answered is the exact
+// conflation citadel-cli#735 is about.
+func classifyProbeError(err error) pubSubProbeState {
+	if isTimeoutError(err) {
+		return pubSubProbeTimedOut
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return pubSubProbeBadStatus
+	}
+	return pubSubProbeUnreachable
+}
+
+// isTimeoutError reports whether err is a deadline/timeout rather than a
+// connection failure. http.Client.Timeout surfaces as a *url.Error whose
+// Timeout() is true; the context check is a belt for the deadline propagated
+// into the request.
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // parsePubSubTransport extracts worker.pubsub_transport from a /status payload.
@@ -235,7 +335,7 @@ func parsePubSubTransport(body []byte) (string, pubSubProbeState) {
 		} `json:"worker"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", pubSubProbeUnreachable
+		return "", pubSubProbeMalformed
 	}
 	if payload.Worker == nil || payload.Worker.PubSubTransport == "" {
 		return "", pubSubProbeNotReported

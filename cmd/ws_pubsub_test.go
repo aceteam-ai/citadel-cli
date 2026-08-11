@@ -295,7 +295,9 @@ func TestParsePubSubTransport(t *testing.T) {
 		{"http fallback", `{"worker":{"consuming":true,"pubsub_transport":"http"}}`, "http", pubSubProbeOK},
 		{"no worker section", `{"version":"v1"}`, "", pubSubProbeNotReported},
 		{"older worker, field absent", `{"worker":{"consuming":true}}`, "", pubSubProbeNotReported},
-		{"malformed", `not json`, "", pubSubProbeUnreachable},
+		// A reply we cannot decode is NOT an absent server: reporting it as one
+		// would tell the operator to enable something already running (#735).
+		{"malformed", `not json`, "", pubSubProbeMalformed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

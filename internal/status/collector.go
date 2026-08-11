@@ -237,6 +237,19 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	return status, nil
 }
 
+// WorkerLivenessSnapshot returns the live worker consume-loop liveness WITHOUT
+// running a collection. Collect() gathers docker stats and nvidia-smi output;
+// this block needs neither (it is an in-memory snapshot plus a live read off the
+// API client), so a caller that only wants liveness must not pay for the sweep
+// (citadel-cli#735). Returns nil when no provider was wired: a status server
+// with no consume loop behind it, not an error.
+func (c *Collector) WorkerLivenessSnapshot() *WorkerLiveness {
+	if c.workerLiveness == nil {
+		return nil
+	}
+	return c.workerLiveness()
+}
+
 // populateServices sets AvailableServices to the sorted list of serving
 // services this build knows how to deploy (the embedded services.ServiceMap
 // keys). It advertises what the binary CAN run, not what is currently

@@ -220,6 +220,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// These route to the status server started by 'citadel work --status-port'
 	gw.AddUpstream("/health", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/status", &gateway.Upstream{Address: statusAddr})
+	// /worker is the cheap liveness read (#735). Routed alongside /status so a
+	// 404 here can only mean "this build predates the route", never "no upstream".
+	gw.AddUpstream("/worker", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/ping", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/services", &gateway.Upstream{Address: statusAddr})
 	gw.AddUpstream("/api/screenshot", &gateway.Upstream{Address: statusAddr})
@@ -265,7 +268,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	listenAddr := fmt.Sprintf("%s:%d", serveBind, servePort)
 	fmt.Printf("   - Gateway: %s://%s\n", scheme, listenAddr)
 	fmt.Println("   - Routes:")
-	fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
+	fmt.Printf("     /health, /status, /worker, /ping -> %s (status server)\n", statusAddr)
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 	fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 	fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)

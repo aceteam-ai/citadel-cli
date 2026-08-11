@@ -182,28 +182,59 @@ func fetchHealth(client *http.Client, port int) string {
 	return payload.Status
 }
 
+// defaultHTTPGetTimeout bounds a probe whose client carries no Timeout of its
+// own.
+const defaultHTTPGetTimeout = 2 * time.Second
+
+// httpStatusError is returned by httpGetBodyErr when the server answered but
+// with a non-2xx. Callers that treat "no such route" (404, an older worker)
+// differently from a transport failure need to tell the two apart (#735).
+type httpStatusError struct{ StatusCode int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("http status %d", e.StatusCode) }
+
 // httpGetBody performs a bounded GET and returns the body on a 2xx, else ok=false.
 func httpGetBody(client *http.Client, url string) ([]byte, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	body, err := httpGetBodyErr(client, url)
+	return body, err == nil
+}
+
+// httpGetBodyErr is httpGetBody with the failure reason preserved.
+//
+// The bound is the CALLER's client.Timeout (defaultHTTPGetTimeout when the
+// client sets none). This used to be a hardcoded 2s context deadline that
+// silently overrode every caller's Timeout, so a caller that needed longer
+// could not have it and would not be told: raising client.Timeout was a no-op,
+// which is what made citadel-cli#735 look like a timeout that had already been
+// widened. Any new caller here must set client.Timeout, not assume 2s.
+func httpGetBodyErr(client *http.Client, url string) ([]byte, error) {
+	if client == nil {
+		client = &http.Client{}
+	}
+	timeout := client.Timeout
+	if timeout <= 0 {
+		timeout = defaultHTTPGetTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, false
+		return nil, &httpStatusError{StatusCode: resp.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-	return body, true
+	return body, nil
 }
 
 // buildAttachBanner renders the discover-and-attach banner. Pure (no IO) so it is
