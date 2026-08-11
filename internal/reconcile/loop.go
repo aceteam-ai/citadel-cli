@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -62,6 +63,8 @@ type Reconciler struct {
 	// plane. When true, a SUCCESSFUL fetch that yields ZERO desired modules while
 	// the node still has installed modules is REFUSED (the pass errors and applies
 	// nothing) instead of letting the authoritative engine uninstall every module.
+	// A refused pass STILL reports its observed actual state (#733): the guard
+	// blocks the destructive apply, not the report.
 	// A fetch FAILURE is already safe (it aborts before the diff); this guards the
 	// distinct "empty backend storage returns 200 with no modules" foot-gun. The
 	// live wiring sets it true; it is off in the zero value so existing engine
@@ -92,9 +95,27 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	// Full-wipe guard: refuse to converge to an empty desired set while modules
 	// are installed (likely an empty/misconfigured control plane), rather than
 	// uninstalling everything the node runs.
+	//
+	// Refusing to APPLY is not a reason to stop OBSERVING (#733). The guard used
+	// to return here, before the report at the bottom of this function, so a node
+	// that tripped it never told the control plane what it had installed. The
+	// destructive path stays refused; the observability path still runs, so an
+	// operator can see the installed set against the empty desired set instead of
+	// only a log line repeating every pass.
 	if r.RefuseFullWipe && len(desired.Modules) == 0 && len(actual) > 0 {
-		return Plan{}, ApplyResult{}, fmt.Errorf(
+		guardErr := fmt.Errorf(
 			"reconcile: refusing empty desired state with %d module(s) installed (possible control-plane misconfiguration)", len(actual))
+		// Report the state the guard OBSERVED (no re-listing: `actual` is that
+		// state, and a re-list would repeat a per-module container inspection
+		// sweep on every refused pass).
+		//
+		// AppliedRevision is deliberately LEFT EMPTY here, unlike the converge
+		// path below: the node did not apply this revision, it refused it.
+		// Stamping it would report a convergence that never happened.
+		reportErr := r.Provider.Report(ctx, ActualState{Node: r.Node, Modules: actual})
+		// The guard error comes first so the refusal stays the headline; a report
+		// failure is additive, never a reason to hide the refusal.
+		return Plan{}, ApplyResult{}, errors.Join(guardErr, reportErr)
 	}
 
 	plan, err := Reconcile(ctx, desired, actual)

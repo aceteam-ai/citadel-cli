@@ -30,8 +30,102 @@ func TestRefuseFullWipeBlocksEmptyDesiredWithInstalled(t *testing.T) {
 			t.Fatalf("full-wipe guard must not uninstall anything, saw %q", c)
 		}
 	}
-	if len(provider.Reported) != 0 {
-		t.Errorf("guard must abort before reporting, got %d reports", len(provider.Reported))
+	// The guard blocks the APPLY, not the report (#733). Reporting is the
+	// observability path: suppressing it left the control plane unable to see the
+	// installed set it was refusing to wipe. Exactly one report per refused pass.
+	if len(provider.Reported) != 1 {
+		t.Fatalf("guard must still report actual state, got %d reports", len(provider.Reported))
+	}
+}
+
+// TestRefuseFullWipeStillReportsActualState is the #733 regression: a refused
+// pass must still tell the control plane what the node has installed. Before the
+// fix the guard returned before BuildActualState/Report, so a node that tripped
+// it reported nothing about its modules for as long as the condition held.
+func TestRefuseFullWipeStillReportsActualState(t *testing.T) {
+	ops := newFakeOps(
+		InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning},
+		InstalledModule{Name: "b", Source: "src-b", Health: HealthStopped},
+	)
+	provider := &FakeProvider{Desired: DesiredState{Revision: "rev-empty"}} // zero modules
+	rec := NewReconciler(provider, ops, "node-7")
+	rec.RefuseFullWipe = true
+
+	if _, _, err := rec.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("expected refusal error for empty desired with modules installed")
+	}
+
+	if len(provider.Reported) != 1 {
+		t.Fatalf("want exactly 1 report from the refused pass, got %d", len(provider.Reported))
+	}
+	report := provider.Reported[0]
+	if report.Node != "node-7" {
+		t.Errorf("report node = %q, want %q", report.Node, "node-7")
+	}
+	if len(report.Modules) != 2 {
+		t.Fatalf("want 2 reported modules, got %d (%+v)", len(report.Modules), report.Modules)
+	}
+	got := map[string]InstalledModule{}
+	for _, m := range report.Modules {
+		got[m.Name] = m
+	}
+	if m, ok := got["a"]; !ok || m.Source != "src-a" || m.Health != HealthRunning {
+		t.Errorf("module a reported as %+v, want source src-a health running", m)
+	}
+	if m, ok := got["b"]; !ok || m.Source != "src-b" || m.Health != HealthStopped {
+		t.Errorf("module b reported as %+v, want source src-b health stopped", m)
+	}
+}
+
+// TestRefuseFullWipeReportOmitsAppliedRevision pins the handshake half of the
+// fix: a refused pass must NOT claim it applied the revision it refused. The
+// converge path stamps AppliedRevision; the guard path deliberately does not, or
+// the control plane would record a convergence that never happened.
+func TestRefuseFullWipeReportOmitsAppliedRevision(t *testing.T) {
+	ops := newFakeOps(InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning})
+	provider := &FakeProvider{Desired: DesiredState{Revision: "rev-42"}} // zero modules
+	rec := NewReconciler(provider, ops, "node-7")
+	rec.RefuseFullWipe = true
+
+	if _, _, err := rec.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("expected refusal error")
+	}
+	if len(provider.Reported) != 1 {
+		t.Fatalf("want exactly 1 report, got %d", len(provider.Reported))
+	}
+	if rev := provider.Reported[0].AppliedRevision; rev != "" {
+		t.Errorf("refused pass reported AppliedRevision %q, want empty (nothing was applied)", rev)
+	}
+}
+
+// TestRefuseFullWipeSurfacesReportFailure confirms a failed report on the guard
+// path does not swallow either error: the refusal stays visible (it is the
+// operator-actionable one) and the report failure is surfaced alongside it, so a
+// node that is refusing AND unable to report is not mistaken for one that is
+// merely refusing.
+func TestRefuseFullWipeSurfacesReportFailure(t *testing.T) {
+	ops := newFakeOps(InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning})
+	provider := &FakeProvider{
+		Desired:   DesiredState{Revision: "rev-empty"},
+		ReportErr: errf("post node-state: 503"),
+	}
+	rec := NewReconciler(provider, ops, "node-7")
+	rec.RefuseFullWipe = true
+
+	_, _, err := rec.ReconcileOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when both the guard trips and the report fails")
+	}
+	if !strings.Contains(err.Error(), "refusing empty desired state") {
+		t.Errorf("refusal must stay visible, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "post node-state: 503") {
+		t.Errorf("report failure must be surfaced, got: %v", err)
+	}
+	for _, c := range ops.calls {
+		if strings.HasPrefix(c, "uninstall:") {
+			t.Fatalf("a failed report must not unblock the apply, saw %q", c)
+		}
 	}
 }
 
