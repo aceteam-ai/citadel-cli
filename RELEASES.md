@@ -1577,3 +1577,20 @@ Auto-generated log of every release.
   - fix(redisapi): serialize websocket writes with a dedicated mutex (#725)
 
 
+---
+
+## v2.104.0 — 2026-08-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 18 |
+| Lines added | +1963 |
+
+**Changes:**
+
+  - fix(status): read pub/sub transport from a cheap /worker endpoint (#738)
+  - fix(redisapi): integrate the backoff-race and keepalive fixes, and jitter the reconnect (#728, #734, #740, #741) (#749)
+  - fix(work): already-running worklock is a benign exit-0 no-op, not a crash-loop (#736) (#744)
+
+
