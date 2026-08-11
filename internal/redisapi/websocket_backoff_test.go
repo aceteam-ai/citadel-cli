@@ -82,10 +82,14 @@ func TestReconnectBackoffAccessIsSynchronized(t *testing.T) {
 // dangerous direction: an overshoot was indistinguishable from a correct wait,
 // so the failure this whole area is about (a backoff that is too SHORT) is
 // exactly the one such a test cannot see.
+// The jitter is stubbed to its zero draw so this keeps pinning the SCHEDULE,
+// which is what it is about. The jitter that sits on top of the schedule has
+// its own tests in websocket_reconnect_test.go.
 func TestNextReconnectDelayAdvancesAndClamps(t *testing.T) {
 	c := NewWSClient(WSClientConfig{BaseURL: "https://example.invalid", Token: "t"})
 	c.reconnectBackoff = 100 * time.Millisecond
 	c.maxBackoff = 400 * time.Millisecond
+	c.jitterFrac = func() float64 { return 0 }
 
 	want := []time.Duration{
 		100 * time.Millisecond,
@@ -125,6 +129,9 @@ func TestNextReconnectDelayAdvancesAtomically(t *testing.T) {
 	// Above the largest expected delay (128ms), so nothing clamps and every
 	// caller in a round must come away with a different value.
 	c.maxBackoff = time.Second
+	// Zero draw: the subject here is the read-modify-write, not the jitter, and
+	// a random addend would blur the distinct-values assertion below.
+	c.jitterFrac = func() float64 { return 0 }
 
 	// A lost doubling needs the two callers to interleave, so one round proves
 	// little. Repeat: rounds are joined, so each one is an independent trial and
@@ -172,6 +179,8 @@ func TestSuccessfulConnectResetsReconnectBackoff(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	c.reconnectBackoff = 42 * time.Second
+	// Zero draw, so the assertion below is on the reset value itself.
+	c.jitterFrac = func() float64 { return 0 }
 
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)

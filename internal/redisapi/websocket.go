@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -91,6 +92,13 @@ type WSClient struct {
 	reconnectBackoff time.Duration
 	maxBackoff       time.Duration
 
+	// jitterFrac draws the randomness nextReconnectDelay adds on top of the
+	// schedule. It is a field rather than a package var so a test can make the
+	// delay deterministic without mutating shared state that a previous test's
+	// still-running reconnect goroutine might be reading. Set once in
+	// NewWSClient, before any goroutine exists. Must return [0,1).
+	jitterFrac func() float64
+
 	// Reconnect callbacks fired after a successful reconnection
 	reconnectCallbacks   []func()
 	reconnectCallbacksMu sync.RWMutex
@@ -139,6 +147,56 @@ type WSMessage struct {
 // one place so the constructor and the reset in connectLocked cannot drift.
 const initialReconnectBackoff = time.Second
 
+// Reconnect jitter.
+//
+// The schedule used to be exactly 1, 2, 4, ... 60 seconds on every node, with no
+// randomness anywhere in this file. Whenever the control plane blips, every node
+// in the fleet is disconnected at nearly the same instant and then redials in
+// lockstep, against an endpoint that answers 429 (typed by rateLimitFromUpgrade
+// above). That is a self-inflicted thundering herd, and the keepalive in #734
+// makes it worse rather than better: handleDisconnect now fires on every
+// read-deadline expiry instead of almost never, so this path runs routinely.
+//
+// The scheme is ADDITIVE and UPWARD-ONLY: the sleep is drawn uniformly from
+// [base, 2*base), where base is the deterministic step. The two textbook
+// alternatives were both rejected for the same reason, which is the only
+// property this package cannot trade away:
+//
+//   - Full jitter, rand(0, base), has a floor of zero. A node that has just been
+//     told 429 could redial milliseconds later, and the mean delay is HALF the
+//     current schedule, so fleet-wide retry pressure doubles. That is the shape
+//     of #443, where tight retries burned the node's daily Redis-API quota and
+//     locked it out for about a day, and it is the direction #728 calls out as
+//     the one that matters. cmd/work.go's rate-limit path already refuses to
+//     "poll tighter than retry_after" for the same reason.
+//   - Decorrelated jitter, min(cap, rand(base, prev*3)), can also return to base
+//     repeatedly, so a long outage can sit near one second indefinitely. It also
+//     wants the previous SLEEP as its state, which would collide with
+//     reconnectBackoff holding the deterministic schedule that connectLocked
+//     resets on a successful dial.
+//
+// Additive jitter is never shorter than what shipped before, and its spread is
+// the full width of the current step, which is exactly enough to decorrelate a
+// fleet whose nodes all hold the same step after a shared blip.
+//
+// The jittered sleep is deliberately NOT clamped to maxBackoff. maxBackoff caps
+// the SCHEDULE, not the sleep. Clamping the result would collapse the spread to
+// zero at the ceiling, which is precisely the worst case: a long control-plane
+// outage puts every node at the cap, and they would all dial together again.
+// The cost is a worst-case sleep of two minutes rather than one, reached only
+// after roughly seven consecutive failed dials, and publishes fall back to HTTP
+// throughout (see Client.Publish).
+//
+// Note what this does NOT fix, so nobody reads more into it than is there: the
+// flap in #734's own "what this makes worse" (a peer that is alive but never
+// pongs, torn down every pongWait, reconnecting at one second, forever) has a
+// period dominated by pongWait, not by the backoff. One second of jitter per
+// 46-second cycle random-walks those phases apart far too slowly to matter. Two
+// things would actually address it, both filed rather than done here: not
+// resetting the schedule for a connection that never proved itself, and honoring
+// the typed rate-limit hint that connectLocked already builds and reconnect
+// currently discards.
+
 // NewWSClient creates a new WebSocket client.
 func NewWSClient(cfg WSClientConfig) *WSClient {
 	reconnectEnabled := cfg.ReconnectEnabled
@@ -159,6 +217,7 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		writeTimeout:     defaultWriteTimeout,
 		pingInterval:     defaultPingInterval,
 		pongWait:         defaultPongWait,
+		jitterFrac:       rand.Float64,
 		debugFunc:        cfg.DebugFunc,
 	}
 }
@@ -487,18 +546,79 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 // The reset has to live in connectLocked, which is the only place that knows a
 // dial succeeded and whose caller already holds connMu, so connMu costs no extra
 // lock and no nested acquire. connMu is NOT held across the sleep.
+//
+// The returned delay is JITTERED; the stored schedule is not. See the jitter
+// note above initialReconnectBackoff for why it is additive and upward-only,
+// and why the returned sleep is deliberately allowed to exceed maxBackoff.
 func (c *WSClient) nextReconnectDelay() time.Duration {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
-	delay := c.reconnectBackoff
+	base := c.reconnectBackoff
 
 	c.reconnectBackoff *= 2
 	if c.reconnectBackoff > c.maxBackoff {
 		c.reconnectBackoff = c.maxBackoff
 	}
 
-	return delay
+	return c.jitteredLocked(base)
+}
+
+// jitteredLocked spreads base over [base, 2*base). Caller holds connMu.
+//
+// Only the RETURNED sleep is randomized. c.reconnectBackoff keeps holding the
+// clean doubling, so the schedule stays predictable, connectLocked's reset still
+// means exactly "back to one second", and nothing accumulates randomness across
+// attempts.
+func (c *WSClient) jitteredLocked(base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	frac := rand.Float64
+	if c.jitterFrac != nil {
+		frac = c.jitterFrac
+	}
+	return base + time.Duration(frac()*float64(base))
+}
+
+// sleepUnlessDone waits for d, returning false if Close happened first (#741).
+//
+// The bare time.Sleep this replaces was not cancellable and, worse, reconnect
+// did not re-check c.done afterwards, so a Close landing during a backoff still
+// let the loop dial and then mark a closed client connected: IsConnected()
+// reported true after Close returned, and the socket it opened was left dangling
+// until the next iteration noticed done and returned without closing it.
+//
+// The window is the whole remaining sleep, so it was widest exactly when the
+// control plane was unhealthy and the schedule had grown to a minute. The
+// keepalive (#734) is what turns this from rare into ordinary: reconnect used to
+// run almost never and now runs on every read-deadline expiry. Jitter can push
+// the sleep to two minutes, which widens the same window again.
+//
+// Not addressed here, and deliberately: connectLocked is still called with
+// context.Background(), so the dial itself is bound only by the 10s handshake
+// timeout rather than by the caller's lifetime. Giving the client a real context
+// is a larger change than this loop.
+func (c *WSClient) sleepUnlessDone(d time.Duration) bool {
+	if d <= 0 {
+		// Still honour a Close that has already happened.
+		select {
+		case <-c.done:
+			return false
+		default:
+			return true
+		}
+	}
+
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-c.done:
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // reconnect attempts to reconnect with exponential backoff
@@ -520,7 +640,9 @@ func (c *WSClient) reconnect() {
 
 		delay := c.nextReconnectDelay()
 		c.debug("ws: attempting reconnect in %v", delay)
-		time.Sleep(delay)
+		if !c.sleepUnlessDone(delay) {
+			return
+		}
 
 		c.connMu.Lock()
 		err := c.connectLocked(context.Background())
