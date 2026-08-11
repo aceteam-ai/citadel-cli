@@ -63,10 +63,14 @@ func newWedgedWSServer(t *testing.T) *httptest.Server {
 
 // newTestWSClient connects a WSClient to srv with reconnection disabled.
 //
-// Reconnect is off on purpose: reconnect() mutates reconnectBackoff without
-// holding connMu, which is a separate (real, unfixed) data race in this file.
-// Letting it run would make -race report something unrelated to the write path
-// under test.
+// Reconnect is off on purpose, so that a test which deliberately wedges or
+// breaks a write exercises only the write path. Several of these tests trigger
+// handleDisconnect, and letting it schedule reconnects would add dial attempts,
+// a second connection and its own goroutines to the picture under test.
+//
+// This used to say reconnect was excluded because it mutated reconnectBackoff
+// unsynchronized. That was true and is now fixed (#728); the field is guarded by
+// connMu and advanced through nextReconnectDelay.
 func newTestWSClient(t *testing.T, srv *httptest.Server) *WSClient {
 	t.Helper()
 
