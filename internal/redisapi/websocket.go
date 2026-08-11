@@ -3,7 +3,10 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -42,6 +45,13 @@ type WSClient struct {
 	// Overridden in tests; see defaultWriteTimeout for the value rationale.
 	writeTimeout time.Duration
 
+	// pingInterval and pongWait drive the keepalive (#734). pongWait is the
+	// read deadline: nothing arriving within it means the socket is dead.
+	// pingInterval is how often we send a ping to provoke traffic. Both are
+	// overridden in tests; see defaultPongWait for the value rationale.
+	pingInterval time.Duration
+	pongWait     time.Duration
+
 	// Message handlers
 	handlers   map[string]func(WSMessage)
 	handlersMu sync.RWMutex
@@ -54,10 +64,40 @@ type WSClient struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// Reconnection settings
+	// loopsOnce guards the background goroutines. readLoop and pingLoop are
+	// deliberately long-lived: they re-read c.conn every iteration, so they
+	// survive a reconnect and must NOT be started per connection. Connect is
+	// callable again whenever connected is false (the #723 retry loop does
+	// exactly that), and without this a second Connect would start a second
+	// reader -- gorilla permits exactly one concurrent reader (#734, #740).
+	loopsOnce sync.Once
+
+	// Reconnection settings.
+	//
+	// reconnectBackoff is guarded by connMu (#728). It is written by
+	// connectLocked, whose caller already holds connMu for write, and it is
+	// advanced by nextReconnectDelay, which takes connMu for the whole
+	// read-modify-write and releases it before the caller sleeps. Nothing may
+	// touch it unlocked: reconnect used to, and a torn or stale read there
+	// shortens a backoff.
+	//
+	// The keepalive (#734) is what makes that guard load-bearing rather than
+	// theoretical: handleDisconnect used to fire almost never, and now fires on
+	// every read-deadline expiry, so the reconnect goroutine advances this
+	// field routinely instead of exotically.
+	//
+	// reconnectEnabled and maxBackoff are set once in NewWSClient and never
+	// written again, so they need no guard.
 	reconnectEnabled bool
 	reconnectBackoff time.Duration
 	maxBackoff       time.Duration
+
+	// jitterFrac draws the randomness nextReconnectDelay adds on top of the
+	// schedule. It is a field rather than a package var so a test can make the
+	// delay deterministic without mutating shared state that a previous test's
+	// still-running reconnect goroutine might be reading. Set once in
+	// NewWSClient, before any goroutine exists. Must return [0,1).
+	jitterFrac func() float64
 
 	// Reconnect callbacks fired after a successful reconnection
 	reconnectCallbacks   []func()
@@ -102,6 +142,63 @@ type WSMessage struct {
 	Data      map[string]string `json:"data,omitempty"`      // Job data fields from stream
 }
 
+// initialReconnectBackoff is the delay before the first reconnect attempt, and
+// the value the schedule returns to after any successful connect. It lives in
+// one place so the constructor and the reset in connectLocked cannot drift.
+const initialReconnectBackoff = time.Second
+
+// Reconnect jitter.
+//
+// The schedule used to be exactly 1, 2, 4, ... 60 seconds on every node, with no
+// randomness anywhere in this file. Whenever the control plane blips, every node
+// in the fleet is disconnected at nearly the same instant and then redials in
+// lockstep, against an endpoint that answers 429 (typed by rateLimitFromUpgrade
+// above). That is a self-inflicted thundering herd, and the keepalive in #734
+// makes it worse rather than better: handleDisconnect now fires on every
+// read-deadline expiry instead of almost never, so this path runs routinely.
+//
+// The scheme is ADDITIVE and UPWARD-ONLY: the sleep is drawn uniformly from
+// [base, 2*base), where base is the deterministic step. The two textbook
+// alternatives were both rejected for the same reason, which is the only
+// property this package cannot trade away:
+//
+//   - Full jitter, rand(0, base), has a floor of zero. A node that has just been
+//     told 429 could redial milliseconds later, and the mean delay is HALF the
+//     current schedule, so fleet-wide retry pressure doubles. That is the shape
+//     of #443, where tight retries burned the node's daily Redis-API quota and
+//     locked it out for about a day, and it is the direction #728 calls out as
+//     the one that matters. cmd/work.go's rate-limit path already refuses to
+//     "poll tighter than retry_after" for the same reason.
+//   - Decorrelated jitter, min(cap, rand(base, prev*3)), can also return to base
+//     repeatedly, so a long outage can sit near one second indefinitely. It also
+//     wants the previous SLEEP as its state, which would collide with
+//     reconnectBackoff holding the deterministic schedule that connectLocked
+//     resets on a successful dial.
+//
+// Additive jitter is never shorter than what shipped before, and its spread is
+// the full width of the current step, which is exactly enough to decorrelate a
+// fleet whose nodes all hold the same step after a shared blip.
+//
+// The jittered sleep is deliberately NOT clamped to maxBackoff. maxBackoff caps
+// the SCHEDULE, not the sleep. Clamping the result would collapse the spread to
+// zero at the ceiling, which is precisely the worst case: a long control-plane
+// outage puts every node at the cap, and they would all dial together again.
+// The cost is a worst-case sleep of two minutes rather than one, reached only
+// after roughly seven consecutive failed dials, and publishes fall back to HTTP
+// throughout (see Client.Publish).
+//
+// Note what this does NOT fix, so nobody reads more into it than is there: the
+// flap in #734's own "what this makes worse" (a peer that is alive but never
+// pongs, torn down every pongWait, reconnecting at one second, forever) has a
+// period dominated by pongWait, not by the backoff. One second of jitter per
+// 46-second cycle random-walks those phases apart far too slowly to matter. Two
+// things would actually address it, both filed rather than done here: #746, not
+// resetting the schedule for a connection that never proved itself, and #747,
+// honoring the typed rate-limit hint that connectLocked already builds and
+// reconnect currently discards. #747 outranks this jitter for a 429ing endpoint,
+// because it uses the interval the server actually sent rather than one we
+// invented.
+
 // NewWSClient creates a new WebSocket client.
 func NewWSClient(cfg WSClientConfig) *WSClient {
 	reconnectEnabled := cfg.ReconnectEnabled
@@ -117,9 +214,12 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		subscriptions:    make(map[string]bool),
 		done:             make(chan struct{}),
 		reconnectEnabled: reconnectEnabled,
-		reconnectBackoff: time.Second,
+		reconnectBackoff: initialReconnectBackoff,
 		maxBackoff:       time.Minute,
 		writeTimeout:     defaultWriteTimeout,
+		pingInterval:     defaultPingInterval,
+		pongWait:         defaultPongWait,
+		jitterFrac:       rand.Float64,
 		debugFunc:        cfg.DebugFunc,
 	}
 }
@@ -144,8 +244,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	// Start read loop
-	go c.readLoop()
+	// Both loops outlive any single connection; see loopsOnce.
+	c.loopsOnce.Do(func() {
+		go c.readLoop()
+		go c.pingLoop()
+	})
 
 	return nil
 }
@@ -185,9 +288,21 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 		return fmt.Errorf("WebSocket connection failed: %w", err)
 	}
 
+	// Arm the keepalive BEFORE publishing the connection (#734).
+	//
+	// SetReadDeadline, SetPongHandler and SetPingHandler are gorilla READ
+	// methods, so they must not run concurrently with ReadMessage. Doing this
+	// while conn is still private -- readLoop cannot see it until c.conn is
+	// assigned under connMu -- is what makes that safe. The handlers only ever
+	// fire from inside ReadMessage afterwards, i.e. on the read goroutine.
+	c.armKeepalive(conn)
+
 	c.conn = conn
 	c.connected = true
-	c.reconnectBackoff = time.Second // Reset backoff on successful connection
+	// Reset the backoff schedule on a successful connection. The caller holds
+	// connMu for write, which is what makes this assignment safe against
+	// nextReconnectDelay running in a reconnect goroutine (#728).
+	c.reconnectBackoff = initialReconnectBackoff
 
 	c.debug("ws: connected successfully")
 
@@ -254,10 +369,25 @@ func (c *WSClient) readLoop() {
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			c.debug("ws: read error: %v", err)
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				// The read deadline expired: nothing at all arrived for
+				// pongWait, not even a pong for our pings. Before #734 this
+				// case did not exist and the loop simply blocked forever, so a
+				// half-open socket stayed "connected" while nothing flowed.
+				c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
+			} else {
+				c.debug("ws: read error: %v", err)
+			}
 			c.handleDisconnect(conn)
 			continue
 		}
+
+		// Any inbound frame is evidence the peer is alive, so extend the
+		// deadline on data too, not just on pongs. That matters if a proxy or
+		// server ever stops honoring ping frames: a busy connection then still
+		// stays up on its own traffic.
+		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -283,6 +413,91 @@ func (c *WSClient) readLoop() {
 
 		if ok {
 			wildcardHandler(msg)
+		}
+	}
+}
+
+// armKeepalive installs the read deadline and the control-frame handlers on a
+// freshly dialed connection. Caller must not have published conn yet: these are
+// gorilla read methods and cannot race ReadMessage.
+func (c *WSClient) armKeepalive(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
+
+	conn.SetPongHandler(func(string) error {
+		// Our ping came back, so the round trip is intact. Runs on the read
+		// goroutine, from inside ReadMessage.
+		return conn.SetReadDeadline(time.Now().Add(c.pongWait))
+	})
+
+	conn.SetPingHandler(func(appData string) error {
+		// A server-side keepalive counts as liveness too. We still have to
+		// answer it, which gorilla's default handler would have done for us,
+		// so replicate that here including its one-second bound and its error
+		// swallowing: a peer that has already gone away must not turn into a
+		// read error from the pong.
+		//
+		// The short bound is the point. This runs on the read goroutine, and
+		// WriteControl waits on gorilla's write semaphore, which an in-flight
+		// WriteMessage can hold for defaultWriteTimeout. A longer deadline here
+		// would park the ONLY reader behind write congestion, processing no
+		// inbound messages while it waited. Skipping a pong is cheaper: the
+		// timeout is swallowed below, we keep reading, and if the peer really
+		// does give up on us the read deadline notices within pongWait.
+		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(pongReplyWait))
+		if err == websocket.ErrCloseSent {
+			return nil
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return nil
+		}
+		return err
+	})
+}
+
+// pingLoop sends a ping every pingInterval so an idle connection still proves
+// itself. It is long-lived and re-reads c.conn each tick, so it spans
+// reconnects; see loopsOnce.
+//
+// The ping is written with WriteControl, which does NOT need writeMu. Verified
+// against the vendored gorilla source rather than taken on faith: WriteControl
+// takes gorilla's own single-writer semaphore (c.mu) for the duration of the
+// frame, reads writeErr under writeErrMu, and sets the deadline directly on the
+// underlying net.Conn (goroutine-safe) instead of touching the c.writeDeadline
+// field that writeMu exists to guard. The package docs say the same thing in
+// one line: "The Close and WriteControl methods can be called concurrently with
+// all other methods."
+func (c *WSClient) pingLoop() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+		}
+
+		c.connMu.RLock()
+		conn := c.conn
+		connected := c.connected
+		c.connMu.RUnlock()
+
+		if !connected || conn == nil {
+			continue
+		}
+
+		if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(pingWriteWait)); err != nil {
+			// Deliberately advisory: the read deadline is the single authority
+			// on liveness. A ping can fail simply because a large WriteMessage
+			// is holding gorilla's write semaphore, and tearing down a healthy
+			// connection because a control frame queued too long would be a
+			// self-inflicted outage. A genuinely fatal failure is not lost:
+			// gorilla latches it in writeErr, so the next publish tears the
+			// connection down, and no pongs will arrive either way, so the
+			// read deadline fires within pongWait regardless.
+			c.debug("ws: ping failed: %v", err)
 		}
 	}
 }
@@ -314,6 +529,100 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 	go c.reconnect()
 }
 
+// nextReconnectDelay returns how long the caller should wait before its next
+// reconnect attempt, and advances the schedule for the attempt after that.
+//
+// The read, the doubling and the clamp all happen in ONE critical section under
+// connMu, and the caller sleeps on the returned value instead of re-reading the
+// field. reconnect used to do all of it with no lock at all, racing the reset in
+// connectLocked, which runs under connMu (#728). It also read the field twice,
+// once to log the delay and once to sleep it, so a reset landing between the two
+// made the node retry sooner than it had just announced.
+//
+// Both defects point the same way, and it is the way that hurts: anything that
+// silently shortens a backoff moves toward the #443 restart storm referenced
+// above connectWithBackoff in cmd/work.go, where tight retries burned the node's
+// daily Redis-API quota and locked it out for about a day.
+//
+// connMu is reused deliberately rather than adding a third mutex to this file.
+// The reset has to live in connectLocked, which is the only place that knows a
+// dial succeeded and whose caller already holds connMu, so connMu costs no extra
+// lock and no nested acquire. connMu is NOT held across the sleep.
+//
+// The returned delay is JITTERED; the stored schedule is not. See the jitter
+// note above initialReconnectBackoff for why it is additive and upward-only,
+// and why the returned sleep is deliberately allowed to exceed maxBackoff.
+func (c *WSClient) nextReconnectDelay() time.Duration {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	base := c.reconnectBackoff
+
+	c.reconnectBackoff *= 2
+	if c.reconnectBackoff > c.maxBackoff {
+		c.reconnectBackoff = c.maxBackoff
+	}
+
+	return c.jitteredLocked(base)
+}
+
+// jitteredLocked spreads base over [base, 2*base). Caller holds connMu.
+//
+// Only the RETURNED sleep is randomized. c.reconnectBackoff keeps holding the
+// clean doubling, so the schedule stays predictable, connectLocked's reset still
+// means exactly "back to one second", and nothing accumulates randomness across
+// attempts.
+func (c *WSClient) jitteredLocked(base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	frac := rand.Float64
+	if c.jitterFrac != nil {
+		frac = c.jitterFrac
+	}
+	return base + time.Duration(frac()*float64(base))
+}
+
+// sleepUnlessDone waits for d, returning false if Close happened first (#741).
+//
+// The bare time.Sleep this replaces was not cancellable and, worse, reconnect
+// did not re-check c.done afterwards, so a Close landing during a backoff still
+// let the loop dial and then mark a closed client connected: IsConnected()
+// reported true after Close returned, and the socket it opened was left dangling
+// until the next iteration noticed done and returned without closing it.
+//
+// The window is the whole remaining sleep, so it was widest exactly when the
+// control plane was unhealthy and the schedule had grown to a minute. The
+// keepalive (#734) is what turns this from rare into ordinary: reconnect used to
+// run almost never and now runs on every read-deadline expiry. Jitter can push
+// the sleep to two minutes, which widens the same window again.
+//
+// Not addressed here, and deliberately: connectLocked is still called with
+// context.Background(), so the dial itself is bound only by the 10s handshake
+// timeout rather than by the caller's lifetime. Giving the client a real context
+// is a larger change than this loop.
+func (c *WSClient) sleepUnlessDone(d time.Duration) bool {
+	if d <= 0 {
+		// Still honour a Close that has already happened.
+		select {
+		case <-c.done:
+			return false
+		default:
+			return true
+		}
+	}
+
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-c.done:
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // reconnect attempts to reconnect with exponential backoff
 func (c *WSClient) reconnect() {
 	for {
@@ -331,13 +640,10 @@ func (c *WSClient) reconnect() {
 			return
 		}
 
-		c.debug("ws: attempting reconnect in %v", c.reconnectBackoff)
-		time.Sleep(c.reconnectBackoff)
-
-		// Increase backoff for next attempt
-		c.reconnectBackoff *= 2
-		if c.reconnectBackoff > c.maxBackoff {
-			c.reconnectBackoff = c.maxBackoff
+		delay := c.nextReconnectDelay()
+		c.debug("ws: attempting reconnect in %v", delay)
+		if !c.sleepUnlessDone(delay) {
+			return
 		}
 
 		c.connMu.Lock()
@@ -497,6 +803,37 @@ const closeWriteWait = 2 * time.Second
 // so it should never fire in normal operation, and well under the worker
 // self-heal stall timer (600s) that would otherwise be the only backstop.
 const defaultWriteTimeout = 15 * time.Second
+
+// Keepalive intervals (#734).
+//
+// defaultPongWait is the read deadline. Nothing arriving on the socket within
+// it -- not a message, not a pong for our own pings -- means the connection is
+// declared dead and torn down. It is sized against the platform's 120s offline
+// sweep, not against network latency: detection has to happen with room to
+// spare, or the node is already marked offline (and refused for targeted
+// dispatch) by the time it notices. 45s detection plus ~1s of reconnect backoff
+// leaves better than 2x margin, and lands inside two 30s heartbeat intervals.
+//
+// defaultPingInterval is one third of it on purpose, so three pings go
+// unanswered before we act. That absorbs a single dropped pong and scheduler
+// jitter on a GPU-saturated node without pushing detection past the sweep.
+// Tightening these buys little (the sweep, not us, sets the deadline that
+// matters) and costs false-positive teardowns of working connections.
+const (
+	defaultPingInterval = 15 * time.Second
+	defaultPongWait     = 45 * time.Second
+)
+
+// pingWriteWait bounds the ping control frame itself. WriteControl blocks until
+// it can take gorilla's write semaphore, which an in-flight WriteMessage holds
+// for up to defaultWriteTimeout, so this is a bound on how long a ping may wait
+// rather than a liveness signal. Failing here is advisory; see pingLoop.
+const pingWriteWait = 10 * time.Second
+
+// pongReplyWait bounds the pong we send in answer to a server ping. It is much
+// shorter than pingWriteWait because that reply runs on the read goroutine; see
+// the ping handler in armKeepalive. It matches gorilla's own default handler.
+const pongReplyWait = time.Second
 
 // tryLockWrite acquires writeMu, giving up after d. Close must not block
 // forever behind a wedged writer (see the deadline note in Close), so it needs

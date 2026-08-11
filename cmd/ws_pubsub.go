@@ -62,8 +62,14 @@ func (w wsConnector) Connect(ctx context.Context) error {
 //
 // Re-arming after a LOST connection is already handled one layer down by
 // WSClient.handleDisconnect -> reconnect, which retries indefinitely and
-// restores subscriptions. This function deliberately does not duplicate that:
-// a second connect path could start a second readLoop on the same connection.
+// restores subscriptions. This function deliberately does not duplicate that.
+//
+// It used to be unsafe as well as redundant: a second connect path could start a
+// second readLoop on the same gorilla Conn, which permits exactly one concurrent
+// reader (#740). That is fixed (WSClient.loopsOnce starts the loops once for the
+// client's whole life), so the reason to keep a single re-arm path is now purely
+// that two of them would dial twice and leave one of the connections orphaned
+// (#748), not that they would corrupt the reader.
 // The returned channel closes when the retry loop has finished (immediately
 // when no loop was needed). Production callers ignore it; it exists so a test
 // can join the goroutine instead of sleeping and guessing.
