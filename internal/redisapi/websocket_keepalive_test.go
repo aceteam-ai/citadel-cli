@@ -203,6 +203,70 @@ func TestReadDeadlineDisconnectTriggersReconnect(t *testing.T) {
 		t.Fatalf("no reconnect after a read-deadline disconnect: attempts=%d connected=%v",
 			attempts.Load(), c.IsConnected())
 	}
+
+	// The reconnected socket must be armed too. Without this the test would
+	// pass on a connection that merely happened to be up at the instant we
+	// looked: connectLocked, not Connect, is what has to arm the keepalive,
+	// because reconnect never goes through Connect. An unarmed connection has
+	// no read deadline and no pings, which is the original bug restored on
+	// every socket after the first.
+	settled := attempts.Load()
+	deadline := time.Now().Add(3 * c.pongWait)
+	for time.Now().Before(deadline) {
+		if !c.IsConnected() {
+			t.Fatal("reconnected connection dropped again: it is not being kept alive")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := attempts.Load(); got != settled {
+		t.Fatalf("dial attempts kept climbing (%d -> %d) against a healthy peer: reconnect is flapping", settled, got)
+	}
+}
+
+// TestKeepaliveIsRearmedOnEveryReconnect pins that connectLocked, not Connect,
+// owns the arming.
+//
+// Reconnect never goes through Connect, so arming there would leave every
+// socket after the first with no read deadline and no handlers. That is the
+// original bug restored one connection later, and it is invisible to a test
+// that only checks the reconnected socket stays up: an unarmed connection is
+// MORE stable, not less, because nothing can ever declare it dead. The
+// observable difference is whether the client keeps noticing. Here every
+// connection the server accepts goes silent, so a correctly armed client
+// detects and redials over and over; an armed-once client stalls at two.
+func TestKeepaliveIsRearmedOnEveryReconnect(t *testing.T) {
+	var attempts atomic.Int64
+	upgrader := websocket.Upgrader{}
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		attempts.Add(1)
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
+	c.pingInterval = 100 * time.Millisecond
+	c.pongWait = 400 * time.Millisecond
+	c.reconnectEnabled = true
+	c.reconnectBackoff = 50 * time.Millisecond
+
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Three accepted connections means the SECOND one was detected as dead too,
+	// which can only happen if the reconnect path armed it.
+	if !waitFor(func() bool { return attempts.Load() >= 3 }, 25*time.Second) {
+		t.Fatalf("server accepted %d connections, want at least 3: the keepalive is not re-armed after a reconnect", attempts.Load())
+	}
 }
 
 // TestPingsAreSafeAlongsideConcurrentWrites checks the load-bearing claim that
