@@ -6,7 +6,7 @@
 // collection (docker stats per running service plus nvidia-smi). On a gateway
 // node that collection measured 1.98-2.67s against a 2s probe bound, so the line
 // degraded to "unknown" on 9 of 10 runs on a node whose status server was
-// enabled and answering 200 -- and the "unknown" text told the operator to
+// enabled and answering 200, and the "unknown" text told the operator to
 // enable a feature that was already on.
 //
 // These tests pin both halves: the transport is readable while /status is slow,
@@ -14,6 +14,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -193,8 +194,11 @@ func TestHTTPGetBodyErrReportsStatus(t *testing.T) {
 	defer srv.Close()
 
 	_, err := httpGetBodyErr(&http.Client{Timeout: time.Second}, srv.URL)
-	statusErr, ok := err.(*httpStatusError)
-	if !ok {
+	// errors.As, matching the predicate the /status fallback actually branches
+	// on. A bare type assertion would pass here and still let a future wrap break
+	// the fallback silently.
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
 		t.Fatalf("err = %T (%v), want *httpStatusError", err, err)
 	}
 	if statusErr.StatusCode != http.StatusNotFound {
