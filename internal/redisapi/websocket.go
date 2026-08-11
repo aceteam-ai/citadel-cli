@@ -348,10 +348,19 @@ func (c *WSClient) armKeepalive(conn *websocket.Conn) {
 	conn.SetPingHandler(func(appData string) error {
 		// A server-side keepalive counts as liveness too. We still have to
 		// answer it, which gorilla's default handler would have done for us,
-		// so replicate that here including its error swallowing: a peer that
-		// has already gone away must not turn into a read error from the pong.
+		// so replicate that here including its one-second bound and its error
+		// swallowing: a peer that has already gone away must not turn into a
+		// read error from the pong.
+		//
+		// The short bound is the point. This runs on the read goroutine, and
+		// WriteControl waits on gorilla's write semaphore, which an in-flight
+		// WriteMessage can hold for defaultWriteTimeout. A longer deadline here
+		// would park the ONLY reader behind write congestion, processing no
+		// inbound messages while it waited. Skipping a pong is cheaper: the
+		// timeout is swallowed below, we keep reading, and if the peer really
+		// does give up on us the read deadline notices within pongWait.
 		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
-		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(pingWriteWait))
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(pongReplyWait))
 		if err == websocket.ErrCloseSent {
 			return nil
 		}
@@ -645,6 +654,11 @@ const (
 // for up to defaultWriteTimeout, so this is a bound on how long a ping may wait
 // rather than a liveness signal. Failing here is advisory; see pingLoop.
 const pingWriteWait = 10 * time.Second
+
+// pongReplyWait bounds the pong we send in answer to a server ping. It is much
+// shorter than pingWriteWait because that reply runs on the read goroutine; see
+// the ping handler in armKeepalive. It matches gorilla's own default handler.
+const pongReplyWait = time.Second
 
 // tryLockWrite acquires writeMu, giving up after d. Close must not block
 // forever behind a wedged writer (see the deadline note in Close), so it needs

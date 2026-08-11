@@ -53,11 +53,16 @@ func waitFor(cond func() bool, budget time.Duration) bool {
 
 // newKeepaliveTestClient builds a client with the keepalive scaled down so a
 // test does not have to wait out the production 45s read deadline.
+//
+// The scaling keeps production's 1:4 ping-to-deadline ratio but stays coarse on
+// purpose. CI runs these on a shared, heavily contended runner under -race, and
+// a sub-second budget would turn an ordinary scheduling hiccup into a red build
+// that gets rerun rather than diagnosed.
 func newKeepaliveTestClient(srv *httptest.Server) *WSClient {
 	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
 	c.reconnectEnabled = false
-	c.pingInterval = 100 * time.Millisecond
-	c.pongWait = 400 * time.Millisecond
+	c.pingInterval = 250 * time.Millisecond
+	c.pongWait = time.Second
 	return c
 }
 
@@ -151,7 +156,7 @@ func TestPingsReachTheServer(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	// pingInterval is 100ms, so three pings is a very slack budget.
+	// pingInterval is 250ms, so a 5s budget for three pings is very slack.
 	if !waitFor(func() bool { return pings.Load() >= 3 }, 5*time.Second) {
 		t.Fatalf("server saw %d pings, want at least 3: the ping ticker is not running", pings.Load())
 	}
@@ -187,8 +192,8 @@ func TestReadDeadlineDisconnectTriggersReconnect(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
-	c.pingInterval = 100 * time.Millisecond
-	c.pongWait = 400 * time.Millisecond
+	c.pingInterval = 250 * time.Millisecond
+	c.pongWait = time.Second
 	// reconnectEnabled defaults on for a configured BaseURL; make it explicit,
 	// since the whole subject of this test is the reconnect.
 	c.reconnectEnabled = true
@@ -252,8 +257,8 @@ func TestKeepaliveIsRearmedOnEveryReconnect(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
-	c.pingInterval = 100 * time.Millisecond
-	c.pongWait = 400 * time.Millisecond
+	c.pingInterval = 250 * time.Millisecond
+	c.pongWait = time.Second
 	c.reconnectEnabled = true
 	c.reconnectBackoff = 50 * time.Millisecond
 
