@@ -713,6 +713,31 @@ current directory, and it does not look for `/etc/citadel/citadel.yaml` directly
 Read the function for the exact order; do not re-copy it here. A restated
 algorithm is what went stale before.
 
+### Two ActualState reporters, two different module sets (#733)
+
+A node ships `ActualState` to the control plane from TWO independent paths, and
+they do not enumerate the same thing. Both are wired in `cmd/work.go`:
+
+- `nodestate.BuildActualState` decides the report the 60s `nodestate.Emitter`
+  sends. Its authority for "what is installed" is the **lockfile**
+  (`catalog.LoadLockfile`). No lockfile means it returns early with an EMPTY
+  module list, and the control plane's ingest writes zero module rows.
+- `liveModuleOps.ListInstalled` (`cmd/module_ops.go`) decides the report the
+  reconcile loop sends, and its authority is the **manifest** `services:` list.
+  Every embedded/catalog service in `citadel.yaml` counts, whether or not the
+  module system ever installed it.
+
+**The consequence that bites:** a node running services with no lockfile entries
+reports fine and still shows up as "has not reported any modules" upstream, so
+that message says nothing about whether the node is healthy or reporting. Check
+which path you expect to carry the data before concluding a node is silent. It
+also means the reconcile engine's authority is WIDER than "modules": see #739.
+
+Reporting is on the observability path, never the apply path. The full-wipe
+guard in `internal/reconcile/loop.go` refuses the destructive converge and still
+reports, deliberately leaving `AppliedRevision` empty because nothing was
+applied. `TestRefuseFullWipeReportOmitsAppliedRevision` pins that.
+
 ### GPU Detection
 Status command detects NVIDIA GPUs using:
 1. `nvidia-smi` command output parsing
