@@ -54,7 +54,17 @@ type WSClient struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// Reconnection settings
+	// Reconnection settings.
+	//
+	// reconnectBackoff is guarded by connMu (#728). It is written by
+	// connectLocked, whose caller already holds connMu for write, and it is
+	// advanced by nextReconnectDelay, which takes connMu for the whole
+	// read-modify-write and releases it before the caller sleeps. Nothing may
+	// touch it unlocked: reconnect used to, and a torn or stale read there
+	// shortens a backoff.
+	//
+	// reconnectEnabled and maxBackoff are set once in NewWSClient and never
+	// written again, so they need no guard.
 	reconnectEnabled bool
 	reconnectBackoff time.Duration
 	maxBackoff       time.Duration
@@ -102,6 +112,11 @@ type WSMessage struct {
 	Data      map[string]string `json:"data,omitempty"`      // Job data fields from stream
 }
 
+// initialReconnectBackoff is the delay before the first reconnect attempt, and
+// the value the schedule returns to after any successful connect. It lives in
+// one place so the constructor and the reset in connectLocked cannot drift.
+const initialReconnectBackoff = time.Second
+
 // NewWSClient creates a new WebSocket client.
 func NewWSClient(cfg WSClientConfig) *WSClient {
 	reconnectEnabled := cfg.ReconnectEnabled
@@ -117,7 +132,7 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		subscriptions:    make(map[string]bool),
 		done:             make(chan struct{}),
 		reconnectEnabled: reconnectEnabled,
-		reconnectBackoff: time.Second,
+		reconnectBackoff: initialReconnectBackoff,
 		maxBackoff:       time.Minute,
 		writeTimeout:     defaultWriteTimeout,
 		debugFunc:        cfg.DebugFunc,
@@ -187,7 +202,10 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 
 	c.conn = conn
 	c.connected = true
-	c.reconnectBackoff = time.Second // Reset backoff on successful connection
+	// Reset the backoff schedule on a successful connection. The caller holds
+	// connMu for write, which is what makes this assignment safe against
+	// nextReconnectDelay running in a reconnect goroutine (#728).
+	c.reconnectBackoff = initialReconnectBackoff
 
 	c.debug("ws: connected successfully")
 
@@ -314,6 +332,39 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 	go c.reconnect()
 }
 
+// nextReconnectDelay returns how long the caller should wait before its next
+// reconnect attempt, and advances the schedule for the attempt after that.
+//
+// The read, the doubling and the clamp all happen in ONE critical section under
+// connMu, and the caller sleeps on the returned value instead of re-reading the
+// field. reconnect used to do all of it with no lock at all, racing the reset in
+// connectLocked, which runs under connMu (#728). It also read the field twice,
+// once to log the delay and once to sleep it, so a reset landing between the two
+// made the node retry sooner than it had just announced.
+//
+// Both defects point the same way, and it is the way that hurts: anything that
+// silently shortens a backoff moves toward the #443 restart storm referenced
+// above connectWithBackoff in cmd/work.go, where tight retries burned the node's
+// daily Redis-API quota and locked it out for about a day.
+//
+// connMu is reused deliberately rather than adding a third mutex to this file.
+// The reset has to live in connectLocked, which is the only place that knows a
+// dial succeeded and whose caller already holds connMu, so connMu costs no extra
+// lock and no nested acquire. connMu is NOT held across the sleep.
+func (c *WSClient) nextReconnectDelay() time.Duration {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
+	delay := c.reconnectBackoff
+
+	c.reconnectBackoff *= 2
+	if c.reconnectBackoff > c.maxBackoff {
+		c.reconnectBackoff = c.maxBackoff
+	}
+
+	return delay
+}
+
 // reconnect attempts to reconnect with exponential backoff
 func (c *WSClient) reconnect() {
 	for {
@@ -331,14 +382,9 @@ func (c *WSClient) reconnect() {
 			return
 		}
 
-		c.debug("ws: attempting reconnect in %v", c.reconnectBackoff)
-		time.Sleep(c.reconnectBackoff)
-
-		// Increase backoff for next attempt
-		c.reconnectBackoff *= 2
-		if c.reconnectBackoff > c.maxBackoff {
-			c.reconnectBackoff = c.maxBackoff
-		}
+		delay := c.nextReconnectDelay()
+		c.debug("ws: attempting reconnect in %v", delay)
+		time.Sleep(delay)
 
 		c.connMu.Lock()
 		err := c.connectLocked(context.Background())
