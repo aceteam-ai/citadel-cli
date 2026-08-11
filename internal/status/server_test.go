@@ -420,3 +420,77 @@ func TestExistingEndpointsUnaffectedByDesktopConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestServerWorkerEndpoint pins the cheap liveness route added for
+// citadel-cli#735: it must serve the same `worker` envelope /status uses (so one
+// parser reads either), and it must reach the provider directly rather than via
+// a collection.
+func TestServerWorkerEndpoint(t *testing.T) {
+	calls := 0
+	collector := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		WorkerLiveness: func() *WorkerLiveness {
+			calls++
+			return &WorkerLiveness{Consuming: true, PubSubTransport: "websocket"}
+		},
+	})
+	server := NewServer(ServerConfig{}, collector)
+
+	req := httptest.NewRequest(http.MethodGet, "/worker", nil)
+	w := httptest.NewRecorder()
+	server.handleWorker(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %v, want %v", resp.StatusCode, http.StatusOK)
+	}
+	var env WorkerEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if env.Worker == nil {
+		t.Fatal("worker block absent; the whole point of the route is to serve it")
+	}
+	if env.Worker.PubSubTransport != "websocket" {
+		t.Errorf("PubSubTransport = %q, want websocket", env.Worker.PubSubTransport)
+	}
+	if calls != 1 {
+		t.Errorf("liveness provider called %d times, want 1", calls)
+	}
+}
+
+// TestServerWorkerEndpointNoProvider: a status server with no consume loop
+// behind it (e.g. `citadel serve`) must answer 200 with the block absent, not
+// 404. A newer CLI uses 404 to mean "this build predates /worker" and falls back
+// to /status; returning it here would send that caller down the slow path
+// forever.
+func TestServerWorkerEndpointNoProvider(t *testing.T) {
+	server := NewServer(ServerConfig{}, NewCollector(CollectorConfig{NodeName: "test-node"}))
+
+	req := httptest.NewRequest(http.MethodGet, "/worker", nil)
+	w := httptest.NewRecorder()
+	server.handleWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %v, want %v", w.Code, http.StatusOK)
+	}
+	var env WorkerEnvelope
+	if err := json.NewDecoder(w.Result().Body).Decode(&env); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if env.Worker != nil {
+		t.Errorf("worker = %+v, want absent", env.Worker)
+	}
+}
+
+func TestServerWorkerEndpointRejectsNonGET(t *testing.T) {
+	server := NewServer(ServerConfig{}, NewCollector(CollectorConfig{NodeName: "test-node"}))
+
+	req := httptest.NewRequest(http.MethodPost, "/worker", nil)
+	w := httptest.NewRecorder()
+	server.handleWorker(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("StatusCode = %v, want %v", w.Code, http.StatusMethodNotAllowed)
+	}
+}

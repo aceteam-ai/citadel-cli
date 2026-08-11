@@ -1131,6 +1131,17 @@ Unit tests focus on manifest parsing and utility functions. Most command logic i
 
 **Version Injection**: The `build.sh` script injects version via linker flags: `-ldflags="-X '${MODULE_PATH}/cmd.Version=${VERSION}'"`. Version is set as global var in `cmd/version.go`.
 
+**Reading one field off the running worker**: use `GET /worker`, not `GET /status`.
+`/status` runs a full collection (docker stats per running service plus
+`nvidia-smi`), which on a busy gateway node takes seconds; `/worker` serves the
+same `worker` envelope from an in-memory snapshot and shells out to nothing. A 404
+on `/worker` means the *serving* worker predates it (the probing binary is
+whatever `citadel status` you just ran; the serving one is a long-lived `citadel
+work`), so callers fall back to `/status`. See `probeWorkerPubSubTransport`
+(#735). Related: `httpGetBodyErr` (`cmd/work_attach.go`) derives its deadline from
+the caller's `client.Timeout`; it used to impose its own constant instead, so
+raising a caller's timeout was a silent no-op.
+
 **Mock Mode**:
 - The Nexus client in `internal/nexus/client.go` has a mock mode using `mock_jobs.json` for local testing
 - Device auth client has mock server in `internal/nexus/deviceauth_mock.go` for testing without backend

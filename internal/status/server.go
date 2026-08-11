@@ -232,6 +232,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/worker", s.handleWorker)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/services", s.handleServices)
 	mux.HandleFunc("/resources", s.handleResources)
@@ -392,6 +393,48 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// WorkerEnvelope is the /worker response body. It deliberately reuses the field
+// name and shape /status uses for the same block, so one parser reads either
+// endpoint and a caller can fall back from /worker to /status without a second
+// decoder.
+type WorkerEnvelope struct {
+	Worker *WorkerLiveness `json:"worker,omitempty"`
+}
+
+// handleWorker returns ONLY the worker liveness block.
+// GET /worker
+//
+// It exists because /status runs a full collection (docker stats across every
+// running service, plus nvidia-smi), which on a busy gateway node takes about as
+// long as any caller's patience. Reading a single cached field should not be
+// coupled to that sweep: `citadel status` was reporting the pub/sub transport as
+// "unknown" on healthy nodes because its probe raced the collection
+// (citadel-cli#735). The liveness block is assembled from an in-memory snapshot
+// and a live accessor on the API client, so this handler shells out to nothing.
+//
+// Auth posture is the same as /status on this listener: unauthenticated. The
+// body is a strict SUBSET of what /status already serves unauthenticated here,
+// so this adds a route, not an exposure.
+//
+// A worker that supplies no liveness provider (e.g. `citadel serve`, which runs
+// a status server with no consume loop) answers 200 with the block absent, NOT
+// 404. 404 must keep meaning "this build has no /worker route" so a newer CLI
+// can use it to detect an older worker.
+func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var live *WorkerLiveness
+	if s.collector != nil {
+		live = s.collector.WorkerLivenessSnapshot()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(WorkerEnvelope{Worker: live})
 }
 
 // handleHealth returns a simple health check response.
