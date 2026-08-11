@@ -60,7 +60,7 @@ Examples:
 
 .PP
 \fB--attach\fP[=false]
-	When a worker is already running, print its status banner instead of refusing (default: only on an interactive terminal)
+	When a worker is already running, print its full status banner and exit 0 (default: banner on an interactive terminal, a concise no-op notice otherwise)
 
 .PP
 \fB--auto-detect\fP=false
@@ -132,7 +132,7 @@ Examples:
 
 .PP
 \fB--no-attach\fP[=false]
-	When a worker is already running, refuse with exit 1 instead of printing the status banner
+	When a worker is already running, refuse with exit 1 instead of the exit-0 no-op notice/banner
 
 .PP
 \fB--no-footprint\fP[=false]

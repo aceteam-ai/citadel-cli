@@ -11,27 +11,68 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 )
 
-func TestDecideAttach(t *testing.T) {
+func TestDecideAlreadyRunning(t *testing.T) {
 	cases := []struct {
 		name         string
 		isTTY        bool
 		attachFlag   bool
 		noAttachFlag bool
-		want         bool
+		want         alreadyRunningAction
+		wantExit     int
 	}{
-		{"tty shows banner", true, false, false, true},
-		{"non-tty refuses (systemd)", false, false, false, false},
-		{"attach flag forces banner off tty", false, true, false, true},
-		{"no-attach flag forces refusal on tty", true, false, true, false},
-		{"no-attach beats attach", true, true, true, false},
+		// TTY (or --attach) -> full banner, exit 0.
+		{"tty shows banner", true, false, false, actionBanner, 0},
+		{"attach flag forces banner off tty", false, true, false, actionBanner, 0},
+		// The #736 fix: a non-TTY (systemd) invocation is now a concise no-op that
+		// exits 0 instead of the pre-#736 exit-1 refusal, so a duplicate
+		// Restart=on-failure unit stops crash-looping.
+		{"non-tty is a no-op notice (systemd)", false, false, false, actionNoOpNotice, 0},
+		// --no-attach is the strict escape hatch: exit 1 even on a TTY, and it beats
+		// --attach. No unit file passes it, so it cannot reintroduce the crash-loop.
+		{"no-attach forces strict refusal on tty", true, false, true, actionStrictRefuse, 1},
+		{"no-attach forces strict refusal off tty", false, false, true, actionStrictRefuse, 1},
+		{"no-attach beats attach", true, true, true, actionStrictRefuse, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := decideAttach(tc.isTTY, tc.attachFlag, tc.noAttachFlag); got != tc.want {
-				t.Fatalf("decideAttach(tty=%v, attach=%v, noAttach=%v) = %v, want %v",
+			got := decideAlreadyRunning(tc.isTTY, tc.attachFlag, tc.noAttachFlag)
+			if got != tc.want {
+				t.Fatalf("decideAlreadyRunning(tty=%v, attach=%v, noAttach=%v) = %v, want %v",
 					tc.isTTY, tc.attachFlag, tc.noAttachFlag, got, tc.want)
 			}
+			if ec := got.exitCode(); ec != tc.wantExit {
+				t.Fatalf("exitCode() = %d, want %d (action %v)", ec, tc.wantExit, got)
+			}
 		})
+	}
+}
+
+func TestNoOpAlreadyRunningMessage(t *testing.T) {
+	// Full record: PID + start time both surface, plus the two actionable next steps.
+	start := time.Date(2026, 7, 15, 9, 12, 44, 0, time.UTC)
+	msg := noOpAlreadyRunningMessage(&worklock.ErrAlreadyRunning{PID: 41372, StartTime: start})
+	for _, want := range []string{
+		"citadel worker already running",
+		"PID 41372",
+		start.Format(time.RFC3339),
+		"no-op",
+		"--no-single-instance",
+		"citadel logs -f",
+		"journalctl",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("no-op message missing %q\n---\n%s", want, msg)
+		}
+	}
+
+	// Legacy lock record with no PID/start: the notice degrades gracefully to the
+	// bare "already running" line without inventing a "(PID 0)".
+	bare := noOpAlreadyRunningMessage(&worklock.ErrAlreadyRunning{})
+	if strings.Contains(bare, "PID") {
+		t.Errorf("no-op message should omit PID when unknown\n---\n%s", bare)
+	}
+	if !strings.Contains(bare, "no-op") {
+		t.Errorf("no-op message missing no-op clause\n---\n%s", bare)
 	}
 }
 
