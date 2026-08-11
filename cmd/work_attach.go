@@ -11,7 +11,13 @@
 //
 // Deliberately additive and zero-daemon-change: no new endpoint, no lock
 // mutation. The banner is a read-only HTTP client of the already-running worker.
-// TTY-gated so systemd / scripts keep today's exit-1 refusal (see decideAttach).
+//
+// Response policy (see decideAlreadyRunning): an interactive TTY renders the full
+// banner; a non-interactive invocation (systemd, journald, scripts) prints a
+// concise no-op notice. BOTH exit 0 — a live worker already serves this node, so a
+// second invocation is a benign no-op, and a duplicate Restart=on-failure unit
+// therefore settles to inactive(dead) instead of crash-looping forever (issue
+// #736). Only --no-attach opts back into the strict exit-1 refusal.
 package cmd
 
 import (
@@ -44,23 +50,70 @@ type attachStatus struct {
 	Health string
 }
 
-// decideAttach reports whether to render the friendly discover-and-attach banner
-// (true) versus the legacy exit-1 refusal (false). Pure so the TTY/flag policy is
-// unit tested without a terminal.
+// alreadyRunningAction is how `citadel work` responds when the single-instance
+// lock is already held by a live worker (issues #524 / #736).
+type alreadyRunningAction int
+
+const (
+	// actionBanner: render the full discover-and-attach status banner, exit 0.
+	actionBanner alreadyRunningAction = iota
+	// actionNoOpNotice: print a concise one-line "already running, no-op" notice,
+	// exit 0. This is the DEFAULT for a non-interactive invocation (systemd,
+	// journald, scripts) — the #736 fix that stops a duplicate Restart=on-failure
+	// unit from crash-looping. Before #736 the non-TTY default was actionStrictRefuse.
+	actionNoOpNotice
+	// actionStrictRefuse: print the refusal and exit 1. Opt-in via --no-attach for a
+	// caller that wants a double-start to fail loudly. No unit file passes it, so it
+	// cannot reintroduce the #736 crash-loop.
+	actionStrictRefuse
+)
+
+// exitCode maps an action to the process exit code: 0 for the two benign no-op
+// paths (a live worker already serves the node), 1 only for the strict refusal.
+func (a alreadyRunningAction) exitCode() int {
+	if a == actionStrictRefuse {
+		return 1
+	}
+	return 0
+}
+
+// decideAlreadyRunning chooses how to respond when another live worker already
+// holds this node's single-instance lock. Pure so the policy (and its exit codes)
+// are unit tested without a terminal or a running daemon.
 //
-//   - --no-attach forces the legacy refusal (scripts that want the old behavior).
-//   - --attach forces the banner (e.g. capturing it from a non-TTY).
-//   - otherwise the banner is shown only on an interactive TTY. Non-TTY (systemd,
-//     journald, pipelines) keeps the exit-1 refusal so a misconfigured double
-//     systemd unit still fails visibly instead of "succeeding" as an attach.
-func decideAttach(isTTY, attachFlag, noAttachFlag bool) bool {
+//   - --no-attach forces actionStrictRefuse (exit 1): the documented escape hatch
+//     for a caller that wants a double-start to fail loudly.
+//   - --attach, or an interactive TTY, renders the full status banner (exit 0).
+//   - otherwise (the systemd/non-TTY default) a concise no-op notice (exit 0), so a
+//     redundant Restart=on-failure unit settles to inactive(dead) instead of
+//     crash-looping forever (#736). Before #736 this default was exit 1.
+func decideAlreadyRunning(isTTY, attachFlag, noAttachFlag bool) alreadyRunningAction {
 	if noAttachFlag {
-		return false
+		return actionStrictRefuse
 	}
-	if attachFlag {
-		return true
+	if attachFlag || isTTY {
+		return actionBanner
 	}
-	return isTTY
+	return actionNoOpNotice
+}
+
+// noOpAlreadyRunningMessage is the concise one-line notice printed when a
+// non-interactive `citadel work` finds a live worker already serving this node
+// (issue #736). It names the holder and points at the two real next steps, and
+// accompanies the exit-0 no-op so journald shows an intelligible line instead of a
+// crash-loop. Pure (no IO) so its wording is unit tested.
+func noOpAlreadyRunningMessage(running *worklock.ErrAlreadyRunning) string {
+	who := "citadel worker already running"
+	if running.PID > 0 {
+		who += fmt.Sprintf(" (PID %d", running.PID)
+		if !running.StartTime.IsZero() {
+			who += ", started " + running.StartTime.Format(time.RFC3339)
+		}
+		who += ")"
+	}
+	return who + "; this instance is a no-op. " +
+		"Pass --no-single-instance to force a second worker, " +
+		"or follow the running one with `citadel logs -f` (or `journalctl -u <citadel unit> -f`)."
 }
 
 // resolveStatusPort returns the plaintext status server port to probe for attach
@@ -219,8 +272,8 @@ func humanizeUptime(d time.Duration) string {
 // renderWorkAttach prints the discover-and-attach banner for a refused
 // `citadel work`, reading the holder metadata and probing the local status
 // server. It writes to stdout (this is informational success for an interactive
-// user, not an error) and is only reached after decideAttach approved the banner.
-// stateDir is the resolved node state dir the lock is keyed to.
+// user, not an error) and is only reached after decideAlreadyRunning chose the
+// banner. stateDir is the resolved node state dir the lock is keyed to.
 func renderWorkAttach(stateDir string, running *worklock.ErrAlreadyRunning) {
 	holder, ok := worklock.ReadHolder(stateDir)
 	if !ok {

@@ -344,19 +344,39 @@ func runWork(cmd *cobra.Command, args []string) {
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
 			if errors.As(lockErr, &running) {
-				// Discover-and-attach (issue #524, increment 1): on an interactive
-				// TTY, print the running worker's status instead of a bare error
-				// (docker-daemon style). Non-TTY (systemd, scripts) keeps today's
-				// exit-1 refusal UNCHANGED so a misconfigured double systemd unit
-				// still fails visibly. --attach / --no-attach override the heuristic.
-				if decideAttach(stdoutIsTTY(), workAttach, workNoAttach) {
-					renderWorkAttach(network.GetStateDir(), running)
+				// An ErrAlreadyRunning means the OS advisory lock is CONTENDED — a
+				// live process genuinely holds it (the kernel frees flock on death).
+				// Confirm it is a live *citadel* worker via IsHeld (flock-contended +
+				// live citadel PID, the same gate Acquire refuses on) before treating
+				// this as a benign duplicate, so a rare "flock held by something else"
+				// case is never mistaken for "a worker is serving this node".
+				liveHolder, _ := worklock.IsHeld(network.GetStateDir())
+				action := decideAlreadyRunning(stdoutIsTTY(), workAttach, workNoAttach)
+				if liveHolder && action != actionStrictRefuse {
+					// Discover-and-attach (issue #524): render the running worker's
+					// status on a TTY, else a concise no-op notice (issue #736). ONE
+					// worker IS serving this node, so this invocation is a no-op: exit
+					// 0. A duplicate Restart=on-failure unit therefore settles to
+					// inactive(dead) instead of crash-looping forever (the #736 bug).
+					if action == actionBanner {
+						renderWorkAttach(network.GetStateDir(), running)
+					} else {
+						// stderr (not stdout like the banner): this path is the
+						// non-interactive/systemd default, and a diagnostic notice
+						// belongs on stderr so journald records it as a log line.
+						fmt.Fprintln(os.Stderr, noOpAlreadyRunningMessage(running))
+					}
 					os.Exit(0)
 				}
+				// Strict refusal (opt-in --no-attach) or a non-live holder: keep the
+				// visible non-zero refusal so a genuinely-wrong double-start still
+				// fails loudly and a "should be running but isn't" case is never masked.
 				fmt.Fprintf(os.Stderr, "Error: %v\n", running)
 				fmt.Fprintln(os.Stderr, "\nAnother 'citadel work' is already serving this node.")
 				fmt.Fprintln(os.Stderr, "Stop it first (e.g. 'systemctl --user stop citadel' or kill the PID above),")
 				fmt.Fprintln(os.Stderr, "or pass --no-single-instance to run a second worker intentionally.")
+				// Reached only for the strict --no-attach refusal or a non-live holder;
+				// both are a visible failure (exit 1), never the benign no-op exit 0.
 				os.Exit(1)
 			}
 			// Non-contention lock error (e.g. unwritable dir): warn but do not block
@@ -2894,8 +2914,8 @@ func init() {
 	workCmd.Flags().BoolVar(&workNoUpdate, "no-update", false, "(Deprecated) No longer has any effect - use 'citadel update disable' instead")
 	workCmd.Flags().BoolVar(&workNoFootprint, "no-footprint", false, "Disable the background resource-footprint sampler")
 	workCmd.Flags().BoolVar(&workNoSingleInstance, "no-single-instance", false, "Allow a second worker to run for this node (skips the single-instance lock)")
-	workCmd.Flags().BoolVar(&workAttach, "attach", false, "When a worker is already running, print its status banner instead of refusing (default: only on an interactive terminal)")
-	workCmd.Flags().BoolVar(&workNoAttach, "no-attach", false, "When a worker is already running, refuse with exit 1 instead of printing the status banner")
+	workCmd.Flags().BoolVar(&workAttach, "attach", false, "When a worker is already running, print its full status banner and exit 0 (default: banner on an interactive terminal, a concise no-op notice otherwise)")
+	workCmd.Flags().BoolVar(&workNoAttach, "no-attach", false, "When a worker is already running, refuse with exit 1 instead of the exit-0 no-op notice/banner")
 	workCmd.Flags().BoolVar(&workNoKeyRenew, "no-key-renew", false, "Disable the background Headscale node-key renewer (renews the key before expiry while online)")
 	workCmd.Flags().MarkDeprecated("no-update", "use 'citadel update disable' to disable auto-update checks")
 
