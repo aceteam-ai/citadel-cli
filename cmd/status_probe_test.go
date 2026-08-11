@@ -122,6 +122,51 @@ func TestProbeWorkerPubSubTransportPrefersCheapEndpoint(t *testing.T) {
 	}
 }
 
+// TestProbeWorkerPubSubTransportDoesNotFallBackOnNon404 pins the OTHER half of
+// the version-skew branch: only a 404 buys the expensive fallback.
+//
+// 404 is the one status that means "this build has no /worker route" (the status
+// server's mux registers no "/" catch-all, so net/http answers it). Any other
+// status came from a server that answered, and re-asking that server for a full
+// collection would pay the 10s sweep this change exists to avoid, on a node that
+// is already unhealthy.
+//
+// It also pins the message: a server that answered must not be reported as one
+// the operator still needs to enable.
+func TestProbeWorkerPubSubTransportDoesNotFallBackOnNon404(t *testing.T) {
+	for _, code := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			var statusHits int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/worker":
+					http.Error(w, "upstream unavailable", code)
+				case "/status":
+					statusHits++
+					fmt.Fprint(w, `{"worker":{"consuming":true,"pubsub_transport":"websocket"}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			pointProbeAtServer(t, srv)
+
+			_, state := probeWorkerPubSubTransport()
+			if statusHits != 0 {
+				t.Errorf("/status was collected %d time(s) after a %d on /worker; only a 404 means "+
+					"\"no such route\", and the full sweep is exactly the cost being avoided", statusHits, code)
+			}
+			if state == pubSubProbeUnreachable {
+				t.Errorf("probe state = pubSubProbeUnreachable after a %d; the server ANSWERED, so telling the "+
+					"operator to enable --status-port/--gateway points at a setting that is not the problem", code)
+			}
+			if state != pubSubProbeBadStatus {
+				t.Errorf("probe state = %v, want pubSubProbeBadStatus", state)
+			}
+		})
+	}
+}
+
 // TestProbeWorkerPubSubTransportDistinguishesTimeoutFromAbsent covers the second
 // half of #735: "timed out" and "not enabled" are different operator actions and
 // used to print the same string.

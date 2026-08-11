@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -459,11 +461,12 @@ func TestServerWorkerEndpoint(t *testing.T) {
 	}
 }
 
-// TestServerWorkerEndpointNoProvider: a status server with no consume loop
-// behind it (e.g. `citadel serve`) must answer 200 with the block absent, not
-// 404. A newer CLI uses 404 to mean "this build predates /worker" and falls back
-// to /status; returning it here would send that caller down the slow path
-// forever.
+// TestServerWorkerEndpointNoProvider: a server built with no liveness provider
+// must answer 200 with the block absent, not 404. A newer CLI uses 404 to mean
+// "this build predates /worker" and falls back to /status; returning it here
+// would send that caller down the slow path forever. No production path
+// constructs the server that way today (cmd/work.go always passes the closure),
+// so this pins a protocol guarantee rather than a live case.
 func TestServerWorkerEndpointNoProvider(t *testing.T) {
 	server := NewServer(ServerConfig{}, NewCollector(CollectorConfig{NodeName: "test-node"}))
 
@@ -481,6 +484,91 @@ func TestServerWorkerEndpointNoProvider(t *testing.T) {
 	if env.Worker != nil {
 		t.Errorf("worker = %+v, want absent", env.Worker)
 	}
+}
+
+// TestServerWorkerEndpointServesNoMoreThanStatus pins the route's SIZE, not just
+// its contents. /worker is unauthenticated on a listener that is also reachable
+// over the mesh, and the argument for that is entirely "it serves a subset of
+// what /status already serves there". Nothing else in this file would fail if
+// /worker grew: the other tests assert the worker block is PRESENT and say
+// nothing about what else is absent, so a later `node_name` or `version` added
+// for a caller's convenience would widen an ungated route silently.
+//
+// The top-level assertion is the load-bearing half. The inner comparison is a
+// weaker guard by construction: both endpoints marshal the same *WorkerLiveness,
+// so a field added THERE appears in both and cannot diverge. What can diverge is
+// WorkerEnvelope, which only /worker uses.
+//
+// Every WorkerLiveness field is populated non-zero on purpose: most are
+// omitempty, so a zero value would drop the key and leave this asserting almost
+// nothing.
+func TestServerWorkerEndpointServesNoMoreThanStatus(t *testing.T) {
+	now := time.Now().UTC()
+	collector := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		WorkerLiveness: func() *WorkerLiveness {
+			return &WorkerLiveness{
+				Consuming:          true,
+				LastJobConsumedAt:  &now,
+				LastPollAt:         &now,
+				InFlight:           1,
+				Processed:          2,
+				Failed:             3,
+				IdentityUnresolved: true,
+				PubSubTransport:    "websocket",
+			}
+		},
+	})
+	server := NewServer(ServerConfig{}, collector)
+
+	workerBody := decodeJSONMap(t, func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		server.handleWorker(w, httptest.NewRequest(http.MethodGet, "/worker", nil))
+		return w
+	}())
+
+	topLevel := slices.Sorted(maps.Keys(workerBody))
+	if !slices.Equal(topLevel, []string{"worker"}) {
+		t.Fatalf("/worker top-level keys = %v, want exactly [worker]: this route is unauthenticated, so "+
+			"anything added to WorkerEnvelope widens what an unauthenticated caller can read", topLevel)
+	}
+
+	workerBlock, ok := workerBody["worker"].(map[string]any)
+	if !ok {
+		t.Fatalf("/worker `worker` = %T, want an object", workerBody["worker"])
+	}
+
+	statusBody := decodeJSONMap(t, func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		server.handleStatus(w, httptest.NewRequest(http.MethodGet, "/status", nil))
+		return w
+	}())
+	statusWorker, ok := statusBody["worker"].(map[string]any)
+	if !ok {
+		t.Fatalf("/status `worker` = %T, want an object", statusBody["worker"])
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(workerBlock)) {
+		if _, present := statusWorker[key]; !present {
+			t.Errorf("/worker serves worker.%s and /status does not; the subset claim that justifies "+
+				"leaving this route ungated no longer holds", key)
+		}
+	}
+}
+
+// decodeJSONMap decodes a recorded response into an untyped map, so a test can
+// assert on the keys actually on the wire rather than on the ones its own struct
+// happens to know about.
+func decodeJSONMap(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("StatusCode = %v, want %v", w.Code, http.StatusOK)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(w.Result().Body).Decode(&body); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	return body
 }
 
 func TestServerWorkerEndpointRejectsNonGET(t *testing.T) {

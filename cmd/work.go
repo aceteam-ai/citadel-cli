@@ -2040,7 +2040,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		listenAddr := fmt.Sprintf("%s:%d", workGatewayBind, workGatewayPort)
 		fmt.Printf("   - Gateway: %s://%s\n", scheme, listenAddr)
 		fmt.Println("   - Routes:")
-		fmt.Printf("     /health, /status, /ping  -> %s (status server)\n", statusAddr)
+		fmt.Printf("     /health, /status, /worker, /ping -> %s (status server)\n", statusAddr)
 		fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)

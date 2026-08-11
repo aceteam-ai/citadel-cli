@@ -192,6 +192,10 @@ func printPubSubInfo(w io.Writer) {
 	case state == pubSubProbeMalformed:
 		fmt.Fprintf(w, "  %s\t%s\n", label,
 			faintColor.Sprint("unknown (the worker status server answered with a payload this build could not parse)"))
+	case state == pubSubProbeBadStatus:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (the worker status server answered with an error status: it IS running, "+
+				"so check its logs rather than the --status-port/--gateway setting)"))
 	case state == pubSubProbeNotReported:
 		fmt.Fprintf(w, "  %s\t%s\n", label,
 			faintColor.Sprint("unknown (worker reports no pub/sub transport: not API mode, or an older build)"))
@@ -229,6 +233,12 @@ const (
 	// and reporting it as one would send the operator to enable something that is
 	// already running.
 	pubSubProbeMalformed
+	// pubSubProbeBadStatus: the server answered with a non-2xx we cannot use (and
+	// that is not the 404 meaning "no such route"). Same reason as the two above
+	// for not folding it into Unreachable: an HTTP status is proof something
+	// answered, so "enable --status-port/--gateway" would be advice to change a
+	// setting that is not the problem.
+	pubSubProbeBadStatus
 )
 
 // Probe bounds. Package vars so tests can shrink them rather than sleep.
@@ -265,10 +275,15 @@ func probeWorkerPubSubTransport() (string, pubSubProbeState) {
 	if err == nil {
 		return parsePubSubTransport(body)
 	}
-	// A transport-level failure (refused, timed out) will repeat on /status and
-	// only doubles the operator's wait, so report it rather than retry.
+	// Only a 404 earns the fallback. 404 is the one status that means "this build
+	// has no /worker route": internal/status.Server.buildMux registers no "/"
+	// catch-all, so an unregistered path is answered by net/http itself. Every
+	// other outcome is either a transport failure that will repeat on /status, or
+	// a server that answered and simply could not serve this — and paying for a
+	// full collection on either buys nothing but the sweep's latency, which is
+	// the cost this whole change exists to avoid.
 	var statusErr *httpStatusError
-	if !errors.As(err, &statusErr) {
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
 		return "", classifyProbeError(err)
 	}
 
@@ -282,11 +297,18 @@ func probeWorkerPubSubTransport() (string, pubSubProbeState) {
 	return parsePubSubTransport(body)
 }
 
-// classifyProbeError separates "took too long" from "nothing there", because
-// they are different operator actions and used to print the same string.
+// classifyProbeError maps a probe failure onto the state whose message names the
+// right operator action. Only a failure to reach anything at all may return
+// Unreachable: that is the one state whose message says "enable the status
+// server", and saying it to someone whose server just answered is the exact
+// conflation citadel-cli#735 is about.
 func classifyProbeError(err error) pubSubProbeState {
 	if isTimeoutError(err) {
 		return pubSubProbeTimedOut
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return pubSubProbeBadStatus
 	}
 	return pubSubProbeUnreachable
 }

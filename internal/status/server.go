@@ -418,10 +418,14 @@ type WorkerEnvelope struct {
 // body is a strict SUBSET of what /status already serves unauthenticated here,
 // so this adds a route, not an exposure.
 //
-// A worker that supplies no liveness provider (e.g. `citadel serve`, which runs
-// a status server with no consume loop) answers 200 with the block absent, NOT
-// 404. 404 must keep meaning "this build has no /worker route" so a newer CLI
-// can use it to detect an older worker.
+// A 404 from this route is load-bearing elsewhere: it is what a newer
+// `citadel status` branches on to detect a worker predating the route (see
+// probeWorkerPubSubTransport in cmd/status.go), so this handler must never emit
+// 404 for any other reason. A server built without a liveness provider therefore
+// answers 200 with the block absent. No production path reaches that: the only
+// status.NewServer call site is in cmd/work.go, and both collector constructions
+// there pass the worker liveness closure. It is a guarantee for constructions
+// that wire no provider, not a case that fires today.
 func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
