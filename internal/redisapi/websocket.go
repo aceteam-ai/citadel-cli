@@ -3,7 +3,9 @@ package redisapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -42,6 +44,13 @@ type WSClient struct {
 	// Overridden in tests; see defaultWriteTimeout for the value rationale.
 	writeTimeout time.Duration
 
+	// pingInterval and pongWait drive the keepalive (#734). pongWait is the
+	// read deadline: nothing arriving within it means the socket is dead.
+	// pingInterval is how often we send a ping to provoke traffic. Both are
+	// overridden in tests; see defaultPongWait for the value rationale.
+	pingInterval time.Duration
+	pongWait     time.Duration
+
 	// Message handlers
 	handlers   map[string]func(WSMessage)
 	handlersMu sync.RWMutex
@@ -54,6 +63,14 @@ type WSClient struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
+	// loopsOnce guards the background goroutines. readLoop and pingLoop are
+	// deliberately long-lived: they re-read c.conn every iteration, so they
+	// survive a reconnect and must NOT be started per connection. Connect is
+	// callable again whenever connected is false (the #723 retry loop does
+	// exactly that), and without this a second Connect would start a second
+	// reader -- gorilla permits exactly one concurrent reader (#734, #740).
+	loopsOnce sync.Once
+
 	// Reconnection settings.
 	//
 	// reconnectBackoff is guarded by connMu (#728). It is written by
@@ -62,6 +79,11 @@ type WSClient struct {
 	// read-modify-write and releases it before the caller sleeps. Nothing may
 	// touch it unlocked: reconnect used to, and a torn or stale read there
 	// shortens a backoff.
+	//
+	// The keepalive (#734) is what makes that guard load-bearing rather than
+	// theoretical: handleDisconnect used to fire almost never, and now fires on
+	// every read-deadline expiry, so the reconnect goroutine advances this
+	// field routinely instead of exotically.
 	//
 	// reconnectEnabled and maxBackoff are set once in NewWSClient and never
 	// written again, so they need no guard.
@@ -135,6 +157,8 @@ func NewWSClient(cfg WSClientConfig) *WSClient {
 		reconnectBackoff: initialReconnectBackoff,
 		maxBackoff:       time.Minute,
 		writeTimeout:     defaultWriteTimeout,
+		pingInterval:     defaultPingInterval,
+		pongWait:         defaultPongWait,
 		debugFunc:        cfg.DebugFunc,
 	}
 }
@@ -159,8 +183,11 @@ func (c *WSClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	// Start read loop
-	go c.readLoop()
+	// Both loops outlive any single connection; see loopsOnce.
+	c.loopsOnce.Do(func() {
+		go c.readLoop()
+		go c.pingLoop()
+	})
 
 	return nil
 }
@@ -199,6 +226,15 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 		}
 		return fmt.Errorf("WebSocket connection failed: %w", err)
 	}
+
+	// Arm the keepalive BEFORE publishing the connection (#734).
+	//
+	// SetReadDeadline, SetPongHandler and SetPingHandler are gorilla READ
+	// methods, so they must not run concurrently with ReadMessage. Doing this
+	// while conn is still private -- readLoop cannot see it until c.conn is
+	// assigned under connMu -- is what makes that safe. The handlers only ever
+	// fire from inside ReadMessage afterwards, i.e. on the read goroutine.
+	c.armKeepalive(conn)
 
 	c.conn = conn
 	c.connected = true
@@ -272,10 +308,25 @@ func (c *WSClient) readLoop() {
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			c.debug("ws: read error: %v", err)
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				// The read deadline expired: nothing at all arrived for
+				// pongWait, not even a pong for our pings. Before #734 this
+				// case did not exist and the loop simply blocked forever, so a
+				// half-open socket stayed "connected" while nothing flowed.
+				c.debug("ws: no traffic for %v, treating connection as dead", c.pongWait)
+			} else {
+				c.debug("ws: read error: %v", err)
+			}
 			c.handleDisconnect(conn)
 			continue
 		}
+
+		// Any inbound frame is evidence the peer is alive, so extend the
+		// deadline on data too, not just on pongs. That matters if a proxy or
+		// server ever stops honoring ping frames: a busy connection then still
+		// stays up on its own traffic.
+		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -301,6 +352,91 @@ func (c *WSClient) readLoop() {
 
 		if ok {
 			wildcardHandler(msg)
+		}
+	}
+}
+
+// armKeepalive installs the read deadline and the control-frame handlers on a
+// freshly dialed connection. Caller must not have published conn yet: these are
+// gorilla read methods and cannot race ReadMessage.
+func (c *WSClient) armKeepalive(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
+
+	conn.SetPongHandler(func(string) error {
+		// Our ping came back, so the round trip is intact. Runs on the read
+		// goroutine, from inside ReadMessage.
+		return conn.SetReadDeadline(time.Now().Add(c.pongWait))
+	})
+
+	conn.SetPingHandler(func(appData string) error {
+		// A server-side keepalive counts as liveness too. We still have to
+		// answer it, which gorilla's default handler would have done for us,
+		// so replicate that here including its one-second bound and its error
+		// swallowing: a peer that has already gone away must not turn into a
+		// read error from the pong.
+		//
+		// The short bound is the point. This runs on the read goroutine, and
+		// WriteControl waits on gorilla's write semaphore, which an in-flight
+		// WriteMessage can hold for defaultWriteTimeout. A longer deadline here
+		// would park the ONLY reader behind write congestion, processing no
+		// inbound messages while it waited. Skipping a pong is cheaper: the
+		// timeout is swallowed below, we keep reading, and if the peer really
+		// does give up on us the read deadline notices within pongWait.
+		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(pongReplyWait))
+		if err == websocket.ErrCloseSent {
+			return nil
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return nil
+		}
+		return err
+	})
+}
+
+// pingLoop sends a ping every pingInterval so an idle connection still proves
+// itself. It is long-lived and re-reads c.conn each tick, so it spans
+// reconnects; see loopsOnce.
+//
+// The ping is written with WriteControl, which does NOT need writeMu. Verified
+// against the vendored gorilla source rather than taken on faith: WriteControl
+// takes gorilla's own single-writer semaphore (c.mu) for the duration of the
+// frame, reads writeErr under writeErrMu, and sets the deadline directly on the
+// underlying net.Conn (goroutine-safe) instead of touching the c.writeDeadline
+// field that writeMu exists to guard. The package docs say the same thing in
+// one line: "The Close and WriteControl methods can be called concurrently with
+// all other methods."
+func (c *WSClient) pingLoop() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+		}
+
+		c.connMu.RLock()
+		conn := c.conn
+		connected := c.connected
+		c.connMu.RUnlock()
+
+		if !connected || conn == nil {
+			continue
+		}
+
+		if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(pingWriteWait)); err != nil {
+			// Deliberately advisory: the read deadline is the single authority
+			// on liveness. A ping can fail simply because a large WriteMessage
+			// is holding gorilla's write semaphore, and tearing down a healthy
+			// connection because a control frame queued too long would be a
+			// self-inflicted outage. A genuinely fatal failure is not lost:
+			// gorilla latches it in writeErr, so the next publish tears the
+			// connection down, and no pongs will arrive either way, so the
+			// read deadline fires within pongWait regardless.
+			c.debug("ws: ping failed: %v", err)
 		}
 	}
 }
@@ -543,6 +679,37 @@ const closeWriteWait = 2 * time.Second
 // so it should never fire in normal operation, and well under the worker
 // self-heal stall timer (600s) that would otherwise be the only backstop.
 const defaultWriteTimeout = 15 * time.Second
+
+// Keepalive intervals (#734).
+//
+// defaultPongWait is the read deadline. Nothing arriving on the socket within
+// it -- not a message, not a pong for our own pings -- means the connection is
+// declared dead and torn down. It is sized against the platform's 120s offline
+// sweep, not against network latency: detection has to happen with room to
+// spare, or the node is already marked offline (and refused for targeted
+// dispatch) by the time it notices. 45s detection plus ~1s of reconnect backoff
+// leaves better than 2x margin, and lands inside two 30s heartbeat intervals.
+//
+// defaultPingInterval is one third of it on purpose, so three pings go
+// unanswered before we act. That absorbs a single dropped pong and scheduler
+// jitter on a GPU-saturated node without pushing detection past the sweep.
+// Tightening these buys little (the sweep, not us, sets the deadline that
+// matters) and costs false-positive teardowns of working connections.
+const (
+	defaultPingInterval = 15 * time.Second
+	defaultPongWait     = 45 * time.Second
+)
+
+// pingWriteWait bounds the ping control frame itself. WriteControl blocks until
+// it can take gorilla's write semaphore, which an in-flight WriteMessage holds
+// for up to defaultWriteTimeout, so this is a bound on how long a ping may wait
+// rather than a liveness signal. Failing here is advisory; see pingLoop.
+const pingWriteWait = 10 * time.Second
+
+// pongReplyWait bounds the pong we send in answer to a server ping. It is much
+// shorter than pingWriteWait because that reply runs on the read goroutine; see
+// the ping handler in armKeepalive. It matches gorilla's own default handler.
+const pongReplyWait = time.Second
 
 // tryLockWrite acquires writeMu, giving up after d. Close must not block
 // forever behind a wedged writer (see the deadline note in Close), so it needs
