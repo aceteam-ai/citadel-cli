@@ -279,9 +279,9 @@ func probeWorkerPubSubTransport() (string, pubSubProbeState) {
 	// has no /worker route": internal/status.Server.buildMux registers no "/"
 	// catch-all, so an unregistered path is answered by net/http itself. Every
 	// other outcome is either a transport failure that will repeat on /status, or
-	// a server that answered and simply could not serve this — and paying for a
-	// full collection on either buys nothing but the sweep's latency, which is
-	// the cost this whole change exists to avoid.
+	// a server that answered and simply could not serve this. Paying for a full
+	// collection on either buys nothing but the sweep's latency, which is the
+	// cost this whole change exists to avoid.
 	var statusErr *httpStatusError
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
 		return "", classifyProbeError(err)
