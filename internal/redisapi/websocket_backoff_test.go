@@ -174,24 +174,69 @@ func TestNextReconnectDelayAdvancesAtomically(t *testing.T) {
 }
 
 // TestSuccessfulConnectResetsReconnectBackoff pins the other half of the
-// schedule: a connection that comes back returns the node to the initial delay,
-// so a later blip does not start out already backed off to a minute.
+// schedule: a connection that comes back and PROVES itself returns the node to
+// the initial delay once it is torn down, so a later blip does not start out
+// already backed off to a minute.
+//
+// This test used to assert the reset happened immediately at Connect()
+// success. #746 moved it: connectLocked resetting on every successful dial,
+// regardless of what happened next, was the bug -- a peer that dials fine but
+// never answers a ping then gets torn down every pongWait, the redial
+// succeeds, the schedule resets to 1s, and the node redials forever at
+// roughly pongWait+1s instead of backing off. The reset now happens in
+// handleDisconnect, and only for a connection old enough to have proved
+// itself; see the connEstablishedAt / provenConnDurationMultiplier comments on
+// the reconnectBackoff field and on handleDisconnect.
 func TestSuccessfulConnectResetsReconnectBackoff(t *testing.T) {
 	srv := newDrainingWSServer(t)
 
 	c := NewWSClient(WSClientConfig{BaseURL: srv.URL, Token: "test-token"})
 	c.reconnectEnabled = false
+	// Scaled down so the test does not have to wait out production's 45s
+	// pongWait to reach the proven threshold, but keeping the same 1:4
+	// ping-to-deadline ratio so the connection is actually kept alive by real
+	// pong traffic (newDrainingWSServer answers pings via gorilla's default
+	// handler) rather than free-running to its own read-deadline teardown
+	// before the test's manual one.
+	c.pingInterval = 10 * time.Millisecond
+	c.pongWait = 40 * time.Millisecond
 	t.Cleanup(func() { _ = c.Close() })
 
 	c.reconnectBackoff = 42 * time.Second
-	// Zero draw, so the assertion below is on the reset value itself.
+	// Zero draw, so the assertions below are on the reset value itself.
 	c.jitterFrac = func() float64 { return 0 }
 
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 
-	if got := c.nextReconnectDelay(); got != initialReconnectBackoff {
-		t.Fatalf("delay after a successful connect = %v, want %v", got, initialReconnectBackoff)
+	// Immediately after Connect, the schedule must be UNCHANGED: the
+	// connection has had no chance to prove anything yet, and a dial alone
+	// must not reset it (#746).
+	c.connMu.RLock()
+	got := c.reconnectBackoff
+	c.connMu.RUnlock()
+	if got != 42*time.Second {
+		t.Fatalf("schedule right after Connect = %v, want unchanged 42s", got)
+	}
+
+	// Let the connection survive well past the proven threshold (kept alive by
+	// real pong traffic; see the client setup above), then tear it down the
+	// way a real read-deadline expiry would.
+	time.Sleep(3 * time.Duration(provenConnDurationMultiplier) * c.pongWait)
+	c.connMu.RLock()
+	conn := c.conn
+	connected := c.connected
+	c.connMu.RUnlock()
+	if !connected {
+		t.Fatal("connection was torn down on its own before the manual handleDisconnect below; the keepalive is not holding it up as expected")
+	}
+	c.handleDisconnect(conn)
+
+	c.connMu.RLock()
+	got = c.reconnectBackoff
+	c.connMu.RUnlock()
+	if got != initialReconnectBackoff {
+		t.Fatalf("schedule after a proven connection's teardown = %v, want %v", got, initialReconnectBackoff)
 	}
 }

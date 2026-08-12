@@ -25,6 +25,12 @@ type WSClient struct {
 	connMu    sync.RWMutex
 	connected bool
 
+	// connEstablishedAt is when the current conn was published (connectLocked).
+	// Guarded by connMu, like conn/connected. handleDisconnect reads it against
+	// pongWait to decide whether the connection PROVED itself before it died --
+	// see the #746 note on reconnectBackoff below. Zero when conn is nil.
+	connEstablishedAt time.Time
+
 	// writeMu serializes gorilla "write methods" (WriteMessage,
 	// SetWriteDeadline) on conn. gorilla supports exactly ONE concurrent
 	// writer and panics with "concurrent write to websocket connection"
@@ -74,17 +80,25 @@ type WSClient struct {
 
 	// Reconnection settings.
 	//
-	// reconnectBackoff is guarded by connMu (#728). It is written by
-	// connectLocked, whose caller already holds connMu for write, and it is
-	// advanced by nextReconnectDelay, which takes connMu for the whole
-	// read-modify-write and releases it before the caller sleeps. Nothing may
-	// touch it unlocked: reconnect used to, and a torn or stale read there
-	// shortens a backoff.
+	// reconnectBackoff is guarded by connMu (#728). It is advanced by
+	// nextReconnectDelay, which takes connMu for the whole read-modify-write
+	// and releases it before the caller sleeps. Nothing may touch it unlocked:
+	// reconnect used to, and a torn or stale read there shortens a backoff.
 	//
 	// The keepalive (#734) is what makes that guard load-bearing rather than
 	// theoretical: handleDisconnect used to fire almost never, and now fires on
 	// every read-deadline expiry, so the reconnect goroutine advances this
 	// field routinely instead of exotically.
+	//
+	// It is reset to initialReconnectBackoff in exactly two places, neither of
+	// which is "a dial succeeded" (that was #746's bug -- see the note there):
+	//   - handleDisconnect, when the connection being torn down PROVED itself
+	//     (survived long enough that connEstablishedAt shows real traffic kept
+	//     its read deadline alive, not just that the dial worked).
+	//   - reconnect, after honoring a server-requested retry_after on a 429
+	//     (#747): once the server has spoken, it is the authority, so the local
+	//     schedule resumes from the start rather than from wherever doubling
+	//     had already taken it.
 	//
 	// reconnectEnabled and maxBackoff are set once in NewWSClient and never
 	// written again, so they need no guard.
@@ -143,9 +157,24 @@ type WSMessage struct {
 }
 
 // initialReconnectBackoff is the delay before the first reconnect attempt, and
-// the value the schedule returns to after any successful connect. It lives in
-// one place so the constructor and the reset in connectLocked cannot drift.
+// the value the schedule returns to once a connection has PROVED itself (see
+// handleDisconnect, #746) or once a 429's retry_after has been honored in full
+// (see reconnect, #747). It lives in one place so the constructor and both
+// resets cannot drift.
 const initialReconnectBackoff = time.Second
+
+// provenConnDurationMultiplier is how many pongWait cycles a connection must
+// survive before handleDisconnect treats it as having proved itself and resets
+// reconnectBackoff (#746).
+//
+// It is expressed as a multiple of pongWait, not a fixed duration, because
+// pongWait is what times out a silent connection: surviving several of those
+// cycles is only possible if the read deadline was genuinely pushed out by
+// real traffic (a pong or a message; see armKeepalive), not merely by a dial
+// that happened to succeed. A single cycle is not enough margin -- a
+// connection that dies right at (rather than comfortably past) the deadline
+// should not count -- so this is "a few", matching the guidance in #746 itself.
+const provenConnDurationMultiplier = 3
 
 // Reconnect jitter.
 //
@@ -187,17 +216,18 @@ const initialReconnectBackoff = time.Second
 // after roughly seven consecutive failed dials, and publishes fall back to HTTP
 // throughout (see Client.Publish).
 //
-// Note what this does NOT fix, so nobody reads more into it than is there: the
-// flap in #734's own "what this makes worse" (a peer that is alive but never
-// pongs, torn down every pongWait, reconnecting at one second, forever) has a
-// period dominated by pongWait, not by the backoff. One second of jitter per
-// 46-second cycle random-walks those phases apart far too slowly to matter. Two
-// things would actually address it, both filed rather than done here: #746, not
-// resetting the schedule for a connection that never proved itself, and #747,
-// honoring the typed rate-limit hint that connectLocked already builds and
-// reconnect currently discards. #747 outranks this jitter for a 429ing endpoint,
-// because it uses the interval the server actually sent rather than one we
-// invented.
+// Note what this does NOT fix on its own, so nobody reads more into the jitter
+// than is there: the flap in #734's own "what this makes worse" (a peer that is
+// alive but never pongs, torn down every pongWait, reconnecting at one second,
+// forever) has a period dominated by pongWait, not by the backoff. One second of
+// jitter per 46-second cycle random-walks those phases apart far too slowly to
+// matter. Two things actually address it, both implemented alongside this
+// jitter rather than by it: #746, not resetting the schedule for a connection
+// that never proved itself (see the connEstablishedAt note on reconnectBackoff
+// above, and handleDisconnect), and #747, honoring the typed rate-limit hint
+// that connectLocked already builds and reconnect used to discard (see
+// reconnect). #747 outranks this jitter for a 429ing endpoint, because it uses
+// the interval the server actually sent rather than one we invented.
 
 // NewWSClient creates a new WebSocket client.
 func NewWSClient(cfg WSClientConfig) *WSClient {
@@ -299,10 +329,15 @@ func (c *WSClient) connectLocked(ctx context.Context) error {
 
 	c.conn = conn
 	c.connected = true
-	// Reset the backoff schedule on a successful connection. The caller holds
-	// connMu for write, which is what makes this assignment safe against
-	// nextReconnectDelay running in a reconnect goroutine (#728).
-	c.reconnectBackoff = initialReconnectBackoff
+	// Record when THIS connection was established, not whether it will reset
+	// the backoff (#746). A dial succeeding is not evidence the connection is
+	// useful -- a peer that is alive but never pongs dials fine and then dies
+	// at the next pongWait every time -- so the reset itself happens later, in
+	// handleDisconnect, only if this connection survives long enough to prove
+	// it. The caller holds connMu for write, which is what makes this
+	// assignment safe against nextReconnectDelay running in a reconnect
+	// goroutine (#728).
+	c.connEstablishedAt = time.Now()
 
 	c.debug("ws: connected successfully")
 
@@ -516,8 +551,28 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 	}
 	c.connected = false
 	if c.conn != nil {
+		// #746: reset the backoff schedule here, on teardown, and only for a
+		// connection that PROVED itself -- never unconditionally on dial
+		// success (that was the bug: connectLocked used to reset on every
+		// successful dial regardless of what happened after). A peer that is
+		// alive but never pongs (a proxy stripping control frames, a server
+		// that stopped ponging) then gets torn down every pongWait, the redial
+		// succeeds, the schedule resets to 1s, and the node redials roughly
+		// every pongWait+1s FOREVER instead of backing off toward maxBackoff
+		// like any other repeated failure.
+		//
+		// "Proved itself" is measured as this connection's age against
+		// provenConnDurationMultiplier*pongWait; see the comment there for why
+		// age is a sound proxy for real traffic having kept it alive.
+		if !c.connEstablishedAt.IsZero() {
+			proven := time.Since(c.connEstablishedAt) >= time.Duration(provenConnDurationMultiplier)*c.pongWait
+			if proven {
+				c.reconnectBackoff = initialReconnectBackoff
+			}
+		}
 		c.conn.Close()
 		c.conn = nil
+		c.connEstablishedAt = time.Time{}
 	}
 	c.connMu.Unlock()
 
@@ -534,10 +589,11 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 //
 // The read, the doubling and the clamp all happen in ONE critical section under
 // connMu, and the caller sleeps on the returned value instead of re-reading the
-// field. reconnect used to do all of it with no lock at all, racing the reset in
-// connectLocked, which runs under connMu (#728). It also read the field twice,
-// once to log the delay and once to sleep it, so a reset landing between the two
-// made the node retry sooner than it had just announced.
+// field. reconnect used to do all of it with no lock at all, racing the resets
+// in handleDisconnect and connectLocked, all of which run under connMu (#728).
+// It also read the field twice, once to log the delay and once to sleep it, so
+// a reset landing between the two made the node retry sooner than it had just
+// announced.
 //
 // Both defects point the same way, and it is the way that hurts: anything that
 // silently shortens a backoff moves toward the #443 restart storm referenced
@@ -545,9 +601,9 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 // daily Redis-API quota and locked it out for about a day.
 //
 // connMu is reused deliberately rather than adding a third mutex to this file.
-// The reset has to live in connectLocked, which is the only place that knows a
-// dial succeeded and whose caller already holds connMu, so connMu costs no extra
-// lock and no nested acquire. connMu is NOT held across the sleep.
+// Both resets (handleDisconnect for #746, reconnect for #747) already run under
+// connMu for other reasons, so connMu costs no extra lock and no nested acquire
+// there either. connMu is NOT held across the sleep.
 //
 // The returned delay is JITTERED; the stored schedule is not. See the jitter
 // note above initialReconnectBackoff for why it is additive and upward-only,
@@ -569,9 +625,9 @@ func (c *WSClient) nextReconnectDelay() time.Duration {
 // jitteredLocked spreads base over [base, 2*base). Caller holds connMu.
 //
 // Only the RETURNED sleep is randomized. c.reconnectBackoff keeps holding the
-// clean doubling, so the schedule stays predictable, connectLocked's reset still
-// means exactly "back to one second", and nothing accumulates randomness across
-// attempts.
+// clean doubling, so the schedule stays predictable, a reset (handleDisconnect
+// or reconnect; see the reconnectBackoff field comment) still means exactly
+// "back to one second", and nothing accumulates randomness across attempts.
 func (c *WSClient) jitteredLocked(base time.Duration) time.Duration {
 	if base <= 0 {
 		return base
@@ -623,7 +679,88 @@ func (c *WSClient) sleepUnlessDone(d time.Duration) bool {
 	}
 }
 
-// reconnect attempts to reconnect with exponential backoff
+// reconnectRateLimitChunk bounds a single sleep against a server-requested
+// retry_after (#747), mirroring cmd/work.go's connectRateLimitChunk: honoring a
+// very long wait (e.g. retry_after: 86400 on a daily quota) must not turn into
+// an hours-long timer that only re-checks Close once at the very end.
+const reconnectRateLimitChunk = 90 * time.Second
+
+// sleepUnlessDoneUntil is sleepUnlessDone's chunked form, for a wait whose
+// total length may be very large (a server-requested retry_after, #747). It
+// sleeps in bounded chunks, re-checking c.done between them -- the same policy
+// cmd/work.go's sleepUntilCtx uses for the HTTP retry path (connectWithBackoffLabeled),
+// so the WebSocket path honors retry_after the same way the REST path already
+// does rather than inventing a second scheme. Returns false the moment Close
+// happens, at any point in the wait.
+func (c *WSClient) sleepUnlessDoneUntil(deadline time.Time) bool {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			select {
+			case <-c.done:
+				return false
+			default:
+				return true
+			}
+		}
+		chunk := remaining
+		if chunk > reconnectRateLimitChunk {
+			chunk = reconnectRateLimitChunk
+		}
+		if !c.sleepUnlessDone(chunk) {
+			return false
+		}
+	}
+}
+
+// fireReconnectCallbacks runs the registered OnReconnect callbacks.
+//
+// Split out of reconnect because #748 needs it from two call sites: the normal
+// "reconnect dialed successfully" path, and the "a racing Connect() already
+// re-established the connection" path (see bailIfAlreadyReconnected). Callbacks
+// run without any lock held -- they may call sendMessage, which takes connMu
+// for read, so holding connMu here would deadlock a callback against its own
+// caller.
+func (c *WSClient) fireReconnectCallbacks() {
+	c.reconnectCallbacksMu.RLock()
+	cbs := make([]func(), len(c.reconnectCallbacks))
+	copy(cbs, c.reconnectCallbacks)
+	c.reconnectCallbacksMu.RUnlock()
+
+	for _, cb := range cbs {
+		cb()
+	}
+}
+
+// bailIfAlreadyReconnected reports whether a racing Connect() has already
+// re-established the connection (#748), and if so fires the reconnect
+// callbacks before telling the caller to stop.
+//
+// Connect() itself deliberately never fires OnReconnect (see its doc comment:
+// only actual reconnects do, not the initial connect). But from a caller's
+// point of view, THIS is a reconnect -- the socket had gone down and
+// handleDisconnect had already spawned this goroutine to bring it back -- it
+// just happened to be Connect() that won the race, most likely the #723
+// background retry loop (enableWebSocketWithRetry) polling in on its own
+// schedule. If reconnect silently returned here without firing anything, a
+// caller that relies on OnReconnect to re-arm (e.g. re-subscribing at a higher
+// layer) would end up connected but with nothing flowing -- the exact failure
+// #734 exists to prevent. So reconnect, not Connect, is the one piece of code
+// responsible for firing the callbacks in this race, and it does so exactly
+// once, for whichever side's connection is the one left standing.
+func (c *WSClient) bailIfAlreadyReconnected() bool {
+	c.connMu.RLock()
+	connected := c.connected
+	c.connMu.RUnlock()
+	if !connected {
+		return false
+	}
+	c.debug("ws: reconnect: already connected (a racing Connect() won), firing callbacks instead of dialing again")
+	c.fireReconnectCallbacks()
+	return true
+}
+
+// reconnect attempts to reconnect with exponential backoff.
 func (c *WSClient) reconnect() {
 	for {
 		select {
@@ -632,11 +769,7 @@ func (c *WSClient) reconnect() {
 		default:
 		}
 
-		c.connMu.RLock()
-		alreadyConnected := c.connected
-		c.connMu.RUnlock()
-
-		if alreadyConnected {
+		if c.bailIfAlreadyReconnected() {
 			return
 		}
 
@@ -646,28 +779,55 @@ func (c *WSClient) reconnect() {
 			return
 		}
 
+		// Re-check under the SAME lock that performs the dial (#748). c.done
+		// is re-checked by sleepUnlessDone above, but c.connected was not
+		// re-checked at all: a Connect() landing anywhere during the sleep
+		// (bailIfAlreadyReconnected only catches one landing BEFORE the sleep
+		// started) would set c.conn = A, connected = true, and then this
+		// goroutine would wake up and call connectLocked unconditionally,
+		// which dials a SECOND connection B, overwrites c.conn with it, and
+		// never closes A. A is orphaned: an open FD and a server-side
+		// connection that nothing will ever read (readLoop follows c.conn,
+		// which now points at B) or close.
 		c.connMu.Lock()
+		if c.connected {
+			c.connMu.Unlock()
+			c.debug("ws: reconnect: Connect() already re-established the connection during the backoff sleep, skipping duplicate dial")
+			c.fireReconnectCallbacks()
+			return
+		}
 		err := c.connectLocked(context.Background())
 		c.connMu.Unlock()
 
 		if err != nil {
 			c.debug("ws: reconnect failed: %v", err)
+
+			// #747: a rejected dial against a 429ing endpoint carries a typed
+			// retry_after (connectLocked / rateLimitFromUpgrade). Falling
+			// through to our own doubling schedule here would poll TIGHTER
+			// than the server just asked -- the #443 shape, where a tight
+			// retry loop burned a node's daily Redis-API quota and locked it
+			// out for about a day. Honor the server's interval instead, in
+			// done-aware chunks so a shutdown still interrupts the sleep
+			// (mirrors cmd/work.go's connectWithBackoffLabeled), and reset the
+			// local schedule afterwards: once the server has spoken, it is the
+			// authority, not wherever our own doubling had gotten to.
+			if rle, ok := AsRateLimitError(err); ok {
+				if wait := rle.Wait(time.Now()); wait > 0 {
+					c.debug("ws: reconnect: rate limited (limit=%d window=%q), honoring server backoff of %s instead of local schedule", rle.Limit, rle.Window, wait)
+					if !c.sleepUnlessDoneUntil(time.Now().Add(wait)) {
+						return
+					}
+					c.connMu.Lock()
+					c.reconnectBackoff = initialReconnectBackoff
+					c.connMu.Unlock()
+				}
+			}
 			continue
 		}
 
 		c.debug("ws: reconnected successfully")
-
-		// Fire reconnect callbacks AFTER releasing connMu to avoid
-		// deadlock (callbacks may call sendMessage which takes RLock).
-		c.reconnectCallbacksMu.RLock()
-		cbs := make([]func(), len(c.reconnectCallbacks))
-		copy(cbs, c.reconnectCallbacks)
-		c.reconnectCallbacksMu.RUnlock()
-
-		for _, cb := range cbs {
-			cb()
-		}
-
+		c.fireReconnectCallbacks()
 		return
 	}
 }
