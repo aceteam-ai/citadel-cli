@@ -129,6 +129,92 @@ func TestRefuseFullWipeSurfacesReportFailure(t *testing.T) {
 	}
 }
 
+// TestRefuseFullWipeSkipsNeverManagedNode is the #733 root-cause regression: a
+// node the control plane has NEVER assigned any desired state to (Revision ==
+// "0", the zero value the control plane serves when it holds no
+// fabric_node_module_desired row for this node at all) must not be treated as
+// "misconfigured". Before this fix EVERY node hit this path forever, because
+// nothing writes that durable store yet — the guard fired and errored on every
+// single pass (4574+ times over 5+ days, observed on node 1297). It must now
+// succeed as a no-op converge (nothing installed, nothing uninstalled) while
+// still reporting the observed actual state, exactly like a legitimate
+// converged pass.
+func TestRefuseFullWipeSkipsNeverManagedNode(t *testing.T) {
+	ops := newFakeOps(
+		InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning},
+		InstalledModule{Name: "b", Source: "src-b", Health: HealthRunning},
+	)
+	provider := &FakeProvider{Desired: DesiredState{Revision: "0"}} // never managed
+	rec := NewReconciler(provider, ops, "node-1297")
+	rec.RefuseFullWipe = true
+
+	plan, _, err := rec.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("never-managed node with modules installed must succeed as a no-op, got: %v", err)
+	}
+	if !plan.IsEmpty() {
+		t.Errorf("want empty plan (nothing to converge to), got %+v", plan.Steps)
+	}
+	for _, c := range ops.calls {
+		if strings.HasPrefix(c, "uninstall:") {
+			t.Fatalf("a never-managed node must not uninstall anything, saw %q", c)
+		}
+	}
+	if len(provider.Reported) != 1 {
+		t.Fatalf("want exactly 1 report, got %d", len(provider.Reported))
+	}
+	report := provider.Reported[0]
+	if len(report.Modules) != 2 {
+		t.Fatalf("want 2 reported modules, got %d (%+v)", len(report.Modules), report.Modules)
+	}
+	// Unlike the refused-and-errored path, this IS a (no-op) converge, so the
+	// revision handshake stamps normally.
+	if report.AppliedRevision != "0" {
+		t.Errorf("AppliedRevision = %q, want %q (echoed like any other converge)", report.AppliedRevision, "0")
+	}
+}
+
+// TestRefuseFullWipeSkipsNeverManagedNodeEmptyRevision confirms the same
+// no-op behavior when Revision is the empty string, not just the literal "0"
+// — both are DesiredState.NeverManaged().
+func TestRefuseFullWipeSkipsNeverManagedNodeEmptyRevision(t *testing.T) {
+	ops := newFakeOps(InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning})
+	provider := &FakeProvider{Desired: DesiredState{Revision: ""}}
+	rec := NewReconciler(provider, ops, "node")
+	rec.RefuseFullWipe = true
+
+	plan, _, err := rec.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("never-managed node (empty revision) must succeed as a no-op, got: %v", err)
+	}
+	if !plan.IsEmpty() {
+		t.Errorf("want empty plan, got %+v", plan.Steps)
+	}
+}
+
+// TestDesiredStateNeverManaged pins the predicate directly: only the true
+// zero-history values ("" and "0") count as never-managed; any other revision
+// — including a non-numeric opaque token, which is all the wire contract
+// promises — means the control plane has a history for this node.
+func TestDesiredStateNeverManaged(t *testing.T) {
+	cases := []struct {
+		revision string
+		want     bool
+	}{
+		{"", true},
+		{"0", true},
+		{"1", false},
+		{"rev-42", false},
+		{"1784231386757", false},
+	}
+	for _, c := range cases {
+		got := DesiredState{Revision: c.revision}.NeverManaged()
+		if got != c.want {
+			t.Errorf("DesiredState{Revision: %q}.NeverManaged() = %v, want %v", c.revision, got, c.want)
+		}
+	}
+}
+
 // TestRefuseFullWipeAllowsEmptyDesiredWhenNothingInstalled confirms the guard is
 // scoped: an empty desired set on an empty node is a legitimate no-op converge.
 func TestRefuseFullWipeAllowsEmptyDesiredWhenNothingInstalled(t *testing.T) {

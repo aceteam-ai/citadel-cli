@@ -96,13 +96,31 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	// are installed (likely an empty/misconfigured control plane), rather than
 	// uninstalling everything the node runs.
 	//
-	// Refusing to APPLY is not a reason to stop OBSERVING (#733). The guard used
-	// to return here, before the report at the bottom of this function, so a node
-	// that tripped it never told the control plane what it had installed. The
-	// destructive path stays refused; the observability path still runs, so an
-	// operator can see the installed set against the empty desired set instead of
-	// only a log line repeating every pass.
-	if r.RefuseFullWipe && len(desired.Modules) == 0 && len(actual) > 0 {
+	// An empty desired set with modules installed splits into two situations
+	// that must NOT be treated the same way (#733 root cause):
+	//
+	//   - UNMANAGED: the control plane has never assigned this node ANY desired
+	//     state (DesiredState.NeverManaged — see its doc: Revision is the zero
+	//     value the control plane serves only when it holds no
+	//     fabric_node_module_desired row for this node at all, live or
+	//     soft-deleted). There is nothing to refuse: the node was never told to
+	//     converge to anything, so this is not a misconfiguration, it is a node
+	//     that is simply not under declarative module management yet — true of
+	//     essentially every node today, since nothing yet writes that durable
+	//     store (aceteam#4273's deferred follow-up; see PR description). Treating
+	//     this as an error made the guard trip every single pass forever (4574+
+	//     times over 5+ days on node 1297, which was never assigned anything).
+	//   - MANAGED: the control plane DOES have a revision history for this node
+	//     (it was assigned modules at some point) and is now serving zero. That
+	//     is the genuine "empty/misconfigured control plane" foot-gun this guard
+	//     exists for — refuse and error, exactly as before.
+	//
+	// Both situations still refuse to APPLY: neither calls Reconcile/Apply below,
+	// so neither can produce an uninstall plan. Only whether the refusal is
+	// logged as an error differs. Refusing to APPLY is also not a reason to stop
+	// OBSERVING (#733): both situations still report the observed actual state.
+	emptyWithModulesInstalled := r.RefuseFullWipe && len(desired.Modules) == 0 && len(actual) > 0
+	if emptyWithModulesInstalled && !desired.NeverManaged() {
 		guardErr := fmt.Errorf(
 			"reconcile: refusing empty desired state with %d module(s) installed (possible control-plane misconfiguration)", len(actual))
 		// Report the state the guard OBSERVED (no re-listing: `actual` is that
@@ -118,15 +136,22 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 		return Plan{}, ApplyResult{}, errors.Join(guardErr, reportErr)
 	}
 
-	plan, err := Reconcile(ctx, desired, actual)
-	if err != nil {
-		return Plan{}, ApplyResult{}, err
+	var plan Plan
+	var applyRes ApplyResult
+	if !emptyWithModulesInstalled {
+		plan, err = Reconcile(ctx, desired, actual)
+		if err != nil {
+			return Plan{}, ApplyResult{}, err
+		}
+		applyRes, err = Apply(ctx, r.Ops, plan)
+		if err != nil {
+			return plan, applyRes, err
+		}
 	}
-
-	applyRes, err := Apply(ctx, r.Ops, plan)
-	if err != nil {
-		return plan, applyRes, err
-	}
+	// else: an unmanaged node with modules installed. Nothing was ever assigned,
+	// so there is nothing to converge — plan/applyRes stay zero-valued (an
+	// empty, successful pass) and execution falls through to report the observed
+	// actual state below, same as any other converged pass.
 
 	// Report actual state back (best-effort: a report failure does not undo a
 	// successful converge, but it IS surfaced to the caller).
@@ -134,9 +159,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	if err != nil {
 		return plan, applyRes, err
 	}
-	// Revision handshake: echo the desired revision the node just converged to.
-	// Set unconditionally (even on partial per-module failure) — the node HAS
-	// processed this revision; failures surface per-module as Health == HealthError.
+	// Revision handshake: echo the desired revision the node just converged to
+	// (or, for the unmanaged no-op above, the "never managed" revision it
+	// correctly did nothing with). Set unconditionally (even on partial
+	// per-module failure) — the node HAS processed this revision; failures
+	// surface per-module as Health == HealthError.
 	report.AppliedRevision = desired.Revision
 	if err := r.Provider.Report(ctx, report); err != nil {
 		return plan, applyRes, err
