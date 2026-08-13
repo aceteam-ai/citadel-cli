@@ -59,6 +59,11 @@ func isValidIP(s string) bool {
 	return err == nil
 }
 
+// ensureNetworkConnectedFn indirects ensureNetworkConnected so tests (e.g.
+// connectToNode's routing tests, #754) can stub it without a live mesh.
+// Mirrors the listenVPNFn pattern in cmd/controlcenter.go.
+var ensureNetworkConnectedFn = ensureNetworkConnected
+
 // ensureNetworkConnected verifies the network connection and reconnects if needed.
 // Returns an error if the network cannot be established.
 func ensureNetworkConnected(ctx context.Context) error {

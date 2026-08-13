@@ -11,11 +11,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,11 +45,11 @@ import (
 // default (citadel #585, DefaultSessionName="citadel"), so a repeated connect —
 // or a reconnect after a drop — re-attaches to the same live shell. Operators
 // can force a bare shell with CITADEL_TERMINAL_SESSION=none.
-func runRemoteShell(target string) error {
+func runRemoteShell(target, passcode string) error {
 	// Ensure the mesh is up before resolving/dialing.
 	netCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := ensureNetworkConnected(netCtx); err != nil {
+	if err := ensureNetworkConnectedFn(netCtx); err != nil {
 		return err
 	}
 
@@ -69,16 +72,7 @@ func runRemoteShell(target string) error {
 	}
 
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", connectTerminalPort))
-	query := url.Values{}
-	if token != "" {
-		query.Set("token", token)
-	}
-	wsURL := url.URL{
-		Scheme:   "ws",
-		Host:     addr,
-		Path:     "/terminal",
-		RawQuery: query.Encode(),
-	}
+	wsURL := terminalWSURL(addr, token, passcode)
 
 	display := hostname
 	if display == "" {
@@ -107,11 +101,113 @@ func runRemoteShell(target string) error {
 	return pumpRemoteShell(conn)
 }
 
+// terminalWSURL builds the terminal endpoint's WebSocket upgrade URL for
+// addr (host:port), forwarding token and/or passcode as query parameters the
+// same way the server reads them (internal/terminal/server.go:
+// r.URL.Query().Get("token") / .Get("passcode")). Each is set ONLY when
+// non-empty, so a node with neither configured sees the exact same request
+// it always has, and a node passcode (citadel#753) is never appended when
+// none was supplied. Pure and side-effect-free so the exact query string
+// (notably, the "passcode" key's presence) can be pinned by a test.
+func terminalWSURL(addr, token, passcode string) url.URL {
+	query := url.Values{}
+	if token != "" {
+		query.Set("token", token)
+	}
+	if passcode != "" {
+		query.Set("passcode", passcode)
+	}
+	return url.URL{
+		Scheme:   "ws",
+		Host:     addr,
+		Path:     "/terminal",
+		RawQuery: query.Encode(),
+	}
+}
+
+// terminalDialErrKind classifies why the ts-net terminal-endpoint dial failed
+// (#754), so connectToNode knows whether to prompt for a passcode and retry,
+// fall back to the legacy raw-sshd path, or just report the error as-is.
+type terminalDialErrKind int
+
+const (
+	// terminalDialErrOther covers every dial failure that is neither a
+	// passcode rejection nor a bare connection-refused: forbidden/not-found
+	// auth rejections, 503, malformed handshake, etc. Never a fallback
+	// trigger and never a passcode-retry trigger, surfaced as-is.
+	terminalDialErrOther terminalDialErrKind = iota
+	// terminalDialErrUnreachable means the ts-net terminal endpoint refused
+	// the TCP connection outright (not listening / 'citadel work' not
+	// running / --no-terminal). Safe to fall back to raw sshd for.
+	terminalDialErrUnreachable
+	// terminalDialErrPasscode means the endpoint IS reachable but rejected
+	// the connection with the terminal passcode gate (HTTP 401, node
+	// passcode required). NOT a fallback trigger: the caller should prompt
+	// for a passcode and retry ts-net.
+	terminalDialErrPasscode
+)
+
+// terminalDialError wraps a ts-net terminal-endpoint dial failure with a
+// classification connectToNode uses to route between prompting for a
+// passcode, falling back to raw sshd, and reporting the error directly.
+type terminalDialError struct {
+	kind terminalDialErrKind
+	err  error
+}
+
+func (e *terminalDialError) Error() string { return e.err.Error() }
+func (e *terminalDialError) Unwrap() error { return e.err }
+
+// terminalErrorBody mirrors the JSON error shape internal/terminal/server.go
+// writes ({"error":...,"status":...}, plus an optional "reason" field added
+// by citadel#753) closely enough to detect the passcode gate, without
+// importing that package: the wire contract, not the Go type, is what a
+// client should couple to (same rationale as isConnRefused's string match).
+type terminalErrorBody struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+}
+
+// isPasscodeRequiredResponse reports whether a 401 from the terminal
+// endpoint is specifically the passcode gate (node passcode required)
+// rather than a rejected/invalid auth token: both return HTTP 401
+// (internal/terminal/server.go resolveAuth vs. the PasscodeVerifier check),
+// so the response body is the only thing that tells them apart. A
+// malformed/unreadable body is treated as NOT passcode-required (falls
+// through to the existing generic auth-rejected message) rather than
+// guessing. The "reason" field (citadel#753) is read opportunistically when
+// present but never required; the "error" text is the stable contract.
+func isPasscodeRequiredResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return false
+	}
+	var body terminalErrorBody
+	if err := json.Unmarshal(data, &body); err != nil {
+		return false
+	}
+	if strings.HasPrefix(body.Reason, "passcode_") {
+		return true
+	}
+	return body.Error == "node passcode required"
+}
+
 // remoteShellDialError turns a WebSocket dial failure into an actionable message.
 func remoteShellDialError(err error, resp *http.Response, display, addr string) error {
 	if resp != nil {
 		switch resp.StatusCode {
-		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		case http.StatusUnauthorized:
+			if isPasscodeRequiredResponse(resp) {
+				return &terminalDialError{
+					kind: terminalDialErrPasscode,
+					err:  fmt.Errorf("%s requires a node passcode", display),
+				}
+			}
+			return fmt.Errorf("authentication rejected by %s (HTTP %d): mesh-peer identity was not accepted (target may have mesh trust disabled, or we are not a same-owner tailnet peer) and no valid --token was supplied", display, resp.StatusCode)
+		case http.StatusForbidden, http.StatusNotFound:
 			return fmt.Errorf("authentication rejected by %s (HTTP %d): mesh-peer identity was not accepted (target may have mesh trust disabled, or we are not a same-owner tailnet peer) and no valid --token was supplied", display, resp.StatusCode)
 		case http.StatusServiceUnavailable:
 			return fmt.Errorf("%s is at capacity or its auth service is unavailable (HTTP %d)", display, resp.StatusCode)
@@ -120,6 +216,19 @@ func remoteShellDialError(err error, resp *http.Response, display, addr string) 
 		}
 	}
 	// No HTTP response => transport-level failure (refused / unreachable).
+	if isConnRefused(err) {
+		// Reuses the isConnRefused pattern from cmd/mesh.go: a refused dial
+		// means the terminal endpoint isn't listening at all (e.g.
+		// 'citadel work' isn't running, or --no-terminal), which IS safe to
+		// fall back to raw sshd for (#754), unlike the passcode case above.
+		return &terminalDialError{
+			kind: terminalDialErrUnreachable,
+			err: fmt.Errorf("could not reach a terminal endpoint on %s (%s): %w\n"+
+				"  The target may not be running 'citadel work' (its terminal endpoint is\n"+
+				"  enabled by default), may have it disabled (--no-terminal), or may be\n"+
+				"  offline / not yet reachable on the mesh.", display, addr, err),
+		}
+	}
 	return fmt.Errorf("could not reach a terminal endpoint on %s (%s): %w\n"+
 		"  The target may not be running 'citadel work' (its terminal endpoint is\n"+
 		"  enabled by default), may have it disabled (--no-terminal), or may be\n"+

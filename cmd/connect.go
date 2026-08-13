@@ -23,29 +23,46 @@ var (
 
 var connectCmd = &cobra.Command{
 	Use:   "connect [peer|peer:port]",
-	Short: "Open a remote shell on another node, or pipe a raw TCP service",
+	Short: "Open a shell on another node, or pipe a raw TCP service",
 	Long: `Two modes, selected by whether you give a port:
 
-  citadel connect <node-name | ip>          Open an interactive remote shell
+  citadel connect <node-name | ip>          Open a shell on the target
   citadel connect <node-name | ip>:<port>   Pipe a raw TCP service (stdin/stdout)
 
-REMOTE SHELL (no port):
-  Drops you into an interactive shell on the target node over the AceTeam
-  Network mesh — collapsing the old multi-hop SSH chain
-  (ssh a -> ssh b -> tmux) into a single command from any machine on the mesh.
-  No host SSH config, no '.local' mDNS, no manual hops.
+BARE TARGET (no port):
+  This is an alias of 'citadel ssh <peer>' (see 'citadel ssh --help'): both
+  commands route a bare target through the exact same logic (issue #754).
 
-  The target node must be running its terminal endpoint, which 'citadel work'
-  starts by default (disable with --no-terminal). No token is needed: the node
-  trusts your verified mesh-peer identity over the VPN (citadel #585). Repeated
-  connects re-attach to the same live tmux-backed shell. A --token (or
+  By default this tries the AceTeam Network terminal endpoint first,
+  collapsing the old multi-hop SSH chain (ssh a -> ssh b -> tmux) into a
+  single command from any machine on the mesh, no host SSH config, no
+  '.local' mDNS, no manual hops, and it works even on nodes whose host sshd
+  is not exposed on the mesh. A node passcode challenge is NOT treated as a
+  failure to fall back on: you are prompted for it interactively instead.
+  Only when the terminal endpoint itself is unreachable does this fall back
+  to a real OpenSSH connection (tunneled through the mesh to the peer's
+  sshd, port 22 by default), the pre-#754 behavior of 'citadel ssh'.
+
+  The terminal endpoint is started by 'citadel work' by default (disable
+  with --no-terminal). No token is needed there: the node trusts your
+  verified mesh-peer identity over the VPN (citadel #585). Repeated connects
+  re-attach to the same live tmux-backed shell. A --token (or
   CITADEL_TERMINAL_TOKEN) is still accepted for the platform terminal path or
   when the target disables mesh trust.
 
+  --raw (alias --via-sshd) skips straight to the OpenSSH path.
+  --mesh (alias --terminal) forces the terminal-endpoint path only, with no
+  OpenSSH fallback.
+  A node passcode (when the operator has set one) is supplied via --passcode
+  or CITADEL_TERMINAL_PASSCODE, or prompted for interactively. -u/--user and
+  -p/--port for the OpenSSH path are only on 'citadel ssh'.
+
 RAW TCP (with port):
   Establishes a raw TCP connection to a service on the target and pipes
-  stdin/stdout to it. Used internally by 'citadel ssh' as a ProxyCommand,
-  and useful for testing connectivity or piping data through the network.
+  stdin/stdout to it. Used internally by the OpenSSH fallback as a
+  ProxyCommand, and useful for testing connectivity or piping data through
+  the network. Unaffected by any of the above: always a direct dial, no
+  terminal-endpoint attempt, no passcode prompt.
 
 PEER IDENTIFICATION (both modes):
   - By hostname:  citadel connect gpu-node-1
@@ -54,12 +71,15 @@ PEER IDENTIFICATION (both modes):
 
 The connection uses the tsnet userspace network, so it can reach peers
 that system networking cannot.`,
-	Example: `  # Open an interactive remote shell (by name or mesh IP)
+	Example: `  # Open a shell (by name or mesh IP; tries the terminal endpoint, falls back to sshd)
   citadel connect gpu-node-1
   citadel connect 100.64.0.25
 
-  # Remote shell with an explicit terminal token / port
+  # Shell with an explicit terminal token / port
   citadel connect gpu-node-1 --token tok_... --terminal-port 7860
+
+  # Force the terminal-endpoint path only, no OpenSSH fallback
+  citadel connect gpu-node-1 --mesh
 
   # Raw TCP: connect to a PostgreSQL server
   citadel connect gpu-node-1:5432
@@ -71,11 +91,13 @@ that system networking cannot.`,
   citadel connect`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		// Remote-shell mode: a single bare target (name or IP) with no :port.
-		// A port (host:port) always routes to the existing raw-TCP path, which
-		// keeps 'citadel ssh's ProxyCommand (always ip:port) unchanged.
+		// Bare-target mode: a single target (name or IP) with no :port,
+		// shared with 'citadel ssh' via connectToNode (#754). A port
+		// (host:port) always routes to the existing raw-TCP path below,
+		// which keeps the OpenSSH fallback's ProxyCommand (always ip:port)
+		// unchanged.
 		if len(args) == 1 && connectIsShellTarget(args[0]) {
-			if err := runRemoteShell(args[0]); err != nil {
+			if err := connectToNode(cmd, args[0]); err != nil {
 				badColor.Printf("Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -283,6 +305,17 @@ func connectIsShellTarget(arg string) bool {
 func init() {
 	rootCmd.AddCommand(connectCmd)
 	connectCmd.Flags().IntVar(&connectTimeout, "timeout", 0, "Connection timeout in seconds (0 = no timeout, raw-TCP mode)")
-	connectCmd.Flags().IntVar(&connectTerminalPort, "terminal-port", 7860, "Terminal endpoint port on the target (remote-shell mode)")
-	connectCmd.Flags().StringVar(&connectToken, "token", "", "Terminal auth token (remote-shell mode; OPTIONAL — mesh identity is trusted by default; or set CITADEL_TERMINAL_TOKEN)")
+	connectCmd.Flags().IntVar(&connectTerminalPort, "terminal-port", 7860, "Terminal endpoint port on the target (bare-target mode)")
+	connectCmd.Flags().StringVar(&connectToken, "token", "", "Terminal auth token (bare-target mode; OPTIONAL, mesh identity is trusted by default; or set CITADEL_TERMINAL_TOKEN)")
+
+	// Shared with 'citadel ssh' (same package vars, cmd/ssh.go, cmd/connect_dispatch.go)
+	// so a bare target behaves identically regardless of which command name
+	// was used (#754). -u/--user and -p/--port for the OpenSSH fallback are
+	// deliberately NOT mirrored here: they only make sense against a real
+	// sshd, and 'citadel ssh -u/-p' remains the way to set them.
+	connectCmd.Flags().BoolVar(&viaRaw, "raw", false, "Force the raw sshd path, skipping the terminal endpoint entirely (bare-target mode)")
+	connectCmd.Flags().BoolVar(&viaRaw, "via-sshd", false, "Alias of --raw")
+	connectCmd.Flags().BoolVar(&viaMesh, "mesh", false, "Force the terminal-endpoint path only, no raw sshd fallback (bare-target mode)")
+	connectCmd.Flags().BoolVar(&viaMesh, "terminal", false, "Alias of --mesh")
+	connectCmd.Flags().StringVar(&shellPasscode, "passcode", "", "Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted")
 }

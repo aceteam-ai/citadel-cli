@@ -21,8 +21,13 @@ var (
 
 var sshCmd = &cobra.Command{
 	Use:   "ssh [peer]",
-	Short: "SSH to another node on the AceTeam Network",
-	Long: `Establishes an SSH connection to another node on the AceTeam Network.
+	Short: "Open a shell on another node on the AceTeam Network",
+	Long: `Opens a shell on another node on the AceTeam Network.
+
+This command is an alias of 'citadel connect <peer>' (see
+'citadel connect --help'): a bare peer target routes through the exact same
+logic on both commands, so 'citadel ssh <node>' and 'citadel connect <node>'
+behave identically (issue #754).
 
 PEER IDENTIFICATION:
   You can specify the peer in multiple ways:
@@ -31,38 +36,50 @@ PEER IDENTIFICATION:
   - Interactive:  citadel ssh  (shows a list of online peers to choose from)
 
 HOW IT WORKS:
-  This command tunnels SSH through the AceTeam Network's secure mesh.
-  It works even when system tools (ping, ssh) can't reach the peer directly,
-  because it uses the internal tsnet userspace network.
+  By default this tries the AceTeam Network terminal endpoint first (works on
+  every node, including nodes whose host sshd is not exposed on the mesh, no
+  host SSH config required). A node passcode challenge is NOT treated as
+  a failure to fall back on: you are prompted for it interactively instead.
+  Only when the terminal endpoint itself is unreachable does this fall back
+  to a real OpenSSH connection, tunneled through the mesh to the peer's sshd
+  (port 22 by default).
+
+  --raw (alias --via-sshd) skips straight to the OpenSSH path, no terminal
+  endpoint attempt at all.
+  --mesh (alias --terminal) forces the terminal-endpoint path only, with no
+  OpenSSH fallback.
+  -u/--user and -p/--port select the OpenSSH path implicitly, since they only
+  make sense against a real sshd.
 
 REQUIREMENTS:
   - Both machines must be registered to the same AceTeam Network
-  - The target peer must have SSH enabled (port 22 or custom port)
-  - You must have valid SSH credentials for the target machine`,
+  - For the OpenSSH path: the target peer must have SSH enabled (port 22 or
+    a custom port) and you must have valid SSH credentials for it`,
 	Example: `  # Interactive mode - select from available peers
   citadel ssh
 
-  # Connect by hostname
+  # Connect by hostname (tries the terminal endpoint, falls back to sshd)
   citadel ssh gpu-node-1
 
   # Connect by network IP address
   citadel ssh 100.64.0.25
 
-  # Specify SSH username
-  citadel ssh gpu-node-1 -u ubuntu
+  # Force the OpenSSH path with a specific user and port
+  citadel ssh gpu-node-1 -u ubuntu -p 2222
 
-  # Specify custom SSH port
-  citadel ssh gpu-node-1 -p 2222
+  # Force the terminal-endpoint path only, no OpenSSH fallback
+  citadel ssh gpu-node-1 --mesh
 
-  # Combine options
-  citadel ssh gpu-node-1 -u admin -p 2222 -v`,
+  # Supply a node passcode up front instead of being prompted
+  citadel ssh gpu-node-1 --passcode 123456`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		// Ensure network connection
+		// Ensure network connection (also needed for the interactive picker
+		// below, before connectToNode gets a chance to ensure it itself).
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := ensureNetworkConnected(ctx); err != nil {
+		if err := ensureNetworkConnectedFn(ctx); err != nil {
 			badColor.Println(err)
 			os.Exit(1)
 		}
@@ -81,85 +98,100 @@ REQUIREMENTS:
 			peer = args[0]
 		}
 
-		// Resolve peer to IP
-		ip, hostname, err := resolvePeer(peer)
-		if err != nil {
-			badColor.Printf("Could not resolve peer '%s': %v\n", peer, err)
-			suggestAvailablePeers()
-			os.Exit(1)
-		}
-
-		// Determine SSH port
-		port := "22"
-		if sshPort != "" {
-			port = sshPort
-		}
-
-		// Get the path to the current citadel executable for ProxyCommand
-		citadelPath, err := os.Executable()
-		if err != nil {
-			badColor.Printf("Could not determine citadel path: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build SSH command arguments
-		// Use ProxyCommand to tunnel through tsnet via 'citadel connect'
-		proxyCmd := fmt.Sprintf("%s connect %s:%s", citadelPath, ip, port)
-		sshArgs := []string{
-			"-o", fmt.Sprintf("ProxyCommand=%s", proxyCmd),
-			"-o", "StrictHostKeyChecking=accept-new", // Auto-accept new host keys (user can override)
-		}
-
-		// Add verbose flag if requested
-		if sshVerbose {
-			sshArgs = append(sshArgs, "-v")
-		}
-
-		// Build target - use a placeholder hostname since ProxyCommand handles the actual connection
-		// SSH needs a target but ProxyCommand bypasses normal resolution
-		target := ip
-		if sshUser != "" {
-			target = sshUser + "@" + ip
-		}
-		sshArgs = append(sshArgs, target)
-
-		// Display connection info
-		displayName := hostname
-		if displayName == "" {
-			displayName = ip
-		}
-		fmt.Printf("Connecting to %s via AceTeam Network...\n", displayName)
-		if hostname != "" && hostname != ip {
-			fmt.Printf("  Peer: %s (%s)\n", hostname, ip)
-		}
-		if sshUser != "" {
-			fmt.Printf("  User: %s\n", sshUser)
-		}
-		if port != "22" {
-			fmt.Printf("  Port: %s\n", port)
-		}
-		fmt.Println()
-
-		// Execute SSH
-		sshPath, err := exec.LookPath("ssh")
-		if err != nil {
-			badColor.Println("Error: ssh command not found. Please install OpenSSH.")
-			os.Exit(1)
-		}
-
-		sshExec := exec.Command(sshPath, sshArgs...)
-		sshExec.Stdin = os.Stdin
-		sshExec.Stdout = os.Stdout
-		sshExec.Stderr = os.Stderr
-
-		if err := sshExec.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			badColor.Printf("SSH error: %v\n", err)
+		if err := connectToNode(cmd, peer); err != nil {
+			badColor.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 	},
+}
+
+// runLegacySSH execs the real ssh(1) binary against peer, tunneled through
+// the mesh via 'citadel connect <ip>:<port>' as ProxyCommand. This predates
+// #754's ts-net-first routing and is now: the fallback path when the ts-net
+// terminal endpoint is unreachable, and the explicit path for
+// --raw/--via-sshd (or naming -u/-p, which only make sense against a real
+// sshd).
+func runLegacySSH(peer string) error {
+	ip, hostname, err := resolvePeer(peer)
+	if err != nil {
+		suggestAvailablePeers()
+		return fmt.Errorf("could not resolve peer '%s': %w", peer, err)
+	}
+
+	// Determine SSH port
+	port := "22"
+	if sshPort != "" {
+		port = sshPort
+	}
+
+	// Get the path to the current citadel executable for ProxyCommand
+	citadelPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("could not determine citadel path: %w", err)
+	}
+
+	sshArgs := buildSSHArgs(citadelPath, ip, port, sshUser, sshVerbose)
+
+	// Display connection info
+	displayName := hostname
+	if displayName == "" {
+		displayName = ip
+	}
+	fmt.Printf("Connecting to %s via AceTeam Network (raw sshd)...\n", displayName)
+	if hostname != "" && hostname != ip {
+		fmt.Printf("  Peer: %s (%s)\n", hostname, ip)
+	}
+	if sshUser != "" {
+		fmt.Printf("  User: %s\n", sshUser)
+	}
+	if port != "22" {
+		fmt.Printf("  Port: %s\n", port)
+	}
+	fmt.Println()
+
+	// Execute SSH
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("ssh command not found. Please install OpenSSH")
+	}
+
+	sshExec := exec.Command(sshPath, sshArgs...)
+	sshExec.Stdin = os.Stdin
+	sshExec.Stdout = os.Stdout
+	sshExec.Stderr = os.Stderr
+
+	if err := sshExec.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return fmt.Errorf("ssh error: %w", err)
+	}
+	return nil
+}
+
+// buildSSHArgs constructs the argv passed to the ssh(1) binary for the raw
+// sshd path (#754's fallback / --raw path). Factored out for testability: it
+// takes only the exact values that end up in argv, so a test can pin exactly
+// what ssh(1) sees. Notably it has no passcode parameter at all: the node
+// passcode (citadel#753) belongs to the terminal-endpoint auth path, which
+// this raw-sshd path never touches, and it must never appear in a
+// subprocess argv (visible to other users on the same machine via `ps`).
+func buildSSHArgs(citadelPath, ip, port, user string, verbose bool) []string {
+	proxyCmd := fmt.Sprintf("%s connect %s:%s", citadelPath, ip, port)
+	args := []string{
+		"-o", fmt.Sprintf("ProxyCommand=%s", proxyCmd),
+		"-o", "StrictHostKeyChecking=accept-new", // Auto-accept new host keys (user can override)
+	}
+	if verbose {
+		args = append(args, "-v")
+	}
+	// Build target - use a placeholder hostname since ProxyCommand handles the actual connection
+	// SSH needs a target but ProxyCommand bypasses normal resolution
+	target := ip
+	if user != "" {
+		target = user + "@" + ip
+	}
+	return append(args, target)
 }
 
 // selectPeerInteractive shows a list of online peers and lets the user select one.
@@ -206,7 +238,12 @@ func selectPeerInteractive(ctx context.Context) (string, error) {
 
 func init() {
 	rootCmd.AddCommand(sshCmd)
-	sshCmd.Flags().StringVarP(&sshUser, "user", "u", "", "SSH username (defaults to current user)")
-	sshCmd.Flags().StringVarP(&sshPort, "port", "p", "", "SSH port (defaults to 22)")
-	sshCmd.Flags().BoolVarP(&sshVerbose, "verbose", "v", false, "Enable verbose SSH output")
+	sshCmd.Flags().StringVarP(&sshUser, "user", "u", "", "SSH username for the raw sshd path (implies --raw)")
+	sshCmd.Flags().StringVarP(&sshPort, "port", "p", "", "sshd port for the raw sshd path, default 22 (implies --raw)")
+	sshCmd.Flags().BoolVarP(&sshVerbose, "verbose", "v", false, "Enable verbose OpenSSH output (raw sshd path only)")
+	sshCmd.Flags().BoolVar(&viaRaw, "raw", false, "Force the raw sshd path, skipping the terminal endpoint entirely")
+	sshCmd.Flags().BoolVar(&viaRaw, "via-sshd", false, "Alias of --raw")
+	sshCmd.Flags().BoolVar(&viaMesh, "mesh", false, "Force the terminal-endpoint path only, no raw sshd fallback")
+	sshCmd.Flags().BoolVar(&viaMesh, "terminal", false, "Alias of --mesh")
+	sshCmd.Flags().StringVar(&shellPasscode, "passcode", "", "Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted")
 }
