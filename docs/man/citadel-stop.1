@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-stop - Stop services (all if no service specified, or a specific one)
@@ -17,7 +17,7 @@ When a service name is provided, that specific service is stopped.
 When no service is specified, all services in the manifest are stopped.
 
 .PP
-Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, sglang, transcribe, vllm
+Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, sglang, tei, transcribe, unlimited-ocr, vllm
 
 
 .SH OPTIONS
@@ -48,6 +48,10 @@ Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, o
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH EXAMPLE

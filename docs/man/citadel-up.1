@@ -1,0 +1,83 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-up - Put this whole machine on the AceTeam Network (needs sudo)
+
+
+.SH SYNOPSIS
+\fBcitadel up [flags]\fP
+
+
+.SH DESCRIPTION
+Brings up a network interface so EVERY program on this machine can reach
+your other nodes directly — ssh, curl, a browser, a database client — using
+their network IPs and names.
+
+.PP
+This is different from 'citadel login', which connects only the citadel
+process itself. Both use the same node identity, so this machine appears once
+on your network either way.
+
+.PP
+Because it creates a network interface and edits the system routing table,
+this command needs administrator privileges. 'citadel login' does not, and
+remains the right choice if you only need citadel itself to reach the network.
+
+.PP
+Runs in the foreground until interrupted; Ctrl-C takes the machine back off
+the network and restores routing and DNS.
+
+
+.SH OPTIONS
+\fB--authkey\fP=""
+	Pre-generated authkey for non-interactive join
+
+.PP
+\fB--check\fP[=false]
+	Report whether this machine can run machine-wide mode, then exit (changes nothing)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for up
+
+.PP
+\fB--node-name\fP=""
+	Override the node name (defaults to hostname)
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  # Put this machine on the network (foreground)
+  sudo citadel up
+
+  # First-time join with an authkey
+  sudo citadel up --authkey tskey-auth-xxx
+
+  # Check whether this machine can do it, without changing anything
+  sudo citadel up --check
+
+  # Take the machine back off the network
+  sudo citadel down
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

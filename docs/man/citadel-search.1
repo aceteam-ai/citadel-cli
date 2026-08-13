@@ -1,0 +1,70 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-search - Semantic search over this node's authorized directories (local, private)
+
+
+.SH SYNOPSIS
+\fBcitadel search  [flags]\fP
+
+
+.SH DESCRIPTION
+Search the files under your authorized root directories by meaning, entirely
+on-box, using the node's self-hosted embedding model (local TEI, :8102).
+
+.PP
+Nothing is searchable until you authorize a root directory:
+
+.PP
+citadel search roots add ~/Documents      # authorize a directory
+  citadel search index                       # index all authorized roots
+  citadel search "quarterly revenue"         # semantic search
+  citadel search "quarterly revenue" --json  # machine-readable output
+
+.PP
+The authorized-roots allowlist is the security boundary: only files under an
+authorized root are ever indexed or returned. Indexing and searching require the
+local TEI embedding service (start it with 'citadel module install tei').
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for search
+
+.PP
+\fB--json\fP[=false]
+	Emit machine-readable JSON (stable wrapper contract)
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+.PP
+\fB--root\fP=""
+	Restrict the search to this authorized root
+
+.PP
+\fB--top-k\fP=10
+	Max results to return
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-search-index(1)\fP, \fBcitadel-search-roots(1)\fP

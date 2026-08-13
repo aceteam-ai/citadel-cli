@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-proxmox-status - Show Proxmox VE status and guests
@@ -29,6 +29,10 @@ Display the status of the configured Proxmox VE server, including nodes, VMs, an
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO

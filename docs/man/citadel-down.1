@@ -1,0 +1,45 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-down - Take this machine off the AceTeam Network and restore routing/DNS
+
+
+.SH SYNOPSIS
+\fBcitadel down [flags]\fP
+
+
+.SH DESCRIPTION
+Reverses 'citadel up'.
+
+.PP
+If a 'citadel up' is running in another terminal, stop it there (Ctrl-C) so it
+can shut down cleanly. This command is the recovery path for when that did not
+happen — after a crash or a hard reboot — and removes any network interface
+configuration, routes, and DNS settings left behind.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for down
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

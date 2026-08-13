@@ -1,0 +1,71 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-expose - Expose a local service on the AceTeam Network gateway
+
+
+.SH SYNOPSIS
+\fBcitadel service expose  [flags]\fP
+
+
+.SH DESCRIPTION
+Serves a local port on this node's gateway at /expose//, gated by a
+visibility level.
+
+.PP
+private  only the creator (requires a caller identity the backend supplies,
+           so a local CLI cannot grant it — use org or link)
+  org      any member of your organization on the network
+  link     anyone holding the signed, expiring link token
+
+.PP
+Requires the node gateway to be running (citadel work).
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for expose
+
+.PP
+\fB--port\fP=0
+	Local port the service listens on (required)
+
+.PP
+\fB--ttl\fP=24h0m0s
+	Lifetime of a --visibility link token
+
+.PP
+\fB--visibility\fP="org"
+	Who may reach it: org or link
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  # Expose the nvr module's Frigate UI to your organization
+  citadel service expose frigate --port 8212 --visibility org
+
+  # Share a dashboard by link for 2 hours
+  citadel service expose grafana --port 3000 --visibility link --ttl 2h
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-service(1)\fP

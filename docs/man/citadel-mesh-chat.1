@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-mesh-chat - Send a one-shot chat request to a model on another node
@@ -62,6 +62,10 @@ such nodes. Adding the node-side gateway chat route is tracked in #581.
 .PP
 \fB--port\fP=8080
 	Peer status endpoint port to probe over the mesh
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH EXAMPLE

@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-service-install - Install Citadel as a system service
@@ -45,6 +45,10 @@ variable set, enabling auto-restart on failure and boot-time startup.
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO

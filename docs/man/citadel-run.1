@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-run - Start services (all if no service specified, or a specific one)
@@ -24,7 +24,7 @@ Note: For production use, consider 'citadel work' which starts services AND runs
 the job worker in a single command.
 
 .PP
-Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, sglang, transcribe, vllm
+Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, sglang, tei, transcribe, unlimited-ocr, vllm
 
 
 .SH OPTIONS
@@ -55,6 +55,10 @@ Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, o
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH EXAMPLE

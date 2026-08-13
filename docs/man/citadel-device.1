@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-device - Enroll and maintain this machine as a personal device on your org's network
@@ -21,8 +21,11 @@ nears expiry, the device proves its identity with a certificate and rejoins
 without any human involvement.
 
 .PP
-Requires the Tailscale client to be installed (device mode drives it; it does
-not replace it).
+Device mode is the one Citadel command that needs the Tailscale client
+installed: it deliberately drives the machine's existing system client so a
+laptop keeps its own traffic policies. Joining a compute node to the AceTeam
+Network ('citadel login', 'citadel init') needs no external client at all --
+that path is built into this binary.
 
 
 .SH OPTIONS
@@ -41,6 +44,10 @@ not replace it).
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO

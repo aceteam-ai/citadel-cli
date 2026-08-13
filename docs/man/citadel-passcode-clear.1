@@ -1,0 +1,44 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-passcode-clear - Clear the node passcode
+
+
+.SH SYNOPSIS
+\fBcitadel passcode clear [flags]\fP
+
+
+.SH DESCRIPTION
+Clears the per-node passcode. This FAILS CLOSED: with no passcode set, every
+sensitive remote-access surface (Console/Desktop/Files) stays denied even if
+it is enabled, until 'citadel passcode set' is run again.
+
+.PP
+Takes effect immediately, without restarting the worker.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for clear
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-passcode(1)\fP

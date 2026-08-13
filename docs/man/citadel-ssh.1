@@ -1,8 +1,8 @@
 .nh
-.TH "CITADEL" "1" "Jul 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-ssh - SSH to another node on the AceTeam Network
+citadel-ssh - Open a shell on another node on the AceTeam Network
 
 
 .SH SYNOPSIS
@@ -10,7 +10,13 @@ citadel-ssh - SSH to another node on the AceTeam Network
 
 
 .SH DESCRIPTION
-Establishes an SSH connection to another node on the AceTeam Network.
+Opens a shell on another node on the AceTeam Network.
+
+.PP
+This command is an alias of 'citadel connect \&' (see
+\&'citadel connect --help'): a bare peer target routes through the exact same
+logic on both commands, so 'citadel ssh \&' and 'citadel connect \&'
+behave identically (issue #754).
 
 .PP
 PEER IDENTIFICATION:
@@ -21,15 +27,27 @@ PEER IDENTIFICATION:
 
 .PP
 HOW IT WORKS:
-  This command tunnels SSH through the AceTeam Network's secure mesh.
-  It works even when system tools (ping, ssh) can't reach the peer directly,
-  because it uses the internal tsnet userspace network.
+  By default this tries the AceTeam Network terminal endpoint first (works on
+  every node, including nodes whose host sshd is not exposed on the mesh, no
+  host SSH config required). A node passcode challenge is NOT treated as
+  a failure to fall back on: you are prompted for it interactively instead.
+  Only when the terminal endpoint itself is unreachable does this fall back
+  to a real OpenSSH connection, tunneled through the mesh to the peer's sshd
+  (port 22 by default).
+
+.PP
+--raw (alias --via-sshd) skips straight to the OpenSSH path, no terminal
+  endpoint attempt at all.
+  --mesh (alias --terminal) forces the terminal-endpoint path only, with no
+  OpenSSH fallback.
+  -u/--user and -p/--port select the OpenSSH path implicitly, since they only
+  make sense against a real sshd.
 
 .PP
 REQUIREMENTS:
   - Both machines must be registered to the same AceTeam Network
-  - The target peer must have SSH enabled (port 22 or custom port)
-  - You must have valid SSH credentials for the target machine
+  - For the OpenSSH path: the target peer must have SSH enabled (port 22 or
+    a custom port) and you must have valid SSH credentials for it
 
 
 .SH OPTIONS
@@ -37,16 +55,36 @@ REQUIREMENTS:
 	help for ssh
 
 .PP
+\fB--mesh\fP[=false]
+	Force the terminal-endpoint path only, no raw sshd fallback
+
+.PP
+\fB--passcode\fP=""
+	Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted
+
+.PP
 \fB-p\fP, \fB--port\fP=""
-	SSH port (defaults to 22)
+	sshd port for the raw sshd path, default 22 (implies --raw)
+
+.PP
+\fB--raw\fP[=false]
+	Force the raw sshd path, skipping the terminal endpoint entirely
+
+.PP
+\fB--terminal\fP[=false]
+	Alias of --mesh
 
 .PP
 \fB-u\fP, \fB--user\fP=""
-	SSH username (defaults to current user)
+	SSH username for the raw sshd path (implies --raw)
 
 .PP
 \fB-v\fP, \fB--verbose\fP[=false]
-	Enable verbose SSH output
+	Enable verbose OpenSSH output (raw sshd path only)
+
+.PP
+\fB--via-sshd\fP[=false]
+	Alias of --raw
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -61,26 +99,30 @@ REQUIREMENTS:
 \fB--no-color\fP[=false]
 	Disable colorized output
 
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
 
 .SH EXAMPLE
 .EX
   # Interactive mode - select from available peers
   citadel ssh
 
-  # Connect by hostname
+  # Connect by hostname (tries the terminal endpoint, falls back to sshd)
   citadel ssh gpu-node-1
 
   # Connect by network IP address
   citadel ssh 100.64.0.25
 
-  # Specify SSH username
-  citadel ssh gpu-node-1 -u ubuntu
+  # Force the OpenSSH path with a specific user and port
+  citadel ssh gpu-node-1 -u ubuntu -p 2222
 
-  # Specify custom SSH port
-  citadel ssh gpu-node-1 -p 2222
+  # Force the terminal-endpoint path only, no OpenSSH fallback
+  citadel ssh gpu-node-1 --mesh
 
-  # Combine options
-  citadel ssh gpu-node-1 -u admin -p 2222 -v
+  # Supply a node passcode up front instead of being prompted
+  citadel ssh gpu-node-1 --passcode 123456
 .EE
 
 

@@ -1,0 +1,64 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-passcode-set - Set or change the node passcode
+
+
+.SH SYNOPSIS
+\fBcitadel passcode set [flags]\fP
+
+
+.SH DESCRIPTION
+Sets the per-node passcode that gates Console/Desktop/Files remote access
+(aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
+in addition to a valid token or verified mesh-peer identity, before an
+enabled sensitive surface will actually respond.
+
+.PP
+Takes effect immediately, without restarting the worker: every gate
+(terminal server, gateway, SHELL_COMMAND handler) reloads permissions.yaml on
+each connection, so a running 'citadel work' picks up the new passcode on its
+very next request.
+
+.PP
+The PIN is read from a no-echo interactive prompt (with a confirmation
+re-entry), or piped in on stdin when stdin is not a terminal. It is never
+accepted as a command-line argument, so it can't land in shell history or be
+visible to other users on the machine via 'ps'.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for set
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  # Interactive (prompts twice, no echo)
+  citadel passcode set
+
+  # Piped (e.g. from a secrets manager); no confirmation re-prompt
+  echo -n "1234" | citadel passcode set
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-passcode(1)\fP

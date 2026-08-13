@@ -1,0 +1,48 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-search-index - Index the authorized roots (or a path under one) into the local index
+
+
+.SH SYNOPSIS
+\fBcitadel search index [path] [flags]\fP
+
+
+.SH DESCRIPTION
+Chunk, embed, and store files into the node-local semantic index.
+
+.PP
+With no argument, indexes every authorized root. With a path, indexes that path
+(which must resolve under an authorized root). Incremental and idempotent:
+unchanged files are skipped and deleted files are pruned.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for index
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--model\fP=""
+	Embedding model override (default: gte-multilingual-base)
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-search(1)\fP

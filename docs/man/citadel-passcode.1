@@ -1,0 +1,46 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-passcode - Manage the node passcode that gates Console/Desktop/Files access
+
+
+.SH SYNOPSIS
+\fBcitadel passcode [flags]\fP
+
+
+.SH DESCRIPTION
+The node passcode (aceteam#6524) gates the sensitive remote-access surfaces
+(Console/terminal, Desktop/VNC/screen, and Files) once an operator has
+enabled them. Enabling a surface is not enough by itself: without a passcode
+set, that surface fails closed (access denied) even though it is enabled.
+
+.PP
+Use 'citadel passcode set' to set or change it, and 'citadel passcode clear'
+to remove it (which re-locks every enabled sensitive surface).
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for passcode
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-passcode-clear(1)\fP, \fBcitadel-passcode-set(1)\fP

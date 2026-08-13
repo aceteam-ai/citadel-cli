@@ -1,0 +1,52 @@
+.nh
+.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-unexpose - Revoke a service exposed on the AceTeam Network gateway
+
+
+.SH SYNOPSIS
+\fBcitadel service unexpose  [flags]\fP
+
+
+.SH DESCRIPTION
+Stops serving /expose// on this node's gateway and deletes its saved
+record, so the service is unreachable now AND does not come back the next time
+the node restarts.
+
+.PP
+Any outstanding 'link' tokens for the service stop working, because the gateway
+fails closed for a name with no exposure policy.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for unexpose
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  # Stop sharing the nvr module's Frigate UI
+  citadel service unexpose frigate
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-service(1)\fP
