@@ -128,7 +128,7 @@ type DesiredState struct {
 }
 
 // NeverManaged reports whether the control plane has never assigned this node
-// ANY desired state — not even a since-removed one. Revision is "" or "0" only
+// ANY desired state, not even a since-removed one. Revision is "" or "0" only
 // when the control plane holds no fabric_node_module_desired row for this node
 // at all (live or soft-deleted); the moment a row has ever existed, Revision
 // carries that row's (or the max historical row's) value and stays non-zero
@@ -138,7 +138,7 @@ type DesiredState struct {
 //   - never managed (this): the node was never told to converge to anything,
 //     so an empty desired set is not a misconfiguration.
 //   - explicitly emptied (NeverManaged() == false, Modules empty): the node
-//     WAS assigned modules and the control plane is now serving zero — the
+//     WAS assigned modules and the control plane is now serving zero, the
 //     genuine foot-gun Reconciler.RefuseFullWipe exists to catch.
 //
 // See internal/reconcile/loop.go's full-wipe guard, the only caller (#733).

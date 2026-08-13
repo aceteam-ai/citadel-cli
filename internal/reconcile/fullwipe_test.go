@@ -134,7 +134,7 @@ func TestRefuseFullWipeSurfacesReportFailure(t *testing.T) {
 // "0", the zero value the control plane serves when it holds no
 // fabric_node_module_desired row for this node at all) must not be treated as
 // "misconfigured". Before this fix EVERY node hit this path forever, because
-// nothing writes that durable store yet — the guard fired and errored on every
+// nothing writes that durable store yet: the guard fired and errored on every
 // single pass (4574+ times over 5+ days, observed on node 1297). It must now
 // succeed as a no-op converge (nothing installed, nothing uninstalled) while
 // still reporting the observed actual state, exactly like a legitimate
@@ -175,8 +175,8 @@ func TestRefuseFullWipeSkipsNeverManagedNode(t *testing.T) {
 }
 
 // TestRefuseFullWipeSkipsNeverManagedNodeEmptyRevision confirms the same
-// no-op behavior when Revision is the empty string, not just the literal "0"
-// — both are DesiredState.NeverManaged().
+// no-op behavior when Revision is the empty string, not just the literal "0":
+// both are DesiredState.NeverManaged().
 func TestRefuseFullWipeSkipsNeverManagedNodeEmptyRevision(t *testing.T) {
 	ops := newFakeOps(InstalledModule{Name: "a", Source: "src-a", Health: HealthRunning})
 	provider := &FakeProvider{Desired: DesiredState{Revision: ""}}
@@ -193,9 +193,9 @@ func TestRefuseFullWipeSkipsNeverManagedNodeEmptyRevision(t *testing.T) {
 }
 
 // TestDesiredStateNeverManaged pins the predicate directly: only the true
-// zero-history values ("" and "0") count as never-managed; any other revision
-// — including a non-numeric opaque token, which is all the wire contract
-// promises — means the control plane has a history for this node.
+// zero-history values ("" and "0") count as never-managed; any other revision,
+// including a non-numeric opaque token (which is all the wire contract
+// promises), means the control plane has a history for this node.
 func TestDesiredStateNeverManaged(t *testing.T) {
 	cases := []struct {
 		revision string

@@ -100,12 +100,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	// that must NOT be treated the same way (#733 root cause):
 	//
 	//   - UNMANAGED: the control plane has never assigned this node ANY desired
-	//     state (DesiredState.NeverManaged — see its doc: Revision is the zero
+	//     state (DesiredState.NeverManaged, see its doc: Revision is the zero
 	//     value the control plane serves only when it holds no
 	//     fabric_node_module_desired row for this node at all, live or
 	//     soft-deleted). There is nothing to refuse: the node was never told to
 	//     converge to anything, so this is not a misconfiguration, it is a node
-	//     that is simply not under declarative module management yet — true of
+	//     that is simply not under declarative module management yet, true of
 	//     essentially every node today, since nothing yet writes that durable
 	//     store (aceteam#4273's deferred follow-up; see PR description). Treating
 	//     this as an error made the guard trip every single pass forever (4574+
@@ -113,7 +113,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	//   - MANAGED: the control plane DOES have a revision history for this node
 	//     (it was assigned modules at some point) and is now serving zero. That
 	//     is the genuine "empty/misconfigured control plane" foot-gun this guard
-	//     exists for — refuse and error, exactly as before.
+	//     exists for, so refuse and error, exactly as before.
 	//
 	// Both situations still refuse to APPLY: neither calls Reconcile/Apply below,
 	// so neither can produce an uninstall plan. Only whether the refusal is
@@ -149,7 +149,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 		}
 	}
 	// else: an unmanaged node with modules installed. Nothing was ever assigned,
-	// so there is nothing to converge — plan/applyRes stay zero-valued (an
+	// so there is nothing to converge: plan/applyRes stay zero-valued (an
 	// empty, successful pass) and execution falls through to report the observed
 	// actual state below, same as any other converged pass.
 
@@ -162,7 +162,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	// Revision handshake: echo the desired revision the node just converged to
 	// (or, for the unmanaged no-op above, the "never managed" revision it
 	// correctly did nothing with). Set unconditionally (even on partial
-	// per-module failure) — the node HAS processed this revision; failures
+	// per-module failure): the node HAS processed this revision; failures
 	// surface per-module as Health == HealthError.
 	report.AppliedRevision = desired.Revision
 	if err := r.Provider.Report(ctx, report); err != nil {

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
@@ -167,6 +168,47 @@ func TestProtoProviderRevisionHandshakeThroughReconcileOnce(t *testing.T) {
 	}
 	if got.GetAppliedRevision() != "rev-100" {
 		t.Fatalf("handshake broken: applied_revision = %q, want rev-100", got.GetAppliedRevision())
+	}
+}
+
+// TestNeverManagedThroughRealProtoWireNoUninstall is the end-to-end proof for
+// #733/#752: TestRefuseFullWipeSkipsNeverManagedNode (fullwipe_test.go)
+// exercises DesiredState.NeverManaged() by constructing the internal type
+// directly, which never proves Revision actually survives the real wire path
+// (marshal -> HTTP body -> unmarshal -> adaptDesiredState). This test drives
+// that whole path: a real fabricpb.DesiredState with Revision "0" (the
+// control-plane zero value for "no fabric_node_module_desired row for this
+// node, ever") and zero modules, through ProtoProvider.Fetch, into a
+// Reconciler that already has two modules installed. If adaptDesiredState
+// ever stopped copying Revision through, this would start failing with an
+// uninstall plan instead of a no-op.
+func TestNeverManagedThroughRealProtoWireNoUninstall(t *testing.T) {
+	tr := &fakeTransport{desired: &fabricpb.DesiredState{
+		Revision: "0",
+		Modules:  nil,
+	}}
+	provider := NewProtoProvider(tr, tr, "node-1297", "v1")
+	ops := newFakeOps(
+		InstalledModule{Name: "a", Source: "a", Health: HealthRunning},
+		InstalledModule{Name: "b", Source: "b", Health: HealthRunning},
+	)
+	rec := NewReconciler(provider, ops, "node-1297")
+	rec.RefuseFullWipe = true
+
+	plan, _, err := rec.ReconcileOnce(context.Background())
+	if err != nil {
+		t.Fatalf("never-managed node over the real proto wire must succeed as a no-op, got: %v", err)
+	}
+	if !plan.IsEmpty() {
+		t.Errorf("want empty plan, got %+v", plan.Steps)
+	}
+	for _, c := range ops.calls {
+		if strings.HasPrefix(c, "uninstall:") {
+			t.Fatalf("a never-managed node must not uninstall anything, saw %q", c)
+		}
+	}
+	if tr.posts != 1 {
+		t.Fatalf("want the observed actual state still reported, got %d posts", tr.posts)
 	}
 }
 
