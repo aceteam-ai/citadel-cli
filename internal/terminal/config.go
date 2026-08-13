@@ -106,6 +106,19 @@ type Config struct {
 	// nil (e.g. the localhost test server), no passcode is required and behavior
 	// is unchanged. The verifier fails closed (see config.Permissions.VerifyPasscode).
 	PasscodeVerifier func(pin string) bool
+
+	// PasscodeHasPasscode, when non-nil, reports whether a node passcode is
+	// configured at all (WITHOUT leaking it). It lets a PasscodeVerifier
+	// rejection distinguish ReasonPasscodeNotSet ("nothing to check against;
+	// the operator must set one") from ReasonPasscodeInvalid ("a passcode is
+	// set but what was presented is wrong or missing"), a distinction
+	// PasscodeVerifier's bool result alone cannot carry, mirroring
+	// internal/jobs/shell_command.go's HasPasscode/VerifyPasscode split
+	// (aceteam#6524, citadel#753). Optional: when nil, the reject response
+	// omits the "reason" field entirely (unchanged pre-#753 behavior), so
+	// existing callers that only wire PasscodeVerifier keep working. Wire it
+	// from config.LoadPermissions(...).HasPasscode alongside PasscodeVerifier.
+	PasscodeHasPasscode func() bool
 }
 
 // DefaultConfig returns a Config with sensible defaults

@@ -352,6 +352,20 @@ func writeJSONError(w http.ResponseWriter, message string, status int) {
 	fmt.Fprintf(w, `{"error":"%s","status":%d}`, message, status)
 }
 
+// writeJSONErrorWithReason writes a JSON-formatted error response carrying an
+// additional machine-readable "reason" field alongside the existing "error"
+// and "status" fields (citadel#753), so a client can branch on Reason instead
+// of string-matching the human-readable message, mirroring the
+// {"reason":"<code>","message":"<human>"} shape internal/jobs/shell_command.go
+// uses for SHELL_COMMAND refusals. The HTTP status and body shape for every
+// existing writeJSONError caller are unchanged; this is a purely additive
+// sibling used only where a reason code is available.
+func writeJSONErrorWithReason(w http.ResponseWriter, message string, status int, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"error":"%s","status":%d,"reason":"%s"}`, message, status, reason)
+}
+
 // handleRoot handles requests to the root endpoint
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -502,8 +516,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			passcode = r.Header.Get("X-Citadel-Passcode")
 		}
 		if !s.config.PasscodeVerifier(passcode) {
-			s.logger.Printf("passcode gate rejected connection from %s (user %s, via %s)", ip, tokenInfo.UserID, authVia)
+			// Distinguish "no passcode configured at all" (ReasonPasscodeNotSet:
+			// the operator must set one) from "a passcode is set but the wrong
+			// one was presented" (ReasonPasscodeInvalid), mirroring
+			// internal/jobs/shell_command.go (citadel#753). When
+			// PasscodeHasPasscode is not wired, the distinction is unavailable
+			// and the reject falls back to the pre-#753 reason-less response
+			// (writeJSONError) rather than guessing.
 			atomic.AddInt64(&s.failedConnections, 1)
+			if s.config.PasscodeHasPasscode != nil {
+				reason := ReasonPasscodeInvalid
+				if !s.config.PasscodeHasPasscode() {
+					reason = ReasonPasscodeNotSet
+				}
+				s.logger.Printf("passcode gate rejected connection from %s (user %s, via %s, reason=%s)", ip, tokenInfo.UserID, authVia, reason)
+				writeJSONErrorWithReason(w, "node passcode required", http.StatusUnauthorized, reason)
+				return
+			}
+			s.logger.Printf("passcode gate rejected connection from %s (user %s, via %s)", ip, tokenInfo.UserID, authVia)
 			writeJSONError(w, "node passcode required", http.StatusUnauthorized)
 			return
 		}
