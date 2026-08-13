@@ -127,6 +127,25 @@ type DesiredState struct {
 	Modules []ModuleAssignment `json:"modules"`
 }
 
+// NeverManaged reports whether the control plane has never assigned this node
+// ANY desired state, not even a since-removed one. Revision is "" or "0" only
+// when the control plane holds no fabric_node_module_desired row for this node
+// at all (live or soft-deleted); the moment a row has ever existed, Revision
+// carries that row's (or the max historical row's) value and stays non-zero
+// even after the live set is emptied.
+//
+// This distinguishes two situations that both serve an empty Modules list:
+//   - never managed (this): the node was never told to converge to anything,
+//     so an empty desired set is not a misconfiguration.
+//   - explicitly emptied (NeverManaged() == false, Modules empty): the node
+//     WAS assigned modules and the control plane is now serving zero, the
+//     genuine foot-gun Reconciler.RefuseFullWipe exists to catch.
+//
+// See internal/reconcile/loop.go's full-wipe guard, the only caller (#733).
+func (d DesiredState) NeverManaged() bool {
+	return d.Revision == "" || d.Revision == "0"
+}
+
 // ----------------------------------------------------------------------------
 // Actual-state report (node -> control plane)
 // ----------------------------------------------------------------------------
