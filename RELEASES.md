@@ -1594,3 +1594,20 @@ Auto-generated log of every release.
   - fix(work): already-running worklock is a benign exit-0 no-op, not a crash-loop (#736) (#744)
 
 
+---
+
+## v2.105.0 — 2026-08-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 8 |
+| Lines added | +749 |
+
+**Changes:**
+
+  - reconcile: never-managed nodes no longer trip the full-wipe guard (#733)
+  - fix(ws): honor 429 retry_after on reconnect, stop orphaned-conn leak and redial-forever (#747, #748, #746) (#750)
+  - fix(reconcile): keep reporting actual state when the full-wipe guard refuses (#737)
+
+
