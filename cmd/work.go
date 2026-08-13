@@ -421,6 +421,17 @@ func runWork(cmd *cobra.Command, args []string) {
 		workTerminal = false
 	}
 
+	// Surface the citadel#753 gap locally: a sensitive surface (console/
+	// desktop/files) enabled with no node passcode set fails closed (access
+	// denied) rather than opening, but doctor/heartbeat stay green because the
+	// probe path is exempt from the passcode gate -- the only prior signal was
+	// a single node log line per rejected connection. One line at startup, not
+	// buried per-connection, so an operator who enabled a surface without also
+	// setting a passcode sees it immediately.
+	if warning := sensitiveCapabilityPasscodeWarning(config.LoadPermissions(platform.ConfigDir())); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,
 	// auto-updater, usage syncer) observes cancellation and unwinds. As a
@@ -1780,6 +1791,11 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.PasscodeVerifier = func(pin string) bool {
 					return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
 				}
+				// Lets the reject response distinguish passcode_not_set from
+				// passcode_invalid (citadel#753); see terminal.Config.PasscodeHasPasscode.
+				termConfig.PasscodeHasPasscode = func() bool {
+					return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+				}
 
 				// Best-effort: provision a Citadel-managed tmux binary so persistent
 				// terminal sessions "just work" on nodes without a system tmux. This
@@ -2382,6 +2398,36 @@ func resolveEnergySampling() bool {
 		return update.IsTruthy(raw)
 	}
 	return config.LoadEnergy(platform.ConfigDir()).SamplingEnabled
+}
+
+// sensitiveCapabilityPasscodeWarning returns a single warning line when a
+// passcode-gated remote-access surface (console/desktop/files, aceteam#6524)
+// is enabled but no node passcode is configured, or "" when there is nothing
+// to warn about. Every one of these surfaces already fails closed without a
+// passcode (config.Permissions.VerifyPasscode), so this is not itself a
+// functional bug -- but a surface that is enabled, unreachable, and reports
+// no local signal is exactly the "broken while reporting green" failure mode
+// citadel#753 exists to close. Kept pure (permissions in, string out) so it
+// is testable without starting a worker.
+func sensitiveCapabilityPasscodeWarning(perms *config.Permissions) string {
+	if perms == nil || perms.HasPasscode() {
+		return ""
+	}
+	var enabled []string
+	if perms.Console {
+		enabled = append(enabled, "Console")
+	}
+	if perms.Desktop {
+		enabled = append(enabled, "Desktop")
+	}
+	if perms.Files {
+		enabled = append(enabled, "Files")
+	}
+	if len(enabled) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("   - ⚠️ %s enabled but no node passcode is set: remote access stays blocked until one is set (run 'citadel passcode set')",
+		strings.Join(enabled, "/"))
 }
 
 // stopManagedServices tears down services this worker started, mirroring the

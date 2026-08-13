@@ -592,6 +592,11 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	termCfg.PasscodeVerifier = func(pin string) bool {
 		return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
 	}
+	// Lets the reject response distinguish passcode_not_set from
+	// passcode_invalid (citadel#753); see terminal.Config.PasscodeHasPasscode.
+	termCfg.PasscodeHasPasscode = func() bool {
+		return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+	}
 
 	// Create the caching token validator
 	apiToken := ""

@@ -86,3 +86,24 @@ var (
 	// ErrServerAlreadyRunning indicates the server is already running
 	ErrServerAlreadyRunning = errors.New("server is already running")
 )
+
+// Passcode gate reason codes (aceteam#6524, citadel#753). handleWebSocket's
+// reject response carries one of these in its "reason" field so a client can
+// distinguish "no passcode configured at all" from "wrong passcode presented"
+// instead of string-matching the "error" text. Mirrors the
+// ReasonPasscodeNotSet / ReasonPasscodeInvalid pair in
+// internal/jobs/shell_command.go, which gates SHELL_COMMAND the same way; kept
+// as separate constants here (rather than imported) to avoid coupling the
+// terminal package to internal/jobs for two string literals.
+const (
+	// ReasonPasscodeNotSet means the node has no passcode configured at all
+	// (the underlying config.Permissions.PasscodeHash is empty). Nothing was
+	// presented for VerifyPasscode to check against; the operator must set a
+	// passcode (citadel passcode set) before this surface is reachable.
+	ReasonPasscodeNotSet = "passcode_not_set"
+
+	// ReasonPasscodeInvalid means a passcode IS configured but the one
+	// presented on the connection (?passcode= query param or the
+	// X-Citadel-Passcode header) was absent or did not match.
+	ReasonPasscodeInvalid = "passcode_invalid"
+)
