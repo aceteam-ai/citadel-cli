@@ -18,6 +18,7 @@ import (
 func resetDispatchState(t *testing.T) {
 	t.Helper()
 	origViaRaw, origViaMesh, origPasscode := viaRaw, viaMesh, shellPasscode
+	origWantTmux, origWantNoTmux := wantTmuxSession, wantNoTmuxSession
 	origSSHUser, origSSHPort := sshUser, sshPort
 	origTerminalAttempt := terminalAttemptFn
 	origLegacySSH := legacySSHFn
@@ -26,6 +27,7 @@ func resetDispatchState(t *testing.T) {
 
 	t.Cleanup(func() {
 		viaRaw, viaMesh, shellPasscode = origViaRaw, origViaMesh, origPasscode
+		wantTmuxSession, wantNoTmuxSession = origWantTmux, origWantNoTmux
 		sshUser, sshPort = origSSHUser, origSSHPort
 		terminalAttemptFn = origTerminalAttempt
 		legacySSHFn = origLegacySSH
@@ -34,6 +36,7 @@ func resetDispatchState(t *testing.T) {
 	})
 
 	viaRaw, viaMesh, shellPasscode = false, false, ""
+	wantTmuxSession, wantNoTmuxSession = false, false
 	sshUser, sshPort = "", ""
 	ensureNetworkConnectedFn = func(context.Context) error { return nil }
 }
@@ -60,7 +63,7 @@ func TestConnectToNode_TsNetSuccess(t *testing.T) {
 
 	var gotTarget, gotPasscode string
 	var calls int
-	terminalAttemptFn = func(target, passcode string) error {
+	terminalAttemptFn = func(target, passcode, session string) error {
 		calls++
 		gotTarget, gotPasscode = target, passcode
 		return nil
@@ -87,7 +90,7 @@ func TestConnectToNode_TsNetSuccess(t *testing.T) {
 func TestConnectToNode_UnreachableFallsBackToRawSSHD(t *testing.T) {
 	resetDispatchState(t)
 
-	terminalAttemptFn = func(target, passcode string) error {
+	terminalAttemptFn = func(target, passcode, session string) error {
 		return &terminalDialError{kind: terminalDialErrUnreachable, err: errors.New("connection refused")}
 	}
 	var legacyCalls int
@@ -130,7 +133,7 @@ func TestConnectToNode_MeshOnly_NoFallbackOnUnreachable(t *testing.T) {
 	viaMesh = true
 
 	wantErr := &terminalDialError{kind: terminalDialErrUnreachable, err: errors.New("connection refused")}
-	terminalAttemptFn = func(target, passcode string) error { return wantErr }
+	terminalAttemptFn = func(target, passcode, session string) error { return wantErr }
 	legacySSHFn = func(string) error {
 		t.Fatal("legacySSHFn must not be called with --mesh forcing ts-net only")
 		return nil
@@ -147,7 +150,7 @@ func TestConnectToNode_PasscodePromptAndRetry(t *testing.T) {
 	resetDispatchState(t)
 
 	var attempts []string // passcodes seen by terminalAttemptFn, in order
-	terminalAttemptFn = func(target, passcode string) error {
+	terminalAttemptFn = func(target, passcode, session string) error {
 		attempts = append(attempts, passcode)
 		if passcode == "correct-horse" {
 			return nil
@@ -185,7 +188,7 @@ func TestConnectToNode_PasscodeRejectedExhausted_NeverFallsBack(t *testing.T) {
 	resetDispatchState(t)
 
 	var attempts int
-	terminalAttemptFn = func(target, passcode string) error {
+	terminalAttemptFn = func(target, passcode, session string) error {
 		attempts++
 		return &terminalDialError{kind: terminalDialErrPasscode, err: errors.New("node passcode required")}
 	}
@@ -216,7 +219,7 @@ func TestConnectToNode_PasscodeFromEnv(t *testing.T) {
 	t.Setenv("CITADEL_TERMINAL_PASSCODE", "env-secret")
 
 	var gotPasscode string
-	terminalAttemptFn = func(target, passcode string) error {
+	terminalAttemptFn = func(target, passcode, session string) error {
 		gotPasscode = passcode
 		return nil
 	}
@@ -234,7 +237,7 @@ func TestConnectToNode_RawSkipsTsNet(t *testing.T) {
 	resetDispatchState(t)
 	viaRaw = true
 
-	terminalAttemptFn = func(string, string) error {
+	terminalAttemptFn = func(string, string, string) error {
 		t.Fatal("terminalAttemptFn must not be called with --raw")
 		return nil
 	}
@@ -253,7 +256,7 @@ func TestConnectToNode_RawAndMeshConflict(t *testing.T) {
 	resetDispatchState(t)
 	viaRaw, viaMesh = true, true
 
-	terminalAttemptFn = func(string, string) error { t.Fatal("unexpected call"); return nil }
+	terminalAttemptFn = func(string, string, string) error { t.Fatal("unexpected call"); return nil }
 	legacySSHFn = func(string) error { t.Fatal("unexpected call"); return nil }
 
 	err := connectToNode(cmdWithChangedFlags(nil), "gpu-node-1")
@@ -267,7 +270,7 @@ func TestConnectToNode_PortOrUserImpliesRaw(t *testing.T) {
 		t.Run(flag, func(t *testing.T) {
 			resetDispatchState(t)
 
-			terminalAttemptFn = func(string, string) error {
+			terminalAttemptFn = func(string, string, string) error {
 				t.Fatal("terminalAttemptFn must not be called when -p/-u was given")
 				return nil
 			}
@@ -288,7 +291,7 @@ func TestConnectToNode_PortOrUserConflictsWithMesh(t *testing.T) {
 	resetDispatchState(t)
 	viaMesh = true
 
-	terminalAttemptFn = func(string, string) error { t.Fatal("unexpected call"); return nil }
+	terminalAttemptFn = func(string, string, string) error { t.Fatal("unexpected call"); return nil }
 	legacySSHFn = func(string) error { t.Fatal("unexpected call"); return nil }
 
 	err := connectToNode(cmdWithChangedFlags([]string{"port"}), "gpu-node-1")
@@ -301,7 +304,7 @@ func TestConnectToNode_OtherErrorSurfacedDirectly(t *testing.T) {
 	resetDispatchState(t)
 
 	wantErr := fmt.Errorf("terminal handshake with node failed (HTTP 503)")
-	terminalAttemptFn = func(string, string) error { return wantErr }
+	terminalAttemptFn = func(string, string, string) error { return wantErr }
 	legacySSHFn = func(string) error {
 		t.Fatal("legacySSHFn must not be called for a non-passcode, non-refused error")
 		return nil

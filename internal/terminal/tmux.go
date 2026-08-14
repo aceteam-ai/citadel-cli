@@ -4,9 +4,12 @@ package terminal
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
+	"github.com/aceteam-ai/citadel-cli/internal/tmuxinstall"
 )
 
 // disableSentinels are case-insensitive values of CITADEL_TERMINAL_SESSION (or
@@ -108,4 +111,73 @@ func sessionCommand(sessionName, shell string) []string {
 		return nil
 	}
 	return append([]string{bin}, tmux.AttachOrCreateArgs(sessionName, shell)...)
+}
+
+// resolveSessionOverride decides the effective session BASE name for a single
+// connection (citadel #759): configDefault is the node's own configured
+// default (Config.SessionName); requestOverride is read from the connection
+// request's "session" query parameter, sent only by the CLI connect/ssh path
+// ("none" for a bare shell, or a session name for --tmux). The web console
+// and any other caller that sends no override at all get configDefault
+// completely unchanged: that is what keeps this additive rather than a
+// behavior change for existing callers. A present override, even "none",
+// always wins over configDefault: only the CLI sends one, so honoring it can
+// never surprise a browser connection.
+func resolveSessionOverride(configDefault, requestOverride string) (base string, overridden bool) {
+	if requestOverride == "" {
+		return configDefault, false
+	}
+	return requestOverride, true
+}
+
+// resolveSessionCommand is handleWebSocket's full session decision, factored
+// out so it is unit-testable without a live WebSocket/PTY: it applies the
+// per-connection override over the node default (resolveSessionOverride),
+// derives the per-user session name, and, ONLY when an override explicitly
+// asked for a persistent session that isn't currently backed by a resolvable
+// tmux binary, attempts an on-node install via ensureInstall before falling
+// back to a bare shell (citadel #759). The plain (non-overridden) default
+// path is untouched: a node whose own CITADEL_TERMINAL_SESSION wants tmux but
+// has none installed still just falls back, exactly as before this change.
+//
+// command is nil for a bare shell. wantedSession reports whether a
+// persistent session was asked for at all (by the override or the node
+// default), which is what the caller needs to decide whether the "tmux
+// unavailable" warning applies.
+func resolveSessionCommand(configDefault, requestOverride, userID, shell string, ensureInstall func() bool) (command []string, sessionName string, wantedSession bool) {
+	base, overridden := resolveSessionOverride(configDefault, requestOverride)
+	if sessionDisabled(base) {
+		return nil, "", false
+	}
+
+	sessionName = sessionNameForUser(base, userID)
+	command = sessionCommand(sessionName, shell)
+	if command == nil && overridden && ensureInstall != nil {
+		if ensureInstall() {
+			command = sessionCommand(sessionName, shell)
+		}
+	}
+	return command, sessionName, true
+}
+
+// tmuxInstallTimeout bounds the on-demand install attempt (below) well under
+// the terminal server's http.Server WriteTimeout (15s, see Start in
+// server.go): a slow or stalled download must degrade to the bare-shell
+// fallback rather than trip the server's own write deadline and kill the
+// WebSocket upgrade outright.
+const tmuxInstallTimeout = 10 * time.Second
+
+// ensureTmuxInstalledFn attempts an on-node install of a Citadel-managed tmux
+// binary (mirrors 'citadel tmux install', cmd/tmux.go, both built on
+// internal/tmuxinstall) when a per-connection override explicitly requests a
+// persistent session but no tmux binary resolves (citadel #759), so
+// '--tmux' works without the operator installing tmux by hand. Package var so
+// tests can substitute a fake without a live network fetch. Returns true when
+// a tmux binary is now present (already installed counts).
+var ensureTmuxInstalledFn = defaultEnsureTmuxInstalled
+
+func defaultEnsureTmuxInstalled() bool {
+	inst := tmuxinstall.New(tmuxinstall.WithHTTPClient(&http.Client{Timeout: tmuxInstallTimeout}))
+	installed, err := inst.Ensure()
+	return err == nil && installed
 }

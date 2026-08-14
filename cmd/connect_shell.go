@@ -40,12 +40,17 @@ import (
 // creates duplicate node state — each invocation is an independent view, and on
 // exit the terminal is always restored and the socket closed cleanly. Stateful
 // re-attach (reconnecting to the *same* live shell with its running command and
-// scrollback after a dropped connection) is now the default: the node-side
-// terminal server backs sessions with a persistent per-user tmux session by
-// default (citadel #585, DefaultSessionName="citadel"), so a repeated connect —
-// or a reconnect after a drop — re-attaches to the same live shell. Operators
-// can force a bare shell with CITADEL_TERMINAL_SESSION=none.
-func runRemoteShell(target, passcode string) error {
+// scrollback after a dropped connection) is opt-in from the CLI (citadel #759):
+// a plain `citadel ssh`/`citadel connect` requests a bare shell by default,
+// and `--tmux` opts back into a persistent per-user tmux session. The node's
+// own CITADEL_TERMINAL_SESSION default (tmux ON, DefaultSessionName="citadel")
+// only governs connections that send no override at all, i.e. the web console.
+//
+// session carries that per-connection override: "" leaves the node default
+// alone (unused by this CLI path, which always sets one, see connectToNode),
+// "none" forces a bare shell, and any other value names the persistent
+// session's base to request (see terminalWSURL).
+func runRemoteShell(target, passcode, session string) error {
 	// Ensure the mesh is up before resolving/dialing.
 	netCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -72,7 +77,7 @@ func runRemoteShell(target, passcode string) error {
 	}
 
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", connectTerminalPort))
-	wsURL := terminalWSURL(addr, token, passcode)
+	wsURL := terminalWSURL(addr, token, passcode, session)
 
 	display := hostname
 	if display == "" {
@@ -102,20 +107,28 @@ func runRemoteShell(target, passcode string) error {
 }
 
 // terminalWSURL builds the terminal endpoint's WebSocket upgrade URL for
-// addr (host:port), forwarding token and/or passcode as query parameters the
-// same way the server reads them (internal/terminal/server.go:
-// r.URL.Query().Get("token") / .Get("passcode")). Each is set ONLY when
-// non-empty, so a node with neither configured sees the exact same request
-// it always has, and a node passcode (citadel#753) is never appended when
-// none was supplied. Pure and side-effect-free so the exact query string
-// (notably, the "passcode" key's presence) can be pinned by a test.
-func terminalWSURL(addr, token, passcode string) url.URL {
+// addr (host:port), forwarding token, passcode, and session as query
+// parameters the same way the server reads them (internal/terminal/server.go:
+// r.URL.Query().Get("token") / .Get("passcode") / .Get("session")). token and
+// passcode are set ONLY when non-empty, so a node with neither configured
+// sees the exact same request it always has, and a node passcode
+// (citadel#753) is never appended when none was supplied. session (citadel
+// #759) is set whenever the caller supplies one; connectToNode always does,
+// since it is what makes the CLI path default to a bare shell regardless of
+// the node's own tmux default; only a caller that explicitly passes "" (none
+// today) leaves it off the query string entirely, which is what keeps a
+// hypothetical non-CLI caller's request byte-identical to before #759. Pure
+// and side-effect-free so the exact query string can be pinned by a test.
+func terminalWSURL(addr, token, passcode, session string) url.URL {
 	query := url.Values{}
 	if token != "" {
 		query.Set("token", token)
 	}
 	if passcode != "" {
 		query.Set("passcode", passcode)
+	}
+	if session != "" {
+		query.Set("session", session)
 	}
 	return url.URL{
 		Scheme:   "ws",

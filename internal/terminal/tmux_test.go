@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
@@ -20,6 +21,22 @@ func makeFakeTmux(t *testing.T) string {
 	}
 	t.Setenv("CITADEL_TMUX_BIN", bin)
 	return bin
+}
+
+// TestTmuxInstallTimeoutUnderServerWriteTimeout pins the constraint that
+// makes the on-demand tmux install (citadel #759) safe to run synchronously
+// inside handleWebSocket: it must finish well before the terminal server's
+// own http.Server.WriteTimeout (15s, see Start in server.go) would tear down
+// the not-yet-upgraded connection out from under it. If this ever regresses
+// (e.g. someone raises tmuxInstallTimeout to "be more generous"), the
+// failure mode is a dead WebSocket upgrade on a slow/stalled install, not a
+// clean bare-shell fallback, so it is worth a hard assertion, not just a
+// comment.
+func TestTmuxInstallTimeoutUnderServerWriteTimeout(t *testing.T) {
+	const serverWriteTimeout = 15 * time.Second // internal/terminal/server.go Start()
+	if tmuxInstallTimeout >= serverWriteTimeout {
+		t.Fatalf("tmuxInstallTimeout = %v, want strictly less than the server's WriteTimeout (%v)", tmuxInstallTimeout, serverWriteTimeout)
+	}
 }
 
 func TestSessionCommand_NoSessionName(t *testing.T) {

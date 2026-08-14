@@ -17,7 +17,7 @@ import (
 // one via either command name has the same effect). -u/-p/-v are
 // deliberately asymmetric (sshCmd only); see TestConnectCmdHasNoRawSSHDFlags.
 func TestSSHConnectSharedFlagsPresent(t *testing.T) {
-	shared := []string{"raw", "via-sshd", "mesh", "terminal", "passcode"}
+	shared := []string{"raw", "via-sshd", "mesh", "terminal", "passcode", "tmux", "no-tmux"}
 	for _, name := range shared {
 		if sshCmd.Flags().Lookup(name) == nil {
 			t.Errorf("sshCmd missing shared flag --%s", name)
@@ -72,7 +72,7 @@ func TestSSHAndConnectRouteBareTargetIdentically(t *testing.T) {
 	const target = "100.64.0.9" // valid IP -> resolvePeer's isValidIP fast path, no network call
 
 	var calls []string
-	terminalAttemptFn = func(gotTarget, passcode string) error {
+	terminalAttemptFn = func(gotTarget, passcode, session string) error {
 		calls = append(calls, gotTarget)
 		return nil
 	}
