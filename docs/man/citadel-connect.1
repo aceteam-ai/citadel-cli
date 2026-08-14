@@ -35,10 +35,20 @@ By default this tries the AceTeam Network terminal endpoint first,
 .PP
 The terminal endpoint is started by 'citadel work' by default (disable
   with --no-terminal). No token is needed there: the node trusts your
-  verified mesh-peer identity over the VPN (citadel #585). Repeated connects
-  re-attach to the same live tmux-backed shell. A --token (or
+  verified mesh-peer identity over the VPN (citadel #585). A --token (or
   CITADEL_TERMINAL_TOKEN) is still accepted for the platform terminal path or
   when the target disables mesh trust.
+
+.PP
+This CLI path gives you a PLAIN shell by default: no tmux, nothing
+  persists once you disconnect. Pass --tmux to opt into a persistent,
+  reconnect-resilient session instead, a repeated connect (or a reconnect
+  after a drop) re-attaches to the same live shell, running command and
+  scrollback intact. If the target has no tmux binary, it is installed on
+  the node automatically; if that install fails, you get a plain shell with
+  a warning instead of a failed connection. --no-tmux is accepted for
+  symmetry but is already the default. (The web console's own connections
+  are unaffected either way and stay persistent by default.)
 
 .PP
 --raw (alias --via-sshd) skips straight to the OpenSSH path.
@@ -76,6 +86,10 @@ that system networking cannot.
 	Force the terminal-endpoint path only, no raw sshd fallback (bare-target mode)
 
 .PP
+\fB--no-tmux\fP[=false]
+	Explicit bare shell (the default); accepted for symmetry with --tmux
+
+.PP
 \fB--passcode\fP=""
 	Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted
 
@@ -94,6 +108,10 @@ that system networking cannot.
 .PP
 \fB--timeout\fP=0
 	Connection timeout in seconds (0 = no timeout, raw-TCP mode)
+
+.PP
+\fB--tmux\fP[=false]
+	Opt into a persistent, reconnect-resilient tmux-backed session (bare-target mode; default is a plain shell)
 
 .PP
 \fB--token\fP=""
@@ -132,6 +150,9 @@ that system networking cannot.
 
   # Force the terminal-endpoint path only, no OpenSSH fallback
   citadel connect gpu-node-1 --mesh
+
+  # Opt into a persistent, reconnect-resilient tmux-backed session
+  citadel connect gpu-node-1 --tmux
 
   # Raw TCP: connect to a PostgreSQL server
   citadel connect gpu-node-1:5432
