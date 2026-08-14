@@ -1799,7 +1799,33 @@ func (cc *ControlCenter) stopWorker() {
 	}()
 }
 
-// showPeerDetailModal shows a modal with peer details and ping option
+// peerModalKeyHandler builds the input-capture callback for the Network Peers
+// modal table. Extracted from showPeerDetailModal (issue #761) so the
+// Enter=connect / p=ping / Esc=close routing is a plain function of a key
+// event and three callbacks, independent of tview widget state, live mesh
+// connectivity, or a running event loop: a test can supply fake
+// connect/ping/close callbacks and assert which one a given key fires,
+// without a live tview screen or mesh.
+func (cc *ControlCenter) peerModalKeyHandler(connectSelected, pingSelected, closeModal func()) func(event *tcell.EventKey) *tcell.EventKey {
+	return func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			closeModal()
+			return nil
+		case tcell.KeyEnter:
+			connectSelected()
+			return nil
+		case tcell.KeyRune:
+			if event.Rune() == 'p' || event.Rune() == 'P' {
+				pingSelected()
+				return nil
+			}
+		}
+		return event
+	}
+}
+
+// showPeerDetailModal shows a modal with peer details, connect, and ping options.
 func (cc *ControlCenter) showPeerDetailModal() {
 	if !cc.data.Connected || len(cc.data.Peers) == 0 {
 		cc.AddActivity("info", "No peers available")
@@ -1818,7 +1844,7 @@ func (cc *ControlCenter) showPeerDetailModal() {
 		SetBorders(false).
 		SetSelectable(true, false).
 		SetFixed(1, 0)
-	table.SetBorder(true).SetTitle(" Network Peers (p=ping, Enter=ping, Esc=close) ")
+	table.SetBorder(true).SetTitle(" Network Peers (Enter=connect, p=ping, Esc=close) ")
 
 	// Header
 	headers := []string{" ", "HOSTNAME", "IP", "STATUS", "LATENCY"}
@@ -1890,24 +1916,67 @@ func (cc *ControlCenter) showPeerDetailModal() {
 		}()
 	}
 
-	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyEsc:
-			cc.inModal = false
-			cc.app.SetRoot(cc.rootView, true)
-			cc.updatePaneFocus()
-			return nil
-		case tcell.KeyEnter:
-			pingSelected()
-			return nil
-		case tcell.KeyRune:
-			if event.Rune() == 'p' || event.Rune() == 'P' {
-				pingSelected()
-				return nil
-			}
+	// Connect function: opens an interactive shell on the selected peer
+	// (issue #761). Enter used to be bound to ping, which was redundant with
+	// 'p'; the natural action on a selected peer is to connect to it.
+	//
+	// Reuses the same connect path as `citadel connect <peer>` (#754/PR #756)
+	// via cc.connectToPeerFn: ts-net terminal endpoint first, node-passcode
+	// prompt on the gate, raw-sshd fallback only when unreachable. That path
+	// takes over stdin/stdout directly (raw terminal mode, blocking read/write
+	// loop) to drive the remote shell, which would otherwise fight tview's own
+	// terminal-mode screen for the same TTY. cc.app.Suspend() is tview's
+	// documented mechanism for exactly this: it exits terminal UI mode
+	// (restoring the TTY to normal/cooked mode), runs the given function
+	// synchronously, and re-enters terminal UI mode (redrawing the TUI) only
+	// after that function returns, so the connect session gets the terminal
+	// to itself and the Control Center is guaranteed to be restored afterward,
+	// including on error or a non-zero remote exit.
+	connectSelected := func() {
+		selectedRow, _ := table.GetSelection()
+		if selectedRow < 1 || selectedRow > len(cc.data.Peers) {
+			return
 		}
-		return event
-	})
+		selectedPeer := cc.data.Peers[selectedRow-1]
+		if selectedPeer.IP == "" {
+			cc.AddActivity("warning", fmt.Sprintf("No IP for %s", selectedPeer.Hostname))
+			return
+		}
+		if cc.connectToPeerFn == nil {
+			cc.AddActivity("warning", "Connect is not available")
+			return
+		}
+
+		var connectErr error
+		suspended := cc.app.Suspend(func() {
+			connectErr = cc.connectToPeerFn(selectedPeer.IP)
+		})
+		if !suspended {
+			// Suspend() returns false without calling the given function when
+			// the screen is already gone (e.g. the Control Center is mid-exit).
+			// Report this explicitly rather than falling through to the
+			// success message below with connectErr still nil, which would be
+			// a silent no-op reported as a normal disconnect.
+			cc.AddActivity("error", fmt.Sprintf("Could not suspend the TUI to connect to %s", selectedPeer.Hostname))
+			return
+		}
+		if connectErr != nil {
+			// Surfaced whether the terminal endpoint was unreachable, the
+			// passcode was rejected, or anything else connectToNode returns:
+			// never a silent no-op.
+			cc.AddActivity("error", fmt.Sprintf("Connect to %s failed: %v", selectedPeer.Hostname, connectErr))
+		} else {
+			cc.AddActivity("info", fmt.Sprintf("Disconnected from %s", selectedPeer.Hostname))
+		}
+	}
+
+	closeModal := func() {
+		cc.inModal = false
+		cc.app.SetRoot(cc.rootView, true)
+		cc.updatePaneFocus()
+	}
+
+	table.SetInputCapture(cc.peerModalKeyHandler(connectSelected, pingSelected, closeModal))
 
 	cc.app.SetRoot(table, true)
 	cc.app.SetFocus(table)

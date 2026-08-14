@@ -516,6 +516,7 @@ type ControlCenter struct {
 	worker             WorkerCallbacks                          // Worker management callbacks
 	permissions        PermissionsCallbacks                     // Gateway permissions callbacks
 	onConnect          func(activityFn func(level, msg string)) // Post-VPN-connect hook
+	connectToPeerFn    func(ip string) error                    // Opens an interactive shell on a peer (issue #761)
 	authServiceURL     string                                   // URL for device auth service
 	nexusURL           string                                   // URL for headscale/nexus coordination server
 
@@ -661,6 +662,7 @@ type Config struct {
 	Worker             WorkerCallbacks                          // Worker management callbacks
 	Permissions        PermissionsCallbacks                     // Gateway permissions callbacks
 	OnConnect          func(activityFn func(level, msg string)) // Called after VPN connects (starts terminal/VNC servers)
+	ConnectToPeerFn    func(ip string) error                    // Opens an interactive shell on a peer, e.g. from the Network Peers modal (issue #761)
 	Chat               ChatPageConfig                           // Chat page configuration (initial snapshot; may be empty pre-auth)
 	ChatConfigProvider func() ChatPageConfig                    // Lazy re-resolver for chat credentials (picks up post-startup device auth)
 
@@ -727,6 +729,7 @@ func New(cfg Config) *ControlCenter {
 		worker:              cfg.Worker,
 		permissions:         cfg.Permissions,
 		onConnect:           cfg.OnConnect,
+		connectToPeerFn:     cfg.ConnectToPeerFn,
 		authServiceURL:      cfg.AuthServiceURL,
 		nexusURL:            cfg.NexusURL,
 		chatConfig:          cfg.Chat,
@@ -1822,7 +1825,7 @@ func (cc *ControlCenter) showHelpModal() {
 [yellow]Navigation (nothing to memorize):[-]
   [white::b]Tab[-:-:-] / [white::b]Shift+Tab[-:-:-]  Move through panes, then on to the next/prev tab
   [white::b]↑/↓[-:-:-] or [white::b]j/k[-:-:-]   Navigate within the focused pane
-  [white::b]Enter[-:-:-]         Details / toggle service / ping peer
+  [white::b]Enter[-:-:-]         Details / toggle service / connect to peer
   [white::b]Alt+1..N[-:-:-]      Jump straight to a tab (optional shortcut)
 
 [yellow]Services Pane:[-]

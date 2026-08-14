@@ -47,6 +47,7 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/spf13/cobra"
 )
 
 // Worker state for TUI management
@@ -242,7 +243,8 @@ func runControlCenter() {
 				return config.SavePermissions(platform.ConfigDir(), p)
 			},
 		},
-		OnConnect: ccOnNetworkConnect,
+		OnConnect:       ccOnNetworkConnect,
+		ConnectToPeerFn: ccConnectToPeer,
 		// Chat is seeded with the snapshot resolvable at startup, but a node that
 		// completes device authorization in-TUI persists its credentials only
 		// afterward. ChatConfigProvider lets the ChatPage re-resolve them lazily
@@ -505,6 +507,20 @@ func stopDemoServer() {
 	if ccDemoServer != nil {
 		_ = ccDemoServer.Stop()
 	}
+}
+
+// ccConnectToPeer opens an interactive shell on the given peer IP, wired into
+// the Control Center's Network Peers modal (issue #761, Enter=connect) via
+// controlcenter.Config.ConnectToPeerFn. Reuses the exact same bare-target
+// routing `citadel connect <peer>` uses (#754/PR #756): the ts-net terminal
+// endpoint first (with an interactive node-passcode prompt on the gate), and
+// the legacy raw-sshd path only when the terminal endpoint itself is
+// unreachable. A throwaway *cobra.Command carries no --user/--port/--raw/
+// --mesh flags, so connectToNode always takes the default (ts-net-first,
+// fallback-on-unreachable) route here, the same default a bare `citadel
+// connect <peer>` gets from the CLI.
+func ccConnectToPeer(ip string) error {
+	return connectToNode(&cobra.Command{}, ip)
 }
 
 // ccOnNetworkConnect starts terminal server, VNC server, and worker after VPN connects.
