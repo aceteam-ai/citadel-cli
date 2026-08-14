@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/terminal"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -53,11 +54,27 @@ var (
 	// CITADEL_TERMINAL_PASSCODE, then an interactive no-echo prompt on a
 	// 401. Never logged, never placed on any subprocess argv.
 	shellPasscode string
+	// wantTmuxSession is set by --tmux: opt into a persistent, reconnect-
+	// resilient tmux-backed session instead of the CLI's bare-shell default
+	// (citadel #759).
+	wantTmuxSession bool
+	// wantNoTmuxSession is set by --no-tmux: explicit symmetry with --tmux.
+	// It never changes behavior on its own (a bare shell is already the
+	// default); it exists so operators can say what they mean and so
+	// --tmux/--no-tmux together is a detectable, rejected conflict.
+	wantNoTmuxSession bool
 )
 
 // maxPasscodeAttempts bounds the interactive retry loop so a mistyped
 // passcode does not prompt forever, while still tolerating a typo.
 const maxPasscodeAttempts = 3
+
+// bareSessionOverride is the session-query value the terminal server
+// (internal/terminal/server.go) reads as "force a bare, non-persistent
+// shell regardless of the node's own default" (citadel #759). It is the
+// CLI's default override, sent on every connect/ssh unless --tmux asks for
+// a persistent session instead.
+const bareSessionOverride = "none"
 
 // rawFallbackNotice is printed right before falling back to the legacy raw
 // sshd path. The guidance has to be up front, not appended after the fact:
@@ -72,8 +89,8 @@ const rawFallbackNotice = "Terminal endpoint unreachable on the mesh; falling ba
 	"start 'citadel work' on it, or re-run with --mesh to see the terminal-endpoint error directly."
 
 // terminalAttemptFn performs one attempt to open the ts-net terminal shell
-// against target with the given passcode. Package var so tests can
-// substitute a fake without a live mesh/terminal server.
+// against target with the given passcode and session override. Package var
+// so tests can substitute a fake without a live mesh/terminal server.
 var terminalAttemptFn = runRemoteShell
 
 // legacySSHFn execs the real ssh(1) binary against target via the raw-TCP
@@ -109,6 +126,9 @@ func connectToNode(cmd *cobra.Command, target string) error {
 	if portOrUserGiven && viaMesh {
 		return fmt.Errorf("--user/--port select the raw sshd path, which conflicts with --mesh/--terminal (ts-net only, no sshd)")
 	}
+	if wantTmuxSession && wantNoTmuxSession {
+		return fmt.Errorf("--tmux and --no-tmux are mutually exclusive")
+	}
 
 	if viaRaw || portOrUserGiven {
 		return legacySSHFn(target)
@@ -119,8 +139,22 @@ func connectToNode(cmd *cobra.Command, target string) error {
 		passcode = os.Getenv("CITADEL_TERMINAL_PASSCODE")
 	}
 
+	// citadel #759: the CLI connect path always sends an explicit session
+	// override, which is what makes 'citadel ssh'/'citadel connect' default
+	// to a bare shell regardless of the node's own CITADEL_TERMINAL_SESSION
+	// default (tmux ON by default, citadel #585); that default keeps
+	// governing every OTHER caller (namely the web console), which never
+	// sends this override at all. "none" forces a bare shell (the CLI
+	// default, and also what --no-tmux asks for explicitly); --tmux instead
+	// requests the node's standard persistent session name, so a reconnect
+	// (with or without --tmux again) re-attaches to the same live shell.
+	session := bareSessionOverride
+	if wantTmuxSession {
+		session = terminal.DefaultSessionName
+	}
+
 	for attempt := 1; attempt <= maxPasscodeAttempts; attempt++ {
-		err := terminalAttemptFn(target, passcode)
+		err := terminalAttemptFn(target, passcode, session)
 		if err == nil {
 			return nil
 		}

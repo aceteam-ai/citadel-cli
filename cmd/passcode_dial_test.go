@@ -128,30 +128,36 @@ func TestRemoteShellDialError_OtherTransportFailureNotClassifiedAsUnreachable(t 
 	}
 }
 
-// TestTerminalWSURL pins the #754 wire-level requirement: the passcode is
-// forwarded as a "?passcode=" query parameter on the terminal WebSocket
-// upgrade URL, present ONLY when non-empty. The empty case matters as much
-// as the present case: a node with no passcode configured must see a
-// byte-identical request to before #754, or internal/terminal/server.go's
-// gate (only active when config.PasscodeVerifier != nil, independent of the
-// query string) would still work, but a regression here would be invisible
-// to every routing test in this package (they all stub terminalAttemptFn).
+// TestTerminalWSURL pins the #754/#759 wire-level requirements: the passcode
+// is forwarded as a "?passcode=" query parameter, and the session override
+// (#759) as "?session=", each present ONLY when non-empty. The empty case
+// matters as much as the present case: a node with no passcode configured
+// must see a byte-identical request to before #754 (independent of the
+// session param), or internal/terminal/server.go's gate (only active when
+// config.PasscodeVerifier != nil, independent of the query string) would
+// still work, but a regression here would be invisible to every routing test
+// in this package (they all stub terminalAttemptFn).
 func TestTerminalWSURL(t *testing.T) {
 	cases := []struct {
-		name            string
-		token, passcode string
-		wantHasPasscode bool
-		wantPasscodeVal string
-		wantHasToken    bool
+		name                     string
+		token, passcode, session string
+		wantHasPasscode          bool
+		wantPasscodeVal          string
+		wantHasToken             bool
+		wantHasSession           bool
+		wantSessionVal           string
 	}{
 		{name: "neither set", token: "", passcode: "", wantHasPasscode: false, wantHasToken: false},
 		{name: "passcode only", token: "", passcode: "hunter2", wantHasPasscode: true, wantPasscodeVal: "hunter2", wantHasToken: false},
 		{name: "token only", token: "tok_abc", passcode: "", wantHasPasscode: false, wantHasToken: true},
 		{name: "both set", token: "tok_abc", passcode: "hunter2", wantHasPasscode: true, wantPasscodeVal: "hunter2", wantHasToken: true},
+		{name: "bare session override", session: "none", wantHasSession: true, wantSessionVal: "none"},
+		{name: "named session override", session: "citadel", wantHasSession: true, wantSessionVal: "citadel"},
+		{name: "no session override", session: "", wantHasSession: false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			u := terminalWSURL("100.64.0.5:7860", c.token, c.passcode)
+			u := terminalWSURL("100.64.0.5:7860", c.token, c.passcode, c.session)
 			q := u.Query()
 
 			if _, has := q["passcode"]; has != c.wantHasPasscode {
@@ -162,6 +168,12 @@ func TestTerminalWSURL(t *testing.T) {
 			}
 			if _, has := q["token"]; has != c.wantHasToken {
 				t.Errorf("token key present = %v, want %v (query=%q)", has, c.wantHasToken, u.RawQuery)
+			}
+			if _, has := q["session"]; has != c.wantHasSession {
+				t.Errorf("session key present = %v, want %v (query=%q)", has, c.wantHasSession, u.RawQuery)
+			}
+			if c.wantHasSession && q.Get("session") != c.wantSessionVal {
+				t.Errorf("session value = %q, want %q", q.Get("session"), c.wantSessionVal)
 			}
 			if u.Scheme != "ws" || u.Host != "100.64.0.5:7860" || u.Path != "/terminal" {
 				t.Errorf("URL = %+v, want scheme=ws host=100.64.0.5:7860 path=/terminal", u)

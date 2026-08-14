@@ -44,6 +44,15 @@ HOW IT WORKS:
   to a real OpenSSH connection, tunneled through the mesh to the peer's sshd
   (port 22 by default).
 
+  The terminal endpoint gives you a PLAIN shell by default: no tmux, nothing
+  persists once you disconnect. Pass --tmux to opt into a persistent,
+  reconnect-resilient session instead, a repeated connect (or a reconnect
+  after a drop) re-attaches to the same live shell, running command and
+  scrollback intact. If the target has no tmux binary, it is installed on
+  the node automatically; if that install fails, you get a plain shell with
+  a warning instead of a failed connection. --no-tmux is accepted for
+  symmetry but is already the default.
+
   --raw (alias --via-sshd) skips straight to the OpenSSH path, no terminal
   endpoint attempt at all.
   --mesh (alias --terminal) forces the terminal-endpoint path only, with no
@@ -69,6 +78,9 @@ REQUIREMENTS:
 
   # Force the terminal-endpoint path only, no OpenSSH fallback
   citadel ssh gpu-node-1 --mesh
+
+  # Opt into a persistent, reconnect-resilient tmux-backed session
+  citadel ssh gpu-node-1 --tmux
 
   # Supply a node passcode up front instead of being prompted
   citadel ssh gpu-node-1 --passcode 123456`,
@@ -246,4 +258,6 @@ func init() {
 	sshCmd.Flags().BoolVar(&viaMesh, "mesh", false, "Force the terminal-endpoint path only, no raw sshd fallback")
 	sshCmd.Flags().BoolVar(&viaMesh, "terminal", false, "Alias of --mesh")
 	sshCmd.Flags().StringVar(&shellPasscode, "passcode", "", "Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted")
+	sshCmd.Flags().BoolVar(&wantTmuxSession, "tmux", false, "Opt into a persistent, reconnect-resilient tmux-backed session (terminal-endpoint path only; default is a plain shell)")
+	sshCmd.Flags().BoolVar(&wantNoTmuxSession, "no-tmux", false, "Explicit bare shell (the default); accepted for symmetry with --tmux")
 }

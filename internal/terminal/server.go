@@ -573,17 +573,28 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// derived per-user from the configured base name so a reconnecting client
 	// re-attaches to its own live session (running command, scrollback, cwd all
 	// preserved by the tmux server) while staying isolated from other users.
-	var tmuxCommand []string
-	if !sessionDisabled(s.config.SessionName) {
-		tmuxSessionName := sessionNameForUser(s.config.SessionName, tokenInfo.UserID)
-		tmuxCommand = sessionCommand(tmuxSessionName, s.config.Shell)
+	//
+	// citadel #759: a per-connection "session" query override, when present,
+	// wins over the node's own CITADEL_TERMINAL_SESSION default: "none"
+	// forces a bare shell, any other value requests a persistent session by
+	// that base name. Only the CLI connect/ssh path ever sends this (the web
+	// console does not), so an absent override reproduces the exact prior
+	// behavior. See resolveSessionCommand for the full contract, including
+	// the on-demand tmux install that only fires for an override-requested
+	// session.
+	sessionOverride := r.URL.Query().Get("session")
+	tmuxCommand, tmuxSessionName, wantedSession := resolveSessionCommand(
+		s.config.SessionName, sessionOverride, tokenInfo.UserID, s.config.Shell, ensureTmuxInstalledFn)
+	if wantedSession {
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
 		} else {
-			// tmux backing is wanted (citadel #585 defaults it ON) but no usable
-			// tmux binary resolved. Fall back to a bare, non-persistent shell:
-			// the connection still succeeds, it just won't survive a reconnect.
-			// Warn (not silent) so the missing re-attach is diagnosable.
+			// tmux backing is wanted (either the node default, citadel #585, or
+			// an explicit --tmux override) but no usable tmux binary resolved,
+			// and (for an override) an on-node install attempt also failed.
+			// Fall back to a bare, non-persistent shell: the connection still
+			// succeeds, it just won't survive a reconnect. Warn (not silent) so
+			// the missing re-attach is diagnosable.
 			s.logger.Printf("tmux unavailable; session %s falls back to a bare (non-persistent) shell — reconnect re-attach disabled (install tmux, or set CITADEL_TERMINAL_SESSION=none to silence)", sessionID)
 		}
 	}

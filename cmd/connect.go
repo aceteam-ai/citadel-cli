@@ -45,10 +45,19 @@ BARE TARGET (no port):
 
   The terminal endpoint is started by 'citadel work' by default (disable
   with --no-terminal). No token is needed there: the node trusts your
-  verified mesh-peer identity over the VPN (citadel #585). Repeated connects
-  re-attach to the same live tmux-backed shell. A --token (or
+  verified mesh-peer identity over the VPN (citadel #585). A --token (or
   CITADEL_TERMINAL_TOKEN) is still accepted for the platform terminal path or
   when the target disables mesh trust.
+
+  This CLI path gives you a PLAIN shell by default: no tmux, nothing
+  persists once you disconnect. Pass --tmux to opt into a persistent,
+  reconnect-resilient session instead, a repeated connect (or a reconnect
+  after a drop) re-attaches to the same live shell, running command and
+  scrollback intact. If the target has no tmux binary, it is installed on
+  the node automatically; if that install fails, you get a plain shell with
+  a warning instead of a failed connection. --no-tmux is accepted for
+  symmetry but is already the default. (The web console's own connections
+  are unaffected either way and stay persistent by default.)
 
   --raw (alias --via-sshd) skips straight to the OpenSSH path.
   --mesh (alias --terminal) forces the terminal-endpoint path only, with no
@@ -80,6 +89,9 @@ that system networking cannot.`,
 
   # Force the terminal-endpoint path only, no OpenSSH fallback
   citadel connect gpu-node-1 --mesh
+
+  # Opt into a persistent, reconnect-resilient tmux-backed session
+  citadel connect gpu-node-1 --tmux
 
   # Raw TCP: connect to a PostgreSQL server
   citadel connect gpu-node-1:5432
@@ -318,4 +330,6 @@ func init() {
 	connectCmd.Flags().BoolVar(&viaMesh, "mesh", false, "Force the terminal-endpoint path only, no raw sshd fallback (bare-target mode)")
 	connectCmd.Flags().BoolVar(&viaMesh, "terminal", false, "Alias of --mesh")
 	connectCmd.Flags().StringVar(&shellPasscode, "passcode", "", "Node passcode for the terminal endpoint (or CITADEL_TERMINAL_PASSCODE); prompted interactively if required and omitted")
+	connectCmd.Flags().BoolVar(&wantTmuxSession, "tmux", false, "Opt into a persistent, reconnect-resilient tmux-backed session (bare-target mode; default is a plain shell)")
+	connectCmd.Flags().BoolVar(&wantNoTmuxSession, "no-tmux", false, "Explicit bare shell (the default); accepted for symmetry with --tmux")
 }
