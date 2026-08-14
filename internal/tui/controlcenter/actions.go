@@ -2014,6 +2014,18 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 	renderRows()
 	table.Select(0, 0)
 
+	// passcodeStatusLine renders the current node-passcode state (citadel#760).
+	// It calls Load() fresh on every render instead of reusing the outer
+	// perms snapshot, so re-opening this modal after a set/rotate/clear (which
+	// tears down and rebuilds it) always shows the current on-disk state.
+	passcodeStatusLine := func() string {
+		status := "[red]NOT SET[-]"
+		if cc.permissions.Load != nil && cc.permissions.Load().HasPasscode() {
+			status = "[green]SET[-]"
+		}
+		return fmt.Sprintf("[yellow::b]Node Passcode:[-:-:-] %s   [gray](gates Console/Desktop/Files, press[-] [yellow::b]P[-:-:-] [gray]to manage)[-]", status)
+	}
+
 	updateDetail := func(row int) {
 		if row < 0 || row >= len(services) {
 			return
@@ -2024,8 +2036,8 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 			statusLine = "[green]ENABLED[-]"
 		}
 		detailView.SetText(fmt.Sprintf(
-			"[yellow::b]%s[-:-:-]  %s\n\n[gray]%s[-]\n\n%s\n\n[gray]Space/Enter[-] toggle  [gray]+[-] add Docker service  [gray]Esc[-] close",
-			svc.name, statusLine, svc.desc, svc.detail,
+			"[yellow::b]%s[-:-:-]  %s\n\n[gray]%s[-]\n\n%s\n\n%s\n\n[gray]Space/Enter[-] toggle  [gray]+[-] add Docker service  [gray]P[-] passcode  [gray]Esc[-] close",
+			svc.name, statusLine, svc.desc, svc.detail, passcodeStatusLine(),
 		))
 	}
 	updateDetail(0)
@@ -2085,6 +2097,11 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 				cc.inModal = false
 				cc.app.SetRoot(cc.rootView, true)
 				cc.showAddServiceModal()
+				return nil
+			case 'p', 'P':
+				cc.inModal = false
+				cc.app.SetRoot(cc.rootView, true)
+				cc.showPasscodeModal()
 				return nil
 			}
 		}
