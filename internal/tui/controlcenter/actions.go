@@ -2015,8 +2015,9 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 	table.Select(0, 0)
 
 	// passcodeStatusLine renders the current node-passcode state (citadel#760).
-	// Re-read on every render (not cached) so a set/rotate/clear performed via
-	// the P hotkey is reflected the moment this modal regains focus.
+	// It calls Load() fresh on every render instead of reusing the outer
+	// perms snapshot, so re-opening this modal after a set/rotate/clear (which
+	// tears down and rebuilds it) always shows the current on-disk state.
 	passcodeStatusLine := func() string {
 		status := "[red]NOT SET[-]"
 		if cc.permissions.Load != nil && cc.permissions.Load().HasPasscode() {

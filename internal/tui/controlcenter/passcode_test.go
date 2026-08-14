@@ -2,6 +2,7 @@ package controlcenter
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -180,6 +181,35 @@ func TestPasscodeClearNeedsWarning(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := passcodeClearNeedsWarning(tc.perms); got != tc.want {
 				t.Errorf("passcodeClearNeedsWarning(%+v) = %v, want %v", tc.perms, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuiltinServicesActionDesc(t *testing.T) {
+	cases := []struct {
+		name        string
+		perms       *config.Permissions
+		wantCount   string
+		wantWarning bool
+	}{
+		{"all off", &config.Permissions{}, "0/5 enabled", false},
+		{"non-sensitive only, no warning", &config.Permissions{Services: true, SSH: true}, "2/5 enabled", false},
+		{"sensitive enabled with passcode set, no warning", &config.Permissions{Console: true, PasscodeHash: "x"}, "1/5 enabled", false},
+		{"sensitive enabled without passcode, warns", &config.Permissions{Console: true}, "1/5 enabled", true},
+		{"desktop enabled without passcode, warns", &config.Permissions{Desktop: true}, "1/5 enabled", true},
+		{"all five on without passcode, warns", &config.Permissions{Console: true, Desktop: true, Files: true, Services: true, SSH: true}, "5/5 enabled", true},
+		{"shell alone does not count toward N/5 or warn (citadel#763)", &config.Permissions{Shell: true}, "0/5 enabled", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := builtinServicesActionDesc(tc.perms)
+			if !strings.Contains(got, tc.wantCount) {
+				t.Errorf("builtinServicesActionDesc(%+v) = %q, want it to contain %q", tc.perms, got, tc.wantCount)
+			}
+			hasWarning := strings.Contains(got, "no passcode")
+			if hasWarning != tc.wantWarning {
+				t.Errorf("builtinServicesActionDesc(%+v) = %q, wantWarning=%v", tc.perms, got, tc.wantWarning)
 			}
 		})
 	}

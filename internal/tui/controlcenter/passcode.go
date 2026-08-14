@@ -289,8 +289,37 @@ func (cc *ControlCenter) showPasscodeClearConfirmModal() {
 // (actions.go's showBuiltinServicesModal toggle handler) applies again. Pure
 // so the "refresh the warning state" behavior is unit-testable without a
 // running TUI.
+//
+// Deliberately matches the existing toggle-warning's surface set (Console,
+// Desktop, Files) and 'citadel passcode clear's own message
+// (cmd/passcode.go's runPasscodeClear), not config.Permissions.Shell, even
+// though Shell is also passcode-gated in enforcement
+// (internal/jobs/shell_command.go calls VerifyPasscode). Extending the
+// warning to Shell is a real gap, but it is a pre-existing one shared by both
+// of those call sites, out of scope for citadel#760's ask (give the TUI a way
+// to set/rotate/clear), and tracked separately (citadel#763) rather than
+// fixed as a side effect here.
 func passcodeClearNeedsWarning(perms *config.Permissions) bool {
 	return perms.Console || perms.Desktop || perms.Files
+}
+
+// builtinServicesActionDesc renders the Actions-panel description for the
+// Built-in Services row (key 1). It appends a passcode warning when a
+// sensitive surface is enabled but no passcode is set, so an operator who
+// never opens the modal still sees the gap on the always-visible action
+// panel, not only inside showBuiltinServicesModal's detail pane.
+func builtinServicesActionDesc(perms *config.Permissions) string {
+	enabled := 0
+	for _, e := range []bool{perms.Console, perms.Desktop, perms.Files, perms.Services, perms.SSH} {
+		if e {
+			enabled++
+		}
+	}
+	desc := fmt.Sprintf("[gray]%d/5 enabled[-]", enabled)
+	if passcodeClearNeedsWarning(perms) && !perms.HasPasscode() {
+		desc += "  [red]no passcode[-]"
+	}
+	return desc
 }
 
 // doClearNodePasscode performs the passcode clear and reports the resulting

@@ -1900,14 +1900,7 @@ func (cc *ControlCenter) getActions() []actionDef {
 
 	svcDesc := "[gray]Built-in + add[-]"
 	if cc.permissions.Load != nil {
-		perms := cc.permissions.Load()
-		enabled := 0
-		for _, e := range []bool{perms.Console, perms.Desktop, perms.Files, perms.Services, perms.SSH} {
-			if e {
-				enabled++
-			}
-		}
-		svcDesc = fmt.Sprintf("[gray]%d/5 enabled[-]", enabled)
+		svcDesc = builtinServicesActionDesc(cc.permissions.Load())
 	}
 
 	return []actionDef{
