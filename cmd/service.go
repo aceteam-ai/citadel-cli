@@ -146,6 +146,14 @@ func startService(serviceName, composeFilePath string) error {
 	rt := catalog.SelectContainerRuntime()
 	fmt.Printf("   Container runtime: %s\n", rt.Label())
 
+	// Preflight: fail fast with a friendly, actionable message when the engine
+	// CLI is missing or its daemon is unreachable (citadel #767), instead of
+	// letting the inspect/compose exec calls below surface a raw
+	// `exec: "docker": executable file not found in $PATH`-style error.
+	if err := platform.EnsureDockerUsable(rt.EngineBin); err != nil {
+		return fmt.Errorf("cannot start %s: %s", serviceName, err)
+	}
+
 	// Check if container already exists and its state
 	inspectCmd := exec.Command(rt.EngineBin, "inspect", "--format", "{{.State.Status}}", containerName)
 	output, err := inspectCmd.Output()

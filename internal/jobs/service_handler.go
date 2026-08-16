@@ -354,11 +354,21 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// gets published (the container comes up with NetworkSettings.Ports == {}).
 		// Same treatment as llamacpp_inference.go's restart path. See citadel-cli#415.
 		composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
-		cmd := exec.Command("docker", composeArgs...)
-		cmd.Env = h.composeEnv()
-		out, cmdErr := cmd.CombinedOutput()
-		if cmdErr != nil {
-			err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+		// Preflight (citadel #767): when the engine CLI is missing or its
+		// daemon is unreachable, skip the exec and report a friendly,
+		// actionable diagnosis instead of letting the raw
+		// `exec: "docker": executable file not found in $PATH`-style error
+		// surface as the failure detail (this handler always drives "docker"
+		// directly, see the exec.Command("docker", ...) below).
+		if dockerErr := platform.EnsureDockerUsable("docker"); dockerErr != nil {
+			err = fmt.Errorf("docker compose up failed: %s", dockerErr)
+		} else {
+			cmd := exec.Command("docker", composeArgs...)
+			cmd.Env = h.composeEnv()
+			out, cmdErr := cmd.CombinedOutput()
+			if cmdErr != nil {
+				err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+			}
 		}
 	}
 
