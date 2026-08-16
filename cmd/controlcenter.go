@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
@@ -1424,7 +1425,19 @@ func ccStartService(name string) error {
 			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
 			// start button dies for llamacpp/vllm/extraction/diffusers on
 			// v2.57.0 (#426).
-			return composeCommand(composeArgs...).Run()
+			if err := composeCommand(composeArgs...).Run(); err != nil {
+				// A bare *exec.Error / os.PathError here (engine CLI missing, or
+				// its daemon unreachable) is what citadel-cli#767 asked to stop
+				// surfacing raw into the activity log (e.g. `Failed to start
+				// ollama: exec: "docker": executable file not found in $PATH`).
+				// Diagnose it; fall back to the original error for a real compose
+				// failure the engine itself is healthy for.
+				if diag := platform.DiagnoseEngine(catalog.SelectContainerRuntime().EngineBin); !diag.Healthy() {
+					return fmt.Errorf("%s", diag.Diagnose(fmt.Sprintf("%s cannot start", name)))
+				}
+				return err
+			}
+			return nil
 		}
 	}
 

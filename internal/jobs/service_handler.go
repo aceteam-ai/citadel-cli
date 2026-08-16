@@ -358,7 +358,19 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
-			err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+			// When the docker CLI itself is missing or its daemon is
+			// unreachable, CombinedOutput() never actually ran anything: out is
+			// empty, so the naive "docker compose up failed: %s" below silently
+			// drops cmdErr and reports nothing useful. Diagnose it instead --
+			// this is the raw `exec: "docker": executable file not found in
+			// $PATH` string citadel-cli#767 asked to stop surfacing. Fall back
+			// to the original (output-carrying) message for a real compose
+			// failure the engine itself is healthy for.
+			if diag := platform.DiagnoseEngine("docker"); !diag.Healthy() {
+				err = fmt.Errorf("%s", diag.Diagnose(fmt.Sprintf("%s cannot start", svc.Name)))
+			} else {
+				err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+			}
 		}
 	}
 

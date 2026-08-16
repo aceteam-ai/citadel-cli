@@ -166,9 +166,14 @@ func TestServiceStartModelFlow(t *testing.T) {
 		t.Fatalf("Execute SERVICE_START with model: %v", err)
 	}
 	// The up itself must have failed (docker unreachable) — proving the test
-	// never started anything — but the model is already durable.
-	if !strings.Contains(string(out), "docker compose up failed") {
-		t.Errorf("expected compose-up failure with neutered PATH, got: %s", out)
+	// never started anything — but the model is already durable. Since
+	// citadel-cli#767, a docker-CLI-missing failure is diagnosed rather than
+	// reported as the generic "docker compose up failed" (whose neutered-PATH
+	// form is a raw, unhelpful exec error), so assert on the diagnosis instead:
+	// it always names the service ("vllm cannot start") regardless of what
+	// evidence (if any) the host has for a running runtime.
+	if !strings.Contains(string(out), "vllm cannot start") {
+		t.Errorf("expected a docker-unavailable diagnosis with neutered PATH, got: %s", out)
 	}
 	if v, ok := compose.ReadEnvVar(envPath, "VLLM_MODEL"); !ok || v != "Qwen/Qwen2.5-0.5B-Instruct" {
 		t.Fatalf("model not persisted by SERVICE_START: %q, %v", v, ok)

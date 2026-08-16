@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -1027,6 +1028,22 @@ func printServiceInfo(w *tabwriter.Writer) {
 		return
 	}
 
+	// Lazily probed and cached across the loop below: DiagnoseEngine shells out
+	// (LookPath, "<bin> info", a Homebrew "brew --prefix" query), so re-running
+	// it once per configured service -- rather than once per printServiceInfo
+	// call -- would turn a broken-docker node's `citadel status` into N
+	// subprocess launches (citadel-cli#767 follow-up). Computed only if a
+	// service actually fails to report status; a fully healthy node never
+	// probes at all.
+	var engineDiagCache *platform.EngineDiagnosis
+	engineDiag := func() platform.EngineDiagnosis {
+		if engineDiagCache == nil {
+			d := platform.DiagnoseEngine(catalog.SelectContainerRuntime().EngineBin)
+			engineDiagCache = &d
+		}
+		return *engineDiagCache
+	}
+
 	for _, service := range manifest.Services {
 		fullComposePath := filepath.Join(configDir, service.ComposeFile)
 
@@ -1042,14 +1059,30 @@ func printServiceInfo(w *tabwriter.Writer) {
 		output, err := psCmd.CombinedOutput() // Use CombinedOutput to get stderr
 		if err != nil {
 			errMsg := string(output)
-			if strings.Contains(errMsg, "permission denied") && strings.Contains(errMsg, "docker.sock") {
+			switch {
+			case strings.Contains(errMsg, "permission denied") && strings.Contains(errMsg, "docker.sock"):
 				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprint("❌ PERMISSION DENIED"))
 				fmt.Fprintf(w, "    %s\n", "Could not connect to the Docker daemon.")
 				fmt.Fprintf(w, "    %s\n", "Hint: Add your user to the 'docker' group (`sudo usermod -aG docker $USER`)")
 				fmt.Fprintf(w, "    %s\n", "      then log out and log back in for the change to take effect.")
-			} else {
-				fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
-				fmt.Fprintf(w, "    %s\n", strings.TrimSpace(errMsg))
+			default:
+				// A blank errMsg (or a raw `exec: "docker": executable file not
+				// found in $PATH`) means the engine CLI itself is missing or its
+				// daemon is unreachable -- CombinedOutput() never actually ran
+				// anything (citadel-cli#767). Diagnose it as a first-class local-
+				// inference-unavailable warning instead of the generic "could not
+				// get status" line, which said nothing when errMsg was empty.
+				if diag := engineDiag(); !diag.Healthy() {
+					fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, badColor.Sprint("❌ LOCAL INFERENCE UNAVAILABLE"))
+					fmt.Fprintf(w, "    %s\n", warnColor.Sprint(diag.Diagnose(fmt.Sprintf("%s cannot start", service.Name))))
+					for _, line := range diag.Remediate(platform.OS()) {
+						fmt.Fprintf(w, "    Fix: %s\n", line)
+					}
+					fmt.Fprintf(w, "    %s\n", "Run 'citadel doctor' for details.")
+				} else {
+					fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, warnColor.Sprint("⚠️  Could not get status"))
+					fmt.Fprintf(w, "    %s\n", strings.TrimSpace(errMsg))
+				}
 			}
 			continue
 		}

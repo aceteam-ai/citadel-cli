@@ -221,6 +221,15 @@ func startService(serviceName, composeFilePath string) error {
 	composeCmd.Env = composeEnv()
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
+		// When the engine CLI itself is missing or its daemon is unreachable,
+		// CombinedOutput() never actually ran anything: output is empty and err
+		// is the raw exec.LookPath/os.PathError text (citadel-cli#767, e.g.
+		// `exec: "docker": executable file not found in $PATH`). Diagnose it
+		// instead of surfacing that -- or, when the compose file exists and ran
+		// but simply failed, keep the original message with its real output.
+		if diag := platform.DiagnoseEngine(rt.EngineBin); !diag.Healthy() {
+			return fmt.Errorf("%s", diag.Diagnose(fmt.Sprintf("%s cannot start", serviceName)))
+		}
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, string(output))
 	}
 	return nil
