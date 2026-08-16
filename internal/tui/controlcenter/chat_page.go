@@ -720,15 +720,15 @@ func formatChatStatusBar(state connState, endpoint, detail string) string {
 	}
 	switch state {
 	case connConnected:
-		return fmt.Sprintf(" [green]●[white] connected  [gray]%s[white]", tview.Escape(endpoint))
+		return fmt.Sprintf(" [green]%s[white] connected  [gray]%s[white]", Glyph(MarkerActive), tview.Escape(endpoint))
 	case connError:
-		msg := fmt.Sprintf(" [red]●[white] error  [gray]%s[white]", tview.Escape(endpoint))
+		msg := fmt.Sprintf(" [red]%s[white] error  [gray]%s[white]", Glyph(MarkerActive), tview.Escape(endpoint))
 		if detail != "" {
 			msg += fmt.Sprintf("  [red]%s[white]", tview.Escape(detail))
 		}
 		return msg
 	default:
-		return fmt.Sprintf(" [yellow]●[white] connecting…  [gray]%s[white]", tview.Escape(endpoint))
+		return fmt.Sprintf(" [yellow]%s[white] connecting…  [gray]%s[white]", Glyph(MarkerActive), tview.Escape(endpoint))
 	}
 }
 
@@ -801,9 +801,9 @@ func (p *ChatPage) updatePeersView() {
 			name = peer.NodeID
 		}
 		if peer.IsOnline(presenceTimeout) {
-			fmt.Fprintf(&sb, " [green]●[white] %s\n", tview.Escape(name))
+			fmt.Fprintf(&sb, " [green]%s[white] %s\n", Glyph(MarkerActive), tview.Escape(name))
 		} else {
-			fmt.Fprintf(&sb, " [gray]○[white] [gray]%s[white]\n", tview.Escape(name))
+			fmt.Fprintf(&sb, " [gray]%s[white] [gray]%s[white]\n", Glyph(MarkerInactive), tview.Escape(name))
 		}
 	}
 

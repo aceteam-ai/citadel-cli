@@ -333,18 +333,18 @@ func (p *WhatsAppPage) render() {
 	case !st.Deployed:
 		sb.WriteString("   Status:  [gray]not deployed[-]\n")
 	case st.Running && st.Reachable:
-		sb.WriteString("   Status:  [green::b]● running[-:-:-]\n")
+		sb.WriteString(fmt.Sprintf("   Status:  [green::b]%s running[-:-:-]\n", Glyph(MarkerActive)))
 	case st.Running:
-		sb.WriteString("   Status:  [yellow::b]◐ starting[-:-:-]\n")
+		sb.WriteString(fmt.Sprintf("   Status:  [yellow::b]%s starting[-:-:-]\n", Glyph(MarkerConnecting)))
 	default:
-		sb.WriteString("   Status:  [red::b]○ stopped[-:-:-]\n")
+		sb.WriteString(fmt.Sprintf("   Status:  [red::b]%s stopped[-:-:-]\n", Glyph(MarkerInactive)))
 	}
 
 	if st.Deployed && st.Reachable {
 		if st.LoggedIn {
 			sb.WriteString("   Phone:   [green::b]linked[-:-:-]\n")
 		} else {
-			sb.WriteString("   Phone:   [yellow]not linked -- scan the QR ➜[-]\n")
+			sb.WriteString(fmt.Sprintf("   Phone:   [yellow]not linked -- scan the QR %s[-]\n", Glyph(MarkerPointer)))
 		}
 	}
 

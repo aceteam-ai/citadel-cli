@@ -123,11 +123,11 @@ func (cc *ControlCenter) showServiceDetailModal() {
 		// Status with icon
 		switch svc.Status {
 		case "running":
-			sb.WriteString("[green]● Status: running[-]\n")
+			sb.WriteString(fmt.Sprintf("[green]%s Status: running[-]\n", Glyph(MarkerActive)))
 		case "stopped":
-			sb.WriteString("[gray]○ Status: stopped[-]\n")
+			sb.WriteString(fmt.Sprintf("[gray]%s Status: stopped[-]\n", Glyph(MarkerInactive)))
 		case "error":
-			sb.WriteString("[red]✗ Status: error[-]\n")
+			sb.WriteString(fmt.Sprintf("[red]%s Status: error[-]\n", Glyph(MarkerError)))
 		default:
 			sb.WriteString(fmt.Sprintf("[yellow]? Status: %s[-]\n", svc.Status))
 		}
@@ -1031,17 +1031,17 @@ func (cc *ControlCenter) ShowLoginPrompt() bool {
 	cc.inModal = true
 
 	modal := tview.NewModal().
-		SetText(`[yellow::b]Not Connected[-:-:-]
+		SetText(fmt.Sprintf(`[yellow::b]Not Connected[-:-:-]
 
 You're not connected to the AceTeam Network.
 
 Connect to enable:
-• Remote access to your services
-• Network-wide port forwarding
-• Peer-to-peer connectivity
-• Job queue processing
+%[1]s Remote access to your services
+%[1]s Network-wide port forwarding
+%[1]s Peer-to-peer connectivity
+%[1]s Job queue processing
 
-Log in now?`).
+Log in now?`, Glyph(MarkerBullet))).
 		AddButtons([]string{"Log In", "Continue Offline"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			cc.inModal = false
@@ -1107,17 +1107,17 @@ Your system Tailscale is already connected to the same network:
 
 [yellow]Differences:[-]
   [white]System Tailscale[-]
-    • System-wide VPN (all apps use it)
-    • Requires root/admin to install
-    • Managed via 'tailscale' CLI
+    %[3]s System-wide VPN (all apps use it)
+    %[3]s Requires root/admin to install
+    %[3]s Managed via 'tailscale' CLI
 
   [white]Citadel (embedded)[-]
-    • App-specific (only Citadel services)
-    • No root required (userspace networking)
-    • Managed via this TUI
-    • Separate identity on the mesh
+    %[3]s App-specific (only Citadel services)
+    %[3]s No root required (userspace networking)
+    %[3]s Managed via this TUI
+    %[3]s Separate identity on the mesh
 
-[gray]Both can run simultaneously and reach each other.[-]`, tsName, tsIP)
+[gray]Both can run simultaneously and reach each other.[-]`, tsName, tsIP, Glyph(MarkerBullet))
 
 	modal := tview.NewModal().
 		SetText(content).
@@ -1149,14 +1149,14 @@ func (cc *ControlCenter) showDisconnectConfirmModal() {
 	}
 
 	warningText := fmt.Sprintf(`[red::b]Disconnect from AceTeam Network?[-:-:-]
-%s
+%[1]s
 
 [yellow]Warning:[-]
-• Your services will no longer be accessible
-• Other nodes won't be able to connect to this machine
-• Active port forwards will be closed
+%[2]s Your services will no longer be accessible
+%[2]s Other nodes won't be able to connect to this machine
+%[2]s Active port forwards will be closed
 
-Are you sure you want to disconnect?`, nodeInfo)
+Are you sure you want to disconnect?`, nodeInfo, Glyph(MarkerBullet))
 
 	modal := tview.NewModal().
 		SetText(warningText).
@@ -1508,26 +1508,26 @@ func (cc *ControlCenter) showNodeDetailModal() {
 
 	if cc.data.DualConnection {
 		// Both connections active
-		sb.WriteString("[green]● Dual Connection Active[-]\n\n")
+		sb.WriteString(fmt.Sprintf("[green]%s Dual Connection Active[-]\n\n", Glyph(MarkerActive)))
 
 		sb.WriteString("[cyan]Citadel (embedded tsnet):[-]\n")
 		sb.WriteString(fmt.Sprintf("  IP: [white]%s[-]\n", cc.data.NodeIP))
-		sb.WriteString("  [gray]• App-specific networking (only Citadel)[-]\n")
-		sb.WriteString("  [gray]• No root required (userspace)[-]\n")
-		sb.WriteString("  [gray]• Services exposed via this IP[-]\n\n")
+		sb.WriteString(fmt.Sprintf("  [gray]%s App-specific networking (only Citadel)[-]\n", Glyph(MarkerBullet)))
+		sb.WriteString(fmt.Sprintf("  [gray]%s No root required (userspace)[-]\n", Glyph(MarkerBullet)))
+		sb.WriteString(fmt.Sprintf("  [gray]%s Services exposed via this IP[-]\n\n", Glyph(MarkerBullet)))
 
 		sb.WriteString("[blue]System Tailscale:[-]\n")
 		if cc.data.SystemTailscaleName != "" {
 			sb.WriteString(fmt.Sprintf("  Name: %s\n", cc.data.SystemTailscaleName))
 		}
 		sb.WriteString(fmt.Sprintf("  IP: [white]%s[-]\n", cc.data.SystemTailscaleIP))
-		sb.WriteString("  [gray]• System-wide VPN (all apps)[-]\n")
-		sb.WriteString("  [gray]• Managed via 'tailscale' CLI[-]\n\n")
+		sb.WriteString(fmt.Sprintf("  [gray]%s System-wide VPN (all apps)[-]\n", Glyph(MarkerBullet)))
+		sb.WriteString(fmt.Sprintf("  [gray]%s Managed via 'tailscale' CLI[-]\n\n", Glyph(MarkerBullet)))
 
 		sb.WriteString("[gray]Both can coexist and reach each other on the mesh.[-]\n")
 
 	} else if cc.data.Connected {
-		sb.WriteString("[green]● Connected via Citadel[-]\n")
+		sb.WriteString(fmt.Sprintf("[green]%s Connected via Citadel[-]\n", Glyph(MarkerActive)))
 		sb.WriteString(fmt.Sprintf("  IP: [white]%s[-]\n", cc.data.NodeIP))
 		sb.WriteString("  [gray]Embedded tsnet - app-specific, no root needed[-]\n")
 
@@ -1537,7 +1537,7 @@ func (cc *ControlCenter) showNodeDetailModal() {
 		}
 
 	} else if cc.data.SystemTailscaleRunning {
-		sb.WriteString("[blue]● Connected via System Tailscale[-]\n")
+		sb.WriteString(fmt.Sprintf("[blue]%s Connected via System Tailscale[-]\n", Glyph(MarkerActive)))
 		if cc.data.SystemTailscaleName != "" {
 			sb.WriteString(fmt.Sprintf("  Name: %s\n", cc.data.SystemTailscaleName))
 		}
@@ -1545,7 +1545,7 @@ func (cc *ControlCenter) showNodeDetailModal() {
 		sb.WriteString("\n[gray]Press 0 to also connect via Citadel[-]\n")
 
 	} else {
-		sb.WriteString("[gray]○ Not connected[-]\n")
+		sb.WriteString(fmt.Sprintf("[gray]%s Not connected[-]\n", Glyph(MarkerInactive)))
 		sb.WriteString("[gray]Press 0 to connect to network[-]\n")
 	}
 
@@ -1611,18 +1611,18 @@ func (cc *ControlCenter) showJobsDetailModal() {
 		// Worker status
 		sb.WriteString("[yellow]Worker Status[-]\n")
 		if cc.data.WorkerRunning {
-			sb.WriteString("  [green]● Active[-]\n")
+			sb.WriteString(fmt.Sprintf("  [green]%s Active[-]\n", Glyph(MarkerActive)))
 		} else {
-			sb.WriteString("  [gray]○ Stopped[-]\n")
+			sb.WriteString(fmt.Sprintf("  [gray]%s Stopped[-]\n", Glyph(MarkerInactive)))
 		}
 
 		// Queue subscriptions
 		sb.WriteString("\n[yellow]Queue Subscriptions[-]\n")
 		if len(cc.data.Queues) > 0 {
 			for _, q := range cc.data.Queues {
-				statusIcon := "[gray]○[-]"
+				statusIcon := "[gray]" + Glyph(MarkerInactive) + "[-]"
 				if q.Connected {
-					statusIcon = "[green]●[-]"
+					statusIcon = "[green]" + Glyph(MarkerActive) + "[-]"
 				}
 				sb.WriteString(fmt.Sprintf("  %s %s [gray](%s)[-]", statusIcon, q.Name, q.Type))
 				if q.PendingCount > 0 {
@@ -1631,9 +1631,9 @@ func (cc *ControlCenter) showJobsDetailModal() {
 				sb.WriteString("\n")
 			}
 		} else if cc.data.WorkerQueue != "" {
-			sb.WriteString(fmt.Sprintf("  [green]●[-] %s\n", cc.data.WorkerQueue))
+			sb.WriteString(fmt.Sprintf("  [green]%s[-] %s\n", Glyph(MarkerActive), cc.data.WorkerQueue))
 		} else if cc.data.WorkerRunning {
-			sb.WriteString("  [green]●[-] default queue\n")
+			sb.WriteString(fmt.Sprintf("  [green]%s[-] default queue\n", Glyph(MarkerActive)))
 		} else {
 			sb.WriteString("  [gray]not subscribed[-]\n")
 		}
@@ -1653,11 +1653,11 @@ func (cc *ControlCenter) showJobsDetailModal() {
 			sb.WriteString("\n[yellow]Recent Jobs (last 10)[-]\n")
 			sb.WriteString("  [gray]TYPE              STATUS    DURATION   TIME[-]\n")
 			for _, job := range recentJobs {
-				statusIcon := "[green]✓ success[-]"
+				statusIcon := "[green]" + Glyph(MarkerOK) + " success[-]"
 				if job.Status == "failed" {
-					statusIcon = "[red]✗ failed [-]"
+					statusIcon = "[red]" + Glyph(MarkerError) + " failed [-]"
 				} else if job.Status == "processing" {
-					statusIcon = "[cyan]● running[-]"
+					statusIcon = "[cyan]" + Glyph(MarkerActive) + " running[-]"
 				}
 
 				timeStr := job.StartedAt.Format("15:04:05")
@@ -1856,10 +1856,10 @@ func (cc *ControlCenter) showPeerDetailModal() {
 	// Populate peers
 	for i, p := range cc.data.Peers {
 		tableRow := i + 1
-		icon := "[gray]○[-]"
+		icon := "[gray]" + Glyph(MarkerInactive) + "[-]"
 		statusText := "[gray]offline[-]"
 		if p.Online {
-			icon = "[green]●[-]"
+			icon = "[green]" + Glyph(MarkerActive) + "[-]"
 			statusText = "[green]online[-]"
 		}
 
@@ -2067,11 +2067,11 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 	renderRows := func() {
 		table.Clear()
 		for i, svc := range services {
-			checkbox := "✗"
+			checkbox := Glyph(MarkerError)
 			stateColor := "[red]"
 			statusText := "disabled"
 			if *svc.enabled {
-				checkbox = "✓"
+				checkbox = Glyph(MarkerOK)
 				stateColor = "[green]"
 				statusText = "enabled"
 			}
