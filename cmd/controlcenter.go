@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
@@ -1401,6 +1402,16 @@ func ccStartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Preflight (citadel #767): this is the literal repro from the
+			// issue (TUI "Starting ollama..." -> "Failed to start ollama:
+			// exec: \"docker\": executable file not found in $PATH") --
+			// composeCommand below execs the resolved engine binary directly
+			// with no prior check. Fail fast with a friendly diagnosis
+			// instead of letting that raw exec error bubble up as the
+			// activity-log error.
+			if dockerErr := platform.EnsureDockerUsable(catalog.SelectContainerRuntime().EngineBin); dockerErr != nil {
+				return fmt.Errorf("cannot start %s: %s", name, dockerErr)
+			}
 			// Clear the durable stopped marker FIRST (mirrors liveModuleOps.Start):
 			// an explicit start restores start-on-boot even if the compose up below
 			// fails transiently. Best-effort: the service is in the manifest (we
@@ -1475,6 +1486,10 @@ func ccRestartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Preflight (citadel #767): same rationale as ccStartService above.
+			if dockerErr := platform.EnsureDockerUsable(catalog.SelectContainerRuntime().EngineBin); dockerErr != nil {
+				return fmt.Errorf("cannot restart %s: %s", name, dockerErr)
+			}
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
 			_ = setServiceDesiredStatus(configDir, name, "")

@@ -1,10 +1,21 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// dockerInfoTimeout bounds the daemon-reachability probe (`docker info`). A
+// wedged daemon (dead socket, hung Docker Desktop/colima) must not hang the
+// caller indefinitely -- this check is reachable from citadel doctor
+// (agentDoctor), and the whole point of that endpoint is to stay responsive
+// when something else on the node is stuck. A timeout here is correctly
+// classified as "daemon_unreachable" (the accurate verdict for a wedged
+// daemon), not a false negative.
+const dockerInfoTimeout = 5 * time.Second
 
 // DockerHealth is the outcome of a lightweight docker/podman CLI + daemon
 // preflight check (citadel #767). It exists so a missing/unusable engine
@@ -24,7 +35,7 @@ type DockerHealth struct {
 	Hint string
 }
 
-// Error renders the health check as a single-line message ("" when OK), so a
+// String renders the health check as a single-line message ("" when OK), so a
 // DockerHealth can be turned into an error with fmt.Errorf("%s", h) or by
 // calling EnsureDockerUsable.
 func (h DockerHealth) String() string {
@@ -68,7 +79,9 @@ func defaultDockerPreflightProbes() dockerPreflightProbes {
 			return err == nil
 		},
 		daemonInfo: func(bin string) (string, error) {
-			out, err := exec.Command(bin, "info").CombinedOutput()
+			ctx, cancel := context.WithTimeout(context.Background(), dockerInfoTimeout)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, bin, "info").CombinedOutput()
 			return string(out), err
 		},
 		colimaRunning: func() bool {
