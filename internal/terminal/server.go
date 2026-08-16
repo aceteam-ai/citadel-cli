@@ -588,6 +588,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if wantedSession {
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		} else if insideTmux() {
+			// citadel #751: this citadel process is itself already running
+			// inside a tmux client, so sessionCommand deliberately refused to
+			// nest a new tmux session under it (nesting breaks prefix keys and
+			// is confusing, not useful). Fall back to a bare shell rather than
+			// attempting the on-demand install, which could never fix this.
+			s.logger.Printf("already inside a tmux session (TMUX is set); session %s uses a bare (non-persistent) shell to avoid nesting tmux-in-tmux", sessionID)
 		} else {
 			// tmux backing is wanted (either the node default, citadel #585, or
 			// an explicit --tmux override) but no usable tmux binary resolved,

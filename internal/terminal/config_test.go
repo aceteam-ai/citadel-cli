@@ -78,6 +78,7 @@ func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 	// Empty simulates "unset": getEnvOrDefault treats "" as absent and falls
 	// back to DefaultSessionName, which is now "citadel".
 	t.Setenv("CITADEL_TERMINAL_SESSION", "")
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
 
 	config := DefaultConfig()

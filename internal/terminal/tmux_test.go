@@ -61,11 +61,34 @@ func TestSessionCommand_TmuxUnavailable(t *testing.T) {
 }
 
 func TestSessionCommand_BuildsAttachOrCreate(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
 	got := sessionCommand("agent", "/bin/bash")
 	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
+	}
+}
+
+// TestSessionCommand_InsideTmux pins citadel #751: even when tmux is fully
+// resolvable and the session name is valid, sessionCommand refuses to nest a
+// new tmux session under one this process is already running inside of.
+func TestSessionCommand_InsideTmux(t *testing.T) {
+	makeFakeTmux(t) // tmux IS available; the nesting guard must still win.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+	if got := sessionCommand("agent", "/bin/bash"); got != nil {
+		t.Errorf("expected nil command when already inside tmux, got %v", got)
+	}
+}
+
+func TestInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "")
+	if insideTmux() {
+		t.Error("insideTmux() = true with TMUX unset, want false")
+	}
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+	if !insideTmux() {
+		t.Error("insideTmux() = false with TMUX set, want true")
 	}
 }
 

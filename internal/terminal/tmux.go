@@ -5,12 +5,33 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/aceteam-ai/citadel-cli/internal/tmuxinstall"
 )
+
+// tmuxSessionEnvVar is the environment variable tmux sets on every process
+// running inside one of its clients (tmux(1), ENVIRONMENT). Its presence in
+// THIS process's environment means the citadel process itself was launched
+// from inside a tmux session — an operator's own manual `tmux` window, most
+// commonly, since a systemd-managed worker has no controlling terminal at
+// all. Wrapping a new PTY in `tmux new-session` on top of that would nest a
+// tmux client inside another tmux client on the same node: prefix keys
+// collide and status bars stack, which is confusing rather than useful
+// (citadel #751).
+const tmuxSessionEnvVar = "TMUX"
+
+// insideTmux reports whether this process is already running inside a tmux
+// client. It only sees the CITADEL PROCESS's own environment — it has no way
+// to tell whether the remote caller (web console tab, iOS app, `citadel ssh`)
+// is itself inside a tmux session on a different machine, since that
+// environment never reaches the node.
+func insideTmux() bool {
+	return os.Getenv(tmuxSessionEnvVar) != ""
+}
 
 // disableSentinels are case-insensitive values of CITADEL_TERMINAL_SESSION (or
 // Config.SessionName) that explicitly turn persistent tmux backing OFF, forcing
@@ -97,10 +118,19 @@ func sessionNameForUser(base, userID string) string {
 // A SessionName matching a disable sentinel ("none"/"off"/...) returns nil so
 // operators can opt out of persistence without unsetting the default.
 //
+// It also returns nil when this process is already inside a tmux client
+// (insideTmux, citadel #751): nesting a new tmux session under one that is
+// already running is never the right default, regardless of how the session
+// was requested (node default or an explicit --tmux override), so the guard
+// applies unconditionally here rather than only for one caller.
+//
 // The returned command starts only a shell inside tmux; launching claude (or
 // any agent) is a separate explicit step and never coupled here.
 func sessionCommand(sessionName, shell string) []string {
 	if sessionName == "" || sessionDisabled(sessionName) {
+		return nil
+	}
+	if insideTmux() {
 		return nil
 	}
 	if err := tmux.ValidateSessionName(sessionName); err != nil {
@@ -152,7 +182,12 @@ func resolveSessionCommand(configDefault, requestOverride, userID, shell string,
 
 	sessionName = sessionNameForUser(base, userID)
 	command = sessionCommand(sessionName, shell)
-	if command == nil && overridden && ensureInstall != nil {
+	// Skip the on-demand install when this process is already inside a tmux
+	// client (citadel #751): installing a tmux binary can never fix a nil
+	// command caused by insideTmux, since sessionCommand refuses to nest
+	// regardless of whether a binary resolves. Attempting it anyway would
+	// just be a wasted network round-trip on every such connection.
+	if command == nil && overridden && ensureInstall != nil && !insideTmux() {
 		if ensureInstall() {
 			command = sessionCommand(sessionName, shell)
 		}

@@ -50,6 +50,7 @@ func TestResolveSessionOverride(t *testing.T) {
 // still just falls back exactly as before.
 func TestResolveSessionCommand_NoOverridePreservesDefault(t *testing.T) {
 	t.Run("tmux available, node default names a session", func(t *testing.T) {
+		t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 		bin := makeFakeTmux(t)
 		installCalled := false
 		cmd, name, wanted := resolveSessionCommand("citadel", "", "alice", "/bin/bash", func() bool {
@@ -122,6 +123,7 @@ func TestResolveSessionCommand_OverrideBareForcesBare(t *testing.T) {
 // own default is "none" (an operator who disabled the persistent default
 // can still have their OWN connection opt back in via --tmux).
 func TestResolveSessionCommand_OverrideNamedRequestsTmux(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
 	cmd, name, wanted := resolveSessionCommand("none", "citadel", "alice", "/bin/bash", nil)
 	if !wanted {
@@ -140,6 +142,7 @@ func TestResolveSessionCommand_OverrideNamedRequestsTmux(t *testing.T) {
 // picked up immediately (the fake makes tmux resolve as a side effect,
 // simulating a real install landing a binary at the resolved path).
 func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
 
 	var installCalls int
@@ -170,6 +173,7 @@ func TestResolveSessionCommand_OverrideTriggersInstallOnMissingTmux(t *testing.T
 // platform is gated/unsupported), the connection still succeeds as a bare
 // shell rather than erroring out.
 func TestResolveSessionCommand_OverrideInstallFailsFallsBackToBare(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
 
 	var installCalls int
@@ -187,6 +191,32 @@ func TestResolveSessionCommand_OverrideInstallFailsFallsBackToBare(t *testing.T)
 	}
 	if cmd != nil {
 		t.Errorf("command = %v, want nil (bare fallback after a failed install)", cmd)
+	}
+}
+
+// TestResolveSessionCommand_InsideTmuxSkipsNesting pins citadel #751 end to
+// end: when this process is already inside a tmux client, resolveSessionCommand
+// returns a nil command (bare-shell fallback) even though tmux fully
+// resolves and a session was explicitly requested via --tmux, AND it must
+// not waste an on-demand install attempt trying to "fix" something an
+// install can never fix.
+func TestResolveSessionCommand_InsideTmuxSkipsNesting(t *testing.T) {
+	makeFakeTmux(t) // tmux IS available; the nesting guard must still win.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+
+	installCalled := false
+	cmd, _, wanted := resolveSessionCommand("none", "citadel", "alice", "/bin/bash", func() bool {
+		installCalled = true
+		return true
+	})
+	if !wanted {
+		t.Fatal("wantedSession = false, want true (override names a session)")
+	}
+	if cmd != nil {
+		t.Errorf("command = %v, want nil (bare fallback, already inside tmux)", cmd)
+	}
+	if installCalled {
+		t.Error("on-demand install must not run when the reason is nesting, not a missing binary")
 	}
 }
 
