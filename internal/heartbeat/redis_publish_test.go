@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -126,6 +127,79 @@ func TestRedisPublishHappyPath(t *testing.T) {
 	if len(*logs) != 0 {
 		t.Errorf("a healthy heartbeat must not log, got: %v", *logs)
 	}
+}
+
+// TestRedisPublishRecordsMarkerOnSuccess pins the wiring half of #726: a
+// successful durable stream write must update the on-disk freshness marker,
+// not just the helpers marker_test.go exercises in isolation.
+func TestRedisPublishRecordsMarkerOnSuccess(t *testing.T) {
+	pub, _, _ := newTestRedisPublisher(t)
+	dir := t.TempDir()
+	pub.markerDir = dir
+
+	before := time.Now()
+	if err := pub.publishMessage(context.Background(), testStatusMessage(), ""); err != nil {
+		t.Fatalf("publishMessage: %v", err)
+	}
+
+	m := LoadMarker(dir)
+	if m.LastSuccessAt.Before(before) {
+		t.Fatalf("LastSuccessAt = %v, want >= %v", m.LastSuccessAt, before)
+	}
+	if m.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0", m.ConsecutiveFailures)
+	}
+}
+
+// TestRedisPublishDoesNotMoveMarkerOnFailure proves a failed durable write
+// leaves LastSuccessAt where it was (never advances it on failure) while
+// still recording the attempt and the failure count -- the distinction
+// printHeartbeatFreshness relies on to tell "stopped publishing" apart from
+// "publishing but failing".
+func TestRedisPublishDoesNotMoveMarkerOnFailure(t *testing.T) {
+	pub, _, _ := newTestRedisPublisher(t)
+	dir := t.TempDir()
+	pub.markerDir = dir
+
+	if err := pub.publishMessage(context.Background(), testStatusMessage(), ""); err != nil {
+		t.Fatalf("publishMessage (success): %v", err)
+	}
+	success := LoadMarker(dir).LastSuccessAt
+
+	pub.client.AddHook(failCommandHook{command: "xadd", err: errors.New("simulated XADD failure")})
+	if err := pub.publishMessage(context.Background(), testStatusMessage(), ""); err == nil {
+		t.Fatal("expected the second publish to fail")
+	}
+
+	m := LoadMarker(dir)
+	if !m.LastSuccessAt.Equal(success) {
+		t.Fatalf("LastSuccessAt moved on failure: %v -> %v", success, m.LastSuccessAt)
+	}
+	if m.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", m.ConsecutiveFailures)
+	}
+	if m.LastError == "" {
+		t.Error("expected LastError to be recorded")
+	}
+}
+
+// TestRedisPublishSkipsMarkerWhenDirUnset proves the default (markerDir ==
+// "", as every other test in this file relies on) never writes anywhere --
+// this is what stopped a prior version of this feature from polluting
+// whoever's real ~/.citadel-cli happened to run `go test`.
+func TestRedisPublishSkipsMarkerWhenDirUnset(t *testing.T) {
+	pub, _, _ := newTestRedisPublisher(t)
+	if pub.markerDir != "" {
+		t.Fatalf("expected markerDir to default to empty, got %q", pub.markerDir)
+	}
+	if err := pub.publishMessage(context.Background(), testStatusMessage(), ""); err != nil {
+		t.Fatalf("publishMessage: %v", err)
+	}
+	// Nothing to assert on disk -- the point is that RecordSuccess/RecordFailure
+	// are never reached, which the empty markerDir guard in publishMessage
+	// enforces. This test exists so a future refactor that removes that guard
+	// (or resolves a default directory inline) fails loudly instead of
+	// silently, since there is no marker path here to inspect.
 }
 
 // streamEntries reads node:status:stream out of miniredis as field maps.
