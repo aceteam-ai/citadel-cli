@@ -51,12 +51,27 @@ func TestSensitiveCapabilityPasscodeWarning_EnabledNoPasscode(t *testing.T) {
 // TestSensitiveCapabilityPasscodeWarning_ListsAllEnabled confirms multiple
 // enabled surfaces are all named, not just the first.
 func TestSensitiveCapabilityPasscodeWarning_ListsAllEnabled(t *testing.T) {
-	perms := &config.Permissions{Console: true, Desktop: true, Files: true}
+	perms := &config.Permissions{Console: true, Desktop: true, Files: true, Shell: true}
 	got := sensitiveCapabilityPasscodeWarning(perms)
-	for _, want := range []string{"Console", "Desktop", "Files"} {
+	for _, want := range []string{"Console", "Desktop", "Files", "Shell"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("warning %q should mention %q", got, want)
 		}
+	}
+}
+
+// TestSensitiveCapabilityPasscodeWarning_ShellEnabledNoPasscode is the
+// citadel#763 case: shell_command.go gates an enabled Shell handler on
+// VerifyPasscode the same way Console/Desktop/Files are gated, so enabling
+// only Shell (with no other sensitive surface) must still produce a warning.
+func TestSensitiveCapabilityPasscodeWarning_ShellEnabledNoPasscode(t *testing.T) {
+	perms := &config.Permissions{Shell: true}
+	got := sensitiveCapabilityPasscodeWarning(perms)
+	if got == "" {
+		t.Fatal("expected a warning when Shell is enabled with no passcode set")
+	}
+	if !strings.Contains(got, "Shell") {
+		t.Errorf("warning should name the enabled surface, got %q", got)
 	}
 }
 

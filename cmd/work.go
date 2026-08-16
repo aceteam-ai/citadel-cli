@@ -2401,14 +2401,18 @@ func resolveEnergySampling() bool {
 }
 
 // sensitiveCapabilityPasscodeWarning returns a single warning line when a
-// passcode-gated remote-access surface (console/desktop/files, aceteam#6524)
-// is enabled but no node passcode is configured, or "" when there is nothing
-// to warn about. Every one of these surfaces already fails closed without a
-// passcode (config.Permissions.VerifyPasscode), so this is not itself a
-// functional bug -- but a surface that is enabled, unreachable, and reports
-// no local signal is exactly the "broken while reporting green" failure mode
-// citadel#753 exists to close. Kept pure (permissions in, string out) so it
-// is testable without starting a worker.
+// passcode-gated remote-access surface (console/desktop/files/shell,
+// aceteam#6524) is enabled but no node passcode is configured, or "" when
+// there is nothing to warn about. Every one of these surfaces already fails
+// closed without a passcode (config.Permissions.VerifyPasscode), so this is
+// not itself a functional bug -- but a surface that is enabled, unreachable,
+// and reports no local signal is exactly the "broken while reporting green"
+// failure mode citadel#753 exists to close. Kept pure (permissions in, string
+// out) so it is testable without starting a worker.
+//
+// Shell is included (citadel#763): internal/jobs/shell_command.go gates an
+// enabled Shell handler on VerifyPasscode exactly like Console/Desktop/Files,
+// so this warning must name it too.
 func sensitiveCapabilityPasscodeWarning(perms *config.Permissions) string {
 	if perms == nil || perms.HasPasscode() {
 		return ""
@@ -2422,6 +2426,9 @@ func sensitiveCapabilityPasscodeWarning(perms *config.Permissions) string {
 	}
 	if perms.Files {
 		enabled = append(enabled, "Files")
+	}
+	if perms.Shell {
+		enabled = append(enabled, "Shell")
 	}
 	if len(enabled) == 0 {
 		return ""

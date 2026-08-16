@@ -1,7 +1,7 @@
 // Package controlcenter: node-passcode set/rotate/clear controls (citadel#760).
 //
 // Before this file, the Control Center could only WARN when a sensitive
-// remote-access surface (Console/Desktop/Files) was enabled with no node
+// remote-access surface (Console/Desktop/Files/Shell) was enabled with no node
 // passcode set (see the "enabled but no node passcode is set" line in
 // actions.go's showBuiltinServicesModal) and pointed the operator elsewhere
 // (the web console, APPLY_DEVICE_CONFIG, or 'citadel passcode set' at a
@@ -64,8 +64,9 @@ func (cc *ControlCenter) setNodePasscode(pin string) (*config.Permissions, error
 
 // clearNodePasscode removes the node passcode via the PermissionsCallbacks
 // Load/Save pair. Clearing re-locks every enabled sensitive surface
-// (Console/Desktop/Files): config.Permissions.VerifyPasscode fails CLOSED with
-// no hash stored, so an enabled-but-ungated surface is never a possible state.
+// (Console/Desktop/Files/Shell): config.Permissions.VerifyPasscode fails
+// CLOSED with no hash stored, so an enabled-but-ungated surface is never a
+// possible state.
 func (cc *ControlCenter) clearNodePasscode() (*config.Permissions, error) {
 	if cc.permissions.Load == nil || cc.permissions.Save == nil {
 		return nil, fmt.Errorf("permissions not configured")
@@ -101,8 +102,8 @@ func (cc *ControlCenter) showPasscodeModal() {
 		buttons = append(buttons, "Rotate", "Clear")
 	} else {
 		statusLine = "[red::b]Not set[-:-:-]"
-		body = "No node passcode is set. Console, Desktop, and Files fail CLOSED\n" +
-			"(access denied) even when enabled, until you set one here."
+		body = "No node passcode is set. Console, Desktop, Files, and Shell fail\n" +
+			"CLOSED (access denied) even when enabled, until you set one here."
 		buttons = append(buttons, "Set")
 	}
 
@@ -216,8 +217,8 @@ func (cc *ControlCenter) showPasscodeInputModal(rotate bool) {
 			verb = "updated"
 		}
 		cc.AddActivity("success", fmt.Sprintf("Node passcode %s.", verb))
-		if !(perms.Console || perms.Desktop || perms.Files) {
-			cc.AddActivity("info", "Console, Desktop, and Files are all currently disabled, so this passcode has nothing to gate yet.")
+		if !(perms.Console || perms.Desktop || perms.Files || perms.Shell) {
+			cc.AddActivity("info", "Console, Desktop, Files, and Shell are all currently disabled, so this passcode has nothing to gate yet.")
 		}
 	}
 
@@ -259,14 +260,14 @@ func (cc *ControlCenter) showPasscodeInputModal(rotate bool) {
 }
 
 // showPasscodeClearConfirmModal confirms before clearing the node passcode,
-// which re-locks every enabled sensitive surface (Console/Desktop/Files).
+// which re-locks every enabled sensitive surface (Console/Desktop/Files/Shell).
 func (cc *ControlCenter) showPasscodeClearConfirmModal() {
 	cc.inModal = true
 
 	modal := tview.NewModal().
 		SetText("[red::b]Clear node passcode?[-:-:-]\n\n" +
-			"Console, Desktop, and Files (if enabled) will fail closed\n" +
-			"immediately (no worker restart needed) until a new\n" +
+			"Console, Desktop, Files, and Shell (if enabled) will fail\n" +
+			"closed immediately (no worker restart needed) until a new\n" +
 			"passcode is set.\n\nAre you sure?").
 		AddButtons([]string{"Cancel", "Clear"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
@@ -284,23 +285,20 @@ func (cc *ControlCenter) showPasscodeClearConfirmModal() {
 }
 
 // passcodeClearNeedsWarning reports whether clearing the passcode leaves any
-// sensitive remote-access surface (Console/Desktop/Files) enabled but now
-// unreachable, so the "enabled but no node passcode is set" warning
+// sensitive remote-access surface (Console/Desktop/Files/Shell) enabled but
+// now unreachable, so the "enabled but no node passcode is set" warning
 // (actions.go's showBuiltinServicesModal toggle handler) applies again. Pure
 // so the "refresh the warning state" behavior is unit-testable without a
 // running TUI.
 //
-// Deliberately matches the existing toggle-warning's surface set (Console,
-// Desktop, Files) and 'citadel passcode clear's own message
-// (cmd/passcode.go's runPasscodeClear), not config.Permissions.Shell, even
-// though Shell is also passcode-gated in enforcement
-// (internal/jobs/shell_command.go calls VerifyPasscode). Extending the
-// warning to Shell is a real gap, but it is a pre-existing one shared by both
-// of those call sites, out of scope for citadel#760's ask (give the TUI a way
-// to set/rotate/clear), and tracked separately (citadel#763) rather than
-// fixed as a side effect here.
+// Matches config.IsSensitiveCategory's set, 'citadel passcode clear's own
+// message (cmd/passcode.go's runPasscodeClear), and the toggle-warning in
+// actions.go. Shell is included (citadel#763):
+// internal/jobs/shell_command.go gates an enabled Shell handler on
+// VerifyPasscode exactly like Console/Desktop/Files, so the warned set must
+// match the actually-gated set.
 func passcodeClearNeedsWarning(perms *config.Permissions) bool {
-	return perms.Console || perms.Desktop || perms.Files
+	return perms.Console || perms.Desktop || perms.Files || perms.Shell
 }
 
 // builtinServicesActionDesc renders the Actions-panel description for the
@@ -308,6 +306,12 @@ func passcodeClearNeedsWarning(perms *config.Permissions) bool {
 // sensitive surface is enabled but no passcode is set, so an operator who
 // never opens the modal still sees the gap on the always-visible action
 // panel, not only inside showBuiltinServicesModal's detail pane.
+//
+// The "N/5" tally deliberately covers only the original five toggles
+// (Console/Desktop/Files/Services/SSH); Shell is intentionally NOT counted
+// here to keep this summary stable, but it DOES participate in the
+// no-passcode warning via passcodeClearNeedsWarning (citadel#763), since that
+// warning must match the actually-gated set regardless of this tally.
 func builtinServicesActionDesc(perms *config.Permissions) string {
 	enabled := 0
 	for _, e := range []bool{perms.Console, perms.Desktop, perms.Files, perms.Services, perms.SSH} {
@@ -334,7 +338,7 @@ func (cc *ControlCenter) doClearNodePasscode() {
 	}
 	cc.AddActivity("success", "Node passcode cleared.")
 	if passcodeClearNeedsWarning(perms) {
-		cc.AddActivity("warning", "Console, Desktop, and/or Files are enabled; they now fail closed (access denied) until a new passcode is set.")
+		cc.AddActivity("warning", "Console, Desktop, Files, and/or Shell are enabled; they now fail closed (access denied) until a new passcode is set.")
 	}
 	cc.updatePaneFocus()
 }
