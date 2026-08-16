@@ -31,6 +31,24 @@ type ActivityEntry struct {
 	Message string
 }
 
+// maxActivityEntries bounds cc.activities, which is stored chronologically
+// (oldest first, newest last — see appendActivityEntry). Kept as a named
+// constant since both New() (initial capacity) and appendActivityEntry (trim
+// threshold) need to agree on it.
+const maxActivityEntries = 100
+
+// appendActivityEntry appends entry to the chronological activity log (oldest
+// first, newest last) and trims from the FRONT once it exceeds max, so the
+// most recent entries are always retained. Extracted as a pure function so
+// the ordering/trim behavior is unit-testable without a running app.
+func appendActivityEntry(entries []ActivityEntry, entry ActivityEntry, max int) []ActivityEntry {
+	entries = append(entries, entry)
+	if len(entries) > max {
+		entries = entries[len(entries)-max:]
+	}
+	return entries
+}
+
 // JobStats holds job queue statistics
 type JobStats struct {
 	Pending    int64
@@ -712,7 +730,7 @@ func proxmoxTabVisible(cfg ProxmoxConfig) bool {
 func New(cfg Config) *ControlCenter {
 	return &ControlCenter{
 		stopChan:            make(chan struct{}),
-		activities:          make([]ActivityEntry, 0, 100),
+		activities:          make([]ActivityEntry, 0, maxActivityEntries),
 		activeForwards:      make([]PortForward, 0),
 		serviceOverrides:    make(map[string]*serviceStateOverride),
 		data:                StatusData{Version: cfg.Version},
@@ -754,13 +772,11 @@ func (cc *ControlCenter) AddActivity(level, message string) {
 		Message: message,
 	}
 
-	// Prepend (newest first)
-	cc.activities = append([]ActivityEntry{entry}, cc.activities...)
-
-	// Keep only last 100
-	if len(cc.activities) > 100 {
-		cc.activities = cc.activities[:100]
-	}
+	// Append chronologically (oldest first, newest last) so the Activity pane
+	// reads top-to-bottom like a terminal / `tail -f`. updateActivityView,
+	// getActivityText, and showActivityFullScreen all render cc.activities in
+	// this same order.
+	cc.activities = appendActivityEntry(cc.activities, entry, maxActivityEntries)
 	cc.activityMu.Unlock()
 
 	// Stream the activity entry to the control plane for remote debugging.
@@ -1095,6 +1111,14 @@ func (cc *ControlCenter) buildUI() {
 		SetDynamicColors(true).
 		SetScrollable(true)
 	cc.activityView.SetBorder(true).SetTitle(" Activity ")
+	// Pin to the bottom by default so the newest entry is always visible as
+	// activity streams in (tail -f behavior). tview's trackEnd flag (set here,
+	// cleared by scrolling) is re-evaluated on every redraw and survives the
+	// SetText() calls updateActivityView does on each new entry — it is NOT
+	// reset by SetText — so scrolling up (arrow keys via cc.handleArrowUp, or
+	// the mouse wheel) leaves the operator's position alone across new
+	// entries; 'G' / End (below) jump back to the bottom.
+	cc.activityView.ScrollToEnd()
 
 	// Bottom row: Peers + Activity (2 columns)
 	bottomRow := tview.NewFlex().
@@ -1196,6 +1220,16 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyDown:
 		cc.handleArrowDown()
 		return nil
+	case tcell.KeyEnd:
+		// Re-pin the Activity pane to the bottom. Needed because
+		// handleArrowDown/handleArrowUp scroll via ScrollTo, which always
+		// disables tview's auto-bottom tracking — with no other binding, one
+		// stray Down press would otherwise leave the pane permanently off the
+		// latest entry.
+		if cc.focusedPane == paneActivity {
+			cc.activityView.ScrollToEnd()
+		}
+		return nil
 	case tcell.KeyRune:
 		switch event.Rune() {
 		case 'q', 'Q':
@@ -1229,6 +1263,13 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		case 'k':
 			// Vim-style up
 			cc.handleArrowUp()
+			return nil
+		case 'G':
+			// Vim-style "go to bottom" — re-pins the Activity pane to the
+			// latest entry (see the KeyEnd case above for why this exists).
+			if cc.focusedPane == paneActivity {
+				cc.activityView.ScrollToEnd()
+			}
 			return nil
 		// Action menu shortcuts (0-3)
 		case '1':
@@ -2343,6 +2384,9 @@ func (cc *ControlCenter) updatePeersView() {
 	}
 }
 
+// updateActivityView renders cc.activities in slice order — oldest first,
+// newest last (see appendActivityEntry) — so the pane reads top-to-bottom
+// like a terminal, with the newest line at the bottom.
 func (cc *ControlCenter) updateActivityView() {
 	cc.activityMu.Lock()
 	defer cc.activityMu.Unlock()
@@ -2425,7 +2469,7 @@ func (cc *ControlCenter) updateHelpBar() {
 			set("[yellow::b]Tab[-:-:-] pane/tab  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActivity:
-		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
+		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]End[-:-:-] latest  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
 	}
 
 	// When mouse is on, advertise it so the click affordances are discoverable
@@ -2931,6 +2975,11 @@ func (cc *ControlCenter) showActivityFullScreen() {
 
 	sb.WriteString("\n[gray]Press Esc to close, 'l' to save a snapshot[-]")
 	textView.SetText(sb.String())
+	// cc.activities is oldest-first/newest-last (see appendActivityEntry), so
+	// without this the modal would open showing the OLDEST entries with the
+	// latest activity scrolled off the bottom — open pinned to the newest
+	// instead, matching the main Activity pane.
+	textView.ScrollToEnd()
 	textView.SetBorder(true).SetTitle(" Activity Log (Full Screen) ")
 
 	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
