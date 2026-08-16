@@ -4,7 +4,22 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestDockerInfoTimeoutBounded pins dockerInfoTimeout to a sane, non-zero
+// window. The real probe path (which this constant guards) is not exercised
+// by the stubbed tests below, so nothing else would notice it being deleted
+// or zeroed -- a wedged daemon must still be bounded, and a bound that's too
+// tight would misclassify a merely-slow daemon as unreachable.
+func TestDockerInfoTimeoutBounded(t *testing.T) {
+	if dockerInfoTimeout <= 0 {
+		t.Fatalf("dockerInfoTimeout must be > 0 (unbounded probe can hang citadel doctor), got %v", dockerInfoTimeout)
+	}
+	if dockerInfoTimeout > 10*time.Second {
+		t.Fatalf("dockerInfoTimeout = %v is too generous for a doctor/preflight check", dockerInfoTimeout)
+	}
+}
 
 func TestCheckDockerUsable_OK(t *testing.T) {
 	p := dockerPreflightProbes{

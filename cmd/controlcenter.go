@@ -1408,7 +1408,10 @@ func ccStartService(name string) error {
 			// composeCommand below execs the resolved engine binary directly
 			// with no prior check. Fail fast with a friendly diagnosis
 			// instead of letting that raw exec error bubble up as the
-			// activity-log error.
+			// activity-log error. ccStopService deliberately carries no
+			// equivalent check: a stop that can't reach docker is already a
+			// no-op (nothing to stop), not the silent "start reported nothing
+			// wrong" failure mode this issue is about.
 			if dockerErr := platform.EnsureDockerUsable(catalog.SelectContainerRuntime().EngineBin); dockerErr != nil {
 				return fmt.Errorf("cannot start %s: %s", name, dockerErr)
 			}
