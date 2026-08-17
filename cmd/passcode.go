@@ -1,7 +1,7 @@
 // cmd/passcode.go
 //
 // citadel#753: before this command existed, the only ways to set the per-node
-// passcode that gates Console/Desktop/Files (aceteam#6524) were an
+// passcode that gates Console/Desktop/Files/Shell (aceteam#6524) were an
 // APPLY_DEVICE_CONFIG push from the platform or the Control Center TUI. A node
 // that enabled one of those surfaces any other way (e.g. by hand-editing
 // permissions.yaml, or on a headless box with no Control Center session) had
@@ -24,11 +24,12 @@ import (
 
 var passcodeCmd = &cobra.Command{
 	Use:   "passcode",
-	Short: "Manage the node passcode that gates Console/Desktop/Files access",
+	Short: "Manage the node passcode that gates Console/Desktop/Files/Shell access",
 	Long: `The node passcode (aceteam#6524) gates the sensitive remote-access surfaces
-(Console/terminal, Desktop/VNC/screen, and Files) once an operator has
-enabled them. Enabling a surface is not enough by itself: without a passcode
-set, that surface fails closed (access denied) even though it is enabled.
+(Console/terminal, Desktop/VNC/screen, Files, and Shell/SHELL_COMMAND) once an
+operator has enabled them. Enabling a surface is not enough by itself: without
+a passcode set, that surface fails closed (access denied) even though it is
+enabled.
 
 Use 'citadel passcode set' to set or change it, and 'citadel passcode clear'
 to remove it (which re-locks every enabled sensitive surface).`,
@@ -37,8 +38,8 @@ to remove it (which re-locks every enabled sensitive surface).`,
 var passcodeSetCmd = &cobra.Command{
 	Use:   "set",
 	Short: "Set or change the node passcode",
-	Long: `Sets the per-node passcode that gates Console/Desktop/Files remote access
-(aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
+	Long: `Sets the per-node passcode that gates Console/Desktop/Files/Shell remote
+access (aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
 in addition to a valid token or verified mesh-peer identity, before an
 enabled sensitive surface will actually respond.
 
@@ -64,8 +65,8 @@ var passcodeClearCmd = &cobra.Command{
 	Use:   "clear",
 	Short: "Clear the node passcode",
 	Long: `Clears the per-node passcode. This FAILS CLOSED: with no passcode set, every
-sensitive remote-access surface (Console/Desktop/Files) stays denied even if
-it is enabled, until 'citadel passcode set' is run again.
+sensitive remote-access surface (Console/Desktop/Files/Shell) stays denied even
+if it is enabled, until 'citadel passcode set' is run again.
 
 Takes effect immediately, without restarting the worker.`,
 	Args: cobra.NoArgs,
@@ -91,8 +92,8 @@ func runPasscodeSet(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Node passcode set.")
 	fmt.Println("Takes effect immediately, no worker restart needed (the gate reloads permissions.yaml per connection).")
-	if !(perms.Console || perms.Desktop || perms.Files) {
-		fmt.Println("Note: Console, Desktop, and Files are all currently disabled, so this passcode has nothing to gate yet.")
+	if !(perms.Console || perms.Desktop || perms.Files || perms.Shell) {
+		fmt.Println("Note: Console, Desktop, Files, and Shell are all currently disabled, so this passcode has nothing to gate yet.")
 	}
 	return nil
 }
@@ -104,8 +105,11 @@ func runPasscodeClear(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("Node passcode cleared.")
-	if perms.Console || perms.Desktop || perms.Files {
-		fmt.Println("Console, Desktop, and/or Files are enabled; they now fail closed (access denied) until a new passcode is set.")
+	// Shell is included here (citadel#763): internal/jobs/shell_command.go gates
+	// an enabled Shell handler on VerifyPasscode the same way Console/Desktop/
+	// Files are gated, so this warning must name it too.
+	if perms.Console || perms.Desktop || perms.Files || perms.Shell {
+		fmt.Println("Console, Desktop, Files, and/or Shell are enabled; they now fail closed (access denied) until a new passcode is set.")
 	}
 	fmt.Println("Takes effect immediately, no worker restart needed.")
 	return nil

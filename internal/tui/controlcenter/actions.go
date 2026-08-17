@@ -2092,7 +2092,7 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 		if cc.permissions.Load != nil && cc.permissions.Load().HasPasscode() {
 			status = "[green]SET[-]"
 		}
-		return fmt.Sprintf("[yellow::b]Node Passcode:[-:-:-] %s   [gray](gates Console/Desktop/Files, press[-] [yellow::b]P[-:-:-] [gray]to manage)[-]", status)
+		return fmt.Sprintf("[yellow::b]Node Passcode:[-:-:-] %s   [gray](gates Console/Desktop/Files/Shell, press[-] [yellow::b]P[-:-:-] [gray]to manage)[-]", status)
 	}
 
 	updateDetail := func(row int) {
@@ -2134,12 +2134,15 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on restart)", services[row].name, state))
 
 			// Passcode reminder (aceteam#6524): a sensitive surface
-			// (Console/Desktop/Files) that is enabled without a node passcode
-			// fails CLOSED — enabling it does not open it. Warn so the operator
-			// knows to set a passcode (via the web console / APPLY_DEVICE_CONFIG)
-			// before the surface is actually reachable.
+			// (Console/Desktop/Files/Shell) that is enabled without a node
+			// passcode fails CLOSED — enabling it does not open it. Warn so the
+			// operator knows to set a passcode (via the web console /
+			// APPLY_DEVICE_CONFIG) before the surface is actually reachable.
+			// Shell is included here (citadel#763): internal/jobs/shell_command.go
+			// gates it on VerifyPasscode the same way Console/Desktop/Files are
+			// gated, so the warned set must match the actually-gated set.
 			name := services[row].name
-			if *services[row].enabled && (name == "Console" || name == "Desktop" || name == "Files") && !perms.HasPasscode() {
+			if *services[row].enabled && (name == "Console" || name == "Desktop" || name == "Files" || name == "Shell") && !perms.HasPasscode() {
 				cc.AddActivity("warning", fmt.Sprintf("%s enabled but no node passcode is set — access stays denied until you set a passcode", name))
 			}
 		}
