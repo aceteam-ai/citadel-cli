@@ -85,6 +85,12 @@ func runUpCheck() error {
 	}
 	goodColor.Println("  Administrator:   yes")
 
+	if !res.DriverOK {
+		badColor.Printf("  Network driver:  FAILED — %s\n", res.Detail)
+		return fmt.Errorf("this machine cannot prepare the network driver machine-wide mode needs")
+	}
+	goodColor.Println("  Network driver:  yes")
+
 	if !res.DeviceOK {
 		badColor.Printf("  Network device:  FAILED — %s\n", res.Detail)
 		return fmt.Errorf("this machine cannot create the network interface machine-wide mode needs")

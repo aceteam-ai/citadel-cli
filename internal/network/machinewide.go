@@ -63,6 +63,14 @@ func ConnectMachineWide(ctx context.Context, config ServerConfig, elevated bool)
 		return nil, err
 	}
 
+	// No-op on non-Windows. On Windows, extracts + hash-verifies + pre-loads
+	// the embedded wintun driver from the executable's own directory, and
+	// refuses (rather than falling back to userspace) if that directory is
+	// writable by a non-administrator -- see EnsureWintunDriver.
+	if err := ensureWintunDriverIfNeeded(); err != nil {
+		return nil, err
+	}
+
 	s := &NetworkServer{
 		controlURL: config.ControlURL,
 		hostname:   config.Hostname,
@@ -115,7 +123,17 @@ func MachineWideRunning() bool {
 
 // PreflightResult describes whether this machine can run machine-wide mode.
 type PreflightResult struct {
-	Elevated  bool   `json:"elevated"`
+	Elevated bool `json:"elevated"`
+
+	// DriverOK reports whether the platform's network driver is ready to
+	// load. On Windows (issue #709) this covers extracting, hash-verifying,
+	// and pre-loading the embedded wintun driver -- including the
+	// install-directory ACL check, so a wrong install location (e.g.
+	// %LOCALAPPDATA%\Citadel instead of %ProgramFiles%\Citadel) is reported
+	// distinctly from a missing-privileges failure via Detail. Trivially
+	// true on Linux/macOS, which have no external driver file.
+	DriverOK bool `json:"driver_ok"`
+
 	DeviceOK  bool   `json:"device_ok"`
 	Device    string `json:"device,omitempty"`
 	Detail    string `json:"detail,omitempty"`
@@ -143,6 +161,18 @@ func PreflightMachineWide(elevated bool) PreflightResult {
 		res.Detail = ElevationHint()
 		return res
 	}
+
+	// Windows-only in practice (no-op elsewhere): extracts, hash-verifies,
+	// and pre-loads the embedded wintun driver, including the
+	// install-directory ACL check. Checked BEFORE tstunNew so a
+	// wrong-install-location failure is reported as exactly that, not as a
+	// generic "could not create the device" error from deeper in wintun's
+	// own loader.
+	if err := ensureWintunDriverIfNeeded(); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	res.DriverOK = true
 
 	name := DefaultTUNName()
 	dev, devName, err := tstunNew(name)
