@@ -174,6 +174,7 @@ func TestPasscodeClearNeedsWarning(t *testing.T) {
 		{"console enabled", &config.Permissions{Console: true}, true},
 		{"desktop enabled", &config.Permissions{Desktop: true}, true},
 		{"files enabled", &config.Permissions{Files: true}, true},
+		{"shell enabled (citadel#763)", &config.Permissions{Shell: true}, true},
 		{"non-sensitive surfaces only", &config.Permissions{Services: true, SSH: true, Provision: true}, false},
 		{"mixed sensitive and non-sensitive", &config.Permissions{Console: true, Services: true}, true},
 	}
@@ -199,7 +200,8 @@ func TestBuiltinServicesActionDesc(t *testing.T) {
 		{"sensitive enabled without passcode, warns", &config.Permissions{Console: true}, "1/5 enabled", true},
 		{"desktop enabled without passcode, warns", &config.Permissions{Desktop: true}, "1/5 enabled", true},
 		{"all five on without passcode, warns", &config.Permissions{Console: true, Desktop: true, Files: true, Services: true, SSH: true}, "5/5 enabled", true},
-		{"shell alone does not count toward N/5 or warn (citadel#763)", &config.Permissions{Shell: true}, "0/5 enabled", false},
+		{"shell alone does not count toward the N/5 tally but does warn (citadel#763)", &config.Permissions{Shell: true}, "0/5 enabled", true},
+		{"shell enabled with passcode set, no warning", &config.Permissions{Shell: true, PasscodeHash: "x"}, "0/5 enabled", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

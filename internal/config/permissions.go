@@ -151,9 +151,14 @@ func (p *Permissions) VerifyPasscode(pin string) bool {
 // IsSensitiveCategory reports whether a permission category is a passcode-gated
 // sensitive remote-access surface. Kept as a package function so the gateway and
 // listener paths agree on the set without duplicating the string literals.
+//
+// "shell" belongs here (citadel#763): internal/jobs/shell_command.go gates an
+// enabled Shell handler on VerifyPasscode exactly like console/desktop/files,
+// so this switch — the package's own stated authority for "what is
+// sensitive" — must not disagree with that enforcement.
 func IsSensitiveCategory(category string) bool {
 	switch category {
-	case "console", "desktop", "files":
+	case "console", "desktop", "files", "shell":
 		return true
 	default:
 		return false
