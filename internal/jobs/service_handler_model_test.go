@@ -170,6 +170,14 @@ func TestServiceStartModelFlow(t *testing.T) {
 	if !strings.Contains(string(out), "docker compose up failed") {
 		t.Errorf("expected compose-up failure with neutered PATH, got: %s", out)
 	}
+	// citadel #767: the failure detail must be the friendly preflight
+	// diagnosis, never the raw Go exec error string.
+	if !strings.Contains(string(out), "docker CLI not found on PATH") {
+		t.Errorf("expected friendly docker-missing diagnosis, got: %s", out)
+	}
+	if strings.Contains(string(out), "exec:") {
+		t.Errorf("failure detail must not leak the raw exec error, got: %s", out)
+	}
 	if v, ok := compose.ReadEnvVar(envPath, "VLLM_MODEL"); !ok || v != "Qwen/Qwen2.5-0.5B-Instruct" {
 		t.Fatalf("model not persisted by SERVICE_START: %q, %v", v, ok)
 	}

@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -381,6 +383,20 @@ func agentDoctor(snap worker.WorkerSnapshot) map[string]any {
 		statusDetail += "; last error: " + snap.LastConsumeError
 	}
 	add("consume_http_status_ok", consumeOK, statusDetail)
+
+	// 6. Docker/podman engine usable (citadel #767). Distinct concern from
+	// job-routing health above -- a node can route jobs fine and still be
+	// unable to start any docker-based service (ollama, vllm, ...) because the
+	// engine CLI is missing/unlinked or its daemon is unreachable. Surfaced as
+	// its own check (not folded into `healthy`, which is specifically the
+	// per-node job-routing verdict) so this shows up as a first-class warning
+	// instead of a one-line error buried in the activity log.
+	dockerHealth := platform.CheckDockerUsable(catalog.SelectContainerRuntime().EngineBin)
+	dockerDetail := "usable"
+	if !dockerHealth.OK {
+		dockerDetail = dockerHealth.String()
+	}
+	add("docker_usable", dockerHealth.OK, dockerDetail)
 
 	healthy := netOK && orgOK && perNodeOK && snap.Consuming && consumeOK
 
