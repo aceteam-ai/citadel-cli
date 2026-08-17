@@ -88,7 +88,7 @@ func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 	if sessionDisabled(config.SessionName) {
 		t.Error("expected tmux backing to be ENABLED by default (citadel #585)")
 	}
-	got := sessionCommand(config.SessionName, "/bin/bash")
+	got := sessionCommand(config.SessionName, "/bin/bash", false)
 	want := []string{bin, "new-session", "-A", "-s", "citadel", "/bin/bash"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
@@ -108,7 +108,7 @@ func TestDefaultConfig_TmuxOptOut(t *testing.T) {
 	if !sessionDisabled(config.SessionName) {
 		t.Error("expected tmux backing to be disabled when opted out")
 	}
-	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
+	if got := sessionCommand(config.SessionName, config.Shell, false); got != nil {
 		t.Errorf("expected nil session command when opted out, got %v", got)
 	}
 }
@@ -126,7 +126,7 @@ func TestDefaultConfig_TmuxMissingFallsBackToBareShell(t *testing.T) {
 	if sessionDisabled(config.SessionName) {
 		t.Fatal("precondition: tmux should be enabled by default")
 	}
-	if got := sessionCommand(config.SessionName, config.Shell); got != nil {
+	if got := sessionCommand(config.SessionName, config.Shell, false); got != nil {
 		t.Errorf("expected nil session command (bare-shell fallback) when tmux is missing, got %v", got)
 	}
 }

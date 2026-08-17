@@ -195,28 +195,58 @@ func TestResolveSessionCommand_OverrideInstallFailsFallsBackToBare(t *testing.T)
 }
 
 // TestResolveSessionCommand_InsideTmuxSkipsNesting pins citadel #751 end to
-// end: when this process is already inside a tmux client, resolveSessionCommand
-// returns a nil command (bare-shell fallback) even though tmux fully
-// resolves and a session was explicitly requested via --tmux, AND it must
-// not waste an on-demand install attempt trying to "fix" something an
-// install can never fix.
+// end for the AUTO path: with no override (the web console / iOS app never
+// send one, so the node's own default governs), when this process is already
+// inside a tmux client, resolveSessionCommand returns a nil command
+// (bare-shell fallback) even though tmux fully resolves, AND it must not
+// waste an on-demand install attempt (which is scoped to overridden requests
+// anyway, so it never fires on this path in the first place — asserted here
+// to keep the contract explicit).
 func TestResolveSessionCommand_InsideTmuxSkipsNesting(t *testing.T) {
 	makeFakeTmux(t) // tmux IS available; the nesting guard must still win.
 	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
 
 	installCalled := false
-	cmd, _, wanted := resolveSessionCommand("none", "citadel", "alice", "/bin/bash", func() bool {
+	cmd, _, wanted := resolveSessionCommand("citadel", "", "alice", "/bin/bash", func() bool {
+		installCalled = true
+		return true
+	})
+	if !wanted {
+		t.Fatal("wantedSession = false, want true (node default names a session)")
+	}
+	if cmd != nil {
+		t.Errorf("command = %v, want nil (bare fallback, already inside tmux, auto path)", cmd)
+	}
+	if installCalled {
+		t.Error("on-demand install must not run on the auto (non-overridden) path")
+	}
+}
+
+// TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux is the
+// review-requested fix for citadel #751 (PR #769 was BLOCKed for missing
+// this): an EXPLICIT override (--tmux) must be honored — and, if tmux isn't
+// yet resolvable, still attempt the on-demand install — even when this
+// process is already inside a tmux client. Only the AUTO path avoids
+// nesting; an explicit ask is a deliberate, informed request that #751 was
+// never meant to second-guess.
+func TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux(t *testing.T) {
+	bin := makeFakeTmux(t) // tmux IS available.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+
+	installCalled := false
+	cmd, name, wanted := resolveSessionCommand("none", "citadel", "alice", "/bin/bash", func() bool {
 		installCalled = true
 		return true
 	})
 	if !wanted {
 		t.Fatal("wantedSession = false, want true (override names a session)")
 	}
-	if cmd != nil {
-		t.Errorf("command = %v, want nil (bare fallback, already inside tmux)", cmd)
+	want := []string{bin, "new-session", "-A", "-s", name, "/bin/bash"}
+	if !reflect.DeepEqual(cmd, want) {
+		t.Errorf("command = %v, want %v (explicit --tmux must win over the nesting guard)", cmd, want)
 	}
 	if installCalled {
-		t.Error("on-demand install must not run when the reason is nesting, not a missing binary")
+		t.Error("on-demand install must not run when tmux already resolves")
 	}
 }
 
