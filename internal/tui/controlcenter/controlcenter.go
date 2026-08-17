@@ -1228,8 +1228,11 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		// latest entry.
 		if cc.focusedPane == paneActivity {
 			cc.activityView.ScrollToEnd()
+			return nil
 		}
-		return nil
+		// Other panes are tview Tables with native End ("jump to last row")
+		// handling — pass the event through instead of swallowing it.
+		return event
 	case tcell.KeyRune:
 		switch event.Rune() {
 		case 'q', 'Q':
@@ -1269,8 +1272,11 @@ func (cc *ControlCenter) handleInput(event *tcell.EventKey) *tcell.EventKey {
 			// latest entry (see the KeyEnd case above for why this exists).
 			if cc.focusedPane == paneActivity {
 				cc.activityView.ScrollToEnd()
+				return nil
 			}
-			return nil
+			// Other panes are tview Tables with native 'G' ("jump to last
+			// row") handling — pass through instead of swallowing it.
+			return event
 		// Action menu shortcuts (0-3)
 		case '1':
 			cc.showBuiltinServicesModal()
