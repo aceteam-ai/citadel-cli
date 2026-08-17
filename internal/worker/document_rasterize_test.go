@@ -312,13 +312,27 @@ func TestDocumentRasterizeStopsWhenTheJobDeadlinePasses(t *testing.T) {
 	}
 }
 
-// The live path: real poppler, a real PDF, real PNG bytes back. Skipped rather
-// than failed where poppler is absent, which is exactly the condition the
-// capability error above covers.
-func TestDocumentRasterizeRendersRealPagesWithPoppler(t *testing.T) {
+// requireUsablePoppler skips the live-poppler tests both when pdftoppm is
+// absent from PATH and when it is present but unusable (e.g. broken by a
+// mismatched shared library on the host). exec.LookPath alone only proves the
+// binary exists, not that it runs, so this also probes it with a cheap
+// no-op invocation ("-v"). Seen in the wild: LookPath succeeds while
+// `pdftoppm -v` fails with "GLIBC_ABI_DT_X86_64_PLT not found" — see #715.
+func requireUsablePoppler(t *testing.T) {
+	t.Helper()
 	if _, err := exec.LookPath(rasterizeRenderer); err != nil {
 		t.Skipf("%s is not installed", rasterizeRenderer)
 	}
+	if out, err := exec.Command(rasterizeRenderer, "-v").CombinedOutput(); err != nil {
+		t.Skipf("%s is installed but not usable: %v (%s)", rasterizeRenderer, err, strings.TrimSpace(string(out)))
+	}
+}
+
+// The live path: real poppler, a real PDF, real PNG bytes back. Skipped rather
+// than failed where poppler is absent or unusable, which is exactly the
+// condition the capability error above covers.
+func TestDocumentRasterizeRendersRealPagesWithPoppler(t *testing.T) {
+	requireUsablePoppler(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -355,9 +369,7 @@ func TestDocumentRasterizeRendersRealPagesWithPoppler(t *testing.T) {
 // A page past the end of the document is named, not swallowed. poppler exits
 // non-zero and its first diagnostic is what the caller shows.
 func TestDocumentRasterizeNamesAPagePastTheEndOfTheDocument(t *testing.T) {
-	if _, err := exec.LookPath(rasterizeRenderer); err != nil {
-		t.Skipf("%s is not installed", rasterizeRenderer)
-	}
+	requireUsablePoppler(t)
 	res := runRaster(t, NewDocumentRasterizeHandler(DocumentRasterizeConfig{}),
 		rasterPayload(buildPDF(1), float64(9)))
 	if res.Status != JobStatusFailure {
