@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -444,6 +445,23 @@ func (h *ConfigHandler) updateManifest(configDir string, config *DeviceConfig) e
 // startServices starts the configured services using docker compose.
 func (h *ConfigHandler) startServices(configDir string, serviceNames []string) error {
 	servicesDir := filepath.Join(configDir, "services")
+
+	// Preflight (citadel #767): this is the FRESH-NODE FIRST START path
+	// (citadel init -> onboarding wizard -> autoStartServices), the exact
+	// scenario the issue reports (macOS, docker installed via Homebrew but
+	// not linked while colima ran healthy). Checked once, not per-service --
+	// every iteration below drives "docker" directly. Refuse ONLY when the
+	// CLI is missing (every exec.Command("docker", ...) below would fail
+	// immediately anyway); a daemon that failed to answer the preflight's
+	// probe is logged as a warning and every service below still attempts to
+	// start, since it may simply be slow and each compose-up call already
+	// surfaces docker's own error if it truly is unreachable -- see
+	// platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return refuseErr
+	} else if warning != "" {
+		clilog.Writef("warning", "docker preflight before APPLY_DEVICE_CONFIG service start: %s", warning)
+	}
 
 	for _, svcName := range serviceNames {
 		// Validate service name to prevent path traversal

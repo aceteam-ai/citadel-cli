@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/demo"
 	"github.com/aceteam-ai/citadel-cli/internal/deskstream"
@@ -1406,14 +1407,22 @@ func ccStartService(name string) error {
 			// issue (TUI "Starting ollama..." -> "Failed to start ollama:
 			// exec: \"docker\": executable file not found in $PATH") --
 			// composeCommand below execs the resolved engine binary directly
-			// with no prior check. Fail fast with a friendly diagnosis
-			// instead of letting that raw exec error bubble up as the
-			// activity-log error. ccStopService deliberately carries no
-			// equivalent check: a stop that can't reach docker is already a
-			// no-op (nothing to stop), not the silent "start reported nothing
-			// wrong" failure mode this issue is about.
-			if dockerErr := platform.EnsureDockerUsable(catalog.SelectContainerRuntime().EngineBin); dockerErr != nil {
-				return fmt.Errorf("cannot start %s: %s", name, dockerErr)
+			// with no prior check. Refuse ONLY when the CLI is missing (that
+			// exec would fail immediately anyway); a daemon that failed to
+			// answer the preflight's probe is logged as a warning and the
+			// start proceeds, since it may simply be slow and the compose-up
+			// call below already surfaces docker's own error if it truly is
+			// unreachable -- see platform.PreflightDockerStart. ccStopService
+			// deliberately carries no equivalent check: a stop that can't
+			// reach docker is already a no-op (nothing to stop), not the
+			// silent "start reported nothing wrong" failure mode this issue
+			// is about. Resolved once and reused below (composeCommandFor)
+			// so this doesn't re-probe the runtime a second time.
+			rt := catalog.SelectContainerRuntime()
+			if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+				return fmt.Errorf("cannot start %s: %s", name, refuseErr)
+			} else if warning != "" {
+				clilog.Writef("warning", "docker preflight for %s: %s", name, warning)
 			}
 			// Clear the durable stopped marker FIRST (mirrors liveModuleOps.Start):
 			// an explicit start restores start-on-boot even if the compose up below
@@ -1438,7 +1447,7 @@ func ccStartService(name string) error {
 			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
 			// start button dies for llamacpp/vllm/extraction/diffusers on
 			// v2.57.0 (#426).
-			return composeCommand(composeArgs...).Run()
+			return composeCommandFor(rt, composeArgs...).Run()
 		}
 	}
 
@@ -1489,9 +1498,13 @@ func ccRestartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
-			// Preflight (citadel #767): same rationale as ccStartService above.
-			if dockerErr := platform.EnsureDockerUsable(catalog.SelectContainerRuntime().EngineBin); dockerErr != nil {
-				return fmt.Errorf("cannot restart %s: %s", name, dockerErr)
+			// Preflight (citadel #767): same warn-and-proceed rationale as
+			// ccStartService above.
+			rt := catalog.SelectContainerRuntime()
+			if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+				return fmt.Errorf("cannot restart %s: %s", name, refuseErr)
+			} else if warning != "" {
+				clilog.Writef("warning", "docker preflight for %s: %s", name, warning)
 			}
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
@@ -1506,7 +1519,7 @@ func ccRestartService(name string) error {
 			removeLegacyCitadelProject(name)
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
 			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
-			cmd := composeCommand(restartArgs...)
+			cmd := composeCommandFor(rt, restartArgs...)
 			return cmd.Run()
 		}
 	}

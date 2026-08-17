@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -238,6 +239,21 @@ func restartAllServices() {
 
 	fmt.Printf("--- 🔄 Restarting %d service(s) ---\n", len(manifest.Services))
 
+	// Preflight (citadel #767): checked once, not per-service, since
+	// composeCommand below always resolves to the same engine for every
+	// iteration. Refuse ONLY when the CLI is missing (every compose call
+	// below would fail immediately anyway); a daemon that failed to answer
+	// the preflight's probe is a warning, not a refusal -- it may simply be
+	// slow, and each `compose restart` below already surfaces docker's own
+	// error if it truly is unreachable. See platform.PreflightDockerStart.
+	rt := catalog.SelectContainerRuntime()
+	if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", refuseErr)
+		os.Exit(1)
+	} else if warning != "" {
+		fmt.Printf("⚠️  %s\n", warning)
+	}
+
 	for _, service := range manifest.Services {
 		// Validate that compose file path stays within config directory (prevent path traversal)
 		fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
@@ -248,7 +264,7 @@ func restartAllServices() {
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
 		restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "restart")
-		composeCmd := composeCommand(restartArgs...)
+		composeCmd := composeCommandFor(rt, restartArgs...)
 		output, err := composeCmd.CombinedOutput()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))

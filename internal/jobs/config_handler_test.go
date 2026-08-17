@@ -2,8 +2,34 @@ package jobs
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+// TestStartServices_DockerCLIMissing_RefusesWithFriendlyMessage covers the
+// onboarding autostart path (citadel #767 follow-up): APPLY_DEVICE_CONFIG's
+// startServices is the fresh-node first-start path (citadel init -> wizard ->
+// autoStartServices), the exact scenario the issue reports. With no docker on
+// PATH, it must refuse with the friendly platform.PreflightDockerStart
+// diagnosis -- never a raw `exec: "docker": executable file not found in
+// $PATH` string -- and must refuse before ever touching a compose file (no
+// service dirs exist here, so any attempt to exec compose would fail
+// differently, proving the preflight is what's stopping this).
+func TestStartServices_DockerCLIMissing_RefusesWithFriendlyMessage(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no docker, no native binaries
+
+	h := NewConfigHandler(t.TempDir())
+	err := h.startServices(h.ConfigDir, []string{"ollama"})
+	if err == nil {
+		t.Fatalf("expected startServices to refuse with docker missing from PATH")
+	}
+	if !strings.Contains(err.Error(), "docker CLI not found on PATH") {
+		t.Fatalf("expected friendly docker-missing diagnosis, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "exec:") {
+		t.Fatalf("error must not leak the raw exec error, got: %v", err)
+	}
+}
 
 // TestDeviceConfig_MeetingEnabledUnmarshal verifies the *bool distinguishes an
 // absent field (nil -> leave the persisted toggle untouched) from an explicit

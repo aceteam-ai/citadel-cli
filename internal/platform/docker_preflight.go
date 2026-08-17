@@ -109,17 +109,55 @@ func CheckDockerUsable(bin string) DockerHealth {
 }
 
 // EnsureDockerUsable is the convenience error form of CheckDockerUsable: nil
-// when usable, otherwise an error carrying the friendly diagnosis + hint.
-// Callers that currently exec docker/podman directly (or via docker compose)
-// should call this first so an unusable engine fails fast with an actionable
-// message instead of surfacing whatever raw exec error the first subprocess
-// call happens to hit.
+// when usable, otherwise an error carrying the friendly diagnosis + hint. It
+// treats BOTH failure classes as a hard refusal, which is the right call for a
+// read-only health check like citadel doctor (agentDoctor) -- there is no
+// "proceed anyway" for a status report. Docker-based service-start call sites
+// must NOT use this directly; use PreflightDockerStart instead (see its doc
+// for why).
 func EnsureDockerUsable(bin string) error {
 	h := CheckDockerUsable(bin)
 	if h.OK {
 		return nil
 	}
 	return fmt.Errorf("%s", h.String())
+}
+
+// PreflightDockerStart is the warn-and-proceed sibling of EnsureDockerUsable
+// for docker-based service-start call sites (citadel #767 follow-up). Unlike
+// EnsureDockerUsable/CheckDockerUsable, it must not turn a merely
+// slow-to-answer-but-live daemon (a 5s dockerInfoTimeout trip on a busy/loaded
+// GPU host, say) into an outright refusal: before this preflight existed, a
+// slow daemon just made `docker compose up` slower, and docker's own error
+// already covers the "daemon really is down" case at least as well as a probe
+// with its own (necessarily shorter) timeout can. So only "cli_missing" -- an
+// exec that would fail immediately anyway, where refusing early costs nothing
+// and gives a far better message -- is a hard refusal here.
+// "daemon_unreachable" instead returns a warning string for the caller to log
+// before falling through to the real docker/compose invocation, which
+// surfaces docker's own error if the daemon truly is unreachable.
+//
+// Returns (refuseErr, warning):
+//   - refuseErr is non-nil ONLY for cli_missing: the caller must not proceed.
+//   - warning is non-empty ONLY for daemon_unreachable: the caller should log
+//     it, then proceed exactly as if this preflight did not exist.
+//
+// Both are zero-value on a healthy engine.
+func PreflightDockerStart(bin string) (refuseErr error, warning string) {
+	return preflightDockerStart(bin, defaultDockerPreflightProbes())
+}
+
+// preflightDockerStart is PreflightDockerStart's probe-injectable core, so the
+// warn-vs-refuse split is unit-testable without a real docker/daemon.
+func preflightDockerStart(bin string, p dockerPreflightProbes) (refuseErr error, warning string) {
+	h := checkDockerUsable(bin, p)
+	if h.OK {
+		return nil, ""
+	}
+	if h.Code == "cli_missing" {
+		return fmt.Errorf("%s", h.String()), ""
+	}
+	return nil, h.String()
 }
 
 func checkDockerUsable(bin string, p dockerPreflightProbes) DockerHealth {

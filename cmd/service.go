@@ -67,7 +67,15 @@ func composeEnv() []string {
 // exec.Command("docker", "compose", ...) reintroduces the v2.57.0 regression
 // where `citadel run --restart` and `citadel status` failed the :? guard (#426).
 func composeCommand(args ...string) *exec.Cmd {
-	rt := catalog.SelectContainerRuntime()
+	return composeCommandFor(catalog.SelectContainerRuntime(), args...)
+}
+
+// composeCommandFor is composeCommand's variant for callers that already
+// resolved a catalog.ContainerRuntime (e.g. because they also need it for a
+// platform.PreflightDockerStart check) and want to avoid a second, redundant
+// catalog.SelectContainerRuntime() call -- which re-probes podman/docker on
+// the host, not merely reads a cached value.
+func composeCommandFor(rt catalog.ContainerRuntime, args ...string) *exec.Cmd {
 	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
 	cmd.Env = composeEnv()
 	return cmd
@@ -146,12 +154,16 @@ func startService(serviceName, composeFilePath string) error {
 	rt := catalog.SelectContainerRuntime()
 	fmt.Printf("   Container runtime: %s\n", rt.Label())
 
-	// Preflight: fail fast with a friendly, actionable message when the engine
-	// CLI is missing or its daemon is unreachable (citadel #767), instead of
-	// letting the inspect/compose exec calls below surface a raw
-	// `exec: "docker": executable file not found in $PATH`-style error.
-	if err := platform.EnsureDockerUsable(rt.EngineBin); err != nil {
-		return fmt.Errorf("cannot start %s: %s", serviceName, err)
+	// Preflight (citadel #767): fail fast ONLY when the engine CLI is missing
+	// (that exec would fail immediately anyway). A daemon that failed to
+	// answer within the preflight's probe timeout is a warning, not a
+	// refusal -- it may simply be slow (a busy/loaded host), and the
+	// inspect/compose calls below already surface docker's own error if it
+	// truly is unreachable. See platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+		return fmt.Errorf("cannot start %s: %s", serviceName, refuseErr)
+	} else if warning != "" {
+		fmt.Printf("   ⚠️  %s\n", warning)
 	}
 
 	// Check if container already exists and its state

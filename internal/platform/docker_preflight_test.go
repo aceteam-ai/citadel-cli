@@ -137,6 +137,68 @@ func TestCheckDockerUsable_DefaultsBinToDocker(t *testing.T) {
 	}
 }
 
+// TestPreflightDockerStart_DaemonUnreachable_WarnsAndProceeds pins the
+// coordinator-requested behavior fix: a service-start preflight must NOT
+// hard-refuse just because `docker info` failed (including a timeout on a
+// slow-but-live daemon) -- before this preflight existed, a slow daemon just
+// made `docker compose up` slower, and docker's own error already covers the
+// truly-down case. Only cli_missing may refuse.
+func TestPreflightDockerStart_DaemonUnreachable_WarnsAndProceeds(t *testing.T) {
+	p := dockerPreflightProbes{
+		lookPath: func(bin string) bool { return true },
+		daemonInfo: func(bin string) (string, error) {
+			return "", errors.New("context deadline exceeded")
+		},
+		colimaRunning: func() bool { return false },
+		goos:          "linux",
+	}
+	refuseErr, warning := preflightDockerStart("docker", p)
+	if refuseErr != nil {
+		t.Fatalf("daemon_unreachable must NOT refuse the start, got refuseErr=%v", refuseErr)
+	}
+	if warning == "" {
+		t.Fatalf("expected a non-empty warning for daemon_unreachable")
+	}
+	if strings.Contains(warning, "exec:") {
+		t.Fatalf("warning must not leak the raw exec error, got %q", warning)
+	}
+}
+
+// TestPreflightDockerStart_CLIMissing_Refuses pins the other half: a missing
+// CLI (an exec that would fail immediately anyway) is still a hard refusal.
+func TestPreflightDockerStart_CLIMissing_Refuses(t *testing.T) {
+	p := dockerPreflightProbes{
+		lookPath:             func(bin string) bool { return false },
+		daemonInfo:           func(bin string) (string, error) { return "", errors.New("unused") },
+		colimaRunning:        func() bool { return false },
+		dockerDesktopRunning: func() bool { return false },
+		brewFormulaInstalled: func(bin string) bool { return false },
+		haveBrew:             func() bool { return false },
+		goos:                 "linux",
+	}
+	refuseErr, warning := preflightDockerStart("docker", p)
+	if refuseErr == nil {
+		t.Fatalf("expected cli_missing to refuse the start")
+	}
+	if warning != "" {
+		t.Fatalf("expected no warning alongside a refusal, got %q", warning)
+	}
+}
+
+// TestPreflightDockerStart_OK pins the healthy no-op case: no refusal, no
+// warning.
+func TestPreflightDockerStart_OK(t *testing.T) {
+	p := dockerPreflightProbes{
+		lookPath:   func(bin string) bool { return true },
+		daemonInfo: func(bin string) (string, error) { return "", nil },
+		goos:       "linux",
+	}
+	refuseErr, warning := preflightDockerStart("docker", p)
+	if refuseErr != nil || warning != "" {
+		t.Fatalf("expected no refusal and no warning on a healthy engine, got refuseErr=%v warning=%q", refuseErr, warning)
+	}
+}
+
 func TestEnsureDockerUsable_WrapsError(t *testing.T) {
 	// EnsureDockerUsable exercises the real (non-stubbed) probes, so this just
 	// checks the OK short-circuit and the error-wrapping shape rather than
