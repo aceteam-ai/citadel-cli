@@ -46,6 +46,20 @@ type StatusData struct {
 	PendingJobs     int64  `json:"pendingJobs,omitempty"`
 	InProgressJobs  int64  `json:"inProgressJobs,omitempty"`
 	FailedJobs      int64  `json:"failedJobs,omitempty"`
+
+	// Heartbeat freshness (citadel-cli#726): whether this node's durable
+	// heartbeat write (node:status:stream) is actually landing, read from the
+	// on-disk marker internal/heartbeat.RecordSuccess/RecordFailure writes.
+	// HeartbeatKnown is false when no marker has ever been written (fresh
+	// install, worker never published, or a config dir the live worker does
+	// not share) -- deliberately distinct from "not stale", since an absent
+	// signal must never read as healthy.
+	HeartbeatKnown               bool      `json:"heartbeatKnown"`
+	HeartbeatLastSuccessAt       time.Time `json:"heartbeatLastSuccessAt,omitempty"`
+	HeartbeatLastAttemptAt       time.Time `json:"heartbeatLastAttemptAt,omitempty"`
+	HeartbeatStale               bool      `json:"heartbeatStale,omitempty"`
+	HeartbeatConsecutiveFailures int       `json:"heartbeatConsecutiveFailures,omitempty"`
+	HeartbeatLastError           string    `json:"heartbeatLastError,omitempty"`
 }
 
 // GPUInfo holds GPU information

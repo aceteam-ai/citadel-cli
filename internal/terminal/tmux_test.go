@@ -40,39 +40,82 @@ func TestTmuxInstallTimeoutUnderServerWriteTimeout(t *testing.T) {
 }
 
 func TestSessionCommand_NoSessionName(t *testing.T) {
-	if got := sessionCommand("", "/bin/bash"); got != nil {
+	if got := sessionCommand("", "/bin/bash", false); got != nil {
 		t.Errorf("expected nil command without a session name, got %v", got)
 	}
 }
 
 func TestSessionCommand_InvalidName(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	makeFakeTmux(t)
-	if got := sessionCommand("bad name", "/bin/bash"); got != nil {
+	if got := sessionCommand("bad name", "/bin/bash", false); got != nil {
 		t.Errorf("expected nil command for invalid session name, got %v", got)
 	}
 }
 
 func TestSessionCommand_TmuxUnavailable(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	// Override points at a nonexistent file -> Resolve fails -> fall back.
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
-	if got := sessionCommand("agent", "/bin/bash"); got != nil {
+	if got := sessionCommand("agent", "/bin/bash", false); got != nil {
 		t.Errorf("expected nil command when tmux is unavailable, got %v", got)
 	}
 }
 
 func TestSessionCommand_BuildsAttachOrCreate(t *testing.T) {
+	t.Setenv("TMUX", "") // isolate from the ambient test-runner environment (citadel #751)
 	bin := makeFakeTmux(t)
-	got := sessionCommand("agent", "/bin/bash")
+	got := sessionCommand("agent", "/bin/bash", false)
 	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("sessionCommand = %v, want %v", got, want)
 	}
 }
 
+// TestSessionCommand_InsideTmux pins citadel #751: even when tmux is fully
+// resolvable and the session name is valid, sessionCommand refuses to nest a
+// new tmux session under one this process is already running inside of --
+// but ONLY on the auto (explicit=false) path, i.e. the node's own default
+// with no explicit ask from the connecting caller.
+func TestSessionCommand_InsideTmux(t *testing.T) {
+	makeFakeTmux(t) // tmux IS available; the nesting guard must still win.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+	if got := sessionCommand("agent", "/bin/bash", false); got != nil {
+		t.Errorf("expected nil command when already inside tmux (auto path), got %v", got)
+	}
+}
+
+// TestSessionCommand_ExplicitHonoredInsideTmux is the review-requested fix
+// for citadel #751 (PR #769 was BLOCKed for missing this): an explicit
+// request (explicit=true, i.e. the operator's own --tmux flag) must still be
+// honored even when this process is already inside a tmux client. #751 is
+// about not AUTO-starting a nested tmux; it was never about overriding a
+// deliberate, informed ask.
+func TestSessionCommand_ExplicitHonoredInsideTmux(t *testing.T) {
+	bin := makeFakeTmux(t)
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+	got := sessionCommand("agent", "/bin/bash", true)
+	want := []string{bin, "new-session", "-A", "-s", "agent", "/bin/bash"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sessionCommand(explicit=true) = %v, want %v (explicit --tmux must win over the nesting guard)", got, want)
+	}
+}
+
+func TestInsideTmux(t *testing.T) {
+	t.Setenv("TMUX", "")
+	if insideTmux() {
+		t.Error("insideTmux() = true with TMUX unset, want false")
+	}
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+	if !insideTmux() {
+		t.Error("insideTmux() = false with TMUX set, want true")
+	}
+}
+
 func TestSessionCommand_DisableSentinel(t *testing.T) {
 	makeFakeTmux(t)
 	for _, name := range []string{"none", "off", "OFF", "disabled", "false", "0", " none "} {
-		if got := sessionCommand(name, "/bin/bash"); got != nil {
+		if got := sessionCommand(name, "/bin/bash", false); got != nil {
 			t.Errorf("sessionCommand(%q) = %v, want nil (disabled)", name, got)
 		}
 	}

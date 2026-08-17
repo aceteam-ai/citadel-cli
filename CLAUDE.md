@@ -1197,6 +1197,17 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   conclude it needs root and quietly no-op. It nearly did exactly that to #696's
   pidfile.
 
+  **`ConfigDir()` is invoker-scoped; do not use it for cross-context state.**
+  Anything one invocation context writes and another reads (a systemd-root
+  `citadel work` writing, an interactive non-root `citadel status` reading) must
+  use `network.GetNodeConfigDir()` instead — the machine-convergent node config
+  dir, hardened for exactly this divergence by #383 and already used by
+  `worklock.LockPathForStateDir`. `ConfigDir()` silently resolves to different
+  directories for those two callers, so the reader sees nothing and reports
+  "unknown" forever rather than erroring. #726's cross-process heartbeat
+  freshness marker (`internal/heartbeat/marker.go`) uses `GetNodeConfigDir()`
+  for this reason, not `ConfigDir()`.
+
 **Package Management** (`internal/platform/packages.go`):
 - `GetPackageManager()` - Returns apt (Linux), brew (macOS), or winget (Windows) manager
 - `EnsureHomebrew()` - Installs Homebrew if not present on macOS

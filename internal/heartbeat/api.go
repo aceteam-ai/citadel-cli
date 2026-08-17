@@ -67,6 +67,12 @@ type APIPublisher struct {
 	// (citadel-cli#587). It is a cache read — it must never block or error —
 	// and may return nil (no stats field on that heartbeat). Optional.
 	statsFn func() *pulse.StatsBlock
+
+	// markerDir, when non-empty, is where the cross-process heartbeat
+	// freshness marker is written after every publish attempt (#726; see
+	// marker.go and RedisPublisher.markerDir's longer comment). Empty is the
+	// default and means "do not write a marker".
+	markerDir string
 }
 
 // SetStatsProvider registers the Fabric Pulse cached-stats reader
@@ -109,6 +115,12 @@ type APIPublisherConfig struct {
 
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
+
+	// MarkerDir, when set, is where the cross-process heartbeat freshness
+	// marker is written after every publish attempt so `citadel status` can
+	// read it (citadel-cli#726). Callers pass network.GetNodeConfigDir(); left
+	// empty (as every test in this package does), no marker is written.
+	MarkerDir string
 }
 
 // NewAPIPublisher creates a new API-based status publisher.
@@ -143,6 +155,7 @@ func NewAPIPublisher(cfg APIPublisherConfig, collector *status.Collector) (*APIP
 		streamName:      "node:status:stream",
 		debugFunc:       cfg.DebugFunc,
 		logFn:           cfg.LogFn,
+		markerDir:       cfg.MarkerDir,
 	}, nil
 }
 
@@ -272,6 +285,21 @@ func (p *APIPublisher) publishMessage(ctx context.Context, msg StatusMessage, ti
 	streamErr := p.client.StreamAdd(ctx, p.streamName, streamFields, 10000)
 	if streamErr == nil {
 		p.debug("heartbeat: stream add successful")
+	}
+	// Cross-process freshness marker for `citadel status` (#726): this
+	// process (a long-running `citadel work`) is the only writer, and status
+	// is a separate short-lived invocation with no other handle on it.
+	// Best-effort -- never lets a marker-write failure turn a successful
+	// heartbeat into a reported failure. Skipped entirely when markerDir is
+	// unset (every test in this package; production sets it via
+	// APIPublisherConfig.MarkerDir).
+	if p.markerDir != "" {
+		now := time.Now()
+		if streamErr == nil {
+			_ = RecordSuccess(p.markerDir, now)
+		} else {
+			_ = RecordFailure(p.markerDir, now, streamErr)
+		}
 	}
 
 	// 2. Best-effort pub/sub for real-time UI updates. Attempted even when the

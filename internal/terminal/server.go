@@ -562,6 +562,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&s.activeConnections, -1)
 	}()
 
+	// sc serializes every write to conn for the rest of this connection's
+	// lifetime (citadel #729, same bug class as #720/PR #725). One instance
+	// is constructed here and threaded through to handleConnection so both
+	// the early-return error writes below and every write inside
+	// handleConnection share the same mutex — see safeConn's doc comment.
+	sc := newSafeConn(conn)
+
 	// Generate session ID
 	sessionID := generateSessionID()
 
@@ -588,6 +595,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if wantedSession {
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		} else if sessionOverride == "" && insideTmux() {
+			// citadel #751: this citadel process is itself already running
+			// inside a tmux client, and this session was AUTO-started off the
+			// node's own default (no explicit "session" override — only the
+			// CLI's --tmux path ever sends one), so sessionCommand refused to
+			// nest a new tmux session under it (nesting breaks prefix keys and
+			// is confusing, not useful). An explicit --tmux request would have
+			// been honored instead (see sessionCommand's explicit parameter)
+			// and landed in the tmuxCommand != nil branch above, so reaching
+			// here with sessionOverride == "" unambiguously means the auto
+			// path. Fall back to a bare shell rather than attempting the
+			// on-demand install, which could never fix this.
+			s.logger.Printf("already inside a tmux session (TMUX is set); session %s uses a bare (non-persistent) shell to avoid nesting tmux-in-tmux", sessionID)
 		} else {
 			// tmux backing is wanted (either the node default, citadel #585, or
 			// an explicit --tmux override) but no usable tmux binary resolved,
@@ -617,7 +637,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.logger.Printf("failed to create PTY session %s: %v", sessionID, err)
 		msg := NewErrorMessage(err.Error())
 		data, _ := msg.Marshal()
-		conn.WriteMessage(websocket.TextMessage, data)
+		sc.WriteMessage(websocket.TextMessage, data)
 		return
 	}
 
@@ -627,7 +647,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		session.Close()
 		msg := NewErrorMessage(err.Error())
 		data, _ := msg.Marshal()
-		conn.WriteMessage(websocket.TextMessage, data)
+		sc.WriteMessage(websocket.TextMessage, data)
 		return
 	}
 
@@ -635,18 +655,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		sessionID, tokenInfo.UserID, s.config.Shell, s.sessions.Count())
 
 	// Handle the connection
-	s.handleConnection(conn, session)
+	s.handleConnection(conn, sc, session)
 
 	s.logger.Printf("session %s ended (sessions=%d)", sessionID, s.sessions.Count())
 }
 
-// handleConnection manages the bidirectional communication between WebSocket and PTY
-func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
+// handleConnection manages the bidirectional communication between WebSocket
+// and PTY. sc wraps conn and must be the same instance the caller already
+// used for any pre-connection writes (citadel #729) — every write in this
+// function goes through sc, never conn.WriteMessage directly, because the
+// PTY->WebSocket relay goroutine below and this function's own WebSocket->PTY
+// loop are two independent goroutines that can both want to write at once.
+func (s *Server) handleConnection(conn *websocket.Conn, sc *safeConn, session *Session) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer session.Close()
 
-	// Set up ping/pong for connection health
+	// Set up ping/pong for connection health. WriteControl is intentionally
+	// called on conn directly, not through sc: gorilla documents it as safe
+	// concurrently with all other write methods (it does not share the
+	// deadline WriteMessage/SetWriteDeadline touch), so it needs no guard —
+	// see safeConn's doc comment.
 	conn.SetPingHandler(func(appData string) error {
 		s.logger.Debugf("received ping from session %s", session.ID)
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
@@ -673,7 +702,7 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 						s.logger.Debugf("failed to marshal output for session %s: %v", session.ID, err)
 						continue
 					}
-					if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+					if err := sc.WriteMessage(websocket.TextMessage, data); err != nil {
 						s.logger.Debugf("WebSocket write error for session %s: %v", session.ID, err)
 						cancel()
 						return
@@ -712,7 +741,7 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 				s.logger.Debugf("message validation failed for session %s: %v", session.ID, err)
 				errMsg := NewErrorMessage(err.Error())
 				errData, _ := errMsg.Marshal()
-				conn.WriteMessage(websocket.TextMessage, errData)
+				sc.WriteMessage(websocket.TextMessage, errData)
 				continue
 			}
 
@@ -729,14 +758,14 @@ func (s *Server) handleConnection(conn *websocket.Conn, session *Session) {
 					s.logger.Debugf("resize failed for session %s: %v", session.ID, err)
 					errMsg := NewErrorMessage(err.Error())
 					errData, _ := errMsg.Marshal()
-					conn.WriteMessage(websocket.TextMessage, errData)
+					sc.WriteMessage(websocket.TextMessage, errData)
 				}
 
 			case MessageTypePing:
 				s.logger.Debugf("received application ping from session %s", session.ID)
 				pong := NewPongMessage()
 				pongData, _ := pong.Marshal()
-				conn.WriteMessage(websocket.TextMessage, pongData)
+				sc.WriteMessage(websocket.TextMessage, pongData)
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package controlcenter
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -351,6 +352,75 @@ func TestActivityEntry(t *testing.T) {
 	}
 	if entry.Message != "Job completed" {
 		t.Errorf("ActivityEntry.Message = %s, want Job completed", entry.Message)
+	}
+}
+
+// TestAppendActivityEntryOrdersOldestFirst guards citadel-cli #766: the
+// Activity pane must read oldest-at-top, newest-at-bottom, which requires the
+// backing slice to be built in chronological (append, not prepend) order.
+func TestAppendActivityEntryOrdersOldestFirst(t *testing.T) {
+	var entries []ActivityEntry
+	for _, msg := range []string{"first", "second", "third"} {
+		entries = appendActivityEntry(entries, ActivityEntry{Message: msg}, maxActivityEntries)
+	}
+
+	if len(entries) != 3 {
+		t.Fatalf("len(entries) = %d, want 3", len(entries))
+	}
+	if entries[0].Message != "first" {
+		t.Errorf("entries[0].Message = %s, want first (oldest first)", entries[0].Message)
+	}
+	if entries[len(entries)-1].Message != "third" {
+		t.Errorf("entries[last].Message = %s, want third (newest last)", entries[len(entries)-1].Message)
+	}
+}
+
+// TestAppendActivityEntryTrimsOldestOverCapacity guards that once the log
+// exceeds its cap, the OLDEST entries are dropped and the newest are kept —
+// the opposite corner case from the old prepend-and-truncate-tail behavior,
+// which would have discarded the newest entries instead.
+func TestAppendActivityEntryTrimsOldestOverCapacity(t *testing.T) {
+	const max = 5
+	var entries []ActivityEntry
+	for i := 0; i < max+3; i++ {
+		entries = appendActivityEntry(entries, ActivityEntry{Message: strconv.Itoa(i)}, max)
+	}
+
+	if len(entries) != max {
+		t.Fatalf("len(entries) = %d, want %d", len(entries), max)
+	}
+	// The oldest 3 (0, 1, 2) should have been dropped; entries[0] is now "3"
+	// and the newest, "7", is last.
+	if entries[0].Message != "3" {
+		t.Errorf("entries[0].Message = %s, want 3 (oldest retained entry)", entries[0].Message)
+	}
+	if entries[len(entries)-1].Message != "7" {
+		t.Errorf("entries[last].Message = %s, want 7 (newest entry)", entries[len(entries)-1].Message)
+	}
+}
+
+// TestGetActivityTextRendersNewestAtBottom guards the rendering path from
+// cc.activities to the plain-text view (shared by the Activity pane, the
+// full-screen modal, and the 'l' snapshot): the most recently appended entry
+// must land on the LAST line, not the first. Populates cc.activities directly
+// (rather than via AddActivity) so the test exercises only the ordering
+// contract, without the side effect of AddActivity also writing to the
+// on-disk clilog.
+func TestGetActivityTextRendersNewestAtBottom(t *testing.T) {
+	cc := New(Config{Version: "test"})
+
+	now := time.Now()
+	cc.activities = appendActivityEntry(cc.activities, ActivityEntry{Time: now, Level: "info", Message: "oldest-event"}, maxActivityEntries)
+	cc.activities = appendActivityEntry(cc.activities, ActivityEntry{Time: now.Add(time.Second), Level: "info", Message: "newest-event"}, maxActivityEntries)
+
+	text := cc.getActivityText()
+	oldestIdx := strings.Index(text, "oldest-event")
+	newestIdx := strings.Index(text, "newest-event")
+	if oldestIdx < 0 || newestIdx < 0 {
+		t.Fatalf("activity text missing expected entries: %q", text)
+	}
+	if oldestIdx > newestIdx {
+		t.Errorf("expected oldest-event before newest-event in rendered text, got %q", text)
 	}
 }
 

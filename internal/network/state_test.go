@@ -304,3 +304,26 @@ func TestEnsureMachineStatePointerRecordsResolvedDir(t *testing.T) {
 		t.Errorf("pointer = %q, want %q (the parent of network/)", got, nodeDir)
 	}
 }
+
+// TestNodeConfigDirFromStateDir pins the relationship GetNodeConfigDir relies
+// on: it is always the PARENT of the resolved state dir (<nodeConfigDir>/network),
+// the same relationship worklock.LockPathForStateDir depends on to place its
+// lock file next to (not inside) the network/ state subdirectory.
+func TestNodeConfigDirFromStateDir(t *testing.T) {
+	cases := []struct {
+		name     string
+		stateDir string
+		want     string
+	}{
+		{"unix path", "/home/user/citadel-node/network", "/home/user/citadel-node"},
+		{"root-owned path", "/root/citadel-node/network", "/root/citadel-node"},
+		{"trailing slash", "/root/citadel-node/network/", "/root/citadel-node"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeConfigDirFromStateDir(tc.stateDir); got != tc.want {
+				t.Errorf("nodeConfigDirFromStateDir(%q) = %q, want %q", tc.stateDir, got, tc.want)
+			}
+		})
+	}
+}
