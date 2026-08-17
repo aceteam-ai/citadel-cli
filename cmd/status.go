@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -148,6 +149,11 @@ func printWorkerInfo(w io.Writer) {
 	held, pid := worklock.IsHeld(stateDir)
 	if !held {
 		fmt.Fprintf(w, "  %s\t%s\n", labelColor.Sprint("Status:"), warnColor.Sprint("not running"))
+		// Still check the marker even with no worker detected: a stale or
+		// missing marker is exactly the "no signal must not read as healthy"
+		// case #726 asks for, and a marker left over from a crashed worker is
+		// informative on its own.
+		printHeartbeatFreshness(w)
 		return
 	}
 	detail := fmt.Sprintf("PID %d", pid)
@@ -161,6 +167,53 @@ func printWorkerInfo(w io.Writer) {
 	}
 	fmt.Fprintf(w, "  %s\t%s (%s)\n", labelColor.Sprint("Status:"), goodColor.Sprint("running"), detail)
 	printPubSubInfo(w)
+	printHeartbeatFreshness(w)
+}
+
+// printHeartbeatFreshness reports how long ago this node's DURABLE heartbeat
+// write (the `node:status:stream` XADD / StreamAdd) last succeeded
+// (citadel-cli#726). It is the node-local complement to printPubSubInfo: that
+// function reports the live worker's best-effort pub/sub transport, while
+// this one reports the reliable stream write the platform actually uses to
+// decide whether the node is online -- the fact a healthy-looking node in
+// citadel-cli#722 had no way to check about itself for 12 hours.
+//
+// Reads a marker file the publisher writes on every publish attempt
+// (internal/heartbeat.RecordSuccess/RecordFailure) rather than talking to the
+// worker process, since the worker (`citadel work`) and `citadel status` are
+// separate processes -- the marker is the only cross-process channel. An
+// absent marker (fresh install, worker never published, or a config dir the
+// live worker does not share) is reported as "unknown", never as healthy.
+func printHeartbeatFreshness(w io.Writer) {
+	m := heartbeat.LoadMarker(network.GetNodeConfigDir())
+	label := labelColor.Sprint("Heartbeat:")
+	state, age := heartbeat.Freshness(m, time.Now(), heartbeat.DefaultStaleAfter)
+
+	switch state {
+	case heartbeat.FreshnessUnknown:
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			faintColor.Sprint("unknown (no successful durable heartbeat write recorded for this node yet)"))
+	case heartbeat.FreshnessStale:
+		detail := fmt.Sprintf("last success %s ago", age.Round(time.Second))
+		// LastAttemptAt distinguishes "the worker is alive and every write is
+		// failing" (fresh attempt, stale success) from "the worker stopped
+		// publishing entirely" (attempt also stale) -- the two scenarios call
+		// for different operator action, so surface both timestamps rather
+		// than collapsing them into one "stale" verdict.
+		if !m.LastAttemptAt.IsZero() && !m.LastAttemptAt.Equal(m.LastSuccessAt) {
+			detail += fmt.Sprintf(", last attempt %s ago", time.Since(m.LastAttemptAt).Round(time.Second))
+		}
+		if m.ConsecutiveFailures > 0 {
+			detail += fmt.Sprintf(", %d consecutive failure(s)", m.ConsecutiveFailures)
+		}
+		if m.LastError != "" {
+			detail += fmt.Sprintf(": %s", m.LastError)
+		}
+		fmt.Fprintf(w, "  %s\t%s\n", label,
+			warnColor.Sprint("STALE -- "+detail+" (the node's heartbeat may not be landing upstream)"))
+	default: // FreshnessOK
+		fmt.Fprintf(w, "  %s\t%s\n", label, goodColor.Sprintf("last success %s ago", age.Round(time.Second)))
+	}
 }
 
 // printPubSubInfo reports which transport the running worker's pub/sub
@@ -490,6 +543,20 @@ func gatherStatusData() (dashboard.StatusData, error) {
 
 			data.Services = append(data.Services, svcStatus)
 		}
+	}
+
+	// Heartbeat freshness (citadel-cli#726). Age is derivable from
+	// HeartbeatLastSuccessAt by callers, so it is not duplicated on the wire.
+	if m := heartbeat.LoadMarker(network.GetNodeConfigDir()); m != nil {
+		state, _ := heartbeat.Freshness(m, time.Now(), heartbeat.DefaultStaleAfter)
+		data.HeartbeatKnown = state != heartbeat.FreshnessUnknown
+		if data.HeartbeatKnown {
+			data.HeartbeatLastSuccessAt = m.LastSuccessAt
+			data.HeartbeatStale = state == heartbeat.FreshnessStale
+		}
+		data.HeartbeatLastAttemptAt = m.LastAttemptAt
+		data.HeartbeatConsecutiveFailures = m.ConsecutiveFailures
+		data.HeartbeatLastError = m.LastError
 	}
 
 	return data, nil

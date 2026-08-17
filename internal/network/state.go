@@ -52,6 +52,26 @@ func GetStateDir() string {
 	})
 }
 
+// GetNodeConfigDir returns the resolved node config directory: the PARENT of
+// GetStateDir() (which is always <nodeConfigDir>/network). This is the same
+// machine-convergent directory worklock.LockPathForStateDir places its lock
+// file in ("next to the network state subdirectory... so every invocation on
+// the same box... converges on the same lock") — use this, not
+// platform.ConfigDir(), for any other state a citadel process needs to read
+// back from a DIFFERENT invocation context on the same machine (e.g. a
+// systemd-root `citadel work` vs. an interactive non-root `citadel status`).
+// platform.ConfigDir() is invoker-scoped by design (user-local unless root)
+// and will silently diverge between those two contexts.
+func GetNodeConfigDir() string {
+	return nodeConfigDirFromStateDir(GetStateDir())
+}
+
+// nodeConfigDirFromStateDir is the pure, testable core of GetNodeConfigDir --
+// same reason resolveStateDir is split out of GetStateDir.
+func nodeConfigDirFromStateDir(stateDir string) string {
+	return filepath.Dir(filepath.Clean(stateDir))
+}
+
 // stateDirInputs bundles the (already-resolved) inputs to resolveStateDir so the
 // resolution logic is a pure function testable without touching a real HOME,
 // config file, or filesystem — mirroring resolveConfigDir / resolveChownTargetWith.

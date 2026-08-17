@@ -102,6 +102,17 @@ type RedisPublisher struct {
 	// (citadel-cli#587). It is a cache read — it must never block or error —
 	// and may return nil (no stats field on that heartbeat). Optional.
 	statsFn func() *pulse.StatsBlock
+
+	// markerDir, when non-empty, is where the cross-process heartbeat
+	// freshness marker is written after every publish attempt (#726; see
+	// marker.go). Empty (the default, including in every test in this
+	// package) means "do not write a marker" -- this package does not import
+	// internal/platform and resolve a default itself (same standalone
+	// convention as internal/mesh and internal/config's LoadEnergy/SaveEnergy,
+	// which take a configDir parameter rather than resolving one), so a
+	// caller that wants the marker written must set RedisPublisherConfig.MarkerDir
+	// explicitly (cmd/work.go passes network.GetNodeConfigDir()).
+	markerDir string
 }
 
 // SetStatsProvider registers the Fabric Pulse cached-stats reader
@@ -149,6 +160,12 @@ type RedisPublisherConfig struct {
 
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
+
+	// MarkerDir, when set, is where the cross-process heartbeat freshness
+	// marker is written after every publish attempt so `citadel status` can
+	// read it (citadel-cli#726). Callers pass network.GetNodeConfigDir(); left
+	// empty (as every test in this package does), no marker is written.
+	MarkerDir string
 }
 
 // NewRedisPublisher creates a new Redis status publisher.
@@ -192,6 +209,7 @@ func NewRedisPublisher(cfg RedisPublisherConfig, collector *status.Collector) (*
 		streamName:      "node:status:stream",
 		debugFunc:       cfg.DebugFunc,
 		logFn:           cfg.LogFn,
+		markerDir:       cfg.MarkerDir,
 	}, nil
 }
 
@@ -332,6 +350,21 @@ func (p *RedisPublisher) publishMessage(ctx context.Context, msg StatusMessage, 
 	}).Err()
 	if streamErr == nil {
 		p.debug("heartbeat: stream XADD successful")
+	}
+	// Cross-process freshness marker for `citadel status` (#726): this
+	// process (a long-running `citadel work`) is the only writer, and status
+	// is a separate short-lived invocation with no other handle on it.
+	// Best-effort -- never lets a marker-write failure turn a successful
+	// heartbeat into a reported failure. Skipped entirely when markerDir is
+	// unset (every test in this package; production sets it via
+	// RedisPublisherConfig.MarkerDir).
+	if p.markerDir != "" {
+		now := time.Now()
+		if streamErr == nil {
+			_ = RecordSuccess(p.markerDir, now)
+		} else {
+			_ = RecordFailure(p.markerDir, now, streamErr)
+		}
 	}
 
 	// Best-effort Pub/Sub for real-time UI updates. Never fatal.

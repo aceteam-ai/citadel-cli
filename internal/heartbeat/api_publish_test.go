@@ -233,6 +233,49 @@ func TestPublishMessageHappyPath(t *testing.T) {
 	}
 }
 
+// TestPublishMessageRecordsMarkerOnSuccess pins the wiring half of #726
+// (API-mode side): a successful durable stream write must update the on-disk
+// freshness marker.
+func TestPublishMessageRecordsMarkerOnSuccess(t *testing.T) {
+	stub := &redisAPIStub{}
+	pub, _ := newTestAPIPublisher(t, stub)
+	dir := t.TempDir()
+	pub.markerDir = dir
+
+	before := time.Now()
+	msg := testStatusMessage()
+	if err := pub.publishMessage(context.Background(), msg, msg.Timestamp); err != nil {
+		t.Fatalf("publishMessage: %v", err)
+	}
+
+	m := LoadMarker(dir)
+	if m.LastSuccessAt.Before(before) {
+		t.Fatalf("LastSuccessAt = %v, want >= %v", m.LastSuccessAt, before)
+	}
+}
+
+// TestPublishMessageDoesNotMoveMarkerOnFailure mirrors the direct-Redis test
+// of the same name: a failed durable write must not advance LastSuccessAt.
+func TestPublishMessageDoesNotMoveMarkerOnFailure(t *testing.T) {
+	stub := &redisAPIStub{failStream: true}
+	pub, _ := newTestAPIPublisher(t, stub)
+	dir := t.TempDir()
+	pub.markerDir = dir
+
+	msg := testStatusMessage()
+	if err := pub.publishMessage(context.Background(), msg, msg.Timestamp); err == nil {
+		t.Fatal("expected the durable stream write to fail")
+	}
+
+	m := LoadMarker(dir)
+	if !m.LastSuccessAt.IsZero() {
+		t.Fatalf("expected LastSuccessAt to stay zero after an all-failure run, got %v", m.LastSuccessAt)
+	}
+	if m.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", m.ConsecutiveFailures)
+	}
+}
+
 // TestPublishMessageWarningIsRateLimitedThenRecovers exercises the noise
 // policy end to end through the publisher: a sustained pub/sub outage logs once
 // (not once per 30s interval), and the recovery is announced.

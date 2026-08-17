@@ -1650,6 +1650,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					HeadscaleNodeID: headscaleNodeID,
 					OrgID:           orgID,
 					DebugFunc:       Debug,
+					MarkerDir:       network.GetNodeConfigDir(),
 				}, collector)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
@@ -1686,6 +1687,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				DeviceCode:      deviceCode,
 				ChannelOverride: workStatusChannel,
 				DebugFunc:       Debug,
+				MarkerDir:       network.GetNodeConfigDir(),
 			}, collector)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
