@@ -155,6 +155,7 @@ func TestGlyph_SwitchesOnMode(t *testing.T) {
 		{MarkerError, "✗", "X"},
 		{MarkerArrowUp, "↑", "^"},
 		{MarkerArrowDown, "↓", "v"},
+		{MarkerCheckbox, "✓", "x"},
 	}
 
 	for _, tt := range tests {
@@ -180,6 +181,82 @@ func TestGlyph_UnknownMarkerDegradesGracefully(t *testing.T) {
 	const bogus Marker = 9999
 	if got := Glyph(bogus); got != "?" {
 		t.Errorf("Glyph(bogus) = %q, want %q", got, "?")
+	}
+}
+
+// TestPadGlyph verifies the fixed-width table-alignment helper: a no-op in
+// emoji mode (every glyph is already 1 rune), space-padding in ASCII mode
+// where fallbacks vary in rune length (e.g. "OK" vs "X" vs "*").
+func TestPadGlyph(t *testing.T) {
+	t.Run("emoji mode is a no-op regardless of width", func(t *testing.T) {
+		clearGlyphEnv(t)
+		withEnv(t, map[string]string{"TERM": "xterm-256color", "LANG": "en_US.UTF-8"})
+		if got := PadGlyph(MarkerOK, 2); got != "✓" {
+			t.Errorf("PadGlyph(MarkerOK, 2) in emoji mode = %q, want %q (no padding)", got, "✓")
+		}
+	})
+
+	t.Run("ascii mode pads shorter glyphs to the requested width", func(t *testing.T) {
+		clearGlyphEnv(t)
+		withEnv(t, map[string]string{"CITADEL_ASCII": "1"})
+
+		tests := []struct {
+			marker Marker
+			width  int
+			want   string
+		}{
+			{MarkerOK, 2, "OK"},    // already at width: unchanged
+			{MarkerError, 2, "X "}, // 1 rune -> padded to 2
+			{MarkerActive, 2, "* "},
+		}
+		for _, tt := range tests {
+			got := PadGlyph(tt.marker, tt.width)
+			if got != tt.want {
+				t.Errorf("PadGlyph(%v, %d) = %q, want %q", tt.marker, tt.width, got, tt.want)
+			}
+			if gotLen := len([]rune(got)); gotLen != tt.width {
+				t.Errorf("PadGlyph(%v, %d) rune length = %d, want %d", tt.marker, tt.width, gotLen, tt.width)
+			}
+		}
+	})
+
+	t.Run("ascii mode never truncates a glyph wider than the requested width", func(t *testing.T) {
+		clearGlyphEnv(t)
+		withEnv(t, map[string]string{"CITADEL_ASCII": "1"})
+		if got := PadGlyph(MarkerArrowBoth, 1); got != "<->" {
+			t.Errorf("PadGlyph(MarkerArrowBoth, 1) = %q, want %q (never truncate)", got, "<->")
+		}
+	})
+}
+
+// TestJobStatusMarkersStayAlignedInASCIIMode is a regression test for the
+// showJobsDetailModal recent-jobs table: success/failed/running rows must
+// render the same total marker+word width in both modes, or the DURATION
+// column that follows drifts on success rows (citadel #774 CI follow-up).
+func TestJobStatusMarkersStayAlignedInASCIIMode(t *testing.T) {
+	widthOf := func(marker Marker, word string) int {
+		return len([]rune(PadGlyph(marker, 2))) + len([]rune(word))
+	}
+
+	for _, mode := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{"emoji", map[string]string{"TERM": "xterm-256color", "LANG": "en_US.UTF-8"}},
+		{"ascii", map[string]string{"CITADEL_ASCII": "1"}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			clearGlyphEnv(t)
+			withEnv(t, mode.env)
+
+			success := widthOf(MarkerOK, " success")
+			failed := widthOf(MarkerError, " failed ")
+			running := widthOf(MarkerActive, " running")
+
+			if success != failed || success != running {
+				t.Errorf("marker+word widths not aligned: success=%d failed=%d running=%d", success, failed, running)
+			}
+		})
 	}
 }
 

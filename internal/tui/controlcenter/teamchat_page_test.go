@@ -31,7 +31,7 @@ func TestFormatTeamChatMessage(t *testing.T) {
 				Sender:    &teamchat.Sender{ID: "u-1", Email: "j@x.c", FullName: &name},
 			},
 			contains: []string{"[cyan]Jason Sun[white]", "hello team"},
-			excludes: []string{"replies", "↳"},
+			excludes: []string{"replies", Glyph(MarkerThreadReply)},
 		},
 		{
 			name: "agent message",
@@ -50,7 +50,7 @@ func TestFormatTeamChatMessage(t *testing.T) {
 				ParentMessageID: &parent,
 				ReplyCount:      3,
 			},
-			contains: []string{"↳", "(3 replies)"},
+			contains: []string{Glyph(MarkerThreadReply), "(3 replies)"},
 		},
 		{
 			name: "attachment-only message",

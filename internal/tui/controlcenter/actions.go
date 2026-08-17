@@ -1653,11 +1653,15 @@ func (cc *ControlCenter) showJobsDetailModal() {
 			sb.WriteString("\n[yellow]Recent Jobs (last 10)[-]\n")
 			sb.WriteString("  [gray]TYPE              STATUS    DURATION   TIME[-]\n")
 			for _, job := range recentJobs {
-				statusIcon := "[green]" + Glyph(MarkerOK) + " success[-]"
+				// Marker width is padded to 2 runes in ASCII mode ("OK" is the
+				// widest fallback) so success/failed/running rows stay aligned;
+				// every emoji glyph is 1 rune, so PadGlyph is a no-op there and
+				// this matches the original hand-tuned emoji-mode spacing.
+				statusIcon := "[green]" + PadGlyph(MarkerOK, 2) + " success[-]"
 				if job.Status == "failed" {
-					statusIcon = "[red]" + Glyph(MarkerError) + " failed [-]"
+					statusIcon = "[red]" + PadGlyph(MarkerError, 2) + " failed [-]"
 				} else if job.Status == "processing" {
-					statusIcon = "[cyan]" + Glyph(MarkerActive) + " running[-]"
+					statusIcon = "[cyan]" + PadGlyph(MarkerActive, 2) + " running[-]"
 				}
 
 				timeStr := job.StartedAt.Format("15:04:05")

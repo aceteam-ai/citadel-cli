@@ -444,9 +444,17 @@ func (p *SettingsPage) connectionStatus() (string, ConnState) {
 
 // checkbox renders a colored checkbox glyph for a boolean setting: a green
 // checkmark when on, a dim empty box when off.
+//
+// The bracketed glyph is run through tview.Escape (citadel #656 CI follow-up):
+// tview's style-tag parser accepts any letters/digits as tag content, so a
+// bare "[x]" — the ASCII fallback's checked glyph — is silently swallowed as
+// a (meaningless but syntactically valid) color tag and never reaches the
+// screen. The Unicode "✓" doesn't collide (it isn't a legal tag character,
+// so tview leaves it as literal text), which is why this only broke in ASCII
+// mode. Escaping unconditionally is what future-proofs it against any glyph.
 func checkbox(on bool) string {
 	if on {
-		return "[green::b][" + Glyph(MarkerOK) + "][-:-:-]"
+		return "[green::b]" + tview.Escape("["+Glyph(MarkerCheckbox)+"]") + "[-:-:-]"
 	}
 	return "[gray][ ][-]"
 }

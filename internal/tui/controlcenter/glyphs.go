@@ -49,6 +49,11 @@ const (
 	MarkerPointer
 	// MarkerThreadReply prefixes a threaded chat reply.
 	MarkerThreadReply
+	// MarkerCheckbox is a compact, bracket-ready checked-state glyph (e.g.
+	// "[" + Glyph(MarkerCheckbox) + "]"). It is distinct from MarkerOK, whose
+	// ASCII form ("OK") reads fine as a word-style prefix ("OK trusted") but
+	// would double the brackets' width against a checkbox's unchecked "[ ]".
+	MarkerCheckbox
 )
 
 // glyphSet is the emoji-capable glyph paired with its ASCII fallback.
@@ -71,6 +76,7 @@ var glyphTable = map[Marker]glyphSet{
 	MarkerArrowBoth:   {emoji: "↔", ascii: "<->"},
 	MarkerPointer:     {emoji: "➜", ascii: "->"},
 	MarkerThreadReply: {emoji: "↳", ascii: "->"},
+	MarkerCheckbox:    {emoji: "✓", ascii: "x"},
 }
 
 // Glyph returns the marker's rune, substituting the ASCII fallback when the
@@ -86,6 +92,24 @@ func Glyph(m Marker) string {
 		return set.ascii
 	}
 	return set.emoji
+}
+
+// PadGlyph right-pads a marker's glyph with spaces to width runes, but ONLY
+// when ASCII fallbacks are active (UseASCIIGlyphs). Every emoji/symbol glyph
+// in glyphTable is exactly one rune wide, so fixed-width table layouts built
+// against them need no padding — but ASCII fallbacks vary in rune length
+// ("OK" vs "X" vs "*"), which silently drifts the columns that follow if
+// nothing compensates. In emoji mode this is a no-op, so it never changes
+// the (already correct) emoji-mode output.
+func PadGlyph(m Marker, width int) string {
+	g := Glyph(m)
+	if !UseASCIIGlyphs() {
+		return g
+	}
+	if n := width - len([]rune(g)); n > 0 {
+		return g + strings.Repeat(" ", n)
+	}
+	return g
 }
 
 // UseASCIIGlyphs reports whether the Control Center should render ASCII

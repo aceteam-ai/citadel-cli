@@ -24,8 +24,9 @@ func TestModulePageLoadSourcesSeedsList(t *testing.T) {
 		t.Fatalf("sourceList has %d items, want 2", got)
 	}
 	primary, _ := p.sourceList.GetItemText(0)
-	if primary != "✓ vllm" {
-		t.Errorf("row 0 primary = %q, want %q (trusted check prefix)", primary, "✓ vllm")
+	want := Glyph(MarkerOK) + " vllm"
+	if primary != want {
+		t.Errorf("row 0 primary = %q, want %q (trusted check prefix)", primary, want)
 	}
 }
 
