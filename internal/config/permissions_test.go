@@ -146,12 +146,12 @@ func TestPasscode_RoundTripsThroughSaveLoad(t *testing.T) {
 // TestIsSensitiveCategory pins the set of passcode-gated surfaces the gateway and
 // listener paths agree on.
 func TestIsSensitiveCategory(t *testing.T) {
-	for _, c := range []string{"console", "desktop", "files"} {
+	for _, c := range []string{"console", "desktop", "files", "shell"} {
 		if !IsSensitiveCategory(c) {
 			t.Errorf("%q should be a sensitive category", c)
 		}
 	}
-	for _, c := range []string{"services", "ssh", "provision", "shell", ""} {
+	for _, c := range []string{"services", "ssh", "provision", ""} {
 		if IsSensitiveCategory(c) {
 			t.Errorf("%q should NOT be a sensitive category", c)
 		}
