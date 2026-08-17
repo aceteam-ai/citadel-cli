@@ -84,6 +84,20 @@ tmux is never assumed to be installed. The binary is resolved in order:
 `~/.citadel/bin/tmux`. When none is found, the server falls back to a bare shell
 (connections still work, but do not persist across reconnects).
 
+The server also falls back to a bare shell — without even trying to resolve a
+tmux binary — when the citadel process itself is already running inside a
+tmux client (`$TMUX` is set in its own environment, e.g. an operator manually
+running `citadel work` from inside their own tmux window). Wrapping a new
+connection in `tmux new-session` on top of that would nest a tmux client
+inside another one on the same node, breaking prefix keys and stacking status
+bars (citadel #751). This nesting avoidance applies ONLY to the AUTO path —
+`CITADEL_TERMINAL_SESSION` (the node's own default) with no explicit request
+from the connecting caller. An explicit `citadel ssh`/`citadel connect --tmux`
+request is a deliberate, informed ask and is honored even inside tmux; only
+the auto-started default backs off. The terminal server logs a distinct
+"already inside a tmux session" note when this happens, so it's diagnosable
+in server logs rather than looking like a missing-binary problem.
+
 Starting a session is decoupled from launching `claude`: the session is just a
 shell. Launching an agent inside it is a separate, explicit step (e.g. sending
 keys to the session once `claude` is installed).

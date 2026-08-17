@@ -5,12 +5,33 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/aceteam-ai/citadel-cli/internal/tmuxinstall"
 )
+
+// tmuxSessionEnvVar is the environment variable tmux sets on every process
+// running inside one of its clients (tmux(1), ENVIRONMENT). Its presence in
+// THIS process's environment means the citadel process itself was launched
+// from inside a tmux session — an operator's own manual `tmux` window, most
+// commonly, since a systemd-managed worker has no controlling terminal at
+// all. Wrapping a new PTY in `tmux new-session` on top of that would nest a
+// tmux client inside another tmux client on the same node: prefix keys
+// collide and status bars stack, which is confusing rather than useful
+// (citadel #751).
+const tmuxSessionEnvVar = "TMUX"
+
+// insideTmux reports whether this process is already running inside a tmux
+// client. It only sees the CITADEL PROCESS's own environment — it has no way
+// to tell whether the remote caller (web console tab, iOS app, `citadel ssh`)
+// is itself inside a tmux session on a different machine, since that
+// environment never reaches the node.
+func insideTmux() bool {
+	return os.Getenv(tmuxSessionEnvVar) != ""
+}
 
 // disableSentinels are case-insensitive values of CITADEL_TERMINAL_SESSION (or
 // Config.SessionName) that explicitly turn persistent tmux backing OFF, forcing
@@ -97,10 +118,23 @@ func sessionNameForUser(base, userID string) string {
 // A SessionName matching a disable sentinel ("none"/"off"/...) returns nil so
 // operators can opt out of persistence without unsetting the default.
 //
+// It also returns nil when this process is already inside a tmux client
+// (insideTmux, citadel #751) AND explicit is false — i.e. the session is
+// being AUTO-started off the node's own configured default, not something the
+// connecting caller asked for. Nesting a new tmux session under one already
+// running is never the right AUTO behavior: prefix keys collide and status
+// bars stack. explicit=true (an operator's own --tmux flag) is a deliberate,
+// informed request, not an auto-start, so it is honored even inside a tmux
+// client — #751 is about not auto-starting a nested tmux, not about
+// second-guessing an explicit ask.
+//
 // The returned command starts only a shell inside tmux; launching claude (or
 // any agent) is a separate explicit step and never coupled here.
-func sessionCommand(sessionName, shell string) []string {
+func sessionCommand(sessionName, shell string, explicit bool) []string {
 	if sessionName == "" || sessionDisabled(sessionName) {
+		return nil
+	}
+	if !explicit && insideTmux() {
 		return nil
 	}
 	if err := tmux.ValidateSessionName(sessionName); err != nil {
@@ -144,6 +178,16 @@ func resolveSessionOverride(configDefault, requestOverride string) (base string,
 // persistent session was asked for at all (by the override or the node
 // default), which is what the caller needs to decide whether the "tmux
 // unavailable" warning applies.
+//
+// overridden (an explicit "session" query param — only the CLI's --tmux path
+// sends one) is threaded into sessionCommand as its explicit flag (citadel
+// #751): an explicit request is honored even when this process is already
+// inside a tmux client, while the plain node-default (auto) path still
+// avoids nesting. Because sessionCommand only ever returns nil for the
+// "already inside tmux" reason on the non-explicit path, and that path never
+// reaches the on-demand install below anyway (gated on overridden), a nil
+// command reaching the install attempt always means a genuinely unresolvable
+// tmux binary — worth an install attempt regardless of insideTmux.
 func resolveSessionCommand(configDefault, requestOverride, userID, shell string, ensureInstall func() bool) (command []string, sessionName string, wantedSession bool) {
 	base, overridden := resolveSessionOverride(configDefault, requestOverride)
 	if sessionDisabled(base) {
@@ -151,10 +195,10 @@ func resolveSessionCommand(configDefault, requestOverride, userID, shell string,
 	}
 
 	sessionName = sessionNameForUser(base, userID)
-	command = sessionCommand(sessionName, shell)
+	command = sessionCommand(sessionName, shell, overridden)
 	if command == nil && overridden && ensureInstall != nil {
 		if ensureInstall() {
-			command = sessionCommand(sessionName, shell)
+			command = sessionCommand(sessionName, shell, overridden)
 		}
 	}
 	return command, sessionName, true

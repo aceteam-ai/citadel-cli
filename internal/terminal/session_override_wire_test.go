@@ -59,7 +59,10 @@ func (c *captureLogger) reset() {
 func TestHandleWebSocket_SessionQueryParamWiring(t *testing.T) {
 	// tmux never resolves, so whether the "tmux unavailable" warning fires
 	// depends ENTIRELY on whether a session was wanted, i.e. on how the
-	// "session" query param was (or wasn't) read.
+	// "session" query param was (or wasn't) read. Isolate from the ambient
+	// test-runner environment (citadel #751): if TMUX happened to be set, the
+	// nesting guard would fire first and log a different message.
+	t.Setenv("TMUX", "")
 	t.Setenv("CITADEL_TMUX_BIN", filepath.Join(t.TempDir(), "missing"))
 
 	const port = 17880
@@ -122,5 +125,115 @@ func TestHandleWebSocket_SessionQueryParamWiring(t *testing.T) {
 	dial("none")
 	if logger.contains("tmux unavailable") {
 		t.Error(`unexpected "tmux unavailable" warning with "?session=none" (override should force a bare shell with nothing to fall back FROM)`)
+	}
+}
+
+// TestHandleWebSocket_InsideTmuxSkipsNesting is the end-to-end counterpart to
+// TestSessionCommand_InsideTmux/TestResolveSessionCommand_InsideTmuxSkipsNesting:
+// with a fully resolvable tmux AND a session wanted, setting TMUX in this
+// process's environment (simulating citadel itself running inside a tmux
+// client) must still fall back to a bare shell and log the distinct nesting
+// message rather than "tmux unavailable" (citadel #751).
+func TestHandleWebSocket_InsideTmuxSkipsNesting(t *testing.T) {
+	makeFakeTmux(t) // tmux IS available; the nesting guard must still win.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+
+	const port = 17881
+	cfg := &Config{
+		Host:           "127.0.0.1",
+		Port:           port,
+		MaxConnections: 10,
+		IdleTimeout:    30 * time.Minute,
+		OrgID:          "org-1",
+		Shell:          "/bin/sh",
+		SessionName:    "citadel", // node default WANTS a persistent session
+		RateLimitRPS:   100,
+		RateLimitBurst: 100,
+	}
+	auth := NewMockTokenValidator()
+	auth.AddValidToken("tok_test", &TokenInfo{UserID: "alice", OrgID: "org-1"})
+
+	s := NewServer(cfg, auth)
+	logger := &captureLogger{}
+	s.logger = logger // same package: internal field access is deliberate here
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Stop(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	u := fmt.Sprintf("ws://127.0.0.1:%d/terminal?token=tok_test", port)
+	conn, resp, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	conn.Close()
+	time.Sleep(150 * time.Millisecond)
+
+	if logger.contains("tmux unavailable") {
+		t.Error(`unexpected "tmux unavailable" warning; tmux resolves fine here, nesting is the reason`)
+	}
+	if !logger.contains("already inside a tmux session") {
+		t.Error(`expected an "already inside a tmux session" note when TMUX is set on the citadel process`)
+	}
+}
+
+// TestHandleWebSocket_ExplicitTmuxHonoredInsideTmux is the end-to-end
+// counterpart to TestSessionCommand_ExplicitHonoredInsideTmux/
+// TestResolveSessionCommand_ExplicitOverrideHonoredInsideTmux (the
+// review-requested fix for citadel #751, PR #769 was BLOCKed for missing
+// this): a connection carrying an EXPLICIT "?session=" override (the CLI's
+// --tmux path) must get a real persistent-session debug log — not the
+// nesting fallback — even though this process is already inside a tmux
+// client. Only the auto/no-override path avoids nesting.
+func TestHandleWebSocket_ExplicitTmuxHonoredInsideTmux(t *testing.T) {
+	makeFakeTmux(t) // tmux IS available.
+	t.Setenv("TMUX", "/tmp/tmux-1000/default,12345,0")
+
+	const port = 17882
+	cfg := &Config{
+		Host:           "127.0.0.1",
+		Port:           port,
+		MaxConnections: 10,
+		IdleTimeout:    30 * time.Minute,
+		OrgID:          "org-1",
+		Shell:          "/bin/sh",
+		SessionName:    "none", // node default is OFF; the explicit override opts back in
+		RateLimitRPS:   100,
+		RateLimitBurst: 100,
+	}
+	auth := NewMockTokenValidator()
+	auth.AddValidToken("tok_test", &TokenInfo{UserID: "alice", OrgID: "org-1"})
+
+	s := NewServer(cfg, auth)
+	logger := &captureLogger{}
+	s.logger = logger // same package: internal field access is deliberate here
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Stop(context.Background())
+	time.Sleep(100 * time.Millisecond)
+
+	u := fmt.Sprintf("ws://127.0.0.1:%d/terminal?token=tok_test&session=citadel", port)
+	conn, resp, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	conn.Close()
+	time.Sleep(150 * time.Millisecond)
+
+	if logger.contains("already inside a tmux session") {
+		t.Error(`unexpected nesting fallback; an explicit --tmux override must be honored even inside tmux`)
+	}
+	if logger.contains("tmux unavailable") {
+		t.Error(`unexpected "tmux unavailable" warning; tmux resolves fine here`)
 	}
 }

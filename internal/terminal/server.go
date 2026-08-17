@@ -595,6 +595,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if wantedSession {
 		if tmuxCommand != nil {
 			s.logger.Debugf("backing session %s with persistent tmux session %q", sessionID, tmuxSessionName)
+		} else if sessionOverride == "" && insideTmux() {
+			// citadel #751: this citadel process is itself already running
+			// inside a tmux client, and this session was AUTO-started off the
+			// node's own default (no explicit "session" override — only the
+			// CLI's --tmux path ever sends one), so sessionCommand refused to
+			// nest a new tmux session under it (nesting breaks prefix keys and
+			// is confusing, not useful). An explicit --tmux request would have
+			// been honored instead (see sessionCommand's explicit parameter)
+			// and landed in the tmuxCommand != nil branch above, so reaching
+			// here with sessionOverride == "" unambiguously means the auto
+			// path. Fall back to a bare shell rather than attempting the
+			// on-demand install, which could never fix this.
+			s.logger.Printf("already inside a tmux session (TMUX is set); session %s uses a bare (non-persistent) shell to avoid nesting tmux-in-tmux", sessionID)
 		} else {
 			// tmux backing is wanted (either the node default, citadel #585, or
 			// an explicit --tmux override) but no usable tmux binary resolved,
