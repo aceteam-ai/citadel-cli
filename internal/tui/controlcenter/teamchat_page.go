@@ -785,7 +785,7 @@ func formatTeamChatMessage(msg teamchat.Message) string {
 
 	thread := ""
 	if msg.ParentMessageID != nil && *msg.ParentMessageID != "" {
-		thread = "↳ "
+		thread = Glyph(MarkerThreadReply) + " "
 	}
 
 	body := strings.TrimSpace(msg.Content)

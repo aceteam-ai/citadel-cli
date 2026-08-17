@@ -358,9 +358,9 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString(fmt.Sprintf("   %s [white::b]Mouse control[-:-:-]            Click tabs, peers, and Send instead of memorizing keys.\n", checkbox(mouseEnabled)))
 	sb.WriteString("                                Tradeoff: your terminal's drag-to-copy stops working while\n")
 	sb.WriteString("                                this is on. To copy anyway, hold:\n")
-	sb.WriteString("                                  [white]• Shift[-]        (most terminals)\n")
-	sb.WriteString("                                  [white]• Fn[-]           (macOS Terminal.app)\n")
-	sb.WriteString("                                  [white]• Option[-]        (iTerm2)\n")
+	sb.WriteString(fmt.Sprintf("                                  [white]%s Shift[-]        (most terminals)\n", Glyph(MarkerBullet)))
+	sb.WriteString(fmt.Sprintf("                                  [white]%s Fn[-]           (macOS Terminal.app)\n", Glyph(MarkerBullet)))
+	sb.WriteString(fmt.Sprintf("                                  [white]%s Option[-]        (iTerm2)\n", Glyph(MarkerBullet)))
 	sb.WriteString("   [gray]press[-] [yellow::b]1[-:-:-] [gray]to toggle (applies immediately)[-]\n\n")
 
 	// Checkbox 2: Fullscreen rendering.
@@ -444,9 +444,17 @@ func (p *SettingsPage) connectionStatus() (string, ConnState) {
 
 // checkbox renders a colored checkbox glyph for a boolean setting: a green
 // checkmark when on, a dim empty box when off.
+//
+// The bracketed glyph is run through tview.Escape (citadel #656 CI follow-up):
+// tview's style-tag parser accepts any letters/digits as tag content, so a
+// bare "[x]" — the ASCII fallback's checked glyph — is silently swallowed as
+// a (meaningless but syntactically valid) color tag and never reaches the
+// screen. The Unicode "✓" doesn't collide (it isn't a legal tag character,
+// so tview leaves it as literal text), which is why this only broke in ASCII
+// mode. Escaping unconditionally is what future-proofs it against any glyph.
 func checkbox(on bool) string {
 	if on {
-		return "[green::b][✓][-:-:-]"
+		return "[green::b]" + tview.Escape("["+Glyph(MarkerCheckbox)+"]") + "[-:-:-]"
 	}
 	return "[gray][ ][-]"
 }
@@ -455,11 +463,11 @@ func checkbox(on bool) string {
 func connStateLabel(state ConnState) string {
 	switch state {
 	case ConnConnected:
-		return "[green::b]● connected[-:-:-]"
+		return "[green::b]" + Glyph(MarkerActive) + " connected[-:-:-]"
 	case ConnConnecting:
-		return "[yellow::b]◐ connecting[-:-:-]"
+		return "[yellow::b]" + Glyph(MarkerConnecting) + " connecting[-:-:-]"
 	default:
-		return "[red::b]○ disconnected[-:-:-]"
+		return "[red::b]" + Glyph(MarkerInactive) + " disconnected[-:-:-]"
 	}
 }
 

@@ -195,7 +195,7 @@ func (p *ModulePage) loadSources() {
 	for _, s := range srcs {
 		primary := s.Name
 		if s.Trusted {
-			primary = "✓ " + primary
+			primary = Glyph(MarkerOK) + " " + primary
 		}
 		secondary := s.Description
 		sel := s // capture
@@ -546,7 +546,7 @@ func (p *ModulePage) render() {
 	var sb strings.Builder
 	sb.WriteString("\n [yellow::b]Install a service module[-:-:-]\n\n")
 	sb.WriteString(" [gray]Pick a known module on the left (Enter), or type a[-]\n")
-	sb.WriteString(" [gray]source in the form. Tab moves list ↔ form ↔ tabs.[-]\n\n")
+	sb.WriteString(fmt.Sprintf(" [gray]source in the form. Tab moves list %s form %s tabs.[-]\n\n", Glyph(MarkerArrowBoth), Glyph(MarkerArrowBoth)))
 	sb.WriteString(" Install a module from any standardized repo.\n")
 	sb.WriteString(" [gray]A module repo self-describes via citadel/service.yaml[-]\n")
 	sb.WriteString(" [gray]+ citadel/compose.yml. Sources:[-]\n")
@@ -568,9 +568,9 @@ func (p *ModulePage) render() {
 
 		// Trust banner.
 		if res.Trusted {
-			sb.WriteString("   Source: [green]✓ trusted[-]\n")
+			sb.WriteString(fmt.Sprintf("   Source: [green]%s trusted[-]\n", Glyph(MarkerOK)))
 		} else {
-			sb.WriteString("   Source: [yellow]⚠ UNTRUSTED[-]\n")
+			sb.WriteString(fmt.Sprintf("   Source: [yellow]%s UNTRUSTED[-]\n", Glyph(MarkerWarn)))
 			sb.WriteString("   [yellow]Installs & runs an arbitrary container with[-]\n")
 			sb.WriteString("   [yellow]Docker-level (host root) access on this node.[-]\n")
 		}

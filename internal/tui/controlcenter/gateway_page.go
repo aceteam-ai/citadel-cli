@@ -163,9 +163,9 @@ func (g *GatewayPage) updateStatus() {
 	g.mu.Unlock()
 
 	if s.TotalRequests > 0 {
-		g.statusView.SetText(" [green::b]Gateway[-:-:-]                    [green]● Active[-]")
+		g.statusView.SetText(fmt.Sprintf(" [green::b]Gateway[-:-:-]                    [green]%s Active[-]", Glyph(MarkerActive)))
 	} else {
-		g.statusView.SetText(" [yellow::b]Gateway[-:-:-]                    [gray]○ No activity[-]")
+		g.statusView.SetText(fmt.Sprintf(" [yellow::b]Gateway[-:-:-]                    [gray]%s No activity[-]", Glyph(MarkerInactive)))
 	}
 }
 

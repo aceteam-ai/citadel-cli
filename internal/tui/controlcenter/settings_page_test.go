@@ -289,9 +289,9 @@ func TestSettingsRender_MouseAndRenderingCopy(t *testing.T) {
 		"Click tabs, peers, and Send instead of memorizing keys.",
 		"Tradeoff: your terminal's drag-to-copy stops working while",
 		"this is on. To copy anyway, hold:",
-		"• Shift        (most terminals)",
-		"• Fn           (macOS Terminal.app)",
-		"• Option        (iTerm2)",
+		Glyph(MarkerBullet) + " Shift        (most terminals)",
+		Glyph(MarkerBullet) + " Fn           (macOS Terminal.app)",
+		Glyph(MarkerBullet) + " Option        (iTerm2)",
 		"Fullscreen rendering",
 		"Flicker-free, app-like. Off = output goes to normal",
 		"scrollback (easier to scroll + copy long history).",
@@ -318,7 +318,7 @@ func TestSettingsRender_CheckboxReflectsState(t *testing.T) {
 
 	got := p.view.GetText(true)
 	// Mouse on -> checked; Fullscreen off -> unchecked. Both rows must be present.
-	if !strings.Contains(got, "[✓] Mouse control") {
+	if !strings.Contains(got, "["+Glyph(MarkerCheckbox)+"] Mouse control") {
 		t.Errorf("expected checked Mouse control row, got:\n%s", got)
 	}
 	if !strings.Contains(got, "[ ] Fullscreen rendering") {

@@ -1048,7 +1048,7 @@ func (cc *ControlCenter) buildUI() {
 	header := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	header.SetText(fmt.Sprintf("\n[::b]⚡ CITADEL CONTROL CENTER[::-] [gray]%s[-]", cc.data.Version))
+	header.SetText(fmt.Sprintf("\n[::b]%s CITADEL CONTROL CENTER[::-] [gray]%s[-]", Glyph(MarkerBolt), cc.data.Version))
 
 	// Node info panel
 	cc.nodePanel = tview.NewTextView().
@@ -1798,14 +1798,16 @@ func (cc *ControlCenter) showQuitConfirm() {
 Citadel is installed as a system service and will continue running in the background.`
 		buttons = []string{"Cancel", "Exit"}
 	} else {
-		warningText = `⚠️  Are you sure you want to exit?
+		bullet := Glyph(MarkerBullet)
+		warningText = fmt.Sprintf(`%s  Are you sure you want to exit?
 
 If you quit:
-• Your services will no longer be accessible on the network
-• Other nodes won't be able to connect to this machine
-• Jobs won't be processed on this node
+%s Your services will no longer be accessible on the network
+%s Other nodes won't be able to connect to this machine
+%s Jobs won't be processed on this node
 
-To keep Citadel running in the background, install it as a system service.`
+To keep Citadel running in the background, install it as a system service.`,
+			Glyph(MarkerWarn), bullet, bullet, bullet)
 		buttons = []string{"Cancel", "Install Service", "Exit Anyway"}
 	}
 
@@ -1867,11 +1869,11 @@ func isWindows() bool {
 }
 
 func (cc *ControlCenter) showHelpModal() {
-	helpText := `[yellow::b]Citadel Control Center[-:-:-]
+	helpText := fmt.Sprintf(`[yellow::b]Citadel Control Center[-:-:-]
 
 [yellow]Navigation (nothing to memorize):[-]
   [white::b]Tab[-:-:-] / [white::b]Shift+Tab[-:-:-]  Move through panes, then on to the next/prev tab
-  [white::b]↑/↓[-:-:-] or [white::b]j/k[-:-:-]   Navigate within the focused pane
+  [white::b]%s/%s[-:-:-] or [white::b]j/k[-:-:-]   Navigate within the focused pane
   [white::b]Enter[-:-:-]         Details / toggle service / connect to peer
   [white::b]Alt+1..N[-:-:-]      Jump straight to a tab (optional shortcut)
 
@@ -1903,7 +1905,7 @@ func (cc *ControlCenter) showHelpModal() {
   (Fn on macOS Terminal, Option in iTerm2) to select text, or
   turn mouse off in Settings (Alt tab) / launch with --no-mouse.[-]
 
-[gray]Press any key to close[-]`
+[gray]Press any key to close[-]`, Glyph(MarkerArrowUp), Glyph(MarkerArrowDown))
 
 	cc.inModal = true
 
@@ -1943,9 +1945,9 @@ type actionDef struct {
 }
 
 func (cc *ControlCenter) getActions() []actionDef {
-	connectAction := actionDef{key: "0", name: "Connect", desc: "[gray]○ Offline[-]", fn: cc.showNetworkModal}
+	connectAction := actionDef{key: "0", name: "Connect", desc: "[gray]" + Glyph(MarkerInactive) + " Offline[-]", fn: cc.showNetworkModal}
 	if cc.data.Connected {
-		connectAction = actionDef{key: "0", name: "Disconnect", desc: "[green]● Connected[-]", fn: cc.showNetworkModal}
+		connectAction = actionDef{key: "0", name: "Disconnect", desc: "[green]" + Glyph(MarkerActive) + " Connected[-]", fn: cc.showNetworkModal}
 	}
 
 	svcDesc := "[gray]Built-in + add[-]"
@@ -2003,10 +2005,10 @@ func (cc *ControlCenter) updateNodePanel() {
 		nodeName = "unknown"
 	}
 
-	statusIcon := "[red]●[-]"
+	statusIcon := "[red]" + Glyph(MarkerActive) + "[-]"
 	statusText := "OFFLINE"
 	if cc.data.Connected {
-		statusIcon = "[green]●[-]"
+		statusIcon = "[green]" + Glyph(MarkerActive) + "[-]"
 		statusText = "ONLINE"
 	}
 
@@ -2049,9 +2051,9 @@ func (cc *ControlCenter) updateNodePanel() {
 	// affordances may be unavailable on this node (e.g. headless/SSH session).
 	if d := cc.desktopInfo(); d != nil {
 		if d.HasDesktop {
-			sb.WriteString(" [yellow]Desktop:[-] [green]●[-] available\n")
+			sb.WriteString(fmt.Sprintf(" [yellow]Desktop:[-] [green]%s[-] available\n", Glyph(MarkerActive)))
 		} else {
-			sb.WriteString(fmt.Sprintf(" [yellow]Desktop:[-] [gray]○ unavailable (%s) — VNC/screenshot disabled[-]\n", d.Reason))
+			sb.WriteString(fmt.Sprintf(" [yellow]Desktop:[-] [gray]%s unavailable (%s) — VNC/screenshot disabled[-]\n", Glyph(MarkerInactive), d.Reason))
 		}
 	}
 
@@ -2074,9 +2076,9 @@ func (cc *ControlCenter) updateNodePanel() {
 		} else {
 			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
 		}
-		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]●[-] %s", agoStr))
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]%s[-] %s", Glyph(MarkerActive), agoStr))
 	} else if cc.data.WorkerRunning {
-		sb.WriteString(" [yellow]Heartbeat:[-] [gray]○[-] starting...")
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [gray]%s[-] starting...", Glyph(MarkerInactive)))
 	}
 
 	cc.nodePanel.SetText(sb.String())
@@ -2159,11 +2161,11 @@ func (cc *ControlCenter) updateServicesView() {
 		var statusCell string
 		switch svc.Status {
 		case "running":
-			statusCell = "[green]● running[-]"
+			statusCell = "[green]" + Glyph(MarkerActive) + " running[-]"
 		case "stopped":
-			statusCell = "[gray]○ stopped[-]"
+			statusCell = "[gray]" + Glyph(MarkerInactive) + " stopped[-]"
 		case "error":
-			statusCell = "[red]✗ error[-]"
+			statusCell = "[red]" + Glyph(MarkerError) + " error[-]"
 		default:
 			statusCell = "[yellow]? " + svc.Status + "[-]"
 		}
@@ -2187,11 +2189,11 @@ func (cc *ControlCenter) updateServicesView() {
 		if hasOverride {
 			switch override.status {
 			case "starting":
-				statusCell = "[yellow]● starting[-]"
+				statusCell = "[yellow]" + Glyph(MarkerActive) + " starting[-]"
 			case "stopping":
-				statusCell = "[yellow]○ stopping[-]"
+				statusCell = "[yellow]" + Glyph(MarkerInactive) + " stopping[-]"
 			case "failed":
-				statusCell = "[red]✗ failed[-]"
+				statusCell = "[red]" + Glyph(MarkerError) + " failed[-]"
 			}
 		}
 
@@ -2248,7 +2250,7 @@ func (cc *ControlCenter) updateServicesView() {
 				desc = "port"
 			}
 			cc.servicesView.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf(" :%d", fwd.LocalPort)).SetSelectable(true))
-			cc.servicesView.SetCell(row, 1, tview.NewTableCell("[cyan]● exposed[-]").SetSelectable(true))
+			cc.servicesView.SetCell(row, 1, tview.NewTableCell("[cyan]"+Glyph(MarkerActive)+" exposed[-]").SetSelectable(true))
 			cc.servicesView.SetCell(row, 2, tview.NewTableCell("").SetSelectable(true))
 			cc.servicesView.SetCell(row, 3, tview.NewTableCell("").SetSelectable(true))
 			cc.servicesView.SetCell(row, 4, tview.NewTableCell("[gray]"+desc+"[-]").SetSelectable(true))
@@ -2272,9 +2274,9 @@ func (cc *ControlCenter) updateJobsPanel() {
 
 	// Worker status - prominent at top
 	if cc.data.WorkerRunning {
-		sb.WriteString(" [green::b]● WORKER ACTIVE[-:-:-]\n")
+		sb.WriteString(fmt.Sprintf(" [green::b]%s WORKER ACTIVE[-:-:-]\n", Glyph(MarkerActive)))
 	} else {
-		sb.WriteString(" [gray]○ Worker stopped[-]\n")
+		sb.WriteString(fmt.Sprintf(" [gray]%s Worker stopped[-]\n", Glyph(MarkerInactive)))
 	}
 
 	// Queue subscription - compact
@@ -2303,11 +2305,11 @@ func (cc *ControlCenter) updateJobsPanel() {
 			if i >= 3 {
 				break
 			}
-			statusIcon := "[green]✓[-]"
+			statusIcon := "[green]" + Glyph(MarkerOK) + "[-]"
 			if job.Status == "failed" {
-				statusIcon = "[red]✗[-]"
+				statusIcon = "[red]" + Glyph(MarkerError) + "[-]"
 			} else if job.Status == "processing" {
-				statusIcon = "[cyan]●[-]"
+				statusIcon = "[cyan]" + Glyph(MarkerActive) + "[-]"
 			}
 			sb.WriteString(fmt.Sprintf(" %s %s [gray]%s[-]\n", statusIcon, job.Type, formatDurationCompact(job.Duration)))
 		}
@@ -2365,10 +2367,10 @@ func (cc *ControlCenter) updatePeersView() {
 		row := i + 1 // Start after header
 
 		// Status icon
-		icon := "[gray]○[-]"
+		icon := "[gray]" + Glyph(MarkerInactive) + "[-]"
 		statusText := "[gray]offline[-]"
 		if peer.Online {
-			icon = "[green]●[-]"
+			icon = "[green]" + Glyph(MarkerActive) + "[-]"
 			statusText = "[green]online[-]"
 		}
 
@@ -2403,20 +2405,20 @@ func (cc *ControlCenter) updateActivityView() {
 		timeStr := entry.Time.Format("15:04:05")
 
 		color := "white"
-		icon := "•"
+		icon := Glyph(MarkerBullet)
 		switch entry.Level {
 		case "success":
 			color = "green"
-			icon = "✓"
+			icon = Glyph(MarkerOK)
 		case "warning":
 			color = "yellow"
-			icon = "⚠"
+			icon = Glyph(MarkerWarn)
 		case "error":
 			color = "red"
-			icon = "✗"
+			icon = Glyph(MarkerError)
 		case "info":
 			color = "gray"
-			icon = "•"
+			icon = Glyph(MarkerBullet)
 		}
 
 		sb.WriteString(fmt.Sprintf(" [gray]%s[-] [%s]%s[-] %s\n", timeStr, color, icon, entry.Message))
@@ -2440,16 +2442,17 @@ func (cc *ControlCenter) updateHelpBar() {
 		svcName := cc.getSelectedServiceName()
 		svcStatus := cc.getSelectedServiceStatus()
 		if svcName != "" {
-			statusIcon := "[gray]○[-]"
+			statusIcon := "[gray]" + Glyph(MarkerInactive) + "[-]"
 			action := "start"
 			if svcStatus == "running" {
-				statusIcon = "[green]●[-]"
+				statusIcon = "[green]" + Glyph(MarkerActive) + "[-]"
 				action = "stop"
 			}
 			set(fmt.Sprintf("[white::b]%s[-:-:-] %s  │  [yellow::b]Enter[-:-:-] %s  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help",
 				svcName, statusIcon, action))
 		} else {
-			set("[yellow::b]↑/↓[-:-:-] select  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
+			set(fmt.Sprintf("[yellow::b]%s/%s[-:-:-] select  │  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]0-3[-:-:-] actions  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
+				Glyph(MarkerArrowUp), Glyph(MarkerArrowDown)))
 		}
 	case paneActions:
 		row, _ := cc.actionsView.GetSelection()
@@ -2459,7 +2462,8 @@ func (cc *ControlCenter) updateHelpBar() {
 			set(fmt.Sprintf("[yellow::b]%s[-:-:-] [white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit",
 				action.key, action.name))
 		} else {
-			set("[yellow::b]↑/↓[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
+			set(fmt.Sprintf("[yellow::b]%s/%s[-:-:-] select action  │  [yellow::b]Enter[-:-:-] execute  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help",
+				Glyph(MarkerArrowUp), Glyph(MarkerArrowDown)))
 		}
 	case panePeers:
 		if len(cc.data.Peers) > 0 {
@@ -2469,13 +2473,15 @@ func (cc *ControlCenter) updateHelpBar() {
 				set(fmt.Sprintf("[white::b]%s[-:-:-]  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]p[-:-:-] ping  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help",
 					peer.Hostname))
 			} else {
-				set("[yellow::b]↑/↓[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
+				set(fmt.Sprintf("[yellow::b]%s/%s[-:-:-] select peer  │  [yellow::b]Enter[-:-:-] view peers  [yellow::b]a[-:-:-] ping all  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help",
+					Glyph(MarkerArrowUp), Glyph(MarkerArrowDown)))
 			}
 		} else {
 			set("[yellow::b]Tab[-:-:-] pane/tab  │  [yellow::b]0[-:-:-] connect  [yellow::b]?[-:-:-] help  [yellow::b]q[-:-:-] quit")
 		}
 	case paneActivity:
-		set("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]↑/↓[-:-:-] scroll  [yellow::b]End[-:-:-] latest  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help")
+		set(fmt.Sprintf("[yellow::b]Enter[-:-:-] full screen  │  [yellow::b]l[-:-:-] copy logs  [yellow::b]%s/%s[-:-:-] scroll  [yellow::b]End[-:-:-] latest  [yellow::b]Tab[-:-:-] pane/tab  [yellow::b]?[-:-:-] help",
+			Glyph(MarkerArrowUp), Glyph(MarkerArrowDown)))
 	}
 
 	// When mouse is on, advertise it so the click affordances are discoverable
@@ -2958,20 +2964,20 @@ func (cc *ControlCenter) showActivityFullScreen() {
 			timeStr := entry.Time.Format("15:04:05")
 
 			color := "white"
-			icon := "•"
+			icon := Glyph(MarkerBullet)
 			switch entry.Level {
 			case "success":
 				color = "green"
-				icon = "✓"
+				icon = Glyph(MarkerOK)
 			case "warning":
 				color = "yellow"
-				icon = "⚠"
+				icon = Glyph(MarkerWarn)
 			case "error":
 				color = "red"
-				icon = "✗"
+				icon = Glyph(MarkerError)
 			case "info":
 				color = "gray"
-				icon = "•"
+				icon = Glyph(MarkerBullet)
 			}
 
 			sb.WriteString(fmt.Sprintf("[gray]%s[-] [%s]%s[-] %s\n", timeStr, color, icon, entry.Message))
