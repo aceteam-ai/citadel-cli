@@ -363,6 +363,20 @@ func (c *Client) isNewerVersion(newVersion string) (bool, error) {
 	return IsNewerVersion(c.CurrentVersion, newVersion)
 }
 
+// IsInsideAppBundle reports whether path lives inside a macOS .app bundle's
+// Contents/MacOS directory (e.g. .../Citadel.app/Contents/MacOS/citadel).
+// ApplyUpdate uses this to refuse an in-place binary swap that would
+// invalidate the bundle's code signature (citadel#672/#670) — see the comment
+// there for why. A plain string check is deliberate: it needs no filesystem
+// access, works identically for a bundle that hasn't been code-signed yet
+// (e.g. mid-build), and doesn't care whether the path has been through
+// EvalSymlinks already (GetCurrentBinaryPath does that upstream, but nothing
+// here depends on it).
+func IsInsideAppBundle(path string) bool {
+	return strings.Contains(path, ".app/Contents/MacOS/") ||
+		strings.Contains(path, ".app\\Contents\\MacOS\\")
+}
+
 // IsTruthy reports whether an environment-variable value should be treated as
 // "on". It mirrors the truthy set already used by resolveAutoUpdateEnabled
 // ("1"/"true"/"yes"/"on") and is case- and whitespace-insensitive. Used by the

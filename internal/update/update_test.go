@@ -165,6 +165,28 @@ func TestIsTruthy(t *testing.T) {
 	}
 }
 
+func TestIsInsideAppBundle(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"/Applications/Citadel.app/Contents/MacOS/citadel", true},
+		{"/Users/jane/Applications/Citadel.app/Contents/MacOS/citadel", true},
+		{`C:\Program Files\Citadel.app\Contents\MacOS\citadel`, true},
+		{"/usr/local/bin/citadel", false},
+		{"/home/jane/.citadel-cli/citadel", false},
+		{"", false},
+		// A path that merely mentions ".app" without the bundle-interior
+		// shape must not false-positive.
+		{"/Users/jane/my.app.notes/citadel", false},
+	}
+	for _, tt := range tests {
+		if got := IsInsideAppBundle(tt.in); got != tt.want {
+			t.Errorf("IsInsideAppBundle(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestIsReleaseVersion(t *testing.T) {
 	tests := []struct {
 		in   string
