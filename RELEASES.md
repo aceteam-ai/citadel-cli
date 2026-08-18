@@ -1611,3 +1611,26 @@ Auto-generated log of every release.
   - fix(reconcile): keep reporting actual state when the full-wipe guard refuses (#737)
 
 
+---
+
+## v2.108.0 — 2026-08-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 9 |
+| Files changed | 55 |
+| Lines added | +2673 |
+
+**Changes:**
+
+  - tui: add ASCII fallback for Control Center status glyphs (#774)
+  - fix: detect missing/unlinked docker and surface an actionable hint (#773)
+  - fix: reverse Activity Log pane order and pin to bottom (#770)
+  - terminal: skip auto-tmux wrapping when citadel is already inside tmux (#751) (#769)
+  - feat: surface heartbeat freshness in citadel status (#726) (#775)
+  - fix(terminal): serialize websocket writes with a dedicated mutex (#771)
+  - passcode: include Shell in the no-passcode warning (#763) (#772)
+  - test: skip live-poppler rasterize tests when pdftoppm is present but unusable (#768)
+  - chore: sync generated files after v2.107.0 release
+
+
