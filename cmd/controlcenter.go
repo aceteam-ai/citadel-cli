@@ -1969,7 +1969,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					LogFn:           activity, // Route logs through TUI
 				}, collector); err == nil {
 					// Include current permissions in heartbeat
-					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
 
 					// Fabric Pulse stats collector (citadel-cli#587), same wiring
 					// as runWork: cached GPU + inference internals attached to

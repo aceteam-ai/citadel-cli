@@ -1656,7 +1656,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
 				} else {
 					// Include current permissions in heartbeat
-					apiPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 					}
@@ -1693,7 +1693,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
 			} else {
 				// Include current permissions in heartbeat
-				redisPublisher.SetPermissions(permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir())))
+				redisPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
 				if autoStop != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 				}
@@ -2886,13 +2886,30 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 		return nil
 	}
 	return &heartbeat.PermissionState{
-		Console:  p.Console,
-		Desktop:  p.Desktop,
-		Files:    p.Files,
-		Services: p.Services,
-		SSH:      p.SSH,
-		Shell:    p.Shell,
+		Console:     p.Console,
+		Desktop:     p.Desktop,
+		Files:       p.Files,
+		Services:    p.Services,
+		SSH:         p.SSH,
+		Shell:       p.Shell,
+		HasPasscode: p.HasPasscode(),
 	}
+}
+
+// currentPermissionsForHeartbeat re-reads permissions.yaml from disk and
+// converts it to the heartbeat wire format. It is registered as a heartbeat
+// permissions PROVIDER (heartbeat.RedisPublisher/APIPublisher's
+// SetPermissionsProvider), called fresh on every ~30s heartbeat, rather than
+// converted once at startup and cached — permissions.yaml (including the
+// node passcode, citadel #758) can change out from under a running worker via
+// `citadel passcode set`/`clear`, the Control Center, or APPLY_DEVICE_CONFIG,
+// all of which are separate write paths from this one. A stale one-shot
+// snapshot would silently reintroduce the exact staleness citadel #758 exists
+// to remove. config.LoadPermissions is a small YAML file read (the same cost
+// every passcode/permission enforcement path already pays per request), so
+// re-reading every heartbeat is cheap.
+func currentPermissionsForHeartbeat() *heartbeat.PermissionState {
+	return permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir()))
 }
 
 // ensureManagedTmux best-effort provisions a Citadel-managed tmux binary so the
