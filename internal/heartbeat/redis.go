@@ -57,6 +57,16 @@ type PermissionState struct {
 	Services bool `json:"services"`
 	SSH      bool `json:"ssh"`
 	Shell    bool `json:"shell"`
+
+	// HasPasscode reports whether the node currently has a passcode set
+	// (config.Permissions.HasPasscode), NOT the hash or plaintext itself
+	// (citadel #758). Without this, a remote controller (dashboard/MCP) can
+	// only infer "is a passcode set" from its own dispatch history, which
+	// goes stale the moment a passcode is set/cleared directly on the node
+	// (`citadel passcode set`, #755) or out of band. No omitempty: false is
+	// the meaningful "not set" state, not an absent field — same as the
+	// other capability bools in this struct.
+	HasPasscode bool `json:"has_passcode"`
 }
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.
@@ -83,8 +93,14 @@ type RedisPublisher struct {
 	logFn func(level, msg string)
 
 	// permissions is included in heartbeats so the web UI knows which capabilities
-	// the operator has enabled. Set via SetPermissions.
+	// the operator has enabled. Set via SetPermissions (a one-time snapshot) or,
+	// preferably, SetPermissionsProvider (re-read every publish). See
+	// SetPermissionsProvider for why the snapshot form goes stale.
 	permissions *PermissionState
+
+	// permissionsFn, when set, is called fresh on every publish instead of
+	// reading the static permissions snapshot above. See SetPermissionsProvider.
+	permissionsFn func() *PermissionState
 
 	// heartbeatCount tracks heartbeats to trigger keep-alive every 60s
 	heartbeatCount int
@@ -302,7 +318,7 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		HeadscaleNodeID: p.headscaleNodeID,
 		DeviceCode:      deviceCode,
 		Status:          nodeStatus,
-		Permissions:     p.permissions,
+		Permissions:     p.currentPermissions(),
 	}
 	if p.statsFn != nil {
 		msg.Stats = p.statsFn()
@@ -438,9 +454,38 @@ func (p *RedisPublisher) StreamName() string {
 	return p.streamName
 }
 
-// SetPermissions updates the permission state included in heartbeats.
+// SetPermissions updates the permission state included in heartbeats as a
+// one-time snapshot. Prefer SetPermissionsProvider: a snapshot never reflects
+// a permission (or the node passcode) changed after this call, e.g. by
+// `citadel passcode set`/`clear` run in a separate process, or a Control
+// Center edit, while this worker keeps running (citadel #758).
 func (p *RedisPublisher) SetPermissions(perms *PermissionState) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.permissions = perms
+}
+
+// SetPermissionsProvider registers a function re-read on every publish
+// instead of a static snapshot, so heartbeats reflect the CURRENT permissions
+// state (including HasPasscode) rather than whatever was set at worker
+// startup. Mirrors SetStatsProvider's cache-read contract: fn must be cheap
+// and non-blocking (config.LoadPermissions is a small YAML file read) and may
+// return nil.
+func (p *RedisPublisher) SetPermissionsProvider(fn func() *PermissionState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.permissionsFn = fn
+}
+
+// currentPermissions resolves the permissions to attach to this heartbeat:
+// the live provider if one is registered, else the static snapshot.
+func (p *RedisPublisher) currentPermissions() *PermissionState {
+	p.mu.RLock()
+	fn := p.permissionsFn
+	static := p.permissions
+	p.mu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	return static
 }

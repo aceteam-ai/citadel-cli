@@ -41,8 +41,14 @@ type APIPublisher struct {
 	streamName    string // format: node:status:stream
 
 	// permissions is included in heartbeats so the web UI knows which capabilities
-	// the operator has enabled. Set via SetPermissions.
+	// the operator has enabled. Set via SetPermissions (a one-time snapshot) or,
+	// preferably, SetPermissionsProvider (re-read every publish). See
+	// SetPermissionsProvider for why the snapshot form goes stale.
 	permissions *PermissionState
+
+	// permissionsFn, when set, is called fresh on every publish instead of
+	// reading the static permissions snapshot above. See SetPermissionsProvider.
+	permissionsFn func() *PermissionState
 
 	// Debug callback (optional)
 	debugFunc func(format string, args ...any)
@@ -238,7 +244,7 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		NodeID:          p.nodeID,
 		HeadscaleNodeID: p.headscaleNodeID,
 		Status:          nodeStatus,
-		Permissions:     p.permissions,
+		Permissions:     p.currentPermissions(),
 	}
 	if p.statsFn != nil {
 		msg.Stats = p.statsFn()
@@ -356,7 +362,30 @@ func (p *APIPublisher) StreamName() string {
 	return p.streamName
 }
 
-// SetPermissions updates the permission state included in heartbeats.
+// SetPermissions updates the permission state included in heartbeats as a
+// one-time snapshot. Prefer SetPermissionsProvider: a snapshot never reflects
+// a permission (or the node passcode) changed after this call, e.g. by
+// `citadel passcode set`/`clear` run in a separate process, or a Control
+// Center edit, while this worker keeps running (citadel #758).
 func (p *APIPublisher) SetPermissions(perms *PermissionState) {
 	p.permissions = perms
+}
+
+// SetPermissionsProvider registers a function re-read on every publish
+// instead of a static snapshot, so heartbeats reflect the CURRENT permissions
+// state (including HasPasscode) rather than whatever was set at worker
+// startup. Mirrors SetStatsProvider's cache-read contract: fn must be cheap
+// and non-blocking (config.LoadPermissions is a small YAML file read) and may
+// return nil.
+func (p *APIPublisher) SetPermissionsProvider(fn func() *PermissionState) {
+	p.permissionsFn = fn
+}
+
+// currentPermissions resolves the permissions to attach to this heartbeat:
+// the live provider if one is registered, else the static snapshot.
+func (p *APIPublisher) currentPermissions() *PermissionState {
+	if p.permissionsFn != nil {
+		return p.permissionsFn()
+	}
+	return p.permissions
 }
