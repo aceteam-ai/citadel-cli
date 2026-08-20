@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>
+<!--
+Hardened runtime (codesign --options runtime, citadel#672) blocks a process
+from sending Apple Events to other apps unless this entitlement is present --
+independent of App Sandbox, which this bundle does not use.
+packaging/macos/citadel-launcher drives Terminal.app via `osascript` to open a
+window and run the CLI; that is the bundle's only current use of Apple Events,
+and it silently breaks the moment hardened runtime signing lands without this
+entry.
+
+NOTE: this comment must stay AFTER the closing </plist> tag. codesign's
+entitlements parser (AMFIUnserializeXML) is stricter than plutil/libxml: a
+comment placed before <plist>, or nested inside <dict>, both pass
+`plutil -lint` but make codesign fail with "AMFIUnserializeXML: syntax error"
+at sign time. Verified empirically while wiring this file in -- there is no
+public Apple documentation of the restriction. Only a trailing comment, after
+</plist>, is safe.
+-->
