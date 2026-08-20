@@ -8,15 +8,19 @@
 // then hand off to the SAME platform-agnostic record → transcribe path. Nothing
 // past admission is Teams-specific.
 //
-// ⚠️ EVERY SELECTOR / JS SNIPPET BELOW IS UNVERIFIED (best-guess). Unlike the
-// Meet flow — whose interstitial + host auto-admit path were confirmed against a
-// live call on 2026-07-11 — the Teams web DOM here has NOT been exercised against
-// a real Teams meeting. Teams renders its pre-join and in-call UI inside a heavy,
-// frequently-changing Fluent UI app; the class names, data-tid values, and button
-// labels WILL need live tuning against a real meeting before this can be trusted.
-// The statically-verifiable parts (URL → platform detection, passcode extraction)
-// live in meeting_join.go and are unit-tested; this file is the part a human must
-// tune. Everything is kept in this one file so tuning is a single-file edit.
+// The selectors / JS snippets below were VERIFIED against a real, live Teams
+// meeting on 2026-08-01 (light-meetings anonymous web join, driven through the
+// meeting-service container on node 1297) — see the VERIFIED block below for the
+// captured DOM shapes and exactly what was and was not exercised (e.g. the
+// mic/cam-off toggles could not be tested on a device-less container). Teams
+// renders its pre-join and in-call UI inside a heavy, frequently-changing Fluent
+// UI app, so a future Teams UI change can still drift these constants — if the
+// join flow starts failing, re-run the live-tuning harness
+// (internal/platform/teams_livetune_test.go) against a real meeting rather than
+// assuming they are still correct. The statically-verifiable parts (URL →
+// platform detection, passcode extraction) live in meeting_join.go and are
+// unit-tested; this file is the part a human must tune. Everything is kept in
+// this one file so tuning is a single-file edit.
 package jobs
 
 import (

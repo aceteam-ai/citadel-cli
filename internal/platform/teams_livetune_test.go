@@ -4,8 +4,8 @@ package platform
 // (citadel #660 / aceteam #7000). NOT a unit test: it is env-gated on
 // TEAMS_LIVE_URL and drives the running meeting-service container's Chromium
 // (published CDP port, default host 8208) against a REAL Teams meeting so a human
-// can read off the true pre-join selectors that meeting_join_teams.go's constants
-// only best-guess.
+// can confirm the shipped pre-join selectors in meeting_join_teams.go (VERIFIED
+// 2026-08-01) still match — or re-tune them if a Teams UI change has drifted them.
 //
 // Usage (sandbox OFF; localhost + the container must be reachable):
 //
@@ -20,8 +20,8 @@ package platform
 // redirect to login.microsoftonline.com means selector tuning is a dead end and
 // the fallback is the Graph-transcript MVP), (2) dumps an iframe- and
 // shadow-DOM-aware inventory of every button/input/[role] on the pre-join screen
-// to OUT_DIR, (3) screenshots the page, and (4) reports which of the current
-// UNVERIFIED constants actually match live. Re-run after each edit to converge.
+// to OUT_DIR, (3) screenshots the page, and (4) reports whether the current
+// shipped constants still match live. Re-run after each edit to converge.
 
 import (
 	"encoding/base64"
@@ -94,15 +94,44 @@ const teamsInventoryJS = `(function(){
   return JSON.stringify(out);
 })()`
 
-// teamsCandidateSelectors are the CURRENT best-guess selectors from
-// meeting_join_teams.go (kept in sync by hand). The harness reports how many
-// elements each matches live, so a 0 means "re-tune this constant".
+// teamsShipped* below are VERBATIM copies of the shipped selectors / JS in
+// internal/jobs/meeting_join_teams.go (VERIFIED block, 2026-08-01 live join).
+// They are copied rather than imported because internal/jobs already imports
+// internal/platform (browser + CDP types), so internal/platform importing
+// internal/jobs back would be a cycle. KEEP THESE BYTE-IDENTICAL to their
+// meeting_join_teams.go counterparts whenever that file is re-tuned — a stale
+// copy here reports 0 matches for a selector that actually ships fine, which
+// misleads a future re-tuner into "fixing" a working production selector.
+const (
+	// mirrors teamsNameInputSelector
+	teamsShippedNameInputSelector = `input[data-tid="prejoin-display-name-input"],input[placeholder*="name" i],input[aria-label*="name" i]`
+	// mirrors teamsPasscodeInputSelector
+	teamsShippedPasscodeInputSelector = `input[data-tid*="passcode" i],input[placeholder*="passcode" i],input[aria-label*="passcode" i],input[type="password"]`
+	// mirrors the querySelector target set inside teamsIsAdmittedJS
+	teamsShippedAdmittedSelector = `#hangup-button,#roster-button,#screenshare-button,div[data-tid="ckeditor"]`
+	// mirrors the toggle-mute entries in teamsMuteMicCamJS's sels array
+	teamsShippedMuteMicSelector = `input[data-tid="toggle-mute"],button[data-tid="toggle-mute"]`
+	// mirrors the toggle-video entries in teamsMuteMicCamJS's sels array
+	teamsShippedMuteCamSelector = `input[data-tid="toggle-video"],button[data-tid="toggle-video"]`
+	// mirrors the querySelector target inside teamsLeaveJS (id first, before
+	// its "Leave" text-match fallback, which a CSS selector can't express)
+	teamsShippedLeaveButtonSelector = `#hangup-button`
+	// mirrors teamsSelectComputerAudioJS verbatim (the full production JS, not
+	// just its selector, so the harness exercises exactly what ships).
+	teamsShippedSelectComputerAudioJS = `(function(){` +
+		`var r=document.querySelector('input[type="radio"][aria-label="Computer audio" i]');` +
+		`if(r&&!r.checked){r.click();return true;}return false;})()`
+)
+
+// teamsCandidateSelectors are the CURRENT selectors from meeting_join_teams.go
+// (kept in sync via the teamsShipped* consts above). The harness reports how
+// many elements each matches live, so a 0 means "re-tune this constant".
 var teamsCandidateSelectors = map[string]string{
-	"name_input":     `input[data-tid="prejoin-display-name-input"],input[placeholder*="name" i],input[aria-label*="name" i]`,
-	"passcode_input": `input[data-tid*="passcode" i],input[placeholder*="passcode" i],input[aria-label*="passcode" i],input[type="password"]`,
-	"admitted":       `button[data-tid="hangup-button"],button[aria-label*="Leave" i],button[title*="Leave" i],[data-tid="call-duration"]`,
-	"mute_mic":       `button[data-tid="toggle-mute"],button[aria-label*="microphone" i]`,
-	"mute_cam":       `button[data-tid="toggle-video"],button[aria-label*="camera" i]`,
+	"name_input":     teamsShippedNameInputSelector,
+	"passcode_input": teamsShippedPasscodeInputSelector,
+	"admitted":       teamsShippedAdmittedSelector,
+	"mute_mic":       teamsShippedMuteMicSelector,
+	"mute_cam":       teamsShippedMuteCamSelector,
 }
 
 func teamsSelectorProbeJS(sel string) string {
@@ -175,21 +204,10 @@ func TestTeamsLiveTune(t *testing.T) {
 	t.Logf("wrote DOM inventory -> %s (%d bytes)", invPath, len(invStr))
 
 	// ---- STEP 3: screenshot ----
-	shot, err := cdpCommandPublished(port, "Page.captureScreenshot", map[string]any{"format": "png"})
-	if err != nil {
-		t.Logf("screenshot cdp error: %v", err)
-	} else if data, ok := shot["result"].(map[string]any); ok {
-		if b64, ok := data["data"].(string); ok {
-			if raw, derr := base64.StdEncoding.DecodeString(b64); derr == nil {
-				shotPath := filepath.Join(outDir, "teams_prejoin_"+stamp+".png")
-				_ = os.WriteFile(shotPath, raw, 0o644)
-				t.Logf("wrote screenshot -> %s (%d bytes)", shotPath, len(raw))
-			}
-		}
-	}
+	saveScreenshot(t, port, filepath.Join(outDir, "teams_prejoin_"+stamp+".png"))
 
-	// ---- STEP 4: which current UNVERIFIED constants match live? ----
-	t.Logf("---- current best-guess selector match counts (0 = re-tune) ----")
+	// ---- STEP 4: do the shipped constants still match live? ----
+	t.Logf("---- shipped (verified 2026-08-01) selector match counts (0 = Teams UI drifted, re-tune) ----")
 	for name, sel := range teamsCandidateSelectors {
 		v, err := br.Evaluate(teamsSelectorProbeJS(sel))
 		if err != nil {
@@ -249,8 +267,8 @@ func TestTeamsLiveJoin(t *testing.T) {
 		t.Fatalf("sign-in wall at %s", cur)
 	}
 
-	// Fill the guest display name (verified selector).
-	if err := br.Type(`input[data-tid="prejoin-display-name-input"]`, botName); err != nil {
+	// Fill the guest display name (shipped selector).
+	if err := br.Type(teamsShippedNameInputSelector, botName); err != nil {
 		t.Logf("set name (non-fatal): %v", err)
 	} else {
 		t.Logf("set bot name = %q", botName)
@@ -258,8 +276,11 @@ func TestTeamsLiveJoin(t *testing.T) {
 
 	// Best-effort: select "Computer audio" so meeting audio routes to the
 	// recording sink (a capture bot must hear the room). Non-fatal if the radio
-	// is absent (device-less container may force the no-audio nudge).
-	if _, err := br.Evaluate(`(function(){var r=document.querySelector('input[name="radiogroup-ra"][aria-label="Computer audio"],#radio-rb');if(r){r.click();return true;}return false;})()`); err != nil {
+	// is absent (device-less container may force the no-audio nudge). Uses the
+	// SHIPPED teamsSelectComputerAudioJS verbatim (copied above as
+	// teamsShippedSelectComputerAudioJS) so this verifies what actually ships,
+	// not a hand-typed guess.
+	if _, err := br.Evaluate(teamsShippedSelectComputerAudioJS); err != nil {
 		t.Logf("select Computer audio (non-fatal): %v", err)
 	}
 
@@ -285,24 +306,13 @@ func TestTeamsLiveJoin(t *testing.T) {
 	_ = os.WriteFile(invPath, []byte(prettyJSON(invStr)), 0o644)
 	t.Logf("wrote post-join inventory -> %s", invPath)
 
-	// Screenshot (log raw keys if the shape is unexpected).
-	if shot, err := cdpCommandPublished(port, "Page.captureScreenshot", map[string]any{"format": "png"}); err != nil {
-		t.Logf("screenshot error: %v", err)
-	} else if res, ok := shot["result"].(map[string]any); ok {
-		if b64, ok := res["data"].(string); ok {
-			if raw, derr := base64.StdEncoding.DecodeString(b64); derr == nil {
-				_ = os.WriteFile(filepath.Join(outDir, "teams_"+stamp+".png"), raw, 0o644)
-				t.Logf("wrote screenshot -> teams_%s.png (%d bytes)", stamp, len(raw))
-			}
-		}
-	} else {
-		t.Logf("screenshot unexpected response keys: %v", keysOf(shot))
-	}
+	// Screenshot.
+	saveScreenshot(t, port, filepath.Join(outDir, "teams_"+stamp+".png"))
 
 	// Report current in-call/lobby selector matches.
 	inCall := map[string]string{
-		"admitted":  `button[data-tid="hangup-button"],button[aria-label*="Leave" i],button[title*="Leave" i],[data-tid="call-duration"]`,
-		"leave_btn": `button[data-tid="hangup-button"],button[aria-label*="Leave" i]`,
+		"admitted":  teamsShippedAdmittedSelector,
+		"leave_btn": teamsShippedLeaveButtonSelector,
 	}
 	for name, sel := range inCall {
 		if v, err := br.Evaluate(teamsSelectorProbeJS(sel)); err == nil {
