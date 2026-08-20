@@ -13,6 +13,16 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
+// vllmInferenceBaseURL returns the node-local vLLM base URL via the shared
+// vllmBaseURL() helper (inference_helpers.go), which resolves the
+// citadel-owned host port (services.VLLMHostPort) instead of the vLLM
+// container's in-container port. Previously this handler hardcoded
+// "http://localhost:8000" — the container-internal port, never a published
+// host port on any published-port setup — so it never reached a real vLLM
+// instance (citadel#428). A package var (not a plain function call) so tests
+// can substitute a mock server's base URL.
+var vllmInferenceBaseURL = vllmBaseURL
+
 type VLLMInferenceHandler struct{}
 
 func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
@@ -30,7 +40,7 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 	ctx.Log("info", "     - [Job %s] vLLM service is ready. Running inference on model '%s'", job.ID, model)
 
 	// --- INFERENCE LOGIC ---
-	vllmCompletionsURL := "http://localhost:8000/v1/completions"
+	vllmCompletionsURL := vllmInferenceBaseURL() + "/v1/completions"
 	requestPayload := map[string]interface{}{
 		"model":       model,
 		"prompt":      prompt,
@@ -62,7 +72,7 @@ func (h *VLLMInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 }
 
 func (h *VLLMInferenceHandler) waitForVLLMReady() error {
-	vllmHealthURL := "http://localhost:8000/health"
+	vllmHealthURL := vllmInferenceBaseURL() + "/health"
 	maxWait := 60 * time.Second
 	pollInterval := 1 * time.Second
 	startTime := time.Now()

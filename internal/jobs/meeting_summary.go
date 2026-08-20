@@ -29,12 +29,14 @@ import (
 )
 
 // localVLLMBaseURL returns the node-local vLLM OpenAI-compatible base URL. It
-// uses the shared vllmBaseURL() helper (llm_inference.go) rather than a literal
-// so the port comes from the citadel port registry (services.VLLMHostPort) AND
-// honors the CITADEL_VLLM_HOST_PORT override — the same source the newer
-// LLMInferenceHandler resolves. (The legacy VLLMInferenceHandler still hardcodes
-// :8000, a pre-registry literal; a per-node port change belongs in the registry/
-// env, not here.)
+// uses the shared vllmBaseURL() helper (inference_helpers.go) rather than a
+// literal so the port comes from the citadel port registry (services.VLLMHostPort)
+// — the same source the newer LLMInferenceHandler resolves, and (as of
+// citadel#428) the same source the legacy VLLMInferenceHandler resolves too.
+// Note: vllmBaseURL() reads the registry CONST, not the CITADEL_VLLM_HOST_PORT
+// env var (that var is compose-injection-only, consumed by services.HostPortEnv()
+// for `docker compose up`, not read back by Go callers) — a per-node runtime
+// override here is a documented gap, not something this helper covers today.
 func localVLLMBaseURL() string {
 	return vllmBaseURL()
 }
