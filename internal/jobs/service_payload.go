@@ -48,6 +48,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -457,6 +458,26 @@ func (h *ServiceHandler) serviceStartPayload(ctx JobContext, job *nexus.Job) ([]
 			ctx.Log("warning", "     - [Job %s] instance %s running but store update failed: %v", job.ID, spec.ServiceName, err)
 		}
 		return h.instanceResult(spec, "start", true, "")
+	}
+
+	// Preflight (citadel #767 follow-up, #781): this generic RUN_MODULE-style
+	// container start execs "docker" directly (runtime query below, plus
+	// rm/run further down) with no prior check. Refuse ONLY when the CLI is
+	// missing (every exec below -- including preflightRuntime's own `docker
+	// info` -- would fail immediately anyway) and report a friendly diagnosis
+	// instead of the raw `exec: "docker": executable file not found in
+	// $PATH`-style error. Deliberately BEFORE preflightRuntime and the
+	// state-volume MkdirAll below: preflightRuntime execs "docker info" too,
+	// so without this ordering a missing CLI would surface through ITS raw
+	// exec error first, and a refusal here must not leave a state-volume dir
+	// behind. A daemon that failed to answer the preflight's probe is a
+	// WARNING, not a refusal -- it may just be slow, and the docker run call
+	// further down already surfaces docker's own error if it truly is
+	// unreachable. See platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return nil, refuseErr
+	} else if warning != "" {
+		ctx.Log("warn", "     - [Job %s] docker preflight: %s", job.ID, warning)
 	}
 
 	// Preflight the requested runtime against the local Docker daemon so a node

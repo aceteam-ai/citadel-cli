@@ -25,6 +25,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
@@ -286,6 +287,20 @@ func composeUpDetached(name, composePath string) error {
 	args := []string{"compose"}
 	args = append(args, composeFileArgs(composePath, composePath)...)
 	args = append(args, "up", "-d")
+	// Preflight (citadel #767 follow-up, #781): this module-restart-on-update
+	// path execs "docker" directly with no prior check. Refuse ONLY when the
+	// CLI is missing (that exec would fail immediately anyway) and report a
+	// friendly diagnosis instead of the raw
+	// `exec: "docker": executable file not found in $PATH`-style error. A
+	// daemon that failed to answer the preflight's probe is a WARNING, not a
+	// refusal -- it may just be slow, and the compose-up call below already
+	// surfaces docker's own error if it truly is unreachable. See
+	// platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return fmt.Errorf("docker compose up failed: %s", refuseErr)
+	} else if warning != "" {
+		fmt.Printf("⚠️  docker preflight for %s: %s\n", name, warning)
+	}
 	c := exec.Command("docker", args...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
