@@ -351,7 +351,7 @@ func ResolveCatalogService(name string) (*ResolvedCatalogService, error) {
 			SourceName:  src.Name,
 		}, nil
 	}
-	return nil, fmt.Errorf("service '%s' not found in catalog", name)
+	return nil, fmt.Errorf("service '%s' not found in catalog: %w", name, ErrServiceNotFound)
 }
 
 // SourceOf returns the name of the catalog source that owns service `name`,
