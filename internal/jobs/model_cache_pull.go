@@ -112,7 +112,7 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 		return nil, fmt.Errorf("job payload missing 'engine' field")
 	}
 
-	engine = strings.ToLower(engine)
+	engine = normalizeEngineToken(strings.ToLower(engine))
 
 	switch engine {
 	case "ollama":
@@ -127,6 +127,24 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 		}
 		return nil, fmt.Errorf("unsupported engine %q: this handler pulls for ollama, vllm, llamacpp and bonsai; "+
 			"engines whose compose owns its weights (%s) are a no-op", engine, strings.Join(sortedSelfProvisioningEngines(), ", "))
+	}
+}
+
+// normalizeEngineToken canonicalizes engine spellings that the backend's
+// provisioning templates emit but that differ from the node's internal engine
+// names (citadel#545). The backend's `resolve_model_engine` and the node's
+// `services.ServiceMap` disagree on llama.cpp's token: the templates use the
+// upstream project's own spelling ("llama.cpp", occasionally "llama-cpp" /
+// "llama_cpp"), while the node's compose/service name is "llamacpp". Mirrors
+// the equivalent normalization in internal/mesh/discovery.go's engineFromName.
+// Every other token (including "diffusers", already a selfProvisioningEngines
+// no-op) passes through unchanged.
+func normalizeEngineToken(engine string) string {
+	switch engine {
+	case "llama.cpp", "llama-cpp", "llama_cpp":
+		return "llamacpp"
+	default:
+		return engine
 	}
 }
 
