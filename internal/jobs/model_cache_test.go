@@ -91,6 +91,94 @@ func TestModelCachePull_EngineNormalization(t *testing.T) {
 	}
 }
 
+// TestModelCachePull_EngineTokenNormalization pins citadel#545: the backend's
+// provisioning templates can emit "llama.cpp" / "llama-cpp" / "llama_cpp"
+// (the upstream project's own spelling) where the node's internal engine name
+// is "llamacpp". A rejected pull here means the whole deploy fails even though
+// the compose/service name resolves fine everywhere else.
+func TestModelCachePull_EngineTokenNormalization(t *testing.T) {
+	tests := []struct {
+		name   string
+		engine string
+	}{
+		{"dot form", "llama.cpp"},
+		{"hyphen form", "llama-cpp"},
+		{"underscore form", "llama_cpp"},
+		{"uppercase dot form", "LLAMA.CPP"},
+		{"canonical form still works", "llamacpp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &ModelCachePullHandler{}
+			_, err := h.Execute(JobContext{}, makeJob(map[string]string{
+				// A deliberately nonexistent repo so a real `hf` CLI (if present
+				// on the test machine) fails fast on a 404 instead of actually
+				// downloading gigabytes of GGUF weights.
+				"model_name": "citadel-test-org/nonexistent-model-xyz-545",
+				"engine":     tt.engine,
+			}))
+			// The assertion is that the pull fails for a download/no-op reason,
+			// not because the engine token was rejected as unsupported.
+			if err == nil {
+				t.Fatalf("expected the download to fail for a nonexistent repo, got success")
+			}
+			if strings.Contains(err.Error(), "unsupported engine") {
+				t.Errorf("engine %q should normalize to llamacpp, got: %v", tt.engine, err)
+			}
+		})
+	}
+}
+
+// TestModelCachePull_DiffusersIsSelfProvisionedNoOp pins that "diffusers" (the
+// other token citadel#545 flagged as rejected) is a no-op success: the
+// diffusers compose pins its model and downloads weights itself on first
+// start, so MODEL_CACHE_PULL has nothing to fetch.
+func TestModelCachePull_DiffusersIsSelfProvisionedNoOp(t *testing.T) {
+	h := &ModelCachePullHandler{}
+	out, err := h.Execute(JobContext{}, makeJob(map[string]string{
+		"model_name": "stabilityai/stable-diffusion-3.5-medium",
+		"engine":     "diffusers",
+	}))
+	if err != nil {
+		t.Fatalf("expected diffusers pull to be a no-op success, got error: %v", err)
+	}
+	var result modelCachePullResult
+	if jsonErr := json.Unmarshal(out, &result); jsonErr != nil {
+		t.Fatalf("failed to unmarshal result: %v", jsonErr)
+	}
+	if result.Status != "skipped" {
+		t.Errorf("status = %q, want 'skipped'", result.Status)
+	}
+	if result.Engine != "diffusers" {
+		t.Errorf("engine = %q, want 'diffusers'", result.Engine)
+	}
+}
+
+// --- normalizeEngineToken tests ---
+
+func TestNormalizeEngineToken(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"llama.cpp", "llamacpp"},
+		{"llama-cpp", "llamacpp"},
+		{"llama_cpp", "llamacpp"},
+		{"llamacpp", "llamacpp"},
+		{"vllm", "vllm"},
+		{"ollama", "ollama"},
+		{"diffusers", "diffusers"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := normalizeEngineToken(tt.in); got != tt.want {
+				t.Errorf("normalizeEngineToken(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // --- MODEL_CACHE_EVICT payload parsing tests ---
 
 func TestModelCacheEvict_MissingModelName(t *testing.T) {
