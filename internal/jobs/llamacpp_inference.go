@@ -41,6 +41,22 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	ctx.Log("info", "     - [Job %s] Configuring llama.cpp to use model '%s'", job.ID, modelFile)
 	homeDir := getUserHomeDir()
 	composeFile := filepath.Join(homeDir, "citadel-node/services/llamacpp.yml") // Assuming standard path
+
+	// Preflight (citadel #767 follow-up, #781): this model-swap restart execs
+	// "docker" directly with no prior check. Refuse ONLY when the CLI is
+	// missing (that exec would fail immediately anyway) and report a friendly
+	// diagnosis instead of the raw
+	// `exec: "docker": executable file not found in $PATH`-style error. A
+	// daemon that failed to answer the preflight's probe is a WARNING, not a
+	// refusal -- it may just be slow, and the compose-up call below already
+	// surfaces docker's own error if it truly is unreachable. See
+	// platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return nil, fmt.Errorf("failed to restart llama.cpp service with new model: %s", refuseErr)
+	} else if warning != "" {
+		ctx.Log("warn", "     - [Job %s] docker preflight: %s", job.ID, warning)
+	}
+
 	newCommand := fmt.Sprintf("--model /models/%s --host 0.0.0.0 --port 8080 --n-gpu-layers -1", modelFile)
 	restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
 	restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))

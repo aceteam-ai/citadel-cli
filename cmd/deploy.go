@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
@@ -84,6 +85,21 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 // runLocalDeploy pulls an image and runs a container locally.
 func runLocalDeploy(image, containerName string) error {
 	stepColor := color.New(color.FgCyan)
+
+	// Preflight (citadel #767 follow-up, #781): this ad-hoc deploy execs
+	// "docker" directly (pull/inspect/stop/rm/run below) with no prior check.
+	// Refuse ONLY when the CLI is missing (every exec below would fail
+	// immediately anyway) and report a friendly diagnosis instead of the raw
+	// `exec: "docker": executable file not found in $PATH`-style error. A
+	// daemon that failed to answer the preflight's probe is a WARNING, not a
+	// refusal -- it may just be slow, and the pull/run calls below already
+	// surface docker's own error if it truly is unreachable. See
+	// platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return refuseErr
+	} else if warning != "" {
+		fmt.Printf("⚠️  %s\n", warning)
+	}
 
 	// Step 1: Pull the image
 	stepColor.Printf("--- Pulling image: %s ---\n", image)

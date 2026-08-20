@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -95,8 +97,20 @@ type Status struct {
 // or minted by LoadOrCreateState); the backing dir is bounded to the storage
 // data dir.
 func Start() error {
-	if err := dockerAvailable(); err != nil {
-		return err
+	// Preflight (citadel #767 follow-up, #781): this ensure-running path execs
+	// "docker" directly (docker rm -f + docker run below) with no prior check.
+	// Refuse ONLY when the CLI is missing (every exec below would fail
+	// immediately anyway) and report a friendly diagnosis instead of the raw
+	// `exec: "docker": executable file not found in $PATH`-style error. A
+	// daemon that failed to answer the preflight's probe is a WARNING, not a
+	// refusal (replacing the previous dockerAvailable hard-refuse-on-any-
+	// failure check) -- it may just be slow, and the docker run call below
+	// already surfaces docker's own error if it truly is unreachable. See
+	// platform.PreflightDockerStart.
+	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		return refuseErr
+	} else if warning != "" {
+		clilog.Writef("warning", "docker preflight before storage gateway start: %s", warning)
 	}
 	state, err := LoadOrCreateState()
 	if err != nil {
@@ -242,14 +256,6 @@ func meshIP() string {
 		return ""
 	}
 	return ip
-}
-
-// dockerAvailable checks that the docker daemon is responsive.
-func dockerAvailable() error {
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		return fmt.Errorf("Docker is not available (is Docker installed and running?): %w", err)
-	}
-	return nil
 }
 
 // containerRunning reports whether the gateway container is running.

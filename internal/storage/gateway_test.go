@@ -93,6 +93,30 @@ func TestStorageHostPort_Allocation(t *testing.T) {
 	}
 }
 
+// TestStart_DockerCLIMissing_RefusesWithFriendlyMessage covers the storage
+// gateway's ensure-running path (citadel #767 follow-up, #781): with no
+// docker on PATH, Start must refuse with the friendly
+// platform.PreflightDockerStart diagnosis -- never a raw
+// `exec: "docker": executable file not found in $PATH` string -- and must
+// refuse before LoadOrCreateState mints any create-once credentials or
+// touches disk. Mirrors internal/jobs's
+// TestStartServices_DockerCLIMissing_RefusesWithFriendlyMessage (#773).
+func TestStart_DockerCLIMissing_RefusesWithFriendlyMessage(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no docker, no native binaries
+	t.Setenv("HOME", t.TempDir())
+
+	err := Start()
+	if err == nil {
+		t.Fatalf("expected Start to refuse with docker missing from PATH")
+	}
+	if !strings.Contains(err.Error(), "docker CLI not found on PATH") {
+		t.Fatalf("expected friendly docker-missing diagnosis, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "exec:") {
+		t.Fatalf("error must not leak the raw exec error, got: %v", err)
+	}
+}
+
 // containsPair reports whether args contains flag immediately followed by value.
 func containsPair(args []string, flag, value string) bool {
 	for i := 0; i+1 < len(args); i++ {
