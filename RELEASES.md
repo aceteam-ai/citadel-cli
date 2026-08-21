@@ -1654,3 +1654,18 @@ Auto-generated log of every release.
   - fix: route legacy VLLM_INFERENCE handler through the vLLM host-port registry (#783)
 
 
+---
+
+## v2.110.0 — 2026-08-21
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 15 |
+| Lines added | +968 |
+
+**Changes:**
+
+  - feat(windows): embed wintun.dll — dual-mode install, hardened load path (#709) (#777)
+
+
