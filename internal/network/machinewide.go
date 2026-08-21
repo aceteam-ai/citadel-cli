@@ -63,6 +63,14 @@ func ConnectMachineWide(ctx context.Context, config ServerConfig, elevated bool)
 		return nil, err
 	}
 
+	// No-op on non-Windows. On Windows, extracts + hash-verifies + pre-loads
+	// the embedded wintun driver from the executable's own directory, and
+	// refuses (rather than falling back to userspace) if that directory is
+	// writable by a non-administrator -- see EnsureWintunDriver.
+	if err := ensureWintunDriverIfNeeded(); err != nil {
+		return nil, err
+	}
+
 	s := &NetworkServer{
 		controlURL: config.ControlURL,
 		hostname:   config.Hostname,
@@ -115,7 +123,17 @@ func MachineWideRunning() bool {
 
 // PreflightResult describes whether this machine can run machine-wide mode.
 type PreflightResult struct {
-	Elevated  bool   `json:"elevated"`
+	Elevated bool `json:"elevated"`
+
+	// DriverOK reports whether the platform's network driver is ready to
+	// load. On Windows (issue #709) this covers extracting, hash-verifying,
+	// and pre-loading the embedded wintun driver -- including the
+	// install-directory ACL check, so a wrong install location (e.g.
+	// %LOCALAPPDATA%\Citadel instead of %ProgramFiles%\Citadel) is reported
+	// distinctly from a missing-privileges failure via Detail. Trivially
+	// true on Linux/macOS, which have no external driver file.
+	DriverOK bool `json:"driver_ok"`
+
 	DeviceOK  bool   `json:"device_ok"`
 	Device    string `json:"device,omitempty"`
 	Detail    string `json:"detail,omitempty"`
@@ -123,12 +141,19 @@ type PreflightResult struct {
 }
 
 // PreflightMachineWide answers "can this box do machine-wide mode?" without
-// changing any system state that outlives the call.
+// changing any *routing/DNS* state that outlives the call.
 //
 // It creates the network interface and immediately closes it again. It does
 // NOT start the engine, install routes, or touch DNS — so it is safe to run
 // on a machine already carrying other VPN software, and safe to kill (there
-// is nothing to leave behind).
+// is no routing/DNS state to leave behind).
+//
+// Windows exception: ensureWintunDriverIfNeeded (below) extracts wintun.dll
+// to disk next to citadel.exe and loads it into this process before the
+// interface check runs. That disk write and in-process load are real,
+// harmless, idempotent side effects (re-extraction always re-verifies the
+// hash) -- but they are NOT nothing, so "no state to strand" above refers
+// only to the interface/routes/DNS, not the driver file.
 //
 // This exists because the failure that actually bites users is per-platform
 // and happens at exactly this step: a missing wintun.dll on Windows, no
@@ -143,6 +168,18 @@ func PreflightMachineWide(elevated bool) PreflightResult {
 		res.Detail = ElevationHint()
 		return res
 	}
+
+	// Windows-only in practice (no-op elsewhere): extracts, hash-verifies,
+	// and pre-loads the embedded wintun driver, including the
+	// install-directory ACL check. Checked BEFORE tstunNew so a
+	// wrong-install-location failure is reported as exactly that, not as a
+	// generic "could not create the device" error from deeper in wintun's
+	// own loader.
+	if err := ensureWintunDriverIfNeeded(); err != nil {
+		res.Detail = err.Error()
+		return res
+	}
+	res.DriverOK = true
 
 	name := DefaultTUNName()
 	dev, devName, err := tstunNew(name)

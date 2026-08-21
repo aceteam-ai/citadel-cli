@@ -6,14 +6,42 @@
 #   Invoke-WebRequest -Uri https://get.aceteam.ai/citadel.ps1 -OutFile citadel.ps1
 #   .\citadel.ps1
 
+# -MachineWide installs to %ProgramFiles%\Citadel with an admin-only ACL
+# instead of the default %LOCALAPPDATA%\Citadel, and is what 'citadel up'
+# (machine-wide TUN mode, citadel #709) requires: its embedded wintun.dll can
+# only be loaded from the directory the running exe lives in, so that
+# directory must not be writable by a non-administrator, or a local user
+# could plant a DLL that loads into citadel's elevated process. 'citadel
+# login' works from EITHER install location -- it needs no driver.
 param(
     [string]$Version = "latest",
     [string]$InstallDir = "$env:LOCALAPPDATA\Citadel",
     [switch]$AddToPath = $true,
-    [switch]$Force = $false
+    [switch]$Force = $false,
+    [switch]$MachineWide = $false
 )
 
 $ErrorActionPreference = "Stop"
+
+# Only move the default install location for -MachineWide when the caller
+# didn't already pass an explicit -InstallDir.
+if ($MachineWide -and -not $PSBoundParameters.ContainsKey('InstallDir')) {
+    $InstallDir = "$env:ProgramFiles\Citadel"
+}
+
+if ($MachineWide) {
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host ""
+        Write-Host "-MachineWide needs an elevated (Administrator) PowerShell session:" -ForegroundColor Red
+        Write-Host "  it writes to $InstallDir and locks its ACL down to admins only," -ForegroundColor Red
+        Write-Host "  which a non-admin session cannot do." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Re-run from 'Run as Administrator', or drop -MachineWide to install" -ForegroundColor Yellow
+        Write-Host "unprivileged to $env:LOCALAPPDATA\Citadel (citadel login only)." -ForegroundColor Yellow
+        exit 1
+    }
+}
 
 # Colors for output
 function Write-ColorOutput($ForegroundColor, $Message) {
@@ -146,6 +174,34 @@ try {
     Copy-Item -Path $citadelExe.FullName -Destination $targetPath -Force
     Write-Success "Installed citadel.exe"
 
+    # Lock the install directory down to admins-only. This is what makes
+    # machine-wide mode's embedded-driver loading safe (citadel #709): the
+    # wintun.dll citadel extracts at 'citadel up' time can only be loaded
+    # from this same directory, and 'citadel up' refuses to load anything
+    # from a directory a non-administrator could write to (see
+    # docs/machine-wide-tun.md). icacls SIDs are used instead of names so
+    # this works on non-English Windows too.
+    if ($MachineWide) {
+        Write-Info "Restricting $InstallDir to administrators..."
+        # Passed as a plain array element (not manually quoted): PowerShell's
+        # native-command argument marshaling already quotes an element
+        # containing spaces, and doing it ourselves as well would hand icacls
+        # a path with literal quote characters baked in.
+        $icaclsArgs = @(
+            $InstallDir, "/inheritance:r",
+            "/grant:r", "*S-1-5-18:(OI)(CI)F",     # NT AUTHORITY\SYSTEM: Full Control
+            "/grant:r", "*S-1-5-32-544:(OI)(CI)F", # BUILTIN\Administrators: Full Control
+            "/grant:r", "*S-1-5-32-545:(OI)(CI)RX" # BUILTIN\Users: Read & Execute (citadel login/status stay runnable unprivileged)
+        )
+        $icaclsResult = & icacls @icaclsArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to lock down $InstallDir -- machine-wide mode ('citadel up') would refuse to load its driver from here."
+            Write-Error "$icaclsResult"
+            exit 1
+        }
+        Write-Success "Locked $InstallDir to SYSTEM + Administrators (Users: read & execute only)"
+    }
+
     # Verify installation
     $installedVersion = & $targetPath version 2>&1
     if ($LASTEXITCODE -eq 0) {
@@ -154,25 +210,28 @@ try {
         Write-Warning "Installation completed but version check failed"
     }
 
-    # Add to PATH if requested
+    # Add to PATH if requested. A machine-wide install goes on the Machine
+    # PATH (visible to every user and to services); the default unprivileged
+    # install stays on the User PATH, as before.
     if ($AddToPath) {
-        $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        $pathScope = if ($MachineWide) { "Machine" } else { "User" }
+        $existingPath = [Environment]::GetEnvironmentVariable("Path", $pathScope)
 
-        if ($userPath -notlike "*$InstallDir*") {
-            Write-Info "Adding to user PATH..."
+        if ($existingPath -notlike "*$InstallDir*") {
+            Write-Info "Adding to $pathScope PATH..."
 
-            $newPath = if ($userPath) {
-                "$userPath;$InstallDir"
+            $newPath = if ($existingPath) {
+                "$existingPath;$InstallDir"
             } else {
                 $InstallDir
             }
 
-            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+            [Environment]::SetEnvironmentVariable("Path", $newPath, $pathScope)
 
             # Update current session
             $env:Path = "$env:Path;$InstallDir"
 
-            Write-Success "Added to PATH (restart shell to apply)"
+            Write-Success "Added to $pathScope PATH (restart shell to apply)"
         } else {
             Write-Info "Already in PATH"
         }
@@ -198,6 +257,17 @@ Write-Host ""
 Write-Host "To provision a new node:"
 Write-Host "  - Open PowerShell as Administrator"
 Write-Host "  - Run: citadel init"
+Write-Host ""
+if ($MachineWide) {
+    Write-Host "This is a machine-wide install: 'citadel up' (puts the whole machine on"
+    Write-Host "the network, not just citadel itself) can run from here. From an elevated"
+    Write-Host "(Administrator) PowerShell, run: citadel up"
+} else {
+    Write-Host "This is the unprivileged install: 'citadel login' works as-is. 'citadel up'"
+    Write-Host "(machine-wide mode) needs the admin-only install -- re-run this installer"
+    Write-Host "with -MachineWide from an elevated PowerShell session to switch, or run"
+    Write-Host "'citadel up --check' from here to see exactly what it's missing."
+}
 Write-Host ""
 Write-Host "Documentation: https://github.com/aceteam-ai/citadel-cli"
 Write-Host ""
