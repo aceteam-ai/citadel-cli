@@ -17,6 +17,11 @@ package network
 // wintun.dll payloads extracted from that archive's bin/<arch>/wintun.dll —
 // the Prebuilt Binaries License (winassets/LICENSE.txt) §3a forbids
 // modifying them, so these hashes pin the exact bytes citadel ships.
+//
+// Provenance re-verified 2026-08-20: re-downloaded wintun-0.14.1.zip from
+// wintun.net, confirmed the zip sha256 above, and confirmed both per-arch
+// bin/<arch>/wintun.dll hashes inside it match wintunAMD64SHA256 /
+// wintunARM64SHA256 below exactly.
 const (
 	wintunAMD64SHA256 = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
 	wintunARM64SHA256 = "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"

@@ -65,12 +65,20 @@ the network and restores routing and DNS.`,
 }
 
 // runUpCheck reports whether machine-wide mode can work here WITHOUT leaving
-// anything behind: it creates the network interface and immediately removes
-// it, never starting the engine, installing routes, or touching DNS.
+// anything behind that matters: it creates the network interface and
+// immediately removes it, never starting the engine, installing routes, or
+// touching DNS.
+//
+// Windows exception: this still extracts wintun.dll next to citadel.exe and
+// loads it into this process (see PreflightMachineWide / EnsureWintunDriver
+// in internal/network) -- a real, if harmless and idempotent, disk write. It
+// is not part of "no state to strand": the file is expected to be there on
+// every subsequent run regardless, and re-extraction always re-verifies its
+// hash.
 //
 // This is the safe way to answer "will 'citadel up' work on this box?" — and
 // it is safe to run on a machine already carrying other VPN software, or to
-// kill part-way, because there is no state to strand.
+// kill part-way, because there is no *routing/DNS* state to strand.
 func runUpCheck() error {
 	res := network.PreflightMachineWide(platform.IsRoot())
 

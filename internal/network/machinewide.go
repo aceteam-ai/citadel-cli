@@ -141,12 +141,19 @@ type PreflightResult struct {
 }
 
 // PreflightMachineWide answers "can this box do machine-wide mode?" without
-// changing any system state that outlives the call.
+// changing any *routing/DNS* state that outlives the call.
 //
 // It creates the network interface and immediately closes it again. It does
 // NOT start the engine, install routes, or touch DNS — so it is safe to run
 // on a machine already carrying other VPN software, and safe to kill (there
-// is nothing to leave behind).
+// is no routing/DNS state to leave behind).
+//
+// Windows exception: ensureWintunDriverIfNeeded (below) extracts wintun.dll
+// to disk next to citadel.exe and loads it into this process before the
+// interface check runs. That disk write and in-process load are real,
+// harmless, idempotent side effects (re-extraction always re-verifies the
+// hash) -- but they are NOT nothing, so "no state to strand" above refers
+// only to the interface/routes/DNS, not the driver file.
 //
 // This exists because the failure that actually bites users is per-platform
 // and happens at exactly this step: a missing wintun.dll on Windows, no

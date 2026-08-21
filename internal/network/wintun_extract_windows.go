@@ -136,7 +136,15 @@ func extractAndPreload(destPath string, data []byte, wantHashHex string) error {
 	// bytes on disk are guaranteed unchanged since the hash check, and
 	// wintun's own later LoadLibraryEx("wintun.dll", ...) resolves to this
 	// same cached module by path instead of reading the file again.
-	if _, err := windows.LoadLibraryEx(destPath, 0, 0); err != nil {
+	//
+	// flags pin dependency-DLL resolution to System32 + destPath's own
+	// directory. flags=0 would leave resolution on the legacy search order,
+	// which still consults the current working directory and PATH under
+	// SafeDllSearchMode -- and EnsureWintunDriver's caller adds the install
+	// dir to the Machine PATH, so an unpinned load could pick up a
+	// same-named dependency planted there instead of System32's.
+	const loadFlags = windows.LOAD_LIBRARY_SEARCH_SYSTEM32 | windows.LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+	if _, err := windows.LoadLibraryEx(destPath, 0, loadFlags); err != nil {
 		return fmt.Errorf("load %s: %w", destPath, err)
 	}
 	return nil
