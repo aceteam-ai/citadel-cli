@@ -1634,3 +1634,23 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.107.0 release
 
 
+---
+
+## v2.109.0 — 2026-08-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 28 |
+| Lines added | +1755 |
+
+**Changes:**
+
+  - fix(heartbeat): report the services that are actually running, not the ones we thought to probe (#702)
+  - fix(meetings): verify + correct Teams join selectors against a live meeting (#660) (#664)
+  - fix: extend docker preflight to remaining service/module start sites (#781) (#784)
+  - heartbeat: add HasPasscode to PermissionState for live passcode truth (#785)
+  - fix(jobs): normalize llama.cpp engine token in MODEL_CACHE_PULL (#545) (#782)
+  - fix: route legacy VLLM_INFERENCE handler through the vLLM host-port registry (#783)
+
+
