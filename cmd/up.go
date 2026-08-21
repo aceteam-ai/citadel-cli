@@ -198,5 +198,5 @@ func init() {
 	rootCmd.AddCommand(downCmd)
 	upCmd.Flags().StringVar(&upAuthkey, "authkey", "", "Pre-generated authkey for non-interactive join")
 	upCmd.Flags().StringVar(&upNodeName, "node-name", "", "Override the node name (defaults to hostname)")
-	upCmd.Flags().BoolVar(&upCheck, "check", false, "Report whether this machine can run machine-wide mode, then exit (changes nothing)")
+	upCmd.Flags().BoolVar(&upCheck, "check", false, "Report whether this machine can run machine-wide mode, then exit (does not change routing or DNS)")
 }
