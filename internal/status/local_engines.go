@@ -2,8 +2,6 @@ package status
 
 import (
 	"context"
-
-	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 )
 
 // LocalEngine describes a managed serving engine currently running on THIS node
@@ -24,16 +22,26 @@ type LocalEngine struct {
 // DiscoverLocalEngines probes the managed serving engines (managedProbeEngines)
 // for a live signal on this node and returns those that are running, along with
 // each engine's currently loaded model(s). It reuses the same running-check and
-// model-discovery path the heartbeat uses (managedEnginePortIfRunning +
-// ModelDiscovery), so `citadel chat` sees exactly what the fleet sees.
+// model-discovery path the heartbeat uses (enginePortIfRunning + ModelDiscovery),
+// so `citadel chat` sees exactly what the fleet sees.
 //
 // An engine is included when it is running and its port is known, regardless of
 // whether model discovery returned any models — a running-but-empty engine is
 // real state the caller may still want to surface. Model discovery is bounded by
 // ModelDiscoveryTimeout so a slow/hung engine never stalls discovery; a failed
 // probe simply leaves Models empty.
+//
+// Enumerates the running "citadel-<name>" containers ONCE (runningEmbeddedServices)
+// and threads that snapshot through every managedProbeEngines lookup below,
+// mirroring collector.go's heartbeat path (aceteam#7148). This call sits on the
+// gateway chat-route / `citadel chat` / nodeIsServingModels subscription-gate
+// paths, not just the 30s heartbeat, so the previous per-engine
+// managedEnginePortIfRunning (a fresh `docker ps` per entry in
+// managedProbeEngines, ~5 calls) was 5x redundant container-runtime work on every
+// invocation.
 func DiscoverLocalEngines(ctx context.Context) []LocalEngine {
-	return discoverLocalEngines(ctx, catalog.SelectContainerRuntime().EngineBin, managedEnginePortIfRunning, NewModelDiscovery())
+	running := runningEmbeddedServices(containerRuntimeBin())
+	return discoverLocalEngines(ctx, running, enginePortIfRunning, NewModelDiscovery())
 }
 
 // modelLister is the slice of ModelDiscovery that discoverLocalEngines needs.
@@ -44,16 +52,22 @@ type modelLister interface {
 	DiscoverModels(ctx context.Context, serviceType string, port int) ([]string, error)
 }
 
+// discoverLocalEngines is DiscoverLocalEngines with the runtime snapshot and
+// lookup injected for testability (mirroring modelLister above).
+//
+// running is the pre-collected running-container set (runningEmbeddedServices),
+// gathered ONCE by the caller so this loop makes zero container-runtime calls of
+// its own -- see the "Enumerates ... ONCE" note on DiscoverLocalEngines.
 func discoverLocalEngines(
 	ctx context.Context,
-	engineBin string,
-	portIfRunning func(engineBin, name string) (int, bool),
+	running map[string]bool,
+	portIfRunning func(running map[string]bool, name string) (int, bool),
 	md modelLister,
 ) []LocalEngine {
 	var out []LocalEngine
 	for _, name := range managedProbeEngines {
-		port, running := portIfRunning(engineBin, name)
-		if !running || port <= 0 {
+		port, isRunning := portIfRunning(running, name)
+		if !isRunning || port <= 0 {
 			continue
 		}
 

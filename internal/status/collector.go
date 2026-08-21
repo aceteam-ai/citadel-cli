@@ -133,7 +133,15 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	for _, svc := range status.Services {
 		reported[svc.Name] = struct{}{}
 	}
-	for _, eng := range c.collectManagedEngineStatus() {
+
+	// Enumerate the running "citadel-<name>" containers ONCE and thread the set
+	// through every service collector below (aceteam#7148). One container-runtime
+	// call per heartbeat instead of one per known engine, and, the reason it
+	// exists, a single source of truth for "what is actually up" that no longer
+	// depends on a service appearing in a hardcoded probe list.
+	runningServices := runningEmbeddedServices(containerRuntimeBin())
+
+	for _, eng := range c.collectManagedEngineStatus(runningServices) {
 		if _, dup := reported[eng.Name]; dup {
 			continue
 		}
@@ -145,12 +153,22 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// is the discovery signal the sovereign-RAG backend matches on to embed on
 	// the org's own node; like the engine probe it runs in the heartbeat path
 	// where c.services is nil, so a manifest entry is not required.
-	for _, emb := range c.collectEmbeddingServiceStatus() {
+	for _, emb := range c.collectEmbeddingServiceStatus(runningServices) {
 		if _, dup := reported[emb.Name]; dup {
 			continue
 		}
 		reported[emb.Name] = struct{}{}
 		status.Services = append(status.Services, emb)
+	}
+
+	// Backstop: every OTHER running embedded-compose service (kokoro, transcribe,
+	// diffusers, extraction, sglang, lmstudio). None of these has a probe above,
+	// so before #7148 a node running them reported nothing at all: the operator
+	// saw an empty node right after a successful deploy, and an unreported
+	// service can never be flagged idle or reclaimable either.
+	for _, svc := range collectRunningEmbeddedServices(runningServices, reported) {
+		reported[svc.Name] = struct{}{}
+		status.Services = append(status.Services, svc)
 	}
 
 	// Mark pinned services (citadel #577) so the heartbeat and `citadel services`

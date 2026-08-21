@@ -4,13 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os/exec"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
@@ -49,30 +46,26 @@ var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unli
 // model), ollama `GET /api/tags` (every pulled model, all auto-loadable on
 // request; citadel-cli#606).
 //
-// It only emits an entry for an engine that is actually running AND answered
-// at least one probe (idle scrape or model discovery). An engine that answers
-// model discovery with an empty list (llama.cpp up with no model loaded,
-// ollama with nothing pulled) IS emitted: running with no models is real,
-// reportable state. A running-but-unresponsive engine (e.g. still loading its
-// model, HTTP not yet up) is skipped rather than reported with a misleading
-// "idle since startup" — the existing manifest-driven collectServiceStatus
-// still reports its up/down state when configured. Probe failures never fail
-// the collection: each probe is bounded by ModelDiscoveryTimeout and a failure
-// simply leaves the corresponding field empty.
-func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
+// It emits an entry for every engine that is actually running. An engine that
+// answered a probe carries Health=ok plus its models/idle signal; one whose
+// container is up but not answering yet (still loading weights, HTTP not up)
+// carries Health=starting with no models and no idle signal (aceteam#7148).
+// Dropping the unresponsive case is what made a just-deployed engine invisible
+// in the fabric UI while `service_status` reported it running; "running but not
+// ready yet" is real, reportable state, and callers that need readiness read
+// Health. Probe failures never fail the collection: each probe is bounded by
+// ModelDiscoveryTimeout and a failure simply leaves the corresponding field
+// empty.
+//
+// running is the set of embedded-service names whose "citadel-<name>" container
+// is up, collected once per heartbeat by runningEmbeddedServices.
+func (c *Collector) collectManagedEngineStatus(running map[string]bool) []ServiceInfo {
 	ctx := context.Background()
 	var out []ServiceInfo
 
-	// Resolve the container runtime once and use its engine binary for the
-	// running-check, mirroring the start path (cmd/service.go). GPU/inference
-	// containers are the ones most likely to run under the hardened podman
-	// runtime (#348); a docker-only inspect would miss them entirely and the
-	// idle signal would never fire on exactly the nodes this feature targets.
-	engineBin := catalog.SelectContainerRuntime().EngineBin
-
 	for _, name := range managedProbeEngines {
-		port, running := managedEnginePortIfRunning(engineBin, name)
-		if !running || port <= 0 {
+		port, isRunning := enginePortIfRunning(running, name)
+		if !isRunning || port <= 0 {
 			continue
 		}
 
@@ -104,7 +97,9 @@ func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
 		}
 
 		if !responded {
-			continue
+			info.Health = HealthStatusStarting
+			info.Models = nil
+			info.IdleState = nil
 		}
 		out = append(out, info)
 	}
@@ -119,35 +114,32 @@ func (c *Collector) collectManagedEngineStatus() []ServiceInfo {
 // /v1/embeddings upstream, not /v1/chat/completions.
 var embeddingProbeServices = []string{"tei"}
 
-// collectEmbeddingServiceStatus reports running embedding services that answer a
-// health check, as ServiceInfo with Type=embedding. This is the discovery signal
-// the sovereign-embeddings backend (_find_tei_node) matches on: a node
-// advertising a "tei" service becomes eligible to embed on its own model. Kept
-// separate from collectManagedEngineStatus so an embedding server is never
-// mistaken for a chat LLM (whose idle probe and chat-router listing do not
-// apply).
+// collectEmbeddingServiceStatus reports running embedding services as
+// ServiceInfo with Type=embedding. This is the discovery signal the
+// sovereign-embeddings backend (_find_tei_node) matches on: a node advertising a
+// READY "tei" service becomes eligible to embed on its own model. Kept separate
+// from collectManagedEngineStatus so an embedding server is never mistaken for a
+// chat LLM (whose idle probe and chat-router listing do not apply).
 //
-// Each entry carries the model the server is ACTUALLY serving, read from the
-// engine's own /info (citadel-cli#690). Reporting no models let a stopped vllm's
-// <name>.env default claim the embedding model instead, so the platform credited
-// a dead engine and reasoned about the wrong VRAM cost and lifecycle for both.
+// Each ready entry carries the model the server is ACTUALLY serving, read from
+// the engine's own /info (citadel-cli#690). Reporting no models let a stopped
+// vllm's <name>.env default claim the embedding model instead, so the platform
+// credited a dead engine and reasoned about the wrong VRAM cost and lifecycle
+// for both.
 //
-// Running is decided by managedEnginePortIfRunning, not by a container check:
-// an embedding server installed natively (systemd unit, `serve` process) is
-// serving just as much as one in a container, and a docker-only test reports a
-// false negative on exactly the consumer-grade box this product targets.
-func (c *Collector) collectEmbeddingServiceStatus() []ServiceInfo {
+// running is the set of embedded-service names whose "citadel-<name>" container
+// is up, enumerated once per heartbeat by runningEmbeddedServices. It is only
+// half the running test: enginePortIfRunning falls back to the native probe, so
+// an embedding server installed as a systemd unit or a bare `serve` process
+// counts too (citadel-cli#690) instead of reporting a false negative on exactly
+// the consumer-grade box this product targets.
+func (c *Collector) collectEmbeddingServiceStatus(running map[string]bool) []ServiceInfo {
 	var lister embeddingModelLister
 	if c.modelDiscovery != nil {
 		lister = c.modelDiscovery
 	}
-	return collectEmbeddingServices(
-		context.Background(),
-		catalog.SelectContainerRuntime().EngineBin,
-		managedEnginePortIfRunning,
-		embeddingServiceHealthy,
-		lister,
-	)
+	portIfRunning := func(name string) (int, bool) { return enginePortIfRunning(running, name) }
+	return collectEmbeddingServices(context.Background(), portIfRunning, embeddingServiceHealthy, lister)
 }
 
 // embeddingModelLister is the slice of ModelDiscovery collectEmbeddingServices
@@ -158,23 +150,27 @@ type embeddingModelLister interface {
 	DiscoverEmbeddingModel(ctx context.Context, port int) ([]string, error)
 }
 
+// collectEmbeddingServices is collectEmbeddingServiceStatus with its live probes
+// injected.
+//
+// Readiness rides Health, not presence (aceteam#7148). A container that is up but
+// whose model is still downloading answers /health with a non-200 and used to be
+// omitted from the heartbeat entirely, so a node that had just been told to start
+// TEI reported "no services" for the whole warm-up while `service_status` said it
+// was running. It is now reported Status=running with Health=starting and no
+// models: a warming server has none to name, and naming one anyway would be
+// citadel-cli#690 in reverse. The platform gates embedding dispatch on
+// Health=ok, so a warming node is still never handed an embed that would 503.
 func collectEmbeddingServices(
 	ctx context.Context,
-	engineBin string,
-	portIfRunning func(engineBin, name string) (int, bool),
+	portIfRunning func(name string) (int, bool),
 	healthy func(port int) bool,
 	md embeddingModelLister,
 ) []ServiceInfo {
 	var out []ServiceInfo
 	for _, name := range embeddingProbeServices {
-		port, running := portIfRunning(engineBin, name)
+		port, running := portIfRunning(name)
 		if !running || port <= 0 {
-			continue
-		}
-		// Advertise only once the model is loaded (TEI /health is 200 only then),
-		// so the backend never discovers a still-warming node and then fails the
-		// embed with a 503.
-		if !healthy(port) {
 			continue
 		}
 		info := ServiceInfo{
@@ -182,14 +178,19 @@ func collectEmbeddingServices(
 			Type:   ServiceTypeEmbedding,
 			Status: ServiceStatusRunning,
 			Port:   port,
-			Health: HealthStatusOK,
+			Health: HealthStatusStarting,
 		}
-		if md != nil {
-			mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
-			models, err := md.DiscoverEmbeddingModel(mctx, port)
-			cancel()
-			if err == nil {
-				info.Models = models
+		// TEI answers /health with 200 only once the model has loaded, so this
+		// is the ready-vs-warming decision.
+		if healthy(port) {
+			info.Health = HealthStatusOK
+			if md != nil {
+				mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
+				models, err := md.DiscoverEmbeddingModel(mctx, port)
+				cancel()
+				if err == nil {
+					info.Models = models
+				}
 			}
 		}
 		out = append(out, info)
@@ -227,7 +228,14 @@ func engineInList(list []string, name string) bool {
 // embedded compose file's port mapping, falling back to the known native
 // default.
 func managedEnginePortIfRunning(engineBin, name string) (port int, running bool) {
-	if containerRunning(engineBin, "citadel-"+name) {
+	return enginePortIfRunning(runningEmbeddedServices(engineBin), name)
+}
+
+// enginePortIfRunning is managedEnginePortIfRunning against an already-collected
+// running-container set, so one heartbeat pass makes ONE container-runtime call
+// instead of one per engine.
+func enginePortIfRunning(running map[string]bool, name string) (port int, isRunning bool) {
+	if running[name] {
 		return managedEngineHostPort(name), true
 	}
 	// Serving, not process-present (#649). This function decides what the node
@@ -241,22 +249,6 @@ func managedEnginePortIfRunning(engineBin, name string) (port int, running bool)
 		return managedEngineHostPort(name), true
 	}
 	return 0, false
-}
-
-// containerRunning reports whether a container with the given name is in the
-// "running" state, using the provided engine binary (docker or podman). Any
-// error (runtime not installed, container absent) yields false so callers treat
-// the engine as not-managed-here.
-func containerRunning(engineBin, containerName string) bool {
-	if engineBin == "" {
-		engineBin = "docker"
-	}
-	cmd := exec.Command(engineBin, "inspect", "--format", "{{.State.Status}}", containerName)
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == "running"
 }
 
 // composePortRe matches the host side of a compose short-form port mapping,
