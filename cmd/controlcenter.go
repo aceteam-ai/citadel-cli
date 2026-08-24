@@ -1262,8 +1262,9 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	if manifest != nil && configDir != "" {
 		for _, service := range manifest.Services {
 			svcInfo := controlcenter.ServiceInfo{
-				Name:   service.Name,
-				Status: "stopped",
+				Name:    service.Name,
+				Status:  "stopped",
+				Managed: true,
 			}
 
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
@@ -1279,6 +1280,26 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 			data.Services = append(data.Services, svcInfo)
 		}
 	}
+
+	// Surface inference engines running on this node that citadel did NOT
+	// start (citadel #657) — e.g. ollama installed via its own `curl | sh`
+	// script. Without this, an engine like that is invisible in the console
+	// (which only walked citadel.yaml `services:` above) while the platform's
+	// inference_nodes still lists the node as serving it, so the two screens
+	// disagreed and the operator had no way to tell which was lying. Reuses
+	// status.DiscoverLocalEngines — the SAME probe the heartbeat, `citadel
+	// chat`, and the gateway chat router already use to decide what a node is
+	// serving — so this pane agrees with the rest of the fleet instead of
+	// running a second, possibly-divergent detection sweep.
+	// 5s mirrors enrichServiceFootprints' budget below: DiscoverLocalEngines
+	// probes each running managed engine sequentially at up to
+	// status.ModelDiscoveryTimeout (2s) apiece, so this comfortably covers the
+	// realistic case (1-2 engines running) without letting a wedged engine
+	// stall this 15s-cadence refresh for the worst-case count.
+	discCtx, discCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	discovered := status.DiscoverLocalEngines(discCtx)
+	discCancel()
+	data.Services = mergeDetectedEngines(data.Services, discovered)
 
 	// Enrich running services with their live resource footprint (CPU/RAM/VRAM/
 	// GPU) and a footprint-derived idle label, then roll up a one-line managed
@@ -1309,6 +1330,41 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	}
 
 	return data, nil
+}
+
+// mergeDetectedEngines combines the manifest-derived managed service rows
+// with engines status.DiscoverLocalEngines found running on this node
+// (citadel #657). A discovered engine already represented by a managed row —
+// matched by name, case-insensitively — is skipped, so a citadel-managed
+// engine is never double-listed; managedProbeEngines' names
+// (vllm/ollama/llamacpp/bonsai/unlimited-ocr) are exactly the citadel.yaml
+// service names for the embedded engines, so this is a reliable de-dupe key.
+// Every remaining discovered engine is appended as an unmanaged row
+// (Managed=false, Status="running") carrying the model(s) it is currently
+// serving, so the console shows it distinctly instead of it being invisible.
+//
+// Pure function — no I/O — so the merge/de-dupe decision is unit-testable
+// without docker, a live engine, or a manifest file.
+func mergeDetectedEngines(managed []controlcenter.ServiceInfo, discovered []status.LocalEngine) []controlcenter.ServiceInfo {
+	existing := make(map[string]bool, len(managed))
+	for _, svc := range managed {
+		existing[strings.ToLower(svc.Name)] = true
+	}
+
+	out := managed
+	for _, eng := range discovered {
+		if existing[strings.ToLower(eng.Name)] {
+			continue
+		}
+		out = append(out, controlcenter.ServiceInfo{
+			Name:    eng.Name,
+			Status:  "running",
+			Managed: false,
+			Models:  eng.Models,
+		})
+		existing[strings.ToLower(eng.Name)] = true
+	}
+	return out
 }
 
 // ccFootprintIdleTracker is the long-lived footprint-derived idle tracker for

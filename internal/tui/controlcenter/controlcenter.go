@@ -156,6 +156,22 @@ type ServiceInfo struct {
 	Footprint    string
 	IdleLabel    string
 	HeavyAndIdle bool
+
+	// Managed is true for a row citadel started/owns (present in citadel.yaml
+	// `services:`). It is false for a row discovered running on this node that
+	// citadel did NOT start (citadel #657, e.g. ollama installed by its own
+	// `curl | sh` script) — the console previously had no way to show these, so
+	// it disagreed with the platform's "this node is serving" view. Rendering
+	// and the service-action modal (start/stop/restart) key off this field to
+	// keep unmanaged rows visually distinct and non-actionable from here.
+	Managed bool
+
+	// Models are the model id(s) a running engine is currently serving,
+	// discovered via the engine's own OpenAI-compatible API (mirrors
+	// status.LocalEngine.Models). Populated for unmanaged/detected rows; a
+	// managed row leaves this empty today (its footprint/idle signal already
+	// covers usage).
+	Models []string
 }
 
 // ServiceDetailInfo holds detailed service information for the modal
@@ -2154,17 +2170,27 @@ func (cc *ControlCenter) updateServicesView() {
 
 	// Services
 	for _, svc := range cc.data.Services {
-		// Name
-		cc.servicesView.SetCell(row, 0, tview.NewTableCell(" "+svc.Name).SetSelectable(true))
+		// Name — an unmanaged/detected row (citadel #657) gets a distinct
+		// suffix so it never reads as a citadel-managed service.
+		name := " " + svc.Name
+		if !svc.Managed {
+			name += " [cyan::i](detected)[-:-:-]"
+		}
+		cc.servicesView.SetCell(row, 0, tview.NewTableCell(name).SetSelectable(true))
 
-		// Status — start with docker state, then apply transitional overrides
+		// Status — start with docker state, then apply transitional overrides.
+		// A detected-unmanaged row never gets transitional overrides (start/
+		// stop/restart are disabled for it), so it always renders straight
+		// from svc.Status.
 		var statusCell string
-		switch svc.Status {
-		case "running":
+		switch {
+		case svc.Status == "running" && !svc.Managed:
+			statusCell = "[cyan]" + Glyph(MarkerActive) + " unmanaged[-]"
+		case svc.Status == "running":
 			statusCell = "[green]" + Glyph(MarkerActive) + " running[-]"
-		case "stopped":
+		case svc.Status == "stopped":
 			statusCell = "[gray]" + Glyph(MarkerInactive) + " stopped[-]"
-		case "error":
+		case svc.Status == "error":
 			statusCell = "[red]" + Glyph(MarkerError) + " error[-]"
 		default:
 			statusCell = "[yellow]? " + svc.Status + "[-]"
@@ -2213,7 +2239,14 @@ func (cc *ControlCenter) updateServicesView() {
 			"["+footprintColor+"]"+footprint+"[-:-:-]").SetSelectable(true))
 
 		// Usage label (busy / idle 38m). Heavy-and-idle rows show it in red too.
+		// A detected-unmanaged row has no idle signal (no footprint collector
+		// runs for it), so show the served model(s) instead — that is the one
+		// piece of live state the operator actually wants from this row
+		// (citadel #657).
 		usage := svc.IdleLabel
+		if usage == "" && len(svc.Models) > 0 {
+			usage = "models: " + strings.Join(svc.Models, ", ")
+		}
 		if usage == "" {
 			usage = "-"
 		}
