@@ -1669,3 +1669,22 @@ Auto-generated log of every release.
   - feat(windows): embed wintun.dll — dual-mode install, hardened load path (#709) (#777)
 
 
+---
+
+## v2.111.0 — 2026-08-24
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 13 |
+| Lines added | +896 |
+
+**Changes:**
+
+  - fix(tui): show detected-unmanaged inference engines in the Services pane (#657) (#802)
+  - feat(terminal): accept node passcode via WebSocket subprotocol (#757) (#800)
+  - feat: add citadel doctor CLI subcommand (#790) (#798)
+  - docs: fix README install/uninstall commands to avoid the get.aceteam.ai 522 (#801)
+  - docs(terminal): document the existing auto-tmux opt-out + widen its test coverage (#780) (#799)
+
+
