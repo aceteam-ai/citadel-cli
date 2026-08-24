@@ -1875,6 +1875,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Start the interactive browser-session stream server (citadel-cli#794) so a
+	// viewer can screencast + drive a running co-browse session (#793) over the
+	// mesh. Best-effort and unconditional: never fails the worker.
+	startCobrowseStreamServer()
+
 	// Start in-process HTTPS gateway if enabled
 	if workGateway {
 		// Validate that gateway port does not collide with upstream ports

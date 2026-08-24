@@ -148,6 +148,7 @@ func TestReservedCitadelPortsPairwiseDistinct(t *testing.T) {
 		VNCWebsockifyPort:  "vnc-websockify",
 		VNCPort:            "vnc-rfb",
 		DeskstreamPort:     "deskstream-h264",
+		CobrowseStreamPort: "cobrowse-stream",
 		TerminalPort:       "terminal-server",
 		LiveKitWSPort:      "livekit-signaling",
 		LiveKitICETCPPort:  "livekit-ice-tcp",
