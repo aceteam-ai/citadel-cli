@@ -301,6 +301,12 @@ const (
 	VNCPort = 5900
 	// DeskstreamPort is the H.264 desktop stream port (internal/deskstream).
 	DeskstreamPort = 5910
+	// CobrowseStreamPort is the per-session interactive browser stream port
+	// (internal/cobrowsestream, citadel-cli#794). It serves a WebSocket that
+	// screencasts one co-browse session (#793) and forwards viewer input back,
+	// exposed over the tsnet mesh exactly like DeskstreamPort/VNCPort. Chosen
+	// adjacent to DeskstreamPort so the desktop/browser stream ports group.
+	CobrowseStreamPort = 5911
 	// TerminalPort is the local terminal server port (cmd/work.go
 	// --terminal-port, internal/terminal/config.go). The platform relay dials
 	// ws://<vpn_ip>:7860, so this is a live mesh port a module must not take.
@@ -334,6 +340,7 @@ var ReservedCitadelPorts = map[int]string{
 	VNCWebsockifyPort:  "vnc-websockify",
 	VNCPort:            "vnc-rfb",
 	DeskstreamPort:     "deskstream-h264",
+	CobrowseStreamPort: "cobrowse-stream",
 	TerminalPort:       "terminal-server",
 	LiveKitWSPort:      "livekit-signaling",
 	LiveKitICETCPPort:  "livekit-ice-tcp",

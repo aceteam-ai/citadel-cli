@@ -16,8 +16,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // Session lifecycle action types carried in the job payload's "action" field.
@@ -80,9 +82,33 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	}
 }
 
-// sessionStatusResult marshals one session's status to JSON output bytes.
+// sessionStreamInfo is the additive stream-endpoint hint carried on start/status
+// results so the live viewer (#8132) does not have to hardcode the port/path
+// convention. A viewer reaches the session over the mesh at
+// ws://<node_vpn_ip>:<port><path>?id=<session_id>.
+type sessionStreamInfo struct {
+	Port int    `json:"port"`
+	Path string `json:"path"`
+}
+
+// sessionResult is one session's status plus the stream endpoint. The embedded
+// status promotes its fields to the top level, so existing fields are unchanged
+// and "stream" is purely additive.
+type sessionResult struct {
+	platform.CobrowseSessionStatus
+	Stream sessionStreamInfo `json:"stream"`
+}
+
+// sessionStatusResult marshals one session's status (plus stream endpoint) to
+// JSON output bytes.
 func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
-	out, err := json.Marshal(st)
+	out, err := json.Marshal(sessionResult{
+		CobrowseSessionStatus: st,
+		Stream: sessionStreamInfo{
+			Port: services.CobrowseStreamPort,
+			Path: cobrowsestream.StreamPath,
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
