@@ -26,6 +26,12 @@ func init() {
 		if !v.IsConfigured() {
 			return false, false // no master PIN: fall back to legacy bcrypt
 		}
+		// Reject an empty/absent passcode for free (fail closed, no KDF, no
+		// lockout accounting) so unauthenticated per-connection probes can't
+		// lock the node — matching the legacy gate's zero-cost empty reject.
+		if pin == "" {
+			return false, true
+		}
 		return v.VerifyPIN(pin) == nil, true
 	}
 }

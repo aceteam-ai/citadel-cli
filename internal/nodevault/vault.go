@@ -289,6 +289,15 @@ func (v *Vault) VerifyPIN(pin string) error {
 // Unlock derives the KEK from pin, unwraps the DEK, and returns a Session. It
 // fails closed on a wrong PIN (no partial unlock) and is subject to lockout.
 func (v *Vault) Unlock(pin string) (*Session, error) {
+	// An empty PIN is always wrong and is rejected for FREE: no KDF, and — most
+	// importantly — no lockout accounting. A gate that probes with an
+	// empty/absent passcode per connection must not be able to lock out the
+	// whole node with unauthenticated traffic (it couldn't under the legacy
+	// bcrypt gate, which returned false at zero cost).
+	if pin == "" {
+		return nil, ErrWrongPIN
+	}
+
 	v.kdfMu.Lock()
 	defer v.kdfMu.Unlock()
 

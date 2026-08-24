@@ -253,6 +253,25 @@ func TestPepperRequiredForUnlock(t *testing.T) {
 	}
 }
 
+func TestEmptyPINDoesNotConsumeLockout(t *testing.T) {
+	v := newTestVault(t)
+	mustSet(t, v, "654321")
+	// An empty PIN is always wrong but must never move the lockout counter,
+	// or unauthenticated per-connection probes could self-DoS an enrolled node.
+	for i := 0; i < maxFreeAttempts*3; i++ {
+		if err := v.VerifyPIN(""); !errors.Is(err, ErrWrongPIN) {
+			t.Fatalf("empty PIN attempt %d: want ErrWrongPIN, got %v", i, err)
+		}
+	}
+	if lo := v.LockoutStatus(); lo.FailedAttempts != 0 || lo.LockedOut {
+		t.Fatalf("empty PIN probes moved the lockout counter: %+v", lo)
+	}
+	// The correct PIN still works (never locked).
+	if err := v.VerifyPIN("654321"); err != nil {
+		t.Fatalf("correct PIN after empty probes: %v", err)
+	}
+}
+
 func TestEntropyGatedBadge(t *testing.T) {
 	// 6-digit PIN -> caveated (below threshold).
 	v1 := newTestVault(t)

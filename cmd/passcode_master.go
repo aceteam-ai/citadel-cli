@@ -73,10 +73,48 @@ func init() {
 	passcodeCmd.AddCommand(passcodeStatusCmd)
 }
 
+// errAlreadyEnrolled is returned when enroll is invoked on a node that already
+// has a master PIN and nothing left to migrate.
+var errAlreadyEnrolled = errors.New("a master PIN is already enrolled; use 'citadel passcode rotate' to change it")
+
+// enrollPrecheck decides how to handle 'passcode enroll' given current state.
+// finishCleanup=true means a prior migration was interrupted (the vault is set
+// but the legacy bcrypt hash still lingers) and enroll should just delete that
+// leftover hash rather than refusing — otherwise the lingering hash, the exact
+// brute-force target enrollment deletes, could never be cleaned up.
+func enrollPrecheck(vaultConfigured, hasLegacyHash bool) (finishCleanup bool, err error) {
+	if !vaultConfigured {
+		return false, nil // normal enrollment path
+	}
+	if hasLegacyHash {
+		return true, nil // finish an interrupted migration
+	}
+	return false, errAlreadyEnrolled
+}
+
+// clearLegacyPasscode deletes the legacy bcrypt PasscodeHash. Idempotent: a
+// no-op when already empty. Used both as Enroll's deleteLegacy callback and to
+// finish an interrupted migration.
+func clearLegacyPasscode() error {
+	p := config.LoadPermissions(platform.ConfigDir())
+	_ = p.SetPasscode("") // empty clears the hash; never re-hashes (guard-safe)
+	return config.SavePermissions(platform.ConfigDir(), p)
+}
+
 func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 	v := masterVault()
-	if v.IsConfigured() {
-		return fmt.Errorf("a master PIN is already enrolled; use 'citadel passcode rotate' to change it")
+	perms := config.LoadPermissions(platform.ConfigDir())
+	// Check the RAW legacy hash, not the vault-aware HasPasscode() (which reports
+	// true once a master PIN is enrolled and would loop the cleanup forever).
+	hasLegacyHash := perms.PasscodeHash != ""
+	if finishCleanup, err := enrollPrecheck(v.IsConfigured(), hasLegacyHash); err != nil {
+		return err
+	} else if finishCleanup {
+		if err := clearLegacyPasscode(); err != nil {
+			return fmt.Errorf("finish interrupted migration (delete legacy passcode): %w", err)
+		}
+		fmt.Println("Master PIN already enrolled; cleaned up the leftover legacy passcode from an interrupted migration.")
+		return nil
 	}
 
 	isTTY := term.IsTerminal(int(os.Stdin.Fd()))
@@ -89,10 +127,9 @@ func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 
 	// Prove ownership against the legacy passcode when one is set. The vault is
 	// not configured yet, so VerifyPasscode still runs the legacy bcrypt path.
-	perms := config.LoadPermissions(platform.ConfigDir())
 	var legacyVerify func(string) bool
 	var legacyPIN string
-	if perms.HasPasscode() {
+	if hasLegacyHash {
 		var err error
 		legacyPIN, err = readSecretOnce("Current node passcode: ", isTTY)
 		if err != nil {
@@ -106,13 +143,7 @@ func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	deleteLegacy := func() error {
-		p := config.LoadPermissions(platform.ConfigDir())
-		_ = p.SetPasscode("") // empty clears the legacy hash; never re-hashes
-		return config.SavePermissions(platform.ConfigDir(), p)
-	}
-
-	if err := v.Enroll(legacyPIN, newPIN, policy, true, legacyVerify, deleteLegacy); err != nil {
+	if err := v.Enroll(legacyPIN, newPIN, policy, true, legacyVerify, clearLegacyPasscode); err != nil {
 		if errors.Is(err, nodevault.ErrWrongPIN) {
 			return fmt.Errorf("current node passcode is incorrect")
 		}
