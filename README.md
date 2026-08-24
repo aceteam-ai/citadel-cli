@@ -7,7 +7,7 @@ The `citadel` CLI is the on-premise agent and administrator's toolkit for the Ac
 The fastest way to turn a fresh Ubuntu machine into a Citadel worker node:
 
 ```bash
-curl -fsSL https://get.aceteam.ai/citadel | sudo -E CITADEL_AUTHKEY=xxx bash
+curl -fsSL https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.sh | sudo -E CITADEL_AUTHKEY=xxx bash
 ```
 
 This single command:
@@ -128,7 +128,7 @@ See [packer/README.md](packer/README.md) for full options, GPU passthrough, and 
 To remove Citadel from a node:
 
 ```bash
-curl -fsSL https://get.aceteam.ai/citadel-uninstall | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/uninstall.sh | sudo bash
 ```
 
 Or run the uninstall script directly:

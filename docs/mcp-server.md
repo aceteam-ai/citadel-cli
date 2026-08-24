@@ -6,7 +6,7 @@ The AceTeam MCP server lets AI coding agents (Claude Code, Cursor, Windsurf, etc
 
 ```bash
 # Install Citadel CLI
-curl -fsSL https://get.aceteam.ai/citadel | bash
+curl -fsSL https://get.aceteam.ai/citadel.sh | bash
 
 # Authenticate
 citadel init
