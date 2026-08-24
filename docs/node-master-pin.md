@@ -1,11 +1,54 @@
 # Node Master PIN + At-Rest Encryption — Design Doc
 
-**Status:** Design only. No implementation in this PR. Implementation follows
-in a separate PR after this doc is approved.
+**Status:** Implemented in `internal/nodevault` (+ config/cmd reconciliation).
+This doc is the original design; the **Implementation amendment** below records
+where the shipped code deliberately follows the issue-#796 comment thread
+instead of the body of this doc.
 
 **Issue:** aceteam-ai/citadel-cli#796
 **Consumer:** aceteam-ai/citadel-cli#795 (encrypted, PIN-unlocked browser profile)
 **Reconciles:** aceteam-ai/citadel-cli#753 (existing node passcode gate)
+
+## Implementation amendment (binding — supersedes the two-secret split below)
+
+After this doc merged (#807), the maintainer resolved #796 toward a **single
+master PIN**, not the two-secret access-PIN/at-rest-passphrase split this doc
+argues for in §1/§5/§6. The implementation follows the issue comments, which
+are binding:
+
+- **One master secret** both gates online access and roots the at-rest
+  encryption. It stays truthful via an **entropy-gated badge**, not via a
+  second secret: a short PIN shows a caveated indicator, a strong passphrase
+  shows the unqualified end-to-end-encrypted claim.
+- **Envelope encryption with a pepper.** The master PIN plus a **dedicated
+  node-held pepper** (a random file, generated once, distinct from `node.key`
+  which rotates under #4583) feed Argon2id → KEK; the KEK AES-256-GCM-wraps a
+  random 256-bit DEK. Consumers receive **HKDF context-scoped subkeys**, never
+  the master DEK. Rotating the PIN re-wraps the DEK (no bulk re-encryption).
+- **Verify-by-unwrap.** There is no separate password hash; a wrong PIN simply
+  fails to AEAD-open the wrapped DEK. This is why migration **deletes** the
+  legacy bcrypt `PasscodeHash` after a one-time re-entry enrollment — a bcrypt
+  hash cannot yield a key, and leaving it behind re-introduces the cheap
+  brute-force target the KDF removes.
+- **Configurable PIN length, default 6 digits.** Length/policy is a node
+  **config value from day one** (`nodevault.Policy`: `min_length` default 6,
+  `allow_passphrase` default true, `e2e_threshold_bits` default 60), never a
+  hardcoded constant. A user may set anything from the 6-digit default up to a
+  full passphrase.
+- **Set locally only.** The master PIN is set via CLI/TUI/local prompt; the
+  platform-push path (`APPLY_DEVICE_CONFIG.NodePasscode`) is disabled once a
+  master PIN is enrolled.
+- **Defaults:** auto-wipe OFF (hard, time-escalating lockout that never
+  destroys data; a local-presence `ResetLockout` exists); software-only, no TPM
+  dependency; no unlock persists across a restart (encrypted surfaces stay dark
+  until a local re-entry); setup requires a typed data-loss acknowledgement and
+  a loud full-machine-access disclosure.
+
+Sections §1, §5 (two-secret framing) and §6 ("access PIN forgotten → no data
+loss") describe the earlier design and are kept for traceability; where they
+conflict with the bullets above, the bullets win. The Argon2id parameters (§3),
+AES-256-GCM choice (§3/§4), envelope structure (§3), extensibility (§7), and
+threat model (§2) carried over unchanged.
 
 ## TL;DR
 

@@ -124,6 +124,16 @@ func (p *Permissions) SetPasscode(pin string) error {
 		p.PasscodeHash = ""
 		return nil
 	}
+	// Anti-resurrection guard + local-only master PIN (aceteam-ai/citadel-cli#796).
+	// Once a master PIN is enrolled, writing a fresh bcrypt hash here would
+	// re-create exactly the cheap offline brute-force target enrollment deleted,
+	// and would let a platform push (APPLY_DEVICE_CONFIG.NodePasscode) set the
+	// gate secret remotely — the master PIN is set LOCALLY only. So refuse any
+	// non-empty set while a vault is enrolled; clearing (empty pin) stays
+	// allowed (the enrollment path itself uses it to delete the legacy hash).
+	if VaultConfigured != nil && VaultConfigured() {
+		return fmt.Errorf("a node master PIN is enrolled; it is set locally only — use 'citadel passcode rotate' (the legacy/platform passcode path is disabled)")
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(pin), bcryptPasscodeCost)
 	if err != nil {
 		return fmt.Errorf("hash passcode: %w", err)
@@ -132,16 +142,53 @@ func (p *Permissions) SetPasscode(pin string) error {
 	return nil
 }
 
-// HasPasscode reports whether a node passcode is set.
+// Master-PIN delegation hooks (aceteam-ai/citadel-cli#796).
+//
+// When a node migrates to the master PIN, the legacy bcrypt PasscodeHash is
+// DELETED (a bcrypt hash cannot yield an encryption key, and leaving it behind
+// re-introduces the cheap brute-force target the KDF exists to remove). If the
+// gate readers still only consulted PasscodeHash, every gate would fail closed
+// the moment a node enrolled — bricking remote access.
+//
+// The master vault lives under network.GetNodeConfigDir(), and this package is
+// a widely-imported leaf that must NOT import network (which drags in the whole
+// tailscale stack). So the gate is made vault-aware through these package-level
+// hooks, wired once at startup in package cmd (which already imports network +
+// nodevault). Every existing gate call site keeps calling VerifyPasscode /
+// HasPasscode unchanged and transparently gets the master-PIN answer.
+//
+// Contract:
+//   - VaultConfigured reports whether a master PIN is enrolled on this node.
+//   - VaultVerify checks a PIN against the vault and returns (ok, handled).
+//     handled==false means "no vault; use the legacy bcrypt path" so un-migrated
+//     nodes behave exactly as before.
+//   - When the hooks are nil (e.g. a binary that never wired them, or a unit
+//     test), behavior falls back to the legacy bcrypt path — never a panic.
+var (
+	VaultConfigured func() bool
+	VaultVerify     func(pin string) (ok bool, handled bool)
+)
+
+// HasPasscode reports whether a node passcode (legacy) OR a master PIN is set.
 func (p *Permissions) HasPasscode() bool {
+	if VaultConfigured != nil && VaultConfigured() {
+		return true
+	}
 	return p.PasscodeHash != ""
 }
 
-// VerifyPasscode reports whether pin matches the stored node passcode. It fails
-// CLOSED: an unset passcode (no hash) or an empty pin returns false, so a
-// sensitive surface that was enabled but never given a passcode stays locked
-// rather than silently opening to anyone on the org mesh.
+// VerifyPasscode reports whether pin matches the node's access secret. When a
+// master PIN is enrolled it delegates to the vault (rate-limited, lockout-gated,
+// verify-by-unwrap); otherwise it verifies against the legacy bcrypt hash. It
+// fails CLOSED: an unset secret or an empty pin returns false, so a sensitive
+// surface that was enabled but never given a passcode stays locked rather than
+// silently opening to anyone on the org mesh.
 func (p *Permissions) VerifyPasscode(pin string) bool {
+	if VaultVerify != nil {
+		if ok, handled := VaultVerify(pin); handled {
+			return ok
+		}
+	}
 	if p.PasscodeHash == "" || pin == "" {
 		return false
 	}
