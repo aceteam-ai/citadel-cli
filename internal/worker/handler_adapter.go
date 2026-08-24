@@ -215,6 +215,11 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeAndroidBuild, jobs.NewAndroidBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeGomobileBuild, jobs.NewGomobileBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeCobrowse, jobs.NewCobrowseHandler()),
+		// Interactive browser sessions (issue #793): isolated, concurrent
+		// start/status/stop sessions. Registered unconditionally like COBROWSE — the
+		// manager needs no workspace or config dir, and each action is a short
+		// lifecycle call against the node-local session manager.
+		NewLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandler()),
 		// Resource snapshot (issue #427): returns the node's full GPU/host
 		// resource-consumer picture over the fabric. Registered unconditionally
 		// like the inference handlers — it needs no workspace sandbox, and gating

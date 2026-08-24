@@ -374,17 +374,30 @@ func findFreeDisplay() int {
 	return 99
 }
 
+// managedXvfbMu serializes display allocation across ALL managed-Xvfb launchers
+// (co-browse singleton, meeting bot, and the multi-session manager). findFreeDisplay
+// picks a display number by probing for an X socket/lock, and this function returns
+// only once that socket exists -- so without serialization two concurrent launches
+// could both pick :99, the second Xvfb would exit ("server already active"), and its
+// socket poll would see the FIRST launch's socket and wrongly succeed, silently
+// rendering both browsers on one display. Holding the lock until the socket exists
+// makes the next findFreeDisplay skip it.
+var managedXvfbMu sync.Mutex
+
 // startManagedXvfb launches a dedicated Xvfb virtual display and waits for its
 // socket so the browser launch does not race startup. Returns the running
 // command and the ":N" display string; the caller owns reaping (mirroring the
 // Chromium reaper). A missing Xvfb binary yields an actionable error rather than
-// a confusing downstream "CDP not ready" timeout.
+// a confusing downstream "CDP not ready" timeout. Concurrent-safe: display
+// allocation is serialized under managedXvfbMu.
 func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
 	if !isCommandAvailable("Xvfb") {
 		return nil, "", fmt.Errorf(
 			"Xvfb not found: install it (e.g. 'apt-get install xvfb') to run headless co-browse, "+
 				"or set %s to an existing X display (e.g. :0)", EnvCobrowseDisplay)
 	}
+	managedXvfbMu.Lock()
+	defer managedXvfbMu.Unlock()
 	n := findFreeDisplay()
 	display := fmt.Sprintf(":%d", n)
 	cmd := exec.Command("Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp")
