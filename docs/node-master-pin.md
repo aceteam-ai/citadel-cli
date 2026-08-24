@@ -34,6 +34,43 @@ framing, made explicitly, not silently — see §1. Everything below explains
 why, what the split costs in UX, and how the two primitives share one node
 without becoming two separate products.
 
+## Resolved decisions
+
+The maintainer reviewed this design and resolved the questions this doc
+originally left open (§10 below). These are now locked; the implementation
+PR should follow them as written, not re-derive them:
+
+1. **Boot-critical secrets (device bearer token, tsnet machine key) are
+   excluded from v1's vault scope**, confirmed (§2). A future phase may seal
+   them behind a "prompt on every reboot" trade-off; that is out of scope
+   for this design and its implementation PR.
+2. **The access-PIN lockout counter is a single node-wide counter**, not
+   scoped per caller identity. It is persisted under
+   `network.GetNodeConfigDir()` in the sibling state file proposed in §5
+   (e.g. `passcode_state.yaml`), alongside the lockout-until timestamp and
+   last-verified-at.
+3. **`permissions.yaml` / `PasscodeHash` stays under `platform.ConfigDir()`
+   in v1 — not migrated.** It works today because each gate's reader and
+   writer are co-located per-process (§5). Only the *new* lockout/attempt
+   state (item 2) moves to `network.GetNodeConfigDir()`; the migration of
+   `permissions.yaml` itself is deferred, not part of v1.
+4. **The DEK-wrap and data-encryption primitive is AES-256-GCM (stdlib)**,
+   not NaCl secretbox.
+5. **Session lifecycle for v1 is explicit `Lock()` + process exit only —
+   no auto-idle timeout.** A `Session` (and therefore `vault_unlocked` in
+   the heartbeat, §9) stays true until the caller explicitly locks it or the
+   process exits; there is no shorter idle-based expiry in v1.
+6. **The weekly re-prompt window is sliding**: it resets on every correct
+   entry, and re-prompts once more than 7 days have passed since the *last*
+   correct entry (not a fixed period from first entry).
+7. **Heartbeat fields are `has_vault_passphrase` and `vault_unlocked`**,
+   both without `omitempty` — `false` is a meaningful, reportable state for
+   both, mirroring the existing `has_passcode` field's reasoning.
+8. **Argon2id v1 defaults (`time=3, memory=64MiB, threads=4, keyLen=32`)
+   are kept as proposed.** Validating them against the real range of node
+   hardware (a headless 3090 box vs. a modest laptop) is a **pre-ship task
+   for the implementation PR**, not a design blocker here.
+
 ## 1. Two secrets, not one — the deviation and why
 
 The issue text says "single secret, single UX." This doc deliberately does
@@ -62,7 +99,7 @@ recovery, extensibility for scoped PINs) follows the issue as written.
 |---|---|
 | Disk theft or backup exfiltration of the vault + encrypted blobs, **when the passphrase is unknown to the attacker** — ciphertext only, DEK is not recoverable from disk contents alone | The vault's own files (salt, wrapped DEK, encrypted blobs) sitting *next to* a known or guessed passphrase — at that point decryption is trivial; passphrase secrecy is the entire boundary |
 | The node encrypting data while genuinely unattended (no session unlocked) — nothing on disk decrypts without the passphrase being supplied fresh | A live, unlocked session: the DEK is resident in process memory for the session's duration; malware or an attacker with code-exec as the same user during that window reads plaintext same as the user does |
-| A stolen/powered-off node — vault stays sealed; no cached plaintext key survives a reboot (this doc assumes no unlock persists across restarts; see Open Questions on session lifecycle) | The access PIN, at any point — it is an online authorization gate only and never touches at-rest key material. A leaked or brute-forced PIN grants console/VNC/shell/files access but decrypts nothing |
+| A stolen/powered-off node — vault stays sealed; no cached plaintext key survives a reboot (resolved: no unlock persists across restarts — v1 session lifecycle is explicit `Lock()` + process exit only, see Resolved decisions) | The access PIN, at any point — it is an online authorization gate only and never touches at-rest key material. A leaked or brute-forced PIN grants console/VNC/shell/files access but decrypts nothing |
 | Offline brute force of the passphrase, to the extent Argon2id cost + real passphrase entropy make it infeasible in practice | A weak or reused passphrase — Argon2id raises cost, it does not manufacture entropy that isn't there. This doc does not propose enforced passphrase complexity, only setup-time disclosure (see §6) |
 | — | Boot-critical secrets the node needs with **no human present** — the device bearer token (`internal/config/devicecreds.go`) and the tsnet machine key under the network state dir. These are explicitly **out of scope for v1** (see below) |
 
@@ -75,8 +112,9 @@ cannot rejoin the network or authenticate to the backend without a human
 present at every boot, which contradicts what "unattended" means for a
 fabric node's core function. Covering them is a **product decision**
 (accept "prompt on every reboot" as a trade-off) rather than a crypto gap
-this design should silently claim to close. Left as an explicit open
-question below rather than assumed either way.
+this design should silently claim to close. **Resolved: excluded from v1**
+(see Resolved decisions) — a future phase may revisit the trade-off, but it
+is not part of this design or its implementation PR.
 
 ## 3. Key hierarchy — envelope encryption
 
@@ -99,19 +137,19 @@ touching already-encrypted data — see §7 (Extensibility).
   dependency** — `golang.org/x/crypto v0.52.0` is already a direct
   dependency (it backs the existing `bcrypt` passcode hash in
   `internal/config/permissions.go`), and `argon2` ships in the same module.
-- AES-256-GCM (`crypto/aes` + `crypto/cipher`, stdlib) for both DEK-wraps-KEK
-  and DEK-encrypts-data. Also introduces no new dependency, and gets
-  hardware AES-NI acceleration on essentially every node this runs on.
-  `golang.org/x/crypto/nacl/secretbox` is available too (same vendored
-  module) as a drop-in alternative; flagged as an open question rather than
-  decided here.
-- Argon2id v1 defaults: `time=3, memory=64*1024 (64 MiB), threads=4,
-  keyLen=32`. These are a starting point, not a pin — see §8 (Open
-  Questions) on validating them against real node hardware (a headless
-  3090 box and a laptop are very different KDF budgets). The chosen params
-  are stored **in the vault header itself**, so a future default change
-  never breaks an existing vault — each vault always records the params it
-  was actually created with.
+- **AES-256-GCM (`crypto/aes` + `crypto/cipher`, stdlib) for both
+  DEK-wraps-KEK and DEK-encrypts-data — resolved (see Resolved decisions).**
+  Introduces no new dependency and gets hardware AES-NI acceleration on
+  essentially every node this runs on. `golang.org/x/crypto/nacl/secretbox`
+  was considered as a drop-in alternative (same vendored module) but is not
+  the chosen primitive.
+- **Argon2id v1 defaults — resolved (see Resolved decisions):** `time=3,
+  memory=64*1024 (64 MiB), threads=4, keyLen=32`. Validating these against
+  real node hardware (a headless 3090 box and a laptop are very different
+  KDF budgets) is a pre-ship task for the implementation PR, not an open
+  design question. The chosen params are stored **in the vault header
+  itself**, so a future default change never breaks an existing vault —
+  each vault always records the params it was actually created with.
 
 **On-disk layout.** The vault lives under `network.GetNodeConfigDir()`, not
 `platform.ConfigDir()`. `platform.ConfigDir()` is invoker-scoped —
@@ -183,11 +221,15 @@ type Session interface {
 
 A consumer (e.g. #795) calls `Unlock(passphrase)` at the moment a user
 mounts the encrypted browser profile, holds the returned `Session` for the
-lifetime of that use, and calls `Lock()` (or lets the session's own
-lifecycle — see §8, Open Questions — expire it) when done. `Seal`/`Unseal`
-only work through a live `Session`; there is no bare "decrypt with
-passphrase" call, so nothing outside this package ever holds the KEK or DEK
-directly.
+lifetime of that use, and calls `Lock()` when done. **Resolved (see Resolved
+decisions): v1 has no auto-idle timeout** — a `Session` stays unlocked until
+the caller explicitly calls `Lock()` or the process exits, full stop. A
+consumer that wants a shorter effective window (e.g. locking a browser
+profile when its own session ends) is responsible for calling `Lock()`
+itself; `internal/nodevault` does not time it out on their behalf.
+`Seal`/`Unseal` only work through a live `Session`; there is no bare
+"decrypt with passphrase" call, so nothing outside this package ever holds
+the KEK or DEK directly.
 
 ## 5. Access-PIN behavior
 
@@ -235,12 +277,13 @@ under `network.GetNodeConfigDir()` (same cross-context reasoning as the
 vault, §3) as a small sibling file — e.g. `passcode_state.yaml` — recording
 a failed-attempt counter, a lockout-until timestamp, and last-verified-at.
 
-Open question: **scope of that state.** The terminal path already carries
-a caller identity (`tokenInfo.UserID`); the gateway and SHELL_COMMAND paths
-do not obviously have an equivalent. A single node-wide counter is simplest
-and matches "one PIN, one node," but conflates a legitimate user's failed
-typo with a genuine attacker's guesses across surfaces. Flagged in §8 (Open
-Questions) rather than decided here.
+**Resolved: node-wide, not per-identity (see Resolved decisions).** The
+terminal path already carries a caller identity (`tokenInfo.UserID`); the
+gateway and SHELL_COMMAND paths do not obviously have an equivalent. The
+maintainer confirmed a single node-wide counter — simplest, matches "one
+PIN, one node," and does not require every gate site to carry a caller
+identity. The trade-off (a legitimate user's failed typo counts toward the
+same lockout as a genuine attacker's guesses) is accepted.
 
 `has_passcode` in the heartbeat needs no change under this plan — it
 already reports "is `PasscodeHash` set," and the PIN *is* `PasscodeHash`.
@@ -312,37 +355,42 @@ an absent one):
   This is the field that actually backs an "encrypted" vs. "unlocked right
   now" UI distinction; `has_vault_passphrase` alone cannot.
 
-Exact field names are a review question, not a design blocker — listed
-again below.
+**Resolved (see Resolved decisions):** these field names and the
+no-`omitempty` semantics on both are locked as written above.
 
 ## 10. Open questions for the maintainer
 
-- **Boot-critical secrets (device bearer token, tsnet machine key) are
-  excluded from v1's vault scope (§2).** Accept that permanently as a
-  different threat tier, or pursue a later phase that seals them with a
-  "prompt on every reboot" trade-off?
-- **Should `permissions.yaml` (and `PasscodeHash`) move from
-  `platform.ConfigDir()` to `network.GetNodeConfigDir()`** for consistency
-  with the vault's home, given `ConfigDir()`'s documented invoker-scoping
-  hazard? It works today only because each gate site's writer and reader
-  are co-located in the same process — is that assumption safe to keep
-  relying on long-term, or should it move now while it's cheap?
-- **Scope of the lockout counter / weekly re-prompt cache** (§5): one
-  counter per node, or per caller identity? Not every gate site currently
-  carries an identity to key on.
-- **Exact heartbeat field names/shape** for vault presence vs. unlock state
-  (§9) — proposed here, needs review against how the platform side will
-  actually consume/display it.
-- **AES-256-GCM (stdlib) vs. NaCl secretbox** (`x/crypto/nacl/secretbox`,
-  already vendored) for the DEK-wrap and data-encryption primitive — either
-  avoids a new dependency; pick one to standardize on.
-- **Argon2id parameter defaults** (`time=3, memory=64MiB, threads=4`) need
-  validation against the real range of node hardware (a headless 3090 box
-  vs. a modest laptop) before being locked in as the v1 shipped default.
-- **Session/Lock lifecycle**: does a `Session` auto-lock on an idle timeout,
-  only on explicit `Lock()`/process exit, or both? Not specified by the
-  issue; affects how long `vault_unlocked` can stay true.
-- **Weekly cache semantics**: is the 7-day window a sliding window that
-  resets on every correct entry (this doc assumes yes — "re-prompt if more
-  than a week has passed since the *last* entry"), or a fixed period from
-  first entry? Please confirm the intended reading.
+All questions originally raised here have been reviewed and resolved by the
+maintainer — see **Resolved decisions** near the top of this doc for the
+locked answers. Kept below for traceability; none are still open.
+
+- ~~Boot-critical secrets (device bearer token, tsnet machine key) excluded
+  from v1's vault scope (§2)?~~ **RESOLVED** — excluded from v1 permanently;
+  a future phase may revisit with a "prompt on every reboot" trade-off.
+- ~~Should `permissions.yaml` (and `PasscodeHash`) move from
+  `platform.ConfigDir()` to `network.GetNodeConfigDir()`?~~ **RESOLVED** —
+  not migrated in v1; stays under `platform.ConfigDir()`. Only the new
+  lockout/attempt-counter state (§5) goes under `GetNodeConfigDir()`.
+- ~~Scope of the lockout counter / weekly re-prompt cache (§5): per node or
+  per caller identity?~~ **RESOLVED** — single node-wide counter, not
+  scoped per identity.
+- ~~Exact heartbeat field names/shape for vault presence vs. unlock state
+  (§9)?~~ **RESOLVED** — `has_vault_passphrase` and `vault_unlocked`, both
+  without `omitempty`.
+- ~~AES-256-GCM (stdlib) vs. NaCl secretbox for the DEK-wrap and
+  data-encryption primitive?~~ **RESOLVED** — AES-256-GCM (stdlib).
+- ~~Argon2id parameter defaults need validation against real node
+  hardware?~~ **RESOLVED (defaults kept as proposed)** — `time=3,
+  memory=64MiB, threads=4, keyLen=32` ships as the v1 default; validating
+  against real hardware is a **pre-ship task for the implementation PR**,
+  not an open design question.
+- ~~Session/Lock lifecycle: auto-idle timeout, explicit `Lock()`/process
+  exit only, or both?~~ **RESOLVED** — v1 is explicit `Lock()` + process
+  exit only, no auto-idle timeout.
+- ~~Weekly cache semantics: sliding window from last entry, or fixed period
+  from first entry?~~ **RESOLVED** — sliding window, resets on every
+  correct entry.
+
+No genuinely open design questions remain for this doc. Any new questions
+that surface during implementation should be raised on the implementation
+PR, not resolved by silently re-interpreting this doc.
