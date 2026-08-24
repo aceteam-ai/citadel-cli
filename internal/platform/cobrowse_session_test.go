@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeLauncher returns a launchCobrowseProc replacement that never spawns a real
@@ -16,20 +17,28 @@ type fakeLauncher struct {
 	mu       sync.Mutex
 	n        int
 	profiles []string
+	urls     []string
 	stopped  int
 	// exitedNow, when set, returns an already-closed exited channel so the session
 	// reads as crashed (SessionExited) immediately.
 	exitedNow bool
+	// gate, when non-nil, blocks each launch until it is received from, so a test can
+	// hold a launch mid-flight and race a concurrent Stop against it.
+	gate chan struct{}
 }
 
 func (f *fakeLauncher) install(t *testing.T) {
 	t.Helper()
 	prev := launchCobrowseProc
 	launchCobrowseProc = func(profileDir, startURL string) (*cobrowseProc, error) {
+		if f.gate != nil {
+			<-f.gate
+		}
 		f.mu.Lock()
 		f.n++
 		n := f.n
 		f.profiles = append(f.profiles, profileDir)
+		f.urls = append(f.urls, startURL)
 		f.mu.Unlock()
 		exited := make(chan struct{})
 		if f.exitedNow {
@@ -62,13 +71,26 @@ func TestCobrowseSession_Isolation(t *testing.T) {
 
 	m := newCobrowseSessionManager(t.TempDir(), 8)
 
-	a, err := m.StartSession("")
+	a, err := m.StartSession("https://a.example")
 	if err != nil {
 		t.Fatalf("start session a: %v", err)
 	}
-	b, err := m.StartSession("")
+	b, err := m.StartSession("https://b.example")
 	if err != nil {
 		t.Fatalf("start session b: %v", err)
+	}
+
+	// The start URL must reach the launcher (mutation check for the dropped-url bug):
+	// StartSession's argument has to be threaded through to launchCobrowseProc.
+	f.mu.Lock()
+	gotURLs := append([]string(nil), f.urls...)
+	f.mu.Unlock()
+	wantURLs := map[string]bool{"https://a.example": true, "https://b.example": true}
+	for _, u := range gotURLs {
+		delete(wantURLs, u)
+	}
+	if len(wantURLs) != 0 {
+		t.Errorf("start URLs not passed to launcher; missing %v (got %v)", wantURLs, gotURLs)
 	}
 
 	if a.ID == b.ID {
@@ -242,7 +264,8 @@ func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
-	writeSessionPidfile(orphan, 424242, 424243)
+	// Owner PID 424241 is a dead process (unused), so the dir is a real orphan.
+	writeSessionPidfile(orphan, 424241, 424242, 424243)
 
 	var killed []int
 	prevKiller := pidKiller
@@ -270,14 +293,153 @@ func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
 // TestCobrowseSession_PidfileRoundTrip pins the pidfile format the sweep depends on.
 func TestCobrowseSession_PidfileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	writeSessionPidfile(dir, 111, 222)
-	b, x := readSessionPidfile(dir)
-	if b != 111 || x != 222 {
-		t.Errorf("pidfile round-trip mismatch: got (%d,%d) want (111,222)", b, x)
+	writeSessionPidfile(dir, 111, 222, 333)
+	o, b, x := readSessionPidfile(dir)
+	if o != 111 || b != 222 || x != 333 {
+		t.Errorf("pidfile round-trip mismatch: got (%d,%d,%d) want (111,222,333)", o, b, x)
 	}
 	// A missing pidfile yields zeros, never a panic.
-	b, x = readSessionPidfile(t.TempDir())
-	if b != 0 || x != 0 {
-		t.Errorf("missing pidfile should read (0,0), got (%d,%d)", b, x)
+	o, b, x = readSessionPidfile(t.TempDir())
+	if o != 0 || b != 0 || x != 0 {
+		t.Errorf("missing pidfile should read (0,0,0), got (%d,%d,%d)", o, b, x)
+	}
+}
+
+// TestCobrowseSession_SweepSkipsLiveOwner verifies the sweep leaves a session dir
+// owned by a STILL-ALIVE process alone -- one citadel process must never reap the
+// live sessions of a sibling worker sharing the parent dir. Mutation check: without
+// the pidAlive owner guard, this test's kill-count assertion fails.
+func TestCobrowseSession_SweepSkipsLiveOwner(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "cb-live-sibling")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Use the parent process PID as the owner: it is alive for the duration of the
+	// test and differs from our own PID, so it models a live SIBLING worker (the
+	// sweep deliberately does not skip its own PID, only other live processes).
+	writeSessionPidfile(live, os.Getppid(), 515151, 515152)
+
+	var killed []int
+	prevKiller := pidKiller
+	pidKiller = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+	t.Cleanup(func() { pidKiller = prevKiller })
+
+	m := newCobrowseSessionManager(base, 8)
+	m.sweep()
+
+	if len(killed) != 0 {
+		t.Errorf("sweep must not kill a live owner's browser pids, killed %v", killed)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("live sibling's dir must survive the sweep: %v", err)
+	}
+}
+
+// TestCobrowseSession_StopDuringLaunch is the shutdown-mid-start race: a StopAll that
+// races an in-flight launch must not orphan the browser. The launcher is gated so the
+// launch is held mid-flight; StopAll runs, then the launch is released. StartSession
+// must error AND the freshly launched browser must be torn down (no orphan).
+func TestCobrowseSession_StopDuringLaunch(t *testing.T) {
+	f := &fakeLauncher{gate: make(chan struct{})}
+	f.install(t)
+	m := newCobrowseSessionManager(t.TempDir(), 8)
+
+	startErr := make(chan error, 1)
+	go func() {
+		_, err := m.StartSession("")
+		startErr <- err
+	}()
+
+	// Wait until the session slot is registered (StartSession inserted it before
+	// blocking in the gated launcher), then stop everything mid-launch.
+	waitFor(t, func() bool { return len(m.List()) == 1 })
+	if err := m.StopAll(); err != nil {
+		t.Fatalf("stop all: %v", err)
+	}
+
+	// Release the launch so it completes into a stopped slot.
+	close(f.gate)
+	err := <-startErr
+	if err == nil {
+		t.Fatalf("StartSession should error when the session is stopped during launch")
+	}
+
+	// The browser that finished launching must have been torn down, not orphaned.
+	f.mu.Lock()
+	stopped := f.stopped
+	f.mu.Unlock()
+	if stopped != 1 {
+		t.Errorf("browser launched into a stopped slot must be torn down; stop calls=%d", stopped)
+	}
+	if got := len(m.List()); got != 0 {
+		t.Errorf("no session should remain after stop-during-launch, got %d", got)
+	}
+}
+
+// waitFor polls cond up to ~2s, failing the test if it never becomes true.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
+}
+
+// TestCobrowseSession_RealLaunch exercises the REAL defaultLaunchCobrowseProc path
+// (the fake-launcher tests never touch it). It launches two concurrent sessions with
+// real Chromium + Xvfb, asserts they land on distinct displays and ports, and that
+// StopAll leaves no live browser/Xvfb process behind. Opt-in only (like
+// TestMeetingBrowser_Launch): CI containers have no working display even when the
+// binaries exist, so binary presence alone is not a safe trigger.
+func TestCobrowseSession_RealLaunch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real-launch test in -short mode")
+	}
+	if os.Getenv("CITADEL_BROWSER_INTEGRATION") == "" {
+		t.Skip("set CITADEL_BROWSER_INTEGRATION=1 to run the browser-session launch integration test")
+	}
+	if !ChromiumAvailable() || !XvfbAvailable() {
+		t.Skip("no Chromium or Xvfb on this host; skipping browser-session launch test")
+	}
+
+	m := newCobrowseSessionManager(filepath.Join(t.TempDir(), cobrowseSessionsDirName), 8)
+
+	a, err := m.StartSession("")
+	if err != nil {
+		t.Fatalf("start a: %v", err)
+	}
+	b, err := m.StartSession("")
+	if err != nil {
+		t.Fatalf("start b: %v", err)
+	}
+	if a.Display == b.Display {
+		t.Fatalf("concurrent real sessions share a display: %s", a.Display)
+	}
+	if a.DebugPort == b.DebugPort {
+		t.Fatalf("concurrent real sessions share a CDP port: %d", a.DebugPort)
+	}
+
+	// Capture the browser PIDs before teardown so we can confirm they are gone after.
+	var pids []int
+	for _, st := range []CobrowseSessionStatus{a, b} {
+		if _, bpid, _ := readSessionPidfile(st.Profile); bpid > 0 {
+			pids = append(pids, bpid)
+		}
+	}
+
+	if err := m.StopAll(); err != nil {
+		t.Fatalf("stop all: %v", err)
+	}
+	for _, pid := range pids {
+		if pidAlive(pid) {
+			t.Errorf("browser pid %d still alive after StopAll (orphaned)", pid)
+		}
 	}
 }

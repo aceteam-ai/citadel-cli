@@ -101,16 +101,9 @@ type cobrowseProc struct {
 // virtual display with the given throwaway profile dir. It is a package var so tests
 // can substitute a deterministic fake (mirroring portOwnerLookup / pidKiller). It
 // blocks until CDP is ready so the returned session is immediately drivable.
+// Display allocation is serialized inside startManagedXvfb, so concurrent launches
+// never collide on one virtual display.
 var launchCobrowseProc = defaultLaunchCobrowseProc
-
-// cobrowseXvfbLaunchMu serializes the display-allocation + Xvfb start across
-// concurrent launches. findFreeDisplay picks a display number by probing for the
-// X socket/lock, and startManagedXvfb returns only once that socket exists -- so
-// two concurrent StartSession calls could both pick :99, the second Xvfb would exit
-// ("server already active"), and its socket poll would see the FIRST session's
-// socket and wrongly succeed, silently rendering both browsers on one display.
-// Holding this mutex until the socket exists makes the next findFreeDisplay skip it.
-var cobrowseXvfbLaunchMu sync.Mutex
 
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
@@ -213,7 +206,8 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 	m.sessions[id] = s
 	m.mu.Unlock()
 
-	if err := m.launch(s); err != nil {
+	proc, err := m.launch(s, startURL)
+	if err != nil {
 		// Failed launch: drop the reserved slot and remove the throwaway profile dir
 		// so a launch that never produced a browser leaks neither a slot nor a dir.
 		m.mu.Lock()
@@ -222,29 +216,47 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 		_ = os.RemoveAll(s.profile)
 		return CobrowseSessionStatus{}, err
 	}
+
+	// A concurrent Stop/StopAll (e.g. node shutdown mid-launch) may have removed this
+	// session from the map while the browser was still starting. teardown() then saw
+	// proc==nil and only removed the profile dir, so the browser we just finished
+	// launching is owned by nobody -- not the map, not a pidfile. Re-check under the
+	// lock: if the slot is gone, tear down the fresh browser ourselves so it does not
+	// orphan across shutdown.
+	m.mu.Lock()
+	if m.sessions[id] != s {
+		m.mu.Unlock()
+		_ = proc.stop()
+		_ = os.RemoveAll(s.profile)
+		return CobrowseSessionStatus{}, fmt.Errorf("session %s was stopped during launch", id)
+	}
+	m.mu.Unlock()
+
 	return s.status(), nil
 }
 
 // launch creates the session's profile dir, spawns the browser via the (injectable)
 // launcher, records the PIDs for crash recovery, and flips the session to running.
-func (m *CobrowseSessionManager) launch(s *cobrowseSession) error {
+// Returns the running proc so the caller can tear it down if the session was stopped
+// during launch.
+func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*cobrowseProc, error) {
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
-		return fmt.Errorf("create session profile dir: %w", err)
+		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
-	proc, err := launchCobrowseProc(s.profile, "")
+	proc, err := launchCobrowseProc(s.profile, startURL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
 	// the session still runs and graceful stop still reaps it in-process.
-	writeSessionPidfile(s.profile, proc.browserPID, proc.xvfbPID)
+	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID)
 
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
 	s.mu.Unlock()
-	return nil
+	return proc, nil
 }
 
 // SessionStatus returns the queryable state of one session.
@@ -396,12 +408,9 @@ func defaultLaunchCobrowseProc(profileDir, startURL string) (*cobrowseProc, erro
 		return nil, err
 	}
 
-	// Serialize display allocation so concurrent launches never collide on one
-	// virtual display (see cobrowseXvfbLaunchMu). Hold only until the Xvfb socket
-	// exists, not across the browser launch or CDP wait.
-	cobrowseXvfbLaunchMu.Lock()
+	// startManagedXvfb serializes display allocation internally, so concurrent
+	// launches never collide on one virtual display.
 	xvfb, display, err := startManagedXvfb(xvfbResolution())
-	cobrowseXvfbLaunchMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -501,37 +510,45 @@ func pidOf(cmd *exec.Cmd) int {
 	return cmd.Process.Pid
 }
 
-// writeSessionPidfile records the browser and Xvfb PIDs under the session dir so a
-// later process's sweep can reap them if this process dies before graceful teardown.
-func writeSessionPidfile(profileDir string, browserPID, xvfbPID int) {
+// writeSessionPidfile records the OWNING citadel process PID plus the browser and
+// Xvfb PIDs under the session dir, so a later process's sweep can reap the browser +
+// Xvfb if the owner dies before graceful teardown -- while leaving sessions of a
+// still-live sibling process (e.g. the control-center worker running beside
+// `citadel work`) untouched.
+func writeSessionPidfile(profileDir string, ownerPID, browserPID, xvfbPID int) {
 	path := filepath.Join(profileDir, sessionPidfileName)
-	content := fmt.Sprintf("%d\n%d\n", browserPID, xvfbPID)
+	content := fmt.Sprintf("%d\n%d\n%d\n", ownerPID, browserPID, xvfbPID)
 	_ = os.WriteFile(path, []byte(content), 0o600)
 }
 
-// readSessionPidfile parses the browser + Xvfb PIDs from a session dir's pidfile.
-// Missing or malformed lines yield 0 (skip), never an error, so a partial file still
-// lets the sweep reap whatever it can.
-func readSessionPidfile(profileDir string) (browserPID, xvfbPID int) {
+// readSessionPidfile parses the owner, browser, and Xvfb PIDs from a session dir's
+// pidfile. Missing or malformed lines yield 0 (skip), never an error, so a partial
+// file still lets the sweep reap whatever it can.
+func readSessionPidfile(profileDir string) (ownerPID, browserPID, xvfbPID int) {
 	data, err := os.ReadFile(filepath.Join(profileDir, sessionPidfileName))
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	lines := strings.Fields(string(data))
 	if len(lines) > 0 {
-		browserPID, _ = strconv.Atoi(lines[0])
+		ownerPID, _ = strconv.Atoi(lines[0])
 	}
 	if len(lines) > 1 {
-		xvfbPID, _ = strconv.Atoi(lines[1])
+		browserPID, _ = strconv.Atoi(lines[1])
 	}
-	return browserPID, xvfbPID
+	if len(lines) > 2 {
+		xvfbPID, _ = strconv.Atoi(lines[2])
+	}
+	return ownerPID, browserPID, xvfbPID
 }
 
-// sweep reaps sessions orphaned by a prior crashed/SIGKILLed process: for every
-// session dir under baseDir it kills the recorded PIDs (if still alive) and removes
-// the dir. Runs once, before this process's first StartSession, when the in-memory
-// map is empty -- so every dir on disk belongs to a dead predecessor, never a live
-// session of this process. Reuses the injectable pidKiller seam from cobrowse_orphan.go.
+// sweep reaps sessions orphaned by a CRASHED/SIGKILLed process: for every session dir
+// under baseDir whose owning citadel process is no longer alive, it kills the recorded
+// browser + Xvfb PIDs and removes the dir. Dirs owned by a still-live process are left
+// alone -- multiple citadel processes on one host (e.g. `citadel work` beside the
+// control-center worker) share this parent dir, and one must never reap another's live
+// sessions. Runs once, before this process's first StartSession. Reuses the injectable
+// pidKiller / pidAlive seams from cobrowse_orphan.go.
 func (m *CobrowseSessionManager) sweep() {
 	entries, err := os.ReadDir(m.baseDir)
 	if err != nil {
@@ -542,7 +559,12 @@ func (m *CobrowseSessionManager) sweep() {
 			continue
 		}
 		dir := filepath.Join(m.baseDir, e.Name())
-		browserPID, xvfbPID := readSessionPidfile(dir)
+		ownerPID, browserPID, xvfbPID := readSessionPidfile(dir)
+		// Skip a dir whose owning process is still alive: it is not an orphan, and its
+		// browser belongs to a live sibling worker.
+		if ownerPID > 0 && ownerPID != os.Getpid() && pidAlive(ownerPID) {
+			continue
+		}
 		for _, pid := range []int{browserPID, xvfbPID} {
 			if pid > 0 && pid != os.Getpid() {
 				_ = pidKiller(pid)
