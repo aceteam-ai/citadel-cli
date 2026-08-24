@@ -3,6 +3,7 @@ package terminal
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,73 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// terminalPasscodeSubprotocol is the WebSocket subprotocol marker a BROWSER
+// client uses to present the node passcode without a query-string secret
+// (citadel #757). A browser's WebSocket API cannot set arbitrary request
+// headers on the upgrade — so the CLI's X-Citadel-Passcode header path is
+// unavailable to it — but `new WebSocket(url, protocols)` CAN set the
+// Sec-WebSocket-Protocol request header via its second argument. Convention:
+// a TWO-ELEMENT protocol list, [terminalPasscodeSubprotocol,
+// "<base64url(passcode)>"], e.g. in JS:
+//
+//	new WebSocket(url, ["citadel.passcode", base64UrlEncode(passcode)])
+//
+// Base64url (no padding, RFC 4648 §5) is mandatory for the second element,
+// not just convenient: Sec-WebSocket-Protocol values must satisfy the HTTP
+// token grammar (RFC 6455 §4.1 → RFC 2616 token), which rejects many
+// characters — spaces, commas, quotes — a raw passcode could contain.
+// Base64url's alphabet (A-Za-z0-9-_) is always token-safe regardless of the
+// passcode's raw bytes. See aceteam#7528 for the browser/relay-side encoder
+// this must match.
+//
+// Per RFC 6455 §4.1 and the WebSocket API spec, the server MUST echo back
+// exactly one of the client-offered subprotocol values in its 101 response,
+// or the browser MUST fail the handshake. handleWebSocket echoes back
+// terminalPasscodeSubprotocol itself (never the encoded passcode) whenever
+// the client offered it — see clientOfferedPasscodeSubprotocol.
+const terminalPasscodeSubprotocol = "citadel.passcode"
+
+// clientOfferedPasscodeSubprotocol reports whether the client's parsed
+// Sec-WebSocket-Protocol list included the terminalPasscodeSubprotocol
+// marker, regardless of whether a decodable passcode value followed it.
+// Deliberately decoupled from whether config.PasscodeVerifier is even wired:
+// a browser dialing with the subprotocol convention expects the marker
+// echoed back on ANY /terminal upgrade, not only nodes with a passcode
+// configured, or the handshake fails client-side before the passcode gate
+// (or its absence) is ever reached.
+func clientOfferedPasscodeSubprotocol(protocols []string) bool {
+	for _, p := range protocols {
+		if p == terminalPasscodeSubprotocol {
+			return true
+		}
+	}
+	return false
+}
+
+// passcodeFromSubprotocol extracts a passcode from the parsed
+// Sec-WebSocket-Protocol list per the terminalPasscodeSubprotocol convention:
+// a two-element [marker, base64url(passcode)] list (see that const's doc
+// comment). Returns ok=false when the marker is absent, has no following
+// element, or the following element fails to base64url-decode — a malformed
+// offer is treated as "no passcode presented this way", not as a literal
+// (and certainly wrong) passcode value.
+func passcodeFromSubprotocol(protocols []string) (passcode string, ok bool) {
+	for i, p := range protocols {
+		if p != terminalPasscodeSubprotocol {
+			continue
+		}
+		if i+1 >= len(protocols) {
+			return "", false
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(protocols[i+1])
+		if err != nil {
+			return "", false
+		}
+		return string(decoded), true
+	}
+	return "", false
+}
 
 // Logger is the interface for terminal server logging
 type Logger interface {
@@ -462,6 +530,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Get client IP for rate limiting
 	ip := getClientIP(r)
 
+	// Parsed once and reused both by the passcode gate (below) and by the
+	// upgrade response (which must echo back the subprotocol the client
+	// offered, citadel #757 — see terminalPasscodeSubprotocol's doc comment).
+	wsProtocols := websocket.Subprotocols(r)
+
 	atomic.AddInt64(&s.totalConnections, 1)
 	s.logger.Debugf("new connection attempt from %s", ip)
 
@@ -505,15 +578,33 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Passcode gate (aceteam#6524): even after a valid token or same-owner mesh
 	// identity, the caller must present the per-node passcode to open a shell.
 	// This is the owner-consent factor that makes "console enabled" different
-	// from "any org mesh peer can dial :7860 and get a shell". Presented via the
-	// ?passcode= query param (a browser WebSocket cannot set request headers on
-	// the upgrade), with the X-Citadel-Passcode header honored for non-browser
-	// clients. Fails closed. Skipped only when no verifier is wired (e.g. the
-	// localhost test server), preserving existing behavior there.
+	// from "any org mesh peer can dial :7860 and get a shell". Fails closed.
+	// Skipped only when no verifier is wired (e.g. the localhost test server),
+	// preserving existing behavior there.
+	//
+	// Three sources, in precedence order (citadel #757):
+	//  1. X-Citadel-Passcode header — non-browser clients (the CLI), which CAN
+	//     set arbitrary request headers on the upgrade.
+	//  2. The Sec-WebSocket-Protocol subprotocol convention — what a BROWSER
+	//     client uses instead, since the browser WebSocket API cannot set
+	//     arbitrary headers but CAN set this one via `new WebSocket(url,
+	//     protocols)`. See terminalPasscodeSubprotocol's doc comment for the
+	//     exact wire convention.
+	//  3. ?passcode= query param — DEPRECATED. Kept only so in-flight web
+	//     console builds that predate the subprotocol convention keep working
+	//     during rollout; it leaks the passcode into proxy/gateway access
+	//     logs, browser history, and Referer headers. Slated for removal in a
+	//     later release once #7528's browser/relay side ships the
+	//     subprotocol path.
 	if s.config.PasscodeVerifier != nil {
-		passcode := r.URL.Query().Get("passcode")
+		passcode := r.Header.Get("X-Citadel-Passcode")
 		if passcode == "" {
-			passcode = r.Header.Get("X-Citadel-Passcode")
+			if sp, ok := passcodeFromSubprotocol(wsProtocols); ok {
+				passcode = sp
+			}
+		}
+		if passcode == "" {
+			passcode = r.URL.Query().Get("passcode")
 		}
 		if !s.config.PasscodeVerifier(passcode) {
 			// Distinguish "no passcode configured at all" (ReasonPasscodeNotSet:
@@ -547,8 +638,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upgrade to WebSocket
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	// Upgrade to WebSocket. If the client offered the passcode subprotocol
+	// (citadel #757), the 101 response MUST echo it back — RFC 6455 requires
+	// the server to confirm one of the client-offered Sec-WebSocket-Protocol
+	// values, and a browser fails the handshake client-side otherwise. The
+	// Upgrader itself has no static Subprotocols list configured (this value
+	// is per-connection, base64-encoded passcode aside), so gorilla's
+	// selectSubprotocol falls through to whatever we set here — see
+	// terminalPasscodeSubprotocol's doc comment for the wire convention.
+	var upgradeResponseHeader http.Header
+	if clientOfferedPasscodeSubprotocol(wsProtocols) {
+		upgradeResponseHeader = http.Header{}
+		upgradeResponseHeader.Set("Sec-WebSocket-Protocol", terminalPasscodeSubprotocol)
+	}
+	conn, err := s.upgrader.Upgrade(w, r, upgradeResponseHeader)
 	if err != nil {
 		s.logger.Printf("websocket upgrade failed for %s: %v", ip, err)
 		atomic.AddInt64(&s.failedConnections, 1)
