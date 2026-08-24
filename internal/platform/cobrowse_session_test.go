@@ -3,6 +3,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -69,7 +70,7 @@ func TestCobrowseSession_Isolation(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	a, err := m.StartSession("https://a.example")
 	if err != nil {
@@ -120,7 +121,7 @@ func TestCobrowseSession_Isolation(t *testing.T) {
 func TestCobrowseSession_StopRemovesProfileAndSlot(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	a, _ := m.StartSession("")
 	b, _ := m.StartSession("")
@@ -151,7 +152,7 @@ func TestCobrowseSession_StopRemovesProfileAndSlot(t *testing.T) {
 func TestCobrowseSession_StopAll(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	sessions := []CobrowseSessionStatus{}
 	for i := 0; i < 3; i++ {
@@ -186,7 +187,7 @@ func TestCobrowseSession_StopAll(t *testing.T) {
 func TestCobrowseSession_Cap(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 2)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 2)
 
 	if _, err := m.StartSession(""); err != nil {
 		t.Fatalf("first start: %v", err)
@@ -204,7 +205,7 @@ func TestCobrowseSession_Cap(t *testing.T) {
 func TestCobrowseSession_CrashReportsExited(t *testing.T) {
 	f := &fakeLauncher{exitedNow: true}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	st, err := m.StartSession("")
 	if err != nil {
@@ -222,7 +223,7 @@ func TestCobrowseSession_CrashReportsExited(t *testing.T) {
 // TestCobrowseSession_StatusUnknown confirms an unknown id reports not-found rather
 // than a fabricated status.
 func TestCobrowseSession_StatusUnknown(t *testing.T) {
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 	if _, ok := m.SessionStatus("cb-does-not-exist"); ok {
 		t.Errorf("unknown session should not be found")
 	}
@@ -233,7 +234,7 @@ func TestCobrowseSession_StatusUnknown(t *testing.T) {
 func TestCobrowseSession_Attach(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	st, _ := m.StartSession("")
 	if !m.MarkAttached(st.ID) {
@@ -255,11 +256,33 @@ func TestCobrowseSession_Attach(t *testing.T) {
 	}
 }
 
+// trustedBaseDir returns a fresh temp dir chmod'd to 0700, modeling what
+// ensureCobrowseBaseDir itself creates in production (plain os.MkdirAll(dir, 0o700)
+// under os.TempDir()). t.TempDir()'s own per-test subdir is NOT a stand-in for this:
+// Go's testing package creates it via MkdirAll(dir, 0777), which under a permissive
+// umask can leave it group-writable -- exactly the shape validateCobrowseBaseDirPerms
+// exists to reject, but not what production's own dir-creation path produces. Tests
+// that exercise sweep()'s actual reap/skip behavior (as opposed to the refusal gate
+// itself) need a base dir that passes validation, so they use this instead of a bare
+// t.TempDir().
+func trustedBaseDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatalf("chmod base dir: %v", err)
+		}
+	}
+	return dir
+}
+
 // TestCobrowseSession_SweepReapsOrphans verifies the startup sweep kills the PIDs
 // recorded in an orphaned session dir and removes the dir. Uses the injectable
-// pidKiller seam so no real process is signalled.
+// pidKiller seam so no real process is signalled, and stubs the cmdline-identity
+// check to match so the kill path (not the identity check itself, covered separately
+// below) is what's under test here.
 func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
-	base := t.TempDir()
+	base := trustedBaseDir(t)
 	orphan := filepath.Join(base, "cb-orphan")
 	if err := os.MkdirAll(orphan, 0o700); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
@@ -274,6 +297,7 @@ func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { pidKiller = prevKiller })
+	installMatchingCmdlineReader(t)
 
 	m := newCobrowseSessionManager(base, 8)
 	m.sweep()
@@ -310,7 +334,7 @@ func TestCobrowseSession_PidfileRoundTrip(t *testing.T) {
 // live sessions of a sibling worker sharing the parent dir. Mutation check: without
 // the pidAlive owner guard, this test's kill-count assertion fails.
 func TestCobrowseSession_SweepSkipsLiveOwner(t *testing.T) {
-	base := t.TempDir()
+	base := trustedBaseDir(t)
 	live := filepath.Join(base, "cb-live-sibling")
 	if err := os.MkdirAll(live, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -346,7 +370,7 @@ func TestCobrowseSession_SweepSkipsLiveOwner(t *testing.T) {
 func TestCobrowseSession_StopDuringLaunch(t *testing.T) {
 	f := &fakeLauncher{gate: make(chan struct{})}
 	f.install(t)
-	m := newCobrowseSessionManager(t.TempDir(), 8)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
 	startErr := make(chan error, 1)
 	go func() {
@@ -377,6 +401,211 @@ func TestCobrowseSession_StopDuringLaunch(t *testing.T) {
 	}
 	if got := len(m.List()); got != 0 {
 		t.Errorf("no session should remain after stop-during-launch, got %d", got)
+	}
+}
+
+// installMatchingCmdlineReader stubs procCmdlineReader to report a cmdline that
+// matches BOTH the browser and Xvfb identity markers for any PID, so a sweep test
+// exercising something other than the identity check itself (orphan reaping, owner
+// skip) doesn't get tripped up by the fail-closed default.
+func installMatchingCmdlineReader(t *testing.T) {
+	t.Helper()
+	prev := procCmdlineReader
+	procCmdlineReader = func(pid int) (string, error) {
+		return "/usr/bin/chromium --headless\x00Xvfb :99", nil
+	}
+	t.Cleanup(func() { procCmdlineReader = prev })
+}
+
+// TestCobrowseSession_SweepVerifiesIdentityBeforeKill is the core security-fix test
+// (issue #793 review): sweep must NOT SIGKILL a recorded PID whose cmdline does not
+// match the expected browser/Xvfb binary -- e.g. because the PID was recycled by the
+// OS to an unrelated process after a reboot (the pidfile's base dir is plain /tmp,
+// which often survives a reboot). It must still clean up the stale session dir.
+func TestCobrowseSession_SweepVerifiesIdentityBeforeKill(t *testing.T) {
+	base := trustedBaseDir(t)
+	orphan := filepath.Join(base, "cb-orphan")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatalf("mkdir orphan: %v", err)
+	}
+	// Dead owner -> orphan. Recorded browser/xvfb PIDs are arbitrary numbers standing
+	// in for "recycled to some unrelated process" (e.g. sshd) since the reboot.
+	const recycledBrowserPID = 909001
+	const recycledXvfbPID = 909002
+	writeSessionPidfile(orphan, 424241, recycledBrowserPID, recycledXvfbPID)
+
+	var killed []int
+	prevKiller := pidKiller
+	pidKiller = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+	t.Cleanup(func() { pidKiller = prevKiller })
+
+	// Simulate the recycled PIDs now belonging to an unrelated process: cmdline
+	// present and readable, but it names neither a browser nor Xvfb.
+	prevReader := procCmdlineReader
+	procCmdlineReader = func(pid int) (string, error) {
+		if pid == recycledBrowserPID || pid == recycledXvfbPID {
+			return "/usr/sbin/sshd -D\x00", nil
+		}
+		return "", os.ErrNotExist
+	}
+	t.Cleanup(func() { procCmdlineReader = prevReader })
+
+	m := newCobrowseSessionManager(base, 8)
+	m.sweep()
+
+	if len(killed) != 0 {
+		t.Errorf("sweep must not kill a PID whose cmdline no longer matches, killed %v", killed)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("stale orphan dir should still be cleaned up even when the kill is skipped, stat err=%v", err)
+	}
+}
+
+// TestCobrowseSession_SweepSkipsKillWhenCmdlineUnreadable covers the other fail-closed
+// branch: the cmdline read errors outright (process gone between the pidfile read and
+// the check, or -- on a non-Linux node -- no /proc at all). Unreadable must be treated
+// the same as "mismatched": no kill, but the stale dir is still removed.
+func TestCobrowseSession_SweepSkipsKillWhenCmdlineUnreadable(t *testing.T) {
+	base := trustedBaseDir(t)
+	orphan := filepath.Join(base, "cb-orphan")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatalf("mkdir orphan: %v", err)
+	}
+	writeSessionPidfile(orphan, 424241, 909003, 909004)
+
+	var killed []int
+	prevKiller := pidKiller
+	pidKiller = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+	t.Cleanup(func() { pidKiller = prevKiller })
+
+	prevReader := procCmdlineReader
+	procCmdlineReader = func(pid int) (string, error) {
+		return "", os.ErrNotExist
+	}
+	t.Cleanup(func() { procCmdlineReader = prevReader })
+
+	m := newCobrowseSessionManager(base, 8)
+	m.sweep()
+
+	if len(killed) != 0 {
+		t.Errorf("sweep must not kill a PID it cannot verify, killed %v", killed)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("stale orphan dir should still be cleaned up, stat err=%v", err)
+	}
+}
+
+// TestCobrowseSession_ProcessMatchesRole pins the marker-matching rules processMatch
+// esRole depends on, independent of sweep.
+func TestCobrowseSession_ProcessMatchesRole(t *testing.T) {
+	prev := procCmdlineReader
+	t.Cleanup(func() { procCmdlineReader = prev })
+
+	cases := []struct {
+		name    string
+		cmdline string
+		err     error
+		role    cobrowseProcRole
+		want    bool
+	}{
+		{"chrome matches browser", "/usr/bin/google-chrome\x00--headless", nil, roleCobrowseBrowser, true},
+		{"chromium matches browser", "/usr/lib/chromium/chromium\x00--headless", nil, roleCobrowseBrowser, true},
+		{"xvfb matches xvfb", "/usr/bin/Xvfb\x00:51\x00-screen\x000\x001280x800x24", nil, roleCobrowseXvfb, true},
+		{"sshd does not match browser", "/usr/sbin/sshd\x00-D", nil, roleCobrowseBrowser, false},
+		{"sshd does not match xvfb", "/usr/sbin/sshd\x00-D", nil, roleCobrowseXvfb, false},
+		{"unreadable does not match", "", os.ErrNotExist, roleCobrowseBrowser, false},
+		{"empty cmdline does not match", "", nil, roleCobrowseXvfb, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			procCmdlineReader = func(pid int) (string, error) { return tc.cmdline, tc.err }
+			if got := processMatchesRole(12345, tc.role); got != tc.want {
+				t.Errorf("processMatchesRole(%q, role=%v) = %v, want %v", tc.cmdline, tc.role, got, tc.want)
+			}
+		})
+	}
+	if processMatchesRole(0, roleCobrowseBrowser) {
+		t.Errorf("pid<=0 must never match")
+	}
+}
+
+// TestCobrowseSession_SweepRefusesUntrustedBaseDir verifies the second gate: a base
+// dir that is NOT owned by the current user, or is group/other-writable, must cause
+// sweep to refuse entirely (no reads of its pidfiles trusted), rather than silently
+// fixing the permissions. This models a local unprivileged user pre-creating the
+// shared /tmp parent before citadel ever runs. Unix-only: the check is a no-op on
+// Windows (see cobrowse_basedir_windows.go).
+func TestCobrowseSession_SweepRefusesUntrustedBaseDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("base dir permission/ownership check is unix-only")
+	}
+	parent := t.TempDir()
+	base := filepath.Join(parent, "shared-base")
+	if err := os.MkdirAll(base, 0o777); err != nil {
+		t.Fatalf("mkdir base: %v", err)
+	}
+	// MkdirAll's mode is subject to umask, so force world-writable explicitly --
+	// models a pre-created, untrusted shared dir regardless of the test host's umask.
+	if err := os.Chmod(base, 0o777); err != nil {
+		t.Fatalf("chmod base: %v", err)
+	}
+
+	orphan := filepath.Join(base, "cb-orphan")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatalf("mkdir orphan: %v", err)
+	}
+	writeSessionPidfile(orphan, 424241, 909005, 909006)
+	installMatchingCmdlineReader(t) // would match/kill if sweep got this far
+
+	var killed []int
+	prevKiller := pidKiller
+	pidKiller = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+	t.Cleanup(func() { pidKiller = prevKiller })
+
+	m := newCobrowseSessionManager(base, 8)
+	m.sweep()
+
+	if len(killed) != 0 {
+		t.Errorf("sweep must refuse to act on a world-writable base dir, killed %v", killed)
+	}
+	// The untrusted dir's own contents must be left exactly alone -- sweep never even
+	// looks inside it.
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("sweep must not touch contents of an untrusted base dir: %v", err)
+	}
+}
+
+// TestCobrowseSession_EnsureBaseDirCreatesTrusted verifies the normal, no-prior-state
+// path: an absent base dir is created 0o700 (so a subsequent sweep in the same process
+// trusts it), matching what StartSession's first launch relies on implicitly.
+func TestCobrowseSession_EnsureBaseDirCreatesTrusted(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "fresh-base")
+	if err := ensureCobrowseBaseDir(dir); err != nil {
+		t.Fatalf("ensureCobrowseBaseDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat created dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("expected a directory")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
+		t.Errorf("expected mode 0700, got %o", info.Mode().Perm())
+	}
+	// Idempotent: calling again on the now-existing, well-formed dir must succeed.
+	if err := ensureCobrowseBaseDir(dir); err != nil {
+		t.Errorf("second ensureCobrowseBaseDir call should pass validation: %v", err)
 	}
 }
 

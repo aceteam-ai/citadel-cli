@@ -25,6 +25,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -364,9 +365,15 @@ func (s *cobrowseSession) teardown() error {
 
 // status computes the live queryable state, detecting a crashed browser via the
 // reaper channel so a dead session reports SessionExited rather than a stale running.
+//
+// The CDP probe (pickTarget) runs OUTSIDE s.mu: it is an HTTP round-trip that can take
+// up to a few seconds against a wedged endpoint, and teardown() also takes s.mu -- so
+// probing under the lock would let a hung CDP endpoint add that latency to every
+// Stop/StopAll of this session (and, since List calls status() per session serially,
+// to every session status in the list). st is a local, unshared struct, so filling in
+// its URL after unlocking is race-free.
 func (s *cobrowseSession) status() CobrowseSessionStatus {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	st := CobrowseSessionStatus{
 		ID:      s.id,
 		State:   s.state,
@@ -375,6 +382,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
+	var probePort int
 	if s.proc != nil {
 		st.DebugPort = s.proc.debugPort
 		st.Display = s.proc.display
@@ -385,9 +393,14 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		default:
 		}
 		if st.State == SessionRunning || st.State == SessionAttached {
-			if t, err := pickTarget(s.proc.debugPort); err == nil {
-				st.URL = t.URL
-			}
+			probePort = s.proc.debugPort
+		}
+	}
+	s.mu.Unlock()
+
+	if probePort != 0 {
+		if t, err := pickTarget(probePort); err == nil {
+			st.URL = t.URL
 		}
 	}
 	return st
@@ -542,14 +555,53 @@ func readSessionPidfile(profileDir string) (ownerPID, browserPID, xvfbPID int) {
 	return ownerPID, browserPID, xvfbPID
 }
 
+// ensureCobrowseBaseDir makes sure the session base dir exists, is owned by the
+// current user, and is not group/other-writable -- creating it (0o700) when absent so
+// the normal, no-prior-state path always passes. sweep() must call this BEFORE it
+// trusts any pidfile found under the dir: the parent lives under a shared, world-
+// writable os.TempDir(), so without this check a local unprivileged user could
+// pre-create the dir (or leave a stale one group/other-writable) and plant a pidfile
+// naming an arbitrary PID for a future sweep -- often running as root under systemd,
+// see CLAUDE.md's worker-watchdog notes -- to kill. Deliberately never modifies an
+// EXISTING dir that fails the check (no auto-chmod/chown): the caller refuses to sweep
+// instead.
+func ensureCobrowseBaseDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return os.MkdirAll(dir, 0o700)
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("cobrowse base dir %s exists and is not a directory", dir)
+	}
+	return validateCobrowseBaseDirPerms(dir, info)
+}
+
 // sweep reaps sessions orphaned by a CRASHED/SIGKILLed process: for every session dir
-// under baseDir whose owning citadel process is no longer alive, it kills the recorded
-// browser + Xvfb PIDs and removes the dir. Dirs owned by a still-live process are left
-// alone -- multiple citadel processes on one host (e.g. `citadel work` beside the
-// control-center worker) share this parent dir, and one must never reap another's live
-// sessions. Runs once, before this process's first StartSession. Reuses the injectable
-// pidKiller / pidAlive seams from cobrowse_orphan.go.
+// under baseDir whose owning citadel process is no longer alive, it identity-verifies
+// and kills the recorded browser + Xvfb PIDs, then removes the dir. Dirs owned by a
+// still-live process are left alone -- multiple citadel processes on one host (e.g.
+// `citadel work` beside the control-center worker) share this parent dir, and one must
+// never reap another's live sessions. Runs once, before this process's first
+// StartSession. Reuses the injectable pidKiller / pidAlive seams from
+// cobrowse_orphan.go plus processMatchesRole from cobrowse_identity.go.
+//
+// SECURITY: a pidfile is an on-disk claim from a PRIOR process, not a guarantee -- PIDs
+// are recycled by the OS, this base dir survives a reboot (plain /tmp, often not
+// tmpfs), and the recorded PID could by now belong to an unrelated process (sshd, a
+// user shell, ...). Two independent gates protect the kill:
+//  1. ensureCobrowseBaseDir, above, confirms the pidfiles themselves are trustworthy
+//     (nobody else could have planted this directory).
+//  2. processMatchesRole confirms, PID by PID, that the specific PID we are about to
+//     SIGKILL is STILL the browser/Xvfb it was recorded as, via /proc/<pid>/cmdline.
+//     A PID that fails this check is never killed -- only the stale dir is cleaned up.
 func (m *CobrowseSessionManager) sweep() {
+	if err := ensureCobrowseBaseDir(m.baseDir); err != nil {
+		log.Printf("[cobrowse] refusing session sweep of %s: %v", m.baseDir, err)
+		return
+	}
 	entries, err := os.ReadDir(m.baseDir)
 	if err != nil {
 		return // no parent dir yet: nothing to reap
@@ -565,11 +617,22 @@ func (m *CobrowseSessionManager) sweep() {
 		if ownerPID > 0 && ownerPID != os.Getpid() && pidAlive(ownerPID) {
 			continue
 		}
-		for _, pid := range []int{browserPID, xvfbPID} {
-			if pid > 0 && pid != os.Getpid() {
-				_ = pidKiller(pid)
-			}
-		}
+		m.sweepKillIfVerified(browserPID, roleCobrowseBrowser, "browser")
+		m.sweepKillIfVerified(xvfbPID, roleCobrowseXvfb, "Xvfb")
 		_ = os.RemoveAll(dir)
 	}
+}
+
+// sweepKillIfVerified kills pid only when processMatchesRole confirms it is still the
+// process sweep recorded it as for role. A mismatch or unverifiable PID is logged and
+// left alone -- fail closed, never kill on doubt.
+func (m *CobrowseSessionManager) sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
+	if pid <= 0 || pid == os.Getpid() {
+		return
+	}
+	if !processMatchesRole(pid, role) {
+		log.Printf("[cobrowse] sweep: pid %d recorded as %s no longer matches (or is unverifiable); skipping kill", pid, label)
+		return
+	}
+	_ = pidKiller(pid)
 }
