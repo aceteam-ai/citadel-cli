@@ -96,20 +96,28 @@ func TestDefaultConfig_TmuxOnByDefault(t *testing.T) {
 }
 
 // TestDefaultConfig_TmuxOptOut verifies operators can force a bare, non-persistent
-// shell by setting CITADEL_TERMINAL_SESSION to a disable sentinel.
+// shell by setting CITADEL_TERMINAL_SESSION to a disable sentinel. Covers every
+// accepted sentinel value (citadel #780), not just "none", at the same
+// env-var-driven layer a real deployment goes through (DefaultConfig ->
+// sessionCommand), complementing the pure-function coverage in
+// TestSessionCommand_DisableSentinel / TestSessionDisabled (tmux_test.go).
 func TestDefaultConfig_TmuxOptOut(t *testing.T) {
-	t.Setenv("CITADEL_TERMINAL_SESSION", "none")
-	makeFakeTmux(t) // even with tmux available, opt-out wins
+	for _, sentinel := range []string{"none", "off", "OFF", "disabled", "false", "0", " none "} {
+		t.Run(sentinel, func(t *testing.T) {
+			t.Setenv("CITADEL_TERMINAL_SESSION", sentinel)
+			makeFakeTmux(t) // even with tmux available, opt-out wins
 
-	config := DefaultConfig()
-	if config.SessionName != "none" {
-		t.Errorf("expected SessionName %q from env, got %q", "none", config.SessionName)
-	}
-	if !sessionDisabled(config.SessionName) {
-		t.Error("expected tmux backing to be disabled when opted out")
-	}
-	if got := sessionCommand(config.SessionName, config.Shell, false); got != nil {
-		t.Errorf("expected nil session command when opted out, got %v", got)
+			config := DefaultConfig()
+			if config.SessionName != sentinel {
+				t.Errorf("expected SessionName %q from env, got %q", sentinel, config.SessionName)
+			}
+			if !sessionDisabled(config.SessionName) {
+				t.Error("expected tmux backing to be disabled when opted out")
+			}
+			if got := sessionCommand(config.SessionName, config.Shell, false); got != nil {
+				t.Errorf("expected nil session command when opted out, got %v", got)
+			}
+		})
 	}
 }
 

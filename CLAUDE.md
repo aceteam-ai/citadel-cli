@@ -592,6 +592,14 @@ Handles device configuration from onboarding wizard. Config fields:
 
 The terminal service provides WebSocket-based terminal access to nodes. See [docs/terminal-service.md](docs/terminal-service.md) for full documentation.
 
+Connections are tmux-backed by default (`internal/terminal/tmux.go:sessionCommand`
+decides this per connection; `sessionDisabled` owns the disable-sentinel check).
+A power user running their own tmux (console, ssh elsewhere, `tmux a`) can avoid
+nesting by setting `CITADEL_TERMINAL_SESSION` to `none`/`off`/`disabled`/`false`/`0`
+on the node (citadel #780) — this is node-wide. The CLI (`citadel ssh`/`citadel
+connect`) is unaffected either way: it always defaults to a bare shell and only
+opts into tmux persistence with `--tmux` (citadel #759).
+
 **Key Packages:**
 - **`internal/terminal/server.go`**: WebSocket server with rate limiting
 - **`internal/terminal/session.go`**: PTY session management (creack/pty)
