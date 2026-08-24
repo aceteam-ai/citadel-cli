@@ -450,6 +450,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		if err := platform.GetCobrowseManager().Stop(); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: co-browse browser stop: %v\n", err)
 		}
+		// Tear down every interactive browser session (issue #793) so no session
+		// Chromium or virtual display orphans across a worker restart. No-op when
+		// no session was ever started.
+		if err := platform.GetCobrowseSessionManager().StopAll(); err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: browser session stop: %v\n", err)
+		}
 		// Cancel first so the async service-startup goroutine stops launching any
 		// further services.
 		cancel()

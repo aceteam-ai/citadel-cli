@@ -1,0 +1,103 @@
+// internal/jobs/cobrowse_session.go
+//
+// Interactive browser-session job handler (issue #793). Bridges the node's job stream
+// to the multi-session CobrowseSessionManager so a caller can start, query, and stop
+// isolated, concurrently-running browser sessions on the node.
+//
+// A single COBROWSE_SESSION job type carries an "action" payload field (start /
+// status / stop), keeping the worker registration to one entry -- mirroring the
+// single-session COBROWSE handler's wire shape. Each job is one short lifecycle
+// action; the browser session itself is a long-lived process owned by the manager,
+// not by any one job. The handler returns a JSON document as its output bytes so the
+// backend can parse a structured result.
+package jobs
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+)
+
+// Session lifecycle action types carried in the job payload's "action" field.
+const (
+	CobrowseSessionActionStart  = "start"
+	CobrowseSessionActionStatus = "status"
+	CobrowseSessionActionStop   = "stop"
+)
+
+// CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
+// CobrowseSessionManager singleton.
+type CobrowseSessionHandler struct{}
+
+// NewCobrowseSessionHandler constructs an interactive browser-session handler.
+func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+
+func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	action := job.Payload["action"]
+	if action == "" {
+		return nil, fmt.Errorf("job payload missing 'action' field")
+	}
+	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
+
+	mgr := platform.GetCobrowseSessionManager()
+
+	switch action {
+	case CobrowseSessionActionStart:
+		st, err := mgr.StartSession(job.Payload["url"])
+		if err != nil {
+			return nil, err
+		}
+		return sessionStatusResult(st)
+
+	case CobrowseSessionActionStatus:
+		// With a session_id, report that one session. Without, list every session --
+		// the queryable-state contract, always answerable even with none running.
+		id := job.Payload["session_id"]
+		if id == "" {
+			return sessionListResult(mgr.List())
+		}
+		st, ok := mgr.SessionStatus(id)
+		if !ok {
+			return nil, fmt.Errorf("no such browser session: %q", id)
+		}
+		return sessionStatusResult(st)
+
+	case CobrowseSessionActionStop:
+		id := job.Payload["session_id"]
+		if id == "" {
+			return nil, fmt.Errorf("stop requires a 'session_id' field")
+		}
+		if err := mgr.Stop(id); err != nil {
+			return nil, err
+		}
+		out, _ := json.Marshal(map[string]any{"stopped": id})
+		return out, nil
+
+	default:
+		return nil, fmt.Errorf("unknown browser-session action: %q", action)
+	}
+}
+
+// sessionStatusResult marshals one session's status to JSON output bytes.
+func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
+	out, err := json.Marshal(st)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// sessionListResult marshals a list of session statuses to JSON output bytes, always
+// as a JSON array (never null) so a caller can iterate an empty result unconditionally.
+func sessionListResult(list []platform.CobrowseSessionStatus) ([]byte, error) {
+	if list == nil {
+		list = []platform.CobrowseSessionStatus{}
+	}
+	out, err := json.Marshal(map[string]any{"sessions": list})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
