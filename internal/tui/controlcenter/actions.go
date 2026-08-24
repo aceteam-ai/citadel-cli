@@ -137,6 +137,17 @@ func (cc *ControlCenter) showServiceDetailModal() {
 			sb.WriteString(fmt.Sprintf("[yellow]Uptime:[-] %s\n", svc.Uptime))
 		}
 
+		// Detected-unmanaged marker (citadel #657): this row is an inference
+		// engine running on the node that citadel did not start (not in
+		// citadel.yaml `services:`), so citadel has no compose file to act on
+		// and start/stop/restart from here is disabled.
+		if !svc.Managed {
+			sb.WriteString("[cyan]Detected, unmanaged[-] — citadel did not start this engine\n")
+			if len(svc.Models) > 0 {
+				sb.WriteString(fmt.Sprintf("[yellow]Serving:[-] %s\n", strings.Join(svc.Models, ", ")))
+			}
+		}
+
 		// Container info if running (get via docker inspect)
 		if svc.Status == "running" && cc.getServiceDetailFn != nil {
 			if detail := cc.getServiceDetailFn(svc.Name); detail != nil {
@@ -157,9 +168,12 @@ func (cc *ControlCenter) showServiceDetailModal() {
 
 		// Actions hint
 		sb.WriteString("\n[gray]─────────────────────────────────────────[-]\n")
-		if svc.Status == "running" {
+		switch {
+		case !svc.Managed:
+			sb.WriteString("[gray]No actions available for a detected/unmanaged engine  │  Esc Close[-]")
+		case svc.Status == "running":
 			sb.WriteString("[yellow]X[-] Stop  │  [yellow]R[-] Restart  │  [yellow]L[-] Logs  │  [gray]Esc[-] Close")
-		} else {
+		default:
 			sb.WriteString("[yellow]S[-] Start  │  [yellow]L[-] Logs  │  [gray]Esc[-] Close")
 		}
 
@@ -184,6 +198,12 @@ func (cc *ControlCenter) showServiceDetailModal() {
 			closeModal()
 			return nil
 		case tcell.KeyRune:
+			// A detected/unmanaged row (citadel #657) has no compose file or
+			// container name citadel owns, so every action here is a no-op by
+			// design — see the "No actions available" hint above.
+			if !svcInfo.Managed {
+				return nil
+			}
 			switch event.Rune() {
 			case 's', 'S':
 				if svcInfo.Status != "running" {
