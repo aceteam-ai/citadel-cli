@@ -64,25 +64,39 @@ citadel work --mode=nexus --terminal --terminal-port 7860
 | `CITADEL_TERMINAL_IDLE_TIMEOUT` | Idle timeout in minutes | 30 |
 | `CITADEL_TERMINAL_MAX_CONNECTIONS` | Max concurrent sessions | 10 |
 | `CITADEL_TERMINAL_SHELL` | Shell to spawn | Platform default |
-| `CITADEL_TERMINAL_SESSION` | Persistent tmux session name to back connections | (unset = bare shell) |
+| `CITADEL_TERMINAL_SESSION` | Persistent tmux session base name to back connections, or a disable sentinel (`none`/`off`/`disabled`/`false`/`0`, case-insensitive) to force a bare shell | `citadel` (tmux backing ON) |
 | `CITADEL_TMUX_BIN` | Explicit path to a tmux binary (overrides PATH/managed lookup) | (unset) |
 | `CITADEL_AUTH_HOST` | Authentication service URL | https://aceteam.ai |
 | `CITADEL_TOKEN_REFRESH_INTERVAL` | Token cache refresh interval in minutes | 60 |
 
 ### Persistent tmux Sessions
 
-When `CITADEL_TERMINAL_SESSION` is set (and a usable `tmux` binary is available),
-each WebSocket connection is backed by a named tmux session via
-`tmux new-session -A -s <name>` instead of a fresh bare shell. The tmux server
-keeps the session alive after a client disconnects, so reconnecting re-attaches
-to the same session and the terminal state (running programs, scrollback,
-working directory) survives reconnects. This backs the "chat to a node" path in
-the mobile/desktop apps.
+By default (`CITADEL_TERMINAL_SESSION` unset, base name `citadel`), and as long
+as a usable `tmux` binary is available, each WebSocket connection is backed by a
+named tmux session via `tmux new-session -A -s <name>` instead of a fresh bare
+shell. The tmux server keeps the session alive after a client disconnects, so
+reconnecting re-attaches to the same session and the terminal state (running
+programs, scrollback, working directory) survives reconnects. This backs the
+"chat to a node" path in the mobile/desktop apps, and is what makes a dropped
+`citadel connect`/web console session resumable.
 
 tmux is never assumed to be installed. The binary is resolved in order:
 `CITADEL_TMUX_BIN` → `tmux` on `PATH` → a Citadel-managed binary at
 `~/.citadel/bin/tmux`. When none is found, the server falls back to a bare shell
 (connections still work, but do not persist across reconnects).
+
+**Opting out (citadel #780):** a power user who runs their own tmux — connecting
+through the Citadel console, sshing elsewhere, running `tmux a` there — ends up
+nested inside Citadel's outer tmux session: stacked status bars, prefix-key
+collisions. Set `CITADEL_TERMINAL_SESSION` to a disable sentinel (`none`, `off`,
+`disabled`, `false`, or `0`, case-insensitive, matched after trimming
+whitespace) to force every connection on that node back to a fresh, non-
+persistent bare shell — no tmux wrap at all. This is a node-wide setting (it
+governs any connection that does not itself request a session, i.e. the web
+console and any token-based client); the CLI's `citadel ssh`/`citadel connect`
+already default to a bare shell independently of this setting and only opt into
+persistence with `--tmux` (citadel #759), so a plain `citadel connect` never
+nests regardless of the node's own default.
 
 The server also falls back to a bare shell — without even trying to resolve a
 tmux binary — when the citadel process itself is already running inside a
