@@ -1,505 +1,348 @@
-# Node master PIN: access authorization + zero-knowledge at-rest encryption
+# Node Master PIN + At-Rest Encryption — Design Doc
 
-Design proposal for [citadel-cli#796](https://github.com/aceteam-ai/citadel-cli/issues/796).
-Status: **proposal, for review**. No code in this PR.
+**Status:** Design only. No implementation in this PR. Implementation follows
+in a separate PR after this doc is approved.
 
-This document specifies **how** to build the single per-node master PIN decided
-in #796: one secret that both (a) authorizes the agent to use the node's
-sensitive resources (console, desktop/VNC, files, code, browser sessions) and
-(b) is the key that encrypts node-held session data at rest. It supersedes the
-existing node passcode gate - the two become one secret, not two.
+**Issue:** aceteam-ai/citadel-cli#796
+**Consumer:** aceteam-ai/citadel-cli#795 (encrypted, PIN-unlocked browser profile)
+**Reconciles:** aceteam-ai/citadel-cli#753 (existing node passcode gate)
 
-The requirements in #796 are decided and are not re-litigated here. What this
-doc owns is the cryptographic construction, the reconciliation with the code
-that exists today, the extensibility seam, the exact truthfulness condition for
-an "end-to-end encrypted" indication, and the open questions that are Jason's
-call.
+## TL;DR
 
-It is deliberately adversarial about its own security claim. A 4-digit PIN is
-~13 bits of entropy; several sections below exist only to be honest about what
-that does and does not buy.
+#796 asks for one PIN that both gates online access and encrypts data at
+rest. That can't be built as specified and still be truthful: a 4-digit PIN
+is 10,000 guesses, and an attacker who has stolen the disk also has the
+salt, the KDF params, and any node-held secret co-located with them — a slow
+KDF raises the cost per guess, not the guess space, so 10,000 x
+(KDF cost) is still a bounded, offline, parallelizable search. "The node
+can't decrypt unattended" is not a true claim if the key that unlocks it is
+a 4-digit number sitting on the same disk.
 
----
+So this doc splits the single secret into two, and treats that split as the
+central design decision, not an implementation detail:
 
-## 1. What exists today (the thing this supersedes)
+- **Access PIN** (4 digits) — gates online use of the node (console, VNC,
+  files, shell, browser sessions). Rate-limited, lockout-gated, always
+  online-only. Reuses the existing passcode primitive (`config.Permissions`,
+  #753/#755/#757/#758/#760) rather than adding a second one.
+- **At-rest passphrase** — a separate, higher-entropy secret. It is the only
+  key material for encrypting data at rest (`internal/nodevault`, new). It is
+  never derivable from the access PIN.
 
-This design is grounded in the current passcode gate, not invented in a vacuum.
+This is a deliberate deviation from the issue's "single secret, single UX"
+framing, made explicitly, not silently — see §1. Everything below explains
+why, what the split costs in UX, and how the two primitives share one node
+without becoming two separate products.
 
-**The gate (`internal/config/permissions.go`).**
-`Permissions.PasscodeHash` is a **bcrypt** hash (library `DefaultCost`) of the
-per-node passcode, stored in `permissions.yaml` (0600) under
-`platform.ConfigDir()`. Three functions own it:
+## 1. Two secrets, not one — the deviation and why
 
-- `SetPasscode(pin)` - bcrypt-hashes and stores; empty pin clears.
-- `HasPasscode()` - is a hash present.
-- `VerifyPasscode(pin)` - fail-CLOSED: no hash or empty pin returns false, so an
-  *enabled* sensitive surface with no passcode stays denied rather than opening.
+The issue text says "single secret, single UX." This doc deliberately does
+not build that, because the issue's other requirement — a truthful
+"zero-knowledge / node can't decrypt unattended" claim — is incompatible
+with a 4-digit key. Both requirements are in the issue; they conflict; this
+doc picks correctness over UX minimalism and designs the UX to make the cost
+bearable instead of hiding the conflict.
 
-`IsSensitiveCategory` names the gated set: `console`, `desktop`, `files`,
-`shell`.
+**The reconciliation:** the at-rest passphrase is prompted **only when a
+user actually touches an encrypted surface** — today that means #795's
+encrypted browser profile, at profile-mount time. A user who never uses an
+encrypted surface never sees the passphrase prompt at all; their entire
+experience is the 4-digit access PIN, which is what the issue's UX
+expectation actually optimizes for in practice (most sessions are
+console/VNC/shell, not the encrypted profile). The passphrase is opt-in by
+usage, not by a separate setup step nobody takes.
 
-**Enforcement points** (all reload `permissions.yaml` per connection, so a
-change takes effect with no worker restart):
+This is the one place this doc knowingly overrides the issue's stated
+design. Everything else below (weekly cache, lockout, loud disclosures, no
+recovery, extensibility for scoped PINs) follows the issue as written.
 
-- `internal/gateway/gateway.go` (~line 469): `IsSensitiveCategory(category)` →
-  `perms.VerifyPasscode(passcodeFromRequest(r))`.
-- `internal/terminal/` (server + `passcode_subprotocol`): the console path,
-  distinguishing `ReasonPasscodeNotSet` from `ReasonPasscodeInvalid` so clients
-  render actionable text.
-- `internal/jobs/shell_command.go`: `SHELL_COMMAND` gated on `VerifyPasscode`.
+## 2. Threat model
 
-**Three set-paths exist today - the migration must account for all three:**
+| Protected | Not protected |
+|---|---|
+| Disk theft or backup exfiltration of the vault + encrypted blobs, **when the passphrase is unknown to the attacker** — ciphertext only, DEK is not recoverable from disk contents alone | The vault's own files (salt, wrapped DEK, encrypted blobs) sitting *next to* a known or guessed passphrase — at that point decryption is trivial; passphrase secrecy is the entire boundary |
+| The node encrypting data while genuinely unattended (no session unlocked) — nothing on disk decrypts without the passphrase being supplied fresh | A live, unlocked session: the DEK is resident in process memory for the session's duration; malware or an attacker with code-exec as the same user during that window reads plaintext same as the user does |
+| A stolen/powered-off node — vault stays sealed; no cached plaintext key survives a reboot (this doc assumes no unlock persists across restarts; see Open Questions on session lifecycle) | The access PIN, at any point — it is an online authorization gate only and never touches at-rest key material. A leaked or brute-forced PIN grants console/VNC/shell/files access but decrypts nothing |
+| Offline brute force of the passphrase, to the extent Argon2id cost + real passphrase entropy make it infeasible in practice | A weak or reused passphrase — Argon2id raises cost, it does not manufacture entropy that isn't there. This doc does not propose enforced passphrase complexity, only setup-time disclosure (see §6) |
+| — | Boot-critical secrets the node needs with **no human present** — the device bearer token (`internal/config/devicecreds.go`) and the tsnet machine key under the network state dir. These are explicitly **out of scope for v1** (see below) |
 
-1. **CLI** - `cmd/passcode.go` (`citadel passcode set` / `clear`), no-echo
-   double prompt or piped stdin.
-2. **TUI** - `internal/tui/controlcenter/passcode.go` (Control Center).
-3. **Platform push** - `APPLY_DEVICE_CONFIG` with `DeviceConfig.NodePasscode
-   *string` (`internal/jobs/config_handler.go`), bcrypt-hashed **on the node**
-   but sent from AceTeam infrastructure.
+**Why boot-critical secrets are excluded, not "the gap this fills."** The
+worker needs the device bearer token at process start, and tsnet needs its
+machine key to bring the mesh connection up — both with zero human
+interaction, on every boot including an unattended reboot after a power
+loss. Sealing either behind a user-supplied passphrase would mean the node
+cannot rejoin the network or authenticate to the backend without a human
+present at every boot, which contradicts what "unattended" means for a
+fabric node's core function. Covering them is a **product decision**
+(accept "prompt on every reboot" as a trade-off) rather than a crypto gap
+this design should silently claim to close. Left as an explicit open
+question below rather than assumed either way.
 
-**Node-held secrets already on disk** (candidates the KDF could bind to):
-
-- `internal/nodeidentity/` - EC P-256 private key at `ConfigDir()/identity/node.key`
-  (0600, never transmitted). Its own header states citadel has **no TPM
-  abstraction / no `internal/platform` TPM seam** (see aceteam #4583); the key
-  is software-protected by file perms only.
-- tsnet WireGuard machine key under `network.GetStateDir()` (`<nodeConfigDir>/network/`).
-- `internal/tlscert/` self-signed gateway TLS key.
-- `config.yaml` device API token (0600).
-
-**Two facts from the existing code that shape everything below:**
-
-- **bcrypt is a verification hash, not a KDF.** You cannot derive an encryption
-  key from `PasscodeHash`. Turning the passcode into *also* an at-rest key is a
-  genuinely new primitive, and migrating an existing node **requires re-entering
-  the PIN** (see §6). This is a finding, not a detail.
-- **The bcrypt cost was deliberately fast** (comment in `permissions.go`:
-  per-connection access path). A memory-hard KDF per connection would be a DoS.
-  The new design must keep per-connection checks cheap (§5).
-
----
-
-## 2. Key hierarchy
-
-**Recommendation: envelope encryption (LUKS-style keyslot).**
+## 3. Key hierarchy — envelope encryption
 
 ```
-PIN ──Argon2id(salt, pepper)──▶ KEK ──AEAD-unwrap──▶ DEK (random 256-bit)
-                                                        │
-                                        HKDF(DEK, "context-label")
-                                                        │
-                                    ┌───────────────────┼───────────────────┐
-                                 browser-profile      console-session      files-cache
-                                 subkey (#795)         subkey               subkey
+passphrase --Argon2id(salt, params)--> KEK (32 bytes)
+KEK  --wrap-->  DEK (32 bytes, random, generated once at SetPassphrase)
+DEK  --AES-256-GCM-->  ciphertext (per-blob random nonce)
 ```
 
-- A strong **random 256-bit DEK** is generated once at PIN setup. It - never the
-  PIN - encrypts data at rest, via per-consumer subkeys derived with HKDF and a
-  context label (so #795 holds a browser-scoped subkey, never the master DEK).
-- The PIN derives a **KEK** (Argon2id, §2.2), which wraps the DEK in a keyslot
-  using an AEAD (AES-256-GCM or XChaCha20-Poly1305). "Verify the PIN" =
-  "the AEAD unwrap authenticates." There is **no separate verification hash**.
-- Rotating the PIN re-wraps the *same* DEK under a new KEK - existing ciphertext
-  is untouched, no bulk re-encryption. This is the property PIN-derives-key-
-  directly cannot offer.
+**Why envelope, not `passphrase -> key -> data` directly:** changing the
+passphrase must re-wrap the DEK, not re-encrypt every blob under a new key.
+For #795's browser profile this matters immediately — a profile reset or a
+passphrase rotation should be a small, fast operation, not a full re-encrypt
+of session data. It's also the only structure that lets a second unlock
+method (recovery key, hardware token) wrap the *same* DEK later without
+touching already-encrypted data — see §7 (Extensibility).
 
-### 2.1 Why not PIN-derives-key-directly
+**Primitives:**
+- Argon2id (`golang.org/x/crypto/argon2`) for passphrase -> KEK. **No new
+  dependency** — `golang.org/x/crypto v0.52.0` is already a direct
+  dependency (it backs the existing `bcrypt` passcode hash in
+  `internal/config/permissions.go`), and `argon2` ships in the same module.
+- AES-256-GCM (`crypto/aes` + `crypto/cipher`, stdlib) for both DEK-wraps-KEK
+  and DEK-encrypts-data. Also introduces no new dependency, and gets
+  hardware AES-NI acceleration on essentially every node this runs on.
+  `golang.org/x/crypto/nacl/secretbox` is available too (same vendored
+  module) as a drop-in alternative; flagged as an open question rather than
+  decided here.
+- Argon2id v1 defaults: `time=3, memory=64*1024 (64 MiB), threads=4,
+  keyLen=32`. These are a starting point, not a pin — see §8 (Open
+  Questions) on validating them against real node hardware (a headless
+  3090 box and a laptop are very different KDF budgets). The chosen params
+  are stored **in the vault header itself**, so a future default change
+  never breaks an existing vault — each vault always records the params it
+  was actually created with.
 
-If the PIN (via Argon2id) *is* the data key:
+**On-disk layout.** The vault lives under `network.GetNodeConfigDir()`, not
+`platform.ConfigDir()`. `platform.ConfigDir()` is invoker-scoped —
+`platform.resolveConfigDir` picks a different path depending on whether the
+caller is root, and CLAUDE.md is explicit that this makes it wrong for state
+one process writes and a different invocation context reads.
+`network.GetNodeConfigDir()` is the machine-convergent directory built for
+exactly that cross-context case (per #383/#726). The vault is a clean case
+of it: an interactive `citadel` invocation sets the passphrase, and a
+long-lived `citadel work` (often systemd-root) is the process that later
+needs to unseal — the same divergence #726 already documents for the
+heartbeat freshness marker.
 
-- rotating the PIN forces re-encrypting everything;
-- multiple/scoped PINs later (§7) are impossible without a rewrite;
-- worst: every distinct ciphertext is a fresh oracle for the same 13-bit guess.
+Proposed: `{GetNodeConfigDir()}/vault/vault.yaml`, directory mode `0700`,
+file mode `0600`. Contents: a version byte, the Argon2id salt + params used,
+the wrapped DEK, and the wrap nonce. No plaintext key material is ever
+written to disk.
 
-Envelope keeps exactly one small keyslot as the brute-force target and cleanly
-separates "authorize" from "encrypt." **Recommended: envelope.**
+## 4. Seal/Unseal API sketch (`internal/nodevault`)
 
-### 2.2 The node-secret binding - a dedicated pepper, NOT the identity key
-
-A 4-digit PIN cannot be sole key material. We combine it with a node-held
-secret ("pepper") mixed into the Argon2id input, so ciphertext alone (without
-the node's disk) is not attackable by PIN-guessing.
-
-**Recommendation: a dedicated random 32-byte pepper file**, e.g.
-`identity/pin-pepper` (0600), created at PIN setup, following the
-`nodeidentity` file pattern as precedent.
-
-**Do NOT bind to `node.key`.** It is tempting ("it's already there"), but:
-
-- #4583 is explicitly building *self-healing identity* (re-enrollment, eventual
-  key rotation). If that key ever rotates, **all PIN-encrypted data silently
-  becomes undecryptable** - a latent data-loss landmine.
-- It is circular if the PIN store ever needs to encrypt identity material.
-- It buys nothing over a dedicated secret: both sit on the same disk.
-
-A dedicated pepper has the same threat model, a clean lifecycle, and is the
-natural place to add TPM sealing later (§2.3).
-
-### 2.3 Hardware sealing (TPM / Secure Enclave): assumed ABSENT in v1
-
-Per `nodeidentity`'s own comment, citadel has no TPM seam today. So v1 assumes
-**software-only** protection: the pepper is a 0600 file. The honest consequence:
-
-> An attacker who obtains the node's disk obtains **both** the ciphertext **and**
-> the pepper. Security then reduces to Argon2id-hardened brute force of the
-> ~13-bit PIN. See §10 (adversarial).
-
-The pepper is designed so that, when a `platform` TPM abstraction lands (#4583's
-follow-up), **sealing the pepper to the TPM** is the drop-in hardening: the PIN
-+ a TPM-resident secret would then be required, and disk theft alone would no
-longer expose the pepper. **Whether TPM sealing is a hard v1 dependency is an
-open question for Jason (§10).**
-
----
-
-## 3. KDF choice and parameters
-
-**Recommendation: Argon2id** (`golang.org/x/crypto/argon2`, already a
-dependency - `x/crypto v0.52.0`). Memory-hardness is what matters against a
-low-entropy secret: it denies the GPU/ASIC parallelism that would otherwise
-make 10⁴ guesses trivial.
-
-Starting parameters, **calibrated at setup** to a wall-clock target rather than
-frozen constants:
-
-| Param | Starting value | Notes |
-|---|---|---|
-| target time | **~1 s** on the setup machine | calibrate `time`/`memory` up to hit it |
-| memory | 256–512 MiB | the real cost lever; bound so a small node still unlocks |
-| iterations (time) | ≥3 | raised if the memory bound is hit before the time target |
-| parallelism | = CPU cores (cap ~4) | |
-| salt | 16 B random, **per keyslot** | stored in the slot header |
-| output | 32 B KEK | |
-
-**Store the parameters in the keyslot header** (LUKS-style), never in code, so
-cost can be raised later without breaking old slots and so a slot migrated from
-a weaker machine still records what produced it. `TestKDFParamDefaults`-style
-pinning belongs on the *floor* values, not the calibrated ones.
-
-Honest bound: at ~1 s/guess, the full 4-digit space is ~2.7 hours single-
-threaded. Argon2id makes each guess cost RAM+time; it **cannot** make 13 bits
-be more than 13 bits. Longer/alphanumeric PINs are the only real fix (§10).
-
-scrypt is an acceptable alternative (same memory-hard family) but Argon2id is
-the current best-practice default and is already vendored.
-
----
-
-## 4. Lockout / rate-limit policy
-
-Rate-limiting protects the **online** path only (someone typing guesses at a
-live node). It does nothing against offline disk brute force - that is bounded
-solely by Argon2id cost (§3). Say this plainly; do not let lockout imply
-at-rest safety.
-
-**Recommendation:**
-
-- Count consecutive failures in a **persisted** counter (see §4.1). Per-guess
-  Argon2id cost (~1 s) is itself the first rate limit.
-- Exponential backoff after a small threshold: e.g. free up to 5 attempts, then
-  delay `min(2^(n−5) sec, 5 min)` before the next attempt is even evaluated.
-- **Hard lockout** after N total failures (recommend N≈20): refuse further
-  attempts until **local presence** is demonstrated (a CLI unlock on the box,
-  not a remote/mesh attempt). This defeats remote online guessing without
-  destroying data.
-- **No auto-wipe by default.** Wiping the keyslot on lockout means a mistyped-
-  PIN storm (or a cat on the keyboard) permanently destroys unrecoverable data.
-  Auto-wipe is offered as an **opt-in** posture only (§10 - Jason's call on the
-  threshold and whether to offer it at all).
-
-### 4.1 Reconciling lockout with "no recovery"
-
-"No recovery" (forgetting the PIN loses the data) and "lockout" are different
-axes: recovery is about the *legitimate holder forgetting*; lockout is about an
-*attacker guessing*. Hard lockout requiring local presence satisfies both - the
-real operator can always get back in at the console with the correct PIN, an
-attacker on the mesh cannot grind. Only **opt-in auto-wipe** couples them, and
-that coupling is exactly why it is off by default.
-
-**The counter must persist across restart** (§4.1 state placement in §5.3),
-or a crash/restart resets the online rate limit and hands an attacker unlimited
-fresh attempts.
-
----
-
-## 5. Unlock lifetime in memory + weekly re-entry
-
-### 5.1 Cached unlocked state (per-connection checks stay cheap)
-
-Running Argon2id per connection would DoS the node (the old bcrypt cost was
-deliberately fast for exactly this path). Instead:
-
-- On correct entry, the KDF runs **once**; the unwrapped DEK (and derived
-  subkeys) live in the **worker process RAM only**.
-- Per-connection gating (console/desktop/files/shell) checks the **cached
-  unlocked state** - "is this node currently unlocked?" - not the KDF.
-- The enable/disable bits keep their existing **fail-closed per-connection
-  reload** of `permissions.yaml`. Enablement without an unlocked master secret
-  denies, exactly as `VerifyPasscode` denies today.
-
-### 5.2 Weekly rolling re-entry
-
-- Persist a **`last_entry_at`** timestamp on successful unlock.
-- On unlock/first-use, if `now − last_entry_at > 7 days`, the cached state is
-  treated as expired: re-prompt, re-run the KDF, refresh `last_entry_at`.
-- Re-entry gates **decrypt-dependent access** (anything needing the DEK) and
-  re-authorization of the sensitive surfaces. It shrinks the unlocked-window
-  attack surface and aids recall (a PIN entered weekly is remembered).
-
-### 5.3 State placement (repo rule, not a choice)
-
-`last_entry_at`, the lockout counter, the keyslot header, and the pepper are
-**cross-context state**: written by a systemd-root `citadel work`, read by an
-interactive non-root `citadel status`/`unlock`. Per this repo's own hard-won
-rule (#383, #726, documented in CLAUDE.md), that means
-**`network.GetNodeConfigDir()`**, NOT `platform.ConfigDir()` - the latter
-silently resolves to *different* directories for those two callers and the
-reader would see nothing forever.
-
-> Migration note: `permissions.yaml` (and its `PasscodeHash`) lives under
-> `platform.ConfigDir()` today. The new keyslot/pepper/counters move to
-> `GetNodeConfigDir()`. The enable/disable bits may stay where they are; the
-> **secret** material must move. Call out the path change in the migration PR.
-
-### 5.4 Zeroization and the exposure window - honest limits
-
-- Best-effort zeroization: overwrite key buffers on lock/expiry/shutdown.
-- **Go zeroization is best-effort only.** The GC may copy a `[]byte` before you
-  wipe the original, and there is no portable `mlock` to keep keys out of swap.
-  Do not oversell this. Mitigations: keep the plaintext key material minimal and
-  short-lived, prefer OS-page-locked buffers where a platform allows, and rely
-  on the reboot-relock (below) as the real backstop.
-- **Exposure window:** while unlocked, the DEK is in live RAM and the node *can*
-  decrypt - the node is only zero-knowledge **while locked**. A root-level
-  compromise of a live, unlocked node can read the key. This is inherent to
-  "the agent must actually use the resource"; the weekly expiry and an explicit
-  `citadel lock` (§8) bound it.
-
----
-
-## 6. Migration from the existing passcode gate
-
-**The hard finding first:** bcrypt (`PasscodeHash`) is one-way and cannot be
-turned into a KEK. **There is no silent, zero-touch migration.** A node's
-existing passcode cannot become the master PIN's encryption key without the
-operator re-entering it once so the KDF can run and a keyslot can be created.
-This is a genuine limitation of what exists, not a design shortcut.
-
-**Recommended migration:**
-
-1. **First correct entry after upgrade = enrollment.** The operator enters the
-   PIN via the same no-echo prompt. On success, citadel:
-   - creates the pepper, generates the DEK, runs Argon2id, writes the keyslot;
-   - **deletes `PasscodeHash`** from `permissions.yaml` (see below).
-2. Until enrollment, the node keeps gating on the legacy `VerifyPasscode` so
-   access is not broken mid-upgrade (backward compat for the *gate*; there is
-   simply no at-rest encryption yet on that node).
-3. All **three** set-paths converge on the new primitive:
-   - CLI `citadel passcode set` becomes (or is aliased by) `citadel pin set`;
-   - the TUI Control Center path calls the same API;
-   - the **platform-push path is the open question of §10** - a PIN pushed from
-     AceTeam has transited AceTeam, so it can never back a truthful E2E badge
-     (§8). Recommendation: for the master PIN, the platform push should *prompt
-     for local entry* rather than carry the secret, or be disabled outright.
-
-**Delete the bcrypt hash after enrollment.** If `PasscodeHash` survives next to
-the Argon2id keyslot, it is the **cheaper** brute-force target (bcrypt
-`DefaultCost`, no memory-hardness) and quietly undoes the whole KDF story. One
-secret means one keyslot and no legacy hash.
-
-**What breaks (state it in the PR):**
-
-- A node that never re-enters its PIN post-upgrade gets no at-rest encryption
-  and shows no E2E badge - correct, but a behavior change to disclose.
-- **Reboot relocks everything.** The DEK cache is RAM-only, so every crash or
-  reboot leaves encrypted-dependent surfaces (browser profiles #795, etc.)
-  **dark** until a human re-enters the PIN. A 3 a.m. systemd auto-restart
-  brings the worker back but not the decrypt key. "No unattended decrypt" is
-  fundamentally incompatible with unattended recovery - this is the point of the
-  feature, and it must be stated, not hidden. The existing **piped-stdin**
-  pattern (`echo -n PIN | citadel unlock`) is the operator's explicit opt-out
-  for headless auto-start, with its tradeoff named: a PIN readable by whatever
-  can write that pipe is only as private as that pipe.
-
----
-
-## 7. Extensibility hook for scoped PINs (build the seam, not the feature)
-
-The envelope + **keyslot table** IS the extensibility mechanism. v1 ships a
-one-slot table; scoped/multiple PINs later add slots - no rewrite, no data
-re-encryption (every slot wraps the same DEK, or a scope-restricted subkey).
-
-Proposed internal shape (illustrative - not built in v1):
+Interface only — no implementation, no method bodies. This is the shape a
+consumer like #795 codes against.
 
 ```go
-// Keyslot wraps the node DEK under one PIN-derived KEK. v1 writes exactly one.
-type Keyslot struct {
-    ID       string      // "master" in v1
-    KDF      KDFParams   // algo + calibrated params + salt (per-slot)
-    Wrapped  []byte      // AEAD-wrapped DEK (or scope subkey)
-    Scope    Scope       // v1: ScopeAll. Later: {Console, Files, ...}
+package nodevault
+
+// Vault is the sealed at-rest secret store for this node. One vault per
+// node, backed by network.GetNodeConfigDir().
+type Vault interface {
+	// IsConfigured reports whether an at-rest passphrase has been set.
+	IsConfigured() bool
+
+	// SetPassphrase initializes the vault: generates a random DEK, derives a
+	// KEK from passphrase via Argon2id, wraps the DEK, and persists the
+	// vault file. Errors if already configured — use ChangePassphrase to
+	// rotate.
+	SetPassphrase(passphrase string) error
+
+	// ChangePassphrase re-derives the KEK from newPassphrase and re-wraps
+	// the EXISTING DEK. Does not touch already-encrypted data. Requires the
+	// current passphrase.
+	ChangePassphrase(oldPassphrase, newPassphrase string) error
+
+	// Unlock derives the KEK from passphrase, unwraps the DEK, and returns a
+	// Session for Seal/Unseal. Fails closed on a wrong passphrase; no
+	// partial or degraded unlock exists.
+	Unlock(passphrase string) (Session, error)
+
+	// Lock discards any cached session/DEK material held by this Vault.
+	Lock()
 }
 
-// Unlocker is what console/terminal/files/#795 call. v1 has one impl.
-type Unlocker interface {
-    Unlock(ctx context.Context, pin string) (Session, error) // runs KDF, opens a slot
-    IsUnlocked() bool                                          // cheap per-conn check
-    Lock()                                                     // zeroize + relock
-}
-
-// Session hands out context-scoped subkeys; consumers never see the master DEK.
+// Session is a short-lived unlocked handle. The DEK lives only in the
+// memory backing a Session — Seal/Unseal never touch disk except through
+// the caller's own ciphertext storage.
 type Session interface {
-    Subkey(label string) ([]byte, error) // HKDF(DEK, label)
-    Authorizes(category string) bool      // v1: always true for a valid session
+	// Seal encrypts plaintext under the DEK. Returns a self-describing
+	// ciphertext (nonce + params needed to Unseal it later).
+	Seal(plaintext []byte) (ciphertext []byte, err error)
+
+	// Unseal decrypts a ciphertext previously produced by Seal. Errors
+	// (does not return partial plaintext) on any integrity failure.
+	Unseal(ciphertext []byte) (plaintext []byte, err error)
+
+	// IsUnlocked reports whether this session's DEK is still resident.
+	IsUnlocked() bool
 }
 ```
 
-`Scope` defaulting to `ScopeAll` and `Authorizes` returning true unconditionally
-is what keeps v1 a single all-powerful PIN while leaving the exact seam where
-scoped enforcement later slots in. **v1 exposes none of this** - the UX is one
-PIN, and setup loudly says scoped PINs are "contact us" (#796).
+A consumer (e.g. #795) calls `Unlock(passphrase)` at the moment a user
+mounts the encrypted browser profile, holds the returned `Session` for the
+lifetime of that use, and calls `Lock()` (or lets the session's own
+lifecycle — see §8, Open Questions — expire it) when done. `Seal`/`Unseal`
+only work through a live `Session`; there is no bare "decrypt with
+passphrase" call, so nothing outside this package ever holds the KEK or DEK
+directly.
 
----
+## 5. Access-PIN behavior
 
-## 8. The "end-to-end encrypted" truthfulness gate
+**Reuse, don't duplicate.** The access PIN should be implemented as the
+*same* field as today's passcode: `config.Permissions.PasscodeHash`
+(`internal/config/permissions.go:51`), verified via
+`Permissions.VerifyPasscode` and set via `Permissions.SetPasscode`. This
+achieves the issue's "supersedes the node passcode gate" with **zero
+migration**: every existing gate call site keeps working unchanged —
+`internal/terminal/server.go:599-620` (terminal), `cmd/work.go:1332-1333`
+and `:1793-1799` (desktop + terminal wiring), `cmd/controlcenter.go:610-616`
+(Control Center), `internal/gateway/gateway.go:470` (gateway HTTP),
+`internal/jobs/shell_command.go:301,311` (SHELL_COMMAND) — as do all three
+writers (`cmd/passcode.go`, `internal/tui/controlcenter/passcode.go`,
+`internal/jobs/config_handler.go`'s `APPLY_DEVICE_CONFIG` → `NodePasscode`)
+and the `has_passcode` heartbeat field
+(`internal/heartbeat/redis.go:61-69`, `internal/heartbeat/api.go:376`). The
+"PIN" is not a new concept sitting beside the passcode; it *is* the
+passcode, with the new behavior below layered on top of the same field.
 
-A surface (CLI, web console, mobile) may show an "end-to-end encrypted" /
-zero-knowledge indication **only when ALL of the following hold**. If any fails,
-the badge must not appear.
+**New behavior needed on top of the existing primitive:**
+- **4-digit format enforcement.** Today `SetPasscode` accepts any string;
+  v1 of this design should constrain new entries to numeric, 4-digit input
+  at the setter boundary (CLI prompt, Control Center form, and the
+  `APPLY_DEVICE_CONFIG` handler), without breaking `VerifyPasscode` for any
+  existing longer passcode until it's rotated.
+- **Rate limiting + lockout after N attempts.** `VerifyPasscode` today has
+  no notion of attempt history — it's a pure bcrypt compare. A 4-digit
+  space is only safe to gate online at all *because* it's rate-limitable;
+  without a persisted counter, "lockout after N attempts" is decorative.
+- **Weekly re-prompt cache.** Cache a successful verification and skip
+  re-prompting for repeat use, but force re-entry once more than 7 days
+  have passed since the last correct entry.
 
-1. **A master PIN keyslot exists** and backs the node's at-rest encryption
-   (enrollment completed; the legacy bcrypt-only state does not qualify).
-2. **The node is currently locked** *or* the claim is scoped to "at rest":
-   the truthful statement is *"ciphertext at rest when locked; the unwrap key
-   exists only in this node's live process RAM while unlocked; locked again on
-   reboot or weekly expiry."* A live-unlocked node is not "the provider cannot
-   read this right now" - do not imply that.
-3. **PIN provenance is local.** The PIN was set by **local/interactive entry**
-   (CLI/TUI/console-on-box) and **never transited AceTeam infrastructure**. A
-   PIN delivered via `APPLY_DEVICE_CONFIG` platform push fails this - that node
-   must not show the badge (and see §10 on whether that path is killed).
-4. **No plaintext PIN or DEK escrow leaves the node** (no backup of the pepper
-   or unwrapped DEK to the platform).
-5. *(If a minimum-entropy policy is adopted, §10)* the PIN meets it - a 4-digit
-   PIN arguably should not earn an unqualified "E2E" claim (§10).
+**Both need a cross-process, on-disk home — and the verifier sites already
+prove why.** The four independent gate call sites above
+(`terminal/server.go`, `gateway.go`, `shell_command.go`,
+`controlcenter.go`) each call `config.LoadPermissions(...).VerifyPasscode(...)`
+fresh, in their own process or goroutine, specifically so a passcode
+rotated at runtime is honored without a restart. An in-memory attempt
+counter or cache in any one of them would (a) reset on worker restart and
+(b) not apply across the other three surfaces — exactly the failure mode
+"lockout after N attempts" is supposed to prevent. This state should live
+under `network.GetNodeConfigDir()` (same cross-context reasoning as the
+vault, §3) as a small sibling file — e.g. `passcode_state.yaml` — recording
+a failed-attempt counter, a lockout-until timestamp, and last-verified-at.
 
-Implement this as a single predicate (e.g. `pin.E2EEligible() (bool, reason)`)
-so every surface asks the same authority and a future condition is added in one
-place - mirroring how `IsSensitiveCategory` centralizes "what is sensitive."
+Open question: **scope of that state.** The terminal path already carries
+a caller identity (`tokenInfo.UserID`); the gateway and SHELL_COMMAND paths
+do not obviously have an equivalent. A single node-wide counter is simplest
+and matches "one PIN, one node," but conflates a legitimate user's failed
+typo with a genuine attacker's guesses across surfaces. Flagged in §8 (Open
+Questions) rather than decided here.
 
-**Web-console caveat (state it honestly):** even with node-terminated TLS over
-the relay, a PIN typed into a browser console is only as trustworthy as the JS
-the platform serves to that browser. Node-side E2E does not make browser-entry
-E2E; that is the standard web-crypto limitation and should be disclosed where
-the badge is shown for browser-originated entry.
+`has_passcode` in the heartbeat needs no change under this plan — it
+already reports "is `PasscodeHash` set," and the PIN *is* `PasscodeHash`.
 
----
+## 6. No recovery — and a consequence worth calling out
 
-## 9. Consumer API (specified, not implemented)
+**Passphrase forgotten → the vault's data is permanently unrecoverable.**
+This is the zero-knowledge property working as designed, not a bug: if the
+node (or anyone) could recover the data without the passphrase, the "node
+can't decrypt unattended" claim would be false. Loud, explicit disclosure
+at vault setup (first use of an encrypted surface): *"If you forget this
+passphrase, this data cannot be recovered — not by you, not by AceTeam."*
 
-The one primitive #795 (browser profile), the terminal, the console, and future
-surfaces call. Rough Go shape; names illustrative:
+**Access PIN forgotten → re-enroll, with no data loss**, because under the
+two-secret split (§1) the PIN never encrypts anything. This is a real
+consequence of splitting the secret and is *more forgiving* than the
+issue's stated behavior ("forgetting the PIN means the encrypted data is
+unrecoverable") — flagging explicitly because it changes an acceptance
+criterion from the issue, in the safe direction. PIN reset reuses whatever
+reset/clear path `SetPasscode` already supports.
 
-```go
-package pin // internal/pin (proposed)
+**Loud power disclosure, at PIN setup** (this is the issue's disclosure
+requirement, and it belongs on the PIN, not the passphrase, since the PIN
+is what grants "full use of every resource on the machine"): state plainly
+that the PIN grants full console/desktop/files/shell access, that anyone
+holding it can do the same, and that scoped/multiple PINs are not available
+in v1 ("contact us if wanted").
 
-// State / lifecycle
-func Enrolled() bool                 // a master keyslot exists on this node
-func IsUnlocked() bool               // cheap; per-connection gates use this
-func LastEntryAt() (time.Time, bool)
-func ExpiredForWeekly() bool         // now - LastEntryAt > 7d
+## 7. Extensibility (structure only — not built in v1)
 
-// Setup / rotation (CLI, TUI, migration all call these)
-func Enroll(ctx, pin string) error   // first-time: pepper+DEK+keyslot; calibrates KDF
-func Rotate(ctx, old, new string) error // re-wrap same DEK; no bulk re-encrypt
-func Disenroll(ctx, pin string) error   // destroy keyslot (explicit, warned)
+- **Vault:** the wrapped-DEK layout should reserve room for *multiple*
+  wrap entries (each an independent KEK-derivation method wrapping the same
+  DEK) rather than a single field, even though v1 populates exactly one.
+  That's what lets a future unlock method (a recovery key, a hardware
+  token) be added without re-encrypting any existing ciphertext — the new
+  method just wraps the already-existing DEK a second way.
+- **PIN:** v1 keeps one global `PasscodeHash` per node. The natural
+  extension point for scoped/multiple PINs is that several gate call sites
+  already thread a caller identity through (`tokenInfo.UserID` in the
+  terminal path) — a later version could key a map of passcodes by identity
+  or surface without restructuring how `VerifyPasscode` is called at each
+  site. Not designed further here, per the issue's explicit "not in v1."
 
-// Unlock / lock
-func Unlock(ctx, pin string) (Session, error) // runs Argon2id; opens slot; may lock out
-func Lock()                                    // zeroize + relock (explicit `citadel lock`)
+## 8. Consumers
 
-// Per-consumer key material (consumers NEVER get the master DEK)
-type Session interface {
-    Subkey(label string) ([]byte, error) // e.g. "browser-profile", "console"
-    Authorizes(category string) bool      // console/desktop/files/shell
-}
+- **#795 (encrypted browser profile)** is the first and only v1 consumer of
+  `internal/nodevault`. It calls `Unlock(passphrase)` at profile-mount time
+  and uses the returned `Session` for the profile's encrypted contents.
+  Nothing about the access PIN changes for it — profile *access* isn't
+  gated by the PIN, only the profile's at-rest bytes are gated by the
+  passphrase.
+- **Terminal, console (Control Center), gateway, SHELL_COMMAND** continue
+  exactly as today, on the access-PIN/passcode primitive (§5). None of them
+  touch `internal/nodevault`.
 
-// Truthfulness
-func E2EEligible() (bool, reason string)  // the §8 predicate, one authority
+## 9. Heartbeat additions
 
-// Errors carry the §1 reason distinction (client renders actionable text)
-var (
-    ErrNotEnrolled  = errors.New("no master PIN set")
-    ErrInvalidPIN   = errors.New("incorrect PIN")
-    ErrLockedOut    = errors.New("too many attempts; local unlock required")
-    ErrExpired      = errors.New("weekly re-entry required")
-)
-```
+`has_passcode` (§5) is unaffected. The vault needs its own, **distinct**
+signal, because "a passphrase has been configured" and "this node can
+decrypt right now" are different claims — a truthful E2E indication on the
+platform side needs to be able to tell them apart. Proposed additions to
+the same `PermissionState`-shaped struct (`internal/heartbeat/redis.go`,
+mirrored in `api.go`), following the existing `has_passcode` field's own
+reasoning (no `omitempty` — `false` is a meaningful, reportable state, not
+an absent one):
 
-Notes for consumers:
+- `has_vault_passphrase bool` — a passphrase has been set for this node.
+- `vault_unlocked bool` — a session is currently unlocked in this process.
+  This is the field that actually backs an "encrypted" vs. "unlocked right
+  now" UI distinction; `has_vault_passphrase` alone cannot.
 
-- **#795 asks for `Subkey("browser-profile")`**, encrypts its profile with that,
-  and never touches the master DEK. Each consumer gets an independent HKDF
-  subkey, so a leak of one does not expose others or the DEK.
-- The **gateway/terminal/shell** enforcement points swap `VerifyPasscode(pin)`
-  for `IsUnlocked()` + `Session.Authorizes(category)`; they keep the
-  per-connection fail-closed reload of the enable bits.
-- The `Reason`/error split preserves the existing `ReasonPasscodeNotSet` vs
-  `ReasonPasscodeInvalid` client behavior (§1).
+Exact field names are a review question, not a design blocker — listed
+again below.
 
----
+## 10. Open questions for the maintainer
 
-## 10. Open questions for Jason
-
-These are genuinely product/risk calls, not implementation details:
-
-1. **Auto-wipe on lockout - offer it at all, and at what threshold?**
-   Recommendation: **off by default**; hard lockout requiring local presence
-   instead (a mistyped-PIN storm must not permanently destroy unrecoverable
-   data). If offered, it is strictly opt-in. Your call on the threshold and
-   whether to ship it in v1.
-
-2. **Is TPM/Secure-Enclave sealing a hard v1 dependency?** Today there is no TPM
-   seam (#4583). Recommendation: ship software-only (0600 pepper) and be honest
-   in the badge, with TPM sealing as the designed hardening hook. Confirm you
-   accept the "disk theft ⇒ 13-bit offline brute force" exposure for v1.
-
-3. **Kill the platform-push PIN path for the master PIN?** A PIN pushed via
-   `APPLY_DEVICE_CONFIG` has transited AceTeam and can never back a truthful E2E
-   badge. Recommendation: convert it to "prompt for local entry" or disable it
-   for the master PIN. Your call.
-
-4. **Minimum PIN length / allow alphanumeric passphrases - and does the E2E
-   badge require a minimum entropy?** A 4-digit PIN is ~13 bits; that
-   fundamentally caps the security claim. Recommendation: allow (and gently
-   encourage) longer/alphanumeric secrets; consider gating the *unqualified*
-   E2E badge on a minimum entropy, showing a qualified indicator below it.
-
-5. **Unattended-restart operational stance.** "No unattended decrypt" means a
-   reboot leaves encrypted surfaces dark until a human re-enters the PIN. Accept
-   that (and document the piped-stdin opt-out with its tradeoff), or carve out a
-   narrower posture for specific always-on nodes?
-
-6. **Accept-data-loss setup messaging.** #796 mandates loud disclosure of
-   (a) data loss on forget, (b) full-machine power, (c) "contact us for scoped
-   PINs." Confirm the exact wording and whether setup should require a typed
-   acknowledgement ("I understand this cannot be recovered") before enrolling.
-
----
-
-## 11. The honest limitation, in one paragraph
-
-A 4-digit PIN is ~13 bits of entropy. Argon2id + a node-held pepper make each
-guess cost real memory and ~1 second, and rate-limiting/lockout defeat *online*
-guessing - but none of that changes that there are only ten thousand possible
-PINs. An attacker who steals the node's disk gets the ciphertext **and** the
-pepper (no TPM in v1), so the at-rest guarantee degrades to Argon2id-bounded
-brute force of those ten thousand values: roughly hours, not centuries. The
-zero-knowledge / E2E claim is therefore **truthful only in the specific senses
-enumerated in §8** - most strongly against an adversary who obtains ciphertext
-**without** the node's disk (a backup, a cloud sync, a memory-only exfil) or
-once the pepper is TPM-sealed, and **only while the node is locked**. It should
-be presented that way, not as unconditional secrecy. The real fix for the
-entropy ceiling is a longer or alphanumeric secret (§10.4); everything else is
-damage control around thirteen bits.
-```
+- **Boot-critical secrets (device bearer token, tsnet machine key) are
+  excluded from v1's vault scope (§2).** Accept that permanently as a
+  different threat tier, or pursue a later phase that seals them with a
+  "prompt on every reboot" trade-off?
+- **Should `permissions.yaml` (and `PasscodeHash`) move from
+  `platform.ConfigDir()` to `network.GetNodeConfigDir()`** for consistency
+  with the vault's home, given `ConfigDir()`'s documented invoker-scoping
+  hazard? It works today only because each gate site's writer and reader
+  are co-located in the same process — is that assumption safe to keep
+  relying on long-term, or should it move now while it's cheap?
+- **Scope of the lockout counter / weekly re-prompt cache** (§5): one
+  counter per node, or per caller identity? Not every gate site currently
+  carries an identity to key on.
+- **Exact heartbeat field names/shape** for vault presence vs. unlock state
+  (§9) — proposed here, needs review against how the platform side will
+  actually consume/display it.
+- **AES-256-GCM (stdlib) vs. NaCl secretbox** (`x/crypto/nacl/secretbox`,
+  already vendored) for the DEK-wrap and data-encryption primitive — either
+  avoids a new dependency; pick one to standardize on.
+- **Argon2id parameter defaults** (`time=3, memory=64MiB, threads=4`) need
+  validation against the real range of node hardware (a headless 3090 box
+  vs. a modest laptop) before being locked in as the v1 shipped default.
+- **Session/Lock lifecycle**: does a `Session` auto-lock on an idle timeout,
+  only on explicit `Lock()`/process exit, or both? Not specified by the
+  issue; affects how long `vault_unlocked` can stay true.
+- **Weekly cache semantics**: is the 7-day window a sliding window that
+  resets on every correct entry (this doc assumes yes — "re-prompt if more
+  than a week has passed since the *last* entry"), or a fixed period from
+  first entry? Please confirm the intended reading.
