@@ -105,6 +105,39 @@ func defaultArgonParams() argonParams {
 	return argonParams{Time: argonTime, Memory: argonMemory, Threads: argonThreads, KeyLen: argonKeyLen}
 }
 
+// validate reports whether p is safe to feed into argon2.IDKey. The vendored
+// Argon2id implementation PANICS — not errors — when Time<1 or Threads<1
+// (golang.org/x/crypto/argon2's deriveKey: "number of rounds too small" /
+// "parallelism degree too low"). A corrupted or truncated vault.yaml, or a
+// future field-rename that unmarshals into zero values, must never reach
+// that call with an unvalidated header (citadel#808 fast-follow). Memory
+// doesn't panic the library either, but a zero value would silently produce
+// a degenerate KEK, which is just as unsafe to treat as a normal vault.
+//
+// KeyLen is checked against the valid AES key sizes {16,24,32} — the actual
+// invariant the rest of the package depends on (deriveKEK's output feeds
+// aes.NewCipher via newGCM) — rather than against argonKeyLen, the CURRENT
+// default. The header doc comment is explicit that params are stored per-vault
+// "so a future default change never breaks an existing vault"; comparing
+// against the live default here would silently break that promise the moment
+// argonKeyLen's value ever changes, turning every existing 32-byte vault into
+// a permanent ErrWrongPIN with no recovery path.
+func (p argonParams) validate() error {
+	if p.Time < 1 || p.Threads < 1 || p.Memory == 0 {
+		return ErrWrongPIN
+	}
+	switch p.KeyLen {
+	case 16, 24, 32: // valid AES-128/192/256 key sizes
+	default:
+		// Deliberately the SAME sentinel a wrong PIN or a tampered wrap
+		// produces (see ErrWrongPIN's doc comment): a corrupt header must be
+		// indistinguishable from a wrong guess, or it becomes a new oracle
+		// ("this vault's header is broken" vs. "you guessed wrong").
+		return ErrWrongPIN
+	}
+	return nil
+}
+
 // wrapEntry is one method of unwrapping the shared DEK. v1 populates exactly
 // one entry ("pin"), but the list shape reserves room for a future recovery
 // key or hardware token to wrap the SAME DEK without re-encrypting any data
@@ -482,6 +515,9 @@ func (v *Vault) readHeader() (header, error) {
 	var h header
 	if err := yaml.Unmarshal(data, &h); err != nil {
 		return header{}, fmt.Errorf("nodevault: parse vault: %w", err)
+	}
+	if err := h.KDF.validate(); err != nil {
+		return header{}, err
 	}
 	return h, nil
 }

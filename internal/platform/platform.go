@@ -187,6 +187,71 @@ func resolveConfigDir(isRoot, isWindows, isLinux, isDarwin bool) string {
 	return "/etc/citadel"
 }
 
+// ConfigDirCandidates returns every directory ConfigDir() could plausibly
+// resolve to for SOME invocation context on this machine: a non-root
+// process, root/sudo with HOME forwarded, root/sudo resolved via SUDO_USER,
+// and a bare root/systemd invocation with no user context at all (the
+// shipped citadel-worker.service pins HOME=/root, which resolveConfigDir
+// cannot map back to a user's ~/.citadel-cli).
+//
+// ConfigDir() is invoker-scoped by design (see its doc comment) and returns
+// exactly ONE of these paths for the CURRENT process. A caller that needs to
+// find state possibly written by a DIFFERENT invocation context on the same
+// machine — without paying for the network.GetNodeConfigDir() migration —
+// enumerates every candidate instead and checks each one. This is an
+// enumeration, not a resolution: it does not decide which candidate is "the"
+// config dir, only which directories are worth checking. The current
+// process's own ConfigDir() is always first.
+func ConfigDirCandidates() []string {
+	return configDirCandidates(IsRoot(), IsWindows(), IsLinux(), IsDarwin())
+}
+
+// configDirCandidates is the testable core of ConfigDirCandidates, mirroring
+// resolveConfigDir's split so the enumeration is exercisable without real
+// privileges or a real HOME.
+func configDirCandidates(isRoot, isWindows, isLinux, isDarwin bool) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+
+	// Always start with what THIS process would resolve to.
+	add(resolveConfigDir(isRoot, isWindows, isLinux, isDarwin))
+
+	if isWindows {
+		return out // ConfigDir() is invoker-invariant on Windows; nothing else to add.
+	}
+
+	// A non-root process's own home (covers e.g. `citadel passcode set` or an
+	// APPLY_DEVICE_CONFIG handler run as a normal user).
+	if home, err := os.UserHomeDir(); err == nil {
+		add(filepath.Join(home, ".citadel-cli"))
+	}
+	// Explicit $HOME, if forwarded to a root process (e.g. `sudo -E`).
+	if home := os.Getenv("HOME"); home != "" {
+		add(filepath.Join(home, ".citadel-cli"))
+	}
+	// SUDO_USER-derived home (interactive `sudo citadel ...` without -E).
+	if su := os.Getenv("SUDO_USER"); su != "" && su != "root" {
+		if home, err := HomeDir(su); err == nil {
+			add(filepath.Join(home, ".citadel-cli"))
+		}
+	}
+	// System-wide root paths (a systemd worker with HOME=/root and no
+	// SUDO_USER at all falls all the way through to these).
+	if isDarwin {
+		add("/usr/local/etc/citadel")
+	} else {
+		add("/etc/citadel")
+	}
+	return out
+}
+
 // DefaultNodeDir returns the default directory for node configuration
 func DefaultNodeDir(username string) (string, error) {
 	home, err := HomeDir(username)
