@@ -430,9 +430,14 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		return
 	}
 
-	// GPU tracking: acquire/release GPU slot if tracker is set
+	// GPU tracking: acquire/release GPU slot if tracker is set AND this job
+	// type actually contends for a GPU (citadel-cli#825). Without the
+	// needsGPUSlot check, a SERVICE_START or any other non-GPU job racing
+	// concurrent inference jobs under --max-concurrency > GPU count could hit
+	// the "no GPU slots available" Nack below with ZERO published terminal
+	// events. See gpuBoundJobTypes for the full explanation.
 	gpuIndex := -1
-	if r.gpuTracker != nil {
+	if r.gpuTracker != nil && needsGPUSlot(job.Type) {
 		// Check if job requests a specific GPU
 		if targetGpu, ok := job.Payload["targetGpu"]; ok {
 			if idx, ok := targetGpu.(float64); ok {

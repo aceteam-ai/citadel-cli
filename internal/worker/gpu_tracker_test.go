@@ -117,3 +117,44 @@ func TestGPUTracker_ReleaseInvalidIndex(t *testing.T) {
 		t.Fatalf("expected 2 available after invalid releases, got %d", tracker.AvailableCount())
 	}
 }
+
+// TestGPUBoundJobTypes pins the EXACT membership of gpuBoundJobTypes
+// (citadel-cli#825). This is the fact CLAUDE.md's "GPU-slot gate is
+// job-type-scoped" entry points at instead of restating -- change the set
+// here, not just in gpu_tracker.go, or this test fails and says so. Mirrors
+// the TestSwapAccountingDefaults precedent (internal/worker/swap_ledger.go)
+// for pinning a package-var set/table that a doc entry names but does not copy.
+func TestGPUBoundJobTypes(t *testing.T) {
+	want := map[string]struct{}{
+		JobTypeLlamaCppInference: {},
+		JobTypeVLLMInference:     {},
+		JobTypeOllamaInference:   {},
+		JobTypeLLMInference:      {},
+	}
+
+	if len(gpuBoundJobTypes) != len(want) {
+		t.Fatalf("gpuBoundJobTypes has %d entries, want %d: got %v", len(gpuBoundJobTypes), len(want), gpuBoundJobTypes)
+	}
+	for jt := range want {
+		if _, ok := gpuBoundJobTypes[jt]; !ok {
+			t.Errorf("gpuBoundJobTypes missing %q", jt)
+		}
+	}
+	for jt := range gpuBoundJobTypes {
+		if _, ok := want[jt]; !ok {
+			t.Errorf("gpuBoundJobTypes has unexpected extra member %q", jt)
+		}
+	}
+
+	for jt := range want {
+		if !needsGPUSlot(jt) {
+			t.Errorf("needsGPUSlot(%q) = false, want true", jt)
+		}
+	}
+
+	for _, jt := range []string{JobTypeServiceStart, JobTypeShellCommand, JobTypeFileRead, JobTypeEmbedding} {
+		if needsGPUSlot(jt) {
+			t.Errorf("needsGPUSlot(%q) = true, want false (non-GPU-bound job type)", jt)
+		}
+	}
+}

@@ -1130,6 +1130,28 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 | `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
 | `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
 
+### GPU-slot gate is job-type-scoped, not global (citadel #825)
+
+`Runner.processJob`'s GPU-slot acquire (`internal/worker/runner.go`, guarding the
+`gpuTracker.Acquire()` Nack branch) only runs for job types `needsGPUSlot`
+(`internal/worker/gpu_tracker.go`) says actually dispatch to a node-local GPU
+inference engine. `needsGPUSlot`/`gpuBoundJobTypes` is the authority for that
+set — `TestGPUBoundJobTypes` (`gpu_tracker_test.go`) pins its exact membership,
+so read the test rather than trusting a doc copy of it. Everything NOT in that
+set — `SERVICE_START`, shell, file, config, etc. — skips the gate entirely and
+can never be Nacked by GPU contention.
+
+This matters because `--max-concurrency` (`cmd/work.go`) can be set above the
+node's GPU count, so more jobs can be in flight than GPU slots. Before #825, the
+gate applied unconditionally: a non-GPU job racing concurrent inference jobs
+could hit "no GPU slots available" and Nack with **zero published terminal
+events** (the same-job-ID-redelivery reasoning at that Nack deliberately omits a
+terminal publish — see the #559 note inline), reproducing #559's
+"backend waiter times out, degrades to polling" symptom via GPU contention
+instead of a stream-publish failure. `needsGPUSlot` is the authority for which
+job types can reach that Nack at all; extend `gpuBoundJobTypes`, not the check
+site, if another job type turns out to genuinely contend for engine VRAM.
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json
