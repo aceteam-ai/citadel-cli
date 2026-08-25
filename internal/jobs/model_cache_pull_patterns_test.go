@@ -169,15 +169,122 @@ func TestDeriveDiffusersAllowPatterns(t *testing.T) {
 		}
 	})
 
-	t.Run("only two of five diffusers dirs present -> nil (not enough evidence)", func(t *testing.T) {
+	// Design note (post-#840 review): confidence now comes from the SUBSET
+	// check (every present dir is recognized), not from a count threshold.
+	// Two recognized dirs with no unrecognized sibling is sufficient evidence
+	// -- there is nothing being silently dropped, which is the property that
+	// actually matters.
+	t.Run("two recognized dirs with no unrecognized sibling is sufficient evidence", func(t *testing.T) {
 		entries := []hfTreeEntry{
 			{Type: "file", Path: "a.safetensors", Size: 1},
 			{Type: "file", Path: "b.safetensors", Size: 1},
 			{Type: "file", Path: "transformer/config.json", Size: 1},
 			{Type: "file", Path: "vae/config.json", Size: 1},
 		}
-		if got := deriveDiffusersAllowPatterns(entries); got != nil {
-			t.Errorf("expected nil with only 2 of 5 diffusers dirs present, got %v", got)
+		got := deriveDiffusersAllowPatterns(entries)
+		if got == nil {
+			t.Fatal("expected a derived allow list when every present dir is recognized")
+		}
+		if !containsPattern(got, "transformer/*") || !containsPattern(got, "vae/*") {
+			t.Errorf("derived allow list %v missing transformer/* or vae/*", got)
 		}
 	})
+
+	// The #840 review's core finding: a UNet-based pipeline (Stable Diffusion
+	// 1.x/2.x/XL and derivatives -- everything that ISN'T a DiT model like
+	// Flux/SD3/LTX-Video) keeps its weights in unet/, not transformer/. The
+	// original version of this function hardcoded a 5-dir list that omitted
+	// unet/ entirely, so this exact shape had its actual model weights
+	// silently excluded from both the size estimate and the download -- a
+	// pull that "succeeds" with an unloadable pipeline and no error anywhere.
+	t.Run("SD1.5 (unet-based) shape never strips the unet weights", func(t *testing.T) {
+		entries := []hfTreeEntry{
+			{Type: "file", Path: "v1-5-pruned.safetensors", Size: 1},
+			{Type: "file", Path: "v1-5-pruned-emaonly.safetensors", Size: 1},
+			{Type: "file", Path: "unet/config.json", Size: 1},
+			{Type: "file", Path: "unet/diffusion_pytorch_model.safetensors", Size: 1},
+			{Type: "file", Path: "vae/config.json", Size: 1},
+			{Type: "file", Path: "vae/diffusion_pytorch_model.safetensors", Size: 1},
+			{Type: "file", Path: "text_encoder/config.json", Size: 1},
+			{Type: "file", Path: "text_encoder/model.safetensors", Size: 1},
+			{Type: "file", Path: "tokenizer/vocab.json", Size: 1},
+			{Type: "file", Path: "scheduler/scheduler_config.json", Size: 1},
+			{Type: "file", Path: "feature_extractor/preprocessor_config.json", Size: 1},
+			{Type: "file", Path: "safety_checker/config.json", Size: 1},
+			{Type: "file", Path: "safety_checker/pytorch_model.bin", Size: 1},
+		}
+		allow := deriveDiffusersAllowPatterns(entries)
+		// Whichever way it goes (derived subset, or a nil bail), the UNet
+		// weights must survive into the FINAL pull set. This is the assertion
+		// that actually matters -- checking the derived pattern list alone
+		// would have passed even the buggy version if it happened to bail.
+		unetWeights := "unet/diffusion_pytorch_model.safetensors"
+		if !patternsInclude(unetWeights, allow, nil) {
+			t.Fatalf("unet weights %q excluded from the pull set (allow=%v) -- this is the #840 silent-data-loss bug", unetWeights, allow)
+		}
+		// Every dir here IS recognized, so this should actually derive a
+		// subset (not bail) -- confirm unet/* is explicitly present in it.
+		if allow == nil {
+			t.Fatal("expected a derived allow list for a fully-recognized SD1.5 shape, got nil")
+		}
+		if !containsPattern(allow, "unet/*") {
+			t.Errorf("derived allow list %v missing unet/*", allow)
+		}
+	})
+
+	// SDXL's dual text encoder (text_encoder_2/tokenizer_2) is a second
+	// component-naming shape distinct from both transformer/ and unet/.
+	t.Run("SDXL shape keeps the second text encoder", func(t *testing.T) {
+		entries := []hfTreeEntry{
+			{Type: "file", Path: "sd_xl_base_1.0.safetensors", Size: 1},
+			{Type: "file", Path: "sd_xl_base_1.0_0.9vae.safetensors", Size: 1},
+			{Type: "file", Path: "unet/diffusion_pytorch_model.safetensors", Size: 1},
+			{Type: "file", Path: "vae/diffusion_pytorch_model.safetensors", Size: 1},
+			{Type: "file", Path: "text_encoder/model.safetensors", Size: 1},
+			{Type: "file", Path: "text_encoder_2/model.safetensors", Size: 1},
+			{Type: "file", Path: "tokenizer/vocab.json", Size: 1},
+			{Type: "file", Path: "tokenizer_2/vocab.json", Size: 1},
+			{Type: "file", Path: "scheduler/scheduler_config.json", Size: 1},
+		}
+		allow := deriveDiffusersAllowPatterns(entries)
+		for _, p := range []string{
+			"unet/diffusion_pytorch_model.safetensors",
+			"vae/diffusion_pytorch_model.safetensors",
+			"text_encoder/model.safetensors",
+			"text_encoder_2/model.safetensors",
+		} {
+			if !patternsInclude(p, allow, nil) {
+				t.Errorf("%q excluded from the pull set (allow=%v)", p, allow)
+			}
+		}
+	})
+
+	// The confidence gate: a single unrecognized top-level directory --
+	// which might carry weights this package has never heard of -- must bail
+	// the WHOLE derivation to nil (pull everything unfiltered), never be
+	// silently dropped from the allow list.
+	t.Run("unrecognized top-level dir bails to nil (pull everything)", func(t *testing.T) {
+		entries := []hfTreeEntry{
+			{Type: "file", Path: "model-a.safetensors", Size: 1},
+			{Type: "file", Path: "model-b.safetensors", Size: 1},
+			{Type: "file", Path: "transformer/config.json", Size: 1},
+			{Type: "file", Path: "vae/config.json", Size: 1},
+			// An adapter/component dir this package has no entry for.
+			{Type: "file", Path: "some_custom_adapter/weights.safetensors", Size: 1},
+		}
+		got := deriveDiffusersAllowPatterns(entries)
+		if got != nil {
+			t.Errorf("expected nil when an unrecognized top-level dir is present, got %v (would risk silently dropping it)", got)
+		}
+	})
+}
+
+// containsPattern reports whether patterns contains want, exactly.
+func containsPattern(patterns []string, want string) bool {
+	for _, p := range patterns {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }

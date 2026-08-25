@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -82,9 +83,29 @@ func (e hfTreeEntry) fileSize() int64 {
 // revision). Overridable for tests; production wiring is fetchHFRepoTree.
 var hfRepoTreeFn = fetchHFRepoTree
 
+// hfTreeAPIBase is the HF tree-API base URL, overridable so tests can point
+// fetchHFRepoTree at an httptest server instead of the real huggingface.co
+// (used to test pagination without live HTTP).
+var hfTreeAPIBase = "https://huggingface.co/api/models"
+
+// hfMaxTreePages bounds how many pages fetchHFRepoTree will follow via the
+// tree API's Link-header (RFC 5988) pagination (citadel #840 review: an
+// unpaginated fetch would silently UNDERSTATE requiredBytes on a repo with
+// more files than one page, which is a fail-open in the WRONG direction --
+// a real shortfall could slip through the preflight). Confirmed empirically
+// against the live API that a normal model repo (black-forest-labs/FLUX.1-dev,
+// ~40 files) gets no Link header at all at the default page size; pagination
+// only activates on repos actually big enough to need it. 50 pages is
+// generous headroom over that, and existing purely to stop a malformed/
+// hostile Link chain from looping forever, not because real repos are
+// expected to approach it.
+const hfMaxTreePages = 50
+
 // fetchHFRepoTree calls the HF `tree` API (not the model-info API) because it
 // is the one that resolves LFS pointer files to their real byte size inline,
-// with no extra per-file round trip.
+// with no extra per-file round trip. It follows the API's Link-header
+// pagination to completion (see hfMaxTreePages) so a large repo's estimate is
+// never silently truncated.
 //
 // Known limitations (both degrade to the fail-open path in runDiskPreflight,
 // never to a blocked download): the request is unauthenticated except for
@@ -94,27 +115,71 @@ var hfRepoTreeFn = fetchHFRepoTree
 // simply skips itself in that case. And the revision is hardcoded to `main`;
 // a repo whose default branch is something else 404s the same way.
 func fetchHFRepoTree(ctx context.Context, repo string) ([]hfTreeEntry, error) {
-	url := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/main?recursive=true", repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building huggingface tree request for %s: %w", repo, err)
+	url := fmt.Sprintf("%s/%s/tree/main?recursive=true", hfTreeAPIBase, repo)
+	token := hfAuthToken()
+
+	var all []hfTreeEntry
+	for page := 0; page < hfMaxTreePages; page++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building huggingface tree request for %s: %w", repo, err)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := hfHTTPClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetching huggingface tree for %s: %w", repo, err)
+		}
+
+		var entries []hfTreeEntry
+		decodeErr := json.NewDecoder(resp.Body).Decode(&entries)
+		next := nextTreePageURL(resp.Header)
+		statusCode, status := resp.StatusCode, resp.Status
+		resp.Body.Close()
+
+		if statusCode != http.StatusOK {
+			return nil, fmt.Errorf("huggingface tree API returned %s for %s", status, repo)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decoding huggingface tree response for %s: %w", repo, decodeErr)
+		}
+		all = append(all, entries...)
+		if next == "" {
+			return all, nil
+		}
+		url = next
 	}
-	if token := hfAuthToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	// A malformed/hostile Link chain that never terminates must not silently
+	// return a truncated (understated) tree -- that would size a real repo
+	// wrong in the direction that lets an actual shortfall through.
+	return nil, fmt.Errorf("huggingface tree for %s did not terminate within %d pages", repo, hfMaxTreePages)
+}
+
+// nextTreePageURL extracts the rel="next" target from an RFC 5988 Link
+// header (the pagination mechanism HF's tree API uses, confirmed empirically:
+// `Link: <...&cursor=...>; rel="next"`), or "" when there is no next page.
+func nextTreePageURL(h http.Header) string {
+	link := h.Get("Link")
+	if link == "" {
+		return ""
 	}
-	resp, err := hfHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetching huggingface tree for %s: %w", repo, err)
+	for _, part := range strings.Split(link, ",") {
+		segs := strings.Split(part, ";")
+		if len(segs) < 2 {
+			continue
+		}
+		urlPart := strings.TrimSpace(segs[0])
+		if !strings.HasPrefix(urlPart, "<") || !strings.HasSuffix(urlPart, ">") {
+			continue
+		}
+		for _, attr := range segs[1:] {
+			if strings.TrimSpace(attr) == `rel="next"` {
+				return strings.Trim(urlPart, "<>")
+			}
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("huggingface tree API returned %s for %s", resp.Status, repo)
-	}
-	var entries []hfTreeEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("decoding huggingface tree response for %s: %w", repo, err)
-	}
-	return entries, nil
+	return ""
 }
 
 // sumFilteredSize totals the byte size of every FILE entry that patternsInclude

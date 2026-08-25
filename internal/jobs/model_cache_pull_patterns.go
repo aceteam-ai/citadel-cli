@@ -10,6 +10,7 @@ package jobs
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -111,18 +112,44 @@ func isShardedCheckpointName(name string) bool {
 	return shardedCheckpointPattern.MatchString(strings.ToLower(name))
 }
 
-// diffusersLayoutDirs are the subfolders a standard diffusers pipeline needs.
-// This is exactly the LTX-Video shape that caused #828: a repo with these
-// subfolders ALSO carries several sibling top-level single-file checkpoints
-// (alternate quantizations/precisions), and an unfiltered snapshot pull grabs
-// all of them.
-var diffusersLayoutDirs = []string{"transformer", "vae", "text_encoder", "tokenizer", "scheduler"}
-
-// minDiffusersDirsMatched is how many of diffusersLayoutDirs must be present
-// before deriveDiffusersAllowPatterns treats the repo as diffusers-shaped,
-// avoiding a false-positive default-filter on a repo that merely happens to
-// have one similarly-named folder alongside a single checkpoint.
-const minDiffusersDirsMatched = 3
+// knownDiffusersComponentDirs is the set of top-level subfolder names this
+// package trusts NOT to be silently droppable if omitted from a derived
+// allow-list. It is deliberately broad (covers both UNet pipelines --
+// Stable Diffusion 1.x/2.x/XL and derivatives -- and the newer DiT
+// pipelines -- Flux/SD3/LTX-Video -- plus SDXL's dual text encoder and the
+// auxiliary safety/feature dirs), but it is NOT treated as exhaustive. See
+// deriveDiffusersAllowPatterns: this list is only ever used to build a
+// CONFIDENCE gate (every dir present must be a member), never to select a
+// safe subset out of a possibly-larger, partly-unrecognized set. A PR review
+// on #840 caught exactly that flaw: an earlier version derived from ONLY the
+// dirs it recognized, so a repo with an unrecognized weight-bearing dir (the
+// original version didn't even list `unet/`, the actual weights dir for
+// every pre-DiT diffusers pipeline) had that dir silently excluded from both
+// the size estimate and the download -- a pull that "succeeds" with missing
+// weights and no error anywhere. Extend this list generously; the subset gate
+// below is what keeps an incomplete list SAFE rather than merely convenient.
+var knownDiffusersComponentDirs = map[string]bool{
+	// Weight-bearing pipeline components.
+	"transformer":    true, // DiT pipelines: Flux, SD3, LTX-Video, ...
+	"unet":           true, // UNet pipelines: SD 1.x/2.x/SDXL and derivatives
+	"unet_ema":       true,
+	"vae":            true,
+	"vae_encoder":    true,
+	"vae_decoder":    true,
+	"text_encoder":   true,
+	"text_encoder_2": true, // SDXL dual text encoder
+	"text_encoder_3": true, // SD3 triple text encoder
+	"image_encoder":  true,
+	"controlnet":     true,
+	// Small, non-weight (or negligible) auxiliary components.
+	"tokenizer":         true,
+	"tokenizer_2":       true,
+	"tokenizer_3":       true,
+	"scheduler":         true,
+	"feature_extractor": true,
+	"safety_checker":    true,
+	"image_processor":   true,
+}
 
 // minRootCheckpointSiblings is the number of top-level *.safetensors files
 // required before deriveDiffusersAllowPatterns activates. A single top-level
@@ -137,10 +164,27 @@ const minRootCheckpointSiblings = 2
 // checkpoints shape, default to pulling only the pipeline subfolders (plus
 // small root config files) instead of everything.
 //
-// Returns nil when the shape doesn't match (not enough diffusers subfolders,
-// or no sibling checkpoint problem to solve), so callers fall back to an
-// unfiltered pull unchanged -- this is a narrow, evidence-gated default, not a
-// blanket "diffusers models get filtered" rule.
+// Confidence gate (the load-bearing safety property, per #840's review): this
+// derives an allow-list ONLY when EVERY top-level directory in the repo is a
+// recognized pipeline component (knownDiffusersComponentDirs) -- i.e. the
+// repo's directory set is a SUBSET of what we know is safe to enumerate
+// explicitly. The moment even one top-level directory is NOT recognized, this
+// bails to nil (pull everything, unfiltered) rather than build an allow-list
+// that silently omits it. This is deliberately the opposite of "select the
+// dirs we recognize and ignore the rest" -- that was the exact shape of the
+// bug this fix replaces (a hardcoded 5-dir list that omitted `unet/`, so a
+// Stable-Diffusion-1.5-shaped repo had its actual weights excluded from both
+// the size estimate and the download, with no error anywhere). An unmapped
+// directory must mean "not confident enough to filter", never "safe to
+// drop" -- when this returns nil, the ONLY behavior change is that the
+// unfiltered pull proceeds exactly as it did before this PR.
+//
+// Also returns nil when there's no sibling-checkpoint problem to solve
+// (fewer than minRootCheckpointSiblings root .safetensors files) or when the
+// root .safetensors files are shards of ONE model
+// (isShardedCheckpointName) rather than independent alternates -- filtering
+// those out would strip the actual weights the same way an unrecognized
+// component dir would.
 func deriveDiffusersAllowPatterns(entries []hfTreeEntry) []string {
 	dirSeen := make(map[string]bool)
 	rootCheckpoints := 0
@@ -168,16 +212,25 @@ func deriveDiffusersAllowPatterns(entries []hfTreeEntry) []string {
 	if rootCheckpoints < minRootCheckpointSiblings {
 		return nil
 	}
-	matched := 0
-	patterns := make([]string, 0, len(diffusersLayoutDirs)+3)
-	for _, d := range diffusersLayoutDirs {
-		if dirSeen[d] {
-			matched++
-			patterns = append(patterns, d+"/*")
+	if len(dirSeen) == 0 {
+		return nil
+	}
+	// Confidence gate: EVERY directory present must be recognized, or bail.
+	// No count threshold -- the safety property comes from the subset check,
+	// not from how many dirs happen to match.
+	for dir := range dirSeen {
+		if !knownDiffusersComponentDirs[dir] {
+			return nil
 		}
 	}
-	if matched < minDiffusersDirsMatched {
-		return nil
+	dirNames := make([]string, 0, len(dirSeen))
+	for dir := range dirSeen {
+		dirNames = append(dirNames, dir)
+	}
+	sort.Strings(dirNames)
+	patterns := make([]string, 0, len(dirNames)+2)
+	for _, dir := range dirNames {
+		patterns = append(patterns, dir+"/*")
 	}
 	// Root-level config/index files are tiny and needed to load the pipeline.
 	patterns = append(patterns, "*.json", "*.txt")

@@ -92,6 +92,17 @@ func TestHFCacheBaseDirPrecedence(t *testing.T) {
 			t.Errorf("hfCacheBaseDir() = %q, want %q", got, want)
 		}
 	})
+
+	t.Run("XDG_CACHE_HOME/huggingface/hub when HF_HOME is unset", func(t *testing.T) {
+		t.Setenv("HF_HUB_CACHE", "")
+		t.Setenv("HUGGINGFACE_HUB_CACHE", "")
+		t.Setenv("HF_HOME", "")
+		t.Setenv("XDG_CACHE_HOME", "/custom/xdg-cache")
+		want := filepath.Join("/custom/xdg-cache", "huggingface", "hub")
+		if got := hfCacheBaseDir(); got != want {
+			t.Errorf("hfCacheBaseDir() = %q, want %q", got, want)
+		}
+	})
 }
 
 // TestRunDiskPreflightInjected exercises the glue function with the
