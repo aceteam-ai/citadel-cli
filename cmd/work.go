@@ -2012,6 +2012,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// and /v1/models) with model->engine resolution so mesh-direct chat to this
 		// node reaches whichever local engine serves the requested model.
 		gw.SetChatRouter(newLocalChatLister())
+		// Node-routed request recorder (citadel #691): gives ollama/bonsai/
+		// llamacpp/unlimited-ocr -- which expose no scrapeable request metric --
+		// a real last_request_at in the heartbeat instead of "never". Read back
+		// by status.Collector.nodeRoutedIdle via the shared process-wide log.
+		gw.SetRequestRecorder(status.RecordEngineRequest)
 
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,

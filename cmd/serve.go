@@ -14,6 +14,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/tlscert"
 	"github.com/spf13/cobra"
 )
@@ -240,6 +241,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// and /v1/models) with model->engine resolution so mesh-direct chat to this
 	// node reaches whichever local engine serves the requested model.
 	gw.SetChatRouter(newLocalChatLister())
+	// Node-routed request recorder (citadel #691): see the matching call in
+	// cmd/work.go for why.
+	gw.SetRequestRecorder(status.RecordEngineRequest)
 
 	// VNC WebSocket proxy (requires websockify running on vnc-port)
 	gw.AddUpstream("/vnc", &gateway.Upstream{

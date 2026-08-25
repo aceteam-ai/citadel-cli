@@ -74,6 +74,15 @@ func (s *Server) SetChatRouter(lister ChatModelLister) {
 	s.chatLister = lister
 }
 
+// SetRequestRecorder wires a callback that records a node-routed request
+// against the resolved engine name (citadel #691). Passing nil (the default)
+// disables recording. Must be called before Start, like SetChatRouter.
+func (s *Server) SetRequestRecorder(recorder func(engine string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requestRecorder = recorder
+}
+
 // registerChatRoutes wires the chat-routing handlers onto the mux. It is called
 // from Start (and directly from tests) so the test exercises the SAME
 // registration path as production rather than a hand-rolled parallel mux.
@@ -96,6 +105,7 @@ func (s *Server) registerChatRoutes() {
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	lister := s.chatLister
+	recorder := s.requestRecorder
 	nodeName := s.config.NodeName
 	s.mu.RUnlock()
 
@@ -128,6 +138,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, http.StatusNotFound, "model_not_found",
 			fmt.Sprintf("model %q not served on this node", model))
 		return
+	}
+
+	// Record the dispatch against the resolved engine (citadel #691) before
+	// proxying. This fires on every request routed here regardless of the
+	// upstream engine's own response, matching the vLLM idle tracker's "active"
+	// gauge semantics (a queued/in-flight request already counts as activity) --
+	// recording only on a verified 2xx would need wrapping the ResponseWriter
+	// for no real benefit, since a request that reached here already proves the
+	// node is routing traffic to this engine.
+	if recorder != nil {
+		recorder(engine)
 	}
 
 	// Restore the body for the proxy.
