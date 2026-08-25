@@ -291,42 +291,86 @@ func (o *liveModuleOps) Stop(ctx context.Context, name string) error {
 	return o.composeDown(composePath, false)
 }
 
-// ListInstalled reports the actual on-node state of every installed module,
-// joining the manifest (source of truth for what is installed) with the lockfile
-// (canonical Source / Ref / Config provenance). CANONICAL-FORM CONTRACT: Source
-// is the REQUESTED source string the module was installed from (lockfile Source,
-// i.e. src.Raw), so it diffs equal against a desired assignment expressed in the
-// same requested form. Health reflects the durable stopped marker first, then the
-// live container run-state.
+// ListInstalled reports the actual on-node state of every MODULE-MANAGED
+// module -- i.e. every entry the module system itself installed, as recorded
+// in the lockfile -- joined with the manifest for run-state (the durable
+// stopped marker) and the live container inspection for health.
+//
+// CRITICAL SCOPING (citadel#739): the lockfile, not the manifest `services:`
+// list, is the converge engine's authority for "what is installed". A node's
+// manifest also lists services that were never module-managed -- started by
+// `citadel run`, provisioned by `citadel init`, or an embedded engine brought
+// up some other way -- and those carry no lockfile entry. Reconcile.Reconcile
+// treats anything in `actual` but not in `desired` as drift to UNINSTALL, so
+// enumerating the wider manifest set here (as this used to) meant the FIRST
+// non-empty desired state control-plane-side would tear down every other
+// manifest service the moment it didn't also appear in that desired set --
+// the empty-desired-set full-wipe guard in internal/reconcile/loop.go does not
+// cover this, because the desired set here is non-empty. Scoping to the
+// lockfile keeps operator-run / embedded services permanently OUTSIDE
+// reconcile's uninstall authority, exactly as internal/reconcile/ops.go's
+// ModuleOps.ListInstalled doc already specified ("read modules.lock ... joined
+// with the live container run-state") and exactly as the OTHER ActualState
+// reporter, nodestate.BuildActualState, already does (see CLAUDE.md "Two
+// ActualState reporters, two different module sets").
+//
+// CANONICAL-FORM CONTRACT: Source is the REQUESTED source string the module
+// was installed from (lockfile Source, i.e. src.Raw), so it diffs equal
+// against a desired assignment expressed in the same requested form. Health
+// reflects the durable stopped marker first, then the live container
+// run-state.
+//
+// Preserves the pre-existing "no manifest => nothing installed" short-circuit
+// (unrelated to #739's fix; kept as-is to minimize the blast radius of a
+// change to this destructive-adjacent path) -- a node with no manifest has no
+// compose files to run anything from regardless of what the lockfile claims.
 func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.InstalledModule, error) {
 	manifest, _, err := findAndReadManifest()
 	if err != nil {
 		// No manifest => nothing installed. Not an error for the reconciler.
 		return nil, nil
 	}
-	lf, _ := catalog.LoadLockfile() // best-effort; nil-safe below
+	lf, err := catalog.LoadLockfile()
+	if err != nil {
+		// Can't read the module-system's install ledger: report nothing rather
+		// than falling back to the wider (and, per #739, unsafe) manifest scan.
+		// Mirrors nodestate.BuildActualState's "no readable lockfile -> report
+		// zero modules" -- unconditional, crash-free, and it never widens the
+		// converge engine's uninstall authority.
+		o.log("MODULE_SET: could not read lockfile, reporting no installed modules: %v", err)
+		return nil, nil
+	}
+	if lf == nil || len(lf.Modules) == 0 {
+		return nil, nil
+	}
 
-	out := make([]reconcile.InstalledModule, 0, len(manifest.Services))
+	// The manifest is consulted ONLY to enrich run-state (the durable stopped
+	// marker); it is never the enumeration source.
+	servicesByName := make(map[string]Service, len(manifest.Services))
 	for _, s := range manifest.Services {
-		im := reconcile.InstalledModule{Name: s.Name}
-		if lf != nil {
-			if e, ok := lf.LookupLock(s.Name); ok {
-				im.Source = e.Source
-				im.Ref = e.Ref
-				im.Commit = e.Commit
-				im.Config = e.Config
-			}
+		servicesByName[s.Name] = s
+	}
+
+	out := make([]reconcile.InstalledModule, 0, len(lf.Modules))
+	for _, e := range lf.Modules {
+		im := reconcile.InstalledModule{
+			Name:   e.Name,
+			Source: e.Source,
+			Ref:    e.Ref,
+			Commit: e.Commit,
+			Config: e.Config,
 		}
-		// Catalog / embedded services carry no lockfile entry: their source IS the
-		// service name (a bare catalog name), which is also what NameFromSource
-		// derives, so a desired assignment with source == name diffs equal.
+		// Pre-canonical-form lockfile entries (or a blank Source) fall back to
+		// the module name, matching NameFromSource so a desired assignment with
+		// source == name still diffs equal.
 		if im.Source == "" {
-			im.Source = s.Name
+			im.Source = e.Name
 		}
-		// Health: a durable stopped marker wins; otherwise reflect the container.
-		if serviceStartDisabled(s) {
+		// Health: a durable stopped marker wins (when the manifest still lists
+		// this module); otherwise reflect the live container.
+		if s, ok := servicesByName[e.Name]; ok && serviceStartDisabled(s) {
 			im.Health = reconcile.HealthStopped
-		} else if o.isRunning(s.Name) {
+		} else if o.isRunning(e.Name) {
 			im.Health = reconcile.HealthRunning
 		} else {
 			im.Health = reconcile.HealthStopped

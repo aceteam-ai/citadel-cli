@@ -382,6 +382,10 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to update manifest: %w", err)
 	}
 
+	// Record provenance into the lockfile so this module is recognized as
+	// module-installed (citadel#739 follow-up: see recordCatalogModuleLock).
+	recordCatalogModuleLock(result.Name, overrides, result.Sandboxed)
+
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
 	if result.EnvDestPath != "" {
@@ -391,6 +395,38 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  citadel run %s\n", result.Name)
 
 	return nil
+}
+
+// recordCatalogModuleLock records provenance for a catalog-installed module into
+// modules.lock, mirroring recordModuleLock's git-source path (citadel#739
+// follow-up, root-gap fix). Both `citadel catalog install <name>` and
+// `citadel module install <catalog-name>` funnel through runCatalogInstall
+// (see cmd/module.go's KindCatalog delegation), and before this it left NO
+// lockfile entry -- harmless pre-#739 (the reconcile engine scanned the whole
+// manifest anyway), but AFTER #739 scoped liveModuleOps.ListInstalled's
+// converge authority to the lockfile, a catalog-CLI-installed module became
+// invisible to it. A later MODULE_SET (aceteam#5280, live) targeting that same
+// module by name would then fail to recognize it as installed and do a full
+// uninstall+reinstall (real downtime) instead of converging as a no-op.
+//
+// Catalog installs carry no git ref/commit/images (those are
+// KindGitHub/KindGitURL-only concepts resolved by catalog.ResolveSource, not
+// catalog.ResolveCatalogService), so this entry is intentionally minimal: Name
+// + Source (the bare catalog name, matching ModuleAssignment.Source's
+// documented "a bare catalog name" grammar and what catalog.ParseSource(name)
+// itself would set as Raw) + the config overrides the module was installed
+// with + whether it was sandboxed. Best-effort: a write failure is reported to
+// stderr but does not fail the install, matching recordModuleLock.
+func recordCatalogModuleLock(name string, config map[string]string, sandboxed bool) {
+	entry := catalog.LockEntry{
+		Name:      name,
+		Source:    name,
+		Config:    config,
+		Sandboxed: sandboxed,
+	}
+	if err := catalog.UpsertLockEntry(entry); err != nil {
+		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)
+	}
 }
 
 // printNotInstallableGuidance explains that a host-provisioned service (no

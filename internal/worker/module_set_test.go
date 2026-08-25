@@ -277,6 +277,36 @@ func TestModuleSetRunningConvergedIsNoOp(t *testing.T) {
 	}
 }
 
+// TestModuleSetAbsentNoOpForUnrecordedService documents a citadel#739
+// consequence: since liveModuleOps.ListInstalled (the real, non-fake adapter)
+// now scopes its enumeration to the lockfile, a service that was never
+// module-installed (an operator-run or embedded service, or any install path
+// that hasn't recorded a lockfile entry -- see the runCatalogInstall gap
+// closed in cmd/catalog.go's recordCatalogModuleLock) is invisible to it. A
+// fakeModuleOps seeded with nothing for that name reproduces exactly that
+// view. A MODULE_SET "absent" (remove) targeting such a service must be a
+// SAFE no-op -- scopeToSingleModule builds an empty desired + empty actual,
+// which reconcile.Reconcile diffs to an empty plan -- rather than reaching for
+// destructive cleanup on a service the reconcile engine does not recognize as
+// its own. The trade-off (documented in CLAUDE.md): a remote "remove" request
+// for such a service silently does nothing and still reports success.
+func TestModuleSetAbsentNoOpForUnrecordedService(t *testing.T) {
+	f := newFakeModuleOps() // nothing recorded: models a lockfile-less service
+	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})
+	res, err := h.Execute(context.Background(), moduleSetJob(perNodeQueue, map[string]any{
+		"source": "vllm", "desired_status": "absent",
+	}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success (safe no-op)", res.Status)
+	}
+	if hasCall(f.calls, "uninstall:vllm") {
+		t.Fatalf("must not attempt to uninstall a service reconcile has no record of: %v", f.calls)
+	}
+}
+
 func TestModuleSetMissingSourceIsTerminal(t *testing.T) {
 	f := newFakeModuleOps()
 	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})

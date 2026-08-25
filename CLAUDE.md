@@ -736,23 +736,79 @@ algorithm is what went stale before.
 
 ### Two ActualState reporters, two different module sets (#733)
 
-A node ships `ActualState` to the control plane from TWO independent paths, and
-they do not enumerate the same thing. Both are wired in `cmd/work.go`:
+A node ships `ActualState` to the control plane from TWO independent paths.
+Both are wired in `cmd/work.go`, and (since #739) both now share the SAME
+enumeration authority — the **lockfile** (`catalog.LoadLockfile`) — but still
+differ in how they fill in per-module health:
 
 - `nodestate.BuildActualState` decides the report the 60s `nodestate.Emitter`
-  sends. Its authority for "what is installed" is the **lockfile**
-  (`catalog.LoadLockfile`). No lockfile means it returns early with an EMPTY
-  module list, and the control plane's ingest writes zero module rows.
+  sends. It enumerates `lf.Modules` directly and determines health via a live
+  `ModuleInspector.Inspect` per entry. No lockfile means it returns early with
+  an EMPTY module list, and the control plane's ingest writes zero module rows.
 - `liveModuleOps.ListInstalled` (`cmd/module_ops.go`) decides the report the
-  reconcile loop sends, and its authority is the **manifest** `services:` list.
-  Every embedded/catalog service in `citadel.yaml` counts, whether or not the
-  module system ever installed it.
+  reconcile loop sends AND the set the reconcile engine (`internal/reconcile`)
+  is authoritative — i.e. eligible to UNINSTALL — over. It also enumerates
+  `lf.Modules`, then consults the manifest `services:` list ONLY to read the
+  durable stopped marker (`Service.DesiredStatus`) for health, falling back to
+  a live container check when the manifest doesn't have the entry.
 
 **The consequence that bites:** a node running services with no lockfile entries
-reports fine and still shows up as "has not reported any modules" upstream, so
-that message says nothing about whether the node is healthy or reporting. Check
-which path you expect to carry the data before concluding a node is silent. It
-also means the reconcile engine's authority is WIDER than "modules": see #739.
+(started by `citadel run`, provisioned by `citadel init`, or any embedded engine
+brought up outside the module system) reports fine and still shows up as "has
+not reported any modules" upstream, so that message says nothing about whether
+the node is healthy or reporting. Check which path you expect to carry the data
+before concluding a node is silent.
+
+**Why this scoping matters more than it looks (#739, fixed):**
+`liveModuleOps.ListInstalled` used to enumerate the manifest `services:` list
+instead of the lockfile — every embedded/catalog service in `citadel.yaml`
+counted as "installed" to the reconcile engine, whether or not the module
+system ever installed it. `internal/reconcile.Reconcile` treats anything in
+`actual` but not in the control plane's `desired` set as drift to UNINSTALL, and
+that check is NOT the empty-desired-set full-wipe guard in
+`internal/reconcile/loop.go` — that guard only fires when desired is entirely
+empty. The FIRST non-empty desired state (even a single module) would have torn
+down every OTHER manifest service alongside it: install/uninstall + drop from
+the manifest + delete lockfile entries + remove materialized compose/env files.
+Latent (nothing wrote durable desired rows at the time), but real the moment
+something does. `TestOneDesiredModuleDoesNotWipeManifest`
+(`cmd/module_ops_test.go`) pins the fixed contract directly against
+`reconcile.Reconcile`.
+
+**Every real install path must call `catalog.UpsertLockEntry`, or it's invisible
+to converge.** The "present in lockfile ⇒ module-installed" direction only holds
+if every code path that genuinely installs a module also records it: `citadel
+module install <source>` (`cmd/module.go`, external git sources), `citadel
+module update` (`cmd/module_update.go`), the reconcile engine's own `Install`
+(`cmd/module_ops.go`), and `citadel catalog install <name>` / `citadel module
+install <catalog-name>` (both funnel through `runCatalogInstall`, `cmd/catalog.go`
+— this one was MISSING the lockfile write until the #739 follow-up that added
+`recordCatalogModuleLock`; pre-#739 that gap was harmless because the manifest-wide
+scan papered over it, but post-#739 it meant a catalog-CLI-installed module was
+invisible to `ListInstalled`, so a later MODULE_SET retargeting it by name would
+uninstall+reinstall instead of converging as a no-op — `TestCatalogInstalledModuleNoLongerReinstallsOnRetarget`
+pins the fix). If you add a new install entry point, it needs this too, or this
+same gap reopens under a new name.
+
+**Residual, accepted gap:** even with every path wired, the reverse direction
+isn't airtight — every write above is best-effort (a failed lockfile write is
+logged, not fatal, so the install/compose-up still proceeds). A false negative
+here means `ListInstalled` under-reports a genuinely module-installed service,
+which the engine resolves with a harmless idempotent re-`Install`, not an
+uninstall of something else — the direction of error this scoping fix cares
+about. Hardening those writes to be non-best-effort is a documented,
+low-priority follow-up, not part of #739's fix.
+
+**MODULE_SET `absent` on a lockfile-less service is a silent no-op.** In
+`internal/worker/module_set.go`'s `scopeToSingleModule`, a `desired_status:
+absent` (remove) targeting a service with NO lockfile entry — an
+operator-run/embedded service, or any install path that hasn't recorded one —
+now converges to an empty desired + empty actual = an empty plan, rather than
+the old compose-down/deregister/cleanup. This is the safe direction (nothing
+gets destroyed that reconcile doesn't recognize as its own), but it means a
+remote "remove" request for such a service does nothing and reports success.
+`TestModuleSetAbsentNoOpForUnrecordedService` (`internal/worker/module_set_test.go`)
+pins this.
 
 Reporting is on the observability path, never the apply path. The full-wipe
 guard in `internal/reconcile/loop.go` refuses the destructive converge and still
