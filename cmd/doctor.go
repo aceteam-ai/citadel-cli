@@ -80,6 +80,17 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 	if checks, ok := r.doctor["checks"].([]map[string]any); ok {
 		for _, c := range checks {
 			name, _ := c["name"].(string)
+			// agentDoctor (cmd/agent_tools.go) runs its own
+			// platform.CheckDockerUsable probe and folds the result into this
+			// same "checks" slice as "docker_usable". The DOCKER / ENGINE
+			// section above already renders that exact signal from
+			// r.dockerHealth, so printing it again here would show the docker
+			// check twice per `citadel doctor` run (citadel-cli#803). Skip it
+			// -- agentDoctor's own return shape is untouched; this is
+			// display-only de-dup for the `doctor` command's rendering.
+			if name == "docker_usable" {
+				continue
+			}
 			checkOK, _ := c["ok"].(bool)
 			detail, _ := c["detail"].(string)
 			status := goodColor.Sprint("[OK]")

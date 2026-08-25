@@ -136,6 +136,60 @@ func TestRenderDoctorReport_UnhealthyDocker(t *testing.T) {
 	}
 }
 
+// dockerUsableCheck mirrors the "docker_usable" entry agentDoctor
+// (cmd/agent_tools.go) folds into its "checks" slice via its own internal
+// platform.CheckDockerUsable probe.
+func dockerUsableCheck(ok bool, detail string) map[string]any {
+	return map[string]any{"name": "docker_usable", "ok": ok, "detail": detail}
+}
+
+// TestRenderDoctorReport_DockerCheckShownOnce pins the fix for citadel-cli#803:
+// agentDoctor's own "checks" slice includes a "docker_usable" entry (it runs
+// its own platform.CheckDockerUsable probe for the /agent/doctor HTTP
+// endpoint / citadel_doctor MCP tool, whose contract this test must not
+// disturb), but the `doctor` command's DOCKER / ENGINE section already
+// renders that exact signal from r.dockerHealth. Without de-duping, the
+// rendered report showed the docker check twice per invocation. This test
+// builds a doctor payload shaped like the real agentDoctor output (checks
+// includes "docker_usable") and asserts the human report shows it once.
+func TestRenderDoctorReport_DockerCheckShownOnce(t *testing.T) {
+	dockerMsg := "docker CLI not found on PATH."
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{
+			OK:      false,
+			Code:    "cli_missing",
+			Message: dockerMsg,
+			Hint:    "Install it with 'brew install docker'.",
+		},
+		doctor: map[string]any{
+			"healthy": false,
+			"checks": []map[string]any{
+				{"name": "headscale_node_id_resolved", "ok": true, "detail": "node-123"},
+				dockerUsableCheck(false, dockerMsg),
+			},
+			"diagnosis": "Node looks healthy for per-node job routing.",
+		},
+	}
+
+	var buf bytes.Buffer
+	renderDoctorReport(&buf, r)
+	out := buf.String()
+
+	if n := strings.Count(out, "DOCKER / ENGINE"); n != 1 {
+		t.Errorf("expected exactly one DOCKER / ENGINE section, got %d:\n%s", n, out)
+	}
+	if n := strings.Count(out, dockerMsg); n != 1 {
+		t.Errorf("expected the docker health message to appear exactly once, got %d:\n%s", n, out)
+	}
+	if strings.Contains(out, "docker_usable") {
+		t.Errorf("expected the job-routing section to suppress the duplicate docker_usable line:\n%s", out)
+	}
+	// Non-docker job-routing checks must still render.
+	if !strings.Contains(out, "headscale_node_id_resolved") {
+		t.Errorf("expected non-docker job-routing checks to still render:\n%s", out)
+	}
+}
+
 // TestRunDoctorChecksNoCrash exercises the real wiring (agentDoctor +
 // platform.CheckDockerUsable) end to end. It intentionally does not assert on
 // docker's presence/absence -- CI/dev machines differ -- only that gathering
@@ -157,6 +211,19 @@ func TestRunDoctorChecksNoCrash(t *testing.T) {
 	// Rendering must not panic regardless of the local docker/engine state.
 	var buf bytes.Buffer
 	renderDoctorReport(&buf, report)
+
+	// citadel-cli#803: end-to-end (real agentDoctor output, which does
+	// include a "docker_usable" check), the rendered report must show the
+	// docker/engine check exactly once -- in DOCKER / ENGINE -- not also as a
+	// "docker_usable" line under JOB ROUTING / WORKER HEALTH.
+	out := buf.String()
+	if n := strings.Count(out, "DOCKER / ENGINE"); n != 1 {
+		t.Errorf("expected exactly one DOCKER / ENGINE section, got %d:\n%s", n, out)
+	}
+	if strings.Contains(out, "docker_usable") {
+		t.Errorf("expected the job-routing section to suppress the duplicate docker_usable line:\n%s", out)
+	}
+
 	if buf.Len() == 0 {
 		t.Fatalf("expected renderDoctorReport to write output")
 	}
