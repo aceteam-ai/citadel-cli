@@ -775,16 +775,40 @@ something does. `TestOneDesiredModuleDoesNotWipeManifest`
 (`cmd/module_ops_test.go`) pins the fixed contract directly against
 `reconcile.Reconcile`.
 
-**Known residual gap:** the "present in lockfile ⇒ module-installed" direction
-is sound (`catalog.UpsertLockEntry` has exactly three call sites, all inside
-`citadel module install`/`update` or the reconcile engine's own `Install`), but
-the reverse isn't airtight — both write sites are best-effort (a failed lockfile
-write is logged, not fatal, so the install/compose-up still proceeds). A false
-negative here means `ListInstalled` under-reports a genuinely module-installed
-service, which the engine resolves with a harmless idempotent re-`Install`, not
-an uninstall of something else — the direction of error this scoping fix cares
-about. Hardening those writes to be non-best-effort is a documented, low-priority
-follow-up, not part of #739's fix.
+**Every real install path must call `catalog.UpsertLockEntry`, or it's invisible
+to converge.** The "present in lockfile ⇒ module-installed" direction only holds
+if every code path that genuinely installs a module also records it: `citadel
+module install <source>` (`cmd/module.go`, external git sources), `citadel
+module update` (`cmd/module_update.go`), the reconcile engine's own `Install`
+(`cmd/module_ops.go`), and `citadel catalog install <name>` / `citadel module
+install <catalog-name>` (both funnel through `runCatalogInstall`, `cmd/catalog.go`
+— this one was MISSING the lockfile write until the #739 follow-up that added
+`recordCatalogModuleLock`; pre-#739 that gap was harmless because the manifest-wide
+scan papered over it, but post-#739 it meant a catalog-CLI-installed module was
+invisible to `ListInstalled`, so a later MODULE_SET retargeting it by name would
+uninstall+reinstall instead of converging as a no-op — `TestCatalogInstalledModuleNoLongerReinstallsOnRetarget`
+pins the fix). If you add a new install entry point, it needs this too, or this
+same gap reopens under a new name.
+
+**Residual, accepted gap:** even with every path wired, the reverse direction
+isn't airtight — every write above is best-effort (a failed lockfile write is
+logged, not fatal, so the install/compose-up still proceeds). A false negative
+here means `ListInstalled` under-reports a genuinely module-installed service,
+which the engine resolves with a harmless idempotent re-`Install`, not an
+uninstall of something else — the direction of error this scoping fix cares
+about. Hardening those writes to be non-best-effort is a documented,
+low-priority follow-up, not part of #739's fix.
+
+**MODULE_SET `absent` on a lockfile-less service is a silent no-op.** In
+`internal/worker/module_set.go`'s `scopeToSingleModule`, a `desired_status:
+absent` (remove) targeting a service with NO lockfile entry — an
+operator-run/embedded service, or any install path that hasn't recorded one —
+now converges to an empty desired + empty actual = an empty plan, rather than
+the old compose-down/deregister/cleanup. This is the safe direction (nothing
+gets destroyed that reconcile doesn't recognize as its own), but it means a
+remote "remove" request for such a service does nothing and reports success.
+`TestModuleSetAbsentNoOpForUnrecordedService` (`internal/worker/module_set_test.go`)
+pins this.
 
 Reporting is on the observability path, never the apply path. The full-wipe
 guard in `internal/reconcile/loop.go` refuses the destructive converge and still
