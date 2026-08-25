@@ -130,3 +130,78 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: go build ./...
+
+  # Tokenizer smoke test for the diffusers sidecar (citadel-cli#829). Real
+  # incident: LTX-Video's T5 tokenizer failed to construct on a live node,
+  # mid-provision -- first a missing tiktoken, then a missing
+  # sentencepiece/protobuf -- because nothing had ever exercised tokenizer
+  # construction before the sidecar image shipped. build-diffusers-service.yml
+  # deliberately does NOT build the (multi-GB, CUDA) sidecar image on PRs (see
+  # that workflow's comment), so this is NOT a full-image build: it installs
+  # only the pinned tokenizer-stack packages from
+  # services/diffusers-service/requirements.txt (no torch/diffusers/
+  # accelerate) and runs a CPU-only script that imports each pinned dep
+  # directly and constructs a tokenizer for each model family the sidecar
+  # serves, downloading only small tokenizer/config files -- never the
+  # multi-GB weight shards a real model load would pull. See
+  # services/diffusers-service/scripts/check_tokenizer_deps.py for exactly
+  # what is and isn't covered (including why one probe is gated on an
+  # optional HF_TOKEN secret that this repo does not currently define, and why
+  # the tier-2 probes only ever SKIP -- never fail -- on a network/HF problem).
+  #
+  # Path-filtered so it only does real work when the sidecar source or this
+  # workflow file changes -- same "don't tax unrelated PRs" reasoning
+  # build-diffusers-service.yml documents, but a different mechanism: that
+  # workflow uses a workflow-level `on.push.paths` filter and doesn't trigger
+  # on pull_request at all, whereas ci.yml runs on every PR/push and this job
+  # instead uses a step-level `dorny/paths-filter` (below) to skip its own
+  # steps when nothing under services/diffusers-service/** changed.
+  diffusers-tokenizer-smoke:
+    name: Diffusers sidecar tokenizer smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check for sidecar changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            sidecar:
+              - 'services/diffusers-service/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Set up Python
+        if: steps.changes.outputs.sidecar == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned tokenizer-stack deps
+        if: steps.changes.outputs.sidecar == 'true'
+        working-directory: services/diffusers-service
+        run: |
+          python -m pip install --upgrade pip
+          # Install only the tokenizer-relevant subset of requirements.txt --
+          # sourced from the pinned file itself (not restated here) so this
+          # step can never drift from the versions the sidecar image actually
+          # ships. Deliberately skips torch/diffusers/accelerate: this is a
+          # CPU-only tokenizer test, not a model-load test.
+          deps="$(grep -E '^(transformers|sentencepiece|protobuf|tiktoken|ftfy)==' requirements.txt)"
+          echo "$deps"
+          pip install $deps
+
+      - name: Tokenizer construction smoke test
+        if: steps.changes.outputs.sidecar == 'true'
+        working-directory: services/diffusers-service
+        # HF_TOKEN is optional and not currently defined as a repo secret;
+        # when absent the script skips (not fails) the one probe that needs
+        # it (SD 3.5 Medium is HF-gated). Tier 2 as a whole only ever SKIPS on
+        # a network/HF problem -- see the script's module docstring for why
+        # that's deliberate and what stays a hard, offline gate (tier 1, plus
+        # the tier-2 dependency-shaped-failure path exercised by
+        # Lightricks/LTX-Video, the model this issue is actually about).
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/check_tokenizer_deps.py
