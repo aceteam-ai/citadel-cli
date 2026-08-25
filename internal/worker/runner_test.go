@@ -166,6 +166,14 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 }
 
 // MockStreamWriter is a test implementation of StreamWriter.
+//
+// WriteEndErr / WriteErrorErr let a test simulate a failed publish (network
+// blip, WS hiccup, transient API error) -- the exact scenario citadel-cli#559
+// left unobservable when WriteEnd/WriteError's return value was discarded in
+// Runner.processJob. The write is still recorded (ended/errored flip to true,
+// as a real StreamWriter would have attempted the publish); only the RETURN
+// VALUE is the injected error, so tests can assert both "the publish was
+// attempted" and "the runner logged/handled the failure to publish."
 type MockStreamWriter struct {
 	claimed        bool
 	claimedVersion string
@@ -176,6 +184,11 @@ type MockStreamWriter struct {
 	erroredErr     error
 	erroredRecover bool
 	cancelled      bool
+
+	// WriteEndErr, when non-nil, is returned by WriteEnd instead of nil.
+	WriteEndErr error
+	// WriteErrorErr, when non-nil, is returned by WriteError instead of nil.
+	WriteErrorErr error
 }
 
 func (m *MockStreamWriter) WriteClaimed(agentVersion string) error {
@@ -196,14 +209,14 @@ func (m *MockStreamWriter) WriteChunk(content string, index int) error {
 
 func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 	m.ended = true
-	return nil
+	return m.WriteEndErr
 }
 
 func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 	m.errored = true
 	m.erroredErr = err
 	m.erroredRecover = recoverable
-	return nil
+	return m.WriteErrorErr
 }
 
 func (m *MockStreamWriter) WriteCancelled(reason string) error {
@@ -1123,5 +1136,243 @@ func TestRunnerTargetNodeMismatchNoUsageRecord(t *testing.T) {
 
 	if recordCount != 0 {
 		t.Errorf("Expected 0 usage records for skipped job, got %d", recordCount)
+	}
+}
+
+// TestRunnerServiceStartPublishesTerminalEndOnSuccess pins the fix for
+// citadel-cli#559: a SERVICE_START that completes successfully must publish
+// exactly one terminal "end" event to stream:v1:{jobId} -- the backend
+// subscribes BEFORE dispatch and waits on this event to short-circuit its
+// slow poll-based fallback. Also guards against a double-publish (end AND
+// error both firing for the same outcome).
+func TestRunnerServiceStartPublishesTerminalEndOnSuccess(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false) // succeeds
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.112.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.ended {
+		t.Error("expected a terminal 'end' event to be published for a successful SERVICE_START")
+	}
+	if stream.errored {
+		t.Error("a successful SERVICE_START must not also publish a terminal error event (exactly one terminal event)")
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartPublishesTerminalErrorOnFailure is the failure-side
+// counterpart of the above: a SERVICE_START whose handler fails must publish
+// exactly one terminal "error" event, not silently Nack with nothing on the
+// stream.
+func TestRunnerServiceStartPublishesTerminalErrorOnFailure(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, true) // fails
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.112.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.errored {
+		t.Error("expected a terminal error event to be published for a failed SERVICE_START")
+	}
+	if stream.ended {
+		t.Error("a failed SERVICE_START must not also publish a terminal end event (exactly one terminal event)")
+	}
+	if stream.erroredErr == nil {
+		t.Fatal("expected a non-nil error on the published terminal event")
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartLogsWarningWhenTerminalEndPublishFails pins the actual
+// behavioral change in citadel-cli#559: previously the success path discarded
+// stream.WriteEnd's return value entirely, so a failed publish to
+// stream:v1:{jobId} was invisible -- no log, no signal anywhere. This test
+// forces WriteEnd to fail and asserts (a) the runner now logs a warning about
+// it, and (b) the job still completes normally (Acked, not silently dropped)
+// despite the publish failure -- the node's own bookkeeping must not regress
+// just because the stream publish did.
+func TestRunnerServiceStartLogsWarningWhenTerminalEndPublishFails(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false) // succeeds
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.112.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{WriteEndErr: errors.New("simulated publish failure (network blip)")}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.ended {
+		t.Error("expected the runner to have attempted the terminal 'end' publish")
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+
+	foundWarning := false
+	for _, m := range messages {
+		if strings.Contains(m, "warning") && strings.Contains(m, "Failed to publish terminal end event") && strings.Contains(m, "job-1") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected a warning log about the failed terminal-end publish, got messages: %v", messages)
+	}
+
+	// Despite the publish failure, the job itself succeeded on the node and
+	// must still be Acked -- the publish failure must not turn into a job
+	// failure or a silently dropped job.
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1 (publish failure must not block Ack of a locally-successful job)", len(source.AckedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartLogsWarningWhenTerminalErrorPublishFails is the
+// failure-side counterpart: previously stream.WriteError's return value was
+// discarded on the generic handler-failure path too. Forces WriteError to
+// fail and asserts the runner logs a warning and still Nacks the job.
+func TestRunnerServiceStartLogsWarningWhenTerminalErrorPublishFails(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, true) // fails
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.112.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{WriteErrorErr: errors.New("simulated publish failure (network blip)")}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.errored {
+		t.Error("expected the runner to have attempted the terminal error publish")
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+
+	foundWarning := false
+	for _, m := range messages {
+		if strings.Contains(m, "warning") && strings.Contains(m, "Failed to publish terminal error event") && strings.Contains(m, "job-1") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected a warning log about the failed terminal-error publish, got messages: %v", messages)
+	}
+
+	// The job itself failed on the node and must still be Nacked, regardless
+	// of whether the stream publish also failed.
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1 (publish failure must not block Nack of a locally-failed job)", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 0 {
+		t.Errorf("Acked jobs = %d, want 0", len(source.AckedJobs()))
+	}
+}
+
+// TestRunnerNoGPUSlotsNacksWithoutHandlerExecution pins the CURRENT (deliberately
+// unchanged) behavior of the GPU-slot-exhaustion path: the job is Nacked for
+// redelivery without running the handler. This Nack redelivers the same job
+// ID, so a caller streaming this attempt would need to already treat a Nack
+// as non-terminal -- unlike a genuine terminal outcome (success/failure),
+// there is no terminal-event contract for a will-be-retried attempt. See the
+// PR for citadel-cli#559 for why a terminal-event publish was deliberately
+// NOT added here (it risks turning a transparent retry into a reported
+// failure if the backend treats any published error as final).
+func TestRunnerNoGPUSlotsNacksWithoutHandlerExecution(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+	config := RunnerConfig{
+		WorkerID:   "test-worker",
+		GPUTracker: NewGPUTracker(0), // zero slots: every Acquire() fails
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("handler should not run when no GPU slot is available, got %d executions", len(handler.ExecutedJobs()))
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
 	}
 }

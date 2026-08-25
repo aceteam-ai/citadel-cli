@@ -441,7 +441,9 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 					err := fmt.Errorf("requested GPU %d is unavailable", gpuIdx)
 					r.log("error", "GPU unavailable: %v", err)
 					r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
-					stream.WriteError(err, false)
+					if werr := stream.WriteError(err, false); werr != nil {
+						r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
+					}
 					r.source.Nack(ctx, job, err)
 					return
 				}
@@ -455,6 +457,14 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 				err := fmt.Errorf("no GPU slots available")
 				r.log("warning", "No GPU slots: %v", err)
 				r.recordJob(buildUsageRecord(job, "retry", startTime, time.Now(), nil, err))
+				// NOTE (citadel-cli#559): this Nack redelivers the SAME job ID, so a
+				// terminal event published here would land on stream:v1:{jobId}
+				// for an attempt that isn't actually final -- if the backend treats
+				// any "error" event as terminal-failure (rather than "recoverable,
+				// keep waiting"), this would turn a transparent retry into a
+				// reported failure. Left as pre-existing behavior (no publish)
+				// pending confirmation of how the backend interprets
+				// recoverable=true; see the PR for #559 for the deferred-fix note.
 				r.source.Nack(ctx, job, err)
 				return
 			}
@@ -496,7 +506,9 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
-		stream.WriteError(actualErr, false)
+		if werr := stream.WriteError(actualErr, false); werr != nil {
+			r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
+		}
 
 		// A watchdog abandon (deadline exceeded) is terminal, not a transient
 		// failure: the handler goroutine is orphaned and still running, so
@@ -532,6 +544,11 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	if result != nil && result.Status == JobStatusRetry {
 		r.log("warning", "Job %s needs retry (%v)", job.ID, duration)
 		r.recordJob(buildUsageRecord(job, "retry", startTime, endTime, result, result.Error))
+		// NOTE (citadel-cli#559): same reasoning as the no-GPU-slots Nack above --
+		// this Nack redelivers the same job ID, so left as pre-existing behavior
+		// (no publish) pending confirmation of the backend's contract for a
+		// non-final attempt. SERVICE_START (routed through LegacyHandlerAdapter)
+		// never returns JobStatusRetry, so this branch does not affect it.
 		r.source.Nack(ctx, job, result.Error)
 		return
 	}
@@ -540,10 +557,19 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	jobOK = true
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
+	var output map[string]any
 	if result != nil {
-		stream.WriteEnd(result.Output)
-	} else {
-		stream.WriteEnd(nil)
+		output = result.Output
+	}
+	// This publish is the entire contract for the streaming dispatch path
+	// (issue #559): the backend subscribes to stream:v1:{jobId} BEFORE
+	// dispatch and waits on this terminal event. Previously the error was
+	// discarded, so ANY publish failure here was invisible: no log line, no
+	// retry, no signal that the node's terminal event never reached the
+	// backend -- whatever caused a given drop, this path could not have
+	// reported it. It is now at least observable in the node log.
+	if werr := stream.WriteEnd(output); werr != nil {
+		r.log("warning", "Failed to publish terminal end event for job %s: %v", job.ID, werr)
 	}
 	r.source.Ack(ctx, job)
 }
