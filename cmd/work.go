@@ -1724,6 +1724,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					NodeID:          nodeName,
 					HeadscaleNodeID: headscaleNodeID,
 					OrgID:           orgID,
+					AgentVersion:    Version,
 					DebugFunc:       Debug,
 					MarkerDir:       network.GetNodeConfigDir(),
 				}, collector)
@@ -1785,6 +1786,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				NodeID:          nodeName,
 				HeadscaleNodeID: headscaleNodeID,
 				DeviceCode:      deviceCode,
+				AgentVersion:    Version,
 				ChannelOverride: workStatusChannel,
 				DebugFunc:       Debug,
 				MarkerDir:       network.GetNodeConfigDir(),
