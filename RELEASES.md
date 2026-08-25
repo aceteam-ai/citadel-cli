@@ -1712,3 +1712,19 @@ Auto-generated log of every release.
   - docs: node master-PIN + at-rest encryption design (#796) (#807)
 
 
+---
+
+## v2.113.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 5 |
+| Lines added | +441 |
+
+**Changes:**
+
+  - fix(worker): stop silently dropping SERVICE_START terminal-stream publish errors (#559) (#822)
+  - fix(terminal): defensively parse previous_hash_expires_at (#815) (#821)
+
+
