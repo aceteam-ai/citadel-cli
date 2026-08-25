@@ -1359,8 +1359,14 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 // compose stack is up. When the managed row IS running, it wins unchanged —
 // composeServiceState is already authoritative for that case.
 //
-// Pure function — no I/O — so the merge/de-dupe/upgrade decision is
-// unit-testable without docker, a live engine, or a manifest file.
+// No I/O, so the merge/de-dupe/upgrade decision is unit-testable without
+// docker, a live engine, or a manifest file. NOT allocation-pure, though: an
+// upgrade mutates the matched element of `managed` in place (out shares
+// managed's backing array until an append grows it), so the caller's slice
+// header can be reassigned from the return value but its already-existing
+// elements may already reflect the upgrade too. The single call site
+// (`data.Services = mergeDetectedEngines(data.Services, ...)`) relies on
+// exactly this, not a defensive copy.
 func mergeDetectedEngines(managed []controlcenter.ServiceInfo, discovered []status.LocalEngine) []controlcenter.ServiceInfo {
 	indexByName := make(map[string]int, len(managed))
 	for i, svc := range managed {
