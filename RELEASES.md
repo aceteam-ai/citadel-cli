@@ -1728,3 +1728,20 @@ Auto-generated log of every release.
   - fix(terminal): defensively parse previous_hash_expires_at (#815) (#821)
 
 
+---
+
+## v2.114.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 22 |
+| Lines added | +1677 |
+
+**Changes:**
+
+  - feat(heartbeat): surface swap activity (swaps_per_hour, evicting, ceiling) + whether a swap pulled (#717) (#836)
+  - fix(status): record last_request_at for every node-routed engine, not just vLLM (#691) (#834)
+  - fix(worker): don't Nack non-GPU jobs (e.g. SERVICE_START) on GPU-slot contention (#825) (#827)
+
+
