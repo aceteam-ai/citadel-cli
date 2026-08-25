@@ -251,17 +251,45 @@ type SystemMetrics struct {
 	MemoryUsedGB  float64 `json:"memory_used_gb"`
 	MemoryTotalGB float64 `json:"memory_total_gb"`
 	MemoryPercent float64 `json:"memory_percent"`
-	DiskUsedGB    float64 `json:"disk_used_gb"`
-	DiskTotalGB   float64 `json:"disk_total_gb"`
-	DiskPercent   float64 `json:"disk_percent"`
+	// MemoryAvailableGB is RAM available for programs to allocate (gopsutil's
+	// kernel-computed "available", e.g. Linux MemAvailable — it already
+	// accounts for reclaimable page cache, unlike a naive total-used).
+	// This is the number the routing gate needs (citadel #833): the incident
+	// that motivated it was a node with plenty of free VRAM but ~0 free RAM
+	// (a CPU-offloaded text encoder needing ~19GB RAM), OOM-killed because
+	// nothing surfaced RAM headroom for scheduling to gate on. Zero when
+	// unavailable (no fabricated value), matching the sibling fields above.
+	MemoryAvailableGB float64 `json:"memory_available_gb"`
+	DiskUsedGB        float64 `json:"disk_used_gb"`
+	DiskTotalGB       float64 `json:"disk_total_gb"`
+	DiskPercent       float64 `json:"disk_percent"`
+	// DiskAvailableGB is free space on the root filesystem (gopsutil's Free),
+	// the same "/" mount the sibling Disk* fields above already measure.
+	// Zero when unavailable, matching the sibling fields.
+	DiskAvailableGB float64 `json:"disk_available_gb"`
 }
 
 // GPUMetrics contains GPU utilization information.
 type GPUMetrics struct {
-	Index              int     `json:"index"`
-	Name               string  `json:"name"`
-	MemoryUsedMB       int     `json:"memory_used_mb,omitempty"`
-	MemoryTotalMB      int     `json:"memory_total_mb,omitempty"`
+	Index         int    `json:"index"`
+	Name          string `json:"name"`
+	MemoryUsedMB  int    `json:"memory_used_mb,omitempty"`
+	MemoryTotalMB int    `json:"memory_total_mb,omitempty"`
+	// MemoryFreeMB is free VRAM as reported directly by nvidia-smi's
+	// memory.free query (citadel #833; platform.GPUInfo.MemoryFree). It is
+	// deliberately NOT MemoryTotalMB-MemoryUsedMB: nvidia-smi reserves memory
+	// that counts against neither, so a derived value systematically
+	// overstates what's actually free — the wrong direction of error for a
+	// signal meant to prevent an OOM/placement mistake. Omitted when unknown
+	// (e.g. macOS/Metal, which does not report it).
+	//
+	// Zero is ambiguous by construction (0 = "genuinely no free VRAM" OR
+	// "unset/unknown"), same as MemoryUsedMB/MemoryTotalMB's existing
+	// omitempty convention on this struct. A consumer that must distinguish
+	// "full GPU" from "no signal" needs to gate on MemoryTotalMB>0 as well
+	// (internal/jobs.freeVRAMBytes already does, treating <=0 as "fall back
+	// to the derived total-used value" for exactly this reason).
+	MemoryFreeMB       int     `json:"memory_free_mb,omitempty"`
 	UtilizationPercent float64 `json:"utilization_percent,omitempty"`
 	TemperatureCelsius int     `json:"temperature_celsius,omitempty"`
 	Driver             string  `json:"driver,omitempty"`

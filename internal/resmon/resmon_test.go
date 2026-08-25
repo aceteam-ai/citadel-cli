@@ -3,9 +3,15 @@ package resmon
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// errFakeHomeDir is a stand-in error for an unresolvable home directory in
+// TestResolveDiskPath.
+var errFakeHomeDir = errors.New("fake: home dir unresolvable")
 
 // gib is a non-constant GiB multiplier so fractional byte literals compile as
 // uint64 conversions (a constant float with a fractional value cannot convert
@@ -36,25 +42,44 @@ func TestParseComputeApps_MultiGPUSamePIDSums(t *testing.T) {
 }
 
 func TestParseGPUTotals(t *testing.T) {
-	// memory.used, memory.total, utilization.gpu — MiB, MiB, %.
-	// Two devices: totals sum, util is the max.
-	out := "8192, 24576, 12\n1024, 24576, 47\n"
-	used, total, util := parseGPUTotals(out)
+	// memory.used, memory.total, utilization.gpu, memory.free — MiB, MiB, %, MiB.
+	// Two devices: used/total/free sum, util is the max.
+	out := "8192, 24576, 12, 16000\n1024, 24576, 47, 23000\n"
+	used, total, free, util := parseGPUTotals(out)
 	if want := uint64(8192+1024) * (1 << 20); used != want {
 		t.Errorf("used = %d, want %d", used, want)
 	}
 	if want := uint64(24576+24576) * (1 << 20); total != want {
 		t.Errorf("total = %d, want %d", total, want)
 	}
+	if want := uint64(16000+23000) * (1 << 20); free != want {
+		t.Errorf("free = %d, want %d", free, want)
+	}
 	if util != 47 {
 		t.Errorf("util = %v, want 47 (max across devices)", util)
 	}
 }
 
+func TestParseGPUTotals_NotDerivedFromTotalMinusUsed(t *testing.T) {
+	// Real RTX 3090 sample (citadel #833 investigation): total=24576, used=17827,
+	// nvidia-smi's own memory.free=6292 — NOT the derived 24576-17827=6749. The
+	// whole reason free is probed directly instead of computed.
+	used, total, free, _ := parseGPUTotals("17827, 24576, 12, 6292\n")
+	if used != uint64(17827)*(1<<20) || total != uint64(24576)*(1<<20) {
+		t.Fatalf("used/total = %d/%d, want the raw parsed values", used, total)
+	}
+	if free != uint64(6292)*(1<<20) {
+		t.Errorf("free = %d, want %d (the reported value, not total-used)", free, uint64(6292)*(1<<20))
+	}
+	if derived := total - used; free == derived {
+		t.Errorf("free (%d) unexpectedly equals the derived total-used (%d); fixture no longer exercises the distinction", free, derived)
+	}
+}
+
 func TestParseGPUTotals_Empty(t *testing.T) {
-	used, total, util := parseGPUTotals("")
-	if used != 0 || total != 0 {
-		t.Errorf("empty totals = %d/%d, want 0/0", used, total)
+	used, total, free, util := parseGPUTotals("")
+	if used != 0 || total != 0 || free != 0 {
+		t.Errorf("empty totals = %d/%d/%d, want 0/0/0", used, total, free)
 	}
 	if util != -1 {
 		t.Errorf("empty util = %v, want -1", util)
@@ -245,21 +270,24 @@ type fakeProbe struct {
 	pidVRAM  map[int]uint64
 	used     uint64
 	total    uint64
+	free     uint64
 	util     float64
 	hasGPU   bool
 	idToName map[string]string
 	cgroups  map[int]string
 	comms    map[int]string
 	rss      map[int]uint64
+	host     HostResources
 }
 
-func (f fakeProbe) GPU(context.Context) (map[int]uint64, uint64, uint64, float64, bool) {
-	return f.pidVRAM, f.used, f.total, f.util, f.hasGPU
+func (f fakeProbe) GPU(context.Context) (map[int]uint64, uint64, uint64, uint64, float64, bool) {
+	return f.pidVRAM, f.used, f.total, f.free, f.util, f.hasGPU
 }
 func (f fakeProbe) Containers(context.Context) map[string]string { return f.idToName }
 func (f fakeProbe) Cgroup(pid int) string                        { return f.cgroups[pid] }
 func (f fakeProbe) Comm(pid int) string                          { return f.comms[pid] }
 func (f fakeProbe) RSS(pid int) uint64                           { return f.rss[pid] }
+func (f fakeProbe) Host(context.Context) HostResources           { return f.host }
 
 func TestCollectWith_SnapshotShape(t *testing.T) {
 	full := "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -269,6 +297,7 @@ func TestCollectWith_SnapshotShape(t *testing.T) {
 		pidVRAM:  map[int]uint64{101: uint64(3 * gib), 202: uint64(1 * gib)},
 		used:     uint64(4 * gib),
 		total:    uint64(24 * gib),
+		free:     uint64(20 * gib),
 		util:     3, // below GPU idle threshold → consumers can be idle
 		hasGPU:   true,
 		idToName: map[string]string{full: "tei-gte", managedFull: "citadel-vllm"},
@@ -278,6 +307,13 @@ func TestCollectWith_SnapshotShape(t *testing.T) {
 		},
 		comms: map[int]string{},
 		rss:   map[int]uint64{101: uint64(1 * gib), 202: uint64(6 * gib)},
+		host: HostResources{
+			MemoryTotalBytes:     uint64(64 * gib),
+			MemoryAvailableBytes: uint64(2 * gib), // the #833 incident shape: VRAM free, RAM tight
+			DiskTotalBytes:       uint64(500 * gib),
+			DiskAvailableBytes:   uint64(50 * gib),
+			DiskPath:             "/home/citadel/citadel-cache",
+		},
 	}
 
 	// Idle tracker whose clock is already past the threshold, so a consumer seen
@@ -296,6 +332,18 @@ func TestCollectWith_SnapshotShape(t *testing.T) {
 	}
 	if snap.GPU.UsedBytes != uint64(4*gib) || snap.GPU.TotalBytes != uint64(24*gib) {
 		t.Errorf("GPU totals = %d/%d", snap.GPU.UsedBytes, snap.GPU.TotalBytes)
+	}
+	if snap.GPU.FreeBytes != uint64(20*gib) {
+		t.Errorf("GPU.FreeBytes = %d, want %d (from the injected probe, not total-used)", snap.GPU.FreeBytes, uint64(20*gib))
+	}
+	if snap.Host.MemoryAvailableBytes != uint64(2*gib) {
+		t.Errorf("Host.MemoryAvailableBytes = %d, want %d", snap.Host.MemoryAvailableBytes, uint64(2*gib))
+	}
+	if snap.Host.DiskAvailableBytes != uint64(50*gib) {
+		t.Errorf("Host.DiskAvailableBytes = %d, want %d", snap.Host.DiskAvailableBytes, uint64(50*gib))
+	}
+	if snap.Host.DiskPath != "/home/citadel/citadel-cache" {
+		t.Errorf("Host.DiskPath = %q, want the injected cache path", snap.Host.DiskPath)
 	}
 	if len(snap.Consumers) != 2 {
 		t.Fatalf("expected 2 consumers, got %d", len(snap.Consumers))
@@ -333,7 +381,7 @@ func TestCollectWith_SnapshotShape(t *testing.T) {
 	if err := json.Unmarshal(b, &round); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"has_gpu", "gpu", "gpu_util", "consumers", "collected_at"} {
+	for _, key := range []string{"has_gpu", "gpu", "gpu_util", "host", "consumers", "collected_at"} {
 		if _, ok := round[key]; !ok {
 			t.Errorf("snapshot JSON missing key %q; got keys %v", key, round)
 		}
@@ -345,10 +393,29 @@ func TestCollectWith_SnapshotShape(t *testing.T) {
 	if _, ok := gpu["total"]; !ok {
 		t.Error("gpu object missing 'total' key")
 	}
+	if _, ok := gpu["free"]; !ok {
+		t.Error("gpu object missing 'free' key")
+	}
+	host, _ := round["host"].(map[string]any)
+	for _, key := range []string{"memory_total_bytes", "memory_available_bytes", "disk_total_bytes", "disk_available_bytes"} {
+		if _, ok := host[key]; !ok {
+			t.Errorf("host object missing %q key; got keys %v", key, host)
+		}
+	}
 }
 
 func TestCollectWith_NoGPU(t *testing.T) {
-	snap := collectWith(context.Background(), fakeProbe{hasGPU: false}, newIdleTracker(), nil)
+	// Host resources are independent of GPU presence: a no-GPU node still gets
+	// a real Host reading (citadel #833) — the RAM/disk gate matters most on
+	// exactly this class of node.
+	host := HostResources{
+		MemoryTotalBytes:     uint64(32 * gib),
+		MemoryAvailableBytes: uint64(1 * gib),
+		DiskTotalBytes:       uint64(200 * gib),
+		DiskAvailableBytes:   uint64(10 * gib),
+		DiskPath:             "/home/citadel",
+	}
+	snap := collectWith(context.Background(), fakeProbe{hasGPU: false, host: host}, newIdleTracker(), nil)
 	if snap.HasGPU {
 		t.Error("expected HasGPU=false")
 	}
@@ -358,10 +425,64 @@ func TestCollectWith_NoGPU(t *testing.T) {
 	if snap.GPUUtil != -1 {
 		t.Errorf("GPUUtil = %v, want -1 when no GPU", snap.GPUUtil)
 	}
+	if snap.GPU.FreeBytes != 0 {
+		t.Errorf("GPU.FreeBytes = %d, want 0 when no GPU (never fabricated)", snap.GPU.FreeBytes)
+	}
+	if snap.Host != host {
+		t.Errorf("Host = %+v, want %+v (populated even with no GPU)", snap.Host, host)
+	}
 	// Still serializes cleanly.
 	if _, err := json.Marshal(snap); err != nil {
 		t.Fatalf("marshal no-GPU snapshot: %v", err)
 	}
+}
+
+func TestCollectWith_HostUnavailableIsZeroValueNotFabricated(t *testing.T) {
+	// A probe that can't read RAM/disk (e.g. gopsutil call failed) must yield
+	// zero-value Host, not a guessed number.
+	snap := collectWith(context.Background(), fakeProbe{hasGPU: false}, newIdleTracker(), nil)
+	if snap.Host != (HostResources{}) {
+		t.Errorf("Host = %+v, want zero-value when the probe reports nothing", snap.Host)
+	}
+}
+
+func TestResolveDiskPath(t *testing.T) {
+	t.Run("cache dir exists, is preferred", func(t *testing.T) {
+		home := func() (string, error) { return "/home/citadel", nil }
+		exists := func(p string) bool { return p == filepath.Join("/home/citadel", "citadel-cache") }
+		got := resolveDiskPath(home, exists)
+		want := filepath.Join("/home/citadel", "citadel-cache")
+		if got != want {
+			t.Errorf("resolveDiskPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("cache dir absent, falls back to home", func(t *testing.T) {
+		home := func() (string, error) { return "/home/citadel", nil }
+		exists := func(string) bool { return false }
+		got := resolveDiskPath(home, exists)
+		if got != "/home/citadel" {
+			t.Errorf("resolveDiskPath = %q, want home dir fallback", got)
+		}
+	})
+
+	t.Run("home dir unresolvable, falls back to cwd", func(t *testing.T) {
+		home := func() (string, error) { return "", errFakeHomeDir }
+		exists := func(string) bool { return true }
+		got := resolveDiskPath(home, exists)
+		if got != "." {
+			t.Errorf("resolveDiskPath = %q, want \".\"", got)
+		}
+	})
+
+	t.Run("empty home dir treated as unresolvable", func(t *testing.T) {
+		home := func() (string, error) { return "", nil }
+		exists := func(string) bool { return true }
+		got := resolveDiskPath(home, exists)
+		if got != "." {
+			t.Errorf("resolveDiskPath = %q, want \".\"", got)
+		}
+	})
 }
 
 func TestIdleTracker_SinglePollNotIdle(t *testing.T) {

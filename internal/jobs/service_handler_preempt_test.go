@@ -53,6 +53,37 @@ func TestFreeVRAMBytes(t *testing.T) {
 	}
 }
 
+func TestFreeVRAMBytes_PrefersReportedMemoryFreeOverDerived(t *testing.T) {
+	// citadel #833: MemoryFreeMB (nvidia-smi's own memory.free) must win over
+	// the derived total-used whenever it's populated, since nvidia-smi
+	// reserves memory that counts against neither figure and the derived
+	// value overstates headroom. total-used here would be 6749MB; the
+	// reported figure (a real RTX 3090 sample) is the smaller 6292MB.
+	free, ok := freeVRAMBytes([]status.GPUMetrics{
+		{MemoryTotalMB: 24576, MemoryUsedMB: 17827, MemoryFreeMB: 6292},
+	})
+	if !ok {
+		t.Fatal("expected found=true")
+	}
+	if want := uint64(6292) * 1024 * 1024; free != want {
+		t.Errorf("free = %d, want %d (the reported memory_free_mb, not the derived 6749MB)", free, want)
+	}
+}
+
+func TestFreeVRAMBytes_FallsBackToDerivedWhenMemoryFreeUnset(t *testing.T) {
+	// Platforms/older builds without MemoryFreeMB (e.g. macOS/Metal) still get
+	// a usable (if less precise) answer instead of "unknown".
+	free, ok := freeVRAMBytes([]status.GPUMetrics{
+		{MemoryTotalMB: 24576, MemoryUsedMB: 20480}, // MemoryFreeMB left zero
+	})
+	if !ok {
+		t.Fatal("expected found=true")
+	}
+	if want := uint64(4096) * 1024 * 1024; free != want {
+		t.Errorf("free = %d, want %d (derived fallback)", free, want)
+	}
+}
+
 func TestBuildPreemptCandidates(t *testing.T) {
 	st := &status.NodeStatus{
 		Services: []status.ServiceInfo{

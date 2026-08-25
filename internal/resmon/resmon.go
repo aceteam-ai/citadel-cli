@@ -22,10 +22,14 @@ package resmon
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // collectTimeout bounds the nvidia-smi / container-runtime execs so a hung
@@ -89,6 +93,39 @@ type GPUTotals struct {
 	UsedBytes uint64 `json:"used"`
 	// TotalBytes is total GPU memory capacity across all devices.
 	TotalBytes uint64 `json:"total"`
+	// FreeBytes is free GPU memory across all devices, read directly from
+	// nvidia-smi's memory.free (citadel #833) — NOT TotalBytes-UsedBytes.
+	// nvidia-smi reserves memory that counts against neither figure, so a
+	// derived value systematically overstates what's actually free, which is
+	// the wrong direction of error for a value meant to prevent an
+	// OOM/placement mistake. Zero when unavailable.
+	FreeBytes uint64 `json:"free"`
+}
+
+// HostResources holds host-level RAM and disk headroom (citadel #833). This is
+// the producer side of a real OOM incident (2026-08-25): a job landed on a
+// node with plenty of free VRAM but ~0 free RAM (a CPU-offloaded text encoder
+// needing ~19GB RAM) and was OOM-killed, because nothing surfaced system RAM
+// headroom for a placement decision to gate on. Routing that actually gates on
+// this is an aceteam-side follow-up (#831 preflight); this only reports it
+// honestly. Zero-value fields mean the signal was unavailable — never a
+// fabricated number.
+type HostResources struct {
+	// MemoryTotalBytes / MemoryAvailableBytes mirror gopsutil's
+	// VirtualMemoryStat.Total/.Available. Available (not Free) is what
+	// matters for scheduling: it already accounts for reclaimable page cache,
+	// the same number a human `free -h`'s "available" column reports.
+	MemoryTotalBytes     uint64 `json:"memory_total_bytes"`
+	MemoryAvailableBytes uint64 `json:"memory_available_bytes"`
+	// DiskTotalBytes / DiskAvailableBytes report headroom on the filesystem
+	// backing DiskPath: the citadel model/data cache dir (~/citadel-cache,
+	// where a model pull actually writes) when it exists, else the user's
+	// home directory, else the process's working directory.
+	DiskTotalBytes     uint64 `json:"disk_total_bytes"`
+	DiskAvailableBytes uint64 `json:"disk_available_bytes"`
+	// DiskPath is the path the disk figures were measured on, so a consumer
+	// knows what was actually sampled rather than assuming "/".
+	DiskPath string `json:"disk_path,omitempty"`
 }
 
 // Snapshot is the full resource picture returned by Collect: host GPU totals
@@ -103,6 +140,9 @@ type Snapshot struct {
 	GPU GPUTotals `json:"gpu"`
 	// GPUUtil is the max whole-GPU utilization across devices. -1 when no GPU.
 	GPUUtil float64 `json:"gpu_util"`
+	// Host holds whole-node RAM and disk headroom (citadel #833). Independent
+	// of GPU presence: populated even when HasGPU is false.
+	Host HostResources `json:"host"`
 	// Consumers is every GPU compute process, one entry per pid.
 	Consumers []Consumer `json:"consumers"`
 	// CollectedAt is the snapshot time (RFC3339, UTC).
@@ -155,10 +195,14 @@ func collectWith(ctx context.Context, p probe, tracker *idleTracker, managedName
 		CollectedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	pidVRAM, gpuUsed, gpuTotal, gpuUtil, hasGPU := p.GPU(ctx)
+	// Host RAM/disk headroom (citadel #833) is independent of GPU presence, so
+	// it is gathered unconditionally rather than nested under the GPU probe.
+	snap.Host = p.Host(ctx)
+
+	pidVRAM, gpuUsed, gpuTotal, gpuFree, gpuUtil, hasGPU := p.GPU(ctx)
 	snap.HasGPU = hasGPU
 	if hasGPU {
-		snap.GPU = GPUTotals{UsedBytes: gpuUsed, TotalBytes: gpuTotal}
+		snap.GPU = GPUTotals{UsedBytes: gpuUsed, TotalBytes: gpuTotal, FreeBytes: gpuFree}
 		snap.GPUUtil = gpuUtil
 	}
 
@@ -198,25 +242,79 @@ type realProbe struct{}
 // GPU runs one compute-apps query (pid → vram) and one gpu memory+util query,
 // returning per-pid VRAM plus whole-node totals. hasGPU is false when nvidia-smi
 // is absent or the compute-apps query fails.
-func (realProbe) GPU(ctx context.Context) (pidVRAM map[int]uint64, used, total uint64, util float64, hasGPU bool) {
+func (realProbe) GPU(ctx context.Context) (pidVRAM map[int]uint64, used, total, free uint64, util float64, hasGPU bool) {
 	if _, err := exec.LookPath("nvidia-smi"); err != nil {
-		return nil, 0, 0, -1, false
+		return nil, 0, 0, 0, -1, false
 	}
 	appsOut, err := exec.CommandContext(ctx, "nvidia-smi",
 		"--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits").Output()
 	if err != nil {
-		return nil, 0, 0, -1, false
+		return nil, 0, 0, 0, -1, false
 	}
 	pidVRAM = parseComputeApps(string(appsOut))
 
+	// memory.free is read directly (citadel #833), not derived as total-used —
+	// see parseGPUTotals for why that derivation would overstate free VRAM.
 	gpuOut, err := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits").Output()
+		"--query-gpu=memory.used,memory.total,utilization.gpu,memory.free", "--format=csv,noheader,nounits").Output()
 	if err != nil {
-		// compute-apps worked, so a GPU is present; totals/util unknown.
-		return pidVRAM, 0, 0, -1, true
+		// compute-apps worked, so a GPU is present; totals/util/free unknown.
+		return pidVRAM, 0, 0, 0, -1, true
 	}
-	used, total, util = parseGPUTotals(string(gpuOut))
-	return pidVRAM, used, total, util, true
+	used, total, free, util = parseGPUTotals(string(gpuOut))
+	return pidVRAM, used, total, free, util, true
+}
+
+// Host gathers whole-node RAM and disk headroom (citadel #833) via gopsutil,
+// which is already cross-platform (Linux/macOS/Windows) — the same library
+// internal/status uses for SystemMetrics. Zero-value fields when a signal is
+// unavailable; never an error, matching the rest of this package's "always
+// serializable" contract.
+func (realProbe) Host(ctx context.Context) HostResources {
+	var h HostResources
+	if v, err := mem.VirtualMemoryWithContext(ctx); err == nil {
+		h.MemoryTotalBytes = v.Total
+		h.MemoryAvailableBytes = v.Available
+	}
+	path := hostDiskPath()
+	if d, err := disk.UsageWithContext(ctx, path); err == nil {
+		h.DiskTotalBytes = d.Total
+		h.DiskAvailableBytes = d.Free
+		h.DiskPath = path
+	}
+	return h
+}
+
+// hostDiskPath resolves the path disk headroom is measured on: the citadel
+// model/data cache directory (~/citadel-cache — the same directory
+// internal/jobs/download_model.go writes pulled models to) when it exists,
+// else the user's home directory, else the current working directory. It
+// never returns a path that doesn't exist, since a disk-usage syscall
+// requires one.
+func hostDiskPath() string {
+	return resolveDiskPath(os.UserHomeDir, dirExists)
+}
+
+// dirExists reports whether path exists (any type), matching os.Stat's error
+// contract: only a nil error counts as "exists".
+func dirExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// resolveDiskPath is the pure core of hostDiskPath, taking the home-directory
+// and existence lookups as injected functions so the fallback chain is
+// unit-testable without touching the real filesystem or environment.
+func resolveDiskPath(homeDir func() (string, error), exists func(string) bool) string {
+	home, err := homeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	cache := filepath.Join(home, "citadel-cache")
+	if exists(cache) {
+		return cache
+	}
+	return home
 }
 
 // Containers runs one `<engine> ps --no-trunc` and returns container-id → name.
@@ -249,9 +347,11 @@ func (realProbe) RSS(pid int) uint64 { return readProcRSS(pid) }
 // probe abstracts the OS-level reads so collectWith can be unit-tested against
 // string fixtures with no real GPU/proc dependency.
 type probe interface {
-	GPU(ctx context.Context) (pidVRAM map[int]uint64, used, total uint64, util float64, hasGPU bool)
+	GPU(ctx context.Context) (pidVRAM map[int]uint64, used, total, free uint64, util float64, hasGPU bool)
 	Containers(ctx context.Context) map[string]string
 	Cgroup(pid int) string
 	Comm(pid int) string
 	RSS(pid int) uint64
+	// Host gathers whole-node RAM and disk headroom (citadel #833).
+	Host(ctx context.Context) HostResources
 }
