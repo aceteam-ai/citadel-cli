@@ -166,6 +166,14 @@ func (m *MockJobHandler) ExecutedJobs() []*Job {
 }
 
 // MockStreamWriter is a test implementation of StreamWriter.
+//
+// WriteEndErr / WriteErrorErr let a test simulate a failed publish (network
+// blip, WS hiccup, transient API error) -- the exact scenario citadel-cli#559
+// left unobservable when WriteEnd/WriteError's return value was discarded in
+// Runner.processJob. The write is still recorded (ended/errored flip to true,
+// as a real StreamWriter would have attempted the publish); only the RETURN
+// VALUE is the injected error, so tests can assert both "the publish was
+// attempted" and "the runner logged/handled the failure to publish."
 type MockStreamWriter struct {
 	claimed        bool
 	claimedVersion string
@@ -176,6 +184,11 @@ type MockStreamWriter struct {
 	erroredErr     error
 	erroredRecover bool
 	cancelled      bool
+
+	// WriteEndErr, when non-nil, is returned by WriteEnd instead of nil.
+	WriteEndErr error
+	// WriteErrorErr, when non-nil, is returned by WriteError instead of nil.
+	WriteErrorErr error
 }
 
 func (m *MockStreamWriter) WriteClaimed(agentVersion string) error {
@@ -196,14 +209,14 @@ func (m *MockStreamWriter) WriteChunk(content string, index int) error {
 
 func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 	m.ended = true
-	return nil
+	return m.WriteEndErr
 }
 
 func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 	m.errored = true
 	m.erroredErr = err
 	m.erroredRecover = recoverable
-	return nil
+	return m.WriteErrorErr
 }
 
 func (m *MockStreamWriter) WriteCancelled(reason string) error {
@@ -1197,6 +1210,135 @@ func TestRunnerServiceStartPublishesTerminalErrorOnFailure(t *testing.T) {
 	}
 	if len(source.NackedJobs()) != 1 {
 		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartLogsWarningWhenTerminalEndPublishFails pins the actual
+// behavioral change in citadel-cli#559: previously the success path discarded
+// stream.WriteEnd's return value entirely, so a failed publish to
+// stream:v1:{jobId} was invisible -- no log, no signal anywhere. This test
+// forces WriteEnd to fail and asserts (a) the runner now logs a warning about
+// it, and (b) the job still completes normally (Acked, not silently dropped)
+// despite the publish failure -- the node's own bookkeeping must not regress
+// just because the stream publish did.
+func TestRunnerServiceStartLogsWarningWhenTerminalEndPublishFails(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false) // succeeds
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.112.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{WriteEndErr: errors.New("simulated publish failure (network blip)")}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.ended {
+		t.Error("expected the runner to have attempted the terminal 'end' publish")
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+
+	foundWarning := false
+	for _, m := range messages {
+		if strings.Contains(m, "warning") && strings.Contains(m, "Failed to publish terminal end event") && strings.Contains(m, "job-1") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected a warning log about the failed terminal-end publish, got messages: %v", messages)
+	}
+
+	// Despite the publish failure, the job itself succeeded on the node and
+	// must still be Acked -- the publish failure must not turn into a job
+	// failure or a silently dropped job.
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1 (publish failure must not block Ack of a locally-successful job)", len(source.AckedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartLogsWarningWhenTerminalErrorPublishFails is the
+// failure-side counterpart: previously stream.WriteError's return value was
+// discarded on the generic handler-failure path too. Forces WriteError to
+// fail and asserts the runner logs a warning and still Nacks the job.
+func TestRunnerServiceStartLogsWarningWhenTerminalErrorPublishFails(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, true) // fails
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.112.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{WriteErrorErr: errors.New("simulated publish failure (network blip)")}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.errored {
+		t.Error("expected the runner to have attempted the terminal error publish")
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+
+	foundWarning := false
+	for _, m := range messages {
+		if strings.Contains(m, "warning") && strings.Contains(m, "Failed to publish terminal error event") && strings.Contains(m, "job-1") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected a warning log about the failed terminal-error publish, got messages: %v", messages)
+	}
+
+	// The job itself failed on the node and must still be Nacked, regardless
+	// of whether the stream publish also failed.
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1 (publish failure must not block Nack of a locally-failed job)", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 0 {
+		t.Errorf("Acked jobs = %d, want 0", len(source.AckedJobs()))
 	}
 }
 
