@@ -69,6 +69,41 @@ func TestResolveSelfHealingStillAbsentAfterRefresh(t *testing.T) {
 	}
 }
 
+// TestResolveSelfHealingStillAbsentAndRefreshFailed covers the branch none of
+// the other tests hit: the refresh call itself errors (e.g. a fully offline
+// node -- git clone fails outright, not just a partial multi-source error) AND
+// the module is still absent afterward. This is the message an operator
+// actually reads when self-heal can't help ("no network" rather than "found
+// nothing new"), so it must mention both the not-found and the refresh
+// failure, and still classify as ErrServiceNotFound.
+func TestResolveSelfHealingStillAbsentAndRefreshFailed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	calls := stubRefresh(t, func() error {
+		return errors.New("dial tcp: lookup github.com: no such host")
+	})
+
+	_, err := ResolveCatalogServiceSelfHealing("nonexistent")
+	if err == nil {
+		t.Fatal("expected an error when the module is absent and the refresh itself failed")
+	}
+	if !errors.Is(err, ErrServiceNotFound) {
+		t.Errorf("error = %v, want it to wrap ErrServiceNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "not found in catalog") {
+		t.Errorf("error = %q, want the not-found message", err.Error())
+	}
+	if !strings.Contains(err.Error(), "catalog refresh also failed") {
+		t.Errorf("error = %q, want it to also surface the refresh failure", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no such host") {
+		t.Errorf("error = %q, want the underlying refresh error text", err.Error())
+	}
+	if *calls != 1 {
+		t.Errorf("catalog refresh called %d times, want exactly 1", *calls)
+	}
+}
+
 // TestResolveSelfHealingRefreshPartialErrorButResolves is the landmine guard: a
 // node with a broken community source makes Update() return a non-nil (partial)
 // error even though the DEFAULT catalog refreshed fine. The wrapper must retry
