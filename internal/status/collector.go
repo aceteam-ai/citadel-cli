@@ -457,6 +457,9 @@ func (c *Collector) collectSystemMetrics() SystemMetrics {
 		metrics.MemoryUsedGB = float64(v.Used) / (1024 * 1024 * 1024)
 		metrics.MemoryTotalGB = float64(v.Total) / (1024 * 1024 * 1024)
 		metrics.MemoryPercent = v.UsedPercent
+		// Available (not Free) is what scheduling should gate on: it already
+		// accounts for reclaimable page cache. See SystemMetrics.MemoryAvailableGB.
+		metrics.MemoryAvailableGB = float64(v.Available) / (1024 * 1024 * 1024)
 	}
 
 	// CPU
@@ -469,6 +472,7 @@ func (c *Collector) collectSystemMetrics() SystemMetrics {
 		metrics.DiskUsedGB = float64(d.Used) / (1024 * 1024 * 1024)
 		metrics.DiskTotalGB = float64(d.Total) / (1024 * 1024 * 1024)
 		metrics.DiskPercent = d.UsedPercent
+		metrics.DiskAvailableGB = float64(d.Free) / (1024 * 1024 * 1024)
 	}
 
 	return metrics
@@ -509,6 +513,18 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 			memStr = strings.TrimSuffix(memStr, "MB")
 			if mb, err := strconv.Atoi(strings.TrimSpace(memStr)); err == nil {
 				metrics.MemoryUsedMB = mb
+			}
+		}
+
+		// Parse free memory (e.g., "6292 MB"), reported directly by nvidia-smi's
+		// memory.free (citadel #833) — not derived from total-used, which would
+		// overstate what's actually free. Empty on platforms/detectors that
+		// don't report it (e.g. macOS/Metal).
+		if gpu.MemoryFree != "" {
+			memStr := strings.TrimSuffix(gpu.MemoryFree, " MB")
+			memStr = strings.TrimSuffix(memStr, "MB")
+			if mb, err := strconv.Atoi(strings.TrimSpace(memStr)); err == nil {
+				metrics.MemoryFreeMB = mb
 			}
 		}
 

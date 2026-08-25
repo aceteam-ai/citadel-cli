@@ -206,6 +206,83 @@ func TestNvidiaSMIErrorMessageStderr(t *testing.T) {
 	})
 }
 
+func TestParseNvidiaSMICSVLine(t *testing.T) {
+	// name, memory.total, memory.used, temperature.gpu, utilization.gpu,
+	// driver_version, memory.free — csv,noheader,nounits.
+	line := "NVIDIA GeForce RTX 3090, 24576, 17827, 65, 12, 535.86.10, 6292"
+	gpu, ok := parseNvidiaSMICSVLine(line)
+	if !ok {
+		t.Fatal("expected a valid parse")
+	}
+	if gpu.Name != "NVIDIA GeForce RTX 3090" {
+		t.Errorf("Name = %q", gpu.Name)
+	}
+	if gpu.Memory != "24576 MB" {
+		t.Errorf("Memory = %q, want '24576 MB'", gpu.Memory)
+	}
+	if gpu.MemoryUsed != "17827 MB" {
+		t.Errorf("MemoryUsed = %q, want '17827 MB'", gpu.MemoryUsed)
+	}
+	// The whole point of probing memory.free directly (citadel #833): it is
+	// NOT total-used (24576-17827=6749) — nvidia-smi reserves memory that
+	// counts against neither, so a derived value would overstate what's free.
+	if gpu.MemoryFree != "6292 MB" {
+		t.Errorf("MemoryFree = %q, want '6292 MB' (not the derived 6749)", gpu.MemoryFree)
+	}
+	if gpu.Temperature != "65°C" {
+		t.Errorf("Temperature = %q", gpu.Temperature)
+	}
+	if gpu.Utilization != "12%" {
+		t.Errorf("Utilization = %q", gpu.Utilization)
+	}
+	if gpu.Driver != "535.86.10" {
+		t.Errorf("Driver = %q", gpu.Driver)
+	}
+}
+
+func TestParseNvidiaSMICSVLine_MissingMemoryFreeDegradesNotFails(t *testing.T) {
+	// A pre-#833 6-field row (no memory.free) must still parse: GPU detection
+	// (name/memory/temp/util/driver) backs capability detection and
+	// inference-queue routing, so it must not go all-or-nothing on one new
+	// optional field a driver/GPU combination might someday omit.
+	gpu, ok := parseNvidiaSMICSVLine("RTX 3090, 24576, 17827, 65, 12, 535.86.10")
+	if !ok {
+		t.Fatal("expected a 6-field row (no memory.free) to still parse")
+	}
+	if gpu.Name != "RTX 3090" || gpu.Memory != "24576 MB" {
+		t.Errorf("core fields not parsed: %+v", gpu)
+	}
+	if gpu.MemoryFree != "" {
+		t.Errorf("MemoryFree = %q, want empty (absent, not fabricated) when the field is missing", gpu.MemoryFree)
+	}
+}
+
+func TestParseNvidiaSMICSVLine_TooFewFields(t *testing.T) {
+	// Genuinely malformed rows (below the core field count) are rejected.
+	if _, ok := parseNvidiaSMICSVLine("RTX 3090, 24576, 17827"); ok {
+		t.Error("expected a row below the core field count to be rejected")
+	}
+	if _, ok := parseNvidiaSMICSVLine(""); ok {
+		t.Error("expected an empty row to be rejected")
+	}
+}
+
+func TestParseNvidiaSMICSVOutput_MultiGPUSkipsMalformed(t *testing.T) {
+	out := "GPU0, 24576, 17827, 65, 12, 535.86.10, 6292\n" +
+		"malformed row\n" +
+		"GPU1, 24576, 1024, 40, 3, 535.86.10, 23000\n"
+	gpus := parseNvidiaSMICSVOutput(out)
+	if len(gpus) != 2 {
+		t.Fatalf("expected 2 valid GPUs (malformed row skipped), got %d", len(gpus))
+	}
+	if gpus[0].Name != "GPU0" || gpus[1].Name != "GPU1" {
+		t.Errorf("unexpected names: %q, %q", gpus[0].Name, gpus[1].Name)
+	}
+	if gpus[1].MemoryFree != "23000 MB" {
+		t.Errorf("GPU1 MemoryFree = %q, want '23000 MB'", gpus[1].MemoryFree)
+	}
+}
+
 func TestFormatGPUInfo(t *testing.T) {
 	// Test with empty slice
 	result := FormatGPUInfo([]GPUInfo{})

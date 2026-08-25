@@ -597,10 +597,19 @@ func (h *ServiceHandler) preemptForVRAM(ctx JobContext, svc manifestService, req
 	return nil
 }
 
-// freeVRAMBytes sums the currently-free VRAM (total - used) across all GPUs that
-// report a total, in bytes. The bool is false when NO GPU reports a memory total
+// freeVRAMBytes sums the currently-free VRAM across all GPUs that report a
+// memory total, in bytes. The bool is false when NO GPU reports a memory total
 // (no GPU / nvidia-smi absent), so callers skip the VRAM fit check rather than
 // treat "unknown" as "zero free".
+//
+// Prefers MemoryFreeMB (citadel #833) — nvidia-smi's own memory.free — over
+// the derived MemoryTotalMB-MemoryUsedMB whenever it's populated. The two are
+// NOT equivalent: nvidia-smi reserves some memory (driver/ECC overhead) that
+// counts against neither total-as-free nor used, so the derived value
+// systematically overstates what's actually free (measured drift on a real
+// RTX 3090: 457MiB) — the wrong direction of error for a value gating whether
+// a deploy fits. Falls back to the derived value only when MemoryFreeMB is
+// unset (older/partial GPU reporting, e.g. macOS/Metal).
 func freeVRAMBytes(gpus []status.GPUMetrics) (uint64, bool) {
 	var free uint64
 	found := false
@@ -609,7 +618,10 @@ func freeVRAMBytes(gpus []status.GPUMetrics) (uint64, bool) {
 			continue
 		}
 		found = true
-		f := g.MemoryTotalMB - g.MemoryUsedMB
+		f := g.MemoryFreeMB
+		if f <= 0 {
+			f = g.MemoryTotalMB - g.MemoryUsedMB
+		}
 		if f < 0 {
 			f = 0
 		}

@@ -40,11 +40,19 @@ func parseComputeApps(out string) map[int]uint64 {
 }
 
 // parseGPUTotals parses nvidia-smi
-// `--query-gpu=memory.used,memory.total,utilization.gpu` CSV (units stripped:
-// memory in MiB, util in %). It sums used/total across devices (whole-node
-// totals) and returns the max utilization across devices, so a busy GPU is not
-// diluted by an idle second card. Returns util=-1 when no row parses.
-func parseGPUTotals(out string) (used, total uint64, util float64) {
+// `--query-gpu=memory.used,memory.total,utilization.gpu,memory.free` CSV
+// (units stripped: memory in MiB, util in %). It sums used/total/free across
+// devices (whole-node totals) and returns the max utilization across devices,
+// so a busy GPU is not diluted by an idle second card. Returns util=-1 when no
+// row parses.
+//
+// free is read directly from nvidia-smi's memory.free column, NOT derived as
+// total-used (citadel #833): nvidia-smi reserves some memory that counts
+// against neither total-as-free nor used, so a derived value systematically
+// overstates what's actually free — measured drift on a real RTX 3090 was
+// 457MiB, the wrong direction of error for a value meant to prevent an OOM
+// placement decision.
+func parseGPUTotals(out string) (used, total, free uint64, util float64) {
 	util = -1
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
@@ -53,7 +61,7 @@ func parseGPUTotals(out string) (used, total uint64, util float64) {
 			continue
 		}
 		parts := strings.Split(line, ",")
-		if len(parts) < 3 {
+		if len(parts) < 4 {
 			continue
 		}
 		if u, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64); err == nil && u >= 0 {
@@ -65,8 +73,11 @@ func parseGPUTotals(out string) (used, total uint64, util float64) {
 		if v, err := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64); err == nil && v > util {
 			util = v
 		}
+		if f, err := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64); err == nil && f >= 0 {
+			free += uint64(f * (1 << 20))
+		}
 	}
-	return used, total, util
+	return used, total, free, util
 }
 
 // parsePsOutput parses tab-separated `<engine> ps --format {{.ID}}\t{{.Names}}`

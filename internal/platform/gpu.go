@@ -18,6 +18,14 @@ type GPUInfo struct {
 	Temperature string
 	Utilization string
 	Driver      string
+	// MemoryFree is free VRAM as reported directly by nvidia-smi's
+	// memory.free query (citadel #833). It is NOT total-minus-used: nvidia-smi
+	// reserves some memory (driver/ECC overhead) that counts against neither
+	// total-as-free nor used, so total-used systematically overstates what is
+	// actually available — the wrong direction of error for a value that
+	// exists to prevent an OOM placement. Empty when unknown (e.g. the Metal
+	// detector on macOS, which does not query it).
+	MemoryFree string
 }
 
 // GPUDetector interface defines operations for GPU detection
@@ -25,6 +33,64 @@ type GPUDetector interface {
 	HasGPU() bool
 	GetGPUInfo() ([]GPUInfo, error)
 	GetGPUCount() int
+}
+
+// nvidiaSMIQueryGPUFields is the shared --query-gpu field list for the Linux
+// and Windows detectors. memory.free is appended LAST so existing field
+// indices (0-5) never shift; parseNvidiaSMICSVLine reads it at index 6.
+const nvidiaSMIQueryGPUFields = "--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version,memory.free"
+
+// nvidiaSMIQueryGPUFieldCount is the number of CSV fields nvidiaSMIQueryGPUFields
+// produces per row; a row with fewer fields is skipped as malformed.
+const nvidiaSMIQueryGPUFieldCount = 7
+
+// parseNvidiaSMICSVOutput parses the full CSV output of
+// `nvidia-smi <nvidiaSMIQueryGPUFields> --format=csv,noheader,nounits` into
+// GPUInfo values, skipping any malformed row. Shared by the Linux and Windows
+// detectors so the field layout lives in exactly one place.
+func parseNvidiaSMICSVOutput(output string) []GPUInfo {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	gpus := make([]GPUInfo, 0, len(lines))
+	for _, line := range lines {
+		if gpu, ok := parseNvidiaSMICSVLine(line); ok {
+			gpus = append(gpus, gpu)
+		}
+	}
+	return gpus
+}
+
+// nvidiaSMICoreFieldCount is the pre-#833 field count (name through
+// driver_version). A row with fewer than this is genuinely malformed and
+// skipped. memory.free (index 6) is read when present but its absence does
+// NOT reject the row: if some driver/GPU combination ever omits or rejects
+// memory.free on a subset of rows, GPU detection as a whole (name/memory/
+// temp/util/driver — which capability detection and inference-queue routing
+// depend on) must keep working. MemoryFree simply stays empty in that case,
+// same as the darwin/Metal detector, which never populates it at all.
+const nvidiaSMICoreFieldCount = 6
+
+// parseNvidiaSMICSVLine parses one CSV row produced by nvidiaSMIQueryGPUFields
+// (name, memory.total, memory.used, temperature.gpu, utilization.gpu,
+// driver_version, memory.free — all with "csv,noheader,nounits" formatting, so
+// units are appended back on here). Pure and unit-tested directly against CSV
+// fixtures, independent of a real nvidia-smi binary.
+func parseNvidiaSMICSVLine(line string) (GPUInfo, bool) {
+	parts := strings.Split(line, ",")
+	if len(parts) < nvidiaSMICoreFieldCount {
+		return GPUInfo{}, false
+	}
+	gpu := GPUInfo{
+		Name:        strings.TrimSpace(parts[0]),
+		Memory:      strings.TrimSpace(parts[1]) + " MB",
+		MemoryUsed:  strings.TrimSpace(parts[2]) + " MB",
+		Temperature: strings.TrimSpace(parts[3]) + "°C",
+		Utilization: strings.TrimSpace(parts[4]) + "%",
+		Driver:      strings.TrimSpace(parts[5]),
+	}
+	if len(parts) >= nvidiaSMIQueryGPUFieldCount {
+		gpu.MemoryFree = strings.TrimSpace(parts[6]) + " MB"
+	}
+	return gpu, true
 }
 
 // NvidiaSMIExitHint translates a known nvidia-smi exit code into a
@@ -153,7 +219,7 @@ func (l *LinuxGPUDetector) GetGPUCount() int {
 func (l *LinuxGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 	cmd := exec.Command(
 		"nvidia-smi",
-		"--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version",
+		nvidiaSMIQueryGPUFields,
 		"--format=csv,noheader,nounits",
 	)
 
@@ -162,27 +228,7 @@ func (l *LinuxGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 		return nil, fmt.Errorf("failed to query NVIDIA GPUs: %w", err)
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	gpus := make([]GPUInfo, 0, len(lines))
-
-	for _, line := range lines {
-		parts := strings.Split(line, ",")
-		if len(parts) < 6 {
-			continue
-		}
-
-		gpu := GPUInfo{
-			Name:        strings.TrimSpace(parts[0]),
-			Memory:      strings.TrimSpace(parts[1]) + " MB",
-			MemoryUsed:  strings.TrimSpace(parts[2]) + " MB",
-			Temperature: strings.TrimSpace(parts[3]) + "°C",
-			Utilization: strings.TrimSpace(parts[4]) + "%",
-			Driver:      strings.TrimSpace(parts[5]),
-		}
-		gpus = append(gpus, gpu)
-	}
-
-	return gpus, nil
+	return parseNvidiaSMICSVOutput(string(output)), nil
 }
 
 // DarwinGPUDetector implements GPUDetector for macOS systems
@@ -365,7 +411,7 @@ func (w *WindowsGPUDetector) GetGPUCount() int {
 
 func (w *WindowsGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 	cmd := w.nvidiaSmiCommand(
-		"--query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version",
+		nvidiaSMIQueryGPUFields,
 		"--format=csv,noheader,nounits",
 	)
 
@@ -374,27 +420,7 @@ func (w *WindowsGPUDetector) GetGPUInfo() ([]GPUInfo, error) {
 		return nil, fmt.Errorf("failed to query NVIDIA GPUs: %w", err)
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	gpus := make([]GPUInfo, 0, len(lines))
-
-	for _, line := range lines {
-		parts := strings.Split(line, ",")
-		if len(parts) < 6 {
-			continue
-		}
-
-		gpu := GPUInfo{
-			Name:        strings.TrimSpace(parts[0]),
-			Memory:      strings.TrimSpace(parts[1]) + " MB",
-			MemoryUsed:  strings.TrimSpace(parts[2]) + " MB",
-			Temperature: strings.TrimSpace(parts[3]) + "°C",
-			Utilization: strings.TrimSpace(parts[4]) + "%",
-			Driver:      strings.TrimSpace(parts[5]),
-		}
-		gpus = append(gpus, gpu)
-	}
-
-	return gpus, nil
+	return parseNvidiaSMICSVOutput(string(output)), nil
 }
 
 // nvidiaSmiCommand creates an exec.Cmd for nvidia-smi with the given arguments

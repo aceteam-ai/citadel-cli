@@ -716,13 +716,29 @@ func printResourcesInfo(w *tabwriter.Writer) {
 	}
 	snap := resmon.CollectWithManaged(ctx, managedNames)
 
+	// Host RAM/disk headroom (citadel #833) is independent of GPU presence —
+	// print it before the GPU-gated section below so a no-GPU/CPU-only node
+	// still shows it. Blank when the underlying probe couldn't read it.
+	if snap.Host.MemoryTotalBytes > 0 {
+		fmt.Fprintf(w, "  %s:\t%s available / %s total\n", labelColor.Sprint("RAM"),
+			formatBytes(snap.Host.MemoryAvailableBytes), formatBytes(snap.Host.MemoryTotalBytes))
+	}
+	if snap.Host.DiskTotalBytes > 0 {
+		pathSuffix := ""
+		if snap.Host.DiskPath != "" {
+			pathSuffix = " (" + snap.Host.DiskPath + ")"
+		}
+		fmt.Fprintf(w, "  %s:\t%s available / %s total%s\n", labelColor.Sprint("Disk"),
+			formatBytes(snap.Host.DiskAvailableBytes), formatBytes(snap.Host.DiskTotalBytes), pathSuffix)
+	}
+
 	if !snap.HasGPU {
 		fmt.Fprintln(w, "  GPU:\tNo GPU / nvidia-smi unavailable — no GPU consumers to report.")
 		return
 	}
 
-	fmt.Fprintf(w, "  %s:\t%s / %s used\n", labelColor.Sprint("GPU Memory"),
-		formatBytes(snap.GPU.UsedBytes), formatBytes(snap.GPU.TotalBytes))
+	fmt.Fprintf(w, "  %s:\t%s / %s used (%s free)\n", labelColor.Sprint("GPU Memory"),
+		formatBytes(snap.GPU.UsedBytes), formatBytes(snap.GPU.TotalBytes), formatBytes(snap.GPU.FreeBytes))
 
 	if len(snap.Consumers) == 0 {
 		fmt.Fprintf(w, "  %s\n", goodColor.Sprint("No GPU compute processes — GPU is free."))
