@@ -163,10 +163,27 @@ func (c *Collector) mergeNodeRoutedSignal(engine string, dst **IdleState) {
 		return // no node-routed request ever recorded; nothing to add
 	}
 	if *dst == nil {
-		// No other signal exists at all: this IS the signal. Adopting it
-		// wholesale cannot manufacture idleness relative to "unknown" -- unknown
-		// was already being reported as "never".
-		*dst = local
+		// No other signal exists at all. A LastRequestAt is always safe to adopt
+		// -- it is purely informational and "unknown" was already being reported
+		// as "never". Idle/IdleSeconds are NOT: this is a single, uncorroborated
+		// local stamp with no other signal to check it against, so adopting
+		// local.Idle=true here would let one stale dispatch (recorded once, e.g.
+		// at the start of a still-in-flight request, or the engine's only
+		// visible traffic being direct-to-port and therefore invisible to this
+		// recorder) manufacture Idle=true out of thin air -- exactly what
+		// autostop.go's "an absent/unknown signal is never treated as idle"
+		// guard (#416) exists to prevent. So: adopt the timestamp unconditionally,
+		// but only adopt Idle/IdleSeconds when the local record itself says NOT
+		// idle. When local.Idle is true, the zero-value IdleState{Idle: false,
+		// IdleSeconds: 0} is used instead -- "not (yet) proven idle", matching the
+		// pre-#691 behavior of reporting no idle signal, but now with the
+		// timestamp this issue exists to add.
+		fresh := &IdleState{LastRequestAt: local.LastRequestAt}
+		if !local.Idle {
+			fresh.Idle = local.Idle
+			fresh.IdleSeconds = local.IdleSeconds
+		}
+		*dst = fresh
 		return
 	}
 	existing := *dst

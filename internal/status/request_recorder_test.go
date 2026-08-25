@@ -186,6 +186,44 @@ func TestMergeNodeRoutedSignal_NoExistingSignal_AdoptsLocal(t *testing.T) {
 	if dst.LastRequestAt == nil || !dst.LastRequestAt.Equal(now) {
 		t.Fatalf("expected last_request_at %v, got %v", now, dst.LastRequestAt)
 	}
+	if dst.Idle {
+		t.Fatal("a just-recorded request must not read Idle=true")
+	}
+}
+
+// TestMergeNodeRoutedSignal_NoExistingSignal_StaleRecordNeverManufacturesIdle
+// is the blocking regression this test suite was missing: when no other idle
+// signal exists at all (dst==nil) AND the only node-routed record is stale
+// enough to read Idle=true on its own (a single uncorroborated dispatch --
+// e.g. one gateway-routed request long ago, with the engine's ACTUAL ongoing
+// traffic arriving direct-to-port and therefore invisible to this recorder),
+// the merge must NOT surface Idle=true. autostop.go's #416 safety guard
+// ("an absent/unknown signal is never treated as idle") depends on this: a
+// first-ever, no-corroboration local stamp is exactly as uncertain as
+// "unknown" was pre-#691, so it must never become an actionable Idle=true
+// that SERVICE_AUTO_STOP_WHEN_IDLE could act on. The timestamp itself is
+// still safe to surface (purely informational).
+func TestMergeNodeRoutedSignal_NoExistingSignal_StaleRecordNeverManufacturesIdle(t *testing.T) {
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	staleTime := now.Add(-10 * time.Minute) // well past the default 300s threshold
+	log := newTestRequestLog(&now)
+	log.record("bonsai")
+	log.last["bonsai"] = staleTime // backdate directly, mirroring the other stale-record tests
+
+	c := &Collector{reqLog: log}
+
+	var dst *IdleState
+	c.mergeNodeRoutedSignal("bonsai", &dst)
+
+	if dst == nil {
+		t.Fatal("expected the timestamp to still be adopted")
+	}
+	if dst.Idle {
+		t.Fatal("a stale, uncorroborated first-ever local record must never manufacture Idle=true")
+	}
+	if dst.LastRequestAt == nil || !dst.LastRequestAt.Equal(staleTime) {
+		t.Fatalf("expected last_request_at %v (informational), got %v", staleTime, dst.LastRequestAt)
+	}
 }
 
 // TestMergeNodeRoutedSignal_NeverRecorded_StaysNil is the "received none ->
