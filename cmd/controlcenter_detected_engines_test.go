@@ -43,13 +43,14 @@ func TestMergeDetectedEnginesAddsUnmanagedRow(t *testing.T) {
 }
 
 // TestMergeDetectedEnginesDedupesManagedByName pins the de-dupe rule: an
-// engine already represented by a manifest/managed row (matched
+// engine already represented by a RUNNING manifest/managed row (matched
 // case-insensitively by name) must NOT also appear as a detected/unmanaged
-// row, or a citadel-managed engine would be double-listed.
+// row, or a citadel-managed engine would be double-listed. The managed row
+// wins unchanged when its compose stack is actually running.
 func TestMergeDetectedEnginesDedupesManagedByName(t *testing.T) {
 	managed := []controlcenter.ServiceInfo{
 		{Name: "vllm", Status: "running", Managed: true},
-		{Name: "Ollama", Status: "stopped", Managed: true}, // manifest casing may differ
+		{Name: "Ollama", Status: "running", Managed: true}, // manifest casing may differ
 	}
 	discovered := []status.LocalEngine{
 		{Name: "vllm", Port: 8100, Models: []string{"qwen"}},
@@ -59,12 +60,58 @@ func TestMergeDetectedEnginesDedupesManagedByName(t *testing.T) {
 	got := mergeDetectedEngines(managed, discovered)
 
 	if len(got) != 2 {
-		t.Fatalf("expected no new rows (both discovered engines already managed), got %d: %+v", len(got), got)
+		t.Fatalf("expected no new rows (both discovered engines already managed+running), got %d: %+v", len(got), got)
 	}
 	for _, svc := range got {
 		if !svc.Managed {
 			t.Errorf("row %q should remain Managed=true, was demoted to unmanaged", svc.Name)
 		}
+		if len(svc.Models) != 0 {
+			t.Errorf("row %q should not gain Models from a discovered signal when the managed compose is already running, got %v", svc.Name, svc.Models)
+		}
+	}
+}
+
+// TestMergeDetectedEnginesUpgradesStoppedManagedRow is the citadel #804 case:
+// citadel.yaml declares an engine (e.g. "ollama") but its compose stack is not
+// running, while status.DiscoverLocalEngines' native-serving probe
+// (nativesvc.IsNativeServiceServing) finds a live instance answering on the
+// same engine's port — e.g. a separately-started native install. The live
+// signal must upgrade the existing managed row (running state + models)
+// rather than being silently dropped by the name-based de-dupe, and it must
+// NOT also produce a second, duplicate row.
+func TestMergeDetectedEnginesUpgradesStoppedManagedRow(t *testing.T) {
+	managed := []controlcenter.ServiceInfo{
+		{Name: "vllm", Status: "running", Managed: true},
+		{Name: "Ollama", Status: "stopped", Managed: true}, // manifest casing may differ
+	}
+	discovered := []status.LocalEngine{
+		{Name: "ollama", Port: 11434, Models: []string{"llama3"}},
+	}
+
+	got := mergeDetectedEngines(managed, discovered)
+
+	if len(got) != 2 {
+		t.Fatalf("expected the stopped row to be upgraded in place, not duplicated; got %d rows: %+v", len(got), got)
+	}
+
+	// The already-running vllm row must be untouched.
+	if got[0].Name != "vllm" || got[0].Status != "running" || !got[0].Managed {
+		t.Errorf("running managed row changed unexpectedly: %+v", got[0])
+	}
+
+	upgraded := got[1]
+	if upgraded.Name != "Ollama" {
+		t.Fatalf("expected the upgraded row to keep the manifest name %q, got %+v", "Ollama", upgraded)
+	}
+	if upgraded.Status != "running" {
+		t.Errorf("upgraded row status = %q, want running", upgraded.Status)
+	}
+	if upgraded.Managed {
+		t.Errorf("upgraded row must flip Managed=false so the console shows it as detected/native, not compose-managed")
+	}
+	if len(upgraded.Models) != 1 || upgraded.Models[0] != "llama3" {
+		t.Errorf("upgraded row models = %v, want [llama3]", upgraded.Models)
 	}
 }
 
