@@ -16,8 +16,11 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowsestream"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodevault"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
@@ -27,6 +30,11 @@ const (
 	CobrowseSessionActionStart  = "start"
 	CobrowseSessionActionStatus = "status"
 	CobrowseSessionActionStop   = "stop"
+	// CobrowseSessionActionReset discards the encrypted persistent profile named
+	// in the "profile" field. It requires NO pin: under the node's no-recovery
+	// master-PIN model a forgotten PIN can never unlock the profile again, so
+	// reset is the only escape hatch and must work without it.
+	CobrowseSessionActionReset = "reset"
 )
 
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
@@ -41,17 +49,15 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	if action == "" {
 		return nil, fmt.Errorf("job payload missing 'action' field")
 	}
+	// Log the action and profile name only; the "pin" field is a secret and is
+	// never logged here or passed anywhere but nodevault's Unlock.
 	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
 
 	mgr := platform.GetCobrowseSessionManager()
 
 	switch action {
 	case CobrowseSessionActionStart:
-		st, err := mgr.StartSession(job.Payload["url"])
-		if err != nil {
-			return nil, err
-		}
-		return sessionStatusResult(st)
+		return startSession(mgr, job)
 
 	case CobrowseSessionActionStatus:
 		// With a session_id, report that one session. Without, list every session --
@@ -77,9 +83,57 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		out, _ := json.Marshal(map[string]any{"stopped": id})
 		return out, nil
 
+	case CobrowseSessionActionReset:
+		name := job.Payload["profile"]
+		if name == "" {
+			return nil, fmt.Errorf("reset requires a 'profile' field")
+		}
+		if err := cobrowseprofile.Reset(network.GetNodeConfigDir(), name); err != nil {
+			return nil, err
+		}
+		out, _ := json.Marshal(map[string]any{"reset": name})
+		return out, nil
+
 	default:
 		return nil, fmt.Errorf("unknown browser-session action: %q", action)
 	}
+}
+
+// startSession launches one browser session. When the payload carries a "profile"
+// name it launches with the encrypted, PIN-unlocked persistent profile of that
+// name; the "pin" field is REQUIRED in that case and unlocks the shared node vault
+// at use time. Absent/wrong PIN fails closed (no session, no plaintext profile) —
+// a present "profile" NEVER silently falls back to a throwaway session, since that
+// would look like "logged out" and break the persistence contract. With no
+// "profile" field it launches a throwaway session exactly as before.
+func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte, error) {
+	name := job.Payload["profile"]
+	if name == "" {
+		st, err := mgr.StartSession(job.Payload["url"])
+		if err != nil {
+			return nil, err
+		}
+		return sessionStatusResult(st)
+	}
+
+	pin := job.Payload["pin"]
+	if pin == "" {
+		return nil, fmt.Errorf("a 'pin' is required to open persistent profile %q", name)
+	}
+	baseDir := network.GetNodeConfigDir()
+	handle, err := cobrowseprofile.OpenHandle(baseDir, name, pin, nodevault.Open(baseDir))
+	if err != nil {
+		// Wrong/absent PIN, lockout, unconfigured vault, busy profile, or bad name:
+		// all fail closed, no session and no plaintext profile materialized.
+		return nil, err
+	}
+	// Ownership of handle transfers to the manager, which guarantees Close on every
+	// path (including a failed start), so there is no Close to do here.
+	st, err := mgr.StartSessionWithProfile(job.Payload["url"], handle)
+	if err != nil {
+		return nil, err
+	}
+	return sessionStatusResult(st)
 }
 
 // sessionStreamInfo is the additive stream-endpoint hint carried on start/status
