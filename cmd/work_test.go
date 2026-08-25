@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -297,4 +300,77 @@ func TestSwapStatsFrom(t *testing.T) {
 	if empty.Recent != nil {
 		t.Errorf("Recent = %v, want nil for no records", empty.Recent)
 	}
+}
+
+// TestSwapShapeParity guards the hand-maintained mirror between
+// worker.SwapStats/SwapRecord (the source of truth, owned by the swap
+// manager) and status.SwapActivity/SwapRecord (the heartbeat-facing
+// projection swapStatsFrom builds). internal/status cannot import
+// internal/worker (worker already imports status), so nothing but a test
+// keeps the two shapes honest: without this, #835 adding a `Pulled` field to
+// worker.SwapRecord would compile fine and silently never reach the
+// heartbeat, because swapStatsFrom maps fields by hand with no compiler link
+// between the two structs. Mirrors the "pin it so a reader can check in one
+// step" convention CLAUDE.md cites for TestSwapAccountingDefaults.
+//
+// This checks JSON field-name parity, not type identity: SwapStats.Recent is
+// []worker.SwapRecord and SwapActivity.Recent is []status.SwapRecord, which
+// is expected (the whole point of the mirror) and not itself a violation.
+func TestSwapShapeParity(t *testing.T) {
+	assertFieldsMatch := func(t *testing.T, source, mirror reflect.Type) {
+		t.Helper()
+		sourceFields := jsonFieldNames(source)
+		mirrorFields := jsonFieldNames(mirror)
+		for name := range sourceFields {
+			if _, ok := mirrorFields[name]; !ok {
+				t.Errorf("%s has JSON field %q with no counterpart in %s -- "+
+					"a field was added to the swap manager's source-of-truth "+
+					"type without updating the heartbeat-facing mirror (and "+
+					"swapStatsFrom), so it will never reach the heartbeat",
+					source, name, mirror)
+			}
+		}
+		for name := range mirrorFields {
+			if _, ok := sourceFields[name]; !ok {
+				t.Errorf("%s has JSON field %q with no counterpart in %s -- "+
+					"the heartbeat-facing mirror has drifted ahead of its "+
+					"source of truth; verify swapStatsFrom still maps this "+
+					"field from something real", mirror, name, source)
+			}
+		}
+	}
+
+	t.Run("SwapRecord", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(worker.SwapRecord{}),
+			reflect.TypeOf(status.SwapRecord{}))
+	})
+	t.Run("SwapStats/SwapActivity", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(worker.SwapStats{}),
+			reflect.TypeOf(status.SwapActivity{}))
+	})
+}
+
+// jsonFieldNames returns the set of JSON field names a struct type encodes
+// to, keyed by the tag name (falling back to the Go field name when there is
+// no json tag, and skipping `json:"-"` fields).
+func jsonFieldNames(t reflect.Type) map[string]struct{} {
+	out := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag, ok := f.Tag.Lookup("json")
+		name := f.Name
+		if ok {
+			parts := strings.Split(tag, ",")
+			if parts[0] == "-" {
+				continue
+			}
+			if parts[0] != "" {
+				name = parts[0]
+			}
+		}
+		out[name] = struct{}{}
+	}
+	return out
 }

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -675,11 +676,18 @@ func runWork(cmd *cobra.Command, args []string) {
 	var wsRetryDone <-chan struct{}
 	// nodeSwapManager is the model-hotswap swap manager (citadel-cli#632),
 	// constructed later inside buildNodeJobHandlers (nil under the break-glass
-	// disable or with no config dir). Declared here so the heartbeat closure
-	// below (swapStatsFn) can close over it before it exists — assigned at the
-	// buildNodeJobHandlers call site, read here at each heartbeat collection.
-	// Same late-binding as pubSubTransportFn above.
-	var nodeSwapManager *worker.SwapManager
+	// disable or with no config dir). It is an atomic.Pointer, NOT a plain var
+	// like pubSubTransportFn above: the status/heartbeat publisher goroutines
+	// (Redis status publisher, API status publisher, the /status HTTP server)
+	// are all started EARLIER in this function and read this value via
+	// swapStatsFn's closure from their own goroutines, while the single Store
+	// below happens later on the main goroutine at the buildNodeJobHandlers call
+	// site — an unsynchronized plain var would be a genuine data race between
+	// that write and those concurrent reads (citadel-cli#717 review). A plain
+	// var IS safe for pubSubTransportFn because that one is assigned before any
+	// reader goroutine starts; this one is not, so it needs its own
+	// synchronization instead of relying on assignment order.
+	var nodeSwapManager atomic.Pointer[worker.SwapManager]
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -1255,14 +1263,17 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 
 	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
-	// this node thrashing?" without shell access. nodeSwapManager is assigned
-	// below at the buildNodeJobHandlers call site; nil here (before hotswap is
-	// enabled) or when hotswap is disabled means no Swap block on the heartbeat.
+	// this node thrashing?" without shell access. nodeSwapManager.Store is called
+	// below at the buildNodeJobHandlers call site, from status-publisher
+	// goroutines that are already running by then (Load() is what makes that
+	// safe); nil here (before the store) or under the hotswap break-glass
+	// disable means no Swap block on the heartbeat.
 	swapStatsFn := func() *status.SwapActivity {
-		if nodeSwapManager == nil {
+		mgr := nodeSwapManager.Load()
+		if mgr == nil {
 			return nil
 		}
-		return swapStatsFrom(nodeSwapManager.SwapStats())
+		return swapStatsFrom(mgr.SwapStats())
 	}
 
 	// Create status collector (used by status server and Redis status publisher)
@@ -2179,7 +2190,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 		PinnedServices:            manifestPinnedServices(workManifest),
 	}
-	handlers, nodeSwapManager := buildNodeJobHandlers(nodeJobOpts)
+	handlers, swapMgr := buildNodeJobHandlers(nodeJobOpts)
+	// Published via atomic.Store, not a plain assignment: status-publisher
+	// goroutines started earlier in this function may already be calling
+	// swapStatsFn's nodeSwapManager.Load() concurrently with this write
+	// (citadel-cli#717 review) -- see the nodeSwapManager declaration above.
+	nodeSwapManager.Store(swapMgr)
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)

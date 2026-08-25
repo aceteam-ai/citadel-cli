@@ -1072,20 +1072,28 @@ attached to the heartbeat as `NodeStatus.Swap` — `internal/status.SwapActivity
 — so "is this node thrashing?" is answerable without shell access. The swap
 manager is constructed inside `buildNodeJobHandlers` (`cmd/nodejobs.go`), not at
 the collector site, so `buildNodeJobHandlers` returns it as a second value and
-`cmd/work.go` threads it to the collector via a late-bound closure
-(`nodeSwapManager` declared early, assigned at the `buildNodeJobHandlers` call
-site, read by `swapStatsFn` on every heartbeat collection) — the same pattern
-`pubSubTransportFn` already uses for `WorkerLiveness`. `internal/status` cannot
-import `internal/worker` (worker already imports status), so `SwapActivity`/
-`SwapRecord` are a hand-maintained mirror of `worker.SwapStats`/`SwapRecord`;
-the projection is `swapStatsFrom` in `cmd/work.go`, tested by
-`TestSwapStatsFrom`. Additive/omitempty: nil when no swap manager is wired
-(hotswap disabled via `CITADEL_MODEL_HOTSWAP`, or no config dir), so a
-hotswap-off heartbeat is unchanged. The control-center-only collector
-(`cmd/controlcenter.go`) does NOT get this field yet — it also doesn't wire
-`WorkerLiveness`/`PinnedServices`/`ModelHotswap`, a pre-existing gap this
-doesn't widen; low-priority follow-up alongside the other TUI-collector gaps
-noted under Service Preemption above.
+`cmd/work.go` threads it to the collector via `nodeSwapManager`, an
+`atomic.Pointer[worker.SwapManager]` — deliberately NOT a plain var like
+`pubSubTransportFn`: the status-publisher goroutines (Redis, API, the `/status`
+HTTP server) are already running by the time `buildNodeJobHandlers` returns and
+`Store`s it, so `swapStatsFn`'s `Load()` on every heartbeat collection is racing
+that one write. `pubSubTransportFn` gets away with a plain var only because it
+is assigned before any reader goroutine starts — an earlier version of this
+wiring copied that pattern without checking the ordering and had a real data
+race as a result; if you touch this again, check which side of goroutine
+startup the assignment falls on before choosing plain-var vs atomic.
+`internal/status` cannot import `internal/worker` (worker already imports
+status), so `SwapActivity`/`SwapRecord` are a hand-maintained mirror of
+`worker.SwapStats`/`SwapRecord`; the projection is `swapStatsFrom` in
+`cmd/work.go`, tested by `TestSwapStatsFrom` plus a reflection-based shape-parity
+test (`TestSwapShapeParity`) that fails loudly if either side gains a field the
+other doesn't mirror — e.g. #835's `Pulled`. Additive/omitempty: nil when no
+swap manager is wired (hotswap disabled via `CITADEL_MODEL_HOTSWAP`, or no
+config dir), so a hotswap-off heartbeat is unchanged. The control-center-only
+collector (`cmd/controlcenter.go`) does NOT get this field yet — it also
+doesn't wire `WorkerLiveness`/`PinnedServices`/`ModelHotswap`, a pre-existing
+gap this doesn't widen; low-priority follow-up alongside the other
+TUI-collector gaps noted under Service Preemption above.
 
 **"Whether a swap pulled" is still NOT reported (#717 part 2, deferred).**
 `SwapRecord` has no `pulled` field. For docker-based engines (vLLM, bonsai,
