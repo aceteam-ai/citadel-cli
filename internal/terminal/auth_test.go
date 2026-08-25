@@ -343,6 +343,160 @@ func TestCachingTokenValidatorRateLimiting(t *testing.T) {
 	}
 }
 
+// TestCachingTokenValidatorRotationGrace covers the #792 behavior: during a
+// bounded rotation window the platform may carry an outgoing token's hash
+// forward via TokenHashEntry.PreviousHash/PreviousHashExpiresAt, and the node
+// should accept EITHER the current or the still-in-grace previous token.
+func TestCachingTokenValidatorRotationGrace(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	currentToken := "current-token-after-rotation"
+	previousToken := "previous-token-before-rotation"
+
+	mock.AddValidToken(currentToken, &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-456",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	mock.SetPreviousToken(currentToken, previousToken, time.Now().Add(time.Hour))
+
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
+	if err := validator.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer validator.Stop()
+
+	t.Run("current token accepted", func(t *testing.T) {
+		info, err := validator.ValidateToken(currentToken, "org-456")
+		if err != nil {
+			t.Fatalf("expected no error for current token, got %v", err)
+		}
+		if info.UserID != "user-123" {
+			t.Errorf("expected UserID user-123, got %s", info.UserID)
+		}
+	})
+
+	t.Run("previous-in-grace token accepted", func(t *testing.T) {
+		info, err := validator.ValidateToken(previousToken, "org-456")
+		if err != nil {
+			t.Fatalf("expected no error for previous-in-grace token, got %v", err)
+		}
+		if info.UserID != "user-123" {
+			t.Errorf("expected UserID user-123, got %s", info.UserID)
+		}
+	})
+
+	t.Run("wrong token still rejected", func(t *testing.T) {
+		_, err := validator.ValidateToken("some-other-token", "org-456")
+		if err != ErrInvalidToken {
+			t.Errorf("expected ErrInvalidToken, got %v", err)
+		}
+	})
+}
+
+// TestCachingTokenValidatorRotationGraceExpired verifies the previous hash is
+// rejected, like any invalid token, once its grace window has elapsed.
+func TestCachingTokenValidatorRotationGraceExpired(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	currentToken := "current-token-2"
+	previousToken := "previous-token-2-expired"
+
+	mock.AddValidToken(currentToken, &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-456",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	// Grace window already in the past.
+	mock.SetPreviousToken(currentToken, previousToken, time.Now().Add(-time.Minute))
+
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
+	// Speed up the on-demand refresh path so the cache-miss retry doesn't
+	// need to wait out the default rate limit.
+	validator.refreshRateLimit = 0
+	if err := validator.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer validator.Stop()
+
+	_, err := validator.ValidateToken(previousToken, "org-456")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken for expired-grace previous token, got %v", err)
+	}
+}
+
+// TestCachingTokenValidatorPreviousHashAbsentIsNoRegression pins the
+// forward-compatibility contract: when the platform response carries no
+// PreviousHash/PreviousHashExpiresAt (today's reality), behavior is
+// byte-for-byte identical to before this change - only the current hash is
+// ever accepted.
+func TestCachingTokenValidatorPreviousHashAbsentIsNoRegression(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	currentToken := "current-token-3-no-grace"
+	someOtherToken := "unrelated-token-not-in-cache"
+
+	mock.AddValidToken(currentToken, &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-456",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	// Deliberately do NOT call SetPreviousToken - mirrors today's API response.
+
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
+	if err := validator.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer validator.Stop()
+
+	if _, err := validator.ValidateToken(currentToken, "org-456"); err != nil {
+		t.Fatalf("expected current token to validate, got %v", err)
+	}
+
+	if _, err := validator.ValidateToken(someOtherToken, "org-456"); err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken for a token with no grace window, got %v", err)
+	}
+
+	if len(validator.previousCache) != 0 {
+		t.Errorf("expected previousCache to stay empty when platform sends no PreviousHash, got %d entries", len(validator.previousCache))
+	}
+}
+
+// TestCachingTokenValidatorPreviousHashNoExpiryNotAccepted pins the "set hash
+// but no expiry" edge case: PreviousHash present with a zero
+// PreviousHashExpiresAt must NOT create an unbounded grace window - only the
+// current hash is accepted, exactly like the absent-fields case.
+func TestCachingTokenValidatorPreviousHashNoExpiryNotAccepted(t *testing.T) {
+	mock := StartMockAuthServer()
+	defer mock.Close()
+
+	currentToken := "current-token-4"
+	previousToken := "previous-token-4-no-expiry"
+
+	mock.AddValidToken(currentToken, &TokenInfo{
+		UserID:    "user-123",
+		OrgID:     "org-456",
+		ExpiresAt: time.Now().Add(time.Hour),
+	})
+	// Zero-value expiry: the entry has a PreviousHash but no bound on it.
+	mock.SetPreviousToken(currentToken, previousToken, time.Time{})
+
+	validator := NewCachingTokenValidator(mock.URL(), "org-456", "", time.Hour)
+	validator.refreshRateLimit = 0
+	if err := validator.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer validator.Stop()
+
+	_, err := validator.ValidateToken(previousToken, "org-456")
+	if err != ErrInvalidToken {
+		t.Errorf("expected ErrInvalidToken for previous hash with no expiry, got %v", err)
+	}
+}
+
 func TestCachingTokenValidatorOrgIsolation(t *testing.T) {
 	mock := StartMockAuthServer()
 	defer mock.Close()
