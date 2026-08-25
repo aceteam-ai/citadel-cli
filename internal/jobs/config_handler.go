@@ -220,8 +220,17 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			perms.Shell = *config.ShellEnabled
 		}
 		if config.NodePasscode != nil {
+			// The master PIN (aceteam-ai/citadel-cli#796) is set LOCALLY only, so
+			// it never transits AceTeam infra. When one is enrolled, SetPasscode
+			// refuses a non-empty set — surface that as an explicit, non-alarming
+			// message rather than a generic warning: the platform push is
+			// deliberately disabled for this node, not failing.
 			if err := perms.SetPasscode(*config.NodePasscode); err != nil {
-				result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
+				if citadelconfig.VaultConfigured != nil && citadelconfig.VaultConfigured() {
+					result += "\nNode passcode push ignored: a local master PIN is enrolled (set it locally with 'citadel passcode rotate'; the platform passcode push is disabled)"
+				} else {
+					result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
+				}
 			}
 		}
 		if err := citadelconfig.SavePermissions(platform.ConfigDir(), perms); err != nil {
