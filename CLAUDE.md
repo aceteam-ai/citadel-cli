@@ -1022,6 +1022,36 @@ Environment variables:
 | `SERVICE_AUTO_STOP_WHEN_IDLE` | unset (OFF) | Opt-in to auto-stop idle services. Truthy: `1`/`true`/`yes`/`on`. |
 | `SERVICE_AUTO_STOP_IDLE_SECONDS` | idle threshold | Idle seconds before auto-stop acts. |
 
+### Dynamic Inference-Queue Resubscription (citadel #612)
+
+`capabilities.InferenceQueues(caps, serving)` is evaluated ONCE, at `citadel
+work` startup (API-mode queue resolution in `cmd/work.go`). A node with no
+static GPU-derived queue (`GPUInferenceQueues` empty -- no discrete GPU) and no
+serving engine yet at boot gets no inference queue at all there. Previously
+that was permanent for the process's lifetime: a platform `SERVICE_START` that
+starts an engine minutes later (the console model-deploy path onto a fresh
+node) would never be picked up without a worker restart.
+
+`worker.InferenceQueueReconciler` (`internal/worker/inference_queue_reconciler.go`)
+closes the gap by re-checking `nodeIsServingModels` (the same
+`status.DiscoverLocalEngines`-backed, #649-safe check startup already uses) on
+every heartbeat tick and calling the source's existing `AddQueue` on the
+false->true transition. It does not poll on its own -- it rides the
+heartbeat's existing ~30s `OnStatus` tick, which now **fans out to multiple
+registered callbacks** (`SetOnStatus` in `internal/heartbeat/redis.go` /
+`api.go` appends rather than replaces) so this reconciler and #416's auto-stop
+reconciler can both subscribe without clobbering each other.
+
+Deliberately subscribe-only, matching what `JobSource.AddQueue` actually
+offers (there is no `RemoveQueue`): once subscribed the reconciler stops
+probing for good, and it never un-subscribes when an engine later stops --
+direct-Redis mode already tolerates a node staying subscribed to
+`jobs:v1:gpu-general` while idle unconditionally, so this is not a new
+tradeoff. Wired in API mode only: direct-Redis mode's `ResolveQueues` already
+joins `jobs:v1:gpu-general` unconditionally regardless of `serving` (see
+`cmd/work.go`'s direct-Redis queue-resolution block), so it has no analogous
+startup-snapshot gap for this reconciler to fix.
+
 ### Service Preemption and Node Pinning (citadel #577)
 
 A `SERVICE_START` that declares a VRAM budget on a full GPU auto-evicts

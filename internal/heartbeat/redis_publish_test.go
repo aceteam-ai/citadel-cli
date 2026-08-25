@@ -202,6 +202,45 @@ func TestRedisPublishSkipsMarkerWhenDirUnset(t *testing.T) {
 	// silently, since there is no marker path here to inspect.
 }
 
+// TestRedisPublisherOnStatusFansOut pins the citadel #612 wiring: SetOnStatus
+// must ACCUMULATE callbacks rather than the last registration silently
+// replacing an earlier one. Before this fix, a single onStatus field meant the
+// inference-queue reconciler and the #416 auto-stop reconciler could not both
+// register -- whichever called SetOnStatus second would clobber the other. A
+// future "simplify this back to one field" refactor would compile fine and
+// pass every other test in this file, so the count assertion (not just "the
+// callback fires") is the part that actually guards the regression.
+func TestRedisPublisherOnStatusFansOut(t *testing.T) {
+	pub, _, _ := newTestRedisPublisher(t)
+
+	var mu sync.Mutex
+	var calls []string
+	pub.SetOnStatus(func(_ *status.NodeStatus) {
+		mu.Lock()
+		calls = append(calls, "auto-stop")
+		mu.Unlock()
+	})
+	pub.SetOnStatus(func(_ *status.NodeStatus) {
+		mu.Lock()
+		calls = append(calls, "inference-queue")
+		mu.Unlock()
+	})
+
+	if got := len(pub.onStatusFns); got != 2 {
+		t.Fatalf("SetOnStatus must accumulate registrations, got %d callbacks registered (want 2)", got)
+	}
+
+	if err := pub.publishStatus(context.Background()); err != nil {
+		t.Fatalf("publishStatus: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("want both OnStatus callbacks invoked per publish, got %v", calls)
+	}
+}
+
 // streamEntries reads node:status:stream out of miniredis as field maps.
 func streamEntries(t *testing.T, mr *miniredis.Miniredis) []map[string]string {
 	t.Helper()

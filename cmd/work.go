@@ -688,6 +688,16 @@ func runWork(cmd *cobra.Command, args []string) {
 	// reader goroutine starts; this one is not, so it needs its own
 	// synchronization instead of relying on assignment order.
 	var nodeSwapManager atomic.Pointer[worker.SwapManager]
+	// inferenceQueueReconciler watches for a serving-engine transition and
+	// self-subscribes the inference queue once one appears, so a node that
+	// boots with no engine does not need a restart to serve inference once one
+	// starts (citadel #612). Wired in API mode only -- see its construction
+	// below for why direct-Redis mode has no equivalent gap. Stays nil (no
+	// reconciler built) unless the boot-time queue set is actually missing the
+	// inference queue -- a GPU node, or any node already serving at boot, has
+	// nothing for it to do and must not get one (see missingQueues). Registered
+	// as an OnStatus observer once the heartbeat publisher exists.
+	var inferenceQueueReconciler *worker.InferenceQueueReconciler
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -787,6 +797,27 @@ func runWork(cmd *cobra.Command, args []string) {
 			// subscribed during a live node-routing test (issue #3924).
 			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
+
+		// A node with no discrete GPU (GPUInferenceQueues empty) and not yet
+		// serving at boot gets NO inference queue above -- InferenceQueues
+		// returns nil when !serving. If an engine starts later (a platform
+		// SERVICE_START from a console model deploy on a fresh node), the node
+		// would never join jobs:v1:gpu-general without a restart (#612).
+		// Precompute the queue set for "if serving" (a GPU node's set is
+		// identical whether serving is true or false, since it comes from
+		// GPUInferenceQueues, so AddQueue-ing it again below is a harmless
+		// already-present no-op) and wire a reconciler that watches for the
+		// false->true transition on the heartbeat's existing ~30s OnStatus tick
+		// (registered further down, once the publisher exists) instead of
+		// polling separately.
+		inferenceQueueReconciler = worker.NewInferenceQueueReconciler(
+			capabilities.InferenceQueues(nodeCaps, true),
+			nodeIsServingModels,
+			func(_ context.Context, queue string) error {
+				apiSource.AddQueue(queue) // APISource creates its consumer group lazily; no error to surface
+				return nil
+			},
+		)
 
 		// Connect early so client is available for heartbeat.
 		//
@@ -1696,6 +1727,28 @@ func runWork(cmd *cobra.Command, args []string) {
 					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
+					}
+					if inferenceQueueReconciler != nil {
+						inferenceQueueReconciler.Log = Log
+						// Ignore the passed-in NodeStatus and re-check serving via
+						// nodeIsServingModels (DiscoverLocalEngines) rather than reading
+						// NodeStatus.Services: that snapshot still lists a
+						// non-answering engine (Health="starting", just not
+						// "healthy"), which is exactly the false-positive #649 fixed
+						// for the startup check this reconciler mirrors. Reusing the
+						// canonical check here keeps the two paths agreeing.
+						//
+						// Dispatched via `go` deliberately: nodeIsServingModels's 5s
+						// context deadline does NOT bound the underlying `docker ps`
+						// (listRunningContainerNames uses exec.Command, not
+						// CommandContext), so a wedged container runtime can block this
+						// call indefinitely. Running it inline in the OnStatus fan-out
+						// would stall every subsequent heartbeat publish -- exactly the
+						// liveness regression #548's watchdog work exists to prevent.
+						// The reconciler's own mutex + post-probe re-check of
+						// `subscribed` (TestInferenceQueueReconciler_ConcurrentReconcile)
+						// make concurrent/overlapping ticks safe.
+						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go inferenceQueueReconciler.Reconcile(ctx) })
 					}
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)

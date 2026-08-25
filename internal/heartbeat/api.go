@@ -63,11 +63,13 @@ type APIPublisher struct {
 	// pub/sub publish while keeping a sustained outage visible (#722).
 	pubSubHealth pubSubHealth
 
-	// onStatus, when set, is invoked with each freshly collected status after a
-	// successful publish. It lets an auto-stop reconciler act on the exact state
-	// that was just published without triggering a second (expensive) collection
-	// pass on an already-loaded node. Optional; nil by default. See citadel #416.
-	onStatus func(*status.NodeStatus)
+	// onStatusFns, when non-empty, are each invoked with every freshly collected
+	// status after a successful publish. It lets independent reconcilers (the
+	// auto-stop reconciler, citadel #416; the dynamic inference-queue
+	// reconciler, citadel #612) act on the exact state that was just published
+	// without each triggering a second (expensive) collection pass on an
+	// already-loaded node. See SetOnStatus.
+	onStatusFns []func(*status.NodeStatus)
 
 	// statsFn, when set, returns the latest cached Fabric Pulse stats block
 	// (citadel-cli#587). It is a cache read — it must never block or error —
@@ -90,11 +92,16 @@ func (p *APIPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
-// drive the config-gated auto-stop-when-idle reconciler (citadel #416) off the
-// heartbeat's existing collection, so enabling it adds no extra docker/nvidia-smi
-// execs.
+// drive the config-gated auto-stop-when-idle reconciler (citadel #416) and the
+// dynamic inference-queue reconciler (citadel #612) off the heartbeat's
+// existing collection, so enabling either adds no extra docker/nvidia-smi
+// execs. May be called more than once -- callbacks accumulate (fan out)
+// rather than replacing each other.
 func (p *APIPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
-	p.onStatus = fn
+	if fn == nil {
+		return
+	}
+	p.onStatusFns = append(p.onStatusFns, fn)
 }
 
 // APIPublisherConfig holds configuration for the API status publisher.
@@ -228,11 +235,12 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to collect status: %w", err)
 	}
 
-	// Feed the collected status to any registered observer (the auto-stop
-	// reconciler) before publishing. Reusing this collection avoids a second
-	// docker stats / nvidia-smi sweep on a contended node.
-	if p.onStatus != nil {
-		p.onStatus(nodeStatus)
+	// Feed the collected status to every registered observer (auto-stop,
+	// inference-queue reconciliation, ...) before publishing. Reusing this
+	// collection avoids each observer triggering its own docker stats /
+	// nvidia-smi sweep.
+	for _, fn := range p.onStatusFns {
+		fn(nodeStatus)
 	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)

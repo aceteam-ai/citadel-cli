@@ -109,10 +109,13 @@ type RedisPublisher struct {
 	// pub/sub publish while keeping a sustained outage visible (#722).
 	pubSubHealth pubSubHealth
 
-	// onStatus, when set, is invoked with each freshly collected status after a
-	// successful publish, driving the config-gated auto-stop reconciler off the
-	// heartbeat's existing collection (citadel #416). Optional; nil by default.
-	onStatus func(*status.NodeStatus)
+	// onStatusFns, when non-empty, are each invoked with every freshly collected
+	// status after a successful publish. Multiple independent reconcilers (the
+	// config-gated auto-stop reconciler, citadel #416; the dynamic
+	// inference-queue reconciler, citadel #612) share this ONE heartbeat
+	// collection instead of each registering their own poller, so enabling one
+	// adds no extra docker/nvidia-smi sweep. See SetOnStatus.
+	onStatusFns []func(*status.NodeStatus)
 
 	// statsFn, when set, returns the latest cached Fabric Pulse stats block
 	// (citadel-cli#587). It is a cache read — it must never block or error —
@@ -140,9 +143,15 @@ func (p *RedisPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 }
 
 // SetOnStatus registers a callback invoked with each collected status. Used to
-// drive the config-gated auto-stop-when-idle reconciler (citadel #416).
+// drive the config-gated auto-stop-when-idle reconciler (citadel #416) and the
+// dynamic inference-queue reconciler (citadel #612). May be called more than
+// once -- callbacks accumulate (fan out) rather than replacing each other, so
+// independent reconcilers can each register without clobbering the others.
 func (p *RedisPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
-	p.onStatus = fn
+	if fn == nil {
+		return
+	}
+	p.onStatusFns = append(p.onStatusFns, fn)
 }
 
 // RedisPublisherConfig holds configuration for the Redis status publisher.
@@ -300,11 +309,12 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to collect status: %w", err)
 	}
 
-	// Feed the collected status to any registered observer (the auto-stop
-	// reconciler) before publishing, reusing this collection rather than
-	// triggering a second stats/nvidia-smi sweep.
-	if p.onStatus != nil {
-		p.onStatus(nodeStatus)
+	// Feed the collected status to every registered observer (auto-stop,
+	// inference-queue reconciliation, ...) before publishing, reusing this
+	// collection rather than each observer triggering its own stats/nvidia-smi
+	// sweep.
+	for _, fn := range p.onStatusFns {
+		fn(nodeStatus)
 	}
 
 	// Get device code (thread-safe)
