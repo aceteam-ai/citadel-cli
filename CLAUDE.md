@@ -1135,10 +1135,11 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 `Runner.processJob`'s GPU-slot acquire (`internal/worker/runner.go`, guarding the
 `gpuTracker.Acquire()` Nack branch) only runs for job types `needsGPUSlot`
 (`internal/worker/gpu_tracker.go`) says actually dispatch to a node-local GPU
-inference engine — today `gpuBoundJobTypes` is the four inference types
-(`LLAMACPP_INFERENCE`, `VLLM_INFERENCE`, `OLLAMA_INFERENCE`, `llm_inference`).
-Everything else — `SERVICE_START`, shell, file, config, etc. — skips the gate
-entirely and can never be Nacked by GPU contention.
+inference engine. `needsGPUSlot`/`gpuBoundJobTypes` is the authority for that
+set — `TestGPUBoundJobTypes` (`gpu_tracker_test.go`) pins its exact membership,
+so read the test rather than trusting a doc copy of it. Everything NOT in that
+set — `SERVICE_START`, shell, file, config, etc. — skips the gate entirely and
+can never be Nacked by GPU contention.
 
 This matters because `--max-concurrency` (`cmd/work.go`) can be set above the
 node's GPU count, so more jobs can be in flight than GPU slots. Before #825, the
