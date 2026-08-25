@@ -803,21 +803,28 @@ func runWork(cmd *cobra.Command, args []string) {
 		// returns nil when !serving. If an engine starts later (a platform
 		// SERVICE_START from a console model deploy on a fresh node), the node
 		// would never join jobs:v1:gpu-general without a restart (#612).
-		// Precompute the queue set for "if serving" (a GPU node's set is
-		// identical whether serving is true or false, since it comes from
-		// GPUInferenceQueues, so AddQueue-ing it again below is a harmless
-		// already-present no-op) and wire a reconciler that watches for the
-		// false->true transition on the heartbeat's existing ~30s OnStatus tick
-		// (registered further down, once the publisher exists) instead of
-		// polling separately.
-		inferenceQueueReconciler = worker.NewInferenceQueueReconciler(
-			capabilities.InferenceQueues(nodeCaps, true),
-			nodeIsServingModels,
-			func(_ context.Context, queue string) error {
-				apiSource.AddQueue(queue) // APISource creates its consumer group lazily; no error to surface
-				return nil
-			},
-		)
+		//
+		// Only wire the reconciler when that gap actually exists. A GPU node's
+		// InferenceQueues(caps, true) is IDENTICAL to InferenceQueues(caps,
+		// false) -- GPUInferenceQueues is unconditional on `serving` -- so the
+		// boot-time apiQueueNames above already contains it regardless of
+		// whether the node happened to be serving yet. Building a reconciler
+		// for that node would find nothing left to add and just re-probe
+		// nodeIsServingModels (a docker ps) forever on every heartbeat tick --
+		// exactly the extra sweep OnStatus reuse was meant to avoid. missingQueues
+		// diffs the "if serving" set against what boot already subscribed, so a
+		// GPU node or a node already serving at boot gets no reconciler at all;
+		// only a fresh CPU-only node with no engine yet does.
+		if missing := missingQueues(capabilities.InferenceQueues(nodeCaps, true), apiQueueNames); len(missing) > 0 {
+			inferenceQueueReconciler = worker.NewInferenceQueueReconciler(
+				missing,
+				nodeIsServingModels,
+				func(_ context.Context, queue string) error {
+					apiSource.AddQueue(queue) // APISource creates its consumer group lazily; no error to surface
+					return nil
+				},
+			)
+		}
 
 		// Connect early so client is available for heartbeat.
 		//
@@ -2596,6 +2603,30 @@ func appendUniqueQueues(base, extra []string) []string {
 		}
 	}
 	return base
+}
+
+// missingQueues returns the entries of desired not already present in
+// existing, preserving desired's order and de-duplicating. Used to decide
+// whether the inference-queue reconciler (#612) actually has a gap to fill: a
+// GPU node's InferenceQueues(caps, true) is already fully covered by the boot
+// path (capabilities.GPUInferenceQueues is unconditional on `serving`), so
+// this returns empty for it -- the reconciler must not be built in that case,
+// or it would probe nodeIsServingModels forever with nothing left to add.
+func missingQueues(desired, existing []string) []string {
+	have := make(map[string]bool, len(existing))
+	for _, q := range existing {
+		have[q] = true
+	}
+	seen := make(map[string]bool, len(desired))
+	var missing []string
+	for _, q := range desired {
+		if q == "" || have[q] || seen[q] {
+			continue
+		}
+		seen[q] = true
+		missing = append(missing, q)
+	}
+	return missing
 }
 
 // meetingQueueName returns the org-scoped meeting-notetaker tag queue name.

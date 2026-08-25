@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -63,12 +64,23 @@ type APIPublisher struct {
 	// pub/sub publish while keeping a sustained outage visible (#722).
 	pubSubHealth pubSubHealth
 
-	// onStatusFns, when non-empty, are each invoked with every freshly collected
-	// status after a successful publish. It lets independent reconcilers (the
-	// auto-stop reconciler, citadel #416; the dynamic inference-queue
-	// reconciler, citadel #612) act on the exact state that was just published
-	// without each triggering a second (expensive) collection pass on an
-	// already-loaded node. See SetOnStatus.
+	// onStatusMu guards onStatusFns. All three production SetOnStatus call
+	// sites (cmd/work.go) register before Start(ctx)'s goroutine is spawned, so
+	// this is a belt-and-suspenders guard rather than a fix for an observed
+	// race -- but unlike RedisPublisher, APIPublisher had no mutex at all
+	// before #612, so a future caller that registers after Start (or a second
+	// concurrent Start) would have raced silently.
+	onStatusMu sync.RWMutex
+	// onStatusFns, when non-empty, are each invoked with every freshly
+	// collected status after a successful COLLECTION, before that status is
+	// PUBLISHED (see publishStatus: collect -> run onStatusFns -> publish). It
+	// lets independent reconcilers (the auto-stop reconciler, citadel #416; the
+	// dynamic inference-queue reconciler, citadel #612) act on the exact state
+	// that was just collected without each triggering a second (expensive)
+	// collection pass on an already-loaded node. Because callbacks run BEFORE
+	// publish, a slow callback delays the heartbeat itself -- which is why
+	// #612's reconciler dispatches its own probe via `go` rather than blocking
+	// here. Guarded by onStatusMu. See SetOnStatus.
 	onStatusFns []func(*status.NodeStatus)
 
 	// statsFn, when set, returns the latest cached Fabric Pulse stats block
@@ -96,12 +108,18 @@ func (p *APIPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 // dynamic inference-queue reconciler (citadel #612) off the heartbeat's
 // existing collection, so enabling either adds no extra docker/nvidia-smi
 // execs. May be called more than once -- callbacks accumulate (fan out)
-// rather than replacing each other.
+// rather than replacing each other. Every production call site registers
+// before Start(ctx) is called; registering concurrently with a running
+// publish loop is safe (onStatusMu-guarded) but not a supported pattern to
+// rely on for ordering (a callback added mid-cycle may or may not see that
+// cycle's publish).
 func (p *APIPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
 	if fn == nil {
 		return
 	}
+	p.onStatusMu.Lock()
 	p.onStatusFns = append(p.onStatusFns, fn)
+	p.onStatusMu.Unlock()
 }
 
 // APIPublisherConfig holds configuration for the API status publisher.
@@ -238,10 +256,16 @@ func (p *APIPublisher) publishStatus(ctx context.Context) error {
 	// Feed the collected status to every registered observer (auto-stop,
 	// inference-queue reconciliation, ...) before publishing. Reusing this
 	// collection avoids each observer triggering its own docker stats /
-	// nvidia-smi sweep.
+	// nvidia-smi sweep. Held under RLock only for the duration of the
+	// iteration -- every registered callback returns fast (the reconcilers
+	// that do real work, e.g. #612's docker-ps probe, dispatch it via `go`
+	// rather than running it here), so this never blocks a concurrent
+	// SetOnStatus for long.
+	p.onStatusMu.RLock()
 	for _, fn := range p.onStatusFns {
 		fn(nodeStatus)
 	}
+	p.onStatusMu.RUnlock()
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 

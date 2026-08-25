@@ -78,7 +78,10 @@ type RedisPublisher struct {
 	interval        time.Duration
 	collector       *status.Collector
 
-	// deviceCode is protected by mu since it can be updated after auth
+	// deviceCode and onStatusFns are protected by mu since both can be read
+	// or written after the publish loop has started (deviceCode after auth;
+	// onStatusFns in principle, though every production SetOnStatus call
+	// registers before Start(ctx) -- see SetOnStatus).
 	mu         sync.RWMutex
 	deviceCode string
 
@@ -109,12 +112,16 @@ type RedisPublisher struct {
 	// pub/sub publish while keeping a sustained outage visible (#722).
 	pubSubHealth pubSubHealth
 
-	// onStatusFns, when non-empty, are each invoked with every freshly collected
-	// status after a successful publish. Multiple independent reconcilers (the
-	// config-gated auto-stop reconciler, citadel #416; the dynamic
-	// inference-queue reconciler, citadel #612) share this ONE heartbeat
-	// collection instead of each registering their own poller, so enabling one
-	// adds no extra docker/nvidia-smi sweep. See SetOnStatus.
+	// onStatusFns, when non-empty, are each invoked with every freshly
+	// collected status after a successful COLLECTION, before that status is
+	// PUBLISHED (see publishStatus: collect -> run onStatusFns -> publish).
+	// Multiple independent reconcilers (the config-gated auto-stop reconciler,
+	// citadel #416; the dynamic inference-queue reconciler, citadel #612) share
+	// this ONE heartbeat collection instead of each registering their own
+	// poller, so enabling one adds no extra docker/nvidia-smi sweep. Because
+	// callbacks run BEFORE publish, a slow callback delays the heartbeat itself
+	// -- which is why #612's reconciler dispatches its own probe via `go`
+	// rather than blocking here. See SetOnStatus.
 	onStatusFns []func(*status.NodeStatus)
 
 	// statsFn, when set, returns the latest cached Fabric Pulse stats block
@@ -147,11 +154,16 @@ func (p *RedisPublisher) SetStatsProvider(fn func() *pulse.StatsBlock) {
 // dynamic inference-queue reconciler (citadel #612). May be called more than
 // once -- callbacks accumulate (fan out) rather than replacing each other, so
 // independent reconcilers can each register without clobbering the others.
+// Every production call site registers before Start(ctx) is called;
+// registering concurrently with a running publish loop is safe (mu-guarded)
+// but not a supported pattern to rely on for ordering.
 func (p *RedisPublisher) SetOnStatus(fn func(*status.NodeStatus)) {
 	if fn == nil {
 		return
 	}
+	p.mu.Lock()
 	p.onStatusFns = append(p.onStatusFns, fn)
+	p.mu.Unlock()
 }
 
 // RedisPublisherConfig holds configuration for the Redis status publisher.
@@ -312,10 +324,15 @@ func (p *RedisPublisher) publishStatus(ctx context.Context) error {
 	// Feed the collected status to every registered observer (auto-stop,
 	// inference-queue reconciliation, ...) before publishing, reusing this
 	// collection rather than each observer triggering its own stats/nvidia-smi
-	// sweep.
+	// sweep. Held under RLock only for the duration of the iteration -- every
+	// registered callback returns fast (the reconcilers that do real work,
+	// e.g. #612's docker-ps probe, dispatch it via `go` rather than running it
+	// here), so this never blocks a concurrent SetOnStatus for long.
+	p.mu.RLock()
 	for _, fn := range p.onStatusFns {
 		fn(nodeStatus)
 	}
+	p.mu.RUnlock()
 
 	// Get device code (thread-safe)
 	deviceCode := p.getDeviceCode()

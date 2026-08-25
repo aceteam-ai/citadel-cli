@@ -1052,6 +1052,16 @@ joins `jobs:v1:gpu-general` unconditionally regardless of `serving` (see
 `cmd/work.go`'s direct-Redis queue-resolution block), so it has no analogous
 startup-snapshot gap for this reconciler to fix.
 
+**Construction is itself gated on the gap existing** (`missingQueues` in
+`cmd/work.go`), not just what it does once built: `GPUInferenceQueues` is
+unconditional on `serving`, so a GPU node's boot-time queue set already equals
+`InferenceQueues(caps, true)` -- diff them, and a reconciler for that node
+would have nothing to add, ever. Without this gate it would still self-limit
+to one in-flight probe (see below) but would burn a `docker ps` every ~30s
+forever with no possible payoff, which is exactly the sweep OnStatus reuse
+exists to avoid. Only a node whose boot set is missing something (no discrete
+GPU, not yet serving) gets a reconciler at all.
+
 ### Service Preemption and Node Pinning (citadel #577)
 
 A `SERVICE_START` that declares a VRAM budget on a full GPU auto-evicts
