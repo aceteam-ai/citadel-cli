@@ -152,6 +152,23 @@ func TestDeriveDiffusersAllowPatterns(t *testing.T) {
 		}
 	})
 
+	t.Run("sharded root checkpoint is NOT mistaken for sibling checkpoints -> nil", func(t *testing.T) {
+		// A sharded single model (several files that together ARE the model)
+		// must never be filtered out as if it were LTX-Video's alternate-sibling
+		// shape -- that would strip the actual weights from the pull.
+		entries := []hfTreeEntry{
+			{Type: "file", Path: "model-00001-of-00003.safetensors", Size: 1},
+			{Type: "file", Path: "model-00002-of-00003.safetensors", Size: 1},
+			{Type: "file", Path: "model-00003-of-00003.safetensors", Size: 1},
+			{Type: "file", Path: "transformer/config.json", Size: 1},
+			{Type: "file", Path: "vae/config.json", Size: 1},
+			{Type: "file", Path: "text_encoder/config.json", Size: 1},
+		}
+		if got := deriveDiffusersAllowPatterns(entries); got != nil {
+			t.Errorf("expected nil for a sharded root checkpoint, got %v (would strip the actual weights)", got)
+		}
+	})
+
 	t.Run("only two of five diffusers dirs present -> nil (not enough evidence)", func(t *testing.T) {
 		entries := []hfTreeEntry{
 			{Type: "file", Path: "a.safetensors", Size: 1},

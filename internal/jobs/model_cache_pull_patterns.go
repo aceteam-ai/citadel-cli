@@ -98,6 +98,19 @@ func patternsInclude(path string, allowPatterns, ignorePatterns []string) bool {
 	return false
 }
 
+// shardedCheckpointPattern matches the standard HF sharded-checkpoint naming
+// convention (e.g. "model-00001-of-00003.safetensors"): several root-level
+// files that together ARE one model, as opposed to several independent
+// sibling checkpoints (LTX-Video's shape, where each file is a complete,
+// alternate model).
+var shardedCheckpointPattern = regexp.MustCompile(`-\d+-of-\d+\.safetensors$`)
+
+// isShardedCheckpointName reports whether name looks like one shard of a
+// sharded checkpoint rather than a standalone sibling checkpoint.
+func isShardedCheckpointName(name string) bool {
+	return shardedCheckpointPattern.MatchString(strings.ToLower(name))
+}
+
 // diffusersLayoutDirs are the subfolders a standard diffusers pipeline needs.
 // This is exactly the LTX-Video shape that caused #828: a repo with these
 // subfolders ALSO carries several sibling top-level single-file checkpoints
@@ -137,6 +150,14 @@ func deriveDiffusersAllowPatterns(entries []hfTreeEntry) []string {
 		}
 		if !strings.Contains(e.Path, "/") {
 			if strings.HasSuffix(strings.ToLower(e.Path), ".safetensors") {
+				if isShardedCheckpointName(e.Path) {
+					// A sharded single model (model-00001-of-00003.safetensors)
+					// has multiple root .safetensors files that ARE the model, not
+					// sibling alternate checkpoints to discard. Filtering them out
+					// would strip the actual weights, so bail on the whole repo
+					// rather than risk a "pull succeeded but has no weights" job.
+					return nil
+				}
 				rootCheckpoints++
 			}
 			continue

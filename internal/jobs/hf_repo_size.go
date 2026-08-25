@@ -18,8 +18,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
+
+// hfAuthToken returns a best-effort HuggingFace auth token from the
+// environment, mirroring huggingface_hub's own precedence (HF_TOKEN first,
+// HUGGING_FACE_HUB_TOKEN for backward compat). It does NOT read the stored
+// token file (~/.cache/huggingface/token) that `hf auth login` writes -- a
+// gated repo authorized only that way still 401s the metadata fetch here,
+// which is one more reason the preflight fails open rather than closed on a
+// fetch error (fetchHFRepoTree's doc comment).
+func hfAuthToken() string {
+	if v := os.Getenv("HF_TOKEN"); v != "" {
+		return v
+	}
+	return os.Getenv("HUGGING_FACE_HUB_TOKEN")
+}
 
 // hfMetadataTimeout bounds the HF tree-API call. MODEL_CACHE_PULL is in the
 // worker watchdog's unbounded tier (see CLAUDE.md's Consume-Loop Watchdog
@@ -70,11 +85,22 @@ var hfRepoTreeFn = fetchHFRepoTree
 // fetchHFRepoTree calls the HF `tree` API (not the model-info API) because it
 // is the one that resolves LFS pointer files to their real byte size inline,
 // with no extra per-file round trip.
+//
+// Known limitations (both degrade to the fail-open path in runDiskPreflight,
+// never to a blocked download): the request is unauthenticated except for
+// hfAuthToken()'s best-effort token, so a gated repo the operator hasn't
+// separately authorized for CAN still 401/403 here even though the actual
+// `hf download` succeeds via its own cached credentials -- the preflight
+// simply skips itself in that case. And the revision is hardcoded to `main`;
+// a repo whose default branch is something else 404s the same way.
 func fetchHFRepoTree(ctx context.Context, repo string) ([]hfTreeEntry, error) {
 	url := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/main?recursive=true", repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building huggingface tree request for %s: %w", repo, err)
+	}
+	if token := hfAuthToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := hfHTTPClient.Do(req)
 	if err != nil {

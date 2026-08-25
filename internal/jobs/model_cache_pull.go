@@ -505,20 +505,32 @@ func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePat
 	return finalAllow, finalIgnore, nil
 }
 
-// hfCacheBaseDir returns the root HuggingFace cache directory (HF_HOME, or
-// ~/.cache/huggingface) that a repo pull lands in, used by the disk
-// preflight's free-space check. Falls back to "." (rather than hfCacheDir's
-// "" on UserHomeDir failure) because nearestExistingDir needs a concrete path
-// to walk up from, not a signal to skip the check outright.
+// hfCacheBaseDir returns the actual hub-cache directory a repo pull writes
+// into, used by the disk preflight's free-space check. Mirrors
+// huggingface_hub's own precedence (internal/constants.py):
+// HF_HUB_CACHE > (legacy) HUGGINGFACE_HUB_CACHE > "$HF_HOME/hub" >
+// ~/.cache/huggingface/hub. Getting this wrong is not cosmetic: an operator
+// who points HF_HUB_CACHE at a large secondary disk (the common reason to set
+// it at all) would otherwise have free space measured on the ROOT volume,
+// inverting the check exactly on the nodes most likely to need it. Falls back
+// to "." (rather than hfCacheDir's "" on UserHomeDir failure) because
+// nearestExistingDir needs a concrete path to walk up from, not a signal to
+// skip the check outright.
 func hfCacheBaseDir() string {
+	if v := os.Getenv("HF_HUB_CACHE"); v != "" {
+		return v
+	}
+	if v := os.Getenv("HUGGINGFACE_HUB_CACHE"); v != "" {
+		return v
+	}
 	if base := os.Getenv("HF_HOME"); base != "" {
-		return base
+		return filepath.Join(base, "hub")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "."
 	}
-	return filepath.Join(home, ".cache", "huggingface")
+	return filepath.Join(home, ".cache", "huggingface", "hub")
 }
 
 // hfCacheModelSize walks the HuggingFace cache directory for the model and

@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -55,6 +56,42 @@ func TestBuildHuggingFaceDownloadCommandFiltered(t *testing.T) {
 	if !equalStrs(unfiltered.Args, filtered.Args) {
 		t.Errorf("BuildHuggingFaceDownloadCommandFiltered(no patterns) = %v, want %v", filtered.Args, unfiltered.Args)
 	}
+}
+
+// TestHFCacheBaseDirPrecedence pins the env-var precedence hfCacheBaseDir must
+// follow to match huggingface_hub's own resolution (constants.py): HF_HUB_CACHE
+// wins outright, then the legacy HUGGINGFACE_HUB_CACHE, then "$HF_HOME/hub",
+// then ~/.cache/huggingface/hub. Getting this wrong means the disk preflight
+// measures free space on the wrong volume on exactly the nodes an operator
+// bothered to relocate the cache on.
+func TestHFCacheBaseDirPrecedence(t *testing.T) {
+	t.Run("HF_HUB_CACHE wins outright", func(t *testing.T) {
+		t.Setenv("HF_HUB_CACHE", "/mnt/models/hub")
+		t.Setenv("HUGGINGFACE_HUB_CACHE", "/other/hub")
+		t.Setenv("HF_HOME", "/other/home")
+		if got := hfCacheBaseDir(); got != "/mnt/models/hub" {
+			t.Errorf("hfCacheBaseDir() = %q, want /mnt/models/hub", got)
+		}
+	})
+
+	t.Run("legacy HUGGINGFACE_HUB_CACHE wins over HF_HOME", func(t *testing.T) {
+		t.Setenv("HF_HUB_CACHE", "")
+		t.Setenv("HUGGINGFACE_HUB_CACHE", "/legacy/hub")
+		t.Setenv("HF_HOME", "/other/home")
+		if got := hfCacheBaseDir(); got != "/legacy/hub" {
+			t.Errorf("hfCacheBaseDir() = %q, want /legacy/hub", got)
+		}
+	})
+
+	t.Run("HF_HOME/hub when neither cache var is set", func(t *testing.T) {
+		t.Setenv("HF_HUB_CACHE", "")
+		t.Setenv("HUGGINGFACE_HUB_CACHE", "")
+		t.Setenv("HF_HOME", "/custom/home")
+		want := filepath.Join("/custom/home", "hub")
+		if got := hfCacheBaseDir(); got != want {
+			t.Errorf("hfCacheBaseDir() = %q, want %q", got, want)
+		}
+	})
 }
 
 // TestRunDiskPreflightInjected exercises the glue function with the
