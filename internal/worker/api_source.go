@@ -35,6 +35,15 @@ type APISource struct {
 // ~10x faster than the 5s poll — the whole point of the wake.
 const apiWakeDrainBlockMs = 500
 
+// DefaultCPUQueue is the base Redis Stream every API-mode worker consumes
+// when no other queue is configured. It is the single source of truth for
+// that value: NewAPISource's zero-value fallback below reads it, and any
+// caller that needs to know what an unconfigured APISource subscribes to
+// (e.g. cmd/controlcenter.go's boot-time inference-queue set, citadel #823)
+// should reference this constant rather than copying the literal, so the two
+// can never drift apart.
+const DefaultCPUQueue = "jobs:v1:cpu-general"
+
 // APISourceConfig holds configuration for APISource.
 type APISourceConfig struct {
 	// BaseURL is the AceTeam API base URL (e.g., "https://aceteam.ai")
@@ -85,7 +94,7 @@ func NewAPISource(cfg APISourceConfig) *APISource {
 	} else if cfg.QueueName != "" {
 		queues = []string{cfg.QueueName}
 	} else {
-		queues = []string{"jobs:v1:cpu-general"}
+		queues = []string{DefaultCPUQueue}
 	}
 
 	return &APISource{
