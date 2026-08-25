@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestInferenceQueueReconciler_NotServingYet_NoOp asserts that a node with no
@@ -184,12 +185,34 @@ func TestInferenceQueueReconciler_EmptyQueuesNeverProbes(t *testing.T) {
 
 // TestInferenceQueueReconciler_ConcurrentReconcile exercises concurrent
 // Reconcile calls (e.g. a manual /agent/resubscribe racing the heartbeat
-// tick) under -race to confirm the mutex-guarded transition is safe.
+// tick) under -race to confirm the mutex-guarded transition is safe, AND that
+// only one IsServing probe is ever in flight at a time.
+//
+// The single-in-flight-probe property specifically matters because a caller
+// may run Reconcile in its own goroutine BECAUSE IsServing can block for an
+// unbounded time (nodeIsServingModels's underlying `docker ps` has no context
+// deadline on a wedged runtime -- see cmd/work.go). Without the `probing`
+// guard, every subsequent heartbeat tick would launch another goroutine that
+// also blocks forever on the wedged probe: an unbounded goroutine leak
+// instead of the single bounded stall the caller moved off the heartbeat path
+// to avoid. A looser ">= 1 AddQueue call" assertion (the pre-guard version of
+// this test) cannot catch that regression -- it passes whether probes
+// serialize or all run at once.
 func TestInferenceQueueReconciler_ConcurrentReconcile(t *testing.T) {
 	var addCalls int32
+	var servingCalls int32
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	var startedOnce sync.Once
+
 	r := NewInferenceQueueReconciler(
 		[]string{"jobs:v1:gpu-general"},
-		func(ctx context.Context) bool { return true },
+		func(ctx context.Context) bool {
+			atomic.AddInt32(&servingCalls, 1)
+			startedOnce.Do(func() { close(started) })
+			<-proceed // block until the test says every concurrent caller has been turned away
+			return true
+		},
 		func(ctx context.Context, queue string) error {
 			atomic.AddInt32(&addCalls, 1)
 			return nil
@@ -197,20 +220,35 @@ func TestInferenceQueueReconciler_ConcurrentReconcile(t *testing.T) {
 	)
 
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.Reconcile(context.Background())
+	}()
+
+	<-started // the first (and only) probe is now blocked inside IsServing
+
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.Reconcile(context.Background())
+			r.Reconcile(context.Background()) // must return immediately: probing is true
 		}()
 	}
+	// Give the flood a moment to actually reach (and be turned away by) the
+	// probing guard before asserting. The guard itself is just a mutex
+	// lock/check/unlock, so this is generous.
+	time.Sleep(50 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&servingCalls); got != 1 {
+		t.Fatalf("want exactly 1 in-flight IsServing probe while one is already running (goroutine-leak guard), got %d", got)
+	}
+
+	close(proceed) // let the original probe (and its AddQueue call) complete
 	wg.Wait()
 
-	// AddQueue itself is idempotent on the real sources, so >=1 is the safety
-	// property under race; the strict-single-call case is covered serially
-	// above without concurrency ambiguity.
-	if got := atomic.LoadInt32(&addCalls); got < 1 {
-		t.Fatalf("want at least 1 AddQueue call across concurrent Reconcile calls, got %d", got)
+	if got := atomic.LoadInt32(&addCalls); got != 1 {
+		t.Fatalf("want exactly 1 AddQueue call, got %d", got)
 	}
 }
 

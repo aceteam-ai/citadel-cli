@@ -46,6 +46,7 @@ type InferenceQueueReconciler struct {
 	mu         sync.Mutex
 	queues     []string // the inference queue(s) to add once serving is true
 	subscribed bool     // true once every queue has been added successfully
+	probing    bool     // true while an IsServing/AddQueue probe is in flight
 }
 
 // NewInferenceQueueReconciler builds a reconciler for the given queue set. An
@@ -71,20 +72,38 @@ func NewInferenceQueueReconciler(queues []string, isServing func(ctx context.Con
 // concurrently and repeatedly (e.g. once per heartbeat collection) --
 // subsequent calls after a successful subscribe return immediately without
 // re-probing.
+//
+// At most one probe (IsServing + AddQueue) runs at a time, guarded by
+// `probing`. This matters because callers may run Reconcile in its own
+// goroutine specifically because IsServing can block for an unbounded time
+// (e.g. nodeIsServingModels's underlying `docker ps` has no context deadline
+// on a wedged container runtime -- see cmd/work.go). Without this guard, a
+// wedged runtime would leave the previous tick's probe goroutine permanently
+// blocked while every subsequent heartbeat tick launches another one -- an
+// unbounded goroutine leak instead of the bounded stall the caller moved to a
+// goroutine to avoid.
 func (r *InferenceQueueReconciler) Reconcile(ctx context.Context) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	if r.subscribed || len(r.queues) == 0 || r.IsServing == nil || r.AddQueue == nil {
+	if r.subscribed || r.probing || len(r.queues) == 0 || r.IsServing == nil || r.AddQueue == nil {
 		r.mu.Unlock()
 		return
 	}
+	r.probing = true
 	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.probing = false
+		r.mu.Unlock()
+	}()
 
-	// IsServing may probe over HTTP (bounded by its own timeout upstream), so
-	// deliberately do this outside the lock -- it must never block a
-	// concurrent Reconcile call (or the run loop) waiting on it.
+	// IsServing may block for an unbounded time (see the doc comment above),
+	// so deliberately do this outside the lock -- it must never block a
+	// concurrent Reconcile call (or the run loop) waiting on it. `probing`
+	// above is what actually prevents pile-up; the lock here is only ever
+	// held briefly.
 	if !r.IsServing(ctx) {
 		return
 	}

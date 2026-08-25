@@ -1745,9 +1745,12 @@ func runWork(cmd *cobra.Command, args []string) {
 						// call indefinitely. Running it inline in the OnStatus fan-out
 						// would stall every subsequent heartbeat publish -- exactly the
 						// liveness regression #548's watchdog work exists to prevent.
-						// The reconciler's own mutex + post-probe re-check of
-						// `subscribed` (TestInferenceQueueReconciler_ConcurrentReconcile)
-						// make concurrent/overlapping ticks safe.
+						// This means a wedged runtime leaves that probe blocked
+						// indefinitely -- but the reconciler self-limits to ONE
+						// in-flight probe (an internal `probing` guard under its
+						// mutex), so a wedge costs exactly one permanently-blocked
+						// goroutine, not one per heartbeat tick forever. See
+						// TestInferenceQueueReconciler_ConcurrentReconcile.
 						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go inferenceQueueReconciler.Reconcile(ctx) })
 					}
 					if pulseStats != nil {
