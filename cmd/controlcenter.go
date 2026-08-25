@@ -2183,7 +2183,12 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 		PinnedServices:            ccPinnedServices,
 	}
-	handlers := buildNodeJobHandlers(nodeJobOpts)
+	// Swap manager (if any) is discarded here: this collector does not wire
+	// WorkerLiveness/PinnedServices/ModelHotswap either (a pre-existing gap —
+	// see CLAUDE.md's Service Preemption section), so surfacing swap activity
+	// on the control-center-only heartbeat is a documented follow-up, not
+	// silently regressed by this change.
+	handlers, _ := buildNodeJobHandlers(nodeJobOpts)
 
 	// Create runner with TUI callbacks
 	runner := worker.NewRunner(source, handlers, worker.RunnerConfig{

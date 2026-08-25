@@ -673,6 +673,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Post-connect wiring that runs LATER in startup (push-wake) waits on it so a
 	// late connect still gets armed. nil outside API mode.
 	var wsRetryDone <-chan struct{}
+	// nodeSwapManager is the model-hotswap swap manager (citadel-cli#632),
+	// constructed later inside buildNodeJobHandlers (nil under the break-glass
+	// disable or with no config dir). Declared here so the heartbeat closure
+	// below (swapStatsFn) can close over it before it exists — assigned at the
+	// buildNodeJobHandlers call site, read here at each heartbeat collection.
+	// Same late-binding as pubSubTransportFn above.
+	var nodeSwapManager *worker.SwapManager
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -1247,6 +1254,17 @@ func runWork(cmd *cobra.Command, args []string) {
 		return live
 	}
 
+	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
+	// this node thrashing?" without shell access. nodeSwapManager is assigned
+	// below at the buildNodeJobHandlers call site; nil here (before hotswap is
+	// enabled) or when hotswap is disabled means no Swap block on the heartbeat.
+	swapStatsFn := func() *status.SwapActivity {
+		if nodeSwapManager == nil {
+			return nil
+		}
+		return swapStatsFrom(nodeSwapManager.SwapStats())
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1259,6 +1277,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			Services:       nil,
 			Capabilities:   statusCaps,
 			WorkerLiveness: workerLivenessFn,
+			SwapStats:      swapStatsFn,
 			PinnedServices: manifestPinnedServices(workManifest),
 			ModelHotswap:   status.ModelHotswapEnabled(),
 		})
@@ -1547,6 +1566,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				Services:       nil,
 				Capabilities:   statusCaps,
 				WorkerLiveness: workerLivenessFn,
+				SwapStats:      swapStatsFn,
 				PinnedServices: manifestPinnedServices(workManifest),
 				ModelHotswap:   status.ModelHotswapEnabled(),
 			})
@@ -2159,7 +2179,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 		PinnedServices:            manifestPinnedServices(workManifest),
 	}
-	handlers := buildNodeJobHandlers(nodeJobOpts)
+	handlers, nodeSwapManager := buildNodeJobHandlers(nodeJobOpts)
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
@@ -2696,6 +2716,32 @@ func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 		Failed:             snap.Failed,
 		IdentityUnresolved: snap.IdentityUnresolved,
 	}
+}
+
+// swapStatsFrom projects a worker.SwapStats onto the heartbeat-facing
+// status.SwapActivity payload (citadel-cli#717). Extracted like
+// workerLivenessFrom above so the hand-maintained field-by-field mapping
+// between the two independently-evolving structs is testable on its own.
+func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
+	activity := &status.SwapActivity{
+		SwapsPerHour:         stats.SwapsPerHour,
+		EvictingSwapsPerHour: stats.EvictingSwapsPerHour,
+		MaxEvictingPerHour:   stats.MaxEvictingPerHour,
+	}
+	if len(stats.Recent) > 0 {
+		activity.Recent = make([]status.SwapRecord, len(stats.Recent))
+		for i, r := range stats.Recent {
+			activity.Recent[i] = status.SwapRecord{
+				Backend:   r.Backend,
+				Model:     r.Model,
+				Evicted:   r.Evicted,
+				StartedAt: r.StartedAt,
+				Wait:      r.Wait,
+				Outcome:   r.Outcome,
+			}
+		}
+	}
+	return activity
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {

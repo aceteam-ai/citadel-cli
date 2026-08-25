@@ -39,6 +39,12 @@ type NodeStatus struct {
 	// jobs (issue #548). Additive and back-compatible: omitted on nodes that run
 	// no worker loop (pure status/desktop nodes) and on legacy builds.
 	Worker *WorkerLiveness `json:"worker,omitempty"`
+	// Swap carries model-hotswap activity (citadel-cli#687, #717) so "is this
+	// node thrashing?" is answerable from the heartbeat instead of shell access.
+	// Additive and back-compatible: omitted whenever no swap manager is wired in
+	// (model hotswap disabled via CITADEL_MODEL_HOTSWAP, no config dir, or a
+	// legacy build).
+	Swap *SwapActivity `json:"swap,omitempty"`
 }
 
 // WorkerLiveness is the heartbeat-facing view of the job consume loop. It is the
@@ -92,6 +98,56 @@ type WorkerLiveness struct {
 	// platform reads it as offline while every other field above looks healthy.
 	// Nothing else distinguishes that node from a working one (issue #723).
 	PubSubTransport string `json:"pubsub_transport,omitempty"`
+}
+
+// SwapActivity is the heartbeat-facing view of model-hotswap activity
+// (citadel-cli#632, #687, #717) — the operator-facing worker.SwapStats
+// projected onto the heartbeat. internal/status cannot import internal/worker
+// (worker already imports status), so this is a hand-maintained mirror; the
+// conversion lives in cmd/work.go (swapStatsFrom), same split as
+// WorkerLiveness/workerLivenessFrom above.
+//
+// Present only when a swap manager is wired on this node (model hotswap on,
+// which is the default, AND a config dir resolved); absent entirely otherwise,
+// so a hotswap-off heartbeat is unchanged by this field's existence.
+type SwapActivity struct {
+	// SwapsPerHour counts every swap attempt in the trailing window.
+	SwapsPerHour int `json:"swaps_per_hour"`
+	// EvictingSwapsPerHour counts only swaps that stopped a resident engine —
+	// the subset the swap rate bound (citadel-cli#687) governs.
+	EvictingSwapsPerHour int `json:"evicting_swaps_per_hour"`
+	// MaxEvictingPerHour is the ceiling in force, so a reader can tell how close
+	// to refusing the node is without knowing the build's defaults.
+	MaxEvictingPerHour int `json:"max_evicting_per_hour"`
+	// Recent holds the most recent swap records, oldest first.
+	Recent []SwapRecord `json:"recent,omitempty"`
+}
+
+// SwapRecord is one swap this node attempted, mirroring worker.SwapRecord.
+//
+// Deliberately absent: "whether a pull was required" (citadel-cli#717, part
+// 2). The swap manager issues a SERVICE_START and, for docker-based engines,
+// any weights pull happens opaquely inside the container's own startup —
+// invisible to the Go code driving `docker compose up`. Reporting it honestly
+// needs the start path itself to observe and report a pull, which is
+// straightforward for the native ollama path but not for the docker path
+// without new engine-specific instrumentation; a guessed field here is worse
+// than an absent one, so it stays out until that instrumentation exists.
+type SwapRecord struct {
+	// Backend is the engine swapped in.
+	Backend string `json:"backend"`
+	// Model is the model it was started for.
+	Model string `json:"model,omitempty"`
+	// Evicted names the engines stopped to make room, in stop order. Empty when
+	// the swap fit in free VRAM.
+	Evicted []string `json:"evicted,omitempty"`
+	// StartedAt is when the swap began.
+	StartedAt time.Time `json:"started_at"`
+	// Wait is how long the swap ran before reaching its outcome.
+	Wait time.Duration `json:"wait"`
+	// Outcome is one of the swap outcome values: "ready", "warming", "failed",
+	// "blocked", "rate_limited".
+	Outcome string `json:"outcome"`
 }
 
 // AppInfo contains information about an installed catalog app.

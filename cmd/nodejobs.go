@@ -59,7 +59,13 @@ type nodeJobHandlerOpts struct {
 // privileged, runner-coupled handlers (AGENT_UPDATE, WHATSAPP_PROVISION) are added
 // afterward via registerPrivilegedNodeJobHandlers, because they need the live
 // runner's Drain/ActiveJobs for the "publish result, THEN restart" ordering.
-func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
+//
+// The second return value is the model-hotswap swap manager attached to the
+// llm_inference handler (nil under the break-glass disable, or no config dir) --
+// it is constructed here, not at the heartbeat collector site, so callers that
+// want to surface swap activity on the heartbeat (citadel-cli#717) must thread
+// it through themselves; see cmd/work.go's nodeSwapManager/swapStatsFn.
+func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker.SwapManager) {
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		LogFn:                     opts.LogFn,
 		WorkspaceDir:              opts.WorkspaceDir,
@@ -87,7 +93,8 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 	// swap manager so an installed-but-not-resident target engine is swapped in on
 	// demand. Returns nil (no swapper) only under the break-glass disable, in which
 	// case the handler is byte-for-byte the pre-#632 one.
-	if swapper := newModelSwapManager(opts.ConfigDir, opts.WorkspaceDir, opts.PinnedServices, opts.HandlerLog); swapper != nil {
+	swapper := newModelSwapManager(opts.ConfigDir, opts.WorkspaceDir, opts.PinnedServices, opts.HandlerLog)
+	if swapper != nil {
 		llmHandler = llmHandler.WithSwapper(swapper)
 	}
 	handlers = append(handlers, llmHandler)
@@ -99,7 +106,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) []worker.JobHandler {
 	handlers = append(handlers, worker.NewDocumentRasterizeHandler(worker.DocumentRasterizeConfig{
 		Log: opts.HandlerLog,
 	}))
-	return handlers
+	return handlers, swapper
 }
 
 // registerPrivilegedNodeJobHandlers registers the node-targeted privileged handlers

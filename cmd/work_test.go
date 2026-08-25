@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
 // TestResolveAutoUpdateEnabled verifies the precedence that lets the web UI /
@@ -228,5 +230,63 @@ func TestNodeQueueName(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("nodeQueueName(%q, %q) = %q, want %q", tt.orgID, tt.nodeID, got, tt.want)
 		}
+	}
+}
+
+// TestSwapStatsFrom pins the hand-maintained field-by-field projection from
+// worker.SwapStats onto the heartbeat-facing status.SwapActivity (citadel-cli
+// #717), mirroring the existing coverage intent for workerLivenessFrom: a
+// mapping between two independently-evolving structs is exactly the kind of
+// thing that silently loses a field, so it gets its own test.
+func TestSwapStatsFrom(t *testing.T) {
+	startedAt := time.Now().Add(-90 * time.Second)
+	stats := worker.SwapStats{
+		SwapsPerHour:         4,
+		EvictingSwapsPerHour: 2,
+		MaxEvictingPerHour:   6,
+		Recent: []worker.SwapRecord{
+			{
+				Backend:   "bonsai",
+				Model:     "Bonsai-27B-Q1_0.gguf",
+				Evicted:   []string{"vllm"},
+				StartedAt: startedAt,
+				Wait:      90 * time.Second,
+				Outcome:   "ready",
+			},
+		},
+	}
+
+	got := swapStatsFrom(stats)
+	if got == nil {
+		t.Fatal("swapStatsFrom returned nil")
+	}
+	if got.SwapsPerHour != 4 || got.EvictingSwapsPerHour != 2 || got.MaxEvictingPerHour != 6 {
+		t.Errorf("counters = %+v, want swaps=4 evicting=2 max=6", got)
+	}
+	if len(got.Recent) != 1 {
+		t.Fatalf("Recent count = %d, want 1", len(got.Recent))
+	}
+	rec := got.Recent[0]
+	if rec.Backend != "bonsai" || rec.Model != "Bonsai-27B-Q1_0.gguf" || rec.Outcome != "ready" {
+		t.Errorf("record = %+v, want backend=bonsai model=Bonsai-27B-Q1_0.gguf outcome=ready", rec)
+	}
+	if len(rec.Evicted) != 1 || rec.Evicted[0] != "vllm" {
+		t.Errorf("Evicted = %v, want [vllm]", rec.Evicted)
+	}
+	if !rec.StartedAt.Equal(startedAt) {
+		t.Errorf("StartedAt = %v, want %v", rec.StartedAt, startedAt)
+	}
+	if rec.Wait != 90*time.Second {
+		t.Errorf("Wait = %v, want 90s", rec.Wait)
+	}
+
+	// Empty stats (no swaps yet) must not panic and must yield a non-nil struct
+	// with a nil Recent slice, matching the omitempty JSON contract.
+	empty := swapStatsFrom(worker.SwapStats{MaxEvictingPerHour: 6})
+	if empty == nil {
+		t.Fatal("swapStatsFrom(empty) returned nil")
+	}
+	if empty.Recent != nil {
+		t.Errorf("Recent = %v, want nil for no records", empty.Recent)
 	}
 }

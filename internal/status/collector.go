@@ -29,6 +29,7 @@ type Collector struct {
 	modelDiscovery *ModelDiscovery
 	capabilities   *NodeCapabilities      // cached capabilities (set once at startup)
 	workerLiveness func() *WorkerLiveness // live worker consume-loop liveness (issue #548), optional
+	swapStats      func() *SwapActivity   // live model-hotswap activity (citadel #717), optional
 	idleTracker    *IdleTracker           // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
 	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
@@ -55,6 +56,11 @@ type CollectorConfig struct {
 	// to each heartbeat so the platform can flag "green but wedged" nodes
 	// (issue #548). Optional: nil on nodes with no worker loop.
 	WorkerLiveness func() *WorkerLiveness
+	// SwapStats, when set, returns live model-hotswap activity attached to each
+	// heartbeat so "is this node thrashing?" is answerable without shell access
+	// (citadel #717). Optional: nil when no swap manager is wired (hotswap off,
+	// no config dir, or a legacy build).
+	SwapStats func() *SwapActivity
 	// PinnedServices is the node's pinned_services allowlist (citadel #577). Each
 	// running service whose name is listed is marked ServiceInfo.Pinned=true so
 	// the heartbeat and `citadel services` show pinned vs preemptible. Optional.
@@ -77,6 +83,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		modelDiscovery: NewModelDiscovery(),
 		capabilities:   cfg.Capabilities,
 		workerLiveness: cfg.WorkerLiveness,
+		swapStats:      cfg.SwapStats,
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
 		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
@@ -379,6 +386,13 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// heartbeating-but-wedged node from one actually draining jobs (issue #548).
 	if c.workerLiveness != nil {
 		status.Worker = c.workerLiveness()
+	}
+
+	// Attach live model-hotswap activity so "is this node thrashing?" is
+	// answerable from the heartbeat (issue #717). Additive: nil provider (no
+	// swap manager wired) leaves the field omitted exactly as before this change.
+	if c.swapStats != nil {
+		status.Swap = c.swapStats()
 	}
 
 	return status, nil
