@@ -107,6 +107,15 @@ type CachedTokenEntry struct {
 	FetchedAt time.Time  // When this token was fetched
 }
 
+// previousHashEntry indexes a token by its previous (pre-rotation) hash, so a
+// still-in-grace token can be accepted alongside the current one during a
+// rotation window (see TokenHashEntry.PreviousHash). Only populated when the
+// platform sends a PreviousHash for an entry.
+type previousHashEntry struct {
+	Info      *TokenInfo // Token metadata (same as the rotated-to current token)
+	ExpiresAt time.Time  // Grace window expiry; rejected once now is past this
+}
+
 // CachingTokenValidator wraps a token validator with local caching
 // It fetches token hashes from the API periodically and validates locally
 type CachingTokenValidator struct {
@@ -114,7 +123,8 @@ type CachingTokenValidator struct {
 	orgID           string
 	apiToken        string // Device API token (act_*) for authenticating with the platform
 	httpClient      *http.Client
-	cache           map[string]*CachedTokenEntry // SHA-256 hash -> entry
+	cache           map[string]*CachedTokenEntry  // SHA-256 hash (current) -> entry
+	previousCache   map[string]*previousHashEntry // SHA-256 hash (previous-in-grace) -> entry
 	cacheMu         sync.RWMutex
 	refreshInterval time.Duration
 	lastRefresh     time.Time
@@ -139,6 +149,7 @@ func NewCachingTokenValidator(baseURL, orgID, apiToken string, refreshInterval t
 		apiToken:         apiToken,
 		httpClient:       &http.Client{Timeout: 10 * time.Second},
 		cache:            make(map[string]*CachedTokenEntry),
+		previousCache:    make(map[string]*previousHashEntry),
 		refreshInterval:  refreshInterval,
 		stopCh:           make(chan struct{}),
 		minBackoff:       1 * time.Second,
@@ -209,12 +220,33 @@ type TokensResponse struct {
 	Tokens []TokenHashEntry `json:"tokens"`
 }
 
-// TokenHashEntry represents a single token entry from the API
+// TokenHashEntry represents a single token entry from the API.
+//
+// PreviousHash and PreviousHashExpiresAt are OPTIONAL and forward-compatible:
+// the platform does not send them today (the token endpoint returns only the
+// current hash), so both are zero-valued and validation behaves exactly as
+// before (only Hash is accepted). When the platform starts carrying an
+// outgoing token's hash forward during a rotation grace window, it should
+// populate both fields (see CachingTokenValidator.ValidateToken for the
+// acceptance rule).
 type TokenHashEntry struct {
 	Hash      string    `json:"hash"`
 	UserID    string    `json:"user_id"`
 	OrgID     string    `json:"org_id"`
 	ExpiresAt time.Time `json:"expires_at"`
+
+	// PreviousHash is the SHA-256 hash of the immediately-prior token for this
+	// user/org. During a bounded rotation grace window the platform may carry
+	// this forward so a node that hasn't re-polled yet still accepts a client
+	// still holding the just-rotated-out token. Omitted (empty) means no grace
+	// window is in effect for this entry.
+	PreviousHash string `json:"previous_hash,omitempty"`
+
+	// PreviousHashExpiresAt bounds how long PreviousHash is accepted. It is
+	// only meaningful when PreviousHash is set. If PreviousHash is set but
+	// this is zero, PreviousHash is treated as already expired (never
+	// accepted) rather than as an unbounded grace window.
+	PreviousHashExpiresAt time.Time `json:"previous_hash_expires_at,omitempty"`
 }
 
 // fetchAndCacheTokens fetches token hashes from the API and updates the cache
@@ -251,17 +283,30 @@ func (v *CachingTokenValidator) fetchAndCacheTokens() error {
 
 	// Clear old cache and populate with new tokens
 	v.cache = make(map[string]*CachedTokenEntry)
+	v.previousCache = make(map[string]*previousHashEntry)
 	now := time.Now()
 
 	for _, entry := range tokensResp.Tokens {
+		info := &TokenInfo{
+			UserID:    entry.UserID,
+			OrgID:     entry.OrgID,
+			ExpiresAt: entry.ExpiresAt,
+		}
 		v.cache[entry.Hash] = &CachedTokenEntry{
-			Hash: entry.Hash,
-			Info: &TokenInfo{
-				UserID:    entry.UserID,
-				OrgID:     entry.OrgID,
-				ExpiresAt: entry.ExpiresAt,
-			},
+			Hash:      entry.Hash,
+			Info:      info,
 			FetchedAt: now,
+		}
+
+		// Only index the previous hash when the platform sent BOTH a hash and
+		// a bounded expiry. A PreviousHash with a zero expiry is treated as
+		// "no grace window" (not indexed), so a platform bug can't produce an
+		// unbounded grace window.
+		if entry.PreviousHash != "" && !entry.PreviousHashExpiresAt.IsZero() {
+			v.previousCache[entry.PreviousHash] = &previousHashEntry{
+				Info:      info,
+				ExpiresAt: entry.PreviousHashExpiresAt,
+			}
 		}
 	}
 
@@ -269,16 +314,17 @@ func (v *CachingTokenValidator) fetchAndCacheTokens() error {
 	return nil
 }
 
-// ValidateToken validates a token using the local cache
+// ValidateToken validates a token using the local cache. A token matching the
+// current cached hash is always accepted. A token matching a previous-in-grace
+// hash (see TokenHashEntry.PreviousHash) is also accepted, but only while
+// still within that hash's grace window - see lookupCached.
 func (v *CachingTokenValidator) ValidateToken(token string, orgID string) (*TokenInfo, error) {
 	// Hash the incoming token
 	hash := hashToken(token)
 
 	// Check cache
-	v.cacheMu.RLock()
-	entry, ok := v.cache[hash]
-	lastAttempt := v.lastRefreshAttempt
-	v.cacheMu.RUnlock()
+	info, ok := v.lookupCached(hash)
+	lastAttempt := v.lastRefreshAttemptTime()
 
 	if !ok {
 		// Token not found in cache - try a refresh if rate limit allows
@@ -289,9 +335,7 @@ func (v *CachingTokenValidator) ValidateToken(token string, orgID string) (*Toke
 			v.cacheMu.Unlock()
 
 			if err := v.fetchAndCacheTokens(); err == nil {
-				v.cacheMu.RLock()
-				entry, ok = v.cache[hash]
-				v.cacheMu.RUnlock()
+				info, ok = v.lookupCached(hash)
 			}
 		}
 
@@ -301,16 +345,42 @@ func (v *CachingTokenValidator) ValidateToken(token string, orgID string) (*Toke
 	}
 
 	// Verify org ID matches
-	if entry.Info.OrgID != orgID {
+	if info.OrgID != orgID {
 		return nil, ErrUnauthorized
 	}
 
 	// Check expiration
-	if !entry.Info.ExpiresAt.IsZero() && time.Now().After(entry.Info.ExpiresAt) {
+	if !info.ExpiresAt.IsZero() && time.Now().After(info.ExpiresAt) {
 		return nil, ErrTokenExpired
 	}
 
-	return entry.Info, nil
+	return info, nil
+}
+
+// lookupCached resolves a token hash against the current-hash cache, falling
+// back to the previous-hash (grace window) cache. The previous-hash entry is
+// only honored while now is before its ExpiresAt - once the grace window
+// elapses, that hash is rejected exactly like any unknown token.
+func (v *CachingTokenValidator) lookupCached(hash string) (*TokenInfo, bool) {
+	v.cacheMu.RLock()
+	defer v.cacheMu.RUnlock()
+
+	if entry, ok := v.cache[hash]; ok {
+		return entry.Info, true
+	}
+
+	if entry, ok := v.previousCache[hash]; ok && time.Now().Before(entry.ExpiresAt) {
+		return entry.Info, true
+	}
+
+	return nil, false
+}
+
+// lastRefreshAttemptTime returns the last on-demand refresh attempt time.
+func (v *CachingTokenValidator) lastRefreshAttemptTime() time.Time {
+	v.cacheMu.RLock()
+	defer v.cacheMu.RUnlock()
+	return v.lastRefreshAttempt
 }
 
 // hashToken computes the SHA-256 hash of a token

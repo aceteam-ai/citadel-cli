@@ -622,6 +622,11 @@ The terminal server uses a caching validator to avoid API calls per connection:
 2. Validates tokens locally via SHA-256 hash comparison
 3. Refreshes on cache miss before rejecting
 4. Exponential backoff (1s → 5min) on API failures
+5. `lookupCached` (citadel #792) also accepts a `previous_hash` still inside its
+   `previous_hash_expires_at` window, so a client that fetched the new token
+   just before rotation and a node that hasn't re-polled yet still agree. Both
+   fields are optional on `TokenHashEntry` and inert today — the platform does
+   not yet send them, so behavior is unchanged until it does.
 
 ```go
 // Create caching validator

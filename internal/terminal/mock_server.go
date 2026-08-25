@@ -18,6 +18,9 @@ type MockAuthServer struct {
 
 	mu          sync.RWMutex
 	validTokens map[string]*TokenInfo
+	// previousGrace maps a current token to the (hash, expiry) of the token it
+	// rotated out, for exercising the rotation-grace-window hashes response.
+	previousGrace map[string]previousGraceEntry
 
 	// RequestCount tracks the number of validation requests
 	RequestCount int
@@ -29,10 +32,18 @@ type MockAuthServer struct {
 	FailStatusCode int
 }
 
+// previousGraceEntry is the hash + expiry of a token that was rotated out but
+// is still accepted during the grace window (see TokenHashEntry.PreviousHash).
+type previousGraceEntry struct {
+	Hash      string
+	ExpiresAt time.Time
+}
+
 // StartMockAuthServer creates and starts a mock auth server
 func StartMockAuthServer() *MockAuthServer {
 	mock := &MockAuthServer{
 		validTokens:    make(map[string]*TokenInfo),
+		previousGrace:  make(map[string]previousGraceEntry),
 		FailStatusCode: http.StatusServiceUnavailable,
 	}
 
@@ -72,12 +83,17 @@ func StartMockAuthServer() *MockAuthServer {
 			for token, info := range mock.validTokens {
 				if info.OrgID == orgID {
 					h := sha256.Sum256([]byte(token))
-					tokens = append(tokens, TokenHashEntry{
+					entry := TokenHashEntry{
 						Hash:      hex.EncodeToString(h[:]),
 						UserID:    info.UserID,
 						OrgID:     info.OrgID,
 						ExpiresAt: info.ExpiresAt,
-					})
+					}
+					if grace, ok := mock.previousGrace[token]; ok {
+						entry.PreviousHash = grace.Hash
+						entry.PreviousHashExpiresAt = grace.ExpiresAt
+					}
+					tokens = append(tokens, entry)
 				}
 			}
 			mock.mu.RUnlock()
@@ -141,6 +157,19 @@ func (m *MockAuthServer) AddValidToken(token string, info *TokenInfo) {
 	m.validTokens[token] = info
 }
 
+// SetPreviousToken records that currentToken's PREVIOUS token (the one it
+// rotated out of) was previousToken, accepted until expiresAt. This exercises
+// the rotation-grace-window fields on the /hashes response.
+func (m *MockAuthServer) SetPreviousToken(currentToken, previousToken string, expiresAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := sha256.Sum256([]byte(previousToken))
+	m.previousGrace[currentToken] = previousGraceEntry{
+		Hash:      hex.EncodeToString(h[:]),
+		ExpiresAt: expiresAt,
+	}
+}
+
 // RemoveToken removes a token from the mock server
 func (m *MockAuthServer) RemoveToken(token string) {
 	m.mu.Lock()
@@ -177,6 +206,7 @@ func (m *MockAuthServer) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.validTokens = make(map[string]*TokenInfo)
+	m.previousGrace = make(map[string]previousGraceEntry)
 	m.RequestCount = 0
 	m.ShouldFail = false
 }
