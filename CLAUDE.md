@@ -627,6 +627,14 @@ The terminal server uses a caching validator to avoid API calls per connection:
    just before rotation and a node that hasn't re-polled yet still agree. Both
    fields are optional on `TokenHashEntry` and inert today — the platform does
    not yet send them, so behavior is unchanged until it does.
+6. `TokenHashEntry.UnmarshalJSON` (citadel #815) decodes `previous_hash_expires_at`
+   leniently: a malformed value (empty string, wrong type, non-RFC3339) degrades
+   that one entry to "no grace window" rather than erroring. This matters beyond
+   the single entry — `TokensResponse.Tokens` decodes as one slice, so a plain
+   `time.Time` field failing there would otherwise reject the ENTIRE token list,
+   and on a cold start (`Start()` with no prior cache) that means every terminal
+   connection is denied until the platform fixes the payload. The current-hash
+   fields (`hash`/`user_id`/`org_id`/`expires_at`) are still parsed strictly.
 
 ```go
 // Create caching validator

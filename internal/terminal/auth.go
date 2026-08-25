@@ -249,6 +249,56 @@ type TokenHashEntry struct {
 	PreviousHashExpiresAt time.Time `json:"previous_hash_expires_at,omitempty"`
 }
 
+// UnmarshalJSON implements a lenient decode for the previous-hash grace pair
+// (citadel #815). previous_hash / previous_hash_expires_at are optional and
+// platform-controlled; a malformed previous_hash_expires_at (empty string, a
+// number, non-RFC3339) must degrade to "no grace window" for that entry, not
+// fail the entry outright. That distinction matters beyond the single entry:
+// TokensResponse.Tokens is decoded as one []TokenHashEntry slice, so a plain
+// time.Time field failing to parse would reject the ENTIRE token list - on a
+// cold start (empty v.cache) that means every terminal connection is denied
+// until the platform fixes the payload. The current-hash fields (hash,
+// user_id, org_id, expires_at) are still parsed strictly: those are required
+// for the entry to be usable at all.
+func (e *TokenHashEntry) UnmarshalJSON(data []byte) error {
+	// Decode the required fields strictly. previous_hash_expires_at is
+	// deliberately absent from this struct - encoding/json ignores unknown
+	// object keys by default, so a malformed value here can't fail this step.
+	var strict struct {
+		Hash         string    `json:"hash"`
+		UserID       string    `json:"user_id"`
+		OrgID        string    `json:"org_id"`
+		ExpiresAt    time.Time `json:"expires_at"`
+		PreviousHash string    `json:"previous_hash,omitempty"`
+	}
+	if err := json.Unmarshal(data, &strict); err != nil {
+		return err
+	}
+
+	e.Hash = strict.Hash
+	e.UserID = strict.UserID
+	e.OrgID = strict.OrgID
+	e.ExpiresAt = strict.ExpiresAt
+	e.PreviousHash = strict.PreviousHash
+	e.PreviousHashExpiresAt = time.Time{}
+
+	// Parse previous_hash_expires_at separately and leniently: on any parse
+	// failure (or if it's absent), leave PreviousHashExpiresAt zero rather
+	// than propagating the error. fetchAndCacheTokens already treats a zero
+	// PreviousHashExpiresAt as "no grace window" for this entry.
+	var grace struct {
+		PreviousHashExpiresAt json.RawMessage `json:"previous_hash_expires_at"`
+	}
+	if err := json.Unmarshal(data, &grace); err == nil && len(grace.PreviousHashExpiresAt) > 0 {
+		var t time.Time
+		if err := json.Unmarshal(grace.PreviousHashExpiresAt, &t); err == nil {
+			e.PreviousHashExpiresAt = t
+		}
+	}
+
+	return nil
+}
+
 // fetchAndCacheTokens fetches token hashes from the API and updates the cache
 func (v *CachingTokenValidator) fetchAndCacheTokens() error {
 	url := fmt.Sprintf("%s/api/fabric/terminal/tokens/%s/hashes", v.baseURL, v.orgID)
