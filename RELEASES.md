@@ -1745,3 +1745,21 @@ Auto-generated log of every release.
   - fix(worker): don't Nack non-GPU jobs (e.g. SERVICE_START) on GPU-slot contention (#825) (#827)
 
 
+---
+
+## v2.115.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 20 |
+| Lines added | +1646 |
+
+**Changes:**
+
+  - fix(heartbeat): carry citadel binary version in status heartbeat (aceteam#5819) (#521)
+  - feat(catalog): self-healing resolution auto-refreshes a cold cache (#520)
+  - feat(worker): dynamically re-subscribe inference queues when an engine starts/stops (#612) (#824)
+  - fix(reconcile): scope converge authority to lockfile modules so one desired row can't wipe the manifest (#739) (#830)
+
+
