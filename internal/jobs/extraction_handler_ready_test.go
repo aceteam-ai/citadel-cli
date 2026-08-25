@@ -130,10 +130,26 @@ func TestWaitForReadyListeningButUnhealthyKeepsTheLongBudget(t *testing.T) {
 	pinExtractionPort(t, srv.Listener.Addr().(*net.TCPAddr).Port)
 
 	done := make(chan error, 1)
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		h := &ExtractionHandler{}
 		done <- h.waitForReady()
 	}()
+
+	// t.Cleanup runs LIFO, and this is registered after shrinkExtractionBounds'/
+	// pinExtractionPort's cleanups above, so it runs FIRST: it drains the
+	// goroutine (bounded by extractionMaxWait) before those restore the
+	// package-level bounds/port vars the goroutine's waitForReady loop is still
+	// reading. Without this, the still-running goroutine's reads race the
+	// restoring cleanups' writes to the same vars once this test function
+	// returns (#810). A dedicated close-only channel (rather than draining
+	// `done` again) matters on the failure branch below: the select there
+	// already consumes the one buffered value off `done`, and `t.Fatalf` calls
+	// runtime.Goexit() straight into this cleanup, so a second `<-done` would
+	// deadlock with no sender left. Receiving on a closed channel is always
+	// immediate, regardless of which branch ran.
+	t.Cleanup(func() { <-finished })
 
 	select {
 	case err := <-done:
@@ -141,6 +157,7 @@ func TestWaitForReadyListeningButUnhealthyKeepsTheLongBudget(t *testing.T) {
 			"the long budget must still apply once the port answers", err)
 	case <-time.After(extractionNotRunningWait * 3):
 		// Still waiting, which is correct. The goroutine is left to finish on its
-		// own; it is bounded by extractionMaxWait.
+		// own; it is bounded by extractionMaxWait, and the Cleanup above ensures
+		// it has actually finished before the bounds it depends on are restored.
 	}
 }
