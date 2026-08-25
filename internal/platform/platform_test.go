@@ -171,6 +171,115 @@ func TestResolveConfigDir_NotRoot(t *testing.T) {
 	}
 }
 
+func TestConfigDirCandidates_NotRoot(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo/system paths not applicable on Windows")
+	}
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("SUDO_USER", "")
+
+	got := configDirCandidates(false, false, true, false)
+	want := []string{filepath.Join(tmpHome, ".citadel-cli"), "/etc/citadel"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestConfigDirCandidates_RootHOMEForwarded(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo/system paths not applicable on Windows")
+	}
+	tmpHome := t.TempDir()
+	configDir := filepath.Join(tmpHome, ".citadel-cli")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte("node_config_dir: /tmp\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("SUDO_USER", "")
+
+	got := configDirCandidates(true, false, true, false)
+	want := []string{filepath.Join(tmpHome, ".citadel-cli"), "/etc/citadel"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestConfigDirCandidates_RootNoContextIncludesSystemPathAndHOME(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo/system paths not applicable on Windows")
+	}
+	// Simulates the shipped systemd unit (HOME set, but with no config.yaml
+	// underneath it, and no SUDO_USER): resolveConfigDir falls through to
+	// /etc/citadel, but the candidate list must ALSO keep the HOME-derived
+	// dir in case a legacy hash was written there directly (e.g. by an
+	// earlier binary/config layout). Uses a synthetic nonexistent path (like
+	// TestResolveConfigDir_RootFallbackToSystemPath) so the test result does
+	// not depend on what happens to exist on the machine running it.
+	t.Setenv("HOME", "/nonexistent-home-for-candidates-test")
+	t.Setenv("SUDO_USER", "")
+
+	got := configDirCandidates(true, false, true, false)
+	want := []string{"/etc/citadel", "/nonexistent-home-for-candidates-test/.citadel-cli"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestConfigDirCandidates_RootDarwinSystemPath(t *testing.T) {
+	t.Setenv("HOME", "/nonexistent-home-for-candidates-test")
+	t.Setenv("SUDO_USER", "")
+
+	got := configDirCandidates(true, false, false, true)
+	want := []string{"/usr/local/etc/citadel", "/nonexistent-home-for-candidates-test/.citadel-cli"}
+	assertStringSlicesEqual(t, got, want)
+}
+
+func TestConfigDirCandidates_Windows(t *testing.T) {
+	// Windows ConfigDir() is invoker-invariant, so there is exactly one
+	// candidate: whatever resolveConfigDir itself returns.
+	got := configDirCandidates(true, true, false, false)
+	if len(got) != 1 {
+		t.Fatalf("Windows candidates = %v, want exactly 1 entry", got)
+	}
+}
+
+func TestConfigDirCandidates_NoDuplicates(t *testing.T) {
+	if IsWindows() {
+		t.Skip("sudo/system paths not applicable on Windows")
+	}
+	// HOME equal to the process's real home is the common case: every source
+	// (resolveConfigDir, os.UserHomeDir, explicit $HOME) agrees, so the list
+	// must collapse to the system path plus exactly one home-derived entry.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot determine home dir")
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+
+	got := configDirCandidates(false, false, true, false)
+	seen := map[string]bool{}
+	for _, d := range got {
+		if seen[d] {
+			t.Fatalf("duplicate candidate %q in %v", d, got)
+		}
+		seen[d] = true
+	}
+	if len(got) != 2 {
+		t.Fatalf("candidates = %v, want exactly 2 deduplicated entries", got)
+	}
+}
+
+func assertStringSlicesEqual(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
 func TestDefaultNodeDir(t *testing.T) {
 	// Test with current user
 	dir, err := DefaultNodeDir("")

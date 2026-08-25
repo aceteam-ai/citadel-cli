@@ -340,3 +340,104 @@ func TestRealDefaultParams(t *testing.T) {
 		t.Fatalf("wrong PIN under real params: %v", err)
 	}
 }
+
+// TestArgonParamsValidate pins the exact conditions that would otherwise
+// reach the vendored argon2.IDKey and PANIC (Time<1, Threads<1 — see
+// golang.org/x/crypto/argon2's deriveKey), plus the two additional fields
+// (Memory, KeyLen) that don't panic the library but would silently produce a
+// degenerate/wrong-strength key if left unvalidated.
+func TestArgonParamsValidate(t *testing.T) {
+	if err := defaultArgonParams().validate(); err != nil {
+		t.Fatalf("default params rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		p    argonParams
+	}{
+		{"time zero", argonParams{Time: 0, Memory: argonMemory, Threads: argonThreads, KeyLen: argonKeyLen}},
+		{"threads zero", argonParams{Time: argonTime, Memory: argonMemory, Threads: 0, KeyLen: argonKeyLen}},
+		{"memory zero", argonParams{Time: argonTime, Memory: 0, Threads: argonThreads, KeyLen: argonKeyLen}},
+		{"keylen not a valid AES size", argonParams{Time: argonTime, Memory: argonMemory, Threads: argonThreads, KeyLen: 20}},
+		{"all zero (unmarshalled zero value)", argonParams{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := c.p.validate(); !errors.Is(err, ErrWrongPIN) {
+				t.Fatalf("validate(%+v) = %v, want ErrWrongPIN", c.p, err)
+			}
+		})
+	}
+
+	// 16 and 24 are valid AES-128/192 key sizes even though the vault only
+	// ever CREATES vaults with argonKeyLen (32, AES-256): validate() checks
+	// the real invariant (does aes.NewCipher accept this length), not
+	// equality with today's default, so an older/different vault version
+	// using a different valid AES key size is not rejected as corrupt.
+	for _, keyLen := range []uint32{16, 24, 32} {
+		p := argonParams{Time: argonTime, Memory: argonMemory, Threads: argonThreads, KeyLen: keyLen}
+		if err := p.validate(); err != nil {
+			t.Errorf("validate(KeyLen=%d) = %v, want nil (valid AES key size)", keyLen, err)
+		}
+	}
+}
+
+// TestCorruptKDFParamsReturnsErrorNotPanic is the regression test for the
+// #808 fast-follow panic: a vault.yaml whose KDF header was corrupted (e.g.
+// truncated, hand-edited, or produced by a future field-rename that
+// unmarshals into zero values) must make VerifyPIN return an error, not crash
+// the process. Before the fix, Time=0 or Threads=0 here would panic inside
+// argon2.IDKey; if this test ever panics again, `go test` reports it as a
+// failure (there is no recover — an uncaught panic IS the regression signal).
+func TestCorruptKDFParamsReturnsErrorNotPanic(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*argonParams)
+	}{
+		{"time zero", func(p *argonParams) { p.Time = 0 }},
+		{"threads zero", func(p *argonParams) { p.Threads = 0 }},
+		{"memory zero", func(p *argonParams) { p.Memory = 0 }},
+		{"keylen mismatched", func(p *argonParams) { p.KeyLen = 8 }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := newTestVault(t)
+			mustSet(t, v, "654321")
+
+			h, err := v.readHeader()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.mutate(&h.KDF)
+			if err := writeHeaderAtomic(v.headerPath(), h); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := v.VerifyPIN("654321"); !errors.Is(err, ErrWrongPIN) {
+				t.Fatalf("VerifyPIN with corrupt KDF params = %v, want ErrWrongPIN (not a panic)", err)
+			}
+		})
+	}
+}
+
+// TestStatusOnCorruptKDFDoesNotPanic covers the OTHER readHeader call site:
+// Status() must degrade to "not configured" rather than panic or report a
+// badge computed from an unsafe header.
+func TestStatusOnCorruptKDFDoesNotPanic(t *testing.T) {
+	v := newTestVault(t)
+	mustSet(t, v, "654321")
+
+	h, err := v.readHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.KDF.Time = 0
+	if err := writeHeaderAtomic(v.headerPath(), h); err != nil {
+		t.Fatal(err)
+	}
+
+	st := v.Status()
+	if st.Configured {
+		t.Fatal("Status() reported Configured=true for a vault with invalid KDF params")
+	}
+}

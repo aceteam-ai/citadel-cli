@@ -23,6 +23,7 @@ import (
 )
 
 var ackDataLossFlag bool
+var assumeNoLegacyPasscodeFlag bool
 
 var passcodeEnrollCmd = &cobra.Command{
 	Use:   "enroll",
@@ -66,6 +67,8 @@ var passcodeStatusCmd = &cobra.Command{
 func init() {
 	passcodeEnrollCmd.Flags().BoolVar(&ackDataLossFlag, "ack-data-loss", false,
 		"acknowledge that forgetting the master PIN (or losing the node pepper) permanently destroys encrypted data (required for non-interactive/piped use)")
+	passcodeEnrollCmd.Flags().BoolVar(&assumeNoLegacyPasscodeFlag, "assume-no-legacy-passcode", false,
+		"override a failed check for an existing legacy node passcode (e.g. a candidate config location could not be read) and enroll as if none was ever set; only pass this if you are certain")
 	passcodeRotateCmd.Flags().BoolVar(&ackDataLossFlag, "ack-data-loss", false,
 		"acknowledge the data-loss risk (required for non-interactive/piped use)")
 	passcodeCmd.AddCommand(passcodeEnrollCmd)
@@ -76,6 +79,21 @@ func init() {
 // errAlreadyEnrolled is returned when enroll is invoked on a node that already
 // has a master PIN and nothing left to migrate.
 var errAlreadyEnrolled = errors.New("a master PIN is already enrolled; use 'citadel passcode rotate' to change it")
+
+// errLegacyCheckInconclusive is returned when the legacy-passcode ownership
+// check could not read every plausible ConfigDir on this machine (citadel#808
+// fast-follow). platform.ConfigDir() is invoker-scoped, but the master-PIN
+// vault enroll installs is machine-convergent (network.GetNodeConfigDir()):
+// if enroll trusted an incomplete "no legacy hash found" answer, it would
+// install a brand-new master PIN WITHOUT proving the existing passcode, and
+// that PIN would immediately become the binding gate answer for every
+// process on the machine — an authorization bypass. So an ambiguous scan
+// fails closed instead of being treated as "no passcode was ever set".
+var errLegacyCheckInconclusive = errors.New(
+	"could not conclusively determine whether a legacy node passcode already exists on this machine " +
+		"(a candidate config location could not be read); refusing to enroll without proof. " +
+		"Re-run with privileges that can read it, or pass --assume-no-legacy-passcode if you are certain " +
+		"no legacy passcode was ever set on this node")
 
 // enrollPrecheck decides how to handle 'passcode enroll' given current state.
 // finishCleanup=true means a prior migration was interrupted (the vault is set
@@ -92,29 +110,121 @@ func enrollPrecheck(vaultConfigured, hasLegacyHash bool) (finishCleanup bool, er
 	return false, errAlreadyEnrolled
 }
 
-// clearLegacyPasscode deletes the legacy bcrypt PasscodeHash. Idempotent: a
-// no-op when already empty. Used both as Enroll's deleteLegacy callback and to
-// finish an interrupted migration.
-func clearLegacyPasscode() error {
-	p := config.LoadPermissions(platform.ConfigDir())
-	_ = p.SetPasscode("") // empty clears the hash; never re-hashes (guard-safe)
-	return config.SavePermissions(platform.ConfigDir(), p)
+// legacyOwnershipGate decides whether enroll may trust the legacy-passcode
+// scan at all, split out as a pure function (mirrors enrollPrecheck) so the
+// ambiguous-scan fail-closed behavior is unit-testable without touching the
+// filesystem.
+//
+// Inconclusive blocks REGARDLESS of Found. It is tempting to only refuse when
+// nothing was found (a found hash "already" requires legacyVerify to pass) —
+// but that reopens the exact bypass this check exists to close: an invoker
+// who can write to even ONE readable candidate directory (e.g. their own
+// ~/.citadel-cli) can plant a hash of a PIN they know, which makes
+// Found()==true, while the REAL hash sits in a candidate they cannot read
+// (Inconclusive==true). If Inconclusive were only checked when nothing was
+// found, that planted hash would sail through as "the" legacy proof. So an
+// incomplete scan is never trustworthy, whether or not it also turned up a
+// hash — only a scan that read every candidate cleanly may be trusted, and
+// only the operator's explicit override may stand in for that.
+func legacyOwnershipGate(legacy config.LegacyPasscodeSearchResult, assumeNoLegacy bool) error {
+	if legacy.Inconclusive && !assumeNoLegacy {
+		return errLegacyCheckInconclusive
+	}
+	return nil
+}
+
+// legacyClearDirs returns the set of directories clearLegacyPasscodeAt should
+// clear: every directory FindLegacyPasscode actually found a hash in, plus
+// the current invocation's own platform.ConfigDir() (preserving the
+// pre-#808-fix behavior of always touching it, so permissions.yaml keeps
+// materializing there even on a fresh node with nothing to clear).
+func legacyClearDirs(legacy config.LegacyPasscodeSearchResult) []string {
+	dirs := append([]string{platform.ConfigDir()}, legacy.Dirs...)
+	seen := make(map[string]bool, len(dirs))
+	out := dirs[:0]
+	for _, d := range dirs {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
+}
+
+// clearLegacyPasscodeAt deletes the legacy bcrypt PasscodeHash from every
+// directory in dirs. Idempotent per-directory (SetPasscode("") on an already
+// empty hash is a no-op), so it is safe to call on a superset of dirs that
+// actually have a hash, and safe for Enroll to re-run to finish an
+// interrupted migration. It keeps going past a single directory's failure —
+// one unwritable candidate (e.g. a system path this invocation can't write)
+// must not block clearing the others — and joins every failure into the
+// returned error so none is silently swallowed.
+func clearLegacyPasscodeAt(dirs []string) error {
+	var errs []error
+	for _, dir := range dirs {
+		p := config.LoadPermissions(dir)
+		_ = p.SetPasscode("") // empty clears the hash; never re-hashes (guard-safe)
+		if err := config.SavePermissions(dir, p); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", dir, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// legacyWrongPINMessage explains an Enroll ErrWrongPIN in terms the operator
+// can act on. Verify's AND semantics (see LegacyPasscodeSearchResult.Verify)
+// mean this can trigger for a reason OTHER than a typo: if legacy hashes were
+// found in more than one directory (nothing in this codebase keeps
+// permissions.yaml in sync across invocation contexts — see "ConfigDir() is
+// invoker-scoped" in CLAUDE.md), and they are for DIFFERENT PINs, no single
+// PIN can ever satisfy all of them, and the plain "incorrect" message would
+// be a dead end. Naming the directories turns that into a fixable state: the
+// operator can inspect/remove the stale permissions.yaml files by hand.
+func legacyWrongPINMessage(legacy config.LegacyPasscodeSearchResult) string {
+	if len(legacy.Dirs) <= 1 {
+		return "current node passcode is incorrect"
+	}
+	return fmt.Sprintf(
+		"current node passcode is incorrect, OR a different legacy passcode hash was found in each of: %s "+
+			"(nothing keeps permissions.yaml in sync across invocation contexts — see CLAUDE.md 'ConfigDir() is "+
+			"invoker-scoped'). If these are stale copies from an old context, remove the wrong permissions.yaml "+
+			"by hand and re-run enroll.",
+		strings.Join(legacy.Dirs, ", "))
 }
 
 func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 	v := masterVault()
-	perms := config.LoadPermissions(platform.ConfigDir())
-	// Check the RAW legacy hash, not the vault-aware HasPasscode() (which reports
-	// true once a master PIN is enrolled and would loop the cleanup forever).
-	hasLegacyHash := perms.PasscodeHash != ""
+
+	// The legacy passcode is invoker-scoped (platform.ConfigDir() resolves
+	// differently per invocation context — see CLAUDE.md "ConfigDir() is
+	// invoker-scoped" / citadel#696), but the master-PIN vault this command
+	// installs is machine-convergent (network.GetNodeConfigDir()). Scanning
+	// only the current invocation's ConfigDir() could miss a legacy passcode
+	// set under a different context (e.g. a systemd-root 'citadel work'
+	// applying APPLY_DEVICE_CONFIG), letting enroll skip the ownership proof
+	// entirely (citadel#808 fast-follow). So check every plausible ConfigDir.
+	candidates := platform.ConfigDirCandidates()
+	legacy := config.FindLegacyPasscode(candidates)
+	hasLegacyHash := legacy.Found()
+
 	if finishCleanup, err := enrollPrecheck(v.IsConfigured(), hasLegacyHash); err != nil {
 		return err
 	} else if finishCleanup {
-		if err := clearLegacyPasscode(); err != nil {
+		if err := clearLegacyPasscodeAt(legacyClearDirs(legacy)); err != nil {
 			return fmt.Errorf("finish interrupted migration (delete legacy passcode): %w", err)
 		}
 		fmt.Println("Master PIN already enrolled; cleaned up the leftover legacy passcode from an interrupted migration.")
 		return nil
+	}
+
+	// About to enroll fresh: if the scan could not read every candidate, the
+	// result — found or not — is not trustworthy proof of what legacy
+	// passcodes actually exist on this machine. Refuse rather than risk
+	// installing an unauthenticated master PIN or accepting a hash an
+	// unprivileged invoker could have planted themselves.
+	if err := legacyOwnershipGate(legacy, assumeNoLegacyPasscodeFlag); err != nil {
+		return err
 	}
 
 	isTTY := term.IsTerminal(int(os.Stdin.Fd()))
@@ -125,8 +235,7 @@ func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 
 	policy := nodevault.LoadPolicy(network.GetNodeConfigDir())
 
-	// Prove ownership against the legacy passcode when one is set. The vault is
-	// not configured yet, so VerifyPasscode still runs the legacy bcrypt path.
+	// Prove ownership against the legacy passcode when one is set.
 	var legacyVerify func(string) bool
 	var legacyPIN string
 	if hasLegacyHash {
@@ -135,7 +244,7 @@ func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		legacyVerify = perms.VerifyPasscode
+		legacyVerify = legacy.Verify
 	}
 
 	newPIN, err := readSecretConfirmed("New master PIN: ", "Confirm master PIN: ", isTTY)
@@ -143,9 +252,10 @@ func runPasscodeEnroll(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := v.Enroll(legacyPIN, newPIN, policy, true, legacyVerify, clearLegacyPasscode); err != nil {
+	deleteLegacy := func() error { return clearLegacyPasscodeAt(legacyClearDirs(legacy)) }
+	if err := v.Enroll(legacyPIN, newPIN, policy, true, legacyVerify, deleteLegacy); err != nil {
 		if errors.Is(err, nodevault.ErrWrongPIN) {
-			return fmt.Errorf("current node passcode is incorrect")
+			return errors.New(legacyWrongPINMessage(legacy))
 		}
 		return fmt.Errorf("enroll master PIN: %w", err)
 	}
