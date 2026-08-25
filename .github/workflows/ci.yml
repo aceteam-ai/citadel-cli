@@ -149,9 +149,13 @@ jobs:
   # optional HF_TOKEN secret that this repo does not currently define, and why
   # the tier-2 probes only ever SKIP -- never fail -- on a network/HF problem).
   #
-  # Path-filtered like build-diffusers-service.yml (same "don't tax unrelated
-  # PRs" reasoning that workflow already documents) -- this job only does real
-  # work when the sidecar source or this workflow file changes.
+  # Path-filtered so it only does real work when the sidecar source or this
+  # workflow file changes -- same "don't tax unrelated PRs" reasoning
+  # build-diffusers-service.yml documents, but a different mechanism: that
+  # workflow uses a workflow-level `on.push.paths` filter and doesn't trigger
+  # on pull_request at all, whereas ci.yml runs on every PR/push and this job
+  # instead uses a step-level `dorny/paths-filter` (below) to skip its own
+  # steps when nothing under services/diffusers-service/** changed.
   diffusers-tokenizer-smoke:
     name: Diffusers sidecar tokenizer smoke test
     runs-on: ubuntu-latest
