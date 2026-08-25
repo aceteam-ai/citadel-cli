@@ -1343,21 +1343,26 @@ func TestRunnerServiceStartLogsWarningWhenTerminalErrorPublishFails(t *testing.T
 }
 
 // TestRunnerNoGPUSlotsNacksWithoutHandlerExecution pins the CURRENT (deliberately
-// unchanged) behavior of the GPU-slot-exhaustion path: the job is Nacked for
-// redelivery without running the handler. This Nack redelivers the same job
-// ID, so a caller streaming this attempt would need to already treat a Nack
-// as non-terminal -- unlike a genuine terminal outcome (success/failure),
-// there is no terminal-event contract for a will-be-retried attempt. See the
-// PR for citadel-cli#559 for why a terminal-event publish was deliberately
-// NOT added here (it risks turning a transparent retry into a reported
-// failure if the backend treats any published error as final).
+// unchanged) behavior of the GPU-slot-exhaustion path FOR A GENUINELY GPU-BOUND
+// JOB TYPE: the job is Nacked for redelivery without running the handler. This
+// Nack redelivers the same job ID, so a caller streaming this attempt would need
+// to already treat a Nack as non-terminal -- unlike a genuine terminal outcome
+// (success/failure), there is no terminal-event contract for a will-be-retried
+// attempt. See the PR for citadel-cli#559 for why a terminal-event publish was
+// deliberately NOT added here (it risks turning a transparent retry into a
+// reported failure if the backend treats any published error as final).
+//
+// Uses JobTypeLLMInference (a real GPU-bound type per gpuBoundJobTypes) rather
+// than an arbitrary "TEST_JOB" -- citadel-cli#825 scoped the GPU-slot gate to
+// GPU-bound job types only, so a made-up type would no longer exercise this
+// path at all. See TestRunnerNonGPUJobSkipsGPUSlotGate for the non-GPU case.
 func TestRunnerNoGPUSlotsNacksWithoutHandlerExecution(t *testing.T) {
 	jobs := []*Job{
-		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+		{ID: "job-1", Type: JobTypeLLMInference, Payload: map[string]any{}},
 	}
 
 	source := NewMockJobSource("test", jobs)
-	handler := NewMockJobHandler("TEST_JOB", false)
+	handler := NewMockJobHandler(JobTypeLLMInference, false)
 	config := RunnerConfig{
 		WorkerID:   "test-worker",
 		GPUTracker: NewGPUTracker(0), // zero slots: every Acquire() fails
@@ -1371,6 +1376,98 @@ func TestRunnerNoGPUSlotsNacksWithoutHandlerExecution(t *testing.T) {
 
 	if len(handler.ExecutedJobs()) != 0 {
 		t.Errorf("handler should not run when no GPU slot is available, got %d executions", len(handler.ExecutedJobs()))
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerNonGPUJobSkipsGPUSlotGate is the regression test for citadel-cli#825.
+// It models the ACTUAL production scenario the issue describes: 1 GPU, but
+// MaxConcurrency raised above the GPU count (2), and the sole GPU slot already
+// held by an in-flight inference job (simulated by pre-acquiring it, rather than
+// racing a real concurrent job -- this pins the "more in-flight than GPU slots"
+// state directly instead of depending on goroutine scheduling). Under exactly
+// that contention, a non-GPU-bound job like SERVICE_START must NOT be routed
+// through the GPU-slot acquire/Nack path at all. Before the fix, this Nacked
+// with zero published terminal events -- a SERVICE_START would vanish from the
+// backend's stream:v1:{jobId} waiter with no success, failure, or even a retry
+// signal it could distinguish from a dead node. See
+// TestRunnerGPUJobStillNacksUnderRealContention for proof the genuine GPU path
+// is unchanged under the identical setup.
+func TestRunnerNonGPUJobSkipsGPUSlotGate(t *testing.T) {
+	tracker := NewGPUTracker(1) // 1 GPU
+	if _, ok := tracker.Acquire(); !ok {
+		t.Fatal("precondition: expected to acquire the tracker's only slot")
+	} // now held by a simulated in-flight inference job, mirroring MaxConcurrency > GPU count
+
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false)
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 2, // > GPU count (1) -- the exact operator config #825 describes
+		GPUTracker:     tracker,
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 1 {
+		t.Errorf("handler should run despite the GPU slot being held (non-GPU job type), got %d executions", len(handler.ExecutedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0 -- a non-GPU job must never be Nacked by GPU-slot contention", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+	if !stream.ended {
+		t.Error("expected a terminal WriteEnd for the successful non-GPU job")
+	}
+}
+
+// TestRunnerGPUJobStillNacksUnderRealContention proves #825's fix did not
+// regress the genuine GPU-bound path: under the identical contention setup as
+// TestRunnerNonGPUJobSkipsGPUSlotGate (1 GPU slot, already held, MaxConcurrency
+// raised above the GPU count), a real inference job (JobTypeLLMInference) still
+// hits the GPU-slot gate and is Nacked without running the handler -- exactly
+// the pre-#825 behavior, just now scoped to job types that actually need it.
+func TestRunnerGPUJobStillNacksUnderRealContention(t *testing.T) {
+	tracker := NewGPUTracker(1)
+	if _, ok := tracker.Acquire(); !ok {
+		t.Fatal("precondition: expected to acquire the tracker's only slot")
+	}
+
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeLLMInference, Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeLLMInference, false)
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 2,
+		GPUTracker:     tracker,
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("handler should not run when the sole GPU slot is already held, got %d executions", len(handler.ExecutedJobs()))
 	}
 	if len(source.NackedJobs()) != 1 {
 		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
