@@ -2,6 +2,9 @@
 package terminal
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -518,5 +521,101 @@ func TestCachingTokenValidatorOrgIsolation(t *testing.T) {
 	_, err := validator.ValidateToken("org-a-token", "org-B")
 	if err != ErrInvalidToken && err != ErrUnauthorized {
 		t.Errorf("expected ErrInvalidToken or ErrUnauthorized for cross-org access, got %v", err)
+	}
+}
+
+// TestTokenHashEntryMalformedPreviousHashExpiresAtDoesNotRejectEntry pins the
+// #815 fix directly against TokenHashEntry.UnmarshalJSON: a malformed
+// previous_hash_expires_at (non-RFC3339 string) must not error the entry -
+// it must degrade to "no grace window" (PreviousHashExpiresAt left zero)
+// while the current-hash fields still decode normally.
+func TestTokenHashEntryMalformedPreviousHashExpiresAtDoesNotRejectEntry(t *testing.T) {
+	raw := []byte(`{
+		"hash": "abc123",
+		"user_id": "user-1",
+		"org_id": "org-1",
+		"expires_at": "2026-01-01T00:00:00Z",
+		"previous_hash": "def456",
+		"previous_hash_expires_at": "not-a-timestamp"
+	}`)
+
+	var entry TokenHashEntry
+	if err := entry.UnmarshalJSON(raw); err != nil {
+		t.Fatalf("expected malformed previous_hash_expires_at to be tolerated, got error: %v", err)
+	}
+
+	if entry.Hash != "abc123" || entry.UserID != "user-1" || entry.OrgID != "org-1" {
+		t.Errorf("expected current-hash fields to parse normally, got %+v", entry)
+	}
+	if !entry.ExpiresAt.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("expected expires_at to parse normally, got %v", entry.ExpiresAt)
+	}
+	if entry.PreviousHash != "def456" {
+		t.Errorf("expected previous_hash to still be captured, got %q", entry.PreviousHash)
+	}
+	if !entry.PreviousHashExpiresAt.IsZero() {
+		t.Errorf("expected malformed previous_hash_expires_at to degrade to zero (no grace window), got %v", entry.PreviousHashExpiresAt)
+	}
+}
+
+// TestCachingTokenValidatorMalformedPreviousHashExpiresAtColdStart is the
+// full end-to-end regression for #815: on a COLD START (no prior cache), a
+// token-list response containing one entry with a malformed
+// previous_hash_expires_at must still populate the cache with EVERY valid
+// current-hash entry - including the malformed one's own current hash - not
+// leave the cache empty and reject every connection.
+func TestCachingTokenValidatorMalformedPreviousHashExpiresAtColdStart(t *testing.T) {
+	goodToken := "good-token-only"
+	badGraceToken := "token-with-bad-grace"
+	previousOfBadGrace := "previous-of-bad-grace-token"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"tokens": [
+				{
+					"hash": %q,
+					"user_id": "user-good",
+					"org_id": "org-1",
+					"expires_at": "2099-01-01T00:00:00Z"
+				},
+				{
+					"hash": %q,
+					"user_id": "user-bad-grace",
+					"org_id": "org-1",
+					"expires_at": "2099-01-01T00:00:00Z",
+					"previous_hash": %q,
+					"previous_hash_expires_at": "not-a-timestamp"
+				}
+			]
+		}`, hashToken(goodToken), hashToken(badGraceToken), hashToken(previousOfBadGrace))
+	}))
+	defer server.Close()
+
+	validator := NewCachingTokenValidator(server.URL, "org-1", "", time.Hour)
+	if err := validator.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer validator.Stop()
+
+	if validator.CacheSize() != 2 {
+		t.Fatalf("expected cold-start decode to keep both current-hash entries despite the malformed grace field, got cache size %d", validator.CacheSize())
+	}
+
+	if _, err := validator.ValidateToken(goodToken, "org-1"); err != nil {
+		t.Errorf("expected the entry unaffected by the malformed field to validate, got %v", err)
+	}
+	if _, err := validator.ValidateToken(badGraceToken, "org-1"); err != nil {
+		t.Errorf("expected the current hash of the entry WITH the malformed grace field to still validate, got %v", err)
+	}
+
+	// The grace window itself must not be honored - it was malformed, so it
+	// degrades to "no grace window" rather than being silently accepted.
+	if _, err := validator.ValidateToken(previousOfBadGrace, "org-1"); err != ErrInvalidToken {
+		t.Errorf("expected the previous-hash to be rejected (malformed grace never grants a window), got %v", err)
+	}
+
+	if len(validator.previousCache) != 0 {
+		t.Errorf("expected previousCache to stay empty when the only grace field present was malformed, got %d entries", len(validator.previousCache))
 	}
 }
