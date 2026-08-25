@@ -2722,6 +2722,14 @@ func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 // status.SwapActivity payload (citadel-cli#717). Extracted like
 // workerLivenessFrom above so the hand-maintained field-by-field mapping
 // between the two independently-evolving structs is testable on its own.
+//
+// Recent is mirrored in full (bounded by swap_ledger.go's swapRecordsKept=64
+// and pruned to the trailing rate window), matching worker.SwapStats' own
+// doc comment: the counters ARE the #717 ask, but the records exist so a "why
+// is this node slow" question has an answer instead of a number, and that
+// reasoning applies just as much on the heartbeat as it does to the
+// ObserveSwap log line. Only a node with heavy swap churn pays for a larger
+// payload -- the same condition an operator most wants the detail for.
 func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
 	activity := &status.SwapActivity{
 		SwapsPerHour:         stats.SwapsPerHour,
@@ -2732,9 +2740,15 @@ func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
 		activity.Recent = make([]status.SwapRecord, len(stats.Recent))
 		for i, r := range stats.Recent {
 			activity.Recent[i] = status.SwapRecord{
-				Backend:   r.Backend,
-				Model:     r.Model,
-				Evicted:   r.Evicted,
+				Backend: r.Backend,
+				Model:   r.Model,
+				// Copied rather than aliased: r.Evicted is already an
+				// independent slice by the time it reaches here (swap.go's
+				// swapRecord builds it via append([]string(nil), ...)), so
+				// this is redundant today, not required for correctness --
+				// but it removes any future dependence on that internal
+				// invariant holding.
+				Evicted:   append([]string(nil), r.Evicted...),
 				StartedAt: r.StartedAt,
 				Wait:      r.Wait,
 				Outcome:   r.Outcome,

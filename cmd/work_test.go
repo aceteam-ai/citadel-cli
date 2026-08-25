@@ -280,6 +280,14 @@ func TestSwapStatsFrom(t *testing.T) {
 		t.Errorf("Wait = %v, want 90s", rec.Wait)
 	}
 
+	// Evicted must be an independent copy, not an alias of the source slice:
+	// mutating the caller's stats after conversion must not reach back into the
+	// already-returned heartbeat payload.
+	stats.Recent[0].Evicted[0] = "mutated"
+	if got.Recent[0].Evicted[0] != "vllm" {
+		t.Errorf("Evicted aliases the source slice: got %v after mutating the source, want unaffected [vllm]", got.Recent[0].Evicted)
+	}
+
 	// Empty stats (no swaps yet) must not panic and must yield a non-nil struct
 	// with a nil Recent slice, matching the omitempty JSON contract.
 	empty := swapStatsFrom(worker.SwapStats{MaxEvictingPerHour: 6})
