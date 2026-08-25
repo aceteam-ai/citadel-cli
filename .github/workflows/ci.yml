@@ -72,6 +72,14 @@ jobs:
       - name: go test
         run: go test ./...
 
+      # -race gate for internal/jobs only (not repo-wide: -race is slow and
+      # other packages haven't been swept for races yet). This package hit a
+      # real intra-test race (#810) that a plain `go test` never caught, so it
+      # earns its own scoped, always-on race run rather than a one-off local
+      # check.
+      - name: go test -race (internal/jobs)
+        run: go test -race ./internal/jobs/...
+
   # Cross-compile smoke for every release target. Catches a target that builds
   # locally but breaks on a GOOS/GOARCH the host can't run, so a release tag can
   # never fail at build.sh time after the tag is cut. -o /dev/null: we only need
