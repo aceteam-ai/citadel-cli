@@ -1,0 +1,164 @@
+package jobs
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
+
+// TestHFDownloadArgsFilteredBackwardCompat pins that absent patterns produce
+// byte-identical argv to the pre-#828 hfDownloadArgs -- the whole point of
+// "optional and inert when absent".
+func TestHFDownloadArgsFilteredBackwardCompat(t *testing.T) {
+	got := hfDownloadArgsFiltered("meta-llama/Llama-2-7b-chat-hf", "", "", nil, nil)
+	want := hfDownloadArgs("meta-llama/Llama-2-7b-chat-hf", "", "")
+	if !equalStrs(got, want) {
+		t.Errorf("hfDownloadArgsFiltered(no patterns) = %v, want %v (identical to hfDownloadArgs)", got, want)
+	}
+}
+
+// TestHFDownloadArgsFilteredThreadsPatterns asserts the exact argv shape a
+// caller-supplied allow/ignore list produces: repeated --include/--exclude
+// flags, one per pattern, matching both `hf` and `huggingface-cli`'s grammar.
+func TestHFDownloadArgsFilteredThreadsPatterns(t *testing.T) {
+	got := hfDownloadArgsFiltered(
+		"Lightricks/LTX-Video", "", "",
+		[]string{"transformer/*", "vae/*"},
+		[]string{"*.bin"},
+	)
+	want := []string{
+		"download", "Lightricks/LTX-Video",
+		"--include", "transformer/*",
+		"--include", "vae/*",
+		"--exclude", "*.bin",
+	}
+	if !equalStrs(got, want) {
+		t.Errorf("hfDownloadArgsFiltered(patterns) = %v, want %v", got, want)
+	}
+}
+
+func TestBuildHuggingFaceDownloadCommandFiltered(t *testing.T) {
+	cmd := BuildHuggingFaceDownloadCommandFiltered("hf", "Lightricks/LTX-Video",
+		[]string{"transformer/*", "vae/*", "text_encoder/*", "tokenizer/*", "scheduler/*"}, nil)
+	args := cmd.Args
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--include transformer/*", "--include vae/*"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("argv %v missing %q", args, want)
+		}
+	}
+
+	// No patterns must produce the exact same command as the unfiltered builder.
+	unfiltered := BuildHuggingFaceDownloadCommand("hf", "meta-llama/Llama-2-7b-chat-hf")
+	filtered := BuildHuggingFaceDownloadCommandFiltered("hf", "meta-llama/Llama-2-7b-chat-hf", nil, nil)
+	if !equalStrs(unfiltered.Args, filtered.Args) {
+		t.Errorf("BuildHuggingFaceDownloadCommandFiltered(no patterns) = %v, want %v", filtered.Args, unfiltered.Args)
+	}
+}
+
+// TestRunDiskPreflightInjected exercises the glue function with the
+// free-space and size-estimate funcs both injected (per the issue's testing
+// guidance), so it needs no real disk or network access.
+func TestRunDiskPreflightInjected(t *testing.T) {
+	origTree, origDisk := hfRepoTreeFn, availableDiskBytesFn
+	t.Cleanup(func() { hfRepoTreeFn, availableDiskBytesFn = origTree, origDisk })
+
+	jc := JobContext{}
+
+	t.Run("blocks and downloads nothing when the estimate exceeds free space", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "huge.safetensors", Size: 161 << 30},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 50 << 30, nil // only 50GiB free
+		}
+
+		allow, ignore, err := runDiskPreflight(jc, "Lightricks/LTX-Video", nil, nil, diskSafetyMarginBytes)
+		if err == nil {
+			t.Fatal("expected a blocking error when the estimate exceeds free space")
+		}
+		if allow != nil || ignore != nil {
+			t.Errorf("expected nil patterns on block, got allow=%v ignore=%v", allow, ignore)
+		}
+		if !strings.Contains(err.Error(), "insufficient disk space") {
+			t.Errorf("error = %v, want an 'insufficient disk space' message", err)
+		}
+	})
+
+	t.Run("proceeds when the estimate fits", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "model.safetensors", Size: 5 << 30},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 500 << 30, nil
+		}
+
+		_, _, err := runDiskPreflight(jc, "some/small-model", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected no error when the estimate fits, got %v", err)
+		}
+	})
+
+	t.Run("fails open (proceeds, no error) when the metadata fetch errors", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return nil, errors.New("connection reset")
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			t.Error("availableDiskBytesFn must not be called when the metadata fetch already failed")
+			return 0, nil
+		}
+
+		allow, ignore, err := runDiskPreflight(jc, "some/model", []string{"a/*"}, []string{"b/*"}, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected fail-open (nil error) on metadata fetch failure, got %v", err)
+		}
+		// Caller's original patterns must survive unchanged.
+		if !equalStrs(allow, []string{"a/*"}) || !equalStrs(ignore, []string{"b/*"}) {
+			t.Errorf("expected caller patterns to pass through unchanged, got allow=%v ignore=%v", allow, ignore)
+		}
+	})
+
+	t.Run("fails open (proceeds, no error) when the disk-free read errors", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{{Type: "file", Path: "model.safetensors", Size: 5 << 30}}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 0, errors.New("statfs not supported")
+		}
+
+		_, _, err := runDiskPreflight(jc, "some/model", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected fail-open (nil error) on disk-free read failure, got %v", err)
+		}
+	})
+
+	t.Run("auto-selects diffusers subfolders when caller supplied no patterns (#828 part 3)", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "ltx-video-a.safetensors", Size: 80 << 30},
+				{Type: "file", Path: "ltx-video-b.safetensors", Size: 80 << 30},
+				{Type: "file", Path: "transformer/model.safetensors", Size: 10 << 30},
+				{Type: "file", Path: "vae/model.safetensors", Size: 2 << 30},
+				{Type: "file", Path: "text_encoder/model.safetensors", Size: 5 << 30},
+				{Type: "file", Path: "tokenizer/vocab.json", Size: 1 << 20},
+				{Type: "file", Path: "scheduler/scheduler_config.json", Size: 1 << 10},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 100 << 30, nil // enough for the filtered ~17GB, not the full ~160GB
+		}
+
+		allow, _, err := runDiskPreflight(jc, "Lightricks/LTX-Video", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected the diffusers-filtered pull to fit and proceed, got error: %v", err)
+		}
+		if allow == nil {
+			t.Fatal("expected auto-derived allow patterns, got nil")
+		}
+	})
+}

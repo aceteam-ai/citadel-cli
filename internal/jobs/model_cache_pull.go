@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,7 +119,7 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 	case "ollama":
 		return h.pullOllama(ctx, job.ID, modelName)
 	case "vllm", "llamacpp":
-		return h.pullHuggingFace(ctx, job.ID, modelName, engine)
+		return h.pullHuggingFace(ctx, job.ID, modelName, engine, job.Payload)
 	case "bonsai":
 		return h.pullBonsai(ctx, job.ID)
 	default:
@@ -218,12 +219,30 @@ func BuildBonsaiDownloadCommand(bin, localDir string) *exec.Cmd {
 // differs. A non-empty file pulls that single file; an empty file pulls the repo.
 // A non-empty localDir materializes into a predictable path (vs the hub cache).
 func hfDownloadArgs(repo, file, localDir string) []string {
+	return hfDownloadArgsFiltered(repo, file, localDir, nil, nil)
+}
+
+// hfDownloadArgsFiltered extends hfDownloadArgs with `--include`/`--exclude`
+// glob flags for allow_patterns/ignore_patterns (citadel #828). Both the
+// modern `hf` and the deprecated `huggingface-cli` accept repeated
+// `--include`/`--exclude` flags mapping directly to `snapshot_download`'s
+// `allow_patterns`/`ignore_patterns`. Nil/empty slices add no flags, so this
+// is a strict superset of hfDownloadArgs's output — existing callers
+// (BuildBonsaiDownloadCommand, and BuildHuggingFaceDownloadCommand's
+// no-patterns case) are byte-for-byte unchanged.
+func hfDownloadArgsFiltered(repo, file, localDir string, allowPatterns, ignorePatterns []string) []string {
 	args := []string{"download", repo}
 	if file != "" {
 		args = append(args, file)
 	}
 	if localDir != "" {
 		args = append(args, "--local-dir", localDir)
+	}
+	for _, p := range allowPatterns {
+		args = append(args, "--include", p)
+	}
+	for _, p := range ignorePatterns {
+		args = append(args, "--exclude", p)
 	}
 	return args
 }
@@ -363,14 +382,34 @@ func parseHumanSize(numStr, unit string) int64 {
 // pullHuggingFace runs `hf download <model>` (falling back to the deprecated
 // `huggingface-cli download <model>`) for vllm/llamacpp engines. The repo lands
 // in the HF hub cache (no --local-dir).
-func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName, engine string) ([]byte, error) {
+//
+// Two additive, backward-compatible protections were added for citadel #828
+// (a snapshot pull of Lightricks/LTX-Video grabbed ~161GB and filled a node's
+// disk): the payload's optional allow_patterns/ignore_patterns are threaded
+// into the download argv (model_cache_pull_patterns.go), and a free-disk
+// preflight runs first (disk_space.go) using a size estimate from the repo's
+// own file metadata (hf_repo_size.go). Both steps are best-effort with
+// respect to metadata/network availability -- see runDiskPreflight's doc
+// comment for why a failure to ESTIMATE fails open while a CONFIRMED
+// shortfall fails closed.
+func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName, engine string, payload map[string]string) ([]byte, error) {
 	bin, err := resolveHFDownloader()
 	if err != nil {
 		return nil, err
 	}
+
+	allowPatterns, ignorePatterns := parseModelCachePullPatterns(payload)
+	marginBytes := parseMinFreeBytes(payload, diskSafetyMarginBytes)
+
+	finalAllow, finalIgnore, blockErr := runDiskPreflight(ctx, modelName, allowPatterns, ignorePatterns, marginBytes)
+	if blockErr != nil {
+		ctx.Log("error", "     - [Job %s] MODEL_CACHE_PULL blocked for '%s': %v", jobID, modelName, blockErr)
+		return nil, blockErr
+	}
+
 	ctx.Log("info", "     - [Job %s] Pulling model '%s' via %s for %s", jobID, modelName, bin, engine)
 
-	cmd := BuildHuggingFaceDownloadCommand(bin, modelName)
+	cmd := BuildHuggingFaceDownloadCommandFiltered(bin, modelName, finalAllow, finalIgnore)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return output, fmt.Errorf("hf download failed: %w", err)
@@ -391,6 +430,95 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 		Engine:    engine,
 	}
 	return json.Marshal(result)
+}
+
+// parseMinFreeBytes reads the optional `min_free_bytes` payload field
+// (citadel #828's configurable safety margin), falling back to def when
+// absent, empty, or unparsable.
+func parseMinFreeBytes(payload map[string]string, def int64) int64 {
+	raw := strings.TrimSpace(payload["min_free_bytes"])
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return def
+	}
+	return v
+}
+
+// runDiskPreflight is the glue between the pure decision (planDiskPreflight)
+// and this handler's I/O (HF metadata fetch, disk-free read, logging). It
+// returns the patterns pullHuggingFace should actually download with:
+//   - the caller's own allowPatterns/ignorePatterns, unchanged, in the common
+//     case (metadata fetch unavailable, or the pull fits as requested);
+//   - deriveDiffusersAllowPatterns's auto-selected subset when the caller
+//     supplied NO patterns AND the repo's shape matches (#828 part 3 -- this
+//     is what makes the LTX-Video acceptance case pass with no backend
+//     change, since the platform does not send allow_patterns yet);
+//   - a non-nil err ONLY when the preflight found a CONFIRMED shortfall; the
+//     caller must abort the pull entirely on a non-nil err (patterns are
+//     meaningless at that point -- nothing should download).
+//
+// Deliberately fails OPEN (logs a warning, proceeds with the pull unchanged
+// from pre-#828 behavior, err==nil) when the HF metadata fetch or the
+// disk-free read itself errors -- a transient HF API hiccup or an
+// unsupported statfs platform must not turn a previously-working pull into a
+// new failure mode. It fails CLOSED (non-nil err, nothing downloaded) only on
+// a positive, confirmed required-bytes-exceeds-available-bytes result, which
+// is #828's actual ask.
+func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePatterns []string, marginBytes int64) (finalAllow, finalIgnore []string, err error) {
+	reqCtx, cancel := context.WithTimeout(ctx.Context(), hfMetadataTimeout)
+	defer cancel()
+
+	entries, treeErr := hfRepoTreeFn(reqCtx, modelName)
+	if treeErr != nil {
+		ctx.Log("warn", "     - [Job] disk-space preflight skipped for '%s' (could not fetch repo metadata: %v)", modelName, treeErr)
+		return allowPatterns, ignorePatterns, nil
+	}
+
+	finalAllow, finalIgnore = allowPatterns, ignorePatterns
+	if len(allowPatterns) == 0 && len(ignorePatterns) == 0 {
+		if derived := deriveDiffusersAllowPatterns(entries); derived != nil {
+			finalAllow = derived
+			ctx.Log("info", "     - [Job] auto-selected diffusers subfolders for '%s' (multi-checkpoint repo layout detected): %s", modelName, strings.Join(derived, ", "))
+		}
+	}
+
+	requiredBytes := sumFilteredSize(entries, finalAllow, finalIgnore)
+	if requiredBytes <= 0 {
+		// No sizeable files matched (or the tree response carried no sizes) --
+		// nothing to gate on.
+		return finalAllow, finalIgnore, nil
+	}
+
+	dir := nearestExistingDir(hfCacheBaseDir())
+	available, availErr := availableDiskBytesFn(dir)
+	if availErr != nil {
+		ctx.Log("warn", "     - [Job] disk-space preflight skipped for '%s' (could not read free space at %s: %v)", modelName, dir, availErr)
+		return finalAllow, finalIgnore, nil
+	}
+
+	if planErr := planDiskPreflight(dir, requiredBytes, int64(available), marginBytes); planErr != nil {
+		return nil, nil, planErr
+	}
+	return finalAllow, finalIgnore, nil
+}
+
+// hfCacheBaseDir returns the root HuggingFace cache directory (HF_HOME, or
+// ~/.cache/huggingface) that a repo pull lands in, used by the disk
+// preflight's free-space check. Falls back to "." (rather than hfCacheDir's
+// "" on UserHomeDir failure) because nearestExistingDir needs a concrete path
+// to walk up from, not a signal to skip the check outright.
+func hfCacheBaseDir() string {
+	if base := os.Getenv("HF_HOME"); base != "" {
+		return base
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return filepath.Join(home, ".cache", "huggingface")
 }
 
 // hfCacheModelSize walks the HuggingFace cache directory for the model and
@@ -444,5 +572,14 @@ func BuildOllamaPullCommand(modelName string) *exec.Cmd {
 // repo via the given HuggingFace CLI binary (bin, resolved via
 // resolveHFDownloader). Exported for testing command construction.
 func BuildHuggingFaceDownloadCommand(bin, modelName string) *exec.Cmd {
-	return exec.Command(bin, hfDownloadArgs(modelName, "", "")...)
+	return BuildHuggingFaceDownloadCommandFiltered(bin, modelName, nil, nil)
+}
+
+// BuildHuggingFaceDownloadCommandFiltered is BuildHuggingFaceDownloadCommand
+// plus allow_patterns/ignore_patterns (citadel #828), so a diffusers-style
+// multi-checkpoint repo (e.g. LTX-Video) can pull only the subfolders a
+// deploy actually needs instead of every sibling checkpoint. Nil/empty
+// patterns produce the identical command BuildHuggingFaceDownloadCommand does.
+func BuildHuggingFaceDownloadCommandFiltered(bin, modelName string, allowPatterns, ignorePatterns []string) *exec.Cmd {
+	return exec.Command(bin, hfDownloadArgsFiltered(modelName, "", "", allowPatterns, ignorePatterns)...)
 }
