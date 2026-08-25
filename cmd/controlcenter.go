@@ -1335,25 +1335,57 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 // mergeDetectedEngines combines the manifest-derived managed service rows
 // with engines status.DiscoverLocalEngines found running on this node
 // (citadel #657). A discovered engine already represented by a managed row —
-// matched by name, case-insensitively — is skipped, so a citadel-managed
-// engine is never double-listed; managedProbeEngines' names
-// (vllm/ollama/llamacpp/bonsai/unlimited-ocr) are exactly the citadel.yaml
-// service names for the embedded engines, so this is a reliable de-dupe key.
-// Every remaining discovered engine is appended as an unmanaged row
-// (Managed=false, Status="running") carrying the model(s) it is currently
-// serving, so the console shows it distinctly instead of it being invisible.
+// matched by name, case-insensitively — is never double-listed;
+// managedProbeEngines' names (vllm/ollama/llamacpp/bonsai/unlimited-ocr) are
+// exactly the citadel.yaml service names for the embedded engines, so name is
+// a reliable de-dupe key. Every remaining discovered engine is appended as an
+// unmanaged row (Managed=false, Status="running") carrying the model(s) it is
+// currently serving, so the console shows it distinctly instead of it being
+// invisible.
 //
-// Pure function — no I/O — so the merge/de-dupe decision is unit-testable
-// without docker, a live engine, or a manifest file.
+// Name-matched engines split on whether the MANAGED row is actually running
+// (citadel #804): DiscoverLocalEngines' liveness check
+// (status.enginePortIfRunning) falls back to nativesvc.IsNativeServiceServing
+// — a raw "does something answer this engine's port" probe — independent of
+// composeServiceState (docker compose ps), which is the ONLY thing that sets a
+// managed row's Status above. So a managed row can read "stopped" while a live
+// signal for the same name exists (e.g. citadel.yaml declares "ollama" but its
+// compose stack isn't running, while a separately-started native ollama
+// answers on the same port). Dropping that live signal because the name
+// already "exists" silently hid a serving engine. When the managed row is NOT
+// running, the discovered signal UPGRADES it in place instead: Status flips to
+// "running", Models is attached, and Managed flips to false so the console
+// renders it as a detected/native instance rather than implying citadel's own
+// compose stack is up. When the managed row IS running, it wins unchanged —
+// composeServiceState is already authoritative for that case.
+//
+// No I/O, so the merge/de-dupe/upgrade decision is unit-testable without
+// docker, a live engine, or a manifest file. NOT allocation-pure, though: an
+// upgrade mutates the matched element of `managed` in place (out shares
+// managed's backing array until an append grows it), so the caller's slice
+// header can be reassigned from the return value but its already-existing
+// elements may already reflect the upgrade too. The single call site
+// (`data.Services = mergeDetectedEngines(data.Services, ...)`) relies on
+// exactly this, not a defensive copy.
 func mergeDetectedEngines(managed []controlcenter.ServiceInfo, discovered []status.LocalEngine) []controlcenter.ServiceInfo {
-	existing := make(map[string]bool, len(managed))
-	for _, svc := range managed {
-		existing[strings.ToLower(svc.Name)] = true
+	indexByName := make(map[string]int, len(managed))
+	for i, svc := range managed {
+		indexByName[strings.ToLower(svc.Name)] = i
 	}
 
 	out := managed
 	for _, eng := range discovered {
-		if existing[strings.ToLower(eng.Name)] {
+		key := strings.ToLower(eng.Name)
+		if idx, ok := indexByName[key]; ok {
+			if out[idx].Status == "running" {
+				// Managed compose is already running — it wins, no change.
+				continue
+			}
+			// Live signal for a declared-but-not-compose-running engine:
+			// upgrade the row instead of silently dropping it.
+			out[idx].Status = "running"
+			out[idx].Managed = false
+			out[idx].Models = eng.Models
 			continue
 		}
 		out = append(out, controlcenter.ServiceInfo{
@@ -1362,7 +1394,7 @@ func mergeDetectedEngines(managed []controlcenter.ServiceInfo, discovered []stat
 			Managed: false,
 			Models:  eng.Models,
 		})
-		existing[strings.ToLower(eng.Name)] = true
+		indexByName[key] = len(out) - 1
 	}
 	return out
 }
@@ -1375,11 +1407,14 @@ func mergeDetectedEngines(managed []controlcenter.ServiceInfo, discovered []stat
 var ccFootprintIdleTracker = status.NewFootprintIdleTracker()
 
 // enrichServiceFootprints attaches a live resource footprint + idle label to
-// each running managed service in data, and computes the one-line managed
-// summary. It makes a single batched footprint collection for all running
-// services (one stats call + one nvidia-smi pair), then formats per-service.
+// each running service in data, and computes the one-line managed summary. It
+// makes a single batched footprint collection for all running services (one
+// stats call + one nvidia-smi pair), then formats per-service.
 func enrichServiceFootprints(data *controlcenter.StatusData) {
-	// Collect candidate container names for running services only.
+	// Collect candidate container names for running services only. Note this
+	// is NOT filtered to Managed rows — a detected/unmanaged row (citadel
+	// #657) still gets a per-row footprint; applyServiceFootprints is what
+	// keeps it out of the managed TOTAL (citadel #805).
 	var names []string
 	nameToIdx := map[string]int{}
 	for i := range data.Services {
@@ -1402,6 +1437,30 @@ func enrichServiceFootprints(data *controlcenter.StatusData) {
 	defer cancel()
 	footprints := status.CollectFootprints(ctx, names)
 
+	applyServiceFootprints(data, nameToIdx, footprints, ccFootprintIdleTracker)
+}
+
+// applyServiceFootprints attaches a footprint/idle label to every running row
+// in data.Services that a pre-collected footprints map resolved (keyed by
+// candidate container name, via nameToIdx), and rolls up the one-line
+// "managed: RAM .../VRAM ..." summary.
+//
+// Unmanaged rows (Managed=false — a detected engine citadel did not start,
+// citadel #657) still get their own per-row Footprint/IdleLabel/HeavyAndIdle,
+// but their RAM/VRAM is deliberately excluded from the summed total (citadel
+// #805): that summary is read as "what citadel itself is using", and an
+// engine running under its own bare container name (e.g. an official Ollama
+// install answering on the port citadel.yaml also declares) is not citadel's
+// usage to report.
+//
+// Split out from enrichServiceFootprints so the roll-up/exclusion logic is
+// unit-testable against a fixed footprints map, without docker or nvidia-smi.
+func applyServiceFootprints(
+	data *controlcenter.StatusData,
+	nameToIdx map[string]int,
+	footprints map[string]status.ServiceFootprint,
+	idleTracker *status.FootprintIdleTracker,
+) {
 	var totalRAM, totalVRAM uint64
 	var anyGPU bool
 	for cn, fp := range footprints {
@@ -1415,11 +1474,14 @@ func enrichServiceFootprints(data *controlcenter.StatusData) {
 			continue
 		}
 		fpCopy := fp
-		idle := ccFootprintIdleTracker.Observe(cn, &fpCopy)
+		idle := idleTracker.Observe(cn, &fpCopy)
 		data.Services[idx].Footprint = status.FormatFootprint(&fpCopy)
 		data.Services[idx].IdleLabel = status.FormatIdleLabel(&idle)
 		data.Services[idx].HeavyAndIdle = status.IsHeavyAndIdle(&fpCopy, &idle)
 
+		if !data.Services[idx].Managed {
+			continue
+		}
 		totalRAM += fpCopy.RAMBytes
 		totalVRAM += fpCopy.VRAMBytes
 		if fpCopy.HasGPU {
