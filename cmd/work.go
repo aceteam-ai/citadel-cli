@@ -688,6 +688,16 @@ func runWork(cmd *cobra.Command, args []string) {
 	// reader goroutine starts; this one is not, so it needs its own
 	// synchronization instead of relying on assignment order.
 	var nodeSwapManager atomic.Pointer[worker.SwapManager]
+	// inferenceQueueReconciler watches for a serving-engine transition and
+	// self-subscribes the inference queue once one appears, so a node that
+	// boots with no engine does not need a restart to serve inference once one
+	// starts (citadel #612). Wired in API mode only -- see its construction
+	// below for why direct-Redis mode has no equivalent gap. Stays nil (no
+	// reconciler built) unless the boot-time queue set is actually missing the
+	// inference queue -- a GPU node, or any node already serving at boot, has
+	// nothing for it to do and must not get one (see missingQueues). Registered
+	// as an OnStatus observer once the heartbeat publisher exists.
+	var inferenceQueueReconciler *worker.InferenceQueueReconciler
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -787,6 +797,34 @@ func runWork(cmd *cobra.Command, args []string) {
 			// subscribed during a live node-routing test (issue #3924).
 			LogFn: func(_ string, msg string) { Log("%s", msg) },
 		})
+
+		// A node with no discrete GPU (GPUInferenceQueues empty) and not yet
+		// serving at boot gets NO inference queue above -- InferenceQueues
+		// returns nil when !serving. If an engine starts later (a platform
+		// SERVICE_START from a console model deploy on a fresh node), the node
+		// would never join jobs:v1:gpu-general without a restart (#612).
+		//
+		// Only wire the reconciler when that gap actually exists. A GPU node's
+		// InferenceQueues(caps, true) is IDENTICAL to InferenceQueues(caps,
+		// false) -- GPUInferenceQueues is unconditional on `serving` -- so the
+		// boot-time apiQueueNames above already contains it regardless of
+		// whether the node happened to be serving yet. Building a reconciler
+		// for that node would find nothing left to add and just re-probe
+		// nodeIsServingModels (a docker ps) forever on every heartbeat tick --
+		// exactly the extra sweep OnStatus reuse was meant to avoid. missingQueues
+		// diffs the "if serving" set against what boot already subscribed, so a
+		// GPU node or a node already serving at boot gets no reconciler at all;
+		// only a fresh CPU-only node with no engine yet does.
+		if missing := missingQueues(capabilities.InferenceQueues(nodeCaps, true), apiQueueNames); len(missing) > 0 {
+			inferenceQueueReconciler = worker.NewInferenceQueueReconciler(
+				missing,
+				nodeIsServingModels,
+				func(_ context.Context, queue string) error {
+					apiSource.AddQueue(queue) // APISource creates its consumer group lazily; no error to surface
+					return nil
+				},
+			)
+		}
 
 		// Connect early so client is available for heartbeat.
 		//
@@ -1697,6 +1735,31 @@ func runWork(cmd *cobra.Command, args []string) {
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 					}
+					if inferenceQueueReconciler != nil {
+						inferenceQueueReconciler.Log = Log
+						// Ignore the passed-in NodeStatus and re-check serving via
+						// nodeIsServingModels (DiscoverLocalEngines) rather than reading
+						// NodeStatus.Services: that snapshot still lists a
+						// non-answering engine (Health="starting", just not
+						// "healthy"), which is exactly the false-positive #649 fixed
+						// for the startup check this reconciler mirrors. Reusing the
+						// canonical check here keeps the two paths agreeing.
+						//
+						// Dispatched via `go` deliberately: nodeIsServingModels's 5s
+						// context deadline does NOT bound the underlying `docker ps`
+						// (listRunningContainerNames uses exec.Command, not
+						// CommandContext), so a wedged container runtime can block this
+						// call indefinitely. Running it inline in the OnStatus fan-out
+						// would stall every subsequent heartbeat publish -- exactly the
+						// liveness regression #548's watchdog work exists to prevent.
+						// This means a wedged runtime leaves that probe blocked
+						// indefinitely -- but the reconciler self-limits to ONE
+						// in-flight probe (an internal `probing` guard under its
+						// mutex), so a wedge costs exactly one permanently-blocked
+						// goroutine, not one per heartbeat tick forever. See
+						// TestInferenceQueueReconciler_ConcurrentReconcile.
+						apiPublisher.SetOnStatus(func(_ *status.NodeStatus) { go inferenceQueueReconciler.Reconcile(ctx) })
+					}
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
@@ -2540,6 +2603,30 @@ func appendUniqueQueues(base, extra []string) []string {
 		}
 	}
 	return base
+}
+
+// missingQueues returns the entries of desired not already present in
+// existing, preserving desired's order and de-duplicating. Used to decide
+// whether the inference-queue reconciler (#612) actually has a gap to fill: a
+// GPU node's InferenceQueues(caps, true) is already fully covered by the boot
+// path (capabilities.GPUInferenceQueues is unconditional on `serving`), so
+// this returns empty for it -- the reconciler must not be built in that case,
+// or it would probe nodeIsServingModels forever with nothing left to add.
+func missingQueues(desired, existing []string) []string {
+	have := make(map[string]bool, len(existing))
+	for _, q := range existing {
+		have[q] = true
+	}
+	seen := make(map[string]bool, len(desired))
+	var missing []string
+	for _, q := range desired {
+		if q == "" || have[q] || seen[q] {
+			continue
+		}
+		seen[q] = true
+		missing = append(missing, q)
+	}
+	return missing
 }
 
 // meetingQueueName returns the org-scoped meeting-notetaker tag queue name.

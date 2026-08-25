@@ -233,6 +233,43 @@ func TestPublishMessageHappyPath(t *testing.T) {
 	}
 }
 
+// TestAPIPublisherOnStatusFansOut is the API-mode half of citadel #612's
+// wiring: SetOnStatus must accumulate callbacks, not have the second
+// registration clobber the first. Both the #416 auto-stop reconciler and the
+// #612 inference-queue reconciler register on the same publisher, so a
+// regression here silently drops one of them.
+func TestAPIPublisherOnStatusFansOut(t *testing.T) {
+	stub := &redisAPIStub{}
+	pub, _ := newTestAPIPublisher(t, stub)
+
+	var mu sync.Mutex
+	var calls []string
+	pub.SetOnStatus(func(_ *status.NodeStatus) {
+		mu.Lock()
+		calls = append(calls, "auto-stop")
+		mu.Unlock()
+	})
+	pub.SetOnStatus(func(_ *status.NodeStatus) {
+		mu.Lock()
+		calls = append(calls, "inference-queue")
+		mu.Unlock()
+	})
+
+	if got := len(pub.onStatusFns); got != 2 {
+		t.Fatalf("SetOnStatus must accumulate registrations, got %d callbacks registered (want 2)", got)
+	}
+
+	if err := pub.publishStatus(context.Background()); err != nil {
+		t.Fatalf("publishStatus: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("want both OnStatus callbacks invoked per publish, got %v", calls)
+	}
+}
+
 // TestPublishMessageRecordsMarkerOnSuccess pins the wiring half of #726
 // (API-mode side): a successful durable stream write must update the on-disk
 // freshness marker.
