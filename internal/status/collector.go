@@ -32,6 +32,7 @@ type Collector struct {
 	idleTracker    *IdleTracker           // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
 	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
 	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
+	reqLog         *requestLog            // node-routed request log, every engine (citadel #691)
 	pinnedServices map[string]bool        // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
 	modelHotswap   bool                   // advertise installed-vs-resident models (citadel #632)
 }
@@ -79,8 +80,108 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
 		fpIdleTracker:  NewFootprintIdleTracker(),
 		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
+		reqLog:         nodeRequestLog,
 		pinnedServices: toStringSet(cfg.PinnedServices),
 		modelHotswap:   cfg.ModelHotswap,
+	}
+}
+
+// nodeRoutedIdle returns the IdleState derived from locally-recorded
+// node-routed requests for the named engine (citadel #691), or nil when no
+// such request has ever been recorded for it.
+func (c *Collector) nodeRoutedIdle(engine string) *IdleState {
+	if c.reqLog == nil {
+		return nil
+	}
+	threshold := time.Duration(IdleThresholdSeconds()) * time.Second
+	st, ok := c.reqLog.idleState(engine, threshold)
+	if !ok {
+		return nil
+	}
+	return &st
+}
+
+// applyNodeRoutedRequestSignal folds the node-routed request log (citadel
+// #691) into every running service/app's IdleState, in ONE central pass run
+// LAST -- after collectServiceStatus, collectManagedEngineStatus,
+// collectEmbeddingServiceStatus, the collectRunningEmbeddedServices backstop,
+// and attachFootprints have all already produced whatever scrape/network/
+// footprint-derived signal they could (Collect() ordering). Centralizing here
+// (rather than a fallback wired into each producer) is what makes the
+// backstop-reported engines (diffusers, sglang, kokoro, transcribe,
+// extraction, lmstudio -- see collectRunningEmbeddedServices) get the same
+// last_request_at coverage as the explicitly-probed ones: iterating
+// status.Services once, after assembly, does not care which producer emitted
+// a given entry.
+//
+// A "starting" service is skipped entirely: an engine that has not answered
+// any probe this cycle must not surface a stale local timestamp as if it were
+// live right now, matching the existing !responded contract in
+// collectManagedEngineStatus (TestCollectManagedEngineStatus_
+// UnresponsiveEngineIsStarting).
+func (c *Collector) applyNodeRoutedRequestSignal(status *NodeStatus) {
+	if c.reqLog == nil {
+		return
+	}
+	for i := range status.Services {
+		svc := &status.Services[i]
+		if svc.Status != ServiceStatusRunning || svc.Health == HealthStatusStarting {
+			continue
+		}
+		c.mergeNodeRoutedSignal(svc.Name, &svc.IdleState)
+	}
+	for i := range status.Apps {
+		app := &status.Apps[i]
+		if app.Status != "running" {
+			continue
+		}
+		c.mergeNodeRoutedSignal(app.Name, &app.IdleState)
+	}
+}
+
+// mergeNodeRoutedSignal folds the node-routed request log into an
+// already-derived IdleState, following one rule: it may only ADD information
+// (a last_request_at where none existed) or REDUCE apparent idleness, never
+// manufacture idleness a more precise/more authoritative signal already ruled
+// out.
+//
+// Why that direction only: a coarse local record can be stale relative to a
+// live, more precise signal -- e.g. one long-running dispatch stamped once at
+// request start, still in flight past the idle threshold with the engine
+// visibly busy on GPU. Letting a stale local timestamp flip an existing
+// Idle=false to Idle=true would hand autostop.go (idle && idle_seconds >=
+// threshold, default OFF but real once enabled) grounds to evict a genuinely
+// working engine -- worse than the "never" this issue is fixing. A false
+// "still looks busy" costs nothing (idle_seconds is a hair stale); a false
+// "idle" can evict.
+//
+// dst is the *IdleState the existing scrape/network/footprint cascade already
+// produced for this service (nil if none did).
+func (c *Collector) mergeNodeRoutedSignal(engine string, dst **IdleState) {
+	local := c.nodeRoutedIdle(engine)
+	if local == nil {
+		return // no node-routed request ever recorded; nothing to add
+	}
+	if *dst == nil {
+		// No other signal exists at all: this IS the signal. Adopting it
+		// wholesale cannot manufacture idleness relative to "unknown" -- unknown
+		// was already being reported as "never".
+		*dst = local
+		return
+	}
+	existing := *dst
+	// A proven request is always safe to record, and taking the MORE RECENT of
+	// the two timestamps can only ever agree with or reduce apparent idleness.
+	if existing.LastRequestAt == nil || (local.LastRequestAt != nil && local.LastRequestAt.After(*existing.LastRequestAt)) {
+		existing.LastRequestAt = local.LastRequestAt
+	}
+	// Only ever downgrade Idle=true -> false, and only ever shrink IdleSeconds.
+	// Never the reverse.
+	if !local.Idle && existing.Idle {
+		existing.Idle = false
+	}
+	if local.IdleSeconds < existing.IdleSeconds {
+		existing.IdleSeconds = local.IdleSeconds
 	}
 }
 
@@ -191,6 +292,17 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// holding GPU/RAM is now visible instead of a bare "running" with no
 	// footprint. One stats call + one nvidia-smi pair for the whole set.
 	c.attachFootprints(status)
+
+	// Node-routed request fallback (citadel #691): backfills last_request_at
+	// (and, safely, idle/idle_seconds) for every running service/app using
+	// requests THIS node itself dispatched -- the gateway's chat router and the
+	// worker's llm_inference handler -- covering engines the scrape/network/
+	// footprint cascade above still leaves without any signal (ollama, bonsai,
+	// diffusers, sglang, ...). MUST run after attachFootprints: it only ever
+	// adds a timestamp or reduces reported idleness relative to what the
+	// cascade already decided, never the reverse. See
+	// applyNodeRoutedRequestSignal for why that direction is load-bearing.
+	c.applyNodeRoutedRequestSignal(status)
 
 	// Model hotswap (#632, default OFF): mark running engines resident and
 	// additively advertise installed-but-stopped engines as swap-in candidates.
@@ -427,7 +539,10 @@ func (c *Collector) collectServiceStatus() []ServiceInfo {
 					info.Health = health
 				}
 			}
-			// Attach the per-service idle signal for engines we can scrape.
+			// Attach the per-service idle signal for engines we can scrape. The
+			// node-routed request fallback (citadel #691) is applied centrally in
+			// applyNodeRoutedRequestSignal, after every producer (including this
+			// one) has run.
 			if idle := c.observeIdle(ctx, svc.Name, svc.Name, svc.Port); idle != nil {
 				info.IdleState = idle
 			}
@@ -543,6 +658,8 @@ func (c *Collector) collectAppStatus() []AppInfo {
 		// heartbeat without any manifest wiring. The engine is discriminated on
 		// both the app name and its image (e.g. "vllm/vllm-openai"), since a
 		// catalog slug like "llm-server" would not match on name alone.
+		// The node-routed request fallback (citadel #691) is applied centrally in
+		// applyNodeRoutedRequestSignal, after this producer has run.
 		if dockerStatus == "running" && installed.HostPort > 0 {
 			if idle := c.observeIdle(ctx, installed.Name, installed.Name+" "+installed.Image, installed.HostPort); idle != nil {
 				info.IdleState = idle

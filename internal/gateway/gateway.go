@@ -177,6 +177,17 @@ type Server struct {
 	// chat_route.go (issue #581, node-side complement of aceteam #6236).
 	chatLister ChatModelLister
 
+	// requestRecorder, when non-nil, is called with the resolved engine name
+	// every time handleChatCompletions dispatches a request to a local engine.
+	// It is the node-routed complement to engine-scraped idle detection
+	// (citadel #691): ollama/bonsai/llamacpp expose no request metric an idle
+	// tracker can scrape, so this records the request directly at the one place
+	// this package proxies to them. Deliberately a plain func, not
+	// status.RecordEngineRequest directly, so this package stays free of the
+	// heavy internal/status transitive deps (see the ChatUpstream doc comment)
+	// and so tests can inject a spy. Set via SetRequestRecorder.
+	requestRecorder func(engine string)
+
 	// started is set once Start has registered the proxy handlers for the routes
 	// present at that moment. It gates WireModuleRoute: a route added AFTER Start
 	// must have its proxy handler registered live (Start's registration loop has

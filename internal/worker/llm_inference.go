@@ -36,6 +36,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -57,6 +58,14 @@ type LLMInferenceHandler struct {
 	// resident target is swapped in. Injected ONLY when CITADEL_MODEL_HOTSWAP is
 	// on (cmd/nodejobs.go), so a nil swapper == today's behavior exactly.
 	swapper modelSwapper
+
+	// requestRecorder records a node-routed request against the resolved
+	// backend name (citadel #691) -- the worker's half of the last_request_at
+	// fix; the gateway's is internal/gateway.Server.requestRecorder. Defaults to
+	// status.RecordEngineRequest in the constructor; overridable via
+	// WithRequestRecorder so tests can inject a spy instead of touching the
+	// shared process-wide log.
+	requestRecorder func(engine string)
 }
 
 // modelSwapper is the swap surface the handler needs. Satisfied by *SwapManager;
@@ -87,7 +96,8 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 			"sglang": "http://localhost:30000",
 			"ollama": "http://localhost:11434",
 		},
-		httpClient: http.DefaultClient,
+		httpClient:      http.DefaultClient,
+		requestRecorder: status.RecordEngineRequest,
 	}
 }
 
@@ -96,6 +106,15 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 // the handler's behavior identical to before hotswap.
 func (h *LLMInferenceHandler) WithSwapper(s modelSwapper) *LLMInferenceHandler {
 	h.swapper = s
+	return h
+}
+
+// WithRequestRecorder overrides the node-routed request recorder
+// (citadel #691), primarily for tests that want to observe recorded calls
+// without touching the shared process-wide status.RecordEngineRequest log.
+// Passing nil disables recording entirely.
+func (h *LLMInferenceHandler) WithRequestRecorder(recorder func(engine string)) *LLMInferenceHandler {
+	h.requestRecorder = recorder
 	return h
 }
 
@@ -156,6 +175,15 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 			return h.warming(payload.Model, engineWarmETA(payload.Backend), 0), nil
 		}
 		return h.failure(err), nil
+	}
+
+	// Record the dispatch against the resolved backend (citadel #691), now that
+	// the engine has passed the readiness probe above and is actually about to
+	// receive the request. This is what gives ollama/bonsai/llamacpp/
+	// unlimited-ocr -- none of which expose a scrapeable request metric -- a
+	// real last_request_at in the heartbeat instead of "never".
+	if h.requestRecorder != nil {
+		h.requestRecorder(payload.Backend)
 	}
 
 	switch payload.Backend {

@@ -14,9 +14,17 @@ import (
 )
 
 // idleCapableEngines lists the serving engines for which idle detection has a
-// reliable request signal. Currently only vLLM exposes the Prometheus request
-// counters + running/waiting gauges the IdleTracker scrapes. Extend this as
-// other engines (sglang, llama.cpp) grow comparable metrics.
+// reliable SCRAPED request signal. Currently only vLLM exposes the Prometheus
+// request counters + running/waiting gauges the IdleTracker scrapes. Extend
+// this as other engines (sglang, llama.cpp) grow comparable metrics.
+//
+// This is NOT the only idle/last-request signal in the heartbeat: every
+// running service/app also gets a last_request_at fallback from locally-
+// recorded node-routed requests (request_recorder.go, citadel #691), plus the
+// #433 network-activity/footprint heuristics in footprint.go. See
+// Collector.applyNodeRoutedRequestSignal for the merge order (it runs last, on
+// the fully-assembled status, so it applies uniformly regardless of which of
+// these engine lists produced a given entry).
 var idleCapableEngines = []string{"vllm"}
 
 // managedProbeEngines lists the managed serving engines the heartbeat path
@@ -96,6 +104,10 @@ func (c *Collector) collectManagedEngineStatus(running map[string]bool) []Servic
 			}
 		}
 
+		// The node-routed request fallback (citadel #691) is applied centrally in
+		// applyNodeRoutedRequestSignal (collector.go), after every producer
+		// (including this one) has run and Health has settled -- an entry that
+		// stays "starting" below is skipped there too.
 		if !responded {
 			info.Health = HealthStatusStarting
 			info.Models = nil
