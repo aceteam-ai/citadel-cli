@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -51,6 +52,33 @@ func TestCobrowseSession_StatusUnknownID(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown session id")
+	}
+}
+
+// A start that names a persistent profile MUST fail closed when no pin is supplied:
+// it must never silently fall back to a throwaway (logged-out) session. This is the
+// "absent PIN fails closed" acceptance criterion at the job entry point. The guard
+// fires before any vault unlock, so no configured vault is needed here. Mutation
+// check: a refactor that falls back to StartSession(url) on an absent pin loses the
+// "pin" phrase this asserts.
+func TestCobrowseSession_StartWithProfileRequiresPIN(t *testing.T) {
+	_, err := runSession(t, map[string]string{
+		"action":  CobrowseSessionActionStart,
+		"profile": "my-account",
+		"url":     "https://example.com",
+	})
+	if err == nil {
+		t.Fatal("expected fail-closed error when a profile is named without a pin")
+	}
+	if !strings.Contains(err.Error(), "pin") {
+		t.Errorf("error should cite the missing pin, got %v", err)
+	}
+}
+
+func TestCobrowseSession_ResetRequiresProfile(t *testing.T) {
+	_, err := runSession(t, map[string]string{"action": CobrowseSessionActionReset})
+	if err == nil {
+		t.Fatal("expected error when reset has no profile field")
 	}
 }
 

@@ -17,8 +17,16 @@
 // Live viewing and input forwarding (screencast + input bridge) are a SEPARATE issue
 // (#794); this file builds only the session lifecycle. Status exposes debug_port and
 // display so a viewer can attach later, and MarkAttached/MarkDetached flip the session
-// state without any streaming transport here. A persistent/encrypted per-session
-// profile is issue #795; here every session gets an isolated temp profile dir.
+// state without any streaming transport here.
+//
+// A session's working profile dir is a private temp dir either way. Without a
+// SessionProfile it is throwaway (removed on stop, fresh each time). With one
+// (issue #795), the same temp dir is the DECRYPTED working copy of an encrypted,
+// PIN-unlocked persistent profile: StartSessionWithProfile materializes the
+// profile into it before launch and re-encrypts it on stop, so logins persist
+// while only ciphertext lives at rest. The plaintext working copy is still just a
+// temp dir, so the existing crash-sweep and teardown removal keep the guarantee
+// that no plaintext profile is left behind.
 package platform
 
 import (
@@ -116,12 +124,38 @@ type CobrowseSessionManager struct {
 	sweepOnce   sync.Once
 }
 
+// SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
+// session (issue #795). It is satisfied structurally by internal/cobrowseprofile's
+// Handle; declaring it as an interface here keeps platform free of a nodevault /
+// network import (network imports platform, so a back-import would cycle). The
+// caller unlocks the profile with the PIN BEFORE StartSessionWithProfile and hands
+// over ownership; the manager guarantees Close eventually runs on every path.
+//
+//   - Materialize decrypts the stored profile into the session's private working
+//     dir (already created 0700, empty) before the browser launches; first use
+//     leaves it empty for a fresh profile. It must fail closed.
+//   - Persist re-encrypts that working dir back to the store. The manager calls it
+//     ONLY after the browser actually ran, so a failed launch never overwrites a
+//     good profile with an empty dir.
+//   - Close zeroes the unlocked key material and releases the profile's
+//     single-session lock. Idempotent.
+type SessionProfile interface {
+	Materialize(dir string) error
+	Persist(dir string) error
+	Close() error
+}
+
 // cobrowseSession is one isolated browser session. Its own mutex guards proc/state so
 // a status/stop of a sibling never blocks on this session's launch or CDP wait.
 type cobrowseSession struct {
 	id        string
 	profile   string
 	startedAt time.Time
+
+	// encProfile is the encrypted persistent profile for this session, or nil for a
+	// throwaway session. When set, teardown persists (only if the browser ran) and
+	// always Closes it.
+	encProfile SessionProfile
 
 	mu    sync.Mutex
 	state CobrowseSessionState
@@ -186,6 +220,19 @@ func newSessionID() string {
 // reports the running session. The session is registered as SessionLaunching before
 // the launch so it is observable and reapable mid-launch by StopAll on shutdown.
 func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionStatus, error) {
+	return m.StartSessionWithProfile(startURL, nil)
+}
+
+// StartSessionWithProfile is StartSession with an optional encrypted persistent
+// profile (issue #795). When profile is nil it is exactly StartSession: a throwaway
+// working dir removed on stop. When non-nil, the caller has already unlocked the
+// profile with the PIN; the working dir is materialized from it before launch and
+// re-encrypted on stop. Ownership of profile transfers to the manager: Close is
+// guaranteed to run on every exit path here (failed launch, stopped-during-launch)
+// and on teardown, so neither the unlocked key nor the profile's single-session
+// lock can leak — a missed Close is structurally impossible because every cleanup
+// path routes through teardown().
+func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
 
@@ -193,41 +240,56 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 	if len(m.sessions) >= m.maxSessions {
 		max := m.maxSessions
 		m.mu.Unlock()
+		// The caller handed us the profile; Close it since we are not taking it.
+		if profile != nil {
+			_ = profile.Close()
+		}
 		return CobrowseSessionStatus{}, fmt.Errorf(
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
 	id := newSessionID()
 	s := &cobrowseSession{
-		id:        id,
-		profile:   filepath.Join(m.baseDir, id),
-		startedAt: time.Now(),
-		state:     SessionLaunching,
+		id:         id,
+		profile:    filepath.Join(m.baseDir, id),
+		startedAt:  time.Now(),
+		state:      SessionLaunching,
+		encProfile: profile,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
 
 	proc, err := m.launch(s, startURL)
 	if err != nil {
-		// Failed launch: drop the reserved slot and remove the throwaway profile dir
-		// so a launch that never produced a browser leaks neither a slot nor a dir.
+		// Failed launch: drop the reserved slot and tear the session down. teardown
+		// removes the working dir and Closes the profile (no Persist, since proc is
+		// nil), so a launch that never produced a browser leaks neither a slot, a
+		// dir, nor an unlocked key.
 		m.mu.Lock()
 		delete(m.sessions, id)
 		m.mu.Unlock()
-		_ = os.RemoveAll(s.profile)
+		_ = s.teardown()
 		return CobrowseSessionStatus{}, err
 	}
 
 	// A concurrent Stop/StopAll (e.g. node shutdown mid-launch) may have removed this
 	// session from the map while the browser was still starting. teardown() then saw
-	// proc==nil and only removed the profile dir, so the browser we just finished
-	// launching is owned by nobody -- not the map, not a pidfile. Re-check under the
-	// lock: if the slot is gone, tear down the fresh browser ourselves so it does not
-	// orphan across shutdown.
+	// proc==nil and only removed the profile dir (and Closed the profile), so the
+	// browser we just finished launching is owned by nobody -- not the map, not a
+	// pidfile. Re-check under the lock: if the slot is gone, tear down the fresh
+	// browser ourselves so it does not orphan across shutdown. Close on the profile
+	// is idempotent, so a double Close across the two teardowns is safe.
 	m.mu.Lock()
 	if m.sessions[id] != s {
 		m.mu.Unlock()
 		_ = proc.stop()
+		// Do NOT persist here: the session was torn down mid-launch, the concurrent
+		// teardown may already have removed the working dir, and sealing an empty or
+		// vanishing dir would overwrite a good profile with nothing. Just Close
+		// (idempotent — the concurrent teardown already Closed it) and remove the dir.
+		if profile != nil {
+			_ = profile.Close()
+		}
 		_ = os.RemoveAll(s.profile)
 		return CobrowseSessionStatus{}, fmt.Errorf("session %s was stopped during launch", id)
 	}
@@ -243,6 +305,19 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*cobrowseProc, error) {
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
+	}
+	// For a persistent session, decrypt the stored profile into the (private, 0700)
+	// working dir BEFORE launching the browser, so the browser opens with the saved
+	// logins. Fails closed: a materialize error (e.g. tampered/corrupt store) aborts
+	// the launch rather than starting with a partial profile. Read encProfile under
+	// s.mu: a concurrent teardown (StopAll mid-launch) nils it under the same lock.
+	s.mu.Lock()
+	enc := s.encProfile
+	s.mu.Unlock()
+	if enc != nil {
+		if err := enc.Materialize(s.profile); err != nil {
+			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
+		}
 	}
 	proc, err := launchCobrowseProc(s.profile, startURL)
 	if err != nil {
@@ -343,20 +418,40 @@ func (m *CobrowseSessionManager) StopAll() error {
 	return lastErr
 }
 
-// teardown kills the session's processes (if launched) and removes its profile dir.
+// teardown kills the session's processes (if launched), persists the encrypted
+// profile (only if the browser actually ran), Closes the profile, and removes the
+// plaintext working dir. Every cleanup path routes through here, so the profile is
+// always Closed exactly-effectively-once (Close is idempotent) — the unlocked key
+// and the single-session lock cannot leak.
 func (s *cobrowseSession) teardown() error {
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
 	profile := s.profile
+	enc := s.encProfile
+	s.encProfile = nil
 	s.mu.Unlock()
 
 	var err error
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
-	// Throwaway profile (persistent profile is issue #795): remove it on teardown so
-	// a stopped session leaves no state behind. The pidfile lives under it and goes too.
+	if enc != nil {
+		// Persist ONLY if the browser ran (proc != nil): a failed launch never
+		// produced new state, and sealing an empty/partial working dir would
+		// overwrite a good profile with nothing.
+		if proc != nil {
+			if perr := enc.Persist(profile); perr != nil && err == nil {
+				err = perr
+			}
+		}
+		// Close zeroes the unlocked key material and releases the profile's
+		// single-session lock, always — even when Persist failed above.
+		_ = enc.Close()
+	}
+	// Remove the plaintext working dir so a stopped session leaves no decrypted
+	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
+	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
 		_ = os.RemoveAll(profile)
 	}
