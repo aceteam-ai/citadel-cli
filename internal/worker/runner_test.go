@@ -1125,3 +1125,112 @@ func TestRunnerTargetNodeMismatchNoUsageRecord(t *testing.T) {
 		t.Errorf("Expected 0 usage records for skipped job, got %d", recordCount)
 	}
 }
+
+// TestRunnerServiceStartPublishesTerminalEndOnSuccess pins the fix for
+// citadel-cli#559: a SERVICE_START that completes successfully must publish
+// exactly one terminal "end" event to stream:v1:{jobId} -- the backend
+// subscribes BEFORE dispatch and waits on this event to short-circuit its
+// slow poll-based fallback. Also guards against a double-publish (end AND
+// error both firing for the same outcome).
+func TestRunnerServiceStartPublishesTerminalEndOnSuccess(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false) // succeeds
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.112.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.ended {
+		t.Error("expected a terminal 'end' event to be published for a successful SERVICE_START")
+	}
+	if stream.errored {
+		t.Error("a successful SERVICE_START must not also publish a terminal error event (exactly one terminal event)")
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerServiceStartPublishesTerminalErrorOnFailure is the failure-side
+// counterpart of the above: a SERVICE_START whose handler fails must publish
+// exactly one terminal "error" event, not silently Nack with nothing on the
+// stream.
+func TestRunnerServiceStartPublishesTerminalErrorOnFailure(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, true) // fails
+	config := RunnerConfig{WorkerID: "test-worker", AgentVersion: "v2.112.0"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if !stream.errored {
+		t.Error("expected a terminal error event to be published for a failed SERVICE_START")
+	}
+	if stream.ended {
+		t.Error("a failed SERVICE_START must not also publish a terminal end event (exactly one terminal event)")
+	}
+	if stream.erroredErr == nil {
+		t.Fatal("expected a non-nil error on the published terminal event")
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerNoGPUSlotsNacksWithoutHandlerExecution pins the CURRENT (deliberately
+// unchanged) behavior of the GPU-slot-exhaustion path: the job is Nacked for
+// redelivery without running the handler. This Nack redelivers the same job
+// ID, so a caller streaming this attempt would need to already treat a Nack
+// as non-terminal -- unlike a genuine terminal outcome (success/failure),
+// there is no terminal-event contract for a will-be-retried attempt. See the
+// PR for citadel-cli#559 for why a terminal-event publish was deliberately
+// NOT added here (it risks turning a transparent retry into a reported
+// failure if the backend treats any published error as final).
+func TestRunnerNoGPUSlotsNacksWithoutHandlerExecution(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: "TEST_JOB", Payload: map[string]any{}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("TEST_JOB", false)
+	config := RunnerConfig{
+		WorkerID:   "test-worker",
+		GPUTracker: NewGPUTracker(0), // zero slots: every Acquire() fails
+	}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(handler.ExecutedJobs()) != 0 {
+		t.Errorf("handler should not run when no GPU slot is available, got %d executions", len(handler.ExecutedJobs()))
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
