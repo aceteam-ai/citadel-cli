@@ -1763,3 +1763,20 @@ Auto-generated log of every release.
   - fix(reconcile): scope converge authority to lockfile modules so one desired row can't wipe the manifest (#739) (#830)
 
 
+---
+
+## v2.116.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 16 |
+| Lines added | +1072 |
+
+**Changes:**
+
+  - feat(status): report free RAM + VRAM + disk headroom in node status (#833) (#841)
+  - fix(diffusers): bake tokenizer deps (tiktoken/sentencepiece/protobuf/ftfy) + CI tokenizer smoke test (#829) (#838)
+  - feat(tui): dynamic inference-queue self-subscribe in the Control Center worker path (#823) (#837)
+
+
