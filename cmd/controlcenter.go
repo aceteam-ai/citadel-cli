@@ -2303,7 +2303,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 // one anyway would probe nodeIsServingModels forever with nothing left to
 // add.
 func resolveControlCenterInferenceQueues(nodeCaps *capabilities.NodeCapabilities, serving, workerHeld bool) (queues, missing []string) {
-	queues = []string{"jobs:v1:cpu-general"}
+	// worker.DefaultCPUQueue is the single source of truth for this value --
+	// it's the same literal NewAPISource's zero-value default resolves to, so
+	// referencing the constant here keeps the two from drifting apart (see
+	// its doc comment in internal/worker/api_source.go).
+	queues = []string{worker.DefaultCPUQueue}
 	if workerHeld {
 		return queues, nil
 	}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
 // TestResolveControlCenterInferenceQueues pins the boot-time queue set and
@@ -32,7 +33,7 @@ func TestResolveControlCenterInferenceQueues(t *testing.T) {
 			nodeCaps:    gpuCaps,
 			serving:     false,
 			workerHeld:  false,
-			wantQueues:  []string{"jobs:v1:cpu-general", "jobs:v1:gpu-general"},
+			wantQueues:  []string{worker.DefaultCPUQueue, "jobs:v1:gpu-general"},
 			wantMissing: nil,
 		},
 		{
@@ -40,7 +41,7 @@ func TestResolveControlCenterInferenceQueues(t *testing.T) {
 			nodeCaps:    &capabilities.NodeCapabilities{},
 			serving:     false,
 			workerHeld:  false,
-			wantQueues:  []string{"jobs:v1:cpu-general"},
+			wantQueues:  []string{worker.DefaultCPUQueue},
 			wantMissing: []string{"jobs:v1:gpu-general"},
 		},
 		{
@@ -48,7 +49,7 @@ func TestResolveControlCenterInferenceQueues(t *testing.T) {
 			nodeCaps:    &capabilities.NodeCapabilities{},
 			serving:     true,
 			workerHeld:  false,
-			wantQueues:  []string{"jobs:v1:cpu-general", "jobs:v1:gpu-general"},
+			wantQueues:  []string{worker.DefaultCPUQueue, "jobs:v1:gpu-general"},
 			wantMissing: nil,
 		},
 		{
@@ -56,7 +57,7 @@ func TestResolveControlCenterInferenceQueues(t *testing.T) {
 			nodeCaps:   gpuCaps,
 			serving:    true,
 			workerHeld: true,
-			wantQueues: []string{"jobs:v1:cpu-general"},
+			wantQueues: []string{worker.DefaultCPUQueue},
 			// missing is nil even though a GPU/serving node would otherwise
 			// have queues to add -- workerHeld means this TUI instance never
 			// runs a consume loop, so nothing should be built.
