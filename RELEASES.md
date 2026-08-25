@@ -1688,3 +1688,27 @@ Auto-generated log of every release.
   - docs(terminal): document the existing auto-tmux opt-out + widen its test coverage (#780) (#799)
 
 
+---
+
+## v2.112.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 10 |
+| Files changed | 60 |
+| Lines added | +8751 |
+
+**Changes:**
+
+  - fix(nodevault): close enroll auth-bypass (ConfigDir divergence) + Argon2 header panic (#818)
+  - fix(tui): identity-aware engine de-dupe + exclude unmanaged from managed footprint (#804, #805) (#816)
+  - fix: synchronize leaked goroutine before restoring extraction bounds (#810) (#817)
+  - feat(terminal): accept previous-in-grace token hash during rotation window (#792) (#813)
+  - fix(doctor): show the docker check once, not twice (#803) (#814)
+  - feat(node): encrypted, PIN-unlocked persistent browser profile (#811)
+  - feat(node): master PIN with at-rest envelope encryption (#796) (#808)
+  - feat(node): browser session screencast + input bridge over mesh transport (#809)
+  - feat(node): interactive browser session job type with observable lifecycle (#793) (#806)
+  - docs: node master-PIN + at-rest encryption design (#796) (#807)
+
+
