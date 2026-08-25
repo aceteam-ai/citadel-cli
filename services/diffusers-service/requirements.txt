@@ -2,11 +2,30 @@ diffusers==0.31.0
 transformers==4.46.3
 accelerate==1.1.1
 safetensors==0.4.5
-# sentencepiece + protobuf are needed by the T5 text encoder used by SD 3.5 /
-# other transformer-encoder diffusion models (the default SDXL-Turbo does not
-# need them, but the documented DIFFUSERS_MODEL alternatives do).
+# Full text-encoder tokenizer stack (citadel-cli#829). AutoTokenizer /
+# AutoPipelineForText2Image silently depend on different optional backends
+# per model family, and a missing one fails at model-LOAD time (mid-provision,
+# on the node), not at image-build time. sentencepiece + protobuf back the T5
+# tokenizer used by SD 3.5 Medium and (planned) LTX-Video; ftfy is
+# CLIPTokenizer's optional text-cleaning backend (used by the default
+# SDXL-Turbo). Real incident: LTX-Video's T5 tokenizer failed twice in a row
+# on a live node -- first `ModuleNotFoundError: No module named 'tiktoken'`
+# (this transformers version's tokenizer-loading path imported it on that
+# model's tokenizer even though tiktoken's own BPE format isn't otherwise
+# involved -- root cause not fully traced beyond the observed error; treat as
+# an empirical requirement for this pin set, not a documented mechanism), then
+# `ValueError: Error parsing tokenizer/spiece.model` once tiktoken alone was
+# hand-installed but sentencepiece/protobuf were not (reproduced locally:
+# services/diffusers-service/scripts/check_tokenizer_deps.py fails the same
+# way against Lightricks/LTX-Video's tokenizer with sentencepiece
+# uninstalled). Bake all four so no supported model can hit this class of
+# failure again. Pinned to versions contemporaneous with the
+# transformers/diffusers pins above; do NOT loosen any pin in this file when
+# adding to it.
 sentencepiece==0.2.0
 protobuf==5.28.3
+tiktoken==0.8.0
+ftfy==6.3.1
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4
