@@ -180,3 +180,46 @@ func TestCollectorWorkerLiveness(t *testing.T) {
 		t.Errorf("Worker = %+v, want nil (omitted) when no provider set", st2.Worker)
 	}
 }
+
+// TestCollectorSwapActivity verifies the #717 heartbeat swap-activity
+// attachment: when a SwapStats provider is set, Collect() attaches it; when it
+// is not (hotswap off, or a node with no swap manager wired at all), the field
+// is omitted so a hotswap-off heartbeat is byte-identical to one predating this
+// field. Mirrors TestCollectorWorkerLiveness above.
+func TestCollectorSwapActivity(t *testing.T) {
+	withFn := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		SwapStats: func() *SwapActivity {
+			return &SwapActivity{
+				SwapsPerHour:         3,
+				EvictingSwapsPerHour: 1,
+				MaxEvictingPerHour:   6,
+				Recent: []SwapRecord{
+					{Backend: "bonsai", Model: "Bonsai-27B-Q1_0.gguf", Outcome: "ready"},
+				},
+			}
+		},
+	})
+	st, err := withFn.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st.Swap == nil {
+		t.Fatal("Swap activity not attached when provider was set")
+	}
+	if st.Swap.SwapsPerHour != 3 || st.Swap.EvictingSwapsPerHour != 1 || st.Swap.MaxEvictingPerHour != 6 {
+		t.Errorf("Swap = %+v, want swaps_per_hour=3 evicting=1 max=6", st.Swap)
+	}
+	if len(st.Swap.Recent) != 1 || st.Swap.Recent[0].Backend != "bonsai" {
+		t.Errorf("Swap.Recent = %+v, want one bonsai record", st.Swap.Recent)
+	}
+
+	without := NewCollector(CollectorConfig{NodeName: "test-node"})
+	st2, err := without.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st2.Swap != nil {
+		t.Errorf("Swap = %+v, want nil (omitted) when no provider set", st2.Swap)
+	}
+}

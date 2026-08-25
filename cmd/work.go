@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -673,6 +674,20 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Post-connect wiring that runs LATER in startup (push-wake) waits on it so a
 	// late connect still gets armed. nil outside API mode.
 	var wsRetryDone <-chan struct{}
+	// nodeSwapManager is the model-hotswap swap manager (citadel-cli#632),
+	// constructed later inside buildNodeJobHandlers (nil under the break-glass
+	// disable or with no config dir). It is an atomic.Pointer, NOT a plain var
+	// like pubSubTransportFn above: the status/heartbeat publisher goroutines
+	// (Redis status publisher, API status publisher, the /status HTTP server)
+	// are all started EARLIER in this function and read this value via
+	// swapStatsFn's closure from their own goroutines, while the single Store
+	// below happens later on the main goroutine at the buildNodeJobHandlers call
+	// site — an unsynchronized plain var would be a genuine data race between
+	// that write and those concurrent reads (citadel-cli#717 review). A plain
+	// var IS safe for pubSubTransportFn because that one is assigned before any
+	// reader goroutine starts; this one is not, so it needs its own
+	// synchronization instead of relying on assignment order.
+	var nodeSwapManager atomic.Pointer[worker.SwapManager]
 
 	// Live worker introspection state for the out-of-band control path
 	// (issue #236). Created here so the same pointer is shared by the runner
@@ -1247,6 +1262,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		return live
 	}
 
+	// Model-hotswap swap-activity stats for the heartbeat (citadel-cli#717): "is
+	// this node thrashing?" without shell access. nodeSwapManager.Store is called
+	// below at the buildNodeJobHandlers call site, from status-publisher
+	// goroutines that are already running by then (Load() is what makes that
+	// safe); nil here (before the store) or under the hotswap break-glass
+	// disable means no Swap block on the heartbeat.
+	swapStatsFn := func() *status.SwapActivity {
+		mgr := nodeSwapManager.Load()
+		if mgr == nil {
+			return nil
+		}
+		return swapStatsFrom(mgr.SwapStats())
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1259,6 +1288,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			Services:       nil,
 			Capabilities:   statusCaps,
 			WorkerLiveness: workerLivenessFn,
+			SwapStats:      swapStatsFn,
 			PinnedServices: manifestPinnedServices(workManifest),
 			ModelHotswap:   status.ModelHotswapEnabled(),
 		})
@@ -1547,6 +1577,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				Services:       nil,
 				Capabilities:   statusCaps,
 				WorkerLiveness: workerLivenessFn,
+				SwapStats:      swapStatsFn,
 				PinnedServices: manifestPinnedServices(workManifest),
 				ModelHotswap:   status.ModelHotswapEnabled(),
 			})
@@ -2159,7 +2190,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 		PinnedServices:            manifestPinnedServices(workManifest),
 	}
-	handlers := buildNodeJobHandlers(nodeJobOpts)
+	handlers, swapMgr := buildNodeJobHandlers(nodeJobOpts)
+	// Published via atomic.Store, not a plain assignment: status-publisher
+	// goroutines started earlier in this function may already be calling
+	// swapStatsFn's nodeSwapManager.Load() concurrently with this write
+	// (citadel-cli#717 review) -- see the nodeSwapManager declaration above.
+	nodeSwapManager.Store(swapMgr)
 
 	// Build job record function for usage tracking
 	var jobRecordFn func(record usage.UsageRecord)
@@ -2696,6 +2732,46 @@ func workerLivenessFrom(snap worker.WorkerSnapshot) *status.WorkerLiveness {
 		Failed:             snap.Failed,
 		IdentityUnresolved: snap.IdentityUnresolved,
 	}
+}
+
+// swapStatsFrom projects a worker.SwapStats onto the heartbeat-facing
+// status.SwapActivity payload (citadel-cli#717). Extracted like
+// workerLivenessFrom above so the hand-maintained field-by-field mapping
+// between the two independently-evolving structs is testable on its own.
+//
+// Recent is mirrored in full (bounded by swap_ledger.go's swapRecordsKept=64
+// and pruned to the trailing rate window), matching worker.SwapStats' own
+// doc comment: the counters ARE the #717 ask, but the records exist so a "why
+// is this node slow" question has an answer instead of a number, and that
+// reasoning applies just as much on the heartbeat as it does to the
+// ObserveSwap log line. Only a node with heavy swap churn pays for a larger
+// payload -- the same condition an operator most wants the detail for.
+func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
+	activity := &status.SwapActivity{
+		SwapsPerHour:         stats.SwapsPerHour,
+		EvictingSwapsPerHour: stats.EvictingSwapsPerHour,
+		MaxEvictingPerHour:   stats.MaxEvictingPerHour,
+	}
+	if len(stats.Recent) > 0 {
+		activity.Recent = make([]status.SwapRecord, len(stats.Recent))
+		for i, r := range stats.Recent {
+			activity.Recent[i] = status.SwapRecord{
+				Backend: r.Backend,
+				Model:   r.Model,
+				// Copied rather than aliased: r.Evicted is already an
+				// independent slice by the time it reaches here (swap.go's
+				// swapRecord builds it via append([]string(nil), ...)), so
+				// this is redundant today, not required for correctness --
+				// but it removes any future dependence on that internal
+				// invariant holding.
+				Evicted:   append([]string(nil), r.Evicted...),
+				StartedAt: r.StartedAt,
+				Wait:      r.Wait,
+				Outcome:   r.Outcome,
+			}
+		}
+	}
+	return activity
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {

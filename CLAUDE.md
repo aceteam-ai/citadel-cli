@@ -1066,6 +1066,48 @@ The knobs are package vars (so tests need not sleep an hour) with the shipped
 values pinned by `TestSwapAccountingDefaults` — change them there. The ledger is
 in-process: the bound resets on restart, so a crash-looping worker can exceed it.
 
+**Swap activity on the heartbeat (citadel #717).** `SwapManager.SwapStats()`
+(swaps-per-hour, the evicting subset, the ceiling, and recent records) is
+attached to the heartbeat as `NodeStatus.Swap` — `internal/status.SwapActivity`
+— so "is this node thrashing?" is answerable without shell access. The swap
+manager is constructed inside `buildNodeJobHandlers` (`cmd/nodejobs.go`), not at
+the collector site, so `buildNodeJobHandlers` returns it as a second value and
+`cmd/work.go` threads it to the collector via `nodeSwapManager`, an
+`atomic.Pointer[worker.SwapManager]` — deliberately NOT a plain var like
+`pubSubTransportFn`: the status-publisher goroutines (Redis, API, the `/status`
+HTTP server) are already running by the time `buildNodeJobHandlers` returns and
+`Store`s it, so `swapStatsFn`'s `Load()` on every heartbeat collection is racing
+that one write. `pubSubTransportFn` gets away with a plain var only because it
+is assigned before any reader goroutine starts — an earlier version of this
+wiring copied that pattern without checking the ordering and had a real data
+race as a result; if you touch this again, check which side of goroutine
+startup the assignment falls on before choosing plain-var vs atomic.
+`internal/status` cannot import `internal/worker` (worker already imports
+status), so `SwapActivity`/`SwapRecord` are a hand-maintained mirror of
+`worker.SwapStats`/`SwapRecord`; the projection is `swapStatsFrom` in
+`cmd/work.go`, tested by `TestSwapStatsFrom` plus a reflection-based shape-parity
+test (`TestSwapShapeParity`) that fails loudly if either side gains a field the
+other doesn't mirror — e.g. #835's `Pulled`. Additive/omitempty: nil when no
+swap manager is wired (hotswap disabled via `CITADEL_MODEL_HOTSWAP`, or no
+config dir), so a hotswap-off heartbeat is unchanged. The control-center-only
+collector (`cmd/controlcenter.go`) does NOT get this field yet — it also
+doesn't wire `WorkerLiveness`/`PinnedServices`/`ModelHotswap`, a pre-existing
+gap this doesn't widen; low-priority follow-up alongside the other
+TUI-collector gaps noted under Service Preemption above.
+
+**"Whether a swap pulled" is still NOT reported (#717 part 2, deferred).**
+`SwapRecord` has no `pulled` field. For docker-based engines (vLLM, bonsai,
+llama.cpp) a weights pull, if any, happens opaquely inside the container's own
+startup during `docker compose up` — invisible to the Go code driving it — so
+observing it honestly needs new engine-specific instrumentation (e.g. sampling
+each engine's model-cache directory before/after `Start`), not just a return
+value threaded through `SwapController.Start`. Native ollama IS observable
+(`ensureOllamaModel` in `internal/jobs/service_handler.go` already knows whether
+a pull ran), but that alone would cover a minority of swap targets. Per #717's
+explicit instruction, a guessed field is worse than no field, so this stays
+open rather than half-implemented; a follow-up issue should scope the
+docker-side instrumentation before adding the field.
+
 ### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
 
 A hung job handler must never silently stall the whole node. The wedge that

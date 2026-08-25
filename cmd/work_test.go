@@ -1,9 +1,14 @@
 package cmd
 
 import (
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
 // TestResolveAutoUpdateEnabled verifies the precedence that lets the web UI /
@@ -229,4 +234,143 @@ func TestNodeQueueName(t *testing.T) {
 			t.Errorf("nodeQueueName(%q, %q) = %q, want %q", tt.orgID, tt.nodeID, got, tt.want)
 		}
 	}
+}
+
+// TestSwapStatsFrom pins the hand-maintained field-by-field projection from
+// worker.SwapStats onto the heartbeat-facing status.SwapActivity (citadel-cli
+// #717), mirroring the existing coverage intent for workerLivenessFrom: a
+// mapping between two independently-evolving structs is exactly the kind of
+// thing that silently loses a field, so it gets its own test.
+func TestSwapStatsFrom(t *testing.T) {
+	startedAt := time.Now().Add(-90 * time.Second)
+	stats := worker.SwapStats{
+		SwapsPerHour:         4,
+		EvictingSwapsPerHour: 2,
+		MaxEvictingPerHour:   6,
+		Recent: []worker.SwapRecord{
+			{
+				Backend:   "bonsai",
+				Model:     "Bonsai-27B-Q1_0.gguf",
+				Evicted:   []string{"vllm"},
+				StartedAt: startedAt,
+				Wait:      90 * time.Second,
+				Outcome:   "ready",
+			},
+		},
+	}
+
+	got := swapStatsFrom(stats)
+	if got == nil {
+		t.Fatal("swapStatsFrom returned nil")
+	}
+	if got.SwapsPerHour != 4 || got.EvictingSwapsPerHour != 2 || got.MaxEvictingPerHour != 6 {
+		t.Errorf("counters = %+v, want swaps=4 evicting=2 max=6", got)
+	}
+	if len(got.Recent) != 1 {
+		t.Fatalf("Recent count = %d, want 1", len(got.Recent))
+	}
+	rec := got.Recent[0]
+	if rec.Backend != "bonsai" || rec.Model != "Bonsai-27B-Q1_0.gguf" || rec.Outcome != "ready" {
+		t.Errorf("record = %+v, want backend=bonsai model=Bonsai-27B-Q1_0.gguf outcome=ready", rec)
+	}
+	if len(rec.Evicted) != 1 || rec.Evicted[0] != "vllm" {
+		t.Errorf("Evicted = %v, want [vllm]", rec.Evicted)
+	}
+	if !rec.StartedAt.Equal(startedAt) {
+		t.Errorf("StartedAt = %v, want %v", rec.StartedAt, startedAt)
+	}
+	if rec.Wait != 90*time.Second {
+		t.Errorf("Wait = %v, want 90s", rec.Wait)
+	}
+
+	// Evicted must be an independent copy, not an alias of the source slice:
+	// mutating the caller's stats after conversion must not reach back into the
+	// already-returned heartbeat payload.
+	stats.Recent[0].Evicted[0] = "mutated"
+	if got.Recent[0].Evicted[0] != "vllm" {
+		t.Errorf("Evicted aliases the source slice: got %v after mutating the source, want unaffected [vllm]", got.Recent[0].Evicted)
+	}
+
+	// Empty stats (no swaps yet) must not panic and must yield a non-nil struct
+	// with a nil Recent slice, matching the omitempty JSON contract.
+	empty := swapStatsFrom(worker.SwapStats{MaxEvictingPerHour: 6})
+	if empty == nil {
+		t.Fatal("swapStatsFrom(empty) returned nil")
+	}
+	if empty.Recent != nil {
+		t.Errorf("Recent = %v, want nil for no records", empty.Recent)
+	}
+}
+
+// TestSwapShapeParity guards the hand-maintained mirror between
+// worker.SwapStats/SwapRecord (the source of truth, owned by the swap
+// manager) and status.SwapActivity/SwapRecord (the heartbeat-facing
+// projection swapStatsFrom builds). internal/status cannot import
+// internal/worker (worker already imports status), so nothing but a test
+// keeps the two shapes honest: without this, #835 adding a `Pulled` field to
+// worker.SwapRecord would compile fine and silently never reach the
+// heartbeat, because swapStatsFrom maps fields by hand with no compiler link
+// between the two structs. Mirrors the "pin it so a reader can check in one
+// step" convention CLAUDE.md cites for TestSwapAccountingDefaults.
+//
+// This checks JSON field-name parity, not type identity: SwapStats.Recent is
+// []worker.SwapRecord and SwapActivity.Recent is []status.SwapRecord, which
+// is expected (the whole point of the mirror) and not itself a violation.
+func TestSwapShapeParity(t *testing.T) {
+	assertFieldsMatch := func(t *testing.T, source, mirror reflect.Type) {
+		t.Helper()
+		sourceFields := jsonFieldNames(source)
+		mirrorFields := jsonFieldNames(mirror)
+		for name := range sourceFields {
+			if _, ok := mirrorFields[name]; !ok {
+				t.Errorf("%s has JSON field %q with no counterpart in %s -- "+
+					"a field was added to the swap manager's source-of-truth "+
+					"type without updating the heartbeat-facing mirror (and "+
+					"swapStatsFrom), so it will never reach the heartbeat",
+					source, name, mirror)
+			}
+		}
+		for name := range mirrorFields {
+			if _, ok := sourceFields[name]; !ok {
+				t.Errorf("%s has JSON field %q with no counterpart in %s -- "+
+					"the heartbeat-facing mirror has drifted ahead of its "+
+					"source of truth; verify swapStatsFrom still maps this "+
+					"field from something real", mirror, name, source)
+			}
+		}
+	}
+
+	t.Run("SwapRecord", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(worker.SwapRecord{}),
+			reflect.TypeOf(status.SwapRecord{}))
+	})
+	t.Run("SwapStats/SwapActivity", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(worker.SwapStats{}),
+			reflect.TypeOf(status.SwapActivity{}))
+	})
+}
+
+// jsonFieldNames returns the set of JSON field names a struct type encodes
+// to, keyed by the tag name (falling back to the Go field name when there is
+// no json tag, and skipping `json:"-"` fields).
+func jsonFieldNames(t reflect.Type) map[string]struct{} {
+	out := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag, ok := f.Tag.Lookup("json")
+		name := f.Name
+		if ok {
+			parts := strings.Split(tag, ",")
+			if parts[0] == "-" {
+				continue
+			}
+			if parts[0] != "" {
+				name = parts[0]
+			}
+		}
+		out[name] = struct{}{}
+	}
+	return out
 }
