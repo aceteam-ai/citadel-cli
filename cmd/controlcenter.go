@@ -1897,6 +1897,28 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 
+	// citadel#853/#856: mirrors runWork's boot-time --node-dir refusal
+	// (cmd/work.go). This is the control center's OTHER path into
+	// buildNodeJobHandlers (below), which registers the SAME
+	// jobs.NewConfigHandler("") (internal/worker/handler_adapter.go) --
+	// hardcoded to "", NOT threaded from nodeJobHandlerOpts.ConfigDir, so it
+	// is NOT --node-dir-aware regardless of which entry point constructed it.
+	// Without this check here too, a bare `citadel` (TUI, the default when no
+	// dedicated worker holds the lock) run under an active
+	// --node-dir/CITADEL_NODE_DIR would silently apply an APPLY_DEVICE_CONFIG
+	// job against this machine's REAL ~/citadel-node instead of the
+	// override -- exactly the split runWork's refusal exists to prevent, via
+	// a different entry point that reaches the same unguarded handler.
+	if override := resolveNodeDirOverride(); override != "" {
+		return fmt.Errorf(
+			"--node-dir/CITADEL_NODE_DIR (%q) is not supported by the control center's worker mode: like "+
+				"'citadel work', it wires jobs.NewConfigHandler(\"\") (internal/worker/handler_adapter.go), "+
+				"which is not --node-dir-aware and would resolve APPLY_DEVICE_CONFIG jobs against this "+
+				"machine's real config directory regardless of the override. Unset the override to use the "+
+				"control center, or use 'citadel module stop|start|restart' for targeted node operations.",
+			override)
+	}
+
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 

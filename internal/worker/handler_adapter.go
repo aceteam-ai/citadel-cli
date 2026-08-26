@@ -200,6 +200,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// don't run TEI simply never receive `embedding` jobs (they only land on
 		// nodes carrying the task:embedding capability tag).
 		NewLegacyHandlerAdapter(JobTypeEmbedding, &jobs.EmbeddingHandler{}),
+		// citadel-cli#853/#856: "" is NOT --node-dir/CITADEL_NODE_DIR-aware
+		// (falls back to $HOME/citadel-node inside ConfigHandler.Execute) --
+		// safe only because both callers of CreateLegacyHandlersWithOpts
+		// (cmd/work.go's runWork, cmd/controlcenter.go's runTUIWorker) now
+		// refuse to start at all under an active override. See the fuller
+		// note at ConfigHandler.Execute's configDir resolution
+		// (internal/jobs/config_handler.go) before assuming this is safe
+		// from a new call site.
 		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),

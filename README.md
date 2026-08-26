@@ -305,6 +305,35 @@ The built-in updater:
 
 ## Command Reference
 
+**Targeting a specific node directory:** most commands above resolve the node
+manifest (`citadel.yaml` + `services/`) via `$HOME`/the platform config
+directory by default. Pass `--node-dir <path>` (or set `CITADEL_NODE_DIR`) to
+point a command at an explicit node directory instead — useful for scripts,
+tests, and agents that need to target a specific node's config without
+depending on `$HOME`. `citadel module start|stop|restart`, `citadel run`, and
+`citadel stop` honor it fully, including compose-project scoping (the
+`-p`/`--project-name` compose flag is derived from the override dir, so a
+`down`/`up` against it cannot silently touch a different node's containers —
+see below); `citadel module install`/`update` and `citadel catalog install`
+refuse under it (they also write the module lockfile, which this flag
+deliberately does not redirect), and `citadel work` refuses to start at all
+under it, for the same reason.
+
+**What `--node-dir` does NOT give you:** an isolated Docker container
+identity. Every embedded compose file pins a global `container_name:
+citadel-<svc>`, unchanged by which directory citadel materialized/read it
+from — so on a machine whose Docker daemon also runs a real citadel node,
+`--node-dir` compose actions are scoped to a distinct *compose project* (safe
+against silently reusing/destroying the real container: `down` no-ops, `up`
+fails loudly on the name conflict), but two nodes still can't run the SAME
+service side by side under the same container name. It also never redirects
+network/mesh state, the module lockfile, or nodevault. If you need an actual
+"refuse unless this is definitely the right node" guarantee regardless of what
+the Docker layer would do, use `--expect-node <name-or-id>` on `citadel module
+stop|start|restart` — that's the real cross-node safety net; `--node-dir`
+alone is a targeting convenience with a safer failure mode, not isolation.
+See `citadel --help` for the full flag description.
+
 ### Interactive Mode
 
 | Command | Description |
@@ -320,6 +349,7 @@ The built-in updater:
 | `citadel work`                                                            | **(Primary command)** Starts services from manifest AND runs the job worker (Redis Streams). Includes auto-update checks.                                                                              |
 | `citadel run [service]`                                                   | Starts services only. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                     |
 | `citadel stop [service]`                                                  | Stops services. With no arguments, stops all manifest services. With a service name, stops that specific service.                                                                                       |
+| `citadel module start\|stop\|restart <name>`                              | **Blessed recovery path** for a single stopped/crashed service — an embedded engine (`vllm`, `bonsai`, ...) or a catalog module alike. Scoped: no sibling module is touched. Never hand-run `docker compose` directly — several compose files require citadel-injected env vars (host ports) that only citadel supplies. Add `--dry-run` to preview, or `--expect-node <name>` to refuse if this isn't the node you expect. |
 | `citadel login`                                                           | Connects the machine to the network. Interactive prompts by default, or use `--authkey <key>` for non-interactive automation.                                                                           |
 
 ### Node Operation & Monitoring

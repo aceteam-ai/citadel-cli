@@ -99,3 +99,30 @@ func TestComposeEnvWorkspaceDefaultsAndNeverEmpty(t *testing.T) {
 		t.Errorf("CITADEL_WORKSPACE %q is not an absolute path", got)
 	}
 }
+
+// --- composeFailureMessage (citadel#854) ---
+
+func TestComposeFailureMessage_GuardedVarAppendsHint(t *testing.T) {
+	raw := "error while interpolating services.vllm.ports.[0]: required variable CITADEL_VLLM_HOST_PORT is missing a value: citadel must supply CITADEL_VLLM_HOST_PORT"
+	got := composeFailureMessage("vllm", []byte(raw))
+	if !strings.Contains(got, raw) {
+		t.Fatalf("composeFailureMessage should preserve the original docker error, got: %s", got)
+	}
+	if !strings.Contains(got, "citadel module start vllm") {
+		t.Fatalf("composeFailureMessage should point at 'citadel module start vllm', got: %s", got)
+	}
+	if !strings.Contains(got, "citadel run vllm") {
+		t.Fatalf("composeFailureMessage should also mention 'citadel run vllm', got: %s", got)
+	}
+}
+
+func TestComposeFailureMessage_UnrelatedFailureUnchanged(t *testing.T) {
+	raw := "Error response from daemon: pull access denied for some/image"
+	got := composeFailureMessage("vllm", []byte(raw))
+	if got != raw {
+		t.Fatalf("composeFailureMessage should pass through an unrelated failure unchanged, got: %s", got)
+	}
+	if strings.Contains(got, "citadel module start") {
+		t.Fatalf("unrelated failure must not get the guard hint, got: %s", got)
+	}
+}

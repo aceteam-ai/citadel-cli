@@ -300,6 +300,13 @@ func runCatalogInfo(cmd *cobra.Command, args []string) error {
 
 // runCatalogInstall installs a service from the catalog and registers it in the manifest.
 func runCatalogInstall(cmd *cobra.Command, args []string) error {
+	// citadel#853: writes both the manifest (--node-dir-aware) and the module
+	// lockfile (not --node-dir-aware) -- see cmd/nodedir.go. Also covers
+	// 'citadel module install <catalog-name>', which delegates here.
+	if err := refuseIfLockfileWriteUnsupported("citadel catalog install"); err != nil {
+		return err
+	}
+
 	name := args[0]
 
 	// Parse --set flags into a map.

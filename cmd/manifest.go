@@ -82,7 +82,16 @@ func manifestPinnedServices(m *CitadelManifest) []string {
 // It exclusively uses the global config file as the single source of truth for
 // locating the node's configuration directory. This ensures consistent behavior
 // regardless of the current working directory.
+//
+// EXCEPTION (citadel#853): when --node-dir/CITADEL_NODE_DIR is set
+// (resolveNodeDirOverride), the global config indirection is bypassed
+// entirely and citadel.yaml is read directly from the override directory. See
+// cmd/nodedir.go for why this exists and its exact scope.
 func findAndReadManifest() (*CitadelManifest, string, error) {
+	if override := resolveNodeDirOverride(); override != "" {
+		return readManifestFromDir(override)
+	}
+
 	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
 
 	// Step 1: Read the global config file to find the node's directory.
@@ -155,8 +164,39 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 	return &manifest, nodeConfigDir, nil
 }
 
+// readManifestFromDir loads citadel.yaml directly from configDir, bypassing the
+// global config.yaml indirection entirely. This is the --node-dir/
+// CITADEL_NODE_DIR override path (citadel#853): a caller that wants to target
+// an explicit node directory without depending on $HOME or platform.ConfigDir()
+// gets EXACTLY that directory, with no auto-fix/fallback behavior layered on
+// top (unlike the default path above, which self-heals a missing
+// node_config_dir key).
+func readManifestFromDir(configDir string) (*CitadelManifest, string, error) {
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("manifest not found at %s (--node-dir/CITADEL_NODE_DIR override). Run 'citadel init' there, or drop the override to use the default location", manifestPath)
+		}
+		return nil, "", fmt.Errorf("could not read manifest from %s: %w", manifestPath, err)
+	}
+
+	var manifest CitadelManifest
+	if err := yaml.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, "", fmt.Errorf("could not parse manifest from %s: %w", manifestPath, err)
+	}
+	return &manifest, configDir, nil
+}
+
 // findOrCreateManifest returns the manifest if it exists, or creates a bootstrap
 // configuration if it doesn't. This enables `citadel run` to work without `citadel init`.
+//
+// EXCEPTION (citadel#853): when --node-dir/CITADEL_NODE_DIR is set, a missing
+// manifest is bootstrapped AT the override directory instead of
+// $HOME/citadel-node, and the machine-wide global config.yaml is left
+// untouched -- an override is a one-off target (a test, an agent's isolated
+// probe), not a new permanent default for every future un-overridden
+// invocation on this machine.
 func findOrCreateManifest() (*CitadelManifest, string, error) {
 	// Try to find existing manifest
 	manifest, configDir, err := findAndReadManifest()
@@ -164,13 +204,16 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 		return manifest, configDir, nil
 	}
 
-	// No manifest found - bootstrap a minimal configuration
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to get home directory: %w", err)
+	override := resolveNodeDirOverride()
+	if override != "" {
+		configDir = override
+	} else {
+		homeDir, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return nil, "", fmt.Errorf("failed to get home directory: %w", homeErr)
+		}
+		configDir = filepath.Join(homeDir, "citadel-node")
 	}
-
-	configDir = filepath.Join(homeDir, "citadel-node")
 	servicesDir := filepath.Join(configDir, "services")
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
@@ -203,9 +246,12 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 		return nil, "", err
 	}
 
-	// Create global config pointing to this directory
-	if err := writeGlobalConfig(configDir); err != nil {
-		return nil, "", err
+	// Only point the machine-wide global config at this dir when there is no
+	// override active -- see the function doc comment above.
+	if override == "" {
+		if err := writeGlobalConfig(configDir); err != nil {
+			return nil, "", err
+		}
 	}
 
 	fmt.Printf("✅ Created new configuration at %s\n", configDir)

@@ -262,10 +262,14 @@ Built with Cobra. Main command files are in `cmd/`:
 - `status.go`: Health check dashboard (system vitals, GPU, network, services)
 - `login.go`: Interactive AceTeam Network authentication
 - `logout.go`: Disconnect from AceTeam Network
-- `down.go`: Stops services defined in citadel.yaml
-- `run.go`: Ad-hoc service execution without manifest
+- `run.go`: Ad-hoc service execution without manifest; also owns `citadel stop` (despite the name, `stop.go` is where that command lives)
 - `logs.go`: Service log streaming
 - `test.go`: Service diagnostic testing
+
+Stale-doc note found while fixing citadel#853/#854: there is no `down.go`.
+`citadel down` (defined in `up.go`) reverses `citadel up`'s machine-wide TUN
+mode -- it restores routing/DNS and never reads `citadel.yaml`. The
+manifest-mutating "stop services" command is `citadel stop` (`cmd/stop.go`).
 
 ### Core Architecture Patterns
 
@@ -1385,6 +1389,117 @@ already performs — nothing persists it to disk). Full trail, including why
 `internal/devicemode`'s superficially-similar `NodeUID` is NOT this (different
 identity, different — non-overlapping — population of hosts):
 [docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
+
+### Safe node targeting: `--node-dir`, `--dry-run`, `--expect-node` (citadel#853, #854)
+
+Motivated by a real incident: a subagent smoke-testing `citadel module` had set
+an isolated `$HOME` for one shell call, but a LATER call in the same session
+ran without it (shell state does not persist between an agent's tool calls),
+so `citadel module stop/restart` fell through to the default
+`$HOME`/`ConfigDir` resolution and cycled a LIVE production container.
+
+**`--node-dir` (also `CITADEL_NODE_DIR`, global persistent flag,
+`resolveNodeDirOverride` in `cmd/nodedir.go`)** redirects manifest + services-dir
+resolution. It is wired at the single choke point almost every manifest command
+already goes through — `findAndReadManifest`/`findOrCreateManifest`
+(`cmd/manifest.go`) — so it is honored consistently by every command that
+reads the node manifest through those two functions (module stop/start/
+restart, `run`, `stop`, `status`, `services`, `logs`, module/catalog install,
+...) with no per-command checklist to keep in sync or fall out of. When set,
+the `$HOME`/`platform.ConfigDir()`/global-`config.yaml` indirection is bypassed
+ENTIRELY: `citadel.yaml` is read directly from the override dir, and a missing
+manifest there errors rather than silently falling back to `$HOME`.
+
+**Scope — what it does NOT redirect (corrected by the citadel#856 review — the
+original PR overclaimed isolation here; read this before assuming
+`--node-dir` alone makes a target "safe to run against"):** network/mesh
+state (`internal/network.GetStateDir`/`GetNodeConfigDir`, the tsnet identity),
+the module lockfile (`catalog.LockfilePath`, still hardcoded to
+`platform.ConfigDir()`), anything under `nodevault`/`worklock` — and, the
+sharp one, **Docker container identity**. Every embedded compose file pins a
+GLOBAL `container_name: citadel-<svc>` (`services/compose/*.yml`), unaffected
+by which directory citadel materialized/read the compose file from. On a
+machine whose Docker daemon ALSO runs a real citadel node — the exact
+production topology `--node-dir` exists to be used safely against —
+`citadel run vllm --node-dir /tmp/x` materializes a `vllm.yml` in `/tmp/x`
+naming the SAME `citadel-vllm` container the real node manages. `--node-dir`
+alone does not stop a compose action against that file from touching the real
+container; see "Compose-project scoping" below for what closes (part of) that
+gap, and what still doesn't.
+
+This means `citadel module install <source>` / `module update` / `catalog
+install` (which write BOTH the manifest and the lockfile) are deliberately NOT
+override-aware end to end: `refuseIfLockfileWriteUnsupported`
+(`cmd/nodedir.go`), called from their RunE functions, REFUSES rather than
+silently splitting a module's manifest entry (override dir) from its
+provenance (real machine's `modules.lock`) — half-honoring an override here
+would be worse than not honoring it. `citadel work` refuses the SAME way, but
+at boot rather than per-call: its reconcile loop and MODULE_SET handler drive
+the identical `liveModuleOps.Install`/`Uninstall` from inside a long-running
+process, so a per-job refusal there would just be an infinite quiet converge
+failure (a silently-dark node) rather than a fixable operator error — `runWork`
+(`cmd/work.go`) checks the override once, before any job source connects, and
+exits loudly if set. `citadel module stop|start|restart` never touch the
+lockfile (only the `desired_status` marker + compose up/down), so they — and
+the service startup `citadel work` does before reaching its reconcile loop —
+are fully override-aware for MANIFEST resolution. Threading the override into
+the catalog lockfile path is a deferred follow-up.
+
+**Compose-project scoping (citadel#856).** `composeProjectOverride`/
+`composeArgsWithProject` (`cmd/nodedir.go`) derive a `-p`/`--project-name`
+compose flag from a hash of the resolved override directory, and every
+compose invocation `module stop|start|restart`/`run`/`stop` drive
+(`composeCommandFor`, `startServiceComposeArgs`, `stopComposeArgs`) applies it
+— when no override is active this is a byte-identical no-op, preserving the
+#528 no-`-p` default exactly. Under an override, this converts the failure
+mode from "silent" to "safe and loud": `down` selects containers by the
+`com.docker.compose.project` label, so it cannot match a DIFFERENT project's
+container and becomes a no-op; `up` on a `container_name` already owned by a
+different project fails outright (`composeFailureMessage` detects this and
+names the cause instead of leaking raw docker output). It does NOT namespace
+`container_name` itself, so this is project-identity isolation, not
+container-identity isolation — two override dirs both materializing the same
+embedded service still collide with each other (loudly) on `up`. True
+per-node container-name isolation is a deferred follow-up, tracked in
+citadel#860.
+
+Two RAW (non-compose) container-name paths cannot be protected by `-p` at all,
+because plain `docker inspect`/`stop`/`rm` take a bare name with no
+project-scoping mechanism: `startService`'s pre-flight "does this container
+already exist" check (`cmd/service.go`) SKIPS entirely under an active
+override — the project-scoped `up -d` alone is sufficient for idempotency and
+fails loudly on a real conflict instead of this code reading/deleting the
+wrong container first — and `stopServiceByContainer`'s fallback (`cmd/stop.go`,
+used when a service isn't in the resolved manifest) REFUSES outright under an
+active override rather than stop/remove a container it cannot verify belongs
+to this node.
+
+**`citadel module stop|start|restart --dry-run`** (`cmd/module_control.go`)
+prints the resolved node dir, the compose file, the compose project (when an
+override is active), and the container name(s) — read from the compose
+file's own `container_name:` fields where possible (`dryRunContainerNames`),
+not just the `citadel-<name>` convention (see the Service Management section
+above on why that convention alone isn't trustworthy) — and returns before
+`newLiveModuleOps` is ever constructed, so nothing is touched.
+
+**`--expect-node <name-or-id>` is the actual cross-node guarantee — not
+`--node-dir` alone.** It refuses (fails CLOSED) unless the resolved node's
+identity matches, checked BEFORE anything else runs — including before
+printing a `--dry-run` plan, since a preview a real run would refuse is the
+wrong direction of error — and regardless of what the Docker/compose layer
+above would have done. It reuses citadel#844's identity resolution
+(`gatherIdentity`, `cmd/whoami.go`) rather than reinventing node-identity
+logic; `nodeIdentityMatches` compares case-insensitively against the manifest
+node name (itself `--node-dir`-aware), OS hostname, and the live Headscale
+mesh node ID. If a caller genuinely needs "refuse unless this is definitely
+the intended node" (rather than "a friendlier failure mode if it isn't"),
+`--expect-node` is that primitive; `--node-dir` by itself is a targeting
+convenience with improved failure modes, not isolation.
+
+`citadel whoami --node-dir ...` deliberately skips writing `identity.json`
+(which lives at the REAL machine's `network.GetNodeConfigDir()`, not the
+override) rather than caching an overridden node's identity into the real
+machine's cache file.
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
