@@ -1292,6 +1292,29 @@ instead of a stream-publish failure. `needsGPUSlot` is the authority for which
 job types can reach that Nack at all; extend `gpuBoundJobTypes`, not the check
 site, if another job type turns out to genuinely contend for engine VRAM.
 
+### Node self-identity and the missing numeric fabric ID (`citadel whoami`, aceteam #8139)
+
+`citadel whoami` (alias `id`, `cmd/whoami.go`) answers "am I on a Citadel node,
+and what is its identity?" from local/persisted state and caches the answer at
+`<node config dir>/identity.json`. `gatherIdentity` (`cmd/whoami.go`) is the
+authority for which sources feed which field — read it, don't assume.
+
+**No numeric AceTeam fabric node ID is persisted anywhere on a node's local
+filesystem.** The device-auth response (`nexus.TokenResponse`,
+`internal/nexus/deviceauth.go`) carries org/user identity but never a node ID;
+nothing else writes one either. The one on-disk slot clearly intended for it —
+`SSHSyncConfig.NodeID` ("Node ID in AceTeam platform",
+`internal/nexus/sshkeys.go`) — has no code path that ever writes it
+(`SaveSSHSyncConfig` has zero non-test callers). `gatherIdentity` still reads
+it opportunistically so it lights up for free the day a backend process
+starts populating it. The only fabric-adjacent identifier resolvable from a
+node today is the Headscale/mesh numeric node ID, and only LIVE (the same
+saved-state `VerifyOrReconnect` + `GetGlobalStatus` probe `citadel status`
+already performs — nothing persists it to disk). Full trail, including why
+`internal/devicemode`'s superficially-similar `NodeUID` is NOT this (different
+identity, different — non-overlapping — population of hosts):
+[docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json

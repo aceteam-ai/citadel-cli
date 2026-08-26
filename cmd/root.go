@@ -287,6 +287,7 @@ func init() {
 func hideAdvancedCommands() {
 	visible := map[string]bool{
 		"status":  true,
+		"whoami":  true,
 		"update":  true,
 		"version": true,
 		"help":    true,
