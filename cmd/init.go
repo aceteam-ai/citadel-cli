@@ -38,6 +38,23 @@ var (
 	userAddedToDockerGroup bool // Track if we added user to docker group in this run
 )
 
+// fixStatePermissionsFn is network.FixStatePermissions, indirected through a
+// package var so tests can observe/stub the call without needing to run as
+// root (citadel-cli#878). Real callers always get the real function; only
+// tests override it.
+var fixStatePermissionsFn = network.FixStatePermissions
+
+// nodeConfigDirFn is network.GetNodeConfigDir, indirected the same way as
+// fixStatePermissionsFn so a test can point saveDeviceConfigToFile/
+// saveRedisURLToConfig at a temp directory instead of the real
+// machine-convergent node config dir. Overriding this (rather than calling
+// network.GetNodeConfigDir() directly) matters here specifically: on a real
+// node, that directory can resolve outside the test's temp dir via
+// /etc/citadel/config.yaml's node_config_dir (world-readable, no root
+// needed to read it), so a test that didn't redirect this would write into
+// this machine's real citadel-node/config.yaml.
+var nodeConfigDirFn = network.GetNodeConfigDir
+
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
@@ -1027,7 +1044,7 @@ func maskToken(token string) string {
 // to the legacy platform.ConfigDir() location for a node registered before
 // this fix.
 func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
-	globalConfigDir := network.GetNodeConfigDir()
+	globalConfigDir := nodeConfigDirFn()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1085,6 +1102,16 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	if err := verifyConfigPersisted(globalConfigFile, token.DeviceAPIToken); err != nil {
 		return fmt.Errorf("config verification failed after write: %w", err)
 	}
+
+	// Fix ownership of the node config dir after a successful write (citadel-cli
+	// #878, follow-up to #845/#877): when this runs as root (e.g. `sudo citadel
+	// init` re-auth in the NetChoiceVerified branch, where Connect() is NOT
+	// re-invoked because the network is already connected), the write above can
+	// leave a root-owned config.yaml in an otherwise non-root-owned
+	// network.GetNodeConfigDir(). Best-effort and a no-op when not root -- see
+	// FixStatePermissions' doc comment -- so it must never turn this successful
+	// write into an error return.
+	fixStatePermissionsFn()
 
 	return nil
 }
@@ -1158,7 +1185,7 @@ func verifyConfigPersisted(configFile, expectedToken string) error {
 // Deprecated: use saveDeviceConfigToFile instead.
 // This is called after device auth to store the org-specific Redis endpoint.
 func saveRedisURLToConfig(redisURL string) error {
-	globalConfigDir := network.GetNodeConfigDir()
+	globalConfigDir := nodeConfigDirFn()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1193,6 +1220,11 @@ func saveRedisURLToConfig(redisURL string) error {
 	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
+
+	// Fix ownership of the node config dir after a successful write --
+	// see saveDeviceConfigToFile's identical comment (citadel-cli #878).
+	fixStatePermissionsFn()
+
 	return nil
 }
 
