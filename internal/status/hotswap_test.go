@@ -54,6 +54,23 @@ func TestCollectInstalledEngines_AdvertisesStoppedWithDefaultModel(t *testing.T)
 	if bonsai.VRAMEstimateMB == 0 {
 		t.Errorf("expected a non-zero VRAM estimate for bonsai")
 	}
+	// citadel-cli#684: the disk-only branch (compose materialized, container
+	// NOT running) must classify as ReadinessDown with the exact reason the
+	// issue names, additive on top of the unchanged Status/Health assertions
+	// above. No live probe ran here (this is a filesystem read), so ProbedAt
+	// stays nil.
+	if bonsai.Readiness != ReadinessDown {
+		t.Errorf("readiness = %q, want %q", bonsai.Readiness, ReadinessDown)
+	}
+	if bonsai.Reason != "installed_not_running" {
+		t.Errorf("reason = %q, want %q", bonsai.Reason, "installed_not_running")
+	}
+	if bonsai.ProbedAt != nil {
+		t.Errorf("probed_at = %v, want nil (no live probe ran)", bonsai.ProbedAt)
+	}
+	if bonsai.Health != HealthStatusUnknown {
+		t.Errorf("health = %q, want %q (unchanged by #684)", bonsai.Health, HealthStatusUnknown)
+	}
 }
 
 func TestResolveInstalledModel_EnvOverrideWins(t *testing.T) {

@@ -337,6 +337,32 @@ type ServiceInfo struct {
 	// fit: the live footprint VRAM for a running engine, else a coarse per-engine
 	// estimate. Omitted (0) when unknown or hotswap off.
 	VRAMEstimateMB int `json:"vram_estimate_mb,omitempty"`
+
+	// Readiness is a four-valued lifecycle/protocol classification, PURELY
+	// ADDITIVE to Status/Health (citadel-cli#684): one of ReadinessDown,
+	// ReadinessStarting, ReadinessReady, ReadinessUnhealthy. Status and Health
+	// keep their pre-#684 values byte-for-byte for every case that was already
+	// classified correctly -- Readiness exists because "up but not serving yet"
+	// (a loading vLLM/TEI) previously had no honest lifecycle name of its own and
+	// either vanished from the heartbeat entirely or was indistinguishable from a
+	// fully stopped/never-installed engine. Omitted when the producer performed
+	// no readiness classification (e.g. the collectRunningEmbeddedServices
+	// backstop, which runs no probe at all) -- omission means "not evaluated",
+	// never "down".
+	Readiness string `json:"readiness,omitempty"`
+
+	// ProbedAt is when the live readiness probe that produced Readiness last
+	// ran. nil when Readiness was derived without a live protocol probe (e.g.
+	// the installed-but-not-running disk branch, collectInstalledEngines) or
+	// when Readiness itself is unset. This is the expiry marker the issue calls
+	// out: without it a stale Readiness value from a paused heartbeat has
+	// nothing marking it as old.
+	ProbedAt *time.Time `json:"probed_at,omitempty"`
+
+	// Reason is a short, stable string explaining why Readiness holds its
+	// current value, e.g. "model discovery probe timed out after 2s" or
+	// "installed_not_running". Omitted when Readiness is unset.
+	Reason string `json:"reason,omitempty"`
 }
 
 // HealthResponse is the response for /health endpoint.
@@ -374,6 +400,19 @@ const (
 	// that need READINESS, for example the platform's TEI embedding-node resolver,
 	// must gate on this health value, not on Status alone.
 	HealthStatusStarting = "starting"
+)
+
+// Readiness constants (citadel-cli#684). Four-valued, purely additive to
+// Status/Health (see ServiceInfo.Readiness):
+//   - ReadinessDown:      no container and no process.
+//   - ReadinessStarting:  lifecycle up, protocol probe not passing yet.
+//   - ReadinessReady:     serving the declared models now.
+//   - ReadinessUnhealthy: lifecycle up, probe failing past a threshold.
+const (
+	ReadinessDown      = "down"
+	ReadinessStarting  = "starting"
+	ReadinessReady     = "ready"
+	ReadinessUnhealthy = "unhealthy"
 )
 
 // StatusVersion is the current version of the status payload format.

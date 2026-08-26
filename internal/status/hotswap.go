@@ -171,12 +171,23 @@ func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{
 		}
 		notResident := false
 		out = append(out, ServiceInfo{
-			Name:           name,
-			Type:           ServiceTypeLLM,
-			Status:         ServiceStatusStopped,
-			Port:           managedEngineHostPort(name),
-			Health:         HealthStatusUnknown,
-			Models:         []string{model},
+			Name:   name,
+			Type:   ServiceTypeLLM,
+			Status: ServiceStatusStopped,
+			Port:   managedEngineHostPort(name),
+			Health: HealthStatusUnknown,
+			Models: []string{model},
+			// Readiness/Reason (citadel-cli#684): Status/Health above are
+			// unchanged (still "stopped"/"unknown") -- this is the disk-only
+			// branch, no container is running and no live probe ran, so
+			// ProbedAt stays nil (there is nothing to time-stamp: this is a
+			// filesystem read, not a protocol probe). ReadinessDown +
+			// "installed_not_running" is the exact classification the issue
+			// calls out for this branch, distinguishing "we know this engine
+			// was deployed here but it is not running" from "we know nothing
+			// about this engine at all".
+			Readiness:      ReadinessDown,
+			Reason:         "installed_not_running",
 			Resident:       &notResident,
 			VRAMEstimateMB: engineVRAMEstimateMB[name],
 		})

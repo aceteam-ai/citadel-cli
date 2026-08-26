@@ -65,6 +65,13 @@ var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unli
 // ModelDiscoveryTimeout and a failure simply leaves the corresponding field
 // empty.
 //
+// Readiness/ProbedAt/Reason (citadel-cli#684) are additive on top of the above:
+// Status and Health keep exactly the values described in the paragraph above,
+// unchanged. Readiness carries the same "answered vs. timed out" distinction as
+// a dedicated four-valued field (ReadinessReady / ReadinessStarting) plus WHEN
+// the probe ran and WHY it landed where it did, so a platform that ignores
+// Readiness entirely sees byte-identical Status/Health output to before #684.
+//
 // running is the set of embedded-service names whose "citadel-<name>" container
 // is up, collected once per heartbeat by runningEmbeddedServices.
 func (c *Collector) collectManagedEngineStatus(running map[string]bool) []ServiceInfo {
@@ -85,6 +92,7 @@ func (c *Collector) collectManagedEngineStatus(running map[string]bool) []Servic
 			Health: HealthStatusOK,
 		}
 		responded := false
+		probeAttempted := c.idleTracker != nil || c.modelDiscovery != nil
 
 		if c.idleTracker != nil && engineInList(idleCapableEngines, name) {
 			if state, ok := c.idleTracker.Observe(ctx, name, name, port); ok {
@@ -113,6 +121,12 @@ func (c *Collector) collectManagedEngineStatus(running map[string]bool) []Servic
 			info.Models = nil
 			info.IdleState = nil
 		}
+
+		// Readiness (citadel-cli#684) is purely additive: Status/Health above are
+		// unchanged from pre-#684 behavior. Container is confirmed up (isRunning,
+		// from docker ps), so the only question a live probe answers is whether it
+		// is serving yet.
+		info.Readiness, info.Reason, info.ProbedAt = readinessForProbe(responded, probeAttempted)
 		out = append(out, info)
 	}
 	return out
@@ -192,10 +206,13 @@ func collectEmbeddingServices(
 			Port:   port,
 			Health: HealthStatusStarting,
 		}
+		probedAt := time.Now()
+		info.ProbedAt = &probedAt
 		// TEI answers /health with 200 only once the model has loaded, so this
 		// is the ready-vs-warming decision.
 		if healthy(port) {
 			info.Health = HealthStatusOK
+			info.Readiness = ReadinessReady
 			if md != nil {
 				mctx, cancel := context.WithTimeout(ctx, ModelDiscoveryTimeout)
 				models, err := md.DiscoverEmbeddingModel(mctx, port)
@@ -204,6 +221,11 @@ func collectEmbeddingServices(
 					info.Models = models
 				}
 			}
+		} else {
+			// Readiness (citadel-cli#684) is additive: Health above is unchanged
+			// from pre-#684 behavior (still "starting").
+			info.Readiness = ReadinessStarting
+			info.Reason = "container running, /health has not returned 200 yet"
 		}
 		out = append(out, info)
 	}
@@ -231,6 +253,45 @@ func engineInList(list []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// readinessForProbe derives the additive Readiness/Reason/ProbedAt triple
+// (citadel-cli#684) for an engine confirmed running (container up, via
+// docker ps). It is a pure function -- no I/O, no clock dependency beyond
+// time.Now() -- specifically so the down/starting/ready state matrix is
+// directly unit-testable without a live probe or an httptest server.
+//
+// probeAttempted distinguishes "we tried to ask and it didn't answer" from "we
+// never asked at all": the latter only happens with a Collector that has
+// neither an idle tracker nor a model-discovery client wired (a bare
+// zero-value Collector in a test; production's NewCollector always sets both),
+// and in that case there is no live probe to timestamp, so ProbedAt stays nil.
+// responded means at least one live probe (idle scrape or model discovery)
+// answered within its own timeout this cycle.
+//
+// The unresponded reason deliberately does NOT say "timed out": DiscoverModels
+// fails for three distinct causes -- connection refused (nothing bound to the
+// port yet, the common case for the first several seconds/minutes of a real
+// weights load, e.g. vLLM importing Python before uvicorn binds), a non-200
+// response (still loading), or an actual context.DeadlineExceeded -- and only
+// the last of those is a timeout. Claiming "timed out" for a refused
+// connection would send an operator hunting for a slow engine instead of an
+// unbound port, so the reason names the bound the probe ran under, not a
+// specific cause.
+func readinessForProbe(responded, probeAttempted bool) (readiness, reason string, probedAt *time.Time) {
+	if !probeAttempted {
+		if responded {
+			// Unreachable in practice (responded requires a probe to have run),
+			// but handled explicitly rather than assumed impossible.
+			return ReadinessReady, "", nil
+		}
+		return ReadinessStarting, "container running, no readiness probe available", nil
+	}
+	now := time.Now()
+	if responded {
+		return ReadinessReady, "", &now
+	}
+	return ReadinessStarting, fmt.Sprintf("model discovery probe did not return a served model within %s", ModelDiscoveryTimeout), &now
 }
 
 // managedEnginePortIfRunning reports whether a managed engine is running and,

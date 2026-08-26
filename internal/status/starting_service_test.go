@@ -42,6 +42,17 @@ func TestCollectEmbeddingServices_WarmingIsReportedAsStarting(t *testing.T) {
 	if len(got[0].Models) != 0 {
 		t.Errorf("a warming service must claim no models, got %v", got[0].Models)
 	}
+	// citadel-cli#684: Readiness is additive on top of the Status/Health
+	// assertions above (unchanged).
+	if got[0].Readiness != ReadinessStarting {
+		t.Errorf("readiness = %q, want %q", got[0].Readiness, ReadinessStarting)
+	}
+	if got[0].Reason == "" {
+		t.Error("expected a non-empty reason for the starting classification")
+	}
+	if got[0].ProbedAt == nil {
+		t.Error("expected ProbedAt to be set: a live /health probe did run this cycle")
+	}
 }
 
 // The ready case still reports Health=ok and the served model, so making the
@@ -61,6 +72,17 @@ func TestCollectEmbeddingServices_ReadyReportsModelAndOK(t *testing.T) {
 	}
 	if len(got[0].Models) != 1 || got[0].Models[0] != "Alibaba-NLP/gte-multilingual-base" {
 		t.Errorf("models = %v, want the served TEI model id", got[0].Models)
+	}
+	// citadel-cli#684: Readiness is additive on top of the Status/Health
+	// assertions above (unchanged).
+	if got[0].Readiness != ReadinessReady {
+		t.Errorf("readiness = %q, want %q", got[0].Readiness, ReadinessReady)
+	}
+	if got[0].Reason != "" {
+		t.Errorf("reason = %q, want empty for the ready case", got[0].Reason)
+	}
+	if got[0].ProbedAt == nil {
+		t.Error("expected ProbedAt to be set: a live /health probe did run this cycle")
 	}
 }
 
@@ -115,6 +137,15 @@ func TestCollectManagedEngineStatus_UnresponsiveEngineIsStarting(t *testing.T) {
 	}
 	if vllm.IdleState != nil {
 		t.Error("an unresponsive engine must not claim an idle signal")
+	}
+	// citadel-cli#684: Readiness is purely additive on top of the Status/Health
+	// assertions above, which are unchanged. A container that is up but not yet
+	// answering must classify as starting, never stopped/down.
+	if vllm.Readiness != ReadinessStarting {
+		t.Errorf("readiness = %q, want %q", vllm.Readiness, ReadinessStarting)
+	}
+	if vllm.Reason == "" {
+		t.Error("expected a non-empty reason for the starting classification")
 	}
 }
 
