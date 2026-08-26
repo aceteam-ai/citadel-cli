@@ -96,7 +96,10 @@ func runSvcDiagnose(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("%q is not a managed service.\n\n%s", name, unmanagedServiceGuidance(manifestNames))
 	}
 
-	in := buildDiagnoseInput(name, manifest, configDir, manifestNames)
+	in, err := buildDiagnoseInput(name, manifest, configDir, manifestNames)
+	if err != nil {
+		return err
+	}
 	insp := resolveInspector()
 	report := servicediag.Diagnose(in, insp)
 	_ = source // already reflected in report.ManagedSource
@@ -139,7 +142,12 @@ func unmanagedServiceGuidance(manifestNames []string) string {
 // mirrors docker compose's own precedence), and the VRAM signals (citadel
 // #833's free-VRAM reporting via resmon, and the coarse per-engine
 // provisioning budget table).
-func buildDiagnoseInput(name string, manifest *CitadelManifest, configDir string, manifestNames []string) servicediag.Input {
+//
+// Returns an error (never a zero-value Input alongside a nil error) when
+// diagnosing under an active --node-dir/CITADEL_NODE_DIR override would
+// silently target the REAL node's global container -- see
+// diagnoseNodeDirRefusalError.
+func buildDiagnoseInput(name string, manifest *CitadelManifest, configDir string, manifestNames []string) (servicediag.Input, error) {
 	in := servicediag.Input{
 		ServiceName:          name,
 		ContainerName:        "citadel-" + name,
@@ -184,6 +192,14 @@ func buildDiagnoseInput(name string, manifest *CitadelManifest, configDir string
 		}
 	}
 
+	// citadel#863 (follow-up review of #862/#860): refuse rather than
+	// silently diagnosing the REAL node's container. See
+	// diagnoseNodeDirRefusalError for the exact predicate and rationale; a
+	// no-op when no --node-dir/CITADEL_NODE_DIR override is active.
+	if err := diagnoseNodeDirRefusalError(name, resolveNodeDirOverride(), source, in.ContainerName); err != nil {
+		return servicediag.Input{}, err
+	}
+
 	in.ResolvedEnv = resolveEnvForCompose(composePath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -199,7 +215,54 @@ func buildDiagnoseInput(name string, manifest *CitadelManifest, configDir string
 		}
 	}
 
-	return in
+	return in, nil
+}
+
+// diagnoseNodeDirRefusalError returns a non-nil error when diagnosing name
+// under an active --node-dir/CITADEL_NODE_DIR override (override != "")
+// would silently target the REAL node's global "citadel-<name>" container
+// instead of anything isolated to the override.
+//
+// source is resolveComposeContent's third return value. "manifest" is the
+// ONLY source that means "read from an actual file inside the override's
+// resolved configDir" -- findAndReadManifest/findOrCreateManifest already
+// make configDir --node-dir-aware (cmd/nodedir.go), so a "manifest" source
+// is a real, override-owned, on-disk compose file, and (per citadel#860)
+// citadel's OWN materialization writes it with a namespaced container_name
+// the moment `citadel run`/`module start` under this override touches it.
+// Anything else -- "embedded" (services.ServiceMap fallback: the common
+// first-diagnose-before-first-start case the issue describes) or ""
+// (nothing found at all) -- means the override directory has never
+// materialized a compose file for this service, so in.ContainerName is
+// still the bare, unnamespaced "citadel-<name>" convention (or a name
+// parsed from the UNmaterialized embedded template, which is the same
+// unnamespaced convention) -- exactly the name a REAL node's container on
+// this same Docker daemon carries. servicediag.Diagnose always inspects and
+// tails logs from in.ContainerName unconditionally (it does not gate on
+// whether compose content was found), so without this refusal the command
+// would read-only-but-silently disclose the real container's state and log
+// tail to an operator who believes they're diagnosing an isolated override
+// service -- the exact hazard citadel#863 tracks. Mirrors
+// stopServiceByContainer's "refuse under active override" pattern
+// (cmd/stop.go, citadel#856 review) for the identical reason: a bare
+// container-name-keyed docker operation has no compose-project scope
+// (composeArgsWithProject/#856) to protect it.
+//
+// No-op (nil) whenever override == "" -- the no-override path is
+// byte-identical to pre-#863 behavior, matching every other --node-dir
+// guard in this codebase.
+func diagnoseNodeDirRefusalError(name, override, source, containerName string) error {
+	if override == "" || source == "manifest" {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to diagnose %q under --node-dir/CITADEL_NODE_DIR %q: no compose file for it has been "+
+			"materialized inside the override directory yet, so there is nothing isolated here to diagnose -- "+
+			"diagnosing now would inspect and tail logs from %q, which (absent materialization under this "+
+			"override) is the node's REAL, unnamespaced container. Start the service under this override first "+
+			"(e.g. 'citadel run %s --node-dir %s'), then re-run diagnose, or drop --node-dir to diagnose the "+
+			"default node.",
+		name, override, containerName, name, override)
 }
 
 // resolveComposeContent finds the compose definition for name WITHOUT ever

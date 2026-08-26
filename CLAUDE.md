@@ -1522,15 +1522,37 @@ third-party module compose files author their own `container_name` and are
 NOT namespaced by `--node-dir` — a documented follow-up-of-the-follow-up, not
 done here. A few read-only/display-only sites were deliberately left
 un-namespace-aware (informational only, never decide what to start/stop):
-`citadel service diagnose`'s pre-materialization fallback
-(`cmd/service_diagnose.go`), `internal/status/footprint.go`'s container-name
-candidates (feeds `citadel services`/`citadel status`, which — since those
-ARE override-aware for manifest resolution — could misattribute the REAL
-node's footprint to the override node's row; nothing acts on this, since
-auto-stop only runs inside `citadel work`, which refuses `--node-dir`
-outright), and the TUI control center's footprint enrichment
-(`cmd/controlcenter.go`), consistent with the pre-existing TUI-collector gaps
-noted under Service Preemption and Model Hotswap above.
+`internal/status/footprint.go`'s container-name candidates (feeds `citadel
+services`/`citadel status`, which — since those ARE override-aware for
+manifest resolution — could misattribute the REAL node's footprint to the
+override node's row; nothing acts on this, since auto-stop only runs inside
+`citadel work`, which refuses `--node-dir` outright), and the TUI control
+center's footprint enrichment (`cmd/controlcenter.go`), consistent with the
+pre-existing TUI-collector gaps noted under Service Preemption and Model
+Hotswap above.
+
+**`citadel service diagnose` refuses, rather than silently disclosing the
+REAL node's container, under a not-yet-materialized override (citadel#863,
+follow-up to the paragraph above).** Even though diagnose is read-only
+(inspect + log tail, never start/stop), its pre-materialization fallback
+(`resolveComposeContent` returning the embedded `services.ServiceMap`
+template, or nothing at all) left `in.ContainerName` at the bare
+`citadel-<name>` convention — and `servicediag.Diagnose` inspects and tails
+logs from that name UNCONDITIONALLY, whether or not compose content was
+found. Under `--node-dir` before a service has ever been started under that
+override, that silently rendered the REAL node's container state and log
+tail to an operator who believed they were diagnosing an isolated override
+service — a disclosure/misdiagnosis hazard, not a helpful fallback.
+`diagnoseNodeDirRefusalError` (`cmd/service_diagnose.go`) closes this the
+same way `stopServiceByContainer` does (`cmd/stop.go`, citadel#856 review):
+refuse outright when an override is active and `resolveComposeContent`'s
+source isn't `"manifest"` (i.e., no compose file has actually been
+materialized inside the override's resolved config dir yet — `"embedded"`
+or `""` both mean the container name in play is still the unnamespaced
+global default). A `"manifest"` source is safe to proceed with because
+`configDir` is itself `--node-dir`-aware and citadel's own materialization
+already namespaces the `container_name` (citadel#860) the moment the service
+is actually started under that override. No-op when no override is active.
 
 Two RAW (non-compose) container-name paths cannot be protected by `-p` at all,
 because plain `docker inspect`/`stop`/`rm` take a bare name with no
