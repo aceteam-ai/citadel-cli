@@ -1849,3 +1849,23 @@ Auto-generated log of every release.
   - fix(jobs): preserve pinned_services across APPLY_DEVICE_CONFIG round-trip (#850) (#864)
 
 
+---
+
+## v2.121.0 — 2026-08-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 29 |
+| Lines added | +2889 |
+
+**Changes:**
+
+  - fix(status): use measured VRAM footprint over the estimate table for resident engines (#689) (#874)
+  - fix(config): read machine-convergent device/org config via GetNodeConfigDir, not invoker-scoped ConfigDir (#845) (#877)
+  - feat(reconcile): surface full-wipe-refused as a queryable state + throttle the warning (#742) (#875)
+  - feat(status): emit a starting readiness state with probed_at + reason (#684) (#876)
+  - fix(worker): persist LRU lastUsed across restart + fix forget (#688) (#873)
+  - fix(jobs): stop TestServiceStartNativeOllama flake — quiesce leaked child before TempDir cleanup (#872)
+
+
