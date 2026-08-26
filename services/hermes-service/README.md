@@ -104,7 +104,7 @@ tells today.
 | `ACETEAM_INSTANCE_ID` | instance id, used in the reply URL path |
 | `ACETEAM_PLATFORM_URL` | base URL to POST replies to (e.g. `https://aceteam.ai`) |
 | `ACETEAM_GATEWAY_KEY` | raw gateway key: inbound validated vs `hooks_`+it, outbound auth with it |
-| `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `FIREWORKS_API_KEY` / `GOOGLE_API_KEY` / `GLM_API_KEY` / `KIMI_API_KEY` / `MINIMAX_API_KEY` | at least ONE inference provider credential (Hermes reads these directly) |
+| `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `FIREWORKS_API_KEY` / `GOOGLE_API_KEY` / `GEMINI_API_KEY` / `GLM_API_KEY` / `KIMI_API_KEY` / `MINIMAX_API_KEY` | at least ONE inference provider credential (Hermes reads these directly; `GEMINI_API_KEY` is Hermes's own documented alias for `GOOGLE_API_KEY`) |
 | `OPENAI_BASE_URL` | optional; only affects the `openai-api` provider (see above) |
 | `HERMES_MODEL` | optional; mapped onto `hermes chat -m` |
 | `HERMES_PROVIDER` | optional; mapped onto `hermes chat --provider` |
