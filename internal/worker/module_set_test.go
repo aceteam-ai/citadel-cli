@@ -350,3 +350,36 @@ func TestModuleSetInstallFailureRetries(t *testing.T) {
 		t.Fatalf("status = %v, want retry on transient install failure", res.Status)
 	}
 }
+
+// TestModuleSetGotenbergNeverInstalledNeverFalseConverges is the handler-level
+// regression test for citadel#645 ("MODULE_SET converges 'gotenberg' in 0
+// steps but the module never runs"). scopeToSingleModule + reconcile.Reconcile
+// (the real engine, not a mock) must plan an install for a module with source
+// "gotenberg" that ListInstalled reports nothing for -- never a "0 step(s)"
+// converged success. See cmd/module_ops_test.go's
+// TestGotenbergManifestOnlyEntryNeverFalseConverges for the root-cause finding
+// (a pre-citadel#739 ListInstalled enumeration gap, fixed on main) this pins
+// against regressing.
+func TestModuleSetGotenbergNeverInstalledNeverFalseConverges(t *testing.T) {
+	f := newFakeModuleOps() // nothing installed anywhere: a fresh node
+	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})
+	res, err := h.Execute(context.Background(), moduleSetJob(perNodeQueue, map[string]any{
+		"source": "gotenberg", "desired_status": "running",
+	}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success", res.Status)
+	}
+	steps, _ := res.Output["steps"].([]map[string]any)
+	if len(steps) == 0 {
+		t.Fatalf("citadel#645: MODULE_SET must never report 0 steps for a never-installed gotenberg; output = %+v", res.Output)
+	}
+	if !hasCall(f.calls, "install:gotenberg") {
+		t.Fatalf("expected install:gotenberg, got %v", f.calls)
+	}
+	if _, ok := f.byName["gotenberg"]; !ok {
+		t.Fatalf("gotenberg must be recorded as installed after convergence")
+	}
+}

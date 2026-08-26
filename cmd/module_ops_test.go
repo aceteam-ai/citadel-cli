@@ -190,6 +190,70 @@ func TestDesiredNamingUnmanagedEmbeddedServiceReinstallsRatherThanAdopts(t *test
 	}
 }
 
+// TestGotenbergManifestOnlyEntryNeverFalseConverges is the direct regression
+// test for citadel#645 ("MODULE_SET converges 'gotenberg' in 0 steps but the
+// module never runs").
+//
+// Root-cause finding: on v2.96.0 (the reported version), liveModuleOps.
+// ListInstalled enumerated the MANIFEST `services:` list (see the pre-#739
+// implementation, git show v2.96.0:cmd/module_ops.go), so a "gotenberg" entry
+// that reached citadel.yaml -- e.g. via a first Install() attempt that ran
+// addServiceToManifestWithTags before the compose-up step, then failed or
+// left a container in a broken-but-"Running" state -- was reported as
+// "already installed" with NO lockfile row required. That is exactly
+// reproducible from the issue's own second symptom ("the node does not
+// report node_module_state ... 'no module state reported'"): per the #733
+// CLAUDE.md note, that platform-visible state is driven by the LOCKFILE being
+// empty, which is consistent with a manifest-only, lockfile-less "gotenberg"
+// entry -- precisely the case ListInstalled used to (wrongly) report as
+// installed.
+//
+// citadel#739 (merged after v2.96.0, cmd/module_ops.go's ListInstalled)
+// re-scoped enumeration to the LOCKFILE, so a manifest-only "gotenberg" entry
+// is now invisible to it, and reconcile.Reconcile (whose diff algorithm is
+// otherwise unchanged -- see internal/reconcile/engine.go) can no longer
+// treat it as already-converged: MODULE_SET now always plans >=1 step
+// (install) for it. Confirmed independently that "gotenberg" IS a resolvable
+// catalog module (aceteam-ai/citadel-services `services/gotenberg/
+// service.yaml` + `compose.yml` exist), so the "unresolvable source" theory
+// from the issue does not apply -- this was a state-detection false positive
+// in the reconcile engine's actual-state enumeration, now closed.
+func TestGotenbergManifestOnlyEntryNeverFalseConverges(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: "gotenberg", ComposeFile: filepath.Join("services", "gotenberg.yml")},
+	})
+	// No lockfile: models the exact v2.96.0 symptom ("no module state
+	// reported") -- a "gotenberg" manifest entry with no module-system
+	// provenance recorded.
+
+	// The container LOOKS running (e.g. a crash-looping "Running: true"
+	// sample, or a container left over from a broken earlier attempt) --
+	// even so, an entry with no lockfile row must be invisible.
+	o := newTestModuleOps(map[string]bool{"gotenberg": true})
+	actual, err := o.ListInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstalled: %v", err)
+	}
+	if len(actual) != 0 {
+		t.Fatalf("want the lockfile-less gotenberg entry invisible to ListInstalled (citadel#645), got %+v", actual)
+	}
+
+	desired := reconcile.DesiredState{
+		Revision: "rev-1",
+		Modules:  []reconcile.ModuleAssignment{{Name: "gotenberg", Source: "gotenberg", DesiredStatus: reconcile.StatusRunning}},
+	}
+	plan, err := reconcile.Reconcile(context.Background(), desired, actual)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if plan.IsEmpty() {
+		t.Fatalf("citadel#645: MODULE_SET must never report a 0-step false converge for an uninstalled gotenberg")
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Action != reconcile.ActionInstall || plan.Steps[0].Name != "gotenberg" {
+		t.Fatalf("want a single install step for gotenberg, got %+v", plan.Steps)
+	}
+}
+
 // TestListInstalledNoManifestReportsNothing pins the preserved (pre-existing,
 // unrelated to #739) short-circuit: no manifest means nothing is reported as
 // installed, even if a lockfile exists -- a node with no manifest has no
