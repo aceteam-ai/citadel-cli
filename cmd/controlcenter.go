@@ -1993,16 +1993,23 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			}
 			ccServing = nodeIsServingModels(ctx)
 		}
-		ccQueueResult := resolveWorkerQueues(ctx, WorkerQueueParams{
+		// Deliberately does NOT write the resolved OrgID back onto
+		// deviceConfig.OrgID: unlike runWork, the pre-#839 Control Center
+		// path never called FetchWorkerConfig at all, so downstream org
+		// resolution here (perNodeOrgID below, the heartbeat orgID further
+		// down) still falls back to manifest.Node.OrgID exactly as before.
+		// Propagating the fetched org would let it silently outrank that
+		// existing fallback -- a behavior change outside #839's scope
+		// (queue-set parity only). See resolveWorkerQueues' doc comment.
+		ccQueueResult := resolveWorkerQueues(ctx, workerQueueParams{
 			APIBaseURL: apiBaseURL,
 			Token:      deviceConfig.DeviceAPIToken,
 			OrgID:      deviceConfig.OrgID,
 			NodeCaps:   ccNodeCaps,
 			Serving:    ccServing,
-			Skip:       workerHeld,
+			WorkerHeld: workerHeld,
 			DebugFn:    func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 		})
-		deviceConfig.OrgID = ccQueueResult.OrgID
 		ccQueueNames, ccMissingQueues := ccQueueResult.Queues, ccQueueResult.Missing
 
 		apiSource := worker.NewAPISource(worker.APISourceConfig{

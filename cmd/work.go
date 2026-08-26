@@ -756,7 +756,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// works for a natively run ollama, which the docker-only Engines snapshot
 		// misses. A node serving nothing adds nothing.
 		serving := nodeIsServingModels(ctx)
-		queueResult := resolveWorkerQueues(ctx, WorkerQueueParams{
+		queueResult := resolveWorkerQueues(ctx, workerQueueParams{
 			APIBaseURL: apiBaseURL,
 			Token:      deviceConfig.DeviceAPIToken,
 			WorkQueue:  workQueue,

@@ -86,7 +86,7 @@ func TestResolveWorkerQueues_FetchUnavailable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := resolveWorkerQueues(context.Background(), WorkerQueueParams{
+			got := resolveWorkerQueues(context.Background(), workerQueueParams{
 				APIBaseURL: unreachableAPIBaseURL,
 				Token:      "test-token",
 				OrgID:      tt.orgID,
@@ -103,31 +103,34 @@ func TestResolveWorkerQueues_FetchUnavailable(t *testing.T) {
 	}
 }
 
-// TestResolveWorkerQueues_Skip pins the workerHeld-equivalent short-circuit:
-// when Skip is set (runTUIWorker's dedicated-worker-holds-the-lock case), no
+// TestResolveWorkerQueues_WorkerHeld pins the workerHeld short-circuit: when
+// WorkerHeld is set (runTUIWorker's dedicated-worker-holds-the-lock case), no
 // FetchWorkerConfig call is made (no APIBaseURL/Token needed), no shell
 // queue or inference queue is added, and no reconciler gap is reported --
-// regardless of what NodeCaps/Serving/OrgID would otherwise produce.
-func TestResolveWorkerQueues_Skip(t *testing.T) {
+// regardless of what NodeCaps/Serving/OrgID would otherwise produce. This is
+// the "one input the two entry points legitimately differ on" the issue asks
+// to model explicitly: runWork never sets it (always false); runTUIWorker
+// sets it from its own workerHeld detection.
+func TestResolveWorkerQueues_WorkerHeld(t *testing.T) {
 	gpuCaps := &capabilities.NodeCapabilities{
 		GPU: &capabilities.GPUCapabilities{
 			Devices: []capabilities.GPUDevice{{Name: "RTX 3090"}},
 		},
 	}
 
-	got := resolveWorkerQueues(context.Background(), WorkerQueueParams{
-		OrgID:    "org-1",
-		NodeCaps: gpuCaps,
-		Serving:  true,
-		Skip:     true,
+	got := resolveWorkerQueues(context.Background(), workerQueueParams{
+		OrgID:      "org-1",
+		NodeCaps:   gpuCaps,
+		Serving:    true,
+		WorkerHeld: true,
 	})
 
-	want := WorkerQueueResult{
+	want := workerQueueResult{
 		OrgID:  "org-1",
 		Queues: []string{worker.DefaultCPUQueue},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("resolveWorkerQueues(Skip=true) = %+v, want %+v", got, want)
+		t.Errorf("resolveWorkerQueues(WorkerHeld=true) = %+v, want %+v", got, want)
 	}
 }
 
@@ -146,7 +149,7 @@ func TestResolveWorkerQueues_FetchWorkerConfig(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got := resolveWorkerQueues(context.Background(), WorkerQueueParams{
+	got := resolveWorkerQueues(context.Background(), workerQueueParams{
 		APIBaseURL: srv.URL,
 		Token:      "test-token",
 		NodeCaps:   &capabilities.NodeCapabilities{},
@@ -169,15 +172,23 @@ func TestResolveWorkerQueues_FetchWorkerConfig(t *testing.T) {
 	}
 }
 
-// TestResolveWorkerQueuesParity is the direct pin for citadel-cli#839: given
-// the same node config (a fetched workQueue + orgID + serving state), the
-// worker path (runWork) and the Control Center path (runTUIWorker) must
-// resolve to the IDENTICAL queue set. Both entry points now call
-// resolveWorkerQueues with the same shape of input, so this simulates each
-// call site's invocation (both starting from WorkQueue=="" / OrgID=="", the
-// state a freshly-authenticated node is in) against the same mock
-// FetchWorkerConfig server and asserts the two results are indistinguishable.
-func TestResolveWorkerQueuesParity(t *testing.T) {
+// TestResolveWorkerQueuesRepresentativeConfig is citadel-cli#839's literal
+// test ask: call the shared helper with a representative config -- a
+// FetchWorkerConfig-fetched workQueue + orgID, plus a GPU node already
+// serving -- and pin the resolved set.
+//
+// This does NOT simulate runWork and runTUIWorker as two independently
+// re-derived call sites and diff their outputs -- doing so with hand-written
+// duplicate literals in a test would be tautological (identical inputs
+// trivially produce identical outputs; it proves nothing about the
+// production call sites, which are what could actually drift). What
+// structurally prevents that drift is that cmd/work.go's runWork and
+// cmd/controlcenter.go's runTUIWorker both call this ONE function -- there
+// is no second implementation left to diverge. See resolveWorkerQueues' and
+// workerQueueParams' doc comments for that contract, and
+// TestResolveWorkerQueues_WorkerHeld above for the one input (WorkerHeld)
+// the two call sites are documented to legitimately differ on.
+func TestResolveWorkerQueuesRepresentativeConfig(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(redisapi.WorkerConfigResponse{
@@ -193,9 +204,7 @@ func TestResolveWorkerQueuesParity(t *testing.T) {
 		},
 	}
 
-	// Simulates runWork's call site (cmd/work.go): workQueue/orgID both
-	// start empty, DebugFn wired to Debug.
-	workDotGoResult := resolveWorkerQueues(context.Background(), WorkerQueueParams{
+	got := resolveWorkerQueues(context.Background(), workerQueueParams{
 		APIBaseURL: srv.URL,
 		Token:      "test-token",
 		NodeCaps:   nodeCaps,
@@ -203,26 +212,30 @@ func TestResolveWorkerQueuesParity(t *testing.T) {
 		DebugFn:    Debug,
 	})
 
-	// Simulates runTUIWorker's call site (cmd/controlcenter.go): same shape,
-	// different (but functionally equivalent) DebugFn wiring, workerHeld
-	// false (not skipped) since the reconciler-gap comparison only makes
-	// sense when both sides actually resolve queues.
-	controlCenterResult := resolveWorkerQueues(context.Background(), WorkerQueueParams{
+	if got.WorkQueue != "jobs:v1:platform-assigned" {
+		t.Errorf("WorkQueue = %q, want %q", got.WorkQueue, "jobs:v1:platform-assigned")
+	}
+	if got.OrgID != "org-parity" {
+		t.Errorf("OrgID = %q, want %q", got.OrgID, "org-parity")
+	}
+	wantQueues := []string{"jobs:v1:platform-assigned", "jobs:v1:shell:org_org-parity", "jobs:v1:gpu-general"}
+	if !reflect.DeepEqual(got.Queues, wantQueues) {
+		t.Errorf("queues = %v, want %v", got.Queues, wantQueues)
+	}
+	if got.Missing != nil {
+		t.Errorf("missing = %v, want nil (GPU node already covers gpu-general)", got.Missing)
+	}
+
+	// Determinism: a second call with the identical config must produce the
+	// identical result (no hidden shared/mutable state inside the resolver).
+	got2 := resolveWorkerQueues(context.Background(), workerQueueParams{
 		APIBaseURL: srv.URL,
 		Token:      "test-token",
 		NodeCaps:   nodeCaps,
 		Serving:    true,
-		Skip:       false,
 		DebugFn:    func(format string, args ...any) {},
 	})
-
-	if !reflect.DeepEqual(workDotGoResult, controlCenterResult) {
-		t.Errorf("runWork and runTUIWorker resolved different queue sets:\n  runWork:        %+v\n  runTUIWorker:   %+v",
-			workDotGoResult, controlCenterResult)
-	}
-
-	wantQueues := []string{"jobs:v1:platform-assigned", "jobs:v1:shell:org_org-parity", "jobs:v1:gpu-general"}
-	if !reflect.DeepEqual(workDotGoResult.Queues, wantQueues) {
-		t.Errorf("queues = %v, want %v", workDotGoResult.Queues, wantQueues)
+	if !reflect.DeepEqual(got, got2) {
+		t.Errorf("resolveWorkerQueues is not deterministic for the same config:\n  first:  %+v\n  second: %+v", got, got2)
 	}
 }

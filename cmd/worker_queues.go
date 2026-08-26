@@ -9,7 +9,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
-// WorkerQueueParams bundles the API-mode boot-time queue resolution inputs
+// workerQueueParams bundles the API-mode boot-time queue resolution inputs
 // shared by `citadel work` (runWork, cmd/work.go) and the Control Center's
 // worker path (runTUIWorker, cmd/controlcenter.go).
 //
@@ -22,7 +22,7 @@ import (
 // diverging from an equivalent `citadel work` node. resolveWorkerQueues is
 // the single place both entry points now build this set, so they cannot
 // drift apart again.
-type WorkerQueueParams struct {
+type workerQueueParams struct {
 	// APIBaseURL and Token authenticate the FetchWorkerConfig lookup.
 	APIBaseURL string
 	Token      string
@@ -37,25 +37,26 @@ type WorkerQueueParams struct {
 	// runWork's nodeCaps and nodeIsServingModels(ctx) do.
 	NodeCaps *capabilities.NodeCapabilities
 	Serving  bool
-	// Skip short-circuits to the cpu-general-only base set: no
+	// WorkerHeld short-circuits to the cpu-general-only base set: no
 	// FetchWorkerConfig call, no shell queue, no inference queues, and no
 	// reconciler gap. This models runTUIWorker's workerHeld case, where a
 	// dedicated `citadel work` already owns this node's consumption and the
 	// Control Center must not compete for it (the competing-consumer
 	// incident referenced elsewhere in cmd/controlcenter.go) — subscribing
 	// to anything here would be pure waste at best and a step back toward
-	// that split at worst. runWork always passes false.
-	Skip bool
+	// that split at worst. runWork always passes false (it has no
+	// workerHeld concept of its own).
+	WorkerHeld bool
 	// DebugFn receives fetch/debug tracing. runWork wires Debug; runTUIWorker
 	// wires its activity log. May be nil.
 	DebugFn func(format string, args ...any)
 }
 
-// WorkerQueueResult is resolveWorkerQueues' output: the (possibly
+// workerQueueResult is resolveWorkerQueues' output: the (possibly
 // FetchWorkerConfig-resolved) WorkQueue and OrgID, the final boot-time queue
 // list, and the residual inference-queue gap for InferenceQueueReconciler
 // (see missingQueues' doc comment for why that gap can be nil).
-type WorkerQueueResult struct {
+type workerQueueResult struct {
 	WorkQueue string
 	OrgID     string
 	Queues    []string
@@ -65,17 +66,28 @@ type WorkerQueueResult struct {
 // resolveWorkerQueues resolves the API-mode boot-time Redis Streams queue
 // set: cpu-general base, the FetchWorkerConfig-assigned workQueue, the
 // per-org shellQueue, and inference queues -- in that order, matching
-// runWork's pre-#839 inline logic exactly. See WorkerQueueParams for the
+// runWork's pre-#839 inline logic exactly. See workerQueueParams for the
 // shared contract and citadel-cli#839 for why runWork and runTUIWorker must
 // produce an identical set for the same inputs.
-func resolveWorkerQueues(ctx context.Context, p WorkerQueueParams) WorkerQueueResult {
+//
+// Callers must NOT write the returned OrgID back onto their own org-identity
+// state unless that call site already did so before #839: runWork's original
+// inline block always did (deviceConfig.OrgID = workerCfg.OrgID), so its
+// call site preserves that write-back exactly. runTUIWorker's pre-#839 code
+// never called FetchWorkerConfig at all, so its call site deliberately does
+// NOT propagate the resolved OrgID elsewhere -- doing so would let a
+// FetchWorkerConfig-resolved org silently outrank the Control Center's
+// existing deviceConfig/manifest org-resolution fallback for callers
+// downstream of queue resolution (per-node shell stream, telemetry), which
+// is a behavior change outside #839's stated scope (queue-set parity only).
+func resolveWorkerQueues(ctx context.Context, p workerQueueParams) workerQueueResult {
 	debug := p.DebugFn
 	if debug == nil {
 		debug = func(string, ...any) {}
 	}
 
-	if p.Skip {
-		return WorkerQueueResult{
+	if p.WorkerHeld {
+		return workerQueueResult{
 			WorkQueue: p.WorkQueue,
 			OrgID:     p.OrgID,
 			Queues:    []string{worker.DefaultCPUQueue},
@@ -143,7 +155,7 @@ func resolveWorkerQueues(ctx context.Context, p WorkerQueueParams) WorkerQueueRe
 	// comment for the full reasoning.
 	missing := missingQueues(capabilities.InferenceQueues(p.NodeCaps, true), queueNames)
 
-	return WorkerQueueResult{
+	return workerQueueResult{
 		WorkQueue: workQueue,
 		OrgID:     orgID,
 		Queues:    queueNames,
