@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // TestLLMInferenceHandler_CanHandle asserts the handler only claims the
@@ -400,6 +402,107 @@ func TestLLMInferenceHandler_BackendRouting(t *testing.T) {
 		}
 		if !strings.Contains(result.Error.Error(), "unsupported backend") {
 			t.Errorf("error = %v, want 'unsupported backend'", result.Error)
+		}
+	})
+}
+
+// TestPromptTextFromPayload_NilSafe pins that the grounding guardrail's input
+// extraction never panics on a nil or empty payload — a defensive edge case
+// with no HTTP round-trip needed, since it's a pure function of the payload.
+func TestPromptTextFromPayload_NilSafe(t *testing.T) {
+	if got := promptTextFromPayload(nil); got != "" {
+		t.Errorf("nil payload: got %q, want empty string", got)
+	}
+	empty := &jobs.LLMInferencePayload{}
+	if got := promptTextFromPayload(empty); got != "" {
+		t.Errorf("empty payload: got %q, want empty string", got)
+	}
+	withPrompt := &jobs.LLMInferencePayload{Prompt: "hello"}
+	if got := promptTextFromPayload(withPrompt); got != "hello" {
+		t.Errorf("prompt payload: got %q, want %q", got, "hello")
+	}
+}
+
+// TestLLMInferenceHandler_GroundingGuardrailGate pins the opt-in contract for
+// the on-node grounding guardrail (citadel #8253, guardrail half) at its one
+// wired integration point, bufferedChatCompletions:
+//   - CITADEL_GROUNDING_GUARDRAIL unset (default): the output map has NO
+//     "grounding" key at all — byte-identical to before the guardrail existed.
+//   - CITADEL_GROUNDING_GUARDRAIL=1: the output carries a "grounding" receipt
+//     shaped {grounded, score, claims_checked, flagged}, and a genuinely
+//     fabricated statistic (a number in the reply absent from the request) is
+//     flagged.
+func TestLLMInferenceHandler_GroundingGuardrailGate(t *testing.T) {
+	// The reply fabricates "68%" — nothing numeric appears in the request
+	// messages, mirroring the motivating incident (internal/trust's
+	// TestCheckGrounding_FabricatedPercentages_Flagged pins the extraction
+	// logic itself; this test only pins that the worker wires it in/out
+	// correctly under the env gate).
+	body := `{"choices":[{"message":{"content":"68% of respondents agreed."},"finish_reason":"stop"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	newJob := func() *Job {
+		return &Job{
+			ID:   "job-grounding",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":   "m",
+				"backend": "bonsai",
+				"messages": []map[string]any{
+					{"role": "user", "content": "Summarize: a majority of respondents agreed."},
+				},
+			},
+		}
+	}
+
+	t.Run("disabled by default: no grounding key", func(t *testing.T) {
+		h := NewLLMInferenceHandler()
+		h.baseURLs["bonsai"] = ts.URL
+		result, err := h.Execute(context.Background(), newJob(), &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		if _, present := result.Output["grounding"]; present {
+			t.Errorf("Output = %+v, want no \"grounding\" key when disabled", result.Output)
+		}
+	})
+
+	t.Run("enabled: flags the fabricated percentage", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		h := NewLLMInferenceHandler()
+		h.baseURLs["bonsai"] = ts.URL
+		result, err := h.Execute(context.Background(), newJob(), &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		grounding, ok := result.Output["grounding"].(map[string]any)
+		if !ok {
+			t.Fatalf("Output[\"grounding\"] = %#v (%T), want map[string]any", result.Output["grounding"], result.Output["grounding"])
+		}
+		if grounded, _ := grounding["grounded"].(bool); grounded {
+			t.Errorf("grounding[\"grounded\"] = %v, want false (68%% is fabricated)", grounded)
+		}
+		if checked, _ := grounding["claims_checked"].(int); checked != 1 {
+			t.Errorf("grounding[\"claims_checked\"] = %v, want 1", grounding["claims_checked"])
+		}
+		flagged, ok := grounding["flagged"].([]map[string]any)
+		if !ok || len(flagged) != 1 {
+			t.Fatalf("grounding[\"flagged\"] = %#v, want one flagged claim", grounding["flagged"])
+		}
+		if flagged[0]["value"] != "68%" {
+			t.Errorf("flagged claim value = %v, want \"68%%\"", flagged[0]["value"])
 		}
 	})
 }

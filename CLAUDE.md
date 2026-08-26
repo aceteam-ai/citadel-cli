@@ -892,10 +892,13 @@ a predictable path the compose mount serves (the HF hub cache path carries an
 unpredictable snapshot hash). `bonsaiCacheDir()` and the compose mount must stay
 in sync (guarded by a test).
 
-**Worker inference routing:** the Redis `llm_inference` handler routes
+**Worker inference routing:** the `llm_inference` handler routes
 `backend: "bonsai"` to the bonsai host port via `executeLlamaCppAt` (the bonsai
 llama-server exposes the identical llama.cpp-server API). See
-`internal/jobs/llm_inference.go`. Direct mesh HTTP to `:8210` also works.
+`internal/worker/llm_inference.go` — the Redis-interface handler that used to
+live at `internal/jobs/llm_inference.go` was ported to this native
+`worker.JobHandler` by issue #590 (that old path no longer exists; see the
+Worker Mode section above). Direct mesh HTTP to `:8210` also works.
 
 **First start builds inline (~7min on Ampere):** because bonsai is build-based,
 the first `SERVICE_START` (or `citadel run --service bonsai`) runs `docker
@@ -992,6 +995,66 @@ index-based and fine. A direct DuckDB glob over both schemas needs
 | `CITADEL_ENERGY_SAMPLING` | unset (OFF) | Enable the energy estimate. Truthy: `1`/`true`/`yes`/`on`. Overrides energy.yaml when set. |
 | `CITADEL_GPU_TDP_WATTS` | unset (use `power.limit`) | Override TDP for the GPU util estimate (tier 2). |
 | `CITADEL_CPU_TDP_WATTS` | `65` | CPU package TDP for the coarse CPU floor (tier 3). Apple Silicon runs lower than 65W. |
+
+### On-node Grounding Guardrail (`internal/trust`, aceteam #8253, guardrail half)
+
+`trust.CheckGrounding(input, output string) GroundingResult` is a pure, local,
+deterministic check (regex/tokenization, NOT an LLM judge — no network call)
+for whether numeric/statistic claims in a model's OUTPUT are supported by its
+INPUT. It exists because an insight-extraction run on llama3.1:8b turned the
+source's "a majority" / "a small fraction" into fabricated "68%" / "7%" —
+exactly the case `TestCheckGrounding_FabricatedPercentages_Flagged` pins.
+
+`eligible(kind ClaimKind)` decides which extracted claims are even checked —
+read it before assuming "every number is a claim": years and list-index/
+ordinal tokens are classified but never flagged, everything else (percent,
+ratio, currency, bare count) is. `isSupported` decides what counts as
+grounded: exact numeric match after normalization, rounding-tolerance
+equality, or an "N out of M" ratio and its derived N/M*100 percentage
+matching each other — deliberately NO semantic derivation (no word→number
+mapping like "majority" implies ">50%"); adding one would silently un-flag
+the incident this guardrail exists to catch.
+
+**`GroundingResult.Score`/`Grounded` are not a truthfulness signal.** A
+claim-free reply is `Grounded=true, Score=1.0` — vacuously, because there was
+nothing to check, not because anything was verified. `ClaimsChecked` is the
+denominator that disambiguates "nothing to check" from "everything checked
+out"; read it alongside Score, never Score alone.
+
+**Wiring is opt-in and single-point, not pervasive.** `llm_inference` serves
+general chat, code generation, and vision/OCR through the SAME handler
+(`internal/worker/llm_inference.go`), and "a number in the output not in the
+input" is normal for those (arithmetic answers, port numbers, facts recalled
+from training data) — attaching the guardrail unconditionally would flag most
+of that traffic. `groundingGuardrailEnabled()` gates it behind
+`CITADEL_GROUNDING_GUARDRAIL` (default OFF, like every other advisory-signal
+toggle in this codebase), and the ONE wired call site is
+`bufferedChatCompletions` — the non-streaming chat-completions path, chosen
+because it is the only place both the full input and full output already
+exist as Go strings before anything is sent, so flag-only (the shipped
+default; see `Policy`/`Block`) is safe and gating would be too (a streamed
+reply is already sent token-by-token before the full text exists, so it can
+be flagged post-hoc but not gated). The streaming and llamacpp/ollama
+buffered/stream pairs in that file are documented, not-yet-wired hooks with
+the identical shape.
+
+**Known false negative:** `extractClaims`' regex priority gives years
+(`ClaimYear`) precedence over bare counts, so a fabricated count that looks
+like a plausible year ("1,950 respondents") slips through unflagged —
+`TestCheckGrounding_YearPriorityIsAKnownFalseNegative` pins this as a
+documented v1 tradeoff, not a bug to silently fix by making the guardrail
+guess at year-vs-count from context.
+
+**Receipt-signing is a separate, deferred issue.** This package attaches a
+`grounding` map to the job output (`groundingReceipt`, mirroring
+`synthesizeReceiptFromHeaders` in `internal/jobs/synthesize_speech.go`) but
+never signs, persists, or transmits anything on its own. Cryptographically
+signing that receipt (the AEP half of aceteam #8253) overlaps the nodevault
+node-identity lane and is intentionally out of scope here.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt to buffered chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
 
 ### Service Idle Detection and Auto-Stop (citadel #416)
 
