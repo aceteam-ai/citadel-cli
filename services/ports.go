@@ -40,6 +40,12 @@ const (
 	// (Hermes/OpenClaw, aceteam#4591) claim the next slot in the 8200 block instead
 	// of every module hardcoding a literal 8204 and colliding.
 	EnvClaudecodeHostPort = "CITADEL_CLAUDECODE_HOST_PORT"
+	// EnvHermesHostPort carries the host port for the Hermes (Nous Research)
+	// agent-runtime module (aceteam#8170), the second agent-runtime harness after
+	// claudecode. Same shape as claudecode: it claims the 8205 slot the comments
+	// above earmarked for it, and its module compose lives in
+	// aceteam-ai/citadel-services, not the embedded ServiceMap.
+	EnvHermesHostPort = "CITADEL_HERMES_HOST_PORT"
 	// EnvMeetingdHostPort / EnvMeetingCDPHostPort carry the two host ports for the
 	// meeting media-stack MODULE (aceteam-ai/citadel-cli#514). Like claudecode, the
 	// meeting module's compose lives in aceteam-ai/citadel-services (not the
@@ -110,24 +116,29 @@ const (
 	DiffusersHostPort = 8203
 	// claudecode: the first agent-runtime MODULE (#458). Next free slot in the
 	// 8200 block, above the apps 8100-8199 range. The wrapper's internal contract
-	// port is 8787; this is the host publish. Kept in this registry so the next
-	// agent-runtime module (Hermes/OpenClaw) is allocated 8205 rather than
+	// port is 8787; this is the host publish. Kept in this registry so the second
+	// agent-runtime module (Hermes, aceteam#8170) is allocated 8205 rather than
 	// re-hardcoding 8204.
 	ClaudecodeHostPort = 8204
+	// hermes: the second agent-runtime MODULE (Nous Research Hermes Agent,
+	// aceteam#8170), claiming the 8205 slot claudecode's registration earmarked
+	// for it. Same shape as claudecode: the wrapper's internal contract port is
+	// 8787; this is the host publish. Its module compose lives in
+	// aceteam-ai/citadel-services, not the embedded ServiceMap.
+	HermesHostPort = 8205
 	// storage: the on-node S3-compatible object store (VersityGW, #469). It is
 	// NOT a compose service and has no ${CITADEL_*_HOST_PORT} env var -- the
 	// `citadel storage` command constructs its `docker run` publish directly from
-	// this constant (internal/storage). It sits above the earmarked 8205
-	// Hermes/OpenClaw slot so a fixed, reboot-stable port is signed into S3
-	// presigned URLs without a persisted-port crash-loop risk. Kept in the
-	// registry so future allocations skip it and the collision guard covers it.
+	// this constant (internal/storage). It sits above hermes's 8205 slot so a
+	// fixed, reboot-stable port is signed into S3 presigned URLs without a
+	// persisted-port crash-loop risk. Kept in the registry so future allocations
+	// skip it and the collision guard covers it.
 	StorageHostPort = 8206
 	// meeting: the meeting media-stack module (#514) publishes TWO loopback
-	// listeners, so it takes the next two free slots after the earmarked 8205
-	// Hermes/OpenClaw slot and storage's 8206. The container-internal ports are
-	// 8102 (meetingd) and 9223 (CDP); these are the HOST publish. Both are bound to
-	// 127.0.0.1 by the compose -- the only consumer is the co-located citadel
-	// process.
+	// listeners, so it takes the next two free slots after hermes's 8205 and
+	// storage's 8206. The container-internal ports are 8102 (meetingd) and 9223
+	// (CDP); these are the HOST publish. Both are bound to 127.0.0.1 by the
+	// compose -- the only consumer is the co-located citadel process.
 	MeetingdHostPort   = 8207
 	MeetingCDPHostPort = 8208
 	// gotenberg: the document-conversion module (LibreOffice + Chromium -> PDF,
@@ -140,17 +151,17 @@ const (
 	// bonsai: PrismML Bonsai-27B (1-bit Qwen3.6-27B) served by an
 	// OpenAI-compatible llama-server built from the PrismML llama.cpp fork
 	// (services/compose/bonsai.yml). Next free slot in the 8200 block after
-	// gotenberg's 8209 (8205 stays earmarked for Hermes/OpenClaw). It is an
-	// embedded ServiceMap compose, so its container serves on :8080 and this is
-	// the HOST publish.
+	// gotenberg's 8209 (8205 is hermes's, see above). It is an embedded
+	// ServiceMap compose, so its container serves on :8080 and this is the HOST
+	// publish.
 	BonsaiHostPort = 8210
 	// kokoro: Kokoro-82M text-to-speech served over an OpenAI-compatible HTTP API
 	// (services/compose/kokoro.yml), the synthesis counterpart to the whisper
 	// transcribe sidecar. Next free slot in the 8200 block after bonsai's 8210
-	// (8205 stays earmarked for Hermes/OpenClaw). It is an embedded ServiceMap
-	// compose, so its container serves on :8080 and this is the HOST publish,
-	// bound to 127.0.0.1 only (the service has no auth of its own and its sole
-	// consumer is the co-located citadel worker).
+	// (8205 is hermes's, see above). It is an embedded ServiceMap compose, so its
+	// container serves on :8080 and this is the HOST publish, bound to
+	// 127.0.0.1 only (the service has no auth of its own and its sole consumer
+	// is the co-located citadel worker).
 	//
 	// NOTE: the citadel-services kokoro module (README, service.yaml ports.host
 	// and health_check.port) still names 8210 for this service, written before
@@ -166,9 +177,9 @@ const (
 	FrigateHostPort = 8212
 	// unlimited-ocr: Baidu Unlimited-OCR (a 3B vision-language OCR model) served by
 	// an OpenAI-compatible vLLM server (services/compose/unlimited-ocr.yml). Next
-	// free slot in the 8200 block after frigate's 8212 (8205 stays earmarked for
-	// Hermes/OpenClaw). It is an embedded ServiceMap compose, so its container
-	// serves on :8000 and this is the HOST publish.
+	// free slot in the 8200 block after frigate's 8212 (8205 is hermes's, see
+	// above). It is an embedded ServiceMap compose, so its container serves on
+	// :8000 and this is the HOST publish.
 	UnlimitedOCRHostPort = 8213
 )
 
@@ -194,6 +205,7 @@ var ServiceHostPorts = map[string]int{
 	"extraction":    ExtractionHostPort,
 	"diffusers":     DiffusersHostPort,
 	"claudecode":    ClaudecodeHostPort,
+	"hermes":        HermesHostPort,
 	"storage":       StorageHostPort,
 	"meeting":       MeetingdHostPort,
 	"meeting-cdp":   MeetingCDPHostPort,
@@ -212,6 +224,7 @@ var serviceHostPortEnv = map[string]string{
 	"extraction":    EnvExtractionHostPort,
 	"diffusers":     EnvDiffusersHostPort,
 	"claudecode":    EnvClaudecodeHostPort,
+	"hermes":        EnvHermesHostPort,
 	"meeting":       EnvMeetingdHostPort,
 	"meeting-cdp":   EnvMeetingCDPHostPort,
 	"gotenberg":     EnvGotenbergHostPort,

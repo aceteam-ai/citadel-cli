@@ -1,0 +1,55 @@
+# Module compose for the headless Hermes Agent runtime (aceteam#8170, the
+# second agent-runtime module after claudecode/citadel-cli#458).
+#
+# `citadel module install hermes` copies this into the node's services dir and
+# `citadel run hermes` brings it up via startService -> composeEnv, which
+# injects CITADEL_HERMES_HOST_PORT from the host-port registry
+# (citadel-cli services/ports.go). That is why the host publish is deferred to
+# ${CITADEL_HERMES_HOST_PORT:?...} rather than a literal 8205: the registry
+# owns the port so no other module can collide with it.
+#
+# Image: ghcr.io/aceteam-ai/hermes-service is NOT YET PUBLISHED (built from the
+# Dockerfile alongside this file). Move to an immutable :sha / @sha256 digest
+# once the image-publish workflow lands (see README).
+services:
+  hermes:
+    image: ghcr.io/aceteam-ai/hermes-service:latest
+    container_name: citadel-hermes
+    ports:
+      - "${CITADEL_HERMES_HOST_PORT:?citadel must supply CITADEL_HERMES_HOST_PORT}:8787"
+    volumes:
+      # The durable $HERMES_HOME the upstream image declares as its VOLUME.
+      # The base image's own stage2-hook.sh chowns this to the hermes user
+      # (uid 10000) at boot -- unlike claudecode, this wrapper needs no
+      # hand-written entrypoint.sh for that.
+      - ~/citadel-cache/hermes:/opt/data
+    environment:
+      # --- AceTeam routing-seam contract (aceteam #4593) ---
+      - ACETEAM_INSTANCE_ID=${ACETEAM_INSTANCE_ID:?set ACETEAM_INSTANCE_ID}
+      - ACETEAM_PLATFORM_URL=${ACETEAM_PLATFORM_URL:?set ACETEAM_PLATFORM_URL}
+      - ACETEAM_GATEWAY_KEY=${ACETEAM_GATEWAY_KEY:?set ACETEAM_GATEWAY_KEY}
+
+      # --- Model path: at least ONE of these provider credentials must be set.
+      # Hermes reads them directly; the wrapper does not validate which. ---
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GLM_API_KEY=${GLM_API_KEY:-}
+      - KIMI_API_KEY=${KIMI_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+      - HERMES_MODEL=${HERMES_MODEL:-}
+      - HERMES_PROVIDER=${HERMES_PROVIDER:-}
+
+      # --- Wrapper knobs (sane defaults; override only if needed) ---
+      - PORT=8787
+      - HERMES_TURN_TIMEOUT=${HERMES_TURN_TIMEOUT:-600}
+    healthcheck:
+      # Hits the wrapper /health on the fixed internal contract port.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
