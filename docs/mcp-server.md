@@ -23,7 +23,23 @@ claude mcp add aceteam -e ACETEAM_API_KEY=act_xxx -- citadel mcp
 
 ## How It Works
 
-`citadel mcp` starts a local stdio MCP server that proxies JSON-RPC messages to the AceTeam backend. It uses your existing Citadel credentials (from `citadel init`) or an API key.
+`citadel mcp` starts a local stdio MCP server. Most tools are proxied as JSON-RPC to the AceTeam backend, using your existing Citadel credentials (from `citadel init`) or an API key. A separate set of `local_*` tools (below) runs entirely on this node instead — see [Local Tools](#local-tools-no-platform-required).
+
+## Local Tools (no platform required)
+
+The `local_*` tools are **LOCAL authority**: they run on this node for the node owner and never call the AceTeam backend. They work even with no API key configured at all — `citadel mcp` (no credentials) still serves them, only the remote/fabric tools above are unavailable in that mode. They exist so an agent running ON the node can drive it directly, without round-tripping the central platform or needing a `node:modules` scope.
+
+| Tool | Description |
+|------|-------------|
+| `local_module_stop` | Stop a single module/service on this node by name (scoped: no other module touched, worker not restarted). Drives the same primitive as `citadel module stop`. |
+| `local_module_start` | Start a single module/service on this node by name (scoped). Drives the same primitive as `citadel module start`. |
+| `local_module_restart` | Stop then start a single module/service on this node by name (scoped). Drives the same primitive as `citadel module restart`. |
+| `local_list_models` | List models currently served by local inference engines on this node (vLLM, llama.cpp, bonsai, Ollama), with engine name and host port. |
+| `local_chat` | Send a chat-completion request directly to a model served locally on this node's own engine — dials the engine's host port on 127.0.0.1 directly, no central Redis, no mesh hop. |
+| `local_read_file` | Read a file from this node's workspace directory. Sandboxed: cannot escape the workspace. Read-only. |
+| `local_list_files` | List directory contents within this node's workspace directory. Sandboxed the same way. Read-only. |
+
+**Deferred to a follow-on (not in this tool set yet):** model deploy/evict and `run --exclusive`. Those need a VRAM-reservation/eviction primitive (aceteam #8248 part 2, citadel #832/#851) that isn't merged yet.
 
 ## Tools
 
@@ -152,7 +168,7 @@ Agent calls: terminal_exec(node_id, command="df -h")
 
 ## Authentication
 
-Three methods, checked in order:
+Needed only for the remote/fabric tools (the `local_*` tools work with none of these configured). Three methods, checked in order:
 
 1. `--api-key` flag: `citadel mcp --api-key act_xxx`
 2. `ACETEAM_API_KEY` environment variable

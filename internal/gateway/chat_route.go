@@ -228,6 +228,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // candidate resolves to the same port (a single engine); otherwise it is a miss
 // so the caller returns 404 rather than guessing. Returns ok=false when nothing
 // serves the model.
+//
+// ResolveChatModel exports this for callers outside a gateway HTTP request --
+// e.g. `citadel mcp`'s local inference tool (aceteam #8249), which routes a
+// chat request directly to 127.0.0.1:<port> without going through the gateway
+// mux at all, but must still agree with the gateway on which engine serves a
+// given model. Keeping ONE resolver (this one) means that agreement can never
+// drift; ResolveChatModel is a zero-logic wrapper, never a second
+// implementation.
+func ResolveChatModel(model string, engines []ChatUpstream) (port int, engine string, ok bool) {
+	return resolveChatModel(model, engines)
+}
+
 func resolveChatModel(model string, engines []ChatUpstream) (port int, engine string, ok bool) {
 	type cand struct {
 		engine string

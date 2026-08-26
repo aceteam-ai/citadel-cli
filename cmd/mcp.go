@@ -7,6 +7,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -84,6 +85,11 @@ type mcpBridge struct {
 	mcpServer  string // e.g., "aceteam"
 	sessionID  string // Mcp-Session-Id from the backend
 	httpClient *http.Client
+
+	// localTools are node-local tools served WITHOUT a backend round-trip
+	// (aceteam #8249 v1: module control, local inference, workspace files --
+	// see cmd/mcp_local.go). Populated once at startup by runMCP.
+	localTools []localMCPTool
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
@@ -99,15 +105,21 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		apiKey = getAPIKeyFromConfig()
 	}
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: No API key configured.")
+		// No API key does NOT mean "refuse to start" -- the local tools
+		// (module control, local inference, workspace files; aceteam #8249)
+		// are LOCAL authority: they run on this node for the node owner and
+		// never call the AceTeam backend, so they work with zero central
+		// credentials. Only the remote/fabric tool set (proxied to the
+		// backend below) is unavailable in this mode.
+		fmt.Fprintln(os.Stderr, "Note: No AceTeam API key configured -- remote AceTeam tools unavailable.")
+		fmt.Fprintln(os.Stderr, "Local node tools (module control, local inference, workspace files) are still served.")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Provide an API key using one of:")
+		fmt.Fprintln(os.Stderr, "To also enable remote AceTeam tools, provide an API key using one of:")
 		fmt.Fprintln(os.Stderr, "  1. citadel mcp --api-key <key>")
 		fmt.Fprintln(os.Stderr, "  2. ACETEAM_API_KEY=<key> citadel mcp")
 		fmt.Fprintln(os.Stderr, "  3. citadel init (saves token to config)")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Generate an API key at: https://aceteam.ai/settings/api-keys")
-		return fmt.Errorf("no API key configured")
 	}
 
 	// Resolve API URL
@@ -131,9 +143,10 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		httpClient: &http.Client{
 			Timeout: 120 * time.Second,
 		},
+		localTools: newLocalMCPTools(realLocalMCPDeps()),
 	}
 
-	Debug("MCP bridge starting: server=%s, url=%s", mcpServer, apiURL)
+	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d", mcpServer, apiURL, len(bridge.localTools))
 
 	return bridge.run()
 }
@@ -170,6 +183,19 @@ func (b *mcpBridge) run() error {
 			if !isNotification {
 				b.writeResult(req.ID, json.RawMessage(`{}`))
 			}
+		case "tools/list":
+			// Always includes the local tool set (aceteam #8249), merged with
+			// the backend's remote tool set when a backend is reachable.
+			b.handleToolsList(&req)
+		case "tools/call":
+			// A tools/call for one of OUR local tool names is dispatched here,
+			// entirely without a backend round-trip. Anything else falls
+			// through to the same backend-forwarding path every other method
+			// uses (below).
+			if b.tryLocalToolsCall(&req) {
+				continue
+			}
+			fallthrough
 		default:
 			if isNotification {
 				// Forward notifications to the backend but don't write a response.
@@ -203,29 +229,173 @@ func (b *mcpBridge) run() error {
 // handleInitialize handles the MCP initialize request.
 // We forward to the backend so it creates a session, but we also ensure
 // the response includes the required fields.
+//
+// With no API key configured there is no backend session to create -- local
+// tools (aceteam #8249) don't need one -- so this short-circuits straight to
+// the local response instead of forwarding first and waiting on a call that
+// will only fail.
 func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
+	if b.apiKey == "" {
+		b.writeLocalInitializeResult(req.ID)
+		return
+	}
+
 	resp, err := b.forwardToBackend(req)
 	if err != nil {
 		Debug("MCP: initialize backend error: %v, using local fallback", err)
-		// Fallback: return a local initialize response
-		result := map[string]interface{}{
-			"protocolVersion": "2025-03-26",
-			"capabilities": map[string]interface{}{
-				"tools": map[string]interface{}{},
-			},
-			"serverInfo": map[string]interface{}{
-				"name":    "aceteam",
-				"version": Version,
-			},
-		}
-		resultBytes, _ := json.Marshal(result)
-		b.writeResult(req.ID, resultBytes)
+		b.writeLocalInitializeResult(req.ID)
 		return
 	}
 
 	// Write the backend's response directly.
 	os.Stdout.Write(resp)
 	os.Stdout.Write([]byte("\n"))
+}
+
+// writeLocalInitializeResult writes a self-contained initialize response with
+// no backend session, used both when no API key is configured and as the
+// fallback when the backend is unreachable.
+func (b *mcpBridge) writeLocalInitializeResult(id json.RawMessage) {
+	result := map[string]interface{}{
+		"protocolVersion": "2025-03-26",
+		"capabilities": map[string]interface{}{
+			"tools": map[string]interface{}{},
+		},
+		"serverInfo": map[string]interface{}{
+			"name":    "aceteam",
+			"version": Version,
+		},
+	}
+	resultBytes, _ := json.Marshal(result)
+	b.writeResult(id, resultBytes)
+}
+
+// handleToolsList responds to tools/list with the local tool set (aceteam
+// #8249) merged into the backend's remote tool set. With no API key, or on a
+// backend error, it serves the local tools only rather than failing the
+// whole listing -- an agent should still see (and be able to use) the node's
+// own local tools even when remote AceTeam tools are unavailable.
+func (b *mcpBridge) handleToolsList(req *jsonRPCRequest) {
+	localRaw := make([]json.RawMessage, 0, len(b.localTools))
+	for _, t := range b.localTools {
+		desc, err := json.Marshal(map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+			"inputSchema": t.InputSchema,
+		})
+		if err != nil {
+			Debug("MCP: failed to marshal local tool %q: %v", t.Name, err)
+			continue
+		}
+		localRaw = append(localRaw, desc)
+	}
+
+	if b.apiKey == "" {
+		b.writeToolsListResult(req.ID, localRaw)
+		return
+	}
+
+	resp, err := b.forwardToBackend(req)
+	if err != nil {
+		Debug("MCP: tools/list backend error: %v; serving local tools only", err)
+		b.writeToolsListResult(req.ID, localRaw)
+		return
+	}
+
+	var parsed struct {
+		Result map[string]json.RawMessage `json:"result"`
+		Error  *jsonRPCError              `json:"error"`
+	}
+	if uerr := json.Unmarshal(resp, &parsed); uerr != nil || parsed.Result == nil || parsed.Error != nil {
+		Debug("MCP: tools/list backend response unusable (parse=%v, error=%v); serving local tools only", uerr, parsed.Error)
+		b.writeToolsListResult(req.ID, localRaw)
+		return
+	}
+
+	var backendTools []json.RawMessage
+	if raw, ok := parsed.Result["tools"]; ok {
+		_ = json.Unmarshal(raw, &backendTools)
+	}
+	merged := append(backendTools, localRaw...)
+	mergedTools, err := json.Marshal(merged)
+	if err != nil {
+		Debug("MCP: failed to marshal merged tools/list: %v", err)
+		b.writeToolsListResult(req.ID, localRaw)
+		return
+	}
+	parsed.Result["tools"] = mergedTools
+
+	resultBytes, err := json.Marshal(parsed.Result)
+	if err != nil {
+		Debug("MCP: failed to marshal merged tools/list result: %v", err)
+		b.writeToolsListResult(req.ID, localRaw)
+		return
+	}
+	b.writeResult(req.ID, resultBytes)
+}
+
+// writeToolsListResult writes a tools/list result carrying exactly the given
+// tools (used for the local-only fallback paths).
+func (b *mcpBridge) writeToolsListResult(id json.RawMessage, tools []json.RawMessage) {
+	if tools == nil {
+		tools = []json.RawMessage{}
+	}
+	result, err := json.Marshal(map[string]any{"tools": tools})
+	if err != nil {
+		Debug("MCP: failed to marshal tools/list result: %v", err)
+		b.writeError(id, -32603, "failed to build tools/list result")
+		return
+	}
+	b.writeResult(id, result)
+}
+
+// tryLocalToolsCall dispatches a tools/call request to a local tool
+// (aceteam #8249) when its "name" matches one, entirely without a backend
+// round-trip. Returns false (having written nothing) when the requested tool
+// is not one of ours, so the caller falls through to normal backend
+// forwarding.
+func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
+	var params struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		// Malformed params -- let the backend's own validation produce the
+		// error rather than guessing here.
+		return false
+	}
+
+	tool, ok := findLocalTool(b.localTools, params.Name)
+	if !ok {
+		return false
+	}
+
+	Debug("MCP: dispatching local tool %q", tool.Name)
+	ctx, cancel := context.WithTimeout(context.Background(), localToolCallTimeout)
+	defer cancel()
+	text, err := tool.Call(ctx, params.Arguments)
+
+	var result map[string]any
+	if err != nil {
+		Debug("MCP: local tool %q failed: %v", tool.Name, err)
+		result = map[string]any{
+			"content": []map[string]any{{"type": "text", "text": err.Error()}},
+			"isError": true,
+		}
+	} else {
+		result = map[string]any{
+			"content": []map[string]any{{"type": "text", "text": text}},
+			"isError": false,
+		}
+	}
+
+	resultBytes, merr := json.Marshal(result)
+	if merr != nil {
+		b.writeError(req.ID, -32603, fmt.Sprintf("failed to marshal local tool result: %v", merr))
+		return true
+	}
+	b.writeResult(req.ID, resultBytes)
+	return true
 }
 
 // forwardToBackend sends a JSON-RPC request to the AceTeam MCP backend
