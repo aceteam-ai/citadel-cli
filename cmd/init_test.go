@@ -4,8 +4,10 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -671,5 +673,132 @@ func TestSeedAceteamAPIKeyFromLegacyFile_LegacyHasNoKey(t *testing.T) {
 
 	if _, exists := config["aceteam_api_key"]; exists {
 		t.Errorf("aceteam_api_key should not be set, got %v", config["aceteam_api_key"])
+	}
+}
+
+// withHookOverrides redirects the two package hooks saveDeviceConfigToFile/
+// saveRedisURLToConfig go through (nodeConfigDirFn, fixStatePermissionsFn) and
+// restores the originals via t.Cleanup. nodeConfigDirFn MUST be overridden by
+// any test that calls either writer directly: network.GetNodeConfigDir() (the
+// default) resolves through /etc/citadel/config.yaml's node_config_dir when
+// present, which is world-readable and, on a real provisioned node, points at
+// that node's REAL citadel-node/config.yaml -- not a path under the test's
+// control. Redirecting here is what makes it safe to call the real writer
+// functions from a test at all.
+func withHookOverrides(t *testing.T, dir string, onFix func()) {
+	t.Helper()
+	origDirFn := nodeConfigDirFn
+	origFixFn := fixStatePermissionsFn
+	nodeConfigDirFn = func() string { return dir }
+	fixStatePermissionsFn = onFix
+	t.Cleanup(func() {
+		nodeConfigDirFn = origDirFn
+		fixStatePermissionsFn = origFixFn
+	})
+}
+
+// TestSaveDeviceConfigToFile_CallsFixStatePermissionsAfterWrite verifies
+// saveDeviceConfigToFile calls fixStatePermissionsFn (network.FixStatePermissions
+// in production) exactly once, AFTER the config file is durably on disk --
+// closing the citadel-cli#878 gap where a root-context write (e.g. `sudo
+// citadel init` re-auth via the NetChoiceVerified branch, which does not
+// re-invoke Connect()) could leave a root-owned config.yaml unreadable by the
+// node's normal non-root reader.
+func TestSaveDeviceConfigToFile_CallsFixStatePermissionsAfterWrite(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yaml")
+
+	var calls int
+	var fileExistedAtCallTime bool
+	withHookOverrides(t, dir, func() {
+		calls++
+		_, err := os.Stat(configFile)
+		fileExistedAtCallTime = err == nil
+	})
+
+	token := &nexus.TokenResponse{
+		DeviceAPIToken: "dat_test_878",
+		APIBaseURL:     "https://aceteam.ai",
+		OrgID:          "org-878",
+	}
+	if err := saveDeviceConfigToFile(token); err != nil {
+		t.Fatalf("saveDeviceConfigToFile: %v", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("fixStatePermissionsFn called %d times, want exactly 1", calls)
+	}
+	if !fileExistedAtCallTime {
+		t.Error("fixStatePermissionsFn was called before config.yaml existed on disk")
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("config file was not written: %v", err)
+	}
+	if !strings.Contains(string(data), "dat_test_878") {
+		t.Errorf("config file missing written token, got: %s", data)
+	}
+}
+
+// TestSaveRedisURLToConfig_CallsFixStatePermissionsAfterWrite mirrors
+// TestSaveDeviceConfigToFile_CallsFixStatePermissionsAfterWrite for
+// saveRedisURLToConfig -- the second writer citadel-cli#878 requires the same
+// fix for.
+func TestSaveRedisURLToConfig_CallsFixStatePermissionsAfterWrite(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yaml")
+
+	var calls int
+	var fileExistedAtCallTime bool
+	withHookOverrides(t, dir, func() {
+		calls++
+		_, err := os.Stat(configFile)
+		fileExistedAtCallTime = err == nil
+	})
+
+	if err := saveRedisURLToConfig("redis://localhost:6379"); err != nil {
+		t.Fatalf("saveRedisURLToConfig: %v", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("fixStatePermissionsFn called %d times, want exactly 1", calls)
+	}
+	if !fileExistedAtCallTime {
+		t.Error("fixStatePermissionsFn was called before config.yaml existed on disk")
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("config file was not written: %v", err)
+	}
+	if !strings.Contains(string(data), "redis://localhost:6379") {
+		t.Errorf("config file missing written redis_url, got: %s", data)
+	}
+}
+
+// TestSaveDeviceConfigToFile_SkipsFixStatePermissionsOnWriteFailure verifies
+// the fix is applied only after a SUCCESSFUL write: fixStatePermissionsFn must
+// never run (and must never turn a failed write into a reported success) when
+// the write itself fails.
+func TestSaveDeviceConfigToFile_SkipsFixStatePermissionsOnWriteFailure(t *testing.T) {
+	// Point nodeConfigDirFn at a path whose parent is a regular file, so
+	// os.MkdirAll (the first thing saveDeviceConfigToFile does) fails.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	badDir := filepath.Join(blocker, "config-dir")
+
+	var calls int
+	withHookOverrides(t, badDir, func() { calls++ })
+
+	err := saveDeviceConfigToFile(&nexus.TokenResponse{DeviceAPIToken: "dat_should_not_persist"})
+	if err == nil {
+		t.Fatal("expected saveDeviceConfigToFile to fail when its config dir cannot be created")
+	}
+	if calls != 0 {
+		t.Errorf("fixStatePermissionsFn called %d times on a failed write, want 0", calls)
 	}
 }
