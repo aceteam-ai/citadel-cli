@@ -1814,3 +1814,19 @@ Auto-generated log of every release.
   - feat(mcp): local node control plane — module control + local inference + file tools (aceteam #8249 v1) (#855)
 
 
+---
+
+## v2.119.0 — 2026-08-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 16 |
+| Lines added | +1515 |
+
+**Changes:**
+
+  - fix(cli): namespace embedded container_name under --node-dir override (#860) (#862)
+  - fix(mcp): defer stdout restore + real local-tool timeout (#858) (#861)
+
+
