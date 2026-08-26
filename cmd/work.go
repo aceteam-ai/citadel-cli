@@ -2721,22 +2721,15 @@ func getWorkHostname() string {
 	return hostname
 }
 
-// getRedisURLFromConfig reads Redis URL from global config file.
-// Returns empty string if not configured.
+// getRedisURLFromConfig reads the Redis URL from the device/org config.
+// Returns empty string if not configured. Currently unused (kept for API
+// compatibility), but wired through getDeviceConfigFromFile like every other
+// reader (citadel-cli#845) rather than reading platform.ConfigDir() directly.
 func getRedisURLFromConfig() string {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return ""
+	if dc := getDeviceConfigFromFile(); dc != nil {
+		return dc.RedisURL
 	}
-
-	var config struct {
-		RedisURL string `yaml:"redis_url"`
-	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return ""
-	}
-	return config.RedisURL
+	return ""
 }
 
 // resolveWorkspaceDir returns the sandbox directory for file-operation handlers.
@@ -2978,25 +2971,74 @@ type DeviceConfig struct {
 	AceteamAPIKey string `yaml:"aceteam_api_key"`
 }
 
-// getDeviceConfigFromFile reads device authentication config from global config file.
+// getDeviceConfigFromFile reads device authentication config from the
+// device/org config file (config.yaml: device_api_token, org_id, org_name,
+// user_email, user_name, redis_url, ...). This is the single read path for
+// every `deviceConfig := getDeviceConfigFromFile()` call site in cmd/
+// (login, work, whoami, controlcenter, notify, logs, deploy, reconnect,
+// keyrenew, mcp, ...), so fixing it here converges all of them at once.
+//
+// It checks deviceConfigDirs() (cmd/devicecreds_hooks.go) in order:
+// network.GetNodeConfigDir() (machine-convergent, matching
+// saveDeviceConfigToFile's write location as of citadel-cli#845) first, then
+// the legacy invoker-scoped platform.ConfigDir() as a read-only fallback for
+// a node whose config was written before #845 and hasn't re-run citadel
+// init/login/reauth since. See CLAUDE.md's ConfigDir()/GetNodeConfigDir()
+// section. internal/worker reaches the SAME search order via
+// config.LoadDeviceCredsConverged, wired to deviceConfigDirs through
+// config.DeviceConfigDirsHook (internal/config is a leaf and cannot import
+// internal/network directly -- see cmd/devicecreds_hooks.go).
+//
+// The actual search is the pure, directly-testable readDeviceConfigFromDirs --
+// split out the same way network.GetStateDir/resolveStateDir are, since
+// deviceConfigDirs()'s real entries depend on env/HOME/filesystem state a
+// unit test should not have to fake end-to-end.
 func getDeviceConfigFromFile() *DeviceConfig {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return nil
-	}
+	return readDeviceConfigFromDirs(deviceConfigDirs())
+}
 
-	var config DeviceConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil
-	}
+// readDeviceConfigFromDirs searches dirs, in order, for a <dir>/config.yaml
+// with a non-empty device_api_token or redis_url, and returns the first
+// match. Pure aside from the file reads, so a test can pass fabricated
+// directories instead of the real config.DeviceConfigDirs() -- e.g. to prove
+// that a config written to what a root-context invocation resolves as
+// network.GetNodeConfigDir() is read back correctly by a non-root-context
+// invocation that resolves the SAME GetNodeConfigDir (even though their
+// respective platform.ConfigDir() would diverge -- see CLAUDE.md's
+// ConfigDir()/GetNodeConfigDir() section and citadel-cli#845).
+//
+// A missing file (os.IsNotExist) is the expected, silent case for every
+// candidate that simply hasn't been written yet. Any OTHER read error --
+// most notably EACCES, the concrete risk for the new preferred candidate: a
+// `sudo citadel init --provision` writes network.GetNodeConfigDir()/config.yaml
+// root-owned 0600 before the chown pass that normally follows network
+// connection runs -- is logged at Debug rather than swallowed, so a
+// mysteriously-empty read is traceable instead of silently falling back to
+// (possibly stale) legacy data.
+func readDeviceConfigFromDirs(dirs []string) *DeviceConfig {
+	for _, dir := range dirs {
+		globalConfigFile := filepath.Join(dir, "config.yaml")
+		data, err := os.ReadFile(globalConfigFile)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				Debug("readDeviceConfigFromDirs: cannot read %s: %v", globalConfigFile, err)
+			}
+			continue
+		}
 
-	// Return nil if no relevant config found
-	if config.DeviceAPIToken == "" && config.RedisURL == "" {
-		return nil
-	}
+		var dc DeviceConfig
+		if err := yaml.Unmarshal(data, &dc); err != nil {
+			continue
+		}
 
-	return &config
+		// Skip if no relevant config found in this candidate.
+		if dc.DeviceAPIToken == "" && dc.RedisURL == "" {
+			continue
+		}
+
+		return &dc
+	}
+	return nil
 }
 
 // createUsagePublishFn returns a function that publishes usage records to Redis.

@@ -440,3 +440,236 @@ func TestReloginVsNewDeviceFlags(t *testing.T) {
 	t.Log("  --relogin --new-device: Same machine key, NEW backend mapping → still same IP")
 	t.Log("                         (backend ignores old mapping but Headscale sees same machine)")
 }
+
+// --- citadel-cli#845: device/org config must read/write via the
+// machine-convergent network.GetNodeConfigDir(), not the invoker-scoped
+// platform.ConfigDir(), so a root-owned systemd `citadel work` and an
+// interactive non-root reader (`citadel whoami`/`status`/...) agree on where
+// the config lives. See CLAUDE.md's ConfigDir()/GetNodeConfigDir() section.
+
+// TestReadDeviceConfigFromDirs_ConvergedDirWins models the exact scenario
+// #845 reports: a root-context writer and a non-root-context reader have
+// DIFFERENT platform.ConfigDir() results, but BOTH resolve
+// network.GetNodeConfigDir() to the SAME directory (that convergence is the
+// whole point of GetNodeConfigDir's pointer-file / SUDO_USER-aware
+// resolution -- see internal/network/state.go). dirs[0] here stands in for
+// that shared, converged GetNodeConfigDir(); dirs[1] stands in for a
+// platform.ConfigDir() that would NOT have agreed between the two contexts.
+func TestReadDeviceConfigFromDirs_ConvergedDirWins(t *testing.T) {
+	convergedDir := t.TempDir() // what both contexts resolve as GetNodeConfigDir()
+	diverged := t.TempDir()     // a ConfigDir() that would diverge between contexts
+
+	content := "device_api_token: dat_converged\norg_id: org-1\norg_name: Acme\n"
+	if err := os.WriteFile(filepath.Join(convergedDir, "config.yaml"), []byte(content), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{convergedDir, diverged})
+	if dc == nil {
+		t.Fatal("expected a device config, got nil")
+	}
+	if dc.DeviceAPIToken != "dat_converged" || dc.OrgID != "org-1" || dc.OrgName != "Acme" {
+		t.Errorf("got %+v, want token=dat_converged org_id=org-1 org_name=Acme (read should come from the converged dir, not the diverged one)", dc)
+	}
+}
+
+// TestReadDeviceConfigFromDirs_LegacyFallback pins the backward-compat
+// contract: a node registered before #845 has its device config ONLY at the
+// legacy platform.ConfigDir() location. It must not be stranded -- the read
+// falls back to the legacy dir when the preferred (new) dir has nothing.
+func TestReadDeviceConfigFromDirs_LegacyFallback(t *testing.T) {
+	preferredDir := t.TempDir() // GetNodeConfigDir() -- nothing written yet
+	legacyDir := t.TempDir()    // platform.ConfigDir() -- pre-#845 write lives here
+
+	content := "device_api_token: dat_legacy\nredis_url: redis://legacy:6379\n"
+	if err := os.WriteFile(filepath.Join(legacyDir, "config.yaml"), []byte(content), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{preferredDir, legacyDir})
+	if dc == nil {
+		t.Fatal("expected a device config via legacy fallback, got nil")
+	}
+	if dc.DeviceAPIToken != "dat_legacy" {
+		t.Errorf("DeviceAPIToken = %q, want dat_legacy", dc.DeviceAPIToken)
+	}
+}
+
+// TestReadDeviceConfigFromDirs_PreferredOverLegacy verifies preference order
+// when both locations have data (e.g. a stale legacy file left behind after
+// a post-#845 re-registration wrote the new location): the preferred dir
+// wins.
+func TestReadDeviceConfigFromDirs_PreferredOverLegacy(t *testing.T) {
+	preferredDir := t.TempDir()
+	legacyDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(preferredDir, "config.yaml"), []byte("device_api_token: dat_new\n"), 0600); err != nil {
+		t.Fatalf("write preferred config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "config.yaml"), []byte("device_api_token: dat_stale\n"), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{preferredDir, legacyDir})
+	if dc == nil || dc.DeviceAPIToken != "dat_new" {
+		t.Errorf("got %+v, want token=dat_new (preferred dir should win over stale legacy data)", dc)
+	}
+}
+
+// TestReadDeviceConfigFromDirs_SkipsEmptyCandidates verifies a directory
+// whose config.yaml exists but carries neither device_api_token nor
+// redis_url (e.g. only hostname/node_config_dir, the legacy pointer file's
+// other keys) is skipped in favor of a later candidate that has real data --
+// matching the original single-directory behavior's "return nil if no
+// relevant config found" rule, now applied per-candidate.
+func TestReadDeviceConfigFromDirs_SkipsEmptyCandidates(t *testing.T) {
+	emptyDir := t.TempDir()
+	dataDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(emptyDir, "config.yaml"), []byte("node_config_dir: /home/user/citadel-node\nhostname: citadel-abc\n"), 0600); err != nil {
+		t.Fatalf("write empty-candidate config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte("device_api_token: dat_real\n"), 0600); err != nil {
+		t.Fatalf("write data config: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{emptyDir, dataDir})
+	if dc == nil || dc.DeviceAPIToken != "dat_real" {
+		t.Errorf("got %+v, want token=dat_real (candidate with no device_api_token/redis_url should be skipped)", dc)
+	}
+}
+
+// TestReadDeviceConfigFromDirs_NoneFound verifies a miss across every
+// candidate returns nil, not a zero-valued non-nil struct or an error.
+func TestReadDeviceConfigFromDirs_NoneFound(t *testing.T) {
+	dc := readDeviceConfigFromDirs([]string{t.TempDir(), t.TempDir()})
+	if dc != nil {
+		t.Errorf("got %+v, want nil", dc)
+	}
+}
+
+// TestClearDeviceFieldsPreservingNodeConfigDir verifies the pure core of
+// clearLegacyDeviceConfig: it clears every device-auth field (including
+// org_name, added alongside the #845 fix -- the original clearSavedConfig
+// deleted org_id but never org_name, so a --relogin left a stale org name
+// behind) while preserving node_config_dir, matching (and extending)
+// TestClearSavedConfigPreservesNodeConfigDir above.
+func TestClearDeviceFieldsPreservingNodeConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yaml")
+	content := `node_config_dir: "/home/user/citadel-node"
+device_api_token: "test-token"
+api_base_url: "https://aceteam.ai"
+org_id: "test-org"
+org_name: "Test Org"
+user_email: "user@test.com"
+user_name: "Test User"
+redis_url: "redis://localhost:6379"
+`
+	if err := os.WriteFile(configFile, []byte(content), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	clearDeviceFieldsPreservingNodeConfigDir(configFile)
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("read back config: %v", err)
+	}
+	var got map[string]interface{}
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+
+	if got["node_config_dir"] != "/home/user/citadel-node" {
+		t.Errorf("node_config_dir should be preserved, got %v", got["node_config_dir"])
+	}
+	for _, field := range []string{"device_api_token", "api_base_url", "org_id", "org_name", "user_email", "user_name", "redis_url"} {
+		if _, exists := got[field]; exists {
+			t.Errorf("%s should be cleared, still present: %v", field, got[field])
+		}
+	}
+}
+
+// TestClearDeviceFieldsPreservingNodeConfigDir_MissingFile verifies clearing
+// a nonexistent file is a silent no-op (matches the original behavior: "File
+// doesn't exist, nothing to clear").
+func TestClearDeviceFieldsPreservingNodeConfigDir_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.yaml")
+	// Do not create the file.
+	clearDeviceFieldsPreservingNodeConfigDir(configFile)
+	if _, err := os.Stat(configFile); !os.IsNotExist(err) {
+		t.Errorf("expected file to remain absent, stat err = %v", err)
+	}
+}
+
+// TestSeedAceteamAPIKeyFromLegacyFile_CarriesForward pins the fix for a real
+// gap the #845 location change would otherwise introduce: aceteam_api_key is
+// hand-set by the user (never written by device auth, #495) and
+// readDeviceConfigFromDirs returns the FIRST candidate with a token rather
+// than merging fields across candidates. Without this seed, a user's
+// hand-added key at the legacy location would silently stop being read the
+// moment the new (preferred) location starts winning.
+func TestSeedAceteamAPIKeyFromLegacyFile_CarriesForward(t *testing.T) {
+	legacyFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(legacyFile, []byte("aceteam_api_key: act_hand_set_by_user\ndevice_api_token: dat_old\n"), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	config := map[string]interface{}{"device_api_token": "dat_new"}
+	seedAceteamAPIKeyFromLegacyFile(config, legacyFile)
+
+	if config["aceteam_api_key"] != "act_hand_set_by_user" {
+		t.Errorf("aceteam_api_key = %v, want act_hand_set_by_user (should carry forward from legacy file)", config["aceteam_api_key"])
+	}
+	// The seed must not clobber unrelated fields already being written.
+	if config["device_api_token"] != "dat_new" {
+		t.Errorf("device_api_token = %v, want dat_new (unrelated field must be untouched)", config["device_api_token"])
+	}
+}
+
+// TestSeedAceteamAPIKeyFromLegacyFile_DoesNotOverwriteExisting verifies the
+// seed is idempotent and never clobbers a value already present in the
+// target config (e.g. the user set aceteam_api_key directly at the new
+// location, or a previous seed already ran).
+func TestSeedAceteamAPIKeyFromLegacyFile_DoesNotOverwriteExisting(t *testing.T) {
+	legacyFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(legacyFile, []byte("aceteam_api_key: act_legacy\n"), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	config := map[string]interface{}{"aceteam_api_key": "act_current"}
+	seedAceteamAPIKeyFromLegacyFile(config, legacyFile)
+
+	if config["aceteam_api_key"] != "act_current" {
+		t.Errorf("aceteam_api_key = %v, want act_current (must not overwrite an already-set value)", config["aceteam_api_key"])
+	}
+}
+
+// TestSeedAceteamAPIKeyFromLegacyFile_NoLegacyFile verifies a missing/empty
+// legacy file is a silent no-op, not an error or a panic.
+func TestSeedAceteamAPIKeyFromLegacyFile_NoLegacyFile(t *testing.T) {
+	config := map[string]interface{}{"device_api_token": "dat_new"}
+	seedAceteamAPIKeyFromLegacyFile(config, filepath.Join(t.TempDir(), "config.yaml"))
+
+	if _, exists := config["aceteam_api_key"]; exists {
+		t.Errorf("aceteam_api_key should not be set, got %v", config["aceteam_api_key"])
+	}
+}
+
+// TestSeedAceteamAPIKeyFromLegacyFile_LegacyHasNoKey verifies a legacy file
+// that exists but has no aceteam_api_key field leaves config untouched.
+func TestSeedAceteamAPIKeyFromLegacyFile_LegacyHasNoKey(t *testing.T) {
+	legacyFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(legacyFile, []byte("device_api_token: dat_old\n"), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	config := map[string]interface{}{}
+	seedAceteamAPIKeyFromLegacyFile(config, legacyFile)
+
+	if _, exists := config["aceteam_api_key"]; exists {
+		t.Errorf("aceteam_api_key should not be set, got %v", config["aceteam_api_key"])
+	}
+}

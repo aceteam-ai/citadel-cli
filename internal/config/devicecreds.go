@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -13,6 +14,50 @@ import (
 // needs (the device API token + the API base URL) so a handler in internal/
 // can authenticate against the AceTeam backend without importing cmd.
 const deviceCredsFile = "config.yaml"
+
+// DeviceConfigDirsHook resolves, in preference order, the directories that
+// may hold the device/org config file (config.yaml: device_api_token,
+// api_base_url, org_id, org_name, user_email, user_name, redis_url,
+// aceteam_api_key): network.GetNodeConfigDir() (the machine-convergent node
+// config dir, already used for identity.json/ssh_sync.yaml) first, then the
+// legacy invoker-scoped platform.ConfigDir() as a read-only fallback for a
+// node whose config was written before citadel-cli#845.
+//
+// internal/config is a leaf that must not import internal/network (see
+// cmd/nodevault_hooks.go's identical config.VaultConfigured/VaultVerify
+// pattern), so cmd wires this hook at init time -- every citadel entrypoint
+// loads it via main -> cmd.Execute. A nil hook (e.g. a standalone test binary
+// that never called cmd.Execute) makes LoadDeviceCredsConverged fall back to
+// platform.ConfigDir() alone -- the pre-#845, leaf-safe behavior -- rather
+// than panicking.
+var DeviceConfigDirsHook func() []string
+
+// LoadDeviceCredsConverged loads device creds by trying DeviceConfigDirsHook()
+// (or, if unset, platform.ConfigDir() alone) in preference order and
+// returning the first entry with a non-empty token. Prefer this over calling
+// LoadDeviceCreds(platform.ConfigDir()) directly -- that single-directory
+// form is invoker-scoped and will miss the config in a cross-context read
+// (see DeviceConfigDirsHook).
+func LoadDeviceCredsConverged() DeviceCreds {
+	if DeviceConfigDirsHook == nil {
+		return LoadDeviceCreds(platform.ConfigDir())
+	}
+	return loadDeviceCredsFromDirs(DeviceConfigDirsHook())
+}
+
+// loadDeviceCredsFromDirs is the pure core of LoadDeviceCredsConverged: given
+// an explicit, ordered directory list, return the first entry with a
+// non-empty token. Split out (mirroring cmd.readDeviceConfigFromDirs) so a
+// test can pass fabricated directories instead of the real
+// DeviceConfigDirsHook(), whose entries depend on env/HOME/filesystem state.
+func loadDeviceCredsFromDirs(dirs []string) DeviceCreds {
+	for _, dir := range dirs {
+		if c := LoadDeviceCreds(dir); c.Token != "" {
+			return c
+		}
+	}
+	return DeviceCreds{}
+}
 
 // DeviceCreds carries the minimal device-auth material needed to call the
 // AceTeam backend as this node: the bearer token and the API base URL.

@@ -903,47 +903,51 @@ func createGlobalConfig(nodeConfigDir string) error {
 	return nil
 }
 
-// hasRedisURLConfigured checks if a Redis URL is stored in the global config.
-// Deprecated: use hasDeviceConfigured instead.
+// hasRedisURLConfigured checks if a Redis URL is stored in the device/org
+// config. Deprecated: use hasDeviceConfigured instead. Currently unused
+// (kept for API compatibility), but wired through getDeviceConfigFromFile
+// like every other reader (citadel-cli#845) rather than reading
+// platform.ConfigDir() directly, so it can't silently regress into the same
+// invoker-scoped bug if a future caller reaches for it.
 func hasRedisURLConfigured() bool {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return false
-	}
-
-	var config struct {
-		RedisURL string `yaml:"redis_url"`
-	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return false
-	}
-	return config.RedisURL != ""
+	dc := getDeviceConfigFromFile()
+	return dc != nil && dc.RedisURL != ""
 }
 
 // hasDeviceConfigured checks if device authentication config is present.
 // Returns true if either device_api_token or redis_url is configured.
+// Delegates to getDeviceConfigFromFile so this agrees with every other reader
+// on the same convergent-then-legacy-fallback search order (citadel-cli#845).
 func hasDeviceConfigured() bool {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return false
-	}
-
-	var config struct {
-		DeviceAPIToken string `yaml:"device_api_token"`
-		RedisURL       string `yaml:"redis_url"`
-	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return false
-	}
-	return config.DeviceAPIToken != "" || config.RedisURL != ""
+	return getDeviceConfigFromFile() != nil
 }
 
-// clearSavedConfig removes the saved config file to force fresh authentication.
+// clearSavedConfig removes the saved device config to force fresh
+// authentication. It clears BOTH locations getDeviceConfigFromFile reads
+// (citadel-cli#845): the current, machine-convergent
+// network.GetNodeConfigDir()/config.yaml (where saveDeviceConfigToFile now
+// writes) and the legacy platform.ConfigDir()/config.yaml (where a
+// pre-#845 node's device config may still live, and which also doubles as
+// the pointer file for node_config_dir/hostname -- those keys are preserved
+// there, never in the new location, since saveDeviceConfigToFile only ever
+// writes device-auth fields to it).
 func clearSavedConfig() {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
+	clearLegacyDeviceConfig()
+	clearNodeDeviceConfig()
+}
 
+// clearLegacyDeviceConfig clears device-auth fields from
+// platform.ConfigDir()/config.yaml, preserving node_config_dir/hostname
+// (the pointer-file keys that also live in this file and must survive a
+// --relogin).
+func clearLegacyDeviceConfig() {
+	clearDeviceFieldsPreservingNodeConfigDir(filepath.Join(platform.ConfigDir(), "config.yaml"))
+}
+
+// clearDeviceFieldsPreservingNodeConfigDir is the pure, path-parameterized
+// core of clearLegacyDeviceConfig, split out so a test can pass a temp-dir
+// path directly instead of needing platform.ConfigDir() to resolve there.
+func clearDeviceFieldsPreservingNodeConfigDir(globalConfigFile string) {
 	// Read existing config to preserve node_config_dir
 	data, err := os.ReadFile(globalConfigFile)
 	if err != nil {
@@ -965,6 +969,7 @@ func clearSavedConfig() {
 	delete(config, "device_api_token")
 	delete(config, "api_base_url")
 	delete(config, "org_id")
+	delete(config, "org_name")
 	delete(config, "redis_url")
 	delete(config, "user_email")
 	delete(config, "user_name")
@@ -988,6 +993,16 @@ func clearSavedConfig() {
 	_ = os.WriteFile(globalConfigFile, newData, 0600)
 }
 
+// clearNodeDeviceConfig removes network.GetNodeConfigDir()/config.yaml
+// entirely -- unlike the legacy file, this one (written only by
+// saveDeviceConfigToFile/saveRedisURLToConfig, post-#845) holds device-auth
+// fields exclusively, so a full removal is safe and there is nothing to
+// preserve. Best-effort: a missing file is not an error.
+func clearNodeDeviceConfig() {
+	globalConfigFile := filepath.Join(network.GetNodeConfigDir(), "config.yaml")
+	_ = os.Remove(globalConfigFile)
+}
+
 // maskToken masks a token for safe logging, showing only first/last few chars.
 func maskToken(token string) string {
 	if token == "" {
@@ -999,10 +1014,20 @@ func maskToken(token string) string {
 	return token[:4] + "..." + token[len(token)-4:]
 }
 
-// saveDeviceConfigToFile saves device authentication config to the global config file.
-// This is called after device auth to store the device_api_token and api_base_url.
+// saveDeviceConfigToFile saves device authentication config to the
+// machine-convergent node config file. This is called after device auth to
+// store the device_api_token and api_base_url.
+//
+// Writes to network.GetNodeConfigDir(), NOT platform.ConfigDir() (citadel-cli
+// #845): the reader (getDeviceConfigFromFile) and every writer of this file
+// must agree on the SAME directory regardless of invocation context (a
+// root-owned systemd `citadel work` vs. an interactive non-root `citadel
+// init`), or one under-reports org/user the way #726/#696 already documented
+// for identity.json/ssh_sync.yaml. getDeviceConfigFromFile still falls back
+// to the legacy platform.ConfigDir() location for a node registered before
+// this fix.
 func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
-	globalConfigDir := platform.ConfigDir()
+	globalConfigDir := network.GetNodeConfigDir()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1021,6 +1046,9 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	if config == nil {
 		config = make(map[string]interface{})
 	}
+
+	// Seed-on-first-write (citadel-cli#845): see seedAceteamAPIKeyFromLegacyFile.
+	seedAceteamAPIKeyFromLegacyFile(config, filepath.Join(platform.ConfigDir(), "config.yaml"))
 
 	// Add device API token, base URL, and org ID (secure mode)
 	config["device_api_token"] = token.DeviceAPIToken
@@ -1061,6 +1089,44 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	return nil
 }
 
+// seedAceteamAPIKeyFromLegacyFile carries aceteam_api_key forward from
+// legacyFile into config if config doesn't already have it set.
+//
+// Why this exists (citadel-cli#845): readDeviceConfigFromDirs returns the
+// FIRST candidate directory with a token -- it does NOT merge fields across
+// candidates. aceteam_api_key is hand-set by the user directly in config.yaml
+// (device auth never writes it, #495), so once this node's device config
+// starts resolving from the new, preferred network.GetNodeConfigDir()
+// location instead of the legacy platform.ConfigDir() one, a key that only
+// exists in the legacy file would silently stop being read -- not a
+// config.yaml the user touched, so citadel must not be the reason it goes
+// missing. Called from every write path (saveDeviceConfigToFile,
+// saveRedisURLToConfig) so the key survives regardless of which one first
+// creates the new file. Idempotent: a no-op once already present in config,
+// and a no-op if legacyFile has no key to carry forward.
+//
+// Pure aside from the one read of legacyFile (an explicit parameter, not
+// platform.ConfigDir() resolved internally), so a test can point it at a
+// temp file instead of the real invoker-scoped location.
+func seedAceteamAPIKeyFromLegacyFile(config map[string]interface{}, legacyFile string) {
+	if _, alreadySet := config["aceteam_api_key"]; alreadySet {
+		return
+	}
+	data, err := os.ReadFile(legacyFile)
+	if err != nil {
+		return
+	}
+	var legacy struct {
+		AceteamAPIKey string `yaml:"aceteam_api_key"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return
+	}
+	if legacy.AceteamAPIKey != "" {
+		config["aceteam_api_key"] = legacy.AceteamAPIKey
+	}
+}
+
 // verifyConfigPersisted reads back the config file and verifies the token
 // is present. This catches silent write failures on read-only or full filesystems.
 func verifyConfigPersisted(configFile, expectedToken string) error {
@@ -1087,11 +1153,12 @@ func verifyConfigPersisted(configFile, expectedToken string) error {
 	return nil
 }
 
-// saveRedisURLToConfig saves the Redis URL to the global config file.
+// saveRedisURLToConfig saves the Redis URL to the machine-convergent node
+// config file (see saveDeviceConfigToFile's doc comment -- same #845 reasoning).
 // Deprecated: use saveDeviceConfigToFile instead.
 // This is called after device auth to store the org-specific Redis endpoint.
 func saveRedisURLToConfig(redisURL string) error {
-	globalConfigDir := platform.ConfigDir()
+	globalConfigDir := network.GetNodeConfigDir()
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1111,6 +1178,9 @@ func saveRedisURLToConfig(redisURL string) error {
 	if config == nil {
 		config = make(map[string]interface{})
 	}
+
+	// Seed-on-first-write (citadel-cli#845): see seedAceteamAPIKeyFromLegacyFile.
+	seedAceteamAPIKeyFromLegacyFile(config, filepath.Join(platform.ConfigDir(), "config.yaml"))
 
 	// Add Redis URL
 	config["redis_url"] = redisURL

@@ -383,9 +383,12 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	// Sovereign audio backup (aceteam#5097): default-on Opus upload + local
 	// retention. Creds (device token + API base) are loaded FRESH on each upload
 	// via the closure so a token rotated by the worker's in-place reauth is
-	// honored — not frozen at handler construction.
+	// honored — not frozen at handler construction. LoadDeviceCredsConverged
+	// (not LoadDeviceCreds(platform.ConfigDir())) so this agrees with a
+	// root-owned citadel work vs. any other invocation context that wrote the
+	// creds (citadel-cli#845).
 	h.SetAudioBackup(m.AudioBackupEnabled, m.RetentionAge(), func() (string, string) {
-		creds := config.LoadDeviceCreds(platform.ConfigDir())
+		creds := config.LoadDeviceCredsConverged()
 		return creds.APIBaseURL, creds.Token
 	})
 	return h
