@@ -409,6 +409,30 @@ func TestLocalListFilesPatternFilter(t *testing.T) {
 }
 
 // ============================================================================
+// tailTruncate
+// ============================================================================
+
+func TestTailTruncateShortStringUnchanged(t *testing.T) {
+	if got := tailTruncate("short", 100); got != "short" {
+		t.Errorf("got %q, want unchanged", got)
+	}
+}
+
+func TestTailTruncateKeepsTail(t *testing.T) {
+	s := strings.Repeat("a", 100) + "TAIL-MARKER"
+	got := tailTruncate(s, 20)
+	if !strings.HasSuffix(got, "TAIL-MARKER") {
+		t.Errorf("expected truncated output to keep the tail, got: %s", got)
+	}
+	if strings.Contains(got, strings.Repeat("a", 100)) {
+		t.Error("expected the head to be dropped, but the full head is still present")
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("expected a truncation marker, got: %s", got)
+	}
+}
+
+// ============================================================================
 // captureStdout
 // ============================================================================
 

@@ -123,11 +123,21 @@ func findLocalTool(tools []localMCPTool, name string) (localMCPTool, bool) {
 	return localMCPTool{}, false
 }
 
-// localToolCallTimeout bounds how long a single local tool invocation may
-// run. Module actions shell out to `docker compose`; inference dials a local
-// engine; both are node-local operations that should complete in seconds to
-// low minutes, not hang the stdio loop indefinitely (mirroring the worker's
-// per-job watchdog philosophy, internal/worker/deadline.go).
+// localToolCallTimeout bounds how long a tool that OBSERVES a context may
+// run -- concretely, today, only local_chat's HTTP call
+// (deps.chatClient.ChatCompletion honors ctx). It does NOT bound
+// local_module_stop/start/restart: moduleControlFn's signature has no ctx
+// parameter, because the primitive it drives (runModuleControl ->
+// liveModuleOps.Start/Stop -> `docker compose up|down` via a synchronous
+// exec.Cmd.Run()) has no cancellation hook to wire one into, and threading a
+// context through it here would not actually bound the call -- the pipe swap
+// in captureStdout can only be undone by the subprocess itself exiting (see
+// its doc comment), so a "timeout" that let tool.Call return early would
+// leave os.Stdout redirected while runModuleControl kept running in the
+// background, corrupting every subsequent JSON-RPC response. An unbounded
+// module action (matching the worker's own unbounded tier for SERVICE_START
+// and friends -- see CLAUDE.md's "Consume-Loop Watchdog" section) is the
+// honest tradeoff, not a bug to silently paper over with an inert deadline.
 const localToolCallTimeout = 5 * time.Minute
 
 // ============================================================================
@@ -140,10 +150,33 @@ const localToolCallTimeout = 5 * time.Minute
 // captureStdout so its human-readable progress lines (and any `docker
 // compose` subprocess output nested inside it, see captureStdout's comment)
 // never reach the MCP server's real stdout, which is the JSON-RPC transport.
+//
+// The capture is tail-truncated to maxCapturedModuleOutputBytes: a
+// build-based service's first start (e.g. bonsai, see CLAUDE.md) can emit a
+// multi-megabyte `docker compose build` log, and captureStdout itself makes
+// no promise about size -- only that collecting it won't hang.
 func runModuleControlCaptured(name string, action moduleAction) (string, error) {
-	return captureStdout(func() error {
+	out, err := captureStdout(func() error {
 		return runModuleControl(name, action)
 	})
+	return tailTruncate(out, maxCapturedModuleOutputBytes), err
+}
+
+// maxCapturedModuleOutputBytes bounds how much of a module-control command's
+// captured output rides in a single JSON-RPC tool result.
+const maxCapturedModuleOutputBytes = 16 * 1024 // 16 KiB
+
+// tailTruncate keeps the LAST maxLen bytes of s, marking that truncation
+// happened. Deliberately tail- rather than head-truncation (unlike
+// truncate() in mcp.go, used for short debug-log previews): for `docker
+// compose` output the diagnostically useful text -- the actual error -- is
+// at the END of the log, and head-truncating would keep only build/pull
+// noise and drop exactly the part an agent needs to see.
+func tailTruncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return fmt.Sprintf("...[truncated %d bytes]...\n", len(s)-maxLen) + s[len(s)-maxLen:]
 }
 
 // newModuleControlTools builds the local_module_stop/start/restart tools.
@@ -531,8 +564,24 @@ func localListFilesCall(workspaceDir string, args json.RawMessage) (string, erro
 // or a subprocess it starts produces -- including a multi-megabyte first-time
 // build log (e.g. bonsai's inline `docker compose build`, see CLAUDE.md). The
 // caller is still responsible for bounding what it does with a very large
-// capture (see truncate() call sites); this helper only guarantees it won't
-// hang collecting it.
+// capture (see runModuleControlCaptured's tailTruncate call); this helper
+// only guarantees it won't hang collecting it.
+//
+// This also depends on fn only starting subprocesses SYNCHRONOUSLY (i.e. via
+// exec.Cmd.Run, as startService/stopServiceByCompose do today) so that fn
+// does not return until the subprocess has exited and its dup of the pipe
+// write end is closed. A future fn that used exec.Cmd.Start (backgrounding
+// the subprocess) would return while the child still held that fd open, so
+// closing w here would not be enough to unblock the reader goroutine's
+// io.ReadAll -- it would keep waiting for the CHILD's copy to close too,
+// i.e. potentially forever. Anything added to this call chain must stay
+// synchronous.
+//
+// Also note there is no cancellation here: fn runs to completion regardless
+// of any context a caller might have wanted to bound it with, because the
+// pipe swap can only be safely undone once fn (and everything it started
+// synchronously) has actually returned -- see localToolCallTimeout's comment
+// for why this specifically affects the module-control tools.
 func captureStdout(fn func() error) (string, error) {
 	r, w, perr := os.Pipe()
 	if perr != nil {
