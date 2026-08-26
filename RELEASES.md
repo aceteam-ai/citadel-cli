@@ -1797,3 +1797,20 @@ Auto-generated log of every release.
   - feat(cli): citadel whoami — node self-identity (aceteam #8139) (#844)
 
 
+---
+
+## v2.118.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 43 |
+| Lines added | +5770 |
+
+**Changes:**
+
+  - feat(cli): safe node-targeted module ops — --node-dir, --dry-run, --expect-node + blessed recovery path (#853, #854) (#856)
+  - feat(cli): citadel service diagnose <name> — one-command service failure triage (#852) (#857)
+  - feat(mcp): local node control plane — module control + local inference + file tools (aceteam #8249 v1) (#855)
+
+
