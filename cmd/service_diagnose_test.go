@@ -131,7 +131,10 @@ func TestBuildDiagnoseInput_PrefersComposeDeclaredContainerName(t *testing.T) {
 	}
 
 	manifest := &CitadelManifest{Services: []Service{{Name: "acme", ComposeFile: "services/acme.yml"}}}
-	in := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	in, err := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	if err != nil {
+		t.Fatalf("buildDiagnoseInput returned error: %v", err)
+	}
 	if in.ContainerName != "acme-app" {
 		t.Errorf("ContainerName = %q, want the compose-declared %q", in.ContainerName, "acme-app")
 	}
@@ -159,7 +162,10 @@ func TestBuildDiagnoseInput_MultiServiceComposeDoesNotOverrideContainerName(t *t
 	}
 
 	manifest := &CitadelManifest{Services: []Service{{Name: "acme", ComposeFile: "services/acme.yml"}}}
-	in := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	in, err := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	if err != nil {
+		t.Fatalf("buildDiagnoseInput returned error: %v", err)
+	}
 	if in.ContainerName != "citadel-acme" {
 		t.Errorf("ContainerName = %q, want the conventional fallback %q for an ambiguous multi-service compose", in.ContainerName, "citadel-acme")
 	}
@@ -181,9 +187,93 @@ func TestBuildDiagnoseInput_FallsBackToConventionalContainerName(t *testing.T) {
 	}
 
 	manifest := &CitadelManifest{Services: []Service{{Name: "vllm", ComposeFile: "services/vllm.yml"}}}
-	in := buildDiagnoseInput("vllm", manifest, dir, []string{"vllm"})
+	in, err := buildDiagnoseInput("vllm", manifest, dir, []string{"vllm"})
+	if err != nil {
+		t.Fatalf("buildDiagnoseInput returned error: %v", err)
+	}
 	if in.ContainerName != "citadel-vllm" {
 		t.Errorf("ContainerName = %q, want the conventional %q", in.ContainerName, "citadel-vllm")
+	}
+}
+
+// TestBuildDiagnoseInput_RefusesUnmaterializedComposeUnderNodeDirOverride
+// pins the citadel#863 fix: a catalog-only service (the common first-use
+// case -- never started, so nothing has ever been materialized into the
+// override directory) must REFUSE rather than fall back to the embedded
+// template's unnamespaced "citadel-<name>" container name, which -- on the
+// shared-Docker-daemon topology --node-dir exists to be used safely against
+// -- could be a DIFFERENT node's real, running container. This never touches
+// docker: the assertion is purely on the returned error, mirroring how
+// stopServiceByContainer's refuse-under-override case is tested.
+func TestBuildDiagnoseInput_RefusesUnmaterializedComposeUnderNodeDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	setNodeDirOverrideForTest(t, dir)
+
+	_, err := buildDiagnoseInput("vllm", nil, dir, nil)
+	if err == nil {
+		t.Fatal("expected buildDiagnoseInput to refuse when no compose file is materialized under the --node-dir override")
+	}
+	if !strings.Contains(err.Error(), "--node-dir") {
+		t.Errorf("error should mention --node-dir, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "citadel-vllm") {
+		t.Errorf("error should name the REAL container it would have diagnosed (citadel-vllm), got: %v", err)
+	}
+}
+
+// TestBuildDiagnoseInput_RefusesManifestEntryNotYetMaterializedUnderNodeDirOverride
+// covers the sibling shape: the override's OWN manifest declares the
+// service, but citadel.yaml alone doesn't materialize a compose file to
+// disk -- resolveComposeContent still falls back to embedded content, so
+// the same refusal must apply.
+func TestBuildDiagnoseInput_RefusesManifestEntryNotYetMaterializedUnderNodeDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	setNodeDirOverrideForTest(t, dir)
+
+	manifest := &CitadelManifest{Services: []Service{{Name: "vllm", ComposeFile: "services/vllm.yml"}}}
+	_, err := buildDiagnoseInput("vllm", manifest, dir, []string{"vllm"})
+	if err == nil {
+		t.Fatal("expected buildDiagnoseInput to refuse: citadel.yaml declares vllm but its compose file was never materialized under this override")
+	}
+}
+
+// TestBuildDiagnoseInput_AllowsMaterializedComposeUnderNodeDirOverride is the
+// control: once the override's OWN compose file is actually on disk inside
+// the override directory (i.e. the service has been started under this
+// override at least once), diagnose must proceed normally -- the container
+// name it resolves is scoped to this override (citadel#860 namespacing, once
+// materialization has run), so there is no real-container disclosure risk.
+func TestBuildDiagnoseInput_AllowsMaterializedComposeUnderNodeDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	setNodeDirOverrideForTest(t, dir)
+
+	servicesDir := filepath.Join(dir, "services")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	composeBody := "services:\n  vllm:\n    image: vllm/vllm-openai\n"
+	if err := os.WriteFile(filepath.Join(servicesDir, "vllm.yml"), []byte(composeBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := &CitadelManifest{Services: []Service{{Name: "vllm", ComposeFile: "services/vllm.yml"}}}
+	in, err := buildDiagnoseInput("vllm", manifest, dir, []string{"vllm"})
+	if err != nil {
+		t.Fatalf("buildDiagnoseInput should not refuse once the override's own compose file is materialized: %v", err)
+	}
+	if in.ComposeSource != "manifest" {
+		t.Errorf("ComposeSource = %q, want manifest", in.ComposeSource)
+	}
+}
+
+// TestDiagnoseNodeDirRefusalError_NoOverrideIsANoOp pins that the no-override
+// path is byte-identical to pre-#863 behavior regardless of source, matching
+// every other --node-dir guard in this codebase.
+func TestDiagnoseNodeDirRefusalError_NoOverrideIsANoOp(t *testing.T) {
+	for _, source := range []string{"manifest", "embedded", ""} {
+		if err := diagnoseNodeDirRefusalError("vllm", "", source, "citadel-vllm"); err != nil {
+			t.Errorf("source=%q: expected nil error with no override active, got: %v", source, err)
+		}
 	}
 }
 
