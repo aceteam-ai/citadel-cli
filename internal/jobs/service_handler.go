@@ -188,7 +188,19 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		// vram_gb triggers node-side preemption of non-pinned services to make
 		// room when the GPU lacks free VRAM. Absent => no preemption (the current
 		// backend does not yet forward it; see parseRequiredVRAMBytes).
-		return h.serviceStart(ctx, svc, job.Payload["model"], parseRequiredVRAMBytes(job.Payload))
+		//
+		// Optional trust_remote_code (#848): a SERVICE_START that declares
+		// trust_remote_code=true opts THIS deploy into vLLM's
+		// --trust-remote-code (needed by models shipping custom code, e.g.
+		// gte-multilingual-base, some Qwen/InternLM). Absent => leave any
+		// persisted opt-in as-is; an explicit falsy value clears it (opt-in,
+		// default OFF, non-sticky -- see parseTrustRemoteCodeIntent). Like
+		// vram_mb, the aceteam backend does not yet forward this field, so it
+		// is inert until it does; the aceteam-side follow-up is catalog
+		// metadata marking which models need it so the deploy path can set it
+		// automatically (and clear it for every other deploy to the same
+		// service).
+		return h.serviceStart(ctx, svc, job.Payload["model"], parseRequiredVRAMBytes(job.Payload), parseTrustRemoteCodeIntent(job.Payload))
 	case "SERVICE_STOP":
 		// A remote SERVICE_STOP is operator/cloud intent: mark the service
 		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
@@ -237,7 +249,9 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 // serve-time model (serviceModelEnvVar), it is persisted to the sibling
 // <name>.env BEFORE the already-running short-circuit, so a model change on a
 // running engine falls through to `up -d --force-recreate` and reloads it.
-func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes uint64) ([]byte, error) {
+// trustRemoteCode is the optional --trust-remote-code intent (#848); same
+// persist-then-recreate treatment as model, via persistServiceTrustRemoteCode.
+func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
 	// appliedModel is the model this start serves via compose env interpolation;
@@ -299,9 +313,22 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				modelChanged = changed
 			}
 		}
-		// Already-running short-circuit, UNLESS the persisted model just changed:
-		// then the running container serves the old model and must be recreated.
-		if !modelChanged && h.isDockerServiceRunning(svc.Name) {
+		// trustRemoteCode (#848): opt-in, default OFF, and explicitly
+		// NON-sticky -- an absent field leaves a previously-persisted value
+		// alone, but an explicit falsy value clears it (see
+		// parseTrustRemoteCodeIntent's SECURITY note: without a disable path,
+		// one deploy's opt-in would silently outlive the model that needed
+		// it). Persisted BEFORE the already-running short-circuit, same as
+		// model, so a change either direction on a running engine recreates
+		// the container instead of silently leaving the old flag in force.
+		trustChanged, tErr := h.persistServiceTrustRemoteCode(ctx, svc, trustRemoteCode)
+		if tErr != nil {
+			return nil, fmt.Errorf("failed to persist trust_remote_code for %s: %w", svc.Name, tErr)
+		}
+		// Already-running short-circuit, UNLESS the persisted model or
+		// trust_remote_code flag just changed: then the running container serves
+		// the old config and must be recreated.
+		if !modelChanged && !trustChanged && h.isDockerServiceRunning(svc.Name) {
 			msg := svc.Name + " is already running"
 			if appliedModel != "" {
 				msg = fmt.Sprintf("%s is already running serving %s", svc.Name, appliedModel)
@@ -531,6 +558,70 @@ func parseRequiredVRAMBytes(payload map[string]string) uint64 {
 	return 0
 }
 
+// ---------------------------------------------------------------------------
+// --trust-remote-code opt-in (citadel#848)
+// ---------------------------------------------------------------------------
+
+// trustRemoteCodeIntent is the tri-state result of parsing the optional
+// SERVICE_START trust_remote_code payload field: a SERVICE_START that omits
+// the field (the common/current case -- see parseTrustRemoteCodeIntent) must
+// leave a previously-persisted opt-in untouched, which a plain bool cannot
+// distinguish from "explicitly turn it off".
+type trustRemoteCodeIntent int
+
+const (
+	// trustRemoteCodeUnspecified: the payload did not address trust_remote_code
+	// at all. Leaves any persisted value as-is (e.g. a plain restart, or a
+	// deploy of a DIFFERENT model that doesn't mention the field).
+	trustRemoteCodeUnspecified trustRemoteCodeIntent = iota
+	// trustRemoteCodeEnable: persist the opt-in.
+	trustRemoteCodeEnable
+	// trustRemoteCodeDisable: explicitly clear a previously-persisted opt-in.
+	// SECURITY (this is the load-bearing case, not a nicety): without it, once
+	// one deploy opts a service into --trust-remote-code, EVERY later deploy of
+	// a DIFFERENT model to that same service would keep running with it too --
+	// arbitrary code execution silently outliving the one model that needed it.
+	trustRemoteCodeDisable
+)
+
+// parseTrustRemoteCodeIntent reads the optional SERVICE_START payload flag
+// that opts a deploy into vLLM's --trust-remote-code -- required by models
+// that ship custom modeling code (e.g. gte-multilingual-base, some Qwen/
+// InternLM), which otherwise crash Exited(1) at model-config creation.
+// SECURITY: --trust-remote-code executes arbitrary Python from the model
+// repo, so this must default OFF and only ever be turned on by explicit
+// signal here -- never baked into the compose template unconditionally (see
+// services/compose/vllm.yml). A missing/blank value is trustRemoteCodeUnspecified
+// (leave persisted state alone); a truthy value ("1"/"true"/"yes"/"on",
+// mirroring the convention used throughout this codebase -- energy sampling,
+// self-heal, etc. -- case/whitespace-insensitive) is Enable; any other
+// non-blank value (e.g. "false"/"0"/"no") is Disable, so a later deploy can
+// explicitly turn a previous opt-in back off.
+//
+// NOTE: like vram_mb/vram_gb (#577), the aceteam backend does NOT yet forward
+// this field on SERVICE_START (fabric_provision dispatches only
+// {service, model}), so this is INERT until the backend sends it. The
+// aceteam-side follow-up is catalog metadata marking which models require
+// trust_remote_code, so the deploy path can set it automatically ONLY for
+// those models -- and MUST send an explicit disable for every other deploy to
+// the same service, or this tri-state design buys nothing -- tracked
+// separately, not built here.
+func parseTrustRemoteCodeIntent(payload map[string]string) trustRemoteCodeIntent {
+	v, ok := payload["trust_remote_code"]
+	if !ok {
+		return trustRemoteCodeUnspecified
+	}
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return trustRemoteCodeUnspecified
+	}
+	switch strings.ToLower(trimmed) {
+	case "1", "true", "yes", "on":
+		return trustRemoteCodeEnable
+	}
+	return trustRemoteCodeDisable
+}
+
 // preemptForVRAM makes room for a deploy that declares a VRAM budget by durably
 // stopping non-pinned services until it fits. It is a no-op when the requirement
 // is unknown (requiredVRAMBytes==0), when free VRAM already suffices, or when the
@@ -714,6 +805,76 @@ func (h *ServiceHandler) persistServiceModel(ctx JobContext, svc manifestService
 	}
 	ctx.Log("info", "     - Persisted %s=%s to %s", envVar, model, envPath)
 	return envVar, true, nil
+}
+
+// serviceTrustRemoteCodeEnvVar maps a managed engine to the compose
+// interpolation variable that opts it into --trust-remote-code (#848).
+// Deliberately its own map (not folded into serviceModelEnvVar): engines
+// absent here take no trust-remote-code parameter at all, and keeping this
+// list separate from the model-env map means adding a future engine to one
+// never silently wires it into the other. vllm only, for now -- llamacpp/
+// bonsai/ollama have no equivalent flag wired in their compose files.
+var serviceTrustRemoteCodeEnvVar = map[string]string{
+	"vllm": "VLLM_TRUST_REMOTE_CODE",
+}
+
+// persistServiceTrustRemoteCode applies a SERVICE_START job's trust_remote_code
+// intent (#848) to the sibling <name>.env next to the service's compose file --
+// the same file persistServiceModel writes to and both start paths (this
+// handler and the cmd/ boot path) pass to compose via --env-file, so the
+// setting survives a plain `citadel work` restart.
+//
+// intent==Unspecified is a no-op (never called by serviceStart, but safe if it
+// is). intent==Enable writes <envVar>=1. intent==Disable writes <envVar>=
+// (empty) rather than deleting the line: compose's ${VAR:+word} interpolation
+// (services/compose/vllm.yml) treats a variable that is SET-BUT-EMPTY
+// identically to UNSET -- both are "null" in POSIX parameter-expansion terms,
+// which is exactly why the compose template uses the colon form (:+) and not
+// the bare (+) form -- so an empty value reliably turns --trust-remote-code
+// back off. This is the mechanism that makes the flag non-sticky: a later
+// deploy of a DIFFERENT model to the same service can send an explicit
+// "false" to clear an earlier opt-in (see parseTrustRemoteCodeIntent's
+// SECURITY note -- without this, the opt-in would silently outlive the model
+// that needed it). Returns whether the persisted value actually changed, so a
+// re-dispatched identical SERVICE_START does not force an unnecessary
+// container recreate.
+func (h *ServiceHandler) persistServiceTrustRemoteCode(ctx JobContext, svc manifestService, intent trustRemoteCodeIntent) (bool, error) {
+	if intent == trustRemoteCodeUnspecified {
+		return false, nil
+	}
+	envVar, ok := serviceTrustRemoteCodeEnvVar[svc.Name]
+	if !ok {
+		ctx.Log("info", "     - Service %s has no --trust-remote-code parameter; trust_remote_code not applied", svc.Name)
+		return false, nil
+	}
+	composePath, err := h.resolveComposePath(svc)
+	if err != nil {
+		return false, err
+	}
+	envPath := compose.SiblingEnvPath(composePath)
+	current, present := compose.ReadEnvVar(envPath, envVar)
+
+	switch intent {
+	case trustRemoteCodeEnable:
+		if present && current == "1" {
+			return false, nil
+		}
+		if err := compose.UpsertEnvVar(envPath, envVar, "1"); err != nil {
+			return false, err
+		}
+		ctx.Log("info", "     - Persisted %s=1 to %s (opt-in, #848)", envVar, envPath)
+		return true, nil
+	case trustRemoteCodeDisable:
+		if !present || current == "" {
+			return false, nil // already off / never set -- nothing to clear
+		}
+		if err := compose.UpsertEnvVar(envPath, envVar, ""); err != nil {
+			return false, err
+		}
+		ctx.Log("info", "     - Cleared %s in %s (explicit opt-out, #848)", envVar, envPath)
+		return true, nil
+	}
+	return false, nil
 }
 
 // ollamaServerWaitTimeout bounds the readiness poll before pulling on a
