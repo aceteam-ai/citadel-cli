@@ -621,8 +621,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		// invocation that crashed or was killed before releasing it (#832's
 		// crash-safety leg). Gated on workerLockHeld -- see that variable's doc
 		// and ReconcileOrphanedReservations' doc for why this is a hard
-		// precondition, not a convenience default. Run before any service
-		// startup below has a chance to race the same manifest entries.
+		// precondition, not a convenience default.
+		//
+		// NOTE: this does NOT run before startManagedServices' async goroutine
+		// (started above, in the default: branch of the switch a few dozen
+		// lines up) -- that goroutine is already running by the time control
+		// reaches here, so the two race on the same citadel.yaml in the general
+		// case (only --wait-services makes startManagedServices synchronous and
+		// therefore ordered before this). The reason a race here is benign
+		// rather than a double-start hazard: an orphaned reservation's tagged
+		// service carries desired_status: stopped, so serviceStartDisabled makes
+		// startManagedServices SKIP it regardless of ordering, and
+		// ReconcileOrphanedReservations' own restart (via Release) short-circuits
+		// on an already-running service. Do not read "run before" as an actual
+		// ordering guarantee if you touch this again.
 		if workerLockHeld {
 			reconcileCtx := jobs.JobContext{LogFn: func(_ string, msg string) { Log("%s", msg) }}
 			if restored, err := reservationHandler.ReconcileOrphanedReservations(reconcileCtx, workerLockHeld); err != nil {

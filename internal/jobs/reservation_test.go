@@ -398,6 +398,103 @@ func TestReleasePartialFailureLeavesFailedServiceTagged(t *testing.T) {
 	}
 }
 
+// writeFailAfterN is an os.WriteFile stand-in that, once armed, fails the Nth
+// write it observes and succeeds (delegating to a real write) on every other
+// call. Used to simulate a manifest write failing partway through Release's
+// two-write sequence (restore desired_status, then clear the reservation tag)
+// without needing a real disk-full/IO-error condition.
+type writeFailAfterN struct {
+	mu     sync.Mutex
+	armed  bool
+	n      int
+	count  int
+	writes [][]byte
+}
+
+func (w *writeFailAfterN) write(path string, data []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes = append(w.writes, append([]byte(nil), data...))
+	if w.armed {
+		w.count++
+		if w.count == w.n {
+			return fmt.Errorf("simulated manifest write failure")
+		}
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// TestReleaseSecondManifestWriteFailureIsRecoverable is the regression test
+// for the stranding bug a review caught: Release used to clear the
+// evicted_by_job tag BEFORE restoring desired_status, so a failure on that
+// SECOND write (the desired_status restore) left the tag gone but
+// desired_status still "stopped" on a service that was, by then, actually
+// running -- serviceStartDisabled would then skip it forever on every future
+// boot, and nothing (not a retry, not reconcile, both keyed on the tag) could
+// ever find it again. Release now writes desired_status FIRST, then clears
+// the tag, so the analogous failure (the tag-clear, now the SECOND write)
+// leaves a state a retry/reconcile CAN still repair: tag present, prior
+// desired_status already restored, service running.
+func TestReleaseSecondManifestWriteFailureIsRecoverable(t *testing.T) {
+	st := fullGPUStatus(
+		svcInfo("svc-pinned", false, 20),
+		svcInfo("svc-idle-small", true, 6),
+	)
+	h, exec := newReservationTestHandler(t, st)
+	if _, err := h.Reserve(testCtx(), testJobID, 5*1024*1024*1024); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Arm AFTER Reserve's own writes, so only Release's two writes for
+	// svc-idle-small are counted: 1st = desired_status restore (must
+	// succeed), 2nd = evicted_by_job/evicted_prior_status clear (fails here).
+	writer := &writeFailAfterN{armed: true, n: 2}
+	h.writeManifestFn = writer.write
+
+	restored, err := h.Release(testCtx(), testJobID)
+	if err == nil {
+		t.Fatal("Release succeeded despite a simulated failure on its second manifest write -- false success is exactly the bug this test guards against")
+	}
+	if containsString(restored, "svc-idle-small") {
+		t.Errorf("svc-idle-small reported restored despite the tag-clear write failing: %v", restored)
+	}
+
+	// The on-disk state must be RECOVERABLE: still tagged (so a retry or
+	// reconcile finds it again), with desired_status already correctly
+	// restored -- never the stranding combination (tag gone, desired_status
+	// still "stopped", service actually running).
+	m := readManifestMap(t, h.ConfigDir)
+	entry := manifestServiceEntry(t, m, "svc-idle-small")
+	if entry == nil {
+		t.Fatal("svc-idle-small entry missing")
+	}
+	if entry["evicted_by_job"] != testJobID {
+		t.Fatalf("STRANDING BUG: evicted_by_job was cleared despite the write that should have failed: %v", entry)
+	}
+	if _, stillMarkedStopped := entry["desired_status"]; stillMarkedStopped {
+		t.Errorf("desired_status was NOT restored before the failing write: %v (this is the ordering the fix requires)", entry)
+	}
+
+	// A retry (mirroring what ReconcileOrphanedReservations would do on the
+	// next worker start) must find the still-tagged service and finish the job.
+	writer.armed = false
+	exec.started = nil
+	restored2, err := h.Release(testCtx(), testJobID)
+	if err != nil {
+		t.Fatalf("retried Release: %v", err)
+	}
+	if !equalStrings(restored2, []string{"svc-idle-small"}) {
+		t.Errorf("retried Release restored %v, want [svc-idle-small]", restored2)
+	}
+	m = readManifestMap(t, h.ConfigDir)
+	entry = manifestServiceEntry(t, m, "svc-idle-small")
+	if entry != nil {
+		if _, present := entry["evicted_by_job"]; present {
+			t.Errorf("svc-idle-small still tagged after the successful retry: %v", entry)
+		}
+	}
+}
+
 // TestReconcileOrphanedReservationsRestoresCrashedWorkerState is the
 // crash-safety test: a manifest carrying a durable evicted_by_job marker with
 // no corresponding live Reservation (simulating a worker that evicted a

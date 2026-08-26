@@ -1294,6 +1294,20 @@ above) and proceeds, silently defeating the hold; whether to refuse a
 `SERVICE_START` during an active reservation is a future caller's policy
 decision, not this primitive's.
 
+**Tag-clearing is a job-path-only guarantee, not a universal one.** Only the
+`Execute()` job dispatch path (`SERVICE_START`/`SERVICE_STOP`, i.e. a remote
+operator/platform action) clears a service's reservation tag. The LOCAL start
+paths — `citadel run --service X`, and boot-time `startManagedServices` — call
+into the service-start machinery directly, bypassing `Execute()`, so they do
+NOT clear it. An operator manually running a reservation-held service back up
+this way leaves it still tagged `evicted_by_job`; a later `Release` for that
+job then still finds it and rewrites its `desired_status` (though not its
+running state — the start-side helpers already short-circuit on
+already-running, so this is a manifest-only side effect, not a second start).
+Latent and low-severity today (no caller reserves anything yet), documented
+alongside the CC/worklock gap above rather than fixed, for the same reason:
+narrow, deliberate scope for the primitive PR.
+
 ### Model Hotswap: residency invariant and swap rate bound (citadel #632, #687)
 
 With `CITADEL_MODEL_HOTSWAP` on, an inference request for an installed-but-absent

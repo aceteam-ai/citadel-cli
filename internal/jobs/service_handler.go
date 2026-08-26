@@ -92,6 +92,14 @@ type ServiceHandler struct {
 	// StopServiceByName / StartServiceByName.
 	stopServiceFn  func(name string) error
 	startServiceFn func(name string) error
+	// writeManifestFn, when non-nil, overrides the final write in every
+	// yaml.Node-surgery manifest setter (addServiceToManifestFile,
+	// setDesiredStatusInManifestFile, setEvictedMarkersInManifestFile). Tests
+	// use it to simulate a manifest write failing partway through a multi-write
+	// sequence (e.g. Release's desired_status-then-tag-clear pair, #832) without
+	// needing a real disk-full/IO-error condition. nil (the production default)
+	// uses os.WriteFile.
+	writeManifestFn func(path string, data []byte) error
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
@@ -791,6 +799,17 @@ func (h *ServiceHandler) startByName(name string) error {
 	return h.StartServiceByName(name)
 }
 
+// writeManifestBytes performs the final write in every yaml.Node-surgery
+// manifest setter, via the injected writeManifestFn override when set
+// (tests), else a real os.WriteFile. See the ServiceHandler.writeManifestFn
+// field doc.
+func (h *ServiceHandler) writeManifestBytes(path string, data []byte) error {
+	if h.writeManifestFn != nil {
+		return h.writeManifestFn(path, data)
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
 // freeVRAMBytes sums the currently-free VRAM across all GPUs that report a
 // memory total, in bytes. The bool is false when NO GPU reports a memory total
 // (no GPU / nvidia-smi absent), so callers skip the VRAM fit check rather than
@@ -1209,7 +1228,7 @@ func (h *ServiceHandler) addServiceToManifestFile(svc manifestService) error {
 	if err := enc.Close(); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0600)
+	return h.writeManifestBytes(path, buf.Bytes())
 }
 
 // setDesiredStatusInManifestFile sets (status == "stopped") or clears
@@ -1299,7 +1318,7 @@ func (h *ServiceHandler) setDesiredStatusInManifestFile(name, status string) err
 	if err := enc.Close(); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0600)
+	return h.writeManifestBytes(path, buf.Bytes())
 }
 
 // setEvictedMarkersInManifestFile sets or clears the durable job-scoped
@@ -1381,7 +1400,7 @@ func (h *ServiceHandler) setEvictedMarkersInManifestFile(name, jobID, priorStatu
 	if err := enc.Close(); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0600)
+	return h.writeManifestBytes(path, buf.Bytes())
 }
 
 // setManifestScalarField sets (value != "") or clears (value == "") a single

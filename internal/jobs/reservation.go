@@ -164,11 +164,16 @@ func (h *ServiceHandler) Reserve(ctx JobContext, jobID string, requiredVRAMBytes
 }
 
 // Release restores every service tagged evicted_by_job==jobID: restarts each
-// one and, only on a SUCCESSFUL restart, clears its reservation markers
-// (restoring EvictedPriorStatus rather than unconditionally clearing
-// desired_status — see that field's doc). A service whose restart fails KEEPS
-// its tag, so a retried Release (or a later crash-recovery reconcile) will
-// pick it up again — this is what makes Release safe to call more than once.
+// one, then restores EvictedPriorStatus (rather than unconditionally clearing
+// desired_status — see that field's doc), THEN clears the reservation tag —
+// in that order, deliberately (see the inline comment at the call site for
+// why the order is load-bearing, not cosmetic). A service is appended to the
+// returned slice, and its tag cleared, only when EVERY step succeeds; a
+// failure at any step (start, desired_status restore, or tag clear) KEEPS its
+// tag and is folded into a non-nil returned error — Release never reports
+// success while leaving inconsistent on-disk state. A still-tagged service is
+// picked up again by a retried Release (or a later crash-recovery reconcile)
+// — this is what makes Release safe to call more than once.
 //
 // Idempotent: when no service carries jobID's tag (nothing ever evicted, or a
 // prior Release/reconcile already restored everything), Release is a no-op:
@@ -202,13 +207,38 @@ func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error)
 			ctx.Log("warning", "     - [release %s] failed to restore %s: %v", jobID, name, err)
 			continue // leave the tag in place so a retry/reconcile can pick it up
 		}
-		// Restore the prior durable intent (clears both markers when the prior
-		// desired_status was itself empty).
-		if err := h.setEvictedMarkersInManifestFile(name, "", ""); err != nil {
-			ctx.Log("warning", "     - [release %s] restored %s but could not clear reservation tag: %v", jobID, name, err)
-		}
+		// Durable-FIRST, mirroring Reserve's "tag before stop" discipline in
+		// reverse: restore the prior desired_status BEFORE clearing the
+		// evicted_by_job/evicted_prior_status tag, and fold EITHER write's
+		// failure into errs (never just logged) so Release cannot report
+		// success while leaving inconsistent on-disk state.
+		//
+		// This order matters because the two writes are not symmetric: if
+		// desired_status is restored first and the tag-clear then fails, the
+		// tag is still present describing a fully-consistent, RECOVERABLE
+		// state (desired_status already correct, service running) — a retried
+		// Release or a crash-recovery reconcile revisits it and finishes the
+		// job (both remaining writes are idempotent). The inverse order
+		// (clear the tag first, as an earlier version of this function did)
+		// risks the OPPOSITE, UNRECOVERABLE state on the same kind of
+		// mid-write failure (disk full, I/O error, process killed here): tag
+		// gone — so nothing (not a retry, not reconcile, which keys on the
+		// tag) ever revisits this service again — while desired_status still
+		// reads "stopped", silently stranding a running-but-marked-stopped
+		// service off forever on the next boot (serviceStartDisabled skips
+		// it). A service is only appended to restored once BOTH writes
+		// succeed; otherwise it stays tagged and is deliberately excluded so
+		// callers can rely on "not in restored ⇒ still tagged ⇒ will be
+		// retried" as the invariant.
 		if err := h.setDesiredStatusInManifestFile(name, s.EvictedPriorStatus); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: could not restore desired_status: %v", name, err))
 			ctx.Log("warning", "     - [release %s] restored %s but could not restore prior desired_status: %v", jobID, name, err)
+			continue
+		}
+		if err := h.setEvictedMarkersInManifestFile(name, "", ""); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: could not clear reservation tag: %v", name, err))
+			ctx.Log("warning", "     - [release %s] restored %s but could not clear reservation tag: %v", jobID, name, err)
+			continue
 		}
 		restored = append(restored, name)
 		ctx.Log("info", "     - [release %s] restored %s", jobID, name)
