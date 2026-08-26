@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
@@ -270,15 +271,50 @@ exit 0`)
 	}
 
 	// Assert on WHICH BRANCH the handler took, via the result message, rather
-	// than on the fake binary's side effects. StartNativeService uses cmd.Start(),
-	// so the child runs concurrently and any file it writes is a race the test
-	// would lose under load -- observed failing only inside a full `go test ./...`
-	// while passing for the package alone. The branch is the actual subject here:
-	// "already running" is the #649 bug, "started" is the fix.
+	// than on the fake binary's side effects (StartNativeService uses
+	// cmd.Start(), so the child runs concurrently with the rest of this
+	// function). The branch is the actual subject here: "already running" is
+	// the #649 bug, "started" is the fix.
 	if strings.Contains(string(out), "already running") {
 		t.Errorf("dead engine was short-circuited as already running (#649): %s", out)
 	}
 	if !strings.Contains(string(out), "started") {
 		t.Errorf("expected the handler to start the dead engine, got: %s", out)
+	}
+
+	// Quiesce before returning. cmd.Start() (deliberately, for a real engine
+	// that's meant to keep running) does not wait for the child, so the fake
+	// `ollama serve` script above is still an in-flight, un-awaited process at
+	// this point -- it writes argsFile itself, asynchronously. Previously this
+	// test returned right after the assertions above, racing that write
+	// against this test's own t.TempDir() cleanup (which removes fakeBinDir,
+	// the directory argsFile lives in): under CI load the scheduler could
+	// delay the child long enough that its write into fakeBinDir landed WHILE
+	// os.RemoveAll was mid-scan, so RemoveAll saw a file appear after it had
+	// already deleted everything it originally found and failed with
+	// "directory not empty" -- assertions still passed (0.00s) because the
+	// failure was purely in Go's post-test cleanup, not in this function.
+	// Waiting here for the child's write to land makes the directory
+	// quiescent before cleanup runs, and doubles as confirmation that the
+	// dead-engine path actually invoked the binary (not just a
+	// correctly-worded message).
+	waitForFileContent(t, argsFile, "serve", 2*time.Second)
+}
+
+// waitForFileContent polls (bounded) for path to exist and contain want. Used
+// to synchronize with a deliberately un-awaited background process (started
+// via cmd.Start(), never cmd.Wait()'d) before returning from a test, so the
+// process's own writes can't still be landing when t.TempDir() cleanup runs.
+func waitForFileContent(t *testing.T, path, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if data, err := os.ReadFile(path); err == nil && strings.Contains(string(data), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s to contain %q (background process never finished writing)", timeout, path, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
