@@ -47,6 +47,101 @@ func TestDiagnose_ExtractsExitCodeAndRootErrorFromLogs(t *testing.T) {
 	}
 }
 
+// TestDiagnose_RunningContainerWithErrorInLogs_NoFalseExitedVerdict pins the
+// fix for a reported BLOCK: a HEALTHY, currently-running container whose log
+// tail contains an old/transient/recovered error line (a startup retry, a
+// recovered OOM, ...) must NOT get a verdict claiming "container exited with:
+// ..." -- that directly contradicts the [RUNNING] status printed in the same
+// report. See synthesize's doc comment for the reasoning.
+func TestDiagnose_RunningContainerWithErrorInLogs_NoFalseExitedVerdict(t *testing.T) {
+	insp := fakeInspector{
+		state: ContainerState{Found: true, Running: true, Status: "running", ExitCode: 0},
+		logs: []string{
+			"INFO: starting up",
+			"ERROR: transient connection retry failed, retrying...",
+			"INFO: server ready and serving requests",
+		},
+	}
+	in := Input{ServiceName: "vllm", ContainerName: "citadel-vllm"}
+	rep := Diagnose(in, insp)
+
+	if !rep.Container.Running {
+		t.Fatalf("test setup: expected Container.Running=true, got %+v", rep.Container)
+	}
+	if rep.Logs.RootError == "" {
+		t.Fatalf("test setup: expected a matched RootError from the log tail, got none")
+	}
+	if strings.Contains(rep.Verdict, "exited") {
+		t.Errorf("Verdict falsely claims the container exited while Running=true: %q", rep.Verdict)
+	}
+	if !strings.Contains(rep.Verdict, "running") {
+		t.Errorf("Verdict should acknowledge the container is running, got %q", rep.Verdict)
+	}
+	if !strings.Contains(rep.Verdict, rep.Logs.RootError) {
+		t.Errorf("Verdict should still surface the matched log line informationally, got %q (root error %q)", rep.Verdict, rep.Logs.RootError)
+	}
+}
+
+// TestDiagnose_RunningContainerWithVRAMCheckFail_NoFalseInsufficientVerdict
+// covers the same false-contradiction bug as the RootError case above, but
+// via the VRAM-fit check: DeclaredVRAMNeedMB is a coarse cold-start budget
+// for the engine TYPE, not a live footprint, so it does not know the
+// target's own running instance is part of what's already occupying "free"
+// VRAM. A healthy running service holding most of the GPU's VRAM legitimately
+// fails VRAMFitCheck -- the top verdict must not claim "insufficient free
+// VRAM to start this service" directly under a [RUNNING] status.
+func TestDiagnose_RunningContainerWithVRAMCheckFail_NoFalseInsufficientVerdict(t *testing.T) {
+	insp := fakeInspector{state: ContainerState{Found: true, Running: true, Status: "running", ExitCode: 0}}
+	in := Input{
+		ServiceName:           "vllm",
+		ContainerName:         "citadel-vllm",
+		FreeVRAMBytes:         1 * 1024 * 1024 * 1024, // 1GB free
+		FreeVRAMKnown:         true,
+		DeclaredVRAMNeedMB:    20 * 1024, // 20GB coarse budget
+		DeclaredVRAMNeedKnown: true,
+	}
+	rep := Diagnose(in, insp)
+
+	var vram *PreflightCheck
+	for i := range rep.Checks {
+		if rep.Checks[i].Name == VRAMFitCheckName {
+			vram = &rep.Checks[i]
+		}
+	}
+	if vram == nil || vram.Verdict != VerdictFail {
+		t.Fatalf("test setup: expected a failed vram_fit check, got %+v", rep.Checks)
+	}
+	if strings.Contains(rep.Verdict, "insufficient free VRAM to start") {
+		t.Errorf("Verdict falsely claims insufficient VRAM to start while Running=true: %q", rep.Verdict)
+	}
+	if strings.Contains(rep.Verdict, "to start") {
+		t.Errorf("Verdict should not use 'to start' phrasing for an already-running container: %q", rep.Verdict)
+	}
+	if strings.Contains(rep.Verdict, "no obvious problem") {
+		t.Errorf("Verdict should not claim no problem was detected while a preflight check FAILs: %q", rep.Verdict)
+	}
+}
+
+// TestDiagnose_StoppedContainerWithErrorInLogs_StillGetsExitedVerdict is the
+// control for the above: a NON-running container's matched error line should
+// still produce the causal "exited with" verdict -- the fix must not
+// over-correct into never using that phrasing.
+func TestDiagnose_StoppedContainerWithErrorInLogs_StillGetsExitedVerdict(t *testing.T) {
+	insp := fakeInspector{
+		state: ContainerState{Found: true, Running: false, Status: "exited", ExitCode: 1},
+		logs: []string{
+			"INFO: starting up",
+			"RuntimeError: CUDA out of memory",
+		},
+	}
+	in := Input{ServiceName: "vllm", ContainerName: "citadel-vllm"}
+	rep := Diagnose(in, insp)
+
+	if !strings.Contains(rep.Verdict, "exited with") {
+		t.Errorf("expected a causal 'exited with' verdict for a stopped container, got %q", rep.Verdict)
+	}
+}
+
 func TestDiagnose_RequiredEnvMissingTakesPriorityInVerdict(t *testing.T) {
 	insp := fakeInspector{state: ContainerState{Found: false}}
 	in := Input{
@@ -70,6 +165,72 @@ func TestDiagnose_RequiredEnvMissingTakesPriorityInVerdict(t *testing.T) {
 	}
 	if !strings.Contains(rep.Verdict, "required compose variable") {
 		t.Errorf("Verdict = %q, want it to call out the missing required var", rep.Verdict)
+	}
+}
+
+// TestDiagnose_RedactsSecretValueFromLogsAndRootError pins the fix for a
+// reported BLOCK: raw container log lines and the derived RootError were
+// printed completely unredacted, so any secret that appears in application
+// logs (an entrypoint echoing env, a stack trace with a credentialed URL, an
+// auth-failure message embedding the token) leaked straight through -- even
+// though ComposeInfo.Env was already redacted.
+func TestDiagnose_RedactsSecretValueFromLogsAndRootError(t *testing.T) {
+	insp := fakeInspector{
+		state: ContainerState{Found: true, Running: false, Status: "exited", ExitCode: 1},
+		logs: []string{
+			"INFO: starting with token hf_supersecretvalue123",
+			"AuthError: request to https://example.com/hf_supersecretvalue123/models failed",
+		},
+	}
+	in := Input{
+		ServiceName:   "vllm",
+		ContainerName: "citadel-vllm",
+		ResolvedEnv:   map[string]string{"HF_TOKEN": "hf_supersecretvalue123"},
+	}
+	rep := Diagnose(in, insp)
+
+	for _, line := range rep.Logs.Lines {
+		if strings.Contains(line, "hf_supersecretvalue123") {
+			t.Errorf("log line %q still contains the secret value", line)
+		}
+	}
+	if strings.Contains(rep.Logs.RootError, "hf_supersecretvalue123") {
+		t.Errorf("RootError %q still contains the secret value", rep.Logs.RootError)
+	}
+	if strings.Contains(rep.Verdict, "hf_supersecretvalue123") {
+		t.Errorf("Verdict %q still contains the secret value", rep.Verdict)
+	}
+	if !strings.Contains(rep.Logs.RootError, redactedPlaceholder) {
+		t.Errorf("RootError %q should carry the redaction placeholder", rep.Logs.RootError)
+	}
+}
+
+// TestDiagnose_DoesNotOverRedactNonSecretRootError is the asymmetry control:
+// a NON-secret root-error message (a model name, a plain numeric, an
+// arch-mismatch string) must reach the Report/Verdict untouched even when
+// ResolvedEnv carries an unrelated secret. Redaction must never blank real
+// error text it wasn't asked to.
+func TestDiagnose_DoesNotOverRedactNonSecretRootError(t *testing.T) {
+	insp := fakeInspector{
+		state: ContainerState{Found: true, Running: false, Status: "exited", ExitCode: 1},
+		logs: []string{
+			"Traceback (most recent call last):",
+			"ValueError: The checkpoint you are trying to load has model type `newmodel` but Transformers does not recognize this architecture.",
+		},
+	}
+	in := Input{
+		ServiceName:   "vllm",
+		ContainerName: "citadel-vllm",
+		ResolvedEnv:   map[string]string{"HF_TOKEN": "hf_supersecretvalue123", "PORT": "8213"},
+	}
+	rep := Diagnose(in, insp)
+
+	wantRootErr := "ValueError: The checkpoint you are trying to load has model type `newmodel` but Transformers does not recognize this architecture."
+	if rep.Logs.RootError != wantRootErr {
+		t.Errorf("RootError = %q, want unchanged %q (unrelated secret in env must not over-redact)", rep.Logs.RootError, wantRootErr)
+	}
+	if strings.Contains(rep.Verdict, redactedPlaceholder) {
+		t.Errorf("Verdict = %q, unexpectedly contains a redaction placeholder for a non-secret message", rep.Verdict)
 	}
 }
 

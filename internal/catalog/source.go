@@ -535,9 +535,12 @@ func parseComposeImages(compose string) []string {
 	return images
 }
 
-// parseComposeContainerName extracts the first `container_name:` value from a
-// compose file, or "" if none. Pure -- table-tested.
-func parseComposeContainerName(compose string) string {
+// ParseComposeContainerName extracts the first `container_name:` value from a
+// compose file, or "" if none. Pure -- table-tested. Exported so other
+// packages (e.g. cmd/service_diagnose.go) can resolve a compose file's actual
+// container name instead of assuming the "citadel-<service>" convention,
+// which an external/module compose is free to override.
+func ParseComposeContainerName(compose string) string {
 	for _, line := range strings.Split(compose, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "container_name:") {

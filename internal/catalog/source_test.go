@@ -329,10 +329,10 @@ func TestParseComposeImages_None(t *testing.T) {
 
 func TestParseComposeContainerName(t *testing.T) {
 	compose := "services:\n  app:\n    image: x\n    container_name: \"my-app\"\n"
-	if got := parseComposeContainerName(compose); got != "my-app" {
+	if got := ParseComposeContainerName(compose); got != "my-app" {
 		t.Errorf("parseComposeContainerName = %q, want my-app", got)
 	}
-	if got := parseComposeContainerName("services:\n  app:\n    image: x\n"); got != "" {
+	if got := ParseComposeContainerName("services:\n  app:\n    image: x\n"); got != "" {
 		t.Errorf("expected empty container name, got %q", got)
 	}
 }

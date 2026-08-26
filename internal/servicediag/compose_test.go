@@ -1,6 +1,9 @@
 package servicediag
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const sampleCompose = `
 services:
@@ -112,6 +115,71 @@ func TestBuildComposeInfo(t *testing.T) {
 	}
 	if ci.Source != "manifest" || ci.ComposeFilePath == "" {
 		t.Errorf("Source/ComposeFilePath not preserved: %+v", ci)
+	}
+}
+
+// TestBuildComposeInfo_RedactsSecretInCommand pins the fix for a reported
+// BLOCK: Command is a single interpolated string (not a key/value map like
+// Env), so RedactEnv's key-name pass never touched it -- a compose command:
+// interpolating a secret-shaped var printed the live secret verbatim.
+func TestBuildComposeInfo_RedactsSecretInCommand(t *testing.T) {
+	const composeWithSecretInCommand = `
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >-
+      --host 0.0.0.0
+      --hf-token ${HF_TOKEN}
+      --model ${VLLM_MODEL:-Qwen/Qwen3-8B}
+`
+	env := map[string]string{
+		"HF_TOKEN":   "hf_supersecretvalue123",
+		"VLLM_MODEL": "my-org/my-model",
+	}
+	ci := buildComposeInfo(Input{
+		ServiceName:    "vllm",
+		ComposeContent: []byte(composeWithSecretInCommand),
+		ResolvedEnv:    env,
+	})
+	if strings.Contains(ci.Command, "hf_supersecretvalue123") {
+		t.Errorf("Command = %q, still contains the secret value", ci.Command)
+	}
+	if !strings.Contains(ci.Command, redactedPlaceholder) {
+		t.Errorf("Command = %q, want it to contain %q", ci.Command, redactedPlaceholder)
+	}
+	// Non-secret substitutions must survive untouched -- the asymmetry test.
+	if !strings.Contains(ci.Command, "my-org/my-model") {
+		t.Errorf("Command = %q, want it to still contain the non-secret model name", ci.Command)
+	}
+}
+
+// TestBuildComposeInfo_RedactsSecretValueInsideNonSecretKeyedEnvVar covers a
+// gap RedactEnv's key-name pass alone can't catch: a non-secret-shaped key
+// (e.g. MODEL_URL) can still interpolate another var's secret value into
+// itself. Only a value-based scrub (RedactText) closes this.
+func TestBuildComposeInfo_RedactsSecretValueInsideNonSecretKeyedEnvVar(t *testing.T) {
+	const composeWithSecretInURL = `
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    environment:
+      - MODEL_URL=https://user:${HF_TOKEN}@host/model
+      - LOG_LEVEL=info
+`
+	env := map[string]string{"HF_TOKEN": "hf_supersecretvalue123"}
+	ci := buildComposeInfo(Input{
+		ServiceName:    "vllm",
+		ComposeContent: []byte(composeWithSecretInURL),
+		ResolvedEnv:    env,
+	})
+	if strings.Contains(ci.Env["MODEL_URL"], "hf_supersecretvalue123") {
+		t.Errorf("Env[MODEL_URL] = %q, still contains the secret value", ci.Env["MODEL_URL"])
+	}
+	if !strings.Contains(ci.Env["MODEL_URL"], redactedPlaceholder) {
+		t.Errorf("Env[MODEL_URL] = %q, want it to contain %q", ci.Env["MODEL_URL"], redactedPlaceholder)
+	}
+	if ci.Env["LOG_LEVEL"] != "info" {
+		t.Errorf("Env[LOG_LEVEL] = %q, want unchanged (no secret involved)", ci.Env["LOG_LEVEL"])
 	}
 }
 

@@ -111,6 +111,82 @@ func TestResolveEnvForCompose_NoComposePath(t *testing.T) {
 	}
 }
 
+// TestBuildDiagnoseInput_PrefersComposeDeclaredContainerName pins the fix for
+// a reported WANT: the container name was hardcoded "citadel-"+name,
+// ignoring a compose file's actual container_name:, so a module-installed
+// service that overrides the name (internal/catalog.ParseComposeContainerName
+// exists for exactly this -- catalog install already uses it for conflict
+// detection) got diagnosed against the wrong container and falsely reported
+// "no container found".
+func TestBuildDiagnoseInput_PrefersComposeDeclaredContainerName(t *testing.T) {
+	dir := t.TempDir()
+	servicesDir := filepath.Join(dir, "services")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	composeBody := "services:\n  acme:\n    image: acme/app\n    container_name: acme-app\n"
+	composePath := filepath.Join(servicesDir, "acme.yml")
+	if err := os.WriteFile(composePath, []byte(composeBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := &CitadelManifest{Services: []Service{{Name: "acme", ComposeFile: "services/acme.yml"}}}
+	in := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	if in.ContainerName != "acme-app" {
+		t.Errorf("ContainerName = %q, want the compose-declared %q", in.ContainerName, "acme-app")
+	}
+}
+
+// TestBuildDiagnoseInput_MultiServiceComposeDoesNotOverrideContainerName
+// guards against a narrow regression the container-name fix could otherwise
+// introduce: catalog.ParseComposeContainerName returns the FIRST
+// container_name: in the file with no notion of which `services:` key it
+// belongs to. For a multi-service module compose (like the real
+// services/nvr-service/compose.yml), trusting that value would silently
+// diagnose an unrelated sibling container instead of the intended one.
+func TestBuildDiagnoseInput_MultiServiceComposeDoesNotOverrideContainerName(t *testing.T) {
+	dir := t.TempDir()
+	servicesDir := filepath.Join(dir, "services")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	composeBody := "services:\n" +
+		"  sidecar:\n    image: acme/sidecar\n    container_name: acme-sidecar\n" +
+		"  main:\n    image: acme/main\n    container_name: acme-main\n"
+	composePath := filepath.Join(servicesDir, "acme.yml")
+	if err := os.WriteFile(composePath, []byte(composeBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := &CitadelManifest{Services: []Service{{Name: "acme", ComposeFile: "services/acme.yml"}}}
+	in := buildDiagnoseInput("acme", manifest, dir, []string{"acme"})
+	if in.ContainerName != "citadel-acme" {
+		t.Errorf("ContainerName = %q, want the conventional fallback %q for an ambiguous multi-service compose", in.ContainerName, "citadel-acme")
+	}
+}
+
+// TestBuildDiagnoseInput_FallsBackToConventionalContainerName is the control:
+// a compose file with no container_name: keeps the "citadel-<service>"
+// convention.
+func TestBuildDiagnoseInput_FallsBackToConventionalContainerName(t *testing.T) {
+	dir := t.TempDir()
+	servicesDir := filepath.Join(dir, "services")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	composeBody := "services:\n  vllm:\n    image: vllm/vllm-openai\n"
+	composePath := filepath.Join(servicesDir, "vllm.yml")
+	if err := os.WriteFile(composePath, []byte(composeBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := &CitadelManifest{Services: []Service{{Name: "vllm", ComposeFile: "services/vllm.yml"}}}
+	in := buildDiagnoseInput("vllm", manifest, dir, []string{"vllm"})
+	if in.ContainerName != "citadel-vllm" {
+		t.Errorf("ContainerName = %q, want the conventional %q", in.ContainerName, "citadel-vllm")
+	}
+}
+
 func TestUnmanagedServiceGuidance_ListsManagedServices(t *testing.T) {
 	msg := unmanagedServiceGuidance([]string{"my-custom-svc"})
 	if !strings.Contains(msg, "my-custom-svc") {

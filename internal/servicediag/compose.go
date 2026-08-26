@@ -218,12 +218,24 @@ func buildComposeInfo(in Input) ComposeInfo {
 	if !ok {
 		return ci
 	}
-	ci.Command = substituteVars(commandString(svc.Command), in.ResolvedEnv)
+	// Command is a single interpolated string (not a key/value map), so it
+	// can't be redacted by RedactEnv's key-name pass -- a compose command:
+	// like "--hf-token ${HF_TOKEN}" renders the literal secret into the
+	// string with no variable name left in it. RedactText scrubs by VALUE
+	// instead, using the same secret-shaped-key heuristic to decide which
+	// resolved env values count as secrets.
+	ci.Command = RedactText(substituteVars(commandString(svc.Command), in.ResolvedEnv), in.ResolvedEnv)
 	rawEnv := environmentMap(svc.Environment)
 	if rawEnv != nil {
 		resolved := make(map[string]string, len(rawEnv))
 		for k, v := range rawEnv {
-			resolved[k] = substituteVars(v, in.ResolvedEnv)
+			// RedactEnv below only catches a secret by its OWN key name. A
+			// non-secret-shaped key can still interpolate another var's
+			// secret value into itself (e.g.
+			// MODEL_URL=https://user:${HF_TOKEN}@host/model) -- RedactText
+			// closes that gap by value, same as Command above, before the
+			// key-name pass runs.
+			resolved[k] = RedactText(substituteVars(v, in.ResolvedEnv), in.ResolvedEnv)
 		}
 		ci.Env = RedactEnv(resolved)
 	}

@@ -170,7 +170,7 @@ func InstallFromManifest(manifest *ServiceManifest, composeSrcPath, servicesDir 
 		// container matching this compose's container_name is a foreign collision
 		// -- refuse with a clear escape hatch. Best-effort (skipped if docker is
 		// unavailable).
-		if cn := parseComposeContainerName(composeText); cn != "" && ContainerNameConflict(cn) {
+		if cn := ParseComposeContainerName(composeText); cn != "" && ContainerNameConflict(cn) {
 			return nil, fmt.Errorf("container name '%s' is already in use by another container; "+
 				"remove it (docker rm -f %s) or override the name via the module's compose before installing '%s'",
 				cn, cn, name)

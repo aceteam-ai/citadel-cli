@@ -152,6 +152,38 @@ func buildDiagnoseInput(name string, manifest *CitadelManifest, configDir string
 	in.ComposeContent = content
 	in.ComposeSource = source
 
+	// An external/module compose file is free to declare its own
+	// `container_name:` (catalog.ParseComposeContainerName is the same
+	// extraction `citadel module install` uses to check for name conflicts),
+	// which overrides this repo's "citadel-<service>" convention. Diagnosing
+	// against the wrong container name reports a false "no container found"
+	// for a module-installed service whose compose renamed it.
+	//
+	// Only trust the override when the compose declares exactly ONE
+	// container_name: -- ParseComposeContainerName returns the FIRST match
+	// with no notion of which `services:` key it belongs to. A multi-service
+	// module compose (e.g. services/nvr-service/compose.yml: wyze-bridge,
+	// nvr-config, mosquitto, frigate each with their own container_name) has
+	// no reliable way here to know which one corresponds to in.ServiceName,
+	// and silently diagnosing an unrelated sibling container would be worse
+	// than the old, honestly-wrong "citadel-<service>" guess.
+	//
+	// KNOWN LIMITATION: this guard is a text-level count of container_name:
+	// occurrences, not a parsed count of `services:` entries -- it does not
+	// catch a multi-service compose where only ONE service happens to declare
+	// a container_name: at all. In that (currently unseen in this repo's own
+	// compose files) shape, the count is 1 but it may not belong to
+	// in.ServiceName, and the override would still apply. Resolving that
+	// properly needs the same structured per-service compose decode
+	// buildComposeInfo already does (doc.Services[in.ServiceName]) rather
+	// than a package-boundary text scan; not worth pulling that parser across
+	// the cmd/internal/catalog boundary for a shape that doesn't exist yet.
+	if len(content) > 0 && strings.Count(string(content), "container_name:") == 1 {
+		if cn := catalog.ParseComposeContainerName(string(content)); cn != "" {
+			in.ContainerName = cn
+		}
+	}
+
 	in.ResolvedEnv = resolveEnvForCompose(composePath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -244,7 +276,7 @@ func renderDiagnoseReport(w *os.File, r servicediag.Report) {
 	printContainerState(w, r.Container)
 
 	headerColor.Fprintln(w, "\nLOG TAIL")
-	printLogTail(w, r.Logs)
+	printLogTail(w, r.Logs, r.Container.Running)
 
 	headerColor.Fprintln(w, "\nCOMPOSE")
 	printComposeInfo(w, r.Compose)
@@ -282,7 +314,12 @@ func printContainerState(w *os.File, cs servicediag.ContainerState) {
 	fmt.Fprintf(w, "  %s status=%s exit_code=%d\n", badge, cs.Status, cs.ExitCode)
 }
 
-func printLogTail(w *os.File, l servicediag.LogTail) {
+// printLogTail renders the log tail. running is r.Container.Running: a
+// matched error-looking line in an otherwise-healthy running container is
+// informational, not a claimed cause, so it gets a neutral label instead of
+// the "root error:" phrasing reserved for a non-running container -- keeping
+// this in sync with synthesize's identical running/not-running distinction.
+func printLogTail(w *os.File, l servicediag.LogTail, running bool) {
 	if l.Error != "" {
 		fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[UNKNOWN]"), l.Error)
 		return
@@ -292,7 +329,11 @@ func printLogTail(w *os.File, l servicediag.LogTail) {
 		return
 	}
 	if l.RootError != "" {
-		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("root error:"), l.RootError)
+		if running {
+			fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("error-looking line (container is running):"), l.RootError)
+		} else {
+			fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("root error:"), l.RootError)
+		}
 	} else {
 		fmt.Fprintln(w, faintColor.Sprint("  (no specific error line matched a known pattern; see full tail below)"))
 	}
