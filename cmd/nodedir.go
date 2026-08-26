@@ -17,28 +17,34 @@
 //
 // SCOPE (read this before assuming --node-dir gives you an isolated node --
 // citadel#856 review of the original #853/#854 PR corrected an overclaim
-// here): the override redirects citadel.yaml + services/ dir RESOLUTION and,
-// as of the compose-project scoping below, the compose PROJECT identity used
-// for invocations driven through that resolved manifest. It does NOT redirect
-// network state (internal/network.GetStateDir/GetNodeConfigDir -- the tsnet
-// mesh identity), the module lockfile (catalog.LockfilePath, still
-// platform.ConfigDir()), anything under nodevault/worklock, or -- the sharp
-// edge -- DOCKER CONTAINER IDENTITY: every embedded compose file pins a
-// GLOBAL `container_name: citadel-<svc>` (services/compose/*.yml), unchanged
-// by which directory citadel materialized/read the compose file from. On a
+// here): the override redirects citadel.yaml + services/ dir RESOLUTION,
+// the compose PROJECT identity used for invocations driven through that
+// resolved manifest (composeProjectOverride/composeArgsWithProject below),
+// and, for EMBEDDED services only (services.ServiceMap; citadel#860,
+// embeddedContainerName below), the container_name each one's compose file
+// pins. It does NOT redirect network state (internal/network.GetStateDir/
+// GetNodeConfigDir -- the tsnet mesh identity), the module lockfile
+// (catalog.LockfilePath, still platform.ConfigDir()), anything under
+// nodevault/worklock, or catalog/third-party module container_name (those are
+// author-controlled, not templated by citadel -- see embeddedContainerName's
+// SCOPE note).
+//
+// History: every embedded compose file pins a GLOBAL `container_name:
+// citadel-<svc>` (services/compose/*.yml). Before #860, that was unchanged by
+// which directory citadel materialized/read the compose file from -- on a
 // machine whose Docker daemon ALSO runs a real citadel node (the exact
 // production topology this flag was built to be used safely against),
-// `citadel run vllm --node-dir /tmp/x` materializes a vllm.yml in /tmp/x
-// naming the SAME `citadel-vllm` container the real node manages -- the
-// override does not, by itself, stop a compose action against that file from
-// touching the real container. composeProjectOverride/composeArgsWithProject
-// below close the compose-invocation half of that gap (down -> safe no-op,
-// up -> loud cross-project failure instead of a silent mutation); they do NOT
-// namespace container_name itself, so two DIFFERENT override dirs both
-// materializing the same embedded service still name the same container and
-// will still loudly conflict with each other on `up`. True per-node
-// container-name isolation is a deferred follow-up (see the --node-dir
-// section of CLAUDE.md for the tracking issue).
+// `citadel run vllm --node-dir /tmp/x` materialized a vllm.yml in /tmp/x
+// naming the SAME `citadel-vllm` container the real node manages. #856's
+// compose-project scoping closed the compose-invocation half of that gap
+// (down -> safe no-op, up -> loud cross-project failure instead of a silent
+// mutation) but did not namespace container_name itself, so two DIFFERENT
+// override dirs both materializing the same embedded service still collided
+// with EACH OTHER. #860 (embeddedContainerName, cmd/manifest.go's
+// ensureComposeFile, internal/jobs/service_handler.go's
+// ensureEmbeddedComposeFile) closes that: under an active override, the
+// materialized container_name is namespaced to "citadel-<hash>-<svc>", <hash>
+// matching the compose "-p" project's hash so the two never disagree.
 //
 // The one guarantee that does NOT depend on any of the above:
 // --expect-node (cmd/module_control.go) fails closed on a resolved-identity
@@ -58,12 +64,12 @@
 package cmd
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // nodeDirFlag is the value of the global --node-dir flag (empty if unset).
@@ -146,16 +152,11 @@ func refuseIfLockfileWriteUnsupported(cmdLabel string) error {
 // also feeds network/volume names compose creates), long enough that an
 // accidental collision between two override dirs is not a practical concern.
 func composeProjectOverride() string {
-	dir := resolveNodeDirOverride()
-	if dir == "" {
+	hash := compose.NodeDirHash(resolveNodeDirOverride())
+	if hash == "" {
 		return ""
 	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		abs = dir
-	}
-	sum := sha256.Sum256([]byte(filepath.Clean(abs)))
-	return "citadel-nodedir-" + hex.EncodeToString(sum[:])[:12]
+	return "citadel-nodedir-" + hash
 }
 
 // composeArgsWithProject prepends "-p <project>" to a compose invocation's
@@ -183,4 +184,41 @@ func composeArgsWithProject(args []string) []string {
 	out := make([]string, 0, len(args)+2)
 	out = append(out, "-p", project)
 	return append(out, args...)
+}
+
+// embeddedContainerName returns the container name to materialize/expect for
+// an EMBEDDED service (a services.ServiceMap entry) named svc: unchanged
+// "citadel-<svc>" with no --node-dir/CITADEL_NODE_DIR override active (byte-
+// identical to pre-#860 behavior), or the override-namespaced
+// "citadel-<hash>-<svc>" when one is (citadel#860, closing the gap
+// composeProjectOverride's doc comment above describes -- the compose "-p"
+// project scoping alone does not stop two DIFFERENT override dirs from both
+// materializing a `container_name: citadel-vllm` and colliding with EACH
+// OTHER). <hash> is compose.NodeDirHash(resolveNodeDirOverride()) -- the SAME
+// value composeProjectOverride derives for "-p", so a compose action's project
+// and the container it starts under always agree on which override owns them;
+// see internal/compose/nodedir.go's package doc for why that sharing matters
+// and lives there (both cmd and internal/jobs need to reach it, and jobs
+// cannot import cmd).
+//
+// This is the single choke point materialization (cmd.ensureComposeFile) and
+// the resolvers (containerIsRunning, dryRunContainerNames) all route through,
+// so they cannot disagree on what an embedded service's container is named.
+//
+// SCOPE: for services.ServiceMap entries only -- do not call this for a
+// catalog/third-party module name (those author their own container_name and
+// are not namespaced by --node-dir; see cmd/module_ops.go's containerIsRunning
+// for the ServiceMap-membership gate callers must apply first).
+func embeddedContainerName(svc string) string {
+	return compose.ContainerName(svc, resolveNodeDirOverride())
+}
+
+// isEmbeddedService reports whether name is a services.ServiceMap entry --
+// the ServiceMap-membership gate embeddedContainerName's callers must apply
+// (see its doc comment): namespacing container_name under --node-dir is
+// scoped to EMBEDDED services only (citadel#860's non-goal), never to
+// catalog/third-party modules, which author their own container_name.
+func isEmbeddedService(name string) bool {
+	_, ok := services.ServiceMap[name]
+	return ok
 }

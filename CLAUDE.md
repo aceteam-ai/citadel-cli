@@ -1456,12 +1456,46 @@ mode from "silent" to "safe and loud": `down` selects containers by the
 `com.docker.compose.project` label, so it cannot match a DIFFERENT project's
 container and becomes a no-op; `up` on a `container_name` already owned by a
 different project fails outright (`composeFailureMessage` detects this and
-names the cause instead of leaking raw docker output). It does NOT namespace
-`container_name` itself, so this is project-identity isolation, not
-container-identity isolation — two override dirs both materializing the same
-embedded service still collide with each other (loudly) on `up`. True
-per-node container-name isolation is a deferred follow-up, tracked in
-citadel#860.
+names the cause instead of leaking raw docker output).
+
+**Container-name namespacing for EMBEDDED services (citadel#860).** #856
+alone was project-identity isolation, not container-identity isolation: two
+override dirs both materializing the same `services.ServiceMap` entry still
+pinned the identical `container_name: citadel-<svc>` and collided with each
+other (loudly, but still) on `up`. `embeddedContainerName` (`cmd/nodedir.go`)
+closes that: under an active override it returns `citadel-<hash>-<svc>`,
+`<hash>` the SAME value `composeProjectOverride` derives for `-p`, so the
+compose project and the container it starts always agree on which override
+owns them. `cmd.ensureComposeFile` / `internal/jobs.ServiceHandler.
+ensureEmbeddedComposeFile` write that name at materialization time — both
+sites reconcile it on EVERY call, not just first-write, because the
+"the .yml already exists, leave it alone" fast path predates #860 and would
+otherwise leave a file materialized before an override was set (or by a
+pre-#860 binary) carrying the unnamespaced name forever, which is worse than
+cosmetic: a later `up` against that stale file targets the REAL node's global
+`citadel-<svc>` container, and #856's "safe and loud" guarantee only holds
+while that real container currently exists — `internal/compose.
+EnsureNamespacedContainerName` owns the exact reconcile-vs-refuse rule
+(rewrite the unnamespaced default in place; refuse loudly on anything else,
+e.g. a hand-edited file or a different override's hash). `containerIsRunning`
+(`cmd/module_ops.go`) and `dryRunContainerNames`'s fallback
+(`cmd/module_control.go`) resolve the same namespaced name via
+`embeddedContainerName`/`resolveModuleContainerName`, so materialization and
+lookup can never disagree. Scoped to `services.ServiceMap` entries ONLY (the
+ServiceMap-membership check every call site applies first): catalog/
+third-party module compose files author their own `container_name` and are
+NOT namespaced by `--node-dir` — a documented follow-up-of-the-follow-up, not
+done here. A few read-only/display-only sites were deliberately left
+un-namespace-aware (informational only, never decide what to start/stop):
+`citadel service diagnose`'s pre-materialization fallback
+(`cmd/service_diagnose.go`), `internal/status/footprint.go`'s container-name
+candidates (feeds `citadel services`/`citadel status`, which — since those
+ARE override-aware for manifest resolution — could misattribute the REAL
+node's footprint to the override node's row; nothing acts on this, since
+auto-stop only runs inside `citadel work`, which refuses `--node-dir`
+outright), and the TUI control center's footprint enrichment
+(`cmd/controlcenter.go`), consistent with the pre-existing TUI-collector gaps
+noted under Service Preemption and Model Hotswap above.
 
 Two RAW (non-compose) container-name paths cannot be protected by `-p` at all,
 because plain `docker inspect`/`stop`/`rm` take a bare name with no

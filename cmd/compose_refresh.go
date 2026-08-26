@@ -101,7 +101,17 @@ func recreateOnUpgradeEnabled() bool {
 // untouched (recreated=false).
 func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
 	rt := catalog.SelectContainerRuntime()
+	// citadel#860: this sweep only ever runs from citadel work's boot path
+	// (refreshManagedComposeFiles, cmd/work.go), which refuses --node-dir/
+	// CITADEL_NODE_DIR outright before reaching here -- so this is a
+	// defensive mirror, not a live gap today. Kept consistent with
+	// containerIsRunning/embeddedContainerName so it can't silently disagree
+	// with what ensureComposeFile just materialized if that refusal is ever
+	// narrowed.
 	containerName := "citadel-" + service
+	if isEmbeddedService(service) {
+		containerName = embeddedContainerName(service)
+	}
 
 	current, running := runningPublishedHostPort(rt.EngineBin, containerName)
 	if !running {

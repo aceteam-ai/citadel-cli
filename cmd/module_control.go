@@ -332,8 +332,23 @@ func moduleDryRunPlan(name string, action moduleAction, configDir, composePath s
 // no explicit container_name; this is informational-only (the dry-run
 // preview), never used to decide what the real stop/start touches, which is
 // driven by compose file path exactly as the live path already does.
+//
+// The common case never reaches the fallback: composePath is the resolved
+// (already-materialized-under-override, if any) compose file, so once
+// ensureComposeFile has run, its container_name: line already reads back the
+// override-namespaced name (citadel#860) and the parse branch below picks it
+// up with no changes needed here. The fallback only matters pre-materialization
+// (a dry-run before the file exists) or on a corrupt file, so it is made
+// override-aware too, via the same embeddedContainerName/isEmbeddedService
+// gate containerIsRunning uses -- otherwise a dry-run against a not-yet-
+// materialized embedded service under --node-dir would preview the WRONG
+// (unnamespaced) container name.
 func dryRunContainerNames(composePath, serviceName string) []string {
-	fallback := []string{"citadel-" + serviceName}
+	fallbackName := "citadel-" + serviceName
+	if isEmbeddedService(serviceName) {
+		fallbackName = embeddedContainerName(serviceName)
+	}
+	fallback := []string{fallbackName}
 	data, err := os.ReadFile(composePath)
 	if err != nil {
 		return fallback
