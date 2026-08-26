@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/mesh"
@@ -412,6 +413,15 @@ func TestLocalListFilesPatternFilter(t *testing.T) {
 // tailTruncate
 // ============================================================================
 
+// TestLocalToolCallTimeoutDefault pins the shipped default (5 minutes) now
+// that localToolCallTimeout is a var (so tests can shorten it) rather than a
+// const -- mirroring internal/worker's swap-rate knobs / TestSwapAccountingDefaults.
+func TestLocalToolCallTimeoutDefault(t *testing.T) {
+	if localToolCallTimeout != 5*time.Minute {
+		t.Errorf("localToolCallTimeout = %s, want 5m (if this is an intentional change, update this test too)", localToolCallTimeout)
+	}
+}
+
 func TestTailTruncateShortStringUnchanged(t *testing.T) {
 	if got := tailTruncate("short", 100); got != "short" {
 		t.Errorf("got %q, want unchanged", got)
@@ -460,6 +470,79 @@ func TestCaptureStdoutRestoresRealStdout(t *testing.T) {
 	})
 	if os.Stdout != before {
 		t.Error("os.Stdout was not restored after captureStdout returned")
+	}
+}
+
+// TestCaptureStdoutRestoresOnPanic pins citadel#858's hardening: the restore
+// (and paired pipe-close/drain-wait cleanup) must run via defer so it fires
+// on EVERY exit path, including a panic inside fn, not just a normal return.
+// Before this fix a panic inside fn would leave os.Stdout pointed at the
+// capture pipe for the rest of the process's life (fatal under `citadel mcp`,
+// where os.Stdout is the JSON-RPC transport) rather than merely crashing
+// cleanly. This test recovers the panic itself specifically to observe that
+// os.Stdout was restored before the panic finished unwinding this frame --
+// captureStdout itself is NOT expected to recover, and does not.
+func TestCaptureStdoutRestoresOnPanic(t *testing.T) {
+	before := os.Stdout
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected captureStdout to propagate the panic from fn")
+			}
+		}()
+		_, _ = captureStdout(func() error {
+			panic("boom")
+		})
+	}()
+
+	if os.Stdout != before {
+		t.Error("os.Stdout was not restored after a panic inside fn")
+	}
+}
+
+// TestCaptureStdoutRefusesToNestConcurrentCaptures pins the stdoutCaptureInFlight
+// guard: citadel#858's real per-call timeout (localToolCallTimeout /
+// callLocalToolWithTimeout, cmd/mcp.go) can leave a timed-out local tool
+// call's goroutine still running inside captureStdout -- holding os.Stdout
+// redirected -- after the caller has already moved on. A second captureStdout
+// call starting while that's still true must fail fast rather than starting a
+// second os.Stdout redirection (which would corrupt the process-wide
+// os.Stdout variable once the two calls' restores race each other -- see
+// captureStdout's doc comment).
+func TestCaptureStdoutRefusesToNestConcurrentCaptures(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan struct{})
+
+	go func() {
+		defer close(firstDone)
+		_, _ = captureStdout(func() error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+
+	<-started // the first capture now holds stdoutCaptureInFlight
+
+	secondFnRan := false
+	_, err := captureStdout(func() error {
+		secondFnRan = true
+		return nil
+	})
+
+	close(release)
+	<-firstDone // avoid leaking the goroutine past the test
+
+	if err == nil {
+		t.Fatal("expected an error when a capture is already in flight")
+	}
+	if secondFnRan {
+		t.Error("fn must not run while another capture is in flight")
+	}
+	if os.Stdout == nil {
+		t.Error("os.Stdout should never be left nil")
 	}
 }
 
