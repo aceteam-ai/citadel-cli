@@ -311,6 +311,15 @@ func moduleDryRunPlan(name string, action moduleAction, configDir, composePath s
 	fmt.Fprintf(&b, "  Resolved node dir: %s\n", configDir)
 	fmt.Fprintf(&b, "  Compose file:      %s\n", composePath)
 	fmt.Fprintf(&b, "  Container(s):      %s\n", strings.Join(dryRunContainerNames(composePath, name), ", "))
+	// citadel#856 review: container_name above is GLOBAL (pinned in every
+	// embedded compose file), not scoped to this node dir -- surface the
+	// compose project that WOULD be used, so a --node-dir dry-run makes the
+	// (lack of) container-identity isolation visible before the operator
+	// commits to a real run. See cmd/nodedir.go's package doc comment.
+	if project := composeProjectOverride(); project != "" {
+		fmt.Fprintf(&b, "  Compose project:   %s (via --node-dir/CITADEL_NODE_DIR; the container name above "+
+			"is still global -- see CLAUDE.md's \"--node-dir\" section)\n", project)
+	}
 	fmt.Fprintln(&b, "No changes made.")
 	return b.String()
 }

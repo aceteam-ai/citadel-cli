@@ -75,8 +75,15 @@ func composeCommand(args ...string) *exec.Cmd {
 // platform.PreflightDockerStart check) and want to avoid a second, redundant
 // catalog.SelectContainerRuntime() call -- which re-probes podman/docker on
 // the host, not merely reads a cached value.
+//
+// Routes args through composeArgsWithProject (citadel#856) so EVERY caller of
+// composeCommand/composeCommandFor -- composeServiceState's `ps`,
+// restartAllServices' `restart` -- picks up --node-dir's compose-project
+// scoping automatically, with no per-caller change and no behavior change at
+// all when no override is active (composeArgsWithProject returns args
+// unchanged in that case).
 func composeCommandFor(rt catalog.ContainerRuntime, args ...string) *exec.Cmd {
-	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
+	cmd := exec.Command(rt.Bin, rt.ComposeArgs(composeArgsWithProject(args)...)...)
 	cmd.Env = composeEnv()
 	return cmd
 }
@@ -166,41 +173,57 @@ func startService(serviceName, composeFilePath string) error {
 		fmt.Printf("   ⚠️  %s\n", warning)
 	}
 
-	// Check if container already exists and its state
-	inspectCmd := exec.Command(rt.EngineBin, "inspect", "--format", "{{.State.Status}}", containerName)
-	output, err := inspectCmd.Output()
+	// Check if container already exists and its state -- but ONLY when no
+	// --node-dir/CITADEL_NODE_DIR override is active (citadel#856 review).
+	// `docker inspect`/`docker rm -f` by bare container name is NOT a compose
+	// action at all, so composeArgsWithProject's -p scoping (applied to the
+	// `up` call below) cannot protect it: under an override, containerName is
+	// the SAME global "citadel-<svc>" name a real node on this shared Docker
+	// daemon may be using RIGHT NOW, and this pre-check would silently read
+	// (or, with --force, DELETE) that real container -- the exact incident
+	// class this flag exists to prevent, reintroduced through a path -p
+	// scoping doesn't reach. Skipping it entirely under override is safe: the
+	// project-scoped `up -d` below is self-sufficient for idempotency (it
+	// manages containers under ITS OWN project) and, if containerName is
+	// genuinely owned by a different project, fails LOUDLY on the conflict
+	// (see composeFailureMessage) instead of this code silently acting on it
+	// first.
+	if composeProjectOverride() == "" {
+		inspectCmd := exec.Command(rt.EngineBin, "inspect", "--format", "{{.State.Status}}", containerName)
+		output, err := inspectCmd.Output()
 
-	if err == nil {
-		status := strings.TrimSpace(string(output))
+		if err == nil {
+			status := strings.TrimSpace(string(output))
 
-		if status == "running" {
-			// Container is already running - skip starting
-			fmt.Printf("   ✅ Container %s is already running.\n", containerName)
-			return nil
-		}
-
-		// Container exists but is stopped/exited/paused
-		if forceRecreate {
-			// Force mode: remove the old container and recreate
-			fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-			rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
-			rmCmd.Run() // Ignore errors - container might already be gone
-		} else {
-			// Interactive mode: prompt user
-			fmt.Printf("   ⚠️  Container %s exists but is %s.\n", containerName, status)
-			fmt.Print("   Recreate container? (Y/n) ")
-			var response string
-			fmt.Scanln(&response)
-			response = strings.TrimSpace(strings.ToLower(response))
-
-			if response != "" && response != "y" && response != "yes" {
-				return fmt.Errorf("container %s exists but is not running - user chose not to recreate", containerName)
+			if status == "running" {
+				// Container is already running - skip starting
+				fmt.Printf("   ✅ Container %s is already running.\n", containerName)
+				return nil
 			}
 
-			// Remove the old container before recreating
-			fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-			rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
-			rmCmd.Run() // Ignore errors
+			// Container exists but is stopped/exited/paused
+			if forceRecreate {
+				// Force mode: remove the old container and recreate
+				fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
+				rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
+				rmCmd.Run() // Ignore errors - container might already be gone
+			} else {
+				// Interactive mode: prompt user
+				fmt.Printf("   ⚠️  Container %s exists but is %s.\n", containerName, status)
+				fmt.Print("   Recreate container? (Y/n) ")
+				var response string
+				fmt.Scanln(&response)
+				response = strings.TrimSpace(strings.ToLower(response))
+
+				if response != "" && response != "y" && response != "yes" {
+					return fmt.Errorf("container %s exists but is not running - user chose not to recreate", containerName)
+				}
+
+				// Remove the old container before recreating
+				fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
+				rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
+				rmCmd.Run() // Ignore errors
+			}
 		}
 	}
 
@@ -229,9 +252,7 @@ func startService(serviceName, composeFilePath string) error {
 	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
 	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
 	// the latter may be a GPU-stripped temp file in a different directory.
-	composeArgs := composeFileArgs(composeFilePath, actualComposePath)
-	composeArgs = append(composeArgs, "up", "-d")
-	args := rt.ComposeArgs(composeArgs...)
+	args := rt.ComposeArgs(startServiceComposeArgs(composeFilePath, actualComposePath)...)
 	composeCmd := exec.Command(rt.Bin, args...)
 	// Supply the citadel-owned host ports so compose files that defer their host
 	// publish to ${CITADEL_*_HOST_PORT:?...} (llamacpp/vllm/extraction/diffusers)
@@ -239,11 +260,23 @@ func startService(serviceName, composeFilePath string) error {
 	// fail at this boot-path site (only the SERVICE_START job handler injected it
 	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426).
 	composeCmd.Env = composeEnv()
-	output, err = composeCmd.CombinedOutput()
+	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
 	return nil
+}
+
+// startServiceComposeArgs builds the compose args for `... up -d` (everything
+// after the runtime's ComposePrefix, e.g. "compose"), including the
+// --node-dir project-scoping (composeArgsWithProject, citadel#856). Pure and
+// separated from startService so the argv contract -- -p present/absent, and
+// its exact position relative to -f/up/-d -- is unit-testable without
+// invoking docker (see TestStartServiceComposeArgs*).
+func startServiceComposeArgs(composeFilePath, actualComposePath string) []string {
+	args := composeFileArgs(composeFilePath, actualComposePath)
+	args = append(args, "up", "-d")
+	return composeArgsWithProject(args)
 }
 
 // composeFailureMessage formats a `docker compose up` failure, appending a
@@ -258,14 +291,34 @@ func startService(serviceName, composeFilePath string) error {
 // back to the supported path instead of hand-crafting the missing var.
 func composeFailureMessage(serviceName string, output []byte) string {
 	msg := strings.TrimSpace(string(output))
-	if !strings.Contains(msg, "citadel must supply") {
+	switch {
+	case strings.Contains(msg, "citadel must supply"):
+		return fmt.Sprintf(
+			"%s\n   Hint: this compose file needs a citadel-injected env var (e.g. a host port) that a "+
+				"hand-run 'docker compose' does not supply. Use 'citadel module start %s' (or 'citadel run "+
+				"%s') instead -- citadel supplies these automatically.",
+			msg, serviceName, serviceName)
+
+	// citadel#856 review: under --node-dir/CITADEL_NODE_DIR, `up` is
+	// project-scoped (composeArgsWithProject) specifically so a container_name
+	// collision with a DIFFERENT node's real container fails LOUDLY here
+	// instead of silently reusing/destroying it. Name the cause instead of
+	// leaking docker's raw "already in use by container ..." text, which reads
+	// like an ordinary bug report rather than "you are about to collide with
+	// another node's container."
+	case composeProjectOverride() != "" && strings.Contains(strings.ToLower(msg), "already in use"):
+		return fmt.Sprintf(
+			"%s\n   Hint: container `citadel-%s` is owned by another compose project on this Docker "+
+				"daemon -- almost certainly a DIFFERENT node's real container, since this node is running "+
+				"under --node-dir/CITADEL_NODE_DIR (which gives it a distinct manifest but NOT a distinct "+
+				"container name; every embedded compose file pins container_name globally). This is the "+
+				"SAFE failure direction: refusing rather than silently reusing or removing that container. "+
+				"See CLAUDE.md's \"--node-dir\" section.",
+			msg, serviceName)
+
+	default:
 		return msg
 	}
-	return fmt.Sprintf(
-		"%s\n   Hint: this compose file needs a citadel-injected env var (e.g. a host port) that a "+
-			"hand-run 'docker compose' does not supply. Use 'citadel module start %s' (or 'citadel run "+
-			"%s') instead -- citadel supplies these automatically.",
-		msg, serviceName, serviceName)
 }
 
 // composeFileArgs returns the ordered "-f <file>" arguments for a docker compose

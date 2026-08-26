@@ -228,18 +228,28 @@ func stopSingleService(serviceName string) {
 	fmt.Printf("✅ Service '%s' stopped.\n", serviceName)
 }
 
+// stopComposeArgs builds the compose args for `... down` (everything after
+// the literal "compose" subcommand selector -- stopServiceByCompose hardcodes
+// the "docker" binary, so unlike startService there is no rt.ComposeArgs
+// prefix to apply separately), including the --node-dir project-scoping
+// (composeArgsWithProject, citadel#856). Pure and separated from
+// stopServiceByCompose so the argv contract is unit-testable without invoking
+// docker (see TestStopComposeArgs*).
+func stopComposeArgs(composePath string, remove bool) []string {
+	fileArgs := []string{"-f", composePath, "down"}
+	if remove {
+		fileArgs = append(fileArgs, "-v") // Also remove volumes
+	}
+	return append([]string{"compose"}, composeArgsWithProject(fileArgs)...)
+}
+
 // stopServiceByCompose stops a service using docker compose down.
 func stopServiceByCompose(composePath string, remove bool) error {
 	if _, err := os.Stat(composePath); os.IsNotExist(err) {
 		return fmt.Errorf("compose file '%s' not found", composePath)
 	}
 
-	args := []string{"compose", "-f", composePath, "down"}
-	if remove {
-		args = append(args, "-v") // Also remove volumes
-	}
-
-	cmd := exec.Command("docker", args...)
+	cmd := exec.Command("docker", stopComposeArgs(composePath, remove)...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
 	cmd.Env = composeEnv()
@@ -251,7 +261,29 @@ func stopServiceByCompose(composePath string, remove bool) error {
 }
 
 // stopServiceByContainer stops a service by its container name directly.
+//
+// Refuses outright under --node-dir/CITADEL_NODE_DIR (citadel#856 review):
+// this fallback runs when serviceName is NOT found in the resolved manifest,
+// and it operates on the bare GLOBAL container name via `docker
+// inspect`/`stop`/`rm` -- none of which accept a compose-project scope the
+// way `docker compose ... -p <project>` does, so composeArgsWithProject
+// cannot protect this path. Under an override, "citadel-<serviceName>" may be
+// a DIFFERENT node's real, running container on this same Docker daemon;
+// silently stopping (or, with --rm, removing) it by name is exactly the
+// incident class --node-dir exists to prevent. Refusing here is safe in both
+// directions: the common override use case (a service intentionally NOT in
+// the override's manifest) has nothing to stop anyway, and the dangerous case
+// (a name collision with a real node) is refused rather than acted on.
 func stopServiceByContainer(serviceName string) error {
+	if composeProjectOverride() != "" {
+		return fmt.Errorf(
+			"refusing to stop %q: it is not in the --node-dir/CITADEL_NODE_DIR override's manifest, and "+
+				"this fallback would stop a container by its GLOBAL name (citadel-%s) with no way to scope "+
+				"that to the override -- it could be a DIFFERENT node's real container on this same Docker "+
+				"daemon. Add %q to the override's citadel.yaml, or drop --node-dir to target the default node.",
+			serviceName, serviceName, serviceName)
+	}
+
 	containerName := fmt.Sprintf("citadel-%s", serviceName)
 
 	// Check if container exists
