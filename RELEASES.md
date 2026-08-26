@@ -1869,3 +1869,20 @@ Auto-generated log of every release.
   - fix(jobs): stop TestServiceStartNativeOllama flake — quiesce leaked child before TempDir cleanup (#872)
 
 
+---
+
+## v2.122.0 — 2026-08-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 7 |
+| Lines added | +450 |
+
+**Changes:**
+
+  - test(reconcile): pin the fix for MODULE_SET false-converging an uninstalled gotenberg (#645) (#881)
+  - fix(service-diagnose): refuse to diagnose the real container under an unmaterialized --node-dir override (#880)
+  - config: call FixStatePermissions after device-config writers (#878) (#879)
+
+
