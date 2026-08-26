@@ -13,13 +13,10 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -43,7 +40,7 @@ Authentication uses an AceTeam API key. Generate one at:
 The API key is read from (in priority order):
   1. --api-key flag
   2. ACETEAM_API_KEY environment variable
-  3. ~/.citadel-cli/config.yaml (device_api_token from 'citadel init')
+  3. the node's device config saved by 'citadel init' (device_api_token)
 
 Usage with Claude Code:
   claude mcp add aceteam -- citadel mcp
@@ -647,38 +644,25 @@ func (b *mcpBridge) writeError(id json.RawMessage, code int, message string) {
 	b.bridgeStdout().Write([]byte("\n"))
 }
 
-// getAPIKeyFromConfig reads the device API token from the citadel config file.
+// getAPIKeyFromConfig reads the device API token from the citadel device
+// config, via getDeviceConfigFromFile -- the same converged (machine-
+// convergent-dir-first, legacy-ConfigDir-fallback) read every other cmd/
+// call site uses, so `citadel mcp` agrees with `citadel init`/`citadel work`
+// on where the token lives regardless of invocation context (citadel-cli#845).
 func getAPIKeyFromConfig() string {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return ""
+	if dc := getDeviceConfigFromFile(); dc != nil {
+		return dc.DeviceAPIToken
 	}
-
-	var config struct {
-		DeviceAPIToken string `yaml:"device_api_token"`
-	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return ""
-	}
-	return config.DeviceAPIToken
+	return ""
 }
 
-// getAPIURLFromConfig reads the API base URL from the citadel config file.
+// getAPIURLFromConfig reads the API base URL from the citadel device config
+// (see getAPIKeyFromConfig).
 func getAPIURLFromConfig() string {
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-	data, err := os.ReadFile(globalConfigFile)
-	if err != nil {
-		return ""
+	if dc := getDeviceConfigFromFile(); dc != nil {
+		return dc.APIBaseURL
 	}
-
-	var config struct {
-		APIBaseURL string `yaml:"api_base_url"`
-	}
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return ""
-	}
-	return config.APIBaseURL
+	return ""
 }
 
 // truncate shortens a string to maxLen, appending "..." if truncated.

@@ -1636,6 +1636,21 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   freshness marker (`internal/heartbeat/marker.go`) uses `GetNodeConfigDir()`
   for this reason, not `ConfigDir()`.
 
+  **Device/org config (`device_api_token`, `org_id`, `org_name`, `user_email`,
+  `user_name`, `redis_url`, `aceteam_api_key`) is machine-convergent state too
+  (#845), and had the identical bug until fixed:** `cmd.getDeviceConfigFromFile`
+  (the single read path behind every `deviceConfig := getDeviceConfigFromFile()`
+  call site) and its writers (`saveDeviceConfigToFile`, `saveRedisURLToConfig`)
+  now agree on `network.GetNodeConfigDir()`, with a read-only fallback to the
+  legacy `ConfigDir()` location for a node registered before #845.
+  `cmd.deviceConfigDirs` (`cmd/devicecreds_hooks.go`) is the authority for the
+  search order — read it before assuming a path. `internal/config` is a leaf
+  that must not import `internal/network` (see `cmd/nodevault_hooks.go`'s
+  comment on `config.VaultConfigured`/`VaultVerify`, the identical pattern),
+  so `internal/worker`'s `config.LoadDeviceCredsConverged` reaches the same
+  order through `config.DeviceConfigDirsHook`, wired at `cmd` init
+  (`cmd/devicecreds_hooks.go`) — not by importing `network` directly.
+
 **Package Management** (`internal/platform/packages.go`):
 - `GetPackageManager()` - Returns apt (Linux), brew (macOS), or winget (Windows) manager
 - `EnsureHomebrew()` - Installs Homebrew if not present on macOS
