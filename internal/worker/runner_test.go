@@ -24,6 +24,14 @@ type MockJobSource struct {
 	closed        bool
 	mu            sync.Mutex
 	cancelledJobs map[string]bool
+
+	// requeueOnNack, when true, simulates RedisSource's real redelivery
+	// behavior (issue #826): a Nack'd job whose delivery-attempt metadata says
+	// another attempt is still within budget (willRetry) is re-appended to the
+	// queue with Attempts incremented, so Next() returns it again on a later
+	// call within the same Run(). Default false preserves every pre-existing
+	// test's exact behavior (a Nack'd job is never seen again).
+	requeueOnNack bool
 }
 
 func NewMockJobSource(name string, jobs []*Job) *MockJobSource {
@@ -72,6 +80,11 @@ func (m *MockJobSource) Nack(ctx context.Context, job *Job, err error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nacked = append(m.nacked, job)
+	if m.requeueOnNack && willRetry(job) {
+		redelivered := *job
+		redelivered.Metadata.Attempts++
+		m.jobs = append(m.jobs, &redelivered)
+	}
 	return nil
 }
 
@@ -185,6 +198,13 @@ type MockStreamWriter struct {
 	erroredRecover bool
 	cancelled      bool
 
+	// endCount/errorCount count every WriteEnd/WriteError call, not just
+	// whether one happened -- needed to assert "exactly one terminal event"
+	// (issue #826) when the SAME writer instance is reused across multiple
+	// processJob dispatches for one job id (a retry-then-succeed sequence).
+	endCount   int
+	errorCount int
+
 	// WriteEndErr, when non-nil, is returned by WriteEnd instead of nil.
 	WriteEndErr error
 	// WriteErrorErr, when non-nil, is returned by WriteError instead of nil.
@@ -209,6 +229,7 @@ func (m *MockStreamWriter) WriteChunk(content string, index int) error {
 
 func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 	m.ended = true
+	m.endCount++
 	return m.WriteEndErr
 }
 
@@ -216,6 +237,7 @@ func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
 	m.errored = true
 	m.erroredErr = err
 	m.erroredRecover = recoverable
+	m.errorCount++
 	return m.WriteErrorErr
 }
 
@@ -1471,5 +1493,172 @@ func TestRunnerGPUJobStillNacksUnderRealContention(t *testing.T) {
 	}
 	if len(source.NackedJobs()) != 1 {
 		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// flakyThenSucceedsHandler fails on the first delivered attempt
+// (job.Metadata.Attempts <= 1) and succeeds on any later attempt. Combined
+// with MockJobSource's requeueOnNack, this lets a test drive a real
+// transient-fail-then-retry-succeeds sequence through Runner.processJob
+// twice for the SAME job id, the exact shape of issue #826's bug.
+type flakyThenSucceedsHandler struct {
+	jobType   string
+	mu        sync.Mutex
+	execCount int
+}
+
+func (h *flakyThenSucceedsHandler) CanHandle(jobType string) bool { return h.jobType == jobType }
+
+func (h *flakyThenSucceedsHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	h.mu.Lock()
+	h.execCount++
+	h.mu.Unlock()
+
+	if job.Metadata.Attempts <= 1 {
+		err := errors.New("transient failure")
+		return &JobResult{Status: JobStatusFailure, Error: err}, err
+	}
+	return &JobResult{Status: JobStatusSuccess, Output: map[string]any{"ok": true}}, nil
+}
+
+func (h *flakyThenSucceedsHandler) ExecCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.execCount
+}
+
+// TestRunnerTransientFailureThenSuccessPublishesExactlyOneEndEvent is issue
+// #826's core regression test. Before the fix, processJob published a
+// terminal "error" unconditionally before every Nack -- including a Nack that
+// gets redelivered and later succeeds -- so a job that failed transiently and
+// then succeeded on retry published BOTH an "error" and an "end" on the same
+// stream:v1:{jobId}, violating "exactly one terminal event per job id".
+//
+// job-1's first delivery carries Metadata{Attempts:1, MaxAttempts:3} (so
+// willRetry is true: another attempt is still within budget) and the handler
+// fails. MockJobSource's requeueOnNack redelivers it as Attempts:2, on which
+// the handler succeeds. The SAME MockStreamWriter instance is used for both
+// dispatches (job id is stable), so endCount/errorCount are cumulative across
+// the whole retry sequence.
+func TestRunnerTransientFailureThenSuccessPublishesExactlyOneEndEvent(t *testing.T) {
+	jobType := "FLAKY_JOB"
+	jobs := []*Job{
+		{
+			ID:      "job-1",
+			Type:    jobType,
+			Payload: map[string]any{},
+			Metadata: JobMetadata{
+				Attempts:    1,
+				MaxAttempts: 3,
+			},
+		},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	source.requeueOnNack = true
+	handler := &flakyThenSucceedsHandler{jobType: jobType}
+	config := RunnerConfig{WorkerID: "test-worker"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if handler.ExecCount() != 2 {
+		t.Fatalf("handler executions = %d, want 2 (fail once, then succeed on retry)", handler.ExecCount())
+	}
+	if stream.endCount != 1 {
+		t.Errorf("endCount = %d, want 1", stream.endCount)
+	}
+	if stream.errorCount != 0 {
+		t.Errorf("errorCount = %d, want 0 (the transient failure must not publish a terminal error)", stream.errorCount)
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1 (the transient failure)", len(source.NackedJobs()))
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1 (the eventual success)", len(source.AckedJobs()))
+	}
+}
+
+// TestRunnerExhaustedRetriesPublishesExactlyOneErrorEvent is the failure-side
+// counterpart: a job on its FINAL allowed attempt (Attempts+1 == MaxAttempts,
+// so willRetry is false -- no further redelivery will ever reach a handler)
+// must still publish exactly one terminal error, so a job that exhausts its
+// retries reports failure once rather than silently (see willRetry's doc
+// comment on why MaxAttempts>0 is what makes this attempt "final" rather than
+// "unknown").
+func TestRunnerExhaustedRetriesPublishesExactlyOneErrorEvent(t *testing.T) {
+	jobType := "ALWAYS_FAILS_JOB"
+	jobs := []*Job{
+		{
+			ID:      "job-1",
+			Type:    jobType,
+			Payload: map[string]any{},
+			Metadata: JobMetadata{
+				Attempts:    2, // final dispatched attempt: 2+1 == MaxAttempts
+				MaxAttempts: 3,
+			},
+		},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	// requeueOnNack left false: even if set, willRetry(job) is false here, so
+	// no redelivery would happen regardless -- this is the exhausted case.
+	handler := NewMockJobHandler(jobType, true) // always fails
+	config := RunnerConfig{WorkerID: "test-worker"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if stream.errorCount != 1 {
+		t.Errorf("errorCount = %d, want 1 (the exhausted final attempt must still report failure)", stream.errorCount)
+	}
+	if stream.endCount != 0 {
+		t.Errorf("endCount = %d, want 0", stream.endCount)
+	}
+	if len(source.NackedJobs()) != 1 {
+		t.Errorf("Nacked jobs = %d, want 1", len(source.NackedJobs()))
+	}
+}
+
+// TestRunnerFailureWithNoRetrySignalPublishesTerminalError pins the
+// conservative fallback in willRetry: a job with no populated
+// Attempts/MaxAttempts metadata (MaxAttempts == 0, e.g. an APISource job --
+// the AceTeam Redis API proxy exposes no per-message delivery count -- or any
+// job predating this signal) is treated as "unknown, assume terminal" and
+// still publishes on a generic failure, exactly matching pre-#826 behavior.
+// This is also what TestRunnerServiceStartPublishesTerminalErrorOnFailure
+// already relies on; this test names the reason explicitly.
+func TestRunnerFailureWithNoRetrySignalPublishesTerminalError(t *testing.T) {
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, true) // fails
+	config := RunnerConfig{WorkerID: "test-worker"}
+
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	stream := &MockStreamWriter{}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if stream.errorCount != 1 {
+		t.Errorf("errorCount = %d, want 1 (no retry signal must default to publishing, not suppressing)", stream.errorCount)
 	}
 }
