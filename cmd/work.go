@@ -734,51 +734,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 		Debug("API base URL: %s", apiBaseURL)
 
-		// Fetch worker config from API (queue, org).
-		// This replaces the need for WORKER_QUEUE env vars.
-		// Consumer group is resolved earlier from node identity.
-		if workQueue == "" || deviceConfig.OrgID == "" {
-			tempClient := redisapi.NewClient(redisapi.ClientConfig{
-				BaseURL:   apiBaseURL,
-				Token:     deviceConfig.DeviceAPIToken,
-				DebugFunc: Debug,
-			})
-			workerCfg, err := tempClient.FetchWorkerConfig(ctx)
-			if err != nil {
-				Debug("worker-config fetch failed: %v (using defaults)", err)
-			} else if workerCfg != nil {
-				Debug("worker-config: queue=%s, group=%s, org=%s",
-					workerCfg.Queue, workerCfg.ConsumerGroup, workerCfg.OrgID)
-				if workQueue == "" && workerCfg.Queue != "" {
-					workQueue = workerCfg.Queue
-				}
-				// Store org_id from API if not already in config
-				if deviceConfig.OrgID == "" && workerCfg.OrgID != "" {
-					deviceConfig.OrgID = workerCfg.OrgID
-				}
-			} else {
-				Debug("worker-config: endpoint not available, using defaults")
-			}
-			_ = tempClient.Close()
-		}
-
-		// Build queue list: primary queue + per-org shell queue.
-		// Ensure a base queue is always present so that appending
-		// the shell queue does not suppress the NewAPISource default.
-		var apiQueueNames []string
-		if workQueue != "" {
-			apiQueueNames = append(apiQueueNames, workQueue)
-		}
-		orgID := deviceConfig.OrgID
-		if orgID != "" {
-			shellQueue := shellQueueName(orgID)
-			if len(apiQueueNames) == 0 {
-				apiQueueNames = []string{"jobs:v1:cpu-general"}
-			}
-			apiQueueNames = append(apiQueueNames, shellQueue)
-			Debug("shell queue: %s", shellQueue)
-		}
-
+		// Resolve the boot-time queue set: cpu-general base + the
+		// FetchWorkerConfig-assigned workQueue + the per-org shellQueue +
+		// inference queues. Shared with the Control Center's worker path
+		// (runTUIWorker, cmd/controlcenter.go) via resolveWorkerQueues
+		// (citadel-cli#839) so the two entry points cannot drift apart on
+		// which queues an equivalent node ends up consuming.
+		//
 		// Inference-capable nodes must also consume the GPU inference queues. In
 		// API mode the server's worker-config returns only the CPU base queue
 		// today (#6315), so platform inference dispatched to jobs:v1:gpu-general
@@ -794,11 +756,18 @@ func runWork(cmd *cobra.Command, args []string) {
 		// works for a natively run ollama, which the docker-only Engines snapshot
 		// misses. A node serving nothing adds nothing.
 		serving := nodeIsServingModels(ctx)
-		if infQueues := capabilities.InferenceQueues(nodeCaps, serving); len(infQueues) > 0 {
-			apiQueueNames = appendUniqueQueues(apiQueueNames, infQueues)
-			Debug("inference node (gpu=%t serving=%t): also subscribing to inference queues %v",
-				nodeCaps != nil && nodeCaps.GPU != nil && len(nodeCaps.GPU.Devices) > 0, serving, infQueues)
-		}
+		queueResult := resolveWorkerQueues(ctx, WorkerQueueParams{
+			APIBaseURL: apiBaseURL,
+			Token:      deviceConfig.DeviceAPIToken,
+			WorkQueue:  workQueue,
+			OrgID:      deviceConfig.OrgID,
+			NodeCaps:   nodeCaps,
+			Serving:    serving,
+			DebugFn:    Debug,
+		})
+		workQueue = queueResult.WorkQueue
+		deviceConfig.OrgID = queueResult.OrgID
+		apiQueueNames := queueResult.Queues
 
 		apiSource = worker.NewAPISource(worker.APISourceConfig{
 			BaseURL:       apiBaseURL,
@@ -829,11 +798,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// whether the node happened to be serving yet. Building a reconciler
 		// for that node would find nothing left to add and just re-probe
 		// nodeIsServingModels (a docker ps) forever on every heartbeat tick --
-		// exactly the extra sweep OnStatus reuse was meant to avoid. missingQueues
-		// diffs the "if serving" set against what boot already subscribed, so a
-		// GPU node or a node already serving at boot gets no reconciler at all;
-		// only a fresh CPU-only node with no engine yet does.
-		if missing := missingQueues(capabilities.InferenceQueues(nodeCaps, true), apiQueueNames); len(missing) > 0 {
+		// exactly the extra sweep OnStatus reuse was meant to avoid. queueResult.Missing
+		// (resolveWorkerQueues' missingQueues diff against the "if serving" set)
+		// is empty for a GPU node or a node already serving at boot; only a
+		// fresh CPU-only node with no engine yet has one.
+		if missing := queueResult.Missing; len(missing) > 0 {
 			inferenceQueueReconciler = worker.NewInferenceQueueReconciler(
 				missing,
 				nodeIsServingModels,

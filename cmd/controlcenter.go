@@ -1968,15 +1968,21 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			apiBaseURL = authServiceURL
 		}
 
-		// Boot-time inference-queue subscription + reconciler gap (mirrors
-		// runWork in cmd/work.go, citadel #612/#823). Before this fix the TUI
-		// worker path relied on NewAPISource's QueueName:"" default, which
-		// resolves to jobs:v1:cpu-general alone -- a GPU node, or any node
-		// already serving at boot, run via the Control Center never joined
-		// jobs:v1:gpu-general at all, not just after a later serving
-		// transition. resolveControlCenterInferenceQueues is a pure
-		// extraction of that decision (see its doc comment for the
-		// workerHeld short-circuit and the missingQueues gate).
+		// Boot-time queue resolution (cpu-general base + FetchWorkerConfig
+		// workQueue + org shellQueue + inference queues), shared with runWork
+		// (cmd/work.go) via resolveWorkerQueues (citadel-cli#839) so the two
+		// entry points cannot drift apart on which queues an equivalent node
+		// ends up consuming. Before this fix the TUI worker path built its own
+		// inline set (resolveControlCenterInferenceQueues) that covered the
+		// cpu-general base and inference queues (#612/#823/#837) but never
+		// fetched the platform-assigned workQueue or joined the org shell
+		// queue, so a TUI-run node silently missed jobs dispatched to either.
+		//
+		// ccNodeCaps/ccServing are only computed when !workerHeld (skip the
+		// manifest read / docker ps when the resolver will Skip anyway --
+		// resolveWorkerQueues never touches them in that case, see its doc
+		// comment for why: a dedicated `citadel work` already owns this
+		// node's consumption and the Control Center must not compete for it).
 		var ccNodeCaps *capabilities.NodeCapabilities
 		ccServing := false
 		if !workerHeld {
@@ -1987,7 +1993,17 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			}
 			ccServing = nodeIsServingModels(ctx)
 		}
-		ccQueueNames, ccMissingQueues := resolveControlCenterInferenceQueues(ccNodeCaps, ccServing, workerHeld)
+		ccQueueResult := resolveWorkerQueues(ctx, WorkerQueueParams{
+			APIBaseURL: apiBaseURL,
+			Token:      deviceConfig.DeviceAPIToken,
+			OrgID:      deviceConfig.OrgID,
+			NodeCaps:   ccNodeCaps,
+			Serving:    ccServing,
+			Skip:       workerHeld,
+			DebugFn:    func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
+		})
+		deviceConfig.OrgID = ccQueueResult.OrgID
+		ccQueueNames, ccMissingQueues := ccQueueResult.Queues, ccQueueResult.Missing
 
 		apiSource := worker.NewAPISource(worker.APISourceConfig{
 			BaseURL:       apiBaseURL,
@@ -2300,44 +2316,6 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Run the worker (blocks until context is cancelled)
 	return runner.Run(ctx)
-}
-
-// resolveControlCenterInferenceQueues decides the boot-time Redis Streams
-// queue set for the Control Center worker path and whether a residual gap
-// remains for the InferenceQueueReconciler to fill on a later serving
-// transition (citadel #612/#823). Extracted as a pure function so the cases
-// that matter -- a GPU node, a CPU-only node not yet serving, a CPU-only
-// node already serving, and a dedicated worker holding the node lock -- are
-// unit-testable without spinning up the TUI.
-//
-// workerHeld short-circuits to the cpu-general-only base set with no gap:
-// when a dedicated `citadel work` holds this node's lock, the control center
-// never runs a consume loop at all (see runTUIWorker's workerHeld
-// early-return before runner.Run), so subscribing to an inference queue here
-// would be pure waste -- an idle consumer-group entry at best, and a step
-// back toward the competing-consumer split the workerHeld gate exists to
-// prevent at worst.
-//
-// The missingQueues gate mirrors cmd/work.go's runWork exactly: a GPU node's
-// InferenceQueues(caps, true) is identical to InferenceQueues(caps, false)
-// (GPUInferenceQueues is unconditional on `serving`), so it's already fully
-// covered by the boot-time set built here and gets no reconciler -- building
-// one anyway would probe nodeIsServingModels forever with nothing left to
-// add.
-func resolveControlCenterInferenceQueues(nodeCaps *capabilities.NodeCapabilities, serving, workerHeld bool) (queues, missing []string) {
-	// worker.DefaultCPUQueue is the single source of truth for this value --
-	// it's the same literal NewAPISource's zero-value default resolves to, so
-	// referencing the constant here keeps the two from drifting apart (see
-	// its doc comment in internal/worker/api_source.go).
-	queues = []string{worker.DefaultCPUQueue}
-	if workerHeld {
-		return queues, nil
-	}
-	if infQueues := capabilities.InferenceQueues(nodeCaps, serving); len(infQueues) > 0 {
-		queues = appendUniqueQueues(queues, infQueues)
-	}
-	missing = missingQueues(capabilities.InferenceQueues(nodeCaps, true), queues)
-	return queues, missing
 }
 
 // ccAutoUpdate checks for updates and auto-updates if available.
