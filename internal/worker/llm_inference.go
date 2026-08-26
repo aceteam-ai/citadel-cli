@@ -33,10 +33,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/trust"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -752,12 +755,34 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	if payload.Stream {
 		return h.streamChatCompletions(stream, resp.Body)
 	}
-	return h.bufferedChatCompletions(stream, resp.Body)
+	return h.bufferedChatCompletions(stream, resp.Body, payload)
 }
 
 // bufferedChatCompletions parses a buffered OpenAI chat-completions response and
 // emits the assistant's message content as a single chunk.
-func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader) (*JobResult, error) {
+//
+// This is the wired integration point for the on-node grounding guardrail
+// (internal/trust, citadel #8253 guardrail half): it is the one call site
+// where the full request input and the full model output both already exist
+// as Go strings before the result leaves the node, non-streaming so there is
+// no possibility of gating a response already sent. The other chat/completions
+// paths in this file (streamChatCompletions and the llamacpp/ollama
+// buffered/stream pairs) are documented, not-yet-wired hook points — same
+// shape, not done here to keep this change to ONE clear integration point per
+// #8253's scope.
+//
+// The guardrail is opt-in (see groundingGuardrailEnabled): `llm_inference`
+// serves general chat, code generation, and vision/OCR traffic through this
+// SAME function, not just grounded-extraction tasks, and "a number in the
+// output not present in the input" is the NORMAL case for those (a code
+// answer citing "port 8080", a model doing arithmetic, a fact recalled from
+// training data). Attaching the receipt unconditionally would flag most of
+// that traffic, so it stays off until a caller opts in, matching this repo's
+// default-OFF convention for advisory signals (CITADEL_ENERGY_SAMPLING,
+// SERVICE_AUTO_STOP_WHEN_IDLE). Disabled, the output map is byte-identical to
+// before this change — no new key, nothing for a downstream consumer to
+// notice.
+func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader, payload *jobs.LLMInferencePayload) (*JobResult, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return h.failure(err), nil
@@ -767,11 +792,15 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 		return h.failure(err), nil
 	}
 	writeSingleChunk(stream, content)
-	return h.success(map[string]any{
+	output := map[string]any{
 		"content":       content,
 		"finish_reason": finishReason,
 		"usage":         usage,
-	}), nil
+	}
+	if groundingGuardrailEnabled() {
+		output["grounding"] = groundingReceipt(promptTextFromPayload(payload), content)
+	}
+	return h.success(output), nil
 }
 
 // streamChatCompletions translates an OpenAI chat-completions SSE stream into
@@ -925,6 +954,84 @@ func writeSingleChunk(stream StreamWriter, content string) {
 
 func (h *LLMInferenceHandler) success(output map[string]any) *JobResult {
 	return &JobResult{Status: JobStatusSuccess, Output: output}
+}
+
+// promptTextFromPayload builds the plain-text "input" side of a grounding
+// check from an inference payload: Messages when present, else Prompt.
+// Messages-first matches what this handler's ONLY caller of this function
+// (bufferedChatCompletions, reached exclusively through
+// executeChatCompletionsAt) actually sent to the engine — every dispatch
+// site that routes there does so specifically because `len(payload.Messages)
+// > 0` (see Execute/executeVLLM/executeLlamaCppAt), and
+// executeChatCompletionsAt builds its outbound request body from Messages
+// alone, never Prompt. A payload that happened to carry a stray Prompt
+// alongside Messages must not have the guardrail compare the output against
+// text the model never saw. ChatMessage.Text() already strips multimodal
+// content parts down to their text; messages are joined in order so the
+// guardrail sees the full conversation context, not just the latest turn.
+func promptTextFromPayload(payload *jobs.LLMInferencePayload) string {
+	if payload == nil {
+		return ""
+	}
+	if len(payload.Messages) > 0 {
+		parts := make([]string, 0, len(payload.Messages))
+		for _, m := range payload.Messages {
+			if t := m.Text(); t != "" {
+				parts = append(parts, t)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return payload.Prompt
+}
+
+// groundingGuardrailEnvVar opts a node into attaching the grounding-guardrail
+// receipt (see groundingGuardrailEnabled). Named distinctly from the
+// job-payload-level toggles elsewhere in this file because it is a NODE
+// setting, not something the platform sends per job.
+const groundingGuardrailEnvVar = "CITADEL_GROUNDING_GUARDRAIL"
+
+// groundingGuardrailEnabled reports whether bufferedChatCompletions should run
+// and attach the on-node grounding guardrail (citadel #8253). Default OFF,
+// like every other advisory-signal toggle in this codebase
+// (CITADEL_ENERGY_SAMPLING, SERVICE_AUTO_STOP_WHEN_IDLE) — see the doc comment
+// on bufferedChatCompletions for why unconditional attachment would be noisy
+// for this handler's non-extraction traffic.
+func groundingGuardrailEnabled() bool {
+	return update.IsTruthy(os.Getenv(groundingGuardrailEnvVar))
+}
+
+// groundingReceipt runs the on-node grounding guardrail (internal/trust,
+// citadel #8253 guardrail half) and shapes its result as an advisory receipt
+// attached alongside the primary "content" field — mirroring the
+// synthesizeReceiptFromHeaders precedent (internal/jobs/synthesize_speech.go):
+// the guardrail's job is to FLAG, not block, so a result never fails or
+// withholds content because of what this returns. Policy is PolicyFlag
+// (default, never gates) here; gating is a documented follow-up for a caller
+// that wants HITL review of ungrounded results.
+//
+// claims_checked (the eligible-claim denominator behind score) is included
+// deliberately: without it, a claim-free prose reply and a reply with ten
+// verified statistics both report {grounded: true, score: 1.0} and are
+// indistinguishable to a consumer — see GroundingResult.Grounded's doc
+// comment in internal/trust for why score alone must not be read as
+// "verified true".
+func groundingReceipt(input, output string) map[string]any {
+	result := trust.CheckGrounding(input, output)
+	flagged := make([]map[string]any, 0, len(result.Flagged))
+	for _, c := range result.Flagged {
+		flagged = append(flagged, map[string]any{
+			"value":  c.Value,
+			"kind":   string(c.Kind),
+			"reason": c.Reason,
+		})
+	}
+	return map[string]any{
+		"grounded":       result.Grounded,
+		"score":          result.Score,
+		"claims_checked": result.ClaimsChecked,
+		"flagged":        flagged,
+	}
 }
 
 // warming returns the structured model_warming result (citadel-cli#632) for an
