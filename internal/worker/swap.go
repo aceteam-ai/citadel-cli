@@ -82,6 +82,14 @@ type SwapController interface {
 
 	// Ready reports whether the engine's HTTP API answers (loaded and serving).
 	Ready(ctx context.Context, backend string) bool
+
+	// MeasuredVRAM returns the LIVE measured VRAM footprint (bytes) attributed
+	// to the now-resident engine `backend`, and whether a measurement was
+	// available. Called once, right after Ready reports true, so the engine's
+	// process actually exists to attribute VRAM to. ok is false when no
+	// footprint signal exists (no GPU, footprint collection failed) — callers
+	// must never treat that as "measured zero" (citadel-cli#689).
+	MeasuredVRAM(ctx context.Context, backend string) (bytes uint64, ok bool)
 }
 
 // SwapOutcome is what EnsureResident reports to the inference handler.
@@ -128,7 +136,11 @@ type swapOp struct {
 type SwapManager struct {
 	ctrl SwapController
 
-	// requiredVRAM returns the VRAM budget (bytes) a swap-in of `backend` needs.
+	// requiredVRAM is the coarse per-engine PROVISIONING ESTIMATE (bytes) — the
+	// table (status.EngineVRAMEstimateMB), unavoidable for a backend this node
+	// has never actually measured. requiredVRAMBytes (below) is what callers
+	// should use: it prefers vramMeasured over this when a measurement exists
+	// (citadel-cli#689).
 	requiredVRAM func(backend string) uint64
 	// loadEstimate returns the expected cold-start time for `backend`, used for
 	// the warming ETA.
@@ -161,6 +173,17 @@ type SwapManager struct {
 	// dropping it would send the next swap-in back to the table (the same defect
 	// citadel-cli#688 describes for lastUsed).
 	loadMeasured map[string]time.Duration
+	// vramMeasured is the observed LIVE VRAM footprint (bytes) per (engine,
+	// model) pair, recorded once a swap-in becomes ready (citadel-cli#689).
+	// Keyed by vramCacheKey(backend, model), not backend alone: the same engine
+	// (vllm in particular) can be swapped in for different models across
+	// swaps, and a stale measurement from a smaller model would understate the
+	// budget for a larger one. Mirrors loadMeasured's eviction behavior: it
+	// SURVIVES eviction, because the footprint of a given (engine, model) does
+	// not change because the engine was stopped, and dropping it would send the
+	// next swap-in of the same pair back to the padded provisioning budget it
+	// exists to replace.
+	vramMeasured map[string]uint64
 	// swaps is the in-process swap ledger (swap_ledger.go).
 	swaps []SwapRecord
 	// startedAt records when this node last ISSUED a start for an engine, which
@@ -203,6 +226,7 @@ func NewSwapManager(ctrl SwapController, opts ...SwapManagerOption) *SwapManager
 		startedAt:            map[string]time.Time{},
 		servedAt:             map[string]time.Time{},
 		loadMeasured:         map[string]time.Duration{},
+		vramMeasured:         map[string]uint64{},
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -360,6 +384,34 @@ func (m *SwapManager) runSwap(op *swapOp) {
 			// measurement is what raises the residency ceiling above the load
 			// (citadel-cli#687) instead of trusting the coarse table.
 			m.recordLoadDuration(op.backend, m.now().Sub(op.startedAt))
+			// Kick off the LIVE VRAM footprint measurement (citadel-cli#689) now
+			// that the engine is actually resident and serving -- this is the
+			// only point in the swap lifecycle where a real measurement is even
+			// possible (the engine did not exist to attribute VRAM to before
+			// Start, and this goroutine's own view of "resident" is what just
+			// went true). Deliberately FIRE-AND-FORGET via its own goroutine,
+			// NOT awaited here: MeasuredVRAM runs a full status.Collector.Collect
+			// (docker stats + nvidia-smi across every service), documented as
+			// multi-second on a busy node, and this loop is on the path to
+			// close(op.done) via the deferred cleanup below -- EnsureResident's
+			// <=15s wait blocks on <-op.done, so a swap that genuinely loaded in
+			// time could spuriously report model_warming while waiting on a
+			// measurement nobody asked to wait for. measureAndRecordVRAM uses
+			// its own bounded context rather than this function's ctx, because
+			// this function's ctx is cancelled by the `defer cancel()` above the
+			// instant runSwap returns -- which happens right after this line.
+			//
+			// Gated on vramMeasurableOnReady: for ollama, Ready==true does NOT
+			// mean weights are resident (see SwapController.Ready's doc comment)
+			// — it means a model is merely LISTED, and it lazy-loads on first
+			// request. Measuring here for ollama would attribute a near-zero
+			// cold VRAM reading to the engine, and because vramMeasured
+			// deliberately survives eviction (see forget below), that bad number
+			// would stay cached for the rest of the process's life on exactly
+			// the path that decides how much VRAM to free.
+			if vramMeasurableOnReady(op.backend) {
+				go m.measureAndRecordVRAM(op.backend, op.model)
+			}
 			m.markReady(op.backend)
 			return
 		}
@@ -378,7 +430,7 @@ func (m *SwapManager) runSwap(op *swapOp) {
 // A genuine inability to fit (pinned / not enough VRAM even ignoring
 // min-residency) is a hard error.
 func (m *SwapManager) preempt(ctx context.Context, op *swapOp) error {
-	required := m.requiredVRAM(op.backend)
+	required := m.requiredVRAMBytes(op.backend, op.model)
 	if required == 0 {
 		return nil // no budget known: skip preemption (fail-safe)
 	}
@@ -522,6 +574,118 @@ func (m *SwapManager) MeasuredLoad(backend string) (time.Duration, bool) {
 	return d, ok
 }
 
+// vramCacheKey is the vramMeasured map key for a (backend, model) pair. Model
+// is part of the key because the same engine can be swapped in for different
+// models across swaps (vllm in particular), and their footprints differ.
+func vramCacheKey(backend, model string) string {
+	return backend + "\x00" + model
+}
+
+// vramMeasurableOnReady reports whether Ready()==true for `backend` actually
+// means its weights are resident in VRAM -- the precondition for trusting a
+// MeasuredVRAM reading taken at that moment as the engine's real footprint.
+// False only for ollama: SwapController.Ready's doc comment states ollama
+// lists a pulled model before loading it and only loads on the first request,
+// so Ready==true there means "listed", not "resident". Mirrors that exception
+// exactly so the two cannot silently drift apart.
+func vramMeasurableOnReady(backend string) bool {
+	return backend != "ollama"
+}
+
+// vramMeasureTimeout bounds the background MeasuredVRAM call
+// (measureAndRecordVRAM). It is generous relative to a single status
+// collection (documented as multi-second on a busy node) because nothing
+// downstream is waiting on it -- the only cost of a slow measurement is a
+// slightly later cache fill, never a delayed ready signal (that's the whole
+// point of running it off the critical path).
+const vramMeasureTimeout = 10 * time.Second
+
+// measureAndRecordVRAM runs MeasuredVRAM and caches the result, entirely off
+// the swap's readiness critical path (citadel-cli#689 review finding: calling
+// this synchronously before close(op.done) let a slow measurement delay the
+// ready signal EnsureResident's wait budget blocks on). Called via `go` from
+// runSwap, so it uses its OWN bounded context rather than runSwap's: that
+// context is cancelled by runSwap's `defer cancel()` the moment runSwap
+// returns, which happens immediately after this goroutine is launched --
+// reusing it here would race the measurement against its own cancellation.
+// Best-effort: an error or a false `ok` just means no measurement is cached
+// this round, same as it always has (requiredVRAMBytes falls back to the
+// table either way).
+func (m *SwapManager) measureAndRecordVRAM(backend, model string) {
+	ctx, cancel := context.WithTimeout(context.Background(), vramMeasureTimeout)
+	defer cancel()
+	bytes, ok := m.ctrl.MeasuredVRAM(ctx, backend)
+	if !ok {
+		return
+	}
+	m.recordMeasuredVRAM(backend, model, bytes)
+}
+
+// recordMeasuredVRAM remembers the live VRAM footprint (bytes) observed for a
+// (backend, model) pair right after it became ready. A zero reading is
+// dropped rather than cached: it almost always means the footprint signal was
+// unavailable (no GPU, attribution miss), and caching it would make a later
+// fit check see "measured: needs nothing", the wrong direction of error for a
+// check that exists to prevent an OOM (citadel-cli#689).
+func (m *SwapManager) recordMeasuredVRAM(backend, model string, bytes uint64) {
+	if bytes == 0 {
+		return
+	}
+	m.mu.Lock()
+	m.vramMeasured[vramCacheKey(backend, model)] = bytes
+	m.mu.Unlock()
+}
+
+// MeasuredVRAMBytes reports the last observed live VRAM footprint (bytes) for
+// a (backend, model) pair, and whether one has been observed at all.
+func (m *SwapManager) MeasuredVRAMBytes(backend, model string) (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.vramMeasured[vramCacheKey(backend, model)]
+	return b, ok
+}
+
+// vramFitMarginFactor inflates a MEASURED footprint before it sizes an
+// incoming (about-to-load) engine's fit check (citadel-cli#689 review
+// finding). The table estimate's padding exists specifically so two big
+// engines can't both end up resident at once -- see the engineVRAMEstimateMB
+// doc comment in internal/status/hotswap.go: sizing at raw steady-state lets
+// the planner see "fits, no evict" and admit a second model into a card that
+// cannot actually hold both, "a no-op swap followed by an OOM". A zero-margin
+// MEASURED value reintroduces exactly that: on node 1297's 3090,
+// unlimited-ocr (~14GB measured) + bonsai (~6GB measured) sum to ~20GB
+// resident against a 24GB card -- only ~4GB free, no headroom for load-time
+// transients (KV-cache warm-up, allocator fragmentation, CUDA context
+// overhead) that a STEADY-STATE reading doesn't capture. 15% is well below
+// the table's own padding -- unlimited-ocr's fit value is still ~16GB against
+// a 20GB table budget, a real improvement -- but never a bare zero-margin bet
+// on the raw number.
+const vramFitMarginFactor = 1.15
+
+// vramFitBytes applies the fit-check safety margin to a measured footprint.
+// Deliberately NOT applied inside MeasuredVRAMBytes: that accessor (and the
+// value cmd/hotswap.go logs) reports the raw measurement for observability,
+// so the margin exists in exactly one place -- the fit decision -- rather
+// than leaking into every reader as a silently-inflated "measurement".
+func vramFitBytes(measured uint64) uint64 {
+	return uint64(float64(measured) * vramFitMarginFactor)
+}
+
+// requiredVRAMBytes is the VRAM budget (bytes) preempt() sizes a swap-in
+// against: a MEASURED footprint from a prior residency of this exact
+// (backend, model) pair, margined by vramFitBytes, when one exists, else the
+// coarse table estimate (citadel-cli#689). The estimate is unavoidable the
+// first time a given pair is swapped in — nothing can measure a model that
+// has never been loaded — but every swap after the first replaces the padded
+// provisioning number with a margined version of what the engine actually
+// used.
+func (m *SwapManager) requiredVRAMBytes(backend, model string) uint64 {
+	if measured, ok := m.MeasuredVRAMBytes(backend, model); ok {
+		return vramFitBytes(measured)
+	}
+	return m.requiredVRAM(backend)
+}
+
 // swapRecord builds the ledger entry for a finished swap. The outcome ordering
 // matters: a rate-limited or otherwise failed swap is reported as such even
 // though it also did not become ready.
@@ -617,6 +781,10 @@ func (m *SwapManager) markServed(backend string) {
 // before writing this comment: forget() has never deleted lastUsed, so this is
 // pinning existing (correct) behavior against a plausible-looking future
 // regression, not documenting a fix made here.
+//
+// vramMeasured SURVIVES for the identical reason as loadMeasured (citadel-cli
+// #689): the VRAM a (backend, model) pair uses does not change because we
+// stopped it.
 func (m *SwapManager) forget(name string) {
 	m.mu.Lock()
 	delete(m.readyAt, name)

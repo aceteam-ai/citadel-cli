@@ -56,18 +56,24 @@ var engineDefaultModel = map[string]string{
 
 // engineVRAMEstimateMB is a per-engine VRAM PROVISIONING BUDGET (MB): the VRAM
 // the node should have FREE before it is safe to start the engine, NOT its
-// steady-state footprint. This is what the swap planner feeds PlanPreemption as
-// requiredVRAM, and what a STOPPED installed engine advertises as VRAMEstimateMB.
+// steady-state footprint. It is what a STOPPED installed engine advertises as
+// VRAMEstimateMB, and it is the FALLBACK the worker swap planner
+// (internal/worker.SwapManager.requiredVRAMBytes) uses only when this node has
+// never actually measured the (engine, model) pair being swapped in —
+// unavoidable the first time, since nothing can measure a model that isn't
+// loaded yet (citadel-cli#689). Once a swap-in completes, the swap planner
+// caches and prefers the LIVE measured footprint for that pair over this table
+// on every subsequent swap.
 //
-// Why provisioning budgets, not steady-state: on the RTX 3090 pilot (24GB) with
-// Unlimited-OCR resident (~13.5GB), ~10.5GB is free. If bonsai's budget were its
-// bounded-context steady-state (~6-8GB) the planner would see "fits, no evict"
-// and start bonsai into a card that then can't safely hold both — a no-op swap
-// followed by an OOM. Sizing the big engines above half the card forces the
-// intended single-big-model-at-a-time swap: starting one evicts the other. A
-// RUNNING engine advertises its live footprint instead (applyModelHotswap), so
-// these conservative numbers only gate the swap decision. Refined per model in
-// Phase 3.
+// Why provisioning budgets, not steady-state, for the fallback: on the RTX
+// 3090 pilot (24GB) with Unlimited-OCR resident (~13.5GB), ~10.5GB is free. If
+// bonsai's budget were its bounded-context steady-state (~6-8GB) the planner
+// would see "fits, no evict" and start bonsai into a card that then can't
+// safely hold both — a no-op swap followed by an OOM. Sizing the big engines
+// above half the card forces the intended single-big-model-at-a-time swap:
+// starting one evicts the other. A RUNNING engine advertises its live
+// footprint instead (applyModelHotswap below), so these conservative numbers
+// only gate the swap decision, and only until it has been measured once.
 var engineVRAMEstimateMB = map[string]int{
 	"vllm":          22000,
 	"sglang":        22000,
@@ -79,7 +85,9 @@ var engineVRAMEstimateMB = map[string]int{
 
 // EngineVRAMEstimateMB returns the coarse VRAM estimate (MB) for a managed
 // engine, or 0 when unknown. Exported so the worker swap planner can size its
-// required-VRAM budget from the same table the heartbeat advertises.
+// FALLBACK required-VRAM budget from the same table the heartbeat advertises
+// for a STOPPED engine — a measured (engine, model) pair overrides it
+// (citadel-cli#689; see the engineVRAMEstimateMB doc comment above).
 func EngineVRAMEstimateMB(engine string) int {
 	return engineVRAMEstimateMB[engine]
 }

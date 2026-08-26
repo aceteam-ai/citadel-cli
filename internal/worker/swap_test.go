@@ -27,6 +27,11 @@ type mockSwapController struct {
 	stopped    []string // names passed to StopNonDurable
 
 	readyAfterStart bool // Ready returns true once the backend has been started
+
+	// measuredVRAM, when non-zero, is what MeasuredVRAM reports (ok=true) for
+	// ANY backend once ready. Zero means "no measurement available" (ok=false),
+	// matching a real node with no footprint signal.
+	measuredVRAM uint64
 }
 
 func newMockController() *mockSwapController {
@@ -99,6 +104,15 @@ func (m *mockSwapController) Ready(_ context.Context, backend string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.resident[backend]
+}
+
+func (m *mockSwapController) MeasuredVRAM(_ context.Context, _ string) (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.measuredVRAM == 0 {
+		return 0, false
+	}
+	return m.measuredVRAM, true
 }
 
 // newTestManager builds a manager with fast, deterministic timing.

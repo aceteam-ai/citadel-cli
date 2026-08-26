@@ -148,6 +148,40 @@ func (c *swapController) Ready(ctx context.Context, backend string) bool {
 	return false
 }
 
+// MeasuredVRAM returns the LIVE measured VRAM footprint (bytes) for the
+// now-resident engine `backend`, sourced from the same #421 footprint
+// collector PreemptInputs reads for OTHER engines (attachFootprints ->
+// ServiceInfo.Footprint.VRAMBytes) — never the engineVRAMEstimateMB table
+// (citadel-cli#689). ok is false when the service isn't currently running or
+// carries no footprint signal (no GPU, attribution miss); the swap manager
+// must not cache a zero as "measured".
+func (c *swapController) MeasuredVRAM(ctx context.Context, backend string) (uint64, bool) {
+	collector := status.NewCollector(status.CollectorConfig{ConfigDir: c.configDir})
+	st, err := collector.Collect()
+	if err != nil {
+		c.logf("[hotswap] status collect failed measuring %s VRAM: %v", backend, err)
+		return 0, false
+	}
+	for i := range st.Services {
+		s := &st.Services[i]
+		if s.Name != backend || s.Status != status.ServiceStatusRunning {
+			continue
+		}
+		if s.Footprint != nil && s.Footprint.VRAMBytes > 0 {
+			// Log the estimate alongside the measurement so the gap between
+			// them (the citadel-cli#689 motivation -- unlimited-ocr measured
+			// ~14GB against a 20GB table budget) is visible in the node's
+			// logs at the moment it is known, not just applied silently.
+			estimateMB := status.EngineVRAMEstimateMB(backend)
+			measuredMB := s.Footprint.VRAMBytes / (1024 * 1024)
+			c.logf("[hotswap] %s measured VRAM %dMB (table estimate %dMB) -- future swap-ins of this model use the measurement",
+				backend, measuredMB, estimateMB)
+			return s.Footprint.VRAMBytes, true
+		}
+	}
+	return 0, false
+}
+
 // ObserveSwap logs the per-swap record and the running counter that
 // citadel-cli#687 asks the node to emit. Before this, an alternating two-model
 // workload could spend most of its wall clock loading rather than serving and
