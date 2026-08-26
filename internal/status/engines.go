@@ -261,13 +261,23 @@ func engineInList(list []string, name string) bool {
 // time.Now() -- specifically so the down/starting/ready state matrix is
 // directly unit-testable without a live probe or an httptest server.
 //
-// probeAttempted distinguishes "we tried to ask and it didn't answer in time"
-// from "we never asked at all": the latter only happens with a Collector that
-// has neither an idle tracker nor a model-discovery client wired (a bare
+// probeAttempted distinguishes "we tried to ask and it didn't answer" from "we
+// never asked at all": the latter only happens with a Collector that has
+// neither an idle tracker nor a model-discovery client wired (a bare
 // zero-value Collector in a test; production's NewCollector always sets both),
 // and in that case there is no live probe to timestamp, so ProbedAt stays nil.
 // responded means at least one live probe (idle scrape or model discovery)
 // answered within its own timeout this cycle.
+//
+// The unresponded reason deliberately does NOT say "timed out": DiscoverModels
+// fails for three distinct causes -- connection refused (nothing bound to the
+// port yet, the common case for the first several seconds/minutes of a real
+// weights load, e.g. vLLM importing Python before uvicorn binds), a non-200
+// response (still loading), or an actual context.DeadlineExceeded -- and only
+// the last of those is a timeout. Claiming "timed out" for a refused
+// connection would send an operator hunting for a slow engine instead of an
+// unbound port, so the reason names the bound the probe ran under, not a
+// specific cause.
 func readinessForProbe(responded, probeAttempted bool) (readiness, reason string, probedAt *time.Time) {
 	if !probeAttempted {
 		if responded {
@@ -281,7 +291,7 @@ func readinessForProbe(responded, probeAttempted bool) (readiness, reason string
 	if responded {
 		return ReadinessReady, "", &now
 	}
-	return ReadinessStarting, fmt.Sprintf("model discovery probe timed out after %s", ModelDiscoveryTimeout), &now
+	return ReadinessStarting, fmt.Sprintf("model discovery probe did not return a served model within %s", ModelDiscoveryTimeout), &now
 }
 
 // managedEnginePortIfRunning reports whether a managed engine is running and,

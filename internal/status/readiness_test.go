@@ -88,6 +88,12 @@ func TestCollectManagedEngineStatus_ContainerDownYieldsNoEntry(t *testing.T) {
 // at the test server's port (restored via t.Cleanup) since
 // collectManagedEngineStatus resolves the probe port through that registry,
 // not through an injectable parameter.
+//
+// Mutates the package-level services.ServiceHostPorts map, which is safe only
+// because internal/status has no t.Parallel() calls today (this package runs
+// its tests sequentially) and no other "vllm" test in this package expects a
+// different port concurrently. If either changes, this test (and its sibling
+// below) need a non-shared way to inject the probe port.
 func TestCollectManagedEngineStatus_ReadyIsReportedWithProbedAtAndNoReason(t *testing.T) {
 	discovery, port := newTestDiscovery(t, openAIModelsHandler("Qwen/Qwen3-8B"))
 
@@ -137,16 +143,24 @@ func TestCollectManagedEngineStatus_ReadyIsReportedWithProbedAtAndNoReason(t *te
 	}
 }
 
-// TestCollectManagedEngineStatus_TimedOutProbeIsStartingNotStopped is the
+// TestCollectManagedEngineStatus_UnansweredProbeIsStartingNotStopped is the
 // direct regression test for the issue's headline bug: a container that is up
 // but whose model-discovery probe does not answer must classify as starting,
 // carrying a reason, never as stopped/unknown (which is what the disk branch
 // used to re-classify it as before the container-up check was added).
-func TestCollectManagedEngineStatus_TimedOutProbeIsStartingNotStopped(t *testing.T) {
-	// Bind then immediately close a listener: the port is reserved but dead,
-	// so DiscoverModels fails fast (connection refused) instead of consuming
-	// the full 2s ModelDiscoveryTimeout -- same trick as
-	// TestDiscoverModels_Unreachable in models_test.go.
+//
+// This exercises the CONNECTION-REFUSED failure mode specifically (bind then
+// immediately close a listener, same trick as TestDiscoverModels_Unreachable
+// in models_test.go) rather than an actual context.DeadlineExceeded, because
+// refused is the common real-world case: for a real weights load (e.g. vLLM
+// importing Python before uvicorn ever binds the port) nothing is listening
+// for most of the load, not merely responding slowly. That is exactly why the
+// Reason text says "did not return a served model within Ns" rather than
+// "timed out" -- a refused connection fails immediately, well inside the
+// probe's timeout bound, and readinessForProbe's Reason must stay true for
+// all three DiscoverModels failure modes (refused, non-200, and a genuine
+// deadline), not just this one.
+func TestCollectManagedEngineStatus_UnansweredProbeIsStartingNotStopped(t *testing.T) {
 	discovery := NewModelDiscovery()
 	discovery.host = "127.0.0.1"
 	deadPort := reserveDeadPort(t)
@@ -190,8 +204,8 @@ func TestCollectManagedEngineStatus_TimedOutProbeIsStartingNotStopped(t *testing
 	if vllm.Readiness != ReadinessStarting {
 		t.Errorf("readiness = %q, want %q", vllm.Readiness, ReadinessStarting)
 	}
-	if !strings.Contains(vllm.Reason, "timed out") {
-		t.Errorf("reason = %q, want it to explain the timeout", vllm.Reason)
+	if !strings.Contains(vllm.Reason, "did not return a served model") {
+		t.Errorf("reason = %q, want it to explain the unanswered probe without claiming a timeout", vllm.Reason)
 	}
 	if vllm.ProbedAt == nil {
 		t.Error("expected ProbedAt to be set: a live model-discovery probe did run this cycle")
