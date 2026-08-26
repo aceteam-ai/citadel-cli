@@ -620,19 +620,32 @@ func localListFilesCall(workspaceDir string, args json.RawMessage) (string, erro
 // pipe swap can only be safely undone once fn (and everything it started
 // synchronously) has actually returned -- see localToolCallTimeout's comment
 // for why this specifically affects the module-control tools.
+
 // stdoutCaptureInFlight is the nesting guard described in captureStdout's
 // doc comment. It is released only once os.Stdout has actually been fully
 // restored (registered before the restore defer below, so LIFO ordering runs
 // it last), so a new capture can never start while a previous one -- even an
 // abandoned, still-running one -- is mid-redirection.
+//
+// The refusal below can persist for as long as the orphaned call keeps
+// running -- potentially minutes for a slow `docker compose` action (a
+// build-based service's first start, e.g. bonsai, can take ~7min -- see
+// CLAUDE.md's Bonsai section). That is still strictly better than the
+// pre-#858 behavior (the ENTIRE JSON-RPC loop wedged for that whole window),
+// but it is not instantaneous: a caller that retries a refused local tool
+// call in a tight loop should back off, not spin.
 var stdoutCaptureInFlight atomic.Bool
 
 func captureStdout(fn func() error) (out string, err error) {
 	if !stdoutCaptureInFlight.CompareAndSwap(false, true) {
+		// fn is never invoked on this path -- nothing was started, changed, or
+		// partially applied. Say so explicitly: a caller (an agent driving
+		// local_module_stop/start/restart) needs to know the module's state is
+		// UNCHANGED, not guess whether the stop/start partially ran.
 		return "", fmt.Errorf(
-			"mcp: another local tool's stdout capture is still in progress " +
-				"(a previous module-control call likely timed out and is still " +
-				"finishing in the background); try again shortly")
+			"mcp: no action was taken -- another local tool's stdout capture is " +
+				"still in progress (a previous module-control call likely timed " +
+				"out and is still finishing in the background); try again shortly")
 	}
 	defer stdoutCaptureInFlight.Store(false)
 
