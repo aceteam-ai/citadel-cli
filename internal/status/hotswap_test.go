@@ -143,6 +143,79 @@ func TestApplyModelHotswap_MarksRunningEngineResident(t *testing.T) {
 	}
 }
 
+// TestApplyModelHotswap_ResidentEngineUsesMeasuredFootprintOverTable is the
+// citadel-cli#689 regression: a RESIDENT engine with a live measured VRAM
+// footprint must advertise that measurement, not the coarse provisioning
+// estimate (engineVRAMEstimateMB) -- even when the measurement is far below
+// the table (the live unlimited-ocr case the issue reports: ~14GB measured
+// against a 20GB budget).
+func TestApplyModelHotswap_ResidentEngineUsesMeasuredFootprintOverTable(t *testing.T) {
+	dir := t.TempDir()
+	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
+
+	const measuredBytes = 14 << 30 // ~14GB
+	st := &NodeStatus{Services: []ServiceInfo{
+		{
+			Name:      "unlimited-ocr",
+			Type:      ServiceTypeLLM,
+			Status:    ServiceStatusRunning,
+			Footprint: &ServiceFootprint{VRAMBytes: measuredBytes},
+		},
+	}}
+	reported := map[string]struct{}{"unlimited-ocr": {}}
+
+	c.applyModelHotswap(st, reported)
+
+	got := st.Services[0].VRAMEstimateMB
+	wantMB := int(measuredBytes / (1024 * 1024))
+	if got != wantMB {
+		t.Fatalf("VRAMEstimateMB = %d, want the measured %d (table estimate is %d)",
+			got, wantMB, engineVRAMEstimateMB["unlimited-ocr"])
+	}
+	if got == engineVRAMEstimateMB["unlimited-ocr"] {
+		t.Fatalf("VRAMEstimateMB equals the table estimate (%d); the measured footprint was ignored", got)
+	}
+}
+
+// TestApplyModelHotswap_ResidentEngineFallsBackToTableWithoutFootprint is the
+// other half of #689: a running engine with NO footprint signal (no GPU,
+// attribution miss) must still advertise the table estimate rather than 0 --
+// the pre-existing behavior this change must not regress.
+func TestApplyModelHotswap_ResidentEngineFallsBackToTableWithoutFootprint(t *testing.T) {
+	dir := t.TempDir()
+	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
+
+	st := &NodeStatus{Services: []ServiceInfo{
+		{Name: "unlimited-ocr", Type: ServiceTypeLLM, Status: ServiceStatusRunning},
+	}}
+	reported := map[string]struct{}{"unlimited-ocr": {}}
+
+	c.applyModelHotswap(st, reported)
+
+	if got, want := st.Services[0].VRAMEstimateMB, engineVRAMEstimateMB["unlimited-ocr"]; got != want {
+		t.Fatalf("VRAMEstimateMB = %d, want the table estimate %d (no footprint signal available)", got, want)
+	}
+}
+
+// TestCollectInstalledEngines_StoppedEngineUsesTableEstimate pins the "cannot
+// measure a model that isn't loaded" half of #689: a STOPPED (not resident)
+// installed engine has no footprint to measure, so it must advertise the
+// table estimate, unchanged by the measured-vram routing added for running
+// engines.
+func TestCollectInstalledEngines_StoppedEngineUsesTableEstimate(t *testing.T) {
+	dir := t.TempDir()
+	writeInstalledEngine(t, dir, "bonsai", "")
+	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
+
+	got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one advertised stopped engine, got %d", len(got))
+	}
+	if want := engineVRAMEstimateMB["bonsai"]; got[0].VRAMEstimateMB != want {
+		t.Fatalf("VRAMEstimateMB = %d, want the table estimate %d", got[0].VRAMEstimateMB, want)
+	}
+}
+
 // TestServiceInfo_FlagOffOmitsResidentKey asserts the omitempty on the *bool and
 // int keeps a flag-off heartbeat byte-identical: no `resident`/`vram_estimate_mb`.
 func TestServiceInfo_FlagOffOmitsResidentKey(t *testing.T) {
