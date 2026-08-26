@@ -431,13 +431,33 @@ func (o *liveModuleOps) composePathFor(configDir, name string) string {
 	return ""
 }
 
-// containerIsRunning reports whether the module's citadel-<name> container is up.
+// resolveModuleContainerName resolves the container name containerIsRunning
+// (and any future module-health check) should inspect for a module named
+// name. Split out from containerIsRunning so the name resolution -- the part
+// citadel#860 changes -- is unit-testable without a container runtime.
+//
+// citadel#860: for an EMBEDDED service (services.ServiceMap), the container
+// name is resolved via embeddedContainerName -- override-scoped
+// ("citadel-<hash>-<name>") under an active --node-dir/CITADEL_NODE_DIR,
+// unchanged "citadel-<name>" otherwise -- so this agrees with what
+// ensureComposeFile just materialized. Catalog/third-party module names (not
+// in ServiceMap) keep the plain "citadel-<name>" convention unconditionally:
+// those compose files author their own container_name and are not namespaced
+// by --node-dir (see cmd/nodedir.go's package doc).
+func resolveModuleContainerName(name string) string {
+	if isEmbeddedService(name) {
+		return embeddedContainerName(name)
+	}
+	return "citadel-" + name
+}
+
+// containerIsRunning reports whether the module's container is up.
 // Best-effort: returns false if the engine is unavailable or the query fails.
 func containerIsRunning(name string) bool {
 	rt := catalog.SelectContainerRuntime()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, rt.EngineBin, "inspect", "--format", "{{.State.Running}}", "citadel-"+name).Output()
+	out, err := exec.CommandContext(ctx, rt.EngineBin, "inspect", "--format", "{{.State.Running}}", resolveModuleContainerName(name)).Output()
 	if err != nil {
 		return false
 	}

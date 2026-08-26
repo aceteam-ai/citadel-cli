@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -278,5 +279,113 @@ func TestRunTUIWorker_RefusesUnderNodeDirOverride(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--node-dir") {
 		t.Fatalf("error = %v, want it to mention --node-dir", err)
+	}
+}
+
+// --- embedded container-name namespacing under --node-dir (citadel#860) ---
+//
+// These pin embeddedContainerName/isEmbeddedService directly (pure, no exec
+// involved), matching this issue's "verify with Go tests only" constraint.
+
+func TestIsEmbeddedService(t *testing.T) {
+	if !isEmbeddedService("vllm") {
+		t.Fatal("vllm is a services.ServiceMap entry, want isEmbeddedService(vllm) = true")
+	}
+	if isEmbeddedService("some-catalog-module") {
+		t.Fatal("a non-ServiceMap name must not be classified as embedded")
+	}
+}
+
+func TestEmbeddedContainerName_NoOverrideIsUnchanged(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	if got := embeddedContainerName("vllm"); got != "citadel-vllm" {
+		t.Fatalf("embeddedContainerName(vllm) = %q, want citadel-vllm (byte-identical to pre-#860)", got)
+	}
+}
+
+func TestEmbeddedContainerName_WithOverrideMatchesComposeProjectHash(t *testing.T) {
+	setNodeDirOverrideForTest(t, t.TempDir())
+
+	// composeProjectOverride() is "citadel-nodedir-<hash>"; embeddedContainerName
+	// must reuse the SAME <hash> -- the whole point of #860 is that the compose
+	// project and the container it starts always agree on which override owns
+	// them.
+	project := composeProjectOverride()
+	hash := strings.TrimPrefix(project, "citadel-nodedir-")
+	if hash == "" || hash == project {
+		t.Fatalf("could not extract hash from project %q", project)
+	}
+
+	want := "citadel-" + hash + "-vllm"
+	if got := embeddedContainerName("vllm"); got != want {
+		t.Fatalf("embeddedContainerName(vllm) = %q, want %q (matching composeProjectOverride's hash)", got, want)
+	}
+}
+
+func TestEmbeddedContainerName_TwoDifferentOverrideDirsProduceDifferentNames(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	setNodeDirOverrideForTest(t, dirA)
+	nameA := embeddedContainerName("vllm")
+
+	setNodeDirOverrideForTest(t, dirB)
+	nameB := embeddedContainerName("vllm")
+
+	if nameA == nameB {
+		t.Fatalf("two different override dirs must materialize DIFFERENT container names for the same service; both = %q", nameA)
+	}
+}
+
+// --- containerIsRunning's name resolution (citadel#860) ---
+
+func TestResolveModuleContainerName_EmbeddedService_NoOverride(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	if got := resolveModuleContainerName("vllm"); got != "citadel-vllm" {
+		t.Fatalf("resolveModuleContainerName(vllm) = %q, want citadel-vllm", got)
+	}
+}
+
+func TestResolveModuleContainerName_EmbeddedService_WithOverride(t *testing.T) {
+	dir := t.TempDir()
+	setNodeDirOverrideForTest(t, dir)
+	want := embeddedContainerName("vllm")
+	if want == "citadel-vllm" {
+		t.Fatal("embeddedContainerName should be override-scoped here, not the plain name -- test setup bug")
+	}
+	if got := resolveModuleContainerName("vllm"); got != want {
+		t.Fatalf("resolveModuleContainerName(vllm) = %q, want %q (must agree with embeddedContainerName)", got, want)
+	}
+}
+
+// TestResolveModuleContainerName_CatalogModule_UnaffectedByOverride pins the
+// non-goal: a name that is NOT a services.ServiceMap entry (a catalog/
+// third-party module) always resolves to the plain "citadel-<name>"
+// convention, regardless of --node-dir -- those compose files author their
+// own container_name and are out of scope for this issue's namespacing.
+func TestResolveModuleContainerName_CatalogModule_UnaffectedByOverride(t *testing.T) {
+	setNodeDirOverrideForTest(t, t.TempDir())
+	if got := resolveModuleContainerName("some-catalog-module"); got != "citadel-some-catalog-module" {
+		t.Fatalf("resolveModuleContainerName(catalog module) = %q, want the unnamespaced citadel-<name> convention even under override", got)
+	}
+}
+
+// --- dryRunContainerNames' override-aware fallback (citadel#860) ---
+
+func TestDryRunContainerNames_FallbackUnnamespacedWithoutOverride(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	got := dryRunContainerNames(filepath.Join(t.TempDir(), "does-not-exist.yml"), "vllm")
+	want := []string{"citadel-vllm"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("dryRunContainerNames fallback = %v, want %v", got, want)
+	}
+}
+
+func TestDryRunContainerNames_FallbackNamespacedUnderOverride(t *testing.T) {
+	setNodeDirOverrideForTest(t, t.TempDir())
+	got := dryRunContainerNames(filepath.Join(t.TempDir(), "does-not-exist.yml"), "vllm")
+	want := []string{embeddedContainerName("vllm")}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("dryRunContainerNames fallback under override = %v, want %v", got, want)
 	}
 }

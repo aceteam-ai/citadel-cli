@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
 
@@ -124,6 +125,177 @@ func TestEnsureComposeFile(t *testing.T) {
 	err = ensureComposeFile(tmpDir, "unknown-service")
 	if err == nil {
 		t.Error("ensureComposeFile() expected error for unknown service, got nil")
+	}
+}
+
+// TestEnsureComposeFile_NoOverrideWritesVerbatim pins the #860 backward-compat
+// contract: with no --node-dir/CITADEL_NODE_DIR override active, the
+// materialized compose file must be byte-identical to the embedded template
+// -- no container_name rewriting at all.
+func TestEnsureComposeFile_NoOverrideWritesVerbatim(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	tmpDir := t.TempDir()
+
+	if err := ensureComposeFile(tmpDir, "vllm"); err != nil {
+		t.Fatalf("ensureComposeFile() error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(tmpDir, "services", "vllm.yml"))
+	if err != nil {
+		t.Fatalf("failed to read materialized compose file: %v", err)
+	}
+	want := services.ServiceMap["vllm"]
+	if string(got) != want {
+		t.Fatalf("materialized compose file is not byte-identical to the embedded template without an override")
+	}
+	if !strings.Contains(string(got), "container_name: citadel-vllm") {
+		t.Fatalf("materialized compose file missing the unnamespaced container_name line, got: %s", got)
+	}
+}
+
+// TestEnsureComposeFile_OverrideNamespacesContainerName pins the #860 fix
+// itself: under an active override, the materialized container_name line
+// carries the SAME hash embeddedContainerName/composeProjectOverride derive
+// for that override dir.
+func TestEnsureComposeFile_OverrideNamespacesContainerName(t *testing.T) {
+	overrideDir := t.TempDir()
+	setNodeDirOverrideForTest(t, overrideDir)
+	tmpDir := t.TempDir()
+
+	if err := ensureComposeFile(tmpDir, "vllm"); err != nil {
+		t.Fatalf("ensureComposeFile() error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(tmpDir, "services", "vllm.yml"))
+	if err != nil {
+		t.Fatalf("failed to read materialized compose file: %v", err)
+	}
+
+	wantName := embeddedContainerName("vllm")
+	wantLine := "container_name: " + wantName
+	if !strings.Contains(string(got), wantLine) {
+		t.Fatalf("materialized compose file = %s, want it to contain %q", got, wantLine)
+	}
+	if strings.Contains(string(got), "container_name: citadel-vllm\n") {
+		t.Fatalf("materialized compose file still contains the UNnamespaced container_name line: %s", got)
+	}
+	// bonsai-style services also reference "citadel-<svc>" in an image: tag;
+	// vllm doesn't, but assert the rewrite didn't touch anything else in the
+	// file besides the one container_name line (content is otherwise
+	// identical to the embedded template).
+	rewrittenBack := strings.Replace(string(got), wantLine, "container_name: citadel-vllm", 1)
+	if rewrittenBack != services.ServiceMap["vllm"] {
+		t.Fatalf("materialization changed more than just the container_name line")
+	}
+}
+
+// TestEnsureComposeFile_ExistingUnnamespacedFileIsReconciledUnderOverride
+// pins the review fix: a compose file already materialized (by a pre-#860
+// binary, or by this binary before an override was set) with the plain
+// "citadel-vllm" container_name must be rewritten in place the NEXT time
+// ensureComposeFile runs under an active override -- the "file already
+// exists, leave it alone" fast path must not leave a stale, colliding name
+// on disk forever.
+func TestEnsureComposeFile_ExistingUnnamespacedFileIsReconciledUnderOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// First materialize with NO override (the pre-existing, unnamespaced file).
+	setNodeDirOverrideForTest(t, "")
+	if err := ensureComposeFile(tmpDir, "vllm"); err != nil {
+		t.Fatalf("initial ensureComposeFile() error = %v", err)
+	}
+
+	// Now re-run against the SAME dir with an override active.
+	overrideDir := t.TempDir()
+	setNodeDirOverrideForTest(t, overrideDir)
+	if err := ensureComposeFile(tmpDir, "vllm"); err != nil {
+		t.Fatalf("ensureComposeFile() under override error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(tmpDir, "services", "vllm.yml"))
+	if err != nil {
+		t.Fatalf("read materialized file: %v", err)
+	}
+	want := "container_name: " + embeddedContainerName("vllm")
+	if !strings.Contains(string(got), want) {
+		t.Fatalf("existing file was not reconciled to the namespaced name: got %s, want it to contain %q", got, want)
+	}
+	if strings.Contains(string(got), "container_name: citadel-vllm\n") {
+		t.Fatalf("existing file still carries the stale unnamespaced container_name: %s", got)
+	}
+}
+
+// TestEnsureComposeFile_ExistingCatalogServiceFileUntouchedUnderOverride pins
+// the scope boundary from the OTHER direction: ensureComposeFile is also the
+// materialization choke point for non-embedded (e.g. catalog-installed)
+// manifest services, whose compose files author their own container_name.
+// The existing-file reconciliation must not touch (or refuse on) a file for
+// a service name that isn't in services.ServiceMap.
+func TestEnsureComposeFile_ExistingCatalogServiceFileUntouchedUnderOverride(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	tmpDir := t.TempDir()
+	servicesDir := filepath.Join(tmpDir, "services")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	const catalogContent = "services:\n  acme-app:\n    image: acme/app\n    container_name: acme-app\n"
+	if err := os.WriteFile(filepath.Join(servicesDir, "acme-app.yml"), []byte(catalogContent), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	setNodeDirOverrideForTest(t, t.TempDir())
+	if err := ensureComposeFile(tmpDir, "acme-app"); err != nil {
+		t.Fatalf("ensureComposeFile() for a non-embedded service under override must not error, got: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(servicesDir, "acme-app.yml"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != catalogContent {
+		t.Fatalf("a non-embedded service's compose file must be left untouched under --node-dir, got: %s", got)
+	}
+}
+
+// TestEnsureComposeFile_TwoDifferentOverrideDirsProduceDifferentContainerNames
+// is the end-to-end version of the same contract pinned at the unit level in
+// internal/compose/nodedir_test.go and cmd/nodedir_test.go: two operators
+// running against DIFFERENT --node-dir overrides never materialize a
+// colliding container_name for the same embedded service.
+func TestEnsureComposeFile_TwoDifferentOverrideDirsProduceDifferentContainerNames(t *testing.T) {
+	overrideA := t.TempDir()
+	overrideB := t.TempDir()
+	nodeDirA := t.TempDir()
+	nodeDirB := t.TempDir()
+
+	setNodeDirOverrideForTest(t, overrideA)
+	nameA := embeddedContainerName("vllm")
+	if err := ensureComposeFile(nodeDirA, "vllm"); err != nil {
+		t.Fatalf("ensureComposeFile(A) error = %v", err)
+	}
+	contentA, err := os.ReadFile(filepath.Join(nodeDirA, "services", "vllm.yml"))
+	if err != nil {
+		t.Fatalf("read A: %v", err)
+	}
+
+	setNodeDirOverrideForTest(t, overrideB)
+	nameB := embeddedContainerName("vllm")
+	if err := ensureComposeFile(nodeDirB, "vllm"); err != nil {
+		t.Fatalf("ensureComposeFile(B) error = %v", err)
+	}
+	contentB, err := os.ReadFile(filepath.Join(nodeDirB, "services", "vllm.yml"))
+	if err != nil {
+		t.Fatalf("read B: %v", err)
+	}
+
+	if nameA == nameB {
+		t.Fatalf("two different --node-dir overrides derived the SAME container name %q for vllm -- they would collide", nameA)
+	}
+	if !strings.Contains(string(contentA), "container_name: "+nameA) {
+		t.Fatalf("materialized file A does not contain the expected container_name %q: %s", nameA, contentA)
+	}
+	if !strings.Contains(string(contentB), "container_name: "+nameB) {
+		t.Fatalf("materialized file B does not contain the expected container_name %q: %s", nameB, contentB)
 	}
 }
 

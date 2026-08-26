@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
@@ -440,12 +441,25 @@ func containsTag(tags []string, tag string) bool {
 
 // ensureComposeFile ensures the compose file exists in the services directory.
 // If it doesn't exist, it extracts the embedded compose file from the binary.
+//
+// citadel#860: under an active --node-dir/CITADEL_NODE_DIR override, the
+// materialized file's `container_name: citadel-<serviceName>` line is
+// rewritten to the override-namespaced name embeddedContainerName derives
+// (citadel-<hash>-<serviceName>), so two override dirs materializing the same
+// service never collide on `up`. No override -> content is written/left
+// verbatim, byte-identical to pre-#860. This reconciliation runs on EVERY
+// call, not just first-write -- see ensureNamespacedContainerNameOnDisk for
+// why the "file already exists, leave it alone" fast path below cannot skip
+// it.
 func ensureComposeFile(configDir, serviceName string) error {
 	servicesDir := filepath.Join(configDir, "services")
 	destPath := filepath.Join(servicesDir, serviceName+".yml")
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
+		if err := ensureNamespacedContainerNameOnDisk(destPath, serviceName); err != nil {
+			return err
+		}
 		// Still ensure any build-context aux files exist (idempotent), so a
 		// build-based service like bonsai is startable even if its .yml was
 		// materialized by an older binary that predated WriteAuxFiles.
@@ -456,6 +470,21 @@ func ensureComposeFile(configDir, serviceName string) error {
 	content, ok := services.ServiceMap[serviceName]
 	if !ok {
 		return fmt.Errorf("unknown service: %s", serviceName)
+	}
+
+	// citadel#860: namespace container_name under an active override. Only
+	// EMBEDDED services (services.ServiceMap, confirmed above) are templated
+	// this way -- catalog/third-party modules author their own container_name
+	// and are out of scope (see cmd/nodedir.go's package doc). Shares
+	// compose.EnsureNamespacedContainerName with the existing-file branch
+	// above (not a second ad hoc rewrite) so both paths apply the identical
+	// rule.
+	if override := resolveNodeDirOverride(); override != "" {
+		rewritten, _, err := compose.EnsureNamespacedContainerName(content, serviceName, override)
+		if err != nil {
+			return fmt.Errorf("namespace container_name for %q under --node-dir override: %w", serviceName, err)
+		}
+		content = rewritten
 	}
 
 	// Ensure services directory exists
@@ -471,4 +500,55 @@ func ensureComposeFile(configDir, serviceName string) error {
 	// Materialize any build-context files the service needs (e.g. bonsai's
 	// Dockerfile), so `docker compose build` resolves on the node.
 	return services.WriteAuxFiles(servicesDir, serviceName)
+}
+
+// ensureNamespacedContainerNameOnDisk re-checks (and if needed rewrites) an
+// ALREADY-MATERIALIZED embedded compose file's container_name against the
+// active --node-dir/CITADEL_NODE_DIR override, if any.
+//
+// Without this, ensureComposeFile's "the .yml already exists, leave it alone"
+// fast path (the common case on any node that has run before) would leave a
+// file materialized BEFORE #860 shipped -- or materialized by this same
+// binary before an override was ever pointed at this dir -- carrying the
+// UNnamespaced `container_name: citadel-<svc>` forever. That's not just a
+// cosmetic drift from what embeddedContainerName now returns: a later
+// `citadel run`/`module start --node-dir <this dir>` would `up` that stale
+// file, and #856's compose "-p" project scoping only makes that "safe and
+// loud" (a cross-project container_name conflict) WHEN the real node's
+// citadel-<svc> container currently exists. If it's stopped/absent, the `up`
+// SUCCEEDS -- silently annexing the real node's global container name under
+// the override's compose project. Reconciling on every call closes that gap
+// (see compose.EnsureNamespacedContainerName's doc for the exact rule,
+// including its loud refusal on a hand-edited or differently-namespaced
+// file). A no-op, including the read, when no override is active.
+func ensureNamespacedContainerNameOnDisk(destPath, serviceName string) error {
+	override := resolveNodeDirOverride()
+	if override == "" {
+		return nil
+	}
+	// SCOPE (citadel#860's non-goal): ensureComposeFile is also the
+	// materialization choke point for manifest-declared, NON-embedded
+	// services (e.g. a catalog-installed module whose .yml already exists on
+	// disk) -- serviceIsKnown/knownServiceNames (cmd/run.go) accepts both. A
+	// catalog module authors its own container_name; it is not
+	// "citadel-<name>" by convention, so probing for that pattern would
+	// either false-negative-refuse (the loud error in
+	// compose.EnsureNamespacedContainerName) or, worse, coincidentally match
+	// and rewrite something this issue does not own. Only reconcile when
+	// serviceName is an actual services.ServiceMap entry.
+	if !isEmbeddedService(serviceName) {
+		return nil
+	}
+	existing, err := os.ReadFile(destPath)
+	if err != nil {
+		return fmt.Errorf("read materialized compose file for %q: %w", serviceName, err)
+	}
+	rewritten, changed, err := compose.EnsureNamespacedContainerName(string(existing), serviceName, override)
+	if err != nil {
+		return fmt.Errorf("namespace container_name for %q under --node-dir override: %w", serviceName, err)
+	}
+	if !changed {
+		return nil
+	}
+	return os.WriteFile(destPath, []byte(rewritten), 0600)
 }

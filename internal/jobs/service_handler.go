@@ -800,6 +800,25 @@ func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestServic
 // ensureEmbeddedComposeFile writes the embedded compose file for name into
 // ConfigDir/services/<name>.yml if it does not already exist. Mirrors
 // cmd.ensureComposeFile (kept here to avoid a jobs -> cmd import).
+//
+// citadel#860: under an active CITADEL_NODE_DIR override, the materialized
+// file's `container_name: citadel-<name>` line is rewritten to the
+// override-namespaced name (citadel-<hash>-<name>), matching
+// cmd.ensureComposeFile/cmd.embeddedContainerName -- both derive the name via
+// compose.ContainerName from the SAME override-directory string, so the two
+// materialization sites can never disagree. This reconciliation runs on
+// EVERY call, including when the .yml already exists (see
+// compose.EnsureNamespacedContainerName's doc for why the "already exists,
+// leave it alone" fast path cannot skip it -- a stale unnamespaced file left
+// in place is not just cosmetic drift, it's a `up` away from annexing the
+// real node's global container name under the override's compose project).
+// This package cannot see the --node-dir CLI flag (only cmd wires cobra
+// flags), only the env var -- today that's moot in practice: every current
+// constructor of ServiceHandler (cmd/work.go's runWork, cmd/hotswap.go) is
+// unreachable while an override is active, because runWork refuses
+// --node-dir/CITADEL_NODE_DIR outright before building any handlers (see
+// cmd/work.go). This check is a defensive mirror of cmd.ensureComposeFile
+// for when/if that refusal is ever narrowed to something override-compatible.
 func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	content, ok := embeddedservices.ServiceMap[name]
 	if !ok {
@@ -807,10 +826,33 @@ func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	}
 	servicesDir := filepath.Join(h.ConfigDir, "services")
 	destPath := filepath.Join(servicesDir, name+".yml")
+	override := strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))
 	if _, err := os.Stat(destPath); err == nil {
+		if override != "" {
+			existing, err := os.ReadFile(destPath)
+			if err != nil {
+				return fmt.Errorf("read materialized compose file for %q: %w", name, err)
+			}
+			rewritten, changed, err := compose.EnsureNamespacedContainerName(string(existing), name, override)
+			if err != nil {
+				return fmt.Errorf("namespace container_name for %q under CITADEL_NODE_DIR override: %w", name, err)
+			}
+			if changed {
+				if err := os.WriteFile(destPath, []byte(rewritten), 0600); err != nil {
+					return fmt.Errorf("failed to rewrite compose file: %w", err)
+				}
+			}
+		}
 		// Ensure build-context aux files exist even if the .yml was written by
 		// an older binary (idempotent no-op for image-based services).
 		return embeddedservices.WriteAuxFiles(servicesDir, name)
+	}
+	if override != "" {
+		rewritten, _, err := compose.EnsureNamespacedContainerName(content, name, override)
+		if err != nil {
+			return fmt.Errorf("namespace container_name for %q under CITADEL_NODE_DIR override: %w", name, err)
+		}
+		content = rewritten
 	}
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return fmt.Errorf("failed to create services directory: %w", err)
@@ -1027,8 +1069,25 @@ func (h *ServiceHandler) resolveKind(svc manifestService) string {
 	return "docker"
 }
 
+// embeddedContainerNameFor mirrors cmd.embeddedContainerName for this
+// package (citadel#860): "citadel-<svcName>" unchanged with no
+// CITADEL_NODE_DIR override active, or the override-namespaced
+// "citadel-<hash>-<svcName>" (compose.ContainerName, the SAME derivation
+// cmd.embeddedContainerName and ensureEmbeddedComposeFile use) when one is --
+// but ONLY for svcName values that are actually a services.ServiceMap entry.
+// A payload/instance service name (e.g. a claudecode instance, containerNamePrefix
+// in service_payload.go) is never in ServiceMap and keeps the plain
+// "citadel-<svcName>" convention unconditionally, matching that this
+// namespacing is scoped to EMBEDDED services only (citadel#860's non-goal).
+func embeddedContainerNameFor(svcName string) string {
+	if _, ok := embeddedservices.ServiceMap[svcName]; !ok {
+		return "citadel-" + svcName
+	}
+	return compose.ContainerName(svcName, strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR")))
+}
+
 func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
-	containerName := "citadel-" + svcName
+	containerName := embeddedContainerNameFor(svcName)
 	cmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
 	out, err := cmd.Output()
 	if err != nil {
@@ -1045,7 +1104,7 @@ func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
 // Docker. The empty return is what lets serviceStart detect the #415 failure
 // mode (a container that came up with NetworkSettings.Ports == {}).
 func (h *ServiceHandler) dockerServiceEndpoint(svcName string) string {
-	containerName := "citadel-" + svcName
+	containerName := embeddedContainerNameFor(svcName)
 	cmd := exec.Command("docker", "inspect",
 		"--format", "{{json .NetworkSettings.Ports}}", containerName)
 	out, err := cmd.Output()
