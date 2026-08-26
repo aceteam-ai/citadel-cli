@@ -90,6 +90,31 @@ type mcpBridge struct {
 	// (aceteam #8249 v1: module control, local inference, workspace files --
 	// see cmd/mcp_local.go). Populated once at startup by runMCP.
 	localTools []localMCPTool
+
+	// stdout is the JSON-RPC transport writer, captured ONCE at startup
+	// (runMCP) before any tool call can run. citadel#858: reading the live
+	// os.Stdout variable at write time (the pre-#858 behavior) is unsafe once
+	// callLocalToolWithTimeout can abandon a local tool call -- the abandoned
+	// goroutine can still be inside captureStdout, holding the process-wide
+	// os.Stdout variable redirected to ITS pipe, for as long as the
+	// underlying `docker compose` call keeps running. A response written via
+	// the live os.Stdout variable during that window would silently land in
+	// the orphan's pipe instead of reaching the client. Writing through this
+	// saved reference instead sidesteps that entirely: captureStdout swaps
+	// the *variable*, never the object this field already points at. Falls
+	// back to the live os.Stdout via bridgeStdout() when unset (every
+	// existing test constructs a bare &mcpBridge{} and relies on that).
+	stdout io.Writer
+}
+
+// bridgeStdout returns the JSON-RPC transport writer -- see the stdout
+// field's doc comment for why this must NOT simply read os.Stdout at write
+// time.
+func (b *mcpBridge) bridgeStdout() io.Writer {
+	if b.stdout != nil {
+		return b.stdout
+	}
+	return os.Stdout
 }
 
 func runMCP(cmd *cobra.Command, args []string) error {
@@ -144,6 +169,10 @@ func runMCP(cmd *cobra.Command, args []string) error {
 			Timeout: 120 * time.Second,
 		},
 		localTools: newLocalMCPTools(realLocalMCPDeps()),
+		// Captured HERE, before bridge.run() ever dispatches a tool call, so
+		// this is always the real transport -- never a captureStdout pipe.
+		// See the stdout field's doc comment.
+		stdout: os.Stdout,
 	}
 
 	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d", mcpServer, apiURL, len(bridge.localTools))
@@ -215,8 +244,8 @@ func (b *mcpBridge) run() error {
 				continue
 			}
 			// Write the raw response directly to stdout.
-			os.Stdout.Write(resp)
-			os.Stdout.Write([]byte("\n"))
+			b.bridgeStdout().Write(resp)
+			b.bridgeStdout().Write([]byte("\n"))
 		}
 	}
 
@@ -248,8 +277,8 @@ func (b *mcpBridge) handleInitialize(req *jsonRPCRequest) {
 	}
 
 	// Write the backend's response directly.
-	os.Stdout.Write(resp)
-	os.Stdout.Write([]byte("\n"))
+	b.bridgeStdout().Write(resp)
+	b.bridgeStdout().Write([]byte("\n"))
 }
 
 // writeLocalInitializeResult writes a self-contained initialize response with
@@ -373,7 +402,7 @@ func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
 	Debug("MCP: dispatching local tool %q", tool.Name)
 	ctx, cancel := context.WithTimeout(context.Background(), localToolCallTimeout)
 	defer cancel()
-	text, err := tool.Call(ctx, params.Arguments)
+	text, err := callLocalToolWithTimeout(ctx, tool, params.Arguments)
 
 	var result map[string]any
 	if err != nil {
@@ -396,6 +425,72 @@ func (b *mcpBridge) tryLocalToolsCall(req *jsonRPCRequest) bool {
 	}
 	b.writeResult(req.ID, resultBytes)
 	return true
+}
+
+// callLocalToolWithTimeout makes localToolCallTimeout actually bound a local
+// tool call, rather than merely decorating one. Handing tool.Call a context
+// with a deadline is not enough on its own: local_module_stop/start/restart's
+// underlying primitive (runModuleControl -> a synchronous `docker compose
+// up|down` exec.Cmd.Run(), see localToolCallTimeout's doc comment) has no
+// cancellation hook, so a caller that just awaited tool.Call(ctx, ...)
+// directly would still block on it regardless of ctx.Done() -- exactly the
+// bug this closes: a wedged module action used to stall the entire
+// single-threaded JSON-RPC loop (cmd/mcp_local.go's mcpBridge.run), not just
+// its own request.
+//
+// This mirrors the worker consume-loop watchdog's exact tradeoff
+// (internal/worker/deadline.go's executeWithDeadline): run the call in its
+// own goroutine and race it against ctx.Done(). On timeout this function
+// returns immediately with a timeout error and the JSON-RPC loop moves on to
+// the next request; the goroutine is NOT killed and keeps running the
+// (possibly still-synchronous, still-stdout-capturing) tool call to
+// completion in the background. That is an accepted, documented leak, not an
+// oversight -- see executeWithDeadline's comment for why a handler that
+// ignores cancellation makes this the only option short of threading real
+// cancellation into every call chain (out of scope here; see
+// localToolCallTimeout's own comment on why that's a separate, harder
+// follow-up for the module-control primitives specifically).
+//
+// Two consequences of the abandoned goroutine, both closed elsewhere -- read
+// this alongside those, don't assume this function alone makes timeout
+// handling safe:
+//   - The abandoned goroutine still holds captureStdout's os.Stdout
+//     redirection open until it finishes, so a SECOND local tool call
+//     dispatched while it's still running would otherwise race the same
+//     os.Stdout variable (the MCP stdio loop is otherwise single-threaded and
+//     synchronous -- see captureStdout's doc comment -- so this is the one
+//     place that invariant can be violated). captureStdout's
+//     stdoutCaptureInFlight guard closes this: it refuses to nest and returns
+//     a clear error instead of corrupting os.Stdout or blocking.
+//   - This function's own timeout error still has to reach the client, and it
+//     must NOT be written via a possibly-still-redirected os.Stdout. The
+//     caller (tryLocalToolsCall, via b.writeResult/writeError) writes through
+//     mcpBridge.stdout -- a reference captured once at startup, before any
+//     tool call could ever redirect the live os.Stdout variable -- so the
+//     timeout response reaches the real transport even while an orphaned
+//     goroutine elsewhere still has os.Stdout pointed at its own pipe. See
+//     the stdout field's doc comment on mcpBridge.
+func callLocalToolWithTimeout(ctx context.Context, tool localMCPTool, args json.RawMessage) (string, error) {
+	type callResult struct {
+		text string
+		err  error
+	}
+	// Buffered (size 1) so an abandoned goroutine that finishes after we've
+	// already given up on it can still send its result and exit, rather than
+	// leaking blocked on the channel send forever.
+	done := make(chan callResult, 1)
+	go func() {
+		text, err := tool.Call(ctx, args)
+		done <- callResult{text: text, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.text, r.err
+	case <-ctx.Done():
+		Debug("MCP: local tool %q timed out after %s (orphaned goroutine will finish in the background)", tool.Name, localToolCallTimeout)
+		return "", fmt.Errorf("local tool %s timed out after %s", tool.Name, localToolCallTimeout)
+	}
 }
 
 // forwardToBackend sends a JSON-RPC request to the AceTeam MCP backend
@@ -529,8 +624,8 @@ func (b *mcpBridge) writeResult(id json.RawMessage, result json.RawMessage) {
 		Debug("MCP: failed to marshal response: %v", err)
 		return
 	}
-	os.Stdout.Write(data)
-	os.Stdout.Write([]byte("\n"))
+	b.bridgeStdout().Write(data)
+	b.bridgeStdout().Write([]byte("\n"))
 }
 
 // writeError writes an error JSON-RPC response to stdout.
@@ -548,8 +643,8 @@ func (b *mcpBridge) writeError(id json.RawMessage, code int, message string) {
 		Debug("MCP: failed to marshal error response: %v", err)
 		return
 	}
-	os.Stdout.Write(data)
-	os.Stdout.Write([]byte("\n"))
+	b.bridgeStdout().Write(data)
+	b.bridgeStdout().Write([]byte("\n"))
 }
 
 // getAPIKeyFromConfig reads the device API token from the citadel config file.

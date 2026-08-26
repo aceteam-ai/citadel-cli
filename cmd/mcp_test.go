@@ -2,6 +2,8 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTruncate(t *testing.T) {
@@ -424,5 +427,163 @@ func TestParseSSEResponseEmpty(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "no JSON-RPC message found") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// ============================================================================
+// callLocalToolWithTimeout (citadel#858: make localToolCallTimeout real)
+// ============================================================================
+
+// TestCallLocalToolWithTimeoutAbandonsBlockedCall pins the core citadel#858
+// fix: a tool.Call that blocks past its deadline must not block the caller.
+// Before this fix, tryLocalToolsCall awaited tool.Call(ctx, ...) directly, so
+// a tool ignoring ctx (as local_module_stop/start/restart's underlying
+// primitive does -- see localToolCallTimeout's doc comment) would wedge the
+// entire single-threaded JSON-RPC loop, not just this one request.
+func TestCallLocalToolWithTimeoutAbandonsBlockedCall(t *testing.T) {
+	blockCh := make(chan struct{})
+	// Let the orphaned goroutine finish (this is the accepted leak the
+	// timeout intentionally does not prevent) so it doesn't outlive the test.
+	defer close(blockCh)
+
+	tool := localMCPTool{
+		Name: "test_blocking_tool",
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			<-blockCh // never returns before the test closes blockCh
+			return "finished-too-late", nil
+		},
+	}
+
+	const timeout = 30 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	start := time.Now()
+	text, err := callLocalToolWithTimeout(ctx, tool, nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %q, want it to mention timing out", err.Error())
+	}
+	if !strings.Contains(err.Error(), tool.Name) {
+		t.Errorf("error = %q, want it to name the tool %q", err.Error(), tool.Name)
+	}
+	if text != "" {
+		t.Errorf("text = %q, want empty on timeout", text)
+	}
+	// Generous bound: this should return at (roughly) the ctx deadline, not
+	// after blockCh is eventually closed by the deferred call above.
+	if elapsed > 2*time.Second {
+		t.Errorf("callLocalToolWithTimeout took %s to return, want it bounded by the %s deadline", elapsed, timeout)
+	}
+}
+
+// TestCallLocalToolWithTimeoutReturnsResultWhenFast is the control case: a
+// tool that finishes well within its deadline still returns its real result
+// and error, unaffected by the new goroutine/select wrapper.
+func TestCallLocalToolWithTimeoutReturnsResultWhenFast(t *testing.T) {
+	tool := localMCPTool{
+		Name: "test_fast_tool",
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return "ok", nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	text, err := callLocalToolWithTimeout(ctx, tool, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if text != "ok" {
+		t.Errorf("text = %q, want %q", text, "ok")
+	}
+}
+
+// TestCallLocalToolWithTimeoutPropagatesToolError confirms a tool's own
+// (non-timeout) error still passes through unchanged.
+func TestCallLocalToolWithTimeoutPropagatesToolError(t *testing.T) {
+	sentinel := fmt.Errorf("boom from tool")
+	tool := localMCPTool{
+		Name: "test_erroring_tool",
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return "", sentinel
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := callLocalToolWithTimeout(ctx, tool, nil)
+	if err == nil || !strings.Contains(err.Error(), "boom from tool") {
+		t.Errorf("err = %v, want it to wrap %v", err, sentinel)
+	}
+}
+
+// TestBridgeToolsCallTimeoutRespondsOnStableWriter is the bridge-level
+// regression test for the bug caught in citadel#858 review: a naive fix that
+// just raced tool.Call against ctx.Done() would return promptly, but
+// tryLocalToolsCall's subsequent b.writeResult/writeError call used to
+// resolve the live os.Stdout variable AT WRITE TIME -- and that variable can
+// still be pointed at the abandoned call's captureStdout pipe when the
+// timeout response is written, silently dropping it. mcpBridge.stdout (a
+// reference captured once at construction, before any tool call can ever
+// redirect os.Stdout) fixes that; this test proves the timeout response
+// actually reaches it instead of the live-at-write-time os.Stdout.
+//
+// This also exercises localToolCallTimeout as a real (short-overridden) var
+// end to end through tryLocalToolsCall, not just callLocalToolWithTimeout in
+// isolation.
+func TestBridgeToolsCallTimeoutRespondsOnStableWriter(t *testing.T) {
+	origTimeout := localToolCallTimeout
+	localToolCallTimeout = 30 * time.Millisecond
+	defer func() { localToolCallTimeout = origTimeout }()
+
+	blockCh := make(chan struct{})
+	defer close(blockCh) // let the orphaned goroutine finish; don't leak it past the test
+
+	var stdout bytes.Buffer
+	bridge := &mcpBridge{
+		stdout: &stdout,
+		localTools: []localMCPTool{
+			{
+				Name: "local_slow_tool",
+				Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+					<-blockCh
+					return "too-late", nil
+				},
+			},
+		},
+	}
+
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"local_slow_tool","arguments":{}}`),
+	}
+
+	handledCh := make(chan bool, 1)
+	go func() { handledCh <- bridge.tryLocalToolsCall(req) }()
+
+	select {
+	case handled := <-handledCh:
+		if !handled {
+			t.Fatal("expected tryLocalToolsCall to handle the local tool name")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("tryLocalToolsCall did not return promptly after the injected timeout")
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "timed out") {
+		t.Fatalf("expected the timeout response written to bridge.stdout, got: %q", out)
+	}
+	if !strings.Contains(out, `"isError":true`) {
+		t.Errorf("expected isError:true in the response, got: %q", out)
 	}
 }

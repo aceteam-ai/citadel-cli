@@ -36,6 +36,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
@@ -123,22 +124,41 @@ func findLocalTool(tools []localMCPTool, name string) (localMCPTool, bool) {
 	return localMCPTool{}, false
 }
 
-// localToolCallTimeout bounds how long a tool that OBSERVES a context may
-// run -- concretely, today, only local_chat's HTTP call
-// (deps.chatClient.ChatCompletion honors ctx). It does NOT bound
-// local_module_stop/start/restart: moduleControlFn's signature has no ctx
-// parameter, because the primitive it drives (runModuleControl ->
-// liveModuleOps.Start/Stop -> `docker compose up|down` via a synchronous
-// exec.Cmd.Run()) has no cancellation hook to wire one into, and threading a
-// context through it here would not actually bound the call -- the pipe swap
-// in captureStdout can only be undone by the subprocess itself exiting (see
-// its doc comment), so a "timeout" that let tool.Call return early would
-// leave os.Stdout redirected while runModuleControl kept running in the
-// background, corrupting every subsequent JSON-RPC response. An unbounded
-// module action (matching the worker's own unbounded tier for SERVICE_START
-// and friends -- see CLAUDE.md's "Consume-Loop Watchdog" section) is the
-// honest tradeoff, not a bug to silently paper over with an inert deadline.
-const localToolCallTimeout = 5 * time.Minute
+// localToolCallTimeout bounds how long tryLocalToolsCall (cmd/mcp.go) waits
+// on ANY local tool call before giving up on it and letting the JSON-RPC loop
+// move on -- see callLocalToolWithTimeout, which is what makes this real
+// rather than merely decorative (citadel #858; a prior version of this
+// comment documented the deadline as inert for module control because
+// tool.Call used to be awaited directly).
+//
+// What this bounds and what it doesn't, per tool:
+//   - local_chat: deps.chatClient.ChatCompletion also honors ctx directly, so
+//     on timeout the underlying HTTP request is ACTUALLY cancelled, not just
+//     abandoned.
+//   - local_module_stop/start/restart: moduleControlFn's signature has no ctx
+//     parameter, because the primitive it drives (runModuleControl ->
+//     liveModuleOps.Start/Stop -> `docker compose up|down` via a synchronous
+//     exec.Cmd.Run()) has no cancellation hook to wire one into. On timeout
+//     the CALLER still gets its response back promptly (callLocalToolWithTimeout
+//     races the call against ctx.Done() in a separate goroutine), but the
+//     underlying docker compose invocation is NOT killed -- it keeps running
+//     in the background, still holding captureStdout's os.Stdout redirection,
+//     until the subprocess itself exits (see captureStdout's doc comment for
+//     why that pipe swap can only be undone by the subprocess exiting). This
+//     is the SAME accepted-leak tradeoff as the worker consume-loop watchdog
+//     (internal/worker/deadline.go's executeWithDeadline) makes for legacy
+//     handlers that don't receive a context: the goroutine+select is what
+//     keeps the loop responsive; the orphaned call finishing on its own is
+//     the cost of that, not a bug to silently paper over. An unbounded
+//     module action (matching the worker's own unbounded tier for
+//     SERVICE_START and friends -- see CLAUDE.md's "Consume-Loop Watchdog"
+//     section) is the honest tradeoff underneath this timeout, not something
+//     the timeout pretends to fix.
+//
+// A package var (not a const) so tests can shorten it, mirroring the pattern
+// CLAUDE.md documents for internal/worker's swap-rate knobs ("tests need not
+// sleep an hour"); TestLocalToolCallTimeoutDefault pins the shipped value.
+var localToolCallTimeout = 5 * time.Minute
 
 // ============================================================================
 // Module control tools (#846 reuse)
@@ -560,11 +580,21 @@ func localListFilesCall(workspaceDir string, args json.RawMessage) (string, erro
 // (cmd/mcp.go), so anything that leaks onto it corrupts the protocol for the
 // rest of the session -- this is not a cosmetic concern.
 //
-// Safe to do here specifically because the MCP stdio loop (mcpBridge.run) is
+// Safe to do here because the MCP stdio loop (mcpBridge.run) is
 // single-threaded and fully synchronous: it reads one line, handles it
-// completely (including any local tool call), and only then reads the next.
-// Nothing else in a `citadel mcp` process writes to stdout concurrently, so
-// there is exactly one os.Stdout redirection in flight at a time.
+// completely, and only then reads the next -- so under normal operation there
+// is exactly one os.Stdout redirection in flight at a time. That invariant
+// stopped being automatic once citadel#858 gave local tool calls a REAL
+// timeout (callLocalToolWithTimeout, cmd/mcp.go): a call that blows its
+// deadline is abandoned, not killed, so its goroutine can still be in here,
+// holding os.Stdout redirected to its own pipe, when the loop moves on and
+// dispatches a SECOND local tool call. Two concurrent redirections stomping
+// on the same os.Stdout variable would corrupt it for good (whichever
+// finishes last "wins" the restore, and the loser's saved prevStdout was
+// never the real stdout). stdoutCaptureInFlight below closes that gap by
+// refusing to nest -- fail fast with a clear error instead of blocking (a
+// mutex here would just reintroduce the wedge #858 fixes) or silently
+// racing.
 //
 // The read side is drained by a background goroutine for the ENTIRE
 // redirection window (started before fn runs, read until EOF after the pipe
@@ -590,7 +620,22 @@ func localListFilesCall(workspaceDir string, args json.RawMessage) (string, erro
 // pipe swap can only be safely undone once fn (and everything it started
 // synchronously) has actually returned -- see localToolCallTimeout's comment
 // for why this specifically affects the module-control tools.
-func captureStdout(fn func() error) (string, error) {
+// stdoutCaptureInFlight is the nesting guard described in captureStdout's
+// doc comment. It is released only once os.Stdout has actually been fully
+// restored (registered before the restore defer below, so LIFO ordering runs
+// it last), so a new capture can never start while a previous one -- even an
+// abandoned, still-running one -- is mid-redirection.
+var stdoutCaptureInFlight atomic.Bool
+
+func captureStdout(fn func() error) (out string, err error) {
+	if !stdoutCaptureInFlight.CompareAndSwap(false, true) {
+		return "", fmt.Errorf(
+			"mcp: another local tool's stdout capture is still in progress " +
+				"(a previous module-control call likely timed out and is still " +
+				"finishing in the background); try again shortly")
+	}
+	defer stdoutCaptureInFlight.Store(false)
+
 	r, w, perr := os.Pipe()
 	if perr != nil {
 		// Fail closed: never call fn with the real os.Stdout still wired in, or
@@ -607,12 +652,27 @@ func captureStdout(fn func() error) (string, error) {
 		outCh <- data
 	}()
 
-	fnErr := fn()
+	// Deferred so the restore (and the paired pipe-close/drain-wait cleanup)
+	// runs on EVERY exit path, including a panic inside fn -- not just the
+	// normal return this used to rely on. A panic here still propagates (this
+	// does not recover), so a wedge in fn still crashes the process rather
+	// than silently continuing with corrupted JSON-RPC framing (see this
+	// function's doc comment on "fail closed"); the defer only guarantees
+	// os.Stdout points back at the real transport before that happens, so a
+	// recover()ing caller (or a panic that unwinds further before the process
+	// exits) never observes a still-redirected os.Stdout.
+	//
+	// Order matters for the no-deadlock guarantee documented above: restore
+	// os.Stdout, THEN close w (which is what lets the reader goroutine's
+	// io.ReadAll observe EOF and return), THEN wait for it to actually send on
+	// outCh before closing r.
+	defer func() {
+		os.Stdout = prevStdout
+		_ = w.Close()
+		out = string(<-outCh)
+		_ = r.Close()
+	}()
 
-	os.Stdout = prevStdout
-	_ = w.Close()
-	captured := <-outCh
-	_ = r.Close()
-
-	return string(captured), fnErr
+	err = fn()
+	return
 }
