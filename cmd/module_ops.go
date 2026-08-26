@@ -62,6 +62,13 @@ func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
 	provider := reconcile.NewProtoProvider(client, client, nodeID, Version)
 	rec := reconcile.NewReconciler(provider, newLiveModuleOps(log), nodeID)
 	rec.RefuseFullWipe = true
+	// Replace the default silent tracker with one that actually prints
+	// (citadel-cli#742): loud once on refused<->ok transitions, a periodic
+	// summary while a refusal persists -- see reconcile.HealthTracker's doc
+	// for why this replaces the old "identical WARN every pass" behavior.
+	rec.Health = reconcile.NewHealthTracker(func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "   - "+format+"\n", args...)
+	})
 	return reconcile.NewLoop(reconcile.Config{Enabled: true, Node: nodeID}, rec)
 }
 

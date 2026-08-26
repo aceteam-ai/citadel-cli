@@ -22,20 +22,21 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
-	nodeName       string
-	configDir      string
-	services       []ServiceConfig
-	startTime      time.Time
-	modelDiscovery *ModelDiscovery
-	capabilities   *NodeCapabilities      // cached capabilities (set once at startup)
-	workerLiveness func() *WorkerLiveness // live worker consume-loop liveness (issue #548), optional
-	swapStats      func() *SwapActivity   // live model-hotswap activity (citadel #717), optional
-	idleTracker    *IdleTracker           // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
-	fpIdleTracker  *FootprintIdleTracker  // footprint-derived idle for engines #416 can't scrape (citadel #421)
-	netIdleTracker *IdleTracker           // network-activity idle for non-vLLM services (citadel #433)
-	reqLog         *requestLog            // node-routed request log, every engine (citadel #691)
-	pinnedServices map[string]bool        // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
-	modelHotswap   bool                   // advertise installed-vs-resident models (citadel #632)
+	nodeName        string
+	configDir       string
+	services        []ServiceConfig
+	startTime       time.Time
+	modelDiscovery  *ModelDiscovery
+	capabilities    *NodeCapabilities       // cached capabilities (set once at startup)
+	workerLiveness  func() *WorkerLiveness  // live worker consume-loop liveness (issue #548), optional
+	swapStats       func() *SwapActivity    // live model-hotswap activity (citadel #717), optional
+	reconcileHealth func() *ReconcileHealth // live full-wipe-guard refusal state (citadel #742), optional
+	idleTracker     *IdleTracker            // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker   *FootprintIdleTracker   // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker  *IdleTracker            // network-activity idle for non-vLLM services (citadel #433)
+	reqLog          *requestLog             // node-routed request log, every engine (citadel #691)
+	pinnedServices  map[string]bool         // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
+	modelHotswap    bool                    // advertise installed-vs-resident models (citadel #632)
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -61,6 +62,14 @@ type CollectorConfig struct {
 	// (citadel #717). Optional: nil when no swap manager is wired (hotswap off,
 	// no config dir, or a legacy build).
 	SwapStats func() *SwapActivity
+	// ReconcileHealth, when set, returns the live full-wipe-guard refusal
+	// state (citadel #742) so a node whose reconcile pass is stuck refused
+	// shows up on the heartbeat instead of only in a log line. Optional: nil
+	// when no reconcile loop is wired (pull reconcile disabled, or a legacy
+	// build). The provider itself decides presence -- returning nil when not
+	// currently refused is what keeps NodeStatus.Reconcile omitted for the
+	// healthy/common case; Collect() attaches whatever it returns unconditionally.
+	ReconcileHealth func() *ReconcileHealth
 	// PinnedServices is the node's pinned_services allowlist (citadel #577). Each
 	// running service whose name is listed is marked ServiceInfo.Pinned=true so
 	// the heartbeat and `citadel services` show pinned vs preemptible. Optional.
@@ -76,20 +85,21 @@ type CollectorConfig struct {
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
-		nodeName:       cfg.NodeName,
-		configDir:      cfg.ConfigDir,
-		services:       cfg.Services,
-		startTime:      time.Now(),
-		modelDiscovery: NewModelDiscovery(),
-		capabilities:   cfg.Capabilities,
-		workerLiveness: cfg.WorkerLiveness,
-		swapStats:      cfg.SwapStats,
-		idleTracker:    NewIdleTracker(IdleThresholdSeconds()),
-		fpIdleTracker:  NewFootprintIdleTracker(),
-		netIdleTracker: NewIdleTracker(IdleThresholdSeconds()),
-		reqLog:         nodeRequestLog,
-		pinnedServices: toStringSet(cfg.PinnedServices),
-		modelHotswap:   cfg.ModelHotswap,
+		nodeName:        cfg.NodeName,
+		configDir:       cfg.ConfigDir,
+		services:        cfg.Services,
+		startTime:       time.Now(),
+		modelDiscovery:  NewModelDiscovery(),
+		capabilities:    cfg.Capabilities,
+		workerLiveness:  cfg.WorkerLiveness,
+		swapStats:       cfg.SwapStats,
+		reconcileHealth: cfg.ReconcileHealth,
+		idleTracker:     NewIdleTracker(IdleThresholdSeconds()),
+		fpIdleTracker:   NewFootprintIdleTracker(),
+		netIdleTracker:  NewIdleTracker(IdleThresholdSeconds()),
+		reqLog:          nodeRequestLog,
+		pinnedServices:  toStringSet(cfg.PinnedServices),
+		modelHotswap:    cfg.ModelHotswap,
 	}
 }
 
@@ -393,6 +403,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// swap manager wired) leaves the field omitted exactly as before this change.
 	if c.swapStats != nil {
 		status.Swap = c.swapStats()
+	}
+
+	// Attach the full-wipe-guard refusal state, when refused (citadel #742).
+	// The provider itself returns nil while healthy/never-refused, so this
+	// assignment is a no-op (status.Reconcile stays nil -> omitted) for the
+	// common case.
+	if c.reconcileHealth != nil {
+		status.Reconcile = c.reconcileHealth()
 	}
 
 	return status, nil

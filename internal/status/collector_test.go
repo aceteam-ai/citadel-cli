@@ -223,3 +223,55 @@ func TestCollectorSwapActivity(t *testing.T) {
 		t.Errorf("Swap = %+v, want nil (omitted) when no provider set", st2.Swap)
 	}
 }
+
+// TestCollectorReconcileHealth verifies the citadel-cli#742 heartbeat
+// attachment: when the ReconcileHealth provider is set AND currently
+// reports a refusal, Collect() attaches it; when the provider is unset, OR
+// set but reporting the healthy/never-refused state, the field is omitted --
+// the deliberate asymmetry with WorkerLiveness/SwapActivity above (which are
+// always attached once wired, healthy or not): NodeStatus.Reconcile is
+// present ONLY for the alarm, so a healthy node's payload -- with or without
+// a reconcile loop running at all -- stays unchanged.
+func TestCollectorReconcileHealth(t *testing.T) {
+	since := time.Now().Add(-30 * time.Minute)
+	withRefusal := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		ReconcileHealth: func() *ReconcileHealth {
+			return &ReconcileHealth{Refused: true, Reason: "refusing empty desired state", Since: since, Count: 6}
+		},
+	})
+	st, err := withRefusal.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st.Reconcile == nil {
+		t.Fatal("Reconcile health not attached when provider reported a refusal")
+	}
+	if !st.Reconcile.Refused || st.Reconcile.Count != 6 || st.Reconcile.Reason == "" {
+		t.Errorf("Reconcile = %+v, want refused=true count=6 with a reason", st.Reconcile)
+	}
+
+	// Provider wired but currently healthy (returns nil): must stay omitted.
+	healthy := NewCollector(CollectorConfig{
+		NodeName:        "test-node",
+		ReconcileHealth: func() *ReconcileHealth { return nil },
+	})
+	stHealthy, err := healthy.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if stHealthy.Reconcile != nil {
+		t.Errorf("Reconcile = %+v, want nil (omitted) when the provider reports healthy", stHealthy.Reconcile)
+	}
+
+	// No provider at all (no reconcile loop wired): must stay omitted, same
+	// payload shape as every node predating this field.
+	without := NewCollector(CollectorConfig{NodeName: "test-node"})
+	st2, err := without.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st2.Reconcile != nil {
+		t.Errorf("Reconcile = %+v, want nil (omitted) when no provider set", st2.Reconcile)
+	}
+}

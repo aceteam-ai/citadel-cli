@@ -45,6 +45,19 @@ type NodeStatus struct {
 	// (model hotswap disabled via CITADEL_MODEL_HOTSWAP, no config dir, or a
 	// legacy build).
 	Swap *SwapActivity `json:"swap,omitempty"`
+	// Reconcile carries the queryable full-wipe-guard refusal state
+	// (citadel-cli#742): a node whose desired-state reconcile pass is being
+	// refused by the full-wipe guard (internal/reconcile.Reconciler.
+	// RefuseFullWipe) looks green on every other signal -- it heartbeats fine,
+	// it just silently stopped converging module state -- so this field is the
+	// alarm. Unlike Worker/Swap above (present whenever their subsystem is
+	// wired, healthy or not), this is present ONLY while a refusal is
+	// currently active; omitted the rest of the time, including on a node that
+	// has never hit the guard, so this addition changes no existing heartbeat
+	// payload until a node actually enters the refused state. See
+	// internal/reconcile.HealthTracker for the throttled-logging half of the
+	// same fix, and reconcileHealthFrom (cmd/work.go) for the conversion.
+	Reconcile *ReconcileHealth `json:"reconcile,omitempty"`
 }
 
 // WorkerLiveness is the heartbeat-facing view of the job consume loop. It is the
@@ -148,6 +161,31 @@ type SwapRecord struct {
 	// Outcome is one of the swap outcome values: "ready", "warming", "failed",
 	// "blocked", "rate_limited".
 	Outcome string `json:"outcome"`
+}
+
+// ReconcileHealth is the heartbeat-facing mirror of reconcile.HealthState
+// (citadel-cli#742). Unlike SwapActivity above, this mirror is not forced by
+// an import cycle -- internal/status could import internal/reconcile without
+// one -- it follows the same hand-maintained-mirror-plus-conversion
+// convention as a deliberate choice, keeping this package's heartbeat types
+// free of a dependency on the reconcile engine's own types. The conversion is
+// reconcileHealthFrom in cmd/work.go, and the "HealthState/ReconcileHealth"
+// subtest of TestSwapShapeParity (cmd/work_test.go) keeps the two struct
+// shapes from silently drifting apart.
+//
+// Present on NodeStatus ONLY while Refused is true (see NodeStatus.Reconcile's
+// doc); every field here is therefore non-zero whenever this struct is
+// reachable at all.
+type ReconcileHealth struct {
+	// Refused is always true when this block is present.
+	Refused bool `json:"refused"`
+	// Reason is the full-wipe guard's error text for the CURRENT (most
+	// recent) refused pass.
+	Reason string `json:"reason,omitempty"`
+	// Since is when the refused streak began (the false->true transition).
+	Since time.Time `json:"since,omitempty"`
+	// Count is the number of consecutive refused passes since Since.
+	Count int `json:"count,omitempty"`
 }
 
 // AppInfo contains information about an installed catalog app.

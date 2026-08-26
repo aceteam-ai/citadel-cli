@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -350,6 +351,54 @@ func TestSwapShapeParity(t *testing.T) {
 			reflect.TypeOf(worker.SwapStats{}),
 			reflect.TypeOf(status.SwapActivity{}))
 	})
+	t.Run("HealthState/ReconcileHealth", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(reconcile.HealthState{}),
+			reflect.TypeOf(status.ReconcileHealth{}))
+	})
+}
+
+// TestReconcileHealthFrom pins the hand-maintained projection from
+// reconcile.HealthState onto the heartbeat-facing status.ReconcileHealth
+// (citadel-cli#742), mirroring TestSwapStatsFrom's coverage intent above: a
+// field-by-field mapping between two independently-evolving structs is
+// exactly what silently loses a field, so it gets its own test.
+//
+// This also pins the deliberate asymmetry with workerLivenessFrom/
+// swapStatsFrom: those are unconditionally non-nil once their subsystem is
+// wired; reconcileHealthFrom returns nil whenever NOT currently refused, so
+// the heartbeat field is omitted for the common (healthy) case instead of
+// always present with Refused=false.
+func TestReconcileHealthFrom(t *testing.T) {
+	// Healthy / never-refused: nil in, nil out -- NodeStatus.Reconcile must
+	// stay omitted, not become a present-but-false block.
+	if got := reconcileHealthFrom(reconcile.HealthState{}); got != nil {
+		t.Errorf("reconcileHealthFrom(zero value) = %+v, want nil (no change to the healthy heartbeat payload)", got)
+	}
+
+	since := time.Now().Add(-90 * time.Minute)
+	refused := reconcile.HealthState{
+		Refused: true,
+		Reason:  "reconcile: refused full wipe: refusing empty desired state with 3 module(s) installed",
+		Since:   since,
+		Count:   17,
+	}
+	got := reconcileHealthFrom(refused)
+	if got == nil {
+		t.Fatal("reconcileHealthFrom(refused) returned nil, want a populated block")
+	}
+	if !got.Refused {
+		t.Error("Refused should be true when the source state is refused")
+	}
+	if got.Reason != refused.Reason {
+		t.Errorf("Reason = %q, want %q", got.Reason, refused.Reason)
+	}
+	if !got.Since.Equal(since) {
+		t.Errorf("Since = %v, want %v", got.Since, since)
+	}
+	if got.Count != 17 {
+		t.Errorf("Count = %d, want 17", got.Count)
+	}
 }
 
 // jsonFieldNames returns the set of JSON field names a struct type encodes

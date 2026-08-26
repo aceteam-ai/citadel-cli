@@ -70,18 +70,37 @@ type Reconciler struct {
 	// live wiring sets it true; it is off in the zero value so existing engine
 	// tests keep the raw authoritative semantics.
 	RefuseFullWipe bool
+
+	// Health tracks the full-wipe-guard refusal state across passes
+	// (citadel-cli#742): ReconcileOnce reports every pass outcome to it via
+	// Observe, so the throttled-log + queryable-state behavior applies
+	// uniformly to the periodic Loop, a one-shot push-nudge (HandleReconcileJob),
+	// and direct test calls alike -- there is exactly one call site
+	// (ReconcileOnce) feeding it. Always non-nil after NewReconciler; safe to
+	// call on a zero-value Reconciler too (Observe/State are nil-receiver-safe).
+	Health *HealthTracker
 }
 
-// NewReconciler builds a Reconciler.
+// NewReconciler builds a Reconciler with a default (silent) HealthTracker.
+// Callers that want the throttled log to actually print (e.g. the live
+// worker path) should replace Health with reconcile.NewHealthTracker(logf)
+// after construction.
 func NewReconciler(p DesiredStateProvider, ops ModuleOps, node string) *Reconciler {
-	return &Reconciler{Provider: p, Ops: ops, Node: node}
+	return &Reconciler{Provider: p, Ops: ops, Node: node, Health: NewHealthTracker(nil)}
 }
 
 // ReconcileOnce performs a single end-to-end pass. It returns the plan that was
 // applied and the apply result. Per-module failures are inside ApplyResult (and
 // reported back as Health == HealthError); a returned error is reserved for
 // pass-level failures (fetch failed, list failed, context cancelled).
-func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, error) {
+func (r *Reconciler) ReconcileOnce(ctx context.Context) (plan Plan, applyRes ApplyResult, err error) {
+	// Report every pass outcome to Health (citadel-cli#742), regardless of
+	// which return path below fires. A deferred func (rather than a call at
+	// each return) is what makes this unconditional without touching every
+	// return statement, and it is safe to read the named returns here: Go
+	// assigns them before running deferred funcs.
+	defer func() { r.Health.Observe(err) }()
+
 	desired, err := r.Provider.Fetch(ctx)
 	if err != nil {
 		return Plan{}, ApplyResult{}, err
@@ -121,8 +140,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 	// OBSERVING (#733): both situations still report the observed actual state.
 	emptyWithModulesInstalled := r.RefuseFullWipe && len(desired.Modules) == 0 && len(actual) > 0
 	if emptyWithModulesInstalled && !desired.NeverManaged() {
+		// %w wraps ErrFullWipeRefused (citadel-cli#742) so callers can identify
+		// a guard refusal via errors.Is instead of matching this message text;
+		// the message itself is unchanged (TestRefuseFullWipeBlocksEmptyDesiredWithInstalled
+		// still substring-matches "refusing empty desired state").
 		guardErr := fmt.Errorf(
-			"reconcile: refusing empty desired state with %d module(s) installed (possible control-plane misconfiguration)", len(actual))
+			"%w: refusing empty desired state with %d module(s) installed (possible control-plane misconfiguration)", ErrFullWipeRefused, len(actual))
 		// Report the state the guard OBSERVED (no re-listing: `actual` is that
 		// state, and a re-list would repeat a per-module container inspection
 		// sweep on every refused pass).
@@ -136,8 +159,6 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (Plan, ApplyResult, erro
 		return Plan{}, ApplyResult{}, errors.Join(guardErr, reportErr)
 	}
 
-	var plan Plan
-	var applyRes ApplyResult
 	if !emptyWithModulesInstalled {
 		plan, err = Reconcile(ctx, desired, actual)
 		if err != nil {
@@ -197,6 +218,19 @@ func NewLoop(cfg Config, rec *Reconciler) *Loop {
 		nudg: make(chan struct{}, 1),
 		now:  time.Now,
 	}
+}
+
+// Health returns the underlying Reconciler's HealthTracker (citadel-cli#742),
+// so a caller wiring the heartbeat (cmd/work.go) can read the queryable
+// full-wipe-guard state without reaching into the unexported rec field. Nil
+// when the Loop was built with a nil Reconciler (e.g. NewLoop(cfg, nil) in
+// tests); State()/Observe() on a nil *HealthTracker are themselves no-ops, so
+// callers do not need to nil-check the result before calling State().
+func (l *Loop) Health() *HealthTracker {
+	if l == nil || l.rec == nil {
+		return nil
+	}
+	return l.rec.Health
 }
 
 // Nudge requests an immediate reconcile pass. It is non-blocking and coalescing:
