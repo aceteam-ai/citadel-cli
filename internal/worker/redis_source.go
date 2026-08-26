@@ -233,7 +233,7 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 	}
 
 	// Check delivery count for DLQ handling
-	deliveryCount, _ := s.client.GetDeliveryCount(ctx, redisJob.MessageID)
+	deliveryCount, deliveryCountErr := s.client.GetDeliveryCount(ctx, redisJob.MessageID)
 	if int(deliveryCount) >= s.client.MaxAttempts() {
 		s.log("warning", "   - Job %s exceeded max attempts (%d), moving to DLQ",
 			redisJob.JobID, s.client.MaxAttempts())
@@ -246,6 +246,27 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 
 	job := s.convertJob(redisJob)
 	job.SourceQueue = queue
+	// Delivery-count signal for the runner's Nack-vs-terminal-publish decision
+	// (issue #826): this is the ONLY source that can see a real per-message
+	// Redis delivery count, so it is the only one that populates it. See
+	// runner.go's willRetry for how this is consumed.
+	//
+	// Only populated when the lookup actually succeeded. GetDeliveryCount
+	// returns (0, nil) on "no pending entry found" AND (0, non-nil) on a real
+	// XPENDING error, and those two zeros are indistinguishable here. Before
+	// this field existed, a spurious 0 from a lookup error was harmless (it
+	// only affected the DLQ check above, which fails open toward processing).
+	// Populating Metadata on THAT same zero would make willRetry read a
+	// lookup error as "attempt 1 of N, definitely more retries coming" and
+	// suppress the terminal-error publish even on a job's actual final
+	// attempt -- reintroducing the #559 symptom (backend waits on a stream
+	// event that never arrives) via a transient Redis error rather than a
+	// bug. Leaving MaxAttempts at its zero value on error routes through
+	// willRetry's own "no signal, don't guess" fallback instead.
+	if deliveryCountErr == nil {
+		job.Metadata.Attempts = int(deliveryCount)
+		job.Metadata.MaxAttempts = s.client.MaxAttempts()
+	}
 	return job, nil
 }
 
@@ -261,7 +282,7 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 	}
 
 	// Check delivery count for DLQ handling
-	deliveryCount, _ := s.client.GetDeliveryCountOnQueue(ctx, sourceQueue, redisJob.MessageID)
+	deliveryCount, deliveryCountErr := s.client.GetDeliveryCountOnQueue(ctx, sourceQueue, redisJob.MessageID)
 	if int(deliveryCount) >= s.client.MaxAttempts() {
 		s.log("warning", "   - Job %s exceeded max attempts (%d), moving to DLQ",
 			redisJob.JobID, s.client.MaxAttempts())
@@ -274,6 +295,12 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 
 	job := s.convertJob(redisJob)
 	job.SourceQueue = sourceQueue
+	// See nextSingle's comment: same delivery-count signal (and the same
+	// "only populate on a successful lookup" guard), multi-queue path.
+	if deliveryCountErr == nil {
+		job.Metadata.Attempts = int(deliveryCount)
+		job.Metadata.MaxAttempts = s.client.MaxAttempts()
+	}
 	return job, nil
 }
 

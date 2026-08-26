@@ -511,9 +511,6 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		}
 		r.log("error", "Job %s failed (%v): %v", job.ID, duration, actualErr)
 		r.recordJob(buildUsageRecord(job, "failed", startTime, endTime, result, actualErr))
-		if werr := stream.WriteError(actualErr, false); werr != nil {
-			r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
-		}
 
 		// A watchdog abandon (deadline exceeded) is terminal, not a transient
 		// failure: the handler goroutine is orphaned and still running, so
@@ -533,7 +530,28 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		// overlap window is bounded. We prefer this to permanently leaking the slot
 		// (which would slowly exhaust GPU capacity across repeated abandons).
 		var deadlineErr *deadlineExceededError
-		if errors.As(actualErr, &deadlineErr) {
+		isDeadlineExceeded := errors.As(actualErr, &deadlineErr)
+
+		// Exactly one terminal event per job id (issue #826). A generic failure
+		// that will be retried (Nack path, another attempt still within budget)
+		// must NOT publish a terminal "error" here -- if the retry then
+		// succeeds, processJob reaches the success path below and publishes an
+		// "end" on the SAME stream:v1:{jobId}, so publishing here too would
+		// double-report (error, then end) for a job that ultimately succeeded.
+		// A deadline-exceeded abandon is always terminal (Fail, never retried
+		// by this node), so it always publishes. A generic failure that will
+		// NOT be retried -- the final attempt, per willRetry's delivery-count
+		// signal, or no signal available at all (see willRetry) -- also
+		// publishes, so a job that exhausts its retries still reports failure
+		// exactly once. Mirrors the reasoning #822/#559 already applied to the
+		// JobStatusRetry and no-GPU-slot Nack paths below/above.
+		if isDeadlineExceeded || !willRetry(job) {
+			if werr := stream.WriteError(actualErr, false); werr != nil {
+				r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
+			}
+		}
+
+		if isDeadlineExceeded {
 			r.source.Fail(ctx, job, actualErr, map[string]any{
 				"deadline_exceeded":  true,
 				"deadline_seconds":   deadlineErr.timeout.Seconds(),
@@ -577,6 +595,35 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		r.log("warning", "Failed to publish terminal end event for job %s: %v", job.ID, werr)
 	}
 	r.source.Ack(ctx, job)
+}
+
+// willRetry reports whether processJob's generic-failure Nack (issue #826)
+// will actually be redelivered to a handler again, so the pre-Nack terminal
+// "error" publish in processJob can be skipped for a job that has not yet
+// exhausted its attempts.
+//
+// The signal is job.Metadata.Attempts/MaxAttempts, populated ONLY by
+// RedisSource (internal/worker/redis_source.go's nextSingle/nextMulti) from
+// the real per-message Redis delivery count -- the same count RedisSource
+// itself uses to decide whether to hand the job to processJob at all versus
+// silently moving it straight to the DLQ. Attempts is this dispatch's
+// delivery count (1-indexed, matching Redis XPENDING's RetryCount): a further
+// attempt will be dispatched iff the NEXT delivery count (Attempts+1) is
+// still under MaxAttempts.
+//
+// MaxAttempts == 0 means "no signal" -- APISource (the default production
+// path per CLAUDE.md; the AceTeam Redis API proxy does not expose a
+// per-message delivery count to the node) and any job without populated
+// metadata (e.g. a test job). Read as "retry status unknown", not "will not
+// retry": in that case we deliberately return false (do not suppress the
+// publish), preserving the exact pre-#826 behavior of always publishing a
+// terminal error on a generic failure, rather than guessing this is the
+// final attempt when it might not be.
+func willRetry(job *Job) bool {
+	if job == nil || job.Metadata.MaxAttempts <= 0 {
+		return false
+	}
+	return job.Metadata.Attempts+1 < job.Metadata.MaxAttempts
 }
 
 // failUnsupportedJobType terminally fails a job whose type has no registered
