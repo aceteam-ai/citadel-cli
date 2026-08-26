@@ -338,11 +338,12 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 // CitadelManifest represents the citadel.yaml configuration file.
 //
 // It mirrors every field cmd/manifest.go's CitadelManifest models (org_id,
-// capabilities, per-service type/port/desired_status): updateManifest
-// round-trips the whole document through this struct, so any field missing
-// here would be silently DROPPED from citadel.yaml on every
-// APPLY_DEVICE_CONFIG (#528). Capabilities is kept as a raw yaml.Node so its
-// structure survives without duplicating cmd's types (a VALUE node, not
+// capabilities, pinned_services, per-service type/port/desired_status):
+// updateManifest round-trips the whole document through this struct, so any
+// field missing here would be silently DROPPED from citadel.yaml on every
+// APPLY_DEVICE_CONFIG (#528; pinned_services itself was exactly this failure
+// mode until #850 added it here). Capabilities is kept as a raw yaml.Node so
+// its structure survives without duplicating cmd's types (a VALUE node, not
 // *yaml.Node: yaml.v3 does not populate pointer-to-Node fields on decode, so a
 // pointer would silently drop the section again).
 type CitadelManifest struct {
@@ -354,6 +355,12 @@ type CitadelManifest struct {
 	Services     []ManifestService `yaml:"services,omitempty"`
 	Config       ManifestConfig    `yaml:"config,omitempty"`
 	Capabilities yaml.Node         `yaml:"capabilities,omitempty"`
+	// PinnedServices is the node-wide preemption allowlist (citadel-cli#577),
+	// mirroring cmd/manifest.go CitadelManifest.PinnedServices. Missing here
+	// until #850: APPLY_DEVICE_CONFIG silently dropped a node's pins on every
+	// device-config apply, since this struct is what updateManifest round-trips
+	// the whole citadel.yaml through.
+	PinnedServices []string `yaml:"pinned_services,omitempty"`
 }
 
 // ManifestService represents a service entry in the manifest. DesiredStatus is
