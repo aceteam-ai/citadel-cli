@@ -241,9 +241,31 @@ func startService(serviceName, composeFilePath string) error {
 	composeCmd.Env = composeEnv()
 	output, err = composeCmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s compose failed: %s", rt.Bin, string(output))
+		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
 	return nil
+}
+
+// composeFailureMessage formats a `docker compose up` failure, appending a
+// recovery hint when the failure is the guarded ${CITADEL_*_HOST_PORT:?...}
+// interpolation error (citadel#854): several embedded compose files
+// (vllm/llamacpp/extraction/diffusers/bonsai) refuse to interpolate without a
+// citadel-injected env var, so a hand-run 'docker compose up' outside citadel
+// fails with exactly this message. citadel's own start paths (this function,
+// and everything that funnels through it -- 'citadel run', 'citadel module
+// start/restart', MODULE_SET) already supply these vars via composeEnv(); the
+// hint redirects an operator who hit this from a manual docker invocation
+// back to the supported path instead of hand-crafting the missing var.
+func composeFailureMessage(serviceName string, output []byte) string {
+	msg := strings.TrimSpace(string(output))
+	if !strings.Contains(msg, "citadel must supply") {
+		return msg
+	}
+	return fmt.Sprintf(
+		"%s\n   Hint: this compose file needs a citadel-injected env var (e.g. a host port) that a "+
+			"hand-run 'docker compose' does not supply. Use 'citadel module start %s' (or 'citadel run "+
+			"%s') instead -- citadel supplies these automatically.",
+		msg, serviceName, serviceName)
 }
 
 // composeFileArgs returns the ordered "-f <file>" arguments for a docker compose

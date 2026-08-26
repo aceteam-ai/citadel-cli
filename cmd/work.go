@@ -327,6 +327,24 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 func runWork(cmd *cobra.Command, args []string) {
+	// citadel#853: --node-dir/CITADEL_NODE_DIR redirects manifest resolution
+	// but NOT the module lockfile (catalog.LockfilePath, still hardcoded to
+	// platform.ConfigDir()). liveModuleOps.Install/Uninstall -- the reconcile
+	// loop's and MODULE_SET's apply path, both driven from inside this
+	// long-running process -- write BOTH. Refusing per-job there would just
+	// turn into a silently-dark node (an infinite converge failure that reads
+	// like a CLI usage error); fail loudly ONCE at boot instead, before any
+	// job source connects.
+	if override := resolveNodeDirOverride(); override != "" {
+		fmt.Fprintf(os.Stderr, "Error: --node-dir/CITADEL_NODE_DIR (%q) is not supported by 'citadel work'.\n", override)
+		fmt.Fprintln(os.Stderr, "  Its reconcile loop and MODULE_SET handler install/uninstall modules by writing")
+		fmt.Fprintln(os.Stderr, "  BOTH the node manifest (which the override redirects) AND the module lockfile")
+		fmt.Fprintln(os.Stderr, "  (modules.lock, which does not honor the override) -- running under it would")
+		fmt.Fprintln(os.Stderr, "  silently split the two. Unset the override to run 'citadel work'; --node-dir")
+		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
+		os.Exit(1)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

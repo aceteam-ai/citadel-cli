@@ -75,6 +75,12 @@ func init() {
 
 // runModuleUpdate re-resolves installed modules and re-installs the changed ones.
 func runModuleUpdate(cmd *cobra.Command, args []string) error {
+	// citadel#853: writes both the manifest (--node-dir-aware) and the module
+	// lockfile (not --node-dir-aware) -- see cmd/nodedir.go.
+	if err := refuseIfLockfileWriteUnsupported("citadel module update"); err != nil {
+		return err
+	}
+
 	lf, err := catalog.LoadLockfile()
 	if err != nil {
 		return err

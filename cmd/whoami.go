@@ -343,7 +343,19 @@ See aceteam #8139.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id := gatherIdentity(cmd.Context())
 
-		if err := writeIdentityCache(id.NodeConfigDir, id); err != nil {
+		// citadel#853: NodeName above may have come from an overridden
+		// manifest (--node-dir/CITADEL_NODE_DIR), but id.NodeConfigDir is
+		// network.GetNodeConfigDir() -- the REAL machine's node config dir,
+		// not the override -- since --node-dir intentionally does not
+		// redirect network/mesh state. Writing the cache here would overwrite
+		// the real machine's identity.json with an overridden node's name, a
+		// cross-context split the same class as the ConfigDir()/
+		// GetNodeConfigDir() hazard this file's package doc warns about.
+		if override := resolveNodeDirOverride(); override != "" {
+			id.Warnings = append(id.Warnings, fmt.Sprintf(
+				"--node-dir/CITADEL_NODE_DIR override is active (%s): identity.json cache write skipped "+
+					"to avoid overwriting this machine's real identity cache with overridden data", override))
+		} else if err := writeIdentityCache(id.NodeConfigDir, id); err != nil {
 			id.Warnings = append(id.Warnings, fmt.Sprintf("could not write identity cache: %v", err))
 		}
 

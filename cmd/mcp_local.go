@@ -157,7 +157,15 @@ const localToolCallTimeout = 5 * time.Minute
 // no promise about size -- only that collecting it won't hang.
 func runModuleControlCaptured(name string, action moduleAction) (string, error) {
 	out, err := captureStdout(func() error {
-		return runModuleControl(name, action)
+		// citadel#853: runModuleControl gained a ctx parameter (feeds
+		// --expect-node's gatherIdentity fallback probe only -- see its doc
+		// comment). This tool's own moduleControlFn signature has no ctx (see
+		// localToolCallTimeout's doc comment for why threading one through
+		// wouldn't actually bound this call), and local_module_stop/start/
+		// restart don't expose --expect-node, so there is nothing for a
+		// caller-supplied context to cancel here; context.Background() is
+		// correct, not a placeholder.
+		return runModuleControl(context.Background(), name, action)
 	})
 	return tailTruncate(out, maxCapturedModuleOutputBytes), err
 }

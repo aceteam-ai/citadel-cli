@@ -305,6 +305,18 @@ The built-in updater:
 
 ## Command Reference
 
+**Targeting a specific node directory:** most commands above resolve the node
+manifest (`citadel.yaml` + `services/`) via `$HOME`/the platform config
+directory by default. Pass `--node-dir <path>` (or set `CITADEL_NODE_DIR`) to
+point a command at an explicit node directory instead — useful for scripts,
+tests, and agents that must never accidentally fall through to the real
+machine's node. `citadel module start|stop|restart`, `citadel run`, and
+`citadel stop` honor it fully; `citadel module install`/`update` and `citadel
+catalog install` refuse under it (they also write the module lockfile, which
+this flag deliberately does not redirect), and `citadel work` refuses to start
+at all under it, for the same reason. It never redirects network/mesh state.
+See `citadel --help` for the full flag description.
+
 ### Interactive Mode
 
 | Command | Description |
@@ -320,6 +332,7 @@ The built-in updater:
 | `citadel work`                                                            | **(Primary command)** Starts services from manifest AND runs the job worker (Redis Streams). Includes auto-update checks.                                                                              |
 | `citadel run [service]`                                                   | Starts services only. With no arguments, starts all manifest services. With a service name, adds it to the manifest and starts it.                                                                     |
 | `citadel stop [service]`                                                  | Stops services. With no arguments, stops all manifest services. With a service name, stops that specific service.                                                                                       |
+| `citadel module start\|stop\|restart <name>`                              | **Blessed recovery path** for a single stopped/crashed service — an embedded engine (`vllm`, `bonsai`, ...) or a catalog module alike. Scoped: no sibling module is touched. Never hand-run `docker compose` directly — several compose files require citadel-injected env vars (host ports) that only citadel supplies. Add `--dry-run` to preview, or `--expect-node <name>` to refuse if this isn't the node you expect. |
 | `citadel login`                                                           | Connects the machine to the network. Interactive prompts by default, or use `--authkey <key>` for non-interactive automation.                                                                           |
 
 ### Node Operation & Monitoring

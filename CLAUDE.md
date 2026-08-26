@@ -262,10 +262,14 @@ Built with Cobra. Main command files are in `cmd/`:
 - `status.go`: Health check dashboard (system vitals, GPU, network, services)
 - `login.go`: Interactive AceTeam Network authentication
 - `logout.go`: Disconnect from AceTeam Network
-- `down.go`: Stops services defined in citadel.yaml
-- `run.go`: Ad-hoc service execution without manifest
+- `run.go`: Ad-hoc service execution without manifest; also owns `citadel stop` (despite the name, `stop.go` is where that command lives)
 - `logs.go`: Service log streaming
 - `test.go`: Service diagnostic testing
+
+Stale-doc note found while fixing citadel#853/#854: there is no `down.go`.
+`citadel down` (defined in `up.go`) reverses `citadel up`'s machine-wide TUN
+mode -- it restores routing/DNS and never reads `citadel.yaml`. The
+manifest-mutating "stop services" command is `citadel stop` (`cmd/stop.go`).
 
 ### Core Architecture Patterns
 
@@ -1385,6 +1389,70 @@ already performs — nothing persists it to disk). Full trail, including why
 `internal/devicemode`'s superficially-similar `NodeUID` is NOT this (different
 identity, different — non-overlapping — population of hosts):
 [docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
+
+### Safe node targeting: `--node-dir`, `--dry-run`, `--expect-node` (citadel#853, #854)
+
+Motivated by a real incident: a subagent smoke-testing `citadel module` had set
+an isolated `$HOME` for one shell call, but a LATER call in the same session
+ran without it (shell state does not persist between an agent's tool calls),
+so `citadel module stop/restart` fell through to the default
+`$HOME`/`ConfigDir` resolution and cycled a LIVE production container.
+
+**`--node-dir` (also `CITADEL_NODE_DIR`, global persistent flag,
+`resolveNodeDirOverride` in `cmd/nodedir.go`)** redirects manifest + services-dir
+resolution. It is wired at the single choke point almost every manifest command
+already goes through — `findAndReadManifest`/`findOrCreateManifest`
+(`cmd/manifest.go`) — so it is honored consistently by every command that
+reads the node manifest through those two functions (module stop/start/
+restart, `run`, `stop`, `status`, `services`, `logs`, module/catalog install,
+...) with no per-command checklist to keep in sync or fall out of. When set,
+the `$HOME`/`platform.ConfigDir()`/global-`config.yaml` indirection is bypassed
+ENTIRELY: `citadel.yaml` is read directly from the override dir, and a missing
+manifest there errors rather than silently falling back to `$HOME`.
+
+**Scope — what it does NOT redirect:** network/mesh state
+(`internal/network.GetStateDir`/`GetNodeConfigDir`, the tsnet identity), the
+module lockfile (`catalog.LockfilePath`, still hardcoded to
+`platform.ConfigDir()`), or anything under `nodevault`/`worklock`. This means
+`citadel module install <source>` / `module update` / `catalog install`
+(which write BOTH the manifest and the lockfile) are deliberately NOT
+override-aware end to end: `refuseIfLockfileWriteUnsupported`
+(`cmd/nodedir.go`), called from their RunE functions, REFUSES rather than
+silently splitting a module's manifest entry (override dir) from its
+provenance (real machine's `modules.lock`) — half-honoring an override here
+would be worse than not honoring it. `citadel work` refuses the SAME way, but
+at boot rather than per-call: its reconcile loop and MODULE_SET handler drive
+the identical `liveModuleOps.Install`/`Uninstall` from inside a long-running
+process, so a per-job refusal there would just be an infinite quiet converge
+failure (a silently-dark node) rather than a fixable operator error — `runWork`
+(`cmd/work.go`) checks the override once, before any job source connects, and
+exits loudly if set. `citadel module stop|start|restart` never touch the
+lockfile (only the `desired_status` marker + compose up/down), so they — and
+the service startup `citadel work` does before reaching its reconcile loop —
+are fully override-aware. Threading the override into the catalog lockfile
+path is a deferred follow-up.
+
+**`citadel module stop|start|restart --dry-run`** (`cmd/module_control.go`)
+prints the resolved node dir, the compose file, and the container name(s) —
+read from the compose file's own `container_name:` fields where possible
+(`dryRunContainerNames`), not just the `citadel-<name>` convention (see the
+Service Management section above on why that convention alone isn't
+trustworthy) — and returns before `newLiveModuleOps` is ever constructed, so
+nothing is touched.
+
+**`--expect-node <name-or-id>`** refuses (fails CLOSED) unless the resolved
+node's identity matches, checked BEFORE anything else runs — including before
+printing a `--dry-run` plan, since a preview a real run would refuse is the
+wrong direction of error. It reuses citadel#844's identity resolution
+(`gatherIdentity`, `cmd/whoami.go`) rather than reinventing node-identity
+logic; `nodeIdentityMatches` compares case-insensitively against the manifest
+node name (itself `--node-dir`-aware), OS hostname, and the live Headscale
+mesh node ID.
+
+`citadel whoami --node-dir ...` deliberately skips writing `identity.json`
+(which lives at the REAL machine's `network.GetNodeConfigDir()`, not the
+override) rather than caching an overridden node's identity into the real
+machine's cache file.
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:

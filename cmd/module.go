@@ -115,6 +115,13 @@ func parseSetFlags(flags []string) (map[string]string, error) {
 // runModuleInstall installs a module from any source: catalog name (delegated to
 // the existing catalog flow) or an external git source resolved on the fly.
 func runModuleInstall(cmd *cobra.Command, args []string) error {
+	// citadel#853: this command writes BOTH the manifest (--node-dir-aware)
+	// and the module lockfile (NOT --node-dir-aware, see cmd/nodedir.go) --
+	// refuse rather than silently split them under an active override.
+	if err := refuseIfLockfileWriteUnsupported("citadel module install"); err != nil {
+		return err
+	}
+
 	src, err := catalog.ParseSource(args[0])
 	if err != nil {
 		return err
