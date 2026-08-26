@@ -25,14 +25,22 @@ import (
 // this stays hermetic (no real network dependency) while still exercising
 // the actual FetchWorkerConfig call path rather than bypassing it.
 //
-// With no workQueue and no orgID, the returned Queues slice deliberately does
-// NOT get an explicit jobs:v1:cpu-general entry prepended -- that mirrors
-// runWork's original inline behavior exactly (apiQueueNames starts nil; only
-// the shellQueue branch, when orgID is known, injects the explicit base so
-// appending the shell queue doesn't suppress it). An empty/nil Queues slice
-// is not a bug: worker.NewAPISource's own zero-value default already falls
-// back to worker.DefaultCPUQueue (see api_source.go), so the two forms
-// resolve to an identical effective subscription either way.
+// worker.DefaultCPUQueue must be present in EVERY case here, even the ones
+// with no workQueue and no orgID (post-review fix, not part of #839's
+// original cut): earlier this function returned an empty/nil Queues slice
+// for the CPU-only/not-serving case on the theory that worker.NewAPISource's
+// own zero-value default (which falls back to DefaultCPUQueue) covers it --
+// true ONLY when Queues ends up completely empty. For a GPU-capable or
+// already-serving node in this same no-workQueue/no-orgID window, Queues
+// would hold ONLY the inference queue (e.g. ["jobs:v1:gpu-general"]) --
+// non-empty, so NewAPISource's default never fires, and the node would
+// silently never consume jobs:v1:cpu-general (shell/config/general dispatch)
+// for its entire process lifetime. resolveWorkerQueues now unconditionally
+// seeds the base queue before appending inference queues, closing this for
+// both runWork (a real, if narrow, pre-#839 gap -- FetchWorkerConfig
+// unreachable/empty AND org unknown AND GPU/serving) and runTUIWorker
+// (previously protected by the now-deleted resolveControlCenterInferenceQueues,
+// which always started from worker.DefaultCPUQueue).
 func TestResolveWorkerQueues_FetchUnavailable(t *testing.T) {
 	gpuCaps := &capabilities.NodeCapabilities{
 		GPU: &capabilities.GPUCapabilities{
@@ -49,24 +57,24 @@ func TestResolveWorkerQueues_FetchUnavailable(t *testing.T) {
 		wantMissing []string
 	}{
 		{
-			name:        "GPU node, no org: boot set already covers gpu-general -- no reconciler gap",
+			name:        "GPU node, no org: base queue survives alongside gpu-general -- no reconciler gap",
 			nodeCaps:    gpuCaps,
 			serving:     false,
-			wantQueues:  []string{"jobs:v1:gpu-general"},
+			wantQueues:  []string{worker.DefaultCPUQueue, "jobs:v1:gpu-general"},
 			wantMissing: nil,
 		},
 		{
-			name:        "CPU-only, not yet serving at boot, no org: no inference queue yet, gap to fill",
+			name:        "CPU-only, not yet serving at boot, no org: base queue alone, gap to fill",
 			nodeCaps:    &capabilities.NodeCapabilities{},
 			serving:     false,
-			wantQueues:  nil,
+			wantQueues:  []string{worker.DefaultCPUQueue},
 			wantMissing: []string{"jobs:v1:gpu-general"},
 		},
 		{
-			name:        "CPU-only, already serving at boot, no org: gpu-general already subscribed -- no gap",
+			name:        "CPU-only, already serving at boot, no org: base queue survives alongside gpu-general -- no gap",
 			nodeCaps:    &capabilities.NodeCapabilities{},
 			serving:     true,
-			wantQueues:  []string{"jobs:v1:gpu-general"},
+			wantQueues:  []string{worker.DefaultCPUQueue, "jobs:v1:gpu-general"},
 			wantMissing: nil,
 		},
 		{
@@ -99,8 +107,23 @@ func TestResolveWorkerQueues_FetchUnavailable(t *testing.T) {
 			if !reflect.DeepEqual(got.Missing, tt.wantMissing) {
 				t.Errorf("missing = %v, want %v", got.Missing, tt.wantMissing)
 			}
+			assertContainsBaseQueue(t, got.Queues)
 		})
 	}
+}
+
+// assertContainsBaseQueue fails the test unless worker.DefaultCPUQueue is
+// present in queues. Every non-WorkerHeld resolveWorkerQueues result must
+// contain it -- see TestResolveWorkerQueues_FetchUnavailable's doc comment
+// for why losing it is a real (if narrow) regression, not a cosmetic gap.
+func assertContainsBaseQueue(t *testing.T, queues []string) {
+	t.Helper()
+	for _, q := range queues {
+		if q == worker.DefaultCPUQueue {
+			return
+		}
+	}
+	t.Errorf("queues = %v does not contain the base queue %q", queues, worker.DefaultCPUQueue)
 }
 
 // TestResolveWorkerQueues_WorkerHeld pins the workerHeld short-circuit: when
@@ -162,6 +185,14 @@ func TestResolveWorkerQueues_FetchWorkerConfig(t *testing.T) {
 	if got.OrgID != "org-777" {
 		t.Errorf("OrgID = %q, want %q", got.OrgID, "org-777")
 	}
+	// worker.DefaultCPUQueue is deliberately ABSENT here: workQueue resolved
+	// to a specific platform-assigned queue ("jobs:v1:platform-assigned"),
+	// which is the exact case the base-queue guard in resolveWorkerQueues
+	// must NOT touch -- runWork's pre-#839 code never included cpu-general
+	// when a workQueue was already known, and this test pins that byte-for-
+	// byte. The guard only fires in the gap window neither this test nor
+	// this call has (see TestResolveWorkerQueues_FetchUnavailable and
+	// assertContainsBaseQueue's doc comment for that case).
 	wantQueues := []string{"jobs:v1:platform-assigned", "jobs:v1:shell:org_org-777"}
 	if !reflect.DeepEqual(got.Queues, wantQueues) {
 		t.Errorf("queues = %v, want %v", got.Queues, wantQueues)
@@ -218,6 +249,11 @@ func TestResolveWorkerQueuesRepresentativeConfig(t *testing.T) {
 	if got.OrgID != "org-parity" {
 		t.Errorf("OrgID = %q, want %q", got.OrgID, "org-parity")
 	}
+	// worker.DefaultCPUQueue is deliberately ABSENT here too, same reasoning
+	// as TestResolveWorkerQueues_FetchWorkerConfig: workQueue resolved to a
+	// specific platform-assigned queue, so the base-queue guard (which only
+	// fires when NEITHER workQueue nor orgID resolved to anything) correctly
+	// does not add it.
 	wantQueues := []string{"jobs:v1:platform-assigned", "jobs:v1:shell:org_org-parity", "jobs:v1:gpu-general"}
 	if !reflect.DeepEqual(got.Queues, wantQueues) {
 		t.Errorf("queues = %v, want %v", got.Queues, wantQueues)

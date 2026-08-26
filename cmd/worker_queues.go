@@ -140,6 +140,24 @@ func resolveWorkerQueues(ctx context.Context, p workerQueueParams) workerQueueRe
 		debug("shell queue: %s", shellQueue)
 	}
 
+	// Guarantee the base queue survives even when neither workQueue nor
+	// orgID resolved to anything (FetchWorkerConfig unreachable/empty and no
+	// org known -- authkey flow or a stale/incomplete config). Without this,
+	// a GPU-capable or already-serving node would fall through to the
+	// inference-queues block below with queueNames still nil, and that block
+	// would leave it holding ONLY the inference queue (e.g.
+	// ["jobs:v1:gpu-general"]) -- non-empty, so worker.NewAPISource's own
+	// zero-value default (which only fires when QueueNames is COMPLETELY
+	// empty) would never kick in to add cpu-general back, and the node would
+	// silently never consume shell/config/general dispatch for its whole
+	// process lifetime. This only fires when queueNames is still empty at
+	// this point, so it changes nothing for the common case (workQueue or
+	// orgID present) -- runWork's resulting set for those cases is
+	// byte-identical to before this guard existed.
+	if len(queueNames) == 0 {
+		queueNames = []string{worker.DefaultCPUQueue}
+	}
+
 	// Inference-capable nodes must also consume the GPU inference queues.
 	// Additive to whatever worker-config returned. See
 	// capabilities.InferenceQueues' doc comment for the GPU/serving rules.
