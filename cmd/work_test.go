@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
@@ -420,6 +421,70 @@ func jsonFieldNames(t reflect.Type) map[string]struct{} {
 			}
 		}
 		out[name] = struct{}{}
+	}
+	return out
+}
+
+// TestReservationsFrom pins the internal/jobs.ReservationSummary ->
+// internal/status.GPUReservation projection (citadel-cli#832), mirroring
+// swapStatsFrom.
+func TestReservationsFrom(t *testing.T) {
+	t.Run("nil for empty input", func(t *testing.T) {
+		if got := reservationsFrom(nil); got != nil {
+			t.Errorf("reservationsFrom(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("maps fields and copies slices", func(t *testing.T) {
+		in := []jobs.ReservationSummary{
+			{JobID: "job-1", EvictedServices: []string{"vllm", "bonsai"}},
+		}
+		got := reservationsFrom(in)
+		want := []status.GPUReservation{
+			{JobID: "job-1", EvictedServices: []string{"vllm", "bonsai"}},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("reservationsFrom(%+v) = %+v, want %+v", in, got, want)
+		}
+		// The returned slice must be independent of the source (defensive
+		// copy), so a caller mutating one cannot corrupt the other.
+		in[0].EvictedServices[0] = "mutated"
+		if got[0].EvictedServices[0] == "mutated" {
+			t.Error("reservationsFrom aliased the source slice instead of copying it")
+		}
+	})
+}
+
+// TestReservationShapeParity mirrors TestSwapShapeParity: it pins that
+// jobs.ReservationSummary (the reservation primitive's local source-of-truth
+// shape) and status.GPUReservation (its heartbeat-facing projection) carry the
+// same fields, by Go field name -- ReservationSummary has no json tags (it is
+// never itself serialized; see its doc comment), so this compares field names
+// directly rather than reusing jsonFieldNames' tag-based comparison.
+func TestReservationShapeParity(t *testing.T) {
+	sourceFields := goFieldNames(reflect.TypeOf(jobs.ReservationSummary{}))
+	mirrorFields := goFieldNames(reflect.TypeOf(status.GPUReservation{}))
+	for name := range sourceFields {
+		if _, ok := mirrorFields[name]; !ok {
+			t.Errorf("jobs.ReservationSummary has field %q with no counterpart in status.GPUReservation -- "+
+				"a field was added to the reservation primitive's source-of-truth type "+
+				"without updating the heartbeat-facing mirror (and reservationsFrom), "+
+				"so it will never reach the heartbeat", name)
+		}
+	}
+	for name := range mirrorFields {
+		if _, ok := sourceFields[name]; !ok {
+			t.Errorf("status.GPUReservation has field %q with no counterpart in jobs.ReservationSummary -- "+
+				"the heartbeat-facing mirror has drifted ahead of its source of truth", name)
+		}
+	}
+}
+
+// goFieldNames returns the set of exported Go field names on a struct type.
+func goFieldNames(t reflect.Type) map[string]struct{} {
+	out := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		out[t.Field(i).Name] = struct{}{}
 	}
 	return out
 }

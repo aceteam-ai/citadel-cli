@@ -55,6 +55,12 @@ type manifestService struct {
 	// service). Read here so handlers can reason about it; written via
 	// setDesiredStatusInManifestFile (yaml.Node surgery, not this struct).
 	DesiredStatus string `yaml:"desired_status,omitempty"`
+	// EvictedByJob / EvictedPriorStatus mirror cmd/manifest.go Service's
+	// citadel-cli#832 reservation markers (see there for the full explanation).
+	// Written via setEvictedMarkersInManifestFile (yaml.Node surgery, not this
+	// struct) by Reserve/Release/ReconcileOrphanedReservations (reservation.go).
+	EvictedByJob       string `yaml:"evicted_by_job,omitempty"`
+	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -72,6 +78,20 @@ type ServiceHandler struct {
 	// (BYOC, citadel-cli#462), lazily initialized. These live outside
 	// citadel.yaml, so SERVICE_STOP / SERVICE_STATUS find them here.
 	instances *instanceStore
+
+	// collectStatus, when non-nil, overrides live node-status collection used by
+	// VRAM-aware preemption/reservation (#577, #832: preemptForVRAM, Reserve).
+	// Tests inject a synthetic *status.NodeStatus to exercise eviction decisions
+	// without shelling to docker/nvidia-smi. nil (the production default) uses
+	// status.NewCollector(CollectorConfig{ConfigDir: h.ConfigDir}).Collect().
+	collectStatus func() (*status.NodeStatus, error)
+	// stopServiceFn / startServiceFn, when non-nil, override the reservation
+	// primitive's evict/restore execution (#832: Reserve/Release) for tests, so
+	// eviction ordering and marker correctness are verifiable without a live
+	// docker daemon. nil (the production default) uses the real
+	// StopServiceByName / StartServiceByName.
+	stopServiceFn  func(name string) error
+	startServiceFn func(name string) error
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
@@ -179,6 +199,14 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		if err := h.setDesiredStatusInManifestFile(svc.Name, ""); err != nil {
 			ctx.Log("warning", "     - [Job %s] could not clear stopped marker for %s: %v", job.ID, svc.Name, err)
 		}
+		// Also clear any job-scoped reservation eviction tag (#832): an explicit
+		// operator/platform start is a stronger signal than a pending
+		// reservation restore, and clearing it here keeps a later Release for
+		// the (now irrelevant) reserving job a harmless no-op instead of an
+		// unexpected extra restart. Best-effort, same as above.
+		if err := h.setEvictedMarkersInManifestFile(svc.Name, "", ""); err != nil {
+			ctx.Log("warning", "     - [Job %s] could not clear reservation marker for %s: %v", job.ID, svc.Name, err)
+		}
 		// Optional model selection (#530): the backend's model-deploy contract
 		// dispatches MODEL_CACHE_PULL (weights) then SERVICE_START
 		// {service, model}. The model, when present, is persisted per-service
@@ -210,6 +238,14 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		// state, and must not prevent an evicted service from starting on boot.
 		if err := h.setDesiredStatusInManifestFile(svc.Name, "stopped"); err != nil {
 			ctx.Log("warning", "     - [Job %s] could not set stopped marker for %s: %v", job.ID, svc.Name, err)
+		}
+		// Also clear any job-scoped reservation eviction tag (#832): an explicit
+		// operator/platform stop is its own reason for the service being down,
+		// so it must NOT later be restarted by an unrelated reservation's
+		// Release just because it happens to still carry that reservation's
+		// job id from an earlier eviction. Best-effort, same as above.
+		if err := h.setEvictedMarkersInManifestFile(svc.Name, "", ""); err != nil {
+			ctx.Log("warning", "     - [Job %s] could not clear reservation marker for %s: %v", job.ID, svc.Name, err)
 		}
 		return h.serviceStop(ctx, svc)
 	default:
@@ -531,6 +567,43 @@ func (h *ServiceHandler) StopServiceByName(name string) error {
 	return nil
 }
 
+// StartServiceByName starts a manifest-declared or embedded managed service by
+// its logical name, without a remote job — the start-side counterpart of
+// StopServiceByName. It is the programmatic entry point used by the
+// reservation primitive's Release (#832, reservation.go): a reservation
+// decides WHICH services to restart; this reuses the same start implementation
+// a SERVICE_START job would take, with no model change and no VRAM budget (so
+// restoring a reservation never itself recurses into another eviction). A
+// service absent from the manifest and not embedded is reported as an error.
+// Like StopServiceByName, this does NOT touch desired_status or the
+// reservation markers — callers own that.
+func (h *ServiceHandler) StartServiceByName(name string) error {
+	manifest, err := h.loadManifest()
+	if err != nil {
+		return fmt.Errorf("failed to load manifest: %w", err)
+	}
+	svc, ok := h.findService(manifest, name)
+	if !ok {
+		if _, embedded := embeddedservices.ServiceMap[name]; !embedded {
+			return fmt.Errorf("service %q not found in manifest", name)
+		}
+		svc, err = h.materializeEmbeddedService(name)
+		if err != nil {
+			return fmt.Errorf("failed to reconcile embedded service %q: %w", name, err)
+		}
+	}
+	// Silent JobContext: there is no remote job to report progress against.
+	res, err := h.serviceStart(JobContext{LogFn: func(string, string) {}}, svc, "", 0)
+	if err != nil {
+		return err
+	}
+	var parsed serviceResult
+	if json.Unmarshal(res, &parsed) == nil && parsed.Error != "" {
+		return fmt.Errorf("%s", parsed.Error)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // VRAM preemption + node pinning (#577)
 // ---------------------------------------------------------------------------
@@ -643,8 +716,7 @@ func (h *ServiceHandler) preemptForVRAM(ctx JobContext, svc manifestService, req
 	// Collect live node status once: free VRAM + per-service VRAM footprints. A
 	// fresh collector's debounced IdleState is unreliable here (no history), so
 	// the idle ORDERING signal is derived instantaneously from the footprint.
-	collector := status.NewCollector(status.CollectorConfig{ConfigDir: h.ConfigDir})
-	st, err := collector.Collect()
+	st, err := h.collectNodeStatus()
 	if err != nil {
 		ctx.Log("warning", "     - [preempt] could not collect node status: %v; skipping VRAM fit check", err)
 		return nil
@@ -679,13 +751,44 @@ func (h *ServiceHandler) preemptForVRAM(ctx JobContext, svc manifestService, req
 		if err := h.setDesiredStatusInManifestFile(name, "stopped"); err != nil {
 			ctx.Log("warning", "     - [preempt] could not mark %s stopped: %v", name, err)
 		}
-		if err := h.StopServiceByName(name); err != nil {
+		if err := h.stopByName(name); err != nil {
 			// A failed eviction leaves VRAM unfreed: fail the deploy rather than
 			// start into insufficient VRAM.
 			return fmt.Errorf("cannot start %s: failed to preempt %s: %w", svc.Name, name, err)
 		}
 	}
 	return nil
+}
+
+// collectNodeStatus returns live node status, via the injected collectStatus
+// override when set (tests), else a real status.NewCollector collection. See
+// the ServiceHandler.collectStatus field doc.
+func (h *ServiceHandler) collectNodeStatus() (*status.NodeStatus, error) {
+	if h.collectStatus != nil {
+		return h.collectStatus()
+	}
+	collector := status.NewCollector(status.CollectorConfig{ConfigDir: h.ConfigDir})
+	return collector.Collect()
+}
+
+// stopByName routes through the injected stopServiceFn override when set
+// (tests), else the real StopServiceByName. See the ServiceHandler
+// stopServiceFn field doc.
+func (h *ServiceHandler) stopByName(name string) error {
+	if h.stopServiceFn != nil {
+		return h.stopServiceFn(name)
+	}
+	return h.StopServiceByName(name)
+}
+
+// startByName routes through the injected startServiceFn override when set
+// (tests), else the real StartServiceByName. See the ServiceHandler
+// startServiceFn field doc.
+func (h *ServiceHandler) startByName(name string) error {
+	if h.startServiceFn != nil {
+		return h.startServiceFn(name)
+	}
+	return h.StartServiceByName(name)
 }
 
 // freeVRAMBytes sums the currently-free VRAM across all GPUs that report a
@@ -1197,6 +1300,114 @@ func (h *ServiceHandler) setDesiredStatusInManifestFile(name, status string) err
 		return err
 	}
 	return os.WriteFile(path, buf.Bytes(), 0600)
+}
+
+// setEvictedMarkersInManifestFile sets or clears the durable job-scoped
+// reservation markers on a named service (citadel-cli#832, extends #577's
+// plain desired_status): evicted_by_job records WHICH reservation stopped
+// this service, so Release / ReconcileOrphanedReservations restore only what
+// THIS reservation evicted — never a service an operator stopped for an
+// unrelated reason (Execute()'s SERVICE_STOP/SERVICE_START clear these
+// markers on any explicit operator action, for exactly that reason).
+// evicted_prior_status records the service's desired_status value immediately
+// before eviction, so a restore reinstates that exact prior durable intent
+// instead of unconditionally clearing it.
+//
+// jobID == "" clears both markers (used by Release/reconcile once a restore
+// succeeds, and by an explicit operator SERVICE_STOP/SERVICE_START). Like
+// setDesiredStatusInManifestFile, this is yaml.Node surgery, not a struct
+// round-trip, so node:, capabilities:, and any operator-defined fields survive
+// the rewrite. Returns an error if the service is not present.
+func (h *ServiceHandler) setEvictedMarkersInManifestFile(name, jobID, priorStatus string) error {
+	path := filepath.Join(h.ConfigDir, "citadel.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("unexpected manifest structure in %s", path)
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("manifest root is not a mapping in %s", path)
+	}
+
+	var servicesSeq *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "services" {
+			servicesSeq = root.Content[i+1]
+			break
+		}
+	}
+	if servicesSeq == nil || servicesSeq.Kind != yaml.SequenceNode {
+		return fmt.Errorf("service %q not found in manifest", name)
+	}
+
+	found := false
+	for _, item := range servicesSeq.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		isTarget := false
+		for j := 0; j+1 < len(item.Content); j += 2 {
+			if item.Content[j].Value == "name" && item.Content[j+1].Value == name {
+				isTarget = true
+				break
+			}
+		}
+		if !isTarget {
+			continue
+		}
+		found = true
+		setManifestScalarField(item, "evicted_by_job", jobID)
+		setManifestScalarField(item, "evicted_prior_status", priorStatus)
+		break
+	}
+	if !found {
+		return fmt.Errorf("service %q not found in manifest", name)
+	}
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0600)
+}
+
+// setManifestScalarField sets (value != "") or clears (value == "") a single
+// scalar key on an already-located service mapping node, in place. Shared by
+// setEvictedMarkersInManifestFile so the two reservation markers get identical
+// set/clear/append handling without duplicating the node-surgery logic.
+func setManifestScalarField(item *yaml.Node, key, value string) {
+	idx := -1
+	for j := 0; j+1 < len(item.Content); j += 2 {
+		if item.Content[j].Value == key {
+			idx = j
+			break
+		}
+	}
+	switch {
+	case value == "" && idx >= 0:
+		item.Content = append(item.Content[:idx], item.Content[idx+2:]...)
+	case value != "" && idx >= 0:
+		item.Content[idx+1].Value = value
+		item.Content[idx+1].Tag = "!!str"
+	case value != "":
+		item.Content = append(item.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+		)
+	}
 }
 
 func (h *ServiceHandler) findService(m *serviceManifest, name string) (manifestService, bool) {

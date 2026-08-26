@@ -1207,6 +1207,93 @@ and `citadel services`).
 - The TUI control center collector is not yet fed `PinnedServices` (heartbeat and
   `citadel services` are); low-priority follow-up.
 
+### Job-scoped GPU reserve/evict/restore (citadel #832)
+
+`internal/jobs.ServiceHandler.Reserve` / `.Release` / `.ReconcileOrphanedReservations`
+extend #577's preemption with an auto-RESTORE leg, so a caller (a future job type,
+not wired up yet) can hold a guaranteed VRAM budget for its own lifetime and have
+whatever it evicted come back automatically — including across a crash. It reuses
+#577's decision unchanged (`buildPreemptCandidates` + `status.PlanPreemption`); the
+new piece is durable per-service tagging.
+
+**The marker IS the reservation — no separate ledger file.** `Reserve` durably
+tags every service it stops with `evicted_by_job: <jobID>` (plus
+`evicted_prior_status`, the service's `desired_status` immediately before
+eviction) via `setEvictedMarkersInManifestFile`, the same yaml.Node-surgery
+pattern as #577's `desired_status`. `Release(jobID)` restarts exactly the
+services carrying that tag and, only on a successful restart, clears both
+markers — restoring `evicted_prior_status` rather than unconditionally
+clearing it, so a service an operator had already marked stopped (e.g. a prior
+`SERVICE_STOP` whose compose-down failed, leaving it running and therefore a
+preemption candidate) comes back with that same stopped intent, not silently
+flipped to start-on-boot. A service whose restart fails KEEPS its tag, so a
+retried `Release` (or the crash reconcile below) picks it up again — this is
+what makes `Release` idempotent and safe to call more than once.
+
+**Tag-scoped restore, not blanket restore.** `Execute()`'s `SERVICE_START` and
+`SERVICE_STOP` branches both clear a service's reservation tag as part of
+handling an explicit operator/platform action — operator intent is a stronger
+signal than a pending reservation, and clearing it here is what keeps a later
+`Release` for the now-irrelevant reserving job a harmless no-op instead of an
+unexpected extra restart of a service the operator stopped for an unrelated
+reason.
+
+**Crash-safety is a call-site precondition, not an assumption — and the
+precondition covers only ONE of two competing-consumer doors.**
+`ReconcileOrphanedReservations` takes a required `holdsWorkerLock bool` and
+refuses outright when false — it does not infer or trust call order. The
+argument "any `evicted_by_job` tag found here is orphaned" is only true when
+exactly one worker can be live for this node: this `ServiceHandler` has
+created no reservations of its own yet at that point, so a tag can only be
+left over from a previous process invocation that exited before releasing it.
+The only correct call site is `cmd/work.go`'s `runWork`, immediately after a
+successful `worklock.Acquire`, before the job consume loop starts.
+
+`internal/worklock` guards `citadel work` against a SECOND `citadel work` — it
+does NOT guard against the control-center TUI's own worker path. When no
+dedicated `citadel work` holds the lock (`workerHeld == false` in
+`cmd/controlcenter.go`), the control center runs its own consume loop off the
+SAME `buildNodeJobHandlers` handler set **without ever calling
+`worklock.Acquire`**. Reservation reconcile is wired only in `runWork` today,
+so this is currently latent (nothing calls `Reserve` yet) — but a future
+caller (e.g. #8248) wiring `Reserve`/`Release` into a handler reachable from
+the control-center path reopens exactly the hazard `holdsWorkerLock` exists to
+close, via the other door: a CC-held reservation, then a later `citadel work`
+legitimately `Acquire`s (nobody holds the lock) and its startup reconcile
+destructively restarts a service the still-live CC job is using.
+`ReconcileOrphanedReservations`' doc comment states this gap and the two ways
+to close it (make the CC path `Acquire` too, or add owner identity — pid +
+start time — to the marker) in detail; read it before wiring such a caller.
+
+**Reserve's fit-check divergence from #577 is deliberate.** `preemptForVRAM`
+skips the check (logs and proceeds un-preempted) when free VRAM can't be
+determined — safe there, since a `SERVICE_START` with no fit signal just
+proceeds. `Reserve` is an explicit ask for a *guaranteed* hold, so an unknown
+free-VRAM signal is a hard error instead: silently granting an unverifiable
+reservation would defeat reserving at all.
+
+**Heartbeat surfacing.** `NodeStatus.GPUReservations` (`gpu_reservations`,
+omitempty) lists active reservations by job id, fed by
+`ServiceHandler.ActiveReservations()` — a pure manifest read — via
+`CollectorConfig.Reservations`, wired only in `cmd/work.go`'s two heartbeat
+collector construction sites (same pattern as `PinnedServices`/`SwapStats`; the
+TUI control-center collector has the same not-yet-wired gap noted above). The
+projection lives in `cmd/work.go`'s `reservationsFrom`
+(`jobs.ReservationSummary` → `status.GPUReservation`), mirroring #717's
+`swapStatsFrom` for the same reason: `internal/status` cannot import
+`internal/jobs`. `TestReservationShapeParity` pins the two shapes stay in sync.
+
+**Scope boundary (deliberate, citadel #832):** this issue is the on-node
+primitive only — reserve/evict/restore plus crash-safe reconcile plus
+heartbeat state. It does **not** wire Reserve/Release to any job type (no
+caller exists yet) and does **not** pick a dedicated node across the fabric
+(that's the platform's scheduler, a heartbeat consumer of `GPUReservations`).
+A routine platform `SERVICE_START` targeting a reservation-held service mid-
+reservation is not refused here — it clears the tag (per "tag-scoped restore"
+above) and proceeds, silently defeating the hold; whether to refuse a
+`SERVICE_START` during an active reservation is a future caller's policy
+decision, not this primitive's.
+
 ### Model Hotswap: residency invariant and swap rate bound (citadel #632, #687)
 
 With `CITADEL_MODEL_HOTSWAP` on, an inference request for an installed-but-absent

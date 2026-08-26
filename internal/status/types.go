@@ -58,6 +58,29 @@ type NodeStatus struct {
 	// internal/reconcile.HealthTracker for the throttled-logging half of the
 	// same fix, and reconcileHealthFrom (cmd/work.go) for the conversion.
 	Reconcile *ReconcileHealth `json:"reconcile,omitempty"`
+	// GPUReservations lists active job-scoped GPU VRAM reservations (citadel-cli
+	// #832) not yet released — durable evicted_by_job tags in citadel.yaml,
+	// extending #577's plain preemption with an auto-restore leg. Surfaced so a
+	// scheduler consuming the heartbeat (a future issue, out of scope here) can
+	// see which nodes currently hold exclusive reservations and what they are
+	// blocking, without shelling into the node. Additive/omitempty: nil on a
+	// node with none active, no reservation provider wired, or a legacy build.
+	GPUReservations []GPUReservation `json:"gpu_reservations,omitempty"`
+}
+
+// GPUReservation describes one active job-scoped GPU VRAM reservation
+// (citadel-cli#832): a durable evicted_by_job tag in citadel.yaml that has not
+// yet been released. A reservation restores automatically when the reserving
+// job releases it, or — if the reserving process crashed instead — at the next
+// worker startup. See internal/jobs.ServiceHandler.Reserve / .Release /
+// .ReconcileOrphanedReservations for the primitive this projects.
+type GPUReservation struct {
+	// JobID is the reservation's key, matching the id a future caller (e.g.
+	// `model run --exclusive`) passed to Reserve.
+	JobID string `json:"job_id"`
+	// EvictedServices lists the non-pinned services this reservation durably
+	// stopped to free VRAM, in eviction order.
+	EvictedServices []string `json:"evicted_services,omitempty"`
 }
 
 // WorkerLiveness is the heartbeat-facing view of the job consume loop. It is the

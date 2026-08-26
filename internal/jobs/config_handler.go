@@ -366,13 +366,19 @@ type CitadelManifest struct {
 // ManifestService represents a service entry in the manifest. DesiredStatus is
 // the durable stop marker (see cmd/manifest.go Service.DesiredStatus): it must
 // round-trip through APPLY_DEVICE_CONFIG or a dashboard config save would
-// silently resurrect stopped services on the next boot (#528).
+// silently resurrect stopped services on the next boot (#528). EvictedByJob /
+// EvictedPriorStatus are the citadel-cli#832 reservation markers (see
+// cmd/manifest.go Service for the full explanation) — they must round-trip
+// here for the same reason: a config apply mid-reservation must not silently
+// drop the tag that lets Release/reconcile restore the right service.
 type ManifestService struct {
-	Name          string `yaml:"name"`
-	Type          string `yaml:"type,omitempty"`
-	ComposeFile   string `yaml:"compose_file"`
-	Port          int    `yaml:"port,omitempty"`
-	DesiredStatus string `yaml:"desired_status,omitempty"`
+	Name               string `yaml:"name"`
+	Type               string `yaml:"type,omitempty"`
+	ComposeFile        string `yaml:"compose_file"`
+	Port               int    `yaml:"port,omitempty"`
+	DesiredStatus      string `yaml:"desired_status,omitempty"`
+	EvictedByJob       string `yaml:"evicted_by_job,omitempty"`
+	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.

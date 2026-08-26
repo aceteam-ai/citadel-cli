@@ -27,6 +27,26 @@ type Service struct {
 	// survives a reboot instead of silently coming back. This is a per-service
 	// marker; it is NOT the same as uninstalling (which removes the service).
 	DesiredStatus string `yaml:"desired_status,omitempty"`
+	// EvictedByJob is a durable marker set when a job-scoped GPU reservation
+	// (citadel-cli#832, internal/jobs.ServiceHandler.Reserve) stopped this
+	// service to free VRAM. Non-empty means DesiredStatus=="stopped" exists
+	// BECAUSE that reservation evicted it, so Release(jobID) — or a worker-
+	// startup reconcile, if the reserving process crashed — should restart it.
+	// Distinct from a plain #577 preemptForVRAM eviction, which stops peers
+	// WITHOUT tagging them (sticky forever until an explicit SERVICE_START).
+	// This struct never WRITES the field (internal/jobs owns that, via its own
+	// yaml.Node-surgery setter to avoid a jobs->cmd import), but it must be
+	// modeled here so any cmd-package manifest rewrite (writeManifest does a
+	// full struct round-trip) does not silently drop it — see #832's PR
+	// description for why that failure mode is the one that matters most.
+	EvictedByJob string `yaml:"evicted_by_job,omitempty"`
+	// EvictedPriorStatus records this service's DesiredStatus value immediately
+	// before a reservation (above) evicted it, so Release restores that exact
+	// prior durable intent instead of unconditionally clearing it — e.g. a
+	// service an operator had already marked "stopped" (whose compose-down
+	// then failed, leaving it still running and a preemption candidate) must
+	// not be silently flipped to start-on-boot by an unrelated reservation.
+	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
 }
 
 // serviceStartDisabled reports whether a service is marked "stopped" and must be

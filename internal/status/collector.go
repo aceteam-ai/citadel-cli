@@ -37,6 +37,7 @@ type Collector struct {
 	reqLog          *requestLog             // node-routed request log, every engine (citadel #691)
 	pinnedServices  map[string]bool         // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
 	modelHotswap    bool                    // advertise installed-vs-resident models (citadel #632)
+	reservations    func() []GPUReservation // live job-scoped GPU reservations (citadel #832), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -80,6 +81,11 @@ type CollectorConfig struct {
 	// default; wired from CITADEL_MODEL_HOTSWAP. Requires ConfigDir to enumerate
 	// installed engines. When false the heartbeat output is unchanged.
 	ModelHotswap bool
+	// Reservations, when set, returns the node's currently-active job-scoped GPU
+	// reservations attached to each heartbeat as NodeStatus.GPUReservations
+	// (citadel #832). Optional: nil when no reservation provider is wired
+	// (legacy build, or a heartbeat path that predates #832).
+	Reservations func() []GPUReservation
 }
 
 // NewCollector creates a new status collector.
@@ -100,6 +106,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		reqLog:          nodeRequestLog,
 		pinnedServices:  toStringSet(cfg.PinnedServices),
 		modelHotswap:    cfg.ModelHotswap,
+		reservations:    cfg.Reservations,
 	}
 }
 
@@ -411,6 +418,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// common case.
 	if c.reconcileHealth != nil {
 		status.Reconcile = c.reconcileHealth()
+	}
+
+	// Attach active job-scoped GPU reservations so a heartbeat consumer can see
+	// which services are durably held down by a reservation, not just a plain
+	// #577 preemption (citadel-cli#832). Additive: nil provider leaves the
+	// field omitted exactly as before this change.
+	if c.reservations != nil {
+		status.GPUReservations = c.reservations()
 	}
 
 	return status, nil
