@@ -2,8 +2,13 @@ package jobs
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestStartServices_DockerCLIMissing_RefusesWithFriendlyMessage covers the
@@ -99,4 +104,62 @@ func TestDeviceConfig_AudioBackupUnmarshal(t *testing.T) {
 			t.Errorf("meetingRetentionDays:7 should be non-nil 7, got %v", c.MeetingRetentionDays)
 		}
 	})
+}
+
+// TestUpdateManifest_PreservesPinnedServices pins the fix for citadel#850:
+// CitadelManifest here (the round-trip type updateManifest unmarshals the
+// whole citadel.yaml into and marshals back out) previously had no
+// PinnedServices field, unlike cmd/manifest.go's CitadelManifest -- so ANY
+// node's `pinned_services:` allowlist was silently DROPPED the next time
+// APPLY_DEVICE_CONFIG ran (dashboard/onboarding config save), un-pinning a
+// service and making it preemptible (breaking #577 preemption / #832
+// reservations). A device config that doesn't mention pins at all -- the
+// normal onboarding-wizard shape -- must leave the existing pins untouched,
+// per this struct's own doc contract.
+func TestUpdateManifest_PreservesPinnedServices(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "citadel.yaml")
+
+	initial := `node:
+  name: existing-node
+  tags: [gpu]
+pinned_services:
+  - bonsai
+  - vllm
+services:
+  - name: bonsai
+    compose_file: ./services/bonsai.yml
+`
+	if err := os.WriteFile(manifestPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	h := NewConfigHandler(dir)
+	// A device config that does not mention pinned_services at all -- the
+	// shape APPLY_DEVICE_CONFIG normally receives from the onboarding wizard.
+	config := &DeviceConfig{DeviceName: "existing-node"}
+	if err := h.updateManifest(dir, config); err != nil {
+		t.Fatalf("updateManifest: %v", err)
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+
+	var got CitadelManifest
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal round-tripped manifest: %v", err)
+	}
+
+	want := []string{"bonsai", "vllm"}
+	if !reflect.DeepEqual(got.PinnedServices, want) {
+		t.Fatalf("pinned_services did not survive the APPLY_DEVICE_CONFIG round-trip: got %v, want %v", got.PinnedServices, want)
+	}
+
+	// Also assert the raw YAML still carries the key, in case a future zero-value
+	// change to the field type silently produces a DeepEqual-but-omitted encode.
+	if !strings.Contains(string(data), "pinned_services:") {
+		t.Fatalf("round-tripped manifest is missing the pinned_services key entirely:\n%s", data)
+	}
 }
