@@ -1830,3 +1830,22 @@ Auto-generated log of every release.
   - fix(mcp): defer stdout restore + real local-tool timeout (#858) (#861)
 
 
+---
+
+## v2.120.0 — 2026-08-26
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 16 |
+| Lines added | +1436 |
+
+**Changes:**
+
+  - fix(tui): share worker queue resolution between citadel work and Control Center (#839) (#867)
+  - fix(worker): publish exactly one terminal event per job id on retry (#826) (#866)
+  - fix(vllm): opt-in --trust-remote-code (default off) for models needing custom code (#848) (#868)
+  - fix(nodeindex): de-flake TestHNSWParityWithBruteForce (#678) (#869)
+  - fix(jobs): preserve pinned_services across APPLY_DEVICE_CONFIG round-trip (#850) (#864)
+
+
