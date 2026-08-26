@@ -706,6 +706,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// reader goroutine starts; this one is not, so it needs its own
 	// synchronization instead of relying on assignment order.
 	var nodeSwapManager atomic.Pointer[worker.SwapManager]
+	// nodeReconcileHealth is the desired-state PULL reconcile loop's
+	// full-wipe-guard HealthTracker (citadel-cli#742), same atomic-pointer
+	// reasoning as nodeSwapManager above: the status-publisher goroutines that
+	// read it via reconcileHealthFn's closure are already running by the time
+	// the reconcile loop (and its Health tracker) is constructed further down,
+	// so an unsynchronized plain var would race that later Store.
+	var nodeReconcileHealth atomic.Pointer[reconcile.HealthTracker]
 	// inferenceQueueReconciler watches for a serving-engine transition and
 	// self-subscribes the inference queue once one appears, so a node that
 	// boots with no engine does not need a restart to serve inference once one
@@ -1301,6 +1308,23 @@ func runWork(cmd *cobra.Command, args []string) {
 		return swapStatsFrom(mgr.SwapStats())
 	}
 
+	// Full-wipe-guard refusal state for the heartbeat (citadel-cli#742): "is
+	// this node's reconcile pass currently being refused?" without shell
+	// access to the journal. nodeReconcileHealth.Store is called below at the
+	// desired-state pull reconcile loop's construction site (nil until then,
+	// and permanently nil when pull reconcile never starts -- kill switch,
+	// direct-Redis mode, or an unresolved Headscale node ID), which is why
+	// reconcileHealthFrom's caller must nil-check the tracker itself: a nil
+	// *reconcile.HealthTracker's State() is itself nil-safe (returns the zero
+	// value), so this only needs to short-circuit on a nil Load.
+	reconcileHealthFn := func() *status.ReconcileHealth {
+		tracker := nodeReconcileHealth.Load()
+		if tracker == nil {
+			return nil
+		}
+		return reconcileHealthFrom(tracker.State())
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1309,13 +1333,14 @@ func runWork(cmd *cobra.Command, args []string) {
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
 			// not read from the manifest). Model hotswap (#632) needs it to
 			// enumerate installed-but-stopped engines, so pass it only when enabled.
-			ConfigDir:      hotswapConfigDir(workConfigDir),
-			Services:       nil,
-			Capabilities:   statusCaps,
-			WorkerLiveness: workerLivenessFn,
-			SwapStats:      swapStatsFn,
-			PinnedServices: manifestPinnedServices(workManifest),
-			ModelHotswap:   status.ModelHotswapEnabled(),
+			ConfigDir:       hotswapConfigDir(workConfigDir),
+			Services:        nil,
+			Capabilities:    statusCaps,
+			WorkerLiveness:  workerLivenessFn,
+			SwapStats:       swapStatsFn,
+			ReconcileHealth: reconcileHealthFn,
+			PinnedServices:  manifestPinnedServices(workManifest),
+			ModelHotswap:    status.ModelHotswapEnabled(),
 		})
 	}
 
@@ -1597,14 +1622,15 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Create collector if not already created
 		if collector == nil {
 			collector = status.NewCollector(status.CollectorConfig{
-				NodeName:       nodeName,
-				ConfigDir:      hotswapConfigDir(workConfigDir),
-				Services:       nil,
-				Capabilities:   statusCaps,
-				WorkerLiveness: workerLivenessFn,
-				SwapStats:      swapStatsFn,
-				PinnedServices: manifestPinnedServices(workManifest),
-				ModelHotswap:   status.ModelHotswapEnabled(),
+				NodeName:        nodeName,
+				ConfigDir:       hotswapConfigDir(workConfigDir),
+				Services:        nil,
+				Capabilities:    statusCaps,
+				WorkerLiveness:  workerLivenessFn,
+				SwapStats:       swapStatsFn,
+				ReconcileHealth: reconcileHealthFn,
+				PinnedServices:  manifestPinnedServices(workManifest),
+				ModelHotswap:    status.ModelHotswapEnabled(),
 			})
 		}
 
@@ -1687,9 +1713,21 @@ func runWork(cmd *cobra.Command, args []string) {
 				// reported id via `get_node_info`, which accepts the numeric ID, so
 				// reporting the numeric ID keys `node_module_state` correctly too.
 				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID); loop != nil {
+					// Publish the loop's HealthTracker for the heartbeat
+					// (citadel-cli#742) BEFORE Run starts, so the very first pass's
+					// outcome is already visible to reconcileHealthFn.
+					nodeReconcileHealth.Store(loop.Health())
 					go func() {
 						runErr := loop.Run(ctx, func(_ reconcile.Plan, _ reconcile.ApplyResult, passErr error) {
-							if passErr != nil {
+							// A full-wipe-guard refusal is already logged, loudly and
+							// then on a decaying cadence, by the Health tracker's own
+							// logf (see newReconcileLoop) -- printing it again here on
+							// every single pass would reproduce the exact noise
+							// citadel-cli#742 exists to fix (4574 identical WARNs over
+							// 5 days on node 1297). Any OTHER pass-level error (fetch
+							// failure, list failure, ...) still prints every time, same
+							// as before.
+							if passErr != nil && !errors.Is(passErr, reconcile.ErrFullWipeRefused) {
 								fmt.Fprintf(os.Stderr, "   - ⚠️ reconcile pass error: %v\n", passErr)
 							}
 						})
@@ -2848,6 +2886,29 @@ func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
 		}
 	}
 	return activity
+}
+
+// reconcileHealthFrom projects a reconcile.HealthState onto the
+// heartbeat-facing status.ReconcileHealth (citadel-cli#742), mirroring
+// swapStatsFrom's split above. Unlike SwapActivity, this mirror is not forced
+// by an import cycle (internal/status could import internal/reconcile without
+// one) -- it is a deliberate consistency choice, keeping internal/status's
+// heartbeat-facing types free of a dependency on the reconcile engine's own
+// types, matching the established WorkerLiveness/SwapActivity pattern in this
+// codebase. Returns nil when NOT currently refused, so NodeStatus.Reconcile
+// stays omitted for the common (healthy) case -- the deliberate difference
+// from workerLivenessFrom/swapStatsFrom, which are always non-nil once their
+// subsystem is wired regardless of health.
+func reconcileHealthFrom(state reconcile.HealthState) *status.ReconcileHealth {
+	if !state.Refused {
+		return nil
+	}
+	return &status.ReconcileHealth{
+		Refused: true,
+		Reason:  state.Reason,
+		Since:   state.Since,
+		Count:   state.Count,
+	}
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
