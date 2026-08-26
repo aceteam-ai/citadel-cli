@@ -1780,3 +1780,20 @@ Auto-generated log of every release.
   - feat(tui): dynamic inference-queue self-subscribe in the Control Center worker path (#823) (#837)
 
 
+---
+
+## v2.117.0 — 2026-08-25
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 11 |
+| Lines added | +2291 |
+
+**Changes:**
+
+  - feat(trust): on-node grounding guardrail — flag fabricated numbers not in source (aceteam #8253, guardrail half) (#847)
+  - feat(cli): citadel module stop|start|restart with scoped reconcile (aceteam #8248 part 1) (#846)
+  - feat(cli): citadel whoami — node self-identity (aceteam #8139) (#844)
+
+
