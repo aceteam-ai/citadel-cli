@@ -1239,6 +1239,39 @@ The knobs are package vars (so tests need not sleep an hour) with the shipped
 values pinned by `TestSwapAccountingDefaults` — change them there. The ledger is
 in-process: the bound resets on restart, so a crash-looping worker can exceed it.
 
+**LRU is real, not absent — what blocked it was durability, not the sort itself
+(citadel #688).** `sortByLRU` (`swap.go`) already orders `preempt`'s candidates
+least-recently-used first, and `touch` (called from every `EnsureResident`)
+already keeps `m.lastUsed` current — but that map was purely in-process, so a
+worker restart zeroed it and every engine looked equally "never used" until
+fresh touches rebuilt real signal. `WithPersistence` (`internal/worker/
+swap_persist.go`, a `SwapManagerOption`) closes that: `cmd/hotswap.go`'s
+`newModelSwapManager` wires it to `<network.GetNodeConfigDir()>/swap-lru.json`
+— the machine-convergent node config dir, NOT the invoker-scoped `configDir`
+parameter also threaded through that function (see the `ConfigDir()` note
+above for why those two differ) — so `lastUsed` survives the exact restart
+that motivated this. Writes are debounced (`persistMinGap`, default 5s;
+`touch` fires on every inference request, not just swaps) and best-effort
+(a failed write is logged via `persistLogf`, never surfaced as a swap error);
+reads degrade a missing/corrupt file to "no persisted recency" rather than
+failing startup, mirroring the `TokenHashEntry.UnmarshalJSON` (#815)
+lenient-parse reasoning. `pruneStaleLastUsedLocked` bounds the file against
+entries for engines that are gone for good (uninstalled/renamed) — harmless to
+eviction ordering either way (`PreemptInputs` only ever lists currently-running
+engines as candidates) but otherwise unbounded growth once the map is durable.
+
+`forget()` (called on every eviction) has never deleted `lastUsed` — verified
+against git history before touching it — and #688 is explicit that it must
+stay that way: an evicted engine should re-enter as "used recently", not
+"never used", or an LRU-ordered candidate set thrashes (evict A, forget A, A
+now looks coldest, evict A again before it ever serves). The comment on
+`forget()` pins this so a future edit doesn't add that line back believing it
+is symmetric cleanup with `readyAt`/`startedAt`/`servedAt` (which DO get
+cleared there, deliberately — different lifecycle, not an oversight to match).
+Promoting LRU to preemption's PRIMARY sort key (ahead of idle) is #688's
+suggested fix #3 and is explicitly NOT part of this — only the two durability
+defects blocking it are fixed here.
+
 **Swap activity on the heartbeat (citadel #717).** `SwapManager.SwapStats()`
 (swaps-per-hour, the evicting subset, the ceiling, and recent records) is
 attached to the heartbeat as `NodeStatus.Swap` — `internal/status.SwapActivity`

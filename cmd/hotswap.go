@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
@@ -195,7 +197,19 @@ func newModelSwapManager(configDir, workspaceDir string, pinned []string, logf f
 	if logf != nil {
 		logf("[hotswap] model hotswap ENABLED (CITADEL_MODEL_HOTSWAP); configDir=%s", configDir)
 	}
-	return worker.NewSwapManager(newSwapController(configDir, workspaceDir, pinned, logf))
+	// LRU recency (citadel-cli#688) persists under the machine-convergent node
+	// config dir (network.GetNodeConfigDir()), NOT the passed-in configDir —
+	// that is the invoker-scoped manifest/services dir (platform.ConfigDir()
+	// under the hood), which a root systemd worker and an interactive `citadel
+	// status` can resolve differently on the same machine (see CLAUDE.md's
+	// ConfigDir() note). The swap manager's own restart is what this file
+	// exists to survive, so it needs the ONE directory every invocation agrees
+	// on, the same reasoning #726's heartbeat freshness marker and worklock use.
+	lruPath := filepath.Join(network.GetNodeConfigDir(), worker.LastUsedFileName)
+	return worker.NewSwapManager(
+		newSwapController(configDir, workspaceDir, pinned, logf),
+		worker.WithPersistence(lruPath, logf),
+	)
 }
 
 // hotswapConfigDir returns configDir when model hotswap is enabled, else "".

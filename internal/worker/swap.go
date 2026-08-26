@@ -170,13 +170,24 @@ type SwapManager struct {
 	// fails and when an engine is evicted, so a stale entry can never keep an
 	// absent engine reporting "warming".
 	startedAt map[string]time.Time
+
+	// Durable lastUsed mirror (citadel-cli#688; see swap_persist.go). Empty
+	// persistPath means persistence was never enabled (the NewSwapManager(ctrl)
+	// default, and every existing test) and every method below becomes a no-op.
+	persistPath   string
+	persistLogf   func(format string, args ...any)
+	persistMinGap time.Duration
+	persistMu     sync.Mutex // guards lastPersistAt only; I/O runs outside it
+	lastPersistAt time.Time
 }
 
 // NewSwapManager builds a swap manager with default timing and VRAM/load
 // estimates sourced from the shared status tables. ctrl supplies the node
-// side-effects.
-func NewSwapManager(ctrl SwapController) *SwapManager {
-	return &SwapManager{
+// side-effects. Without WithPersistence, lastUsed is purely in-process (matches
+// every pre-#688 caller/test); pass WithPersistence to seed it from disk and
+// keep it durable across restarts.
+func NewSwapManager(ctrl SwapController, opts ...SwapManagerOption) *SwapManager {
+	m := &SwapManager{
 		ctrl:                 ctrl,
 		requiredVRAM:         func(b string) uint64 { return uint64(status.EngineVRAMEstimateMB(b)) * 1024 * 1024 },
 		loadEstimate:         defaultLoadEstimate,
@@ -193,6 +204,10 @@ func NewSwapManager(ctrl SwapController) *SwapManager {
 		servedAt:             map[string]time.Time{},
 		loadMeasured:         map[string]time.Duration{},
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // defaultLoadEstimate is a coarse per-engine cold-start estimate for the warming
@@ -543,11 +558,15 @@ func (m *SwapManager) sortByLRU(candidates []status.PreemptCandidate) {
 	})
 }
 
-// touch records that `backend` was just requested (LRU freshness).
+// touch records that `backend` was just requested (LRU freshness). Persistence
+// (if enabled) is debounced, not synchronous: touch fires on every
+// EnsureResident call, including the already-resident fast path, so writing on
+// every call would be one disk write per inference request.
 func (m *SwapManager) touch(backend string) {
 	m.mu.Lock()
 	m.lastUsed[backend] = m.now()
 	m.mu.Unlock()
+	m.persistIfDue()
 }
 
 // markReady records that `backend` just became ready (starts its min-residency
@@ -558,6 +577,7 @@ func (m *SwapManager) markReady(backend string) {
 	m.readyAt[backend] = now
 	m.lastUsed[backend] = now
 	m.mu.Unlock()
+	m.persistIfDue()
 }
 
 // markServed records that a request was just dispatched to backend — the moment
@@ -583,8 +603,20 @@ func (m *SwapManager) markServed(backend string) {
 // loadMeasured deliberately SURVIVES: it measures how long the engine takes to
 // load, which does not change because we stopped it, and dropping it would send
 // the next swap-in of this engine back to the coarse table estimate for its
-// residency ceiling. (This is exactly the defect citadel-cli#688 describes for
-// lastUsed, which is why it is called out here rather than left to be noticed.)
+// residency ceiling.
+//
+// lastUsed ALSO deliberately survives — do not add delete(m.lastUsed, name)
+// here. citadel-cli#688's suggested fix is explicit: "On eviction, preserve the
+// engine's last-use time rather than dropping it. An evicted engine should
+// re-enter as 'used recently', not 'never used'." Clearing it here would make
+// an evicted engine look like it was never used at all (sortByLRU treats a
+// missing entry as the oldest possible timestamp — first victim), which under
+// an LRU-ordered candidate set is precisely the alternating-eviction thrash
+// #688 exists to prevent: evict A, forget A, A now looks coldest, evict A
+// again before it ever gets to serve. Verified against this function's history
+// before writing this comment: forget() has never deleted lastUsed, so this is
+// pinning existing (correct) behavior against a plausible-looking future
+// regression, not documenting a fix made here.
 func (m *SwapManager) forget(name string) {
 	m.mu.Lock()
 	delete(m.readyAt, name)
