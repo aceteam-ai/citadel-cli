@@ -80,7 +80,7 @@ func TestInteractive_LeaveViaChat(t *testing.T) {
 	page := &fakeMeetPage{chatReads: []string{`[{"index":0,"sender":"Bob","text":"/ace leave"}]`}}
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 
 	if out.endReason != "ace_command_leave" {
 		t.Errorf("endReason = %q, want ace_command_leave", out.endReason)
@@ -108,7 +108,7 @@ func TestInteractive_LeaveViaSpokenTranscript(t *testing.T) {
 		}, nil
 	}
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), transcribe, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), transcribe, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 
 	if out.endReason != "ace_command_leave" {
 		t.Errorf("endReason = %q, want ace_command_leave", out.endReason)
@@ -136,9 +136,10 @@ func TestInteractive_RollingStopsWhenCallEnds(t *testing.T) {
 
 	done := make(chan interactiveOutcome, 1)
 	go func() {
-		done <- h.waitForMeetingEndInteractive(
-			JobContext{}, page, testParams(), failingTranscribe, time.Millisecond, map[string]struct{}{},
+		out, _ := h.waitForMeetingEndInteractive(
+			JobContext{}, page, testParams(), failingTranscribe, time.Millisecond, map[string]struct{}{}, deathTestMedia{},
 		)
+		done <- out
 	}()
 
 	var out interactiveOutcome
@@ -166,7 +167,7 @@ func TestInteractive_EndsWhenCallEnds(t *testing.T) {
 	page := &fakeMeetPage{ended: true}
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 	if out.endReason != "call_ended" {
 		t.Errorf("endReason = %q, want call_ended", out.endReason)
 	}
@@ -180,7 +181,7 @@ func TestInteractive_AloneInCall(t *testing.T) {
 	page := &fakeMeetPage{participant: float64(1)}
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 	if out.endReason != "alone_in_call" {
 		t.Errorf("endReason = %q, want alone_in_call", out.endReason)
 	}
@@ -205,7 +206,7 @@ func TestInteractive_CapturesGenericCommandsWithoutLeaving(t *testing.T) {
 	}()
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 
 	if page.leaveHit {
 		t.Error("a generic (non-leave) command must NOT trigger a leave")
@@ -230,7 +231,7 @@ func TestInteractive_ChatDedupByIndex(t *testing.T) {
 	}()
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 	if len(out.chat) != 1 {
 		t.Errorf("captured chat = %d messages, want 1 (deduped by index across polls)", len(out.chat))
 	}
@@ -244,7 +245,7 @@ func TestInteractive_TranscribeErrorIsNonFatal(t *testing.T) {
 	}
 	// A panic in the rolling pass is recovered on its goroutine; the loop still
 	// ends the call normally.
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), panicky, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), panicky, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 	if out.endReason != "call_ended" {
 		t.Errorf("endReason = %q, want call_ended despite a panicking transcriber", out.endReason)
 	}
@@ -300,7 +301,7 @@ func TestInteractive_HelpCommandDoesNotSelfLeaveOnEcho(t *testing.T) {
 	}()
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 
 	if out.endReason == "ace_command_leave" || page.leaveHit {
 		t.Fatal("bot self-triggered a leave from its own /ace help echo")
@@ -338,7 +339,7 @@ func TestInteractive_NoteCommandRecordsToOutcome(t *testing.T) {
 	}()
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{})
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, map[string]struct{}{}, deathTestMedia{})
 
 	if page.leaveHit {
 		t.Error("/ace note must not trigger a leave")
@@ -372,7 +373,7 @@ func TestInteractive_DoesNotSelfTriggerOnAnnouncementEcho(t *testing.T) {
 	botMessages := map[string]struct{}{normalizeChatText(meetAnnouncementText): {}}
 	noSegments := func() ([]TranscriptSegment, error) { return nil, nil }
 
-	out := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, botMessages)
+	out, _ := h.waitForMeetingEndInteractive(JobContext{}, page, testParams(), noSegments, time.Millisecond, botMessages, deathTestMedia{})
 
 	if out.endReason == "ace_command_leave" {
 		t.Fatal("bot self-triggered a leave from its own announcement echo")

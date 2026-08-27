@@ -205,10 +205,11 @@ func TestMeetingdHealthy(t *testing.T) {
 // fakeMedia is a MeetingMedia stub for selection tests.
 type fakeMedia struct{}
 
-func (fakeMedia) Start() (meetingBrowser, error) { return nil, nil }
-func (fakeMedia) StartRecording() error          { return nil }
-func (fakeMedia) StopRecording() (string, error) { return "", nil }
-func (fakeMedia) Close() error                   { return nil }
+func (fakeMedia) Start() (meetingBrowser, error)  { return nil, nil }
+func (fakeMedia) StartRecording() error           { return nil }
+func (fakeMedia) StopRecording() (string, error)  { return "", nil }
+func (fakeMedia) Close() error                    { return nil }
+func (fakeMedia) RecordingAlive() <-chan struct{} { return nil }
 
 func TestSelectMediaUsesOverride(t *testing.T) {
 	called := false

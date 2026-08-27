@@ -126,12 +126,21 @@ func (h *MeetingJoinHandler) announceOnAdmission(ctx JobContext, page meetPage, 
 }
 
 // waitForMeetingEndInteractive runs the during-call interactive loop until the
-// call ends, an `/ace leave` is recognized, or the hard duration cap trips. It
-// never errors: any interactive failure degrades to the batch behavior (a valid
-// recording still gets transcribed at the end). transcribe is injected (built
+// call ends, an `/ace leave` is recognized, or the hard duration cap trips. Any
+// interactive failure (a stale chat/DOM selector, a rolling-transcription
+// panic) degrades to the batch behavior (a valid recording still gets
+// transcribed at the end) rather than erroring. transcribe is injected (built
 // from h.transcribeSegments in production, a fake in tests). pollInterval is the
 // loop cadence for chat/end/leave checks; the rolling transcriber ticks
 // independently at h.streamingInterval().
+//
+// media watches the recorder's own death signal (citadel#490) alongside that
+// poll cadence, same as the plain waitForMeetingEnd: this loop is the DEFAULT
+// production path (config.Meeting.StreamingEnabled defaults true), so it needs
+// the identical protection against silently recording nothing while the DOM
+// still looks healthy. A non-nil returned error means the recorder died before
+// the call ended; the caller (runMeetingLoop) propagates it so Execute reports
+// a job failure instead of a "completed" result over a truncated WAV.
 func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	ctx JobContext,
 	page meetPage,
@@ -139,7 +148,8 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	transcribe TranscribeFunc,
 	pollInterval time.Duration,
 	botMessages map[string]struct{},
-) interactiveOutcome {
+	media MeetingMedia,
+) (interactiveOutcome, error) {
 	segCh := make(chan TranscriptSegment, 64)
 	stop := make(chan struct{})
 	rollingDone := make(chan struct{})
@@ -227,6 +237,12 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 		exec.dispatch(cmd)
 	}
 
+	// recorderDead is the recorder's death signal (citadel#490), captured once
+	// up front — see waitForMeetingEnd for the fuller rationale. A backend with
+	// no liveness signal (containerMedia) returns nil, which never fires in the
+	// select below, so this degrades safely rather than false-positiving.
+	recorderDead := media.RecordingAlive()
+
 	deadline := time.Now().Add(p.maxDuration())
 	for time.Now().Before(deadline) {
 		// 1. Drain newly-stabilized transcript segments (non-blocking).
@@ -259,19 +275,30 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 				ctx.Log("warn", "     - graceful leave click errored (non-fatal, teardown closes the browser): %v", err)
 			}
 			out.endReason = "ace_command_leave"
-			return out
+			return out, nil
 		}
 
 		// 4. Existing end heuristics (call ended / bot alone).
 		if reason, ended := checkMeetingEnded(page); ended {
 			out.endReason = reason
-			return out
+			return out, nil
 		}
 
-		time.Sleep(pollInterval)
+		// 5. Recorder-death watch (citadel#490), alongside the normal poll wait.
+		// checkMeetingEnded above already runs first each iteration, so a
+		// simultaneous natural end and recorder death favors reporting the
+		// normal end reason.
+		select {
+		case <-recorderDead:
+			err := fmt.Errorf("recording process exited before the meeting ended; the saved audio is truncated or empty")
+			ctx.Log("error", "     - recorder died mid-meeting: %v", err)
+			out.endReason = "recorder_died"
+			return out, err
+		case <-time.After(pollInterval):
+		}
 	}
 	ctx.Log("info", "     - max meeting duration (%s) reached; leaving", p.maxDuration())
-	return out
+	return out, nil
 }
 
 // drainSegments pulls all currently-buffered transcript segments without

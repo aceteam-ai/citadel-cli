@@ -151,6 +151,25 @@ func (r *NullSinkRecorder) monitorSource() string {
 	return r.sinkName + ".monitor"
 }
 
+// Exited exposes the reaper's death signal (citadel#490): the returned channel
+// is closed the moment the ffmpeg recorder process exits, whether via a clean
+// Stop() (SIGINT) or an unexpected crash/kill (pulse restart, OOM, the sink
+// getting unloaded out from under it). Callers select on it alongside their own
+// poll loop to detect a dead recorder WHILE the meeting is still in progress,
+// instead of only noticing after polling for meeting-end runs to completion (or
+// the hard duration cap trips) and handing a truncated/empty WAV to
+// transcription with no error surfaced.
+//
+// Returns nil before Start has been called, and again after Stop has run
+// (Stop clears r.exited under the same lock) — a nil channel blocks forever in
+// a select, so "not currently recording" degrades to "no death signal", never a
+// false positive.
+func (r *NullSinkRecorder) Exited() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.exited
+}
+
 // LoadSink creates the null sink. Call before launching the browser so the
 // browser's PULSE_SINK target exists at launch. Idempotent-ish: refuses if a sink
 // is already loaded on this recorder.
