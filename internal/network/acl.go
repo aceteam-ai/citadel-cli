@@ -66,6 +66,26 @@ func isAdminLikeSID(sid string) bool {
 	}
 }
 
+// ownerNotAdminLike reports whether ownerSID -- the directory's actual
+// owner, as returned by directoryACLEntries -- is NOT an admin-like
+// principal (issue #789).
+//
+// This is deliberately independent of evaluateDACL's ACE-based walk, not a
+// replacement for it: Windows grants an object's owner implicit
+// READ_CONTROL and WRITE_DAC regardless of what the DACL currently allows,
+// so a DACL evaluateDACL finds spotless today is not a durable guarantee if
+// the owner itself isn't admin-like -- that owner could rewrite the DACL to
+// grant itself write access at any time, with no ACE ever needing to look
+// suspicious in the meantime. checkDirectoryNotWritableByNonAdmin asserts on
+// this in addition to, not instead of, evaluateDACL.
+//
+// An empty/unresolved ownerSID is NOT treated as admin-like -- fails closed,
+// matching the fail-closed posture of the rest of this check (see
+// evaluateDACL's doc comment).
+func ownerNotAdminLike(ownerSID string) bool {
+	return !isAdminLikeSID(ownerSID)
+}
+
 // evaluateDACL returns the entries that grant a non-admin principal
 // write-capable access, i.e. the reasons machine-wide mode must refuse to
 // load a driver from this directory.

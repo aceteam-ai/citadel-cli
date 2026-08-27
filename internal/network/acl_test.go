@@ -157,3 +157,28 @@ func TestIsAdminLikeSID(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerNotAdminLike(t *testing.T) {
+	const sidSomeUser = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+
+	tests := []struct {
+		name     string
+		ownerSID string
+		want     bool
+	}{
+		{"BUILTIN\\Administrators owner -- admin-like, no violation", sidAdministrators, false},
+		{"LocalSystem owner -- admin-like, no violation", sidLocalSystem, false},
+		{"TrustedInstaller owner -- admin-like, no violation", sidTrustedInstaller, false},
+		{"specific non-admin user owner -- violation", sidSomeUser, true},
+		{"BUILTIN\\Users owner -- violation", "S-1-5-32-545", true},
+		{"unresolved owner -- fails closed, violation", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ownerNotAdminLike(tt.ownerSID); got != tt.want {
+				t.Errorf("ownerNotAdminLike(%q) = %v, want %v", tt.ownerSID, got, tt.want)
+			}
+		})
+	}
+}
