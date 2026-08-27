@@ -51,17 +51,31 @@ mkdir -p "$RUNTIME_DIR/pulse"
 chown -R bot:bot "$RUNTIME_DIR" /home/bot /app
 chmod 700 "$RUNTIME_DIR"
 
-# Bring the bind-mounted dirs to the target owner. This is the MIGRATION step for
-# existing nodes: the persisted profile (the signed-in Google session) was created
-# by the old `bot` (10001, mode 700); after remapping `bot` to the node owner it
+# Bring the persisted profile to the target owner. This is the MIGRATION step
+# for existing nodes: the profile (the signed-in Google session) was created by
+# the old `bot` (10001, mode 700); after remapping `bot` to the node owner it
 # would be unreadable, so chown it across. Only chown when the top dir's owner
 # differs from the target (a large already-correct tree isn't re-chowned every
-# boot). The workspace is normally already node-owned, so it is skipped.
-for dir in "$PROFILE_DIR" "$WORKSPACE_DIR"; do
-    if [ "$(stat -c '%u' "$dir")" != "$TARGET_UID" ]; then
-        chown -R bot:bot "$dir"
-    fi
-done
+# boot). PROFILE_DIR is exclusively owned by this container (nothing else binds
+# it), so a full recursive chown of it is safe.
+if [ "$(stat -c '%u' "$PROFILE_DIR")" != "$TARGET_UID" ]; then
+    chown -R bot:bot "$PROFILE_DIR"
+fi
+
+# WORKSPACE_DIR, unlike PROFILE_DIR, is a SHARED bind mount: the host `citadel
+# work` process and other containerized modules (e.g. transcribe) read/write it
+# directly too. NEVER chown the workspace ROOT here -- citadel-cli#551 traced a
+# `chown -R` of the workspace root (reachable whenever TARGET_UID fell back to
+# the image default, e.g. a root-run worker where PUID resolves to 0) to every
+# host-worker file write breaking node-wide. Confine the migration chown to
+# this module's OWN subdir instead: meetingd only ever writes recordings under
+# "$WORKSPACE_DIR/meetings", so bring just that subdir to the target owner.
+# Deliberately unconditional (unlike the PROFILE_DIR chown above, not gated on
+# the parent dir's owner) so an already node-owned workspace root no longer
+# hides a stale, wrong-owned meetings/ subdir left behind by a pre-#549 image
+# (citadel-cli#557) -- cheap and idempotent since the dir is small.
+mkdir -p "$WORKSPACE_DIR/meetings"
+chown -R "$TARGET_UID:$TARGET_GID" "$WORKSPACE_DIR/meetings"
 
 # Clear stale Chromium profile singleton locks. Chrome writes SingletonLock as
 # <hostname>-<pid>; on container recreation (module upgrade, restart, `docker rm

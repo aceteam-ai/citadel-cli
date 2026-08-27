@@ -100,9 +100,49 @@ def test_entrypoint_maps_to_host_uid_and_migrates_profile():
     # Explicit PUID/PGID honored, with a fallback derived from the workspace owner.
     assert "PUID" in body and "PGID" in body
     assert "stat -c '%u'" in body and "WORKSPACE_DIR" in body
-    # Migration: chown the bind mounts (incl. the persisted profile) to the target.
+    # Migration: chown the persisted profile to the target.
     assert "PROFILE_DIR" in body
-    assert "chown -R bot:bot" in body
+    assert "chown -R bot:bot \"$PROFILE_DIR\"" in body
+
+
+def test_entrypoint_never_chowns_shared_workspace_root():
+    """Bug fixes for citadel-cli#557 + #551. Both bugs traced back to the same
+    flawed migration logic: chowning the shared /workspace bind mount at its
+    ROOT. #551: when TARGET_UID fell back to the image default (PUID=0/unset,
+    e.g. a root-run worker), a `chown -R` of the workspace root re-owned the
+    ENTIRE shared workspace to 10001, breaking every host-worker file write.
+    #557: the migration only recursed when the TOP dir's owner differed from
+    the target, so an already node-owned workspace root silently skipped a
+    stale, wrong-owned `meetings/` subdir left by a pre-#549 image.
+
+    Fix: never chown the workspace root at all; confine the migration chown to
+    the module's own `meetings/` subdir, unconditionally (not gated on the
+    parent's owner, so a node-owned root no longer hides a stale subdir)."""
+    script = os.path.join(os.path.dirname(__file__), "entrypoint.sh")
+    subprocess.run(["sh", "-n", script], check=True)
+    body = open(script).read()
+
+    # No `chown -R` line may target the bare workspace root as one of its
+    # arguments. Normalize each candidate line (strip quotes/braces so
+    # "$WORKSPACE_DIR", "${WORKSPACE_DIR}", and an unquoted $WORKSPACE_DIR all
+    # collapse to the same token) before comparing whitespace-split tokens --
+    # a plain substring check would pass trivially against
+    # "$WORKSPACE_DIR/meetings" (a superstring of the bad token) and miss
+    # unquoted/braced regressions.
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "chown -R" not in stripped:
+            continue
+        normalized = stripped.replace('"', "").replace("{", "").replace("}", "")
+        tokens = normalized.split()
+        assert "$WORKSPACE_DIR" not in tokens, (
+            f"chown -R must not target the bare workspace root: {line!r}"
+        )
+
+    # The migration chown is confined to the meetings/ subdir, and creates it
+    # first (so the chown can't silently no-op on a missing dir).
+    assert 'mkdir -p "$WORKSPACE_DIR/meetings"' in body
+    assert 'chown -R "$TARGET_UID:$TARGET_GID" "$WORKSPACE_DIR/meetings"' in body
 
 
 def _write_wav(path: str, samples: list[int]):
