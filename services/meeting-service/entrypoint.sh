@@ -56,8 +56,19 @@ chmod 700 "$RUNTIME_DIR"
 # the old `bot` (10001, mode 700); after remapping `bot` to the node owner it
 # would be unreadable, so chown it across. Only chown when the top dir's owner
 # differs from the target (a large already-correct tree isn't re-chowned every
-# boot). PROFILE_DIR is exclusively owned by this container (nothing else binds
-# it), so a full recursive chown of it is safe.
+# boot). A full recursive chown of PROFILE_DIR is safe even though it too is a
+# host bind mount other processes touch: the host-native fallback path
+# (`internal/platform/meeting_browser.go`'s `preparePersistentProfileDir`,
+# used by `defaultSelectMedia` when the container is unhealthy) writes the
+# SAME default profile path directly as the host worker's own UID, and
+# `internal/jobs/service_handler.go`'s `composeEnv()` always sets this
+# container's PUID to that same worker's `os.Getuid()` (pinned by
+# `TestComposeEnv_PUIDTracksHostGetuid`, `internal/jobs/service_handler_test.go`)
+# -- so TARGET_UID here and the host-native writer's UID can never diverge.
+# (When the worker runs as root, root bypasses DAC ownership checks entirely,
+# so the chown is moot either way.) WORKSPACE_DIR below has no equivalent
+# guarantee -- it is genuinely shared with independent writers -- which is why
+# it gets a different, more conservative treatment.
 if [ "$(stat -c '%u' "$PROFILE_DIR")" != "$TARGET_UID" ]; then
     chown -R bot:bot "$PROFILE_DIR"
 fi
