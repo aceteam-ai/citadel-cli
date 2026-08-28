@@ -14,12 +14,14 @@
 # it must equal the registry value (it is what the install-time port-conflict
 # pre-check and the collision-guard test read).
 #
-# Image status: ghcr.io/aceteam-ai/hermes-service is NOT YET BUILT/PUBLISHED
-# (this PR adds the Dockerfile that builds it -- see the README). This mirrors
-# claudecode-service's own situation when #432 first landed (image published by
-# a follow-up, #442). The UPSTREAM base image this Dockerfile builds from --
-# nousresearch/hermes-agent -- IS real and actively published on Docker Hub
-# (multi-arch, verified 2026-08-25); only the derived wrapper image is pending.
+# Image status: ghcr.io/aceteam-ai/hermes-service is NOT YET BUILT/PUBLISHED as
+# of this diff, but the Dockerfile + build-hermes-service.yml CI workflow this
+# PR adds together publish it on the first push to main -- see the README.
+# This mirrors claudecode-service's own situation when #432 first landed
+# non-draft (image published by a same-repo CI follow-up, #459). The UPSTREAM
+# base image this Dockerfile builds from -- nousresearch/hermes-agent -- IS
+# real and actively published on Docker Hub (multi-arch, verified 2026-08-25);
+# only the derived wrapper image is pending.
 schema_version: 2
 name: hermes
 version: 0.1.0
@@ -66,8 +68,8 @@ config:
       Inference credential (one of several Hermes accepts natively). At least
       ONE provider credential must be supplied -- see the README for the full
       list Hermes recognizes (OPENAI_API_KEY, FIREWORKS_API_KEY, GOOGLE_API_KEY,
-      GLM_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY, ...). None is individually
-      required because any one works.
+      GEMINI_API_KEY, GLM_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY, ...). None is
+      individually required because any one works.
     required: false
   - name: OPENAI_API_KEY
     description: >-

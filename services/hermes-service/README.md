@@ -13,11 +13,13 @@ HTTP wrapper.
   (2026-08-25; digest `sha256:8c1cc8be...`, pushed the same day). This is NOT
   a guessed or invented reference.
 - **The derived image `ghcr.io/aceteam-ai/hermes-service` is NOT YET BUILT OR
-  PUBLISHED.** This PR adds the `Dockerfile` that builds it; a follow-up PR
-  (mirroring how claudecode-service's image was published by #442, after
-  #432 added its Dockerfile) needs to actually build and push it. `docker
-  build` from this directory works locally today (verified) -- what's missing
-  is CI wiring to publish the result.
+  PUBLISHED as of this PR's diff, but will be the moment it merges to `main`.**
+  This PR adds both the `Dockerfile` and `.github/workflows/build-hermes-service.yml`
+  (mirroring `build-claudecode-service.yml`, added for claudecode by #459
+  after #432's Dockerfile landed non-draft -- same precedent this PR follows:
+  an unpublished image is not a merge blocker in this repo, since the publish
+  workflow only fires on push to `main`). `docker build` from this directory
+  works locally today (verified).
 
 ## How it works
 
@@ -146,6 +148,11 @@ citadel-services PR paired with this one.
 
 ## Build the image
 
+CI (`.github/workflows/build-hermes-service.yml`) builds and pushes
+`ghcr.io/aceteam-ai/hermes-service:latest` on every push to `main` that
+touches this directory -- mirrors `build-claudecode-service.yml` exactly.
+To build locally instead:
+
 ```sh
 docker build -t ghcr.io/aceteam-ai/hermes-service:latest services/hermes-service
 ```
@@ -155,6 +162,20 @@ the upstream base image is pulled as `:latest`. Pinning both this image's tag
 and the upstream base to a digest is a follow-up before production use (see
 the Dockerfile header).
 
+## Known follow-ups
+
+- **Provider secret echo (tracked, not fixed here):** `wrapper.py` forwards
+  the `hermes chat` subprocess's stdout/stderr verbatim into the platform
+  reply/error payload, inherited from claudecode's wrapper. For claudecode
+  that's a low-risk AceTeam-issued proxy token; for Hermes it's the
+  operator's own third-party provider API key sitting in the same process
+  environment. See
+  [citadel-cli#898](https://github.com/aceteam-ai/citadel-cli/issues/898) for
+  the scoped fix (redact known provider-key values from forwarded output) and
+  why it isn't done inline.
+- Pin both this image's tag and the upstream `nousresearch/hermes-agent` base
+  to a digest before production use (see the Dockerfile header).
+
 ## AceTeam-side follow-ups (different repo, NOT done here)
 
 - Wire `runtime_type: "hermes"` in `configGenerator.ts` / the `INSTANCE_TEMPLATES`
@@ -162,8 +183,6 @@ the Dockerfile header).
   sketches (it names `ghcr.io/aceteam-ai/hermes-agent:latest` as an EXAMPLE --
   that reference predates this PR and should be corrected to
   `ghcr.io/aceteam-ai/hermes-service` once published).
-- Publish the `ghcr.io/aceteam-ai/hermes-service` image via CI (mirrors how
-  claudecode-service's image was published after citadel-cli#432/#442).
 - Decide whether the fabric proxy should grow an OpenAI **Responses API**
   facade (`/v1/responses`) so Hermes's `openai-api` provider can point at it
   the way claudecode points `ANTHROPIC_BASE_URL` at the Anthropic-compatible

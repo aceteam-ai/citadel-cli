@@ -36,9 +36,9 @@ const (
 	// services above, claudecode ships as an installable catalog MODULE (its
 	// compose lives in aceteam-ai/citadel-services, not the embedded ServiceMap),
 	// but it is registered here so its host port is injected by the same
-	// HostPortEnv() mechanism. That is what lets a second agent-runtime module
-	// (Hermes/OpenClaw, aceteam#4591) claim the next slot in the 8200 block instead
-	// of every module hardcoding a literal 8204 and colliding.
+	// HostPortEnv() mechanism. That is what let the second agent-runtime module
+	// (Hermes, aceteam#8170, see EnvHermesHostPort below) claim the next slot in
+	// the 8200 block instead of hardcoding a literal 8204 and colliding.
 	EnvClaudecodeHostPort = "CITADEL_CLAUDECODE_HOST_PORT"
 	// EnvHermesHostPort carries the host port for the Hermes (Nous Research)
 	// agent-runtime module (aceteam#8170), the second agent-runtime harness after
