@@ -577,12 +577,17 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// rolling transcription + the in-call `/ace` command monitor, and captures
 	// Meet chat — all best-effort, so a stale live selector degrades to the batch
 	// behavior rather than regressing the recording. Otherwise the plain
-	// record-until-end loop runs exactly as the shipped batch notetaker.
-	outcome := h.runMeetingLoop(ctx, br, p, wavPath)
+	// record-until-end loop runs exactly as the shipped batch notetaker. A
+	// non-nil recorderErr means the recording process itself died mid-call
+	// (citadel#490) — the WAV on disk is truncated or empty, and this is
+	// reported as a job failure below rather than a silent "completed" result.
+	outcome, recorderErr := h.runMeetingLoop(ctx, br, p, wavPath, media)
 
 	// Finalize the recording (host: SIGINT ffmpeg + unload the sink; container:
 	// POST /record/stop). media.Close (deferred) then tears the browser down. Take
-	// the path from StopRecording so we transcribe exactly what was written.
+	// the path from StopRecording so we transcribe exactly what was written. Safe
+	// to call even after a recorderErr: the process has already exited, so this
+	// is just cleanup (unloading the sink / finalizing session state).
 	recordedPath, stopErr := media.StopRecording()
 	if stopErr != nil {
 		ctx.Log("warn", "     - [Job %s] recorder stop reported: %v", job.ID, stopErr)
@@ -595,8 +600,14 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	// WAV is finalized but BEFORE transcription — so the backend still receives
 	// the audio even when transcription fails (the failure path returns early
 	// below, and the backup is MOST valuable exactly then). Fully best-effort:
-	// it never returns an error and never touches the meeting result.
+	// it never returns an error and never touches the meeting result. Runs even
+	// on a recorderErr: whatever partial audio exists is still worth backing up.
 	h.backupAndPrune(ctx, job, p, recordedPath)
+
+	if recorderErr != nil {
+		ctx.Log("error", "     - [Job %s] recording died before the meeting ended (end_reason=%s): %v", job.ID, outcome.endReason, recorderErr)
+		return nil, fmt.Errorf("meeting recording failed: %w (truncated/empty audio saved at %s)", recorderErr, recordedPath)
+	}
 
 	// Transcribe node-locally by reusing the transcribe handler in-process. This
 	// end-of-call batch pass remains the SOURCE OF TRUTH for the stored
@@ -639,7 +650,16 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 // returns an interactiveOutcome; the plain path fills only endReason so the
 // result shape is uniform (chat/recognized_commands come back empty). Splitting
 // here keeps Execute's happy path readable and the streaming gate in one place.
-func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string) interactiveOutcome {
+//
+// media is threaded through so BOTH paths can watch the recorder's own death
+// signal (citadel#490) alongside their meeting-end poll — see
+// waitForMeetingEnd and waitForMeetingEndInteractive. A non-nil returned error
+// means the recorder died before the meeting ended; Execute surfaces that as a
+// job failure rather than a silent "completed" result over a truncated WAV.
+// This matters most for the interactive path: config.Meeting.StreamingEnabled
+// defaults true, so waitForMeetingEndInteractive is the loop a production Meet
+// meeting actually runs.
+func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string, media MeetingMedia) (interactiveOutcome, error) {
 	// The interactive during-call layer (announce / rolling `/ace` commands /
 	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
 	// MVP scope (#7000: join + record + transcribe, no in-call chat). Route Teams
@@ -647,7 +667,8 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	// end-detection (checkMeetingEndedFor). Wiring the interactive layer for Teams
 	// is a documented follow-up once its DOM is live-tuned.
 	if !h.StreamingEnabled || p.Platform == platformTeams {
-		return interactiveOutcome{endReason: h.waitForMeetingEnd(ctx, br, p)}
+		reason, err := h.waitForMeetingEnd(ctx, br, p, media)
+		return interactiveOutcome{endReason: reason}, err
 	}
 
 	// botMessages tracks the normalized text of messages the bot itself posts, so
@@ -662,7 +683,7 @@ func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p
 	transcribe := func() ([]TranscriptSegment, error) {
 		return h.transcribeSegments(ctx, p.MeetingID, wavPath)
 	}
-	return h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages)
+	return h.waitForMeetingEndInteractive(ctx, br, p, transcribe, meetingPollInterval, botMessages, media)
 }
 
 // runJoinFlow dispatches to the platform-specific pre-join sequence based on the
@@ -803,18 +824,33 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 
 // waitForMeetingEnd blocks until the call ends (end heuristic true, or the bot is
 // left alone), or until the hard duration cap trips. Returns a short reason
-// string for the result. It never errors: reaching the cap or an unreadable DOM
-// still yields a valid recording to transcribe.
-func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams) string {
+// string for the result. Reaching the cap or an unreadable DOM still yields a
+// valid recording to transcribe (no error there, as before) — but a non-nil
+// error IS now returned if media's recorder dies mid-call (citadel#490): the
+// wedge that motivated this fix was ffmpeg exiting early (pulse restart, OOM,
+// sink unloaded) while this loop kept polling the browser for the full
+// duration, then handed whisper a truncated/empty file with nothing to say it
+// happened. media.RecordingAlive() is selected on alongside the poll cadence
+// so death is caught within one poll tick rather than only at the next
+// checkMeetingEndedFor call (which never fires again once the browser side is
+// otherwise healthy) or the duration cap.
+func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser, p meetingJoinParams, media MeetingMedia) (string, error) {
 	deadline := time.Now().Add(p.maxDuration())
+	recorderDead := media.RecordingAlive()
 	for time.Now().Before(deadline) {
 		if reason, ended := checkMeetingEndedFor(p.Platform, br); ended {
-			return reason
+			return reason, nil
 		}
-		time.Sleep(meetingPollInterval)
+		select {
+		case <-recorderDead:
+			err := fmt.Errorf("recording process exited before the meeting ended; the saved audio is truncated or empty")
+			ctx.Log("error", "     - recorder died mid-meeting: %v", err)
+			return "recorder_died", err
+		case <-time.After(meetingPollInterval):
+		}
 	}
 	ctx.Log("info", "     - max meeting duration (%s) reached; leaving", p.maxDuration())
-	return "max_duration_reached"
+	return "max_duration_reached", nil
 }
 
 // checkMeetingEndedFor dispatches the end heuristic by platform so a Teams call

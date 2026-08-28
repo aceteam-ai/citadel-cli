@@ -62,6 +62,19 @@ type MeetingMedia interface {
 	StopRecording() (string, error)
 	// Close tears down the browser and audio stack. Idempotent.
 	Close() error
+	// RecordingAlive returns a channel that is closed the moment the underlying
+	// recording process exits — cleanly or otherwise — so the meeting loop can
+	// detect a dead recorder WHILE the call is still in progress (citadel#490)
+	// instead of only discovering it after the meeting-end poll (or the hard
+	// duration cap) finally returns, by which point the WAV is truncated or
+	// empty and nothing has flagged it. Callers select on this alongside their
+	// existing poll ticker.
+	//
+	// A backend that cannot observe recorder liveness this way returns a
+	// channel that never fires (nil is fine here — a nil channel blocks forever
+	// in a select), degrading to the pre-#490 behavior for that backend rather
+	// than risking a false "recorder died" report.
+	RecordingAlive() <-chan struct{}
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +131,17 @@ func (m *hostMedia) StopRecording() (string, error) {
 		p = m.wavPath
 	}
 	return p, err
+}
+
+// RecordingAlive delegates to the null-sink recorder's own death signal
+// (platform.NullSinkRecorder.Exited). m.rec is set by Start and cleared by
+// Close, so a call outside that window (or before StartRecording has run)
+// returns nil — no signal, never a false positive.
+func (m *hostMedia) RecordingAlive() <-chan struct{} {
+	if m.rec == nil {
+		return nil
+	}
+	return m.rec.Exited()
 }
 
 func (m *hostMedia) Close() error {
@@ -293,6 +317,18 @@ func (m *containerMedia) StopRecording() (string, error) {
 		return m.wavAbsPath, fmt.Errorf("meetingd stop recording returned status %d: %s", status, string(respBody))
 	}
 	return m.wavAbsPath, nil
+}
+
+// RecordingAlive: meetingd owns and reaps its own in-container ffmpeg process
+// entirely over HTTP (POST /sessions, /record, /record/stop) — there is no
+// equivalent liveness channel exposed by that control API today, so container
+// recording liveness isn't observable the same way host recording is. Return a
+// channel that never fires; this backend degrades to the pre-citadel#490
+// behavior (a dead in-container recorder is invisible until the next
+// meeting-end poll or the duration cap) rather than the fix, which is
+// documented here as a known gap, not silently dropped.
+func (m *containerMedia) RecordingAlive() <-chan struct{} {
+	return nil
 }
 
 func (m *containerMedia) Close() error {
