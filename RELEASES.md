@@ -1945,3 +1945,20 @@ Auto-generated log of every release.
   - docs: design for per-job resource isolation on consumer GPUs (#831/#842/#843) (#897)
 
 
+---
+
+## v2.126.0 — 2026-08-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 32 |
+| Lines added | +2126 |
+
+**Changes:**
+
+  - fix: three latent engine bugs surfaced by the #685/#686 design review (#905)
+  - feat(jobs,status,catalog): RAM cgroup ceiling + citadel-side VRAM preflight estimate (#831) (#907)
+  - fix(jobs): redirect model_cache_pull HF download to the canonical citadel cache (#682 P0) (#904)
+
+
