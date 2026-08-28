@@ -29,7 +29,8 @@ var availableDiskBytesFn = defaultAvailableDiskBytes
 // download size before a pull is allowed to proceed. A download writes
 // partial/resume files during the pull and the on-disk layout can exceed the
 // summed repo file sizes slightly, so this is not just rounding slop.
-// Overridable per-job via the payload's `min_free_bytes` field.
+// Overridable per-job via the payload's `min_headroom_bytes` field
+// (parseMinHeadroomBytes, model_cache_pull.go).
 const diskSafetyMarginBytes int64 = 2 << 30 // 2 GiB
 
 // nearestExistingDir walks up from path until it finds a directory that

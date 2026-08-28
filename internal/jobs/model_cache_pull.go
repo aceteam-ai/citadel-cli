@@ -399,7 +399,7 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 	}
 
 	allowPatterns, ignorePatterns := parseModelCachePullPatterns(payload)
-	marginBytes := parseMinFreeBytes(payload, diskSafetyMarginBytes)
+	marginBytes := parseMinHeadroomBytes(payload, diskSafetyMarginBytes)
 
 	finalAllow, finalIgnore, blockErr := runDiskPreflight(ctx, modelName, allowPatterns, ignorePatterns, marginBytes)
 	if blockErr != nil {
@@ -432,11 +432,19 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 	return json.Marshal(result)
 }
 
-// parseMinFreeBytes reads the optional `min_free_bytes` payload field
+// parseMinHeadroomBytes reads the optional `min_headroom_bytes` payload field
 // (citadel #828's configurable safety margin), falling back to def when
 // absent, empty, or unparsable.
-func parseMinFreeBytes(payload map[string]string, def int64) int64 {
-	raw := strings.TrimSpace(payload["min_free_bytes"])
+//
+// Named (and, per a #840 review WANT, RENAMED from the original
+// `min_free_bytes`) to match what this number actually is: headroom required
+// ABOVE the estimated download size, not a minimum total-free-disk floor —
+// `min_free_bytes` read like the latter, which would have been a materially
+// different (and wrong) check once anything actually sent it. Inert today
+// (the aceteam backend does not send either key yet), so the rename is a
+// no-op in practice and free to make before it matters.
+func parseMinHeadroomBytes(payload map[string]string, def int64) int64 {
+	raw := strings.TrimSpace(payload["min_headroom_bytes"])
 	if raw == "" {
 		return def
 	}
@@ -467,6 +475,13 @@ func parseMinFreeBytes(payload map[string]string, def int64) int64 {
 // new failure mode. It fails CLOSED (non-nil err, nothing downloaded) only on
 // a positive, confirmed required-bytes-exceeds-available-bytes result, which
 // is #828's actual ask.
+//
+// requiredBytes is netted against hfCacheModelSizeFn(modelName) before the
+// gate runs (citadel#840 review), so a redeploy of an already-cached model --
+// MODEL_CACHE_PULL is dispatched on every deploy, cached or not -- gates on
+// the REMAINING download, not the full repo size. Without this, an
+// already-fully-cached model on a now-tight-on-disk node (tight BECAUSE it's
+// cached) would fail closed on what used to be a free no-op.
 func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePatterns []string, marginBytes int64) (finalAllow, finalIgnore []string, err error) {
 	reqCtx, cancel := context.WithTimeout(ctx.Context(), hfMetadataTimeout)
 	defer cancel()
@@ -486,9 +501,42 @@ func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePat
 	}
 
 	requiredBytes := sumFilteredSize(entries, finalAllow, finalIgnore)
+
+	// citadel#840 review (BLOCKING): MODEL_CACHE_PULL is dispatched on every
+	// deploy, including a redeploy of a model that's already fully (or
+	// partially) present in the local HF hub cache -- and `hf download` into
+	// that cache (no --local-dir) is resumable/idempotent: already-present
+	// blobs are not re-fetched. Without crediting what's already on disk,
+	// requiredBytes here is computed as if downloading entirely from
+	// scratch, and because "model already cached" strongly correlates with
+	// "disk is tight" (the cache is what made it tight), that turns a
+	// previously-trivial no-op redeploy into a preflight failure -- a worse
+	// regression than the disk-fill this preflight exists to prevent. Net
+	// out the already-cached bytes (reusing hfCacheModelSize, the same walk
+	// pullHuggingFace's own post-download no-op check uses) so the gate acts
+	// on the REMAINING bytes to download, not the full repo size. Clamped at
+	// 0, never negative.
+	//
+	// This is a deliberately coarse credit, not a byte-exact one: it nets the
+	// TOTAL cached size for the model against the CURRENT filtered
+	// requirement, without correlating specific files/blobs. A model cached
+	// under different patterns than the current request would still net
+	// (accurately, since HF's blob store is content-addressed and dedupes
+	// across requests) if fully re-coverable, but a partial, unrelated cache
+	// could theoretically under-credit or over-credit slightly. Netting the
+	// coarse total is still strictly more correct than the pre-fix behavior
+	// of crediting nothing at all.
+	if cached := hfCacheModelSizeFn(modelName); cached > 0 {
+		requiredBytes -= cached
+		if requiredBytes < 0 {
+			requiredBytes = 0
+		}
+	}
+
 	if requiredBytes <= 0 {
-		// No sizeable files matched (or the tree response carried no sizes) --
-		// nothing to gate on.
+		// Nothing left to download (fully covered by the local cache), or no
+		// sizeable files matched, or the tree response carried no sizes --
+		// either way, nothing to gate on.
 		return finalAllow, finalIgnore, nil
 	}
 
@@ -536,6 +584,15 @@ func hfCacheBaseDir() string {
 	}
 	return filepath.Join(home, ".cache", "huggingface", "hub")
 }
+
+// hfCacheModelSizeFn resolves how many bytes of a model are already present
+// in the local HF cache. Overridable for tests (citadel#840 review); production
+// wiring is hfCacheModelSize -- the SAME function pullHuggingFace's own
+// post-download no-op check (above) already calls, reused here (not
+// reimplemented) so the preflight's "already cached" notion and the
+// no-op-detection's "did anything land" notion never disagree about what
+// "cached" means.
+var hfCacheModelSizeFn = hfCacheModelSize
 
 // hfCacheModelSize walks the HuggingFace cache directory for the model and
 // sums file sizes. Returns 0 if the cache directory cannot be found.

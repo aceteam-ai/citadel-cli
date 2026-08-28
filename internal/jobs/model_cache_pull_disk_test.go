@@ -109,8 +109,12 @@ func TestHFCacheBaseDirPrecedence(t *testing.T) {
 // free-space and size-estimate funcs both injected (per the issue's testing
 // guidance), so it needs no real disk or network access.
 func TestRunDiskPreflightInjected(t *testing.T) {
-	origTree, origDisk := hfRepoTreeFn, availableDiskBytesFn
-	t.Cleanup(func() { hfRepoTreeFn, availableDiskBytesFn = origTree, origDisk })
+	origTree, origDisk, origCacheSize := hfRepoTreeFn, availableDiskBytesFn, hfCacheModelSizeFn
+	t.Cleanup(func() { hfRepoTreeFn, availableDiskBytesFn, hfCacheModelSizeFn = origTree, origDisk, origCacheSize })
+	// Every sub-test below that doesn't care about caching must see "nothing
+	// cached", matching pre-fix behavior -- only the caching-specific
+	// sub-tests override this.
+	hfCacheModelSizeFn = func(modelName string) int64 { return 0 }
 
 	jc := JobContext{}
 
@@ -235,6 +239,86 @@ func TestRunDiskPreflightInjected(t *testing.T) {
 		}
 		if allow == nil {
 			t.Fatal("expected auto-derived allow patterns, got nil")
+		}
+	})
+
+	// citadel#840 review (BLOCKING regression): MODEL_CACHE_PULL redeploys on
+	// every deploy, even a model already sitting in the local HF hub cache.
+	// `hf download` (no --local-dir) is resumable/idempotent -- already-present
+	// blobs are not re-fetched -- so requiredBytes must be netted against what's
+	// already cached, or a redeploy of an already-cached model on a
+	// now-tight-on-disk node (tight BECAUSE that cache is what filled it) fails
+	// closed on a pull that would actually download nothing.
+	t.Run("proceeds when the model is already fully cached, even though the full repo size would not fit", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "huge.safetensors", Size: 161 << 30},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			// Nowhere close to covering the full 161GB -- if the fix regressed,
+			// this alone would fail the preflight closed.
+			return 5 << 30, nil
+		}
+		origCache := hfCacheModelSizeFn
+		hfCacheModelSizeFn = func(modelName string) int64 { return 161 << 30 } // fully cached
+		t.Cleanup(func() { hfCacheModelSizeFn = origCache })
+
+		_, _, err := runDiskPreflight(jc, "Lightricks/LTX-Video", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected a fully-cached model to proceed as a no-op redeploy, got blocking error: %v", err)
+		}
+	})
+
+	t.Run("partially cached: gates on the REMAINING bytes, not the full repo size", func(t *testing.T) {
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "huge.safetensors", Size: 161 << 30},
+			}, nil
+		}
+		// Only 20GiB free -- would fail against the full 161GB, but 150GB is
+		// already cached, so only ~11GB (well under the margin-adjusted
+		// available) actually needs to download.
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 20 << 30, nil
+		}
+		origCache := hfCacheModelSizeFn
+		hfCacheModelSizeFn = func(modelName string) int64 { return 150 << 30 }
+		t.Cleanup(func() { hfCacheModelSizeFn = origCache })
+
+		_, _, err := runDiskPreflight(jc, "Lightricks/LTX-Video", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected the ~11GB REMAINING download to fit in 20GiB free, got blocking error: %v", err)
+		}
+	})
+
+	t.Run("partially cached but the remaining bytes still don't fit: still fails closed", func(t *testing.T) {
+		// Proves netting is not a blanket "any caching at all skips the gate"
+		// shortcut -- a partial cache that leaves a genuinely-too-large
+		// remainder must still block.
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "huge.safetensors", Size: 161 << 30},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			return 20 << 30, nil // 20GiB free
+		}
+		origCache := hfCacheModelSizeFn
+		// Only 50GB cached -- 111GB would still need to download, which does not
+		// fit in 20GiB free.
+		hfCacheModelSizeFn = func(modelName string) int64 { return 50 << 30 }
+		t.Cleanup(func() { hfCacheModelSizeFn = origCache })
+
+		err := func() error {
+			_, _, err := runDiskPreflight(jc, "Lightricks/LTX-Video", nil, nil, diskSafetyMarginBytes)
+			return err
+		}()
+		if err == nil {
+			t.Fatal("expected a blocking error: the remaining ~111GB does not fit in 20GiB free even after netting the 50GB cached")
+		}
+		if !strings.Contains(err.Error(), "insufficient disk space") {
+			t.Errorf("error = %v, want an 'insufficient disk space' message", err)
 		}
 	})
 }
