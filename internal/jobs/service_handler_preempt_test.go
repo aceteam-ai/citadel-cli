@@ -32,6 +32,55 @@ func TestParseRequiredVRAMBytes(t *testing.T) {
 	}
 }
 
+// TestResolveRequiredVRAMBytes pins citadel#831's VRAM-preflight wiring:
+// payload always wins when present; the citadel-side estimate
+// (status.EngineVRAMEstimateMB) is used ONLY as a fallback and ONLY when
+// CITADEL_RESOURCE_ISOLATION is opted in; absent both, the result is 0 --
+// today's inert #577 behavior, unchanged when the flag is off.
+func TestResolveRequiredVRAMBytes(t *testing.T) {
+	t.Run("payload always wins, flag off", func(t *testing.T) {
+		payload := map[string]string{"vram_mb": "8192"}
+		got := resolveRequiredVRAMBytes("vllm", payload)
+		if want := uint64(8192) * 1024 * 1024; got != want {
+			t.Errorf("got %d, want %d", got, want)
+		}
+	})
+
+	t.Run("payload always wins, flag on", func(t *testing.T) {
+		t.Setenv("CITADEL_RESOURCE_ISOLATION", "1")
+		payload := map[string]string{"vram_gb": "6"}
+		got := resolveRequiredVRAMBytes("vllm", payload)
+		if want := uint64(6) * 1024 * 1024 * 1024; got != want {
+			t.Errorf("got %d, want %d (payload must override the citadel-side estimate)", got, want)
+		}
+	})
+
+	t.Run("no payload, flag off => inert (0)", func(t *testing.T) {
+		if got := resolveRequiredVRAMBytes("vllm", map[string]string{}); got != 0 {
+			t.Errorf("got %d, want 0 when CITADEL_RESOURCE_ISOLATION is unset", got)
+		}
+	})
+
+	t.Run("no payload, flag on => citadel-side estimate", func(t *testing.T) {
+		t.Setenv("CITADEL_RESOURCE_ISOLATION", "1")
+		got := resolveRequiredVRAMBytes("vllm", map[string]string{})
+		want := uint64(status.EngineVRAMEstimateMB("vllm")) * 1024 * 1024
+		if want == 0 {
+			t.Fatal("test fixture assumption broken: vllm must have a nonzero EngineVRAMEstimateMB")
+		}
+		if got != want {
+			t.Errorf("got %d, want %d (status.EngineVRAMEstimateMB fallback)", got, want)
+		}
+	})
+
+	t.Run("no payload, flag on, unknown engine => 0", func(t *testing.T) {
+		t.Setenv("CITADEL_RESOURCE_ISOLATION", "1")
+		if got := resolveRequiredVRAMBytes("no-such-engine", map[string]string{}); got != 0 {
+			t.Errorf("got %d, want 0 for an engine with no table entry", got)
+		}
+	})
+}
+
 func TestFreeVRAMBytes(t *testing.T) {
 	// No GPU reporting a total => unknown (found=false), so callers skip the fit
 	// check rather than treat unknown as zero-free.

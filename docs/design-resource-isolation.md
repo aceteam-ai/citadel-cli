@@ -326,3 +326,43 @@ them.
    overrun in practice force revisiting MPS (#842) sooner than "if preflight
    proves insufficient" implies? Worth a explicit revisit trigger/threshold
    rather than leaving it open-ended.
+
+## 7. Implementation status (citadel#831 v1, shipped)
+
+§5's "build now" items 1-3 shipped together, gated behind a single opt-in
+`CITADEL_RESOURCE_ISOLATION` flag (default OFF — see CLAUDE.md's "Per-job
+resource isolation" section for the exact mechanism, file names, and why one
+flag rather than two). Resolutions to §6's open questions, either from the
+owner's 2026-08-25 design-decision comment on citadel#831 or, where still
+left open by that comment, chosen here:
+
+1. **Reserved-floor sizing (Q1, left open by the owner):** a fixed 2GiB OS
+   headroom on top of pinned services' own measured RAM footprint. When the
+   resulting ceiling would fall below a 2GiB viable minimum, RAMBudgetBytes
+   returns 0 ("no safe ceiling can be derived") rather than clamping UP to
+   that minimum — a clamped-up value would be fabricated, with no
+   relationship to what's actually free, and applying it as a real inference
+   engine's `mem_limit` would reproduce the exact failure this doc warns
+   about for the Tier-2 2GB default. The caller skips applying any ceiling
+   for that start instead (fail open). `status.RAMBudgetBytes` /
+   `ramHeadroomBytes` / `minViableRAMCeilingBytes` (`internal/status/ram.go`).
+   A chosen default, not a value pinned by an external spec — reconsider if
+   operational experience says otherwise.
+2. **Where the RAM/VRAM requirement comes from (Q2):** VRAM now has a real
+   citadel-side estimate (`status.EngineVRAMEstimateMB`, reused from the
+   hotswap planner — see CLAUDE.md). RAM does NOT get an equivalent estimate
+   table in v1: `ram_mb`/`ram_gb` mirrors `vram_mb`/`vram_gb`'s payload-only
+   contract exactly, and an absent value fails OPEN (never refuses) rather
+   than guessing a per-engine RAM number this doc has no vetted source for —
+   the safer of the two options this implementation had to pick between when
+   the doc left this open for RAM specifically.
+3. **RAM preflight refusal behavior (Q3):** resolved by the owner — job
+   FAILURE, no on-node queue, matching #828's disk preflight exactly.
+   `status.PlanRAMPreflight`.
+4. **CPU-offload-vs-GPU-offload preference (Q4):** NOT built here — remains
+   its own follow-up issue, as §5 item 5 anticipated.
+5. **VRAM preflight-only posture indefinitely (Q5):** unchanged by this
+   implementation; still an open revisit trigger, not resolved here.
+
+Explicitly NOT built (still parked, per §5): MIG (#843) and MPS (#842) hard
+VRAM caps.

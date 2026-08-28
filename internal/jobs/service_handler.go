@@ -236,7 +236,19 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		// metadata marking which models need it so the deploy path can set it
 		// automatically (and clear it for every other deploy to the same
 		// service).
-		return h.serviceStart(ctx, svc, job.Payload["model"], parseRequiredVRAMBytes(job.Payload), parseTrustRemoteCodeIntent(job.Payload))
+		//
+		// Optional RAM budget (#831): mirrors vram_mb/vram_gb exactly --
+		// parseRequiredRAMBytes reads ram_mb/ram_gb from the payload, which the
+		// aceteam backend does not send today either. requiredVRAMBytes now
+		// resolves through resolveRequiredVRAMBytes rather than
+		// parseRequiredVRAMBytes directly: payload still wins when present, but
+		// when CITADEL_RESOURCE_ISOLATION is opted in and the payload carries
+		// nothing, it falls back to this node's own per-engine VRAM estimate
+		// (status.EngineVRAMEstimateMB) so preemption works without waiting on
+		// the backend (see resolveRequiredVRAMBytes).
+		return h.serviceStart(ctx, svc, job.Payload["model"],
+			resolveRequiredVRAMBytes(svc.Name, job.Payload), parseRequiredRAMBytes(job.Payload),
+			parseTrustRemoteCodeIntent(job.Payload))
 	case "SERVICE_STOP":
 		// A remote SERVICE_STOP is operator/cloud intent: mark the service
 		// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
@@ -295,7 +307,10 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 // running engine falls through to `up -d --force-recreate` and reloads it.
 // trustRemoteCode is the optional --trust-remote-code intent (#848); same
 // persist-then-recreate treatment as model, via persistServiceTrustRemoteCode.
-func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) ([]byte, error) {
+// requiredRAMBytes is the optional RAM budget (#831) applyRAMIsolation's
+// preflight enforces; like requiredVRAMBytes it is 0 when no budget is known,
+// which always fits (fail-safe on an absent signal).
+func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes, requiredRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
 	// appliedModel is the model this start serves via compose env interpolation;
@@ -382,20 +397,36 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				Action: "start", Message: msg,
 			})
 		}
-		// Preempt non-pinned services to free VRAM for this deploy (#577). Gated
-		// on the target NOT already running: an already-running start (including
-		// the model-change --force-recreate path below, which reached here with
-		// modelChanged==true) already holds its own VRAM, so evicting peers for it
-		// would be a needless disruption. Returns an error — failing the deploy —
-		// when the requirement cannot be met without evicting a pinned service.
+		composePath, pathErr := h.resolveComposePath(svc)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		// ramOverridePath is the citadel#831 per-service RAM ceiling override
+		// (empty when resource isolation is off, the target isn't GPU, or the
+		// target is already running -- see applyRAMIsolation and the gate
+		// below). Declared here so it is in scope for the composeArgs append
+		// further down, alongside the sandbox override.
+		var ramOverridePath string
+		// Preempt non-pinned services to free VRAM for this deploy (#577), and
+		// separately size/apply this deploy's own RAM ceiling (#831). Both are
+		// gated on the target NOT already running: an already-running start
+		// (including the model-change --force-recreate path below, which
+		// reached here with modelChanged==true) already holds its own
+		// VRAM/RAM, so evicting peers or resizing its ceiling would be a
+		// needless disruption. Each returns an error — failing the deploy —
+		// when its requirement cannot be met (VRAM: without evicting a pinned
+		// service; RAM: a declared budget that doesn't fit — see
+		// applyRAMIsolation's RAM-preflight doc comment for the fail-open/
+		// fail-closed contract).
 		if !h.isDockerServiceRunning(svc.Name) {
 			if err := h.preemptForVRAM(ctx, svc, requiredVRAMBytes); err != nil {
 				return nil, err
 			}
-		}
-		composePath, pathErr := h.resolveComposePath(svc)
-		if pathErr != nil {
-			return nil, pathErr
+			var ramErr error
+			ramOverridePath, ramErr = h.applyRAMIsolation(ctx, svc, composePath, requiredRAMBytes)
+			if ramErr != nil {
+				return nil, ramErr
+			}
 		}
 		// Transitional (#528): remove any container still under the legacy
 		// "citadel-<name>" compose project (created by pre-fix TUI/config-apply
@@ -410,6 +441,11 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		if override := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
 			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
 			composeArgs = append(composeArgs, "-f", override)
+		}
+		// citadel#831 RAM ceiling override (empty when not applicable — see the
+		// ramOverridePath assignment above and applyRAMIsolation).
+		if ramOverridePath != "" {
+			composeArgs = append(composeArgs, "-f", ramOverridePath)
 		}
 		// Pass the sibling config env (<name>.env) explicitly: docker compose
 		// only auto-loads a file literally named ".env", so without --env-file
@@ -604,7 +640,7 @@ func (h *ServiceHandler) StartServiceByName(name string) error {
 	// trustRemoteCodeUnspecified leaves any already-persisted trust setting
 	// untouched (see parseTrustRemoteCodeIntent) -- restoring a reservation
 	// must not itself change trust posture.
-	res, err := h.serviceStart(JobContext{LogFn: func(string, string) {}}, svc, "", 0, trustRemoteCodeUnspecified)
+	res, err := h.serviceStart(JobContext{LogFn: func(string, string) {}}, svc, "", 0, 0, trustRemoteCodeUnspecified)
 	if err != nil {
 		return err
 	}
@@ -640,6 +676,213 @@ func parseRequiredVRAMBytes(payload map[string]string) uint64 {
 		}
 	}
 	return 0
+}
+
+// resolveRequiredVRAMBytes decides the VRAM budget (bytes) preemptForVRAM
+// enforces for a SERVICE_START (citadel#831, wiring #577's preflight to a
+// citadel-side estimate so it works without waiting on the backend):
+//
+//  1. The payload-declared value always wins when present
+//     (parseRequiredVRAMBytes > 0) — an explicit backend-provided budget is
+//     always more precise than anything this node can guess.
+//  2. Otherwise, ONLY when CITADEL_RESOURCE_ISOLATION is opted in
+//     (resourceIsolationEnabled), fall back to this node's own per-engine
+//     VRAM estimate: status.EngineVRAMEstimateMB, the SAME provisioning-budget
+//     table the model-hotswap swap planner already uses as ITS fallback
+//     (citadel#689) when it has never measured the (engine, model) pair being
+//     swapped in. Reusing it here means no new numbers to invent or keep in
+//     sync — one table, two consumers.
+//  3. Absent both, returns 0 — today's inert behavior (#577 shipped gated on
+//     a payload field the backend never sends), UNCHANGED while the flag is
+//     off. This is the deliberate safe-by-default posture: flipping on VRAM
+//     preemption for every deploy is a real behavior change (it can now durably
+//     stop other services on a node that has never had that happen before), so
+//     it stays off until an operator opts in on a node they've reviewed.
+func resolveRequiredVRAMBytes(svcName string, payload map[string]string) uint64 {
+	if v := parseRequiredVRAMBytes(payload); v > 0 {
+		return v
+	}
+	if !resourceIsolationEnabled() {
+		return 0
+	}
+	mb := status.EngineVRAMEstimateMB(svcName)
+	if mb <= 0 {
+		return 0
+	}
+	return uint64(mb) * 1024 * 1024
+}
+
+// ---------------------------------------------------------------------------
+// RAM isolation (citadel#831): per-service mem_limit ceiling + RAM preflight
+// ---------------------------------------------------------------------------
+//
+// See docs/design-resource-isolation.md §2/§4 and the owner's design-decision
+// comment on citadel#831 (2026-08-25): RAM gets a REAL cgroup limit (unlike
+// VRAM, which has no hardware/driver mechanism to hard-cap on the 3090 target
+// fleet — preflight/preemption only). Both this and resolveRequiredVRAMBytes's
+// citadel-side VRAM estimate above are gated behind the SAME opt-in flag: they
+// are the two halves of #831 v1, both newly able to refuse or durably stop a
+// deploy on a node that has never seen that happen, so both stay off by
+// default until an operator opts in — matching this codebase's convention for
+// every other toggle that can change eviction/refusal behavior
+// (CITADEL_GROUNDING_GUARDRAIL, SERVICE_AUTO_STOP_WHEN_IDLE,
+// CITADEL_ENERGY_SAMPLING, ...).
+
+// resourceIsolationEnabled reports whether citadel#831's v1 mechanisms are
+// active on this node. Default OFF; truthy 1/true/yes/on
+// (case/whitespace-insensitive), matching every other opt-in toggle in this
+// codebase. A garbage/unset value stays OFF (unlike CITADEL_MODEL_HOTSWAP's
+// break-glass-disable convention, which defaults ON — this is the opposite
+// direction: a NEW capability that can newly refuse/evict, not an existing
+// one being turned off).
+func resourceIsolationEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_RESOURCE_ISOLATION"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// parseRequiredRAMBytes reads the optional RAM budget a SERVICE_START job
+// declares, in bytes. Deliberately mirrors parseRequiredVRAMBytes's shape and
+// naming exactly (ram_mb preferred, else ram_gb; a missing/blank/non-numeric/
+// non-positive value yields 0 = "no requirement declared"). The aceteam
+// backend does not send either key today — same pre-#831 state vram_mb/
+// vram_gb were in before #577 — so this exists mainly to make the preflight
+// forward-compatible with a future backend-declared budget; PlanRAMPreflight
+// fails OPEN (never refuses) when this returns 0, matching #577/#828's
+// identical fail-safe-on-absent-signal contract.
+func parseRequiredRAMBytes(payload map[string]string) uint64 {
+	if v := strings.TrimSpace(payload["ram_mb"]); v != "" {
+		if mb, err := strconv.ParseFloat(v, 64); err == nil && mb > 0 {
+			return uint64(mb * 1024 * 1024)
+		}
+	}
+	if v := strings.TrimSpace(payload["ram_gb"]); v != "" {
+		if gb, err := strconv.ParseFloat(v, 64); err == nil && gb > 0 {
+			return uint64(gb * 1024 * 1024 * 1024)
+		}
+	}
+	return 0
+}
+
+// pinnedRAMBytes sums the RAM footprint currently attributed to RUNNING
+// pinned services, excluding the deploy target itself. Mirrors
+// buildPreemptCandidates' enumeration (RUNNING managed services only), but
+// only needs the RAM sum — RAM isolation does not preempt (that's a
+// documented follow-up per the design doc; RAM safety here comes entirely
+// from the per-service cgroup ceiling, not eviction).
+func pinnedRAMBytes(st *status.NodeStatus, exclude string, pinned map[string]bool) uint64 {
+	var total uint64
+	for i := range st.Services {
+		s := &st.Services[i]
+		if s.Name == exclude || s.Status != status.ServiceStatusRunning || !pinned[s.Name] {
+			continue
+		}
+		if s.Footprint != nil {
+			total += s.Footprint.RAMBytes
+		}
+	}
+	return total
+}
+
+// applyRAMIsolation computes and writes the per-service RAM ceiling override
+// for a GPU service about to start (citadel#831 §2), and separately refuses
+// the start (RAM preflight, §4) when a declared RAM requirement does not fit.
+// Returns the override file path to append as an additional compose `-f`
+// (empty when isolation is off, the target isn't a GPU service, or nothing
+// else applies). A non-nil error is a hard refusal: the caller MUST fail the
+// deploy (job FAILURE), per the owner's citadel#831 design decision ("refuse
+// fast, clear error").
+//
+// Fails OPEN (skips isolation silently, does NOT refuse) on any
+// signal-collection error — unreadable compose, uncollectable node status,
+// unreadable manifest — mirroring #828's disk-preflight policy exactly: an
+// estimation/signal failure must never turn a previously-working deploy into
+// a new failure mode. The ONLY refusing case is a CONFIRMED shortfall: a
+// declared RAM requirement that a successfully-collected budget says will not
+// fit (PlanRAMPreflight).
+func (h *ServiceHandler) applyRAMIsolation(ctx JobContext, svc manifestService, composePath string, requiredRAMBytes uint64) (string, error) {
+	if !resourceIsolationEnabled() {
+		return "", nil
+	}
+	baseContent, readErr := os.ReadFile(composePath)
+	if readErr != nil {
+		ctx.Log("warning", "     - [ram] could not read compose for %s: %v; skipping RAM isolation", svc.Name, readErr)
+		return "", nil
+	}
+	isGPU, gpuErr := catalog.ComposeDeclaresGPU(string(baseContent))
+	if gpuErr != nil {
+		ctx.Log("warning", "     - [ram] could not parse compose for %s: %v; skipping RAM isolation", svc.Name, gpuErr)
+		return "", nil
+	}
+	if !isGPU {
+		return "", nil // RAM isolation is scoped to GPU/media services (§2); non-GPU services are unaffected
+	}
+
+	st, err := h.collectNodeStatus()
+	if err != nil {
+		ctx.Log("warning", "     - [ram] could not collect node status: %v; skipping RAM isolation for %s", err, svc.Name)
+		return "", nil
+	}
+	// Reuses freeVRAMBytes's own "found" signal for hostHasGPU: it is already
+	// the exact fail-safe GPU-presence check this file uses for VRAM
+	// (freeVRAMBytes, #833), so this stays consistent with
+	// GenerateGPUMemoryOverride's own hostHasGPU gate without an extra
+	// nvidia-smi probe.
+	_, hostHasGPU := freeVRAMBytes(st.GPU)
+	if !hostHasGPU {
+		return "", nil
+	}
+
+	manifest, mErr := h.loadManifest()
+	if mErr != nil {
+		ctx.Log("warning", "     - [ram] could not load manifest: %v; skipping RAM isolation for %s", mErr, svc.Name)
+		return "", nil
+	}
+	pinned := manifest.pinnedSet()
+	pinnedRAM := pinnedRAMBytes(st, svc.Name, pinned)
+	var availableRAM uint64
+	if st.System.MemoryAvailableGB > 0 {
+		availableRAM = uint64(st.System.MemoryAvailableGB * float64(1<<30))
+	}
+
+	// RAM preflight (§4): refuse ONLY on a confirmed shortfall against a
+	// declared requirement; requiredRAMBytes==0 (no payload field) always Fits.
+	plan := status.PlanRAMPreflight(requiredRAMBytes, availableRAM, pinnedRAM)
+	if !plan.Fits {
+		return "", fmt.Errorf("cannot start %s: %s", svc.Name, plan.Reason)
+	}
+
+	// RAMBudgetBytes returns 0 when no safe ceiling can be derived (a
+	// transiently tight reading, e.g.) -- GenerateGPUMemoryOverride rejects a
+	// non-positive limit, which the genErr branch below treats as fail-open
+	// (skip isolation this start) rather than applying a fabricated small
+	// cap. See RAMBudgetBytes' doc comment for why returning 0 here, not a
+	// clamped floor, is the safe direction.
+	ceiling := status.RAMBudgetBytes(availableRAM, pinnedRAM)
+	override, genErr := catalog.GenerateGPUMemoryOverride(string(baseContent), int64(ceiling), hostHasGPU)
+	if genErr != nil {
+		ctx.Log("warning", "     - [ram] could not derive a safe RAM ceiling for %s (%v); skipping RAM isolation for this start", svc.Name, genErr)
+		return "", nil
+	}
+	if override == "" {
+		return "", nil // nothing to override (e.g. base compose already sets its own mem_limit)
+	}
+
+	dir := filepath.Dir(composePath)
+	name := strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))
+	overridePath := catalog.GPURAMOverridePath(dir, name)
+	// 0600, matching every other manifest/override write in this tree
+	// (writeManifestBytes, the sandbox override) -- not 0644.
+	if writeErr := os.WriteFile(overridePath, []byte(override), 0600); writeErr != nil {
+		ctx.Log("warning", "     - [ram] could not write RAM override for %s: %v; skipping RAM isolation", svc.Name, writeErr)
+		return "", nil
+	}
+	ctx.Log("info", "     - [ram] applying mem_limit ceiling of %.1fGB to %s (%.1fGB available, %.1fGB reserved for pinned services + headroom)",
+		float64(ceiling)/(1<<30), svc.Name, float64(availableRAM)/(1<<30), float64(pinnedRAM)/(1<<30))
+	return overridePath, nil
 }
 
 // ---------------------------------------------------------------------------

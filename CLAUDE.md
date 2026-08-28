@@ -1226,6 +1226,93 @@ and `citadel services`).
 - The TUI control center collector is not yet fed `PinnedServices` (heartbeat and
   `citadel services` are); low-priority follow-up.
 
+### Per-job resource isolation: RAM cgroup ceiling + citadel-side VRAM preflight estimate (citadel #831)
+
+Design doc: [docs/design-resource-isolation.md](docs/design-resource-isolation.md)
+(read it for the full RAM-vs-VRAM tractability analysis; MIG/MPS hard VRAM caps
+are explicitly parked there — #842/#843 — and NOT part of this). Both halves
+below are gated behind ONE opt-in flag, default OFF:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_RESOURCE_ISOLATION` | unset (OFF) | Enables both mechanisms below. Truthy: `1`/`true`/`yes`/`on`. |
+
+Off by default because both can newly refuse or durably affect a GPU-service
+start on a node that has never seen that happen — the same posture this
+codebase already uses for every toggle that changes eviction/refusal behavior
+(`SERVICE_AUTO_STOP_WHEN_IDLE`, `CITADEL_GROUNDING_GUARDRAIL`,
+`CITADEL_ENERGY_SAMPLING`, ...). The design doc's owner decision (2026-08-25,
+on citadel#831) resolved the POLICY ("real cgroup for RAM," "preflight-only,
+refuse fast for VRAM," "no on-node wait queue") but left exact reserved-floor
+SIZING an open question (§6 Q1) — this flag is the deliberate way to light the
+mechanism up on a node an operator has reviewed, without waiting for the
+sizing question to be fully closed or for the backend to start forwarding
+`vram_mb`/`ram_mb`.
+
+**1. RAM cgroup ceiling for GPU services (`internal/jobs.applyRAMIsolation`,
+`internal/catalog/ram_override.go`, `internal/status/ram.go`).** Extends the
+existing `.sandbox.yml` override delivery (`catalog.GenerateHardeningOverride`,
+Service Management section above) to the population it deliberately EXEMPTS —
+GPU/inference services — but with a NARROWER override (`mem_limit` only, no
+cap-drop/read-only-rootfs, delivered as a separate `<name>.ram.yml` so the two
+overrides never collide) and a generous, dynamically-derived ceiling instead of
+the Tier-2 2GB default. `status.RAMBudgetBytes(availableRAMBytes,
+pinnedRAMBytes)` computes it: `SystemMetrics.MemoryAvailableGB` minus the
+RUNNING `pinned_services`' own measured `Footprint.RAMBytes` minus a 2GiB OS
+headroom. When that would fall below a 2GiB viable minimum, it returns 0 ("no
+safe ceiling") rather than clamping UP to that minimum — a clamped-up value
+would be a fabricated number with no relationship to what's actually free,
+and applying it as a real inference engine's `mem_limit` reproduces the exact
+failure this mechanism exists to prevent, just reached a different way;
+`applyRAMIsolation` treats 0 as "skip isolation for this start" (fail open),
+same direction as every other decision here. Regenerated on every
+`SERVICE_START` for a GPU service that is not already running
+(`ServiceHandler.serviceStart`'s docker branch, alongside `preemptForVRAM`) —
+a runaway process is then killed by ITS OWN cgroup `memory.max` before the
+host's global OOM killer has to pick a victim across every container on the
+box (the incident that motivated #831: a CPU-offloaded ~19GB text encoder
+OOM-killed an unrelated production container). `cmd/service.go`'s boot-time
+start path (`composeFileArgs`) deliberately does NOT apply this override, even
+though `catalog.ExistingGPURAMOverride` exists and would resolve it: that path
+has no per-call access to `CITADEL_RESOURCE_ISOLATION`, so a file left over
+from an earlier opted-in run would keep applying after an operator turns the
+flag back off, silently defeating the opt-out. Only the job-driven
+`SERVICE_START` path applies (and can refuse on) this override today.
+
+**RAM preflight is a separate, narrower check bundled into the same call**
+(`status.PlanRAMPreflight`): mirrors `PlanPreemption`'s (#577) and
+`planDiskPreflight`'s (#828, `internal/jobs/disk_space.go`) fail-open/
+fail-closed contract exactly — a `SERVICE_START` payload's `ram_mb`/`ram_gb`
+(mirroring `vram_mb`/`vram_gb`; the aceteam backend does not send either
+today) of `0` (absent) ALWAYS fits (never refuse on an absent signal); a
+declared requirement that exceeds the RAM budget is the ONLY refusing case — a
+confirmed shortfall, never a guess, returned as a job FAILURE with a precise
+"needs X, node has Y" message, per the owner's "refuse fast, clear error"
+decision. Unlike VRAM (#577), RAM isolation does NOT preempt/evict other
+services to make room — the design doc scopes RAM preemption as a documented
+follow-up; RAM safety here comes entirely from the per-service cgroup ceiling,
+never from stopping something else.
+
+**2. VRAM preflight's citadel-side estimate (`internal/jobs.
+resolveRequiredVRAMBytes`).** #577's `preemptForVRAM`/`PlanPreemption` has
+been real, tested, wired code since #577 shipped — but inert on a live deploy,
+because it only fires when the `SERVICE_START` payload carries `vram_mb`/
+`vram_gb`, which the aceteam backend has never sent (see the Service
+Preemption and Node Pinning section above). `resolveRequiredVRAMBytes` closes
+that gap WITHOUT waiting on the backend: the payload-declared value still
+wins unconditionally when present; only when it's absent AND resource
+isolation is opted in does it fall back to `status.EngineVRAMEstimateMB`, the
+SAME per-engine VRAM provisioning-budget table the model-hotswap swap planner
+(`internal/worker/swap.go`) already uses as ITS OWN fallback when it has never
+measured a given (engine, model) pair (citadel#689) — one table, two
+consumers, no new numbers invented. `EngineVRAMEstimateMB` is already a
+conservative PROVISIONING budget (sized above half a 24GB card for the big
+engines — see its doc comment in `internal/status/hotswap.go`), so no
+additional margin is applied on top here; the swap planner's OWN separate
+1.15× margin on a MEASURED footprint (`vramFitMarginFactor`, `internal/worker/
+swap.go`, citadel#874) is a different code path entirely and is untouched by
+this change.
+
 ### Job-scoped GPU reserve/evict/restore (citadel #832)
 
 `internal/jobs.ServiceHandler.Reserve` / `.Release` / `.ReconcileOrphanedReservations`
