@@ -275,3 +275,38 @@ func TestCollectorReconcileHealth(t *testing.T) {
 		t.Errorf("Reconcile = %+v, want nil (omitted) when no provider set", st2.Reconcile)
 	}
 }
+
+// TestCollectorGPUReservations verifies the citadel-cli#832 heartbeat
+// attachment: when a Reservations provider is set, Collect() attaches its
+// result to NodeStatus.GPUReservations; when it is not (no reservation
+// handler wired, or a legacy build), the field is omitted so a heartbeat
+// predating #832 is byte-identical. Mirrors TestCollectorSwapActivity above.
+func TestCollectorGPUReservations(t *testing.T) {
+	withFn := NewCollector(CollectorConfig{
+		NodeName: "test-node",
+		Reservations: func() []GPUReservation {
+			return []GPUReservation{
+				{JobID: "job-1", EvictedServices: []string{"vllm", "bonsai"}},
+			}
+		},
+	})
+	st, err := withFn.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if len(st.GPUReservations) != 1 {
+		t.Fatalf("GPUReservations not attached when provider was set: %+v", st.GPUReservations)
+	}
+	if st.GPUReservations[0].JobID != "job-1" || len(st.GPUReservations[0].EvictedServices) != 2 {
+		t.Errorf("GPUReservations = %+v, want one job-1 entry with 2 evicted services", st.GPUReservations)
+	}
+
+	without := NewCollector(CollectorConfig{NodeName: "test-node"})
+	st2, err := without.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	if st2.GPUReservations != nil {
+		t.Errorf("GPUReservations = %+v, want nil (omitted) when no provider set", st2.GPUReservations)
+	}
+}

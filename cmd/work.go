@@ -358,6 +358,17 @@ func runWork(cmd *cobra.Command, args []string) {
 	// is an OS advisory lock, released by the kernel on process death, so a crashed
 	// worker never blocks its own restart. Skipped with --no-single-instance for
 	// intentional side-by-side runs (e.g. a second debug-redis worker in dev).
+	// workerLockHeld records whether THIS process holds the single-instance
+	// worklock (below). It is the required precondition for
+	// ReconcileOrphanedReservations (citadel-cli#832): "any evicted_by_job tag
+	// found at startup is orphaned" is only true when exactly one worker can be
+	// live for this node, so the reconcile call is gated on this, not run
+	// unconditionally. False under --no-single-instance (deliberately allows
+	// side-by-side workers) and when the lock could not be acquired for a
+	// non-contention reason (line below: "defense in depth, not a hard
+	// prerequisite") — both cases where a second live worker cannot be ruled
+	// out, so reconciling here would risk a destructive false-positive restore.
+	workerLockHeld := false
 	if !workNoSingleInstance {
 		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
@@ -404,6 +415,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			Log("acquired single-instance worker lock (%s)", lock.Path())
 			defer lock.Release()
+			workerLockHeld = true
 		}
 	}
 
@@ -595,6 +607,44 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if len(nodeCaps.Tags) > 0 {
 		Debug("capability tags: %v", nodeCaps.Tags)
+	}
+
+	// Job-scoped GPU reservation primitive (citadel-cli#832, extends #577).
+	// reservationHandler backs both the crash-recovery reconcile below and the
+	// heartbeat's GPUReservations field (reservationsFn, wired at the collector
+	// construction sites further down). Built unconditionally (cheap: it holds
+	// no live resources until a method is called) so the later heartbeat
+	// closure always has something to call, even when workConfigDir is empty.
+	reservationHandler := jobs.NewServiceHandlerWithWorkspace(workConfigDir, resolveWorkspaceDir())
+	if workConfigDir != "" {
+		// Restore anything still tagged evicted_by_job from a previous process
+		// invocation that crashed or was killed before releasing it (#832's
+		// crash-safety leg). Gated on workerLockHeld -- see that variable's doc
+		// and ReconcileOrphanedReservations' doc for why this is a hard
+		// precondition, not a convenience default.
+		//
+		// NOTE: this does NOT run before startManagedServices' async goroutine
+		// (started above, in the default: branch of the switch a few dozen
+		// lines up) -- that goroutine is already running by the time control
+		// reaches here, so the two race on the same citadel.yaml in the general
+		// case (only --wait-services makes startManagedServices synchronous and
+		// therefore ordered before this). The reason a race here is benign
+		// rather than a double-start hazard: an orphaned reservation's tagged
+		// service carries desired_status: stopped, so serviceStartDisabled makes
+		// startManagedServices SKIP it regardless of ordering, and
+		// ReconcileOrphanedReservations' own restart (via Release) short-circuits
+		// on an already-running service. Do not read "run before" as an actual
+		// ordering guarantee if you touch this again.
+		if workerLockHeld {
+			reconcileCtx := jobs.JobContext{LogFn: func(_ string, msg string) { Log("%s", msg) }}
+			if restored, err := reservationHandler.ReconcileOrphanedReservations(reconcileCtx, workerLockHeld); err != nil {
+				fmt.Fprintf(os.Stderr, "   - Warning: reservation reconcile: %v\n", err)
+			} else if len(restored) > 0 {
+				fmt.Printf("   - Restored %d service(s) from an orphaned GPU reservation: %s\n", len(restored), strings.Join(restored, ", "))
+			}
+		} else {
+			Debug("skipping reservation reconcile: this process does not hold the single-instance worker lock")
+		}
 	}
 
 	// Detect Proxmox hypervisor (host fact, checked regardless of manifest vs auto-detect)
@@ -1325,6 +1375,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		return reconcileHealthFrom(tracker.State())
 	}
 
+	// Active job-scoped GPU reservations for the heartbeat (citadel-cli#832).
+	// reservationHandler is the same handler the startup reconcile above used;
+	// ActiveReservations is a pure manifest read, so calling it on every
+	// heartbeat tick is cheap. Errors (e.g. workConfigDir=="") degrade to "no
+	// reservations" rather than breaking the heartbeat, matching swapStatsFn's
+	// nil-on-absence convention.
+	reservationsFn := func() []status.GPUReservation {
+		list, err := reservationHandler.ActiveReservations()
+		if err != nil || len(list) == 0 {
+			return nil
+		}
+		return reservationsFrom(list)
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1341,6 +1405,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			ReconcileHealth: reconcileHealthFn,
 			PinnedServices:  manifestPinnedServices(workManifest),
 			ModelHotswap:    status.ModelHotswapEnabled(),
+			Reservations:    reservationsFn,
 		})
 	}
 
@@ -1631,6 +1696,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				ReconcileHealth: reconcileHealthFn,
 				PinnedServices:  manifestPinnedServices(workManifest),
 				ModelHotswap:    status.ModelHotswapEnabled(),
+				Reservations:    reservationsFn,
 			})
 		}
 
@@ -2902,6 +2968,28 @@ func reconcileHealthFrom(state reconcile.HealthState) *status.ReconcileHealth {
 		Since:   state.Since,
 		Count:   state.Count,
 	}
+}
+
+// reservationsFrom projects internal/jobs.ReservationSummary (jobs-local,
+// citadel-cli#832) onto internal/status.GPUReservation (the heartbeat-facing
+// shape) — the same reason swapStatsFrom exists (citadel-cli#717):
+// internal/status cannot import internal/jobs (jobs already imports status),
+// so the producing package keeps its own local type and this is the one place
+// that translates it. TestReservationShapeParity pins that both shapes carry
+// the same fields, so a future field added to one side fails loudly instead of
+// silently not appearing on the heartbeat.
+func reservationsFrom(list []jobs.ReservationSummary) []status.GPUReservation {
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]status.GPUReservation, len(list))
+	for i, r := range list {
+		out[i] = status.GPUReservation{
+			JobID:           r.JobID,
+			EvictedServices: append([]string(nil), r.EvictedServices...),
+		}
+	}
+	return out
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {
