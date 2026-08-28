@@ -646,6 +646,59 @@ func TestExplicitServiceStopClearsReservationTag(t *testing.T) {
 	}
 }
 
+// TestExplicitServiceStartClearsReservationTag mirrors
+// TestExplicitServiceStopClearsReservationTag for the other clear site
+// (service_handler.go's SERVICE_START branch): an operator/platform-issued
+// SERVICE_START on a reservation-evicted service must clear its
+// evicted_by_job tag too, so a later Release for the (now irrelevant)
+// reserving job cannot restart-on-top-of an already-running service the
+// operator explicitly started for an unrelated reason.
+func TestExplicitServiceStartClearsReservationTag(t *testing.T) {
+	st := fullGPUStatus(
+		svcInfo("svc-pinned", false, 20),
+		svcInfo("svc-idle-small", true, 6),
+	)
+	h, exec := newReservationTestHandler(t, st)
+	if _, err := h.Reserve(testCtx(), testJobID, 5*1024*1024*1024); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	m := readManifestMap(t, h.ConfigDir)
+	if entry := manifestServiceEntry(t, m, "svc-idle-small"); entry == nil || entry["evicted_by_job"] != testJobID {
+		t.Fatalf("precondition failed: svc-idle-small not tagged after Reserve: %v", entry)
+	}
+
+	// Operator explicitly starts the reservation-evicted service for an
+	// unrelated reason (e.g. manually resuming it before the reservation
+	// itself was released).
+	start := &nexus.Job{ID: "j-start", Type: "SERVICE_START", Payload: map[string]string{"service": "svc-idle-small"}}
+	if _, err := h.Execute(testCtx(), start); err != nil {
+		t.Fatalf("SERVICE_START execute: %v", err)
+	}
+	m = readManifestMap(t, h.ConfigDir)
+	entry := manifestServiceEntry(t, m, "svc-idle-small")
+	if entry == nil {
+		t.Fatal("svc-idle-small entry missing after SERVICE_START")
+	}
+	if _, present := entry["evicted_by_job"]; present {
+		t.Errorf("SERVICE_START did not clear the reservation tag: %v", entry["evicted_by_job"])
+	}
+
+	// The reservation's Release must now be a no-op for this service: it must
+	// not issue a second, redundant start against a service the operator
+	// already explicitly started.
+	exec.started = nil
+	restored, err := h.Release(testCtx(), testJobID)
+	if err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if containsString(restored, "svc-idle-small") {
+		t.Errorf("Release restarted an operator-started service: %v", restored)
+	}
+	if containsString(exec.started, "svc-idle-small") {
+		t.Errorf("start() was called again for an operator-started service: %v", exec.started)
+	}
+}
+
 // TestActiveReservationsGroupsByJob exercises the heartbeat-facing read.
 func TestActiveReservationsGroupsByJob(t *testing.T) {
 	st := fullGPUStatus(

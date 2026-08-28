@@ -601,7 +601,10 @@ func (h *ServiceHandler) StartServiceByName(name string) error {
 		}
 	}
 	// Silent JobContext: there is no remote job to report progress against.
-	res, err := h.serviceStart(JobContext{LogFn: func(string, string) {}}, svc, "", 0)
+	// trustRemoteCodeUnspecified leaves any already-persisted trust setting
+	// untouched (see parseTrustRemoteCodeIntent) -- restoring a reservation
+	// must not itself change trust posture.
+	res, err := h.serviceStart(JobContext{LogFn: func(string, string) {}}, svc, "", 0, trustRemoteCodeUnspecified)
 	if err != nil {
 		return err
 	}
