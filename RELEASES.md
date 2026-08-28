@@ -1886,3 +1886,21 @@ Auto-generated log of every release.
   - config: call FixStatePermissions after device-config writers (#878) (#879)
 
 
+---
+
+## v2.123.0 — 2026-08-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 19 |
+| Lines added | +1120 |
+
+**Changes:**
+
+  - fix(update): warn or optionally restart a managed service after `citadel update install` (#454) (#886)
+  - fix: surface ffmpeg recorder death mid-meeting instead of silently truncating (#490) (#885)
+  - fix(meeting): confine migration chown to owned subdirs, never the shared workspace root (#883)
+  - fix(network): assert admin-like directory owner in machine-wide ACL check (#884)
+
+
