@@ -185,6 +185,34 @@ func TestRunDiskPreflightInjected(t *testing.T) {
 		}
 	})
 
+	t.Run("proceeds when the tree fetch succeeds but reports no usable sizes", func(t *testing.T) {
+		// Distinct from the "metadata fetch errors" case above: here the HF tree
+		// API call itself succeeds, but every entry's size is unknown/zero (an
+		// older API shape, or a repo the tree endpoint can list but not size).
+		// sumFilteredSize then totals 0, which must NOT be misread as "an empty
+		// download fits" turning into a false refusal, nor read the disk at all
+		// -- it degrades to "nothing to gate on" and proceeds, same direction as
+		// the fetch-error fail-open path.
+		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+			return []hfTreeEntry{
+				{Type: "file", Path: "model.safetensors", Size: 0},
+				{Type: "file", Path: "config.json", Size: 0},
+			}, nil
+		}
+		availableDiskBytesFn = func(path string) (uint64, error) {
+			t.Error("availableDiskBytesFn must not be called when requiredBytes is 0 (nothing to gate on)")
+			return 0, nil
+		}
+
+		allow, ignore, err := runDiskPreflight(jc, "some/unsized-model", nil, nil, diskSafetyMarginBytes)
+		if err != nil {
+			t.Fatalf("expected no error when the size estimate is unknown/zero, got %v", err)
+		}
+		if allow != nil || ignore != nil {
+			t.Errorf("expected caller's (empty) patterns to pass through unchanged, got allow=%v ignore=%v", allow, ignore)
+		}
+	})
+
 	t.Run("auto-selects diffusers subfolders when caller supplied no patterns (#828 part 3)", func(t *testing.T) {
 		hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
 			return []hfTreeEntry{

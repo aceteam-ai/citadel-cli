@@ -9,9 +9,10 @@
 //
 // Design: the decision (planDiskPreflight) is pure and takes already-resolved
 // numbers, so it needs no disk/network access to unit-test. The only I/O is
-// availableDiskBytesFn (platform statfs/GetDiskFreeSpaceEx, disk_space_unix.go
-// / disk_space_windows.go) and the HF metadata fetch in hf_repo_size.go — both
-// are package-var funcs so callers (and tests) can inject fakes.
+// availableDiskBytesFn (gopsutil-backed, disk_space_probe.go -- reusing the
+// same disk.Usage() this package already calls in meeting_retention.go) and
+// the HF metadata fetch in hf_repo_size.go — both are package-var funcs so
+// callers (and tests) can inject fakes.
 package jobs
 
 import (
