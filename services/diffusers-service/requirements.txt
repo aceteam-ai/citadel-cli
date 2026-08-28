@@ -2,6 +2,12 @@ diffusers==0.31.0
 transformers==4.46.3
 accelerate==1.1.1
 safetensors==0.4.5
+# Already a transitive dep of diffusers/transformers above (both require
+# huggingface-hub>=0.23.2), pinned explicitly because model_preflight.py
+# (citadel #902) imports it directly for the free-space preflight's
+# list_repo_tree call -- a version contemporaneous with the pins above,
+# comfortably above the 0.23.0 floor list_repo_tree itself requires.
+huggingface_hub==0.26.2
 # Full text-encoder tokenizer stack (citadel-cli#829). AutoTokenizer /
 # AutoPipelineForText2Image silently depend on different optional backends
 # per model family, and a missing one fails at model-LOAD time (mid-provision,

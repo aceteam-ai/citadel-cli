@@ -34,6 +34,8 @@ import threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+import model_preflight
+
 # Model repo id to serve. Defaults to SDXL-Turbo: small (~7GB), fast (1-4 steps),
 # and a good default for a first render. Override for SD 3.5 Medium, SDXL, etc.:
 #   DIFFUSERS_MODEL=stabilityai/stable-diffusion-3.5-medium
@@ -46,6 +48,13 @@ DIFFUSERS_DTYPE = os.environ.get("DIFFUSERS_DTYPE", "float16")
 # Server port. 7860 is the diffusers contract port (aceteam #4468). Matches the
 # EXPOSE/CMD in the Dockerfile; the node compose file owns the host mapping.
 PORT = int(os.environ.get("PORT", "7860"))
+
+# Where model weights land -- HF_HOME (Dockerfile default:
+# /root/.cache/huggingface, bind-mounted from the node's own
+# ~/citadel-cache/huggingface) is also what the free-space preflight checks
+# (citadel #902). Falls back to huggingface_hub's own default cache location
+# so the preflight still resolves a real path if HF_HOME is ever unset.
+DIFFUSERS_CACHE_DIR = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
 
 app = FastAPI(title="citadel-diffusers-service")
 
@@ -80,6 +89,44 @@ def _get_pipe():
         from diffusers import AutoPipelineForText2Image
 
         device, dtype = _resolve_device_and_dtype()
+
+        # citadel #902: free-space preflight + file-selection guard, mirroring
+        # #840's Go-side MODEL_CACHE_PULL fix -- MODEL_CACHE_PULL has been a
+        # no-op for engine:diffusers since #545, so this call site is the only
+        # place that fix's protections can actually reach the LTX-Video-shaped
+        # (multi-checkpoint, ~161GB) disk-fill incident. allow_patterns/
+        # ignore_patterns are optional and additive: unset (the default), this
+        # behaves exactly as before -- an unfiltered pull of the whole repo.
+        # run_preflight fails OPEN on a metadata/disk-probe error and fails
+        # CLOSED (raises, propagated to /generate's caller) only on a
+        # confirmed shortfall -- see model_preflight.py for the full contract.
+        allow_patterns, ignore_patterns = model_preflight.resolve_allow_ignore_patterns()
+        hf_token = model_preflight.hf_auth_token()
+        model_preflight.run_preflight(
+            DIFFUSERS_MODEL,
+            DIFFUSERS_CACHE_DIR,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            token=hf_token,
+        )
+
+        # NOTE: allow_patterns/ignore_patterns are deliberately NOT passed to
+        # from_pretrained below -- verified against the pinned diffusers
+        # library that from_pretrained's own download() ignores those kwargs
+        # (it computes its own allow/ignore list from model_index.json) and
+        # silently drops anything it doesn't recognize. When the operator has
+        # set either pattern, pre-populate the cache ourselves via a direct
+        # huggingface_hub.snapshot_download call so the filter actually
+        # applies to what lands on disk; see model_preflight.
+        # prefetch_filtered_weights's docstring for the full reasoning.
+        model_preflight.prefetch_filtered_weights(
+            DIFFUSERS_MODEL,
+            DIFFUSERS_CACHE_DIR,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            token=hf_token,
+        )
+
         pipe = AutoPipelineForText2Image.from_pretrained(
             DIFFUSERS_MODEL,
             torch_dtype=dtype,

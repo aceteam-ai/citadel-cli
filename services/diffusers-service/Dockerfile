@@ -17,6 +17,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py /app/app.py
+COPY model_preflight.py /app/model_preflight.py
 
 # 7860 is the diffusers contract port (aceteam #4468). The node compose file
 # maps a host port to this; see services/compose/diffusers.yml.
