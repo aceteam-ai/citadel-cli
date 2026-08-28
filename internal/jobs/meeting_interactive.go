@@ -294,6 +294,16 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 			ctx.Log("error", "     - recorder died mid-meeting: %v", err)
 			out.endReason = "recorder_died"
 			return out, err
+		case <-ctx.Context().Done():
+			// citadel#488: same cancellation observance as the plain
+			// waitForMeetingEnd (see its doc comment via runMeetingLoop) — this
+			// is the DEFAULT production loop (StreamingEnabled defaults true),
+			// so it needs the identical protection against blocking shutdown up
+			// to the duration cap.
+			err := fmt.Errorf("meeting cancelled: %w", ctx.Context().Err())
+			ctx.Log("info", "     - meeting wait for %s cancelled (shutdown/drain): %v", p.MeetingID, err)
+			out.endReason = "cancelled"
+			return out, err
 		case <-time.After(pollInterval):
 		}
 	}

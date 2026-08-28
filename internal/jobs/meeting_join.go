@@ -605,6 +605,16 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	h.backupAndPrune(ctx, job, p, recordedPath)
 
 	if recorderErr != nil {
+		// end_reason "cancelled" (citadel#488) means the job's context was
+		// cancelled — a deliberate shutdown/drain, not a recorder crash. Log and
+		// wrap it distinctly so an operator reading this line does not chase a
+		// phantom ffmpeg/audio-sink failure; the caller still returns a non-nil
+		// error either way (the run did not complete), matching how any other
+		// mid-flight cancellation already surfaces through this worker.
+		if outcome.endReason == "cancelled" {
+			ctx.Log("info", "     - [Job %s] meeting cancelled before it ended (shutdown/drain): %v", job.ID, recorderErr)
+			return nil, fmt.Errorf("meeting did not complete: %w (partial audio saved at %s)", recorderErr, recordedPath)
+		}
 		ctx.Log("error", "     - [Job %s] recording died before the meeting ended (end_reason=%s): %v", job.ID, outcome.endReason, recorderErr)
 		return nil, fmt.Errorf("meeting recording failed: %w (truncated/empty audio saved at %s)", recorderErr, recordedPath)
 	}
@@ -659,6 +669,16 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 // This matters most for the interactive path: config.Meeting.StreamingEnabled
 // defaults true, so waitForMeetingEndInteractive is the loop a production Meet
 // meeting actually runs.
+//
+// Both loops also select on ctx.Context().Done() alongside recorderDead
+// (citadel#488): before this, neither loop observed cancellation at all, so a
+// SIGINT/shutdown or drain (e.g. AGENT_UPDATE landing mid-meeting) could not
+// interrupt an in-flight meeting short of the wall-clock duration cap (up to
+// 4h) or a SIGKILL that skips every defer (leaked sink/Xvfb/Chrome/profile
+// dir — the still-open orphan-reaper half of #488). A cancelled context now
+// unwinds the loop within one poll tick, same as a recorder death, so the
+// existing deferred teardown in Execute (media.Close, StopRecording) still
+// runs.
 func (h *MeetingJoinHandler) runMeetingLoop(ctx JobContext, br meetingBrowser, p meetingJoinParams, wavPath string, media MeetingMedia) (interactiveOutcome, error) {
 	// The interactive during-call layer (announce / rolling `/ace` commands /
 	// chat capture) is Meet-coupled (issue #5435) and explicitly OUT of the Teams
@@ -764,6 +784,11 @@ type joinPage interface {
 // the timeout with neither admission nor a join click is fatal. Production
 // callers pass joinButtonTimeout/meetingPollInterval; they are parameters so
 // tests can run the loop in milliseconds.
+//
+// Also selects on ctx.Context().Done() (citadel#488): this loop runs BEFORE
+// waitUntilAdmitted in runMeetJoinFlow, so without this a shutdown/drain
+// landing during the pre-join sequence would block up to joinButtonTimeout
+// before waitUntilAdmitted's own cancellation check could even be reached.
 func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -799,13 +824,21 @@ func pollForJoinClick(ctx JobContext, page joinPage, botDisplayName string, time
 			return nil
 		}
 
-		time.Sleep(interval)
+		select {
+		case <-ctx.Context().Done():
+			return fmt.Errorf("meeting cancelled while waiting for the join button: %w", ctx.Context().Err())
+		case <-time.After(interval):
+		}
 	}
 	return fmt.Errorf("click join button: no button matched labels %v within %s (interstitial/pre-join page may have changed — re-tune meeting_join.go labels)", meetJoinButtonLabels, timeout)
 }
 
-// waitUntilAdmitted polls the admission heuristic until the bot is in-call or the
-// lobby timeout elapses.
+// waitUntilAdmitted polls the admission heuristic until the bot is in-call, the
+// lobby timeout elapses, or the job context is cancelled (worker shutdown/drain,
+// citadel#488). Cancellation is checked every poll tick via a select so a
+// SIGINT/shutdown mid-lobby returns promptly instead of blocking up to
+// admitTimeout — the caller's deferred media.Close() then tears down the
+// browser/Xvfb/sink instead of leaking them to a SIGKILL.
 func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	deadline := time.Now().Add(admitTimeout)
 	for time.Now().Before(deadline) {
@@ -817,7 +850,13 @@ func (h *MeetingJoinHandler) waitUntilAdmitted(ctx JobContext, br meetingBrowser
 		} else {
 			ctx.Log("warn", "     - admission check errored (retrying): %v", err)
 		}
-		time.Sleep(meetingPollInterval)
+		select {
+		case <-ctx.Context().Done():
+			err := fmt.Errorf("meeting cancelled while waiting for admission: %w", ctx.Context().Err())
+			ctx.Log("info", "     - admission wait for meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
+			return err
+		case <-time.After(meetingPollInterval):
+		}
 	}
 	return fmt.Errorf("not admitted to meeting within %s (host did not let the bot in, or admission selector is stale)", admitTimeout)
 }
@@ -846,6 +885,10 @@ func (h *MeetingJoinHandler) waitForMeetingEnd(ctx JobContext, br meetingBrowser
 			err := fmt.Errorf("recording process exited before the meeting ended; the saved audio is truncated or empty")
 			ctx.Log("error", "     - recorder died mid-meeting: %v", err)
 			return "recorder_died", err
+		case <-ctx.Context().Done():
+			err := fmt.Errorf("meeting cancelled: %w", ctx.Context().Err())
+			ctx.Log("info", "     - meeting wait for %s cancelled (shutdown/drain): %v", p.MeetingID, err)
+			return "cancelled", err
 		case <-time.After(meetingPollInterval):
 		}
 	}
