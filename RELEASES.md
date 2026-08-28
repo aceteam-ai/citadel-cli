@@ -1924,3 +1924,24 @@ Auto-generated log of every release.
   - fix: replace non-ASCII glyphs in install.ps1 so it parses on PS 5.1 (#888)
 
 
+---
+
+## v2.125.0 — 2026-08-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 7 |
+| Files changed | 38 |
+| Lines added | +6225 |
+
+**Changes:**
+
+  - feat(worker): job-scoped GPU reserve/evict/restore primitive with crash-safe auto-restore (#832) (#851)
+  - fix(jobs): model_cache_pull free-space preflight + per-model allow/ignore patterns (#828) (#840)
+  - feat(services): Hermes agent harness as a Citadel-node module (aceteam #8170) (#849)
+  - docs: design for Engine adapter interface + gateway swapper (#685/#686) (#901)
+  - docs: design for model-cache ownership + GC (#682/#683) (#900)
+  - docs: design for node:exec pairing-code local display (#659) (#899)
+  - docs: design for per-job resource isolation on consumer GPUs (#831/#842/#843) (#897)
+
+
