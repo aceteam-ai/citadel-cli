@@ -273,6 +273,34 @@ func TestComposeEnv_InjectsHostUIDGID(t *testing.T) {
 	}
 }
 
+// TestComposeEnv_PUIDTracksHostGetuid pins the specific invariant
+// services/meeting-service/entrypoint.sh's PROFILE_DIR migration-chown safety
+// argument depends on (citadel-cli#551): PUID must always equal THIS
+// process's own os.Getuid(), never a hardcoded or independently-derived
+// value. That equality is what guarantees the container's remapped TARGET_UID
+// can never diverge from the UID the host-native fallback path
+// (internal/platform/meeting_browser.go's preparePersistentProfileDir) uses
+// to write the SAME profile path directly. If a future change decouples
+// PUID from os.Getuid() (e.g. reading it from config or an env override),
+// this test -- not just the entrypoint comment -- should catch it before a
+// #551-class stale/cross-UID chown bug reopens for PROFILE_DIR.
+func TestComposeEnv_PUIDTracksHostGetuid(t *testing.T) {
+	if os.Getuid() < 0 {
+		t.Skip("non-POSIX host: PUID intentionally not injected")
+	}
+	h := NewServiceHandlerWithWorkspace("/etc/citadel", "/home/u/citadel-node/workspace")
+	want := fmt.Sprintf("PUID=%d", os.Getuid())
+	for _, kv := range h.composeEnv() {
+		if strings.HasPrefix(kv, "PUID=") {
+			if kv != want {
+				t.Fatalf("composeEnv exported %q, want %q (must track os.Getuid())", kv, want)
+			}
+			return
+		}
+	}
+	t.Fatal("composeEnv did not export PUID")
+}
+
 // TestComposeEnv_NoWorkspaceLeavesEnvUntouched verifies that when no workspace
 // is configured we do not inject an empty CITADEL_WORKSPACE (which would mount
 // the wrong path); compose's :? guard should then fail loudly instead.
