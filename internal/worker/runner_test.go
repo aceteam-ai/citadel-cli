@@ -1886,15 +1886,23 @@ func TestRunnerLongSessionJobDoesNotBlockOtherJobs(t *testing.T) {
 }
 
 // TestRunnerGPUBoundJobDoesNotBlockOtherJobs is the regression test for
-// citadel-cli#903 Stage 1: on a maxConcurrency=1 node (the default), a
-// GPU-bound inference job (llm_inference, per gpuBoundJobTypes in
-// gpu_tracker.go) must not occupy the node's only sequential slot for the
-// length of the inference call and starve every other poll cycle. A newly
-// dispatched targeted job (e.g. FILE_READ_BYTES) must be fetched and
-// completed while the inference job is still in flight -- mirroring #489's
-// long-session-job fix, extended here to the GPU-bound lane. It must still
-// run through the same per-job machinery (watchdog/deadline, terminal-event
-// publishing, WorkerState in-flight accounting, ack) as every other job.
+// citadel-cli#903 Stage 1: on a maxConcurrency=1 node with a GPU tracker
+// (the node-1297 incident node -- a discrete GPU, so cmd/work.go constructs
+// a non-nil r.gpuTracker), a GPU-bound inference job (llm_inference, per
+// gpuBoundJobTypes in gpu_tracker.go) must not occupy the node's only
+// sequential slot for the length of the inference call and starve every
+// other poll cycle. A newly dispatched targeted job (e.g. FILE_READ_BYTES)
+// must be fetched and completed while the inference job is still in flight
+// -- mirroring #489's long-session-job fix, extended here to the GPU-bound
+// lane. It must still run through the same per-job machinery
+// (watchdog/deadline, terminal-event publishing, WorkerState in-flight
+// accounting, ack) as every other job.
+//
+// A tracker is required here deliberately: the async lane only applies to
+// GPU-bound jobs when r.gpuTracker is non-nil (see the nil-tracker gate in
+// runner.go and TestRunnerGPUBoundJobsSequentialWithoutTracker, its
+// no-tracker counterpart). A single generous slot count keeps the tracker's
+// own gate a no-op here so this test isolates the fetch-loop behavior.
 func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -1915,7 +1923,8 @@ func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 	state := NewWorkerState()
 	config := RunnerConfig{
 		WorkerID:       "test-worker",
-		MaxConcurrency: 1, // the default that triggers #903's head-of-line blocking
+		MaxConcurrency: 1,                // the default that triggers #903's head-of-line blocking
+		GPUTracker:     NewGPUTracker(1), // node-1297-class: a real discrete GPU
 		State:          state,
 	}
 	runner := NewRunner(source, []JobHandler{inferenceHandler, fileHandler}, config)
@@ -2096,5 +2105,113 @@ func TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention(t *testing.T) {
 	}
 	if fileStream := streams.get("file-1"); fileStream == nil || !fileStream.ended {
 		t.Error("expected a terminal WriteEnd for the successful non-GPU job")
+	}
+}
+
+// TestRunnerGPUBoundJobsSequentialWithoutTracker is the regression test for
+// the nil-tracker safety gap a PR review caught in #903 Stage 1: r.gpuTracker
+// is only constructed when platform.GetGPUCountSimple() finds a discrete GPU
+// (cmd/work.go). Citadel explicitly supports a first-class node class with
+// NO discrete GPU that still serves GPU-bound-typed inference -- CPU-only,
+// native ollama, Apple Silicon (#606/#612/aceteam#6634) -- where
+// r.gpuTracker is nil. On such a node, nothing else throttles concurrent
+// GPU-bound dispatch: the sequential fetch loop (a GPU-bound job falling
+// through to the inline `else` branch in Run()) was the ONLY thing
+// serializing inference there before #903 -- accidental but real
+// backpressure against a single CPU-serving engine. Unconditionally
+// async-dispatching GPU-bound jobs (the initial #903 Stage 1 patch) would
+// have removed that backpressure in the DEFAULT config (MaxConcurrency: 1,
+// no tracker set), letting concurrently-arriving llm_inference jobs hit one
+// engine with zero throttle. This test asserts the sequential fallback is
+// preserved for GPU-bound jobs when no tracker is configured: a second
+// llm_inference job must not even START until the first one finishes. It
+// fails against the unconditional-async version of the fix.
+func TestRunnerGPUBoundJobsSequentialWithoutTracker(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+
+	handler := &blockingJobHandler{
+		jobType: JobTypeLLMInference,
+		onStart: func() { started <- struct{}{} },
+		release: release,
+	}
+
+	jobs := []*Job{
+		{ID: "inference-1", Type: JobTypeLLMInference, Payload: map[string]any{}},
+		{ID: "inference-2", Type: JobTypeLLMInference, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1, // the default -- and GPUTracker is deliberately left nil
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		runner.Run(ctx)
+		close(runDone)
+	}()
+
+	// Wait for the first job to start.
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first llm_inference job never started")
+	}
+
+	// While job 1 is still blocked in its handler, job 2 must NOT have
+	// started -- on a nil-tracker node the sequential fetch loop must not
+	// even fetch it yet. This is the core assertion: without the nil-tracker
+	// gate, both jobs would dispatch on the always-async lane and job 2
+	// would start immediately, in parallel with job 1.
+	select {
+	case <-started:
+		t.Fatal("second llm_inference job started while the first was still in flight -- a nil-tracker node must keep GPU-bound dispatch sequential")
+	case <-time.After(300 * time.Millisecond):
+		// Expected: no second start yet.
+	}
+
+	if got := len(handler.ExecutedJobs()); got != 1 {
+		t.Fatalf("executions while job 1 is still blocked = %d, want 1", got)
+	}
+	if got := len(source.AckedJobs()); got != 0 {
+		t.Fatalf("acked jobs while job 1 is still blocked = %d, want 0", got)
+	}
+
+	// Release job 1 so it can complete; job 2 should then start and run to
+	// completion through the same sequential path.
+	close(release)
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second llm_inference job never started after the first was released")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(source.AckedJobs()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	acked := source.AckedJobs()
+	if len(acked) != 2 {
+		t.Fatalf("acked jobs = %d, want 2 (both jobs should eventually complete sequentially)", len(acked))
+	}
+	if len(handler.ExecutedJobs()) != 2 {
+		t.Fatalf("total executions = %d, want 2", len(handler.ExecutedJobs()))
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after the context was cancelled")
 	}
 }
