@@ -105,6 +105,21 @@ type SwapOutcome struct {
 	// the node knows the caller's model is not being worked on yet, so a retry
 	// loop does not spin against a node doing nothing for it (citadel-cli#680).
 	RetryAfterSeconds int
+	// WarmingFor names the model actually loading on this node right now, which
+	// may NOT be the requested model (citadel-cli#681). Set whenever Ready is
+	// false and the node has SOME load in flight:
+	//   - equal to the requested model when this node is loading THAT model
+	//     (the common case: a freshly started or joined same-backend swap, or
+	//     the post-swap readiness probe).
+	//   - the DIFFERENT in-flight model when single-flight refused to start a
+	//     second swap and this request's load has not begun at all — this is
+	//     the case the caller cannot distinguish from the above without this
+	//     field, and ETASeconds already reflects the combined wait for it
+	//     (citadel-cli#680's blockedETASeconds).
+	// Empty only when the node cannot name a load at all (should not happen
+	// alongside Ready=false, but callers must not treat empty as "loading
+	// mine" — it means "unknown").
+	WarmingFor string
 }
 
 // swapOp is a single in-flight background swap. done is closed when the swap
@@ -269,13 +284,22 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 		// cold-start estimate here would be a fabricated number: the real wait is
 		// the in-flight swap finishing PLUS this engine's own load. Quote that, and
 		// pace the retry hint to it, so a caller does not busy-retry a node that is
-		// not working on its request (citadel-cli#680). Telling the two cases apart
-		// on the wire ("loading yours" vs "busy with another") is citadel-cli#681.
-		eta := m.blockedETASeconds(backend)
+		// not working on its request (citadel-cli#680).
+		//
+		// Snapshot the blocking op ONCE so the ETA and the discriminator
+		// (citadel-cli#681) agree with each other rather than each re-reading
+		// m.inflight and possibly observing two different states.
+		blocking := m.inflightSnapshot()
+		eta := m.blockedETASeconds(backend, blocking)
+		warmingFor := model // blocking swap finished between startOrJoin and here
+		if blocking != nil {
+			warmingFor = blocking.model
+		}
 		return SwapOutcome{
 			Ready:             false,
 			ETASeconds:        eta,
 			RetryAfterSeconds: retryAfterFor(eta),
+			WarmingFor:        warmingFor,
 		}, nil
 	}
 
@@ -299,13 +323,16 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 			return SwapOutcome{Ready: true}, nil
 		}
 		// Completed but not ready (transient block, e.g. min-residency): warm.
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op)}, nil
+		// op.model (not the caller's `model` param) is the honest answer even
+		// here — a join onto an in-flight same-backend swap can be for a
+		// different model than this call requested (citadel-cli#681).
+		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
 	case <-timer.C:
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op)}, nil
+		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
 	case <-ctx.Done():
 		// The job context was cancelled; the background swap keeps running so a
 		// retry can pick up the now-resident model. Report warming.
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op)}, nil
+		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
 	}
 }
 
@@ -831,23 +858,33 @@ func (m *SwapManager) etaSeconds(op *swapOp) int {
 	return secs
 }
 
+// inflightSnapshot returns the single in-flight swap op, or nil, under lock.
+// Callers that need to derive more than one value from the same in-flight
+// state (e.g. ETA and the citadel-cli#681 WarmingFor discriminator) should
+// snapshot once via this and pass it along, rather than each re-reading
+// m.inflight and risking two different observations of it.
+func (m *SwapManager) inflightSnapshot() *swapOp {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inflight
+}
+
 // blockedETASeconds estimates the wait for a backend whose swap cannot start
 // because a DIFFERENT swap holds the single-flight slot: the in-flight swap's
 // remaining time plus this backend's own cold start. Without the first term the
 // node quotes a number that assumes work already underway that has not begun.
-func (m *SwapManager) blockedETASeconds(backend string) int {
+// blocking is the caller's own inflightSnapshot() (nil when the blocking swap
+// finished between startOrJoin and here).
+func (m *SwapManager) blockedETASeconds(backend string, blocking *swapOp) int {
 	own := int(m.loadEstimate(backend).Seconds())
 
-	m.mu.Lock()
-	op := m.inflight
-	m.mu.Unlock()
-	if op == nil {
+	if blocking == nil {
 		// The blocking swap finished between startOrJoin and here. This backend
 		// still is not resident, so its own cold start is the honest estimate.
 		return own
 	}
 
-	remaining := int((op.loadEst - m.now().Sub(op.startedAt)).Seconds())
+	remaining := int((blocking.loadEst - m.now().Sub(blocking.startedAt)).Seconds())
 	if remaining < 0 {
 		remaining = 0
 	}

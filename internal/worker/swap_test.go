@@ -202,6 +202,11 @@ func TestEnsureResident_DifferentModelInFlight_WarmsAndStartsNoSecondSwap(t *tes
 	if out1.Ready {
 		t.Fatalf("expected first miss to warm while swap is in flight")
 	}
+	// The node IS loading the requested model here (freshly started, own
+	// backend) so WarmingFor should name it (citadel-cli#681).
+	if out1.WarmingFor != "Bonsai-27B" {
+		t.Fatalf("expected WarmingFor=%q for the model actually being loaded, got %q", "Bonsai-27B", out1.WarmingFor)
+	}
 
 	// Second miss for a DIFFERENT model while the first is in flight.
 	out2, err := m.EnsureResident(context.Background(), "unlimited-ocr", "baidu/Unlimited-OCR")
@@ -213,6 +218,22 @@ func TestEnsureResident_DifferentModelInFlight_WarmsAndStartsNoSecondSwap(t *tes
 	}
 	if got := ctrl.startCountVal(); got != 1 {
 		t.Fatalf("expected exactly ONE swap started (no thrash), got %d", got)
+	}
+	// citadel-cli#681: WarmingFor must name the BLOCKING model ("Bonsai-27B",
+	// the one actually loading), never the requested model
+	// ("baidu/Unlimited-OCR", whose load has not begun) — that is exactly the
+	// discriminator that lets a caller tell "loading yours" apart from "busy
+	// with someone else's".
+	if out2.WarmingFor != "Bonsai-27B" {
+		t.Fatalf("expected WarmingFor to name the blocking backend's model %q, got %q", "Bonsai-27B", out2.WarmingFor)
+	}
+	if out2.WarmingFor == "baidu/Unlimited-OCR" {
+		t.Fatalf("WarmingFor must not equal the requested model when a DIFFERENT swap is blocking it")
+	}
+	// ETASeconds must still be the honest combined wait (citadel-cli#680),
+	// unchanged by this fix.
+	if out2.ETASeconds < warmingRetryAfter {
+		t.Fatalf("expected blocked ETA >= retry_after floor, got %d", out2.ETASeconds)
 	}
 
 	close(ctrl.startGate) // let the first swap proceed and exit

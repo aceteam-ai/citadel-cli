@@ -162,7 +162,7 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 			return h.failure(fmt.Errorf("model hotswap failed: %w", swapErr)), nil
 		}
 		if !outcome.Ready {
-			return h.warming(payload.Model, outcome.ETASeconds, outcome.RetryAfterSeconds), nil
+			return h.warming(payload.Model, outcome.ETASeconds, outcome.RetryAfterSeconds, outcome.WarmingFor), nil
 		}
 	}
 
@@ -175,7 +175,10 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	// differ per engine.
 	if err := h.ensureEngineReady(ctx, payload.Backend); err != nil {
 		if errors.Is(err, errEngineWarming) {
-			return h.warming(payload.Model, engineWarmETA(payload.Backend), 0), nil
+			// This node's own start already targets payload.Model on this
+			// backend (there is no "someone else's model" ambiguity here), so
+			// the warmingFor discriminator is simply the requested model.
+			return h.warming(payload.Model, engineWarmETA(payload.Backend), 0, payload.Model), nil
 		}
 		return h.failure(err), nil
 	}
@@ -1047,21 +1050,32 @@ func groundingReceipt(input, output string) map[string]any {
 // better (e.g. a swap for a DIFFERENT model is holding the single-flight slot,
 // so this model's load has not even started) passes its own, so the platform
 // does not busy-retry against a node that is not working on its request.
-func (h *LLMInferenceHandler) warming(model string, etaSeconds, retryAfterSeconds int) *JobResult {
+//
+// warmingFor names the model actually loading right now (citadel-cli#681),
+// which may differ from `model` — the discriminator that lets a caller tell
+// "loading yours" from "busy with someone else's, yours not started" apart,
+// rather than both rendering as the same warming response. Additive:
+// warmingFor == "" omits `warming_for` from the output entirely, so a caller
+// parsing the pre-#681 contract sees no change.
+func (h *LLMInferenceHandler) warming(model string, etaSeconds, retryAfterSeconds int, warmingFor string) *JobResult {
 	if etaSeconds < 0 {
 		etaSeconds = 0
 	}
 	if retryAfterSeconds <= 0 {
 		retryAfterSeconds = warmingRetryAfter
 	}
+	output := map[string]any{
+		"status":      "model_warming",
+		"model":       model,
+		"eta_seconds": etaSeconds,
+		"retry_after": retryAfterSeconds,
+	}
+	if warmingFor != "" {
+		output["warming_for"] = warmingFor
+	}
 	return &JobResult{
 		Status: JobStatusSuccess,
-		Output: map[string]any{
-			"status":      "model_warming",
-			"model":       model,
-			"eta_seconds": etaSeconds,
-			"retry_after": retryAfterSeconds,
-		},
+		Output: output,
 	}
 }
 
@@ -1076,7 +1090,8 @@ func (h *LLMInferenceHandler) engineRequestFailure(
 	wrap string,
 ) *JobResult {
 	if isEngineNotServing(err) {
-		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
+		// Same-model case, as in the readiness-gate warming above.
+		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0, payload.Model)
 	}
 	// A refused connection here means the engine went away between the readiness
 	// probe and the request. That is warming ONLY while a start this node issued
@@ -1084,7 +1099,7 @@ func (h *LLMInferenceHandler) engineRequestFailure(
 	// amount of retrying will change that, so it stays a failure the caller can
 	// act on (citadel-cli#705).
 	if isConnectionRefused(err) && h.engineStartInFlight(payload.Backend) {
-		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0)
+		return h.warming(payload.Model, engineWarmETA(payload.Backend), 0, payload.Model)
 	}
 	return h.failure(fmt.Errorf("%s: %w", wrap, err))
 }
