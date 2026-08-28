@@ -867,6 +867,25 @@ has only two values (`provisioned` / `already_linked`): the aceteam backend
 branches on `status == "already_linked"` by equality, so upgrade information is
 additive, never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
 
+### Canonical HuggingFace cache path (citadel #682 P0, model-cache ownership design)
+
+`internal/jobs.canonicalHFCacheDir()` is the single authority for where a
+host-side HF pull must write so it agrees with what the engine containers
+mount (`~/citadel-cache/huggingface:/root/.cache/huggingface` — matched by
+hand-grepping all seven HF-caching compose files at fix time; no test pins
+this mapping yet, so re-verify by grep before trusting it if it's been a
+while). `hfCacheBaseDir()` (the disk-preflight/no-op-detection/
+`MODEL_CACHE_EVICT` resolver) and `hfDownloadEnv()` (the actual pull
+subprocess's env) both resolve through it — that agreement is the fix; before
+#682 the pull subprocess had no `HF_HOME` set at all and silently wrote to the
+CLI's own host default instead, which no container could see. See
+`docs/design-cache-ownership.md` for the full ownership/GC design (this note
+covers P0 only) — P1 (`services/caches.go`, a single engine→cache-dir table
+for every engine family, not just HF, with a test pinning the table against
+every compose file's actual mount) should read `canonicalHFCacheDir()` before
+inventing a second HF-path resolver, and can retire this note once its own
+table + test supersede it.
+
 ### Bonsai service (PrismML Bonsai-27B, 1-bit)
 
 Bonsai-27B is PrismML's 1-bit quantized Qwen3.6-27B. The `bonsai` service serves

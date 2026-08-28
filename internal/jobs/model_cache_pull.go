@@ -408,8 +408,9 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 	}
 
 	ctx.Log("info", "     - [Job %s] Pulling model '%s' via %s for %s", jobID, modelName, bin, engine)
+	warnIfLegacyHFCacheExists(ctx, jobID)
 
-	cmd := BuildHuggingFaceDownloadCommandFiltered(bin, modelName, finalAllow, finalIgnore)
+	cmd := buildHFPullCommand(bin, modelName, finalAllow, finalIgnore)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return output, fmt.Errorf("hf download failed: %w", err)
@@ -553,18 +554,47 @@ func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePat
 	return finalAllow, finalIgnore, nil
 }
 
+// canonicalHFCacheDir is the ONE place the canonical, container-mounted
+// HuggingFace cache directory is computed (citadel #682 P0). It MUST match
+// the container mount every self-provisioning/vllm/llamacpp compose file
+// uses (`~/citadel-cache/huggingface:/root/.cache/huggingface` --
+// services/compose/vllm.yml et al.), or a host-side pull and the container's
+// own reads land in two different places again -- the exact bug this fixes.
+//
+// Both pullHuggingFace's subprocess env (below) and hfCacheBaseDir's default
+// resolve through THIS function rather than each hard-coding the path
+// separately, per the citadel #840 review coordination note: setting the
+// canonical path only on the exec.Cmd's own Env would leave hfCacheBaseDir
+// (a parent-process os.Getenv read, never seeing a child's Env) still
+// pointing at the pre-fix host default (~/.cache/huggingface), silently
+// reopening the divergence for the disk preflight and the already-cached
+// netting (#840) even though the download itself moved.
+func canonicalHFCacheDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("citadel-cache", "huggingface")
+	}
+	return filepath.Join(home, "citadel-cache", "huggingface")
+}
+
 // hfCacheBaseDir returns the actual hub-cache directory a repo pull writes
-// into, used by the disk preflight's free-space check. Mirrors
-// huggingface_hub's own precedence (constants.py): HF_HUB_CACHE > (legacy)
-// HUGGINGFACE_HUB_CACHE > "$HF_HOME/hub" > "$XDG_CACHE_HOME/huggingface/hub"
-// > ~/.cache/huggingface/hub. Getting this wrong is not cosmetic: an operator
+// into, used by the disk preflight's free-space check and (via hfCacheDir)
+// the already-cached-size lookups. Mirrors huggingface_hub's own precedence
+// (constants.py): HF_HUB_CACHE > (legacy) HUGGINGFACE_HUB_CACHE >
+// "$HF_HOME/hub" > "$XDG_CACHE_HOME/huggingface/hub" > canonicalHFCacheDir()
+// + "/hub". Getting the env-var precedence wrong is not cosmetic: an operator
 // who points HF_HUB_CACHE at a large secondary disk (the common reason to set
 // it at all) would otherwise have free space measured on the ROOT volume,
 // inverting the check exactly on the nodes most likely to need it -- the same
 // reasoning extends to XDG_CACHE_HOME, which huggingface_hub consults before
-// falling back to ~/.cache. Falls back to "." (rather than hfCacheDir's ""
-// on UserHomeDir failure) because nearestExistingDir needs a concrete path to
-// walk up from, not a signal to skip the check outright.
+// falling back further. The final fallback (no env vars set at all) is
+// canonicalHFCacheDir(), NOT the historical ~/.cache/huggingface/hub --
+// citadel #682's whole point is that a bare `hf download` with no HF_HOME
+// set must not land somewhere the engine containers can't see, and this is
+// the function the disk-space/no-op-detection code trusts to know where that
+// is. canonicalHFCacheDir() always returns a concrete path (it degrades to a
+// relative one on a UserHomeDir failure rather than erroring), so
+// nearestExistingDir always has something to walk up from.
 func hfCacheBaseDir() string {
 	if v := os.Getenv("HF_HUB_CACHE"); v != "" {
 		return v
@@ -578,11 +608,106 @@ func hfCacheBaseDir() string {
 	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
 		return filepath.Join(xdg, "huggingface", "hub")
 	}
+	return filepath.Join(canonicalHFCacheDir(), "hub")
+}
+
+// hfDownloadEnv returns the environment for the `hf`/`huggingface-cli`
+// download subprocess (citadel #682 P0): the process's own environment, plus
+// HF_HOME pointed at canonicalHFCacheDir() so a pull with no cache location
+// configured lands in the SAME directory the engine containers mount,
+// instead of the CLI's own default (~/.cache/huggingface, invisible to any
+// container). canonicalHFCacheDir() is the exact function hfCacheBaseDir's
+// own default resolves through, so this subprocess's actual write location
+// and every parent-process read of "where are the weights" (the disk
+// preflight, the post-download no-op check, MODEL_CACHE_EVICT) agree.
+//
+// Checks the same four env vars in the same order hfCacheBaseDir does, and
+// injects nothing if any is already set -- an operator's own HF_HUB_CACHE /
+// HUGGINGFACE_HUB_CACHE / HF_HOME / XDG_CACHE_HOME is respected, never
+// silently overridden. (A duplicate HF_HOME entry appended after os.Environ()
+// would usually be shadowed by the earlier one in practice, but that relies
+// on unspecified getenv-with-duplicate-keys behavior across libc
+// implementations -- checking explicitly is the portable way to guarantee an
+// override always wins, not just usually.)
+func hfDownloadEnv() []string {
+	for _, k := range []string{"HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"} {
+		if os.Getenv(k) != "" {
+			return os.Environ()
+		}
+	}
+	return append(os.Environ(), "HF_HOME="+canonicalHFCacheDir())
+}
+
+// buildHFPullCommand is pullHuggingFace's actual command constructor: argv
+// via BuildHuggingFaceDownloadCommandFiltered, env via hfDownloadEnv(). This
+// is the ONE call site that applies the citadel #682 fix to a real pull --
+// exported test coverage of hfDownloadEnv()/hfCacheBaseDir() agreeing is not
+// by itself proof the running handler uses either; assert on THIS function's
+// output, not just its ingredients.
+func buildHFPullCommand(bin, modelName string, allowPatterns, ignorePatterns []string) *exec.Cmd {
+	cmd := BuildHuggingFaceDownloadCommandFiltered(bin, modelName, allowPatterns, ignorePatterns)
+	cmd.Env = hfDownloadEnv()
+	return cmd
+}
+
+// legacyHFCacheDir is the pre-fix host default `hf download` used to write
+// into before citadel #682 -- a directory no engine container ever mounts.
+func legacyHFCacheDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "."
+		return ""
 	}
-	return filepath.Join(home, ".cache", "huggingface", "hub")
+	return filepath.Join(home, ".cache", "huggingface")
+}
+
+// warnIfLegacyHFCacheExists reports, once per pull, whether the pre-fix
+// duplicate cache is still present. Per docs/design-cache-ownership.md's P0
+// scope ("report the pre-existing duplicate cache once, informationally"):
+// this is a log line, not a migration and not the durable/aggregated
+// duplicate-detection `citadel status`/heartbeat surfacing that's P3's job --
+// existing files at the legacy path are left exactly where they are.
+//
+// Checks <legacy>/hub for at least one `models--*` entry, NOT just
+// os.Stat(legacyHFCacheDir()) existing. The bare ~/.cache/huggingface
+// directory exists on essentially any machine anyone ran `hf auth login` on
+// -- it may hold nothing but a `token` file. Reporting on that alone would
+// point an operator at their HF credentials directory and tell them it "can
+// be removed manually to reclaim space", which is actively harmful advice --
+// so this only fires when there is a real, sizeable model cache to report.
+//
+// Reports hfCacheBaseDir() (the directory THIS pull actually resolves to,
+// respecting any operator env override) as the "instead" location, not a
+// hardcoded canonicalHFCacheDir() -- an operator running with HF_HOME/
+// HF_HUB_CACHE/etc already set is not redirected by this fix at all (see
+// hfDownloadEnv's doc comment), and a message claiming "the canonical cache"
+// in that case would be actively wrong. Skips entirely when the legacy hub
+// dir and the actual resolved hub dir are the SAME directory (an operator
+// override that happens to point back at ~/.cache/huggingface, or a test
+// redirect) -- there is no second copy to report.
+// Best-effort throughout: any stat/read failure is silently treated as
+// "nothing to report", never a pull error.
+func warnIfLegacyHFCacheExists(ctx JobContext, jobID string) {
+	dir := legacyHFCacheDir()
+	if dir == "" {
+		return
+	}
+	legacyHub := filepath.Join(dir, "hub")
+	actualHub := hfCacheBaseDir()
+	if legacyHub == actualHub {
+		return
+	}
+	entries, err := os.ReadDir(legacyHub)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "models--") {
+			ctx.Log("info", "     - [Job %s] found a pre-existing HuggingFace cache at %s (predates citadel #682's fix) — "+
+				"this pull writes to %s instead; the old directory is not touched and can be removed manually to reclaim space",
+				jobID, dir, actualHub)
+			return
+		}
+	}
 }
 
 // hfCacheModelSizeFn resolves how many bytes of a model are already present
@@ -614,21 +739,17 @@ func hfCacheModelSize(modelName string) int64 {
 }
 
 // hfCacheDir returns the HuggingFace cache directory for a model, or empty
-// string if it cannot be determined.
+// string if it cannot be determined. Built on hfCacheBaseDir() (the hub-cache
+// resolver, citadel #682/#840) rather than its own separate HF_HOME/default
+// logic -- the pre-fix version of this function had its own env lookup and
+// its own (different) default, which is exactly how the disk preflight's
+// "already cached" netting and this function's own callers (the post-download
+// no-op check, MODEL_CACHE_EVICT) could disagree with where a pull actually
+// wrote. One resolver, used everywhere a model's on-disk cache path matters.
 func hfCacheDir(modelName string) string {
-	// HuggingFace cache follows: ~/.cache/huggingface/hub/models--{org}--{model}/
-	base := os.Getenv("HF_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
-		}
-		base = filepath.Join(home, ".cache", "huggingface")
-	}
-
-	// Convert "org/model" to "models--org--model"
+	// HuggingFace cache layout: <hfCacheBaseDir()>/models--{org}--{model}/
 	sanitized := "models--" + strings.ReplaceAll(modelName, "/", "--")
-	dir := filepath.Join(base, "hub", sanitized)
+	dir := filepath.Join(hfCacheBaseDir(), sanitized)
 	if _, err := os.Stat(dir); err != nil {
 		return ""
 	}
