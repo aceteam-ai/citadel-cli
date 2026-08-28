@@ -83,6 +83,38 @@ def _expected_inbound_bearer() -> str:
     return f"hooks_{GATEWAY_KEY}"
 
 
+# Same 8 provider-key env var names /health already enumerates (see below) --
+# keep this list and that one in sync.
+_SECRET_ENV_NAMES = (
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "FIREWORKS_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GLM_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact any LITERAL provider-secret env var VALUES found in ``text``.
+
+    Exact-substring match against secrets known to be live in this process's
+    own environment -- zero false-positive risk on ordinary reply text (a
+    provider key must be echoed verbatim to be redacted; nothing else in
+    ordinary output can coincidentally equal a live secret value). Safer than
+    a general secret-shaped regex, which has no single reliable shape across
+    providers and risks corrupting legitimate reply content (aceteam#8170
+    PR #849 review; citadel#898).
+    """
+    for name in _SECRET_ENV_NAMES:
+        value = os.environ.get(name)
+        if value and len(value) >= 8:  # floor avoids redacting trivially-short/incidental values
+            text = text.replace(value, f"[REDACTED_{name}]")
+    return text
+
+
 def _run_hermes_turn(message: str) -> str:
     """Drive one headless Hermes turn and return the assistant text.
 
@@ -121,16 +153,23 @@ def _run_hermes_turn(message: str) -> str:
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Hermes turn timed out after {TURN_TIMEOUT_SECONDS}s")
 
+    # Scrub BEFORE either the success or failure path consumes stdout/stderr --
+    # both are forwarded verbatim to the platform reply/error, and the Hermes
+    # CLI runs with the operator's own provider key(s) in its environment
+    # (citadel#898).
+    stdout_text = _scrub_secrets(proc.stdout or "")
+    stderr_text = _scrub_secrets(proc.stderr or "")
+
     if proc.returncode != 0:
         # Surface the tail of stderr (Hermes prints user-facing errors to
         # stdout too, e.g. "No inference provider configured" -- include both
         # so the terminal error is actionable) but keep it short: it goes to
         # a user-facing chat.
-        err = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        err = stderr_text.strip() or stdout_text.strip()
         tail = err[-800:] if err else "(no output)"
         raise RuntimeError(f"Hermes exited {proc.returncode}: {tail}")
 
-    stdout = (proc.stdout or "").strip()
+    stdout = stdout_text.strip()
     if not stdout:
         raise RuntimeError("Hermes produced no output")
 
@@ -184,20 +223,7 @@ def health():
     confirm without shell access (booleans/labels only -- never the secret
     values). Does not invoke the CLI.
     """
-    provider_keys_set = sorted(
-        name
-        for name in (
-            "OPENROUTER_API_KEY",
-            "OPENAI_API_KEY",
-            "FIREWORKS_API_KEY",
-            "GOOGLE_API_KEY",
-            "GEMINI_API_KEY",
-            "GLM_API_KEY",
-            "KIMI_API_KEY",
-            "MINIMAX_API_KEY",
-        )
-        if os.environ.get(name)
-    )
+    provider_keys_set = sorted(name for name in _SECRET_ENV_NAMES if os.environ.get(name))
     return {
         "status": "ok",
         "instance_id": INSTANCE_ID or None,
