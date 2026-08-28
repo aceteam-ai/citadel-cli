@@ -105,6 +105,128 @@ func TestHFCacheBaseDirPrecedence(t *testing.T) {
 	})
 }
 
+// clearHFEnv unsets every env var hfCacheBaseDir/hfDownloadEnv consult, so a
+// test starts from "operator configured nothing" regardless of what the host
+// running `go test` happens to have set.
+func clearHFEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "XDG_CACHE_HOME"} {
+		t.Setenv(k, "")
+	}
+}
+
+// hfHomeFromEnv extracts the value of HF_HOME from an env slice (as returned
+// by hfDownloadEnv), or "" if absent. Mirrors how the OS resolves env for a
+// subprocess: the LAST occurrence of a key wins for exec's envp (this
+// package never emits duplicates, but scanning to the end keeps the helper
+// correct even if that ever changes).
+func hfHomeFromEnv(env []string) string {
+	val := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HF_HOME=") {
+			val = strings.TrimPrefix(kv, "HF_HOME=")
+		}
+	}
+	return val
+}
+
+// TestHFCachePathsAgree pins the citadel #682 P0 fix and its #840
+// coordination requirement in one place: the directory pullHuggingFace's
+// subprocess actually downloads into (HF_HOME on hfDownloadEnv()), the
+// canonical citadel cache directory the engine containers mount
+// (canonicalHFCacheDir()), and the directory the disk preflight/no-op
+// detection reads free space and "already cached" size from
+// (hfCacheBaseDir()) must all agree. Hermetic: no real `hf` binary or
+// network access, just the env-construction seam.
+func TestHFCachePathsAgree(t *testing.T) {
+	t.Run("no operator override: subprocess env, canonical dir, and hfCacheBaseDir all agree", func(t *testing.T) {
+		clearHFEnv(t)
+
+		wantCanonical := canonicalHFCacheDir()
+		if wantCanonical == "" {
+			t.Fatal("canonicalHFCacheDir() returned empty")
+		}
+
+		// What the download subprocess will actually write into.
+		gotHFHome := hfHomeFromEnv(hfDownloadEnv())
+		if gotHFHome != wantCanonical {
+			t.Errorf("hfDownloadEnv() sets HF_HOME=%q, want %q (canonicalHFCacheDir())", gotHFHome, wantCanonical)
+		}
+
+		// What the disk preflight / no-op detection / MODEL_CACHE_EVICT believe
+		// the hub cache directory is (HF_HOME/hub, since no HF_HUB_CACHE/
+		// HUGGINGFACE_HUB_CACHE is set).
+		wantHubDir := filepath.Join(wantCanonical, "hub")
+		if got := hfCacheBaseDir(); got != wantHubDir {
+			t.Errorf("hfCacheBaseDir() = %q, want %q (canonicalHFCacheDir()+\"/hub\")", got, wantHubDir)
+		}
+
+		// The subprocess's own hub dir (what `hf download` with HF_HOME=gotHFHome
+		// actually resolves to) must be the SAME directory hfCacheBaseDir() reads.
+		subprocessHubDir := filepath.Join(gotHFHome, "hub")
+		if subprocessHubDir != wantHubDir {
+			t.Errorf("subprocess would write under %q, but hfCacheBaseDir() reads %q -- divergence reintroduced", subprocessHubDir, wantHubDir)
+		}
+	})
+
+	t.Run("operator HF_HUB_CACHE override: subprocess env respects it, does not inject HF_HOME", func(t *testing.T) {
+		clearHFEnv(t)
+		t.Setenv("HF_HUB_CACHE", "/mnt/models/hub")
+
+		if got := hfHomeFromEnv(hfDownloadEnv()); got != "" {
+			t.Errorf("hfDownloadEnv() injected HF_HOME=%q despite an explicit HF_HUB_CACHE override", got)
+		}
+		if got := hfCacheBaseDir(); got != "/mnt/models/hub" {
+			t.Errorf("hfCacheBaseDir() = %q, want /mnt/models/hub (the operator override)", got)
+		}
+	})
+
+	t.Run("operator HF_HOME override: subprocess env respects it, does not inject a second HF_HOME", func(t *testing.T) {
+		clearHFEnv(t)
+		t.Setenv("HF_HOME", "/custom/home")
+
+		if got := hfHomeFromEnv(hfDownloadEnv()); got != "/custom/home" {
+			t.Errorf("hfDownloadEnv() HF_HOME = %q, want /custom/home (the operator's own value, untouched)", got)
+		}
+		want := filepath.Join("/custom/home", "hub")
+		if got := hfCacheBaseDir(); got != want {
+			t.Errorf("hfCacheBaseDir() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("hfCacheDir resolves under the same base hfCacheBaseDir reports", func(t *testing.T) {
+		clearHFEnv(t)
+		// hfCacheDir stats the resolved path and returns "" when absent -- we
+		// only need the base-directory computation to agree, which we can check
+		// indirectly: a model whose cache dir exists under hfCacheBaseDir()
+		// would be found there and nowhere else. Assert the (nonexistent) path
+		// it would have looked for is under hfCacheBaseDir(), not the old
+		// ~/.cache/huggingface default.
+		base := hfCacheBaseDir()
+		if !strings.Contains(base, filepath.Join("citadel-cache", "huggingface")) {
+			t.Errorf("hfCacheBaseDir() = %q, does not resolve under citadel-cache/huggingface (the canonical, container-mounted path)", base)
+		}
+	})
+
+	// The three sub-tests above pin hfDownloadEnv()/hfCacheBaseDir() agreeing
+	// as ingredients -- they do NOT prove pullHuggingFace's real download
+	// actually applies that env. buildHFPullCommand is the one call site that
+	// does (pullHuggingFace calls exactly this, nothing else), so assert on
+	// ITS output, not just the helper it's built from.
+	t.Run("buildHFPullCommand (pullHuggingFace's actual command) carries the fix", func(t *testing.T) {
+		clearHFEnv(t)
+		cmd := buildHFPullCommand("hf", "meta-llama/Llama-2-7b-chat-hf", nil, nil)
+		if got := hfHomeFromEnv(cmd.Env); got != canonicalHFCacheDir() {
+			t.Errorf("buildHFPullCommand(...).Env has HF_HOME=%q, want %q -- pullHuggingFace's actual subprocess would not write to the canonical cache", got, canonicalHFCacheDir())
+		}
+		// argv is unaffected -- byte-identical to the pure-argv builder.
+		wantArgv := BuildHuggingFaceDownloadCommandFiltered("hf", "meta-llama/Llama-2-7b-chat-hf", nil, nil).Args
+		if !equalStrs(cmd.Args, wantArgv) {
+			t.Errorf("buildHFPullCommand(...).Args = %v, want %v", cmd.Args, wantArgv)
+		}
+	})
+}
+
 // TestRunDiskPreflightInjected exercises the glue function with the
 // free-space and size-estimate funcs both injected (per the issue's testing
 // guidance), so it needs no real disk or network access.

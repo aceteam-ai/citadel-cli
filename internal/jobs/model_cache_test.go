@@ -115,6 +115,16 @@ func TestModelCachePull_EngineTokenNormalization(t *testing.T) {
 	}
 	t.Cleanup(func() { hfRepoTreeFn = origTree })
 
+	// citadel#682 review: since pullHuggingFace now injects HF_HOME (when the
+	// operator hasn't set one) so the subprocess writes to the canonical
+	// citadel-cache/huggingface dir, a real `hf` binary on the test machine
+	// would otherwise touch that machine's actual cache directory even though
+	// the repo is fake and the download 404s before writing anything. Pin
+	// HF_HOME to a throwaway tempdir so this test's subprocess -- and this
+	// test's use of a real `hf`/`huggingface-cli` binary if one happens to be
+	// on PATH -- never resolves to a real, shared cache location.
+	t.Setenv("HF_HOME", t.TempDir())
+
 	tests := []struct {
 		name   string
 		engine string
