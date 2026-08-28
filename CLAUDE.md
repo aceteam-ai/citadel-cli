@@ -1592,6 +1592,51 @@ convenience with improved failure modes, not isolation.
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
 
+### Manual `citadel update install` vs the two automatic update paths (citadel #454)
+
+Three code paths swap the citadel binary; only two of them restart the process
+that needs to run it. `internal/worker/agent_update.go` (the `AGENT_UPDATE` job)
+and `internal/update/autoupdater.go` (the hourly background check) both run
+*inside* the worker they update, so they drain in-flight jobs, wait for idle,
+and `syscall.Exec`-restart themselves. `cmd/update.go`'s `installUpdate()`
+(`citadel update install`, run by an operator) is a separate, short-lived CLI
+process — swapping the on-disk binary there does nothing to the already-running
+managed worker, which keeps executing the pre-swap code indefinitely
+(citadel#454's split-brain incident).
+
+**`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
+stub on `!linux`) is the authority for "is a managed citadel service running
+**on this host**", not "is *this process* service-managed". It scans the
+citadel-owned systemd units on disk (`candidateManagedUnits`,
+`isCitadelManagedUnit` — the same enumeration `RematerializeManagedUnits`
+already uses) and their live `systemctl` state directly, so it gives the right
+answer from an unrelated process. `managedByServiceManager`
+(`cmd/agent_tools.go`) answers the different question "is *this* process
+running under systemd" via `INVOCATION_ID`, and is only correct from inside
+the worker being restarted — using it (or a `CITADEL_SERVICE` env check) from
+`citadel update install` would read the operator's own SSH shell, which never
+inherited the worker's environment, so the gate would silently never fire in
+exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
+(`cmd/update.go`) layers `ActiveManagedUnit` (the only signal that sees the
+install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
+ships on most nodes) with the cross-platform `service.Manager.Status()` (the
+only signal on macOS/Windows, and for a `citadel service install`-managed
+Linux node).
+
+`citadel update install` now warns loudly by default when a managed service is
+detected, and restarts it only with an explicit `--restart` flag. That restart
+is a blunt `systemctl restart` / `Stop()+Start()` with **no drain** — unlike
+the two automatic paths, it can drop in-flight jobs. This is an accepted
+tradeoff for an interactive, explicitly-opted-in flag: the CLI process has no
+way to observe the *other* (worker) process's in-flight job count, which is
+exactly why draining is owned by the paths that run inside that process.
+Known, accepted gaps: `ActiveManagedUnit` returns only the first active unit
+found, so a host running both a fleet unit and a `citadel service install`
+unit gets one warned/restarted and the other left stale (a narrower version of
+the same split-brain); and detection does not verify the swapped binary is the
+one the unit's `ExecStart=` actually runs (a dev binary at a different path
+would produce a spurious warning).
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json
