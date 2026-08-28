@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,6 +82,49 @@ func (s *Server) SetRequestRecorder(recorder func(engine string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requestRecorder = recorder
+}
+
+// ModelSwapper is the minimal interface the gateway chat route needs to make an
+// installed-but-not-currently-resident model available before routing a request
+// to it (citadel-cli#686). It is the SAME operation the job path already uses
+// (worker.SwapManager.EnsureResident) — defined locally, with gateway-owned
+// types, rather than by importing internal/worker, so this package keeps the
+// import direction it already has everywhere else (gateway depends on nothing
+// under internal/worker; cmd/, which already imports both, supplies the real
+// adapter via SetModelSwapper). A nil error with the swap still in progress is
+// "warming" (not yet expressible in this narrow interface); the response
+// contract for that case is #686's remaining scope — see the SetModelSwapper
+// doc comment for exactly what this change does and does not do.
+type ModelSwapper interface {
+	EnsureResident(ctx context.Context, backend, model string) error
+}
+
+// SetModelSwapper wires the node's model-hotswap manager to the gateway
+// (citadel-cli#686, construction-order half). This is the fix for the bug the
+// design doc (docs/design-engine-adapter.md §4) describes: a *worker.SwapManager
+// is constructed in cmd/work.go's buildNodeJobHandlers, but that happens AFTER
+// the gateway's chat router is wired (SetChatRouter) and after gw.Start has
+// already been kicked off in its own goroutine — so there was no point in the
+// startup sequence at which a caller could hand the gateway a valid swapper
+// reference at all; the capability existed in the same process but was
+// unreachable from here.
+//
+// Scope of THIS change: it makes a swapper reference reachable from the
+// gateway — SetModelSwapper is called at gateway-construction time in cmd/,
+// wrapping the SAME atomic.Pointer[worker.SwapManager] the heartbeat's swap-stats
+// reporting already reads (see cmd/work.go's nodeSwapManager), so the adapter
+// resolves to the real manager the moment buildNodeJobHandlers populates that
+// pointer, with no reordering of the existing startup sequence required. It does
+// NOT make handleChatCompletions call EnsureResident, and does NOT add the
+// installed-but-stopped fallback in resolveChatModel or the model_warming
+// response contract for a still-warming swap — wiring the swapper INTO the
+// routing decision is #686's larger, deferred scope. Safe to call at any time
+// (mutex-guarded, like SetChatRouter/SetRequestRecorder above); passing nil
+// disables it (the default, unchanged behavior).
+func (s *Server) SetModelSwapper(swapper ModelSwapper) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelSwapper = swapper
 }
 
 // registerChatRoutes wires the chat-routing handlers onto the mux. It is called

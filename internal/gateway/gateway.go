@@ -188,6 +188,13 @@ type Server struct {
 	// and so tests can inject a spy. Set via SetRequestRecorder.
 	requestRecorder func(engine string)
 
+	// modelSwapper, when non-nil, is the node's model-hotswap manager
+	// (citadel-cli#686), reachable from the chat-route path so a future change
+	// can make an installed-but-not-resident model swap in before routing to
+	// it. Set via SetModelSwapper; see chat_route.go for the construction-order
+	// problem this field's wiring fixes and what remains out of scope.
+	modelSwapper ModelSwapper
+
 	// started is set once Start has registered the proxy handlers for the routes
 	// present at that moment. It gates WireModuleRoute: a route added AFTER Start
 	// must have its proxy handler registered live (Start's registration loop has

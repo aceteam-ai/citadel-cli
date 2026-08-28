@@ -34,9 +34,9 @@ func NewModelDiscovery() *ModelDiscovery {
 }
 
 // EngineTypeFromName maps a service/app name to a model-discovery engine type
-// ("vllm", "ollama", "llamacpp", "bonsai"), or "" when the name is not a known
-// serving engine. Order matters: "ollama" contains "llama", so it must be
-// checked before the llama.cpp patterns. "bonsai" is kept as its own type (it
+// ("vllm", "ollama", "llamacpp", "bonsai", "sglang"), or "" when the name is not
+// a known serving engine. Order matters: "ollama" contains "llama", so it must
+// be checked before the llama.cpp patterns. "bonsai" is kept as its own type (it
 // serves the llama.cpp /v1/models API but the heartbeat reports it under its own
 // engine name so the gateway can route with backend=bonsai).
 func EngineTypeFromName(name string) string {
@@ -52,6 +52,8 @@ func EngineTypeFromName(name string) string {
 		return "unlimited-ocr"
 	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
 		return "llamacpp"
+	case strings.Contains(n, "sglang"):
+		return "sglang"
 	}
 	return ""
 }
@@ -89,6 +91,14 @@ func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string,
 		// never surfaces the model (the engine is dropped from
 		// collectManagedEngineStatus), so the gateway/fabric can't route to it.
 		return m.discoverOpenAIModels(ctx, "Unlimited-OCR", port)
+	case "sglang":
+		// sglang's launch_server is OpenAI-compatible and exposes the same
+		// GET /v1/models listing (citadel-cli#685 §1b) — without this case,
+		// adding "sglang" to managedProbeEngines/EngineTypeFromName alone would
+		// make every heartbeat probe of a running sglang hit the default
+		// "unsupported service type" error below and report it permanently
+		// "starting" instead of resolving its served model.
+		return m.discoverOpenAIModels(ctx, "SGLang", port)
 	case "ollama":
 		return m.discoverOllamaModels(ctx, port)
 	default:
@@ -230,9 +240,11 @@ func (m *ModelDiscovery) DiscoverEmbeddingModel(ctx context.Context, port int) (
 // CheckServiceHealth performs a health check on an LLM service.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
 	switch serviceType {
-	case "vllm", "llamacpp", "bonsai", "unlimited-ocr":
-		// vLLM, llama.cpp, the bonsai fork, and the vLLM-served Unlimited-OCR all
-		// expose GET /health.
+	case "vllm", "llamacpp", "bonsai", "unlimited-ocr", "sglang":
+		// vLLM, llama.cpp, the bonsai fork, the vLLM-served Unlimited-OCR, and
+		// sglang (citadel-cli#685 §1b; confirmed against
+		// internal/worker/llm_readiness.go's engineReadyPath, which already
+		// probes sglang's readiness at this same path) all expose GET /health.
 		return m.checkHTTPHealth(ctx, port)
 	case "ollama":
 		return m.checkOllamaHealth(ctx, port)

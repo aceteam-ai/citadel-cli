@@ -41,6 +41,18 @@ var engineModelEnvVars = map[string][]string{
 	"vllm":          {"VLLM_MODEL"},
 	"unlimited-ocr": {"OCR_SERVED_NAME", "OCR_MODEL"},
 	"bonsai":        {"BONSAI_MODEL"},
+	// llamacpp (citadel-cli#685 §1a): services/compose/llamacpp.yml now honors
+	// LLAMACPP_MODEL (three non-nested ${VAR}/${VAR:+literal} substitutions —
+	// see that file's command comment for why not one nested
+	// ${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}), so a persisted
+	// override on a stopped llamacpp advertises the same GGUF it
+	// would serve on start, same as vllm/bonsai above. Before this, llamacpp was
+	// entirely absent from this map, so resolveInstalledModel("llamacpp") always
+	// returned "" and collectInstalledEngines could never advertise it as a swap
+	// candidate — not intermittently, structurally (nothing ever wrote this
+	// var). See the engineDefaultModel comment below for why llamacpp still has
+	// no *default* entry.
+	"llamacpp": {"LLAMACPP_MODEL"},
 }
 
 // engineDefaultModel is the served model id an engine falls back to when its
@@ -49,6 +61,17 @@ var engineModelEnvVars = map[string][]string{
 // concrete model while stopped (the pilot case on node 1297). Engines with no
 // stable default (vllm serves whatever weights the deploy selected) are absent,
 // so they are advertised only when a model was persisted.
+//
+// llamacpp is deliberately absent too, for a stronger reason than vllm's: its
+// compose has no ${VAR:-default} at all (see llamacpp.yml) — unlike bonsai/
+// unlimited-ocr, llamacpp is a bring-your-own-GGUF engine with no single stable
+// default file, and with no LLAMACPP_MODEL override set the container starts in
+// llama.cpp's own router/deferred-load mode serving no model at all. Advertising
+// a fabricated default here would tell the swap path a model is available that
+// the engine cannot actually serve, producing a swap that starts llamacpp with
+// nothing loaded. resolveInstalledModel("llamacpp") correctly returns "" (no
+// swap candidate) until an operator/job persists a real LLAMACPP_MODEL via
+// engineModelEnvVars above.
 var engineDefaultModel = map[string]string{
 	"unlimited-ocr": "baidu/Unlimited-OCR",
 	"bonsai":        "Bonsai-27B-Q1_0.gguf",

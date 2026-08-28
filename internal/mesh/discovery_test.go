@@ -42,6 +42,10 @@ func TestEngineTypeFromName(t *testing.T) {
 		"llama-cpp-server": "llamacpp",
 		"postgres":         "",
 		"OLLAMA-Big":       "ollama", // case-insensitive; ollama checked before llama
+		// citadel-cli#685 §1c: this duplicate of internal/status.EngineTypeFromName
+		// was missing sglang for the same reason the original was.
+		"sglang":         "sglang",
+		"citadel-sglang": "sglang",
 	}
 	for in, want := range cases {
 		if got := EngineTypeFromName(in); got != want {

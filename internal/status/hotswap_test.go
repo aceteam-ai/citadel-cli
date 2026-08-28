@@ -94,6 +94,57 @@ func TestResolveInstalledModel_EnvOverrideWins(t *testing.T) {
 	}
 }
 
+// TestResolveInstalledModel_LlamaCppEnvOverrideResolves pins the citadel-cli#685
+// §1a fix: llamacpp was entirely absent from engineModelEnvVars, so
+// resolveInstalledModel("llamacpp") always returned "" and an
+// installed-but-stopped llamacpp could never be advertised as a swap
+// candidate — structurally, not intermittently, regardless of what was
+// persisted to llamacpp.env. With LLAMACPP_MODEL now a recognized override
+// var, a persisted value must resolve and make llamacpp swappable.
+func TestResolveInstalledModel_LlamaCppEnvOverrideResolves(t *testing.T) {
+	dir := t.TempDir()
+	writeInstalledEngine(t, dir, "llamacpp", "LLAMACPP_MODEL=my-model.gguf\n")
+
+	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+
+	var found bool
+	for _, e := range engines {
+		if e.Name == "llamacpp" {
+			found = true
+			if len(e.Models) != 1 || e.Models[0] != "my-model.gguf" {
+				t.Errorf("llamacpp Models = %v, want [my-model.gguf]", e.Models)
+			}
+			if e.Resident == nil || *e.Resident {
+				t.Errorf("Resident = %v, want non-nil false", e.Resident)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected llamacpp advertised as a swap candidate from persisted LLAMACPP_MODEL, got %+v", engines)
+	}
+}
+
+// TestResolveInstalledModel_LlamaCppNoDefaultWithoutOverride pins the other
+// half of the same fix: unlike bonsai/unlimited-ocr, llamacpp has no compose-
+// level default model (services/compose/llamacpp.yml starts in router/
+// deferred-load mode when LLAMACPP_MODEL is unset), so a stopped llamacpp with
+// no persisted override must stay un-advertised rather than fabricate a model
+// id the engine cannot actually serve.
+func TestResolveInstalledModel_LlamaCppNoDefaultWithoutOverride(t *testing.T) {
+	dir := t.TempDir()
+	writeInstalledEngine(t, dir, "llamacpp", "") // no env override, no compose default
+
+	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+
+	for _, e := range engines {
+		if e.Name == "llamacpp" {
+			t.Fatalf("expected llamacpp NOT advertised absent a persisted model, got %+v", e)
+		}
+	}
+}
+
 func TestCollectInstalledEngines_SkipsAlreadyReported(t *testing.T) {
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "bonsai", "")
