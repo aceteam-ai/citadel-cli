@@ -1,7 +1,9 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -97,6 +99,22 @@ func TestModelCachePull_EngineNormalization(t *testing.T) {
 // is "llamacpp". A rejected pull here means the whole deploy fails even though
 // the compose/service name resolves fine everywhere else.
 func TestModelCachePull_EngineTokenNormalization(t *testing.T) {
+	// citadel#840 review WANT: this test drives the real Execute -> pullHuggingFace
+	// path, which since #828/#840 runs a disk-space preflight that fetches live
+	// HF repo metadata (hfRepoTreeFn) before ever reaching the download step
+	// this test actually cares about. Left un-injected, every subtest below made
+	// a real network call to huggingface.co (up to hfMetadataTimeout each) just
+	// to 401/404 on a fake org -- an unrelated, un-hermetic dependency this test
+	// never intended to take on. Fail the metadata fetch immediately so
+	// runDiskPreflight takes its documented fail-open path (proceeds unchanged)
+	// and this test again only exercises the engine-token-normalization
+	// assertion it's named for.
+	origTree := hfRepoTreeFn
+	hfRepoTreeFn = func(ctx context.Context, repo string) ([]hfTreeEntry, error) {
+		return nil, errors.New("network access disabled in TestModelCachePull_EngineTokenNormalization")
+	}
+	t.Cleanup(func() { hfRepoTreeFn = origTree })
+
 	tests := []struct {
 		name   string
 		engine string
