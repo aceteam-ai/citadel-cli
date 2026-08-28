@@ -42,7 +42,20 @@ var idleCapableEngines = []string{"vllm"}
 // an OpenAI-compatible /v1 engine — it just takes image_url input on
 // /v1/chat/completions — so probing it surfaces baidu/Unlimited-OCR in the
 // heartbeat and lets the gateway/mesh route document-OCR requests to it by model.
-var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unlimited-ocr"}
+//
+// sglang (citadel-cli#685 §1b) was missing from this list even though it has a
+// full dispatch path elsewhere (llm_inference.go's executeSGLang, an
+// engineReadyPath entry, load/VRAM estimates): that ONE omission made it
+// invisible to EngineTypeFromName's gate (models.go) and therefore to
+// DiscoverModels, CheckServiceHealth, the gateway chat router, mesh discovery,
+// and hotswap residency/preemption tracking all at once — five to six
+// consumers from one root cause. Before this fix, a running sglang was still
+// reported (the collectRunningEmbeddedServices backstop in collector.go covers
+// any running embedded-compose service), just with no model/health/idle
+// signal, permanently "starting". Adding sglang here requires the matching
+// DiscoverModels/CheckServiceHealth cases below to land in the same change, or
+// the probe added here just errors instead of resolving.
+var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unlimited-ocr", "sglang"}
 
 // collectManagedEngineStatus reports running managed serving engines (from the
 // embedded services.ServiceMap) so their telemetry reaches the heartbeat even

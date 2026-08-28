@@ -105,6 +105,17 @@ func TestManagedProbeEnginesSupersetOfIdleCapable(t *testing.T) {
 	}
 }
 
+// TestManagedProbeEnginesIncludesSGLang pins citadel-cli#685 §1b directly:
+// sglang has a full dispatch path in llm_inference.go (executeSGLang, a
+// readiness entry, load/VRAM estimates) but was entirely absent from
+// managedProbeEngines, making it invisible to the heartbeat's model/health
+// probe despite being fully wired everywhere else.
+func TestManagedProbeEnginesIncludesSGLang(t *testing.T) {
+	if !engineInList(managedProbeEngines, "sglang") {
+		t.Fatalf("managedProbeEngines = %v, want it to include sglang", managedProbeEngines)
+	}
+}
+
 func TestIdleEngineType_MatchesImage(t *testing.T) {
 	// A catalog slug that doesn't contain "vllm" in the name but whose image does.
 	if got := idleEngineType("llm-server vllm/vllm-openai:latest"); got != "vllm" {

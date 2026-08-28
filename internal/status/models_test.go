@@ -83,6 +83,22 @@ func TestDiscoverModels_LlamacppNoModelLoaded(t *testing.T) {
 	}
 }
 
+// TestDiscoverModels_SGLang pins citadel-cli#685 §1b: sglang exposes the same
+// OpenAI-compatible GET /v1/models listing as vllm/llamacpp, so DiscoverModels
+// must resolve it instead of falling through to "unsupported service type"
+// (which is what happened before sglang had a case in this switch at all).
+func TestDiscoverModels_SGLang(t *testing.T) {
+	discovery, port := newTestDiscovery(t, openAIModelsHandler("meta-llama/Llama-3.1-8B-Instruct"))
+
+	models, err := discovery.DiscoverModels(context.Background(), "sglang", port)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(models, []string{"meta-llama/Llama-3.1-8B-Instruct"}) {
+		t.Fatalf("expected [meta-llama/Llama-3.1-8B-Instruct], got %v", models)
+	}
+}
+
 // TestDiscoverModels_OllamaAvailable verifies ollama discovery reports the
 // AVAILABLE (pulled) models from /api/tags (the servable set, since ollama
 // auto-loads any pulled model on request) and does NOT depend on /api/ps
@@ -216,6 +232,12 @@ func TestEngineTypeFromName(t *testing.T) {
 		"gotenberg":      "",
 		"postgres":       "",
 		"LLAMACPP-serve": "llamacpp",
+		// citadel-cli#685 §1b: sglang was entirely absent from this switch, so
+		// it fell through to "" (not a known serving engine) — the single root
+		// cause that made sglang invisible to DiscoverModels, CheckServiceHealth,
+		// the gateway chat router, mesh discovery, and hotswap tracking at once.
+		"sglang":         "sglang",
+		"citadel-sglang": "sglang",
 	}
 	for name, want := range cases {
 		if got := EngineTypeFromName(name); got != want {
@@ -234,7 +256,10 @@ func TestCheckServiceHealth(t *testing.T) {
 	})
 	discovery, port := newTestDiscovery(t, mux)
 
-	for _, engine := range []string{"vllm", "llamacpp", "ollama"} {
+	// sglang included (citadel-cli#685 §1b): it was missing from
+	// CheckServiceHealth's httpHealth case group, so this always fell through
+	// to the default HealthStatusUnknown, nil rather than actually checking.
+	for _, engine := range []string{"vllm", "llamacpp", "ollama", "sglang"} {
 		health, err := discovery.CheckServiceHealth(context.Background(), engine, port)
 		if err != nil {
 			t.Errorf("%s: unexpected error: %v", engine, err)

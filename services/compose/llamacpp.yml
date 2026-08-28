@@ -14,7 +14,20 @@ services:
       - "${CITADEL_LLAMACPP_HOST_PORT:?citadel must supply CITADEL_LLAMACPP_HOST_PORT}:8080"
     volumes:
       - ~/citadel-cache/llamacpp:/models
-    command: ["--host", "0.0.0.0", "--port", "8080"]
+    # LLAMACPP_MODEL (citadel-cli#685 §1a) optionally points the server at a
+    # specific GGUF under /models (the cache mount above), mirroring bonsai's
+    # BONSAI_MODEL / vllm's VLLM_MODEL. Unlike those, llamacpp is a
+    # bring-your-own-GGUF engine with no single stable default file, so the
+    # flag is OMITTED entirely when unset (the ${VAR:+...} idiom, same as
+    # vllm.yml's VLLM_TRUST_REMOTE_CODE; verified against `docker compose
+    # config` that the bare $LLAMACPP_MODEL inside the alt-text also expands)
+    # rather than defaulting to a filename that might not exist on this node.
+    # Unset, the server starts in llama.cpp's own router/deferred-load mode
+    # (see internal/status/models.go's DiscoverModels comment on that mode).
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      ${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}
     deploy:
       resources:
         reservations:

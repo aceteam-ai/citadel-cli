@@ -1308,6 +1308,48 @@ Latent and low-severity today (no caller reserves anything yet), documented
 alongside the CC/worklock gap above rather than fixed, for the same reason:
 narrow, deliberate scope for the primitive PR.
 
+### Per-engine tables are hand-synced, not generated (citadel #685, #686)
+
+Engine identity (host port, request dialect, default model, idle capability,
+...) is spread across roughly a dozen hand-maintained tables/switches instead
+of one adapter interface — deliberate today, not an oversight; see
+`docs/design-engine-adapter.md` for the full inventory and the migration plan
+(explicitly deferred: this is a design doc only, no interface exists yet).
+Three latent gaps that doc surfaced were fixed as bounded bug fixes (#685/#686
+follow-up), each pinned by a test rather than restated here:
+
+- `internal/status.resolveInstalledModel` (`hotswap.go`) is the read path for
+  "what model would a stopped engine serve" — it now recognizes an
+  `engineModelEnvVars` entry for `llamacpp`, so a persisted `LLAMACPP_MODEL`
+  resolves and the engine becomes a swap candidate (`TestResolveInstalledModel_
+  LlamaCppEnvOverrideResolves`). It deliberately still has NO `engineDefaultModel`
+  entry: unlike bonsai/unlimited-ocr, llamacpp's compose has no single stable
+  default GGUF (bring-your-own-model, deferred-load/router mode when unset) —
+  fabricating one would advertise a model the engine cannot actually serve.
+  `services/compose/llamacpp.yml`'s `${LLAMACPP_MODEL:+...}` idiom is what makes
+  the env var meaningful; it did not exist before.
+- `internal/status.managedProbeEngines` (`engines.go`) is the list the
+  heartbeat's model/health probe iterates; it was missing `sglang` entirely,
+  making it invisible to that probe, `EngineTypeFromName`/`DiscoverModels`/
+  `CheckServiceHealth` (`models.go`), and `mesh.EngineTypeFromName`'s standalone
+  duplicate (`internal/mesh/discovery.go`) all at once — one root cause, several
+  consumers. Fixed together in one change (a partial landing, e.g. adding the
+  engine to the probe list without the `DiscoverModels` case, converts a silent
+  gap into a live per-heartbeat error instead).
+- `internal/gateway.Server.SetModelSwapper` makes the node's model-hotswap
+  manager REACHABLE from the gateway's chat-route path — it was constructed
+  (`buildNodeJobHandlers`, `cmd/work.go`) after the chat router was wired and
+  after the gateway had already started serving, so there was no point in
+  startup at which a caller could hand it a valid reference at all. The fix
+  (`cmd/gateway_swap.go`'s `swapManagerAdapter`) wraps the SAME
+  `nodeSwapManager atomic.Pointer[worker.SwapManager]` the heartbeat's swap-stats
+  reporting already reads, so `SetModelSwapper` can be called at
+  gateway-construction time and resolve correctly once that pointer is
+  populated later — no reordering of the existing startup sequence. This does
+  NOT make the chat route call `EnsureResident`; wiring the swapper INTO the
+  routing decision (the `resolveChatModel` installed-but-stopped fallback, the
+  `model_warming` response contract) is #686's larger, still-open scope.
+
 ### Model Hotswap: residency invariant and swap rate bound (citadel #632, #687)
 
 With `CITADEL_MODEL_HOTSWAP` on, an inference request for an installed-but-absent

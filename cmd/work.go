@@ -2165,6 +2165,19 @@ func runWork(cmd *cobra.Command, args []string) {
 		perms := config.LoadPermissions(platform.ConfigDir())
 		gw.SetPermissions(perms)
 
+		// Model swapper (citadel-cli#686, construction-order fix): wired here, at
+		// gateway-construction time, NOT after buildNodeJobHandlers further down —
+		// that ordering (chat router wired and gw.Start already running before the
+		// swap manager even exists) was the bug. newSwapManagerAdapter wraps the
+		// nodeSwapManager atomic.Pointer declared above (populated later by
+		// buildNodeJobHandlers), so this reference resolves to the real manager
+		// once that Store happens, without moving buildNodeJobHandlers earlier or
+		// adding a second atomic pointer. See cmd/gateway_swap.go and
+		// internal/gateway/chat_route.go's SetModelSwapper doc comment for what
+		// this does (make the swapper reachable) and does not yet do (call it from
+		// the chat route — deferred to #686's larger scope).
+		gw.SetModelSwapper(newSwapManagerAdapter(&nodeSwapManager))
+
 		// Service ingress / exposure (issue #598): wire the identity resolver
 		// (private/org visibility) and the per-node link-token signing key so an
 		// exposed service under /expose/<name>/ can be gated by mesh identity or a

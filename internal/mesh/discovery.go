@@ -143,11 +143,14 @@ type nodeStatus struct {
 type statusFetchFunc func(ctx context.Context, ip string) (*nodeStatus, error)
 
 // EngineTypeFromName maps a service name to a serving-engine type
-// ("vllm"/"ollama"/"llamacpp"/"bonsai"), or "" when not a known engine. Order
-// matters: "ollama" contains "llama" so it is checked before the llama.cpp
-// patterns. This replicates internal/status.EngineTypeFromName locally to keep
-// this layer standalone (the value is informational for the model->engine view;
-// all four engines expose the same /v1/chat/completions routing path).
+// ("vllm"/"ollama"/"llamacpp"/"bonsai"/"sglang"), or "" when not a known
+// engine. Order matters: "ollama" contains "llama" so it is checked before the
+// llama.cpp patterns. This replicates internal/status.EngineTypeFromName
+// locally to keep this layer standalone (the value is informational for the
+// model->engine view; all these engines expose the same /v1/chat/completions
+// routing path). Kept in sync with the internal/status copy by hand — see
+// citadel-cli#685 §1c, which found this duplicate missing sglang for the same
+// reason the internal/status original was.
 func EngineTypeFromName(name string) string {
 	n := strings.ToLower(name)
 	switch {
@@ -161,6 +164,8 @@ func EngineTypeFromName(name string) string {
 		return "unlimited-ocr"
 	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
 		return "llamacpp"
+	case strings.Contains(n, "sglang"):
+		return "sglang"
 	}
 	return ""
 }
