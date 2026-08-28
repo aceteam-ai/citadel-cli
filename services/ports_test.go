@@ -106,6 +106,53 @@ func TestGotenbergHostPortRegistered(t *testing.T) {
 	}
 }
 
+// TestHermesHostPortRegistered pins the Hermes (Nous Research Hermes Agent)
+// agent-runtime module's host port (aceteam#8170), the second agent-runtime
+// harness after claudecode (#458). It must be registered, distinct from every
+// other managed/reserved port, and above the apps auto-allocation range. Like
+// claudecode, Hermes's module compose lives in citadel-services (not the
+// embedded ServiceMap), so this registry -- and this test -- is the only thing
+// that stops a future module from hardcoding over 8205, the slot claudecode's
+// own registration earmarked for it.
+func TestHermesHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["hermes"]
+	if !ok || got != HermesHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "hermes", got, ok, HermesHostPort)
+	}
+	if _, ok := serviceHostPortEnv["hermes"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "hermes")
+	}
+	if HermesHostPort >= AppsPortRangeStart && HermesHostPort <= AppsPortRangeEnd {
+		t.Errorf("hermes host port %d sits inside the apps auto-allocation range %d-%d", HermesHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[HermesHostPort]; taken {
+		t.Errorf("hermes host port %d collides with reserved citadel port %q", HermesHostPort, name)
+	}
+	// Pairwise-unique against every other managed service.
+	for svc, port := range ServiceHostPorts {
+		if svc == "hermes" {
+			continue
+		}
+		if port == HermesHostPort {
+			t.Errorf("hermes host port collides with managed service %q (%d)", svc, port)
+		}
+	}
+	// HostPortEnv must emit the hermes var so a compose that defers to it
+	// resolves.
+	env := HostPortEnv()
+	want := EnvHermesHostPort + "=8205"
+	found := false
+	for _, kv := range env {
+		if kv == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}
+
 // TestReservedCitadelPortsPairwiseDistinct asserts that no two DISTINCT
 // citadel-owned listeners are registered on the same port. Reserved ports are
 // a set-to-avoid for modules/apps (covered by the apps collision guard), but

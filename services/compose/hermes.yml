@@ -1,0 +1,72 @@
+# services/compose/hermes.yml
+#
+# Headless Hermes Agent runtime for a Citadel node (aceteam#8170), the second
+# agent-runtime module after claudecode (citadel-cli#432, Child C of the BYOC
+# agent-hosting epic aceteam-ai/aceteam#4588). Reuses the SAME generic runtime
+# path claudecode proved out.
+#
+# A Hermes Agent (https://github.com/NousResearch/hermes-agent) turn driven
+# headlessly by a tiny HTTP wrapper (services/hermes-service), with the model
+# routed through an operator-supplied inference provider credential (see
+# services/hermes-service/README.md for the confirmed provider list and the
+# "fabric proxy" follow-up).
+#
+# The wrapper listens on a FIXED internal port 8787 (same contract port
+# claudecode uses -- these are different containers with no shared network
+# namespace, so this is not a real collision). The HOST port is owned by
+# citadel and supplied via CITADEL_HERMES_HOST_PORT (8205, the slot
+# claudecode's own registration earmarked for the second agent-runtime
+# module); the :? guard fails loudly if it is missing. This is CPU-only --
+# no GPU reservation (contrast diffusers/vllm).
+#
+# Standalone run (the live-proof path -- operator supplies the env):
+#   CITADEL_HERMES_HOST_PORT=8205 \
+#   ACETEAM_INSTANCE_ID=... ACETEAM_PLATFORM_URL=https://aceteam.ai \
+#   ACETEAM_GATEWAY_KEY=... \
+#   OPENAI_API_KEY=... \
+#   docker compose -f services/compose/hermes.yml up
+
+services:
+  hermes:
+    image: ghcr.io/aceteam-ai/hermes-service:latest
+    container_name: citadel-hermes
+    ports:
+      - "${CITADEL_HERMES_HOST_PORT:?citadel must supply CITADEL_HERMES_HOST_PORT}:8787"
+    volumes:
+      # The durable $HERMES_HOME the upstream nousresearch/hermes-agent image
+      # declares as its VOLUME (config, sessions, memory, skills). The base
+      # image's own bootstrap chowns this to the hermes user at boot -- unlike
+      # claudecode, no hand-written entrypoint.sh chown dance is needed here.
+      - ~/citadel-cache/hermes:/opt/data
+    environment:
+      # --- AceTeam routing-seam contract (aceteam #4593) ---
+      - ACETEAM_INSTANCE_ID=${ACETEAM_INSTANCE_ID:?set ACETEAM_INSTANCE_ID}
+      - ACETEAM_PLATFORM_URL=${ACETEAM_PLATFORM_URL:?set ACETEAM_PLATFORM_URL}
+      - ACETEAM_GATEWAY_KEY=${ACETEAM_GATEWAY_KEY:?set ACETEAM_GATEWAY_KEY}
+
+      # --- Model path: at least ONE provider credential must be set. Hermes
+      # reads these directly (verified against its own source); the wrapper
+      # does not validate which one. ---
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GLM_API_KEY=${GLM_API_KEY:-}
+      - KIMI_API_KEY=${KIMI_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+      - HERMES_MODEL=${HERMES_MODEL:-}
+      - HERMES_PROVIDER=${HERMES_PROVIDER:-}
+
+      # --- Wrapper knobs (sane defaults; override only if needed) ---
+      - PORT=8787
+      - HERMES_TURN_TIMEOUT=${HERMES_TURN_TIMEOUT:-600}
+    healthcheck:
+      # Hits the wrapper /health on the fixed internal contract port.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped

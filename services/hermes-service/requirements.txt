@@ -1,0 +1,8 @@
+# HTTP wrapper deps for the headless Hermes runtime. Installed into a
+# dedicated venv at /opt/wrapper-venv, NOT the upstream image's own
+# /opt/hermes/.venv (that tree is sealed read-only at runtime via
+# HERMES_DISABLE_LAZY_INSTALLS -- see the Dockerfile header). CPU-only: the
+# model runs remotely via the operator-supplied inference provider, so there
+# is no ML stack here.
+fastapi==0.115.6
+uvicorn==0.34.0

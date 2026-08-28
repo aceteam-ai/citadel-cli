@@ -1,0 +1,127 @@
+# Citadel module manifest for the headless Hermes Agent runtime (aceteam#8170).
+# This is the module-install path: it mirrors the schema consumed by
+# internal/catalog (ServiceManifest). To ship as an installable module,
+# publish this dir as services/hermes/{service.yaml, compose.yml} in a catalog
+# repo (e.g. aceteam-ai/citadel-services); citadel then resolves it via
+# `citadel service catalog` / module install. Same shape as claudecode
+# (citadel-cli#458).
+#
+# The standalone compose lives at services/compose/hermes.yml. As of aceteam#8170
+# hermes is registered in the services/ports.go host-port registry
+# (CITADEL_HERMES_HOST_PORT = 8205 -- the slot claudecode's own registration
+# earmarked for it), so both composes defer their host publish to
+# ${CITADEL_HERMES_HOST_PORT:?...}. The `host: 8205` below stays authoritative:
+# it must equal the registry value (it is what the install-time port-conflict
+# pre-check and the collision-guard test read).
+#
+# Image status: ghcr.io/aceteam-ai/hermes-service is NOT YET BUILT/PUBLISHED as
+# of this diff, but the Dockerfile + build-hermes-service.yml CI workflow this
+# PR adds together publish it on the first push to main -- see the README.
+# This mirrors claudecode-service's own situation when #432 first landed
+# non-draft (image published by a same-repo CI follow-up, #459). The UPSTREAM
+# base image this Dockerfile builds from -- nousresearch/hermes-agent -- IS
+# real and actively published on Docker Hub (multi-arch, verified 2026-08-25);
+# only the derived wrapper image is pending.
+schema_version: 2
+name: hermes
+version: 0.1.0
+description: >-
+  Headless Hermes Agent runtime (Nous Research, https://github.com/NousResearch/hermes-agent).
+  The second agent-runtime harness after claudecode, reusing the same generic
+  runtime path -- runs a full Hermes turn on your own node.
+category: agent-runtime
+author: AceTeam
+license: Apache-2.0
+homepage: https://github.com/NousResearch/hermes-agent
+
+requires:
+  # CPU-only: the model path is an operator-supplied inference provider (or a
+  # future fabric-proxy passthrough -- see README), so no GPU is needed.
+  gpu: false
+  arch: [amd64, arm64]
+
+ports:
+  # The wrapper listens on the fixed internal contract port 8787 (same
+  # contract port claudecode uses -- no shared network namespace between
+  # modules, so this is not a collision); the module publishes it on host
+  # 8205 (the slot claudecode's registration earmarked for the second
+  # agent-runtime module).
+  - host: 8205
+    container: 8787
+    protocol: tcp
+    description: Hermes runtime wrapper HTTP (/hooks/agent, /health)
+
+config:
+  - name: ACETEAM_INSTANCE_ID
+    description: Instance id used in the reply URL path.
+    required: true
+  - name: ACETEAM_PLATFORM_URL
+    description: Base URL to POST replies to (e.g. https://aceteam.ai).
+    required: true
+  - name: ACETEAM_GATEWAY_KEY
+    description: >-
+      Raw gateway key. Inbound /hooks/agent is validated against hooks_+key;
+      outbound replies auth with the raw key.
+    required: true
+  - name: OPENROUTER_API_KEY
+    description: >-
+      Inference credential (one of several Hermes accepts natively). At least
+      ONE provider credential must be supplied -- see the README for the full
+      list Hermes recognizes (OPENAI_API_KEY, FIREWORKS_API_KEY, GOOGLE_API_KEY,
+      GEMINI_API_KEY, GLM_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY, ...). None is
+      individually required because any one works.
+    required: false
+  - name: OPENAI_API_KEY
+    description: >-
+      Alternate inference credential, routed through Hermes's `openai-api`
+      provider. Pair with OPENAI_BASE_URL to point at a self-hosted or fabric
+      OpenAI-compatible endpoint (see README "Fabric proxy story" for the
+      confirmed-but-unwired follow-up).
+    required: false
+  - name: OPENAI_BASE_URL
+    description: >-
+      Optional base URL override for the openai-api provider (defaults to
+      https://api.openai.com/v1 upstream). Only takes effect with
+      --provider openai-api / HERMES_PROVIDER=openai-api.
+    required: false
+  - name: HERMES_MODEL
+    description: Model id, mapped onto `hermes chat -m`.
+    required: false
+  - name: HERMES_PROVIDER
+    description: >-
+      Provider name, mapped onto `hermes chat --provider` (e.g. openai-api,
+      openrouter). Built-in or a user-defined name from Hermes's own
+      providers: config.
+    required: false
+  - name: HERMES_TURN_TIMEOUT
+    description: Per-turn timeout in seconds (default 600).
+    required: false
+
+health_check:
+  endpoint: /health
+  port: 8787
+  interval: 10s
+  timeout: 5s
+  retries: 12
+
+volumes:
+  - name: hermes-state
+    host: ~/citadel-cache/hermes
+    container: /opt/data
+    description: >-
+      Hermes state (config, sessions, memory, skills) -- the durable
+      $HERMES_HOME volume declared by the upstream image. Persists across
+      restarts on the node disk. NOTE: this path differs from claudecode's
+      ~/citadel-cache/claudecode -> /home/claude/.claude -- Hermes's own image
+      declares /opt/data as its VOLUME, so the module mount follows that
+      contract rather than mirroring claudecode's path literally.
+
+# Namespaced routing tag so this node becomes routable as a Hermes runtime
+# without a CLI change.
+node_tags:
+  - runtime:hermes
+
+tags:
+  - agent
+  - hermes
+  - byoc

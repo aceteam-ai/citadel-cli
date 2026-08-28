@@ -5,9 +5,9 @@
 # citadel via ${CITADEL_CLAUDECODE_HOST_PORT:?...}. claudecode is now registered
 # in services/ports.go, so HostPortEnv() injects CITADEL_CLAUDECODE_HOST_PORT
 # (=8204) on every citadel compose-up site -- including `citadel run <module>`
-# via startService -> composeEnv. This removes the literal 8204 so a second
-# agent-runtime module (Hermes/OpenClaw, aceteam#4591) can take 8205 from the
-# registry instead of colliding on a hardcoded port.
+# via startService -> composeEnv. This removes the literal 8204 so the second
+# agent-runtime module (Hermes, aceteam#8170, services/hermes-service/) takes
+# 8205 from the registry instead of colliding on a hardcoded port.
 services:
   claudecode:
     image: ghcr.io/aceteam-ai/claudecode-service:latest
