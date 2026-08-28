@@ -77,8 +77,18 @@ func (f *fakeReservationExec) start(name string) error {
 // temp dir carrying reservationTestManifestYAML.
 func newReservationTestHandler(t *testing.T, st *status.NodeStatus) (*ServiceHandler, *fakeReservationExec) {
 	t.Helper()
+	return newReservationTestHandlerWithManifest(t, reservationTestManifestYAML, st)
+}
+
+// newReservationTestHandlerWithManifest is newReservationTestHandler
+// generalized over the manifest content, so a test that needs a different
+// fixture -- e.g. avoiding services.ServiceMap/type:docker entirely, see
+// nativeReservationTestManifestYAML below -- can still share the
+// collectStatus/stopServiceFn/startServiceFn seam wiring.
+func newReservationTestHandlerWithManifest(t *testing.T, manifestYAML string, st *status.NodeStatus) (*ServiceHandler, *fakeReservationExec) {
+	t.Helper()
 	dir := t.TempDir()
-	writeManifestFile(t, dir, reservationTestManifestYAML)
+	writeManifestFile(t, dir, manifestYAML)
 	exec := &fakeReservationExec{}
 	h := NewServiceHandler(dir)
 	h.collectStatus = func() (*status.NodeStatus, error) { return st, nil }
@@ -86,6 +96,41 @@ func newReservationTestHandler(t *testing.T, st *status.NodeStatus) (*ServiceHan
 	h.startServiceFn = exec.start
 	return h, exec
 }
+
+// nativeReservationTestManifestYAML mirrors reservationTestManifestYAML but
+// declares every service `type: native` instead of `type: docker`. Reserve
+// and Release never consult this field (they evict/restore exclusively
+// through the injected stopServiceFn/startServiceFn seams above), but
+// Execute()'s SERVICE_START/SERVICE_STOP dispatch does, via resolveKind --
+// and TestExplicitServiceStopClearsReservationTag /
+// TestExplicitServiceStartClearsReservationTag deliberately drive the REAL
+// Execute() path (not the seams) to prove its tag-clearing side effect
+// end-to-end. `type: docker` there would route serviceStart/serviceStop into
+// branches that shell out to a real `docker` binary (`docker inspect`, the
+// preflight's `docker info`, `docker compose up|down`) -- harmless against a
+// nonexistent container/compose file today, but a real subprocess spawned
+// against whatever Docker daemon happens to be reachable from the test
+// machine, which on a citadel dev/CI host can be a LIVE production node.
+// `type: native` routes those branches into services.IsNativeServiceServing /
+// StartNativeService / IsNativeServiceRunning / StopNativeService instead,
+// every one of which does a services.NativeServices[name] map lookup FIRST
+// and returns immediately (no exec.Command anywhere) when the name is
+// unknown -- true for every synthetic service name in this file, since none
+// of them are "ollama"/"llamacpp"/"vllm". This keeps the assertion (an
+// explicit SERVICE_START/SERVICE_STOP clears the evicted_by_job tag)
+// hermetic without weakening what it proves.
+const nativeReservationTestManifestYAML = `node:
+  name: test-node
+services:
+  - name: svc-pinned
+    type: native
+    compose_file: ./services/svc-pinned.yml
+  - name: svc-idle-small
+    type: native
+    compose_file: ./services/svc-idle-small.yml
+pinned_services:
+  - svc-pinned
+`
 
 func writeManifestFile(t *testing.T, dir, content string) {
 	t.Helper()
@@ -608,7 +653,10 @@ func TestExplicitServiceStopClearsReservationTag(t *testing.T) {
 		svcInfo("svc-pinned", false, 20),
 		svcInfo("svc-idle-small", true, 6),
 	)
-	h, exec := newReservationTestHandler(t, st)
+	// type: native (see nativeReservationTestManifestYAML's doc): this test
+	// drives the real Execute() dispatch below, which must not shell out to
+	// docker.
+	h, exec := newReservationTestHandlerWithManifest(t, nativeReservationTestManifestYAML, st)
 	if _, err := h.Reserve(testCtx(), testJobID, 5*1024*1024*1024); err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
@@ -658,7 +706,10 @@ func TestExplicitServiceStartClearsReservationTag(t *testing.T) {
 		svcInfo("svc-pinned", false, 20),
 		svcInfo("svc-idle-small", true, 6),
 	)
-	h, exec := newReservationTestHandler(t, st)
+	// type: native (see nativeReservationTestManifestYAML's doc): this test
+	// drives the real Execute() dispatch below, which must not shell out to
+	// docker.
+	h, exec := newReservationTestHandlerWithManifest(t, nativeReservationTestManifestYAML, st)
 	if _, err := h.Reserve(testCtx(), testJobID, 5*1024*1024*1024); err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
