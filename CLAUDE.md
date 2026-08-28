@@ -1405,6 +1405,105 @@ instead of a stream-publish failure. `needsGPUSlot` is the authority for which
 job types can reach that Nack at all; extend `gpuBoundJobTypes`, not the check
 site, if another job type turns out to genuinely contend for engine VRAM.
 
+### Long-session jobs get a dedicated always-async lane (citadel #489)
+
+`Runner.Run` (`internal/worker/runner.go`) dispatches a job whose type is in
+`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE)
+on its own goroutine UNCONDITIONALLY, checked before the `concurrency > 1`
+branch. This is a dedicated lane, not a special case of the semaphore pool: it
+never touches `sem`, so it can never occupy a pool slot either, and it applies
+regardless of `--max-concurrency`.
+
+This matters because `cmd/work.go` defaults `maxConcurrency` to 1 on a
+GPU-less node — meeting nodes are typically GPU-less — and before #489 a
+`concurrency == 1` job ran INLINE in the main loop, blocking the next
+`source.Next()` poll until it returned. A 4h `MEETING_JOIN` (the long-tier
+deadline; see Consume-Loop Watchdog above) therefore monopolized the node's
+only slot and starved every other job (deploys, shell, transcription) for up
+to 4 hours — head-of-line blocking, not a wedge (the #548 watchdog/self-heal
+machinery doesn't catch this: the loop was doing exactly what it was told,
+just serially).
+
+The async-dispatched job still runs through the SAME `r.processJob(ctx, job)`
+call every other job takes, so the per-job watchdog/deadline, terminal-event
+publishing, cancellation, `WorkerState` in-flight accounting, and DLQ/ack
+semantics are unchanged — only the sequential/semaphore gate is bypassed.
+Mirrors the job-type-scoped pattern `needsGPUSlot`/`gpuBoundJobTypes`
+established for the GPU-slot gate (#825, directly above): a `map[string]struct{}`
+membership check decides which job types skip a concurrency gate entirely,
+rather than threading a new special case through the gate itself.
+`TestRunnerLongSessionJobDoesNotBlockOtherJobs` (`runner_test.go`) pins the
+regression directly: with `MaxConcurrency: 1`, a blocked MEETING_JOIN handler
+does not prevent a queued SHELL_COMMAND from completing.
+
+**The async lane exposed a SEPARATE, pre-existing single-instance assumption
+that #489's PR review caught before merge: the host meeting-browser profile.**
+Before #489, a maxConcurrency=1 node's sequential dispatch INCIDENTALLY
+enforced "at most one MEETING_JOIN at a time" as a side effect of serializing
+every job. Making MEETING_JOIN always-async removes that incidental
+serialization, so two overlapping meetings (back-to-back/overlapping calendar
+joins) can now genuinely run concurrently — and `hostMedia`
+(`internal/jobs/meeting_media.go`) launches Chrome against a FIXED, shared,
+persistent `--user-data-dir` (`platform.preparePersistentProfileDir`,
+`internal/platform/meeting_browser.go`), which Chrome locks to ONE process: a
+second launch against an already-open profile silently FORWARDS into the
+first, still-live instance instead of starting independently — the forwarded
+launch can navigate/click inside the FIRST meeting's browser, disrupting an
+in-progress call, while the second caller's own CDP port never comes up (an
+opaque `waitForCDPReady` timeout).
+
+The fix is a process-wide guard on the RESOURCE itself, not the dispatch lane
+(so it protects against collision from ANY caller, not just the async lane):
+`acquireMeetingProfileLock`/`meetingProfileLockFor` (`internal/platform/
+meeting_browser.go`) key a `sync.Mutex` by the resolved, absolute profile
+directory, mirroring `GetCobrowseManager()`'s process-wide-singleton pattern
+but keyed rather than a single instance (the meeting bot legitimately supports
+more than one profile dir via `EnvMeetingProfileDir`/per-browser override).
+`MeetingBrowser.Start()` claims it with `TryLock` — never a blocking `Lock` —
+so a collision fails FAST with a clear "meeting bot profile already in use"
+error rather than blocking up to the 4h long-session deadline (a queued
+meeting would be over by the time its turn came) or silently proceeding into
+Chrome's own forwarding collision. `closeLocked()` releases it (idempotently —
+the release func is `sync.Once`-wrapped), so Close() on every exit path
+(success, join-flow error, the `defer media.Close()` in
+`MeetingJoinHandler.Execute`, which fires on cancellation and panic-unwind
+alike) frees the profile for the next meeting.
+
+**Scope: HOST backend only.** The container backend (`containerMedia`,
+meetingd) is NOT exposed the same way — it already enforces "one meeting per
+node" server-side (meetingd's own session state returns 409 on a second
+`POST /sessions`, and `containerMedia.createSession` surfaces that as an
+immediate, clear error), so it needed no change here.
+
+`TestAcquireMeetingProfileLock`/`TestAcquireMeetingProfileLock_Concurrent`/
+`TestAcquireMeetingProfileLock_ReleaseIsIdempotent`/
+`TestMeetingBrowser_CloseReleasesProfileLock` (`meeting_browser_test.go`) pin
+this hermetically — the lock-acquisition seam is tested directly, with no real
+Chrome/Xvfb launched.
+
+**Self-heal STUCK detection hardening (non-blocking review WANT, also fixed
+here).** `LivenessMonitor`'s STUCK check (`internal/worker/selfheal.go`) used
+to measure `WorkerState.LastJobAt` — the time the MOST RECENT job started,
+overwritten by every `RecordJobReceived()` call. On a maxConcurrency=1 node
+with the async lane, a wedged MEETING_JOIN can sit in-flight for hours while a
+stream of ordinary SHELL_COMMAND jobs completes beside it; each one used to
+reset `LastJobAt`, so the STUCK ceiling would never trip for the wedged
+meeting as long as short jobs kept arriving. `WorkerState` now also tracks
+`oldestInFlightUnixNano` (surfaced as `WorkerSnapshot.OldestInFlightAt`): the
+time the CURRENT in-flight streak began (the last `0 -> >0` transition),
+untouched by jobs that start after it and cleared only when in-flight fully
+drains back to 0. `RecordJobReceived`/`RecordJobDone` serialize the
+increment/decrement against this conditional stamp under a small
+`inFlightMu` (kept separate from the atomic `inFlight` counter itself, so
+existing lock-free readers like `Snapshot()` are unaffected) — without that
+serialization, a decrement-to-zero and a concurrent increment-to-one could
+apply their stamps out of order and silently erase a legitimate in-flight
+start time. The STUCK check now reads `OldestInFlightAt`, not `LastJobAt`.
+`TestLivenessMonitorCheck_StuckUsesOldestInFlightNotLastJob`
+(`selfheal_test.go`) pins the fix by driving real `WorkerState` transitions
+(a wedged 6h job plus an interleaved short job) through the actual
+`RecordJobReceived`/`RecordJobDone` API.
+
 ### Node self-identity and the missing numeric fabric ID (`citadel whoami`, aceteam #8139)
 
 `citadel whoami` (alias `id`, `cmd/whoami.go`) answers "am I on a Citadel node,

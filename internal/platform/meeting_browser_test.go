@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -327,6 +328,190 @@ func TestMeetingBrowser_CloseDoesNotRemoveProfileDir(t *testing.T) {
 	}
 	if got := br.ProfileDir(); got != "" {
 		t.Errorf("expected in-memory ProfileDir cleared after Close, got %q", got)
+	}
+}
+
+// TestAcquireMeetingProfileLock is the regression test for the citadel-cli#895
+// review finding: two concurrent host-media Starts against the SAME
+// persistent profile directory must not both proceed. Chrome's own
+// --user-data-dir lock silently FORWARDS a second launch into the first,
+// still-live meeting's browser instead of failing -- disrupting an
+// in-progress call -- so this guard must fail the second attempt fast and
+// clearly instead. This exercises the lock-acquisition seam directly
+// (acquireMeetingProfileLock), not a real MeetingBrowser.Start(), so it is
+// hermetic: no Chrome/Xvfb binary required, no real browser launched.
+func TestAcquireMeetingProfileLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	// First caller (the "first meeting") claims the profile.
+	release1, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("first acquire: unexpected error: %v", err)
+	}
+	if release1 == nil {
+		t.Fatal("first acquire: expected a non-nil release func")
+	}
+
+	// A second, overlapping caller against the SAME dir must fail immediately
+	// with a clear reason -- never block (a queued meeting waiting up to 4h
+	// for the first to finish would already be over), and never silently
+	// proceed into Chrome's launch-forwarding collision.
+	release2, err := acquireMeetingProfileLock(dir)
+	if err == nil {
+		if release2 != nil {
+			release2()
+		}
+		t.Fatal("second acquire against the same profile dir should have failed fast, got nil error")
+	}
+	if !strings.Contains(err.Error(), "already in use") {
+		t.Errorf("expected a clear 'already in use' error, got: %v", err)
+	}
+	if release2 != nil {
+		t.Error("expected a nil release func on a failed acquire")
+	}
+
+	// The first caller must be entirely unaffected by the second's failed
+	// attempt: it can still release normally.
+	release1()
+
+	// Once released, a third acquire against the same dir must succeed --
+	// proving the failure above was contention, not a permanently poisoned lock.
+	release3, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire after release: unexpected error: %v", err)
+	}
+	defer release3()
+
+	// A DIFFERENT profile dir must never contend with this one (distinct test
+	// fixtures / a deliberately multi-profile deployment must not collide).
+	otherDir := filepath.Join(t.TempDir(), "other-meeting-profile")
+	releaseOther, err := acquireMeetingProfileLock(otherDir)
+	if err != nil {
+		t.Fatalf("acquire on a different profile dir should not contend, got: %v", err)
+	}
+	releaseOther()
+}
+
+// TestAcquireMeetingProfileLock_Concurrent races real goroutines against the
+// same profile dir (rather than the deterministic sequential ordering in
+// TestAcquireMeetingProfileLock above) so `go test -race` exercises the
+// actual mutex under contention, matching the literal "two concurrent Starts"
+// shape of the regression this guards against.
+func TestAcquireMeetingProfileLock_Concurrent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	releases := make([]func(), n)
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start.Wait() // release all goroutines together to maximize contention
+			release, err := acquireMeetingProfileLock(dir)
+			errs[i] = err
+			releases[i] = release
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	var succeeded, failed int
+	for i := 0; i < n; i++ {
+		if errs[i] == nil {
+			succeeded++
+			if releases[i] == nil {
+				t.Errorf("goroutine %d: succeeded but got a nil release func", i)
+			}
+		} else {
+			failed++
+			if releases[i] != nil {
+				t.Errorf("goroutine %d: failed but got a non-nil release func", i)
+			}
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("expected exactly 1 of %d concurrent acquires to succeed, got %d", n, succeeded)
+	}
+	if failed != n-1 {
+		t.Fatalf("expected %d failures, got %d", n-1, failed)
+	}
+	for _, release := range releases {
+		if release != nil {
+			release()
+		}
+	}
+}
+
+// TestAcquireMeetingProfileLock_ReleaseIsIdempotent pins that the returned
+// release func can be called more than once safely. MeetingBrowser's
+// closeLocked() is itself documented safe to call repeatedly (Close() ->
+// closeLocked(), and the waitForCDPReady failure path inside Start() also
+// routes there), so a double-release must never panic ("sync: unlock of
+// unlocked mutex") or leave the lock in an inconsistent state.
+func TestAcquireMeetingProfileLock_ReleaseIsIdempotent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	release, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire: unexpected error: %v", err)
+	}
+
+	release()
+	release() // must not panic
+
+	// The lock must be genuinely free after release, not left held by the
+	// no-op second release call.
+	release2, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire after idempotent release: unexpected error: %v", err)
+	}
+	release2()
+}
+
+// TestMeetingBrowser_CloseReleasesProfileLock pins the MeetingBrowser-level
+// wiring (not just the standalone acquireMeetingProfileLock seam above):
+// closeLocked() must release whatever lock Start() attached to
+// profileLockRelease, so a second MeetingBrowser can claim the same profile
+// dir once the first is closed. Constructed directly (no real Start()), same
+// hermetic pattern as TestMeetingBrowser_CloseDoesNotRemoveProfileDir.
+func TestMeetingBrowser_CloseReleasesProfileLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	release, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire: unexpected error: %v", err)
+	}
+
+	br := &MeetingBrowser{profileDir: dir, profileLockRelease: release}
+
+	// While br "holds" the profile (simulating a live meeting), a second
+	// acquire must fail -- exactly the collision this guard exists to prevent.
+	if _, err := acquireMeetingProfileLock(dir); err == nil {
+		t.Fatal("expected the profile to be reported busy while br holds it")
+	}
+
+	if err := br.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if br.profileLockRelease != nil {
+		t.Error("expected profileLockRelease to be cleared after Close")
+	}
+
+	// Now that br released it, a new acquire must succeed.
+	release2, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire after Close: unexpected error: %v", err)
+	}
+	release2()
+
+	// Close() is documented safe to call more than once; must not panic on
+	// the already-nil profileLockRelease.
+	if err := br.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 

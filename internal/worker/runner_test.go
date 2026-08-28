@@ -1662,3 +1662,225 @@ func TestRunnerFailureWithNoRetrySignalPublishesTerminalError(t *testing.T) {
 		t.Errorf("errorCount = %d, want 1 (no retry signal must default to publishing, not suppressing)", stream.errorCount)
 	}
 }
+
+// blockingJobHandler blocks in Execute until release is closed or ctx is
+// cancelled, calling onStart the first time Execute begins. Used by
+// TestRunnerLongSessionJobDoesNotBlockOtherJobs (citadel-cli#489) to hold a
+// MEETING_JOIN job in flight while asserting a later job still completes.
+type blockingJobHandler struct {
+	jobType string
+	onStart func()
+	release chan struct{}
+
+	mu       sync.Mutex
+	executed []*Job
+}
+
+func (h *blockingJobHandler) CanHandle(jobType string) bool { return h.jobType == jobType }
+
+func (h *blockingJobHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	h.mu.Lock()
+	h.executed = append(h.executed, job)
+	h.mu.Unlock()
+
+	if h.onStart != nil {
+		h.onStart()
+	}
+
+	select {
+	case <-h.release:
+		return &JobResult{Status: JobStatusSuccess, Output: map[string]any{"ok": true}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (h *blockingJobHandler) ExecutedJobs() []*Job {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.executed
+}
+
+// keyedStreamWriterFactory hands out one MockStreamWriter per job ID, so a
+// test with multiple in-flight jobs can inspect each job's terminal events
+// independently.
+type keyedStreamWriterFactory struct {
+	mu      sync.Mutex
+	writers map[string]*MockStreamWriter
+}
+
+func newKeyedStreamWriterFactory() *keyedStreamWriterFactory {
+	return &keyedStreamWriterFactory{writers: make(map[string]*MockStreamWriter)}
+}
+
+func (f *keyedStreamWriterFactory) factory(job *Job) StreamWriter {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, ok := f.writers[job.ID]
+	if !ok {
+		w = &MockStreamWriter{}
+		f.writers[job.ID] = w
+	}
+	return w
+}
+
+func (f *keyedStreamWriterFactory) get(jobID string) *MockStreamWriter {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writers[jobID]
+}
+
+func jobIDs(jobs []*Job) []string {
+	ids := make([]string, len(jobs))
+	for i, j := range jobs {
+		ids[i] = j.ID
+	}
+	return ids
+}
+
+// TestRunnerLongSessionJobDoesNotBlockOtherJobs is the regression test for
+// citadel-cli#489: on a maxConcurrency=1 node (the GPU-less default that
+// cmd/work.go picks), a long-session job type (MEETING_JOIN, per
+// longSessionJobTypes in deadline.go) must not occupy the node's only
+// sequential slot for the length of a multi-hour meeting and starve every
+// other poll cycle. It should now dispatch on its own always-async goroutine,
+// independent of maxConcurrency, so a job queued right behind it is fetched
+// and completed while the meeting is still in flight -- and it must still run
+// through the same per-job machinery (watchdog/deadline, terminal-event
+// publishing, WorkerState in-flight accounting, ack) as every other job.
+func TestRunnerLongSessionJobDoesNotBlockOtherJobs(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+
+	meetingHandler := &blockingJobHandler{
+		jobType: JobTypeMeetingJoin,
+		onStart: func() { startOnce.Do(func() { close(started) }) },
+		release: release,
+	}
+	shellHandler := NewMockJobHandler(JobTypeShellCommand, false)
+
+	jobs := []*Job{
+		{ID: "meeting-1", Type: JobTypeMeetingJoin, Payload: map[string]any{}},
+		{ID: "shell-1", Type: JobTypeShellCommand, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	state := NewWorkerState()
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1, // the GPU-less default that triggers #489's head-of-line blocking
+		State:          state,
+	}
+	runner := NewRunner(source, []JobHandler{meetingHandler, shellHandler}, config)
+
+	streams := newKeyedStreamWriterFactory()
+	runner.WithStreamWriterFactory(streams.factory)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		runner.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MEETING_JOIN handler never started")
+	}
+
+	// While the meeting job is still blocked in its handler, the shell job
+	// must still be fetched and dispatched -- the core #489 assertion. Before
+	// the fix, MEETING_JOIN ran inline on the sole sequential slot and
+	// SHELL_COMMAND was never even fetched until the meeting finished.
+	deadline := time.Now().Add(2 * time.Second)
+	var shellDispatched bool
+	for time.Now().Before(deadline) {
+		if len(shellHandler.ExecutedJobs()) >= 1 {
+			shellDispatched = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !shellDispatched {
+		t.Fatal("SHELL_COMMAND was not dispatched while MEETING_JOIN was still in flight (head-of-line blocking regression)")
+	}
+
+	// Give the shell job's terminal ack a moment to land.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(source.AckedJobs()) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	acked := source.AckedJobs()
+	if len(acked) != 1 || acked[0].ID != "shell-1" {
+		t.Fatalf("expected exactly shell-1 to be acked while the meeting job is blocked, got %v", jobIDs(acked))
+	}
+
+	shellStream := streams.get("shell-1")
+	if shellStream == nil || !shellStream.ended {
+		t.Error("expected a terminal WriteEnd for the shell job")
+	}
+
+	meetingStream := streams.get("meeting-1")
+	if meetingStream == nil || !meetingStream.started {
+		t.Error("expected the meeting job's handler to have published WriteStart")
+	}
+	if meetingStream != nil && meetingStream.ended {
+		t.Error("meeting job should not have a terminal event yet -- its handler is still blocked")
+	}
+
+	// In-flight accounting (WorkerState, #548 self-heal / liveness) must still
+	// reflect the blocked meeting job even though it's on the async lane.
+	if snap := state.Snapshot(); snap.InFlight < 1 {
+		t.Errorf("WorkerState.InFlight = %d, want >= 1 while MEETING_JOIN is still running", snap.InFlight)
+	}
+
+	// Release the meeting handler so it can finish through the normal success
+	// path, and wait for it to actually be acked -- deliberately BEFORE
+	// cancelling the context below, so the handler's select always picks the
+	// (already-closed) release channel rather than racing it against ctx.Done().
+	close(release)
+
+	deadline = time.Now().Add(2 * time.Second)
+	var meetingAcked bool
+	for time.Now().Before(deadline) {
+		for _, j := range source.AckedJobs() {
+			if j.ID == "meeting-1" {
+				meetingAcked = true
+			}
+		}
+		if meetingAcked {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !meetingAcked {
+		t.Fatal("meeting-1 was not acked after releasing its handler")
+	}
+
+	if len(meetingHandler.ExecutedJobs()) != 1 {
+		t.Fatalf("meeting handler executions = %d, want 1", len(meetingHandler.ExecutedJobs()))
+	}
+	if meetingStream := streams.get("meeting-1"); meetingStream == nil || !meetingStream.ended {
+		t.Error("expected a terminal WriteEnd for the meeting job after it completed")
+	}
+
+	if snap := state.Snapshot(); snap.InFlight != 0 {
+		t.Errorf("WorkerState.InFlight = %d, want 0 after both jobs finished", snap.InFlight)
+	}
+
+	// Both jobs are done; cancel rather than wait out the full 5s timeout so
+	// the test doesn't need to sit through it just to observe clean shutdown.
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after the context was cancelled")
+	}
+}

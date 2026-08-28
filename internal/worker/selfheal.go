@@ -177,9 +177,22 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 		}
 	}
 
-	// STUCK: a single job has occupied the loop far past any legitimate budget.
-	if snap.InFlight > 0 && m.stuckTimeout > 0 && snap.LastJobAt != nil {
-		if held := now.Sub(*snap.LastJobAt); held > m.stuckTimeout {
+	// STUCK: something has occupied the loop far past any legitimate budget.
+	//
+	// Deliberately reads OldestInFlightAt, not LastJobAt (citadel-cli#489
+	// review): LastJobAt is overwritten by EVERY job that starts, including a
+	// short one that starts WHILE a longer job is still running. On a
+	// maxConcurrency=1 node with the #489 long-session async lane, a wedged
+	// MEETING_JOIN can sit in_flight for hours while a steady stream of
+	// ordinary SHELL_COMMAND jobs completes beside it on the sequential lane
+	// -- each one would reset LastJobAt, so a STUCK ceiling measured against
+	// it would never trip for the wedged meeting as long as short jobs kept
+	// arriving. OldestInFlightAt instead marks when the current in-flight
+	// streak began and is untouched by jobs that start after it, so it
+	// correctly reflects how long SOMETHING (not necessarily the most
+	// recently started job) has been continuously running.
+	if snap.InFlight > 0 && m.stuckTimeout > 0 && snap.OldestInFlightAt != nil {
+		if held := now.Sub(*snap.OldestInFlightAt); held > m.stuckTimeout {
 			return "job stuck in handler for " + held.Truncate(time.Second).String() + " (exceeds self-heal ceiling)", true
 		}
 	}
