@@ -28,15 +28,15 @@ function Write-Info($Message) {
 }
 
 function Write-Success($Message) {
-    Write-ColorOutput Green "✓ $Message"
+    Write-ColorOutput Green "[OK] $Message"
 }
 
 function Write-Error-Msg($Message) {
-    Write-ColorOutput Red "✗ $Message"
+    Write-ColorOutput Red "[ERROR] $Message"
 }
 
 function Write-Warning-Msg($Message) {
-    Write-ColorOutput Yellow "⚠ $Message"
+    Write-ColorOutput Yellow "[WARN] $Message"
 }
 
 function Write-Step($Number, $Total, $Message) {
@@ -63,9 +63,9 @@ if ($Help) {
 
 # Banner
 Write-Host ""
-Write-ColorOutput Cyan "╔════════════════════════════════════════════════╗"
-Write-ColorOutput Cyan "║   Citadel CLI - Windows Dev Environment Setup ║"
-Write-ColorOutput Cyan "╚════════════════════════════════════════════════╝"
+Write-ColorOutput Cyan "+================================================+"
+Write-ColorOutput Cyan "|   Citadel CLI - Windows Dev Environment Setup |"
+Write-ColorOutput Cyan "+================================================+"
 Write-Host ""
 
 $totalSteps = 5
@@ -232,9 +232,9 @@ try {
 # Step 6: Build the project
 if (-not $SkipBuild) {
     Write-Host ""
-    Write-ColorOutput Cyan "╔════════════════════════════════════════════════╗"
-    Write-ColorOutput Cyan "║                 Building Project               ║"
-    Write-ColorOutput Cyan "╚════════════════════════════════════════════════╝"
+    Write-ColorOutput Cyan "+================================================+"
+    Write-ColorOutput Cyan "|                 Building Project               |"
+    Write-ColorOutput Cyan "+================================================+"
     Write-Host ""
 
     Write-Info "Building for Windows..."
@@ -255,9 +255,9 @@ if (-not $SkipBuild) {
 # Step 7: Run tests
 if (-not $SkipTests) {
     Write-Host ""
-    Write-ColorOutput Cyan "╔════════════════════════════════════════════════╗"
-    Write-ColorOutput Cyan "║                  Running Tests                 ║"
-    Write-ColorOutput Cyan "╚════════════════════════════════════════════════╝"
+    Write-ColorOutput Cyan "+================================================+"
+    Write-ColorOutput Cyan "|                  Running Tests                 |"
+    Write-ColorOutput Cyan "+================================================+"
     Write-Host ""
 
     Write-Info "Running test suite..."
@@ -277,9 +277,9 @@ if (-not $SkipTests) {
 
 # Final summary
 Write-Host ""
-Write-ColorOutput Cyan "╔════════════════════════════════════════════════╗"
-Write-ColorOutput Cyan "║              Setup Complete! 🎉                ║"
-Write-ColorOutput Cyan "╚════════════════════════════════════════════════╝"
+Write-ColorOutput Cyan "+================================================+"
+Write-ColorOutput Cyan "|              Setup Complete!                   |"
+Write-ColorOutput Cyan "+================================================+"
 Write-Host ""
 
 Write-Host "Development environment is ready!"

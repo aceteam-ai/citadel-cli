@@ -168,7 +168,7 @@ Get-ChildItem -Path $RELEASE_DIR -Filter "*.zip" -ErrorAction SilentlyContinue |
 
 $checksums | Out-File -FilePath $checksumFile -Encoding ASCII
 
-Write-Host "✅ Build and packaging complete."
+Write-Host "[OK] Build and packaging complete."
 Write-Host ""
 Write-Host "Binaries for local use are in: '.\$BUILD_DIR'"
 Get-ChildItem -Path $BUILD_DIR -Recurse -File | ForEach-Object {
@@ -182,7 +182,7 @@ Get-ChildItem -Path $RELEASE_DIR -File | ForEach-Object {
 }
 
 Write-Host ""
-Write-Host "📋 SHA256 Checksums (copy this into your release notes):"
+Write-Host "SHA256 Checksums (copy this into your release notes):"
 Write-Host "----------------------------------------------------"
 Get-Content $checksumFile
 Write-Host "----------------------------------------------------"
