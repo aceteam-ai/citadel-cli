@@ -199,6 +199,23 @@ try {
             Write-Error "$icaclsResult"
             exit 1
         }
+
+        # /grant above sets the DACL but never reassigns ownership -- an
+        # object's owner keeps implicit WRITE_DAC/READ_CONTROL over its own
+        # permissions regardless of what the DACL says, so a non-admin owner
+        # could still re-DACL this directory later even with the grants
+        # above in place. citadel's ACL check now asserts the owner itself
+        # is admin-like, independent of the DACL (issue #789,
+        # ownerNotAdminLike in internal/network/acl.go) -- set it explicitly
+        # so that check passes durably rather than by accident of whichever
+        # SID an elevated mkdir happened to assign.
+        $ownerResult = & icacls $InstallDir /setowner "*S-1-5-32-544" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to set owner of $InstallDir to Administrators -- machine-wide mode ('citadel up') would refuse to load its driver from here."
+            Write-Error "$ownerResult"
+            exit 1
+        }
+
         Write-Success "Locked $InstallDir to SYSTEM + Administrators (Users: read & execute only)"
     }
 
