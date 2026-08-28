@@ -1904,3 +1904,23 @@ Auto-generated log of every release.
   - fix(network): assert admin-like directory owner in machine-wide ACL check (#884)
 
 
+---
+
+## v2.124.0 — 2026-08-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 21 |
+| Lines added | +1604 |
+
+**Changes:**
+
+  - fix: dedicated always-async dispatch lane for long-session jobs (#895)
+  - fix: meeting bot wait loops observe job cancellation (citadel#488, cancellation half) (#894)
+  - fix: replace non-ASCII glyphs in remaining .ps1 files for PS 5.1 parsing (#890)
+  - chore(service): refuse install when a competing citadel unit is already active (#893)
+  - fix: add warming_for discriminator to model_warming (citadel-cli#681) (#892)
+  - fix: replace non-ASCII glyphs in install.ps1 so it parses on PS 5.1 (#888)
+
+
