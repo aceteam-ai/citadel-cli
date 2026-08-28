@@ -36,8 +36,11 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"586347f463e368ff0c9d81f911c935cc8816851be64a20cb14d2b3eb0252251b": true,
 		"b0977ce71d1572e45ff818068ebd84cfb4aff57cf51f116cc8a51d3c4d9d65ca": true,
 		"b3bbfbe895ee67e0ea60da4151ef3ef40158941e892a94a8b01f05e6d36bb2ea": true,
-		// citadel-cli#685 §1a: adds the optional LLAMACPP_MODEL --model flag.
-		"37847cb2b31692d64445e0dc8e8ff19ebed4e4278e7d59fc8d7a019cd14a6cab": true,
+		// citadel-cli#685 §1a: adds the optional LLAMACPP_MODEL --model flag,
+		// via three non-nested substitutions (see llamacpp.yml's command
+		// comment for why nesting a $VAR inside another substitution's
+		// alt-text was replaced before merge -- PR #905 review).
+		"ea38cf731d5330b96aacee62ad787b1b2ebfd1679df01b508a08638acb4f01f2": true,
 	},
 	"lmstudio": {
 		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,

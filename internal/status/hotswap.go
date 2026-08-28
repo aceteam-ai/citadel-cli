@@ -42,8 +42,10 @@ var engineModelEnvVars = map[string][]string{
 	"unlimited-ocr": {"OCR_SERVED_NAME", "OCR_MODEL"},
 	"bonsai":        {"BONSAI_MODEL"},
 	// llamacpp (citadel-cli#685 §1a): services/compose/llamacpp.yml now honors
-	// LLAMACPP_MODEL (${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}), so a
-	// persisted override on a stopped llamacpp advertises the same GGUF it
+	// LLAMACPP_MODEL (three non-nested ${VAR}/${VAR:+literal} substitutions —
+	// see that file's command comment for why not one nested
+	// ${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}), so a persisted
+	// override on a stopped llamacpp advertises the same GGUF it
 	// would serve on start, same as vllm/bonsai above. Before this, llamacpp was
 	// entirely absent from this map, so resolveInstalledModel("llamacpp") always
 	// returned "" and collectInstalledEngines could never advertise it as a swap

@@ -18,16 +18,29 @@ services:
     # specific GGUF under /models (the cache mount above), mirroring bonsai's
     # BONSAI_MODEL / vllm's VLLM_MODEL. Unlike those, llamacpp is a
     # bring-your-own-GGUF engine with no single stable default file, so the
-    # flag is OMITTED entirely when unset (the ${VAR:+...} idiom, same as
-    # vllm.yml's VLLM_TRUST_REMOTE_CODE; verified against `docker compose
-    # config` that the bare $LLAMACPP_MODEL inside the alt-text also expands)
-    # rather than defaulting to a filename that might not exist on this node.
-    # Unset, the server starts in llama.cpp's own router/deferred-load mode
-    # (see internal/status/models.go's DiscoverModels comment on that mode).
+    # flag is OMITTED entirely when unset rather than defaulting to a
+    # filename that might not exist on this node -- the server then starts in
+    # llama.cpp's own router/deferred-load mode (see internal/status/models.go's
+    # DiscoverModels comment on that mode).
+    #
+    # Deliberately built from THREE independent, non-nested substitutions
+    # rather than one `${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}`
+    # (an earlier version of this file used that form): whether compose's
+    # interpolation engine recursively expands a bare $VAR reference living
+    # INSIDE another substitution's alt-text is implementation-defined, and
+    # this repo has no test that renders a compose file to pin the answer, so
+    # a change of compose implementation could silently regress the SET case
+    # (LLAMACPP_MODEL literally passed through unexpanded, and llama-server
+    # failing to start) while the UNSET case kept working -- the one case
+    # this fix exists for. Each piece below is a single top-level `${VAR}` or
+    # a `${VAR:+literal}` with no variable reference in its alt-text, which
+    # is unambiguous under any compose interpolation implementation:
+    #   unset  -> "" "" ""                       -> (no --model flag)
+    #   set=x  -> "--model" "/models/" "x"        -> --model /models/x
     command: >-
       --host 0.0.0.0
       --port 8080
-      ${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}
+      ${LLAMACPP_MODEL:+--model} ${LLAMACPP_MODEL:+/models/}${LLAMACPP_MODEL}
     deploy:
       resources:
         reservations:
