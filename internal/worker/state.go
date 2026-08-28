@@ -36,6 +36,32 @@ type WorkerState struct {
 	lastPollUnixNano int64
 	// lastJobUnixNano is the time the most recent job was received.
 	lastJobUnixNano int64
+	// oldestInFlightUnixNano is the time the CURRENT streak of in-flight work
+	// began -- i.e. the last moment inFlight transitioned 0 -> >0 -- reset to 0
+	// whenever inFlight drops back to 0. Unlike lastJobUnixNano (which every
+	// job start overwrites, including a short job that starts WHILE a longer
+	// one is still running), this is not perturbed by concurrent short jobs:
+	// as long as at least one job has been continuously in flight, it keeps
+	// pointing at when that streak started. Exists so the self-heal STUCK
+	// check (issue #489 review) measures "how long has something been
+	// running", not "when did the most recent job start" -- on a
+	// maxConcurrency=1 node with the #489 long-session async lane, a wedged
+	// MEETING_JOIN sits in_flight for hours while a stream of ordinary
+	// SHELL_COMMAND jobs keeps completing beside it; each one used to reset
+	// lastJobUnixNano, so a STUCK ceiling measured against it would never trip
+	// for the wedged meeting as long as short jobs kept arriving.
+	oldestInFlightUnixNano int64
+	// inFlightMu serializes the inFlight increment/decrement against the
+	// conditional oldestInFlightUnixNano store that accompanies a 0<->non-zero
+	// transition. inFlight itself stays a plain atomic (readers like Snapshot
+	// use atomic.LoadInt64 with no lock), so this mutex exists ONLY to make
+	// "bump inFlight, then maybe touch oldestInFlightUnixNano" one atomic
+	// transaction with respect to OTHER concurrent transitions -- without it,
+	// a decrement-to-zero and a separate increment-to-one racing on two
+	// different goroutines could apply their oldestInFlightUnixNano stores out
+	// of order (the decrement's zero-out landing AFTER the new streak's
+	// stamp), silently erasing a legitimate in-flight start time.
+	inFlightMu sync.Mutex
 	// lastConsumeStatus is the HTTP status of the most recent consume call
 	// (API mode). 0 means "never polled / unknown". This is THE signal that
 	// would have surfaced the pre-fix 400s in #3924.
@@ -120,8 +146,19 @@ func (s *WorkerState) RecordJobReceived() {
 	if s == nil {
 		return
 	}
-	atomic.StoreInt64(&s.lastJobUnixNano, time.Now().UnixNano())
-	atomic.AddInt64(&s.inFlight, 1)
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&s.lastJobUnixNano, now)
+
+	s.inFlightMu.Lock()
+	newInFlight := atomic.AddInt64(&s.inFlight, 1)
+	if newInFlight == 1 {
+		// 0 -> 1 transition: a fresh in-flight streak begins now. A job that
+		// starts while another is ALREADY in flight (concurrency > 1, or the
+		// #489 long-session async lane) must not move this -- see the field
+		// comment on oldestInFlightUnixNano.
+		atomic.StoreInt64(&s.oldestInFlightUnixNano, now)
+	}
+	s.inFlightMu.Unlock()
 }
 
 // RecordJobDone decrements in-flight and increments processed or failed.
@@ -129,7 +166,14 @@ func (s *WorkerState) RecordJobDone(ok bool) {
 	if s == nil {
 		return
 	}
-	atomic.AddInt64(&s.inFlight, -1)
+	s.inFlightMu.Lock()
+	newInFlight := atomic.AddInt64(&s.inFlight, -1)
+	if newInFlight == 0 {
+		// >0 -> 0 transition: the in-flight streak has fully drained.
+		atomic.StoreInt64(&s.oldestInFlightUnixNano, 0)
+	}
+	s.inFlightMu.Unlock()
+
 	if ok {
 		atomic.AddInt64(&s.processed, 1)
 	} else {
@@ -159,11 +203,17 @@ type WorkerSnapshot struct {
 	UptimeSeconds      int64      `json:"uptime_seconds"`
 	LastPollAt         *time.Time `json:"last_poll_at,omitempty"`
 	LastJobAt          *time.Time `json:"last_job_at,omitempty"`
-	LastConsumeStatus  int        `json:"last_consume_status"`
-	LastConsumeError   string     `json:"last_consume_error,omitempty"`
-	InFlight           int64      `json:"in_flight"`
-	Processed          int64      `json:"processed"`
-	Failed             int64      `json:"failed"`
+	// OldestInFlightAt is when the CURRENT in-flight streak began (nil when
+	// InFlight==0) -- see WorkerState.oldestInFlightUnixNano for why this is
+	// distinct from LastJobAt once more than one job can be in flight (#489's
+	// long-session async lane, or MaxConcurrency > 1). The self-heal STUCK
+	// check reads this, not LastJobAt.
+	OldestInFlightAt  *time.Time `json:"oldest_in_flight_at,omitempty"`
+	LastConsumeStatus int        `json:"last_consume_status"`
+	LastConsumeError  string     `json:"last_consume_error,omitempty"`
+	InFlight          int64      `json:"in_flight"`
+	Processed         int64      `json:"processed"`
+	Failed            int64      `json:"failed"`
 }
 
 // Snapshot returns a consistent copy of the current state. Safe for concurrent
@@ -204,6 +254,10 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 	if ns := atomic.LoadInt64(&s.lastJobUnixNano); ns > 0 {
 		t := time.Unix(0, ns)
 		snap.LastJobAt = &t
+	}
+	if ns := atomic.LoadInt64(&s.oldestInFlightUnixNano); ns > 0 {
+		t := time.Unix(0, ns)
+		snap.OldestInFlightAt = &t
 	}
 	return snap
 }

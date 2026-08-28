@@ -306,6 +306,20 @@ func describeCDPException(exc any) string {
 // meeting at a time. Safe for concurrent use; the reaper goroutines own the
 // single Wait() for each child process, mirroring CobrowseManager's process
 // handling.
+//
+// That "cannot run concurrently" sentence used to be enforced only
+// INCIDENTALLY, by whatever serialized the callers (e.g. a maxConcurrency=1
+// job runner). It is now enforced HERE directly, at the resource itself (issue
+// #895 review, a citadel-cli#489 follow-up): Start() claims a process-wide,
+// per-profile-dir lock (see acquireMeetingProfileLock) before touching
+// anything, and closeLocked() releases it. Without this, a second concurrent
+// Start() against the same profile reaches Chrome's own --user-data-dir lock:
+// Chrome silently FORWARDS the launch to the already-running instance and
+// exits immediately, so the second caller's CDP port never comes up (a slow,
+// opaque waitForCDPReady timeout) AND the forwarded launch can navigate/click
+// inside the FIRST, still-live meeting's browser — disrupting an in-progress
+// call. Guarding here protects against that collision from ANY caller, not
+// just one dispatch path.
 type MeetingBrowser struct {
 	mu                 sync.Mutex
 	sinkName           string
@@ -318,6 +332,67 @@ type MeetingBrowser struct {
 	exited             chan struct{}
 	xvfb               *exec.Cmd
 	xvfbExited         chan struct{}
+	// profileLockRelease releases the process-wide profile-dir guard acquired
+	// by Start() (see acquireMeetingProfileLock). nil before Start() succeeds
+	// far enough to claim the resource, or after it has been released.
+	profileLockRelease func()
+}
+
+// meetingProfileLocks guards concurrent MeetingBrowser.Start() calls against
+// the SAME persistent profile directory. Keyed by the resolved, absolute
+// profile directory rather than a single global lock, so two MeetingBrowsers
+// deliberately configured with DIFFERENT profile dirs (only possible via
+// profileDirOverride / EnvMeetingProfileDir — e.g. distinct test fixtures, or
+// a deliberately multi-profile deployment) never contend with each other.
+var (
+	meetingProfileLocksMu sync.Mutex
+	meetingProfileLocks   = map[string]*sync.Mutex{}
+)
+
+// meetingProfileLockFor returns the (lazily-created) mutex guarding dir. The
+// returned *sync.Mutex is process-wide and shared by every caller that
+// resolves to the same dir, mirroring the singleton pattern of
+// GetCobrowseManager() but keyed rather than a single instance, since the
+// meeting bot legitimately supports more than one profile directory.
+func meetingProfileLockFor(dir string) *sync.Mutex {
+	meetingProfileLocksMu.Lock()
+	defer meetingProfileLocksMu.Unlock()
+	l, ok := meetingProfileLocks[dir]
+	if !ok {
+		l = &sync.Mutex{}
+		meetingProfileLocks[dir] = l
+	}
+	return l
+}
+
+// acquireMeetingProfileLock claims the process-wide guard for profileDir. It
+// is a TryLock, never a blocking Lock: a second MEETING_JOIN whose browser
+// wants a profile another meeting is actively using must fail FAST with a
+// clear reason, not block for up to the 4h long-session deadline (a queued
+// meeting would be over long before its turn came) and not silently proceed
+// into Chrome's own launch-forwarding collision (see the MeetingBrowser
+// doc comment).
+//
+// On success it returns a release func the caller must invoke exactly once
+// when the profile is no longer in use. The release func is idempotent
+// (sync.Once-wrapped) so a caller that both defers it on an error path AND
+// hands it off to a longer-lived owner (MeetingBrowser.closeLocked) on the
+// success path can never double-unlock.
+//
+// This is the seam TestAcquireMeetingProfileLock exercises directly, without
+// starting a real browser (issue #895 review): it is the entire fast-path
+// decision that would otherwise be un-unit-testable except by racing two real
+// Chrome launches.
+func acquireMeetingProfileLock(profileDir string) (release func(), err error) {
+	lock := meetingProfileLockFor(profileDir)
+	if !lock.TryLock() {
+		return nil, fmt.Errorf(
+			"meeting bot profile already in use — this node's bot can only be in one meeting at a time (profile: %s)",
+			profileDir,
+		)
+	}
+	var once sync.Once
+	return func() { once.Do(lock.Unlock) }, nil
 }
 
 // NewMeetingBrowser creates a meeting browser whose audio will route into the
@@ -426,6 +501,23 @@ func (b *MeetingBrowser) Start() error {
 		return err
 	}
 
+	// Claim the process-wide guard on this profile dir BEFORE doing any other
+	// setup work, so a collision fails fast without spinning up Xvfb/Chrome
+	// first just to tear it down (issue #895 review). release is unlocked by
+	// the deferred cleanup below on every early return; ownership transfers to
+	// b.profileLockRelease (released by closeLocked) only once the browser
+	// process itself has actually started.
+	release, err := acquireMeetingProfileLock(profileDir)
+	if err != nil {
+		return err
+	}
+	releasePending := release
+	defer func() {
+		if releasePending != nil {
+			releasePending()
+		}
+	}()
+
 	debugPort, err := findFreeDebugPort()
 	if err != nil {
 		return err
@@ -463,6 +555,12 @@ func (b *MeetingBrowser) Start() error {
 	b.profileDir = profileDir
 	b.display = display
 	b.xvfb = xvfb
+
+	// Transfer ownership of the profile-dir guard to b: from here on
+	// closeLocked() releases it (on Close(), or on the waitForCDPReady failure
+	// path below), not this function's own deferred cleanup.
+	b.profileLockRelease = release
+	releasePending = nil
 
 	// Reap each child so a crash is observable and no zombie is left. Stop/Close
 	// signal the kill and wait on these channels; they never call Wait directly.
@@ -581,5 +679,17 @@ func (b *MeetingBrowser) closeLocked() error {
 	// meeting teardown, forcing a re-seed before the bot could ever join again.
 	// Only clear the in-memory field; the directory on disk stays.
 	b.profileDir = ""
+
+	// Release the process-wide profile guard (issue #895 review) LAST, only
+	// once the browser process is confirmed gone (or the bounded wait above
+	// gave up) -- so another MeetingBrowser's TryLock never succeeds while
+	// this one's Chrome could still be holding the --user-data-dir lock.
+	// Idempotent: closeLocked can run more than once (Close() is documented
+	// safe to call repeatedly, and the waitForCDPReady failure path in Start()
+	// also routes here), and profileLockRelease itself is sync.Once-wrapped.
+	if b.profileLockRelease != nil {
+		b.profileLockRelease()
+		b.profileLockRelease = nil
+	}
 	return firstErr
 }

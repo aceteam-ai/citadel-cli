@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -23,7 +24,13 @@ func newTestMonitor(state *WorkerState, draining bool) *LivenessMonitor {
 }
 
 // stateWith stamps a WorkerState with a chosen startedAt, lastPoll, lastJob and
-// in-flight count so check() sees a specific liveness snapshot.
+// in-flight count so check() sees a specific liveness snapshot. lastJob also
+// seeds oldestInFlightUnixNano when inFlight > 0 -- every existing caller of
+// this helper models a single job in flight, where "when it started" and
+// "when the in-flight streak began" are the same instant, so this keeps their
+// intent unchanged after the STUCK check switched to OldestInFlightAt (see
+// TestLivenessMonitorCheck_StuckUsesOldestInFlightNotLastJob below for a case
+// where the two diverge).
 func stateWith(started, lastPoll, lastJob time.Time, inFlight int64) *WorkerState {
 	s := NewWorkerState()
 	s.startedAt = started
@@ -32,6 +39,9 @@ func stateWith(started, lastPoll, lastJob time.Time, inFlight int64) *WorkerStat
 	}
 	if !lastJob.IsZero() {
 		s.lastJobUnixNano = lastJob.UnixNano()
+		if inFlight > 0 {
+			s.oldestInFlightUnixNano = lastJob.UnixNano()
+		}
 	}
 	s.inFlight = inFlight
 	return s
@@ -93,6 +103,49 @@ func TestLivenessMonitorCheck(t *testing.T) {
 			t.Fatal("worker up 10m that never polled not flagged wedged")
 		}
 	})
+}
+
+// TestLivenessMonitorCheck_StuckUsesOldestInFlightNotLastJob is the regression
+// test for the citadel-cli#489 review WANT: on a maxConcurrency=1 node with
+// the #489 long-session async lane, a wedged MEETING_JOIN can sit in_flight
+// for hours while ordinary SHELL_COMMAND jobs keep completing beside it on
+// the sequential lane. Before this fix, the STUCK check measured time since
+// WorkerState.LastJobAt, which every one of those short jobs resets -- so as
+// long as short jobs kept arriving, the check would never see the meeting as
+// stuck even after it blew well past the ceiling. This drives real
+// WorkerState transitions (not the stateWith fixture, which cannot represent
+// "two overlapping jobs with different start times") through
+// RecordJobReceived/RecordJobDone to prove the fix.
+func TestLivenessMonitorCheck_StuckUsesOldestInFlightNotLastJob(t *testing.T) {
+	now := time.Now()
+	s := NewWorkerState()
+	s.startedAt = now.Add(-10 * time.Hour)
+	s.lastPollUnixNano = now.Add(-1 * time.Second).UnixNano()
+
+	// The wedged long-session job starts 6h ago (past the 5h test ceiling)...
+	s.oldestInFlightUnixNano = now.Add(-6 * time.Hour).UnixNano()
+	s.inFlight = 1
+	// ...and LastJobAt is kept FRESH by a stream of short jobs completing
+	// beside it, exactly as concurrent SHELL_COMMAND traffic would. Simulate
+	// one such job via the real API so both fields update the way production
+	// code actually updates them.
+	s.RecordJobReceived() // in_flight now 2 (meeting + this short job)
+	s.RecordJobDone(true) // in_flight back to 1 (only the meeting remains)
+
+	if held := now.Sub(time.Unix(0, s.lastJobUnixNano)); held > time.Minute {
+		t.Fatalf("precondition: LastJobAt should be fresh (just stamped), got %s old", held)
+	}
+	if held := now.Sub(time.Unix(0, s.oldestInFlightUnixNano)); held < 5*time.Hour {
+		t.Fatalf("precondition: OldestInFlightAt should still reflect the 6h-old meeting, got %s old", held)
+	}
+
+	reason, wedged := newTestMonitor(s, false).check(now)
+	if !wedged {
+		t.Fatal("a job stuck 6h (> 5h ceiling) was not flagged wedged, even though short jobs kept LastJobAt fresh")
+	}
+	if !strings.Contains(reason, "stuck") {
+		t.Errorf("expected a 'stuck' reason, got: %q", reason)
+	}
 }
 
 func TestSelfHealEnabled(t *testing.T) {
