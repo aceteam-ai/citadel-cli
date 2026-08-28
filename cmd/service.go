@@ -329,6 +329,15 @@ func composeFailureMessage(serviceName string, output []byte) string {
 // actualComposePath (which may be a platform-stripped temp copy). When no
 // override exists, only the base file is returned -- additive and a no-op for
 // every pre-sandbox service.
+//
+// Deliberately does NOT apply the citadel#831 RAM ceiling override
+// (internal/jobs.applyRAMIsolation's `<name>.ram.yml`), even though
+// catalog.ExistingGPURAMOverride exists and would resolve it: this boot-time
+// path has no per-call access to CITADEL_RESOURCE_ISOLATION, so a file left
+// over from an earlier opted-in job-driven run would keep applying here even
+// after an operator turns the flag back off, silently defeating the opt-out.
+// The job-driven SERVICE_START path is the one this mechanism targets; if you
+// add the override here, thread the flag check through first.
 func composeFileArgs(origComposePath, actualComposePath string) []string {
 	args := []string{"-f", actualComposePath}
 	if override := sandboxOverridePathFor(origComposePath); override != "" {

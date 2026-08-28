@@ -79,6 +79,28 @@ func deployReservesGPU(svc map[string]any) bool {
 	return false
 }
 
+// ComposeDeclaresGPU reports whether ANY service in composeYAML requests a
+// GPU (serviceRequestsGPU). Exported so callers outside this package (the
+// citadel#831 RAM-ceiling override wiring in internal/jobs) can gate on "is
+// this a GPU service" without duplicating the per-service compose-GPU-signal
+// detection serviceRequestsGPU (and, transitively, GenerateHardeningOverride/
+// GenerateGPUMemoryOverride) already owns. Every embedded ServiceMap compose
+// file declares exactly one service, so "any" is equivalent to "the one
+// service" in practice; checking every service keeps this correct even for a
+// hand-authored multi-service compose.
+func ComposeDeclaresGPU(composeYAML string) (bool, error) {
+	services, err := decodeComposeServices(composeYAML)
+	if err != nil {
+		return false, err
+	}
+	for _, svc := range services {
+		if serviceRequestsGPU(svc) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // decodeComposeServices decodes a compose document into a per-service generic
 // map keyed by service name, preserving each service body so callers can inspect
 // already-set keys (for inject-only-where-absent) and GPU signals. A document
