@@ -1884,3 +1884,217 @@ func TestRunnerLongSessionJobDoesNotBlockOtherJobs(t *testing.T) {
 		t.Fatal("Run() did not return after the context was cancelled")
 	}
 }
+
+// TestRunnerGPUBoundJobDoesNotBlockOtherJobs is the regression test for
+// citadel-cli#903 Stage 1: on a maxConcurrency=1 node (the default), a
+// GPU-bound inference job (llm_inference, per gpuBoundJobTypes in
+// gpu_tracker.go) must not occupy the node's only sequential slot for the
+// length of the inference call and starve every other poll cycle. A newly
+// dispatched targeted job (e.g. FILE_READ_BYTES) must be fetched and
+// completed while the inference job is still in flight -- mirroring #489's
+// long-session-job fix, extended here to the GPU-bound lane. It must still
+// run through the same per-job machinery (watchdog/deadline, terminal-event
+// publishing, WorkerState in-flight accounting, ack) as every other job.
+func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+
+	inferenceHandler := &blockingJobHandler{
+		jobType: JobTypeLLMInference,
+		onStart: func() { startOnce.Do(func() { close(started) }) },
+		release: release,
+	}
+	fileHandler := NewMockJobHandler(JobTypeFileReadBytes, false)
+
+	jobs := []*Job{
+		{ID: "inference-1", Type: JobTypeLLMInference, Payload: map[string]any{}},
+		{ID: "file-1", Type: JobTypeFileReadBytes, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	state := NewWorkerState()
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1, // the default that triggers #903's head-of-line blocking
+		State:          state,
+	}
+	runner := NewRunner(source, []JobHandler{inferenceHandler, fileHandler}, config)
+
+	streams := newKeyedStreamWriterFactory()
+	runner.WithStreamWriterFactory(streams.factory)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		runner.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("llm_inference handler never started")
+	}
+
+	// While the inference job is still blocked in its handler, the file job
+	// must still be fetched and dispatched -- the core #903 assertion. Before
+	// the fix, llm_inference ran inline on the sole sequential slot and
+	// FILE_READ_BYTES was never even fetched until the inference finished
+	// (reproducing the claim-window fast-fail from node 1297's OCR incident).
+	deadline := time.Now().Add(2 * time.Second)
+	var fileDispatched bool
+	for time.Now().Before(deadline) {
+		if len(fileHandler.ExecutedJobs()) >= 1 {
+			fileDispatched = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fileDispatched {
+		t.Fatal("FILE_READ_BYTES was not dispatched while llm_inference was still in flight (head-of-line blocking regression)")
+	}
+
+	// Give the file job's terminal ack a moment to land.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(source.AckedJobs()) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	acked := source.AckedJobs()
+	if len(acked) != 1 || acked[0].ID != "file-1" {
+		t.Fatalf("expected exactly file-1 to be acked while the inference job is blocked, got %v", jobIDs(acked))
+	}
+
+	fileStream := streams.get("file-1")
+	if fileStream == nil || !fileStream.ended {
+		t.Error("expected a terminal WriteEnd for the file job")
+	}
+
+	inferenceStream := streams.get("inference-1")
+	if inferenceStream == nil || !inferenceStream.started {
+		t.Error("expected the inference job's handler to have published WriteStart")
+	}
+	if inferenceStream != nil && inferenceStream.ended {
+		t.Error("inference job should not have a terminal event yet -- its handler is still blocked")
+	}
+
+	// In-flight accounting (WorkerState, #548 self-heal / liveness) must still
+	// reflect the blocked inference job even though it's on the async lane.
+	if snap := state.Snapshot(); snap.InFlight < 1 {
+		t.Errorf("WorkerState.InFlight = %d, want >= 1 while llm_inference is still running", snap.InFlight)
+	}
+
+	// Release the inference handler so it can finish through the normal
+	// success path, and wait for it to actually be acked -- deliberately
+	// BEFORE cancelling the context below, so the handler's select always
+	// picks the (already-closed) release channel rather than racing it
+	// against ctx.Done().
+	close(release)
+
+	deadline = time.Now().Add(2 * time.Second)
+	var inferenceAcked bool
+	for time.Now().Before(deadline) {
+		for _, j := range source.AckedJobs() {
+			if j.ID == "inference-1" {
+				inferenceAcked = true
+			}
+		}
+		if inferenceAcked {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !inferenceAcked {
+		t.Fatal("inference-1 was not acked after releasing its handler")
+	}
+
+	if len(inferenceHandler.ExecutedJobs()) != 1 {
+		t.Fatalf("inference handler executions = %d, want 1", len(inferenceHandler.ExecutedJobs()))
+	}
+	if inferenceStream := streams.get("inference-1"); inferenceStream == nil || !inferenceStream.ended {
+		t.Error("expected a terminal WriteEnd for the inference job after it completed")
+	}
+
+	if snap := state.Snapshot(); snap.InFlight != 0 {
+		t.Errorf("WorkerState.InFlight = %d, want 0 after both jobs finished", snap.InFlight)
+	}
+
+	// Both jobs are done; cancel rather than wait out the full 5s timeout so
+	// the test doesn't need to sit through it just to observe clean shutdown.
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after the context was cancelled")
+	}
+}
+
+// TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention pins the safety
+// claim behind #903 Stage 1: putting GPU-bound jobs on the always-async lane
+// removes the fetch-loop block on a maxConcurrency=1 node, but does NOT
+// change what happens when a second GPU-bound job races the GPU-slot gate
+// with no free slot (#825) -- it still Nacks without running the handler and
+// without a terminal stream event, exactly as it already does today under
+// MaxConcurrency > GPU count (TestRunnerGPUJobStillNacksUnderRealContention).
+// This test is the maxConcurrency=1 analogue of that one: the async lane
+// makes this contention newly REACHABLE on a maxConcurrency=1 node (before
+// #903, the sole sequential slot meant a second inference job was never even
+// fetched while the first ran), so it needs its own coverage that the
+// reachable path still behaves like the pre-existing, accepted #825 contract
+// rather than silently stranding the job. Meanwhile a concurrently-queued
+// non-GPU job (FILE_READ_BYTES) must still complete normally -- the actual
+// point of #903 Stage 1.
+func TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention(t *testing.T) {
+	tracker := NewGPUTracker(1) // 1 GPU slot total
+	if _, ok := tracker.Acquire(); !ok {
+		t.Fatal("precondition: expected to acquire the tracker's only slot")
+	} // now held, simulating an in-flight inference job already running elsewhere
+
+	jobs := []*Job{
+		{ID: "inference-2", Type: JobTypeLLMInference, Payload: map[string]any{}},
+		{ID: "file-1", Type: JobTypeFileReadBytes, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	inferenceHandler := NewMockJobHandler(JobTypeLLMInference, false)
+	fileHandler := NewMockJobHandler(JobTypeFileReadBytes, false)
+	state := NewWorkerState()
+	config := RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1, // the #903 scenario: no semaphore pool, no slot free
+		GPUTracker:     tracker,
+		State:          state,
+	}
+	runner := NewRunner(source, []JobHandler{inferenceHandler, fileHandler}, config)
+
+	streams := newKeyedStreamWriterFactory()
+	runner.WithStreamWriterFactory(streams.factory)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if len(inferenceHandler.ExecutedJobs()) != 0 {
+		t.Errorf("inference handler should not run when no GPU slot is available, got %d executions", len(inferenceHandler.ExecutedJobs()))
+	}
+	if nacked := source.NackedJobs(); len(nacked) != 1 || nacked[0].ID != "inference-2" {
+		t.Errorf("Nacked jobs = %v, want exactly [inference-2]", jobIDs(nacked))
+	}
+	if inferenceStream := streams.get("inference-2"); inferenceStream != nil && inferenceStream.ended {
+		t.Error("a GPU-slot-contention Nack must not publish a terminal event (see the #559/#825 note in runner.go)")
+	}
+
+	if len(fileHandler.ExecutedJobs()) != 1 {
+		t.Errorf("file handler executions = %d, want 1 (must not be blocked by GPU-slot contention on the other job)", len(fileHandler.ExecutedJobs()))
+	}
+	if acked := source.AckedJobs(); len(acked) != 1 || acked[0].ID != "file-1" {
+		t.Errorf("Acked jobs = %v, want exactly [file-1]", jobIDs(acked))
+	}
+	if fileStream := streams.get("file-1"); fileStream == nil || !fileStream.ended {
+		t.Error("expected a terminal WriteEnd for the successful non-GPU job")
+	}
+}

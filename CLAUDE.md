@@ -1654,14 +1654,35 @@ instead of a stream-publish failure. `needsGPUSlot` is the authority for which
 job types can reach that Nack at all; extend `gpuBoundJobTypes`, not the check
 site, if another job type turns out to genuinely contend for engine VRAM.
 
-### Long-session jobs get a dedicated always-async lane (citadel #489)
+### Long-session and GPU-bound jobs get a dedicated always-async lane (citadel #489, extended by #903 Stage 1)
 
 `Runner.Run` (`internal/worker/runner.go`) dispatches a job whose type is in
 `longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE)
+**or** satisfies `needsGPUSlot` (`internal/worker/gpu_tracker.go` —
+`llm_inference`, `LLAMACPP_INFERENCE`, `VLLM_INFERENCE`, `OLLAMA_INFERENCE`)
 on its own goroutine UNCONDITIONALLY, checked before the `concurrency > 1`
 branch. This is a dedicated lane, not a special case of the semaphore pool: it
 never touches `sem`, so it can never occupy a pool slot either, and it applies
 regardless of `--max-concurrency`.
+
+**#903 Stage 1 (GPU-bound extension):** on a `--max-concurrency=1` node (the
+common case), a long-running `llm_inference` job used to run INLINE in the
+fetch loop exactly like any other job — blocking `source.Next()` until it
+returned, so a *targeted* dispatch to that node (e.g. `FILE_READ_BYTES` in a
+`file_parse` pipeline that alternates file reads and GPU jobs) was never even
+claimed within the backend's short claim-ack window and fast-failed as
+"unreachable," even though the node was healthy and simply busy. This is a
+**fetch-loop fix, not a concurrency change**: `r.gpuTracker` (#825) still gates
+actual execution inside `processJob` exactly as before — it admits up to its
+slot count and Nacks (non-terminal, redelivered) the rest. What changes is
+which jobs can even REACH that gate on a maxConcurrency=1 node: previously a
+second GPU-bound job was never fetched while the first ran, so the gate was
+unreachable there; now it's reachable, and `TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention`
+(`runner_test.go`) pins that the gate's own behavior is unchanged under that
+newly-reachable contention. The general/unbounded case — every OTHER job type
+(`SERVICE_START`, model pulls, `MODULE_SET`, ...) still blocking the fetch loop
+inline on a maxConcurrency=1 node — is a separate, deliberately out-of-scope
+Stage 2 design issue (decoupling job receipt from execution generally).
 
 This matters because `cmd/work.go` defaults `maxConcurrency` to 1 on a
 GPU-less node — meeting nodes are typically GPU-less — and before #489 a
@@ -1684,6 +1705,8 @@ rather than threading a new special case through the gate itself.
 `TestRunnerLongSessionJobDoesNotBlockOtherJobs` (`runner_test.go`) pins the
 regression directly: with `MaxConcurrency: 1`, a blocked MEETING_JOIN handler
 does not prevent a queued SHELL_COMMAND from completing.
+`TestRunnerGPUBoundJobDoesNotBlockOtherJobs` is the #903 analogue for a
+blocked `llm_inference` handler and a queued `FILE_READ_BYTES`.
 
 **The async lane exposed a SEPARATE, pre-existing single-instance assumption
 that #489's PR review caught before merge: the host meeting-browser profile.**
