@@ -1402,6 +1402,37 @@ instead of a stream-publish failure. `needsGPUSlot` is the authority for which
 job types can reach that Nack at all; extend `gpuBoundJobTypes`, not the check
 site, if another job type turns out to genuinely contend for engine VRAM.
 
+### Long-session jobs get a dedicated always-async lane (citadel #489)
+
+`Runner.Run` (`internal/worker/runner.go`) dispatches a job whose type is in
+`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE)
+on its own goroutine UNCONDITIONALLY, checked before the `concurrency > 1`
+branch. This is a dedicated lane, not a special case of the semaphore pool: it
+never touches `sem`, so it can never occupy a pool slot either, and it applies
+regardless of `--max-concurrency`.
+
+This matters because `cmd/work.go` defaults `maxConcurrency` to 1 on a
+GPU-less node — meeting nodes are typically GPU-less — and before #489 a
+`concurrency == 1` job ran INLINE in the main loop, blocking the next
+`source.Next()` poll until it returned. A 4h `MEETING_JOIN` (the long-tier
+deadline; see Consume-Loop Watchdog above) therefore monopolized the node's
+only slot and starved every other job (deploys, shell, transcription) for up
+to 4 hours — head-of-line blocking, not a wedge (the #548 watchdog/self-heal
+machinery doesn't catch this: the loop was doing exactly what it was told,
+just serially).
+
+The async-dispatched job still runs through the SAME `r.processJob(ctx, job)`
+call every other job takes, so the per-job watchdog/deadline, terminal-event
+publishing, cancellation, `WorkerState` in-flight accounting, and DLQ/ack
+semantics are unchanged — only the sequential/semaphore gate is bypassed.
+Mirrors the job-type-scoped pattern `needsGPUSlot`/`gpuBoundJobTypes`
+established for the GPU-slot gate (#825, directly above): a `map[string]struct{}`
+membership check decides which job types skip a concurrency gate entirely,
+rather than threading a new special case through the gate itself.
+`TestRunnerLongSessionJobDoesNotBlockOtherJobs` (`runner_test.go`) pins the
+regression directly: with `MaxConcurrency: 1`, a blocked MEETING_JOIN handler
+does not prevent a queued SHELL_COMMAND from completing.
+
 ### Node self-identity and the missing numeric fabric ID (`citadel whoami`, aceteam #8139)
 
 `citadel whoami` (alias `id`, `cmd/whoami.go`) answers "am I on a Citadel node,
