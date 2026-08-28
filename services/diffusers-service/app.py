@@ -119,9 +119,16 @@ def _get_pipe():
         # huggingface_hub.snapshot_download call so the filter actually
         # applies to what lands on disk; see model_preflight.
         # prefetch_filtered_weights's docstring for the full reasoning.
+        #
+        # NOTE: no cache_dir is passed here either (deliberately -- see
+        # default_snapshot_download's docstring). from_pretrained below also
+        # never passes cache_dir, so both resolve to huggingface_hub's own
+        # default (HF_HUB_CACHE = HF_HOME/hub) identically. Passing
+        # DIFFUSERS_CACHE_DIR (== HF_HOME, missing the /hub suffix) here was a
+        # confirmed second bug in an earlier version of this fix: it wrote the
+        # filtered prefetch to a directory from_pretrained never reads.
         model_preflight.prefetch_filtered_weights(
             DIFFUSERS_MODEL,
-            DIFFUSERS_CACHE_DIR,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
             token=hf_token,

@@ -185,7 +185,6 @@ def test_prefetch_filtered_weights_noop_when_no_patterns():
     calls = []
     ran = mp.prefetch_filtered_weights(
         "stabilityai/sdxl-turbo",
-        "/citadel-cache/huggingface",
         snapshot_download_fn=lambda *a, **kw: calls.append((a, kw)) or "unused",
     )
     assert ran is False
@@ -195,22 +194,20 @@ def test_prefetch_filtered_weights_noop_when_no_patterns():
 def test_prefetch_filtered_weights_calls_snapshot_download_with_patterns():
     calls = []
 
-    def fake_snapshot_download(repo_id, *, cache_dir, allow_patterns, ignore_patterns, revision, token):
+    def fake_snapshot_download(repo_id, *, allow_patterns, ignore_patterns, revision, token):
         calls.append(
             dict(
                 repo_id=repo_id,
-                cache_dir=cache_dir,
                 allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
                 revision=revision,
                 token=token,
             )
         )
-        return cache_dir
+        return "unused"
 
     ran = mp.prefetch_filtered_weights(
         "Lightricks/LTX-Video",
-        "/citadel-cache/huggingface",
         allow_patterns=["transformer/*", "vae/*"],
         ignore_patterns=["*.bin"],
         token="tok",
@@ -230,12 +227,65 @@ def test_prefetch_filtered_weights_ignore_only_still_runs():
     calls = []
     ran = mp.prefetch_filtered_weights(
         "some-org/some-repo",
-        "/citadel-cache/huggingface",
         ignore_patterns=["*.onnx"],
         snapshot_download_fn=lambda *a, **kw: calls.append(kw) or "unused",
     )
     assert ran is True
     assert len(calls) == 1
+
+
+def test_prefetch_filtered_weights_never_passes_cache_dir():
+    """Pins the citadel#902 cache-dir-parity fix. An earlier version of this
+    function accepted a `cache_dir` parameter and forwarded
+    DIFFUSERS_CACHE_DIR (== HF_HOME) straight to snapshot_download. Verified
+    against the pinned huggingface_hub==0.26.2 source
+    (`_snapshot_download.py`): `if cache_dir is None: cache_dir =
+    constants.HF_HUB_CACHE`, and `HF_HUB_CACHE` defaults to `HF_HOME/hub` --
+    a DIFFERENT directory than `HF_HOME` itself. Because app.py's
+    `from_pretrained` call also never passes `cache_dir`, it always resolves
+    to `HF_HUB_CACHE`, so passing `HF_HOME` here wrote the filtered prefetch
+    to a directory `from_pretrained` never reads -- from_pretrained's
+    pipeline_is_cached check would never find it and would silently
+    re-download via its own (possibly still-broad) selection, AND the
+    filtered subset would sit duplicated on disk for nothing. Both from
+    prefetch_filtered_weights and default_snapshot_download must never pass a
+    cache_dir at all, so they always defer to huggingface_hub's own default
+    resolution -- the same resolution from_pretrained relies on -- and can
+    never diverge from it.
+
+    This test calls the PUBLIC prefetch_filtered_weights (not
+    default_snapshot_download directly) so it also catches a regression where
+    prefetch_filtered_weights re-adds a cache_dir passthrough even if
+    default_snapshot_download's own signature stays clean.
+    """
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append(kwargs)
+        return "unused"
+
+    mp.prefetch_filtered_weights(
+        "Lightricks/LTX-Video",
+        allow_patterns=["transformer/*"],
+        snapshot_download_fn=fake_snapshot_download,
+    )
+    assert len(calls) == 1
+    assert "cache_dir" not in calls[0], (
+        "prefetch_filtered_weights must never pass cache_dir to "
+        "snapshot_download -- from_pretrained doesn't either, and both must "
+        "resolve to the identical huggingface_hub default (HF_HUB_CACHE) or "
+        "the prefetched files land somewhere from_pretrained never looks"
+    )
+
+
+def test_default_snapshot_download_signature_has_no_cache_dir_param():
+    """Belt-and-suspenders on the same fix: default_snapshot_download's own
+    signature must not accept cache_dir either, so a future caller can't
+    reintroduce the bug by passing one explicitly."""
+    import inspect
+
+    params = inspect.signature(mp.default_snapshot_download).parameters
+    assert "cache_dir" not in params
 
 
 # ---------------------------------------------------------------------------

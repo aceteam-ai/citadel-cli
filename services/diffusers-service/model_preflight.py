@@ -258,7 +258,6 @@ def plan_disk_preflight(
 def default_snapshot_download(
     repo_id: str,
     *,
-    cache_dir: str,
     allow_patterns: Sequence[str] | None = None,
     ignore_patterns: Sequence[str] | None = None,
     revision: str = "main",
@@ -287,12 +286,31 @@ def default_snapshot_download(
     already cached (its `pipeline_is_cached` fast path, no further network
     call) or fetches only the small remainder via its own safe,
     component-based selection -- never the full unfiltered repo tree.
+
+    Deliberately does NOT accept a `cache_dir` argument -- an earlier version
+    of this function did, called with `DIFFUSERS_CACHE_DIR` (== `HF_HOME`),
+    and that was a SECOND, independently-confirmed bug on top of the
+    from_pretrained-kwargs one above. Verified against the pinned
+    huggingface_hub==0.26.2 source (`_snapshot_download.py`):
+    `if cache_dir is None: cache_dir = constants.HF_HUB_CACHE`, and
+    `constants.HF_HUB_CACHE` defaults to `HF_HOME/hub`, NOT `HF_HOME` itself.
+    `from_pretrained` (app.py's call site) never passes `cache_dir` either, so
+    diffusers' own `download()` also resolves to `HF_HUB_CACHE`. Passing
+    `HF_HOME` here would therefore write the filtered prefetch to a directory
+    `from_pretrained` never reads: its `pipeline_is_cached` check looks in
+    `HF_HOME/hub` and never finds it, so it silently re-downloads via its OWN
+    (possibly still-broad) selection -- the filter never governs the real
+    download (still a no-op, just moved one layer down) AND the filtered
+    subset sits duplicated on disk for nothing. Never passing `cache_dir` at
+    all is what guarantees this call and `from_pretrained`'s always resolve
+    to the SAME directory: both defer unconditionally to
+    huggingface_hub's own default resolution rather than either side
+    hardcoding a path the other might drift from.
     """
     from huggingface_hub import snapshot_download
 
     return snapshot_download(
         repo_id,
-        cache_dir=cache_dir,
         allow_patterns=list(allow_patterns) if allow_patterns else None,
         ignore_patterns=list(ignore_patterns) if ignore_patterns else None,
         revision=revision,
@@ -305,7 +323,6 @@ SnapshotDownloadFn = Callable[..., str]
 
 def prefetch_filtered_weights(
     repo_id: str,
-    cache_dir: str,
     *,
     allow_patterns: Sequence[str] | None = None,
     ignore_patterns: Sequence[str] | None = None,
@@ -313,7 +330,9 @@ def prefetch_filtered_weights(
     token: str | None = None,
     snapshot_download_fn: SnapshotDownloadFn = default_snapshot_download,
 ) -> bool:
-    """Pre-populates `cache_dir` with exactly the allow/ignore-filtered
+    """Pre-populates the SAME cache directory `from_pretrained` reads from
+    (see `default_snapshot_download`'s docstring for why this deliberately
+    takes no `cache_dir` parameter) with exactly the allow/ignore-filtered
     subset of `repo_id`'s files, when either pattern list is set. Returns
     True if a prefetch ran, False if there was nothing to filter (both
     pattern lists empty) -- in the False case `from_pretrained`'s own
@@ -329,7 +348,6 @@ def prefetch_filtered_weights(
         return False
     snapshot_download_fn(
         repo_id,
-        cache_dir=cache_dir,
         allow_patterns=allow_patterns,
         ignore_patterns=ignore_patterns,
         revision=revision,
