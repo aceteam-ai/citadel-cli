@@ -1324,12 +1324,15 @@ node showed green while executing nothing. Three defenses (`internal/worker/`):
 
 1. **Per-job watchdog (root fix, `deadline.go` + `runner.go`).** Every handler
    dispatch runs in its own goroutine bounded by a deadline (`executeWithDeadline`).
-   On timeout the loop abandons the job and advances. CRITICAL: legacy handlers do
-   NOT receive the context (`LegacyHandlerAdapter.Execute` builds a bare
-   `jobs.JobContext`), so a context-cancel alone can't unblock them — the
-   goroutine+select is what keeps the loop alive; the orphaned handler goroutine
-   leaks until it finishes on its own (accepted tradeoff; threading ctx into
-   legacy handlers is the follow-up that lets the leak be fixed). Timeout
+   On timeout the loop abandons the job and advances. `LegacyHandlerAdapter.Execute`
+   now threads the worker's `context.Context` into `jobs.JobContext.Ctx` (landed
+   after this section was first written; read via `JobContext.Context()`, which
+   falls back to `context.Background()` for a caller that predates threading), so a
+   context-cancel CAN unblock a legacy handler that actually selects on it —
+   `internal/jobs`' three MEETING_JOIN wait loops are the first to do so
+   (citadel#488). Most legacy handlers still don't select on it, though, so for
+   THEM the goroutine+select here remains what keeps the loop alive on a timeout:
+   the orphaned handler goroutine leaks until it finishes on its own. Timeout
    precedence: an explicit payload `timeout_ms` (backend budget, PR #552) wins;
    otherwise a **generous per-class fallback** applies so the wedge is bounded even
    when the backend sends no budget (the exact wedge condition). Classes:
@@ -1591,6 +1594,74 @@ convenience with improved failure modes, not isolation.
 (which lives at the REAL machine's `network.GetNodeConfigDir()`, not the
 override) rather than caching an overridden node's identity into the real
 machine's cache file.
+
+### Meeting-bot wait-loop cancellation (citadel#488, cancellation half)
+
+Every poll loop in the MEETING_JOIN join/wait chain now `select`s on
+`ctx.Context().Done()` each tick instead of a bare `time.Sleep`: the pre-join
+click loops (`pollForJoinClick`, Meet; `pollForTeamsJoinClick`, Teams — both
+run BEFORE their platform's admission wait), the admission waits
+(`waitUntilAdmitted`, Meet; `waitUntilTeamsAdmitted`, Teams), and the two
+in-call wait loops (`waitForMeetingEnd`, the plain path; and
+`waitForMeetingEndInteractive`, `internal/jobs/meeting_interactive.go`, the
+DEFAULT loop since `config.Meeting.StreamingEnabled` defaults true) — the
+latter two alongside the existing recorder-death signal (citadel#490) they
+already watched. All are in `internal/jobs/meeting_join.go` except the two
+Teams functions (`meeting_join_teams.go`) and the interactive loop. On
+cancellation each returns within one poll tick with a distinct error
+(`errors.Is`-compatible with `context.Canceled`/`context.DeadlineExceeded` via
+`%w`); the two in-call loops additionally report a distinct `"cancelled"`
+reason rather than the misleading `recorder_died`/`recording died` shape —
+`meeting_join.go`'s `Execute` branches on `outcome.endReason == "cancelled"` to
+log and wrap it distinctly. Cleanup is unaffected either way: `Execute`'s
+`defer media.Close()` and the `media.StopRecording()` call after
+`runMeetingLoop` returns both already ran regardless of *why* the loop
+returned (recorder death, cancellation, or a clean end) — this fix only makes
+that return happen promptly instead of after up to `p.maxDuration()` (default
+4h) or, for the pre-join/admission loops, `joinButtonTimeout`/`admitTimeout`.
+
+**What actually cancels the context in production, and what still doesn't:**
+`cmd/work.go`'s own top-level `signal.Notify` goroutine (separate from
+`internal/worker.Runner.Run`'s internal one) calls the root `cancel()` on
+SIGINT/SIGTERM; that root context is what flows into
+`Runner.Run(ctx)` -> `processJob(ctx, job)` -> `LegacyHandlerAdapter.Execute`'s
+`jobs.JobContext{Ctx: ctx}` -- so it reaches these loops even when
+`Runner.Run`'s OWN internal signal handling can't (in sequential mode,
+`concurrency<=1`, `processJob` is called inline in the poll loop's `select`,
+so `Runner.Run`'s internal `sigs` case can't be reached — and thus can't itself
+call `cancel()` — until the in-flight job returns; `cmd/work.go`'s separate
+goroutine has no such gate). A **drain** (`Runner.Drain`, e.g. the auto-updater
+readying a new binary) is a DIFFERENT signal and deliberately does NOT cancel
+any job's context — `internal/update.AutoUpdater.runOnce` only stops new job
+pickup and waits (bounded, deferring to the next cycle on timeout) for natural
+completion, matching the general worker convention that a drain waits rather
+than kills. This fix does not change that: a live meeting still blocks an
+auto-update until it ends on its own or the duration cap trips. Only true
+process-level cancellation (SIGINT/SIGTERM, or a future explicit per-job
+cancel) is observed here.
+
+**A side effect of returning promptly: `backupAndPrune`'s upload now reliably
+no-ops on a cancelled shutdown.** `Execute` still calls
+`h.backupAndPrune(ctx, ...)` after `runMeetingLoop` returns, and
+`uploadAudioBackup` (`meeting_audio_backup.go`) derives both its transcode and
+HTTP-upload deadlines from the SAME job `ctx.Context()` via
+`context.WithTimeout`. On the cancellation path that parent is already Done,
+so the derived contexts are too, and the docker-exec/HTTP calls fail
+immediately — logged as an ordinary "non-fatal" backup failure, same as any
+other transcode/upload error. This was already possible before this fix (a
+cancellation reaching Execute at all was the rare/slow case); this fix just
+makes it the COMMON case on shutdown. No data loss: `backupAndPrune`'s
+`uploadConfirmed=false` path protects the local WAV from the retention sweep
+either way, and the WAV is what `citadel#488`'s orphan-reaper half (next
+paragraph) would need to reconcile regardless.
+
+**Orphan-reaper half is a separate, not-yet-built follow-up.** A SIGKILL (the
+watchdog's grace-period force-exit, `citadel#312`, or an external `kill -9`)
+still skips every defer, so the null-sink module, Xvfb display, Chrome
+process, and `citadel-meeting-profile-*` temp dir it left behind are not
+reclaimed by anything in this fix — cobrowse's `cobrowse_orphan.go` reaper
+only sweeps the fixed cobrowse `:9222`, not the meeting bot's random CDP port
+or `citadel_meeting_*` sink naming. Tracked separately under citadel#488.
 
 ### Manual `citadel update install` vs the two automatic update paths (citadel #454)
 

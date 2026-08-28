@@ -239,6 +239,11 @@ func (h *MeetingJoinHandler) runTeamsJoinFlow(ctx JobContext, br meetingBrowser,
 // reaching the timeout with neither admission nor a join click is fatal. Params
 // mirror pollForJoinClick so tests can run it in milliseconds. Selectors VERIFIED
 // against a live light-meetings anon join (2026-08-01).
+//
+// Also selects on ctx.Context().Done(), mirroring pollForJoinClick's Meet
+// counterpart (citadel#488): this loop runs before waitUntilTeamsAdmitted in
+// runTeamsJoinFlow, so a shutdown/drain landing during the pre-join sequence
+// needs the same prompt-return contract.
 func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passcode string, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -298,13 +303,18 @@ func pollForTeamsJoinClick(ctx JobContext, page joinPage, botDisplayName, passco
 			return nil
 		}
 
-		time.Sleep(interval)
+		select {
+		case <-ctx.Context().Done():
+			return fmt.Errorf("Teams meeting cancelled while waiting for the join button: %w", ctx.Context().Err())
+		case <-time.After(interval):
+		}
 	}
 	return fmt.Errorf("click Teams join button: no button matched labels %v within %s (interstitial/pre-join page may have changed — re-tune meeting_join_teams.go labels)", teamsJoinButtonLabels, timeout)
 }
 
 // waitUntilTeamsAdmitted polls the Teams admission heuristic until the bot is
-// in-call or the lobby timeout elapses. Mirrors waitUntilAdmitted for Meet.
+// in-call, the lobby timeout elapses, or the job context is cancelled (worker
+// shutdown/drain, citadel#488 — mirrors waitUntilAdmitted for Meet).
 func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBrowser, p meetingJoinParams) error {
 	deadline := time.Now().Add(admitTimeout)
 	for time.Now().Before(deadline) {
@@ -322,7 +332,13 @@ func (h *MeetingJoinHandler) waitUntilTeamsAdmitted(ctx JobContext, br meetingBr
 		} else {
 			ctx.Log("warn", "     - Teams admission check errored (retrying): %v", err)
 		}
-		time.Sleep(meetingPollInterval)
+		select {
+		case <-ctx.Context().Done():
+			err := fmt.Errorf("Teams meeting cancelled while waiting for admission: %w", ctx.Context().Err())
+			ctx.Log("info", "     - admission wait for Teams meeting %s cancelled (shutdown/drain): %v", p.MeetingID, err)
+			return err
+		case <-time.After(meetingPollInterval):
+		}
 	}
 	return fmt.Errorf("not admitted to Teams meeting within %s (host did not let the bot in, or the admission selector is stale — re-tune teamsIsAdmittedJS)", admitTimeout)
 }
