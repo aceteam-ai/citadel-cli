@@ -18,6 +18,7 @@ import (
 var (
 	svcUserMode   bool
 	svcSystemMode bool
+	svcForce      bool
 )
 
 // --- Subcommand group: citadel service ... ---
@@ -116,6 +117,7 @@ func init() {
 	for _, cmd := range []*cobra.Command{svcInstallCmd, installServiceCmd} {
 		cmd.Flags().BoolVar(&svcUserMode, "user", false, "Install as a user service (default on Linux/macOS)")
 		cmd.Flags().BoolVar(&svcSystemMode, "system", false, "Install as a system-wide service (requires root/admin)")
+		cmd.Flags().BoolVar(&svcForce, "force", false, "Install even if a competing citadel managed service is already active (adopts/overwrites; does not stop the existing unit)")
 	}
 }
 
@@ -132,6 +134,16 @@ func resolveUserMode() bool {
 	return !platform.IsWindows()
 }
 
+// activeManagedUnitFn and newServiceManagerFn are indirections over
+// service.ActiveManagedUnit / service.NewManager so runSvcInstall's
+// competing-unit refusal is testable end-to-end without shelling out to
+// systemctl or writing real unit files (which mgr.Install does for real,
+// including a daemon-reload and enable). Tests swap these and restore them.
+var (
+	activeManagedUnitFn = service.ActiveManagedUnit
+	newServiceManagerFn = service.NewManager
+)
+
 func runSvcInstall(_ *cobra.Command, _ []string) error {
 	cfg, err := service.DefaultConfig()
 	if err != nil {
@@ -139,8 +151,64 @@ func runSvcInstall(_ *cobra.Command, _ []string) error {
 	}
 	cfg.UserMode = resolveUserMode()
 
-	mgr := service.NewManager()
+	if !svcForce {
+		if unit, competing := competingManagedUnit(cfg, activeManagedUnitFn); competing {
+			return competingManagedUnitError(unit)
+		}
+	}
+
+	mgr := newServiceManagerFn()
 	return mgr.Install(cfg)
+}
+
+// competingManagedUnit reports whether an already-ACTIVE citadel-managed
+// systemd unit (detect scans both unit families it recognizes -- see
+// service.ActiveManagedUnit's own doc comment) refers to something other than
+// the unit `citadel service install` is about to write for cfg.
+//
+// "Matches" requires both the unit name (service.ServiceName, "citadel" --
+// the fleet's citadel-worker.service can therefore never match) AND the
+// user/system scope: a same-named unit in the OTHER scope still lands at a
+// different systemd unit path (~/.config/systemd/user/... vs
+// /etc/systemd/system/...) and would run ALONGSIDE the existing one, not
+// replace it -- exactly the duplicate-unit outcome citadel#882 is about.
+//
+// No active unit, or an active unit that already IS the one about to be
+// installed, is not competing: the former has nothing to collide with, the
+// latter makes `citadel service install` an idempotent re-install.
+//
+// detect is injected (service.ActiveManagedUnit in production) so this stays
+// unit-testable without shelling out to systemctl, mirroring
+// resolveManagedServiceRestartTarget / managedServiceTargetFromManagerStatus
+// in cmd/update.go.
+func competingManagedUnit(cfg service.ServiceConfig, detect func() (service.ManagedUnit, bool)) (service.ManagedUnit, bool) {
+	unit, found := detect()
+	if !found {
+		return service.ManagedUnit{}, false
+	}
+	if unit.Name == service.ServiceName && unit.UserMode == cfg.UserMode {
+		return service.ManagedUnit{}, false
+	}
+	return unit, true
+}
+
+// competingManagedUnitError renders the refusal for an install blocked by
+// competingManagedUnit. It names the existing unit and gives an exact stop
+// command (mirroring the format ManagedUnit.RestartCommand already uses) plus
+// the --force escape hatch.
+func competingManagedUnitError(unit service.ManagedUnit) error {
+	stopCmd := fmt.Sprintf("sudo systemctl stop %s", unit.Name)
+	if unit.UserMode {
+		stopCmd = fmt.Sprintf("systemctl --user stop %s", unit.Name)
+	}
+	return fmt.Errorf(
+		"refusing to install: a competing citadel managed service is already active (%s)\n"+
+			"Installing another would create a duplicate unit running citadel twice.\n\n"+
+			"  Stop/disable it first:  %s\n"+
+			"  Or install anyway:      citadel service install --force\n"+
+			"                          (this does NOT stop the existing unit; you will end up\n"+
+			"                          with two managed citadel services running)",
+		unit.Description(), stopCmd)
 }
 
 func runSvcUninstall(_ *cobra.Command, _ []string) error {
