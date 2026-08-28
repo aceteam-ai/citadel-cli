@@ -56,22 +56,22 @@ function Write-Info($Message) {
 }
 
 function Write-Success($Message) {
-    Write-ColorOutput Green "✓ $Message"
+    Write-ColorOutput Green "[OK] $Message"
 }
 
 function Write-Error($Message) {
-    Write-ColorOutput Red "✗ $Message"
+    Write-ColorOutput Red "[ERROR] $Message"
 }
 
 function Write-Warning($Message) {
-    Write-ColorOutput Yellow "⚠ $Message"
+    Write-ColorOutput Yellow "[WARN] $Message"
 }
 
 # Banner
 Write-Host ""
-Write-ColorOutput Cyan "╔════════════════════════════════════════╗"
-Write-ColorOutput Cyan "║   Citadel CLI Installer for Windows   ║"
-Write-ColorOutput Cyan "╔════════════════════════════════════════╝"
+Write-ColorOutput Cyan "+========================================+"
+Write-ColorOutput Cyan "|   Citadel CLI Installer for Windows   |"
+Write-ColorOutput Cyan "+========================================+"
 Write-Host ""
 
 # Detect architecture
