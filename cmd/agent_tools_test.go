@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
@@ -184,6 +185,65 @@ func TestAgentNodeInfoFields(t *testing.T) {
 	}
 	if up, _ := info["uptime_seconds"].(int64); up < 50 {
 		t.Fatalf("uptime should be ~60s, got %d", up)
+	}
+}
+
+// TestAgentNodeInfoPendingUpdate covers the split-brain case (issue #922):
+// ApplyUpdate succeeded and persisted state.CurrentVersion, but Restart()
+// never happened (or an external installer swapped the binary), so the
+// running Version still lags what's staged on disk. agentNodeInfo must
+// surface that gap via loadUpdateState's seam, without touching a real
+// state.json on this host.
+func TestAgentNodeInfoPendingUpdate(t *testing.T) {
+	origVersion, origLoad := Version, loadUpdateState
+	defer func() { Version, loadUpdateState = origVersion, origLoad }()
+	Version = "v1.0.0"
+
+	loadUpdateState = func() (*update.State, error) {
+		return &update.State{CurrentVersion: "v1.1.0"}, nil
+	}
+	info := agentNodeInfo("node-1", "1008", "org-x", time.Now())
+	if info["pending_version"] != "v1.1.0" {
+		t.Fatalf("pending_version = %v, want v1.1.0", info["pending_version"])
+	}
+	if info["restart_required"] != true {
+		t.Fatalf("restart_required = %v, want true", info["restart_required"])
+	}
+}
+
+// TestAgentNodeInfoNoPendingUpdate pins the no-op case: when the staged
+// version matches the running one (or no update was ever recorded), the
+// payload must stay byte-identical to today -- neither field is added.
+func TestAgentNodeInfoNoPendingUpdate(t *testing.T) {
+	origVersion, origLoad := Version, loadUpdateState
+	defer func() { Version, loadUpdateState = origVersion, origLoad }()
+	Version = "v1.0.0"
+
+	cases := []struct {
+		name string
+		load func() (*update.State, error)
+	}{
+		{"versions equal", func() (*update.State, error) {
+			return &update.State{CurrentVersion: "v1.0.0"}, nil
+		}},
+		{"no state recorded", func() (*update.State, error) {
+			return &update.State{}, nil
+		}},
+		{"state load error", func() (*update.State, error) {
+			return nil, os.ErrNotExist
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loadUpdateState = tc.load
+			info := agentNodeInfo("node-1", "1008", "org-x", time.Now())
+			if _, ok := info["pending_version"]; ok {
+				t.Errorf("pending_version present, want absent: %+v", info)
+			}
+			if _, ok := info["restart_required"]; ok {
+				t.Errorf("restart_required present, want absent: %+v", info)
+			}
+		})
 	}
 }
 
