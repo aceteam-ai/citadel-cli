@@ -205,3 +205,17 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python scripts/check_tokenizer_deps.py
+
+      # citadel #902: model_preflight.py's free-space preflight + prefetch
+      # guard is deliberately import-light (huggingface_hub only, no
+      # diffusers/torch/fastapi -- see the module docstring), so its tests
+      # run hermetically in a plain pytest install, no other sidecar deps
+      # needed. Same path-filter as the tokenizer-stack step above.
+      - name: Install pytest
+        if: steps.changes.outputs.sidecar == 'true'
+        run: python -m pip install --quiet pytest
+
+      - name: Model preflight unit tests
+        if: steps.changes.outputs.sidecar == 'true'
+        working-directory: services/diffusers-service
+        run: python -m pytest test_model_preflight.py -v
