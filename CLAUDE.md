@@ -867,24 +867,80 @@ has only two values (`provisioned` / `already_linked`): the aceteam backend
 branches on `status == "already_linked"` by equality, so upgrade information is
 additive, never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
 
-### Canonical HuggingFace cache path (citadel #682 P0, model-cache ownership design)
+### Canonical per-engine cache paths (citadel #682 P0/P1, #906, model-cache ownership design)
 
-`internal/jobs.canonicalHFCacheDir()` is the single authority for where a
-host-side HF pull must write so it agrees with what the engine containers
-mount (`~/citadel-cache/huggingface:/root/.cache/huggingface` — matched by
-hand-grepping all seven HF-caching compose files at fix time; no test pins
-this mapping yet, so re-verify by grep before trusting it if it's been a
-while). `hfCacheBaseDir()` (the disk-preflight/no-op-detection/
+`services.EngineCacheDirs` (`services/caches.go`) is the single source of
+truth for where EVERY embedded `services.ServiceMap` engine's weights live on
+disk — one map from engine name to its canonical `~/citadel-cache/<dir>`
+subdirectory and on-disk layout family (HF hub-cache blob layout, raw GGUF
+directory, or an engine-native store), asserted against the embedded compose
+files' actual volume mounts by `TestEngineCacheDirsMatchComposeMounts`
+(`services/caches_test.go`) — string-matched, not hand-copied, so (unlike the
+prior P0-only state this note used to describe) the table cannot silently
+drift from what the compose files actually mount. See
+`docs/design-cache-ownership.md` for the full ownership/GC design; this note
+covers P0+P1 only (P2 durable index / P3 reporting / P5 GC are separate,
+not-yet-built follow-ons).
+
+**HF-hub-layout engines** (vllm, sglang, diffusers, extraction, transcribe,
+unlimited-ocr, kokoro): `internal/jobs.canonicalHFCacheDir()` is the authority
+for where a host-side HF pull must write so it agrees with what the engine
+containers mount — sourced from `services.HFHubCacheDirName`, not a
+hardcoded literal. `hfCacheBaseDir()` (the disk-preflight/no-op-detection/
 `MODEL_CACHE_EVICT` resolver) and `hfDownloadEnv()` (the actual pull
-subprocess's env) both resolve through it — that agreement is the fix; before
-#682 the pull subprocess had no `HF_HOME` set at all and silently wrote to the
-CLI's own host default instead, which no container could see. See
-`docs/design-cache-ownership.md` for the full ownership/GC design (this note
-covers P0 only) — P1 (`services/caches.go`, a single engine→cache-dir table
-for every engine family, not just HF, with a test pinning the table against
-every compose file's actual mount) should read `canonicalHFCacheDir()` before
-inventing a second HF-path resolver, and can retire this note once its own
-table + test supersede it.
+subprocess's env) both resolve through it — that agreement is the P0 fix;
+before #682 the pull subprocess had no `HF_HOME` set at all and silently
+wrote to the CLI's own host default instead, which no container could see.
+
+**GGUF engines are NOT routed through the HF-hub path (citadel #906, the P1
+fix).** Before #906, llamacpp was dispatched identically to vllm
+(`pullHuggingFace`), writing the HF hub-cache blob layout into
+`~/citadel-cache/huggingface` — but `services/compose/llamacpp.yml` mounts
+`~/citadel-cache/llamacpp:/models` expecting flat, raw GGUF files, a
+directory and layout that path never touched. `internal/jobs.
+pullLlamaCppGGUF`/`llamaCppCacheDir()` (sourced from
+`services.LlamaCppCacheDirName`) fix this: a `--local-dir` download into the
+correct directory, mirroring `pullBonsai`'s existing single-file idiom but
+generalized to an arbitrary bring-your-own-GGUF repo, with its own disk
+preflight (`runGGUFDiskPreflight`) pointed at the same directory. Its no-op
+detection (`dirTotalSize` before/after) deliberately gates on the AFTER state
+being non-empty, not on the delta being positive: `hf download` is idempotent
+and MODEL_CACHE_PULL is dispatched on every deploy, so a redeploy of an
+already-cached repo legitimately re-fetches nothing (delta == 0) without that
+being a #566-style CLI no-op.
+`runGGUFDiskPreflight` nets against `alreadyCachedGGUFBytes`, NOT
+`hfCacheModelSizeFn` (#840's HF-hub netting) — the raw, flat directory has no
+`models--org--repo` naming to trust, but a repo-relative PATH match (the repo
+tree entry's own path, checked for existence under `llamaCppCacheDir()`) is
+still exact provenance for THIS pull's own files (`--local-dir` preserves the
+repo's file layout), so no durable cache index (#682 P2) is needed to net
+correctly here. Skipping this netting entirely was tried and reverted during
+review: it reintroduced, for llamacpp, the exact "redeploy of an
+already-cached model fails closed on the full repo size" regression #840's
+review caught and fixed for the HF-hub path. `MODEL_CACHE_EVICT` for llamacpp
+(`evictLlamaCppGGUF`, `internal/jobs/model_cache_evict.go`) is similarly
+routed to the raw directory instead of falling through to
+`evictHuggingFace`'s HF hub-cache resolver (which always failed with "not
+found" for llamacpp — safe, but didn't free any space); for the same
+provenance reason it only supports removing an exact, existing cached
+filename, not resolving a repo id to "whichever files belong to it".
+
+**Known limitation, not yet fixed:** an unfiltered `MODEL_CACHE_PULL` for a
+multi-quant GGUF repo (the common TheBloke-style shape: 10+ sibling
+quantizations, several GB each) downloads EVERY sibling into the shared
+`/models` mount, same as an unfiltered `pullHuggingFace` would for a
+multi-checkpoint HF repo pre-#828. The disk preflight bounds the worst case
+(refuses rather than fills the disk) but does not select a subset the way
+`deriveDiffusersAllowPatterns` does for diffusers — deliberately, since no
+GGUF-shape heuristic exists yet. The payload's `allow_patterns` (#828) is the
+escape hatch for a caller that knows the desired quantization (e.g.
+`["*Q4_K_M.gguf"]`); the aceteam backend does not send it yet.
+
+`bonsaiCacheDir()` is unchanged in behavior but now also sources its
+subdirectory name from the table (`services.BonsaiCacheDirName`) rather than
+a second hardcoded `"bonsai"` literal, so all three engine families
+(HF-hub, GGUF, bonsai's single-file GGUF) read their directory name from ONE
+place.
 
 ### Bonsai service (PrismML Bonsai-27B, 1-bit)
 

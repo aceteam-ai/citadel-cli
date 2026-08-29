@@ -125,6 +125,16 @@ func TestModelCachePull_EngineTokenNormalization(t *testing.T) {
 	// on PATH -- never resolves to a real, shared cache location.
 	t.Setenv("HF_HOME", t.TempDir())
 
+	// citadel#906: llamacpp no longer routes through pullHuggingFace (and
+	// therefore no longer respects HF_HOME above) -- it downloads via
+	// --local-dir directly into llamaCppCacheDir(). Redirect that too, for
+	// the identical reason: a real `hf`/`huggingface-cli` binary on the test
+	// machine must never touch this machine's actual ~/citadel-cache/llamacpp.
+	origLlamaCppCacheDirFn := llamaCppCacheDirFn
+	llamaCppDir := t.TempDir()
+	llamaCppCacheDirFn = func() string { return llamaCppDir }
+	t.Cleanup(func() { llamaCppCacheDirFn = origLlamaCppCacheDirFn })
+
 	tests := []struct {
 		name   string
 		engine string

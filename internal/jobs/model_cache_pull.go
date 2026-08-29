@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // ollamaPullTimeout bounds a foreground `ollama pull`. Pulls of large models
@@ -118,8 +119,14 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 	switch engine {
 	case "ollama":
 		return h.pullOllama(ctx, job.ID, modelName)
-	case "vllm", "llamacpp":
+	case "vllm":
 		return h.pullHuggingFace(ctx, job.ID, modelName, engine, job.Payload)
+	case "llamacpp":
+		// Routed separately from vllm (citadel #906 / #682 P1): llamacpp's
+		// compose mounts a raw-GGUF directory, not the HuggingFace hub-cache
+		// layout pullHuggingFace writes -- see services/caches.go and
+		// pullLlamaCppGGUF's doc comment.
+		return h.pullLlamaCppGGUF(ctx, job.ID, modelName, job.Payload)
 	case "bonsai":
 		return h.pullBonsai(ctx, job.ID)
 	default:
@@ -160,12 +167,15 @@ const (
 // bonsaiCacheDir is the fixed local dir the bonsai GGUF is downloaded into. It
 // MUST match services/compose/bonsai.yml's `~/citadel-cache/bonsai:/models`
 // mount, or the served path (/models/Bonsai-27B-Q1_0.gguf) will not exist.
+// Sourced from services.BonsaiCacheDirName (citadel #906 / #682 P1) rather
+// than a second hardcoded "bonsai" literal, so this and
+// services/caches_test.go's compose-mount check can never disagree.
 func bonsaiCacheDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join("citadel-cache", "bonsai")
+		return filepath.Join("citadel-cache", services.BonsaiCacheDirName)
 	}
-	return filepath.Join(home, "citadel-cache", "bonsai")
+	return filepath.Join(home, "citadel-cache", services.BonsaiCacheDirName)
 }
 
 // pullBonsai downloads the single Bonsai-27B-Q1_0.gguf file via the HuggingFace
@@ -211,6 +221,251 @@ func (h *ModelCachePullHandler) pullBonsai(ctx JobContext, jobID string) ([]byte
 // construction.
 func BuildBonsaiDownloadCommand(bin, localDir string) *exec.Cmd {
 	return exec.Command(bin, hfDownloadArgs(bonsaiRepo, bonsaiGGUFFile, localDir)...)
+}
+
+// llamaCppCacheDirFn resolves llamacpp's canonical raw-GGUF cache directory
+// (citadel #906 / #682 P1) -- the counterpart to canonicalHFCacheDir() for
+// the GGUF-layout engine family. A package var (like hfCacheModelSizeFn,
+// availableDiskBytesFn elsewhere in this package) so a test can redirect it
+// away from this machine's real home directory without ever letting a real
+// `hf download` subprocess create files under the actual
+// ~/citadel-cache/llamacpp.
+var llamaCppCacheDirFn = defaultLlamaCppCacheDir
+
+// defaultLlamaCppCacheDir is llamaCppCacheDirFn's production wiring. It MUST
+// match services/compose/llamacpp.yml's `~/citadel-cache/llamacpp:/models`
+// mount, or a pulled GGUF will not be where LLAMACPP_MODEL/the container
+// expects it. Sourced from services.LlamaCppCacheDirName rather than a
+// hardcoded "llamacpp" literal, so this and services/caches_test.go's
+// compose-mount check can never disagree -- the exact divergence #906
+// reports (llamacpp routed through pullHuggingFace, writing into
+// ~/citadel-cache/huggingface instead).
+func defaultLlamaCppCacheDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("citadel-cache", services.LlamaCppCacheDirName)
+	}
+	return filepath.Join(home, "citadel-cache", services.LlamaCppCacheDirName)
+}
+
+// llamaCppCacheDir is the call-site wrapper around llamaCppCacheDirFn, mirroring
+// hfCacheBaseDir/bonsaiCacheDir's shape.
+func llamaCppCacheDir() string {
+	return llamaCppCacheDirFn()
+}
+
+// dirTotalSize sums the sizes of every regular file under dir, recursively.
+// Returns 0 if dir cannot be walked (in particular, if it does not exist yet
+// -- the normal case before a directory's first-ever pull). Generalizes
+// hfCacheModelSize's identical walk-and-sum shape to an arbitrary directory,
+// used by pullLlamaCppGGUF's before/after no-op detection since a raw-GGUF
+// pull (unlike the HF-hub layout) has no per-model subdirectory to inspect in
+// isolation.
+func dirTotalSize(dir string) int64 {
+	var total int64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
+
+// alreadyCachedGGUFBytes sums the size of every entry in the repo tree that
+// already exists, at its repo-relative path, under dir -- i.e. bytes this
+// specific pull would NOT need to (re-)download. Unlike the HF-hub layout's
+// hfCacheModelSizeFn (which trusts the hub cache's own models--org--repo
+// naming to mean "this belongs to this model"), the raw GGUF directory has no
+// such convention -- but a repo-relative PATH match is still exact
+// provenance for files hf download's own --local-dir mode would have written
+// (it preserves the repo's own file layout under --local-dir), so this needs
+// no durable cache index (#682 P2) to be correct for THIS repo's own files.
+// It intentionally cannot credit a file that happens to be present under a
+// DIFFERENT name/path (e.g. a manually renamed GGUF) -- that is a conscious
+// under-credit, not a bug: crediting on name/size alone without a real
+// provenance record risks the opposite, worse mistake (treating an unrelated
+// file as "already downloaded").
+func alreadyCachedGGUFBytes(dir string, entries []hfTreeEntry, allowPatterns, ignorePatterns []string) int64 {
+	var total int64
+	for _, e := range entries {
+		if e.Type != "file" {
+			continue
+		}
+		if !patternsInclude(e.Path, allowPatterns, ignorePatterns) {
+			continue
+		}
+		local := filepath.Join(dir, filepath.FromSlash(e.Path))
+		if fi, err := os.Stat(local); err == nil && !fi.IsDir() {
+			total += e.fileSize()
+		}
+	}
+	return total
+}
+
+// llamaCppPullSucceeded decides whether a completed llamacpp GGUF pull (a
+// `hf download ... --local-dir` subprocess that exited 0) should be treated
+// as a real success, given llamaCppCacheDir()'s total size before and after
+// the download ran (citadel #906 review). ok==false is pullLlamaCppGGUF's
+// #566 no-op-detection failure; sizeBytes is the delta, reported only on
+// success.
+//
+// Deliberately gates on the AFTER state (after > 0), NOT on delta > 0: the
+// deprecated `huggingface-cli` no-ops on huggingface_hub >= 1.x (creates
+// --local-dir and exits 0 WITHOUT downloading), which is the real case this
+// must catch -- a first-ever pull into an empty directory that produces
+// nothing (after == 0). But MODEL_CACHE_PULL is dispatched on every deploy,
+// and `hf download` is idempotent, so a REDEPLOY of an already-cached GGUF
+// repo legitimately re-fetches nothing (delta == 0, after > 0) -- a
+// delta-based gate would misreport that success as a no-op failure. Gating
+// on "is anything there" mirrors hfCacheModelSize(modelName) == 0 on the
+// HF-hub path, which has the identical redeploy-is-a-legitimate-no-op shape.
+//
+// sizeBytes is clamped at 0 (never negative): dirTotalSize walks the WHOLE
+// shared llamacpp directory (not just this pull's files), so a concurrent
+// eviction mid-pull could in principle make after < before even though this
+// pull itself added bytes; reporting the post-pull total in that edge case
+// beats reporting a nonsensical negative size.
+func llamaCppPullSucceeded(before, after int64) (sizeBytes int64, ok bool) {
+	if after <= 0 {
+		return 0, false
+	}
+	sizeBytes = after - before
+	if sizeBytes < 0 {
+		sizeBytes = after
+	}
+	return sizeBytes, true
+}
+
+// runGGUFDiskPreflight is llamacpp's disk-space preflight (citadel #906 /
+// #682 P1): the same HF repo-metadata size estimate and free-space gate
+// runDiskPreflight applies for the HF-hub layout, but pointed at
+// llamaCppCacheDir() (the raw-GGUF mount, not the HF hub-cache dir), and
+// netted against alreadyCachedGGUFBytes rather than hfCacheModelSizeFn --
+// see that function's doc comment for why a repo-relative path match is
+// exact provenance here without needing the P2 durable index. Without this
+// netting, MODEL_CACHE_PULL (dispatched on every deploy, cached or not) would
+// fail closed on the FULL repo size for a redeploy of an already-cached
+// model on a disk-tight node -- the same regression citadel #840's review
+// flagged (and fixed) for the HF-hub path; a GGUF redeploy must get the same
+// protection.
+//
+// Deliberately does NOT apply deriveDiffusersAllowPatterns's auto-filtering
+// (runDiskPreflight's #828-part-3 behavior): that heuristic targets
+// diffusers' subfolder-plus-sibling-checkpoints shape, which does not
+// describe a GGUF repo, so it is left out rather than risk mis-filtering a
+// llamacpp pull.
+func runGGUFDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePatterns []string, marginBytes int64) (finalAllow, finalIgnore []string, err error) {
+	reqCtx, cancel := context.WithTimeout(ctx.Context(), hfMetadataTimeout)
+	defer cancel()
+
+	entries, treeErr := hfRepoTreeFn(reqCtx, modelName)
+	if treeErr != nil {
+		ctx.Log("warn", "     - [Job] disk-space preflight skipped for '%s' (could not fetch repo metadata: %v)", modelName, treeErr)
+		return allowPatterns, ignorePatterns, nil
+	}
+
+	dir := llamaCppCacheDir()
+	requiredBytes := sumFilteredSize(entries, allowPatterns, ignorePatterns)
+	if cached := alreadyCachedGGUFBytes(dir, entries, allowPatterns, ignorePatterns); cached > 0 {
+		requiredBytes -= cached
+		if requiredBytes < 0 {
+			requiredBytes = 0
+		}
+	}
+	if requiredBytes <= 0 {
+		// Nothing sizeable matched, the tree response carried no sizes, or
+		// everything filtered-in is already present locally -- either way,
+		// nothing left to gate on (mirrors runDiskPreflight's identical
+		// early-return).
+		return allowPatterns, ignorePatterns, nil
+	}
+
+	statDir := nearestExistingDir(dir)
+	available, availErr := availableDiskBytesFn(statDir)
+	if availErr != nil {
+		ctx.Log("warn", "     - [Job] disk-space preflight skipped for '%s' (could not read free space at %s: %v)", modelName, statDir, availErr)
+		return allowPatterns, ignorePatterns, nil
+	}
+
+	if planErr := planDiskPreflight(statDir, requiredBytes, int64(available), marginBytes); planErr != nil {
+		return nil, nil, planErr
+	}
+	return allowPatterns, ignorePatterns, nil
+}
+
+// pullLlamaCppGGUF downloads model_name's raw GGUF file(s) into
+// llamaCppCacheDir() via --local-dir (citadel #906 / #682 P1) -- the same
+// idiom pullBonsai already uses for its single fixed file, generalized here
+// to an arbitrary bring-your-own-GGUF repo.
+//
+// This is the fix for the bug #906 reports: before this, llamacpp was
+// dispatched through pullHuggingFace, which writes the HuggingFace HUB-cache
+// blob layout into ~/citadel-cache/huggingface -- a directory
+// services/compose/llamacpp.yml never mounts. llamacpp's compose mounts
+// ~/citadel-cache/llamacpp:/models expecting flat, raw GGUF files (see
+// services/caches.go), so this pulls into THAT directory with --local-dir,
+// which forces the raw layout the same way pullBonsai's --local-dir does
+// (huggingface_hub materializes real files at --local-dir instead of the hub
+// cache's content-addressed blob store).
+//
+// The payload's optional allow_patterns/ignore_patterns (#828) apply exactly
+// as they do for pullHuggingFace, so a caller that knows the desired
+// quantization can target it (e.g. allow_patterns: ["*Q4_K_M.gguf"]) instead
+// of pulling every sibling quant in the repo. Absent patterns pull everything
+// in the repo, same as an unfiltered pullHuggingFace call.
+func (h *ModelCachePullHandler) pullLlamaCppGGUF(ctx JobContext, jobID, modelName string, payload map[string]string) ([]byte, error) {
+	bin, err := resolveHFDownloader()
+	if err != nil {
+		return nil, err
+	}
+
+	allowPatterns, ignorePatterns := parseModelCachePullPatterns(payload)
+	marginBytes := parseMinHeadroomBytes(payload, diskSafetyMarginBytes)
+
+	finalAllow, finalIgnore, blockErr := runGGUFDiskPreflight(ctx, modelName, allowPatterns, ignorePatterns, marginBytes)
+	if blockErr != nil {
+		ctx.Log("error", "     - [Job %s] MODEL_CACHE_PULL blocked for '%s': %v", jobID, modelName, blockErr)
+		return nil, blockErr
+	}
+
+	localDir := llamaCppCacheDir()
+	ctx.Log("info", "     - [Job %s] Pulling llamacpp GGUF repo '%s' into %s via %s", jobID, modelName, localDir, bin)
+
+	// No-op detection (citadel #566, generalized) -- see llamaCppPullSucceeded's
+	// doc comment for why this gates on the directory's AFTER-pull total, not
+	// the before/after delta.
+	before := dirTotalSize(localDir)
+
+	cmd := BuildLlamaCppGGUFDownloadCommand(bin, modelName, localDir, finalAllow, finalIgnore)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("hf download failed: %w", err)
+	}
+
+	after := dirTotalSize(localDir)
+	sizeBytes, ok := llamaCppPullSucceeded(before, after)
+	if !ok {
+		return output, fmt.Errorf("hf download reported success but %s is empty — the CLI likely no-oped (deprecated huggingface-cli on huggingface_hub >= 1.x); output: %s", localDir, strings.TrimSpace(string(output)))
+	}
+
+	result := modelCachePullResult{
+		Status:    "cached",
+		ModelName: modelName,
+		SizeBytes: sizeBytes,
+		Engine:    "llamacpp",
+	}
+	return json.Marshal(result)
+}
+
+// BuildLlamaCppGGUFDownloadCommand returns the exec.Cmd that downloads
+// modelName's GGUF file(s) into localDir using --local-dir (citadel #906 /
+// #682 P1) -- llamacpp's counterpart to
+// BuildHuggingFaceDownloadCommandFiltered/BuildBonsaiDownloadCommand.
+// Exported for testing command construction.
+func BuildLlamaCppGGUFDownloadCommand(bin, modelName, localDir string, allowPatterns, ignorePatterns []string) *exec.Cmd {
+	return exec.Command(bin, hfDownloadArgsFiltered(modelName, "", localDir, allowPatterns, ignorePatterns)...)
 }
 
 // hfDownloadArgs builds the argument list for a HuggingFace CLI download. Both
@@ -569,12 +824,18 @@ func runDiskPreflight(ctx JobContext, modelName string, allowPatterns, ignorePat
 // pointing at the pre-fix host default (~/.cache/huggingface), silently
 // reopening the divergence for the disk preflight and the already-cached
 // netting (#840) even though the download itself moved.
+//
+// The subdirectory name is sourced from services.HFHubCacheDirName (citadel
+// #906 / #682 P1's canonical cache-path table), not a second hardcoded
+// "huggingface" literal, so this function and every OTHER HF-hub-layout
+// engine's compose mount (asserted by services/caches_test.go) can never
+// disagree.
 func canonicalHFCacheDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join("citadel-cache", "huggingface")
+		return filepath.Join("citadel-cache", services.HFHubCacheDirName)
 	}
-	return filepath.Join(home, "citadel-cache", "huggingface")
+	return filepath.Join(home, "citadel-cache", services.HFHubCacheDirName)
 }
 
 // hfCacheBaseDir returns the actual hub-cache directory a repo pull writes

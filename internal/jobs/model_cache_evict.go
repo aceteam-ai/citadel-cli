@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -37,8 +38,16 @@ func (h *ModelCacheEvictHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	switch engine {
 	case "ollama":
 		return h.evictOllama(ctx, job.ID, modelName)
-	case "vllm", "llamacpp":
+	case "vllm":
 		return h.evictHuggingFace(ctx, job.ID, modelName, engine)
+	case "llamacpp":
+		// Routed separately from vllm (citadel #906 / #682 P1): llamacpp's
+		// cache is a flat directory of raw GGUF files, not the HF hub-cache
+		// blob layout evictHuggingFace resolves via hfCacheDir -- routing
+		// llamacpp through evictHuggingFace always failed with "not found in
+		// HuggingFace cache" (safe, but confusing, and doesn't actually free
+		// any space).
+		return h.evictLlamaCppGGUF(ctx, job.ID, modelName)
 	default:
 		return nil, fmt.Errorf("unsupported engine %q: must be ollama, vllm, or llamacpp", engine)
 	}
@@ -81,6 +90,53 @@ func (h *ModelCacheEvictHandler) evictHuggingFace(ctx JobContext, jobID, modelNa
 		Status:    "evicted",
 		ModelName: modelName,
 		Engine:    engine,
+	}
+	return json.Marshal(result)
+}
+
+// evictLlamaCppGGUF removes a raw GGUF file from llamaCppCacheDir() (citadel
+// #906 / #682 P1) -- the counterpart to evictHuggingFace for the GGUF-layout
+// engine family (llamaCppCacheDir is defined in model_cache_pull.go, same
+// package).
+//
+// The raw, flat directory carries no repo provenance (that's what the
+// durable cache index, #682 P2, would add), so this only supports the ONE
+// unambiguous case: modelName names an exact, existing file (by basename)
+// directly under llamaCppCacheDir() -- exactly what LLAMACPP_MODEL and the
+// compose mount expect. Anything else (an HF repo id with no matching bare
+// filename present) is a clear, honest error rather than a guess at which
+// file(s) to remove.
+func (h *ModelCacheEvictHandler) evictLlamaCppGGUF(ctx JobContext, jobID, modelName string) ([]byte, error) {
+	dir := llamaCppCacheDir()
+	base := filepath.Base(modelName)
+	candidate := filepath.Join(dir, base)
+
+	// filepath.Base already collapses any path traversal in modelName down to
+	// a bare filename, but guard explicitly anyway: refuse rather than
+	// silently resolve outside dir on an unexpected input shape (e.g.
+	// modelName == ".." or "").
+	if base == "." || base == ".." || base == string(filepath.Separator) || filepath.Dir(candidate) != filepath.Clean(dir) {
+		return nil, fmt.Errorf("invalid model name %q for llamacpp eviction", modelName)
+	}
+
+	ctx.Log("info", "     - [Job %s] Evicting GGUF file '%s' from llamacpp cache", jobID, base)
+
+	fi, err := os.Stat(candidate)
+	if err != nil || fi.IsDir() {
+		return nil, fmt.Errorf("model %q not found as a file in the llamacpp GGUF cache (%s); "+
+			"llamacpp eviction only supports removing an exact cached filename", modelName, dir)
+	}
+
+	if err := os.Remove(candidate); err != nil {
+		return nil, fmt.Errorf("failed to remove GGUF file %s: %w", candidate, err)
+	}
+
+	ctx.Log("info", "     - [Job %s] Removed GGUF file: %s", jobID, candidate)
+
+	result := modelCacheEvictResult{
+		Status:    "evicted",
+		ModelName: modelName,
+		Engine:    "llamacpp",
 	}
 	return json.Marshal(result)
 }
