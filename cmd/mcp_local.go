@@ -87,6 +87,15 @@ type localMCPDeps struct {
 	// FILE_LIST job handlers use, so a path this tool can read is exactly a
 	// path a dispatched FILE_READ job could read, not a wider surface.
 	workspaceDir string
+
+	// reservations backs local_model_deploy/local_run_exclusive/
+	// local_model_stop (aceteam#8248/#8249 v2, docs/design-model-exclusivity.md).
+	// Production wires realLocalReservationOps(), which constructs a real
+	// internal/jobs.ServiceHandler per call (resolving the manifest config
+	// dir fresh each time, mirroring moduleControl's own pattern). Tests
+	// inject stubs so exercising the tool wiring never reads a live
+	// manifest, container runtime, or GPU.
+	reservations localReservationOps
 }
 
 // moduleControlFn is the shape of the actual stop/start/restart action. See
@@ -101,6 +110,7 @@ func realLocalMCPDeps() localMCPDeps {
 		chatLister:    newLocalChatLister(),
 		chatClient:    mesh.NewClient((&net.Dialer{}).DialContext),
 		workspaceDir:  resolveWorkspaceDir(),
+		reservations:  realLocalReservationOps(),
 	}
 }
 
@@ -111,6 +121,7 @@ func newLocalMCPTools(deps localMCPDeps) []localMCPTool {
 	tools := newModuleControlTools(deps.moduleControl)
 	tools = append(tools, newLocalInferenceTools(deps)...)
 	tools = append(tools, newLocalFileTools(deps.workspaceDir)...)
+	tools = append(tools, newModelExclusivityTools(deps)...)
 	return tools
 }
 
@@ -559,6 +570,365 @@ func localListFilesCall(workspaceDir string, args json.RawMessage) (string, erro
 		return "", err
 	}
 	return string(out), nil
+}
+
+// ============================================================================
+// Model exclusivity tools (aceteam#8248/#8249 v2, reusing internal/jobs's
+// Reserve/ReserveExclusive/Release/StartServiceWithModel -- see
+// docs/design-model-exclusivity.md and internal/jobs/model_exclusivity.go's
+// package doc for the full design, including the crash-safety shape these
+// tools inherit)
+// ============================================================================
+
+// localDeployFn pulls (if model is non-empty) then starts serviceName
+// serving model with an optional VRAM budget. jobID is used as the
+// MODEL_CACHE_PULL job id (cosmetic/logging only when this is a plain,
+// non-exclusive deploy) or the reservation's deterministic id (when called
+// as the start-half of local_run_exclusive, after eviction already ran).
+type localDeployFn func(jobID, serviceName, model string, requiredVRAMBytes uint64) (string, error)
+
+// localReserveExclusiveFn evicts every non-pinned running service (except
+// exclude) unconditionally, tagging each with jobID. Mirrors
+// internal/jobs.ServiceHandler.ReserveExclusive's return shape (Evicted,
+// Reason, error) without exposing *jobs.Reservation to the tool layer, so a
+// test stub needs no dependency on internal/jobs at all.
+type localReserveExclusiveFn func(jobID, exclude string) (evicted []string, reason string, err error)
+
+// localReserveBudgetFn is the bounded (vram_mb) alternative: an ordinary,
+// satisfiable internal/jobs.ServiceHandler.Reserve against an explicit
+// budget rather than "evict everything".
+type localReserveBudgetFn func(jobID string, requiredVRAMBytes uint64) (evicted []string, reason string, err error)
+
+// localReleaseFn restores every service tagged evicted_by_job==jobID.
+type localReleaseFn func(jobID string) (restored []string, err error)
+
+// localHasReservationFn reports whether jobID currently holds an active
+// reservation -- used by local_model_stop to decide whether stopping the
+// model it served should ALSO release a reservation.
+type localHasReservationFn func(jobID string) (bool, error)
+
+// localReservationOps groups the #8248/#8249 v2 model-exclusivity operations
+// behind simple function types, mirroring localMCPDeps.moduleControl's
+// existing injection pattern exactly: tests stub each independently without
+// ever constructing a real internal/jobs.ServiceHandler.
+type localReservationOps struct {
+	deploy               localDeployFn
+	reserveExclusive     localReserveExclusiveFn
+	reserveBudget        localReserveBudgetFn
+	release              localReleaseFn
+	hasActiveReservation localHasReservationFn
+}
+
+// realLocalReservationOps builds the production localReservationOps. Each
+// closure resolves the manifest config dir fresh (via findOrCreateManifest,
+// --node-dir-aware) and constructs a jobs.ServiceHandler per call --
+// deliberately not shared/cached across calls, mirroring how
+// runModuleControlCaptured re-resolves the manifest on every invocation
+// rather than assuming it hasn't changed between two tool calls in the same
+// `citadel mcp` process.
+func realLocalReservationOps() localReservationOps {
+	resolve := func() (*jobs.ServiceHandler, error) {
+		if err := refuseIfReservationNodeDirUnsupported("citadel mcp (local_model_deploy/local_run_exclusive/local_model_stop)"); err != nil {
+			return nil, err
+		}
+		_, configDir, err := findOrCreateManifest()
+		if err != nil {
+			return nil, err
+		}
+		return jobs.NewServiceHandlerWithWorkspace(configDir, resolveWorkspaceDir()), nil
+	}
+	jctx := jobs.JobContext{LogFn: localJobLogFn}
+
+	return localReservationOps{
+		deploy: func(jobID, serviceName, model string, requiredVRAMBytes uint64) (string, error) {
+			h, err := resolve()
+			if err != nil {
+				return "", err
+			}
+			if model != "" {
+				pull := &jobs.ModelCachePullHandler{}
+				if _, pullErr := pull.Execute(jctx, &nexus.Job{ID: jobID, Payload: map[string]string{"model_name": model, "engine": serviceName}}); pullErr != nil {
+					return "", fmt.Errorf("pull model %q for %q: %w", model, serviceName, pullErr)
+				}
+			}
+			out, startErr := h.StartServiceWithModel(jctx, serviceName, model, requiredVRAMBytes)
+			if startErr != nil {
+				return "", startErr
+			}
+			return string(out), nil
+		},
+		reserveExclusive: func(jobID, exclude string) ([]string, string, error) {
+			h, err := resolve()
+			if err != nil {
+				return nil, "", err
+			}
+			res, resErr := h.ReserveExclusive(jctx, jobID, exclude)
+			if res == nil {
+				return nil, "", resErr
+			}
+			return res.Evicted, res.Reason, resErr
+		},
+		reserveBudget: func(jobID string, requiredVRAMBytes uint64) ([]string, string, error) {
+			h, err := resolve()
+			if err != nil {
+				return nil, "", err
+			}
+			res, resErr := h.Reserve(jctx, jobID, requiredVRAMBytes)
+			if res == nil {
+				return nil, "", resErr
+			}
+			return res.Evicted, res.Reason, resErr
+		},
+		release: func(jobID string) ([]string, error) {
+			h, err := resolve()
+			if err != nil {
+				return nil, err
+			}
+			return h.Release(jctx, jobID)
+		},
+		hasActiveReservation: func(jobID string) (bool, error) {
+			h, err := resolve()
+			if err != nil {
+				return false, err
+			}
+			return h.HasActiveReservation(jobID)
+		},
+	}
+}
+
+// vramMBToBytes converts an optional vram_mb tool argument to bytes, treating
+// a non-positive value as "no budget declared" (0) -- mirrors
+// internal/jobs.parseRequiredVRAMBytes's identical fail-safe-on-absent-signal
+// contract.
+func vramMBToBytes(mb float64) uint64 {
+	if mb <= 0 {
+		return 0
+	}
+	return uint64(mb * 1024 * 1024)
+}
+
+// newModelExclusivityTools builds local_model_deploy, local_run_exclusive,
+// and local_model_stop.
+func newModelExclusivityTools(deps localMCPDeps) []localMCPTool {
+	engineDesc := `Target managed service (e.g. "vllm", "bonsai", "llamacpp", "ollama"). Required -- ` +
+		`this tool does not guess an engine from the model name; call local_list_models to see what ` +
+		`this node can serve.`
+
+	deploy := localMCPTool{
+		Name: "local_model_deploy",
+		Description: "Pull (if needed) and start a model on THIS node's own engine. Optionally bounds " +
+			"VRAM via vram_mb, which may durably stop OTHER non-pinned services to fit " +
+			"(citadel-cli#577's ordinary preemption -- NOT a reservation: nothing is automatically " +
+			"restored later). For a reservation that restores evicted peers when you're done, use " +
+			"local_run_exclusive instead. LOCAL authority: runs on this node for the node owner, no " +
+			"AceTeam platform round-trip, no node:modules scope required.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"model":   map[string]any{"type": "string", "description": "Model id/repo to deploy."},
+				"engine":  map[string]any{"type": "string", "description": engineDesc},
+				"vram_mb": map[string]any{"type": "number", "description": "Optional VRAM budget in MB. May durably stop other non-pinned services to fit (not a reservation -- see local_run_exclusive for that)."},
+			},
+			"required": []string{"model", "engine"},
+		},
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return localModelDeployCall(deps, args)
+		},
+	}
+
+	exclusive := localMCPTool{
+		Name: "local_run_exclusive",
+		Description: "Reserve THIS node's GPU exclusively for one model: durably evict every other " +
+			"non-pinned service (or, with vram_mb, reserve exactly that many MB instead), then pull " +
+			"(if needed) and start 'engine' serving 'model'. The reservation is NOT auto-released -- " +
+			"call local_model_stop with the SAME model once you're done, which restores every evicted " +
+			"peer. If this MCP session ends without calling local_model_stop, the reservation stays " +
+			"held until either an explicit 'citadel module reservations release exclusive:<engine>' or " +
+			"the next 'citadel work' boot on this node (which restores an orphaned reservation " +
+			"automatically) -- a `citadel work` that boots WHILE this reservation is still legitimately " +
+			"active can also mistake it for orphaned and restore the evicted peers prematurely; see " +
+			"docs/design-model-exclusivity.md for the full crash-safety contract. Always returns the " +
+			"full list of evicted services so you can see the blast radius before relying on it.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"model":   map[string]any{"type": "string", "description": "Model id/repo to deploy exclusively."},
+				"engine":  map[string]any{"type": "string", "description": engineDesc + ` Also determines the reservation id ("exclusive:<engine>").`},
+				"vram_mb": map[string]any{"type": "number", "description": "Optional: reserve exactly this many MB instead of evicting every non-pinned service."},
+			},
+			"required": []string{"model", "engine"},
+		},
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return localRunExclusiveCall(deps, args)
+		},
+	}
+
+	stop := localMCPTool{
+		Name: "local_model_stop",
+		Description: "Stop the engine currently serving 'model' on THIS node (resolved via the same " +
+			"lookup local_list_models uses). If 'model' was deployed via local_run_exclusive, this ALSO " +
+			"releases that reservation, restoring every service it evicted -- this IS the paired " +
+			"release call for local_run_exclusive, not a second, separate tool. Distinct from the " +
+			"platform's MODEL_CACHE_EVICT job type, which deletes cached weights from disk -- this " +
+			"tool only stops serving; nothing is deleted. LOCAL authority: no AceTeam platform " +
+			"round-trip, no node:modules scope required.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"model": map[string]any{"type": "string", "description": "Model id as reported by local_list_models."},
+			},
+			"required": []string{"model"},
+		},
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return localModelStopCall(deps, args)
+		},
+	}
+
+	return []localMCPTool{deploy, exclusive, stop}
+}
+
+func localModelDeployCall(deps localMCPDeps, args json.RawMessage) (string, error) {
+	var in struct {
+		Model  string  `json:"model"`
+		Engine string  `json:"engine"`
+		VRAMMB float64 `json:"vram_mb"`
+	}
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	model := strings.TrimSpace(in.Model)
+	engine := strings.TrimSpace(in.Engine)
+	if model == "" {
+		return "", fmt.Errorf("'model' is required")
+	}
+	if engine == "" {
+		return "", fmt.Errorf("'engine' is required (the target managed service, e.g. \"vllm\"); not inferred from the model name")
+	}
+	if deps.reservations.deploy == nil {
+		return "", fmt.Errorf("model deploy is not available")
+	}
+	return deps.reservations.deploy("mcp-local-deploy", engine, model, vramMBToBytes(in.VRAMMB))
+}
+
+func localRunExclusiveCall(deps localMCPDeps, args json.RawMessage) (string, error) {
+	var in struct {
+		Model  string  `json:"model"`
+		Engine string  `json:"engine"`
+		VRAMMB float64 `json:"vram_mb"`
+	}
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	model := strings.TrimSpace(in.Model)
+	engine := strings.TrimSpace(in.Engine)
+	if model == "" {
+		return "", fmt.Errorf("'model' is required")
+	}
+	if engine == "" {
+		return "", fmt.Errorf("'engine' is required (the target managed service, e.g. \"vllm\"); not inferred from the model name")
+	}
+	if deps.reservations.deploy == nil {
+		return "", fmt.Errorf("exclusive model run is not available")
+	}
+
+	jobID := jobs.ExclusiveReservationJobID(engine)
+	var evicted []string
+	var reason string
+	var err error
+	if in.VRAMMB > 0 {
+		if deps.reservations.reserveBudget == nil {
+			return "", fmt.Errorf("bounded (vram_mb) reservation is not available")
+		}
+		evicted, reason, err = deps.reservations.reserveBudget(jobID, vramMBToBytes(in.VRAMMB))
+	} else {
+		if deps.reservations.reserveExclusive == nil {
+			return "", fmt.Errorf("exclusive reservation is not available")
+		}
+		evicted, reason, err = deps.reservations.reserveExclusive(jobID, engine)
+	}
+	if err != nil {
+		return "", fmt.Errorf("reserve GPU for %q: %w (evicted before the failure: %s)", engine, err, strings.Join(evicted, ", "))
+	}
+
+	startOut, startErr := deps.reservations.deploy(jobID, engine, model, 0)
+	if startErr != nil {
+		return "", fmt.Errorf("reservation %s is HELD (evicted: %s) but starting %q failed: %w -- "+
+			"call local_model_stop(model=%q) or 'citadel module reservations release %s' to restore the evicted peers",
+			jobID, strings.Join(evicted, ", "), engine, startErr, model, jobID)
+	}
+
+	result := map[string]any{
+		"reservation_id": jobID,
+		"evicted":        evicted,
+		"reason":         reason,
+		"start_result":   json.RawMessage(startOut),
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func localModelStopCall(deps localMCPDeps, args json.RawMessage) (string, error) {
+	if deps.chatLister == nil {
+		return "", fmt.Errorf("local engine discovery is not available")
+	}
+	var in struct {
+		Model string `json:"model"`
+	}
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	model := strings.TrimSpace(in.Model)
+	if model == "" {
+		return "", fmt.Errorf("'model' is required")
+	}
+
+	engines := deps.chatLister()
+	_, engine, ok := gateway.ResolveChatModel(model, engines)
+	if !ok {
+		return "", fmt.Errorf("model %q is not served locally on this node; call local_list_models to see what is available", model)
+	}
+	if deps.moduleControl == nil {
+		return "", fmt.Errorf("module control is not available")
+	}
+
+	// Stop the target FIRST, then release any reservation it held. The
+	// reverse order would restart evicted peers while the target still holds
+	// its own VRAM, which can fail to fit or needlessly contend for it.
+	stopOut, stopErr := deps.moduleControl(engine, moduleActionStop)
+	if stopErr != nil {
+		return "", fmt.Errorf("stop %q (serving %q): %w", engine, model, stopErr)
+	}
+
+	result := map[string]any{
+		"engine":      engine,
+		"stop_result": stopOut,
+	}
+	jobID := jobs.ExclusiveReservationJobID(engine)
+	if deps.reservations.hasActiveReservation != nil {
+		if has, hasErr := deps.reservations.hasActiveReservation(jobID); hasErr == nil && has && deps.reservations.release != nil {
+			restored, relErr := deps.reservations.release(jobID)
+			result["reservation_id"] = jobID
+			result["restored"] = restored
+			if relErr != nil {
+				result["release_error"] = relErr.Error()
+			}
+		}
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // ============================================================================
