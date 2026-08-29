@@ -66,6 +66,39 @@ type NodeStatus struct {
 	// blocking, without shelling into the node. Additive/omitempty: nil on a
 	// node with none active, no reservation provider wired, or a legacy build.
 	GPUReservations []GPUReservation `json:"gpu_reservations,omitempty"`
+	// Lanes reports the live activity of the node's bounded execution lanes
+	// (citadel-cli#908): how many jobs are queued vs executing per lane, and
+	// since when each lane has been fully saturated. It lets a dispatcher see a
+	// busy-but-healthy node (one whose lane is at capacity) rather than only
+	// reacting after a fast-fail or a queued response. Additive/omitempty: nil on
+	// a node with no lanes wired (no worker loop) or a legacy build; a heartbeat
+	// consumer that does not know this field is unaffected. Projected from
+	// worker.LaneSnapshot by cmd/work.go's laneActivityFrom (internal/status
+	// cannot import internal/worker); TestLaneShapeParity pins the two shapes.
+	Lanes []LaneActivity `json:"lanes,omitempty"`
+}
+
+// LaneActivity is the heartbeat-facing view of one bounded execution lane
+// (citadel-cli#908) -- the "how loaded is this node right now" signal (§4). It
+// is a hand-maintained mirror of worker.LaneSnapshot (internal/status cannot
+// import internal/worker), same split as SwapActivity/WorkerLiveness; the
+// conversion is laneActivityFrom in cmd/work.go.
+type LaneActivity struct {
+	// Lane names the lane: "unbounded" (manifest/lockfile writers, exec
+	// concurrency 1) or "inference" (GPU-bound, exec concurrency = GPU count).
+	Lane string `json:"lane"`
+	// Queued is the number of jobs claimed and admitted onto this lane but still
+	// waiting for a free execution slot.
+	Queued int `json:"queued"`
+	// Executing is the number of jobs currently inside a handler on this lane.
+	Executing int `json:"executing"`
+	// ExecCapacity is the lane's execution concurrency (the ceiling on
+	// Executing).
+	ExecCapacity int `json:"exec_capacity"`
+	// BusySince is set the moment Executing first reaches ExecCapacity (the lane
+	// is fully saturated) and cleared the moment it drops below -- the literal
+	// "busy since T" primitive. Omitted while the lane has spare capacity.
+	BusySince *time.Time `json:"busy_since,omitempty"`
 }
 
 // GPUReservation describes one active job-scoped GPU VRAM reservation

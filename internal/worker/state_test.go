@@ -61,6 +61,50 @@ func TestWorkerStateSnapshot(t *testing.T) {
 	}
 }
 
+// TestWorkerStateQueuedExecutingSplit pins the queued-vs-executing distinction
+// (citadel-cli#908): RecordJobReceived brackets the wider claimed-to-done span
+// (InFlight), RecordJobExecuting/RecordJobExecuteDone bracket only actual
+// handler execution. A job claimed and admitted onto a lane but not yet
+// executing reads Queued=1, Executing=0; once executing it reads Queued=0,
+// Executing=1; InFlight stays 1 throughout.
+func TestWorkerStateQueuedExecutingSplit(t *testing.T) {
+	s := NewWorkerState()
+
+	// Claimed + admitted, waiting for a lane slot: in-flight but not executing.
+	s.RecordJobReceived()
+	snap := s.Snapshot()
+	if snap.InFlight != 1 || snap.Queued != 1 || snap.Executing != 0 {
+		t.Fatalf("after claim: InFlight=%d Queued=%d Executing=%d, want 1/1/0", snap.InFlight, snap.Queued, snap.Executing)
+	}
+	if snap.OldestExecutingAt != nil {
+		t.Error("OldestExecutingAt must be nil while nothing is executing")
+	}
+
+	// Now executing.
+	s.RecordJobExecuting()
+	snap = s.Snapshot()
+	if snap.InFlight != 1 || snap.Queued != 0 || snap.Executing != 1 {
+		t.Fatalf("while executing: InFlight=%d Queued=%d Executing=%d, want 1/0/1", snap.InFlight, snap.Queued, snap.Executing)
+	}
+	if snap.OldestExecutingAt == nil {
+		t.Error("OldestExecutingAt must be set while a job is executing")
+	}
+
+	// Done.
+	s.RecordJobExecuteDone()
+	s.RecordJobDone(true)
+	snap = s.Snapshot()
+	if snap.InFlight != 0 || snap.Queued != 0 || snap.Executing != 0 {
+		t.Fatalf("after done: InFlight=%d Queued=%d Executing=%d, want 0/0/0", snap.InFlight, snap.Queued, snap.Executing)
+	}
+	if snap.OldestExecutingAt != nil {
+		t.Error("OldestExecutingAt must clear when executing drains to 0")
+	}
+	if snap.Processed != 1 {
+		t.Errorf("Processed = %d, want 1", snap.Processed)
+	}
+}
+
 func TestWorkerStateConsumingFalseWhenStale(t *testing.T) {
 	s := NewWorkerState()
 	// Force an old poll time.

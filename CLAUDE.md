@@ -1688,10 +1688,78 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 | `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
 | `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
 
+### Node execution model: claim/execute decoupling + bounded lanes (citadel #908, aceteam#8254)
+
+`Runner.Run`'s fetch loop no longer conflates "claim a job" with "execute it"
+(this is what `processJob` used to do inline, blocking `source.Next()` for the
+whole handler run). Design doc:
+[docs/design-node-execution-queue.md](docs/design-node-execution-queue.md). The
+split, all in `internal/worker/runner.go`:
+
+- **`claimJob`** runs SYNCHRONOUSLY in the fetch-loop goroutine: target-node
+  filter, `WriteClaimed` (the claim-ack the backend's ~12s window waits on), and
+  the cancellation check. So the claim-ack fires the instant a job is read,
+  independent of how long execution takes or waits — the direct #908 fix.
+- **`executeJob`** is everything after: handler lookup, the #825 GPU-slot gate
+  (unchanged), the #548 watchdog/deadline (still started AT execution, never
+  counting lane queue-wait), and terminal Ack/Nack/Fail. `finishSuccess` is the
+  ONE success-terminal implementation (usage record → `WriteEnd` → `Ack`), reused
+  by the inference queue-wait path so there is never a second place that could
+  Ack without a terminal event (#559).
+
+**Lanes** (`internal/worker/lane.go`, the `lane` type): a bounded `admit` channel
+(non-blocking send in the fetch loop → the loop NEVER blocks; at the bound it
+Nacks, the #825-shaped transparent retry) plus a bounded `exec` channel (all
+waiting happens inside the spawned goroutine). Two instances, constructed in
+`NewRunner`:
+
+- **unbounded lane**, exec-concurrency **1**, for `serializedLaneJobTypes`
+  (`deadline.go` — the authority, pinned by `TestSerializedLaneJobTypes`; it is
+  `unboundedJobTypes` PLUS `MODULE_SET`/`SERVICE_STOP`, the manifest/lockfile
+  writers that aren't unbounded). Exec-concurrency 1 REPRODUCES today's implicit
+  single-writer safety over the unlocked `citadel.yaml`/`modules.lock`
+  read-modify-write paths EXACTLY — that is why v1 needs no manifest locking
+  (Phase 3 in the doc is deferred). `needsSerializedLane`, not the routing check,
+  is where a new manifest writer is added.
+- **inference lane**, exec-concurrency = `GPUTracker.Total()`, for
+  `gpuBoundJobTypes`, and ONLY when a real discrete GPU exists (nil when
+  `GPUTracker` is nil or `Total()<1` — a GPU-less node keeps the #903 inline
+  fallback). On queue-wait exceeded (`runLaneJob`'s bounded select,
+  `WORKER_INFERENCE_QUEUE_WAIT_SECONDS`) it returns the EXISTING `model_warming`
+  success (the platform already retries it — zero backend change), NOT a Nack.
+  The in-`executeJob` GPU-slot gate is retained but is effectively unreachable in
+  production (lane exec-cap == `Total()` keeps them in lockstep), so the
+  queue-wait is the real backpressure — the aceteam#8254 fix.
+
+**WorkerState now tracks executing separately from in-flight**
+(`RecordJobExecuting`/`RecordJobExecuteDone`, alongside the unchanged
+`RecordJobReceived`/`RecordJobDone`). `InFlight = queued + executing`;
+`Queued`/`Executing`/`OldestExecutingAt` are additive. **Self-heal STUCK
+(`selfheal.go`) now gates on `Executing>0` and reads `OldestExecutingAt`**, so a
+job legitimately QUEUED for hours behind a long pull on the exec-1 lane does not
+false-trip a restart; STALL still reads `InFlight==0`.
+
+**Heartbeat `LaneActivity`** (`internal/status.NodeStatus.Lanes`, projected from
+`worker.LaneSnapshot` by `cmd/work.go`'s `laneActivityFrom`, pinned by
+`TestLaneShapeParity`): per-lane queued/executing/exec-capacity + `BusySince`
+(stamped when executing hits capacity). Wired via `nodeRunner atomic.Pointer`
+(the runner is built AFTER the status-publisher goroutines start — plain var
+would race, the #717 lesson). The control-center collector does NOT get it yet,
+consistent with the WorkerLiveness/Swap/Reservations gaps there.
+
+Env: `WORKER_INFERENCE_QUEUE_WAIT_SECONDS` (default 120), `WORKER_UNBOUNDED_LANE_QUEUE`
+(admission depth, default 8).
+
+Deliberate counter change: a foreign-`target_node` job (Ack-and-skip) and a
+pre-cancelled job no longer touch `processed`/`failed` (claimJob has no counters,
+per the design's exit-path table) — before #908 those bumped `failed`/`processed`
+respectively.
+
 ### GPU-slot gate is job-type-scoped, not global (citadel #825)
 
-`Runner.processJob`'s GPU-slot acquire (`internal/worker/runner.go`, guarding the
-`gpuTracker.Acquire()` Nack branch) only runs for job types `needsGPUSlot`
+`executeJob`'s GPU-slot acquire (`internal/worker/runner.go`, guarding the
+`gpuTracker.Acquire()` Nack branch; was `processJob` before #908) only runs for
+job types `needsGPUSlot`
 (`internal/worker/gpu_tracker.go`) says actually dispatch to a node-local GPU
 inference engine. `needsGPUSlot`/`gpuBoundJobTypes` is the authority for that
 set — `TestGPUBoundJobTypes` (`gpu_tracker_test.go`) pins its exact membership,
@@ -1732,7 +1800,8 @@ a `file_parse` pipeline that alternates file reads and GPU jobs) was never
 even claimed within the backend's short claim-ack window and fast-failed as
 "unreachable," even though the node was healthy and simply busy. On a node
 WITH a tracker, this is a **fetch-loop fix, not a concurrency change**:
-`r.gpuTracker` (#825) still gates actual execution inside `processJob` exactly
+`r.gpuTracker` (#825) still gates actual execution inside `executeJob` (was
+`processJob` before #908's claim/execute split) exactly
 as before — it admits up to its slot count and Nacks (non-terminal,
 redelivered) the rest. What changes is which jobs can even REACH that gate on
 a maxConcurrency=1 node: previously a second GPU-bound job was never fetched
@@ -1777,8 +1846,8 @@ to 4 hours — head-of-line blocking, not a wedge (the #548 watchdog/self-heal
 machinery doesn't catch this: the loop was doing exactly what it was told,
 just serially).
 
-The async-dispatched job still runs through the SAME `r.processJob(ctx, job)`
-call every other job takes, so the per-job watchdog/deadline, terminal-event
+The async-dispatched job still runs through the SAME claim/execute path
+(`claimJob`+`executeJob`, `processJob` before #908) every other job takes, so the per-job watchdog/deadline, terminal-event
 publishing, cancellation, `WorkerState` in-flight accounting, and DLQ/ack
 semantics are unchanged — only the sequential/semaphore gate is bypassed.
 Mirrors the job-type-scoped pattern `needsGPUSlot`/`gpuBoundJobTypes`
@@ -2081,10 +2150,12 @@ that return happen promptly instead of after up to `p.maxDuration()` (default
 `cmd/work.go`'s own top-level `signal.Notify` goroutine (separate from
 `internal/worker.Runner.Run`'s internal one) calls the root `cancel()` on
 SIGINT/SIGTERM; that root context is what flows into
-`Runner.Run(ctx)` -> `processJob(ctx, job)` -> `LegacyHandlerAdapter.Execute`'s
+`Runner.Run(ctx)` -> `executeJob(ctx, job)` (was `processJob` pre-#908) ->
+`LegacyHandlerAdapter.Execute`'s
 `jobs.JobContext{Ctx: ctx}` -- so it reaches these loops even when
 `Runner.Run`'s OWN internal signal handling can't (in sequential mode,
-`concurrency<=1`, `processJob` is called inline in the poll loop's `select`,
+`concurrency<=1`, a non-laned job's `executeJob` is called inline in the poll
+loop's `select`,
 so `Runner.Run`'s internal `sigs` case can't be reached — and thus can't itself
 call `cancel()` — until the in-flight job returns; `cmd/work.go`'s separate
 goroutine has no such gate). A **drain** (`Runner.Drain`, e.g. the auto-updater

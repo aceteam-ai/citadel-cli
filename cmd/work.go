@@ -763,6 +763,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// the reconcile loop (and its Health tracker) is constructed further down,
 	// so an unsynchronized plain var would race that later Store.
 	var nodeReconcileHealth atomic.Pointer[reconcile.HealthTracker]
+	// nodeRunner is the worker Runner (citadel-cli#908), constructed much later
+	// in this function (after the collector and status-publisher goroutines are
+	// already running). Same atomic-pointer reasoning as nodeSwapManager above:
+	// laneActivityFn's closure reads it from those already-running publisher
+	// goroutines while the single Store below happens later on the main
+	// goroutine, so an unsynchronized plain var would be a genuine data race.
+	var nodeRunner atomic.Pointer[worker.Runner]
 	// inferenceQueueReconciler watches for a serving-engine transition and
 	// self-subscribes the inference queue once one appears, so a node that
 	// boots with no engine does not need a restart to serve inference once one
@@ -1389,6 +1396,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		return reservationsFrom(list)
 	}
 
+	// Live bounded-execution-lane activity for the heartbeat (citadel-cli#908):
+	// "how loaded is this node right now" so a dispatcher can avoid targeting a
+	// saturated node. nodeRunner.Store is called below at the runner's
+	// construction site, from a point where these status-publisher goroutines are
+	// already running (Load() is what makes that safe); nil here (before the
+	// store) leaves the Lanes field omitted from the heartbeat.
+	laneActivityFn := func() []status.LaneActivity {
+		rn := nodeRunner.Load()
+		if rn == nil {
+			return nil
+		}
+		return laneActivityFrom(rn.LaneSnapshots())
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1406,6 +1427,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			PinnedServices:  manifestPinnedServices(workManifest),
 			ModelHotswap:    status.ModelHotswapEnabled(),
 			Reservations:    reservationsFn,
+			LaneActivity:    laneActivityFn,
 		})
 	}
 
@@ -1697,6 +1719,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				PinnedServices:  manifestPinnedServices(workManifest),
 				ModelHotswap:    status.ModelHotswapEnabled(),
 				Reservations:    reservationsFn,
+				LaneActivity:    laneActivityFn,
 			})
 		}
 
@@ -2410,6 +2433,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		GPUTracker:     gpuTracker,
 		State:          workerState,
 	})
+	// Publish the runner so the heartbeat's laneActivityFn (running on the
+	// already-started status-publisher goroutines) can read its lane activity.
+	// Atomic Store paired with the atomic Load in that closure — see the
+	// nodeRunner declaration above for why a plain var would race (citadel-cli#908).
+	nodeRunner.Store(runner)
 
 	// Add stream writer factory if available
 	if streamFactory != nil {
@@ -3000,6 +3028,30 @@ func reservationsFrom(list []jobs.ReservationSummary) []status.GPUReservation {
 		out[i] = status.GPUReservation{
 			JobID:           r.JobID,
 			EvictedServices: append([]string(nil), r.EvictedServices...),
+		}
+	}
+	return out
+}
+
+// laneActivityFrom projects worker.LaneSnapshot (worker-local, citadel-cli#908)
+// onto internal/status.LaneActivity (the heartbeat-facing shape) — same reason
+// swapStatsFrom/reservationsFrom exist: internal/status cannot import
+// internal/worker (worker already imports status), so this is the one place that
+// translates it. TestLaneShapeParity pins that both shapes carry the same JSON
+// fields, so a future field added to one side fails loudly instead of silently
+// not appearing on the heartbeat.
+func laneActivityFrom(snaps []worker.LaneSnapshot) []status.LaneActivity {
+	if len(snaps) == 0 {
+		return nil
+	}
+	out := make([]status.LaneActivity, len(snaps))
+	for i, s := range snaps {
+		out[i] = status.LaneActivity{
+			Lane:         s.Lane,
+			Queued:       s.Queued,
+			Executing:    s.Executing,
+			ExecCapacity: s.ExecCapacity,
+			BusySince:    s.BusySince,
 		}
 	}
 	return out
