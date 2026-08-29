@@ -13,15 +13,114 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // TestLLMInferenceHandler_CanHandle asserts the handler only claims the
 // "llm_inference" job type (issue #590).
+// TestAEPSigningStoreDir_PureFunctionOfNodeConfigDir pins that
+// aepSigningStoreDir is a deterministic, side-effect-free function of its
+// input: the same nodeConfigDir always yields the same signing-store
+// directory, and it is rooted at "<nodeConfigDir>/identity" -- i.e. it is a
+// child of whatever network.GetNodeConfigDir() resolves to, not a
+// hardcoded/absolute path of its own.
+func TestAEPSigningStoreDir_PureFunctionOfNodeConfigDir(t *testing.T) {
+	converged := filepath.Join(string(filepath.Separator), "var", "lib", "citadel-node")
+	want := filepath.Join(converged, "identity")
+
+	if got := aepSigningStoreDir(converged); got != want {
+		t.Errorf("aepSigningStoreDir(%q) = %q, want %q", converged, got, want)
+	}
+	// Deterministic across repeated calls.
+	if got1, got2 := aepSigningStoreDir(converged), aepSigningStoreDir(converged); got1 != got2 {
+		t.Errorf("aepSigningStoreDir is not deterministic: %q vs %q", got1, got2)
+	}
+}
+
+// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts is the
+// coordinator-requested regression pin for the invoker-scoping hazard: it
+// proves that TWO independently-constructed nodeidentity.Store instances,
+// each standing in for a DIFFERENT invocation context (e.g. `citadel init`
+// run interactively vs. `citadel work` run under systemd-root) that both
+// legitimately resolve network.GetNodeConfigDir() to the SAME converged
+// directory (that convergence property is network.GetNodeConfigDir()'s own
+// job, and is pinned by internal/network's own tests -- not re-tested here),
+// load/create the IDENTICAL signing key rather than two different ones.
+//
+// Before this fix, the default signer was nodeidentity.Default() -- rooted
+// at invoker-scoped platform.ConfigDir() -- so this same test, run against
+// that default, would NOT hold: two different invocation contexts (e.g. a
+// non-root interactive shell vs. a root/systemd context) resolve DIFFERENT
+// platform.ConfigDir() paths and would silently generate two different
+// keypairs.
+func TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts(t *testing.T) {
+	convergedNodeConfigDir := t.TempDir() // stands in for network.GetNodeConfigDir()'s converged result
+
+	// Context A: e.g. `citadel init`, run interactively.
+	storeA := nodeidentity.New(aepSigningStoreDir(convergedNodeConfigDir))
+	keyA, err := storeA.GetOrCreateKey()
+	if err != nil {
+		t.Fatalf("context A GetOrCreateKey: %v", err)
+	}
+
+	// Context B: e.g. `citadel work`, run under systemd-root. A DIFFERENT
+	// Store instance, but constructed from the SAME converged directory --
+	// exactly what defaultAEPSigner() does via network.GetNodeConfigDir()
+	// in each process.
+	storeB := nodeidentity.New(aepSigningStoreDir(convergedNodeConfigDir))
+	keyB, err := storeB.GetOrCreateKey()
+	if err != nil {
+		t.Fatalf("context B GetOrCreateKey: %v", err)
+	}
+
+	if keyA.D.Cmp(keyB.D) != 0 {
+		t.Fatalf("two invocation contexts resolving the same converged node config dir loaded DIFFERENT signing keys -- machine-convergence broken")
+	}
+
+	fpA, err := storeA.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("context A PublicKeyFingerprint: %v", err)
+	}
+	fpB, err := storeB.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("context B PublicKeyFingerprint: %v", err)
+	}
+	if fpA != fpB {
+		t.Fatalf("fingerprints diverged across invocation contexts: %q vs %q", fpA, fpB)
+	}
+}
+
+// TestNewLLMInferenceHandler_SignerIsMachineConvergentNotInvokerScoped pins
+// the constructor wiring itself: NewLLMInferenceHandler's default signer
+// must be rooted at network.GetNodeConfigDir(), NOT at
+// nodeidentity.Default()'s invoker-scoped platform.ConfigDir() (which
+// cmd/device.go's separate device-mode flow still legitimately uses).
+func TestNewLLMInferenceHandler_SignerIsMachineConvergentNotInvokerScoped(t *testing.T) {
+	h := NewLLMInferenceHandler()
+	store, ok := h.signer.(*nodeidentity.Store)
+	if !ok {
+		t.Fatalf("h.signer = %T, want *nodeidentity.Store", h.signer)
+	}
+
+	want := aepSigningStoreDir(network.GetNodeConfigDir())
+	if store.Dir() != want {
+		t.Errorf("default signer store dir = %q, want %q (network.GetNodeConfigDir()-rooted)", store.Dir(), want)
+	}
+
+	invokerScoped := filepath.Join(platform.ConfigDir(), "identity")
+	if store.Dir() == invokerScoped && want != invokerScoped {
+		t.Errorf("default signer store dir unexpectedly matches nodeidentity.Default()'s invoker-scoped path %q", invokerScoped)
+	}
+}
+
 func TestLLMInferenceHandler_CanHandle(t *testing.T) {
 	h := NewLLMInferenceHandler()
 	if !h.CanHandle(JobTypeLLMInference) {

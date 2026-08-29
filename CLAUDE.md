@@ -1217,18 +1217,25 @@ key is unavailable) fails OPEN: the job still succeeds with `content`/
 non-fatally — an injectable field, not a bare `log.Printf`, since this
 package otherwise imports no logger at all).
 
-**Known hazard, not fixed here:** `nodeidentity.Default()` roots the key
-store at `platform.ConfigDir()`, which is invoker-scoped (see the
-`ConfigDir()`/`GetNodeConfigDir()` entry above). Before this PR the key had
-exactly one, dormant consumer (`citadel init`'s `ensureNodeIdentity`); this
-PR adds a second, LIVE consumer (`citadel work`'s inference handler) that
-can run in a different invocation context (systemd-root worker vs.
-interactive non-root init). `GetOrCreateKey` does not error on a mismatch —
-it silently generates a second, different keypair. Latent today (nothing
-verifies signatures yet); real the moment a future Phase 2 registers one
-context's public key and a different context signs with the other.
-`LLMInferenceHandler.WithSigner` is the seam a future fix can use to inject
-a `network.GetNodeConfigDir()`-rooted store instead.
+**Machine-convergent by construction — fixed, not a known hazard.** The
+signing key is NOT `nodeidentity.Default()` (which roots at invoker-scoped
+`platform.ConfigDir()`, see the `ConfigDir()`/`GetNodeConfigDir()` entry
+above — still used, unchanged, by `cmd/device.go`'s device-mode enrollment
+and `cmd/init.go`'s dormant mTLS CSR flow, both of which depend on staying
+invoker-scoped/shared with `citadel init`'s own context). `defaultAEPSigner()`
+(`internal/worker/llm_inference.go`) instead constructs a **separate**
+`nodeidentity.Store` rooted at `aepSigningStoreDir(network.GetNodeConfigDir())`
+— the SAME machine-convergent directory `citadel init`'s device-config write
+(#845) and #726's heartbeat marker already use — so a systemd-root `citadel
+work` and an interactive non-root process resolve the IDENTICAL signing key
+file; a future Phase 2 backend registration of this node's public key can
+never desync from what `citadel work` actually signs with.
+`TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts`
+(`internal/worker/llm_inference_test.go`) pins this directly: two
+independently-constructed `Store` instances resolving the same converged
+`nodeConfigDir` (standing in for two different invocation contexts) load/
+create the identical key. `LLMInferenceHandler.WithSigner` remains the
+override seam for tests and any future signer change.
 
 **Inert until the aceteam-side lands** (design doc §4): signing is fully
 wired citadel-side, but the backend does not yet hold this node's public key
