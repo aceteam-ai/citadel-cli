@@ -1715,12 +1715,16 @@ waiting happens inside the spawned goroutine). Two instances, constructed in
 
 - **unbounded lane**, exec-concurrency **1**, for `serializedLaneJobTypes`
   (`deadline.go` — the authority, pinned by `TestSerializedLaneJobTypes`; it is
-  `unboundedJobTypes` PLUS `MODULE_SET`/`SERVICE_STOP`, the manifest/lockfile
-  writers that aren't unbounded). Exec-concurrency 1 REPRODUCES today's implicit
-  single-writer safety over the unlocked `citadel.yaml`/`modules.lock`
-  read-modify-write paths EXACTLY — that is why v1 needs no manifest locking
-  (Phase 3 in the doc is deferred). `needsSerializedLane`, not the routing check,
-  is where a new manifest writer is added.
+  `unboundedJobTypes` PLUS `MODULE_SET`/`SERVICE_STOP`/`APPLY_DEVICE_CONFIG`, the
+  manifest/lockfile writers that aren't unbounded). Exec-concurrency 1 REPRODUCES
+  today's implicit single-writer safety over the unlocked
+  `citadel.yaml`/`modules.lock` read-modify-write paths EXACTLY — that is why v1
+  needs no manifest locking (Phase 3 in the doc is deferred). `needsSerializedLane`,
+  not the routing check, is where a new manifest writer is added — every job type
+  that does a full read-modify-write of `citadel.yaml` (incl.
+  `ConfigHandler.updateManifest` behind `APPLY_DEVICE_CONFIG`, which is neither
+  gpu-bound nor long-session, so absent from this set it would fall to the inline
+  branch and corrupt the manifest concurrently with a lane writer) must be a member.
 - **inference lane**, exec-concurrency = `GPUTracker.Total()`, for
   `gpuBoundJobTypes`, and ONLY when a real discrete GPU exists (nil when
   `GPUTracker` is nil or `Total()<1` — a GPU-less node keeps the #903 inline

@@ -890,15 +890,15 @@ func (r *Runner) LaneSnapshots() []LaneSnapshot {
 	return out
 }
 
-// willRetry reports whether processJob's generic-failure Nack (issue #826)
+// willRetry reports whether executeJob's generic-failure Nack (issue #826)
 // will actually be redelivered to a handler again, so the pre-Nack terminal
-// "error" publish in processJob can be skipped for a job that has not yet
+// "error" publish in executeJob can be skipped for a job that has not yet
 // exhausted its attempts.
 //
 // The signal is job.Metadata.Attempts/MaxAttempts, populated ONLY by
 // RedisSource (internal/worker/redis_source.go's nextSingle/nextMulti) from
 // the real per-message Redis delivery count -- the same count RedisSource
-// itself uses to decide whether to hand the job to processJob at all versus
+// itself uses to decide whether to hand the job to executeJob at all versus
 // silently moving it straight to the DLQ. Attempts is this dispatch's
 // delivery count (1-indexed, matching Redis XPENDING's RetryCount): a further
 // attempt will be dispatched iff the NEXT delivery count (Attempts+1) is

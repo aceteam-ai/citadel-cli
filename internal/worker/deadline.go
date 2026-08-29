@@ -83,18 +83,30 @@ var unboundedJobTypes = map[string]struct{}{
 //
 // It is a SUPERSET of unboundedJobTypes: every unbounded job is a manifest
 // writer or a long opaque job that today ran one-at-a-time on the sequential
-// loop, PLUS the two manifest/lockfile writers that are NOT unbounded --
-// MODULE_SET (drives cmd/module_ops.go's Install/Uninstall, writing both files)
-// and SERVICE_STOP (setDesiredStatusInManifestFile). Keeping these OUT of
-// unboundedJobTypes is deliberate: they keep their generous default watchdog
-// deadline (they are not opaque unbounded work), they only join the serialized
-// EXECUTION lane. Membership is pinned by TestSerializedLaneJobTypes; extend
-// THIS set (not the routing check in runner.go) when a new manifest/lockfile
-// writer is added, mirroring the needsGPUSlot/gpuBoundJobTypes precedent.
+// loop, PLUS the manifest/lockfile writers that are NOT unbounded --
+// MODULE_SET (drives cmd/module_ops.go's Install/Uninstall, writing both files),
+// SERVICE_STOP (setDesiredStatusInManifestFile), and APPLY_DEVICE_CONFIG
+// (ConfigHandler.updateManifest, internal/jobs/config_handler.go: a full
+// ReadFile -> yaml.Unmarshal -> mutate -> yaml.Marshal -> non-atomic
+// os.WriteFile of citadel.yaml). Keeping these OUT of unboundedJobTypes is
+// deliberate: they keep their generous default watchdog deadline (they are not
+// opaque unbounded work), they only join the serialized EXECUTION lane.
+//
+// APPLY_DEVICE_CONFIG is the sharp one: it is neither gpu-bound nor
+// long-session, so without this membership it fell to the INLINE default branch
+// and could truncate-write citadel.yaml CONCURRENTLY with a serialized-lane
+// manifest writer (SERVICE_START/SERVICE_STOP/MODULE_SET) executing on the
+// exec-cap-1 lane goroutine -- a torn read / lost update on a live node. The
+// exec-cap-1 lane reproduces single-writer safety only for jobs ON the lane, so
+// every manifest writer must be on it. Membership is pinned by
+// TestSerializedLaneJobTypes; extend THIS set (not the routing check in
+// runner.go) when a new manifest/lockfile writer is added, mirroring the
+// needsGPUSlot/gpuBoundJobTypes precedent.
 var serializedLaneJobTypes = func() map[string]struct{} {
 	m := map[string]struct{}{
-		JobTypeModuleSet:   {},
-		JobTypeServiceStop: {},
+		JobTypeModuleSet:         {},
+		JobTypeServiceStop:       {},
+		JobTypeApplyDeviceConfig: {},
 	}
 	for jt := range unboundedJobTypes {
 		m[jt] = struct{}{}

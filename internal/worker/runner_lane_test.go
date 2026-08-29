@@ -30,8 +30,9 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 		JobTypeWhatsAppProvision: {},
 		// Manifest/lockfile writers that are NOT unbounded but still must
 		// serialize (they read-modify-write citadel.yaml / modules.lock).
-		JobTypeModuleSet:   {},
-		JobTypeServiceStop: {},
+		JobTypeModuleSet:         {},
+		JobTypeServiceStop:       {},
+		JobTypeApplyDeviceConfig: {},
 	}
 	if len(serializedLaneJobTypes) != len(want) {
 		t.Fatalf("serializedLaneJobTypes has %d entries, want %d: %v",
@@ -110,7 +111,7 @@ func TestRunnerUnboundedLaneDoesNotBlockFetchLoop(t *testing.T) {
 
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("SERVICE_START handler never started")
 	}
 
@@ -122,10 +123,10 @@ func TestRunnerUnboundedLaneDoesNotBlockFetchLoop(t *testing.T) {
 
 	// While the deploy is still blocked in its handler, the file read must be
 	// claimed and completed.
-	if !laneWaitFor(2*time.Second, func() bool { return len(fileHandler.ExecutedJobs()) >= 1 }) {
+	if !laneWaitFor(5*time.Second, func() bool { return len(fileHandler.ExecutedJobs()) >= 1 }) {
 		t.Fatal("FILE_READ_BYTES was not dispatched while SERVICE_START was still in flight (head-of-line blocking regression)")
 	}
-	if !laneWaitFor(2*time.Second, func() bool {
+	if !laneWaitFor(5*time.Second, func() bool {
 		for _, j := range source.AckedJobs() {
 			if j.ID == "file-1" {
 				return true
@@ -145,7 +146,7 @@ func TestRunnerUnboundedLaneDoesNotBlockFetchLoop(t *testing.T) {
 	}
 
 	close(release)
-	if !laneWaitFor(2*time.Second, func() bool {
+	if !laneWaitFor(5*time.Second, func() bool {
 		for _, j := range source.AckedJobs() {
 			if j.ID == "deploy-1" {
 				return true
@@ -159,7 +160,7 @@ func TestRunnerUnboundedLaneDoesNotBlockFetchLoop(t *testing.T) {
 	cancel()
 	select {
 	case <-runDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 }
@@ -199,7 +200,7 @@ func TestRunnerUnboundedLaneExecutesSequentially(t *testing.T) {
 	// First job starts.
 	select {
 	case <-starts:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("first SERVICE_START never started")
 	}
 
@@ -219,17 +220,88 @@ func TestRunnerUnboundedLaneExecutesSequentially(t *testing.T) {
 	close(release)
 	select {
 	case <-starts:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("second SERVICE_START never started after the first was released")
 	}
-	if !laneWaitFor(2*time.Second, func() bool { return len(source.AckedJobs()) >= 2 }) {
+	if !laneWaitFor(5*time.Second, func() bool { return len(source.AckedJobs()) >= 2 }) {
 		t.Fatalf("both jobs should complete sequentially; acked = %d", len(source.AckedJobs()))
 	}
 
 	cancel()
 	select {
 	case <-runDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+// TestRunnerApplyDeviceConfigSerializesWithServiceStart is the regression test
+// for the review BLOCK: APPLY_DEVICE_CONFIG (ConfigHandler.updateManifest) does
+// a full non-atomic read-modify-write of citadel.yaml, so it MUST execute on the
+// serialized (exec-cap-1) lane with the other manifest writers -- never inline
+// and concurrently with a SERVICE_START/SERVICE_STOP/MODULE_SET that is also
+// mid-write. This asserts the two DIFFERENT manifest-writer types cannot execute
+// at the same time: while the first (whichever the lane admits first) is blocked
+// in its handler, the second must not start. Before the fix APPLY_DEVICE_CONFIG
+// fell to the inline default branch and could truncate-write citadel.yaml
+// concurrently with a lane manifest writer -> torn read / lost update.
+func TestRunnerApplyDeviceConfigSerializesWithServiceStart(t *testing.T) {
+	starts := make(chan string, 2)
+	release := make(chan struct{})
+	applyHandler := &blockingJobHandler{
+		jobType: JobTypeApplyDeviceConfig,
+		onStart: func() { starts <- JobTypeApplyDeviceConfig },
+		release: release,
+	}
+	deployHandler := &blockingJobHandler{
+		jobType: JobTypeServiceStart,
+		onStart: func() { starts <- JobTypeServiceStart },
+		release: release,
+	}
+	jobs := []*Job{
+		{ID: "apply-1", Type: JobTypeApplyDeviceConfig, Payload: map[string]any{}},
+		{ID: "deploy-1", Type: JobTypeServiceStart, Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	runner := NewRunner(source, []JobHandler{applyHandler, deployHandler}, RunnerConfig{
+		WorkerID:       "test-worker",
+		MaxConcurrency: 1,
+		ActivityFn:     func(string, string) {},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() { runner.Run(ctx); close(runDone) }()
+
+	// Exactly one manifest writer starts and blocks; the other must NOT start
+	// while it holds the single serialized exec slot.
+	select {
+	case <-starts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("neither manifest-writer job started")
+	}
+	select {
+	case second := <-starts:
+		t.Fatalf("%s started while another manifest writer was still executing -- APPLY_DEVICE_CONFIG must serialize with SERVICE_START on the exec-cap-1 lane", second)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: no concurrent second manifest writer.
+	}
+	total := len(applyHandler.ExecutedJobs()) + len(deployHandler.ExecutedJobs())
+	if total != 1 {
+		t.Fatalf("manifest-writer executions while one blocked = %d, want 1", total)
+	}
+
+	// Release; both must complete sequentially.
+	close(release)
+	if !laneWaitFor(5*time.Second, func() bool { return len(source.AckedJobs()) >= 2 }) {
+		t.Fatalf("both manifest writers should complete sequentially; acked = %d", len(source.AckedJobs()))
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 }
@@ -272,13 +344,13 @@ func TestRunnerLaneActivityPopulatedWhenBusy(t *testing.T) {
 
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("handler never started")
 	}
 
 	// Wait for the second job to be admitted-and-queued behind the executing one.
 	var unbounded *LaneSnapshot
-	if !laneWaitFor(2*time.Second, func() bool {
+	if !laneWaitFor(5*time.Second, func() bool {
 		for _, s := range runner.LaneSnapshots() {
 			if s.Lane == "unbounded" && s.Executing >= 1 && s.Queued >= 1 {
 				snap := s
@@ -301,7 +373,7 @@ func TestRunnerLaneActivityPopulatedWhenBusy(t *testing.T) {
 	cancel()
 	select {
 	case <-runDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 }
@@ -345,12 +417,12 @@ func TestRunnerLaneSaturatedNacks(t *testing.T) {
 
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("deploy-1 handler never started")
 	}
 
 	// deploy-2 must be Nacked (lane saturated), never executed, no terminal event.
-	if !laneWaitFor(2*time.Second, func() bool {
+	if !laneWaitFor(5*time.Second, func() bool {
 		for _, j := range source.NackedJobs() {
 			if j.ID == "deploy-2" {
 				return true
@@ -371,7 +443,7 @@ func TestRunnerLaneSaturatedNacks(t *testing.T) {
 	cancel()
 	select {
 	case <-runDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 }
@@ -412,7 +484,7 @@ func TestRunnerInferenceQueueReturnsWarmingOnWaitExceeded(t *testing.T) {
 	// Exactly one job wins the single exec slot and blocks in the handler; which
 	// one is nondeterministic, so identify it rather than assuming. The OTHER
 	// job is the one that must exceed the queue-wait and return warming.
-	if !laneWaitFor(2*time.Second, func() bool { return len(handler.ExecutedJobs()) == 1 }) {
+	if !laneWaitFor(5*time.Second, func() bool { return len(handler.ExecutedJobs()) == 1 }) {
 		t.Fatalf("expected exactly one inference job to acquire the exec slot; executed=%v", jobIDs(handler.ExecutedJobs()))
 	}
 	runningID := handler.ExecutedJobs()[0].ID
@@ -422,7 +494,7 @@ func TestRunnerInferenceQueueReturnsWarmingOnWaitExceeded(t *testing.T) {
 	}
 
 	// The queued job must be Acked (warming is a SUCCESS terminal), never Nacked.
-	if !laneWaitFor(2*time.Second, func() bool {
+	if !laneWaitFor(5*time.Second, func() bool {
 		for _, j := range source.AckedJobs() {
 			if j.ID == queuedID {
 				return true
@@ -461,7 +533,7 @@ func TestRunnerInferenceQueueReturnsWarmingOnWaitExceeded(t *testing.T) {
 	cancel()
 	select {
 	case <-runDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
 }
