@@ -149,12 +149,14 @@ func meetingOwnerAlive(profileDir string) (ownerPID int, alive bool) {
 
 // reapMeetingProcessOrphans reclaims a leaked Chrome + Xvfb pair left behind
 // by a SIGKILLed/crashed prior process, verified against the persistent
-// meeting profile's fixed pidfile. Called at the top of
-// MeetingBrowser.Start(), before this run's own browser/Xvfb are launched, so
-// a stale --user-data-dir lock or a stray Xvfb display from a dead process
-// never lingers into the new attempt. A live owner (another citadel process
-// still legitimately using this profile) is left completely alone --
-// verified the same way cobrowse's sweep protects a live sibling worker.
+// meeting profile's fixed pidfile. Called from MeetingBrowser.Start() --
+// AFTER acquireMeetingProfileLock succeeds, see the call site's comment for
+// why that ordering matters -- and before this run's own browser/Xvfb are
+// launched, so a stale --user-data-dir lock or a stray Xvfb display from a
+// dead process never lingers into the new attempt. A live owner (another
+// citadel process, OR a live sibling meeting in THIS SAME process -- see
+// meetingOwnerAlive) is left completely alone -- verified the same way
+// cobrowse's sweep protects a live sibling worker.
 //
 // SECURITY (mirrors cobrowse's sweep exactly, cobrowse_session.go): the
 // pidfile is an on-disk claim from a PRIOR process, not a guarantee -- PIDs
