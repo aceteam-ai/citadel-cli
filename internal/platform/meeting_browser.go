@@ -594,7 +594,7 @@ func (b *MeetingBrowser) Start() error {
 	// process's reapMeetingProcessOrphans can then reclaim this browser +
 	// Xvfb if THIS process is SIGKILLed before graceful teardown, even if
 	// that happens before CDP ever comes up. Best-effort (logged, not fatal).
-	writeMeetingPidfile(profileDir, os.Getpid(), cmd.Process.Pid, xvfb.Process.Pid)
+	writeMeetingPidfile(profileDir, os.Getpid(), pidOf(cmd), pidOf(xvfb))
 
 	// Reap each child so a crash is observable and no zombie is left. Stop/Close
 	// signal the kill and wait on these channels; they never call Wait directly.

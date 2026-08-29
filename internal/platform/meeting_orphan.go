@@ -121,14 +121,27 @@ func removeMeetingPidfile(profileDir string) {
 }
 
 // meetingOwnerAlive reports whether the pidfile under profileDir names a
-// STILL-LIVE owning process other than this one. Shared by both reap halves
-// (process + sink) so they agree on what counts as "orphaned": a pidfile
-// naming this process itself is never treated as a live foreign owner (it
-// cannot be an orphan of itself), matching cobrowse's sweep's identical
-// self-PID exclusion.
+// STILL-LIVE owning process. Shared by both reap halves (process + sink) so
+// they agree on what counts as "orphaned".
+//
+// Deliberately does NOT exclude os.Getpid(), unlike cobrowse's sweep()'s
+// analogous check. cobrowse's exclusion is safe only because sweep() runs
+// exactly ONCE per process, via sweepOnce.Do, before that process's first
+// StartSession -- so a session dir can never yet belong to this process at
+// sweep time, and the self-PID case is structurally unreachable there. This
+// reap has no once-guard: it runs on EVERY MeetingBrowser.Start() and every
+// hostMedia.Start(), including a SECOND, genuinely concurrent meeting in the
+// SAME process (citadel-cli#489 made two overlapping meetings real --
+// acquireMeetingProfileLock exists precisely because of it). If a live
+// second Start() excluded its own PID here, it would see the pidfile
+// (correctly still naming ITS OWN process, from the FIRST meeting's
+// writeMeetingPidfile) as "no live owner" and reap the first meeting's
+// still-running Chrome/Xvfb/sink out from under it. pidAlive(os.Getpid()) is
+// always true, so simply not special-casing it already gives the correct
+// answer: same-process is alive, exactly like any other live PID.
 func meetingOwnerAlive(profileDir string) (ownerPID int, alive bool) {
 	ownerPID, _, _ = readMeetingPidfile(profileDir)
-	if ownerPID <= 0 || ownerPID == os.Getpid() {
+	if ownerPID <= 0 {
 		return ownerPID, false
 	}
 	return ownerPID, pidAlive(ownerPID)

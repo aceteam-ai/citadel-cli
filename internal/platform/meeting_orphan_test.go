@@ -267,14 +267,81 @@ func TestMeetingBrowser_CloseLockedNoPidfileIsSafe(t *testing.T) {
 	}
 }
 
-// TestMeetingOwnerAlive_IgnoresOwnPID pins that a pidfile naming THIS
-// process as owner is never treated as a live foreign owner -- mirroring
-// cobrowse's sweep, which excludes its own PID from the live-owner check.
-func TestMeetingOwnerAlive_IgnoresOwnPID(t *testing.T) {
+// TestMeetingOwnerAlive_TreatsOwnPIDAsAlive pins the OPPOSITE of what
+// cobrowse's sweep does, deliberately: unlike sweep() (which runs exactly
+// once per process, before its own first StartSession, so a self-owned
+// pidfile can never exist yet), reapMeetingProcessOrphans/
+// ReapOrphanedMeetingSinks run on EVERY MeetingBrowser.Start()/
+// hostMedia.Start(), including a second, genuinely concurrent meeting in the
+// SAME process (citadel-cli#489). A pidfile naming this process as owner
+// means a first meeting THIS process is still running, not an orphan --
+// excluding self-PID here would make a live second Start() reap the first,
+// still-running meeting's Chrome/Xvfb/sink out from under it.
+func TestMeetingOwnerAlive_TreatsOwnPIDAsAlive(t *testing.T) {
 	dir := t.TempDir()
 	writeMeetingPidfile(dir, os.Getpid(), 1, 2)
-	if _, alive := meetingOwnerAlive(dir); alive {
-		t.Error("meetingOwnerAlive must not report this process's own pid as a live foreign owner")
+	if _, alive := meetingOwnerAlive(dir); !alive {
+		t.Error("meetingOwnerAlive must report this process's own pid as alive -- a same-process pidfile owner is a live sibling meeting, not an orphan")
+	}
+}
+
+// TestReapMeetingProcessOrphans_SkipsSameProcessOwner is the discriminating
+// regression test for the same hazard: a pidfile whose owner is THIS
+// process (a live sibling meeting already running in it) must never be
+// reaped, even though its recorded browser/Xvfb PIDs would otherwise
+// verify as real chrome/Xvfb processes.
+func TestReapMeetingProcessOrphans_SkipsSameProcessOwner(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, os.Getpid(), 828281, 828282)
+	installMeetingMatchingCmdlineReader(t) // would match/kill if reap got this far
+
+	var killed []int
+	prevKiller := pidKiller
+	pidKiller = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+	t.Cleanup(func() { pidKiller = prevKiller })
+
+	reapMeetingProcessOrphans(dir)
+
+	if len(killed) != 0 {
+		t.Errorf("reap must never kill a same-process (sibling meeting) owner's browser/Xvfb pids, killed %v", killed)
+	}
+	if _, err := os.Stat(meetingPidfilePath(dir)); err != nil {
+		t.Errorf("a same-process owner's pidfile must be left in place, stat err=%v", err)
+	}
+}
+
+// TestReapOrphanedMeetingSinks_SkipsSameProcessOwner is the sink-side
+// analogue: a live sibling meeting in THIS process must keep its sink.
+func TestReapOrphanedMeetingSinks_SkipsSameProcessOwner(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, os.Getpid(), 0, 0)
+
+	listCalled := false
+	prevList := pactlListModulesFn
+	pactlListModulesFn = func() (string, error) {
+		listCalled = true
+		return "10\tmodule-null-sink\tsink_name=citadel_meeting_sibling sink_properties=device.description=citadel_meeting_sibling\n", nil
+	}
+	t.Cleanup(func() { pactlListModulesFn = prevList })
+
+	var unloaded []string
+	prevUnload := pactlUnloadModuleFn
+	pactlUnloadModuleFn = func(id string) error {
+		unloaded = append(unloaded, id)
+		return nil
+	}
+	t.Cleanup(func() { pactlUnloadModuleFn = prevUnload })
+
+	ReapOrphanedMeetingSinks(dir)
+
+	if listCalled {
+		t.Error("sink sweep must not list pactl modules at all for a same-process (sibling meeting) owner")
+	}
+	if len(unloaded) != 0 {
+		t.Errorf("sink sweep must not unload a same-process sibling meeting's sink, unloaded %v", unloaded)
 	}
 }
 
