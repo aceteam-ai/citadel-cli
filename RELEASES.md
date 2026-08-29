@@ -1980,3 +1980,23 @@ Auto-generated log of every release.
   - fix(hermes-service): scrub provider secrets from forwarded CLI output (#909)
 
 
+---
+
+## v2.128.0 — 2026-08-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 42 |
+| Lines added | +7226 |
+
+**Changes:**
+
+  - feat(worker): node execution model — claim/execute decoupling + bounded lanes (#908) (#919)
+  - feat: model exclusivity -- run --exclusive + local MCP deploy/evict (aceteam#8248/#8249) (#918)
+  - feat: node identity persistence + signed AEP receipts (aceteam#8139/#8253) (#917)
+  - docs: design node identity persistence + signed AEP receipts (#8139/#8253) (#914)
+  - docs: design for model exclusivity — run-exclusive + local MCP deploy/evict via the #851 primitive (#8248/#8249) (#915)
+  - docs: design for node execution model — claim/execute decoupling + inference slot queue (#908/#8254) (#916)
+
+
