@@ -38,6 +38,7 @@ type Collector struct {
 	pinnedServices  map[string]bool         // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
 	modelHotswap    bool                    // advertise installed-vs-resident models (citadel #632)
 	reservations    func() []GPUReservation // live job-scoped GPU reservations (citadel #832), optional
+	laneActivity    func() []LaneActivity   // live bounded-execution-lane activity (citadel #908), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -86,6 +87,11 @@ type CollectorConfig struct {
 	// (citadel #832). Optional: nil when no reservation provider is wired
 	// (legacy build, or a heartbeat path that predates #832).
 	Reservations func() []GPUReservation
+	// LaneActivity, when set, returns the node's live bounded-execution-lane
+	// activity attached to each heartbeat as NodeStatus.Lanes (citadel #908) so a
+	// dispatcher can see a saturated-but-healthy node. Optional: nil when no
+	// worker runner is wired (pure status node) or a legacy build.
+	LaneActivity func() []LaneActivity
 }
 
 // NewCollector creates a new status collector.
@@ -107,6 +113,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		pinnedServices:  toStringSet(cfg.PinnedServices),
 		modelHotswap:    cfg.ModelHotswap,
 		reservations:    cfg.Reservations,
+		laneActivity:    cfg.LaneActivity,
 	}
 }
 
@@ -426,6 +433,13 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// field omitted exactly as before this change.
 	if c.reservations != nil {
 		status.GPUReservations = c.reservations()
+	}
+
+	// Attach live bounded-execution-lane activity so a dispatcher can see a
+	// saturated-but-healthy node (citadel-cli#908). Additive: nil provider
+	// leaves the field omitted exactly as before this change.
+	if c.laneActivity != nil {
+		status.Lanes = c.laneActivity()
 	}
 
 	return status, nil

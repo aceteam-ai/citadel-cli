@@ -73,6 +73,28 @@ type WorkerState struct {
 	inFlight  int64
 	processed int64
 	failed    int64
+
+	// executing counts jobs currently INSIDE a handler (past lane admission and
+	// the exec-slot acquire), a strict subset of inFlight (citadel-cli#908). It
+	// exists so the self-heal STUCK check can distinguish a job that has been
+	// legitimately QUEUED for hours behind a long model pull (the general lane's
+	// exec-concurrency is 1) from one whose handler is actually wedged -- only
+	// the latter should trip STUCK. inFlight = queued + executing, so
+	// queued (the wire field) is inFlight - executing.
+	executing int64
+	// oldestExecutingUnixNano is the executing analogue of
+	// oldestInFlightUnixNano: the time the current EXECUTING streak began (last
+	// executing 0 -> >0 transition), cleared when executing drains to 0. The
+	// self-heal STUCK check reads this (surfaced as OldestExecutingAt), NOT
+	// oldestInFlightUnixNano, so a long queue wait cannot look like a wedged
+	// handler.
+	oldestExecutingUnixNano int64
+	// executingMu serializes the executing increment/decrement against the
+	// conditional oldestExecutingUnixNano stamp, for the identical reason
+	// inFlightMu exists for inFlight/oldestInFlightUnixNano above -- kept
+	// separate so the two brackets (received-at-claim, executing-at-dispatch)
+	// never contend with each other.
+	executingMu sync.Mutex
 }
 
 // NewWorkerState creates an empty WorkerState stamped with the start time.
@@ -181,6 +203,40 @@ func (s *WorkerState) RecordJobDone(ok bool) {
 	}
 }
 
+// RecordJobExecuting stamps the transition of a job from queued (or directly
+// claimed, for non-laned jobs) into actual handler execution. Increments the
+// executing counter and, on the 0 -> 1 transition, stamps the executing streak
+// start. Pair with RecordJobExecuteDone. Distinct from RecordJobReceived, which
+// brackets the WIDER claimed-to-done span (inFlight): a job admitted onto a lane
+// is RecordJobReceived immediately but only RecordJobExecuting once it acquires
+// an exec slot, so the interval between them is genuinely "queued, not running".
+func (s *WorkerState) RecordJobExecuting() {
+	if s == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	s.executingMu.Lock()
+	if atomic.AddInt64(&s.executing, 1) == 1 {
+		atomic.StoreInt64(&s.oldestExecutingUnixNano, now)
+	}
+	s.executingMu.Unlock()
+}
+
+// RecordJobExecuteDone decrements the executing counter and clears the executing
+// streak start when it drains to 0. Pair with RecordJobExecuting. It does NOT
+// touch processed/failed (RecordJobDone owns outcome classification, on the
+// wider claimed-to-done bracket).
+func (s *WorkerState) RecordJobExecuteDone() {
+	if s == nil {
+		return
+	}
+	s.executingMu.Lock()
+	if atomic.AddInt64(&s.executing, -1) == 0 {
+		atomic.StoreInt64(&s.oldestExecutingUnixNano, 0)
+	}
+	s.executingMu.Unlock()
+}
+
 // WorkerSnapshot is a point-in-time, JSON-serializable view of WorkerState.
 type WorkerSnapshot struct {
 	WorkerID        string   `json:"worker_id"`
@@ -212,6 +268,17 @@ type WorkerSnapshot struct {
 	LastConsumeStatus int        `json:"last_consume_status"`
 	LastConsumeError  string     `json:"last_consume_error,omitempty"`
 	InFlight          int64      `json:"in_flight"`
+	// Queued and Executing partition InFlight (Queued = InFlight - Executing):
+	// Queued jobs are claimed and admitted onto a lane but waiting for a free
+	// execution slot; Executing jobs are inside a handler (citadel-cli#908).
+	// Additive/back-compatible -- InFlight keeps its exact prior meaning.
+	Queued    int64 `json:"queued"`
+	Executing int64 `json:"executing"`
+	// OldestExecutingAt is when the current EXECUTING streak began (nil when
+	// Executing==0). The self-heal STUCK check reads this rather than
+	// OldestInFlightAt, so a job merely queued behind a long one for hours does
+	// not read as a wedged handler (citadel-cli#908 §2d).
+	OldestExecutingAt *time.Time `json:"oldest_executing_at,omitempty"`
 	Processed         int64      `json:"processed"`
 	Failed            int64      `json:"failed"`
 }
@@ -243,6 +310,13 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 		snap.LastConsumeError = *p
 	}
 	snap.InFlight = atomic.LoadInt64(&s.inFlight)
+	snap.Executing = atomic.LoadInt64(&s.executing)
+	// Queued is derived from two independently-loaded atomics, so clamp at 0: a
+	// momentary skew between the loads must never surface a negative count.
+	snap.Queued = snap.InFlight - snap.Executing
+	if snap.Queued < 0 {
+		snap.Queued = 0
+	}
 	snap.Processed = atomic.LoadInt64(&s.processed)
 	snap.Failed = atomic.LoadInt64(&s.failed)
 
@@ -258,6 +332,10 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 	if ns := atomic.LoadInt64(&s.oldestInFlightUnixNano); ns > 0 {
 		t := time.Unix(0, ns)
 		snap.OldestInFlightAt = &t
+	}
+	if ns := atomic.LoadInt64(&s.oldestExecutingUnixNano); ns > 0 {
+		t := time.Unix(0, ns)
+		snap.OldestExecutingAt = &t
 	}
 	return snap
 }

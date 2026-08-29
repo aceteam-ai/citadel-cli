@@ -69,6 +69,58 @@ var unboundedJobTypes = map[string]struct{}{
 	JobTypeWhatsAppProvision: {},
 }
 
+// serializedLaneJobTypes decides which job types are routed onto the general
+// UNBOUNDED EXECUTION LANE (runner.go, exec-concurrency 1) -- a SEPARATE concern
+// from unboundedJobTypes above, which decides the per-job WATCHDOG TIER. It is
+// the set of job types that read-modify-write the whole citadel.yaml
+// (addServiceToManifestFile / setDesiredStatusInManifestFile /
+// setEvictedMarkersInManifestFile, internal/jobs/service_handler.go) or
+// modules.lock (UpsertLockEntry / DeleteLockEntry, internal/catalog/lockfile.go)
+// with NO file lock -- so running two of them concurrently is a whole-file
+// read-modify-write race (citadel-cli#908 §1b/§2c). Routing them to a lane with
+// exec-concurrency 1 preserves EXACTLY today's implicit single-writer guarantee
+// (the sequential fetch loop was that lock) while decoupling claim from execute.
+//
+// It is a SUPERSET of unboundedJobTypes: every unbounded job is a manifest
+// writer or a long opaque job that today ran one-at-a-time on the sequential
+// loop, PLUS the manifest/lockfile writers that are NOT unbounded --
+// MODULE_SET (drives cmd/module_ops.go's Install/Uninstall, writing both files),
+// SERVICE_STOP (setDesiredStatusInManifestFile), and APPLY_DEVICE_CONFIG
+// (ConfigHandler.updateManifest, internal/jobs/config_handler.go: a full
+// ReadFile -> yaml.Unmarshal -> mutate -> yaml.Marshal -> non-atomic
+// os.WriteFile of citadel.yaml). Keeping these OUT of unboundedJobTypes is
+// deliberate: they keep their generous default watchdog deadline (they are not
+// opaque unbounded work), they only join the serialized EXECUTION lane.
+//
+// APPLY_DEVICE_CONFIG is the sharp one: it is neither gpu-bound nor
+// long-session, so without this membership it fell to the INLINE default branch
+// and could truncate-write citadel.yaml CONCURRENTLY with a serialized-lane
+// manifest writer (SERVICE_START/SERVICE_STOP/MODULE_SET) executing on the
+// exec-cap-1 lane goroutine -- a torn read / lost update on a live node. The
+// exec-cap-1 lane reproduces single-writer safety only for jobs ON the lane, so
+// every manifest writer must be on it. Membership is pinned by
+// TestSerializedLaneJobTypes; extend THIS set (not the routing check in
+// runner.go) when a new manifest/lockfile writer is added, mirroring the
+// needsGPUSlot/gpuBoundJobTypes precedent.
+var serializedLaneJobTypes = func() map[string]struct{} {
+	m := map[string]struct{}{
+		JobTypeModuleSet:         {},
+		JobTypeServiceStop:       {},
+		JobTypeApplyDeviceConfig: {},
+	}
+	for jt := range unboundedJobTypes {
+		m[jt] = struct{}{}
+	}
+	return m
+}()
+
+// needsSerializedLane reports whether jobType executes on the general unbounded
+// (exec-concurrency-1) lane. See serializedLaneJobTypes.
+func needsSerializedLane(jobType string) bool {
+	_, ok := serializedLaneJobTypes[jobType]
+	return ok
+}
+
 // resolveJobTimeout returns the execution budget the runner should apply to a
 // job. An explicit payload timeout_ms wins; otherwise the per-class fallback
 // applies. ok=false means "run unbounded" (no watchdog), preserving the exact

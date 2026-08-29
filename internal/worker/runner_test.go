@@ -205,6 +205,11 @@ type MockStreamWriter struct {
 	endCount   int
 	errorCount int
 
+	// endResult captures the most recent WriteEnd payload so a test can assert
+	// on the terminal success output (e.g. the model_warming backpressure signal
+	// and latency metrics, citadel-cli#908).
+	endResult map[string]any
+
 	// WriteEndErr, when non-nil, is returned by WriteEnd instead of nil.
 	WriteEndErr error
 	// WriteErrorErr, when non-nil, is returned by WriteError instead of nil.
@@ -230,6 +235,7 @@ func (m *MockStreamWriter) WriteChunk(content string, index int) error {
 func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 	m.ended = true
 	m.endCount++
+	m.endResult = result
 	return m.WriteEndErr
 }
 

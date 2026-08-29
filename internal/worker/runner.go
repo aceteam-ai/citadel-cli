@@ -33,6 +33,18 @@ type Runner struct {
 	maxConcurrency int
 	gpuTracker     *GPUTracker
 
+	// Bounded execution lanes (citadel-cli#908, aceteam#8254). unboundedLane
+	// carries every manifest/lockfile-writing job type (serializedLaneJobTypes)
+	// at exec-concurrency 1 -- preserving today's implicit single-writer
+	// guarantee off the fetch loop. inferenceLane carries GPU-bound inference at
+	// exec-concurrency = GPUTracker.Total() with a bounded queue wait; it is nil
+	// on a node with no discrete GPU (GPUTracker nil or Total()<1), where
+	// GPU-bound jobs keep the pre-#908 inline/sequential fallback. See the lane
+	// routing in Run.
+	unboundedLane      *lane
+	inferenceLane      *lane
+	inferenceQueueWait time.Duration
+
 	// state, when set, records live introspection metrics (poll time, job
 	// counts) for the out-of-band status/control path (issue #236).
 	state *WorkerState
@@ -88,17 +100,36 @@ type RunnerConfig struct {
 
 // NewRunner creates a new job runner.
 func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Runner {
-	return &Runner{
-		source:         source,
-		handlers:       handlers,
-		config:         config,
-		agentVersion:   config.AgentVersion,
-		activityFn:     config.ActivityFn,
-		jobRecordFn:    config.JobRecordFn,
-		maxConcurrency: config.MaxConcurrency,
-		gpuTracker:     config.GPUTracker,
-		state:          config.State,
+	r := &Runner{
+		source:             source,
+		handlers:           handlers,
+		config:             config,
+		agentVersion:       config.AgentVersion,
+		activityFn:         config.ActivityFn,
+		jobRecordFn:        config.JobRecordFn,
+		maxConcurrency:     config.MaxConcurrency,
+		gpuTracker:         config.GPUTracker,
+		state:              config.State,
+		inferenceQueueWait: resolveInferenceQueueWait(),
 	}
+
+	// The general unbounded lane always exists (exec-concurrency 1): it is the
+	// relocated single-writer lock over the unlocked manifest/lockfile paths.
+	r.unboundedLane = newLane("unbounded", resolveUnboundedLaneQueue(), 1, false)
+
+	// The inference admission queue exists ONLY on a node with a real discrete
+	// GPU (a non-nil tracker with >=1 slot). On a GPU-less node that still
+	// serves GPU-typed inference (CPU-only, native ollama, Apple Silicon), it
+	// stays nil and GPU-bound jobs fall through to the pre-#908 inline/sequential
+	// path -- the only backpressure such a node has against its single serving
+	// engine (the #903 nil-tracker gate, preserved). Total()<1 would make an
+	// unbuffered exec channel that could never run a job, so it is excluded too.
+	if config.GPUTracker != nil && config.GPUTracker.Total() >= 1 {
+		total := config.GPUTracker.Total()
+		r.inferenceLane = newLane("inference", total*3, total, true)
+	}
+
+	return r
 }
 
 // log outputs a message - uses activity callback if set, otherwise prints to stdout/stderr
@@ -318,80 +349,77 @@ runLoop:
 				continue // No job available, loop again
 			}
 
-			// Long-session job types (MEETING_JOIN, COBROWSE -- see
-			// longSessionJobTypes in deadline.go) always get their own
-			// goroutine, independent of maxConcurrency and the semaphore below
-			// (citadel-cli#489). These jobs legitimately run for the length of
-			// a human session (up to the 4h long-tier deadline); routing one
-			// through the sequential path on a maxConcurrency=1 node -- the
-			// default on a GPU-less meeting node -- would occupy the node's
-			// only slot and starve every other poll cycle (deploys, shell,
-			// file reads) for the duration. Dispatching async here, before the
-			// concurrency>1 branch, means these jobs never acquire the
-			// semaphore either, so they can't hog a pool slot there either.
-			// They still run through the exact same r.processJob path as
-			// every other job -- same per-job watchdog/deadline, terminal-
-			// event publishing, cancellation, WorkerState in-flight
-			// accounting, and DLQ/ack semantics -- just not gated by the
-			// sequential/semaphore slot.
-			//
-			// citadel-cli#903 Stage 1: GPU-bound inference job types (see
-			// gpuBoundJobTypes in gpu_tracker.go) join this async lane too --
-			// but ONLY when r.gpuTracker is non-nil. r.gpuTracker gates actual
-			// execution inside processJob (#825): it admits up to its slot
-			// count and Nacks (non-terminal, redelivered -- see the #559 note
-			// on processJob) the rest. When a tracker exists, this async
-			// dispatch is a pure fetch-loop fix, not a concurrency change: the
-			// tracker's own gate is what still throttles concurrent GPU
-			// execution, exactly as it already does whenever --max-concurrency
-			// is raised above the GPU count -- see
-			// TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention, which
-			// pins that the gate's behavior is unchanged under the newly-
-			// reachable maxConcurrency=1 contention.
-			//
-			// But r.gpuTracker is nil whenever platform.GetGPUCountSimple()
-			// found no discrete GPU (cmd/work.go) -- a first-class node class
-			// (CPU-only, native ollama, Apple Silicon; #606/#612/aceteam#6634)
-			// that still serves GPU-bound-typed inference. On such a node
-			// nothing else throttles concurrent GPU-bound dispatch: the
-			// sequential fetch loop (this job type falling through to the
-			// `else` inline branch below) was the ONLY thing serializing
-			// inference there, accidental but real backpressure against a
-			// single CPU-serving engine. Unconditionally async-dispatching
-			// GPU-bound jobs would remove that backpressure in the DEFAULT
-			// config (maxConcurrency=1, no tracker) and let N concurrently-
-			// arriving inference jobs hit one engine with zero throttle.
-			// TestRunnerGPUBoundJobsSequentialWithoutTracker pins that a
-			// nil-tracker node keeps the old inline/sequential fallback for
-			// GPU-bound jobs. Real admission control for that node class
-			// (a semaphore/lock sized to its actual concurrency, not this
-			// GPU-count-shaped tracker) is Stage-2 scope, not this fix.
-			//
-			// The fetch loop is now free to claim non-GPU jobs (e.g.
-			// FILE_READ_BYTES) while a GPU job executes on a tracked node,
-			// instead of blocking source.Next() until it returns. The
-			// general/unbounded case (every other job type, and admission
-			// control for tracker-less GPU-serving nodes) is left for a
-			// separate Stage 2 design issue.
+			// CLAIM (synchronous, in this fetch-loop goroutine): publish the
+			// claim-ack, run the target-node filter + cancellation check. This
+			// is the fast half -- no handler work, no lane wait -- so the
+			// backend's short claim-ack window sees a claim the instant a job is
+			// read, no matter how long EXECUTION ends up taking or waiting
+			// (citadel-cli#908 §2a). A non-proceed result (foreign target, or
+			// cancelled) is fully handled inside claimJob (Ack/terminal), so the
+			// loop just moves on.
+			proceed, stream, startTime := r.claimJob(ctx, job)
+			if !proceed {
+				continue
+			}
+
+			// EXECUTE dispatch. The fetch loop NEVER blocks on execution: it
+			// either admits onto a bounded lane (and loops back to source.Next
+			// immediately) or hands off to an async goroutine / the semaphore
+			// pool / an inline call. All waiting for an execution slot happens
+			// OFF this goroutine (citadel-cli#908 §2b).
 			_, longSession := longSessionJobTypes[job.Type]
-			gpuBoundAsync := needsGPUSlot(job.Type) && r.gpuTracker != nil
-			if longSession || gpuBoundAsync {
+			gpuBound := needsGPUSlot(job.Type) && r.gpuTracker != nil
+			switch {
+			case r.unboundedLane != nil && needsSerializedLane(job.Type):
+				// General unbounded lane (exec-concurrency 1): SERVICE_START,
+				// model pulls, builds, MODULE_SET, SERVICE_STOP, ... -- every
+				// manifest/lockfile writer, serialized off the fetch loop. This
+				// is the direct #908 fix: a long deploy no longer blocks the node
+				// from claiming a FILE_READ_BYTES behind it.
+				r.dispatchLane(ctx, r.unboundedLane, job, stream, startTime, &wg)
+			case r.inferenceLane != nil && gpuBound:
+				// Inference admission queue (aceteam#8254): bounded queue-on-full
+				// (returns model_warming, never a silent Nack) instead of the
+				// bare #825 Nack. The in-executeJob GPU-slot gate is retained;
+				// with the lane's exec-concurrency = GPUTracker.Total() it stays
+				// in lockstep in production, so the queue-wait is the real
+				// backpressure and the #825 Nack becomes effectively unreachable.
+				r.dispatchLane(ctx, r.inferenceLane, job, stream, startTime, &wg)
+			case longSession || gpuBound:
+				// #489 long-session lane (MEETING_JOIN/COBROWSE), plus the
+				// degenerate GPU-bound-but-no-inference-lane case (a tracker with
+				// Total()<1, test-only) which still reaches the #825 GPU-slot
+				// Nack inside executeJob. Unbounded always-async goroutine,
+				// independent of the semaphore.
+				r.enterJob()
 				wg.Add(1)
-				go func(j *Job) {
+				go func(j *Job, s StreamWriter, st time.Time) {
 					defer wg.Done()
-					r.processJob(ctx, j)
-				}(job)
-			} else if concurrency > 1 {
-				// Process the job concurrently via the semaphore-gated pool.
+					jobOK := false
+					defer func() { r.exitJob(jobOK) }()
+					jobOK = r.executeJob(ctx, j, s, st, false, 0)
+				}(job, stream, startTime)
+			case concurrency > 1:
+				// Semaphore-gated concurrent pool.
+				r.enterJob()
 				sem <- struct{}{} // Acquire semaphore slot
 				wg.Add(1)
-				go func(j *Job) {
+				go func(j *Job, s StreamWriter, st time.Time) {
 					defer wg.Done()
 					defer func() { <-sem }() // Release semaphore slot
-					r.processJob(ctx, j)
-				}(job)
-			} else {
-				r.processJob(ctx, job)
+					jobOK := false
+					defer func() { r.exitJob(jobOK) }()
+					jobOK = r.executeJob(ctx, j, s, st, false, 0)
+				}(job, stream, startTime)
+			default:
+				// Inline (sequential maxConcurrency=1 node): a non-laned job
+				// (shell, file, config, GPU-bound on a tracker-less node) still
+				// runs on the fetch-loop goroutine, exactly as before -- the lane
+				// fix targets only the manifest-writers and GPU inference that
+				// used to block here.
+				r.enterJob()
+				jobOK := r.executeJob(ctx, job, stream, startTime, false, 0)
+				r.exitJob(jobOK)
 			}
 		}
 	}
@@ -412,20 +440,45 @@ func (r *Runner) newStreamWriter(job *Job) StreamWriter {
 	return &NoOpStreamWriter{}
 }
 
-// processJob dispatches a job to the appropriate handler.
-func (r *Runner) processJob(ctx context.Context, job *Job) {
-	atomic.AddInt64(&r.activeJobs, 1)
-	defer atomic.AddInt64(&r.activeJobs, -1)
+// errLaneSaturated is the Nack error when a claimed job cannot be admitted onto
+// its lane because the lane is at its admission bound. Like the #825 GPU-slot
+// Nack, this is a transparent, non-terminal retry (no stream publish): the job
+// was claimed (WriteClaimed already fired in claimJob) but never admitted, so
+// nothing decremented and there is nothing to undo (citadel-cli#908 §2b).
+var errLaneSaturated = errors.New("execution lane saturated; retry")
 
-	// Track job in the introspection state. jobOK is flipped to true only on a
-	// clean success; the deferred RecordJobDone classifies the outcome (issue
-	// #236). Covers every return path of this function.
+// enterJob does the synchronous in-flight accounting for a claimed job that is
+// being dispatched for execution: it increments the introspection in-flight
+// bracket (RecordJobReceived) and the auto-updater's activeJobs counter. Pair
+// with exitJob. Deliberately NOT called for a job rejected at a lane's admission
+// bound (that job was claimed but never admitted -- see errLaneSaturated), so
+// its counters never move and InFlight can always return to 0.
+func (r *Runner) enterJob() {
 	r.state.RecordJobReceived()
-	jobOK := false
-	defer func() { r.state.RecordJobDone(jobOK) }()
+	atomic.AddInt64(&r.activeJobs, 1)
+}
 
+// exitJob is enterJob's terminal counterpart: it releases the activeJobs slot
+// and classifies the outcome (RecordJobDone). Counting queued-but-not-yet-
+// executing jobs in activeJobs is deliberate -- it keeps the auto-updater from
+// swapping the binary out from under a job that has been claimed (WriteClaimed
+// published) but is still waiting for a lane slot.
+func (r *Runner) exitJob(jobOK bool) {
+	atomic.AddInt64(&r.activeJobs, -1)
+	r.state.RecordJobDone(jobOK)
+}
+
+// claimJob is the fast, synchronous half of the old processJob (citadel-cli#908
+// §2a): it runs in the fetch-loop goroutine so the backend's short claim-ack
+// window sees a claim the instant a job is read, independent of how long
+// EXECUTION takes or waits for a lane slot. It performs the target-node filter,
+// publishes the claim-ack, and checks cancellation. It does NOT touch the
+// in-flight counters (enterJob owns that at dispatch, so a job rejected at a
+// lane's admission bound never increments them). A false `proceed` means claimJob
+// fully handled the job (Ack + any terminal event) and the caller must stop.
+func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream StreamWriter, startTime time.Time) {
+	startTime = time.Now()
 	r.log("info", "Received job %s (type: %s)", job.ID, job.Type)
-	startTime := time.Now()
 
 	// Target-node filter: when per-node consumer groups are used, every node
 	// sees every message on the shared org queue. If the job specifies a
@@ -452,7 +505,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 			r.log("info", "Skipping job %s: target_node=%s (this node=%s)", job.ID, targetNode, r.config.NodeID)
 		}
 		r.source.Ack(ctx, job)
-		return
+		return false, nil, startTime
 	}
 
 	// Claim-ack (aceteam#6000): publish a lightweight "claimed" event the moment
@@ -462,7 +515,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	// a wedged or dead-but-heartbeating node never reaches this line, so the
 	// dispatcher fast-fails in ~3s instead of burning the full result budget.
 	// Best-effort: a publish failure must not block execution.
-	stream := r.newStreamWriter(job)
+	stream = r.newStreamWriter(job)
 	if err := stream.WriteClaimed(r.agentVersion); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
 	}
@@ -474,10 +527,106 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 			r.log("warning", "Failed to publish cancelled event for job %s: %v", job.ID, err)
 		}
 		r.recordJob(buildUsageRecord(job, "cancelled", startTime, time.Now(), nil, nil))
-		jobOK = true // cleanly acked, not a processing failure
 		r.source.Ack(ctx, job)
+		return false, nil, startTime
+	}
+
+	return true, stream, startTime
+}
+
+// dispatchLane admits a claimed job onto a bounded lane and spawns the goroutine
+// that runs it (citadel-cli#908 §2b). The admission send is NON-BLOCKING: on
+// success the fetch loop immediately loops back to source.Next; at the admission
+// bound the job is Nacked now (transparent retry) and never enters the lane.
+// The spawned goroutine holds the admit slot for its whole life (queued +
+// executing) and releases it on return.
+func (r *Runner) dispatchLane(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time, wg *sync.WaitGroup) {
+	if !l.tryAdmit() {
+		// Admission bound reached: Nack now (non-terminal, no stream publish),
+		// exactly the shape of the #825 GPU-slot-full Nack. enterJob was NOT
+		// called, so no counter is left dangling.
+		r.log("warning", "%s lane saturated (job %s, type %s); nacking for redelivery", l.name, job.ID, job.Type)
+		r.source.Nack(ctx, job, errLaneSaturated)
 		return
 	}
+	r.enterJob()
+	wg.Add(1)
+	go func(j *Job, s StreamWriter, st time.Time) {
+		defer wg.Done()
+		jobOK := false
+		defer func() {
+			r.exitJob(jobOK)
+			l.releaseAdmit()
+		}()
+		jobOK = r.runLaneJob(ctx, l, j, s, st)
+	}(job, stream, startTime)
+}
+
+// runLaneJob acquires the lane's execution slot (the wait happens here, off the
+// fetch-loop goroutine) and then runs executeJob. The exec-acquire discipline
+// depends on the lane:
+//   - general/unbounded lane (hasExecWait=false): unbounded wait for the single
+//     exec slot -- the relocated single-writer serialization; it only unblocks
+//     early on shutdown/cancel, which Nacks the still-queued job.
+//   - inference lane (hasExecWait=true): BOUNDED wait; on expiry the node returns
+//     the existing model_warming backpressure signal (a SUCCESS the platform
+//     already retries), never a silent Nack (aceteam#8254 §3a). This is the
+//     queue-on-full that replaces the bare #825 Nack for inference under load.
+func (r *Runner) runLaneJob(ctx context.Context, l *lane, job *Job, stream StreamWriter, startTime time.Time) (jobOK bool) {
+	queueStart := time.Now()
+
+	if l.hasExecWait {
+		timer := time.NewTimer(r.inferenceQueueWait)
+		defer timer.Stop()
+		select {
+		case l.exec <- struct{}{}:
+			timer.Stop()
+		case <-timer.C:
+			// Queue-wait exceeded: return the model_warming signal through the
+			// SAME success-path terminal publish a normal completion uses, so
+			// there is exactly one terminal-publish implementation (never a
+			// silent Nack that reintroduces the #559 no-terminal-event bug).
+			return r.finishQueueWaitExceeded(ctx, job, stream, queueStart)
+		case <-ctx.Done():
+			// Cancelled/shutting down while queued: never executed. Nack for
+			// redelivery so shutdown can't deadlock on a queued job.
+			r.source.Nack(ctx, job, ctx.Err())
+			return false
+		}
+	} else {
+		select {
+		case l.exec <- struct{}{}:
+		case <-ctx.Done():
+			r.source.Nack(ctx, job, ctx.Err())
+			return false
+		}
+	}
+	defer func() { <-l.exec }()
+	l.beginExec()
+	defer l.endExec()
+
+	queueWaitMs := time.Since(queueStart).Milliseconds()
+	// Only the inference lane emits per-request latency metrics (aceteam#8254 §3c).
+	return r.executeJob(ctx, job, stream, startTime, l.hasExecWait, queueWaitMs)
+}
+
+// executeJob is the execution half of the old processJob (citadel-cli#908 §2a):
+// handler lookup, the #825 GPU-slot gate, the #548 per-job watchdog/deadline,
+// and terminal Ack/Nack/Fail + stream publish. It brackets ONLY the actual
+// handler execution with the executing counter (RecordJobExecuting/
+// RecordJobExecuteDone) -- the self-heal STUCK signal -- so a job that spent
+// time queued on a lane before reaching here never looks wedged. The wider
+// claimed-to-done in-flight bracket (enterJob/exitJob) is owned by the caller.
+//
+// The per-job execution deadline (executeWithDeadline) is started HERE, at the
+// moment execution begins, never counting lane queue-wait against it (§1e/§2a).
+//
+// emitLatency and queueWaitMs are set only for the inference lane; every other
+// caller passes (false, 0) and executeJob's output is byte-identical to before.
+// Returns jobOK true only on a clean success.
+func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, startTime time.Time, emitLatency bool, queueWaitMs int64) (jobOK bool) {
+	r.state.RecordJobExecuting()
+	defer r.state.RecordJobExecuteDone()
 
 	// Find handler
 	var handler JobHandler
@@ -490,15 +639,17 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 
 	if handler == nil {
 		r.failUnsupportedJobType(ctx, job, startTime)
-		return
+		return false
 	}
 
 	// GPU tracking: acquire/release GPU slot if tracker is set AND this job
-	// type actually contends for a GPU (citadel-cli#825). Without the
-	// needsGPUSlot check, a SERVICE_START or any other non-GPU job racing
-	// concurrent inference jobs under --max-concurrency > GPU count could hit
-	// the "no GPU slots available" Nack below with ZERO published terminal
-	// events. See gpuBoundJobTypes for the full explanation.
+	// type actually contends for a GPU (citadel-cli#825). Unchanged from the
+	// pre-#908 processJob. On the inference lane the lane's exec-concurrency
+	// already equals GPUTracker.Total(), so this acquire is effectively a
+	// no-op in production (they stay in lockstep) and the queue-wait is the
+	// real backpressure -- but it is retained so the job-type-scoped gate and
+	// specific-GPU assignment still work, and so a degenerate configuration
+	// (e.g. an externally-held tracker slot) still Nacks rather than mis-runs.
 	gpuIndex := -1
 	if r.gpuTracker != nil && needsGPUSlot(job.Type) {
 		// Check if job requests a specific GPU
@@ -513,7 +664,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 						r.log("warning", "Failed to publish terminal error event for job %s: %v", job.ID, werr)
 					}
 					r.source.Nack(ctx, job, err)
-					return
+					return false
 				}
 				gpuIndex = gpuIdx
 			}
@@ -534,7 +685,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 				// pending confirmation of how the backend interprets
 				// recoverable=true; see the PR for #559 for the deferred-fix note.
 				r.source.Nack(ctx, job, err)
-				return
+				return false
 			}
 			gpuIndex = idx
 		}
@@ -544,7 +695,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		job.Payload["_gpuIndex"] = gpuIndex
 	}
 
-	// Execute handler (stream writer created above, at claim time)
+	// Execute handler (stream writer created at claim time)
 	stream.WriteStart("Job processing started")
 
 	// Per-job execution deadline (aceteam#6000). When the payload carries a
@@ -556,6 +707,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 	// budget present (older backend, or a legitimately unbounded job type like
 	// model download / build / provision) the call stays exactly as before --
 	// synchronous, no timeout, no watchdog goroutine.
+	execStart := time.Now()
 	var result *JobResult
 	var err error
 	if timeout, ok := r.resolveJobTimeout(job); ok {
@@ -584,9 +736,11 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		// wedge (issue #548). Every other failure keeps the existing Nack/retry
 		// semantics.
 		// Accepted tradeoff on abandon: like the orphaned handler goroutine, any
-		// GPU slot this job holds is released when processJob returns (the
+		// GPU slot this job holds is released when executeJob returns (the
 		// deferred gpuTracker.Release), so a still-running orphan and the next job
-		// can briefly share a slot. In practice the tracker schedules routing
+		// can briefly share a slot -- unchanged from before #908, since the
+		// unbounded lane's exec-concurrency 1 admits the next job only after this
+		// one's goroutine returns. In practice the tracker schedules routing
 		// fairness rather than exclusive CUDA ownership (inference is an HTTP call
 		// into the engine container, which batches concurrent requests), and the
 		// orphan self-terminates when its own client/handler timeout fires, so the
@@ -598,7 +752,7 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		// Exactly one terminal event per job id (issue #826). A generic failure
 		// that will be retried (Nack path, another attempt still within budget)
 		// must NOT publish a terminal "error" here -- if the retry then
-		// succeeds, processJob reaches the success path below and publishes an
+		// succeeds, executeJob reaches the success path below and publishes an
 		// "end" on the SAME stream:v1:{jobId}, so publishing here too would
 		// double-report (error, then end) for a job that ultimately succeeded.
 		// A deadline-exceeded abandon is always terminal (Fail, never retried
@@ -620,11 +774,11 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 				"deadline_seconds":   deadlineErr.timeout.Seconds(),
 				"abandoned_by_agent": true,
 			})
-			return
+			return false
 		}
 
 		r.source.Nack(ctx, job, actualErr)
-		return
+		return false
 	}
 
 	if result != nil && result.Status == JobStatusRetry {
@@ -636,39 +790,115 @@ func (r *Runner) processJob(ctx context.Context, job *Job) {
 		// non-final attempt. SERVICE_START (routed through LegacyHandlerAdapter)
 		// never returns JobStatusRetry, so this branch does not affect it.
 		r.source.Nack(ctx, job, result.Error)
-		return
+		return false
 	}
 
-	// Success
-	jobOK = true
+	// Success. Attach per-request latency metrics for the inference lane only
+	// (aceteam#8254 §3c) -- tokens_per_second is measured against EXECUTION
+	// time (endTime-execStart), never total (which includes lane queue wait),
+	// so throughput does not silently under-report on a queued node.
+	if emitLatency {
+		result = r.attachLatencyMetrics(result, queueWaitMs, startTime, execStart, endTime)
+	}
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
+	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
+	return true
+}
+
+// finishSuccess is the ONE implementation of the success terminal tail: usage
+// record, the stream:v1:{jobId} terminal "end" publish (issue #559 -- the entire
+// contract the streaming dispatch path waits on), and the source Ack. Factored
+// out of executeJob so the inference queue-wait-exceeded path (finishQueueWait-
+// Exceeded) reuses the exact same terminal-publish-then-Ack sequence rather than
+// duplicating it -- duplicating it is how a "queued" job would end up Acked with
+// no terminal event, reintroducing the #559 bug this design exists to avoid.
+func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWriter, result *JobResult, startTime, endTime time.Time) {
 	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
 	var output map[string]any
 	if result != nil {
 		output = result.Output
 	}
-	// This publish is the entire contract for the streaming dispatch path
-	// (issue #559): the backend subscribes to stream:v1:{jobId} BEFORE
-	// dispatch and waits on this terminal event. Previously the error was
-	// discarded, so ANY publish failure here was invisible: no log line, no
-	// retry, no signal that the node's terminal event never reached the
-	// backend -- whatever caused a given drop, this path could not have
-	// reported it. It is now at least observable in the node log.
 	if werr := stream.WriteEnd(output); werr != nil {
 		r.log("warning", "Failed to publish terminal end event for job %s: %v", job.ID, werr)
 	}
 	r.source.Ack(ctx, job)
 }
 
-// willRetry reports whether processJob's generic-failure Nack (issue #826)
+// finishQueueWaitExceeded handles an inference job that never got an execution
+// slot within the queue-wait budget (aceteam#8254 §3a/§3b). It synthesizes the
+// EXISTING model_warming success contract (LLMInferenceHandler.warming's shape),
+// which the platform already retries after retry_after seconds -- so this needs
+// zero backend change and, crucially, is NOT a Nack: it removes the job from the
+// PEL via the normal success terminal (finishSuccess) instead of leaving it
+// unacked with no terminal event. queueStart is when the job was admitted (its
+// whole in-lane life has been queue wait). Returns true (a warming answer is a
+// clean, Acked success from the node's bookkeeping perspective).
+func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream StreamWriter, queueStart time.Time) bool {
+	model, _ := job.Payload["model"].(string)
+	now := time.Now()
+	queueWaitMs := now.Sub(queueStart).Milliseconds()
+	r.log("info", "Job %s exceeded the inference queue-wait budget (%s); returning model_warming backpressure signal",
+		job.ID, r.inferenceQueueWait)
+	output := map[string]any{
+		"status":        "model_warming",
+		"model":         model,
+		"eta_seconds":   0,
+		"retry_after":   warmingRetryAfter,
+		"warming_for":   "queue",
+		"queue_wait_ms": queueWaitMs,
+		"total_ms":      queueWaitMs,
+	}
+	result := &JobResult{Status: JobStatusSuccess, Output: output}
+	r.finishSuccess(ctx, job, stream, result, queueStart, now)
+	return true
+}
+
+// attachLatencyMetrics adds per-request timing to an inference job's output
+// (aceteam#8254 §3c): total_ms (claim -> terminal, so total_ms - queue_wait_ms
+// is execution time), queue_wait_ms (lane admit -> exec slot), and
+// tokens_per_second computed from EXECUTION time only. Purely additive to the
+// existing JobResult.Output map; no contract change.
+func (r *Runner) attachLatencyMetrics(result *JobResult, queueWaitMs int64, startTime, execStart, endTime time.Time) *JobResult {
+	if result == nil {
+		result = &JobResult{Status: JobStatusSuccess}
+	}
+	if result.Output == nil {
+		result.Output = map[string]any{}
+	}
+	result.Output["queue_wait_ms"] = queueWaitMs
+	result.Output["total_ms"] = endTime.Sub(startTime).Milliseconds()
+	if execMs := endTime.Sub(execStart).Milliseconds(); execMs > 0 {
+		if completion := intFromOutput(result.Output, "_usage_completion_tokens"); completion > 0 {
+			result.Output["tokens_per_second"] = float64(completion) / (float64(execMs) / 1000.0)
+		}
+	}
+	return result
+}
+
+// LaneSnapshots returns the current activity of this runner's execution lanes
+// for the heartbeat (citadel-cli#908 §4). Nil when no lanes have any relevant
+// state to report is not enforced here -- callers project onto omitempty. The
+// order is stable: unbounded first, then inference.
+func (r *Runner) LaneSnapshots() []LaneSnapshot {
+	var out []LaneSnapshot
+	if r.unboundedLane != nil {
+		out = append(out, r.unboundedLane.snapshot())
+	}
+	if r.inferenceLane != nil {
+		out = append(out, r.inferenceLane.snapshot())
+	}
+	return out
+}
+
+// willRetry reports whether executeJob's generic-failure Nack (issue #826)
 // will actually be redelivered to a handler again, so the pre-Nack terminal
-// "error" publish in processJob can be skipped for a job that has not yet
+// "error" publish in executeJob can be skipped for a job that has not yet
 // exhausted its attempts.
 //
 // The signal is job.Metadata.Attempts/MaxAttempts, populated ONLY by
 // RedisSource (internal/worker/redis_source.go's nextSingle/nextMulti) from
 // the real per-message Redis delivery count -- the same count RedisSource
-// itself uses to decide whether to hand the job to processJob at all versus
+// itself uses to decide whether to hand the job to executeJob at all versus
 // silently moving it straight to the DLQ. Attempts is this dispatch's
 // delivery count (1-indexed, matching Redis XPENDING's RetryCount): a further
 // attempt will be dispatched iff the NEXT delivery count (Attempts+1) is

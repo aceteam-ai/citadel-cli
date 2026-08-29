@@ -357,6 +357,32 @@ func TestSwapShapeParity(t *testing.T) {
 			reflect.TypeOf(reconcile.HealthState{}),
 			reflect.TypeOf(status.ReconcileHealth{}))
 	})
+	t.Run("LaneSnapshot/LaneActivity", func(t *testing.T) {
+		assertFieldsMatch(t,
+			reflect.TypeOf(worker.LaneSnapshot{}),
+			reflect.TypeOf(status.LaneActivity{}))
+	})
+}
+
+// TestLaneActivityFrom pins the worker.LaneSnapshot -> status.LaneActivity
+// projection (citadel-cli#908), mirroring swapStatsFrom/reservationsFrom.
+func TestLaneActivityFrom(t *testing.T) {
+	if got := laneActivityFrom(nil); got != nil {
+		t.Errorf("laneActivityFrom(nil) = %v, want nil", got)
+	}
+	since := time.Now().Add(-2 * time.Minute)
+	in := []worker.LaneSnapshot{
+		{Lane: "unbounded", Queued: 3, Executing: 1, ExecCapacity: 1, BusySince: &since},
+		{Lane: "inference", Queued: 0, Executing: 2, ExecCapacity: 4},
+	}
+	got := laneActivityFrom(in)
+	want := []status.LaneActivity{
+		{Lane: "unbounded", Queued: 3, Executing: 1, ExecCapacity: 1, BusySince: &since},
+		{Lane: "inference", Queued: 0, Executing: 2, ExecCapacity: 4},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("laneActivityFrom(%+v) = %+v, want %+v", in, got, want)
+	}
 }
 
 // TestReconcileHealthFrom pins the hand-maintained projection from

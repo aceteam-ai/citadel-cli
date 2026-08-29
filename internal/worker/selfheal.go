@@ -177,22 +177,25 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 		}
 	}
 
-	// STUCK: something has occupied the loop far past any legitimate budget.
+	// STUCK: a handler has occupied an execution slot far past any legitimate
+	// budget.
 	//
-	// Deliberately reads OldestInFlightAt, not LastJobAt (citadel-cli#489
-	// review): LastJobAt is overwritten by EVERY job that starts, including a
-	// short one that starts WHILE a longer job is still running. On a
-	// maxConcurrency=1 node with the #489 long-session async lane, a wedged
-	// MEETING_JOIN can sit in_flight for hours while a steady stream of
-	// ordinary SHELL_COMMAND jobs completes beside it on the sequential lane
-	// -- each one would reset LastJobAt, so a STUCK ceiling measured against
-	// it would never trip for the wedged meeting as long as short jobs kept
-	// arriving. OldestInFlightAt instead marks when the current in-flight
-	// streak began and is untouched by jobs that start after it, so it
-	// correctly reflects how long SOMETHING (not necessarily the most
-	// recently started job) has been continuously running.
-	if snap.InFlight > 0 && m.stuckTimeout > 0 && snap.OldestInFlightAt != nil {
-		if held := now.Sub(*snap.OldestInFlightAt); held > m.stuckTimeout {
+	// Reads OldestExecutingAt and gates on Executing>0, NOT InFlight /
+	// OldestInFlightAt (citadel-cli#908, extending the #489-review reasoning).
+	// Two independent reasons this must measure EXECUTING, not merely in-flight:
+	//   1. Like #489's LastJobAt problem, OldestInFlightAt would be reset by a
+	//      short job only if it were the sole in-flight job -- but it is not
+	//      perturbed by concurrent jobs, so that half is already handled.
+	//   2. With claim/execute decoupling, a job can be legitimately QUEUED for
+	//      hours on the general lane (exec-concurrency 1) behind a large model
+	//      pull. Such a job is in_flight the whole time but is NOT executing --
+	//      nothing is wedged, it is waiting its turn. Measuring in-flight would
+	//      restart the node for a perfectly healthy backlog. OldestExecutingAt
+	//      marks when the current EXECUTING streak began and is nil while every
+	//      in-flight job is still queued, so only a handler that has genuinely
+	//      run past the ceiling trips this.
+	if snap.Executing > 0 && m.stuckTimeout > 0 && snap.OldestExecutingAt != nil {
+		if held := now.Sub(*snap.OldestExecutingAt); held > m.stuckTimeout {
 			return "job stuck in handler for " + held.Truncate(time.Second).String() + " (exceeds self-heal ceiling)", true
 		}
 	}
