@@ -472,6 +472,54 @@ func TestAcquireMeetingProfileLock_ReleaseIsIdempotent(t *testing.T) {
 	release2()
 }
 
+// TestMeetingBrowser_StartAcquiresProfileLockFirst is the citadel-cli#896
+// regression test for the acquire-side wiring itself: unlike
+// TestMeetingBrowser_CloseReleasesProfileLock below (which hand-constructs a
+// MeetingBrowser with a pre-set profileLockRelease and so would stay green
+// even if a future refactor dropped the acquireMeetingProfileLock call from
+// Start()), this test pre-holds the profile lock and then calls the REAL
+// Start() -- proving the acquire call is actually still there and still runs
+// first. It relies on Start()'s ordering (profile lock acquired before
+// findChromium/preparePersistentProfileDir/Xvfb/Chrome -- see the comment in
+// Start()) to stay hermetic: no Chromium/Xvfb binary is required, because a
+// locked profile must make Start() return before any of that setup work is
+// even attempted. If the acquire call were ever removed or reordered after
+// findChromium, this test would start failing (or, worse, would slow down
+// or need Xvfb/Chrome -- an equally loud signal something regressed).
+func TestMeetingBrowser_StartAcquiresProfileLockFirst(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	// Simulate a first, still-live meeting holding this profile.
+	release, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("pre-acquire: unexpected error: %v", err)
+	}
+	defer release()
+
+	br := NewMeetingBrowser("citadel_meeting_gotest", dir)
+	err = br.Start()
+	if err == nil {
+		t.Fatal("expected Start() to fail fast against an already-locked profile dir, got nil error")
+	}
+	if !strings.Contains(err.Error(), "already in use") {
+		t.Errorf("expected the profile-lock 'already in use' error, got: %v", err)
+	}
+
+	// Start() must not have gotten far enough to do ANY setup work: no
+	// Chrome/Xvfb process was assigned, and the profile dir itself was never
+	// created -- proving the lock check ran before preparePersistentProfileDir's
+	// mkdir, i.e. genuinely first, not merely before the Chrome/Xvfb exec.
+	if br.cmd != nil {
+		t.Error("Start() must not have started a Chrome process")
+	}
+	if br.xvfb != nil {
+		t.Error("Start() must not have started an Xvfb process")
+	}
+	if _, statErr := os.Stat(dir); statErr == nil {
+		t.Error("Start() must not have created the profile dir before failing the lock check")
+	}
+}
+
 // TestMeetingBrowser_CloseReleasesProfileLock pins the MeetingBrowser-level
 // wiring (not just the standalone acquireMeetingProfileLock seam above):
 // closeLocked() must release whatever lock Start() attached to

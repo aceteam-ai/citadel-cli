@@ -53,14 +53,20 @@ type WorkerState struct {
 	oldestInFlightUnixNano int64
 	// inFlightMu serializes the inFlight increment/decrement against the
 	// conditional oldestInFlightUnixNano store that accompanies a 0<->non-zero
-	// transition. inFlight itself stays a plain atomic (readers like Snapshot
-	// use atomic.LoadInt64 with no lock), so this mutex exists ONLY to make
-	// "bump inFlight, then maybe touch oldestInFlightUnixNano" one atomic
-	// transaction with respect to OTHER concurrent transitions -- without it,
-	// a decrement-to-zero and a separate increment-to-one racing on two
-	// different goroutines could apply their oldestInFlightUnixNano stores out
-	// of order (the decrement's zero-out landing AFTER the new streak's
-	// stamp), silently erasing a legitimate in-flight start time.
+	// transition -- without it, a decrement-to-zero and a separate
+	// increment-to-one racing on two different goroutines could apply their
+	// oldestInFlightUnixNano stores out of order (the decrement's zero-out
+	// landing AFTER the new streak's stamp), silently erasing a legitimate
+	// in-flight start time. inFlight and oldestInFlightUnixNano both stay
+	// plain atomics internally (writers here still use AddInt64/StoreInt64
+	// under the lock, readers use LoadInt64), but citadel-cli#896 hardened
+	// Snapshot() to take this SAME mutex around its own paired read of the
+	// two fields too -- an independent lock-free read of each atomic could
+	// land between this critical section's Add and its conditional Store and
+	// observe a torn pair (e.g. InFlight==1 with oldestInFlightUnixNano still
+	// 0). See Snapshot() for the read side and
+	// TestWorkerState_SnapshotInFlightPairingIsConsistent for the pinned
+	// invariant.
 	inFlightMu sync.Mutex
 	// lastConsumeStatus is the HTTP status of the most recent consume call
 	// (API mode). 0 means "never polled / unknown". This is THE signal that
@@ -91,7 +97,8 @@ type WorkerState struct {
 	oldestExecutingUnixNano int64
 	// executingMu serializes the executing increment/decrement against the
 	// conditional oldestExecutingUnixNano stamp, for the identical reason
-	// inFlightMu exists for inFlight/oldestInFlightUnixNano above -- kept
+	// inFlightMu exists for inFlight/oldestInFlightUnixNano above (including
+	// the citadel-cli#896 Snapshot()-side hardening noted there) -- kept
 	// separate so the two brackets (received-at-claim, executing-at-dispatch)
 	// never contend with each other.
 	executingMu sync.Mutex
@@ -309,10 +316,39 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 	if p := s.lastConsumeErr.Load(); p != nil {
 		snap.LastConsumeError = *p
 	}
+	// InFlight/OldestInFlightAt and Executing/OldestExecutingAt are each
+	// written together, under inFlightMu/executingMu, by
+	// RecordJobReceived/RecordJobDone and RecordJobExecuting/
+	// RecordJobExecuteDone respectively (see those methods and the field
+	// comments above) -- but each pair used to be read here as two
+	// INDEPENDENT lock-free atomic loads. That let a snapshot land between a
+	// writer's count bump and its conditional timestamp store/clear and
+	// observe a torn pair (e.g. Executing==1 with OldestExecutingAt==nil)
+	// (citadel-cli#896 follow-up to #489/#908's review). Harmless in
+	// practice today for the pair the self-heal STUCK check actually reads
+	// (`Executing>0 && OldestExecutingAt!=nil`, selfheal.go, since #908) --
+	// a torn read there just skips one 30s tick against a multi-hour ceiling
+	// -- but reading each pair under the SAME mutex its writers use removes
+	// the window entirely rather than relying on that gating to keep it
+	// harmless, and OldestInFlightAt is surfaced on the heartbeat directly
+	// (no internal gating today), so a torn InFlight/OldestInFlightAt read
+	// had no such safety net at all.
+	// TestWorkerState_SnapshotInFlightPairingIsConsistent pins the resulting
+	// invariant (InFlight>0 <=> OldestInFlightAt!=nil, and the Executing
+	// analogue) under concurrent writers.
+	s.inFlightMu.Lock()
 	snap.InFlight = atomic.LoadInt64(&s.inFlight)
+	oldestInFlightNs := atomic.LoadInt64(&s.oldestInFlightUnixNano)
+	s.inFlightMu.Unlock()
+
+	s.executingMu.Lock()
 	snap.Executing = atomic.LoadInt64(&s.executing)
-	// Queued is derived from two independently-loaded atomics, so clamp at 0: a
-	// momentary skew between the loads must never surface a negative count.
+	oldestExecutingNs := atomic.LoadInt64(&s.oldestExecutingUnixNano)
+	s.executingMu.Unlock()
+
+	// Queued is derived from the two counts above, so clamp at 0: a momentary
+	// skew between the (now individually consistent) inFlight/executing pairs
+	// must never surface a negative count.
 	snap.Queued = snap.InFlight - snap.Executing
 	if snap.Queued < 0 {
 		snap.Queued = 0
@@ -329,12 +365,12 @@ func (s *WorkerState) Snapshot() WorkerSnapshot {
 		t := time.Unix(0, ns)
 		snap.LastJobAt = &t
 	}
-	if ns := atomic.LoadInt64(&s.oldestInFlightUnixNano); ns > 0 {
-		t := time.Unix(0, ns)
+	if oldestInFlightNs > 0 {
+		t := time.Unix(0, oldestInFlightNs)
 		snap.OldestInFlightAt = &t
 	}
-	if ns := atomic.LoadInt64(&s.oldestExecutingUnixNano); ns > 0 {
-		t := time.Unix(0, ns)
+	if oldestExecutingNs > 0 {
+		t := time.Unix(0, oldestExecutingNs)
 		snap.OldestExecutingAt = &t
 	}
 	return snap

@@ -486,6 +486,32 @@ func (b *MeetingBrowser) Start() error {
 		return fmt.Errorf("meeting browser has no audio sink; construct with NewMeetingBrowser(sinkName)")
 	}
 
+	// Claim the process-wide guard on this profile dir BEFORE doing ANY other
+	// setup work -- including findChromium and preparePersistentProfileDir's
+	// mkdir/chmod, not just Xvfb/Chrome -- so a collision fails fast without
+	// touching the filesystem or spinning up a process first just to tear it
+	// down (issue #895 review, hardened by #896: this ordering is what makes
+	// the failure path hermetically testable without a real Chrome/Xvfb
+	// install -- see TestMeetingBrowser_StartAcquiresProfileLockFirst).
+	// resolveMeetingProfileDir is the same pure resolution
+	// preparePersistentProfileDir uses internally (override, then
+	// EnvMeetingProfileDir, then the ConfigDir() default), so both calls agree
+	// on the directory the lock is keyed by. release is unlocked by the
+	// deferred cleanup below on every early return; ownership transfers to
+	// b.profileLockRelease (released by closeLocked) only once the browser
+	// process itself has actually started.
+	profileDirForLock := resolveMeetingProfileDir(b.profileDirOverride)
+	release, err := acquireMeetingProfileLock(profileDirForLock)
+	if err != nil {
+		return err
+	}
+	releasePending := release
+	defer func() {
+		if releasePending != nil {
+			releasePending()
+		}
+	}()
+
 	chrome, err := findChromium()
 	if err != nil {
 		return err
@@ -500,23 +526,6 @@ func (b *MeetingBrowser) Start() error {
 	if err != nil {
 		return err
 	}
-
-	// Claim the process-wide guard on this profile dir BEFORE doing any other
-	// setup work, so a collision fails fast without spinning up Xvfb/Chrome
-	// first just to tear it down (issue #895 review). release is unlocked by
-	// the deferred cleanup below on every early return; ownership transfers to
-	// b.profileLockRelease (released by closeLocked) only once the browser
-	// process itself has actually started.
-	release, err := acquireMeetingProfileLock(profileDir)
-	if err != nil {
-		return err
-	}
-	releasePending := release
-	defer func() {
-		if releasePending != nil {
-			releasePending()
-		}
-	}()
 
 	debugPort, err := findFreeDebugPort()
 	if err != nil {
