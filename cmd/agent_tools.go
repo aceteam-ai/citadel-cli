@@ -21,8 +21,14 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
+
+// loadUpdateState is a seam over update.LoadState so agentNodeInfo's
+// split-brain check (issue #922) can be exercised hermetically in tests
+// without touching this host's real ~/citadel-node/update/state.json.
+var loadUpdateState = update.LoadState
 
 // agentProviderDeps carries everything buildAgentProviders needs from runWork.
 type agentProviderDeps struct {
@@ -216,6 +222,19 @@ func agentNodeInfo(nodeName, headscaleNodeID, orgID string, startedAt time.Time)
 	}
 	if hn, err := os.Hostname(); err == nil {
 		info["hostname"] = hn
+	}
+	// Split-brain detection (issue #922): the autoupdater persists
+	// state.CurrentVersion to state.json right after ApplyUpdate succeeds,
+	// BEFORE Restart() is attempted (internal/update/autoupdater.go). If
+	// ApplyUpdate succeeded but Restart() failed -- or an external installer
+	// swapped the binary without restarting -- state.json's CurrentVersion is
+	// the STAGED/on-disk version while Version (above) is still the RUNNING
+	// one. Surface the mismatch so the platform can prompt a restart; a
+	// missing/corrupt state.json (no update ever recorded) or an equal
+	// version adds neither field, leaving the payload unchanged from today.
+	if st, err := loadUpdateState(); err == nil && st.CurrentVersion != "" && st.CurrentVersion != Version {
+		info["pending_version"] = st.CurrentVersion
+		info["restart_required"] = true
 	}
 	if st, err := network.GetGlobalStatus(ctx); err == nil {
 		info["connected"] = st.Connected
