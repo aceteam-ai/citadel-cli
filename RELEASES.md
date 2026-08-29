@@ -2000,3 +2000,21 @@ Auto-generated log of every release.
   - docs: design for node execution model — claim/execute decoupling + inference slot queue (#908/#8254) (#916)
 
 
+---
+
+## v2.129.0 — 2026-08-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 14 |
+| Lines added | +1807 |
+
+**Changes:**
+
+  - meeting bot: orphan reaper for leaked Chrome/Xvfb/audio-sink (#488) (#925)
+  - worker/meeting: harden Start() acquire test + Snapshot() torn read (#896) (#924)
+  - citadel node-info: surface staged-but-not-running update (#922) (#923)
+  - fix(diffusers): default preflight path warns instead of false-refusing (#913) (#921)
+
+
