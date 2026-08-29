@@ -94,6 +94,17 @@ func newHostMedia(meetingID, profileDir, wavPath string) *hostMedia {
 }
 
 func (m *hostMedia) Start() (meetingBrowser, error) {
+	// Reap any `citadel_meeting_*` null sink orphaned by a SIGKILLed/crashed
+	// prior process (issue #488) BEFORE creating THIS meeting's own sink
+	// below. Ordering is load-bearing: ReapOrphanedMeetingSinks only ever
+	// unloads sinks that already exist at call time, so calling it here --
+	// strictly before rec.LoadSink() creates the current sink -- guarantees
+	// the sweep can never unload the sink this very Start() is about to load.
+	// Reversing the order (sweeping after LoadSink) would unload the current
+	// meeting's own just-created sink, since nothing yet distinguishes it
+	// from a stale one.
+	platform.ReapOrphanedMeetingSinks(m.profileDir)
+
 	// Create the per-meeting null sink FIRST so the browser's PULSE_SINK target
 	// exists at launch.
 	rec := platform.NewNullSinkRecorder(m.meetingID)

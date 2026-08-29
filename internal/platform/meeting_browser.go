@@ -512,6 +512,24 @@ func (b *MeetingBrowser) Start() error {
 		}
 	}()
 
+	// Reap a Chrome + Xvfb pair leaked by a SIGKILLed/crashed prior process
+	// (issue #488), now that the profile-dir lock above is held: no OTHER
+	// live Start() (in this process OR another) can be mid-launch against
+	// the same profile concurrently, so a same-process second meeting can
+	// never reach this reap while its own chrome/xvfb are still live (see
+	// meetingOwnerAlive's doc comment for why that matters -- it does NOT
+	// special-case os.Getpid()). Deliberately placed here, right after the
+	// lock and before findChromium/preparePersistentProfileDir (citadel#924
+	// moved the lock to be the very first thing Start() does; the reap
+	// follows it for the same "before touching anything else" reason). A
+	// stale --user-data-dir lock or dangling Xvfb display from a genuinely
+	// DEAD prior owner is cleared here, before any filesystem/process setup
+	// below. profileDirForLock and preparePersistentProfileDir's profileDir
+	// resolve to the same directory (see the lock-acquisition comment
+	// above), so using it here is correct even though preparePersistentProfileDir
+	// has not run yet.
+	reapMeetingProcessOrphans(profileDirForLock)
+
 	chrome, err := findChromium()
 	if err != nil {
 		return err
@@ -570,6 +588,13 @@ func (b *MeetingBrowser) Start() error {
 	// path below), not this function's own deferred cleanup.
 	b.profileLockRelease = release
 	releasePending = nil
+
+	// Record the owner + child PIDs (issue #488) right after a successful
+	// spawn, mirroring cobrowse's writeSessionPidfile placement: a future
+	// process's reapMeetingProcessOrphans can then reclaim this browser +
+	// Xvfb if THIS process is SIGKILLed before graceful teardown, even if
+	// that happens before CDP ever comes up. Best-effort (logged, not fatal).
+	writeMeetingPidfile(profileDir, os.Getpid(), cmd.Process.Pid, xvfb.Process.Pid)
 
 	// Reap each child so a crash is observable and no zombie is left. Stop/Close
 	// signal the kill and wait on these channels; they never call Wait directly.
@@ -681,6 +706,13 @@ func (b *MeetingBrowser) closeLocked() error {
 	b.xvfb = nil
 	b.xvfbExited = nil
 	b.display = ""
+
+	// Delete ONLY the pidfile (issue #488), never the profile directory
+	// itself (see below): a graceful teardown must not look like an orphan to
+	// the NEXT Start()'s reapMeetingProcessOrphans, which would otherwise log
+	// spurious "reap: pid N ... skipping kill" noise (or, worse, chase a
+	// recycled PID) for a browser that already exited cleanly right here.
+	removeMeetingPidfile(b.profileDir)
 
 	// Deliberately NOT removed (issue #5122): b.profileDir is the persistent,
 	// signed-in bot profile, not a throwaway per-run artifact. Deleting it here
