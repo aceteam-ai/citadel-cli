@@ -78,8 +78,26 @@ func meetingPidfilePath(profileDir string) string {
 func writeMeetingPidfile(profileDir string, ownerPID, browserPID, xvfbPID int) {
 	path := meetingPidfilePath(profileDir)
 	content := fmt.Sprintf("%d\n%d\n%d\n", ownerPID, browserPID, xvfbPID)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	// Explicit open+write+Sync+Close (rather than os.WriteFile) so the
+	// content is durably flushed before this call returns: the very next
+	// thing a caller typically does (ReapOrphanedMeetingSinks) spawns a
+	// REAL subprocess (pactl) that reads this same path, and a write not
+	// yet visible across that process boundary would silently defeat the
+	// placeholder's whole purpose.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		log.Printf("[meeting] failed to write pidfile %s: %v", path, err)
+		return
+	}
+	_, writeErr := f.Write([]byte(content))
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil {
+		log.Printf("[meeting] failed to write pidfile %s: %v", path, writeErr)
+	} else if syncErr != nil {
+		log.Printf("[meeting] failed to sync pidfile %s: %v", path, syncErr)
+	} else if closeErr != nil {
+		log.Printf("[meeting] failed to close pidfile %s: %v", path, closeErr)
 	}
 }
 
@@ -139,12 +157,82 @@ func removeMeetingPidfile(profileDir string) {
 // still-running Chrome/Xvfb/sink out from under it. pidAlive(os.Getpid()) is
 // always true, so simply not special-casing it already gives the correct
 // answer: same-process is alive, exactly like any other live PID.
+//
+// KNOWN, ACCEPTED FAIL-SAFE GAP: a citadel worker abandoned by the #548
+// watchdog (a wedged handler goroutine that leaks rather than exits) leaves
+// THIS PROCESS itself alive, so this always reads "owned" for that process's
+// own pidfile -- meaning the abandoning process can never self-reap its own
+// stranded meeting resources; only a subsequent restart (a genuinely new PID)
+// sees a dead owner and reaps. This is the safe direction (a live process's
+// own tracked resources are never torn down out from under it on a guess),
+// but it does mean a watchdog-abandoned meeting's Chrome/Xvfb/sink lingers
+// until that process restarts, not from the next heartbeat tick.
 func meetingOwnerAlive(profileDir string) (ownerPID int, alive bool) {
 	ownerPID, _, _ = readMeetingPidfile(profileDir)
 	if ownerPID <= 0 {
 		return ownerPID, false
 	}
 	return ownerPID, pidAlive(ownerPID)
+}
+
+// MarkMeetingProfileOwned closes the citadel-cli#925 review race: hostMedia.
+// Start() (internal/jobs/meeting_media.go) creates the current meeting's own
+// sink and launches its browser well BEFORE the real pidfile is written (that
+// only happens deep inside MeetingBrowser.Start(), after Chrome actually
+// spawns) -- so a CONCURRENT hostMedia.Start() (another goroutine in this
+// process, or a sibling process sharing this profile dir) that runs its own
+// ReapOrphanedMeetingSinks in that window sees no pidfile at all, reads "no
+// live owner", and unloads the sink this call just loaded (or is about to
+// load). Calling this FIRST -- before the sink sweep and before LoadSink --
+// closes that window: it resolves the persistent profile dir (creating it if
+// this is the very first meeting ever attempted) and, UNLESS the pidfile
+// already shows a live owner, writes a PLACEHOLDER (owner=this process,
+// chrome=0, xvfb=0). The placeholder is enough to make any concurrent
+// meetingOwnerAlive report "owned" -- and is completely inert to
+// reapMeetingProcessOrphans, which early-returns whenever both child PIDs are
+// <=0 -- so it protects the sink without ever risking a bogus kill. The later
+// real writeMeetingPidfile (after Chrome/Xvfb actually launch) overwrites it
+// with the genuine PIDs.
+//
+// wrote reports whether THIS call is the one that wrote the placeholder.
+// When false (an existing live owner was found and left untouched), the
+// caller must NOT clear the pidfile on its own error paths -- it does not
+// own whatever is there. Deliberately does NOT overwrite an existing live
+// owner: doing so unconditionally is exactly what would corrupt a
+// genuinely in-flight launch's real chrome/xvfb PIDs if this call raced
+// AFTER that launch's real pidfile write (e.g. while it is still inside
+// waitForCDPReady) -- narrower than eliminated (the read-then-write here is
+// itself not atomic against a truly simultaneous racer), but this closes
+// the wide, easily-hit window the review reported and does not widen the
+// residual one beyond what already exists for the on-disk pidfile in
+// general (see the package doc comment's cross-process caveat).
+func MarkMeetingProfileOwned(profileDirOverride string) (profileDir string, wrote bool, err error) {
+	profileDir, err = preparePersistentProfileDir(profileDirOverride)
+	if err != nil {
+		return "", false, err
+	}
+	if _, alive := meetingOwnerAlive(profileDir); alive {
+		return profileDir, false, nil
+	}
+	writeMeetingPidfile(profileDir, os.Getpid(), 0, 0)
+	return profileDir, true, nil
+}
+
+// ClearMeetingProfilePlaceholder removes the pidfile ONLY IF it still holds
+// exactly the placeholder shape MarkMeetingProfileOwned writes for THIS
+// process (owner==os.Getpid(), chrome==0, xvfb==0) -- i.e. it was never
+// upgraded to a real pidfile by a successful browser launch, and nothing
+// else has since written something different. Safe to call unconditionally
+// on every hostMedia.Start() error path that follows a wrote==true
+// MarkMeetingProfileOwned: if the browser DID launch (the real chrome/xvfb
+// pidfile has since overwritten this), or MeetingBrowser.closeLocked already
+// removed it (the CDP-not-ready teardown path), this is a harmless no-op --
+// it will never delete state it did not itself create.
+func ClearMeetingProfilePlaceholder(profileDir string) {
+	owner, chrome, xvfb := readMeetingPidfile(profileDir)
+	if owner == os.Getpid() && chrome == 0 && xvfb == 0 {
+		removeMeetingPidfile(profileDir)
+	}
 }
 
 // reapMeetingProcessOrphans reclaims a leaked Chrome + Xvfb pair left behind
@@ -257,12 +345,59 @@ func orphanSinkModuleIDs(pactlOutput string) []string {
 	return ids
 }
 
+// meetingSinkSweepBlocked reports whether ReapOrphanedMeetingSinks should
+// skip sweeping because the pidfile shows a GENUINELY in-use owner -- either
+// a different, live process, or THIS process with a REAL (already-launched:
+// chrome!=0 or xvfb!=0) pidfile.
+//
+// Deliberately does NOT block on THIS process's own PLACEHOLDER (self-owned,
+// chrome==0 && xvfb==0, written by MarkMeetingProfileOwned). hostMedia.Start()
+// calls MarkMeetingProfileOwned immediately before this sweep (citadel-cli#925
+// review), so in the overwhelmingly common sequential case the pidfile
+// ALWAYS shows "owned by me" by the time this runs -- if that alone blocked
+// the sweep, the sweep would never run at all, defeating its entire purpose
+// (a placeholder cannot own a sink; nothing has been loaded yet). A REAL
+// pidfile (non-zero chrome/xvfb), by contrast, means a browser has actually
+// launched against this profile -- possibly a still-live, already-running
+// meeting -- and IS a genuine reason to leave every currently-listed sink
+// alone, exactly as meetingOwnerAlive's original "a live owner might own one
+// of these" reasoning intends.
+//
+// RESIDUAL, ACCEPTED GAP (same character as the package's other cross-
+// process pidfile caveats): two genuinely CONCURRENT hostMedia.Start() calls
+// for the SAME profile in the SAME process -- a real scenario, since
+// MEETING_JOIN runs on its own dedicated async lane (see CLAUDE.md's "Long-
+// session and GPU-bound jobs get a dedicated always-async lane" section, so
+// two overlapping meetings really can race here) -- are NOT fully
+// distinguishable by PID alone: a second goroutine's own MarkMeetingProfileOwned
+// sees the SAME os.Getpid() the first goroutine's placeholder (or even its
+// real pidfile, mid-write) carries, so this check alone cannot tell "my own
+// upcoming placeholder" from "a sibling goroutine's in-flight one". hostMedia.
+// Start() additionally holds AcquireMeetingProfileSetupLock (a real,
+// goroutine-correct mutex, unlike a PID) across mark+sweep+LoadSink to narrow
+// this specific window to the brief gap between releasing that lock and
+// MeetingBrowser.Start() re-acquiring its own -- not literally zero, but
+// several orders of magnitude smaller than the original report's window
+// (which spanned the full sink-load-to-CDP-ready duration). Fully eliminating
+// it needs MeetingBrowser to accept an already-held lock instead of always
+// acquiring its own; deferred as a documented follow-up, not done here.
+func meetingSinkSweepBlocked(profileDir string) bool {
+	owner, chrome, xvfb := readMeetingPidfile(profileDir)
+	if owner <= 0 || !pidAlive(owner) {
+		return false
+	}
+	if owner == os.Getpid() && chrome == 0 && xvfb == 0 {
+		return false // our own not-yet-launched placeholder -- nothing to protect
+	}
+	return true
+}
+
 // ReapOrphanedMeetingSinks unloads every currently-loaded `citadel_meeting_*`
-// null sink, but ONLY when the persistent meeting profile's pidfile shows no
-// live owner -- a live owner means a meeting may legitimately still be using
-// one, and this node's single-profile design means at most one meeting runs
-// at a time, so there is no way to selectively identify "this one is safe"
-// among several without that owner signal.
+// null sink, but ONLY when meetingSinkSweepBlocked reports no genuine in-use
+// owner -- a live owner means a meeting may legitimately still be using one,
+// and this node's single-profile design means at most one meeting runs at a
+// time, so there is no way to selectively identify "this one is safe" among
+// several without that signal.
 //
 // CALLER CONTRACT (load-bearing, see the package doc comment above): this
 // must run BEFORE the caller's own NullSinkRecorder.LoadSink for the CURRENT
@@ -276,7 +411,7 @@ func orphanSinkModuleIDs(pactlOutput string) []string {
 // EnvMeetingProfileDir / the ConfigDir() default.
 func ReapOrphanedMeetingSinks(profileDirOverride string) {
 	profileDir := resolveMeetingProfileDir(profileDirOverride)
-	if _, alive := meetingOwnerAlive(profileDir); alive {
+	if meetingSinkSweepBlocked(profileDir) {
 		return
 	}
 	out, err := pactlListModulesFn()
@@ -289,4 +424,27 @@ func ReapOrphanedMeetingSinks(profileDirOverride string) {
 			log.Printf("[meeting] sink reap: failed to unload orphaned sink module %s: %v", id, err)
 		}
 	}
+}
+
+// AcquireMeetingProfileSetupLock resolves the persistent meeting profile
+// directory and claims the SAME process-wide profile lock
+// MeetingBrowser.Start() uses (TryLock, never blocking) -- but only for
+// hostMedia's SETUP phase (mark-owned + sink-sweep + LoadSink), a distinct,
+// shorter-lived claim on the identical underlying mutex, not a hold spanning
+// the whole browser lifetime. This is a real, goroutine-correct mutex
+// (unlike the pidfile, which only distinguishes by PID and cannot tell two
+// same-process goroutines apart -- see meetingSinkSweepBlocked's doc
+// comment), so holding it here narrows the same-process concurrent-meeting
+// race window that a PID-keyed pidfile alone cannot fully close.
+//
+// The caller MUST release before calling MeetingBrowser.Start() against the
+// same profile, so that call's own acquireMeetingProfileLock succeeds
+// normally instead of finding the mutex already held by its own caller.
+func AcquireMeetingProfileSetupLock(profileDirOverride string) (profileDir string, release func(), err error) {
+	profileDir = resolveMeetingProfileDir(profileDirOverride)
+	release, err = acquireMeetingProfileLock(profileDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("meeting profile busy: %w", err)
+	}
+	return profileDir, release, nil
 }

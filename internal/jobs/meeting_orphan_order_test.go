@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -117,5 +118,108 @@ esac
 		t.Errorf("sink sweep (`pactl list`, index %d) must run BEFORE LoadSink's `pactl load-module` "+
 			"(index %d) -- reversing this order would unload the current meeting's own just-created "+
 			"sink; full invocation log: %v", listIdx, loadIdx, lines)
+	}
+}
+
+// TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep is the regression test
+// for the citadel-cli#925 review's blocking finding: hostMedia.Start() must
+// mark the profile owned (MarkMeetingProfileOwned) BEFORE running the sink
+// sweep (ReapOrphanedMeetingSinks), so a concurrent sweep landing in that
+// exact window sees the profile as owned rather than unloading the
+// live/loading sink.
+//
+// This is verified fully hermetically, in Go, via the injectable package
+// vars hostMedia.Start() calls through (acquireMeetingProfileSetupLockFn,
+// markMeetingProfileOwnedFn, reapOrphanedMeetingSinksFn,
+// clearMeetingProfilePlaceholderFn) -- deliberately NOT via a real pactl
+// subprocess reading a pidfile the parent Go process just wrote: that
+// approach was tried first and found genuinely flaky in this sandboxed
+// environment (a freshly-written file was sometimes not yet visible to a
+// spawned child process, even though every same-process Go read of it
+// succeeded immediately -- verified directly, not merely suspected). An
+// injected fake Go func cannot be affected by any cross-process filesystem-
+// visibility timing, so this test cannot flake for reasons unrelated to the
+// code under test. PATH is additionally isolated to an empty temp dir so
+// the real (unmocked) NullSinkRecorder.LoadSink() call fails immediately
+// and safely (no real pactl/ffmpeg on PATH -> audioStackAvailable() is
+// false), well before ever reaching MeetingBrowser.Start() -- no real
+// process is spawned by this test at all.
+//
+// This test FAILS against the pre-fix hostMedia.Start() (sink sweep called
+// with no prior MarkMeetingProfileOwned): "sweep" appears in the recorded
+// call order before "mark", or "mark" is absent entirely.
+func TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep(t *testing.T) {
+	var calls []string
+
+	prevAcquire := acquireMeetingProfileSetupLockFn
+	acquireMeetingProfileSetupLockFn = func(profileDirOverride string) (string, func(), error) {
+		calls = append(calls, "acquire")
+		return "fake-profile-dir", func() { calls = append(calls, "release") }, nil
+	}
+	t.Cleanup(func() { acquireMeetingProfileSetupLockFn = prevAcquire })
+
+	prevMark := markMeetingProfileOwnedFn
+	markMeetingProfileOwnedFn = func(profileDirOverride string) (string, bool, error) {
+		calls = append(calls, "mark")
+		return profileDirOverride, true, nil
+	}
+	t.Cleanup(func() { markMeetingProfileOwnedFn = prevMark })
+
+	prevClear := clearMeetingProfilePlaceholderFn
+	clearMeetingProfilePlaceholderFn = func(profileDir string) {
+		calls = append(calls, "clear")
+	}
+	t.Cleanup(func() { clearMeetingProfilePlaceholderFn = prevClear })
+
+	prevSweep := reapOrphanedMeetingSinksFn
+	reapOrphanedMeetingSinksFn = func(profileDirOverride string) {
+		calls = append(calls, "sweep")
+	}
+	t.Cleanup(func() { reapOrphanedMeetingSinksFn = prevSweep })
+
+	// Isolate PATH to an empty dir so the real (unmocked) rec.LoadSink()
+	// call fails immediately and safely -- no real pactl/ffmpeg is ever
+	// resolved or spawned, regardless of what this host has installed.
+	t.Setenv("PATH", t.TempDir())
+
+	wavPath := filepath.Join(t.TempDir(), "out.wav")
+	m := newHostMedia("owned-before-sweep-meeting", "unused-profile-dir", wavPath)
+
+	// Expected to fail: audioStackAvailable() is false with no pactl/ffmpeg
+	// on the isolated PATH, so rec.LoadSink() errors before anything else
+	// (MeetingBrowser.Start, Chrome, Xvfb) is ever touched.
+	if _, err := m.Start(); err == nil {
+		t.Fatal("Start() unexpectedly succeeded with no pactl/ffmpeg on PATH")
+	} else if !strings.Contains(err.Error(), "load meeting audio sink") {
+		t.Fatalf("Start() failed for an unexpected reason (want a LoadSink error): %v", err)
+	}
+
+	markIdx, sweepIdx := -1, -1
+	for i, c := range calls {
+		switch c {
+		case "mark":
+			if markIdx == -1 {
+				markIdx = i
+			}
+		case "sweep":
+			if sweepIdx == -1 {
+				sweepIdx = i
+			}
+		}
+	}
+	if markIdx == -1 {
+		t.Fatalf("hostMedia.Start() never called MarkMeetingProfileOwned; call order: %v", calls)
+	}
+	if sweepIdx == -1 {
+		t.Fatalf("hostMedia.Start() never called ReapOrphanedMeetingSinks; call order: %v", calls)
+	}
+	if markIdx >= sweepIdx {
+		t.Errorf("MarkMeetingProfileOwned (index %d) must run BEFORE ReapOrphanedMeetingSinks "+
+			"(index %d) -- reversing this order reopens the citadel-cli#925 race; full call order: %v",
+			markIdx, sweepIdx, calls)
+	}
+	wantOrder := []string{"acquire", "mark", "sweep", "clear", "release"}
+	if !reflect.DeepEqual(calls, wantOrder) {
+		t.Errorf("full call order = %v, want %v", calls, wantOrder)
 	}
 }

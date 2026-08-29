@@ -32,6 +32,21 @@ import (
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
+// The four platform calls hostMedia.Start() drives for the citadel-cli#925
+// fix are package vars (mirroring the injectable-seam pattern used
+// throughout internal/platform, e.g. pidKiller/pactlListModulesFn) so a
+// jobs-level test can verify the exact CALL ORDER hermetically, in Go, with
+// no subprocess involved at all -- unlike a real `pactl` binary invoked via
+// PATH, an injected fake here cannot be affected by any cross-process
+// filesystem-visibility timing, so the resulting test cannot flake for
+// reasons unrelated to the code under test.
+var (
+	acquireMeetingProfileSetupLockFn = platform.AcquireMeetingProfileSetupLock
+	markMeetingProfileOwnedFn        = platform.MarkMeetingProfileOwned
+	clearMeetingProfilePlaceholderFn = platform.ClearMeetingProfilePlaceholder
+	reapOrphanedMeetingSinksFn       = platform.ReapOrphanedMeetingSinks
+)
+
 // meetingBrowser is the CDP surface the MEETING_JOIN join + interactive flow
 // drives. Both the in-process *platform.MeetingBrowser and the container-driving
 // *platform.CDPBrowser satisfy it, so the same Meet DOM logic runs against either
@@ -94,6 +109,67 @@ func newHostMedia(meetingID, profileDir, wavPath string) *hostMedia {
 }
 
 func (m *hostMedia) Start() (meetingBrowser, error) {
+	// Claim the SAME process-wide profile lock MeetingBrowser.Start() uses
+	// below, but only for THIS function's setup phase (mark-owned + sink-
+	// sweep + LoadSink) -- a real, goroutine-correct mutex that narrows the
+	// window in which two genuinely concurrent SAME-PROCESS meeting attempts
+	// against this profile (MEETING_JOIN runs on its own dedicated async
+	// lane -- see CLAUDE.md's "Long-session and GPU-bound jobs get a
+	// dedicated always-async lane" -- so two overlapping meetings really can
+	// race here) could interleave their setup steps and have one's sweep
+	// unload the other's just-loaded sink; a PID-keyed pidfile alone cannot
+	// distinguish two goroutines in this SAME process (see
+	// meetingSinkSweepBlocked's doc comment for the precise residual this
+	// still leaves). Released BEFORE calling MeetingBrowser.Start(), so that
+	// call's own (separate, full-launch-lifetime) acquire on the identical
+	// mutex succeeds normally instead of finding it already held.
+	profileDir, releaseSetupLock, err := acquireMeetingProfileSetupLockFn(m.profileDir)
+	if err != nil {
+		return nil, err
+	}
+	setupLockHeld := true
+	defer func() {
+		if setupLockHeld {
+			releaseSetupLock()
+		}
+	}()
+
+	// Mark this profile OWNED by this process BEFORE the sink sweep or
+	// LoadSink runs (citadel-cli#925 review). Root cause: the real pidfile
+	// is only written deep inside MeetingBrowser.Start(), well after Chrome
+	// actually launches -- so there is a real window where THIS meeting has
+	// already called LoadSink (its sink is now live and visible to `pactl
+	// list short modules`) but no pidfile exists yet. A concurrent
+	// hostMedia.Start() (another goroutine in this process, or a sibling
+	// process sharing this same persistent profile) that runs its own
+	// ReapOrphanedMeetingSinks in that window sees "no live owner" and
+	// unloads THIS meeting's sink out from under it -- the browser is left
+	// with PULSE_SINK pointing at a now-gone sink, so ffmpeg silently
+	// records silence. A placeholder pidfile (owner=this process, chrome=0,
+	// xvfb=0) is enough to make any concurrent sweep see this profile as
+	// owned, while being completely inert to reapMeetingProcessOrphans
+	// (which never acts when both child PIDs are <=0). MarkMeetingProfileOwned
+	// refuses to overwrite an existing live owner (protects a genuinely
+	// in-flight launch's real chrome/xvfb PIDs from being clobbered), so
+	// `wrote` tells us whether the placeholder here is actually ours to
+	// clean up.
+	_, wrote, err := markMeetingProfileOwnedFn(profileDir)
+	if err != nil {
+		return nil, fmt.Errorf("mark meeting profile owned: %w", err)
+	}
+	if wrote {
+		// Clears the placeholder ONLY if it is still exactly what we wrote
+		// (ClearMeetingProfilePlaceholder's own compare-before-delete): once
+		// MeetingBrowser.Start() launches successfully it overwrites this
+		// with the real (owner, chrome, xvfb) pidfile, at which point this
+		// defer is a safe no-op -- that real pidfile's lifecycle from there
+		// is closeLocked's job (deletes it on graceful/CDP-fail teardown),
+		// not this one's. This defer exists only for the window BEFORE any
+		// browser ever launches: rec.LoadSink() failing below, or
+		// br.Start() failing before it ever writes its own real pidfile.
+		defer clearMeetingProfilePlaceholderFn(profileDir)
+	}
+
 	// Reap any `citadel_meeting_*` null sink orphaned by a SIGKILLed/crashed
 	// prior process (issue #488) BEFORE creating THIS meeting's own sink
 	// below. Ordering is load-bearing: ReapOrphanedMeetingSinks only ever
@@ -102,8 +178,11 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	// the sweep can never unload the sink this very Start() is about to load.
 	// Reversing the order (sweeping after LoadSink) would unload the current
 	// meeting's own just-created sink, since nothing yet distinguishes it
-	// from a stale one.
-	platform.ReapOrphanedMeetingSinks(m.profileDir)
+	// from a stale one. The placeholder written above additionally protects
+	// against a CONCURRENT caller's sweep landing in this same window (see
+	// MarkMeetingProfileOwned's doc comment) -- this call and that
+	// protection are independent halves of the same fix.
+	reapOrphanedMeetingSinksFn(profileDir)
 
 	// Create the per-meeting null sink FIRST so the browser's PULSE_SINK target
 	// exists at launch.
@@ -113,9 +192,15 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	}
 	m.rec = rec
 
+	// Release the setup lock now, immediately before MeetingBrowser.Start()
+	// claims its own separate, full-launch-lifetime hold on the identical
+	// mutex -- see the acquire comment above for why this must happen here.
+	releaseSetupLock()
+	setupLockHeld = false
+
 	// Launch the sibling browser routed into the sink, reusing the persistent,
 	// signed-in bot Chrome profile (issue #5122).
-	br := platform.NewMeetingBrowser(rec.SinkName(), m.profileDir)
+	br := platform.NewMeetingBrowser(rec.SinkName(), profileDir)
 	if err := br.Start(); err != nil {
 		// Unload the sink we just loaded so a browser-launch failure does not leak it.
 		_, _ = rec.Stop()

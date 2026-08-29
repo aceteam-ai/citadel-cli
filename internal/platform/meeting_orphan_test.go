@@ -314,10 +314,15 @@ func TestReapMeetingProcessOrphans_SkipsSameProcessOwner(t *testing.T) {
 }
 
 // TestReapOrphanedMeetingSinks_SkipsSameProcessOwner is the sink-side
-// analogue: a live sibling meeting in THIS process must keep its sink.
+// analogue: a live sibling meeting in THIS process, with a REAL (already
+// launched -- non-zero chrome/xvfb) pidfile, must keep its sink. Uses a real
+// pidfile shape deliberately, not a placeholder: see
+// meetingSinkSweepBlocked's doc comment for why a same-process PLACEHOLDER
+// (chrome==0 && xvfb==0) is, by contrast, NOT a block -- it cannot own a
+// sink, since nothing has launched yet.
 func TestReapOrphanedMeetingSinks_SkipsSameProcessOwner(t *testing.T) {
 	dir := t.TempDir()
-	writeMeetingPidfile(dir, os.Getpid(), 0, 0)
+	writeMeetingPidfile(dir, os.Getpid(), 606001, 606002)
 
 	listCalled := false
 	prevList := pactlListModulesFn
@@ -338,10 +343,42 @@ func TestReapOrphanedMeetingSinks_SkipsSameProcessOwner(t *testing.T) {
 	ReapOrphanedMeetingSinks(dir)
 
 	if listCalled {
-		t.Error("sink sweep must not list pactl modules at all for a same-process (sibling meeting) owner")
+		t.Error("sink sweep must not list pactl modules at all for a same-process (sibling meeting) real owner")
 	}
 	if len(unloaded) != 0 {
 		t.Errorf("sink sweep must not unload a same-process sibling meeting's sink, unloaded %v", unloaded)
+	}
+}
+
+// TestReapOrphanedMeetingSinks_SameProcessPlaceholderDoesNotBlock is the
+// deliberate CONTRAST to the test above: a same-process PLACEHOLDER
+// (chrome==0 && xvfb==0 -- what MarkMeetingProfileOwned writes BEFORE any
+// browser launches) must NOT block the sweep, or the sweep would never run
+// at all for the ordinary sequential case (hostMedia.Start() always marks
+// itself owned immediately before calling ReapOrphanedMeetingSinks). Pins
+// the exact distinction meetingSinkSweepBlocked's doc comment describes.
+func TestReapOrphanedMeetingSinks_SameProcessPlaceholderDoesNotBlock(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, os.Getpid(), 0, 0)
+
+	prevList := pactlListModulesFn
+	pactlListModulesFn = func() (string, error) {
+		return "10\tmodule-null-sink\tsink_name=citadel_meeting_stale sink_properties=device.description=citadel_meeting_stale\n", nil
+	}
+	t.Cleanup(func() { pactlListModulesFn = prevList })
+
+	var unloaded []string
+	prevUnload := pactlUnloadModuleFn
+	pactlUnloadModuleFn = func(id string) error {
+		unloaded = append(unloaded, id)
+		return nil
+	}
+	t.Cleanup(func() { pactlUnloadModuleFn = prevUnload })
+
+	ReapOrphanedMeetingSinks(dir)
+
+	if len(unloaded) != 1 || unloaded[0] != "10" {
+		t.Errorf("a same-process PLACEHOLDER owner must not block the sweep (nothing has launched yet to protect), unloaded %v", unloaded)
 	}
 }
 
@@ -350,5 +387,188 @@ func TestMeetingPidfilePath(t *testing.T) {
 	want := filepath.Join("/tmp/profile", meetingPidfileName)
 	if got != want {
 		t.Errorf("meetingPidfilePath = %q, want %q", got, want)
+	}
+}
+
+// TestMarkMeetingProfileOwned_WritesPlaceholderWhenUnowned is the common
+// case: a fresh profile (no pidfile yet, or a dead owner) gets a placeholder
+// naming this process, and wrote reports true so the caller knows to clean
+// it up later.
+func TestMarkMeetingProfileOwned_WritesPlaceholderWhenUnowned(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	got, wrote, err := MarkMeetingProfileOwned(dir)
+	if err != nil {
+		t.Fatalf("MarkMeetingProfileOwned: unexpected error: %v", err)
+	}
+	if !wrote {
+		t.Fatal("expected wrote=true for an unowned profile")
+	}
+	if got != dir {
+		t.Errorf("resolved profileDir = %q, want %q", got, dir)
+	}
+	owner, chrome, xvfb := readMeetingPidfile(dir)
+	if owner != os.Getpid() || chrome != 0 || xvfb != 0 {
+		t.Errorf("placeholder pidfile = (%d,%d,%d), want (%d,0,0)", owner, chrome, xvfb, os.Getpid())
+	}
+}
+
+// TestMarkMeetingProfileOwned_DoesNotOverwriteLiveOwner is the corruption
+// guard: MarkMeetingProfileOwned must NEVER overwrite a pidfile that already
+// shows a live owner -- doing so unconditionally is exactly what would
+// clobber a genuinely in-flight launch's real chrome/xvfb PIDs (e.g. a
+// second hostMedia.Start() racing in after the first has already written
+// its real pidfile but is still inside waitForCDPReady).
+func TestMarkMeetingProfileOwned_DoesNotOverwriteLiveOwner(t *testing.T) {
+	dir := t.TempDir()
+	// A real, in-flight launch: owner is THIS process (alive by definition),
+	// with real (non-placeholder) chrome/xvfb PIDs already recorded.
+	writeMeetingPidfile(dir, os.Getpid(), 777001, 777002)
+
+	got, wrote, err := MarkMeetingProfileOwned(dir)
+	if err != nil {
+		t.Fatalf("MarkMeetingProfileOwned: unexpected error: %v", err)
+	}
+	if wrote {
+		t.Fatal("expected wrote=false when a live owner already exists -- must not have overwritten it")
+	}
+	if got != dir {
+		t.Errorf("resolved profileDir = %q, want %q", got, dir)
+	}
+	owner, chrome, xvfb := readMeetingPidfile(dir)
+	if owner != os.Getpid() || chrome != 777001 || xvfb != 777002 {
+		t.Errorf("pidfile was corrupted by MarkMeetingProfileOwned: got (%d,%d,%d), want (%d,777001,777002)",
+			owner, chrome, xvfb, os.Getpid())
+	}
+}
+
+// TestClearMeetingProfilePlaceholder_ClearsExactPlaceholder verifies the
+// happy path: a placeholder this process wrote is removed.
+func TestClearMeetingProfilePlaceholder_ClearsExactPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, os.Getpid(), 0, 0)
+
+	ClearMeetingProfilePlaceholder(dir)
+
+	if _, err := os.Stat(meetingPidfilePath(dir)); !os.IsNotExist(err) {
+		t.Errorf("placeholder pidfile should be removed, stat err=%v", err)
+	}
+}
+
+// TestClearMeetingProfilePlaceholder_DoesNotClearRealPidfile is the other
+// half of the corruption guard: if the pidfile has since been upgraded to a
+// REAL one (non-zero chrome/xvfb), clearing must be a no-op -- it must never
+// delete a live launch's actual PIDs just because this process happened to
+// write the placeholder that preceded it.
+func TestClearMeetingProfilePlaceholder_DoesNotClearRealPidfile(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, os.Getpid(), 888001, 888002)
+
+	ClearMeetingProfilePlaceholder(dir)
+
+	owner, chrome, xvfb := readMeetingPidfile(dir)
+	if owner != os.Getpid() || chrome != 888001 || xvfb != 888002 {
+		t.Errorf("real pidfile was incorrectly cleared: got (%d,%d,%d), want (%d,888001,888002)",
+			owner, chrome, xvfb, os.Getpid())
+	}
+}
+
+// TestClearMeetingProfilePlaceholder_DoesNotClearForeignOwner verifies
+// clearing never touches a pidfile owned by a DIFFERENT process (even one
+// that happens to also be a placeholder shape) -- it only ever removes what
+// THIS process itself wrote.
+func TestClearMeetingProfilePlaceholder_DoesNotClearForeignOwner(t *testing.T) {
+	dir := t.TempDir()
+	writeMeetingPidfile(dir, deadMeetingPID, 0, 0)
+
+	ClearMeetingProfilePlaceholder(dir)
+
+	owner, _, _ := readMeetingPidfile(dir)
+	if owner != deadMeetingPID {
+		t.Errorf("a foreign-owner pidfile must not be cleared, owner now = %d", owner)
+	}
+}
+
+// TestReapOrphanedMeetingSinks_PlaceholderProtectsConcurrentLoadWindow pins
+// the citadel-cli#925 review's blocking finding directly, at the level the
+// placeholder mechanism ALONE (a PID-keyed pidfile, without the additional
+// AcquireMeetingProfileSetupLock hostMedia.Start() also takes -- see
+// meetingSinkSweepBlocked's doc comment) actually protects: a DIFFERENT
+// process. It reproduces the exact vulnerable steady state the review
+// described -- meeting A (a sibling process, os.Getppid() standing in for
+// "alive, not us") has already loaded its sink -- visible in the fake pactl
+// module list -- but the real pidfile does not exist yet, since that is
+// only written after Chrome launches; only A's OWN placeholder is on disk --
+// and proves a concurrent caller's sweep (B, this test, a different PID)
+// does not unload it.
+//
+// This test FAILS against the pre-fix code: without A's placeholder pidfile
+// on disk at all (i.e. deleting the writeMeetingPidfile call below), the
+// profile has no pidfile, meetingOwnerAlive reports "no live owner", and the
+// sweep unloads citadel_meeting_A -- exactly the reported bug (pinned
+// directly, without the placeholder, by the negative-control test below).
+func TestReapOrphanedMeetingSinks_PlaceholderProtectsConcurrentLoadWindow(t *testing.T) {
+	dir := t.TempDir()
+	// The vulnerable steady state per the review: meeting A (a DIFFERENT,
+	// still-alive process -- os.Getppid() stands in for "not us" the same
+	// way TestReapMeetingProcessOrphans_SkipsLiveOwner already does) has
+	// already loaded its sink (LoadSink has run) but NO real pidfile exists
+	// yet -- only the placeholder A's own MarkMeetingProfileOwned wrote
+	// before its sink sweep and LoadSink.
+	const liveSinkModuleID = "77"
+	writeMeetingPidfile(dir, os.Getppid(), 0, 0)
+
+	prevList := pactlListModulesFn
+	pactlListModulesFn = func() (string, error) {
+		return liveSinkModuleID + "\tmodule-null-sink\tsink_name=citadel_meeting_A sink_properties=device.description=citadel_meeting_A\n", nil
+	}
+	t.Cleanup(func() { pactlListModulesFn = prevList })
+
+	var unloaded []string
+	prevUnload := pactlUnloadModuleFn
+	pactlUnloadModuleFn = func(id string) error {
+		unloaded = append(unloaded, id)
+		return nil
+	}
+	t.Cleanup(func() { pactlUnloadModuleFn = prevUnload })
+
+	// B's (this call's) own sweep, landing in the window A's placeholder
+	// protects.
+	ReapOrphanedMeetingSinks(dir)
+
+	if len(unloaded) != 0 {
+		t.Errorf("placeholder-protected sweep must not unload another live process's loading sink, unloaded module(s) %v", unloaded)
+	}
+}
+
+// TestReapOrphanedMeetingSinks_WithoutPlaceholderReproducesTheRace is the
+// explicit negative control for the test above: with NO placeholder written
+// (the exact pre-fix hostMedia.Start() behavior -- sweep called with no
+// prior pidfile at all), the sweep DOES unload the live sink. This pins that
+// the protection above comes from the placeholder, not from some unrelated
+// change to orphanSinkModuleIDs/ReapOrphanedMeetingSinks itself.
+func TestReapOrphanedMeetingSinks_WithoutPlaceholderReproducesTheRace(t *testing.T) {
+	dir := t.TempDir()
+	const liveSinkModuleID = "77"
+	prevList := pactlListModulesFn
+	pactlListModulesFn = func() (string, error) {
+		return liveSinkModuleID + "\tmodule-null-sink\tsink_name=citadel_meeting_A sink_properties=device.description=citadel_meeting_A\n", nil
+	}
+	t.Cleanup(func() { pactlListModulesFn = prevList })
+
+	var unloaded []string
+	prevUnload := pactlUnloadModuleFn
+	pactlUnloadModuleFn = func(id string) error {
+		unloaded = append(unloaded, id)
+		return nil
+	}
+	t.Cleanup(func() { pactlUnloadModuleFn = prevUnload })
+
+	// No MarkMeetingProfileOwned call: pre-fix hostMedia.Start() behavior.
+	ReapOrphanedMeetingSinks(dir)
+
+	if len(unloaded) != 1 || unloaded[0] != liveSinkModuleID {
+		t.Fatalf("expected the unprotected sweep to reproduce the race and unload module %q, got %v",
+			liveSinkModuleID, unloaded)
 	}
 }
