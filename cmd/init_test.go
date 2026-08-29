@@ -802,3 +802,136 @@ func TestSaveDeviceConfigToFile_SkipsFixStatePermissionsOnWriteFailure(t *testin
 		t.Errorf("fixStatePermissionsFn called %d times on a failed write, want 0", calls)
 	}
 }
+
+// --- aceteam #8139: fabric node ID persistence
+// (docs/design-node-identity-receipts.md §2) ---
+
+// TestSaveDeviceConfigToFile_PersistsFabricNodeID pins the device-auth
+// /token candidate echo point: when nexus.TokenResponse carries a
+// FabricNodeID, saveDeviceConfigToFile writes it to the SAME
+// machine-convergent config.yaml as org_id/org_name/..., and it reads back
+// via the real, pure readDeviceConfigFromDirs core (not a fake).
+func TestSaveDeviceConfigToFile_PersistsFabricNodeID(t *testing.T) {
+	dir := t.TempDir()
+	withHookOverrides(t, dir, func() {})
+
+	token := &nexus.TokenResponse{
+		DeviceAPIToken: "dat_8139",
+		OrgID:          "org-8139",
+		FabricNodeID:   "1297",
+	}
+	if err := saveDeviceConfigToFile(token); err != nil {
+		t.Fatalf("saveDeviceConfigToFile: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{dir})
+	if dc == nil {
+		t.Fatal("expected a device config, got nil")
+	}
+	if dc.FabricNodeID != "1297" {
+		t.Errorf("FabricNodeID = %q, want 1297", dc.FabricNodeID)
+	}
+	if dc.DeviceAPIToken != "dat_8139" {
+		t.Errorf("DeviceAPIToken = %q, want dat_8139 (other fields must survive the new field)", dc.DeviceAPIToken)
+	}
+}
+
+// TestSaveDeviceConfigToFile_OmitsFabricNodeIDWhenAbsent pins that an empty
+// TokenResponse.FabricNodeID (today's universal case -- no backend sends one
+// yet) does not write a "fabric_node_id: \"\"" key, matching how OrgName/
+// UserEmail/... already handle an empty value from the backend.
+func TestSaveDeviceConfigToFile_OmitsFabricNodeIDWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	withHookOverrides(t, dir, func() {})
+
+	if err := saveDeviceConfigToFile(&nexus.TokenResponse{DeviceAPIToken: "dat_no_node_id"}); err != nil {
+		t.Fatalf("saveDeviceConfigToFile: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "fabric_node_id") {
+		t.Errorf("expected no fabric_node_id key when TokenResponse carried none, got: %s", data)
+	}
+}
+
+// TestSaveFabricNodeIDToConfig_RoundTrips pins the standalone writer (the
+// citadel-side hook for the OTHER candidate echo point, a heartbeat ack --
+// design doc §2): a caller with only a node ID in hand, no device token,
+// can still persist it and read it back.
+//
+// Asserts against the RAW file rather than readDeviceConfigFromDirs: that
+// function requires a non-empty DeviceAPIToken or RedisURL to return a match
+// (see its doc comment) -- a fabric-node-ID-only config.yaml legitimately
+// has neither, so it would return nil here even though the write succeeded.
+// This is a real, documented quirk (not a bug this test papers over): a
+// node whose ONLY device-config write is a fabric-node-ID-only one (no
+// caller does this today -- every real node has a device token first) would
+// be invisible to getDeviceConfigFromFile. Harmless in practice, worth
+// knowing if a future heartbeat-ack caller ever calls this in isolation.
+func TestSaveFabricNodeIDToConfig_RoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	withHookOverrides(t, dir, func() {})
+
+	if err := saveFabricNodeIDToConfig("4242"); err != nil {
+		t.Fatalf("saveFabricNodeIDToConfig: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw struct {
+		FabricNodeID string `yaml:"fabric_node_id"`
+	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	if raw.FabricNodeID != "4242" {
+		t.Errorf("fabric_node_id = %q, want 4242, file contents: %s", raw.FabricNodeID, data)
+	}
+}
+
+// TestSaveFabricNodeIDToConfig_DoesNotClobberAPIToken is the regression test
+// the design doc calls out by name (§1a): SSHSyncConfig.NodeID's writer
+// (SaveSSHSyncConfig) clobbers api_token to "" when a caller only knows the
+// node ID. saveFabricNodeIDToConfig must NOT repeat that bug -- it reads the
+// existing file, sets only fabric_node_id, and writes the merged map back.
+func TestSaveFabricNodeIDToConfig_DoesNotClobberAPIToken(t *testing.T) {
+	dir := t.TempDir()
+	withHookOverrides(t, dir, func() {})
+
+	// First, a normal device-auth write establishes device_api_token/org_id
+	// the way `citadel init` would.
+	token := &nexus.TokenResponse{
+		DeviceAPIToken: "dat_must_survive",
+		OrgID:          "org-survive",
+		OrgName:        "Survive Inc",
+	}
+	if err := saveDeviceConfigToFile(token); err != nil {
+		t.Fatalf("saveDeviceConfigToFile: %v", err)
+	}
+
+	// Later, a caller that knows ONLY the fabric node ID (e.g. a heartbeat-ack
+	// handler) persists it -- this must not blank device_api_token/org_id/
+	// org_name, the exact failure mode SSHSyncConfig.NodeID's writer has.
+	if err := saveFabricNodeIDToConfig("9001"); err != nil {
+		t.Fatalf("saveFabricNodeIDToConfig: %v", err)
+	}
+
+	dc := readDeviceConfigFromDirs([]string{dir})
+	if dc == nil {
+		t.Fatal("expected a device config after the fabric-node-ID-only write, got nil")
+	}
+	if dc.DeviceAPIToken != "dat_must_survive" {
+		t.Errorf("DeviceAPIToken = %q, want dat_must_survive (saveFabricNodeIDToConfig must not clobber it)", dc.DeviceAPIToken)
+	}
+	if dc.OrgID != "org-survive" || dc.OrgName != "Survive Inc" {
+		t.Errorf("OrgID/OrgName = %q/%q, want org-survive/Survive Inc (must survive the fabric-node-ID-only write)", dc.OrgID, dc.OrgName)
+	}
+	if dc.FabricNodeID != "9001" {
+		t.Errorf("FabricNodeID = %q, want 9001", dc.FabricNodeID)
+	}
+}

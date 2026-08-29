@@ -144,6 +144,14 @@ type TokenResponse struct {
 	APIBaseURL     string `json:"api_base_url,omitempty"`     // Base URL for API calls
 	UserEmail      string `json:"user_email,omitempty"`       // User email for display
 	UserName       string `json:"user_name,omitempty"`        // User display name
+	// FabricNodeID is the numeric AceTeam fabric/platform node ID (aceteam
+	// #8139). NOT sent by the backend today -- this is the citadel-side hook
+	// for one of two candidate echo points the design doc leaves open (the
+	// other is a heartbeat ack); see
+	// docs/design-node-identity-receipts.md §2/§4. Additive and inert until
+	// the backend starts populating it: an empty value here is the expected,
+	// universal case, not an error.
+	FabricNodeID string `json:"fabric_node_id,omitempty"`
 }
 
 // TokenError represents an error response from the /token endpoint

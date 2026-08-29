@@ -1134,16 +1134,118 @@ like a plausible year ("1,950 respondents") slips through unflagged —
 documented v1 tradeoff, not a bug to silently fix by making the guardrail
 guess at year-vs-count from context.
 
-**Receipt-signing is a separate, deferred issue.** This package attaches a
-`grounding` map to the job output (`groundingReceipt`, mirroring
-`synthesizeReceiptFromHeaders` in `internal/jobs/synthesize_speech.go`) but
-never signs, persists, or transmits anything on its own. Cryptographically
-signing that receipt (the AEP half of aceteam #8253) overlaps the nodevault
-node-identity lane and is intentionally out of scope here.
+**Receipt-signing (aceteam #8253's AEP half) is implemented — see
+`internal/aep` and the Signed AEP Receipt section below.** This package
+(`internal/trust`) still attaches only the plain `grounding` map to job
+output (`groundingReceiptMap` in `internal/worker/llm_inference.go`,
+mirroring `synthesizeReceiptFromHeaders` in
+`internal/jobs/synthesize_speech.go`) and does not sign, persist, or
+transmit anything itself — signing is a separate, additional opt-in layered
+on top by the caller, described below.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt to buffered chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
+
+### Node identity persistence + signed AEP receipt (aceteam #8139/#8253, `internal/aep`)
+
+Design doc: [docs/design-node-identity-receipts.md](docs/design-node-identity-receipts.md).
+Two adjacent slices, both citadel-Go only — the aceteam-side halves (backend
+echo of the fabric node ID, backend signature verification, public-key
+registration) are separate, not-yet-built work this doc's §4 table tracks.
+
+**#8139 — fabric node ID persistence.** `DeviceConfig.FabricNodeID`
+(`cmd/work.go`) and `config.DeviceCreds.FabricNodeID`
+(`internal/config/devicecreds.go`) read/write the numeric AceTeam
+fabric/platform node ID from the SAME machine-convergent `config.yaml` as
+`org_id`/`org_name`/... (see the Device/org config note under
+`ConfigDir()`/`GetNodeConfigDir()` above). Two write paths: `nexus.
+TokenResponse.FabricNodeID` (an additive, inert field on the device-auth
+`/token` response, persisted by `saveDeviceConfigToFile`) for one candidate
+backend echo point, and the standalone `saveFabricNodeIDToConfig` (`cmd/
+init.go`) for the other (a future heartbeat-ack handler) — both use the same
+read-existing-map/merge-one-key/write-back discipline, DELIBERATELY not
+reusing `SSHSyncConfig.NodeID`'s writer pattern: that one clobbers
+`api_token` to `""` when a caller supplies only the node ID (no non-test
+callers exist today for exactly this reason — see
+`docs/whoami-fabric-id-gap.md`). `cmd/whoami.go`'s `gatherIdentity` prefers
+`DeviceConfig.FabricNodeID` over the legacy `SSHSyncConfig.NodeID` fallback
+(`resolvePlatformNodeID`). **Inert today**: no backend process sends either
+echo point yet, so this reads empty on every real node — the same "not
+available locally" state as before this landed, just with a real read/write
+path instead of no path at all.
+
+**#8253 — signed AEP receipt.** `internal/aep` (`AEPReceiptV1`,
+`Canonicalize`, `BuildSignedReceipt`) signs the `internal/trust` grounding
+receipt (see above) with `internal/nodeidentity`'s ECDSA P-256 key — NOT
+`internal/nodevault`: nodevault is a PIN-gated symmetric secrets vault
+(`Session.DeriveSubkey` + AES-GCM) with no asymmetric primitive and no
+unattended-unlock story, so it structurally cannot back signing under a
+headless `citadel work` (design doc §1c). `nodeidentity.Store` already
+generates an unattended-capable ECDSA key at every `citadel init`
+(`ensureNodeIdentity`, for a currently-inert mTLS CSR/leaf flow, #4583) —
+`Store.Sign`/`Store.PublicKeyFingerprint` (added here) are its second
+consumer.
+
+`Canonicalize` signs a fixed-shape, newline-delimited byte sequence over
+nine explicit fields (`node_id`, `job_id`, `issued_at`, `engine`, `model`,
+`grounded`, `score`, `claims_checked`, `flagged_hash`) — deliberately NOT
+`json.Marshal` of the receipt or a generic map, because `Score` (a float64)
+can change byte representation across an unrelated re-serialization (a Redis
+hop, the backend's own re-marshal of the job-output envelope) without
+changing value, which would silently break a naive byte-signature. A
+verifier must recompute this SAME canonical form from the receipt's own
+fields, not from a generic re-marshal. `Signature`/`PublicKeyFingerprint` are
+populated AFTER signing and are excluded from what's canonicalized — a
+signature covering its own field is the standard way this class of scheme
+breaks silently.
+
+**Wiring is nested inside the existing grounding gate, plus one more opt-in
+on top** (`internal/worker/llm_inference.go`'s `bufferedChatCompletions`):
+signing only runs when `CITADEL_GROUNDING_GUARDRAIL` has already computed a
+`GroundingResult` (there's nothing to sign otherwise) AND
+`CITADEL_SIGN_AEP_RECEIPTS` is separately on — a node can run the guardrail
+without ever touching a private key. `LLMInferenceHandler.ToMap()`
+(`internal/aep`) converts the signed `*AEPReceiptV1` to a plain
+`map[string]any` before it's attached to job `Output["aep_receipt"]` —
+Output crosses the wire via StreamWriter/Redis/API serialization elsewhere
+in the worker, so attaching a typed Go pointer directly would be the only
+one of its kind in that map and risks a downstream consumer that
+stringifies rather than `json.Marshal`s it. Signing failure (e.g. the node's
+key is unavailable) fails OPEN: the job still succeeds with `content`/
+`grounding` intact, just without `aep_receipt` (`h.aepLogf` logs it,
+non-fatally — an injectable field, not a bare `log.Printf`, since this
+package otherwise imports no logger at all).
+
+**Machine-convergent by construction — fixed, not a known hazard.** The
+signing key is NOT `nodeidentity.Default()` (which roots at invoker-scoped
+`platform.ConfigDir()`, see the `ConfigDir()`/`GetNodeConfigDir()` entry
+above — still used, unchanged, by `cmd/device.go`'s device-mode enrollment
+and `cmd/init.go`'s dormant mTLS CSR flow, both of which depend on staying
+invoker-scoped/shared with `citadel init`'s own context). `defaultAEPSigner()`
+(`internal/worker/llm_inference.go`) instead constructs a **separate**
+`nodeidentity.Store` rooted at `aepSigningStoreDir(network.GetNodeConfigDir())`
+— the SAME machine-convergent directory `citadel init`'s device-config write
+(#845) and #726's heartbeat marker already use — so a systemd-root `citadel
+work` and an interactive non-root process resolve the IDENTICAL signing key
+file; a future Phase 2 backend registration of this node's public key can
+never desync from what `citadel work` actually signs with.
+`TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts`
+(`internal/worker/llm_inference_test.go`) pins this directly: two
+independently-constructed `Store` instances resolving the same converged
+`nodeConfigDir` (standing in for two different invocation contexts) load/
+create the identical key. `LLMInferenceHandler.WithSigner` remains the
+override seam for tests and any future signer change.
+
+**Inert until the aceteam-side lands** (design doc §4): signing is fully
+wired citadel-side, but the backend does not yet hold this node's public key
+to verify against, and does not yet echo a fabric node ID for `#8139`'s
+`node_id` field to use (it falls back to the signer's own
+`PublicKeyFingerprint` — `aep.ResolveNodeID`'s phasing rule — until it does).
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_SIGN_AEP_RECEIPTS` | unset (OFF) | Attach a signed `aep_receipt` alongside `grounding` on buffered chat-completion results. Requires `CITADEL_GROUNDING_GUARDRAIL` also on. Truthy: `1`/`true`/`yes`/`on`. |
 
 ### Service Idle Detection and Auto-Stop (citadel #416)
 
@@ -1869,20 +1971,26 @@ and what is its identity?" from local/persisted state and caches the answer at
 `<node config dir>/identity.json`. `gatherIdentity` (`cmd/whoami.go`) is the
 authority for which sources feed which field — read it, don't assume.
 
-**No numeric AceTeam fabric node ID is persisted anywhere on a node's local
-filesystem.** The device-auth response (`nexus.TokenResponse`,
-`internal/nexus/deviceauth.go`) carries org/user identity but never a node ID;
-nothing else writes one either. The one on-disk slot clearly intended for it —
-`SSHSyncConfig.NodeID` ("Node ID in AceTeam platform",
-`internal/nexus/sshkeys.go`) — has no code path that ever writes it
-(`SaveSSHSyncConfig` has zero non-test callers). `gatherIdentity` still reads
-it opportunistically so it lights up for free the day a backend process
-starts populating it. The only fabric-adjacent identifier resolvable from a
-node today is the Headscale/mesh numeric node ID, and only LIVE (the same
-saved-state `VerifyOrReconnect` + `GetGlobalStatus` probe `citadel status`
-already performs — nothing persists it to disk). Full trail, including why
-`internal/devicemode`'s superficially-similar `NodeUID` is NOT this (different
-identity, different — non-overlapping — population of hosts):
+**A real persistence path for the numeric AceTeam fabric node ID now exists
+(citadel-Go side), but no backend process sends one yet, so it still reads
+empty on every real node.** See the "Node identity persistence + signed AEP
+receipt" section above for the implementation
+(`DeviceConfig.FabricNodeID`/`config.DeviceCreds.FabricNodeID`,
+`nexus.TokenResponse.FabricNodeID`, `saveFabricNodeIDToConfig`) and
+[docs/design-node-identity-receipts.md](docs/design-node-identity-receipts.md)
+for the design. `gatherIdentity` prefers `DeviceConfig.FabricNodeID` over the
+legacy `SSHSyncConfig.NodeID` slot ("Node ID in AceTeam platform",
+`internal/nexus/sshkeys.go`), which is kept only as a documented last-resort
+fallback: its writer (`SaveSSHSyncConfig`) has zero non-test callers AND, if
+ever wired up naively, would clobber `api_token` to `""` for a caller that
+supplies only the node ID (see the design doc §1a — this is exactly why the
+new persistence uses `DeviceConfig`/`config.yaml` instead). The only
+fabric-adjacent identifier ALSO resolvable LIVE (no persistence needed) is
+the Headscale/mesh numeric node ID, the same saved-state `VerifyOrReconnect`
++ `GetGlobalStatus` probe `citadel status` already performs. Full trail on
+the original gap, including why `internal/devicemode`'s superficially-similar
+`NodeUID` is NOT this (different identity, different — non-overlapping —
+population of hosts):
 [docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
 
 ### Safe node targeting: `--node-dir`, `--dry-run`, `--expect-node` (citadel#853, #854)

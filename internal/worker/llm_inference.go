@@ -32,11 +32,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/trust"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
@@ -69,6 +76,54 @@ type LLMInferenceHandler struct {
 	// WithRequestRecorder so tests can inject a spy instead of touching the
 	// shared process-wide log.
 	requestRecorder func(engine string)
+
+	// signer backs the signed AEP receipt (aceteam #8253, internal/aep).
+	// Defaults to defaultAEPSigner() -- see that function's doc comment for
+	// why it is NOT nodeidentity.Default() -- in the constructor; overridable
+	// via WithSigner so tests never touch the real host's filesystem.
+	//
+	// MACHINE-CONVERGENT BY CONSTRUCTION: unlike nodeidentity.Default()
+	// (rooted at invoker-scoped platform.ConfigDir(), see CLAUDE.md's
+	// ConfigDir()/GetNodeConfigDir() section and citadel-cli#845/#726/#696/
+	// #383), this key is rooted at network.GetNodeConfigDir() -- the SAME
+	// machine-convergent directory `citadel init`'s device-config write
+	// (#845) and #726's heartbeat marker already use. A systemd-root
+	// `citadel work` and an interactive non-root process therefore resolve
+	// the IDENTICAL signing key file, so a future Phase 2 backend
+	// registration of this node's public key can never desync from what
+	// `citadel work` actually signs with.
+	// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts pins
+	// this: two Store instances constructed against the same converged
+	// nodeConfigDir (standing in for two different invocation contexts that
+	// both resolved to it, e.g. `citadel init` and `citadel work`)
+	// load/create the IDENTICAL key.
+	//
+	// Deliberately a SEPARATE key/directory from nodeidentity.Default()
+	// (still used, unchanged, by cmd/device.go's device-mode enrollment and
+	// cmd/init.go's dormant mTLS CSR flow) rather than re-rooting Default()
+	// itself: device.go's package doc states "the identity store is the same
+	// one `citadel init` uses" as a deliberate feature (flipping a device to
+	// a node is a config change, not a re-enrollment), so re-rooting the
+	// shared Default() would need to satisfy that assumption too, which is a
+	// larger, separate change outside this PR's scope. Giving THIS signing
+	// path its own convergent store is the narrower fix that only touches
+	// the code this PR actually added.
+	signer aep.Signer
+
+	// fabricNodeID resolves the AEP receipt's preferred node_id (aceteam
+	// #8139's fabric node ID, via config.LoadDeviceCredsConverged --
+	// inert/empty on every node until a backend echo point lands, see
+	// docs/design-node-identity-receipts.md §2/§4). A func field (not a
+	// direct call in buildAEPReceipt) so WithFabricNodeIDResolver lets tests
+	// avoid reading the real host's device-config file.
+	fabricNodeID func() string
+
+	// aepLogf logs a non-fatal AEP receipt-signing failure (fail-open --
+	// signing must never break inference). An injectable field, mirroring
+	// swap_persist.go's persistLogf, rather than a bare log.Printf call:
+	// this package otherwise imports no logger at all, and this keeps that
+	// true for anything that doesn't opt into signing.
+	aepLogf func(format string, args ...any)
 }
 
 // modelSwapper is the swap surface the handler needs. Satisfied by *SwapManager;
@@ -101,7 +156,39 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 		},
 		httpClient:      http.DefaultClient,
 		requestRecorder: status.RecordEngineRequest,
+		signer:          defaultAEPSigner(),
+		fabricNodeID:    func() string { return config.LoadDeviceCredsConverged().FabricNodeID },
+		aepLogf:         log.Printf,
 	}
+}
+
+// aepIdentitySubdir names the subdirectory (under the AEP signing store's
+// root) the key files live in, mirroring nodeidentity's own "identity"
+// convention (nodeidentity.dirName, unexported) so the on-disk layout is
+// familiar -- just rooted at a different, machine-convergent parent.
+const aepIdentitySubdir = "identity"
+
+// aepSigningStoreDir is the pure core of defaultAEPSigner's path resolution:
+// given an already-resolved machine-convergent node config dir, return the
+// directory the AEP signing key is rooted at. Split out as a pure function
+// (rather than inlined where network.GetNodeConfigDir() is called) so a test
+// can assert convergence without needing two real, differently-configured
+// processes -- see TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts.
+func aepSigningStoreDir(nodeConfigDir string) string {
+	return filepath.Join(nodeConfigDir, aepIdentitySubdir)
+}
+
+// defaultAEPSigner returns the default signer for the AEP receipt (aceteam
+// #8253): a nodeidentity.Store rooted at network.GetNodeConfigDir(), the
+// machine-convergent node config dir -- NOT nodeidentity.Default(), which is
+// rooted at invoker-scoped platform.ConfigDir() and is used elsewhere
+// (cmd/device.go's device-mode enrollment, cmd/init.go's dormant mTLS CSR
+// flow) for reasons that depend on staying invoker-scoped/shared with
+// `citadel init`'s own context. See the `signer` field's doc comment on
+// LLMInferenceHandler for the full reasoning on why this is a deliberately
+// SEPARATE store rather than a re-rooted Default().
+func defaultAEPSigner() aep.Signer {
+	return nodeidentity.New(aepSigningStoreDir(network.GetNodeConfigDir()))
 }
 
 // WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
@@ -118,6 +205,23 @@ func (h *LLMInferenceHandler) WithSwapper(s modelSwapper) *LLMInferenceHandler {
 // Passing nil disables recording entirely.
 func (h *LLMInferenceHandler) WithRequestRecorder(recorder func(engine string)) *LLMInferenceHandler {
 	h.requestRecorder = recorder
+	return h
+}
+
+// WithSigner overrides the AEP receipt signer (aceteam #8253), primarily for
+// tests that want a hermetic in-memory signer instead of nodeidentity.Default()
+// (which reads/writes real key material under platform.ConfigDir()).
+func (h *LLMInferenceHandler) WithSigner(signer aep.Signer) *LLMInferenceHandler {
+	h.signer = signer
+	return h
+}
+
+// WithFabricNodeIDResolver overrides how the AEP receipt resolves the
+// preferred node_id (aceteam #8139), primarily for tests that want a
+// hermetic, fixed value instead of config.LoadDeviceCredsConverged() reading
+// the real host's device-config file.
+func (h *LLMInferenceHandler) WithFabricNodeIDResolver(resolver func() string) *LLMInferenceHandler {
+	h.fabricNodeID = resolver
 	return h
 }
 
@@ -194,21 +298,21 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 
 	switch payload.Backend {
 	case "vllm":
-		return h.executeVLLM(ctx, stream, payload)
+		return h.executeVLLM(ctx, stream, payload, job.ID)
 	case "sglang":
 		return h.executeSGLang(ctx, stream, payload)
 	case "ollama":
 		return h.executeOllama(ctx, stream, payload)
 	case "llamacpp":
-		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("llamacpp"))
+		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("llamacpp"), job.ID)
 	case "bonsai":
 		// Bonsai serves the identical llama.cpp-server API on its own host port
 		// (PrismML fork). Reuse the llama.cpp request/stream path pointed at it.
-		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("bonsai"))
+		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("bonsai"), job.ID)
 	case "unlimited-ocr":
 		// Baidu Unlimited-OCR is a vLLM OpenAI engine on its own host port; use the
 		// chat-completions path so multimodal image_url content (#625) reaches it.
-		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("unlimited-ocr"))
+		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("unlimited-ocr"), job.ID)
 	default:
 		return h.failure(fmt.Errorf("unsupported backend: %s", payload.Backend)), nil
 	}
@@ -239,12 +343,12 @@ func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, e
 }
 
 // executeVLLM handles inference via vLLM's OpenAI-compatible API.
-func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
+func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, jobID string) (*JobResult, error) {
 	// Chat-style requests (gateway `messages`) use /v1/chat/completions so vLLM
 	// applies the served model's chat template; the legacy /v1/completions prompt
 	// path is kept for prompt-style jobs.
 	if len(payload.Messages) > 0 {
-		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("vllm"))
+		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("vllm"), jobID)
 	}
 	return h.executeCompletions(ctx, stream, payload, h.baseURL("vllm"), "vLLM")
 }
@@ -613,14 +717,14 @@ func ollamaUsage(promptTokens, completionTokens int) map[string]any {
 // executeLlamaCppAt runs a llama.cpp-server inference against an explicit base
 // URL. Shared by the llamacpp and bonsai backends (bonsai is the PrismML
 // llama.cpp fork serving the identical API on its own host port).
-func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, baseURL string) (*JobResult, error) {
+func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, baseURL string, jobID string) (*JobResult, error) {
 	// Chat-style requests (the OpenAI gateway sends `messages`, not `prompt`) go
 	// to /v1/chat/completions so the engine applies the model's chat template.
 	// This is required for chat/instruct models — and essential for thinking
 	// models like Bonsai whose template emits the reasoning/answer split. The
 	// legacy /completion path is kept for prompt-style jobs.
 	if len(payload.Messages) > 0 {
-		return h.executeChatCompletionsAt(ctx, stream, payload, baseURL)
+		return h.executeChatCompletionsAt(ctx, stream, payload, baseURL, jobID)
 	}
 
 	reqPayload := map[string]any{
@@ -717,7 +821,7 @@ func (h *LLMInferenceHandler) bufferedLlamaCpp(stream StreamWriter, body io.Read
 // which is required for instruct/chat models and essential for thinking models
 // like Bonsai. Used whenever an llm_inference job carries `messages` (the shape
 // the OpenAI inference gateway dispatches).
-func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, baseURL string) (*JobResult, error) {
+func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, baseURL string, jobID string) (*JobResult, error) {
 	// Forward content verbatim (map[string]any, not map[string]string) so the
 	// OpenAI multimodal "content parts" array — e.g. an image_url for a vision/OCR
 	// model like baidu/Unlimited-OCR (#625) — reaches the engine intact. A plain
@@ -758,7 +862,7 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	if payload.Stream {
 		return h.streamChatCompletions(stream, resp.Body)
 	}
-	return h.bufferedChatCompletions(stream, resp.Body, payload)
+	return h.bufferedChatCompletions(stream, resp.Body, payload, jobID)
 }
 
 // bufferedChatCompletions parses a buffered OpenAI chat-completions response and
@@ -785,7 +889,7 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 // SERVICE_AUTO_STOP_WHEN_IDLE). Disabled, the output map is byte-identical to
 // before this change — no new key, nothing for a downstream consumer to
 // notice.
-func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader, payload *jobs.LLMInferencePayload) (*JobResult, error) {
+func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader, payload *jobs.LLMInferencePayload, jobID string) (*JobResult, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return h.failure(err), nil
@@ -801,9 +905,58 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 		"usage":         usage,
 	}
 	if groundingGuardrailEnabled() {
-		output["grounding"] = groundingReceipt(promptTextFromPayload(payload), content)
+		result := trust.CheckGrounding(promptTextFromPayload(payload), content)
+		output["grounding"] = groundingReceiptMap(result)
+
+		// Signed AEP receipt (aceteam #8253, the signing half deferred at
+		// citadel#847's merge -- see internal/aep's package doc and
+		// docs/design-node-identity-receipts.md §3). Nested INSIDE the
+		// grounding-guardrail gate deliberately: the receipt signs THIS
+		// GroundingResult, so signing it when the guardrail itself is off
+		// would mean signing a check that was never surfaced anywhere else.
+		// A second, independent opt-in (signAEPReceiptsEnabled) gates
+		// signing on top of that -- default OFF, so a
+		// guardrail-on-but-signing-off node's output is unchanged from
+		// before this feature existed (only "grounding" attaches, exactly
+		// as citadel#847 shipped it).
+		if signAEPReceiptsEnabled() {
+			receipt, err := h.buildAEPReceipt(jobID, payload, result)
+			if err != nil {
+				// Fail open: signing must never break inference. Mirrors
+				// internal/nodeidentity's own fail-open convention for its
+				// other consumer (the mTLS CSR/leaf flow, cmd/init.go's
+				// ensureNodeIdentity) -- a node whose key is unavailable
+				// simply serves without a signed receipt.
+				h.aepLogf("[aep] failed to build signed receipt for job %s (non-fatal): %v", jobID, err)
+			} else if receiptMap, err := receipt.ToMap(); err != nil {
+				// Attaching *aep.AEPReceiptV1 directly would be the only typed
+				// Go pointer in this map -- see ToMap's doc comment for why
+				// that's unsafe across this map's eventual wire
+				// serialization. This branch should be unreachable (the
+				// struct is always JSON-marshalable) but is handled the same
+				// fail-open way regardless.
+				h.aepLogf("[aep] failed to shape signed receipt for job %s (non-fatal): %v", jobID, err)
+			} else {
+				output["aep_receipt"] = receiptMap
+			}
+		}
 	}
 	return h.success(output), nil
+}
+
+// buildAEPReceipt resolves node_id (aceteam #8139's fabric node ID when
+// known, else the signer's own public-key fingerprint -- internal/aep.
+// ResolveNodeID's phasing fallback) and signs the AEP receipt with h.signer.
+func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInferencePayload, result trust.GroundingResult) (*aep.AEPReceiptV1, error) {
+	var fabricNodeID string
+	if h.fabricNodeID != nil {
+		fabricNodeID = h.fabricNodeID()
+	}
+	nodeID, err := aep.ResolveNodeID(h.signer, fabricNodeID)
+	if err != nil {
+		return nil, err
+	}
+	return aep.BuildSignedReceipt(h.signer, nodeID, jobID, payload.Backend, payload.Model, result, time.Now())
 }
 
 // streamChatCompletions translates an OpenAI chat-completions SSE stream into
@@ -1004,14 +1157,43 @@ func groundingGuardrailEnabled() bool {
 	return update.IsTruthy(os.Getenv(groundingGuardrailEnvVar))
 }
 
-// groundingReceipt runs the on-node grounding guardrail (internal/trust,
-// citadel #8253 guardrail half) and shapes its result as an advisory receipt
-// attached alongside the primary "content" field — mirroring the
-// synthesizeReceiptFromHeaders precedent (internal/jobs/synthesize_speech.go):
-// the guardrail's job is to FLAG, not block, so a result never fails or
-// withholds content because of what this returns. Policy is PolicyFlag
-// (default, never gates) here; gating is a documented follow-up for a caller
-// that wants HITL review of ungrounded results.
+// signAEPReceiptsEnvVar opts a node into SIGNING the grounding receipt
+// (aceteam #8253's deferred signing half, internal/aep) with the node's
+// internal/nodeidentity ECDSA key. A separate toggle from
+// groundingGuardrailEnvVar, per docs/design-node-identity-receipts.md §5
+// Phase 3 — a node can run the (cheap, local, non-cryptographic) grounding
+// check without ever touching a private key, and only opts into signing
+// deliberately.
+const signAEPReceiptsEnvVar = "CITADEL_SIGN_AEP_RECEIPTS"
+
+// signAEPReceiptsEnabled reports whether bufferedChatCompletions should
+// additionally sign the grounding receipt into a verifiable AEP receipt
+// (internal/aep.AEPReceiptV1). Default OFF, matching this codebase's
+// advisory-signal convention. Inert today in the sense that matters to a
+// verifier: the backend does not yet hold this node's public key to check
+// the signature against (design doc §3/§4, Phase 2, not done here) — see
+// this file's doc comment on the call site for what "inert" does and does
+// not mean here.
+func signAEPReceiptsEnabled() bool {
+	return update.IsTruthy(os.Getenv(signAEPReceiptsEnvVar))
+}
+
+// groundingReceiptMap shapes an already-computed trust.GroundingResult
+// (citadel #8253 guardrail half) as an advisory receipt attached alongside
+// the primary "content" field — mirroring the synthesizeReceiptFromHeaders
+// precedent (internal/jobs/synthesize_speech.go): the guardrail's job is to
+// FLAG, not block, so a result never fails or withholds content because of
+// what this returns. Policy is PolicyFlag (default, never gates) here;
+// gating is a documented follow-up for a caller that wants HITL review of
+// ungrounded results.
+//
+// Takes the GroundingResult directly (rather than running
+// trust.CheckGrounding itself, as this function did before the aep receipt
+// signing addition) so bufferedChatCompletions can compute it ONCE and reuse
+// it for both this map and, when CITADEL_SIGN_AEP_RECEIPTS is also on, the
+// signed receipt — trust.CheckGrounding is a pure function of the same
+// (input, output) pair either way, so this is a refactor, not a behavior
+// change.
 //
 // claims_checked (the eligible-claim denominator behind score) is included
 // deliberately: without it, a claim-free prose reply and a reply with ten
@@ -1019,8 +1201,7 @@ func groundingGuardrailEnabled() bool {
 // indistinguishable to a consumer — see GroundingResult.Grounded's doc
 // comment in internal/trust for why score alone must not be read as
 // "verified true".
-func groundingReceipt(input, output string) map[string]any {
-	result := trust.CheckGrounding(input, output)
+func groundingReceiptMap(result trust.GroundingResult) map[string]any {
 	flagged := make([]map[string]any, 0, len(result.Flagged))
 	for _, c := range result.Flagged {
 		flagged = append(flagged, map[string]any{

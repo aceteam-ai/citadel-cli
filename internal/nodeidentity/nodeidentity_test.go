@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,6 +240,85 @@ func TestStoreLeaf_EmptyIsNoOp(t *testing.T) {
 	}
 	if s.HasLeaf() {
 		t.Fatal("leaf file created from empty input")
+	}
+}
+
+// TestSign_VerifiesAgainstOwnPublicKey pins that Sign produces a signature
+// that verifies against the SAME key GetOrCreateKey returns -- the property
+// internal/aep's BuildSignedReceipt relies on.
+func TestSign_VerifiesAgainstOwnPublicKey(t *testing.T) {
+	s := newTestStore(t)
+	payload := []byte("aep receipt canonical bytes")
+
+	sig, err := s.Sign(payload)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	key, err := s.GetOrCreateKey()
+	if err != nil {
+		t.Fatalf("GetOrCreateKey: %v", err)
+	}
+	digest := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(&key.PublicKey, digest[:], sig) {
+		t.Fatalf("Sign produced a signature that does not verify against GetOrCreateKey's public key")
+	}
+}
+
+// TestSign_LazilyCreatesKey pins that Sign works on a Store with no key on
+// disk yet (mirrors GetOrCreateKey's own idempotent-create contract) rather
+// than requiring a caller to call GetOrCreateKey first.
+func TestSign_LazilyCreatesKey(t *testing.T) {
+	s := newTestStore(t)
+	if s.HasKey() {
+		t.Fatalf("test setup: expected no key yet")
+	}
+	if _, err := s.Sign([]byte("x")); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if !s.HasKey() {
+		t.Fatalf("Sign did not create a key as GetOrCreateKey would")
+	}
+}
+
+// TestPublicKeyFingerprint_StableAcrossCalls pins that the fingerprint is a
+// pure function of the persisted key -- the same on-disk key always yields
+// the same fingerprint, which is what lets a verifier look up a registered
+// key by this value.
+func TestPublicKeyFingerprint_StableAcrossCalls(t *testing.T) {
+	s := newTestStore(t)
+	fp1, err := s.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("PublicKeyFingerprint: %v", err)
+	}
+	fp2, err := s.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("PublicKeyFingerprint (2nd call): %v", err)
+	}
+	if fp1 != fp2 {
+		t.Fatalf("fingerprint changed across calls: %q vs %q", fp1, fp2)
+	}
+	if !strings.HasPrefix(fp1, "sha256:") {
+		t.Errorf("fingerprint = %q, want a sha256: prefix", fp1)
+	}
+}
+
+// TestPublicKeyFingerprint_DiffersAcrossStores pins that two distinct keys
+// (two different node identities) produce distinct fingerprints -- otherwise
+// the fingerprint would be useless as a lookup key.
+func TestPublicKeyFingerprint_DiffersAcrossStores(t *testing.T) {
+	s1 := newTestStore(t)
+	s2 := newTestStore(t)
+	fp1, err := s1.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("PublicKeyFingerprint (s1): %v", err)
+	}
+	fp2, err := s2.PublicKeyFingerprint()
+	if err != nil {
+		t.Fatalf("PublicKeyFingerprint (s2): %v", err)
+	}
+	if fp1 == fp2 {
+		t.Fatalf("two distinct stores produced the same fingerprint: %q", fp1)
 	}
 }
 

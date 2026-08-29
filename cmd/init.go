@@ -1084,6 +1084,9 @@ func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
 	if token.UserName != "" {
 		config["user_name"] = token.UserName
 	}
+	if token.FabricNodeID != "" {
+		config["fabric_node_id"] = token.FabricNodeID
+	}
 	// Remove redis_url - not needed when using API mode
 	delete(config, "redis_url")
 
@@ -1223,6 +1226,60 @@ func saveRedisURLToConfig(redisURL string) error {
 
 	// Fix ownership of the node config dir after a successful write --
 	// see saveDeviceConfigToFile's identical comment (citadel-cli #878).
+	fixStatePermissionsFn()
+
+	return nil
+}
+
+// saveFabricNodeIDToConfig persists the numeric AceTeam fabric/platform node
+// ID (aceteam #8139) to the SAME machine-convergent config.yaml
+// saveDeviceConfigToFile/saveRedisURLToConfig write, using the identical
+// read-existing-map/merge-one-key/write-back discipline. This is the
+// citadel-side hook for whichever backend echo point lands (design doc §2):
+// if it turns out to be a heartbeat ack rather than the device-auth /token
+// response (already wired via saveDeviceConfigToFile above), the caller that
+// parses that ack calls this directly instead of threading the value through
+// a *nexus.TokenResponse.
+//
+// Deliberately does NOT reuse saveDeviceConfigToFile's map-building --
+// SSHSyncConfig.NodeID's clobber bug (design doc §1a) is exactly a writer
+// that rewrote *every* field of a shared config from a struct that only had
+// one of them populated. This function reads the existing file, sets ONLY
+// "fabric_node_id", and writes the merged map back -- so a caller that only
+// knows the node ID (e.g. a heartbeat-ack handler with no device token in
+// hand) can never blank out device_api_token or any other key.
+// TestSaveFabricNodeIDToConfig_DoesNotClobberAPIToken pins this directly.
+func saveFabricNodeIDToConfig(nodeID string) error {
+	globalConfigDir := nodeConfigDirFn()
+	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+
+	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+		return fmt.Errorf("failed to create global config directory: %w", err)
+	}
+
+	var config map[string]interface{}
+	data, err := os.ReadFile(globalConfigFile)
+	if err == nil {
+		if unmarshalErr := yaml.Unmarshal(data, &config); unmarshalErr != nil {
+			config = nil
+		}
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+
+	seedAceteamAPIKeyFromLegacyFile(config, filepath.Join(platform.ConfigDir(), "config.yaml"))
+
+	config["fabric_node_id"] = nodeID
+
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
 	fixStatePermissionsFn()
 
 	return nil
