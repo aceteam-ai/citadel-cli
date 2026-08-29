@@ -319,21 +319,63 @@ runLoop:
 			}
 
 			// Long-session job types (MEETING_JOIN, COBROWSE -- see
-			// longSessionJobTypes in deadline.go) always get their own goroutine,
-			// independent of maxConcurrency and the semaphore below
-			// (citadel-cli#489). These jobs legitimately run for the length of a
-			// human session (up to the 4h long-tier deadline); routing one through
-			// the sequential path on a maxConcurrency=1 node -- the default on a
-			// GPU-less meeting node -- would occupy the node's only slot and
-			// starve every other poll cycle (deploys, shell, transcription) for
-			// hours of head-of-line blocking. Dispatching async here, before the
-			// concurrency>1 branch, means these jobs never acquire the semaphore
-			// either, so they can't hog a pool slot there either. They still run
-			// through the exact same r.processJob path as every other job --
-			// same per-job watchdog/deadline, terminal-event publishing,
-			// cancellation, WorkerState in-flight accounting, and DLQ/ack
-			// semantics -- just not gated by the sequential/semaphore slot.
-			if _, longSession := longSessionJobTypes[job.Type]; longSession {
+			// longSessionJobTypes in deadline.go) always get their own
+			// goroutine, independent of maxConcurrency and the semaphore below
+			// (citadel-cli#489). These jobs legitimately run for the length of
+			// a human session (up to the 4h long-tier deadline); routing one
+			// through the sequential path on a maxConcurrency=1 node -- the
+			// default on a GPU-less meeting node -- would occupy the node's
+			// only slot and starve every other poll cycle (deploys, shell,
+			// file reads) for the duration. Dispatching async here, before the
+			// concurrency>1 branch, means these jobs never acquire the
+			// semaphore either, so they can't hog a pool slot there either.
+			// They still run through the exact same r.processJob path as
+			// every other job -- same per-job watchdog/deadline, terminal-
+			// event publishing, cancellation, WorkerState in-flight
+			// accounting, and DLQ/ack semantics -- just not gated by the
+			// sequential/semaphore slot.
+			//
+			// citadel-cli#903 Stage 1: GPU-bound inference job types (see
+			// gpuBoundJobTypes in gpu_tracker.go) join this async lane too --
+			// but ONLY when r.gpuTracker is non-nil. r.gpuTracker gates actual
+			// execution inside processJob (#825): it admits up to its slot
+			// count and Nacks (non-terminal, redelivered -- see the #559 note
+			// on processJob) the rest. When a tracker exists, this async
+			// dispatch is a pure fetch-loop fix, not a concurrency change: the
+			// tracker's own gate is what still throttles concurrent GPU
+			// execution, exactly as it already does whenever --max-concurrency
+			// is raised above the GPU count -- see
+			// TestRunnerGPUBoundAsyncLaneStillNacksUnderSlotContention, which
+			// pins that the gate's behavior is unchanged under the newly-
+			// reachable maxConcurrency=1 contention.
+			//
+			// But r.gpuTracker is nil whenever platform.GetGPUCountSimple()
+			// found no discrete GPU (cmd/work.go) -- a first-class node class
+			// (CPU-only, native ollama, Apple Silicon; #606/#612/aceteam#6634)
+			// that still serves GPU-bound-typed inference. On such a node
+			// nothing else throttles concurrent GPU-bound dispatch: the
+			// sequential fetch loop (this job type falling through to the
+			// `else` inline branch below) was the ONLY thing serializing
+			// inference there, accidental but real backpressure against a
+			// single CPU-serving engine. Unconditionally async-dispatching
+			// GPU-bound jobs would remove that backpressure in the DEFAULT
+			// config (maxConcurrency=1, no tracker) and let N concurrently-
+			// arriving inference jobs hit one engine with zero throttle.
+			// TestRunnerGPUBoundJobsSequentialWithoutTracker pins that a
+			// nil-tracker node keeps the old inline/sequential fallback for
+			// GPU-bound jobs. Real admission control for that node class
+			// (a semaphore/lock sized to its actual concurrency, not this
+			// GPU-count-shaped tracker) is Stage-2 scope, not this fix.
+			//
+			// The fetch loop is now free to claim non-GPU jobs (e.g.
+			// FILE_READ_BYTES) while a GPU job executes on a tracked node,
+			// instead of blocking source.Next() until it returns. The
+			// general/unbounded case (every other job type, and admission
+			// control for tracker-less GPU-serving nodes) is left for a
+			// separate Stage 2 design issue.
+			_, longSession := longSessionJobTypes[job.Type]
+			gpuBoundAsync := needsGPUSlot(job.Type) && r.gpuTracker != nil
+			if longSession || gpuBoundAsync {
 				wg.Add(1)
 				go func(j *Job) {
 					defer wg.Done()
