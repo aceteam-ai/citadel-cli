@@ -65,6 +65,34 @@ func TestRefuseIfLockfileWriteUnsupported(t *testing.T) {
 	}
 }
 
+// TestRefuseIfReservationNodeDirUnsupported pins the model-exclusivity
+// guard (aceteam#8248/#8249): no override -> nil; the FLAG form active ->
+// refuses (internal/jobs only sees CITADEL_NODE_DIR via the environment,
+// never the cobra flag); the ENV VAR form active with the identical value
+// -> nil, since internal/jobs sees that value directly.
+func TestRefuseIfReservationNodeDirUnsupported(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	setNodeDirOverrideForTest(t, "")
+	if err := refuseIfReservationNodeDirUnsupported("citadel run --exclusive"); err != nil {
+		t.Fatalf("no override active: want nil, got %v", err)
+	}
+
+	setNodeDirOverrideForTest(t, "/tmp/some-override")
+	err := refuseIfReservationNodeDirUnsupported("citadel run --exclusive")
+	if err == nil {
+		t.Fatal("flag-form override active: want a refusal error")
+	}
+	if !strings.Contains(err.Error(), "citadel run --exclusive") || !strings.Contains(err.Error(), "--node-dir") {
+		t.Fatalf("error = %v, want it to name the command and mention --node-dir", err)
+	}
+	setNodeDirOverrideForTest(t, "")
+
+	t.Setenv("CITADEL_NODE_DIR", "/tmp/some-override")
+	if err := refuseIfReservationNodeDirUnsupported("citadel run --exclusive"); err != nil {
+		t.Fatalf("env-var-form override active: want nil (internal/jobs sees the same value), got %v", err)
+	}
+}
+
 // --- compose-project scoping under --node-dir (citadel#856 review) ---
 //
 // These pin the argv contract directly, per the review's instruction: verify

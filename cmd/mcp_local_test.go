@@ -54,6 +54,7 @@ func TestNewLocalMCPToolsRegistersExpectedTools(t *testing.T) {
 		"local_module_stop", "local_module_start", "local_module_restart",
 		"local_list_models", "local_chat",
 		"local_read_file", "local_list_files",
+		"local_model_deploy", "local_run_exclusive", "local_model_stop",
 	}
 	got := map[string]bool{}
 	for _, tool := range tools {

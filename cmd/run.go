@@ -47,10 +47,16 @@ Available services: %s`, strings.Join(services.GetAvailableServices(), ", ")),
   # Start in foreground mode
   citadel run ollama --detach=false
 
+  # Reserve the GPU exclusively for one service, evicting everything else non-pinned first
+  citadel run bonsai --exclusive --detach=false
+
   # Recommended: Start services + worker together
   citadel work --mode=nexus`,
 	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		if runCmdDispatchExclusive(cmd, args) {
+			return
+		}
 		if restartServices {
 			// Restart mode
 			restartAllServices()

@@ -1572,6 +1572,98 @@ Latent and low-severity today (no caller reserves anything yet), documented
 alongside the CC/worklock gap above rather than fixed, for the same reason:
 narrow, deliberate scope for the primitive PR.
 
+### Model exclusivity: `run --exclusive` + local MCP deploy/evict (aceteam#8248/#8249, citadel#851's first caller)
+
+Design: [docs/design-model-exclusivity.md](docs/design-model-exclusivity.md).
+`internal/jobs/model_exclusivity.go` is #832's reserve/evict/restore
+primitive's first real caller: `citadel run <service> --exclusive`
+(`cmd/run_exclusive.go`) and three local MCP tools
+(`local_model_deploy`/`local_run_exclusive`/`local_model_stop`,
+`cmd/mcp_local.go`).
+
+**The naive VRAM budget ("whole card minus a margin" fed into `Reserve`) is
+unsatisfiable by construction** whenever VRAM is held by something
+`status.PlanPreemption` cannot see as a candidate (an unmanaged process,
+driver/CUDA overhead) — `Reserve` would refuse even though evicting
+everything non-pinned is exactly what was asked and would free real VRAM.
+`ServiceHandler.ReserveExclusive(ctx, jobID, exclude)` fixes this by skipping
+the fit-check arithmetic entirely: it evicts every non-pinned RUNNING
+candidate unconditionally (including one reporting `VRAMBytes==0` — a
+genuinely exclusive ask does not selectively spare a service just because its
+footprint measurement happened to read zero), tags each exactly like
+`Reserve` does, and reports the ACTUAL resulting free VRAM on the returned
+`Reservation` (`FreeVRAMBytes`/`FreeVRAMKnown`) rather than asking the caller
+to have predicted it. It collects node status TWICE — once for candidates,
+once after eviction for the real free-VRAM reading — so a test stub must
+expect two `collectStatus` calls. Unlike `Reserve`, an unknown pre-eviction
+free-VRAM signal is NOT a hard error: `Reserve`'s hard-error contract exists
+to protect a fit CLAIM it is verifying; `ReserveExclusive` makes no fit claim
+at all. `Reserve` itself is still used for the bounded alternative
+(`--vram`/`vram_mb`): an ordinary, satisfiable ask for exactly N bytes.
+
+**Ownership shape is deliberately (a) from the design doc's §2.3, not (b):**
+the CLI process (or `citadel mcp`) calls `Reserve`/`ReserveExclusive`/
+`Release` DIRECTLY — no worklock, no job dispatched into a running worker —
+mirroring how `citadel module stop|start|restart` (#846) already calls
+`liveModuleOps` directly. The design doc found no existing local
+job-submission path into `internal/worker.Runner`; building one was judged
+real, non-trivial plumbing, not a thin wrapper, so it was deliberately not
+built for this. **Crash-safety consequence, stated plainly rather than
+assumed away:** the `evicted_by_job` tag is durable, and `cmd/work.go`'s
+`runWork` already calls `ReconcileOrphanedReservations` right after acquiring
+`internal/worklock`, before its consume loop — so a CLI/MCP process that dies
+mid-exclusive-run does not strand evicted services forever; the NEXT `citadel
+work` boot restores them. But this is the EXACT hazard
+`ReconcileOrphanedReservations`' own doc comment already names for a future
+`#8248` caller: neither this CLI/MCP process nor the control-center's consume
+loop holds `worklock`, so a `citadel work` that boots WHILE an exclusive
+run/deploy is still legitimately in progress can conclude the tag is
+orphaned and restore the evicted peers out from under it. This is a real,
+live race on any node that might also run `citadel work` (or the
+control-center) concurrently with a standalone exclusive run — not a
+theoretical one closed off by this design. Closing it (owner identity on the
+marker, mirroring `worklock`'s own stale-lock classification, or making
+every job-consuming path acquire `worklock`) is deferred, tracked follow-up
+work. `citadel module reservations release <jobID>` is the manual escape
+hatch if this race (or any other stuck reservation) needs it.
+
+**`citadel module reservations list|release`** (`cmd/module_reservations.go`,
+the design's §2.6 escape hatch) are thin wrappers over the already-tested
+`ActiveReservations`/`Release` primitives, with the same `--dry-run`/
+`--expect-node` posture `citadel module stop|start|restart` has.
+
+**`--node-dir` as a FLAG (not `CITADEL_NODE_DIR` as an env var) is refused**
+by all three CLI/MCP entry points
+(`refuseIfReservationNodeDirUnsupported`, `cmd/nodedir.go`): these paths call
+`internal/jobs.ServiceHandler` directly, and that package's own
+`ensureEmbeddedComposeFile` container-name-namespacing (citadel#860) reads
+`CITADEL_NODE_DIR` from the environment ONLY — it cannot see cobra flags. The
+flag form would silently namespace nothing while still durably
+evicting/starting the real node's services — the exact citadel#853/#856/#860
+incident class. Using the env var instead of the flag is fine (no
+divergence) and is not refused.
+
+**Naming collision, resolved:** the release-half tool is `local_model_stop`,
+not `local_model_evict` — `MODEL_CACHE_EVICT` (`internal/worker/job.go`) is a
+DIFFERENT, already-existing job type that deletes cached weights from disk;
+`local_model_stop` only stops serving, consistent with `local_module_stop`'s
+existing naming. It is deliberately overloaded to do two things depending on
+state: always stops the engine serving the given model (resolved via the
+SAME `gateway.ResolveChatModel` lookup `local_list_models`/`local_chat` use),
+and — ONLY if an active reservation exists under `jobs.ExclusiveReservationJobID(engine)`
+(a pure `HasActiveReservation` read) — ALSO releases it afterward, restoring
+whatever `local_run_exclusive` evicted. **Order is load-bearing: stop the
+target FIRST, then release.** Releasing first would restart evicted peers
+while the target still holds its own VRAM, which can fail to fit or
+needlessly contend for it — `TestLocalModelStopOrderingStopsBeforeRelease`
+pins the call order directly.
+
+The deterministic reservation id — `jobs.ExclusiveReservationJobID(serviceName)`
+= `"exclusive:" + serviceName` — is the stable, documented contract every
+caller (the CLI, both MCP tools, the escape hatch) computes independently
+rather than passing an in-memory handle around, since #2.3(a)'s shape means
+no handle survives between two separately-invoked calls.
+
 ### Per-engine tables are hand-synced, not generated (citadel #685, #686)
 
 Engine identity (host port, request dialect, default model, idle capability,

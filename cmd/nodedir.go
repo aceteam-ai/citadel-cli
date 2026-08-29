@@ -123,6 +123,45 @@ func refuseIfLockfileWriteUnsupported(cmdLabel string) error {
 		cmdLabel, override)
 }
 
+// refuseIfReservationNodeDirUnsupported guards the model-exclusivity paths
+// (`citadel run --exclusive`, `citadel module reservations *`, and the local
+// MCP local_model_deploy/local_run_exclusive/local_model_stop tools,
+// aceteam#8248/#8249) that call straight into internal/jobs.ServiceHandler's
+// Reserve/ReserveExclusive/Release/StartServiceWithModel.
+//
+// Those resolve citadel.yaml from the caller-supplied configDir (itself
+// --node-dir-aware, since it flows through findAndReadManifest/
+// findOrCreateManifest) -- but internal/jobs.ensureEmbeddedComposeFile's own
+// container-name-namespacing reconciliation (citadel#860) reads
+// CITADEL_NODE_DIR directly from the ENVIRONMENT, not the --node-dir cobra
+// flag, because internal/jobs cannot see cobra flags (only cmd/ wires them).
+// A `--node-dir /tmp/x` invocation using the FLAG form would therefore
+// materialize/start services under the UNNAMESPACED "citadel-<svc>"
+// container_name while durably evicting/starting the REAL node's services --
+// exactly the citadel#853/#856/#860 incident class this package exists to
+// prevent. Refusing loudly beats silently producing that split.
+//
+// Using CITADEL_NODE_DIR (the env var) instead of --node-dir (the flag) is
+// NOT refused: internal/jobs sees that value directly, so there is no
+// flag/env divergence to guard against in that case.
+func refuseIfReservationNodeDirUnsupported(cmdLabel string) error {
+	override := resolveNodeDirOverride()
+	if override == "" {
+		return nil
+	}
+	if strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR")) == override {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s does not yet support --node-dir as a FLAG: it calls internal/jobs.ServiceHandler "+
+			"directly, which only sees CITADEL_NODE_DIR via the environment, not this flag -- "+
+			"container-name namespacing (citadel#860) would silently NOT apply while eviction/"+
+			"start actions still target %q. Set CITADEL_NODE_DIR=%q in the environment instead of "+
+			"--node-dir to run this command, or unset the override to run it against this machine's "+
+			"real node",
+		cmdLabel, override, override)
+}
+
 // composeProjectOverride returns the compose "-p"/"--project-name" value to
 // use for compose invocations while --node-dir/CITADEL_NODE_DIR is active, or
 // "" when no override is set. "" is the signal every call site below uses to

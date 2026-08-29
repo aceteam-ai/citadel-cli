@@ -41,15 +41,36 @@ import (
 type Reservation struct {
 	// JobID is the caller-supplied identifier this reservation is scoped to.
 	JobID string
-	// RequiredVRAMBytes is the budget Reserve was asked to fit.
+	// RequiredVRAMBytes is the budget Reserve was asked to fit. Zero for a
+	// Reservation returned by ReserveExclusive (aceteam#8248/#8249, see
+	// model_exclusivity.go) — exclusive mode has no budget, it evicts
+	// unconditionally.
 	RequiredVRAMBytes uint64
+	// Exclusive reports whether this Reservation was produced by
+	// ReserveExclusive rather than Reserve: every non-pinned running
+	// candidate was evicted unconditionally (no fit-check arithmetic), not
+	// the minimal prefix that satisfies RequiredVRAMBytes.
+	Exclusive bool
 	// Evicted lists the non-pinned services this reservation durably stopped,
-	// in eviction order (idle-first, then largest-VRAM-first — #577's
-	// ordering, unchanged). Empty when the budget already fit without
-	// eviction, or when RequiredVRAMBytes==0.
+	// in eviction order (idle-first, then largest-VRAM-first for Reserve;
+	// name-ascending for ReserveExclusive, which stops all of them so order
+	// does not affect the outcome). Empty when the budget already fit without
+	// eviction, when RequiredVRAMBytes==0, or (Exclusive) when nothing
+	// non-pinned was running.
 	Evicted []string
 	// Reason is a human-readable explanation, mirroring status.PreemptPlan.Reason.
 	Reason string
+	// FreeVRAMBytes is the free VRAM this node reported AFTER eviction
+	// completed (ReserveExclusive only — see docs/design-model-exclusivity.md
+	// §2.1: exclusive mode reports the ACTUAL resulting free VRAM rather than
+	// asking the caller to predict it from a precomputed budget). Zero/unset
+	// for a plain Reserve.
+	FreeVRAMBytes uint64
+	// FreeVRAMKnown reports whether FreeVRAMBytes is a real reading (false
+	// when the post-eviction status collection failed or no GPU reports a
+	// memory total — the eviction itself still succeeded either way, this
+	// only affects whether the caller can print a resulting-free-VRAM number).
+	FreeVRAMKnown bool
 }
 
 // ReservationSummary is the read-only, heartbeat-facing view of an active
