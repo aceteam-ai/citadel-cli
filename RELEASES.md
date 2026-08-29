@@ -1962,3 +1962,21 @@ Auto-generated log of every release.
   - fix(jobs): redirect model_cache_pull HF download to the canonical citadel cache (#682 P0) (#904)
 
 
+---
+
+## v2.127.0 — 2026-08-28
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +2423 |
+
+**Changes:**
+
+  - fix(worker): extend async dispatch lane to GPU-bound inference jobs (#903 Stage 1) (#911)
+  - fix: canonical per-engine cache-path table so llamacpp pulls land where the container mounts (#906) (#912)
+  - diffusers-service: free-space preflight + file-selection guard on the sidecar's own weight pull (#910)
+  - fix(hermes-service): scrub provider secrets from forwarded CLI output (#909)
+
+
