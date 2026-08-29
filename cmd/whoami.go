@@ -4,20 +4,30 @@
 // what is its identity?" using LOCAL/persisted state -- no sudo, no live
 // `citadel work`/`citadel up` process required. See aceteam #8139.
 //
-// KEY FINDING (verified before writing this file, do not re-litigate without
-// re-checking the code): there is NO numeric AceTeam fabric node ID persisted
-// anywhere on a node's local filesystem.
-//   - The device-auth response (nexus.TokenResponse, internal/nexus/deviceauth.go)
-//     carries OrgID/OrgName/UserEmail/UserName/DeviceAPIToken but no node ID.
+// KEY FINDING (originally verified for citadel#844; updated for aceteam
+// #8139's persistence half -- docs/design-node-identity-receipts.md -- do
+// not re-litigate without re-checking the code): there is still NO backend
+// process that actually SENDS a numeric AceTeam fabric node ID to a node
+// today, but there is now a place for one to land if it does.
+//   - DeviceConfig.FabricNodeID (cmd/work.go) is read from the SAME
+//     machine-convergent config.yaml as OrgID/OrgName/UserEmail/UserName,
+//     and nexus.TokenResponse (internal/nexus/deviceauth.go) carries an
+//     additive, inert FabricNodeID field for one candidate backend echo
+//     point (device-auth /token). Until the backend populates one of the two
+//     echo points the design doc leaves open, this reads empty -- same as
+//     before, just with a real read/write path instead of no path at all.
 //   - internal/heartbeat's on-disk marker (marker.go) tracks write freshness
 //     only, no identity fields.
-//   - The ONE on-disk slot that was clearly intended for it --
+//   - The OTHER on-disk slot that looked intended for it --
 //     SSHSyncConfig.NodeID ("Node ID in AceTeam platform",
 //     internal/nexus/sshkeys.go) -- has no code path that ever writes it
 //     (SaveSSHSyncConfig has zero non-test callers; only LoadSSHSyncConfig is
-//     called, from cmd/run.go). whoami still reads it (PlatformNodeID below)
-//     so it lights up for free the day a backend process starts populating
-//     it; today it reads empty on essentially every real node.
+//     called, from cmd/run.go) and has a documented clobber trap besides
+//     (design doc §1a) -- do not use it as a write target. whoami still
+//     reads it as a documented last-resort fallback, below DeviceConfig.
+//     FabricNodeID, so it lights up for free the day a backend process
+//     starts populating it; today it reads empty on essentially every real
+//     node.
 //
 // The one identifier that IS resolvable locally is the Headscale/mesh numeric
 // node ID (network.NetworkStatus.NodeID) -- but only LIVE, from an active or
@@ -116,6 +126,20 @@ type NodeIdentity struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
+// resolvePlatformNodeID picks whoami's platform_node_id: the device-config
+// FabricNodeID (aceteam #8139, DeviceConfig.FabricNodeID via
+// getDeviceConfigFromFile) when present, else the legacy
+// SSHSyncConfig.NodeID fallback (design-node-identity-receipts.md §1a/§2).
+// Split out as a pure function -- rather than left inline in gatherIdentity
+// -- so the preference order is unit-testable without faking
+// network.GetNodeConfigDir() or nexus.LoadSSHSyncConfig's file reads.
+func resolvePlatformNodeID(fabricNodeID, sshSyncNodeID string) string {
+	if fabricNodeID != "" {
+		return fabricNodeID
+	}
+	return sshSyncNodeID
+}
+
 // gatherIdentity collects a NodeIdentity from local/persisted state, plus the
 // one live network probe described in the package doc comment. It never
 // errors and never panics on an unregistered/offline host -- every source is
@@ -152,6 +176,13 @@ func gatherIdentity(ctx context.Context) NodeIdentity {
 		id.OrgName = dc.OrgName
 		id.UserEmail = dc.UserEmail
 		id.UserName = dc.UserName
+		// FabricNodeID (aceteam #8139) is read here, alongside the other
+		// fields from the SAME /token-response-derived file, rather than
+		// SSHSyncConfig.NodeID below -- see design-node-identity-receipts.md
+		// §2. It is empty on every node until a backend echo point starts
+		// populating it; SSHSyncConfig remains a documented last-resort
+		// fallback (see below) since it costs nothing to leave in place.
+		id.PlatformNodeID = dc.FabricNodeID
 	} else if manifestOrgID != "" {
 		id.OrgID = manifestOrgID
 	}
@@ -163,9 +194,16 @@ func gatherIdentity(ctx context.Context) NodeIdentity {
 	nodeConfigDir := network.GetNodeConfigDir()
 	id.NodeConfigDir = nodeConfigDir
 
+	// Last-resort fallback ONLY: SSHSyncConfig.NodeID has no writer today
+	// (design-node-identity-receipts.md §1a) and reads empty on essentially
+	// every real node, but costs nothing to keep checking -- it lights up
+	// for free if a backend process ever starts populating it, and the
+	// device-config value above always wins when present.
+	var sshSyncNodeID string
 	if sshConfig, err := nexus.LoadSSHSyncConfig(nodeConfigDir); err == nil && sshConfig != nil {
-		id.PlatformNodeID = sshConfig.NodeID
+		sshSyncNodeID = sshConfig.NodeID
 	}
+	id.PlatformNodeID = resolvePlatformNodeID(id.PlatformNodeID, sshSyncNodeID)
 
 	if network.HasState() {
 		id.Registered = true

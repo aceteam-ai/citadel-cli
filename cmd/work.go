@@ -3070,6 +3070,11 @@ type DeviceConfig struct {
 	// device token cannot reach (Team Chat, MCP). Set manually by the user;
 	// device auth never writes it. See aceteam-ai/citadel-cli#495.
 	AceteamAPIKey string `yaml:"aceteam_api_key"`
+	// FabricNodeID is the numeric AceTeam fabric/platform node ID (aceteam
+	// #8139), once a backend echo point has sent one. Empty on every node
+	// today -- see docs/design-node-identity-receipts.md §2 and
+	// cmd/whoami.go's NodeIdentity.PlatformNodeID, which reads this field.
+	FabricNodeID string `yaml:"fabric_node_id"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the

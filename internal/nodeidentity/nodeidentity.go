@@ -25,8 +25,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -250,6 +252,49 @@ func (s *Store) LoadLeaf() (*x509.Certificate, error) {
 		return nil, fmt.Errorf("parse leaf cert: %w", err)
 	}
 	return cert, nil
+}
+
+// Sign signs the SHA-256 digest of payload with the node's ECDSA P-256
+// private key (creating one via GetOrCreateKey if none exists yet) and
+// returns an ASN.1 DER-encoded signature.
+//
+// Added for citadel-cli's signed AEP receipt (aceteam #8253, the deferred
+// signing half of internal/trust's grounding guardrail) — a second consumer
+// of this package's key alongside the mTLS CSR/leaf flow it was originally
+// built for (#4583). See docs/design-node-identity-receipts.md §1c/§1d for
+// why this key (unattended-capable, no PIN gate) was chosen over
+// internal/nodevault's Session/DeriveSubkey (symmetric, PIN-gated, cannot
+// sign unattended under a headless `citadel work`).
+func (s *Store) Sign(payload []byte) ([]byte, error) {
+	key, err := s.GetOrCreateKey()
+	if err != nil {
+		return nil, fmt.Errorf("get or create signing key: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
+	if err != nil {
+		return nil, fmt.Errorf("sign payload: %w", err)
+	}
+	return sig, nil
+}
+
+// PublicKeyFingerprint returns a stable identifier for the node's public key
+// — sha256 of its DER-encoded SubjectPublicKeyInfo, hex-encoded and prefixed
+// "sha256:" — that a verifier can look up a registered public key by without
+// needing the private key or a full certificate. Deterministic: the same
+// on-disk key always yields the same fingerprint, and (like Sign) creates a
+// key via GetOrCreateKey if none exists yet.
+func (s *Store) PublicKeyFingerprint() (string, error) {
+	key, err := s.GetOrCreateKey()
+	if err != nil {
+		return "", fmt.Errorf("get or create signing key: %w", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("marshal public key: %w", err)
+	}
+	sum := sha256.Sum256(der)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // validateCertPEM confirms that data contains at least one parseable X.509

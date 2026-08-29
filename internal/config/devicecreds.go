@@ -67,6 +67,15 @@ type DeviceCreds struct {
 	// APIBaseURL is the AceTeam API base (e.g. "https://aceteam.ai"). May be
 	// empty in older configs; callers should fall back to their own default.
 	APIBaseURL string `yaml:"api_base_url"`
+	// FabricNodeID is the numeric AceTeam fabric/platform node ID (aceteam
+	// #8139), when the backend has echoed one back to this node. Read from
+	// the SAME config.yaml as Token/APIBaseURL. Empty on every node today --
+	// see docs/design-node-identity-receipts.md §2 -- until a backend echo
+	// point (device-auth /token response, or a heartbeat ack) starts sending
+	// it. Included here (not just in cmd.DeviceConfig) so a leaf package like
+	// internal/aep/internal/worker can resolve a signed receipt's node_id
+	// without importing cmd.
+	FabricNodeID string `yaml:"fabric_node_id"`
 }
 
 // LoadDeviceCreds reads the device bearer token + API base URL from

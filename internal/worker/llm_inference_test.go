@@ -2,12 +2,21 @@ package worker
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
@@ -505,4 +514,264 @@ func TestLLMInferenceHandler_GroundingGuardrailGate(t *testing.T) {
 			t.Errorf("flagged claim value = %v, want \"68%%\"", flagged[0]["value"])
 		}
 	})
+}
+
+// fakeAEPSigner is an in-memory ECDSA signer implementing aep.Signer, used to
+// keep AEP receipt-signing tests hermetic -- unlike nodeidentity.Default()
+// (the production default), it never touches the real host's
+// platform.ConfigDir()/identity directory.
+type fakeAEPSigner struct {
+	key *ecdsa.PrivateKey
+}
+
+func newFakeAEPSigner(t *testing.T) *fakeAEPSigner {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	return &fakeAEPSigner{key: key}
+}
+
+func (f *fakeAEPSigner) Sign(payload []byte) ([]byte, error) {
+	digest := sha256.Sum256(payload)
+	return ecdsa.SignASN1(rand.Reader, f.key, digest[:])
+}
+
+func (f *fakeAEPSigner) PublicKeyFingerprint() (string, error) {
+	der, err := x509.MarshalPKIXPublicKey(&f.key.PublicKey)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(der)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// TestLLMInferenceHandler_SignAEPReceiptsGate pins the opt-in contract for
+// the signed AEP receipt (aceteam #8253, the signing half deferred at
+// citadel#847's merge -- docs/design-node-identity-receipts.md):
+//   - CITADEL_GROUNDING_GUARDRAIL off (regardless of CITADEL_SIGN_AEP_RECEIPTS):
+//     byte-identical output to before this feature existed -- no "grounding",
+//     no "aep_receipt".
+//   - CITADEL_GROUNDING_GUARDRAIL on, CITADEL_SIGN_AEP_RECEIPTS off (the
+//     citadel#847 shipped default): "grounding" attaches, "aep_receipt" does
+//     NOT -- signing is a second, independent opt-in.
+//   - Both on: "aep_receipt" attaches, shaped as designed, and its signature
+//     verifies against the injected signer's own public key.
+func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"the answer is 42."},"finish_reason":"stop"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	newJob := func() *Job {
+		return &Job{
+			ID:   "job-aep-1",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":   "bonsai-27b",
+				"backend": "bonsai",
+				"messages": []map[string]any{
+					{"role": "user", "content": "what is the answer?"},
+				},
+			},
+		}
+	}
+
+	t.Run("both off: no grounding, no aep_receipt", func(t *testing.T) {
+		h := NewLLMInferenceHandler().WithSigner(newFakeAEPSigner(t)).WithFabricNodeIDResolver(func() string { return "" })
+		h.baseURLs["bonsai"] = ts.URL
+		result, err := h.Execute(context.Background(), newJob(), &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if _, present := result.Output["grounding"]; present {
+			t.Errorf("Output = %+v, want no grounding key", result.Output)
+		}
+		if _, present := result.Output["aep_receipt"]; present {
+			t.Errorf("Output = %+v, want no aep_receipt key", result.Output)
+		}
+	})
+
+	t.Run("grounding on, signing off: grounding attaches, aep_receipt does not", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		h := NewLLMInferenceHandler().WithSigner(newFakeAEPSigner(t)).WithFabricNodeIDResolver(func() string { return "" })
+		h.baseURLs["bonsai"] = ts.URL
+		result, err := h.Execute(context.Background(), newJob(), &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if _, present := result.Output["grounding"]; !present {
+			t.Errorf("Output = %+v, want a grounding key", result.Output)
+		}
+		if _, present := result.Output["aep_receipt"]; present {
+			t.Errorf("Output = %+v, want no aep_receipt key when signing is off", result.Output)
+		}
+	})
+
+	t.Run("signing on but grounding off: aep_receipt does not attach either", func(t *testing.T) {
+		// Signing rides INSIDE the grounding gate (it signs the
+		// GroundingResult) -- CITADEL_SIGN_AEP_RECEIPTS alone, without the
+		// guardrail itself on, must be a no-op.
+		t.Setenv(signAEPReceiptsEnvVar, "1")
+		h := NewLLMInferenceHandler().WithSigner(newFakeAEPSigner(t)).WithFabricNodeIDResolver(func() string { return "" })
+		h.baseURLs["bonsai"] = ts.URL
+		result, err := h.Execute(context.Background(), newJob(), &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if _, present := result.Output["grounding"]; present {
+			t.Errorf("Output = %+v, want no grounding key", result.Output)
+		}
+		if _, present := result.Output["aep_receipt"]; present {
+			t.Errorf("Output = %+v, want no aep_receipt key when grounding is off", result.Output)
+		}
+	})
+
+	t.Run("both on: aep_receipt attaches and verifies", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		t.Setenv(signAEPReceiptsEnvVar, "1")
+		signer := newFakeAEPSigner(t)
+		h := NewLLMInferenceHandler().WithSigner(signer).WithFabricNodeIDResolver(func() string { return "" })
+		h.baseURLs["bonsai"] = ts.URL
+
+		job := newJob()
+		result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if _, present := result.Output["grounding"]; !present {
+			t.Fatalf("Output = %+v, want a grounding key", result.Output)
+		}
+
+		raw, present := result.Output["aep_receipt"]
+		if !present {
+			t.Fatalf("Output = %+v, want an aep_receipt key", result.Output)
+		}
+		// MUST be a plain map[string]any, not *aep.AEPReceiptV1 -- Output
+		// crosses the wire via StreamWriter/Redis/API serialization
+		// elsewhere in the worker, so a typed Go pointer attached here would
+		// be the only one of its kind in this map. Proving json.Marshal
+		// produces the expected wire shape (not just that the in-process Go
+		// value looks right) is the point of this assertion.
+		receiptMap, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("aep_receipt = %#v (%T), want map[string]any", raw, raw)
+		}
+		wireBytes, err := json.Marshal(result.Output)
+		if err != nil {
+			t.Fatalf("json.Marshal(result.Output): %v", err)
+		}
+		var wire struct {
+			AEPReceipt aep.AEPReceiptV1 `json:"aep_receipt"`
+		}
+		if err := json.Unmarshal(wireBytes, &wire); err != nil {
+			t.Fatalf("json.Unmarshal wire bytes: %v", err)
+		}
+		receipt := &wire.AEPReceipt
+
+		if receipt.JobID != job.ID {
+			t.Errorf("receipt.JobID = %q, want %q", receipt.JobID, job.ID)
+		}
+		if receipt.Engine != "bonsai" {
+			t.Errorf("receipt.Engine = %q, want bonsai", receipt.Engine)
+		}
+		if receipt.Model != "bonsai-27b" {
+			t.Errorf("receipt.Model = %q, want bonsai-27b", receipt.Model)
+		}
+		wantFP, _ := signer.PublicKeyFingerprint()
+		if receipt.NodeID != wantFP {
+			t.Errorf("receipt.NodeID = %q, want the signer's own fingerprint %q (no fabric node ID configured in this test)", receipt.NodeID, wantFP)
+		}
+		if receipt.PublicKeyFingerprint != wantFP {
+			t.Errorf("receipt.PublicKeyFingerprint = %q, want %q", receipt.PublicKeyFingerprint, wantFP)
+		}
+		if receiptMap["job_id"] != job.ID {
+			t.Errorf(`receiptMap["job_id"] = %v, want %q (snake_case wire key)`, receiptMap["job_id"], job.ID)
+		}
+
+		sigDER, err := base64.StdEncoding.DecodeString(receipt.Signature)
+		if err != nil {
+			t.Fatalf("decode signature: %v", err)
+		}
+		digest := sha256.Sum256(aep.Canonicalize(receipt))
+		if !ecdsa.VerifyASN1(&signer.key.PublicKey, digest[:], sigDER) {
+			t.Errorf("receipt signature does not verify against the signer's own public key")
+		}
+	})
+}
+
+// failingAEPSigner always errors, used to pin the fail-open contract: a
+// signing failure must never fail the job or drop the "content"/"grounding"
+// fields already computed -- only the aep_receipt attachment is skipped.
+type failingAEPSigner struct{}
+
+func (failingAEPSigner) Sign([]byte) ([]byte, error) {
+	return nil, errFakeSignerBoom
+}
+
+func (failingAEPSigner) PublicKeyFingerprint() (string, error) {
+	return "", errFakeSignerBoom
+}
+
+var errFakeSignerBoom = fmt.Errorf("fake signer: boom")
+
+// TestLLMInferenceHandler_SignAEPReceiptFailsOpen pins that a signing failure
+// (e.g. the node's key is unavailable) never fails the job or drops content
+// already computed -- only the aep_receipt attachment is skipped. This is
+// the "signing must never break inference" contract stated in
+// bufferedChatCompletions' doc comment.
+func TestLLMInferenceHandler_SignAEPReceiptFailsOpen(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"the answer is 42."},"finish_reason":"stop"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	t.Setenv(groundingGuardrailEnvVar, "1")
+	t.Setenv(signAEPReceiptsEnvVar, "1")
+
+	h := NewLLMInferenceHandler().
+		WithSigner(failingAEPSigner{}).
+		WithFabricNodeIDResolver(func() string { return "" })
+	h.baseURLs["bonsai"] = ts.URL
+
+	var loggedCalls int
+	h.aepLogf = func(format string, args ...any) { loggedCalls++ }
+
+	job := &Job{
+		ID:   "job-fail-open",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "bonsai-27b",
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "what is the answer?"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success even when signing fails", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "the answer is 42." {
+		t.Errorf("content = %q, want the answer to still be present", got)
+	}
+	if _, present := result.Output["grounding"]; !present {
+		t.Errorf("Output = %+v, want the grounding key to still attach", result.Output)
+	}
+	if _, present := result.Output["aep_receipt"]; present {
+		t.Errorf("Output = %+v, want no aep_receipt key when signing fails", result.Output)
+	}
+	if loggedCalls != 1 {
+		t.Errorf("aepLogf called %d times, want exactly 1 (the signing failure logged, non-fatally)", loggedCalls)
+	}
 }

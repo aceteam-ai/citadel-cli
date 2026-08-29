@@ -16,8 +16,14 @@
 // whether to sign that receipt, is the caller's responsibility — see
 // internal/worker/llm_inference.go's bufferedChatCompletions for the one
 // wired integration point. Cryptographically signing the receipt (the AEP
-// half of #8253) is a separate, deferred issue: it overlaps the nodevault
-// node-identity lane and is explicitly out of scope here.
+// half of #8253, internal/aep) is now implemented — see
+// docs/design-node-identity-receipts.md for the design and
+// internal/aep's package doc for the implementation. It signs with
+// internal/nodeidentity's ECDSA key, NOT internal/nodevault: nodevault is a
+// PIN-gated symmetric secrets vault that structurally cannot back unattended
+// signing under a headless `citadel work` (see the design doc §1c). This
+// package (internal/trust) still does not sign anything itself — the
+// signing lives entirely in internal/aep and its call site.
 package trust
 
 import (
