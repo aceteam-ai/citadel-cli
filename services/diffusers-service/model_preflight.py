@@ -376,10 +376,34 @@ def run_preflight(
     internal/jobs/disk_space.go's contract exactly: a pull proceeding
     un-preflighted is preferable to blocking a legitimate download because
     OUR size estimate couldn't be computed. Fails CLOSED (raises
-    InsufficientDiskSpaceError, propagated to the caller) only on a
-    CONFIRMED shortfall between a successfully estimated size and
-    actually-measured free space -- never on a guess.
+    InsufficientDiskSpaceError, propagated to the caller) only when an
+    operator has set `allow_patterns`/`ignore_patterns` -- see the
+    "default path" note below for why an unfiltered estimate never fails
+    closed.
+
+    **Default path (neither pattern set) never refuses -- citadel#913.**
+    With no filter, `estimate_repo_size_bytes` sums the ENTIRE repo tree
+    (`allow_patterns=None` selects everything not ignored), but
+    `from_pretrained`'s own `download()` only ever fetches the smaller
+    `model_index.json`-derived component subset -- see
+    `default_snapshot_download`'s docstring for the verified diffusers
+    source behavior this relies on. For a repo shaped like
+    Lightricks/LTX-Video (many sibling checkpoints, one small pipeline
+    actually loaded), that mismatch can make a real, fitting download look
+    like it won't fit. Refusing on that guess would be a false, safe-direction
+    refusal, but still a usability regression on the path #902/#910 didn't
+    intend to touch -- deferred estimating the true component subset (option
+    (b) in citadel#913) as not cleanly doable without reimplementing
+    diffusers' own component-selection logic (`deriveDiffusersAllowPatterns`'s
+    Go-side non-goal, restated for this path). So on the default path this
+    only WARNS on an apparent shortfall and always proceeds; the REFUSE
+    behavior is preserved exactly as before whenever the operator has set
+    `DIFFUSERS_ALLOW_PATTERNS`/`DIFFUSERS_IGNORE_PATTERNS` -- that is the
+    real disk-fill scenario #902 targets (an operator-declared, and
+    therefore reliably-estimated, subset), and it still fails CLOSED.
     """
+    operator_filter_set = bool(allow_patterns) or bool(ignore_patterns)
+
     try:
         required_bytes = estimate_repo_size_bytes(
             repo_id,
@@ -407,11 +431,42 @@ def run_preflight(
         )
         return
 
-    plan_disk_preflight(cache_dir, required_bytes, available_bytes, margin_bytes)
-    logger.info(
-        "diffusers preflight: %s needs ~%s, %s free at %s -- proceeding",
-        repo_id,
-        _human_bytes(required_bytes),
-        _human_bytes(available_bytes),
-        cache_dir,
-    )
+    if operator_filter_set:
+        # The real disk-fill scenario #902 targets: an operator-declared
+        # subset is a reliable estimate of what will actually be
+        # downloaded (prefetch_filtered_weights fetches exactly this
+        # subset itself), so a confirmed shortfall here fails CLOSED.
+        plan_disk_preflight(cache_dir, required_bytes, available_bytes, margin_bytes)
+        logger.info(
+            "diffusers preflight: %s needs ~%s (filtered), %s free at %s -- proceeding",
+            repo_id,
+            _human_bytes(required_bytes),
+            _human_bytes(available_bytes),
+            cache_dir,
+        )
+        return
+
+    # Default path (citadel#913): the full-tree estimate above is an
+    # upper bound on the real download, not a prediction of it, so an
+    # apparent shortfall is only ever a WARNING, never a refusal.
+    needed = max(required_bytes, 0) + max(margin_bytes, 0)
+    if available_bytes < needed:
+        logger.warning(
+            "diffusers preflight: %s full-tree estimate (~%s) exceeds free space "
+            "(~%s free at %s), but no DIFFUSERS_ALLOW_PATTERNS/DIFFUSERS_IGNORE_PATTERNS "
+            "is set -- from_pretrained only downloads its own component subset of the "
+            "repo, which may still fit, so proceeding without refusing. Set one of "
+            "those env vars to enable the disk-fill refusal guard for this repo.",
+            repo_id,
+            _human_bytes(required_bytes),
+            _human_bytes(available_bytes),
+            cache_dir,
+        )
+    else:
+        logger.info(
+            "diffusers preflight: %s needs ~%s (full-tree estimate), %s free at %s -- proceeding",
+            repo_id,
+            _human_bytes(required_bytes),
+            _human_bytes(available_bytes),
+            cache_dir,
+        )

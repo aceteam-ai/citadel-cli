@@ -95,11 +95,21 @@ def _get_pipe():
         # no-op for engine:diffusers since #545, so this call site is the only
         # place that fix's protections can actually reach the LTX-Video-shaped
         # (multi-checkpoint, ~161GB) disk-fill incident. allow_patterns/
-        # ignore_patterns are optional and additive: unset (the default), this
-        # behaves exactly as before -- an unfiltered pull of the whole repo.
-        # run_preflight fails OPEN on a metadata/disk-probe error and fails
-        # CLOSED (raises, propagated to /generate's caller) only on a
-        # confirmed shortfall -- see model_preflight.py for the full contract.
+        # ignore_patterns are optional and additive: unset (the default), the
+        # actual pull below behaves exactly as before -- from_pretrained
+        # fetches its own unfiltered model_index.json-derived subset.
+        #
+        # run_preflight fails OPEN (never blocks) on a metadata/disk-probe
+        # error, and its fail-CLOSED behavior (raises, propagated to
+        # /generate's caller) is now narrower than "any confirmed shortfall"
+        # (citadel #913): it only refuses when allow_patterns/ignore_patterns
+        # is actually set, because only then is its size estimate a reliable
+        # prediction of what from_pretrained will download. On the default,
+        # unfiltered path it estimates the FULL repo tree, which
+        # from_pretrained's own component-subset download rarely matches --
+        # so a confirmed shortfall there is only logged as a warning and
+        # never blocks the load. See run_preflight's docstring for the full
+        # two-branch contract.
         allow_patterns, ignore_patterns = model_preflight.resolve_allow_ignore_patterns()
         hf_token = model_preflight.hf_auth_token()
         model_preflight.run_preflight(

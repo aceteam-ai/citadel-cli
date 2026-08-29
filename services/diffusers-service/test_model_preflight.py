@@ -294,20 +294,59 @@ def test_default_snapshot_download_signature_has_no_cache_dir_param():
 # ---------------------------------------------------------------------------
 
 
-def test_run_preflight_refuses_on_confirmed_shortfall():
-    """The core citadel #902 case: a repo shaped like LTX-Video (161GB
-    unfiltered) against a node with only 50GB free must refuse loudly with
-    required-vs-available numbers, and must download nothing."""
+def test_run_preflight_refuses_on_confirmed_shortfall_with_operator_filter():
+    """The core citadel #902 case, WITH an operator-declared filter: a repo
+    shaped like LTX-Video, filtered down to a subset that still doesn't fit
+    a node with only 50GB free, must refuse loudly with required-vs-available
+    numbers, and must download nothing. citadel#913 narrows the REFUSE
+    behavior to exactly this operator-filter-set case (see below for the
+    default, unfiltered path, which now only warns)."""
     with pytest.raises(mp.InsufficientDiskSpaceError) as exc_info:
         mp.run_preflight(
             "Lightricks/LTX-Video",
             "/citadel-cache/huggingface",
+            ignore_patterns=["*.md"],  # any operator filter, even a no-op one, engages the guard
             list_repo_files_fn=_fake_list_repo_files(_LTX_VIDEO_SHAPED_ENTRIES),
             available_disk_bytes_fn=lambda _dir: 50 << 30,
         )
     message = str(exc_info.value)
     assert "insufficient disk space" in message
     assert "downloading nothing" in message
+
+
+def test_run_preflight_default_path_warns_but_does_not_refuse_on_full_tree_shortfall(caplog):
+    """citadel#913 (PR #910 review Finding 2): on the DEFAULT path (no
+    DIFFUSERS_ALLOW_PATTERNS/DIFFUSERS_IGNORE_PATTERNS set), run_preflight's
+    estimate sums the ENTIRE repo tree, but from_pretrained's own download()
+    only fetches the smaller model_index.json-derived component subset. A
+    node with enough free space for the REAL (subset) download but not the
+    inflated full-tree estimate must NOT be false-refused -- it must proceed,
+    with a warning logged instead of a raise. This is the exact LTX-Video
+    shape: ~162GB full tree, but the free space (50GB) comfortably covers the
+    real ~12GB pipeline subset that would actually be fetched."""
+    with caplog.at_level("WARNING"):
+        mp.run_preflight(
+            "Lightricks/LTX-Video",
+            "/citadel-cache/huggingface",
+            list_repo_files_fn=_fake_list_repo_files(_LTX_VIDEO_SHAPED_ENTRIES),
+            available_disk_bytes_fn=lambda _dir: 50 << 30,
+        )  # must not raise, even though 50GB < the 162GB full-tree estimate
+    assert any("no DIFFUSERS_ALLOW_PATTERNS" in record.message for record in caplog.records)
+
+
+def test_run_preflight_default_path_still_proceeds_quietly_when_full_tree_fits():
+    """Sanity check alongside the warn-not-refuse case above: when the full
+    tree estimate DOES fit, the default path behaves exactly as before
+    (proceeds, no exception) -- citadel#913 only changes the refuse-on-
+    shortfall direction, not the fits-fine direction."""
+    mp.run_preflight(
+        "stabilityai/sdxl-turbo",
+        "/citadel-cache/huggingface",
+        list_repo_files_fn=_fake_list_repo_files(
+            [mp.RepoFileInfo(path="model.safetensors", size=7 << 30)]
+        ),
+        available_disk_bytes_fn=lambda _dir: 100 << 30,
+    )  # must not raise
 
 
 def test_run_preflight_allow_patterns_lets_the_filtered_pull_through():
