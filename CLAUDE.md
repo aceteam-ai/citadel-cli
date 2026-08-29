@@ -2106,6 +2106,25 @@ immediate, clear error), so it needed no change here.
 this hermetically — the lock-acquisition seam is tested directly, with no real
 Chrome/Xvfb launched.
 
+**The lock is acquired before ANY other Start() setup work, not just before
+Xvfb/Chrome exec (citadel#896 hardening).** `Start()` originally called
+`findChromium()` and `preparePersistentProfileDir()` (a real `mkdir`/`chmod`)
+BEFORE `acquireMeetingProfileLock` — those two still ran unconditionally even
+against an already-locked profile, so only Xvfb/Chrome were actually skipped
+on a collision, not the doc's stated "before touching anything". Reordered so
+the lock (keyed by the same `resolveMeetingProfileDir` resolution
+`preparePersistentProfileDir` uses internally, so the key is unchanged) is
+claimed first and everything else — including the two calls above — sits
+inside the deferred-release span. This closes a real gap
+(`TestMeetingBrowser_CloseReleasesProfileLock` hand-constructs a
+`MeetingBrowser` with a pre-set `profileLockRelease` and so would stay green
+even if a future refactor dropped the `acquireMeetingProfileLock` call from
+`Start()` entirely) and is what makes
+`TestMeetingBrowser_StartAcquiresProfileLockFirst` — which calls the REAL
+`Start()` against a pre-locked profile and asserts it fails fast with no
+Chrome/Xvfb process and no profile-dir creation — hermetic on a host with no
+Chromium/Xvfb installed at all.
+
 **Self-heal STUCK detection hardening (non-blocking review WANT, also fixed
 here).** `LivenessMonitor`'s STUCK check (`internal/worker/selfheal.go`) used
 to measure `WorkerState.LastJobAt` — the time the MOST RECENT job started,
@@ -2119,15 +2138,31 @@ time the CURRENT in-flight streak began (the last `0 -> >0` transition),
 untouched by jobs that start after it and cleared only when in-flight fully
 drains back to 0. `RecordJobReceived`/`RecordJobDone` serialize the
 increment/decrement against this conditional stamp under a small
-`inFlightMu` (kept separate from the atomic `inFlight` counter itself, so
-existing lock-free readers like `Snapshot()` are unaffected) — without that
-serialization, a decrement-to-zero and a concurrent increment-to-one could
-apply their stamps out of order and silently erase a legitimate in-flight
-start time. The STUCK check now reads `OldestInFlightAt`, not `LastJobAt`.
+`inFlightMu` — without that serialization, a decrement-to-zero and a
+concurrent increment-to-one could apply their stamps out of order and
+silently erase a legitimate in-flight start time. The STUCK check now reads
+`OldestInFlightAt`, not `LastJobAt` (later narrowed to `OldestExecutingAt`,
+its `Executing`-scoped analogue — see #908 above).
 `TestLivenessMonitorCheck_StuckUsesOldestInFlightNotLastJob`
 (`selfheal_test.go`) pins the fix by driving real `WorkerState` transitions
 (a wedged 6h job plus an interleaved short job) through the actual
 `RecordJobReceived`/`RecordJobDone` API.
+
+**`Snapshot()` reads each pair under that same mutex too (citadel#896).**
+`inFlight`/`oldestInFlightUnixNano` (and the `executing`/
+`oldestExecutingUnixNano` pair `inFlightMu`'s comment above describes) were
+originally read here as two INDEPENDENT lock-free atomic loads apiece, so a
+snapshot could land between a writer's count bump and its conditional
+timestamp store/clear and observe a torn pair (e.g. `Executing==1` with
+`OldestExecutingAt==nil`) — harmless for the pair the STUCK check actually
+reads today (it already gates on both being set), but with no such safety
+net for `InFlight`/`OldestInFlightAt`, which is surfaced on the heartbeat
+directly with no internal gating. `Snapshot()` now takes `inFlightMu`/
+`executingMu` around each paired read, closing the window instead of relying
+on gating to keep it harmless.
+`TestWorkerState_SnapshotInFlightPairingIsConsistent` (`state_test.go`) pins
+the resulting invariant (`InFlight>0 <=> OldestInFlightAt!=nil`, and the
+`Executing` analogue) under concurrent writers.
 
 ### Node self-identity and the missing numeric fabric ID (`citadel whoami`, aceteam #8139)
 

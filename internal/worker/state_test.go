@@ -173,3 +173,64 @@ func TestSnapshotIdentityUnresolved(t *testing.T) {
 		t.Error("expected IdentityUnresolved=false when the Headscale node ID resolved")
 	}
 }
+
+// TestWorkerState_SnapshotInFlightPairingIsConsistent is the citadel-cli#896
+// regression test for the Snapshot() torn-read hardening: InFlight/
+// OldestInFlightAt and Executing/OldestExecutingAt are each written together
+// under inFlightMu/executingMu (RecordJobReceived/RecordJobDone and
+// RecordJobExecuting/RecordJobExecuteDone respectively), so a consistent
+// Snapshot() must never observe one half of a pair mid-update: a count > 0
+// with a nil timestamp, or a count == 0 with a non-nil one. Drives real
+// concurrent writers (not a single-goroutine sequence, which can't expose a
+// torn read) against a concurrent reader long enough to exercise the window
+// the fix closes.
+func TestWorkerState_SnapshotInFlightPairingIsConsistent(t *testing.T) {
+	s := NewWorkerState()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				s.RecordJobReceived()
+				s.RecordJobExecuting()
+				s.RecordJobExecuteDone()
+				s.RecordJobDone(true)
+			}
+		}()
+	}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		snap := s.Snapshot()
+		if snap.InFlight > 0 && snap.OldestInFlightAt == nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("torn read: InFlight=%d but OldestInFlightAt is nil", snap.InFlight)
+		}
+		if snap.InFlight == 0 && snap.OldestInFlightAt != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("torn read: InFlight=0 but OldestInFlightAt=%v", *snap.OldestInFlightAt)
+		}
+		if snap.Executing > 0 && snap.OldestExecutingAt == nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("torn read: Executing=%d but OldestExecutingAt is nil", snap.Executing)
+		}
+		if snap.Executing == 0 && snap.OldestExecutingAt != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("torn read: Executing=0 but OldestExecutingAt=%v", *snap.OldestExecutingAt)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
