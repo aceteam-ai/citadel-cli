@@ -834,7 +834,7 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	messages := make([]map[string]any, 0, len(payload.Messages))
 	for _, m := range payload.Messages {
 		msg := map[string]any{"role": m.Role, "content": m.ContentJSON()}
-		if len(m.ToolCalls) > 0 {
+		if hasToolCalls(m.ToolCalls) {
 			msg["tool_calls"] = m.ToolCalls
 		}
 		if m.ToolCallID != "" {
@@ -1110,6 +1110,31 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 	return h.success(output), nil
 }
 
+// hasToolCalls reports whether raw is a MEANINGFUL, non-empty OpenAI
+// tool_calls array -- i.e. whether it should be treated as "tool calls are
+// present", as opposed to absent. json.RawMessage's byte length alone is NOT
+// a meaningful presence check: the literal JSON `null` is 4 bytes and `[]` is
+// 2 bytes, both len(raw) > 0 despite meaning "no tool calls". A Pydantic- (or
+// any strictly-typed-response-model-) backed engine can plausibly serialize
+// `"tool_calls": null` on an ORDINARY non-tool reply, so `len(raw) > 0` alone
+// would wrongly treat that reply as tool-calls-present -- on the buffered
+// response path this wrongly suppresses the reasoning_content->content
+// fallback for a thinking model (e.g. bonsai) that ran out of budget
+// mid-reasoning and also happened to carry an explicit null/empty tool_calls
+// field, so the caller gets an empty reply instead of the reasoning. This
+// unmarshals into a slice and counts elements instead of trusting the byte
+// length, so `null`/`""`/`[]`/malformed JSON all correctly read as "absent".
+func hasToolCalls(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return false
+	}
+	return len(arr) > 0
+}
+
 // toolCallDelta is one entry in an OpenAI streaming delta.tool_calls array
 // (citadel-cli#603). Deltas arrive incrementally by index -- id/type/
 // function.name typically land on the FIRST delta for that index, and
@@ -1129,10 +1154,13 @@ type toolCallDelta struct {
 // toolCallAccumulator merges streaming tool_calls deltas (indexed, partial)
 // into a final OpenAI-shaped tool_calls array. Deliberately NOT a generic
 // json.RawMessage merge: `arguments` must be concatenated as TEXT (a delta may
-// split the JSON string mid-token), and id/type/name must be LATCHED from
-// whichever delta first carries them, never overwritten by a later delta that
-// omits them (the common shape: id+name on the first delta for an index, bare
-// argument fragments on every delta after).
+// split the JSON string mid-token), and id/type/name follow "last non-empty
+// wins" (merge only overwrites on a non-empty delta field, never blanks a
+// value an earlier delta already set) rather than being locked after the
+// first sighting -- in the common shape (id+name on the first delta for an
+// index, bare argument fragments after) those two behave identically, but
+// they are not the same rule, so don't describe this as "latched from the
+// first delta".
 type toolCallAccumulator struct {
 	order []int
 	byIdx map[int]*accumulatedToolCall
@@ -1242,7 +1270,7 @@ func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string
 	if len(response.Choices) > 0 {
 		msg := response.Choices[0].Message
 		content = msg.Content
-		if len(msg.ToolCalls) > 0 {
+		if hasToolCalls(msg.ToolCalls) {
 			toolCalls = msg.ToolCalls
 		} else if content == "" {
 			content = msg.ReasoningContent

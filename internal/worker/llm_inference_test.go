@@ -1378,3 +1378,129 @@ func TestLLMInferenceHandler_BufferedContentAndToolCallsBothPresent(t *testing.T
 		t.Errorf("chunks = %v, want the narration published as a single parity chunk", stream.chunks)
 	}
 }
+
+// TestLLMInferenceHandler_ToolCallsNullOrEmptyTreatedAsAbsent is the coordinator
+// review pin for a real robustness gap: json.RawMessage's byte length alone is
+// NOT a meaningful "tool calls present" check -- the literal JSON `null` is 4
+// bytes and `[]` is 2 bytes, both len(raw) > 0 despite meaning "no tool calls".
+// A Pydantic-typed engine response can plausibly serialize an explicit
+// "tool_calls": null (or []) on an ORDINARY reply. Before the hasToolCalls fix,
+// a thinking model (e.g. bonsai) with empty content, non-empty
+// reasoning_content, AND an explicit null/empty tool_calls field would take the
+// "tool_calls present" branch and NOT fall back to reasoning_content -- the
+// caller got an empty reply instead of the reasoning. This must FAIL against
+// the old `len(msg.ToolCalls) > 0` check.
+func TestLLMInferenceHandler_ToolCallsNullOrEmptyTreatedAsAbsent(t *testing.T) {
+	cases := []struct {
+		name         string
+		toolCallsRaw string
+	}{
+		{name: "explicit null", toolCallsRaw: `null`},
+		{name: "empty array", toolCallsRaw: `[]`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"choices":[{"message":{"content":"","reasoning_content":"thinking hard about the weather",` +
+				`"tool_calls":` + tc.toolCallsRaw + `},"finish_reason":"stop"}]}`
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_, _ = w.Write([]byte(body))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["bonsai"] = ts.URL
+
+			job := &Job{
+				ID:   "job-null-tool-calls-" + tc.name,
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model":    "m",
+					"backend":  "bonsai",
+					"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+				},
+			}
+			stream := &MockStreamWriter{}
+			result, err := h.Execute(context.Background(), job, stream)
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+			if got, _ := result.Output["content"].(string); got != "thinking hard about the weather" {
+				t.Errorf("content = %q, want the reasoning fallback to fire (tool_calls=%s must behave as absent)", got, tc.toolCallsRaw)
+			}
+			if _, present := result.Output["tool_calls"]; present {
+				t.Errorf("Output = %+v, want no \"tool_calls\" key (tool_calls=%s means absent)", result.Output, tc.toolCallsRaw)
+			}
+			if len(stream.chunks) != 1 || stream.chunks[0] != "thinking hard about the weather" {
+				t.Errorf("chunks = %v, want the reasoning published as a single parity chunk", stream.chunks)
+			}
+		})
+	}
+}
+
+// TestLLMInferenceHandler_RequestSideNullToolCallsNotForwarded is the
+// request-build analogue of the response-side fix above: an assistant
+// message in the incoming payload carrying an explicit "tool_calls": null (or
+// []) must not gain a spurious "tool_calls" key on the outbound engine
+// request -- it must behave exactly like an absent field.
+func TestLLMInferenceHandler_RequestSideNullToolCallsNotForwarded(t *testing.T) {
+	cases := []struct {
+		name          string
+		toolCallsJSON json.RawMessage
+	}{
+		{name: "explicit null", toolCallsJSON: json.RawMessage(`null`)},
+		{name: "empty array", toolCallsJSON: json.RawMessage(`[]`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["bonsai"] = ts.URL
+
+			// Build the payload directly (not via a job.Payload map[string]any
+			// round-trip) so the ChatMessage.ToolCalls field is exactly the raw
+			// literal under test, matching how parseLLMInferencePayload would
+			// decode an engine/backend that actually sent this literal.
+			payload := &jobs.LLMInferencePayload{
+				Model:   "m",
+				Backend: "bonsai",
+				Messages: []jobs.ChatMessage{
+					{Role: "user", Content: json.RawMessage(`"hi"`)},
+					{Role: "assistant", Content: json.RawMessage(`"ok"`), ToolCalls: tc.toolCallsJSON},
+				},
+			}
+			result, err := h.executeLlamaCppAt(context.Background(), &MockStreamWriter{}, payload, ts.URL, "job-null-tool-calls-req-"+tc.name)
+			if err != nil {
+				t.Fatalf("executeLlamaCppAt error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+
+			msgs, _ := gotReq["messages"].([]any)
+			if len(msgs) != 2 {
+				t.Fatalf("outbound messages = %v, want 2", msgs)
+			}
+			assistantMsg, _ := msgs[1].(map[string]any)
+			if _, present := assistantMsg["tool_calls"]; present {
+				t.Errorf("outbound assistant message = %+v, want no \"tool_calls\" key (input was %s)", assistantMsg, tc.toolCallsJSON)
+			}
+		})
+	}
+}
