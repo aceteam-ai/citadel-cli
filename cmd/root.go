@@ -99,6 +99,19 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// citadel#926: repair a Windows binary swap interrupted mid-update
+		// (a kill between atomicReplaceWindows's two renames can leave no
+		// binary at all at the running executable's path). Runs before
+		// anything else so a self-healed binary is what serves the rest of
+		// this invocation. No-op on every other OS and when nothing needs
+		// recovering; best-effort -- a failure here must never block the
+		// command the user actually asked for.
+		if recovered, err := update.RecoverInterruptedSwap(); err != nil {
+			Debug("interrupted update recovery check failed: %v", err)
+		} else if recovered {
+			Log("recovered from an interrupted update (citadel#926)")
+		}
+
 		// --runtime overrides container-runtime auto-detection (#636). Export it
 		// so the catalog selector sees it without threading a flag through the
 		// 13 call sites that resolve a runtime.
