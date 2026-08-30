@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -1283,6 +1284,21 @@ func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
 		return fmt.Errorf("ollama pull %s failed: %w: %s", model, err, strings.TrimSpace(string(out)))
 	}
 	ctx.Log("info", "     - Model %q pulled and available on ollama", model)
+
+	// Cache index write (citadel #682 P2a, design doc §8.3): this is the
+	// ONE pull site that does NOT run through ModelCachePullHandler
+	// (MODEL_CACHE_PULL) -- it is the SERVICE_START native-ollama path
+	// (#543). Missing it would reopen the #739 "every install path must
+	// record itself, or it's invisible" gap under a new name. Best-effort,
+	// like every other write site: a failed index update never fails the
+	// SERVICE_START that already succeeded.
+	upsertCacheIndexEntry(ctx, "", cacheindex.Entry{
+		CacheDir:  embeddedservices.EngineCacheDirs["ollama"].Dir,
+		Family:    embeddedservices.CacheFamilyNative,
+		Model:     model,
+		Engine:    "ollama",
+		SizeBytes: ollamaModelSize(model),
+	})
 	return nil
 }
 

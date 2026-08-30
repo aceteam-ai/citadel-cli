@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
@@ -205,6 +206,15 @@ func (h *ModelCachePullHandler) pullBonsai(ctx JobContext, jobID string) ([]byte
 	if err != nil {
 		return output, fmt.Errorf("bonsai pull reported success but produced no file (%w); output: %s", err, strings.TrimSpace(string(output)))
 	}
+
+	upsertCacheIndexEntry(ctx, jobID, cacheindex.Entry{
+		CacheDir:  services.BonsaiCacheDirName,
+		Family:    services.CacheFamilyGGUFDir,
+		Model:     bonsaiGGUFFile,
+		Engine:    "bonsai",
+		Files:     []string{bonsaiGGUFFile},
+		SizeBytes: sizeBytes,
+	})
 
 	result := modelCachePullResult{
 		Status:    "cached",
@@ -437,6 +447,7 @@ func (h *ModelCachePullHandler) pullLlamaCppGGUF(ctx JobContext, jobID, modelNam
 	// doc comment for why this gates on the directory's AFTER-pull total, not
 	// the before/after delta.
 	before := dirTotalSize(localDir)
+	beforeFiles := listFilesRelative(localDir)
 
 	cmd := BuildLlamaCppGGUFDownloadCommand(bin, modelName, localDir, finalAllow, finalIgnore)
 	output, err := cmd.CombinedOutput()
@@ -450,6 +461,8 @@ func (h *ModelCachePullHandler) pullLlamaCppGGUF(ctx JobContext, jobID, modelNam
 		return output, fmt.Errorf("hf download reported success but %s is empty — the CLI likely no-oped (deprecated huggingface-cli on huggingface_hub >= 1.x); output: %s", localDir, strings.TrimSpace(string(output)))
 	}
 
+	recordLlamaCppCacheIndexEntry(ctx, jobID, modelName, finalAllow, finalIgnore, localDir, beforeFiles, sizeBytes)
+
 	result := modelCachePullResult{
 		Status:    "cached",
 		ModelName: modelName,
@@ -457,6 +470,97 @@ func (h *ModelCachePullHandler) pullLlamaCppGGUF(ctx JobContext, jobID, modelNam
 		Engine:    "llamacpp",
 	}
 	return json.Marshal(result)
+}
+
+// listFilesRelative walks dir and returns the set of regular files present,
+// keyed by their slash-separated path relative to dir. Used by
+// recordLlamaCppCacheIndexEntry's before/after-diff fallback when the repo
+// tree re-fetch fails (see that function's doc comment).
+func listFilesRelative(dir string) map[string]bool {
+	out := map[string]bool{}
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		out[filepath.ToSlash(rel)] = true
+		return nil
+	})
+	return out
+}
+
+// recordLlamaCppCacheIndexEntry writes (or refreshes) this pull's cache
+// index entry, keyed by the repo id (modelName) with the COMPLETE set of
+// repo-relative files this pull's own files landed at -- design doc §8.1's
+// "post-pull intersection" rule: re-fetch the repo tree (the same call
+// runGGUFDiskPreflight already made minutes earlier) and keep exactly the
+// entries that pass the pull's own allow/ignore patterns AND exist on disk
+// now. This is deliberately the FULL current file set, not just what THIS
+// pull newly downloaded -- so a redeploy of an already-cached repo (a
+// legitimate no-op per llamaCppPullSucceeded's doc comment) still records
+// accurate, complete provenance rather than an empty Files list that would
+// silently erase what a prior pull already recorded.
+//
+// Falls back to a before/after directory-listing diff (unioned with
+// whatever Files the index already has for this model, if any) when the
+// tree re-fetch fails -- coarser (a concurrent pull into the SAME shared
+// directory could in principle cross-attribute a file), but the exec-1
+// serialized lane (design doc §8.2, and this handler's own
+// serializedLaneJobTypes membership) makes a concurrent pull into this
+// specific repo's own files not something that happens in practice; this is
+// an honest degrade for a rare network hiccup, not a correctness gap this
+// handler can close for free.
+func recordLlamaCppCacheIndexEntry(ctx JobContext, jobID, modelName string, allowPatterns, ignorePatterns []string, dir string, beforeFiles map[string]bool, sizeBytes int64) {
+	store := cacheIndexFn()
+	if store == nil {
+		return
+	}
+
+	var files []string
+	reqCtx, cancel := context.WithTimeout(ctx.Context(), hfMetadataTimeout)
+	entries, treeErr := hfRepoTreeFn(reqCtx, modelName)
+	cancel()
+	if treeErr == nil {
+		for _, e := range entries {
+			if e.Type != "file" || !patternsInclude(e.Path, allowPatterns, ignorePatterns) {
+				continue
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, filepath.FromSlash(e.Path))); statErr == nil {
+				files = append(files, e.Path)
+			}
+		}
+	} else {
+		after := listFilesRelative(dir)
+		union := map[string]bool{}
+		for f := range after {
+			if !beforeFiles[f] {
+				union[f] = true
+			}
+		}
+		if existing, ok := store.Snapshot().Lookup(services.LlamaCppCacheDirName, modelName); ok {
+			for _, f := range existing.Files {
+				union[f] = true
+			}
+		}
+		for f := range union {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+	}
+
+	if err := store.Upsert(cacheindex.Entry{
+		CacheDir:  services.LlamaCppCacheDirName,
+		Family:    services.CacheFamilyGGUFDir,
+		Model:     modelName,
+		Engine:    "llamacpp",
+		Files:     files,
+		SizeBytes: sizeBytes,
+	}); err != nil {
+		ctx.Log("warn", "     - [Job %s] cache index update failed for llamacpp %q (pull still succeeded): %v", jobID, modelName, err)
+	}
 }
 
 // BuildLlamaCppGGUFDownloadCommand returns the exec.Cmd that downloads
@@ -575,6 +679,14 @@ func (h *ModelCachePullHandler) pullOllama(ctx JobContext, jobID, modelName stri
 	// Query model size via `ollama list`
 	sizeBytes := ollamaModelSize(modelName)
 
+	upsertCacheIndexEntry(ctx, jobID, cacheindex.Entry{
+		CacheDir:  services.EngineCacheDirs["ollama"].Dir,
+		Family:    services.CacheFamilyNative,
+		Model:     modelName,
+		Engine:    "ollama",
+		SizeBytes: sizeBytes,
+	})
+
 	result := modelCachePullResult{
 		Status:    "cached",
 		ModelName: modelName,
@@ -679,6 +791,15 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 		return output, fmt.Errorf("hf download reported success but the model cache for %q is empty — the CLI likely no-oped (deprecated huggingface-cli on huggingface_hub >= 1.x); output: %s", modelName, strings.TrimSpace(string(output)))
 	}
 
+	upsertCacheIndexEntry(ctx, jobID, cacheindex.Entry{
+		CacheDir:  services.HFHubCacheDirName,
+		Family:    services.CacheFamilyHFHub,
+		Model:     modelName,
+		Engine:    engine,
+		Files:     []string{hfHubEntryDirName(modelName)},
+		SizeBytes: sizeBytes,
+	})
+
 	result := modelCachePullResult{
 		Status:    "cached",
 		ModelName: modelName,
@@ -686,6 +807,17 @@ func (h *ModelCachePullHandler) pullHuggingFace(ctx JobContext, jobID, modelName
 		Engine:    engine,
 	}
 	return json.Marshal(result)
+}
+
+// hfHubEntryDirName returns the HF hub-cache "models--org--repo" directory
+// name for modelName, relative to the resolved hub dir -- the same
+// provenance unit evictHuggingFace's hfCacheDir already resolves (and
+// os.RemoveAll's), used here to record the ONE-directory hf-hub cache index
+// entry (design doc §8.1). Does not check existence -- callers only use this
+// after already confirming the pull produced a non-empty cache via
+// hfCacheModelSize, so the directory is known to exist at this point.
+func hfHubEntryDirName(modelName string) string {
+	return "models--" + strings.ReplaceAll(modelName, "/", "--")
 }
 
 // parseMinHeadroomBytes reads the optional `min_headroom_bytes` payload field

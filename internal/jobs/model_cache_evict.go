@@ -9,8 +9,23 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+// removeCacheIndexEntry is the shared call-site helper for a whole-entry
+// eviction (ollama, HF-hub): best-effort, never fails the eviction that
+// already succeeded. Mirrors upsertCacheIndexEntry's logging shape.
+func removeCacheIndexEntry(ctx JobContext, jobID, cacheDir, model string) {
+	store := cacheIndexFn()
+	if store == nil {
+		return
+	}
+	if err := store.Remove(cacheDir, model); err != nil {
+		ctx.Log("warn", "     - [Job %s] cache index update failed removing %s/%s: %v", jobID, cacheDir, model, err)
+	}
+}
 
 // ModelCacheEvictHandler handles MODEL_CACHE_EVICT jobs.
 // It removes cached model weights for the specified engine.
@@ -63,6 +78,8 @@ func (h *ModelCacheEvictHandler) evictOllama(ctx JobContext, jobID, modelName st
 		return output, fmt.Errorf("ollama rm failed: %w", err)
 	}
 
+	removeCacheIndexEntry(ctx, jobID, services.EngineCacheDirs["ollama"].Dir, modelName)
+
 	result := modelCacheEvictResult{
 		Status:    "evicted",
 		ModelName: modelName,
@@ -85,6 +102,8 @@ func (h *ModelCacheEvictHandler) evictHuggingFace(ctx JobContext, jobID, modelNa
 	}
 
 	ctx.Log("info", "     - [Job %s] Removed cache directory: %s", jobID, cacheDir)
+
+	removeCacheIndexEntry(ctx, jobID, services.HFHubCacheDirName, modelName)
 
 	result := modelCacheEvictResult{
 		Status:    "evicted",
@@ -133,12 +152,45 @@ func (h *ModelCacheEvictHandler) evictLlamaCppGGUF(ctx JobContext, jobID, modelN
 
 	ctx.Log("info", "     - [Job %s] Removed GGUF file: %s", jobID, candidate)
 
+	// The cache index's Model key for a gguf-dir entry is the REPO id
+	// (pull-created) or the bare filename (backfill-created) -- not
+	// necessarily `base`, which is only ever a bare filename here (see this
+	// function's own doc comment on why eviction only supports an exact
+	// filename). Find whichever entry actually recorded `base` in its Files
+	// list and remove just that file from it, dropping the entry entirely
+	// if it was the last file recorded for it (Store.RemoveFile's contract).
+	if store := cacheIndexFn(); store != nil {
+		if model, ok := findLlamaCppIndexEntryForFile(store, base); ok {
+			if err := store.RemoveFile(services.LlamaCppCacheDirName, model, base); err != nil {
+				ctx.Log("warn", "     - [Job %s] cache index update failed removing %s: %v", jobID, base, err)
+			}
+		}
+		// else: no index entry recorded this file (pre-index cache, or
+		// backfill has not run yet) -- nothing to remove, not an error.
+	}
+
 	result := modelCacheEvictResult{
 		Status:    "evicted",
 		ModelName: modelName,
 		Engine:    "llamacpp",
 	}
 	return json.Marshal(result)
+}
+
+// findLlamaCppIndexEntryForFile scans every llamacpp cache-index entry for
+// one whose Files list contains filename, returning its Model key. Needed
+// because evictLlamaCppGGUF's caller-supplied modelName is a bare filename,
+// while a pull-created entry is keyed by the REPO id (with filename as one
+// of possibly several entries in Files) -- see the call site's comment.
+func findLlamaCppIndexEntryForFile(store *cacheindex.Store, filename string) (string, bool) {
+	for _, e := range store.Snapshot().EntriesByDir()[services.LlamaCppCacheDirName] {
+		for _, f := range e.Files {
+			if f == filename {
+				return e.Model, true
+			}
+		}
+	}
+	return "", false
 }
 
 // BuildOllamaRmCommand returns the exec.Cmd for removing a model via ollama.

@@ -2310,6 +2310,14 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// see CLAUDE.md's Service Preemption section), so surfacing swap activity
 	// on the control-center-only heartbeat is a documented follow-up, not
 	// silently regressed by this change.
+	//
+	// Same gap for the cache index (citadel #682 P2a): this path never calls
+	// jobs.InitCacheIndexStore, unlike runWork (cmd/work.go). A
+	// MODEL_CACHE_PULL/MODEL_CACHE_EVICT/SERVICE_START dispatched through the
+	// control-center's own consume loop therefore gets a nil cache index
+	// store and skips the write safely (jobs.CacheIndexStore()'s nil
+	// contract) -- consistent with, not worse than, the other TUI-collector
+	// gaps noted above, and not a P2a requirement.
 	handlers, _ := buildNodeJobHandlers(nodeJobOpts)
 
 	// Create runner with TUI callbacks
