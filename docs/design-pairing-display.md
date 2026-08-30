@@ -4,6 +4,13 @@ Status: design only, no implementation. Companion to aceteam-ai/aceteam#6975
 (CLOSED — backend grant flow already shipped), which explicitly stubs out the
 on-node rendering this issue owns.
 
+> **Part I (§1–§7)** is the current-state survey and option analysis.
+> **Part II (§8–§14)** is the implementable design: job contract, rendering
+> mechanisms, security invariant, capability field, TTL lifecycle, and the
+> phased file-by-file plan. Where the two disagree (notably phasing — §8.6
+> supersedes §6, per owner direction that P0 is the minimal *headed-node*
+> path that makes `_node_screen_delivery` return True), Part II wins.
+
 ## 1. Current state
 
 ### 1.1 The node:exec grant flow already exists — entirely on the backend
@@ -245,6 +252,12 @@ This is explicitly a two-repo change; §1.1 already shows the exact seam:
 
 ## 6. Phased issue breakdown
 
+> **Superseded by §8.6.** This ordering (capability-first, pull-command-second,
+> headed rendering as a stretch) was the original recommendation; the owner
+> direction is P0 = the minimal headed-node path that makes
+> `_node_screen_delivery` return True. Kept for the reasoning; do not build
+> from this list.
+
 - **Phase 1 — capability reporting only.** Add the new, narrow pairing-display
   capability tier to the heartbeat (`CollectorConfig`-style optional
   accessor, §2.3). Reports `server`/absent everywhere by default. Zero
@@ -293,3 +306,454 @@ This is explicitly a two-repo change; §1.1 already shows the exact seam:
    no capability field at all) should report **no capability**, so the
    backend's current fallback-safe stub behavior (linked device only) is
    preserved with zero coordination risk during rollout.
+
+---
+
+# Part II — Implementation design
+
+Everything below was verified against the code on 2026-08-30 (main @ v2.130.0);
+file/line references are to that state. The governing rule for the whole
+design, stated once here because every mechanism below derives from it:
+
+> **`delivered: true` is a claim that a human can currently see the code, and
+> it SUPPRESSES the backend's linked-device fallback.** A false positive means
+> the human never receives the code at all — strictly worse than a false
+> negative, which merely costs one push notification. Every ambiguous case
+> (can't confirm a text console, can't confirm write access, unsupported OS,
+> render error) must therefore resolve to `delivered: false` with a `reason`.
+
+## 8. Job / control-message contract
+
+### 8.1 Job types
+
+Two new per-node job types, added to the const block and `allKnownJobTypes` in
+`internal/worker/job.go` (the doc comment at line ~99 makes the pairing of
+those two lists mandatory — the supported-type set reported on an
+unsupported-type failure, issue #382, is probed from `allKnownJobTypes`):
+
+```go
+JobTypeShowPairingCode  = "SHOW_PAIRING_CODE"
+JobTypeClearPairingCode = "CLEAR_PAIRING_CODE"
+```
+
+Verb-first matches the existing style (`DOWNLOAD_MODEL`,
+`APPLY_DEVICE_CONFIG`). Deliberately nothing containing `DISPLAY_` — see §1.2
+on the unrelated org display-casting feature.
+
+**Watchdog/lane classification** (`internal/worker/deadline.go`,
+`gpu_tracker.go`): neither type joins `longSessionJobTypes`,
+`unboundedJobTypes`, `serializedLaneJobTypes` (they touch neither
+`citadel.yaml` nor `modules.lock`), nor `gpuBoundJobTypes`. Both run inline on
+the default 60-min watchdog tier and return in well under a second — the TTL
+clear is a background `time.AfterFunc` owned by the manager (§12), **not** a
+sleeping handler.
+
+**Privilege gate**: both handlers require `isPerNodeStream(job.SourceQueue)`
+(`internal/worker/agent_update.go:334-341` — `strings.Contains(sourceQueue,
+":node:")`), failing closed with a structural reason exactly like
+`AGENT_UPDATE` (agent_update.go:213-219), `MODULE_SET`, `EXPOSE_SET`, and
+`WHATSAPP_PROVISION`. A pairing code must only ever arrive as a
+platform-dispatched, node-targeted job, never off a shared org pool where any
+capable node could claim it.
+
+### 8.2 Payloads
+
+`SHOW_PAIRING_CODE`:
+
+```json
+{
+  "code": "12345678",
+  "ttl_seconds": 600,
+  "grant_request_id": "gr_abc123",
+  "requested_by": "Agent Ops (agent) for user jane@…"
+}
+```
+
+- `code` (required): opaque string, max 16 chars (defense against a hostile
+  or buggy dispatcher using the console as a billboard; today's backend sends
+  8 digits, `_CODE_DIGITS = 8`). Rendered verbatim — citadel does not parse
+  or validate its format beyond the length cap and printable-ASCII check.
+- `ttl_seconds` (required): display lifetime. Clamped to `[30, 900]`; when
+  absent/zero, default 600 to match the backend's `_CHALLENGE_TTL_SECONDS`
+  (`aceteam_mcp_node_exec_grant.py:68`). Per §4 this is backend-owned — the
+  backend should send its *remaining* challenge TTL, not a fresh 600, if it
+  retries delivery.
+- `grant_request_id` (required): correlation handle. This — never the code —
+  is what appears in every log line, error string, and the clear-job payload.
+- `requested_by` (optional): human-readable requester line rendered under the
+  code so the person at the console knows what they'd be approving. Free
+  text, rendered with the same length cap discipline (truncate at 80 chars).
+
+`CLEAR_PAIRING_CODE`:
+
+```json
+{ "grant_request_id": "gr_abc123" }
+```
+
+Clears only if the currently-displayed code belongs to that
+`grant_request_id`; a mismatch or nothing-displayed is an idempotent success
+(`{"cleared": false, "reason": "not_displayed"}`), never a failure — the
+backend fires this on confirm/revoke and must not see spurious job failures
+for a code that already expired.
+
+**Idempotency / replacement:** a second `SHOW_PAIRING_CODE` for the same
+`grant_request_id` re-renders and resets the TTL timer (delivery retry). A
+`SHOW` for a *different* `grant_request_id` replaces the current display
+(latest-wins — the newest grant attempt is the one the human is acting on).
+
+### 8.3 Result shape (what `_node_screen_delivery` consumes)
+
+`JobResult.Output` (`internal/worker/job.go`, flows to the backend via
+`StreamWriter.WriteEnd`):
+
+```json
+// SHOW_PAIRING_CODE
+{ "delivered": true,  "surface": "console" }
+{ "delivered": false, "surface": "", "reason": "graphical_session" }
+// reasons: "unsupported_os", "no_console", "graphical_session",
+//          "permission_denied", "render_error", "bad_payload"
+
+// CLEAR_PAIRING_CODE
+{ "cleared": true }
+{ "cleared": false, "reason": "not_displayed" }
+```
+
+**The code never appears in `Output`, in `JobResult.Error`, or in any
+formatted string the handler produces** — see §10. Backend mapping: the body
+of `_node_screen_delivery` dispatches `SHOW_PAIRING_CODE` to the node's
+per-node stream following `dispatch_node_update`'s exact shape
+(`aceteam_mcp_fabric.py:398` — push + bounded await), and returns
+`bool(result.output.delivered)`; a dispatch failure, node timeout, or job
+FAILURE all return `False` and fall through to the linked-device chain,
+preserving today's behavior byte-for-byte for every node that can't display.
+
+### 8.4 Where the handler lives and registers
+
+- `internal/worker/pairing_display.go` — a **native** `worker.JobHandler`
+  (the `expose_set.go` shape: struct + `CanHandle` for both types +
+  `Execute`), NOT a legacy `internal/jobs` handler behind
+  `LegacyHandlerAdapter`. Native keeps the code's transit surface minimal
+  (no `jobs.JobContext`, no legacy output plumbing) and matches the other
+  per-node-stream-gated handlers.
+- Registered in `cmd/nodejobs.go`'s `buildNodeJobHandlers` — the shared
+  registration site for BOTH `citadel work` (`runWork`) and the control
+  center's own consume loop (`runTUIWorker`, cmd/controlcenter.go:1892), so
+  a control-center-only node handles the job identically (the
+  competing-consumer lesson in that file's header comment).
+- The handler delegates all state/rendering to a new leaf package,
+  `internal/pairingdisplay` (§9, §12) — `internal/worker` stays free of VT
+  ioctls, and the manager is testable without a worker.
+
+Audit note (verified 2026-08-30): `internal/worker`'s runner and both job
+sources log job IDs, types, and errors — never `job.Payload` (grep over
+`runner.go`, `api_source.go`, `redis_source.go`). The payload is the only
+place the code exists in transit on the node, so this must stay true; the
+handler's own doc comment should state it so a future "log the payload on
+parse failure" debug change trips over the warning.
+
+## 9. Rendering channels, in priority order, with the actual mechanism
+
+The realistic population split (§2.1) drives the order. "Headed" here means
+**a physical monitor showing a Linux text console** — the homelab/colo GPU box
+with an HDMI monitor and a getty, which is the headed case citadel's actual
+fleet has. A desktop-session machine (X/Wayland owning the seat) is
+explicitly NOT coverable by the P0 mechanism and reports `delivered: false`.
+
+### 9.1 P0 — Linux virtual-terminal (text console) rendering
+
+Mechanism, precisely:
+
+1. **Resolve the active VT**: read `/sys/class/tty/tty0/active` (kernel-owned,
+   world-readable; yields e.g. `tty1`) → target device `/dev/tty1`. Absent or
+   unreadable (container, no VT subsystem) → `reason: "no_console"`.
+2. **Confirm it is a text console, not a display server's VT**: open the
+   device and `ioctl(fd, KDGETMODE)` (`0x4B3B`, via `golang.org/x/sys/unix`).
+   `KD_TEXT` → proceed; `KD_GRAPHICS` (X/Wayland/KMS owns the seat) or ioctl
+   error → `reason: "graphical_session"`. This is the load-bearing check:
+   **`session.DetectDesktop()` (`internal/session/session_linux.go`) is the
+   wrong gate here** — it reads `DISPLAY`/`WAYLAND_DISPLAY` from the
+   *worker's own environment*, and the fleet worker is a root systemd unit
+   (`install.sh` `[Service]` block, ~line 502: no `User=`, `HOME=/root`) with
+   neither var set even when a desktop session owns the seat for some user.
+   From that process, DetectDesktop reports "headless" unconditionally;
+   KDGETMODE asks the kernel what the seat is actually doing. Writing text to
+   a `KD_GRAPHICS` VT succeeds and is invisible — the exact false-`delivered:
+   true` failure the §8 rule forbids.
+3. **Write access**: `os.OpenFile("/dev/ttyN", os.O_WRONLY, 0)`. The fleet
+   worker is root → writable. A `citadel service install` unit runs as the
+   invoking user (`internal/service/systemd.go:123`, `User=%s`) — writable
+   only with `tty` group membership; `EACCES` → `reason:
+   "permission_denied"`. No privilege escalation is attempted.
+4. **Render**: a single `write()` of an ANSI sequence — clear screen + home
+   (`\x1b[2J\x1b[H`), an ASCII box, the code in spaced wide digits (simple
+   3-line block digits, ~30 lines of table; prior art for the box style is
+   `internal/ui/devicecode.go:166`'s enrollment code box), the
+   `requested_by` line, and **both** an absolute expiry (`valid until 14:32
+   UTC`) and the TTL (`for the next 10 minutes`) so a stale render after a
+   crash is self-describing. Direct `write()` to the char device — this
+   bypasses stdout/journald entirely (§10).
+5. **Clear** (TTL expiry, `CLEAR_PAIRING_CODE`, or graceful shutdown):
+   clear-screen + a one-line `pairing code cleared/expired` note. The getty
+   prompt was overwritten at show time; the next keypress redraws it —
+   acceptable for a console, and the reason §13's "how aggressive" question
+   goes to Jason.
+
+Windows and macOS: build-tagged stubs returning `reason: "unsupported_os"`.
+(macOS `osascript` dialog and a Windows toast are P3 — see §11; they are
+desktop-session mechanisms and need the §3.3 presence-hardening discussion
+first.)
+
+### 9.2 P1 — pull command (`citadel pairing-code`), the headless-fleet answer
+
+§3.1's recommendation stands, but Part I glossed over the hard part: **the
+code lives in the memory of the long-running `citadel work` process, and the
+pull command is a different process.** A cross-process transport is required,
+and the options were checked against the code:
+
+- The worker's status HTTP server is off by default (`--status-port 0`,
+  cmd/work.go:3390), is unauthenticated locally, and under `--gateway` its
+  `/status` + `/worker` routes are additionally served over the **mesh VPN
+  listener** (cmd/work.go:2220-2221) — the code must never ride it, in any
+  field, existence-flags included.
+- `internal/instance`'s socket (`~/.citadel-cli/citadel.sock`) is a raw PTY
+  attach relay for the TUI, not request/response, and lives in the
+  invoker-scoped ConfigDir — wrong protocol, wrong directory.
+
+Design: a dedicated one-shot request/response Unix socket,
+`<network.GetNodeConfigDir()>/pairing.sock`, mode `0600`, served by the
+worker only while a code is pending (listener starts on SHOW, closes on
+clear). Machine-convergent dir (the #383/#726/#845 rule) so a root worker and
+a non-root operator shell agree on the path; note `0600` + a root worker
+means the human runs `sudo citadel pairing-code` — same privilege bar as
+every other operation on a fleet node. Client refuses when stdout is not a
+TTY (cosmetic guard against casual scripting; the *real* boundary is the
+socket's file mode — see §10.4's actor-equivalence). Prints the code to its
+own foreground stdout only — a one-shot CLI invocation, not captured by the
+worker unit's `StandardOutput=journal`.
+
+**Capability consequence:** shipping this flips every headless node to
+"capable," which changes the backend's screen-vs-linked-device economics
+(the human must be told, via the linked-device push or web UI, to go run the
+command — the pull surface can't announce itself). This interaction is a
+genuine product question (§13 Q3) and is why the pull command is P1, not P0.
+
+### 9.3 P2 — Control Center TUI banner
+
+Sharper than §3.2 thought, in the good direction: when no dedicated
+`citadel work` holds the worklock, the control center runs its own consume
+loop off the same handler set (`runTUIWorker`) — **the handler and the TUI
+are the same process**, so a banner needs no IPC at all, just an observer
+callback on the `pairingdisplay` manager that posts a tview modal. When a
+dedicated worker holds the lock, the handler runs over *there* and pushing
+into a separately-running TUI would need a new instance-socket message type —
+deferred. P2 ships the same-process case only (delivered stays `false`
+unless the console path also succeeded — a TUI banner proves a human *ran a
+TUI once*, not that anyone is watching; it is additive UX, not a delivery
+surface, until §13 Q4 says otherwise).
+
+### 9.4 Explicitly out (unchanged from §3.4, plus one addition)
+
+No `display_show` reuse, no KVM rendering (not citadel's channel — though
+the backend's own `kvm_*` tools could be a *backend-side* delivery arm for
+BMC-attached hosts; named here as an aceteam-side idea, not designed), no
+`citadel work` stdout, and — new — **no field on `/status` or the heartbeat
+that carries or acknowledges a pending code** (the capability field of §11
+is static "could display," never "is displaying X").
+
+## 10. The security invariant, enforced structurally
+
+The invariant: the code must never land anywhere an agent can read it back.
+Per path:
+
+1. **No stdout / journald / clilog.** The renderer writes with a direct
+   `os.OpenFile`+`Write` on the VT character device. The worker's stdout is
+   journald (`StandardOutput=journal`, install.sh; `journal+console`,
+   systemd.go:73) and journald is agent-readable via `citadel logs` /
+   `SHELL_COMMAND` `journalctl` — so *any* print of the code from the worker
+   process is a leak by construction. The `pairingdisplay` package takes no
+   logger for the code path; its log lines carry `grant_request_id` only.
+2. **No disk.** The code exists in exactly two places: the job payload in
+   transit (worker memory) and the manager's private field (worker memory).
+   The crash marker (§12) deliberately contains VT name + expiry + grant ID —
+   never the code. The pull-command socket (P1) transmits it over a `0600`
+   unix socket, never writes it.
+3. **The job result is `delivered`/`cleared` + `reason` only** (§8.3), and —
+   the subtle half — **no error string may embed the code** (error strings
+   travel through `WriteError` into backend logs and the requester-visible
+   job result). Enforced by a test that runs the handler with a sentinel
+   code against every failure branch (fake renderer erroring, bad payload,
+   graphics mode) and asserts the marshaled result, the error text, and
+   every captured log line do not contain the sentinel. This is the
+   load-bearing test of the PR.
+4. **Actor equivalence, stated honestly:** these defenses close *passive*
+   channels (logs, world-readable state, result echo, mesh endpoints). They
+   cannot defend against an actor who already has arbitrary code execution
+   as root/the worker user on the node — such an actor can read
+   `/dev/vcs1`, the socket, or process memory. That is consistent with the
+   threat model: `node:exec` *is* the capability being escalated, so the
+   requesting agent by definition lacks it; and an agent that already holds
+   an equivalent grant has nothing to gain from the code. The residual gap
+   is a *different* agent/user in the org with an existing shell grant on
+   this node — it could harvest a code meant for a new grant. That gap is
+   inherent to any on-node display (a camera pointed at the monitor beats
+   it too) and is accepted; the backend's max-5-attempts + org-admin-only
+   confirm bound the blast radius.
+
+## 11. Capability reporting
+
+New heartbeat field, additive/omitempty, following the exact
+`CollectorConfig` optional-provider pattern (`internal/status/collector.go:53`
+— `WorkerLiveness`/`SwapStats`/`Reservations`):
+
+```go
+// internal/status/types.go
+type PairingDisplayCapability struct {
+    // Surfaces this node can render a pairing code on right now.
+    // P0: ["console"]. Later: "pull", "tui", "gui".
+    Surfaces []string `json:"surfaces"`
+}
+// NodeStatus:
+PairingDisplay *PairingDisplayCapability `json:"pairing_display,omitempty"`
+
+// CollectorConfig:
+PairingDisplay func() *PairingDisplayCapability // optional; nil ⇒ omitted
+```
+
+- The probe is `pairingdisplay.DetectSurfaces()` — steps 1–3 of §9.1
+  (resolve VT, KDGETMODE, open-for-write probe) without the write. Cheap
+  (two opens, one ioctl), run per collection like the other providers.
+- Wired in `cmd/work.go`'s two heartbeat collector construction sites only,
+  with the projection (`pairingdisplay` type → `status` type) in `cmd`,
+  mirroring `swapStatsFrom`/`reservationsFrom` — `internal/status` imports
+  neither `internal/worker` nor the new package. The TUI-only collector
+  (`cmd/controlcenter.go`) keeps its documented gap, consistent with
+  WorkerLiveness/Swap/Reservations/Lanes.
+- Deliberately NOT folded into `DesktopCapabilities`
+  (`desktop.DetectCapabilities`, collector.go:375) — per §2.2 that signal
+  answers "can I remote-control this" from the process env and is
+  spoofable/irrelevant here; and per §9.1 it is actually *inverted* for a
+  root systemd worker.
+- **Cross-repo dependency (named, not designed):** aceteam's
+  `fabric_node_status.py` ingest must persist `pairing_display` off the
+  heartbeat payload, and `_node_screen_delivery` should consult it to skip
+  the node round-trip for the (majority) headless fleet. Until that lands,
+  the backend MAY dispatch `SHOW_PAIRING_CODE` blindly and branch on
+  `delivered` — correct either way, just paying one bounded job round-trip
+  per grant on headless nodes (§13 Q2). An un-upgraded citadel reports no
+  field ⇒ backend treats as headless ⇒ today's behavior (§7 Q5, confirmed).
+
+## 12. TTL / auto-clear lifecycle
+
+Owner: `pairingdisplay.Manager`, a process-wide singleton
+(`pairingdisplay.Get()`, mirroring the `GetCobrowseManager` precedent —
+needed because the handler (`cmd/nodejobs.go` construction) and the
+heartbeat probe (`cmd/work.go` construction) must share state), configured
+once with the machine-convergent state dir threaded from `cmd`
+(`network.GetNodeConfigDir()`), keeping the package a leaf that imports
+neither `internal/network` nor `internal/worker` and is fully testable with
+an injected fake `Renderer`.
+
+- **Show**: write the crash marker FIRST (`pairing-display-state.json` in
+  the node config dir: `{vt, expires_at, grant_request_id}` — no code),
+  then render, then arm `time.AfterFunc(ttl)`.
+- **Clear** paths, all idempotent, all converging on the same
+  `clearLocked()`:
+  1. TTL timer fires → render "expired" clear → zero state → delete marker.
+  2. `CLEAR_PAIRING_CODE` (backend confirm/revoke, §4's clear-early) →
+     render "cleared" clear → same.
+  3. Graceful shutdown: `Manager.Shutdown()` deferred in `runWork` (and
+     `runTUIWorker`) → clear + marker delete, so SIGTERM/systemd stop never
+     strands a code.
+- **Killed before clear (SIGKILL, crash, power loss):** VT text is just
+  characters — it survives the process. Three-layer mitigation:
+  1. The render itself shows absolute expiry + TTL (§9.1.4), so a stale
+     screen is self-describing, and the code is cryptographically useless
+     after the backend's 600s challenge TTL / 5 attempts regardless.
+  2. Startup reconcile: `runWork` (and `runTUIWorker`) call
+     `pairingdisplay.ReconcileStale()` before the consume loop — marker
+     present ⇒ clear that VT + delete marker. Marker-then-render ordering
+     (above) means a kill between the two clears a VT that was never
+     written: harmless (one clear-screen on a getty).
+  3. Residual: node dies and never comes back up ⇒ code stays on a
+     powered-off/frozen screen until the backend TTL kills its value.
+     Accepted.
+- Reboot: VTs reset; the leftover marker triggers one harmless clear.
+
+## 13. Open questions for Jason (Part II — supersedes §7 where they overlap)
+
+1. **Console aggressiveness.** P0 clears the active VT and holds it for up
+   to 10 minutes — on a box where someone is logged in at the physical
+   console, that stomps their visible session (input/state unharmed, but
+   the screen is taken over). Acceptable for a security prompt, or should
+   citadel refuse (`delivered: false, reason: "console_in_use"`) when the
+   active VT has a live logged-in session (detectable via
+   `utmp`/`loginctl`), only rendering over an idle getty? My lean:
+   stomping is *correct* for a pairing prompt (it is precisely a "someone
+   wants access to this machine" interrupt), but it's a product call.
+2. **Dispatch-blind vs capability-first ordering.** May the backend
+   implement `_node_screen_delivery` by dispatching blindly and branching
+   on `delivered` (works the day citadel P0 ships; costs one bounded
+   round-trip per grant on headless nodes), or must capability ingestion
+   (§11's aceteam half) land first?
+3. **Pull command posture (P1).** Confirm wanted at all given §10.4's actor
+   equivalence, and whether `citadel pairing-code` should demand the
+   `grant_request_id` (shown in the requester's UI) as an argument — a weak
+   human-in-the-loop binding that makes drive-by harvesting by a co-resident
+   agent slightly harder, at the cost of the human typing a handle.
+4. **Is the TUI banner (P2) worth building** (§7 Q2 restated — Control
+   Center production usage unclear), given it can't honestly claim
+   `delivered` on its own?
+
+## 14. Phased plan (supersedes §6) — files and functions
+
+### P0 — headed-node console path (one PR, Sonnet-sized)
+
+Makes `_node_screen_delivery` able to return True end-to-end on a
+root-worker Linux node with a text console. New/touched:
+
+| File | Change |
+|---|---|
+| `internal/pairingdisplay/manager.go` (new) | `Manager` singleton (`Get()`, `Configure(stateDir)`): `Show(code, ttl, grantID, requestedBy)`, `Clear(grantID)`, `Shutdown()`, `ReconcileStale()`, crash marker read/write (no code in marker), `time.AfterFunc` TTL, injected `Renderer` interface. |
+| `internal/pairingdisplay/render_linux.go` (new) | `consoleRenderer`: active-VT resolve (`/sys/class/tty/tty0/active`), `KDGETMODE` gate (via `golang.org/x/sys/unix`), open/write/clear; `DetectSurfaces()` probe (§11). Build tag `linux`. |
+| `internal/pairingdisplay/render_other.go` (new) | `!linux` stubs → `unsupported_os`; `DetectSurfaces()` → nil. |
+| `internal/pairingdisplay/manager_test.go` (new) | Fake-renderer tests: TTL fire, clear-early, replacement, marker lifecycle, reconcile, shutdown. No `/dev` access. |
+| `internal/worker/pairing_display.go` (new) | `PairingDisplayHandler` (native, both types): payload validation/clamps, `isPerNodeStream` gate, result shapes (§8.3). |
+| `internal/worker/pairing_display_test.go` (new) | Gate test (org-pool queue refused), result shapes, **the §10.3 sentinel-leak test**. |
+| `internal/worker/job.go` | Two consts + `allKnownJobTypes` entries. |
+| `internal/status/types.go` | `PairingDisplayCapability` + `NodeStatus.PairingDisplay`. |
+| `internal/status/collector.go` | `CollectorConfig.PairingDisplay func()` provider + attach in `Collect`. |
+| `cmd/nodejobs.go` | Register the handler in `buildNodeJobHandlers` (both consumers get it). |
+| `cmd/work.go` | `pairingdisplay.Configure(network.GetNodeConfigDir())` + `ReconcileStale()` in `runWork` (near the existing `ReconcileOrphanedReservations` call), deferred `Shutdown()`, provider wiring at the two heartbeat collector sites + the small projection func (the `swapStatsFrom` pattern). |
+| `cmd/controlcenter.go` | Same Configure/Reconcile/Shutdown in `runTUIWorker`. |
+
+Non-goals in P0, stated in the PR: no pull command, no TUI banner, no
+GUI/desktop-session rendering, no macOS/Windows, no aceteam-side change.
+Manual test plan: on a Linux box/VM with a VT (not a container), dispatch
+the job via the direct-Redis debug path with a dummy code; verify render,
+TTL clear, `CLEAR_PAIRING_CODE`, `kill -9` + restart reconcile, and
+`delivered:false` under a running X session.
+
+### P1 — pull command (headless fleet)
+
+`cmd/pairingcode.go` (new command, TTY-gated), `internal/pairingdisplay/
+socket.go` (0600 one-shot unix socket in the node config dir, listener
+scoped to code-pending), `DetectSurfaces()` gains `"pull"`. Blocked on §13
+Q3 and on the aceteam-side UX for telling the human to run it.
+
+### P2 — Control Center banner
+
+Observer hook on `Manager` + tview modal in the `runTUIWorker` process
+(§9.3). Additive UX only; does not set `delivered`.
+
+### P3 — desktop-session + other OS rendering
+
+GUI toast/dialog for X/Wayland seats (needs the §3.3 hardened local-seat
+check — `loginctl`-based, since the worker's env is useless for this, §9.1),
+macOS `osascript`, Windows toast. Scope only if P0's capability data shows a
+real headed-desktop population.
+
+### P4 — aceteam repo (cross-repo, tracked there)
+
+`_node_screen_delivery` body (dispatch + `delivered` branch, §8.3),
+`fabric_node_status.py` capability ingestion (§11), `CLEAR_PAIRING_CODE`
+dispatch on confirm/revoke (§4). Named contract only — not designed here.
