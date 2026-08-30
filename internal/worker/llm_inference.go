@@ -575,14 +575,49 @@ func (h *LLMInferenceHandler) bufferedOllama(stream StreamWriter, body io.Reader
 // `messages` and returns the assistant turn in `message.content`, applying the
 // served model's chat template. Used whenever an llm_inference job carries
 // `messages` (the shape the OpenAI gateway and MCP inference_chat dispatch).
+//
+// Tool calling (citadel-cli#603, the ollama half): Ollama's native /api/chat
+// DOES support tools -- a `tools` array on the request (OpenAI-shaped
+// function definitions, forwarded as-is) and `message.tool_calls` on the
+// response. Two wire-shape differences from the OpenAI-compatible engines
+// (executeChatCompletionsAt) are handled at the boundary rather than leaking
+// into the rest of this file's OpenAI-shaped contract: Ollama returns
+// `function.arguments` as a JSON OBJECT (OpenAI/this worker's contract is a
+// JSON STRING containing serialized JSON -- see ollamaToolCallsToOpenAI), and
+// Ollama assigns no `id` to a tool call (a synthetic call_<n> is generated on
+// the way out; see the same function). tool_choice is deliberately NOT
+// forwarded: Ollama's support for it is inconsistent across
+// versions/models, unlike the OpenAI-compatible engines' native support.
 func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload) (*JobResult, error) {
 	// Ollama's /api/chat takes text content (images ride a separate `images`
 	// field we do not populate), so flatten any multimodal content to its text
 	// parts. OCR/vision fabric models run on vLLM (executeChatCompletionsAt), not
 	// this path.
-	messages := make([]map[string]string, 0, len(payload.Messages))
+	messages := make([]map[string]any, 0, len(payload.Messages))
 	for _, m := range payload.Messages {
-		messages = append(messages, map[string]string{"role": m.Role, "content": m.Text()})
+		msg := map[string]any{"role": m.Role, "content": m.Text()}
+		// Replay an assistant turn's prior tool_calls (OpenAI shape, as stored
+		// on ChatMessage) converted to Ollama's request shape -- see
+		// openAIToolCallsToOllama's doc comment for exactly what changes.
+		// hasToolCalls (not a bare len() check) gates this so a `null`/`[]`
+		// ToolCalls value on an ordinary turn is correctly treated as absent.
+		if hasToolCalls(m.ToolCalls) {
+			if converted := openAIToolCallsToOllama(m.ToolCalls); converted != nil {
+				msg["tool_calls"] = converted
+			}
+		}
+		// Ollama's tool-role message has no OpenAI-style tool_call_id
+		// correlation field; forwarding it anyway is harmless (an unknown
+		// JSON key Ollama ignores) and keeps this message shape uniform with
+		// executeChatCompletionsAt's. `name` (the function name on a
+		// role="tool" message) IS meaningful to Ollama.
+		if m.ToolCallID != "" {
+			msg["tool_call_id"] = m.ToolCallID
+		}
+		if m.Name != "" {
+			msg["name"] = m.Name
+		}
+		messages = append(messages, msg)
 	}
 
 	reqPayload := map[string]any{
@@ -609,6 +644,14 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 	if len(options) > 0 {
 		reqPayload["options"] = options
 	}
+	// Tool calling (citadel-cli#603): only attach `tools` when the payload
+	// actually carries a non-empty array. hasToolCalls -- not a bare
+	// len(payload.Tools) > 0 -- is the guard here specifically because a
+	// literal `"tools": null` (4 bytes, len()>0) must read as absent, so a
+	// text-only request's outbound body gains no new key.
+	if hasToolCalls(payload.Tools) {
+		reqPayload["tools"] = payload.Tools
+	}
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/chat", reqPayload)
 	if err != nil {
@@ -630,6 +673,13 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 // streamOllamaChat forwards Ollama's /api/chat newline-delimited JSON stream as
 // chunks. Each frame carries an incremental message.content; the final frame has
 // done=true plus token counts.
+//
+// Tool-call handling (citadel-cli#603): unlike OpenAI's streaming delta.
+// tool_calls (which arrive character-by-character across many frames and need
+// toolCallAccumulator to merge), Ollama emits a tool call already complete in
+// a single frame's message.tool_calls -- there is no partial/incremental
+// tool_calls shape in Ollama's protocol. So the latest non-empty sighting
+// across frames IS the final answer; no accumulator is needed here.
 func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Reader) (*JobResult, error) {
 	scanner := bufio.NewScanner(body)
 	// Allow long JSON lines (large deltas) beyond bufio's default 64KiB cap.
@@ -637,6 +687,7 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 	chunkIndex := 0
 	var fullContent strings.Builder
 	var promptTokens, completionTokens int
+	var toolCalls json.RawMessage
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -645,7 +696,8 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 		}
 		var chunk struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string           `json:"content"`
+				ToolCalls []ollamaToolCall `json:"tool_calls"`
 			} `json:"message"`
 			Done            bool `json:"done"`
 			PromptEvalCount int  `json:"prompt_eval_count"`
@@ -658,6 +710,11 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 			fullContent.WriteString(chunk.Message.Content)
 			stream.WriteChunk(chunk.Message.Content, chunkIndex)
 			chunkIndex++
+		}
+		if len(chunk.Message.ToolCalls) > 0 {
+			if converted := ollamaToolCallsToOpenAI(chunk.Message.ToolCalls); converted != nil {
+				toolCalls = converted
+			}
 		}
 		if chunk.PromptEvalCount > 0 {
 			promptTokens = chunk.PromptEvalCount
@@ -672,14 +729,21 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 	if err := scanner.Err(); err != nil {
 		return h.failure(err), nil
 	}
-	return h.success(map[string]any{
+	finishReason := "stop"
+	output := map[string]any{
 		"content":       fullContent.String(),
-		"finish_reason": "stop",
+		"finish_reason": finishReason,
 		"usage":         ollamaUsage(promptTokens, completionTokens),
-	}), nil
+	}
+	if len(toolCalls) > 0 {
+		output["finish_reason"] = "tool_calls"
+		output["tool_calls"] = toolCalls
+	}
+	return h.success(output), nil
 }
 
-// bufferedOllamaChat parses a non-streamed Ollama /api/chat response.
+// bufferedOllamaChat parses a non-streamed Ollama /api/chat response,
+// including message.tool_calls (citadel-cli#603) when present.
 func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Reader) (*JobResult, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
@@ -687,7 +751,8 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 	}
 	var response struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string           `json:"content"`
+			ToolCalls []ollamaToolCall `json:"tool_calls"`
 		} `json:"message"`
 		PromptEvalCount int `json:"prompt_eval_count"`
 		EvalCount       int `json:"eval_count"`
@@ -695,12 +760,115 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
 		return h.failure(fmt.Errorf("failed to parse Ollama response: %w", err)), nil
 	}
-	writeSingleChunk(stream, response.Message.Content)
-	return h.success(map[string]any{
+	toolCalls := ollamaToolCallsToOpenAI(response.Message.ToolCalls)
+	// A tool_calls-only reply has nothing worth publishing as a chunk --
+	// mirrors bufferedChatCompletions' identical rule for the OpenAI-
+	// compatible engines.
+	if response.Message.Content != "" || len(toolCalls) == 0 {
+		writeSingleChunk(stream, response.Message.Content)
+	}
+	output := map[string]any{
 		"content":       response.Message.Content,
 		"finish_reason": "stop",
 		"usage":         ollamaUsage(response.PromptEvalCount, response.EvalCount),
-	}), nil
+	}
+	if len(toolCalls) > 0 {
+		output["finish_reason"] = "tool_calls"
+		output["tool_calls"] = toolCalls
+	}
+	return h.success(output), nil
+}
+
+// ollamaToolCall is one entry in Ollama's native message.tool_calls array
+// (citadel-cli#603). Unlike OpenAI's shape, Ollama assigns no `id`/`type` and
+// returns `function.arguments` as a JSON OBJECT rather than a JSON-encoded
+// string -- see ollamaToolCallsToOpenAI for the conversion this drives.
+type ollamaToolCall struct {
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+// ollamaToolCallsToOpenAI converts Ollama's native tool_calls into the OpenAI
+// shape every other engine path in this file returns (id, type: "function",
+// function.arguments as a JSON STRING) -- the shape the aceteam consumer
+// (agents/fabric_client.py) and #603's OpenAI-compatible-engine path both
+// already rely on. Ollama assigns no id, so a stable synthetic one
+// (call_<index>) is generated; it only needs to be unique within THIS
+// response for a follow-up tool-role message to reference, which Ollama
+// itself does not validate (unlike OpenAI). Returns nil for no calls, so a
+// text-only reply's output map gains no new key.
+func ollamaToolCallsToOpenAI(calls []ollamaToolCall) json.RawMessage {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(calls))
+	for i, c := range calls {
+		args := "{}"
+		if len(c.Function.Arguments) > 0 && string(c.Function.Arguments) != "null" {
+			args = string(c.Function.Arguments)
+		}
+		out = append(out, map[string]any{
+			"id":   fmt.Sprintf("call_%d", i),
+			"type": "function",
+			"function": map[string]any{
+				"name":      c.Function.Name,
+				"arguments": args,
+			},
+		})
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// openAIToolCallsToOllama converts an OpenAI-shaped tool_calls array (as
+// stored on ChatMessage.ToolCalls -- id, type, function.arguments as a JSON
+// STRING) into Ollama's native request shape (function.arguments as a JSON
+// OBJECT, no id/type -- Ollama does not echo one back and does not require
+// one on replayed history). Used when forwarding a prior assistant turn's
+// tool_calls to Ollama as conversation history. Returns nil when raw has no
+// parseable entries; the call site (hasToolCalls) has already gated presence,
+// so a parse failure here degrades to "omit tool_calls from this replayed
+// turn" rather than failing the whole request.
+func openAIToolCallsToOllama(raw json.RawMessage) []map[string]any {
+	var calls []struct {
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(raw, &calls); err != nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(calls))
+	for _, c := range calls {
+		var args any
+		switch {
+		case c.Function.Arguments == "":
+			args = map[string]any{}
+		default:
+			if err := json.Unmarshal([]byte(c.Function.Arguments), &args); err != nil {
+				// Not valid JSON (shouldn't happen for a well-formed OpenAI
+				// tool call) -- forward the raw string rather than dropping
+				// the argument entirely.
+				args = c.Function.Arguments
+			}
+		}
+		out = append(out, map[string]any{
+			"function": map[string]any{
+				"name":      c.Function.Name,
+				"arguments": args,
+			},
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ollamaUsage maps Ollama's prompt_eval_count/eval_count onto the platform's

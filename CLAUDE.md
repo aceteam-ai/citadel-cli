@@ -739,15 +739,32 @@ citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicit
 
 `executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/
 llamacpp/bonsai/unlimited-ocr) forwards `tools`/`tool_choice` on the request
-and returns `tool_calls` on the response. **`executeOllamaChat` (ollama's
-native `/api/chat` path) still silently drops tools** — a known, undocumented-
-to-the-caller gap, not fixed here. `jobs.LLMInferencePayload.Tools`/
+and returns `tool_calls` on the response. `jobs.LLMInferencePayload.Tools`/
 `ToolChoice` and `jobs.ChatMessage.ToolCalls`/`ToolCallID`/`Name` carry raw
 JSON/strings rather than a typed Go struct, so an engine-specific
 `function.parameters` JSON Schema is never lossily re-typed. Absent on a
 text-only request, pinned by
 `TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools` (asserts key
 ABSENCE, not an empty value).
+
+**`executeOllamaChat` (ollama's native `/api/chat` path) now forwards tools
+too** — the gap this section used to describe as unfixed. Ollama's own wire
+shape differs from OpenAI's in two ways the conversion functions isolate at
+the boundary rather than leaking into the rest of this file's OpenAI-shaped
+contract: `function.arguments` is a JSON OBJECT on the wire (not a JSON
+STRING like OpenAI/this worker's own contract —
+`ollamaToolCallsToOpenAI`/`openAIToolCallsToOllama` convert both directions),
+and Ollama assigns no `id` to a tool call (a synthetic `call_<n>` is
+generated on the way out). `tool_choice` is deliberately NOT forwarded to
+Ollama — its support for it is inconsistent across versions/models, unlike
+the OpenAI-compatible engines' native support. Streaming differs from
+`streamChatCompletions` too: Ollama emits a tool call already complete in a
+single NDJSON frame (no per-token delta the way OpenAI's SSE streams
+`delta.tool_calls`), so `streamOllamaChat` just keeps the latest non-empty
+sighting rather than running it through `toolCallAccumulator`.
+`TestLLMInferenceHandler_OllamaToolsRequestByteIdenticalWithoutTools`/
+`_OllamaToolsForwardedInRequest`/`_OllamaBufferedToolCallsResponse`/
+`_OllamaStreamingToolCallsResponse` pin this half.
 
 **Streaming tool-call deltas are NOT emitted per-chunk** — `StreamWriter.
 WriteChunk(content string, index int)` has no field for structured data, and
