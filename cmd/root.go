@@ -99,13 +99,24 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
+		// output there corrupts the stream. Redirect debug to stderr FIRST,
+		// before any Log()/Debug() call in this function -- including
+		// RecoverInterruptedSwap() below (citadel#934: it used to run before
+		// this check, so its Debug()/Log() calls could land on stdout and
+		// corrupt the JSON-RPC stream under `--debug citadel mcp`).
+		if cmd.Name() == "mcp" {
+			debugToStderr = true
+		}
+
 		// citadel#926: repair a Windows binary swap interrupted mid-update
 		// (a kill between atomicReplaceWindows's two renames can leave no
 		// binary at all at the running executable's path). Runs before
-		// anything else so a self-healed binary is what serves the rest of
-		// this invocation. No-op on every other OS and when nothing needs
-		// recovering; best-effort -- a failure here must never block the
-		// command the user actually asked for.
+		// anything else (other than the debugToStderr routing above) so a
+		// self-healed binary is what serves the rest of this invocation.
+		// No-op on every other OS and when nothing needs recovering;
+		// best-effort -- a failure here must never block the command the
+		// user actually asked for.
 		if recovered, err := update.RecoverInterruptedSwap(); err != nil {
 			Debug("interrupted update recovery check failed: %v", err)
 		} else if recovered {
@@ -117,12 +128,6 @@ control center. All other subcommands are for scripting and advanced use.`,
 		// 13 call sites that resolve a runtime.
 		if containerRuntimeFlag != "" {
 			os.Setenv(catalog.RuntimeOverrideEnv, containerRuntimeFlag)
-		}
-		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
-		// output there corrupts the stream. Redirect debug to stderr early,
-		// before the first Log() call.
-		if cmd.Name() == "mcp" {
-			debugToStderr = true
 		}
 
 		// Route the network engine's diagnostics into the CLI log for EVERY
