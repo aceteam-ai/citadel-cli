@@ -154,6 +154,16 @@ func checkForUpdate() {
 }
 
 func installUpdate() {
+	// citadel#926: self-heal before attempting a new swap, in case a prior
+	// update was interrupted mid-swap (also checked in PersistentPreRun, but
+	// checked again here so `citadel update install` is a reliable manual
+	// recovery action on its own).
+	if recovered, err := update.RecoverInterruptedSwap(); err != nil {
+		fmt.Printf("Warning: interrupted update recovery check failed: %v\n", err)
+	} else if recovered {
+		fmt.Println("Recovered from an interrupted update before installing.")
+	}
+
 	// Check for updates
 	checkSpinner := whimsy.NewSimpleSpinner(whimsy.ProcessingMessages)
 	checkSpinner.Start()
@@ -229,6 +239,14 @@ func installUpdate() {
 }
 
 func rollbackUpdate() {
+	// citadel#926: self-heal before attempting a rollback swap, for the same
+	// reason as installUpdate above.
+	if recovered, err := update.RecoverInterruptedSwap(); err != nil {
+		fmt.Printf("Warning: interrupted update recovery check failed: %v\n", err)
+	} else if recovered {
+		fmt.Println("Recovered from an interrupted update before rolling back.")
+	}
+
 	if !update.HasPreviousVersion() {
 		fmt.Fprintln(os.Stderr, "No previous version available for rollback.")
 		os.Exit(1)
