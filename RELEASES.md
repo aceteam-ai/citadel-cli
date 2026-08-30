@@ -2033,3 +2033,23 @@ Auto-generated log of every release.
   - worker: forward OpenAI tools/tool_calls through llm_inference (#603) (#928)
 
 
+---
+
+## v2.131.0 — 2026-08-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 36 |
+| Lines added | +6652 |
+
+**Changes:**
+
+  - feat: durable model-cache index (citadel #682 P2a) (#936)
+  - feat: on-node pairing-code display, P0 headed-console path (#659) (#935)
+  - docs: implementable design for #659 on-node pairing-code display (#932)
+  - docs: P2 durable cache-index implementation design (#682/#683) (#930)
+  - fix: eliminate no-binary-at-dst window in Windows update swap (#926) (#931)
+  - worker: forward OpenAI tool calling through the native ollama chat path (#603) (#929)
+
+
