@@ -32,6 +32,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
+	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/power"
 	"github.com/aceteam-ai/citadel-cli/internal/provision"
@@ -646,6 +647,24 @@ func runWork(cmd *cobra.Command, args []string) {
 			Debug("skipping reservation reconcile: this process does not hold the single-instance worker lock")
 		}
 	}
+
+	// Pairing-display manager (citadel #659 P0): render a platform-pushed
+	// node:exec pairing code on this node's active text console. Configure
+	// the machine-convergent state dir (network.GetNodeConfigDir(), the same
+	// dir #845's device config and #726's heartbeat marker use) so the crash
+	// marker survives a restart-in-place, then reconcile any stale code left
+	// by a previous crashed/killed process BEFORE job consumption begins
+	// (design doc §12) -- mirroring the reservation reconcile above, but
+	// deliberately NOT gated on workerLockHeld: an unclaimed marker is
+	// harmless to clear even if a second process is somehow live (worst case,
+	// one extra clear-screen on a getty), unlike a reservation restart which
+	// can duplicate a running container.
+	pairingdisplay.Configure(network.GetNodeConfigDir())
+	pairingdisplay.Get().SetLogFunc(Debug)
+	if pairingdisplay.Get().ReconcileStale() {
+		Debug("cleared a stale pairing-code display left by a previous process")
+	}
+	defer pairingdisplay.Get().Shutdown()
 
 	// Detect Proxmox hypervisor (host fact, checked regardless of manifest vs auto-detect)
 	var proxmoxInfo *platform.ProxmoxInfo
@@ -1410,6 +1429,20 @@ func runWork(cmd *cobra.Command, args []string) {
 		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
+	// Pairing-display capability probe for the heartbeat (citadel-cli#659
+	// P0): can this node render a platform-pushed node:exec pairing code
+	// right now? Independent of the pairingdisplay.Manager singleton's
+	// pending-code state -- pairingdisplay.DetectSurfaces() always probes
+	// fresh (§11) -- so this needs no atomic-pointer indirection the way
+	// swapStatsFn/laneActivityFn do.
+	pairingDisplayFn := func() *status.PairingDisplayCapability {
+		surfaces := pairingdisplay.DetectSurfaces()
+		if len(surfaces) == 0 {
+			return nil
+		}
+		return &status.PairingDisplayCapability{Surfaces: surfaces}
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1428,6 +1461,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			ModelHotswap:    status.ModelHotswapEnabled(),
 			Reservations:    reservationsFn,
 			LaneActivity:    laneActivityFn,
+			PairingDisplay:  pairingDisplayFn,
 		})
 	}
 
@@ -1720,6 +1754,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				ModelHotswap:    status.ModelHotswapEnabled(),
 				Reservations:    reservationsFn,
 				LaneActivity:    laneActivityFn,
+				PairingDisplay:  pairingDisplayFn,
 			})
 		}
 

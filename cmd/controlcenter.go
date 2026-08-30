@@ -30,6 +30,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodestate"
+	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/pulse"
@@ -2257,6 +2258,21 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// WHATSAPP_PROVISION), not a subset. Build handlers via the shared helper so the
 	// registered set matches `citadel work` exactly and WHATSAPP_PROVISION /
 	// AGENT_UPDATE never fail with "no handler" in a control-center-only run.
+
+	// Pairing-display manager (citadel #659 P0), mirroring runWork's wiring:
+	// this process is now the sole job consumer for this node (workerHeld is
+	// false, or we returned above), so it is the right place to reconcile any
+	// stale code left by a previous crashed process before job consumption
+	// starts, and to clear on graceful shutdown. Safe/idempotent to Configure
+	// again even if a dedicated `citadel work` also configured its own
+	// process's singleton at some point -- they are separate processes with
+	// separate in-memory managers, coordinated only through the shared
+	// on-disk crash marker.
+	pairingdisplay.Configure(network.GetNodeConfigDir())
+	if pairingdisplay.Get().ReconcileStale() {
+		activity("info", "cleared a stale pairing-code display left by a previous process")
+	}
+	defer pairingdisplay.Get().Shutdown()
 
 	// Create worker ID
 	workerID := fmt.Sprintf("citadel-tui-%s", uuid.New().String()[:8])

@@ -76,6 +76,26 @@ type NodeStatus struct {
 	// worker.LaneSnapshot by cmd/work.go's laneActivityFrom (internal/status
 	// cannot import internal/worker); TestLaneShapeParity pins the two shapes.
 	Lanes []LaneActivity `json:"lanes,omitempty"`
+	// PairingDisplay advertises which surfaces this node can currently render
+	// a platform-pushed node:exec pairing code on (citadel-cli#659 P0). Nil
+	// means no capability -- the backend's `_node_screen_delivery` falls
+	// through to the operator's linked device, exactly as it does on any
+	// pre-#659 node. Additive/omitempty; a legacy build, a node with no VT
+	// subsystem (container, headless without a console), or a node whose
+	// active console is a graphical session all report this as absent. See
+	// internal/pairingdisplay.DetectSurfaces for what the probe actually
+	// checks (deliberately NOT internal/desktop.DetectCapabilities -- see
+	// docs/design-pairing-display.md §2.2/§9.1 for why that signal is the
+	// wrong gate for a root systemd worker).
+	PairingDisplay *PairingDisplayCapability `json:"pairing_display,omitempty"`
+}
+
+// PairingDisplayCapability is the heartbeat-facing pairing-display
+// capability (citadel-cli#659 P0). Surfaces is non-empty only when the
+// node can render right now; P0 only ever reports ["console"] (the Linux
+// VT-text-console mechanism). Later phases may add "pull"/"tui"/"gui".
+type PairingDisplayCapability struct {
+	Surfaces []string `json:"surfaces"`
 }
 
 // LaneActivity is the heartbeat-facing view of one bounded execution lane

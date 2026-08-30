@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 
+	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -104,6 +105,19 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	// or config, and the caller renders and then OCRs on the SAME node, so a
 	// control-center-only node must answer both or the pair splits.
 	handlers = append(handlers, worker.NewDocumentRasterizeHandler(worker.DocumentRasterizeConfig{
+		Log: opts.HandlerLog,
+	}))
+	// SHOW_PAIRING_CODE / CLEAR_PAIRING_CODE (issue #659 P0): render a
+	// platform-pushed node:exec pairing code on this node's active text
+	// console. Registered unconditionally alongside llm_inference/
+	// document_rasterize -- it needs no workspace or config, and delegates
+	// all state/rendering to the pairingdisplay.Get() process-wide singleton
+	// (configured with the machine-convergent state dir by runWork/
+	// runTUIWorker; see docs/design-pairing-display.md §12). Ops.Log NEVER
+	// receives the code -- see internal/worker/pairing_display.go's package
+	// doc for the invariant this call site must preserve.
+	handlers = append(handlers, worker.NewPairingDisplayHandler(worker.PairingDisplayConfig{
+		Ops: pairingdisplay.Get(),
 		Log: opts.HandlerLog,
 	}))
 	return handlers, swapper
