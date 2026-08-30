@@ -1504,3 +1504,310 @@ func TestLLMInferenceHandler_RequestSideNullToolCallsNotForwarded(t *testing.T) 
 		})
 	}
 }
+
+// TestLLMInferenceHandler_OllamaToolsRequestByteIdenticalWithoutTools mirrors
+// TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools for the
+// native Ollama /api/chat path (citadel-cli#603's ollama half): a text-only
+// request's outbound body must gain no "tools" key, and a text-only
+// response's Output must gain no "tool_calls" key.
+func TestLLMInferenceHandler_OllamaToolsRequestByteIdenticalWithoutTools(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"ok"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-no-tools",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "ollama",
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+
+	if _, present := gotReq["tools"]; present {
+		t.Errorf("outbound request = %+v, want no \"tools\" key", gotReq)
+	}
+	if _, present := result.Output["tool_calls"]; present {
+		t.Errorf("Output = %+v, want no \"tool_calls\" key", result.Output)
+	}
+	if got, _ := result.Output["finish_reason"].(string); got != "stop" {
+		t.Errorf("finish_reason = %q, want stop", got)
+	}
+}
+
+// TestLLMInferenceHandler_OllamaToolsForwardedInRequest asserts that tools
+// reach the outbound Ollama request when the payload carries them, and that
+// a prior assistant turn's tool_calls (OpenAI shape, as stored on
+// ChatMessage) is converted to Ollama's native request shape --
+// function.arguments as a JSON OBJECT, and no id/type field -- per
+// openAIToolCallsToOllama's doc comment.
+func TestLLMInferenceHandler_OllamaToolsForwardedInRequest(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"sunny"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-tools-request",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "ollama",
+			"tools": []map[string]any{
+				{
+					"type": "function",
+					"function": map[string]any{
+						"name":        "get_weather",
+						"description": "Get the weather for a city",
+						"parameters": map[string]any{
+							"type":       "object",
+							"properties": map[string]any{"city": map[string]any{"type": "string"}},
+						},
+					},
+				},
+			},
+			"messages": []map[string]any{
+				{"role": "user", "content": "weather in SF?"},
+				{
+					"role":    "assistant",
+					"content": "",
+					"tool_calls": []map[string]any{
+						{
+							"id":   "c1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "get_weather",
+								"arguments": `{"city": "SF"}`,
+							},
+						},
+					},
+				},
+				{
+					"role":         "tool",
+					"content":      `{"temp": 60}`,
+					"tool_call_id": "c1",
+					"name":         "get_weather",
+				},
+			},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+
+	tools, ok := gotReq["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("outbound tools = %#v, want a single-element array", gotReq["tools"])
+	}
+
+	msgs, _ := gotReq["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("outbound messages = %v, want 3", msgs)
+	}
+	assistantMsg, _ := msgs[1].(map[string]any)
+	assistantToolCalls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(assistantToolCalls) != 1 {
+		t.Fatalf("assistant message tool_calls = %#v, want single-element array", assistantMsg["tool_calls"])
+	}
+	tc0, _ := assistantToolCalls[0].(map[string]any)
+	if _, present := tc0["id"]; present {
+		t.Errorf("ollama-shaped tool_calls[0] = %+v, want no \"id\" key (Ollama assigns none)", tc0)
+	}
+	fn0, _ := tc0["function"].(map[string]any)
+	if fn0["name"] != "get_weather" {
+		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn0["name"])
+	}
+	args, ok := fn0["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_calls[0].function.arguments = %#v (%T), want a JSON object (Ollama's request shape), not a string", fn0["arguments"], fn0["arguments"])
+	}
+	if args["city"] != "SF" {
+		t.Errorf("tool_calls[0].function.arguments.city = %v, want SF", args["city"])
+	}
+
+	toolResultMsg, _ := msgs[2].(map[string]any)
+	if toolResultMsg["name"] != "get_weather" {
+		t.Errorf("tool-role message name = %v, want get_weather", toolResultMsg["name"])
+	}
+}
+
+// TestLLMInferenceHandler_OllamaBufferedToolCallsResponse asserts a buffered
+// Ollama /api/chat response carrying message.tool_calls (Ollama's native
+// shape: function.arguments as a JSON OBJECT, no id) is converted to the
+// OpenAI shape (id, type: "function", function.arguments as a JSON STRING)
+// on JobResult.Output, with finish_reason "tool_calls" and no spurious
+// empty-content chunk published.
+func TestLLMInferenceHandler_OllamaBufferedToolCallsResponse(t *testing.T) {
+	body := `{"message":{"role":"assistant","content":"",` +
+		`"tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"SF"}}}]},` +
+		`"done":true,"prompt_eval_count":10,"eval_count":5}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-buffered-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "ollama",
+			"tools": []map[string]any{
+				{"type": "function", "function": map[string]any{"name": "get_weather"}},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["finish_reason"].(string); got != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", got)
+	}
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("content = %q, want empty (tool_calls-only reply)", got)
+	}
+	raw, ok := result.Output["tool_calls"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("Output[\"tool_calls\"] = %#v (%T), want json.RawMessage", result.Output["tool_calls"], result.Output["tool_calls"])
+	}
+	var parsed []map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("tool_calls did not unmarshal as an array: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("tool_calls = %v, want one entry", parsed)
+	}
+	if id, _ := parsed[0]["id"].(string); id == "" {
+		t.Errorf("tool_calls[0].id = %v, want a non-empty synthetic id (Ollama assigns none)", parsed[0]["id"])
+	}
+	if parsed[0]["type"] != "function" {
+		t.Errorf("tool_calls[0].type = %v, want function", parsed[0]["type"])
+	}
+	fn, _ := parsed[0]["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn["name"])
+	}
+	argsStr, ok := fn["arguments"].(string)
+	if !ok {
+		t.Fatalf("tool_calls[0].function.arguments = %#v (%T), want a JSON string (OpenAI shape, converted from Ollama's object)", fn["arguments"], fn["arguments"])
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		t.Fatalf("tool_calls[0].function.arguments %q did not parse as JSON: %v", argsStr, err)
+	}
+	if args["city"] != "SF" {
+		t.Errorf("tool_calls[0].function.arguments.city = %v, want SF", args["city"])
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("chunks = %v, want none published for a tool_calls-only reply", stream.chunks)
+	}
+}
+
+// TestLLMInferenceHandler_OllamaStreamingToolCallsResponse drives an Ollama
+// streaming (NDJSON) response where the tool call arrives complete in a
+// single frame -- Ollama's protocol has no per-token tool_calls delta the way
+// OpenAI's streaming shape does -- and asserts the converted, OpenAI-shaped
+// tool_calls array is still returned on the terminal JobResult.Output with
+// finish_reason "tool_calls", matching the buffered path's contract.
+func TestLLMInferenceHandler_OllamaStreamingToolCallsResponse(t *testing.T) {
+	frames := []string{
+		`{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"SF"}}}]},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":9,"eval_count":4}`,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		for _, f := range frames {
+			_, _ = w.Write([]byte(f + "\n"))
+		}
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-streaming-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "ollama",
+			"stream":  true,
+			"tools": []map[string]any{
+				{"type": "function", "function": map[string]any{"name": "get_weather"}},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["finish_reason"].(string); got != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", got)
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("chunks = %v, want none (no content in any frame)", stream.chunks)
+	}
+	raw, ok := result.Output["tool_calls"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("Output[\"tool_calls\"] = %#v (%T), want json.RawMessage", result.Output["tool_calls"], result.Output["tool_calls"])
+	}
+	var parsed []map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("tool_calls did not unmarshal: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("tool_calls = %v, want one entry", parsed)
+	}
+	fn, _ := parsed[0]["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn["name"])
+	}
+}
