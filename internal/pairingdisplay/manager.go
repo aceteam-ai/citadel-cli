@@ -106,6 +106,15 @@ type pendingCode struct {
 	target         string
 	expiresAt      time.Time
 	timer          *time.Timer
+	// gen is a monotonically-increasing generation stamp, distinct from
+	// grantRequestID. It exists because §8.2 allows a re-Show for the SAME
+	// grantRequestID (a delivery retry) to reset the TTL: if the OLD timer
+	// has already fired and is blocked on m.mu when the retry's Show
+	// completes, onExpire would otherwise compare grantRequestID (equal,
+	// since it's a same-grant retry) and clear the freshly-rendered code.
+	// Comparing gen instead makes onExpire identify ITS OWN Show call, not
+	// just its grant.
+	gen uint64
 }
 
 // Manager owns the currently-displayed pairing code's lifecycle: render, TTL
@@ -116,6 +125,7 @@ type Manager struct {
 	renderer Renderer
 	stateDir string
 	pending  *pendingCode
+	nextGen  uint64
 	logf     func(format string, args ...any)
 }
 
@@ -214,8 +224,10 @@ func (m *Manager) Show(code string, ttl time.Duration, grantRequestID, requested
 		return ShowOutcome{Reason: result.Reason}
 	}
 
-	pc := &pendingCode{grantRequestID: grantRequestID, target: target, expiresAt: expiresAt}
-	pc.timer = time.AfterFunc(ttl, func() { m.onExpire(grantRequestID) })
+	m.nextGen++
+	gen := m.nextGen
+	pc := &pendingCode{grantRequestID: grantRequestID, target: target, expiresAt: expiresAt, gen: gen}
+	pc.timer = time.AfterFunc(ttl, func() { m.onExpire(gen) })
 	m.pending = pc
 
 	m.logf("pairing-display: showing code (grant_request_id=%s, surface=%s, target=%s, expires_at=%s)",
@@ -289,15 +301,18 @@ func (m *Manager) clearPendingLocked(note string) {
 	m.deleteMarkerLocked()
 }
 
-// onExpire is the TTL timer callback (design doc §12, path 1). It re-checks
-// identity under the lock so a replacement that raced the timer (Show called
-// for a different grant just before this fires) does not clear the NEW
-// code.
-func (m *Manager) onExpire(grantRequestID string) {
+// onExpire is the TTL timer callback (design doc §12, path 1). It compares
+// by GENERATION, not grantRequestID: §8.2 allows a re-Show for the SAME
+// grantRequestID (a delivery retry) to reset the TTL, so a grant-id match
+// alone is not enough to prove this timer belongs to the code currently
+// displayed -- see pendingCode.gen's doc comment for the exact race this
+// closes (the old timer firing after a same-grant retry has already
+// re-armed a new one).
+func (m *Manager) onExpire(gen uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pending == nil || m.pending.grantRequestID != grantRequestID {
-		return // already replaced or cleared
+	if m.pending == nil || m.pending.gen != gen {
+		return // already replaced, retried, or cleared
 	}
 	m.clearPendingLocked("expired")
 }

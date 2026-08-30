@@ -111,8 +111,15 @@ func resolveActiveVTDevice() (string, bool) {
 // KD_TEXT mode. On any failure it returns a nil file and a §8.3 reason
 // string; the caller must fail closed (delivered:false) on every one of
 // them.
+//
+// O_NOCTTY is load-bearing, not defensive polish: citadel work runs as a
+// systemd worker with no controlling terminal, and DetectSurfaces (called
+// on every ~30s heartbeat) opens this SAME device on every headed node this
+// feature targets. Without O_NOCTTY, opening /dev/ttyN can make it the
+// process's controlling terminal, after which a signal delivered to the
+// physical console (e.g. Ctrl+C at the getty) reaches this worker process.
 func openTextConsole(device string) (*os.File, string) {
-	f, err := os.OpenFile(device, os.O_RDWR, 0)
+	f, err := os.OpenFile(device, os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
 		if os.IsPermission(err) {
 			return nil, "permission_denied"

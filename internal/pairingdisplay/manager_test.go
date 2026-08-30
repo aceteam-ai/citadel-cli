@@ -1,6 +1,7 @@
 package pairingdisplay
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,6 +230,44 @@ func TestManager_ExpiryAfterReplacementDoesNotClearNewCode(t *testing.T) {
 	}
 }
 
+func TestManager_SameGrantRetryResetsTTLWithoutStaleExpiry(t *testing.T) {
+	// Pins the race pendingCode.gen exists to close (design doc §8.2 allows
+	// a re-Show for the SAME grant_request_id -- a delivery retry -- to
+	// reset the TTL): time.Timer.Stop() cannot un-run an already-fired
+	// callback, so the ORIGINAL timer's goroutine can still reach onExpire
+	// well after a same-grant retry has replaced the pending state. A
+	// grant-id-only comparison would incorrectly treat that as "still my
+	// code" and clear the freshly-rendered retry. Driven directly (not via
+	// real timer scheduling, which cannot deterministically force this
+	// interleaving) by capturing the original generation and invoking the
+	// unexported onExpire exactly as the stale timer callback would.
+	r := newFakeRenderer()
+	m := NewManager(r)
+
+	m.Show("12345678", time.Hour, "gr_1", "")
+	staleGen := m.pending.gen
+
+	// A retry for the SAME grant_request_id. This itself performs one
+	// renderer.Clear as part of replacing the prior pending state (Show
+	// always clears-before-showing) -- that is expected and unrelated to
+	// the race under test.
+	m.Show("12345678", time.Hour, "gr_1", "")
+	clearsAfterRetry := r.clearCount()
+
+	// Simulate the original (now-stale) timer's callback finally running.
+	// It must be a no-op: no additional renderer.Clear call.
+	m.onExpire(staleGen)
+	if r.clearCount() != clearsAfterRetry {
+		t.Fatalf("expected the stale onExpire to be a no-op (no additional Clear call), went from %d to %d",
+			clearsAfterRetry, r.clearCount())
+	}
+
+	out := m.Clear("gr_1")
+	if !out.Cleared {
+		t.Fatalf("expected the retried gr_1 to still be displayed after the stale timer's callback ran, got %+v", out)
+	}
+}
+
 func TestManager_MarkerWrittenAndRemoved(t *testing.T) {
 	dir := t.TempDir()
 	r := newFakeRenderer()
@@ -322,6 +361,79 @@ func TestManager_NilRendererFailsClosed(t *testing.T) {
 	if out.Reason != "unsupported_os" {
 		t.Fatalf("expected reason unsupported_os, got %q", out.Reason)
 	}
+}
+
+// TestManager_SentinelNeverLeaksThroughRenderer is the Manager-level half of
+// the design doc §10.3 no-leak test: internal/worker/pairing_display_test.go's
+// TestPairingDisplayHandler_SentinelNeverLeaks injects a fake
+// PairingDisplayOps and so never exercises Manager's own logf lines, the
+// crash-marker write, or the Renderer boundary itself. This test drives the
+// REAL Manager (through a fake Renderer, per §10.3's "run the handler with a
+// sentinel code against every failure branch") across show, a failed
+// render, replacement, TTL expiry, an explicit Clear, and ReconcileStale --
+// scanning every captured log line and the on-disk marker for the sentinel
+// after each step.
+func TestManager_SentinelNeverLeaksThroughRenderer(t *testing.T) {
+	const sentinel = "SENTINEL-MANAGER-LEVEL-4c1e8b02"
+	dir := t.TempDir()
+
+	var logged []string
+	r := newFakeRenderer()
+	m := NewManager(r)
+	m.stateDir = dir
+	m.SetLogFunc(func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	})
+
+	checkNoLeak := func(t *testing.T, step string) {
+		t.Helper()
+		for i, line := range logged {
+			if strings.Contains(line, sentinel) {
+				t.Fatalf("SECURITY [%s]: log line %d leaked the sentinel: %q", step, i, line)
+			}
+		}
+		if raw, err := os.ReadFile(filepath.Join(dir, stateMarkerFile)); err == nil {
+			if strings.Contains(string(raw), sentinel) {
+				t.Fatalf("SECURITY [%s]: crash marker leaked the sentinel: %s", step, raw)
+			}
+		}
+	}
+
+	// 1. Ordinary show.
+	m.Show(sentinel, 20*time.Millisecond, "gr_1", sentinel)
+	checkNoLeak(t, "show")
+
+	// 2. A failed render (graphical_session) for a second grant.
+	r.showResult = RenderResult{Reason: "graphical_session"}
+	m.Show(sentinel, time.Minute, "gr_2", sentinel)
+	checkNoLeak(t, "render failure")
+	r.showResult = RenderResult{Delivered: true, Surface: "console"}
+
+	// 3. Replacement (a third grant takes over from whatever is pending).
+	m.Show(sentinel, time.Minute, "gr_3", sentinel)
+	checkNoLeak(t, "replacement")
+
+	// 4. TTL expiry (drive it directly rather than sleeping on a real timer).
+	m.mu.Lock()
+	gen := m.pending.gen
+	m.mu.Unlock()
+	m.onExpire(gen)
+	checkNoLeak(t, "expiry")
+
+	// 5. Explicit Clear on a fresh show.
+	m.Show(sentinel, time.Minute, "gr_4", sentinel)
+	m.Clear("gr_4")
+	checkNoLeak(t, "clear")
+
+	// 6. ReconcileStale against a marker written directly (simulating a
+	// crashed process), and Shutdown.
+	m.Show(sentinel, time.Minute, "gr_5", sentinel)
+	m.ReconcileStale()
+	checkNoLeak(t, "reconcile")
+
+	m.Show(sentinel, time.Minute, "gr_6", sentinel)
+	m.Shutdown()
+	checkNoLeak(t, "shutdown")
 }
 
 func TestDetectSurfaces_NoPanic(t *testing.T) {
