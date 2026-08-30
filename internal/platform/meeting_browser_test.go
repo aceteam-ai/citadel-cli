@@ -563,6 +563,110 @@ func TestMeetingBrowser_CloseReleasesProfileLock(t *testing.T) {
 	}
 }
 
+// TestMeetingBrowser_ClaimProfileLockDefaultAcquires pins claimProfileLock's
+// default (no WithHeldProfileLock) behavior: it acquires a fresh lock exactly
+// like the pre-#927 unconditional acquireMeetingProfileLock call did, and the
+// returned release func genuinely works.
+func TestMeetingBrowser_ClaimProfileLockDefaultAcquires(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	br := NewMeetingBrowser("citadel_meeting_gotest", dir)
+	release, err := br.claimProfileLock(dir)
+	if err != nil {
+		t.Fatalf("claimProfileLock: unexpected error: %v", err)
+	}
+	if release == nil {
+		t.Fatal("expected a non-nil release when no lock is held externally")
+	}
+
+	if _, err := acquireMeetingProfileLock(dir); err == nil {
+		t.Fatal("expected the profile to be reported busy while claimProfileLock's own lock is held")
+	}
+
+	release()
+	if _, err := acquireMeetingProfileLock(dir); err != nil {
+		t.Fatalf("acquire after release: unexpected error: %v", err)
+	}
+}
+
+// TestMeetingBrowser_WithHeldProfileLockSkipsReacquire is the citadel-cli#927
+// fix's direct regression test at the exact seam Start() uses: with
+// WithHeldProfileLock set, claimProfileLock must NOT attempt its own TryLock
+// at all -- proven by pre-locking the profile dir from a stand-in "setup
+// phase" caller (mirroring internal/jobs.hostMedia.Start()'s
+// AcquireMeetingProfileSetupLock hold) and asserting claimProfileLock
+// neither errors nor returns a release of its own. Exercising the
+// extracted claimProfileLock seam directly, rather than the full Start(),
+// keeps this hermetic (no real Chrome/Xvfb), matching the pattern
+// TestMeetingBrowser_CloseReleasesProfileLock already uses for the
+// release-side wiring below.
+func TestMeetingBrowser_WithHeldProfileLockSkipsReacquire(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	// Stand-in for hostMedia.Start()'s AcquireMeetingProfileSetupLock hold,
+	// carried into (and past) MeetingBrowser.Start().
+	release, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("pre-acquire: unexpected error: %v", err)
+	}
+	defer release()
+
+	br := NewMeetingBrowser("citadel_meeting_gotest", dir).WithHeldProfileLock()
+
+	gotRelease, err := br.claimProfileLock(dir)
+	if err != nil {
+		t.Fatalf("claimProfileLock with an externally-held lock: unexpected error: %v", err)
+	}
+	if gotRelease != nil {
+		t.Error("expected a nil release: ownership of an externally-held lock must stay with the caller, not move to this MeetingBrowser")
+	}
+}
+
+// TestMeetingBrowser_CloseDoesNotReleaseHeldProfileLock is the citadel-cli#927
+// fix's regression test for the release side: when Start() was handed an
+// already-held lock (WithHeldProfileLock), Close() must never release it --
+// the caller retains sole ownership and releases it itself, exactly once,
+// whenever it is actually done with the profile. Hand-constructs the
+// post-Start() state directly (externalProfileLockHeld set, profileLockRelease
+// left nil, exactly as claimProfileLock leaves it in this case) rather than
+// calling a real Start(), the same hermetic pattern
+// TestMeetingBrowser_CloseReleasesProfileLock uses for the normal
+// (non-held) case.
+func TestMeetingBrowser_CloseDoesNotReleaseHeldProfileLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meeting-profile")
+
+	release, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire: unexpected error: %v", err)
+	}
+
+	br := &MeetingBrowser{profileDir: dir, externalProfileLockHeld: true}
+
+	if err := br.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The ORIGINAL lock must still be held: Close() must not have released a
+	// lock this MeetingBrowser never owned in the first place.
+	if _, err := acquireMeetingProfileLock(dir); err == nil {
+		t.Fatal("expected the profile to still be reported busy after Close(): the caller, not the browser, owns this lock")
+	}
+
+	// The single owner releases it itself, exactly once -- proving there was
+	// exactly one live holder throughout (no leak, no double-release panic).
+	release()
+	release2, err := acquireMeetingProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquire after the caller's own release: unexpected error: %v", err)
+	}
+	release2()
+
+	// Close() remains safe to call more than once even in the held-lock case.
+	if err := br.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

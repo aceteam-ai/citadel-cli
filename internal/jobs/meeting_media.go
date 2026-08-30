@@ -102,6 +102,15 @@ type hostMedia struct {
 	wavPath    string
 	rec        *platform.NullSinkRecorder
 	br         *platform.MeetingBrowser
+	// releaseProfileLock releases the process-wide profile lock acquired at
+	// the top of Start() (see acquireMeetingProfileSetupLockFn), once Start()
+	// has succeeded far enough that ownership of that lock has moved from
+	// Start()'s own local defer to this struct -- i.e. it now spans the
+	// browser's full lifetime, handed to platform.MeetingBrowser via
+	// WithHeldProfileLock (citadel-cli#927) rather than released and
+	// re-acquired. nil before that point (Start()'s own defer still owns
+	// releasing it) and after Close() has released it.
+	releaseProfileLock func()
 }
 
 func newHostMedia(meetingID, profileDir, wavPath string) *hostMedia {
@@ -109,28 +118,42 @@ func newHostMedia(meetingID, profileDir, wavPath string) *hostMedia {
 }
 
 func (m *hostMedia) Start() (meetingBrowser, error) {
-	// Claim the SAME process-wide profile lock MeetingBrowser.Start() uses
-	// below, but only for THIS function's setup phase (mark-owned + sink-
-	// sweep + LoadSink) -- a real, goroutine-correct mutex that narrows the
-	// window in which two genuinely concurrent SAME-PROCESS meeting attempts
-	// against this profile (MEETING_JOIN runs on its own dedicated async
-	// lane -- see CLAUDE.md's "Long-session and GPU-bound jobs get a
+	// Claim the SAME process-wide profile lock MeetingBrowser.Start() would
+	// otherwise acquire itself -- a real, goroutine-correct mutex that closes
+	// the window in which two genuinely concurrent SAME-PROCESS meeting
+	// attempts against this profile (MEETING_JOIN runs on its own dedicated
+	// async lane -- see CLAUDE.md's "Long-session and GPU-bound jobs get a
 	// dedicated always-async lane" -- so two overlapping meetings really can
-	// race here) could interleave their setup steps and have one's sweep
-	// unload the other's just-loaded sink; a PID-keyed pidfile alone cannot
+	// race here) could interleave; a PID-keyed pidfile alone cannot
 	// distinguish two goroutines in this SAME process (see
-	// meetingSinkSweepBlocked's doc comment for the precise residual this
-	// still leaves). Released BEFORE calling MeetingBrowser.Start(), so that
-	// call's own (separate, full-launch-lifetime) acquire on the identical
-	// mutex succeeds normally instead of finding it already held.
-	profileDir, releaseSetupLock, err := acquireMeetingProfileSetupLockFn(m.profileDir)
+	// meetingSinkSweepBlocked's doc comment).
+	//
+	// Unlike the pre-citadel-cli#927 version of this function, this lock is
+	// now held CONTINUOUSLY from here through the browser's full launch, not
+	// just this function's own setup phase (mark-owned + sink-sweep +
+	// LoadSink): it is handed off to platform.MeetingBrowser via
+	// WithHeldProfileLock below instead of being released and having Start()
+	// re-acquire its own. That removes the brief release-then-reacquire
+	// window that used to exist between this function's setup and
+	// MeetingBrowser.Start()'s own acquisition -- the residual gap
+	// meetingSinkSweepBlocked's doc comment previously described as
+	// "narrowed, not fully closed".
+	//
+	// lockOwnedHere tracks whether THIS function still owns the single
+	// release call. It starts true and the deferred release below fires on
+	// every early-return failure path (MeetingMedia.Start's documented
+	// contract: the caller only defers Close() on SUCCESS, so a failure here
+	// must clean up its own lock hold, not rely on Close() to do it). On
+	// success, ownership moves to m.releaseProfileLock, released by Close()
+	// only once the browser itself has been torn down.
+	profileDir, release, err := acquireMeetingProfileSetupLockFn(m.profileDir)
 	if err != nil {
 		return nil, err
 	}
-	setupLockHeld := true
+	lockOwnedHere := true
 	defer func() {
-		if setupLockHeld {
-			releaseSetupLock()
+		if lockOwnedHere {
+			release()
 		}
 	}()
 
@@ -192,15 +215,14 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	}
 	m.rec = rec
 
-	// Release the setup lock now, immediately before MeetingBrowser.Start()
-	// claims its own separate, full-launch-lifetime hold on the identical
-	// mutex -- see the acquire comment above for why this must happen here.
-	releaseSetupLock()
-	setupLockHeld = false
-
 	// Launch the sibling browser routed into the sink, reusing the persistent,
-	// signed-in bot Chrome profile (issue #5122).
-	br := platform.NewMeetingBrowser(rec.SinkName(), profileDir)
+	// signed-in bot Chrome profile (issue #5122). WithHeldProfileLock hands
+	// the SAME lock this function has held since before the sink sweep into
+	// the browser's own full-launch-lifetime hold (citadel-cli#927): Start()
+	// skips its own (redundant) acquisition, and it will NOT release this
+	// lock on Close() -- that release call stays ours (see m.releaseProfileLock
+	// below), never transferred to the browser.
+	br := platform.NewMeetingBrowser(rec.SinkName(), profileDir).WithHeldProfileLock()
 	if err := br.Start(); err != nil {
 		// Unload the sink we just loaded so a browser-launch failure does not leak it.
 		_, _ = rec.Stop()
@@ -208,6 +230,12 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 		return nil, fmt.Errorf("start meeting browser: %w", err)
 	}
 	m.br = br
+
+	// Success: the lock now spans the browser's full lifetime. Ownership
+	// moves from this function's own defer to m -- Close() releases it,
+	// AFTER m.br.Close() has torn the browser down, not this function's exit.
+	m.releaseProfileLock = release
+	lockOwnedHere = false
 	return br, nil
 }
 
@@ -254,6 +282,17 @@ func (m *hostMedia) Close() error {
 			firstErr = err
 		}
 		m.rec = nil
+	}
+	// Release the profile lock LAST, only once the browser (and therefore
+	// Chrome's own --user-data-dir hold) is confirmed torn down -- mirrors
+	// platform.MeetingBrowser.closeLocked's own release-last ordering.
+	// Ownership of this lock lives here (not on m.br) precisely because
+	// br.Start() was called with WithHeldProfileLock (citadel-cli#927):
+	// m.br.Close() above will not have released anything. nil (a no-op)
+	// whenever Start() never reached success, or Close() has already run.
+	if m.releaseProfileLock != nil {
+		m.releaseProfileLock()
+		m.releaseProfileLock = nil
 	}
 	return firstErr
 }

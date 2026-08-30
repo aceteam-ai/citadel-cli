@@ -320,6 +320,15 @@ func describeCDPException(exc any) string {
 // inside the FIRST, still-live meeting's browser — disrupting an in-progress
 // call. Guarding here protects against that collision from ANY caller, not
 // just one dispatch path.
+//
+// A caller that already holds this SAME lock across a setup phase preceding
+// Start() (internal/jobs.hostMedia.Start(), which marks the profile owned and
+// sweeps orphaned audio sinks before the browser launches — see
+// AcquireMeetingProfileSetupLock) can hand that hold in via
+// WithHeldProfileLock instead of releasing it and letting Start() re-acquire
+// its own. This closes the citadel-cli#927 residual window: previously that
+// release-then-reacquire gap, however brief, was a real seam in which a
+// second Start() against the same profile could interleave.
 type MeetingBrowser struct {
 	mu                 sync.Mutex
 	sinkName           string
@@ -333,9 +342,22 @@ type MeetingBrowser struct {
 	xvfb               *exec.Cmd
 	xvfbExited         chan struct{}
 	// profileLockRelease releases the process-wide profile-dir guard acquired
-	// by Start() (see acquireMeetingProfileLock). nil before Start() succeeds
-	// far enough to claim the resource, or after it has been released.
+	// BY THIS MeetingBrowser (see acquireMeetingProfileLock). nil before
+	// Start() succeeds far enough to claim the resource, after it has been
+	// released, OR whenever externalProfileLockHeld is true -- in that case
+	// this MeetingBrowser never owns a release call at all (see
+	// WithHeldProfileLock), so closeLocked's "release if non-nil" step is
+	// correctly a no-op.
 	profileLockRelease func()
+	// externalProfileLockHeld records that the CALLER already holds the
+	// process-wide profile-dir lock for this browser's profile dir (set via
+	// WithHeldProfileLock before Start()). When true, Start() skips its own
+	// TryLock acquisition entirely and never populates profileLockRelease, so
+	// Close()/closeLocked() never attempts to release a lock this instance
+	// does not own -- the caller retains sole ownership and must release it
+	// itself, exactly once, whenever it is actually done with the profile
+	// (which may be well after this MeetingBrowser's own Close() returns).
+	externalProfileLockHeld bool
 }
 
 // meetingProfileLocks guards concurrent MeetingBrowser.Start() calls against
@@ -406,6 +428,47 @@ func acquireMeetingProfileLock(profileDir string) (release func(), err error) {
 // point at a non-default data volume.
 func NewMeetingBrowser(sinkName, profileDirOverride string) *MeetingBrowser {
 	return &MeetingBrowser{sinkName: sinkName, profileDirOverride: profileDirOverride}
+}
+
+// WithHeldProfileLock tells this MeetingBrowser that the CALLER already holds
+// the process-wide profile-dir lock (acquireMeetingProfileLock) for the
+// profile this browser will resolve to — typically because the caller
+// acquired it before Start() to guard a setup phase of its own (see
+// AcquireMeetingProfileSetupLock) and wants that SAME hold to continue
+// covering the browser's full launch and lifetime, rather than releasing it
+// and having Start() re-acquire a fresh one (the citadel-cli#927 gap this
+// closes: the brief release-then-reacquire window was a real, if narrow,
+// seam for a second concurrent Start() to slip through).
+//
+// Must be called before Start(). When set, Start() skips its own TryLock
+// acquisition entirely, and Close() never releases anything on this
+// instance's behalf — the caller retains sole ownership of the lock and is
+// responsible for releasing it itself, exactly once, whenever it is actually
+// done with the profile (which may be after this MeetingBrowser's own
+// Close() returns, since the caller may still be tearing down other
+// profile-scoped state, e.g. the audio sink).
+//
+// Returns b for chaining, e.g.
+// platform.NewMeetingBrowser(sink, dir).WithHeldProfileLock().
+func (b *MeetingBrowser) WithHeldProfileLock() *MeetingBrowser {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.externalProfileLockHeld = true
+	return b
+}
+
+// claimProfileLock decides how Start() obtains the process-wide profile-dir
+// lock: acquire a fresh one (the normal case), or — when the caller has
+// already claimed it via WithHeldProfileLock — skip acquisition entirely and
+// return a nil release, since ownership (and therefore the single release
+// call) belongs to the caller, not this MeetingBrowser. Extracted from
+// Start() so this decision is unit-testable without launching a real
+// browser (no Chrome/Xvfb needed either way).
+func (b *MeetingBrowser) claimProfileLock(profileDir string) (release func(), err error) {
+	if b.externalProfileLockHeld {
+		return nil, nil
+	}
+	return acquireMeetingProfileLock(profileDir)
 }
 
 // DebugPort returns the CDP port the browser listens on (0 before Start).
@@ -496,12 +559,16 @@ func (b *MeetingBrowser) Start() error {
 	// resolveMeetingProfileDir is the same pure resolution
 	// preparePersistentProfileDir uses internally (override, then
 	// EnvMeetingProfileDir, then the ConfigDir() default), so both calls agree
-	// on the directory the lock is keyed by. release is unlocked by the
-	// deferred cleanup below on every early return; ownership transfers to
-	// b.profileLockRelease (released by closeLocked) only once the browser
-	// process itself has actually started.
+	// on the directory the lock is keyed by. claimProfileLock (see its doc
+	// comment) either acquires a fresh lock here or, when the caller already
+	// holds one (WithHeldProfileLock, citadel-cli#927), returns a nil release
+	// and this function never becomes an owner of anything to release. When
+	// it IS a fresh acquisition, release is unlocked by the deferred cleanup
+	// below on every early return; ownership transfers to b.profileLockRelease
+	// (released by closeLocked) only once the browser process itself has
+	// actually started.
 	profileDirForLock := resolveMeetingProfileDir(b.profileDirOverride)
-	release, err := acquireMeetingProfileLock(profileDirForLock)
+	release, err := b.claimProfileLock(profileDirForLock)
 	if err != nil {
 		return err
 	}
@@ -585,7 +652,11 @@ func (b *MeetingBrowser) Start() error {
 
 	// Transfer ownership of the profile-dir guard to b: from here on
 	// closeLocked() releases it (on Close(), or on the waitForCDPReady failure
-	// path below), not this function's own deferred cleanup.
+	// path below), not this function's own deferred cleanup. When
+	// externalProfileLockHeld is true, release is nil here (claimProfileLock
+	// never acquired one), so this assigns nil and closeLocked's own
+	// "release if non-nil" check correctly stays a no-op — ownership never
+	// left the caller.
 	b.profileLockRelease = release
 	releasePending = nil
 
@@ -728,6 +799,9 @@ func (b *MeetingBrowser) closeLocked() error {
 	// Idempotent: closeLocked can run more than once (Close() is documented
 	// safe to call repeatedly, and the waitForCDPReady failure path in Start()
 	// also routes here), and profileLockRelease itself is sync.Once-wrapped.
+	// profileLockRelease is nil (this is correctly a no-op) both before
+	// Start() has claimed anything AND whenever WithHeldProfileLock was used
+	// (citadel-cli#927) — the caller owns that release call, not us.
 	if b.profileLockRelease != nil {
 		b.profileLockRelease()
 		b.profileLockRelease = nil
