@@ -59,7 +59,10 @@ func (consoleRenderer) Show(target string, req ShowRequest) RenderResult {
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(renderShowFrame(req)); err != nil {
+	// writeFrameOrClear best-effort clears the console on a failed/partial
+	// write, since Manager arms no TTL/crash-marker cleanup for a
+	// non-delivered outcome — see its doc comment (write_safety.go).
+	if err := writeFrameOrClear(f, renderShowFrame(req)); err != nil {
 		return RenderResult{Reason: "render_error"}
 	}
 	return RenderResult{Delivered: true, Surface: "console"}

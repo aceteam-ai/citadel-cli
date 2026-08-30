@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 )
@@ -228,8 +229,22 @@ func parseShowPairingCodePayload(payload map[string]any) (showPairingCodePayload
 		req.TTLSeconds = pairingTTLMaxSeconds
 	}
 
+	// Sanitize BEFORE bounding: unlike code (rejected outright on any
+	// non-printable-ASCII byte — isPrintableASCII above), requested_by is
+	// free text and was only ever length-bounded, never charset-validated.
+	// Review caught the consequence: it is rendered directly into the
+	// console frame (pairingdisplay.renderShowFrame), so an embedded
+	// ANSI/control sequence (e.g. another screen-clear) could erase an
+	// already-rendered code while this handler still reports
+	// delivered:true — the exact false-positive the package's governing
+	// rule forbids, since it suppresses the backend's linked-device
+	// fallback with nothing actually left on screen. pairingdisplay.
+	// SanitizeText is the SAME function the render path itself applies as
+	// a second, independent layer of defense (see renderShowFrame's doc
+	// comment for why both layers sanitize rather than trusting the other).
+	req.RequestedBy = pairingdisplay.SanitizeText(req.RequestedBy)
 	if len(req.RequestedBy) > pairingRequestedByMaxLen {
-		req.RequestedBy = req.RequestedBy[:pairingRequestedByMaxLen]
+		req.RequestedBy = truncateRuneSafe(req.RequestedBy, pairingRequestedByMaxLen)
 	}
 
 	return req, nil
@@ -246,6 +261,25 @@ func isPrintableASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// truncateRuneSafe bounds s to at most max BYTES without splitting a
+// multi-byte UTF-8 rune (requested_by is free text and may legitimately
+// contain non-ASCII characters, unlike code). Backs off to the last full
+// rune boundary at or before max rather than an unconditional byte slice.
+func truncateRuneSafe(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	trimmed := s[:max]
+	for len(trimmed) > 0 {
+		r, size := utf8.DecodeLastRuneInString(trimmed)
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		trimmed = trimmed[:len(trimmed)-1]
+	}
+	return trimmed
 }
 
 func (h *PairingDisplayHandler) showFailure(reason string, err error) *JobResult {

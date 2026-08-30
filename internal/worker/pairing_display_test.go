@@ -223,6 +223,47 @@ func TestPairingDisplayHandler_ShowBadPayload(t *testing.T) {
 	}
 }
 
+// TestPairingDisplayHandler_ShowSanitizesRequestedBy pins the review-caught
+// fail-closed fix: requested_by is free text, bounded but (before this fix)
+// never charset-validated, unlike code. Because it is rendered directly
+// into the console frame, an embedded ANSI/control sequence could erase an
+// already-rendered code while Show still reports delivered:true -- the
+// exact false-positive the package's governing rule forbids. This asserts
+// the sanitized value (control bytes, including ESC, stripped) is what
+// actually reaches Ops.Show -- i.e. what the render layer receives -- and
+// that the code itself is untouched.
+func TestPairingDisplayHandler_ShowSanitizesRequestedBy(t *testing.T) {
+	ops := &fakePairingOps{showResult: pairingdisplay.ShowOutcome{Delivered: true, Surface: "console"}}
+	h := NewPairingDisplayHandler(PairingDisplayConfig{Ops: ops})
+
+	const maliciousRequestedBy = "evil\x1b[2J\x1b[Hname"
+	job := &Job{Type: JobTypeShowPairingCode, SourceQueue: perNodeQueue, Payload: map[string]any{
+		"code": "12345678", "grant_request_id": "gr_1", "requested_by": maliciousRequestedBy,
+	}}
+	res, err := h.Execute(nil, job, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess || res.Output["delivered"] != true {
+		t.Fatalf("expected a successful delivery, got %v %v", res.Status, res.Output)
+	}
+	if len(ops.showCalls) != 1 {
+		t.Fatalf("expected 1 Show call, got %d", len(ops.showCalls))
+	}
+	got := ops.showCalls[0].requestedBy
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("expected the ESC byte to be stripped from requested_by before it reaches the render layer, got %q", got)
+	}
+	if got != "evil[2J[Hname" {
+		t.Fatalf("expected the sanitized (ESC-stripped) requested_by, got %q", got)
+	}
+	// The code itself is untouched by sanitization -- it went through
+	// isPrintableASCII validation instead (rejected outright, not sanitized).
+	if ops.showCalls[0].code != "12345678" {
+		t.Fatalf("expected the code to be passed through unchanged, got %q", ops.showCalls[0].code)
+	}
+}
+
 func TestPairingDisplayHandler_ClearSuccess(t *testing.T) {
 	ops := &fakePairingOps{clearResult: pairingdisplay.ClearOutcome{Cleared: true}}
 	h := NewPairingDisplayHandler(PairingDisplayConfig{Ops: ops})
@@ -333,6 +374,17 @@ func TestPairingDisplayHandler_SentinelNeverLeaks(t *testing.T) {
 			ops:  nil,
 			job: &Job{Type: JobTypeShowPairingCode, SourceQueue: perNodeQueue, Payload: map[string]any{
 				"code": sentinel, "grant_request_id": "gr_6",
+			}},
+		},
+		{
+			// ANSI/control bytes in requested_by alongside a sentinel code:
+			// the review-caught case. Even though requested_by is sanitized
+			// (not rejected), this confirms sanitization does not somehow
+			// route the CODE itself into a log line or result field.
+			name: "requested_by carries ANSI/control bytes",
+			ops:  &fakePairingOps{showResult: pairingdisplay.ShowOutcome{Delivered: true, Surface: "console"}},
+			job: &Job{Type: JobTypeShowPairingCode, SourceQueue: perNodeQueue, Payload: map[string]any{
+				"code": sentinel, "grant_request_id": "gr_7", "requested_by": "\x1b[2J\x1b[H" + sentinel,
 			}},
 		},
 	}
