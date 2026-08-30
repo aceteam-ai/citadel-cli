@@ -223,3 +223,102 @@ func TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep(t *testing.T) {
 		t.Errorf("full call order = %v, want %v", calls, wantOrder)
 	}
 }
+
+// TestHostMediaStart_HandsOffProfileLockRatherThanReleasingBeforeBrowserStart
+// is the citadel-cli#927 regression test for the setup-lock hand-off fix
+// itself. Unlike TestHostMediaStart_MarksProfileOwnedBeforeSinkSweep above
+// (whose isolated-to-an-empty-dir PATH makes the real rec.LoadSink() fail
+// BEFORE the discriminating point below is ever reached — that test would
+// stay green even if the hand-off fix were fully reverted), this test
+// combines the same seam-injection technique with the fake-pactl-on-PATH
+// setup from TestHostMediaStart_SweepsSinksBeforeLoadSink so the REAL
+// (unmocked) rec.LoadSink() succeeds and execution reaches the REAL
+// (unmocked) platform.MeetingBrowser.Start(), which then fails at
+// findChromium (no fake chrome on the isolated PATH) — the same hermetic
+// failure point that test uses, so nothing real is ever launched here either.
+//
+// Pre-#927, hostMedia.Start() released the setup lock SYNCHRONOUSLY,
+// immediately before calling MeetingBrowser.Start() — so "release" would be
+// recorded in the call order BEFORE "clear" (a deferred call that only fires
+// once the function returns). Post-#927, release only happens via a deferred
+// guard that fires on return, registered BEFORE the "clear" defer — so LIFO
+// unwind runs "clear" first and "release" second. The exact-order assertion
+// below is what actually distinguishes the two: a revert of the
+// WithHeldProfileLock hand-off (restoring the old synchronous
+// release-before-Start) would flip "clear" and "release" here while leaving
+// every platform-level test (which exercises the extracted claimProfileLock
+// seam or a hand-constructed MeetingBrowser, never a real hostMedia.Start()
+// call) unaffected.
+func TestHostMediaStart_HandsOffProfileLockRatherThanReleasingBeforeBrowserStart(t *testing.T) {
+	var calls []string
+
+	profileDir := t.TempDir()
+
+	prevAcquire := acquireMeetingProfileSetupLockFn
+	acquireMeetingProfileSetupLockFn = func(profileDirOverride string) (string, func(), error) {
+		calls = append(calls, "acquire")
+		return profileDir, func() { calls = append(calls, "release") }, nil
+	}
+	t.Cleanup(func() { acquireMeetingProfileSetupLockFn = prevAcquire })
+
+	prevMark := markMeetingProfileOwnedFn
+	markMeetingProfileOwnedFn = func(profileDirOverride string) (string, bool, error) {
+		calls = append(calls, "mark")
+		return profileDirOverride, true, nil
+	}
+	t.Cleanup(func() { markMeetingProfileOwnedFn = prevMark })
+
+	prevClear := clearMeetingProfilePlaceholderFn
+	clearMeetingProfilePlaceholderFn = func(profileDir string) {
+		calls = append(calls, "clear")
+	}
+	t.Cleanup(func() { clearMeetingProfilePlaceholderFn = prevClear })
+
+	prevSweep := reapOrphanedMeetingSinksFn
+	reapOrphanedMeetingSinksFn = func(profileDirOverride string) {
+		calls = append(calls, "sweep")
+	}
+	t.Cleanup(func() { reapOrphanedMeetingSinksFn = prevSweep })
+
+	// Fake pactl: same shape as TestHostMediaStart_SweepsSinksBeforeLoadSink
+	// -- answers just enough for the REAL rec.LoadSink() to succeed, so
+	// execution actually reaches the REAL platform.MeetingBrowser.Start().
+	// No log file needed here (unlike that test): ordering is read off
+	// `calls`, not a parsed pactl invocation log.
+	fakeBin := t.TempDir()
+	writeFakeExecutable(t, fakeBin, "pactl", `
+case "$1" in
+  info) exit 0 ;;
+  list) exit 0 ;;
+  load-module) echo "99"; exit 0 ;;
+  unload-module) exit 0 ;;
+  *) exit 0 ;;
+esac
+`)
+	// Fake ffmpeg: never actually executed here either (only by
+	// NullSinkRecorder.Start, unreached), but audioStackAvailable() path-
+	// checks its presence via exec.LookPath.
+	writeFakeExecutable(t, fakeBin, "ffmpeg", "exit 0")
+	t.Setenv("PATH", fakeBin)
+
+	wavPath := filepath.Join(t.TempDir(), "out.wav")
+	m := newHostMedia("lock-handoff-order-meeting", "unused-profile-dir", wavPath)
+
+	// Expected to fail: findChromium() finds no browser binary on the
+	// isolated PATH -- proving execution reached the REAL
+	// MeetingBrowser.Start() (and therefore past the real LoadSink) without
+	// ever needing a real browser.
+	if _, err := m.Start(); err == nil {
+		t.Fatal("Start() unexpectedly succeeded with no chrome/chromium on PATH")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "chrom") {
+		t.Fatalf("Start() failed for an unexpected reason (want a chromium-not-found error): %v", err)
+	}
+
+	wantOrder := []string{"acquire", "mark", "sweep", "clear", "release"}
+	if !reflect.DeepEqual(calls, wantOrder) {
+		t.Errorf("full call order = %v, want %v -- a pre-#927 revert (releasing the setup lock "+
+			"synchronously right before MeetingBrowser.Start(), instead of handing it off) would "+
+			"instead produce [acquire mark sweep release clear], with release BEFORE the deferred "+
+			"clear", calls, wantOrder)
+	}
+}
