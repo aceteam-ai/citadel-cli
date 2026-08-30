@@ -2053,3 +2053,21 @@ Auto-generated log of every release.
   - worker: forward OpenAI tool calling through the native ollama chat path (#603) (#929)
 
 
+---
+
+## v2.132.0 — 2026-08-30
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 14 |
+| Lines added | +937 |
+
+**Changes:**
+
+  - fix: cache-index P2a hardening — GGUF subdir scan + debounced-flush stale-clobber guard (#937) (#940)
+  - fix: let MeetingBrowser accept an already-held profile lock (#927) (#941)
+  - fix: gate tools forwarding in executeChatCompletionsAt on hasToolCalls, not bare len (#933) (#939)
+  - fix: route mcp debug output to stderr before swap-recovery logging (#934) (#938)
+
+
