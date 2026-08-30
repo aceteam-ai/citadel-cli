@@ -363,24 +363,27 @@ func orphanSinkModuleIDs(pactlOutput string) []string {
 // alone, exactly as meetingOwnerAlive's original "a live owner might own one
 // of these" reasoning intends.
 //
-// RESIDUAL, ACCEPTED GAP (same character as the package's other cross-
-// process pidfile caveats): two genuinely CONCURRENT hostMedia.Start() calls
-// for the SAME profile in the SAME process -- a real scenario, since
-// MEETING_JOIN runs on its own dedicated async lane (see CLAUDE.md's "Long-
-// session and GPU-bound jobs get a dedicated always-async lane" section, so
-// two overlapping meetings really can race here) -- are NOT fully
-// distinguishable by PID alone: a second goroutine's own MarkMeetingProfileOwned
-// sees the SAME os.Getpid() the first goroutine's placeholder (or even its
-// real pidfile, mid-write) carries, so this check alone cannot tell "my own
-// upcoming placeholder" from "a sibling goroutine's in-flight one". hostMedia.
-// Start() additionally holds AcquireMeetingProfileSetupLock (a real,
-// goroutine-correct mutex, unlike a PID) across mark+sweep+LoadSink to narrow
-// this specific window to the brief gap between releasing that lock and
-// MeetingBrowser.Start() re-acquiring its own -- not literally zero, but
-// several orders of magnitude smaller than the original report's window
-// (which spanned the full sink-load-to-CDP-ready duration). Fully eliminating
-// it needs MeetingBrowser to accept an already-held lock instead of always
-// acquiring its own; deferred as a documented follow-up, not done here.
+// Two genuinely CONCURRENT hostMedia.Start() calls for the SAME profile in
+// the SAME process -- a real scenario, since MEETING_JOIN runs on its own
+// dedicated async lane (see CLAUDE.md's "Long-session and GPU-bound jobs get
+// a dedicated always-async lane" section, so two overlapping meetings really
+// can race here) -- are NOT fully distinguishable by PID alone: a second
+// goroutine's own MarkMeetingProfileOwned sees the SAME os.Getpid() the first
+// goroutine's placeholder (or even its real pidfile, mid-write) carries, so
+// this check alone cannot tell "my own upcoming placeholder" from "a sibling
+// goroutine's in-flight one". hostMedia.Start() additionally holds
+// AcquireMeetingProfileSetupLock (a real, goroutine-correct mutex, unlike a
+// PID) across mark+sweep+LoadSink -- and, as of citadel-cli#927, keeps
+// holding that SAME lock straight through MeetingBrowser.Start() (handed off
+// via WithHeldProfileLock, released by hostMedia.Close() once the browser is
+// torn down) rather than releasing it beforehand and letting Start()
+// re-acquire its own. That closes what used to be a residual, accepted gap
+// here: a brief window between releasing the setup lock and
+// MeetingBrowser.Start() re-acquiring it, in which a second Start() against
+// the same profile could interleave. With the hand-off, this mutex now spans
+// the entire mark-owned -> sweep -> LoadSink -> browser-launch sequence with
+// no release in between, so two same-process concurrent Start() calls for
+// one profile are fully serialized by it, not just narrowed.
 func meetingSinkSweepBlocked(profileDir string) bool {
 	owner, chrome, xvfb := readMeetingPidfile(profileDir)
 	if owner <= 0 || !pidAlive(owner) {
@@ -428,18 +431,24 @@ func ReapOrphanedMeetingSinks(profileDirOverride string) {
 
 // AcquireMeetingProfileSetupLock resolves the persistent meeting profile
 // directory and claims the SAME process-wide profile lock
-// MeetingBrowser.Start() uses (TryLock, never blocking) -- but only for
-// hostMedia's SETUP phase (mark-owned + sink-sweep + LoadSink), a distinct,
-// shorter-lived claim on the identical underlying mutex, not a hold spanning
-// the whole browser lifetime. This is a real, goroutine-correct mutex
-// (unlike the pidfile, which only distinguishes by PID and cannot tell two
-// same-process goroutines apart -- see meetingSinkSweepBlocked's doc
-// comment), so holding it here narrows the same-process concurrent-meeting
-// race window that a PID-keyed pidfile alone cannot fully close.
+// MeetingBrowser.Start() uses (TryLock, never blocking). This is a real,
+// goroutine-correct mutex (unlike the pidfile, which only distinguishes by
+// PID and cannot tell two same-process goroutines apart -- see
+// meetingSinkSweepBlocked's doc comment), so holding it closes the
+// same-process concurrent-meeting race window a PID-keyed pidfile alone
+// cannot.
 //
-// The caller MUST release before calling MeetingBrowser.Start() against the
-// same profile, so that call's own acquireMeetingProfileLock succeeds
-// normally instead of finding the mutex already held by its own caller.
+// As of citadel-cli#927, the caller is expected to keep holding this lock
+// straight through MeetingBrowser.Start() rather than releasing it
+// beforehand: hand it off via MeetingBrowser.WithHeldProfileLock() so
+// Start() skips its own (redundant) acquisition, and release it yourself
+// once you are done with the profile entirely -- for hostMedia, that means
+// in Close(), AFTER the browser itself has been torn down, not immediately
+// after this function's own setup phase (mark-owned + sink-sweep +
+// LoadSink) finishes. Releasing before Start() and letting it re-acquire a
+// fresh lock (the pre-#927 pattern) still works mechanically -- the
+// underlying mutex is unchanged -- but reopens the brief interleaving
+// window #927 closed, so new callers should prefer the hand-off.
 func AcquireMeetingProfileSetupLock(profileDirOverride string) (profileDir string, release func(), err error) {
 	profileDir = resolveMeetingProfileDir(profileDirOverride)
 	release, err = acquireMeetingProfileLock(profileDir)

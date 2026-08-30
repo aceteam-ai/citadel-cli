@@ -2225,7 +2225,11 @@ Chrome's own forwarding collision. `closeLocked()` releases it (idempotently —
 the release func is `sync.Once`-wrapped), so Close() on every exit path
 (success, join-flow error, the `defer media.Close()` in
 `MeetingJoinHandler.Execute`, which fires on cancellation and panic-unwind
-alike) frees the profile for the next meeting.
+alike) frees the profile for the next meeting — **unless the caller passed an
+already-held lock in via `WithHeldProfileLock()` (citadel-cli#927): then
+`closeLocked()` releases nothing, and the CALLER (`internal/jobs.hostMedia`)
+owns the single release call instead, in its own `Close()`, after `m.br.Close()`
+has torn the browser down.** See the setup-lock hand-off note below.
 
 **Scope: HOST backend only.** The container backend (`containerMedia`,
 meetingd) is NOT exposed the same way — it already enforces "one meeting per
@@ -2257,6 +2261,36 @@ even if a future refactor dropped the `acquireMeetingProfileLock` call from
 `Start()` against a pre-locked profile and asserts it fails fast with no
 Chrome/Xvfb process and no profile-dir creation — hermetic on a host with no
 Chromium/Xvfb installed at all.
+
+**Setup-lock hand-off closes the residual acquire-order gap (citadel#927).**
+`internal/jobs.hostMedia.Start()` also needs this SAME mutex, but earlier —
+across its own pre-browser setup phase (mark-owned + orphaned-sink sweep +
+`NullSinkRecorder.LoadSink()`, guarding the citadel#925 sink-unload race) —
+via `platform.AcquireMeetingProfileSetupLock`. Before #927 it released that
+setup lock immediately before calling `MeetingBrowser.Start()`, which then
+re-acquired its own hold: a brief but real release-then-reacquire window in
+which a second concurrent `Start()` for the same profile (a genuine
+possibility — MEETING_JOIN runs on its own always-async lane, see above)
+could interleave. `MeetingBrowser.WithHeldProfileLock()` closes it: the
+caller keeps holding the ONE lock continuously from before its setup phase
+through the browser's full launch, hands it to the browser instead of
+releasing it, and `claimProfileLock()` (the seam `Start()` uses to decide
+whether to `TryLock`) skips acquisition entirely when told the caller already
+holds it. `hostMedia.Close()` — not `closeLocked()` — releases it, once,
+after `m.br.Close()` has torn the browser down; every failure path inside
+`hostMedia.Start()` itself still releases it via a deferred guard, since
+`MeetingMedia.Start`'s contract is that the caller only defers `Close()` on
+success. `TestMeetingBrowser_WithHeldProfileLockSkipsReacquire`/
+`TestMeetingBrowser_CloseDoesNotReleaseHeldProfileLock`
+(`meeting_browser_test.go`) pin the platform-side seam hermetically;
+`internal/jobs`'s
+`TestHostMediaStart_HandsOffProfileLockRatherThanReleasingBeforeBrowserStart`
+(`meeting_orphan_order_test.go`) is the one that actually catches a revert of
+the `hostMedia.Start()` wiring itself — it asserts the full call order
+through the real (unmocked) `LoadSink()`+`MeetingBrowser.Start()`, since a
+release call moving from "deferred, after the placeholder-clear defer" back
+to "synchronous, before the browser launch" changes that order but would
+otherwise pass every platform-level test unchanged.
 
 **Self-heal STUCK detection hardening (non-blocking review WANT, also fixed
 here).** `LivenessMonitor`'s STUCK check (`internal/worker/selfheal.go`) used
