@@ -270,6 +270,50 @@ func TestReconcileScanPreservesRepoKeyedGGUFPullEntryInSubdirectory(t *testing.T
 	}
 }
 
+// TestReconcileScanIgnoresDownloaderBookkeepingFiles pins a review-caught
+// corollary of the subdirectory fix above: `hf download --local-dir` writes
+// its OWN bookkeeping tree inside the target directory
+// (".cache/huggingface/download/<file>.metadata"), which the now-recursive
+// scanGGUFDir would otherwise also walk into and mint a bogus SourceBackfill
+// Entry for -- growing the index with an entry no consumer should ever see,
+// on every single pull. The metadata file must never become its own
+// discovered entry, but it also must not be allowed to prune anything real.
+func TestReconcileScanIgnoresDownloaderBookkeepingFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, services.LlamaCppCacheDirName, "sub", "model.gguf"), "aaaa")
+	writeFile(t, filepath.Join(root, services.LlamaCppCacheDirName, ".cache", "huggingface", "download", "model.gguf.metadata"), "metadata-bytes")
+
+	storeDir := t.TempDir()
+	s := Open(filepath.Join(storeDir, FileName), nil)
+	if err := s.Upsert(Entry{
+		CacheDir: services.LlamaCppCacheDirName,
+		Family:   services.CacheFamilyGGUFDir,
+		Model:    "TheBloke/Sub-GGUF",
+		Engine:   "llamacpp",
+		Files:    []string{"sub/model.gguf"},
+		Source:   SourcePull,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ReconcileScan(root); err != nil {
+		t.Fatalf("ReconcileScan: %v", err)
+	}
+
+	idx := s.Snapshot()
+	e, ok := idx.Lookup(services.LlamaCppCacheDirName, "TheBloke/Sub-GGUF")
+	if !ok {
+		t.Fatalf("expected the repo-keyed pull entry to survive despite the sibling bookkeeping file")
+	}
+	if e.Source != SourcePull || len(e.Files) != 1 || e.Files[0] != "sub/model.gguf" {
+		t.Fatalf("expected the pull entry untouched, got %+v", e)
+	}
+
+	if _, ok := idx.Lookup(services.LlamaCppCacheDirName, ".cache/huggingface/download/model.gguf.metadata"); ok {
+		t.Errorf("expected no backfill entry to be created for the downloader's own bookkeeping file")
+	}
+}
+
 // TestReconcileScanNeverPrunesAnUnscannableDir pins the second half of the
 // same review finding: a cache_dir this scan could not read (missing, or --
 // in production -- an operator HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE/HF_HOME

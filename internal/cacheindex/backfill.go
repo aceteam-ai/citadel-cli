@@ -312,6 +312,20 @@ func hfDirToModelID(name string) (string, bool) {
 // directory was actually readable; an error partway through the walk (e.g.
 // a permission-denied subdirectory) skips just that entry rather than
 // aborting the whole scan.
+//
+// A dot-prefixed path component (e.g. ".cache/huggingface/download/x.gguf.metadata",
+// the bookkeeping tree `hf download --local-dir` writes INSIDE its target
+// directory as of huggingface_hub's local_dir tracking; older versions used
+// ".huggingface/") never becomes a discovered candidate -- recursing without
+// this exclusion would mint a SourceBackfill Entry per metadata file on
+// every pull, permanently growing the index with entries no P3/P5 consumer
+// should ever see. markFound is still called for it, though: it can only
+// ever SUPPRESS a staleness-cleanup deletion (the safe direction), and a
+// real repo-keyed pull entry's Files CAN legitimately include such a path --
+// recordLlamaCppCacheIndexEntry's before/after-diff fallback
+// (hfRepoTreeFn failure) walks the directory with listFilesRelative, which
+// does not exclude dotfiles, so a first-ever pull hitting that fallback
+// records them as part of the pull's own provenance.
 func scanGGUFDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
 	dir := filepath.Join(cacheRoot, cacheDirName)
 	if _, err := os.ReadDir(dir); err != nil {
@@ -332,6 +346,9 @@ func scanGGUFDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
 		}
 		rel = filepath.ToSlash(rel)
 		res.markFound(cacheDirName, rel)
+		if hasHiddenPathComponent(rel) {
+			return nil
+		}
 		key := entryKey(cacheDirName, rel)
 		res.discovered[key] = Entry{
 			CacheDir:  cacheDirName,
@@ -345,6 +362,19 @@ func scanGGUFDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
 		}
 		return nil
 	})
+}
+
+// hasHiddenPathComponent reports whether any slash-separated component of a
+// relative path is dot-prefixed (".cache", ".huggingface", ".git", ...).
+// Used to keep scanGGUFDir's recursive walk from minting backfill entries
+// for a downloader's own bookkeeping files -- see scanGGUFDir's doc comment.
+func hasHiddenPathComponent(rel string) bool {
+	for _, part := range strings.Split(rel, "/") {
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	return false
 }
 
 // scanNativeDir records ONE aggregate row (nativeAggregateModel) for a

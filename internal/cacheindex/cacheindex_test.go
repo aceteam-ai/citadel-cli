@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -387,6 +388,19 @@ func TestConcurrentUpsertAndMarkUsedSurviveOnDisk(t *testing.T) {
 
 	if err := s.Upsert(Entry{CacheDir: "llamacpp", Model: "seed.gguf", Engine: "llamacpp", Files: []string{"seed.gguf"}, Source: SourceBackfill}); err != nil {
 		t.Fatalf("seed Upsert: %v", err)
+	}
+
+	// markUsedFlushMinGap (5s) would otherwise debounce all but the very
+	// first MarkUsed call away before it ever takes a snapshot -- a
+	// wall-clock test finishes in milliseconds, so flushIfDue's actual
+	// write path (the one this fix targets) would barely run. Force every
+	// call to see time strictly past the gap, via an atomic counter (s.now
+	// is read from multiple goroutines with no lock held), so every
+	// MarkUsed genuinely races a flush to disk.
+	var clockTick int64
+	s.now = func() time.Time {
+		tick := atomic.AddInt64(&clockTick, 1)
+		return time.Unix(0, 0).Add(time.Duration(tick) * time.Hour)
 	}
 
 	const n = 25

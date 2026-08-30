@@ -571,6 +571,13 @@ func (s *Store) flushLocked() error {
 // NEWER state already reached disk, so this call is a no-op rather than a
 // clobber. See the Store.lastWrittenVersion doc comment for the exact
 // scenario this closes.
+//
+// Cost of that guarantee, stated rather than left implicit: flushLocked
+// (Upsert/Remove/RemoveFile/ReconcileScan) calls this while STILL holding
+// s.mu, so those callers -- and anything waiting on s.mu behind them, e.g.
+// Snapshot() -- can briefly block on flushMu behind an in-flight debounced
+// flushIfDue write. Bounded and rare in practice (a small JSON file, at most
+// one flushIfDue write per markUsedFlushMinGap), not a hazard, but real.
 func (s *Store) writeSnapshot(idx *Index, version uint64) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
