@@ -33,6 +33,10 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 		JobTypeModuleSet:         {},
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
+		// Not a manifest writer, but a read-modify-write of the SAME-shaped
+		// shared-state file (cache-index.json, citadel-cli#682 P2a) -- see
+		// serializedLaneJobTypes' doc comment.
+		JobTypeModelCacheEvict: {},
 	}
 	if len(serializedLaneJobTypes) != len(want) {
 		t.Fatalf("serializedLaneJobTypes has %d entries, want %d: %v",

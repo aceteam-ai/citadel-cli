@@ -102,11 +102,26 @@ var unboundedJobTypes = map[string]struct{}{
 // TestSerializedLaneJobTypes; extend THIS set (not the routing check in
 // runner.go) when a new manifest/lockfile writer is added, mirroring the
 // needsGPUSlot/gpuBoundJobTypes precedent.
+//
+// MODEL_CACHE_EVICT joins the same way, for the identical reason applied to a
+// DIFFERENT shared file (citadel-cli#682 P2a, docs/design-cache-ownership.md
+// §8.2): it is not itself a citadel.yaml/modules.lock writer, but it now
+// mutates internal/cacheindex's cache-index.json (jobs.CacheIndexStore) via a
+// read-modify-write with no file lock of its own -- the SAME shape as the
+// manifest writers above. Before this it ran on the INLINE default branch and
+// could execute CONCURRENTLY with MODEL_CACHE_PULL (already unbounded, and
+// therefore already on this lane): a pull's own before/after-size no-op
+// detection (llamaCppPullSucceeded's doc comment, internal/jobs/
+// model_cache_pull.go) already flagged a concurrent eviction mid-pull as a
+// pre-existing accounting hazard, and an os.RemoveAll racing an in-progress
+// `hf download` into the SAME hub directory is worse than an accounting bug.
+// Routing it here makes the cache index a clean single-writer, closing both.
 var serializedLaneJobTypes = func() map[string]struct{} {
 	m := map[string]struct{}{
 		JobTypeModuleSet:         {},
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
+		JobTypeModelCacheEvict:   {},
 	}
 	for jt := range unboundedJobTypes {
 		m[jt] = struct{}{}

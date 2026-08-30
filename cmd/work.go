@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -53,6 +54,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
@@ -348,6 +350,17 @@ func runWork(cmd *cobra.Command, args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Cache index (citadel #682 P2a, docs/design-cache-ownership.md §8):
+	// initialize the process-wide store as early as possible, before
+	// startManagedServices' boot-time service starts (below, which can reach
+	// ensureOllamaModel's #543 native-ollama pull) and well before the job
+	// dispatch loop (MODEL_CACHE_PULL/MODEL_CACHE_EVICT). See
+	// jobs.InitCacheIndexStore's doc comment for why this is an explicit call
+	// rather than an implicit lazy-open default -- only `citadel work` makes
+	// this call, so every other CLI entry point and every test binary sees a
+	// nil store and skips index writes safely.
+	jobs.InitCacheIndexStore(filepath.Join(network.GetNodeConfigDir(), cacheindex.FileName), Log)
 
 	// Single-instance guard (issues #443 / #435). Refuse to start a second worker
 	// for the same node so a stale duplicate can never run beside the systemd unit.
@@ -665,6 +678,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		Debug("cleared a stale pairing-code display left by a previous process")
 	}
 	defer pairingdisplay.Get().Shutdown()
+
+	// Cache index backfill scan (citadel #682 P2a, design doc §8.5):
+	// reconciles existing on-disk services.EngineCacheDirs contents into
+	// cache-index.json, right beside ReconcileOrphanedReservations above --
+	// the SAME single-live-worker precondition applies here, because the
+	// scan durably DROPS index entries it does not rediscover on disk
+	// (Store.ReconcileScan's staleness cleanup); running it from a second
+	// concurrent process could delete entries a sibling process just wrote.
+	if workerLockHeld {
+		if err := jobs.CacheIndexStore().ReconcileScan(cacheindex.DefaultCacheRoot()); err != nil {
+			fmt.Fprintf(os.Stderr, "   - Warning: cache index backfill scan: %v\n", err)
+		}
+	} else {
+		Debug("skipping cache index backfill scan: this process does not hold the single-instance worker lock")
+	}
 
 	// Detect Proxmox hypervisor (host fact, checked regardless of manifest vs auto-detect)
 	var proxmoxInfo *platform.ProxmoxInfo
@@ -1885,6 +1913,10 @@ func runWork(cmd *cobra.Command, args []string) {
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 					}
+					// Cache index resident-implies-used reconciler (citadel #682
+					// P2a). Unconditional (no opt-in flag, unlike autoStop) --
+					// see cacheIndexMarkUsedReconciler's doc comment.
+					apiPublisher.SetOnStatus(cacheIndexMarkUsedReconciler)
 					if inferenceQueueReconciler != nil {
 						inferenceQueueReconciler.Log = Log
 						// Ignore the passed-in NodeStatus and re-check serving via
@@ -1948,6 +1980,10 @@ func runWork(cmd *cobra.Command, args []string) {
 				if autoStop != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 				}
+				// Cache index resident-implies-used reconciler (citadel #682
+				// P2a). Unconditional (no opt-in flag, unlike autoStop) -- see
+				// cacheIndexMarkUsedReconciler's doc comment.
+				redisPublisher.SetOnStatus(cacheIndexMarkUsedReconciler)
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
@@ -2937,6 +2973,62 @@ func newAutoStopReconciler() *status.AutoStopReconciler {
 	r := status.NewAutoStopReconciler(true, status.AutoStopThresholdSeconds(), stop, logFn)
 	fmt.Printf("   - Auto-stop-when-idle: ENABLED (threshold %ds)\n", status.AutoStopThresholdSeconds())
 	return r
+}
+
+// cacheIndexMarkUsedReconciler is the "resident-implies-used" v1 LRU signal
+// (citadel #682 P2a, design doc §8.1): on every heartbeat tick it marks the
+// models each RUNNING engine is currently serving as recently used in the
+// cache index. Debounced internally by Store.MarkUsed's own flush-gap, so
+// this is safe to call on every ~30s tick -- the existing OnStatus fan-out
+// (#612/#416 precedent), no new sweep. A no-op when the cache index was
+// never initialized (jobs.CacheIndexStore() returns nil -- see its doc
+// comment) or when a service's name is not a services.EngineCacheDirs
+// member (catalog apps, third-party modules -- out of scope for this
+// signal, same boundary the cache index itself uses throughout).
+//
+// Per-request touch fidelity (via status.RecordEngineRequest's call sites)
+// is a documented, deferred refinement (design doc §8.7 Q3) -- this v1
+// heartbeat-granularity signal is coarse (residency, not requests) but
+// strictly truthful in the direction GC needs: a model being actively
+// served is never allowed to look cold.
+//
+// Largely INERT for llamacpp/bonsai today, named explicitly so nobody later
+// reads "resident-implies-used is wired" as "works for every engine": this
+// calls store.MarkUsed(ec.Dir, model, ...) with the model string the
+// engine's own /v1/models reports (svc.Models), but a gguf-dir pull entry
+// for llamacpp is keyed by REPO ID (e.g. "TheBloke/X-GGUF" --
+// recordLlamaCppCacheIndexEntry, internal/jobs/model_cache_pull.go), not by
+// the served model name -- so this MarkUsed call essentially never matches
+// an existing entry and silently no-ops (Store.MarkUsed's documented
+// contract: it never fabricates an entry). Bonsai matches by construction
+// (its one entry IS keyed by the served filename), and hf-hub entries
+// (vllm/sglang/...) match because their key IS the served model id. This
+// degrades gracefully, not incorrectly: LeastRecentlyUsed's PulledAt
+// fallback (cacheindex.go) is exactly the "no LastUsed signal" case this
+// produces for llamacpp, so a future P5 GC still orders it sanely, just
+// less precisely. Fixing this needs a served-model -> repo-id resolution
+// this reconciler does not have; a documented follow-up, not part of P2a.
+func cacheIndexMarkUsedReconciler(s *status.NodeStatus) {
+	if s == nil {
+		return
+	}
+	store := jobs.CacheIndexStore()
+	if store == nil {
+		return
+	}
+	now := time.Now()
+	for _, svc := range s.Services {
+		if svc.Status != status.ServiceStatusRunning || len(svc.Models) == 0 {
+			continue
+		}
+		ec, ok := services.EngineCacheDirs[svc.Name]
+		if !ok {
+			continue
+		}
+		for _, model := range svc.Models {
+			store.MarkUsed(ec.Dir, model, now)
+		}
+	}
 }
 
 // resolveAllowReadOutsideWorkspace returns whether read-only file handlers may
