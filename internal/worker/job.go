@@ -148,6 +148,8 @@ const (
 	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
+	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
+	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
 
 	// Fabric instance provisioning on a local hypervisor (aceteam#5963). These
 	// act on hypervisor VMs; JobTypeInstanceMessage above predates this family
@@ -214,6 +216,8 @@ var allKnownJobTypes = []string{
 	JobTypeExposeSet,
 	JobTypeMeetingJoin,
 	JobTypeDocumentRasterize,
+	JobTypeShowPairingCode,
+	JobTypeClearPairingCode,
 	JobTypeInstanceProvision,
 	JobTypeInstanceStart,
 	JobTypeInstanceStop,

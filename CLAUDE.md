@@ -664,6 +664,95 @@ info, err := auth.ValidateToken(token, orgID)
 - Linux/macOS: Full PTY support via `creack/pty`
 - Windows: Not yet supported (requires ConPTY implementation)
 
+### On-node pairing-code display (`internal/pairingdisplay`, citadel #659 P0)
+
+Design doc: [docs/design-pairing-display.md](docs/design-pairing-display.md)
+(Part II, §8-14, is the plan of record). Lets aceteam's node:exec grant flow
+(`_node_screen_delivery`, `aceteam_mcp_node_exec_grant.py`) render a
+short-lived pairing code on a headed node's own console instead of always
+falling through to the operator's linked device. `SHOW_PAIRING_CODE`/
+`CLEAR_PAIRING_CODE` (`internal/worker/pairing_display.go`) are per-node-
+stream-gated jobs, same posture as `AGENT_UPDATE`/`EXPOSE_SET`.
+
+**`pairingdisplay.Manager` owns the whole lifecycle** — render, TTL
+auto-clear, latest-grant-wins replacement, and crash-safe cleanup — behind an
+injected `Renderer` interface, so it never needs a real console to test.
+`pairingdisplay.Get()` is a process-wide singleton (mirrors
+`platform.GetCobrowseManager()`) because the job handler and the heartbeat
+capability probe must observe the same pending-code state; `Configure` points
+it at `network.GetNodeConfigDir()` (machine-convergent, so a root `citadel
+work` and a later invocation agree on the crash-marker path).
+
+**`KDGETMODE`, not `session.DetectDesktop()`, is the load-bearing "is this a
+real headed console" check** (`render_linux.go`'s `openTextConsole`).
+`session.DetectDesktop()` reads `DISPLAY`/`WAYLAND_DISPLAY` off the calling
+process's own environment — for a root systemd `citadel work` unit those are
+always unset, so it reports "headless" unconditionally even when a desktop
+session owns the seat for some other user. `KDGETMODE` asks the KERNEL
+whether the active VT is `KD_TEXT` or `KD_GRAPHICS`; writing to a
+`KD_GRAPHICS` VT succeeds silently, which is exactly the false
+`delivered:true` this package must never produce. The open also carries
+`O_NOCTTY` — without it, opening `/dev/ttyN` from a session leader with no
+controlling terminal (the systemd worker) can make it one, after which a
+signal at the physical console reaches the worker process; this bites the
+heartbeat capability probe too, since `DetectSurfaces()` opens the same
+device on every ~30s collection on every headed node.
+
+**`delivered: true` suppresses the backend's linked-device fallback — the
+single rule every reason code in this package exists to protect.** A false
+positive means the human never receives the code at all (strictly worse than
+a false negative, which only costs one push notification), so every
+ambiguous case (`no_console`, `graphical_session`, `permission_denied`,
+`render_error`, `unsupported_os`, `bad_payload`) resolves to
+`delivered: false`. Windows/macOS build-tag to a stub that always returns
+`unsupported_os` (P3 desktop-session rendering is deferred).
+
+**A same-grant retry racing its own stale TTL timer is closed by a
+generation stamp, not the grant id.** §8.2 lets a re-`SHOW` for the SAME
+`grant_request_id` (a delivery retry) reset the TTL. `time.Timer.Stop()`
+cannot un-run an already-fired callback, so the ORIGINAL timer's goroutine
+can still reach `onExpire` after the retry has replaced the pending state —
+comparing only `grantRequestID` would match (it's the same grant) and clear
+the fresh render. `pendingCode.gen` (a monotonic counter, captured in the
+`time.AfterFunc` closure) disambiguates "my own Show call" from "some earlier
+Show for the same grant"; `TestManager_SameGrantRetryResetsTTLWithoutStaleExpiry`
+pins it by driving `onExpire` directly with a captured stale generation
+(real timer scheduling can't force this interleaving deterministically).
+
+**The no-leak invariant is enforced by two tests, not one, because a fake
+`PairingDisplayOps` bypasses `Manager` entirely.**
+`internal/worker/pairing_display_test.go`'s
+`TestPairingDisplayHandler_SentinelNeverLeaks` scans the job result, the
+error, and every captured log line across the HANDLER's failure branches.
+`internal/pairingdisplay/manager_test.go`'s
+`TestManager_SentinelNeverLeaksThroughRenderer` does the same thing one
+layer down — through the real `Manager`, a fake `Renderer`, and
+`SetLogFunc` — so `Manager`'s own log lines and the on-disk crash marker
+(which `cmd/work.go` routes to the real `Debug` logger) are covered too. A
+future "log the payload on parse failure" edit to either layer trips one of
+these.
+
+Per Jason's product decision, the console render is unconditional (never
+refused because the console appears "in use") but always carries an
+explanatory banner ("someone is requesting access to this machine") so a
+person at the physical console understands why their screen changed.
+
+**Graceful-shutdown clearing is real but conditional, not guaranteed.**
+`runWork`/`runTUIWorker` `defer pairingdisplay.Get().Shutdown()`, which DOES
+run on a clean SIGTERM (the runner's `Run(ctx)` returns `context.Canceled`,
+`runWork` falls through to its closing brace, defers unwind normally) — but
+`cmd/work.go`'s shutdown watchdog `os.Exit(1)`s on a second signal or if
+teardown exceeds the grace period, and a SIGKILL skips every defer either
+way. `ReconcileStale()` (called at startup, before job consumption) is the
+actual backstop for both cases — see the design doc §12's three-layer
+mitigation; the deferred `Shutdown()` is the fast path, not the only path.
+
+Deferred to later phases, not built here (see the design doc §14 for the
+full breakdown): the `citadel pairing-code` pull command for the headless
+fleet (P1), a Control Center TUI banner (P2), and non-Linux/desktop-session
+rendering (P3). The aceteam-side `_node_screen_delivery` body and capability
+ingestion (P4) are a separate, not-yet-built repo.
+
 ### Mesh Model Discovery & Remote Chat (citadel #576, Phase 2)
 
 `citadel mesh` discovers the models served by OTHER citadel nodes on the mesh and

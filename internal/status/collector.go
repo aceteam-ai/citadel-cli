@@ -27,18 +27,19 @@ type Collector struct {
 	services        []ServiceConfig
 	startTime       time.Time
 	modelDiscovery  *ModelDiscovery
-	capabilities    *NodeCapabilities       // cached capabilities (set once at startup)
-	workerLiveness  func() *WorkerLiveness  // live worker consume-loop liveness (issue #548), optional
-	swapStats       func() *SwapActivity    // live model-hotswap activity (citadel #717), optional
-	reconcileHealth func() *ReconcileHealth // live full-wipe-guard refusal state (citadel #742), optional
-	idleTracker     *IdleTracker            // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
-	fpIdleTracker   *FootprintIdleTracker   // footprint-derived idle for engines #416 can't scrape (citadel #421)
-	netIdleTracker  *IdleTracker            // network-activity idle for non-vLLM services (citadel #433)
-	reqLog          *requestLog             // node-routed request log, every engine (citadel #691)
-	pinnedServices  map[string]bool         // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
-	modelHotswap    bool                    // advertise installed-vs-resident models (citadel #632)
-	reservations    func() []GPUReservation // live job-scoped GPU reservations (citadel #832), optional
-	laneActivity    func() []LaneActivity   // live bounded-execution-lane activity (citadel #908), optional
+	capabilities    *NodeCapabilities                // cached capabilities (set once at startup)
+	workerLiveness  func() *WorkerLiveness           // live worker consume-loop liveness (issue #548), optional
+	swapStats       func() *SwapActivity             // live model-hotswap activity (citadel #717), optional
+	reconcileHealth func() *ReconcileHealth          // live full-wipe-guard refusal state (citadel #742), optional
+	idleTracker     *IdleTracker                     // metrics-based per-service idle detection (aceteam#4472 / citadel #416)
+	fpIdleTracker   *FootprintIdleTracker            // footprint-derived idle for engines #416 can't scrape (citadel #421)
+	netIdleTracker  *IdleTracker                     // network-activity idle for non-vLLM services (citadel #433)
+	reqLog          *requestLog                      // node-routed request log, every engine (citadel #691)
+	pinnedServices  map[string]bool                  // node pinned_services allowlist -> ServiceInfo.Pinned (citadel #577)
+	modelHotswap    bool                             // advertise installed-vs-resident models (citadel #632)
+	reservations    func() []GPUReservation          // live job-scoped GPU reservations (citadel #832), optional
+	laneActivity    func() []LaneActivity            // live bounded-execution-lane activity (citadel #908), optional
+	pairingDisplay  func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -92,6 +93,13 @@ type CollectorConfig struct {
 	// dispatcher can see a saturated-but-healthy node. Optional: nil when no
 	// worker runner is wired (pure status node) or a legacy build.
 	LaneActivity func() []LaneActivity
+	// PairingDisplay, when set, returns the node's live pairing-display
+	// capability (citadel #659 P0), attached to each heartbeat as
+	// NodeStatus.PairingDisplay. The provider itself decides presence --
+	// returning nil when this node cannot currently render is what keeps
+	// NodeStatus.PairingDisplay omitted for the common (headless) case.
+	// Optional: nil on a legacy build.
+	PairingDisplay func() *PairingDisplayCapability
 }
 
 // NewCollector creates a new status collector.
@@ -114,6 +122,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		modelHotswap:    cfg.ModelHotswap,
 		reservations:    cfg.Reservations,
 		laneActivity:    cfg.LaneActivity,
+		pairingDisplay:  cfg.PairingDisplay,
 	}
 }
 
@@ -440,6 +449,15 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// leaves the field omitted exactly as before this change.
 	if c.laneActivity != nil {
 		status.Lanes = c.laneActivity()
+	}
+
+	// Attach the pairing-display capability probe (citadel-cli#659 P0): can
+	// this node render a platform-pushed node:exec pairing code right now?
+	// The provider itself returns nil while not capable, so this is a no-op
+	// (status.PairingDisplay stays nil -> omitted) for the common headless
+	// case.
+	if c.pairingDisplay != nil {
+		status.PairingDisplay = c.pairingDisplay()
 	}
 
 	return status, nil
