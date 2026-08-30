@@ -735,6 +735,33 @@ citadel mesh chat --model M "hi"    # one-shot chat to a uniquely-named model
 citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicitly
 ```
 
+### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
+
+`executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/
+llamacpp/bonsai/unlimited-ocr) forwards `tools`/`tool_choice` on the request
+and returns `tool_calls` on the response. **`executeOllamaChat` (ollama's
+native `/api/chat` path) still silently drops tools** — a known, undocumented-
+to-the-caller gap, not fixed here. `jobs.LLMInferencePayload.Tools`/
+`ToolChoice` and `jobs.ChatMessage.ToolCalls`/`ToolCallID`/`Name` carry raw
+JSON/strings rather than a typed Go struct, so an engine-specific
+`function.parameters` JSON Schema is never lossily re-typed. Absent on a
+text-only request, pinned by
+`TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools` (asserts key
+ABSENCE, not an empty value).
+
+**Streaming tool-call deltas are NOT emitted per-chunk** — `StreamWriter.
+WriteChunk(content string, index int)` has no field for structured data, and
+widening it would ripple through both stream-writer implementations,
+`internal/redis`/`internal/redisapi`'s `PublishChunk`, and every existing
+caller (the #717 `SwapRecord.Pulled` "guessed field is worse than no field"
+tradeoff). Verified against the real consumer before choosing this scope:
+`aceteam/python-backend/agents/fabric_client.py`'s `_event_to_chunk` already
+reads `tool_calls` off the terminal **`end` event's `data.result`** — exactly
+what `bufferedChatCompletions`/`streamChatCompletions` return as
+`JobResult.Output` (published via `stream.WriteEnd`) — so this is not a gap
+for that consumer today. `streamChatCompletions`' `toolCallAccumulator` merges
+the engine's own incremental deltas into one final array before returning it.
+
 ## Important Implementation Notes
 
 ### Manifest Loading

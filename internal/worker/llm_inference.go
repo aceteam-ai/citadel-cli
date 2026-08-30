@@ -826,9 +826,24 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	// OpenAI multimodal "content parts" array — e.g. an image_url for a vision/OCR
 	// model like baidu/Unlimited-OCR (#625) — reaches the engine intact. A plain
 	// string content marshals back to a string unchanged.
+	//
+	// tool_calls/tool_call_id/name (citadel-cli#603) are attached ONLY when the
+	// message actually carries them, so a plain user/assistant/system turn's
+	// wire shape is byte-for-byte what it was before #603 — no new keys, no
+	// engine that validates message shape strictly ever sees them.
 	messages := make([]map[string]any, 0, len(payload.Messages))
 	for _, m := range payload.Messages {
-		messages = append(messages, map[string]any{"role": m.Role, "content": m.ContentJSON()})
+		msg := map[string]any{"role": m.Role, "content": m.ContentJSON()}
+		if hasToolCalls(m.ToolCalls) {
+			msg["tool_calls"] = m.ToolCalls
+		}
+		if m.ToolCallID != "" {
+			msg["tool_call_id"] = m.ToolCallID
+		}
+		if m.Name != "" {
+			msg["name"] = m.Name
+		}
+		messages = append(messages, msg)
 	}
 
 	reqPayload := map[string]any{
@@ -846,6 +861,16 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	}
 	if len(payload.Stop) > 0 {
 		reqPayload["stop"] = payload.Stop
+	}
+	// Tool calling (citadel-cli#603, aceteam #6555): only attach `tools`/
+	// `tool_choice` when the job payload actually carries them, so a text-only
+	// request's outbound body gains no new keys -- vLLM/llama.cpp/bonsai's
+	// OpenAI-compatible /v1/chat/completions already accept both natively.
+	if len(payload.Tools) > 0 {
+		reqPayload["tools"] = payload.Tools
+		if len(payload.ToolChoice) > 0 {
+			reqPayload["tool_choice"] = payload.ToolChoice
+		}
 	}
 
 	resp, err := h.postJSON(ctx, baseURL+"/v1/chat/completions", reqPayload)
@@ -894,15 +919,25 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 	if err != nil {
 		return h.failure(err), nil
 	}
-	content, finishReason, usage, err := parseChatCompletionResponse(bodyBytes)
+	content, finishReason, toolCalls, usage, err := parseChatCompletionResponse(bodyBytes)
 	if err != nil {
 		return h.failure(err), nil
 	}
-	writeSingleChunk(stream, content)
+	// A tool_calls-only reply (content=="" alongside a populated tool_calls
+	// array — the common shape for a model that decided to call a tool rather
+	// than answer in text) has nothing worth publishing as a chunk; the
+	// pre-#603 single-parity-chunk behavior for a genuine text reply (even an
+	// empty one) is unchanged.
+	if content != "" || len(toolCalls) == 0 {
+		writeSingleChunk(stream, content)
+	}
 	output := map[string]any{
 		"content":       content,
 		"finish_reason": finishReason,
 		"usage":         usage,
+	}
+	if len(toolCalls) > 0 {
+		output["tool_calls"] = toolCalls
 	}
 	if groundingGuardrailEnabled() {
 		result := trust.CheckGrounding(promptTextFromPayload(payload), content)
@@ -964,9 +999,30 @@ func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInf
 // from delta.content (matching the buffered path and standard OpenAI clients).
 // Thinking models like Bonsai emit the chain-of-thought in delta.reasoning_content
 // and the answer in delta.content; the reasoning is accumulated but only surfaced
-// if the stream ends with NO answer (token budget spent mid-reasoning), so a
-// reply is never silently blank while staying consistent with the non-stream
-// content-only result.
+// if the stream ends with NO answer AND no tool call (token budget spent
+// mid-reasoning), so a reply is never silently blank while staying consistent
+// with the non-stream content-only result. A thinking model that decided to
+// call a tool instead (citadel-cli#603) has real reasoning_content but nothing
+// there is the visible reply, so it must not be promoted to `content` there
+// either -- see parseChatCompletionResponse's doc comment for the identical
+// buffered-path reasoning.
+//
+// Tool-call deltas (choices[].delta.tool_calls) are accumulated across chunks
+// via toolCallAccumulator and surfaced ONLY in the returned JobResult.Output
+// (the Runner's terminal WriteEnd, per this file's package doc comment) --
+// deliberately NOT emitted as per-chunk deltas via stream.WriteChunk, because
+// StreamWriter.WriteChunk(content string, index int) has no field for
+// structured data; widening it would ripple through RedisStreamWriter/
+// APIStreamWriter/NoOpStreamWriter, internal/redis and internal/redisapi's
+// PublishChunk, and every existing caller, for a payload the consumer does not
+// need: aceteam/python-backend's FabricInferenceClient._event_to_chunk (the
+// real consumer, agents/fabric_client.py) already reads tool_calls from the
+// "end" event's `data.result` -- exactly what this function returns here --
+// and its "chunk" event branch drops a delta entirely when it carries neither
+// text nor tool_calls, so a node that never emits per-chunk deltas is not a
+// regression for that consumer today. Mirrors the citadel-cli#717 "a guessed
+// field is worse than no field" precedent for exactly this kind of interface
+// widening with no verified consumer.
 func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io.Reader) (*JobResult, error) {
 	scanner := bufio.NewScanner(body)
 	// Allow long SSE lines (large deltas) beyond bufio's default 64KiB cap.
@@ -974,6 +1030,8 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 	chunkIndex := 0
 	var answer strings.Builder
 	var reasoning strings.Builder
+	finishReason := "stop"
+	toolCalls := newToolCallAccumulator()
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -988,8 +1046,9 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content          string `json:"content"`
-					ReasoningContent string `json:"reasoning_content"`
+					Content          string          `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        []toolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
@@ -1008,8 +1067,23 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 		} else if rc := chunk.Choices[0].Delta.ReasoningContent; rc != "" {
 			reasoning.WriteString(rc)
 		}
+		if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+			toolCalls.merge(chunk.Choices[0].Delta.ToolCalls)
+		}
 
-		if chunk.Choices[0].FinishReason != "" {
+		if fr := chunk.Choices[0].FinishReason; fr != "" {
+			// Only "tool_calls" overrides the pre-#603 hardcoded "stop" --
+			// this streaming path never surfaced any other finish_reason
+			// (e.g. "length") before this change, so widening the override to
+			// every finish_reason would change output for a text-only stream
+			// that previously always reported "stop", violating the
+			// no-tools-⇒-unchanged-behavior contract. "tool_calls" cannot
+			// have occurred before #603 (tools were never forwarded), so this
+			// branch is unreachable pre-#603 and only activates in the new
+			// tool-calling path.
+			if fr == "tool_calls" {
+				finishReason = fr
+			}
 			break
 		}
 	}
@@ -1018,32 +1092,167 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 	}
 
 	final := answer.String()
-	if final == "" {
-		// No answer produced (thinking model ran out of budget mid-reason); surface
-		// the reasoning so the reply is not blank, mirroring the buffered path's
-		// reasoning_content fallback.
+	if final == "" && toolCalls.empty() {
+		// No answer and no tool call produced (thinking model ran out of budget
+		// mid-reason); surface the reasoning so the reply is not blank, mirroring
+		// the buffered path's reasoning_content fallback.
 		if final = reasoning.String(); final != "" {
 			stream.WriteChunk(final, chunkIndex)
 		}
 	}
-	return h.success(map[string]any{
+	output := map[string]any{
 		"content":       final,
-		"finish_reason": "stop",
-	}), nil
+		"finish_reason": finishReason,
+	}
+	if tc := toolCalls.json(); len(tc) > 0 {
+		output["tool_calls"] = tc
+	}
+	return h.success(output), nil
 }
 
-// parseChatCompletionResponse extracts the assistant content, finish reason, and
-// usage from a buffered OpenAI chat-completions body. Content falls back to
-// reasoning_content when the answer field is empty (thinking models like Bonsai
-// whose token budget was spent mid-reasoning), so a caller never gets a blank
-// reply while tokens were clearly generated. (Ported from internal/jobs; kept
-// unexported here to keep the worker handler self-contained.)
-func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string, usage map[string]any, err error) {
+// hasToolCalls reports whether raw is a MEANINGFUL, non-empty OpenAI
+// tool_calls array -- i.e. whether it should be treated as "tool calls are
+// present", as opposed to absent. json.RawMessage's byte length alone is NOT
+// a meaningful presence check: the literal JSON `null` is 4 bytes and `[]` is
+// 2 bytes, both len(raw) > 0 despite meaning "no tool calls". A Pydantic- (or
+// any strictly-typed-response-model-) backed engine can plausibly serialize
+// `"tool_calls": null` on an ORDINARY non-tool reply, so `len(raw) > 0` alone
+// would wrongly treat that reply as tool-calls-present -- on the buffered
+// response path this wrongly suppresses the reasoning_content->content
+// fallback for a thinking model (e.g. bonsai) that ran out of budget
+// mid-reasoning and also happened to carry an explicit null/empty tool_calls
+// field, so the caller gets an empty reply instead of the reasoning. This
+// unmarshals into a slice and counts elements instead of trusting the byte
+// length, so `null`/`""`/`[]`/malformed JSON all correctly read as "absent".
+func hasToolCalls(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return false
+	}
+	return len(arr) > 0
+}
+
+// toolCallDelta is one entry in an OpenAI streaming delta.tool_calls array
+// (citadel-cli#603). Deltas arrive incrementally by index -- id/type/
+// function.name typically land on the FIRST delta for that index, and
+// function.arguments accumulates piecemeal across many subsequent deltas
+// (potentially character-by-character), so a single delta is never a complete
+// tool call on its own.
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// toolCallAccumulator merges streaming tool_calls deltas (indexed, partial)
+// into a final OpenAI-shaped tool_calls array. Deliberately NOT a generic
+// json.RawMessage merge: `arguments` must be concatenated as TEXT (a delta may
+// split the JSON string mid-token), and id/type/name follow "last non-empty
+// wins" (merge only overwrites on a non-empty delta field, never blanks a
+// value an earlier delta already set) rather than being locked after the
+// first sighting -- in the common shape (id+name on the first delta for an
+// index, bare argument fragments after) those two behave identically, but
+// they are not the same rule, so don't describe this as "latched from the
+// first delta".
+type toolCallAccumulator struct {
+	order []int
+	byIdx map[int]*accumulatedToolCall
+}
+
+type accumulatedToolCall struct {
+	id        string
+	typ       string
+	name      string
+	arguments strings.Builder
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{byIdx: make(map[int]*accumulatedToolCall)}
+}
+
+// merge folds one delta frame's tool_calls entries into the accumulator,
+// preserving first-seen order by index.
+func (a *toolCallAccumulator) merge(deltas []toolCallDelta) {
+	for _, d := range deltas {
+		tc, ok := a.byIdx[d.Index]
+		if !ok {
+			tc = &accumulatedToolCall{}
+			a.byIdx[d.Index] = tc
+			a.order = append(a.order, d.Index)
+		}
+		if d.ID != "" {
+			tc.id = d.ID
+		}
+		if d.Type != "" {
+			tc.typ = d.Type
+		}
+		if d.Function.Name != "" {
+			tc.name = d.Function.Name
+		}
+		tc.arguments.WriteString(d.Function.Arguments)
+	}
+}
+
+// empty reports whether any tool-call delta has been seen at all.
+func (a *toolCallAccumulator) empty() bool {
+	return len(a.order) == 0
+}
+
+// json renders the merged tool_calls as a final OpenAI-shaped array (nil when
+// no tool-call deltas were seen, or on the never-expected marshal failure --
+// either way a text-only stream's output map gains no new key).
+func (a *toolCallAccumulator) json() json.RawMessage {
+	if a.empty() {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(a.order))
+	for _, idx := range a.order {
+		tc := a.byIdx[idx]
+		typ := tc.typ
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, map[string]any{
+			"id":   tc.id,
+			"type": typ,
+			"function": map[string]any{
+				"name":      tc.name,
+				"arguments": tc.arguments.String(),
+			},
+		})
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// parseChatCompletionResponse extracts the assistant content, finish reason,
+// tool_calls, and usage from a buffered OpenAI chat-completions body. Content
+// falls back to reasoning_content when the answer field is empty (thinking
+// models like Bonsai whose token budget was spent mid-reasoning), so a caller
+// never gets a blank reply while tokens were clearly generated -- EXCEPT when
+// the model instead emitted tool_calls (citadel-cli#603): a thinking model
+// that decided to call a tool has real chain-of-thought in reasoning_content
+// but nothing there is meant to be the assistant's visible reply, so surfacing
+// it as `content` would render as a bogus text answer ALONGSIDE the tool call.
+// (Ported from internal/jobs; kept unexported here to keep the worker handler
+// self-contained.)
+func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string, toolCalls json.RawMessage, usage map[string]any, err error) {
 	var response struct {
 		Choices []struct {
 			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content          string          `json:"content"`
+				ReasoningContent string          `json:"reasoning_content"`
+				ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -1054,14 +1263,17 @@ func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
-		return "", "", nil, fmt.Errorf("failed to parse chat completions response: %w", err)
+		return "", "", nil, nil, fmt.Errorf("failed to parse chat completions response: %w", err)
 	}
 
 	finishReason = "stop"
 	if len(response.Choices) > 0 {
-		content = response.Choices[0].Message.Content
-		if content == "" {
-			content = response.Choices[0].Message.ReasoningContent
+		msg := response.Choices[0].Message
+		content = msg.Content
+		if hasToolCalls(msg.ToolCalls) {
+			toolCalls = msg.ToolCalls
+		} else if content == "" {
+			content = msg.ReasoningContent
 		}
 		if response.Choices[0].FinishReason != "" {
 			finishReason = response.Choices[0].FinishReason
@@ -1073,7 +1285,7 @@ func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string
 		"completion_tokens": response.Usage.CompletionTokens,
 		"total_tokens":      response.Usage.TotalTokens,
 	}
-	return content, finishReason, usage, nil
+	return content, finishReason, toolCalls, usage, nil
 }
 
 // postJSON issues a ctx-bound POST with a JSON body so a per-job deadline

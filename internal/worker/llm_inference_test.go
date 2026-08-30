@@ -874,3 +874,633 @@ func TestLLMInferenceHandler_SignAEPReceiptFailsOpen(t *testing.T) {
 		t.Errorf("aepLogf called %d times, want exactly 1 (the signing failure logged, non-fatally)", loggedCalls)
 	}
 }
+
+// --- Tool calling (citadel-cli#603, aceteam #6555) ---------------------------
+
+// TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools pins the
+// "no tools key ⇒ identical behavior" contract from #603's definition of done:
+// a job payload with no tools/tool_choice and plain text messages must not
+// gain ANY new key on the outbound engine request -- not even an empty one.
+// Asserting key ABSENCE (not just an empty value) is deliberate: it is the
+// assertion that fails if a future edit turns `if len(payload.Tools) > 0`
+// into an unconditional assignment.
+func TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-no-tools",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+
+	if _, present := gotReq["tools"]; present {
+		t.Errorf("outbound request = %+v, want no \"tools\" key", gotReq)
+	}
+	if _, present := gotReq["tool_choice"]; present {
+		t.Errorf("outbound request = %+v, want no \"tool_choice\" key", gotReq)
+	}
+	msgs, _ := gotReq["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("outbound messages = %v, want exactly one", msgs)
+	}
+	msg, _ := msgs[0].(map[string]any)
+	for _, key := range []string{"tool_calls", "tool_call_id", "name"} {
+		if _, present := msg[key]; present {
+			t.Errorf("outbound message = %+v, want no %q key", msg, key)
+		}
+	}
+	if _, present := result.Output["tool_calls"]; present {
+		t.Errorf("Output = %+v, want no \"tool_calls\" key", result.Output)
+	}
+}
+
+// TestLLMInferenceHandler_ToolsForwardedInRequest asserts that tools,
+// tool_choice, and a message history carrying assistant tool_calls plus a
+// tool-role result (tool_call_id/name) all reach the engine's outbound
+// request intact -- the request-build half of #603.
+func TestLLMInferenceHandler_ToolsForwardedInRequest(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"the weather is sunny"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["vllm"] = ts.URL
+
+	job := &Job{
+		ID:   "job-tools-request",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "vllm",
+			"tools": []map[string]any{
+				{
+					"type": "function",
+					"function": map[string]any{
+						"name":        "get_weather",
+						"description": "Get the weather for a city",
+						"parameters": map[string]any{
+							"type":       "object",
+							"properties": map[string]any{"city": map[string]any{"type": "string"}},
+						},
+					},
+				},
+			},
+			"tool_choice": "auto",
+			"messages": []map[string]any{
+				{"role": "user", "content": "weather in SF?"},
+				{
+					"role":    "assistant",
+					"content": "",
+					"tool_calls": []map[string]any{
+						{
+							"id":   "c1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "get_weather",
+								"arguments": `{"city": "SF"}`,
+							},
+						},
+					},
+				},
+				{
+					"role":         "tool",
+					"content":      `{"temp": 60}`,
+					"tool_call_id": "c1",
+					"name":         "get_weather",
+				},
+			},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+
+	tools, ok := gotReq["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("outbound tools = %#v, want a single-element array", gotReq["tools"])
+	}
+	toolFn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if toolFn["name"] != "get_weather" {
+		t.Errorf("outbound tool function name = %v, want get_weather", toolFn["name"])
+	}
+	if gotReq["tool_choice"] != "auto" {
+		t.Errorf("outbound tool_choice = %v, want \"auto\"", gotReq["tool_choice"])
+	}
+
+	msgs, _ := gotReq["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("outbound messages = %v, want 3", msgs)
+	}
+	assistantMsg, _ := msgs[1].(map[string]any)
+	assistantToolCalls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(assistantToolCalls) != 1 {
+		t.Fatalf("assistant message tool_calls = %#v, want single-element array", assistantMsg["tool_calls"])
+	}
+	tc0, _ := assistantToolCalls[0].(map[string]any)
+	if tc0["id"] != "c1" {
+		t.Errorf("assistant tool_calls[0].id = %v, want c1", tc0["id"])
+	}
+
+	toolResultMsg, _ := msgs[2].(map[string]any)
+	if toolResultMsg["tool_call_id"] != "c1" {
+		t.Errorf("tool-role message tool_call_id = %v, want c1", toolResultMsg["tool_call_id"])
+	}
+	if toolResultMsg["name"] != "get_weather" {
+		t.Errorf("tool-role message name = %v, want get_weather", toolResultMsg["name"])
+	}
+}
+
+// TestLLMInferenceHandler_BufferedToolCallsResponse asserts that a buffered
+// (non-streaming) engine response carrying message.tool_calls surfaces them
+// on JobResult.Output, with finish_reason forwarded as "tool_calls" and no
+// spurious empty-content chunk published (a tool_calls-only reply has no text
+// worth publishing as a chunk).
+func TestLLMInferenceHandler_BufferedToolCallsResponse(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"","tool_calls":[` +
+		`{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}` +
+		`]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-buffered-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "bonsai",
+			"tools": []map[string]any{
+				{"type": "function", "function": map[string]any{"name": "get_weather"}},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["finish_reason"].(string); got != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", got)
+	}
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("content = %q, want empty (tool_calls-only reply)", got)
+	}
+	raw, ok := result.Output["tool_calls"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("Output[\"tool_calls\"] = %#v (%T), want json.RawMessage", result.Output["tool_calls"], result.Output["tool_calls"])
+	}
+	var parsed []map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("tool_calls did not unmarshal as an array: %v", err)
+	}
+	if len(parsed) != 1 || parsed[0]["id"] != "call_1" {
+		t.Errorf("tool_calls = %v, want one entry with id call_1", parsed)
+	}
+	fn, _ := parsed[0]["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn["name"])
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("chunks = %v, want none published for a tool_calls-only reply", stream.chunks)
+	}
+}
+
+// TestLLMInferenceHandler_StreamingToolCallsAccumulate drives a tool-calling
+// SSE stream where the tool_calls delta arrives split across multiple frames
+// (id+name on the first, arguments fragments on the next two -- the real
+// OpenAI streaming shape) and asserts the merged, final tool_calls array is
+// returned on JobResult.Output with finish_reason "tool_calls". Per this
+// file's streamChatCompletions doc comment, no per-chunk tool_calls delta is
+// asserted here -- only the terminal result, which is what the real consumer
+// (aceteam's FabricInferenceClient._event_to_chunk "end" branch) reads.
+func TestLLMInferenceHandler_StreamingToolCallsAccumulate(t *testing.T) {
+	frames := []string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+	}
+	ts := newChatCompletionsServer(t, frames, nil)
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-streaming-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "bonsai-27b",
+			"backend": "bonsai",
+			"stream":  true,
+			"tools": []map[string]any{
+				{"type": "function", "function": map[string]any{"name": "get_weather"}},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["finish_reason"].(string); got != "tool_calls" {
+		t.Errorf("finish_reason = %q, want tool_calls", got)
+	}
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("content = %q, want empty", got)
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("chunks = %v, want none (no delta.content in any frame)", stream.chunks)
+	}
+	raw, ok := result.Output["tool_calls"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("Output[\"tool_calls\"] = %#v (%T), want json.RawMessage", result.Output["tool_calls"], result.Output["tool_calls"])
+	}
+	var parsed []map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("tool_calls did not unmarshal as an array: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("tool_calls = %v, want exactly one merged entry", parsed)
+	}
+	if parsed[0]["id"] != "call_1" {
+		t.Errorf("tool_calls[0].id = %v, want call_1", parsed[0]["id"])
+	}
+	fn, _ := parsed[0]["function"].(map[string]any)
+	if fn["name"] != "get_weather" {
+		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn["name"])
+	}
+	if fn["arguments"] != `{"city":"SF"}` {
+		t.Errorf("tool_calls[0].function.arguments = %v, want merged JSON string", fn["arguments"])
+	}
+}
+
+// TestLLMInferenceHandler_StreamingTextUnaffectedByToolCallPlumbing is the
+// #603 "no tools key ⇒ identical behavior" pin for the streaming path: a
+// plain text stream (no tool_calls deltas anywhere) must still report
+// finish_reason "stop" exactly as TestLLMInferenceHandler_ChatStreaming
+// already asserts, and gain no "tool_calls" key.
+func TestLLMInferenceHandler_StreamingTextUnaffectedByToolCallPlumbing(t *testing.T) {
+	frames := []string{
+		`data: {"choices":[{"delta":{"content":"Hello"}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+	}
+	ts := newChatCompletionsServer(t, frames, nil)
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-streaming-text-only",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "bonsai-27b",
+			"backend":  "bonsai",
+			"stream":   true,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	// finish_reason stays "stop" even though the upstream sent "length" --
+	// this streaming path has never forwarded a real finish_reason other than
+	// "tool_calls" (see streamChatCompletions's gate), so a text-only stream's
+	// output is unchanged by #603.
+	if got, _ := result.Output["finish_reason"].(string); got != "stop" {
+		t.Errorf("finish_reason = %q, want stop (unchanged pre-#603 behavior)", got)
+	}
+	if _, present := result.Output["tool_calls"]; present {
+		t.Errorf("Output = %+v, want no \"tool_calls\" key", result.Output)
+	}
+}
+
+// TestLLMInferenceHandler_GroundingGuardrailHandlesToolCallsOnlyResponse pins
+// the #603 grounding-guardrail interaction explicitly asked for: a
+// tool_calls-only response (empty content) must not crash the guardrail or
+// false-flag anything -- it is vacuously grounded because there is no text to
+// check (internal/trust.CheckGrounding's ClaimsChecked==0 case).
+func TestLLMInferenceHandler_GroundingGuardrailHandlesToolCallsOnlyResponse(t *testing.T) {
+	t.Setenv(groundingGuardrailEnvVar, "1")
+
+	body := `{"choices":[{"message":{"content":"","tool_calls":[` +
+		`{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}` +
+		`]},"finish_reason":"tool_calls"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-grounding-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	grounding, ok := result.Output["grounding"].(map[string]any)
+	if !ok {
+		t.Fatalf("Output[\"grounding\"] = %#v, want map[string]any", result.Output["grounding"])
+	}
+	if grounded, _ := grounding["grounded"].(bool); !grounded {
+		t.Errorf("grounding[\"grounded\"] = %v, want true (nothing to check)", grounded)
+	}
+	if checked, _ := grounding["claims_checked"].(int); checked != 0 {
+		t.Errorf("grounding[\"claims_checked\"] = %v, want 0", grounding["claims_checked"])
+	}
+	if _, present := result.Output["tool_calls"]; !present {
+		t.Errorf("Output = %+v, want tool_calls to still be present alongside grounding", result.Output)
+	}
+}
+
+// TestLLMInferenceHandler_BufferedReasoningFallbackSkippedWhenToolCallsPresent
+// pins the advisor-caught collision between the thinking-model reasoning_content
+// fallback and tool_calls: a response with empty content, non-empty
+// reasoning_content, AND tool_calls must NOT promote the chain-of-thought to
+// `content` -- doing so would render the CoT as a bogus visible assistant
+// reply alongside the tool call.
+func TestLLMInferenceHandler_BufferedReasoningFallbackSkippedWhenToolCallsPresent(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"","reasoning_content":"I should check the weather API",` +
+		`"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},` +
+		`"finish_reason":"tool_calls"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-reasoning-vs-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("content = %q, want empty (reasoning must not leak into content when tool_calls present)", got)
+	}
+	if _, present := result.Output["tool_calls"]; !present {
+		t.Errorf("Output = %+v, want tool_calls present", result.Output)
+	}
+}
+
+// TestLLMInferenceHandler_BufferedContentAndToolCallsBothPresent covers the
+// OpenAI-permitted "narration + tool call" shape (e.g. "Let me check the
+// weather" alongside a tool_calls array) — real, non-empty `content` must be
+// preserved verbatim (NOT zeroed out just because tool_calls are also
+// present) and still publish its parity chunk, while `tool_calls` also
+// attaches. This is the case advisor review flagged as needing an explicit
+// pin: a future "simplify the branch to `if len(msg.ToolCalls) > 0 { content
+// = "" }`" edit would pass every other tool_calls test but fail this one.
+func TestLLMInferenceHandler_BufferedContentAndToolCallsBothPresent(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"Let me check the weather.",` +
+		`"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},` +
+		`"finish_reason":"tool_calls"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["bonsai"] = ts.URL
+
+	job := &Job{
+		ID:   "job-content-and-tool-calls",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+		},
+	}
+	stream := &MockStreamWriter{}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "Let me check the weather." {
+		t.Errorf("content = %q, want the narration text preserved", got)
+	}
+	if _, present := result.Output["tool_calls"]; !present {
+		t.Errorf("Output = %+v, want tool_calls present alongside content", result.Output)
+	}
+	if len(stream.chunks) != 1 || stream.chunks[0] != "Let me check the weather." {
+		t.Errorf("chunks = %v, want the narration published as a single parity chunk", stream.chunks)
+	}
+}
+
+// TestLLMInferenceHandler_ToolCallsNullOrEmptyTreatedAsAbsent is the coordinator
+// review pin for a real robustness gap: json.RawMessage's byte length alone is
+// NOT a meaningful "tool calls present" check -- the literal JSON `null` is 4
+// bytes and `[]` is 2 bytes, both len(raw) > 0 despite meaning "no tool calls".
+// A Pydantic-typed engine response can plausibly serialize an explicit
+// "tool_calls": null (or []) on an ORDINARY reply. Before the hasToolCalls fix,
+// a thinking model (e.g. bonsai) with empty content, non-empty
+// reasoning_content, AND an explicit null/empty tool_calls field would take the
+// "tool_calls present" branch and NOT fall back to reasoning_content -- the
+// caller got an empty reply instead of the reasoning. This must FAIL against
+// the old `len(msg.ToolCalls) > 0` check.
+func TestLLMInferenceHandler_ToolCallsNullOrEmptyTreatedAsAbsent(t *testing.T) {
+	cases := []struct {
+		name         string
+		toolCallsRaw string
+	}{
+		{name: "explicit null", toolCallsRaw: `null`},
+		{name: "empty array", toolCallsRaw: `[]`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"choices":[{"message":{"content":"","reasoning_content":"thinking hard about the weather",` +
+				`"tool_calls":` + tc.toolCallsRaw + `},"finish_reason":"stop"}]}`
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_, _ = w.Write([]byte(body))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["bonsai"] = ts.URL
+
+			job := &Job{
+				ID:   "job-null-tool-calls-" + tc.name,
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model":    "m",
+					"backend":  "bonsai",
+					"messages": []map[string]any{{"role": "user", "content": "weather in SF?"}},
+				},
+			}
+			stream := &MockStreamWriter{}
+			result, err := h.Execute(context.Background(), job, stream)
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+			if got, _ := result.Output["content"].(string); got != "thinking hard about the weather" {
+				t.Errorf("content = %q, want the reasoning fallback to fire (tool_calls=%s must behave as absent)", got, tc.toolCallsRaw)
+			}
+			if _, present := result.Output["tool_calls"]; present {
+				t.Errorf("Output = %+v, want no \"tool_calls\" key (tool_calls=%s means absent)", result.Output, tc.toolCallsRaw)
+			}
+			if len(stream.chunks) != 1 || stream.chunks[0] != "thinking hard about the weather" {
+				t.Errorf("chunks = %v, want the reasoning published as a single parity chunk", stream.chunks)
+			}
+		})
+	}
+}
+
+// TestLLMInferenceHandler_RequestSideNullToolCallsNotForwarded is the
+// request-build analogue of the response-side fix above: an assistant
+// message in the incoming payload carrying an explicit "tool_calls": null (or
+// []) must not gain a spurious "tool_calls" key on the outbound engine
+// request -- it must behave exactly like an absent field.
+func TestLLMInferenceHandler_RequestSideNullToolCallsNotForwarded(t *testing.T) {
+	cases := []struct {
+		name          string
+		toolCallsJSON json.RawMessage
+	}{
+		{name: "explicit null", toolCallsJSON: json.RawMessage(`null`)},
+		{name: "empty array", toolCallsJSON: json.RawMessage(`[]`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["bonsai"] = ts.URL
+
+			// Build the payload directly (not via a job.Payload map[string]any
+			// round-trip) so the ChatMessage.ToolCalls field is exactly the raw
+			// literal under test, matching how parseLLMInferencePayload would
+			// decode an engine/backend that actually sent this literal.
+			payload := &jobs.LLMInferencePayload{
+				Model:   "m",
+				Backend: "bonsai",
+				Messages: []jobs.ChatMessage{
+					{Role: "user", Content: json.RawMessage(`"hi"`)},
+					{Role: "assistant", Content: json.RawMessage(`"ok"`), ToolCalls: tc.toolCallsJSON},
+				},
+			}
+			result, err := h.executeLlamaCppAt(context.Background(), &MockStreamWriter{}, payload, ts.URL, "job-null-tool-calls-req-"+tc.name)
+			if err != nil {
+				t.Fatalf("executeLlamaCppAt error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+
+			msgs, _ := gotReq["messages"].([]any)
+			if len(msgs) != 2 {
+				t.Fatalf("outbound messages = %v, want 2", msgs)
+			}
+			assistantMsg, _ := msgs[1].(map[string]any)
+			if _, present := assistantMsg["tool_calls"]; present {
+				t.Errorf("outbound assistant message = %+v, want no \"tool_calls\" key (input was %s)", assistantMsg, tc.toolCallsJSON)
+			}
+		})
+	}
+}

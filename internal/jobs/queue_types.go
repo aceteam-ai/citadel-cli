@@ -82,6 +82,19 @@ type LLMInferencePayload struct {
 
 	// Stop sequences to end generation
 	Stop []string `json:"stop,omitempty"`
+
+	// Tools carries the OpenAI `tools` array (function/tool definitions) for
+	// tool-calling requests (citadel-cli#603, aceteam #6555). Kept as raw JSON
+	// -- like ChatMessage.Content -- rather than a typed Go struct so an
+	// engine-specific JSON Schema shape in `function.parameters` is never
+	// lossily re-typed. nil/absent means no tools (the pre-#603 text-only
+	// path), so a text-only request's payload is structurally unchanged.
+	Tools json.RawMessage `json:"tools,omitempty"`
+
+	// ToolChoice carries the OpenAI `tool_choice` field, which is EITHER a
+	// bare string ("auto"/"none"/"required") OR an object naming a specific
+	// function -- forwarded raw for the same reason as Tools.
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 }
 
 // ChatMessage represents a message in chat-style APIs.
@@ -96,6 +109,19 @@ type LLMInferencePayload struct {
 type ChatMessage struct {
 	Role    string          `json:"role"` // "system", "user", "assistant"
 	Content json.RawMessage `json:"content,omitempty"`
+
+	// ToolCalls carries the OpenAI `tool_calls` array on an assistant message
+	// that requested one or more tool invocations (citadel-cli#603). Raw JSON,
+	// forwarded verbatim -- the same reasoning as Content. nil on a plain text
+	// turn, so a non-tool conversation's messages are unaffected.
+	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+
+	// ToolCallID correlates a role="tool" message's result back to the
+	// assistant tool_calls entry that requested it (OpenAI convention).
+	ToolCallID string `json:"tool_call_id,omitempty"`
+
+	// Name is the function name on a role="tool" message.
+	Name string `json:"name,omitempty"`
 }
 
 // Text returns the message content as plain text. Content may be a JSON string
