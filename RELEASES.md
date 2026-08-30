@@ -2018,3 +2018,18 @@ Auto-generated log of every release.
   - fix(diffusers): default preflight path warns instead of false-refusing (#913) (#921)
 
 
+---
+
+## v2.130.0 — 2026-08-29
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 4 |
+| Lines added | +925 |
+
+**Changes:**
+
+  - worker: forward OpenAI tools/tool_calls through llm_inference (#603) (#928)
+
+
