@@ -1,8 +1,10 @@
 package cacheindex
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -317,5 +319,109 @@ func TestUpsertRequiresKey(t *testing.T) {
 	}
 	if err := s.Upsert(Entry{CacheDir: "huggingface"}); err == nil {
 		t.Errorf("expected Upsert to reject an entry with no Model")
+	}
+}
+
+// TestWriteSnapshotRefusesAStaleVersion pins citadel #937's fix directly and
+// deterministically (no goroutine timing involved): flushIfDue's debounced
+// write takes its snapshot under s.mu but writes to disk AFTER releasing it,
+// so a concurrent Upsert/Remove that flushes NEWER state (synchronously,
+// still under s.mu) can complete and reach disk BEFORE that older snapshot's
+// write finally lands. Without a staleness guard, the older write's rename
+// would silently revert the newer one on disk. This test manually replays
+// that exact interleaving: capture a snapshot+version, mutate further (a
+// "someone raced ahead" stand-in), then attempt to writeSnapshot the STALE
+// capture and assert it is a no-op that never reaches disk.
+func TestWriteSnapshotRefusesAStaleVersion(t *testing.T) {
+	dir := t.TempDir()
+	s := Open(filepath.Join(dir, FileName), nil)
+
+	if err := s.Upsert(Entry{CacheDir: "huggingface", Model: "org/a", Engine: "vllm", Files: []string{"models--org--a"}}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+
+	// Simulate flushIfDue: snapshot + version captured under s.mu, exactly
+	// like flushIfDue itself does, standing in for a MarkUsed call that
+	// hasn't reached disk yet.
+	s.mu.Lock()
+	staleSnapshot := s.idx.snapshot()
+	staleVersion := s.version
+	s.mu.Unlock()
+
+	// A second, independent mutation "wins the race" and reaches disk first
+	// -- newer state, higher version, synchronous flush under s.mu.
+	if err := s.Upsert(Entry{CacheDir: "huggingface", Model: "org/b", Engine: "vllm", Files: []string{"models--org--b"}}); err != nil {
+		t.Fatalf("second Upsert: %v", err)
+	}
+
+	// The stale, already-superseded snapshot finally attempts its write --
+	// must be refused (a no-op), not a clobber.
+	if err := s.writeSnapshot(staleSnapshot, staleVersion); err != nil {
+		t.Fatalf("writeSnapshot(stale): %v", err)
+	}
+
+	// Load fresh from disk (bypassing the in-memory Store entirely) and
+	// confirm the newer entry survived and nothing was reverted.
+	reloaded, err := Load(s.path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := reloaded.Lookup("huggingface", "org/a"); !ok {
+		t.Errorf("expected the first entry to still be on disk")
+	}
+	if _, ok := reloaded.Lookup("huggingface", "org/b"); !ok {
+		t.Errorf("stale flushIfDue-style write clobbered the newer Upsert entry on disk")
+	}
+}
+
+// TestConcurrentUpsertAndMarkUsedSurviveOnDisk exercises the real concurrent
+// path (Upsert's synchronous flush racing MarkUsed's debounced flushIfDue)
+// under go test -race, so the new version/lastWrittenVersion bookkeeping
+// itself is proven data-race-free, not just logically correct. Each Upsert's
+// flush is synchronous (returns only after its own write completes), so by
+// the time all goroutines finish, every upserted entry must be present on a
+// fresh disk load regardless of how MarkUsed's debounced writes interleaved.
+func TestConcurrentUpsertAndMarkUsedSurviveOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	s := Open(filepath.Join(dir, FileName), nil)
+
+	if err := s.Upsert(Entry{CacheDir: "llamacpp", Model: "seed.gguf", Engine: "llamacpp", Files: []string{"seed.gguf"}, Source: SourceBackfill}); err != nil {
+		t.Fatalf("seed Upsert: %v", err)
+	}
+
+	const n = 25
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = s.Upsert(Entry{
+				CacheDir: "llamacpp",
+				Model:    fmt.Sprintf("model-%d.gguf", i),
+				Engine:   "llamacpp",
+				Files:    []string{fmt.Sprintf("model-%d.gguf", i)},
+				Source:   SourceBackfill,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			s.MarkUsed("llamacpp", "seed.gguf", time.Now())
+		}()
+	}
+	wg.Wait()
+
+	reloaded, err := Load(s.path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := reloaded.Lookup("llamacpp", "seed.gguf"); !ok {
+		t.Errorf("expected the seed entry to survive concurrent Upsert/MarkUsed")
+	}
+	for i := 0; i < n; i++ {
+		model := fmt.Sprintf("model-%d.gguf", i)
+		if _, ok := reloaded.Lookup("llamacpp", model); !ok {
+			t.Errorf("expected %s to be present on disk after concurrent flush, but it was missing (a stale write clobbered it)", model)
+		}
 	}
 }

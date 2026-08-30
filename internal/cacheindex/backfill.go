@@ -1,6 +1,7 @@
 package cacheindex
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -289,42 +290,61 @@ func hfDirToModelID(name string) (string, bool) {
 	return parts[0] + "/" + parts[1], true
 }
 
-// scanGGUFDir discovers flat GGUF (or any) files directly under
-// cacheRoot/cacheDirName. Records one FILENAME-keyed backfill Entry
-// candidate per file -- the repo id is not recoverable from a bare file on
-// disk (design doc §8.5) -- but ReconcileScan's caller-side "claimed" check
-// is what stops this from double-counting a file a repo-keyed
-// MODEL_CACHE_PULL entry already tracks; this function itself has no
-// knowledge of the index's existing entries. Marks cacheDirName scanned
-// only when the directory was actually readable.
+// scanGGUFDir discovers GGUF (or any) files under cacheRoot/cacheDirName,
+// RECURSIVELY -- a llamacpp pull of a repo whose GGUF lives in a
+// subdirectory (pullLlamaCppGGUF/recordLlamaCppCacheIndexEntry) records that
+// file's Files entry keyed by its repo-relative path (e.g. "sub/x.gguf",
+// straight from the HF repo tree's own Path, forward-slash separated -- see
+// recordLlamaCppCacheIndexEntry and listFilesRelative, both of which walk
+// the SAME way and join relative to llamaCppCacheDir()'s root). A top-level-
+// only scan never rediscovers that path, so ReconcileScan's staleness
+// cleanup below would drop the repo-keyed pull entry on the very next
+// restart even though the bytes are still on disk (citadel #937).
+//
+// Records one Entry candidate per file, keyed by its path RELATIVE TO dir
+// (filepath.Rel + ToSlash) -- for a top-level file this is unchanged from
+// before (bare filename == its own relative path), so existing filename
+// keys are stable. The repo id itself is still not recoverable from a bare
+// file on disk (design doc §8.5); ReconcileScan's caller-side "claimed"
+// check is what stops this from double-counting a file a repo-keyed
+// MODEL_CACHE_PULL entry already tracks, matched by relative path just like
+// a top-level match. Marks cacheDirName scanned only when the root
+// directory was actually readable; an error partway through the walk (e.g.
+// a permission-denied subdirectory) skips just that entry rather than
+// aborting the whole scan.
 func scanGGUFDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
 	dir := filepath.Join(cacheRoot, cacheDirName)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.ReadDir(dir); err != nil {
 		return
 	}
 	res.markScanned(cacheDirName)
-	for _, de := range entries {
-		if de.IsDir() {
-			continue
+	_ = filepath.WalkDir(dir, func(path string, de fs.DirEntry, err error) error {
+		if err != nil || de.IsDir() {
+			return nil
 		}
-		info, err := de.Info()
-		if err != nil {
-			continue
+		info, infoErr := de.Info()
+		if infoErr != nil {
+			return nil
 		}
-		res.markFound(cacheDirName, de.Name())
-		key := entryKey(cacheDirName, de.Name())
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		res.markFound(cacheDirName, rel)
+		key := entryKey(cacheDirName, rel)
 		res.discovered[key] = Entry{
 			CacheDir:  cacheDirName,
 			Family:    services.CacheFamilyGGUFDir,
-			Model:     de.Name(),
+			Model:     rel,
 			Engine:    engine,
-			Files:     []string{de.Name()},
+			Files:     []string{rel},
 			SizeBytes: info.Size(),
 			PulledAt:  info.ModTime(),
 			Source:    SourceBackfill,
 		}
-	}
+		return nil
+	})
 }
 
 // scanNativeDir records ONE aggregate row (nativeAggregateModel) for a

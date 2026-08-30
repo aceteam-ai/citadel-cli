@@ -500,8 +500,26 @@ type Store struct {
 	logf func(format string, args ...any)
 	now  func() time.Time
 
-	flushMu       sync.Mutex
+	// version increases monotonically (under mu) on every mutation --
+	// Upsert/Remove/RemoveFile/MarkUsed. It is what lets writeSnapshot tell
+	// a fresh write from a stale one below.
+	version uint64
+
+	flushMu sync.Mutex
+	// lastFlushedAt debounces MarkUsed's flushIfDue call (unrelated to
+	// lastWrittenVersion below); both fields share flushMu.
 	lastFlushedAt time.Time
+	// lastWrittenVersion is the version of the last snapshot actually
+	// written to disk. Guarded by flushMu (not mu): flushIfDue's snapshot
+	// is taken under mu but written to disk AFTER releasing it, so without
+	// a version check that in-flight, now-unlocked write can land AFTER a
+	// concurrent Upsert/Remove's own (synchronous, mu-held) flush and
+	// rename an OLDER full-index snapshot over a NEWER one already on disk
+	// -- silently reverting it (citadel #937). writeSnapshot refuses to
+	// write when version <= lastWrittenVersion, so only a write that is
+	// strictly newer than whatever is already on disk is ever allowed to
+	// land.
+	lastWrittenVersion uint64
 }
 
 // Open constructs a Store, seeding its in-memory Index from path (leniently
@@ -534,15 +552,37 @@ func (s *Store) Snapshot() *Index {
 }
 
 // flushLocked writes the current in-memory index to disk. Callers must hold
-// s.mu. Used by the immediate-flush write paths (Upsert/Remove/RemoveFile);
+// s.mu -- reading s.idx directly (rather than a standalone snapshot) is safe
+// only because of that: nothing else can mutate it concurrently while this
+// runs. Used by the immediate-flush write paths (Upsert/Remove/RemoveFile);
 // MarkUsed's debounced path snapshots and flushes OUTSIDE the lock instead
-// (flushSnapshot below), matching swap_persist.go's flushPersist shape.
+// (flushIfDue below), matching swap_persist.go's flushPersist shape -- which
+// is exactly why both funnel through writeSnapshot's version guard rather
+// than calling writeIndexFile directly.
 func (s *Store) flushLocked() error {
-	err := writeIndexFile(s.path, s.idx)
-	if err != nil {
-		s.logf("[cacheindex] failed to persist %s: %v", s.path, err)
+	s.version++
+	return s.writeSnapshot(s.idx, s.version)
+}
+
+// writeSnapshot persists idx to disk at the given version, serialized
+// through flushMu (so flushLocked's mu-held write and flushIfDue's unlocked
+// write can never race each other's os.Rename) and guarded against staleness:
+// a version at or below lastWrittenVersion means a write for an EQUAL OR
+// NEWER state already reached disk, so this call is a no-op rather than a
+// clobber. See the Store.lastWrittenVersion doc comment for the exact
+// scenario this closes.
+func (s *Store) writeSnapshot(idx *Index, version uint64) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if version <= s.lastWrittenVersion {
+		return nil
 	}
-	return err
+	if err := writeIndexFile(s.path, idx); err != nil {
+		s.logf("[cacheindex] failed to persist %s: %v", s.path, err)
+		return err
+	}
+	s.lastWrittenVersion = version
+	return nil
 }
 
 // Upsert records or replaces the entry for (e.CacheDir, e.Model), flushing
@@ -637,14 +677,17 @@ func (s *Store) MarkUsed(cacheDir, model string, at time.Time) {
 	}
 	e.LastUsed = at
 	s.idx.entries[key] = e
+	s.version++
 	s.mu.Unlock()
 	s.flushIfDue()
 }
 
-// flushIfDue debounces MarkUsed's disk write, mirroring
-// swap_persist.go's persistIfDue shape exactly (a separate flushMu so the
-// debounce check/update never blocks a MarkUsed caller on I/O, and the
-// snapshot-then-write happens outside s.mu).
+// flushIfDue debounces MarkUsed's disk write, mirroring swap_persist.go's
+// persistIfDue shape exactly (a separate flushMu so the debounce check/
+// update never blocks a MarkUsed caller on I/O, and the snapshot-then-write
+// happens outside s.mu) -- with the snapshot's version captured under s.mu
+// alongside it, so writeSnapshot can detect and no-op a write that has gone
+// stale by the time it actually reaches disk (see Store.lastWrittenVersion).
 func (s *Store) flushIfDue() {
 	now := s.now()
 	s.flushMu.Lock()
@@ -658,10 +701,9 @@ func (s *Store) flushIfDue() {
 	}
 	s.mu.Lock()
 	snapshot := s.idx.snapshot()
+	version := s.version
 	s.mu.Unlock()
-	if err := writeIndexFile(s.path, snapshot); err != nil {
-		s.logf("[cacheindex] failed to persist %s: %v", s.path, err)
-	}
+	_ = s.writeSnapshot(snapshot, version)
 }
 
 // errEmptyKey is Upsert's validation error for a caller that forgot to set

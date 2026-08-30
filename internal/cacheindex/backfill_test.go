@@ -224,6 +224,52 @@ func TestReconcileScanPreservesRepoKeyedGGUFPullEntry(t *testing.T) {
 	}
 }
 
+// TestReconcileScanPreservesRepoKeyedGGUFPullEntryInSubdirectory pins
+// citadel #937's fix: a llamacpp pull whose GGUF lives in a subdirectory of
+// the cache dir (a real repo-tree shape, not hypothetical) records its
+// Files entry using the repo-relative path INCLUDING the subdirectory
+// (e.g. "sub/model.gguf" -- see recordLlamaCppCacheIndexEntry). Before the
+// fix, scanGGUFDir only read the top level, so this file was never
+// rediscovered and the repo-keyed pull entry was dropped as "stale" on the
+// very next ReconcileScan (e.g. every `citadel work` restart), even though
+// the bytes were still on disk.
+func TestReconcileScanPreservesRepoKeyedGGUFPullEntryInSubdirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, services.LlamaCppCacheDirName, "sub", "model.gguf"), "aaaa")
+
+	storeDir := t.TempDir()
+	s := Open(filepath.Join(storeDir, FileName), nil)
+	if err := s.Upsert(Entry{
+		CacheDir: services.LlamaCppCacheDirName,
+		Family:   services.CacheFamilyGGUFDir,
+		Model:    "TheBloke/Sub-GGUF",
+		Engine:   "llamacpp",
+		Files:    []string{"sub/model.gguf"},
+		Source:   SourcePull,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ReconcileScan(root); err != nil {
+		t.Fatalf("ReconcileScan: %v", err)
+	}
+
+	idx := s.Snapshot()
+	e, ok := idx.Lookup(services.LlamaCppCacheDirName, "TheBloke/Sub-GGUF")
+	if !ok {
+		t.Fatalf("expected the repo-keyed pull entry (subdirectory file) to survive the scan")
+	}
+	if e.Source != SourcePull || len(e.Files) != 1 || e.Files[0] != "sub/model.gguf" {
+		t.Fatalf("expected the pull entry untouched, got %+v", e)
+	}
+
+	// No duplicate entry keyed by the subdirectory-relative path -- it's
+	// already claimed by the repo-keyed pull entry above.
+	if _, ok := idx.Lookup(services.LlamaCppCacheDirName, "sub/model.gguf"); ok {
+		t.Errorf("expected no duplicate entry keyed by sub/model.gguf (already claimed by the repo-keyed pull entry)")
+	}
+}
+
 // TestReconcileScanNeverPrunesAnUnscannableDir pins the second half of the
 // same review finding: a cache_dir this scan could not read (missing, or --
 // in production -- an operator HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE/HF_HOME
