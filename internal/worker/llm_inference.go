@@ -1030,13 +1030,25 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	if len(payload.Stop) > 0 {
 		reqPayload["stop"] = payload.Stop
 	}
-	// Tool calling (citadel-cli#603, aceteam #6555): only attach `tools`/
-	// `tool_choice` when the job payload actually carries them, so a text-only
-	// request's outbound body gains no new keys -- vLLM/llama.cpp/bonsai's
-	// OpenAI-compatible /v1/chat/completions already accept both natively.
-	if len(payload.Tools) > 0 {
+	// Tool calling (citadel-cli#603, aceteam #6555, citadel-cli#933): only
+	// attach `tools`/`tool_choice` when the job payload actually carries them,
+	// so a text-only request's outbound body gains no new keys --
+	// vLLM/llama.cpp/bonsai's OpenAI-compatible /v1/chat/completions already
+	// accept both natively. hasToolCalls -- not a bare len(payload.Tools) > 0
+	// -- gates `tools` for the same reason it gates m.ToolCalls above: a
+	// literal `"tools": null` (4 bytes) or `"tools": []` (2 bytes) both pass a
+	// bare length check despite meaning "no tools", so a payload carrying
+	// either forwarded a `"tools": null`/`"tools": []` key to the engine
+	// instead of omitting it (citadel-cli#933; the ollama path already got
+	// this right at its own hasToolCalls(payload.Tools) call above). `tools`
+	// is an OpenAI array like tool_calls, so hasToolCalls' array-unmarshal
+	// check applies directly. `tool_choice` is NOT an array (OpenAI's shape is
+	// a string -- "auto"/"none"/"required" -- or an object), so it uses
+	// hasJSONValue instead, which only rejects an explicit null/empty value
+	// rather than requiring array shape.
+	if hasToolCalls(payload.Tools) {
 		reqPayload["tools"] = payload.Tools
-		if len(payload.ToolChoice) > 0 {
+		if hasJSONValue(payload.ToolChoice) {
 			reqPayload["tool_choice"] = payload.ToolChoice
 		}
 	}
@@ -1301,6 +1313,23 @@ func hasToolCalls(raw json.RawMessage) bool {
 		return false
 	}
 	return len(arr) > 0
+}
+
+// hasJSONValue reports whether raw carries a meaningful JSON value, as
+// opposed to being absent or an explicit `null`. Unlike hasToolCalls, it does
+// NOT require an array shape -- it exists for fields like tool_choice, whose
+// OpenAI shape is a string ("auto"/"none"/"required") or an object (a
+// specific tool selection), never an array, so hasToolCalls' array-unmarshal
+// check would (incorrectly) reject every legitimate value. A bare
+// len(raw) > 0 check is still not enough on its own: the literal JSON `null`
+// is 4 bytes, so it would pass and forward a `"tool_choice": null` key the
+// same way the bare len() check on `tools` did before citadel-cli#933.
+func hasJSONValue(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	trimmed := bytes.TrimSpace(raw)
+	return string(trimmed) != "null"
 }
 
 // toolCallDelta is one entry in an OpenAI streaming delta.tool_calls array

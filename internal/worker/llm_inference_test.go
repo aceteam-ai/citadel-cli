@@ -1042,6 +1042,65 @@ func TestLLMInferenceHandler_ToolsForwardedInRequest(t *testing.T) {
 	}
 }
 
+// TestLLMInferenceHandler_ToolsRequestByteIdenticalWithExplicitNullTools is
+// the citadel-cli#933 regression test: a payload carrying a LITERAL
+// `"tools": null` (as opposed to no "tools" key at all, which
+// TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools already
+// covers) must still omit the "tools"/"tool_choice" keys from the outbound
+// engine request. Before #933's fix, executeChatCompletionsAt gated on a bare
+// len(payload.Tools) > 0 -- json.RawMessage("null") is 4 bytes, so it passed
+// that check and forwarded a literal `"tools": null` to the engine.
+func TestLLMInferenceHandler_ToolsRequestByteIdenticalWithExplicitNullTools(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		tools any
+	}{
+		{name: "explicit null", tools: nil},
+		{name: "empty array", tools: []any{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["bonsai"] = ts.URL
+
+			job := &Job{
+				ID:   "job-null-tools",
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model":       "m",
+					"backend":     "bonsai",
+					"messages":    []map[string]any{{"role": "user", "content": "hi"}},
+					"tools":       tc.tools,
+					"tool_choice": nil,
+				},
+			}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+
+			if v, present := gotReq["tools"]; present {
+				t.Errorf("outbound request tools = %#v (present=%v), want no \"tools\" key", v, present)
+			}
+			if v, present := gotReq["tool_choice"]; present {
+				t.Errorf("outbound request tool_choice = %#v (present=%v), want no \"tool_choice\" key", v, present)
+			}
+		})
+	}
+}
+
 // TestLLMInferenceHandler_BufferedToolCallsResponse asserts that a buffered
 // (non-streaming) engine response carrying message.tool_calls surfaces them
 // on JobResult.Output, with finish_reason forwarded as "tool_calls" and no
