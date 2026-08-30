@@ -3,6 +3,11 @@
 Status: DRAFT for review. No code in this doc; it defines the shape of the fix so
 the phased issues below can be filed and implemented independently.
 
+> **Update 2026-08-30:** P0 and P1 (plus P4's `hfCacheBaseDir()` sync and P6's
+> llamacpp half) have SHIPPED — see §7 for what landed and where. §8 is the
+> implementation design for P2 (the durable cache index), appended after the
+> original draft; §§1–6 are left as written and describe the pre-P0 state.
+
 ## 1. Current state
 
 ### 1.1 Where weights live today
@@ -375,3 +380,366 @@ as a prerequisite, and nothing about it can be honest before P2 and P4 exist.
    P2 index now, or leave it as a documented, unindexed exception? It writes
    into `~/citadel-cache/<model_type>/<file>` today, outside this design's
    index unless explicitly included.
+
+## 7. Status update (2026-08-30): what shipped since the draft
+
+Verified against the code on `main` (not restated from memory — the function
+names below are the authorities; read them, not this list, for exact behavior):
+
+- **P0 shipped (#904).** `internal/jobs.canonicalHFCacheDir()` is the one
+  place the canonical container-mounted HF path is computed;
+  `hfDownloadEnv()` sets `HF_HOME` on the pull subprocess (respecting any
+  operator override of the four HF env vars), and
+  `warnIfLegacyHFCacheExists()` reports the pre-fix duplicate once,
+  informationally. **P4 was folded into P0** rather than staying a separate
+  phase: `hfCacheBaseDir()`'s final fallback resolves through
+  `canonicalHFCacheDir()`, so the disk preflight, the already-cached netting
+  (#840), and the actual download can no longer disagree.
+- **P1 shipped (#912/#906).** `services/caches.go` (`EngineCacheDirs`,
+  `CacheFamily`, the `HFHubCacheDirName`/`LlamaCppCacheDirName`/
+  `BonsaiCacheDirName` constants), pinned against every embedded compose
+  mount by `TestEngineCacheDirsMatchComposeMounts`. llamacpp is now routed
+  through `pullLlamaCppGGUF` (raw `--local-dir` GGUF layout into
+  `llamaCppCacheDir()`, with `runGGUFDiskPreflight` netting against
+  `alreadyCachedGGUFBytes`) instead of `pullHuggingFace`.
+- **P6's llamacpp half shipped with P1.** `evictLlamaCppGGUF`
+  (`internal/jobs/model_cache_evict.go`) evicts an exact cached filename
+  from the raw GGUF dir. The rest of P6 (bonsai eviction, resolving a repo
+  id to "whichever files belong to it") is exactly what the P2 index
+  unlocks — see §8.4.
+- **Not shipped:** P2 (this design, §8), P3 (reporting), P5 (GC), P7
+  (`warm_on_demand`).
+
+## 8. P2 implementation design: the durable cache index (#682 P2 / #683 prerequisite)
+
+P2 gives the node a durable answer to "which files on disk belong to which
+pulled model" — the record that §1.3 established does not exist anywhere
+today, and without which P3's reporting is a `du -sh` guess, P5's GC cannot
+safely delete anything, P6 cannot resolve a repo id to its files, and P7's
+weights-present clause cannot be answered honestly.
+
+### 8.1 What the index records
+
+One entry per cached artifact. The **primary key is `(cache_dir, model)` —
+deliberately NOT `(engine, model)`**: seven engines share the
+`huggingface` bucket (`services.EngineCacheDirs`), so an entry keyed by
+engine would either duplicate a shared repo seven times or force a fake
+"owning engine" onto a directory the layout says is shared. `engine` is
+recorded as provenance (who pulled it), not identity.
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "cache_dir": "huggingface",
+      "family": "hf-hub",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "engine": "vllm",
+      "files": ["hub/models--meta-llama--Llama-3.1-8B-Instruct"],
+      "size_bytes": 16800000000,
+      "pulled_at": "2026-08-20T10:00:00Z",
+      "last_used": "2026-08-27T14:32:00Z",
+      "source": "pull"
+    },
+    {
+      "cache_dir": "llamacpp",
+      "family": "gguf-dir",
+      "model": "TheBloke/Llama-2-7B-GGUF",
+      "engine": "llamacpp",
+      "files": ["llama-2-7b.Q4_K_M.gguf", "config.json"],
+      "size_bytes": 4080000000,
+      "pulled_at": "2026-08-29T08:00:00Z",
+      "source": "pull"
+    }
+  ]
+}
+```
+
+**`files` semantics differ per `CacheFamily`, matching how each family's
+provenance actually works** (this is the §2.2 draft made concrete against
+the shipped P1 layout table):
+
+- **`hf-hub`**: ONE directory path, the `models--<org>--<repo>` dir relative
+  to the resolved hub dir — the same dir `hfCacheDir(modelName)` resolves
+  and `evictHuggingFace` already `os.RemoveAll`s. Directory-level provenance
+  is exact in the hub layout (the naming convention IS the provenance, as
+  #840 established); recording per-blob paths would fight the
+  content-addressed blob store, where blobs dedup across repos and snapshot
+  hashes churn. Stored relative to the hub dir, not absolute, so an
+  operator's `HF_HUB_CACHE` override doesn't strand entries.
+- **`gguf-dir`**: the explicit repo-relative file paths this pull's own
+  files landed at. These are FREE at pull time: `hfRepoTreeFn`
+  (`internal/jobs/hf_repo_size.go`) already fetches the repo tree with
+  per-entry `Path`s for the disk preflight, and `alreadyCachedGGUFBytes`
+  already matches those same paths on disk — the index write records the
+  post-pull intersection (tree entries passing `patternsInclude` that exist
+  under `llamaCppCacheDir()`), i.e. exactly the provenance rule #906 already
+  trusts, now persisted. If the tree fetch failed (the preflight's
+  fail-open path), fall back to the before/after file-list diff of the
+  directory walk `dirTotalSize` already performs — coarser (a concurrent
+  pull could cross-attribute) but honest for the single-writer lane (§8.2).
+  Bonsai records its one fixed file (`bonsaiGGUFFile`).
+- **`native` (ollama)**: `files` empty. Ollama's store is its own
+  provenance; `ollama rm <model>` is the evictor and `ollamaModelSize` the
+  sizer. The entry still carries model/size/timestamps so reporting and GC
+  ordering see ollama models without parsing `ollama list` on every read.
+- **`native` (lmstudio, tei)**: one aggregate per-store entry
+  (`model: "_store"`, size only, `files` empty, never GC-evictable via the
+  index). These stores have no Go-side pull path at all; the entry exists so
+  P3's reporting has a size row, nothing more.
+
+**`last_used` — separate from `swap-lru.json`, as §2.2 already decided**
+(VRAM-residency-by-engine vs disk-weights-by-model; different axis,
+different lifecycle — do not unify them, and do not seed one from the
+other: swap-lru's key is an engine name, which for the shared hf-hub bucket
+does not identify a model). P2a's signal, in order of precision:
+
+1. A pull sets `last_used = pulled_at`.
+2. A heartbeat-tick reconciler ("resident-implies-used"): on the existing
+   `OnStatus` fan-out (`SetOnStatus`, the #612/#416 precedent — no new
+   sweeps), mark the models each RUNNING engine is currently serving (the
+   `services[].models` already on the assembled status) as used, debounced
+   (§8.2). Coarse — residency ≠ requests — but strictly truthful in the
+   direction GC needs: a model being actively served is never allowed to
+   look cold. Per-request precision (touching from
+   `status.RecordEngineRequest`'s call sites, which know the model on the
+   gateway/worker dispatch paths) is a P5-adjacent refinement, deferred
+   until GC actually needs to discriminate among resident models.
+
+Filesystem atime stays rejected (relatime/noatime, §2.2). `pinned` from
+§3.1 is RESERVED in the schema but not written by P2a — pinning lands with
+GC (P5), where it has a consumer.
+
+### 8.2 Location, ownership, format, concurrency
+
+**Path:** `<network.GetNodeConfigDir()>/cache-index.json`. NOT
+`platform.ConfigDir()` — the writer is the pull handler inside a
+(frequently systemd-root) `citadel work`; the readers include an
+interactive non-root `citadel status`. `ConfigDir()` resolves those to
+different directories and the reader sees nothing forever (the
+#726/#845/CLAUDE.md bug class). `swap-lru.json` (`cmd/hotswap.go` wiring)
+and `aepSigningStoreDir` (`internal/worker/llm_inference.go`) are the two
+shipped precedents; this follows them.
+
+**Package:** NEW `internal/cacheindex`, a LEAF that takes an explicit path
+(mirroring `nodeidentity.Store`) — it imports `services` (for
+`EngineCacheDirs`/`CacheFamily`) and stdlib only. Callers resolve
+`network.GetNodeConfigDir()` themselves; `internal/jobs` already imports
+`internal/network` (`cobrowse_session.go`), so no hook indirection is
+needed, but the handlers reach the store through an injectable package var
+(`cacheIndexFn`, mirroring `llamaCppCacheDirFn`/`hfCacheModelSizeFn`'s
+existing test seams in the same file) so tests never touch the real node
+config dir.
+
+**Format:** versioned JSON (`{"version":1,"entries":[...]}`). Reads are
+LENIENT per entry — a malformed entry degrades to "absent", never fails the
+load, and a missing/corrupt file degrades to an empty index (the #815
+`TokenHashEntry` reasoning, already reapplied by `loadLastUsedFile` in
+`swap_persist.go`). Writes are atomic (temp file + rename in the same dir).
+Pull/evict mutations flush immediately (they're rare and each one matters);
+`MarkUsed` from the heartbeat reconciler is debounced (`persistMinGap`
+analogue, `swap_persist.go:166`'s `persistIfDue` pattern) since it fires
+every ~30s tick.
+
+**Concurrency — verified against the #908 lane membership, not assumed:**
+
+- `MODEL_CACHE_PULL` is in `unboundedJobTypes` and therefore in
+  `serializedLaneJobTypes` (`internal/worker/deadline.go:59-115`, pinned by
+  `TestSerializedLaneJobTypes`) — it executes on the exec-concurrency-1
+  serialized lane. `SERVICE_START` (whose `ensureOllamaModel` is a pull
+  site, §8.3) is too. So all but one index-writing job type already have
+  the single-writer guarantee the manifest writers rely on.
+- **`MODEL_CACHE_EVICT` is NOT a member** — today it executes on the inline
+  branch and can run CONCURRENTLY with a lane pull. That is already a live
+  (pre-index) hazard: `llamaCppPullSucceeded`'s clamp comment
+  (`model_cache_pull.go:325-329`) documents a concurrent eviction mid-pull
+  corrupting the before/after accounting, and an `os.RemoveAll` racing an
+  in-progress `hf download` into the same hub dir is worse than an
+  accounting bug. **P2a adds `JobTypeModelCacheEvict` to
+  `serializedLaneJobTypes`** — exactly what that set's own doc comment
+  instructs for a new shared-state writer ("extend THIS set, not the
+  routing check") — and updates `TestSerializedLaneJobTypes`. Cost: an
+  evict queues behind a multi-GB pull on the exec-1 lane; acceptable, since
+  evicting mid-pull was never safe anyway (flagged as an open question,
+  §8.7).
+- Cross-process: index WRITES are worker-owned (pull/evict handlers, the
+  heartbeat reconciler, the startup backfill — all inside `citadel work`).
+  Interactive commands (`citadel status`, P2b) are read-only and never
+  self-heal-write (they log staleness instead) — same reasoning as
+  `citadel whoami --node-dir` skipping the identity cache write. The
+  control-center TUI's own consume loop is the same second-door the #832
+  reservation reconcile documents (`ReconcileOrphanedReservations`' doc
+  comment); a CC-driven pull writing the index concurrently with a
+  `citadel work` writer is bounded by read-merge-write-rename to a lost
+  update, which the staleness self-heal (§8.5) repairs. Documented, not
+  fixed here — same posture as #832.
+
+**Best-effort, and which direction of error is safe (the #739 discipline,
+stated up front):** a failed index write is logged, never fatal — the
+pull/evict still succeeds, mirroring `catalog.UpsertLockEntry`'s posture and
+`persistLogf`. The resulting false NEGATIVE (a genuinely-cached model
+missing from the index) degrades to: preflights/`warm_on_demand` treat it as
+not-cached (a redundant, idempotent re-pull at worst — `hf download`
+re-fetches nothing), and GC skips it (a missed reclaim, never a wrong
+delete). The dangerous direction — a STALE entry claiming files that are
+gone or attributing files that belong to something else — is guarded not by
+write reliability but by **verify-before-act** (§8.4/§8.5): any consumer
+about to delete or report re-stats the entry's recorded paths first.
+Recording exact paths at pull time (§8.1) is what makes cross-attribution
+structurally impossible for gguf-dir, and the hub layout's own naming makes
+it impossible for hf-hub.
+
+### 8.3 Every write site (enumerated, per the #739 lesson: any pull path not wired is invisible)
+
+| Site | File | Index op |
+|---|---|---|
+| `pullHuggingFace` (vllm) | `internal/jobs/model_cache_pull.go` | Upsert hf-hub entry on the post-`hfCacheModelSize` success path |
+| `pullLlamaCppGGUF` | `internal/jobs/model_cache_pull.go` | Upsert gguf-dir entry (tree-verified file list, §8.1) on success |
+| `pullBonsai` | `internal/jobs/model_cache_pull.go` | Upsert gguf-dir entry (the one `bonsaiGGUFFile`) on the post-`verifyDownloadedFile` success path |
+| `pullOllama` | `internal/jobs/model_cache_pull.go` | Upsert native entry (size via `ollamaModelSize`) |
+| `ensureOllamaModel` (#543, the SERVICE_START native-ollama pull) | `internal/jobs/service_handler.go:1252` | Upsert native entry when its pull actually ran — **the one pull site NOT inside `MODEL_CACHE_PULL`**; missing it reopens #739's gap under a new name |
+| `evictOllama` | `internal/jobs/model_cache_evict.go` | Remove entry on success |
+| `evictHuggingFace` | `internal/jobs/model_cache_evict.go` | Remove entry on success |
+| `evictLlamaCppGGUF` | `internal/jobs/model_cache_evict.go` | Remove the file from its entry's `files`; drop the entry when empty |
+
+**Known NON-sites, named so nobody hunts for missing wiring later:**
+
+- `selfProvisioningEngines` (tei/diffusers/kokoro/transcribe/unlimited-ocr/
+  extraction): the CONTAINER downloads weights inside `docker compose up` —
+  invisible to Go by construction (the same observability wall #717's
+  "whether a swap pulled" gap documents). No pull-time write is possible;
+  the backfill/staleness scan (§8.5) is how these enter the index, tagged
+  `source: "backfill"`.
+- Engine first-start downloads for vllm etc. when no `MODEL_CACHE_PULL`
+  preceded them: same wall, same answer (backfill).
+- `DOWNLOAD_MODEL` (`internal/jobs/download_model.go`): stays unindexed per
+  §6 Q5 unless Jason says otherwise (§8.7).
+
+### 8.4 Read API — designed so P3/P5/P6/P7 are thin consumers
+
+```go
+package cacheindex
+
+func Load(path string) (*Index, error)            // lenient; empty on missing/corrupt
+func Open(path string) *Store                     // the write handle (worker-only)
+
+// Reads (on *Index):
+func (ix *Index) Lookup(cacheDir, model string) (Entry, bool)
+func (ix *Index) LookupForEngine(engine, model string) (Entry, bool)
+    // resolves engine -> cacheDir via services.EngineCacheDirs, then Lookup
+func (ix *Index) FilesFor(cacheDir, model string) []string   // exact-provenance eviction (P6)
+func (ix *Index) EntriesByDir() map[string][]Entry           // reporting (P3)
+func (ix *Index) LeastRecentlyUsed() []Entry                 // GC ordering (P5)
+func (ix *Index) Verify(e Entry) (Entry, bool)               // re-stat recorded paths; false = stale
+
+// Writes (on *Store, mutex-guarded, atomic temp+rename):
+func (s *Store) Upsert(e Entry) / Remove(cacheDir, model string) / RemoveFile(...)
+func (s *Store) MarkUsed(cacheDir, model string, at time.Time)   // debounced flush
+func (s *Store) ReconcileScan(cacheRoot string) error            // backfill, §8.5
+```
+
+What each follow-on consumes (hooks designed here; features NOT built here):
+
+- **P6, exact-provenance eviction:** `MODEL_CACHE_EVICT` for a gguf repo id
+  (which `evictLlamaCppGGUF` today honestly refuses) becomes
+  `FilesFor("llamacpp", repoID)` → remove each verified file → `RemoveFile`.
+  Bonsai eviction is the same three lines. The existing exact-filename path
+  stays as the index-miss fallback.
+- **P3, honest reporting:** `printCacheInfo` (`cmd/status.go:565`, the
+  display-only `du -sh`) gains per-model rows from `EntriesByDir()` with the
+  `du` totals kept as the "unindexed remainder" cross-check (index total vs
+  du total diverging IS the duplicate/orphan signal #682 items 3–4 want).
+  Heartbeat: a `NodeStatus.Cache` field fed the same way, additive/omitempty
+  (the `SwapActivity` wiring pattern, including the atomic-pointer lesson).
+- **P5, GC:** `LeastRecentlyUsed()` + `Verify` + the §3 never-evict-resident
+  cross-check against `status.DiscoverLocalEngines`. GC never trusts an
+  entry without `Verify`, per §8.2's direction-of-error rule.
+- **P7, weights-present:** `LookupForEngine(engine, resolvedModel)` +
+  `Verify`, falling back to the live canonical-path existence check for a
+  node whose index hasn't backfilled — the fallback §4 already specified.
+
+### 8.5 Migration/backfill and staleness
+
+**Backfill:** `Store.ReconcileScan(cacheRoot)` runs at every `citadel work`
+startup (in `runWork`, after `worklock.Acquire`, beside
+`ReconcileOrphanedReservations` — same single-live-worker precondition,
+same call-site reasoning). Idempotent: it never overwrites a richer
+`source:"pull"` entry with a backfill one. Per family:
+
+- hf-hub: enumerate `models--*` dirs under the resolved hub dir
+  (`hfCacheBaseDir()`); the model id is recoverable by reversing the
+  `models--org--repo` sanitization. Size via the same walk
+  `hfCacheModelSize` does.
+- gguf-dir (llamacpp, bonsai): one entry per file; `model` = filename (the
+  repo id is NOT recoverable from a bare file — accepted; eviction by
+  exact filename already works for these).
+- ollama: `ollama list` (reusing `ollamaModelSize`'s parse).
+- other native: the aggregate `_store` row (§8.1).
+
+Backfilled entries set `pulled_at` from file **mtime** — a real signal for
+downloaded files (unlike atime) — and leave `last_used` EMPTY, meaning
+**unknown, not "never"**. This matters for P5 in both directions: unknown
+must not read as coldest (or every pre-index model gets evicted first — the
+inverse of #632's "no record must not read as recently loaded" rule, same
+class), so GC orders unknowns by `pulled_at` mtime, after any entry with a
+real `last_used` older than it, never as an automatic front-of-queue.
+
+**Staleness / out-of-band changes:**
+
+- Files REMOVED out-of-band (operator `rm`, a container's own cache
+  management): `Verify` catches it at the point of use; the worker-side
+  store additionally drops verified-stale entries at each startup scan
+  (logged). Read-only CLI readers report the entry as stale rather than
+  writing (§8.2).
+- Files ADDED out-of-band (container first-start downloads, operator
+  copies): picked up by the next startup `ReconcileScan`. There is
+  deliberately NO periodic mid-run rescan — a du-scale walk on a tick is
+  exactly the extra sweep the #416 reconciler design avoided; the startup
+  scan plus pull-time writes keep the index honest to within one worker
+  restart, and every consumer that ACTS re-verifies anyway.
+
+### 8.6 Phased plan (P2a is one Sonnet-sized PR)
+
+**P2a — the index (one PR):**
+
+| Change | File(s) |
+|---|---|
+| `Entry`/`Index`/`Store`, lenient load, atomic+debounced write, `Verify`, `ReconcileScan` | NEW `internal/cacheindex/cacheindex.go`, `backfill.go`, `cacheindex_test.go` |
+| Injectable store seam + wire the 4 pull sites and 3 evict sites (§8.3 table) | `internal/jobs/model_cache_pull.go`, `model_cache_evict.go` (a `cacheIndexFn` package var beside `llamaCppCacheDirFn`) |
+| Wire `ensureOllamaModel` | `internal/jobs/service_handler.go` |
+| `JobTypeModelCacheEvict` → `serializedLaneJobTypes` | `internal/worker/deadline.go` + `TestSerializedLaneJobTypes` |
+| Startup: `Open(GetNodeConfigDir()/cache-index.json)` + `ReconcileScan`; register the `OnStatus` MarkUsed reconciler | `cmd/work.go` |
+| Tests: lenient parse, atomic write, verify-self-heal, backfill against a fixture tree, handler-write-on-success (via the seam), lane membership | the `_test.go` files above |
+
+**P2b (next PR):** `printCacheInfo` reads the index + du-remainder
+cross-check; heartbeat `NodeStatus.Cache` (this is P3, split so P2a stays
+node-internal with zero heartbeat-schema change).
+
+**Later, unchanged from §5:** P5 GC (now buildable on
+`LeastRecentlyUsed`/`Verify` + pinning), P6 completeness
+(`FilesFor`-driven repo-id eviction, bonsai evict), P7.
+
+### 8.7 Open questions for Jason (P2 additions to §6)
+
+1. **Index format/unification:** single versioned JSON file at
+   `GetNodeConfigDir()/cache-index.json` (proposed, mirroring
+   swap-lru.json), vs JSONL, vs folding into one combined node-state file
+   with swap-lru. Proposal: separate file, same dir — different lifecycle,
+   and swap-lru's schema is deliberately not model-keyed.
+2. **`MODEL_CACHE_EVICT` onto the serialized lane:** accept that an evict
+   can queue behind a multi-GB pull on the exec-1 lane? (The alternative —
+   leaving it inline — keeps the existing evict-races-pull hazard AND makes
+   the index a multi-writer file.)
+3. **`last_used` v1 fidelity:** is resident-implies-used at heartbeat
+   granularity (§8.1) sufficient for P5's LRU, or should per-request
+   touches (via the `RecordEngineRequest` call sites) be a P2a requirement
+   before GC is allowed to ship?
+4. **Backfilled-entry GC eligibility:** mtime-as-`pulled_at` ordering
+   (§8.5) OK, or should `source:"backfill"` entries be exempt from GC v1
+   entirely (safer, but the pre-index weights are precisely the ones most
+   likely to be forgotten disk hogs)?
+5. **GC default budget (carries §6 Q2 forward):** disk-percent trigger at
+   90% via resmon's existing signal, or an absolute size budget per cache
+   dir?
+6. **`DOWNLOAD_MODEL` (carries §6 Q5 forward):** still leave unindexed?
