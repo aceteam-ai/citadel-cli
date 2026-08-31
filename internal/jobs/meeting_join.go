@@ -524,6 +524,31 @@ func NewMeetingJoinHandler(workspace string) *MeetingJoinHandler {
 	}
 }
 
+// SetConfigDir wires citadel#891's readiness-failure diagnosis and VRAM
+// preflight (meeting_vram_diagnosis.go) to a live status.NodeStatus
+// collection rooted at configDir. It forwards to the internal transcriber
+// (transcriber is unexported so both the top-of-Execute meeting preflight
+// and every rolling/batch transcribe pass share the identical collector),
+// so both handlers this package exposes agree on one status source. A no-op
+// on a handler with no transcriber (a hand-built test struct); leaving it
+// unset keeps diagnosis/preflight inert, matching the pre-#891 behavior.
+func (h *MeetingJoinHandler) SetConfigDir(configDir string) {
+	if h.transcriber != nil {
+		h.transcriber.ConfigDir = configDir
+	}
+}
+
+// ConfigDir reports the value SetConfigDir last wired (empty if never
+// called, or if the handler has no transcriber). Exists primarily so
+// construction-site tests (internal/worker) can assert the wiring reached
+// the internal transcriber without depending on the unexported field.
+func (h *MeetingJoinHandler) ConfigDir() string {
+	if h.transcriber == nil {
+		return ""
+	}
+	return h.transcriber.ConfigDir
+}
+
 // Execute runs the full join → record → transcribe lifecycle and returns a JSON
 // document (transcript + wav path + status). The browser and null sink are torn
 // down on every exit path, including errors.
@@ -535,6 +560,21 @@ func (h *MeetingJoinHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
+
+	// citadel#891: refuse fast, BEFORE joining the call, if the payload
+	// declares a VRAM budget this node's transcription stack cannot fit --
+	// joining, recording, and only then discovering transcription cannot run
+	// wastes the whole call. Inert today (the backend does not send
+	// vram_mb/vram_gb on MEETING_JOIN yet); see meeting_vram_diagnosis.go.
+	// h.transcriber is nil only for a hand-built test struct that never
+	// reaches this far (every real construction goes through
+	// NewMeetingJoinHandler).
+	if h.transcriber != nil {
+		if err := checkVRAMPreflight(ctx, job.Payload, h.transcriber.collectStatusForDiagnosis); err != nil {
+			return nil, err
+		}
+	}
+
 	ctx.Log("info", "     - [Job %s] MEETING_JOIN %s (id=%s, bot=%q)", job.ID, p.MeetingURL, p.MeetingID, p.BotDisplayName)
 
 	// Pick the media backend for this run: the containerized meeting module when

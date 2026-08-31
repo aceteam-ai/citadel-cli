@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 func TestParseMeetingJoinParams_Valid(t *testing.T) {
@@ -393,6 +394,65 @@ func TestMeetingJoin_MissingWorkspace(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when workspace is unconfigured")
+	}
+}
+
+// TestMeetingJoin_VRAMPreflightRefusesBeforeJoining is citadel#891's
+// MEETING_JOIN-side preflight test: a payload-declared vram_mb budget this
+// node cannot fit must refuse with a structured VRAMRefusal BEFORE the
+// handler attempts to select/start a media backend (selectMedia is never
+// reached -- there is no fake newMedia injected, so a nil-pointer/real-
+// browser-launch failure here would prove the refusal did NOT happen early).
+func TestMeetingJoin_VRAMPreflightRefusesBeforeJoining(t *testing.T) {
+	h := NewMeetingJoinHandler(t.TempDir())
+	h.SetConfigDir("/unused") // exercised via the injected collectStatusFn below
+	h.transcriber.collectStatusFn = func() (*status.NodeStatus, error) {
+		return fakeContendedNodeStatus(), nil
+	}
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "m2",
+		Type: "MEETING_JOIN",
+		Payload: map[string]string{
+			"meeting_url": "https://meet.google.com/x",
+			"meeting_id":  "id1",
+			"vram_mb":     "4000", // needs 4GB; fakeContendedNodeStatus has ~2.4GB free
+		},
+	})
+	if err == nil {
+		t.Fatal("expected a VRAM preflight refusal")
+	}
+	var refusal *VRAMRefusal
+	if !errors.As(err, &refusal) {
+		t.Fatalf("error = %v (%T), want *VRAMRefusal", err, err)
+	}
+	if refusal.Reason != ReasonInsufficientVRAM {
+		t.Errorf("Reason = %q, want %q", refusal.Reason, ReasonInsufficientVRAM)
+	}
+}
+
+// TestMeetingJoin_VRAMPreflightNoOpWithoutPayloadField proves the shipped,
+// backend-never-sends-vram_mb config is untouched: no vram_mb/vram_gb in the
+// payload means the preflight never even calls the status collector. Tested
+// directly against checkVRAMPreflight (the exact function MEETING_JOIN's
+// Execute calls) rather than the full Execute path, so this stays hermetic
+// and never depends on a real browser/media backend being available.
+func TestMeetingJoin_VRAMPreflightNoOpWithoutPayloadField(t *testing.T) {
+	collectorCalled := false
+	collect := func() (*status.NodeStatus, error) {
+		collectorCalled = true
+		return fakeContendedNodeStatus(), nil
+	}
+
+	err := checkVRAMPreflight(JobContext{}, map[string]string{
+		"meeting_url": "https://meet.google.com/x",
+		"meeting_id":  "id1",
+	}, collect)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if collectorCalled {
+		t.Error("status collector was consulted despite no vram_mb/vram_gb in the payload")
 	}
 }
 

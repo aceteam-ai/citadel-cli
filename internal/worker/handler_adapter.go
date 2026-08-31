@@ -319,8 +319,16 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// default-ON meeting capability, NOT the files surface — registered with
 		// the workspace (so it can validate audio paths the way file handlers do)
 		// but OUTSIDE the FilesDisabled gate.
+		//
+		// ConfigDir is wired so citadel#891's readiness-failure diagnosis and
+		// VRAM preflight (meeting_vram_diagnosis.go) can collect live node
+		// status; empty opts.ConfigDir (no service handlers registered) leaves
+		// both pieces inert (no ConfigDir => no status source => skip), same as
+		// today's behavior.
+		transcribeHandler := jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)
+		transcribeHandler.ConfigDir = opts.ConfigDir
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, jobs.NewTranscribeAudioHandler(opts.WorkspaceDir)),
+			NewLegacyHandlerAdapter(JobTypeTranscribeAudio, transcribeHandler),
 		)
 
 		// Auto-join meeting notetaker (aceteam#5098): records the call into a
@@ -371,6 +379,9 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	h := jobs.NewMeetingJoinHandler(opts.WorkspaceDir)
 	h.ProfileDir = opts.MeetingProfileDir
+	// citadel#891: see the ConfigDir comment on the TRANSCRIBE_AUDIO
+	// registration above -- same wiring, same inert-when-empty behavior.
+	h.SetConfigDir(opts.ConfigDir)
 	// Wire the during-call interactive layer (issue #5435) from the persisted
 	// meeting config (default-on, opt-out — same house convention as the meeting
 	// capability itself). The config accessors clamp non-positive cadence values
