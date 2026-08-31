@@ -50,11 +50,12 @@ var (
 
 // Swap outcomes recorded in the ledger.
 const (
-	swapOutcomeReady       = "ready"        // engine loaded and became ready
-	swapOutcomeWarming     = "warming"      // start issued; not ready before the background ceiling
-	swapOutcomeFailed      = "failed"       // the start (or an eviction) errored
-	swapOutcomeBlocked     = "blocked"      // could not proceed now (residency protection); nothing started
-	swapOutcomeRateLimited = "rate_limited" // refused by the swap rate bound; nothing started
+	swapOutcomeReady            = "ready"             // engine loaded and became ready
+	swapOutcomeWarming          = "warming"           // start issued; not ready before the background ceiling
+	swapOutcomeFailed           = "failed"            // the start (or an eviction) errored
+	swapOutcomeBlocked          = "blocked"           // could not proceed now (residency protection); nothing started
+	swapOutcomeRateLimited      = "rate_limited"      // refused by the swap rate bound; nothing started
+	swapOutcomePreflightBlocked = "preflight_blocked" // refused by the #956 serveability preflight; nothing started
 )
 
 // SwapRecord is one swap this node attempted. It records what the manager

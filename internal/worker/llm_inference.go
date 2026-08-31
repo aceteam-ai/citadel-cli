@@ -263,6 +263,15 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 			if errors.As(swapErr, &rateErr) {
 				return h.unavailable(payload.Model, "swap_rate_limited", swapErr), nil
 			}
+			// A serveability preflight refusal (citadel-cli#956): the image was
+			// GC'd, the weights were swept, or the disk is under pressure. Same
+			// posture as the rate-limit branch above -- a named, machine-readable
+			// reason, never a model_warming success that would just burn the
+			// wait budget on a pull that was always going to fail.
+			var preflightErr *SwapPreflightBlockedError
+			if errors.As(swapErr, &preflightErr) {
+				return h.unavailable(payload.Model, preflightErr.Reason, swapErr), nil
+			}
 			return h.failure(fmt.Errorf("model hotswap failed: %w", swapErr)), nil
 		}
 		if !outcome.Ready {

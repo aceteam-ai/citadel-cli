@@ -162,6 +162,19 @@ type SwapManager struct {
 	loadEstimate func(backend string) time.Duration
 	now          func() time.Time
 
+	// preflight decides whether `backend` is serveable before this swap starts
+	// it (citadel-cli#956, swap_preflight.go). Defaults to
+	// status.EngineServeablePreflight (reusing #955's image/weights/disk
+	// checks unmodified); overridden in tests to avoid depending on a real
+	// docker/podman daemon or real disk state.
+	preflight func(backend string, sys status.SystemMetrics) (blocked bool, reason string)
+	// diskMetrics supplies the disk reading preflight's disk-headroom check
+	// needs, WITHOUT running a full status.Collector.Collect() (memory + a
+	// 100ms CPU sample + disk) on every swap decision -- EnsureResident calls
+	// this on every on-demand swap, not once per ~30s heartbeat tick like the
+	// collector. Defaults to status.DiskMetricsOnly (disk.Usage("/") alone).
+	diskMetrics func() status.SystemMetrics
+
 	waitBudget    time.Duration
 	minResidency  time.Duration
 	backgroundMax time.Duration // ceiling on a background swap (releases the lock)
@@ -230,6 +243,8 @@ func NewSwapManager(ctrl SwapController, opts ...SwapManagerOption) *SwapManager
 		requiredVRAM:         func(b string) uint64 { return uint64(status.EngineVRAMEstimateMB(b)) * 1024 * 1024 },
 		loadEstimate:         defaultLoadEstimate,
 		now:                  time.Now,
+		preflight:            defaultSwapPreflight,
+		diskMetrics:          status.DiskMetricsOnly,
 		waitBudget:           swapWaitBudget,
 		minResidency:         swapMinResidency,
 		backgroundMax:        swapBackgroundMaxDur,
@@ -379,6 +394,17 @@ func (m *SwapManager) runSwap(op *swapOp) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), m.backgroundMax)
 	defer cancel()
+
+	// Serveability preflight (citadel-cli#956): runSwap only ever runs for a
+	// target that EnsureResident already confirmed is NOT resident (the
+	// resident-hit fast path returns before startOrJoin/runSwap are reached at
+	// all), so this is exactly "about to start a NEW engine". Checked BEFORE
+	// preemption so a genuinely unserveable target never evicts another
+	// resident engine to make room for a start that was always going to fail.
+	if blocked, reason := m.preflight(op.backend, m.diskMetrics()); blocked {
+		op.err = &SwapPreflightBlockedError{Backend: op.backend, Reason: reason}
+		return
+	}
 
 	// Plan and execute non-durable preemption to free VRAM.
 	if err := m.preempt(ctx, op); err != nil {
@@ -722,8 +748,12 @@ func (m *SwapManager) swapRecord(op *swapOp) SwapRecord {
 	case op.err != nil:
 		outcome = swapOutcomeFailed
 		var rateErr *SwapRateLimitedError
-		if errors.As(op.err, &rateErr) {
+		var preflightErr *SwapPreflightBlockedError
+		switch {
+		case errors.As(op.err, &rateErr):
 			outcome = swapOutcomeRateLimited
+		case errors.As(op.err, &preflightErr):
+			outcome = swapOutcomePreflightBlocked
 		}
 	case op.ready:
 		outcome = swapOutcomeReady

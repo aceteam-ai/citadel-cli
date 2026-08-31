@@ -412,3 +412,136 @@ func TestCollectInstalledEngines_AllChecksPassAdvertisedAsBefore(t *testing.T) {
 		t.Errorf("flag-off-equivalent JSON must not contain a swap_blocked key: %s", s)
 	}
 }
+
+// --- EngineServeablePreflight (citadel-cli#956) ----------------------------
+//
+// The exported entry point internal/worker's SwapManager.EnsureResident calls
+// before starting a NEW engine. It is a thin composition of the exact same
+// three checks collectInstalledEngines above already exercises, so these
+// tests focus on the composition (ordering, which reason wins, the fail-open
+// pass-through) rather than re-testing each check's own edge cases.
+
+func TestEngineServeablePreflight_WeightsMissingBlocks(t *testing.T) {
+	origImg, origWeights := engineImagePresentFn, engineWeightsPresentFn
+	engineImagePresentFn = func(string) bool { return true }
+	engineWeightsPresentFn = func(string) bool { return false } // cache swept
+	t.Cleanup(func() {
+		engineImagePresentFn = origImg
+		engineWeightsPresentFn = origWeights
+	})
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 100, DiskPercent: 40})
+	if !blocked {
+		t.Fatalf("expected blocked=true")
+	}
+	if reason != "weights_missing" {
+		t.Errorf("reason = %q, want %q", reason, "weights_missing")
+	}
+}
+
+func TestEngineServeablePreflight_DiskPressureBlocks(t *testing.T) {
+	origImg, origWeights := engineImagePresentFn, engineWeightsPresentFn
+	engineImagePresentFn = func(string) bool { return true }
+	engineWeightsPresentFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		engineImagePresentFn = origImg
+		engineWeightsPresentFn = origWeights
+	})
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 1, DiskPercent: 95})
+	if !blocked {
+		t.Fatalf("expected blocked=true")
+	}
+	if reason != "disk_pressure" {
+		t.Errorf("reason = %q, want %q", reason, "disk_pressure")
+	}
+}
+
+func TestEngineServeablePreflight_ImageMissingBlocks(t *testing.T) {
+	origImg, origWeights := engineImagePresentFn, engineWeightsPresentFn
+	engineImagePresentFn = func(string) bool { return false } // "GC'd"
+	engineWeightsPresentFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		engineImagePresentFn = origImg
+		engineWeightsPresentFn = origWeights
+	})
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 100, DiskPercent: 40})
+	if !blocked {
+		t.Fatalf("expected blocked=true")
+	}
+	if reason != "image_missing" {
+		t.Errorf("reason = %q, want %q", reason, "image_missing")
+	}
+}
+
+func TestEngineServeablePreflight_AllPassNotBlocked(t *testing.T) {
+	stubHotswapPreflightPass(t)
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 100, DiskPercent: 40})
+	if blocked {
+		t.Errorf("expected blocked=false, got reason %q", reason)
+	}
+	if reason != "" {
+		t.Errorf("reason = %q, want empty", reason)
+	}
+}
+
+// TestEngineServeablePreflight_CouldntDetermineFailsOpen pins the load-bearing
+// direction: EngineServeablePreflight must reuse engineImagePresentFn's own
+// "couldn't determine" classification unweakened -- a daemon-unreachable/
+// timeout/permission-denied result already reads as "present" from
+// engineImagePresentFn (fail open baked into the seam itself, see
+// runImageInspect's doc comment), and this composition must not add a second,
+// stricter interpretation on top.
+func TestEngineServeablePreflight_CouldntDetermineFailsOpen(t *testing.T) {
+	stubHotswapPreflightPass(t) // both underlying seams report "no signal -> present"
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{}) // no disk signal either
+	if blocked {
+		t.Errorf("expected blocked=false on an undeterminable signal (fail open), got reason %q", reason)
+	}
+	if reason != "" {
+		t.Errorf("reason = %q, want empty", reason)
+	}
+}
+
+func TestEngineServeablePreflight_OrderingWeightsBeforeImage(t *testing.T) {
+	// When both weights and image would block, weights_missing must win --
+	// pins the cheap-first ordering (weights/disk before the docker-shelling
+	// image check) rather than asserting it only by code inspection.
+	origImg, origWeights := engineImagePresentFn, engineWeightsPresentFn
+	engineImagePresentFn = func(string) bool { return false }
+	engineWeightsPresentFn = func(string) bool { return false }
+	t.Cleanup(func() {
+		engineImagePresentFn = origImg
+		engineWeightsPresentFn = origWeights
+	})
+
+	blocked, reason := EngineServeablePreflight("bonsai", SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 100, DiskPercent: 40})
+	if !blocked {
+		t.Fatalf("expected blocked=true")
+	}
+	if reason != "weights_missing" {
+		t.Errorf("reason = %q, want %q (weights checked before image)", reason, "weights_missing")
+	}
+}
+
+// --- DiskMetricsOnly --------------------------------------------------------
+
+// TestDiskMetricsOnly_ReturnsUsableDiskFields is a light smoke test: it can't
+// control what the real "/" filesystem reports, so it only asserts the
+// populated fields are internally consistent (a real read succeeded) rather
+// than pinning specific numbers.
+func TestDiskMetricsOnly_ReturnsUsableDiskFields(t *testing.T) {
+	got := DiskMetricsOnly()
+	if got.DiskTotalGB <= 0 {
+		t.Skip("no disk usage signal available in this environment")
+	}
+	if got.DiskAvailableGB < 0 {
+		t.Errorf("DiskAvailableGB = %v, want >= 0", got.DiskAvailableGB)
+	}
+	if got.DiskPercent < 0 || got.DiskPercent > 100 {
+		t.Errorf("DiskPercent = %v, want within [0,100]", got.DiskPercent)
+	}
+}
