@@ -357,6 +357,16 @@ type MeetingBrowser struct {
 	// does not own -- the caller retains sole ownership and must release it
 	// itself, exactly once, whenever it is actually done with the profile
 	// (which may be well after this MeetingBrowser's own Close() returns).
+	//
+	// Synchronization (citadel-cli#942): written under b.mu by
+	// WithHeldProfileLock. Its ONE production read is inside Start(), which
+	// already holds b.mu for the call's entire duration -- so that read is
+	// itself inside a b.mu critical section, just not one claimProfileLock
+	// opens itself. Start() reads it into a local (`held`) and passes that
+	// down to claimProfileLock as a plain bool rather than letting
+	// claimProfileLock re-read the field, precisely so claimProfileLock never
+	// needs to (and never must not) touch b.mu itself -- see claimProfileLock's
+	// doc comment for why re-locking there would deadlock.
 	externalProfileLockHeld bool
 }
 
@@ -464,8 +474,19 @@ func (b *MeetingBrowser) WithHeldProfileLock() *MeetingBrowser {
 // call) belongs to the caller, not this MeetingBrowser. Extracted from
 // Start() so this decision is unit-testable without launching a real
 // browser (no Chrome/Xvfb needed either way).
-func (b *MeetingBrowser) claimProfileLock(profileDir string) (release func(), err error) {
-	if b.externalProfileLockHeld {
+//
+// externalHeld is passed in rather than read from b.externalProfileLockHeld
+// here (citadel-cli#942): Start() is this function's only production caller,
+// and Start() already holds b.mu for the entire call (Lock at the top,
+// deferred Unlock) — b.mu is NOT reentrant, so a b.mu.Lock() inside this
+// function would self-deadlock the very call that's supposed to read the
+// field safely. Start() reads the field into a local while it already holds
+// b.mu (see its call site) and passes the value down instead, so the field's
+// one real read stays properly synchronized without this function ever
+// touching b.mu. Test callers below call this directly (no Start(), no held
+// lock) and pass the field's value explicitly for the same reason.
+func (b *MeetingBrowser) claimProfileLock(profileDir string, externalHeld bool) (release func(), err error) {
+	if externalHeld {
 		return nil, nil
 	}
 	return acquireMeetingProfileLock(profileDir)
@@ -567,8 +588,16 @@ func (b *MeetingBrowser) Start() error {
 	// below on every early return; ownership transfers to b.profileLockRelease
 	// (released by closeLocked) only once the browser process itself has
 	// actually started.
+	//
+	// held is read here, under b.mu (already locked above), rather than
+	// inside claimProfileLock itself (citadel-cli#942): b.mu is not
+	// reentrant, and this function holds it for its entire body, so
+	// claimProfileLock re-locking it would deadlock. This is the field's one
+	// production read, and it is synchronized by the b.mu this function
+	// already holds.
 	profileDirForLock := resolveMeetingProfileDir(b.profileDirOverride)
-	release, err := b.claimProfileLock(profileDirForLock)
+	held := b.externalProfileLockHeld
+	release, err := b.claimProfileLock(profileDirForLock, held)
 	if err != nil {
 		return err
 	}
