@@ -2107,3 +2107,18 @@ Auto-generated log of every release.
   - fix: synchronize externalProfileLockHeld read in claimProfileLock (#942) (#952)
 
 
+---
+
+## v2.135.0 — 2026-08-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +779 |
+
+**Changes:**
+
+  - fix: warm_on_demand advertises image/weights/disk-checked serveability, not just a YAML on disk (#683) (#955)
+
+
