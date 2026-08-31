@@ -116,12 +116,21 @@ func (m *mockSwapController) MeasuredVRAM(_ context.Context, _ string) (uint64, 
 }
 
 // newTestManager builds a manager with fast, deterministic timing.
+//
+// preflight defaults to an always-pass stub (citadel-cli#956): the real
+// default (status.EngineServeablePreflight) shells out to docker and reads
+// ~/citadel-cache, neither of which the mockSwapController-based tests in
+// this package set up or want to depend on -- exactly the same reason
+// mockSwapController exists instead of a real SwapController. Tests that
+// specifically exercise the preflight override m.preflight themselves (see
+// swap_preflight_test.go).
 func newTestManager(ctrl SwapController) *SwapManager {
 	m := NewSwapManager(ctrl)
 	m.waitBudget = 40 * time.Millisecond
 	m.minResidency = time.Minute
 	m.backgroundMax = 2 * time.Second
 	m.readyPoll = 2 * time.Millisecond
+	m.preflight = func(string, status.SystemMetrics) (bool, string) { return false, "" }
 	return m
 }
 

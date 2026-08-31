@@ -36,6 +36,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/services"
+	"github.com/shirou/gopsutil/v3/disk"
 	"gopkg.in/yaml.v3"
 )
 
@@ -75,6 +76,74 @@ func diskHeadroomBlocked(sys SystemMetrics) bool {
 		return true
 	}
 	return false
+}
+
+// EngineServeablePreflight is the exported entry point citadel-cli#956 adds so
+// the node's OWN on-demand swap path (internal/worker/swap.go's
+// SwapManager.EnsureResident) can fail fast on a genuinely unserveable engine
+// before attempting a doomed multi-GB pull -- defense-in-depth alongside the
+// heartbeat honesty check above (collectInstalledEngines), since the image can
+// be GC'd in the race between a heartbeat and a dispatch. It is a thin
+// composition of the SAME three checks collectInstalledEngines already uses;
+// it does not reimplement or weaken any of their fail-open behavior.
+//
+// Ordering is cheap-first: engineWeightsPresentFn and diskHeadroomBlocked are
+// pure local reads (a directory walk, a pre-collected SystemMetrics field),
+// while engineImagePresentFn shells out to `docker image inspect` (bounded by
+// imageInspectTimeout, but still the only check that can be slow) -- so a
+// swap that would fail on weights or disk never pays that cost.
+//
+// Returns blocked=true with a machine-readable reason
+// ("weights_missing" | "disk_pressure" | "image_missing") ONLY on a
+// positively-classified genuine absence. Returns blocked=false, "" both when
+// the engine is serveable AND when a check could not determine the answer
+// (couldn't reach docker, disk metrics never collected, ...) -- fail OPEN,
+// the same direction every check below is individually documented to take. A
+// false block here fails a healthy inference request, which is worse than the
+// doomed pull this preflight exists to prevent.
+func EngineServeablePreflight(name string, sys SystemMetrics) (blocked bool, reason string) {
+	if !engineWeightsPresentFn(name) {
+		return true, "weights_missing"
+	}
+	if diskHeadroomBlocked(sys) {
+		return true, "disk_pressure"
+	}
+	if !engineImagePresentFn(name) {
+		return true, "image_missing"
+	}
+	return false, ""
+}
+
+// DiskMetricsOnly reads just the root filesystem's disk usage into a
+// SystemMetrics, leaving every other field zero. It is the lightweight
+// counterpart to Collector.collectSystemMetrics (memory + a 100ms CPU sample +
+// disk) for a caller that only needs diskHeadroomBlocked's inputs and cannot
+// afford a full heartbeat-shaped collection on every call --
+// SwapManager.EnsureResident (internal/worker/swap.go) runs
+// EngineServeablePreflight on every on-demand swap decision, not once per
+// ~30s heartbeat tick like collectInstalledEngines above.
+//
+// Reads the same "/" mount via the same gopsutil call collectSystemMetrics
+// uses, so the two never disagree about which filesystem is being measured.
+// Returns a zero SystemMetrics (DiskTotalGB<=0) on a read failure --
+// diskHeadroomBlocked's own fail-open contract for an absent signal takes it
+// from there; this function does not need its own fallback logic.
+//
+// A plain function, not a package var: unlike engineImagePresentFn/
+// engineWeightsPresentFn above, nothing in THIS package calls it internally
+// (EngineServeablePreflight takes sys as a parameter), so there is no
+// in-package seam that needs stubbing. Callers that need to stub it (the
+// SwapManager wiring in internal/worker) inject it through their OWN
+// package-private field instead.
+func DiskMetricsOnly() SystemMetrics {
+	var metrics SystemMetrics
+	if d, err := disk.Usage("/"); err == nil {
+		metrics.DiskUsedGB = float64(d.Used) / (1024 * 1024 * 1024)
+		metrics.DiskTotalGB = float64(d.Total) / (1024 * 1024 * 1024)
+		metrics.DiskPercent = d.UsedPercent
+		metrics.DiskAvailableGB = float64(d.Free) / (1024 * 1024 * 1024)
+	}
+	return metrics
 }
 
 // engineImagePresentFn checks whether an engine's compose-declared image
