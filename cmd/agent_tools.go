@@ -89,6 +89,7 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			return liveExposeOps{}.Expose(ctx, worker.ExposeRequest{
 				Name:       spec.Name,
 				Port:       spec.Port,
+				Path:       spec.Path,
 				Visibility: spec.Visibility,
 				TTLSeconds: spec.TTLSeconds,
 				Creator:    spec.Creator,

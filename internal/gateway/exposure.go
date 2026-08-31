@@ -224,12 +224,16 @@ func (s *Server) Unexpose(name string) bool {
 	_, existed := s.exposures[name]
 	delete(s.exposures, name)
 	up := s.config.Upstreams[ExposeRoutePath(name)]
+	dr := s.dirExposures[ExposeRoutePath(name)]
 	s.mu.Unlock()
 
-	// Outside the lock: setAddr takes the Upstream's own mutex.
+	// Outside the lock: setAddr/set take the Upstream's/dirRoot's own mutex.
 	if up != nil {
 		up.setAddr("")
 		up.Address = ""
+	}
+	if dr != nil {
+		dr.set("")
 	}
 	return existed
 }
@@ -255,6 +259,17 @@ func (s *Server) Expose(name, address string, policy *ExposePolicy) error {
 	}
 	if policy == nil || !policy.Visibility.Valid() {
 		return fmt.Errorf("gateway: Expose requires a valid visibility (private|org|link)")
+	}
+	// A name's source type is fixed for the life of the process once its mux
+	// pattern is registered (http.ServeMux has no deregister — see the
+	// dirExposures doc comment on Server). A name already claimed by a
+	// directory share cannot become a proxy target; the operator must pick a
+	// different name.
+	s.mu.RLock()
+	_, isDir := s.dirExposures[ExposeRoutePath(name)]
+	s.mu.RUnlock()
+	if isDir {
+		return fmt.Errorf("gateway: expose %q is already registered as a directory source; use a different name to expose a port", name)
 	}
 	// StripPrefix so the exposed app's own paths (/, /assets, ...) map through
 	// unchanged, exactly like a module route. WebSocket is enabled because a real

@@ -72,8 +72,12 @@ type ExposeSpec struct {
 	// Name is the exposed-service slug (the <name> in /expose/<name>/).
 	Name string `json:"name"`
 	// Port is the service's loopback host port (e.g. 8212 for the nvr module's
-	// Frigate UI).
+	// Frigate UI). Mutually exclusive with Path (issue #943).
 	Port int `json:"port"`
+	// Path is a workspace-relative or absolute directory to serve as a
+	// read-only, auto-indexed static file share instead of a proxy target.
+	// Mutually exclusive with Port.
+	Path string `json:"path"`
 	// Visibility is "private", "org", or "link".
 	Visibility string `json:"visibility"`
 	// TTLSeconds bounds a `link` token's lifetime; ignored for private/org.

@@ -37,8 +37,14 @@ const exposuresFile = "exposures.json"
 type ExposureRecord struct {
 	// Name is the exposed-service slug (the <name> in /expose/<name>/).
 	Name string `json:"name"`
-	// Port is the loopback host port the route proxies to.
-	Port int `json:"port"`
+	// Port is the loopback host port the route proxies to. Mutually exclusive
+	// with Path (issue #943) — exactly one is non-zero/non-empty.
+	Port int `json:"port,omitempty"`
+	// Path is the resolved, workspace-confined directory served as a static
+	// file share instead of a proxy target. Mutually exclusive with Port.
+	// Restoring this verbatim on restart is what makes a directory share (like
+	// a port-backed one) survive a worker restart (#647).
+	Path string `json:"path,omitempty"`
 	// Visibility is "private", "org", or "link".
 	Visibility string `json:"visibility"`
 	// Creator is the tailnet login authorized for a `private` exposure. Empty

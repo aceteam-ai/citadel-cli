@@ -61,10 +61,13 @@ func TestExposeSet_ValidatesPayload(t *testing.T) {
 		payload map[string]any
 	}{
 		{"missing name", map[string]any{"port": 5000, "visibility": "org"}},
-		{"missing port", map[string]any{"name": "frigate", "visibility": "org"}},
-		{"zero port", map[string]any{"name": "frigate", "port": 0, "visibility": "org"}},
+		{"missing port and path", map[string]any{"name": "frigate", "visibility": "org"}},
+		{"zero port and no path", map[string]any{"name": "frigate", "port": 0, "visibility": "org"}},
 		{"bad visibility", map[string]any{"name": "frigate", "port": 5000, "visibility": "public"}},
 		{"empty payload", nil},
+		// #943: port and path are mutually exclusive source types.
+		{"both port and path", map[string]any{"name": "frigate", "port": 5000, "path": "results/ocr", "visibility": "org"}},
+		{"blank path and no port", map[string]any{"name": "frigate", "path": "   ", "visibility": "org"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -106,6 +109,28 @@ func TestExposeSet_Success(t *testing.T) {
 	}
 	if res.Output["token"] != "tok" {
 		t.Errorf("token output: got %v", res.Output["token"])
+	}
+}
+
+// TestExposeSet_PathSource_Success proves the directory-source EXPOSE_SET
+// payload (issue #943) routes through cleanly: no port required, and the raw
+// path is passed to ExposeOps for the cmd-layer to workspace-confine (this
+// package deliberately does not know what "the workspace" is).
+func TestExposeSet_PathSource_Success(t *testing.T) {
+	ops := &fakeExposeOps{result: &ExposeResult{URL: "https://100.64.0.9:8443/expose/scans"}}
+	h := NewExposeSetHandler(ExposeSetConfig{Ops: ops})
+	job := newExposeJob(exposePerNodeQueue, map[string]any{
+		"name": "scans", "path": "results/ocr", "visibility": "link", "ttl_seconds": 3600,
+	})
+	res, _ := h.Execute(context.Background(), job, nil)
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("valid path-source EXPOSE_SET: got %s (%v), want success", res.Status, res.Error)
+	}
+	if ops.got.Path != "results/ocr" {
+		t.Errorf("path passthrough: got %q, want %q", ops.got.Path, "results/ocr")
+	}
+	if ops.got.Port != 0 {
+		t.Errorf("port must stay zero for a path source, got %d", ops.got.Port)
 	}
 }
 
