@@ -951,6 +951,16 @@ func checkMeetingEndedFor(plat meetingPlatform, page meetPage) (string, bool) {
 // syntheticTranscribeJob builds the in-process TRANSCRIBE_AUDIO job used to reuse
 // the transcribe handler for both the end-of-call batch pass and each rolling
 // pass, keyed by a caller-supplied id so the two are distinguishable in logs.
+//
+// Payload MUST NOT carry vram_mb/vram_gb (#950). TranscribeAudioHandler.Execute
+// runs checkVRAMPreflight (#946) unconditionally on every job, including each
+// synthetic per-pass job routed through here — and that preflight ABORTS the job
+// on a declared-but-unfittable VRAM budget. It is harmless per-pass today only
+// because this payload declares no budget, so parseRequiredVRAMBytes returns 0
+// and the preflight short-circuits before touching the collector. Threading a
+// vram_mb/vram_gb key in here would silently start aborting rolling passes
+// mid-meeting, contradicting the design's "check before joining, log-and-continue
+// per-pass" intent. Keep this payload to {audio_path} only.
 func syntheticTranscribeJob(id, wavPath string) *nexus.Job {
 	return &nexus.Job{
 		ID:   id,
