@@ -26,9 +26,13 @@
 package status
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -100,8 +104,70 @@ func defaultEngineImagePresent(name string) bool {
 	if engineBin == "" {
 		engineBin = "docker"
 	}
-	err := exec.Command(engineBin, "image", "inspect", ref).Run()
-	return err == nil
+	return runImageInspect(engineBin, ref)
+}
+
+// imageInspectTimeout bounds the docker/podman `image inspect` subprocess.
+// collectInstalledEngines runs synchronously inside Collect() (the whole
+// heartbeat collection), so an unbounded call here would let a
+// wedged/unreachable daemon hang the ENTIRE heartbeat, not just this one
+// field -- caught in review of citadel-cli#683's first pass. A package var
+// (not a const) so a test can shrink it to force the timeout path without an
+// actual multi-second sleep. Mirrors the bounded-docker-call pattern already
+// used for footprint collection (footprint.go's footprintCollectTimeout).
+var imageInspectTimeout = 5 * time.Second
+
+// runImageInspect runs `<engineBin> image inspect <ref>` and classifies the
+// result. A package var (like engineImagePresentFn/engineWeightsPresentFn
+// above) so tests can point engineBin at a fake command and drive the
+// error-handling branches directly, without a real docker/podman daemon.
+//
+// The classification is the fix for the citadel-cli#683 review finding: a
+// naive `err == nil` check treats EVERY failure -- genuine "no such image",
+// AND daemon-unreachable/restarting, missing binary, permission-denied, or a
+// timeout -- as "image absent". A routine `systemctl restart docker` at
+// heartbeat time would then make every installed-but-stopped engine
+// node-wide flip to image_missing even though every image is present,
+// exactly the "confidently wrong signal" #683 itself warns against, just
+// moved from "file exists" to "docker call succeeded". Only a command that
+// ran to completion AND whose stderr clearly reports a genuine miss counts as
+// absent; everything else fails OPEN (does not block) -- when in doubt, a
+// false "swappable" is the pre-existing, already-accepted risk, while a false
+// "blocked" is a NEW regression this check must not introduce.
+var runImageInspect = defaultRunImageInspect
+
+func defaultRunImageInspect(engineBin, ref string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), imageInspectTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, engineBin, "image", "inspect", ref)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true // present
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return true // couldn't determine in time -- fail open, not blocked
+	}
+	if imageGenuinelyMissing(stderr.String()) {
+		return false // confirmed absent
+	}
+	// *exec.Error (binary not found), a daemon-connection error, permission
+	// denied, or any output we can't positively classify as a genuine miss --
+	// couldn't determine, so fail open.
+	return true
+}
+
+// imageGenuinelyMissing reports whether stderr output from `image inspect`
+// clearly indicates the image is confirmed absent, as opposed to some other
+// failure (daemon unreachable, permission denied, ...). docker emits
+// "No such image", podman emits "no such image" / "image not known".
+// Deliberately conservative: an unrecognized message is NOT treated as a
+// genuine miss (see runImageInspect's doc comment for why that direction is
+// load-bearing).
+func imageGenuinelyMissing(stderrOutput string) bool {
+	s := strings.ToLower(stderrOutput)
+	return strings.Contains(s, "no such image") || strings.Contains(s, "image not known")
 }
 
 // engineImageRef returns the `image:` value declared in an engine's embedded

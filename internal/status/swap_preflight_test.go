@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/services"
 )
@@ -81,6 +83,121 @@ func TestDefaultEngineImagePresent_NoRefFailsOpen(t *testing.T) {
 	// must never manufacture a block from nothing.
 	if !defaultEngineImagePresent("no-such-engine") {
 		t.Errorf("expected fail-open (true) for an engine with no image ref")
+	}
+}
+
+// --- runImageInspect / defaultRunImageInspect error-handling ---------------
+//
+// These drive the REAL error-handling branch (not the stubbed-bool
+// engineImagePresentFn), per citadel-cli#683's review finding: a naive
+// `err == nil` check collapsed "genuine no-such-image" and "couldn't
+// determine" (daemon down, binary missing, permission denied, timeout) into
+// the same "absent" result. Each test injects a raw exec failure via a fake
+// script/binary and asserts the classification.
+
+// writeFakeCommand writes an executable shell script at dir/name that prints
+// output to stderr and exits with the given code. Returns the script's path,
+// suitable to pass as engineBin to runImageInspect.
+func writeFakeCommand(t *testing.T, dir, name, stderrOutput string, exitCode int) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	script := "#!/bin/sh\n"
+	if stderrOutput != "" {
+		script += "echo '" + stderrOutput + "' 1>&2\n"
+	}
+	script += "exit " + strconv.Itoa(exitCode) + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestRunImageInspect_GenuineMissReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-docker", "Error: No such image: myref", 1)
+	if runImageInspect(bin, "myref") {
+		t.Errorf("expected false (blocked) for a genuine 'No such image' report")
+	}
+}
+
+func TestRunImageInspect_PodmanGenuineMissReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-podman", "Error: myref: image not known", 1)
+	if runImageInspect(bin, "myref") {
+		t.Errorf("expected false (blocked) for podman's 'image not known' report")
+	}
+}
+
+func TestRunImageInspect_DaemonUnreachableFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-docker",
+		"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?", 1)
+	if !runImageInspect(bin, "myref") {
+		t.Errorf("expected true (fail open) when the daemon is unreachable -- this is the exact citadel-cli#683 review regression (a restarting daemon must not flip every engine to image_missing)")
+	}
+}
+
+func TestRunImageInspect_PermissionDeniedFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-docker",
+		"Got permission denied while trying to connect to the Docker daemon socket", 1)
+	if !runImageInspect(bin, "myref") {
+		t.Errorf("expected true (fail open) on a permission-denied failure")
+	}
+}
+
+func TestRunImageInspect_UnrecognizedOutputFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-docker", "", 1) // exits 1, no stderr at all
+	if !runImageInspect(bin, "myref") {
+		t.Errorf("expected true (fail open) when the failure can't be positively classified as a genuine miss")
+	}
+}
+
+func TestRunImageInspect_BinaryNotFoundFailsOpen(t *testing.T) {
+	// exec.Command returns *exec.Error (not a process exit) when the binary
+	// itself doesn't exist -- must still fail open, not block.
+	if !runImageInspect("/no/such/binary-xyz-citadel-683", "myref") {
+		t.Errorf("expected true (fail open) when the engine binary is not found")
+	}
+}
+
+func TestRunImageInspect_SuccessReturnsTrue(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCommand(t, dir, "fake-docker", "", 0)
+	if !runImageInspect(bin, "myref") {
+		t.Errorf("expected true when the command exits 0")
+	}
+}
+
+func TestRunImageInspect_TimeoutFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake-docker-slow")
+	// `exec sleep` replaces the shell process image rather than forking a
+	// child, so exec.CommandContext's SIGKILL-on-deadline actually terminates
+	// the sleeping process immediately instead of leaving a grandchild
+	// holding the captured-stderr pipe open until it finishes on its own.
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 0.3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origTimeout := imageInspectTimeout
+	imageInspectTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { imageInspectTimeout = origTimeout })
+
+	if !runImageInspect(path, "myref") {
+		t.Errorf("expected true (fail open) on a context-deadline timeout, not a block")
+	}
+}
+
+func TestImageGenuinelyMissing_CaseInsensitive(t *testing.T) {
+	if !imageGenuinelyMissing("ERROR: No Such Image: foo") {
+		t.Errorf("expected case-insensitive match for docker's message")
+	}
+	if !imageGenuinelyMissing("bar: Image Not Known") {
+		t.Errorf("expected case-insensitive match for podman's message")
+	}
+	if imageGenuinelyMissing("connection refused") {
+		t.Errorf("expected no match for an unrelated failure message")
 	}
 }
 
