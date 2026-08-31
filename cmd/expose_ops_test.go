@@ -7,6 +7,8 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -246,6 +248,77 @@ func TestExposeOps_RestoreExposuresFloorsStaleRecordToHighWater(t *testing.T) {
 	}
 	if epoch < 2 {
 		t.Fatalf("restored epoch = %d, want floored to high-water >= 2 (stale record must not resurrect a revoked token)", epoch)
+	}
+}
+
+// TestExposeOps_RestoreExposures_PathEscapingCurrentWorkspaceIsSkipped pins
+// issue #949 item 1: a persisted directory-source exposure's Path is the
+// resolved root Expose() validated against the workspace AT WRITE TIME, but
+// the workspace boundary itself is not durable -- an operator can narrow
+// CITADEL_WORKSPACE/--workspace between then and a later restart. A record
+// whose Path no longer resolves inside the CURRENT workspace must be skipped
+// on restore rather than re-wired verbatim, even though the gateway's own
+// resolveConfinedRoot would happily accept it (it only requires an absolute,
+// existing directory -- it has no notion of "the workspace" at all). A
+// still-valid record restores normally alongside it.
+func TestExposeOps_RestoreExposures_PathEscapingCurrentWorkspaceIsSkipped(t *testing.T) {
+	gw := setupExposeOpsTest(t)
+	dir := platform.ConfigDir()
+
+	workspace := t.TempDir()
+	prevWorkspace := workWorkspaceDir
+	workWorkspaceDir = workspace
+	t.Cleanup(func() { workWorkspaceDir = prevWorkspace })
+
+	// A valid record: its Path sits inside the CURRENT workspace.
+	validPath := filepath.Join(workspace, "shared")
+	if err := os.MkdirAll(validPath, 0o755); err != nil {
+		t.Fatalf("mkdir valid path: %v", err)
+	}
+	if err := config.SaveExposure(dir, config.ExposureRecord{
+		Name: "valid-share", Path: validPath, Visibility: "org",
+	}); err != nil {
+		t.Fatalf("save valid record: %v", err)
+	}
+
+	// An escaping record: Path is a real, existing directory, but OUTSIDE the
+	// current workspace -- as if the workspace was narrowed after this share
+	// was originally created and persisted.
+	escapingPath := t.TempDir()
+	if err := config.SaveExposure(dir, config.ExposureRecord{
+		Name: "escaping-share", Path: escapingPath, Visibility: "org",
+	}); err != nil {
+		t.Fatalf("save escaping record: %v", err)
+	}
+
+	// A deleted record: Path pointed inside the workspace at write time, but
+	// the directory itself no longer exists (moved/removed since). Covered
+	// here alongside the new workspace-escape check to pin that the existing
+	// "gateway rejects it" skip path (ExposeDir's own resolveConfinedRoot)
+	// still fires for this case, unchanged.
+	deletedPath := filepath.Join(workspace, "gone")
+	if err := os.MkdirAll(deletedPath, 0o755); err != nil {
+		t.Fatalf("mkdir deleted path (pre-removal): %v", err)
+	}
+	if err := config.SaveExposure(dir, config.ExposureRecord{
+		Name: "deleted-share", Path: deletedPath, Visibility: "org",
+	}); err != nil {
+		t.Fatalf("save deleted record: %v", err)
+	}
+	if err := os.RemoveAll(deletedPath); err != nil {
+		t.Fatalf("remove deleted path: %v", err)
+	}
+
+	restoreExposures(gw)
+
+	if _, ok := gw.ExposureEpoch("valid-share"); !ok {
+		t.Error("valid-share was not restored, want it wired")
+	}
+	if _, ok := gw.ExposureEpoch("escaping-share"); ok {
+		t.Error("escaping-share was restored despite resolving outside the current workspace, want it skipped")
+	}
+	if _, ok := gw.ExposureEpoch("deleted-share"); ok {
+		t.Error("deleted-share was restored despite its directory no longer existing, want it skipped")
 	}
 }
 

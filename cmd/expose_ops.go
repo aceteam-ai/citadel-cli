@@ -339,11 +339,28 @@ func restoreExposures(gw *gateway.Server) {
 		}
 
 		if r.Path != "" {
-			// Directory source (#943). The persisted Path is already the
-			// resolved, workspace-confined root Expose() validated at write
-			// time, so it is re-wired verbatim -- no re-validation against a
-			// (possibly different-at-restore-time) workspace dir, matching the
-			// port source's own "re-wire verbatim" contract below.
+			// Directory source (#943/#949). The persisted Path was the
+			// resolved, workspace-confined root Expose() validated at WRITE
+			// time -- but the workspace boundary itself is not durable: an
+			// operator can narrow CITADEL_WORKSPACE (or --workspace) between
+			// then and this restart, so a previously-authorized directory
+			// could now sit outside the CURRENT workspace. Re-run the same
+			// jobs.ValidatePath boundary Expose() used at write time before
+			// re-wiring it, and skip loudly (never fall back to serving it
+			// anyway) when it no longer resolves inside the workspace --
+			// defense-in-depth: the directory is still symlink-confined to
+			// its own resolved root regardless (resolveConfinedTarget, every
+			// request), and reaching this state requires an authorized
+			// operator reconfiguration, not an attacker action.
+			if _, err := jobs.ValidatePath(resolveWorkspaceDir(), r.Path); err != nil {
+				Log("warning: skipping persisted exposure %q: path %q no longer resolves inside the node workspace: %v", r.Name, r.Path, err)
+				continue
+			}
+			// ExposeDir independently re-resolves and re-validates r.Path
+			// (resolveConfinedRoot: absolute, EvalSymlinks, must still be an
+			// existing directory) rather than trusting the stored string, so
+			// this also catches the directory having been deleted or moved
+			// since it was persisted.
 			if err := gw.ExposeDir(r.Name, r.Path, policy); err != nil {
 				// A record the gateway rejects (unknown visibility, bad name, or
 				// the directory no longer exists after a reboot) is data we
