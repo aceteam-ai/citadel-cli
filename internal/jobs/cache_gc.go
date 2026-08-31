@@ -56,6 +56,20 @@ import (
 )
 
 // cacheMutationMu is documented in the package doc comment above.
+//
+// INVARIANT: no code path that already holds this mutex may reach another
+// Lock() site (ModelCachePullHandler.Execute, ModelCacheEvictHandler.Execute,
+// ensureOllamaModel) -- sync.Mutex is not reentrant, and this mutex is held
+// unconditionally on every node (its three callers are not gated behind
+// CITADEL_CACHE_GC), so a re-entrant Lock() would deadlock the exec-1
+// serialized lane for every node, not just GC-opted-in ones. Verified at the
+// time this was written: ensureOllamaModel's only production caller is
+// ServiceHandler.serviceStart (SERVICE_START / model_exclusivity.go), which
+// is never itself reached from inside ModelCachePullHandler.Execute or
+// ModelCacheEvictHandler.Execute. Re-check this with
+// `grep -rn "ensureOllamaModel(\|cacheMutationMu.Lock(" internal/ cmd/` before
+// adding a new Lock() site or a new caller of serviceStart/ensureOllamaModel
+// from inside one of the three existing holders.
 var cacheMutationMu sync.Mutex
 
 // --- Env gating (design doc §10.1, §10.3.3) ---------------------------------
@@ -186,6 +200,14 @@ func defaultCacheGCDeleteEntry(cacheRoot string, e cacheindex.Entry) error {
 		}
 		return firstErr
 	case services.CacheFamilyNative:
+		// Guard the destructive dispatch against the assumption chain that
+		// makes it safe today (only ollama's "_store" family member has
+		// per-model rows at all; lmstudio/tei's aggregate row is excluded
+		// from PlanGC's candidates structurally) -- rather than trust that
+		// chain silently, refuse a native entry outside ollama's own dir.
+		if e.CacheDir != services.EngineCacheDirs["ollama"].Dir {
+			return fmt.Errorf("refusing to run ollama rm for native cache dir %q (only %q is ollama's)", e.CacheDir, services.EngineCacheDirs["ollama"].Dir)
+		}
 		out, err := BuildOllamaRmCommand(e.Model).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("ollama rm %s failed: %w: %s", e.Model, err, strings.TrimSpace(string(out)))
@@ -400,6 +422,16 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 		return result
 	}
 
+	// reachedLowWater/anyDeleteFailure disambiguate WHY the loop ended, so
+	// the reported SkipReason never claims "below_low_water" (i.e. "GC did
+	// its job, disk pressure is resolved") when the loop actually ran out of
+	// candidates -- some skipped as resident/stale, some failing to delete
+	// (e.g. permission denied) -- while disk usage is STILL at/above high
+	// water. Silently reporting below_low_water in that case would hide
+	// exactly the state design doc §10.4's observability requirement exists
+	// to surface.
+	reachedLowWater := false
+	anyDeleteFailure := false
 	for _, e := range plan.Candidates {
 		p, ok := deps.DiskUsedPercent(deps.DiskPath)
 		if !ok {
@@ -407,7 +439,7 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 			break
 		}
 		if p <= deps.LowPercent {
-			result.SkipReason = "below_low_water"
+			reachedLowWater = true
 			break
 		}
 
@@ -423,6 +455,24 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 
 		verified, verifyOK := store.Snapshot().Verify(e, deps.CacheRoot)
 		if !verifyOK {
+			// An hf-hub entry's Verify unconditionally checks
+			// cacheRoot/CacheDir/hub -- it does NOT resolve HF_HUB_CACHE /
+			// HUGGINGFACE_HUB_CACHE / HF_HOME / XDG_CACHE_HOME the way
+			// hfCacheBaseDir() (what deleteHFHubModelDir/DeleteEntry
+			// actually resolve through) does. On a node with one of those
+			// set -- an operator routing the cache to a bigger secondary
+			// disk, the documented reason to set it at all -- Verify would
+			// falsely report EVERY hf-hub entry stale and store.Remove
+			// would destroy the index entries (files survive, so this is
+			// still the safe direction, but P3 reporting and future GC
+			// passes go blind on that node with no way back, since
+			// ReconcileScan has the identical, already-documented gap for
+			// an overridden dir). Skip cleanly instead: don't guess, don't
+			// remove an entry Verify cannot actually check here.
+			if e.Family == services.CacheFamilyHFHub && hfCacheBaseDir() != filepath.Join(deps.CacheRoot, e.CacheDir, "hub") {
+				deps.Logf("info", "[cache-gc] skipping %s/%s: not verifiable under an operator cache-location override (HF_HUB_CACHE/HUGGINGFACE_HUB_CACHE/HF_HOME/XDG_CACHE_HOME)", e.CacheDir, e.Model)
+				continue
+			}
 			deps.Logf("warn", "[cache-gc] dropping stale entry %s/%s (recorded files no longer found on disk)", e.CacheDir, e.Model)
 			if err := store.Remove(e.CacheDir, e.Model); err != nil {
 				deps.Logf("warn", "[cache-gc] failed to drop stale index entry %s/%s: %v", e.CacheDir, e.Model, err)
@@ -431,6 +481,7 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 		}
 
 		if err := deps.DeleteEntry(deps.CacheRoot, verified); err != nil {
+			anyDeleteFailure = true
 			deps.Logf("warn", "[cache-gc] failed to evict %s/%s (engine=%s): %v", e.CacheDir, e.Model, e.Engine, err)
 			continue
 		}
@@ -445,8 +496,20 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 	}
 
 	if result.SkipReason == "" {
-		if result.EvictedCount == 0 {
+		switch {
+		case reachedLowWater:
 			result.SkipReason = "below_low_water"
+		case result.EvictedCount > 0:
+			// Evicted something but ran out of candidates before reaching
+			// low-water -- still under pressure, just nothing left this
+			// pass could safely reclaim.
+			result.SkipReason = "candidates_exhausted_above_low_water"
+		case anyDeleteFailure:
+			result.SkipReason = "all_evictions_failed"
+		default:
+			// Every candidate was skipped (resident/stale/override), none
+			// even attempted -- distinct from "GC succeeded".
+			result.SkipReason = "all_candidates_skipped"
 		}
 	}
 	return result

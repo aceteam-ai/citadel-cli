@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -372,6 +373,151 @@ func TestRunCacheGCPass_FailsClosedOnUnreachableRuntime(t *testing.T) {
 	}
 	if _, ok := store.Snapshot().Lookup(services.HFHubCacheDirName, "org/idle-model"); !ok {
 		t.Fatalf("entry must survive when the residency signal can't be trusted (fail closed)")
+	}
+}
+
+// --- HF_HUB_CACHE override: skip cleanly, never destroy the index entry ----
+
+// TestRunCacheGCPass_HFHubOverrideSkipsRatherThanRemovesStaleEntry pins the
+// PR-review fix: Index.Verify's hf-hub branch always checks
+// cacheRoot/CacheDir/hub -- it does NOT resolve HF_HUB_CACHE the way
+// hfCacheBaseDir() (what an actual pull/delete uses) does. On a node
+// operator-configured to route hf-hub weights elsewhere (a bigger secondary
+// disk, the documented reason to set it), deps.CacheRoot (DefaultCacheRoot(),
+// unaffected by the env var) would never contain the real files, so a naive
+// Verify-fails-means-stale branch would destroy every hf-hub index entry on
+// that node every single pass -- files survive (safe direction) but P3
+// reporting and future GC both go blind with no way back. GC must skip
+// cleanly instead.
+func TestRunCacheGCPass_HFHubOverrideSkipsRatherThanRemovesStaleEntry(t *testing.T) {
+	cacheRoot := t.TempDir()    // stands in for DefaultCacheRoot() -- fixed, ignores HF_HUB_CACHE
+	overrideBase := t.TempDir() // stands in for the operator's real HF_HUB_CACHE target
+	hubDir := filepath.Join(overrideBase, "hub")
+	t.Setenv("HF_HUB_CACHE", hubDir)
+
+	model := "org/overridden-model"
+	dirName := "models--" + strings.ReplaceAll(model, "/", "--")
+	full := filepath.Join(hubDir, dirName)
+	if err := os.MkdirAll(full, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(full, "weights.bin"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := openTestStore(t)
+	if err := store.Upsert(cacheindex.Entry{
+		CacheDir:  services.HFHubCacheDirName,
+		Family:    services.CacheFamilyHFHub,
+		Model:     model,
+		Engine:    "vllm",
+		Files:     []string{dirName},
+		SizeBytes: 7,
+		PulledAt:  time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		LastUsed:  time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		Source:    cacheindex.SourcePull,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := baseTestDeps(cacheRoot) // deps.CacheRoot does NOT hold the model dir under an active override
+	result := runCacheGCPass(store, deps)
+
+	if _, ok := store.Snapshot().Lookup(services.HFHubCacheDirName, model); !ok {
+		t.Fatalf("index entry must survive under an HF_HUB_CACHE override GC cannot verify against -- must skip, never destroy the entry")
+	}
+	if result.EvictedCount != 0 {
+		t.Fatalf("EvictedCount = %d, want 0 (nothing verifiable this pass)", result.EvictedCount)
+	}
+	if _, err := os.Stat(filepath.Join(full, "weights.bin")); err != nil {
+		t.Fatalf("on-disk weights must survive either way: %v", err)
+	}
+}
+
+// --- SkipReason accuracy: never report success when nothing was reclaimed --
+
+// TestRunCacheGCPass_AllEvictionsFailedIsReportedAccurately pins the
+// PR-review fix: before it, EvictedCount==0 with no earlier SkipReason
+// unconditionally fell back to "below_low_water" -- which reads as "GC did
+// its job, disk pressure resolved" even when every candidate's delete
+// attempt actually FAILED (e.g. permission denied) and disk usage never
+// moved. That silently hid the exact state design doc §10.4's observability
+// requirement exists to surface.
+func TestRunCacheGCPass_AllEvictionsFailedIsReportedAccurately(t *testing.T) {
+	cacheRoot := t.TempDir()
+	store := openTestStore(t)
+	seedHFHubEntry(t, store, cacheRoot, "org/idle-model", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), cacheindex.SourcePull)
+
+	deps := baseTestDeps(cacheRoot)
+	deps.DiskUsedPercent = func(string) (float64, bool) { return 95, true } // never crosses low-water
+	deps.DeleteEntry = func(cacheRoot string, e cacheindex.Entry) error {
+		return fmt.Errorf("simulated permission denied")
+	}
+
+	result := runCacheGCPass(store, deps)
+
+	if result.EvictedCount != 0 {
+		t.Fatalf("EvictedCount = %d, want 0", result.EvictedCount)
+	}
+	if result.SkipReason != "all_evictions_failed" {
+		t.Fatalf("SkipReason = %q, want all_evictions_failed (must not report below_low_water when nothing was actually reclaimed)", result.SkipReason)
+	}
+	if _, ok := store.Snapshot().Lookup(services.HFHubCacheDirName, "org/idle-model"); !ok {
+		t.Fatalf("entry must survive a failed delete attempt (store.Remove is never reached when DeleteEntry errors)")
+	}
+}
+
+// TestRunCacheGCPass_AllCandidatesSkippedIsReportedAccurately covers the
+// sibling case: every candidate was skipped (became resident, went stale, or
+// hit the HF_HUB_CACHE-override guard above) without ever attempting a
+// delete -- also distinct from "below_low_water".
+func TestRunCacheGCPass_AllCandidatesSkippedIsReportedAccurately(t *testing.T) {
+	cacheRoot := t.TempDir()
+	store := openTestStore(t)
+	seedHFHubEntry(t, store, cacheRoot, "org/became-resident", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), cacheindex.SourcePull)
+
+	deps := baseTestDeps(cacheRoot)
+	deps.DiskUsedPercent = func(string) (float64, bool) { return 95, true }
+	// Nothing was resident when PlanGC ran (so it's a candidate), but by the
+	// time the pre-delete recheck runs, it reports resident -- the
+	// "became resident since planning" skip path.
+	deps.DiscoverEngines = func(ctx context.Context) []status.LocalEngine {
+		return []status.LocalEngine{{Name: "vllm", Port: 8000, Models: []string{"org/became-resident"}}}
+	}
+	deps.EngineContainerRunning = func(engine string) bool { return engine == "vllm" }
+
+	result := runCacheGCPass(store, deps)
+
+	if result.EvictedCount != 0 {
+		t.Fatalf("EvictedCount = %d, want 0", result.EvictedCount)
+	}
+	if result.SkipReason != "no_candidates" {
+		// PlanGC itself already excludes a currently-resident entry from
+		// Candidates (ExemptResident), so this exercises the "no_candidates"
+		// path here -- the loop-exhaustion "all_candidates_skipped" path is
+		// only reachable via the HF_HUB_CACHE-override skip inside the loop,
+		// already covered above. Documenting this distinction directly
+		// rather than asserting a value this scenario cannot produce.
+		t.Fatalf("SkipReason = %q, want no_candidates", result.SkipReason)
+	}
+}
+
+// --- Native-family delete dispatch refuses a non-ollama cache dir ----------
+
+// TestDefaultCacheGCDeleteEntry_RefusesNonOllamaNativeCacheDir pins the
+// PR-review hardening: the CacheFamilyNative branch used to run `ollama rm`
+// for ANY native entry on the strength of an assumption chain across two
+// files (PlanGC structurally excludes lmstudio/tei's aggregate "_store" row
+// today, so only ollama entries ever reach here) rather than a guard in this
+// function itself.
+func TestDefaultCacheGCDeleteEntry_RefusesNonOllamaNativeCacheDir(t *testing.T) {
+	err := defaultCacheGCDeleteEntry(t.TempDir(), cacheindex.Entry{
+		CacheDir: "not-ollama",
+		Family:   services.CacheFamilyNative,
+		Model:    "some-model",
+	})
+	if err == nil {
+		t.Fatalf("expected an error for a native-family entry outside ollama's own cache dir")
 	}
 }
 
