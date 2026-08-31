@@ -618,3 +618,35 @@ func TestCacheReportFromCapsModelRows(t *testing.T) {
 		t.Errorf("len(Models) = %d, want the capped %d", len(dr.Models), maxCacheHeartbeatModelRows)
 	}
 }
+
+// TestCacheGCReportFromNil pins cacheGCReportFrom's defensive nil handling
+// (citadel #682 P5, design doc §10.4) -- a disabled/never-constructed GC
+// reconciler's stats (Enabled==false, the zero value) must project to a nil
+// *status.CacheGCReport, so CacheReport.Gc stays omitted exactly like a
+// pre-P5 node.
+func TestCacheGCReportFromNil(t *testing.T) {
+	if got := cacheGCReportFrom(jobs.CacheGCStats{}); got != nil {
+		t.Errorf("cacheGCReportFrom(zero value) = %+v, want nil", got)
+	}
+}
+
+// TestCacheGCReportFrom pins the jobs.CacheGCStats -> status.CacheGCReport
+// field-by-field projection.
+func TestCacheGCReportFrom(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	stats := jobs.CacheGCStats{
+		Enabled:               true,
+		LastRunAt:             now,
+		LastRunReclaimedBytes: 500,
+		TotalReclaimedBytes:   1500,
+		LastSkipReason:        "no_candidates",
+	}
+	got := cacheGCReportFrom(stats)
+	if got == nil {
+		t.Fatalf("cacheGCReportFrom returned nil for Enabled=true stats")
+	}
+	if !got.Enabled || !got.LastRunAt.Equal(now) || got.LastRunReclaimedBytes != 500 ||
+		got.TotalReclaimedBytes != 1500 || got.LastSkipReason != "no_candidates" {
+		t.Errorf("unexpected projection: %+v", got)
+	}
+}

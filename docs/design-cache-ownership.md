@@ -423,8 +423,16 @@ names below are the authorities; read them, not this list, for exact behavior):
   (`internal/worker/deadline.go:124`), and the resident-implies-used
   `MarkUsed` reconciler on the heartbeat's OnStatus fan-out
   (`cacheIndexMarkUsedReconciler`, `cmd/work.go:3011`).
-- **Not shipped:** P3 (reporting — §9 below is its implementation design),
-  P5 (GC — §10), P7 (`warm_on_demand`).
+- **P3 shipped (reporting).** `internal/cacheindex`'s scan metadata
+  (`ScannedAt`/`Dirs`/`LegacyHF`), `NodeStatus.Cache` on the heartbeat, and
+  `printCacheInfo`'s index-backed rewrite — see §9's "What P3 shipped,
+  precisely" and §11's P3 resolution below for the exact file/function list.
+- **P5 shipped (GC).** `cacheindex.PlanGC` (the pure planner,
+  `internal/cacheindex/gc.go`) plus its executor
+  (`internal/jobs/cache_gc.go`'s `runCacheGCPass`/`CacheGCReconciler`),
+  default OFF behind `CITADEL_CACHE_GC` — see §10's "Status: SHIPPED" note
+  and §11's P5 resolution below for the exact file/function list.
+- **Not shipped:** P7 (`warm_on_demand`).
 
 ## 8. P2 implementation design: the durable cache index (#682 P2 / #683 prerequisite)
 
@@ -989,6 +997,19 @@ Same data, third access path (§9.2's read-only `Load`):
 
 ## 10. P5 implementation design: GC (size-pressure eviction of stale weights)
 
+> **Status: SHIPPED (2026-08-30).** Implemented per this section exactly as
+> designed, with the decisions §11 records. Pure planner: `PlanGC`/`GCInputs`/
+> `GCPlan`/`DirModel`/`IsResident` (`internal/cacheindex/gc.go`). Executor:
+> `runCacheGCPass`/`CacheGCReconciler`/`cacheMutationMu`/the per-family
+> deletion cores (`internal/jobs/cache_gc.go`), wired into
+> `ModelCachePullHandler.Execute`/`ModelCacheEvictHandler.Execute`/
+> `ensureOllamaModel` (the mutex) and `cmd/work.go`'s `newCacheGCReconciler`
+> + both heartbeat publisher branches (the OnStatus trigger + the `gc`
+> heartbeat sub-struct, `status.CacheGCReport`). Default OFF behind
+> `CITADEL_CACHE_GC`. Not shipped in this pass: the `citadel cache gc
+> --dry-run` CLI (§10.4) — a documented, low-risk follow-up, not required for
+> the GC mechanism itself to be safe.
+
 P5 is the phase that actually reclaims the #682 disk. Everything below builds
 on shipped primitives: `LeastRecentlyUsed()`/`Verify()` (§8.4),
 `SourceBackfill` provenance, the per-family evict implementations
@@ -1075,6 +1096,63 @@ snapshot is advisory, the pre-delete check is the guarantee):
      running ollama's served list are exempt anyway. `_store` aggregate rows
      (lmstudio/tei) are never evictable via the index, as already documented
      at `scanNativeDir`.
+
+   **The pre-delete re-check is a LIVE `docker inspect` per candidate, not a
+   re-read of the same plan-time snapshot (independent Opus safety-review
+   must-fix, applied post-ship).** As first implemented, the "re-checked
+   immediately before each individual deletion" line above was true in
+   intent but not in code: the loop's only pre-delete guard reused the SAME
+   `exemptDirs`/`exemptModels` maps `PlanGC`'s candidates were already
+   filtered against, so it could never actually fire — the plan snapshot
+   WAS the guarantee, not merely advisory. `runCacheGCPass` now also calls
+   `deps.EngineContainerRunning(e.Engine)` again, live, immediately before
+   deleting each candidate — the same dependency `buildGCResidencyExemptions`
+   uses for its one-shot per-pass probe, just re-invoked per candidate. This
+   closes the real window it exists to close: a non-ollama `SERVICE_START`
+   never acquires `cacheMutationMu` (§10.4), so a container that reaches
+   `running` between the pass's one-shot probe and this specific candidate's
+   deletion is now caught here instead of proceeding. Deliberately coarse
+   for that TRANSITION specifically — whole-engine, not per-model,
+   mirroring the "we couldn't ask precisely, so don't guess" posture the
+   probe-failure bullet above already applies — so the live re-check can
+   occasionally skip a candidate whose SPECIFIC model isn't actually the
+   one that just came up (safe direction: a missed reclaim, never a wrong
+   delete). Gated on `engineWasRunning[e.Engine]==false` (a new third
+   return value from `buildGCResidencyExemptions`, the plan-time baseline):
+   the live check only fires for an engine the plan-time probe reported as
+   NOT running. An engine that WAS already running at plan time already had
+   its served-model list asked, and any candidate that survived THAT
+   narrower per-model check earned its exemption on the merits (e.g.
+   hf-hub: a genuinely idle model on an engine busy serving something
+   else) — re-asking the same coarse "is the container running" question
+   again for that engine would answer identically (true) and would wrongly
+   read "still running the same models it already was" as NEW information,
+   silently defeating per-model eviction for the engine's entire cache dir
+   for as long as it happens to be up. `TestRunCacheGCPass_ResidentModelNeverEvicted`
+   pins that this gate does not regress that existing per-model guarantee.
+   `TestRunCacheGCPass_LiveRecheckCatchesResidencyMissedAtPlanTime`
+   (`internal/jobs/cache_gc_test.go`) pins the fix itself by driving the injected
+   `EngineContainerRunning` dependency to answer differently on its
+   plan-time call vs. its per-candidate re-check call.
+
+   **Known lower-fidelity case, documented rather than silently left
+   unhandled: `--served-model-name` aliasing.** The hf-hub exemption above
+   matches an entry's `Model` (the pulled repo id) against the running
+   engine's SERVED model id(s) from `status.DiscoverLocalEngines`. A vLLM
+   instance started with `--served-model-name <alias>` reports the alias on
+   its `/v1/models` endpoint, not the underlying repo id the index recorded
+   at pull time — so an aliased deployment's weights will not match by
+   name and can look evictable even while actively serving. This is bounded
+   to cost, not corruption: `Index.Verify` still must pass before any
+   deletion runs, but more importantly the weights are memory-mapped/loaded
+   into the RUNNING engine process — deleting the on-disk copy does not stop
+   an in-flight server from continuing to serve out of already-loaded
+   memory, and a subsequent restart simply re-pulls before serving again
+   (the same §8.2-blessed direction every other GC false-positive in this
+   design resolves to). Closing this precisely would need `DiscoverLocalEngines`
+   (or a new signal) to report the underlying repo id alongside the served
+   alias — not attempted here; v1 accepts the gap as a known, documented
+   lower-fidelity case rather than a silent one.
 2. **Pinned.** v1 reads a `pinned_models` list from `citadel.yaml` at plan
    time (the §3.1 axis; recommendation and alternative in §11 Q5). The
    reserved `Entry.Pinned` field stays reserved — a manifest list needs no
@@ -1267,34 +1345,87 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
   (the out-of-band-drift cross-check §9.5 specifies) and dropping the
   expensive per-subdir `du` loop.
 
-### P5 — NOT IMPLEMENTED IN THIS PR (design only; next PR)
+### P5 — RESOLVED, P5 SHIPPED (2026-08-30)
 
 3. **Backfill evictability — the headline fork** (§10.3.4): **RESOLVED by
-   Jason (2026-08-30): EVICTABLE.** Reverses `SourceBackfill`'s shipped doc
+   Jason (2026-08-25): EVICTABLE.** Reverses `SourceBackfill`'s earlier doc
    comment ("Exempt from GC in a future phase") — the #682 40G duplicate IS
    backfill by definition, so exempting it would gut P5 against its own
-   motivating incident. This decision is recorded here for the P5
-   implementation PR to build against; **P5 itself (the GC executor,
-   `PlanGC`, the `cacheMutationMu`, the `gc` heartbeat sub-struct, `citadel
-   cache gc --dry-run`) is NOT implemented in this PR** — only this doc
-   update. The P5 PR must update `SourceBackfill`'s doc comment in
-   `internal/cacheindex/cacheindex.go` to match (currently still says
-   "Exempt... P2a only sets the marker, no GC logic reads it yet" — accurate
-   today, since no GC logic exists yet, but the exemption presumption it
-   states is superseded by this decision and should be corrected when P5
-   lands so the two don't silently disagree).
-4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): still open — not
-   decided in this pass. disk-percent high/low water on the cache volume
-   (recommended: 90/80) — or do you also want an absolute byte budget (per
-   cache dir or global) for proactive trimming on big-disk nodes where 90%
-   is already catastrophic for neighbors?
-5. **Pinning source** (§10.3.2, carries §6 Q1): still open — not decided in
-   this pass. manifest `pinned_models` in `citadel.yaml` (recommended —
-   mirrors `pinned_services`, no index write, no new write path), vs a
-   runtime `citadel cache pin` CLI (needs a cross-process index-write path
-   that violates the single-writer rule today — would have to be a job type
-   or wait for a local job-submission path)?
-6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): still open — not decided
-   in this pass. OK to ship GC on the v1 resident-implies-used signal per the
-   §10.2 sufficiency argument (recommended), or hold P5 until per-request
-   `MarkUsed` touches (via the `RecordEngineRequest` call sites) land first?
+   motivating incident. `PlanGC` applies no source-based exemption at all;
+   `TestPlanGC_BackfillEntriesAreEligible` pins this. `SourceBackfill`'s doc
+   comment in `internal/cacheindex/cacheindex.go` was updated to match.
+4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): **RESOLVED by Jason
+   (2026-08-30): disk-percent high/low-water hysteresis on the cache volume,
+   90%/80% defaults, NO absolute byte budget in v1.** Implemented exactly as
+   §10.1 specifies: `CITADEL_CACHE_GC_HIGH_PERCENT`/`CITADEL_CACHE_GC_LOW_PERCENT`
+   (`internal/jobs/cache_gc.go`'s `cacheGCHighLowPercent`), read once at
+   `citadel work` startup, an inverted/degenerate pair falling back to the
+   default pair rather than running unhysteresis'd. An absolute per-dir/
+   global byte budget remains a documented, not-built follow-up if a future
+   node needs proactive trimming below the pressure threshold.
+5. **Pinning source** (§10.3.2, carries §6 Q1): **RESOLVED by Jason
+   (2026-08-30): manifest `pinned_models` in `citadel.yaml`.** Mirrors
+   `pinned_services` exactly (`CitadelManifest.PinnedModels`, `cmd/manifest.go`;
+   `serviceManifest`-equivalent isn't needed since P5's executor reads it
+   once at `citadel work` startup via `workManifest`, the same manifest
+   `manifestPinnedServices` already reads) — no index write, no new
+   cross-process write path, matched exactly (trimmed, case-sensitive)
+   against `Entry.Model`.
+6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): **RESOLVED by Jason
+   (2026-08-30): ship on the v1 resident-implies-used signal**, per §10.2's
+   sufficiency argument — P5 does not wait on per-request `MarkUsed`
+   touches. Implemented: `LeastRecentlyUsed`'s ordering rule, reused inline
+   by `PlanGC`.
+
+**What P5 shipped, precisely:**
+
+- **Pure planner** (`internal/cacheindex/gc.go`): `PlanGC`/`GCInputs`/
+  `GCPlan`/`DirModel`/`IsResident`. Touches no filesystem/network/docker;
+  every exemption (pinned, resident, min-age) and the ordering rule
+  (LRU-first, size-descending tie-break) is unit-tested directly
+  (`gc_test.go`) against synthetic entries.
+- **Executor** (`internal/jobs/cache_gc.go`): `runCacheGCPass` resolves every
+  live signal PlanGC needs — disk-percent via `gopsutil` (checked FIRST,
+  before touching `cacheMutationMu` or the container runtime, so a node
+  nowhere near high-water pays zero cost), residency via
+  `status.DiscoverLocalEngines` PLUS an independent per-engine
+  `docker inspect` check (`gcEngineContainerRunningFn` — deliberately NOT
+  relying on `DiscoverLocalEngines` alone, since it drops an engine from its
+  result entirely on a model-probe timeout, citadel #649's documented
+  behavior for a different consumer; conflating that with "not resident"
+  here would be exactly the false negative this feature must never
+  produce), and pinning from the manifest. Evicts one candidate at a time,
+  re-measuring disk-percent and re-checking residency before each deletion,
+  stopping at low-water (§10.1's "evict-one-then-remeasure" rule).
+  Per-family deletion reuses the SAME resolvers `MODEL_CACHE_EVICT` trusts
+  (`hfCacheDir`, `llamaCppCacheDir`/`bonsaiCacheDir` via `CacheDir`,
+  `BuildOllamaRmCommand`) — no second opinion of where a family's files
+  live.
+- **`cacheMutationMu`** (`internal/jobs/cache_gc.go`): a process-wide mutex,
+  held (blocking `Lock`) by `ModelCachePullHandler.Execute`,
+  `ModelCacheEvictHandler.Execute`, and `ensureOllamaModel` for their whole
+  bodies; `TryLock`'d by GC (a pull/evict in flight makes GC skip the pass
+  entirely and re-evaluate next tick — the #489 meeting-profile-lock
+  fail-open precedent). `TestRunCacheGCPass_SkipsWhenMutationMuHeldByAPull`
+  and `TestModelCachePullHandler_HoldsCacheMutationMu` pin both directions.
+- **Fail-closed rules**: an unreadable disk-percent signal
+  (`unknown_disk_usage`) or an unreachable container runtime
+  (`runtime_unreachable`) each abort the WHOLE pass with zero evictions —
+  `TestRunCacheGCPass_FailsClosedOnUnknownDiskUsage`/
+  `_FailsClosedOnUnreachableRuntime` pin this.
+- **Trigger wiring**: the existing `OnStatus` heartbeat fan-out (the
+  #612/#416/`cacheIndexMarkUsedReconciler` precedent — no new sweep),
+  `cmd/work.go`'s `newCacheGCReconciler` (mirrors `newAutoStopReconciler`'s
+  shape: returns nil, registering nothing at all, unless
+  `jobs.CacheGCEnabled()`). The actual pass runs on its own goroutine with a
+  single-flight `atomic.Bool` guard (the #858 `captureStdout` "refuse to
+  nest" posture).
+- **Heartbeat observability**: `status.CacheReport.Gc` (`*status.CacheGCReport`
+  — enabled/last-run/reclaimed-bytes/last-skip-reason), projected by
+  `cmd/work.go`'s `cacheGCReportFrom` from `jobs.CacheGCStats` (the
+  `SwapActivity`/`GPUReservation` mirror pattern — `internal/status` cannot
+  import `internal/jobs`). Nil when GC is disabled, indistinguishable from a
+  pre-P5 node.
+- **Not shipped in this pass**: `citadel cache gc --dry-run` (§10.4's
+  read-only CLI preview) — a documented, low-risk follow-up; the mechanism's
+  safety does not depend on it.

@@ -76,8 +76,10 @@ const (
 	// reversing an earlier draft presumption of "exempt" recorded in this
 	// comment: the #682 40G duplicate this whole feature exists to reclaim
 	// IS backfill by definition, so exempting it would gut GC against its
-	// own motivating incident. No GC logic exists yet (P5 is a separate,
-	// not-yet-implemented PR) -- this marker alone carries no exemption.
+	// own motivating incident. As of P5 (docs/design-cache-ownership.md §10),
+	// PlanGC applies NO source-based exemption at all -- a SourceBackfill
+	// entry is ordered and evicted exactly like a SourcePull one, subject to
+	// the same pinned/resident/min-age rules.
 	SourceBackfill = "backfill"
 )
 

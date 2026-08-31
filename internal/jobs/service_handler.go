@@ -1261,6 +1261,15 @@ const ollamaServerWaitTimeout = 30 * time.Second
 // `ollama list` before pulling; on poll timeout the pull still runs and
 // surfaces the real connection error.
 func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
+	// cacheMutationMu (citadel #682 P5, design doc §10.4): this is the ONE
+	// pull site not inside ModelCachePullHandler.Execute (the #543
+	// SERVICE_START native-ollama pull, §8.3) -- it needs the same
+	// exclusion against a concurrent GC pass those do. See
+	// ModelCachePullHandler.Execute's identical comment / cache_gc.go's
+	// package doc.
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+
 	// The model is backend-controlled input passed to exec: validate with the
 	// same allowlist the compose env persistence uses.
 	if !modelIDPattern.MatchString(model) {
