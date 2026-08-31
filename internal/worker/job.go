@@ -146,6 +146,8 @@ const (
 	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
 	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
 	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
+	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
+	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
 	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
@@ -214,6 +216,8 @@ var allKnownJobTypes = []string{
 	JobTypeInstanceMessage,
 	JobTypeModuleSet,
 	JobTypeExposeSet,
+	JobTypeExposeList,
+	JobTypeUnexpose,
 	JobTypeMeetingJoin,
 	JobTypeDocumentRasterize,
 	JobTypeShowPairingCode,

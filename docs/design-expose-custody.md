@@ -1,6 +1,9 @@
 # Design: Expose Custody — EXPOSE_LIST, UNEXPOSE, and the Epoch-Regression Guard
 
-Status: **DESIGN ONLY — no Go changes in this PR.**
+Status: **IMPLEMENTED (2026-08-30).** §9's open questions are resolved below;
+the citadel-cli (Go) node-side implementation (EXPOSE_LIST, UNEXPOSE, the
+epoch-regression guard, and the funnel mutex) shipped in this PR. §7's
+backend/MCP wire contract is unimplemented follow-up in the other repo.
 Cross-refs: citadel-cli#944 (this issue), #598 (EXPOSE_SET + visibility ladder),
 #647 (durable exposures + `citadel service unexpose`), aceteam#8557
 (node-hosted publishing epic; the backend/MCP counterpart is a paired aceteam
@@ -501,25 +504,48 @@ What the node will honor / return; the aceteam agent owns everything behind it:
   exposure state (key + records + high-water together) is a deliberate
   non-goal here and flagged as follow-up material.
 
-## 9. Open questions for Jason
+## 9. Open questions for Jason — RESOLVED (2026-08-30)
 
-1. **Re-expose semantics under node-owned epoch (the one real product
-   decision).** §5.3 makes a plain re-expose *preserve* outstanding links and
-   requires `rotate:true` (or a legacy epoch fast-forward) to revoke. The
-   alternative — pure (b), every re-expose revokes — is simpler to explain
-   ("re-exposing rotates the link") but silently kills shared links on
-   re-assert/second-share flows. Which matches the product intent for
-   `expose`?
-2. **Should EXPOSE_LIST probe the upstream port** (`localPortListening`, up to
-   ~300ms/record) and report an `upstream_listening` bool, or is the durable
-   set + `live` policy bit enough for the console's needs? Default: no probe.
-3. **High-water store location**: separate `expose_epochs.json` (§5.3,
-   recommended) vs tombstones inside `exposures.json`. Separate file keeps
-   every existing `LoadExposures` consumer untouched; tombstones keep one file
-   at the cost of teaching restore + list to skip them.
-4. (Minor) Should `citadel service list-exposures` (a local CLI read over the
-   same ops, mirroring `service expose`/`unexpose`) ride along in Phase 1, or
-   stay out of scope? Cheap either way.
+1. **Re-expose semantics under node-owned epoch — RESOLVED: refined option
+   (b), preserve-links + explicit rotate.** A plain re-expose PRESERVES the
+   current epoch (outstanding links and blind/stateless callers keep
+   working); only an explicit `rotate:true` (or a legacy caller sending a
+   LOWER epoch than the name's current one — a fast-forward is still honored,
+   but a value at or below the live epoch never regresses it) increments the
+   epoch — the deliberate revocation act. Implemented exactly as §5.3
+   specifies: `resolveEffectiveEpoch(base, reqEpoch, rotate)` in
+   `cmd/expose_ops.go`, pinned by `TestResolveEffectiveEpoch`
+   (`cmd/expose_ops_test.go`).
+2. **EXPOSE_LIST upstream probe — RESOLVED: no probe (the doc's default).**
+   `ExposureInfo` carries the durable set's own fields plus the gateway's
+   `live` bit; no `localPortListening` call was added. Revisit only if the
+   console asks for it later.
+3. **High-water store location — RESOLVED: separate `expose_epochs.json`
+   (§5.3's recommendation).** Implemented in
+   `internal/config/expose_epochs.go`: a `{"<name>": <highest-epoch-ever>}`
+   map, 0600, temp+rename, entries never deleted. This is the piece of
+   durable memory that OUTLIVES `DeleteExposure` — the property that closes
+   the unexpose→re-expose resurrection hole (§5.2): when Expose finds no
+   durable record for a name (fresh, or the record was just deleted by
+   UNEXPOSE), the new epoch's floor is `ExposeEpochHighWater(name) + 1`, not
+   1. `TestExposeOps_UnexposeThenReExposeDoesNotResurrectRevokedEpoch`
+   (`cmd/expose_ops_test.go`) is the acceptance test for this property
+   end-to-end.
+4. **`citadel service list-exposures` — RESOLVED: out of scope for this
+   PR.** EXPOSE_LIST (the remote job) shipped; a local CLI read-back over the
+   same `liveExposeOps.List` is cheap to add later but was not requested and
+   is not implemented here.
+
+Also decided as part of the same pass: **UNEXPOSE is a dedicated job type**
+(`internal/worker/unexpose.go`), not an `EXPOSE_SET remove:true` flag —
+§4.1's three reasons (payload shape, imperative-verb precedent, audit
+legibility) stand as written. And the §5.4 concurrency mutex was implemented
+exactly as specified: a package-level `sync.Mutex` (`exposeOpsMu`) in
+`cmd/expose_ops.go`, held across the whole of `Expose`, `Unexpose`, and
+`List`, closing the CLI-vs-job race lane membership alone cannot reach.
+`TestExposeOps_ConcurrencyMutexSerializesRMW` pins it: 20 concurrent
+`rotate:true` calls against the same name from a base of 1 land on exactly
+epoch 21, never fewer (a lost update would mean the mutex regressed).
 
 ## 10. Phased plan
 

@@ -170,6 +170,18 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
+	// EXPOSE_LIST + UNEXPOSE (issue #944): remote inventory read-back and remote
+	// teardown, the two custody gaps EXPOSE_SET alone left open. Same live ops
+	// adapter as EXPOSE_SET (one funnel, one mutex — see cmd/expose_ops.go).
+	runner.RegisterHandler(worker.NewExposeListHandler(worker.ExposeListConfig{
+		Ops: liveExposeOps{},
+		Log: opts.HandlerLog,
+	}))
+	runner.RegisterHandler(worker.NewUnexposeHandler(worker.UnexposeConfig{
+		Ops: liveExposeOps{},
+		Log: opts.HandlerLog,
+	}))
+
 	// INSTANCE_* (aceteam#5963): fabric instance provisioning on this node's
 	// Proxmox hypervisor. Registered unconditionally so nodes without a proxmox
 	// provisioning config fail these jobs with a clear message; the lazy factory

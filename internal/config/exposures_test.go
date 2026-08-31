@@ -29,6 +29,12 @@ func TestSaveLoadExposureRoundTrip(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("loaded %d records, want 1", len(got))
 	}
+	// CreatedAt is stamped by SaveExposure on first write (issue #944); compare
+	// everything else verbatim and just assert it got set.
+	if got[0].CreatedAt == "" {
+		t.Error("CreatedAt was not set on first save")
+	}
+	want.CreatedAt = got[0].CreatedAt
 	if got[0] != want {
 		t.Errorf("round trip = %+v, want %+v", got[0], want)
 	}
@@ -57,6 +63,10 @@ func TestSaveLoadExposureRoundTrip_DirSource(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("loaded %d records, want 1", len(got))
 	}
+	if got[0].CreatedAt == "" {
+		t.Error("CreatedAt was not set on first save")
+	}
+	want.CreatedAt = got[0].CreatedAt
 	if got[0] != want {
 		t.Errorf("round trip = %+v, want %+v", got[0], want)
 	}

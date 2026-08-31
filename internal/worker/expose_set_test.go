@@ -13,6 +13,11 @@ type fakeExposeOps struct {
 	called bool
 	result *ExposeResult
 	err    error
+
+	unexposeResult *UnexposeResult
+	unexposeErr    error
+	listResult     *ExposeListResult
+	listErr        error
 }
 
 func (f *fakeExposeOps) Expose(_ context.Context, req ExposeRequest) (*ExposeResult, error) {
@@ -25,6 +30,26 @@ func (f *fakeExposeOps) Expose(_ context.Context, req ExposeRequest) (*ExposeRes
 		return f.result, nil
 	}
 	return &ExposeResult{URL: "https://100.64.0.9:8443/expose/" + req.Name}, nil
+}
+
+func (f *fakeExposeOps) Unexpose(_ context.Context, name string) (*UnexposeResult, error) {
+	if f.unexposeErr != nil {
+		return nil, f.unexposeErr
+	}
+	if f.unexposeResult != nil {
+		return f.unexposeResult, nil
+	}
+	return &UnexposeResult{Name: name, WasExposed: true}, nil
+}
+
+func (f *fakeExposeOps) List(_ context.Context) (*ExposeListResult, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.listResult != nil {
+		return f.listResult, nil
+	}
+	return &ExposeListResult{}, nil
 }
 
 const exposePerNodeQueue = "jobs:v1:shell:org_test:node:1314"
