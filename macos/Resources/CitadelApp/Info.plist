@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference Info.plist for the Citadel.app menu-bar bundle (issue #670).
+
+  This is NOT wired into a build step yet — #672 owns assembling the actual
+  signed .app (merging this into an Xcode project or a manual bundle-copy
+  step, matching how build-dmg.sh assembles today's placeholder Citadel.app).
+  Keep CFBundleIdentifier in sync with CitadelKit's
+  HelperConstants.appBundleIdentifier.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Citadel</string>
+    <key>CFBundleDisplayName</key>
+    <string>Citadel</string>
+    <key>CFBundleIdentifier</key>
+    <string>ai.aceteam.citadel</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>CitadelApp</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <!-- SMAppService requires 13.0 (decided in #670); this raises the .app's
+         floor above the CLI's, which has no such requirement. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- Menu-bar-only: no Dock icon, no main window, matches Tailscale.app's
+         presentation and #670's "lives in the macOS menu bar" goal. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright 2026 AceTeam.ai. All rights reserved.</string>
+    <!-- No SMPrivilegedExecutables key here: that is the legacy SMJobBless
+         mechanism. SMAppService.daemon(plistName:) instead requires the
+         LaunchDaemon plist to be physically present in the bundle at
+         Contents/Library/LaunchDaemons/ai.aceteam.citadel.helper.plist (see
+         Resources/CitadelHelper/ in this package) — no Info.plist
+         declaration needed on the app side. -->
+</dict>
+</plist>
