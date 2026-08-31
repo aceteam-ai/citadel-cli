@@ -20,7 +20,7 @@ import (
 // cmd/module_ops_test.go's writeLockfile convention) and wires a fresh
 // in-process gateway.Server so liveExposeOps has something to program,
 // restoring both to their prior state when the test ends.
-func setupExposeOpsTest(t *testing.T) {
+func setupExposeOpsTest(t *testing.T) *gateway.Server {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
@@ -28,6 +28,7 @@ func setupExposeOpsTest(t *testing.T) {
 	gw := gateway.NewServer(gateway.Config{})
 	setProvisionedServiceGateway(gw, 8443, true, "", 8080)
 	t.Cleanup(func() { setProvisionedServiceGateway(nil, 0, false, "", 0) })
+	return gw
 }
 
 func TestResolveEffectiveEpoch(t *testing.T) {
@@ -169,6 +170,82 @@ func TestExposeOps_UnexposeThenReExposeDoesNotResurrectRevokedEpoch(t *testing.T
 	// epoch, for either revoked epoch.
 	if reExposeRes.Epoch == 1 || reExposeRes.Epoch == 2 {
 		t.Fatalf("re-expose settled on a previously-live epoch %d -- a revoked token can verify again", reExposeRes.Epoch)
+	}
+}
+
+// TestExposeOps_StaleRecordDoesNotShadowHighWater pins the #945 review's core
+// finding: the high-water store must be a FLOOR, not merely an absent-record
+// fallback. It models the disk-fault vector directly — a durable record left
+// at a LOWER epoch than the high-water mark (what a best-effort SaveExposure
+// failure after a successful rotate leaves behind) — and asserts a blind
+// re-expose is floored UP to high-water rather than programmed back down to the
+// stale record's epoch. Against the pre-fix `else if` (record shadows
+// high-water), base would have been the stale 1 and the revoked epoch-1 token
+// would verify again.
+func TestExposeOps_StaleRecordDoesNotShadowHighWater(t *testing.T) {
+	gw := setupExposeOpsTest(t)
+	ops := liveExposeOps{}
+	ctx := context.Background()
+	dir := platform.ConfigDir()
+
+	// expose@1: durable record at epoch 1, high-water at 1.
+	if _, err := ops.Expose(ctx, worker.ExposeRequest{Name: "frigate", Port: 5000, Visibility: "link"}); err != nil {
+		t.Fatalf("initial expose: %v", err)
+	}
+	// Simulate a rotate whose high-water write SUCCEEDED (advancing to 2, and
+	// minting/leaking an epoch-2 token) but whose record-write FAILED — the
+	// exact best-effort-write divergence the review flagged. The on-disk record
+	// is still epoch 1; high-water is 2.
+	if err := config.SaveExposeEpochHighWater(dir, "frigate", 2); err != nil {
+		t.Fatalf("advance high-water: %v", err)
+	}
+	if rec := config.FindExposure(dir, "frigate"); rec == nil || rec.TokenEpoch != 1 {
+		t.Fatalf("precondition: want stale record at epoch 1, got %+v", rec)
+	}
+
+	// A blind re-expose (the MCP wire default) must floor to high-water and land
+	// STRICTLY above every already-minted epoch — never back at the stale 1.
+	res, err := ops.Expose(ctx, worker.ExposeRequest{Name: "frigate", Port: 5000, Visibility: "link", Epoch: 1})
+	if err != nil {
+		t.Fatalf("blind re-expose: %v", err)
+	}
+	if res.Epoch < 2 {
+		t.Fatalf("re-expose epoch = %d, want >= 2 (stale record must not shadow high-water)", res.Epoch)
+	}
+	if epoch, ok := gw.ExposureEpoch("frigate"); !ok || epoch < 2 {
+		t.Fatalf("live gateway epoch = %d (ok=%v), want >= 2", epoch, ok)
+	}
+}
+
+// TestExposeOps_RestoreExposuresFloorsStaleRecordToHighWater is the
+// restart-amplification half of the same #945 finding — the worse vector,
+// because it needs no re-expose at all. A stale, lower-epoch record on disk
+// plus a higher high-water mark, then a routine restart (auto-update,
+// self-heal, reboot) runs restoreExposures: the live policy it programs must be
+// floored to high-water, not taken verbatim from the stale record (which would
+// resurrect the rotated-away token on its own).
+func TestExposeOps_RestoreExposuresFloorsStaleRecordToHighWater(t *testing.T) {
+	gw := setupExposeOpsTest(t)
+	dir := platform.ConfigDir()
+
+	// A stale durable record at epoch 1, but high-water already at 2.
+	if err := config.SaveExposure(dir, config.ExposureRecord{
+		Name: "frigate", Port: 5000, Visibility: "link", TokenEpoch: 1,
+	}); err != nil {
+		t.Fatalf("save stale record: %v", err)
+	}
+	if err := config.SaveExposeEpochHighWater(dir, "frigate", 2); err != nil {
+		t.Fatalf("advance high-water: %v", err)
+	}
+
+	restoreExposures(gw)
+
+	epoch, ok := gw.ExposureEpoch("frigate")
+	if !ok {
+		t.Fatal("restore did not program the exposure")
+	}
+	if epoch < 2 {
+		t.Fatalf("restored epoch = %d, want floored to high-water >= 2 (stale record must not resurrect a revoked token)", epoch)
 	}
 }
 

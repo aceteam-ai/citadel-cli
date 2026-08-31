@@ -109,10 +109,22 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 	}
 
 	configDir := platform.ConfigDir()
+	// The high-water store is a FLOOR, not just an absent-record fallback
+	// (#945 review). A best-effort SaveExposure failure (or a legacy/
+	// hand-edited record) can leave a STALE, lower-epoch record on disk while
+	// the high-water store already records a higher, already-minted epoch. If
+	// the record shadowed high-water, a blind re-expose would program the live
+	// policy back DOWN to the stale epoch and resurrect a token the operator
+	// explicitly rotated away. Flooring the record to high-water closes that,
+	// and subsumes the legacy TokenEpoch==0 case (hw > 0 lifts base off 0).
+	hw := config.ExposeEpochHighWater(configDir, req.Name)
 	base := 1
 	if existing := config.FindExposure(configDir, req.Name); existing != nil {
 		base = existing.TokenEpoch
-	} else if hw := config.ExposeEpochHighWater(configDir, req.Name); hw > 0 {
+		if hw > base {
+			base = hw
+		}
+	} else if hw > 0 {
 		base = hw + 1
 	}
 	effective := resolveEffectiveEpoch(base, req.Epoch, req.Rotate)
@@ -308,10 +320,22 @@ func restoreExposures(gw *gateway.Server) {
 
 	restored := 0
 	for _, r := range recs {
+		// Floor the restored epoch to the high-water store (#945 review). A
+		// best-effort SaveExposure failure can leave a stale, lower-epoch
+		// record on disk after a rotate that already advanced high-water; a
+		// routine restart (auto-update, self-heal, reboot) would otherwise
+		// program the live policy straight from that stale r.TokenEpoch and
+		// resurrect the rotated-away token with no re-expose at all. The
+		// high-water store is never decremented, so this only ever raises the
+		// restored epoch, never lowers it.
+		epoch := r.TokenEpoch
+		if hw := config.ExposeEpochHighWater(platform.ConfigDir(), r.Name); hw > epoch {
+			epoch = hw
+		}
 		policy := &gateway.ExposePolicy{
 			Visibility: gateway.Visibility(r.Visibility),
 			Creator:    r.Creator,
-			TokenEpoch: r.TokenEpoch,
+			TokenEpoch: epoch,
 		}
 
 		if r.Path != "" {
