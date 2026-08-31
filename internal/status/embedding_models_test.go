@@ -167,20 +167,21 @@ func TestCollectEmbeddingServices_ProbeFailureLeavesModelsEmpty(t *testing.T) {
 // This is what re-attributes gte-multilingual-base from the stopped vllm to the
 // running tei on node 1297.
 func TestCollectInstalledEngines_SkipsModelClaimedByRunningService(t *testing.T) {
+	stubHotswapPreflightPass(t)
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "vllm", "VLLM_MODEL=Alibaba-NLP/gte-multilingual-base")
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
 
 	// Nothing running: the stopped vllm is still an honest swap candidate.
-	unclaimed := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	unclaimed := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 	if len(unclaimed) != 1 || unclaimed[0].Name != "vllm" {
 		t.Fatalf("without a claim, expected vllm advertised, got %+v", unclaimed)
 	}
 
 	// tei is running and serving that exact model: the stopped vllm drops it.
 	claimed := map[string]struct{}{"Alibaba-NLP/gte-multilingual-base": {}}
-	got := c.collectInstalledEngines(map[string]struct{}{}, claimed)
+	got := c.collectInstalledEngines(map[string]struct{}{}, claimed, SystemMetrics{})
 	for _, e := range got {
 		if e.Name == "vllm" {
 			t.Fatalf("stopped vllm still claims a model the running tei serves: %+v", e)

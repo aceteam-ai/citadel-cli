@@ -603,6 +603,29 @@ type ServiceInfo struct {
 	// current value, e.g. "model discovery probe timed out after 2s" or
 	// "installed_not_running". Omitted when Readiness is unset.
 	Reason string `json:"reason,omitempty"`
+
+	// SwapBlocked reports whether this installed-but-stopped engine failed one
+	// of the hotswap honesty preflight checks (image present / weights present
+	// / disk headroom -- citadel-cli#683) and must therefore NOT be treated as
+	// a fast warm-on-demand candidate despite being "installed" on disk (a
+	// compose YAML materialized). Omitted (false) when every check passes --
+	// the default, and byte-identical to pre-#683 behavior for the healthy
+	// case thanks to omitempty. See collectInstalledEngines/swap_preflight.go.
+	SwapBlocked bool `json:"swap_blocked,omitempty"`
+
+	// SwapBlockedReason names which preflight check failed when SwapBlocked is
+	// true: "image_missing" (docker/podman has no local image for this engine
+	// -- e.g. Docker GC'd it under disk pressure while the compose YAML
+	// survived, the citadel-cli#683 incident), "weights_missing" (the
+	// engine's canonical cache directory, services.EngineCacheDirs, has no
+	// weights on disk), or "disk_pressure" (free disk headroom is below the
+	// safety threshold, so even a from-scratch pull would be unsafe to
+	// attempt). Omitted when SwapBlocked is false. Deliberately does NOT
+	// reuse Reason above: Reason already means "why is Readiness down" and
+	// "installed_not_running" is its correct HAPPY-PATH value for a stopped,
+	// genuinely swappable engine -- overloading it with a failure reason would
+	// make the happy and blocked cases indistinguishable by string alone.
+	SwapBlockedReason string `json:"swap_blocked_reason,omitempty"`
 }
 
 // HealthResponse is the response for /health endpoint.
