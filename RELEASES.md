@@ -2071,3 +2071,22 @@ Auto-generated log of every release.
   - fix: route mcp debug output to stderr before swap-recovery logging (#934) (#938)
 
 
+---
+
+## v2.133.0 — 2026-08-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 48 |
+| Lines added | +7632 |
+
+**Changes:**
+
+  - feat: P5 disk-pressure GC for the model-cache index (citadel #682 P5) (#951)
+  - feat: expose custody — EXPOSE_LIST, UNEXPOSE, epoch-regression guard (#944) (#945)
+  - citadel#891: honest-refusal tier for meeting/transcribe VRAM co-residency (#946)
+  - cache-index P3 (index-backed reporting) + design for P5 (GC), citadel #682 (#947)
+  - expose: add workspace-confined directory source (citadel #943) (#948)
+
+
