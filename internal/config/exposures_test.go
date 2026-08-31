@@ -34,6 +34,37 @@ func TestSaveLoadExposureRoundTrip(t *testing.T) {
 	}
 }
 
+// A directory-source record (#943) must round-trip its Path verbatim, the
+// same way a port-source record round-trips Port -- restore-on-restart
+// re-wires a directory share exactly as it was, not re-derived.
+func TestSaveLoadExposureRoundTrip_DirSource(t *testing.T) {
+	dir := t.TempDir()
+	want := ExposureRecord{
+		Name:       "scans",
+		Path:       "/home/user/citadel-node/workspace/results/ocr",
+		Visibility: "link",
+		Creator:    "org_abc123",
+		TokenEpoch: 2,
+	}
+	if err := SaveExposure(dir, want); err != nil {
+		t.Fatalf("SaveExposure: %v", err)
+	}
+
+	got, err := LoadExposures(dir)
+	if err != nil {
+		t.Fatalf("LoadExposures: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("loaded %d records, want 1", len(got))
+	}
+	if got[0] != want {
+		t.Errorf("round trip = %+v, want %+v", got[0], want)
+	}
+	if got[0].Port != 0 {
+		t.Errorf("a directory-source record must not carry a port, got %d", got[0].Port)
+	}
+}
+
 // TokenEpoch specifically must survive. If it reset to 0 on restart, every link
 // token minted under the old epoch would stop verifying — live shared links
 // would break — and a later epoch bump could no longer revoke them.

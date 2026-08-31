@@ -28,14 +28,23 @@ import (
 	"strings"
 )
 
-// ExposeRequest is the parsed EXPOSE_SET payload: expose the local loopback
-// service at Port under the gateway name Name with the given Visibility.
+// ExposeRequest is the parsed EXPOSE_SET payload: expose either a local
+// loopback service (Port) or a workspace-confined static directory (Path)
+// under the gateway name Name with the given Visibility. Port and Path are
+// mutually exclusive — exactly one must be set (issue #943).
 type ExposeRequest struct {
 	// Name is the exposed-service slug (the <name> in /expose/<name>/). Lowercase
 	// alphanumeric + dashes; validated by the gateway.
 	Name string `json:"name"`
-	// Port is the service's loopback host port (e.g. 5000 for Frigate).
+	// Port is the service's loopback host port (e.g. 5000 for Frigate). Mutually
+	// exclusive with Path.
 	Port int `json:"port"`
+	// Path is a workspace-relative or absolute directory to serve as a
+	// read-only, auto-indexed static file share instead of proxying to a port.
+	// Mutually exclusive with Port. Confinement to the node workspace (and, per
+	// request, to the exposed directory itself) is enforced by the ExposeOps
+	// implementation and the gateway — never trusted from the payload alone.
+	Path string `json:"path"`
 	// Visibility is "private", "org", or "link".
 	Visibility string `json:"visibility"`
 	// TTLSeconds bounds a `link` token's lifetime. Ignored for private/org. A
@@ -114,7 +123,7 @@ func (h *ExposeSetHandler) Execute(ctx context.Context, job *Job, stream StreamW
 		return h.failure(fmt.Errorf("EXPOSE_SET: %w", err)), nil
 	}
 
-	h.cfg.Log("EXPOSE_SET: name=%q port=%d visibility=%q", req.Name, req.Port, req.Visibility)
+	h.cfg.Log("EXPOSE_SET: name=%q port=%d path=%q visibility=%q", req.Name, req.Port, req.Path, req.Visibility)
 
 	res, err := h.cfg.Ops.Expose(ctx, req)
 	if err != nil {
@@ -154,12 +163,20 @@ func parseExposeRequest(payload map[string]any) (ExposeRequest, error) {
 		return req, fmt.Errorf("decode expose request: %w", err)
 	}
 	req.Name = strings.TrimSpace(req.Name)
+	req.Path = strings.TrimSpace(req.Path)
 	req.Visibility = strings.ToLower(strings.TrimSpace(req.Visibility))
 	if req.Name == "" {
 		return req, fmt.Errorf("expose request is missing a name")
 	}
-	if req.Port <= 0 {
-		return req, fmt.Errorf("expose request has an invalid port %d", req.Port)
+	// Port and Path are mutually exclusive source types (issue #943): a proxy
+	// target and a directory share cannot both back the same exposure.
+	hasPort := req.Port > 0
+	hasPath := req.Path != ""
+	switch {
+	case hasPort && hasPath:
+		return req, fmt.Errorf("expose request must set exactly one of port or path, not both")
+	case !hasPort && !hasPath:
+		return req, fmt.Errorf("expose request requires either a port or a path")
 	}
 	if !validVisibilities[req.Visibility] {
 		return req, fmt.Errorf("unknown visibility %q (want private|org|link)", req.Visibility)

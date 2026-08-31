@@ -216,6 +216,17 @@ type Server struct {
 	// for private/org exposures. Nil makes private/org fail closed. Set via
 	// SetMeshResolver; the cmd layer wires network.WhoIsPeer.
 	meshResolver MeshIdentityResolver
+
+	// dirExposures maps an exposure's route prefix ("/expose/<name>") to the
+	// confined directory root backing it, for the directory-source expose type
+	// (issue #943). Kept as its OWN map (not folded into config.Upstreams)
+	// because a directory share is served directly by this package, never
+	// reverse-proxied — see expose_dir.go. Set via ExposeDir; a name's source
+	// type, once registered here or in config.Upstreams, is fixed for the life
+	// of the process (see ExposeDir/Expose's cross-type guard) because
+	// http.ServeMux has no deregister, so the mux pattern for a prefix can only
+	// ever be claimed by one dispatcher.
+	dirExposures map[string]*dirRoot
 }
 
 // NewServer creates a new gateway server.
@@ -504,6 +515,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// Build the route table
 	for prefix, upstream := range s.config.Upstreams {
 		s.registerProxy(prefix, upstream)
+	}
+	// Directory-source exposures (#943): registered separately from the proxy
+	// upstreams above since a directory share is served directly, not proxied.
+	// Anything added after this point (ExposeDir called live) must register its
+	// own handler — see wireExposeDirRoute's s.started gate.
+	for prefix, dr := range s.dirExposures {
+		s.registerDirHandler(prefix, dr)
 	}
 	// Model->engine chat routing (#581): unlike the static upstreams above, the
 	// chat routes resolve their backend per request from the requested model, so

@@ -17,6 +17,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -29,11 +30,16 @@ const defaultLinkTTL = 24 * time.Hour
 // liveExposeOps implements worker.ExposeOps against the live gateway.
 type liveExposeOps struct{}
 
-// Expose programs the in-process gateway to serve /expose/<name>/ -> the local
-// loopback port under the requested visibility, and returns the managed mesh URL
-// (plus a signed token for visibility=link). Requires the gateway to run in this
-// process (`citadel work --gateway` / `citadel serve`); otherwise it errors so
-// the job retries rather than silently no-oping.
+// Expose programs the in-process gateway to serve /expose/<name>/ under the
+// requested visibility, and returns the managed mesh URL (plus a signed token
+// for visibility=link). Requires the gateway to run in this process (`citadel
+// work --gateway` / `citadel serve`); otherwise it errors so the job retries
+// rather than silently no-oping.
+//
+// Two mutually exclusive source types (issue #943): req.Port reverse-proxies a
+// local loopback service; req.Path serves a workspace-confined static
+// directory directly from the gateway. ExposeSetHandler.parseExposeRequest
+// already enforces exactly one is set before this is ever called.
 func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worker.ExposeResult, error) {
 	ref := getProvisionedServiceGateway()
 	if ref == nil {
@@ -45,9 +51,37 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		Creator:    req.Creator,
 		TokenEpoch: req.Epoch,
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", req.Port)
-	if err := ref.gw.Expose(req.Name, addr, policy); err != nil {
-		return nil, err
+
+	rec := config.ExposureRecord{
+		Name:       req.Name,
+		Visibility: req.Visibility,
+		Creator:    req.Creator,
+		TokenEpoch: req.Epoch,
+	}
+
+	if req.Path != "" {
+		// Directory source (#943). Confine req.Path to the node workspace
+		// BEFORE it ever reaches the gateway -- the same boundary FILE_READ/
+		// FILE_LIST enforce, and deliberately NOT the AllowReadOutsideWorkspace
+		// relaxation those handlers can opt into: a network-reachable share is
+		// workspace-pinned regardless of that flag. jobs.ValidatePath also
+		// resolves symlinks on the root itself, so the gateway's own per-request
+		// confinement (internal/gateway/expose_dir.go) starts from an already
+		// clean boundary.
+		resolvedRoot, err := jobs.ValidatePath(resolveWorkspaceDir(), req.Path)
+		if err != nil {
+			return nil, fmt.Errorf("expose path %q: %w", req.Path, err)
+		}
+		if err := ref.gw.ExposeDir(req.Name, resolvedRoot, policy); err != nil {
+			return nil, err
+		}
+		rec.Path = resolvedRoot
+	} else {
+		addr := fmt.Sprintf("127.0.0.1:%d", req.Port)
+		if err := ref.gw.Expose(req.Name, addr, policy); err != nil {
+			return nil, err
+		}
+		rec.Port = req.Port
 	}
 
 	// Persist so the exposure survives a worker restart (#647). Every caller --
@@ -56,13 +90,7 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 	// write failure is logged, not returned: the exposure IS live and the caller
 	// already has its URL, so failing the call would be a lie; the honest failure
 	// mode is "works now, gone after a restart", and it must be visible.
-	if err := config.SaveExposure(platform.ConfigDir(), config.ExposureRecord{
-		Name:       req.Name,
-		Port:       req.Port,
-		Visibility: req.Visibility,
-		Creator:    req.Creator,
-		TokenEpoch: req.Epoch,
-	}); err != nil {
+	if err := config.SaveExposure(platform.ConfigDir(), rec); err != nil {
 		Log("warning: exposure %q is live but was not persisted (it will not survive a restart): %v", req.Name, err)
 	}
 
@@ -152,6 +180,25 @@ func restoreExposures(gw *gateway.Server) {
 			Creator:    r.Creator,
 			TokenEpoch: r.TokenEpoch,
 		}
+
+		if r.Path != "" {
+			// Directory source (#943). The persisted Path is already the
+			// resolved, workspace-confined root Expose() validated at write
+			// time, so it is re-wired verbatim -- no re-validation against a
+			// (possibly different-at-restore-time) workspace dir, matching the
+			// port source's own "re-wire verbatim" contract below.
+			if err := gw.ExposeDir(r.Name, r.Path, policy); err != nil {
+				// A record the gateway rejects (unknown visibility, bad name, or
+				// the directory no longer exists after a reboot) is data we
+				// cannot honor -- skip it loudly rather than dropping the whole
+				// set.
+				Log("warning: skipping persisted exposure %q: %v", r.Name, err)
+				continue
+			}
+			restored++
+			continue
+		}
+
 		addr := fmt.Sprintf("127.0.0.1:%d", r.Port)
 		if err := gw.Expose(r.Name, addr, policy); err != nil {
 			// A record the gateway rejects (unknown visibility, bad name) is data

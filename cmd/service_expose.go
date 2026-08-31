@@ -23,27 +23,37 @@ import (
 
 var (
 	exposeSvcPort       int
+	exposeSvcPath       string
 	exposeSvcVisibility string
 	exposeSvcTTL        time.Duration
 )
 
 var serviceExposeCmd = &cobra.Command{
 	Use:   "expose <name>",
-	Short: "Expose a local service on the AceTeam Network gateway",
-	Long: `Serves a local port on this node's gateway at /expose/<name>/, gated by a
-visibility level.
+	Short: "Expose a local service or directory on the AceTeam Network gateway",
+	Long: `Serves a local port, or a read-only static directory, on this node's gateway
+at /expose/<name>/, gated by a visibility level. --port and --path are
+mutually exclusive.
 
   private  only the creator (requires a caller identity the backend supplies,
            so a local CLI cannot grant it — use org or link)
   org      any member of your organization on the network
   link     anyone holding the signed, expiring link token
 
+A --path directory is confined to this node's workspace
+(--workspace/CITADEL_WORKSPACE on ` + "`citadel work`" + `) and served with an
+auto-generated index when it has no index.html of its own — no need to run
+your own web server.
+
 Requires the node gateway to be running (citadel work).`,
 	Example: `  # Expose the nvr module's Frigate UI to your organization
   citadel service expose frigate --port 8212 --visibility org
 
   # Share a dashboard by link for 2 hours
-  citadel service expose grafana --port 3000 --visibility link --ttl 2h`,
+  citadel service expose grafana --port 3000 --visibility link --ttl 2h
+
+  # Share a workspace directory (e.g. OCR results) by link
+  citadel service expose scans --path results/ocr --visibility link --ttl 2h`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
@@ -51,8 +61,13 @@ Requires the node gateway to be running (citadel work).`,
 		if !vis.Valid() {
 			return fmt.Errorf("invalid --visibility %q (want private, org, or link)", exposeSvcVisibility)
 		}
-		if exposeSvcPort <= 0 {
-			return fmt.Errorf("--port is required (the local port the service listens on)")
+		hasPort := exposeSvcPort > 0
+		hasPath := exposeSvcPath != ""
+		if hasPort && hasPath {
+			return fmt.Errorf("--port and --path are mutually exclusive; pick one source")
+		}
+		if !hasPort && !hasPath {
+			return fmt.Errorf("--port or --path is required (what to expose)")
 		}
 		// A local caller cannot supply a remote tailnet identity, so `private`
 		// would be inert (fails closed at the gateway). Say so rather than
@@ -76,6 +91,7 @@ Requires the node gateway to be running (citadel work).`,
 		body, err := json.Marshal(status.ExposeSpec{
 			Name:       name,
 			Port:       exposeSvcPort,
+			Path:       exposeSvcPath,
 			Visibility: string(vis),
 			TTLSeconds: int(exposeSvcTTL.Seconds()),
 		})
@@ -113,7 +129,11 @@ Requires the node gateway to be running (citadel work).`,
 			return fmt.Errorf("expose failed: %s", msg)
 		}
 
-		fmt.Printf("\n✅ Exposed %q -> 127.0.0.1:%d\n", name, exposeSvcPort)
+		if hasPath {
+			fmt.Printf("\n✅ Exposed %q -> directory %s\n", name, exposeSvcPath)
+		} else {
+			fmt.Printf("\n✅ Exposed %q -> 127.0.0.1:%d\n", name, exposeSvcPort)
+		}
 		fmt.Printf("   URL:    %s\n", out.URL)
 		fmt.Printf("   Access: %s\n", vis)
 		if out.Token != "" {
@@ -138,7 +158,8 @@ func statusPortFrom(f gatewayFacts) int {
 }
 
 func init() {
-	serviceExposeCmd.Flags().IntVar(&exposeSvcPort, "port", 0, "Local port the service listens on (required)")
+	serviceExposeCmd.Flags().IntVar(&exposeSvcPort, "port", 0, "Local port the service listens on (mutually exclusive with --path)")
+	serviceExposeCmd.Flags().StringVar(&exposeSvcPath, "path", "", "Workspace directory to share read-only, auto-indexed (mutually exclusive with --port)")
 	serviceExposeCmd.Flags().StringVar(&exposeSvcVisibility, "visibility", "org", "Who may reach it: org or link")
 	serviceExposeCmd.Flags().DurationVar(&exposeSvcTTL, "ttl", 24*time.Hour, "Lifetime of a --visibility link token")
 	svcCmd.AddCommand(serviceExposeCmd)
