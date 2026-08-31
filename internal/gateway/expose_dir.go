@@ -296,7 +296,7 @@ func serveConfinedDir(w http.ResponseWriter, r *http.Request, root, resolvedDir,
 		serveConfinedFile(w, r, resolvedIndex, info)
 		return
 	}
-	renderDirIndex(w, r, resolvedDir, cleanRel)
+	renderDirIndex(w, r, root, resolvedDir, cleanRel)
 }
 
 // dirIndexView is the data rendered by dirIndexTemplate.
@@ -333,8 +333,8 @@ var dirIndexTemplate = template.Must(template.New("dirIndex").Parse(`<!DOCTYPE h
 `))
 
 // renderDirIndex writes the auto-index listing for resolvedDir (already
-// confined and resolved by the caller).
-func renderDirIndex(w http.ResponseWriter, r *http.Request, resolvedDir, cleanRel string) {
+// confined and resolved by the caller, and itself beneath root).
+func renderDirIndex(w http.ResponseWriter, r *http.Request, root, resolvedDir, cleanRel string) {
 	entries, err := os.ReadDir(resolvedDir)
 	if err != nil {
 		exposeDeny(w, http.StatusForbidden, "cannot list directory")
@@ -349,6 +349,22 @@ func renderDirIndex(w http.ResponseWriter, r *http.Request, resolvedDir, cleanRe
 			continue
 		}
 		name := e.Name()
+
+		// A symlink inside the exposed tree that resolves OUTSIDE root is
+		// already blocked from being SERVED (resolveConfinedTarget, on
+		// click) -- but advertising its name here is still a leak (confirms
+		// the target exists) and a confusing dead link. Resolve every entry
+		// (a no-op for a plain file/dir, since resolvedDir is already
+		// confined and entry names never contain a path separator) and skip
+		// it if it escapes root, mirroring resolveConfinedTarget's own
+		// confinement check. A broken symlink (EvalSymlinks errors) is
+		// skipped the same way -- it would 404 on click regardless.
+		entryPath := filepath.Join(resolvedDir, name)
+		resolvedEntry, err := filepath.EvalSymlinks(entryPath)
+		if err != nil || !withinDir(root, resolvedEntry) {
+			continue
+		}
+
 		href := name
 		size := humanSize(info.Size())
 		if e.IsDir() {

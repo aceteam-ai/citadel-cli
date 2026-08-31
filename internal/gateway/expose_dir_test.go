@@ -227,6 +227,66 @@ func TestExposeDir_AutoIndex(t *testing.T) {
 	}
 }
 
+// TestExposeDir_AutoIndexOmitsEscapingSymlink pins issue #949 item 2: a
+// symlink inside the exposed tree that resolves OUTSIDE the confined root is
+// already blocked from being SERVED on click (TestExposeDir_SymlinkEscapeRejected),
+// but the auto-index used to still list its NAME, confirming to a browsing
+// client that a link with that name exists (and rendering a dead link). The
+// listing must omit it entirely, while a regular file and an in-tree
+// subdirectory (including one reached through a non-escaping, in-tree
+// symlink) still list normally.
+func TestExposeDir_AutoIndexOmitsEscapingSymlink(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("TOP-SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "report.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Escaping symlink: must be omitted from the listing.
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatalf("os.Symlink (escaping): %v (symlinks may be unavailable in this environment)", err)
+	}
+	// In-tree symlink: resolves to something still inside root, so it must
+	// still list normally (this is not an escape).
+	if err := os.Symlink(filepath.Join(root, "subdir"), filepath.Join(root, "in-tree-link")); err != nil {
+		t.Fatalf("os.Symlink (in-tree): %v", err)
+	}
+
+	h := buildExposedDirGateway(t, "docs", root, orgPolicy, orgResolver())
+
+	w := doGet(h, "/expose/docs/")
+	if w.Code != http.StatusOK {
+		t.Fatalf("auto-index: got %d, want 200 (body=%q)", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+
+	if !strings.Contains(body, "report.txt") {
+		t.Errorf("auto-index missing regular file entry: %s", body)
+	}
+	if !strings.Contains(body, "subdir/") {
+		t.Errorf("auto-index missing in-tree directory entry: %s", body)
+	}
+	if !strings.Contains(body, "in-tree-link") {
+		t.Errorf("auto-index missing in-tree (non-escaping) symlink entry: %s", body)
+	}
+	if strings.Contains(body, "escape") {
+		t.Errorf("auto-index lists the escaping symlink's name (info leak / dead link): %s", body)
+	}
+
+	// Belt and suspenders: the escape must still 404 on click (unchanged
+	// behavior, already pinned by TestExposeDir_SymlinkEscapeRejected) and
+	// never leak the secret content either way.
+	if strings.Contains(body, "TOP-SECRET") {
+		t.Fatalf("auto-index leaked escaped content: %s", body)
+	}
+}
+
 // TestExposeDir_BareNameRedirectsToTrailingSlash asserts requesting the exact
 // exposure name (no trailing slash) redirects to the trailing-slash form, so
 // relative links in an auto-index or index.html resolve correctly.
