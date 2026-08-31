@@ -2090,3 +2090,20 @@ Auto-generated log of every release.
   - expose: add workspace-confined directory source (citadel #943) (#948)
 
 
+---
+
+## v2.134.0 — 2026-08-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 7 |
+| Lines added | +218 |
+
+**Changes:**
+
+  - docs: pin syntheticTranscribeJob's no-vram_mb dependency (#950) (#954)
+  - fix: harden expose directory-source restore + auto-index against escaping symlinks (#949) (#953)
+  - fix: synchronize externalProfileLockHeld read in claimProfileLock (#942) (#952)
+
+
