@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,6 +176,59 @@ func TestRunCacheGCPass_ResidentGGUFDirWholeDirExempt(t *testing.T) {
 
 	if _, ok := store.Snapshot().Lookup(services.LlamaCppCacheDirName, "TheBloke/Old-GGUF"); !ok {
 		t.Fatalf("gguf-dir entry must be exempt while its owning engine (llamacpp) is running")
+	}
+}
+
+// TestRunCacheGCPass_LiveRecheckCatchesResidencyMissedAtPlanTime pins the
+// independent Opus safety-review must-fix: buildGCResidencyExemptions'
+// engine probe runs ONCE per pass, so a container that reaches `running`
+// AFTER that probe but BEFORE this specific candidate's deletion (a
+// non-ollama SERVICE_START never acquires cacheMutationMu, so this is a real
+// window, not a theoretical one) must still be caught. Before the fix, the
+// only "pre-delete" check reused the SAME exemptDirs/exemptModels the plan
+// snapshot was already filtered against, so it could never fire -- design
+// doc §10.3's "the plan snapshot is advisory, the pre-delete check is the
+// guarantee" was untrue as implemented. This drives deps.EngineContainerRunning
+// to answer false for vllm's plan-time probe (so the entry survives PlanGC as
+// a candidate) and true on the SECOND call (the live pre-delete re-check).
+func TestRunCacheGCPass_LiveRecheckCatchesResidencyMissedAtPlanTime(t *testing.T) {
+	cacheRoot := t.TempDir()
+	store := openTestStore(t)
+	seedHFHubEntry(t, store, cacheRoot, "org/became-resident-live", time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), cacheindex.SourcePull)
+
+	deps := baseTestDeps(cacheRoot)
+	var mu sync.Mutex
+	vllmCalls := 0
+	deps.EngineContainerRunning = func(engine string) bool {
+		if engine != "vllm" {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		vllmCalls++
+		// 1st call: buildGCResidencyExemptions' one-shot plan-time probe --
+		// report NOT running, so this entry passes PlanGC as a candidate.
+		// 2nd+ call: the live pre-delete re-check -- report the engine came
+		// up in the interim, exactly the race design doc §10.3 must catch.
+		return vllmCalls > 1
+	}
+
+	result := runCacheGCPass(store, deps)
+
+	if result.EvictedCount != 0 {
+		t.Fatalf("EvictedCount = %d, want 0 -- the live pre-delete re-check must have caught the engine becoming resident", result.EvictedCount)
+	}
+	if result.SkipReason != "became_resident" {
+		t.Fatalf("SkipReason = %q, want became_resident", result.SkipReason)
+	}
+	if _, ok := store.Snapshot().Lookup(services.HFHubCacheDirName, "org/became-resident-live"); !ok {
+		t.Fatalf("index entry must survive: the live re-check must have prevented deletion")
+	}
+	if _, err := os.Stat(filepath.Join(cacheRoot, services.HFHubCacheDirName, "hub", "models--org--became-resident-live")); os.IsNotExist(err) {
+		t.Fatalf("on-disk weights must survive: the live re-check must have prevented deletion")
+	}
+	if vllmCalls < 2 {
+		t.Fatalf(`expected EngineContainerRunning("vllm") to be called at least twice (plan-time probe + pre-delete re-check), got %d`, vllmCalls)
 	}
 }
 

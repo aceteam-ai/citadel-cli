@@ -273,9 +273,21 @@ func gcContainerRuntimeBin() string {
 // resident AT ALL; running's served-model lists only NARROW an
 // already-running hf-hub/native engine's exemption from "whole dir" down to
 // "just these specific models".
-func buildGCResidencyExemptions(running []status.LocalEngine, containerRunning func(engine string) bool) (map[string]bool, map[cacheindex.DirModel]bool) {
-	exemptDirs := map[string]bool{}
-	exemptModels := map[cacheindex.DirModel]bool{}
+//
+// The third return value, engineWasRunning, records every engine this ONE
+// probe observed as running -- the plan-time baseline runCacheGCPass' live
+// pre-delete re-check (§10.3) compares against. It exists so that re-check
+// can tell "this engine just started mid-pass" (new information, safe
+// direction is to skip) apart from "this engine was already running and its
+// served-model list already correctly excluded this specific candidate"
+// (already reflected in exemptModels/exemptDirs above -- re-treating a mere
+// repeat container-running reading as new information here would silently
+// exempt every OTHER model on an already-known-running engine too, which is
+// not what the live re-check is for).
+func buildGCResidencyExemptions(running []status.LocalEngine, containerRunning func(engine string) bool) (exemptDirs map[string]bool, exemptModels map[cacheindex.DirModel]bool, engineWasRunning map[string]bool) {
+	exemptDirs = map[string]bool{}
+	exemptModels = map[cacheindex.DirModel]bool{}
+	engineWasRunning = map[string]bool{}
 	servedByEngine := map[string][]string{}
 	for _, e := range running {
 		servedByEngine[e.Name] = e.Models
@@ -284,6 +296,7 @@ func buildGCResidencyExemptions(running []status.LocalEngine, containerRunning f
 		if !containerRunning(engine) {
 			continue
 		}
+		engineWasRunning[engine] = true
 		switch ec.Family {
 		case services.CacheFamilyGGUFDir:
 			// Single-engine dir (llamacpp, bonsai) -- the whole-dir rule
@@ -320,7 +333,7 @@ func buildGCResidencyExemptions(running []status.LocalEngine, containerRunning f
 			}
 		}
 	}
-	return exemptDirs, exemptModels
+	return exemptDirs, exemptModels, engineWasRunning
 }
 
 // --- Disk-pressure signal (design doc §10.1) --------------------------------
@@ -407,7 +420,7 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	running := deps.DiscoverEngines(ctx)
 	cancel()
-	exemptDirs, exemptModels := buildGCResidencyExemptions(running, deps.EngineContainerRunning)
+	exemptDirs, exemptModels, engineWasRunning := buildGCResidencyExemptions(running, deps.EngineContainerRunning)
 
 	snapshot := store.Snapshot()
 	plan := cacheindex.PlanGC(snapshot.All(), cacheindex.GCInputs{
@@ -422,16 +435,17 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 		return result
 	}
 
-	// reachedLowWater/anyDeleteFailure disambiguate WHY the loop ended, so
-	// the reported SkipReason never claims "below_low_water" (i.e. "GC did
-	// its job, disk pressure is resolved") when the loop actually ran out of
-	// candidates -- some skipped as resident/stale, some failing to delete
-	// (e.g. permission denied) -- while disk usage is STILL at/above high
-	// water. Silently reporting below_low_water in that case would hide
-	// exactly the state design doc §10.4's observability requirement exists
-	// to surface.
+	// reachedLowWater/anyDeleteFailure/anyBecameResident disambiguate WHY the
+	// loop ended, so the reported SkipReason never claims "below_low_water"
+	// (i.e. "GC did its job, disk pressure is resolved") when the loop
+	// actually ran out of candidates -- some skipped as resident/stale, some
+	// failing to delete (e.g. permission denied) -- while disk usage is
+	// STILL at/above high water. Silently reporting below_low_water in that
+	// case would hide exactly the state design doc §10.4's observability
+	// requirement exists to surface.
 	reachedLowWater := false
 	anyDeleteFailure := false
+	anyBecameResident := false
 	for _, e := range plan.Candidates {
 		p, ok := deps.DiskUsedPercent(deps.DiskPath)
 		if !ok {
@@ -443,13 +457,54 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 			break
 		}
 
-		// Re-checked immediately before THIS individual deletion (design
-		// doc §10.3: "the plan snapshot is advisory, the pre-delete check
-		// is the guarantee") -- reuses the SAME exemptDirs/exemptModels
-		// computed once above (one docker/mesh sweep per pass, not one per
-		// candidate) rather than re-probing per entry.
+		// Belt-and-suspenders re-check against the SAME exemptDirs/
+		// exemptModels snapshot PlanGC's candidates were already filtered
+		// against -- this can never actually fire (plan.Candidates already
+		// excludes anything IsResident would flag against these same maps),
+		// kept only so a future caller that assembles exemptDirs/
+		// exemptModels differently from plan-time doesn't lose the check by
+		// accident. It is NOT the guarantee design doc §10.3 promises; see
+		// the LIVE re-check immediately below for that.
 		if cacheindex.IsResident(e, exemptDirs, exemptModels) {
+			anyBecameResident = true
 			deps.Logf("info", "[cache-gc] skipping %s/%s: became resident since planning", e.CacheDir, e.Model)
+			continue
+		}
+
+		// LIVE re-check, immediately before THIS individual deletion --
+		// THIS is what makes design doc §10.3's promise ("the plan snapshot
+		// is advisory, the pre-delete check is the guarantee") true. A
+		// non-ollama SERVICE_START never acquires cacheMutationMu, so a
+		// container that reaches `running` between this pass's one-shot
+		// engine probe (buildGCResidencyExemptions, computed once above)
+		// and THIS specific deletion would otherwise be missed entirely --
+		// the check above reuses the very same probe result and so can
+		// never catch it.
+		//
+		// Gated on engineWasRunning[e.Engine]==false: if the engine was
+		// ALREADY running at plan time, buildGCResidencyExemptions already
+		// asked its served-model list and this candidate survived that
+		// narrower, per-model check on its merits (e.g. hf-hub: a genuinely
+		// idle model on an engine that's busy serving something else) --
+		// re-asking the SAME coarse "is the container running" question
+		// again here would answer identically (true) and would wrongly
+		// treat "the engine is still running the same models it already
+		// was" as new information, silently defeating per-model eviction
+		// for the engine's entire cache dir the whole time it happens to be
+		// up. Only a plan-time-not-running -> now-running TRANSITION is new
+		// information -- that is exactly the race window this check exists
+		// to close, and it is deliberately coarse (whole-engine, not
+		// per-model) for that transition specifically: the same "we
+		// couldn't ask precisely, so don't guess" posture
+		// buildGCResidencyExemptions already applies when a served-model
+		// probe fails. One extra `docker inspect` per still-plan-time-cold
+		// candidate, trivial next to the deletion I/O it guards.
+		// TestRunCacheGCPass_ResidentModelNeverEvicted pins that this gate
+		// does NOT regress legitimate eviction of an idle model on an
+		// already-known-running engine.
+		if e.Engine != "" && !engineWasRunning[e.Engine] && deps.EngineContainerRunning(e.Engine) {
+			anyBecameResident = true
+			deps.Logf("info", "[cache-gc] skipping %s/%s: engine %s became resident immediately before deletion", e.CacheDir, e.Model, e.Engine)
 			continue
 		}
 
@@ -504,6 +559,8 @@ func runCacheGCPass(store *cacheindex.Store, deps cacheGCDeps) cacheGCRunResult 
 			// low-water -- still under pressure, just nothing left this
 			// pass could safely reclaim.
 			result.SkipReason = "candidates_exhausted_above_low_water"
+		case anyBecameResident:
+			result.SkipReason = "became_resident"
 		case anyDeleteFailure:
 			result.SkipReason = "all_evictions_failed"
 		default:

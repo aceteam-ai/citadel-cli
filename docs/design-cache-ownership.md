@@ -1096,6 +1096,63 @@ snapshot is advisory, the pre-delete check is the guarantee):
      running ollama's served list are exempt anyway. `_store` aggregate rows
      (lmstudio/tei) are never evictable via the index, as already documented
      at `scanNativeDir`.
+
+   **The pre-delete re-check is a LIVE `docker inspect` per candidate, not a
+   re-read of the same plan-time snapshot (independent Opus safety-review
+   must-fix, applied post-ship).** As first implemented, the "re-checked
+   immediately before each individual deletion" line above was true in
+   intent but not in code: the loop's only pre-delete guard reused the SAME
+   `exemptDirs`/`exemptModels` maps `PlanGC`'s candidates were already
+   filtered against, so it could never actually fire — the plan snapshot
+   WAS the guarantee, not merely advisory. `runCacheGCPass` now also calls
+   `deps.EngineContainerRunning(e.Engine)` again, live, immediately before
+   deleting each candidate — the same dependency `buildGCResidencyExemptions`
+   uses for its one-shot per-pass probe, just re-invoked per candidate. This
+   closes the real window it exists to close: a non-ollama `SERVICE_START`
+   never acquires `cacheMutationMu` (§10.4), so a container that reaches
+   `running` between the pass's one-shot probe and this specific candidate's
+   deletion is now caught here instead of proceeding. Deliberately coarse
+   for that TRANSITION specifically — whole-engine, not per-model,
+   mirroring the "we couldn't ask precisely, so don't guess" posture the
+   probe-failure bullet above already applies — so the live re-check can
+   occasionally skip a candidate whose SPECIFIC model isn't actually the
+   one that just came up (safe direction: a missed reclaim, never a wrong
+   delete). Gated on `engineWasRunning[e.Engine]==false` (a new third
+   return value from `buildGCResidencyExemptions`, the plan-time baseline):
+   the live check only fires for an engine the plan-time probe reported as
+   NOT running. An engine that WAS already running at plan time already had
+   its served-model list asked, and any candidate that survived THAT
+   narrower per-model check earned its exemption on the merits (e.g.
+   hf-hub: a genuinely idle model on an engine busy serving something
+   else) — re-asking the same coarse "is the container running" question
+   again for that engine would answer identically (true) and would wrongly
+   read "still running the same models it already was" as NEW information,
+   silently defeating per-model eviction for the engine's entire cache dir
+   for as long as it happens to be up. `TestRunCacheGCPass_ResidentModelNeverEvicted`
+   pins that this gate does not regress that existing per-model guarantee.
+   `TestRunCacheGCPass_LiveRecheckCatchesResidencyMissedAtPlanTime`
+   (`internal/jobs/cache_gc_test.go`) pins the fix itself by driving the injected
+   `EngineContainerRunning` dependency to answer differently on its
+   plan-time call vs. its per-candidate re-check call.
+
+   **Known lower-fidelity case, documented rather than silently left
+   unhandled: `--served-model-name` aliasing.** The hf-hub exemption above
+   matches an entry's `Model` (the pulled repo id) against the running
+   engine's SERVED model id(s) from `status.DiscoverLocalEngines`. A vLLM
+   instance started with `--served-model-name <alias>` reports the alias on
+   its `/v1/models` endpoint, not the underlying repo id the index recorded
+   at pull time — so an aliased deployment's weights will not match by
+   name and can look evictable even while actively serving. This is bounded
+   to cost, not corruption: `Index.Verify` still must pass before any
+   deletion runs, but more importantly the weights are memory-mapped/loaded
+   into the RUNNING engine process — deleting the on-disk copy does not stop
+   an in-flight server from continuing to serve out of already-loaded
+   memory, and a subsequent restart simply re-pulls before serving again
+   (the same §8.2-blessed direction every other GC false-positive in this
+   design resolves to). Closing this precisely would need `DiscoverLocalEngines`
+   (or a new signal) to report the underlying repo id alongside the served
+   alias — not attempted here; v1 accepts the gap as a known, documented
+   lower-fidelity case rather than a silent one.
 2. **Pinned.** v1 reads a `pinned_models` list from `citadel.yaml` at plan
    time (the §3.1 axis; recommendation and alternative in §11 Q5). The
    reserved `Entry.Pinned` field stays reserved — a manifest list needs no
