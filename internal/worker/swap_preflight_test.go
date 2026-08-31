@@ -132,6 +132,21 @@ func TestSwap_PreflightNotCalledOnResidentHit(t *testing.T) {
 // TestSwap_PreflightUsesDiskMetricsFn asserts EnsureResident feeds the
 // SwapManager's own diskMetrics reading (not a full status collection) into
 // the preflight, so a stubbed disk-pressure reading reaches it end to end.
+//
+// Uses the real composition (defaultSwapPreflight -> status.
+// EngineServeablePreflight) rather than a fully-stubbed m.preflight, so this
+// test actually exercises the diskMetrics wiring end to end, not just that
+// some function got called -- but that means it also reaches the REAL
+// engineWeightsPresentFn/engineImagePresentFn, which check ~/citadel-cache
+// and shell out to docker. The backend name is deliberately an engine NOT in
+// services.EngineCacheDirs/services.ServiceMap ("bonsai" IS in both): for an
+// unrecognized engine both checks fail OPEN by their own documented contract
+// (see EngineServeablePreflight's doc comment), so only the injected
+// diskMetrics reading determines the outcome -- hermetic on a clean CI
+// runner with no ~/citadel-cache and no bonsai image, unlike a real engine
+// name would be (caught by review: this test used "bonsai" originally and
+// passed only on a dev machine that happened to have a real bonsai GGUF
+// cached).
 func TestSwap_PreflightUsesDiskMetricsFn(t *testing.T) {
 	ctrl := newMockController()
 	m := newTestManager(ctrl)
@@ -139,12 +154,9 @@ func TestSwap_PreflightUsesDiskMetricsFn(t *testing.T) {
 	m.diskMetrics = func() status.SystemMetrics {
 		return status.SystemMetrics{DiskTotalGB: 500, DiskAvailableGB: 0.1, DiskPercent: 99}
 	}
-	// Use the real composition (status.EngineServeablePreflight) rather than a
-	// stub, so this test actually exercises the diskMetrics wiring, not just
-	// that some function got called.
 	m.preflight = defaultSwapPreflight
 
-	_, err := m.EnsureResident(context.Background(), "bonsai", "Bonsai-27B")
+	_, err := m.EnsureResident(context.Background(), "unmapped-test-engine", "some-model")
 	var preflightErr *SwapPreflightBlockedError
 	if !errors.As(err, &preflightErr) {
 		t.Fatalf("expected a SwapPreflightBlockedError from the injected disk-pressure reading, got %v", err)
