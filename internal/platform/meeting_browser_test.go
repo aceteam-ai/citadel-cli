@@ -571,7 +571,7 @@ func TestMeetingBrowser_ClaimProfileLockDefaultAcquires(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "meeting-profile")
 
 	br := NewMeetingBrowser("citadel_meeting_gotest", dir)
-	release, err := br.claimProfileLock(dir)
+	release, err := br.claimProfileLock(dir, br.externalProfileLockHeld)
 	if err != nil {
 		t.Fatalf("claimProfileLock: unexpected error: %v", err)
 	}
@@ -613,7 +613,7 @@ func TestMeetingBrowser_WithHeldProfileLockSkipsReacquire(t *testing.T) {
 
 	br := NewMeetingBrowser("citadel_meeting_gotest", dir).WithHeldProfileLock()
 
-	gotRelease, err := br.claimProfileLock(dir)
+	gotRelease, err := br.claimProfileLock(dir, br.externalProfileLockHeld)
 	if err != nil {
 		t.Fatalf("claimProfileLock with an externally-held lock: unexpected error: %v", err)
 	}
