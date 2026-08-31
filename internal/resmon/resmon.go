@@ -295,6 +295,19 @@ func hostDiskPath() string {
 	return resolveDiskPath(os.UserHomeDir, dirExists)
 }
 
+// HostDiskPath is the exported form of hostDiskPath, for a caller outside
+// this package that needs to measure disk pressure on the SAME "cache
+// volume" this package already resolves (citadel #682 P5, design doc §10.1:
+// "reuse that resolution ... do not add a second probe with a second
+// opinion of the cache volume"). internal/jobs' P5 GC trigger (RunCacheGC)
+// is the first such caller — it must agree with resmon's own #833 disk
+// headroom reporting about which path "the cache volume" means, or an
+// operator could see resmon report healthy headroom while GC (measuring a
+// different path) believes it's at 90%, or vice versa.
+func HostDiskPath() string {
+	return hostDiskPath()
+}
+
 // dirExists reports whether path exists (any type), matching os.Stat's error
 // contract: only a nil error counts as "exists".
 func dirExists(path string) bool {

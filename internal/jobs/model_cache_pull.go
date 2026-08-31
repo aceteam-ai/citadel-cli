@@ -106,6 +106,16 @@ func skipSelfProvisioned(ctx JobContext, jobID, engine, modelName string) ([]byt
 }
 
 func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	// cacheMutationMu (citadel #682 P5, design doc §10.4): held for the whole
+	// pull so a concurrent P5 GC pass (which only TryLocks) can never race an
+	// in-flight download into the same cache dir. MODEL_CACHE_PULL is already
+	// on the exec-concurrency-1 serialized lane (#908), so this never
+	// contends with another pull/evict -- its only real counterparty is GC,
+	// which runs OUTSIDE the lane on its own goroutine. See cache_gc.go's
+	// package doc for the full reasoning.
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+
 	modelName, ok := job.Payload["model_name"]
 	if !ok || modelName == "" {
 		return nil, fmt.Errorf("job payload missing 'model_name' field")

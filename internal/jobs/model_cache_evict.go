@@ -39,6 +39,13 @@ type modelCacheEvictResult struct {
 }
 
 func (h *ModelCacheEvictHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	// cacheMutationMu (citadel #682 P5, design doc §10.4): see the identical
+	// comment on ModelCachePullHandler.Execute. MODEL_CACHE_EVICT is on the
+	// same serialized lane as MODEL_CACHE_PULL (#908/deadline.go), so this
+	// only ever actually contends with a concurrent GC pass.
+	cacheMutationMu.Lock()
+	defer cacheMutationMu.Unlock()
+
 	modelName, ok := job.Payload["model_name"]
 	if !ok || modelName == "" {
 		return nil, fmt.Errorf("job payload missing 'model_name' field")

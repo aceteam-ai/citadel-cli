@@ -819,6 +819,15 @@ func runWork(cmd *cobra.Command, args []string) {
 	// goroutines while the single Store below happens later on the main
 	// goroutine, so an unsynchronized plain var would be a genuine data race.
 	var nodeRunner atomic.Pointer[worker.Runner]
+	// cacheGCReconciler is P5 disk-pressure GC (citadel #682 P5, design doc
+	// §10), constructed later (inside the `if workRedisStatus` block,
+	// alongside autoStop/cacheIndexMarkUsedReconciler) -- nil when
+	// jobs.CacheGCEnabled() is false. Same atomic-pointer reasoning as
+	// nodeSwapManager above: cacheReportFn's closure (below, read by the
+	// already-running status-publisher goroutines) needs to observe
+	// whichever reconciler ends up constructed, including nil, without
+	// racing that later Store.
+	var cacheGCReconciler atomic.Pointer[jobs.CacheGCReconciler]
 	// inferenceQueueReconciler watches for a serving-engine transition and
 	// self-subscribes the inference queue once one appears, so a node that
 	// boots with no engine does not need a restart to serve inference once one
@@ -1489,7 +1498,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		if store == nil {
 			return nil
 		}
-		return cacheReportFrom(store.Snapshot())
+		report := cacheReportFrom(store.Snapshot())
+		// GC stats (citadel #682 P5, design doc §10.4): additive, read via
+		// the atomic pointer above -- nil (jobs.CacheGCEnabled()==false, or
+		// not yet constructed) leaves report.Gc omitted, exactly like a
+		// pre-P5 node.
+		report.Gc = cacheGCReportFrom(cacheGCReconciler.Load().Stats())
+		return report
 	}
 
 	// Create status collector (used by status server and Redis status publisher)
@@ -1821,6 +1836,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		// stats/nvidia-smi sweep). nil when the operator has not opted in.
 		autoStop := newAutoStopReconciler()
 
+		// Optional, config-gated (default OFF) P5 disk-pressure GC reconciler
+		// (citadel #682 P5, design doc §10). Built once, like autoStop above,
+		// and Stored into the atomic pointer immediately so cacheReportFn's
+		// already-defined closure can observe it (including the nil case) as
+		// soon as either publisher branch below registers it.
+		gcReconciler := newCacheGCReconciler(workManifest)
+		cacheGCReconciler.Store(gcReconciler)
+
 		// Fabric Pulse stats collector (citadel-cli#587): GPU + inference-engine
 		// internals scraped node-locally on a short interval into a cached block
 		// the heartbeat attaches as the optional "stats" field. Runs on its own
@@ -1940,6 +1963,12 @@ func runWork(cmd *cobra.Command, args []string) {
 					// P2a). Unconditional (no opt-in flag, unlike autoStop) --
 					// see cacheIndexMarkUsedReconciler's doc comment.
 					apiPublisher.SetOnStatus(cacheIndexMarkUsedReconciler)
+					// P5 disk-pressure GC reconciler (citadel #682 P5, design doc
+					// §10) -- config-gated like autoStop above; nil when
+					// jobs.CacheGCEnabled() is false.
+					if gcReconciler != nil {
+						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { gcReconciler.Reconcile(s) })
+					}
 					if inferenceQueueReconciler != nil {
 						inferenceQueueReconciler.Log = Log
 						// Ignore the passed-in NodeStatus and re-check serving via
@@ -2007,6 +2036,12 @@ func runWork(cmd *cobra.Command, args []string) {
 				// P2a). Unconditional (no opt-in flag, unlike autoStop) -- see
 				// cacheIndexMarkUsedReconciler's doc comment.
 				redisPublisher.SetOnStatus(cacheIndexMarkUsedReconciler)
+				// P5 disk-pressure GC reconciler (citadel #682 P5, design doc
+				// §10) -- config-gated like autoStop above; nil when
+				// jobs.CacheGCEnabled() is false.
+				if gcReconciler != nil {
+					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { gcReconciler.Reconcile(s) })
+				}
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
@@ -2998,6 +3033,28 @@ func newAutoStopReconciler() *status.AutoStopReconciler {
 	return r
 }
 
+// newCacheGCReconciler builds the config-gated P5 disk-pressure GC
+// reconciler (citadel #682 P5, design doc §10), or returns nil when the
+// operator has not opted in (CITADEL_CACHE_GC unset/false) -- mirroring
+// newAutoStopReconciler's shape exactly: a disabled node registers nothing
+// and pays zero cost, rather than a per-tick no-op (the #612
+// "missingQueues" lesson).
+func newCacheGCReconciler(manifest *CitadelManifest) *jobs.CacheGCReconciler {
+	if !jobs.CacheGCEnabled() {
+		return nil
+	}
+	logFn := func(level, format string, args ...any) {
+		if level == "warn" || level == "warning" {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		} else {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+	r := jobs.NewCacheGCReconciler(manifestPinnedModels(manifest), logFn)
+	fmt.Println("   - Cache GC (disk-pressure eviction): ENABLED")
+	return r
+}
+
 // cacheIndexMarkUsedReconciler is the "resident-implies-used" v1 LRU signal
 // (citadel #682 P2a, design doc §8.1): on every heartbeat tick it marks the
 // models each RUNNING engine is currently serving as recently used in the
@@ -3307,6 +3364,25 @@ func cacheReportFrom(idx *cacheindex.Index) *status.CacheReport {
 	}
 
 	return report
+}
+
+// cacheGCReportFrom projects jobs.CacheGCStats onto the heartbeat-facing
+// status.CacheGCReport (citadel #682 P5, design doc §10.4) -- same reason
+// swapStatsFrom/reservationsFrom/laneActivityFrom/cacheReportFrom exist:
+// internal/status cannot import internal/jobs. Returns nil when GC was
+// never enabled/constructed for this process (stats.Enabled==false), which
+// is what leaves CacheReport.Gc omitted.
+func cacheGCReportFrom(stats jobs.CacheGCStats) *status.CacheGCReport {
+	if !stats.Enabled {
+		return nil
+	}
+	return &status.CacheGCReport{
+		Enabled:               true,
+		LastRunAt:             stats.LastRunAt,
+		LastRunReclaimedBytes: stats.LastRunReclaimedBytes,
+		TotalReclaimedBytes:   stats.TotalReclaimedBytes,
+		LastSkipReason:        stats.LastSkipReason,
+	}
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {

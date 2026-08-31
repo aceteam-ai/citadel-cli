@@ -87,6 +87,19 @@ type CitadelManifest struct {
 	// budget may durably stop non-pinned services to fit. Empty/absent =>
 	// preemption allowed for all services (the default).
 	PinnedServices []string `yaml:"pinned_services,omitempty"`
+	// PinnedModels is a node-wide allowlist of cached model/repo ids (the
+	// cache-index Entry.Model value -- an HF repo id, or a bare GGUF filename
+	// for a backfilled gguf-dir entry) that P5 disk GC (citadel #682 P5,
+	// docs/design-cache-ownership.md §10.3.2) must NEVER evict, regardless of
+	// LRU/age. This is a NEW, separate axis from PinnedServices, deliberately
+	// not reused: a service being VRAM-preemptible (#577) says nothing about
+	// whether its on-disk weights are disk-evictable, and vice versa -- see
+	// the design doc §3.1 interaction rule ("a service preempted from VRAM
+	// keeps its weights on disk"). Matched EXACTLY (trimmed, case-sensitive --
+	// HuggingFace repo ids are case-sensitive) against Entry.Model. Empty/
+	// absent => every cached entry is GC-eligible (subject to GC's other
+	// exemptions: residency, min-age).
+	PinnedModels []string `yaml:"pinned_models,omitempty"`
 }
 
 // manifestPinnedServices returns the pinned_services allowlist for a manifest,
@@ -97,6 +110,15 @@ func manifestPinnedServices(m *CitadelManifest) []string {
 		return nil
 	}
 	return m.PinnedServices
+}
+
+// manifestPinnedModels returns the pinned_models allowlist for a manifest,
+// nil-safe like manifestPinnedServices above (citadel #682 P5).
+func manifestPinnedModels(m *CitadelManifest) []string {
+	if m == nil {
+		return nil
+	}
+	return m.PinnedModels
 }
 
 // findAndReadManifest locates and parses the node's manifest file.

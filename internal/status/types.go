@@ -121,6 +121,41 @@ type CacheReport struct {
 	// LegacyHFCache reports the pre-#682 duplicate HuggingFace hub cache
 	// (design doc §9.3) when the last scan found one worth reporting.
 	LegacyHFCache *LegacyCacheReport `json:"legacy_hf_cache,omitempty"`
+	// Gc carries P5 disk-pressure GC's own observability (citadel #682 P5,
+	// design doc §10.4). Nil when GC is disabled (jobs.CacheGCEnabled()
+	// false, the default) or not yet constructed -- indistinguishable from
+	// a pre-P5 node, which is the correct degradation.
+	Gc *CacheGCReport `json:"gc,omitempty"`
+}
+
+// CacheGCReport is the heartbeat-facing projection of a
+// jobs.CacheGCReconciler's stats (citadel #682 P5, design doc §10.4) -- a
+// hand-maintained mirror of jobs.CacheGCStats, matching the SwapActivity/
+// GPUReservation/LaneActivity precedent (internal/status cannot import
+// internal/jobs; jobs already imports status). The projection is
+// cacheGCReportFrom, cmd/work.go, beside its siblings.
+type CacheGCReport struct {
+	// Enabled is true once a GC reconciler has been constructed for this
+	// process (jobs.CacheGCEnabled()==true at `citadel work` startup) --
+	// this field only appears at all when true (see the nil *CacheGCReport
+	// case above), so it is somewhat redundant on the wire, but kept
+	// explicit so a consumer never has to infer "enabled" from "the object
+	// happens to be present".
+	Enabled bool `json:"enabled"`
+	// LastRunAt is when the most recent GC pass (attempted or skipped) ran.
+	// Zero/omitted means GC has never ticked yet on this process.
+	LastRunAt time.Time `json:"last_run_at,omitempty"`
+	// LastRunReclaimedBytes / TotalReclaimedBytes are the most recent pass's
+	// reclaim and this process's running total, respectively.
+	LastRunReclaimedBytes int64 `json:"last_run_reclaimed_bytes"`
+	TotalReclaimedBytes   int64 `json:"total_reclaimed_bytes"`
+	// LastSkipReason names why the most recent pass evicted nothing (e.g.
+	// "below_high_water", "no_candidates", "pull_in_flight",
+	// "unknown_disk_usage", "runtime_unreachable", "below_low_water") --
+	// design doc §10.4: a node stuck at high-water with everything
+	// pinned/resident/young must be visible as such, not silent. Empty when
+	// the last pass DID evict something.
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }
 
 // CacheDirReport is one cache_dir's attribution within CacheReport.
