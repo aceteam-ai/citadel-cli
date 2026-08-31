@@ -32,6 +32,12 @@ services:
       - XVFB_RESOLUTION=${XVFB_RESOLUTION:-1280x720x24}
       - MEETING_PROFILE_DIR=/profile
       - CITADEL_WORKSPACE=/workspace
+      # Virtual-mic speaking path (aceteam#7079). Default OFF: a missing mic is only
+      # REPORTED in /health, never fails CAPTURE. Set to 1 on a node that MUST speak
+      # so an absent mic becomes a hard 503. Compose does not pass host env vars
+      # that aren't listed here, so this passthrough is what makes the opt-in reach
+      # meetingd.
+      - MEETING_MIC_REQUIRED=${MEETING_MIC_REQUIRED:-}
       # Run the in-container `bot` user as the NODE OWNER's UID/GID so the recorded
       # WAV (written into the /workspace mount) is owned by the node process that
       # reads it back for transcription — no cross-UID perms fixup. citadel injects

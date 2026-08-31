@@ -261,3 +261,47 @@ func TestMeetingWavRelPathMatchesAbs(t *testing.T) {
 		}
 	}
 }
+
+// TestContainerMediaSpeakFile exercises the bot->room speaking transport
+// (aceteam#7079): SpeakFile POSTs the workspace-relative path as JSON to meetingd's
+// /mic/play and treats a 200 as success. Verified without a real container/pulse.
+func TestContainerMediaSpeakFile(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/mic/play" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"played":true,"source":"file","path":"/workspace/tts/hi.wav"}`))
+	}))
+	defer srv.Close()
+
+	m := newTestContainerMedia(srv.URL)
+	if err := m.SpeakFile("tts/hi.wav"); err != nil {
+		t.Fatalf("SpeakFile: %v", err)
+	}
+	if gotBody["path"] != "tts/hi.wav" {
+		t.Errorf("posted path = %v, want the workspace-relative tts/hi.wav", gotBody["path"])
+	}
+}
+
+// TestContainerMediaSpeakFileErrorStatus: a non-200 (e.g. 409 already speaking, or
+// 503 mic absent) surfaces as an error with the status, not a silent success.
+func TestContainerMediaSpeakFileErrorStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"already speaking"}`))
+	}))
+	defer srv.Close()
+
+	m := newTestContainerMedia(srv.URL)
+	err := m.SpeakFile("tts/hi.wav")
+	if err == nil {
+		t.Fatal("SpeakFile returned nil error on a 409, want an error")
+	}
+	if !strings.Contains(err.Error(), "409") {
+		t.Errorf("error = %q, want it to mention the 409 status", err.Error())
+	}
+}
