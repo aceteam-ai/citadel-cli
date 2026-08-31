@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -687,7 +688,8 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (Store.ReconcileScan's staleness cleanup); running it from a second
 	// concurrent process could delete entries a sibling process just wrote.
 	if workerLockHeld {
-		if err := jobs.CacheIndexStore().ReconcileScan(cacheindex.DefaultCacheRoot()); err != nil {
+		scanOpts := cacheindex.ScanOptions{LegacyHFHubDir: jobs.LegacyHFHubDirForScan()}
+		if err := jobs.CacheIndexStore().ReconcileScan(cacheindex.DefaultCacheRoot(), scanOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: cache index backfill scan: %v\n", err)
 		}
 	} else {
@@ -1471,6 +1473,25 @@ func runWork(cmd *cobra.Command, args []string) {
 		return &status.PairingDisplayCapability{Surfaces: surfaces}
 	}
 
+	// Cache-index attribution for the heartbeat (citadel #682 P3, design doc
+	// §9.2): reads the LIVE store via jobs.CacheIndexStore(), not the
+	// on-disk file, so pull/evict/MarkUsed mutations are visible immediately.
+	// Safe as a plain closure, not an atomic pointer -- jobs.InitCacheIndexStore
+	// runs at the very top of runWork (before this point), well before the
+	// status-publisher goroutines below start (the #717 plain-var-vs-atomic
+	// lesson: nodeSwapManager/nodeRunner need atomic.Pointer because THEY are
+	// populated only after those goroutines are already running; this is not
+	// that case). jobs.CacheIndexStore() is nil-safe (returns nil in any
+	// process that never initialized it, i.e. every command other than
+	// `citadel work`), which is what leaves NodeStatus.Cache omitted there.
+	cacheReportFn := func() *status.CacheReport {
+		store := jobs.CacheIndexStore()
+		if store == nil {
+			return nil
+		}
+		return cacheReportFrom(store.Snapshot())
+	}
+
 	// Create status collector (used by status server and Redis status publisher)
 	var collector *status.Collector
 	if workStatusPort > 0 {
@@ -1490,6 +1511,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			Reservations:    reservationsFn,
 			LaneActivity:    laneActivityFn,
 			PairingDisplay:  pairingDisplayFn,
+			CacheReport:     cacheReportFn,
 		})
 	}
 
@@ -1783,6 +1805,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				Reservations:    reservationsFn,
 				LaneActivity:    laneActivityFn,
 				PairingDisplay:  pairingDisplayFn,
+				CacheReport:     cacheReportFn,
 			})
 		}
 
@@ -3182,6 +3205,108 @@ func laneActivityFrom(snaps []worker.LaneSnapshot) []status.LaneActivity {
 		}
 	}
 	return out
+}
+
+// maxCacheHeartbeatModelRows caps the per-dir model rows cacheReportFrom
+// attaches to the heartbeat (citadel #682 P3, design doc §9.4) so a hoarder
+// cache cannot balloon the heartbeat payload; CacheDirReport.EntryCount tells
+// a consumer when this truncated a dir's rows.
+const maxCacheHeartbeatModelRows = 32
+
+// cacheReportFrom projects a cacheindex.Index snapshot onto the
+// heartbeat-facing status.CacheReport (citadel #682 P3, design doc §9.4) --
+// same reason swapStatsFrom/reservationsFrom/laneActivityFrom exist:
+// internal/status keeps its heartbeat-facing types free of a dependency on
+// internal/cacheindex's own types (a deliberate consistency choice, not an
+// import-cycle necessity -- see status.CacheReport's doc comment), so this
+// is the one place that translates it. Unlike those three, this is NOT a
+// 1:1 field mirror -- CacheModelReport deliberately omits CacheDir (the
+// parent grouping), Files (internal provenance), and Pinned (reserved,
+// P5-only) -- so no TestCacheShapeParity-style reflection test is added
+// here; the deliberate subset would fail one by design. Returns nil for a
+// nil idx (defensive; Store.Snapshot() never actually returns nil).
+func cacheReportFrom(idx *cacheindex.Index) *status.CacheReport {
+	if idx == nil {
+		return nil
+	}
+	meta := idx.Meta()
+	byDir := idx.EntriesByDir()
+
+	measuredByDir := map[string]int64{}
+	familyByDir := map[string]string{}
+	for _, d := range meta.Dirs {
+		measuredByDir[d.Dir] = d.MeasuredBytes
+		familyByDir[d.Dir] = d.Family
+	}
+	// A dir with a measured scan total but zero live entries (e.g. a
+	// duplicate/orphan directory with nothing indexed) still gets a row --
+	// union the dirs from both sources rather than iterating byDir alone.
+	dirSet := map[string]bool{}
+	for dir := range byDir {
+		dirSet[dir] = true
+	}
+	for dir := range measuredByDir {
+		dirSet[dir] = true
+	}
+	dirNames := make([]string, 0, len(dirSet))
+	for dir := range dirSet {
+		dirNames = append(dirNames, dir)
+	}
+	sort.Strings(dirNames)
+
+	report := &status.CacheReport{ScannedAt: meta.ScannedAt}
+	for _, dir := range dirNames {
+		entries := byDir[dir]
+
+		var indexed int64
+		family := familyByDir[dir]
+		for _, e := range entries {
+			indexed += e.SizeBytes
+			if family == "" {
+				family = string(e.Family)
+			}
+		}
+		report.TotalIndexedBytes += indexed
+
+		dr := status.CacheDirReport{
+			Dir:          dir,
+			Family:       family,
+			IndexedBytes: indexed,
+			EntryCount:   len(entries),
+		}
+		if measured, ok := measuredByDir[dir]; ok {
+			dr.MeasuredBytes = measured
+			if measured > indexed {
+				dr.UnindexedBytes = measured - indexed
+			}
+		}
+
+		sort.SliceStable(entries, func(i, j int) bool { return entries[i].SizeBytes > entries[j].SizeBytes })
+		rows := entries
+		if len(rows) > maxCacheHeartbeatModelRows {
+			rows = rows[:maxCacheHeartbeatModelRows]
+		}
+		for _, e := range rows {
+			dr.Models = append(dr.Models, status.CacheModelReport{
+				Model:     e.Model,
+				Engine:    e.Engine,
+				SizeBytes: e.SizeBytes,
+				PulledAt:  e.PulledAt,
+				LastUsed:  e.LastUsed,
+				Source:    e.Source,
+			})
+		}
+		report.Dirs = append(report.Dirs, dr)
+	}
+
+	if meta.LegacyHF != nil {
+		report.LegacyHFCache = &status.LegacyCacheReport{
+			Path:      meta.LegacyHF.Path,
+			SizeBytes: meta.LegacyHF.SizeBytes,
+		}
+	}
+
+	return report
 }
 
 func resolveConsumerGroup(explicit, headscaleNodeID, hostname string) string {

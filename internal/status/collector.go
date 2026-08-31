@@ -40,6 +40,7 @@ type Collector struct {
 	reservations    func() []GPUReservation          // live job-scoped GPU reservations (citadel #832), optional
 	laneActivity    func() []LaneActivity            // live bounded-execution-lane activity (citadel #908), optional
 	pairingDisplay  func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
+	cacheReport     func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -100,6 +101,12 @@ type CollectorConfig struct {
 	// NodeStatus.PairingDisplay omitted for the common (headless) case.
 	// Optional: nil on a legacy build.
 	PairingDisplay func() *PairingDisplayCapability
+	// CacheReport, when set, returns the node's live cache-index attribution
+	// attached to each heartbeat as NodeStatus.Cache (citadel #682 P3). See
+	// cacheReportFrom (cmd/work.go) for the projection. Optional: nil when no
+	// cache index store is wired (any process other than `citadel work`, or
+	// a legacy build).
+	CacheReport func() *CacheReport
 }
 
 // NewCollector creates a new status collector.
@@ -123,6 +130,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		reservations:    cfg.Reservations,
 		laneActivity:    cfg.LaneActivity,
 		pairingDisplay:  cfg.PairingDisplay,
+		cacheReport:     cfg.CacheReport,
 	}
 }
 
@@ -458,6 +466,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// case.
 	if c.pairingDisplay != nil {
 		status.PairingDisplay = c.pairingDisplay()
+	}
+
+	// Attach the live cache-index attribution (citadel #682 P3). Additive:
+	// nil provider (no cache index store wired) leaves the field omitted.
+	if c.cacheReport != nil {
+		status.Cache = c.cacheReport()
 	}
 
 	return status, nil

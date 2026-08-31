@@ -88,6 +88,97 @@ type NodeStatus struct {
 	// docs/design-pairing-display.md §2.2/§9.1 for why that signal is the
 	// wrong gate for a root systemd worker).
 	PairingDisplay *PairingDisplayCapability `json:"pairing_display,omitempty"`
+	// Cache carries the durable cache-index attribution (citadel #682 P3,
+	// docs/design-cache-ownership.md §9.4): which models are cached where,
+	// their sizes, and the out-of-band-drift/legacy-duplicate signals the
+	// index's scan metadata records. Additive/omitempty: nil on a node whose
+	// cache index was never initialized (any process other than `citadel
+	// work`, or a legacy build) -- indistinguishable from a pre-P3 node,
+	// which is the correct degradation (see cacheReportFrom, cmd/work.go).
+	Cache *CacheReport `json:"cache,omitempty"`
+}
+
+// CacheReport is the heartbeat-facing projection of a cacheindex.Index
+// snapshot (citadel #682 P3, design doc §9.4) -- a hand-maintained mirror,
+// matching the SwapActivity/GPUReservation/LaneActivity precedent: internal/
+// status COULD import the leaf internal/cacheindex without an import cycle,
+// but keeping the heartbeat schema owned in one file next to its siblings
+// (and the projection, cacheReportFrom, living beside ITS siblings in
+// cmd/work.go) is the deliberate, established convention here, not an
+// oversight. See cacheReportFrom for the exact field mapping.
+type CacheReport struct {
+	// ScannedAt is when the index's ReconcileScan last reconciled against
+	// disk. Zero/omitted means never on this node (a cache index that has
+	// only ever been mutated by Upsert/Remove/MarkUsed, no scan yet) -- NOT
+	// "no cache", which is instead the whole *CacheReport being nil.
+	ScannedAt time.Time `json:"scanned_at,omitempty"`
+	// TotalIndexedBytes sums every live entry's SizeBytes across every
+	// cache_dir -- the index's OWN accounting, not a live du.
+	TotalIndexedBytes int64 `json:"total_indexed_bytes"`
+	// Dirs is the per-cache_dir attribution, one row per cache_dir carrying
+	// at least one indexed entry or a measured scan total.
+	Dirs []CacheDirReport `json:"dirs,omitempty"`
+	// LegacyHFCache reports the pre-#682 duplicate HuggingFace hub cache
+	// (design doc §9.3) when the last scan found one worth reporting.
+	LegacyHFCache *LegacyCacheReport `json:"legacy_hf_cache,omitempty"`
+}
+
+// CacheDirReport is one cache_dir's attribution within CacheReport.
+type CacheDirReport struct {
+	// Dir is the cache_dir name (e.g. "huggingface", "llamacpp", "bonsai").
+	Dir string `json:"dir"`
+	// Family names the on-disk layout at Dir ("hf-hub" | "gguf-dir" | "native").
+	Family string `json:"family"`
+	// IndexedBytes sums this dir's live entries' SizeBytes.
+	IndexedBytes int64 `json:"indexed_bytes"`
+	// MeasuredBytes is the last ReconcileScan's measured total for the WHOLE
+	// directory. Omitted (zero) when this dir was not measured by the last
+	// scan (unreadable, or an operator cache-location override) -- absence
+	// means "unknown", never "confirmed zero".
+	MeasuredBytes int64 `json:"measured_bytes,omitempty"`
+	// UnindexedBytes is max(MeasuredBytes-IndexedBytes, 0) -- the out-of-
+	// band-drift/orphan-or-duplicate signal design doc §8.4 promised P3.
+	// Omitted when MeasuredBytes is unknown or does not exceed IndexedBytes.
+	UnindexedBytes int64 `json:"unindexed_bytes,omitempty"`
+	// EntryCount is the number of live index entries in this dir -- lets a
+	// consumer tell when Models (below) has been truncated.
+	EntryCount int `json:"entry_count"`
+	// Models is the per-model attribution, size-descending, capped at
+	// maxCacheHeartbeatModelRows (cmd/work.go) so a hoarder cache cannot
+	// balloon the heartbeat payload.
+	Models []CacheModelReport `json:"models,omitempty"`
+}
+
+// CacheModelReport is one cached model/repo's attribution within a
+// CacheDirReport.
+type CacheModelReport struct {
+	// Model is the model/repo id, or a bare filename for a backfilled
+	// gguf-dir entry with no known repo.
+	Model string `json:"model"`
+	// Engine is provenance (who pulled it), not identity -- several engines
+	// can share one hf-hub cache_dir.
+	Engine string `json:"engine,omitempty"`
+	// SizeBytes is this entry's own attributed size.
+	SizeBytes int64 `json:"size_bytes"`
+	// PulledAt is when this entry was created (a real pull's completion
+	// time, or a backfilled entry's file mtime).
+	PulledAt time.Time `json:"pulled_at,omitempty"`
+	// LastUsed is the most precise "used" signal recorded, zero when unknown
+	// (never "never used" -- see cacheindex.Entry.LastUsed's doc comment).
+	LastUsed time.Time `json:"last_used,omitempty"`
+	// Source is "pull" or "backfill" -- see cacheindex.SourcePull/SourceBackfill.
+	Source string `json:"source,omitempty"`
+}
+
+// LegacyCacheReport is the durable, aggregated counterpart to
+// warnIfLegacyHFCacheExists' per-pull log line (design doc §9.3): a real
+// pre-#682 duplicate HuggingFace hub cache this node is still carrying.
+type LegacyCacheReport struct {
+	// Path is the legacy cache directory (e.g. "~/.cache/huggingface" with
+	// $HOME expanded) an operator can remove manually to reclaim space.
+	Path string `json:"path"`
+	// SizeBytes is the legacy hub-cache subdirectory's size specifically.
+	SizeBytes int64 `json:"size_bytes"`
 }
 
 // PairingDisplayCapability is the heartbeat-facing pairing-display

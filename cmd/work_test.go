@@ -1,16 +1,19 @@
 package cmd
 
 import (
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
+	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // TestResolveAutoUpdateEnabled verifies the precedence that lets the web UI /
@@ -513,4 +516,105 @@ func goFieldNames(t reflect.Type) map[string]struct{} {
 		out[t.Field(i).Name] = struct{}{}
 	}
 	return out
+}
+
+// TestCacheReportFromNil pins cacheReportFrom's defensive nil handling
+// (citadel #682 P3) -- mirrors swapStatsFrom(empty)'s non-nil-but-empty
+// contract check, except here nil really does mean nil: no index means no
+// report at all, not an empty one.
+func TestCacheReportFromNil(t *testing.T) {
+	if got := cacheReportFrom(nil); got != nil {
+		t.Errorf("cacheReportFrom(nil) = %+v, want nil", got)
+	}
+}
+
+// TestCacheReportFrom pins the cacheindex.Index -> status.CacheReport
+// projection (citadel #682 P3, design doc §9.4): per-dir aggregation,
+// indexed-vs-measured unindexed-remainder math, size-descending model rows,
+// and the legacy-cache passthrough.
+func TestCacheReportFrom(t *testing.T) {
+	dir := t.TempDir()
+	s := cacheindex.Open(filepath.Join(dir, cacheindex.FileName), nil)
+	fixedNow := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := s.Upsert(cacheindex.Entry{
+		CacheDir:  services.HFHubCacheDirName,
+		Family:    services.CacheFamilyHFHub,
+		Model:     "org/small",
+		Engine:    "vllm",
+		SizeBytes: 100,
+		PulledAt:  fixedNow.Add(-48 * time.Hour),
+		LastUsed:  fixedNow.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Upsert(cacheindex.Entry{
+		CacheDir:  services.HFHubCacheDirName,
+		Family:    services.CacheFamilyHFHub,
+		Model:     "org/big",
+		Engine:    "vllm",
+		SizeBytes: 900,
+		PulledAt:  fixedNow.Add(-72 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	idx := s.Snapshot()
+	got := cacheReportFrom(idx)
+	if got == nil {
+		t.Fatalf("cacheReportFrom returned nil for a non-nil index")
+	}
+	if got.TotalIndexedBytes != 1000 {
+		t.Errorf("TotalIndexedBytes = %d, want 1000", got.TotalIndexedBytes)
+	}
+	if len(got.Dirs) != 1 {
+		t.Fatalf("Dirs = %+v, want exactly one dir report", got.Dirs)
+	}
+	dr := got.Dirs[0]
+	if dr.Dir != services.HFHubCacheDirName || dr.Family != string(services.CacheFamilyHFHub) {
+		t.Errorf("unexpected dir report identity: %+v", dr)
+	}
+	if dr.IndexedBytes != 1000 || dr.EntryCount != 2 {
+		t.Errorf("IndexedBytes/EntryCount = %d/%d, want 1000/2", dr.IndexedBytes, dr.EntryCount)
+	}
+	// No scan metadata was ever recorded (no ReconcileScan ran), so
+	// Measured/Unindexed must stay zero -- absence, not a fabricated zero.
+	if dr.MeasuredBytes != 0 || dr.UnindexedBytes != 0 {
+		t.Errorf("MeasuredBytes/UnindexedBytes = %d/%d, want 0/0 with no scan metadata", dr.MeasuredBytes, dr.UnindexedBytes)
+	}
+	if len(dr.Models) != 2 || dr.Models[0].Model != "org/big" || dr.Models[1].Model != "org/small" {
+		t.Fatalf("Models = %+v, want size-descending [org/big, org/small]", dr.Models)
+	}
+	if got.LegacyHFCache != nil {
+		t.Errorf("LegacyHFCache = %+v, want nil (none recorded)", got.LegacyHFCache)
+	}
+}
+
+// TestCacheReportFromCapsModelRows pins maxCacheHeartbeatModelRows (citadel
+// #682 P3, design doc §9.4): a dir with more entries than the cap still
+// reports the true EntryCount, but truncates Models.
+func TestCacheReportFromCapsModelRows(t *testing.T) {
+	dir := t.TempDir()
+	s := cacheindex.Open(filepath.Join(dir, cacheindex.FileName), nil)
+	for i := 0; i < maxCacheHeartbeatModelRows+5; i++ {
+		if err := s.Upsert(cacheindex.Entry{
+			CacheDir:  services.LlamaCppCacheDirName,
+			Family:    services.CacheFamilyGGUFDir,
+			Model:     filepath.Join("model", string(rune('a'+i))+".gguf"),
+			SizeBytes: int64(i + 1),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := cacheReportFrom(s.Snapshot())
+	if len(got.Dirs) != 1 {
+		t.Fatalf("Dirs = %+v, want exactly one dir report", got.Dirs)
+	}
+	dr := got.Dirs[0]
+	if dr.EntryCount != maxCacheHeartbeatModelRows+5 {
+		t.Errorf("EntryCount = %d, want %d (the true count, uncapped)", dr.EntryCount, maxCacheHeartbeatModelRows+5)
+	}
+	if len(dr.Models) != maxCacheHeartbeatModelRows {
+		t.Errorf("len(Models) = %d, want the capped %d", len(dr.Models), maxCacheHeartbeatModelRows)
+	}
 }

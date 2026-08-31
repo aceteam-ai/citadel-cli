@@ -1205,38 +1205,96 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
 
 ## 11. Open questions for Jason (P3 + P5)
 
-### P3
+### P3 — RESOLVED, P3 SHIPPED (2026-08-30)
 
-1. **Per-model rows in the heartbeat** (§9.4): top-32-by-size per dir
-   (recommended — it's what makes the dashboard actionable), or per-dir
-   aggregates only (smallest payload; model rows only in `citadel status`)?
-2. **Worker-side freshness** (§9.3/§9.6): is scan-at-startup-only staleness
-   acceptable for the reported numbers (a long-lived worker's scan metadata
-   goes days/weeks stale against out-of-band container downloads), or
-   should the WORKER re-run `ReconcileScan` on a slow timer (e.g. 24h)?
-   §8.5 rejected per-tick rescans; a daily one inside the single-writer
-   worker is a different cost profile (one du-scale walk/day). Recommended:
-   add the daily rescan — P3's numbers are only as good as their scan.
+1. **Per-model rows in the heartbeat** (§9.4): **RESOLVED — shipped with
+   per-model rows.** `cacheReportFrom` (`cmd/work.go`) attaches top-32-by-size
+   `CacheModelReport` rows per `CacheDirReport`, capped by
+   `maxCacheHeartbeatModelRows`; `EntryCount` carries the true (uncapped)
+   count so a consumer can tell when rows were truncated. Pinned by
+   `TestCacheReportFrom`/`TestCacheReportFromCapsModelRows` (`cmd/work_test.go`).
+2. **Worker-side freshness** (§9.3/§9.6): **NOT resolved — left open, and NOT
+   implemented in this PR.** P3 ships §8.5's original decision unchanged:
+   `ReconcileScan` runs once, at `citadel work` startup, via the SAME call
+   site (`cmd/work.go`'s `runWork`) that already ran it for P2a — now passing
+   `cacheindex.ScanOptions{LegacyHFHubDir: jobs.LegacyHFHubDirForScan()}`. No
+   daily/slow-timer rescan was added; a long-lived worker's `ScannedAt`/
+   `MeasuredBytes`/`LegacyHFCache` values go stale against out-of-band
+   container downloads exactly as this question describes, until the next
+   restart. Whether to add a periodic rescan is still Jason's call, for a
+   follow-up PR — not blocking, since `printCacheInfo`'s freshness line
+   ("index last reconciled ... at `citadel work` startup") and the
+   heartbeat's `ScannedAt` field both surface the staleness honestly rather
+   than hiding it.
 
-### P5
+**What P3 shipped, precisely** (docs/design-cache-ownership.md §9, this PR):
+- `internal/cacheindex`'s on-disk format gained additive scan metadata
+  (`ScannedAt`/`Dirs`/`LegacyHF`) at **FormatVersion 1, unchanged** — the
+  fields are new top-level keys with `omitempty`, so a pre-P3 file (missing
+  these keys entirely) loads with `Meta()` at its zero value ("never
+  scanned") rather than failing to load or requiring a version bump. Pinned
+  by `TestLoadOldFormatWithoutScanMetadataForwardCompat` (constructs a
+  literal `{"version":1,"entries":[...]}` file with none of the new keys)
+  and `TestScanMetadataRoundTrip` (`internal/cacheindex/cacheindex_test.go`).
+- `Store.ReconcileScan` gained a required `ScanOptions` parameter
+  (`LegacyHFHubDir`) and now also records `Meta` (measured per-dir totals via
+  `buildDirScans`, the legacy-duplicate probe via `probeLegacyHFCache`) on
+  every pass, per §9.3.
+- `jobs.LegacyHFHubDirForScan()` (`internal/jobs/model_cache_pull.go`) is the
+  new exported resolver + gate (factored out of, and now reused by,
+  `warnIfLegacyHFCacheExists` — one implementation, per §9.3's instruction).
+- `NodeStatus.Cache` (`internal/status/types.go`: `CacheReport`/
+  `CacheDirReport`/`CacheModelReport`/`LegacyCacheReport`) is the new
+  heartbeat field, wired via `CollectorConfig.CacheReport` at both
+  `cmd/work.go` collector construction sites. `cacheReportFrom` is the
+  hand-maintained projection (the `SwapActivity`/`GPUReservation`/
+  `LaneActivity` mirror pattern) — deliberately NOT given a
+  `TestXShapeParity`-style reflection test, because unlike those three it is
+  NOT a 1:1 field mirror (`CacheModelReport` intentionally omits `CacheDir`,
+  `Files`, `Pinned`); see its doc comment.
+- **Index-miss / staleness handling, per §9.2/§9.5 exactly:** the heartbeat
+  reads the LIVE `jobs.CacheIndexStore()` (nil ⇒ `NodeStatus.Cache` omitted,
+  indistinguishable from a pre-P3 node); `citadel status`'s `printCacheInfo`
+  reads the on-disk file read-only via `cacheindex.Load` and NEVER writes
+  it — a missing/empty index falls back to the original live `du`-based
+  rendering verbatim, plus a hint line ("no cache index yet — run `citadel
+  work` to build it"); an index that exists but has never been scanned
+  (`Meta().ScannedAt.IsZero()`) still renders its entries, with a "not yet
+  reconciled" line instead of a fabricated freshness claim.
+- `printCacheInfo` (`cmd/status.go`) now renders index-backed per-dir/
+  per-model rows (size-descending, top 10, with age) plus the legacy-
+  duplicate line and a freshness line, keeping exactly one `du -sh` total
+  (the out-of-band-drift cross-check §9.5 specifies) and dropping the
+  expensive per-subdir `du` loop.
 
-3. **Backfill evictability — the headline fork** (§10.3.4): recommended
-   EVICTABLE (the #682 40G is backfill; exempting it guts the feature),
-   reversing the shipped comment's presumption. Confirm, or keep
-   `SourceBackfill` exempt in v1 and accept that P5 then only manages
-   weights pulled after P2a shipped?
-4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): disk-percent
-   high/low water on the cache volume (recommended: 90/80) — or do you also
-   want an absolute byte budget (per cache dir or global) for proactive
-   trimming on big-disk nodes where 90% is already catastrophic for
-   neighbors?
-5. **Pinning source** (§10.3.2, carries §6 Q1): manifest `pinned_models` in
-   `citadel.yaml` (recommended — mirrors `pinned_services`, no index write,
-   no new write path), vs a runtime `citadel cache pin` CLI (needs a
-   cross-process index-write path that violates the single-writer rule
-   today — would have to be a job type or wait for a local job-submission
-   path)?
-6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): OK to ship GC on the
-   v1 resident-implies-used signal per the §10.2 sufficiency argument
-   (recommended), or hold P5 until per-request `MarkUsed` touches (via the
-   `RecordEngineRequest` call sites) land first?
+### P5 — NOT IMPLEMENTED IN THIS PR (design only; next PR)
+
+3. **Backfill evictability — the headline fork** (§10.3.4): **RESOLVED by
+   Jason (2026-08-30): EVICTABLE.** Reverses `SourceBackfill`'s shipped doc
+   comment ("Exempt from GC in a future phase") — the #682 40G duplicate IS
+   backfill by definition, so exempting it would gut P5 against its own
+   motivating incident. This decision is recorded here for the P5
+   implementation PR to build against; **P5 itself (the GC executor,
+   `PlanGC`, the `cacheMutationMu`, the `gc` heartbeat sub-struct, `citadel
+   cache gc --dry-run`) is NOT implemented in this PR** — only this doc
+   update. The P5 PR must update `SourceBackfill`'s doc comment in
+   `internal/cacheindex/cacheindex.go` to match (currently still says
+   "Exempt... P2a only sets the marker, no GC logic reads it yet" — accurate
+   today, since no GC logic exists yet, but the exemption presumption it
+   states is superseded by this decision and should be corrected when P5
+   lands so the two don't silently disagree).
+4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): still open — not
+   decided in this pass. disk-percent high/low water on the cache volume
+   (recommended: 90/80) — or do you also want an absolute byte budget (per
+   cache dir or global) for proactive trimming on big-disk nodes where 90%
+   is already catastrophic for neighbors?
+5. **Pinning source** (§10.3.2, carries §6 Q1): still open — not decided in
+   this pass. manifest `pinned_models` in `citadel.yaml` (recommended —
+   mirrors `pinned_services`, no index write, no new write path), vs a
+   runtime `citadel cache pin` CLI (needs a cross-process index-write path
+   that violates the single-writer rule today — would have to be a job type
+   or wait for a local job-submission path)?
+6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): still open — not decided
+   in this pass. OK to ship GC on the v1 resident-implies-used signal per the
+   §10.2 sufficiency argument (recommended), or hold P5 until per-request
+   `MarkUsed` touches (via the `RecordEngineRequest` call sites) land first?

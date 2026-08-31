@@ -69,8 +69,15 @@ const (
 	// already on disk, with no pull recorded on this node (pre-existing
 	// cache, a self-provisioning engine's own container download, or a node
 	// that predates the index). Never overwrites a SourcePull entry -- see
-	// ReconcileScan's doc comment. Exempt from GC in a future phase (P5);
-	// P2a only sets the marker, no GC logic reads it yet.
+	// ReconcileScan's doc comment.
+	//
+	// EVICTABLE by P5 GC, per Jason's 2026-08-25 decision
+	// (docs/design-cache-ownership.md §11 P3/P5 -- "Backfill evictability"),
+	// reversing an earlier draft presumption of "exempt" recorded in this
+	// comment: the #682 40G duplicate this whole feature exists to reclaim
+	// IS backfill by definition, so exempting it would gut GC against its
+	// own motivating incident. No GC logic exists yet (P5 is a separate,
+	// not-yet-implemented PR) -- this marker alone carries no exemption.
 	SourceBackfill = "backfill"
 )
 
@@ -207,10 +214,79 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// fileFormat is the top-level on-disk shape.
+// DirScan is one cache_dir's measured total from the most recent
+// ReconcileScan pass (citadel #682 P3, design doc §9.3) -- the du-replacement
+// signal printCacheInfo/the heartbeat need to compute "measured - indexed =
+// unindexed remainder" (the out-of-band-drift / orphan-or-duplicate cross
+// check), without re-walking the tree on every render/tick.
+type DirScan struct {
+	// Dir is the cache_dir name (matches Entry.CacheDir).
+	Dir string `json:"dir"`
+	// Family names the on-disk layout at Dir (services.CacheFamily, as a
+	// plain string so this type stays independent of Entry's typed field).
+	Family string `json:"family"`
+	// MeasuredBytes is the full directory's on-disk size as of ScannedAt --
+	// deliberately the WHOLE cache_dir (not just the entries the scan
+	// indexed), so it also catches non-artifact remainder (a duplicate a
+	// scan can't attribute, engine-native lock/log files, ...).
+	MeasuredBytes int64 `json:"measured_bytes"`
+}
+
+// LegacyHFCache reports the pre-#682 duplicate HuggingFace hub cache at
+// ~/.cache/huggingface (design doc §9.3's "legacy duplicate" record), present
+// only when the caller's ScanOptions.LegacyHFHubDir probe found a real model
+// cache there (see jobs.LegacyHFHubDirForScan's gate -- a bare
+// ~/.cache/huggingface holding only an `hf auth login` token must never be
+// reported as reclaimable).
+type LegacyHFCache struct {
+	// Path is the legacy cache directory (e.g. "~/.cache/huggingface" with
+	// $HOME expanded), the same location warnIfLegacyHFCacheExists already
+	// reports informationally per-pull -- this is its durable, aggregated
+	// counterpart.
+	Path string `json:"path"`
+	// SizeBytes is the size of the legacy hub-cache subdirectory specifically
+	// (the reclaimable model weights), not the whole legacy dir (which may
+	// also hold unrelated files like an `hf auth login` token).
+	SizeBytes int64 `json:"size_bytes"`
+}
+
+// Meta is the index's scan metadata (citadel #682 P3, design doc §9.3):
+// everything ReconcileScan records about ITS OWN most recent pass, as
+// opposed to the per-artifact Entry records. Zero value (ScannedAt.IsZero(),
+// Dirs==nil, LegacyHF==nil) means "never scanned" -- an index file written
+// before this field existed (or one MarkUsed/Upsert alone has touched,
+// without an intervening ReconcileScan) reads exactly this way, per the
+// package's lenient-degrade convention.
+type Meta struct {
+	// ScannedAt is when ReconcileScan last completed a pass. Zero means
+	// never.
+	ScannedAt time.Time
+	// Dirs holds one entry per services.EngineCacheDirs cache_dir the LAST
+	// scan successfully measured. A dir absent from this slice was not
+	// measured this pass (unreadable, or an operator HF_HUB_CACHE-style
+	// override pointing the real layout elsewhere) -- absence means
+	// "unknown", never "zero bytes" (the same #632-class rule ReconcileScan's
+	// staleness cleanup already applies to pruning).
+	Dirs []DirScan
+	// LegacyHF is non-nil only when the last scan's ScanOptions.LegacyHFHubDir
+	// probe found a real legacy duplicate cache.
+	LegacyHF *LegacyHFCache
+}
+
+// fileFormat is the top-level on-disk shape. ScannedAt/Dirs/LegacyHF are
+// additive (design doc §9.3): FormatVersion stays 1 -- a pre-P3 file simply
+// omits these keys, and reading it back leaves Meta at its zero value
+// ("never scanned"), which is exactly the correct answer for a file P3's
+// ReconcileScan has never written to. ScannedAt is an RFC3339 string
+// (omitted when zero), mirroring entryJSON's per-field lenient-timestamp
+// pattern so a malformed scanned_at degrades that ONE field to "unknown"
+// rather than the whole top-level unmarshal failing.
 type fileFormat struct {
-	Version int     `json:"version"`
-	Entries []Entry `json:"entries"`
+	Version   int            `json:"version"`
+	Entries   []Entry        `json:"entries"`
+	ScannedAt string         `json:"scanned_at,omitempty"`
+	Dirs      []DirScan      `json:"dirs,omitempty"`
+	LegacyHF  *LegacyHFCache `json:"legacy_hf_cache,omitempty"`
 }
 
 // entryKey builds the (cache_dir, model) primary key. NUL-joined so a
@@ -225,6 +301,7 @@ func entryKey(cacheDir, model string) string {
 // after construction).
 type Index struct {
 	entries map[string]Entry
+	meta    Meta
 }
 
 func newIndex() *Index {
@@ -235,6 +312,27 @@ func (ix *Index) snapshot() *Index {
 	out := newIndex()
 	for k, v := range ix.entries {
 		out.entries[k] = v
+	}
+	// meta's slices (Dirs) are never mutated in place by ReconcileScan (it
+	// always assigns a fresh slice -- see buildDirScans), so sharing them
+	// with the snapshot is safe under Index's "never mutated after
+	// construction" contract.
+	out.meta = ix.meta
+	return out
+}
+
+// Meta returns the index's scan metadata (design doc §9.3). Zero value when
+// ReconcileScan has never run against this Store/file.
+func (ix *Index) Meta() Meta {
+	return ix.meta
+}
+
+// IndexedBytesByDir sums each cache_dir's live entries' SizeBytes (P3
+// reporting's "indexed" half of "measured - indexed = unindexed remainder").
+func (ix *Index) IndexedBytesByDir() map[string]int64 {
+	out := map[string]int64{}
+	for _, e := range ix.entries {
+		out[e.CacheDir] += e.SizeBytes
 	}
 	return out
 }
@@ -265,8 +363,11 @@ func Load(path string) (*Index, error) {
 	// array. A single json.Unmarshal into []Entry would fail the whole
 	// slice on the first bad element.
 	var raw struct {
-		Version int               `json:"version"`
-		Entries []json.RawMessage `json:"entries"`
+		Version   int               `json:"version"`
+		Entries   []json.RawMessage `json:"entries"`
+		ScannedAt string            `json:"scanned_at,omitempty"`
+		Dirs      []DirScan         `json:"dirs,omitempty"`
+		LegacyHF  *LegacyHFCache    `json:"legacy_hf_cache,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return idx, err
@@ -280,6 +381,19 @@ func Load(path string) (*Index, error) {
 			continue // missing key fields: not identifiable, skip
 		}
 		idx.entries[entryKey(e.CacheDir, e.Model)] = e
+	}
+	// Scan metadata (design doc §9.3) is additive: absent on a pre-P3 file
+	// (raw.ScannedAt/Dirs/LegacyHF all zero-valued from the missing keys),
+	// which leaves idx.meta at its zero value ("never scanned") -- exactly
+	// the correct forward-compat read for an older file. A malformed
+	// scanned_at degrades to "unknown" (zero time) rather than failing the
+	// whole load, mirroring entryJSON's per-field leniency.
+	idx.meta.Dirs = raw.Dirs
+	idx.meta.LegacyHF = raw.LegacyHF
+	if raw.ScannedAt != "" {
+		if t, err := time.Parse(time.RFC3339, raw.ScannedAt); err == nil {
+			idx.meta.ScannedAt = t
+		}
 	}
 	return idx, nil
 }
@@ -308,7 +422,11 @@ func writeIndexFile(path string, idx *Index) error {
 		return entries[i].Model < entries[j].Model
 	})
 
-	data, err := json.MarshalIndent(fileFormat{Version: FormatVersion, Entries: entries}, "", "  ")
+	ff := fileFormat{Version: FormatVersion, Entries: entries, Dirs: idx.meta.Dirs, LegacyHF: idx.meta.LegacyHF}
+	if !idx.meta.ScannedAt.IsZero() {
+		ff.ScannedAt = idx.meta.ScannedAt.UTC().Format(time.RFC3339)
+	}
+	data, err := json.MarshalIndent(ff, "", "  ")
 	if err != nil {
 		return err
 	}

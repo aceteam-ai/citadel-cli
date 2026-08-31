@@ -58,6 +58,23 @@ func (r *scanResult) markFound(cacheDir, file string) {
 	r.foundFiles[cacheDir][file] = true
 }
 
+// ScanOptions carries the scan-time inputs ReconcileScan needs but cannot
+// resolve itself, per design doc §9.3. internal/cacheindex is a LEAF package
+// (imports only stdlib + services) and must not import internal/jobs, so a
+// caller that wants the legacy-HF-duplicate probe (see LegacyHFHubDir below)
+// resolves it externally (jobs.LegacyHFHubDirForScan) and passes it in.
+type ScanOptions struct {
+	// LegacyHFHubDir, when non-empty, is the resolved pre-#682 legacy
+	// HuggingFace hub-cache directory to size for the durable "legacy
+	// duplicate" scan-metadata record (design doc §9.3's LegacyHFCache).
+	// Empty means skip the probe entirely -- Meta.LegacyHF stays nil. The
+	// caller is expected to have already applied the "at least one real
+	// models--* entry" gate (jobs.LegacyHFHubDirForScan's doc comment
+	// explains why): ReconcileScan does not re-derive or re-validate this
+	// path, it only sizes whatever is passed.
+	LegacyHFHubDir string
+}
+
 // ReconcileScan reconciles what is actually on disk under cacheRoot (see
 // DefaultCacheRoot) into the index, per design doc §8.5. It is idempotent
 // and safe to call repeatedly (every `citadel work` startup, per
@@ -106,7 +123,7 @@ func (r *scanResult) markFound(cacheDir, file string) {
 // either) rather than wiping the index, but it will not discover an
 // override-location's models. Widening this to thread the real resolver in
 // is a documented follow-up.
-func (s *Store) ReconcileScan(cacheRoot string) error {
+func (s *Store) ReconcileScan(cacheRoot string, opts ScanOptions) error {
 	res := newScanResult()
 
 	for dir, engines := range enginesByCacheDir(services.CacheFamilyHFHub) {
@@ -119,8 +136,17 @@ func (s *Store) ReconcileScan(cacheRoot string) error {
 		scanNativeDir(cacheRoot, dir, representative(engines), res)
 	}
 
+	// Scan metadata (design doc §9.3): a per-dir measured total for every
+	// cache_dir this pass actually found on disk, plus the legacy-duplicate
+	// probe. Computed from res/disk BEFORE any Store mutation below -- both
+	// are pure reads independent of s.idx.entries.
+	dirScans := buildDirScans(cacheRoot, res)
+	legacyHF := probeLegacyHFCache(opts.LegacyHFHubDir)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.idx.meta = Meta{ScannedAt: s.now(), Dirs: dirScans, LegacyHF: legacyHF}
 
 	// Every file already claimed by an EXISTING entry, per cache_dir --
 	// computed BEFORE any mutation below, so a candidate's own about-to-be-
@@ -384,25 +410,34 @@ func hasHiddenPathComponent(rel string) bool {
 // cleanup only iterates hf-hub/gguf-dir families), so this does not call
 // res.markScanned/markFound -- only res.discovered.
 //
-// Deliberately SKIPS ollama entirely (no row at all), even though ollama is
-// also CacheFamilyNative and design doc §8.1/§8.5 describe per-model
-// backfill for it: ollama's own pull/evict call sites (pullOllama,
-// ensureOllamaModel, evictOllama -- internal/jobs) already write real
-// per-model entries with an accurate size via `ollama list`, so a real gap
-// only exists for models pulled OUTSIDE citadel's tracking before the index
-// existed -- narrower, lower-value than duplicating an `ollama list`
+// Deliberately SKIPS creating a discovered ENTRY for ollama (no aggregate row),
+// even though ollama is also CacheFamilyNative and design doc §8.1/§8.5
+// describe per-model backfill for it: ollama's own pull/evict call sites
+// (pullOllama, ensureOllamaModel, evictOllama -- internal/jobs) already write
+// real per-model entries with an accurate size via `ollama list`, so a real
+// gap only exists for models pulled OUTSIDE citadel's tracking before the
+// index existed -- narrower, lower-value than duplicating an `ollama list`
 // subprocess parser into this leaf package (which would also make
-// ReconcileScan's tests depend on an `ollama` binary being present).
-// Writing a synthetic "_store" aggregate row for ollama here as well would
+// ReconcileScan's tests depend on an `ollama` binary being present). Writing
+// a synthetic "_store" aggregate row for ollama here as well would
 // double-count against its real per-model entries the moment any P3
 // reporting consumer sums a directory's entries. Documented as a deliberate
 // P2a scope decision, not an oversight.
+//
+// res.markScanned IS still called for ollama's cache_dir (unlike P2a's
+// original behavior, which skipped this function entirely for ollama before
+// ANY disk check) -- P3 needs to know the directory was found so its measured
+// total (buildDirScans) can report a real byte count even though this
+// function records no per-model entry for it. Safe: the staleness cleanup
+// this res feeds only iterates hf-hub/gguf-dir families (never native), so
+// marking a native dir scanned has no effect on entry pruning.
 func scanNativeDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
-	if engine == "ollama" {
-		return
-	}
 	dir := filepath.Join(cacheRoot, cacheDirName)
 	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+	res.markScanned(cacheDirName)
+	if engine == "ollama" {
 		return
 	}
 	key := entryKey(cacheDirName, nativeAggregateModel)
@@ -415,6 +450,57 @@ func scanNativeDir(cacheRoot, cacheDirName, engine string, res *scanResult) {
 		PulledAt:  dirModTime(dir),
 		Source:    SourceBackfill,
 	}
+}
+
+// buildDirScans computes design doc §9.3's per-dir measured totals: one
+// DirScan per services.EngineCacheDirs cache_dir that THIS pass successfully
+// found on disk (res.scannedDirs -- set by scanHFHubDir/scanGGUFDir/
+// scanNativeDir only on a successful directory read, per family). A dir NOT
+// in res.scannedDirs is omitted entirely (unreadable, or an operator
+// HF_HUB_CACHE-style override pointing the real layout elsewhere) --
+// omission means "not measured", never "zero bytes", matching Meta.Dirs' doc
+// comment. MeasuredBytes is the WHOLE cache_dir's size (dirSize), not just
+// the entries this scan indexed, so it also catches any non-artifact
+// remainder living alongside them.
+func buildDirScans(cacheRoot string, res *scanResult) []DirScan {
+	familyByDir := map[string]services.CacheFamily{}
+	for _, ec := range services.EngineCacheDirs {
+		familyByDir[ec.Dir] = ec.Family
+	}
+	dirs := make([]string, 0, len(familyByDir))
+	for d := range familyByDir {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+
+	var out []DirScan
+	for _, d := range dirs {
+		if !res.scannedDirs[d] {
+			continue
+		}
+		out = append(out, DirScan{
+			Dir:           d,
+			Family:        string(familyByDir[d]),
+			MeasuredBytes: dirSize(filepath.Join(cacheRoot, d)),
+		})
+	}
+	return out
+}
+
+// probeLegacyHFCache sizes the caller-resolved legacy HF hub-cache dir (see
+// ScanOptions.LegacyHFHubDir) for the durable "legacy duplicate" scan-metadata
+// record (design doc §9.3). Returns nil when legacyHubDir is empty (the
+// caller found nothing to report, or chose not to probe) or when it sizes to
+// zero (nothing there is worth reporting as reclaimable).
+func probeLegacyHFCache(legacyHubDir string) *LegacyHFCache {
+	if legacyHubDir == "" {
+		return nil
+	}
+	size := dirSize(legacyHubDir)
+	if size <= 0 {
+		return nil
+	}
+	return &LegacyHFCache{Path: filepath.Dir(legacyHubDir), SizeBytes: size}
 }
 
 func dirSize(dir string) int64 {

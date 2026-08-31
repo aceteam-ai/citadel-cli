@@ -38,7 +38,7 @@ func TestReconcileScanDiscoversEachFamily(t *testing.T) {
 
 	dir := t.TempDir()
 	s := Open(filepath.Join(dir, FileName), nil)
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 
@@ -100,7 +100,7 @@ func TestReconcileScanNeverOverwritesAPullEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 
@@ -120,7 +120,7 @@ func TestReconcileScanRefreshesBackfillEntriesButKeepsLastUsed(t *testing.T) {
 
 	storeDir := t.TempDir()
 	s := Open(filepath.Join(storeDir, FileName), nil)
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("first ReconcileScan: %v", err)
 	}
 	used := time.Now()
@@ -131,7 +131,7 @@ func TestReconcileScanRefreshesBackfillEntriesButKeepsLastUsed(t *testing.T) {
 	if err := os.WriteFile(dirPath, []byte("aaaaaaaaaaaaaaaaaaaa"), 0o644); err != nil { // 20 bytes
 		t.Fatal(err)
 	}
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("second ReconcileScan: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestReconcileScanDropsStaleEntries(t *testing.T) {
 
 	storeDir := t.TempDir()
 	s := Open(filepath.Join(storeDir, FileName), nil)
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("first scan: %v", err)
 	}
 	if _, ok := s.Snapshot().Lookup(services.LlamaCppCacheDirName, "gone.gguf"); !ok {
@@ -164,7 +164,7 @@ func TestReconcileScanDropsStaleEntries(t *testing.T) {
 	if err := os.Remove(ggufPath); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("second scan: %v", err)
 	}
 	if _, ok := s.Snapshot().Lookup(services.LlamaCppCacheDirName, "gone.gguf"); ok {
@@ -201,7 +201,7 @@ func TestReconcileScanPreservesRepoKeyedGGUFPullEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 
@@ -250,7 +250,7 @@ func TestReconcileScanPreservesRepoKeyedGGUFPullEntryInSubdirectory(t *testing.T
 		t.Fatal(err)
 	}
 
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 
@@ -296,7 +296,7 @@ func TestReconcileScanIgnoresDownloaderBookkeepingFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 
@@ -340,7 +340,7 @@ func TestReconcileScanNeverPrunesAnUnscannableDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ReconcileScan(root); err != nil {
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
 		t.Fatalf("ReconcileScan: %v", err)
 	}
 

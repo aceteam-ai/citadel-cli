@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -562,6 +564,14 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	return data, nil
 }
 
+// printCacheInfo renders cache attribution (citadel #682 P3, design doc
+// §9.5). Primary source is the durable cache index (read-only Load -- this
+// process never writes it, per §9.2's single-writer rule; the remedy for a
+// missing/stale index is running `citadel work`, stated in the output
+// itself). Falls back to the original live du-based rendering, verbatim,
+// when no index file exists yet (a node that has never run a post-P2a
+// `citadel work`) -- back-compat here is behavioral (human-facing tabwriter
+// text, no machine consumer to preserve), not schema-bound.
 func printCacheInfo(w *tabwriter.Writer) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -575,6 +585,94 @@ func printCacheInfo(w *tabwriter.Writer) {
 		return
 	}
 
+	idx, _ := cacheindex.Load(filepath.Join(network.GetNodeConfigDir(), cacheindex.FileName))
+	meta := idx.Meta()
+	byDir := idx.EntriesByDir()
+	if len(byDir) == 0 && meta.ScannedAt.IsZero() && meta.LegacyHF == nil {
+		printCacheInfoDuOnly(w, cacheDir)
+		fmt.Fprintf(w, "  %s\n", faintColor.Sprint("(no cache index yet -- run `citadel work` to build it)"))
+		return
+	}
+
+	// One du -sh total is KEPT (interactive render time is where one du is
+	// affordable): the live total vs. the index's measured total diverging
+	// is itself the out-of-band-drift/duplicate signal §8.4 promised, so it
+	// is worth paying for once here even though the per-subdir du loop
+	// (the expensive part) is gone, replaced by the index's own rows below.
+	totalCmd := exec.Command("du", "-sh", cacheDir)
+	if out, err := totalCmd.Output(); err == nil {
+		parts := strings.Fields(string(out))
+		if len(parts) > 0 {
+			fmt.Fprintf(w, "  %s:\t%s\n", labelColor.Sprint("Total Size (du)"), parts[0])
+		}
+	}
+
+	measuredByDir := map[string]int64{}
+	familyByDir := map[string]string{}
+	for _, d := range meta.Dirs {
+		measuredByDir[d.Dir] = d.MeasuredBytes
+		familyByDir[d.Dir] = d.Family
+	}
+
+	dirNames := make([]string, 0, len(byDir))
+	for dir := range byDir {
+		dirNames = append(dirNames, dir)
+	}
+	sort.Strings(dirNames)
+
+	fmt.Fprintf(w, "  %s:\n", labelColor.Sprint("Indexed Breakdown"))
+	if len(dirNames) == 0 {
+		fmt.Fprintf(w, "    (Empty)\n")
+	}
+	for _, dir := range dirNames {
+		entries := byDir[dir]
+		var indexed int64
+		for _, e := range entries {
+			indexed += e.SizeBytes
+		}
+		line := fmt.Sprintf("    - %s (%s):\t%s, %d model(s)", dir, familyByDir[dir], formatBytes(uint64(indexed)), len(entries))
+		if measured, ok := measuredByDir[dir]; ok && measured > indexed {
+			line += fmt.Sprintf(" (%s unindexed)", formatBytes(uint64(measured-indexed)))
+		}
+		fmt.Fprintln(w, line)
+
+		sort.SliceStable(entries, func(i, j int) bool { return entries[i].SizeBytes > entries[j].SizeBytes })
+		top := entries
+		if len(top) > 10 {
+			top = top[:10]
+		}
+		for _, e := range top {
+			age := "age unknown"
+			switch {
+			case !e.LastUsed.IsZero():
+				age = fmt.Sprintf("used %s ago", formatCacheAge(time.Since(e.LastUsed)))
+			case !e.PulledAt.IsZero():
+				age = fmt.Sprintf("pulled %s ago", formatCacheAge(time.Since(e.PulledAt)))
+			}
+			fmt.Fprintf(w, "      - %s:\t%s (%s)\n", e.Model, formatBytes(uint64(e.SizeBytes)), age)
+		}
+		if len(entries) > len(top) {
+			fmt.Fprintf(w, "      %s\n", faintColor.Sprintf("(%d more, top %d shown)", len(entries)-len(top), len(top)))
+		}
+	}
+
+	if meta.LegacyHF != nil {
+		fmt.Fprintf(w, "  %s:\t%s at %s (not touched -- remove manually to reclaim space)\n",
+			warnColor.Sprint("Legacy HF cache duplicate"), formatBytes(uint64(meta.LegacyHF.SizeBytes)), meta.LegacyHF.Path)
+	}
+
+	if meta.ScannedAt.IsZero() {
+		fmt.Fprintf(w, "  %s\n", faintColor.Sprint("(index not yet reconciled against disk -- run `citadel work`)"))
+	} else {
+		fmt.Fprintf(w, "  %s\n", faintColor.Sprintf("(index last reconciled %s -- at `citadel work` startup)",
+			meta.ScannedAt.Local().Format("2006-01-02 15:04:05")))
+	}
+}
+
+// printCacheInfoDuOnly is the pre-P3 live du-based rendering, verbatim --
+// printCacheInfo's fallback for a node whose cache index has never been
+// built (no post-P2a `citadel work` has run there yet).
+func printCacheInfoDuOnly(w *tabwriter.Writer, cacheDir string) {
 	totalCmd := exec.Command("du", "-sh", cacheDir)
 	totalOutput, err := totalCmd.Output()
 	if err == nil {
@@ -606,6 +704,27 @@ func printCacheInfo(w *tabwriter.Writer) {
 			name := filepath.Base(parts[1])
 			fmt.Fprintf(w, "    - %s:\t%s\n", name, size)
 		}
+	}
+}
+
+// formatCacheAge renders a duration as a coarse, human-scale age ("3d",
+// "5h", "12m") for the cache breakdown's per-model rows -- printCacheInfo is
+// the only caller; kept local rather than reusing a TUI-package helper (see
+// internal/tui/controlcenter's formatDuration/formatDurationCompact) to avoid
+// pulling that package into cmd/status.go for one line of formatting.
+func formatCacheAge(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	default:
+		return "<1m"
 	}
 }
 

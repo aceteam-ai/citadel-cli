@@ -439,3 +439,199 @@ func TestConcurrentUpsertAndMarkUsedSurviveOnDisk(t *testing.T) {
 		}
 	}
 }
+
+// --- Scan metadata (citadel #682 P3, design doc §9.3) ---
+
+// TestScanMetadataRoundTrip pins that ReconcileScan's scan metadata
+// (ScannedAt/Dirs/LegacyHF) survives a full write-then-Load round trip,
+// alongside the entries it discovers in the same pass -- the "version 1"
+// format design doc §9.3 specifies (additive fields, FormatVersion unchanged).
+func TestScanMetadataRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, services.HFHubCacheDirName, "hub", "models--org--repo", "weights.bin"), "0123456789")
+
+	legacyDir := t.TempDir()
+	writeFile(t, filepath.Join(legacyDir, "hub", "models--legacy--dup", "weights.bin"), "legacy-bytes")
+
+	storeDir := t.TempDir()
+	path := filepath.Join(storeDir, FileName)
+	s := Open(path, nil)
+	fixedNow := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return fixedNow }
+
+	opts := ScanOptions{LegacyHFHubDir: filepath.Join(legacyDir, "hub")}
+	if err := s.ReconcileScan(root, opts); err != nil {
+		t.Fatalf("ReconcileScan: %v", err)
+	}
+
+	// In-memory (pre-reload) view first.
+	meta := s.Snapshot().Meta()
+	if !meta.ScannedAt.Equal(fixedNow) {
+		t.Errorf("in-memory ScannedAt = %v, want %v", meta.ScannedAt, fixedNow)
+	}
+	if meta.LegacyHF == nil || meta.LegacyHF.SizeBytes != int64(len("legacy-bytes")) {
+		t.Fatalf("in-memory LegacyHF = %+v, want a populated entry sized %d", meta.LegacyHF, len("legacy-bytes"))
+	}
+	if meta.LegacyHF.Path != legacyDir {
+		t.Errorf("in-memory LegacyHF.Path = %q, want %q (the parent of the probed hub dir)", meta.LegacyHF.Path, legacyDir)
+	}
+	var hfDirScan *DirScan
+	for i := range meta.Dirs {
+		if meta.Dirs[i].Dir == services.HFHubCacheDirName {
+			hfDirScan = &meta.Dirs[i]
+		}
+	}
+	if hfDirScan == nil {
+		t.Fatalf("expected a DirScan for %s, got %+v", services.HFHubCacheDirName, meta.Dirs)
+	}
+	if hfDirScan.Family != string(services.CacheFamilyHFHub) || hfDirScan.MeasuredBytes != 10 {
+		t.Errorf("unexpected hf-hub DirScan: %+v", hfDirScan)
+	}
+
+	// Now the on-disk round trip.
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	rmeta := reloaded.Meta()
+	if !rmeta.ScannedAt.Equal(fixedNow) {
+		t.Errorf("reloaded ScannedAt = %v, want %v", rmeta.ScannedAt, fixedNow)
+	}
+	if rmeta.LegacyHF == nil || rmeta.LegacyHF.SizeBytes != meta.LegacyHF.SizeBytes || rmeta.LegacyHF.Path != meta.LegacyHF.Path {
+		t.Errorf("reloaded LegacyHF = %+v, want it to match the in-memory value %+v", rmeta.LegacyHF, meta.LegacyHF)
+	}
+	if len(rmeta.Dirs) != len(meta.Dirs) {
+		t.Fatalf("reloaded Dirs = %+v, want %d entries like the in-memory value", rmeta.Dirs, len(meta.Dirs))
+	}
+	if _, ok := reloaded.Lookup(services.HFHubCacheDirName, "org/repo"); !ok {
+		t.Errorf("expected the discovered entry to ALSO survive the round trip alongside the scan metadata")
+	}
+}
+
+// TestLoadOldFormatWithoutScanMetadataForwardCompat pins design doc §9.3's
+// explicit contract: a file written before scan metadata existed (only
+// {"version":1,"entries":[...]}, no scanned_at/dirs/legacy_hf_cache keys at
+// all) must still load its entries correctly, with Meta() degrading to its
+// zero value ("never scanned") rather than any read failing. This is the
+// literal forward-compat case the design doc's "FormatVersion stays 1 --
+// additive" decision exists to guarantee.
+func TestLoadOldFormatWithoutScanMetadataForwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	oldFormat := `{
+		"version": 1,
+		"entries": [
+			{
+				"cache_dir": "huggingface",
+				"family": "hf-hub",
+				"model": "meta-llama/Llama-3.1-8B-Instruct",
+				"engine": "vllm",
+				"files": ["models--meta-llama--Llama-3.1-8B-Instruct"],
+				"size_bytes": 16800000000,
+				"pulled_at": "2026-08-20T10:00:00Z",
+				"last_used": "2026-08-27T14:32:00Z",
+				"source": "pull"
+			}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(oldFormat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of a pre-scan-metadata file must not error, got %v", err)
+	}
+
+	e, ok := idx.Lookup(services.HFHubCacheDirName, "meta-llama/Llama-3.1-8B-Instruct")
+	if !ok {
+		t.Fatalf("expected the pre-existing entry to load correctly")
+	}
+	if e.SizeBytes != 16_800_000_000 || e.Source != SourcePull {
+		t.Errorf("unexpected entry from old-format file: %+v", e)
+	}
+
+	meta := idx.Meta()
+	if !meta.ScannedAt.IsZero() {
+		t.Errorf("ScannedAt = %v, want zero (never scanned) for a file with no scan metadata", meta.ScannedAt)
+	}
+	if meta.Dirs != nil {
+		t.Errorf("Dirs = %+v, want nil for a file with no scan metadata", meta.Dirs)
+	}
+	if meta.LegacyHF != nil {
+		t.Errorf("LegacyHF = %+v, want nil for a file with no scan metadata", meta.LegacyHF)
+	}
+
+	// A subsequent write from THIS (upgraded) binary must not choke on
+	// having read an old-format file -- round trip it back out and in.
+	s := Open(path, nil)
+	if got := s.Snapshot().Meta(); !got.ScannedAt.IsZero() {
+		t.Errorf("Store opened against an old-format file must also see zero-value Meta, got %+v", got)
+	}
+	if err := s.Upsert(Entry{CacheDir: "llamacpp", Model: "new.gguf", Engine: "llamacpp", Files: []string{"new.gguf"}}); err != nil {
+		t.Fatalf("Upsert after opening an old-format file: %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load after upgrading an old-format file: %v", err)
+	}
+	if _, ok := reloaded.Lookup(services.HFHubCacheDirName, "meta-llama/Llama-3.1-8B-Instruct"); !ok {
+		t.Errorf("expected the original pre-existing entry to survive the upgrade write")
+	}
+	if _, ok := reloaded.Lookup("llamacpp", "new.gguf"); !ok {
+		t.Errorf("expected the newly-upserted entry to be present after the upgrade write")
+	}
+}
+
+// TestReconcileScanOmitsUnscannedDirsFromMeasuredTotals pins Meta.Dirs' "no
+// row means unmeasured, never zero bytes" rule: a cache_dir this pass never
+// found on disk gets no DirScan entry at all.
+func TestReconcileScanOmitsUnscannedDirsFromMeasuredTotals(t *testing.T) {
+	root := t.TempDir() // nothing on disk under any EngineCacheDirs subdir
+	s := Open(filepath.Join(t.TempDir(), FileName), nil)
+	if err := s.ReconcileScan(root, ScanOptions{}); err != nil {
+		t.Fatalf("ReconcileScan: %v", err)
+	}
+	meta := s.Snapshot().Meta()
+	if len(meta.Dirs) != 0 {
+		t.Errorf("Dirs = %+v, want empty when nothing on disk was scannable", meta.Dirs)
+	}
+	if meta.ScannedAt.IsZero() {
+		t.Errorf("ScannedAt must still be set even when nothing was found -- a scan DID run")
+	}
+}
+
+// TestProbeLegacyHFCacheEmptyAndZeroSize pins probeLegacyHFCache's two
+// nil-returning cases: an empty path (caller chose not to probe) and a path
+// that sizes to zero (nothing worth reporting).
+func TestProbeLegacyHFCacheEmptyAndZeroSize(t *testing.T) {
+	if got := probeLegacyHFCache(""); got != nil {
+		t.Errorf("probeLegacyHFCache(\"\") = %+v, want nil", got)
+	}
+	empty := t.TempDir()
+	if got := probeLegacyHFCache(empty); got != nil {
+		t.Errorf("probeLegacyHFCache(empty dir) = %+v, want nil (nothing to report)", got)
+	}
+}
+
+// TestIndexedBytesByDir pins the P3 reporting helper's sum-per-dir contract.
+func TestIndexedBytesByDir(t *testing.T) {
+	dir := t.TempDir()
+	s := Open(filepath.Join(dir, FileName), nil)
+	if err := s.Upsert(Entry{CacheDir: "huggingface", Model: "a/b", SizeBytes: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Upsert(Entry{CacheDir: "huggingface", Model: "c/d", SizeBytes: 200}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Upsert(Entry{CacheDir: "llamacpp", Model: "e.gguf", SizeBytes: 50}); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Snapshot().IndexedBytesByDir()
+	if got["huggingface"] != 300 {
+		t.Errorf("IndexedBytesByDir()[huggingface] = %d, want 300", got["huggingface"])
+	}
+	if got["llamacpp"] != 50 {
+		t.Errorf("IndexedBytesByDir()[llamacpp] = %d, want 50", got["llamacpp"])
+	}
+}
