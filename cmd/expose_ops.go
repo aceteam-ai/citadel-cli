@@ -13,6 +13,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -27,6 +29,54 @@ import (
 // unbounded credential outstanding.
 const defaultLinkTTL = 24 * time.Hour
 
+// exposeOpsMu serializes every liveExposeOps operation (issue #944 design doc
+// §5.4). liveExposeOps has TWO concurrent entry points inside one process — the
+// worker lane (EXPOSE_SET/UNEXPOSE/EXPOSE_LIST jobs) and the /agent/expose +
+// /agent/unexpose HTTP control handlers serving the local CLI — and
+// SaveExposure/DeleteExposure are unlocked load-modify-writes of
+// exposures.json. That race used to lose at worst one record; now that Expose
+// computes an epoch via its own read-modify-write (resolveEffectiveEpoch,
+// below), two concurrent calls could both read the same base and settle on the
+// same effective epoch, silently defeating a `rotate` revocation.
+//
+// Deliberately NOT lane membership (serializedLaneJobTypes,
+// internal/worker/deadline.go): a lane only serializes JOBS against each
+// other — it has no visibility into the HTTP control endpoints, so lane
+// membership alone would leave the CLI-vs-job race open. A plain mutex here
+// covers both entry points with one lock. Held across the WHOLE op (epoch
+// resolution + gateway programming + persistence) in Expose/Unexpose, and
+// across the read in List for a consistent snapshot. These calls are
+// milliseconds (map writes + one small file), so holding a mutex across them
+// is not a lane-blocking concern.
+var exposeOpsMu sync.Mutex
+
+// resolveEffectiveEpoch computes the node-owned effective epoch for an
+// EXPOSE_SET call (issue #944 design doc §5.3): the caller expresses INTENT
+// (a fast-forward hint via reqEpoch, or an explicit revoke via rotate), the
+// node is the AUTHORITY on the resulting value. base is the highest epoch this
+// name has ever lived at (see the Expose call site for how base itself is
+// derived from the durable record + the high-water store). Pure so it is
+// tested without a gateway.
+//
+//   - A plain re-expose (rotate=false) never decreases the epoch (max(base,
+//     reqEpoch)) and never increases it beyond a caller's own fast-forward —
+//     so a blind, stateless caller sending the wire default (reqEpoch=1)
+//     against a name already living at a higher epoch preserves it: no
+//     outstanding link is revoked.
+//   - rotate=true is the explicit revoke-all verb: it strictly increases the
+//     epoch past base (and past any fast-forward the caller also sent), so
+//     every previously issued token for this name stops verifying.
+func resolveEffectiveEpoch(base, reqEpoch int, rotate bool) int {
+	effective := base
+	if reqEpoch > effective {
+		effective = reqEpoch
+	}
+	if rotate {
+		effective++
+	}
+	return effective
+}
+
 // liveExposeOps implements worker.ExposeOps against the live gateway.
 type liveExposeOps struct{}
 
@@ -40,23 +90,65 @@ type liveExposeOps struct{}
 // local loopback service; req.Path serves a workspace-confined static
 // directory directly from the gateway. ExposeSetHandler.parseExposeRequest
 // already enforces exactly one is set before this is ever called.
+//
+// Epoch custody (issue #944 design doc §5.3): the node, not the caller, owns
+// the resulting epoch. base is the highest epoch this name has EVER lived at —
+// a live durable record's own TokenEpoch when one exists, or one past this
+// name's high-water mark when it does not (fresh, or the record was deleted by
+// a prior UNEXPOSE). The high-water store outlives DeleteExposure, which is
+// what stops an unexpose->re-expose sequence from resurrecting a revoked
+// token (the exact hole a naive "reject a lower epoch" guard has once UNEXPOSE
+// makes the durable record remotely deletable — see the design doc §5.2).
 func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worker.ExposeResult, error) {
+	exposeOpsMu.Lock()
+	defer exposeOpsMu.Unlock()
+
 	ref := getProvisionedServiceGateway()
 	if ref == nil {
 		return nil, fmt.Errorf("no in-process gateway (expose requires the node gateway to be running)")
 	}
 
+	configDir := platform.ConfigDir()
+	// The high-water store is a FLOOR, not just an absent-record fallback
+	// (#945 review). A best-effort SaveExposure failure (or a legacy/
+	// hand-edited record) can leave a STALE, lower-epoch record on disk while
+	// the high-water store already records a higher, already-minted epoch. If
+	// the record shadowed high-water, a blind re-expose would program the live
+	// policy back DOWN to the stale epoch and resurrect a token the operator
+	// explicitly rotated away. Flooring the record to high-water closes that,
+	// and subsumes the legacy TokenEpoch==0 case (hw > 0 lifts base off 0).
+	hw := config.ExposeEpochHighWater(configDir, req.Name)
+	base := 1
+	if existing := config.FindExposure(configDir, req.Name); existing != nil {
+		base = existing.TokenEpoch
+		if hw > base {
+			base = hw
+		}
+	} else if hw > 0 {
+		base = hw + 1
+	}
+	effective := resolveEffectiveEpoch(base, req.Epoch, req.Rotate)
+	if err := config.SaveExposeEpochHighWater(configDir, req.Name, effective); err != nil {
+		// Non-fatal (mirrors the persistence-is-best-effort posture below): the
+		// exposure still programs correctly at `effective` for this process's
+		// lifetime, the loss is scoped to future high-water memory surviving a
+		// restart. Logged so it is visible, not returned, for the same "the
+		// exposure IS live, failing the call would be a lie" reasoning as the
+		// SaveExposure failure below.
+		Log("warning: exposure %q's epoch high-water was not persisted: %v", req.Name, err)
+	}
+
 	policy := &gateway.ExposePolicy{
 		Visibility: gateway.Visibility(req.Visibility),
 		Creator:    req.Creator,
-		TokenEpoch: req.Epoch,
+		TokenEpoch: effective,
 	}
 
 	rec := config.ExposureRecord{
 		Name:       req.Name,
 		Visibility: req.Visibility,
 		Creator:    req.Creator,
-		TokenEpoch: req.Epoch,
+		TokenEpoch: effective,
 	}
 
 	if req.Path != "" {
@@ -90,14 +182,14 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 	// write failure is logged, not returned: the exposure IS live and the caller
 	// already has its URL, so failing the call would be a lie; the honest failure
 	// mode is "works now, gone after a restart", and it must be visible.
-	if err := config.SaveExposure(platform.ConfigDir(), rec); err != nil {
+	if err := config.SaveExposure(configDir, rec); err != nil {
 		Log("warning: exposure %q is live but was not persisted (it will not survive a restart): %v", req.Name, err)
 	}
 
-	res := &worker.ExposeResult{URL: exposeMeshURL(req.Name)}
+	res := &worker.ExposeResult{URL: exposeMeshURL(req.Name), Epoch: effective}
 
 	if policy.Visibility == gateway.VisibilityLink {
-		key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir())
+		key, err := config.LoadOrCreateExposeSigningKey(configDir)
 		if err != nil {
 			return nil, fmt.Errorf("load link signing key: %w", err)
 		}
@@ -106,23 +198,18 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 			ttl = defaultLinkTTL
 		}
 		exp := time.Now().Add(ttl)
-		res.Token = gateway.MintLinkToken(key, req.Name, req.Epoch, exp)
+		res.Token = gateway.MintLinkToken(key, req.Name, effective, exp)
 		res.ExpiresAt = exp.UTC().Format(time.RFC3339)
 	}
 	return res, nil
 }
 
-// UnexposeResult is what the unexpose path returns to its caller (the CLI, the
-// aceteam MCP verb).
-type UnexposeResult struct {
-	// Name is the exposed-service slug that was revoked.
-	Name string `json:"name"`
-	// WasExposed reports whether a live exposure actually existed. False means
-	// the call still succeeded (revoke is idempotent) but nothing was serving --
-	// surfaced so a caller can say "not exposed" instead of implying it tore
-	// something down.
-	WasExposed bool `json:"was_exposed"`
-}
+// UnexposeResult is an alias of the worker-side type (worker.UnexposeResult):
+// cmd already imports worker (never the reverse — see the worker.ExposeOps doc
+// comment), so this keeps every existing reference to cmd.UnexposeResult
+// working while the actual struct lives in the leaf package the UNEXPOSE
+// handler also uses.
+type UnexposeResult = worker.UnexposeResult
 
 // Unexpose revokes an exposure: it drops the gateway's live route AND the
 // durable record, so the service stops being reachable now and does not come
@@ -134,7 +221,16 @@ type UnexposeResult struct {
 // that resurrects on the next restart -- noisy but not an exposure the operator
 // believes is gone. Deleting the record first would invert that into the unsafe
 // direction (record gone, service still serving, nothing left to reconcile it).
-func (liveExposeOps) Unexpose(_ context.Context, name string) (*UnexposeResult, error) {
+//
+// Deliberately does NOT touch the epoch high-water store (issue #944 design
+// doc §4.2): UNEXPOSE's job is done the moment the live route and the durable
+// record are gone (old tokens die because the gateway 404s an unregistered
+// name). What stops a LATER re-expose from resurrecting an old token is
+// Expose's own high-water read, not anything this function does.
+func (liveExposeOps) Unexpose(_ context.Context, name string) (*worker.UnexposeResult, error) {
+	exposeOpsMu.Lock()
+	defer exposeOpsMu.Unlock()
+
 	if name == "" {
 		return nil, fmt.Errorf("unexpose requires a service name")
 	}
@@ -152,7 +248,56 @@ func (liveExposeOps) Unexpose(_ context.Context, name string) (*UnexposeResult, 
 		return nil, fmt.Errorf("exposure %q is no longer served, but its saved record could not be removed "+
 			"(it will return on the next restart): %w", name, err)
 	}
-	return &UnexposeResult{Name: name, WasExposed: wasExposed}, nil
+	return &worker.UnexposeResult{Name: name, WasExposed: wasExposed}, nil
+}
+
+// List returns the durable exposure inventory merged with the gateway's live
+// policy names (issue #944, design doc §3.2). The durable set
+// (config.LoadExposures) is the authority — it is what survives restarts —
+// but each row also carries a `Live` bit read from the gateway's in-memory
+// policy table, and any LIVE-ONLY exposure (present in the gateway but with no
+// durable record — e.g. SaveExposure's best-effort write failed, or the
+// record predates a field this build now requires) is surfaced separately
+// rather than silently omitted. Locked for a consistent snapshot against a
+// concurrent Expose/Unexpose, not because reading is itself expensive.
+func (liveExposeOps) List(_ context.Context) (*worker.ExposeListResult, error) {
+	exposeOpsMu.Lock()
+	defer exposeOpsMu.Unlock()
+
+	recs, err := config.LoadExposures(platform.ConfigDir())
+	if err != nil {
+		return nil, fmt.Errorf("load exposures: %w", err)
+	}
+
+	liveNames := map[string]bool{}
+	if ref := getProvisionedServiceGateway(); ref != nil {
+		for _, n := range ref.gw.ExposureNames() {
+			liveNames[n] = true
+		}
+	}
+
+	out := &worker.ExposeListResult{Exposures: make([]worker.ExposureInfo, 0, len(recs))}
+	seen := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		seen[r.Name] = true
+		out.Exposures = append(out.Exposures, worker.ExposureInfo{
+			Name:       r.Name,
+			Port:       r.Port,
+			Path:       r.Path,
+			Visibility: r.Visibility,
+			Creator:    r.Creator,
+			Epoch:      r.TokenEpoch,
+			CreatedAt:  r.CreatedAt,
+			Live:       liveNames[r.Name],
+		})
+	}
+	for n := range liveNames {
+		if !seen[n] {
+			out.LiveOnly = append(out.LiveOnly, n)
+		}
+	}
+	sort.Strings(out.LiveOnly)
+	return out, nil
 }
 
 // restoreExposures re-wires the persisted exposure set onto a gateway that has
@@ -175,10 +320,22 @@ func restoreExposures(gw *gateway.Server) {
 
 	restored := 0
 	for _, r := range recs {
+		// Floor the restored epoch to the high-water store (#945 review). A
+		// best-effort SaveExposure failure can leave a stale, lower-epoch
+		// record on disk after a rotate that already advanced high-water; a
+		// routine restart (auto-update, self-heal, reboot) would otherwise
+		// program the live policy straight from that stale r.TokenEpoch and
+		// resurrect the rotated-away token with no re-expose at all. The
+		// high-water store is never decremented, so this only ever raises the
+		// restored epoch, never lowers it.
+		epoch := r.TokenEpoch
+		if hw := config.ExposeEpochHighWater(platform.ConfigDir(), r.Name); hw > epoch {
+			epoch = hw
+		}
 		policy := &gateway.ExposePolicy{
 			Visibility: gateway.Visibility(r.Visibility),
 			Creator:    r.Creator,
-			TokenEpoch: r.TokenEpoch,
+			TokenEpoch: epoch,
 		}
 
 		if r.Path != "" {

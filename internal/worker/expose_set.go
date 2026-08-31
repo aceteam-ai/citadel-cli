@@ -56,7 +56,20 @@ type ExposeRequest struct {
 	Creator string `json:"creator"`
 	// Epoch, when >0, is bound into a `link` token so the backend can revoke all
 	// outstanding tokens for this exposure by bumping it. Defaults to 1.
+	//
+	// Node-owned epoch custody (issue #944, design doc §5.3): the node — not the
+	// caller — is the authority on the effective epoch. This field is kept for
+	// wire back-compat and honored as a fast-forward hint (the node will never
+	// adopt a value LOWER than the name's own high-water mark), never a rewind.
+	// A blind/stateless caller that always sends the default (1) against a name
+	// already living at a higher epoch is safe: the node preserves the current
+	// epoch rather than silently reverting it. Use Rotate to explicitly revoke.
 	Epoch int `json:"epoch"`
+	// Rotate, when true, is the explicit revoke-all verb: the node advances the
+	// name's epoch strictly past its own high-water mark, invalidating every
+	// previously issued link token. A plain re-expose (Rotate=false) never does
+	// this — it is safe to call blind, repeatedly, without revoking anything.
+	Rotate bool `json:"rotate"`
 }
 
 // ExposeResult is what the ops layer returns after programming the gateway.
@@ -68,13 +81,35 @@ type ExposeResult struct {
 	Token string `json:"token,omitempty"`
 	// ExpiresAt is the link token's RFC3339 expiry (visibility=link only).
 	ExpiresAt string `json:"expires_at,omitempty"`
+	// Epoch is the AUTHORITATIVE effective epoch the node settled on (issue
+	// #944) — the caller's Epoch/Rotate are a request, this is the truth. A
+	// caller that wants to track epoch state at all should store this value,
+	// not its own input.
+	Epoch int `json:"epoch"`
 }
 
-// ExposeOps is the live side-effect surface: program the gateway and return the
-// managed URL/token. The live adapter is wired in cmd; a nil Ops makes Execute
-// fail with a clear error rather than panic.
+// UnexposeResult is the worker-side mirror of the cmd-layer unexpose result
+// (issue #944 design doc §6.1): kept here, not imported from cmd, since cmd
+// imports worker and never the reverse. The live adapter (cmd.liveExposeOps)
+// converts to/returns this shape directly.
+type UnexposeResult struct {
+	// Name is the exposed-service slug that was revoked.
+	Name string `json:"name"`
+	// WasExposed reports whether a live exposure actually existed. False still
+	// means success (revoke is idempotent).
+	WasExposed bool `json:"was_exposed"`
+}
+
+// ExposeOps is the live side-effect surface behind all three expose-custody
+// verbs (issue #944): program the gateway (Expose), tear one down (Unexpose),
+// and read back the durable inventory (List). One interface, one live adapter,
+// one wiring site, one test fake — see the design doc §6.1. The live adapter is
+// wired in cmd; a nil Ops makes each handler's Execute fail with a clear error
+// rather than panic.
 type ExposeOps interface {
 	Expose(ctx context.Context, req ExposeRequest) (*ExposeResult, error)
+	Unexpose(ctx context.Context, name string) (*UnexposeResult, error)
+	List(ctx context.Context) (*ExposeListResult, error)
 }
 
 // ExposeSetConfig configures an ExposeSetHandler.
@@ -136,6 +171,10 @@ func (h *ExposeSetHandler) Execute(ctx context.Context, job *Job, stream StreamW
 		"name":       req.Name,
 		"visibility": req.Visibility,
 		"url":        res.URL,
+		// The node's authoritative effective epoch (issue #944 design doc §5.3),
+		// not req.Epoch echoed back — a caller that wants to track epoch state at
+		// all should store THIS value.
+		"epoch": res.Epoch,
 	}
 	if res.Token != "" {
 		out["token"] = res.Token

@@ -245,6 +245,42 @@ func (s *Server) getExposure(name string) *ExposePolicy {
 	return s.exposures[name]
 }
 
+// HasExposure reports whether name currently has a live policy programmed in
+// this process (issue #944, design doc §3.2/§6.2). Used by EXPOSE_LIST's
+// "live" bit to distinguish a durable record with a live counterpart from one
+// that restored badly or was never wired.
+func (s *Server) HasExposure(name string) bool {
+	return s.getExposure(name) != nil
+}
+
+// ExposureEpoch returns the TokenEpoch currently programmed for name, and
+// whether name is live at all. It is the read sibling of HasExposure that lets
+// a caller observe which epoch a restore/re-expose landed on without exposing
+// the policy map — used by the #945 restore-path regression test to confirm a
+// stale, lower-epoch durable record was floored UP to the high-water mark
+// rather than programmed verbatim (which would resurrect a rotated-away token).
+func (s *Server) ExposureEpoch(name string) (int, bool) {
+	p := s.getExposure(name)
+	if p == nil {
+		return 0, false
+	}
+	return p.TokenEpoch, true
+}
+
+// ExposureNames returns the names of every exposure currently live in this
+// process. Used by EXPOSE_LIST to compute the durable set's "live_only" diff
+// (a live exposure the durable set has no record of) without exposing the
+// policy map itself.
+func (s *Server) ExposureNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	names := make([]string, 0, len(s.exposures))
+	for n := range s.exposures {
+		names = append(names, n)
+	}
+	return names
+}
+
 // Expose wires the /expose/<name> reverse-proxy route to a loopback address AND
 // records its visibility policy, atomically from the caller's perspective. It is
 // the one call the EXPOSE control path (worker job / CLI) makes to program the

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // exposuresFile is the filename (under the config dir) holding the exposure set.
@@ -57,6 +58,13 @@ type ExposureRecord struct {
 	// would stop verifying (breaking live links), and a later bump could not
 	// revoke anything it had already handed out.
 	TokenEpoch int `json:"token_epoch,omitempty"`
+	// CreatedAt is the RFC3339 timestamp this exposure was FIRST created (issue
+	// #944 design doc §3.2). Set on first save; preserved across a later
+	// replace-by-name (SaveExposure carries it forward) so the record's
+	// identity continuity survives a re-expose. Additive field: a record
+	// written before this existed decodes with it empty, and old binaries
+	// simply ignore it — no migration.
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // LoadExposures returns the persisted exposure set, or an empty slice when
@@ -81,6 +89,12 @@ func LoadExposures(configDir string) ([]ExposureRecord, error) {
 // SaveExposure records (or replaces, by name) one exposure. It is called on the
 // same path that programs the gateway, so the durable set and the live set are
 // written together and cannot diverge.
+//
+// CreatedAt is carried forward across a replace-by-name (the record's identity
+// continuity across re-exposes, design doc §3.2) and set only when the record
+// did not previously exist — a caller that leaves it empty on every call (the
+// common case; see cmd.liveExposeOps.Expose) still gets correct "first seen"
+// semantics without having to look the old record up itself.
 func SaveExposure(configDir string, rec ExposureRecord) error {
 	if rec.Name == "" {
 		return fmt.Errorf("save exposure: empty name")
@@ -95,15 +109,41 @@ func SaveExposure(configDir string, rec ExposureRecord) error {
 	replaced := false
 	for i := range recs {
 		if recs[i].Name == rec.Name {
+			if rec.CreatedAt == "" {
+				rec.CreatedAt = recs[i].CreatedAt
+			}
 			recs[i] = rec
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
+		if rec.CreatedAt == "" {
+			rec.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		}
 		recs = append(recs, rec)
 	}
 	return writeExposures(configDir, recs)
+}
+
+// FindExposure returns the persisted record for name, or nil if none exists —
+// including when the store is corrupt or unreadable. Degrading a corrupt store
+// to "not found" (rather than propagating the parse error) mirrors
+// SaveExposure's own corrupt-store recovery: a reader that cannot tell "never
+// exposed" from "store is corrupt" must still let a new expose proceed rather
+// than wedging every future call on this name.
+func FindExposure(configDir, name string) *ExposureRecord {
+	recs, err := LoadExposures(configDir)
+	if err != nil {
+		return nil
+	}
+	for i := range recs {
+		if recs[i].Name == name {
+			rec := recs[i]
+			return &rec
+		}
+	}
+	return nil
 }
 
 // DeleteExposure drops one exposure from the durable set. Deleting an absent
