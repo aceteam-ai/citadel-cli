@@ -1,10 +1,77 @@
 # Design: Meeting/Transcribe VRAM Fail-Fast or Preempt (citadel#891, split from #558)
 
-Status: DESIGN — no production code in this PR. Companion to
+Status: **P0 + P1 IMPLEMENTED** (this PR); P2 (preempt) and P3 (cross-repo)
+remain future work — see "Implementation status" below and §7's resolved
+open questions. Companion to
 [design-resource-isolation.md](design-resource-isolation.md) (#831/#842/#843)
 and [design-model-exclusivity.md](design-model-exclusivity.md) (#8248/#8249);
 this doc extends the same primitives to two job types that are not
 `SERVICE_START`: `MEETING_JOIN` and `TRANSCRIBE_AUDIO`.
+
+## Implementation status (2026-08-30, Jason's decision)
+
+Jason's call: **ship the honest-refusal / diagnosis tier only. Do NOT build
+the preempt arm.** `CITADEL_MEETING_VRAM_PREEMPT` (§4, §8 P2) and any
+`Reserve`/`Release` wiring are DEFERRED pending a live re-verify on node 1297
+per §7 Q1 — this design's own §1a finding (the shipped transcribe sidecar is
+CPU-only, so #558's VRAM mechanism may not even reproduce) makes building an
+eviction mechanism premature until that's confirmed.
+
+What shipped, in `internal/jobs/meeting_vram_diagnosis.go` plus small hooks
+in `transcribe_audio.go` and `meeting_join.go`:
+
+1. **§4a's always-on diagnosis tier, P0, as designed.** `waitForReady`'s two
+   failure returns (timeout AND unreachable) are annotated with free GPU
+   VRAM, free RAM, and the top resource holders (VRAM-ranked, falling back to
+   RAM-ranked on a VRAM-less node — see `topResourceHolders`) via
+   `diagnoseReadinessFailure`/`annotateReadinessError`. Best-effort: a
+   collection failure or an unconfigured `ConfigDir` leaves the original
+   error untouched (fail open on missing observability, never masks the real
+   failure with a collection error).
+2. **§3/§4's fail-fast preflight, P1, SMALLER than designed.** `checkVRAMPreflight`
+   refuses a MEETING_JOIN (before joining, per §2 point 4) or TRANSCRIBE_AUDIO
+   dispatch whose payload declares a `vram_mb`/`vram_gb` budget this node's
+   free VRAM cannot satisfy, returning a `*VRAMRefusal{Reason:
+   "insufficient_vram", Message: "..."}` — mirroring `ShellRefusal`'s
+   `{"reason":...,"message":...}` JSON-error convention
+   (`shell_command.go`), since that is the actual mechanism a legacy
+   `jobs.JobHandler` has for surfacing a structured reason through
+   `LegacyHandlerAdapter` (it forwards `err.Error()` verbatim into
+   `Output["error"]` — there is no separate structured-reason channel for
+   legacy handlers the way `worker.JobHandler`'s `swap_rate_limited`
+   precedent has). Payload-only and **deliberately UNGATED** by
+   `CITADEL_RESOURCE_ISOLATION`, mirroring how #577's own payload-declared
+   `vram_mb` already acts ungated on `SERVICE_START` — inert today because
+   the backend does not send either key on these two job types (§5, item 4
+   of the reuse map), same posture as #577's original landing.
+
+   **What was NOT built, and why:** §3 option 2's config-derived
+   `TranscribeVRAMEstimateBytes` estimator (gated behind
+   `CITADEL_RESOURCE_ISOLATION`) is skipped. Checked directly against
+   `services/compose/transcribe.yml` before deciding this: `WHISPER_DEVICE`
+   is hardcoded `cpu` straight in the compose file's `environment:` list —
+   there is no `<name>.env`-style operator override the way llamacpp's
+   `LLAMACPP_MODEL` has, and no `transcribe-gpu` compose variant exists yet.
+   An estimator that "reads the materialized transcribe compose/env" would
+   therefore always read that same hardcoded value and return 0 — provably
+   dead code on every node today, with or without the flag. Building it
+   becomes worthwhile the moment a GPU-configurable transcribe compose
+   exists (§7 Q4); until then this is a documented, deliberate gap, not a
+   silently dropped deliverable.
+
+3. **Item 3's inertness requirement, verified by test, not just argued.**
+   `TestTranscribeAudio_HealthyPathUnaffectedByDiagnosisWiring` and
+   `TestMeetingJoin_VRAMPreflightNoOpWithoutPayloadField` assert the status
+   collector is never even CALLED on the shipped/happy path (no `vram_mb` in
+   the payload, sidecar becomes ready normally) — not just that the outcome
+   is unchanged. Every pre-existing test in `transcribe_audio_test.go` and
+   `meeting_join_test.go` passes byte-for-byte unmodified, confirming no new
+   refusal was introduced on any path the pre-#891 handler already exercised.
+
+§5's wire contract (payload `vram_mb`/`vram_gb`, `reason: "insufficient_vram"`)
+is otherwise unchanged from the design below — this is the node-side half;
+the aceteam-side backend forwarding/branching is still cross-repo future work
+(§8 P3), same as documented.
 
 ## Context
 
@@ -346,67 +413,84 @@ container's actual state — *whatever* the true mechanism was, VRAM or not.
    cross-repo contract, inert until the backend sends it — same posture as
    #577's original landing).
 
-## 7. Open questions for Jason
+## 7. Open questions for Jason — RESOLVED 2026-08-30
 
-1. **Was node-1084's starvation actually VRAM?** The shipped sidecar is
-   CPU-only and `/health` never touches the model (§1a), so the #558
-   mechanism as written cannot reproduce on today's config — the readiness
-   failure was something else (host-RAM thrash beside a 21GB-resident vLLM is
-   the leading suspect; a RAM-sibling of this design would then matter more
-   than the VRAM arm). Before building the preempt arm (P2), is it worth a
-   live re-check on node 1297 (vLLM serving + a meeting join, capture
-   `docker logs citadel-transcribe` + `free -m` this time)? P0/P1 are
-   justified either way; P2's priority depends on the answer.
-2. **Is evicting a co-resident vLLM for a meeting EVER the right call on our
-   fleet, or should the preempt arm be dropped entirely** (fail-fast only,
-   backend re-routes/falls back)? §2 recommends keeping it as a double-gated
-   opt-in because `Reserve`/`Release` makes it *restorative* rather than
-   destructive — but if the answer is "never," P2 disappears and the design
-   is purely preflight + diagnosis.
-3. **Flag identity:** reuse `CITADEL_RESOURCE_ISOLATION` for the fail-fast
-   estimate tier (§4's recommendation), or a dedicated
-   `CITADEL_MEETING_VRAM_GUARD` so an operator can opt into RAM cgroups
-   without meeting refusals? Reuse keeps one flag family; a split is more
-   granular. This mirrors #831's own Q-and-decision, so your call there
-   ("one flag") suggests reuse — confirm.
-4. **Is GPU whisper a supported configuration we intend to ship** (a
-   `transcribe-gpu` compose variant or `WHISPER_DEVICE=cuda` interpolation,
-   plus #522 diarization), or is CPU whisper the permanent posture? If
-   permanent, §3's estimator only ever returns 0 from our own composes and
-   the payload field is the sole live source — still worth building (the
-   backend can declare diarization needs), but the estimator's table shrinks
-   to "whatever #522 ships."
-5. **Control-center caveat for P2:** the CC TUI's own consume loop
-   (`cmd/controlcenter.go`, `workerHeld == false` path) runs MEETING_JOIN
-   without holding `worklock` — the exact door
-   `ReconcileOrphanedReservations`'s doc comment flags. A meeting reserved
-   from the CC path, concurrent with a fresh `citadel work` boot, could have
-   its reservation "reconciled" (vLLM restored) mid-meeting. Options: gate
-   the preempt arm to the worklock-holding path only (recommended for v1),
-   make the CC path acquire `worklock`, or accept-and-document. Same
-   deferred-follow-up territory as #851's identical note — but P2 should not
-   ship pretending the door isn't there.
+1. **Was node-1084's starvation actually VRAM? RESOLVED: unconfirmed, and
+   that uncertainty is exactly why P2 does not ship now.** Jason's decision:
+   ship P0 (diagnosis) + P1 (fail-fast preflight) only; do NOT build the
+   preempt arm. `CITADEL_MEETING_VRAM_PREEMPT` and any `Reserve`/`Release`
+   wiring are DEFERRED pending a live re-verify on node 1297 (vLLM serving +
+   a meeting join, capture `docker logs citadel-transcribe` + `free -m`) —
+   this design's own §1a finding (the shipped sidecar is CPU-only, so #558's
+   VRAM mechanism may not even reproduce) makes building an eviction
+   mechanism premature until that's confirmed. See "Implementation status"
+   at the top of this doc.
+2. **Is evicting a co-resident vLLM for a meeting EVER the right call?
+   RESOLVED: not decided either way yet — deferred alongside Q1,** not
+   because the answer is "never" but because it should not be decided before
+   Q1's live re-verify. If Q1 confirms the mechanism is genuinely VRAM, this
+   question is revisited with real evidence; if it confirms host-RAM
+   instead, P2 (VRAM preempt) may not even be the right fix and a RAM
+   preflight/isolation angle (#831's existing machinery) matters more.
+3. **Flag identity: RESOLVED — moot for what shipped.** The fail-fast
+   preflight that shipped (P1) is entirely payload-driven and does not use
+   `CITADEL_RESOURCE_ISOLATION` (or a new flag) at all — see "Implementation
+   status": the config-derived ESTIMATE (the only piece §4 proposed gating)
+   was not built, so there is no gated tier in this PR to name a flag for.
+   Revisit this question if/when the estimator (Q4) is eventually built.
+4. **Is GPU whisper a supported configuration we intend to ship? Still
+   OPEN — informs a future estimator, not this PR.** CPU whisper remains the
+   only shipped configuration; `services/compose/transcribe.yml` still
+   hardcodes `WHISPER_DEVICE=cpu` with no operator override today (verified
+   while implementing P1 — see "Implementation status"). The
+   `TranscribeVRAMEstimateBytes` estimator stays unbuilt until either this
+   question resolves toward "yes, ship it" or an operator override mechanism
+   is added independently.
+5. **Control-center caveat for P2: N/A — P2 was not built.** The
+   `worklock`-holding-path gap this question raised only applies once a
+   preempt arm exists to reserve/release against; it remains accurate
+   guidance for whoever builds P2 later, restated here rather than deleted so
+   it isn't lost: the CC TUI's own consume loop (`cmd/controlcenter.go`,
+   `workerHeld == false` path) runs MEETING_JOIN without holding `worklock`
+   — the exact door `ReconcileOrphanedReservations`'s doc comment flags. A
+   future P2 must not ship pretending that door isn't there (gate to the
+   worklock-holding path, make the CC path acquire `worklock`, or
+   accept-and-document — same choice #851's identical note already poses).
 
 ## 8. Phased plan
 
-- **P0 — diagnosis (always-on, no flag, no behavior change):**
-  `waitForReady` timeout error enrichment (§4a) + the `diagnoseFn` seam +
-  tests (hermetic: injected closure, no real docker/nvidia-smi). Fixes the
-  observed incident class regardless of mechanism. Smallest reviewable unit.
-- **P1 — fail-fast preflight (gated):** `TranscribeVRAMEstimateBytes` +
-  payload `vram_mb` parsing on `TRANSCRIBE_AUDIO`/`MEETING_JOIN` + the
-  pre-join preflight refusal with `reason: insufficient_vram` + the
-  `vramGuard` interface threading. Inert on every current node (need resolves
-  0) until a payload arrives or an operator opts in on a GPU-whisper node.
-- **P2 — preempt-and-restore (double-gated, pending Q1/Q2/Q5):**
-  `CITADEL_MEETING_VRAM_PREEMPT` wiring `Reserve` at meeting start /
-  `Release` after `backupAndPrune`, worklock-holding path only. First
-  production job-type caller of #832.
-- **P3 — cross-repo (aceteam, other agent):** backend forwards `vram_mb` when
-  a job implies a GPU transcribe stack; backend branches on
-  `insufficient_vram` (cloud fallback / re-dispatch). Contract in §5.
+- **P0 — diagnosis (always-on, no flag, no behavior change): SHIPPED.**
+  `waitForReady`'s timeout AND unreachable returns are annotated (§4a) via
+  `diagnoseReadinessFailure`/`annotateReadinessError`
+  (`internal/jobs/meeting_vram_diagnosis.go`) + hermetic tests (injected
+  `collectStatusFn` closure, no real docker/nvidia-smi). Fixes the observed
+  incident class regardless of mechanism.
+- **P1 — fail-fast preflight: SHIPPED, SMALLER than designed.** Payload
+  `vram_mb`/`vram_gb` parsing (reused verbatim from `parseRequiredVRAMBytes`)
+  on `TRANSCRIBE_AUDIO`/`MEETING_JOIN` + the pre-join preflight refusal with
+  `reason: insufficient_vram` (`checkVRAMPreflight` + `*VRAMRefusal`) — but
+  UNGATED (no flag at all), and WITHOUT `TranscribeVRAMEstimateBytes`. See
+  "Implementation status" at the top of this doc for why the estimator was
+  dropped (the shipped compose has no operator-configurable device override
+  to derive it from — provably dead code today) and why ungated is correct
+  (mirrors #577's own ungated payload precedent; there is no gated estimate
+  tier left to gate). Inert on every current node until the backend sends a
+  payload field.
+- **P2 — preempt-and-restore: DEFERRED**, pending Q1's live re-verify on node
+  1297 (see §7). Not started; `CITADEL_MEETING_VRAM_PREEMPT` does not exist.
+  When it is built: `Reserve` at meeting start / `Release` after
+  `backupAndPrune`, worklock-holding path only, first production job-type
+  caller of #832 — the plan below is unchanged from the original design,
+  just not yet executed.
+- **P3 — cross-repo (aceteam, other agent): NOT STARTED**, unblocked by P1
+  shipping (the node-side half of the wire contract exists now). Backend
+  forwards `vram_mb` when a job implies a GPU transcribe stack; backend
+  branches on `insufficient_vram` (cloud fallback / re-dispatch). Contract in
+  §5.
 - **Explicitly out of scope:** host-RAM starvation of the CPU sidecar (the
   likely true node-1084 mechanism — belongs with #831's RAM machinery if Q1
-  confirms it), fabric-level meeting placement/scheduling, per-pass
+  confirms it; P0's diagnosis annotation DOES surface free RAM today as a
+  first-pass signal toward diagnosing this, without building dedicated RAM
+  machinery), fabric-level meeting placement/scheduling, per-pass
   mid-meeting re-preflight, and any change to the whisper sidecar's Python
   (`/health` stays model-free by design).

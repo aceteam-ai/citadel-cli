@@ -506,6 +506,29 @@ func TestNewMeetingJoinHandler_DefaultsProfileDirEmpty(t *testing.T) {
 	}
 }
 
+// TestNewMeetingJoinHandler_ThreadsConfigDir pins citadel#891's wiring: the
+// worker's ConfigDir must reach jobs.MeetingJoinHandler's internal
+// transcriber so its readiness-failure diagnosis and VRAM preflight
+// (meeting_vram_diagnosis.go) can collect live node status. An empty
+// opts.ConfigDir (no service handlers registered) must leave both pieces
+// inert, matching pre-#891 behavior.
+func TestNewMeetingJoinHandler_ThreadsConfigDir(t *testing.T) {
+	h := newMeetingJoinHandler(LegacyHandlerOpts{
+		WorkspaceDir: t.TempDir(),
+		ConfigDir:    "/custom/config-dir",
+	})
+	if got := h.ConfigDir(); got != "/custom/config-dir" {
+		t.Errorf("ConfigDir() = %q, want %q", got, "/custom/config-dir")
+	}
+}
+
+func TestNewMeetingJoinHandler_DefaultsConfigDirEmpty(t *testing.T) {
+	h := newMeetingJoinHandler(LegacyHandlerOpts{WorkspaceDir: t.TempDir()})
+	if got := h.ConfigDir(); got != "" {
+		t.Errorf("expected empty ConfigDir() when opts.ConfigDir is unset, got %q", got)
+	}
+}
+
 // TestAllKnownJobTypesCoversRegisteredHandlers guards the allKnownJobTypes slice
 // (probed to report a node's supported job-type set in the unsupported-type
 // failure, issue #382) against drift. Handlers only expose CanHandle(type), so a

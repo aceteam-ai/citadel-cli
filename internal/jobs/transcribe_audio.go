@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 // defaultTranscribeServiceURL is the local faster-whisper sidecar address.
@@ -105,6 +106,32 @@ type TranscribeAudioHandler struct {
 	ServiceURL string
 	// HTTPClient lets tests inject a stub; nil uses a default client.
 	HTTPClient *http.Client
+	// ConfigDir roots a live status.NodeStatus collection used ONLY by
+	// citadel#891's readiness-failure diagnosis (waitForReady) and VRAM
+	// preflight (checkVRAMPreflight). Empty (the zero value, and every
+	// existing hermetic test) skips both: no annotation, no preflight check
+	// -- fail open, not fail closed, on missing observability. See
+	// meeting_vram_diagnosis.go.
+	ConfigDir string
+	// collectStatusFn overrides collectStatusForDiagnosis for tests; nil uses
+	// a real status.NewCollector collection rooted at ConfigDir.
+	collectStatusFn collectStatusFn
+}
+
+// collectStatusForDiagnosis returns live node status for citadel#891's
+// readiness-failure diagnosis and VRAM preflight, via the injected
+// collectStatusFn test seam when set, else a real status.NewCollector
+// collection rooted at ConfigDir. Errors (including "no ConfigDir
+// configured") are the caller's cue to skip enrichment/preflight entirely --
+// this never fails a job on its own.
+func (h *TranscribeAudioHandler) collectStatusForDiagnosis() (*status.NodeStatus, error) {
+	if h.collectStatusFn != nil {
+		return h.collectStatusFn()
+	}
+	if h.ConfigDir == "" {
+		return nil, fmt.Errorf("no config dir configured for status collection")
+	}
+	return status.NewCollector(status.CollectorConfig{ConfigDir: h.ConfigDir}).Collect()
 }
 
 // NewTranscribeAudioHandler creates a handler rooted at workspace.
@@ -187,6 +214,14 @@ func (h *TranscribeAudioHandler) requestTimeout(validatedPath string) time.Durat
 //	  ]
 //	}
 func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	// citadel#891: refuse fast, before burning the transcribeReadyTimeout
+	// budget, if the payload declares a VRAM budget this node cannot fit.
+	// Inert today (the backend does not send vram_mb/vram_gb on
+	// TRANSCRIBE_AUDIO yet); see meeting_vram_diagnosis.go.
+	if err := checkVRAMPreflight(ctx, job.Payload, h.collectStatusForDiagnosis); err != nil {
+		return nil, err
+	}
+
 	audioPath, ok := job.Payload["audio_path"]
 	if !ok || audioPath == "" {
 		return nil, fmt.Errorf("job payload missing 'audio_path' field")
@@ -285,7 +320,7 @@ func (h *TranscribeAudioHandler) waitForReady() error {
 			// Nothing has ever answered on this port within the fast-fail
 			// budget: treat the sidecar as absent rather than warming up, and
 			// give up now instead of burning the full model-load timeout.
-			return fmt.Errorf("transcription service unreachable at %s: %w", h.serviceURL(), err)
+			return h.annotateReadinessError(fmt.Errorf("transcription service unreachable at %s: %w", h.serviceURL(), err))
 		}
 
 		if time.Since(startTime) >= transcribeReadyTimeout {
@@ -293,7 +328,23 @@ func (h *TranscribeAudioHandler) waitForReady() error {
 		}
 		time.Sleep(pollInterval)
 	}
-	return fmt.Errorf("transcription service did not become ready within %v", transcribeReadyTimeout)
+	return h.annotateReadinessError(fmt.Errorf("transcription service did not become ready within %v", transcribeReadyTimeout))
+}
+
+// annotateReadinessError appends citadel#891's diagnosis (free VRAM/RAM +
+// top resource holders) to a waitForReady failure, so "did not become
+// ready"/"unreachable" stops being silent about WHY. Best-effort: a
+// collection failure (or no ConfigDir configured) returns err unchanged
+// rather than masking the original failure with a collection error.
+func (h *TranscribeAudioHandler) annotateReadinessError(err error) error {
+	st, cerr := h.collectStatusForDiagnosis()
+	if cerr != nil {
+		return err
+	}
+	if ann := diagnoseReadinessFailure(st); ann != "" {
+		return fmt.Errorf("%w%s", err, ann)
+	}
+	return err
 }
 
 // healthCheck performs a single readiness GET bounded by transcribeHealthTimeout

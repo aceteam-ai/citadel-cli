@@ -2,17 +2,20 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 func TestTranscribeAudio_MissingAudioPath(t *testing.T) {
@@ -387,5 +390,290 @@ func TestTranscribeAudio_SymlinkedWorkspace(t *testing.T) {
 	// The forwarded path must be clean and workspace-relative, with no "../".
 	if gotPath != audioRel {
 		t.Errorf("forwarded audio_path = %q, want %q (no leading ../)", gotPath, audioRel)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// citadel#891: readiness-failure diagnosis + VRAM preflight
+// ---------------------------------------------------------------------------
+
+// fakeContendedNodeStatus builds a NodeStatus shaped like the #558/#891
+// incident: a nearly-full GPU held almost entirely by a co-resident vllm.
+func fakeContendedNodeStatus() *status.NodeStatus {
+	var vllmVRAMGB float64 = 21.2
+	vllmVRAMBytes := uint64(vllmVRAMGB * float64(1<<30)) // ~21.2GB
+	return &status.NodeStatus{
+		System: status.SystemMetrics{MemoryTotalGB: 32, MemoryAvailableGB: 4},
+		GPU: []status.GPUMetrics{
+			{MemoryTotalMB: 24576, MemoryFreeMB: 2458}, // ~2.4GB free of ~24GB
+		},
+		Services: []status.ServiceInfo{
+			{
+				Name:      "vllm",
+				Status:    status.ServiceStatusRunning,
+				Footprint: &status.ServiceFootprint{VRAMBytes: vllmVRAMBytes},
+			},
+		},
+	}
+}
+
+// TestTranscribeAudio_WaitForReady_DiagnosisAnnotatesUnreachable is the
+// diagnosed-failure-path test: a sidecar that is not listening at all (the
+// fast-fail "unreachable" branch of waitForReady, exercised here instead of
+// the 120s patient-timeout branch purely so the test stays fast -- both
+// branches route through the same annotateReadinessError) must, once a
+// status source is wired, produce a structured, diagnosed failure naming the
+// free VRAM/RAM and the current top holder -- not the bare error the
+// pre-#891 handler produced.
+func TestTranscribeAudio_WaitForReady_DiagnosisAnnotatesUnreachable(t *testing.T) {
+	// Bind an ephemeral port, then release it immediately: nothing is
+	// listening on the resulting address (mirrors TestTranscribeAudio_
+	// WaitForReady_UnreachableFailsFast above).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.ServiceURL = "http://" + addr
+	h.collectStatusFn = func() (*status.NodeStatus, error) { return fakeContendedNodeStatus(), nil }
+
+	waitErr := h.waitForReady()
+	if waitErr == nil {
+		t.Fatal("expected a readiness-failure error")
+	}
+	msg := waitErr.Error()
+	if !strings.Contains(msg, "unreachable") {
+		t.Errorf("error %q lost the original readiness-failure message", msg)
+	}
+	for _, want := range []string{"gpu:", "2.4GB free", "ram:", "vllm 21.2GB"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("diagnosed error %q missing %q", msg, want)
+		}
+	}
+}
+
+// TestTranscribeAudio_AnnotateReadinessError_NoDiagnosisWithoutConfigDir pins
+// the hermetic/inert case directly against annotateReadinessError (bypassing
+// the real polling loop, which would otherwise need the full
+// transcribeReadyTimeout to reach the "did not become ready" message): a
+// handler with no ConfigDir and no injected collector (every pre-#891
+// construction, incl. every other pre-existing test in this file) must
+// return the underlying error UNCHANGED -- no status collection is
+// attempted, so this can never fail on a machine with no docker/nvidia-smi.
+func TestTranscribeAudio_AnnotateReadinessError_NoDiagnosisWithoutConfigDir(t *testing.T) {
+	h := NewTranscribeAudioHandler(t.TempDir())
+	// ConfigDir and collectStatusFn both left unset.
+
+	orig := errors.New("transcription service did not become ready within 2m0s")
+	got := h.annotateReadinessError(orig)
+	if got != orig {
+		t.Fatalf("annotateReadinessError = %v, want the original error unchanged (no ConfigDir configured)", got)
+	}
+}
+
+// TestTranscribeAudio_AnnotateReadinessError_DiagnosesFullTimeout exercises
+// the "did not become ready" message shape directly (the patient-timeout
+// branch of waitForReady) without actually waiting transcribeReadyTimeout.
+func TestTranscribeAudio_AnnotateReadinessError_DiagnosesFullTimeout(t *testing.T) {
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.collectStatusFn = func() (*status.NodeStatus, error) { return fakeContendedNodeStatus(), nil }
+
+	orig := errors.New("transcription service did not become ready within " + transcribeReadyTimeout.String())
+	got := h.annotateReadinessError(orig)
+	if got == nil {
+		t.Fatal("expected an annotated error")
+	}
+	if !errors.Is(got, orig) {
+		t.Errorf("annotated error does not wrap the original: %v", got)
+	}
+	msg := got.Error()
+	for _, want := range []string{"did not become ready", "gpu:", "2.4GB free", "ram:", "vllm 21.2GB"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("diagnosed error %q missing %q", msg, want)
+		}
+	}
+}
+
+// TestTranscribeAudio_AnnotateReadinessError_CollectionFailureLeavesErrorAlone
+// proves the fail-open contract: a collector that errors must never mask the
+// original readiness failure with a collection error.
+func TestTranscribeAudio_AnnotateReadinessError_CollectionFailureLeavesErrorAlone(t *testing.T) {
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.collectStatusFn = func() (*status.NodeStatus, error) {
+		return nil, errors.New("docker stats: permission denied")
+	}
+
+	orig := errors.New("transcription service did not become ready within 2m0s")
+	got := h.annotateReadinessError(orig)
+	if got != orig {
+		t.Fatalf("annotateReadinessError = %v, want the original error unchanged on a collection failure", got)
+	}
+}
+
+// TestTranscribeAudio_HealthyPathUnaffectedByDiagnosisWiring proves item 3 of
+// the task: wiring a status collector (ConfigDir/collectStatusFn) changes
+// NOTHING on the happy path -- the collector is never even consulted when the
+// sidecar becomes ready normally.
+func TestTranscribeAudio_HealthyPathUnaffectedByDiagnosisWiring(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"ok","language":"en","segments":[]}`))
+	}))
+	defer srv.Close()
+
+	collectorCalled := false
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+	h.collectStatusFn = func() (*status.NodeStatus, error) {
+		collectorCalled = true
+		return fakeContendedNodeStatus(), nil
+	}
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "t6",
+		Type:    "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{"audio_path": "a.webm"}, // no vram_mb: preflight is a no-op
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if collectorCalled {
+		t.Error("status collector was consulted on the happy path; it must only run on a readiness failure or a declared VRAM budget")
+	}
+}
+
+// TestTranscribeAudio_VRAMPreflightRefusesConfirmedShortfall pins the
+// structured-reason refusal shape: a payload-declared vram_mb the node
+// cannot fit produces a *VRAMRefusal with reason "insufficient_vram" BEFORE
+// the sidecar is ever contacted.
+func TestTranscribeAudio_VRAMPreflightRefusesConfirmedShortfall(t *testing.T) {
+	sidecarHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sidecarHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.ServiceURL = srv.URL
+	h.collectStatusFn = func() (*status.NodeStatus, error) { return fakeContendedNodeStatus(), nil }
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "t7",
+		Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{
+			"audio_path": "a.webm",
+			"vram_mb":    "4000", // needs 4GB; fakeContendedNodeStatus only has ~2.4GB free
+		},
+	})
+	if err == nil {
+		t.Fatal("expected a VRAM preflight refusal")
+	}
+	var refusal *VRAMRefusal
+	if !errors.As(err, &refusal) {
+		t.Fatalf("error = %v (%T), want *VRAMRefusal", err, err)
+	}
+	if refusal.Reason != ReasonInsufficientVRAM {
+		t.Errorf("Reason = %q, want %q", refusal.Reason, ReasonInsufficientVRAM)
+	}
+	for _, want := range []string{"3.9GB", "2.4GB", "vllm"} {
+		if !strings.Contains(refusal.Message, want) {
+			t.Errorf("refusal message %q missing %q", refusal.Message, want)
+		}
+	}
+	// err.Error() must itself be the {"reason":...,"message":...} JSON object
+	// (the ShellRefusal convention LegacyHandlerAdapter surfaces verbatim).
+	var decoded map[string]string
+	if jerr := json.Unmarshal([]byte(err.Error()), &decoded); jerr != nil {
+		t.Fatalf("err.Error() is not a JSON object: %v (%q)", jerr, err.Error())
+	}
+	if decoded["reason"] != ReasonInsufficientVRAM {
+		t.Errorf("decoded reason = %q, want %q", decoded["reason"], ReasonInsufficientVRAM)
+	}
+	if sidecarHit {
+		t.Error("sidecar was contacted despite a confirmed VRAM shortfall; preflight must refuse before waitForReady")
+	}
+}
+
+// TestTranscribeAudio_VRAMPreflightProceedsWhenFits confirms a declared
+// budget the node CAN satisfy is a pure no-op: the job proceeds normally.
+func TestTranscribeAudio_VRAMPreflightProceedsWhenFits(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(`{"text":"ok","segments":[]}`))
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+	h.collectStatusFn = func() (*status.NodeStatus, error) { return fakeContendedNodeStatus(), nil }
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "t8",
+		Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{
+			"audio_path": "a.webm",
+			"vram_mb":    "1000", // 1GB fits in the ~2.4GB free
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected refusal for a satisfiable VRAM budget: %v", err)
+	}
+}
+
+// TestTranscribeAudio_VRAMPreflightFailsOpenOnUnknownVRAM proves the fail-open
+// half of the contract: a declared budget with no GPU signal at all (a
+// CPU-only/no-nvidia-smi node) must proceed, not refuse on an unknown value.
+func TestTranscribeAudio_VRAMPreflightFailsOpenOnUnknownVRAM(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(`{"text":"ok","segments":[]}`))
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+	// No GPU entries at all -- freeVRAMBytes reports "unknown".
+	h.collectStatusFn = func() (*status.NodeStatus, error) {
+		return &status.NodeStatus{System: status.SystemMetrics{MemoryTotalGB: 16, MemoryAvailableGB: 8}}, nil
+	}
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "t9",
+		Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{
+			"audio_path": "a.webm",
+			"vram_mb":    "999999", // an absurd requirement -- must still proceed
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected fail-open (proceed) on an unknown VRAM signal, got: %v", err)
 	}
 }
