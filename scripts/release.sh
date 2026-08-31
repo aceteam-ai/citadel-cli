@@ -118,19 +118,45 @@ hook_build() {
       tar -czf "$release_dir/${archive_name}.tar.gz" -C "$build_dir" "citadel${ext}"
     fi
 
+    # macOS distributable bundle (citadel#672): a signed, notarized .app + DMG
+    # built from the same darwin/${arch} binary, via build-dmg.sh (the single
+    # place that owns .app assembly + scripts/macos-sign.sh). Only possible
+    # when release.sh itself is running on macOS — hdiutil/codesign/notarytool
+    # don't exist elsewhere, and this repo's CI is Linux-only self-hosted ARC
+    # (see .github/workflows/ci.yml), so there is currently no non-Darwin path
+    # that could produce this artifact anyway.
+    if [[ "$os" == "darwin" && "$(uname -s)" == "Darwin" ]]; then
+      info "  Building signed macOS bundle for darwin/${arch}..."
+      # A real release must never silently ship an unsigned .app/DMG — that is
+      # the exact failure mode #672 exists to close. Local/dev use of
+      # build-dmg.sh directly stays skip-with-warning; this is the one place
+      # that upgrades that to a hard requirement.
+      if CITADEL_REQUIRE_SIGNING=1 "$REPO_ROOT/build-dmg.sh" \
+           --binary "$build_dir/citadel" --version "v${version}" --arch "$arch"; then
+        local dmg_name="citadel_v${version}_darwin_${arch}.dmg"
+        if [[ -f "$REPO_ROOT/build/$dmg_name" ]]; then
+          cp "$REPO_ROOT/build/$dmg_name" "$release_dir/$dmg_name"
+        else
+          fatal "build-dmg.sh reported success but $dmg_name is missing from build/."
+        fi
+      else
+        fatal "signed macOS bundle build failed for darwin/${arch} (set CITADEL_REQUIRE_SIGNING=0 to investigate without the signing gate, but do not release with it unset)."
+      fi
+    fi
+
     rm -rf "$build_dir"
   done
 
   (cd "$release_dir" && sha256sum * > checksums.txt)
 
-  ok "Built $(ls "$release_dir"/*.tar.gz "$release_dir"/*.zip 2>/dev/null | wc -l) archives"
+  ok "Built $(ls "$release_dir"/*.tar.gz "$release_dir"/*.zip "$release_dir"/*.dmg 2>/dev/null | wc -l) archives"
   ls -lh "$release_dir/"
 }
 
 hook_artifact() {
   local release_dir="$REPO_ROOT/release"
   if [[ -d "$release_dir" ]]; then
-    find "$release_dir" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'checksums.txt' \) | sort
+    find "$release_dir" -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name 'checksums.txt' \) | sort
   fi
 }
 
