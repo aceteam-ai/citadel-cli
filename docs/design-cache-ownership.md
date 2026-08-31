@@ -7,6 +7,12 @@ the phased issues below can be filed and implemented independently.
 > llamacpp half) have SHIPPED — see §7 for what landed and where. §8 is the
 > implementation design for P2 (the durable cache index), appended after the
 > original draft; §§1–6 are left as written and describe the pre-P0 state.
+>
+> **Update 2026-08-30 (later):** P2a has also SHIPPED (`internal/cacheindex`,
+> #936 + the #940 follow-ups) — §7 updated. §9 (P3, reporting) and §10 (P5,
+> GC) are the implementation designs for the two remaining value-unlock
+> phases, appended in the same convention as §8; §11 collects their open
+> questions.
 
 ## 1. Current state
 
@@ -407,8 +413,18 @@ names below are the authorities; read them, not this list, for exact behavior):
   from the raw GGUF dir. The rest of P6 (bonsai eviction, resolving a repo
   id to "whichever files belong to it") is exactly what the P2 index
   unlocks — see §8.4.
-- **Not shipped:** P2 (this design, §8), P3 (reporting), P5 (GC), P7
-  (`warm_on_demand`).
+- **P2a shipped (#936, hardened by #940).** `internal/cacheindex`
+  (`cacheindex.go` + `backfill.go`): the versioned-JSON durable index at
+  `<network.GetNodeConfigDir()>/cache-index.json`, keyed `(cache_dir, model)`,
+  lenient load, atomic version-guarded writes, `ReconcileScan` backfill at
+  `citadel work` startup (`cmd/work.go:690`), all §8.3 pull/evict sites wired
+  through `internal/jobs/cache_index.go`'s nil-safe singleton,
+  `MODEL_CACHE_EVICT` moved onto the serialized lane
+  (`internal/worker/deadline.go:124`), and the resident-implies-used
+  `MarkUsed` reconciler on the heartbeat's OnStatus fan-out
+  (`cacheIndexMarkUsedReconciler`, `cmd/work.go:3011`).
+- **Not shipped:** P3 (reporting — §9 below is its implementation design),
+  P5 (GC — §10), P7 (`warm_on_demand`).
 
 ## 8. P2 implementation design: the durable cache index (#682 P2 / #683 prerequisite)
 
@@ -714,11 +730,12 @@ real `last_used` older than it, never as an automatic front-of-queue.
 
 **P2b (next PR):** `printCacheInfo` reads the index + du-remainder
 cross-check; heartbeat `NodeStatus.Cache` (this is P3, split so P2a stays
-node-internal with zero heartbeat-schema change).
+node-internal with zero heartbeat-schema change). *Superseded by §9, the
+full P3 implementation design.*
 
 **Later, unchanged from §5:** P5 GC (now buildable on
-`LeastRecentlyUsed`/`Verify` + pinning), P6 completeness
-(`FilesFor`-driven repo-id eviction, bonsai evict), P7.
+`LeastRecentlyUsed`/`Verify` + pinning — implementation design in §10), P6
+completeness (`FilesFor`-driven repo-id eviction, bonsai evict), P7.
 
 ### 8.7 Open questions for Jason (P2 additions to §6)
 
@@ -743,3 +760,541 @@ node-internal with zero heartbeat-schema change).
    90% via resmon's existing signal, or an absolute size budget per cache
    dir?
 6. **`DOWNLOAD_MODEL` (carries §6 Q5 forward):** still leave unindexed?
+
+## 9. P3 implementation design: reporting off the index (#682 items 3–4)
+
+P3 replaces the live `du` sweeps with reads off the P2a index and puts cache
+attribution on the heartbeat for the first time. It is the first externally
+visible win (§5's ordering note stands: it must ship before P5 so the
+duplication is *visible* before anything deletes files based on it).
+
+### 9.1 What P3 replaces, precisely
+
+- **`printCacheInfo` (`cmd/status.go:565-610`, rendered from `:116-117`)** is
+  the only cache reporting that exists: a `du -sh` subprocess on
+  `~/citadel-cache` plus one more per glob'd subdirectory, at render time,
+  every invocation. It has no model attribution, no freshness, no persistence,
+  cannot see `~/.cache/huggingface` (the #682 duplicate), and its per-subdir
+  loop is O(subdirs) subprocess execs walking the full tree — seconds on a
+  40G cache.
+- **The heartbeat carries NOTHING cache-shaped.** `NodeStatus`
+  (`internal/status/types.go:20`) has no cache field; the closest signal is
+  `internal/resmon`'s `HostResources.DiskAvailableBytes` (`resmon.go:268-286`,
+  #833) — *headroom* on the cache volume, not *attribution* of what's
+  consuming it. #682 item 3 ("report cache size and location in the heartbeat
+  so the duplication is visible before it costs 50G") is entirely unmet.
+
+### 9.2 Two readers, two access paths (the single-writer rule applied)
+
+The index has exactly one legal writer — the `citadel work` process's
+singleton `Store` (`internal/jobs/cache_index.go`'s package doc). P3's two
+readers respect that differently:
+
+- **Heartbeat (inside `citadel work`):** reads the LIVE store —
+  `jobs.CacheIndexStore().Snapshot()` — so it sees pull/evict/MarkUsed
+  mutations immediately, not just what's flushed to disk. Wiring is safe as a
+  plain closure, NOT an atomic pointer: `InitCacheIndexStore` runs at
+  `cmd/work.go:363`, well before the status-publisher goroutines start
+  (`:1918`/`:1985`) — this is the #717 plain-var-vs-atomic test applied and
+  passed (the assignment falls on the safe side of goroutine startup, unlike
+  `nodeSwapManager`). The closure is still nil-safe (`CacheIndexStore()`
+  returns nil in any process that never initialized it).
+- **Interactive `citadel status` (separate process, any user):** read-only
+  `cacheindex.Load(filepath.Join(network.GetNodeConfigDir(), cacheindex.FileName))`
+  — never `Open`, never a second `Store` (the same-process clobber hazard the
+  package doc names is a cross-process lost-update hazard here). It sees the
+  last flushed state, which is at most `markUsedFlushMinGap` behind the live
+  store for recency and exactly current for pull/evict (those flush
+  immediately). **Readers never write**: no backfill trigger, no self-heal —
+  a stale/absent index is *reported* as such (§9.5), same posture as `citadel
+  whoami --node-dir` skipping the identity-cache write. The remedy for a
+  missing index is running `citadel work`, and the doc says so in the output.
+
+### 9.3 Index API gap: the file has no scan metadata (the one place the thin-consumer claim fails)
+
+Verified against `internal/cacheindex` as shipped: `EntriesByDir()` (:371),
+`All()` (:386), `Snapshot()` (:548) and `Load()` (:249) are exactly the read
+surface §8.4 promised P3 — per-dir grouping and totals are trivial sums over
+them, no new query shape needed. But three things P3 must report are not in
+the file format (`fileFormat`, :211 — version + entries, nothing else):
+
+1. **Freshness.** Nothing records when `ReconcileScan` last ran. Without it,
+   "unindexed remainder" (below) is uninterpretable — is the delta drift
+   since this morning or since three worker restarts ago?
+2. **Per-dir measured totals.** The index's per-entry `SizeBytes` sums to
+   *indexed* bytes only. The du-replacement needs the *measured* per-dir
+   total from the same walk, so `measured - indexed = unindexed remainder` —
+   which is precisely the orphan/duplicate signal #682 item 4 wants, computed
+   at scan time instead of per render/tick.
+3. **The legacy duplicate.** `warnIfLegacyHFCacheExists`
+   (`internal/jobs/model_cache_pull.go:1082`) is a per-pull log line, P0's
+   deliberate scope; the durable "this node carries a second HF cache at
+   `~/.cache/huggingface`, N bytes" record P3 surfaces does not exist.
+
+**Fix: additive scan metadata, written by `ReconcileScan`, version stays 1.**
+Extend `fileFormat` (and `Index`) with a top-level block, leniently absent on
+old files (zero values → readers render "unknown", exactly the
+`TokenHashEntry`/#815 degradation the format already practices per-field):
+
+```go
+// fileFormat gains (all omitempty; FormatVersion stays 1 — additive):
+ScannedAt time.Time      `json:"scanned_at,omitempty"`
+Dirs      []DirScan      `json:"dirs,omitempty"`
+LegacyHF  *LegacyHFCache `json:"legacy_hf_cache,omitempty"`
+
+type DirScan struct {          // one per services.EngineCacheDirs dir scanned
+    Dir           string `json:"dir"`
+    Family        string `json:"family"`
+    MeasuredBytes int64  `json:"measured_bytes"`
+}
+type LegacyHFCache struct {    // present only when the models-- gate passes
+    Path      string `json:"path"`
+    SizeBytes int64  `json:"size_bytes"`
+}
+
+// New read API (thin, on *Index):
+func (ix *Index) Meta() Meta                  // ScannedAt + Dirs + LegacyHF
+func (ix *Index) IndexedBytesByDir() map[string]int64  // sum of entries
+```
+
+Costs and mechanics, stated:
+
+- The per-dir measured walk is `dirSize`-shaped (`backfill.go:420`) work
+  `ReconcileScan` already mostly performs (it sizes every discovered
+  artifact); the delta is walking a dir's *non-artifact* remainder once per
+  scan. That is du-equivalent cost **at worker startup only** — never per
+  heartbeat tick, never per `citadel status` render. This is the entire
+  point of P3.
+- A dir that was NOT scanned this pass (unreadable, or the operator's
+  HF_HUB_CACHE override case `scanResult.scannedDirs` already guards) gets
+  no `DirScan` row — absence means "not measured", never "zero bytes",
+  the same #632-class rule the scanner already applies to pruning.
+- **The legacy-HF probe needs the path resolution `legacyHFCacheDir` +
+  `warnIfLegacyHFCacheExists` own — including the `models--` gate** (the
+  bare `~/.cache/huggingface` holding only an `hf auth login` token must not
+  be reported as a reclaimable duplicate; that function's doc comment
+  explains the harm). `internal/cacheindex` is a leaf and must not import
+  `internal/jobs`, so `ReconcileScan` grows an options param the caller
+  fills: `ReconcileScan(cacheRoot string, opts ScanOptions)` with
+  `opts.LegacyHFHubDir string` (empty = skip the probe). `cmd/work.go`
+  computes it via a small exported `jobs.LegacyHFHubDirForScan()` that
+  reuses the existing resolution + gate — one implementation, not a
+  duplicated 5-liner that drifts. Existing `ReconcileScan(root)` call sites
+  are updated in the same PR (it has one production caller).
+
+### 9.4 Heartbeat shape: `NodeStatus.Cache`
+
+House pattern throughout — the `SwapActivity` precedent (#717): a
+hand-maintained mirror in `internal/status/types.go` (additive, `omitempty`;
+`internal/status` *could* import the leaf `cacheindex` without a cycle, but
+the mirror keeps the heartbeat schema owned in one file next to
+Swap/Lanes/Reservations, and the projection lives beside its siblings), a
+`CollectorConfig.CacheReport func() *CacheReport` field (the
+`SwapStats`/`Reservations` shape, `internal/status/collector.go:54-90`),
+projected by a `cacheReportFrom` in `cmd/work.go` and wired at the two
+heartbeat collector construction sites (`:1486`/`:1779`). The TUI
+control-center collector does NOT get it, consistent with the documented
+WorkerLiveness/Swap/Reservations/Lanes gaps there.
+
+```go
+// internal/status/types.go — on NodeStatus, additive:
+Cache *CacheReport `json:"cache,omitempty"`
+
+type CacheReport struct {
+    // ScannedAt is when ReconcileScan last reconciled the index against
+    // disk (zero/omitted = never on this node — pre-P3 index file).
+    ScannedAt time.Time        `json:"scanned_at,omitempty"`
+    TotalIndexedBytes int64    `json:"total_indexed_bytes"`
+    Dirs []CacheDirReport      `json:"dirs,omitempty"`
+    // LegacyHFCache reports the #682 duplicate when present (§9.3).
+    LegacyHFCache *LegacyCacheReport `json:"legacy_hf_cache,omitempty"`
+}
+type CacheDirReport struct {
+    Dir            string `json:"dir"`             // "huggingface", ...
+    Family         string `json:"family"`          // "hf-hub", ...
+    IndexedBytes   int64  `json:"indexed_bytes"`   // sum of live entries
+    MeasuredBytes  int64  `json:"measured_bytes,omitempty"`  // last scan; 0 = not measured
+    UnindexedBytes int64  `json:"unindexed_bytes,omitempty"` // max(measured-indexed, 0)
+    EntryCount     int    `json:"entry_count"`
+    // Models is the per-model attribution, size-descending, capped at
+    // maxHeartbeatModelRows (32) so one node's heartbeat cannot balloon on a
+    // hoarder cache; EntryCount tells the consumer when it's truncated.
+    Models []CacheModelReport `json:"models,omitempty"`
+}
+type CacheModelReport struct {
+    Model     string    `json:"model"`
+    Engine    string    `json:"engine,omitempty"`  // provenance, not identity
+    SizeBytes int64     `json:"size_bytes"`
+    PulledAt  time.Time `json:"pulled_at,omitempty"`
+    LastUsed  time.Time `json:"last_used,omitempty"`
+    Source    string    `json:"source,omitempty"`  // "pull" | "backfill"
+}
+```
+
+Decisions:
+
+- **Per-model rows ARE in the heartbeat, capped.** #682 item 3 is satisfiable
+  with per-dir aggregates alone, but the dashboard's actionable rendering
+  ("this node holds 16.8G of Llama-3.1-8B it hasn't used in 3 weeks") needs
+  model rows, and 32 rows × ~150 bytes is noise next to the existing
+  services/GPU payload. Flagged as §11 Q1 in case Jason wants aggregates-only.
+- **Per-tick cost is map-copy only.** `Snapshot()` copies the entries map
+  (tens of entries); `IndexedBytesByDir`/sorting are in-memory. Zero
+  subprocesses, zero filesystem walks on the tick — `MeasuredBytes`/
+  `UnindexedBytes`/`LegacyHFCache` are scan-time values carried from `Meta()`.
+  (The `_store` native rows from `scanNativeDir` are what keep lmstudio/tei
+  represented in `IndexedBytes` despite having no per-model entries.)
+- **Index-miss / nil store ⇒ field omitted** (non-work processes, legacy
+  builds) — indistinguishable from a pre-P3 node, which is correct: the
+  consumer treats absence as "unknown", never "empty cache". An initialized
+  but empty index reports `Cache` with zeros + `ScannedAt`, distinguishing
+  "scanned, nothing there" from "never scanned".
+- The `/status` HTTP endpoint and `citadel services`-adjacent surfaces get
+  the field for free via the collector.
+
+### 9.5 `printCacheInfo` rewrite
+
+Same data, third access path (§9.2's read-only `Load`):
+
+- **Primary rendering from the index:** per-dir rows (indexed bytes, entry
+  count, measured total + unindexed remainder when the scan metadata exists),
+  then per-model rows (size-descending, top ~10 for terminal sanity, with
+  age/last-used), then the legacy-duplicate line when recorded, then a
+  freshness line ("index last reconciled 2026-08-30 04:12 — at `citadel
+  work` startup").
+- **One `du -sh` total is KEPT, per-subdir `du` dropped.** The live total vs
+  the index's `ScannedAt`-stamped measured total diverging is the
+  out-of-band-drift cross-check §8.4 already promised ("index total vs du
+  total diverging IS the duplicate/orphan signal") — and interactive render
+  time is where one `du` is affordable. The per-subdir loop (the expensive
+  part) is replaced by index rows.
+- **Fallback when no index file exists** (node never ran a post-P2a
+  `citadel work`): the current du-based rendering, verbatim, plus one hint
+  line ("no cache index yet — run `citadel work` to build it"). Back-compat
+  is behavioral, not schema-bound: this output is human-facing tabwriter
+  text with no machine consumer to preserve, so keeping the `Total Size` /
+  `Breakdown` labels is courtesy, not contract.
+
+### 9.6 Deliberately NOT in P3
+
+- No reader-side writes of any kind (§9.2) — including "trigger a backfill
+  scan on stale". §8.5's no-mid-run-rescan decision stands for P3; whether
+  the WORKER should rescan on a slow timer for freshness is §11 Q2, a
+  worker-side question, not a reader-side one.
+- No catalog-module cache coverage (the `EngineCacheDirs` boundary,
+  unchanged).
+- No `~/.cache/huggingface` *contents* enumeration — the legacy dup is
+  reported as one path + one size, not indexed per-model (indexing it would
+  bless it as a real cache; it is a to-be-deleted artifact).
+
+## 10. P5 implementation design: GC (size-pressure eviction of stale weights)
+
+P5 is the phase that actually reclaims the #682 disk. Everything below builds
+on shipped primitives: `LeastRecentlyUsed()`/`Verify()` (§8.4),
+`SourceBackfill` provenance, the per-family evict implementations
+(`internal/jobs/model_cache_evict.go`), and `resmon`'s cache-volume disk
+signal. Default OFF behind `CITADEL_CACHE_GC`, per §3 — unchanged.
+
+### 10.1 Trigger and budget: disk-pressure hysteresis on the cache volume, not per-dir byte budgets
+
+**Decision: the trigger is disk-percent on the cache volume, with a
+high-water/low-water pair.** Rationale: #682's incident chain was
+*volume-full* → Docker GC'd engine images → node lied about serveability. A
+per-dir byte budget cannot see the volume filling from anything outside its
+dir (other caches, Docker images, logs) and adds N knobs where one matches
+the actual failure mode. The volume signal already exists and already points
+at the right path: `resmon`'s `hostDiskPath()` resolves `~/citadel-cache`
+when present (`internal/resmon/resmon.go:294-303`) — reuse that resolution
+(exported or mirrored via its pure `resolveDiskPath` core), do not add a
+second probe with a second opinion of "the cache volume".
+
+- Trigger: usage ≥ `CITADEL_CACHE_GC_HIGH_PERCENT` (default **90**, §6 Q2's
+  number, now concrete).
+- Target: evict until usage ≤ `CITADEL_CACHE_GC_LOW_PERCENT` (default
+  **80**) or no eligible candidates remain. Hysteresis is what stops GC from
+  firing every tick while hovering at the threshold.
+- **Evict-one-then-remeasure**, never plan-the-full-set-upfront: entry
+  `SizeBytes` are scan-time estimates (a `SourcePull` entry's size is never
+  refreshed after pull; a container-side re-download can grow a dir
+  invisibly), so the loop's ground truth is a fresh statfs after each
+  eviction, and summed `SizeBytes` are only used for candidate ORDERING
+  (tie-break), never for deciding "we've freed enough".
+- An absolute per-dir/global byte budget is deliberately not in v1 (§11 Q4
+  offers it as the alternative if Jason wants proactive trimming below the
+  pressure threshold on big-disk nodes).
+
+### 10.2 Ordering: `LeastRecentlyUsed()` as shipped — and why the v1 recency signal is sufficient
+
+§3 specified "idle-first, then LRU, largest-size tie-break". With P5's
+exemptions, **idle-first collapses**: resident/serving entries are
+categorically exempt (§10.3), so every candidate is non-resident and the
+ordering is simply `effectiveRecency` ascending (`LeastRecentlyUsed()`,
+`cacheindex.go:417` — including its unknown-sorts-last defensive rule),
+with size-descending as the explicit tie-break added at plan time.
+
+**The resident-implies-used heartbeat signal (§8.1) is sufficient for P5's
+LRU, resolving §8.7 Q3 in the "ship GC on v1 fidelity" direction.** The
+argument: GC only ever *ranks* non-resident entries, and for a non-resident
+entry, `last_used` = the last heartbeat tick at which it was resident — i.e.
+"when did this model last stop being served", which is exactly the recency a
+disk-LRU wants. Per-request precision only discriminates among
+currently-resident models, all of which are exempt anyway. Known
+imperfection, accepted: llamacpp's repo-keyed entries never match the
+reconciler's served-name `MarkUsed` (`cacheIndexMarkUsedReconciler`'s
+documented no-op, `cmd/work.go:2995-3010`) and fall back to `PulledAt`
+ordering — degraded ordering, not wrong deletion, and §10.3's dir-level
+llamacpp exemption is what carries the safety.
+
+`swap-lru.json` stays out, per §2.2/§3.2: engine-keyed VRAM residency cannot
+identify a model in the shared hf-hub bucket. Not re-litigated.
+
+### 10.3 Exemptions — the fail-safe set, per family
+
+Evaluated at plan time AND re-checked immediately before each individual
+deletion (verify-before-act, §8.2's direction-of-error rule — the plan
+snapshot is advisory, the pre-delete check is the guarantee):
+
+1. **Resident/serving weights — the hard rule (§3), per-family because model
+   matching has per-family fidelity.** Residency source:
+   `status.DiscoverLocalEngines` (`internal/status/local_engines.go:42`) —
+   the same authority the gateway chat route and exclusivity tooling use.
+   - **gguf-dir (llamacpp, bonsai):** these dirs are single-engine by
+     construction (`CacheFamilyGGUFDir`'s doc comment). If the owning engine
+     is RUNNING, the **entire dir is exempt** this cycle. Per-entry matching
+     is untrustworthy in the dangerous direction here (served name vs
+     repo-keyed entry, the §10.2 gap), and a whole-dir exemption is
+     right-sized precisely because the dir is single-engine.
+   - **hf-hub:** exact case-insensitive model-id match between an entry's
+     `Model` and any running HF-family engine's served models — the same
+     match that makes the `MarkUsed` reconciler exact for this family. PLUS
+     a conservative catch: if an HF-family engine is running but its served
+     model list is empty/unknown (probe failure), the whole hf dir is exempt
+     this cycle — "we couldn't ask" must not read as "not serving".
+   - **native (ollama):** deletions go through `ollama rm` only (the
+     engine's own store manager; never a raw file delete), and models in a
+     running ollama's served list are exempt anyway. `_store` aggregate rows
+     (lmstudio/tei) are never evictable via the index, as already documented
+     at `scanNativeDir`.
+2. **Pinned.** v1 reads a `pinned_models` list from `citadel.yaml` at plan
+   time (the §3.1 axis; recommendation and alternative in §11 Q5). The
+   reserved `Entry.Pinned` field stays reserved — a manifest list needs no
+   index write, and a `citadel cache pin` CLI writing the index would
+   violate the single-writer rule from a second process (§9.2).
+3. **Min-age.** `effectiveRecency` younger than `CITADEL_CACHE_GC_MIN_AGE_HOURS`
+   (default **24**) is exempt — protects a just-pulled model whose
+   `SERVICE_START` hasn't landed yet (pull and deploy are separate jobs; GC
+   between them would evict the deploy's own weights).
+4. **Backfill entries: RECOMMENDED EVICTABLE — reversing the presumption in
+   `SourceBackfill`'s shipped doc comment.** That comment ("Exempt from GC
+   in a future phase") wrote down the cautious default before P5 was
+   designed. But #682's 40G IS backfill by definition — pre-index weights
+   nobody remembers pulling are *precisely* the forgotten disk hogs the
+   issue names — so exempting `SourceBackfill` guts P5 against its own
+   motivating incident. §8.5 already built the ordering safety
+   (mtime-as-`PulledAt`, unknown-not-coldest); §10.3's residency + min-age +
+   Verify checks apply identically. Worst case for a wrongly-cold backfill
+   entry: a self-provisioning container re-downloads on its next start —
+   cost, not corruption, the §8.2-blessed direction. This is §11 Q3, the
+   headline P5 fork.
+5. **Verify-before-delete.** `Index.Verify` (recorded files still exist)
+   immediately before deletion; a stale entry is dropped from the index
+   (worker-side, we ARE the writer) and skipped, never "deleted" (which
+   would count phantom bytes as reclaimed and could, under a path collision,
+   remove someone else's file).
+
+### 10.4 Execution, structure, and the GC-races-a-pull problem
+
+**Structure mirrors #577's planner/executor split** (`status.PlanPreemption`
++ `ServiceHandler.preemptForVRAM`): a pure, unit-testable planner and a
+side-effectful executor.
+
+- **Planner:** `cacheindex.PlanGC(entries []Entry, in GCInputs) GCPlan` —
+  pure; `GCInputs` carries now, min-age, pinned set, per-family residency
+  facts (running engines + served models, as data), and the ordering rule.
+  Unit tests drive every exemption and ordering case with no filesystem.
+- **Executor:** `jobs.RunCacheGC` — owns Verify, the per-eviction residency
+  re-check, the statfs remeasure loop, and deletion via the SAME per-family
+  cores `MODEL_CACHE_EVICT` uses. Concretely: factor the deletion bodies of
+  `evictHuggingFace`/`evictLlamaCppGGUF`/`evictOllama` into
+  JobContext-independent helpers both callers share — one deletion
+  implementation per family, and the index updates
+  (`removeCacheIndexEntry`-equivalent) ride the shared helpers. GC never
+  grows a second `os.RemoveAll` with its own opinion of HF layout.
+
+**The race:** GC deletes cache files and writes the index from OUTSIDE the
+serialized lane — exactly the writer-concurrency hazard that moved
+`MODEL_CACHE_EVICT` onto the lane (§8.2): an eviction racing an in-flight
+multi-GB `hf download` into the same hub dir. Options considered:
+
+- *Dispatch GC as a job onto the serialized lane:* structurally clean, but
+  there is NO local job-submission path into `worker.Runner`
+  (`docs/design-model-exclusivity.md` §2.3 established this and judged
+  building one real plumbing, not a wrapper). Not built for this either.
+- **Chosen: a process-wide cache-mutation mutex in `internal/jobs`**
+  (`cacheMutationMu`), taken (blocking `Lock`) by the handler bodies of
+  `MODEL_CACHE_PULL`/`MODEL_CACHE_EVICT`/`ensureOllamaModel` — zero new
+  contention among themselves, the serialized lane already runs them one at
+  a time; the lock only materializes the lane's implicit exclusivity so a
+  non-lane participant can observe it — and **`TryLock`'d by GC**: a pull
+  in flight ⇒ GC skips this cycle entirely and re-evaluates next tick.
+  Fail-open in the safe direction (the #489 meeting-profile `TryLock`
+  precedent: never block a reconciler behind a multi-GB pull; disk at 90%
+  survives another 30s). Reverse direction — a pull arriving mid-GC blocks
+  on the lane until GC releases — is bounded: GC holds the lock per *run*,
+  runs are a few file deletions + statfs calls, and §11 Q4's low-water
+  target bounds how long a run can be. If runs prove long in practice, the
+  lock can move to per-eviction granularity without changing the contract.
+
+**Trigger wiring:** the OnStatus fan-out (`SetOnStatus`, the
+#416/#612/MarkUsed precedent — the pressure check is one statfs per ~30s
+tick, no new sweep). On trigger, the actual GC runs on its own goroutine
+with a single-flight guard (an `atomic.Bool`, the #858 `captureStdout`
+posture: refuse-to-nest, don't queue) so heartbeat assembly is never delayed
+by deletion I/O. Wired in `cmd/work.go` beside `cacheIndexMarkUsedReconciler`,
+constructor gated on `CITADEL_CACHE_GC` (the `missingQueues`/#612 lesson: an
+OFF node registers nothing rather than no-oping forever).
+
+**Observability:** every eviction logged (engine, model, bytes, recency,
+source); `CacheReport` (§9.4) gains an additive `gc` sub-struct
+(`enabled`, `last_run_at`, `last_run_reclaimed_bytes`,
+`total_reclaimed_bytes`, `last_skip_reason` — e.g. `"pull_in_flight"`,
+`"no_candidates"`, `"below_low_water"`). A node that keeps hitting
+high-water with `no_candidates` (everything pinned/resident/young) is
+visible as such from the heartbeat — that state is P5's honest analogue of
+the swap-rate-limited refusal: it must be *reportable*, not silent.
+
+**CLI:** `citadel cache gc --dry-run` — read-only from any process
+(`Load` + `PlanGC` + print; residency via a live `DiscoverLocalEngines`
+probe), safe by construction. **No CLI execute path in v1**: a second
+process running deletions + index writes reopens both the single-writer
+hazard and the #832-documented worklock second-door class; if operators need
+manual reclaim they already have `MODEL_CACHE_EVICT` via the platform and
+direct `rm` (which the next `ReconcileScan` reconciles).
+
+### 10.5 Interaction with MODEL_CACHE_EVICT, and non-goals
+
+- `MODEL_CACHE_EVICT` stays the precise, targeted, platform-dispatched
+  primitive (serialized lane, index-wired, as shipped). GC is the autonomous
+  policy ABOVE it, sharing deletion cores and the mutation mutex. Neither
+  path knows about the other's decisions; both converge through the index.
+- A GC-evicted model that is later needed re-enters via the normal
+  `MODEL_CACHE_PULL`/first-start path — idempotent re-pull, the direction of
+  error §8.2 blesses. GC does not notify the platform beyond the heartbeat
+  `gc` stats; a control-plane "this node evicted X" event stream is a
+  platform-side consumer of those stats, not node work.
+- **Non-goals, named:** the legacy `~/.cache/huggingface` duplicate is
+  REPORTED (P3) but never auto-deleted by GC — it is outside every
+  `EngineCacheDirs` dir and outside the index by design (§9.6), and deleting
+  a directory citadel never wrote to crosses a line the operator should
+  cross manually. `DOWNLOAD_MODEL`'s dir stays unindexed and untouched (§6
+  Q5 stands). Catalog-module caches out of scope. Docker IMAGE GC (the other
+  half of the #682 incident) is #683/P7 territory (image-present clause),
+  not weight GC.
+
+### 10.6 Thin-consumer verification for P5
+
+Holds for: `LeastRecentlyUsed()` (ordering incl. unknown-handling),
+`Verify()` (staleness), `Remove`/`RemoveFile` (post-delete index updates),
+`Snapshot()` (plan input), `SourceBackfill`/`Pinned` (schema-ready).
+Genuinely new, and expected to be (it IS the feature): `PlanGC` (pure
+planner), the shared per-family deletion cores refactor, the
+`cacheMutationMu` (a gap in the shipped design — §8.2 serialized the JOB
+writers but exposed no primitive for a non-lane mutator to join that
+exclusion), the `gc` heartbeat sub-struct, and the `resolveDiskPath` reuse.
+Plus §9.3's scan-metadata fields, which P5's reporting shares.
+
+## 11. Open questions for Jason (P3 + P5)
+
+### P3 — RESOLVED, P3 SHIPPED (2026-08-30)
+
+1. **Per-model rows in the heartbeat** (§9.4): **RESOLVED — shipped with
+   per-model rows.** `cacheReportFrom` (`cmd/work.go`) attaches top-32-by-size
+   `CacheModelReport` rows per `CacheDirReport`, capped by
+   `maxCacheHeartbeatModelRows`; `EntryCount` carries the true (uncapped)
+   count so a consumer can tell when rows were truncated. Pinned by
+   `TestCacheReportFrom`/`TestCacheReportFromCapsModelRows` (`cmd/work_test.go`).
+2. **Worker-side freshness** (§9.3/§9.6): **NOT resolved — left open, and NOT
+   implemented in this PR.** P3 ships §8.5's original decision unchanged:
+   `ReconcileScan` runs once, at `citadel work` startup, via the SAME call
+   site (`cmd/work.go`'s `runWork`) that already ran it for P2a — now passing
+   `cacheindex.ScanOptions{LegacyHFHubDir: jobs.LegacyHFHubDirForScan()}`. No
+   daily/slow-timer rescan was added; a long-lived worker's `ScannedAt`/
+   `MeasuredBytes`/`LegacyHFCache` values go stale against out-of-band
+   container downloads exactly as this question describes, until the next
+   restart. Whether to add a periodic rescan is still Jason's call, for a
+   follow-up PR — not blocking, since `printCacheInfo`'s freshness line
+   ("index last reconciled ... at `citadel work` startup") and the
+   heartbeat's `ScannedAt` field both surface the staleness honestly rather
+   than hiding it.
+
+**What P3 shipped, precisely** (docs/design-cache-ownership.md §9, this PR):
+- `internal/cacheindex`'s on-disk format gained additive scan metadata
+  (`ScannedAt`/`Dirs`/`LegacyHF`) at **FormatVersion 1, unchanged** — the
+  fields are new top-level keys with `omitempty`, so a pre-P3 file (missing
+  these keys entirely) loads with `Meta()` at its zero value ("never
+  scanned") rather than failing to load or requiring a version bump. Pinned
+  by `TestLoadOldFormatWithoutScanMetadataForwardCompat` (constructs a
+  literal `{"version":1,"entries":[...]}` file with none of the new keys)
+  and `TestScanMetadataRoundTrip` (`internal/cacheindex/cacheindex_test.go`).
+- `Store.ReconcileScan` gained a required `ScanOptions` parameter
+  (`LegacyHFHubDir`) and now also records `Meta` (measured per-dir totals via
+  `buildDirScans`, the legacy-duplicate probe via `probeLegacyHFCache`) on
+  every pass, per §9.3.
+- `jobs.LegacyHFHubDirForScan()` (`internal/jobs/model_cache_pull.go`) is the
+  new exported resolver + gate (factored out of, and now reused by,
+  `warnIfLegacyHFCacheExists` — one implementation, per §9.3's instruction).
+- `NodeStatus.Cache` (`internal/status/types.go`: `CacheReport`/
+  `CacheDirReport`/`CacheModelReport`/`LegacyCacheReport`) is the new
+  heartbeat field, wired via `CollectorConfig.CacheReport` at both
+  `cmd/work.go` collector construction sites. `cacheReportFrom` is the
+  hand-maintained projection (the `SwapActivity`/`GPUReservation`/
+  `LaneActivity` mirror pattern) — deliberately NOT given a
+  `TestXShapeParity`-style reflection test, because unlike those three it is
+  NOT a 1:1 field mirror (`CacheModelReport` intentionally omits `CacheDir`,
+  `Files`, `Pinned`); see its doc comment.
+- **Index-miss / staleness handling, per §9.2/§9.5 exactly:** the heartbeat
+  reads the LIVE `jobs.CacheIndexStore()` (nil ⇒ `NodeStatus.Cache` omitted,
+  indistinguishable from a pre-P3 node); `citadel status`'s `printCacheInfo`
+  reads the on-disk file read-only via `cacheindex.Load` and NEVER writes
+  it — a missing/empty index falls back to the original live `du`-based
+  rendering verbatim, plus a hint line ("no cache index yet — run `citadel
+  work` to build it"); an index that exists but has never been scanned
+  (`Meta().ScannedAt.IsZero()`) still renders its entries, with a "not yet
+  reconciled" line instead of a fabricated freshness claim.
+- `printCacheInfo` (`cmd/status.go`) now renders index-backed per-dir/
+  per-model rows (size-descending, top 10, with age) plus the legacy-
+  duplicate line and a freshness line, keeping exactly one `du -sh` total
+  (the out-of-band-drift cross-check §9.5 specifies) and dropping the
+  expensive per-subdir `du` loop.
+
+### P5 — NOT IMPLEMENTED IN THIS PR (design only; next PR)
+
+3. **Backfill evictability — the headline fork** (§10.3.4): **RESOLVED by
+   Jason (2026-08-30): EVICTABLE.** Reverses `SourceBackfill`'s shipped doc
+   comment ("Exempt from GC in a future phase") — the #682 40G duplicate IS
+   backfill by definition, so exempting it would gut P5 against its own
+   motivating incident. This decision is recorded here for the P5
+   implementation PR to build against; **P5 itself (the GC executor,
+   `PlanGC`, the `cacheMutationMu`, the `gc` heartbeat sub-struct, `citadel
+   cache gc --dry-run`) is NOT implemented in this PR** — only this doc
+   update. The P5 PR must update `SourceBackfill`'s doc comment in
+   `internal/cacheindex/cacheindex.go` to match (currently still says
+   "Exempt... P2a only sets the marker, no GC logic reads it yet" — accurate
+   today, since no GC logic exists yet, but the exemption presumption it
+   states is superseded by this decision and should be corrected when P5
+   lands so the two don't silently disagree).
+4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): still open — not
+   decided in this pass. disk-percent high/low water on the cache volume
+   (recommended: 90/80) — or do you also want an absolute byte budget (per
+   cache dir or global) for proactive trimming on big-disk nodes where 90%
+   is already catastrophic for neighbors?
+5. **Pinning source** (§10.3.2, carries §6 Q1): still open — not decided in
+   this pass. manifest `pinned_models` in `citadel.yaml` (recommended —
+   mirrors `pinned_services`, no index write, no new write path), vs a
+   runtime `citadel cache pin` CLI (needs a cross-process index-write path
+   that violates the single-writer rule today — would have to be a job type
+   or wait for a local job-submission path)?
+6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): still open — not decided
+   in this pass. OK to ship GC on the v1 resident-implies-used signal per the
+   §10.2 sufficiency argument (recommended), or hold P5 until per-request
+   `MarkUsed` touches (via the `RecordEngineRequest` call sites) land first?

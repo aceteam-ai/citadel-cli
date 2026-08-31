@@ -1060,47 +1060,64 @@ func legacyHFCacheDir() string {
 // duplicate-detection `citadel status`/heartbeat surfacing that's P3's job --
 // existing files at the legacy path are left exactly where they are.
 //
+// Resolution + the "at least one real models--* entry" gate now live in
+// LegacyHFHubDirForScan (below), shared with cacheindex.ReconcileScan's own
+// durable legacy-duplicate scan-metadata record (design doc §9.3) -- one
+// implementation of the gate, not two that could silently drift.
+// Best-effort throughout: any stat/read failure is silently treated as
+// "nothing to report", never a pull error.
+func warnIfLegacyHFCacheExists(ctx JobContext, jobID string) {
+	legacyHub := LegacyHFHubDirForScan()
+	if legacyHub == "" {
+		return
+	}
+	dir := filepath.Dir(legacyHub)
+	ctx.Log("info", "     - [Job %s] found a pre-existing HuggingFace cache at %s (predates citadel #682's fix) — "+
+		"this pull writes to %s instead; the old directory is not touched and can be removed manually to reclaim space",
+		jobID, dir, hfCacheBaseDir())
+}
+
+// LegacyHFHubDirForScan resolves the pre-#682 legacy HuggingFace hub-cache
+// directory (~/.cache/huggingface/hub) for cacheindex.ReconcileScan's
+// scan-metadata legacy-duplicate probe (design doc §9.3,
+// ScanOptions.LegacyHFHubDir) -- exported so cmd/work.go's ReconcileScan call
+// site can compute it without internal/cacheindex (a LEAF package) importing
+// internal/jobs.
+//
 // Checks <legacy>/hub for at least one `models--*` entry, NOT just
 // os.Stat(legacyHFCacheDir()) existing. The bare ~/.cache/huggingface
 // directory exists on essentially any machine anyone ran `hf auth login` on
 // -- it may hold nothing but a `token` file. Reporting on that alone would
 // point an operator at their HF credentials directory and tell them it "can
 // be removed manually to reclaim space", which is actively harmful advice --
-// so this only fires when there is a real, sizeable model cache to report.
+// so this only returns non-empty when there is a real, sizeable model cache
+// to report.
 //
-// Reports hfCacheBaseDir() (the directory THIS pull actually resolves to,
-// respecting any operator env override) as the "instead" location, not a
-// hardcoded canonicalHFCacheDir() -- an operator running with HF_HOME/
-// HF_HUB_CACHE/etc already set is not redirected by this fix at all (see
-// hfDownloadEnv's doc comment), and a message claiming "the canonical cache"
-// in that case would be actively wrong. Skips entirely when the legacy hub
-// dir and the actual resolved hub dir are the SAME directory (an operator
-// override that happens to point back at ~/.cache/huggingface, or a test
-// redirect) -- there is no second copy to report.
-// Best-effort throughout: any stat/read failure is silently treated as
-// "nothing to report", never a pull error.
-func warnIfLegacyHFCacheExists(ctx JobContext, jobID string) {
+// Returns "" (skip the probe) when the legacy hub dir and the actual
+// resolved hub dir (hfCacheBaseDir(), respecting any operator env override)
+// are the SAME directory -- an operator override that happens to point back
+// at ~/.cache/huggingface, or a test redirect -- there is no second copy to
+// report in that case.
+func LegacyHFHubDirForScan() string {
 	dir := legacyHFCacheDir()
 	if dir == "" {
-		return
+		return ""
 	}
 	legacyHub := filepath.Join(dir, "hub")
 	actualHub := hfCacheBaseDir()
 	if legacyHub == actualHub {
-		return
+		return ""
 	}
 	entries, err := os.ReadDir(legacyHub)
 	if err != nil {
-		return
+		return ""
 	}
 	for _, e := range entries {
 		if e.IsDir() && strings.HasPrefix(e.Name(), "models--") {
-			ctx.Log("info", "     - [Job %s] found a pre-existing HuggingFace cache at %s (predates citadel #682's fix) — "+
-				"this pull writes to %s instead; the old directory is not touched and can be removed manually to reclaim space",
-				jobID, dir, actualHub)
-			return
+			return legacyHub
 		}
 	}
+	return ""
 }
 
 // hfCacheModelSizeFn resolves how many bytes of a model are already present
