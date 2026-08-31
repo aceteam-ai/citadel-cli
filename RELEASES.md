@@ -2122,3 +2122,18 @@ Auto-generated log of every release.
   - fix: warm_on_demand advertises image/weights/disk-checked serveability, not just a YAML on disk (#683) (#955)
 
 
+---
+
+## v2.136.0 — 2026-08-31
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +552 |
+
+**Changes:**
+
+  - fix: fail fast on unserveable on-demand swap instead of attempting a doomed pull (#956) (#957)
+
+
