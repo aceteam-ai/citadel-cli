@@ -8,6 +8,23 @@ import (
 	"testing"
 )
 
+// stubHotswapPreflightPass overrides the citadel-cli#683 image/weights
+// preflight package vars to always pass, for tests that exercise other
+// behavior of collectInstalledEngines and don't want a real docker daemon or
+// a real ~/citadel-cache to matter. The disk-headroom clause needs no stub:
+// callers pass a zero-value SystemMetrics{}, which diskHeadroomBlocked
+// treats as "no signal" (DiskTotalGB<=0) and never blocks.
+func stubHotswapPreflightPass(t *testing.T) {
+	t.Helper()
+	origImg, origWeights := engineImagePresentFn, engineWeightsPresentFn
+	engineImagePresentFn = func(string) bool { return true }
+	engineWeightsPresentFn = func(string) bool { return true }
+	t.Cleanup(func() {
+		engineImagePresentFn = origImg
+		engineWeightsPresentFn = origWeights
+	})
+}
+
 // writeInstalledEngine materializes an engine's compose (and optional env) under
 // a temp config dir so collectInstalledEngines treats it as installed.
 func writeInstalledEngine(t *testing.T, dir, name, envContents string) {
@@ -27,11 +44,12 @@ func writeInstalledEngine(t *testing.T, dir, name, envContents string) {
 }
 
 func TestCollectInstalledEngines_AdvertisesStoppedWithDefaultModel(t *testing.T) {
+	stubHotswapPreflightPass(t)
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "bonsai", "") // no env -> compose default model
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 
 	var bonsai *ServiceInfo
 	for i := range engines {
@@ -71,14 +89,23 @@ func TestCollectInstalledEngines_AdvertisesStoppedWithDefaultModel(t *testing.T)
 	if bonsai.Health != HealthStatusUnknown {
 		t.Errorf("health = %q, want %q (unchanged by #684)", bonsai.Health, HealthStatusUnknown)
 	}
+	// citadel-cli#683: with the preflight checks stubbed to pass, this entry
+	// must be advertised exactly as it was before #683 -- no SwapBlocked flag.
+	if bonsai.SwapBlocked {
+		t.Errorf("SwapBlocked = true, want false when all preflight checks pass")
+	}
+	if bonsai.SwapBlockedReason != "" {
+		t.Errorf("SwapBlockedReason = %q, want empty when all preflight checks pass", bonsai.SwapBlockedReason)
+	}
 }
 
 func TestResolveInstalledModel_EnvOverrideWins(t *testing.T) {
+	stubHotswapPreflightPass(t)
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "vllm", "VLLM_MODEL=my-org/my-model\n# a comment\n")
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 
 	var found bool
 	for _, e := range engines {
@@ -102,11 +129,12 @@ func TestResolveInstalledModel_EnvOverrideWins(t *testing.T) {
 // persisted to llamacpp.env. With LLAMACPP_MODEL now a recognized override
 // var, a persisted value must resolve and make llamacpp swappable.
 func TestResolveInstalledModel_LlamaCppEnvOverrideResolves(t *testing.T) {
+	stubHotswapPreflightPass(t)
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "llamacpp", "LLAMACPP_MODEL=my-model.gguf\n")
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 
 	var found bool
 	for _, e := range engines {
@@ -136,7 +164,7 @@ func TestResolveInstalledModel_LlamaCppNoDefaultWithoutOverride(t *testing.T) {
 	writeInstalledEngine(t, dir, "llamacpp", "") // no env override, no compose default
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
-	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 
 	for _, e := range engines {
 		if e.Name == "llamacpp" {
@@ -151,7 +179,7 @@ func TestCollectInstalledEngines_SkipsAlreadyReported(t *testing.T) {
 
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
 	// bonsai already reported (running) => must not be duplicated as stopped.
-	engines := c.collectInstalledEngines(map[string]struct{}{"bonsai": {}}, map[string]struct{}{})
+	engines := c.collectInstalledEngines(map[string]struct{}{"bonsai": {}}, map[string]struct{}{}, SystemMetrics{})
 	for _, e := range engines {
 		if e.Name == "bonsai" {
 			t.Fatalf("bonsai should be skipped when already reported")
@@ -161,7 +189,7 @@ func TestCollectInstalledEngines_SkipsAlreadyReported(t *testing.T) {
 
 func TestCollectInstalledEngines_NoConfigDirReturnsNil(t *testing.T) {
 	c := NewCollector(CollectorConfig{ModelHotswap: true}) // ConfigDir empty
-	if got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}); got != nil {
+	if got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{}); got != nil {
 		t.Fatalf("expected nil with no configDir, got %v", got)
 	}
 }
@@ -254,11 +282,12 @@ func TestApplyModelHotswap_ResidentEngineFallsBackToTableWithoutFootprint(t *tes
 // table estimate, unchanged by the measured-vram routing added for running
 // engines.
 func TestCollectInstalledEngines_StoppedEngineUsesTableEstimate(t *testing.T) {
+	stubHotswapPreflightPass(t)
 	dir := t.TempDir()
 	writeInstalledEngine(t, dir, "bonsai", "")
 	c := NewCollector(CollectorConfig{ConfigDir: dir, ModelHotswap: true})
 
-	got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{})
+	got := c.collectInstalledEngines(map[string]struct{}{}, map[string]struct{}{}, SystemMetrics{})
 	if len(got) != 1 {
 		t.Fatalf("expected exactly one advertised stopped engine, got %d", len(got))
 	}

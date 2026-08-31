@@ -160,7 +160,7 @@ func (c *Collector) applyModelHotswap(st *NodeStatus, reported map[string]struct
 			}
 		}
 	}
-	for _, eng := range c.collectInstalledEngines(reported, claimed) {
+	for _, eng := range c.collectInstalledEngines(reported, claimed, st.System) {
 		st.Services = append(st.Services, eng)
 	}
 }
@@ -178,10 +178,18 @@ func (c *Collector) applyModelHotswap(st *NodeStatus, reported map[string]struct
 // model is being served, just not by this engine, and advertising it twice let
 // the platform attribute it to the stopped one (citadel-cli#690). Pass an empty
 // map to advertise unconditionally.
-func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{}) []ServiceInfo {
+//
+// sys is the already-collected system metrics (disk_percent/disk_available_gb)
+// used by the disk-headroom preflight clause (citadel-cli#683, swap_preflight.go)
+// -- passed in rather than re-collected, since applyModelHotswap's caller already
+// populated NodeStatus.System earlier in the same Collect() pass.
+func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{}, sys SystemMetrics) []ServiceInfo {
 	if c.configDir == "" {
 		return nil
 	}
+	// Disk headroom is a node-wide signal, evaluated once and reused for every
+	// candidate engine below rather than per-engine.
+	diskBlocked := diskHeadroomBlocked(sys)
 	var out []ServiceInfo
 	for name := range embeddedservices.ServiceMap {
 		if EngineTypeFromName(name) == "" {
@@ -201,7 +209,7 @@ func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{
 			continue // a running service on this node already serves it (#690)
 		}
 		notResident := false
-		out = append(out, ServiceInfo{
+		info := ServiceInfo{
 			Name:   name,
 			Type:   ServiceTypeLLM,
 			Status: ServiceStatusStopped,
@@ -216,12 +224,33 @@ func (c *Collector) collectInstalledEngines(reported, claimed map[string]struct{
 			// "installed_not_running" is the exact classification the issue
 			// calls out for this branch, distinguishing "we know this engine
 			// was deployed here but it is not running" from "we know nothing
-			// about this engine at all".
-			Readiness:      ReadinessDown,
-			Reason:         "installed_not_running",
-			Resident:       &notResident,
-			VRAMEstimateMB: engineVRAMEstimateMB[name],
-		})
+			// about this engine at all". This value is unconditional --
+			// unrelated to the SwapBlocked* honesty check right below.
+			Readiness: ReadinessDown,
+			Reason:    "installed_not_running",
+			Resident:  &notResident,
+		}
+		// citadel-cli#683: a compose YAML on disk is a claim about a file, not
+		// about serveability. Only an engine that passes ALL THREE checks below
+		// gets the VRAM estimate/fast-ETA advertisement; a failing engine still
+		// appears (so the platform can render WHY), but carries a
+		// machine-readable SwapBlockedReason instead, and no VRAM number --
+		// the issue's explicit warning against replacing a wrong boolean with a
+		// confidently wrong number.
+		switch {
+		case !engineImagePresentFn(name):
+			info.SwapBlocked = true
+			info.SwapBlockedReason = "image_missing"
+		case !engineWeightsPresentFn(name):
+			info.SwapBlocked = true
+			info.SwapBlockedReason = "weights_missing"
+		case diskBlocked:
+			info.SwapBlocked = true
+			info.SwapBlockedReason = "disk_pressure"
+		default:
+			info.VRAMEstimateMB = engineVRAMEstimateMB[name]
+		}
+		out = append(out, info)
 	}
 	return out
 }
