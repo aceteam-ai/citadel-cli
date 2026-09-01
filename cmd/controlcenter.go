@@ -505,24 +505,28 @@ func nodeServiceShutdownSteps(instanceServer *instance.Server, configDir string)
 // issue #658: this OS process is kept alive instead of tearing down the
 // worker/terminal/VNC/etc. subsystems it started, so the node keeps working
 // exactly as it was while the Control Center was open. This is deliberately
-// NOT full daemonization -- it does not fork/setsid/re-exec to free the
-// controlling terminal the way `tmux detach` or a real background service
-// would (that is real, non-trivial additional plumbing; see the PR for
-// issue #658 for the tradeoff). The process remains attached to the
-// terminal/session it was launched from, so closing that session can still
-// end it (e.g. via SIGHUP) unless the operator backgrounds it themselves.
+// NOT full daemonization -- it does not fork/re-exec into a separate,
+// independently-supervised process the way a real background service would
+// (that is real, non-trivial additional plumbing; see the PR for issue #658
+// for the tradeoff). The node therefore keeps working only as long as THIS
+// process does; the message below points at `citadel service install`
+// (internal/service -- systemd on Linux, launchd on macOS, a Windows Service
+// on Windows, all behind the same Manager interface) as the correct way to
+// keep it running unattended, rather than any shell-specific backgrounding
+// trick that would only apply on some platforms.
 func handleDetach(nodeSteps []shutdownStep) {
 	fmt.Println()
 	fmt.Println("Detached: the Control Center display has closed. This node's worker")
 	fmt.Println("(and any terminal/VNC servers this session started) keep running in")
 	fmt.Printf("this process (PID %d).\n", os.Getpid())
 	fmt.Println()
-	fmt.Println("This process is still attached to the current terminal/session --")
-	fmt.Println("closing it may stop the node unless you background this process")
-	fmt.Println("yourself (Ctrl+Z then 'bg'/'disown', 'nohup citadel &', tmux/screen)")
-	fmt.Println("or install Citadel as a system service ('citadel service install').")
+	fmt.Println("This is NOT a background service -- the node keeps working only as")
+	fmt.Println("long as this process does. To keep it running unattended, install")
+	fmt.Println("Citadel as a background service:")
 	fmt.Println()
-	fmt.Println("Press Ctrl+C, or send SIGTERM, to stop the node.")
+	fmt.Println("    citadel service install")
+	fmt.Println()
+	fmt.Println("Press Ctrl+C in this window to stop the node.")
 
 	detachSigs := make(chan os.Signal, 1)
 	signal.Notify(detachSigs, syscall.SIGINT, syscall.SIGTERM)

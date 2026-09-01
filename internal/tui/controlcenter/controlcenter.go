@@ -1924,10 +1924,11 @@ func (cc *ControlCenter) showDetachQuitModal() {
 This session is the node's active worker. Choose how to exit:
 
 %s Detach - close this display only. The worker (and any terminal/VNC
-  servers this session started) keep running in the background for as
-  long as this process stays alive. This does not survive the terminal
-  closing unless you background it yourself (Ctrl+Z, 'bg'/'disown',
-  'nohup', tmux/screen) or install Citadel as a system service.
+  servers this session started) keep running for as long as this
+  process stays alive. This is NOT a background service: the node
+  stops working when this process stops (e.g. this terminal/session
+  ending). To keep it running unattended, install Citadel as a
+  background service with 'citadel service install'.
 %s Stop - shut down the worker and exit completely. Jobs will no longer
   be processed on this node.`,
 		bullet, bullet)
