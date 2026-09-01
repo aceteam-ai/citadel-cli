@@ -95,9 +95,21 @@ type ExposeResult struct {
 type UnexposeResult struct {
 	// Name is the exposed-service slug that was revoked.
 	Name string `json:"name"`
-	// WasExposed reports whether a live exposure actually existed. False still
-	// means success (revoke is idempotent).
+	// WasExposed reports whether a LIVE exposure actually existed (the
+	// gateway's in-memory route). False still means success (revoke is
+	// idempotent). This is its full, original meaning — do not redefine it to
+	// also cover the durable record; other readers (cmd/service_unexpose.go's
+	// CLI messaging, the raw /agent/unexpose HTTP response) depend on it
+	// meaning specifically "a live route was removed".
 	WasExposed bool `json:"was_exposed"`
+	// DurableRecordRemoved reports whether the persisted exposure record
+	// (config.DeleteExposure) actually existed and was removed. A durable
+	// record can outlive its live route (restored for a port that no longer
+	// listens, or written by an older build), so this can be true while
+	// WasExposed is false — citadel #967. Callers that want "did UNEXPOSE
+	// clean up anything at all" should read WasExposed || DurableRecordRemoved
+	// (see internal/worker/unexpose.go's "removed" wire field).
+	DurableRecordRemoved bool `json:"durable_record_removed"`
 }
 
 // ExposeOps is the live side-effect surface behind all three expose-custody
