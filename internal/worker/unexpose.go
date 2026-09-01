@@ -87,7 +87,14 @@ func (h *UnexposeHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 	}
 
 	out := map[string]any{
-		"name":        res.Name,
+		"name": res.Name,
+		// "removed" is the platform wire contract (aceteam PR #8631's parser:
+		// `removed = bool(result.get("removed")) if ... is not None else True`).
+		// Without this key the parser silently defaults removed=True even for
+		// the idempotent not-currently-exposed case (WasExposed=false), which
+		// misreports the outcome to the caller. "was_exposed" is kept alongside
+		// for back-compat with any existing reader of the raw job output.
+		"removed":     res.WasExposed,
 		"was_exposed": res.WasExposed,
 	}
 	h.cfg.Log("UNEXPOSE: %q was_exposed=%v", name, res.WasExposed)

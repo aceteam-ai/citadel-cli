@@ -377,6 +377,14 @@ func TestExposeOps_List(t *testing.T) {
 	if !frigate.Live {
 		t.Error("frigate should be reported live (gateway currently has it programmed)")
 	}
+	// URL must be built the same way Expose's own ExposeResult.URL is (both go
+	// through exposeMeshURL) — pinned here by cross-checking List's URL against
+	// a fresh Expose call for the same name, rather than a hardcoded string, so
+	// this doesn't silently drift if exposeMeshURL's format ever changes.
+	wantURL := exposeMeshURL("frigate")
+	if frigate.URL != wantURL {
+		t.Errorf("frigate url = %q, want %q (from exposeMeshURL)", frigate.URL, wantURL)
+	}
 }
 
 // TestExposeOps_UnexposeTearsDownAndPersists proves Unexpose both drops the
