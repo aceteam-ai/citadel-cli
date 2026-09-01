@@ -25,14 +25,27 @@ two tiers:
      families the sidecar actually serves, downloading only the small
      tokenizer/config files (a few KB -- never the multi-GB weight shards):
        - `stabilityai/sdxl-turbo` (DIFFUSERS_MODEL default): CLIP tokenizer.
-       - `Lightricks/LTX-Video` (the model literally named in citadel-cli#829,
-         and the planned video sidecar's text encoder): T5 tokenizer. Public,
-         ungated repo -- and, verified locally, its `tokenizer/` subfolder
-         ships ONLY `spiece.model` (no pre-converted `tokenizer.json`), so
-         `AutoTokenizer.from_pretrained` is forced through the same
-         slow-to-fast conversion path that actually broke in the incident,
-         with no `use_fast` override needed to prove it: with sentencepiece
-         uninstalled this raises
+       - `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (DIFFUSERS_VIDEO_MODEL default,
+         citadel #958 -- the actual video sidecar model app.py serves via
+         `/generate/video`): UMT5 tokenizer, the same sentencepiece-backed T5
+         family as the LTX-Video probe below. Public, ungated repo (verified
+         via the HF API's file listing, no auth needed). Unlike LTX-Video,
+         its `tokenizer/` subfolder ships a pre-converted `tokenizer.json`
+         alongside `spiece.model`, so `AutoTokenizer` takes the fast path
+         rather than the slow-to-fast conversion the incident hit -- this is
+         real end-to-end coverage of the model app.py actually loads, not a
+         reproduction of the incident's specific code path (the LTX-Video
+         probe below still covers that).
+       - `Lightricks/LTX-Video` (the model literally named in citadel-cli#829;
+         no longer the served video sidecar model as of citadel #958, which
+         picked Wan2.1 instead -- kept here purely as the T5/sentencepiece
+         regression probe that reproduces the ORIGINAL incident's exact code
+         path): T5 tokenizer. Public, ungated repo -- and, verified locally,
+         its `tokenizer/` subfolder ships ONLY `spiece.model` (no
+         pre-converted `tokenizer.json`), so `AutoTokenizer.from_pretrained`
+         is forced through the same slow-to-fast conversion path that
+         actually broke in the incident, with no `use_fast` override needed
+         to prove it: with sentencepiece uninstalled this raises
          `ValueError: Cannot instantiate this tokenizer from a slow version.
          If it's based on sentencepiece, make sure you have sentencepiece
          installed.` -- the same failure class (root file: spiece.model) as
@@ -45,8 +58,8 @@ two tiers:
          downloading its tokenizer files anonymously 401s. Rather than depend
          on a citadel-cli repo secret that may not exist, this probe runs
          (and is real signal) whenever an `HF_TOKEN` env var is available,
-         and is skipped otherwise. The LTX-Video probe above is what keeps
-         tier 2 a hard, token-free gate on the actual named model.
+         and is skipped otherwise. The Wan2.1 and LTX-Video probes above are
+         what keep tier 2 a hard, token-free gate on the actual named models.
 
   ANY network/access failure in tier 2 (HF unreachable, gated-repo 401, rate
   limiting, DNS) is logged as a SKIP, never a failure -- an HF outage is not a
@@ -181,8 +194,25 @@ def check_served_model_tokenizers() -> None:
         subfolder="tokenizer",
     )
 
-    # Lightricks/LTX-Video: the model citadel-cli#829 is literally about, and
-    # the planned video sidecar's text encoder. Public/ungated. Its
+    # Wan-AI/Wan2.1-T2V-1.3B-Diffusers: the sidecar's DIFFUSERS_VIDEO_MODEL
+    # default (citadel #958) -- the model actually served by /generate/video.
+    # Public/ungated (verified via the HF API's file listing, no auth
+    # needed). UMT5 tokenizer, same sentencepiece-backed T5 family as the
+    # LTX-Video probe below; its tokenizer/ subfolder ships a pre-converted
+    # tokenizer.json alongside spiece.model, so AutoTokenizer takes the fast
+    # path here rather than the slow-to-fast conversion the LTX-Video probe
+    # exercises -- this probe's job is proving the ACTUAL served video model
+    # loads end to end, not reproducing the incident's specific code path.
+    _construct_tokenizer(
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers tokenizer (UMT5, subfolder=tokenizer)",
+        repo_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        subfolder="tokenizer",
+    )
+
+    # Lightricks/LTX-Video: the model citadel-cli#829 is literally about. No
+    # longer the served video sidecar model as of citadel #958 (which picked
+    # Wan2.1 instead, probed above) -- kept here purely as the regression
+    # probe for the incident's exact code path. Public/ungated. Its
     # tokenizer/ subfolder ships only spiece.model (verified locally via the
     # HF API's file listing -- no tokenizer.json), so this reproduces the
     # incident's actual code path with no options needed: AutoTokenizer is
@@ -198,8 +228,8 @@ def check_served_model_tokenizers() -> None:
     # file shape as LTX-Video's. The repo is HF-gated (auto-approval, still
     # needs an authenticated + license-accepted token), so anonymous access
     # 401s -- this probe is real signal whenever HF_TOKEN is configured for
-    # this repo, and a clearly-logged skip otherwise. The LTX-Video probe
-    # above is what keeps tier 2 a hard, token-free gate.
+    # this repo, and a clearly-logged skip otherwise. The Wan2.1 and
+    # LTX-Video probes above are what keep tier 2 a hard, token-free gate.
     _construct_tokenizer(
         "stabilityai/stable-diffusion-3.5-medium tokenizer "
         "(T5, subfolder=tokenizer_3, gated -- requires HF_TOKEN)",

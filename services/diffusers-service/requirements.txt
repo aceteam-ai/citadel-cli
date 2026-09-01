@@ -1,20 +1,40 @@
-diffusers==0.31.0
+# 0.33.1, not 0.31.0: WanPipeline/AutoencoderKLWan (citadel #958, Wan2.1
+# text-to-video) were not exported yet at 0.31.0 -- verified directly against
+# the tagged source (diffusers/__init__.py has no "Wan*" symbol at v0.32.0,
+# both appear at v0.33.0). 0.33.1 also raises this package's OWN
+# huggingface-hub floor to >=0.27.0 (see below) and transformers floor to
+# >=4.41.2 / safetensors to >=0.3.1 / accelerate to >=0.31.0 -- all already
+# comfortably satisfied by the pins below, so this bump is otherwise
+# backward-compatible with the existing sdxl-turbo image path.
+diffusers==0.33.1
 transformers==4.46.3
 accelerate==1.1.1
 safetensors==0.4.5
-# Already a transitive dep of diffusers/transformers above (both require
-# huggingface-hub>=0.23.2), pinned explicitly because model_preflight.py
-# (citadel #902) imports it directly for the free-space preflight's
-# list_repo_tree call -- a version contemporaneous with the pins above,
-# comfortably above the 0.23.0 floor list_repo_tree itself requires.
-huggingface_hub==0.26.2
+# Already a transitive dep of diffusers/transformers above, pinned explicitly
+# because model_preflight.py (citadel #902) imports it directly for the
+# free-space preflight's list_repo_tree call. >=0.27.0 is REQUIRED by
+# diffusers==0.33.1 above (verified against its setup.py); bumped from
+# 0.26.2 alongside the diffusers bump for the same reason.
+huggingface_hub==0.27.1
+# export_to_video's preferred backend (diffusers.utils.export_utils), used by
+# the citadel #958 text-to-video path (services/diffusers-service/app.py's
+# /generate/video) to render a WanPipeline result's frames to an MP4
+# container. Without these two, export_to_video falls back to a deprecated
+# OpenCV path (_legacy_export_to_video) that this image does not otherwise
+# need a dependency for -- pin the modern backend instead of relying on the
+# fallback.
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
 # Full text-encoder tokenizer stack (citadel-cli#829). AutoTokenizer /
-# AutoPipelineForText2Image silently depend on different optional backends
-# per model family, and a missing one fails at model-LOAD time (mid-provision,
-# on the node), not at image-build time. sentencepiece + protobuf back the T5
-# tokenizer used by SD 3.5 Medium and (planned) LTX-Video; ftfy is
-# CLIPTokenizer's optional text-cleaning backend (used by the default
-# SDXL-Turbo). Real incident: LTX-Video's T5 tokenizer failed twice in a row
+# AutoPipelineForText2Image / WanPipeline silently depend on different
+# optional backends per model family, and a missing one fails at model-LOAD
+# time (mid-provision, on the node), not at image-build time. sentencepiece +
+# protobuf back the T5 tokenizer used by SD 3.5 Medium and LTX-Video, and the
+# UMT5 tokenizer citadel #958's Wan2.1 text-to-video model
+# (Wan-AI/Wan2.1-T2V-1.3B-Diffusers, DIFFUSERS_VIDEO_MODEL's default) uses --
+# same sentencepiece-backed T5 family; ftfy is CLIPTokenizer's optional
+# text-cleaning backend (used by the default SDXL-Turbo). Real incident:
+# LTX-Video's T5 tokenizer failed twice in a row
 # on a live node -- first `ModuleNotFoundError: No module named 'tiktoken'`
 # (this transformers version's tokenizer-loading path imported it on that
 # model's tokenizer even though tiktoken's own BPE format isn't otherwise

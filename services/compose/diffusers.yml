@@ -1,9 +1,11 @@
 # services/compose/diffusers.yml
 #
-# Node-local text-to-image serving via the HuggingFace diffusers library.
-# Launched on a node by SERVICE_START "diffusers" (aceteam #4468). The image is
-# our own diffusers sidecar (services/diffusers-service), which serves a
-# /generate endpoint and a /health check on the diffusers contract port 7860.
+# Node-local text-to-image / text-to-video serving via the HuggingFace
+# diffusers library. Launched on a node by SERVICE_START "diffusers" (aceteam
+# #4468). The image is our own diffusers sidecar (services/diffusers-service),
+# which serves /generate (image) and /generate/video (citadel #958, video)
+# endpoints plus a /health check on the diffusers contract port 7860. The two
+# models/pipelines are independent (see app.py) and coexist on one container.
 #
 # NOTE: the container listens on 7860 (the aceteam `diffusers-text-to-image`
 # template's default_port), exactly as vllm listens on 8000. The HOST port is
@@ -28,6 +30,9 @@ services:
       # Model repo id to serve. Override for SD 3.5 Medium / SDXL / etc.:
       #   DIFFUSERS_MODEL=stabilityai/stable-diffusion-3.5-medium
       - DIFFUSERS_MODEL=${DIFFUSERS_MODEL:-stabilityai/sdxl-turbo}
+      # Text-to-video model repo id (citadel #958). Wan2.1's 1.3B model is the
+      # default -- small enough to run alongside the image model above.
+      - DIFFUSERS_VIDEO_MODEL=${DIFFUSERS_VIDEO_MODEL:-Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
       - PORT=7860
       # Gated models (e.g. stabilityai/stable-diffusion-3.5-medium) require a
       # HuggingFace token. Set HF_TOKEN in the node's environment before
