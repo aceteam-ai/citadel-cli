@@ -760,18 +760,41 @@ currently holding.
 process's memory, so this needs real cross-process IPC — a persisted file
 was never on the table (§10's invariant: the code exists in memory only,
 never disk).** `Manager.startSocketLocked`/`stopSocketLocked`
-(`internal/pairingdisplay/socket.go`) open/close a one-shot Unix socket at
-`<network.GetNodeConfigDir()>/pairing.sock`, mode `0600`, for exactly the
-lifetime of a pending code — started from `Show` (see below for WHEN),
-stopped from `clearPendingLocked` (Clear, TTL expiry, replacement, or
+(`internal/pairingdisplay/socket_posix.go`) open/close a one-shot Unix
+socket at `<network.GetNodeConfigDir()>/pairing.sock`, mode `0600`, for
+exactly the lifetime of a pending code — started from `Show` (see below for
+WHEN), stopped from `clearPendingLocked` (Clear, TTL expiry, replacement, or
 `Shutdown`). `RequestPendingCode` is the client half `cmd/pairing_code.go`
 calls, resolving the SAME machine-convergent `network.GetNodeConfigDir()`
 `Configure()` already points the worker's `Manager` at (the #383/#845 rule),
 so a root `citadel work` and a non-root `citadel pairing-code` invocation
-agree on the socket path without new plumbing. The file mode, not the CLI's
-TTY check, is the actual access boundary (§10.4's actor-equivalence) — the
-TTY check is the design doc's own admitted "cosmetic" guard, and
-`--json` deliberately bypasses it for scripting.
+agree on the socket path without new plumbing.
+
+**This mechanism is POSIX only (Linux + macOS), not cross-platform, and the
+split is a build tag, not a runtime check.** `internal/pairingdisplay/socket.go`
+holds only the platform-independent pieces (`PendingCodeInfo`,
+`ErrUnsupportedPlatform`); `socket_posix.go` (`//go:build !windows`) is the
+real listener; `socket_windows.go` (`//go:build windows`) is a stub whose
+`startSocketLocked`/`stopSocketLocked` are no-ops and whose
+`RequestPendingCode` always returns `ErrUnsupportedPlatform`. The reason is
+that the `0600` file mode is the ACTUAL access boundary (§10.4's
+actor-equivalence) — the CLI's TTY check is the design doc's own admitted
+"cosmetic" guard on top of it, and `--json` deliberately bypasses that
+cosmetic check for scripting — but `0600` is only a REAL, kernel-enforced
+boundary on POSIX. Go's `os.Chmod` on Windows merely toggles the read-only
+*attribute*; it sets no ACL, so a `0600` Unix socket there would be
+reachable by any local account. Rather than ship that as a false security
+guarantee (mirroring the pattern already established for the P0 console
+renderer — `render_linux.go` vs `render_other.go`'s `unsupported_os` stub,
+Windows/macOS desktop rendering being P3), Windows gets no socket at all.
+`cmd/pairing_code.go`'s `runPairingCode` therefore surfaces
+`ErrUnsupportedPlatform` as an explicit, non-nil error on Windows — including
+a `{"pending": false, "error": "..."}` JSON body under `--json`
+(`renderPairingCodeError`) — never a silent `Pending:false` that would look
+identical to "nothing is currently pending." A real Windows implementation
+needs a proper DACL (`golang.org/x/sys/windows`'s `SetNamedSecurityInfo`,
+reusing the ACL primitives in `internal/network/acl_windows.go` from
+citadel#789/#884) and is a tracked follow-up, not built here.
 
 **`Manager.Show` now tracks a pending code's `code`/`requestedBy` in
 `pendingCode` UNCONDITIONALLY — including when console rendering fails —
@@ -786,14 +809,18 @@ before calling `Renderer.Clear` so a never-rendered code doesn't generate a
 spurious console-clear attempt.
 
 Verified cross-process, not just cross-`Manager`-instance:
-`internal/pairingdisplay/socket_test.go`'s
+`internal/pairingdisplay/socket_posix_test.go`'s
 `TestRequestPendingCode_ServesRealPendingCode` shows console delivery
 FAILING (`no_console`) and the pull-command socket still serving the code to
 an independently-dialing client — the P1 scenario, proven rather than
-assumed.
+assumed. `socket_windows_test.go`'s
+`TestRequestPendingCode_WindowsIsHonestlyUnsupported` pins the Windows side:
+a distinct, non-nil `ErrUnsupportedPlatform`, never a silent no-op (build-tag
+type-checked via `GOOS=windows go vet`, since this repo's CI does not run
+tests ON Windows — see the note under Windows E2E Test Infrastructure).
 
 **Still deferred** (design doc §14): a Control Center TUI banner (P2), and
-non-Linux/desktop-session rendering (P3). The aceteam-side
+non-Windows-adjacent desktop-session rendering (P3). The aceteam-side
 `_node_screen_delivery` body and capability ingestion (P4) are a separate,
 not-yet-built repo.
 

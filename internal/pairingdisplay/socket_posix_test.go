@@ -1,3 +1,5 @@
+//go:build !windows
+
 package pairingdisplay
 
 import (
@@ -214,6 +216,13 @@ func TestRequestPendingCode_UnavailableAfterShutdown(t *testing.T) {
 }
 
 func TestManager_SocketFileModeIsOwnerOnly(t *testing.T) {
+	// POSIX only: the 0600 permission bit is a real, kernel-enforced
+	// access-control boundary here (see socket.go's package doc). On
+	// Windows this file is not even built -- socket_windows.go never
+	// creates a socket file at all, so there is no equivalent assertion to
+	// make there (a synthesized-from-read-only-attribute mode would be a
+	// false invariant, which is exactly what motivated splitting this file
+	// out of the platform-independent test file).
 	dir := t.TempDir()
 	r := newFakeRenderer()
 	m := NewManager(r)

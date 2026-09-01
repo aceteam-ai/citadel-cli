@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,34 @@ func TestRenderPairingCode_JSONShape_NonePending(t *testing.T) {
 		if _, present := decoded[field]; present {
 			t.Fatalf("expected field %q to be omitted when nothing is pending, got %+v", field, decoded)
 		}
+	}
+}
+
+func TestRenderPairingCodeError_JSONShape(t *testing.T) {
+	// Pins the review-mandated contract: a RequestPendingCode failure in
+	// --json mode (e.g. pairingdisplay.ErrUnsupportedPlatform on Windows)
+	// must still produce a valid JSON body on stdout, not a bare Go error
+	// string -- so a script parsing --json output never gets a broken
+	// pipe. renderPairingCodeError must also return the error UNCHANGED, so
+	// the command still exits non-zero.
+	var buf bytes.Buffer
+	origErr := errors.New("read pending pairing code: " + pairingdisplay.ErrUnsupportedPlatform.Error())
+
+	returned := renderPairingCodeError(&buf, origErr)
+	if returned != origErr {
+		t.Fatalf("expected renderPairingCodeError to return the same error unchanged, got %v", returned)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if pending, ok := decoded["pending"].(bool); !ok || pending {
+		t.Fatalf(`expected "pending": false, got %v`, decoded["pending"])
+	}
+	errMsg, ok := decoded["error"].(string)
+	if !ok || !strings.Contains(errMsg, "not supported on this platform") {
+		t.Fatalf("expected an explanatory error message in the JSON body, got %+v", decoded)
 	}
 }
 

@@ -1,22 +1,27 @@
 // Package pairingdisplay renders a platform-pushed node:exec pairing code on
 // this node's active console (citadel #659 P0; see docs/design-pairing-display.md
-// Part II §8-14), and separately serves it back to a local, authenticated
-// `citadel pairing-code` pull command over a Unix socket for the headless
-// fleet (P1, design doc §9.2/§14). It is a leaf package: it imports neither
-// internal/worker nor internal/network, so it is fully testable with an
-// injected fake Renderer and no real console/VT access.
+// Part II §8-14), and, on POSIX platforms only, separately serves it back to
+// a local, authenticated `citadel pairing-code` pull command over a Unix
+// socket for the headless fleet (P1, design doc §9.2/§14 -- see socket.go's
+// package doc for why Windows does not get the pull-command socket at all).
+// It is a leaf package: it imports neither internal/worker nor
+// internal/network, so it is fully testable with an injected fake Renderer
+// and no real console/VT access.
 //
 // # Security invariant
 //
 // The code passes through Manager.Show, is retained in memory only (never
-// disk), and leaves this package through exactly two channels: a Renderer
-// call, and the pull-command socket (socket.go) -- which is itself gated to
-// 0600 (same UID / root only) rather than open to any local process. It is
-// never logged, never written to disk (the crash marker carries a
-// grant_request_id and a target device name, never the code), and no
-// exported method other than the socket's own request handler ever returns
-// it. See internal/worker/pairing_display.go's package doc for the full
-// invariant this package is one leg of.
+// disk), and leaves this package through at most two channels: a Renderer
+// call, and, on POSIX only, the pull-command socket (socket_posix.go) --
+// which is itself gated to 0600 (same UID / root only), a REAL
+// kernel-enforced boundary there. On Windows that socket is never opened at
+// all (socket_windows.go) precisely because os.Chmod provides no equivalent
+// guarantee on that platform -- see socket.go's package doc for the full
+// reasoning. The code is never logged, never written to disk (the crash
+// marker carries a grant_request_id and a target device name, never the
+// code), and no exported method other than the socket's own request handler
+// ever returns it. See internal/worker/pairing_display.go's package doc for
+// the full invariant this package is one leg of.
 package pairingdisplay
 
 import (
@@ -111,14 +116,17 @@ type crashMarker struct {
 type pendingCode struct {
 	grantRequestID string
 	// code and requestedBy are retained ONLY so the local pull-command
-	// socket (socket.go, design doc §9.2/P1) can serve them back to
-	// `citadel pairing-code` -- a different process than the one that
-	// called Show. This is new as of P1: P0 never stored the code at all
-	// (it flowed straight into the renderer and was discarded). Neither
-	// field is ever logged, and neither is written to the crash marker
-	// (crashMarker below stays code-less) -- only the 0600, same-UID-only
-	// socket ever exposes them. See socket.go's package-level doc for the
-	// full boundary.
+	// socket (socket_posix.go, design doc §9.2/P1 -- POSIX only, see
+	// socket.go's package doc) can serve them back to `citadel pairing-code`
+	// -- a different process than the one that called Show. This is new as
+	// of P1: P0 never stored the code at all (it flowed straight into the
+	// renderer and was discarded). Neither field is ever logged, and
+	// neither is written to the crash marker (crashMarker below stays
+	// code-less) -- on POSIX, only the 0600, same-UID-only socket ever
+	// exposes them; on Windows startSocketLocked/stopSocketLocked
+	// (socket_windows.go) are no-ops, so these fields are tracked but never
+	// exposed through any channel there at all. See socket.go's
+	// package-level doc for the full boundary.
 	code        string
 	requestedBy string
 	// target is the resolved console device, e.g. "/dev/tty1". Empty when

@@ -20,10 +20,22 @@
 // -- the SAME machine-convergent directory Configure() points the worker's
 // Manager at (the #383/#845 rule), so a root `citadel work` and this
 // (possibly non-root, hence `sudo citadel pairing-code`) invocation resolve
-// the identical socket path. The 0600 file mode is the real access-control
-// boundary (design doc §10.4's actor-equivalence) -- the client-side TTY
-// gate below is the doc's own "cosmetic" guard against casual scripting,
-// not a security measure.
+// the identical socket path.
+//
+// # POSIX only -- Windows fails honestly, never silently
+//
+// This mechanism is Linux/macOS only. On those platforms the socket's 0600
+// file mode is a real, kernel-enforced access-control boundary (design doc
+// §10.4's actor-equivalence) -- the client-side TTY gate below is, per the
+// design doc itself, a "cosmetic" guard against casual scripting on top of
+// that, not a security measure in its own right. On Windows, `os.Chmod`
+// does not set a real ACL, so there IS no such boundary there; rather than
+// pretend otherwise, `pairingdisplay.RequestPendingCode` never opens a
+// socket at all on Windows and returns `pairingdisplay.ErrUnsupportedPlatform`
+// -- surfaced below as a clear, distinct error/JSON shape, never as a
+// silent "no pending code" (which would be indistinguishable from "nothing
+// is pending" and could mislead an operator into thinking there's nothing
+// to retrieve when there might be). See internal/pairingdisplay/socket_windows.go.
 package cmd
 
 import (
@@ -59,6 +71,12 @@ nothing to retrieve if no such process is running, or if nothing is
 currently pending. This command never talks to the AceTeam backend and
 never touches the mesh network.
 
+Linux/macOS only for now: on Windows, os.Chmod does not provide a real
+access-control boundary for this mechanism, so it is disabled there rather
+than shipped with a false security guarantee -- this command reports a
+clear "not supported on this platform yet" error on Windows instead of a
+silent "no pending code".
+
 The requesting agent that originated the grant cannot run this command to
 obtain the code for itself: node:exec is exactly the capability being
 escalated, so by definition it has no shell on this node yet. Only a human
@@ -83,19 +101,47 @@ func runPairingCode(cmd *cobra.Command) error {
 	// The TTY gate is the design doc's own "cosmetic" guard (§9.2): it
 	// discourages a script or an agent's own subprocess call from silently
 	// harvesting the human-formatted output, but is NOT the real security
-	// boundary (the socket's 0600 file mode is -- see this file's package
-	// doc). --json is an explicit, deliberate request for machine-readable
-	// output and bypasses it; the default human-formatted path still
-	// refuses outside a real terminal.
+	// boundary -- the socket's 0600 file mode is, and ONLY on POSIX (see
+	// this file's package doc for why Windows has no equivalent boundary
+	// and gets no socket at all). --json is an explicit, deliberate request
+	// for machine-readable output and bypasses this TTY check; the default
+	// human-formatted path still refuses outside a real terminal.
 	if !pairingCodeJSON && !tui.IsTTY() {
 		return fmt.Errorf("citadel pairing-code must be run from an interactive terminal (use --json to allow scripted output)")
 	}
 
 	info, err := pairingdisplay.RequestPendingCode(network.GetNodeConfigDir(), pairingCodeSocketTimeout)
 	if err != nil {
-		return fmt.Errorf("read pending pairing code: %w", err)
+		wrapped := fmt.Errorf("read pending pairing code: %w", err)
+		if pairingCodeJSON {
+			// A script parsing --json output must always get a JSON body on
+			// stdout, even on failure -- including the "unsupported
+			// platform" case (ErrUnsupportedPlatform), which is a NORMAL,
+			// expected outcome on Windows, not an exceptional one. This
+			// still returns the error too (cobra prints it to stderr and
+			// the process exits non-zero), so a caller checking the exit
+			// code sees a real failure; a caller only reading stdout sees a
+			// well-formed, parseable explanation rather than a bare Go
+			// error string mixed into what would otherwise be JSON.
+			return renderPairingCodeError(cmd.OutOrStdout(), wrapped)
+		}
+		return wrapped
 	}
 	return renderPairingCode(cmd.OutOrStdout(), info, pairingCodeJSON)
+}
+
+// renderPairingCodeError writes a machine-readable {"pending":false,
+// "error":"..."} body to out and returns err unchanged, so the command
+// still exits non-zero (cobra's default stderr "Error: ..." line still
+// fires too) while stdout stays valid JSON.
+func renderPairingCodeError(out io.Writer, err error) error {
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(map[string]any{
+		"pending": false,
+		"error":   err.Error(),
+	})
+	return err
 }
 
 // renderPairingCode is the pure, unit-testable half of runPairingCode: given
