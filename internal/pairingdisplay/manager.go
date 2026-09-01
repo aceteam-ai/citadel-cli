@@ -1,20 +1,27 @@
 // Package pairingdisplay renders a platform-pushed node:exec pairing code on
 // this node's active console (citadel #659 P0; see docs/design-pairing-display.md
-// Part II §8-14). It is a leaf package: it imports neither internal/worker nor
-// internal/network, so it is fully testable with an injected fake Renderer and
-// no real console/VT access.
+// Part II §8-14), and separately serves it back to a local, authenticated
+// `citadel pairing-code` pull command over a Unix socket for the headless
+// fleet (P1, design doc §9.2/§14). It is a leaf package: it imports neither
+// internal/worker nor internal/network, so it is fully testable with an
+// injected fake Renderer and no real console/VT access.
 //
 // # Security invariant
 //
-// The code passes through Manager.Show and into a Renderer call, and nowhere
-// else. It is never logged, never written to disk (the crash marker carries a
-// grant_request_id and a target device name, never the code), and never
-// returned from any method here. See internal/worker/pairing_display.go's
-// package doc for the full invariant this package is one leg of.
+// The code passes through Manager.Show, is retained in memory only (never
+// disk), and leaves this package through exactly two channels: a Renderer
+// call, and the pull-command socket (socket.go) -- which is itself gated to
+// 0600 (same UID / root only) rather than open to any local process. It is
+// never logged, never written to disk (the crash marker carries a
+// grant_request_id and a target device name, never the code), and no
+// exported method other than the socket's own request handler ever returns
+// it. See internal/worker/pairing_display.go's package doc for the full
+// invariant this package is one leg of.
 package pairingdisplay
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -103,9 +110,26 @@ type crashMarker struct {
 
 type pendingCode struct {
 	grantRequestID string
-	target         string
-	expiresAt      time.Time
-	timer          *time.Timer
+	// code and requestedBy are retained ONLY so the local pull-command
+	// socket (socket.go, design doc §9.2/P1) can serve them back to
+	// `citadel pairing-code` -- a different process than the one that
+	// called Show. This is new as of P1: P0 never stored the code at all
+	// (it flowed straight into the renderer and was discarded). Neither
+	// field is ever logged, and neither is written to the crash marker
+	// (crashMarker below stays code-less) -- only the 0600, same-UID-only
+	// socket ever exposes them. See socket.go's package-level doc for the
+	// full boundary.
+	code        string
+	requestedBy string
+	// target is the resolved console device, e.g. "/dev/tty1". Empty when
+	// no console render ever succeeded for this pending code (no_console,
+	// graphical_session, unsupported_os, ...) -- the code is still tracked
+	// (for the pull-command socket, which is precisely the headless-fleet
+	// answer for exactly these cases) but there is nothing on a screen to
+	// clear.
+	target    string
+	expiresAt time.Time
+	timer     *time.Timer
 	// gen is a monotonically-increasing generation stamp, distinct from
 	// grantRequestID. It exists because §8.2 allows a re-Show for the SAME
 	// grantRequestID (a delivery retry) to reset the TTL: if the OLD timer
@@ -127,6 +151,10 @@ type Manager struct {
 	pending  *pendingCode
 	nextGen  uint64
 	logf     func(format string, args ...any)
+	// listener serves the pull-command socket (socket.go) for the current
+	// pending code, when one exists and stateDir is configured. nil when
+	// nothing is pending or no state dir is set (e.g. most tests).
+	listener net.Listener
 }
 
 // NewManager constructs a Manager around an injected Renderer, so it is fully
@@ -182,7 +210,19 @@ func (m *Manager) SetLogFunc(f func(format string, args ...any)) {
 // Show renders code on the node's console for ttl, replacing whatever is
 // currently displayed (latest-grant-wins; design doc §8.2). It never
 // returns, logs, or persists the code — only grantRequestID and the
-// resolved target ever leave this call.
+// resolved target ever leave this call via ShowOutcome/logs/the crash
+// marker.
+//
+// The code and requestedBy ARE retained in m.pending itself (P1, design doc
+// §9.2) so the pull-command socket can serve them back to a separate
+// `citadel pairing-code` process -- see pendingCode's doc comment. That
+// tracking happens UNCONDITIONALLY, before any console-rendering attempt
+// below, and regardless of whether one succeeds: the pull command is the
+// headless-fleet answer, so it must work precisely when console delivery is
+// impossible (no_console, graphical_session, unsupported_os). The
+// ShowOutcome/job-result semantics this method returns are unchanged by
+// that -- Delivered still means "confirmed console render", never "a pull
+// command could retrieve it".
 //
 // Ordering is load-bearing (design doc §12): the crash marker is written
 // BEFORE the renderer is asked to draw anything. A process kill between the
@@ -198,15 +238,33 @@ func (m *Manager) Show(code string, ttl time.Duration, grantRequestID, requested
 	// Replace whatever is currently pending (a different or the same grant).
 	m.clearPendingLocked("replaced")
 
+	expiresAt := time.Now().Add(ttl)
+	m.nextGen++
+	gen := m.nextGen
+	pc := &pendingCode{
+		grantRequestID: grantRequestID,
+		code:           code,
+		requestedBy:    requestedBy,
+		expiresAt:      expiresAt,
+		gen:            gen,
+	}
+	pc.timer = time.AfterFunc(ttl, func() { m.onExpire(gen) })
+	m.pending = pc
+	// Best-effort: a listener failure (no state dir configured, permission
+	// error) must never block or fail the console-delivery attempt below --
+	// the pull command is an additional retrieval path, not the primary one.
+	m.startSocketLocked()
+
 	if m.renderer == nil {
+		m.logf("pairing-display: no renderer configured (grant_request_id=%s)", grantRequestID)
 		return ShowOutcome{Reason: "unsupported_os"}
 	}
 	target, failReason, ok := m.renderer.ResolveTarget()
 	if !ok {
+		m.logf("pairing-display: console target unavailable (grant_request_id=%s, reason=%s)", grantRequestID, failReason)
 		return ShowOutcome{Reason: failReason}
 	}
 
-	expiresAt := time.Now().Add(ttl)
 	marker := crashMarker{Target: target, ExpiresAt: expiresAt, GrantRequestID: grantRequestID}
 	if err := m.writeMarkerLocked(marker); err != nil {
 		m.logf("pairing-display: failed to write crash marker (grant_request_id=%s): %v", grantRequestID, err)
@@ -224,11 +282,10 @@ func (m *Manager) Show(code string, ttl time.Duration, grantRequestID, requested
 		return ShowOutcome{Reason: result.Reason}
 	}
 
-	m.nextGen++
-	gen := m.nextGen
-	pc := &pendingCode{grantRequestID: grantRequestID, target: target, expiresAt: expiresAt, gen: gen}
-	pc.timer = time.AfterFunc(ttl, func() { m.onExpire(gen) })
-	m.pending = pc
+	// Record the target on the SAME pendingCode we already created above (do
+	// not replace m.pending -- that would hand it a new timer/gen for no
+	// reason and could race the pull-command socket's read of m.pending).
+	pc.target = target
 
 	m.logf("pairing-display: showing code (grant_request_id=%s, surface=%s, target=%s, expires_at=%s)",
 		grantRequestID, result.Surface, target, expiresAt.UTC().Format(time.RFC3339))
@@ -281,9 +338,9 @@ func (m *Manager) ReconcileStale() bool {
 	return true
 }
 
-// clearPendingLocked stops any pending timer, best-effort clears the
-// renderer, and deletes the marker. Called under m.mu. No-op when nothing is
-// pending.
+// clearPendingLocked stops any pending timer, closes the pull-command
+// socket, best-effort clears the renderer, and deletes the marker. Called
+// under m.mu. No-op when nothing is pending.
 func (m *Manager) clearPendingLocked(note string) {
 	if m.pending == nil {
 		return
@@ -293,7 +350,11 @@ func (m *Manager) clearPendingLocked(note string) {
 	}
 	target := m.pending.target
 	m.pending = nil
-	if m.renderer != nil {
+	m.stopSocketLocked()
+	// target is empty when no console render ever succeeded for this
+	// pending code (see pendingCode.target's doc comment) -- nothing was
+	// ever drawn, so there is nothing for the renderer to clear.
+	if target != "" && m.renderer != nil {
 		if err := m.renderer.Clear(target, "pairing code "+note); err != nil {
 			m.logf("pairing-display: clear failed: %v", err)
 		}
