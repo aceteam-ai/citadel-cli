@@ -2153,3 +2153,19 @@ Auto-generated log of every release.
   - control center: offer Detach on quit when this session owns the worker (#959)
 
 
+---
+
+## v2.138.0 — 2026-09-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 15 |
+| Lines added | +869 |
+
+**Changes:**
+
+  - feat(diffusers): serve Wan2.1 text-to-video via /generate/video (#958) (#964)
+  - fix(worker): EXPOSE_LIST url + UNEXPOSE removed to match platform wire contract (#961) (#963)
+
+
