@@ -11,6 +11,75 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
 )
 
+// TestShouldOfferDetachOnQuit pins the pure decision behind the detach-on-quit
+// modal (issue #658): the Detach/Stop choice is only offered when THIS
+// control-center instance actually owns job consumption for the node AND its
+// worker is currently running. Table-driven over WorkerCallbacks so it never
+// touches tview/the event loop.
+func TestShouldOfferDetachOnQuit(t *testing.T) {
+	tests := []struct {
+		name            string
+		ownsConsumption func() bool
+		isRunning       func() bool
+		want            bool
+	}{
+		{
+			name:            "owns consumption and running -> offer detach",
+			ownsConsumption: func() bool { return true },
+			isRunning:       func() bool { return true },
+			want:            true,
+		},
+		{
+			name:            "monitor-only (dedicated citadel work holds the lock) -> no detach",
+			ownsConsumption: func() bool { return false },
+			isRunning:       func() bool { return true },
+			want:            false,
+		},
+		{
+			name:            "owns consumption but worker not running (never started/exited) -> no detach",
+			ownsConsumption: func() bool { return true },
+			isRunning:       func() bool { return false },
+			want:            false,
+		},
+		{
+			name:            "neither -> no detach",
+			ownsConsumption: func() bool { return false },
+			isRunning:       func() bool { return false },
+			want:            false,
+		},
+		{
+			name:            "OwnsConsumption callback nil -> no detach",
+			ownsConsumption: nil,
+			isRunning:       func() bool { return true },
+			want:            false,
+		},
+		{
+			name:            "IsRunning callback nil -> no detach",
+			ownsConsumption: func() bool { return true },
+			isRunning:       nil,
+			want:            false,
+		},
+		{
+			name:            "both callbacks nil (zero-value WorkerCallbacks) -> no detach",
+			ownsConsumption: nil,
+			isRunning:       nil,
+			want:            false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			worker := WorkerCallbacks{
+				OwnsConsumption: tt.ownsConsumption,
+				IsRunning:       tt.isRunning,
+			}
+			if got := shouldOfferDetachOnQuit(worker); got != tt.want {
+				t.Errorf("shouldOfferDetachOnQuit() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestJobRecordStruct tests the JobRecord struct fields
 func TestJobRecordStruct(t *testing.T) {
 	now := time.Now()

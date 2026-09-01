@@ -58,10 +58,18 @@ import (
 var (
 	ccWorkerMu      sync.Mutex
 	ccWorkerRunning bool
-	ccWorkerCancel  context.CancelFunc
-	ccWorkerQueue   string
-	ccActivityFn    func(level, msg string)
-	ccHeartbeatFn   func(active bool) // Callback when heartbeat publishes
+	// ccWorkerConsuming is true only while runTUIWorker is actually THIS
+	// process's job consumer for the node -- i.e. it passed the workerHeld
+	// check and reached its own consume loop, rather than falling into
+	// monitor-only mode beside a dedicated `citadel work`. It backs
+	// controlcenter.WorkerCallbacks.OwnsConsumption, the signal the
+	// detach-on-quit modal (issue #658) uses to decide whether quitting this
+	// TUI would actually stop job processing for the node.
+	ccWorkerConsuming bool
+	ccWorkerCancel    context.CancelFunc
+	ccWorkerQueue     string
+	ccActivityFn      func(level, msg string)
+	ccHeartbeatFn     func(active bool) // Callback when heartbeat publishes
 )
 
 // Demo server state
@@ -235,9 +243,10 @@ func runControlCenter() {
 			Disconnect: ccDisconnect,
 		},
 		Worker: controlcenter.WorkerCallbacks{
-			Start:     ccStartWorker,
-			Stop:      ccStopWorker,
-			IsRunning: ccWorkerIsRunning,
+			Start:           ccStartWorker,
+			Stop:            ccStopWorker,
+			IsRunning:       ccWorkerIsRunning,
+			OwnsConsumption: ccWorkerOwnsConsumption,
 		},
 		Permissions: controlcenter.PermissionsCallbacks{
 			Load: func() *config.Permissions {
@@ -435,6 +444,21 @@ func runControlCenter() {
 
 	runErr := cc.Run()
 
+	// Detach (issue #658): the user chose to leave the node's worker (and any
+	// terminal/VNC/etc. servers this session started) running rather than
+	// stopping them on quit. Only the TUI-owned subsystems are torn down here
+	// (through the same bounded watchdog every other teardown step uses);
+	// handleDetach keeps this process alive until it's told to stop, at which
+	// point it runs the same node-service teardown the plain-quit path below
+	// runs immediately.
+	nodeSteps := nodeServiceShutdownSteps(instanceServer, configDir)
+
+	if cc.DetachRequested() {
+		gracefulShutdown([]shutdownStep{{name: "tui-cleanup", fn: cc.Cleanup}})
+		handleDetach(nodeSteps)
+		return
+	}
+
 	// Tear down all long-lived subsystems once the TUI event loop has exited.
 	// Each step is bounded internally, but we run them through gracefulShutdown
 	// so that a regression in any one teardown can never hang the process: after
@@ -443,8 +467,26 @@ func runControlCenter() {
 	// uses its own context.Background()-derived context and is NOT tied to the
 	// TUI, so it must be cancelled explicitly here or its goroutines (Redis API
 	// poll, heartbeat) would leak past exit.
-	gracefulShutdown([]shutdownStep{
-		{name: "tui-cleanup", fn: cc.Cleanup},
+	gracefulShutdown(append(
+		[]shutdownStep{{name: "tui-cleanup", fn: cc.Cleanup}},
+		nodeSteps...,
+	))
+
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "Control center error: %v\n", runErr)
+		os.Exit(1)
+	}
+}
+
+// nodeServiceShutdownSteps returns the teardown steps for every long-lived
+// node-facing subsystem the control center may have started: the worker,
+// the terminal/VNC/H.264/demo servers, and the instance server. It excludes
+// the TUI-only "tui-cleanup" step (console/chat page teardown) deliberately
+// -- callers add that separately, since the detach path (handleDetach, issue
+// #658) runs it immediately on quit but defers everything in this slice
+// until the detached process is actually told to stop.
+func nodeServiceShutdownSteps(instanceServer *instance.Server, configDir string) []shutdownStep {
+	return []shutdownStep{
 		{name: "worker", fn: func() { _ = ccStopWorker() }},
 		{name: "terminal-server", fn: stopTerminalServer},
 		{name: "vnc-server", fn: stopVNCServer},
@@ -456,12 +498,38 @@ func runControlCenter() {
 				instance.RemovePID(configDir)
 			}
 		}},
-	})
-
-	if runErr != nil {
-		fmt.Fprintf(os.Stderr, "Control center error: %v\n", runErr)
-		os.Exit(1)
 	}
+}
+
+// handleDetach implements the bounded, honest form of "detach" chosen for
+// issue #658: this OS process is kept alive instead of tearing down the
+// worker/terminal/VNC/etc. subsystems it started, so the node keeps working
+// exactly as it was while the Control Center was open. This is deliberately
+// NOT full daemonization -- it does not fork/setsid/re-exec to free the
+// controlling terminal the way `tmux detach` or a real background service
+// would (that is real, non-trivial additional plumbing; see the PR for
+// issue #658 for the tradeoff). The process remains attached to the
+// terminal/session it was launched from, so closing that session can still
+// end it (e.g. via SIGHUP) unless the operator backgrounds it themselves.
+func handleDetach(nodeSteps []shutdownStep) {
+	fmt.Println()
+	fmt.Println("Detached: the Control Center display has closed. This node's worker")
+	fmt.Println("(and any terminal/VNC servers this session started) keep running in")
+	fmt.Printf("this process (PID %d).\n", os.Getpid())
+	fmt.Println()
+	fmt.Println("This process is still attached to the current terminal/session --")
+	fmt.Println("closing it may stop the node unless you background this process")
+	fmt.Println("yourself (Ctrl+Z then 'bg'/'disown', 'nohup citadel &', tmux/screen)")
+	fmt.Println("or install Citadel as a system service ('citadel service install').")
+	fmt.Println()
+	fmt.Println("Press Ctrl+C, or send SIGTERM, to stop the node.")
+
+	detachSigs := make(chan os.Signal, 1)
+	signal.Notify(detachSigs, syscall.SIGINT, syscall.SIGTERM)
+	<-detachSigs
+
+	gracefulShutdown(nodeSteps)
+	os.Exit(0)
 }
 
 // startDemoServer starts the demo HTTP server in the background
@@ -1833,6 +1901,16 @@ func ccWorkerIsRunning() bool {
 	return ccWorkerRunning
 }
 
+// ccWorkerOwnsConsumption backs controlcenter.WorkerCallbacks.OwnsConsumption
+// (issue #658): true only while this process's own runTUIWorker call is the
+// node's job consumer, false in monitor-only mode (a dedicated `citadel work`
+// holds the worklock) or before/after the worker's consume loop runs.
+func ccWorkerOwnsConsumption() bool {
+	ccWorkerMu.Lock()
+	defer ccWorkerMu.Unlock()
+	return ccWorkerConsuming
+}
+
 // ccStartWorker starts the worker in the background
 func ccStartWorker(activityFn func(level, msg string)) error {
 	ccWorkerMu.Lock()
@@ -1855,6 +1933,7 @@ func ccStartWorker(activityFn func(level, msg string)) error {
 		defer func() {
 			ccWorkerMu.Lock()
 			ccWorkerRunning = false
+			ccWorkerConsuming = false
 			ccWorkerQueue = ""
 			ccWorkerMu.Unlock()
 		}()
@@ -1944,6 +2023,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	if workerHeld {
 		activity("info", fmt.Sprintf("Dedicated worker detected (PID %d); control center runs in monitor-only mode (no job consumption)", workerPID))
 	}
+	// Feeds ccWorkerOwnsConsumption / controlcenter.WorkerCallbacks.OwnsConsumption
+	// (issue #658): this process only ever reaches its own consume loop below
+	// when !workerHeld, so that's also the right moment to record it as the
+	// node's job-consuming worker for the detach-on-quit decision.
+	ccWorkerMu.Lock()
+	ccWorkerConsuming = !workerHeld
+	ccWorkerMu.Unlock()
 
 	// Determine job source mode
 	var source worker.JobSource
