@@ -2137,3 +2137,19 @@ Auto-generated log of every release.
   - fix: fail fast on unserveable on-demand swap instead of attempting a doomed pull (#956) (#957)
 
 
+---
+
+## v2.137.0 — 2026-09-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1468 |
+
+**Changes:**
+
+  - feat: citadel pairing-code pull command for the headless fleet (#659 P1) (#960)
+  - control center: offer Detach on quit when this session owns the worker (#959)
+
+
