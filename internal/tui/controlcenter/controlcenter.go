@@ -577,6 +577,14 @@ type ControlCenter struct {
 	activeForwards []PortForward // Active port forwards
 	focusedPane    int           // 0=services, 1=peers
 
+	// detachRequested is set by the Detach button on the detach-on-quit modal
+	// (showDetachQuitModal, issue #658). Set only from tview callbacks, which
+	// run on the single event-loop goroutine that also calls Stop() -- so it
+	// is safe to read from DetachRequested() after Run() has returned with no
+	// separate synchronization, mirroring how the rest of this struct's
+	// modal-driven state (e.g. inModal) is handled.
+	detachRequested bool
+
 	// Suggestions bar
 	suggestionBar     *tview.TextView
 	showingSuggestion bool
@@ -670,6 +678,35 @@ type WorkerCallbacks struct {
 	Start     func(activityFn func(level, msg string)) error // Start worker with activity callback
 	Stop      func() error                                   // Stop worker
 	IsRunning func() bool                                    // Check if worker is running
+
+	// OwnsConsumption reports whether THIS control-center instance is the
+	// node's actual job consumer -- i.e. no dedicated `citadel work` holds
+	// the node's worklock, so IsRunning()'s worker is not a monitor-only
+	// process (see cmd/controlcenter.go's `workerHeld` handling and
+	// CLAUDE.md's "Job-scoped GPU reserve/evict/restore" section for the
+	// competing-consumer background). Only when this is true does quitting
+	// the TUI actually stop job processing for the node, so only then is a
+	// Detach/Stop choice on quit meaningful (issue #658). Nil is treated as
+	// false (no detach offered) -- see shouldOfferDetachOnQuit.
+	OwnsConsumption func() bool
+}
+
+// shouldOfferDetachOnQuit reports whether the quit flow should present the
+// Detach-vs-Stop choice instead of the plain quit-confirmation modal. This is
+// a pure decision over the callbacks (no tview involved) so it is unit
+// testable without driving the event loop -- see
+// TestShouldOfferDetachOnQuit.
+//
+// The choice is only meaningful when THIS control-center instance actually
+// owns job consumption for the node AND that worker is currently running:
+// otherwise (a dedicated `citadel work` already holds the lock, the worker
+// never started, or it already exited) quitting the TUI never stops any job
+// processing this process owns, so there is nothing to detach from.
+func shouldOfferDetachOnQuit(worker WorkerCallbacks) bool {
+	if worker.OwnsConsumption == nil || worker.IsRunning == nil {
+		return false
+	}
+	return worker.OwnsConsumption() && worker.IsRunning()
 }
 
 // PermissionsCallbacks holds callbacks for gateway permission management.
@@ -1038,6 +1075,15 @@ func (cc *ControlCenter) Stop() {
 			cc.app.Stop()
 		}
 	})
+}
+
+// DetachRequested reports whether the user chose "Detach" on the
+// detach-on-quit modal (issue #658) rather than "Stop" or a plain quit. Only
+// meaningful after Run() has returned. The caller (cmd/controlcenter.go) uses
+// this to decide whether to tear down the node's worker/terminal/VNC/etc. on
+// exit, or to leave them running and keep the process alive.
+func (cc *ControlCenter) DetachRequested() bool {
+	return cc.detachRequested
 }
 
 // Cleanup tears down the control center's owned subsystems (console PTY
@@ -1803,6 +1849,16 @@ func (cc *ControlCenter) showServiceLogs(svcName string) {
 func (cc *ControlCenter) showQuitConfirm() {
 	cc.inModal = true
 
+	// When this TUI instance is itself the node's job consumer, quitting has
+	// a real choice to make: stop the worker (current behavior) or detach,
+	// leaving it (and this session's terminal/VNC servers) running in the
+	// background. See shouldOfferDetachOnQuit's doc comment for exactly when
+	// this applies (issue #658).
+	if shouldOfferDetachOnQuit(cc.worker) {
+		cc.showDetachQuitModal()
+		return
+	}
+
 	installed := isServiceInstalled()
 
 	var warningText string
@@ -1839,6 +1895,56 @@ To keep Citadel running in the background, install it as a system service.`,
 				cc.app.SetRoot(cc.rootView, true)
 				cc.app.SetFocus(cc.servicesView)
 				cc.showInstallServiceHelp()
+			default:
+				cc.app.SetRoot(cc.rootView, true)
+				cc.app.SetFocus(cc.servicesView)
+			}
+		})
+
+	cc.app.SetRoot(modal, true)
+	cc.app.SetFocus(modal)
+}
+
+// showDetachQuitModal is the quit flow used when this TUI instance owns the
+// node's job consumption (shouldOfferDetachOnQuit). It offers a default-easy
+// Detach choice ahead of Stop, per the product decision on issue #658: quitting
+// should not have to mean the node stops working.
+//
+// "Detach" here is deliberately the bounded, honest version, not full
+// daemonization: it leaves this OS process (and therefore its worker,
+// terminal server, VNC server, etc.) running exactly as-is, but does NOT
+// fork/setsid/re-exec to free the controlling terminal the way `tmux detach`
+// or a real background service would. See handleDetach (cmd/controlcenter.go)
+// for what keeps running and the session-lifetime caveat, spelled out again
+// in this modal's own text so the choice is informed at the point it's made.
+func (cc *ControlCenter) showDetachQuitModal() {
+	bullet := Glyph(MarkerBullet)
+	warningText := fmt.Sprintf(`Quit the Control Center?
+
+This session is the node's active worker. Choose how to exit:
+
+%s Detach - close this display only. The worker (and any terminal/VNC
+  servers this session started) keep running for as long as this
+  process stays alive. This is NOT a background service: the node
+  stops working when this process stops (e.g. this terminal/session
+  ending). To keep it running unattended, install Citadel as a
+  background service with 'citadel service install'.
+%s Stop - shut down the worker and exit completely. Jobs will no longer
+  be processed on this node.`,
+		bullet, bullet)
+
+	modal := tview.NewModal().
+		SetText(warningText).
+		AddButtons([]string{"Detach", "Stop", "Cancel"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cc.inModal = false
+			switch buttonLabel {
+			case "Detach":
+				cc.detachRequested = true
+				cc.Stop()
+			case "Stop":
+				cc.detachRequested = false
+				cc.Stop()
 			default:
 				cc.app.SetRoot(cc.rootView, true)
 				cc.app.SetFocus(cc.servicesView)
