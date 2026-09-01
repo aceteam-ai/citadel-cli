@@ -64,6 +64,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"6d57a7a04565fe8954ffe2a2b364813ec2fe700b06f2dfb05567a1a33662d445": true,
 		"81bac6f3c78623c1c08761b1fb99718717e84891459cc50d012d02e88cdd32f7": true,
 		"83842c7faf86de64d7728e0178690f69a0819354d0f290edbcf3d40ea5f01807": true,
+		// citadel #958: adds the DIFFUSERS_VIDEO_MODEL passthrough env var
+		// (text-to-video, Wan2.1) alongside the existing DIFFUSERS_MODEL one.
+		"91649ba0dc4f9817c05782ea90066f601f8ba0b1d86584cb03dcd6ed7ea7fbcc": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,

@@ -219,3 +219,24 @@ jobs:
         if: steps.changes.outputs.sidecar == 'true'
         working-directory: services/diffusers-service
         run: python -m pytest test_model_preflight.py -v
+
+      # citadel #958: test_app.py exercises app.py's HTTP contract for both
+      # /generate (image, pre-existing) and /generate/video (text-to-video)
+      # with the pipeline load functions monkeypatched -- see that file's
+      # module docstring. Needs fastapi/pydantic (+ httpx, for Starlette's
+      # TestClient) but deliberately NOT torch/diffusers/accelerate/imageio:
+      # app.py only imports those lazily, inside the very functions this
+      # suite mocks out. Sourced from requirements.txt (not restated here)
+      # for the same drift-proofing reason as the tokenizer-stack step above.
+      - name: Install app test deps (fastapi/pydantic, no torch/diffusers)
+        if: steps.changes.outputs.sidecar == 'true'
+        working-directory: services/diffusers-service
+        run: |
+          deps="$(grep -E '^(fastapi|pydantic)==' requirements.txt)"
+          echo "$deps"
+          pip install $deps httpx
+
+      - name: App contract tests (image + video paths, pipeline mocked)
+        if: steps.changes.outputs.sidecar == 'true'
+        working-directory: services/diffusers-service
+        run: python -m pytest test_app.py -v

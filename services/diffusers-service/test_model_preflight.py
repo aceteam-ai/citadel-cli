@@ -400,3 +400,96 @@ def test_run_preflight_fails_open_on_disk_probe_error():
         ),
         available_disk_bytes_fn=lambda _dir: (_ for _ in ()).throw(OSError("no such device")),
     )  # must not raise -- fails open despite the huge required size
+
+
+# ---------------------------------------------------------------------------
+# citadel #958: Wan2.1-T2V-1.3B-Diffusers (text-to-video) preflight coverage.
+# model_preflight.py itself needed NO code changes to support the video
+# sidecar model -- repo_id/cache_dir are already plain parameters (see the
+# module docstring's "deliberately import-light" design) -- so these tests
+# pin that the SAME generic preflight machinery the sdxl-turbo image path
+# uses also works correctly against the real Wan2.1 repo shape: multiple
+# sharded safetensors files under text_encoder/ and transformer/, a small
+# vae/, and a tokenizer/ subfolder (verified against the live repo's file
+# listing via the HF API, not guessed).
+# ---------------------------------------------------------------------------
+
+_WAN21_T2V_1_3B_SHAPED_ENTRIES = [
+    mp.RepoFileInfo(path="text_encoder/model-00001-of-00005.safetensors", size=4 << 30),
+    mp.RepoFileInfo(path="text_encoder/model-00002-of-00005.safetensors", size=4 << 30),
+    mp.RepoFileInfo(path="text_encoder/model-00003-of-00005.safetensors", size=4 << 30),
+    mp.RepoFileInfo(path="text_encoder/model-00004-of-00005.safetensors", size=4 << 30),
+    mp.RepoFileInfo(path="text_encoder/model-00005-of-00005.safetensors", size=1 << 30),
+    mp.RepoFileInfo(path="transformer/diffusion_pytorch_model-00001-of-00002.safetensors", size=2 << 30),
+    mp.RepoFileInfo(path="transformer/diffusion_pytorch_model-00002-of-00002.safetensors", size=2 << 30),
+    mp.RepoFileInfo(path="vae/diffusion_pytorch_model.safetensors", size=250 << 20),
+    mp.RepoFileInfo(path="tokenizer/spiece.model", size=4 << 20),
+    mp.RepoFileInfo(path="tokenizer/tokenizer.json", size=16 << 20),
+    mp.RepoFileInfo(path="assets/logo.png", size=1 << 20),
+    mp.RepoFileInfo(path="text_encoder", size=0, is_file=False),  # directories must be skipped
+]
+
+
+def test_wan21_video_preflight_proceeds_when_it_fits():
+    """The full, unfiltered Wan2.1-T2V-1.3B repo (~21GB) fits comfortably on
+    a node with 100GB free -- the default (no allow/ignore patterns) path
+    every video generation goes through, mirroring
+    test_run_preflight_proceeds_when_it_fits for sdxl-turbo above."""
+    mp.run_preflight(
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "/citadel-cache/huggingface",
+        list_repo_files_fn=_fake_list_repo_files(_WAN21_T2V_1_3B_SHAPED_ENTRIES),
+        available_disk_bytes_fn=lambda _dir: 100 << 30,
+    )  # must not raise
+
+
+def test_wan21_video_preflight_refuses_with_operator_filter_on_confirmed_shortfall():
+    """Same operator-filter-engages-the-refusal-guard contract as the image
+    path (test_run_preflight_refuses_on_confirmed_shortfall_with_operator_filter
+    above), proven against the Wan2.1 repo shape instead of LTX-Video's."""
+    with pytest.raises(mp.InsufficientDiskSpaceError) as exc_info:
+        mp.run_preflight(
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            "/citadel-cache/huggingface",
+            ignore_patterns=["*.md"],  # any operator filter engages the guard
+            list_repo_files_fn=_fake_list_repo_files(_WAN21_T2V_1_3B_SHAPED_ENTRIES),
+            available_disk_bytes_fn=lambda _dir: 1 << 20,  # 1 MiB free -- nothing fits
+        )
+    assert "insufficient disk space" in str(exc_info.value)
+
+
+def test_wan21_video_preflight_allow_patterns_excludes_assets():
+    """allow_patterns scoping the pull to the model subfolders (excluding the
+    repo's README assets/) mirrors
+    test_estimate_repo_size_bytes_allow_patterns_excludes_sibling_checkpoints
+    for the LTX-Video shape above."""
+    got = mp.estimate_repo_size_bytes(
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        allow_patterns=["text_encoder/*", "transformer/*", "vae/*", "tokenizer/*"],
+        list_repo_files_fn=_fake_list_repo_files(_WAN21_T2V_1_3B_SHAPED_ENTRIES),
+    )
+    want = sum(e.size for e in _WAN21_T2V_1_3B_SHAPED_ENTRIES if e.is_file and e.path != "assets/logo.png")
+    assert got == want
+
+
+def test_wan21_video_preflight_uses_independent_env_vars_from_image_path(monkeypatch):
+    """app.py resolves the video path's allow/ignore patterns from
+    DIFFUSERS_VIDEO_ALLOW_PATTERNS/DIFFUSERS_VIDEO_IGNORE_PATTERNS -- separate
+    env vars from the image path's DIFFUSERS_ALLOW_PATTERNS/
+    DIFFUSERS_IGNORE_PATTERNS. The two models are different repos with
+    unrelated file layouts, so sharing one pattern pair would silently
+    misfilter whichever model didn't set it. Pinned here since
+    resolve_allow_ignore_patterns' allow_env/ignore_env parameters are what
+    make this possible without any code change to model_preflight.py itself."""
+    monkeypatch.setenv("DIFFUSERS_ALLOW_PATTERNS", '["vae/*"]')
+    monkeypatch.setenv("DIFFUSERS_VIDEO_ALLOW_PATTERNS", '["transformer/*"]')
+    monkeypatch.delenv("DIFFUSERS_IGNORE_PATTERNS", raising=False)
+    monkeypatch.delenv("DIFFUSERS_VIDEO_IGNORE_PATTERNS", raising=False)
+
+    image_allow, _ = mp.resolve_allow_ignore_patterns()
+    video_allow, _ = mp.resolve_allow_ignore_patterns(
+        allow_env="DIFFUSERS_VIDEO_ALLOW_PATTERNS",
+        ignore_env="DIFFUSERS_VIDEO_IGNORE_PATTERNS",
+    )
+    assert image_allow == ["vae/*"]
+    assert video_allow == ["transformer/*"]
