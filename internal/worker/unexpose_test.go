@@ -54,6 +54,13 @@ func TestUnexpose_IdempotentWasExposedFalseIsSuccess(t *testing.T) {
 	if res.Output["was_exposed"] != false {
 		t.Errorf("was_exposed: got %v, want false", res.Output["was_exposed"])
 	}
+	// "removed" is the platform wire contract (aceteam PR #8631): its parser
+	// defaults removed=True whenever the key is ABSENT, so the idempotent
+	// not-currently-exposed case must explicitly send removed=false or the
+	// platform misreports it as removed=true.
+	if res.Output["removed"] != false {
+		t.Errorf("removed: got %v, want false", res.Output["removed"])
+	}
 	if res.Output["name"] != "frigate" {
 		t.Errorf("name: got %v, want frigate", res.Output["name"])
 	}
@@ -69,6 +76,9 @@ func TestUnexpose_Success(t *testing.T) {
 	}
 	if res.Output["was_exposed"] != true {
 		t.Errorf("was_exposed: got %v, want true", res.Output["was_exposed"])
+	}
+	if res.Output["removed"] != true {
+		t.Errorf("removed: got %v, want true", res.Output["removed"])
 	}
 }
 

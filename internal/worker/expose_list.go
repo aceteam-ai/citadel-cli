@@ -43,6 +43,11 @@ type ExposureInfo struct {
 	// programmed in-process (vs. a durable record with no live counterpart —
 	// e.g. one that failed to restore, or was persisted but never wired).
 	Live bool `json:"live"`
+	// URL is the managed mesh URL this exposure is reachable at, built the same
+	// way EXPOSE_SET's own ExposeResult.URL is (see cmd.exposeMeshURL) — never a
+	// second URL format. Empty when the node is off-mesh, mirroring
+	// ExposeResult.URL's own "" convention.
+	URL string `json:"url"`
 }
 
 // ExposeListResult is the EXPOSE_LIST job output: the durable set as the

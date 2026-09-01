@@ -289,6 +289,9 @@ func (liveExposeOps) List(_ context.Context) (*worker.ExposeListResult, error) {
 			Epoch:      r.TokenEpoch,
 			CreatedAt:  r.CreatedAt,
 			Live:       liveNames[r.Name],
+			// Same URL construction EXPOSE_SET's ExposeResult.URL uses — one
+			// format, two callers. "" when off-mesh, matching that contract.
+			URL: exposeMeshURL(r.Name),
 		})
 	}
 	for n := range liveNames {

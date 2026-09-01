@@ -44,8 +44,8 @@ func TestExposeList_CanHandle(t *testing.T) {
 func TestExposeList_EmptyPayloadListsEverything(t *testing.T) {
 	ops := &fakeExposeOps{listResult: &ExposeListResult{
 		Exposures: []ExposureInfo{
-			{Name: "frigate", Port: 5000, Visibility: "org", Epoch: 1, Live: true},
-			{Name: "dash", Port: 6000, Visibility: "link", Epoch: 2, Live: false},
+			{Name: "frigate", Port: 5000, Visibility: "org", Epoch: 1, Live: true, URL: "https://100.64.0.9:8443/expose/frigate"},
+			{Name: "dash", Port: 6000, Visibility: "link", Epoch: 2, Live: false, URL: "https://100.64.0.9:8443/expose/dash"},
 		},
 		LiveOnly: []string{"scratch-dash"},
 	}}
@@ -61,6 +61,11 @@ func TestExposeList_EmptyPayloadListsEverything(t *testing.T) {
 	exposures, ok := res.Output["exposures"].([]ExposureInfo)
 	if !ok || len(exposures) != 2 {
 		t.Fatalf("exposures output wrong shape: %#v", res.Output["exposures"])
+	}
+	for _, e := range exposures {
+		if e.URL == "" {
+			t.Errorf("exposure %q: url must be populated, got empty", e.Name)
+		}
 	}
 	liveOnly, ok := res.Output["live_only"].([]string)
 	if !ok || len(liveOnly) != 1 || liveOnly[0] != "scratch-dash" {
