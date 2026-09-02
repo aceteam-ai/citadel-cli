@@ -27,6 +27,42 @@ import (
 // these engine lists produced a given entry).
 var idleCapableEngines = []string{"vllm"}
 
+// ManagedEngineHostPort exposes managedEngineHostPort to callers outside this
+// package (internal/engine's registry translation, citadel #685 slice 1) that
+// need the exact host port this package's own heartbeat/status collection
+// would resolve for a serving engine -- the registry-first-then-compose-parse
+// resolution below, not a second copy of it.
+func ManagedEngineHostPort(name string) int {
+	return managedEngineHostPort(name)
+}
+
+// ManagedProbeEngines returns a copy of managedProbeEngines, the list of
+// engines the heartbeat's model/health probe iterates. Exported so
+// internal/engine's registry (citadel #685 slice 1) can read the same
+// membership rather than a second hardcoded copy.
+func ManagedProbeEngines() []string {
+	out := make([]string, len(managedProbeEngines))
+	copy(out, managedProbeEngines)
+	return out
+}
+
+// IdleCapableEngines returns a copy of idleCapableEngines -- the engines with a
+// reliable SCRAPED idle/request signal. Exported for the same reason as
+// ManagedProbeEngines above.
+func IdleCapableEngines() []string {
+	out := make([]string, len(idleCapableEngines))
+	copy(out, idleCapableEngines)
+	return out
+}
+
+// EmbeddingProbeServices returns a copy of embeddingProbeServices. Exported for
+// the same reason as ManagedProbeEngines above.
+func EmbeddingProbeServices() []string {
+	out := make([]string, len(embeddingProbeServices))
+	copy(out, embeddingProbeServices)
+	return out
+}
+
 // managedProbeEngines lists the managed serving engines the heartbeat path
 // probes for a live signal: an idle signal (idleCapableEngines) and/or the
 // loaded model(s) over the engine's local HTTP API (#529). It must remain a
