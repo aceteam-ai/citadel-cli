@@ -61,6 +61,26 @@ type ModuleInspector interface {
 	Inspect(ctx context.Context, moduleName string) (Observation, error)
 }
 
+// BridgeEndpointsProvider builds the synthetic ActualModule row (module +
+// endpoints) for a node-hosted module that carries no modules.lock entry of
+// its own -- citadel#624 Phase A's only instance is the WhatsApp bridge. It is
+// defined identically (same method shape) in internal/reconcile so that
+// package's ProtoProvider can accept the SAME concrete value via Go's
+// structural typing without either package importing the other (mirrors the
+// internal/status / internal/worker split for the identical reason -- see
+// that package's SwapActivity note). Both node-state reporters (this
+// package's Emitter and reconcile.ProtoProvider) hold a reference to the SAME
+// provider instance, so they report byte-identical bridge facts rather than
+// two independently-computed snapshots that could disagree -- the
+// "two-reporter flap" the citadel#624 design review called out as
+// must-resolve.
+//
+// A nil return from BridgeModule means nothing to report yet (e.g. the
+// module has never been deployed on this node).
+type BridgeEndpointsProvider interface {
+	BridgeModule(ctx context.Context) *fabricpb.ActualModule
+}
+
 // BuildActualState constructs the node's ActualState from the installed-module
 // set (the modules.lock lockfile) plus a live per-module inspection.
 //
@@ -74,15 +94,7 @@ type ModuleInspector interface {
 // can see"), and a per-module inspect failure is isolated into that module's
 // ERROR health. This keeps emission unconditional and crash-free.
 func BuildActualState(ctx context.Context, insp ModuleInspector, nodeID, agentVersion string) *fabricpb.ActualState {
-	now := timestamppb.Now()
-
-	state := &fabricpb.ActualState{
-		ProtocolVersion: uint32(protocol.FabricProtocolVersion),
-		NodeId:          nodeID,
-		AppliedRevision: "", // no desired-state in v1
-		AgentVersion:    agentVersion,
-		ReportedAt:      now,
-	}
+	state := newEnvelope(nodeID, agentVersion)
 
 	lf, err := loadLockfile()
 	if err != nil || lf == nil {
@@ -96,10 +108,44 @@ func BuildActualState(ctx context.Context, insp ModuleInspector, nodeID, agentVe
 	// Deterministic module order makes the report stable and tests simple.
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 
+	now := timestamppb.Now()
 	for _, e := range entries {
 		state.Modules = append(state.Modules, buildModule(ctx, insp, e, now))
 	}
 	return state
+}
+
+// newEnvelope builds an empty ActualState envelope (no modules) with the
+// header every report shares. Factored out so the telemetry-gate-exempt
+// bridge-only path (Emitter.reportOnce, when anon_telemetry_enabled is false)
+// can build the same header without pulling in the lockfile-driven module
+// enumeration BuildActualState performs.
+func newEnvelope(nodeID, agentVersion string) *fabricpb.ActualState {
+	return &fabricpb.ActualState{
+		ProtocolVersion: uint32(protocol.FabricProtocolVersion),
+		NodeId:          nodeID,
+		AppliedRevision: "", // no desired-state in v1
+		AgentVersion:    agentVersion,
+		ReportedAt:      timestamppb.Now(),
+	}
+}
+
+// AppendBridgeModule appends p's synthetic bridge module row (if any) onto
+// state.Modules. Exported so both this package's Emitter (for the
+// telemetry-gate-exempt path, where the row must be attached to an envelope
+// BuildActualState was not used to build) and the WHATSAPP_PROVISION-adjacent
+// wiring in cmd can attach the identical row this contract describes, with
+// the nil-provider / nil-module handling centralized in one place.
+//
+// A nil state or nil provider is a no-op, so callers need no guard of their
+// own.
+func AppendBridgeModule(ctx context.Context, state *fabricpb.ActualState, p BridgeEndpointsProvider) {
+	if state == nil || p == nil {
+		return
+	}
+	if m := p.BridgeModule(ctx); m != nil {
+		state.Modules = append(state.Modules, m)
+	}
 }
 
 // buildModule maps one lockfile entry plus a live inspection into an
