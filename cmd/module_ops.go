@@ -51,7 +51,14 @@ import (
 // Headscale numeric ID the backend upserts from heartbeats); a hostname never
 // matches, leaving the loop non-functional. Returns nil when nodeID is empty so
 // the loop is skipped rather than started under a wrong key.
-func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
+//
+// bridgeEndpoints (citadel#624 Phase A) is attached to the built ProtoProvider
+// so its Report calls append the synthetic bridge module row alongside the
+// converge result. It is typically the SAME instance runWork also wires into
+// the nodestate.Emitter — see reconcile.BridgeEndpointsProvider's doc comment
+// for why that sharing is what closes the "two-reporter flap". nil is fine
+// (no synthetic row is ever appended).
+func newReconcileLoop(client *redisapi.Client, nodeID string, bridgeEndpoints reconcile.BridgeEndpointsProvider) *reconcile.Loop {
 	if reconcile.PullDisabled() {
 		return nil
 	}
@@ -60,6 +67,7 @@ func newReconcileLoop(client *redisapi.Client, nodeID string) *reconcile.Loop {
 	}
 	log := func(format string, args ...any) { fmt.Printf(format+"\n", args...) }
 	provider := reconcile.NewProtoProvider(client, client, nodeID, Version)
+	provider.BridgeEndpoints = bridgeEndpoints
 	rec := reconcile.NewReconciler(provider, newLiveModuleOps(log), nodeID)
 	rec.RefuseFullWipe = true
 	// Replace the default silent tracker with one that actually prints

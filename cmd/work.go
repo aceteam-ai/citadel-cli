@@ -1896,17 +1896,28 @@ func runWork(cmd *cobra.Command, args []string) {
 			if orgID == "" {
 				fmt.Fprintln(os.Stderr, "   - ⚠️ API status publisher requires org-id (run 'citadel init' first)")
 			} else {
+				// Shared bridge-endpoints provider (citadel#624 Phase A): the SAME
+				// instance is wired into BOTH node-state reporters below so they
+				// report byte-identical bridge facts rather than two
+				// independently-computed snapshots that could disagree (the
+				// "two-reporter flap" the citadel#624 design review called out as
+				// must-resolve).
+				bridgeEndpoints := newWhatsAppBridgeModuleProvider()
+
 				// Periodically report ActualState (installed modules + health)
 				// to the control plane (#353, report-only v1). Headless `citadel
 				// work` is the production node entrypoint, so it must report too
 				// — not just the TUI. Same device-authed client and opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname.
+				// as activity telemetry; node_id is the Headscale hostname. The
+				// bridge row is exempt from that opt-out gate — see
+				// nodestate.Emitter.reportOnce's doc comment.
 				if emitter := nodestate.New(nodestate.Config{
-					Poster:    apiSource.Client(),
-					Inspector: nodestate.DockerInspector(),
-					ConfigDir: platform.ConfigDir(),
-					NodeID:    nodeName,
-					Version:   Version,
+					Poster:          apiSource.Client(),
+					Inspector:       nodestate.DockerInspector(),
+					BridgeEndpoints: bridgeEndpoints,
+					ConfigDir:       platform.ConfigDir(),
+					NodeID:          nodeName,
+					Version:         Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
 					fmt.Printf("   - Node-state reporting: every %s\n", nodestate.DefaultInterval)
@@ -1928,7 +1939,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				// report path is symmetric: the node-state worker re-resolves the
 				// reported id via `get_node_info`, which accepts the numeric ID, so
 				// reporting the numeric ID keys `node_module_state` correctly too.
-				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID); loop != nil {
+				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID, bridgeEndpoints); loop != nil {
 					// Publish the loop's HealthTracker for the heartbeat
 					// (citadel-cli#742) BEFORE Run starts, so the very first pass's
 					// outcome is already visible to reconcileHealthFn.
