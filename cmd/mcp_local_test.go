@@ -16,6 +16,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/mesh"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
 // ============================================================================
@@ -55,6 +56,7 @@ func TestNewLocalMCPToolsRegistersExpectedTools(t *testing.T) {
 		"local_list_models", "local_chat",
 		"local_read_file", "local_list_files",
 		"local_model_deploy", "local_run_exclusive", "local_model_stop",
+		"local_egress_relay_status", "local_egress_relay_set",
 	}
 	got := map[string]bool{}
 	for _, tool := range tools {
@@ -745,5 +747,112 @@ func TestBridgeToolsCallLocalToolErrorBecomesIsError(t *testing.T) {
 	}
 	if len(resp.Result.Content) == 0 || !strings.Contains(resp.Result.Content[0].Text, "module not found") {
 		t.Errorf("unexpected content: %+v", resp.Result.Content)
+	}
+}
+
+// ============================================================================
+// Egress relay config tools (citadel #787)
+// ============================================================================
+
+func TestLocalEgressRelayStatusDefaultsOff(t *testing.T) {
+	dir := t.TempDir()
+	deps := localMCPDeps{egressRelayConfigDir: func() string { return dir }}
+	tools := newLocalMCPTools(deps)
+
+	status, ok := findLocalTool(tools, "local_egress_relay_status")
+	if !ok {
+		t.Fatal("local_egress_relay_status not registered")
+	}
+
+	out, err := status.Call(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var got struct {
+		Enabled  bool `json:"enabled"`
+		AllowLAN bool `json:"allow_lan"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal status output %q: %v", out, err)
+	}
+	if got.Enabled || got.AllowLAN {
+		t.Errorf("expected default-off status, got %+v", got)
+	}
+}
+
+func TestLocalEgressRelaySetRequiresAtLeastOneField(t *testing.T) {
+	dir := t.TempDir()
+	deps := localMCPDeps{egressRelayConfigDir: func() string { return dir }}
+	tools := newLocalMCPTools(deps)
+
+	set, ok := findLocalTool(tools, "local_egress_relay_set")
+	if !ok {
+		t.Fatal("local_egress_relay_set not registered")
+	}
+
+	if _, err := set.Call(context.Background(), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("expected an error when neither enabled nor allow_lan is set")
+	}
+}
+
+func TestLocalEgressRelaySetPersistsAndOnlyTouchesGivenFields(t *testing.T) {
+	dir := t.TempDir()
+	deps := localMCPDeps{egressRelayConfigDir: func() string { return dir }}
+	tools := newLocalMCPTools(deps)
+
+	set, _ := findLocalTool(tools, "local_egress_relay_set")
+	status, _ := findLocalTool(tools, "local_egress_relay_status")
+
+	// Enable the relay only; allow_lan is omitted and must stay false.
+	if _, err := set.Call(context.Background(), json.RawMessage(`{"enabled": true}`)); err != nil {
+		t.Fatalf("set enabled: %v", err)
+	}
+	out, err := status.Call(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var got struct {
+		Enabled  bool `json:"enabled"`
+		AllowLAN bool `json:"allow_lan"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Enabled || got.AllowLAN {
+		t.Fatalf("expected enabled=true, allow_lan=false after first set, got %+v", got)
+	}
+
+	// Now set allow_lan only; enabled must remain true (load-modify-save, not
+	// a fresh struct that would silently flip it back to false).
+	if _, err := set.Call(context.Background(), json.RawMessage(`{"allow_lan": true}`)); err != nil {
+		t.Fatalf("set allow_lan: %v", err)
+	}
+	out, err = status.Call(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Enabled || !got.AllowLAN {
+		t.Fatalf("expected both enabled and allow_lan true after second set, got %+v", got)
+	}
+}
+
+func TestEgressRelayConfigDirOrDefaultFallsBackToGetNodeConfigDir(t *testing.T) {
+	// A zero-value localMCPDeps (as TestNewLocalMCPToolsRegistersExpectedTools
+	// constructs) must not panic when egressRelayConfigDir is nil -- the
+	// fallback resolves to network.GetNodeConfigDir(). Asserted as a STRING
+	// comparison only, with no file I/O: network.GetNodeConfigDir() follows a
+	// machine-global pointer (/etc/citadel/config.yaml when present) that a
+	// test cannot safely redirect (see cmd/work.go's resolveEgressRelayFrom
+	// doc comment), so this test must never go on to call LoadEgressRelay
+	// against the fallback's result -- that would read the REAL node's
+	// config directory on a machine that happens to run one.
+	got := egressRelayConfigDirOrDefault(localMCPDeps{})
+	want := network.GetNodeConfigDir()
+	if got != want {
+		t.Errorf("egressRelayConfigDirOrDefault(nil) = %q, want %q (network.GetNodeConfigDir())", got, want)
 	}
 }

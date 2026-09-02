@@ -2832,6 +2832,29 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   freshness marker (`internal/heartbeat/marker.go`) uses `GetNodeConfigDir()`
   for this reason, not `ConfigDir()`.
 
+  **`GetNodeConfigDir()`'s machine-convergence is exactly what makes it unsafe
+  to call directly in a test on a machine that runs a real citadel node
+  (citadel#787's discovery).** It resolves via `getNodeConfigDirFromGlobalConfig`
+  reading `/etc/citadel/config.yaml` (or the platform-equivalent) FIRST, before
+  any owner-home fallback — and that path is NOT `$HOME`-scoped, so a test's
+  `t.Setenv("HOME", tempdir)` does not redirect it on a dev box where
+  `/etc/citadel/config.yaml` already points `node_config_dir` at a real,
+  possibly-live node's directory (this repo's own dev machine is such a box —
+  see the RESUME notes on node 1297). A test that calls
+  `config.SaveX(network.GetNodeConfigDir(), ...)` to seed a scenario silently
+  WRITES into that real node's config, not a sandbox — caught only because the
+  written file was visible afterward, not because any test failed. The fix
+  (see `internal/egressrelay`'s config wiring, `cmd/work.go`'s
+  `resolveEgressRelayFrom`, `internal/jobs.applyEgressRelayConfig`): split any
+  `GetNodeConfigDir()`-backed logic into a pure core taking `configDir string`
+  as an explicit parameter, test the pure core with `t.TempDir()`, and reserve
+  the real `network.GetNodeConfigDir()`-calling wrapper for production wiring
+  (or, at most, a test that only compares the RESOLVED PATH as a string — never
+  one that goes on to read or write through it). A read-only call (e.g.
+  `LoadEgressRelay`) is lower-risk but still resolves the real path; prefer the
+  pure-core split there too rather than relying on "this particular load
+  function happens not to write."
+
   **Device/org config (`device_api_token`, `org_id`, `org_name`, `user_email`,
   `user_name`, `redis_url`, `aceteam_api_key`) is machine-convergent state too
   (#845), and had the identical bug until fixed:** `cmd.getDeviceConfigFromFile`
