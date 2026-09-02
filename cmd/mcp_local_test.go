@@ -16,6 +16,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/mesh"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
 // ============================================================================
@@ -839,19 +840,19 @@ func TestLocalEgressRelaySetPersistsAndOnlyTouchesGivenFields(t *testing.T) {
 	}
 }
 
-func TestLocalEgressRelayConfigDirDefaultsWhenNil(t *testing.T) {
+func TestEgressRelayConfigDirOrDefaultFallsBackToGetNodeConfigDir(t *testing.T) {
 	// A zero-value localMCPDeps (as TestNewLocalMCPToolsRegistersExpectedTools
 	// constructs) must not panic when egressRelayConfigDir is nil -- the
-	// fallback resolves to network.GetNodeConfigDir(), never a nil deref.
-	deps := localMCPDeps{}
-	tools := newLocalMCPTools(deps)
-	status, ok := findLocalTool(tools, "local_egress_relay_status")
-	if !ok {
-		t.Fatal("local_egress_relay_status not registered")
-	}
-	// Not asserting a specific value here (it depends on the real machine's
-	// node config dir); this only pins that the call does not panic.
-	if _, err := status.Call(context.Background(), nil); err != nil {
-		t.Fatalf("unexpected error with default config dir resolution: %v", err)
+	// fallback resolves to network.GetNodeConfigDir(). Asserted as a STRING
+	// comparison only, with no file I/O: network.GetNodeConfigDir() follows a
+	// machine-global pointer (/etc/citadel/config.yaml when present) that a
+	// test cannot safely redirect (see cmd/work.go's resolveEgressRelayFrom
+	// doc comment), so this test must never go on to call LoadEgressRelay
+	// against the fallback's result -- that would read the REAL node's
+	// config directory on a machine that happens to run one.
+	got := egressRelayConfigDirOrDefault(localMCPDeps{})
+	want := network.GetNodeConfigDir()
+	if got != want {
+		t.Errorf("egressRelayConfigDirOrDefault(nil) = %q, want %q (network.GetNodeConfigDir())", got, want)
 	}
 }
