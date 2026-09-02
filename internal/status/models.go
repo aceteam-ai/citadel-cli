@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/engine"
 )
 
 // ModelDiscoveryTimeout bounds a single model-discovery probe. Discovery runs
@@ -34,28 +36,17 @@ func NewModelDiscovery() *ModelDiscovery {
 }
 
 // EngineTypeFromName maps a service/app name to a model-discovery engine type
-// ("vllm", "ollama", "llamacpp", "bonsai", "sglang"), or "" when the name is not
-// a known serving engine. Order matters: "ollama" contains "llama", so it must
-// be checked before the llama.cpp patterns. "bonsai" is kept as its own type (it
-// serves the llama.cpp /v1/models API but the heartbeat reports it under its own
-// engine name so the gateway can route with backend=bonsai).
+// ("vllm", "ollama", "llamacpp", "bonsai", "unlimited-ocr", "sglang"), or ""
+// when the name is not a known serving engine. "bonsai" is kept as its own
+// type (it serves the llama.cpp /v1/models API but the heartbeat reports it
+// under its own engine name so the gateway can route with backend=bonsai).
+//
+// citadel #685 slice 2: delegates to internal/engine.TypeFromName, the single
+// implementation this function and internal/mesh's own former duplicate
+// (internal/mesh/discovery.go, deleted in this same slice) both used to
+// hand-maintain independently (design doc §1c).
 func EngineTypeFromName(name string) string {
-	n := strings.ToLower(name)
-	switch {
-	case strings.Contains(n, "vllm"):
-		return "vllm"
-	case strings.Contains(n, "ollama"):
-		return "ollama"
-	case strings.Contains(n, "bonsai"):
-		return "bonsai"
-	case strings.Contains(n, "unlimited-ocr"):
-		return "unlimited-ocr"
-	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
-		return "llamacpp"
-	case strings.Contains(n, "sglang"):
-		return "sglang"
-	}
-	return ""
+	return engine.TypeFromName(name)
 }
 
 // DiscoverModels queries an LLM service for the model(s) it can serve right
@@ -72,38 +63,48 @@ func EngineTypeFromName(name string) string {
 // model but not yet served a request advertising an empty model set, so the
 // platform registry stayed empty and inference could not route to it
 // (citadel-cli#606 / aceteam#6634).
+// engineDisplayLabel gives DiscoverModels' discoverOpenAIModels call a
+// human-readable engine name for its own error messages, preserved verbatim
+// from the pre-migration switch's per-case literals (casing included). Not
+// part of internal/engine.EngineSpec -- purely cosmetic, so it stays a small
+// local table rather than new registry surface.
+var engineDisplayLabel = map[string]string{
+	"vllm":          "vLLM",
+	"llamacpp":      "llama.cpp",
+	"bonsai":        "bonsai",
+	"unlimited-ocr": "Unlimited-OCR",
+	"sglang":        "SGLang",
+}
+
+// DiscoverModels dispatches by the engine's request dialect
+// (internal/engine.EngineSpec.Dialect, citadel #685 slice 2) instead of a
+// hand-maintained per-engine switch: OllamaNative goes to
+// discoverOllamaModels, every other registered dialect (OpenAIChat,
+// OpenAICompletions, CompletionsOnly -- sglang) goes to
+// discoverOpenAIModels, since all of them expose the same GET /v1/models
+// listing. An unregistered name or one with no dialect (tei, diffusers,
+// lmstudio, ...) reproduces the old switch's default branch exactly.
+//
+// llama.cpp can be up with NO model loaded (router mode / deferred load):
+// that is an empty list, not an error. Without a sglang/unlimited-ocr
+// dialect entry, a running instance would hit the "unsupported service
+// type" error below and report permanently "starting" instead of resolving
+// its served model (citadel-cli#685 §1b) -- unchanged by this migration,
+// just now sourced from internal/engine's dialectByEngine table rather than
+// this switch's case list.
 func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string, port int) ([]string, error) {
-	switch serviceType {
-	case "vllm":
-		return m.discoverOpenAIModels(ctx, "vLLM", port)
-	case "llamacpp":
-		// llama.cpp's server exposes the same OpenAI-compatible /v1/models list.
-		// It can be up with NO model loaded (router mode / deferred load): that is
-		// an empty list, not an error.
-		return m.discoverOpenAIModels(ctx, "llama.cpp", port)
-	case "bonsai":
-		// bonsai (PrismML Bonsai-27B) is served by the llama.cpp fork, so it
-		// exposes the identical OpenAI-compatible /v1/models endpoint.
-		return m.discoverOpenAIModels(ctx, "bonsai", port)
-	case "unlimited-ocr":
-		// Baidu Unlimited-OCR is served by vLLM, exposing the identical
-		// OpenAI-compatible /v1/models endpoint. Without this case the heartbeat
-		// never surfaces the model (the engine is dropped from
-		// collectManagedEngineStatus), so the gateway/fabric can't route to it.
-		return m.discoverOpenAIModels(ctx, "Unlimited-OCR", port)
-	case "sglang":
-		// sglang's launch_server is OpenAI-compatible and exposes the same
-		// GET /v1/models listing (citadel-cli#685 §1b) — without this case,
-		// adding "sglang" to managedProbeEngines/EngineTypeFromName alone would
-		// make every heartbeat probe of a running sglang hit the default
-		// "unsupported service type" error below and report it permanently
-		// "starting" instead of resolving its served model.
-		return m.discoverOpenAIModels(ctx, "SGLang", port)
-	case "ollama":
-		return m.discoverOllamaModels(ctx, port)
-	default:
+	eng, ok := engine.Default().Lookup(serviceType)
+	if !ok || eng.Spec().Dialect == "" {
 		return nil, fmt.Errorf("unsupported service type: %s", serviceType)
 	}
+	if eng.Spec().Dialect == engine.OllamaNative {
+		return m.discoverOllamaModels(ctx, port)
+	}
+	label := engineDisplayLabel[serviceType]
+	if label == "" {
+		label = serviceType
+	}
+	return m.discoverOpenAIModels(ctx, label, port)
 }
 
 // discoverOpenAIModels queries an OpenAI-compatible API for loaded models.
@@ -237,20 +238,25 @@ func (m *ModelDiscovery) DiscoverEmbeddingModel(ctx context.Context, port int) (
 	return []string{id}, nil
 }
 
-// CheckServiceHealth performs a health check on an LLM service.
+// CheckServiceHealth performs a health check on an LLM service. Like
+// DiscoverModels above, this dispatches by dialect (citadel #685 slice 2)
+// rather than a hand-maintained switch: OllamaNative goes to
+// checkOllamaHealth, every other registered dialect -- vLLM, llama.cpp, the
+// bonsai fork, the vLLM-served Unlimited-OCR, and sglang (citadel-cli#685
+// §1b; confirmed against internal/worker/llm_readiness.go's engineReadyPath,
+// which already probes sglang's readiness at this same path) -- all expose
+// GET /health, so they share checkHTTPHealth. An unregistered name or one
+// with no dialect reproduces the old switch's default (HealthStatusUnknown)
+// exactly.
 func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType string, port int) (string, error) {
-	switch serviceType {
-	case "vllm", "llamacpp", "bonsai", "unlimited-ocr", "sglang":
-		// vLLM, llama.cpp, the bonsai fork, the vLLM-served Unlimited-OCR, and
-		// sglang (citadel-cli#685 §1b; confirmed against
-		// internal/worker/llm_readiness.go's engineReadyPath, which already
-		// probes sglang's readiness at this same path) all expose GET /health.
-		return m.checkHTTPHealth(ctx, port)
-	case "ollama":
-		return m.checkOllamaHealth(ctx, port)
-	default:
+	eng, ok := engine.Default().Lookup(serviceType)
+	if !ok || eng.Spec().Dialect == "" {
 		return HealthStatusUnknown, nil
 	}
+	if eng.Spec().Dialect == engine.OllamaNative {
+		return m.checkOllamaHealth(ctx, port)
+	}
+	return m.checkHTTPHealth(ctx, port)
 }
 
 // checkHTTPHealth checks engine health via the /health endpoint (vLLM,
