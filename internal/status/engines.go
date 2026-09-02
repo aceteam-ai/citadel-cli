@@ -4,13 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
-	"strconv"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/engine"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
-	"github.com/aceteam-ai/citadel-cli/services"
-	"gopkg.in/yaml.v3"
 )
 
 // idleCapableEngines lists the serving engines for which idle detection has a
@@ -25,21 +22,33 @@ import (
 // Collector.applyNodeRoutedRequestSignal for the merge order (it runs last, on
 // the fully-assembled status, so it applies uniformly regardless of which of
 // these engine lists produced a given entry).
-var idleCapableEngines = []string{"vllm"}
+//
+// citadel #685 slice 2: this is now a copy of internal/engine's own
+// idleCapableEngineNames, not a second hand-maintained literal -- extending
+// the idle signal to another engine is now a one-line change in
+// internal/engine/tables.go, read here at package init.
+var idleCapableEngines = engine.IdleCapableEngineNames()
+
+// managedEngineHostPort resolves the published host port for a managed
+// engine or any other citadel-owned embedded service by name. citadel #685
+// slice 2: delegates to internal/engine.HostPortForName, the single
+// implementation of the registry-first-then-compose-parse resolution this
+// function used to own directly (see internal/engine/tables.go's doc comment
+// for why that function is a GENERAL resolver, not scoped to
+// services.ServiceMap/the Registry).
+func managedEngineHostPort(name string) int {
+	return engine.HostPortForName(name)
+}
 
 // ManagedEngineHostPort exposes managedEngineHostPort to callers outside this
-// package (internal/engine's registry translation, citadel #685 slice 1) that
-// need the exact host port this package's own heartbeat/status collection
-// would resolve for a serving engine -- the registry-first-then-compose-parse
-// resolution below, not a second copy of it.
+// package that need the exact host port this package's own heartbeat/status
+// collection would resolve for a serving engine.
 func ManagedEngineHostPort(name string) int {
 	return managedEngineHostPort(name)
 }
 
 // ManagedProbeEngines returns a copy of managedProbeEngines, the list of
-// engines the heartbeat's model/health probe iterates. Exported so
-// internal/engine's registry (citadel #685 slice 1) can read the same
-// membership rather than a second hardcoded copy.
+// engines the heartbeat's model/health probe iterates.
 func ManagedProbeEngines() []string {
 	out := make([]string, len(managedProbeEngines))
 	copy(out, managedProbeEngines)
@@ -47,16 +56,14 @@ func ManagedProbeEngines() []string {
 }
 
 // IdleCapableEngines returns a copy of idleCapableEngines -- the engines with a
-// reliable SCRAPED idle/request signal. Exported for the same reason as
-// ManagedProbeEngines above.
+// reliable SCRAPED idle/request signal.
 func IdleCapableEngines() []string {
 	out := make([]string, len(idleCapableEngines))
 	copy(out, idleCapableEngines)
 	return out
 }
 
-// EmbeddingProbeServices returns a copy of embeddingProbeServices. Exported for
-// the same reason as ManagedProbeEngines above.
+// EmbeddingProbeServices returns a copy of embeddingProbeServices.
 func EmbeddingProbeServices() []string {
 	out := make([]string, len(embeddingProbeServices))
 	copy(out, embeddingProbeServices)
@@ -85,13 +92,16 @@ func EmbeddingProbeServices() []string {
 // invisible to EngineTypeFromName's gate (models.go) and therefore to
 // DiscoverModels, CheckServiceHealth, the gateway chat router, mesh discovery,
 // and hotswap residency/preemption tracking all at once — five to six
-// consumers from one root cause. Before this fix, a running sglang was still
-// reported (the collectRunningEmbeddedServices backstop in collector.go covers
-// any running embedded-compose service), just with no model/health/idle
-// signal, permanently "starting". Adding sglang here requires the matching
-// DiscoverModels/CheckServiceHealth cases below to land in the same change, or
-// the probe added here just errors instead of resolving.
-var managedProbeEngines = []string{"vllm", "ollama", "llamacpp", "bonsai", "unlimited-ocr", "sglang"}
+// consumers from one root cause. Adding a new engine here requires the
+// matching DiscoverModels/CheckServiceHealth cases (now internal/engine's
+// Dialect field, see models.go) to be set in the same change, or the probe
+// added here just errors instead of resolving.
+//
+// citadel #685 slice 2: a copy of internal/engine's own
+// managedProbeEngineNames, not a second hand-maintained literal. Order is
+// preserved from the pre-migration literal (see tables.go's doc comment for
+// why order is load-bearing here).
+var managedProbeEngines = engine.ManagedProbeEngineNames()
 
 // collectManagedEngineStatus reports running managed serving engines (from the
 // embedded services.ServiceMap) so their telemetry reaches the heartbeat even
@@ -187,7 +197,10 @@ func (c *Collector) collectManagedEngineStatus(running map[string]bool) []Servic
 // router: the sovereign RAG path (aceteam) discovers them via the "tei"/
 // "embedding" service marker and reaches them through the gateway's
 // /v1/embeddings upstream, not /v1/chat/completions.
-var embeddingProbeServices = []string{"tei"}
+//
+// citadel #685 slice 2: a copy of internal/engine's own
+// embeddingCapableEngineNames, not a second hand-maintained literal.
+var embeddingProbeServices = engine.EmbeddingCapableEngineNames()
 
 // collectEmbeddingServiceStatus reports running embedding services as
 // ServiceInfo with Type=embedding. This is the discovery signal the
@@ -371,49 +384,4 @@ func enginePortIfRunning(running map[string]bool, name string) (port int, isRunn
 		return managedEngineHostPort(name), true
 	}
 	return 0, false
-}
-
-// composePortRe matches the host side of a compose short-form port mapping,
-// e.g. "8100:8000" or "127.0.0.1:8100:8000" -> host port 8100.
-var composePortRe = regexp.MustCompile(`(?:\d+\.\d+\.\d+\.\d+:)?(\d+):\d+`)
-
-// managedEngineHostPort resolves the published host port for a managed engine.
-// For engines whose host publish citadel owns via ${CITADEL_*_HOST_PORT}
-// substitution (llamacpp/vllm/extraction/diffusers), the compose file no longer
-// carries a literal host port, so the port comes from the registry
-// (services/ports.go). For any other engine it falls back to parsing the first
-// port mapping of its embedded compose file. Returns 0 when neither yields a
-// port.
-func managedEngineHostPort(name string) int {
-	if port, ok := services.ManagedServiceHostPort(name); ok {
-		return port
-	}
-	compose, ok := services.ServiceMap[name]
-	if !ok {
-		return 0
-	}
-	return firstComposeHostPort(compose)
-}
-
-// firstComposeHostPort parses a compose document and returns the host port of
-// the first service's first port mapping, or 0 if none is found.
-func firstComposeHostPort(composeYAML string) int {
-	var doc struct {
-		Services map[string]struct {
-			Ports []string `yaml:"ports"`
-		} `yaml:"services"`
-	}
-	if err := yaml.Unmarshal([]byte(composeYAML), &doc); err != nil {
-		return 0
-	}
-	for _, svc := range doc.Services {
-		for _, p := range svc.Ports {
-			if m := composePortRe.FindStringSubmatch(p); m != nil {
-				if hp, err := strconv.Atoi(m[1]); err == nil {
-					return hp
-				}
-			}
-		}
-	}
-	return 0
 }

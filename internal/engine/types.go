@@ -16,10 +16,10 @@
 // not "fix" a gap discovered while translating; file it as a follow-up
 // instead (see the PR body for the list found while building this).
 //
-// Leaf constraint: this package may import services and internal/status (the
-// two packages allowed to feed it directly), and must NOT be imported by
-// either of them yet -- that stays true until a later slice migrates a real
-// caller. Two of the tables this package translates (internal/worker's
+// Leaf constraint: this package may import services (and nothing else
+// project-internal today), and must NOT be imported by internal/worker or
+// internal/jobs yet -- that stays true until a later slice migrates a real
+// caller there. Two of the tables this package translates (internal/worker's
 // engineReadyPath/defaultLoadEstimate, internal/jobs's
 // selfProvisioningEngines) live in packages internal/engine must NOT import,
 // since internal/worker and internal/jobs are expected to import
@@ -27,11 +27,28 @@
 // would make that a cycle. Their values are therefore literal copies within
 // this package (see registry.go's readyPathByEngine/loadEstimateByEngine/
 // selfProvisioningEngines vars); TestRegistryEquivalence lives in this
-// package's own test binary (which CAN import internal/worker/internal/jobs
-// without creating a cycle, since neither imports back into a _test.go file)
-// and checks those literal copies against the real tables via the exported
-// accessors added alongside this package (worker.EngineReadyPath,
-// worker.DefaultLoadEstimate, jobs.IsSelfProvisioningEngine).
+// package's own EXTERNAL test binary (package engine_test, in
+// registry_test.go) which CAN import internal/worker/internal/jobs/
+// internal/status without creating a cycle, and checks those literal copies
+// against the real tables via the exported accessors added alongside this
+// package (worker.EngineReadyPath, worker.DefaultLoadEstimate,
+// jobs.IsSelfProvisioningEngine).
+//
+// internal/status was ALSO one of this package's inputs in slice 1 (Phase A):
+// buildSpec called status.EngineDefaultModel/ManagedEngineHostPort/
+// EngineVRAMEstimateMB/EngineModelEnvVars/IdleCapableEngines/
+// EmbeddingProbeServices/ManagedProbeEngines to populate EngineSpec. Slice 2
+// (citadel #685) reversed that: internal/status's own read-path consumers
+// (EngineTypeFromName, DiscoverModels, CheckServiceHealth, and those same
+// membership lists) now need to read FROM this package's Registry, which is
+// only possible if this package no longer imports internal/status (a cycle
+// otherwise: internal/status -> internal/engine -> internal/status). So this
+// package now owns those tables directly (tables.go) as literal copies of
+// what internal/status used to hand-maintain, and internal/status's
+// same-named package vars are derived FROM this package's exported
+// accessors at init instead. See tables.go's own doc comment for the detail;
+// this paragraph exists so a reader of THIS file doesn't conclude
+// internal/status still feeds this package the way slice 1 described.
 package engine
 
 import (
@@ -135,26 +152,34 @@ type EngineSpec struct {
 	// branch (registry.go's loadEstimateByEngine is the literal copy).
 	LoadEstimate time.Duration
 	// VRAMEstimateMB is the coarse per-engine VRAM provisioning budget
-	// (status.EngineVRAMEstimateMB). 0 when unknown.
+	// (tables.go's vramEstimateMBByEngine -- internal/status.EngineVRAMEstimateMB
+	// is now a thin wrapper reading this same value back out). 0 when unknown.
 	VRAMEstimateMB int
 	// ModelEnvVar is the <name>.env variable(s), in preference order, that
-	// select this engine's served model (status.EngineModelEnvVars). Nil when
-	// the engine has no such override.
+	// select this engine's served model (tables.go's modelEnvVarsByEngine;
+	// internal/status.EngineModelEnvVars wraps it). Nil when the engine has
+	// no such override.
 	ModelEnvVar []string
 	// DefaultModel is the served model id this engine falls back to when
-	// ModelEnvVar resolves nothing (status.EngineDefaultModel). A POINTER,
+	// ModelEnvVar resolves nothing (tables.go's defaultModelByEngine;
+	// internal/status.EngineDefaultModel wraps it). A POINTER,
 	// deliberately: nil means "no entry in the source table" (llamacpp's
 	// documented gap, citadel #685 §1a -- the engine cannot express a stable
 	// default and none is invented), which is a different fact from a
 	// present-but-empty string. Never dereference without a nil check.
 	DefaultModel *string
-	// IdleCapable reports membership in status.IdleCapableEngines() -- engines
-	// with a reliable SCRAPED idle/request signal.
+	// IdleCapable reports membership in tables.go's idleCapableEngineNames
+	// (internal/status.IdleCapableEngines wraps
+	// IdleCapableEngineNames()) -- engines with a reliable SCRAPED
+	// idle/request signal.
 	IdleCapable bool
-	// EmbeddingCapable reports membership in status.EmbeddingProbeServices().
+	// EmbeddingCapable reports membership in tables.go's
+	// embeddingCapableEngineNames (internal/status.EmbeddingProbeServices
+	// wraps EmbeddingCapableEngineNames()).
 	EmbeddingCapable bool
-	// ManagedProbe reports membership in status.ManagedProbeEngines() -- the
-	// engines the heartbeat's model/health probe iterates.
+	// ManagedProbe reports membership in tables.go's managedProbeEngineNames
+	// (internal/status.ManagedProbeEngines wraps ManagedProbeEngineNames())
+	// -- the engines the heartbeat's model/health probe iterates.
 	ManagedProbe bool
 	// MetricsPort is the host port this engine exposes a Prometheus /metrics
 	// endpoint on (services.InferenceMetricsPorts()), or 0 when it has none.

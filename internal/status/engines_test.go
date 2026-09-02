@@ -6,53 +6,8 @@ import (
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
-func TestFirstComposeHostPort(t *testing.T) {
-	cases := []struct {
-		name    string
-		compose string
-		want    int
-	}{
-		{
-			name: "simple mapping",
-			compose: `services:
-  vllm:
-    image: vllm/vllm-openai:latest
-    ports:
-      - "8100:8000"
-`,
-			want: 8100,
-		},
-		{
-			name: "ip-qualified mapping",
-			compose: `services:
-  svc:
-    ports:
-      - "127.0.0.1:9000:8000"
-`,
-			want: 9000,
-		},
-		{
-			name: "no ports",
-			compose: `services:
-  svc:
-    image: foo
-`,
-			want: 0,
-		},
-		{
-			name:    "malformed yaml",
-			compose: "::: not yaml",
-			want:    0,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := firstComposeHostPort(c.compose); got != c.want {
-				t.Fatalf("got %d, want %d", got, c.want)
-			}
-		})
-	}
-}
+// TestFirstComposeHostPort moved to internal/engine/tables_test.go (citadel
+// #685 slice 2) along with the function it tests.
 
 // TestManagedEngineHostPort_VLLM confirms vLLM resolves to its citadel-owned
 // published host port. vLLM's host publish is managed via

@@ -1,13 +1,33 @@
-package engine
+// Package engine_test (external, not "package engine") is required as of
+// citadel #685 slice 2: this file imports internal/status, internal/worker,
+// and internal/jobs, and internal/status now imports internal/engine (the
+// whole point of slice 2). An in-package ("package engine") test file
+// importing something that transitively imports the package under test is
+// an import cycle Go refuses to build; an external test package is exempt.
+// See internal/engine/tables_test.go for the in-package tests that exercise
+// this package's unexported helpers instead.
+package engine_test
 
 import (
 	"testing"
 
+	. "github.com/aceteam-ai/citadel-cli/internal/engine"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
+
+// stringInSlice is a local copy of the package's own unexported helper of
+// the same name -- unreachable from an external test package by design.
+func stringInSlice(list []string, name string) bool {
+	for _, v := range list {
+		if v == name {
+			return true
+		}
+	}
+	return false
+}
 
 // chatBackends is the exact set of backends internal/worker/llm_inference.go's
 // Execute() routing switch dispatches (verified against that switch directly
