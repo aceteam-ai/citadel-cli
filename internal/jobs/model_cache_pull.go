@@ -79,6 +79,19 @@ var selfProvisioningEngines = map[string]string{
 	"extraction":    "the extraction compose pins MODEL_NAME and downloads into the shared HuggingFace cache",
 }
 
+// IsSelfProvisioningEngine reports whether engine is in selfProvisioningEngines
+// -- an engine whose compose file owns its weights, so MODEL_CACHE_PULL is a
+// no-op for it. Exported so internal/engine's registry equivalence test
+// (citadel #685 slice 1) can verify its own literal copy of this table
+// against the real one -- internal/engine cannot import internal/jobs in
+// production code (it must stay a leaf importable by internal/status without
+// a cycle), so its SelfProvisioning field is a literal translation of this
+// map, checked here.
+func IsSelfProvisioningEngine(engine string) bool {
+	_, ok := selfProvisioningEngines[engine]
+	return ok
+}
+
 // sortedSelfProvisioningEngines returns the no-op engine names in a stable
 // order, so the unsupported-engine error reads the same on every node.
 func sortedSelfProvisioningEngines() []string {

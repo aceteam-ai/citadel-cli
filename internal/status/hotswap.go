@@ -55,6 +55,32 @@ var engineModelEnvVars = map[string][]string{
 	"llamacpp": {"LLAMACPP_MODEL"},
 }
 
+// EngineModelEnvVars returns a copy of engineModelEnvVars[name] -- the
+// <name>.env variable(s) (in preference order) that select the engine's served
+// model, or nil when the engine has no such env. Exported so internal/engine's
+// registry (citadel #685 slice 1) reads the same table rather than a second
+// hardcoded copy.
+func EngineModelEnvVars(name string) []string {
+	vars := engineModelEnvVars[name]
+	if vars == nil {
+		return nil
+	}
+	out := make([]string, len(vars))
+	copy(out, vars)
+	return out
+}
+
+// EngineDefaultModel returns engineDefaultModel[name] and whether an entry is
+// present. The ok return distinguishes "deliberately no default" (e.g. vllm,
+// llamacpp -- present-but-empty would collapse that distinction) from "not in
+// the map at all", which citadel #685 §1a identified as exactly the bug a
+// naive string return would reintroduce. Exported for internal/engine's
+// registry (slice 1).
+func EngineDefaultModel(name string) (string, bool) {
+	v, ok := engineDefaultModel[name]
+	return v, ok
+}
+
 // engineDefaultModel is the served model id an engine falls back to when its
 // <name>.env sets no override — the same value the compose ${VAR:-default}
 // carries. This is what lets a freshly-installed bonsai/unlimited-ocr advertise a

@@ -258,6 +258,16 @@ func ManagedServiceHostPort(name string) (int, bool) {
 	return port, ok
 }
 
+// HostPortEnvVarName returns the compose env-var name that carries the given
+// service's citadel-assigned host port, and whether one is registered. Exported
+// for internal/engine's registry translation (citadel #685 slice 1), which
+// needs the per-engine variable name without re-deriving it from
+// HostPortEnv()'s flattened "KEY=value" list.
+func HostPortEnvVarName(name string) (string, bool) {
+	v, ok := serviceHostPortEnv[name]
+	return v, ok
+}
+
 // SGLangHostPort is sglang's native host port (services/compose/sglang.yml).
 // It never collided with anything, so it is not env-var-managed like the 8200
 // block; the constant exists so consumers (the heartbeat stats scraper,

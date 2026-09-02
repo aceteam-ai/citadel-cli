@@ -73,6 +73,17 @@ var engineReadyPath = map[string]string{
 	"ollama":        "/api/tags",
 }
 
+// EngineReadyPath returns engineReadyPath[backend] and whether an entry is
+// present. Exported so internal/engine's registry equivalence test (citadel
+// #685 slice 1) can verify its own copy of this table against the real one --
+// internal/engine cannot import internal/worker in production code (it must
+// stay a leaf importable by internal/status without a cycle), so its
+// ReadyPath field is a literal translation of this map, checked here.
+func EngineReadyPath(backend string) (string, bool) {
+	v, ok := engineReadyPath[backend]
+	return v, ok
+}
+
 // engineReadyBudgetOverride shortens the budget in tests. Nil in production.
 var engineReadyBudgetOverride *time.Duration
 

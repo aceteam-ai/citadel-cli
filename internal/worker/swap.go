@@ -278,6 +278,17 @@ func defaultLoadEstimate(backend string) time.Duration {
 	}
 }
 
+// DefaultLoadEstimate exposes defaultLoadEstimate to callers outside this
+// package. Exported so internal/engine's registry equivalence test (citadel
+// #685 slice 1) can verify its own literal copy of this table against the
+// real one -- internal/engine cannot import internal/worker in production
+// code (it must stay a leaf importable by internal/status without a cycle),
+// so its LoadEstimate field is a literal translation of this switch, checked
+// here.
+func DefaultLoadEstimate(backend string) time.Duration {
+	return defaultLoadEstimate(backend)
+}
+
 // EnsureResident makes the engine for `backend` (serving `model`) resident, or
 // reports that a swap is in progress. It never blocks longer than the wait
 // budget. The returned error is a hard failure (e.g. the swap cannot fit without
