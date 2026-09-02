@@ -2204,3 +2204,19 @@ Auto-generated log of every release.
   - feat: citadel socks — SOCKS5 dynamic-forward proxy over the mesh (#974)
 
 
+---
+
+## v2.141.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 21 |
+| Lines added | +1503 |
+
+**Changes:**
+
+  - feat: appliance-mode default-serve reconcile on blank GPU nodes (#628) (#982)
+  - engine-adapter slice 2: migrate status/mesh read paths to internal/engine (#981)
+
+
