@@ -148,3 +148,113 @@ func Freshness(m *Marker, now time.Time, staleAfter time.Duration) (FreshnessSta
 	}
 	return FreshnessOK, age
 }
+
+// attemptFreshWindow bounds how recently a durable-write ATTEMPT (success or
+// failure) must have happened for this node to conclude the worker is still
+// actively trying to reach the backend. It is deliberately much shorter than
+// DefaultStaleAfter: the publish interval is ~30s, so an attempt within 90s
+// (3x that) means the worker loop is alive right now, regardless of whether
+// its writes are succeeding. Used to distinguish BackendDown ("the worker is
+// alive and trying, but every attempt fails or the last success is stale")
+// from BackendUnknown ("nothing has attempted a write recently -- most
+// likely the worker itself isn't running, which citadel status's "Status:
+// not running" line already covers; this package must not blame the
+// backend for that").
+const attemptFreshWindow = 90 * time.Second
+
+// BackendState classifies node<->backend heartbeat connectivity for display
+// (citadel-cli#429 Part 1). It is a strictly finer-grained read of the same
+// Marker Freshness already classifies: BackendHealth additionally considers
+// ConsecutiveFailures (to distinguish "landing cleanly" from "landing but
+// flaky") and LastAttemptAt (to distinguish "the backend is unreachable" from
+// "this node has nothing to say" -- see attemptFreshWindow above).
+type BackendState int
+
+const (
+	// BackendUnknown: no evidence either way. Either no marker has ever been
+	// written (fresh install, config dir the live worker does not share), or
+	// the last known success AND the last known attempt are both stale --
+	// most likely because the worker that would write them is not running at
+	// all, a condition the "Status: not running" line already reports.
+	// Deliberately never rendered as healthy.
+	BackendUnknown BackendState = iota
+	// BackendReachable: the last durable write succeeded within
+	// DefaultStaleAfter, and at most one attempt has failed since (isolated
+	// blips do not warrant a warning).
+	BackendReachable
+	// BackendDegraded: the last durable write succeeded within
+	// DefaultStaleAfter, but two or more consecutive attempts have since
+	// failed -- landing, but flaky enough that an operator should know before
+	// it becomes BackendDown.
+	BackendDegraded
+	// BackendDown: the last successful write is stale (or none ever
+	// succeeded), but the worker IS actively attempting writes (an attempt
+	// within attemptFreshWindow) -- i.e. the worker is alive and reachable
+	// enough to try, but the backend itself is not landing writes. This is
+	// the strong "heartbeat is not reaching the platform" signal.
+	BackendDown
+)
+
+// String renders a BackendState as the lowercase token used both in
+// `citadel status`'s human-readable line and its `--json`/dashboard
+// machine-readable output, so the two never drift apart.
+func (s BackendState) String() string {
+	switch s {
+	case BackendReachable:
+		return "reachable"
+	case BackendDegraded:
+		return "degraded"
+	case BackendDown:
+		return "down"
+	default:
+		return "unknown"
+	}
+}
+
+// BackendHealth classifies m as of now using the fixed thresholds
+// DefaultStaleAfter (success freshness) and attemptFreshWindow (attempt
+// freshness) -- see their doc comments for why these are fixed rather than
+// caller-supplied. It returns the age of the last successful durable write
+// alongside the state; age is zero when no success has ever been recorded
+// (BackendUnknown or a not-yet-succeeded BackendDown), and is otherwise
+// always populated -- including for BackendDown and BackendDegraded --
+// because callers render "last ok Xs ago" for every state that has one, not
+// just BackendReachable.
+//
+// This measures the reachability of whatever the running heartbeat
+// publisher's durable write actually targets: `redis.aceteam.ai` directly in
+// direct-Redis mode, or the AceTeam HTTPS API in API mode (the normal
+// post-`citadel init` configuration, where the two are the same backend).
+// v1 does not distinguish the two paths -- see the caller-side doc comment
+// for the full caveat.
+func BackendHealth(m *Marker, now time.Time) (BackendState, time.Duration) {
+	if m == nil {
+		return BackendUnknown, 0
+	}
+
+	attemptFresh := !m.LastAttemptAt.IsZero() && now.Sub(m.LastAttemptAt) <= attemptFreshWindow
+
+	if m.LastSuccessAt.IsZero() {
+		// Never succeeded. Only distinguishable from "worker not running" by
+		// a fresh attempt: the worker is trying and failing every time.
+		if attemptFresh {
+			return BackendDown, 0
+		}
+		return BackendUnknown, 0
+	}
+
+	age := now.Sub(m.LastSuccessAt)
+	if age <= DefaultStaleAfter {
+		if m.ConsecutiveFailures >= 2 {
+			return BackendDegraded, age
+		}
+		return BackendReachable, age
+	}
+
+	// Last success is stale. Still down (not unknown) as long as the worker
+	// is visibly still trying.
+	if attemptFresh {
+		return BackendDown, age
+	}
+	return BackendUnknown, age
+}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/proxmox"
@@ -2189,7 +2190,10 @@ func (cc *ControlCenter) updateNodePanel() {
 		sb.WriteString(fmt.Sprintf(" [yellow]Terminal:[-] [cyan]%s[-]\n", cc.data.TerminalServerURL))
 	}
 
-	// Heartbeat indicator
+	// Heartbeat indicator: whether THIS control center process's own publish
+	// loop is currently ticking (a local, in-process signal -- see
+	// UpdateHeartbeat). Distinct from the Backend: row below, which reports
+	// whether those publishes are actually LANDING at the backend.
 	if cc.data.HeartbeatActive {
 		ago := time.Since(cc.data.LastHeartbeat)
 		var agoStr string
@@ -2198,9 +2202,47 @@ func (cc *ControlCenter) updateNodePanel() {
 		} else {
 			agoStr = fmt.Sprintf("%dm ago", int(ago.Minutes()))
 		}
-		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]%s[-] %s", Glyph(MarkerActive), agoStr))
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [green]%s[-] %s\n", Glyph(MarkerActive), agoStr))
 	} else if cc.data.WorkerRunning {
-		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [gray]%s[-] starting...", Glyph(MarkerInactive)))
+		sb.WriteString(fmt.Sprintf(" [yellow]Heartbeat:[-] [gray]%s[-] starting...\n", Glyph(MarkerInactive)))
+	}
+
+	// Backend connectivity health (citadel-cli#429 Part 1): a direct,
+	// cross-process read of the same on-disk marker `citadel status`'s
+	// Backend: line reads (internal/heartbeat/marker.go, written by
+	// internal/heartbeat.RecordSuccess/RecordFailure on every durable
+	// heartbeat write attempt -- by WHICHEVER process is this node's
+	// publisher, `citadel work` or this control center; see
+	// controlCenterAPIPublisherConfig in cmd/controlcenter.go for the fix
+	// that makes this control center itself write that marker). Deliberately
+	// NOT routed through StatusData/refreshFn/the collector pipeline: this is
+	// a single small file read, cheap enough to do on every render, and
+	// keeping it a direct read (like cmd/status.go's printBackendHealth)
+	// means it reflects the marker's live state even between refresh ticks.
+	//
+	// Semantics caveat: in direct-Redis mode this measures reachability of
+	// redis.aceteam.ai, not the HTTPS API; in API mode (the normal
+	// post-`citadel init` configuration) they are the same backend.
+	if m := heartbeat.LoadMarker(network.GetNodeConfigDir()); m != nil {
+		state, age := heartbeat.BackendHealth(m, time.Now())
+		switch state {
+		case heartbeat.BackendReachable:
+			sb.WriteString(fmt.Sprintf(" [yellow]Backend:[-]   [green]%s[-] reachable (last ok %s ago)",
+				Glyph(MarkerActive), age.Round(time.Second)))
+		case heartbeat.BackendDegraded:
+			sb.WriteString(fmt.Sprintf(" [yellow]Backend:[-]   [yellow]%s[-] degraded (last ok %s ago)",
+				Glyph(MarkerActive), age.Round(time.Second)))
+		case heartbeat.BackendDown:
+			detail := "never reached"
+			if !m.LastSuccessAt.IsZero() {
+				detail = fmt.Sprintf("last ok %s ago", age.Round(time.Second))
+			}
+			sb.WriteString(fmt.Sprintf(" [yellow]Backend:[-]   [red]%s[-] DOWN (%s)",
+				Glyph(MarkerInactive), detail))
+		default: // BackendUnknown
+			sb.WriteString(fmt.Sprintf(" [yellow]Backend:[-]   [gray]%s[-] unknown",
+				Glyph(MarkerInactive)))
+		}
 	}
 
 	cc.nodePanel.SetText(sb.String())

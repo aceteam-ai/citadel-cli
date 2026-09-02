@@ -47,19 +47,28 @@ type StatusData struct {
 	InProgressJobs  int64  `json:"inProgressJobs,omitempty"`
 	FailedJobs      int64  `json:"failedJobs,omitempty"`
 
-	// Heartbeat freshness (citadel-cli#726): whether this node's durable
-	// heartbeat write (node:status:stream) is actually landing, read from the
-	// on-disk marker internal/heartbeat.RecordSuccess/RecordFailure writes.
-	// HeartbeatKnown is false when no marker has ever been written (fresh
-	// install, worker never published, or a config dir the live worker does
-	// not share) -- deliberately distinct from "not stale", since an absent
-	// signal must never read as healthy.
-	HeartbeatKnown               bool      `json:"heartbeatKnown"`
-	HeartbeatLastSuccessAt       time.Time `json:"heartbeatLastSuccessAt,omitempty"`
-	HeartbeatLastAttemptAt       time.Time `json:"heartbeatLastAttemptAt,omitempty"`
-	HeartbeatStale               bool      `json:"heartbeatStale,omitempty"`
-	HeartbeatConsecutiveFailures int       `json:"heartbeatConsecutiveFailures,omitempty"`
-	HeartbeatLastError           string    `json:"heartbeatLastError,omitempty"`
+	// Backend connectivity health (citadel-cli#429 Part 1, superseding the
+	// original citadel-cli#726 two-value Heartbeat{Known,Stale} pair with the
+	// 4-state classification from internal/heartbeat.BackendHealth):
+	// "reachable" / "degraded" / "down" / "unknown", read from the same
+	// on-disk marker internal/heartbeat.RecordSuccess/RecordFailure writes on
+	// every durable heartbeat write attempt (node:status:stream). "unknown"
+	// covers both "no marker has ever been written" (fresh install, worker
+	// never published, or a config dir the live worker does not share) and
+	// "the worker itself appears not to be publishing" -- deliberately never
+	// rendered as healthy. See internal/heartbeat.BackendState's doc comment
+	// for the other three states. BackendLastSuccessAt's age is what
+	// `citadel status` renders as "last ok Xs ago"; recomputed by the caller
+	// rather than duplicated on the wire.
+	//
+	// Semantics caveat: in direct-Redis mode this measures reachability of
+	// redis.aceteam.ai, not the HTTPS API; in API mode (the normal
+	// post-`citadel init` configuration) they are the same backend.
+	BackendState               string    `json:"backendState"`
+	BackendLastSuccessAt       time.Time `json:"backendLastSuccessAt,omitempty"`
+	BackendLastAttemptAt       time.Time `json:"backendLastAttemptAt,omitempty"`
+	BackendConsecutiveFailures int       `json:"backendConsecutiveFailures,omitempty"`
+	BackendLastError           string    `json:"backendLastError,omitempty"`
 }
 
 // GPUInfo holds GPU information

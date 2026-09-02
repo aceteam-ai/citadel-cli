@@ -34,6 +34,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	pmx "github.com/aceteam-ai/citadel-cli/internal/proxmox"
 	"github.com/aceteam-ai/citadel-cli/internal/pulse"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/teamchat"
 	"github.com/aceteam-ai/citadel-cli/internal/telemetry"
@@ -180,6 +181,31 @@ var (
 	isConnectedFn  = network.IsGlobalConnected
 	currentVPNIPFn = network.GetGlobalIPv4
 )
+
+// controlCenterAPIPublisherConfig builds the heartbeat.APIPublisherConfig the
+// control center uses when IT is this node's heartbeat publisher (workerHeld
+// == false in the caller). Extracted to a pure, unit-testable function
+// (TestControlCenterAPIPublisherConfigSetsMarkerDir) so the MarkerDir wiring
+// below cannot silently regress: before citadel#429, this call site omitted
+// MarkerDir entirely, so the control center never wrote the cross-process
+// heartbeat marker (internal/heartbeat/marker.go) -- both `citadel status`
+// and the TUI's own Backend: row would read "unknown" forever whenever the
+// control center, rather than a dedicated `citadel work`, was the node's
+// heartbeat publisher. Matches cmd/work.go's runWork wiring, which passes
+// the same network.GetNodeConfigDir() (the machine-convergent node config
+// dir -- see internal/heartbeat/marker.go's doc comment for why that, and
+// not platform.ConfigDir(), is required here).
+func controlCenterAPIPublisherConfig(client *redisapi.Client, nodeID, headscaleNodeID, orgID string, logFn func(level, msg string)) heartbeat.APIPublisherConfig {
+	return heartbeat.APIPublisherConfig{
+		Client:          client,
+		NodeID:          nodeID,
+		HeadscaleNodeID: headscaleNodeID,
+		OrgID:           orgID,
+		DebugFunc:       nil,
+		LogFn:           logFn, // Route logs through TUI
+		MarkerDir:       network.GetNodeConfigDir(),
+	}
+}
 
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
@@ -2260,14 +2286,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				// so the TUI never falsely claims "Heartbeat publishing started".
 				if workerHeld {
 					activity("info", fmt.Sprintf("Dedicated worker holds this node (PID %d); control center will NOT publish a second heartbeat (monitor-only)", workerPID))
-				} else if apiPublisher, err := heartbeat.NewAPIPublisher(heartbeat.APIPublisherConfig{
-					Client:          apiSource.Client(),
-					NodeID:          nodeName,
-					HeadscaleNodeID: headscaleNodeID,
-					OrgID:           orgID,
-					DebugFunc:       nil,
-					LogFn:           activity, // Route logs through TUI
-				}, collector); err == nil {
+				} else if apiPublisher, err := heartbeat.NewAPIPublisher(
+					controlCenterAPIPublisherConfig(apiSource.Client(), nodeName, headscaleNodeID, orgID, activity),
+					collector,
+				); err == nil {
 					// Include current permissions in heartbeat
 					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
 
