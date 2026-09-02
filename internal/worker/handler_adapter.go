@@ -243,6 +243,13 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// SYNTHESIZE_SPEECH jobs (they only land on nodes carrying the engine:tts
 		// tag).
 		NewLegacyHandlerAdapter(JobTypeSynthesizeSpeech, jobs.NewSynthesizeSpeechHandler()),
+		// Node-local image/video generation (diffusers sidecar, issue #968/#970).
+		// The image/video counterpart to SYNTHESIZE_SPEECH, registered
+		// UNCONDITIONALLY for the same reason: prompt in, media out (base64),
+		// no workspace file touched. Nodes that don't run the diffusers sidecar
+		// simply never receive MEDIA_GENERATE jobs (they only land on nodes
+		// carrying the relevant engine tag).
+		NewLegacyHandlerAdapter(JobTypeMediaGenerate, jobs.NewMediaGenerateHandler()),
 		// Turn delivery to a payload-launched BYOC instance (aceteam#5241).
 		// Registered unconditionally: it resolves the target from its own
 		// on-disk instance store (~/.citadel/instances/state.json, shared with

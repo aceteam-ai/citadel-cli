@@ -86,11 +86,12 @@ func (t *GPUTracker) Total() int {
 // Deliberately excluded, even though their handlers also make an outbound HTTP
 // call to a local engine/sidecar: JobTypeEmbedding (TEI), JobTypeExtraction
 // (GLiNER2), JobTypeTranscribeAudio (faster-whisper), JobTypeSynthesizeSpeech
-// (kokoro). None of them share the vLLM/llama.cpp/Ollama/bonsai chat-completion
-// GPU-serving path this tracker models, and the issue's request was scoped to
-// "inference/llm_inference and similar". If one of these sidecars turns out to
-// genuinely contend for the same GPU in practice, add it here explicitly rather
-// than broadening the predicate implicitly.
+// (kokoro), JobTypeMediaGenerate (diffusers). None of them share the
+// vLLM/llama.cpp/Ollama/bonsai chat-completion GPU-serving path this tracker
+// models, and the issue's request was scoped to "inference/llm_inference and
+// similar". If one of these sidecars turns out to genuinely contend for the
+// same GPU in practice, add it here explicitly rather than broadening the
+// predicate implicitly.
 var gpuBoundJobTypes = map[string]struct{}{
 	JobTypeLlamaCppInference: {},
 	JobTypeVLLMInference:     {},
