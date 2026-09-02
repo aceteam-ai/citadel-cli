@@ -107,22 +107,88 @@ func Authorize(ctx context.Context, resolver IdentityResolver, remoteAddr string
 	return id, nil
 }
 
+// resolveHost is PolicyDialer's DNS resolution hook for a non-literal-IP
+// CONNECT target. A package var (not a parameter threaded through every
+// call), mirroring this codebase's existing injectable-dependency pattern
+// (e.g. citadelconfig.VaultConfigured) so a test can substitute a
+// deterministic resolver without touching real DNS. Returns every address
+// the name resolves to.
+var resolveHost = func(ctx context.Context, host string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		ips[i] = a.IP
+	}
+	return ips, nil
+}
+
 // PolicyDialer wraps an underlying egress dialer with the destination policy
-// (IsDestinationAllowed): every CONNECT target is checked before the
-// underlying dialer is ever called, so a denied destination never reaches
-// net.Dial. allowLAN is read at call time (not captured once), so a
-// long-running Server always applies its CURRENT configured policy rather
-// than whatever was in effect when the Server was constructed.
+// (IsDestinationAllowed). allowLAN is read at call time (not captured once),
+// so a long-running Server always applies its CURRENT configured policy
+// rather than whatever was in effect when the Server was constructed.
+//
+// A CONNECT target that is a hostname (not a literal IP) is resolved HERE,
+// EVERY resolved address is checked against the policy, and -- only if all
+// pass -- the underlying dialer is called with the PINNED literal IP that
+// was actually validated, never the original hostname. This closes two
+// related holes a naive "check the raw host string, then hand it to the
+// dialer" implementation has: (1) IsDestinationAllowed cannot itself see
+// through a hostname to a private A/AAAA record, so a CONNECT to
+// attacker-controlled-name.example with a 192.168.x.x record would sail
+// through unchecked if the raw name were the only thing checked; (2) even
+// checking a resolved address and then handing the ORIGINAL hostname to the
+// underlying dialer (which would resolve it a second time) is a
+// DNS-rebinding TOCTOU -- a short-TTL record can legitimately answer
+// differently between the validation lookup and the dialer's own lookup
+// moments later. Resolving once and dialing the exact address validated
+// closes both. allowLAN=true skips resolution/pinning entirely (nothing to
+// protect), passing the original target straight through, same as before.
 func PolicyDialer(underlying socks.Dialer, allowLAN func() bool) socks.Dialer {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
+		if allowLAN() {
+			return underlying(ctx, network, addr)
+		}
+
+		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			host = addr
+			host, port = addr, ""
 		}
-		if ok, reason := IsDestinationAllowed(host, allowLAN()); !ok {
-			return nil, fmt.Errorf("egress relay: destination %s refused: %s", addr, reason)
+
+		if ip := net.ParseIP(host); ip != nil {
+			// Already a literal IP (the common case: SOCKS5 ATYP IPv4/IPv6,
+			// or a DOMAINNAME that happens to spell an IP literal) -- no
+			// resolution needed, check it directly.
+			if ok, reason := IsDestinationAllowed(host, false); !ok {
+				return nil, fmt.Errorf("egress relay: destination %s refused: %s", addr, reason)
+			}
+			return underlying(ctx, network, addr)
 		}
-		return underlying(ctx, network, addr)
+
+		// A hostname: resolve, validate every answer, then dial the pinned
+		// address -- see the doc comment above for why re-resolving inside
+		// the underlying dialer instead would be unsafe.
+		ips, rerr := resolveHost(ctx, host)
+		if rerr != nil {
+			return nil, fmt.Errorf("egress relay: could not resolve destination %s: %w", host, rerr)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("egress relay: destination %s resolved to no addresses", host)
+		}
+		for _, resolved := range ips {
+			if ok, reason := IsDestinationAllowed(resolved.String(), false); !ok {
+				return nil, fmt.Errorf("egress relay: destination %s (resolves to %s) refused: %s", addr, resolved, reason)
+			}
+		}
+
+		pinned := ips[0].String()
+		dialAddr := pinned
+		if port != "" {
+			dialAddr = net.JoinHostPort(pinned, port)
+		}
+		return underlying(ctx, network, dialAddr)
 	}
 }
 

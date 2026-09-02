@@ -216,14 +216,20 @@ func TestServerAuthorizedPeerReachesDialer(t *testing.T) {
 	}
 	defer conn.Close()
 
-	rep := socks5Connect(t, conn, "example.com", 443)
+	// A literal public IP -- not a hostname -- so this test exercises
+	// "authorized peer reaches the dialer" without depending on real DNS
+	// resolution (PolicyDialer now resolves hostnames itself; see the
+	// dedicated TestPolicyDialer*/TestServerHostnameResolvingToPrivateIP...
+	// tests below for hostname-resolution coverage, which stub resolveHost
+	// instead of hitting the network).
+	rep := socks5Connect(t, conn, "8.8.8.8", 443)
 	if rep != 0x00 {
 		t.Fatalf("expected SOCKS5 success (0x00), got 0x%02x", rep)
 	}
 
 	select {
 	case addr := <-fd.dialed:
-		if addr != "example.com:443" {
+		if addr != "8.8.8.8:443" {
 			t.Fatalf("dialed unexpected target: %s", addr)
 		}
 	case <-time.After(2 * time.Second):
@@ -321,5 +327,238 @@ func TestServerAllowLANPermitsPrivateDestination(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for dialer to be called")
+	}
+}
+
+// --- PolicyDialer: hostname resolution, pinning, and the literal
+// unspecified-address bypass (citadel #787 security-review follow-up) ------
+
+// stubResolveHost swaps the package-level resolveHost hook for the duration
+// of the test, restoring the real resolver on cleanup. Lets these tests
+// drive PolicyDialer's hostname path deterministically without any real DNS.
+func stubResolveHost(t *testing.T, fn func(ctx context.Context, host string) ([]net.IP, error)) {
+	t.Helper()
+	orig := resolveHost
+	resolveHost = fn
+	t.Cleanup(func() { resolveHost = orig })
+}
+
+func mustParseIP(t *testing.T, s string) net.IP {
+	t.Helper()
+	ip := net.ParseIP(s)
+	if ip == nil {
+		t.Fatalf("invalid test IP literal %q", s)
+	}
+	return ip
+}
+
+func TestPolicyDialerDeniesHostnameResolvingToPrivateIP(t *testing.T) {
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		if host != "attacker.example" {
+			t.Fatalf("unexpected resolve host %q", host)
+		}
+		return []net.IP{mustParseIP(t, "192.168.2.201")}, nil
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return false })
+
+	_, err := dial(context.Background(), "tcp", "attacker.example:22")
+	if err == nil {
+		t.Fatal("expected a hostname resolving to a private IP to be denied")
+	}
+
+	select {
+	case addr := <-fd.dialed:
+		t.Fatalf("underlying dialer must never be called for a denied resolved address, was called with %s", addr)
+	default:
+	}
+}
+
+func TestPolicyDialerDeniesHostnameResolvingToUnspecifiedAddress(t *testing.T) {
+	// 0.0.0.0/:: as a RESOLVED answer (not just a literal CONNECT target,
+	// see TestPolicyDialerLiteral0000AndDoubleColonDeniedByDefault below) --
+	// covers a DNS answer, not just what a client typed directly.
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		return []net.IP{mustParseIP(t, "0.0.0.0")}, nil
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return false })
+
+	if _, err := dial(context.Background(), "tcp", "weird.example:22"); err == nil {
+		t.Fatal("expected a hostname resolving to 0.0.0.0 to be denied")
+	}
+	select {
+	case addr := <-fd.dialed:
+		t.Fatalf("underlying dialer must never be called, was called with %s", addr)
+	default:
+	}
+}
+
+func TestPolicyDialerPinsResolvedIPRatherThanRedialingHostname(t *testing.T) {
+	// Proves the DNS-rebinding fix directly: the underlying dialer must
+	// receive the EXACT address PolicyDialer validated, never the original
+	// hostname (which a second, independent resolution inside the
+	// underlying dialer could answer differently for).
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		if host != "public.example" {
+			t.Fatalf("unexpected resolve host %q", host)
+		}
+		return []net.IP{mustParseIP(t, "8.8.8.8")}, nil
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return false })
+
+	if _, err := dial(context.Background(), "tcp", "public.example:443"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case addr := <-fd.dialed:
+		if addr != "8.8.8.8:443" {
+			t.Fatalf("underlying dialer received %q, want the pinned resolved IP %q -- PolicyDialer must never hand the hostname back to the dialer", addr, "8.8.8.8:443")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dialer to be called")
+	}
+}
+
+func TestPolicyDialerDeniesWhenAnyResolvedAddressIsPrivate(t *testing.T) {
+	// A multi-answer hostname (e.g. dual-stack, or round-robin) where only
+	// SOME resolved addresses are private must be refused ENTIRELY, not
+	// dialed via whichever answer happened to be public -- fail closed on
+	// ambiguity rather than silently picking a "safe-looking" address.
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		return []net.IP{mustParseIP(t, "8.8.8.8"), mustParseIP(t, "10.0.0.5")}, nil
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return false })
+
+	if _, err := dial(context.Background(), "tcp", "mixed.example:443"); err == nil {
+		t.Fatal("expected denial when any resolved address is private")
+	}
+	select {
+	case addr := <-fd.dialed:
+		t.Fatalf("underlying dialer must never be called, was called with %s", addr)
+	default:
+	}
+}
+
+func TestPolicyDialerResolveErrorRefusesRatherThanFallingThrough(t *testing.T) {
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		return nil, errors.New("simulated resolver failure")
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return false })
+
+	if _, err := dial(context.Background(), "tcp", "broken.example:443"); err == nil {
+		t.Fatal("expected a resolver error to refuse the connection, not fall through to the underlying dialer")
+	}
+	select {
+	case addr := <-fd.dialed:
+		t.Fatalf("underlying dialer must never be called on a resolve error, was called with %s", addr)
+	default:
+	}
+}
+
+func TestPolicyDialerAllowLANSkipsResolutionAndPassesTargetThrough(t *testing.T) {
+	// With allow_lan on, there is nothing to protect, so resolution/pinning
+	// is skipped entirely and the original target reaches the dialer
+	// unmodified -- proven here by making the resolver hook panic if it is
+	// ever called.
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		t.Fatal("resolveHost must not be called when allow_lan is on")
+		return nil, nil
+	})
+
+	fd := newFakeDialer()
+	dial := PolicyDialer(fd.dial, func() bool { return true })
+
+	if _, err := dial(context.Background(), "tcp", "anything.example:443"); err != nil {
+		t.Fatalf("unexpected error with allow_lan on: %v", err)
+	}
+	select {
+	case addr := <-fd.dialed:
+		if addr != "anything.example:443" {
+			t.Fatalf("dialed unexpected target: %s", addr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dialer to be called")
+	}
+}
+
+func TestPolicyDialerLiteral0000AndDoubleColonDeniedByDefault(t *testing.T) {
+	for _, target := range []string{"0.0.0.0:22", "[::]:22"} {
+		t.Run(target, func(t *testing.T) {
+			fd := newFakeDialer()
+			dial := PolicyDialer(fd.dial, func() bool { return false })
+
+			if _, err := dial(context.Background(), "tcp", target); err == nil {
+				t.Fatalf("expected literal unspecified address %s to be denied", target)
+			}
+			select {
+			case addr := <-fd.dialed:
+				t.Fatalf("underlying dialer must never be called, was called with %s", addr)
+			default:
+			}
+		})
+	}
+}
+
+func TestPolicyDialerLiteral0000AllowedWithAllowLAN(t *testing.T) {
+	for _, target := range []string{"0.0.0.0:22", "[::]:22"} {
+		t.Run(target, func(t *testing.T) {
+			fd := newFakeDialer()
+			dial := PolicyDialer(fd.dial, func() bool { return true })
+
+			if _, err := dial(context.Background(), "tcp", target); err != nil {
+				t.Fatalf("unexpected error with allow_lan on: %v", err)
+			}
+			select {
+			case <-fd.dialed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for dialer to be called")
+			}
+		})
+	}
+}
+
+// --- Server end-to-end: hostname->private-IP denial through the real
+// accept/authorize/PolicyDialer stack, not just the PolicyDialer unit -----
+
+func TestServerHostnameResolvingToPrivateIPIsDeniedEndToEnd(t *testing.T) {
+	stubResolveHost(t, func(ctx context.Context, host string) ([]net.IP, error) {
+		if host != "internal.attacker.example" {
+			t.Fatalf("unexpected resolve host %q", host)
+		}
+		return []net.IP{mustParseIP(t, "192.168.2.201")}, nil
+	})
+
+	resolver := &MockIdentityResolver{Identity: &PeerIdentity{LoginName: "alice", SameOwner: true}}
+	fd := newFakeDialer()
+
+	ln, cleanup := startTestServer(t, resolver, fd.dial, false)
+	defer cleanup()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial relay: %v", err)
+	}
+	defer conn.Close()
+
+	rep := socks5Connect(t, conn, "internal.attacker.example", 22)
+	if rep == 0x00 {
+		t.Fatal("expected a non-success SOCKS5 reply for a hostname resolving to a private IP")
+	}
+
+	select {
+	case addr := <-fd.dialed:
+		t.Fatalf("underlying dialer must never be called for a denied resolved address, was called with %s", addr)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no dial happened.
 	}
 }
