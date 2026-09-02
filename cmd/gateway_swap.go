@@ -30,11 +30,10 @@ import (
 // internal/worker; this adapter is what bridges the two, living in cmd/ (which
 // already imports both).
 //
-// Scope: this makes a swapper reference REACHABLE from the gateway. It does
-// NOT make the chat route call EnsureResident — wiring that into
-// resolveChatModel's routing decision, plus the model_warming response
-// contract for a still-warming swap, is #686's larger, deferred scope (see the
-// SetModelSwapper doc comment in internal/gateway/chat_route.go).
+// resolveWithFallback (internal/gateway/chat_route.go) is the actual caller:
+// on a running-engine miss it consults installedLister (see
+// newInstalledModelLister below) and, on a match, calls THIS adapter's
+// EnsureResident before routing.
 type swapManagerAdapter struct {
 	mgr *atomic.Pointer[worker.SwapManager]
 }
@@ -47,16 +46,23 @@ func newSwapManagerAdapter(mgr *atomic.Pointer[worker.SwapManager]) gateway.Mode
 	return &swapManagerAdapter{mgr: mgr}
 }
 
-func (a *swapManagerAdapter) EnsureResident(ctx context.Context, backend, model string) error {
+func (a *swapManagerAdapter) EnsureResident(ctx context.Context, backend, model string) (gateway.SwapOutcome, error) {
 	m := a.mgr.Load()
 	if m == nil {
 		// Hotswap disabled (break-glass), no config dir, or called before
-		// buildNodeJobHandlers has run yet. Not currently reachable (nothing
-		// calls EnsureResident on the gateway path yet — see the package doc
-		// comment), but a clear error rather than a nil-pointer panic is the
-		// right failure mode for whenever #686 wires a real caller.
-		return fmt.Errorf("model swap manager not available on this node")
+		// buildNodeJobHandlers has run yet. A clear error rather than a
+		// nil-pointer panic or a silent "not ready" is the right failure mode
+		// here — resolveWithFallback surfaces it as a 503 upstream_error.
+		return gateway.SwapOutcome{}, fmt.Errorf("model swap manager not available on this node")
 	}
-	_, err := m.EnsureResident(ctx, backend, model)
-	return err
+	outcome, err := m.EnsureResident(ctx, backend, model)
+	if err != nil {
+		return gateway.SwapOutcome{}, err
+	}
+	return gateway.SwapOutcome{
+		Ready:             outcome.Ready,
+		ETASeconds:        outcome.ETASeconds,
+		RetryAfterSeconds: outcome.RetryAfterSeconds,
+		WarmingFor:        outcome.WarmingFor,
+	}, nil
 }

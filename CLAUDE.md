@@ -1905,10 +1905,30 @@ follow-up), each pinned by a test rather than restated here:
   `nodeSwapManager atomic.Pointer[worker.SwapManager]` the heartbeat's swap-stats
   reporting already reads, so `SetModelSwapper` can be called at
   gateway-construction time and resolve correctly once that pointer is
-  populated later — no reordering of the existing startup sequence. This does
-  NOT make the chat route call `EnsureResident`; wiring the swapper INTO the
-  routing decision (the `resolveChatModel` installed-but-stopped fallback, the
-  `model_warming` response contract) is #686's larger, still-open scope.
+  populated later — no reordering of the existing startup sequence.
+  **`resolveWithFallback` (`internal/gateway/chat_route.go`) is the follow-up
+  that actually wires the swapper INTO the routing decision** (the
+  construction-order fix above only made the reference reachable — it did not
+  yet call it): on a `chatLister` (running-engine) miss, it also checks
+  `installedLister` (`cmd/gateway_chat.go`'s `newInstalledModelLister`, which
+  reuses `status.Collector`'s hotswap logic — `applyModelHotswap`/
+  `collectInstalledEngines` — behind its own 30s TTL cache, gated on the SAME
+  `hotswapConfigDir` enable/configDir check the heartbeat's installed-engine
+  advertising already uses) for an installed-but-stopped engine that would
+  serve the model, and calls `EnsureResident` before routing. This is the fix
+  for "one node answers the same question two ways": before it, an
+  installed-but-stopped engine 404'd on the gateway's HTTP chat path even
+  though the SAME node would happily swap it in and serve it via the worker's
+  job path. `EnsureResident` blocks only up to the swap manager's own wait
+  budget (currently 15s, `worker.swapWaitBudget`) — not the full model load —
+  so a swap still in progress when that budget elapses returns a 503 with the
+  `model_warming` contract (top-level `status`/`model`/`eta_seconds`/
+  `retry_after`, plus a standard `Retry-After` header) mirroring the worker
+  job path's identical shape (`LLMInferenceHandler.warming`), rather than
+  blocking the HTTP request for the full load. `citadel serve` never wires
+  `SetModelSwapper` (constructs no `SwapManager`), so the fallback is simply
+  never consulted there — `citadel work --gateway`-only, a documented,
+  deliberate scope boundary, not a gap.
 
 ### Model Hotswap: residency invariant and swap rate bound (citadel #632, #687)
 

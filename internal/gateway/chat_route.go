@@ -84,6 +84,26 @@ func (s *Server) SetRequestRecorder(recorder func(engine string)) {
 	s.requestRecorder = recorder
 }
 
+// SwapOutcome mirrors the fields of worker.SwapOutcome the gateway needs to
+// shape a model_warming HTTP response (citadel-cli#686) — defined locally,
+// with gateway-owned types, for the same reason ModelSwapper is: this package
+// must not import internal/worker (see the ChatUpstream doc comment above).
+type SwapOutcome struct {
+	// Ready is true when the target engine is resident and serving; the
+	// caller then proceeds to the normal proxy path.
+	Ready bool
+	// ETASeconds is the estimated remaining seconds until the model is ready.
+	ETASeconds int
+	// RetryAfterSeconds is the hint a caller should wait before retrying. <= 0
+	// means "use the standard hint" (see warmingRetryAfter).
+	RetryAfterSeconds int
+	// WarmingFor names the model actually loading on this node right now,
+	// which may differ from the requested model when a DIFFERENT swap is
+	// holding the single-flight slot (worker.SwapOutcome.WarmingFor,
+	// citadel-cli#681). Empty when unknown.
+	WarmingFor string
+}
+
 // ModelSwapper is the minimal interface the gateway chat route needs to make an
 // installed-but-not-currently-resident model available before routing a request
 // to it (citadel-cli#686). It is the SAME operation the job path already uses
@@ -91,40 +111,48 @@ func (s *Server) SetRequestRecorder(recorder func(engine string)) {
 // types, rather than by importing internal/worker, so this package keeps the
 // import direction it already has everywhere else (gateway depends on nothing
 // under internal/worker; cmd/, which already imports both, supplies the real
-// adapter via SetModelSwapper). A nil error with the swap still in progress is
-// "warming" (not yet expressible in this narrow interface); the response
-// contract for that case is #686's remaining scope — see the SetModelSwapper
-// doc comment for exactly what this change does and does not do.
+// adapter via SetModelSwapper).
 type ModelSwapper interface {
-	EnsureResident(ctx context.Context, backend, model string) error
+	EnsureResident(ctx context.Context, backend, model string) (SwapOutcome, error)
 }
 
 // SetModelSwapper wires the node's model-hotswap manager to the gateway
-// (citadel-cli#686, construction-order half). This is the fix for the bug the
-// design doc (docs/design-engine-adapter.md §4) describes: a *worker.SwapManager
-// is constructed in cmd/work.go's buildNodeJobHandlers, but that happens AFTER
-// the gateway's chat router is wired (SetChatRouter) and after gw.Start has
-// already been kicked off in its own goroutine — so there was no point in the
-// startup sequence at which a caller could hand the gateway a valid swapper
-// reference at all; the capability existed in the same process but was
-// unreachable from here.
+// (citadel-cli#686). A *worker.SwapManager is constructed in
+// cmd/work.go's buildNodeJobHandlers, which happens AFTER the gateway's chat
+// router is wired (SetChatRouter) and after gw.Start has already been kicked
+// off in its own goroutine (cmd/work.go's runWork) — so there is no point in
+// the startup sequence at which a caller could hand the gateway a valid
+// swapper reference directly. SetModelSwapper is called at
+// gateway-construction time in cmd/, wrapping the SAME
+// atomic.Pointer[worker.SwapManager] the heartbeat's swap-stats reporting
+// already reads (see cmd/work.go's nodeSwapManager), so the adapter resolves
+// to the real manager the moment buildNodeJobHandlers populates that pointer,
+// with no reordering of the existing startup sequence required.
 //
-// Scope of THIS change: it makes a swapper reference reachable from the
-// gateway — SetModelSwapper is called at gateway-construction time in cmd/,
-// wrapping the SAME atomic.Pointer[worker.SwapManager] the heartbeat's swap-stats
-// reporting already reads (see cmd/work.go's nodeSwapManager), so the adapter
-// resolves to the real manager the moment buildNodeJobHandlers populates that
-// pointer, with no reordering of the existing startup sequence required. It does
-// NOT make handleChatCompletions call EnsureResident, and does NOT add the
-// installed-but-stopped fallback in resolveChatModel or the model_warming
-// response contract for a still-warming swap — wiring the swapper INTO the
-// routing decision is #686's larger, deferred scope. Safe to call at any time
-// (mutex-guarded, like SetChatRouter/SetRequestRecorder above); passing nil
-// disables it (the default, unchanged behavior).
+// resolveWithFallback (below) is what actually calls EnsureResident, on a
+// chatLister miss, only when installedLister also names the model as
+// installed-but-stopped. Safe to call at any time (mutex-guarded, like
+// SetChatRouter/SetRequestRecorder above); passing nil disables the fallback
+// entirely (`citadel serve`, which constructs no SwapManager, never calls
+// this — the fallback is then simply never consulted, unchanged from before
+// this existed).
 func (s *Server) SetModelSwapper(swapper ModelSwapper) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.modelSwapper = swapper
+}
+
+// SetInstalledModelLister wires the installed-but-stopped engine lister
+// (citadel-cli#686). Consulted only on a chatLister (running-engine) miss,
+// and only when a ModelSwapper is also wired — without one, a match here
+// could never actually be brought up, so there is nothing useful to do with
+// it. Must be called before Start, like SetChatRouter. Passing nil disables
+// the fallback (the default): a running-engine miss then goes straight to
+// the existing 404 model_not_found, unchanged from before this existed.
+func (s *Server) SetInstalledModelLister(lister ChatModelLister) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.installedLister = lister
 }
 
 // registerChatRoutes wires the chat-routing handlers onto the mux. It is called
@@ -149,6 +177,8 @@ func (s *Server) registerChatRoutes() {
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	lister := s.chatLister
+	installedLister := s.installedLister
+	swapper := s.modelSwapper
 	recorder := s.requestRecorder
 	nodeName := s.config.NodeName
 	s.mu.RUnlock()
@@ -177,7 +207,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &probe)
 	model := strings.TrimSpace(probe.Model)
 
-	port, engine, ok := resolveChatModel(model, lister())
+	port, engine, ok, wrote := s.resolveWithFallback(r.Context(), w, model, lister(), installedLister, swapper)
+	if wrote {
+		// resolveWithFallback already wrote a 503 (model_warming or a swap
+		// error) directly to w; nothing more to do.
+		return
+	}
 	if !ok {
 		writeChatError(w, http.StatusNotFound, "model_not_found",
 			fmt.Sprintf("model %q not served on this node", model))
@@ -223,6 +258,130 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// warmingRetryAfter is the standard Retry-After hint (seconds) when a swap
+// outcome does not name a better one. Mirrors worker.warmingRetryAfter (the
+// job path's identical constant) so a caller sees the same pacing whether it
+// hit the gateway or the job/stream contract.
+const warmingRetryAfter = 10
+
+// resolveWithFallback resolves model to a routable (port, engine), consulting
+// the installed-but-stopped fallback (citadel-cli#686) on a running-engine
+// (lister) miss: this is the fix for "one node answers the same question two
+// ways" — before this, an installed-but-stopped engine 404'd here even though
+// the SAME node would happily swap it in and serve it via the worker's job
+// path.
+//
+// Return contract (mirrors the shape callers of a "did I already handle this"
+// helper expect, since there are three outcomes, not two):
+//   - ok=true: route to (port, engine) normally. wrote is always false here.
+//   - ok=false, wrote=true: this function already wrote the HTTP response (a
+//     503 model_warming, or a 503 swap-error) directly to w. The caller must
+//     return without writing anything else.
+//   - ok=false, wrote=false: no running engine and no installed-but-stopped
+//     match either (or no installedLister/swapper wired). The caller falls
+//     through to its own 404 model_not_found — unchanged from before this
+//     fallback existed.
+//
+// EnsureResident is called with the request's own context, and itself blocks
+// only up to the swap manager's wait budget (worker.swapWaitBudget, currently
+// 15s) before returning Ready=false rather than the full model load — the
+// SAME bound the job path's identical call already accepts, so this does not
+// newly risk holding the HTTP request open for a multi-minute cold start.
+//
+// Known narrow gap, not fixed here (would mean touching swap plumbing, out of
+// #686's scope): worker.SwapManager.EnsureResident's FAST path (the target
+// already resident when called) reports Ready=true from a bare
+// SwapController.Resident check -- "the container is up", NOT "the engine is
+// serving" (see worker/llm_inference.go's own doc comment on this exact
+// distinction, citadel-cli#680). The job path re-probes with
+// ensureEngineReady AFTER its swapper block specifically to cover this; this
+// gateway path does not have an equivalent engine-agnostic readiness probe
+// available to it (internal/gateway deliberately has no internal/status
+// dependency) and instead relies on the reverse proxy's own ErrorHandler
+// (502 upstream_error) if the engine is not yet actually accepting
+// connections. In practice this fast path is reached only when the container
+// is already up but was NOT found by the running-engine lister's own
+// DiscoverModels probe (chatLister only lists engines that already answer),
+// so the window is narrow: a container that just started and has not yet
+// bound its port. A slower-but-honest swap (the non-fast path) already
+// blocks on a REAL SwapController.Ready probe before reporting Ready=true.
+func (s *Server) resolveWithFallback(
+	ctx context.Context,
+	w http.ResponseWriter,
+	model string,
+	running []ChatUpstream,
+	installedLister ChatModelLister,
+	swapper ModelSwapper,
+) (port int, engine string, ok, wrote bool) {
+	if port, engine, ok = resolveChatModel(model, running); ok {
+		return port, engine, true, false
+	}
+	// An empty model must never trigger the installed fallback: resolveChatModel
+	// treats an empty model as "route unambiguously to the only candidate",
+	// which is a reasonable convenience for an ALREADY-RUNNING single-engine
+	// node (nothing changes) but would be a hazard here -- a request that
+	// simply omitted "model" could otherwise induce a real eviction+swap
+	// against a node with exactly one installed-but-stopped engine. Require an
+	// explicit model name before ever calling EnsureResident.
+	if model == "" || installedLister == nil || swapper == nil {
+		return 0, "", false, false
+	}
+	instPort, instEngine, instOK := resolveChatModel(model, installedLister())
+	if !instOK {
+		return 0, "", false, false
+	}
+	outcome, err := swapper.EnsureResident(ctx, instEngine, model)
+	if err != nil {
+		// A node refusing the swap (rate-limited, preflight-blocked, ...) or a
+		// hard failure either way — not "coming soon", so this is a 503
+		// upstream_error rather than model_warming, matching the job path's
+		// unavailable()/failure() split for the same distinction.
+		writeChatError(w, http.StatusServiceUnavailable, "upstream_error",
+			fmt.Sprintf("model %q could not be brought up on this node: %v", model, err))
+		return 0, "", false, true
+	}
+	if !outcome.Ready {
+		writeChatWarming(w, model, outcome.ETASeconds, outcome.RetryAfterSeconds, outcome.WarmingFor)
+		return 0, "", false, true
+	}
+	return instPort, instEngine, true, false
+}
+
+// writeChatWarming writes a 503 signaling the model is being swapped in but
+// not yet ready, mirroring the worker job path's model_warming contract
+// (LLMInferenceHandler.warming, internal/worker/llm_inference.go) so a caller
+// retrying after retry_after seconds is speaking a shape it already knows how
+// to parse, just carried over HTTP instead of the job/stream contract:
+// top-level status/model/eta_seconds/retry_after(/warming_for), alongside an
+// OpenAI-shaped error object for a plain OpenAI-client caller. The standard
+// HTTP Retry-After header (RFC 7231) is set too, so a generic HTTP client
+// backs off correctly even without model_warming-aware parsing.
+func writeChatWarming(w http.ResponseWriter, model string, etaSeconds, retryAfterSeconds int, warmingFor string) {
+	if etaSeconds < 0 {
+		etaSeconds = 0
+	}
+	if retryAfterSeconds <= 0 {
+		retryAfterSeconds = warmingRetryAfter
+	}
+	body := map[string]any{
+		"error": map[string]string{
+			"message": fmt.Sprintf("model %q is warming up on this node", model),
+			"type":    "model_warming",
+		},
+		"status":      "model_warming",
+		"model":       model,
+		"eta_seconds": etaSeconds,
+		"retry_after": retryAfterSeconds,
+	}
+	if warmingFor != "" {
+		body["warming_for"] = warmingFor
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // handleModels returns the OpenAI-compatible /v1/models listing aggregated from
