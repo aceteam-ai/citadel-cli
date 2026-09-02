@@ -154,7 +154,7 @@ func TestRedisPublishRecordsMarkerOnSuccess(t *testing.T) {
 // TestRedisPublishDoesNotMoveMarkerOnFailure proves a failed durable write
 // leaves LastSuccessAt where it was (never advances it on failure) while
 // still recording the attempt and the failure count -- the distinction
-// printHeartbeatFreshness relies on to tell "stopped publishing" apart from
+// BackendHealth (cmd's printBackendHealth) relies on to tell "stopped publishing" apart from
 // "publishing but failing".
 func TestRedisPublishDoesNotMoveMarkerOnFailure(t *testing.T) {
 	pub, _, _ := newTestRedisPublisher(t)

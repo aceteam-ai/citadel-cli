@@ -55,7 +55,13 @@ var statusCmd = &cobra.Command{
 	Short:   "Shows a comprehensive status of the Citadel node",
 	Long: `Provides a full health check and resource overview of the Citadel node.
 It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
-and the state of all managed services.`,
+and the state of all managed services.
+
+The Backend: line reports whether this node's durable heartbeat write is
+reaching the AceTeam control plane (reachable/degraded/DOWN/unknown). Note:
+in direct-Redis mode this measures reachability of redis.aceteam.ai, not the
+HTTPS API; in the normal API mode (post-'citadel init'), they are the same
+backend.`,
 	Example: `  # View full node status with colors
   citadel status
 
@@ -155,7 +161,7 @@ func printWorkerInfo(w io.Writer) {
 		// missing marker is exactly the "no signal must not read as healthy"
 		// case #726 asks for, and a marker left over from a crashed worker is
 		// informative on its own.
-		printHeartbeatFreshness(w)
+		printBackendHealth(w)
 		return
 	}
 	detail := fmt.Sprintf("PID %d", pid)
@@ -169,52 +175,70 @@ func printWorkerInfo(w io.Writer) {
 	}
 	fmt.Fprintf(w, "  %s\t%s (%s)\n", labelColor.Sprint("Status:"), goodColor.Sprint("running"), detail)
 	printPubSubInfo(w)
-	printHeartbeatFreshness(w)
+	printBackendHealth(w)
 }
 
-// printHeartbeatFreshness reports how long ago this node's DURABLE heartbeat
-// write (the `node:status:stream` XADD / StreamAdd) last succeeded
-// (citadel-cli#726). It is the node-local complement to printPubSubInfo: that
-// function reports the live worker's best-effort pub/sub transport, while
-// this one reports the reliable stream write the platform actually uses to
-// decide whether the node is online -- the fact a healthy-looking node in
-// citadel-cli#722 had no way to check about itself for 12 hours.
+// printBackendHealth reports node<->backend connectivity health as a single
+// `Backend:` line (citadel-cli#429 Part 1), derived from the same
+// cross-process heartbeat marker citadel-cli#726 introduced (the durable
+// `node:status:stream` XADD/StreamAdd write, recorded by
+// internal/heartbeat.RecordSuccess/RecordFailure on every attempt). This
+// supersedes the older two-value "Heartbeat: OK/STALE" line with
+// heartbeat.BackendHealth's 4-state classification (reachable / degraded /
+// down / unknown) -- one signal, one line, so an operator does not have to
+// reconcile a freshness verdict against a separately-read failure count.
 //
-// Reads a marker file the publisher writes on every publish attempt
-// (internal/heartbeat.RecordSuccess/RecordFailure) rather than talking to the
-// worker process, since the worker (`citadel work`) and `citadel status` are
-// separate processes -- the marker is the only cross-process channel. An
-// absent marker (fresh install, worker never published, or a config dir the
-// live worker does not share) is reported as "unknown", never as healthy.
-func printHeartbeatFreshness(w io.Writer) {
+// Reads the marker file rather than talking to the worker process, since the
+// worker (`citadel work`) and `citadel status` are separate processes -- the
+// marker is the only cross-process channel available to a short-lived
+// `citadel status` invocation. An absent/never-succeeded-and-not-attempting
+// marker (fresh install, worker never published, or a config dir the live
+// worker does not share) is reported as "unknown", never as healthy.
+//
+// Semantics caveat: in direct-Redis mode this measures reachability of
+// redis.aceteam.ai, not the HTTPS API; in API mode (the normal
+// post-`citadel init` configuration) they are the same backend, since the
+// API IS the path to Redis. v1 does not distinguish the two -- this line
+// reports whichever backend the node's own heartbeat PATH targets, not
+// necessarily "the AceTeam API" specifically.
+func printBackendHealth(w io.Writer) {
 	m := heartbeat.LoadMarker(network.GetNodeConfigDir())
-	label := labelColor.Sprint("Heartbeat:")
-	state, age := heartbeat.Freshness(m, time.Now(), heartbeat.DefaultStaleAfter)
+	label := labelColor.Sprint("Backend:")
+	state, age := heartbeat.BackendHealth(m, time.Now())
+
+	// "last ok Xs ago" is shown for every state that has a recorded success,
+	// including degraded/down, per the design's "show it always" call --
+	// operators reading STALE/degraded lines still want the same age figure
+	// without having to compute it from a raw timestamp.
+	lastOK := ""
+	if !m.LastSuccessAt.IsZero() {
+		lastOK = fmt.Sprintf("last ok %s ago", age.Round(time.Second))
+	}
 
 	switch state {
-	case heartbeat.FreshnessUnknown:
-		fmt.Fprintf(w, "  %s\t%s\n", label,
-			faintColor.Sprint("unknown (no successful durable heartbeat write recorded for this node yet)"))
-	case heartbeat.FreshnessStale:
-		detail := fmt.Sprintf("last success %s ago", age.Round(time.Second))
-		// LastAttemptAt distinguishes "the worker is alive and every write is
-		// failing" (fresh attempt, stale success) from "the worker stopped
-		// publishing entirely" (attempt also stale) -- the two scenarios call
-		// for different operator action, so surface both timestamps rather
-		// than collapsing them into one "stale" verdict.
-		if !m.LastAttemptAt.IsZero() && !m.LastAttemptAt.Equal(m.LastSuccessAt) {
-			detail += fmt.Sprintf(", last attempt %s ago", time.Since(m.LastAttemptAt).Round(time.Second))
-		}
+	case heartbeat.BackendReachable:
+		fmt.Fprintf(w, "  %s\t%s\n", label, goodColor.Sprintf("reachable (%s)", lastOK))
+	case heartbeat.BackendDegraded:
+		detail := lastOK
 		if m.ConsecutiveFailures > 0 {
-			detail += fmt.Sprintf(", %d consecutive failure(s)", m.ConsecutiveFailures)
+			detail += fmt.Sprintf(", %d consecutive failures", m.ConsecutiveFailures)
 		}
 		if m.LastError != "" {
 			detail += fmt.Sprintf(": %s", m.LastError)
 		}
+		fmt.Fprintf(w, "  %s\t%s\n", label, warnColor.Sprintf("degraded (%s)", detail))
+	case heartbeat.BackendDown:
+		detail := lastOK
+		if lastOK == "" {
+			detail = "never reached"
+		}
+		if m.LastError != "" {
+			detail += fmt.Sprintf(": %s", m.LastError)
+		}
+		fmt.Fprintf(w, "  %s\t%s\n", label, badColor.Sprintf("DOWN (%s)", detail))
+	default: // BackendUnknown
 		fmt.Fprintf(w, "  %s\t%s\n", label,
-			warnColor.Sprint("STALE -- "+detail+" (the node's heartbeat may not be landing upstream)"))
-	default: // FreshnessOK
-		fmt.Fprintf(w, "  %s\t%s\n", label, goodColor.Sprintf("last success %s ago", age.Round(time.Second)))
+			faintColor.Sprint("unknown (worker not publishing)"))
 	}
 }
 
@@ -547,18 +571,16 @@ func gatherStatusData() (dashboard.StatusData, error) {
 		}
 	}
 
-	// Heartbeat freshness (citadel-cli#726). Age is derivable from
-	// HeartbeatLastSuccessAt by callers, so it is not duplicated on the wire.
+	// Backend connectivity health (citadel-cli#429 Part 1). Age is derivable
+	// from BackendLastSuccessAt by callers, so it is not duplicated on the
+	// wire.
 	if m := heartbeat.LoadMarker(network.GetNodeConfigDir()); m != nil {
-		state, _ := heartbeat.Freshness(m, time.Now(), heartbeat.DefaultStaleAfter)
-		data.HeartbeatKnown = state != heartbeat.FreshnessUnknown
-		if data.HeartbeatKnown {
-			data.HeartbeatLastSuccessAt = m.LastSuccessAt
-			data.HeartbeatStale = state == heartbeat.FreshnessStale
-		}
-		data.HeartbeatLastAttemptAt = m.LastAttemptAt
-		data.HeartbeatConsecutiveFailures = m.ConsecutiveFailures
-		data.HeartbeatLastError = m.LastError
+		state, _ := heartbeat.BackendHealth(m, time.Now())
+		data.BackendState = state.String()
+		data.BackendLastSuccessAt = m.LastSuccessAt
+		data.BackendLastAttemptAt = m.LastAttemptAt
+		data.BackendConsecutiveFailures = m.ConsecutiveFailures
+		data.BackendLastError = m.LastError
 	}
 
 	return data, nil
