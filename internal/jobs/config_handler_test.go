@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -161,5 +162,91 @@ services:
 	// change to the field type silently produces a DeepEqual-but-omitted encode.
 	if !strings.Contains(string(data), "pinned_services:") {
 		t.Fatalf("round-tripped manifest is missing the pinned_services key entirely:\n%s", data)
+	}
+}
+
+// TestDeviceConfig_EgressRelayUnmarshal pins the same absent(nil)-vs-explicit
+// pointer contract as MeetingEnabled/EnergySampling: an omitted field must
+// decode to nil (leave the persisted toggle untouched), never to a
+// zero-value false that would silently disable the relay on every
+// unrelated device-config push.
+func TestDeviceConfig_EgressRelayUnmarshal(t *testing.T) {
+	t.Run("absent -> nil", func(t *testing.T) {
+		var c DeviceConfig
+		if err := json.Unmarshal([]byte(`{"deviceName":"n"}`), &c); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if c.EgressRelay != nil {
+			t.Errorf("absent egressRelay should be nil, got %v", *c.EgressRelay)
+		}
+		if c.EgressAllowLan != nil {
+			t.Errorf("absent egressAllowLan should be nil, got %v", *c.EgressAllowLan)
+		}
+	})
+
+	t.Run("explicit false -> non-nil false", func(t *testing.T) {
+		var c DeviceConfig
+		if err := json.Unmarshal([]byte(`{"egressRelay":false}`), &c); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if c.EgressRelay == nil {
+			t.Fatal("explicit egressRelay:false should be non-nil")
+		}
+		if *c.EgressRelay {
+			t.Error("expected false")
+		}
+	})
+}
+
+// TestApplyEgressRelayConfig_NoOpWhenBothNil pins that a device config
+// mentioning neither field never touches the config directory at all -- not
+// even to write back an unchanged default.
+func TestApplyEgressRelayConfig_NoOpWhenBothNil(t *testing.T) {
+	dir := t.TempDir()
+	if got := applyEgressRelayConfig(dir, &DeviceConfig{DeviceName: "n"}); got != "" {
+		t.Errorf("expected no-op result, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "egress-relay.yaml")); !os.IsNotExist(err) {
+		t.Errorf("expected no egress-relay.yaml to be written, stat err = %v", err)
+	}
+}
+
+// TestApplyEgressRelayConfig_AppliesAndPreservesOtherField drives
+// applyEgressRelayConfig directly (a pure function parameterized by
+// relayConfigDir -- see its doc comment for why this is NOT exercised
+// through Execute()/network.GetNodeConfigDir() in a test): a device config
+// that sets only EgressRelay must persist to egress-relay.yaml, and a LATER
+// call that sets only EgressAllowLan must leave the first call's EgressRelay
+// value intact (load-modify-save, not a fresh struct that would silently
+// flip it back to the default).
+func TestApplyEgressRelayConfig_AppliesAndPreservesOtherField(t *testing.T) {
+	dir := t.TempDir()
+
+	enable := true
+	msg := applyEgressRelayConfig(dir, &DeviceConfig{DeviceName: "n", EgressRelay: &enable})
+	if !strings.Contains(msg, "Egress relay enabled") {
+		t.Errorf("expected result message to mention egress relay enabled, got %q", msg)
+	}
+
+	relay := citadelconfig.LoadEgressRelay(dir)
+	if !relay.Enabled {
+		t.Fatal("expected egress relay enabled after first call")
+	}
+	if relay.AllowLAN {
+		t.Fatal("expected allow_lan to remain false after first call")
+	}
+
+	allowLAN := true
+	msg = applyEgressRelayConfig(dir, &DeviceConfig{DeviceName: "n", EgressAllowLan: &allowLAN})
+	if !strings.Contains(msg, "LAN/mesh destinations enabled") {
+		t.Errorf("expected result message to mention allow_lan enabled, got %q", msg)
+	}
+
+	relay = citadelconfig.LoadEgressRelay(dir)
+	if !relay.Enabled {
+		t.Fatal("expected egress relay to remain enabled after second call (load-modify-save)")
+	}
+	if !relay.AllowLAN {
+		t.Fatal("expected allow_lan enabled after second call")
 	}
 }
