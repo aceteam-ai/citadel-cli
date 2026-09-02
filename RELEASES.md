@@ -2220,3 +2220,18 @@ Auto-generated log of every release.
   - engine-adapter slice 2: migrate status/mesh read paths to internal/engine (#981)
 
 
+---
+
+## v2.142.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +881 |
+
+**Changes:**
+
+  - Report WhatsApp bridge endpoints in ActualState (Phase A of #624) (#983)
+
+
