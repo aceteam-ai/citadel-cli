@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"time"
@@ -274,10 +275,12 @@ func showAccessInfoWithCheck() {
 	if exposePeers {
 		checkPeerServices()
 	} else {
-		// Check local services
+		// Check local services. These are OWN-NODE checks: probe loopback,
+		// not this node's own mesh IP (see checkServicePort's doc comment
+		// for why the mesh dial is a false negative here).
 		fmt.Println("Checking local service ports...")
 		for name, port := range servicePorts {
-			checkServicePort(status.IPv4, port, name)
+			checkServicePort(status.IPv4, port, name, true)
 		}
 	}
 }
@@ -301,19 +304,61 @@ func checkPeerServices() {
 
 		fmt.Printf("\n%s (%s):\n", peer.Hostname, peer.IP)
 		for name, port := range servicePorts {
-			checkServicePort(peer.IP, port, name)
+			checkServicePort(peer.IP, port, name, false)
 		}
 	}
 }
 
+// serviceCheckTarget is the resolved address/dial-strategy for a single
+// `expose --check` probe.
+type serviceCheckTarget struct {
+	// Addr is the host:port to dial.
+	Addr string
+	// UseMesh selects the dial mechanism: true dials over the AceTeam
+	// Network (network.Dial, for a peer's mesh IP); false dials plain
+	// loopback (net.Dialer, for this node's own services).
+	UseMesh bool
+}
+
+// resolveServiceCheckTarget decides how `expose --check` should reach a
+// service. This is the fix for citadel-cli#429 Part 2: userspace tsnet
+// cannot dial this node's OWN mesh IP back to a host-bound docker-proxy
+// socket on the same machine (a known tsnet self-dial artifact), so a
+// perfectly healthy own-node service was reported unreachable. Own-node
+// checks must therefore probe loopback (127.0.0.1) directly rather than
+// going out over the mesh to reach themselves. Peer checks are unaffected
+// and must keep dialing the peer's actual mesh IP via network.Dial.
+func resolveServiceCheckTarget(isOwnNode bool, ip string, port int) serviceCheckTarget {
+	if isOwnNode {
+		return serviceCheckTarget{
+			Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+			UseMesh: false,
+		}
+	}
+	return serviceCheckTarget{
+		Addr:    fmt.Sprintf("%s:%d", ip, port),
+		UseMesh: true,
+	}
+}
+
 // checkServicePort attempts to connect to a port and reports success/failure.
-func checkServicePort(ip string, port int, serviceName string) {
-	addr := fmt.Sprintf("%s:%d", ip, port)
+// isOwnNode selects the dial target/mechanism via resolveServiceCheckTarget:
+// true for this node's own services (loopback), false for a peer's services
+// (mesh dial via network.Dial).
+func checkServicePort(ip string, port int, serviceName string, isOwnNode bool) {
+	target := resolveServiceCheckTarget(isOwnNode, ip, port)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	conn, err := network.Dial(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+	if target.UseMesh {
+		conn, err = network.Dial(ctx, "tcp", target.Addr)
+	} else {
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "tcp", target.Addr)
+	}
 	if err != nil {
 		badColor.Printf("  %s (:%d): ❌ unreachable\n", serviceName, port)
 		return
