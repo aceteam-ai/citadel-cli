@@ -148,6 +148,11 @@ var (
 	workGatewayEmbedding int
 	workGatewayNoTLS     bool
 	workGatewayCertDir   string
+
+	// Egress relay flag (citadel #787): forces the relay on regardless of
+	// resolveEgressRelay()'s env/config resolution, mirroring how other
+	// work-mode toggles let an explicit flag override the persisted default.
+	workEgressRelay bool
 )
 
 var workCmd = &cobra.Command{
@@ -2219,6 +2224,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// mesh. Best-effort and unconditional: never fails the worker.
 	startCobrowseStreamServer()
 
+	// Start the on-node SOCKS5 egress relay (citadel #787), when enabled. See
+	// resolveEgressRelay for the enable precedence; no-op (logged) when off or
+	// not connected to the AceTeam Network. Never fails the worker.
+	startEgressRelay(ctx)
+
 	// Start in-process HTTPS gateway if enabled
 	if workGateway {
 		// Validate that gateway port does not collide with upstream ports
@@ -2788,6 +2798,54 @@ func resolveEnergySampling() bool {
 		return update.IsTruthy(raw)
 	}
 	return config.LoadEnergy(platform.ConfigDir()).SamplingEnabled
+}
+
+// resolveEgressRelay decides whether `citadel work` starts the on-node SOCKS5
+// egress relay listener (citadel #787). Default OFF. Precedence: the
+// CITADEL_EGRESS_RELAY env var wins when set (truthy enables, anything else
+// disables); otherwise the node's persisted egress-relay.yaml toggle applies,
+// which the platform can set via APPLY_DEVICE_CONFIG or an operator via
+// 'citadel egress-relay enable'. Reads from network.GetNodeConfigDir() -- the
+// machine-convergent directory, not platform.ConfigDir() -- so this agrees
+// with the CLI and the local MCP tool regardless of which invocation context
+// wrote it (see internal/jobs.applyEgressRelayConfig's doc comment for why
+// that distinction matters here, and for why the actual config-dir
+// resolution is NOT exercised directly in a test -- see
+// resolveEgressRelayFrom below).
+func resolveEgressRelay() bool {
+	return resolveEgressRelayFrom(network.GetNodeConfigDir())
+}
+
+// resolveEgressRelayFrom is resolveEgressRelay's pure core, parameterized by
+// configDir. Split out so it is hermetically testable: network.GetNodeConfigDir()
+// resolves to a MACHINE-GLOBAL path (via /etc/citadel/config.yaml when
+// present) that a test's $HOME override cannot redirect, so a test must never
+// call resolveEgressRelay() itself when asserting a config-file-driven
+// result -- doing so risks reading (or, transitively through a seeding
+// SaveEgressRelay call, WRITING) a real node's actual config directory on a
+// machine that happens to run one.
+func resolveEgressRelayFrom(configDir string) bool {
+	if raw := strings.TrimSpace(os.Getenv("CITADEL_EGRESS_RELAY")); raw != "" {
+		return update.IsTruthy(raw)
+	}
+	return config.LoadEgressRelay(configDir).Enabled
+}
+
+// resolveEgressAllowLAN decides whether the egress relay's LAN/mesh
+// destination deny-list is disabled. Same precedence/config-dir reasoning as
+// resolveEgressRelay.
+func resolveEgressAllowLAN() bool {
+	return resolveEgressAllowLANFrom(network.GetNodeConfigDir())
+}
+
+// resolveEgressAllowLANFrom is resolveEgressAllowLAN's pure core. See
+// resolveEgressRelayFrom's doc comment for why tests must use this, not
+// resolveEgressAllowLAN, to assert a config-file-driven result.
+func resolveEgressAllowLANFrom(configDir string) bool {
+	if raw := strings.TrimSpace(os.Getenv("CITADEL_EGRESS_ALLOW_LAN")); raw != "" {
+		return update.IsTruthy(raw)
+	}
+	return config.LoadEgressRelay(configDir).AllowLAN
 }
 
 // sensitiveCapabilityPasscodeWarning returns a single warning line when a
@@ -3788,6 +3846,9 @@ func init() {
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")
 	workCmd.Flags().StringVar(&workGatewayCertDir, "gateway-cert-dir", "", "Custom directory for gateway TLS certificates")
 	workCmd.Flags().MarkHidden("gateway-no-tls")
+
+	// Egress relay flag (citadel #787)
+	workCmd.Flags().BoolVar(&workEgressRelay, "egress-relay", false, "Force-enable the on-node SOCKS5 egress relay regardless of persisted config/env (see 'citadel egress-relay')")
 }
 
 // initProvisionHandler creates a provision.Handler backed by the Docker

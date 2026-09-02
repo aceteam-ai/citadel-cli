@@ -15,6 +15,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -27,6 +28,54 @@ func enabledLabel(enabled bool) string {
 		return "enabled"
 	}
 	return "disabled"
+}
+
+// applyEgressRelayConfig applies the EgressRelay/EgressAllowLan device-config
+// pointers (citadel #787) to the persisted egress-relay.yaml at
+// relayConfigDir, load-modify-save (only the fields the platform actually set
+// are touched; the other field's persisted value survives untouched). Returns
+// a message suffix describing what happened (possibly "").
+//
+// relayConfigDir is an explicit parameter -- not resolved internally via
+// network.GetNodeConfigDir() -- specifically so this function is a pure,
+// hermetically-testable unit: network.GetNodeConfigDir() resolves to a
+// MACHINE-GLOBAL path (via /etc/citadel/config.yaml when present) that a
+// test's $HOME override cannot redirect, so calling it directly from a test
+// risks writing into a real node's actual config directory on a machine that
+// happens to run one (exactly the hazard documented at length in this repo's
+// CLAUDE.md/worktree memory around --node-dir and GetNodeConfigDir()). The
+// ONE production call site (Execute, below) passes network.GetNodeConfigDir()
+// -- the machine-convergent directory, NOT platform.ConfigDir() -- because
+// this value must read back identically for a systemd-root `citadel work`, an
+// interactive `citadel egress-relay status`, and a `citadel mcp` process,
+// which is exactly the cross-invocation-context divergence
+// platform.ConfigDir() cannot guarantee (see CLAUDE.md's
+// ConfigDir()/GetNodeConfigDir() note).
+func applyEgressRelayConfig(relayConfigDir string, config *DeviceConfig) string {
+	if config.EgressRelay == nil && config.EgressAllowLan == nil {
+		return ""
+	}
+
+	relay := citadelconfig.LoadEgressRelay(relayConfigDir)
+	if config.EgressRelay != nil {
+		relay.Enabled = *config.EgressRelay
+	}
+	if config.EgressAllowLan != nil {
+		relay.AllowLAN = *config.EgressAllowLan
+	}
+
+	if err := citadelconfig.SaveEgressRelay(relayConfigDir, relay); err != nil {
+		return fmt.Sprintf("\nWarning: failed to persist egress relay config: %v", err)
+	}
+
+	var result string
+	if config.EgressRelay != nil {
+		result += fmt.Sprintf("\nEgress relay %s (takes effect on next worker start)", enabledLabel(*config.EgressRelay))
+	}
+	if config.EgressAllowLan != nil {
+		result += fmt.Sprintf("\nEgress relay LAN/mesh destinations %s (takes effect on next worker start)", enabledLabel(*config.EgressAllowLan))
+	}
+	return result
 }
 
 // serviceNamePattern validates service names to prevent path traversal.
@@ -91,6 +140,22 @@ type DeviceConfig struct {
 	// node (it adds an nvidia-smi power probe per tick), so the platform must send
 	// `true` here to turn it on.
 	EnergySampling *bool `json:"energySampling,omitempty"`
+
+	// EgressRelay is the programmatic opt-IN for the on-node SOCKS5 egress relay
+	// (citadel #787). Pointer for the same absent(nil)-vs-explicit reason as the
+	// other *Enabled flags: an omitted field leaves the node's persisted
+	// egress-relay toggle untouched. A non-nil value writes the same
+	// egress-relay.yaml the `citadel egress-relay` CLI and the local MCP tool
+	// read/write. Default-OFF on a fresh node, and even when enabled the relay
+	// only serves a same-org verified mesh peer (network.WhoIsPeer) — there is no
+	// token/passcode fallback for it.
+	EgressRelay *bool `json:"egressRelay,omitempty"`
+	// EgressAllowLan is the programmatic opt-IN for the egress relay's LAN/mesh
+	// pivot destination policy (citadel #787). Pointer for the same reason as
+	// EgressRelay: nil leaves the persisted value untouched. Default-OFF (deny
+	// RFC1918/loopback/link-local/CGNAT destinations); a non-nil `true` lets an
+	// authorized peer CONNECT into this node's own LAN/mesh through the relay.
+	EgressAllowLan *bool `json:"egressAllowLan,omitempty"`
 
 	// NodePasscode sets (or, when empty, clears) the per-node passcode that gates
 	// the sensitive surfaces (aceteam#6524). Pointer so nil leaves the stored
@@ -216,6 +281,11 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			result += fmt.Sprintf("\nEnergy sampling %s (takes effect on next worker start)", enabledLabel(*config.EnergySampling))
 		}
 	}
+
+	// Apply the egress-relay opt-in (citadel #787) when the platform pushed an
+	// explicit value. See applyEgressRelayConfig's doc comment for why this is
+	// written to network.GetNodeConfigDir() rather than platform.ConfigDir().
+	result += applyEgressRelayConfig(network.GetNodeConfigDir(), &config)
 
 	// Apply the sensitive-surface permissions + passcode (aceteam#6524) when the
 	// platform pushed any of them. Load-modify-save the same permissions.yaml the

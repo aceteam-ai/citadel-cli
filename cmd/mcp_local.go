@@ -39,9 +39,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/mesh"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -96,6 +98,15 @@ type localMCPDeps struct {
 	// inject stubs so exercising the tool wiring never reads a live
 	// manifest, container runtime, or GPU.
 	reservations localReservationOps
+
+	// egressRelayConfigDir resolves the directory the egress-relay config file
+	// (egress-relay.yaml) lives in, backing local_egress_relay_status/_set
+	// (citadel #787). Production wires network.GetNodeConfigDir -- the SAME
+	// machine-convergent directory the `citadel egress-relay` CLI and the
+	// APPLY_DEVICE_CONFIG handler read/write, so a `citadel mcp` process never
+	// disagrees with those about the persisted value. Tests inject a func
+	// returning a tempdir.
+	egressRelayConfigDir func() string
 }
 
 // moduleControlFn is the shape of the actual stop/start/restart action. See
@@ -106,11 +117,12 @@ type moduleControlFn func(name string, action moduleAction) (string, error)
 // `citadel mcp` process (cmd/mcp.go:runMCP), not per request.
 func realLocalMCPDeps() localMCPDeps {
 	return localMCPDeps{
-		moduleControl: runModuleControlCaptured,
-		chatLister:    newLocalChatLister(),
-		chatClient:    mesh.NewClient((&net.Dialer{}).DialContext),
-		workspaceDir:  resolveWorkspaceDir(),
-		reservations:  realLocalReservationOps(),
+		moduleControl:        runModuleControlCaptured,
+		chatLister:           newLocalChatLister(),
+		chatClient:           mesh.NewClient((&net.Dialer{}).DialContext),
+		workspaceDir:         resolveWorkspaceDir(),
+		reservations:         realLocalReservationOps(),
+		egressRelayConfigDir: network.GetNodeConfigDir,
 	}
 }
 
@@ -122,6 +134,7 @@ func newLocalMCPTools(deps localMCPDeps) []localMCPTool {
 	tools = append(tools, newLocalInferenceTools(deps)...)
 	tools = append(tools, newLocalFileTools(deps.workspaceDir)...)
 	tools = append(tools, newModelExclusivityTools(deps)...)
+	tools = append(tools, newEgressRelayTools(deps)...)
 	return tools
 }
 
@@ -1058,4 +1071,109 @@ func captureStdout(fn func() error) (out string, err error) {
 
 	err = fn()
 	return
+}
+
+// ============================================================================
+// Local egress-relay config tools (citadel #787)
+// ============================================================================
+
+// newEgressRelayTools builds local_egress_relay_status and
+// local_egress_relay_set: a get/set pair over the SAME persisted
+// egress-relay.yaml the `citadel egress-relay` CLI (cmd/egress_relay.go) and
+// the APPLY_DEVICE_CONFIG handler (internal/jobs/config_handler.go) read and
+// write, so all three configuration surfaces converge on one value. Neither
+// tool shells out or touches os.Stdout, so unlike the module-control tools
+// they do not need captureStdout.
+func newEgressRelayTools(deps localMCPDeps) []localMCPTool {
+	status := localMCPTool{
+		Name: "local_egress_relay_status",
+		Description: "Show THIS node's on-node SOCKS5 egress relay configuration (citadel #787): " +
+			"whether the relay is enabled, and whether it allows an authorized peer to CONNECT into " +
+			"this node's own LAN/mesh (allow_lan). The relay lets ANOTHER citadel node tunnel outbound " +
+			"traffic through this node; it is off by default and, even when on, only serves a same-org " +
+			"verified mesh peer. Changes take effect on the next 'citadel work' start, not immediately.",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		},
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return localEgressRelayStatusCall(deps)
+		},
+	}
+
+	set := localMCPTool{
+		Name: "local_egress_relay_set",
+		Description: "Set THIS node's on-node SOCKS5 egress relay configuration (citadel #787). Both " +
+			"fields are optional pointers -- omit a field to leave its current persisted value " +
+			"untouched. Takes effect on the next 'citadel work' start, not immediately (the relay " +
+			"listener is started once at worker startup). LOCAL authority: runs on this node for the " +
+			"node owner, no AceTeam platform round-trip.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"enabled": map[string]any{
+					"type":        "boolean",
+					"description": "Enable/disable the relay listener. Omit to leave unchanged.",
+				},
+				"allow_lan": map[string]any{
+					"type":        "boolean",
+					"description": "Allow (true) or deny (false, the default) an authorized peer CONNECTing into this node's own LAN/mesh through the relay. Omit to leave unchanged.",
+				},
+			},
+		},
+		Call: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return localEgressRelaySetCall(deps, args)
+		},
+	}
+
+	return []localMCPTool{status, set}
+}
+
+func egressRelayConfigDirOrDefault(deps localMCPDeps) string {
+	if deps.egressRelayConfigDir != nil {
+		return deps.egressRelayConfigDir()
+	}
+	return network.GetNodeConfigDir()
+}
+
+func localEgressRelayStatusCall(deps localMCPDeps) (string, error) {
+	relay := config.LoadEgressRelay(egressRelayConfigDirOrDefault(deps))
+	data, err := json.Marshal(relay)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func localEgressRelaySetCall(deps localMCPDeps, args json.RawMessage) (string, error) {
+	var in struct {
+		Enabled  *bool `json:"enabled,omitempty"`
+		AllowLan *bool `json:"allow_lan,omitempty"`
+	}
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &in); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+	}
+	if in.Enabled == nil && in.AllowLan == nil {
+		return "", fmt.Errorf("at least one of 'enabled' or 'allow_lan' must be set")
+	}
+
+	configDir := egressRelayConfigDirOrDefault(deps)
+	relay := config.LoadEgressRelay(configDir)
+	if in.Enabled != nil {
+		relay.Enabled = *in.Enabled
+	}
+	if in.AllowLan != nil {
+		relay.AllowLAN = *in.AllowLan
+	}
+	if err := config.SaveEgressRelay(configDir, relay); err != nil {
+		return "", fmt.Errorf("failed to save egress relay config: %w", err)
+	}
+
+	data, err := json.Marshal(relay)
+	if err != nil {
+		return "", err
+	}
+	return string(data) + "\n(takes effect on the next 'citadel work' start)", nil
 }
