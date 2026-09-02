@@ -5,15 +5,23 @@ import (
 	"testing"
 )
 
-// fakeModelSwapper is a minimal ModelSwapper for tests; it never actually
-// swaps anything, it just proves it was reached.
+// fakeModelSwapper is a minimal ModelSwapper for tests; it just proves it was
+// reached and records every call. outcome/err let a test configure what
+// EnsureResident reports (a warming outcome, a ready outcome, or a failure);
+// the zero value reports SwapOutcome{Ready: false} (i.e. still warming) with
+// no error, which is the honest zero value, not a stand-in for success.
 type fakeModelSwapper struct {
-	calls []string
+	calls   []string
+	outcome SwapOutcome
+	err     error
 }
 
-func (f *fakeModelSwapper) EnsureResident(_ context.Context, backend, model string) error {
+func (f *fakeModelSwapper) EnsureResident(_ context.Context, backend, model string) (SwapOutcome, error) {
 	f.calls = append(f.calls, backend+"/"+model)
-	return nil
+	if f.err != nil {
+		return SwapOutcome{}, f.err
+	}
+	return f.outcome, nil
 }
 
 // TestModelSwapper_DefaultsToNil pins the pre-#686 behavior: a gateway with no
@@ -52,7 +60,7 @@ func TestSetModelSwapper_ReachableFromChatRoutePath(t *testing.T) {
 	}
 	// Exercise it through the interface the way a future caller would, to
 	// confirm it is a live, callable reference, not just a stored pointer.
-	if err := got.EnsureResident(context.Background(), "vllm", "some-model"); err != nil {
+	if _, err := got.EnsureResident(context.Background(), "vllm", "some-model"); err != nil {
 		t.Fatalf("EnsureResident() error = %v", err)
 	}
 	if len(swapper.calls) != 1 || swapper.calls[0] != "vllm/some-model" {

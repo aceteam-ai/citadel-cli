@@ -37,7 +37,7 @@ func TestSwapManagerAdapter_NotAvailableBeforeStore(t *testing.T) {
 	var ptr atomic.Pointer[worker.SwapManager]
 	adapter := newSwapManagerAdapter(&ptr)
 
-	err := adapter.EnsureResident(context.Background(), "vllm", "some-model")
+	_, err := adapter.EnsureResident(context.Background(), "vllm", "some-model")
 	if err == nil {
 		t.Fatal("expected an error before the swap manager is populated, got nil")
 	}
@@ -59,7 +59,11 @@ func TestSwapManagerAdapter_UsesLatestStoredManager(t *testing.T) {
 	mgr := worker.NewSwapManager(stubSwapController{})
 	ptr.Store(mgr)
 
-	if err := adapter.EnsureResident(context.Background(), "vllm", "some-model"); err != nil {
+	outcome, err := adapter.EnsureResident(context.Background(), "vllm", "some-model")
+	if err != nil {
 		t.Fatalf("EnsureResident() error = %v, want nil once the manager is populated", err)
+	}
+	if !outcome.Ready {
+		t.Fatalf("outcome.Ready = false, want true (stubSwapController reports every backend already resident)")
 	}
 }

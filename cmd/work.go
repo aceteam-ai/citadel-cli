@@ -2364,6 +2364,16 @@ func runWork(cmd *cobra.Command, args []string) {
 		// and /v1/models) with model->engine resolution so mesh-direct chat to this
 		// node reaches whichever local engine serves the requested model.
 		gw.SetChatRouter(newLocalChatLister())
+		// Installed-but-stopped fallback (citadel-cli#686): on a running-engine
+		// miss, resolveWithFallback also checks whether an installed-but-stopped
+		// engine would serve the model and, if so, swaps it in via the
+		// gw.SetModelSwapper wired above before routing -- closing the "one node
+		// answers the same question two ways" gap between this HTTP path and the
+		// worker job path's hotswap. hotswapConfigDir(workConfigDir) applies the
+		// SAME enable/configDir gate the heartbeat's installed-engine advertising
+		// already uses, so this fallback is live exactly when the heartbeat would
+		// already be advertising the same candidates as swap-in-able.
+		gw.SetInstalledModelLister(newInstalledModelLister(hotswapConfigDir(workConfigDir)))
 		// Node-routed request recorder (citadel #691): gives ollama/bonsai/
 		// llamacpp/unlimited-ocr -- which expose no scrapeable request metric --
 		// a real last_request_at in the heartbeat instead of "never". Read back

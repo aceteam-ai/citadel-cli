@@ -177,6 +177,13 @@ type Server struct {
 	// chat_route.go (issue #581, node-side complement of aceteam #6236).
 	chatLister ChatModelLister
 
+	// installedLister, when non-nil, reports installed-but-STOPPED serving
+	// engines and the model each would serve once swapped in (citadel-cli#686).
+	// Consulted only on a chatLister miss, and only alongside a non-nil
+	// modelSwapper (no swapper means nothing could act on a match anyway). Set
+	// via SetInstalledModelLister; see chat_route.go's resolveWithFallback.
+	installedLister ChatModelLister
+
 	// requestRecorder, when non-nil, is called with the resolved engine name
 	// every time handleChatCompletions dispatches a request to a local engine.
 	// It is the node-routed complement to engine-scraped idle detection
@@ -189,10 +196,11 @@ type Server struct {
 	requestRecorder func(engine string)
 
 	// modelSwapper, when non-nil, is the node's model-hotswap manager
-	// (citadel-cli#686), reachable from the chat-route path so a future change
-	// can make an installed-but-not-resident model swap in before routing to
-	// it. Set via SetModelSwapper; see chat_route.go for the construction-order
-	// problem this field's wiring fixes and what remains out of scope.
+	// (citadel-cli#686), reachable from the chat-route path so an
+	// installed-but-not-resident model swaps in before routing to it. Set via
+	// SetModelSwapper; see chat_route.go for the construction-order problem
+	// this field's wiring originally fixed and resolveWithFallback for how it
+	// is actually used in the routing decision.
 	modelSwapper ModelSwapper
 
 	// started is set once Start has registered the proxy handlers for the routes
