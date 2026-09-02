@@ -22,6 +22,32 @@
 // wrong once the singleton's code was read. A CDP round trip into a live page a human
 // is driving is not a passive read from the human's point of view, so extract is held
 // to the same rule for consistency.
+//
+// Driver arbitration is TWO independent bits, not one flag flipped by both halves of
+// the interop pair:
+//   - state == SessionAttached: a viewer is CURRENTLY connected (the #794 screencast
+//     hook's MarkAttached/MarkDetached calls; server.go documents these as a
+//     symmetric presence pair tied to the WebSocket connection's lifetime, and
+//     cobrowsestream/handler.go calls them as `MarkAttached; defer MarkDetached`).
+//     This bit is ephemeral: it clears itself the moment the viewer disconnects, with
+//     NO change to cobrowse_session.go's setAttached (byte-identical to before #978).
+//   - explicitHandoff: set by the `handoff` action, cleared by `resume`. This bit is
+//     STICKY across a transient viewer disconnect -- the mid-2FA case: a network blip
+//     dropping the viewer's WebSocket must not silently resume agent scripting on a
+//     session the human explicitly claimed.
+//
+// humanDrivingLocked ORs them: an agent-scripted action is refused if EITHER a viewer
+// is attached right now OR an explicit handoff is outstanding. This is why merely
+// attaching (a passive watch-along) already satisfies "an agent write must be refused
+// while a human is attached" and "a human can grab a live scripted session mid-run and
+// hand it back" -- attach blocks, detach un-blocks -- with `handoff`/`resume` as the
+// separate, sticky mechanism for a hold that must survive a reconnect. Collapsing
+// these into one flag (making MarkAttached itself set a persistent "human driver" flag
+// that only an explicit resume could clear) was tried and reverted: it would make ANY
+// viewer connection -- including a passive watch-along with no intent to drive --
+// permanently kill agent scripting until someone remembered to call `resume`, and the
+// #8131/#8133 agents have no way to observe a viewer disconnect to know when that is
+// safe.
 package platform
 
 import (
@@ -42,12 +68,28 @@ type ExtractResult struct {
 	Attrs map[string]string `json:"attrs,omitempty"`
 }
 
+// humanDrivingLocked reports whether the session's driver-arbitration state
+// currently blocks agent-scripted actions -- see the package doc comment above
+// for why this is two bits ORed together rather than one flag. Caller holds s.mu.
+func (s *cobrowseSession) humanDrivingLocked() bool {
+	return s.explicitHandoff || s.state == SessionAttached
+}
+
+// driverFor projects humanDrivingLocked's bool onto the reported CobrowseDriver
+// value.
+func driverFor(humanDriving bool) CobrowseDriver {
+	if humanDriving {
+		return DriverHuman
+	}
+	return DriverAI
+}
+
 // requireDrivablePort returns the session's live CDP debug port for a scripted
 // action (navigate, click, type, screenshot, extract), refusing when the browser
 // is not running or has exited (ErrNotStarted) or is currently driven by a human
-// (ErrHandedOff). Every scripted CDP action funnels through this single check --
-// see the package doc comment above for why screenshot/extract are included, not
-// just the mutating actions.
+// (ErrHandedOff, per humanDrivingLocked). Every scripted CDP action funnels
+// through this single check -- see the package doc comment above for why
+// screenshot/extract are included, not just the mutating actions.
 func (s *cobrowseSession) requireDrivablePort() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -59,7 +101,7 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 		return 0, ErrNotStarted
 	default:
 	}
-	if s.driver == DriverHuman {
+	if s.humanDrivingLocked() {
 		return 0, ErrHandedOff
 	}
 	return s.proc.debugPort, nil
@@ -86,10 +128,14 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	}
 	port, err := s.requireDrivablePort()
 	if err != nil {
-		return s.status(), err
+		// No status probe on a refused/not-started call: the job handler
+		// discards the status on this path anyway, and status() does a real
+		// CDP HTTP round trip (bounded, but still needless work on every
+		// refused write).
+		return CobrowseSessionStatus{}, err
 	}
 	if _, err := cdpCommand(port, "Page.navigate", map[string]any{"url": url}); err != nil {
-		return s.status(), err
+		return CobrowseSessionStatus{}, err
 	}
 	return s.status(), nil
 }
@@ -133,7 +179,7 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 	}
 	port, err := s.requireDrivablePort()
 	if err != nil {
-		return s.status(), err
+		return CobrowseSessionStatus{}, err
 	}
 
 	var cx, cy float64
@@ -141,16 +187,16 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 	case selector != "":
 		cx, cy, err = resolveSelectorCenter(port, selector)
 		if err != nil {
-			return s.status(), err
+			return CobrowseSessionStatus{}, err
 		}
 	case x != nil && y != nil:
 		cx, cy = *x, *y
 	default:
-		return s.status(), fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
+		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
 
 	if err := clickAtPoint(port, cx, cy); err != nil {
-		return s.status(), err
+		return CobrowseSessionStatus{}, err
 	}
 	return s.status(), nil
 }
@@ -165,10 +211,10 @@ func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, e
 	}
 	port, err := s.requireDrivablePort()
 	if err != nil {
-		return s.status(), err
+		return CobrowseSessionStatus{}, err
 	}
 	if _, err := cdpCommand(port, "Input.insertText", map[string]any{"text": text}); err != nil {
-		return s.status(), err
+		return CobrowseSessionStatus{}, err
 	}
 	return s.status(), nil
 }
@@ -187,9 +233,11 @@ func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (E
 	return extractElement(port, selector, attrs)
 }
 
-// Handoff transfers control of one session to the human. Idempotent (calling
-// it while already handed off is a no-op success), mirroring
-// CobrowseManager.Handoff.
+// Handoff sets the STICKY explicit-handoff bit on one session (see the package
+// doc comment's two-bit explanation), refusing subsequent agent-scripted
+// actions even across a transient viewer disconnect -- the mid-2FA case.
+// Idempotent (calling it while already handed off is a no-op success),
+// mirroring CobrowseManager.Handoff.
 func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {
@@ -200,16 +248,17 @@ func (m *CobrowseSessionManager) Handoff(id string) (CobrowseSessionStatus, erro
 		s.mu.Unlock()
 		return CobrowseSessionStatus{}, ErrNotStarted
 	}
-	s.driver = DriverHuman
+	s.explicitHandoff = true
 	s.mu.Unlock()
 	return s.status(), nil
 }
 
-// Resume returns control of one session to the AI agent. Idempotent, and
-// deliberately succeeds even while a viewer is still attached (state ==
-// SessionAttached) -- attachment is a presence/view signal, not an exclusive
-// lock on who may script, so an operator watching along can still hand
-// scripting back to the agent. Mirrors CobrowseManager.Resume.
+// Resume clears one session's sticky explicit-handoff bit. Idempotent. Note
+// this does NOT by itself guarantee agent-scripted actions are allowed
+// afterward: if a viewer is STILL attached (state == SessionAttached),
+// humanDrivingLocked remains true on that bit alone and writes stay refused
+// until the viewer disconnects too -- resume only releases an explicit claim,
+// it does not evict a live viewer. Mirrors CobrowseManager.Resume.
 func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {
@@ -220,7 +269,7 @@ func (m *CobrowseSessionManager) Resume(id string) (CobrowseSessionStatus, error
 		s.mu.Unlock()
 		return CobrowseSessionStatus{}, ErrNotStarted
 	}
-	s.driver = DriverAI
+	s.explicitHandoff = false
 	s.mu.Unlock()
 	return s.status(), nil
 }

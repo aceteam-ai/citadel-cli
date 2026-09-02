@@ -140,9 +140,18 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if err != nil {
 			return nil, err
 		}
+		// Mirror the old singleton's screenshot wire shape exactly (image,
+		// format, driver, url) so a consumer that already parses
+		// cobrowse_screenshot's result -- e.g. an aceteam #8131/#8133 rewire
+		// -- does not silently lose driver/url when it switches job types.
+		// Best-effort decoration: the screenshot already succeeded, so a
+		// failure here (session raced to stop) should not fail the job.
+		st, _ := mgr.SessionStatus(id)
 		out, _ := json.Marshal(map[string]any{
 			"image":  img,
 			"format": "png",
+			"driver": string(st.Driver),
+			"url":    st.URL,
 		})
 		return out, nil
 

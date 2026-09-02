@@ -90,7 +90,10 @@ type CobrowseSessionStatus struct {
 	StartedAt string               `json:"started_at,omitempty"`
 	// Driver is the session's driver-arbitration state (issue #978): "ai" while
 	// the agent may issue scripted actions (navigate/click/type/screenshot/
-	// extract), "human" while those are refused (ErrHandedOff). Reuses the same
+	// extract), "human" while those are refused (ErrHandedOff) -- either
+	// because a viewer is currently attached (state == "attached") or because
+	// an explicit `handoff` is in effect. See humanDrivingLocked in
+	// cobrowse_session_actions.go for the exact rule. Reuses the same
 	// CobrowseDriver type and DriverAI/DriverHuman values as the singleton
 	// CobrowseManager (cobrowse.go) -- same concept, per-session instead of
 	// per-node.
@@ -167,12 +170,14 @@ type cobrowseSession struct {
 	mu    sync.Mutex
 	state CobrowseSessionState
 	proc  *cobrowseProc
-	// driver is this session's driver-arbitration state (issue #978): DriverAI
-	// (default) while the agent may issue scripted navigate/click/type/
-	// screenshot/extract actions, DriverHuman while those are refused
-	// (ErrHandedOff). Flipped explicitly by Handoff/Resume, and implicitly by
-	// MarkAttached/MarkDetached -- see setAttached for the interop rule.
-	driver CobrowseDriver
+	// explicitHandoff is this session's STICKY driver-arbitration bit (issue
+	// #978): set by an explicit `handoff` action, cleared by an explicit
+	// `resume` action. It is deliberately independent of, and survives, a
+	// transient viewer disconnect -- see humanDrivingLocked (in
+	// cobrowse_session_actions.go) for how this combines with live attachment
+	// (state == SessionAttached) into the single refuse/allow decision every
+	// scripted action checks, and why that is two bits rather than one.
+	explicitHandoff bool
 }
 
 var (
@@ -268,7 +273,6 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		startedAt:  time.Now(),
 		state:      SessionLaunching,
 		encProfile: profile,
-		driver:     DriverAI,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -383,16 +387,6 @@ func (m *CobrowseSessionManager) MarkAttached(id string) bool { return m.setAtta
 // MarkDetached returns an attached session to the running state.
 func (m *CobrowseSessionManager) MarkDetached(id string) bool { return m.setAttached(id, false) }
 
-// setAttached is also the driver-arbitration interop point (issue #978): a
-// viewer attaching hands the session's driver to the human, so an in-flight or
-// subsequent agent-scripted action (navigate/click/type/screenshot/extract) is
-// refused (ErrHandedOff) the moment a human is watching, without requiring a
-// separate explicit `handoff` job call -- "a human can grab a live scripted
-// session mid-run". Detaching deliberately does NOT hand the driver back to
-// the AI: a transient viewer disconnect (network blip, tab close) must not
-// silently resume agent scripting on a session the human may still consider
-// theirs (e.g. mid-2FA). Returning control to the agent requires the explicit
-// `resume` action, mirroring the old singleton's explicit Resume() contract.
 func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 	m.mu.Lock()
 	s, ok := m.sessions[id]
@@ -405,7 +399,6 @@ func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 	// Never override a terminal/launching state: attach only makes sense once running.
 	if s.state == SessionRunning && attached {
 		s.state = SessionAttached
-		s.driver = DriverHuman
 	} else if s.state == SessionAttached && !attached {
 		s.state = SessionRunning
 	}
@@ -498,7 +491,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		ID:      s.id,
 		State:   s.state,
 		Profile: s.profile,
-		Driver:  s.driver,
+		Driver:  driverFor(s.humanDrivingLocked()),
 	}
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)

@@ -107,8 +107,6 @@ func TestCobrowseSessionActions_HandoffRefusesWrites(t *testing.T) {
 }
 
 func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
-	f := &fakeLauncher{}
-	f.install(t)
 	// Fixed, unused port: after resume the action reaches the CDP call and
 	// fails with a connection error -- the point is that it is NOT ErrHandedOff.
 	installFixedPortLauncher(t, freeTCPPort(t))
@@ -138,10 +136,12 @@ func TestCobrowseSessionActions_ResumeRestoresAIControl(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_MarkAttachedImpliesHumanDriver pins the #978
-// interop rule: a viewer attaching (the #794 screencast hook, MarkAttached)
-// hands the driver to the human WITHOUT a separate explicit handoff call.
-func TestCobrowseSessionActions_MarkAttachedImpliesHumanDriver(t *testing.T) {
+// TestCobrowseSessionActions_MarkAttachedRefusesWrites pins the #978 interop
+// rule's PRESENCE half: a viewer attaching (the #794 screencast hook,
+// MarkAttached) alone -- with NO separate explicit handoff call -- already
+// refuses agent-scripted writes, satisfying "an agent write must be refused
+// while a human is attached" literally.
+func TestCobrowseSessionActions_MarkAttachedRefusesWrites(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -158,17 +158,56 @@ func TestCobrowseSessionActions_MarkAttachedImpliesHumanDriver(t *testing.T) {
 		t.Fatalf("expected attached state, got %q", got.State)
 	}
 	if got.Driver != DriverHuman {
-		t.Errorf("attaching should hand the driver to the human, got %q", got.Driver)
+		t.Errorf("an attached viewer should report driver=human, got %q", got.Driver)
 	}
 	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
 		t.Errorf("type while a viewer is attached: got %v, want ErrHandedOff", err)
 	}
 }
 
-// TestCobrowseSessionActions_MarkDetachedDoesNotAutoResume pins the other half
-// of the interop rule: detaching (a transient disconnect) must NOT silently
-// hand scripting back to the agent -- only an explicit resume does.
-func TestCobrowseSessionActions_MarkDetachedDoesNotAutoResume(t *testing.T) {
+// TestCobrowseSessionActions_DetachWithoutExplicitHandoffRestoresAIControl
+// pins the other half: a BARE attach/detach cycle (no `handoff` action ever
+// called) is itself "a human grabbing a live scripted session mid-run and
+// handing it back" -- detaching alone restores agent scripting, with no
+// change needed to setAttached/MarkDetached (see the package doc comment in
+// cobrowse_session_actions.go for why this is deliberately NOT a one-way
+// latch).
+func TestCobrowseSessionActions_DetachWithoutExplicitHandoffRestoresAIControl(t *testing.T) {
+	installFixedPortLauncher(t, freeTCPPort(t))
+	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
+
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	m.MarkAttached(st.ID)
+	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
+		t.Fatalf("type while attached: got %v, want ErrHandedOff", err)
+	}
+
+	if !m.MarkDetached(st.ID) {
+		t.Fatalf("detach should succeed")
+	}
+	got, _ := m.SessionStatus(st.ID)
+	if got.State != SessionRunning {
+		t.Errorf("expected running state after detach, got %q", got.State)
+	}
+	if got.Driver != DriverAI {
+		t.Errorf("a bare detach (no explicit handoff) should restore driver=ai, got %q", got.Driver)
+	}
+
+	_, err = m.Navigate(st.ID, "https://example.com")
+	if errors.Is(err, ErrHandedOff) {
+		t.Errorf("navigate after a bare detach should not be refused for arbitration reasons, got %v", err)
+	}
+}
+
+// TestCobrowseSessionActions_ExplicitHandoffSurvivesDetach pins the STICKY
+// half: an explicit `handoff` (unlike a bare attach) is NOT undone by a
+// viewer disconnecting -- the mid-2FA scenario, where a transient WebSocket
+// blip must not silently resume agent scripting on a session the human
+// explicitly claimed. Only an explicit `resume` clears it.
+func TestCobrowseSessionActions_ExplicitHandoffSurvivesDetach(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -177,22 +216,24 @@ func TestCobrowseSessionActions_MarkDetachedDoesNotAutoResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	m.MarkAttached(st.ID)
-	if !m.MarkDetached(st.ID) {
-		t.Fatalf("detach should succeed")
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("handoff: %v", err)
 	}
+	// Attach then detach (a viewer connected and disconnected while handed off).
+	m.MarkAttached(st.ID)
+	m.MarkDetached(st.ID)
+
 	got, _ := m.SessionStatus(st.ID)
 	if got.State != SessionRunning {
 		t.Errorf("expected running state after detach, got %q", got.State)
 	}
 	if got.Driver != DriverHuman {
-		t.Errorf("detach must not auto-resume the driver, got %q (want %q)", got.Driver, DriverHuman)
+		t.Errorf("explicit handoff must survive a detach, got driver=%q", got.Driver)
 	}
 	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
-		t.Errorf("type after a bare detach (no resume): got %v, want ErrHandedOff", err)
+		t.Errorf("type after detach with an outstanding explicit handoff: got %v, want ErrHandedOff", err)
 	}
 
-	// The explicit resume is what actually hands control back.
 	resumed, err := m.Resume(st.ID)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
@@ -202,10 +243,11 @@ func TestCobrowseSessionActions_MarkDetachedDoesNotAutoResume(t *testing.T) {
 	}
 }
 
-// TestCobrowseSessionActions_ResumeAllowedWhileStillAttached checks resume is
-// not itself blocked by a live viewer: attachment is a presence/view signal,
-// not an exclusive lock on control.
-func TestCobrowseSessionActions_ResumeAllowedWhileStillAttached(t *testing.T) {
+// TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused
+// checks resume only releases the EXPLICIT bit: while a viewer is STILL
+// attached, resume succeeds (idempotent, no error) but writes remain refused
+// until that viewer also detaches -- resume does not evict a live viewer.
+func TestCobrowseSessionActions_ResumeWhileStillAttachedKeepsWritesRefused(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
@@ -217,13 +259,23 @@ func TestCobrowseSessionActions_ResumeAllowedWhileStillAttached(t *testing.T) {
 	m.MarkAttached(st.ID)
 	resumed, err := m.Resume(st.ID)
 	if err != nil {
-		t.Fatalf("resume while attached should succeed: %v", err)
+		t.Fatalf("resume while attached should succeed (idempotent): %v", err)
 	}
-	if resumed.Driver != DriverAI {
-		t.Errorf("driver after resume-while-attached = %q, want %q", resumed.Driver, DriverAI)
+	if resumed.Driver != DriverHuman {
+		t.Errorf("driver while a viewer is still attached = %q, want %q (resume does not evict a viewer)", resumed.Driver, DriverHuman)
 	}
 	if resumed.State != SessionAttached {
 		t.Errorf("resume must not change the attach/view state, got %q", resumed.State)
+	}
+	if _, err := m.Type(st.ID, "hi"); !errors.Is(err, ErrHandedOff) {
+		t.Errorf("type while still attached (post-resume): got %v, want ErrHandedOff", err)
+	}
+
+	// Detaching the viewer is what finally allows writes again.
+	m.MarkDetached(st.ID)
+	got, _ := m.SessionStatus(st.ID)
+	if got.Driver != DriverAI {
+		t.Errorf("driver after detach following resume = %q, want %q", got.Driver, DriverAI)
 	}
 }
 
@@ -269,8 +321,6 @@ func TestCobrowseSessionActions_UnknownSessionErrors(t *testing.T) {
 }
 
 func TestCobrowseSessionActions_ClickRequiresSelectorOrCoords(t *testing.T) {
-	f := &fakeLauncher{}
-	f.install(t)
 	installFixedPortLauncher(t, freeTCPPort(t))
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 
