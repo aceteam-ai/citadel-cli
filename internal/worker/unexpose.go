@@ -86,18 +86,29 @@ func (h *UnexposeHandler) Execute(ctx context.Context, job *Job, stream StreamWr
 		return h.failure(fmt.Errorf("UNEXPOSE: unexpose %q: %w", name, err)), nil
 	}
 
+	// "removed" must mean "anything was actually cleaned up" (citadel #967),
+	// not just "a live route existed". A durable exposure record can outlive
+	// its live route (restored for a port that no longer listens, or written
+	// by an older build) — Unexpose still deletes that record even when no
+	// live route existed, so a node that genuinely cleaned something up must
+	// not report removed=false just because the thing it cleaned was the
+	// record rather than the route.
+	removed := res.WasExposed || res.DurableRecordRemoved
+
 	out := map[string]any{
 		"name": res.Name,
 		// "removed" is the platform wire contract (aceteam PR #8631's parser:
 		// `removed = bool(result.get("removed")) if ... is not None else True`).
 		// Without this key the parser silently defaults removed=True even for
-		// the idempotent not-currently-exposed case (WasExposed=false), which
-		// misreports the outcome to the caller. "was_exposed" is kept alongside
-		// for back-compat with any existing reader of the raw job output.
-		"removed":     res.WasExposed,
+		// the idempotent not-currently-exposed case (removed=false), which
+		// misreports the outcome to the caller. "was_exposed" is kept alongside,
+		// UNCHANGED in meaning (a live route was removed), for back-compat with
+		// any existing reader of the raw job output.
+		"removed":     removed,
 		"was_exposed": res.WasExposed,
 	}
-	h.cfg.Log("UNEXPOSE: %q was_exposed=%v", name, res.WasExposed)
+	h.cfg.Log("UNEXPOSE: %q was_exposed=%v durable_record_removed=%v removed=%v",
+		name, res.WasExposed, res.DurableRecordRemoved, removed)
 	return &JobResult{Status: JobStatusSuccess, Output: out}, nil
 }
 

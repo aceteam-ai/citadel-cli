@@ -243,12 +243,15 @@ func (liveExposeOps) Unexpose(_ context.Context, name string) (*worker.UnexposeR
 
 	// Delete the durable record even when nothing was live: a record can outlive
 	// its route (restored for a port that no longer listens, or written by an
-	// older build), and revoke must be able to clear that too.
-	if err := config.DeleteExposure(platform.ConfigDir(), name); err != nil {
+	// older build), and revoke must be able to clear that too. The returned bool
+	// (citadel #967) is what lets the caller report "removed" honestly for that
+	// divergent case, rather than only ever reflecting the live route.
+	durableRemoved, err := config.DeleteExposure(platform.ConfigDir(), name)
+	if err != nil {
 		return nil, fmt.Errorf("exposure %q is no longer served, but its saved record could not be removed "+
 			"(it will return on the next restart): %w", name, err)
 	}
-	return &worker.UnexposeResult{Name: name, WasExposed: wasExposed}, nil
+	return &worker.UnexposeResult{Name: name, WasExposed: wasExposed, DurableRecordRemoved: durableRemoved}, nil
 }
 
 // List returns the durable exposure inventory merged with the gateway's live

@@ -414,13 +414,64 @@ func TestExposeOps_UnexposeTearsDownAndPersists(t *testing.T) {
 		t.Error("gateway still reports the exposure live after unexpose")
 	}
 
-	// Idempotent: revoking again is still a success, just was_exposed=false.
+	// Idempotent: revoking again is still a success, just was_exposed=false,
+	// and this time there is no durable record left either.
 	res2, err := ops.Unexpose(ctx, "frigate")
 	if err != nil {
 		t.Fatalf("second unexpose: %v", err)
 	}
 	if res2.WasExposed {
 		t.Error("second unexpose should report was_exposed=false")
+	}
+	if res2.DurableRecordRemoved {
+		t.Error("second unexpose should report DurableRecordRemoved=false (nothing left to remove)")
+	}
+}
+
+// TestExposeOps_UnexposeStaleDurableRecordWithNoLiveRoute pins citadel #967:
+// a durable exposure record can outlive its live route (restored for a port
+// that no longer listens, or written by an older build). Simulated here by
+// writing a record straight to the durable store WITHOUT ever calling
+// Expose (so the gateway has no live route for it). Unexpose must still
+// report DurableRecordRemoved=true — something was genuinely cleaned up —
+// even though WasExposed is false.
+func TestExposeOps_UnexposeStaleDurableRecordWithNoLiveRoute(t *testing.T) {
+	setupExposeOpsTest(t)
+	ops := liveExposeOps{}
+	ctx := context.Background()
+
+	if err := config.SaveExposure(platform.ConfigDir(), config.ExposureRecord{
+		Name: "frigate", Port: 5000, Visibility: "org",
+	}); err != nil {
+		t.Fatalf("seed stale durable record: %v", err)
+	}
+	ref := getProvisionedServiceGateway()
+	if ref.gw.HasExposure("frigate") {
+		t.Fatal("test setup: gateway must NOT have a live route for this case")
+	}
+
+	res, err := ops.Unexpose(ctx, "frigate")
+	if err != nil {
+		t.Fatalf("unexpose: %v", err)
+	}
+	if res.WasExposed {
+		t.Error("was_exposed should be false: no live route ever existed")
+	}
+	if !res.DurableRecordRemoved {
+		t.Error("DurableRecordRemoved should be true: the stale record was cleaned up")
+	}
+	if rec := config.FindExposure(platform.ConfigDir(), "frigate"); rec != nil {
+		t.Errorf("durable record still present after unexpose: %+v", rec)
+	}
+
+	// A genuinely absent name (no live route, no durable record at all) must
+	// report DurableRecordRemoved=false, the negative control for the above.
+	res2, err := ops.Unexpose(ctx, "never-existed")
+	if err != nil {
+		t.Fatalf("unexpose of a name that never existed: %v", err)
+	}
+	if res2.WasExposed || res2.DurableRecordRemoved {
+		t.Errorf("unexpose of an absent name should report both false, got %+v", res2)
 	}
 }
 

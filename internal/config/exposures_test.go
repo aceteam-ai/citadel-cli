@@ -186,20 +186,33 @@ func TestDeleteExposure(t *testing.T) {
 		}
 	}
 
-	if err := DeleteExposure(dir, "frigate"); err != nil {
+	removed, err := DeleteExposure(dir, "frigate")
+	if err != nil {
 		t.Fatalf("DeleteExposure: %v", err)
+	}
+	if !removed {
+		t.Errorf("DeleteExposure: want removed=true for an existing record")
 	}
 	got, _ := LoadExposures(dir)
 	if len(got) != 1 || got[0].Name != "grafana" {
 		t.Errorf("after delete: %+v, want only grafana", got)
 	}
 
-	// Idempotent: unexposing something already gone is not an error.
-	if err := DeleteExposure(dir, "frigate"); err != nil {
+	// Idempotent: unexposing something already gone is not an error, and
+	// reports removed=false (nothing was actually there to clean up).
+	removed, err = DeleteExposure(dir, "frigate")
+	if err != nil {
 		t.Errorf("second DeleteExposure: %v", err)
 	}
-	if err := DeleteExposure(t.TempDir(), "anything"); err != nil {
+	if removed {
+		t.Errorf("second DeleteExposure: want removed=false for an already-gone record")
+	}
+	removed, err = DeleteExposure(t.TempDir(), "anything")
+	if err != nil {
 		t.Errorf("DeleteExposure with no store: %v", err)
+	}
+	if removed {
+		t.Errorf("DeleteExposure with no store: want removed=false")
 	}
 }
 

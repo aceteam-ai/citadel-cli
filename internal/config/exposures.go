@@ -147,11 +147,16 @@ func FindExposure(configDir, name string) *ExposureRecord {
 }
 
 // DeleteExposure drops one exposure from the durable set. Deleting an absent
-// name is a no-op, so an unexpose is idempotent.
-func DeleteExposure(configDir, name string) error {
+// name is a no-op, so an unexpose is idempotent. The returned bool reports
+// whether a record actually existed and was removed — a durable record can
+// outlive its live gateway route (restored for a port that no longer
+// listens, or written by an older build), so a caller cannot infer "was
+// anything actually cleaned up here" from the live route alone (citadel
+// #967: UNEXPOSE's `removed` signal must account for this).
+func DeleteExposure(configDir, name string) (bool, error) {
 	recs, err := LoadExposures(configDir)
 	if err != nil || len(recs) == 0 {
-		return nil
+		return false, nil
 	}
 	out := recs[:0]
 	for _, r := range recs {
@@ -160,9 +165,12 @@ func DeleteExposure(configDir, name string) error {
 		}
 	}
 	if len(out) == len(recs) {
-		return nil
+		return false, nil
 	}
-	return writeExposures(configDir, out)
+	if err := writeExposures(configDir, out); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // writeExposures persists recs 0600, sorted by name for a stable file, via a
