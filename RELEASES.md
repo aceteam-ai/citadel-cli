@@ -2184,3 +2184,23 @@ Auto-generated log of every release.
   - fix(expose): UNEXPOSE removed=true when a stale durable record is cleaned (#967) (#969)
 
 
+---
+
+## v2.140.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 37 |
+| Lines added | +4003 |
+
+**Changes:**
+
+  - fix(gateway): wire the model swapper into chat routing (closes #686) (#976)
+  - feat: surface node<->backend connectivity health as Backend: (#429 Part 1) (#975)
+  - fix: expose --check probes own-node services via loopback, not mesh IP (#971)
+  - feat: implement MEDIA_GENERATE job handler for image/video generation (#972)
+  - feat(engine): additive internal/engine registry (slice 1 of #685) (#973)
+  - feat: citadel socks — SOCKS5 dynamic-forward proxy over the mesh (#974)
+
+
