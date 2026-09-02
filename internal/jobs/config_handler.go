@@ -99,6 +99,18 @@ type DeviceConfig struct {
 	// passcode leaves it fail-closed, so the platform should set this alongside
 	// the *Enabled flags.
 	NodePasscode *string `json:"nodePasscode,omitempty"`
+
+	// DefaultServe is the platform-pushed opt-IN for the "default-serve"
+	// appliance-mode reconcile (citadel-cli#628): on a truly blank GPU node,
+	// `citadel work` startup auto-serves a VRAM-sized model exactly once,
+	// ever. Pointer for the same absent(nil)-vs-explicit reason as the other
+	// *Enabled flags: an omitted field leaves the node's persisted
+	// default-serve toggle untouched. A non-nil value writes the same
+	// default-serve.yaml the CITADEL_DEFAULT_SERVE env var / manifest
+	// default_serve key are also read alongside (see
+	// cmd/default_serve.go's resolveDefaultServe precedence). Default-DENY
+	// on a fresh node, so the platform must send `true` here to opt in.
+	DefaultServe *bool `json:"defaultServe,omitempty"`
 }
 
 // ConfigHandler handles APPLY_DEVICE_CONFIG jobs.
@@ -214,6 +226,23 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 			result += fmt.Sprintf("\nWarning: failed to persist energy config: %v", err)
 		} else {
 			result += fmt.Sprintf("\nEnergy sampling %s (takes effect on next worker start)", enabledLabel(*config.EnergySampling))
+		}
+	}
+
+	// Apply the default-serve appliance-mode opt-in (citadel-cli#628) when the
+	// platform pushed an explicit value. Load-modify-save the same
+	// default-serve.yaml resolveDefaultServe reads (alongside the env var and
+	// manifest default_serve key), so the device-config path and the local
+	// toggles converge on one persisted value (default-off when neither wrote
+	// it). Written to platform.ConfigDir(), not h.ConfigDir -- this is a
+	// per-concern toggle, not a manifest field.
+	if config.DefaultServe != nil {
+		ds := citadelconfig.LoadDefaultServe(platform.ConfigDir())
+		ds.Enabled = *config.DefaultServe
+		if err := citadelconfig.SaveDefaultServe(platform.ConfigDir(), ds); err != nil {
+			result += fmt.Sprintf("\nWarning: failed to persist default-serve config: %v", err)
+		} else {
+			result += fmt.Sprintf("\nDefault-serve appliance mode %s (takes effect on next worker start)", enabledLabel(*config.DefaultServe))
 		}
 	}
 
@@ -361,6 +390,12 @@ type CitadelManifest struct {
 	// device-config apply, since this struct is what updateManifest round-trips
 	// the whole citadel.yaml through.
 	PinnedServices []string `yaml:"pinned_services,omitempty"`
+	// DefaultServe mirrors cmd/manifest.go CitadelManifest.DefaultServe
+	// (citadel-cli#628). Modeled here for the same #850 reason as
+	// PinnedServices above: this struct is what updateManifest round-trips
+	// citadel.yaml through, so an operator-set default_serve: true key would
+	// otherwise be silently dropped by the next APPLY_DEVICE_CONFIG.
+	DefaultServe bool `yaml:"default_serve,omitempty"`
 }
 
 // ManifestService represents a service entry in the manifest. DesiredStatus is

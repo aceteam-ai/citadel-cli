@@ -660,6 +660,24 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			Debug("skipping reservation reconcile: this process does not hold the single-instance worker lock")
 		}
+
+		// Default-serve reconcile (citadel-cli#628, appliance-mode opt-in):
+		// on a truly blank GPU node with default-serve opted in, auto-serve a
+		// VRAM-sized model exactly once, ever. See cmd/default_serve.go for
+		// the full gate (opt-in precedence, GPU present, blank node,
+		// once-ever marker) and safety contract (never pins, never
+		// preempts, fails open -- marks-and-moves-on -- on error). Gated on
+		// workerLockHeld for the same single-live-worker reason the
+		// reservation reconcile above is: this can mutate citadel.yaml and
+		// start a container, so a second concurrent process racing it could
+		// double-start a service or race the completion marker write.
+		// Deliberately NOT run from `citadel init` -- see default_serve.go's
+		// package doc for why this belongs at `citadel work` startup.
+		if workerLockHeld {
+			runDefaultServeReconcile(workManifest, network.GetNodeConfigDir(), realDefaultServeDeps(reservationHandler))
+		} else {
+			Debug("skipping default-serve reconcile: this process does not hold the single-instance worker lock")
+		}
 	}
 
 	// Pairing-display manager (citadel #659 P0): render a platform-pushed

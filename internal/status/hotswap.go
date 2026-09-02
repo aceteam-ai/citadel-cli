@@ -115,6 +115,52 @@ func EngineVRAMEstimateMB(engine string) int {
 	return engineVRAMEstimateMB[engine]
 }
 
+// LargestGPUTotalVRAMMB returns the largest single GPU's total VRAM (MB)
+// across gpus, and whether any GPU with a known (>0) total VRAM was found.
+// Used by the "default-serve" appliance-mode reconcile (citadel-cli#628) to
+// pick a VRAM tier: multi-GPU nodes size the tier off the biggest card, not
+// the sum (a deploy targets one card's worth of VRAM, same reasoning
+// EngineVRAMEstimateMB's provisioning budgets use).
+func LargestGPUTotalVRAMMB(gpus []GPUMetrics) (mb int, found bool) {
+	for _, g := range gpus {
+		if g.MemoryTotalMB <= 0 {
+			continue
+		}
+		found = true
+		if g.MemoryTotalMB > mb {
+			mb = g.MemoryTotalMB
+		}
+	}
+	return mb, found
+}
+
+// DefaultServeTier maps a GPU's total VRAM (MB) to the (engine, model) the
+// "default-serve" appliance-mode reconcile (citadel-cli#628) auto-serves on a
+// blank node. Returns ("", "") when vramTotalMB is unknown/non-positive (no
+// tier applies -- the caller must treat this as "skip", never as a match on
+// the smallest tier).
+//
+// These model names are deliberately editable in one place: swap any of the
+// ollama tags below as preferences evolve, without touching call sites. The
+// >=20GB tier intentionally returns an EMPTY model: it keeps the compose
+// file's own VLLM_MODEL default rather than overriding it, since vllm (unlike
+// ollama) has no single "small default model" convention and a wrong guess
+// there is a multi-GB wasted pull, not a one-line edit.
+func DefaultServeTier(vramTotalMB int) (engine, model string) {
+	switch {
+	case vramTotalMB <= 0:
+		return "", ""
+	case vramTotalMB < 6144: // < 6 GB
+		return "ollama", "llama3.2:3b"
+	case vramTotalMB < 12288: // 6-12 GB
+		return "ollama", "llama3.1:8b"
+	case vramTotalMB < 20480: // 12-20 GB
+		return "ollama", "qwen2.5:14b"
+	default: // >= 20 GB
+		return "vllm", ""
+	}
+}
+
 // applyModelHotswap annotates the collected status for model hotswap (#632):
 //  1. marks every RUNNING managed serving engine Resident=true and attaches its
 //     VRAM estimate (live footprint VRAM when known, else the coarse table), and

@@ -100,6 +100,15 @@ type CitadelManifest struct {
 	// absent => every cached entry is GC-eligible (subject to GC's other
 	// exemptions: residency, min-age).
 	PinnedModels []string `yaml:"pinned_models,omitempty"`
+	// DefaultServe opts this node into the "default-serve" appliance-mode
+	// reconcile (citadel-cli#628): on a truly blank GPU node (no serving
+	// engine installed/running, no model cached), `citadel work` startup
+	// auto-serves a VRAM-sized model exactly once, ever. Default OFF (false):
+	// a node with no opt-in is byte-identical to one without this feature.
+	// This is one of three precedence sources resolveDefaultServe checks
+	// (env var > this manifest key > APPLY_DEVICE_CONFIG-pushed persisted
+	// value); see cmd/default_serve.go.
+	DefaultServe bool `yaml:"default_serve,omitempty"`
 }
 
 // manifestPinnedServices returns the pinned_services allowlist for a manifest,
