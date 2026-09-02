@@ -33,6 +33,22 @@ func runOllamaPull(modelName string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+// runOllamaPullViaDocker runs `docker exec <containerName> ollama pull
+// <modelName>`, bounded by the same ollamaPullTimeout as runOllamaPull. This
+// is the fallback ensureOllamaModel (service_handler.go) uses when no host
+// `ollama` binary is on PATH -- a node running the embedded ollama.yml
+// compose service (rather than a host-installed ollama) has nothing for
+// exec.LookPath to find, but the pull still works by execing into the
+// already-running container. Bounded and logged the same way the host-binary
+// path is; never invents or starts a container just to pull into it (the
+// caller confirms the container is running first).
+func runOllamaPullViaDocker(containerName, modelName string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(context.Background(), ollamaPullTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "docker", "exec", containerName, "ollama", "pull", modelName)
+	return cmd.CombinedOutput()
+}
+
 // ModelCachePullHandler handles MODEL_CACHE_PULL jobs.
 // It pulls model weights into the local cache for the specified engine.
 type ModelCachePullHandler struct{}
