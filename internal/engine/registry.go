@@ -4,7 +4,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -171,29 +170,42 @@ func buildSpec(name string) EngineSpec {
 	}
 
 	var defaultModel *string
-	if v, ok := status.EngineDefaultModel(name); ok {
+	if v, ok := defaultModelByEngine[name]; ok {
 		defaultModel = &v
 	}
 
 	return EngineSpec{
 		Name:             name,
 		Kind:             kind,
-		HostPort:         status.ManagedEngineHostPort(name),
+		HostPort:         HostPortForName(name),
 		HostPortEnvVar:   hostPortEnvVar,
 		CacheDir:         cacheDir,
 		CacheFamily:      cacheFamily,
 		Dialect:          dialectByEngine[name],
 		ReadyPath:        readyPathByEngine[name],
 		LoadEstimate:     loadEstimateByEngine[name],
-		VRAMEstimateMB:   status.EngineVRAMEstimateMB(name),
-		ModelEnvVar:      status.EngineModelEnvVars(name),
+		VRAMEstimateMB:   vramEstimateMBByEngine[name],
+		ModelEnvVar:      copyStringSlice(modelEnvVarsByEngine[name]),
 		DefaultModel:     defaultModel,
-		IdleCapable:      stringInSlice(status.IdleCapableEngines(), name),
-		EmbeddingCapable: stringInSlice(status.EmbeddingProbeServices(), name),
-		ManagedProbe:     stringInSlice(status.ManagedProbeEngines(), name),
+		IdleCapable:      stringInSlice(idleCapableEngineNames, name),
+		EmbeddingCapable: stringInSlice(embeddingCapableEngineNames, name),
+		ManagedProbe:     stringInSlice(managedProbeEngineNames, name),
 		MetricsPort:      services.InferenceMetricsPorts()[name],
 		SelfProvisioning: selfProvisioningEngines[name],
 	}
+}
+
+// copyStringSlice returns a fresh copy of vars, or nil when vars is nil --
+// mirroring the nil-vs-empty distinction internal/status.EngineModelEnvVars
+// used to preserve for its callers (a nil ModelEnvVar means "no entry in the
+// table", not "an entry with zero variables").
+func copyStringSlice(vars []string) []string {
+	if vars == nil {
+		return nil
+	}
+	out := make([]string, len(vars))
+	copy(out, vars)
+	return out
 }
 
 func stringInSlice(list []string, name string) bool {
