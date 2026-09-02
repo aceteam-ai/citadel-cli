@@ -2235,3 +2235,18 @@ Auto-generated log of every release.
   - Report WhatsApp bridge endpoints in ActualState (Phase A of #624) (#983)
 
 
+---
+
+## v2.143.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 5 |
+| Lines added | +1519 |
+
+**Changes:**
+
+  - feat: session-scoped CDP actions on COBROWSE_SESSION (#978) (#984)
+
+
