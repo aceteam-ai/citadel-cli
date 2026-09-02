@@ -63,6 +63,7 @@ func TestFreshNode_StillServesInferenceAndMeeting(t *testing.T) {
 		JobTypeLlamaCppInference,
 		JobTypeEmbedding,
 		JobTypeSynthesizeSpeech,
+		JobTypeMediaGenerate,
 		JobTypeTranscribeAudio, // meeting capability, shares the workspace but not gated
 	}
 	for _, jt := range mustHandle {
