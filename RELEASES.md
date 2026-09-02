@@ -2169,3 +2169,18 @@ Auto-generated log of every release.
   - fix(worker): EXPOSE_LIST url + UNEXPOSE removed to match platform wire contract (#961) (#963)
 
 
+---
+
+## v2.139.0 — 2026-09-01
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 7 |
+| Lines added | +164 |
+
+**Changes:**
+
+  - fix(expose): UNEXPOSE removed=true when a stale durable record is cleaned (#967) (#969)
+
+
