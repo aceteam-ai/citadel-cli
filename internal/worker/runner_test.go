@@ -214,11 +214,37 @@ type MockStreamWriter struct {
 	WriteEndErr error
 	// WriteErrorErr, when non-nil, is returned by WriteError instead of nil.
 	WriteErrorErr error
+
+	// claimedCalls/endCalls count every WriteClaimed/WriteEnd invocation
+	// (including ones swallowed by the retry below), so a test can pin exactly
+	// how many attempts retryStreamWrite made (citadel-cli#985) -- endCount
+	// above already served that role for WriteEnd pre-retry; endCalls is kept
+	// as a clearer, retry-aware name used by the new tests without disturbing
+	// endCount's existing callers.
+	claimedCalls int
+	endCalls     int
+
+	// WriteClaimedFailures / WriteEndFailures, when > 0, make the first N
+	// calls to WriteClaimed / WriteEnd return WriteClaimedErr / WriteEndErr
+	// (or a generic error if unset) before succeeding on call N+1 -- unlike
+	// the "always fail" WriteEndErr-alone contract used by the pre-#985
+	// tests, this simulates a TRANSIENT publish failure that
+	// retryStreamWrite's bounded retry should recover from.
+	WriteClaimedFailures int
+	WriteClaimedErr      error
+	WriteEndFailures     int
 }
 
 func (m *MockStreamWriter) WriteClaimed(agentVersion string) error {
 	m.claimed = true
 	m.claimedVersion = agentVersion
+	m.claimedCalls++
+	if m.claimedCalls <= m.WriteClaimedFailures {
+		if m.WriteClaimedErr != nil {
+			return m.WriteClaimedErr
+		}
+		return errors.New("simulated transient claimed-publish failure")
+	}
 	return nil
 }
 
@@ -235,8 +261,22 @@ func (m *MockStreamWriter) WriteChunk(content string, index int) error {
 func (m *MockStreamWriter) WriteEnd(result map[string]any) error {
 	m.ended = true
 	m.endCount++
+	m.endCalls++
 	m.endResult = result
-	return m.WriteEndErr
+	// WriteEndFailures==0 preserves the original "always fail while WriteEndErr
+	// is set" contract the pre-#985 tests rely on. WriteEndFailures>0 is the
+	// new transient-failure contract: fail exactly that many calls, then
+	// succeed, so a test can pin retryStreamWrite's bounded retry recovering.
+	if m.WriteEndFailures == 0 {
+		return m.WriteEndErr
+	}
+	if m.endCalls <= m.WriteEndFailures {
+		if m.WriteEndErr != nil {
+			return m.WriteEndErr
+		}
+		return errors.New("simulated transient end-publish failure")
+	}
+	return nil
 }
 
 func (m *MockStreamWriter) WriteError(err error, recoverable bool) error {
@@ -532,6 +572,210 @@ func TestRunnerPublishesClaimedBeforeExecution(t *testing.T) {
 	}
 	if !stream.started {
 		t.Error("expected the job to also proceed to WriteStart after claiming")
+	}
+}
+
+// withFastStreamWriteRetry shrinks retryStreamWrite's attempt count/backoff to
+// values a unit test can afford to actually wait out, restoring the real
+// values afterward. The production defaults (a couple of quick attempts, up
+// to a few hundred ms of backoff) are chosen for real network transients, not
+// for a test binary -- see the streamWriteRetryAttempts/streamWriteRetryBackoff
+// doc comment in runner.go for why they must stay small in production too.
+func withFastStreamWriteRetry(t *testing.T) {
+	t.Helper()
+	origAttempts := streamWriteRetryAttempts
+	origBackoff := streamWriteRetryBackoff
+	streamWriteRetryAttempts = 3
+	streamWriteRetryBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() {
+		streamWriteRetryAttempts = origAttempts
+		streamWriteRetryBackoff = origBackoff
+	})
+}
+
+// TestRunnerRetriesWriteClaimedOnTransientFailureThenSucceeds pins the
+// citadel-cli#985 fix: a WriteClaimed failure used to be permanent (one
+// attempt, log a warning, move on), so a single transient publish failure
+// silently lost the claim-ack the coordinator's fast-fail window depends on.
+// retryStreamWrite must give it a couple of extra chances and, when a later
+// attempt succeeds, the job must proceed exactly as if the first attempt had
+// succeeded -- no warning, execution and Ack unaffected.
+func TestRunnerRetriesWriteClaimedOnTransientFailureThenSucceeds(t *testing.T) {
+	withFastStreamWriteRetry(t)
+
+	jobs := []*Job{
+		{ID: "job-1", Type: "SHELL_COMMAND", Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("SHELL_COMMAND", false)
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.144.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	// Fails the first 2 calls, succeeds on the 3rd -- within the 3-attempt
+	// budget withFastStreamWriteRetry configures.
+	stream := &MockStreamWriter{WriteClaimedFailures: 2}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if stream.claimedCalls != 3 {
+		t.Fatalf("WriteClaimed calls = %d, want 3 (2 injected failures + 1 success)", stream.claimedCalls)
+	}
+	if !stream.claimed {
+		t.Fatal("expected the claimed event to have been attempted")
+	}
+	if stream.claimedVersion != "v2.144.0" {
+		t.Errorf("claimed agent_version = %q, want v2.144.0", stream.claimedVersion)
+	}
+	if !stream.started {
+		t.Error("expected the job to proceed to WriteStart once the claimed retry succeeded")
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+	for _, m := range messages {
+		if strings.Contains(m, "Failed to publish claimed event") {
+			t.Errorf("did not expect a claimed-publish warning once the retry succeeded, got: %v", messages)
+		}
+	}
+
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+}
+
+// TestRunnerWriteClaimedStillWarnsAfterExhaustingRetries pins the boundary of
+// the #985 fix: retryStreamWrite gives WriteClaimed extra chances, but it is
+// still bounded and still non-fatal once exhausted -- the job proceeds and the
+// existing warning-log contract is unchanged, just reached after more than one
+// attempt.
+func TestRunnerWriteClaimedStillWarnsAfterExhaustingRetries(t *testing.T) {
+	withFastStreamWriteRetry(t)
+
+	jobs := []*Job{
+		{ID: "job-1", Type: "SHELL_COMMAND", Payload: map[string]any{}},
+	}
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler("SHELL_COMMAND", false)
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.144.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	// Fails every call -- outlives the 3-attempt retry budget entirely.
+	stream := &MockStreamWriter{WriteClaimedFailures: 999}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if stream.claimedCalls != 3 {
+		t.Fatalf("WriteClaimed calls = %d, want exactly 3 (the retry budget), no more and no less", stream.claimedCalls)
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+	foundWarning := false
+	for _, m := range messages {
+		if strings.Contains(m, "warning") && strings.Contains(m, "Failed to publish claimed event") && strings.Contains(m, "job-1") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected a warning log once retries were exhausted, got messages: %v", messages)
+	}
+
+	// The job still proceeds -- retries exhausted is still the pre-#985
+	// non-fatal outcome, just reached after more than one attempt.
+	if !stream.started {
+		t.Error("expected the job to still proceed to WriteStart after retries were exhausted")
+	}
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+}
+
+// TestRunnerRetriesWriteEndOnTransientFailureThenSucceeds is the WriteEnd
+// analogue of TestRunnerRetriesWriteClaimedOnTransientFailureThenSucceeds.
+// Losing WriteEnd is worse than losing WriteClaimed (the job succeeded but the
+// result is never delivered), so it shares the same retryStreamWrite helper
+// rather than a second implementation.
+func TestRunnerRetriesWriteEndOnTransientFailureThenSucceeds(t *testing.T) {
+	withFastStreamWriteRetry(t)
+
+	jobs := []*Job{
+		{ID: "job-1", Type: JobTypeServiceStart, Payload: map[string]any{"service": "vllm"}},
+	}
+	source := NewMockJobSource("test", jobs)
+	handler := NewMockJobHandler(JobTypeServiceStart, false) // succeeds
+
+	var activityMu sync.Mutex
+	var activityMessages []string
+	config := RunnerConfig{
+		WorkerID:     "test-worker",
+		AgentVersion: "v2.144.0",
+		ActivityFn: func(level, msg string) {
+			activityMu.Lock()
+			activityMessages = append(activityMessages, level+": "+msg)
+			activityMu.Unlock()
+		},
+	}
+	runner := NewRunner(source, []JobHandler{handler}, config)
+
+	// Fails the first 2 calls, succeeds on the 3rd.
+	stream := &MockStreamWriter{WriteEndFailures: 2}
+	runner.WithStreamWriterFactory(func(job *Job) StreamWriter { return stream })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	runner.Run(ctx)
+
+	if stream.endCalls != 3 {
+		t.Fatalf("WriteEnd calls = %d, want 3 (2 injected failures + 1 success)", stream.endCalls)
+	}
+
+	activityMu.Lock()
+	messages := append([]string(nil), activityMessages...)
+	activityMu.Unlock()
+	for _, m := range messages {
+		if strings.Contains(m, "Failed to publish terminal end event") {
+			t.Errorf("did not expect a terminal-end warning once the retry succeeded, got: %v", messages)
+		}
+	}
+
+	// finishSuccess's write-then-Ack ordering must be unaffected by the retry:
+	// exactly one Ack, no Nack, once the retried WriteEnd finally succeeds.
+	if len(source.AckedJobs()) != 1 {
+		t.Errorf("Acked jobs = %d, want 1", len(source.AckedJobs()))
+	}
+	if len(source.NackedJobs()) != 0 {
+		t.Errorf("Nacked jobs = %d, want 0", len(source.NackedJobs()))
 	}
 }
 

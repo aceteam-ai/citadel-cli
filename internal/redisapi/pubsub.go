@@ -10,12 +10,28 @@ import (
 )
 
 // Publish publishes a message to a Redis Pub/Sub channel.
-// Uses WebSocket when connected, falls back to HTTP otherwise.
+// Uses WebSocket when connected, falls back to HTTP otherwise -- including
+// synchronously, in this same call, when the WebSocket transport IS connected
+// but the publish itself errors mid-flight (citadel-cli#985).
 func (c *Client) Publish(ctx context.Context, channel string, message any) error {
 	// Prefer WebSocket when connected
 	if c.wsClient != nil && c.wsClient.IsConnected() {
 		c.debug("publish: using WebSocket for channel %s", channel)
-		return c.wsClient.Publish(ctx, channel, message)
+		if err := c.wsClient.Publish(ctx, channel, message); err != nil {
+			// A genuine WS error (e.g. a wedged/broken write -- see
+			// WSClient.sendMessage, which tears the connection down and flips
+			// IsConnected to false on exactly this failure), not merely "not
+			// connected" -- that case never reaches here, it already took the
+			// HTTP path below. Fall back to HTTP synchronously in this same
+			// call instead of surfacing the WS error, so one flaky WS write
+			// does not permanently drop a claim-ack/terminal-event publish.
+			// This cannot double-publish: WS either delivered the message (no
+			// error, we return below) or it didn't (error, so HTTP below is
+			// the only successful attempt).
+			c.debug("publish: WebSocket publish failed for channel %s, falling back to HTTP: %v", channel, err)
+		} else {
+			return nil
+		}
 	}
 
 	// Fall back to HTTP

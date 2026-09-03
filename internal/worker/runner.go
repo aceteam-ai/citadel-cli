@@ -440,6 +440,54 @@ func (r *Runner) newStreamWriter(job *Job) StreamWriter {
 	return &NoOpStreamWriter{}
 }
 
+// streamWriteRetryAttempts / streamWriteRetryBackoff bound the retry
+// citadel-cli#985 adds to WriteClaimed and WriteEnd: a single lost publish
+// (a transient WS write failure, a flaky HTTP POST) used to be permanent --
+// the coordinator's short claim-ack window then fast-fails a job that
+// actually succeeded, and for WriteEnd the result is never delivered at all.
+// Package vars (not consts) so a test can shrink both without eating the real
+// backoff; production defaults are a couple of quick attempts, not a long
+// retry campaign -- this runs synchronously in the fetch-loop goroutine for
+// WriteClaimed (claimJob), so a wedged transport must not stall job pickup
+// for long.
+var (
+	streamWriteRetryAttempts = 3
+	streamWriteRetryBackoff  = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}
+)
+
+// retryStreamWrite calls write up to streamWriteRetryAttempts times, waiting
+// streamWriteRetryBackoff[attempt] between attempts, and returns the error
+// from the LAST attempt (nil on success). The first attempt is always made
+// immediately -- the happy path (success on attempt 1) adds zero latency.
+//
+// It stops waiting out a backoff early if ctx is cancelled (worker shutdown,
+// or a test/job context that has already expired), returning whatever error
+// the most recent attempt produced rather than treating cancellation as
+// success. Callers treat the returned error as non-fatal either way (log and
+// proceed) -- retryStreamWrite only gives the publish more chances, it does
+// not change what happens when they are all exhausted.
+func retryStreamWrite(ctx context.Context, write func() error) error {
+	var err error
+	for attempt := 0; attempt < streamWriteRetryAttempts; attempt++ {
+		if err = write(); err == nil {
+			return nil
+		}
+		if attempt == streamWriteRetryAttempts-1 {
+			break
+		}
+		backoff := streamWriteRetryBackoff[attempt]
+		if attempt >= len(streamWriteRetryBackoff) {
+			backoff = streamWriteRetryBackoff[len(streamWriteRetryBackoff)-1]
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return err
+		}
+	}
+	return err
+}
+
 // errLaneSaturated is the Nack error when a claimed job cannot be admitted onto
 // its lane because the lane is at its admission bound. Like the #825 GPU-slot
 // Nack, this is a transparent, non-terminal retry (no stream publish): the job
@@ -514,9 +562,16 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// handler work. The backend dispatcher waits a short window for this event;
 	// a wedged or dead-but-heartbeating node never reaches this line, so the
 	// dispatcher fast-fails in ~3s instead of burning the full result budget.
-	// Best-effort: a publish failure must not block execution.
+	//
+	// Best-effort, but retried (citadel-cli#985): a single lost publish here
+	// used to be permanent, and the coordinator's fast-fail depends on this
+	// event arriving -- a job that actually claimed, ran, and completed in
+	// under a second was reported "unreachable" because exactly this one
+	// publish never landed. retryStreamWrite gives it a couple of quick extra
+	// chances before this still falls back to a log-and-proceed non-fatal
+	// warning, same as before.
 	stream = r.newStreamWriter(job)
-	if err := stream.WriteClaimed(r.agentVersion); err != nil {
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteClaimed(r.agentVersion) }); err != nil {
 		r.log("warning", "Failed to publish claimed event for job %s: %v", job.ID, err)
 	}
 
@@ -818,7 +873,13 @@ func (r *Runner) finishSuccess(ctx context.Context, job *Job, stream StreamWrite
 	if result != nil {
 		output = result.Output
 	}
-	if werr := stream.WriteEnd(output); werr != nil {
+	// Retried the same way as WriteClaimed (citadel-cli#985): losing the
+	// terminal "end" event is worse than losing the claim-ack -- the job
+	// genuinely succeeded but the result is never delivered to the waiting
+	// caller. Still non-fatal once retries are exhausted, and the Ack below is
+	// unconditional either way: a lost publish must not turn a locally
+	// successful job into one that's re-delivered and re-run.
+	if werr := retryStreamWrite(ctx, func() error { return stream.WriteEnd(output) }); werr != nil {
 		r.log("warning", "Failed to publish terminal end event for job %s: %v", job.ID, werr)
 	}
 	r.source.Ack(ctx, job)
