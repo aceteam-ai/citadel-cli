@@ -25,9 +25,17 @@ func (c *Client) Publish(ctx context.Context, channel string, message any) error
 			// HTTP path below. Fall back to HTTP synchronously in this same
 			// call instead of surfacing the WS error, so one flaky WS write
 			// does not permanently drop a claim-ack/terminal-event publish.
-			// This cannot double-publish: WS either delivered the message (no
-			// error, we return below) or it didn't (error, so HTTP below is
-			// the only successful attempt).
+			//
+			// This one call cannot double-publish: WS either delivered the
+			// message (no error, we return below) or it didn't (error, so
+			// HTTP below is the only successful attempt IN THIS CALL). That
+			// guarantee does NOT extend to the caller's retry layer on top
+			// (retryStreamWrite, internal/worker/runner.go): if THIS HTTP
+			// fallback itself errors (e.g. the response is lost, or a proxy
+			// 502s after the backend already published), the caller retries
+			// the whole Publish, and a since-delivered message can be
+			// published again. See the retryStreamWrite doc comment for why
+			// that at-least-once delivery is the benign direction here.
 			c.debug("publish: WebSocket publish failed for channel %s, falling back to HTTP: %v", channel, err)
 		} else {
 			return nil

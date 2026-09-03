@@ -593,6 +593,48 @@ func withFastStreamWriteRetry(t *testing.T) {
 	})
 }
 
+// TestRetryStreamWriteClampsBackoffIndexWhenAttemptsExceedBackoffLength pins
+// a PR #986 review fix: streamWriteRetryAttempts and streamWriteRetryBackoff
+// are independent package vars (retuned separately -- that is the whole
+// point of making them vars), so indexing streamWriteRetryBackoff[attempt]
+// before checking it's in range panics the moment attempts exceeds the
+// backoff slice's length. It only "worked" before because the production
+// defaults (3 attempts, 2 backoff entries) sit exactly at the boundary.
+// Setting attempts strictly greater than len(backoff)+1 reproduces the crash
+// against the pre-fix code (panic: index out of range) and asserts the fixed
+// version neither panics nor loses the retry -- it still calls write the
+// full attempt budget and recovers when a later attempt succeeds.
+func TestRetryStreamWriteClampsBackoffIndexWhenAttemptsExceedBackoffLength(t *testing.T) {
+	origAttempts := streamWriteRetryAttempts
+	origBackoff := streamWriteRetryBackoff
+	t.Cleanup(func() {
+		streamWriteRetryAttempts = origAttempts
+		streamWriteRetryBackoff = origBackoff
+	})
+
+	// 2 backoff entries but 5 attempts: attempt indices 2 and 3 (0-based, the
+	// waits between attempts 3->4 and 4->5) have no corresponding backoff
+	// entry and must clamp to the last one instead of indexing out of range.
+	streamWriteRetryBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	streamWriteRetryAttempts = 5
+
+	calls := 0
+	err := retryStreamWrite(context.Background(), func() error {
+		calls++
+		if calls < 5 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("retryStreamWrite returned error = %v, want nil (success on the final attempt)", err)
+	}
+	if calls != 5 {
+		t.Fatalf("write called %d times, want 5 (retry must still run the full budget when attempts > len(backoff))", calls)
+	}
+}
+
 // TestRunnerRetriesWriteClaimedOnTransientFailureThenSucceeds pins the
 // citadel-cli#985 fix: a WriteClaimed failure used to be permanent (one
 // attempt, log a warning, move on), so a single transient publish failure

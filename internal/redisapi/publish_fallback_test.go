@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gorilla/websocket"
@@ -108,9 +109,13 @@ func TestPublishDoesNotFallBackWhenWebSocketSucceeds(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = wsc.Close() })
 
-	httpHit := false
+	// The httptest handler runs on a server goroutine, concurrent with this
+	// test goroutine's read below Publish returns -- a plain bool here raced
+	// under -race (citadel-cli#986 review). atomic.Bool makes the write/read
+	// safe without adding synchronization the test doesn't otherwise need.
+	var httpHit atomic.Bool
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		httpHit = true
+		httpHit.Store(true)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"published":true}`))
 	}))
@@ -122,7 +127,7 @@ func TestPublishDoesNotFallBackWhenWebSocketSucceeds(t *testing.T) {
 	if err := client.Publish(context.Background(), "stream:v1:job-1", map[string]any{"hello": "world"}); err != nil {
 		t.Fatalf("Publish over a healthy WS connection should succeed, got: %v", err)
 	}
-	if httpHit {
+	if httpHit.Load() {
 		t.Error("Publish must not fall back to HTTP when the WebSocket publish already succeeded (would double-publish)")
 	}
 }

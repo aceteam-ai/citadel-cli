@@ -466,6 +466,19 @@ var (
 // success. Callers treat the returned error as non-fatal either way (log and
 // proceed) -- retryStreamWrite only gives the publish more chances, it does
 // not change what happens when they are all exhausted.
+//
+// This makes delivery AT-LEAST-ONCE, not exactly-once: redisapi.Client.Publish
+// only guarantees no double-publish WITHIN a single call (see its doc
+// comment), so a `write` that reports an error after the message actually
+// reached the coordinator (a lost 200, a 502 from a proxy sitting in front of
+// an otherwise-successful publish) gets retried here and can be published
+// twice. That is the deliberately benign direction for both call sites: a
+// duplicate `claimed` event is idempotent (the coordinator only cares that
+// one arrived within the window), and a duplicate `end` event carries
+// identical output and re-runs nothing -- unlike a truly LOST event, neither
+// triggers #985's fast-fail/withdrawal hazard. The alternative (treat any
+// error as possibly-already-delivered and never retry) reintroduces the exact
+// bug this issue fixes.
 func retryStreamWrite(ctx context.Context, write func() error) error {
 	var err error
 	for attempt := 0; attempt < streamWriteRetryAttempts; attempt++ {
@@ -475,10 +488,16 @@ func retryStreamWrite(ctx context.Context, write func() error) error {
 		if attempt == streamWriteRetryAttempts-1 {
 			break
 		}
-		backoff := streamWriteRetryBackoff[attempt]
-		if attempt >= len(streamWriteRetryBackoff) {
-			backoff = streamWriteRetryBackoff[len(streamWriteRetryBackoff)-1]
-		}
+		// Clamp BEFORE indexing: streamWriteRetryAttempts and
+		// streamWriteRetryBackoff are independent package vars (retuned
+		// separately, e.g. by a test), so attempt can exceed the backoff
+		// slice's length. Indexing first and clamping after is dead code --
+		// it only "worked" because production defaults (3 attempts, 2
+		// backoff entries) sit exactly at the boundary. min() here is what
+		// actually prevents an out-of-range panic in the fetch-loop/lane
+		// goroutine (no recover -> worker crash) the moment either var is
+		// retuned independently.
+		backoff := streamWriteRetryBackoff[min(attempt, len(streamWriteRetryBackoff)-1)]
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
