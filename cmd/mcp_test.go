@@ -349,6 +349,89 @@ func TestMCPBridgeAcceptHeader(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeForwardToBackendInjectsNodeIDHeaderWhenPresent pins the
+// "present" branch of citadel-cli#977: when the bridge has resolved a fabric
+// node id (mcpBridge.nodeID), forwardToBackend attaches it as the
+// X-Citadel-Node-Id request header with the exact resolved value. The id is
+// injected directly onto the bridge rather than staged through
+// resolveNodeIDForMCPHeader/identity.json, so this test never touches real
+// node state.
+func TestMCPBridgeForwardToBackendInjectsNodeIDHeaderWhenPresent(t *testing.T) {
+	var gotValues []string
+	var gotOK bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotValues, gotOK = r.Header["X-Citadel-Node-Id"]
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	defer server.Close()
+
+	bridge := &mcpBridge{
+		apiKey:     "test-key",
+		apiURL:     server.URL,
+		mcpServer:  "aceteam",
+		httpClient: server.Client(),
+		nodeID:     "1234",
+	}
+
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  "ping",
+	}
+
+	if _, err := bridge.forwardToBackend(req); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	if !gotOK {
+		t.Fatal("expected X-Citadel-Node-Id header to be present")
+	}
+	if len(gotValues) != 1 || gotValues[0] != "1234" {
+		t.Errorf("expected X-Citadel-Node-Id=[1234], got %v", gotValues)
+	}
+}
+
+// TestMCPBridgeForwardToBackendOmitsNodeIDHeaderWhenAbsent pins the "absent"
+// branch: when the bridge has no resolved fabric node id (the common case on
+// every real node today -- see resolveNodeIDForMCPHeader's doc comment), the
+// header key must be entirely ABSENT from the outgoing request, never
+// present with an empty value. An empty header is worse than no header (the
+// backend could misread it as "caller claims to be node ''").
+func TestMCPBridgeForwardToBackendOmitsNodeIDHeaderWhenAbsent(t *testing.T) {
+	var gotOK bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, gotOK = r.Header["X-Citadel-Node-Id"]
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	defer server.Close()
+
+	bridge := &mcpBridge{
+		apiKey:     "test-key",
+		apiURL:     server.URL,
+		mcpServer:  "aceteam",
+		httpClient: server.Client(),
+		// nodeID intentionally left as the zero value "" -- the unresolved case.
+	}
+
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  "ping",
+	}
+
+	if _, err := bridge.forwardToBackend(req); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	if gotOK {
+		t.Fatal("expected X-Citadel-Node-Id header to be entirely absent when nodeID is unresolved, not sent empty")
+	}
+}
+
 func TestMCPBridgeBackendError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -385,6 +468,21 @@ func TestGetAPIKeyFromConfig(t *testing.T) {
 	key := getAPIKeyFromConfig()
 	// Just verify it doesn't panic; the key may or may not be empty depending on the test env.
 	_ = key
+}
+
+// TestResolveNodeIDForMCPHeaderEmptyWithoutConfig hermetically pins the
+// unresolved case of resolveNodeIDForMCPHeader (citadel-cli#977) -- a fresh
+// HOME with no device config or ssh_sync.yaml (the state of every fresh
+// citadel checkout, and the common case on a real node today since no
+// backend process yet echoes FabricNodeID -- see the function's doc
+// comment) resolves to "", never a placeholder. Uses t.Setenv("HOME", ...)
+// so this never reads a real node's config.yaml/identity.json.
+func TestResolveNodeIDForMCPHeaderEmptyWithoutConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	if got := resolveNodeIDForMCPHeader(); got != "" {
+		t.Errorf("expected empty node id with no config present, got %q", got)
+	}
 }
 
 func TestMCPBridgeNotification202(t *testing.T) {
