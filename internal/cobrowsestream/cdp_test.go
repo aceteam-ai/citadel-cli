@@ -30,6 +30,13 @@ type fakeChrome struct {
 	keys    []map[string]any
 	conns   []*websocket.Conn
 	started bool
+
+	// connReg is signaled once per accepted CDP conn, AFTER it has been appended
+	// to conns. dialCDP returns to the test the instant the client sees the 101
+	// upgrade response, which can be strictly before this handler goroutine runs
+	// the append -- so a test that wants to act on a registered conn (e.g.
+	// killConns) must wait on this first, or it races an empty conns slice.
+	connReg chan struct{}
 }
 
 func newFakeChrome() *fakeChrome {
@@ -38,6 +45,7 @@ func newFakeChrome() *fakeChrome {
 		deviceWidth:  800,
 		deviceHeight: 600,
 		jpeg:         []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03}, // JPEG-ish
+		connReg:      make(chan struct{}, 16),
 	}
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	mux := http.NewServeMux()
@@ -49,6 +57,12 @@ func newFakeChrome() *fakeChrome {
 		f.mu.Lock()
 		f.conns = append(f.conns, conn)
 		f.mu.Unlock()
+		// Registration is now visible to conns; signal any waiter (best-effort,
+		// buffered) before we block reading so killConns can't race the append.
+		select {
+		case f.connReg <- struct{}{}:
+		default:
+		}
 		f.serve(conn)
 	})
 	f.server = httptest.NewServer(mux)
@@ -116,8 +130,26 @@ func (f *fakeChrome) sendFrame(conn *websocket.Conn, seq int) {
 	_ = conn.WriteJSON(ev)
 }
 
+// waitConnRegistered blocks until the server handler has accepted and appended
+// at least one CDP conn (see connReg). Callers must do this before killConns:
+// dialCDP returns as soon as the client reads the 101 upgrade response, which
+// can precede the handler's append, so killing "now" may find conns empty and
+// close nothing -- leaving both read loops blocked forever (citadel #819).
+func (f *fakeChrome) waitConnRegistered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.connReg:
+	case <-time.After(10 * time.Second):
+		t.Fatal("server never registered a CDP conn")
+	}
+}
+
 // killConns closes the server-side CDP sockets, simulating the browser going
-// away (session stop) under a live viewer.
+// away (session stop) under a live viewer. A caller must first establish that
+// the conn has been registered (appended to conns) -- either via
+// waitConnRegistered, or by reading a frame that proves f.serve is already
+// running (as TestTeardownOnBrowserStop does). Otherwise this can run before the
+// handler's append and close nothing, leaving both read loops blocked forever.
 func (f *fakeChrome) killConns() {
 	f.mu.Lock()
 	conns := append([]*websocket.Conn(nil), f.conns...)
@@ -242,10 +274,20 @@ func TestCDPCloseSignalsDone(t *testing.T) {
 	}
 	defer cdp.Close()
 
+	// Wait until the fake has actually registered the conn before killing it.
+	// Without this, killConns can run before the handler appends the conn (dialCDP
+	// returns on the 101 upgrade, which precedes the append under parallel load),
+	// close nothing, and leave the read loop blocked forever -- the #819 flake,
+	// which failed a release. The 3s wall-clock guard the select used before was a
+	// red herring: the real defect was this unsynchronized close, not a tight
+	// deadline. Once the kill is deterministic, Done() closes in ms.
+	f.waitConnRegistered(t)
 	f.killConns()
 	select {
 	case <-cdp.Done():
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
+		// Safety net only: with the kill synchronized above this never fires
+		// unless Done() genuinely regresses.
 		t.Fatal("Done() not closed after browser socket dropped")
 	}
 }
