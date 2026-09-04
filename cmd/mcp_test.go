@@ -398,7 +398,7 @@ func TestMCPBridgeForwardToBackendInjectsNodeIDHeaderWhenPresent(t *testing.T) {
 // every real node today -- see resolveNodeIDForMCPHeader's doc comment), the
 // header key must be entirely ABSENT from the outgoing request, never
 // present with an empty value. An empty header is worse than no header (the
-// backend could misread it as "caller claims to be node ''").
+// backend could misread it as "caller claims to be node ”").
 func TestMCPBridgeForwardToBackendOmitsNodeIDHeaderWhenAbsent(t *testing.T) {
 	var gotOK bool
 
