@@ -2250,3 +2250,19 @@ Auto-generated log of every release.
   - feat: session-scoped CDP actions on COBROWSE_SESSION (#978) (#984)
 
 
+---
+
+## v2.144.0 — 2026-09-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 6 |
+| Lines added | +689 |
+
+**Changes:**
+
+  - feat: inject x-citadel-node-id header into generated MCP client config (#977) (#987)
+  - fix: retry WriteClaimed/WriteEnd + synchronous HTTP fallback on WS publish error (#985) (#986)
+
+
