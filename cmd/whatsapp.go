@@ -260,18 +260,42 @@ func deployWhatsAppCompose(source, image string, report *deployReport) func(serv
 	}
 }
 
-// bridgeModuleInstalled reports whether the WhatsApp bridge has a module
-// lockfile entry -- i.e. the module system (lockfile + reconcile / MODULE_SET)
-// owns its compose lifecycle (citadel#624 D5). Best-effort: an unreadable/absent
-// lockfile means "not module-managed", so the bespoke deploy runs as the
-// fallback -- the safe direction (a fresh/old node still provisions).
+// bridgeModuleInstalled reports whether the module system (lockfile + reconcile
+// / MODULE_SET) owns the WhatsApp bridge's compose lifecycle on THIS machine --
+// the citadel#624 D5 delegation trigger.
+//
+// It keys on node-MANIFEST membership, NOT the lockfile (citadel#624 FIX A). Two
+// reasons, both load-bearing:
+//
+//   - Distinguishing: the module system registers the bridge in the manifest
+//     (liveModuleOps.Install / catalog install -> addServiceToManifest), while
+//     the bespoke `citadel whatsapp` deploy deliberately NEVER does (see
+//     runWhatsAppUp). So "in the manifest" means precisely "module-owned", which
+//     is exactly what D5 must delegate on -- a compose-file-exists check could
+//     not tell a module install apart from a bespoke one.
+//   - Machine-convergent: the manifest is read through findAndReadManifest, the
+//     SAME node_config_dir resolution (config.yaml -> node_config_dir) the module
+//     install uses to WRITE it, so a root systemd `citadel work` MODULE_SET
+//     install and a later interactive `citadel whatsapp provision` AGREE whenever
+//     they share a node_config_dir (the normal topology). The prior lockfile
+//     signal did NOT: catalog.LockfilePath() is platform.ConfigDir()-scoped
+//     (/etc/citadel or /root/.citadel-cli for the root worker vs ~/.citadel-cli
+//     for the interactive user), so it diverged even when node_config_dir was
+//     shared -- defeating D5 in exactly the systemd topology this fix targets, so
+//     the bespoke deploy ran OVER the module system's files (the dual-ownership
+//     D5 forbids).
+//
+// Best-effort: an unresolvable manifest means "not module-managed here", so the
+// bespoke deploy runs as the fallback (the safe direction for a fresh/old node).
+// Residual (pre-existing, out of scope): if the two invocations resolve DIFFERENT
+// node_config_dirs via divergent config.yaml, they operate on different node dirs
+// entirely and the only remaining shared resource is the docker compose project.
 func bridgeModuleInstalled() bool {
-	lf, err := catalog.LoadLockfile()
-	if err != nil || lf == nil {
+	manifest, _, err := findAndReadManifest()
+	if err != nil || manifest == nil {
 		return false
 	}
-	_, ok := lf.LookupLock(whatsapp.ServiceName)
-	return ok
+	return hasService(manifest, whatsapp.ServiceName)
 }
 
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It

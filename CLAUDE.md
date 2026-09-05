@@ -1040,9 +1040,14 @@ now proposes `ActionUninstall` ONLY for an `InstalledModule` whose `ManagedBy ==
 reconcile.ManagedByDesiredState` (`"desired-state"`). An UNSTAMPED entry — every
 pre-#624 lockfile row, an operator/catalog CLI install
 (`recordCatalogModuleLock` leaves it empty), an embedded engine, the bespoke
-bridge — is NEVER drift-uninstalled, even when absent from a NON-empty desired
-set. This is the aceteam#4273 blast-radius fix: a single-row desired assignment
-can no longer tear down every OTHER module-recorded service. It is DISTINCT from
+bridge — is never *drift*-uninstalled (installed-but-absent-from-a-non-empty-
+desired-set), even when absent from a NON-empty desired set. It is NOT immune to
+all change: a desired assignment that NAMES it still adopts/replaces it in place
+(`liveModuleOps.Install`'s update-in-place teardown is gated on
+`hasService(manifest, name)`, the manifest, not on provenance — that is how
+bespoke→module adoption works). The guard covers only the drift-DELETE arm. This
+is the aceteam#4273 blast-radius fix: a single-row desired assignment can no
+longer tear down every OTHER module-recorded service. It is DISTINCT from
 the empty-desired full-wipe guard (`loop.go`), which fires before `Reconcile`.
 Only `liveModuleOps.recordLock` (the desired-state/MODULE_SET converge path)
 stamps `ManagedByDesiredState`; `ListInstalled` plumbs `LockEntry.ManagedBy` onto

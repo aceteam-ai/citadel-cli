@@ -201,6 +201,76 @@ func TestBridgeDesiredDoesNotUninstallUnstampedSibling(t *testing.T) {
 	}
 }
 
+// TestBridgeModuleInstalledUsesConvergentManifestNotLockfile pins citadel#624
+// FIX A: D5 delegation must key on node-MANIFEST membership (machine-convergent,
+// resolved through config.yaml -> node_config_dir, the SAME path the module
+// install writes to) rather than the invoker-scoped lockfile. This test writes a
+// manifest that REGISTERS the bridge (what a module/catalog install does via
+// addServiceToManifest) but writes NO lockfile at all -- proving the signal does
+// not depend on the lockfile that diverges between a root systemd `citadel work`
+// (/etc/citadel or /root/.citadel-cli) and an interactive user (~/.citadel-cli).
+// So a root MODULE_SET install is seen by an interactive `citadel whatsapp
+// provision` that shares the node_config_dir, which is the systemd-topology
+// agreement FIX A restores (the bespoke deploy previously ran OVER the module
+// files because the lockfile signal missed).
+func TestBridgeModuleInstalledUsesConvergentManifestNotLockfile(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: whatsapp.ServiceName, ComposeFile: filepath.Join("services", whatsapp.ServiceName+".yml")},
+	})
+	// Deliberately NO writeLockfile: the manifest alone must drive detection.
+	if !bridgeModuleInstalled() {
+		t.Fatal("a bridge registered in the manifest (module-installed) must be detected as module-managed, with no lockfile present (citadel#624 FIX A)")
+	}
+}
+
+// TestBridgeModuleInstalledFalseForBespokeOnly pins the other half of FIX A: the
+// bespoke `citadel whatsapp` deploy NEVER adds the bridge to the manifest (see
+// runWhatsAppUp), so a node with only a bespoke bridge must NOT delegate --
+// otherwise a re-provision would skip the deploy and silently do nothing.
+func TestBridgeModuleInstalledFalseForBespokeOnly(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: "vllm", ComposeFile: filepath.Join("services", "vllm.yml")},
+	})
+	if bridgeModuleInstalled() {
+		t.Fatal("a bespoke-only bridge (absent from the manifest) must NOT be treated as module-managed (citadel#624 FIX A)")
+	}
+}
+
+// TestListInstalledBridgeSteadyStateNoUpdateWithConfig pins citadel#624 FIX F:
+// the steady state must converge to an EMPTY plan even when both the desired
+// assignment and the lockfile carry a real (non-empty) config -- no perpetual
+// ActionUpdate. It exercises reconcile.sameConfig on a populated map (the earlier
+// health test used empty config on both sides), guarding against a future change
+// that lets carried/secret config drift the two sides apart.
+func TestListInstalledBridgeSteadyStateNoUpdateWithConfig(t *testing.T) {
+	cfg := map[string]string{"BRIDGE_PORT": "8123", "PUBLIC_URL": "https://x", "LOG_LEVEL": "info"}
+	writeManifestWithServices(t, []Service{
+		{Name: whatsapp.ServiceName, ComposeFile: filepath.Join("services", whatsapp.ServiceName+".yml")},
+	})
+	writeLockfile(t, []catalog.LockEntry{
+		{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName, ManagedBy: reconcile.ManagedByDesiredState, HealthComposeService: whatsapp.BridgeService, Config: cfg},
+	})
+	o := newTestModuleOps(map[string]bool{})
+	o.composeServiceRunning = func(project, service string) bool { return true }
+	actual, err := o.ListInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstalled: %v", err)
+	}
+	desired := reconcile.DesiredState{
+		Revision: "rev-1",
+		Modules: []reconcile.ModuleAssignment{
+			{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName, Config: cfg},
+		},
+	}
+	plan, err := reconcile.Reconcile(context.Background(), desired, actual)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !plan.IsEmpty() {
+		t.Fatalf("steady state with matching non-empty config must converge EMPTY (no perpetual ActionUpdate), got %v", plan.Steps)
+	}
+}
+
 // TestListInstalledBridgeHealthViaComposeService pins citadel#624 sub-collision
 // 3: a module that declared health_check.compose_service (persisted as
 // HealthComposeService) reports its run-state via the compose PROJECT+SERVICE,

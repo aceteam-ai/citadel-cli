@@ -1,6 +1,8 @@
 package whatsapp
 
 import (
+	"strings"
+
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -148,7 +150,7 @@ func AttachBridgeModule(state *fabricpb.ActualState, m *fabricpb.ActualModule) {
 		return
 	}
 	for _, existing := range state.Modules {
-		if existing == nil || existing.Source != m.Source {
+		if existing == nil || !sourceNamesBridge(existing.Source) {
 			continue
 		}
 		existing.Endpoints = m.Endpoints
@@ -159,4 +161,46 @@ func AttachBridgeModule(state *fabricpb.ActualState, m *fabricpb.ActualModule) {
 		return
 	}
 	state.Modules = append(state.Modules, m)
+}
+
+// sourceNamesBridge reports whether an ActualModule Source refers to the WhatsApp
+// bridge -- whether recorded by its sanctioned catalog NAME ("whatsapp-bridge" ==
+// ServiceName, the D2 install path) OR a git-SOURCE form
+// ("owner/whatsapp-bridge[@ref]", ".../whatsapp-bridge.git"). Both reduce to the
+// same canonical module name, so the decorator keys on that rather than raw
+// string equality (citadel#624 FIX D): otherwise a git-source-installed bridge
+// (lockfile Source "sunapi386/whatsapp-bridge") would never match the synthetic
+// row (Source == ServiceName) and the bridge would be PERMANENTLY double-reported
+// under an upsert-by-source ingest. It mirrors reconcile.NameFromSource's
+// canonicalization for the forms that matter; whatsapp cannot import reconcile
+// (reconcile imports whatsapp), so it is duplicated here and pinned by
+// TestSourceNamesBridge.
+func sourceNamesBridge(source string) bool {
+	return canonicalModuleName(source) == ServiceName
+}
+
+// canonicalModuleName reduces a module source string (catalog name |
+// owner/repo[@ref] | git URL) to its canonical module name -- the repo/basename
+// segment, ref and ".git" stripped. A faithful mirror of reconcile.NameFromSource
+// for the source shapes the bridge can be installed from.
+func canonicalModuleName(source string) string {
+	s := strings.TrimSpace(source)
+	if s == "" {
+		return ""
+	}
+	// Strip an "@ref" suffix, but NOT the "@" of an scp-style git URL
+	// ("git@github.com:owner/repo.git"), where "@" precedes the host (a ref never
+	// contains "/" or ":").
+	if at := strings.LastIndex(s, "@"); at > 0 {
+		if tail := s[at+1:]; tail != "" && !strings.ContainsAny(tail, "/:") {
+			s = s[:at]
+		}
+	}
+	if !strings.ContainsAny(s, "/:") {
+		return s // bare catalog name
+	}
+	if i := strings.LastIndexAny(s, "/:"); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.TrimSuffix(s, ".git")
 }

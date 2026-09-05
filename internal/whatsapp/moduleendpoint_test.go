@@ -8,6 +8,62 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// TestSourceNamesBridge pins citadel#624 FIX D's canonicalization: the sanctioned
+// catalog NAME and every git-SOURCE form of the bridge collapse to ServiceName,
+// while unrelated modules (including a same-prefix decoy) do not.
+func TestSourceNamesBridge(t *testing.T) {
+	match := []string{
+		"whatsapp-bridge",
+		"sunapi386/whatsapp-bridge",
+		"sunapi386/whatsapp-bridge@v1.2.0",
+		"https://github.com/sunapi386/whatsapp-bridge.git",
+		"https://github.com/sunapi386/whatsapp-bridge.git@main",
+		"git@github.com:sunapi386/whatsapp-bridge.git",
+	}
+	for _, s := range match {
+		if !sourceNamesBridge(s) {
+			t.Errorf("sourceNamesBridge(%q) = false, want true", s)
+		}
+	}
+	no := []string{"", "vllm", "owner/other", "sunapi386/whatsapp-bridge-extra", "whatsapp"}
+	for _, s := range no {
+		if sourceNamesBridge(s) {
+			t.Errorf("sourceNamesBridge(%q) = true, want false", s)
+		}
+	}
+}
+
+// TestAttachBridgeModule_GitSourceRealRowCollapses pins citadel#624 FIX D at the
+// decorator: a git-source-installed bridge records lockfile Source
+// "sunapi386/whatsapp-bridge", while the synthetic row's Source is ServiceName.
+// The decorator must collapse them into ONE row (canonical-name match) and attach
+// the endpoints onto the real row -- NOT append a permanent duplicate the
+// upsert-by-source ingest would flap on.
+func TestAttachBridgeModule_GitSourceRealRowCollapses(t *testing.T) {
+	state := &fabricpb.ActualState{Modules: []*fabricpb.ActualModule{
+		{Source: "sunapi386/whatsapp-bridge", Status: fabricpb.ModuleStatus_MODULE_STATUS_RUNNING},
+	}}
+	synthetic := &fabricpb.ActualModule{
+		Source: ServiceName,
+		Status: fabricpb.ModuleStatus_MODULE_STATUS_RUNNING,
+		Health: fabricpb.ModuleHealth_MODULE_HEALTH_HEALTHY,
+		Endpoints: []*fabricpb.ModuleEndpoint{{
+			Name: BridgeService, Kind: "rest", Scheme: "https", Port: 8443,
+			Path: "/modules/whatsapp", HealthPath: HealthPath, AdminKeyFingerprint: "sha256:abcd",
+		}},
+	}
+	AttachBridgeModule(state, synthetic)
+	if len(state.Modules) != 1 {
+		t.Fatalf("git-source real row must collapse to ONE bridge row, got %d", len(state.Modules))
+	}
+	if got := state.Modules[0].GetSource(); got != "sunapi386/whatsapp-bridge" {
+		t.Errorf("the real (git-source) row must be kept, got Source %q", got)
+	}
+	if len(state.Modules[0].GetEndpoints()) != 1 {
+		t.Fatal("the synthetic endpoints must attach to the git-source real row")
+	}
+}
+
 // TestAdminKeyFingerprint_EmptyIsNeverHashOfEmpty pins the required contract:
 // a missing/empty admin key reads "", never the hash of an empty string.
 func TestAdminKeyFingerprint_EmptyIsNeverHashOfEmpty(t *testing.T) {
