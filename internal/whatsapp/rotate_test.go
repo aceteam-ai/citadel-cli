@@ -14,17 +14,35 @@ import (
 // records the admin key it was constructed with so a test can assert the VERIFY
 // call authenticated with the NEW key.
 type fakeRotateBridge struct {
-	ready    error
-	listErr  error
-	adminKey string
+	ready     error
+	listErr   error
+	adminKey  string
+	listCalls int
 }
 
 func (f *fakeRotateBridge) WaitReady(ctx context.Context, timeout time.Duration) error {
 	return f.ready
 }
 func (f *fakeRotateBridge) ListTenants(ctx context.Context) ([]map[string]any, error) {
+	f.listCalls++
 	if f.listErr != nil {
 		return nil, f.listErr
+	}
+	return []map[string]any{}, nil
+}
+
+// flakyListBridge fails ListTenants transiently for the first failFirst calls,
+// then succeeds -- to exercise the verify retry's recovery path.
+type flakyListBridge struct {
+	failFirst int
+	calls     int
+}
+
+func (f *flakyListBridge) WaitReady(ctx context.Context, timeout time.Duration) error { return nil }
+func (f *flakyListBridge) ListTenants(ctx context.Context) ([]map[string]any, error) {
+	f.calls++
+	if f.calls <= f.failFirst {
+		return nil, errors.New("connection refused")
 	}
 	return []map[string]any{}, nil
 }
@@ -44,6 +62,11 @@ const rotateSentinelKey = "wab_admin_ROTATED_SENTINEL_KEY_bytes"
 
 func rotateTestDeps(t *testing.T, env map[string]string) *rotateTestState {
 	t.Helper()
+	// Drop the verify backoff so transient-retry paths don't sleep in tests.
+	prevBackoff := adminVerifyBackoff
+	adminVerifyBackoff = 0
+	t.Cleanup(func() { adminVerifyBackoff = prevBackoff })
+
 	dir := t.TempDir()
 	if env != nil {
 		if err := SaveEnv(dir, env); err != nil {
@@ -53,7 +76,7 @@ func rotateTestDeps(t *testing.T, env map[string]string) *rotateTestState {
 	st := &rotateTestState{dir: dir}
 	st.deps = RotateDeps{
 		ServicesDir:      func() (string, error) { return dir, nil },
-		RecreateBridge:   func(servicesDir string) error { st.recreateCalls++; return nil },
+		RecreateBridge:   func(ctx context.Context, servicesDir string) error { st.recreateCalls++; return nil },
 		GenerateAdminKey: func() (string, error) { return rotateSentinelKey, nil },
 		NewBridgeClient: func(port int, adminKey string) RotateBridgeClient {
 			st.verifyAdminKey = adminKey
@@ -148,27 +171,84 @@ func TestRotateAdminKey_Atomic0600NoTempLeak(t *testing.T) {
 	}
 }
 
-// TestRotateAdminKey_VerifyFailureLeavesNewKeyOnDisk pins the deliberate
-// failure-ordering contract: a verify failure (ListTenants 401) leaves the NEW
-// key persisted (not rolled back), and the error tells the operator so.
-func TestRotateAdminKey_VerifyFailureLeavesNewKeyOnDisk(t *testing.T) {
+// TestRotateAdminKey_AuthRejectionIsDefinitive pins that a real 401/403
+// (ErrAdminUnauthorized) is reported as a REJECTION, is NOT retried, and leaves
+// the NEW key on disk (the deliberate failure-ordering contract).
+func TestRotateAdminKey_AuthRejectionIsDefinitive(t *testing.T) {
 	st := rotateTestDeps(t, map[string]string{"ADMIN_API_KEY": "wab_admin_old", "BRIDGE_PORT": "8082"})
+	var fake *fakeRotateBridge
 	st.deps.NewBridgeClient = func(port int, adminKey string) RotateBridgeClient {
 		st.verifyAdminKey = adminKey
-		return &fakeRotateBridge{listErr: errors.New("HTTP 401 unauthorized")}
+		fake = &fakeRotateBridge{listErr: fmt.Errorf("list tenants failed (HTTP 401): nope: %w", ErrAdminUnauthorized)}
+		return fake
 	}
 
 	_, err := RotateAdminKey(context.Background(), st.deps)
 	if err == nil {
-		t.Fatal("expected error on verify failure, got nil")
+		t.Fatal("expected error on auth rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "REJECTED") {
+		t.Errorf("auth-rejection error should say REJECTED, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "on disk") {
-		t.Errorf("verify-failure error should say the new key is on disk, got: %v", err)
+		t.Errorf("error should tell the operator the new key is on disk, got: %v", err)
 	}
-
+	if fake.listCalls != 1 {
+		t.Errorf("a definitive 401 must NOT be retried; ListTenants calls = %d, want 1", fake.listCalls)
+	}
 	got, _ := LoadEnv(st.dir)
 	if got["ADMIN_API_KEY"] != rotateSentinelKey {
-		t.Errorf("after verify failure ADMIN_API_KEY = %q, want the NEW key (no rollback)", got["ADMIN_API_KEY"])
+		t.Errorf("after auth rejection ADMIN_API_KEY = %q, want the NEW key (no rollback)", got["ADMIN_API_KEY"])
+	}
+}
+
+// TestRotateAdminKey_TransientVerifyIsInconclusive pins that a transport/timeout
+// error (NOT ErrAdminUnauthorized) is retried up to the attempt bound and then
+// reported as "could not verify" -- NEVER asserted as an auth failure -- with the
+// new key still on disk.
+func TestRotateAdminKey_TransientVerifyIsInconclusive(t *testing.T) {
+	st := rotateTestDeps(t, map[string]string{"ADMIN_API_KEY": "wab_admin_old", "BRIDGE_PORT": "8082"})
+	var fake *fakeRotateBridge
+	st.deps.NewBridgeClient = func(port int, adminKey string) RotateBridgeClient {
+		fake = &fakeRotateBridge{listErr: errors.New("dial tcp 127.0.0.1:8082: connect: connection refused")}
+		return fake
+	}
+
+	_, err := RotateAdminKey(context.Background(), st.deps)
+	if err == nil {
+		t.Fatal("expected error on transient verify failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "could not verify") {
+		t.Errorf("transient error must read as 'could not verify', got: %v", err)
+	}
+	if strings.Contains(err.Error(), "REJECTED") {
+		t.Errorf("a transient error must NOT be reported as an auth rejection, got: %v", err)
+	}
+	if fake.listCalls != adminVerifyAttempts {
+		t.Errorf("a transient error should retry to the bound; ListTenants calls = %d, want %d", fake.listCalls, adminVerifyAttempts)
+	}
+	got, _ := LoadEnv(st.dir)
+	if got["ADMIN_API_KEY"] != rotateSentinelKey {
+		t.Errorf("after transient failure ADMIN_API_KEY = %q, want the NEW key (no rollback)", got["ADMIN_API_KEY"])
+	}
+}
+
+// TestRotateAdminKey_VerifyRecoversAfterTransientRetry pins that a verify that
+// fails transiently then succeeds within the bound reports success.
+func TestRotateAdminKey_VerifyRecoversAfterTransientRetry(t *testing.T) {
+	st := rotateTestDeps(t, map[string]string{"ADMIN_API_KEY": "wab_admin_old", "BRIDGE_PORT": "8082"})
+	flaky := &flakyListBridge{failFirst: 2}
+	st.deps.NewBridgeClient = func(port int, adminKey string) RotateBridgeClient { return flaky }
+
+	res, err := RotateAdminKey(context.Background(), st.deps)
+	if err != nil {
+		t.Fatalf("expected success after transient retries, got %v", err)
+	}
+	if !res.Rotated {
+		t.Error("Rotated = false, want true")
+	}
+	if flaky.calls <= 2 {
+		t.Errorf("expected a retry past the transient failures; calls = %d", flaky.calls)
 	}
 }
 
@@ -227,11 +307,14 @@ func TestRotateAdminKey_EmptyOldKeyEmptyFingerprint(t *testing.T) {
 	}
 }
 
-// TestRotateAdminKey_NoSecretBytesLeak scans the result, the error, the
-// persisted-then-reloaded logs, and the on-disk env comment header across BOTH
-// the success and the verify-failure branches for the raw key bytes. The
-// fingerprint (a one-way digest) may appear; the key bytes must never appear in
-// the result struct, the error, or any log line.
+// TestRotateAdminKey_NoSecretBytesLeak scans the result fingerprints, the error,
+// and every captured log line across the success, verify-failure, AND
+// recreate-failure branches for the raw key bytes. The recreate-failure branch
+// matters most: it is the one path whose error wraps a third-party subprocess's
+// output (docker's stdout via startBridgeStack), so it is the likeliest place a
+// secret could ride out. The fingerprint (a one-way digest) may appear; the key
+// bytes must never appear in the result, the error, or any log line. (The on-disk
+// env file legitimately holds the key and is NOT scanned.)
 func TestRotateAdminKey_NoSecretBytesLeak(t *testing.T) {
 	scan := func(t *testing.T, where string, s string) {
 		if strings.Contains(s, rotateSentinelKey) {
@@ -255,11 +338,29 @@ func TestRotateAdminKey_NoSecretBytesLeak(t *testing.T) {
 	t.Run("verify_failure", func(t *testing.T) {
 		st := rotateTestDeps(t, map[string]string{"ADMIN_API_KEY": "wab_admin_old", "BRIDGE_PORT": "8082"})
 		st.deps.NewBridgeClient = func(port int, adminKey string) RotateBridgeClient {
-			return &fakeRotateBridge{listErr: errors.New("HTTP 401 unauthorized")}
+			return &fakeRotateBridge{listErr: fmt.Errorf("rejected: %w", ErrAdminUnauthorized)}
 		}
 		_, err := RotateAdminKey(context.Background(), st.deps)
 		if err == nil {
 			t.Fatal("expected verify failure")
+		}
+		scan(t, "error", err.Error())
+		for i, line := range st.logs {
+			scan(t, fmt.Sprintf("log[%d]", i), line)
+		}
+	})
+
+	t.Run("recreate_failure", func(t *testing.T) {
+		st := rotateTestDeps(t, map[string]string{"ADMIN_API_KEY": "wab_admin_old", "BRIDGE_PORT": "8082"})
+		// A realistic docker recreate error (compose echoes the variable NAME on a
+		// ${VAR:?} failure, never the value). The rotation must not pull the key
+		// value in FROM the env it just wrote and splice it into the error/logs.
+		st.deps.RecreateBridge = func(ctx context.Context, servicesDir string) error {
+			return errors.New("docker compose up failed: required variable ADMIN_API_KEY is missing")
+		}
+		_, err := RotateAdminKey(context.Background(), st.deps)
+		if err == nil {
+			t.Fatal("expected recreate failure")
 		}
 		scan(t, "error", err.Error())
 		for i, line := range st.logs {

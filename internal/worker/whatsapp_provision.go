@@ -121,6 +121,10 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 	// additive operation on the SAME per-node-gated job type (citadel#624 part 3),
 	// not a variant of provision. Rotate-only keeps "one implementation, two entry
 	// points" honest (the CLI `citadel whatsapp rotate-key` is rotate-only too).
+	//
+	// Wire contract for the aceteam side: `rotate_admin_key` must be a JSON BOOL
+	// (`true`) or a truthy STRING (`"true"`/`"1"`/`"yes"`/`"on"`). A JSON NUMBER
+	// (`1`) is NOT accepted -- payloadBool reads it as false -- so send a bool.
 	if payloadBool(job.Payload, "rotate_admin_key") {
 		return h.rotate(ctx), nil
 	}

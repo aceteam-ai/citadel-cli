@@ -21,9 +21,19 @@ package whatsapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
+)
+
+// adminVerifyAttempts / adminVerifyBackoff bound the post-recreate verification
+// retry. They are package vars (not consts) so tests can drop the backoff to
+// zero rather than sleeping. A DEFINITIVE auth rejection (ErrAdminUnauthorized)
+// never retries regardless -- only transient transport/timeout errors do.
+var (
+	adminVerifyAttempts = 4
+	adminVerifyBackoff  = 2 * time.Second
 )
 
 // RotateResult is the structured outcome of an admin-key rotation. It carries
@@ -72,8 +82,10 @@ type RotateDeps struct {
 	// RecreateBridge recreates the bridge container so it starts with the env
 	// file's (now rotated) ADMIN_API_KEY. It must ride the #718 pull-before-up
 	// behavior via startBridgeStack; RotateAdminKey persists the new env BEFORE
-	// calling it, so the recreate observes the new key through --env-file.
-	RecreateBridge func(servicesDir string) error
+	// calling it, so the recreate observes the new key through --env-file. The
+	// ctx is threaded through so a SIGTERM/root-cancel can reach the compose
+	// subprocess (repo precedent #488) instead of being dropped.
+	RecreateBridge func(ctx context.Context, servicesDir string) error
 
 	// NewBridgeClient builds a RotateBridgeClient for the locally running bridge
 	// at the given loopback port using the given admin key.
@@ -104,6 +116,18 @@ type RotateDeps struct {
 // untouched), and it is RECOVERABLE by simply re-running rotation (or `citadel
 // whatsapp up`), which the verify-failure error says explicitly so the operator
 // is never left guessing at a half-applied state.
+//
+// Competing-consumer race (documented, low severity, NOT coordinated here --
+// mirrors how ReconcileOrphanedReservations documents its own worklock gap):
+// `citadel whatsapp rotate-key` runs in a separate CLI process that holds NO
+// worklock, while a concurrent WHATSAPP_PROVISION job (on `citadel work`'s
+// serialized lane) does its own LoadEnv -> ... -> SaveEnv and would write back
+// the OLD admin key it loaded before this rotation ran -- silently reverting a
+// rotation this function already reported as succeeded. It is deliberately not
+// closed with cross-process locking: the outcome is consistent (the bridge and
+// the env file still agree, just on the old key) and re-running rotation
+// recovers. The CLI additionally prints a best-effort warning when a `citadel
+// work` worklock is currently held (cmd/whatsapp_rotate.go).
 func RotateAdminKey(ctx context.Context, deps RotateDeps) (*RotateResult, error) {
 	if deps.ServicesDir == nil || deps.RecreateBridge == nil || deps.NewBridgeClient == nil {
 		return nil, fmt.Errorf("whatsapp.RotateAdminKey: ServicesDir, RecreateBridge and NewBridgeClient are required")
@@ -169,6 +193,13 @@ func RotateAdminKey(ctx context.Context, deps RotateDeps) (*RotateResult, error)
 	// ${ADMIN_API_KEY:?} interpolation.
 	env["ADMIN_API_KEY"] = newKey
 	if err := SaveEnv(servicesDir, env); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			// The env file (and its dir) are typically owned by the root `citadel
+			// work` worker; a non-root operator cannot write the tempfile or rename
+			// it into place. Name the likely cause instead of a bare "permission
+			// denied", and stop before any recreate.
+			return nil, fmt.Errorf("persist rotated admin key: %w -- the bridge env file at %s is likely owned by the root `citadel work` worker; run `citadel whatsapp rotate-key` with the same privileges (e.g. sudo)", err, envPath)
+		}
 		return nil, fmt.Errorf("persist rotated admin key: %w", err)
 	}
 	log("admin key rotated on disk (fingerprint %s -> %s); recreating bridge to apply it", oldFingerprint, newFingerprint)
@@ -179,23 +210,56 @@ func RotateAdminKey(ctx context.Context, deps RotateDeps) (*RotateResult, error)
 	// sunapi386/whatsapp-bridge repo, not readable here) -- the verify step below
 	// is what catches it if a recreate silently no-ops, so this does not assert
 	// the mechanism, only depends on it.
-	if err := deps.RecreateBridge(servicesDir); err != nil {
+	if err := deps.RecreateBridge(ctx, servicesDir); err != nil {
 		return nil, fmt.Errorf("recreate bridge after key rotation (the new admin key is already persisted; re-run rotation or `citadel whatsapp up` to retry): %w", err)
 	}
 
 	// Verify the NEW key authenticates against the admin control plane. WaitReady
-	// first (the container just restarted), then an admin-authed ListTenants with
-	// the new key. A failure here means the recreate did not pick up the new env
-	// -- the state this gate exists to catch -- so the error tells the operator
-	// the new key is already on disk and re-running recovers.
+	// first (the container just restarted), on its OWN readiness budget, then the
+	// admin-authed ListTenants with the new key. The verify gets a FRESH
+	// per-attempt timeout (httpTimeout) -- NOT the leftover slice of the readiness
+	// budget WaitReady already consumed -- plus a bounded retry, so a slow cold
+	// node cannot turn a 2s-leftover transport error into a false auth failure.
 	client := deps.NewBridgeClient(port, newKey)
-	waitCtx, cancel := context.WithTimeout(ctx, readyTimeout)
-	defer cancel()
-	if err := client.WaitReady(waitCtx, readyTimeout); err != nil {
-		return nil, fmt.Errorf("bridge did not become ready after admin-key rotation (the new admin key is already persisted; re-run rotation or `citadel whatsapp up` once the bridge is up): %w", err)
+	readyCtx, cancelReady := context.WithTimeout(ctx, readyTimeout)
+	readyErr := client.WaitReady(readyCtx, readyTimeout)
+	cancelReady()
+	if readyErr != nil {
+		return nil, fmt.Errorf("bridge did not become ready after admin-key rotation (the new admin key is already on disk; re-run rotation or `citadel whatsapp up` once the bridge is up): %w", readyErr)
 	}
-	if _, err := client.ListTenants(waitCtx); err != nil {
-		return nil, fmt.Errorf("the rotated admin key did not authenticate against the bridge control plane -- the new key IS on disk and the bridge was recreated, but an admin call with it failed; re-run `citadel whatsapp rotate-key` (or `citadel whatsapp up`) to retry: %w", err)
+
+	var lastErr error
+	verified := false
+	for attempt := 1; attempt <= adminVerifyAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, httpTimeout)
+		_, err := client.ListTenants(attemptCtx)
+		cancel()
+		if err == nil {
+			verified = true
+			break
+		}
+		lastErr = err
+		// A DEFINITIVE 401/403 will not self-heal -- report an auth failure and
+		// stop (retrying a rejected key is pointless and would waste the budget).
+		if errors.Is(err, ErrAdminUnauthorized) {
+			return nil, fmt.Errorf("the rotated admin key was REJECTED by the bridge control plane (HTTP 401/403) -- the new key IS on disk and the bridge was recreated, but it did not take effect; re-run `citadel whatsapp rotate-key` (or `citadel whatsapp up`) to retry: %w", err)
+		}
+		// Transient (transport/timeout): back off and retry, unless the caller's
+		// context is cancelled or we are out of attempts.
+		if attempt == adminVerifyAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("admin-key rotation verification cancelled -- the new key IS on disk and the bridge was recreated; re-run `citadel whatsapp rotate-key` to re-verify: %w", ctx.Err())
+		case <-time.After(adminVerifyBackoff):
+		}
+	}
+	if !verified {
+		// The check never COMPLETED (timeout/transport), so we must NOT assert an
+		// auth failure -- say "could not verify" and that the key is written, so
+		// the operator re-runs to re-verify rather than assuming the key is bad.
+		return nil, fmt.Errorf("could not verify the rotated admin key against the bridge control plane -- the new key IS on disk and the bridge was recreated, but the check did not complete (timeout or transport error); re-run `citadel whatsapp rotate-key` to re-verify: %w", lastErr)
 	}
 
 	log("admin key rotation verified against the bridge control plane with the new key")
