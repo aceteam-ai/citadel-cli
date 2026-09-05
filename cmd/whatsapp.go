@@ -298,9 +298,44 @@ func bridgeModuleInstalled() bool {
 	return hasService(manifest, whatsapp.ServiceName)
 }
 
+// refuseBridgeProvisionUnderNodeDir refuses the bespoke bridge provision/deploy
+// when a --node-dir/CITADEL_NODE_DIR override is active (citadel#624 FIX A
+// hardening, caught in review). Under an override the D5 delegation signal
+// (bridgeModuleInstalled, via findAndReadManifest) resolves to the OVERRIDE's
+// manifest, not the real node's, so it cannot tell whether the REAL node's bridge
+// is module-managed -- AND the bespoke deploy composes with a project derived
+// from the override services-dir basename (servicesDirForNode is override-aware),
+// which collides with the real node's "services" project and would compose over
+// its bridge containers + the whatsapp_pgdata session volume (the
+// citadel#853/#860 incident class). Refusing matches
+// refuseIfLockfileWriteUnsupported's posture. Returns nil when no override is
+// active (byte-identical behavior). `citadel work` (the WHATSAPP_PROVISION job
+// path) never reaches this -- it refuses --node-dir at boot -- so only the
+// interactive CLI can hit it.
+func refuseBridgeProvisionUnderNodeDir() error {
+	override := resolveNodeDirOverride()
+	if override == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"provisioning the WhatsApp bridge does not support --node-dir/CITADEL_NODE_DIR (override %q active): "+
+			"the module-ownership delegation signal resolves to the override's manifest (not the real node's), "+
+			"and the bespoke deploy's compose project (from the override services-dir basename) can collide with "+
+			"this machine's real 'services' project -- composing over its bridge and the whatsapp_pgdata session "+
+			"volume. Unset the override to provision the bridge.", override)
+}
+
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It
 // is split out so deployWhatsAppCompose can run it under a hard deadline.
 func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, report *deployReport) error {
+	// Refuse the bespoke deploy under an active --node-dir override (citadel#624
+	// FIX A hardening): the delegation signal and the compose project both resolve
+	// unsafely under an override and a bespoke deploy could compose over the real
+	// node's bridge. See refuseBridgeProvisionUnderNodeDir.
+	if err := refuseBridgeProvisionUnderNodeDir(); err != nil {
+		return err
+	}
+
 	// Delegation (citadel#624 D5): when the bridge is a first-class module (a
 	// lockfile entry exists), the module system (lockfile + reconcile /
 	// MODULE_SET) OWNS its compose lifecycle. The bespoke deploy must NOT run a

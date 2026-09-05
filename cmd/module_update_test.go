@@ -1,11 +1,32 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 )
+
+// TestRefuseBridgeProvisionUnderNodeDir pins the citadel#624 FIX A hardening: the
+// bespoke bridge provision refuses under an active CITADEL_NODE_DIR override
+// (where the delegation signal and compose project both resolve unsafely and a
+// bespoke deploy could compose over the real node's bridge), and is a byte-clean
+// no-op when no override is active.
+func TestRefuseBridgeProvisionUnderNodeDir(t *testing.T) {
+	if err := refuseBridgeProvisionUnderNodeDir(); err != nil {
+		t.Fatalf("no override active must be a no-op, got: %v", err)
+	}
+
+	t.Setenv("CITADEL_NODE_DIR", "/tmp/override-node")
+	err := refuseBridgeProvisionUnderNodeDir()
+	if err == nil {
+		t.Fatal("an active override must refuse the bespoke bridge provision")
+	}
+	if !strings.Contains(err.Error(), "/tmp/override-node") {
+		t.Errorf("refusal should name the active override, got: %v", err)
+	}
+}
 
 // TestUpdatedLockEntryPreservesProvenance pins citadel#624 FIX C: `citadel module
 // update` rebuilds the lock entry, and must PRESERVE the desired-state provenance
