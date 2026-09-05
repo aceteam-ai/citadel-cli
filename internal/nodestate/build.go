@@ -30,6 +30,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -139,12 +140,19 @@ func newEnvelope(nodeID, agentVersion string) *fabricpb.ActualState {
 //
 // A nil state or nil provider is a no-op, so callers need no guard of their
 // own.
+//
+// Once the bridge is a first-class lockfile module (citadel#624 Part 1), the
+// attach is a DECORATOR, not a blind append: whatsapp.AttachBridgeModule merges
+// the bridge facts onto the REAL lockfile-derived row when one already exists
+// (matched by Source), emitting the synthetic row only when there is none --
+// see its doc for why (avoids the double-report the upsert-by-source ingest
+// would flap on).
 func AppendBridgeModule(ctx context.Context, state *fabricpb.ActualState, p BridgeEndpointsProvider) {
 	if state == nil || p == nil {
 		return
 	}
 	if m := p.BridgeModule(ctx); m != nil {
-		state.Modules = append(state.Modules, m)
+		whatsapp.AttachBridgeModule(state, m)
 	}
 }
 

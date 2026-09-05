@@ -73,15 +73,28 @@ func Reconcile(ctx context.Context, desired DesiredState, actual []InstalledModu
 
 	var uninstalls, installsUpdates, transitions []Step
 
-	// Uninstall anything installed but no longer desired.
-	for name := range actualByName {
-		if _, ok := desiredByName[name]; !ok {
-			uninstalls = append(uninstalls, Step{
-				Action: ActionUninstall,
-				Name:   name,
-				Reason: "installed but not in desired state",
-			})
+	// Uninstall anything installed but no longer desired -- but ONLY when it
+	// carries the desired-state provenance stamp (citadel#624 D1). An unstamped
+	// entry (operator/catalog-installed via the CLI, an embedded engine, or the
+	// bespoke WhatsApp bridge) is NEVER uninstalled by drift reconciliation, even
+	// when absent from this non-empty desired set. This is the aceteam#4273
+	// blast-radius guard: a single-row desired assignment must not tear down
+	// every other module-recorded service on the node. It is DISTINCT from (and
+	// composes with) the empty-desired full-wipe guard in loop.go, which fires
+	// before Reconcile is ever reached and covers the whole-node case.
+	for name, im := range actualByName {
+		if _, ok := desiredByName[name]; ok {
+			continue
 		}
+		if im.ManagedBy != ManagedByDesiredState {
+			// Provenance-scoped: not ours to uninstall.
+			continue
+		}
+		uninstalls = append(uninstalls, Step{
+			Action: ActionUninstall,
+			Name:   name,
+			Reason: "installed but not in desired state",
+		})
 	}
 
 	// Install / update / transition for everything desired.

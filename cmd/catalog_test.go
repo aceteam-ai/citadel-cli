@@ -24,7 +24,7 @@ func TestRecordCatalogModuleLockRecognizedByListInstalled(t *testing.T) {
 	})
 
 	// Mirrors what runCatalogInstall now does after a successful catalog install.
-	recordCatalogModuleLock("vllm", map[string]string{"PORT": "8000"}, false)
+	recordCatalogModuleLock("vllm", map[string]string{"PORT": "8000"}, false, "")
 
 	o := newTestModuleOps(map[string]bool{"vllm": true})
 	actual, err := o.ListInstalled(context.Background())
@@ -50,7 +50,7 @@ func TestCatalogInstalledModuleNoLongerReinstallsOnRetarget(t *testing.T) {
 	writeManifestWithServices(t, []Service{
 		{Name: "vllm", ComposeFile: filepath.Join("services", "vllm.yml")},
 	})
-	recordCatalogModuleLock("vllm", nil, false)
+	recordCatalogModuleLock("vllm", nil, false, "")
 
 	o := newTestModuleOps(map[string]bool{"vllm": true})
 	actual, err := o.ListInstalled(context.Background())
@@ -77,7 +77,7 @@ func TestRecordCatalogModuleLockEntryShape(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	recordCatalogModuleLock("ollama", map[string]string{"K": "V"}, true)
+	recordCatalogModuleLock("ollama", map[string]string{"K": "V"}, true, "")
 
 	lf, err := catalog.LoadLockfile()
 	if err != nil {
@@ -89,6 +89,12 @@ func TestRecordCatalogModuleLockEntryShape(t *testing.T) {
 	}
 	if e.Source != "ollama" || e.Ref != "" || e.Commit != "" || len(e.Images) != 0 {
 		t.Errorf("unexpected entry shape: %+v", e)
+	}
+	// citadel#624 D1: the operator/catalog CLI path must leave ManagedBy EMPTY
+	// (unstamped = protected from drift-uninstall). Only the desired-state
+	// converge path (liveModuleOps.recordLock) stamps it.
+	if e.ManagedBy != "" {
+		t.Errorf("catalog-CLI install must be UNSTAMPED (protected), got ManagedBy=%q", e.ManagedBy)
 	}
 	if !e.Sandboxed {
 		t.Errorf("want Sandboxed=true carried through")

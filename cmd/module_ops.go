@@ -26,6 +26,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 )
 
 // newReconcileLoop builds the desired-state PULL reconcile loop (aceteam#4273).
@@ -89,6 +90,11 @@ type liveModuleOps struct {
 	startFn     func(name, composePath string) error
 	composeDown func(composePath string, remove bool) error
 	isRunning   func(name string) bool
+	// composeServiceRunning reports whether the given compose SERVICE is up in the
+	// given compose PROJECT (citadel#624 sub-collision 3). It is the health signal
+	// for a module that declared health_check.compose_service -- one whose real
+	// container is not the generic citadel-<name> convention isRunning inspects.
+	composeServiceRunning func(project, service string) bool
 }
 
 // newLiveModuleOps builds the live adapter wired to this node's real edges.
@@ -97,10 +103,11 @@ func newLiveModuleOps(log func(format string, args ...any)) *liveModuleOps {
 		log = func(string, ...any) {}
 	}
 	return &liveModuleOps{
-		log:         log,
-		startFn:     startService,         // cmd/service.go: docker compose up -d
-		composeDown: stopServiceByCompose, // cmd/stop.go: docker compose down
-		isRunning:   containerIsRunning,   // docker inspect state
+		log:                   log,
+		startFn:               startService,                   // cmd/service.go: docker compose up -d
+		composeDown:           stopServiceByCompose,           // cmd/stop.go: docker compose down
+		isRunning:             containerIsRunning,             // docker inspect state
+		composeServiceRunning: composeServiceContainerRunning, // docker compose -p <project> ps <service>
 	}
 }
 
@@ -197,8 +204,12 @@ func (o *liveModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 	// Record provenance so a re-run does not see spurious drift. CRITICAL: store
 	// the REQUESTED source form (src.Raw) and the config, so ListInstalled reports
 	// the same canonical Source + Config the desired assignment carries and the
-	// engine converges to a no-op on the next pass.
-	o.recordLock(src, resolved, result, lockImages, m.Config)
+	// engine converges to a no-op on the next pass. This is the desired-state
+	// install path, so the entry is STAMPED ManagedByDesiredState (citadel#624
+	// D1) -- making it, and only it, eligible for a later drift-uninstall. The
+	// manifest's health_check.compose_service (if any) is carried so ListInstalled
+	// resolves this module's health correctly (sub-collision 3).
+	o.recordLock(src, resolved, result, lockImages, m.Config, manifest.HealthCheck.ComposeService)
 
 	// A fresh install/update is RUNNING: clear any stale stopped marker, then
 	// compose up. (The engine will follow with Stop if desired is stopped.)
@@ -340,7 +351,7 @@ func (o *liveModuleOps) Stop(ctx context.Context, name string) error {
 // change to this destructive-adjacent path) -- a node with no manifest has no
 // compose files to run anything from regardless of what the lockfile claims.
 func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.InstalledModule, error) {
-	manifest, _, err := findAndReadManifest()
+	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		// No manifest => nothing installed. Not an error for the reconciler.
 		return nil, nil
@@ -366,14 +377,26 @@ func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.Installe
 		servicesByName[s.Name] = s
 	}
 
+	// Compose project a no-`-p` catalog start would derive for this node's
+	// services dir (citadel#624 sub-collision 3/5): the override project when
+	// --node-dir is active, else the compose default (sanitized services-dir
+	// basename, exactly what whatsapp.ProjectName computes and the bespoke
+	// bridge deploy already uses). Used only for HealthComposeService entries.
+	servicesDir := filepath.Join(configDir, "services")
+	composeProject := composeProjectOverride()
+	if composeProject == "" {
+		composeProject = whatsapp.ProjectName(servicesDir)
+	}
+
 	out := make([]reconcile.InstalledModule, 0, len(lf.Modules))
 	for _, e := range lf.Modules {
 		im := reconcile.InstalledModule{
-			Name:   e.Name,
-			Source: e.Source,
-			Ref:    e.Ref,
-			Commit: e.Commit,
-			Config: e.Config,
+			Name:      e.Name,
+			Source:    e.Source,
+			Ref:       e.Ref,
+			Commit:    e.Commit,
+			Config:    e.Config,
+			ManagedBy: e.ManagedBy, // provenance for the #624 D1 uninstall guard
 		}
 		// Pre-canonical-form lockfile entries (or a blank Source) fall back to
 		// the module name, matching NameFromSource so a desired assignment with
@@ -382,12 +405,24 @@ func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.Installe
 			im.Source = e.Name
 		}
 		// Health: a durable stopped marker wins (when the manifest still lists
-		// this module); otherwise reflect the live container.
-		if s, ok := servicesByName[e.Name]; ok && serviceStartDisabled(s) {
+		// this module); otherwise reflect the live container. A module that
+		// declared health_check.compose_service (persisted as HealthComposeService)
+		// is checked via its compose PROJECT+SERVICE, because its real container is
+		// not the citadel-<name> convention isRunning inspects (the WhatsApp
+		// bridge's is <project>-bridge-N, #436) -- without this it would report
+		// STOPPED forever and drive a redundant ActionStart every reconcile pass.
+		switch {
+		case entryStartDisabled(servicesByName, e.Name):
 			im.Health = reconcile.HealthStopped
-		} else if o.isRunning(e.Name) {
+		case e.HealthComposeService != "" && o.composeServiceRunning != nil:
+			if o.composeServiceRunning(composeProject, e.HealthComposeService) {
+				im.Health = reconcile.HealthRunning
+			} else {
+				im.Health = reconcile.HealthStopped
+			}
+		case o.isRunning(e.Name):
 			im.Health = reconcile.HealthRunning
-		} else {
+		default:
 			im.Health = reconcile.HealthStopped
 		}
 		out = append(out, im)
@@ -395,16 +430,52 @@ func (o *liveModuleOps) ListInstalled(ctx context.Context) ([]reconcile.Installe
 	return out, nil
 }
 
+// entryStartDisabled reports whether the manifest lists this module with a
+// durable stopped marker.
+func entryStartDisabled(servicesByName map[string]Service, name string) bool {
+	s, ok := servicesByName[name]
+	return ok && serviceStartDisabled(s)
+}
+
+// composeServiceContainerRunning reports whether the given compose SERVICE has a
+// running container in the given compose PROJECT (`docker compose -p <project>
+// ps -q <service>` + a state check). Best-effort: any docker failure returns
+// false. It is the generic form of bridgeContainerRunning (cmd/whatsapp.go),
+// used as ListInstalled's health seam for HealthComposeService modules.
+func composeServiceContainerRunning(project, service string) bool {
+	if project == "" || service == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "compose", "-p", project, "ps", "-q", service).Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if id := strings.TrimSpace(line); id != "" {
+			return containerRunning(id)
+		}
+	}
+	return false
+}
+
 // recordLock upserts provenance for a freshly installed/updated module, carrying
 // the REQUESTED source form + config so the reconciler sees no spurious drift.
 // Best-effort: a lockfile write failure is logged, not fatal to the install.
-func (o *liveModuleOps) recordLock(src catalog.Source, resolved *catalog.ResolvedModule, result *catalog.InstallResult, images []catalog.LockImage, config map[string]string) {
+func (o *liveModuleOps) recordLock(src catalog.Source, resolved *catalog.ResolvedModule, result *catalog.InstallResult, images []catalog.LockImage, config map[string]string, healthComposeService string) {
 	entry := catalog.LockEntry{
 		Name:      result.Name,
 		Source:    src.Raw,
 		Ref:       src.Ref,
 		Config:    config,
 		Sandboxed: result.Sandboxed,
+		// This adapter serves ONLY the desired-state / MODULE_SET converge path,
+		// so everything it installs is eligible for a later drift-uninstall
+		// (citadel#624 D1). An operator/catalog CLI install records its entry via
+		// recordCatalogModuleLock, which leaves ManagedBy empty (protected).
+		ManagedBy:            reconcile.ManagedByDesiredState,
+		HealthComposeService: healthComposeService,
 	}
 	if resolved != nil {
 		entry.ResolvedRef = resolved.ResolvedRef

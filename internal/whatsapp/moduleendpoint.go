@@ -1,6 +1,8 @@
 package whatsapp
 
 import (
+	"strings"
+
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -117,4 +119,88 @@ func BuildBridgeModule(in BridgeModuleInputs) *fabricpb.ActualModule {
 	}
 
 	return m
+}
+
+// AttachBridgeModule merges the bridge's ActualModule row (m, from
+// BuildBridgeModule) into state.Modules WITHOUT creating a duplicate
+// (citadel#624 sub-collision 4). It is a DECORATOR, and it is the ONE place
+// both node-state reporters (nodestate.Emitter and reconcile.ProtoProvider)
+// attach the bridge facts, so the two agree.
+//
+// Once the bridge is a first-class lockfile module (citadel#624 Part 1), both
+// reporters already emit a REAL row for it -- keyed by Source == ServiceName --
+// enumerated from the lockfile. Appending m unchanged (Phase A's behavior) would
+// then double-report the same source; ingest is upsert-by-(node_id, source), so
+// the two rows would flap. So:
+//
+//   - When a real row with the SAME Source already exists, attach m's Endpoints
+//     (the admin-key fingerprint + gateway route facts Phase A carries) to THAT
+//     row, and adopt m's Status/Health -- the bridge-specific compose-project
+//     probe BuildBridgeModule used is authoritative for this module, unlike the
+//     generic citadel-<name> inspector that produced the real row's health
+//     (which never matches the bridge's <project>-bridge-N container, #436). A
+//     genuine converge ERROR on the real row is preserved (a louder, distinct
+//     signal), never overwritten by a probe reading.
+//   - When NO real row exists (an old node / bespoke deploy with no lockfile
+//     entry), m is appended as the synthetic row, exactly as Phase A did.
+//
+// A nil state or nil m is a no-op, so callers need no guard of their own.
+func AttachBridgeModule(state *fabricpb.ActualState, m *fabricpb.ActualModule) {
+	if state == nil || m == nil {
+		return
+	}
+	for _, existing := range state.Modules {
+		if existing == nil || !sourceNamesBridge(existing.Source) {
+			continue
+		}
+		existing.Endpoints = m.Endpoints
+		if existing.Health != fabricpb.ModuleHealth_MODULE_HEALTH_ERROR {
+			existing.Status = m.Status
+			existing.Health = m.Health
+		}
+		return
+	}
+	state.Modules = append(state.Modules, m)
+}
+
+// sourceNamesBridge reports whether an ActualModule Source refers to the WhatsApp
+// bridge -- whether recorded by its sanctioned catalog NAME ("whatsapp-bridge" ==
+// ServiceName, the D2 install path) OR a git-SOURCE form
+// ("owner/whatsapp-bridge[@ref]", ".../whatsapp-bridge.git"). Both reduce to the
+// same canonical module name, so the decorator keys on that rather than raw
+// string equality (citadel#624 FIX D): otherwise a git-source-installed bridge
+// (lockfile Source "sunapi386/whatsapp-bridge") would never match the synthetic
+// row (Source == ServiceName) and the bridge would be PERMANENTLY double-reported
+// under an upsert-by-source ingest. It mirrors reconcile.NameFromSource's
+// canonicalization for the forms that matter; whatsapp cannot import reconcile
+// (reconcile imports whatsapp), so it is duplicated here and pinned by
+// TestSourceNamesBridge.
+func sourceNamesBridge(source string) bool {
+	return canonicalModuleName(source) == ServiceName
+}
+
+// canonicalModuleName reduces a module source string (catalog name |
+// owner/repo[@ref] | git URL) to its canonical module name -- the repo/basename
+// segment, ref and ".git" stripped. A faithful mirror of reconcile.NameFromSource
+// for the source shapes the bridge can be installed from.
+func canonicalModuleName(source string) string {
+	s := strings.TrimSpace(source)
+	if s == "" {
+		return ""
+	}
+	// Strip an "@ref" suffix, but NOT the "@" of an scp-style git URL
+	// ("git@github.com:owner/repo.git"), where "@" precedes the host (a ref never
+	// contains "/" or ":").
+	if at := strings.LastIndex(s, "@"); at > 0 {
+		if tail := s[at+1:]; tail != "" && !strings.ContainsAny(tail, "/:") {
+			s = s[:at]
+		}
+	}
+	if !strings.ContainsAny(s, "/:") {
+		return s // bare catalog name
+	}
+	if i := strings.LastIndexAny(s, "/:"); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.TrimSuffix(s, ".git")
 }

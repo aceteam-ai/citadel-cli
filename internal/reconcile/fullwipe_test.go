@@ -235,7 +235,9 @@ func TestRefuseFullWipeAllowsEmptyDesiredWhenNothingInstalled(t *testing.T) {
 // TestRefuseFullWipeDisabledKeepsAuthoritativeSemantics confirms the default
 // (guard off) still lets the engine uninstall drift, unchanged.
 func TestRefuseFullWipeDisabledKeepsAuthoritativeSemantics(t *testing.T) {
-	ops := newFakeOps(InstalledModule{Name: "a", Source: "a", Health: HealthRunning})
+	// "a" is stamped desired-state so it is drift-uninstall-eligible (#624 D1);
+	// with the guard off, an empty desired set uninstalls it.
+	ops := newFakeOps(InstalledModule{Name: "a", Source: "a", Health: HealthRunning, ManagedBy: ManagedByDesiredState})
 	provider := &FakeProvider{Desired: DesiredState{}}
 	rec := NewReconciler(provider, ops, "node") // RefuseFullWipe defaults false
 

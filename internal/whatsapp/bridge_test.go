@@ -164,6 +164,29 @@ func TestProjectNamePreservesExistingVolume(t *testing.T) {
 	}
 }
 
+// TestBridgeVolumeProjectContinuityAcrossModuleTransition pins citadel#624
+// sub-collision 5: when the bridge becomes a first-class module, a catalog/module
+// start runs `docker compose -f <servicesDir>/whatsapp-bridge.yml up -d` with NO
+// `-p` (the #528 default), so compose derives the project from the compose file's
+// directory basename. That MUST equal ProjectName(servicesDir) -- the project the
+// bespoke deploy pinned explicitly -- or the `<project>_whatsapp_pgdata` Baileys
+// session volume orphans on the bespoke->module transition and silently unlinks
+// the user's phone. Every real node's bridge lives in <configDir>/services, so
+// both resolve to "services".
+func TestBridgeVolumeProjectContinuityAcrossModuleTransition(t *testing.T) {
+	for _, servicesDir := range []string{
+		"/home/user/.citadel-cli/services",
+		"/root/citadel-node/services",
+		filepath.Join(t.TempDir(), "services"),
+	} {
+		// Compose's no-`-p` default project == the (already-clean) basename.
+		composeDefault := filepath.Base(servicesDir)
+		if got := ProjectName(servicesDir); got != composeDefault {
+			t.Errorf("ProjectName(%q)=%q, want %q (must equal the no-`-p` compose default so pgdata survives the module transition)", servicesDir, got, composeDefault)
+		}
+	}
+}
+
 // TestProjectNameSanitizes checks the derived project is always a value docker
 // compose accepts (lowercase [a-z0-9_-], non-empty).
 func TestProjectNameSanitizes(t *testing.T) {
