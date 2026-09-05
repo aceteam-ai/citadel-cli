@@ -377,6 +377,27 @@ func payloadInt(payload map[string]any, key string) int {
 	return 0
 }
 
+// payloadBool reads a boolean value from a job payload, coercing the common
+// JSON-decoded shapes: a real bool, and the truthy strings "true"/"1"/"yes"/"on"
+// (case-insensitive). Missing, nil, or anything else yields false -- so an absent
+// flag is never treated as set.
+func payloadBool(payload map[string]any, key string) bool {
+	v, ok := payload[key]
+	if !ok || v == nil {
+		return false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b
+	case string:
+		switch strings.ToLower(strings.TrimSpace(b)) {
+		case "true", "1", "yes", "on":
+			return true
+		}
+	}
+	return false
+}
+
 // defaultIsService reports whether we are running under a managed service
 // supervisor. The service unit/plist/SCM all set CITADEL_SERVICE=true (see
 // internal/service).

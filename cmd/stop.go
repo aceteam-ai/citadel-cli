@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
@@ -235,8 +236,20 @@ func stopSingleService(serviceName string) {
 // (composeArgsWithProject, citadel#856). Pure and separated from
 // stopServiceByCompose so the argv contract is unit-testable without invoking
 // docker (see TestStopComposeArgs*).
+//
+// The sibling env file (<name>.env next to <name>.yml) is passed on `down` too,
+// mirroring the SERVICE_STOP path (internal/jobs/service_handler.go's down args)
+// -- these two paths were divergent, and the missing --env-file here is a real
+// bug: a compose file whose interpolation hard-requires a config var (the
+// WhatsApp bridge's ${ADMIN_API_KEY:?}) fails to even PARSE on `down`, so an
+// uninstall/stop of it retries forever (citadel#624). --env-file is a GLOBAL
+// compose flag, so it must precede the `down` subcommand. compose.EnvFileArgs
+// returns nil when no <name>.env exists, so this is a byte-identical no-op for
+// every service without a sibling env file (the #528 default is preserved).
 func stopComposeArgs(composePath string, remove bool) []string {
-	fileArgs := []string{"-f", composePath, "down"}
+	fileArgs := []string{"-f", composePath}
+	fileArgs = append(fileArgs, compose.EnvFileArgs(composePath)...)
+	fileArgs = append(fileArgs, "down")
 	if remove {
 		fileArgs = append(fileArgs, "-v") // Also remove volumes
 	}

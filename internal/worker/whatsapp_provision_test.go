@@ -354,3 +354,178 @@ func TestWhatsAppProvisionSurfacesPullError(t *testing.T) {
 		t.Errorf("image_id_after should be omitted when unknown, got %v", doc["image_id_after"])
 	}
 }
+
+// TestWhatsAppRotateAdminKey pins the citadel#624 part-3 rotate branch: a
+// `rotate_admin_key: true` payload short-circuits to the Rotate closure and
+// returns the additive fingerprint document -- with NO `status` field (so the
+// backend's `status == "already_linked"` equality is simply false) and without
+// ever calling Provision.
+func TestWhatsAppRotateAdminKey(t *testing.T) {
+	provisionCalled := false
+	rotateCalled := false
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			provisionCalled = true
+			return &whatsapp.ProvisionResult{}, nil
+		},
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			rotateCalled = true
+			return &whatsapp.RotateResult{
+				Rotated:        true,
+				OldFingerprint: "sha256:oldoldoldoldoldx",
+				NewFingerprint: "sha256:newnewnewnewnewx",
+				Port:           8082,
+			}, nil
+		},
+	})
+
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"rotate_admin_key": true}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success", res.Status)
+	}
+	if !rotateCalled {
+		t.Error("Rotate was not called for a rotate_admin_key job")
+	}
+	if provisionCalled {
+		t.Error("Provision must NOT be called on a rotate-only job")
+	}
+	doc := decodeOutput(t, res)
+	if doc["rotated"] != true {
+		t.Errorf("rotated = %v, want true", doc["rotated"])
+	}
+	if doc["admin_key_fingerprint"] != "sha256:newnewnewnewnewx" {
+		t.Errorf("admin_key_fingerprint = %v, want the new fingerprint", doc["admin_key_fingerprint"])
+	}
+	if doc["old_admin_key_fingerprint"] != "sha256:oldoldoldoldoldx" {
+		t.Errorf("old_admin_key_fingerprint = %v, want the old fingerprint", doc["old_admin_key_fingerprint"])
+	}
+	if _, ok := doc["status"]; ok {
+		t.Errorf("rotate result must NOT carry a status field (backend equality-checks it), got %v", doc["status"])
+	}
+	if _, ok := doc["api_key"]; ok {
+		t.Error("rotate result must not carry api_key")
+	}
+}
+
+// TestWhatsAppRotateOldFingerprintOmittedWhenEmpty pins the "" in / "" out
+// contract at the wire boundary: no prior key -> no old_admin_key_fingerprint.
+func TestWhatsAppRotateOldFingerprintOmittedWhenEmpty(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			return &whatsapp.RotateResult{Rotated: true, NewFingerprint: "sha256:newnewnewnewnewx"}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"rotate_admin_key": true}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if _, ok := doc["old_admin_key_fingerprint"]; ok {
+		t.Errorf("old_admin_key_fingerprint must be omitted when there was no prior key, got %v", doc["old_admin_key_fingerprint"])
+	}
+}
+
+// TestWhatsAppRotateWithoutFuncFails pins that a rotate request with no Rotate
+// wired fails clearly rather than panicking or falling through to provision.
+func TestWhatsAppRotateWithoutFuncFails(t *testing.T) {
+	provisionCalled := false
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			provisionCalled = true
+			return &whatsapp.ProvisionResult{}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"rotate_admin_key": true}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusFailure {
+		t.Fatalf("status = %v, want failure when rotate is unwired", res.Status)
+	}
+	if provisionCalled {
+		t.Error("a rotate request must not fall through to provision")
+	}
+}
+
+// TestWhatsAppRotateFailurePropagates pins that a rotation error surfaces as a
+// job failure (not a partial success).
+func TestWhatsAppRotateFailurePropagates(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			return nil, errors.New("bridge did not become ready after admin-key rotation")
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"rotate_admin_key": true}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusFailure {
+		t.Fatalf("status = %v, want failure", res.Status)
+	}
+}
+
+// TestWhatsAppRotateRefusedOffPerNodeStream pins that rotation is gated by the
+// SAME per-node privilege check as provision (rotating a control-plane secret is
+// privileged), so a shared-org-pool job is refused before Rotate runs.
+func TestWhatsAppRotateRefusedOffPerNodeStream(t *testing.T) {
+	rotateCalled := false
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			rotateCalled = true
+			return &whatsapp.RotateResult{Rotated: true}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob("jobs:v1:shell:org_test", map[string]any{"rotate_admin_key": true}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusFailure {
+		t.Fatalf("status = %v, want failure on the shared org pool", res.Status)
+	}
+	if rotateCalled {
+		t.Error("rotation must be refused before Rotate runs on a non-per-node stream")
+	}
+}
+
+// TestWhatsAppProvisionNotRotatedWhenFlagAbsent pins that the ordinary provision
+// path is byte-unchanged when rotate_admin_key is absent: Rotate is never called
+// even when wired, and Provision runs.
+func TestWhatsAppProvisionNotRotatedWhenFlagAbsent(t *testing.T) {
+	provisionCalled := false
+	rotateCalled := false
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			provisionCalled = true
+			return &whatsapp.ProvisionResult{APIURL: "http://100.64.0.9:8080", APIKey: "wab_key", Tenant: "default"}, nil
+		},
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			rotateCalled = true
+			return &whatsapp.RotateResult{}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success", res.Status)
+	}
+	if !provisionCalled {
+		t.Error("Provision must run when rotate_admin_key is absent")
+	}
+	if rotateCalled {
+		t.Error("Rotate must not run when rotate_admin_key is absent")
+	}
+	doc := decodeOutput(t, res)
+	if doc["status"] != "provisioned" {
+		t.Errorf("normal provision status = %v, want provisioned (unchanged)", doc["status"])
+	}
+}
