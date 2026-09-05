@@ -2298,3 +2298,18 @@ Auto-generated log of every release.
   - fix: drain in-flight CDP handlers before restoring cdpTargetURL in tests (#989) (#990)
 
 
+---
+
+## v2.147.0 — 2026-09-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 25 |
+| Lines added | +1142 |
+
+**Changes:**
+
+  - feat: WhatsApp bridge as a first-class module + provenance-scoped uninstall (Part 1 of #624) (#994)
+
+
