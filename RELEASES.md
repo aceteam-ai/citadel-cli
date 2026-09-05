@@ -2266,3 +2266,18 @@ Auto-generated log of every release.
   - fix: retry WriteClaimed/WriteEnd + synchronous HTTP fallback on WS publish error (#985) (#986)
 
 
+---
+
+## v2.145.0 — 2026-09-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 1 |
+| Lines added | +44 |
+
+**Changes:**
+
+  - fix: synchronize CDP-close test on real conn registration, not a wall clock (#819) (#988)
+
+
