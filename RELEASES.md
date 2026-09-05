@@ -2281,3 +2281,20 @@ Auto-generated log of every release.
   - fix: synchronize CDP-close test on real conn registration, not a wall clock (#819) (#988)
 
 
+---
+
+## v2.146.0 — 2026-09-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 14 |
+| Lines added | +1296 |
+
+**Changes:**
+
+  - feat: WhatsApp bridge admin-key rotation + compose down --env-file fix (Part 3 of 624) (#993)
+  - chore(security): bump Go toolchain to 1.26.6 + x/net/x/text (govulncheck sweep) (#992)
+  - fix: drain in-flight CDP handlers before restoring cdpTargetURL in tests (#989) (#990)
+
+
