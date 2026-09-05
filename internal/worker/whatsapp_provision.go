@@ -72,6 +72,14 @@ type WhatsAppProvisionConfig struct {
 	// network edges (see cmd/work.go). Overridable in tests.
 	Provision func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error)
 
+	// Rotate performs an admin-key rotation, honored ONLY when the payload sets
+	// `rotate_admin_key: true`. It is a closure over whatsapp.RotateAdminKey
+	// wired with the node's real edges (cmd/nodejobs.go) -- the SAME rotation
+	// primitive the `citadel whatsapp rotate-key` CLI uses. Nil means rotation is
+	// not wired, and a rotate request then fails with a clear error rather than a
+	// panic.
+	Rotate func(ctx context.Context) (*whatsapp.RotateResult, error)
+
 	// Log reports progress. Nil is a no-op.
 	Log func(format string, args ...any)
 }
@@ -107,6 +115,14 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 	if !isPerNodeStream(job.SourceQueue) {
 		return h.failure(fmt.Errorf(
 			"WHATSAPP_PROVISION refused: must be dispatched to the per-node stream, got source queue %q", job.SourceQueue)), nil
+	}
+
+	// Admin-key rotation short-circuits BEFORE provisioning: it is a distinct,
+	// additive operation on the SAME per-node-gated job type (citadel#624 part 3),
+	// not a variant of provision. Rotate-only keeps "one implementation, two entry
+	// points" honest (the CLI `citadel whatsapp rotate-key` is rotate-only too).
+	if payloadBool(job.Payload, "rotate_admin_key") {
+		return h.rotate(ctx), nil
 	}
 
 	if h.cfg.Provision == nil {
@@ -197,6 +213,46 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 		Status: JobStatusSuccess,
 		Output: map[string]any{"output": string(out)},
 	}, nil
+}
+
+// rotate handles a `rotate_admin_key: true` WHATSAPP_PROVISION job: it rotates
+// the bridge's admin secret via the shared whatsapp.RotateAdminKey primitive and
+// returns an ADDITIVE result document. It deliberately does NOT emit the
+// provision result's `status` field: the aceteam backend branches on
+// `status == "already_linked"` by equality, and a rotate is neither provisioned
+// nor already_linked -- omitting the field lets that equality be simply false
+// rather than inventing a third value or lying. The result carries fingerprints
+// only (sha256:...), never key bytes.
+func (h *WhatsAppProvisionHandler) rotate(ctx context.Context) *JobResult {
+	if h.cfg.Rotate == nil {
+		return h.failure(fmt.Errorf("WHATSAPP_PROVISION rotate_admin_key requested but the handler is misconfigured: no rotate function"))
+	}
+	h.cfg.Log("WHATSAPP_PROVISION: rotating bridge admin key")
+
+	res, err := h.cfg.Rotate(ctx)
+	if err != nil {
+		return h.failure(fmt.Errorf("WHATSAPP_PROVISION admin-key rotation failed: %w", err))
+	}
+
+	doc := map[string]any{
+		"rotated":               res.Rotated,
+		"admin_key_fingerprint": res.NewFingerprint,
+	}
+	// The prior fingerprint is omitted when there was no key before (first key),
+	// mirroring the "" in / "" out fingerprint contract.
+	if res.OldFingerprint != "" {
+		doc["old_admin_key_fingerprint"] = res.OldFingerprint
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return h.failure(fmt.Errorf("marshal rotation result: %w", err))
+	}
+	// Emit the JSON as the "output" string, matching the provision path's wire
+	// shape so the backend unwraps {"output": "<json>"} identically.
+	return &JobResult{
+		Status: JobStatusSuccess,
+		Output: map[string]any{"output": string(out)},
+	}
 }
 
 func (h *WhatsAppProvisionHandler) failure(err error) *JobResult {
