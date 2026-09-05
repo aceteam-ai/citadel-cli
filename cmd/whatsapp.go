@@ -260,9 +260,50 @@ func deployWhatsAppCompose(source, image string, report *deployReport) func(serv
 	}
 }
 
+// bridgeModuleInstalled reports whether the WhatsApp bridge has a module
+// lockfile entry -- i.e. the module system (lockfile + reconcile / MODULE_SET)
+// owns its compose lifecycle (citadel#624 D5). Best-effort: an unreadable/absent
+// lockfile means "not module-managed", so the bespoke deploy runs as the
+// fallback -- the safe direction (a fresh/old node still provisions).
+func bridgeModuleInstalled() bool {
+	lf, err := catalog.LoadLockfile()
+	if err != nil || lf == nil {
+		return false
+	}
+	_, ok := lf.LookupLock(whatsapp.ServiceName)
+	return ok
+}
+
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It
 // is split out so deployWhatsAppCompose can run it under a hard deadline.
 func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, report *deployReport) error {
+	// Delegation (citadel#624 D5): when the bridge is a first-class module (a
+	// lockfile entry exists), the module system (lockfile + reconcile /
+	// MODULE_SET) OWNS its compose lifecycle. The bespoke deploy must NOT run a
+	// SECOND owner's git-clone + `docker compose -p <project> up` over the same
+	// files -- that is the "two owners over the same files" hazard D5 forbids. We
+	// still persist the env the provision flow resolved (admin key / port /
+	// proxy), atomically and idempotently, so the module-managed stack serves
+	// them; the running stack is assumed already up by the module system, which
+	// provision's WaitReady verifies next. The bespoke deploy below remains the
+	// FALLBACK for lockfile-less / old nodes.
+	//
+	// NOTE (bounded follow-up, documented in the #624 PR): provision still selects
+	// its own host port; a fully-authoritative delegation would read the
+	// module-managed BRIDGE_PORT instead. Today provision reuses the persisted
+	// BRIDGE_PORT (provision.go), so on a module-installed node the two already
+	// agree via this same env file.
+	if bridgeModuleInstalled() {
+		if image != "" {
+			env["BRIDGE_IMAGE"] = image
+		}
+		if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
+			return fmt.Errorf("write bridge config (module-delegated): %w", err)
+		}
+		fmt.Fprintln(os.Stderr, "   - WhatsApp bridge is module-managed; delegating deploy/start to the module system")
+		return nil
+	}
+
 	if source == "" {
 		source = defaultWhatsAppSource
 	}

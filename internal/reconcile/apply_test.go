@@ -13,8 +13,9 @@ func TestApplyConvergesAndIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	ops := newFakeOps(
 		// pre-existing: one stale (to uninstall), one drifted (to update),
-		// one that just needs starting.
-		InstalledModule{Name: "stale", Source: "stale", Health: HealthRunning},
+		// one that just needs starting. "stale" is STAMPED desired-state so it is
+		// drift-uninstall-eligible (citadel#624 D1).
+		InstalledModule{Name: "stale", Source: "stale", Health: HealthRunning, ManagedBy: ManagedByDesiredState},
 		InstalledModule{Name: "drift", Source: "drift@v1", Health: HealthRunning},
 		InstalledModule{Name: "down", Source: "down", Health: HealthStopped},
 	)

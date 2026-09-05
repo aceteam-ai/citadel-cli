@@ -253,6 +253,17 @@ type ConfigVar struct {
 	// satisfies the requirement, and the requirement keeps a mis-typed
 	// `generate:` from silently yielding an empty credential.
 	Generate string `yaml:"generate"`
+	// Carry marks a value that must SURVIVE an update-in-place (uninstall +
+	// reinstall) even though the NODE cannot mint it (citadel#624 sub-collision
+	// 2). Unlike `generate:` -- which the node re-mints if absent -- a `carry:`
+	// value is minted OUT OF BAND (e.g. the WhatsApp bridge's TENANT_API_KEY /
+	// TENANT_ID / TENANT_NAME, issued by the bridge's own admin API), so if the
+	// update path dropped it there is no way to recompute it and the
+	// platform-stored credential would drift (the 401 class #624 exists to kill).
+	// Install reuses whatever is persisted in the module's .env for a carry var,
+	// exactly like a generate var, but never fabricates one when it is absent.
+	// An explicit override still wins (a deliberate rotation is still possible).
+	Carry bool `yaml:"carry"`
 }
 
 // GenerateSecret is the ConfigVar.Generate kind that mints a random token.
@@ -265,6 +276,17 @@ type HealthCheck struct {
 	Interval string `yaml:"interval"`
 	Timeout  string `yaml:"timeout"`
 	Retries  int    `yaml:"retries"`
+	// ComposeService names the compose SERVICE whose running state is this
+	// module's run-state health signal (citadel#624 sub-collision 3), for a
+	// module whose real container is NOT the generic citadel-<name> convention
+	// the reconcile engine's ListInstalled inspects by default. The WhatsApp
+	// bridge's container is <project>-bridge-N (#436), which that convention
+	// never matches -- so declaring `compose_service: bridge` makes ListInstalled
+	// resolve health via `docker compose -p <project> ps bridge` instead of
+	// reporting STOPPED forever (which would drive a redundant ActionStart every
+	// reconcile pass). It is persisted into the lockfile at install time
+	// (LockEntry.HealthComposeService). Empty means "use the default check".
+	ComposeService string `yaml:"compose_service"`
 }
 
 // VolumeMount describes a bind mount from host to container.

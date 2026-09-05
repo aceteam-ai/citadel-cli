@@ -9,6 +9,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -117,11 +118,16 @@ func TestListInstalledEmptyLockfileReportsNothing(t *testing.T) {
 // "installed", so this exact scenario produced 10 ActionUninstall steps.
 func TestOneDesiredModuleDoesNotWipeManifest(t *testing.T) {
 	writeManifestWithServices(t, elevenManifestServices())
+	// module-a is desired-state-managed (STAMPED) and in the desired set below;
+	// legacy-mod is a lockfile-recorded but UNSTAMPED module (operator/catalog
+	// CLI-installed) that is NOT in the desired set -- the citadel#624 D1
+	// protected case, layered onto the #739 manifest-service case.
 	writeLockfile(t, []catalog.LockEntry{
-		{Name: "module-a", Source: "owner/module-a@v1.0.0", Ref: "v1.0.0"},
+		{Name: "module-a", Source: "owner/module-a@v1.0.0", Ref: "v1.0.0", ManagedBy: reconcile.ManagedByDesiredState},
+		{Name: "legacy-mod", Source: "owner/legacy-mod@v1.0.0", Ref: "v1.0.0"},
 	})
 
-	o := newTestModuleOps(map[string]bool{"module-a": true})
+	o := newTestModuleOps(map[string]bool{"module-a": true, "legacy-mod": true})
 	actual, err := o.ListInstalled(context.Background())
 	if err != nil {
 		t.Fatalf("ListInstalled: %v", err)
@@ -143,8 +149,105 @@ func TestOneDesiredModuleDoesNotWipeManifest(t *testing.T) {
 	}
 	for _, step := range plan.Steps {
 		if step.Action == reconcile.ActionUninstall {
-			t.Fatalf("one desired module must not trigger uninstalling manifest service %q (citadel#739)", step.Name)
+			t.Fatalf("one desired module must not trigger uninstalling %q (citadel#739 manifest service / citadel#624 D1 unstamped lockfile sibling)", step.Name)
 		}
+	}
+}
+
+// TestBridgeDesiredDoesNotUninstallUnstampedSibling is the citadel#624 D1
+// blast-radius regression at the cmd/ListInstalled level: a non-empty desired
+// set containing ONLY the module-managed WhatsApp bridge must NOT uninstall a
+// lockfile-recorded but UNSTAMPED sibling (an operator/catalog CLI install).
+// The stamped bridge and the unstamped sibling both come out of the real
+// liveModuleOps.ListInstalled path, then feed reconcile.Reconcile directly.
+func TestBridgeDesiredDoesNotUninstallUnstampedSibling(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: whatsapp.ServiceName, ComposeFile: filepath.Join("services", whatsapp.ServiceName+".yml")},
+		{Name: "operator-mod", ComposeFile: filepath.Join("services", "operator-mod.yml")},
+	})
+	writeLockfile(t, []catalog.LockEntry{
+		// The bridge, module-managed (STAMPED) with a compose-service health source.
+		{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName, ManagedBy: reconcile.ManagedByDesiredState, HealthComposeService: whatsapp.BridgeService},
+		// An operator-installed sibling: recorded but UNSTAMPED -> protected.
+		{Name: "operator-mod", Source: "owner/operator-mod@v1"},
+	})
+
+	o := newTestModuleOps(map[string]bool{"operator-mod": true})
+	// The bridge's health resolves via its compose service, not the citadel-<name>
+	// convention (#436); report it running so it converges rather than needing a
+	// start.
+	o.composeServiceRunning = func(project, service string) bool {
+		return service == whatsapp.BridgeService
+	}
+	actual, err := o.ListInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstalled: %v", err)
+	}
+
+	desired := reconcile.DesiredState{
+		Revision: "rev-1",
+		Modules: []reconcile.ModuleAssignment{
+			{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName},
+		},
+	}
+	plan, err := reconcile.Reconcile(context.Background(), desired, actual)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, step := range plan.Steps {
+		if step.Action == reconcile.ActionUninstall {
+			t.Fatalf("a lone desired bridge must NOT uninstall unstamped sibling %q (citadel#624 D1)", step.Name)
+		}
+	}
+}
+
+// TestListInstalledBridgeHealthViaComposeService pins citadel#624 sub-collision
+// 3: a module that declared health_check.compose_service (persisted as
+// HealthComposeService) reports its run-state via the compose PROJECT+SERVICE,
+// NOT the citadel-<name> container-inspect convention -- whose name never
+// matches the bridge's <project>-bridge-N container (#436) and would report
+// STOPPED forever, driving a redundant ActionStart every reconcile pass. With
+// the compose-service probe reporting RUNNING, the converged plan is EMPTY.
+func TestListInstalledBridgeHealthViaComposeService(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: whatsapp.ServiceName, ComposeFile: filepath.Join("services", whatsapp.ServiceName+".yml")},
+	})
+	writeLockfile(t, []catalog.LockEntry{
+		{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName, ManagedBy: reconcile.ManagedByDesiredState, HealthComposeService: whatsapp.BridgeService},
+	})
+
+	o := newTestModuleOps(map[string]bool{}) // isRunning would report STOPPED (the wrong container)
+	var probedProject, probedService string
+	o.composeServiceRunning = func(project, service string) bool {
+		probedProject, probedService = project, service
+		return true // the bridge IS up under its compose project
+	}
+	actual, err := o.ListInstalled(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstalled: %v", err)
+	}
+	if len(actual) != 1 || actual[0].Health != reconcile.HealthRunning {
+		t.Fatalf("bridge must report RUNNING via its compose service; got %+v", actual)
+	}
+	if probedService != whatsapp.BridgeService {
+		t.Fatalf("health must probe the declared compose service %q, probed %q", whatsapp.BridgeService, probedService)
+	}
+	if probedProject == "" {
+		t.Fatal("health probe must carry a non-empty compose project")
+	}
+
+	desired := reconcile.DesiredState{
+		Revision: "rev-1",
+		Modules: []reconcile.ModuleAssignment{
+			{Name: whatsapp.ServiceName, Source: whatsapp.ServiceName},
+		},
+	}
+	plan, err := reconcile.Reconcile(context.Background(), desired, actual)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !plan.IsEmpty() {
+		t.Fatalf("a healthy module-managed bridge must converge to an EMPTY plan (no perpetual ActionStart), got %v", plan.Steps)
 	}
 }
 

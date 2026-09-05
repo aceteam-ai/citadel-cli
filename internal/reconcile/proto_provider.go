@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -109,7 +110,13 @@ func (p *ProtoProvider) Report(ctx context.Context, actual ActualState) error {
 	// nodestate.Emitter also holds (the "two-reporter flap" fix).
 	if p.BridgeEndpoints != nil {
 		if m := p.BridgeEndpoints.BridgeModule(ctx); m != nil {
-			pb.Modules = append(pb.Modules, m)
+			// Decorator, not a blind append (citadel#624 sub-collision 4): once
+			// the bridge is a first-class lockfile module, `pb` already carries its
+			// REAL row (built from `actual` above); AttachBridgeModule merges the
+			// endpoint facts onto that row instead of double-reporting the source,
+			// and appends the synthetic row only for an old/bespoke node with no
+			// lockfile entry.
+			whatsapp.AttachBridgeModule(pb, m)
 		}
 	}
 	body, err := proto.Marshal(pb)

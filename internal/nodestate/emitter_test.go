@@ -170,6 +170,47 @@ func TestReportOnce_AppendsBridgeModule(t *testing.T) {
 	}
 }
 
+// TestReportOnce_BridgeRealRowSuppressesSyntheticRow pins citadel#624
+// sub-collision 4 (decorator) on the 60s emitter: once the bridge is a
+// first-class lockfile module, BuildActualState already emits a REAL row for it
+// (Source == "whatsapp-bridge"). AppendBridgeModule must NOT add a SECOND
+// synthetic row for the same source; it merges the synthetic endpoints (+
+// fingerprint) onto the real row instead. Ingest is upsert-by-(node_id, source),
+// so a duplicate source would flap between the two reporters.
+func TestReportOnce_BridgeRealRowSuppressesSyntheticRow(t *testing.T) {
+	// The emitter's BuildActualState enumerates by lockfile and matches the merge
+	// on Source, so ManagedBy is irrelevant here (it only gates reconcile's
+	// uninstall) -- a plain lockfile entry for the bridge is enough.
+	stubLockfile(t, []catalog.LockEntry{
+		{Name: "whatsapp-bridge", Source: "whatsapp-bridge"},
+	})
+	p := &capturePoster{}
+	bridge := &fakeBridgeProvider{module: bridgeModuleFixture("sha256:abcd")}
+	e := New(Config{Poster: p, ConfigDir: t.TempDir(), NodeID: "host-1", Version: "v7", BridgeEndpoints: bridge})
+
+	e.reportOnce(context.Background())
+
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(p.bodies[0], &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var bridgeRows, withEndpoints int
+	for _, m := range got.GetModules() {
+		if m.GetSource() == "whatsapp-bridge" {
+			bridgeRows++
+			if len(m.GetEndpoints()) == 1 {
+				withEndpoints++
+			}
+		}
+	}
+	if bridgeRows != 1 {
+		t.Fatalf("want exactly 1 bridge row (real, decorated), got %d (%+v)", bridgeRows, got.GetModules())
+	}
+	if withEndpoints != 1 {
+		t.Fatalf("the real bridge row must carry the synthetic endpoints after the decorator merge")
+	}
+}
+
 // TestReportOnce_BridgeExemptFromTelemetryOptOut is the required "telemetry
 // gate coupling" fix (citadel#624 design review, point 2): with
 // anon_telemetry_enabled=false, the lockfile-driven modules must NOT be

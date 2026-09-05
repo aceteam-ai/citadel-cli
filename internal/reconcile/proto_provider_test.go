@@ -202,6 +202,49 @@ func TestProtoProviderReportAppendsBridgeModule(t *testing.T) {
 	}
 }
 
+// TestProtoProviderReportBridgeRealRowSuppressesSyntheticRow pins citadel#624
+// sub-collision 4 (decorator) on the reconcile reporter: once the bridge is a
+// first-class lockfile module, `actual` already carries its REAL row (Source ==
+// "whatsapp-bridge"). Report must NOT append a SECOND synthetic row for the same
+// source; it must attach the synthetic row's endpoints (+ fingerprint) onto the
+// real row instead. Ingest is upsert-by-(node_id, source), so a duplicate source
+// would flap.
+func TestProtoProviderReportBridgeRealRowSuppressesSyntheticRow(t *testing.T) {
+	tr := &fakeTransport{}
+	p := NewProtoProvider(tr, tr, "node-1", "v1")
+	p.BridgeEndpoints = &fakeBridgeEndpoints{module: bridgeModuleFixture("sha256:abcd")}
+
+	// `actual` already has the bridge as a real lockfile-derived module.
+	if err := p.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{
+			{Name: "whatsapp-bridge", Source: "whatsapp-bridge", Health: HealthRunning},
+		},
+	}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(tr.postBody, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var bridgeRows int
+	var withEndpoints int
+	for _, m := range got.GetModules() {
+		if m.GetSource() == "whatsapp-bridge" {
+			bridgeRows++
+			if len(m.GetEndpoints()) == 1 {
+				withEndpoints++
+			}
+		}
+	}
+	if bridgeRows != 1 {
+		t.Fatalf("want exactly 1 bridge row (real, decorated), got %d (%+v)", bridgeRows, got.GetModules())
+	}
+	if withEndpoints != 1 {
+		t.Fatalf("the real bridge row must carry the synthetic endpoints after the decorator merge")
+	}
+}
+
 // TestProtoProviderReportNilBridgeProviderIsNoOp: an unset BridgeEndpoints
 // (the zero value, i.e. every existing caller that predates this field) must
 // behave exactly as before -- no synthetic row, no panic.
@@ -239,6 +282,21 @@ func TestProtoProviderReportMarshaledStateNeverContainsSecretBytes(t *testing.T)
 	}
 	if strings.Contains(string(tr.postBody), secretAdminKey) {
 		t.Fatalf("marshaled ActualState contains raw secret bytes")
+	}
+
+	// Same pin on the DECORATOR (real-row) path (citadel#624 sub-collision 4):
+	// a report whose `actual` already carries the bridge's real row, decorated
+	// with the endpoint fingerprint, must also never contain the raw secret.
+	tr2 := &fakeTransport{}
+	p2 := NewProtoProvider(tr2, tr2, "node-1", "v1")
+	p2.BridgeEndpoints = &fakeBridgeEndpoints{module: bridgeModuleFixture(fp)}
+	if err := p2.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{{Name: "whatsapp-bridge", Source: "whatsapp-bridge", Health: HealthRunning}},
+	}); err != nil {
+		t.Fatalf("Report (real-row): %v", err)
+	}
+	if strings.Contains(string(tr2.postBody), secretAdminKey) {
+		t.Fatalf("marshaled ActualState (real-row decorator path) contains raw secret bytes")
 	}
 }
 

@@ -34,12 +34,16 @@ func (f *fakeModuleOps) Install(ctx context.Context, m reconcile.ModuleAssignmen
 		return err
 	}
 	// Fresh install => running, recording the requested source + config so a
-	// re-list diffs equal against the same assignment (no churn).
+	// re-list diffs equal against the same assignment (no churn). This is the
+	// desired-state/MODULE_SET install path, so the recorded module is STAMPED
+	// ManagedByDesiredState (citadel#624 D1) -- making it drift-uninstall-eligible,
+	// as the module system's own installs must be.
 	f.byName[m.Key()] = reconcile.InstalledModule{
-		Name:   m.Key(),
-		Source: m.Source,
-		Config: m.Config,
-		Health: reconcile.HealthRunning,
+		Name:      m.Key(),
+		Source:    m.Source,
+		Config:    m.Config,
+		Health:    reconcile.HealthRunning,
+		ManagedBy: reconcile.ManagedByDesiredState,
 	}
 	return nil
 }
@@ -153,7 +157,9 @@ func TestModuleSetDoesNotTouchOtherModules(t *testing.T) {
 	f := newFakeModuleOps(
 		reconcile.InstalledModule{Name: "alpha", Source: "owner/alpha@v1", Health: reconcile.HealthRunning},
 		reconcile.InstalledModule{Name: "beta", Source: "owner/beta@v1", Health: reconcile.HealthRunning},
-		reconcile.InstalledModule{Name: "target", Source: "owner/target@v1", Health: reconcile.HealthRunning},
+		// target is desired-state-managed (STAMPED), so MODULE_SET absent may
+		// uninstall it (citadel#624 D1).
+		reconcile.InstalledModule{Name: "target", Source: "owner/target@v1", Health: reconcile.HealthRunning, ManagedBy: reconcile.ManagedByDesiredState},
 	)
 	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})
 	// Uninstall ONLY target.
@@ -182,7 +188,8 @@ func TestModuleSetDoesNotTouchOtherModules(t *testing.T) {
 // absent uninstalls when installed, and is a no-op when already absent.
 func TestModuleSetAbsentIsIdempotent(t *testing.T) {
 	f := newFakeModuleOps(
-		reconcile.InstalledModule{Name: "target", Source: "owner/target@v1", Health: reconcile.HealthRunning},
+		// STAMPED: a desired-state-managed module MODULE_SET absent may uninstall.
+		reconcile.InstalledModule{Name: "target", Source: "owner/target@v1", Health: reconcile.HealthRunning, ManagedBy: reconcile.ManagedByDesiredState},
 	)
 	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})
 
@@ -304,6 +311,37 @@ func TestModuleSetAbsentNoOpForUnrecordedService(t *testing.T) {
 	}
 	if hasCall(f.calls, "uninstall:vllm") {
 		t.Fatalf("must not attempt to uninstall a service reconcile has no record of: %v", f.calls)
+	}
+}
+
+// TestModuleSetAbsentNoOpForPresentUnstampedModule pins the citadel#624 D1
+// consequence at the MODULE_SET door (the advisor's point 1): a module that IS
+// present in the actual set but carries no desired-state provenance stamp (an
+// operator/catalog CLI install, an embedded service) must NOT be uninstalled by a
+// remote MODULE_SET "absent" -- the reconcile engine may only uninstall STAMPED
+// entries. It reports success (a safe no-op), the same direction as the
+// lockfile-less case above. This is distinct from that case: here the module is
+// genuinely present and scoped in, but the provenance gate protects it.
+func TestModuleSetAbsentNoOpForPresentUnstampedModule(t *testing.T) {
+	f := newFakeModuleOps(
+		// Present in actual, but UNSTAMPED (operator/catalog-installed).
+		reconcile.InstalledModule{Name: "target", Source: "owner/target@v1", Health: reconcile.HealthRunning},
+	)
+	h := NewModuleSetHandler(ModuleSetConfig{Ops: f})
+	res, err := h.Execute(context.Background(), moduleSetJob(perNodeQueue, map[string]any{
+		"source": "owner/target@v1", "desired_status": "absent",
+	}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success (safe no-op)", res.Status)
+	}
+	if hasCall(f.calls, "uninstall:target") {
+		t.Fatalf("MODULE_SET absent must NOT uninstall an unstamped module (citadel#624 D1): %v", f.calls)
+	}
+	if got := f.names(); len(got) != 1 || got[0] != "target" {
+		t.Fatalf("unstamped module must survive absent; remaining = %v", got)
 	}
 }
 

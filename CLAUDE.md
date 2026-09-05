@@ -1033,6 +1033,56 @@ guard in `internal/reconcile/loop.go` refuses the destructive converge and still
 reports, deliberately leaving `AppliedRevision` empty because nothing was
 applied. `TestRefuseFullWipeReportOmitsAppliedRevision` pins that.
 
+### Provenance-scoped uninstall + the WhatsApp bridge as a module (citadel#624 Part 1)
+
+`reconcile.Reconcile`'s drift-uninstall branch (`internal/reconcile/engine.go`)
+now proposes `ActionUninstall` ONLY for an `InstalledModule` whose `ManagedBy ==
+reconcile.ManagedByDesiredState` (`"desired-state"`). An UNSTAMPED entry — every
+pre-#624 lockfile row, an operator/catalog CLI install
+(`recordCatalogModuleLock` leaves it empty), an embedded engine, the bespoke
+bridge — is NEVER drift-uninstalled, even when absent from a NON-empty desired
+set. This is the aceteam#4273 blast-radius fix: a single-row desired assignment
+can no longer tear down every OTHER module-recorded service. It is DISTINCT from
+the empty-desired full-wipe guard (`loop.go`), which fires before `Reconcile`.
+Only `liveModuleOps.recordLock` (the desired-state/MODULE_SET converge path)
+stamps `ManagedByDesiredState`; `ListInstalled` plumbs `LockEntry.ManagedBy` onto
+`InstalledModule.ManagedBy`. **Consequence to know: a MODULE_SET `absent` for an
+UNSTAMPED service is now a silent no-op** (the same safe direction as the
+lockfile-less no-op already documented above). Pinned by
+`TestReconcileDoesNotUninstallUnstampedModule` (engine, direct), the extended
+`TestOneDesiredModuleDoesNotWipeManifest` + `TestBridgeDesiredDoesNotUninstallUnstampedSibling`
+(`cmd`), and `TestRecordCatalogModuleLockEntryShape` (asserts the CLI path stays
+unstamped).
+
+Supporting the bridge becoming a first-class module (catalog entry
+`whatsapp-bridge` in `aceteam-ai/citadel-services`, D2):
+- **`config[].carry: true`** (`internal/catalog`, alongside `generate:`): a value
+  the node CANNOT re-mint (minted out of band — the bridge admin API mints
+  `TENANT_*`). `resolveConfig` AND `CarryGeneratedConfig` reuse a persisted carry
+  value so it survives update-in-place (which deletes `<name>.env`); unlike
+  `generate:`, a carry var with nothing persisted stays unset, never fabricated.
+  The `resolveConfig` reuse (not just `CarryGeneratedConfig`) is what covers the
+  bespoke→module TRANSITION install, where `CarryGeneratedConfig` never runs
+  (service not yet in the manifest). `TestModuleSetBridgeReassignCarriesAdminAndTenantKeys`
+  / `TestCarryVarReusedOnNonTeardownInstallPath` pin both classes.
+- **`health_check.compose_service`** (persisted as `LockEntry.HealthComposeService`):
+  `ListInstalled` resolves such a module's run-state via `docker compose -p
+  <project> ps <service>` (the generic form of `bridgeContainerRunning`), because
+  its real container is `<project>-bridge-N`, not `citadel-<name>` — which the
+  default `isRunning` check never matches, so it would report STOPPED forever and
+  drive a redundant `ActionStart` every pass. `TestListInstalledBridgeHealthViaComposeService`
+  asserts the converged plan is EMPTY.
+- **Synthetic-row decorator** (`whatsapp.AttachBridgeModule`, called by BOTH
+  `nodestate.AppendBridgeModule` and `reconcile.ProtoProvider.Report`): once a
+  real lockfile-derived bridge row exists (matched by `Source`), the Phase-A
+  endpoint facts attach to THAT row (and adopt its compose-probe Status/Health,
+  never overwriting a converge ERROR) instead of appending a duplicate synthetic
+  row the upsert-by-source ingest would flap on. Pinned in both reporter tests.
+- **D5 delegation** (`deployWhatsAppComposeOnce`, gated on `bridgeModuleInstalled()`):
+  when a lockfile entry exists the module system owns the compose lifecycle, so
+  the bespoke git-clone+`compose up` is skipped (env still persisted); the bespoke
+  deploy is the fallback for lockfile-less/old nodes only.
+
 ### GPU Detection
 Status command detects NVIDIA GPUs using:
 1. `nvidia-smi` command output parsing
