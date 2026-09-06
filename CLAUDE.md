@@ -538,13 +538,13 @@ type WorkerJobHandler interface {
 | Scaling | Horizontal via consumer groups |
 | Default endpoint | redis.aceteam.ai (AceTeam private cloud) |
 
-### Direct-Redis redelivery: XREADGROUP alone never retries anything (citadel #871)
+### Direct-Redis redelivery: XREADGROUP alone never retries anything (citadel #871, #998)
 
 `RedisSource.Nack` (`internal/worker/redis_source.go`) deliberately doesn't
 ACK, with a comment that reads "let it retry" -- but `XREADGROUP`'s `>` ID
 hands each message to the consumer group exactly ONCE and never again, not
-even back to the SAME consumer that originally read it (verified against a
-real Redis-protocol implementation:
+even back to the SAME consumer that originally read it (verified against
+miniredis, a Redis-protocol reimplementation:
 `internal/redis`'s `TestXReadGroupNeverRedeliversAlreadyDeliveredMessage`).
 `ReadJobBlock`/`ReadJobMultiBlock` only ever read with `>`. So before #871,
 nothing in this codebase ever redelivered a Nacked message -- it just sat in
@@ -558,19 +558,82 @@ terminal stream events, permanently.
 an `XAUTOCLAIM`-based reclaim, tried on every poll (`RedisSource.nextSingle`/
 `nextMulti`) before the normal blocking read. `XAUTOCLAIM` (without `JUSTID`)
 increments the Redis-native delivery count on every successful claim --
-including a self-claim back to the consumer that already owned it -- so the
-existing DLQ cutoff and `willRetry`'s retry signal both keep working
+including a self-claim back to the consumer that already owned it (verified
+against miniredis: `internal/redis`'s `TestReclaimStalePendingOnQueue`) -- so
+the existing DLQ cutoff and `willRetry`'s retry signal both keep working
 unmodified; this only supplies the missing "does redelivery actually happen"
-half. `Client.StalePendingReclaimMinIdle` (a package var, default 4h,
-matching `WORKER_JOB_TIMEOUT_LONG_SECONDS`) is deliberately conservative: any
-job type with a BOUNDED per-job watchdog is already ACKed out of the PEL by
-its own watchdog abandon (routes to `source.Fail`) before it could become
-eligible for reclaim, so a live bounded job is never at risk of being stolen
-mid-execution. A genuinely UNBOUNDED job (model pulls, `SERVICE_START`,
-builds) that legitimately runs longer than this window is a documented,
-accepted residual risk -- tightening it (per-job-type thresholds, or a true
-consumer-liveness check via `XINFO CONSUMERS` instead of a time-based steal)
-is a follow-up, not part of this fix.
+half.
+
+**The reclaim floor is resolved dynamically from the operator-tunable
+watchdog, not a hardcoded constant (citadel-cli#998 review fix).** The
+straightforward first cut hardcoded `Client.StalePendingReclaimMinIdle` to
+4h, matching `WORKER_JOB_TIMEOUT_LONG_SECONDS`'s *default* -- but that
+default is itself operator-tunable, and reclaim-eligibility (counted from
+DELIVERY time) can precede the watchdog's own deadline (counted from
+EXECUTION-START time, a gap `citadel-cli#908`'s claim/execute split
+introduced) even at matched values. So an operator who raises
+`WORKER_JOB_TIMEOUT_LONG_SECONDS` above the hardcoded 4h would make a
+HEALTHY, still-executing `MEETING_JOIN`/`COBROWSE` deterministically
+reclaim-eligible before its own watchdog ever fires -- stealing and
+re-dispatching a live job, not just a dead one.
+
+`internal/redis` is a leaf package and must not import `internal/worker`
+(the same constraint as the `ConfigDir()`/leaf-package notes elsewhere in
+this file), so it cannot resolve `WORKER_JOB_TIMEOUT_LONG_SECONDS` itself.
+`internal/worker.ResolveStalePendingReclaimFloor()` (`deadline.go`) does
+that resolution on the worker side -- reusing the same
+`envTimeoutSeconds(jobTimeoutLongEnvVar, ...)` `resolveJobTimeout` already
+uses -- and adds `ReclaimFloorMargin` (default 10min, covering the
+claim-gap above) so the floor is STRICTLY GREATER than the resolved
+watchdog ceiling, never merely equal to it. `RedisSource.Connect` threads
+the result across the package boundary via
+`Client.SetStalePendingReclaimMinIdle`, a plain `time.Duration` setter --
+the clean seam the leaf-package constraint requires. When the long-tier
+watchdog itself is unbounded (`WORKER_JOB_TIMEOUT_LONG_SECONDS=0`), no
+finite floor can be proven safe against it, so this falls back to
+`StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
+`internal/redis`'s own construction-time default by
+`TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+
+With this in place: every job type with a BOUNDED per-job watchdog is
+always ACKed out of the PEL by its own watchdog abandon (routes to
+`source.Fail`) before it can become eligible for reclaim here, under the
+resolved (env-aware) floor with its margin -- this is NOT an absolute
+guarantee independent of configuration, it is a guarantee that holds for
+any watchdog value because the floor is derived from that same value.
+
+**Two residual gaps remain, deliberately not closed by this fix -- read
+both before assuming reclaim is fully safe:**
+
+1. **Cross-consumer steal under horizontal scaling.** `XAUTOCLAIM` only
+   moves PEL *ownership* in Redis; it does nothing to stop whichever
+   process is still actually running the handler it already pulled into
+   memory. If more than one `citadel work` process shares this consumer
+   group (this package's own doc comment says horizontal scaling via
+   consumer groups is supported), and a job legitimately runs past the
+   resolved floor, a DIFFERENT process can reclaim and re-dispatch it while
+   the original is still executing -- genuine concurrent double-execution,
+   and potentially a double terminal-event publish. The per-process lane
+   concurrency guarantees (`serializedLaneJobTypes`, exec-concurrency 1)
+   only protect against a SAME-process self-reclaim (which queues behind
+   the still-running original rather than running concurrently with it);
+   they provide no cross-process protection at all.
+2. **A healthy UNBOUNDED job that outlives the reclaim cycle is reported
+   DEAD, not just retried.** A job type with NO watchdog (model pulls,
+   `SERVICE_START`, builds -- `unboundedJobTypes`) that legitimately runs
+   past the resolved floor gets reclaimed, and if it keeps running past
+   roughly `(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts`
+   3, floor ~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` fires:
+   `MoveToDLQ` + `Ack`. That is NOT merely "re-dispatched" -- the message is
+   permanently removed from the PEL and reported as a dead/failed job to
+   the DLQ consumer, even though the original execution may still be
+   legitimately in progress on its original node. A large model pull or a
+   long build on a slow node is the realistic trigger.
+
+Tightening either (a true consumer-liveness check via `XINFO CONSUMERS`
+instead of a blanket time-based steal, so reclaim only ever targets a
+provably-dead consumer's entries -- see the follow-up issue linked from
+`internal/redis/client.go`'s doc comments) is out of scope for this fix.
 
 **API mode has no equivalent, and this fix does not add one (issue #865,
 stays open).** The AceTeam Redis API proxy `APISource` uses exposes no

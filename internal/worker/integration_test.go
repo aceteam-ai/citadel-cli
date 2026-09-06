@@ -10,8 +10,6 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	goredis "github.com/redis/go-redis/v9"
-
-	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
 // recordingStreamWriter captures all StreamWriter calls for verification.
@@ -367,16 +365,18 @@ func TestRunnerDLQEnqueuedAt(t *testing.T) {
 // willRetry/DLQ logic in runner.go keeps working correctly off a signal that
 // now actually reflects reality.
 func TestRedisSourceRedeliversNackedMessageAfterStaleIdle(t *testing.T) {
-	// Shrink the reclaim threshold so the test doesn't need to wait out the
-	// real 4h production default; restore it so other tests (and any test
-	// order) see the normal value.
-	orig := redisclient.StalePendingReclaimMinIdle
-	redisclient.StalePendingReclaimMinIdle = 1 * time.Second
-	t.Cleanup(func() { redisclient.StalePendingReclaimMinIdle = orig })
-
 	queue := "jobs:v1:reclaim-integration"
 	mr, source, raw := setupWorkerIntegration(t, queue, 5) // MaxAttempts=5, well above what this test exercises
 	ctx := context.Background()
+
+	// Connect (inside setupWorkerIntegration) installs the real env-aware
+	// floor (ResolveStalePendingReclaimFloor, ~4h10m at defaults) via
+	// SetStalePendingReclaimMinIdle -- overriding the redis package's
+	// construction-time default, per issue #998's review. Override it again
+	// here, directly on this source's own client, so the test doesn't need
+	// to wait out either value; this also exercises the real setter seam
+	// rather than the package var, which Connect no longer leaves in effect.
+	source.Client().SetStalePendingReclaimMinIdle(1 * time.Second)
 
 	jobID := "job-reclaim-integration-001"
 	payload, _ := json.Marshal(map[string]interface{}{"data": "will-fail-then-strand"})

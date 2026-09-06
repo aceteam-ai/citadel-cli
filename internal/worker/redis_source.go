@@ -133,6 +133,13 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Install the env-aware stale-pending reclaim floor (issue #871/#998
+	// review) so a bounded job (MEETING_JOIN/COBROWSE) is never reclaim-
+	// eligible before its own watchdog would have already ACKed it out of
+	// the PEL, even if WORKER_JOB_TIMEOUT_LONG_SECONDS is raised above the
+	// package default. See ResolveStalePendingReclaimFloor's doc comment.
+	s.client.SetStalePendingReclaimMinIdle(ResolveStalePendingReclaimFloor())
+
 	// Create consumer groups for all queues
 	if err := s.client.EnsureConsumerGroups(ctx, s.queueNames); err != nil {
 		return fmt.Errorf("failed to create consumer groups: %w", err)
