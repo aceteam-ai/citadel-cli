@@ -2789,21 +2789,45 @@ exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
 install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
 ships on most nodes) with the cross-platform `service.Manager.Status()` (the
 only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node).
+Linux node). **This means macOS/Windows detection is already covered, not a
+gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
+on every platform, so a managed launchd/SCM service still gets the warn-vs-
+restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
+(citadel#887 verified this rather than assuming it — read the code before
+concluding the macOS/Windows half of that issue is still open).
 
 `citadel update install` now warns loudly by default when a managed service is
-detected, and restarts it only with an explicit `--restart` flag. That restart
-is a blunt `systemctl restart` / `Stop()+Start()` with **no drain** — unlike
-the two automatic paths, it can drop in-flight jobs. This is an accepted
-tradeoff for an interactive, explicitly-opted-in flag: the CLI process has no
-way to observe the *other* (worker) process's in-flight job count, which is
-exactly why draining is owned by the paths that run inside that process.
+detected, and restarts it only with an explicit `--restart` flag.
+
+**The restart is preceded by a bounded, best-effort drain (citadel#887), not
+the unconditional immediate `systemctl restart` / `Stop()+Start()` this
+section used to describe.** `drainManagedServiceBeforeRestart` (`cmd/update.go`)
+polls `GET /worker` (`internal/status/server.go`'s `handleWorker`, added by
+citadel#735 for an unrelated reason — reading the running worker's
+`WorkerLiveness.InFlight` from an in-memory snapshot without a full `/status`
+collection) until in-flight drops to zero or `managedServiceDrainTimeout`
+(30s) elapses, then restarts regardless. The stale claim this replaced — "the
+CLI process has no way to observe the other process's in-flight job count" —
+was wrong the moment #735 shipped `/worker`; #887 is what actually wired that
+observation in here. This is still not the AGENT_UPDATE/auto-updater paths'
+hard drain: it never stops new jobs from being *picked up* while waiting, and
+it restarts anyway once the timeout elapses (an operator who passed
+`--restart` wants the new binary running, not an indefinite hang). A GET
+`/worker` that cannot be read at all — no status listener
+(`--status-port 0`), an older worker predating the route (404), or any other
+probe failure — is treated as "could not determine", never as "zero
+in-flight": the wait is skipped entirely and the restart proceeds
+immediately, i.e. the exact pre-#887 behavior, not a new failure mode.
+
 Known, accepted gaps: `ActiveManagedUnit` returns only the first active unit
 found, so a host running both a fleet unit and a `citadel service install`
 unit gets one warned/restarted and the other left stale (a narrower version of
-the same split-brain); and detection does not verify the swapped binary is the
+the same split-brain); detection does not verify the swapped binary is the
 one the unit's `ExecStart=` actually runs (a dev binary at a different path
-would produce a spurious warning).
+would produce a spurious warning); and the drain above only observes *this*
+node's own worker over loopback — there is still no cross-process signal for
+whether the jobs it is waiting on are individually safe to interrupt, only a
+count.
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
