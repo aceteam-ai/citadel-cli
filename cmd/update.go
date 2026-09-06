@@ -2,8 +2,10 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -112,9 +114,13 @@ agent within one check interval, without a restart.`,
 
 func init() {
 	updateInstallCmd.Flags().BoolVar(&updateInstallRestart, "restart", false,
-		"Restart the managed citadel service (if any) after installing, so the new binary actually runs. "+
-			"Note: this is an abrupt restart with no drain -- in-flight jobs are dropped, unlike the automatic "+
-			"AGENT_UPDATE/auto-updater paths, which drain and wait for idle first.")
+		fmt.Sprintf("Restart the managed citadel service (if any) after installing, so the new binary actually runs. "+
+			"Before restarting, waits up to %s for the running worker's in-flight jobs to finish (best-effort, "+
+			"via GET /worker; citadel#887) -- restarts anyway once that elapses. If /worker is unreachable "+
+			"(an older worker predating the route, or no status listener at all) the wait is skipped entirely "+
+			"and this restarts immediately, same as before #887. Unlike the automatic AGENT_UPDATE/auto-updater "+
+			"paths, this is not a hard drain: it does not stop new jobs from being picked up while waiting.",
+			managedServiceDrainTimeout))
 
 	rootCmd.AddCommand(updateCmd)
 	updateCmd.AddCommand(updateCheckCmd)
@@ -432,10 +438,16 @@ func formatManagedServiceWarning(target managedServiceTarget) string {
 }
 
 // runManagedServiceGate implements the warn-vs-restart decision and all of its
-// I/O, with the target resolver and output streams injected so it is
-// unit-testable without touching systemctl/launchctl/sc or os.Stdout/Stderr.
-// Returns the process exit code the caller should use (0 = no exit needed).
-func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget, bool), out, errOut io.Writer) int {
+// I/O, with the target resolver, drain step, and output streams injected so it
+// is unit-testable without touching systemctl/launchctl/sc, os.Stdout/Stderr,
+// or a live worker's /worker endpoint.
+//
+// drain runs only on the doRestart==true, found==true path, immediately before
+// target.Restart() -- see drainManagedServiceBeforeRestart for what it does
+// (citadel#887's best-effort in-flight wait). A nil drain skips the wait
+// entirely (used by callers/tests that don't exercise it), which is
+// byte-identical to the pre-#887 immediate-restart behavior.
+func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget, bool), drain func(out io.Writer), out, errOut io.Writer) int {
 	target, found := resolve()
 	if !found {
 		return 0
@@ -445,6 +457,10 @@ func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget,
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, formatManagedServiceWarning(target))
 		return 0
+	}
+
+	if drain != nil {
+		drain(out)
 	}
 
 	fmt.Fprintf(out, "\nRestarting managed service (%s) to load the new binary...\n", target.Description)
@@ -457,6 +473,110 @@ func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget,
 	return 0
 }
 
+// managedServiceDrainTimeout bounds how long drainManagedServiceBeforeRestart
+// will wait for the running worker's in-flight job count to reach zero before
+// giving up and restarting anyway. Package var so tests can shrink it rather
+// than sleep for real.
+var managedServiceDrainTimeout = 30 * time.Second
+
+// managedServiceDrainPollInterval is how often drainManagedServiceBeforeRestart
+// re-polls /worker while waiting.
+var managedServiceDrainPollInterval = 2 * time.Second
+
+// workerInFlightFetcher fetches the current in-flight job count from the
+// running worker. ok=false means "could not determine" -- unreachable (no
+// status listener, connection refused), a 404 (an older worker predating the
+// /worker route), or any other probe failure -- and callers must treat that
+// as "skip the wait", never as "in_flight is 0".
+type workerInFlightFetcher func() (inFlight int64, ok bool)
+
+// fetchWorkerInFlight GETs baseURL+"/worker" and extracts worker.in_flight.
+// Split out from defaultWorkerInFlightFetcher (which resolves baseURL via
+// resolveStatusPort()) so it is testable against an httptest.Server directly,
+// without needing to fake gateway-facts.json resolution.
+//
+// It reuses the same route/shape probeWorkerPubSubTransport (cmd/status.go)
+// already reads (citadel#735): GET /worker serves an in-memory
+// WorkerLiveness snapshot and shells out to nothing, so this is cheap enough
+// to poll on a short interval without adding load to a busy node.
+func fetchWorkerInFlight(baseURL string) (int64, bool) {
+	body, err := httpGetBodyErr(&http.Client{Timeout: pubSubProbeCheapTimeout}, baseURL+"/worker")
+	if err != nil {
+		// Covers: connection refused (no status listener -- e.g. --status-port 0),
+		// a 404 (an older worker predating the /worker route), a timeout, and any
+		// other non-2xx. None of these distinguish "definitely zero in-flight" from
+		// "we simply could not ask" -- the caller must degrade, not block.
+		return 0, false
+	}
+	var payload struct {
+		Worker *struct {
+			InFlight int64 `json:"in_flight"`
+		} `json:"worker"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Worker == nil {
+		return 0, false
+	}
+	return payload.Worker.InFlight, true
+}
+
+// defaultWorkerInFlightFetcher is the production workerInFlightFetcher: it
+// resolves the local status server's port the same way probeWorkerPubSubTransport
+// does (resolveStatusPort, cmd/work_attach.go) and reads /worker over loopback.
+func defaultWorkerInFlightFetcher() (int64, bool) {
+	port := resolveStatusPort()
+	if port <= 0 {
+		return 0, false
+	}
+	return fetchWorkerInFlight(fmt.Sprintf("http://127.0.0.1:%d", port))
+}
+
+// drainManagedServiceBeforeRestart is the best-effort wait for the managed
+// worker's in-flight job count to reach zero before an operator's --restart
+// cuts it off (citadel#887, a follow-up to citadel#454/#886).
+//
+// GET /worker (citadel#735) is what makes this tractable at all from a
+// separate, short-lived CLI process: it serves the running worker's own
+// WorkerState.InFlight from an in-memory snapshot, so `citadel update install
+// --restart` can now observe roughly what the AGENT_UPDATE/auto-updater paths
+// already drain for internally. It is still NOT a hard gate, on purpose:
+//   - fetch returning ok=false (no status listener, an older worker with no
+//     /worker route, a timeout, ...) is NOT evidence of zero in-flight jobs --
+//     it is "could not determine", so this returns immediately and lets the
+//     restart proceed exactly as it did before #887. Blocking on an unreadable
+//     signal would be worse than the abrupt-restart status quo: an operator
+//     running --restart on a node with no status server enabled would get a
+//     command that hangs for the full timeout every single time, forever, for
+//     no benefit.
+//   - if in-flight jobs never reach zero within timeout, this restarts anyway
+//     (an operator who passed --restart wants the new binary running; refusing
+//     forever because a long job never finishes would defeat that ask).
+//
+// out is written to for progress so the wait is observable without a
+// --verbose flag; pass io.Discard to suppress it (there is no nil-writer
+// special case, matching every other I/O injection point in this file).
+func drainManagedServiceBeforeRestart(fetch workerInFlightFetcher, timeout, pollInterval time.Duration, out io.Writer) {
+	deadline := time.Now().Add(timeout)
+	for {
+		inFlight, ok := fetch()
+		if !ok {
+			fmt.Fprintln(out, "Could not read the in-flight job count from the running worker "+
+				"(no /worker route, or nothing listening on the status port); restarting without waiting.")
+			return
+		}
+		if inFlight == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(out, "Timed out after %s waiting for %d in-flight job(s) to finish; restarting anyway.\n",
+				timeout, inFlight)
+			return
+		}
+		fmt.Fprintf(out, "Waiting for %d in-flight job(s) to finish before restarting (up to %s)...\n",
+			inFlight, timeout)
+		time.Sleep(pollInterval)
+	}
+}
+
 // warnOrRestartManagedService is the manual-CLI-path counterpart to the
 // AGENT_UPDATE job handler's self-restart (internal/worker/agent_update.go)
 // and the AutoUpdater (internal/update/autoupdater.go) -- both of those
@@ -465,8 +585,16 @@ func runManagedServiceGate(doRestart bool, resolve func() (managedServiceTarget,
 // (citadel#454). doRestart mirrors updateInstallRestart's default-false,
 // opt-in-only contract; it is a parameter (not a direct flag read) so this
 // function is unit-testable.
+//
+// The drain closure wires defaultWorkerInFlightFetcher into
+// drainManagedServiceBeforeRestart (citadel#887) with the package-level
+// timeout/poll-interval vars above; runManagedServiceGate only invokes it on
+// the doRestart==true, found==true path.
 func warnOrRestartManagedService(doRestart bool) {
-	code := runManagedServiceGate(doRestart, resolveManagedServiceRestartTarget, os.Stdout, os.Stderr)
+	drain := func(out io.Writer) {
+		drainManagedServiceBeforeRestart(defaultWorkerInFlightFetcher, managedServiceDrainTimeout, managedServiceDrainPollInterval, out)
+	}
+	code := runManagedServiceGate(doRestart, resolveManagedServiceRestartTarget, drain, os.Stdout, os.Stderr)
 	if code != 0 {
 		os.Exit(code)
 	}
