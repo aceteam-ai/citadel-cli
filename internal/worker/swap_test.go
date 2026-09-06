@@ -131,6 +131,12 @@ func newTestManager(ctrl SwapController) *SwapManager {
 	m.backgroundMax = 2 * time.Second
 	m.readyPoll = 2 * time.Millisecond
 	m.preflight = func(string, status.SystemMetrics) (bool, string) { return false, "" }
+	// citadel-cli#835: default to "no mapping" (unknown) rather than the real
+	// status.EngineCacheDirSize, which would stat this machine's actual
+	// ~/citadel-cache for any test backend that happens to collide with a
+	// real services.EngineCacheDirs entry (e.g. "vllm"). Tests that exercise
+	// the Pulled signal override this field directly with their own stub.
+	m.cacheDirSize = func(string) (int64, bool) { return 0, false }
 	return m
 }
 

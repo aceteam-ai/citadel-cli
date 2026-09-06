@@ -145,6 +145,13 @@ type swapOp struct {
 	// separates a swap that spent the box's time from one refused before it
 	// began.
 	started bool
+
+	// pulled is the citadel-cli#835 tri-state "did this swap require a
+	// weights fetch" signal, populated only once the engine reports ready
+	// (see SwapRecord.Pulled's doc comment for the full semantics). nil until
+	// then, and nil forever if the engine has no services.EngineCacheDirs
+	// mapping.
+	pulled *bool
 }
 
 // SwapManager serializes and observes model swaps on a node.
@@ -174,6 +181,14 @@ type SwapManager struct {
 	// this on every on-demand swap, not once per ~30s heartbeat tick like the
 	// collector. Defaults to status.DiskMetricsOnly (disk.Usage("/") alone).
 	diskMetrics func() status.SystemMetrics
+
+	// cacheDirSize resolves the total bytes on disk for an engine's canonical
+	// cache directory, and whether the engine has a services.EngineCacheDirs
+	// mapping at all (citadel-cli#835). Defaults to status.EngineCacheDirSize;
+	// a field (not a package var) so tests inject a stub instead of touching
+	// this machine's real ~/citadel-cache — mirroring preflight/diskMetrics
+	// above.
+	cacheDirSize func(backend string) (bytes int64, mapped bool)
 
 	waitBudget    time.Duration
 	minResidency  time.Duration
@@ -245,6 +260,7 @@ func NewSwapManager(ctrl SwapController, opts ...SwapManagerOption) *SwapManager
 		now:                  time.Now,
 		preflight:            defaultSwapPreflight,
 		diskMetrics:          status.DiskMetricsOnly,
+		cacheDirSize:         status.EngineCacheDirSize,
 		waitBudget:           swapWaitBudget,
 		minResidency:         swapMinResidency,
 		backgroundMax:        swapBackgroundMaxDur,
@@ -426,6 +442,15 @@ func (m *SwapManager) runSwap(op *swapOp) {
 		return // could not proceed now; caller warms and retries
 	}
 
+	// Sample the engine's cache directory BEFORE issuing Start, so the
+	// citadel-cli#835 tri-state pull signal below has a baseline. Taken here
+	// rather than at the top of runSwap: preemption above never touches this
+	// engine's own cache dir, but sampling as close to Start as possible
+	// keeps the window in which an unrelated concurrent write could skew the
+	// comparison as small as it can be. cacheSizeMapped never changes for a
+	// given backend within one swap, so it is captured once and reused below.
+	cacheSizeBefore, cacheSizeMapped := m.cacheDirSize(op.backend)
+
 	// Start the target engine (SERVICE_START {service, model}; no vram_mb).
 	// Record the attempt BEFORE issuing it: an inline compose build can take
 	// minutes, and the readiness gate must already see the start as in flight
@@ -443,6 +468,20 @@ func (m *SwapManager) runSwap(op *swapOp) {
 	for {
 		if m.ctrl.Ready(ctx, op.backend) {
 			op.ready = true
+			// Sample the cache dir AFTER ready (citadel-cli#835): whatever
+			// weights fetch was going to happen -- ollama's synchronous
+			// `ollama pull` inside Start, or a docker engine's own download
+			// during its container startup -- has finished by the time the
+			// engine reports ready, so this is the correct "after" reading
+			// for both. cacheSizeMapped==false means this engine has no
+			// services.EngineCacheDirs entry at all, and op.pulled must stay
+			// nil (unknown) rather than resolve to a guessed false -- see
+			// SwapRecord.Pulled's doc comment.
+			if cacheSizeMapped {
+				cacheSizeAfter, _ := m.cacheDirSize(op.backend)
+				pulled := cacheSizeAfter > cacheSizeBefore
+				op.pulled = &pulled
+			}
 			// Time the load before marking ready: this is the only place the node
 			// learns how long THIS engine actually takes to come up, and that
 			// measurement is what raises the residency ceiling above the load
@@ -778,6 +817,7 @@ func (m *SwapManager) swapRecord(op *swapOp) SwapRecord {
 		StartedAt: op.startedAt,
 		Wait:      m.now().Sub(op.startedAt),
 		Outcome:   outcome,
+		Pulled:    op.pulled,
 	}
 }
 

@@ -2079,18 +2079,35 @@ doesn't wire `WorkerLiveness`/`PinnedServices`/`ModelHotswap`, a pre-existing
 gap this doesn't widen; low-priority follow-up alongside the other
 TUI-collector gaps noted under Service Preemption above.
 
-**"Whether a swap pulled" is still NOT reported (#717 part 2, deferred).**
-`SwapRecord` has no `pulled` field. For docker-based engines (vLLM, bonsai,
-llama.cpp) a weights pull, if any, happens opaquely inside the container's own
-startup during `docker compose up` — invisible to the Go code driving it — so
-observing it honestly needs new engine-specific instrumentation (e.g. sampling
-each engine's model-cache directory before/after `Start`), not just a return
-value threaded through `SwapController.Start`. Native ollama IS observable
-(`ensureOllamaModel` in `internal/jobs/service_handler.go` already knows whether
-a pull ran), but that alone would cover a minority of swap targets. Per #717's
-explicit instruction, a guessed field is worse than no field, so this stays
-open rather than half-implemented; a follow-up issue should scope the
-docker-side instrumentation before adding the field.
+**"Whether a swap pulled" is now reported, as a TRI-STATE (citadel #835, #717
+part 2 — fixed).** `SwapRecord.Pulled *bool`: `true` (weights fetched),
+`false` (resident-cache start), or `nil`/absent (unknown). The Go code driving
+`docker compose up` still cannot observe a docker-based engine's weights pull
+directly — it happens opaquely inside the container's own startup — so
+`worker.SwapManager.runSwap` (`internal/worker/swap.go`) derives the signal
+indirectly instead: it samples the engine's canonical cache directory
+(`services.EngineCacheDirs`, via the new `status.EngineCacheDirSize`)
+immediately before issuing `Start` and again once the engine reports ready —
+grew ⇒ `true`, unchanged ⇒ `false`. An engine absent from
+`services.EngineCacheDirs` (a future `ServiceMap` entry not yet added there)
+resolves to `nil`, NEVER a guessed `false` — the exact #717 rule ("a guessed
+field is worse than no field") this field exists to honor, now enforced by
+`TestSwap_Pulled_NilWhenEngineUnmapped`. A swap that never reaches `ready`
+(a `warming`/`blocked`/`failed`/`rate_limited` outcome) also leaves `Pulled`
+nil — the pull, if any, may still be mid-flight when the outcome is recorded
+(`TestSwap_Pulled_NilWhenSwapNeverReachesReady`).
+
+Native ollama deliberately does NOT get a separate, more-precise signal
+plumbed from `ensureOllamaModel` (`internal/jobs/service_handler.go`, which
+already knows whether its own `ollama pull` fetched anything) — that would
+mean widening `SwapController.Start`'s signature for one engine family, judged
+disproportionate. Ollama gets the SAME dir-sampling fallback as every docker
+engine, and it is exact there (not approximate): `ensureOllamaModel` runs
+synchronously inside `Start`, so by the time `Ready` reports true the pull (if
+any) has already completed and the sampled "after" size already reflects it.
+Mirrored onto the heartbeat via `status.SwapRecord.Pulled` (same tri-state,
+`swapStatsFrom` in `cmd/work.go`); `TestSwapShapeParity` is what would have
+caught a field added to one side and not the other.
 
 ### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
 

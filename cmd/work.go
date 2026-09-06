@@ -3228,6 +3228,7 @@ func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
 				StartedAt: r.StartedAt,
 				Wait:      r.Wait,
 				Outcome:   r.Outcome,
+				Pulled:    r.Pulled,
 			}
 		}
 	}
