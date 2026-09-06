@@ -314,6 +314,27 @@ func defaultCitadelCacheBaseDir() string {
 	return filepath.Join(home, "citadel-cache")
 }
 
+// EngineCacheDirSize reports the total size in bytes of engine `name`'s
+// canonical cache directory (services.EngineCacheDirs), and whether the
+// engine has a cache-dir mapping at all. mapped=false means "no mapping" --
+// citadel-cli#835's before/after weights-pull sampling
+// (internal/worker/swap.go) must treat that as UNKNOWN, never as a measured
+// zero: an unmapped engine (a future ServiceMap entry not yet added to this
+// table) could still have pulled real weights through a path this function
+// cannot see, and resolving that to "no pull happened" would be exactly the
+// guessed-false #717 already ruled out for this field. Reuses the same
+// citadelCacheBaseDirFn/cacheDirTotalSize seams defaultEngineWeightsPresent
+// does, so a test that stubs those for THIS package's own tests gets
+// identical behavior here with no separate wiring.
+func EngineCacheDirSize(name string) (bytes int64, mapped bool) {
+	cache, ok := services.EngineCacheDirs[name]
+	if !ok {
+		return 0, false
+	}
+	dir := filepath.Join(citadelCacheBaseDirFn(), cache.Dir)
+	return cacheDirTotalSize(dir), true
+}
+
 // cacheDirTotalSize sums the sizes of every regular file under dir,
 // recursively. Returns 0 if dir cannot be walked (in particular, if it does
 // not exist -- the normal case for weights never pulled, or a directory

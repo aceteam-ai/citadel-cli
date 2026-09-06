@@ -61,10 +61,26 @@ const (
 // SwapRecord is one swap this node attempted. It records what the manager
 // genuinely knows.
 //
-// Deliberately absent: "whether a pull was required" (asked for in #687). The
-// manager issues a SERVICE_START and the weights pull, if any, happens inside
-// it — the manager cannot observe it, and a guessed field is worse than no
-// field. Reporting it needs the start path to report back; tracked separately.
+// Pulled (citadel-cli#835, #717 part 2) is a TRI-STATE signal, not a plain
+// bool: nil means "unknown" and must stay unknown rather than resolve to
+// false. The manager cannot observe a docker-based engine's weights pull
+// directly — it happens opaquely inside the container's own startup during
+// `docker compose up` — so Pulled is derived indirectly, by sampling the
+// engine's canonical cache directory (services.EngineCacheDirs,
+// status.EngineCacheDirSize) immediately before issuing Start and again once
+// the engine reports ready: grew -> true, unchanged -> false, no cache-dir
+// mapping for this engine at all -> nil. #717's rule ("a guessed field is
+// worse than no field") is honored by keeping that third state real: an
+// engine absent from services.EngineCacheDirs (a future ServiceMap entry not
+// yet added there) NEVER resolves to false. Native ollama swaps in through
+// the identical SERVICE_START path (jobs.ServiceHandler.serviceStart's
+// "native" branch calls ensureOllamaModel, which already knows whether its
+// own `ollama pull` fetched anything) — a fully engine-specific signal was
+// judged disproportionate to plumb through this interface for one engine
+// family, so ollama gets the SAME dir-sampling fallback as every docker
+// engine; its cache dir (services.EngineCacheDirs["ollama"], CacheFamilyNative)
+// is real and this table already tracks it, so the fallback is exact there,
+// not approximate.
 type SwapRecord struct {
 	// Backend is the engine swapped in.
 	Backend string `json:"backend"`
@@ -79,6 +95,12 @@ type SwapRecord struct {
 	Wait time.Duration `json:"wait"`
 	// Outcome is one of the swapOutcome* values.
 	Outcome string `json:"outcome"`
+	// Pulled reports whether this swap required a weights fetch: true (cache
+	// dir grew), false (cache dir unchanged — resident-cache start), or nil
+	// (unknown — see the type doc comment). Only ever populated on a swap that
+	// actually reached Start; a swap blocked/rate-limited/preflight-refused
+	// before Start leaves this nil too, for the same "no signal" reason.
+	Pulled *bool `json:"pulled,omitempty"`
 }
 
 // Evicting reports whether this swap took VRAM away from a resident engine.
