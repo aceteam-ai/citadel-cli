@@ -2313,3 +2313,20 @@ Auto-generated log of every release.
   - feat: WhatsApp bridge as a first-class module + provenance-scoped uninstall (Part 1 of #624) (#994)
 
 
+---
+
+## v2.148.0 — 2026-09-06
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 16 |
+| Lines added | +1384 |
+
+**Changes:**
+
+  - fix: direct-Redis Nacked messages were never redelivered (#871) (#998)
+  - fix: bounded best-effort drain for `citadel update install --restart` (#887) (#996)
+  - feat: report whether a model-hotswap swap required a weights pull (#835) (#997)
+
+
