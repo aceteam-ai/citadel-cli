@@ -226,6 +226,86 @@ func (c *Client) ReadJobMultiBlock(ctx context.Context, queues []string, blockMs
 	return nil, "", nil
 }
 
+// StalePendingReclaimMinIdle is how long a delivered-but-unacknowledged
+// message must sit idle in the consumer group's pending-entries list (PEL)
+// before ReclaimStalePending(OnQueue) will steal it via XAUTOCLAIM and make
+// it eligible for redelivery (citadel-cli issue #871).
+//
+// This exists because XREADGROUP's ">" ID NEVER returns an already-delivered
+// message again -- not to a replacement consumer after a crash, and not even
+// back to the SAME consumer that originally read it (verified against a real
+// Redis-protocol implementation: see internal/worker's
+// TestRedisXReadGroupSemantics). Without an explicit reclaim step somewhere
+// in the read path, RedisSource.Nack's "don't ACK, let it retry" comment was
+// aspirational: the message just sits in the PEL forever, nothing ever reads
+// it again, and it never reaches the DLQ either. That turns issue #826's
+// willRetry() suppression of the terminal "error" stream event into a
+// PERMANENT silence bug (the backend waits forever for a stream event that
+// will never arrive) rather than the "deferred until the next attempt or the
+// DLQ" behavior it was designed around.
+//
+// The default is deliberately conservative: it matches
+// WORKER_JOB_TIMEOUT_LONG_SECONDS (4h, internal/worker/deadline.go), the
+// longest BOUNDED per-job watchdog ceiling this codebase has. Every job type
+// with a bounded watchdog is therefore already ACKed out of the PEL by its
+// own watchdog abandon (routes to source.Fail, per the Consume-Loop Watchdog
+// section of CLAUDE.md) well before it could become eligible for reclaim
+// here -- so a live, still-executing bounded job is never at risk of being
+// stolen and double-dispatched by this mechanism.
+//
+// Residual, accepted gap: a genuinely UNBOUNDED job (model pulls,
+// SERVICE_START, builds -- see the same CLAUDE.md section) that legitimately
+// runs longer than this window IS at risk of being reclaimed and
+// re-dispatched while still executing. Tightening this (per-job-type
+// thresholds, or a true consumer-liveness check via XINFO CONSUMERS instead
+// of a time-based steal) is a documented follow-up, not part of this fix.
+//
+// A package var (not a const) so tests can shrink it instead of sleeping
+// real time.
+var StalePendingReclaimMinIdle = 4 * time.Hour
+
+// ReclaimStalePending is ReclaimStalePendingOnQueue for the client's primary
+// (single-queue) configuration.
+func (c *Client) ReclaimStalePending(ctx context.Context) (*Job, error) {
+	return c.ReclaimStalePendingOnQueue(ctx, c.queueName)
+}
+
+// ReclaimStalePendingOnQueue attempts to steal exactly one message from
+// queue's pending-entries list (PEL) that has been idle at least
+// StalePendingReclaimMinIdle, via XAUTOCLAIM, reassigning it to this client's
+// own consumer name. Returns (nil, nil) whenever nothing is eligible -- the
+// overwhelming common case on every poll -- so callers can unconditionally
+// fall through to their normal read.
+//
+// XAUTOCLAIM (without JUSTID) increments the message's delivery count on
+// every successful claim, including a "self-claim" back to the same
+// consumer that already owned it (verified: internal/worker's
+// TestRedisXAutoClaimSemantics) -- so the existing DLQ cutoff
+// (deliveryCount >= MaxAttempts in RedisSource's nextSingle/nextMulti) and
+// willRetry's retry signal (internal/worker/runner.go) both continue to work
+// completely unmodified. This method only supplies the missing "does
+// redelivery actually happen at all" half described above.
+func (c *Client) ReclaimStalePendingOnQueue(ctx context.Context, queue string) (*Job, error) {
+	msgs, _, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   queue,
+		Group:    c.consumerGroup,
+		Consumer: c.workerID,
+		MinIdle:  StalePendingReclaimMinIdle,
+		Start:    "0-0",
+		Count:    1,
+	}).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to reclaim stale pending message on %s: %w", queue, err)
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	return c.parseMessage(msgs[0])
+}
+
 // AckJobOnQueue acknowledges a message on a specific queue (for multi-queue mode).
 func (c *Client) AckJobOnQueue(ctx context.Context, queue, messageID string) error {
 	return c.client.XAck(ctx, queue, c.consumerGroup, messageID).Err()

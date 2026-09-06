@@ -538,6 +538,48 @@ type WorkerJobHandler interface {
 | Scaling | Horizontal via consumer groups |
 | Default endpoint | redis.aceteam.ai (AceTeam private cloud) |
 
+### Direct-Redis redelivery: XREADGROUP alone never retries anything (citadel #871)
+
+`RedisSource.Nack` (`internal/worker/redis_source.go`) deliberately doesn't
+ACK, with a comment that reads "let it retry" -- but `XREADGROUP`'s `>` ID
+hands each message to the consumer group exactly ONCE and never again, not
+even back to the SAME consumer that originally read it (verified against a
+real Redis-protocol implementation:
+`internal/redis`'s `TestXReadGroupNeverRedeliversAlreadyDeliveredMessage`).
+`ReadJobBlock`/`ReadJobMultiBlock` only ever read with `>`. So before #871,
+nothing in this codebase ever redelivered a Nacked message -- it just sat in
+the consumer group's pending-entries list (PEL) forever. Combined with issue
+#826's `willRetry` (which suppresses the terminal `error` stream event
+whenever it believes a retry is coming), a truly-failed or
+transient-fail-then-abandoned job in direct-Redis mode produced ZERO
+terminal stream events, permanently.
+
+`Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
+an `XAUTOCLAIM`-based reclaim, tried on every poll (`RedisSource.nextSingle`/
+`nextMulti`) before the normal blocking read. `XAUTOCLAIM` (without `JUSTID`)
+increments the Redis-native delivery count on every successful claim --
+including a self-claim back to the consumer that already owned it -- so the
+existing DLQ cutoff and `willRetry`'s retry signal both keep working
+unmodified; this only supplies the missing "does redelivery actually happen"
+half. `Client.StalePendingReclaimMinIdle` (a package var, default 4h,
+matching `WORKER_JOB_TIMEOUT_LONG_SECONDS`) is deliberately conservative: any
+job type with a BOUNDED per-job watchdog is already ACKed out of the PEL by
+its own watchdog abandon (routes to `source.Fail`) before it could become
+eligible for reclaim, so a live bounded job is never at risk of being stolen
+mid-execution. A genuinely UNBOUNDED job (model pulls, `SERVICE_START`,
+builds) that legitimately runs longer than this window is a documented,
+accepted residual risk -- tightening it (per-job-type thresholds, or a true
+consumer-liveness check via `XINFO CONSUMERS` instead of a time-based steal)
+is a follow-up, not part of this fix.
+
+**API mode has no equivalent, and this fix does not add one (issue #865,
+stays open).** The AceTeam Redis API proxy `APISource` uses exposes no
+per-message delivery count to the node at all -- `job.Metadata.MaxAttempts`
+is `0` for every API-mode job, which routes `willRetry` through its own
+"no signal, don't guess" fallback (always publish, matching pre-#826
+behavior) rather than through the reclaim path above. Fixing that is
+cross-repo proxy work and is out of scope here.
+
 ### Redis Status Publishing
 
 The worker supports real-time status publishing to Redis for live dashboard updates and reliable status processing.

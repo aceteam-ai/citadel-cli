@@ -223,9 +223,21 @@ func (s *RedisSource) snapshotQueues() []string {
 
 // nextSingle reads from a single queue (original behavior).
 func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
-	redisJob, err := s.client.ReadJobBlock(ctx, blockMs)
+	// Reclaim a stale pending entry (issue #871) before doing a normal read.
+	// This is the ONLY thing that ever redelivers a Nacked-but-unacked
+	// message in direct-Redis mode -- see StalePendingReclaimMinIdle's doc
+	// comment. Best-effort: a reclaim error never fails the poll, it just
+	// falls through to the ordinary read.
+	redisJob, err := s.client.ReclaimStalePendingOnQueue(ctx, queue)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", queue, err)
+		redisJob = nil
+	}
+	if redisJob == nil {
+		redisJob, err = s.client.ReadJobBlock(ctx, blockMs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		}
 	}
 
 	if redisJob == nil {
@@ -272,9 +284,30 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 
 // nextMulti reads from multiple queues simultaneously.
 func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
-	redisJob, sourceQueue, err := s.client.ReadJobMultiBlock(ctx, queues, blockMs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+	// Reclaim a stale pending entry (issue #871) on any of the subscribed
+	// queues before doing a normal read. See nextSingle's comment and
+	// StalePendingReclaimMinIdle's doc comment for why this is needed at all.
+	var redisJob *redisclient.Job
+	var sourceQueue string
+	for _, q := range queues {
+		reclaimed, err := s.client.ReclaimStalePendingOnQueue(ctx, q)
+		if err != nil {
+			s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", q, err)
+			continue
+		}
+		if reclaimed != nil {
+			redisJob = reclaimed
+			sourceQueue = q
+			break
+		}
+	}
+
+	if redisJob == nil {
+		var err error
+		redisJob, sourceQueue, err = s.client.ReadJobMultiBlock(ctx, queues, blockMs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		}
 	}
 
 	if redisJob == nil {
