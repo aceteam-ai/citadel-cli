@@ -172,6 +172,75 @@ func envTimeoutSeconds(envVar string, def int) (time.Duration, bool) {
 	return time.Duration(secs) * time.Second, true
 }
 
+// ReclaimFloorMargin is the safety margin added on top of the resolved
+// long-tier watchdog timeout when computing the direct-Redis stale-pending
+// reclaim floor (citadel-cli#871/#998). It exists because reclaim
+// eligibility and the per-job watchdog measure idle time from two DIFFERENT
+// starting points: a message becomes reclaim-eligible counting from DELIVERY
+// time (when XREADGROUP/XAUTOCLAIM handed it out), while the watchdog
+// deadline in executeJob only starts counting from EXECUTION-START time
+// (citadel-cli#908's claim/execute split put a real, if usually small, gap
+// between those two moments -- lane admission/queueing on the serialized
+// unbounded lane). A floor merely EQUAL to the watchdog ceiling would let
+// reclaim-eligibility arrive first for any job that spent nonzero time
+// queued before executing, defeating the whole point of deriving the floor
+// from the watchdog in the first place. A package var (not a const) so
+// tests can shrink it instead of sleeping real time.
+var ReclaimFloorMargin = 10 * time.Minute
+
+// StalePendingReclaimFloorFallback is the sane, large default
+// ResolveStalePendingReclaimFloor falls back to when the long-tier watchdog
+// itself is configured unbounded (WORKER_JOB_TIMEOUT_LONG_SECONDS=0): with
+// no finite watchdog ceiling to exceed, no time-based floor can be proven
+// safe against a genuinely unbounded job (see the residual-risk
+// documentation on internal/redis.Client.ReclaimStalePendingOnQueue and the
+// CLAUDE.md section this issue added). Deliberately the SAME value as
+// internal/redis.StalePendingReclaimMinIdle's own built-in default --
+// TestStalePendingReclaimFloorFallbackMatchesRedisDefault keeps the two in
+// sync -- so turning the long-tier watchdog off does not silently WIDEN the
+// reclaim exposure beyond what a node that never touches either knob
+// already accepts.
+const StalePendingReclaimFloorFallback = 4 * time.Hour
+
+// ResolveStalePendingReclaimFloor computes the reclaim-eligibility floor
+// RedisSource.Connect hands to internal/redis.Client.
+// SetStalePendingReclaimMinIdle.
+//
+// internal/redis is a leaf package (must not import internal/worker -- see
+// CLAUDE.md's ConfigDir()/leaf-package notes for the identical constraint
+// elsewhere in this codebase) and so cannot itself read
+// WORKER_JOB_TIMEOUT_LONG_SECONDS or otherwise resolve the long-tier
+// watchdog's actual, operator-tunable ceiling. This function lives here,
+// where jobTimeoutLongEnvVar/envTimeoutSeconds already do the resolution
+// for resolveJobTimeout, and the caller threads the result across the
+// package boundary as a plain time.Duration.
+//
+// The floor is STRICTLY GREATER than the resolved long-tier watchdog
+// ceiling, by ReclaimFloorMargin -- not merely equal to it. This closes the
+// bug the citadel-cli#998 review caught in the original hardcoded-4h
+// constant: an operator who raises WORKER_JOB_TIMEOUT_LONG_SECONDS above 4h
+// would otherwise make a healthy, still-executing MEETING_JOIN/COBROWSE
+// deterministically eligible for reclaim before its own watchdog would ever
+// fire. With this resolved dynamically (and the margin), every BOUNDED job
+// type is always ACKed out of the PEL by its own watchdog abandon (routes
+// to source.Fail) before it can become reclaim-eligible -- see
+// ReclaimFloorMargin's doc comment for why equality alone would not be
+// enough.
+//
+// When the long-tier watchdog is itself unbounded
+// (WORKER_JOB_TIMEOUT_LONG_SECONDS=0), there is no finite ceiling to exceed,
+// so this falls back to StalePendingReclaimFloorFallback -- a genuinely
+// unbounded job that legitimately runs longer than that remains the
+// documented residual exposure (see CLAUDE.md's Direct-Redis redelivery
+// section), not something this function can close.
+func ResolveStalePendingReclaimFloor() time.Duration {
+	d, ok := envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
+	if !ok {
+		return StalePendingReclaimFloorFallback
+	}
+	return d + ReclaimFloorMargin
+}
+
 // jobTimeoutPayloadKey is the wire field the backend dispatcher injects to give
 // a job a per-execution budget (aceteam#6000). It is a RELATIVE duration in
 // milliseconds measured from the moment the worker begins executing the job --

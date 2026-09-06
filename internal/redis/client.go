@@ -59,6 +59,15 @@ type Client struct {
 	blockMs       int
 	maxAttempts   int
 	nodeMeta      *NodeMeta
+
+	// reclaimMinIdle is the effective floor ReclaimStalePendingOnQueue uses.
+	// Defaults to the package var StalePendingReclaimMinIdle at construction
+	// time (a safe, self-contained default for a caller with no better
+	// signal), but internal/worker.RedisSource.Connect overrides it via
+	// SetStalePendingReclaimMinIdle with an env-aware, watchdog-derived value
+	// -- see that setter's doc comment for why this package cannot compute
+	// that value itself.
+	reclaimMinIdle time.Duration
 }
 
 // ClientConfig holds configuration for the Redis client.
@@ -84,12 +93,31 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 
 	return &Client{
-		workerID:      fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
-		queueName:     cfg.QueueName,
-		consumerGroup: cfg.ConsumerGroup,
-		blockMs:       cfg.BlockMs,
-		maxAttempts:   cfg.MaxAttempts,
+		workerID:       fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
+		queueName:      cfg.QueueName,
+		consumerGroup:  cfg.ConsumerGroup,
+		blockMs:        cfg.BlockMs,
+		maxAttempts:    cfg.MaxAttempts,
+		reclaimMinIdle: StalePendingReclaimMinIdle,
 	}
+}
+
+// SetStalePendingReclaimMinIdle overrides this client's reclaim-eligibility
+// floor for ReclaimStalePending(OnQueue). This package is a leaf and must
+// not import internal/worker (see CLAUDE.md's ConfigDir()/leaf-package
+// notes for the identical constraint elsewhere in this codebase), so it
+// cannot itself read WORKER_JOB_TIMEOUT_LONG_SECONDS or resolve the
+// long-tier watchdog's actual ceiling -- the caller (internal/worker.
+// RedisSource.Connect, via ResolveStalePendingReclaimFloor) computes that
+// env-aware value and hands it across the package boundary through this
+// setter. A zero or negative duration is ignored (keeps the current value)
+// rather than disabling the floor outright, since "no floor at all" is not
+// a value any caller should be able to reach through this seam.
+func (c *Client) SetStalePendingReclaimMinIdle(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.reclaimMinIdle = d
 }
 
 // Connect establishes connection to Redis.
@@ -224,6 +252,108 @@ func (c *Client) ReadJobMultiBlock(ctx context.Context, queues []string, blockMs
 	}
 
 	return nil, "", nil
+}
+
+// StalePendingReclaimMinIdle is the package-level DEFAULT for how long a
+// delivered-but-unacknowledged message must sit idle in the consumer
+// group's pending-entries list (PEL) before ReclaimStalePending(OnQueue)
+// will steal it via XAUTOCLAIM and make it eligible for redelivery
+// (citadel-cli issue #871). It is only what a *new* Client is constructed
+// with; internal/worker.RedisSource.Connect immediately overrides it per
+// instance, via SetStalePendingReclaimMinIdle, with an env-aware value
+// derived from the actual resolved long-tier watchdog ceiling
+// (internal/worker.ResolveStalePendingReclaimFloor) -- see that function's
+// doc comment for the exact formula and why a fixed constant here is not
+// enough on its own (citadel-cli#998 review).
+//
+// This mechanism exists because XREADGROUP's ">" ID NEVER returns an
+// already-delivered message again -- not to a replacement consumer after a
+// crash, and not even back to the SAME consumer that originally read it
+// (verified against miniredis, a Redis-protocol reimplementation: see
+// internal/redis's TestXReadGroupNeverRedeliversAlreadyDeliveredMessage).
+// Without an explicit reclaim step somewhere in the read path,
+// RedisSource.Nack's "don't ACK, let it retry" comment was aspirational:
+// the message just sits in the PEL forever, nothing ever reads it again,
+// and it never reaches the DLQ either. That turns issue #826's willRetry()
+// suppression of the terminal "error" stream event into a PERMANENT
+// silence bug (the backend waits forever for a stream event that will
+// never arrive) rather than the "deferred until the next attempt or the
+// DLQ" behavior it was designed around.
+//
+// This constant alone is NOT the safety guarantee against stealing a live
+// bounded job -- see ResolveStalePendingReclaimFloor for why an operator-
+// tunable watchdog timeout requires the floor to be resolved dynamically,
+// with a margin, rather than hardcoded here.
+//
+// A package var (not a const) so tests can shrink it instead of sleeping
+// real time.
+var StalePendingReclaimMinIdle = 4 * time.Hour
+
+// ReclaimStalePending is ReclaimStalePendingOnQueue for the client's primary
+// (single-queue) configuration.
+func (c *Client) ReclaimStalePending(ctx context.Context) (*Job, error) {
+	return c.ReclaimStalePendingOnQueue(ctx, c.queueName)
+}
+
+// ReclaimStalePendingOnQueue attempts to steal exactly one message from
+// queue's pending-entries list (PEL) that has been idle at least this
+// client's reclaimMinIdle (StalePendingReclaimMinIdle by default, or the
+// env-aware value SetStalePendingReclaimMinIdle installed), via XAUTOCLAIM,
+// reassigning it to this client's own consumer name. Returns (nil, nil)
+// whenever nothing is eligible -- the overwhelming common case on every
+// poll -- so callers can unconditionally fall through to their normal read.
+//
+// XAUTOCLAIM (without JUSTID) increments the message's delivery count on
+// every successful claim, including a "self-claim" back to the same
+// consumer that already owned it (verified against miniredis: internal/
+// redis's TestReclaimStalePendingOnQueue) -- so the existing DLQ cutoff
+// (deliveryCount >= MaxAttempts in RedisSource's nextSingle/nextMulti) and
+// willRetry's retry signal (internal/worker/runner.go) both continue to work
+// completely unmodified. This method only supplies the missing "does
+// redelivery actually happen at all" half described above.
+//
+// Two residual gaps this method does NOT close, both accepted and
+// documented rather than fixed here (see CLAUDE.md's Direct-Redis
+// redelivery section, and citadel-cli#999 for the proper follow-up fix):
+// (1) it can self-steal from -- and therefore double-dispatch -- MULTIPLE
+// consumer processes sharing this consumer group (horizontal scaling),
+// since a claim only moves PEL ownership in Redis and does nothing to stop
+// whichever process is still actually running the handler; (2) a genuinely
+// unbounded job (see ResolveStalePendingReclaimFloor) that outlives roughly
+// (MaxAttempts-1) reclaim cycles is MoveToDLQ'd and ACKed -- reported dead
+// -- even if it is still legitimately executing.
+//
+// citadel-cli#999 tracks the proper fix: reclaim must not CLAIM an entry it
+// shouldn't be claiming, because XAUTOCLAIM increments the delivery count
+// as a side effect of the claim call itself, before any Go code sees the
+// message -- a caller that detects "already in-flight" and skips executing
+// a reclaimed job has already paid that increment, and will still exhaust
+// MaxAttempts and still trigger the spurious DLQ move. A naive "skip if
+// in-flight" guard on top of this method would NOT close either gap; it
+// would only hide gap (2) behind an extra no-op dispatch. The real fix is
+// to stop calling a blanket XAUTOCLAIM and instead make a positive
+// determination (via XPENDING + targeted XCLAIM, or a true
+// consumer-liveness check via XINFO CONSUMERS) that an entry's owning
+// consumer is actually gone before ever claiming it.
+func (c *Client) ReclaimStalePendingOnQueue(ctx context.Context, queue string) (*Job, error) {
+	msgs, _, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   queue,
+		Group:    c.consumerGroup,
+		Consumer: c.workerID,
+		MinIdle:  c.reclaimMinIdle,
+		Start:    "0-0",
+		Count:    1,
+	}).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to reclaim stale pending message on %s: %w", queue, err)
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	return c.parseMessage(msgs[0])
 }
 
 // AckJobOnQueue acknowledges a message on a specific queue (for multi-queue mode).

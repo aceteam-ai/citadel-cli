@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 )
 
 // ctxHandler honors its context: it returns as soon as the deadline elapses,
@@ -304,4 +306,64 @@ func TestResolveJobTimeout(t *testing.T) {
 			t.Fatal("default tier set to 0 should be unbounded (ok=false)")
 		}
 	})
+}
+
+// TestResolveStalePendingReclaimFloor pins citadel-cli#998's review fix:
+// the direct-Redis reclaim floor must be resolved from the SAME env var
+// that tunes the long-tier watchdog (jobTimeoutLongEnvVar,
+// WORKER_JOB_TIMEOUT_LONG_SECONDS), and must exceed it by ReclaimFloorMargin
+// -- not merely equal it -- so raising the watchdog timeout can never make a
+// still-healthy bounded job (MEETING_JOIN/COBROWSE) reclaim-eligible before
+// its own watchdog would have already ACKed it out of the PEL.
+func TestResolveStalePendingReclaimFloor(t *testing.T) {
+	t.Run("default: matches the default long-tier timeout plus margin", func(t *testing.T) {
+		got := ResolveStalePendingReclaimFloor()
+		want := defaultLongJobTimeoutSeconds*time.Second + ReclaimFloorMargin
+		if got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+		// Must be STRICTLY greater than the watchdog ceiling it is derived
+		// from, not merely equal -- see ReclaimFloorMargin's doc comment for
+		// why equality alone is unsafe.
+		if got <= defaultLongJobTimeoutSeconds*time.Second {
+			t.Fatalf("floor %s is not strictly greater than the watchdog ceiling %ds", got, defaultLongJobTimeoutSeconds)
+		}
+	})
+
+	t.Run("env-aware: an operator-raised WORKER_JOB_TIMEOUT_LONG_SECONDS raises the floor too", func(t *testing.T) {
+		// A watchdog raised ABOVE the old hardcoded 4h constant is exactly
+		// the scenario the review flagged: the floor must track it, or a
+		// healthy long-session job becomes deterministically stealable at
+		// the old fixed 4h mark.
+		t.Setenv(jobTimeoutLongEnvVar, "21600") // 6h
+		got := ResolveStalePendingReclaimFloor()
+		want := 6*time.Hour + ReclaimFloorMargin
+		if got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+		if got <= 6*time.Hour {
+			t.Fatalf("floor %s is not strictly greater than the raised watchdog ceiling 6h", got)
+		}
+	})
+
+	t.Run("unbounded long-tier watchdog falls back to a large sane default", func(t *testing.T) {
+		t.Setenv(jobTimeoutLongEnvVar, "0")
+		got := ResolveStalePendingReclaimFloor()
+		if got != StalePendingReclaimFloorFallback {
+			t.Fatalf("got %s, want the fallback %s", got, StalePendingReclaimFloorFallback)
+		}
+	})
+}
+
+// TestStalePendingReclaimFloorFallbackMatchesRedisDefault pins that the two
+// packages' defaults cannot silently diverge: internal/redis.Client is
+// constructed with StalePendingReclaimMinIdle before RedisSource.Connect
+// ever calls SetStalePendingReclaimMinIdle, so if this constant and that
+// package var disagree, a caller that skips Connect (or a future refactor
+// that reorders construction) could see a DIFFERENT, unreviewed default.
+func TestStalePendingReclaimFloorFallbackMatchesRedisDefault(t *testing.T) {
+	if StalePendingReclaimFloorFallback != redisclient.StalePendingReclaimMinIdle {
+		t.Fatalf("worker fallback %s != redis package default %s -- keep these in sync",
+			StalePendingReclaimFloorFallback, redisclient.StalePendingReclaimMinIdle)
+	}
 }
