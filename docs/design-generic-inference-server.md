@@ -267,6 +267,10 @@ Three real options, given §1.4 #2:
 | B. `citadel-services/services/<name>/build/` (the kokoro precedent) | publish workflow already exists there; catalog entry and build sit together | citadel-services is a *catalog of per-service compose files*; a shared runtime used by N catalog entries doesn't belong under one entry's `build/`, and the per-entry copy pattern (gliner2 already exists as both a private repo and a `build/` copy) is exactly the drift `kokoro.yml`'s own comment warns about ("the two copies can drift") |
 | C. In-repo generic build context in citadel-cli (`services/compose/generic/`), reused via `ServiceAuxFiles` | no new repo | re-introduces Python into citadel-cli (the thing Jason ruled out), makes every consumer a *build-on-node* service like bonsai (first-start builds of minutes, Ampere-only kernels, `WriteAuxFiles` in both materialization sites), and grows the repo's `//go:embed` surface with model code. Rejected. |
 
+**DECIDED (Jason, 2026-09-08): Option A.** The repo
+[`aceteam-ai/citadel-inference-server`](https://github.com/aceteam-ai/citadel-inference-server)
+is created (public), seeded with a README pointing back at this design.
+
 Recommend **A**. Consequence to be explicit about: the six existing in-repo
 `services/*-service/` sources should eventually move OUT (into this new repo
 as adapters where they are inference — diffusers, whisper — or stay put where
@@ -649,9 +653,14 @@ New tests P1 must add: `TestOmniVoiceComposeRegistered`/`Contract` (no
 
 ## 10. Open questions for Jason
 
-1. **Repo**: confirm `aceteam-ai/citadel-inference-server` (public) over
-   `citadel-services/<x>/build/` (§3.2). Public matters: nodes pull GHCR
-   images without credentials today.
+1. **Repo**: ~~confirm `aceteam-ai/citadel-inference-server` (public) over
+   `citadel-services/<x>/build/` (§3.2)~~ → **RESOLVED 2026-09-08 (Jason):
+   Option A confirmed; the public repo is created.** Public matters: nodes
+   pull GHCR images without credentials today.
+   - **Scope also resolved (Jason, 2026-09-08): node-side first.** Build the
+     generic server + citadel-cli registration + OmniVoice (provable via a
+     direct `SYNTHESIZE_SPEECH{backend:"omnivoice"}`), then the two aceteam
+     dependencies (§5.3) as fast-follow so the UI path lights up after.
 2. **`voice` semantics for OmniVoice**: closed preset vocabulary + separate
    `instructions` (recommended, keeps the UI's picker a list), or let `voice`
    carry free-text instruct directly (fewer fields, but `voice` stops being
