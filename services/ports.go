@@ -345,6 +345,15 @@ const (
 	LiveKitWSPort     = 7880
 	LiveKitICETCPPort = 7881
 	LiveKitUDPMuxPort = 7882
+	// EgressRelayPort is the on-node SOCKS5 egress relay listener (citadel
+	// #787): a mesh-only TCP port another citadel node dials to tunnel
+	// outbound traffic through THIS node's own network egress. Reachable
+	// only via network.ListenVPN -- mesh identity (same-org verified peer)
+	// is the relay's authorization boundary, so it is never bound to
+	// localhost/LAN like citadel socks (#786) is. Adjacent to
+	// TerminalPort/CobrowseStreamPort, the other mesh-only TCP listeners in
+	// this block.
+	EgressRelayPort = 7861
 )
 
 // ReservedCitadelPorts is the set of host ports owned by citadel's own
@@ -369,6 +378,7 @@ var ReservedCitadelPorts = map[int]string{
 	LiveKitICETCPPort:  "livekit-ice-tcp",
 	LiveKitUDPMuxPort:  "livekit-udp-mux",
 	WyzeBridgeRTSPPort: "wyze-bridge-rtsp",
+	EgressRelayPort:    "egress-relay",
 }
 
 // AppsPortRange is the inclusive range apps auto-allocate host ports from

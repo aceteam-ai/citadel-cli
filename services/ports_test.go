@@ -201,6 +201,7 @@ func TestReservedCitadelPortsPairwiseDistinct(t *testing.T) {
 		LiveKitICETCPPort:  "livekit-ice-tcp",
 		LiveKitUDPMuxPort:  "livekit-udp-mux",
 		WyzeBridgeRTSPPort: "wyze-bridge-rtsp",
+		EgressRelayPort:    "egress-relay",
 	}
 	if len(ReservedCitadelPorts) != len(wantEntries) {
 		t.Errorf("ReservedCitadelPorts has %d entries, want %d — a port constant collision collapses two listeners onto one port (see #504)",
