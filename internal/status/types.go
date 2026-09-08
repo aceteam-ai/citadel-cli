@@ -544,6 +544,17 @@ type ServiceInfo struct {
 	Health string   `json:"health,omitempty"` // "healthy", "unhealthy", "unknown"
 	Models []string `json:"models,omitempty"` // For LLM services
 
+	// ModelLicense is the license the serving engine's own /info endpoint
+	// reported for the model it is currently serving (citadel-cli#1007 --
+	// OmniVoice's checkpoint is CC-BY-NC, unlike kokoro's Apache-2.0
+	// Kokoro-82M, so this is worth surfacing rather than assuming every TTS
+	// backend is uniformly safe to use commercially). Additive and omitempty:
+	// absent when no engine has reported one this process, which is the
+	// pre-#1007 heartbeat shape byte-for-byte. Populated via
+	// RecordModelLicense/ModelLicenseFor (model_license.go), a process-local,
+	// unpersisted log mirroring request_recorder.go's requestLog.
+	ModelLicense string `json:"model_license,omitempty"`
+
 	// Idle usage signal for running LLM services. Populated only when the
 	// service is a running inference engine whose metrics endpoint could be
 	// scraped; omitted otherwise. Promotes idle/idle_seconds/last_request_at

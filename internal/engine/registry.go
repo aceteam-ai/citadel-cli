@@ -87,6 +87,7 @@ var loadEstimateByEngine = map[string]time.Duration{
 	"kokoro":     60 * time.Second,
 	"tei":        60 * time.Second,
 	"lmstudio":   60 * time.Second,
+	"omnivoice":  60 * time.Second,
 }
 
 // selfProvisioningEngines is a literal copy of internal/jobs's
@@ -102,6 +103,7 @@ var selfProvisioningEngines = map[string]bool{
 	"transcribe":    true,
 	"unlimited-ocr": true,
 	"extraction":    true,
+	"omnivoice":     true,
 }
 
 // composeKindEngines lists the services.ServiceMap engines that are

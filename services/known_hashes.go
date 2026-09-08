@@ -81,4 +81,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 	"unlimited-ocr": {
 		"2f1e1f1ffae72db007b65d1b8d275f69c33c0c7e3207f8139ee8c2c1c8d2c9c0": true,
 	},
+	"omnivoice": {
+		"5a58ceded5200f2dd1d67a199b407edddd3bfe1bd91dd2700cbbed55ee2abe39": true,
+	},
 }

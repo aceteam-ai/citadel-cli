@@ -358,3 +358,47 @@ func TestTTSHostPortRegistered(t *testing.T) {
 		t.Errorf("HostPortEnv() did not emit %q", want)
 	}
 }
+
+// TestOmniVoiceHostPortRegistered pins the omnivoice TTS service's host port
+// (k2-fsa/OmniVoice, served by the citadel inference server -- citadel-cli#1007).
+// Like bonsai/kokoro/unlimited-ocr it is an embedded ServiceMap compose, so its
+// .yml defers the host publish to CITADEL_OMNIVOICE_HOST_PORT and this registry
+// must resolve it. The registry KEY is "omnivoice" (the implementation name /
+// ServiceMap key), the same key/env split kokoro uses for the generic `tts`
+// engine name.
+func TestOmniVoiceHostPortRegistered(t *testing.T) {
+	got, ok := ServiceHostPorts["omnivoice"]
+	if !ok || got != OmniVoiceHostPort {
+		t.Errorf("ServiceHostPorts[%q] = %d (present=%v), want %d", "omnivoice", got, ok, OmniVoiceHostPort)
+	}
+	if _, ok := serviceHostPortEnv["omnivoice"]; !ok {
+		t.Errorf("serviceHostPortEnv is missing %q; HostPortEnv() will not inject its host port", "omnivoice")
+	}
+	// 8213 is unlimited-ocr's; omnivoice must be the distinct next slot, not a
+	// re-use.
+	if OmniVoiceHostPort == UnlimitedOCRHostPort {
+		t.Errorf("OmniVoiceHostPort %d collides with UnlimitedOCRHostPort; 8213 is taken, omnivoice must be the next free slot", OmniVoiceHostPort)
+	}
+	if OmniVoiceHostPort >= AppsPortRangeStart && OmniVoiceHostPort <= AppsPortRangeEnd {
+		t.Errorf("omnivoice host port %d sits inside the apps auto-allocation range %d-%d", OmniVoiceHostPort, AppsPortRangeStart, AppsPortRangeEnd)
+	}
+	if name, taken := ReservedCitadelPorts[OmniVoiceHostPort]; taken {
+		t.Errorf("omnivoice host port %d collides with reserved citadel port %q", OmniVoiceHostPort, name)
+	}
+	for svc, port := range ServiceHostPorts {
+		if svc != "omnivoice" && port == OmniVoiceHostPort {
+			t.Errorf("omnivoice host port %d collides with managed service %q", OmniVoiceHostPort, svc)
+		}
+	}
+	// HostPortEnv must emit the omnivoice var so its compose resolves.
+	want := EnvOmniVoiceHostPort + "=8214"
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}
