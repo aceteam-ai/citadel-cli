@@ -234,14 +234,16 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// it would leave the backend's node-resource pull timing out on nodes
 		// without a configured workspace.
 		NewLegacyHandlerAdapter(JobTypeResourceSnapshot, &jobs.ResourceSnapshotHandler{}),
-		// Node-local speech synthesis (kokoro TTS sidecar, aceteam#6104). The
-		// synthesis counterpart to TRANSCRIBE_AUDIO, but registered
-		// UNCONDITIONALLY like the other inference handlers: it takes text inline
-		// and returns audio inline (base64), touching no workspace file, so
-		// gating it behind WorkspaceDir would needlessly bar workspace-less nodes
-		// from TTS. Nodes that don't run the kokoro sidecar simply never receive
-		// SYNTHESIZE_SPEECH jobs (they only land on nodes carrying the engine:tts
-		// tag).
+		// Node-local speech synthesis (kokoro TTS sidecar, aceteam#6104; the
+		// omnivoice backend, citadel-cli#1007). The synthesis counterpart to
+		// TRANSCRIBE_AUDIO, but registered UNCONDITIONALLY like the other
+		// inference handlers: it takes text inline and returns audio inline
+		// (base64), touching no workspace file, so gating it behind WorkspaceDir
+		// would needlessly bar workspace-less nodes from TTS. SYNTHESIZE_SPEECH
+		// is routed by target_node, NOT by an engine:tts capability tag (stale
+		// claim corrected by citadel-cli#1007's design doc §1.4 #4) -- so a node
+		// that never started the relevant sidecar simply fails the job's
+		// waitForReady/resolveServiceURL step rather than never receiving it.
 		NewLegacyHandlerAdapter(JobTypeSynthesizeSpeech, jobs.NewSynthesizeSpeechHandler()),
 		// Node-local image/video generation (diffusers sidecar, issue #968/#970).
 		// The image/video counterpart to SYNTHESIZE_SPEECH, registered

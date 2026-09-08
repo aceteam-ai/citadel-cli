@@ -93,6 +93,7 @@ var selfProvisioningEngines = map[string]string{
 	"transcribe":    "the transcribe compose pins WHISPER_MODEL and faster-whisper downloads it into the shared HuggingFace cache",
 	"unlimited-ocr": "the unlimited-ocr compose pins --model and vLLM resolves it from the mounted HuggingFace cache on first start",
 	"extraction":    "the extraction compose pins MODEL_NAME and downloads into the shared HuggingFace cache",
+	"omnivoice":     "the omnivoice compose pins CIS_MODEL and the generic inference server downloads it into the shared HuggingFace cache",
 }
 
 // IsSelfProvisioningEngine reports whether engine is in selfProvisioningEngines

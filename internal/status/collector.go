@@ -187,6 +187,27 @@ func (c *Collector) applyNodeRoutedRequestSignal(status *NodeStatus) {
 	}
 }
 
+// applyModelLicenseSignal additively attaches a recorded model_license
+// (ModelLicenseFor, model_license.go) to any running service that has one.
+// Never overwrites an already-set value (defensive; nothing sets one before
+// this runs today) and never touches Status/Health/anything else -- a plain
+// fill-if-empty over the fully-assembled status.Services, run in the same
+// central-pass style as applyNodeRoutedRequestSignal so it covers every
+// producer (the managed-engine probe, the embedding probe, and the
+// collectRunningEmbeddedServices backstop kokoro/omnivoice ride) without a
+// per-producer wiring checklist.
+func (c *Collector) applyModelLicenseSignal(status *NodeStatus) {
+	for i := range status.Services {
+		svc := &status.Services[i]
+		if svc.ModelLicense != "" {
+			continue
+		}
+		if license, ok := ModelLicenseFor(svc.Name); ok && license != "" {
+			svc.ModelLicense = license
+		}
+	}
+}
+
 // mergeNodeRoutedSignal folds the node-routed request log into an
 // already-derived IdleState, following one rule: it may only ADD information
 // (a last_request_at where none existed) or REDUCE apparent idleness, never
@@ -368,6 +389,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// cascade already decided, never the reverse. See
 	// applyNodeRoutedRequestSignal for why that direction is load-bearing.
 	c.applyNodeRoutedRequestSignal(status)
+
+	// Model license signal (citadel-cli#1007): additively attach a recorded
+	// model_license (from a backend's own /info, see model_license.go) to any
+	// running service that has one. Order relative to the request signal above
+	// does not matter -- unlike mergeNodeRoutedSignal there is exactly one
+	// producer here, so this is a plain fill-if-empty, never a "more precise
+	// signal already ruled this out" decision.
+	c.applyModelLicenseSignal(status)
 
 	// Model hotswap (#632, default OFF): mark running engines resident and
 	// additively advertise installed-but-stopped engines as swap-in candidates.

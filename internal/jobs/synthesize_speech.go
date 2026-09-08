@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -27,7 +30,21 @@ func synthesizeServiceURL() string {
 	return fmt.Sprintf("http://localhost:%d", embeddedservices.TTSHostPort)
 }
 
+// omnivoiceServiceURL is the local omnivoice TTS sidecar base URL (citadel-cli
+// #1007, the first citadel-inference-server-backed TTS engine). Same loopback
+// reasoning as synthesizeServiceURL: no auth of its own, sole consumer is this
+// co-located worker.
+func omnivoiceServiceURL() string {
+	return fmt.Sprintf("http://localhost:%d", embeddedservices.OmniVoiceHostPort)
+}
+
 const (
+	// defaultSynthesizeBackend is the TTS backend used when a job payload omits
+	// `backend`. Kept as kokoro so every existing dispatch (which has never sent
+	// this field) is unaffected (citadel-cli#1007 §3.4 — zero change for every
+	// existing dispatch).
+	defaultSynthesizeBackend = "kokoro"
+
 	// defaultSynthesizeVoice is the Kokoro voice used when a job omits `voice`.
 	// Matches the service's own KOKORO_DEFAULT_VOICE default (am_michael, the
 	// book-narration voice).
@@ -38,11 +55,13 @@ const (
 	// KOKORO_DEFAULT_FORMAT default.
 	defaultSynthesizeFormat = "opus"
 
-	// synthesizeReadyTimeout bounds how long we wait for the kokoro sidecar to
-	// load its model (Kokoro-82M, ~350 MB) and report healthy. Model load is a
-	// one-time cost on first job; subsequent jobs hit a warm service. This budget
-	// only applies once the sidecar is actually answering connections; see
-	// synthesizeUnreachableTimeout for the case where nothing is listening.
+	// synthesizeReadyTimeout bounds how long we wait for the TTS sidecar to load
+	// its model and report healthy. Model load is a one-time cost on first job;
+	// subsequent jobs hit a warm service. This budget only applies once the
+	// sidecar is actually answering connections; see synthesizeUnreachableTimeout
+	// for the case where nothing is listening. OmniVoice's checkpoint (~1.2GB
+	// fp16, 0.6B params) is the same order as kokoro's warm-up budget assumes
+	// (citadel-cli#1007 §3.4), so one shared budget covers both backends for v1.
 	synthesizeReadyTimeout = 120 * time.Second
 
 	// synthesizeUnreachableTimeout bounds how long waitForReady tolerates a
@@ -58,39 +77,78 @@ const (
 
 	// synthesizeRequestTimeout bounds a single synthesis POST. Unlike transcribe
 	// (whose budget scales with a potentially multi-hour audio file), TTS input
-	// is bounded text (KOKORO_MAX_INPUT_CHARS, default 5000) and Kokoro-82M runs
-	// near real time even on CPU, so one generous fixed cap is enough.
+	// is bounded text (KOKORO_MAX_INPUT_CHARS / CIS_MAX_INPUT_CHARS, default
+	// 5000) and both backends run near real time even on CPU/GPU, so one
+	// generous fixed cap is enough.
 	synthesizeRequestTimeout = 5 * time.Minute
+
+	// synthesizeInfoTimeout bounds the best-effort GET /info probe used to learn
+	// an engine's model_license (citadel-cli#1007). Short and non-fatal: the
+	// audio artifact is the primary result, this is advisory heartbeat metadata.
+	synthesizeInfoTimeout = 3 * time.Second
 )
 
 // SynthesizeSpeechHandler handles SYNTHESIZE_SPEECH jobs node-locally.
 //
 // It is the synthesis counterpart to TranscribeAudioHandler: the heavy ML
-// dependency (Kokoro-82M) lives in a Docker sidecar (services/compose/kokoro.yml)
-// reachable over loopback, and this Go handler proxies an OpenAI-compatible
-// speech request to it. The text and the resulting audio never leave the node.
+// dependency lives in a Docker sidecar reachable over loopback (kokoro,
+// services/compose/kokoro.yml, or the citadel-inference-server-backed
+// omnivoice, services/compose/omnivoice.yml — citadel-cli#1007), and this Go
+// handler proxies an OpenAI-compatible speech request to it. The text and the
+// resulting audio never leave the node.
 //
 // Unlike transcribe, it needs no workspace: the text arrives inline in the
 // payload and the audio is returned inline (base64), so the handler is
 // registered unconditionally alongside the other sandbox-less inference handlers.
 type SynthesizeSpeechHandler struct {
-	// ServiceURL is the kokoro sidecar base URL; defaults to the registry port.
+	// BaseURLs maps a TTS backend name to its loopback base URL. Built from the
+	// services registry so a per-node CITADEL_*_HOST_PORT override is honored
+	// (mirrors internal/worker.LLMInferenceHandler's baseURLs).
+	BaseURLs map[string]string
+	// ServiceURL, when non-empty, overrides the resolved backend URL
+	// UNCONDITIONALLY, regardless of which backend a job requests. This is a
+	// test-only escape hatch retained for pre-#1007 tests that point a single
+	// stub server at the handler without touching BaseURLs (citadel-cli#1007
+	// §3.4). Production code should leave this unset and let BaseURLs resolve
+	// the backend.
 	ServiceURL string
 	// HTTPClient lets tests inject a stub; nil uses a default client.
 	HTTPClient *http.Client
 }
 
-// NewSynthesizeSpeechHandler creates a handler pointed at the local kokoro
-// sidecar.
+// NewSynthesizeSpeechHandler creates a handler pointed at the local TTS
+// sidecars, keyed by backend name (citadel-cli#1007).
 func NewSynthesizeSpeechHandler() *SynthesizeSpeechHandler {
-	return &SynthesizeSpeechHandler{ServiceURL: synthesizeServiceURL()}
+	return &SynthesizeSpeechHandler{BaseURLs: map[string]string{
+		"kokoro":    synthesizeServiceURL(),
+		"omnivoice": omnivoiceServiceURL(),
+	}}
 }
 
-func (h *SynthesizeSpeechHandler) serviceURL() string {
+// resolveServiceURL returns the base URL to dial for the given backend, and
+// whether one is known. h.ServiceURL, when set, wins unconditionally (see its
+// doc comment); otherwise backend must be a key in h.BaseURLs. An unknown
+// backend (a typo, or a payload naming a backend this handler was never
+// configured for) resolves to ok=false so the caller can fail WITHOUT making
+// an HTTP call — the same "an explicit allowlist, a typo must still fail
+// loudly" posture as selfProvisioningEngines (model_cache_pull.go).
+func (h *SynthesizeSpeechHandler) resolveServiceURL(backend string) (string, bool) {
 	if h.ServiceURL != "" {
-		return h.ServiceURL
+		return h.ServiceURL, true
 	}
-	return synthesizeServiceURL()
+	url, ok := h.BaseURLs[backend]
+	return url, ok
+}
+
+// sortedBackends returns the configured backend names in a stable order, so
+// an "unsupported backend" error message reads the same on every node.
+func sortedBackends(baseURLs map[string]string) []string {
+	names := make([]string, 0, len(baseURLs))
+	for name := range baseURLs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // client returns the HTTP client used for both the health poll and the
@@ -103,14 +161,24 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 	return &http.Client{}
 }
 
-// Execute synthesizes speech from text via the kokoro sidecar.
+// Execute synthesizes speech from text via the resolved TTS sidecar.
 //
 // Payload fields (all strings via nexus.Job):
 //   - text / input:       the text to synthesize (required; `text` preferred,
 //     `input` accepted as an alias for the OpenAI request-body spelling).
-//   - voice:              optional Kokoro voice; empty defaults to am_michael.
-//   - response_format:    optional output container (opus/mp3); empty defaults
-//     to opus (`format` accepted as an alias).
+//   - backend:            optional TTS backend selector ("kokoro" | "omnivoice");
+//     empty defaults to kokoro, so every pre-#1007 dispatch is unaffected
+//     (citadel-cli#1007). An unrecognized value fails the job without
+//     attempting any HTTP call.
+//   - voice:              optional voice; empty defaults to am_michael
+//     (kokoro's default; omnivoice interprets voice as a preset name or "auto").
+//   - response_format:    optional output container (opus/mp3/wav); empty
+//     defaults to opus (`format` accepted as an alias).
+//   - speed:              optional playback speed (0.5-2.0); omitted from the
+//     forwarded request entirely when absent, so a server relying on its own
+//     default sees no change (citadel-cli#603's omit-if-empty rule).
+//   - instructions:       optional free-text voice design, forwarded verbatim;
+//     omitted entirely when absent. kokoro ignores it; omnivoice honors it.
 //
 // Response JSON (this handler DEFINES the envelope; nothing on the aceteam side
 // parses it yet; the fabric may also call the endpoint directly):
@@ -120,6 +188,9 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //	  "content":  "<base64 audio>",  // the synthesized audio bytes
 //	  "format":   "opus",
 //	  "voice":    "am_michael",
+//	  "backend":  "kokoro",           // additive (citadel-cli#1007); existing
+//	                                  // consumers read only encoding/content/
+//	                                  // format/receipt and are unaffected
 //	  "receipt": {                   // metering receipt, from the X-TTS-* headers
 //	    "chars":            24,
 //	    "duration_seconds": 3.575,
@@ -137,6 +208,15 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		return nil, fmt.Errorf("job payload missing 'text' field")
 	}
 
+	backend := job.Payload["backend"]
+	if backend == "" {
+		backend = defaultSynthesizeBackend
+	}
+	serviceURL, ok := h.resolveServiceURL(backend)
+	if !ok {
+		return nil, fmt.Errorf("unsupported TTS backend %q (allowed: %s)", backend, strings.Join(sortedBackends(h.BaseURLs), ", "))
+	}
+
 	voice := job.Payload["voice"]
 	if voice == "" {
 		voice = defaultSynthesizeVoice
@@ -150,17 +230,30 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		format = defaultSynthesizeFormat
 	}
 
-	ctx.Log("info", "     - [Job %s] Waiting for TTS service to become ready...", job.ID)
-	if err := h.waitForReady(); err != nil {
+	ctx.Log("info", "     - [Job %s] Waiting for TTS service (%s) to become ready...", job.ID, backend)
+	if err := h.waitForReady(serviceURL); err != nil {
 		return nil, err
 	}
-	ctx.Log("info", "     - [Job %s] SYNTHESIZE_SPEECH voice=%s format=%s chars=%d", job.ID, voice, format, len(text))
+	ctx.Log("info", "     - [Job %s] SYNTHESIZE_SPEECH backend=%s voice=%s format=%s chars=%d", job.ID, backend, voice, format, len(text))
 
 	requestPayload := map[string]any{
 		"input":           text,
 		"voice":           voice,
 		"response_format": format,
 	}
+	// speed/instructions are omitted entirely when absent (not even an empty
+	// string), so a server relying on its own pydantic/adapter default sees no
+	// change from before this field existed (citadel-cli#603's omit-if-empty
+	// rule, mirrored from buildMediaGenerateRequest).
+	if speedStr := job.Payload["speed"]; speedStr != "" {
+		if speed, err := strconv.ParseFloat(speedStr, 64); err == nil {
+			requestPayload["speed"] = speed
+		}
+	}
+	if instructions := job.Payload["instructions"]; instructions != "" {
+		requestPayload["instructions"] = instructions
+	}
+
 	reqBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -169,7 +262,7 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 	reqCtx, cancel := context.WithTimeout(context.Background(), synthesizeRequestTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.serviceURL()+"/v1/audio/speech", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, serviceURL+"/v1/audio/speech", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build synthesis request: %w", err)
 	}
@@ -187,17 +280,63 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		return audio, fmt.Errorf("TTS API returned non-200 status: %s", resp.Status)
 	}
 
+	// Best-effort: learn this backend's model_license from its own /info so the
+	// heartbeat can surface it (citadel-cli#1007 — OmniVoice's checkpoint is
+	// CC-BY-NC, unlike kokoro's Apache-2.0 Kokoro-82M). Never fails the job;
+	// skipped once already recorded so a warm engine costs no extra round trip.
+	h.recordModelLicense(serviceURL, backend)
+
 	result := map[string]any{
 		"encoding": "base64",
 		"content":  base64.StdEncoding.EncodeToString(audio),
 		"format":   format,
 		"voice":    voice,
+		"backend":  backend,
 		"receipt":  synthesizeReceiptFromHeaders(resp.Header),
 	}
 	return json.Marshal(result)
 }
 
-// synthesizeReceiptFromHeaders extracts the per-item metering receipt the kokoro
+// recordModelLicense performs a best-effort GET <serviceURL>/info and, if it
+// names a model_license, records it against backend via
+// status.RecordModelLicense so the heartbeat can surface it additively on
+// ServiceInfo. Any failure (unreachable, non-200, unparsable body, missing
+// field) is silently ignored — this is advisory metadata, never allowed to
+// fail or delay the job whose audio artifact already succeeded.
+func (h *SynthesizeSpeechHandler) recordModelLicense(serviceURL, backend string) {
+	if _, known := status.ModelLicenseFor(backend); known {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), synthesizeInfoTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL+"/info", nil)
+	if err != nil {
+		return
+	}
+	resp, err := h.client().Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return
+	}
+	var info struct {
+		ModelLicense string `json:"model_license"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return
+	}
+	if info.ModelLicense != "" {
+		status.RecordModelLicense(backend, info.ModelLicense)
+	}
+}
+
+// synthesizeReceiptFromHeaders extracts the per-item metering receipt the TTS
 // service returns in its X-TTS-* response headers. Parsing is best-effort: a
 // missing or malformed header yields the field's zero value rather than failing
 // the job, since the audio artifact is the primary result and the receipt is
@@ -218,13 +357,13 @@ func synthesizeReceiptFromHeaders(headers http.Header) map[string]any {
 	return receipt
 }
 
-// waitForReady polls the kokoro sidecar's /health until it reports ready, with
-// the same fast-fail-if-absent / patient-if-loading policy as the transcribe
+// waitForReady polls the TTS sidecar's /health until it reports ready, with the
+// same fast-fail-if-absent / patient-if-loading policy as the transcribe
 // handler: an unreachable port (nothing listening) gives up within
 // synthesizeUnreachableTimeout, while a reachable-but-loading sidecar gets the
 // full synthesizeReadyTimeout budget.
-func (h *SynthesizeSpeechHandler) waitForReady() error {
-	healthURL := h.serviceURL() + "/health"
+func (h *SynthesizeSpeechHandler) waitForReady(serviceURL string) error {
+	healthURL := serviceURL + "/health"
 	pollInterval := 1 * time.Second
 	startTime := time.Now()
 
@@ -239,7 +378,7 @@ func (h *SynthesizeSpeechHandler) waitForReady() error {
 			// Reachable, just not ready yet (model still loading): fall through
 			// to the patient synthesizeReadyTimeout budget below.
 		} else if isConnectionRefused(err) && time.Since(startTime) >= synthesizeUnreachableTimeout {
-			return fmt.Errorf("TTS service unreachable at %s: %w", h.serviceURL(), err)
+			return fmt.Errorf("TTS service unreachable at %s: %w", serviceURL, err)
 		}
 
 		if time.Since(startTime) >= synthesizeReadyTimeout {
@@ -250,13 +389,14 @@ func (h *SynthesizeSpeechHandler) waitForReady() error {
 	return fmt.Errorf("TTS service did not become ready within %v", synthesizeReadyTimeout)
 }
 
-// synthesizeHealthReady reports whether a /health response means the kokoro
+// synthesizeHealthReady reports whether a /health response means the TTS
 // sidecar is actually ready to synthesize. Unlike the whisper sidecar (which
-// returns non-200 until its model loads), kokoro's /health ALWAYS returns 200
-// and carries readiness in the body: {"status":"up"|"loading","model_loaded":
-// true|false}. Gating on the status code alone would let a cold node POST before
-// Kokoro-82M has loaded, so parse model_loaded. A 200 whose body cannot be
-// parsed is treated as not-ready (fail closed) rather than assuming readiness.
+// returns non-200 until its model loads), kokoro's (and, by contract,
+// omnivoice's — citadel-cli#1007 §4) /health ALWAYS returns 200 and carries
+// readiness in the body: {"status":"up"|"loading","model_loaded":true|false}.
+// Gating on the status code alone would let a cold node POST before the model
+// has loaded, so parse model_loaded. A 200 whose body cannot be parsed is
+// treated as not-ready (fail closed) rather than assuming readiness.
 func synthesizeHealthReady(resp *http.Response) bool {
 	if resp.StatusCode != http.StatusOK {
 		return false
