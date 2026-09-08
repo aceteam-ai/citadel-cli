@@ -55,8 +55,8 @@ Plus four non-inference service sources also in-repo with their own
 `meeting-service`, `nvr-service`.
 
 **So citadel-cli is not pure today.** Bonsai's Dockerfile is not the first
-wrapper the repo carries; it is the seventh, and only the only one that builds
-on the node instead of in CI. The honest framing of the goal is therefore
+wrapper the repo carries; it is the seventh, and the only one that builds on
+the node instead of in CI. The honest framing of the goal is therefore
 **"stop adding in-repo wrappers now; migrate the existing ones out later"**
 (§8), not "keep the repo clean." The v1 rule this doc proposes is: **no new
 `services/<x>-service/` directory and no new `ServiceAuxFiles` entry in
@@ -645,6 +645,7 @@ New tests P1 must add: `TestOmniVoiceComposeRegistered`/`Contract` (no
 | **Metering.** `X-TTS-*` receipts remain advisory and unsigned. | Unchanged from kokoro; the AEP receipt signing path (`internal/aep`) is chat-only today. Out of scope. |
 | **The aceteam routing dependency (§3.4) does not land** and P1 ships inert. | Acceptable and precedented (`vram_mb`, `FabricNodeID`); §6.4's `target_node` path keeps it testable. Named as a hard dependency in the P1 PR body. |
 | **Non-determinism** makes cache hits rare unless keyed on the full request. | Cache key includes every generation input (§6.3). |
+| **Floating image tags never upgrade in place.** `:tts-omnivoice` / `:base` (§3.1) are floating family tags, and `docker compose up -d` does nothing when the tag is already present locally with an unchanged config — the exact #718 lesson (`startBridgeStack`'s pull-before-up in `cmd/whatsapp.go`). Every existing sidecar (`:latest`) inherits this today; the generic server does not make it worse, but a design that owns versioning must not pretend it away. | Publish BOTH a floating family tag and immutable `:tts-omnivoice-<semver>` tags from the matrix workflow; citadel composes pin the floating tag for v1 (parity with kokoro/diffusers), and the `SERVICE_START` path gains a best-effort `pull` before `up` (the `startBridgeStack` pattern, generalized) as its own follow-up — tracked, not built here. Until then an upgrade is `docker compose pull` + restart, same as every sidecar today. |
 
 ## 10. Open questions for Jason
 
