@@ -2330,3 +2330,19 @@ Auto-generated log of every release.
   - feat: report whether a model-hotswap swap required a weights pull (#835) (#997)
 
 
+---
+
+## v2.149.0 — 2026-09-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 19 |
+| Lines added | +1307 |
+
+**Changes:**
+
+  - feat: register omnivoice as a citadel-inference-server-backed TTS engine (P1) (#1008)
+  - feat: citadel agents probe - discovery of installed vendor coding agents (#995)
+
+
