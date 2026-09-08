@@ -6,27 +6,33 @@
 # Usage:
 #   ./build.sh          # Build for current platform only
 #   ./build.sh --all    # Build for all platforms (linux/darwin/windows, amd64/arm64)
+#   ./build.sh --dmg    # Also build the signed macOS .app + DMG (darwin only;
+#                       # see scripts/macos-sign.sh for signing/notarization env)
 
 set -e
 
 # --- Parse Arguments ---
 BUILD_ALL=false
-if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Build the Citadel CLI binary."
-    echo ""
-    echo "Options:"
-    echo "  --all       Build for all platforms (linux/darwin/windows, amd64/arm64)"
-    echo "  --help, -h  Show this help message"
-    echo ""
-    echo "By default, builds only for the current platform."
-    exit 0
-fi
-
-if [[ "$1" == "--all" ]]; then
-    BUILD_ALL=true
-fi
+BUILD_DMG=false
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Build the Citadel CLI binary."
+            echo ""
+            echo "Options:"
+            echo "  --all       Build for all platforms (linux/darwin/windows, amd64/arm64)"
+            echo "  --dmg       Also build the signed macOS .app + DMG bundle (darwin only)"
+            echo "  --help, -h  Show this help message"
+            echo ""
+            echo "By default, builds only for the current platform."
+            exit 0
+            ;;
+        --all) BUILD_ALL=true ;;
+        --dmg) BUILD_DMG=true ;;
+    esac
+done
 
 echo "--- Building and Packaging Citadel CLI..."
 
@@ -141,14 +147,50 @@ if [[ -f "$CURRENT_BINARY" ]]; then
     echo "--- Created symlink: citadel -> $CURRENT_BINARY ---"
 fi
 
+# --- Build signed macOS .app + DMG (--dmg only) ---
+# Reuses build-dmg.sh (which owns .app assembly + scripts/macos-sign.sh) for
+# every darwin/ARCH binary this run actually produced, rather than
+# duplicating bundle assembly here. No-ops with a warning off Darwin (hdiutil
+# and codesign don't exist elsewhere) and skip-with-warning without signing
+# credentials — see scripts/macos-sign.sh; this is a local/dev entry point,
+# not the release path (that's scripts/release.sh, which sets
+# CITADEL_REQUIRE_SIGNING=1).
+if [[ "$BUILD_DMG" == true ]]; then
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo ""
+        echo "⚠️  --dmg requested but not running on macOS; skipping .app/DMG build (hdiutil/codesign are macOS-only)."
+    else
+        for ARCH in "${ARCHS[@]}"; do
+            DARWIN_BIN="$BUILD_DIR/darwin-${ARCH}/citadel"
+            if [[ ! -f "$DARWIN_BIN" ]]; then
+                echo ""
+                echo "⚠️  --dmg: no darwin/${ARCH} binary was built above; skipping."
+                continue
+            fi
+            echo ""
+            echo "--- Building signed macOS .app + DMG for darwin/${ARCH} ---"
+            ./build-dmg.sh --binary "$DARWIN_BIN" --version "$VERSION" --arch "$ARCH"
+            # build-dmg.sh normalizes its DMG name to a leading "v"; VERSION
+            # here (git describe --tags) already carries one, so this matches
+            # directly without re-deriving it.
+            DMG_NAME="citadel_${VERSION}_darwin_${ARCH}.dmg"
+            if [[ -f "$BUILD_DIR/$DMG_NAME" ]]; then
+                cp "$BUILD_DIR/$DMG_NAME" "$RELEASE_DIR/$DMG_NAME"
+            else
+                echo "⚠️  Expected $BUILD_DIR/$DMG_NAME after build-dmg.sh but it's missing."
+            fi
+        done
+    fi
+fi
+
 # --- Generate Checksums ---
 echo ""
 echo "--- Generating Checksums ---"
 # Use shasum on macOS, sha256sum on Linux
 if command -v sha256sum &> /dev/null; then
-    (cd "$RELEASE_DIR" && sha256sum *.tar.gz *.zip 2>/dev/null > checksums.txt || sha256sum *.tar.gz > checksums.txt)
+    (cd "$RELEASE_DIR" && sha256sum *.tar.gz *.zip *.dmg 2>/dev/null > checksums.txt || sha256sum *.tar.gz > checksums.txt)
 else
-    (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz *.zip 2>/dev/null > checksums.txt || shasum -a 256 *.tar.gz > checksums.txt)
+    (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz *.zip *.dmg 2>/dev/null > checksums.txt || shasum -a 256 *.tar.gz > checksums.txt)
 fi
 
 echo "✅ Build and packaging complete."

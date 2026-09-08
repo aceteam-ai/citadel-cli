@@ -18,8 +18,12 @@
     <string>citadel-launcher</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <!-- 13.0, not 10.15: SMAppService (the privileged-helper elevation route
+         citadel#670 uses for machine-wide mode) requires macOS 13. This floor
+         applies to the .app bundle only — the bare CLI binary/tarball has no
+         such dependency and stays on its existing floor. citadel#672. -->
     <key>LSMinimumSystemVersion</key>
-    <string>10.15</string>
+    <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSApplicationCategoryType</key>

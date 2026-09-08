@@ -32,6 +32,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 PACKAGING_DIR="$SCRIPT_DIR/packaging/macos"
 
+# shellcheck source=scripts/macos-sign.sh
+source "$SCRIPT_DIR/scripts/macos-sign.sh"
+
 # Default values
 VERSION=""
 BINARY_PATH=""
@@ -109,10 +112,19 @@ else
     # Get module path for version injection
     MODULE_PATH=$(go list -m 2>/dev/null || echo "citadel-cli")
 
+    # ./cmd/citadel is the actual main package (matches build.sh and
+    # scripts/release.sh); the repo root has no main package, so building
+    # "$SCRIPT_DIR" failed with "build constraints exclude all Go files" —
+    # this script could not produce a binary at all until this fix
+    # (citadel#672). Likewise `cmd.Version` (capital V) is a computed,
+    # non-ldflags-settable var (see cmd/version.go) — the linker's -X only
+    # takes effect on the lowercase `cmd.version` that Version() reads at
+    # init; targeting the wrong symbol silently no-ops and every DMG shipped
+    # a "dev"-or-build-info-stamped binary regardless of VERSION.
     GOOS=darwin GOARCH="$ARCH" go build \
-        -ldflags="-X '${MODULE_PATH}/cmd.Version=${VERSION}'" \
+        -ldflags="-X '${MODULE_PATH}/cmd.version=${VERSION}'" \
         -o "$CITADEL_BIN" \
-        "$SCRIPT_DIR"
+        "$SCRIPT_DIR/cmd/citadel"
 
     echo -e "${GREEN}  Built: $CITADEL_BIN${NC}"
 fi
@@ -159,9 +171,21 @@ fi
 
 echo -e "${GREEN}Created: $APP_DIR${NC}"
 
+# Sign, notarize, and staple the .app before it goes into a DMG (citadel#672).
+# No-ops with a warning when CITADEL_CODESIGN_IDENTITY / ASC_* creds are
+# absent (local dev build) — see scripts/macos-sign.sh for the exact gating,
+# and CITADEL_REQUIRE_SIGNING to make an unsigned bundle a hard failure.
+msign_app_bundle "$APP_DIR" "$PACKAGING_DIR/entitlements.plist"
+
 # Create DMG (macOS only)
 if [ "$CREATE_DMG" = true ]; then
-    DMG_NAME="Citadel-${VERSION}-${ARCH}.dmg"
+    # Normalize to a leading "v" so this matches the citadel_vX.Y.Z_OS_ARCH.*
+    # convention every other release artifact uses (build.sh, scripts/release.sh,
+    # checksums.txt, the Homebrew tap) — VERSION here may or may not already
+    # carry the prefix depending on the caller.
+    DMG_VERSION="$VERSION"
+    [[ "$DMG_VERSION" == v* ]] || DMG_VERSION="v${DMG_VERSION}"
+    DMG_NAME="citadel_${DMG_VERSION}_darwin_${ARCH}.dmg"
     DMG_PATH="$BUILD_DIR/$DMG_NAME"
     DMG_TEMP="$BUILD_DIR/dmg-temp"
 
@@ -215,6 +239,11 @@ EOF
     rm -rf "$DMG_TEMP"
 
     echo -e "${GREEN}Created: $DMG_PATH${NC}"
+
+    # Sign, notarize, and staple the DMG itself (citadel#672). Run AFTER the
+    # .app inside it was stapled above, so both the disk image and the copy a
+    # user drags out of it are independently, offline Gatekeeper-verifiable.
+    msign_dmg "$DMG_PATH"
 
     # Print DMG info
     echo ""

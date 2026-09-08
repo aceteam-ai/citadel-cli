@@ -1,7 +1,9 @@
 #!/bin/bash
 # update-homebrew-tap.sh — Sync the aceteam-ai/homebrew-tap Citadel formula to a
 # published release: rewrites the formula version and the four per-platform
-# SHA256s, then commits and pushes.
+# SHA256s, then commits and pushes. Also syncs the Citadel.app cask
+# (Casks/citadel-app.rb, citadel#672) when the release carries signed DMGs —
+# see the cask section below for exactly what gates that.
 #
 # Invoked automatically by release.sh (hook_post_release). Can also be run
 # standalone to (re)sync the tap to any already-published GitHub release — handy

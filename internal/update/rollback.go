@@ -53,6 +53,23 @@ func ApplyUpdate(newBinaryPath string) error {
 		return fmt.Errorf("failed to get current binary path: %w", err)
 	}
 
+	// A binary running from inside a signed macOS .app bundle (Citadel.app,
+	// citadel#672/#670) cannot be swapped in place: overwriting
+	// Contents/MacOS/citadel invalidates the bundle's code signature (its
+	// CodeResources manifest covers that exact file), which breaks Gatekeeper
+	// on next launch and, for #670's privileged helper, breaks the calling-app
+	// signature check the helper performs before trusting it — the whole
+	// point of signing it in the first place. Refuse and point at the signed
+	// distribution channel (Homebrew cask) that replaces the bundle as a
+	// whole instead. This is the single choke point for both the explicit
+	// `citadel update install` command and the background AutoUpdater, since
+	// both call through ApplyUpdate.
+	if IsInsideAppBundle(currentPath) {
+		return fmt.Errorf("refusing to replace the binary in place: %s is inside a macOS app bundle, "+
+			"which would invalidate its code signature — update the app instead, "+
+			"e.g. `brew upgrade --cask aceteam-ai/tap/citadel-app`", currentPath)
+	}
+
 	// 1. Backup current binary
 	if err := BackupCurrent(); err != nil {
 		return fmt.Errorf("failed to backup current binary: %w", err)
