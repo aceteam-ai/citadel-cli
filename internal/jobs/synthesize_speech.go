@@ -88,6 +88,36 @@ const (
 	synthesizeInfoTimeout = 3 * time.Second
 )
 
+// ttsBackendDefaults holds the voice and response_format a backend falls back
+// to when the job payload omits them.
+type ttsBackendDefaults struct {
+	voice  string
+	format string
+}
+
+// synthesizeBackendDefaults resolves the omitted-field defaults PER BACKEND,
+// not globally — a load-bearing distinction (citadel-cli#1007): the
+// citadel-inference-server OmniVoice adapter is wav-only (an `opus` request
+// 400s) and rejects any `voice` outside its own preset vocabulary (`am_michael`
+// 400s), so kokoro's historical am_michael/opus defaults cannot be applied to
+// it. omnivoice therefore defaults to its own auto-voice + wav. An unmapped
+// backend falls back to kokoro's defaults, preserving pre-#1007 behavior for
+// any caller that predates this map (including the ServiceURL test escape
+// hatch, which resolves an arbitrary backend name).
+var synthesizeBackendDefaults = map[string]ttsBackendDefaults{
+	"kokoro":    {voice: defaultSynthesizeVoice, format: defaultSynthesizeFormat},
+	"omnivoice": {voice: "auto", format: "wav"},
+}
+
+// backendDefaultsFor returns the omitted-field defaults for backend, falling
+// back to kokoro's for any backend not in the map.
+func backendDefaultsFor(backend string) ttsBackendDefaults {
+	if d, ok := synthesizeBackendDefaults[backend]; ok {
+		return d
+	}
+	return synthesizeBackendDefaults[defaultSynthesizeBackend]
+}
+
 // SynthesizeSpeechHandler handles SYNTHESIZE_SPEECH jobs node-locally.
 //
 // It is the synthesis counterpart to TranscribeAudioHandler: the heavy ML
@@ -170,10 +200,12 @@ func (h *SynthesizeSpeechHandler) client() *http.Client {
 //     empty defaults to kokoro, so every pre-#1007 dispatch is unaffected
 //     (citadel-cli#1007). An unrecognized value fails the job without
 //     attempting any HTTP call.
-//   - voice:              optional voice; empty defaults to am_michael
-//     (kokoro's default; omnivoice interprets voice as a preset name or "auto").
-//   - response_format:    optional output container (opus/mp3/wav); empty
-//     defaults to opus (`format` accepted as an alias).
+//   - voice:              optional voice; empty defaults PER BACKEND —
+//     am_michael for kokoro, "auto" for omnivoice (am_michael is not an
+//     omnivoice preset, so it would 400). See synthesizeBackendDefaults.
+//   - response_format:    optional output container; empty defaults PER
+//     BACKEND — opus for kokoro, wav for omnivoice (the OmniVoice adapter is
+//     wav-only, so opus would 400). `format` accepted as an alias.
 //   - speed:              optional playback speed (0.5-2.0); omitted from the
 //     forwarded request entirely when absent, so a server relying on its own
 //     default sees no change (citadel-cli#603's omit-if-empty rule).
@@ -217,9 +249,15 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		return nil, fmt.Errorf("unsupported TTS backend %q (allowed: %s)", backend, strings.Join(sortedBackends(h.BaseURLs), ", "))
 	}
 
+	// Omitted voice/response_format default PER BACKEND (citadel-cli#1007):
+	// kokoro -> am_michael/opus (unchanged); omnivoice -> auto/wav (opus 400s
+	// on the wav-only OmniVoice adapter, and am_michael is not one of its
+	// presets). See synthesizeBackendDefaults.
+	backendDef := backendDefaultsFor(backend)
+
 	voice := job.Payload["voice"]
 	if voice == "" {
-		voice = defaultSynthesizeVoice
+		voice = backendDef.voice
 	}
 
 	format := job.Payload["response_format"]
@@ -227,7 +265,7 @@ func (h *SynthesizeSpeechHandler) Execute(ctx JobContext, job *nexus.Job) ([]byt
 		format = job.Payload["format"]
 	}
 	if format == "" {
-		format = defaultSynthesizeFormat
+		format = backendDef.format
 	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TTS service (%s) to become ready...", job.ID, backend)

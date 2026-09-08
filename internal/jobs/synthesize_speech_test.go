@@ -390,6 +390,59 @@ func TestSynthesizeSpeech_BackendOmniVoiceRoutesToSecondURL(t *testing.T) {
 	}
 }
 
+// TestSynthesizeSpeech_BackendDefaultsArePerBackend pins the citadel-cli#1007
+// reconciliation fix: an omnivoice dispatch that omits voice/response_format
+// must default to the OmniVoice adapter's own auto/wav — the adapter is
+// wav-only (opus 400s) and rejects am_michael (not one of its presets) — while
+// kokoro's omitted-field defaults stay am_michael/opus unchanged. A permissive
+// stub accepts anything, so this asserts the FORWARDED body (and the result
+// envelope), not merely a 200. Without the per-backend defaults, the shared
+// opus/am_michael default would 400 on the first real omnivoice call.
+func TestSynthesizeSpeech_BackendDefaultsArePerBackend(t *testing.T) {
+	cases := []struct {
+		backend    string
+		wantVoice  string
+		wantFormat string
+	}{
+		{"omnivoice", "auto", "wav"},
+		{"kokoro", "am_michael", "opus"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.backend, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := ttsStub(&gotBody)
+			defer srv.Close()
+
+			h := &SynthesizeSpeechHandler{BaseURLs: map[string]string{tc.backend: srv.URL}}
+
+			out, err := h.Execute(JobContext{}, &nexus.Job{
+				ID:      "defaults-" + tc.backend,
+				Type:    "SYNTHESIZE_SPEECH",
+				Payload: map[string]string{"text": "hi", "backend": tc.backend},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotBody["voice"] != tc.wantVoice {
+				t.Errorf("%s forwarded voice = %v, want %q", tc.backend, gotBody["voice"], tc.wantVoice)
+			}
+			if gotBody["response_format"] != tc.wantFormat {
+				t.Errorf("%s forwarded response_format = %v, want %q", tc.backend, gotBody["response_format"], tc.wantFormat)
+			}
+			var res map[string]any
+			if err := json.Unmarshal(out, &res); err != nil {
+				t.Fatalf("result not JSON: %v", err)
+			}
+			if res["format"] != tc.wantFormat {
+				t.Errorf("%s result format = %v, want %q", tc.backend, res["format"], tc.wantFormat)
+			}
+			if res["voice"] != tc.wantVoice {
+				t.Errorf("%s result voice = %v, want %q", tc.backend, res["voice"], tc.wantVoice)
+			}
+		})
+	}
+}
+
 // TestSynthesizeSpeech_UnknownBackendFailsWithoutHTTPCall verifies a typo'd or
 // unrecognized `backend` value fails the job immediately, WITHOUT ever
 // attempting an HTTP call (no health probe, no synthesis POST) -- the same
