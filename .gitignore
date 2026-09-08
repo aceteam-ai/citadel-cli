@@ -19,3 +19,7 @@ docs-site/.docusaurus/
 # git worktrees created for isolated feature work
 .worktrees/
 .wt/
+
+# macos/ (Citadel.app, issue #670) — Swift Package Manager build output
+macos/.build/
+macos/.swiftpm/
