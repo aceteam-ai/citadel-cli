@@ -316,7 +316,6 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// written to network.GetNodeConfigDir() rather than platform.ConfigDir().
 	result += applyEgressRelayConfig(network.GetNodeConfigDir(), &config)
 
-
 	// Apply the sensitive-surface permissions + passcode (aceteam#6524) when the
 	// platform pushed any of them. Load-modify-save the same permissions.yaml the
 	// gateway, terminal/desktop listeners, and Redis handlers read, so the
