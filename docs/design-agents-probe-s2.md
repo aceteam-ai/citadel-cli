@@ -41,7 +41,7 @@ exactly the fields that matter here.
 
 | Unit | Written by | `User=` | `HOME` | How `citadel init` ran |
 |---|---|---|---|---|
-| `citadel-worker.service` (fleet) | `install.sh` (`curl \| sudo -E ... bash`) | none (root) | `/root` | as root, with `SUDO_USER` inherited from `sudo -E` |
+| `citadel-worker.service` (fleet) | `install.sh` (`curl \| sudo -E ... bash`) | none (root) | `/root` | as root, network-only (no `--provision`); `SUDO_USER` set by `sudo` when a human ran it, empty on a true-root install |
 | `citadel-worker.service` (VM image) | `packer/scripts/04-citadel.sh` | `citadel` | `/home/citadel` | `su - citadel -c "citadel init ..."` (`06-firstboot.sh`) |
 | `citadel.service` (`citadel service install`) | `internal/service/systemd.go` `generateSystemUnit` | the `SUDO_USER` who ran install | that user's home | interactively, usually by the same user |
 
@@ -54,25 +54,47 @@ right, and #1012's fallback gives the correct answer with no further signal.
 `internal/network.GetStateDir` (and `GetNodeConfigDir`, its parent) is the
 machine-convergent resolver hardened by #383 for precisely the sudo-vs-service
 divergence this document is about. Its resolution order is documented on the
-function; the two facts S2 depends on are:
+function. Traced through it (from the code, not verified on a live node),
+the install.sh fleet shape has two sub-cases that converge differently:
 
-1. Under `install.sh`, `citadel init` runs as root but with `SUDO_USER` set
-   (`sudo -E` preserves it). `getOwnerHomeDir` resolves the owner home via
-   `platform.GetSudoUser`, so the node directory is created under the HUMAN's
-   home (`~<human>/citadel-node`), not `/root`. `EnsureStateDir` then calls
-   `fixStateDirOwnership`, whose `resolveChownTargetWith` chowns the node
-   config dir and the `network/` state dir to `SUDO_USER`'s uid/gid. Root
-   `init` also writes the machine-global pointer file under `/etc/citadel`.
-2. The root worker later starts with no `SUDO_USER` and `HOME=/root`, and
-   `resolveStateDir` step (1) reads that pointer file, converging on the same
-   `~<human>/citadel-node`. That is how the fleet avoids the duplicate-node
-   failure today.
+**True-root install** (`ssh root@`, or `sudo` from root: `SUDO_USER` empty or
+`root`, which `resolveTargetUser` and `getOwnerHomeDir` both treat as unset).
+`init` resolves the owner home as `/root`, creates `/root/citadel-node`, and
+`saveDeviceConfigToFile` writes the device token there. `fixStateDirOwnership`
+chowns to `resolveChownTargetWith`'s default target, a user named `citadel`,
+only if that account exists; otherwise the dir stays uid 0. The root worker
+(`HOME=/root`, no `SUDO_USER`) resolves the same `/root/citadel-node` by the
+same steps. This is the sub-case `install.sh` itself assumes (its idempotency
+check reads `/root/citadel-node/network`, #1016), and the one that provably
+converges today.
 
-The consequence S2 can lean on: on the fleet's primary unit shape, the node
-config directory is ALREADY owned by the human whose environment the probe
-wants, and the root worker ALREADY resolves that directory on every boot. No
-new persisted state is required to recover the target user; the filesystem
-owner of a directory the worker already resolves carries it.
+**Human-sudo install** (`curl ... | sudo -E ... bash` from an ordinary
+account: `sudo` sets `SUDO_USER` regardless of `-E`). `getOwnerHomeDir`
+resolves the owner home via `platform.GetSudoUser`, so `init` creates
+`~<human>/citadel-node`, chowns it AND `network/` to the human
+(`resolveChownTargetWith`), and writes the device token there. The root worker
+then has no `SUDO_USER`, so by `resolveStateDir`'s order it needs the
+machine-global pointer file or `/etc/citadel/config.yaml` to find that dir.
+Neither exists: the only `WriteMachineStatePointer` call in `cmd/init.go`
+is `createGlobalConfig`, reached only inside the `--provision` branch, and the
+default network-only path (`if !initProvision { ... return }`, which is what
+`install.sh` runs) returns before it; `install.sh` itself only `mkdir -p
+/etc/citadel`. The worker falls through to `/root/citadel-node`, which is
+empty. That is a pre-existing #383-class convergence gap in the network-only
+`init` path, not something S2 introduces, filed as **#1017** with the obvious
+fix (call `EnsureMachineStatePointer` from that path when root, as `citadel
+up` already does in `internal/network/machinewide.go`).
+
+The consequence S2 can lean on, stated at the strength the code supports: the
+`init`-side half of the owner signal already exists on both sub-cases (the
+node dir is owned by the account that ran `init`, human or root), and the
+root worker resolves that same dir wherever it converges at all. On a
+true-root node the owner IS root, and `/root` is where a root-installed CLI
+lives, so probing it is the right answer, not a fallback. On a human-sudo
+node the owner is the human the moment #1017 lets the worker find the dir,
+and no probe-specific state is needed to recover them. What the owner uid
+never does is make a non-converged node converge; it inherits `GetStateDir`'s
+answer, good or bad.
 
 ### 1c. What the current resolver gets wrong, exactly
 
@@ -140,31 +162,35 @@ username and passwd home. Note the home comes from passwd, NOT from the
 directory's path: the node dir can legitimately live outside the home (the
 `/etc/citadel` shapes), and the passwd home is what the vendor CLIs use.
 
-- Correctness on the fleet: CORRECT on the primary shape by construction
-  (section 1b): the human ran `sudo -E`, `init` chowned the dir to them, the
-  root worker resolves the same dir. Correct on the other two shapes (the dir
-  is owned by the process user, which is the target). Agrees with `SUDO_USER`
-  under `sudo citadel work`. Zero new state, zero new config, nothing for the
-  operator to set.
+- Correctness on the fleet (section 1b): on a true-root install the owner is
+  uid 0 and the target is root, which is the honest and correct answer for
+  that node (the account that installed the CLI is the account being probed).
+  On a human-sudo install the dir is already owned by the human; (b) yields
+  them as soon as the root worker can resolve the dir (#1017), because
+  `init`'s chown already did the recording. Correct on the other two unit
+  shapes (the dir is owned by the process user, which is the target). Agrees
+  with `SUDO_USER` under `sudo citadel work`. No probe-specific state, no new
+  config, nothing for the operator to set.
 - Inherited failure modes, stated rather than assumed away. (b) is exactly as
   good as `GetStateDir` convergence and not one bit better:
-  - A root worker with NO pointer file and no `SUDO_USER` (the #383 shape,
-    e.g. onboarded via a non-root `citadel login` that could not write
-    `/etc/citadel`, then a root unit hand-written later) resolves `/root`'s
-    node dir, owned by uid 0, so the target is root. That node is ALSO
-    registering as a duplicate node today, so the probe is not the first thing
-    wrong with it, but it must still report honestly (see the mapping below).
+  - A root worker that cannot converge on the human's node dir (no pointer,
+    no `SUDO_USER`: the #1017 shape today, or any hand-written root unit on a
+    node onboarded by a non-root `citadel login`) resolves `/root`'s node
+    dir, owned by uid 0, so the target is root. Such a node is ALSO failing
+    to find its device token or registering as a duplicate, so the probe is
+    not the first thing wrong with it, but it must still report honestly
+    (see the mapping below).
   - `resolveChownTargetWith` defaults the chown target to a user named
     `citadel` when `SUDO_USER` is empty. On a true-root install (`ssh root@`,
     `SUDO_USER` empty or `root`) on a box that happens to have a `citadel`
     account, the dir is chowned to that account and (b) targets
     `/home/citadel`. That is the packer image's intended owner, so it is
     usually right, but it is a guess the chown made, not the probe.
-  - `fixStateDirOwnership` skips the chown entirely when the parent basename is
-    not `citadel-node` and does not match the global config's node dir. The
-    `network/` state dir is chowned in every branch where a chown happens at
-    all, which is why S2 stats `GetStateDir()` first and only falls back to the
-    parent.
+  - `fixStateDirOwnership` chowns only the `network/` state dir, not its
+    parent, when the parent basename is not `citadel-node` and does not match
+    the global config's node dir. The state dir is therefore chowned in every
+    branch where a chown happens at all, which is why S2 stats `GetStateDir()`
+    first and only falls back to the parent.
 - Multi-user nodes: (b) picks the account that ran `citadel init`. On a box
   where a different human is the one with `claude` installed, that human is
   invisible. This is the case (c) exists for; (b) alone does not cover it and
@@ -222,8 +248,21 @@ Honesty mapping, the rule every branch protects:
 |---|---|---|
 | Owner resolves to a non-root human (fleet common case) | that user | full probe of their `HOME`/`PATH`, `signal: node-dir-owner` |
 | Owner resolves to uid 0 and the worker is root | root | full probe of `/root`, `signal: node-dir-owner`, `target_user: root`; a consumer can see nobody else's environment was inspected |
-| Configured user does not exist in passwd | none | probe with zero `HomeDir`: every installed vendor reports `AuthStateUnknown` (the existing `probeVendor` branch), plus a `resolve_error` string on the snapshot |
+| Configured user does not exist in passwd | none | every installed vendor reports `AuthStateUnknown`, plus a `resolve_error` string on the snapshot. NOTE: this needs a NEW `Probe` input (below); passing a zero `HomeDir` does NOT do this today |
 | Node dir cannot be stat'ed and no other signal | process user | as #1012 today, `signal: process` |
+
+**A discrepancy in the S2 gate that S2 must close (citadel #1015).**
+`ResolveTargetUser`'s doc comment promises that "the caller can pass a zero
+HomeDir and Probe reports AuthStateUnknown". `Probe` does not do that: on an
+empty `Options.HomeDir` it substitutes `os.UserHomeDir()`, the WORKER's own
+home, so an unresolvable target silently becomes a `/root` probe, the exact
+confident-false this design exists to prevent. `probeVendor`'s
+`AuthStateUnknown` branch is only reachable when `os.UserHomeDir()` itself
+fails, which it never does under a unit that sets `HOME`. S2 therefore adds an
+explicit "home unknown" input to `Probe` (an `Options.HomeUnknown bool`, or
+making the empty-string fallback opt-in) and routes every unresolvable branch
+of the resolver through it. Until that lands, the honesty table's third row
+is a design intent, not shipped behavior.
 
 The design does NOT add a rule of the form "owner is root but other homes
 exist, so degrade to unknown". That would be (d) sneaking back in through the
@@ -440,10 +479,17 @@ Confirmed from the code, not asserted:
   drop, and `Stat_t` does not exist; the Windows stub resolves `signal:
   process`. A Windows worker probes its own account, as S1 does today.
 - `install.sh`'s idempotency check (line 472 at v2.152.0) looks for existing
-  state at `/root/citadel-node/network`, but under `sudo -E` `init` writes
-  under the human's home (section 1b), so that branch may never fire. The
-  earlier `status --json` check makes it harmless today. Not S2's to fix;
-  filed as a follow-up rather than changed here.
+  state at `/root/citadel-node/network`, but on a human-sudo run `init`
+  writes under the human's home (section 1b), so that branch only fires on a
+  true-root install. The earlier `status --json` check makes it harmless
+  today. Not S2's to fix; filed as **#1016**.
+- The network-only `init` path never writes the machine state pointer, so a
+  root worker after a human-sudo `install.sh` cannot converge on the human's
+  node dir (section 1b). Pre-existing, independent of S2, and the thing that
+  gates option (b) on that sub-case; filed as **#1017**.
+- `Probe` treats an empty `Options.HomeDir` as "use the worker's own home",
+  contradicting `ResolveTargetUser`'s doc comment (section 2b); filed as
+  **#1015**, closed by S2's explicit "home unknown" input.
 - The `citadel` default chown target (section 2b) is a guess made by
   `resolveChownTargetWith` for the packer image; on a true-root install with a
   coincidental `citadel` account it steers (b). `agents_probe_user` is the
@@ -466,9 +512,18 @@ signing touches S2: a probe result is an observation, not a receipt, and
 signing it would be a proof-shaped claim about an environment the node does
 not control.
 
-Suggested landing order inside S2: resolver + drop + tests first (it is the
-security-relevant piece and independently reviewable), then `Service` +
-endpoint, then heartbeat mirror last (or not at all per open question 2).
+Dependency, not part of S2's own diff: #1017 (network-only `init` writes the
+machine state pointer when root). Without it, option (b) on a human-sudo
+`install.sh` node resolves root, honestly labelled but not what the operator
+wants; with it, (b) resolves the human with no further change. It is a
+one-call fix in `cmd/init.go` that #383 already motivates on its own, so it
+should land first or alongside (open question 7). #1015 (the `Probe`
+empty-home fallback) IS part of S2's diff.
+
+Suggested landing order inside S2: #1015's `Probe` input + resolver + drop +
+tests first (the security-relevant piece and independently reviewable), then
+`Service` + endpoint, then heartbeat mirror last (or not at all per open
+question 2).
 
 ## Open questions for the owner
 
@@ -504,3 +559,10 @@ endpoint, then heartbeat mirror last (or not at all per open question 2).
    designed it works for any caller who can already read the target's home
    (the kernel decides), which matches `citadel pairing-code`'s posture of
    letting file permissions be the boundary.
+7. **Does #1017 (network-only `init` writes the state pointer) land inside
+   S2, or first as its own fix?** The design treats it as a prerequisite
+   for option (b) on the human-sudo fleet shape and recommends it land
+   first on its own #383 merits; it was traced from the code, not verified
+   on a node, so a check against a real human-sudo-installed node (does the
+   root worker find its device token?) is the cheap way to confirm it is
+   live before sequencing.
