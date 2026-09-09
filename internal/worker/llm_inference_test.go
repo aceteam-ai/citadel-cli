@@ -1870,3 +1870,308 @@ func TestLLMInferenceHandler_OllamaStreamingToolCallsResponse(t *testing.T) {
 		t.Errorf("tool_calls[0].function.name = %v, want get_weather", fn["name"])
 	}
 }
+
+// --- Consolidated Trust Engine hook (citadel #1001, aceteam #8253 S1) ------
+
+// trustEngineHookCase describes one of the ten buffered/streaming engine
+// functions that can produce result.Output["content"], and how to drive a
+// job through Execute so that function is the one that actually serves the
+// request.
+type trustEngineHookCase struct {
+	name    string
+	backend string
+	stream  bool
+	// messages, when true, makes the job payload carry `messages` (routing
+	// to the chat-style function for backends that have one); otherwise the
+	// job carries a bare `prompt` (routing to the prompt-style function).
+	messages bool
+	// serve writes the fake engine's response body for the given content,
+	// in whatever shape (buffered JSON or streamed frames) that backend's
+	// function expects.
+	serve func(w http.ResponseWriter, content string)
+}
+
+var trustEngineHookCases = []trustEngineHookCase{
+	{
+		name: "vllm/bufferedCompletions", backend: "vllm", stream: false, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"choices":[{"text":%q,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+				content)))
+		},
+	},
+	{
+		name: "vllm/streamCompletions", backend: "vllm", stream: true, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(fmt.Sprintf(`data: {"choices":[{"text":%q,"finish_reason":"stop"}]}`+"\n", content)))
+			_, _ = w.Write([]byte("data: [DONE]\n"))
+		},
+	},
+	{
+		name: "ollama/bufferedOllama", backend: "ollama", stream: false, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"response":%q}`, content)))
+		},
+	},
+	{
+		name: "ollama/streamOllama", backend: "ollama", stream: true, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"response":%q,"done":true}`+"\n", content)))
+		},
+	},
+	{
+		name: "ollama/bufferedOllamaChat", backend: "ollama", stream: false, messages: true,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"message":{"content":%q}}`, content)))
+		},
+	},
+	{
+		name: "ollama/streamOllamaChat", backend: "ollama", stream: true, messages: true,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"message":{"content":%q},"done":true}`+"\n", content)))
+		},
+	},
+	{
+		name: "llamacpp/bufferedLlamaCpp", backend: "llamacpp", stream: false, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"content":%q}`, content)))
+		},
+	},
+	{
+		name: "llamacpp/streamLlamaCpp", backend: "llamacpp", stream: true, messages: false,
+		serve: func(w http.ResponseWriter, content string) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(fmt.Sprintf(`data: {"content":%q,"stop":true}`+"\n", content)))
+		},
+	},
+	{
+		name: "llamacpp/bufferedChatCompletions", backend: "llamacpp", stream: false, messages: true,
+		serve: func(w http.ResponseWriter, content string) {
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"choices":[{"message":{"content":%q},"finish_reason":"stop"}]}`, content)))
+		},
+	},
+	{
+		name: "llamacpp/streamChatCompletions", backend: "llamacpp", stream: true, messages: true,
+		serve: func(w http.ResponseWriter, content string) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(fmt.Sprintf(`data: {"choices":[{"delta":{"content":%q},"finish_reason":"stop"}]}`+"\n", content)))
+			_, _ = w.Write([]byte("data: [DONE]\n"))
+		},
+	},
+}
+
+// TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths is citadel #1001's
+// direct pin of #8253's proof plan item 2: for every one of the ten
+// buffered/streaming engine functions that can produce
+// result.Output["content"], a fake engine returns a fixed body and this
+// asserts result.Output["trust_verdict"] and result.Output["aep_receipt"]
+// are both present, and trust_verdict's output_sha256 equals sha256 of
+// result.Output["content"].
+//
+// Mutation-testing note: with the OLD (pre-#1001) design -- a hook
+// duplicated inside each of the ten functions -- "remove the call from one
+// path" was a distinct mutation per subtest. This file's design consolidates
+// all ten into ONE call (Execute's h.applyTrustEngine(...), see llm_inference.go)
+// specifically so that mistake can no longer happen per-path: deleting that
+// one call fails EVERY subtest below simultaneously, which
+// TestApplyTrustEngine_NoopWithoutHook below pins directly against
+// applyTrustEngine itself (call it, or don't -- there is no third, partial
+// state), and every subtest here already fails closed if the call is ever
+// deleted from Execute, wired, or gated wrong.
+func TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths(t *testing.T) {
+	t.Setenv(groundingGuardrailEnvVar, "1")
+	t.Setenv(signAEPReceiptsEnvVar, "1")
+
+	const content = "hello world, nothing numeric here"
+
+	for _, tc := range trustEngineHookCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				tc.serve(w, content)
+			}))
+			defer ts.Close()
+
+			signer := newFakeAEPSigner(t)
+			h := NewLLMInferenceHandler().WithSigner(signer).WithFabricNodeIDResolver(func() string { return "" })
+			h.baseURLs[tc.backend] = ts.URL
+
+			payload := map[string]any{
+				"model":   "m",
+				"backend": tc.backend,
+				"stream":  tc.stream,
+			}
+			if tc.messages {
+				payload["messages"] = []map[string]any{{"role": "user", "content": "say hello"}}
+			} else {
+				payload["prompt"] = "say hello"
+			}
+
+			job := &Job{ID: "job-" + tc.name, Type: JobTypeLLMInference, Payload: payload}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+
+			gotContent, _ := result.Output["content"].(string)
+			if gotContent != content {
+				t.Fatalf("Output content = %q, want %q", gotContent, content)
+			}
+
+			verdict, ok := result.Output["trust_verdict"].(map[string]any)
+			if !ok {
+				t.Fatalf("Output[\"trust_verdict\"] = %#v, want map[string]any -- hook did not run for %s", result.Output["trust_verdict"], tc.name)
+			}
+			wantDigest := sha256Hex(content)
+			if got := verdict["output_sha256"]; got != wantDigest {
+				t.Errorf("trust_verdict[\"output_sha256\"] = %v, want %v", got, wantDigest)
+			}
+			if action, _ := verdict["action"].(string); action != "pass" {
+				t.Errorf(`trust_verdict["action"] = %q, want "pass" (benign content)`, action)
+			}
+			checks, ok := verdict["checks"].([]map[string]any)
+			wantNames := []string{"grounding", "secrets", "pii", "ferpa"}
+			if !ok || len(checks) != len(wantNames) {
+				t.Fatalf(`trust_verdict["checks"] = %#v, want %d entries (grounding + 3 detectors)`, verdict["checks"], len(wantNames))
+			}
+			for i, n := range wantNames {
+				if checks[i]["name"] != n {
+					t.Errorf(`trust_verdict["checks"][%d]["name"] = %v, want %q`, i, checks[i]["name"], n)
+				}
+			}
+			if _, ok := verdict["verdict_hash"].(string); !ok {
+				t.Errorf(`trust_verdict["verdict_hash"] = %#v, want a string`, verdict["verdict_hash"])
+			}
+
+			if _, present := result.Output["aep_receipt"]; !present {
+				t.Errorf("Output = %+v, want an aep_receipt key -- hook did not run for %s", result.Output, tc.name)
+			}
+		})
+	}
+}
+
+// TestApplyTrustEngine_NoopWithoutHook is the direct unit pin for
+// applyTrustEngine's own no-op guard conditions, independent of any real
+// engine or Execute() dispatch -- the fast-fail counterpart to the
+// mutation-testing note above: this is what actually fails if
+// applyTrustEngine's call in Execute is ever deleted, if its guard grows a
+// bug, or if it is called on the wrong kind of result.
+func TestApplyTrustEngine_NoopWithoutHook(t *testing.T) {
+	t.Setenv(groundingGuardrailEnvVar, "1")
+	t.Setenv(signAEPReceiptsEnvVar, "1")
+	h := NewLLMInferenceHandler().WithSigner(newFakeAEPSigner(t)).WithFabricNodeIDResolver(func() string { return "" })
+	payload := &jobs.LLMInferencePayload{Backend: "vllm", Model: "m", Prompt: "hi"}
+
+	t.Run("nil result", func(t *testing.T) {
+		h.applyTrustEngine(payload, "job-1", nil) // must not panic
+	})
+
+	t.Run("failure result untouched", func(t *testing.T) {
+		result := h.failure(fmt.Errorf("boom"))
+		before := fmt.Sprintf("%v", result.Output)
+		h.applyTrustEngine(payload, "job-2", result)
+		if got := fmt.Sprintf("%v", result.Output); got != before {
+			t.Errorf("failure Output mutated: got %v, want unchanged %v", got, before)
+		}
+		if _, present := result.Output["trust_verdict"]; present {
+			t.Errorf("Output = %+v, want no trust_verdict on a failure result", result.Output)
+		}
+	})
+
+	t.Run("model_warming result untouched (no content key)", func(t *testing.T) {
+		result := h.warming("m", 5, 0, "m")
+		before := fmt.Sprintf("%v", result.Output)
+		h.applyTrustEngine(payload, "job-3", result)
+		if got := fmt.Sprintf("%v", result.Output); got != before {
+			t.Errorf("warming Output mutated: got %v, want unchanged %v", got, before)
+		}
+	})
+
+	t.Run("success result with content, guardrail disabled", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "0")
+		result := h.success(map[string]any{"content": "hi there"})
+		h.applyTrustEngine(payload, "job-4", result)
+		if _, present := result.Output["trust_verdict"]; present {
+			t.Errorf("Output = %+v, want no trust_verdict when the guardrail is off", result.Output)
+		}
+		if _, present := result.Output["aep_receipt"]; present {
+			t.Errorf("Output = %+v, want no aep_receipt when the guardrail is off", result.Output)
+		}
+	})
+}
+
+// TestApplyTrustEngine_DetectorChecksRegistered pins #8253 S6's contract at the
+// worker seam: with the guardrail on, trust_verdict.checks[] carries grounding
+// plus the three pure detectors (secrets/pii/ferpa) and a verdict_hash; a
+// content-borne secret flips the aggregate action to flag; and with the
+// guardrail off the whole trust_verdict (verdict_hash and detector checks
+// included) is absent, byte-identical to before S6. Signing is turned off here
+// to isolate the verdict from the aep_receipt path.
+func TestApplyTrustEngine_DetectorChecksRegistered(t *testing.T) {
+	t.Setenv(signAEPReceiptsEnvVar, "0")
+	h := NewLLMInferenceHandler()
+	payload := &jobs.LLMInferencePayload{Backend: "vllm", Model: "m", Prompt: "say hello"}
+
+	t.Run("all four checks + verdict_hash present when guardrail on", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		result := h.success(map[string]any{"content": "hello world, nothing sensitive here"})
+		h.applyTrustEngine(payload, "job-a", result)
+
+		verdict, ok := result.Output["trust_verdict"].(map[string]any)
+		if !ok {
+			t.Fatalf("trust_verdict = %#v, want map", result.Output["trust_verdict"])
+		}
+		checks, ok := verdict["checks"].([]map[string]any)
+		wantNames := []string{"grounding", "secrets", "pii", "ferpa"}
+		if !ok || len(checks) != len(wantNames) {
+			t.Fatalf("checks = %#v, want %d entries", verdict["checks"], len(wantNames))
+		}
+		for i, n := range wantNames {
+			if checks[i]["name"] != n {
+				t.Errorf("checks[%d][name] = %v, want %q", i, checks[i]["name"], n)
+			}
+		}
+		if _, ok := verdict["verdict_hash"].(string); !ok {
+			t.Errorf("verdict_hash = %#v, want a string", verdict["verdict_hash"])
+		}
+		if verdict["action"] != "pass" {
+			t.Errorf("action = %v, want pass (benign content)", verdict["action"])
+		}
+	})
+
+	t.Run("secret in output flips aggregate action to flag", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		result := h.success(map[string]any{"content": "token: -----BEGIN RSA PRIVATE KEY-----"})
+		h.applyTrustEngine(payload, "job-b", result)
+		verdict := result.Output["trust_verdict"].(map[string]any)
+		if verdict["action"] != "flag" {
+			t.Errorf("action = %v, want flag", verdict["action"])
+		}
+		checks := verdict["checks"].([]map[string]any)
+		var secrets map[string]any
+		for _, c := range checks {
+			if c["name"] == "secrets" {
+				secrets = c
+			}
+		}
+		if secrets == nil || secrets["action"] != "flag" {
+			t.Errorf("secrets check = %#v, want action=flag", secrets)
+		}
+	})
+
+	t.Run("no trust_verdict at all when guardrail off", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "0")
+		result := h.success(map[string]any{"content": "token: -----BEGIN RSA PRIVATE KEY-----"})
+		h.applyTrustEngine(payload, "job-c", result)
+		if _, present := result.Output["trust_verdict"]; present {
+			t.Errorf("Output = %+v, want no trust_verdict (and thus no verdict_hash) when guardrail off", result.Output)
+		}
+	})
+}

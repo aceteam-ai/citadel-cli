@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -30,12 +31,13 @@ type StatePoster interface {
 // is fire-and-forget and crash-safe: a single failed report is dropped and the
 // loop keeps ticking; a panic in one cycle never crashes the worker.
 type Emitter struct {
-	poster    StatePoster
-	inspector ModuleInspector
-	configDir string // where telemetry.yaml lives; the opt-out flag is re-read here per cycle
-	nodeID    string // Headscale hostname (server auth/identity key)
-	version   string // citadel-cli version (agent_version)
-	interval  time.Duration
+	poster          StatePoster
+	inspector       ModuleInspector
+	bridgeEndpoints BridgeEndpointsProvider
+	configDir       string // where telemetry.yaml lives; the opt-out flag is re-read here per cycle
+	nodeID          string // Headscale hostname (server auth/identity key)
+	version         string // citadel-cli version (agent_version)
+	interval        time.Duration
 }
 
 // Config wires up an Emitter.
@@ -46,6 +48,12 @@ type Config struct {
 	// Inspector observes per-module run-state. May be nil (e.g. no docker), in
 	// which case modules report UNSPECIFIED status/health.
 	Inspector ModuleInspector
+	// BridgeEndpoints builds the synthetic bridge module row (citadel#624 Phase
+	// A). May be nil (no node-hosted module with its own network endpoints to
+	// report), in which case no synthetic row is ever appended. When set, its
+	// row is exempt from the AnonTelemetryEnabled gate below -- see
+	// reportOnce's doc comment.
+	BridgeEndpoints BridgeEndpointsProvider
 	// ConfigDir is where telemetry.yaml lives; the opt-out flag is re-read from
 	// here each cycle so a runtime toggle takes effect without a restart.
 	ConfigDir string
@@ -69,12 +77,13 @@ func New(cfg Config) *Emitter {
 		interval = DefaultInterval
 	}
 	return &Emitter{
-		poster:    cfg.Poster,
-		inspector: cfg.Inspector,
-		configDir: cfg.ConfigDir,
-		nodeID:    cfg.NodeID,
-		version:   cfg.Version,
-		interval:  interval,
+		poster:          cfg.Poster,
+		inspector:       cfg.Inspector,
+		bridgeEndpoints: cfg.BridgeEndpoints,
+		configDir:       cfg.ConfigDir,
+		nodeID:          cfg.NodeID,
+		version:         cfg.Version,
+		interval:        interval,
 	}
 }
 
@@ -99,26 +108,43 @@ func (e *Emitter) Run(ctx context.Context) {
 	}
 }
 
-// reportOnce performs one report cycle with full crash isolation: it gates on
-// the opt-out flag, builds + serializes the report, and posts it — recovering
-// from any panic and bounding the whole cycle with a timeout. Failures are
-// intentionally dropped; node-state reporting is best-effort.
+// reportOnce performs one report cycle with full crash isolation: it builds +
+// serializes the report and posts it — recovering from any panic and bounding
+// the whole cycle with a timeout. Failures are intentionally dropped;
+// node-state reporting is best-effort.
+//
+// The AnonTelemetryEnabled opt-out gates the LOCKFILE-DRIVEN module telemetry
+// (BuildActualState) only — re-read per cycle so a runtime toggle takes
+// effect without a restart, same as activity telemetry. It deliberately does
+// NOT gate BridgeEndpoints: a node-hosted module's network endpoints are
+// OPERATIONAL facts the platform needs to reach it, not telemetry, so riding
+// the opt-out would make an opted-out node's bridge silently unreachable/stale
+// upstream (citadel#624 design review, point 2). When telemetry is off and
+// there is nothing operational to report either, the original opt-out
+// behavior is preserved exactly: no report is posted at all.
 func (e *Emitter) reportOnce(parent context.Context) {
 	defer func() {
 		// Reporting must never crash the worker; swallow any panic (cf. #291).
 		_ = recover()
 	}()
 
-	// Re-read the opt-out flag per cycle so the settings toggle takes effect at
-	// runtime without a restart — the same gate as activity telemetry.
-	if !config.LoadTelemetry(e.configDir).AnonTelemetryEnabled {
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(parent, emitTimeout)
 	defer cancel()
 
-	state := BuildActualState(ctx, e.inspector, e.nodeID, e.version)
+	telemetryOn := config.LoadTelemetry(e.configDir).AnonTelemetryEnabled
+
+	var state *fabricpb.ActualState
+	if telemetryOn {
+		state = BuildActualState(ctx, e.inspector, e.nodeID, e.version)
+	} else {
+		state = newEnvelope(e.nodeID, e.version)
+	}
+	AppendBridgeModule(ctx, state, e.bridgeEndpoints)
+
+	if !telemetryOn && len(state.GetModules()) == 0 {
+		return
+	}
+
 	body, err := proto.Marshal(state)
 	if err != nil {
 		return

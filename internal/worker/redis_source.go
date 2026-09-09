@@ -133,6 +133,21 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
+	// Install the env-aware stale-pending reclaim floor (issue #871/#998
+	// review) so a bounded job (MEETING_JOIN/COBROWSE) is never reclaim-
+	// eligible before its own watchdog would have already ACKed it out of
+	// the PEL, even if WORKER_JOB_TIMEOUT_LONG_SECONDS is raised above the
+	// package default. See ResolveStalePendingReclaimFloor's doc comment.
+	s.client.SetStalePendingReclaimMinIdle(ResolveStalePendingReclaimFloor())
+
+	// Install the env-aware cross-consumer liveness threshold (issue #999)
+	// so a live process blocking the fetch loop on an inline job is never
+	// mistaken for a dead consumer before its own DEFAULT-tier watchdog
+	// would have fired, even if WORKER_JOB_TIMEOUT_SECONDS is raised above
+	// internal/redis's BlockMs-derived default. See
+	// ResolveConsumerDeadAfter's doc comment.
+	s.client.SetConsumerDeadAfter(ResolveConsumerDeadAfter())
+
 	// Create consumer groups for all queues
 	if err := s.client.EnsureConsumerGroups(ctx, s.queueNames); err != nil {
 		return fmt.Errorf("failed to create consumer groups: %w", err)
@@ -223,9 +238,21 @@ func (s *RedisSource) snapshotQueues() []string {
 
 // nextSingle reads from a single queue (original behavior).
 func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int) (*Job, error) {
-	redisJob, err := s.client.ReadJobBlock(ctx, blockMs)
+	// Reclaim a stale pending entry (issue #871) before doing a normal read.
+	// This is the ONLY thing that ever redelivers a Nacked-but-unacked
+	// message in direct-Redis mode -- see StalePendingReclaimMinIdle's doc
+	// comment. Best-effort: a reclaim error never fails the poll, it just
+	// falls through to the ordinary read.
+	redisJob, err := s.client.ReclaimStalePendingOnQueue(ctx, queue)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", queue, err)
+		redisJob = nil
+	}
+	if redisJob == nil {
+		redisJob, err = s.client.ReadJobBlock(ctx, blockMs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		}
 	}
 
 	if redisJob == nil {
@@ -272,9 +299,30 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 
 // nextMulti reads from multiple queues simultaneously.
 func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs int) (*Job, error) {
-	redisJob, sourceQueue, err := s.client.ReadJobMultiBlock(ctx, queues, blockMs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+	// Reclaim a stale pending entry (issue #871) on any of the subscribed
+	// queues before doing a normal read. See nextSingle's comment and
+	// StalePendingReclaimMinIdle's doc comment for why this is needed at all.
+	var redisJob *redisclient.Job
+	var sourceQueue string
+	for _, q := range queues {
+		reclaimed, err := s.client.ReclaimStalePendingOnQueue(ctx, q)
+		if err != nil {
+			s.log("warning", "   - Failed to reclaim stale pending job on %s: %v", q, err)
+			continue
+		}
+		if reclaimed != nil {
+			redisJob = reclaimed
+			sourceQueue = q
+			break
+		}
+	}
+
+	if redisJob == nil {
+		var err error
+		redisJob, sourceQueue, err = s.client.ReadJobMultiBlock(ctx, queues, blockMs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read job from Redis: %w", err)
+		}
 	}
 
 	if redisJob == nil {

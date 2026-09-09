@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -214,6 +215,49 @@ func TestStopComposeArgs_Override_RemoveVolumesAfterDown(t *testing.T) {
 	want := []string{"compose", "-p", project, "-f", "/n/services/vllm.yml", "down", "-v"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Fatalf("stopComposeArgs() = %v, want %v (-v must stay AFTER down, it's down's own flag)", got, want)
+	}
+}
+
+// TestStopComposeArgs_EnvFilePresent pins the citadel#624 Task-A fix: when a
+// sibling <name>.env file exists next to the compose file, `down` must pass it
+// via --env-file (a GLOBAL flag, so it precedes `down`). Without it, a compose
+// file that hard-requires a var via ${VAR:?} -- the WhatsApp bridge's
+// ADMIN_API_KEY -- fails to parse on `down` and the stop/uninstall retries
+// forever.
+func TestStopComposeArgs_EnvFilePresent(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "whatsapp-bridge.yml")
+	envPath := filepath.Join(dir, "whatsapp-bridge.env")
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte("ADMIN_API_KEY=wab_admin_x\n"), 0600); err != nil {
+		t.Fatalf("write env: %v", err)
+	}
+
+	got := stopComposeArgs(composePath, false)
+	want := []string{"compose", "-f", composePath, "--env-file", envPath, "down"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("stopComposeArgs() = %v, want %v (--env-file must precede down when the sibling env exists)", got, want)
+	}
+}
+
+// TestStopComposeArgs_EnvFileAbsent pins that a service WITHOUT a sibling env
+// file gets a byte-identical no-op (the #528 no-`--env-file`/no-`-p` default),
+// so the Task-A fix never changes `down` for the common case.
+func TestStopComposeArgs_EnvFileAbsent(t *testing.T) {
+	setNodeDirOverrideForTest(t, "")
+	dir := t.TempDir()
+	composePath := filepath.Join(dir, "vllm.yml")
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0600); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+
+	got := stopComposeArgs(composePath, false)
+	want := []string{"compose", "-f", composePath, "down"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("stopComposeArgs() = %v, want %v (no sibling env -> no --env-file)", got, want)
 	}
 }
 

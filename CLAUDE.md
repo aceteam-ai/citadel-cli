@@ -538,6 +538,146 @@ type WorkerJobHandler interface {
 | Scaling | Horizontal via consumer groups |
 | Default endpoint | redis.aceteam.ai (AceTeam private cloud) |
 
+### Direct-Redis redelivery: XREADGROUP alone never retries anything (citadel #871, #998, #999)
+
+`RedisSource.Nack` (`internal/worker/redis_source.go`) deliberately doesn't
+ACK, with a comment that reads "let it retry" -- but `XREADGROUP`'s `>` ID
+hands each message to the consumer group exactly ONCE and never again, not
+even back to the SAME consumer that originally read it (verified against
+miniredis, a Redis-protocol reimplementation:
+`internal/redis`'s `TestXReadGroupNeverRedeliversAlreadyDeliveredMessage`).
+`ReadJobBlock`/`ReadJobMultiBlock` only ever read with `>`. So before #871,
+nothing in this codebase ever redelivered a Nacked message -- it just sat in
+the consumer group's pending-entries list (PEL) forever. Combined with issue
+#826's `willRetry` (which suppresses the terminal `error` stream event
+whenever it believes a retry is coming), a truly-failed or
+transient-fail-then-abandoned job in direct-Redis mode produced ZERO
+terminal stream events, permanently.
+
+`Client.ReclaimStalePendingOnQueue` (`internal/redis/client.go`) is the fix:
+a reclaim tried on every poll (`RedisSource.nextSingle`/`nextMulti`) before
+the normal blocking read. A successful claim increments the Redis-native
+delivery count -- including a self-claim back to the consumer that already
+owned it (verified against miniredis: `internal/redis`'s
+`TestReclaimStalePendingOnQueue`) -- so the existing DLQ cutoff and
+`willRetry`'s retry signal both keep working unmodified; this only supplies
+the missing "does redelivery actually happen" half.
+
+**The reclaim floor is resolved dynamically from the operator-tunable
+watchdog, not a hardcoded constant (citadel-cli#998 review fix).** The
+straightforward first cut hardcoded `Client.StalePendingReclaimMinIdle` to
+4h, matching `WORKER_JOB_TIMEOUT_LONG_SECONDS`'s *default* -- but that
+default is itself operator-tunable, and reclaim-eligibility (counted from
+DELIVERY time) can precede the watchdog's own deadline (counted from
+EXECUTION-START time, a gap `citadel-cli#908`'s claim/execute split
+introduced) even at matched values. So an operator who raises
+`WORKER_JOB_TIMEOUT_LONG_SECONDS` above the hardcoded 4h would make a
+HEALTHY, still-executing `MEETING_JOIN`/`COBROWSE` deterministically
+reclaim-eligible before its own watchdog ever fires -- stealing and
+re-dispatching a live job, not just a dead one.
+
+`internal/redis` is a leaf package and must not import `internal/worker`
+(the same constraint as the `ConfigDir()`/leaf-package notes elsewhere in
+this file), so it cannot resolve `WORKER_JOB_TIMEOUT_LONG_SECONDS` itself.
+`internal/worker.ResolveStalePendingReclaimFloor()` (`deadline.go`) does
+that resolution on the worker side -- reusing the same
+`envTimeoutSeconds(jobTimeoutLongEnvVar, ...)` `resolveJobTimeout` already
+uses -- and adds `ReclaimFloorMargin` (default 10min, covering the
+claim-gap above) so the floor is STRICTLY GREATER than the resolved
+watchdog ceiling, never merely equal to it. `RedisSource.Connect` threads
+the result across the package boundary via
+`Client.SetStalePendingReclaimMinIdle`, a plain `time.Duration` setter --
+the clean seam the leaf-package constraint requires. When the long-tier
+watchdog itself is unbounded (`WORKER_JOB_TIMEOUT_LONG_SECONDS=0`), no
+finite floor can be proven safe against it, so this falls back to
+`StalePendingReclaimFloorFallback` (4h, deliberately kept in sync with
+`internal/redis`'s own construction-time default by
+`TestStalePendingReclaimFloorFallbackMatchesRedisDefault`).
+
+With this in place: every job type with a BOUNDED per-job watchdog is
+always ACKed out of the PEL by its own watchdog abandon (routes to
+`source.Fail`) before it can become eligible for reclaim here, under the
+resolved (env-aware) floor with its margin -- this is NOT an absolute
+guarantee independent of configuration, it is a guarantee that holds for
+any watchdog value because the floor is derived from that same value.
+
+**Gap (1) (cross-consumer steal under horizontal scaling) is now closed for
+the provable case (citadel-cli#999).** Before #999, `ReclaimStalePendingOnQueue`
+called a blanket `XAUTOCLAIM`: it only moves PEL *ownership* in Redis, and
+does nothing to stop whichever process is still actually running the
+handler it already pulled into memory -- if more than one `citadel work`
+process shares a consumer group (horizontal scaling) and a job legitimately
+ran past the resolved floor, a DIFFERENT process could reclaim and
+re-dispatch it while the original was still executing.
+
+The fix: `ReclaimStalePendingOnQueue` no longer claims unconditionally. It
+first lists stale candidates via `XPENDING` (no claim, no side effect), then
+claims a candidate via a targeted `XCLAIM` only when ONE of two things is
+true -- (a) the candidate is SELF-owned (`Consumer == c.workerID`), claimed
+exactly as before with no extra check, since a self-claim can never cause
+cross-process double-execution and #871/#998's whole point (a Nacked
+message from THIS SAME process eventually retrying) depends on this path
+staying unconditional; or (b) the candidate is CROSS-owned (a different
+consumer name) AND that consumer is independently confirmed dead via
+`consumerLiveness` (real `XINFO CONSUMERS` by default, `Idle` at least
+`consumerDeadAfter`). `consumerDeadAfter` defaults (at `Client` construction)
+to a value sized off `BlockMs` -- enough to absorb ordinary poll jitter --
+but that alone is NOT safe: a live process also stops polling entirely
+while the fetch loop is blocked on a job's own execution -- either dispatched
+INLINE (`maxConcurrency<=1`) or synchronously acquiring a FULL semaphore pool
+slot (`maxConcurrency>1`, `runner.go`'s `sem <- struct{}{}`) -- for any job
+type that is none of long-session, `needsSerializedLane` (the unbounded-lane
+superset), or GPU-bound-with-a-tracker, all three of which always dispatch
+onto their own lane/goroutine instead (see the Node execution model /
+always-async-lane sections below). `internal/worker.ResolveConsumerDeadAfter`
+(mirroring `ResolveStalePendingReclaimFloor`'s shape exactly) resolves the
+REAL production value: strictly greater than the resolved DEFAULT-tier
+watchdog (`WORKER_JOB_TIMEOUT_SECONDS`) by `ConsumerDeadAfterMargin`, since
+that ceiling bounds the longest such a job can legitimately block polling
+either way -- `RedisSource.Connect` threads it across the leaf-package
+boundary via `SetConsumerDeadAfter`, the identical pattern
+`SetStalePendingReclaimMinIdle` already uses. (A payload `timeout_ms` above
+that env ceiling -- #552's opt-in per-job budget -- can still exceed this
+threshold, the same pre-existing floor-vs-explicit-budget shape #998 already
+accepts for the message-idle floor; not new here.) With this, "still
+polling, or blocked on a job no longer than its own watchdog allows" cleanly
+distinguishes "the owning process crashed" from "the owning process is fine
+and just slow" -- no per-job signal needed. A liveness lookup that fails, or
+a consumer simply absent from
+`XINFO CONSUMERS`, fails OPEN (never claimed): `ConsumerLivenessFunc`'s
+contract is "only a name present with `true` may ever be claimed from."
+`SetConsumerLivenessChecker` is the injectable seam tests use, because
+miniredis only updates a consumer's `idle`/`inactive` XINFO timestamps from
+an explicit `XCLAIM`, not from `XREADGROUP` -- unlike real Redis, where any
+interaction (including a plain poll) refreshes it -- so the cross-consumer
+decision logic is tested against a fake, not miniredis's incomplete
+semantics; a separate test exercises the real default checker's XINFO
+CONSUMERS wiring directly, driven via XCLAIM (the one interaction miniredis
+does track).
+
+**Gap (2) (a healthy UNBOUNDED job that outlives the reclaim cycle is
+reported DEAD) is narrowed but not closed, and remains a deliberate,
+accepted gap.** A job type with NO watchdog (model pulls, `SERVICE_START`,
+builds -- `unboundedJobTypes`) that legitimately runs past the resolved
+floor on the SAME process it started on is still a self-owned candidate, so
+#999's fix does not change its self-claim eligibility: it is still reclaimed
+by its own still-alive process, and if it keeps running past roughly
+`(MaxAttempts-1) x floor` (~8h at today's defaults: `MaxAttempts` 3, floor
+~4h10m) the DLQ cutoff in `nextSingle`/`nextMulti` still fires: `MoveToDLQ`
++ `Ack`. That is NOT merely "re-dispatched" -- the message is permanently
+removed from the PEL and reported as a dead/failed job to the DLQ consumer,
+even though the original execution may still be legitimately in progress.
+A dedicated per-job-type opt-out for this case (see citadel-cli#999) remains
+a separate, not-yet-built follow-up.
+
+**API mode has no equivalent, and this fix does not add one (issue #865,
+stays open).** The AceTeam Redis API proxy `APISource` uses exposes no
+per-message delivery count to the node at all -- `job.Metadata.MaxAttempts`
+is `0` for every API-mode job, which routes `willRetry` through its own
+"no signal, don't guess" fallback (always publish, matching pre-#826
+behavior) rather than through the reclaim path above. Fixing that is
+cross-repo proxy work and is out of scope here.
+
 ### Redis Status Publishing
 
 The worker supports real-time status publishing to Redis for live dashboard updates and reliable status processing.
@@ -1033,6 +1173,61 @@ guard in `internal/reconcile/loop.go` refuses the destructive converge and still
 reports, deliberately leaving `AppliedRevision` empty because nothing was
 applied. `TestRefuseFullWipeReportOmitsAppliedRevision` pins that.
 
+### Provenance-scoped uninstall + the WhatsApp bridge as a module (citadel#624 Part 1)
+
+`reconcile.Reconcile`'s drift-uninstall branch (`internal/reconcile/engine.go`)
+now proposes `ActionUninstall` ONLY for an `InstalledModule` whose `ManagedBy ==
+reconcile.ManagedByDesiredState` (`"desired-state"`). An UNSTAMPED entry — every
+pre-#624 lockfile row, an operator/catalog CLI install
+(`recordCatalogModuleLock` leaves it empty), an embedded engine, the bespoke
+bridge — is never *drift*-uninstalled (installed-but-absent-from-a-non-empty-
+desired-set), even when absent from a NON-empty desired set. It is NOT immune to
+all change: a desired assignment that NAMES it still adopts/replaces it in place
+(`liveModuleOps.Install`'s update-in-place teardown is gated on
+`hasService(manifest, name)`, the manifest, not on provenance — that is how
+bespoke→module adoption works). The guard covers only the drift-DELETE arm. This
+is the aceteam#4273 blast-radius fix: a single-row desired assignment can no
+longer tear down every OTHER module-recorded service. It is DISTINCT from
+the empty-desired full-wipe guard (`loop.go`), which fires before `Reconcile`.
+Only `liveModuleOps.recordLock` (the desired-state/MODULE_SET converge path)
+stamps `ManagedByDesiredState`; `ListInstalled` plumbs `LockEntry.ManagedBy` onto
+`InstalledModule.ManagedBy`. **Consequence to know: a MODULE_SET `absent` for an
+UNSTAMPED service is now a silent no-op** (the same safe direction as the
+lockfile-less no-op already documented above). Pinned by
+`TestReconcileDoesNotUninstallUnstampedModule` (engine, direct), the extended
+`TestOneDesiredModuleDoesNotWipeManifest` + `TestBridgeDesiredDoesNotUninstallUnstampedSibling`
+(`cmd`), and `TestRecordCatalogModuleLockEntryShape` (asserts the CLI path stays
+unstamped).
+
+Supporting the bridge becoming a first-class module (catalog entry
+`whatsapp-bridge` in `aceteam-ai/citadel-services`, D2):
+- **`config[].carry: true`** (`internal/catalog`, alongside `generate:`): a value
+  the node CANNOT re-mint (minted out of band — the bridge admin API mints
+  `TENANT_*`). `resolveConfig` AND `CarryGeneratedConfig` reuse a persisted carry
+  value so it survives update-in-place (which deletes `<name>.env`); unlike
+  `generate:`, a carry var with nothing persisted stays unset, never fabricated.
+  The `resolveConfig` reuse (not just `CarryGeneratedConfig`) is what covers the
+  bespoke→module TRANSITION install, where `CarryGeneratedConfig` never runs
+  (service not yet in the manifest). `TestModuleSetBridgeReassignCarriesAdminAndTenantKeys`
+  / `TestCarryVarReusedOnNonTeardownInstallPath` pin both classes.
+- **`health_check.compose_service`** (persisted as `LockEntry.HealthComposeService`):
+  `ListInstalled` resolves such a module's run-state via `docker compose -p
+  <project> ps <service>` (the generic form of `bridgeContainerRunning`), because
+  its real container is `<project>-bridge-N`, not `citadel-<name>` — which the
+  default `isRunning` check never matches, so it would report STOPPED forever and
+  drive a redundant `ActionStart` every pass. `TestListInstalledBridgeHealthViaComposeService`
+  asserts the converged plan is EMPTY.
+- **Synthetic-row decorator** (`whatsapp.AttachBridgeModule`, called by BOTH
+  `nodestate.AppendBridgeModule` and `reconcile.ProtoProvider.Report`): once a
+  real lockfile-derived bridge row exists (matched by `Source`), the Phase-A
+  endpoint facts attach to THAT row (and adopt its compose-probe Status/Health,
+  never overwriting a converge ERROR) instead of appending a duplicate synthetic
+  row the upsert-by-source ingest would flap on. Pinned in both reporter tests.
+- **D5 delegation** (`deployWhatsAppComposeOnce`, gated on `bridgeModuleInstalled()`):
+  when a lockfile entry exists the module system owns the compose lifecycle, so
+  the bespoke git-clone+`compose up` is skipped (env still persisted); the bespoke
+  deploy is the fallback for lockfile-less/old nodes only.
+
 ### GPU Detection
 Status command detects NVIDIA GPUs using:
 1. `nvidia-smi` command output parsing
@@ -1314,22 +1509,34 @@ nothing to check, not because anything was verified. `ClaimsChecked` is the
 denominator that disambiguates "nothing to check" from "everything checked
 out"; read it alongside Score, never Score alone.
 
-**Wiring is opt-in and single-point, not pervasive.** `llm_inference` serves
-general chat, code generation, and vision/OCR through the SAME handler
+**Wiring is opt-in and consolidated into ONE post-completion hook, not
+duplicated per engine path (citadel #1001, aceteam #8253 S1).** `llm_inference`
+serves general chat, code generation, and vision/OCR through the SAME handler
 (`internal/worker/llm_inference.go`), and "a number in the output not in the
 input" is normal for those (arithmetic answers, port numbers, facts recalled
 from training data) — attaching the guardrail unconditionally would flag most
 of that traffic. `groundingGuardrailEnabled()` gates it behind
 `CITADEL_GROUNDING_GUARDRAIL` (default OFF, like every other advisory-signal
-toggle in this codebase), and the ONE wired call site is
-`bufferedChatCompletions` — the non-streaming chat-completions path, chosen
-because it is the only place both the full input and full output already
-exist as Go strings before anything is sent, so flag-only (the shipped
-default; see `Policy`/`Block`) is safe and gating would be too (a streamed
-reply is already sent token-by-token before the full text exists, so it can
-be flagged post-hoc but not gated). The streaming and llamacpp/ollama
-buffered/stream pairs in that file are documented, not-yet-wired hooks with
-the identical shape.
+toggle in this codebase). `Execute`'s `applyTrustEngine` is the single call
+site — run once, after `Execute`'s backend switch has produced a result from
+whichever of the ten buffered/streaming engine functions actually served the
+request (vLLM/SGLang completions, ollama generate/chat, llama.cpp/bonsai
+completion, and the shared OpenAI-compatible chat-completions path — each
+buffered AND streaming) — rather than inside each function individually. Every
+one of those functions already sets `result.Output["content"]` before
+returning, which is what makes one hook sufficient: it is a POST-completion
+check (never a gate) precisely because a streamed reply is already fully on
+the wire by the time `Execute` sees the final `Output` (tokens went out via
+`stream.WriteChunk` first), so flag-only (the shipped default; see
+`Policy`/`Block`) is safe and gating would not be. Before #1001, the ONLY
+wired call site was `bufferedChatCompletions`, so the streaming agent-chat
+path and every llamacpp/ollama buffered/stream pair left the node with no
+verdict at all (aceteam #8253's "G6" gap) — `applyTrustEngine`'s no-op guard
+(nil result, non-success status, or no string `"content"` key) is what keeps
+a `model_warming`/failure result untouched while still covering every
+content-bearing success path uniformly. `internal/worker/llm_inference_test.go`'s
+`TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths` drives all ten
+functions through a fake engine and pins that the hook fires on every one.
 
 **Known false negative:** `extractClaims`' regex priority gives years
 (`ClaimYear`) precedence over bare counts, so a fabricated count that looks
@@ -1347,9 +1554,42 @@ mirroring `synthesizeReceiptFromHeaders` in
 transmit anything itself — signing is a separate, additional opt-in layered
 on top by the caller, described below.
 
+**`output["trust_verdict"]` (citadel #1001, aceteam #8253 S1/S6) rides
+alongside `grounding`, unsigned.** `trustVerdictMap`
+(`internal/worker/llm_inference.go`) is a thin adapter over
+`trust.BuildVerdict` (`internal/trust/verdict.go`), which owns the pure
+assembly: an aggregate `action` (`"pass"`/`"flag"`; never `"block"` on-node
+yet — that is S5's policy posture), an ordered `checks[]` list, and a
+`verdict_hash`. The adapter adds two receipt-level convenience digests the
+pure package deliberately does not own — `output_sha256` (binds the content)
+and the full legacy `grounding` block (kept verbatim inside for pre-#1001
+consumers).
+
+`checks[]` carries grounding FIRST, then the three pure detectors S6 ported
+from aceteam-aep into `internal/trust/detectors.go` — `secrets`, `pii`,
+`ferpa`, each a network-free/model-free `(input, output) -> []Finding` regex
+check registered via `trust.DefaultDetectors()`. Findings never appear in the
+verdict; only a per-check `evidence_hash` does (bare-hex, the same shape/
+encoding as `internal/aep`'s `flagged_hash`, so grounding's `evidence_hash`
+equals a signed receipt's `flagged_hash` for the same input). `verdict_hash`
+is `sha256:<hex>` over `BuildVerdict`'s DoR §3 canonical trust_verdict object
+(action + the uniform check fields + grounding minus its flagged list) — the
+mechanism the S6 acceptance mutation test pins (drop a detector from the
+injected set → it leaves `checks[]` AND `verdict_hash` changes). Both
+`output_sha256` and `verdict_hash` are UNSIGNED convenience digests; neither
+is part of anything cryptographically signed. S3 (`AEPReceiptV2`) is what
+makes `verdict_hash` a SIGNED canonical field and pins the byte-exact
+`canonical_json` the Python verifier recomputes — until then `BuildVerdict`
+uses `json.Marshal` (deterministic within Go), not aep's fixed float
+formatting.
+
+Excluded from S6 by the ratified DoR (`internal/trust` has no place for
+them): PAW/MoE, CostAnomaly (needs cost context), Content classification
+(needs a model).
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt to buffered chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
+| `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt AND the `trust_verdict` (grounding + secrets/PII/FERPA checks, `verdict_hash`) to chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
 
 ### Node identity persistence + signed AEP receipt (aceteam #8139/#8253, `internal/aep`)
 
@@ -2024,18 +2264,35 @@ doesn't wire `WorkerLiveness`/`PinnedServices`/`ModelHotswap`, a pre-existing
 gap this doesn't widen; low-priority follow-up alongside the other
 TUI-collector gaps noted under Service Preemption above.
 
-**"Whether a swap pulled" is still NOT reported (#717 part 2, deferred).**
-`SwapRecord` has no `pulled` field. For docker-based engines (vLLM, bonsai,
-llama.cpp) a weights pull, if any, happens opaquely inside the container's own
-startup during `docker compose up` — invisible to the Go code driving it — so
-observing it honestly needs new engine-specific instrumentation (e.g. sampling
-each engine's model-cache directory before/after `Start`), not just a return
-value threaded through `SwapController.Start`. Native ollama IS observable
-(`ensureOllamaModel` in `internal/jobs/service_handler.go` already knows whether
-a pull ran), but that alone would cover a minority of swap targets. Per #717's
-explicit instruction, a guessed field is worse than no field, so this stays
-open rather than half-implemented; a follow-up issue should scope the
-docker-side instrumentation before adding the field.
+**"Whether a swap pulled" is now reported, as a TRI-STATE (citadel #835, #717
+part 2 — fixed).** `SwapRecord.Pulled *bool`: `true` (weights fetched),
+`false` (resident-cache start), or `nil`/absent (unknown). The Go code driving
+`docker compose up` still cannot observe a docker-based engine's weights pull
+directly — it happens opaquely inside the container's own startup — so
+`worker.SwapManager.runSwap` (`internal/worker/swap.go`) derives the signal
+indirectly instead: it samples the engine's canonical cache directory
+(`services.EngineCacheDirs`, via the new `status.EngineCacheDirSize`)
+immediately before issuing `Start` and again once the engine reports ready —
+grew ⇒ `true`, unchanged ⇒ `false`. An engine absent from
+`services.EngineCacheDirs` (a future `ServiceMap` entry not yet added there)
+resolves to `nil`, NEVER a guessed `false` — the exact #717 rule ("a guessed
+field is worse than no field") this field exists to honor, now enforced by
+`TestSwap_Pulled_NilWhenEngineUnmapped`. A swap that never reaches `ready`
+(a `warming`/`blocked`/`failed`/`rate_limited` outcome) also leaves `Pulled`
+nil — the pull, if any, may still be mid-flight when the outcome is recorded
+(`TestSwap_Pulled_NilWhenSwapNeverReachesReady`).
+
+Native ollama deliberately does NOT get a separate, more-precise signal
+plumbed from `ensureOllamaModel` (`internal/jobs/service_handler.go`, which
+already knows whether its own `ollama pull` fetched anything) — that would
+mean widening `SwapController.Start`'s signature for one engine family, judged
+disproportionate. Ollama gets the SAME dir-sampling fallback as every docker
+engine, and it is exact there (not approximate): `ensureOllamaModel` runs
+synchronously inside `Start`, so by the time `Ready` reports true the pull (if
+any) has already completed and the sampled "after" size already reflects it.
+Mirrored onto the heartbeat via `status.SwapRecord.Pulled` (same tri-state,
+`swapStatsFrom` in `cmd/work.go`); `TestSwapShapeParity` is what would have
+caught a field added to one side and not the other.
 
 ### Consume-Loop Watchdog, Self-Heal & Liveness (citadel #548)
 
@@ -2256,7 +2513,18 @@ out-of-scope follow-up work, not part of this fix.
 The general/unbounded case — every OTHER job type (`SERVICE_START`, model
 pulls, `MODULE_SET`, ...) still blocking the fetch loop inline on a
 maxConcurrency=1 node — is a separate, deliberately out-of-scope Stage 2
-design issue (decoupling job receipt from execution generally).
+design issue (decoupling job receipt from execution generally). **Stage 2
+landed as citadel-cli#908's serialized unbounded lane (see "Node execution
+model" below) — this paragraph describes the PRE-#908 state and is kept for
+history; `needsSerializedLane`'s superset (`unboundedJobTypes` plus the
+manifest/lockfile writers) now dispatches onto that lane, never inline, on
+every node regardless of `maxConcurrency`.** The remaining inline-blocking
+case today is narrower: an ordinary job type that is none of long-session,
+serialized-lane, or GPU-bound-with-a-tracker (shell, file, config, or
+GPU-bound work on a tracker-less node) still runs inline at
+`maxConcurrency<=1`, or synchronously blocks the fetch loop's semaphore
+acquire once a `maxConcurrency>1` pool is full — see citadel-cli#999's
+`ResolveConsumerDeadAfter`, which is sized against exactly this ceiling.
 
 This matters because `cmd/work.go` defaults `maxConcurrency` to 1 on a
 GPU-less node — meeting nodes are typically GPU-less — and before #489 a
@@ -2717,21 +2985,45 @@ exactly the scenario #454 reported. `resolveManagedServiceRestartTarget`
 install.sh/packer fleet unit, `citadel-worker.service` — how citadel actually
 ships on most nodes) with the cross-platform `service.Manager.Status()` (the
 only signal on macOS/Windows, and for a `citadel service install`-managed
-Linux node).
+Linux node). **This means macOS/Windows detection is already covered, not a
+gap**: `service.Manager.Status()` (`launchd.go`/`windows.go`) is implemented
+on every platform, so a managed launchd/SCM service still gets the warn-vs-
+restart gate even though `ActiveManagedUnit` itself only ever fires on Linux
+(citadel#887 verified this rather than assuming it — read the code before
+concluding the macOS/Windows half of that issue is still open).
 
 `citadel update install` now warns loudly by default when a managed service is
-detected, and restarts it only with an explicit `--restart` flag. That restart
-is a blunt `systemctl restart` / `Stop()+Start()` with **no drain** — unlike
-the two automatic paths, it can drop in-flight jobs. This is an accepted
-tradeoff for an interactive, explicitly-opted-in flag: the CLI process has no
-way to observe the *other* (worker) process's in-flight job count, which is
-exactly why draining is owned by the paths that run inside that process.
+detected, and restarts it only with an explicit `--restart` flag.
+
+**The restart is preceded by a bounded, best-effort drain (citadel#887), not
+the unconditional immediate `systemctl restart` / `Stop()+Start()` this
+section used to describe.** `drainManagedServiceBeforeRestart` (`cmd/update.go`)
+polls `GET /worker` (`internal/status/server.go`'s `handleWorker`, added by
+citadel#735 for an unrelated reason — reading the running worker's
+`WorkerLiveness.InFlight` from an in-memory snapshot without a full `/status`
+collection) until in-flight drops to zero or `managedServiceDrainTimeout`
+(30s) elapses, then restarts regardless. The stale claim this replaced — "the
+CLI process has no way to observe the other process's in-flight job count" —
+was wrong the moment #735 shipped `/worker`; #887 is what actually wired that
+observation in here. This is still not the AGENT_UPDATE/auto-updater paths'
+hard drain: it never stops new jobs from being *picked up* while waiting, and
+it restarts anyway once the timeout elapses (an operator who passed
+`--restart` wants the new binary running, not an indefinite hang). A GET
+`/worker` that cannot be read at all — no status listener
+(`--status-port 0`), an older worker predating the route (404), or any other
+probe failure — is treated as "could not determine", never as "zero
+in-flight": the wait is skipped entirely and the restart proceeds
+immediately, i.e. the exact pre-#887 behavior, not a new failure mode.
+
 Known, accepted gaps: `ActiveManagedUnit` returns only the first active unit
 found, so a host running both a fleet unit and a `citadel service install`
 unit gets one warned/restarted and the other left stale (a narrower version of
-the same split-brain); and detection does not verify the swapped binary is the
+the same split-brain); detection does not verify the swapped binary is the
 one the unit's `ExecStart=` actually runs (a dev binary at a different path
-would produce a spurious warning).
+would produce a spurious warning); and the drain above only observes *this*
+node's own worker over loopback — there is still no cross-process signal for
+whether the jobs it is waiting on are individually safe to interrupt, only a
+count.
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:

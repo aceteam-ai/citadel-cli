@@ -665,6 +665,24 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			Debug("skipping reservation reconcile: this process does not hold the single-instance worker lock")
 		}
+
+		// Default-serve reconcile (citadel-cli#628, appliance-mode opt-in):
+		// on a truly blank GPU node with default-serve opted in, auto-serve a
+		// VRAM-sized model exactly once, ever. See cmd/default_serve.go for
+		// the full gate (opt-in precedence, GPU present, blank node,
+		// once-ever marker) and safety contract (never pins, never
+		// preempts, fails open -- marks-and-moves-on -- on error). Gated on
+		// workerLockHeld for the same single-live-worker reason the
+		// reservation reconcile above is: this can mutate citadel.yaml and
+		// start a container, so a second concurrent process racing it could
+		// double-start a service or race the completion marker write.
+		// Deliberately NOT run from `citadel init` -- see default_serve.go's
+		// package doc for why this belongs at `citadel work` startup.
+		if workerLockHeld {
+			runDefaultServeReconcile(workManifest, network.GetNodeConfigDir(), realDefaultServeDeps(reservationHandler))
+		} else {
+			Debug("skipping default-serve reconcile: this process does not hold the single-instance worker lock")
+		}
 	}
 
 	// Pairing-display manager (citadel #659 P0): render a platform-pushed
@@ -1883,17 +1901,28 @@ func runWork(cmd *cobra.Command, args []string) {
 			if orgID == "" {
 				fmt.Fprintln(os.Stderr, "   - ⚠️ API status publisher requires org-id (run 'citadel init' first)")
 			} else {
+				// Shared bridge-endpoints provider (citadel#624 Phase A): the SAME
+				// instance is wired into BOTH node-state reporters below so they
+				// report byte-identical bridge facts rather than two
+				// independently-computed snapshots that could disagree (the
+				// "two-reporter flap" the citadel#624 design review called out as
+				// must-resolve).
+				bridgeEndpoints := newWhatsAppBridgeModuleProvider()
+
 				// Periodically report ActualState (installed modules + health)
 				// to the control plane (#353, report-only v1). Headless `citadel
 				// work` is the production node entrypoint, so it must report too
 				// — not just the TUI. Same device-authed client and opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname.
+				// as activity telemetry; node_id is the Headscale hostname. The
+				// bridge row is exempt from that opt-out gate — see
+				// nodestate.Emitter.reportOnce's doc comment.
 				if emitter := nodestate.New(nodestate.Config{
-					Poster:    apiSource.Client(),
-					Inspector: nodestate.DockerInspector(),
-					ConfigDir: platform.ConfigDir(),
-					NodeID:    nodeName,
-					Version:   Version,
+					Poster:          apiSource.Client(),
+					Inspector:       nodestate.DockerInspector(),
+					BridgeEndpoints: bridgeEndpoints,
+					ConfigDir:       platform.ConfigDir(),
+					NodeID:          nodeName,
+					Version:         Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
 					fmt.Printf("   - Node-state reporting: every %s\n", nodestate.DefaultInterval)
@@ -1915,7 +1944,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				// report path is symmetric: the node-state worker re-resolves the
 				// reported id via `get_node_info`, which accepts the numeric ID, so
 				// reporting the numeric ID keys `node_module_state` correctly too.
-				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID); loop != nil {
+				if loop := newReconcileLoop(apiSource.Client(), headscaleNodeID, bridgeEndpoints); loop != nil {
 					// Publish the loop's HealthTracker for the heartbeat
 					// (citadel-cli#742) BEFORE Run starts, so the very first pass's
 					// outcome is already visible to reconcileHealthFn.
@@ -3257,6 +3286,7 @@ func swapStatsFrom(stats worker.SwapStats) *status.SwapActivity {
 				StartedAt: r.StartedAt,
 				Wait:      r.Wait,
 				Outcome:   r.Outcome,
+				Pulled:    r.Pulled,
 			}
 		}
 	}

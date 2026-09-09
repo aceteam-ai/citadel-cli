@@ -297,20 +297,32 @@ func resolveConfig(configVars []ConfigVar, overrides, existing map[string]string
 			continue
 		}
 
-		// A generated var mints its own value rather than failing or prompting --
-		// but only after reusing what a previous install already persisted, so the
-		// credential a running container holds is never rotated underneath it.
-		if cv.Generate != "" {
+		// A generated OR carry var reuses whatever a previous install persisted, so
+		// the credential a running container holds is never rotated underneath it
+		// (citadel#624 sub-collision 2). This reuse is what makes carry survive the
+		// update-in-place delete-then-reinstall AND the FIRST module install on a
+		// node whose bespoke stack already wrote the .env (the migration path,
+		// where CarryGeneratedConfig never ran because the service was not yet in
+		// the manifest). The difference between the two kinds is only what happens
+		// when nothing is persisted: a generate var mints a fresh value; a carry
+		// var (minted out of band, e.g. by the bridge admin API) cannot, so it is
+		// simply left unset.
+		if cv.Generate != "" || cv.Carry {
 			if v := existing[cv.Name]; v != "" {
 				values[cv.Name] = v
 				continue
 			}
-			v, err := generateConfigValue(cv.Generate)
-			if err != nil {
-				return nil, fmt.Errorf("config '%s': %w", cv.Name, err)
+			if cv.Generate != "" {
+				v, err := generateConfigValue(cv.Generate)
+				if err != nil {
+					return nil, fmt.Errorf("config '%s': %w", cv.Name, err)
+				}
+				values[cv.Name] = v
+				continue
 			}
-			values[cv.Name] = v
-			continue
+			// A carry var with nothing persisted cannot be minted here (it comes
+			// from out of band); fall through so a default/required/prompt still
+			// applies if the manifest declares one.
 		}
 
 		// Use default if available.
@@ -349,9 +361,9 @@ func resolveConfig(configVars []ConfigVar, overrides, existing map[string]string
 	return values, nil
 }
 
-// CarryGeneratedConfig returns assigned augmented with any `generate:` values
-// already persisted in the module's .env, for callers that TEAR DOWN a module
-// before re-installing it.
+// CarryGeneratedConfig returns assigned augmented with any `generate:` OR
+// `carry:` values already persisted in the module's .env, for callers that TEAR
+// DOWN a module before re-installing it.
 //
 // The fabric MODULE_SET update-in-place path uninstalls before it installs, and
 // uninstall deletes <name>.env -- so by the time InstallFromManifest reads the
@@ -359,6 +371,14 @@ func resolveConfig(configVars []ConfigVar, overrides, existing map[string]string
 // re-assignment. That is not merely churn: compose recreates only the containers
 // whose env changed (the broker), leaving the consumer running with the OLD
 // credential in memory until someone restarts it by hand.
+//
+// `carry:` vars (citadel#624 sub-collision 2) are the same delete-then-restore
+// concern for a credential the node CANNOT re-mint at all (it is minted out of
+// band -- e.g. the WhatsApp bridge's TENANT_* keys, issued by the bridge admin
+// API). Dropping one on update-in-place would rotate the platform-stored
+// credential to nothing, the 401 class #624 exists to kill; there is no
+// fallback like generate's mint, so carrying it forward is the only preservation
+// path.
 //
 // Call this BEFORE the teardown. Values the caller already supplies win, so an
 // operator can still rotate a credential by assigning one explicitly.
@@ -376,7 +396,7 @@ func CarryGeneratedConfig(manifest *ServiceManifest, servicesDir string, assigne
 		merged[k] = v
 	}
 	for _, cv := range manifest.Config {
-		if cv.Generate == "" {
+		if cv.Generate == "" && !cv.Carry {
 			continue
 		}
 		if _, ok := merged[cv.Name]; ok {

@@ -272,6 +272,61 @@ func TestKokoroComposeContract(t *testing.T) {
 // internal/apps/hostport_collision_test.go, which resolves the loopback
 // ${CITADEL_TTS_HOST_PORT} publish against the registry and cross-checks it.
 
+// TestOmniVoiceComposeRegistered ensures the omnivoice TTS service is in the
+// ServiceMap so `citadel run --service omnivoice`, the manifest, and
+// SERVICE_START can find it (citadel-cli#1007).
+func TestOmniVoiceComposeRegistered(t *testing.T) {
+	if _, ok := ServiceMap["omnivoice"]; !ok {
+		t.Fatal("omnivoice not found in ServiceMap")
+	}
+	found := false
+	for _, s := range GetAvailableServices() {
+		if s == "omnivoice" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("GetAvailableServices() does not include omnivoice")
+	}
+}
+
+// TestOmniVoiceComposeContract verifies the embedded omnivoice compose
+// satisfies its contract: it uses the citedel-inference-server `tts` image (no
+// build context to materialize, mirroring kokoro/unlimited-ocr's "should NOT
+// declare a build: section" assertion), defers its host publish to the
+// citadel-owned CITADEL_OMNIVOICE_HOST_PORT with the bare (no :?/:- guard)
+// token the loopback prefix requires, and binds loopback only (the service has
+// no auth of its own).
+func TestOmniVoiceComposeContract(t *testing.T) {
+	content, ok := ServiceMap["omnivoice"]
+	if !ok {
+		t.Fatal("omnivoice not found in ServiceMap")
+	}
+	if !strings.Contains(content, "ghcr.io/aceteam-ai/citadel-inference-server:tts") {
+		t.Errorf("omnivoice compose should use the citadel-inference-server tts image")
+	}
+	if strings.Contains(content, "build:") {
+		t.Errorf("omnivoice compose should NOT declare a build: section (it uses a prebuilt image)")
+	}
+	if !strings.Contains(content, "${CITADEL_OMNIVOICE_HOST_PORT}") {
+		t.Errorf("omnivoice compose must defer its host port to a bare ${CITADEL_OMNIVOICE_HOST_PORT} (no :?/:- guard, which breaks the loopback host-port parser)")
+	}
+	if !strings.Contains(content, "127.0.0.1:${CITADEL_OMNIVOICE_HOST_PORT}:8000") {
+		t.Errorf("omnivoice compose must bind loopback only (127.0.0.1); the service has no auth of its own")
+	}
+	// omnivoice must NOT need aux build-context files (it is image-based).
+	if _, ok := ServiceAuxFiles["omnivoice"]; ok {
+		t.Errorf("ServiceAuxFiles should not contain omnivoice; it uses a prebuilt image, not a build context")
+	}
+	// Jason's decision (citadel-cli#1007 §6.2): OmniVoice is a GPU-only engine,
+	// unlike kokoro -- fail loud on a CPU-only node rather than silently degrade
+	// to an unusably slow CPU diffusion loop.
+	if !strings.Contains(content, "driver: nvidia") {
+		t.Errorf("omnivoice compose must declare the GPU reservation block (driver: nvidia); OmniVoice is not real-time on CPU")
+	}
+}
+
 // composeHostPorts returns the host-side ports declared in a compose file's
 // `ports:` list entries ("HOST:CONTAINER"). Pure parse (no Docker) so the
 // host-port collision assertions run in ordinary CI.
@@ -295,6 +350,7 @@ func composeHostPorts(t *testing.T, composeYAML string) []int {
 		EnvDiffusersHostPort:  DiffusersHostPort,
 		EnvBonsaiHostPort:     BonsaiHostPort,
 		EnvTTSHostPort:        TTSHostPort,
+		EnvOmniVoiceHostPort:  OmniVoiceHostPort,
 	}
 	var hosts []int
 	for _, svc := range doc.Services {

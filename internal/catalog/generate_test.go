@@ -196,6 +196,107 @@ func TestCarryGeneratedConfigOnFirstInstall(t *testing.T) {
 	}
 }
 
+// TestModuleSetBridgeReassignCarriesAdminAndTenantKeys pins citadel#624
+// sub-collision 2 through the update-in-place teardown path: a MODULE_SET
+// reassignment of the bridge must preserve BOTH key classes across the
+// uninstall-then-install that deletes <name>.env -- the `generate:` ADMIN_API_KEY
+// AND the `carry:` TENANT_* keys (minted out of band by the bridge admin API, so
+// they cannot be re-minted; dropping one rotates the platform-stored credential
+// to nothing, the 401 class #624 exists to kill).
+func TestModuleSetBridgeReassignCarriesAdminAndTenantKeys(t *testing.T) {
+	dir := t.TempDir()
+	m := &ServiceManifest{
+		Name: "whatsapp-bridge",
+		Config: []ConfigVar{
+			{Name: "ADMIN_API_KEY", Required: true, Generate: GenerateSecret},
+			{Name: "TENANT_API_KEY", Carry: true},
+			{Name: "TENANT_ID", Carry: true},
+			{Name: "TENANT_NAME", Carry: true},
+			{Name: "BRIDGE_PORT"},
+		},
+	}
+	if err := writeEnvFile(filepath.Join(dir, "whatsapp-bridge.env"), map[string]string{
+		"ADMIN_API_KEY":  "wab_admin_persisted",
+		"TENANT_API_KEY": "wab_tenant_persisted",
+		"TENANT_ID":      "tenant-123",
+		"TENANT_NAME":    "acme",
+		"BRIDGE_PORT":    "8080",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reassignment carries no value for any of the sticky/carry keys.
+	assigned := map[string]string{}
+	got := CarryGeneratedConfig(m, dir, assigned)
+
+	for k, want := range map[string]string{
+		"ADMIN_API_KEY":  "wab_admin_persisted",
+		"TENANT_API_KEY": "wab_tenant_persisted",
+		"TENANT_ID":      "tenant-123",
+		"TENANT_NAME":    "acme",
+	} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want the persisted value carried across the teardown (%q)", k, got[k], want)
+		}
+	}
+	// A plain (non-generate, non-carry) var is NOT resurrected -- the assignment
+	// stays authoritative for those.
+	if _, revived := got["BRIDGE_PORT"]; revived {
+		t.Errorf("BRIDGE_PORT was resurrected from the old .env (%q); only generate/carry vars carry", got["BRIDGE_PORT"])
+	}
+}
+
+// TestCarryVarReusedOnNonTeardownInstallPath is advisor-point-2's regression: on
+// the FIRST module install over a node whose bespoke stack already wrote the
+// .env (the migration path), CarryGeneratedConfig never runs (the service is not
+// yet in the manifest), so resolveConfig itself must reuse a persisted `carry:`
+// value from `existing` -- exactly like a `generate:` var -- or the TENANT_* keys
+// are dropped from the freshly written .env while ADMIN_API_KEY (generate-sticky)
+// survives, silently reproducing the 401 drift on the transition.
+func TestCarryVarReusedOnNonTeardownInstallPath(t *testing.T) {
+	vars := []ConfigVar{
+		{Name: "ADMIN_API_KEY", Required: true, Generate: GenerateSecret},
+		{Name: "TENANT_API_KEY", Carry: true},
+	}
+	existing := map[string]string{
+		"ADMIN_API_KEY":  "wab_admin_persisted",
+		"TENANT_API_KEY": "wab_tenant_persisted",
+	}
+	got, err := resolveConfig(vars, nil, existing, false)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got["ADMIN_API_KEY"] != "wab_admin_persisted" {
+		t.Errorf("ADMIN_API_KEY = %q, want the persisted (generate-sticky) value", got["ADMIN_API_KEY"])
+	}
+	if got["TENANT_API_KEY"] != "wab_tenant_persisted" {
+		t.Errorf("TENANT_API_KEY = %q, want the persisted carry value reused directly by resolveConfig", got["TENANT_API_KEY"])
+	}
+}
+
+// A carry var with nothing persisted (and no override) is LEFT UNSET -- unlike a
+// generate var, the node cannot mint it. It must not become an empty-string
+// credential, and an explicit override still wins.
+func TestCarryVarNotMintedWhenAbsentButOverrideWins(t *testing.T) {
+	vars := []ConfigVar{{Name: "TENANT_API_KEY", Carry: true}}
+
+	got, err := resolveConfig(vars, nil, nil, false)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if _, ok := got["TENANT_API_KEY"]; ok {
+		t.Errorf("carry var was materialized to %q with nothing persisted; it must stay unset", got["TENANT_API_KEY"])
+	}
+
+	got2, err := resolveConfig(vars, map[string]string{"TENANT_API_KEY": "explicit"}, nil, false)
+	if err != nil {
+		t.Fatalf("resolveConfig: %v", err)
+	}
+	if got2["TENANT_API_KEY"] != "explicit" {
+		t.Errorf("TENANT_API_KEY = %q, want the explicit override to win", got2["TENANT_API_KEY"])
+	}
+}
+
 // readEnvFile must not choke on the shapes a real .env grows: comments, blanks,
 // and values that legitimately contain '=' (base64 padding, query strings).
 func TestReadEnvFileTolerance(t *testing.T) {

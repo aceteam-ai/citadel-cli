@@ -211,6 +211,58 @@ func TestServiceStartNativeOllama_PullFailureIsJobFailure(t *testing.T) {
 	}
 }
 
+// TestEnsureOllamaModel_DockerFallbackPullsViaExec pins the citadel-cli#628
+// docker-ollama fallback: when no host `ollama` binary is on PATH but the
+// embedded ollama container is running, the pull runs via
+// `docker exec citadel-ollama ollama pull <model>` instead of failing.
+func TestEnsureOllamaModel_DockerFallbackPullsViaExec(t *testing.T) {
+	_, write := fakeBinDir(t) // PATH has no "ollama" binary at all
+	argsFile := filepath.Join(t.TempDir(), "docker-args.log")
+	write("docker", `
+if [ "$1" = "inspect" ]; then
+  echo "running"
+  exit 0
+fi
+if [ "$1" = "exec" ]; then
+  echo "$@" >> `+argsFile+`
+  exit 0
+fi
+exit 1
+`)
+
+	if err := ensureOllamaModel(JobContext{}, "qwen2.5:7b", false); err != nil {
+		t.Fatalf("ensureOllamaModel: %v", err)
+	}
+	logged, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("fake docker exec was never invoked: %v", err)
+	}
+	if !strings.Contains(string(logged), "citadel-ollama ollama pull qwen2.5:7b") {
+		t.Errorf("fake docker invocations = %q, want a 'citadel-ollama ollama pull qwen2.5:7b' exec call", logged)
+	}
+}
+
+// TestEnsureOllamaModel_DockerFallbackRefusesWhenContainerNotRunning verifies
+// the fallback does not attempt a pull -- and still reports the same
+// "ollama binary not found" error class the pre-#628 hard-failure path used
+// -- when neither a host binary nor a running container is available.
+func TestEnsureOllamaModel_DockerFallbackRefusesWhenContainerNotRunning(t *testing.T) {
+	_, write := fakeBinDir(t)
+	write("docker", `
+if [ "$1" = "inspect" ]; then
+  echo "exited"
+  exit 0
+fi
+echo "should not reach exec" >&2
+exit 1
+`)
+
+	err := ensureOllamaModel(JobContext{}, "qwen2.5:7b", false)
+	if err == nil || !strings.Contains(err.Error(), "ollama binary not found") {
+		t.Errorf("err = %v, want ollama-binary-not-found error", err)
+	}
+}
+
 // TestServiceStartNativeNonOllama_ModelStillIgnored pins the unchanged
 // behavior for native engines with no pull mechanism: the model is logged as
 // ignored and the start succeeds without any pull attempt.

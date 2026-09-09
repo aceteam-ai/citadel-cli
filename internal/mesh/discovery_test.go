@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/engine"
 )
 
 func mkStatus(nodeName string, svcs ...struct {
@@ -31,6 +33,12 @@ func mkStatus(nodeName string, svcs ...struct {
 	return st
 }
 
+// TestEngineTypeFromName exercises modelsFromStatus's engine-name resolution
+// through the exact call site (engine.TypeFromName) it now uses, rather than
+// a package-local duplicate (citadel #685 slice 2 deleted this package's own
+// former copy of internal/status.EngineTypeFromName -- see
+// internal/engine/tables_test.go for the canonical coverage of
+// engine.TypeFromName itself).
 func TestEngineTypeFromName(t *testing.T) {
 	cases := map[string]string{
 		"vllm":             "vllm",
@@ -41,15 +49,13 @@ func TestEngineTypeFromName(t *testing.T) {
 		"llama.cpp":        "llamacpp",
 		"llama-cpp-server": "llamacpp",
 		"postgres":         "",
-		"OLLAMA-Big":       "ollama", // case-insensitive; ollama checked before llama
-		// citadel-cli#685 §1c: this duplicate of internal/status.EngineTypeFromName
-		// was missing sglang for the same reason the original was.
-		"sglang":         "sglang",
-		"citadel-sglang": "sglang",
+		"OLLAMA-Big":       "ollama", // case-insensitive
+		"sglang":           "sglang",
+		"citadel-sglang":   "sglang",
 	}
 	for in, want := range cases {
-		if got := EngineTypeFromName(in); got != want {
-			t.Errorf("EngineTypeFromName(%q) = %q, want %q", in, got, want)
+		if got := engine.TypeFromName(in); got != want {
+			t.Errorf("engine.TypeFromName(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

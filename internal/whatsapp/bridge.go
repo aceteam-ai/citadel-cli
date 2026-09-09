@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,14 @@ import (
 
 	"github.com/mdp/qrterminal/v3"
 )
+
+// ErrAdminUnauthorized is returned (wrapped) by admin-authed calls when the
+// bridge rejects the X-Admin-Key with 401/403. It is a DEFINITIVE auth failure
+// -- the key is wrong, not the network -- so a caller (admin-key rotation
+// verification, whatsapp/rotate.go) can tell it apart from a transport/timeout
+// error via errors.Is and refuse to retry it or to misreport a transport blip
+// as an auth failure.
+var ErrAdminUnauthorized = errors.New("bridge rejected the admin key (HTTP 401/403)")
 
 // ServiceName is the canonical catalog/service name for the bridge module.
 const ServiceName = "whatsapp-bridge"
@@ -232,6 +241,12 @@ func (c *Client) ListTenants(ctx context.Context) ([]map[string]any, error) {
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// A DEFINITIVE auth failure: wrap the sentinel so a caller can tell "the
+		// admin key is wrong" from "the bridge was unreachable" (%w keeps the
+		// HTTP detail in the message too).
+		return nil, fmt.Errorf("list tenants failed (HTTP %d): %s: %w", resp.StatusCode, strings.TrimSpace(string(data)), ErrAdminUnauthorized)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("list tenants failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}

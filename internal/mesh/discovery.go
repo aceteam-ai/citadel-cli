@@ -10,11 +10,19 @@
 // mesh peers and probe each peer's /status directly. This package aggregates
 // those payloads into a fabric-wide model -> (node, engine, port) view.
 //
-// This layer is deliberately standalone: it does NOT import internal/network (or
-// any heavy status deps). Callers inject a Dialer and a PeerLister, which makes
-// the aggregation logic pure and unit-testable without a live mesh. cmd wires
-// network.Dial and network.GetGlobalPeers into it; #575's chat REPL can reuse
-// the same Client/Inventory to add a remote/peer selection mode.
+// This layer is deliberately standalone: it does NOT import internal/network or
+// internal/status (and its heavy transitive deps -- desktop, resmon, terminal,
+// ...). Callers inject a Dialer and a PeerLister, which makes the aggregation
+// logic pure and unit-testable without a live mesh. cmd wires network.Dial and
+// network.GetGlobalPeers into it; #575's chat REPL can reuse the same
+// Client/Inventory to add a remote/peer selection mode.
+//
+// It DOES import internal/engine (citadel #685 slice 2) for engine-name
+// resolution (EngineTypeFromName below, now a thin wrapper over
+// engine.TypeFromName) -- that stays consistent with "standalone": internal/
+// engine is a leaf package with no internal/status/internal/network
+// dependency of its own, so importing it does not pull in the heavy deps
+// this package's standalone charter exists to avoid.
 package mesh
 
 import (
@@ -29,6 +37,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/engine"
 )
 
 // DefaultStatusPort is the port a citadel node serves its /status endpoint on
@@ -142,34 +152,6 @@ type nodeStatus struct {
 // discover() can be unit-tested with a mock fetcher (no HTTP, no mesh).
 type statusFetchFunc func(ctx context.Context, ip string) (*nodeStatus, error)
 
-// EngineTypeFromName maps a service name to a serving-engine type
-// ("vllm"/"ollama"/"llamacpp"/"bonsai"/"sglang"), or "" when not a known
-// engine. Order matters: "ollama" contains "llama" so it is checked before the
-// llama.cpp patterns. This replicates internal/status.EngineTypeFromName
-// locally to keep this layer standalone (the value is informational for the
-// model->engine view; all these engines expose the same /v1/chat/completions
-// routing path). Kept in sync with the internal/status copy by hand — see
-// citadel-cli#685 §1c, which found this duplicate missing sglang for the same
-// reason the internal/status original was.
-func EngineTypeFromName(name string) string {
-	n := strings.ToLower(name)
-	switch {
-	case strings.Contains(n, "vllm"):
-		return "vllm"
-	case strings.Contains(n, "ollama"):
-		return "ollama"
-	case strings.Contains(n, "bonsai"):
-		return "bonsai"
-	case strings.Contains(n, "unlimited-ocr"):
-		return "unlimited-ocr"
-	case strings.Contains(n, "llamacpp"), strings.Contains(n, "llama.cpp"), strings.Contains(n, "llama-cpp"):
-		return "llamacpp"
-	case strings.Contains(n, "sglang"):
-		return "sglang"
-	}
-	return ""
-}
-
 // modelsFromStatus extracts routable served models from a peer's /status
 // payload. A service is included only when it is running, exposes a host port,
 // and reports at least one model — the exact conditions under which chat can be
@@ -187,7 +169,7 @@ func modelsFromStatus(p Peer, st *nodeStatus) []ServedModel {
 			// No port -> cannot route; no models -> nothing to serve.
 			continue
 		}
-		engine := EngineTypeFromName(svc.Name)
+		engineType := engine.TypeFromName(svc.Name)
 		for _, m := range svc.Models {
 			m = strings.TrimSpace(m)
 			if m == "" {
@@ -198,7 +180,7 @@ func modelsFromStatus(p Peer, st *nodeStatus) []ServedModel {
 				NodeName: st.Node.Name,
 				Hostname: p.Hostname,
 				IP:       p.IP,
-				Engine:   engine,
+				Engine:   engineType,
 				Port:     svc.Port,
 			})
 		}

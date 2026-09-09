@@ -1,0 +1,93 @@
+# services/compose/omnivoice.yml
+#
+# Serves OmniVoice (k2-fsa/OmniVoice, Apache-2.0 code / CC-BY-NC checkpoint) --
+# a 0.6B zero-shot TTS diffusion-LM covering 600+ languages -- via the citadel
+# inference server (CIS), the generic config-driven runtime introduced by
+# citadel-cli#1007 (docs/design-generic-inference-server.md). This is the
+# FIRST CIS-backed embedded service: unlike kokoro.yml (its own bespoke
+# image), omnivoice selects its behavior purely through CIS_* env vars against
+# ONE shared image, so future TTS-family models onboard by adding an adapter in
+# aceteam-ai/citadel-inference-server, never a new citadel-cli compose file.
+#
+# It serves the SAME kokoro-byte-identical contract kokoro.yml does
+# (POST /v1/audio/speech, GET /health, GET /info, X-TTS-* receipt headers), so
+# internal/jobs/synthesize_speech.go routes to it via the `backend: "omnivoice"`
+# payload selector -- see SynthesizeSpeechHandler.BaseURLs. The generic engine
+# a node advertises for routing is still `tts`; this embedded service is named
+# for its implementation (omnivoice), the same key/tag split kokoro uses.
+#
+# Host port: the container serves :8000 (CIS's own PORT, overridden from the
+# base runtime's 8080 default -- see CIS_* below). citadel owns the host
+# publish via CITADEL_OMNIVOICE_HOST_PORT (services/ports.go, 8214, the next
+# free slot after unlimited-ocr's 8213). Unlike bonsai/unlimited-ocr's
+# `${VAR:?msg}` guard, the loopback `127.0.0.1:` prefix means this port spec no
+# longer starts with `${`, so a `:?`/`:-` suffix would smear across the
+# host-port test parser's colon split (see kokoro.yml); the bare
+# `${CITADEL_OMNIVOICE_HOST_PORT}` is deliberate. citadel ALWAYS injects the
+# var (services.HostPortEnv) at every `docker compose up` site, so it resolves;
+# do not add a default/guard back.
+#
+# Loopback-only publish (127.0.0.1), deliberately, like kokoro: the only
+# consumer is the co-located citadel worker dispatching synthesis on this same
+# node, and the service has no auth of its own, so it must not be reachable
+# off-host. The handler's health probe always dials 127.0.0.1, so this does not
+# affect probing.
+#
+# GPU reservation block INCLUDED (unlike kokoro, like diffusers/unlimited-ocr):
+# OmniVoice is a 32-step diffusion-LM -- CPU inference is possible but not
+# real-time, and a service that starts fine and then times out every request is
+# worse than one that fails `up` loudly on a GPU-less daemon (Jason's decision,
+# citadel-cli#1007 doc §6.2). A CPU-capable node that wants TTS should run
+# kokoro instead.
+#
+# Weights are self-provisioning: CIS_MODEL is pinned below and the adapter
+# downloads it into the shared ~/citadel-cache/huggingface mount on first
+# start, exactly like kokoro/diffusers/transcribe/extraction/unlimited-ocr
+# (see internal/jobs/model_cache_pull.go's selfProvisioningEngines).
+#
+# Because the `tts` image tag floats (it is rebuilt as the CIS repo's tts
+# family advances), a bare `docker compose up -d` alone cannot upgrade it once
+# the tag is cached locally -- the same #718 lesson the WhatsApp bridge
+# codified (see CLAUDE.md's "WhatsApp bridge deploys must pull"). Any
+# redeploy path for this service should `docker compose pull omnivoice` before
+# `up`, not rely on `up` alone to notice a new build behind the same tag.
+services:
+  omnivoice:
+    image: ghcr.io/aceteam-ai/citadel-inference-server:tts
+    container_name: citadel-omnivoice
+    ports:
+      - "127.0.0.1:${CITADEL_OMNIVOICE_HOST_PORT}:8000"
+    environment:
+      - PORT=8000
+      - CIS_TASK=tts
+      - CIS_ADAPTER=omnivoice
+      - CIS_MODEL=${OMNIVOICE_MODEL:-k2-fsa/OmniVoice}
+      - CIS_DEVICE=${OMNIVOICE_DEVICE:-cuda}
+      - CIS_DTYPE=${OMNIVOICE_DTYPE:-float16}
+      # Concurrent synthesis slots (advertised for fabric backpressure); requests
+      # beyond this queue rather than OOMing the node. Shared knob name with
+      # kokoro's compose so both TTS backends read the same override.
+      - CIS_SLOTS=${TTS_SLOTS:-2}
+      # Max characters per synthesized item; over-cap requests get a 413.
+      - CIS_MAX_INPUT_CHARS=${OMNIVOICE_MAX_INPUT_CHARS:-5000}
+      - CIS_DEFAULT_VOICE=${OMNIVOICE_DEFAULT_VOICE:-auto}
+      - CIS_DEFAULT_FORMAT=${OMNIVOICE_DEFAULT_FORMAT:-opus}
+      # Optional HuggingFace token for a gated checkpoint; empty is fine for
+      # OmniVoice's public CC-BY-NC checkpoint today.
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      # HuggingFace hub cache: k2-fsa/OmniVoice lands here as
+      # models--k2-fsa--OmniVoice, shared with every other HF-hub-layout engine
+      # (services/caches.go EngineCacheDirs["omnivoice"]).
+      - ~/citadel-cache/huggingface:/root/.cache/huggingface
+      # Content-addressed audio cache (node-local), the omnivoice counterpart to
+      # kokoro's own ~/citadel-cache/kokoro mount.
+      - ~/citadel-cache/omnivoice:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

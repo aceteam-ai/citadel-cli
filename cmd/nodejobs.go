@@ -149,6 +149,13 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
 			return whatsapp.Provision(ctx, req, whatsappProvisionDeps(defaultWhatsAppSource, ""))
 		},
+		// Admin-key rotation (citadel#624 part 3): the platform-triggerable half of
+		// the `citadel whatsapp rotate-key` CLI, honored when the payload sets
+		// rotate_admin_key: true. Same rotation primitive, wired with this node's
+		// real docker/network edges via the shared whatsappRotateDeps.
+		Rotate: func(ctx context.Context) (*whatsapp.RotateResult, error) {
+			return whatsapp.RotateAdminKey(ctx, whatsappRotateDeps(opts.HandlerLog))
+		},
 		Log: opts.HandlerLog,
 	}))
 

@@ -51,8 +51,11 @@ func TestReconcileDiff(t *testing.T) {
 		{
 			name:    "uninstall removed",
 			desired: ds(),
-			actual:  []InstalledModule{{Name: "foo", Source: "foo", Health: HealthRunning}},
-			want:    []string{"uninstall:foo"},
+			// STAMPED desired-state provenance: only a desired-state-managed entry
+			// is drift-uninstall-eligible (citadel#624 D1). See the dedicated
+			// TestReconcileDoesNotUninstallUnstampedModule for the protected case.
+			actual: []InstalledModule{{Name: "foo", Source: "foo", Health: HealthRunning, ManagedBy: ManagedByDesiredState}},
+			want:   []string{"uninstall:foo"},
 		},
 		{
 			name:    "update on source-ref change",
@@ -102,7 +105,8 @@ func TestReconcileDiff(t *testing.T) {
 			actual: []InstalledModule{
 				{Name: "drift", Source: "drift@v1", Health: HealthRunning},
 				{Name: "ok", Source: "ok", Health: HealthRunning},
-				{Name: "stale", Source: "stale", Health: HealthRunning},
+				// "stale" is stamped, so it is drift-uninstall-eligible (#624 D1).
+				{Name: "stale", Source: "stale", Health: HealthRunning, ManagedBy: ManagedByDesiredState},
 			},
 			want: []string{"uninstall:stale", "update:drift", "install:new"},
 		},
@@ -137,6 +141,47 @@ func TestReconcileDiff(t *testing.T) {
 				t.Fatalf("plan ordering mismatch:\n got: %v\nwant: %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestReconcileDoesNotUninstallUnstampedModule is the direct #4273 blast-radius
+// regression for citadel#624 D1 (provenance-scoped uninstall). A NON-empty
+// desired set containing ONLY one module must NOT uninstall an installed sibling
+// that carries no desired-state provenance stamp (an operator/catalog-installed
+// module, an embedded engine, or the bespoke WhatsApp bridge) -- only the STAMPED
+// module in the desired set is drift-uninstall-eligible. This fails (the sibling
+// is uninstalled) if the provenance gate in engine.go is removed.
+func TestReconcileDoesNotUninstallUnstampedModule(t *testing.T) {
+	desired := ds(ModuleAssignment{Name: "whatsapp-bridge", Source: "whatsapp-bridge", DesiredStatus: StatusRunning})
+	actual := []InstalledModule{
+		// The desired module, stamped + already converged.
+		{Name: "whatsapp-bridge", Source: "whatsapp-bridge", Health: HealthRunning, ManagedBy: ManagedByDesiredState},
+		// An UNSTAMPED sibling (operator-installed) NOT in the desired set.
+		{Name: "operator-mod", Source: "owner/operator-mod@v1", Health: HealthRunning},
+		// A stamped sibling NOT in the desired set MUST still be uninstalled (a
+		// genuinely desired-state-managed module the plane removed).
+		{Name: "old-managed", Source: "old-managed", Health: HealthRunning, ManagedBy: ManagedByDesiredState},
+	}
+
+	plan, err := Reconcile(context.Background(), desired, actual)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, s := range plan.Steps {
+		if s.Action == ActionUninstall && s.Name == "operator-mod" {
+			t.Fatalf("unstamped sibling %q must NOT be uninstalled (citadel#624 D1 blast-radius guard)", s.Name)
+		}
+	}
+	// Sanity: the stamped-but-undesired sibling IS still uninstalled, so the gate
+	// scopes rather than disables drift-uninstall.
+	sawOldManaged := false
+	for _, s := range plan.Steps {
+		if s.Action == ActionUninstall && s.Name == "old-managed" {
+			sawOldManaged = true
+		}
+	}
+	if !sawOldManaged {
+		t.Fatalf("stamped, undesired module %q must still be uninstalled; plan=%v", "old-managed", planActions(plan))
 	}
 }
 

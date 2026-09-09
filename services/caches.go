@@ -94,6 +94,7 @@ var EngineCacheDirs = map[string]EngineCache{
 	"transcribe":    {Dir: HFHubCacheDirName, Family: CacheFamilyHFHub},
 	"unlimited-ocr": {Dir: HFHubCacheDirName, Family: CacheFamilyHFHub},
 	"kokoro":        {Dir: HFHubCacheDirName, Family: CacheFamilyHFHub},
+	"omnivoice":     {Dir: HFHubCacheDirName, Family: CacheFamilyHFHub},
 
 	// GGUF engines: raw files, NOT the HF hub-cache layout. Each gets its own
 	// directory (see CacheFamilyGGUFDir's doc comment for why they are not

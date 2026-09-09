@@ -179,15 +179,7 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 		return false
 	}
 
-	newEntry := catalog.LockEntry{
-		Name:        resolved.Manifest.Name,
-		Source:      entry.Source,
-		Ref:         entry.Ref,
-		ResolvedRef: resolved.ResolvedRef,
-		Commit:      resolved.Commit,
-		Images:      catalog.BuildLockImages(resolved.Images),
-		Sandboxed:   res.Sandboxed,
-	}
+	newEntry := updatedLockEntry(entry, resolved.Manifest.Name, resolved.ResolvedRef, resolved.Commit, catalog.BuildLockImages(resolved.Images), res.Sandboxed)
 	if err := catalog.UpsertLockEntry(newEntry); err != nil {
 		fmt.Fprintf(os.Stderr, "  could not update lockfile for %s: %v\n", entry.Name, err)
 	}
@@ -210,6 +202,30 @@ func updateOne(entry catalog.LockEntry, src catalog.Source, servicesDir string) 
 
 	fmt.Printf("  %s\n", color.GreenString("updated"))
 	return true
+}
+
+// updatedLockEntry builds the post-update lock entry. It REFRESHES the resolved
+// ref/commit/images/sandbox from the newly-installed version but PRESERVES the
+// previous entry's provenance (ManagedBy) and health source
+// (HealthComposeService) -- citadel#624 FIX C. Rebuilding the entry from scratch
+// dropped ManagedBy, which silently un-managed a desired-state module so a later
+// reconcile no longer converged it (a leak, the safe direction, but wrong);
+// dropping HealthComposeService reset a compose-service-health module (the bridge)
+// back to the citadel-<name> default and reintroduced the perpetual-ActionStart
+// bug. Source/Ref are intentionally the prev's (the update is same-source, new
+// commit). Pure + unit-tested (TestUpdatedLockEntryPreservesProvenance).
+func updatedLockEntry(prev catalog.LockEntry, name, resolvedRef, commit string, images []catalog.LockImage, sandboxed bool) catalog.LockEntry {
+	return catalog.LockEntry{
+		Name:                 name,
+		Source:               prev.Source,
+		Ref:                  prev.Ref,
+		ResolvedRef:          resolvedRef,
+		Commit:               commit,
+		Images:               images,
+		Sandboxed:            sandboxed,
+		ManagedBy:            prev.ManagedBy,
+		HealthComposeService: prev.HealthComposeService,
+	}
 }
 
 // rollback restores a module to its previously-locked commit and re-installs +

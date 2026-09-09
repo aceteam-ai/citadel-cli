@@ -28,6 +28,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -305,26 +307,39 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 		h.requestRecorder(payload.Backend)
 	}
 
+	// Single consolidated post-completion hook (citadel #1001, aceteam #8253
+	// S1): every backend branch below funnels through THIS one result
+	// variable before Execute returns, so applyTrustEngine runs exactly ONCE
+	// per job regardless of which of the ten buffered/streaming engine
+	// functions actually produced result.Output["content"] -- closing G6
+	// (before this, only bufferedChatCompletions attached a verdict, so the
+	// streaming agent-chat path and every llamacpp/ollama pair left the node
+	// with no verdict at all). See applyTrustEngine's doc comment for the
+	// exact no-op conditions (a failure/model_warming/model_unavailable
+	// result, or the guardrail simply being off, leave Output untouched).
+	var result *JobResult
 	switch payload.Backend {
 	case "vllm":
-		return h.executeVLLM(ctx, stream, payload, job.ID)
+		result, err = h.executeVLLM(ctx, stream, payload, job.ID)
 	case "sglang":
-		return h.executeSGLang(ctx, stream, payload)
+		result, err = h.executeSGLang(ctx, stream, payload)
 	case "ollama":
-		return h.executeOllama(ctx, stream, payload)
+		result, err = h.executeOllama(ctx, stream, payload)
 	case "llamacpp":
-		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("llamacpp"), job.ID)
+		result, err = h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("llamacpp"), job.ID)
 	case "bonsai":
 		// Bonsai serves the identical llama.cpp-server API on its own host port
 		// (PrismML fork). Reuse the llama.cpp request/stream path pointed at it.
-		return h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("bonsai"), job.ID)
+		result, err = h.executeLlamaCppAt(ctx, stream, payload, h.baseURL("bonsai"), job.ID)
 	case "unlimited-ocr":
 		// Baidu Unlimited-OCR is a vLLM OpenAI engine on its own host port; use the
 		// chat-completions path so multimodal image_url content (#625) reaches it.
-		return h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("unlimited-ocr"), job.ID)
+		result, err = h.executeChatCompletionsAt(ctx, stream, payload, h.baseURL("unlimited-ocr"), job.ID)
 	default:
 		return h.failure(fmt.Errorf("unsupported backend: %s", payload.Backend)), nil
 	}
+	h.applyTrustEngine(payload, job.ID, result)
+	return result, err
 }
 
 // parseLLMInferencePayload decodes the job payload into the shared payload
@@ -1076,34 +1091,22 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	if payload.Stream {
 		return h.streamChatCompletions(stream, resp.Body)
 	}
-	return h.bufferedChatCompletions(stream, resp.Body, payload, jobID)
+	return h.bufferedChatCompletions(stream, resp.Body)
 }
 
 // bufferedChatCompletions parses a buffered OpenAI chat-completions response and
 // emits the assistant's message content as a single chunk.
 //
-// This is the wired integration point for the on-node grounding guardrail
-// (internal/trust, citadel #8253 guardrail half): it is the one call site
-// where the full request input and the full model output both already exist
-// as Go strings before the result leaves the node, non-streaming so there is
-// no possibility of gating a response already sent. The other chat/completions
-// paths in this file (streamChatCompletions and the llamacpp/ollama
-// buffered/stream pairs) are documented, not-yet-wired hook points — same
-// shape, not done here to keep this change to ONE clear integration point per
-// #8253's scope.
-//
-// The guardrail is opt-in (see groundingGuardrailEnabled): `llm_inference`
-// serves general chat, code generation, and vision/OCR traffic through this
-// SAME function, not just grounded-extraction tasks, and "a number in the
-// output not present in the input" is the NORMAL case for those (a code
-// answer citing "port 8080", a model doing arithmetic, a fact recalled from
-// training data). Attaching the receipt unconditionally would flag most of
-// that traffic, so it stays off until a caller opts in, matching this repo's
-// default-OFF convention for advisory signals (CITADEL_ENERGY_SAMPLING,
-// SERVICE_AUTO_STOP_WHEN_IDLE). Disabled, the output map is byte-identical to
-// before this change — no new key, nothing for a downstream consumer to
-// notice.
-func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader, payload *jobs.LLMInferencePayload, jobID string) (*JobResult, error) {
+// Before citadel #1001 (aceteam #8253 S1) this was the ONE wired integration
+// point for the on-node grounding guardrail/signed-receipt hook: it was the
+// only place where the full request input and the full model output both
+// already existed as Go strings before the result left the node. That hook
+// now lives at Execute's single dispatch point instead (applyTrustEngine),
+// so every buffered AND streaming engine path gets it uniformly -- this
+// function only parses the response and shapes "content"/"finish_reason"/
+// "usage"/"tool_calls" now, same as every other buffered-response parser in
+// this file.
+func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body io.Reader) (*JobResult, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return h.failure(err), nil
@@ -1128,43 +1131,6 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 	if len(toolCalls) > 0 {
 		output["tool_calls"] = toolCalls
 	}
-	if groundingGuardrailEnabled() {
-		result := trust.CheckGrounding(promptTextFromPayload(payload), content)
-		output["grounding"] = groundingReceiptMap(result)
-
-		// Signed AEP receipt (aceteam #8253, the signing half deferred at
-		// citadel#847's merge -- see internal/aep's package doc and
-		// docs/design-node-identity-receipts.md §3). Nested INSIDE the
-		// grounding-guardrail gate deliberately: the receipt signs THIS
-		// GroundingResult, so signing it when the guardrail itself is off
-		// would mean signing a check that was never surfaced anywhere else.
-		// A second, independent opt-in (signAEPReceiptsEnabled) gates
-		// signing on top of that -- default OFF, so a
-		// guardrail-on-but-signing-off node's output is unchanged from
-		// before this feature existed (only "grounding" attaches, exactly
-		// as citadel#847 shipped it).
-		if signAEPReceiptsEnabled() {
-			receipt, err := h.buildAEPReceipt(jobID, payload, result)
-			if err != nil {
-				// Fail open: signing must never break inference. Mirrors
-				// internal/nodeidentity's own fail-open convention for its
-				// other consumer (the mTLS CSR/leaf flow, cmd/init.go's
-				// ensureNodeIdentity) -- a node whose key is unavailable
-				// simply serves without a signed receipt.
-				h.aepLogf("[aep] failed to build signed receipt for job %s (non-fatal): %v", jobID, err)
-			} else if receiptMap, err := receipt.ToMap(); err != nil {
-				// Attaching *aep.AEPReceiptV1 directly would be the only typed
-				// Go pointer in this map -- see ToMap's doc comment for why
-				// that's unsafe across this map's eventual wire
-				// serialization. This branch should be unreachable (the
-				// struct is always JSON-marshalable) but is handled the same
-				// fail-open way regardless.
-				h.aepLogf("[aep] failed to shape signed receipt for job %s (non-fatal): %v", jobID, err)
-			} else {
-				output["aep_receipt"] = receiptMap
-			}
-		}
-	}
 	return h.success(output), nil
 }
 
@@ -1181,6 +1147,128 @@ func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInf
 		return nil, err
 	}
 	return aep.BuildSignedReceipt(h.signer, nodeID, jobID, payload.Backend, payload.Model, result, time.Now())
+}
+
+// applyTrustEngine is the single, consolidated post-completion Trust Engine
+// hook (citadel #1001, aceteam #8253 S1). Execute calls it exactly ONCE,
+// after its backend switch has produced a result from whichever of the ten
+// buffered/streaming engine functions actually served the request (vLLM/
+// SGLang text-completions, ollama /api/generate, ollama /api/chat, llama.cpp/
+// bonsai /completion, and the shared OpenAI-compatible /v1/chat/completions
+// path -- each buffered AND streaming) -- rather than duplicating this call
+// inside each of those ten functions. Every one of them already sets
+// result.Output["content"] before returning, so hooking here closes #8253's
+// G6 gap (before this, only bufferedChatCompletions attached anything, so
+// the streaming agent-chat path and every llamacpp/ollama pair left the node
+// with no verdict at all) with one call site instead of ten.
+//
+// A no-op (result.Output left byte-identical) whenever:
+//   - result is nil, or result.Status != JobStatusSuccess, or result.Output
+//     is nil -- a failure/model_unavailable result carries no content worth
+//     checking, and mutating an error result's Output here would be an
+//     unrelated side effect on a code path this hook has no business
+//     touching.
+//   - result.Output has no "content" key as a string -- a model_warming
+//     success result carries status/model/eta_seconds instead of content,
+//     and there is nothing to check yet (the actual reply has not been
+//     produced).
+//   - CITADEL_GROUNDING_GUARDRAIL is off (the default) -- matching this
+//     repo's advisory-signal opt-in convention exactly as before this
+//     change; a disabled node's Output is unchanged from before #1001.
+//
+// Deliberately a POST-completion hook, never a gate: by the time this runs,
+// a streamed reply is already fully on the wire (tokens went out via
+// stream.WriteChunk before Execute ever sees the final Output), so this can
+// only flag, never withhold, for v1 -- see the (preserved) rationale on
+// groundingGuardrailEnabled/bufferedChatCompletions' old doc comment. v1
+// receipt shape only (AEPReceiptV1, unchanged): #8253 S3 is what upgrades the
+// signed wire shape (input/output/policy digests); not done here.
+func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload, jobID string, result *JobResult) {
+	if result == nil || result.Status != JobStatusSuccess || result.Output == nil {
+		return
+	}
+	content, ok := result.Output["content"].(string)
+	if !ok {
+		return
+	}
+	if !groundingGuardrailEnabled() {
+		return
+	}
+	input := promptTextFromPayload(payload)
+	grounding := trust.CheckGrounding(input, content)
+	result.Output["grounding"] = groundingReceiptMap(grounding)
+	result.Output["trust_verdict"] = trustVerdictMap(grounding, content, input)
+
+	// Signed AEP receipt (aceteam #8253, the signing half deferred at
+	// citadel#847's merge -- see internal/aep's package doc and
+	// docs/design-node-identity-receipts.md §3). Nested INSIDE the
+	// grounding-guardrail gate deliberately: the receipt signs THIS
+	// GroundingResult, so signing it when the guardrail itself is off would
+	// mean signing a check that was never surfaced anywhere else. A second,
+	// independent opt-in (signAEPReceiptsEnabled) gates signing on top of
+	// that -- default OFF, so a guardrail-on-but-signing-off node's output
+	// carries "grounding"/"trust_verdict" but no "aep_receipt", exactly as
+	// citadel#847 shipped it (pre-#1001, for the one path it covered).
+	if !signAEPReceiptsEnabled() {
+		return
+	}
+	receipt, err := h.buildAEPReceipt(jobID, payload, grounding)
+	if err != nil {
+		// Fail open: signing must never break inference. Mirrors
+		// internal/nodeidentity's own fail-open convention for its other
+		// consumer (the mTLS CSR/leaf flow, cmd/init.go's ensureNodeIdentity)
+		// -- a node whose key is unavailable simply serves without a signed
+		// receipt.
+		h.aepLogf("[aep] failed to build signed receipt for job %s (non-fatal): %v", jobID, err)
+		return
+	}
+	receiptMap, err := receipt.ToMap()
+	if err != nil {
+		// Attaching *aep.AEPReceiptV1 directly would be the only typed Go
+		// pointer in this map -- see ToMap's doc comment for why that's
+		// unsafe across this map's eventual wire serialization. This branch
+		// should be unreachable (the struct is always JSON-marshalable) but
+		// is handled the same fail-open way regardless.
+		h.aepLogf("[aep] failed to shape signed receipt for job %s (non-fatal): %v", jobID, err)
+		return
+	}
+	result.Output["aep_receipt"] = receiptMap
+}
+
+// trustVerdictMap shapes the unsigned, human-readable "trust_verdict" map
+// (aceteam #8253's Trust Engine naming; distinct from the legacy "grounding"
+// map, which is kept verbatim alongside it for continuity with pre-#1001
+// consumers). The whole verdict -- the aggregate `action`, the ordered
+// `checks[]`, and `verdict_hash` -- is assembled by trust.BuildVerdict, which
+// runs grounding plus the pure secrets/PII/FERPA detectors (#8253 S6); this
+// function is a thin adapter that adds the two receipt-level convenience
+// digests the pure package deliberately does not own (output_sha256, and the
+// full "grounding" block including its flagged list).
+//
+// output_sha256 and verdict_hash are BOTH unsigned convenience digests
+// (sha256:<hex>): the former binds the exact content, the latter the verdict
+// object (trust.BuildVerdict, DoR §3, excluding grounding.flagged). Neither
+// is a substitute for #8253 S3's SIGNED AEPReceiptV2 digests -- S3 is what
+// makes verdict_hash a signed canonical field and pins the byte-exact
+// canonical_json the Python verifier recomputes; here it is only a fixity
+// hash, never part of anything cryptographically signed.
+func trustVerdictMap(result trust.GroundingResult, content, input string) map[string]any {
+	v := trust.BuildVerdict(input, content, result, trust.DefaultDetectors())
+	return map[string]any{
+		"action":        v.Action,
+		"output_sha256": sha256Hex(content),
+		"verdict_hash":  v.VerdictHash,
+		"checks":        v.CheckMaps(),
+		"grounding":     groundingReceiptMap(result),
+	}
+}
+
+// sha256Hex returns the "sha256:<hex>" digest of s, matching the digest
+// format aceteam's provenance_receipts.py already uses (see #8253's delta
+// DoR, G9) so a future cross-repo comparison needs no reformatting.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // streamChatCompletions translates an OpenAI chat-completions SSE stream into
@@ -1532,17 +1620,19 @@ func (h *LLMInferenceHandler) success(output map[string]any) *JobResult {
 
 // promptTextFromPayload builds the plain-text "input" side of a grounding
 // check from an inference payload: Messages when present, else Prompt.
-// Messages-first matches what this handler's ONLY caller of this function
-// (bufferedChatCompletions, reached exclusively through
-// executeChatCompletionsAt) actually sent to the engine — every dispatch
-// site that routes there does so specifically because `len(payload.Messages)
-// > 0` (see Execute/executeVLLM/executeLlamaCppAt), and
-// executeChatCompletionsAt builds its outbound request body from Messages
-// alone, never Prompt. A payload that happened to carry a stray Prompt
+// Messages-first matches what every dispatch site that populates Messages
+// actually sent to the engine (see Execute/executeVLLM/executeOllama/
+// executeLlamaCppAt/executeChatCompletionsAt, all of which route on
+// `len(payload.Messages) > 0`): whichever backend function served the
+// request built its outbound body from Messages alone once that branch was
+// taken, never Prompt. A payload that happened to carry a stray Prompt
 // alongside Messages must not have the guardrail compare the output against
-// text the model never saw. ChatMessage.Text() already strips multimodal
-// content parts down to their text; messages are joined in order so the
-// guardrail sees the full conversation context, not just the latest turn.
+// text the model never saw. Called from applyTrustEngine (citadel #1001),
+// Execute's single consolidated post-completion hook, so this now runs for
+// every backend/engine path, not just the OpenAI-chat-completions one.
+// ChatMessage.Text() already strips multimodal content parts down to their
+// text; messages are joined in order so the guardrail sees the full
+// conversation context, not just the latest turn.
 func promptTextFromPayload(payload *jobs.LLMInferencePayload) string {
 	if payload == nil {
 		return ""

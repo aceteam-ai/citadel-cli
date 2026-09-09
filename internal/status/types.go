@@ -340,14 +340,11 @@ type SwapActivity struct {
 
 // SwapRecord is one swap this node attempted, mirroring worker.SwapRecord.
 //
-// Deliberately absent: "whether a pull was required" (citadel-cli#717, part
-// 2). The swap manager issues a SERVICE_START and, for docker-based engines,
-// any weights pull happens opaquely inside the container's own startup —
-// invisible to the Go code driving `docker compose up`. Reporting it honestly
-// needs the start path itself to observe and report a pull, which is
-// straightforward for the native ollama path but not for the docker path
-// without new engine-specific instrumentation; a guessed field here is worse
-// than an absent one, so it stays out until that instrumentation exists.
+// Pulled (citadel-cli#835, #717 part 2) mirrors worker.SwapRecord.Pulled's
+// tri-state exactly: true (weights fetched), false (resident-cache start), or
+// nil/absent (unknown — the engine has no services.EngineCacheDirs mapping).
+// See that type's doc comment for the full derivation; this mirror exists
+// only because internal/status cannot import internal/worker.
 type SwapRecord struct {
 	// Backend is the engine swapped in.
 	Backend string `json:"backend"`
@@ -363,6 +360,9 @@ type SwapRecord struct {
 	// Outcome is one of the swap outcome values: "ready", "warming", "failed",
 	// "blocked", "rate_limited".
 	Outcome string `json:"outcome"`
+	// Pulled is the tri-state weights-pull signal. Omitted from JSON when nil
+	// (unknown), never coerced to false.
+	Pulled *bool `json:"pulled,omitempty"`
 }
 
 // ReconcileHealth is the heartbeat-facing mirror of reconcile.HealthState
@@ -543,6 +543,17 @@ type ServiceInfo struct {
 	Port   int      `json:"port,omitempty"`
 	Health string   `json:"health,omitempty"` // "healthy", "unhealthy", "unknown"
 	Models []string `json:"models,omitempty"` // For LLM services
+
+	// ModelLicense is the license the serving engine's own /info endpoint
+	// reported for the model it is currently serving (citadel-cli#1007 --
+	// OmniVoice's checkpoint is CC-BY-NC, unlike kokoro's Apache-2.0
+	// Kokoro-82M, so this is worth surfacing rather than assuming every TTS
+	// backend is uniformly safe to use commercially). Additive and omitempty:
+	// absent when no engine has reported one this process, which is the
+	// pre-#1007 heartbeat shape byte-for-byte. Populated via
+	// RecordModelLicense/ModelLicenseFor (model_license.go), a process-local,
+	// unpersisted log mirroring request_recorder.go's requestLog.
+	ModelLicense string `json:"model_license,omitempty"`
 
 	// Idle usage signal for running LLM services. Populated only when the
 	// service is a running inference engine whose metrics endpoint could be

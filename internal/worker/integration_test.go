@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -338,5 +339,104 @@ func TestRunnerDLQEnqueuedAt(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("DLQ entry for %s not found", jobID)
+	}
+}
+
+// TestRedisSourceRedeliversNackedMessageAfterStaleIdle pins the issue #871
+// fix.
+//
+// XREADGROUP's ">" ID never returns an already-delivered message again --
+// not to a different consumer, and not even back to the SAME consumer that
+// originally read it. Before this fix, RedisSource.Nack's "don't ACK, let it
+// retry" comment was aspirational: nothing in this codebase ever re-read a
+// pending-but-unacked message, so it just sat in the consumer group's
+// pending-entries list (PEL) forever. Combined with issue #826's willRetry()
+// (which suppresses the terminal "error" stream event whenever it believes a
+// retry is coming), that turned into a PERMANENT silence bug: a job that
+// failed once produced no terminal event, ever, and was neither retried nor
+// DLQ'd.
+//
+// The fix is RedisSource attempting an XAUTOCLAIM-based reclaim
+// (redisclient.Client.ReclaimStalePendingOnQueue) on every poll, before its
+// normal read. This test drives the real (miniredis-backed) RedisSource
+// through: read -> Nack (no ACK) -> re-read too soon (nothing, matching the
+// ">" behavior above) -> re-read once the message is stale -> assert it is
+// redelivered with an INCREMENTED delivery count, so the existing
+// willRetry/DLQ logic in runner.go keeps working correctly off a signal that
+// now actually reflects reality.
+func TestRedisSourceRedeliversNackedMessageAfterStaleIdle(t *testing.T) {
+	queue := "jobs:v1:reclaim-integration"
+	mr, source, raw := setupWorkerIntegration(t, queue, 5) // MaxAttempts=5, well above what this test exercises
+	ctx := context.Background()
+
+	// Connect (inside setupWorkerIntegration) installs the real env-aware
+	// floor (ResolveStalePendingReclaimFloor, ~4h10m at defaults) via
+	// SetStalePendingReclaimMinIdle -- overriding the redis package's
+	// construction-time default, per issue #998's review. Override it again
+	// here, directly on this source's own client, so the test doesn't need
+	// to wait out either value; this also exercises the real setter seam
+	// rather than the package var, which Connect no longer leaves in effect.
+	source.Client().SetStalePendingReclaimMinIdle(1 * time.Second)
+
+	jobID := "job-reclaim-integration-001"
+	payload, _ := json.Marshal(map[string]interface{}{"data": "will-fail-then-strand"})
+	enqueueTestJob(t, raw, queue, map[string]interface{}{
+		"jobId":   jobID,
+		"type":    "FAIL_JOB",
+		"payload": string(payload),
+	})
+
+	// First read: delivered for the first time. Redis's own delivery count
+	// starts at 1 on initial delivery (not 0).
+	job1, err := source.Next(ctx)
+	if err != nil {
+		t.Fatalf("first Next() failed: %v", err)
+	}
+	if job1 == nil || job1.ID != jobID {
+		t.Fatalf("expected first Next() to return job %s, got %+v", jobID, job1)
+	}
+	if job1.Metadata.Attempts != 1 {
+		t.Errorf("first delivery Attempts = %d, want 1", job1.Metadata.Attempts)
+	}
+
+	// Simulate the handler failing and the worker Nacking it: no ACK, so the
+	// message stays in the PEL.
+	if err := source.Nack(ctx, job1, errors.New("simulated failure")); err != nil {
+		t.Fatalf("Nack failed: %v", err)
+	}
+
+	// Re-read immediately, before the message is stale enough to reclaim.
+	// Nothing should come back: no new message was enqueued, and the
+	// just-Nacked message is not yet eligible for reclaim. This is the exact
+	// "silently stranded forever" state #871 identified as a real bug, not
+	// merely a theoretical one.
+	tooSoon, err := source.Next(ctx)
+	if err != nil {
+		t.Fatalf("second Next() (before idle threshold) failed: %v", err)
+	}
+	if tooSoon != nil {
+		t.Fatalf("expected no redelivery before the idle threshold, got job %+v", tooSoon)
+	}
+
+	// Advance miniredis's fake clock past the (shrunk) reclaim threshold so
+	// the pending message looks stale -- standing in for either a crashed
+	// consumer or simply enough time passing after a Nack.
+	mr.SetTime(time.Now().Add(2 * time.Second))
+
+	job2, err := source.Next(ctx)
+	if err != nil {
+		t.Fatalf("reclaim Next() failed: %v", err)
+	}
+	if job2 == nil {
+		t.Fatal("expected the stale-pending message to be reclaimed and redelivered, got nil")
+	}
+	if job2.ID != jobID {
+		t.Errorf("redelivered job ID = %q, want %q", job2.ID, jobID)
+	}
+	if job2.Metadata.Attempts != 2 {
+		t.Errorf("redelivered Attempts = %d, want 2 (delivery count must increment on reclaim)", job2.Metadata.Attempts)
+	}
+	if job2.Metadata.MaxAttempts != 5 {
+		t.Errorf("redelivered MaxAttempts = %d, want 5", job2.Metadata.MaxAttempts)
 	}
 }

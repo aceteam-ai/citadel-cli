@@ -2204,3 +2204,191 @@ Auto-generated log of every release.
   - feat: citadel socks — SOCKS5 dynamic-forward proxy over the mesh (#974)
 
 
+---
+
+## v2.141.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 21 |
+| Lines added | +1503 |
+
+**Changes:**
+
+  - feat: appliance-mode default-serve reconcile on blank GPU nodes (#628) (#982)
+  - engine-adapter slice 2: migrate status/mesh read paths to internal/engine (#981)
+
+
+---
+
+## v2.142.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +881 |
+
+**Changes:**
+
+  - Report WhatsApp bridge endpoints in ActualState (Phase A of #624) (#983)
+
+
+---
+
+## v2.143.0 — 2026-09-02
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 5 |
+| Lines added | +1519 |
+
+**Changes:**
+
+  - feat: session-scoped CDP actions on COBROWSE_SESSION (#978) (#984)
+
+
+---
+
+## v2.144.0 — 2026-09-03
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 6 |
+| Lines added | +689 |
+
+**Changes:**
+
+  - feat: inject x-citadel-node-id header into generated MCP client config (#977) (#987)
+  - fix: retry WriteClaimed/WriteEnd + synchronous HTTP fallback on WS publish error (#985) (#986)
+
+
+---
+
+## v2.145.0 — 2026-09-04
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 1 |
+| Lines added | +44 |
+
+**Changes:**
+
+  - fix: synchronize CDP-close test on real conn registration, not a wall clock (#819) (#988)
+
+
+---
+
+## v2.146.0 — 2026-09-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 14 |
+| Lines added | +1296 |
+
+**Changes:**
+
+  - feat: WhatsApp bridge admin-key rotation + compose down --env-file fix (Part 3 of 624) (#993)
+  - chore(security): bump Go toolchain to 1.26.6 + x/net/x/text (govulncheck sweep) (#992)
+  - fix: drain in-flight CDP handlers before restoring cdpTargetURL in tests (#989) (#990)
+
+
+---
+
+## v2.147.0 — 2026-09-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 25 |
+| Lines added | +1142 |
+
+**Changes:**
+
+  - feat: WhatsApp bridge as a first-class module + provenance-scoped uninstall (Part 1 of #624) (#994)
+
+
+---
+
+## v2.148.0 — 2026-09-06
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 16 |
+| Lines added | +1384 |
+
+**Changes:**
+
+  - fix: direct-Redis Nacked messages were never redelivered (#871) (#998)
+  - fix: bounded best-effort drain for `citadel update install --restart` (#887) (#996)
+  - feat: report whether a model-hotswap swap required a weights pull (#835) (#997)
+
+
+---
+
+## v2.149.0 — 2026-09-08
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 19 |
+| Lines added | +1307 |
+
+**Changes:**
+
+  - feat: register omnivoice as a citadel-inference-server-backed TTS engine (P1) (#1008)
+  - feat: citadel agents probe - discovery of installed vendor coding agents (#995)
+
+
+---
+
+## v2.150.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 9 |
+| Lines added | +1236 |
+
+**Changes:**
+
+  - feat: single post-completion Trust Engine hook across all engine paths (#1001) (#1009)
+  - fix: reclaim only steals from provably-dead consumers (#999) (#1010)
+
+
+---
+
+## v2.151.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 7 |
+| Lines added | +1112 |
+
+**Changes:**
+
+  - feat: port Secret/PII/FERPA detectors to internal/trust checks (#1004) (#1011)
+
+
+---
+
+## v2.152.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 3 |
+| Lines added | +496 |
+
+**Changes:**
+
+  - fix: agentsprobe S2-gate — invoker-scoped HOME/PATH + honest auth-unknown (#1005) (#1012)
+
+

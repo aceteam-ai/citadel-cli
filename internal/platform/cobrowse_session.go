@@ -88,6 +88,16 @@ type CobrowseSessionStatus struct {
 	Profile   string               `json:"profile,omitempty"`
 	Display   string               `json:"display,omitempty"`
 	StartedAt string               `json:"started_at,omitempty"`
+	// Driver is the session's driver-arbitration state (issue #978): "ai" while
+	// the agent may issue scripted actions (navigate/click/type/screenshot/
+	// extract), "human" while those are refused (ErrHandedOff) -- either
+	// because a viewer is currently attached (state == "attached") or because
+	// an explicit `handoff` is in effect. See humanDrivingLocked in
+	// cobrowse_session_actions.go for the exact rule. Reuses the same
+	// CobrowseDriver type and DriverAI/DriverHuman values as the singleton
+	// CobrowseManager (cobrowse.go) -- same concept, per-session instead of
+	// per-node.
+	Driver CobrowseDriver `json:"driver,omitempty"`
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -160,6 +170,14 @@ type cobrowseSession struct {
 	mu    sync.Mutex
 	state CobrowseSessionState
 	proc  *cobrowseProc
+	// explicitHandoff is this session's STICKY driver-arbitration bit (issue
+	// #978): set by an explicit `handoff` action, cleared by an explicit
+	// `resume` action. It is deliberately independent of, and survives, a
+	// transient viewer disconnect -- see humanDrivingLocked (in
+	// cobrowse_session_actions.go) for how this combines with live attachment
+	// (state == SessionAttached) into the single refuse/allow decision every
+	// scripted action checks, and why that is two bits rather than one.
+	explicitHandoff bool
 }
 
 var (
@@ -473,6 +491,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		ID:      s.id,
 		State:   s.state,
 		Profile: s.profile,
+		Driver:  driverFor(s.humanDrivingLocked()),
 	}
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)

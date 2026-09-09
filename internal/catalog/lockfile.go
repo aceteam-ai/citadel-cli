@@ -33,6 +33,26 @@ type LockEntry struct {
 	// for this (untrusted/Tier-2) module at install time. Absent/false means the
 	// module runs without an override (trusted/curated, or pre-sandbox installs).
 	Sandboxed bool `yaml:"sandboxed,omitempty"`
+	// ManagedBy records the install provenance (citadel#624 D1). It is stamped
+	// with reconcile.ManagedByDesiredState ("desired-state") ONLY by the
+	// control-plane desired-state / MODULE_SET install path (liveModuleOps.Install
+	// -> recordLock). An operator/catalog CLI install leaves it empty, and a
+	// missing value ALWAYS means "unstamped = protected" -- so every pre-existing
+	// lockfile entry (which predates this field) is protected too. Reconcile may
+	// only drift-uninstall a stamped entry; ListInstalled plumbs this onto
+	// reconcile.InstalledModule.ManagedBy. Additive/omitempty: absence is the
+	// safe, back-compatible default.
+	ManagedBy string `yaml:"managed_by,omitempty"`
+	// HealthComposeService records the compose SERVICE name whose running state
+	// is this module's health signal (citadel#624 sub-collision 3), copied from
+	// the module manifest's health_check.compose_service at install time. It
+	// exists for modules whose real container is NOT the generic
+	// citadel-<name> convention -- the WhatsApp bridge's is <project>-bridge-N
+	// (#436) -- so ListInstalled resolves health via `docker compose -p <project>
+	// ps <service>` instead of a name that never matches (which would report
+	// STOPPED forever and drive a redundant ActionStart every reconcile pass).
+	// Empty means "use the default container-name health check".
+	HealthComposeService string `yaml:"health_compose_service,omitempty"`
 }
 
 // LockImage is a single image reference plus an optional resolved digest.

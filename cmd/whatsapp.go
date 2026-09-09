@@ -260,9 +260,109 @@ func deployWhatsAppCompose(source, image string, report *deployReport) func(serv
 	}
 }
 
+// bridgeModuleInstalled reports whether the module system (lockfile + reconcile
+// / MODULE_SET) owns the WhatsApp bridge's compose lifecycle on THIS machine --
+// the citadel#624 D5 delegation trigger.
+//
+// It keys on node-MANIFEST membership, NOT the lockfile (citadel#624 FIX A). Two
+// reasons, both load-bearing:
+//
+//   - Distinguishing: the module system registers the bridge in the manifest
+//     (liveModuleOps.Install / catalog install -> addServiceToManifest), while
+//     the bespoke `citadel whatsapp` deploy deliberately NEVER does (see
+//     runWhatsAppUp). So "in the manifest" means precisely "module-owned", which
+//     is exactly what D5 must delegate on -- a compose-file-exists check could
+//     not tell a module install apart from a bespoke one.
+//   - Machine-convergent: the manifest is read through findAndReadManifest, the
+//     SAME node_config_dir resolution (config.yaml -> node_config_dir) the module
+//     install uses to WRITE it, so a root systemd `citadel work` MODULE_SET
+//     install and a later interactive `citadel whatsapp provision` AGREE whenever
+//     they share a node_config_dir (the normal topology). The prior lockfile
+//     signal did NOT: catalog.LockfilePath() is platform.ConfigDir()-scoped
+//     (/etc/citadel or /root/.citadel-cli for the root worker vs ~/.citadel-cli
+//     for the interactive user), so it diverged even when node_config_dir was
+//     shared -- defeating D5 in exactly the systemd topology this fix targets, so
+//     the bespoke deploy ran OVER the module system's files (the dual-ownership
+//     D5 forbids).
+//
+// Best-effort: an unresolvable manifest means "not module-managed here", so the
+// bespoke deploy runs as the fallback (the safe direction for a fresh/old node).
+// Residual (pre-existing, out of scope): if the two invocations resolve DIFFERENT
+// node_config_dirs via divergent config.yaml, they operate on different node dirs
+// entirely and the only remaining shared resource is the docker compose project.
+func bridgeModuleInstalled() bool {
+	manifest, _, err := findAndReadManifest()
+	if err != nil || manifest == nil {
+		return false
+	}
+	return hasService(manifest, whatsapp.ServiceName)
+}
+
+// refuseBridgeProvisionUnderNodeDir refuses the bespoke bridge provision/deploy
+// when a --node-dir/CITADEL_NODE_DIR override is active (citadel#624 FIX A
+// hardening, caught in review). Under an override the D5 delegation signal
+// (bridgeModuleInstalled, via findAndReadManifest) resolves to the OVERRIDE's
+// manifest, not the real node's, so it cannot tell whether the REAL node's bridge
+// is module-managed -- AND the bespoke deploy composes with a project derived
+// from the override services-dir basename (servicesDirForNode is override-aware),
+// which collides with the real node's "services" project and would compose over
+// its bridge containers + the whatsapp_pgdata session volume (the
+// citadel#853/#860 incident class). Refusing matches
+// refuseIfLockfileWriteUnsupported's posture. Returns nil when no override is
+// active (byte-identical behavior). `citadel work` (the WHATSAPP_PROVISION job
+// path) never reaches this -- it refuses --node-dir at boot -- so only the
+// interactive CLI can hit it.
+func refuseBridgeProvisionUnderNodeDir() error {
+	override := resolveNodeDirOverride()
+	if override == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"provisioning the WhatsApp bridge does not support --node-dir/CITADEL_NODE_DIR (override %q active): "+
+			"the module-ownership delegation signal resolves to the override's manifest (not the real node's), "+
+			"and the bespoke deploy's compose project (from the override services-dir basename) can collide with "+
+			"this machine's real 'services' project -- composing over its bridge and the whatsapp_pgdata session "+
+			"volume. Unset the override to provision the bridge.", override)
+}
+
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It
 // is split out so deployWhatsAppCompose can run it under a hard deadline.
 func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, report *deployReport) error {
+	// Refuse the bespoke deploy under an active --node-dir override (citadel#624
+	// FIX A hardening): the delegation signal and the compose project both resolve
+	// unsafely under an override and a bespoke deploy could compose over the real
+	// node's bridge. See refuseBridgeProvisionUnderNodeDir.
+	if err := refuseBridgeProvisionUnderNodeDir(); err != nil {
+		return err
+	}
+
+	// Delegation (citadel#624 D5): when the bridge is a first-class module (a
+	// lockfile entry exists), the module system (lockfile + reconcile /
+	// MODULE_SET) OWNS its compose lifecycle. The bespoke deploy must NOT run a
+	// SECOND owner's git-clone + `docker compose -p <project> up` over the same
+	// files -- that is the "two owners over the same files" hazard D5 forbids. We
+	// still persist the env the provision flow resolved (admin key / port /
+	// proxy), atomically and idempotently, so the module-managed stack serves
+	// them; the running stack is assumed already up by the module system, which
+	// provision's WaitReady verifies next. The bespoke deploy below remains the
+	// FALLBACK for lockfile-less / old nodes.
+	//
+	// NOTE (bounded follow-up, documented in the #624 PR): provision still selects
+	// its own host port; a fully-authoritative delegation would read the
+	// module-managed BRIDGE_PORT instead. Today provision reuses the persisted
+	// BRIDGE_PORT (provision.go), so on a module-installed node the two already
+	// agree via this same env file.
+	if bridgeModuleInstalled() {
+		if image != "" {
+			env["BRIDGE_IMAGE"] = image
+		}
+		if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
+			return fmt.Errorf("write bridge config (module-delegated): %w", err)
+		}
+		fmt.Fprintln(os.Stderr, "   - WhatsApp bridge is module-managed; delegating deploy/start to the module system")
+		return nil
+	}
+
 	if source == "" {
 		source = defaultWhatsAppSource
 	}

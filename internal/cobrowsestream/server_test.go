@@ -49,12 +49,44 @@ func (s *fakeSession) counts() (attached, detached int) {
 
 func newHarness(t *testing.T, sess Session, f *fakeChrome) *httptest.Server {
 	t.Helper()
-	withFakeCDP(t, f)
+	withFakeCDP(t, f) // registers the cdpTargetURL restore cleanup FIRST
 	srv := NewServer(Config{}, sess)
 	srv.SetSilent()
 	mux := http.NewServeMux()
 	mux.HandleFunc(StreamPath, srv.handleStream)
 	ts := httptest.NewServer(mux)
+
+	// Drain in-flight stream handlers BEFORE withFakeCDP's cdpTargetURL restore
+	// runs. handleStream reads the cdpTargetURL package var (via dialCDP) from the
+	// httptest server's hijacked-connection goroutine, and httptest.Server.Close()
+	// does NOT join those goroutines -- nothing else does either -- so without an
+	// explicit barrier the restore write races that read (citadel #989). It is a
+	// test-only race: in production cdpTargetURL is set once at init, never mutated.
+	//
+	// t.Cleanup runs LIFO (last registered runs first). Registering this drain
+	// AFTER withFakeCDP but BEFORE ts.Close makes the three cleanups execute in
+	// this order: ts.Close (drop the listener) -> this drain -> withFakeCDP
+	// restore. activeConns is incremented before the dialCDP read and decremented
+	// (via an atomic, which carries a happens-before) when the handler returns, so
+	// once it reaches 0 every dialCDP read has completed and the restore is safe.
+	// Get this ordering wrong -- register before withFakeCDP, or after ts.Close --
+	// and the race is NOT actually closed.
+	//
+	// Note: ts.Close() does NOT close hijacked WebSocket conns (http.Server drops
+	// hijacked conns from its tracked set), so it alone does not drive handlers to
+	// return. What actually does is each test's own viewer-conn close, which runs
+	// as a test-body defer -- i.e. before any t.Cleanup. A server test that leaves
+	// its viewer conn open will trip the timeout below.
+	t.Cleanup(func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for srv.ActiveConnections() != 0 {
+			if time.Now().After(deadline) {
+				t.Errorf("stream handlers did not drain before cleanup: %d still active", srv.ActiveConnections())
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	})
 	t.Cleanup(ts.Close)
 	return ts
 }

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/engine"
 	embeddedservices "github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -37,29 +38,30 @@ func ModelHotswapEnabled() bool {
 // (in preference order) that select its served model. Mirrors the compose files'
 // ${VAR:-default} interpolation so a stopped engine advertises the same model id
 // it would serve on start. Engines absent here have no serve-time model env.
-var engineModelEnvVars = map[string][]string{
-	"vllm":          {"VLLM_MODEL"},
-	"unlimited-ocr": {"OCR_SERVED_NAME", "OCR_MODEL"},
-	"bonsai":        {"BONSAI_MODEL"},
-	// llamacpp (citadel-cli#685 §1a): services/compose/llamacpp.yml now honors
-	// LLAMACPP_MODEL (three non-nested ${VAR}/${VAR:+literal} substitutions —
-	// see that file's command comment for why not one nested
-	// ${LLAMACPP_MODEL:+--model /models/$LLAMACPP_MODEL}), so a persisted
-	// override on a stopped llamacpp advertises the same GGUF it
-	// would serve on start, same as vllm/bonsai above. Before this, llamacpp was
-	// entirely absent from this map, so resolveInstalledModel("llamacpp") always
-	// returned "" and collectInstalledEngines could never advertise it as a swap
-	// candidate — not intermittently, structurally (nothing ever wrote this
-	// var). See the engineDefaultModel comment below for why llamacpp still has
-	// no *default* entry.
-	"llamacpp": {"LLAMACPP_MODEL"},
+//
+// citadel #685 slice 2: this is now derived from internal/engine's registry
+// (ModelEnvVar per EngineSpec) at init, not a second hand-maintained literal
+// -- see internal/engine/tables.go's modelEnvVarsByEngine, the canonical
+// table this is a runtime copy of. The llamacpp/bonsai/unlimited-ocr/vllm
+// entries and the reasoning behind them (services/compose/llamacpp.yml's
+// LLAMACPP_MODEL substitution, citadel-cli#685 §1a) live there now.
+var engineModelEnvVars = buildEngineModelEnvVars()
+
+func buildEngineModelEnvVars() map[string][]string {
+	out := make(map[string][]string)
+	for _, e := range engine.Default().All() {
+		if vars := e.Spec().ModelEnvVar; vars != nil {
+			cp := make([]string, len(vars))
+			copy(cp, vars)
+			out[e.Name()] = cp
+		}
+	}
+	return out
 }
 
 // EngineModelEnvVars returns a copy of engineModelEnvVars[name] -- the
 // <name>.env variable(s) (in preference order) that select the engine's served
-// model, or nil when the engine has no such env. Exported so internal/engine's
-// registry (citadel #685 slice 1) reads the same table rather than a second
-// hardcoded copy.
+// model, or nil when the engine has no such env.
 func EngineModelEnvVars(name string) []string {
 	vars := engineModelEnvVars[name]
 	if vars == nil {
@@ -74,8 +76,7 @@ func EngineModelEnvVars(name string) []string {
 // present. The ok return distinguishes "deliberately no default" (e.g. vllm,
 // llamacpp -- present-but-empty would collapse that distinction) from "not in
 // the map at all", which citadel #685 §1a identified as exactly the bug a
-// naive string return would reintroduce. Exported for internal/engine's
-// registry (slice 1).
+// naive string return would reintroduce.
 func EngineDefaultModel(name string) (string, bool) {
 	v, ok := engineDefaultModel[name]
 	return v, ok
@@ -98,9 +99,20 @@ func EngineDefaultModel(name string) (string, bool) {
 // nothing loaded. resolveInstalledModel("llamacpp") correctly returns "" (no
 // swap candidate) until an operator/job persists a real LLAMACPP_MODEL via
 // engineModelEnvVars above.
-var engineDefaultModel = map[string]string{
-	"unlimited-ocr": "baidu/Unlimited-OCR",
-	"bonsai":        "Bonsai-27B-Q1_0.gguf",
+//
+// citadel #685 slice 2: derived from internal/engine's registry (DefaultModel
+// per EngineSpec) at init -- see internal/engine/tables.go's
+// defaultModelByEngine, the canonical table.
+var engineDefaultModel = buildEngineDefaultModel()
+
+func buildEngineDefaultModel() map[string]string {
+	out := make(map[string]string)
+	for _, e := range engine.Default().All() {
+		if dm := e.Spec().DefaultModel; dm != nil {
+			out[e.Name()] = *dm
+		}
+	}
+	return out
 }
 
 // engineVRAMEstimateMB is a per-engine VRAM PROVISIONING BUDGET (MB): the VRAM
@@ -123,13 +135,22 @@ var engineDefaultModel = map[string]string{
 // starting one evicts the other. A RUNNING engine advertises its live
 // footprint instead (applyModelHotswap below), so these conservative numbers
 // only gate the swap decision, and only until it has been measured once.
-var engineVRAMEstimateMB = map[string]int{
-	"vllm":          22000,
-	"sglang":        22000,
-	"unlimited-ocr": 20000,
-	"bonsai":        22000,
-	"llamacpp":      8000,
-	"ollama":        8000,
+//
+// citadel #685 slice 2: derived from internal/engine's registry
+// (VRAMEstimateMB per EngineSpec) at init -- see internal/engine/tables.go's
+// vramEstimateMBByEngine, the canonical table. Lookup semantics (map[string]int,
+// zero value for an absent key, no comma-ok) are unchanged, so an engine with
+// no entry there still reads 0 here exactly as before.
+var engineVRAMEstimateMB = buildEngineVRAMEstimateMB()
+
+func buildEngineVRAMEstimateMB() map[string]int {
+	out := make(map[string]int)
+	for _, e := range engine.Default().All() {
+		if v := e.Spec().VRAMEstimateMB; v != 0 {
+			out[e.Name()] = v
+		}
+	}
+	return out
 }
 
 // EngineVRAMEstimateMB returns the coarse VRAM estimate (MB) for a managed
@@ -137,8 +158,54 @@ var engineVRAMEstimateMB = map[string]int{
 // FALLBACK required-VRAM budget from the same table the heartbeat advertises
 // for a STOPPED engine — a measured (engine, model) pair overrides it
 // (citadel-cli#689; see the engineVRAMEstimateMB doc comment above).
-func EngineVRAMEstimateMB(engine string) int {
-	return engineVRAMEstimateMB[engine]
+func EngineVRAMEstimateMB(eng string) int {
+	return engineVRAMEstimateMB[eng]
+}
+
+// LargestGPUTotalVRAMMB returns the largest single GPU's total VRAM (MB)
+// across gpus, and whether any GPU with a known (>0) total VRAM was found.
+// Used by the "default-serve" appliance-mode reconcile (citadel-cli#628) to
+// pick a VRAM tier: multi-GPU nodes size the tier off the biggest card, not
+// the sum (a deploy targets one card's worth of VRAM, same reasoning
+// EngineVRAMEstimateMB's provisioning budgets use).
+func LargestGPUTotalVRAMMB(gpus []GPUMetrics) (mb int, found bool) {
+	for _, g := range gpus {
+		if g.MemoryTotalMB <= 0 {
+			continue
+		}
+		found = true
+		if g.MemoryTotalMB > mb {
+			mb = g.MemoryTotalMB
+		}
+	}
+	return mb, found
+}
+
+// DefaultServeTier maps a GPU's total VRAM (MB) to the (engine, model) the
+// "default-serve" appliance-mode reconcile (citadel-cli#628) auto-serves on a
+// blank node. Returns ("", "") when vramTotalMB is unknown/non-positive (no
+// tier applies -- the caller must treat this as "skip", never as a match on
+// the smallest tier).
+//
+// These model names are deliberately editable in one place: swap any of the
+// ollama tags below as preferences evolve, without touching call sites. The
+// >=20GB tier intentionally returns an EMPTY model: it keeps the compose
+// file's own VLLM_MODEL default rather than overriding it, since vllm (unlike
+// ollama) has no single "small default model" convention and a wrong guess
+// there is a multi-GB wasted pull, not a one-line edit.
+func DefaultServeTier(vramTotalMB int) (engine, model string) {
+	switch {
+	case vramTotalMB <= 0:
+		return "", ""
+	case vramTotalMB < 6144: // < 6 GB
+		return "ollama", "llama3.2:3b"
+	case vramTotalMB < 12288: // 6-12 GB
+		return "ollama", "llama3.1:8b"
+	case vramTotalMB < 20480: // 12-20 GB
+		return "ollama", "qwen2.5:14b"
+	default: // >= 20 GB
+		return "vllm", ""
+	}
 }
 
 // applyModelHotswap annotates the collected status for model hotswap (#632):

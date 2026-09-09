@@ -1275,20 +1275,46 @@ func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
 	if !modelIDPattern.MatchString(model) {
 		return fmt.Errorf("invalid model identifier %q", model)
 	}
+	// Docker-ollama fallback (citadel-cli#628): a node running the embedded
+	// ollama.yml compose service (rather than a host-installed ollama binary,
+	// e.g. one auto-served by the default-serve appliance-mode reconcile) has
+	// nothing on PATH for exec.LookPath to find, but the pull still works via
+	// `docker exec <container> ollama pull` against the running container.
+	// dockerContainer stays "" (the pre-existing host-binary path) unless the
+	// host binary is genuinely absent AND the container is confirmed
+	// running -- never invent or start a container just to pull into it.
+	dockerContainer := ""
 	if _, err := exec.LookPath("ollama"); err != nil {
-		return fmt.Errorf("cannot pull model %q: ollama binary not found in PATH", model)
+		candidate := embeddedContainerNameFor("ollama")
+		out, inspectErr := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", candidate).Output()
+		if inspectErr != nil || strings.TrimSpace(string(out)) != "running" {
+			return fmt.Errorf("cannot pull model %q: ollama binary not found in PATH, and no running %q docker container found", model, candidate)
+		}
+		dockerContainer = candidate
 	}
 	if waitForServer {
 		deadline := time.Now().Add(ollamaServerWaitTimeout)
 		for time.Now().Before(deadline) {
-			if exec.Command("ollama", "list").Run() == nil {
+			var probeErr error
+			if dockerContainer != "" {
+				probeErr = exec.Command("docker", "exec", dockerContainer, "ollama", "list").Run()
+			} else {
+				probeErr = exec.Command("ollama", "list").Run()
+			}
+			if probeErr == nil {
 				break
 			}
 			time.Sleep(time.Second)
 		}
 	}
 	ctx.Log("info", "     - Ensuring ollama model %q is pulled (idempotent; fast when cached)", model)
-	out, err := runOllamaPull(model)
+	var out []byte
+	var err error
+	if dockerContainer != "" {
+		out, err = runOllamaPullViaDocker(dockerContainer, model)
+	} else {
+		out, err = runOllamaPull(model)
+	}
 	if err != nil {
 		return fmt.Errorf("ollama pull %s failed: %w: %s", model, err, strings.TrimSpace(string(out)))
 	}

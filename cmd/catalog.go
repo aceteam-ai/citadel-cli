@@ -390,8 +390,12 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	// Record provenance into the lockfile so this module is recognized as
-	// module-installed (citadel#739 follow-up: see recordCatalogModuleLock).
-	recordCatalogModuleLock(result.Name, overrides, result.Sandboxed)
+	// module-installed (citadel#739 follow-up: see recordCatalogModuleLock). This
+	// is the OPERATOR CLI path, so the entry is deliberately left UNSTAMPED
+	// (ManagedBy empty = protected from drift-uninstall, citadel#624 D1). The
+	// manifest's health_check.compose_service is still carried so a bridge-shaped
+	// module installed this way reports health correctly (sub-collision 3).
+	recordCatalogModuleLock(result.Name, overrides, result.Sandboxed, resolved.Manifest.HealthCheck.ComposeService)
 
 	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
 	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
@@ -424,12 +428,16 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 // itself would set as Raw) + the config overrides the module was installed
 // with + whether it was sandboxed. Best-effort: a write failure is reported to
 // stderr but does not fail the install, matching recordModuleLock.
-func recordCatalogModuleLock(name string, config map[string]string, sandboxed bool) {
+func recordCatalogModuleLock(name string, config map[string]string, sandboxed bool, healthComposeService string) {
 	entry := catalog.LockEntry{
 		Name:      name,
 		Source:    name,
 		Config:    config,
 		Sandboxed: sandboxed,
+		// Operator CLI install: ManagedBy is left EMPTY (unstamped = protected
+		// from drift-uninstall, citadel#624 D1). Only the desired-state converge
+		// path (liveModuleOps.recordLock) stamps ManagedByDesiredState.
+		HealthComposeService: healthComposeService,
 	}
 	if err := catalog.UpsertLockEntry(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "  Note: could not record provenance in modules.lock: %v\n", err)

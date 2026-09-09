@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/aceteam-ai/citadel-cli/internal/protocol"
+	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -25,6 +26,28 @@ type DesiredStateFetcher interface {
 // uses). redisapi.Client.PostNodeState satisfies it.
 type ActualStateReporter interface {
 	PostNodeState(ctx context.Context, body []byte) error
+}
+
+// BridgeEndpointsProvider builds the synthetic ActualModule row (module +
+// endpoints) for a node-hosted module that carries no modules.lock entry of
+// its own -- citadel#624 Phase A's only instance is the WhatsApp bridge. It is
+// defined identically (same method shape) in internal/nodestate so that
+// package's Emitter and this package's ProtoProvider can each accept the SAME
+// concrete value via Go's structural typing without either package importing
+// the other (mirrors the internal/status / internal/worker split for the
+// identical reason). Both node-state reporters holding a reference to the
+// SAME provider instance is what makes them report byte-identical bridge
+// facts rather than two independently-computed snapshots that could disagree
+// -- the "two-reporter flap" the citadel#624 design review called out as
+// must-resolve: this package's Report() runs on the pull-reconcile loop's own
+// interval (every 5min, including on a refused/no-op pass) alongside
+// nodestate.Emitter's 60s loop, and both POST to the same control-plane
+// endpoint.
+//
+// A nil return from BridgeModule means nothing to report yet (e.g. the
+// module has never been deployed on this node).
+type BridgeEndpointsProvider interface {
+	BridgeModule(ctx context.Context) *fabricpb.ActualModule
 }
 
 // ProtoProvider is the LIVE DesiredStateProvider for the pull reconcile loop
@@ -48,6 +71,12 @@ type ProtoProvider struct {
 	NodeID string
 	// Version is the citadel-cli version, reported as agent_version.
 	Version string
+	// BridgeEndpoints builds the synthetic bridge module row (citadel#624
+	// Phase A), appended to every Report unconditionally (this loop is not
+	// gated by the telemetry opt-out the nodestate.Emitter path observes).
+	// Nil (the zero value) means no synthetic row is ever appended -- existing
+	// callers that never set this field are unaffected.
+	BridgeEndpoints BridgeEndpointsProvider
 }
 
 // NewProtoProvider builds a ProtoProvider.
@@ -72,7 +101,25 @@ func (p *ProtoProvider) Fetch(ctx context.Context) (DesiredState, error) {
 // Report encodes the converged ActualState as protobuf (stamping the applied
 // revision) and posts it upstream.
 func (p *ProtoProvider) Report(ctx context.Context, actual ActualState) error {
-	body, err := proto.Marshal(p.buildActualStateProto(actual))
+	pb := p.buildActualStateProto(actual)
+	// Appended AFTER the reconcile engine has already consumed `actual` above
+	// -- the synthetic bridge row rides only the wire-level report, so it can
+	// never influence (or be influenced by) converge/uninstall decisions,
+	// which are driven off `actual` alone. See BridgeEndpointsProvider's doc
+	// comment for why this must be the SAME provider instance
+	// nodestate.Emitter also holds (the "two-reporter flap" fix).
+	if p.BridgeEndpoints != nil {
+		if m := p.BridgeEndpoints.BridgeModule(ctx); m != nil {
+			// Decorator, not a blind append (citadel#624 sub-collision 4): once
+			// the bridge is a first-class lockfile module, `pb` already carries its
+			// REAL row (built from `actual` above); AttachBridgeModule merges the
+			// endpoint facts onto that row instead of double-reporting the source,
+			// and appends the synthetic row only for an old/bespoke node with no
+			// lockfile entry.
+			whatsapp.AttachBridgeModule(pb, m)
+		}
+	}
+	body, err := proto.Marshal(pb)
 	if err != nil {
 		return fmt.Errorf("encode actual-state: %w", err)
 	}

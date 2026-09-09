@@ -330,3 +330,54 @@ func TestModelHotswapEnabled_DefaultOnDisableParsing(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultServeTier pins the citadel-cli#628 VRAM->(engine,model) tier
+// boundaries exactly, including the edges (5, 6, 12, 20 GB in MB) and the
+// unknown/non-positive "no tier" case.
+func TestDefaultServeTier(t *testing.T) {
+	cases := []struct {
+		name       string
+		vramMB     int
+		wantEngine string
+		wantModel  string
+	}{
+		{"zero is no tier", 0, "", ""},
+		{"negative is no tier", -1, "", ""},
+		{"just under 6GB", 6143, "ollama", "llama3.2:3b"},
+		{"well under 6GB", 4096, "ollama", "llama3.2:3b"},
+		{"exactly 6GB starts next tier", 6144, "ollama", "llama3.1:8b"},
+		{"just under 12GB", 12287, "ollama", "llama3.1:8b"},
+		{"exactly 12GB starts next tier", 12288, "ollama", "qwen2.5:14b"},
+		{"just under 20GB", 20479, "ollama", "qwen2.5:14b"},
+		{"exactly 20GB starts vllm tier", 20480, "vllm", ""},
+		{"well over 20GB", 24576, "vllm", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, model := DefaultServeTier(tc.vramMB)
+			if engine != tc.wantEngine || model != tc.wantModel {
+				t.Errorf("DefaultServeTier(%d) = (%q, %q), want (%q, %q)", tc.vramMB, engine, model, tc.wantEngine, tc.wantModel)
+			}
+		})
+	}
+}
+
+// TestLargestGPUTotalVRAMMB verifies the multi-GPU max-not-sum contract and
+// the "no GPU with known total VRAM" (found=false) case.
+func TestLargestGPUTotalVRAMMB(t *testing.T) {
+	if mb, found := LargestGPUTotalVRAMMB(nil); found || mb != 0 {
+		t.Errorf("empty gpus: got (%d, %v), want (0, false)", mb, found)
+	}
+	if mb, found := LargestGPUTotalVRAMMB([]GPUMetrics{{MemoryTotalMB: 0}}); found || mb != 0 {
+		t.Errorf("single zero-total gpu: got (%d, %v), want (0, false)", mb, found)
+	}
+	gpus := []GPUMetrics{
+		{Index: 0, MemoryTotalMB: 8192},
+		{Index: 1, MemoryTotalMB: 24576},
+		{Index: 2, MemoryTotalMB: 0}, // unknown -- must not win as "largest"
+	}
+	mb, found := LargestGPUTotalVRAMMB(gpus)
+	if !found || mb != 24576 {
+		t.Errorf("multi-gpu max: got (%d, %v), want (24576, true) -- must be the max, not the sum (32768)", mb, found)
+	}
+}

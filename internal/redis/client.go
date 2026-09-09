@@ -59,6 +59,83 @@ type Client struct {
 	blockMs       int
 	maxAttempts   int
 	nodeMeta      *NodeMeta
+
+	// reclaimMinIdle is the effective floor ReclaimStalePendingOnQueue uses.
+	// Defaults to the package var StalePendingReclaimMinIdle at construction
+	// time (a safe, self-contained default for a caller with no better
+	// signal), but internal/worker.RedisSource.Connect overrides it via
+	// SetStalePendingReclaimMinIdle with an env-aware, watchdog-derived value
+	// -- see that setter's doc comment for why this package cannot compute
+	// that value itself.
+	reclaimMinIdle time.Duration
+
+	// consumerDeadAfter is how long a PEL entry's OWNING CONSUMER (not the
+	// message itself) must have gone without any interaction with this
+	// stream's consumer group before ReclaimStalePendingOnQueue will treat
+	// it as provably dead and steal a CROSS-consumer entry from it
+	// (citadel-cli#999). Defaults to a value derived from blockMs at
+	// construction time (see defaultConsumerDeadAfter); overridable via
+	// SetConsumerDeadAfter. Never consulted for a SELF-owned entry -- see
+	// ReclaimStalePendingOnQueue's doc comment for why self-claims skip this
+	// check entirely.
+	consumerDeadAfter time.Duration
+
+	// consumerLiveness resolves which consumers in a group are provably dead.
+	// nil selects defaultConsumerLiveness (real XINFO CONSUMERS against
+	// c.client). Overridable via SetConsumerLivenessChecker -- the seam
+	// tests use to exercise the cross-consumer reclaim decision without
+	// depending on miniredis's incomplete XINFO CONSUMERS "idle" semantics
+	// (miniredis only updates a consumer's idle/inactive timestamps from an
+	// explicit XCLAIM, not from XREADGROUP -- so a consumer that only ever
+	// polls via XREADGROUP looks permanently "never seen" there, unlike real
+	// Redis).
+	consumerLiveness ConsumerLivenessFunc
+}
+
+// ConsumerLivenessFunc reports which consumers in group (on queue) are
+// PROVABLY dead -- i.e. have not interacted with this stream's consumer
+// group (any XREADGROUP, XCLAIM, or XAUTOCLAIM call, successful or not) in
+// at least deadAfter. Only a name present in the returned set with value
+// true is eligible to have its pending entries stolen by
+// ReclaimStalePendingOnQueue; every other consumer (present with false, or
+// simply absent from the map) must be treated as "cannot prove death" and
+// is never claimed from. A non-nil error means liveness could not be
+// determined at all for ANY consumer; callers must treat that the same as
+// an empty map -- fail open, assume everyone is alive.
+type ConsumerLivenessFunc func(ctx context.Context, queue, group string, deadAfter time.Duration) (dead map[string]bool, err error)
+
+// defaultConsumerDeadAfterMargin and defaultConsumerDeadAfterFloor bound the
+// package default for consumerDeadAfter, computed from the client's own
+// blockMs (the interval a healthy consumer re-polls at) in NewClient. This
+// default is sized ONLY for ordinary poll jitter/network blips between
+// polls -- it is NOT by itself safe against a live process that stops
+// polling entirely for a longer, but still legitimate, stretch (blocking
+// the fetch loop on an inline job -- see ReclaimStalePendingOnQueue's doc
+// comment). internal/worker.RedisSource.Connect overrides it via
+// SetConsumerDeadAfter with an env-aware value (ResolveConsumerDeadAfter)
+// that also accounts for that; this construction-time default only applies
+// to a caller with no such override (tests, or a future non-worker caller
+// of this package that never runs inline-dispatched jobs at all). The
+// floor exists for a caller with a tiny or zero blockMs (tests,
+// misconfiguration) so the threshold is never so small that ordinary poll
+// jitter alone reads as "dead".
+const (
+	defaultConsumerDeadAfterMargin = 20
+	defaultConsumerDeadAfterFloor  = 2 * time.Minute
+)
+
+// defaultConsumerDeadAfter computes NewClient's consumerDeadAfter default
+// from blockMs. A package-level func (not inlined) so tests can pin it
+// directly.
+func defaultConsumerDeadAfter(blockMs int) time.Duration {
+	if blockMs <= 0 {
+		return defaultConsumerDeadAfterFloor
+	}
+	margin := time.Duration(blockMs) * time.Millisecond * defaultConsumerDeadAfterMargin
+	if margin < defaultConsumerDeadAfterFloor {
+		return defaultConsumerDeadAfterFloor
+	}
+	return margin
 }
 
 // ClientConfig holds configuration for the Redis client.
@@ -84,12 +161,63 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 
 	return &Client{
-		workerID:      fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
-		queueName:     cfg.QueueName,
-		consumerGroup: cfg.ConsumerGroup,
-		blockMs:       cfg.BlockMs,
-		maxAttempts:   cfg.MaxAttempts,
+		workerID:          fmt.Sprintf("citadel-%s", uuid.New().String()[:8]),
+		queueName:         cfg.QueueName,
+		consumerGroup:     cfg.ConsumerGroup,
+		blockMs:           cfg.BlockMs,
+		maxAttempts:       cfg.MaxAttempts,
+		reclaimMinIdle:    StalePendingReclaimMinIdle,
+		consumerDeadAfter: defaultConsumerDeadAfter(cfg.BlockMs),
 	}
+}
+
+// SetStalePendingReclaimMinIdle overrides this client's reclaim-eligibility
+// floor for ReclaimStalePending(OnQueue). This package is a leaf and must
+// not import internal/worker (see CLAUDE.md's ConfigDir()/leaf-package
+// notes for the identical constraint elsewhere in this codebase), so it
+// cannot itself read WORKER_JOB_TIMEOUT_LONG_SECONDS or resolve the
+// long-tier watchdog's actual ceiling -- the caller (internal/worker.
+// RedisSource.Connect, via ResolveStalePendingReclaimFloor) computes that
+// env-aware value and hands it across the package boundary through this
+// setter. A zero or negative duration is ignored (keeps the current value)
+// rather than disabling the floor outright, since "no floor at all" is not
+// a value any caller should be able to reach through this seam.
+func (c *Client) SetStalePendingReclaimMinIdle(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.reclaimMinIdle = d
+}
+
+// SetConsumerDeadAfter overrides this client's cross-consumer liveness
+// threshold (see consumerDeadAfter's doc comment). A zero or negative
+// duration is ignored, same rule as SetStalePendingReclaimMinIdle and for
+// the same reason: "no threshold at all" is not a value any caller should
+// be able to reach through this seam.
+//
+// NewClient's own BlockMs-derived default (defaultConsumerDeadAfter) is
+// sized only for ordinary poll jitter and is NOT by itself safe against an
+// INLINE job blocking the fetch loop for up to the default-tier watchdog
+// ceiling (WORKER_JOB_TIMEOUT_SECONDS) -- this package cannot read that env
+// var itself (leaf-package constraint, see SetStalePendingReclaimMinIdle's
+// doc comment for the identical reasoning). internal/worker.RedisSource.
+// Connect calls this setter with the env-aware, watchdog-derived value from
+// ResolveConsumerDeadAfter, the same cross-package-boundary pattern
+// SetStalePendingReclaimMinIdle already uses.
+func (c *Client) SetConsumerDeadAfter(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.consumerDeadAfter = d
+}
+
+// SetConsumerLivenessChecker overrides the function ReclaimStalePendingOnQueue
+// uses to determine which cross-consumer PEL owners are provably dead. Tests
+// use this to inject a fake liveness signal rather than depending on
+// miniredis's incomplete XINFO CONSUMERS semantics (see consumerLiveness's
+// doc comment). Passing nil restores the default (real XINFO CONSUMERS).
+func (c *Client) SetConsumerLivenessChecker(fn ConsumerLivenessFunc) {
+	c.consumerLiveness = fn
 }
 
 // Connect establishes connection to Redis.
@@ -224,6 +352,206 @@ func (c *Client) ReadJobMultiBlock(ctx context.Context, queues []string, blockMs
 	}
 
 	return nil, "", nil
+}
+
+// StalePendingReclaimMinIdle is the package-level DEFAULT for how long a
+// delivered-but-unacknowledged message must sit idle in the consumer
+// group's pending-entries list (PEL) before ReclaimStalePending(OnQueue)
+// will consider stealing it (via XPENDING + a targeted XCLAIM -- see that
+// method's doc comment for the citadel-cli#999 cross-consumer liveness gate
+// layered on top of this floor) and make it eligible for redelivery
+// (citadel-cli issue #871). It is only what a *new* Client is constructed
+// with; internal/worker.RedisSource.Connect immediately overrides it per
+// instance, via SetStalePendingReclaimMinIdle, with an env-aware value
+// derived from the actual resolved long-tier watchdog ceiling
+// (internal/worker.ResolveStalePendingReclaimFloor) -- see that function's
+// doc comment for the exact formula and why a fixed constant here is not
+// enough on its own (citadel-cli#998 review).
+//
+// This mechanism exists because XREADGROUP's ">" ID NEVER returns an
+// already-delivered message again -- not to a replacement consumer after a
+// crash, and not even back to the SAME consumer that originally read it
+// (verified against miniredis, a Redis-protocol reimplementation: see
+// internal/redis's TestXReadGroupNeverRedeliversAlreadyDeliveredMessage).
+// Without an explicit reclaim step somewhere in the read path,
+// RedisSource.Nack's "don't ACK, let it retry" comment was aspirational:
+// the message just sits in the PEL forever, nothing ever reads it again,
+// and it never reaches the DLQ either. That turns issue #826's willRetry()
+// suppression of the terminal "error" stream event into a PERMANENT
+// silence bug (the backend waits forever for a stream event that will
+// never arrive) rather than the "deferred until the next attempt or the
+// DLQ" behavior it was designed around.
+//
+// This constant alone is NOT the safety guarantee against stealing a live
+// bounded job -- see ResolveStalePendingReclaimFloor for why an operator-
+// tunable watchdog timeout requires the floor to be resolved dynamically,
+// with a margin, rather than hardcoded here.
+//
+// A package var (not a const) so tests can shrink it instead of sleeping
+// real time.
+var StalePendingReclaimMinIdle = 4 * time.Hour
+
+// ReclaimStalePending is ReclaimStalePendingOnQueue for the client's primary
+// (single-queue) configuration.
+func (c *Client) ReclaimStalePending(ctx context.Context) (*Job, error) {
+	return c.ReclaimStalePendingOnQueue(ctx, c.queueName)
+}
+
+// reclaimCandidateScanLimit bounds how many stale (idle >= reclaimMinIdle)
+// PEL entries ReclaimStalePendingOnQueue inspects via XPENDING per call. A
+// cross-consumer candidate whose owner turns out to be alive is skipped
+// (not claimed), so a single call may need to look past more than one
+// candidate to find one that is actually claimable; this bounds that scan
+// so one poll can never turn into an unbounded XPENDING page walk.
+const reclaimCandidateScanLimit = 50
+
+// ReclaimStalePendingOnQueue attempts to steal exactly one message from
+// queue's pending-entries list (PEL) that has been idle at least this
+// client's reclaimMinIdle (StalePendingReclaimMinIdle by default, or the
+// env-aware value SetStalePendingReclaimMinIdle installed), reassigning it
+// to this client's own consumer name. Returns (nil, nil) whenever nothing
+// is eligible -- the overwhelming common case on every poll -- so callers
+// can unconditionally fall through to their normal read.
+//
+// A successful claim increments the message's delivery count (matching
+// XAUTOCLAIM's pre-#999 behavior, verified against miniredis: internal/
+// redis's TestReclaimStalePendingOnQueue) -- so the existing DLQ cutoff
+// (deliveryCount >= MaxAttempts in RedisSource's nextSingle/nextMulti) and
+// willRetry's retry signal (internal/worker/runner.go) both continue to work
+// completely unmodified. This method only supplies the missing "does
+// redelivery actually happen at all" half described in
+// StalePendingReclaimMinIdle's doc comment.
+//
+// citadel-cli#999 fix: a stale entry is no longer claimed unconditionally.
+// SELF-owned entries (Consumer == c.workerID) are claimed exactly as
+// before -- a self-claim can never cause cross-process double-execution
+// (there is only one process involved), and #871/#998's whole point is
+// making a Nacked-but-never-redelivered message from THIS SAME process
+// eventually retry, which requires exactly this path to keep working
+// unconditionally. A CROSS-consumer entry (owned by some other consumer
+// name -- i.e. a different `citadel work` process sharing this consumer
+// group, the horizontal-scaling case) is claimed ONLY when that owning
+// consumer is independently confirmed dead via consumerLiveness (real
+// XINFO CONSUMERS by default) -- idle, with no XREADGROUP/XCLAIM/XAUTOCLAIM
+// interaction on this group, for at least consumerDeadAfter. A live
+// process keeps re-polling for new work whenever it isn't itself blocked on
+// a job's own execution -- either dispatched INLINE (maxConcurrency<=1) or
+// synchronously acquiring a FULL semaphore-pool slot (maxConcurrency>1) --
+// and that blocking window is itself bounded by the resolved DEFAULT-tier
+// watchdog: every job type that can reach either of those paths is, by
+// construction, none of long-session, needsSerializedLane's superset
+// (the unbounded-lane job types plus the manifest/lockfile writers), or
+// GPU-bound-with-a-tracker -- all three always dispatch onto their own
+// lane/goroutine instead (internal/worker/runner.go's dispatch switch).
+// consumerDeadAfter's production value (internal/worker.
+// ResolveConsumerDeadAfter) is derived to exceed THAT ceiling too, not just
+// the poll interval -- see its doc comment -- so this distinguishes "the
+// owning process crashed" from "the owning process is fine, just mid-poll
+// or mid-execution" without needing any per-job signal. Liveness that
+// cannot be determined at all (a lookup error, or the consumer simply
+// absent from XINFO CONSUMERS' result) fails OPEN -- never claimed -- per
+// ConsumerLivenessFunc's contract; this method tries the next stale
+// candidate instead of aborting the whole call.
+//
+// This closes citadel-cli#999's gap (1) (cross-consumer steal of a still-
+// executing job) for any consumer XINFO CONSUMERS can prove dead. It does
+// NOT fully close gap (2) (a healthy UNBOUNDED job on the SAME process that
+// outlives roughly (MaxAttempts-1) reclaim cycles still gets MoveToDLQ'd) --
+// though in practice this also narrows gap (2), since a self-claim now only
+// happens for entries genuinely owned by this same live process, unchanged
+// from before. A dedicated per-job-type opt-out for gap (2) remains a
+// separate, not-yet-built follow-up (see CLAUDE.md's Direct-Redis
+// redelivery section).
+func (c *Client) ReclaimStalePendingOnQueue(ctx context.Context, queue string) (*Job, error) {
+	candidates, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: queue,
+		Group:  c.consumerGroup,
+		Idle:   c.reclaimMinIdle,
+		Start:  "-",
+		End:    "+",
+		Count:  reclaimCandidateScanLimit,
+	}).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to list stale pending entries on %s: %w", queue, err)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Only pay for a consumer-liveness lookup when at least one candidate
+	// actually needs it -- the common single-process case (every stale
+	// candidate is self-owned) never calls XINFO CONSUMERS at all.
+	needsLiveness := false
+	for _, p := range candidates {
+		if p.Consumer != c.workerID {
+			needsLiveness = true
+			break
+		}
+	}
+	var dead map[string]bool
+	if needsLiveness {
+		// Error deliberately ignored: dead stays nil, and the per-candidate
+		// check below treats "not found in a nil/empty map" as "cannot
+		// prove death" -- fail open, exactly per ConsumerLivenessFunc's
+		// contract.
+		dead, _ = c.deadConsumers(ctx, queue)
+	}
+
+	for _, p := range candidates {
+		if p.Consumer != c.workerID && !dead[p.Consumer] {
+			continue
+		}
+
+		msgs, claimErr := c.client.XClaim(ctx, &redis.XClaimArgs{
+			Stream:   queue,
+			Group:    c.consumerGroup,
+			Consumer: c.workerID,
+			MinIdle:  c.reclaimMinIdle,
+			Messages: []string{p.ID},
+		}).Result()
+		if claimErr != nil {
+			if claimErr == redis.Nil {
+				continue // raced with someone else claiming it first
+			}
+			return nil, fmt.Errorf("failed to claim stale pending message %s on %s: %w", p.ID, queue, claimErr)
+		}
+		if len(msgs) == 0 {
+			continue // no longer idle enough by the time we claimed -- raced
+		}
+		return c.parseMessage(msgs[0])
+	}
+
+	return nil, nil
+}
+
+// deadConsumers resolves consumerLiveness (or defaultConsumerLiveness when
+// unset) for queue's consumer group.
+func (c *Client) deadConsumers(ctx context.Context, queue string) (map[string]bool, error) {
+	if c.consumerLiveness != nil {
+		return c.consumerLiveness(ctx, queue, c.consumerGroup, c.consumerDeadAfter)
+	}
+	return defaultConsumerLiveness(ctx, c.client, queue, c.consumerGroup, c.consumerDeadAfter)
+}
+
+// defaultConsumerLiveness is the production ConsumerLivenessFunc: a single
+// XINFO CONSUMERS call, classifying every consumer whose Idle (real Redis:
+// ms since its last attempted XREADGROUP/XCLAIM/XAUTOCLAIM interaction with
+// this group, successful or not) is at least deadAfter as dead. A negative
+// Idle (miniredis's sentinel for "never interacted", see consumerLiveness's
+// doc comment) is always < deadAfter and so is never dead -- fail open.
+func defaultConsumerLiveness(ctx context.Context, client *redis.Client, queue, group string, deadAfter time.Duration) (map[string]bool, error) {
+	consumers, err := client.XInfoConsumers(ctx, queue, group).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list consumers for %s/%s: %w", queue, group, err)
+	}
+	dead := make(map[string]bool, len(consumers))
+	for _, cons := range consumers {
+		dead[cons.Name] = cons.Idle >= deadAfter
+	}
+	return dead, nil
 }
 
 // AckJobOnQueue acknowledges a message on a specific queue (for multi-queue mode).

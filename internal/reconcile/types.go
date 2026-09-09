@@ -48,6 +48,18 @@ const (
 	StatusStopped DesiredStatus = "stopped"
 )
 
+// ManagedByDesiredState is the provenance stamp (citadel#624 D1) that marks an
+// installed module as one the control-plane desired-state / MODULE_SET install
+// path put on this node. It is the ONLY provenance value that makes a module
+// eligible for drift-uninstall by Reconcile: an entry with any other value
+// (including the empty default — operator/catalog-installed via the CLI, an
+// embedded engine, or the bespoke WhatsApp bridge) is NEVER uninstalled by
+// drift reconciliation, even when absent from a NON-empty desired set. This is
+// the aceteam#4273 blast-radius guard: a single-row desired assignment can no
+// longer tear down every other module-recorded service on the node. See
+// InstalledModule.ManagedBy and the uninstall branch in engine.go's Reconcile.
+const ManagedByDesiredState = "desired-state"
+
 // ModuleAssignment is one entry of a node's desired state: a module the control
 // plane has assigned to this node, by source, with config overrides and a
 // target run-state.
@@ -209,6 +221,13 @@ type InstalledModule struct {
 	// per-module failure-isolation surface: a module that failed to converge
 	// reports its error here without blocking the others.
 	Error string `json:"error,omitempty"`
+	// ManagedBy is the provenance of this installed module (citadel#624 D1),
+	// plumbed from the lockfile entry by ListInstalled. Only an entry stamped
+	// ManagedByDesiredState is eligible for drift-uninstall by Reconcile; any
+	// other value (including empty) is protected. It is a node-local converge
+	// input, NOT part of the upstream ActualState report (the proto reporters
+	// deliberately drop it — see proto_provider.go / nodestate).
+	ManagedBy string `json:"managed_by,omitempty"`
 }
 
 // ActualState is the node's report of what it actually has installed, posted

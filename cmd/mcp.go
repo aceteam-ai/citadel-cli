@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/spf13/cobra"
 )
 
@@ -102,6 +104,18 @@ type mcpBridge struct {
 	// back to the live os.Stdout via bridgeStdout() when unset (every
 	// existing test constructs a bare &mcpBridge{} and relies on that).
 	stdout io.Writer
+
+	// nodeID is this node's own fabric node id (citadel-cli#977,
+	// aceteam#8657/#8767), resolved ONCE at startup (runMCP) via
+	// resolveNodeIDForMCPHeader -- never re-resolved per request, mirroring
+	// stdout above. forwardToBackend attaches it as the X-Citadel-Node-Id
+	// request header so the backend's resolve_caller_host_node
+	// (python-backend utils/shell_dispatch.py) can recognize a request as
+	// originating ON this node instead of routing it through the remote
+	// node:exec/passcode gate. Empty on essentially every real node today
+	// (see resolveNodeIDForMCPHeader's doc comment) -- forwardToBackend must
+	// OMIT the header entirely when this is "", never send it empty.
+	nodeID string
 }
 
 // bridgeStdout returns the JSON-RPC transport writer -- see the stdout
@@ -170,6 +184,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 		// this is always the real transport -- never a captureStdout pipe.
 		// See the stdout field's doc comment.
 		stdout: os.Stdout,
+		// Resolved HERE, once, rather than per-request -- see the nodeID
+		// field's doc comment.
+		nodeID: resolveNodeIDForMCPHeader(),
 	}
 
 	Debug("MCP bridge starting: server=%s, url=%s, local_tools=%d", mcpServer, apiURL, len(bridge.localTools))
@@ -518,6 +535,16 @@ func (b *mcpBridge) forwardToBackend(req *jsonRPCRequest) ([]byte, error) {
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
 	httpReq.Header.Set("Authorization", "Bearer "+b.apiKey)
 
+	// x-citadel-node-id (citadel-cli#977): a locality signal for the
+	// backend's resolve_caller_host_node, carrying this node's own fabric
+	// node id -- see the nodeID field's doc comment. Omitted entirely (not
+	// sent empty) when unresolved: an empty header is worse than no header,
+	// since a naive backend check for header presence would otherwise read
+	// as "caller claims to be node ''" instead of "caller sent no claim".
+	if b.nodeID != "" {
+		httpReq.Header.Set("X-Citadel-Node-Id", b.nodeID)
+	}
+
 	// Include session ID if we have one from a previous initialize.
 	if b.sessionID != "" {
 		httpReq.Header.Set("Mcp-Session-Id", b.sessionID)
@@ -663,6 +690,41 @@ func getAPIURLFromConfig() string {
 		return dc.APIBaseURL
 	}
 	return ""
+}
+
+// resolveNodeIDForMCPHeader resolves this node's own fabric/platform node id
+// for the X-Citadel-Node-Id request header (citadel-cli#977,
+// aceteam#8657/#8767 slice 1): one of the two locality signals the backend's
+// resolve_caller_host_node (python-backend utils/shell_dispatch.py) uses to
+// recognize a request as originating ON this node, so an agent running here
+// gets redirected to its own local shell instead of the remote
+// node:exec/passcode gate.
+//
+// Reuses cmd/whoami.go's exact platform-node-id preference order via the
+// shared resolvePlatformNodeID helper (DeviceConfig.FabricNodeID, aceteam
+// #8139, wins when present; falls back to the legacy SSHSyncConfig.NodeID
+// slot) -- deliberately NOT gatherIdentity itself, which additionally
+// performs a live mesh reconnect probe and writes identity.json. Neither
+// belongs on citadel mcp's startup path: this bridge needs a fast, local,
+// side-effect-free read, not a network round-trip or a cache write.
+//
+// Returns "" when unresolved -- which is the common case on every real node
+// today, since no backend process yet echoes FabricNodeID back to a node
+// (see cmd/whoami.go's package doc comment). Callers must omit the header
+// entirely on "", never send it empty.
+func resolveNodeIDForMCPHeader() string {
+	var fabricNodeID string
+	if dc := getDeviceConfigFromFile(); dc != nil {
+		fabricNodeID = dc.FabricNodeID
+	}
+
+	nodeConfigDir := network.GetNodeConfigDir()
+	var sshSyncNodeID string
+	if sshConfig, err := nexus.LoadSSHSyncConfig(nodeConfigDir); err == nil && sshConfig != nil {
+		sshSyncNodeID = sshConfig.NodeID
+	}
+
+	return resolvePlatformNodeID(fabricNodeID, sshSyncNodeID)
 }
 
 // truncate shortens a string to maxLen, appending "..." if truncated.

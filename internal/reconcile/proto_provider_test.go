@@ -130,6 +130,176 @@ func TestProtoProviderReportStampsAppliedRevision(t *testing.T) {
 	}
 }
 
+// fakeBridgeEndpoints is a settable BridgeEndpointsProvider for tests.
+type fakeBridgeEndpoints struct {
+	module *fabricpb.ActualModule
+	calls  int
+}
+
+func (f *fakeBridgeEndpoints) BridgeModule(context.Context) *fabricpb.ActualModule {
+	f.calls++
+	return f.module
+}
+
+func bridgeModuleFixture(fingerprint string) *fabricpb.ActualModule {
+	return &fabricpb.ActualModule{
+		Source: "whatsapp-bridge",
+		Status: fabricpb.ModuleStatus_MODULE_STATUS_RUNNING,
+		Health: fabricpb.ModuleHealth_MODULE_HEALTH_HEALTHY,
+		Endpoints: []*fabricpb.ModuleEndpoint{
+			{
+				Name:                "bridge",
+				Kind:                "rest",
+				Scheme:              "https",
+				Port:                8443,
+				Path:                "/modules/whatsapp",
+				Health:              fabricpb.ModuleHealth_MODULE_HEALTH_HEALTHY,
+				HealthPath:          "/health",
+				AdminKeyFingerprint: fingerprint,
+			},
+		},
+	}
+}
+
+// TestProtoProviderReportAppendsBridgeModule pins the reconcile-side half of
+// the "two-reporter flap" fix (citadel#624 design review, point 1): Report
+// appends the SAME BridgeEndpointsProvider's row that nodestate.Emitter
+// appends, unconditionally (this loop has no telemetry-opt-out gate to
+// exempt).
+func TestProtoProviderReportAppendsBridgeModule(t *testing.T) {
+	tr := &fakeTransport{}
+	p := NewProtoProvider(tr, tr, "node-1", "v1")
+	bridge := &fakeBridgeEndpoints{module: bridgeModuleFixture("sha256:abcd")}
+	p.BridgeEndpoints = bridge
+
+	if err := p.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{{Name: "embedding", Source: "embedding", Health: HealthRunning}},
+	}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if bridge.calls != 1 {
+		t.Fatalf("bridge provider called %d times, want 1", bridge.calls)
+	}
+
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(tr.postBody, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.GetModules()) != 2 {
+		t.Fatalf("want 2 modules (reconciled + bridge), got %d", len(got.GetModules()))
+	}
+	var sawBridge bool
+	for _, m := range got.GetModules() {
+		if m.GetSource() == "whatsapp-bridge" {
+			sawBridge = true
+			if len(m.GetEndpoints()) != 1 {
+				t.Errorf("bridge endpoints = %d, want 1", len(m.GetEndpoints()))
+			}
+		}
+	}
+	if !sawBridge {
+		t.Fatalf("bridge module row missing from report")
+	}
+}
+
+// TestProtoProviderReportBridgeRealRowSuppressesSyntheticRow pins citadel#624
+// sub-collision 4 (decorator) on the reconcile reporter: once the bridge is a
+// first-class lockfile module, `actual` already carries its REAL row (Source ==
+// "whatsapp-bridge"). Report must NOT append a SECOND synthetic row for the same
+// source; it must attach the synthetic row's endpoints (+ fingerprint) onto the
+// real row instead. Ingest is upsert-by-(node_id, source), so a duplicate source
+// would flap.
+func TestProtoProviderReportBridgeRealRowSuppressesSyntheticRow(t *testing.T) {
+	tr := &fakeTransport{}
+	p := NewProtoProvider(tr, tr, "node-1", "v1")
+	p.BridgeEndpoints = &fakeBridgeEndpoints{module: bridgeModuleFixture("sha256:abcd")}
+
+	// `actual` already has the bridge as a real lockfile-derived module.
+	if err := p.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{
+			{Name: "whatsapp-bridge", Source: "whatsapp-bridge", Health: HealthRunning},
+		},
+	}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(tr.postBody, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var bridgeRows int
+	var withEndpoints int
+	for _, m := range got.GetModules() {
+		if m.GetSource() == "whatsapp-bridge" {
+			bridgeRows++
+			if len(m.GetEndpoints()) == 1 {
+				withEndpoints++
+			}
+		}
+	}
+	if bridgeRows != 1 {
+		t.Fatalf("want exactly 1 bridge row (real, decorated), got %d (%+v)", bridgeRows, got.GetModules())
+	}
+	if withEndpoints != 1 {
+		t.Fatalf("the real bridge row must carry the synthetic endpoints after the decorator merge")
+	}
+}
+
+// TestProtoProviderReportNilBridgeProviderIsNoOp: an unset BridgeEndpoints
+// (the zero value, i.e. every existing caller that predates this field) must
+// behave exactly as before -- no synthetic row, no panic.
+func TestProtoProviderReportNilBridgeProviderIsNoOp(t *testing.T) {
+	tr := &fakeTransport{}
+	p := NewProtoProvider(tr, tr, "node-1", "v1")
+
+	if err := p.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{{Name: "embedding", Source: "embedding", Health: HealthRunning}},
+	}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	var got fabricpb.ActualState
+	if err := proto.Unmarshal(tr.postBody, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.GetModules()) != 1 {
+		t.Fatalf("want 1 module (no bridge appended), got %d", len(got.GetModules()))
+	}
+}
+
+// TestProtoProviderReportMarshaledStateNeverContainsSecretBytes is the
+// required structural-safety pin at the ActualState level (citadel#624 design
+// review): a marshaled report for a module whose env holds a secret never
+// contains those secret bytes.
+func TestProtoProviderReportMarshaledStateNeverContainsSecretBytes(t *testing.T) {
+	const secretAdminKey = "wab_admin_TOTALLY-SECRET-DO-NOT-LEAK-9f8e7d6c5b4a"
+	fp := "sha256:" + strings.Repeat("a", 16) // stand-in one-way digest shape
+	tr := &fakeTransport{}
+	p := NewProtoProvider(tr, tr, "node-1", "v1")
+	p.BridgeEndpoints = &fakeBridgeEndpoints{module: bridgeModuleFixture(fp)}
+
+	if err := p.Report(context.Background(), ActualState{}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if strings.Contains(string(tr.postBody), secretAdminKey) {
+		t.Fatalf("marshaled ActualState contains raw secret bytes")
+	}
+
+	// Same pin on the DECORATOR (real-row) path (citadel#624 sub-collision 4):
+	// a report whose `actual` already carries the bridge's real row, decorated
+	// with the endpoint fingerprint, must also never contain the raw secret.
+	tr2 := &fakeTransport{}
+	p2 := NewProtoProvider(tr2, tr2, "node-1", "v1")
+	p2.BridgeEndpoints = &fakeBridgeEndpoints{module: bridgeModuleFixture(fp)}
+	if err := p2.Report(context.Background(), ActualState{
+		Modules: []InstalledModule{{Name: "whatsapp-bridge", Source: "whatsapp-bridge", Health: HealthRunning}},
+	}); err != nil {
+		t.Fatalf("Report (real-row): %v", err)
+	}
+	if strings.Contains(string(tr2.postBody), secretAdminKey) {
+		t.Fatalf("marshaled ActualState (real-row decorator path) contains raw secret bytes")
+	}
+}
+
 func TestProtoProviderReportDefaultsNodeID(t *testing.T) {
 	tr := &fakeTransport{}
 	p := NewProtoProvider(tr, tr, "fallback-node", "v1")

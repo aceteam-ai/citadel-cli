@@ -94,6 +94,12 @@ const (
 	// var supplies the HOST publish so `${CITADEL_UNLIMITED_OCR_HOST_PORT}`
 	// resolves at `docker compose up`.
 	EnvUnlimitedOCRHostPort = "CITADEL_UNLIMITED_OCR_HOST_PORT"
+	// EnvOmniVoiceHostPort carries the host port for the omnivoice text-to-speech
+	// service (k2-fsa/OmniVoice, served by the citadel inference server --
+	// citadel-cli#1007, docs/design-generic-inference-server.md). Like bonsai/
+	// kokoro/unlimited-ocr it is an EMBEDDED ServiceMap compose (services/compose/
+	// omnivoice.yml), so its compose defers the host publish to this var.
+	EnvOmniVoiceHostPort = "CITADEL_OMNIVOICE_HOST_PORT"
 )
 
 // Citadel-assigned host ports for the pre-packaged compose services. These are
@@ -181,6 +187,14 @@ const (
 	// above). It is an embedded ServiceMap compose, so its container serves on
 	// :8000 and this is the HOST publish.
 	UnlimitedOCRHostPort = 8213
+	// omnivoice: k2-fsa/OmniVoice (0.6B zero-shot TTS diffusion-LM), the first
+	// consumer of the citadel inference server (CIS, citadel-cli#1007). Next
+	// free slot in the 8200 block after unlimited-ocr's 8213 (8205 is hermes's,
+	// see above). It is an embedded ServiceMap compose, so its container serves
+	// on :8000 and this is the HOST publish, bound to 127.0.0.1 only (like
+	// kokoro, the service has no auth of its own and its sole consumer is the
+	// co-located citadel worker).
+	OmniVoiceHostPort = 8214
 )
 
 // WyzeBridgeRTSPPort is docker-wyze-bridge's RTSP server port in the nvr module
@@ -214,6 +228,7 @@ var ServiceHostPorts = map[string]int{
 	"kokoro":        TTSHostPort,
 	"nvr":           FrigateHostPort,
 	"unlimited-ocr": UnlimitedOCRHostPort,
+	"omnivoice":     OmniVoiceHostPort,
 }
 
 // serviceHostPortEnv maps each managed service to the compose env-var that
@@ -232,6 +247,7 @@ var serviceHostPortEnv = map[string]string{
 	"kokoro":        EnvTTSHostPort,
 	"nvr":           EnvFrigateHostPort,
 	"unlimited-ocr": EnvUnlimitedOCRHostPort,
+	"omnivoice":     EnvOmniVoiceHostPort,
 }
 
 // HostPortEnv returns "KEY=value" entries for every citadel-managed host port,
