@@ -2377,3 +2377,18 @@ Auto-generated log of every release.
   - feat: port Secret/PII/FERPA detectors to internal/trust checks (#1004) (#1011)
 
 
+---
+
+## v2.152.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 3 |
+| Lines added | +496 |
+
+**Changes:**
+
+  - fix: agentsprobe S2-gate — invoker-scoped HOME/PATH + honest auth-unknown (#1005) (#1012)
+
+
