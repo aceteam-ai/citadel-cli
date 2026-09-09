@@ -26,8 +26,8 @@ import (
 // output map but is deliberately NOT part of verdict_hash (grounding's
 // grounded/score/claims_checked live here, additive over the DoR core).
 type CheckReport struct {
-	Name         string
-	Version      int
+	Name    string
+	Version int
 	// Action is "pass" or "flag" for this individual check. (block is #8253
 	// S5's policy-driven posture and is not produced on-node yet.)
 	Action string
