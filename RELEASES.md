@@ -2362,3 +2362,18 @@ Auto-generated log of every release.
   - fix: reclaim only steals from provably-dead consumers (#999) (#1010)
 
 
+---
+
+## v2.151.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 7 |
+| Lines added | +1112 |
+
+**Changes:**
+
+  - feat: port Secret/PII/FERPA detectors to internal/trust checks (#1004) (#1011)
+
+
