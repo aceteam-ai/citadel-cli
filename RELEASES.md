@@ -2346,3 +2346,19 @@ Auto-generated log of every release.
   - feat: citadel agents probe - discovery of installed vendor coding agents (#995)
 
 
+---
+
+## v2.150.0 — 2026-09-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 9 |
+| Lines added | +1236 |
+
+**Changes:**
+
+  - feat: single post-completion Trust Engine hook across all engine paths (#1001) (#1009)
+  - fix: reclaim only steals from provably-dead consumers (#999) (#1010)
+
+
