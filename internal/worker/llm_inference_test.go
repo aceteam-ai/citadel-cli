@@ -2037,8 +2037,17 @@ func TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths(t *testing.T) {
 				t.Errorf(`trust_verdict["action"] = %q, want "pass" (benign content)`, action)
 			}
 			checks, ok := verdict["checks"].([]map[string]any)
-			if !ok || len(checks) != 1 || checks[0]["name"] != "grounding" {
-				t.Errorf(`trust_verdict["checks"] = %#v, want one entry named "grounding"`, verdict["checks"])
+			wantNames := []string{"grounding", "secrets", "pii", "ferpa"}
+			if !ok || len(checks) != len(wantNames) {
+				t.Fatalf(`trust_verdict["checks"] = %#v, want %d entries (grounding + 3 detectors)`, verdict["checks"], len(wantNames))
+			}
+			for i, n := range wantNames {
+				if checks[i]["name"] != n {
+					t.Errorf(`trust_verdict["checks"][%d]["name"] = %v, want %q`, i, checks[i]["name"], n)
+				}
+			}
+			if _, ok := verdict["verdict_hash"].(string); !ok {
+				t.Errorf(`trust_verdict["verdict_hash"] = %#v, want a string`, verdict["verdict_hash"])
 			}
 
 			if _, present := result.Output["aep_receipt"]; !present {
@@ -2094,6 +2103,75 @@ func TestApplyTrustEngine_NoopWithoutHook(t *testing.T) {
 		}
 		if _, present := result.Output["aep_receipt"]; present {
 			t.Errorf("Output = %+v, want no aep_receipt when the guardrail is off", result.Output)
+		}
+	})
+}
+
+// TestApplyTrustEngine_DetectorChecksRegistered pins #8253 S6's contract at the
+// worker seam: with the guardrail on, trust_verdict.checks[] carries grounding
+// plus the three pure detectors (secrets/pii/ferpa) and a verdict_hash; a
+// content-borne secret flips the aggregate action to flag; and with the
+// guardrail off the whole trust_verdict (verdict_hash and detector checks
+// included) is absent, byte-identical to before S6. Signing is turned off here
+// to isolate the verdict from the aep_receipt path.
+func TestApplyTrustEngine_DetectorChecksRegistered(t *testing.T) {
+	t.Setenv(signAEPReceiptsEnvVar, "0")
+	h := NewLLMInferenceHandler()
+	payload := &jobs.LLMInferencePayload{Backend: "vllm", Model: "m", Prompt: "say hello"}
+
+	t.Run("all four checks + verdict_hash present when guardrail on", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		result := h.success(map[string]any{"content": "hello world, nothing sensitive here"})
+		h.applyTrustEngine(payload, "job-a", result)
+
+		verdict, ok := result.Output["trust_verdict"].(map[string]any)
+		if !ok {
+			t.Fatalf("trust_verdict = %#v, want map", result.Output["trust_verdict"])
+		}
+		checks, ok := verdict["checks"].([]map[string]any)
+		wantNames := []string{"grounding", "secrets", "pii", "ferpa"}
+		if !ok || len(checks) != len(wantNames) {
+			t.Fatalf("checks = %#v, want %d entries", verdict["checks"], len(wantNames))
+		}
+		for i, n := range wantNames {
+			if checks[i]["name"] != n {
+				t.Errorf("checks[%d][name] = %v, want %q", i, checks[i]["name"], n)
+			}
+		}
+		if _, ok := verdict["verdict_hash"].(string); !ok {
+			t.Errorf("verdict_hash = %#v, want a string", verdict["verdict_hash"])
+		}
+		if verdict["action"] != "pass" {
+			t.Errorf("action = %v, want pass (benign content)", verdict["action"])
+		}
+	})
+
+	t.Run("secret in output flips aggregate action to flag", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "1")
+		result := h.success(map[string]any{"content": "token: -----BEGIN RSA PRIVATE KEY-----"})
+		h.applyTrustEngine(payload, "job-b", result)
+		verdict := result.Output["trust_verdict"].(map[string]any)
+		if verdict["action"] != "flag" {
+			t.Errorf("action = %v, want flag", verdict["action"])
+		}
+		checks := verdict["checks"].([]map[string]any)
+		var secrets map[string]any
+		for _, c := range checks {
+			if c["name"] == "secrets" {
+				secrets = c
+			}
+		}
+		if secrets == nil || secrets["action"] != "flag" {
+			t.Errorf("secrets check = %#v, want action=flag", secrets)
+		}
+	})
+
+	t.Run("no trust_verdict at all when guardrail off", func(t *testing.T) {
+		t.Setenv(groundingGuardrailEnvVar, "0")
+		result := h.success(map[string]any{"content": "token: -----BEGIN RSA PRIVATE KEY-----"})
+		h.applyTrustEngine(payload, "job-c", result)
+		if _, present := result.Output["trust_verdict"]; present {
+			t.Errorf("Output = %+v, want no trust_verdict (and thus no verdict_hash) when guardrail off", result.Output)
 		}
 	})
 }
