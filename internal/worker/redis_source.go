@@ -140,6 +140,14 @@ func (s *RedisSource) Connect(ctx context.Context) error {
 	// package default. See ResolveStalePendingReclaimFloor's doc comment.
 	s.client.SetStalePendingReclaimMinIdle(ResolveStalePendingReclaimFloor())
 
+	// Install the env-aware cross-consumer liveness threshold (issue #999)
+	// so a live process blocking the fetch loop on an inline job is never
+	// mistaken for a dead consumer before its own DEFAULT-tier watchdog
+	// would have fired, even if WORKER_JOB_TIMEOUT_SECONDS is raised above
+	// internal/redis's BlockMs-derived default. See
+	// ResolveConsumerDeadAfter's doc comment.
+	s.client.SetConsumerDeadAfter(ResolveConsumerDeadAfter())
+
 	// Create consumer groups for all queues
 	if err := s.client.EnsureConsumerGroups(ctx, s.queueNames); err != nil {
 		return fmt.Errorf("failed to create consumer groups: %w", err)
