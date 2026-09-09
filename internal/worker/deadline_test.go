@@ -367,3 +367,57 @@ func TestStalePendingReclaimFloorFallbackMatchesRedisDefault(t *testing.T) {
 			StalePendingReclaimFloorFallback, redisclient.StalePendingReclaimMinIdle)
 	}
 }
+
+// TestResolveConsumerDeadAfter pins citadel-cli#999's fix: the
+// cross-consumer liveness threshold internal/redis.Client uses to decide
+// whether another consumer's stale PEL entry is safe to steal must be
+// resolved from the SAME env var that tunes the DEFAULT-tier watchdog
+// (jobTimeoutDefaultEnvVar, WORKER_JOB_TIMEOUT_SECONDS) -- the ceiling that
+// bounds how long an INLINE job can legitimately block a live process's
+// polling -- and must exceed it by ConsumerDeadAfterMargin, not merely
+// equal it, mirroring ResolveStalePendingReclaimFloor's identical
+// reasoning for the long-tier watchdog.
+func TestResolveConsumerDeadAfter(t *testing.T) {
+	t.Run("default: matches the default watchdog timeout plus margin", func(t *testing.T) {
+		got := ResolveConsumerDeadAfter()
+		want := defaultJobTimeoutSeconds*time.Second + ConsumerDeadAfterMargin
+		if got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+		if got <= defaultJobTimeoutSeconds*time.Second {
+			t.Fatalf("threshold %s is not strictly greater than the watchdog ceiling %ds", got, defaultJobTimeoutSeconds)
+		}
+	})
+
+	t.Run("env-aware: an operator-raised WORKER_JOB_TIMEOUT_SECONDS raises the threshold too", func(t *testing.T) {
+		t.Setenv(jobTimeoutDefaultEnvVar, "10800") // 3h
+		got := ResolveConsumerDeadAfter()
+		want := 3*time.Hour + ConsumerDeadAfterMargin
+		if got != want {
+			t.Fatalf("got %s, want %s", got, want)
+		}
+		if got <= 3*time.Hour {
+			t.Fatalf("threshold %s is not strictly greater than the raised watchdog ceiling 3h", got)
+		}
+	})
+
+	t.Run("unbounded default-tier watchdog falls back to a large sane default", func(t *testing.T) {
+		t.Setenv(jobTimeoutDefaultEnvVar, "0")
+		got := ResolveConsumerDeadAfter()
+		if got != ConsumerDeadAfterFallback {
+			t.Fatalf("got %s, want the fallback %s", got, ConsumerDeadAfterFallback)
+		}
+	})
+}
+
+// TestConsumerDeadAfterFallbackMatchesReclaimFloorFallback pins that the
+// two fallbacks cannot silently diverge -- both exist for the identical
+// "no finite ceiling to exceed" reason, just for different watchdog tiers,
+// and ConsumerDeadAfterFallback is defined as a straight alias of
+// StalePendingReclaimFloorFallback rather than a second literal.
+func TestConsumerDeadAfterFallbackMatchesReclaimFloorFallback(t *testing.T) {
+	if ConsumerDeadAfterFallback != StalePendingReclaimFloorFallback {
+		t.Fatalf("ConsumerDeadAfterFallback %s != StalePendingReclaimFloorFallback %s -- keep these in sync",
+			ConsumerDeadAfterFallback, StalePendingReclaimFloorFallback)
+	}
+}

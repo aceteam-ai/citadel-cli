@@ -55,6 +55,64 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
+// TestDefaultConsumerDeadAfter pins the margin/floor formula
+// defaultConsumerDeadAfter uses to size NewClient's consumerDeadAfter
+// default from BlockMs, so a change to the constants is deliberate rather
+// than an accidental drift.
+func TestDefaultConsumerDeadAfter(t *testing.T) {
+	tests := []struct {
+		name    string
+		blockMs int
+		want    time.Duration
+	}{
+		{"zero blockMs falls back to the floor", 0, defaultConsumerDeadAfterFloor},
+		{"negative blockMs falls back to the floor", -1, defaultConsumerDeadAfterFloor},
+		{"tiny blockMs is clamped to the floor", 100, defaultConsumerDeadAfterFloor},
+		{"default 5s blockMs margin (100s) is still below the 2min floor", 5000, defaultConsumerDeadAfterFloor},
+		{"large blockMs scales via the margin, not the floor", 30000, 600 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := defaultConsumerDeadAfter(tt.blockMs)
+			if got != tt.want {
+				t.Errorf("defaultConsumerDeadAfter(%d) = %v, want %v", tt.blockMs, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewClientSetsConsumerDeadAfterFromBlockMs pins that NewClient actually
+// wires defaultConsumerDeadAfter's result onto the constructed Client,
+// rather than leaving consumerDeadAfter at its zero value.
+func TestNewClientSetsConsumerDeadAfterFromBlockMs(t *testing.T) {
+	client := NewClient(ClientConfig{BlockMs: 5000})
+	want := defaultConsumerDeadAfter(5000)
+	if client.consumerDeadAfter != want {
+		t.Errorf("consumerDeadAfter = %v, want %v", client.consumerDeadAfter, want)
+	}
+}
+
+// TestSetConsumerDeadAfterIgnoresNonPositive mirrors
+// SetStalePendingReclaimMinIdle's existing "no threshold at all" rule.
+func TestSetConsumerDeadAfterIgnoresNonPositive(t *testing.T) {
+	client := NewClient(ClientConfig{})
+	original := client.consumerDeadAfter
+
+	client.SetConsumerDeadAfter(0)
+	if client.consumerDeadAfter != original {
+		t.Errorf("SetConsumerDeadAfter(0) changed the threshold to %v, want unchanged %v", client.consumerDeadAfter, original)
+	}
+	client.SetConsumerDeadAfter(-time.Second)
+	if client.consumerDeadAfter != original {
+		t.Errorf("SetConsumerDeadAfter(negative) changed the threshold to %v, want unchanged %v", client.consumerDeadAfter, original)
+	}
+
+	client.SetConsumerDeadAfter(90 * time.Second)
+	if client.consumerDeadAfter != 90*time.Second {
+		t.Errorf("SetConsumerDeadAfter(90s) = %v, want 90s", client.consumerDeadAfter)
+	}
+}
+
 func TestClientWorkerID(t *testing.T) {
 	client := NewClient(ClientConfig{})
 
