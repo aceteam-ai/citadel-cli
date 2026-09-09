@@ -189,10 +189,11 @@ Two things the experiment surfaced that a prose evaluation would not have:
   (verified from their `go.mod`, §9.6), so it is production-exercised. Python
   `jcs`: three releases, last 2022-04, silent integer rounding. `rfc8785`:
   eight releases, last 2024-09, pure Python, typed, fail-closed — the better
-  choice. Matrix's `canonicaljson` 2.0.0 is **not** RFC 8785 for numbers
-  (renders `1.0` as `1.0` via Python `repr`, §9.5 — note #1018 §3.4 said it
-  "refuses floats"; 1.x did, 2.0.0 accepts them non-conformantly) and is
-  disqualified. Mitigation that makes the risk small: the Go side is ~300
+  choice. Matrix's `canonicaljson` is **not** RFC 8785 for numbers: both 1.6.5 and
+  2.0.0 render `1.0` as `1.0` via Python `repr` (§9.5). #1018 §3.4 described
+  it as "refusing floats entirely" — that is the Matrix canonical-JSON
+  *specification*'s rule, not what the library enforces in either version
+  tested. Disqualified either way. Mitigation that makes the risk small: the Go side is ~300
   lines over `strconv` and can be vendored into `internal/aep/jcs` with the
   cyberphone corpus subset as its test; the Python side is ~200 lines.
 - **R2.2 — No NaN/±Inf.** JSON cannot carry them; every library refuses.
@@ -580,10 +581,11 @@ Scratch test against the real `aep.Canonicalize` (deleted after the run):
 `{Engine:"bonsai\nx", Model:"y"}` and `{Engine:"bonsai", Model:"x\ny"}` (all
 other fields equal) → identical bytes `"n\nj\nt\nbonsai\nx\ny\ntrue\n1.000000\n0\nh"`.
 
-### 9.5 `canonicaljson` 2.0.0
+### 9.5 `canonicaljson` 2.0.0 and 1.6.5
 
-`{"score": 0.5}` → `{"score":0.5}`; `{"score": 1.0}` → `{"score":1.0}` (Python
-`repr`, not ES6 — non-conformant, not a refusal); `{"s":"é"}` → raw UTF-8.
+Both versions (separate venvs): `{"score": 0.5}` → `{"score":0.5}`;
+`{"score": 1.0}` → `{"score":1.0}` (Python `repr`, not ES6 — non-conformant,
+not a refusal); `{"n": 1}` → `{"n":1}`; 2.0.0 `{"s":"é"}` → raw UTF-8.
 
 ### 9.6 Adoption / dependency checks
 
