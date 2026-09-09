@@ -241,6 +241,72 @@ func ResolveStalePendingReclaimFloor() time.Duration {
 	return d + ReclaimFloorMargin
 }
 
+// ConsumerDeadAfterMargin is the safety margin added on top of the resolved
+// DEFAULT-tier watchdog when computing the cross-consumer liveness
+// threshold ResolveConsumerDeadAfter hands to internal/redis.Client.
+// SetConsumerDeadAfter (citadel-cli#999). A live process only stops
+// interacting with its consumer group (XREADGROUP/XCLAIM/XAUTOCLAIM) while
+// the fetch loop (Runner.Run's dispatch switch) is itself blocked on a
+// job's own execution -- either dispatched INLINE (maxConcurrency<=1) or
+// synchronously acquiring a FULL semaphore-pool slot (`sem <- struct{}{}`,
+// maxConcurrency>1). Every job type that can reach either of those two
+// paths is, by construction, none of long-session, needsSerializedLane's
+// superset (unboundedJobTypes plus the manifest/lockfile writers), or
+// GPU-bound-with-a-tracker -- all three always dispatch onto their own
+// lane/goroutine instead (see CLAUDE.md's "Node execution model" and
+// "Long-session and GPU-bound jobs get a dedicated always-async lane"
+// sections), so the resolved DEFAULT tier
+// (jobTimeoutDefaultEnvVar/WORKER_JOB_TIMEOUT_SECONDS) is the true worst
+// case such a job can block polling for -- UNLESS the backend attaches an
+// explicit payload timeout_ms above that env ceiling (PR #552's opt-in
+// per-job budget), the same pre-existing floor-vs-explicit-budget shape
+// #998 already accepts for the message-idle floor, not newly introduced
+// here. Without this margin, a liveness threshold merely EQUAL to the
+// resolved ceiling would risk tripping on the synchronous claim-then-
+// execute handoff itself (scheduling jitter between the watchdog's own
+// deadline firing and the next poll actually landing) -- the identical
+// reasoning ReclaimFloorMargin applies to the long-tier watchdog, just for
+// the default tier and a different downstream consumer.
+var ConsumerDeadAfterMargin = 5 * time.Minute
+
+// ConsumerDeadAfterFallback is what ResolveConsumerDeadAfter falls back to
+// when the default-tier watchdog is itself unbounded
+// (WORKER_JOB_TIMEOUT_SECONDS=0): with no finite ceiling on how long such a
+// job can legitimately block polling, no finite liveness threshold can be
+// proven safe against it, mirroring StalePendingReclaimFloorFallback's
+// identical reasoning for the long-tier watchdog. Deliberately the SAME
+// value, for the same "don't silently widen exposure by turning a knob
+// off" reason -- TestConsumerDeadAfterFallbackMatchesReclaimFloorFallback
+// keeps them in sync.
+const ConsumerDeadAfterFallback = StalePendingReclaimFloorFallback
+
+// ResolveConsumerDeadAfter computes the cross-consumer liveness threshold
+// RedisSource.Connect hands to internal/redis.Client.SetConsumerDeadAfter
+// (citadel-cli#999). Mirrors ResolveStalePendingReclaimFloor's shape and
+// the same leaf-package reasoning: internal/redis cannot itself read
+// WORKER_JOB_TIMEOUT_SECONDS, so this function resolves it here and the
+// caller threads the result across the package boundary.
+//
+// internal/redis.Client's own BlockMs-derived default (see
+// defaultConsumerDeadAfter's doc comment there) is a REASONABLE default for
+// a caller with no better signal, but it is not by itself safe against a
+// job that blocks the fetch loop (inline, or on a full semaphore pool --
+// see ConsumerDeadAfterMargin's doc comment for exactly which job types
+// this applies to): a live process legitimately stops polling entirely
+// while one runs, for up to the resolved DEFAULT-tier watchdog ceiling -- a
+// threshold sized only off the poll interval would then falsely read that
+// process as dead partway through an ordinary, healthy job. This function
+// closes that gap the same way ResolveStalePendingReclaimFloor closes the
+// analogous one for the message-idle floor: STRICTLY GREATER than the
+// resolved ceiling, by ConsumerDeadAfterMargin.
+func ResolveConsumerDeadAfter() time.Duration {
+	d, ok := envTimeoutSeconds(jobTimeoutDefaultEnvVar, defaultJobTimeoutSeconds)
+	if !ok {
+		return ConsumerDeadAfterFallback
+	}
+	return d + ConsumerDeadAfterMargin
+}
+
 // jobTimeoutPayloadKey is the wire field the backend dispatcher injects to give
 // a job a per-execution budget (aceteam#6000). It is a RELATIVE duration in
 // milliseconds measured from the moment the worker begins executing the job --
