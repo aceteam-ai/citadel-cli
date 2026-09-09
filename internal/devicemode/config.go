@@ -49,7 +49,11 @@ const (
 
 // Config is the persisted device-mode state written by `citadel device enroll`
 // and read by the daemon loop. It contains no secrets — the private key and
-// leaf live in the nodeidentity store (ConfigDir()/identity/).
+// leaf live in the machine-convergent nodeidentity store
+// (network.GetNodeConfigDir()/identity/, via nodeidentity.Convergent; see K-A,
+// docs/design-trust-receipt-v2.md §4). This Config file itself remains at the
+// invoker-scoped platform.ConfigDir() (ConfigPath below); the two are separate
+// files, so the identity store's convergence does not move this one.
 type Config struct {
 	// NodeUID is the stable fabric identity assigned at enrollment (the leaf's
 	// CN / aceteam:node: SAN value).

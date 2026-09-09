@@ -1661,25 +1661,55 @@ key is unavailable) fails OPEN: the job still succeeds with `content`/
 non-fatally — an injectable field, not a bare `log.Printf`, since this
 package otherwise imports no logger at all).
 
-**Machine-convergent by construction — fixed, not a known hazard.** The
-signing key is NOT `nodeidentity.Default()` (which roots at invoker-scoped
-`platform.ConfigDir()`, see the `ConfigDir()`/`GetNodeConfigDir()` entry
-above — still used, unchanged, by `cmd/device.go`'s device-mode enrollment
-and `cmd/init.go`'s dormant mTLS CSR flow, both of which depend on staying
-invoker-scoped/shared with `citadel init`'s own context). `defaultAEPSigner()`
-(`internal/worker/llm_inference.go`) instead constructs a **separate**
-`nodeidentity.Store` rooted at `aepSigningStoreDir(network.GetNodeConfigDir())`
-— the SAME machine-convergent directory `citadel init`'s device-config write
-(#845) and #726's heartbeat marker already use — so a systemd-root `citadel
-work` and an interactive non-root process resolve the IDENTICAL signing key
-file; a future Phase 2 backend registration of this node's public key can
-never desync from what `citadel work` actually signs with.
-`TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts`
-(`internal/worker/llm_inference_test.go`) pins this directly: two
-independently-constructed `Store` instances resolving the same converged
-`nodeConfigDir` (standing in for two different invocation contexts) load/
-create the identical key. `LLMInferenceHandler.WithSigner` remains the
-override seam for tests and any future signer change.
+**Machine-convergent AND the same key the CA registered — one convergent
+identity store (K-A, `docs/design-trust-receipt-v2.md` §4, citadel-cli#1002 /
+aceteam#8253).** `nodeidentity.Convergent(nodeConfigDir)`
+(`internal/nodeidentity/nodeidentity.go`) is the authority: it roots the store
+at `<nodeConfigDir>/identity` and, on first key/leaf access, does a one-time
+read-through of a key registered under the legacy invoker-scoped
+`platform.ConfigDir()/identity` location. `reconcileFromLegacy` owns the exact
+rule — never displace a REGISTERED convergent key (`node.crt` present is the
+proof), never destroy key material (a differing leafless convergent key is
+copied aside to `node.key.displaced-<ts>`, never removed), never mint a second
+key beside a registered legacy one (a legacy key present but unreadable is a
+HARD error out of `GetOrCreateKey`, not a fall-through to generate). Adoption
+is byte-identical, so the SPKI — and thus any already-issued CA leaf — stays
+valid; no re-pair.
+
+Both the AEP receipt signer AND every CSR/enrollment site now construct this
+same store: `defaultAEPSigner()` (`internal/worker/llm_inference.go`) and
+`ensureNodeIdentity` (`cmd/init.go`) / the three `cmd/device.go` sites all call
+`nodeidentity.Convergent(network.GetNodeConfigDir())`. Before K-A the signer
+rooted at `GetNodeConfigDir()` while the CSR path used `nodeidentity.Default()`
+(`platform.ConfigDir()`) — two keys, so a real receipt's
+`public_key_fingerprint` could never match a `fabric_node_certs` row (every
+real receipt `unverified` while the golden passed). `nodeidentity.Default()`
+still exists but is DEPRECATED for production identity paths (a new
+`Default()` call site is how the split comes back); it is threaded in from
+`cmd`/`internal/worker` because `nodeidentity` is a leaf that must not import
+`internal/network`. Pins: `internal/nodeidentity/convergence_test.go` (adoption
+byte-identical, signer==CSR key, displaced-vs-registered, hard-fail, leaf/chain
+adoption), `TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts` +
+`TestDefaultAEPSigner_SameConvergentStoreAsCSRPath`
+(`internal/worker/llm_inference_test.go`). `ensureNodeIdentity` is split into a
+store-injected `ensureNodeIdentityWithStore` so its smoke test stays hermetic
+(the real `network.GetNodeConfigDir()` resolves to a live node dir on a box
+with `/etc/citadel/config.yaml`). `LLMInferenceHandler.WithSigner` remains the
+override seam for tests.
+
+**Residual, documented (not closed here):** the legacy read-through SOURCE is
+still invoker-scoped (`platform.ConfigDir()`), so a systemd-root `citadel work`
+whose `ConfigDir()` (`/etc/citadel`) holds no key, running with signing enabled
+on a legacy node BEFORE any `citadel init`/enroll re-run in the registering
+user's context, mints a fresh convergent key (no legacy key visible to adopt).
+The operator's next `citadel init`/enroll heals it: it sees a leafless
+convergent key differing from the now-visible legacy key and adopts the legacy
+one (copying the fresh key aside). Signing is OFF by default, so this window is
+narrow. Raw-path leaf readers (`internal/devicemode/reenroll.go`/`renew.go`,
+which read `store.LeafPath()`/`KeyPath()` directly rather than via a Store
+method) are covered only transitively (the key-access on the same flow triggers
+adoption) — acceptable because that mTLS flow is dormant (CA not activated
+fleet-wide).
 
 **Inert until the aceteam-side lands** (design doc §4): signing is fully
 wired citadel-side, but the backend does not yet hold this node's public key
