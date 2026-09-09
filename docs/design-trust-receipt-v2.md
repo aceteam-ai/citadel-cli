@@ -740,3 +740,147 @@ explicit, time-boxed special case — open question §11.5).
 7. **Confirm S3 is now unblocked** (S2 closed 2026-09-09) and may be promoted
    from `blocked` to `automated` on citadel-cli#1002 once questions 1–4 are
    answered, with the §4 prerequisite as its first commit.
+8. **Longer-term only (§12):** whether to file a follow-up for a protobuf
+   schema of the receipt in `fabric-protocol`, gated on one of the §12.5
+   triggers — or to take the zero-dependency middle path (§12.5) now and
+   revisit. Does not affect S3.
+
+---
+
+## 12. Future architecture: should `AEPReceiptV2` be a protobuf single source of truth in `fabric-protocol`?
+
+Owner-requested evaluation, additive to the above. **The S3 recommendation is
+unchanged: match the deployed hand-rolled verifier (#9287), `'f' 6`, newline
+canon.** This section asks whether the *schema* should later move to
+`aceteam-ai/fabric-protocol` so both repos generate from one definition.
+
+### 12.1 The precedent is real, on both sides
+
+- citadel-cli pins `github.com/aceteam-ai/fabric-protocol` and
+  `google.golang.org/protobuf` in `go.mod`; `internal/nodestate` and
+  `internal/reconcile` build generated messages from
+  `proto/aceteam/fabric/v1/node_state.proto` / `node_activity.proto` (the #624
+  pipeline) and send them as **binary** `proto.Marshal` bodies
+  (`nodestate/emitter.go`, `reconcile/proto_provider.go`).
+- aceteam vendors the generated Python (`python-backend/fabricpb/aceteam/fabric/v1/node_state_pb2.py`,
+  `protobuf>=7.35` in `pyproject.toml`, `ruff` excludes the directory as
+  never-hand-edited) and parses those bodies in `routes/fabric_desired_state.py`.
+
+So "one `.proto`, two generated bindings, re-pin on change" is established
+practice here, not an aspiration. The generate/re-pin machinery exists, and its
+cross-repo cost (merge the proto first, re-pin `go.mod` to the merged pseudo-
+version, then merge the consumer) is known.
+
+### 12.2 What a proto SST would actually buy — and which of this doc's findings it would NOT have prevented
+
+**Buys:** the receipt's *shape* — field set, names, scalar types, and the
+`receipt_version` discriminator — defined once. Adding a field is one edit in
+one repo; a consumer that forgets to regenerate fails to compile (Go) or at
+import (Python) rather than silently walking a stale tuple. Today that shape is
+hand-synced in three places (`AEPReceiptV2`'s Go struct, aceteam's
+`_CANONICAL_FIELDS_V2`, and S9's forthcoming port in aceteam-aep), held
+together by a golden fixture and a comment saying "change these in the same PR".
+
+**Does not buy, stated plainly because the question was framed around this
+doc's own findings:** neither of the two real bugs surfaced here is a schema
+bug. §4 (two signing keys) is an *identity-rooting* bug — which file the key is
+read from — and no receipt schema touches it. §2.2 (`input_sha256`) is a
+*bytes-provenance* bug — the node no longer holds the bytes the platform
+hashed — and a schema for the receipt says nothing about the bytes of the
+*payload*. A proto SST would have prevented a class of bug this project has
+not yet had (field-set drift between emitter and verifier), and would have
+been silent on both it has.
+
+### 12.3 The load-bearing caveat: protobuf serialization is not a canonical form, so SST moves the canonicalization problem rather than removing it
+
+proto3 makes no cross-implementation determinism guarantee for serialized
+bytes: field emission order is unspecified, unknown fields are preserved and
+re-emitted, `map` iteration is unordered, and proto3 scalar fields with
+implicit presence are *omitted entirely* at their default value — so
+`grounded=false`, `score=0`, `claims_checked=0` would contribute zero bytes and
+be indistinguishable from "unset" (unless declared `optional`, which changes
+the wire again). Go's `proto.MarshalOptions{Deterministic: true}` and Python's
+`SerializeToString(deterministic=True)` each stabilize map ordering *within
+that implementation* and are documented as not canonical across languages or
+versions. Signing raw proto bytes is therefore out, full stop — the same reason
+JWS/COSE sign an explicit, separately-defined byte string rather than "whatever
+the codec emitted".
+
+So with a proto SST the signed preimage would still need one of:
+
+- **(i) proto3-JSON mapping, then RFC 8785 (JCS).** Rejected as the *primary*
+  path. `protojson` (Go) deliberately emits unstable whitespace to discourage
+  byte comparison; Python's `json_format` renders `int64` as JSON *strings*,
+  defaults field names to lowerCamelCase (breaking the existing snake_case wire
+  keys unless `preserving_proto_field_name=True` / `json_name` is set on every
+  field), and renders `double` via Python's shortest-repr — i.e. the exact
+  `1` vs `1.0` hazard of §3.2 again, now inside the schema layer. Both sides
+  would then need a JCS library on top (§3.4 option C's cost), made mandatory.
+- **(ii) descriptor-driven, field-wise canon (the only variant worth
+  considering).** Keep today's newline-delimited, type-keyed rendering
+  (`bool → true/false`, `double → 'f' 6`, `int → Itoa`, `string → as-is`) but
+  *drive the field list from the message descriptor in field-number order*
+  instead of from a hand-written list. With field numbers assigned 1..15 in
+  the ratified order, the bytes are identical to today's canon — the schema
+  becomes the drift-proof source of the field list, and each language keeps
+  a ~30-line type-keyed renderer with no JCS dependency. This is genuinely a
+  little better than the hand-rolled form on drift resistance, and no better
+  on bytes. Its own trap: adding a field to the `.proto` silently changes the
+  signed canon for every node, so the versioning discipline (new field ⇒ new
+  `receipt_version`, verifier branches) is still required and still manual;
+  the schema does not encode it.
+
+Net: proto SST yields *schema* SST. The canonical form, the float rule, the
+non-empty-field rule, and the version discipline all remain hand-specified —
+just anchored to a descriptor instead of a struct. That is a modest gain, not
+the elimination of the cross-repo canonicalization problem.
+
+### 12.4 Migration cost (it re-touches a shipped, closed verifier)
+
+On the aceteam side, #9287 (closed 2026-09-09) is hand-rolled over plain
+dicts: `_CANONICAL_FIELDS_V2`, `canonicalize_receipt_v2`,
+`_resolve_receipt_version`, `to_attestation`, plus the harness (#9371/#9461)
+whose per-field tamper sweep is written against those dict keys. Adopting a
+proto SST means, at minimum: vendor a new `aep_receipt_pb2.py` into
+`fabricpb/`; parse the receipt (which arrives as a JSON object inside the job
+`Output` map over Redis/the API proxy — it never travels as binary proto)
+through `json_format.Parse` with field-name preservation; rewrite the v2
+canonicalizer as descriptor-driven while keeping the v1 dict path (v1 receipts
+predate any proto); re-point `to_attestation`, `aep_bundle`'s `claims`
+mapping, and the harness; and mirror all of it in S9's aceteam-aep
+`verify-bundle` (a third repo that today has no fabric-protocol dependency at
+all). On the citadel side: the `.proto`, the re-pin, and replacing the
+`AEPReceiptV2` struct with the generated type behind the same `ToMap()`
+contract. Roughly a medium PR in each of three repos, with **zero change in
+what a verified receipt proves**.
+
+### 12.5 Recommendation: not in S3; not by default later; only on a trigger
+
+- **Not in S3.** S3's critical path is the §4 key fix and byte-exact emission
+  against a verifier that is already deployed. Reopening that verifier to
+  change its *representation* (not its behavior) would delay proof-plan item 6
+  for no security or correctness gain, and would make the golden fixture —
+  the actual cross-language contract — depend on a codec migration landing
+  first.
+- **Not at all, absent a trigger.** The golden fixture pins *bytes*; a schema
+  can only pin *shape*. For a 15-field, three-consumer, hand-versioned signed
+  object, a committed golden plus a "same PR" rule is the stronger contract
+  and the cheaper one. Drift the schema would catch, the golden already
+  catches one step later (at test time rather than compile time).
+- **Revisit — as its own slice, never bundled — if any of these appears:**
+  (a) a receipt **v3** with materially more fields (the MoE/calibrated verdict
+  from aep#136, #8033 DAG linkage, per-check structured evidence), where
+  hand-syncing 20+ fields across three repos becomes the dominant drift risk;
+  (b) a **fourth** producer or consumer of the receipt; (c) the receipt
+  moving to **binary transport** alongside `node_state` (then it must be a
+  proto anyway, and (ii) above is the design). If adopted, the shape is fixed
+  by §12.3: proto as schema only, descriptor-driven field-wise canon, JSON
+  wire with preserved snake_case names, never sign proto bytes, every field
+  addition is a `receipt_version` bump.
+- **Zero-cost middle path, available now:** commit the ratified field list
+  once as a machine-readable artifact in the golden directory
+  (`internal/aep/testdata/v2/fields.txt`, one field per line, in canon order)
+  and have *both* repos' tests assert their own field list equals it. That
+  captures most of the drift protection a schema would give — for the field
+  list, which is the part that can drift — with no new dependency, no codec,
+  and no reopening of #9287. Recommended as part of the S3 golden wave.
