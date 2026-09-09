@@ -1194,9 +1194,10 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 	if !groundingGuardrailEnabled() {
 		return
 	}
-	grounding := trust.CheckGrounding(promptTextFromPayload(payload), content)
+	input := promptTextFromPayload(payload)
+	grounding := trust.CheckGrounding(input, content)
 	result.Output["grounding"] = groundingReceiptMap(grounding)
-	result.Output["trust_verdict"] = trustVerdictMap(grounding, content)
+	result.Output["trust_verdict"] = trustVerdictMap(grounding, content, input)
 
 	// Signed AEP receipt (aceteam #8253, the signing half deferred at
 	// citadel#847's merge -- see internal/aep's package doc and
@@ -1237,36 +1238,28 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 // trustVerdictMap shapes the unsigned, human-readable "trust_verdict" map
 // (aceteam #8253's Trust Engine naming; distinct from the legacy "grounding"
 // map, which is kept verbatim alongside it for continuity with pre-#1001
-// consumers). Structured as an aggregate `action` plus a `checks[]` list so
-// a future detector (#8253 S6: secrets/PII/FERPA) slots into the same list
-// without a shape change -- today `checks` has exactly one entry, since
-// grounding is the only Trust Engine check implemented on-node so far.
+// consumers). The whole verdict -- the aggregate `action`, the ordered
+// `checks[]`, and `verdict_hash` -- is assembled by trust.BuildVerdict, which
+// runs grounding plus the pure secrets/PII/FERPA detectors (#8253 S6); this
+// function is a thin adapter that adds the two receipt-level convenience
+// digests the pure package deliberately does not own (output_sha256, and the
+// full "grounding" block including its flagged list).
 //
-// output_sha256 is an UNSIGNED convenience digest of the exact content this
-// verdict was computed over (sha256:<hex>, matching provenance_receipts.py's
-// digest format) -- it lets a caller confirm the verdict corresponds to the
-// output actually in hand without needing the signed receipt. It is NOT a
-// substitute for #8253 S3's signed input/output digests on AEPReceiptV2;
-// this field is never part of anything cryptographically signed.
-func trustVerdictMap(result trust.GroundingResult, content string) map[string]any {
-	action := "pass"
-	if !result.Grounded {
-		action = "flag"
-	}
+// output_sha256 and verdict_hash are BOTH unsigned convenience digests
+// (sha256:<hex>): the former binds the exact content, the latter the verdict
+// object (trust.BuildVerdict, DoR §3, excluding grounding.flagged). Neither
+// is a substitute for #8253 S3's SIGNED AEPReceiptV2 digests -- S3 is what
+// makes verdict_hash a signed canonical field and pins the byte-exact
+// canonical_json the Python verifier recomputes; here it is only a fixity
+// hash, never part of anything cryptographically signed.
+func trustVerdictMap(result trust.GroundingResult, content, input string) map[string]any {
+	v := trust.BuildVerdict(input, content, result, trust.DefaultDetectors())
 	return map[string]any{
-		"action":        action,
+		"action":        v.Action,
 		"output_sha256": sha256Hex(content),
-		"checks": []map[string]any{
-			{
-				"name":           "grounding",
-				"version":        1,
-				"action":         action,
-				"grounded":       result.Grounded,
-				"score":          result.Score,
-				"claims_checked": result.ClaimsChecked,
-			},
-		},
-		"grounding": groundingReceiptMap(result),
+		"verdict_hash":  v.VerdictHash,
+		"checks":        v.CheckMaps(),
+		"grounding":     groundingReceiptMap(result),
 	}
 }
 

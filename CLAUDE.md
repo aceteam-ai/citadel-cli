@@ -1554,24 +1554,42 @@ mirroring `synthesizeReceiptFromHeaders` in
 transmit anything itself — signing is a separate, additional opt-in layered
 on top by the caller, described below.
 
-**`output["trust_verdict"]` (citadel #1001, aceteam #8253 S1) rides alongside
-`grounding`, unsigned.** `trustVerdictMap` (`internal/worker/llm_inference.go`)
-wraps the SAME `GroundingResult` in a `{action, output_sha256, checks[],
-grounding}` shape — `action` is `"pass"`/`"flag"` (aggregate; only grounding
-exists as a check today, so `checks` has exactly one entry), `output_sha256`
-is an unsigned `sha256:<hex>` convenience digest of the exact content the
-verdict was computed over, and the legacy `grounding` map is kept verbatim
-inside it for continuity with pre-#1001 consumers. `checks[]` is deliberately
-a list so a future detector (#8253 S6: secrets/PII/FERPA) slots in without a
-shape change. `trust_verdict` is NOT part of anything cryptographically
-signed — S3 (`AEPReceiptV2`) is what adds real signed input/output/policy
-digests to `aep_receipt` itself; `output_sha256` here is a convenience field
-only, for a caller that wants to confirm a verdict matches the content in
-hand without decoding the signed receipt.
+**`output["trust_verdict"]` (citadel #1001, aceteam #8253 S1/S6) rides
+alongside `grounding`, unsigned.** `trustVerdictMap`
+(`internal/worker/llm_inference.go`) is a thin adapter over
+`trust.BuildVerdict` (`internal/trust/verdict.go`), which owns the pure
+assembly: an aggregate `action` (`"pass"`/`"flag"`; never `"block"` on-node
+yet — that is S5's policy posture), an ordered `checks[]` list, and a
+`verdict_hash`. The adapter adds two receipt-level convenience digests the
+pure package deliberately does not own — `output_sha256` (binds the content)
+and the full legacy `grounding` block (kept verbatim inside for pre-#1001
+consumers).
+
+`checks[]` carries grounding FIRST, then the three pure detectors S6 ported
+from aceteam-aep into `internal/trust/detectors.go` — `secrets`, `pii`,
+`ferpa`, each a network-free/model-free `(input, output) -> []Finding` regex
+check registered via `trust.DefaultDetectors()`. Findings never appear in the
+verdict; only a per-check `evidence_hash` does (bare-hex, the same shape/
+encoding as `internal/aep`'s `flagged_hash`, so grounding's `evidence_hash`
+equals a signed receipt's `flagged_hash` for the same input). `verdict_hash`
+is `sha256:<hex>` over `BuildVerdict`'s DoR §3 canonical trust_verdict object
+(action + the uniform check fields + grounding minus its flagged list) — the
+mechanism the S6 acceptance mutation test pins (drop a detector from the
+injected set → it leaves `checks[]` AND `verdict_hash` changes). Both
+`output_sha256` and `verdict_hash` are UNSIGNED convenience digests; neither
+is part of anything cryptographically signed. S3 (`AEPReceiptV2`) is what
+makes `verdict_hash` a SIGNED canonical field and pins the byte-exact
+`canonical_json` the Python verifier recomputes — until then `BuildVerdict`
+uses `json.Marshal` (deterministic within Go), not aep's fixed float
+formatting.
+
+Excluded from S6 by the ratified DoR (`internal/trust` has no place for
+them): PAW/MoE, CostAnomaly (needs cost context), Content classification
+(needs a model).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt to buffered chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
+| `CITADEL_GROUNDING_GUARDRAIL` | unset (OFF) | Attach the `grounding` receipt AND the `trust_verdict` (grounding + secrets/PII/FERPA checks, `verdict_hash`) to chat-completion results. Truthy: `1`/`true`/`yes`/`on`. |
 
 ### Node identity persistence + signed AEP receipt (aceteam #8139/#8253, `internal/aep`)
 
