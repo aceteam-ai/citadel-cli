@@ -1509,22 +1509,34 @@ nothing to check, not because anything was verified. `ClaimsChecked` is the
 denominator that disambiguates "nothing to check" from "everything checked
 out"; read it alongside Score, never Score alone.
 
-**Wiring is opt-in and single-point, not pervasive.** `llm_inference` serves
-general chat, code generation, and vision/OCR through the SAME handler
+**Wiring is opt-in and consolidated into ONE post-completion hook, not
+duplicated per engine path (citadel #1001, aceteam #8253 S1).** `llm_inference`
+serves general chat, code generation, and vision/OCR through the SAME handler
 (`internal/worker/llm_inference.go`), and "a number in the output not in the
 input" is normal for those (arithmetic answers, port numbers, facts recalled
 from training data) — attaching the guardrail unconditionally would flag most
 of that traffic. `groundingGuardrailEnabled()` gates it behind
 `CITADEL_GROUNDING_GUARDRAIL` (default OFF, like every other advisory-signal
-toggle in this codebase), and the ONE wired call site is
-`bufferedChatCompletions` — the non-streaming chat-completions path, chosen
-because it is the only place both the full input and full output already
-exist as Go strings before anything is sent, so flag-only (the shipped
-default; see `Policy`/`Block`) is safe and gating would be too (a streamed
-reply is already sent token-by-token before the full text exists, so it can
-be flagged post-hoc but not gated). The streaming and llamacpp/ollama
-buffered/stream pairs in that file are documented, not-yet-wired hooks with
-the identical shape.
+toggle in this codebase). `Execute`'s `applyTrustEngine` is the single call
+site — run once, after `Execute`'s backend switch has produced a result from
+whichever of the ten buffered/streaming engine functions actually served the
+request (vLLM/SGLang completions, ollama generate/chat, llama.cpp/bonsai
+completion, and the shared OpenAI-compatible chat-completions path — each
+buffered AND streaming) — rather than inside each function individually. Every
+one of those functions already sets `result.Output["content"]` before
+returning, which is what makes one hook sufficient: it is a POST-completion
+check (never a gate) precisely because a streamed reply is already fully on
+the wire by the time `Execute` sees the final `Output` (tokens went out via
+`stream.WriteChunk` first), so flag-only (the shipped default; see
+`Policy`/`Block`) is safe and gating would not be. Before #1001, the ONLY
+wired call site was `bufferedChatCompletions`, so the streaming agent-chat
+path and every llamacpp/ollama buffered/stream pair left the node with no
+verdict at all (aceteam #8253's "G6" gap) — `applyTrustEngine`'s no-op guard
+(nil result, non-success status, or no string `"content"` key) is what keeps
+a `model_warming`/failure result untouched while still covering every
+content-bearing success path uniformly. `internal/worker/llm_inference_test.go`'s
+`TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths` drives all ten
+functions through a fake engine and pins that the hook fires on every one.
 
 **Known false negative:** `extractClaims`' regex priority gives years
 (`ClaimYear`) precedence over bare counts, so a fabricated count that looks
@@ -1541,6 +1553,21 @@ mirroring `synthesizeReceiptFromHeaders` in
 `internal/jobs/synthesize_speech.go`) and does not sign, persist, or
 transmit anything itself — signing is a separate, additional opt-in layered
 on top by the caller, described below.
+
+**`output["trust_verdict"]` (citadel #1001, aceteam #8253 S1) rides alongside
+`grounding`, unsigned.** `trustVerdictMap` (`internal/worker/llm_inference.go`)
+wraps the SAME `GroundingResult` in a `{action, output_sha256, checks[],
+grounding}` shape — `action` is `"pass"`/`"flag"` (aggregate; only grounding
+exists as a check today, so `checks` has exactly one entry), `output_sha256`
+is an unsigned `sha256:<hex>` convenience digest of the exact content the
+verdict was computed over, and the legacy `grounding` map is kept verbatim
+inside it for continuity with pre-#1001 consumers. `checks[]` is deliberately
+a list so a future detector (#8253 S6: secrets/PII/FERPA) slots in without a
+shape change. `trust_verdict` is NOT part of anything cryptographically
+signed — S3 (`AEPReceiptV2`) is what adds real signed input/output/policy
+digests to `aep_receipt` itself; `output_sha256` here is a convenience field
+only, for a caller that wants to confirm a verdict matches the content in
+hand without decoding the signed receipt.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
