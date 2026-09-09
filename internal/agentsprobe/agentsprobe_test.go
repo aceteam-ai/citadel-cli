@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,18 +73,202 @@ func TestJSONFileNonEmptyObjectState(t *testing.T) {
 		t.Errorf("populated object: got %q, want %q", got, AuthStateAuthed)
 	}
 
-	if runtime.GOOS != "windows" {
-		unreadable := filepath.Join(dir, "noperm.json")
+	// The permission-denied case lives in its own subtest so its t.Skip on a
+	// root runner (where 0o000 bits are not enforced) does not skip the prior
+	// assertions in this test.
+	t.Run("permission denied", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix permission bits are not enforced on windows")
+		}
+		if os.Getuid() == 0 {
+			t.Skip("running as root: permission bits are not enforced")
+		}
+		unreadable := filepath.Join(t.TempDir(), "noperm.json")
 		if err := os.WriteFile(unreadable, []byte(`{"accessToken":"x"}`), 0o000); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(unreadable, 0o600) })
-		if os.Getuid() == 0 {
-			t.Skip("running as root: permission bits are not enforced")
-		}
 		if got := jsonFileNonEmptyObjectState(unreadable); got != AuthStateUnknown {
 			t.Errorf("unreadable file: got %q, want %q", got, AuthStateUnknown)
 		}
+	})
+}
+
+func TestCredentialFileState(t *testing.T) {
+	dir := t.TempDir()
+
+	absent := filepath.Join(dir, "absent.json")
+
+	empty := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(empty, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	populated := filepath.Join(dir, "creds.json")
+	if err := os.WriteFile(populated, []byte(`{"accessToken":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	malformed := filepath.Join(dir, "malformed.json")
+	if err := os.WriteFile(malformed, []byte(`not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const relocationVar = "CITADEL_TEST_RELOCATION_DIR"
+
+	tests := []struct {
+		name   string
+		path   string
+		vars   []string
+		goos   string
+		setVar bool
+		want   AuthState
+	}{
+		{"absent linux no var → confident no", absent, []string{relocationVar}, "linux", false, AuthStateNo},
+		{"absent linux relocation var set → unknown", absent, []string{relocationVar}, "linux", true, AuthStateUnknown},
+		{"absent darwin → unknown (keychain)", absent, nil, "darwin", false, AuthStateUnknown},
+		{"absent windows → unknown (layout)", absent, nil, "windows", false, AuthStateUnknown},
+		{"populated linux → authed regardless of var", populated, []string{relocationVar}, "linux", true, AuthStateAuthed},
+		{"populated darwin → authed (file wins)", populated, nil, "darwin", false, AuthStateAuthed},
+		{"empty object linux no var → confident no", empty, nil, "linux", false, AuthStateNo},
+		{"empty object darwin → unknown (ambiguous)", empty, nil, "darwin", false, AuthStateUnknown},
+		{"malformed → unknown regardless of platform", malformed, nil, "linux", false, AuthStateUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Ensure the relocation var is unset by default, then set it only
+			// for the case under test (t.Setenv restores on cleanup).
+			t.Setenv(relocationVar, "")
+			if tt.setVar {
+				t.Setenv(relocationVar, filepath.Join(dir, "elsewhere"))
+			} else {
+				_ = os.Unsetenv(relocationVar)
+			}
+			if got := credentialFileState(tt.path, tt.vars, tt.goos); got != tt.want {
+				t.Errorf("credentialFileState(goos=%q, setVar=%v) = %q, want %q", tt.goos, tt.setVar, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveTargetUser(t *testing.T) {
+	const procPath = "/usr/bin:/bin"
+	lookup := func(homes map[string]string) func(string) (string, error) {
+		return func(u string) (string, error) {
+			if h, ok := homes[u]; ok {
+				return h, nil
+			}
+			return "", fmt.Errorf("unknown user %q", u)
+		}
+	}
+
+	t.Run("SUDO_USER set resolves to that user's home", func(t *testing.T) {
+		opts, err := resolveTargetUser(
+			"alice",
+			lookup(map[string]string{"alice": "/home/alice"}),
+			func() (string, error) { return "/root", nil },
+			procPath,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.HomeDir != "/home/alice" {
+			t.Errorf("HomeDir = %q, want /home/alice", opts.HomeDir)
+		}
+		// PATH must prepend the user-local bin dirs AND retain the process PATH.
+		for _, want := range []string{"/home/alice/.npm-global/bin", "/home/alice/.local/bin", "/home/alice/bin", procPath} {
+			if !strings.Contains(opts.PathEnv, want) {
+				t.Errorf("PathEnv %q missing %q", opts.PathEnv, want)
+			}
+		}
+	})
+
+	t.Run("SUDO_USER unset falls back to process home", func(t *testing.T) {
+		opts, err := resolveTargetUser(
+			"",
+			lookup(nil), // must not be consulted
+			func() (string, error) { return "/home/proc", nil },
+			procPath,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.HomeDir != "/home/proc" {
+			t.Errorf("HomeDir = %q, want /home/proc", opts.HomeDir)
+		}
+	})
+
+	t.Run("SUDO_USER=root treated as unset (matches resolveConfigDir)", func(t *testing.T) {
+		opts, err := resolveTargetUser(
+			"root",
+			lookup(nil),
+			func() (string, error) { return "/root", nil },
+			procPath,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.HomeDir != "/root" {
+			t.Errorf("HomeDir = %q, want /root", opts.HomeDir)
+		}
+	})
+
+	t.Run("unresolvable SUDO_USER is an honest error, not a guess", func(t *testing.T) {
+		_, err := resolveTargetUser(
+			"ghost",
+			lookup(map[string]string{"alice": "/home/alice"}),
+			func() (string, error) { return "/root", nil },
+			procPath,
+		)
+		if err == nil {
+			t.Fatal("expected an error for an unresolvable SUDO_USER, got nil")
+		}
+	})
+
+	t.Run("process home failure is an honest error", func(t *testing.T) {
+		_, err := resolveTargetUser(
+			"",
+			lookup(nil),
+			func() (string, error) { return "", fmt.Errorf("no home") },
+			procPath,
+		)
+		if err == nil {
+			t.Fatal("expected an error when process home cannot resolve, got nil")
+		}
+	})
+}
+
+func TestLookPath_OverrideWalk(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("override walk uses POSIX executable-bit semantics")
+	}
+	// dir1 has a non-executable file and a subdir shadowing the name; dir2 has
+	// the real executable. lookPath must skip the first two and find dir2's.
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir1, "notexec"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir1, "claude"), 0o755); err != nil {
+		t.Fatal(err) // a directory named like the binary must be skipped
+	}
+	realBin := filepath.Join(dir2, "claude")
+	if err := os.WriteFile(realBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pathEnv := strings.Join([]string{"", dir1, dir2}, string(os.PathListSeparator))
+	got, err := lookPath("claude", pathEnv)
+	if err != nil {
+		t.Fatalf("lookPath override: unexpected error: %v", err)
+	}
+	if got != realBin {
+		t.Errorf("lookPath = %q, want %q", got, realBin)
+	}
+
+	if _, err := lookPath("does-not-exist", pathEnv); err == nil {
+		t.Error("lookPath for a missing binary: expected error, got nil")
 	}
 }
 
@@ -132,7 +317,8 @@ func TestProbe_DetectsInstalledAndAuthedViaFakePATH(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	agents := Probe(ctx)
+	// A zero Options uses the process HOME/PATH set above (the operator path).
+	agents := Probe(ctx, Options{})
 	byName := make(map[string]VendorAgent, len(agents))
 	for _, a := range agents {
 		byName[a.Name] = a
@@ -196,7 +382,7 @@ func TestProbe_NoVendorsOnPATH(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	agents := Probe(ctx)
+	agents := Probe(ctx, Options{})
 	if len(agents) != len(vendorSpecs) {
 		t.Fatalf("Probe() returned %d entries, want %d (one per vendor spec, present or not)", len(agents), len(vendorSpecs))
 	}
@@ -206,6 +392,82 @@ func TestProbe_NoVendorsOnPATH(t *testing.T) {
 		}
 		if a.Version != "" {
 			t.Errorf("%s: expected empty Version with an empty PATH", a.Name)
+		}
+	}
+}
+
+// TestProbe_ExplicitOptionsDetect proves the S2 shape works: explicit
+// HomeDir/PathEnv are honored WITHOUT relying on the process environment.
+func TestProbe_ExplicitOptionsDetect(t *testing.T) {
+	binDir := t.TempDir()
+	fakeVendorBinary(t, binDir, "claude", "1.2.3")
+
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeDir, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"sk-fake"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Point the PROCESS env somewhere that has NOTHING, to prove the explicit
+	// Options — not the process env — are what drive detection.
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	agents := Probe(ctx, Options{HomeDir: homeDir, PathEnv: binDir})
+	var claude VendorAgent
+	for _, a := range agents {
+		if a.Name == "claude" {
+			claude = a
+		}
+	}
+	if !claude.Installed {
+		t.Error("claude: expected Installed=true from the explicit PathEnv")
+	}
+	if claude.Version != "1.2.3" {
+		t.Errorf("claude: Version = %q, want 1.2.3", claude.Version)
+	}
+	if claude.Authed != AuthStateAuthed {
+		t.Errorf("claude: Authed = %q, want %q (from explicit HomeDir)", claude.Authed, AuthStateAuthed)
+	}
+}
+
+// TestProbe_OptionsOverrideReplacesProcessEnv proves the override REPLACES the
+// process environment rather than merging with it: even though the process
+// HOME/PATH have the binary and credentials, an Options pointing at empty dirs
+// must find nothing. This is the exact worker-vs-operator divergence #1005 is
+// about, verified in the direction that matters (no accidental fallthrough to
+// the process env).
+func TestProbe_OptionsOverrideReplacesProcessEnv(t *testing.T) {
+	procBinDir := t.TempDir()
+	fakeVendorBinary(t, procBinDir, "claude", "1.2.3")
+
+	procHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(procHome, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procHome, ".claude", ".credentials.json"), []byte(`{"accessToken":"sk-fake"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", procBinDir)
+	t.Setenv("HOME", procHome)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Override with empty dirs: the binary and creds in the PROCESS env must
+	// NOT leak through.
+	agents := Probe(ctx, Options{HomeDir: t.TempDir(), PathEnv: t.TempDir()})
+	for _, a := range agents {
+		if a.Name != "claude" {
+			continue
+		}
+		if a.Installed {
+			t.Error("claude: Installed=true — override PathEnv leaked to the process PATH")
 		}
 	}
 }

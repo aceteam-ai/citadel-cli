@@ -9,10 +9,10 @@
 // This is deliberately a sibling of internal/capabilities (fabric/hardware
 // capability detection for queue routing) and internal/discovery (mesh peer
 // discovery), not a bolt-on to either: local vendor-CLI inspection is its
-// own concern with its own read-only guardrail (never executes an agent
-// turn, never makes a network call — see internal/agentsprobe's package
-// doc). Later DoR-v2 slices (S4/S5) build the driving adapter this probe
-// only reports the presence of.
+// own concern with its own read-only guardrail (never executes an agent turn;
+// citadel makes no network call, though a vendor's own --version may — see
+// internal/agentsprobe's package doc). Later DoR-v2 slices (S4/S5) build the
+// driving adapter this probe only reports the presence of.
 package cmd
 
 import (
@@ -41,7 +41,7 @@ var agentsCmd = &cobra.Command{
 	Long: `Detects vendor coding-agent CLIs already installed and authenticated on this
 node, for the node's own account — not a container or binary AceTeam ships.
 
-This is discovery only. It never spawns, drives, or drives a turn of any
+This is discovery only. It never spawns, drives, or runs a turn of any
 vendor agent.`,
 }
 
@@ -52,9 +52,11 @@ var agentsProbeCmd = &cobra.Command{
 opencode), reads each installed binary's --version output, and checks local
 credential files for a best-effort authed/unauthenticated/unknown signal.
 
-Read-only: never executes an agent turn, never makes a network call. Auth
-state is inferred from local credential-file presence and shallow structure
-only — credential VALUES are never read into the output.`,
+Read-only: never executes an agent turn. Citadel makes no network call, but a
+vendor's own --version may — some Node CLIs (Gemini, sometimes Claude Code) run
+an update check when invoked. Auth state is inferred from local credential-file
+presence and shallow structure only — credential VALUES are never read into the
+output.`,
 	Example: `  # Table output
   citadel agents probe
 
@@ -67,7 +69,10 @@ func runAgentsProbe(cmd *cobra.Command, args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), agentsProbeTimeout)
 	defer cancel()
 
-	agents := agentsprobe.Probe(ctx)
+	// A zero Options inspects THIS process's own HOME/PATH, which is correct
+	// here: the operator runs `citadel agents probe` as themselves. S2's
+	// worker call site is the one that resolves a target user instead.
+	agents := agentsprobe.Probe(ctx, agentsprobe.Options{})
 
 	if agentsProbeJSON {
 		enc := json.NewEncoder(os.Stdout)
