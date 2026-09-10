@@ -342,10 +342,10 @@ var loopbackBoundEngineHostPorts = map[string]string{
 	"omnivoice":     "${" + EnvOmniVoiceHostPort + "}",
 }
 
-// TestEngineComposeFilesLoopbackBound is the citadel-cli#9523 (parent
-// aceteam-ai/aceteam#9523) contract test: every OpenAI-compatible inference
-// engine compose file with no auth of its own must publish its host port on
-// 127.0.0.1 only, using the bare-token idiom (no `:?`/`:-` guard, which would
+// TestEngineComposeFilesLoopbackBound is the aceteam-ai/aceteam#9523 contract
+// test: every OpenAI-compatible inference engine compose file with no auth of
+// its own must publish its host port on 127.0.0.1 only, using the bare-token
+// idiom (no `:?`/`:-` guard, which would
 // smear across this parser's colon handling; see the kokoro.yml/
 // omnivoice.yml comments this pattern mirrors). Table-driven per Acceptance
 // criterion 4 in the parent issue ("extend a TestEngineCacheDirsMatchComposeMounts
