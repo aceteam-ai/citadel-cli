@@ -80,6 +80,14 @@ type VendorAgent struct {
 	// down to a bare version number when one is found. Empty when the
 	// binary is not installed or the version exec failed/timed out.
 	Version string `json:"version,omitempty"`
+	// VersionError is set ONLY when the `--version` exec could not be STARTED
+	// under a privilege drop (e.g. the worker lacks CAP_SETUID/SETGID, so
+	// setgroups/setuid returned EPERM before the binary ran). It disambiguates a
+	// drop that failed -- Installed=true with an empty Version -- from a vendor
+	// whose --version merely timed out, honoring the package's honesty principle
+	// (a silent "" would be a confident-looking false). Empty (omitted) on the
+	// operator path and whenever no drop was attempted, so S1 output is unchanged.
+	VersionError string `json:"version_error,omitempty"`
 	// Authed is the tri-state auth signal. Empty (omitted) when the
 	// binary is not installed -- auth state is not meaningful for an
 	// absent binary.
@@ -188,7 +196,7 @@ func probeVendor(ctx context.Context, spec vendorSpec, homeDir string, opts Opti
 		return agent // Installed stays false; Authed stays "" (not meaningful).
 	}
 	agent.Installed = true
-	agent.Version = probeVersion(ctx, path, opts)
+	agent.Version, agent.VersionError = probeVersion(ctx, path, opts)
 
 	if spec.authCheck == nil || homeDir == "" {
 		agent.Authed = AuthStateUnknown
@@ -329,21 +337,38 @@ func pathListContains(pathEnv, dir string) bool {
 }
 
 // probeVersion runs `<path> --version` under probeTimeout and best-effort
-// parses a version number out of the first line of output. Returns "" on any
-// exec failure or timeout -- a missing version is not itself an error here,
-// just an absent field. The exec is hardened (privilege drop, minimal env,
-// bounded output, process-group reaping) by buildVersionCmd; see there.
-func probeVersion(ctx context.Context, path string, opts Options) string {
+// parses a version number out of the first line of output. It returns the
+// parsed version and a versionErr that is non-empty ONLY when the exec could not
+// be STARTED under a privilege drop -- i.e. the drop itself failed (a worker
+// without CAP_SETUID/SETGID: setgroups/setuid EPERM before the binary ran). A
+// RUN failure or timeout returns ("", "") -- a missing version is a legit absent
+// field, not an error. Splitting Start from a confident empty version is the
+// honesty fix: otherwise a broken drop is indistinguishable from a timed-out
+// vendor. The exec is hardened (privilege drop, minimal env, bounded output,
+// process-group reaping) by buildVersionCmd; see there.
+func probeVersion(ctx context.Context, path string, opts Options) (version, versionErr string) {
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	cmd := buildVersionCmd(cctx, path, opts)
 	out := &limitedBuffer{limit: versionOutputLimit}
 	cmd.Stdout = out
 	cmd.Stderr = io.Discard
-	if err := cmd.Run(); err != nil {
-		return ""
+	if err := cmd.Start(); err != nil {
+		// The process never ran. lookPath already confirmed the binary exists and
+		// is executable, so under a drop the overwhelmingly likely cause is the
+		// credential drop failing -- surface it rather than reporting a confident
+		// empty version. Without a drop, a start failure here is a benign race
+		// (the binary vanished between lookPath and exec); keep the S1 "" behavior.
+		if opts.DropTo != nil {
+			return "", fmt.Sprintf("privilege drop failed: %v", err)
+		}
+		return "", ""
 	}
-	return parseVersion(out.String())
+	if err := cmd.Wait(); err != nil {
+		// Ran but failed / was killed on timeout: a legit empty version.
+		return "", ""
+	}
+	return parseVersion(out.String()), ""
 }
 
 // buildVersionCmd constructs the `<path> --version` command with every safety
@@ -449,10 +474,14 @@ func jsonFileNonEmptyObjectState(path string) AuthState {
 	// this path: a root ReadFile on a FIFO/device blocks forever, and because the
 	// probe runs inside the service singleflight lock that would wedge every
 	// future refresh for the process lifetime (a local DoS). A symlink is rejected
-	// too (never follow one as root). Residual stat->open TOCTOU: the target could
-	// swap the regular file for a FIFO between the two calls; it is not chased with
-	// O_NONBLOCK because the read is ALSO size-bounded, so the worst case is a
-	// bounded read, not an unbounded block.
+	// too (never follow one as root). Lstat only refuses to follow the FINAL
+	// component, so an intermediate symlink -- e.g. ~/.claude itself pointed at a
+	// dotfiles dir, the common case -- is still followed; only a symlinked
+	// .credentials.json FILE reads as Unknown. Deliberate tradeoff: an
+	// honest Unknown for that rare shape beats following a symlink as root.
+	// Residual stat->open TOCTOU: the target could swap the regular file for a
+	// FIFO between the two calls; it is not chased with O_NONBLOCK because the read
+	// is ALSO size-bounded, so the worst case is a bounded read, not a block.
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {

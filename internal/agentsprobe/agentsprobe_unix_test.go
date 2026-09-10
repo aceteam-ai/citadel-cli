@@ -76,6 +76,42 @@ func TestBuildVersionCmd_NoDropWhenNil(t *testing.T) {
 	}
 }
 
+// TestProbeVersion_DropStartFailureSurfacesError is the honesty pin for a FAILED
+// privilege drop: a non-root worker cannot setgroups/setuid, so requesting a drop
+// makes the exec fail to START. That must surface as a versionError, never a
+// silent empty version that looks identical to a timed-out vendor.
+func TestProbeVersion_DropStartFailureSurfacesError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can perform the credential drop; this test needs the drop to FAIL")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'claude 1.0.0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{
+		HomeDir: dir,
+		PathEnv: dir,
+		DropTo:  &Credential{UID: 12345, GID: 12345, Username: "nobody"},
+	}
+	version, versionErr := probeVersion(context.Background(), bin, opts)
+	if version != "" {
+		t.Fatalf("expected empty version when the drop fails, got %q", version)
+	}
+	if versionErr == "" {
+		t.Fatal("a failed privilege drop must surface a versionError, not a silent empty version")
+	}
+	if !strings.Contains(versionErr, "privilege drop failed") {
+		t.Fatalf("versionError = %q, want it to name the privilege drop failure", versionErr)
+	}
+
+	// Without a drop, the same binary probes cleanly with no error surfaced.
+	v, ve := probeVersion(context.Background(), bin, Options{HomeDir: dir, PathEnv: dir})
+	if v == "" || ve != "" {
+		t.Fatalf("no-drop probe: got version=%q versionErr=%q, want a version and no error", v, ve)
+	}
+}
+
 // TestProbeVersion_KillsProcessGroupOnTimeout proves the Setpgid + Cancel wiring
 // reaps a daemonizing GRANDCHILD (an update-check helper), not just the direct
 // child, when the probe times out. No privilege drop needed for this property.
@@ -90,10 +126,13 @@ func TestProbeVersion_KillsProcessGroupOnTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	// Generous ctx so the script reliably records the grandchild pid before the
+	// timeout kill fires, even on a loaded CI runner (the pid is $! of the
+	// backgrounded sleep, so it can only be written AFTER the spawn).
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	// Returns "" on timeout; the point is the side effect (group killed).
-	_ = probeVersion(ctx, script, Options{})
+	_, _ = probeVersion(ctx, script, Options{})
 
 	pidBytes := waitForFile(t, pidFile)
 	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))

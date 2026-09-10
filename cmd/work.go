@@ -2874,10 +2874,12 @@ func agentsProbeInterval() time.Duration {
 }
 
 // agentsProbeResolver returns the target-user resolver the probe service runs on
-// each probe (aceteam #8993 S2). It re-reads the live inputs every run — the
-// manifest's agents_probe_user override, the machine-convergent node-dir owner
+// each probe (aceteam #8993 S2). The manifest's agents_probe_user override is
+// captured ONCE here (the manifest is loaded once at boot and does not change
+// without a worker restart); the machine-convergent node-dir owner
 // (network.GetStateDir/GetNodeConfigDir, NOT the invoker-scoped platform.ConfigDir),
-// SUDO_USER, and the process uid — so a mid-lifetime identity change is observed.
+// SUDO_USER, and the process uid are re-read on EVERY run, so a mid-lifetime
+// ownership/identity change is observed.
 func agentsProbeResolver(m *CitadelManifest) func() (agentsprobe.Target, error) {
 	configuredUser := ""
 	if m != nil {
