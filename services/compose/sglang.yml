@@ -4,8 +4,17 @@ services:
   sglang:
     image: lmsysorg/sglang:latest
     container_name: citadel-sglang
+    # Loopback-only publish (127.0.0.1), deliberately (aceteam-ai/aceteam#9523):
+    # this is an OpenAI-compatible server with no auth of its own. Unlike
+    # vllm/llamacpp/bonsai/unlimited-ocr, sglang's host port (30000, see
+    # services.SGLangHostPort) is not deferred through a citadel-injected
+    # ${CITADEL_*_HOST_PORT} var, so the loopback literal here is the whole
+    # fix -- there is no env-var-guard interaction to worry about. Mesh reach
+    # stays available through the gateway's model-routed
+    # /v1/chat/completions (internal/gateway/chat_route.go), which resolves
+    # the model to this engine and reverse-proxies to 127.0.0.1 itself.
     ports:
-      - "30000:30000"
+      - "127.0.0.1:30000:30000"
     volumes:
       # Mount a user-accessible directory to cache Hugging Face models
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
