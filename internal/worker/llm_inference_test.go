@@ -785,13 +785,19 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 			t.Fatalf("json.Marshal(result.Output): %v", err)
 		}
 		var wire struct {
-			AEPReceipt aep.AEPReceiptV1 `json:"aep_receipt"`
+			AEPReceipt aep.AEPReceiptV2 `json:"aep_receipt"`
 		}
 		if err := json.Unmarshal(wireBytes, &wire); err != nil {
 			t.Fatalf("json.Unmarshal wire bytes: %v", err)
 		}
 		receipt := &wire.AEPReceipt
 
+		if receipt.ReceiptVersion != aep.ReceiptVersionV2 {
+			t.Errorf("receipt.ReceiptVersion = %q, want %q", receipt.ReceiptVersion, aep.ReceiptVersionV2)
+		}
+		if receiptMap["receipt_version"] != "2" {
+			t.Errorf(`receiptMap["receipt_version"] = %v, want the string "2"`, receiptMap["receipt_version"])
+		}
 		if receipt.JobID != job.ID {
 			t.Errorf("receipt.JobID = %q, want %q", receipt.JobID, job.ID)
 		}
@@ -800,6 +806,18 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 		}
 		if receipt.Model != "bonsai-27b" {
 			t.Errorf("receipt.Model = %q, want bonsai-27b", receipt.Model)
+		}
+		// output_sha256 binds the exact content ("the answer is 42.") the
+		// engine returned, in the sha256:hex shape the backend's
+		// _expected_output_sha256 recomputes.
+		if want := sha256Hex("the answer is 42."); receipt.OutputSHA256 != want {
+			t.Errorf("receipt.OutputSHA256 = %q, want %q", receipt.OutputSHA256, want)
+		}
+		if receipt.PolicyHash != aep.EmptyPolicyHash {
+			t.Errorf("receipt.PolicyHash = %q, want the interim empty-policy hash %q", receipt.PolicyHash, aep.EmptyPolicyHash)
+		}
+		if receipt.VerdictHash == "" || receipt.Action == "" {
+			t.Errorf("receipt verdict fields empty: action=%q verdict_hash=%q", receipt.Action, receipt.VerdictHash)
 		}
 		wantFP, _ := signer.PublicKeyFingerprint()
 		if receipt.NodeID != wantFP {
@@ -816,7 +834,7 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode signature: %v", err)
 		}
-		digest := sha256.Sum256(aep.Canonicalize(receipt))
+		digest := sha256.Sum256(aep.CanonicalizeV2(receipt))
 		if !ecdsa.VerifyASN1(&signer.key.PublicKey, digest[:], sigDER) {
 			t.Errorf("receipt signature does not verify against the signer's own public key")
 		}
@@ -891,6 +909,67 @@ func TestLLMInferenceHandler_SignAEPReceiptFailsOpen(t *testing.T) {
 	}
 	if loggedCalls != 1 {
 		t.Errorf("aepLogf called %d times, want exactly 1 (the signing failure logged, non-fatally)", loggedCalls)
+	}
+}
+
+// TestLLMInferenceHandler_SignAEPReceiptRefuseGuardFailsOpen drives the REAL
+// pipeline (CheckGrounding -> BuildVerdict -> BuildSignedReceiptV2) with a model
+// name containing the canonical delimiter ("bonsai\nx"), which the
+// refuse-to-sign guard rejects. The job must still succeed with content,
+// grounding, and trust_verdict attached and only the aep_receipt skipped
+// (fail-open on the guard, not just on a failing signer), with the refusal
+// logged exactly once.
+func TestLLMInferenceHandler_SignAEPReceiptRefuseGuardFailsOpen(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"the answer is 42."},"finish_reason":"stop"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	t.Setenv(groundingGuardrailEnvVar, "1")
+	t.Setenv(signAEPReceiptsEnvVar, "1")
+
+	h := NewLLMInferenceHandler().
+		WithSigner(newFakeAEPSigner(t)). // a VALID signer -- the guard, not the key, is what refuses
+		WithFabricNodeIDResolver(func() string { return "" })
+	h.baseURLs["bonsai"] = ts.URL
+
+	var loggedCalls int
+	h.aepLogf = func(format string, args ...any) { loggedCalls++ }
+
+	job := &Job{
+		ID:   "job-refuse-guard",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "bonsai\nx", // newline in a canonical free-string field
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "what is the answer?"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success even when the guard refuses to sign", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "the answer is 42." {
+		t.Errorf("content = %q, want the answer to still be present", got)
+	}
+	if _, present := result.Output["grounding"]; !present {
+		t.Errorf("Output = %+v, want the grounding key to still attach", result.Output)
+	}
+	if _, present := result.Output["trust_verdict"]; !present {
+		t.Errorf("Output = %+v, want the trust_verdict to still attach", result.Output)
+	}
+	if _, present := result.Output["aep_receipt"]; present {
+		t.Errorf("Output = %+v, want NO aep_receipt when the guard refuses to sign", result.Output)
+	}
+	if loggedCalls != 1 {
+		t.Errorf("aepLogf called %d times, want exactly 1 (the refusal logged, non-fatally)", loggedCalls)
 	}
 }
 
@@ -2068,9 +2147,28 @@ func TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths(t *testing.T) {
 			if _, ok := verdict["verdict_hash"].(string); !ok {
 				t.Errorf(`trust_verdict["verdict_hash"] = %#v, want a string`, verdict["verdict_hash"])
 			}
+			// The unsigned trust_verdict now also carries the content-binding
+			// digests (aceteam #8253 S3, design §7.2): policy_hash is the interim
+			// empty-policy hash and input_sha256 is present.
+			if got := verdict["policy_hash"]; got != aep.EmptyPolicyHash {
+				t.Errorf(`trust_verdict["policy_hash"] = %v, want %q`, got, aep.EmptyPolicyHash)
+			}
+			if _, ok := verdict["input_sha256"].(string); !ok {
+				t.Errorf(`trust_verdict["input_sha256"] = %#v, want a string`, verdict["input_sha256"])
+			}
 
-			if _, present := result.Output["aep_receipt"]; !present {
-				t.Errorf("Output = %+v, want an aep_receipt key -- hook did not run for %s", result.Output, tc.name)
+			receiptMap, present := result.Output["aep_receipt"].(map[string]any)
+			if !present {
+				t.Errorf("Output = %+v, want an aep_receipt map -- hook did not run for %s", result.Output, tc.name)
+			} else {
+				// Proof-plan item 2: the receipt is v2 and its output_sha256
+				// binds the exact content this path produced.
+				if receiptMap["receipt_version"] != "2" {
+					t.Errorf(`aep_receipt["receipt_version"] = %v, want "2"`, receiptMap["receipt_version"])
+				}
+				if got := receiptMap["output_sha256"]; got != wantDigest {
+					t.Errorf(`aep_receipt["output_sha256"] = %v, want %v (sha256Hex of Output["content"])`, got, wantDigest)
+				}
 			}
 		})
 	}
