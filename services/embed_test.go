@@ -327,6 +327,144 @@ func TestOmniVoiceComposeContract(t *testing.T) {
 	}
 }
 
+// loopbackBoundEngineHostPorts maps each engine ServiceMap entry that this
+// test asserts is loopback-only to the bare (no `:?`/`:-` guard) host-port
+// token its compose file must publish behind a literal "127.0.0.1:" prefix
+// (aceteam-ai/aceteam#9523). sglang has no citadel-injected host-port var (its
+// compose publishes the literal 30000), so its expected token is empty and the
+// assertion below checks the literal "127.0.0.1:30000:" prefix directly instead.
+var loopbackBoundEngineHostPorts = map[string]string{
+	"vllm":          "${" + EnvVLLMHostPort + "}",
+	"llamacpp":      "${" + EnvLlamacppHostPort + "}",
+	"bonsai":        "${" + EnvBonsaiHostPort + "}",
+	"unlimited-ocr": "${" + EnvUnlimitedOCRHostPort + "}",
+	"kokoro":        "${" + EnvTTSHostPort + "}",
+	"omnivoice":     "${" + EnvOmniVoiceHostPort + "}",
+}
+
+// TestEngineComposeFilesLoopbackBound is the aceteam-ai/aceteam#9523 contract
+// test: every OpenAI-compatible inference engine compose file with no auth of
+// its own must publish its host port on 127.0.0.1 only, using the bare-token
+// idiom (no `:?`/`:-` guard, which would
+// smear across this parser's colon handling; see the kokoro.yml/
+// omnivoice.yml comments this pattern mirrors). Table-driven per Acceptance
+// criterion 4 in the parent issue ("extend a TestEngineCacheDirsMatchComposeMounts
+// -style test to assert the bind for every ServiceMap entry").
+func TestEngineComposeFilesLoopbackBound(t *testing.T) {
+	for name, token := range loopbackBoundEngineHostPorts {
+		t.Run(name, func(t *testing.T) {
+			content, ok := ServiceMap[name]
+			if !ok {
+				t.Fatalf("%q not found in ServiceMap", name)
+			}
+			want := "127.0.0.1:" + token + ":"
+			if !strings.Contains(content, want) {
+				t.Errorf("compose %q must publish its host port loopback-only via %q; got:\n%s", name, want, content)
+			}
+			// The guarded form must be absent. If present, either this
+			// engine's compose was reverted to the old ${VAR:?msg} shape, or a
+			// hand-edit reintroduced a guard that would break the loopback
+			// host-port parsers (services/embed_test.go's composeHostPorts,
+			// internal/apps/hostport_collision_test.go's hostPortField).
+			if strings.Contains(content, token+":?") || strings.Contains(content, token+":-") {
+				t.Errorf("compose %q must use the bare %q token (no :?/:- guard) behind the loopback prefix", name, token)
+			}
+		})
+	}
+
+	// sglang: no citadel-injected host-port var, so its loopback literal is
+	// checked directly rather than via the token map above.
+	sglang, ok := ServiceMap["sglang"]
+	if !ok {
+		t.Fatal("sglang not found in ServiceMap")
+	}
+	if !strings.Contains(sglang, "127.0.0.1:30000:30000") {
+		t.Errorf("sglang compose must publish its host port loopback-only (127.0.0.1:30000:30000); got:\n%s", sglang)
+	}
+}
+
+// nonLoopbackServiceMapAllowlist documents every services.ServiceMap entry
+// that is NOT loopback-bound and why, so TestServiceMapBindSweep enforces
+// "every current or future ServiceMap entry is loopback-bound, or has a
+// recorded reason" rather than silently widening or narrowing over time. Do
+// not add an entry here without a reason a reviewer can check against the
+// actual compose file.
+//
+// services/compose/claudecode.yml and hermes.yml are NOT covered by this
+// sweep (or listed here) even though they publish a 0.0.0.0 host port on
+// disk: neither is `//go:embed`-ed into ServiceMap (verified: no
+// ClaudecodeCompose/HermesCompose var in embed.go, and no other Go code
+// references either path), so both are dead files in this repo. The live
+// copies are the citadel-services catalog modules (services/claudecode,
+// services/hermes), per this repo's CLAUDE.md.
+var nonLoopbackServiceMapAllowlist = map[string]string{
+	"ollama": "internal/apps/catalog.go sets OLLAMA_BASE_URL=http://host.docker.internal:11434 " +
+		"for a catalog app; a container reaching the host via host.docker.internal lands on the " +
+		"docker0 bridge gateway, not 127.0.0.1, so a loopback-only publish would break that consumer. " +
+		"Tracked in aceteam-ai/citadel-cli#1023.",
+	"extraction": "out of scope for aceteam-ai/aceteam#9523 (issue named vllm/sglang/llamacpp/bonsai/" +
+		"unlimited-ocr/ollama only); same 0.0.0.0-with-no-auth shape, tracked as a broader-sweep " +
+		"candidate in aceteam-ai/citadel-cli#1023.",
+	"diffusers": "out of scope for aceteam-ai/aceteam#9523; same shape, tracked in aceteam-ai/citadel-cli#1023.",
+	"transcribe": "out of scope for aceteam-ai/aceteam#9523; fixed native port (8101), not a citadel-" +
+		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
+	"lmstudio": "out of scope for aceteam-ai/aceteam#9523; fixed native port (1234), not a citadel-" +
+		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
+	"tei": "already loopback-bound (127.0.0.1:8102:80), not an oversight, just not matched by the " +
+		"exact-token check below since it has no citadel-injected host-port var either.",
+}
+
+// TestServiceMapBindSweep sweeps EVERY current services.ServiceMap entry and
+// asserts it is either loopback-bound (127.0.0.1: prefix on its ports: host
+// side) or explicitly allowlisted with a reason
+// (nonLoopbackServiceMapAllowlist). A new ServiceMap entry that publishes a
+// host port on all interfaces with no allowlist reason fails here. This is
+// the "assert the bind for every ServiceMap entry" acceptance criterion from
+// aceteam-ai/aceteam#9523, scoped to today's actual fix (5 engines) plus a
+// recorded, reviewable reason for every other entry rather than a silent
+// pass.
+func TestServiceMapBindSweep(t *testing.T) {
+	for name, content := range ServiceMap {
+		t.Run(name, func(t *testing.T) {
+			var doc struct {
+				Services map[string]struct {
+					Ports []string `yaml:"ports"`
+				} `yaml:"services"`
+			}
+			if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+				t.Fatalf("compose %q is not valid YAML: %v", name, err)
+			}
+			hasHostPublish := false
+			loopbackOnly := true
+			for _, svc := range doc.Services {
+				for _, spec := range svc.Ports {
+					if !strings.Contains(spec, ":") {
+						continue // container-port-only, no host publish
+					}
+					hasHostPublish = true
+					if !strings.HasPrefix(spec, "127.0.0.1:") {
+						loopbackOnly = false
+					}
+				}
+			}
+			if !hasHostPublish {
+				return // nothing published on the host; nothing to check
+			}
+			if loopbackOnly {
+				return
+			}
+			if reason, allowlisted := nonLoopbackServiceMapAllowlist[name]; allowlisted {
+				if reason == "" {
+					t.Errorf("nonLoopbackServiceMapAllowlist[%q] must carry a non-empty reason", name)
+				}
+				return
+			}
+			t.Errorf("compose %q publishes a host port on all interfaces with no auth-posture review; "+
+				"either bind it loopback-only or add a reasoned entry to nonLoopbackServiceMapAllowlist", name)
+		})
+	}
+}
+
 // composeHostPorts returns the host-side ports declared in a compose file's
 // `ports:` list entries ("HOST:CONTAINER"). Pure parse (no Docker) so the
 // host-port collision assertions run in ordinary CI.

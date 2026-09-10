@@ -1004,9 +1004,13 @@ self-dialing this node's own mesh IP:8210 via `network.Dial` while bonsai served
 fine on `localhost:8210` → `connection refused`: embedded tsnet's userspace
 netstack does not forward inbound mesh traffic to a host-bound port lacking a
 `srv.Listen()` (only ports citadel explicitly `ListenVPN`s — status 8080, gateway
-8443, terminal, vnc, modules — answer over the mesh). The engine compose files
-bind `0.0.0.0` and carry a "peers reach this engine directly over the mesh"
-comment, but that reflects a full-Tailscale/kernel-TUN node, not embedded tsnet.
+8443, terminal, vnc, modules — answer over the mesh). This was also the
+reasoning for the engine compose files' old `0.0.0.0` bind ("peers reach this
+engine directly over the mesh"), which held only on a full-Tailscale/kernel-TUN
+node, not embedded tsnet, and bought unauthenticated LAN reach on every node
+regardless. vllm/llamacpp/bonsai/unlimited-ocr/sglang are now loopback-only
+(`aceteam-ai/aceteam#9523`; see `TestServiceMapBindSweep` in
+`services/embed_test.go` for the current bind of every `ServiceMap` entry).
 
 **Fix (#581, node-side complement of aceteam #6236):** the gateway now routes
 `/v1/chat/completions` (plus `/v1/completions` and `/v1/models`) by model. Both
@@ -1386,7 +1390,10 @@ llama-server exposes the identical llama.cpp-server API). See
 `internal/worker/llm_inference.go` — the Redis-interface handler that used to
 live at `internal/jobs/llm_inference.go` was ported to this native
 `worker.JobHandler` by issue #590 (that old path no longer exists; see the
-Worker Mode section above). Direct mesh HTTP to `:8210` also works.
+Worker Mode section above). Bonsai's host publish is loopback-only
+(`aceteam-ai/aceteam#9523`, `TestServiceMapBindSweep`), so direct mesh HTTP to
+`:8210` no longer works from another node; use `citadel mesh chat` (routes
+through the target node's gateway) instead.
 
 **First start builds inline (~7min on Ampere):** because bonsai is build-based,
 the first `SERVICE_START` (or `citadel run --service bonsai`) runs `docker
