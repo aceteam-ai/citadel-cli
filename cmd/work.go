@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/agentsprobe"
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
@@ -1559,6 +1560,18 @@ func runWork(cmd *cobra.Command, args []string) {
 		Shell: workflow.ShellConfig{WorkspaceDir: wsDir},
 	})
 
+	// Vendor coding-agent probe service (aceteam #8993 S2): caches which vendor
+	// CLIs (claude/codex/gemini/opencode) are installed+authed for the node's
+	// OWNING user, served on demand at GET /agent/vendor-agents. Constructed here
+	// (the provider closure below needs it), STARTED only when the status server
+	// exists (below) so a plain `citadel work` without a pull surface never execs
+	// vendor binaries for nothing. Default ON; CITADEL_AGENTS_PROBE=off disables.
+	agentsProbeSvc := agentsprobe.NewService(agentsprobe.ServiceConfig{
+		Disabled:   agentsProbeDisabled(),
+		ProcessUID: os.Getuid(),
+		Resolve:    agentsProbeResolver(workManifest),
+	})
+
 	// Build the agent introspection & control providers (issue #236). These
 	// back the status server's /agent/* endpoints, which the aceteam MCP server
 	// wraps as citadel_* tools. They read the shared workerState and act on the
@@ -1571,6 +1584,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		headscaleNodeID: headscaleNodeID,
 		baseURL:         baseURL,
 		deviceConfig:    deviceConfig,
+		agentsProbe:     agentsProbeSvc,
 	})
 
 	// Start status server if enabled
@@ -1698,6 +1712,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		}
 
 		statusServer := status.NewServer(serverCfg, collector)
+
+		// Start the vendor-agents probe now that a pull surface exists (aceteam
+		// #8993 S2): async startup probe + hourly timer (CITADEL_AGENTS_PROBE_
+		// INTERVAL_SECONDS, 0 disables the timer). Never blocks boot; a no-op
+		// under the kill switch. The heartbeat never probes — this is the only
+		// thing that ever execs a vendor binary.
+		agentsProbeSvc.Start(ctx, agentsProbeInterval())
 
 		// Register provisioning API routes on the status server
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
@@ -2817,6 +2838,62 @@ func resolveEnergySampling() bool {
 		return update.IsTruthy(raw)
 	}
 	return config.LoadEnergy(platform.ConfigDir()).SamplingEnabled
+}
+
+// agentsProbeDisabled reports whether the S2 vendor-agents probe is turned OFF
+// (aceteam #8993). Default ON: a default-OFF probe would make node_agents_list
+// report "disabled" for the whole fleet until operators opt in, defeating S2's
+// purpose, and the probe is read-only with dropped privileges. The kill switch
+// CITADEL_AGENTS_PROBE set to any falsey value (0/false/no/off) disables it,
+// mirroring WORKER_SELF_HEAL's falsey-to-disable shape.
+func agentsProbeDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_AGENTS_PROBE"))) {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+// agentsProbeInterval resolves the periodic vendor-agents refresh interval
+// (aceteam #8993 S2). Default 1h; CITADEL_AGENTS_PROBE_INTERVAL_SECONDS overrides
+// it, and 0 disables the timer (startup + on-demand ?refresh=1 only). A refresh
+// execs up to four vendor `--version`s (some of which run an update check), so an
+// hour of staleness is the deliberate tradeoff — auth state changes on human
+// timescales and ?refresh=1 covers "I just logged in, check again".
+func agentsProbeInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CITADEL_AGENTS_PROBE_INTERVAL_SECONDS"))
+	if raw == "" {
+		return time.Hour
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return time.Hour
+	}
+	return time.Duration(n) * time.Second
+}
+
+// agentsProbeResolver returns the target-user resolver the probe service runs on
+// each probe (aceteam #8993 S2). The manifest's agents_probe_user override is
+// captured ONCE here (the manifest is loaded once at boot and does not change
+// without a worker restart); the machine-convergent node-dir owner
+// (network.GetStateDir/GetNodeConfigDir, NOT the invoker-scoped platform.ConfigDir),
+// SUDO_USER, and the process uid are re-read on EVERY run, so a mid-lifetime
+// ownership/identity change is observed.
+func agentsProbeResolver(m *CitadelManifest) func() (agentsprobe.Target, error) {
+	configuredUser := ""
+	if m != nil {
+		configuredUser = m.AgentsProbeUser
+	}
+	return func() (agentsprobe.Target, error) {
+		return agentsprobe.ResolveTargetUserForNode(agentsprobe.ResolveInputs{
+			ConfiguredUser: configuredUser,
+			StateDir:       network.GetStateDir(),
+			NodeConfigDir:  network.GetNodeConfigDir(),
+			SudoUser:       os.Getenv("SUDO_USER"),
+			ProcessUID:     os.Getuid(),
+		})
+	}
 }
 
 // sensitiveCapabilityPasscodeWarning returns a single warning line when a

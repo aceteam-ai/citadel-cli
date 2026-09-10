@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/agentsprobe"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -38,6 +39,10 @@ type agentProviderDeps struct {
 	headscaleNodeID string
 	baseURL         string
 	deviceConfig    *DeviceConfig
+	// agentsProbe backs GET /agent/vendor-agents (aceteam #8993 S2). Nil when the
+	// probe is disabled or not constructed, which leaves VendorAgents unwired so
+	// the endpoint returns 503 rather than a null body.
+	agentsProbe *agentsprobe.Service
 }
 
 // buildAgentProviders constructs the status.AgentProviders that back the
@@ -51,7 +56,7 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 	}
 	startedAt := time.Now()
 
-	return &status.AgentProviders{
+	providers := &status.AgentProviders{
 		WorkerStatus: func() any {
 			return d.state.Snapshot()
 		},
@@ -100,6 +105,21 @@ func buildAgentProviders(ctx context.Context, d agentProviderDeps) *status.Agent
 			return liveExposeOps{}.Unexpose(ctx, name)
 		},
 	}
+
+	// Wire the vendor-agents probe pull surface only when a probe service exists
+	// (aceteam #8993 S2). Left nil -> the endpoint returns 503. The closure
+	// captures runWork's root ctx, NOT the HTTP request ctx, so a disconnecting
+	// backend cannot cancel a probe that other ?refresh callers are blocked on.
+	if svc := d.agentsProbe; svc != nil {
+		providers.VendorAgents = func(refresh bool) (any, error) {
+			if refresh {
+				return svc.Refresh(ctx, false), nil
+			}
+			return svc.Get(), nil
+		}
+	}
+
+	return providers
 }
 
 // processExiter is swappable in tests so agentWorkerRestart can be exercised

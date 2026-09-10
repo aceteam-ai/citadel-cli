@@ -109,6 +109,15 @@ type CitadelManifest struct {
 	// (env var > this manifest key > APPLY_DEVICE_CONFIG-pushed persisted
 	// value); see cmd/default_serve.go.
 	DefaultServe bool `yaml:"default_serve,omitempty"`
+	// AgentsProbeUser is the explicit override for WHOSE account the S2
+	// vendor-coding-agent probe inspects (aceteam #8993). It is the top tier of
+	// agentsprobe.ResolveTargetUserForNode: set it on a multi-user node where the
+	// account with `claude`/`codex`/... installed is not the one that ran
+	// `citadel init`. Empty/absent => the layered resolver falls through to the
+	// node-dir owner, then SUDO_USER, then the process user. A configured name
+	// missing from passwd is an honest resolve error (probe reports Unknown), never
+	// a silent fallback to another account.
+	AgentsProbeUser string `yaml:"agents_probe_user,omitempty"`
 }
 
 // manifestPinnedServices returns the pinned_services allowlist for a manifest,

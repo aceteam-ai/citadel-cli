@@ -2756,6 +2756,78 @@ the original gap, including why `internal/devicemode`'s superficially-similar
 population of hosts):
 [docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
 
+### Vendor coding-agent probe in the worker (`citadel work`, aceteam #8993 S2)
+
+Design: [docs/design-agents-probe-s2.md](docs/design-agents-probe-s2.md). S1
+(`internal/agentsprobe.Probe`, `citadel agents probe`) detects installed/authed
+vendor CLIs (claude/codex/gemini/opencode) AS the operator. S2 runs that same
+`Probe` inside the long-lived `citadel work`, where neither `HOME` nor `PATH`
+is the operator's — so it must decide WHOSE environment to inspect, and must not
+exec a user-writable binary as root.
+
+**`agentsprobe.ResolveTargetUserForNode` (`resolver.go`) owns the owner signal:**
+a layered resolver, first match wins — explicit `agents_probe_user` (manifest) >
+owner uid of `network.GetStateDir()` (home from PASSWD via `user.LookupId`, NOT
+the dir path) > `SUDO_USER` (the #1012 branch) > process user. Each `Target`
+carries a `Signal` (`config`/`node-dir-owner`/`sudo-user`/`process`) so "probed
+jason's env" is distinguishable from "probed root's env on a root-owned node" —
+the two outcomes that look identical otherwise. A configured user missing from
+passwd is an ERROR (→ honest Unknown probe), never a silent fallback. Do NOT add
+systemd `User=` reading (answers the wrong question) or `/home/*` enumeration (a
+privacy/exec-surface reach). The package stays stdlib-only (leaf): the node dir
+is passed IN as a string, the node-dir-owner stat is behind `owner_unix.go`/
+`owner_windows.go` build tags (Windows has no numeric uid → falls to process).
+
+**`Target.probeOptions` owns the privilege-drop decision, `applyExecHardening`
+(`exec_hardening_unix.go`) applies it — the LOCAL PRIVESC this feature would
+otherwise introduce.** On the fleet root worker the target's PATH starts with
+dirs the target user WRITES (`~/.npm-global/bin`); exec'ing `<vendor> --version`
+there as root is arbitrary-code-as-root. The drop fires ONLY when `os.Getuid()==0
+&& target.UID != 0`: `SysProcAttr.Credential{Uid,Gid}` (nil Groups + unset
+NoSetGroups → the runtime `setgroups(0)`-clears the worker's supplementary
+groups), a MINIMAL env (`HOME`/`PATH`/`USER`/`LOGNAME` of the target, not the
+worker's), and `cmd.Dir = target home` (a `WorkingDirectory=/root` cwd else
+EACCEs a dropped Node child). `Setpgid` + a process-group-kill `cmd.Cancel` are
+set ALWAYS so a daemonizing grandchild (a vendor update-check helper) is reaped
+on timeout, alongside the existing `WaitDelay`. `buildVersionCmd` is the
+inspectable seam (`TestBuildVersionCmd_DropSetsCredential`). A non-root worker
+cannot drop and runs normally; Windows has no drop (stub).
+
+**`jsonFileNonEmptyObjectState` reads the target's credential file as the worker
+(root bypasses `0600`) but reads ONLY existence + JSON-object SHAPE, never a
+value** — the S1 contract. It `Lstat`s + requires `IsRegular` (a
+target-controlled FIFO would block a root `ReadFile` forever, wedging the
+singleflight probe) and reads through a `LimitReader`. A future "log the parse
+error with a snippet" edit breaks the contract and must not be added.
+
+**`agentsprobe.Service` (`service.go`) is the cadence/cache; the heartbeat NEVER
+probes.** An `atomic.Pointer[Snapshot]`, a `probeMu` singleflight, and a min-gap.
+`Get()` (the read path) never execs. `Refresh(ctx, force)`: `force` for the
+async startup probe + hourly timer (`Start`), `force=false` for the endpoint's
+`?refresh=1` (skips when a probe ran within `MinRefreshGap`, 60s). Wired in
+`cmd/work.go` (`agentsProbeResolver`/`agentsProbeDisabled`/`agentsProbeInterval`);
+`Start()` is called only inside the `workStatusPort > 0` block so a probe never
+runs with no reader. `GET /agent/vendor-agents` (`internal/status/agent.go`
+`handleVendorAgents`, behind `requireVPNOrAuth`, provider closure in
+`cmd/agent_tools.go`) serves the snapshot; `node_agents_list` is the aceteam-side
+tool (#9157, not built here). Deferred (design §6): the `NodeStatus.VendorAgents`
+heartbeat mirror, `--target-user` on the operator command, the aceteam route.
+
+**Bundled gate fixes.** #1017: `ensureMachineStatePointerForRootWorker`
+(`cmd/init.go`) calls `network.EnsureMachineStatePointer` from the network-only
+init path when root (the `--provision` path already did via `createGlobalConfig`;
+network-only — what install.sh runs — returned first, so a root worker after a
+human-sudo install resolved an empty `/root/citadel-node`), making the node-dir-
+owner tier work on that fleet shape. #1015: `Options.HomeUnknown` distinguishes
+"use the process home" (the S1 operator's empty `HomeDir`) from "target
+unresolved" — the latter reports `AuthStateUnknown`, never a confident false "no"
+against `/root`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_AGENTS_PROBE` | unset (ON) | Kill switch. Any falsey value (`0`/`false`/`no`/`off`) disables the probe (endpoint returns `disabled:true`, nothing execs). |
+| `CITADEL_AGENTS_PROBE_INTERVAL_SECONDS` | `3600` | Periodic refresh interval. `0` disables the timer (startup + `?refresh=1` only). |
+
 ### Safe node targeting: `--node-dir`, `--dry-run`, `--expect-node` (citadel#853, #854)
 
 Motivated by a real incident: a subagent smoke-testing `citadel module` had set
