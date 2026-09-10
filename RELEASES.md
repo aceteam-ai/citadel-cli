@@ -2409,3 +2409,18 @@ Auto-generated log of every release.
   - fix(security): bind engine host ports to loopback, not all interfaces (#1025)
 
 
+---
+
+## v2.154.0 — 2026-09-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 17 |
+| Lines added | +1314 |
+
+**Changes:**
+
+  - feat: AEP receipt v2 signed canon + refuse-to-sign guard (#8253 S3) (#1026)
+
+
