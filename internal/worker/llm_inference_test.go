@@ -912,6 +912,67 @@ func TestLLMInferenceHandler_SignAEPReceiptFailsOpen(t *testing.T) {
 	}
 }
 
+// TestLLMInferenceHandler_SignAEPReceiptRefuseGuardFailsOpen drives the REAL
+// pipeline (CheckGrounding -> BuildVerdict -> BuildSignedReceiptV2) with a model
+// name containing the canonical delimiter ("bonsai\nx"), which the
+// refuse-to-sign guard rejects. The job must still succeed with content,
+// grounding, and trust_verdict attached and only the aep_receipt skipped
+// (fail-open on the guard, not just on a failing signer), with the refusal
+// logged exactly once.
+func TestLLMInferenceHandler_SignAEPReceiptRefuseGuardFailsOpen(t *testing.T) {
+	body := `{"choices":[{"message":{"content":"the answer is 42."},"finish_reason":"stop"}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+
+	t.Setenv(groundingGuardrailEnvVar, "1")
+	t.Setenv(signAEPReceiptsEnvVar, "1")
+
+	h := NewLLMInferenceHandler().
+		WithSigner(newFakeAEPSigner(t)). // a VALID signer -- the guard, not the key, is what refuses
+		WithFabricNodeIDResolver(func() string { return "" })
+	h.baseURLs["bonsai"] = ts.URL
+
+	var loggedCalls int
+	h.aepLogf = func(format string, args ...any) { loggedCalls++ }
+
+	job := &Job{
+		ID:   "job-refuse-guard",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "bonsai\nx", // newline in a canonical free-string field
+			"backend":  "bonsai",
+			"messages": []map[string]any{{"role": "user", "content": "what is the answer?"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success even when the guard refuses to sign", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "the answer is 42." {
+		t.Errorf("content = %q, want the answer to still be present", got)
+	}
+	if _, present := result.Output["grounding"]; !present {
+		t.Errorf("Output = %+v, want the grounding key to still attach", result.Output)
+	}
+	if _, present := result.Output["trust_verdict"]; !present {
+		t.Errorf("Output = %+v, want the trust_verdict to still attach", result.Output)
+	}
+	if _, present := result.Output["aep_receipt"]; present {
+		t.Errorf("Output = %+v, want NO aep_receipt when the guard refuses to sign", result.Output)
+	}
+	if loggedCalls != 1 {
+		t.Errorf("aepLogf called %d times, want exactly 1 (the refusal logged, non-fatally)", loggedCalls)
+	}
+}
+
 // --- Tool calling (citadel-cli#603, aceteam #6555) ---------------------------
 
 // TestLLMInferenceHandler_ToolsRequestByteIdenticalWithoutTools pins the

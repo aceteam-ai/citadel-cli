@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -161,6 +162,21 @@ func TestBuildSignedReceiptV2_RefusesNewlineCollision(t *testing.T) {
 	}
 	if !ecdsa.VerifyASN1(pub, digest[:], sigDER) {
 		t.Error("signature does not verify over CanonicalizeV2(receipt)")
+	}
+}
+
+// TestBuildSignedReceiptV2_RefusesNonFiniteScore pins the NaN/Inf guard: Go's
+// FormatFloat renders those as "NaN"/"+Inf", which the Python verifier's
+// f"{float(v):.6f}" renders as "nan"/"inf" -- a mismatch that would fail the
+// signature. Refuse to sign instead. (Score is a [0,1] ratio, so this never
+// happens in production; the guard is the cheap guarantee.)
+func TestBuildSignedReceiptV2_RefusesNonFiniteScore(t *testing.T) {
+	signer := newFakeSigner(t)
+	inputs := V2Inputs{InputSHA256: "sha256:i", OutputSHA256: "sha256:o", PolicyHash: EmptyPolicyHash, Action: "pass", VerdictHash: "sha256:v"}
+	for _, score := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := BuildSignedReceiptV2(signer, "n", "j", "e", "m", inputs, trust.GroundingResult{Score: score}, time.Unix(0, 0)); err == nil {
+			t.Errorf("BuildSignedReceiptV2 signed a receipt with non-finite score %v; want refusal", score)
+		}
 	}
 }
 

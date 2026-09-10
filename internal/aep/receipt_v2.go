@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -174,6 +175,15 @@ type V2Inputs struct {
 func BuildSignedReceiptV2(signer Signer, nodeID, jobID, engine, model string, in V2Inputs, result trust.GroundingResult, now time.Time) (*AEPReceiptV2, error) {
 	if signer == nil {
 		return nil, fmt.Errorf("aep: nil signer")
+	}
+	// A non-finite score renders as Go's "NaN"/"+Inf"/"-Inf" via FormatFloat,
+	// which the Python verifier's f"{float(v):.6f}" would render as
+	// "nan"/"inf" -- a case/spelling mismatch that fails the signature. Score
+	// is a ratio in [0,1] so this cannot occur today, but refusing to sign is
+	// the cheap guarantee (the newline guard below does not catch it, since
+	// those spellings contain no delimiter).
+	if math.IsNaN(result.Score) || math.IsInf(result.Score, 0) {
+		return nil, fmt.Errorf("aep: score %v is not finite; refusing to sign (renders differently across Go/Python)", result.Score)
 	}
 	flaggedHash, err := hashFlaggedClaims(result.Flagged)
 	if err != nil {
