@@ -106,6 +106,69 @@ func TestAgentLogsQueryParams(t *testing.T) {
 	}
 }
 
+func TestVendorAgentsOverVPN(t *testing.T) {
+	var gotRefresh bool
+	_, mux := newAgentMux(&AgentProviders{
+		VendorAgents: func(refresh bool) (any, error) {
+			gotRefresh = refresh
+			return map[string]any{"stale": false, "agents": []any{}}, nil
+		},
+	})
+
+	// Default (no ?refresh) serves the cache: refresh must be false.
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/vendor-agents"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if gotRefresh {
+		t.Fatal("default request must pass refresh=false")
+	}
+
+	// ?refresh=1 forces a re-probe.
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/vendor-agents?refresh=1"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with refresh, got %d", w.Code)
+	}
+	if !gotRefresh {
+		t.Fatal("?refresh=1 must pass refresh=true to the provider")
+	}
+}
+
+func TestVendorAgentsRequiresAuthFromLAN(t *testing.T) {
+	_, mux := newAgentMux(&AgentProviders{
+		VendorAgents: func(bool) (any, error) { return map[string]any{}, nil },
+	})
+	r := httptest.NewRequest(http.MethodGet, "/agent/vendor-agents", nil)
+	r.RemoteAddr = "192.168.1.50:1234"
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 from LAN without token, got %d", w.Code)
+	}
+}
+
+func TestVendorAgentsNilProviderReturns503(t *testing.T) {
+	_, mux := newAgentMux(&AgentProviders{}) // VendorAgents unwired
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/vendor-agents"))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 for unwired VendorAgents, got %d", w.Code)
+	}
+}
+
+func TestVendorAgentsRejectsPost(t *testing.T) {
+	_, mux := newAgentMux(&AgentProviders{
+		VendorAgents: func(bool) (any, error) { return map[string]any{}, nil },
+	})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/vendor-agents"))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST on read endpoint, got %d", w.Code)
+	}
+}
+
 func TestRegisterAgentRoutesNoopWhenNil(t *testing.T) {
 	// No panic and no routes when providers are nil.
 	s := NewServer(ServerConfig{Port: 8080}, NewCollector(CollectorConfig{NodeName: "n"}))

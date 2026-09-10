@@ -64,6 +64,13 @@ type AgentProviders struct {
 	// Unexpose revokes an exposure by name, the inverse of Expose. Same
 	// in-process reasoning: only this process holds the live gateway.
 	Unexpose func(name string) (any, error)
+
+	// VendorAgents returns the cached vendor-coding-agent probe snapshot for
+	// GET /agent/vendor-agents (aceteam #8993 S2, the node_agents_list surface).
+	// refresh=true forces a re-probe subject to the service's min-gap; the
+	// default serves the cached snapshot. Reading never blocks on a probe. Nil
+	// when this process runs no probe service (-> 503).
+	VendorAgents func(refresh bool) (any, error)
 }
 
 // ExposeSpec is the /agent/expose request body. It mirrors the EXPOSE_SET job
@@ -138,6 +145,8 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	})))
 
 	mux.HandleFunc("/agent/logs", s.requireVPNOrAuth(s.handleAgentLogs))
+
+	mux.HandleFunc("/agent/vendor-agents", s.requireVPNOrAuth(s.handleVendorAgents))
 
 	// Control endpoints (POST, may be nil -> 503).
 	mux.HandleFunc("/agent/set-log-level", s.requireVPNOrAuth(s.handleSetLogLevel))
@@ -256,6 +265,32 @@ func (s *Server) handleAgentAction(name string, fn func() (any, error)) http.Han
 		}
 		writeJSON(w, http.StatusOK, result)
 	}
+}
+
+// handleVendorAgents serves GET /agent/vendor-agents (aceteam #8993 S2). It
+// returns the cached probe snapshot; ?refresh=1 forces a re-probe subject to the
+// service's own min-gap (so a retrying backend cannot hammer the node into
+// exec'ing vendor binaries in a loop). 503 when no probe service runs in this
+// process (e.g. `citadel serve` without the worker).
+func (s *Server) handleVendorAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.agent == nil || s.agent.VendorAgents == nil {
+		writeAgentError(w, errUnavailable)
+		return
+	}
+	refresh := false
+	if v := r.URL.Query().Get("refresh"); v != "" {
+		refresh, _ = strconv.ParseBool(v)
+	}
+	res, err := s.agent.VendorAgents(refresh)
+	if err != nil {
+		writeAgentError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleAgentLogs serves GET /agent/logs?lines=&level=&grep=&since=.
