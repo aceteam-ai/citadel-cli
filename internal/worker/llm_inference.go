@@ -84,32 +84,26 @@ type LLMInferenceHandler struct {
 	// why it is NOT nodeidentity.Default() -- in the constructor; overridable
 	// via WithSigner so tests never touch the real host's filesystem.
 	//
-	// MACHINE-CONVERGENT BY CONSTRUCTION: unlike nodeidentity.Default()
-	// (rooted at invoker-scoped platform.ConfigDir(), see CLAUDE.md's
-	// ConfigDir()/GetNodeConfigDir() section and citadel-cli#845/#726/#696/
-	// #383), this key is rooted at network.GetNodeConfigDir() -- the SAME
-	// machine-convergent directory `citadel init`'s device-config write
-	// (#845) and #726's heartbeat marker already use. A systemd-root
-	// `citadel work` and an interactive non-root process therefore resolve
-	// the IDENTICAL signing key file, so a future Phase 2 backend
-	// registration of this node's public key can never desync from what
-	// `citadel work` actually signs with.
-	// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts pins
-	// this: two Store instances constructed against the same converged
-	// nodeConfigDir (standing in for two different invocation contexts that
-	// both resolved to it, e.g. `citadel init` and `citadel work`)
-	// load/create the IDENTICAL key.
+	// MACHINE-CONVERGENT BY CONSTRUCTION, AND THE SAME KEY THE CA REGISTERED
+	// (K-A, docs/design-trust-receipt-v2.md §4, aceteam#8253): unlike
+	// nodeidentity.Default() (rooted at invoker-scoped platform.ConfigDir(),
+	// see CLAUDE.md's ConfigDir()/GetNodeConfigDir() section and
+	// citadel-cli#845/#726/#696/#383), nodeidentity.Convergent roots this key
+	// at network.GetNodeConfigDir() -- the SAME machine-convergent directory
+	// `citadel init`'s device-config write (#845) and #726's heartbeat marker
+	// already use. A systemd-root `citadel work` and an interactive non-root
+	// process therefore resolve the IDENTICAL signing key file.
+	// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts pins this.
 	//
-	// Deliberately a SEPARATE key/directory from nodeidentity.Default()
-	// (still used, unchanged, by cmd/device.go's device-mode enrollment and
-	// cmd/init.go's dormant mTLS CSR flow) rather than re-rooting Default()
-	// itself: device.go's package doc states "the identity store is the same
-	// one `citadel init` uses" as a deliberate feature (flipping a device to
-	// a node is a config change, not a re-enrollment), so re-rooting the
-	// shared Default() would need to satisfy that assumption too, which is a
-	// larger, separate change outside this PR's scope. Giving THIS signing
-	// path its own convergent store is the narrower fix that only touches
-	// the code this PR actually added.
+	// Crucially, Convergent is now ALSO what every CSR/enrollment site uses
+	// (cmd/init.go:ensureNodeIdentity, cmd/device.go), so the signing key and
+	// the CSR key whose SPKI the fabric CA signed into fabric_node_certs are
+	// ONE key -- previously they were two (signer at GetNodeConfigDir, CSR at
+	// Default()/ConfigDir), so a real receipt's public_key_fingerprint could
+	// never match a fabric_node_certs row. Convergent's first-use read-through
+	// adopts a key already registered under the legacy platform.ConfigDir()
+	// location (byte-identical, so an issued leaf stays valid); see
+	// nodeidentity.reconcileFromLegacy.
 	signer aep.Signer
 
 	// fabricNodeID resolves the AEP receipt's preferred node_id (aceteam
@@ -170,27 +164,31 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 // familiar -- just rooted at a different, machine-convergent parent.
 const aepIdentitySubdir = "identity"
 
-// aepSigningStoreDir is the pure core of defaultAEPSigner's path resolution:
-// given an already-resolved machine-convergent node config dir, return the
-// directory the AEP signing key is rooted at. Split out as a pure function
-// (rather than inlined where network.GetNodeConfigDir() is called) so a test
-// can assert convergence without needing two real, differently-configured
-// processes -- see TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts.
+// aepSigningStoreDir returns the directory the AEP signing key is rooted at for
+// a given machine-convergent node config dir: <nodeConfigDir>/identity.
+//
+// Retained as the TEST ORACLE for the signer's resolved path: defaultAEPSigner
+// now goes through nodeidentity.Convergent (which appends nodeidentity.dirName,
+// == "identity"), so this is an INDEPENDENT re-derivation the signer tests
+// assert against (TestNewLLMInferenceHandler_SignerIsMachineConvergentNotInvokerScoped,
+// TestAEPSigningStoreDir_PureFunctionOfNodeConfigDir) rather than production
+// path resolution.
 func aepSigningStoreDir(nodeConfigDir string) string {
 	return filepath.Join(nodeConfigDir, aepIdentitySubdir)
 }
 
 // defaultAEPSigner returns the default signer for the AEP receipt (aceteam
-// #8253): a nodeidentity.Store rooted at network.GetNodeConfigDir(), the
-// machine-convergent node config dir -- NOT nodeidentity.Default(), which is
-// rooted at invoker-scoped platform.ConfigDir() and is used elsewhere
-// (cmd/device.go's device-mode enrollment, cmd/init.go's dormant mTLS CSR
-// flow) for reasons that depend on staying invoker-scoped/shared with
-// `citadel init`'s own context. See the `signer` field's doc comment on
-// LLMInferenceHandler for the full reasoning on why this is a deliberately
-// SEPARATE store rather than a re-rooted Default().
+// #8253): the machine-convergent nodeidentity.Store rooted at
+// network.GetNodeConfigDir() (via nodeidentity.Convergent) -- NOT
+// nodeidentity.Default(), which is rooted at invoker-scoped
+// platform.ConfigDir() and would silently diverge between a systemd-root
+// `citadel work` and an interactive `citadel init`. This is the SAME
+// convergent store the CSR/enrollment sites now use (cmd/init.go,
+// cmd/device.go), so the signing key IS the key the fabric CA registered
+// (K-A, docs/design-trust-receipt-v2.md §4); see the `signer` field's doc
+// comment on LLMInferenceHandler for the full reasoning.
 func defaultAEPSigner() aep.Signer {
-	return nodeidentity.New(aepSigningStoreDir(network.GetNodeConfigDir()))
+	return nodeidentity.Convergent(network.GetNodeConfigDir())
 }
 
 // WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
@@ -211,8 +209,9 @@ func (h *LLMInferenceHandler) WithRequestRecorder(recorder func(engine string)) 
 }
 
 // WithSigner overrides the AEP receipt signer (aceteam #8253), primarily for
-// tests that want a hermetic in-memory signer instead of nodeidentity.Default()
-// (which reads/writes real key material under platform.ConfigDir()).
+// tests that want a hermetic in-memory signer instead of the default
+// nodeidentity.Convergent store (which reads/writes real key material under
+// network.GetNodeConfigDir() and reads through the legacy platform.ConfigDir()).
 func (h *LLMInferenceHandler) WithSigner(signer aep.Signer) *LLMInferenceHandler {
 	h.signer = signer
 	return h
