@@ -2392,3 +2392,20 @@ Auto-generated log of every release.
   - fix: agentsprobe S2-gate — invoker-scoped HOME/PATH + honest auth-unknown (#1005) (#1012)
 
 
+---
+
+## v2.153.0 — 2026-09-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 34 |
+| Lines added | +2695 |
+
+**Changes:**
+
+  - feat: agents-probe S2 — probe wired into citadel work (#8993) (#1022)
+  - feat: converge AEP signer + CA identity key (K-A) (#8253 S3 prereq) (#1020)
+  - fix(security): bind engine host ports to loopback, not all interfaces (#1025)
+
+
