@@ -22,6 +22,7 @@
 package nodeidentity
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -33,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -58,22 +60,66 @@ const (
 )
 
 // Store is a filesystem-backed node identity store rooted at a directory.
-// The zero value is not usable; construct one with New or Default.
+// The zero value is not usable; construct one with New, Default, or Convergent.
+//
+// legacyDir, when non-empty, is a SECOND directory this store performs a
+// one-time read-through from on first key/leaf access: a convergent store
+// (see Convergent) adopts a key registered under the legacy invoker-scoped
+// location so the AEP receipt signer and the CSR/enrollment flows use ONE key
+// (K-A, docs/design-trust-receipt-v2.md §4, aceteam#8253). Empty for New and
+// Default, which are byte-for-byte unchanged from before convergence.
 type Store struct {
-	dir string
+	dir       string
+	legacyDir string
 }
 
-// Default returns a Store rooted at platform.ConfigDir()/identity, matching the
-// location and pattern citadel already uses for config.yaml and the device
-// token (see cmd/init.go, internal/tlscert).
+// newStore is the internal constructor. A legacyDir that is empty or equal to
+// dir disables the read-through convergence (New/Default). Exposed to tests
+// (in-package) so they can inject a temp legacy dir instead of the real
+// platform.ConfigDir().
+func newStore(dir, legacyDir string) *Store {
+	if legacyDir == dir {
+		legacyDir = ""
+	}
+	return &Store{dir: dir, legacyDir: legacyDir}
+}
+
+// Default returns a Store rooted at platform.ConfigDir()/identity.
+//
+// DEPRECATED for production identity paths: platform.ConfigDir() is
+// invoker-scoped (user-local unless root), so a systemd-root `citadel work`
+// and an interactive non-root process resolve DIFFERENT directories — the
+// exact split that made the AEP receipt signer sign with a key the fabric CA
+// never registered (docs/design-trust-receipt-v2.md §4). Every production
+// identity path now uses Convergent instead; a NEW nodeidentity.Default()
+// call site is how that bug comes back. Kept only for tests and any path that
+// genuinely needs the invoker-scoped location.
 func Default() *Store {
-	return &Store{dir: filepath.Join(platform.ConfigDir(), dirName)}
+	return newStore(filepath.Join(platform.ConfigDir(), dirName), "")
 }
 
-// New returns a Store rooted at an explicit directory. Used in tests to avoid
-// touching the real config dir.
+// New returns a Store rooted at an explicit directory, with NO read-through
+// convergence. Used in tests to avoid touching the real config dir.
 func New(dir string) *Store {
-	return &Store{dir: dir}
+	return newStore(dir, "")
+}
+
+// Convergent returns a Store rooted at <nodeConfigDir>/identity — the
+// machine-convergent node config dir (network.GetNodeConfigDir(), the same
+// directory #845's device config and #726's heartbeat marker converge on).
+// The nodeConfigDir is threaded in from cmd / internal/worker because
+// nodeidentity is a leaf package that must not import internal/network.
+//
+// Every production identity path constructs the store this way — the AEP
+// receipt signer (internal/worker.defaultAEPSigner) and every CSR/enrollment
+// site (cmd/init.go:ensureNodeIdentity, cmd/device.go) — so all of them
+// resolve the IDENTICAL key file (K-A, docs/design-trust-receipt-v2.md §4,
+// aceteam#8253). On first key/leaf access the store performs a one-time
+// read-through of a key previously registered under the legacy invoker-scoped
+// platform.ConfigDir()/identity location; see reconcileFromLegacy for the
+// exact (never-displace-a-registered-key, never-destroy-key-material) rule.
+func Convergent(nodeConfigDir string) *Store {
+	return newStore(filepath.Join(nodeConfigDir, dirName), filepath.Join(platform.ConfigDir(), dirName))
 }
 
 // Dir returns the identity store directory.
@@ -105,10 +151,160 @@ func (s *Store) HasLeaf() bool {
 // subsequent calls it loads the existing key from disk so the node keeps a
 // stable identity across `citadel init` re-runs.
 func (s *Store) GetOrCreateKey() (*ecdsa.PrivateKey, error) {
+	// Read-through convergence (K-A, docs/design-trust-receipt-v2.md §4): before
+	// minting a new key, adopt a key registered under the legacy invoker-scoped
+	// location if one exists there. A HARD error if reconciliation fails while a
+	// legacy key is present — never fall through to generateKey and mint a
+	// SECOND identity beside a CA-registered one, which would orphan the node's
+	// issued mTLS leaf. No-op for a non-convergent store (legacyDir == "").
+	if err := s.reconcileFromLegacy(); err != nil {
+		return nil, err
+	}
 	if s.HasKey() {
 		return s.loadKey()
 	}
 	return s.generateKey()
+}
+
+// reconcileFromLegacy performs the one-time read-through that converges a
+// node's cryptographic identity onto this (machine-convergent) store from the
+// legacy invoker-scoped location a pre-convergence citadel wrote it to
+// (platform.ConfigDir()/identity — see Convergent). It is the mechanism the
+// K-A design (docs/design-trust-receipt-v2.md §4, aceteam#8253) requires so the
+// AEP receipt signer and the CSR/enrollment flows use ONE key — the key whose
+// SPKI the fabric CA already signed — instead of two.
+//
+// No-op for a non-convergent store (legacyDir == "": New/Default).
+//
+// Decision (invariants: never displace a REGISTERED key, never destroy key
+// material). node.crt (the CA-signed leaf) is the local proof that a key was
+// registered: pre-K-A only the legacy Default() store ever received a leaf
+// (device pairing wrote it), while the convergent path only ever received a
+// bare AEP signer key (#917, no leaf), so a convergent leaf can only mean a
+// post-K-A registration here.
+//   - convergent has BOTH key and leaf → registered here already; FINAL. Never
+//     touched, even if a differing legacy key exists.
+//   - legacy key exists, convergent has no leaf, and the convergent key is
+//     absent OR differs from the legacy key → ADOPT the legacy key (and its
+//     leaf + CA chain, if any). A pre-existing (leafless, therefore
+//     unregistered) convergent key being displaced is first copied aside to
+//     node.key.displaced-<unixnano> (never removed), then the legacy key is
+//     installed via atomic temp-write + rename, so node.key is never
+//     momentarily absent.
+//   - otherwise (no legacy key, or convergent key already equals legacy) →
+//     nothing to adopt.
+//
+// Idempotent (a second call sees a convergent leaf, or convergent == legacy)
+// and crash-safe (every write is an atomic temp-file + rename). Safe across
+// processes: two concurrent adopters copy IDENTICAL legacy bytes, so a rename
+// that overwrites the other's install is benign.
+func (s *Store) reconcileFromLegacy() error {
+	if s.legacyDir == "" {
+		return nil
+	}
+	// A convergent key WITH a leaf is a post-K-A registration here: final.
+	if s.HasKey() && s.HasLeaf() {
+		return nil
+	}
+
+	legacyKey, err := readFileIfExists(filepath.Join(s.legacyDir, keyFileName))
+	if err != nil {
+		return fmt.Errorf("read legacy identity key: %w", err)
+	}
+	if legacyKey == nil {
+		return nil // nothing registered at the legacy location to adopt
+	}
+
+	convKey, err := readFileIfExists(s.KeyPath())
+	if err != nil {
+		return fmt.Errorf("read convergent identity key: %w", err)
+	}
+
+	if err := os.MkdirAll(s.dir, dirPerms); err != nil {
+		return fmt.Errorf("create identity dir: %w", err)
+	}
+
+	// Bring the key into agreement unless it already matches. A differing
+	// convergent key (leafless, so never CA-registered — see above) is copied
+	// aside, never destroyed, before the registered legacy key overwrites it.
+	if convKey == nil || !bytes.Equal(convKey, legacyKey) {
+		if convKey != nil {
+			aside := fmt.Sprintf("%s.displaced-%d", s.KeyPath(), time.Now().UnixNano())
+			if err := writeFileAtomic(aside, convKey, keyPerms); err != nil {
+				return fmt.Errorf("preserve displaced identity key: %w", err)
+			}
+		}
+		// Mandatory: the byte-identical preservation of the registered key
+		// (same bytes → same SPKI → the already-issued leaf stays valid) is the
+		// entire point of the read-through.
+		if err := writeFileAtomic(s.KeyPath(), legacyKey, keyPerms); err != nil {
+			return fmt.Errorf("adopt legacy identity key: %w", err)
+		}
+	}
+
+	// Adopt the leaf + CA chain too when present at the legacy location and
+	// absent here — public material, best-effort — so an already-paired node's
+	// `citadel device status` display and its mTLS leaf keep working.
+	for _, f := range []struct{ src, dst string }{
+		{filepath.Join(s.legacyDir, leafFileName), s.LeafPath()},
+		{filepath.Join(s.legacyDir, caChainFileName), s.CAChainPath()},
+	} {
+		if fileExists(f.dst) {
+			continue
+		}
+		if data, rErr := readFileIfExists(f.src); rErr == nil && data != nil {
+			_ = writeFileAtomic(f.dst, data, pubPerms)
+		}
+	}
+	return nil
+}
+
+// readFileIfExists returns the file's bytes, or (nil, nil) if it does not
+// exist. A real read error (permissions, I/O) is returned.
+func readFileIfExists(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// fileExists reports whether path exists (as any file type).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// writeFileAtomic writes data to path via a temp file in the SAME directory
+// (created 0600, so private-key bytes never transit a looser-perm file) chmod'd
+// to perm, then an atomic rename. Crash-safe: a crash leaves either the old
+// file or the fully-written new one, never a partial key.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".identity-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // generateKey creates a new EC P-256 keypair and writes the private key to
@@ -239,6 +435,13 @@ func (s *Store) StoreCAChain(chainPEM string) error {
 
 // LoadLeaf reads and parses the stored leaf certificate.
 func (s *Store) LoadLeaf() (*x509.Certificate, error) {
+	// Best-effort read-through so an already-paired node whose leaf still lives
+	// at the legacy location is displayed/loaded correctly. Unlike
+	// GetOrCreateKey this does NOT hard-fail on a reconcile error — reading a
+	// leaf is a display/dormant path, never a key-minting decision.
+	if s.legacyDir != "" {
+		_ = s.reconcileFromLegacy()
+	}
 	data, err := os.ReadFile(s.LeafPath())
 	if err != nil {
 		return nil, fmt.Errorf("read leaf cert: %w", err)

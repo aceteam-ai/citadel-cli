@@ -121,6 +121,25 @@ func TestNewLLMInferenceHandler_SignerIsMachineConvergentNotInvokerScoped(t *tes
 	}
 }
 
+// TestDefaultAEPSigner_SameConvergentStoreAsCSRPath pins K-A end to end
+// (docs/design-trust-receipt-v2.md §4, aceteam#8253): the AEP receipt signer
+// and the CSR/enrollment path (cmd/init.go, cmd/device.go) both construct
+// nodeidentity.Convergent(network.GetNodeConfigDir()), so they resolve the
+// SAME key file — the prerequisite for a receipt's public_key_fingerprint to
+// match a fabric_node_certs row. Compares resolved dirs only (no filesystem
+// I/O, so this never touches the real host's identity key).
+func TestDefaultAEPSigner_SameConvergentStoreAsCSRPath(t *testing.T) {
+	signer, ok := defaultAEPSigner().(*nodeidentity.Store)
+	if !ok {
+		t.Fatalf("defaultAEPSigner() = %T, want *nodeidentity.Store", defaultAEPSigner())
+	}
+	// Exactly what cmd/init.go:ensureNodeIdentity and cmd/device.go construct.
+	csrPath := nodeidentity.Convergent(network.GetNodeConfigDir())
+	if signer.Dir() != csrPath.Dir() {
+		t.Fatalf("signer store dir %q != CSR path store dir %q — receipts could never verify", signer.Dir(), csrPath.Dir())
+	}
+}
+
 func TestLLMInferenceHandler_CanHandle(t *testing.T) {
 	h := NewLLMInferenceHandler()
 	if !h.CanHandle(JobTypeLLMInference) {

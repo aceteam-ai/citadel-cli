@@ -5,11 +5,25 @@ services:
     image: vllm/vllm-openai:latest
     container_name: citadel-vllm
     # Host port is owned by citadel (services/ports.go), supplied via
-    # CITADEL_VLLM_HOST_PORT; the :? guard fails loudly if citadel forgot to
-    # supply it. Left on the default 0.0.0.0 bind because peers reach this engine
-    # directly over the mesh. The container still serves the OpenAI API on :8000.
+    # CITADEL_VLLM_HOST_PORT. Loopback-only publish (127.0.0.1), deliberately
+    # (aceteam-ai/aceteam#9523): this is an OpenAI-compatible vLLM server with
+    # NO auth of its own, and the "peers reach this engine directly over the
+    # mesh" rationale a prior version of this comment gave does not hold on an
+    # embedded-tsnet node: citadel's userspace netstack never forwards
+    # inbound mesh traffic to a host-bound port it did not explicitly
+    # ListenVPN (see CLAUDE.md's "Chat reachability" note), so the 0.0.0.0
+    # bind bought LAN reach, not mesh reach, on the common node topology. Mesh
+    # reach stays available through the gateway's model-routed
+    # /v1/chat/completions (internal/gateway/chat_route.go), which resolves
+    # the model to this engine and reverse-proxies to 127.0.0.1 itself, so
+    # this bind change does not affect it. The bare `${CITADEL_VLLM_HOST_PORT}`
+    # token below (no `:?`/`:-` guard) mirrors kokoro.yml/omnivoice.yml: a
+    # guard's own colons would smear across the loopback host-port parsers in
+    # services/embed_test.go and internal/apps/hostport_collision_test.go, and
+    # citadel ALWAYS injects the var (services.HostPortEnv) at every
+    # `docker compose up` site, so it resolves; do not add a default/guard back.
     ports:
-      - "${CITADEL_VLLM_HOST_PORT:?citadel must supply CITADEL_VLLM_HOST_PORT}:8000"
+      - "127.0.0.1:${CITADEL_VLLM_HOST_PORT}:8000"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
     # The served model is interpolated from VLLM_MODEL so a SERVICE_START job

@@ -1771,6 +1771,14 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 // #4583): it ensures an EC P-256 keypair exists on disk (0600, never
 // transmitted) and best-effort caches the public fabric CA trust chain.
 //
+// The store is the machine-convergent nodeidentity.Convergent
+// (network.GetNodeConfigDir()) — the SAME store the AEP receipt signer
+// (internal/worker.defaultAEPSigner) uses — so the CSR key whose SPKI the
+// fabric CA signs and the receipt signing key are ONE key (K-A,
+// docs/design-trust-receipt-v2.md §4, aceteam#8253). On a node whose key was
+// registered under the legacy invoker-scoped location, Convergent's first-use
+// read-through adopts those exact bytes so the already-issued leaf stays valid.
+//
 // Idempotent: on re-run it loads the existing key rather than rotating it, so a
 // node keeps a stable identity across `citadel init` invocations.
 //
@@ -1780,8 +1788,13 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 // The stored key + chain only become load-bearing once P2's mTLS self-reenroll
 // lands and consumes them.
 func ensureNodeIdentity(baseURL string) {
-	store := nodeidentity.Default()
+	ensureNodeIdentityWithStore(nodeidentity.Convergent(network.GetNodeConfigDir()), baseURL)
+}
 
+// ensureNodeIdentityWithStore is the store-injected core of ensureNodeIdentity,
+// split out so tests can drive a hermetic temp-dir store rather than the real
+// machine-convergent (and, on this dev box, node-1297-pinned) directory.
+func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	if _, err := store.GetOrCreateKey(); err != nil {
 		// Non-fatal: a node without an identity key simply pairs with an authkey
 		// as before. Do NOT os.Exit — this must never block init.

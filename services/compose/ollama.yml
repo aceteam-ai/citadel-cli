@@ -1,4 +1,15 @@
 # services/compose/ollama.yml
+#
+# NOT loopback-bound, deliberately, unlike vllm/llamacpp/bonsai/unlimited-ocr/
+# sglang (aceteam-ai/aceteam#9523): internal/apps/catalog.go points at least
+# one catalog app's OLLAMA_BASE_URL at `http://host.docker.internal:11434`,
+# and a container reaching the host via host.docker.internal lands on the
+# docker0 bridge gateway (e.g. 172.17.0.1 on Linux), not 127.0.0.1. A bare
+# loopback publish would refuse that connection and break the app. Fixing
+# ollama's exposure needs a bind that still answers the bridge gateway (or a
+# shared user-defined network so that path skips the host publish entirely),
+# tracked in aceteam-ai/citadel-cli#1023 rather than a naive loopback swap
+# here.
 
 services:
   ollama:
