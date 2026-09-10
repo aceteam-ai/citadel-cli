@@ -785,13 +785,19 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 			t.Fatalf("json.Marshal(result.Output): %v", err)
 		}
 		var wire struct {
-			AEPReceipt aep.AEPReceiptV1 `json:"aep_receipt"`
+			AEPReceipt aep.AEPReceiptV2 `json:"aep_receipt"`
 		}
 		if err := json.Unmarshal(wireBytes, &wire); err != nil {
 			t.Fatalf("json.Unmarshal wire bytes: %v", err)
 		}
 		receipt := &wire.AEPReceipt
 
+		if receipt.ReceiptVersion != aep.ReceiptVersionV2 {
+			t.Errorf("receipt.ReceiptVersion = %q, want %q", receipt.ReceiptVersion, aep.ReceiptVersionV2)
+		}
+		if receiptMap["receipt_version"] != "2" {
+			t.Errorf(`receiptMap["receipt_version"] = %v, want the string "2"`, receiptMap["receipt_version"])
+		}
 		if receipt.JobID != job.ID {
 			t.Errorf("receipt.JobID = %q, want %q", receipt.JobID, job.ID)
 		}
@@ -800,6 +806,18 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 		}
 		if receipt.Model != "bonsai-27b" {
 			t.Errorf("receipt.Model = %q, want bonsai-27b", receipt.Model)
+		}
+		// output_sha256 binds the exact content ("the answer is 42.") the
+		// engine returned, in the sha256:hex shape the backend's
+		// _expected_output_sha256 recomputes.
+		if want := sha256Hex("the answer is 42."); receipt.OutputSHA256 != want {
+			t.Errorf("receipt.OutputSHA256 = %q, want %q", receipt.OutputSHA256, want)
+		}
+		if receipt.PolicyHash != aep.EmptyPolicyHash {
+			t.Errorf("receipt.PolicyHash = %q, want the interim empty-policy hash %q", receipt.PolicyHash, aep.EmptyPolicyHash)
+		}
+		if receipt.VerdictHash == "" || receipt.Action == "" {
+			t.Errorf("receipt verdict fields empty: action=%q verdict_hash=%q", receipt.Action, receipt.VerdictHash)
 		}
 		wantFP, _ := signer.PublicKeyFingerprint()
 		if receipt.NodeID != wantFP {
@@ -816,7 +834,7 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode signature: %v", err)
 		}
-		digest := sha256.Sum256(aep.Canonicalize(receipt))
+		digest := sha256.Sum256(aep.CanonicalizeV2(receipt))
 		if !ecdsa.VerifyASN1(&signer.key.PublicKey, digest[:], sigDER) {
 			t.Errorf("receipt signature does not verify against the signer's own public key")
 		}
@@ -2068,9 +2086,28 @@ func TestApplyTrustEngine_HookCoverageAcrossAllEnginePaths(t *testing.T) {
 			if _, ok := verdict["verdict_hash"].(string); !ok {
 				t.Errorf(`trust_verdict["verdict_hash"] = %#v, want a string`, verdict["verdict_hash"])
 			}
+			// The unsigned trust_verdict now also carries the content-binding
+			// digests (aceteam #8253 S3, design §7.2): policy_hash is the interim
+			// empty-policy hash and input_sha256 is present.
+			if got := verdict["policy_hash"]; got != aep.EmptyPolicyHash {
+				t.Errorf(`trust_verdict["policy_hash"] = %v, want %q`, got, aep.EmptyPolicyHash)
+			}
+			if _, ok := verdict["input_sha256"].(string); !ok {
+				t.Errorf(`trust_verdict["input_sha256"] = %#v, want a string`, verdict["input_sha256"])
+			}
 
-			if _, present := result.Output["aep_receipt"]; !present {
-				t.Errorf("Output = %+v, want an aep_receipt key -- hook did not run for %s", result.Output, tc.name)
+			receiptMap, present := result.Output["aep_receipt"].(map[string]any)
+			if !present {
+				t.Errorf("Output = %+v, want an aep_receipt map -- hook did not run for %s", result.Output, tc.name)
+			} else {
+				// Proof-plan item 2: the receipt is v2 and its output_sha256
+				// binds the exact content this path produced.
+				if receiptMap["receipt_version"] != "2" {
+					t.Errorf(`aep_receipt["receipt_version"] = %v, want "2"`, receiptMap["receipt_version"])
+				}
+				if got := receiptMap["output_sha256"]; got != wantDigest {
+					t.Errorf(`aep_receipt["output_sha256"] = %v, want %v (sha256Hex of Output["content"])`, got, wantDigest)
+				}
 			}
 		})
 	}

@@ -1133,10 +1133,13 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 	return h.success(output), nil
 }
 
-// buildAEPReceipt resolves node_id (aceteam #8139's fabric node ID when
+// buildAEPReceiptV2 resolves node_id (aceteam #8139's fabric node ID when
 // known, else the signer's own public-key fingerprint -- internal/aep.
-// ResolveNodeID's phasing fallback) and signs the AEP receipt with h.signer.
-func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInferencePayload, result trust.GroundingResult) (*aep.AEPReceiptV1, error) {
+// ResolveNodeID's phasing fallback) and signs the v2 AEP receipt with h.signer.
+// The content/verdict fields (input/output/policy digests, action, verdict_hash)
+// are passed in via aep.V2Inputs -- they were computed once in applyTrustEngine
+// so the signed verdict_hash matches the unsigned trust_verdict.verdict_hash.
+func (h *LLMInferenceHandler) buildAEPReceiptV2(jobID string, payload *jobs.LLMInferencePayload, result trust.GroundingResult, in aep.V2Inputs) (*aep.AEPReceiptV2, error) {
 	var fabricNodeID string
 	if h.fabricNodeID != nil {
 		fabricNodeID = h.fabricNodeID()
@@ -1145,7 +1148,7 @@ func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInf
 	if err != nil {
 		return nil, err
 	}
-	return aep.BuildSignedReceipt(h.signer, nodeID, jobID, payload.Backend, payload.Model, result, time.Now())
+	return aep.BuildSignedReceiptV2(h.signer, nodeID, jobID, payload.Backend, payload.Model, in, result, time.Now())
 }
 
 // applyTrustEngine is the single, consolidated post-completion Trust Engine
@@ -1195,35 +1198,62 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 	}
 	input := promptTextFromPayload(payload)
 	grounding := trust.CheckGrounding(input, content)
-	result.Output["grounding"] = groundingReceiptMap(grounding)
-	result.Output["trust_verdict"] = trustVerdictMap(grounding, content, input)
 
-	// Signed AEP receipt (aceteam #8253, the signing half deferred at
-	// citadel#847's merge -- see internal/aep's package doc and
-	// docs/design-node-identity-receipts.md §3). Nested INSIDE the
-	// grounding-guardrail gate deliberately: the receipt signs THIS
-	// GroundingResult, so signing it when the guardrail itself is off would
-	// mean signing a check that was never surfaced anywhere else. A second,
-	// independent opt-in (signAEPReceiptsEnabled) gates signing on top of
-	// that -- default OFF, so a guardrail-on-but-signing-off node's output
-	// carries "grounding"/"trust_verdict" but no "aep_receipt", exactly as
-	// citadel#847 shipped it (pre-#1001, for the one path it covered).
+	// Build the whole Trust Engine verdict ONCE and reuse it for both the
+	// unsigned trust_verdict map and (when signing) the signed v2 receipt, so
+	// the two verdict_hash values can never diverge (aceteam #8253 S3, design
+	// §7). The three content-binding digests are also computed once here:
+	//   - output_sha256: sha256:hex(content) -- the final content string every
+	//     engine path already set (matches the backend's _expected_output_sha256).
+	//   - input_sha256: sha256:hex(input). For a bare-prompt payload this is
+	//     byte-identical to the backend's _expected_input_sha256 (a JSON string
+	//     round-trips to the same Go string). For a MESSAGES payload it is the
+	//     node's own \n-joined view of the checked input and does NOT match the
+	//     backend's json.dumps(messages) -- content_bound stays false for
+	//     messages until the raw-payload retention decision lands (design §2.2
+	//     option I-A / open question §11.4). This does not affect the signature
+	//     (input_sha256 is opaque in the canon) and both content gates are OFF
+	//     by default.
+	//   - policy_hash: aep.EmptyPolicyHash (hash of the empty policy {}), the
+	//     interim value until S4/S5 policy delivery lands (design §2.3).
+	outputSHA := sha256Hex(content)
+	inputSHA := sha256Hex(input)
+	policyHash := aep.EmptyPolicyHash
+	verdict := trust.BuildVerdict(input, content, grounding, trust.DefaultDetectors(), policyHash)
+
+	result.Output["grounding"] = groundingReceiptMap(grounding)
+	result.Output["trust_verdict"] = trustVerdictMap(verdict, grounding, inputSHA, outputSHA, policyHash)
+
+	// Signed AEP receipt (aceteam #8253 S3, internal/aep -- the signing half
+	// deferred at citadel#847's merge). Nested INSIDE the grounding-guardrail
+	// gate deliberately: the receipt signs THIS verdict, so signing it when the
+	// guardrail itself is off would mean signing a check that was never
+	// surfaced anywhere else. A second, independent opt-in (signAEPReceiptsEnabled)
+	// gates signing on top of that -- default OFF, so a guardrail-on-but-signing-off
+	// node's output carries "grounding"/"trust_verdict" but no "aep_receipt".
 	if !signAEPReceiptsEnabled() {
 		return
 	}
-	receipt, err := h.buildAEPReceipt(jobID, payload, grounding)
+	receipt, err := h.buildAEPReceiptV2(jobID, payload, grounding, aep.V2Inputs{
+		InputSHA256:  inputSHA,
+		OutputSHA256: outputSHA,
+		PolicyHash:   policyHash,
+		Action:       verdict.Action,
+		VerdictHash:  verdict.VerdictHash,
+	})
 	if err != nil {
 		// Fail open: signing must never break inference. Mirrors
 		// internal/nodeidentity's own fail-open convention for its other
 		// consumer (the mTLS CSR/leaf flow, cmd/init.go's ensureNodeIdentity)
-		// -- a node whose key is unavailable simply serves without a signed
-		// receipt.
+		// -- a node whose key is unavailable, OR a receipt whose free-string
+		// fields collide with the canonical delimiter (BuildSignedReceiptV2's
+		// refuse-to-sign guard), simply serves without a signed receipt.
 		h.aepLogf("[aep] failed to build signed receipt for job %s (non-fatal): %v", jobID, err)
 		return
 	}
 	receiptMap, err := receipt.ToMap()
 	if err != nil {
-		// Attaching *aep.AEPReceiptV1 directly would be the only typed Go
+		// Attaching *aep.AEPReceiptV2 directly would be the only typed Go
 		// pointer in this map -- see ToMap's doc comment for why that's
 		// unsafe across this map's eventual wire serialization. This branch
 		// should be unreachable (the struct is always JSON-marshalable) but
@@ -1237,28 +1267,25 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 // trustVerdictMap shapes the unsigned, human-readable "trust_verdict" map
 // (aceteam #8253's Trust Engine naming; distinct from the legacy "grounding"
 // map, which is kept verbatim alongside it for continuity with pre-#1001
-// consumers). The whole verdict -- the aggregate `action`, the ordered
-// `checks[]`, and `verdict_hash` -- is assembled by trust.BuildVerdict, which
-// runs grounding plus the pure secrets/PII/FERPA detectors (#8253 S6); this
-// function is a thin adapter that adds the two receipt-level convenience
-// digests the pure package deliberately does not own (output_sha256, and the
-// full "grounding" block including its flagged list).
+// consumers). It takes an ALREADY-BUILT verdict (assembled once in
+// applyTrustEngine via trust.BuildVerdict) plus the three content-binding
+// digests, so this unsigned map and the signed v2 receipt carry the identical
+// verdict_hash / input_sha256 / output_sha256 / policy_hash -- they must never
+// diverge (#8253 S3, design §7).
 //
-// output_sha256 and verdict_hash are BOTH unsigned convenience digests
-// (sha256:<hex>): the former binds the exact content, the latter the verdict
-// object (trust.BuildVerdict, DoR §3, excluding grounding.flagged). Neither
-// is a substitute for #8253 S3's SIGNED AEPReceiptV2 digests -- S3 is what
-// makes verdict_hash a signed canonical field and pins the byte-exact
-// canonical_json the Python verifier recomputes; here it is only a fixity
-// hash, never part of anything cryptographically signed.
-func trustVerdictMap(result trust.GroundingResult, content, input string) map[string]any {
-	v := trust.BuildVerdict(input, content, result, trust.DefaultDetectors())
+// The digests are all UNSIGNED convenience copies here (the signed originals
+// live in the v2 aep_receipt). input_sha256/output_sha256/policy_hash are added
+// alongside verdict_hash (design §7.2) so the unsigned verdict is
+// self-describing and content-recomputable without the signed receipt.
+func trustVerdictMap(v trust.Verdict, grounding trust.GroundingResult, inputSHA, outputSHA, policyHash string) map[string]any {
 	return map[string]any{
 		"action":        v.Action,
-		"output_sha256": sha256Hex(content),
+		"input_sha256":  inputSHA,
+		"output_sha256": outputSHA,
+		"policy_hash":   policyHash,
 		"verdict_hash":  v.VerdictHash,
 		"checks":        v.CheckMaps(),
-		"grounding":     groundingReceiptMap(result),
+		"grounding":     groundingReceiptMap(grounding),
 	}
 }
 

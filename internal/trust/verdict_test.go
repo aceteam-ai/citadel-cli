@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+// testPolicyHash is the interim empty-policy hash (aep.EmptyPolicyHash: the
+// "sha256:" + hex(sha256("{}")) value production passes today). Duplicated as a
+// literal here rather than imported, because internal/trust is a leaf that must
+// not import internal/aep.
+const testPolicyHash = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+
 func checkNames(v Verdict) []string {
 	names := make([]string, 0, len(v.Checks))
 	for _, c := range v.Checks {
@@ -25,7 +31,7 @@ func checkByName(v Verdict, name string) (CheckReport, bool) {
 
 func TestBuildVerdict_AllChecksPresentAndPassOnBenign(t *testing.T) {
 	grounding := CheckGrounding("say hello", "hello world, nothing numeric here")
-	v := BuildVerdict("say hello", "hello world, nothing numeric here", grounding, DefaultDetectors())
+	v := BuildVerdict("say hello", "hello world, nothing numeric here", grounding, DefaultDetectors(), testPolicyHash)
 
 	wantNames := []string{"grounding", "secrets", "pii", "ferpa"}
 	if got := checkNames(v); !equalStrings(got, wantNames) {
@@ -51,7 +57,7 @@ func TestBuildVerdict_FlagsDetectorAndAggregates(t *testing.T) {
 	// claim to flag and this isolates the secrets-check contribution.
 	const in, out = "show me a key", "here: -----BEGIN RSA PRIVATE KEY-----"
 	grounding := CheckGrounding(in, out)
-	v := BuildVerdict(in, out, grounding, DefaultDetectors())
+	v := BuildVerdict(in, out, grounding, DefaultDetectors(), testPolicyHash)
 
 	if v.Action != "flag" {
 		t.Fatalf("aggregate action = %q, want flag", v.Action)
@@ -74,7 +80,7 @@ func TestBuildVerdict_GroundingFlagAggregates(t *testing.T) {
 	if grounding.Grounded {
 		t.Fatal("expected the fabricated-percentage fixture to be ungrounded")
 	}
-	v := BuildVerdict("a majority / a small fraction", "68% / 7%", grounding, DefaultDetectors())
+	v := BuildVerdict("a majority / a small fraction", "68% / 7%", grounding, DefaultDetectors(), testPolicyHash)
 	if v.Action != "flag" {
 		t.Errorf("aggregate action = %q, want flag (grounding ungrounded)", v.Action)
 	}
@@ -96,7 +102,7 @@ func TestBuildVerdict_GroundingFlagAggregates(t *testing.T) {
 func TestBuildVerdict_MutationDropDetector(t *testing.T) {
 	const in, out = "say hello", "hello world, nothing numeric here"
 	grounding := CheckGrounding(in, out)
-	full := BuildVerdict(in, out, grounding, DefaultDetectors())
+	full := BuildVerdict(in, out, grounding, DefaultDetectors(), testPolicyHash)
 
 	drops := []struct {
 		name      string
@@ -109,7 +115,7 @@ func TestBuildVerdict_MutationDropDetector(t *testing.T) {
 	}
 	for _, d := range drops {
 		t.Run(d.name, func(t *testing.T) {
-			mutated := BuildVerdict(in, out, grounding, d.detectors)
+			mutated := BuildVerdict(in, out, grounding, d.detectors, testPolicyHash)
 			if _, present := checkByName(mutated, d.gone); present {
 				t.Errorf("check %q still present after drop: %v", d.gone, checkNames(mutated))
 			}
@@ -123,8 +129,8 @@ func TestBuildVerdict_MutationDropDetector(t *testing.T) {
 func TestBuildVerdict_VerdictHashDeterministic(t *testing.T) {
 	const in, out = "say hello", "hello world"
 	g := CheckGrounding(in, out)
-	a := BuildVerdict(in, out, g, DefaultDetectors())
-	b := BuildVerdict(in, out, g, DefaultDetectors())
+	a := BuildVerdict(in, out, g, DefaultDetectors(), testPolicyHash)
+	b := BuildVerdict(in, out, g, DefaultDetectors(), testPolicyHash)
 	if a.VerdictHash != b.VerdictHash {
 		t.Errorf("verdict_hash not deterministic: %q vs %q", a.VerdictHash, b.VerdictHash)
 	}
@@ -140,7 +146,7 @@ func TestBuildVerdict_VerdictHashDeterministic(t *testing.T) {
 // fixed GroundingResult.
 func TestBuildVerdict_GroundingExtrasRideMapNotHash(t *testing.T) {
 	g := CheckGrounding("say hello", "hi")
-	v := BuildVerdict("say hello", "hi", g, DefaultDetectors())
+	v := BuildVerdict("say hello", "hi", g, DefaultDetectors(), testPolicyHash)
 	gCheck, _ := checkByName(v, "grounding")
 	m := gCheck.Map()
 	for _, k := range []string{"grounded", "score", "claims_checked"} {

@@ -18,6 +18,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf16"
 )
 
 // CheckReport is one entry in the verdict's checks[] list. The DoR §3 uniform
@@ -90,7 +95,14 @@ func (v Verdict) CheckMaps() []map[string]any {
 // DefaultDetectors) so the set is a seam, not a hardcode: dropping a detector
 // removes its checks[] entry AND changes verdict_hash, which is exactly what
 // the mutation test asserts.
-func BuildVerdict(input, output string, grounding GroundingResult, detectors []Detector) Verdict {
+//
+// policyHash is the "sha256:<hex>" policy digest that rides the verdict_hash
+// preimage's top-level policy_hash field (aceteam #8253 S3, DoR §3 / design
+// §3.5). The caller passes aep.EmptyPolicyHash today (the hash of the empty
+// policy {}, since S4/S5 policy delivery has not landed); it is a parameter,
+// not a constant here, so this leaf package never imports internal/aep and S5
+// can substitute a real received-policy hash without touching this signature.
+func BuildVerdict(input, output string, grounding GroundingResult, detectors []Detector, policyHash string) Verdict {
 	checks := make([]CheckReport, 0, len(detectors)+1)
 
 	groundingAction := "pass"
@@ -139,84 +151,198 @@ func BuildVerdict(input, output string, grounding GroundingResult, detectors []D
 	return Verdict{
 		Action:      action,
 		Checks:      checks,
-		VerdictHash: computeVerdictHash(action, checks, grounding),
+		VerdictHash: computeVerdictHash(action, checks, grounding, policyHash),
 	}
 }
 
 // --- verdict_hash canonicalization ---
-
-// canonCheck is the fixed, declaration-ordered projection of a CheckReport
-// that verdict_hash covers — the DoR §3 uniform check fields only. Extras are
-// deliberately excluded, so adding a per-check display field never perturbs
-// verdict_hash.
-type canonCheck struct {
-	Name         string `json:"name"`
-	Version      int    `json:"version"`
-	Action       string `json:"action"`
-	Severity     string `json:"severity"`
-	EvidenceHash string `json:"evidence_hash"`
-}
-
-// canonGrounding is the grounding block AS COVERED BY verdict_hash: the scored
-// signal WITHOUT the flagged list. The DoR excludes grounding.flagged from
-// verdict_hash precisely because it carries the raw evidence (the fabricated
-// numbers); that evidence is bound instead through grounding's evidence_hash.
-type canonGrounding struct {
-	Grounded      bool    `json:"grounded"`
-	Score         float64 `json:"score"`
-	ClaimsChecked int     `json:"claims_checked"`
-}
-
-// canonVerdict is the DoR §3 trust_verdict object (policy_hash slots in at
-// #8253 S5) as verdict_hash covers it. output_sha256 is NOT here: it is a
-// receipt-level content digest, not part of the DoR's trust_verdict object,
-// and it already binds content on its own.
-type canonVerdict struct {
-	Action    string         `json:"action"`
-	Checks    []canonCheck   `json:"checks"`
-	Grounding canonGrounding `json:"grounding"`
-}
-
-// computeVerdictHash returns "sha256:<hex>" over the canonical trust_verdict
-// object. It uses typed structs (declaration order, explicit json tags) so
-// the encoding does not depend on Go map key-sorting, mirroring
-// internal/aep.Canonicalize's reason for not hashing a generic map.
 //
-// Float note (deliberate S6 scope): grounding.Score is encoded by json.Marshal
-// (deterministic within Go for a given value), NOT with aep's fixed
-// FormatFloat 'f' 6. That fixed formatting is what a SIGNED, cross-repo
-// digest needs; verdict_hash here is unsigned and only needs determinism +
-// sensitivity to the checks, both of which json.Marshal provides. The
-// byte-exact canonical_json shared with the Python verifier is #8253 S3/S5's
-// job, when verdict_hash becomes a signed field.
-func computeVerdictHash(action string, checks []CheckReport, grounding GroundingResult) string {
-	cc := make([]canonCheck, 0, len(checks))
-	for _, c := range checks {
-		cc = append(cc, canonCheck{
-			Name:         c.Name,
-			Version:      c.Version,
-			Action:       c.Action,
-			Severity:     c.Severity,
-			EvidenceHash: c.EvidenceHash,
-		})
-	}
-	cv := canonVerdict{
-		Action: action,
-		Checks: cc,
-		Grounding: canonGrounding{
-			Grounded:      grounding.Grounded,
-			Score:         grounding.Score,
-			ClaimsChecked: grounding.ClaimsChecked,
-		},
-	}
-	data, err := json.Marshal(cv)
+// The verdict_hash preimage is the DoR §3.5 canonical trust_verdict object,
+// rendered by the aceteam-aep `canonical_json` algorithm (sorted keys at every
+// depth, compact separators, ensure_ascii, drop null map values). This is a
+// SIGNED cross-repo contract at #8253 S3: a future aceteam/aceteam-aep verifier
+// recomputes verdict_hash from the receipt's fields and must derive the same
+// bytes, so this is a faithful port of that specific canonicalizer, NOT
+// json.Marshal (which sorts keys but HTML-escapes <>& and emits raw UTF-8 for
+// non-ASCII — both divergences from Python's ensure_ascii json.dumps).
+//
+// The preimage carries `score` as its FormatFloat 'f' 6 STRING (design §3.4
+// option A), so the object contains no floats at all — the one float rule in
+// the whole receipt system (a score is rendered 'f' 6) is reused rather than a
+// second one invented, and the canonicalizer can reject float64 outright as a
+// guardrail.
+
+// computeVerdictHash returns "sha256:<hex>" over canonicalJSON of the DoR §3.5
+// verdict preimage:
+//
+//	{
+//	  "action":      "<pass|flag|block>",
+//	  "checks":      [ {"action","evidence_hash","name","severity","version"} ... ],
+//	  "grounding":   {"claims_checked","grounded","score":"<'f' 6 string>"},
+//	  "policy_hash": "sha256:<hex>"
+//	}
+//
+// Excluded, per the DoR: grounding.flagged (raw evidence — bound through the
+// per-check evidence_hash), each check's Extras (display-only), and the
+// receipt-level output_sha256/verdict_hash themselves (a hash never covers its
+// own field). Check list order is the node's own (lists are not sorted).
+func computeVerdictHash(action string, checks []CheckReport, grounding GroundingResult, policyHash string) string {
+	data, err := canonicalJSON(VerdictHashPreimage(action, checks, grounding, policyHash))
 	if err != nil {
-		// canonVerdict is always JSON-marshalable (no channels/funcs); this is
-		// unreachable, but degrade to a stable sentinel rather than panicking
-		// on the inference path.
+		// The preimage is built from only string/bool/int/map/list, so
+		// canonicalJSON never errors on it; degrade to a stable sentinel rather
+		// than panicking on the inference path if a future edit adds a float.
 		data = []byte("null")
 	}
 	return "sha256:" + hexSHA256(data)
+}
+
+// VerdictHashPreimage returns the exact object verdict_hash is computed over
+// (design §3.5), as a map[string]any: sorted-key-canonicalized by canonicalJSON
+// and hashed by computeVerdictHash. It is exported so the cross-repo golden
+// fixture (internal/aep/testdata/v2) can serialize it for a future aceteam/
+// aceteam-aep verifier to reproduce with its own canonical_json.
+//
+// score is carried as its FormatFloat 'f' 6 STRING (design §3.4 option A), so
+// the object contains no float — the canonicalizer needs no float branch and
+// both repos reuse the one score-rendering rule the receipt canon already has.
+func VerdictHashPreimage(action string, checks []CheckReport, grounding GroundingResult, policyHash string) map[string]any {
+	checksList := make([]any, 0, len(checks))
+	for _, c := range checks {
+		checksList = append(checksList, map[string]any{
+			"name":          c.Name,
+			"version":       c.Version,
+			"action":        c.Action,
+			"severity":      c.Severity,
+			"evidence_hash": c.EvidenceHash,
+		})
+	}
+	return map[string]any{
+		"action": action,
+		"checks": checksList,
+		"grounding": map[string]any{
+			"grounded":       grounding.Grounded,
+			"score":          strconv.FormatFloat(grounding.Score, 'f', 6, 64),
+			"claims_checked": grounding.ClaimsChecked,
+		},
+		"policy_hash": policyHash,
+	}
+}
+
+// CanonicalJSON exposes the aep canonical_json port (see canonicalJSON) for the
+// cross-repo golden and for tests. It reproduces aceteam-aep's canonical_json
+// byte-for-byte for the JSON value shapes the verdict preimage uses.
+func CanonicalJSON(v any) ([]byte, error) {
+	return canonicalJSON(v)
+}
+
+// canonicalJSON reproduces aceteam-aep's `canonical_json` (aceteam-aep
+// src/aceteam_aep/attestation.py) byte-for-byte for the value shapes the
+// verdict preimage uses: keys sorted at every depth, compact `,`/`:`
+// separators, ensure_ascii escaping, and null values dropped from maps (but
+// kept in lists). It rejects float64 outright — the preimage carries score as
+// a string, so any float64 reaching here is a bug, and refusing it is a
+// guardrail rather than a silent cross-language divergence (Go and Python
+// render floats differently, e.g. 1.0 -> "1" vs "1.0").
+func canonicalJSON(v any) ([]byte, error) {
+	var b strings.Builder
+	if err := encodeCanonical(&b, v); err != nil {
+		return nil, err
+	}
+	return []byte(b.String()), nil
+}
+
+func encodeCanonical(b *strings.Builder, v any) error {
+	switch val := v.(type) {
+	case nil:
+		// Reached only for a nil inside a list; a nil map value is dropped by
+		// the map branch before recursing. Python renders it as null.
+		b.WriteString("null")
+	case string:
+		encodeCanonicalString(b, val)
+	case bool:
+		if val {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+	case int:
+		b.WriteString(strconv.Itoa(val))
+	case int64:
+		b.WriteString(strconv.FormatInt(val, 10))
+	case map[string]any:
+		keys := make([]string, 0, len(val))
+		for k, mv := range val {
+			if mv == nil { // Python's _clean drops None from dicts.
+				continue
+			}
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			encodeCanonicalString(b, k)
+			b.WriteByte(':')
+			if err := encodeCanonical(b, val[k]); err != nil {
+				return err
+			}
+		}
+		b.WriteByte('}')
+	case []any:
+		b.WriteByte('[')
+		for i, item := range val {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if err := encodeCanonical(b, item); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(']')
+	default:
+		return fmt.Errorf("trust: canonicalJSON: unsupported type %T (float64 is deliberately rejected — carry it as a string)", v)
+	}
+	return nil
+}
+
+// encodeCanonicalString writes s as a JSON string escaped exactly as Python's
+// json.dumps(..., ensure_ascii=True) does: the short escapes for \" \\ \n \r
+// \t \b \f, other control characters and 0x7f and all non-ASCII as lowercase
+// \uXXXX (non-BMP as UTF-16 surrogate pairs), everything in 0x20..0x7e raw.
+// Notably it does NOT HTML-escape < > &, which Go's encoding/json would.
+func encodeCanonicalString(b *strings.Builder, s string) {
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			if r >= 0x20 && r <= 0x7e {
+				b.WriteRune(r)
+			} else if r > 0xffff {
+				r1, r2 := utf16.EncodeRune(r)
+				fmt.Fprintf(b, `\u%04x\u%04x`, r1, r2)
+			} else {
+				fmt.Fprintf(b, `\u%04x`, r)
+			}
+		}
+	}
+	b.WriteByte('"')
 }
 
 // --- evidence hashing ---
