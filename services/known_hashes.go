@@ -17,7 +17,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"fdd34b5e8019bac3330ce25e763135250d1e4ad732109aa10a6e15f2fa16b09d": true,
 		// aceteam-ai/aceteam#9523: documents why ollama is NOT loopback-bound
 		// (unlike its siblings below); no functional change.
-		"98c7a48746e329194548f782ec11cbbd61ce1c31064b0be1df6d5b73acbf49b8": true,
+		"6d0779e549255b52eb40d4f78a0a581a9cabf2bd712f645a2eae00a3fa8c7583": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
@@ -33,7 +33,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"faafb47b3ce0e7755a773177a80597defa7ee59a07d97285f55425ebe7910ef3": true,
 		"fbb22432970140a45794760f0775be51d40555aa66aa3a96142b91438776a2ae": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
-		"5128cc4d922cd7479d576670226fccd242bed3ef9654a44f37cd646094514e0e": true,
+		"58b4576aa49864067d040e719c929f8d19ee74ca137c4c83350f9c3c3f71df54": true,
 	},
 	"llamacpp": {
 		"03985065ef91d7ea3a512b3dc3029f08e57ca72a9d6ac96e5a6c3d52d1d9f249": true,
@@ -47,7 +47,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// alt-text was replaced before merge -- PR #905 review).
 		"ea38cf731d5330b96aacee62ad787b1b2ebfd1679df01b508a08638acb4f01f2": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
-		"a072cd6968a5a553771e6feb0cb330f8c1592056a48b28f80f159cbd2e39bfb0": true,
+		"73503ad8531bffd4bcf1774d81ddf5e53e4c34b3ab0ea23c64cd1e0ac638d680": true,
 	},
 	"lmstudio": {
 		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,
@@ -57,7 +57,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"2531d9e78484785543f196082ce38e46ef21dd1d6cd380b69665c331bc21acfb": true,
 		"2e46554d84a142f549b0481b068b14d2bc65fd02829956ea2288c089b5ad518a": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
-		"ff4def4ffb6953de8db6ffd2d361661d308612bb5232bc2365258eda61a36d2d": true,
+		"53bb28a964349de503495857d0f73368a0489109f273822ee5b91c87dacb6f1f": true,
 	},
 	"extraction": {
 		"3f7f02536458773d7f8b22da3e7d4213b943db47c457ce669d9270ff2e0a7260": true,
@@ -81,7 +81,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,
 		"50132811ec60f1d628599cd0c971cb2732087ee11bca58a3bda1312a8ef13ff0": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
-		"68624cf8b62d427c7cb13d237bfdcc4b2841d6ff2ae55c9d7492d71a206d12a9": true,
+		"a97ea6b823df5fde3cb20c8d53d2e486b55833900a949f49851bb934405bb78d": true,
 	},
 	"kokoro": {
 		"3ce764e232b286c75f776872bb3554e15b2e03b229863abce271324a815ab777": true,
@@ -92,7 +92,7 @@ var KnownComposeHashes = map[string]map[string]bool{
 	"unlimited-ocr": {
 		"2f1e1f1ffae72db007b65d1b8d275f69c33c0c7e3207f8139ee8c2c1c8d2c9c0": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
-		"af4e390b1a6cf3147560893439f3bc1f63952a199fde4c9c61b7219452be67fe": true,
+		"75fe75f1342aedc35fad293a8836baab47048c00f35c6dab0b3c288282fc73e0": true,
 	},
 	"omnivoice": {
 		"5a58ceded5200f2dd1d67a199b407edddd3bfe1bd91dd2700cbbed55ee2abe39": true,

@@ -30,7 +30,7 @@ services:
     # deliberately (aceteam-ai/aceteam#9523): this is an OpenAI-compatible
     # llama-server with NO auth of its own, and the "peers reach this engine
     # directly over the mesh" rationale a prior version of this comment gave
-    # does not hold on an embedded-tsnet node -- self-dialing this node's own
+    # does not hold on an embedded-tsnet node. Self-dialing this node's own
     # mesh IP:8210 while bonsai served fine on localhost:8210 returned
     # "connection refused" (see CLAUDE.md's "Chat reachability" note): citadel's
     # userspace netstack never forwards inbound mesh traffic to a host-bound
@@ -38,7 +38,7 @@ services:
     # reach, not mesh reach, on the common node topology. Mesh reach stays
     # available through the gateway's model-routed /v1/chat/completions
     # (internal/gateway/chat_route.go), which resolves the model to this
-    # engine and reverse-proxies to 127.0.0.1 itself -- so this bind change
+    # engine and reverse-proxies to 127.0.0.1 itself, so this bind change
     # does not affect it. The bare `${CITADEL_BONSAI_HOST_PORT}` token below
     # (no `:?`/`:-` guard) mirrors kokoro.yml/omnivoice.yml: a guard's own
     # colons would smear across the loopback host-port parsers in

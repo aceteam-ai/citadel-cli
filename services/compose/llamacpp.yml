@@ -9,7 +9,7 @@ services:
     # deliberately (aceteam-ai/aceteam#9523): this is an OpenAI-compatible
     # llama.cpp server with NO auth of its own, and the "peers reach this
     # engine directly over the mesh" rationale a prior version of this comment
-    # gave does not hold on an embedded-tsnet node -- citadel's userspace
+    # gave does not hold on an embedded-tsnet node: citadel's userspace
     # netstack never forwards inbound mesh traffic to a host-bound port it did
     # not explicitly ListenVPN (see CLAUDE.md's "Chat reachability" note), so
     # the 0.0.0.0 bind bought LAN reach, not mesh reach, on the common node
@@ -18,7 +18,7 @@ services:
     # regression). Mesh reach stays available through the gateway's
     # model-routed /v1/chat/completions (internal/gateway/chat_route.go),
     # which resolves the model to this engine and reverse-proxies to
-    # 127.0.0.1 itself -- so this bind change does not affect it. The bare
+    # 127.0.0.1 itself, so this bind change does not affect it. The bare
     # `${CITADEL_LLAMACPP_HOST_PORT}` token below (no `:?`/`:-` guard) mirrors
     # kokoro.yml/omnivoice.yml: a guard's own colons would smear across the
     # loopback host-port parsers in services/embed_test.go and

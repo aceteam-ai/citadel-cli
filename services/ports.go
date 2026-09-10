@@ -113,13 +113,13 @@ const (
 // clash.
 const (
 	// llamacpp: was host 8080 (collided with gateway + status server). Bound
-	// to 127.0.0.1 only (aceteam-ai/aceteam#9523; services/compose/llamacpp.yml)
-	// -- an OpenAI-compatible server with no auth of its own. Mesh reach is via
+	// to 127.0.0.1 only (aceteam-ai/aceteam#9523; services/compose/llamacpp.yml),
+	// an OpenAI-compatible server with no auth of its own. Mesh reach is via
 	// the gateway's model-routed /v1/chat/completions, not this port directly.
 	LlamacppHostPort = 8200
 	// vllm: was host 8100 (collided with extraction and the apps range). Bound
-	// to 127.0.0.1 only (aceteam-ai/aceteam#9523; services/compose/vllm.yml)
-	// -- an OpenAI-compatible server with no auth of its own. Mesh reach is via
+	// to 127.0.0.1 only (aceteam-ai/aceteam#9523; services/compose/vllm.yml),
+	// an OpenAI-compatible server with no auth of its own. Mesh reach is via
 	// the gateway's model-routed /v1/chat/completions, not this port directly.
 	VLLMHostPort = 8201
 	// extraction: was host 8100 (collided with vllm and the apps range).
@@ -165,8 +165,8 @@ const (
 	// (services/compose/bonsai.yml). Next free slot in the 8200 block after
 	// gotenberg's 8209 (8205 is hermes's, see above). It is an embedded
 	// ServiceMap compose, so its container serves on :8080 and this is the HOST
-	// publish, bound to 127.0.0.1 only (aceteam-ai/aceteam#9523) -- the service
-	// has no auth of its own; mesh reach is via the gateway's model-routed
+	// publish, bound to 127.0.0.1 only (aceteam-ai/aceteam#9523); the service
+	// has no auth of its own, and mesh reach is via the gateway's model-routed
 	// /v1/chat/completions, not this port directly.
 	BonsaiHostPort = 8210
 	// kokoro: Kokoro-82M text-to-speech served over an OpenAI-compatible HTTP API
@@ -194,7 +194,7 @@ const (
 	// free slot in the 8200 block after frigate's 8212 (8205 is hermes's, see
 	// above). It is an embedded ServiceMap compose, so its container serves on
 	// :8000 and this is the HOST publish, bound to 127.0.0.1 only
-	// (aceteam-ai/aceteam#9523) -- the service has no auth of its own; mesh
+	// (aceteam-ai/aceteam#9523); the service has no auth of its own, and mesh
 	// reach is via the gateway's model-routed /v1/chat/completions, not this
 	// port directly.
 	UnlimitedOCRHostPort = 8213
@@ -299,7 +299,7 @@ func HostPortEnvVarName(name string) (string, bool) {
 // It never collided with anything, so it is not env-var-managed like the 8200
 // block; the constant exists so consumers (the heartbeat stats scraper,
 // internal/jobs/llm_inference.go) share one spelling instead of hardcoding
-// 30000. Bound to 127.0.0.1 only (aceteam-ai/aceteam#9523) -- an
+// 30000. Bound to 127.0.0.1 only (aceteam-ai/aceteam#9523), an
 // OpenAI-compatible server with no auth of its own; mesh reach is via the
 // gateway's model-routed /v1/chat/completions, not this port directly.
 const SGLangHostPort = 30000

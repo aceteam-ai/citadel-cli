@@ -9,7 +9,7 @@ services:
     # vllm/llamacpp/bonsai/unlimited-ocr, sglang's host port (30000, see
     # services.SGLangHostPort) is not deferred through a citadel-injected
     # ${CITADEL_*_HOST_PORT} var, so the loopback literal here is the whole
-    # fix -- there is no env-var-guard interaction to worry about. Mesh reach
+    # fix; there is no env-var-guard interaction to worry about. Mesh reach
     # stays available through the gateway's model-routed
     # /v1/chat/completions (internal/gateway/chat_route.go), which resolves
     # the model to this engine and reverse-proxies to 127.0.0.1 itself.

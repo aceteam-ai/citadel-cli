@@ -346,7 +346,7 @@ var loopbackBoundEngineHostPorts = map[string]string{
 // aceteam-ai/aceteam#9523) contract test: every OpenAI-compatible inference
 // engine compose file with no auth of its own must publish its host port on
 // 127.0.0.1 only, using the bare-token idiom (no `:?`/`:-` guard, which would
-// smear across this parser's colon handling -- see the kokoro.yml/
+// smear across this parser's colon handling; see the kokoro.yml/
 // omnivoice.yml comments this pattern mirrors). Table-driven per Acceptance
 // criterion 4 in the parent issue ("extend a TestEngineCacheDirsMatchComposeMounts
 // -style test to assert the bind for every ServiceMap entry").
@@ -361,7 +361,7 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 			if !strings.Contains(content, want) {
 				t.Errorf("compose %q must publish its host port loopback-only via %q; got:\n%s", name, want, content)
 			}
-			// The guarded form must be absent -- if present, either this
+			// The guarded form must be absent. If present, either this
 			// engine's compose was reverted to the old ${VAR:?msg} shape, or a
 			// hand-edit reintroduced a guard that would break the loopback
 			// host-port parsers (services/embed_test.go's composeHostPorts,
@@ -394,7 +394,7 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 // sweep (or listed here) even though they publish a 0.0.0.0 host port on
 // disk: neither is `//go:embed`-ed into ServiceMap (verified: no
 // ClaudecodeCompose/HermesCompose var in embed.go, and no other Go code
-// references either path), so both are dead files in this repo -- the live
+// references either path), so both are dead files in this repo. The live
 // copies are the citadel-services catalog modules (services/claudecode,
 // services/hermes), per this repo's CLAUDE.md.
 var nonLoopbackServiceMapAllowlist = map[string]string{
@@ -410,7 +410,7 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
 	"lmstudio": "out of scope for aceteam-ai/aceteam#9523; fixed native port (1234), not a citadel-" +
 		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
-	"tei": "already loopback-bound (127.0.0.1:8102:80) -- not an oversight, just not matched by the " +
+	"tei": "already loopback-bound (127.0.0.1:8102:80), not an oversight, just not matched by the " +
 		"exact-token check below since it has no citadel-injected host-port var either.",
 }
 
@@ -418,7 +418,7 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 // asserts it is either loopback-bound (127.0.0.1: prefix on its ports: host
 // side) or explicitly allowlisted with a reason
 // (nonLoopbackServiceMapAllowlist). A new ServiceMap entry that publishes a
-// host port on all interfaces with no allowlist reason fails here -- this is
+// host port on all interfaces with no allowlist reason fails here. This is
 // the "assert the bind for every ServiceMap entry" acceptance criterion from
 // aceteam-ai/aceteam#9523, scoped to today's actual fix (5 engines) plus a
 // recorded, reviewable reason for every other entry rather than a silent
