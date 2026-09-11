@@ -2445,3 +2445,19 @@ Auto-generated log of every release.
   - docs: design — Trust Engine S2/S3 signed receipt digests (#8253) (#1018)
 
 
+---
+
+## v2.156.0 — 2026-09-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 22 |
+| Lines added | +2990 |
+
+**Changes:**
+
+  - feat: on-node SOCKS5 egress relay (citadel #787) (#980)
+  - feat(aep): 'citadel aep verify' CLI to verify signed receipt signatures (#1035)
+
+
