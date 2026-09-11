@@ -27,7 +27,7 @@ citadel
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `citadel work` | Start the worker (process jobs from the queue) | `--redis-url`, `--queue`, `--status-port`, `--terminal`, `--terminal-port` |
+| `citadel work` | Start the worker (process jobs from the queue) | `--redis-url`, `--queue`, `--status-port`, `--terminal`, `--terminal-port`, `--egress-relay` |
 | `citadel run [service]` | Start services from the manifest (or a specific service) | `--restart` |
 | `citadel stop [service]` | Stop running services (or a specific service) | |
 | `citadel status` | Display the node health dashboard | |
@@ -43,13 +43,28 @@ citadel
 | `citadel call <node> <endpoint>` | Make an HTTP call to a peer node | |
 | `citadel ping <node>` | Check if a peer node is reachable | |
 | `citadel ssh <node>` | SSH into a peer node via the mesh network | |
-| `citadel proxy <node>` | Proxy local traffic to a remote node | |
+| `citadel proxy [local-port] [peer:port]` | Forward a local port to a service on another node | `--bind`, `--max-conns`, `-v`/`--verbose` |
+| `citadel socks [port]` | Run a local SOCKS5 proxy that dials out over the AceTeam Network | `--bind`, `--auth`, `--max-conns`, `-v`/`--verbose` |
 | `citadel expose <name>` | Expose a local service to other nodes on the network | |
 | `citadel unexpose <name>` | Stop exposing a previously exposed service | |
 | `citadel up` | Put the whole machine on the network (not just this process) | `--check` |
 | `citadel down` | Take the machine back off the network | |
 
 See [Networking](/guides/networking) and [Machine-Wide Network Mode](/guides/machine-wide-mode) for details.
+
+## Egress Relay
+
+Lets another citadel node tunnel its outbound traffic through this node's own internet connection ("your exit, your IP"). Off by default, mesh-only, same-org verified peers only.
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `citadel egress-relay status` | Show the current egress-relay configuration | |
+| `citadel egress-relay enable` | Enable the relay (takes effect on the next `citadel work` start) | |
+| `citadel egress-relay disable` | Disable the relay (takes effect on the next `citadel work` start) | |
+| `citadel egress-relay allow-lan <on\|off>` | Allow (or deny) the relay from CONNECTing into this node's own LAN/mesh | |
+| `citadel egress-relay serve` | Run this node as a pure egress relay -- no worker, no Redis -- until interrupted | |
+
+See [Egress Relay](/guides/egress-relay) for full setup instructions and the security model.
 
 ## Model Serving Across the Fleet
 
@@ -90,6 +105,14 @@ engine (`vllm`, `bonsai`, ...) or a third-party catalog service.
 `citadel init` once, then `claude mcp add aceteam -- citadel mcp` (or the
 equivalent for your MCP client) to let an AI agent manage nodes, deploy
 models, and run inference on your own hardware.
+
+## Trust Receipts
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `citadel aep verify <receipt.json>` | Verify the ECDSA signature of a signed AEP (AceTeam Execution Proof) receipt, entirely offline | `--json`, `--pubkey`, `--cert`, `--show-canonical` |
+
+See [Trust Receipts & Grounding Checks](/guides/trust-receipts) for the full receipt format and how signing is enabled.
 
 ## Update
 

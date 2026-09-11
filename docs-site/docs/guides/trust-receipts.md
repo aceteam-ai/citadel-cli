@@ -65,13 +65,87 @@ Signing fails safe: if the node's signing key is ever unavailable for any
 reason, the response is still returned normally, just without the
 `aep_receipt` field attached.
 
+`aep_receipt` stands for **AceTeam Execution Proof** -- the receipt is a
+signed proof of what a node's inference execution actually produced.
+
+## Verifying a Receipt: `citadel aep verify`
+
+You don't need the AceTeam platform, a network connection, or any credentials
+to check that a receipt is genuine. `citadel aep verify` checks a receipt's
+signature entirely offline, against a node's public identity:
+
+```bash
+citadel aep verify receipt.json
+```
+
+```
+✓ signature valid
+  signed by node   a1b2c3d4e5f6...
+  verifying key    node identity
+  receipt version  2
+  engine/model     vllm / llama-3.1-8b
+  grounded         true (score 1.000000, 0 claims checked)
+  action           pass
+  verdict_hash     sha256:9f8e7d...
+```
+
+### Resolving the verifying key
+
+By default, `citadel aep verify` checks a receipt against the identity key of
+**the node you're running it on** -- useful when you're the node operator
+verifying your own node's output. To verify a receipt against a *different*
+node's identity, supply that node's public key explicitly:
+
+```bash
+citadel aep verify receipt.json --pubkey exit-node-pubkey.pem   # a PKIX/SPKI PEM public key
+citadel aep verify receipt.json --cert exit-node-leaf.pem       # or an X.509 certificate
+```
+
+Precedence is `--cert` > `--pubkey` > this node's own identity -- the first
+one supplied wins.
+
+### Other flags
+
+| Flag | Effect |
+|---|---|
+| `--json` | Emit a machine-readable JSON result instead of the human-readable summary. |
+| `--show-canonical` | Print the exact canonical bytes that were signed, to stderr -- useful for debugging a signature mismatch. |
+
+### Reading a failure
+
+`citadel aep verify` exits non-zero on any verification failure and reports
+*why*, distinguishing a few different cases rather than a single generic
+"invalid":
+
+- **Signed by a different node.** The verifying key's fingerprint doesn't
+  match the fingerprint recorded in the receipt. This means you're checking
+  against the wrong node's key (or someone else's), not that the receipt was
+  tampered with:
+
+  ```
+  ✗ receipt was signed by a different node (receipt fingerprint a1b2..., verifying key f9e8...)
+  ```
+
+- **Invalid signature.** The fingerprints match, but the signature itself
+  doesn't verify against the canonical bytes -- this is the case that
+  indicates real tampering or corruption:
+
+  ```
+  ✗ signature is invalid (does not verify against the signing key)
+  ```
+
+- **Unsigned receipt.** The receipt has no signature at all (produced with
+  `CITADEL_GROUNDING_GUARDRAIL` on but `CITADEL_SIGN_AEP_RECEIPTS` off).
+
+Checking the fingerprint before the signature is deliberate: it's what makes
+"you're pointed at the wrong key" and "this receipt is actually invalid" two
+distinguishable outcomes instead of one confusing failure.
+
 ## Current Status
 
-Both layers are shipped and working today, gated behind the two environment
-variables above. A dedicated CLI command for independently verifying a
-receipt against a node's public key is planned but not yet released -- for
-now, verification happens on the receiving end (e.g. the AceTeam platform),
-which is the intended consumer of these receipts.
+Both layers, plus offline verification via `citadel aep verify`, are shipped
+and working today. Layers 1 and 2 are gated behind the two environment
+variables below.
 
 | Variable | Default | Effect |
 |---|---|---|

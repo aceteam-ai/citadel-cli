@@ -31,6 +31,7 @@ const sidebars: SidebarsConfig = {
         'guides/model-serving-and-mesh-chat',
         'guides/monitoring',
         'guides/networking',
+        'guides/egress-relay',
         'guides/machine-wide-mode',
         'guides/trust-receipts',
         'guides/automation',
