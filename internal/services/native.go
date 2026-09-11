@@ -48,8 +48,12 @@ var NativeServices = map[string]NativeService{
 		AltBinaries: []string{"llama-cpp-server", "server"},
 		// Host port owned by citadel (services/ports.go) so the native path
 		// avoids colliding with the gateway/status server on 8080.
-		Port:      svcports.LlamacppHostPort,
-		StartArgs: []string{"--host", "0.0.0.0", "--port", strconv.Itoa(svcports.LlamacppHostPort)},
+		Port: svcports.LlamacppHostPort,
+		// Loopback-only (#1024; the native counterpart of aceteam#9523 / PR
+		// #1025's compose-side fix): a raw process has no docker-proxy in front
+		// of it, so an all-interfaces bind would expose this unauthenticated
+		// engine on the LAN. Pinned by TestNativeLlamaCppBindsLoopback.
+		StartArgs: []string{"--host", "127.0.0.1", "--port", strconv.Itoa(svcports.LlamacppHostPort)},
 		EnvVars:   map[string]string{},
 	},
 	"vllm": {
