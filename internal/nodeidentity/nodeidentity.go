@@ -492,12 +492,53 @@ func (s *Store) PublicKeyFingerprint() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get or create signing key: %w", err)
 	}
-	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	return FingerprintPublicKey(&key.PublicKey)
+}
+
+// FingerprintPublicKey computes the stable "sha256:<hex>" fingerprint of an
+// arbitrary ECDSA public key — sha256 over its DER-encoded SubjectPublicKeyInfo,
+// the IDENTICAL derivation Store.PublicKeyFingerprint applies to the node's own
+// key. Exposed as a free function so a verifier that holds only a public key
+// (e.g. `citadel aep verify` given a --pubkey or --cert) computes the SAME
+// fingerprint the signer wrote into the receipt, and so both sides can never
+// drift because there is only one derivation.
+func FingerprintPublicKey(pub *ecdsa.PublicKey) (string, error) {
+	if pub == nil {
+		return "", fmt.Errorf("nil public key")
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
 	if err != nil {
 		return "", fmt.Errorf("marshal public key: %w", err)
 	}
 	sum := sha256.Sum256(der)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// PublicKey returns the node identity key's public half by LOADING the persisted
+// key — it never generates one. Unlike Sign/PublicKeyFingerprint (which are on
+// the signing path, where minting a key on first use is the point), a verifier
+// must not create identity as a side effect: a verify command that silently
+// wrote a fresh node.key would leave a leafless key reconcileFromLegacy later
+// has to displace, and would mask the "no key present" failure a verifier needs
+// to report honestly. Mirrors LoadLeaf's read-only, best-effort-reconcile shape:
+// it adopts a legacy key if one exists (convergent stores only), then requires a
+// key to already be on disk, returning a distinct error naming KeyPath otherwise.
+func (s *Store) PublicKey() (*ecdsa.PublicKey, error) {
+	// Best-effort read-through so a convergent store adopts an already-registered
+	// legacy key instead of reporting it absent. Never hard-fails here — reading a
+	// public key is a display/verify path, not a key-minting decision (same
+	// posture as LoadLeaf).
+	if s.legacyDir != "" {
+		_ = s.reconcileFromLegacy()
+	}
+	if !s.HasKey() {
+		return nil, fmt.Errorf("no node identity key at %s", s.KeyPath())
+	}
+	key, err := s.loadKey()
+	if err != nil {
+		return nil, err
+	}
+	return &key.PublicKey, nil
 }
 
 // validateCertPEM confirms that data contains at least one parseable X.509
