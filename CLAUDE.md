@@ -1582,13 +1582,15 @@ equals a signed receipt's `flagged_hash` for the same input). `verdict_hash`
 is `sha256:<hex>` over `BuildVerdict`'s DoR §3 canonical trust_verdict object
 (action + the uniform check fields + grounding minus its flagged list) — the
 mechanism the S6 acceptance mutation test pins (drop a detector from the
-injected set → it leaves `checks[]` AND `verdict_hash` changes). Both
-`output_sha256` and `verdict_hash` are UNSIGNED convenience digests; neither
-is part of anything cryptographically signed. S3 (`AEPReceiptV2`) is what
-makes `verdict_hash` a SIGNED canonical field and pins the byte-exact
-`canonical_json` the Python verifier recomputes — until then `BuildVerdict`
-uses `json.Marshal` (deterministic within Go), not aep's fixed float
-formatting.
+injected set → it leaves `checks[]` AND `verdict_hash` changes). On the
+unsigned `trust_verdict` map, `output_sha256` and `verdict_hash` are
+convenience copies of the receipt's own fields; the SAME `verdict_hash` is a
+SIGNED canonical field of the emitted v2 `aep_receipt` (S3 shipped, #1026 /
+citadel-cli#1002). `computeVerdictHash` (`internal/trust/verdict.go`) hashes
+the DoR §3.5 preimage through the aep `canonical_json` port (`trust.CanonicalJSON`
+over `trust.VerdictHashPreimage`, `score` as its `'f' 6` string), NOT
+`json.Marshal` — pinned byte-exact against `internal/aep/testdata/v2/verdict_preimage.json`
+by `TestGoldenReceiptV2`, the form the Python verifier recomputes.
 
 Excluded from S6 by the ratified DoR (`internal/trust` has no place for
 them): PAW/MoE, CostAnomaly (needs cost context), Content classification

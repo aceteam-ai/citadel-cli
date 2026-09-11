@@ -6,13 +6,14 @@ package trust
 // the whole assembly (including the mutation test that drops a detector and
 // asserts verdict_hash changes) is unit-testable in this package.
 //
-// What this is NOT: it is not the signed AEP receipt. verdict_hash here is an
-// UNSIGNED fixity digest attached alongside output_sha256, same posture — it
-// lets a consumer confirm which verdict it holds without the signed receipt.
-// #8253 S3 owns the SIGNED AEPReceiptV2 (which adds verdict_hash as a signed
-// canonical field) and the byte-exact cross-repo canonical_json the Python
-// verifier recomputes; this package deliberately does not couple to that yet
-// (see computeVerdictHash's note on float formatting).
+// What this is NOT: it is not the signed AEP receipt. The verdict_hash this
+// package attaches to the trust_verdict map is an UNSIGNED fixity copy
+// alongside output_sha256 — it lets a consumer confirm which verdict it holds
+// without the signed receipt. #8253 S3's signed AEPReceiptV2 carries the SAME
+// verdict_hash as a signed canonical field, over the SAME preimage:
+// computeVerdictHash below hashes it through the aep canonical_json port
+// (exported as CanonicalJSON / VerdictHashPreimage) that the v2 receipt and its
+// cross-repo golden reuse — see computeVerdictHash's note on the canonical form.
 
 import (
 	"crypto/sha256"
