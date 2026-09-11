@@ -44,7 +44,52 @@ citadel
 | `citadel ping <node>` | Check if a peer node is reachable | |
 | `citadel ssh <node>` | SSH into a peer node via the mesh network | |
 | `citadel proxy <node>` | Proxy local traffic to a remote node | |
-| `citadel expose` | Expose local services to the fabric network | |
+| `citadel expose <name>` | Expose a local service to other nodes on the network | |
+| `citadel unexpose <name>` | Stop exposing a previously exposed service | |
+| `citadel up` | Put the whole machine on the network (not just this process) | `--check` |
+| `citadel down` | Take the machine back off the network | |
+
+See [Networking](/guides/networking) and [Machine-Wide Network Mode](/guides/machine-wide-mode) for details.
+
+## Model Serving Across the Fleet
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `citadel mesh models` | List models served by other nodes on the network | `--json`, `--port` |
+| `citadel mesh chat [prompt]` | Send a one-shot chat request to a model on another node | `--model`, `--node` |
+
+See [Model Serving & Mesh Chat](/guides/model-serving-and-mesh-chat) for details.
+
+## Modules and Catalog Services
+
+A "module" is any service Citadel installs and manages by name -- a built-in
+engine (`vllm`, `bonsai`, ...) or a third-party catalog service.
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `citadel module install <source>` | Install a module from the catalog or a git source | |
+| `citadel module update [name]` | Update an installed module | |
+| `citadel module list` | List installed modules | |
+| `citadel module info <source>` | Show details for a catalog module | |
+| `citadel module start\|stop\|restart <name>` | Recover a single stopped/crashed module without touching its siblings | `--dry-run`, `--expect-node` |
+| `citadel module search [query]` | Search the module catalog | |
+| `citadel module reservations list` | List active GPU reservations held by exclusive runs | |
+| `citadel module reservations release <jobID>` | Manually release a stuck GPU reservation | |
+
+## Identity, Diagnostics, and AI Tool Access
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `citadel whoami` | Show this node's identity (name, network address, platform node ID) | `--json` |
+| `citadel services` | Show usage/idle status and footprint for every managed service | |
+| `citadel service diagnose <name>` | Inspect a service's container and tail its logs | |
+| `citadel pairing-code` | Read back a pending on-node access pairing code | `--json` |
+| `citadel mcp` | Bridge this node's tools to an MCP-compatible AI assistant | |
+
+`citadel mcp` lets an AI coding assistant manage this node directly. Run
+`citadel init` once, then `claude mcp add aceteam -- citadel mcp` (or the
+equivalent for your MCP client) to let an AI agent manage nodes, deploy
+models, and run inference on your own hardware.
 
 ## Update
 
@@ -83,3 +128,4 @@ These flags are available on all commands:
 | `--help` | Show help for any command |
 | `--nexus <url>` | Override the coordination server URL (default: `https://nexus.aceteam.ai`) |
 | `--auth-service <url>` | Override the auth service URL (default: `https://aceteam.ai`) |
+| `--node-dir <path>` | Point a command at a specific node directory instead of the default location. Also settable via `CITADEL_NODE_DIR`. Useful for scripts and automation that manage more than one node config from a single machine. |

@@ -28,8 +28,11 @@ const sidebars: SidebarsConfig = {
       label: 'Guides',
       items: [
         'guides/managing-services',
+        'guides/model-serving-and-mesh-chat',
         'guides/monitoring',
         'guides/networking',
+        'guides/machine-wide-mode',
+        'guides/trust-receipts',
         'guides/automation',
       ],
     },
