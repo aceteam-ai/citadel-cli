@@ -38,31 +38,66 @@ import (
 // analogous flag for allow_lan -- that knob only ever comes from
 // resolveEgressAllowLAN (config/env), the fail-closed direction, so a
 // caller cannot accidentally force LAN/mesh pivot on via a CLI flag the way
-// they can force the relay itself on.
+// they can force the relay itself on. `citadel egress-relay serve`
+// (cmd/egress_relay_serve.go) keeps this same posture: it force-enables the
+// relay (an explicit "be a relay now" command) but still resolves allow_lan
+// only from resolveEgressAllowLAN, with no flag.
 func startEgressRelay(ctx context.Context) {
 	enabled := workEgressRelay || resolveEgressRelay()
 	if !enabled {
 		Debug("egress relay disabled (see 'citadel egress-relay status')")
 		return
 	}
-	if !network.IsGlobalConnected() {
+	if !egressRelayIsConnected() {
 		Log("egress relay enabled but not connected to the AceTeam Network; skipping")
 		return
 	}
+	// Best-effort: startEgressRelayListener logs/prints its own failure detail,
+	// and a failed optional listener must never fail the worker (same posture as
+	// the terminal VPN listener / cobrowse stream server started nearby).
+	_, _ = startEgressRelayListener(ctx)
+}
 
+// egressRelayIsConnected / egressRelayListenVPN are indirection seams over the
+// network singleton so the two relay-start call sites (startEgressRelay for
+// `citadel work`, and `citadel egress-relay serve`) can be exercised
+// hermetically. Tests swap egressRelayListenVPN for one returning a real
+// loopback listener + a fake mesh IP, so egressrelay.New/Serve run for real
+// against a stub listener without a live mesh -- and swapping ONE seam is also
+// the proof that both call sites go through the same implementation. Never
+// reassigned outside tests.
+var (
+	egressRelayIsConnected = network.IsGlobalConnected
+	egressRelayListenVPN   = network.ListenVPN
+)
+
+// startEgressRelayListener constructs the on-node SOCKS5 egress relay's
+// mesh-only VPN listener + server (citadel #787) and runs Serve on a
+// background goroutine bound to ctx. It is the SINGLE shared implementation
+// behind both `citadel work`'s startEgressRelay (best-effort, enable-gated)
+// and `citadel egress-relay serve` (relay-only, unconditional) -- neither the
+// SOCKS5/policy wiring nor the same-org authz gate is duplicated. The caller
+// owns the two decisions this helper does NOT make: WHETHER to start (the
+// enable-gating) and whether the node is on the mesh (egressRelayIsConnected).
+//
+// Returns the bound mesh IP and a non-nil error only when the listener or
+// server could not be constructed (the specifics are already logged/printed);
+// on success the server serves until ctx is cancelled, which closes the
+// listener and returns nil.
+func startEgressRelayListener(ctx context.Context) (string, error) {
 	vpnPort := fmt.Sprintf("%d", services.EgressRelayPort)
-	vpnLn, vpnIP, err := network.ListenVPN("tcp", vpnPort)
+	vpnLn, vpnIP, err := egressRelayListenVPN("tcp", vpnPort)
 	if err != nil {
 		Log("egress relay VPN listener failed: %v", err)
-		fmt.Fprintf(os.Stderr, "   - ⚠️ Egress relay enabled but its VPN listener failed: %v\n", err)
-		return
+		fmt.Fprintf(os.Stderr, "   - ⚠️ Egress relay's VPN listener failed: %v\n", err)
+		return "", err
 	}
 
 	// KeepAlive bounds a relayed connection whose peer goes silent without
 	// closing (the CONNECT target never sends FIN/RST): without it, an
 	// abandoned connection holds a goroutine + two fds (client + egress leg)
-	// indefinitely inside this long-lived `citadel work` process. Mirrors the
-	// gateway's own bounded-connection posture (its http.Server.WriteTimeout).
+	// indefinitely inside this long-lived process. Mirrors the gateway's own
+	// bounded-connection posture (its http.Server.WriteTimeout).
 	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
 	srv, err := egressrelay.New(egressrelay.Options{
 		Dialer:   dialer.DialContext,
@@ -80,7 +115,7 @@ func startEgressRelay(ctx context.Context) {
 		// proposition is "has open egress", so one authorized-but-misbehaving
 		// peer must not be able to exhaust this node's file descriptors.
 		// Mirrors citadel socks's --max-conns (#786), just with a sane default
-		// here since there is no interactive flag for the worker-started relay.
+		// here since there is no interactive flag for the relay.
 		MaxConns:    egressRelayMaxConns,
 		DialTimeout: 30 * time.Second,
 		Logf: func(format string, args ...any) {
@@ -90,7 +125,7 @@ func startEgressRelay(ctx context.Context) {
 	if err != nil {
 		Log("egress relay: failed to construct server: %v", err)
 		vpnLn.Close()
-		return
+		return "", err
 	}
 
 	go func() {
@@ -102,6 +137,7 @@ func startEgressRelay(ctx context.Context) {
 	allowLAN := resolveEgressAllowLAN()
 	Log("egress relay VPN listener on %s:%s (allow_lan=%v, max_conns=%d)", vpnIP, vpnPort, allowLAN, egressRelayMaxConns)
 	fmt.Printf("   - Egress relay: %s:%d (mesh-only, same-org verified peers, allow_lan=%v)\n", vpnIP, services.EgressRelayPort, allowLAN)
+	return vpnIP, nil
 }
 
 // egressRelayMaxConns bounds concurrent relayed connections. A package var

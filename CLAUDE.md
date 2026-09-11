@@ -1039,6 +1039,46 @@ citadel mesh chat --model M "hi"    # one-shot chat to a uniquely-named model
 citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicitly
 ```
 
+### On-node SOCKS5 egress relay + relay-only mode (`citadel egress-relay`, #787/#980/#1033)
+
+The egress relay (`internal/egressrelay`) lets ANOTHER same-org citadel node on
+the mesh tunnel its outbound traffic through THIS node's internet egress — the
+server side of `citadel socks`. It is default OFF, mesh-only
+(`network.ListenVPN`, never a LAN/localhost bind), authorized SOLELY by verified
+same-org mesh-peer identity (`egressRelayMeshResolver` → `network.WhoIsPeer`;
+there is no token/passcode fallback), and refuses to CONNECT into RFC1918 /
+loopback / link-local / `100.64.0.0/10` by default (`resolveEgressAllowLAN`,
+relaxed only via `citadel egress-relay allow-lan on` / `CITADEL_EGRESS_ALLOW_LAN`
+— fail-closed, deliberately no flag to force it off).
+
+**`startEgressRelayListener` (`cmd/egress_relay_server.go`) is the SINGLE
+relay-start implementation** — the SOCKS5/policy/same-org-authz wiring is not
+duplicated. Two callers share it: `startEgressRelay` (the `citadel work`
+auto-start, enable-gated on `workEgressRelay || resolveEgressRelay()` and
+best-effort — a failed optional listener never fails the worker) and
+`egressRelayServe` (`cmd/egress_relay_serve.go`). The `egressRelayIsConnected` /
+`egressRelayListenVPN` package vars are indirection seams so both call sites are
+hermetically testable against a loopback listener + fake mesh IP — swapping the
+ONE `egressRelayListenVPN` seam is observed by both, which is the proof there is
+a single implementation (`cmd/egress_relay_serve_test.go`).
+
+**Relay-only mode — `citadel egress-relay serve` (#1033).** `citadel work
+--egress-relay` starts the relay but `citadel work` ALSO requires a reachable
+Redis job source: it retries then EXITS on connect failure, taking the relay
+down with it — so a node could not be a PURE egress exit without also being a
+full Redis-connected worker. `serve` is a long-running FOREGROUND command
+(mirrors `runWork`'s network-connect + signal/teardown, but with NO Redis, job
+source, or worker loop) that joins the mesh (`VerifyOrReconnect`, with
+`recoverStaleVPN` on `ErrStaleState`; a not-logged-in node gets an actionable
+error pointing at `citadel login`/`citadel init`), starts the shared listener,
+and blocks until SIGINT/SIGTERM (teardown is a single ctx cancel — the relay's
+`Serve` closes its listener on `ctx.Done`; no docker teardown that can hang, so
+unlike `runWork` it needs no grace-period force-exit watchdog, and it never
+`Logout`s — the identity must persist). Being an explicit "be a relay now"
+command, it force-enables the relay (ignores the `egress-relay enable` toggle)
+but still resolves allow_lan only from config/env. #1006's egress harness can
+use `serve` instead of side-installing Redis on the relay host.
+
 ### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
 
 `executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/
