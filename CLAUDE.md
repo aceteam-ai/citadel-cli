@@ -1745,6 +1745,22 @@ to verify against, and does not yet echo a fabric node ID for `#8139`'s
 `node_id` field to use (it falls back to the signer's own
 `PublicKeyFingerprint` — `aep.ResolveNodeID`'s phasing rule — until it does).
 
+**`citadel aep verify <receipt.json>` (`cmd/aep.go`, citadel-cli#1034) is the
+offline verifier** — the read side of the signing above. `verifyAEPReceipt`
+(the pure core `runAEPVerify` wraps) branches on `receipt_version` to pick
+`aep.Canonicalize` (v1) or `aep.CanonicalizeV2` (v2), resolves a verifying key
+(`--cert` > `--pubkey` > the local node identity via
+`nodeidentity.Convergent(network.GetNodeConfigDir())`), then — the load-bearing
+ordering — recomputes the key's fingerprint and compares it to the receipt's
+`public_key_fingerprint` BEFORE `ecdsa.VerifyASN1`, so "signed by a different
+node" is a distinct reason from "signature is invalid". The fingerprint on both
+sides comes from ONE derivation, `nodeidentity.FingerprintPublicKey` (extracted
+from `Store.PublicKeyFingerprint`, which now calls it), so signer and verifier
+can never drift. `Store.PublicKey()` is the read-only key accessor the default
+path uses: it LOADS (never `GetOrCreateKey`-mints) — a verifier that generated
+identity as a side effect would mask the honest "no key present" failure and
+strand a leafless key for `reconcileFromLegacy` to displace.
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CITADEL_SIGN_AEP_RECEIPTS` | unset (OFF) | Attach a signed `aep_receipt` alongside `grounding` on buffered chat-completion results. Requires `CITADEL_GROUNDING_GUARDRAIL` also on. Truthy: `1`/`true`/`yes`/`on`. |
