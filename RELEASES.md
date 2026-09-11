@@ -2392,3 +2392,56 @@ Auto-generated log of every release.
   - fix: agentsprobe S2-gate — invoker-scoped HOME/PATH + honest auth-unknown (#1005) (#1012)
 
 
+---
+
+## v2.153.0 — 2026-09-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 34 |
+| Lines added | +2695 |
+
+**Changes:**
+
+  - feat: agents-probe S2 — probe wired into citadel work (#8993) (#1022)
+  - feat: converge AEP signer + CA identity key (K-A) (#8253 S3 prereq) (#1020)
+  - fix(security): bind engine host ports to loopback, not all interfaces (#1025)
+
+
+---
+
+## v2.154.0 — 2026-09-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 17 |
+| Lines added | +1314 |
+
+**Changes:**
+
+  - feat: AEP receipt v2 signed canon + refuse-to-sign guard (#8253 S3) (#1026)
+
+
+---
+
+## v2.155.0 — 2026-09-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 7 |
+| Files changed | 13 |
+| Lines added | +3155 |
+
+**Changes:**
+
+  - fix(security): recreate running engines still bound to 0.0.0.0 after a #1025 auto-update (#1032)
+  - docs(aep): correct stale v1-only comments; S3 v2 receipt emission already shipped (#1031)
+  - docs: design — engine bind: all escape hatch + exposure observability + ollama network (#1023) (#1029)
+  - fix(security): bind native llamacpp fallback to loopback, not 0.0.0.0 (#1028)
+  - docs: design — long-term AEP canonicalization framework (bytes-pin) (#1019)
+  - docs: design — agents-probe S2 (owner-signal + worker wiring) (#8993) (#1014)
+  - docs: design — Trust Engine S2/S3 signed receipt digests (#8253) (#1018)
+
+

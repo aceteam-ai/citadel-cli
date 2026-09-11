@@ -1,0 +1,15 @@
+receipt_version
+node_id
+job_id
+issued_at
+engine
+model
+input_sha256
+output_sha256
+policy_hash
+action
+verdict_hash
+grounded
+score
+claims_checked
+flagged_hash

@@ -152,6 +152,13 @@ func startService(serviceName, composeFilePath string) error {
 
 	containerName := "citadel-" + serviceName
 
+	// forceRecreateForBindDrift is set when an already-running #1025 engine is
+	// found still published on all interfaces while its materialized template is
+	// loopback-only (aceteam-ai/citadel-cli#1030). It appends --force-recreate to
+	// the compose-up below so the loopback bind actually applies. See the running
+	// pre-flight branch and shouldRecreateForEngineBindDrift.
+	forceRecreateForBindDrift := false
+
 	// Resolve the container runtime once (podman rootless preferred over docker;
 	// see catalog.SelectContainerRuntime) and drive every sub-command below
 	// through it, so module containers run under the hardened runtime when
@@ -196,33 +203,51 @@ func startService(serviceName, composeFilePath string) error {
 			status := strings.TrimSpace(string(output))
 
 			if status == "running" {
-				// Container is already running - skip starting
-				fmt.Printf("   ✅ Container %s is already running.\n", containerName)
-				return nil
-			}
-
-			// Container exists but is stopped/exited/paused
-			if forceRecreate {
-				// Force mode: remove the old container and recreate
-				fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-				rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
-				rmCmd.Run() // Ignore errors - container might already be gone
-			} else {
-				// Interactive mode: prompt user
-				fmt.Printf("   ⚠️  Container %s exists but is %s.\n", containerName, status)
-				fmt.Print("   Recreate container? (Y/n) ")
-				var response string
-				fmt.Scanln(&response)
-				response = strings.TrimSpace(strings.ToLower(response))
-
-				if response != "" && response != "y" && response != "yes" {
-					return fmt.Errorf("container %s exists but is not running - user chose not to recreate", containerName)
+				// One-time loopback-bind drift remediation (aceteam-ai/citadel-cli#1030):
+				// a node that took a #1025 binary via the re-exec auto-updater
+				// refreshed <svc>.yml on disk to the loopback template but left the
+				// prior container running on 0.0.0.0. Recreate it so the loopback
+				// publish actually applies; otherwise leave a healthy already-running
+				// container untouched. Gated (inside shouldRecreateForEngineBindDrift)
+				// on the #1025 engine set, the materialized file being loopback-only
+				// (loop guard), a live wildcard binding, and the
+				// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE opt-out.
+				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath) {
+					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind (aceteam-ai/citadel-cli#1030)...\n", containerName)
+					forceRecreateForBindDrift = true
+					// Fall through to the compose-up below with --force-recreate.
+				} else {
+					// Container is already running - skip starting
+					fmt.Printf("   ✅ Container %s is already running.\n", containerName)
+					return nil
 				}
+			} else {
+				// Container exists but is stopped/exited/paused. The drift branch
+				// above falls through to the compose-up (with --force-recreate)
+				// instead of coming here, so a RUNNING container is never removed
+				// by this stale-container path.
+				if forceRecreate {
+					// Force mode: remove the old container and recreate
+					fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
+					rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
+					rmCmd.Run() // Ignore errors - container might already be gone
+				} else {
+					// Interactive mode: prompt user
+					fmt.Printf("   ⚠️  Container %s exists but is %s.\n", containerName, status)
+					fmt.Print("   Recreate container? (Y/n) ")
+					var response string
+					fmt.Scanln(&response)
+					response = strings.TrimSpace(strings.ToLower(response))
 
-				// Remove the old container before recreating
-				fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
-				rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
-				rmCmd.Run() // Ignore errors
+					if response != "" && response != "y" && response != "yes" {
+						return fmt.Errorf("container %s exists but is not running - user chose not to recreate", containerName)
+					}
+
+					// Remove the old container before recreating
+					fmt.Printf("   ♻️  Removing stale container %s...\n", containerName)
+					rmCmd := exec.Command(rt.EngineBin, "rm", "-f", containerName)
+					rmCmd.Run() // Ignore errors
+				}
 			}
 		}
 	}
@@ -252,7 +277,15 @@ func startService(serviceName, composeFilePath string) error {
 	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
 	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
 	// the latter may be a GPU-stripped temp file in a different directory.
-	args := rt.ComposeArgs(startServiceComposeArgs(composeFilePath, actualComposePath)...)
+	composeUpArgs := startServiceComposeArgs(composeFilePath, actualComposePath)
+	if forceRecreateForBindDrift {
+		// Recreate the still-running container in place so the loopback publish
+		// applies. Graceful (compose stops then recreates) and on the sanctioned
+		// compose path -- unlike a bare `docker rm -f`, which SIGKILLs a live
+		// engine and bypasses compose's stop.
+		composeUpArgs = append(composeUpArgs, "--force-recreate")
+	}
+	args := rt.ComposeArgs(composeUpArgs...)
 	composeCmd := exec.Command(rt.Bin, args...)
 	// Supply the citadel-owned host ports so compose files that defer their host
 	// publish to ${CITADEL_*_HOST_PORT:?...} (llamacpp/vllm/extraction/diffusers)

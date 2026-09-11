@@ -257,6 +257,14 @@ and system user configuration (requires sudo).`,
 
 		// Default mode: join network and exit (use --provision for full provisioning)
 		if !initProvision {
+			// #1017: record the machine-global state pointer on EVERY network-only
+			// exit (function-scoped defer, so it fires on each return below), so a
+			// later bare-systemd root worker converges on the node dir this init
+			// wrote to rather than an empty /root/citadel-node. Registered only in
+			// the network-only branch; the --provision path writes the pointer
+			// itself via createGlobalConfig.
+			defer ensureMachineStatePointerForRootWorker()
+
 			// If we already connected early, just exit
 			if earlyNetworkConnected {
 				fmt.Printf("Node name: %s\n", nodeName)
@@ -1373,6 +1381,39 @@ func isRoot() bool {
 	return platform.IsRoot()
 }
 
+// Seams over the machine-state-pointer wiring so the #1017 network-only fix is
+// unit-testable without a real /etc/citadel or a real state dir.
+var (
+	initIsRootFn                    = isRoot
+	initGetStateDirFn               = network.GetStateDir
+	initEnsureMachineStatePointerFn = network.EnsureMachineStatePointer
+)
+
+// ensureMachineStatePointerForRootWorker records the machine-global state
+// pointer from the network-only `citadel init` path (#1017). The --provision
+// path already writes it (via createGlobalConfig); the default network-only path
+// — what install.sh runs — returned before ever doing so, so a later
+// bare-systemd ROOT worker after a human-sudo install resolved an EMPTY
+// /root/citadel-node instead of the human's node dir. This mirrors what
+// `citadel up` already does (EnsureMachineStatePointer in machinewide.go), and
+// it is what makes the S2 layered resolver's node-dir-owner tier find the human
+// on that fleet shape.
+//
+// Only root can write the machine-global pointer (under /etc/citadel), and only
+// the root-install shapes need it (the packer/service-install shapes run the
+// worker AS the target user, where owner-home resolution already converges), so
+// a non-root network-only init simply skips it. Best-effort and idempotent:
+// EnsureMachineStatePointer no-ops unless real state exists and no pointer is
+// set yet, so it never pins a wrong path.
+func ensureMachineStatePointerForRootWorker() {
+	if !initIsRootFn() {
+		return
+	}
+	if err := initEnsureMachineStatePointerFn(initGetStateDirFn()); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  Could not record machine state pointer (a later worker run may not find this node): %v\n", err)
+	}
+}
+
 func runCommand(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()
@@ -1730,6 +1771,14 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 // #4583): it ensures an EC P-256 keypair exists on disk (0600, never
 // transmitted) and best-effort caches the public fabric CA trust chain.
 //
+// The store is the machine-convergent nodeidentity.Convergent
+// (network.GetNodeConfigDir()) — the SAME store the AEP receipt signer
+// (internal/worker.defaultAEPSigner) uses — so the CSR key whose SPKI the
+// fabric CA signs and the receipt signing key are ONE key (K-A,
+// docs/design-trust-receipt-v2.md §4, aceteam#8253). On a node whose key was
+// registered under the legacy invoker-scoped location, Convergent's first-use
+// read-through adopts those exact bytes so the already-issued leaf stays valid.
+//
 // Idempotent: on re-run it loads the existing key rather than rotating it, so a
 // node keeps a stable identity across `citadel init` invocations.
 //
@@ -1739,8 +1788,13 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 // The stored key + chain only become load-bearing once P2's mTLS self-reenroll
 // lands and consumes them.
 func ensureNodeIdentity(baseURL string) {
-	store := nodeidentity.Default()
+	ensureNodeIdentityWithStore(nodeidentity.Convergent(network.GetNodeConfigDir()), baseURL)
+}
 
+// ensureNodeIdentityWithStore is the store-injected core of ensureNodeIdentity,
+// split out so tests can drive a hermetic temp-dir store rather than the real
+// machine-convergent (and, on this dev box, node-1297-pinned) directory.
+func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	if _, err := store.GetOrCreateKey(); err != nil {
 		// Non-fatal: a node without an identity key simply pairs with an authkey
 		// as before. Do NOT os.Exit — this must never block init.

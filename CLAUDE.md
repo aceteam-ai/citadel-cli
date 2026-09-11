@@ -1004,9 +1004,13 @@ self-dialing this node's own mesh IP:8210 via `network.Dial` while bonsai served
 fine on `localhost:8210` → `connection refused`: embedded tsnet's userspace
 netstack does not forward inbound mesh traffic to a host-bound port lacking a
 `srv.Listen()` (only ports citadel explicitly `ListenVPN`s — status 8080, gateway
-8443, terminal, vnc, modules — answer over the mesh). The engine compose files
-bind `0.0.0.0` and carry a "peers reach this engine directly over the mesh"
-comment, but that reflects a full-Tailscale/kernel-TUN node, not embedded tsnet.
+8443, terminal, vnc, modules — answer over the mesh). This was also the
+reasoning for the engine compose files' old `0.0.0.0` bind ("peers reach this
+engine directly over the mesh"), which held only on a full-Tailscale/kernel-TUN
+node, not embedded tsnet, and bought unauthenticated LAN reach on every node
+regardless. vllm/llamacpp/bonsai/unlimited-ocr/sglang are now loopback-only
+(`aceteam-ai/aceteam#9523`; see `TestServiceMapBindSweep` in
+`services/embed_test.go` for the current bind of every `ServiceMap` entry).
 
 **Fix (#581, node-side complement of aceteam #6236):** the gateway now routes
 `/v1/chat/completions` (plus `/v1/completions` and `/v1/models`) by model. Both
@@ -1386,7 +1390,10 @@ llama-server exposes the identical llama.cpp-server API). See
 `internal/worker/llm_inference.go` — the Redis-interface handler that used to
 live at `internal/jobs/llm_inference.go` was ported to this native
 `worker.JobHandler` by issue #590 (that old path no longer exists; see the
-Worker Mode section above). Direct mesh HTTP to `:8210` also works.
+Worker Mode section above). Bonsai's host publish is loopback-only
+(`aceteam-ai/aceteam#9523`, `TestServiceMapBindSweep`), so direct mesh HTTP to
+`:8210` no longer works from another node; use `citadel mesh chat` (routes
+through the target node's gateway) instead.
 
 **First start builds inline (~7min on Ampere):** because bonsai is build-based,
 the first `SERVICE_START` (or `citadel run --service bonsai`) runs `docker
@@ -1575,13 +1582,15 @@ equals a signed receipt's `flagged_hash` for the same input). `verdict_hash`
 is `sha256:<hex>` over `BuildVerdict`'s DoR §3 canonical trust_verdict object
 (action + the uniform check fields + grounding minus its flagged list) — the
 mechanism the S6 acceptance mutation test pins (drop a detector from the
-injected set → it leaves `checks[]` AND `verdict_hash` changes). Both
-`output_sha256` and `verdict_hash` are UNSIGNED convenience digests; neither
-is part of anything cryptographically signed. S3 (`AEPReceiptV2`) is what
-makes `verdict_hash` a SIGNED canonical field and pins the byte-exact
-`canonical_json` the Python verifier recomputes — until then `BuildVerdict`
-uses `json.Marshal` (deterministic within Go), not aep's fixed float
-formatting.
+injected set → it leaves `checks[]` AND `verdict_hash` changes). On the
+unsigned `trust_verdict` map, `output_sha256` and `verdict_hash` are
+convenience copies of the receipt's own fields; the SAME `verdict_hash` is a
+SIGNED canonical field of the emitted v2 `aep_receipt` (S3 shipped, #1026 /
+citadel-cli#1002). `computeVerdictHash` (`internal/trust/verdict.go`) hashes
+the DoR §3.5 preimage through the aep `canonical_json` port (`trust.CanonicalJSON`
+over `trust.VerdictHashPreimage`, `score` as its `'f' 6` string), NOT
+`json.Marshal` — pinned byte-exact against `internal/aep/testdata/v2/verdict_preimage.json`
+by `TestGoldenReceiptV2`, the form the Python verifier recomputes.
 
 Excluded from S6 by the ratified DoR (`internal/trust` has no place for
 them): PAW/MoE, CostAnomaly (needs cost context), Content classification
@@ -1645,12 +1654,13 @@ signature covering its own field is the standard way this class of scheme
 breaks silently.
 
 **Wiring is nested inside the existing grounding gate, plus one more opt-in
-on top** (`internal/worker/llm_inference.go`'s `bufferedChatCompletions`):
+on top** (`internal/worker/llm_inference.go`'s `applyTrustEngine` — the single
+post-completion hook since #1001, NOT the per-path `bufferedChatCompletions`):
 signing only runs when `CITADEL_GROUNDING_GUARDRAIL` has already computed a
 `GroundingResult` (there's nothing to sign otherwise) AND
 `CITADEL_SIGN_AEP_RECEIPTS` is separately on — a node can run the guardrail
-without ever touching a private key. `LLMInferenceHandler.ToMap()`
-(`internal/aep`) converts the signed `*AEPReceiptV1` to a plain
+without ever touching a private key. `AEPReceiptV2.ToMap()`
+(`internal/aep`) converts the signed `*AEPReceiptV2` to a plain
 `map[string]any` before it's attached to job `Output["aep_receipt"]` —
 Output crosses the wire via StreamWriter/Redis/API serialization elsewhere
 in the worker, so attaching a typed Go pointer directly would be the only
@@ -1661,31 +1671,95 @@ key is unavailable) fails OPEN: the job still succeeds with `content`/
 non-fatally — an injectable field, not a bare `log.Printf`, since this
 package otherwise imports no logger at all).
 
-**Machine-convergent by construction — fixed, not a known hazard.** The
-signing key is NOT `nodeidentity.Default()` (which roots at invoker-scoped
-`platform.ConfigDir()`, see the `ConfigDir()`/`GetNodeConfigDir()` entry
-above — still used, unchanged, by `cmd/device.go`'s device-mode enrollment
-and `cmd/init.go`'s dormant mTLS CSR flow, both of which depend on staying
-invoker-scoped/shared with `citadel init`'s own context). `defaultAEPSigner()`
-(`internal/worker/llm_inference.go`) instead constructs a **separate**
-`nodeidentity.Store` rooted at `aepSigningStoreDir(network.GetNodeConfigDir())`
-— the SAME machine-convergent directory `citadel init`'s device-config write
-(#845) and #726's heartbeat marker already use — so a systemd-root `citadel
-work` and an interactive non-root process resolve the IDENTICAL signing key
-file; a future Phase 2 backend registration of this node's public key can
-never desync from what `citadel work` actually signs with.
-`TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts`
-(`internal/worker/llm_inference_test.go`) pins this directly: two
-independently-constructed `Store` instances resolving the same converged
-`nodeConfigDir` (standing in for two different invocation contexts) load/
-create the identical key. `LLMInferenceHandler.WithSigner` remains the
-override seam for tests and any future signer change.
+**The EMITTED receipt is the fifteen-field v2 shape (`AEPReceiptV2` /
+`CanonicalizeV2` / `BuildSignedReceiptV2`, `internal/aep/receipt_v2.go`,
+aceteam #8253 S3 / citadel-cli#1002, PR #1026).** On top of v1's fields it
+binds `input_sha256` / `output_sha256` / `policy_hash` (the last =
+`aep.EmptyPolicyHash`, hash of `{}`, until real policy delivery lands at S5 —
+#1003) and the trust `verdict_hash` (`action` + `verdict_hash` from the SAME
+`trust.BuildVerdict` the unsigned `trust_verdict` map uses, so the two
+`verdict_hash` values can never diverge). `receipt_version` is the first
+canonical field so the deployed verifier (aceteam#9287) branches before
+recomputing. The v1 primitive (`AEPReceiptV1` / `Canonicalize`) is retained
+and still pinned by its own tests, but no node emits it anymore. The Go golden
+that pins the exact v2 canonical bytes + a sign→canon→verify round-trip lives
+at `internal/aep/testdata/v2/` (regenerate with
+`go test ./internal/aep -run Golden -update-golden`). The messages-path
+`input_sha256` byte-match (raw-payload retention, design §2.2 option I-A) is a
+deliberately deferred open question, so `content_bound` on a messages payload
+stays false today; a bare-`prompt` payload already matches.
+
+**Machine-convergent AND the same key the CA registered — one convergent
+identity store (K-A, `docs/design-trust-receipt-v2.md` §4, citadel-cli#1002 /
+aceteam#8253).** `nodeidentity.Convergent(nodeConfigDir)`
+(`internal/nodeidentity/nodeidentity.go`) is the authority: it roots the store
+at `<nodeConfigDir>/identity` and, on first key/leaf access, does a one-time
+read-through of a key registered under the legacy invoker-scoped
+`platform.ConfigDir()/identity` location. `reconcileFromLegacy` owns the exact
+rule — never displace a REGISTERED convergent key (`node.crt` present is the
+proof), never destroy key material (a differing leafless convergent key is
+copied aside to `node.key.displaced-<ts>`, never removed), never mint a second
+key beside a registered legacy one (a legacy key present but unreadable is a
+HARD error out of `GetOrCreateKey`, not a fall-through to generate). Adoption
+is byte-identical, so the SPKI — and thus any already-issued CA leaf — stays
+valid; no re-pair.
+
+Both the AEP receipt signer AND every CSR/enrollment site now construct this
+same store: `defaultAEPSigner()` (`internal/worker/llm_inference.go`) and
+`ensureNodeIdentity` (`cmd/init.go`) / the three `cmd/device.go` sites all call
+`nodeidentity.Convergent(network.GetNodeConfigDir())`. Before K-A the signer
+rooted at `GetNodeConfigDir()` while the CSR path used `nodeidentity.Default()`
+(`platform.ConfigDir()`) — two keys, so a real receipt's
+`public_key_fingerprint` could never match a `fabric_node_certs` row (every
+real receipt `unverified` while the golden passed). `nodeidentity.Default()`
+still exists but is DEPRECATED for production identity paths (a new
+`Default()` call site is how the split comes back); it is threaded in from
+`cmd`/`internal/worker` because `nodeidentity` is a leaf that must not import
+`internal/network`. Pins: `internal/nodeidentity/convergence_test.go` (adoption
+byte-identical, signer==CSR key, displaced-vs-registered, hard-fail, leaf/chain
+adoption), `TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts` +
+`TestDefaultAEPSigner_SameConvergentStoreAsCSRPath`
+(`internal/worker/llm_inference_test.go`). `ensureNodeIdentity` is split into a
+store-injected `ensureNodeIdentityWithStore` so its smoke test stays hermetic
+(the real `network.GetNodeConfigDir()` resolves to a live node dir on a box
+with `/etc/citadel/config.yaml`). `LLMInferenceHandler.WithSigner` remains the
+override seam for tests.
+
+**Residual, documented (not closed here):** the legacy read-through SOURCE is
+still invoker-scoped (`platform.ConfigDir()`), so a systemd-root `citadel work`
+whose `ConfigDir()` (`/etc/citadel`) holds no key, running with signing enabled
+on a legacy node BEFORE any `citadel init`/enroll re-run in the registering
+user's context, mints a fresh convergent key (no legacy key visible to adopt).
+The operator's next `citadel init`/enroll heals it: it sees a leafless
+convergent key differing from the now-visible legacy key and adopts the legacy
+one (copying the fresh key aside). Signing is OFF by default, so this window is
+narrow. Raw-path leaf readers (`internal/devicemode/reenroll.go`/`renew.go`,
+which read `store.LeafPath()`/`KeyPath()` directly rather than via a Store
+method) are covered only transitively (the key-access on the same flow triggers
+adoption) — acceptable because that mTLS flow is dormant (CA not activated
+fleet-wide).
 
 **Inert until the aceteam-side lands** (design doc §4): signing is fully
 wired citadel-side, but the backend does not yet hold this node's public key
 to verify against, and does not yet echo a fabric node ID for `#8139`'s
 `node_id` field to use (it falls back to the signer's own
 `PublicKeyFingerprint` — `aep.ResolveNodeID`'s phasing rule — until it does).
+
+**`citadel aep verify <receipt.json>` (`cmd/aep.go`, citadel-cli#1034) is the
+offline verifier** — the read side of the signing above. `verifyAEPReceipt`
+(the pure core `runAEPVerify` wraps) branches on `receipt_version` to pick
+`aep.Canonicalize` (v1) or `aep.CanonicalizeV2` (v2), resolves a verifying key
+(`--cert` > `--pubkey` > the local node identity via
+`nodeidentity.Convergent(network.GetNodeConfigDir())`), then — the load-bearing
+ordering — recomputes the key's fingerprint and compares it to the receipt's
+`public_key_fingerprint` BEFORE `ecdsa.VerifyASN1`, so "signed by a different
+node" is a distinct reason from "signature is invalid". The fingerprint on both
+sides comes from ONE derivation, `nodeidentity.FingerprintPublicKey` (extracted
+from `Store.PublicKeyFingerprint`, which now calls it), so signer and verifier
+can never drift. `Store.PublicKey()` is the read-only key accessor the default
+path uses: it LOADS (never `GetOrCreateKey`-mints) — a verifier that generated
+identity as a side effect would mask the honest "no key present" failure and
+strand a leafless key for `reconcileFromLegacy` to displace.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -2718,6 +2792,78 @@ the original gap, including why `internal/devicemode`'s superficially-similar
 `NodeUID` is NOT this (different identity, different — non-overlapping —
 population of hosts):
 [docs/whoami-fabric-id-gap.md](docs/whoami-fabric-id-gap.md).
+
+### Vendor coding-agent probe in the worker (`citadel work`, aceteam #8993 S2)
+
+Design: [docs/design-agents-probe-s2.md](docs/design-agents-probe-s2.md). S1
+(`internal/agentsprobe.Probe`, `citadel agents probe`) detects installed/authed
+vendor CLIs (claude/codex/gemini/opencode) AS the operator. S2 runs that same
+`Probe` inside the long-lived `citadel work`, where neither `HOME` nor `PATH`
+is the operator's — so it must decide WHOSE environment to inspect, and must not
+exec a user-writable binary as root.
+
+**`agentsprobe.ResolveTargetUserForNode` (`resolver.go`) owns the owner signal:**
+a layered resolver, first match wins — explicit `agents_probe_user` (manifest) >
+owner uid of `network.GetStateDir()` (home from PASSWD via `user.LookupId`, NOT
+the dir path) > `SUDO_USER` (the #1012 branch) > process user. Each `Target`
+carries a `Signal` (`config`/`node-dir-owner`/`sudo-user`/`process`) so "probed
+jason's env" is distinguishable from "probed root's env on a root-owned node" —
+the two outcomes that look identical otherwise. A configured user missing from
+passwd is an ERROR (→ honest Unknown probe), never a silent fallback. Do NOT add
+systemd `User=` reading (answers the wrong question) or `/home/*` enumeration (a
+privacy/exec-surface reach). The package stays stdlib-only (leaf): the node dir
+is passed IN as a string, the node-dir-owner stat is behind `owner_unix.go`/
+`owner_windows.go` build tags (Windows has no numeric uid → falls to process).
+
+**`Target.probeOptions` owns the privilege-drop decision, `applyExecHardening`
+(`exec_hardening_unix.go`) applies it — the LOCAL PRIVESC this feature would
+otherwise introduce.** On the fleet root worker the target's PATH starts with
+dirs the target user WRITES (`~/.npm-global/bin`); exec'ing `<vendor> --version`
+there as root is arbitrary-code-as-root. The drop fires ONLY when `os.Getuid()==0
+&& target.UID != 0`: `SysProcAttr.Credential{Uid,Gid}` (nil Groups + unset
+NoSetGroups → the runtime `setgroups(0)`-clears the worker's supplementary
+groups), a MINIMAL env (`HOME`/`PATH`/`USER`/`LOGNAME` of the target, not the
+worker's), and `cmd.Dir = target home` (a `WorkingDirectory=/root` cwd else
+EACCEs a dropped Node child). `Setpgid` + a process-group-kill `cmd.Cancel` are
+set ALWAYS so a daemonizing grandchild (a vendor update-check helper) is reaped
+on timeout, alongside the existing `WaitDelay`. `buildVersionCmd` is the
+inspectable seam (`TestBuildVersionCmd_DropSetsCredential`). A non-root worker
+cannot drop and runs normally; Windows has no drop (stub).
+
+**`jsonFileNonEmptyObjectState` reads the target's credential file as the worker
+(root bypasses `0600`) but reads ONLY existence + JSON-object SHAPE, never a
+value** — the S1 contract. It `Lstat`s + requires `IsRegular` (a
+target-controlled FIFO would block a root `ReadFile` forever, wedging the
+singleflight probe) and reads through a `LimitReader`. A future "log the parse
+error with a snippet" edit breaks the contract and must not be added.
+
+**`agentsprobe.Service` (`service.go`) is the cadence/cache; the heartbeat NEVER
+probes.** An `atomic.Pointer[Snapshot]`, a `probeMu` singleflight, and a min-gap.
+`Get()` (the read path) never execs. `Refresh(ctx, force)`: `force` for the
+async startup probe + hourly timer (`Start`), `force=false` for the endpoint's
+`?refresh=1` (skips when a probe ran within `MinRefreshGap`, 60s). Wired in
+`cmd/work.go` (`agentsProbeResolver`/`agentsProbeDisabled`/`agentsProbeInterval`);
+`Start()` is called only inside the `workStatusPort > 0` block so a probe never
+runs with no reader. `GET /agent/vendor-agents` (`internal/status/agent.go`
+`handleVendorAgents`, behind `requireVPNOrAuth`, provider closure in
+`cmd/agent_tools.go`) serves the snapshot; `node_agents_list` is the aceteam-side
+tool (#9157, not built here). Deferred (design §6): the `NodeStatus.VendorAgents`
+heartbeat mirror, `--target-user` on the operator command, the aceteam route.
+
+**Bundled gate fixes.** #1017: `ensureMachineStatePointerForRootWorker`
+(`cmd/init.go`) calls `network.EnsureMachineStatePointer` from the network-only
+init path when root (the `--provision` path already did via `createGlobalConfig`;
+network-only — what install.sh runs — returned first, so a root worker after a
+human-sudo install resolved an empty `/root/citadel-node`), making the node-dir-
+owner tier work on that fleet shape. #1015: `Options.HomeUnknown` distinguishes
+"use the process home" (the S1 operator's empty `HomeDir`) from "target
+unresolved" — the latter reports `AuthStateUnknown`, never a confident false "no"
+against `/root`.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CITADEL_AGENTS_PROBE` | unset (ON) | Kill switch. Any falsey value (`0`/`false`/`no`/`off`) disables the probe (endpoint returns `disabled:true`, nothing execs). |
+| `CITADEL_AGENTS_PROBE_INTERVAL_SECONDS` | `3600` | Periodic refresh interval. `0` disables the timer (startup + `?refresh=1` only). |
 
 ### Safe node targeting: `--node-dir`, `--dry-run`, `--expect-node` (citadel#853, #854)
 

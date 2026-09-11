@@ -84,32 +84,26 @@ type LLMInferenceHandler struct {
 	// why it is NOT nodeidentity.Default() -- in the constructor; overridable
 	// via WithSigner so tests never touch the real host's filesystem.
 	//
-	// MACHINE-CONVERGENT BY CONSTRUCTION: unlike nodeidentity.Default()
-	// (rooted at invoker-scoped platform.ConfigDir(), see CLAUDE.md's
-	// ConfigDir()/GetNodeConfigDir() section and citadel-cli#845/#726/#696/
-	// #383), this key is rooted at network.GetNodeConfigDir() -- the SAME
-	// machine-convergent directory `citadel init`'s device-config write
-	// (#845) and #726's heartbeat marker already use. A systemd-root
-	// `citadel work` and an interactive non-root process therefore resolve
-	// the IDENTICAL signing key file, so a future Phase 2 backend
-	// registration of this node's public key can never desync from what
-	// `citadel work` actually signs with.
-	// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts pins
-	// this: two Store instances constructed against the same converged
-	// nodeConfigDir (standing in for two different invocation contexts that
-	// both resolved to it, e.g. `citadel init` and `citadel work`)
-	// load/create the IDENTICAL key.
+	// MACHINE-CONVERGENT BY CONSTRUCTION, AND THE SAME KEY THE CA REGISTERED
+	// (K-A, docs/design-trust-receipt-v2.md §4, aceteam#8253): unlike
+	// nodeidentity.Default() (rooted at invoker-scoped platform.ConfigDir(),
+	// see CLAUDE.md's ConfigDir()/GetNodeConfigDir() section and
+	// citadel-cli#845/#726/#696/#383), nodeidentity.Convergent roots this key
+	// at network.GetNodeConfigDir() -- the SAME machine-convergent directory
+	// `citadel init`'s device-config write (#845) and #726's heartbeat marker
+	// already use. A systemd-root `citadel work` and an interactive non-root
+	// process therefore resolve the IDENTICAL signing key file.
+	// TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts pins this.
 	//
-	// Deliberately a SEPARATE key/directory from nodeidentity.Default()
-	// (still used, unchanged, by cmd/device.go's device-mode enrollment and
-	// cmd/init.go's dormant mTLS CSR flow) rather than re-rooting Default()
-	// itself: device.go's package doc states "the identity store is the same
-	// one `citadel init` uses" as a deliberate feature (flipping a device to
-	// a node is a config change, not a re-enrollment), so re-rooting the
-	// shared Default() would need to satisfy that assumption too, which is a
-	// larger, separate change outside this PR's scope. Giving THIS signing
-	// path its own convergent store is the narrower fix that only touches
-	// the code this PR actually added.
+	// Crucially, Convergent is now ALSO what every CSR/enrollment site uses
+	// (cmd/init.go:ensureNodeIdentity, cmd/device.go), so the signing key and
+	// the CSR key whose SPKI the fabric CA signed into fabric_node_certs are
+	// ONE key -- previously they were two (signer at GetNodeConfigDir, CSR at
+	// Default()/ConfigDir), so a real receipt's public_key_fingerprint could
+	// never match a fabric_node_certs row. Convergent's first-use read-through
+	// adopts a key already registered under the legacy platform.ConfigDir()
+	// location (byte-identical, so an issued leaf stays valid); see
+	// nodeidentity.reconcileFromLegacy.
 	signer aep.Signer
 
 	// fabricNodeID resolves the AEP receipt's preferred node_id (aceteam
@@ -170,27 +164,31 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 // familiar -- just rooted at a different, machine-convergent parent.
 const aepIdentitySubdir = "identity"
 
-// aepSigningStoreDir is the pure core of defaultAEPSigner's path resolution:
-// given an already-resolved machine-convergent node config dir, return the
-// directory the AEP signing key is rooted at. Split out as a pure function
-// (rather than inlined where network.GetNodeConfigDir() is called) so a test
-// can assert convergence without needing two real, differently-configured
-// processes -- see TestDefaultAEPSigner_MachineConvergentAcrossInvocationContexts.
+// aepSigningStoreDir returns the directory the AEP signing key is rooted at for
+// a given machine-convergent node config dir: <nodeConfigDir>/identity.
+//
+// Retained as the TEST ORACLE for the signer's resolved path: defaultAEPSigner
+// now goes through nodeidentity.Convergent (which appends nodeidentity.dirName,
+// == "identity"), so this is an INDEPENDENT re-derivation the signer tests
+// assert against (TestNewLLMInferenceHandler_SignerIsMachineConvergentNotInvokerScoped,
+// TestAEPSigningStoreDir_PureFunctionOfNodeConfigDir) rather than production
+// path resolution.
 func aepSigningStoreDir(nodeConfigDir string) string {
 	return filepath.Join(nodeConfigDir, aepIdentitySubdir)
 }
 
 // defaultAEPSigner returns the default signer for the AEP receipt (aceteam
-// #8253): a nodeidentity.Store rooted at network.GetNodeConfigDir(), the
-// machine-convergent node config dir -- NOT nodeidentity.Default(), which is
-// rooted at invoker-scoped platform.ConfigDir() and is used elsewhere
-// (cmd/device.go's device-mode enrollment, cmd/init.go's dormant mTLS CSR
-// flow) for reasons that depend on staying invoker-scoped/shared with
-// `citadel init`'s own context. See the `signer` field's doc comment on
-// LLMInferenceHandler for the full reasoning on why this is a deliberately
-// SEPARATE store rather than a re-rooted Default().
+// #8253): the machine-convergent nodeidentity.Store rooted at
+// network.GetNodeConfigDir() (via nodeidentity.Convergent) -- NOT
+// nodeidentity.Default(), which is rooted at invoker-scoped
+// platform.ConfigDir() and would silently diverge between a systemd-root
+// `citadel work` and an interactive `citadel init`. This is the SAME
+// convergent store the CSR/enrollment sites now use (cmd/init.go,
+// cmd/device.go), so the signing key IS the key the fabric CA registered
+// (K-A, docs/design-trust-receipt-v2.md §4); see the `signer` field's doc
+// comment on LLMInferenceHandler for the full reasoning.
 func defaultAEPSigner() aep.Signer {
-	return nodeidentity.New(aepSigningStoreDir(network.GetNodeConfigDir()))
+	return nodeidentity.Convergent(network.GetNodeConfigDir())
 }
 
 // WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
@@ -211,8 +209,9 @@ func (h *LLMInferenceHandler) WithRequestRecorder(recorder func(engine string)) 
 }
 
 // WithSigner overrides the AEP receipt signer (aceteam #8253), primarily for
-// tests that want a hermetic in-memory signer instead of nodeidentity.Default()
-// (which reads/writes real key material under platform.ConfigDir()).
+// tests that want a hermetic in-memory signer instead of the default
+// nodeidentity.Convergent store (which reads/writes real key material under
+// network.GetNodeConfigDir() and reads through the legacy platform.ConfigDir()).
 func (h *LLMInferenceHandler) WithSigner(signer aep.Signer) *LLMInferenceHandler {
 	h.signer = signer
 	return h
@@ -1134,10 +1133,13 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 	return h.success(output), nil
 }
 
-// buildAEPReceipt resolves node_id (aceteam #8139's fabric node ID when
+// buildAEPReceiptV2 resolves node_id (aceteam #8139's fabric node ID when
 // known, else the signer's own public-key fingerprint -- internal/aep.
-// ResolveNodeID's phasing fallback) and signs the AEP receipt with h.signer.
-func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInferencePayload, result trust.GroundingResult) (*aep.AEPReceiptV1, error) {
+// ResolveNodeID's phasing fallback) and signs the v2 AEP receipt with h.signer.
+// The content/verdict fields (input/output/policy digests, action, verdict_hash)
+// are passed in via aep.V2Inputs -- they were computed once in applyTrustEngine
+// so the signed verdict_hash matches the unsigned trust_verdict.verdict_hash.
+func (h *LLMInferenceHandler) buildAEPReceiptV2(jobID string, payload *jobs.LLMInferencePayload, result trust.GroundingResult, in aep.V2Inputs) (*aep.AEPReceiptV2, error) {
 	var fabricNodeID string
 	if h.fabricNodeID != nil {
 		fabricNodeID = h.fabricNodeID()
@@ -1146,7 +1148,7 @@ func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInf
 	if err != nil {
 		return nil, err
 	}
-	return aep.BuildSignedReceipt(h.signer, nodeID, jobID, payload.Backend, payload.Model, result, time.Now())
+	return aep.BuildSignedReceiptV2(h.signer, nodeID, jobID, payload.Backend, payload.Model, in, result, time.Now())
 }
 
 // applyTrustEngine is the single, consolidated post-completion Trust Engine
@@ -1178,11 +1180,13 @@ func (h *LLMInferenceHandler) buildAEPReceipt(jobID string, payload *jobs.LLMInf
 //
 // Deliberately a POST-completion hook, never a gate: by the time this runs,
 // a streamed reply is already fully on the wire (tokens went out via
-// stream.WriteChunk before Execute ever sees the final Output), so this can
-// only flag, never withhold, for v1 -- see the (preserved) rationale on
-// groundingGuardrailEnabled/bufferedChatCompletions' old doc comment. v1
-// receipt shape only (AEPReceiptV1, unchanged): #8253 S3 is what upgrades the
-// signed wire shape (input/output/policy digests); not done here.
+// stream.WriteChunk before Execute ever sees the final Output), so it can
+// only flag, never withhold -- see the (preserved) rationale on
+// groundingGuardrailEnabled/bufferedChatCompletions' old doc comment. The
+// signed receipt is the fifteen-field v2 shape (aep.AEPReceiptV2, aceteam
+// #8253 S3): it binds the input/output/policy digests and the trust verdict
+// (buildAEPReceiptV2 below). The v1 primitive (aep.AEPReceiptV1) is retained
+// but no longer emitted.
 func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload, jobID string, result *JobResult) {
 	if result == nil || result.Status != JobStatusSuccess || result.Output == nil {
 		return
@@ -1196,35 +1200,62 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 	}
 	input := promptTextFromPayload(payload)
 	grounding := trust.CheckGrounding(input, content)
-	result.Output["grounding"] = groundingReceiptMap(grounding)
-	result.Output["trust_verdict"] = trustVerdictMap(grounding, content, input)
 
-	// Signed AEP receipt (aceteam #8253, the signing half deferred at
-	// citadel#847's merge -- see internal/aep's package doc and
-	// docs/design-node-identity-receipts.md §3). Nested INSIDE the
-	// grounding-guardrail gate deliberately: the receipt signs THIS
-	// GroundingResult, so signing it when the guardrail itself is off would
-	// mean signing a check that was never surfaced anywhere else. A second,
-	// independent opt-in (signAEPReceiptsEnabled) gates signing on top of
-	// that -- default OFF, so a guardrail-on-but-signing-off node's output
-	// carries "grounding"/"trust_verdict" but no "aep_receipt", exactly as
-	// citadel#847 shipped it (pre-#1001, for the one path it covered).
+	// Build the whole Trust Engine verdict ONCE and reuse it for both the
+	// unsigned trust_verdict map and (when signing) the signed v2 receipt, so
+	// the two verdict_hash values can never diverge (aceteam #8253 S3, design
+	// §7). The three content-binding digests are also computed once here:
+	//   - output_sha256: sha256:hex(content) -- the final content string every
+	//     engine path already set (matches the backend's _expected_output_sha256).
+	//   - input_sha256: sha256:hex(input). For a bare-prompt payload this is
+	//     byte-identical to the backend's _expected_input_sha256 (a JSON string
+	//     round-trips to the same Go string). For a MESSAGES payload it is the
+	//     node's own \n-joined view of the checked input and does NOT match the
+	//     backend's json.dumps(messages) -- content_bound stays false for
+	//     messages until the raw-payload retention decision lands (design §2.2
+	//     option I-A / open question §11.4). This does not affect the signature
+	//     (input_sha256 is opaque in the canon) and both content gates are OFF
+	//     by default.
+	//   - policy_hash: aep.EmptyPolicyHash (hash of the empty policy {}), the
+	//     interim value until S4/S5 policy delivery lands (design §2.3).
+	outputSHA := sha256Hex(content)
+	inputSHA := sha256Hex(input)
+	policyHash := aep.EmptyPolicyHash
+	verdict := trust.BuildVerdict(input, content, grounding, trust.DefaultDetectors(), policyHash)
+
+	result.Output["grounding"] = groundingReceiptMap(grounding)
+	result.Output["trust_verdict"] = trustVerdictMap(verdict, grounding, inputSHA, outputSHA, policyHash)
+
+	// Signed AEP receipt (aceteam #8253 S3, internal/aep -- the signing half
+	// deferred at citadel#847's merge). Nested INSIDE the grounding-guardrail
+	// gate deliberately: the receipt signs THIS verdict, so signing it when the
+	// guardrail itself is off would mean signing a check that was never
+	// surfaced anywhere else. A second, independent opt-in (signAEPReceiptsEnabled)
+	// gates signing on top of that -- default OFF, so a guardrail-on-but-signing-off
+	// node's output carries "grounding"/"trust_verdict" but no "aep_receipt".
 	if !signAEPReceiptsEnabled() {
 		return
 	}
-	receipt, err := h.buildAEPReceipt(jobID, payload, grounding)
+	receipt, err := h.buildAEPReceiptV2(jobID, payload, grounding, aep.V2Inputs{
+		InputSHA256:  inputSHA,
+		OutputSHA256: outputSHA,
+		PolicyHash:   policyHash,
+		Action:       verdict.Action,
+		VerdictHash:  verdict.VerdictHash,
+	})
 	if err != nil {
 		// Fail open: signing must never break inference. Mirrors
 		// internal/nodeidentity's own fail-open convention for its other
 		// consumer (the mTLS CSR/leaf flow, cmd/init.go's ensureNodeIdentity)
-		// -- a node whose key is unavailable simply serves without a signed
-		// receipt.
+		// -- a node whose key is unavailable, OR a receipt whose free-string
+		// fields collide with the canonical delimiter (BuildSignedReceiptV2's
+		// refuse-to-sign guard), simply serves without a signed receipt.
 		h.aepLogf("[aep] failed to build signed receipt for job %s (non-fatal): %v", jobID, err)
 		return
 	}
 	receiptMap, err := receipt.ToMap()
 	if err != nil {
-		// Attaching *aep.AEPReceiptV1 directly would be the only typed Go
+		// Attaching *aep.AEPReceiptV2 directly would be the only typed Go
 		// pointer in this map -- see ToMap's doc comment for why that's
 		// unsafe across this map's eventual wire serialization. This branch
 		// should be unreachable (the struct is always JSON-marshalable) but
@@ -1238,28 +1269,25 @@ func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload
 // trustVerdictMap shapes the unsigned, human-readable "trust_verdict" map
 // (aceteam #8253's Trust Engine naming; distinct from the legacy "grounding"
 // map, which is kept verbatim alongside it for continuity with pre-#1001
-// consumers). The whole verdict -- the aggregate `action`, the ordered
-// `checks[]`, and `verdict_hash` -- is assembled by trust.BuildVerdict, which
-// runs grounding plus the pure secrets/PII/FERPA detectors (#8253 S6); this
-// function is a thin adapter that adds the two receipt-level convenience
-// digests the pure package deliberately does not own (output_sha256, and the
-// full "grounding" block including its flagged list).
+// consumers). It takes an ALREADY-BUILT verdict (assembled once in
+// applyTrustEngine via trust.BuildVerdict) plus the three content-binding
+// digests, so this unsigned map and the signed v2 receipt carry the identical
+// verdict_hash / input_sha256 / output_sha256 / policy_hash -- they must never
+// diverge (#8253 S3, design §7).
 //
-// output_sha256 and verdict_hash are BOTH unsigned convenience digests
-// (sha256:<hex>): the former binds the exact content, the latter the verdict
-// object (trust.BuildVerdict, DoR §3, excluding grounding.flagged). Neither
-// is a substitute for #8253 S3's SIGNED AEPReceiptV2 digests -- S3 is what
-// makes verdict_hash a signed canonical field and pins the byte-exact
-// canonical_json the Python verifier recomputes; here it is only a fixity
-// hash, never part of anything cryptographically signed.
-func trustVerdictMap(result trust.GroundingResult, content, input string) map[string]any {
-	v := trust.BuildVerdict(input, content, result, trust.DefaultDetectors())
+// The digests are all UNSIGNED convenience copies here (the signed originals
+// live in the v2 aep_receipt). input_sha256/output_sha256/policy_hash are added
+// alongside verdict_hash (design §7.2) so the unsigned verdict is
+// self-describing and content-recomputable without the signed receipt.
+func trustVerdictMap(v trust.Verdict, grounding trust.GroundingResult, inputSHA, outputSHA, policyHash string) map[string]any {
 	return map[string]any{
 		"action":        v.Action,
-		"output_sha256": sha256Hex(content),
+		"input_sha256":  inputSHA,
+		"output_sha256": outputSHA,
+		"policy_hash":   policyHash,
 		"verdict_hash":  v.VerdictHash,
 		"checks":        v.CheckMaps(),
-		"grounding":     groundingReceiptMap(result),
+		"grounding":     groundingReceiptMap(grounding),
 	}
 }
 
@@ -1674,9 +1702,9 @@ func groundingGuardrailEnabled() bool {
 // deliberately.
 const signAEPReceiptsEnvVar = "CITADEL_SIGN_AEP_RECEIPTS"
 
-// signAEPReceiptsEnabled reports whether bufferedChatCompletions should
+// signAEPReceiptsEnabled reports whether applyTrustEngine should
 // additionally sign the grounding receipt into a verifiable AEP receipt
-// (internal/aep.AEPReceiptV1). Default OFF, matching this codebase's
+// (internal/aep.AEPReceiptV2). Default OFF, matching this codebase's
 // advisory-signal convention. Inert today in the sense that matters to a
 // verifier: the backend does not yet hold this node's public key to check
 // the signature against (design doc §3/§4, Phase 2, not done here) — see
@@ -1697,7 +1725,7 @@ func signAEPReceiptsEnabled() bool {
 //
 // Takes the GroundingResult directly (rather than running
 // trust.CheckGrounding itself, as this function did before the aep receipt
-// signing addition) so bufferedChatCompletions can compute it ONCE and reuse
+// signing addition) so applyTrustEngine can compute it ONCE and reuse
 // it for both this map and, when CITADEL_SIGN_AEP_RECEIPTS is also on, the
 // signed receipt — trust.CheckGrounding is a pure function of the same
 // (input, output) pair either way, so this is a refactor, not a behavior

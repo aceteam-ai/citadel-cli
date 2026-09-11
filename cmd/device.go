@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/devicemode"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/ui"
@@ -135,7 +136,7 @@ var deviceUninstallCmd = &cobra.Command{
 
 func runDeviceEnroll(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
-	store := nodeidentity.Default()
+	store := nodeidentity.Convergent(network.GetNodeConfigDir())
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 
 	machineID, err := devicemode.MachineID()
@@ -211,7 +212,7 @@ func runDeviceDaemon(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("this machine is not enrolled yet — run 'citadel device enroll' first (%v)", err)
 	}
-	store := nodeidentity.Default()
+	store := nodeidentity.Convergent(network.GetNodeConfigDir())
 
 	interval := defaultDeviceCheckInterval
 	if raw := os.Getenv(deviceCheckIntervalEnv); raw != "" {
@@ -319,7 +320,7 @@ func runDeviceStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Device:      node_uid=%s\n", cfg.NodeUID)
 	fmt.Printf("Coordinator: %s\n", cfg.NexusURL)
 
-	store := nodeidentity.Default()
+	store := nodeidentity.Convergent(network.GetNodeConfigDir())
 	now := time.Now()
 	var leafNotAfter time.Time
 	if leaf, err := store.LoadLeaf(); err != nil {
