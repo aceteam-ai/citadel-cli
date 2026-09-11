@@ -135,7 +135,11 @@ Then:
   asserts `ResolveToken(p.Bind, nil) == "127.0.0.1"` (default is loopback)
   AND that `p.Host` carries a `:?` guard (the guard is back — see the
   Context finding). The `loopbackBoundEngineHostPorts` map becomes a set of
-  service names; the token spelling is derived from the registry.
+  service names; the token spelling is derived from the registry. The two
+  per-engine copies of the same "bare token, no `:?`/`:-` guard" assertion
+  — kokoro's (`services/embed_test.go` ~line 259) and omnivoice's (~line
+  313), each also checking the literal `127.0.0.1:${…}:` prefix — invert
+  the same way, or better, are deleted in favor of the table-driven test.
 - `TestServiceMapBindSweep`: for every entry with a host publish,
   `ResolveToken(p.Bind, nil)` must be `127.0.0.1`, else the entry must be in
   `nonLoopbackServiceMapAllowlist` with a reason. After Phase 4 that
@@ -147,8 +151,13 @@ Then:
   with compose" check in `TestHostPortNoCollisions`): the var name inside
   every entry's `p.Bind` equals `services.BindEnvVarName(<svc>)`.
 - Every phase that edits a compose file regenerates
-  `services/known_hashes.go` (`go run ./services/compose/genhashes`);
-  `TestKnownComposeHashesCoverCurrentTemplates` enforces it.
+  `services/known_hashes.go`. Its header names
+  `go run ./services/compose/genhashes`, but that generator is NOT in-tree
+  (no `services/compose/genhashes/` directory exists on `main`; the only
+  reference is that comment). The impl PR should either restore the
+  generator or use PR #426's shell snippet — either way,
+  `TestKnownComposeHashesCoverCurrentTemplates` is what fails until the
+  new template hash is added.
 
 ### 3.2 Registry (`services/ports.go`)
 
