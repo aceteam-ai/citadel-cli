@@ -1652,12 +1652,13 @@ signature covering its own field is the standard way this class of scheme
 breaks silently.
 
 **Wiring is nested inside the existing grounding gate, plus one more opt-in
-on top** (`internal/worker/llm_inference.go`'s `bufferedChatCompletions`):
+on top** (`internal/worker/llm_inference.go`'s `applyTrustEngine` — the single
+post-completion hook since #1001, NOT the per-path `bufferedChatCompletions`):
 signing only runs when `CITADEL_GROUNDING_GUARDRAIL` has already computed a
 `GroundingResult` (there's nothing to sign otherwise) AND
 `CITADEL_SIGN_AEP_RECEIPTS` is separately on — a node can run the guardrail
-without ever touching a private key. `LLMInferenceHandler.ToMap()`
-(`internal/aep`) converts the signed `*AEPReceiptV1` to a plain
+without ever touching a private key. `AEPReceiptV2.ToMap()`
+(`internal/aep`) converts the signed `*AEPReceiptV2` to a plain
 `map[string]any` before it's attached to job `Output["aep_receipt"]` —
 Output crosses the wire via StreamWriter/Redis/API serialization elsewhere
 in the worker, so attaching a typed Go pointer directly would be the only
@@ -1667,6 +1668,24 @@ key is unavailable) fails OPEN: the job still succeeds with `content`/
 `grounding` intact, just without `aep_receipt` (`h.aepLogf` logs it,
 non-fatally — an injectable field, not a bare `log.Printf`, since this
 package otherwise imports no logger at all).
+
+**The EMITTED receipt is the fifteen-field v2 shape (`AEPReceiptV2` /
+`CanonicalizeV2` / `BuildSignedReceiptV2`, `internal/aep/receipt_v2.go`,
+aceteam #8253 S3 / citadel-cli#1002, PR #1026).** On top of v1's fields it
+binds `input_sha256` / `output_sha256` / `policy_hash` (the last =
+`aep.EmptyPolicyHash`, hash of `{}`, until real policy delivery lands at S5 —
+#1003) and the trust `verdict_hash` (`action` + `verdict_hash` from the SAME
+`trust.BuildVerdict` the unsigned `trust_verdict` map uses, so the two
+`verdict_hash` values can never diverge). `receipt_version` is the first
+canonical field so the deployed verifier (aceteam#9287) branches before
+recomputing. The v1 primitive (`AEPReceiptV1` / `Canonicalize`) is retained
+and still pinned by its own tests, but no node emits it anymore. The Go golden
+that pins the exact v2 canonical bytes + a sign→canon→verify round-trip lives
+at `internal/aep/testdata/v2/` (regenerate with
+`go test ./internal/aep -run Golden -update-golden`). The messages-path
+`input_sha256` byte-match (raw-payload retention, design §2.2 option I-A) is a
+deliberately deferred open question, so `content_bound` on a messages payload
+stays false today; a bare-`prompt` payload already matches.
 
 **Machine-convergent AND the same key the CA registered — one convergent
 identity store (K-A, `docs/design-trust-receipt-v2.md` §4, citadel-cli#1002 /

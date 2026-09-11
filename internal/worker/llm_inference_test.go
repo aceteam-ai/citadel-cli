@@ -770,7 +770,7 @@ func TestLLMInferenceHandler_SignAEPReceiptsGate(t *testing.T) {
 		if !present {
 			t.Fatalf("Output = %+v, want an aep_receipt key", result.Output)
 		}
-		// MUST be a plain map[string]any, not *aep.AEPReceiptV1 -- Output
+		// MUST be a plain map[string]any, not *aep.AEPReceiptV2 -- Output
 		// crosses the wire via StreamWriter/Redis/API serialization
 		// elsewhere in the worker, so a typed Go pointer attached here would
 		// be the only one of its kind in this map. Proving json.Marshal
