@@ -1180,11 +1180,13 @@ func (h *LLMInferenceHandler) buildAEPReceiptV2(jobID string, payload *jobs.LLMI
 //
 // Deliberately a POST-completion hook, never a gate: by the time this runs,
 // a streamed reply is already fully on the wire (tokens went out via
-// stream.WriteChunk before Execute ever sees the final Output), so this can
-// only flag, never withhold, for v1 -- see the (preserved) rationale on
-// groundingGuardrailEnabled/bufferedChatCompletions' old doc comment. v1
-// receipt shape only (AEPReceiptV1, unchanged): #8253 S3 is what upgrades the
-// signed wire shape (input/output/policy digests); not done here.
+// stream.WriteChunk before Execute ever sees the final Output), so it can
+// only flag, never withhold -- see the (preserved) rationale on
+// groundingGuardrailEnabled/bufferedChatCompletions' old doc comment. The
+// signed receipt is the fifteen-field v2 shape (aep.AEPReceiptV2, aceteam
+// #8253 S3): it binds the input/output/policy digests and the trust verdict
+// (buildAEPReceiptV2 below). The v1 primitive (aep.AEPReceiptV1) is retained
+// but no longer emitted.
 func (h *LLMInferenceHandler) applyTrustEngine(payload *jobs.LLMInferencePayload, jobID string, result *JobResult) {
 	if result == nil || result.Status != JobStatusSuccess || result.Output == nil {
 		return
@@ -1700,9 +1702,9 @@ func groundingGuardrailEnabled() bool {
 // deliberately.
 const signAEPReceiptsEnvVar = "CITADEL_SIGN_AEP_RECEIPTS"
 
-// signAEPReceiptsEnabled reports whether bufferedChatCompletions should
+// signAEPReceiptsEnabled reports whether applyTrustEngine should
 // additionally sign the grounding receipt into a verifiable AEP receipt
-// (internal/aep.AEPReceiptV1). Default OFF, matching this codebase's
+// (internal/aep.AEPReceiptV2). Default OFF, matching this codebase's
 // advisory-signal convention. Inert today in the sense that matters to a
 // verifier: the backend does not yet hold this node's public key to check
 // the signature against (design doc §3/§4, Phase 2, not done here) — see
@@ -1723,7 +1725,7 @@ func signAEPReceiptsEnabled() bool {
 //
 // Takes the GroundingResult directly (rather than running
 // trust.CheckGrounding itself, as this function did before the aep receipt
-// signing addition) so bufferedChatCompletions can compute it ONCE and reuse
+// signing addition) so applyTrustEngine can compute it ONCE and reuse
 // it for both this map and, when CITADEL_SIGN_AEP_RECEIPTS is also on, the
 // signed receipt — trust.CheckGrounding is a pure function of the same
 // (input, output) pair either way, so this is a refactor, not a behavior
