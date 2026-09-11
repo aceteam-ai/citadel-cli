@@ -2461,3 +2461,18 @@ Auto-generated log of every release.
   - feat(aep): 'citadel aep verify' CLI to verify signed receipt signatures (#1035)
 
 
+---
+
+## v2.157.0 — 2026-09-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 5 |
+| Lines added | +448 |
+
+**Changes:**
+
+  - feat(egress): 'citadel egress-relay serve' relay-only mode (no worker/Redis) (#1037)
+
+
