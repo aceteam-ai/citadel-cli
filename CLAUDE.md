@@ -1039,6 +1039,46 @@ citadel mesh chat --model M "hi"    # one-shot chat to a uniquely-named model
 citadel mesh chat --node N "hi"     # pick a node (hostname or mesh IP) explicitly
 ```
 
+### On-node SOCKS5 egress relay + relay-only mode (`citadel egress-relay`, #787/#980/#1033)
+
+The egress relay (`internal/egressrelay`) lets ANOTHER same-org citadel node on
+the mesh tunnel its outbound traffic through THIS node's internet egress — the
+server side of `citadel socks`. It is default OFF, mesh-only
+(`network.ListenVPN`, never a LAN/localhost bind), authorized SOLELY by verified
+same-org mesh-peer identity (`egressRelayMeshResolver` → `network.WhoIsPeer`;
+there is no token/passcode fallback), and refuses to CONNECT into RFC1918 /
+loopback / link-local / `100.64.0.0/10` by default (`resolveEgressAllowLAN`,
+relaxed only via `citadel egress-relay allow-lan on` / `CITADEL_EGRESS_ALLOW_LAN`
+— fail-closed, deliberately no flag to force it off).
+
+**`startEgressRelayListener` (`cmd/egress_relay_server.go`) is the SINGLE
+relay-start implementation** — the SOCKS5/policy/same-org-authz wiring is not
+duplicated. Two callers share it: `startEgressRelay` (the `citadel work`
+auto-start, enable-gated on `workEgressRelay || resolveEgressRelay()` and
+best-effort — a failed optional listener never fails the worker) and
+`egressRelayServe` (`cmd/egress_relay_serve.go`). The `egressRelayIsConnected` /
+`egressRelayListenVPN` package vars are indirection seams so both call sites are
+hermetically testable against a loopback listener + fake mesh IP — swapping the
+ONE `egressRelayListenVPN` seam is observed by both, which is the proof there is
+a single implementation (`cmd/egress_relay_serve_test.go`).
+
+**Relay-only mode — `citadel egress-relay serve` (#1033).** `citadel work
+--egress-relay` starts the relay but `citadel work` ALSO requires a reachable
+Redis job source: it retries then EXITS on connect failure, taking the relay
+down with it — so a node could not be a PURE egress exit without also being a
+full Redis-connected worker. `serve` is a long-running FOREGROUND command
+(mirrors `runWork`'s network-connect + signal/teardown, but with NO Redis, job
+source, or worker loop) that joins the mesh (`VerifyOrReconnect`, with
+`recoverStaleVPN` on `ErrStaleState`; a not-logged-in node gets an actionable
+error pointing at `citadel login`/`citadel init`), starts the shared listener,
+and blocks until SIGINT/SIGTERM (teardown is a single ctx cancel — the relay's
+`Serve` closes its listener on `ctx.Done`; no docker teardown that can hang, so
+unlike `runWork` it needs no grace-period force-exit watchdog, and it never
+`Logout`s — the identity must persist). Being an explicit "be a relay now"
+command, it force-enables the relay (ignores the `egress-relay enable` toggle)
+but still resolves allow_lan only from config/env. #1006's egress harness can
+use `serve` instead of side-installing Redis on the relay host.
+
 ### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
 
 `executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/
@@ -1744,6 +1784,22 @@ wired citadel-side, but the backend does not yet hold this node's public key
 to verify against, and does not yet echo a fabric node ID for `#8139`'s
 `node_id` field to use (it falls back to the signer's own
 `PublicKeyFingerprint` — `aep.ResolveNodeID`'s phasing rule — until it does).
+
+**`citadel aep verify <receipt.json>` (`cmd/aep.go`, citadel-cli#1034) is the
+offline verifier** — the read side of the signing above. `verifyAEPReceipt`
+(the pure core `runAEPVerify` wraps) branches on `receipt_version` to pick
+`aep.Canonicalize` (v1) or `aep.CanonicalizeV2` (v2), resolves a verifying key
+(`--cert` > `--pubkey` > the local node identity via
+`nodeidentity.Convergent(network.GetNodeConfigDir())`), then — the load-bearing
+ordering — recomputes the key's fingerprint and compares it to the receipt's
+`public_key_fingerprint` BEFORE `ecdsa.VerifyASN1`, so "signed by a different
+node" is a distinct reason from "signature is invalid". The fingerprint on both
+sides comes from ONE derivation, `nodeidentity.FingerprintPublicKey` (extracted
+from `Store.PublicKeyFingerprint`, which now calls it), so signer and verifier
+can never drift. `Store.PublicKey()` is the read-only key accessor the default
+path uses: it LOADS (never `GetOrCreateKey`-mints) — a verifier that generated
+identity as a side effect would mask the honest "no key present" failure and
+strand a leafless key for `reconcileFromLegacy` to displace.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -3253,6 +3309,29 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   "unknown" forever rather than erroring. #726's cross-process heartbeat
   freshness marker (`internal/heartbeat/marker.go`) uses `GetNodeConfigDir()`
   for this reason, not `ConfigDir()`.
+
+  **`GetNodeConfigDir()`'s machine-convergence is exactly what makes it unsafe
+  to call directly in a test on a machine that runs a real citadel node
+  (citadel#787's discovery).** It resolves via `getNodeConfigDirFromGlobalConfig`
+  reading `/etc/citadel/config.yaml` (or the platform-equivalent) FIRST, before
+  any owner-home fallback — and that path is NOT `$HOME`-scoped, so a test's
+  `t.Setenv("HOME", tempdir)` does not redirect it on a dev box where
+  `/etc/citadel/config.yaml` already points `node_config_dir` at a real,
+  possibly-live node's directory (this repo's own dev machine is such a box —
+  see the RESUME notes on node 1297). A test that calls
+  `config.SaveX(network.GetNodeConfigDir(), ...)` to seed a scenario silently
+  WRITES into that real node's config, not a sandbox — caught only because the
+  written file was visible afterward, not because any test failed. The fix
+  (see `internal/egressrelay`'s config wiring, `cmd/work.go`'s
+  `resolveEgressRelayFrom`, `internal/jobs.applyEgressRelayConfig`): split any
+  `GetNodeConfigDir()`-backed logic into a pure core taking `configDir string`
+  as an explicit parameter, test the pure core with `t.TempDir()`, and reserve
+  the real `network.GetNodeConfigDir()`-calling wrapper for production wiring
+  (or, at most, a test that only compares the RESOLVED PATH as a string — never
+  one that goes on to read or write through it). A read-only call (e.g.
+  `LoadEgressRelay`) is lower-risk but still resolves the real path; prefer the
+  pure-core split there too rather than relying on "this particular load
+  function happens not to write."
 
   **Device/org config (`device_api_token`, `org_id`, `org_name`, `user_email`,
   `user_name`, `redis_url`, `aceteam_api_key`) is machine-convergent state too
