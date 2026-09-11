@@ -73,10 +73,15 @@ var aepVerifyCmd = &cobra.Command{
 		"The key's fingerprint is compared to the receipt's public_key_fingerprint\n" +
 		"before the signature is checked, so a receipt signed by a different node is\n" +
 		"reported distinctly from a genuinely invalid signature.",
-	Args:          cobra.ExactArgs(1),
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	RunE:          runAEPVerify,
+	Args: cobra.ExactArgs(1),
+	// NOTE: SilenceUsage/SilenceErrors are deliberately NOT set on the literal.
+	// Cobra checks them for EVERY error on the subcommand path, including the
+	// arg/flag validation that runs BEFORE RunE — setting them here would make
+	// `citadel aep verify` (missing arg) or an unknown flag exit non-zero with no
+	// message at all. runAEPVerify sets them itself (cobra reads them after RunE
+	// returns), so only its own already-reported verification failure is
+	// silenced, while genuine usage errors still print normally.
+	RunE: runAEPVerify,
 }
 
 func init() {
@@ -122,13 +127,17 @@ type verifyOutcome struct {
 	ReceiptVersion       string `json:"receipt_version,omitempty"`
 	Reason               string `json:"reason,omitempty"`
 
-	canonical    []byte          `json:"-"`
-	summary      *receiptSummary `json:"-"`
-	keySource    string          `json:"-"`
-	verifyingKey string          `json:"-"` // fingerprint of the resolved verifying key
+	canonical []byte          `json:"-"`
+	summary   *receiptSummary `json:"-"`
+	keySource string          `json:"-"` // human label for where the verifying key came from
 }
 
 func runAEPVerify(cmd *cobra.Command, args []string) error {
+	// Silence cobra's own error/usage printing for whatever THIS function
+	// returns — cobra reads these after RunE returns, so arg/flag validation
+	// (which ran before we got here) is unaffected and still prints normally.
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+
 	opts := verifyOptions{
 		receiptPath: args[0],
 		pubkeyPath:  aepVerifyPubKeyPath,
@@ -167,6 +176,9 @@ func renderVerifyHuman(cmd *cobra.Command, o verifyOutcome) {
 	}
 	fmt.Fprintln(out, "✓ signature valid")
 	fmt.Fprintf(out, "  signed by node   %s\n", o.PublicKeyFingerprint)
+	if o.keySource != "" {
+		fmt.Fprintf(out, "  verifying key    %s\n", o.keySource)
+	}
 	fmt.Fprintf(out, "  receipt version  %s\n", o.ReceiptVersion)
 	if o.summary != nil {
 		s := o.summary
@@ -269,7 +281,6 @@ func verifyAEPReceipt(opts verifyOptions) verifyOutcome {
 		base.Reason = fmt.Sprintf("fingerprint verifying key: %v", err)
 		return base
 	}
-	base.verifyingKey = verifyingFP
 
 	// Fingerprint compare BEFORE signature check: a key that doesn't match the
 	// receipt's claimed signer is a DIFFERENT-NODE error, distinct from an

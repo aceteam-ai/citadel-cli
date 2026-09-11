@@ -276,8 +276,11 @@ func TestVerifyAEPReceipt_UnsupportedVersion(t *testing.T) {
 func TestVerifyAEPReceipt_GoldenCertPath(t *testing.T) {
 	receiptPath := filepath.Join("..", "internal", "aep", "testdata", "v2", "receipt.json")
 	certPath := filepath.Join("..", "internal", "aep", "testdata", "v2", "leaf.pem")
+	// The fixture is committed in-repo, so a missing path is a broken checkout /
+	// moved fixture, not a reason to skip — fail loudly rather than let this
+	// silently pass without exercising cert parsing + independent fingerprint.
 	if _, err := os.Stat(receiptPath); err != nil {
-		t.Skipf("golden fixture not present: %v", err)
+		t.Fatalf("golden fixture not present at %s: %v", receiptPath, err)
 	}
 
 	out := verifyAEPReceipt(verifyOptions{receiptPath: receiptPath, certPath: certPath, nodeKeyFn: mustNotReachNodeIdentity(t)})
