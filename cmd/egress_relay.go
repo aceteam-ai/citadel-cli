@@ -28,7 +28,9 @@ machine). It is default OFF and, even when on, only serves a same-org
 verified mesh peer: there is no token or passcode fallback.
 
 Changes here take effect on the next 'citadel work' start (the relay listener
-is started once at worker startup, not re-evaluated live).`,
+is started once at worker startup, not re-evaluated live). To run a node as a
+PURE egress relay -- no worker, no Redis job source -- use 'citadel egress-relay
+serve' instead (citadel #1033).`,
 }
 
 var egressRelayStatusCmd = &cobra.Command{
@@ -39,7 +41,7 @@ var egressRelayStatusCmd = &cobra.Command{
 		relay := config.LoadEgressRelay(network.GetNodeConfigDir())
 		fmt.Printf("Egress relay:     %s\n", enabledStatusLabel(relay.Enabled))
 		fmt.Printf("Allow LAN/mesh:   %s\n", enabledStatusLabel(relay.AllowLAN))
-		fmt.Printf("Mesh port:        %d (started only by 'citadel work' when enabled)\n", services.EgressRelayPort)
+		fmt.Printf("Mesh port:        %d (started by 'citadel work' when enabled, or by 'citadel egress-relay serve')\n", services.EgressRelayPort)
 		if raw := os.Getenv("CITADEL_EGRESS_RELAY"); raw != "" {
 			fmt.Printf("\nNote: CITADEL_EGRESS_RELAY=%q is set in this shell's environment and overrides\n", raw)
 			fmt.Println("the persisted 'enabled' value for any 'citadel work' started from it.")
