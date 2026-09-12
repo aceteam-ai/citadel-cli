@@ -92,6 +92,29 @@ config:
       uses this target to mount/retarget. NOTE: /config (Frigate's SQLite DB)
       ALWAYS stays on local disk regardless of this value — SQLite corrupts over
       NFS; only /media follows the target.
+  - name: NVR_SEMANTIC_SEARCH
+    description: >-
+      Enable Frigate semantic search (default false). Emits semantic_search:
+      {enabled: true, model: jinav1, model_size: small}, which embeds a thumbnail of
+      every TRACKED object into an on-disk vector index so recordings can be searched
+      by description. Search only covers TRACKED objects, so pair this with
+      NVR_TRACK_OBJECTS — enabling it while only `person` is tracked embeds nothing
+      else. Re-indexing historical thumbnails is a MANUAL one-shot via Frigate's UI:
+      it is CPU-heavy (on a CPU-only detector node it competes with detection, and
+      Frigate recommends >=8GB RAM), and the generator never emits reindex because a
+      static reindex:true would re-run on every reconcile. Embeddings live in the
+      /config SQLite DB, which reconcile never rewrites — only config.yml is
+      regenerated — so they are no longer orphaned on the next reconcile.
+    default: "false"
+  - name: NVR_TRACK_OBJECTS
+    description: >-
+      Comma-separated object labels Frigate tracks (default "person"; e.g.
+      "person,dog,cat"). Frigate tracks only person by default, so a dog/cat/package
+      is otherwise never detected — and, with semantic search on, never searchable.
+      Now a generator input, so a widened track list survives reconcile instead of
+      being clobbered. Valid labels depend on the detector's labelmap (cpu = coco80,
+      openvino = coco_91cl); Frigate rejects an unknown label.
+    default: person
   - name: NVR_MQTT
     description: >-
       Run the node-local MQTT broker and point Frigate at it (default true).

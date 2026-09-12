@@ -2,6 +2,7 @@ package nvr
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -320,6 +321,97 @@ func TestVerifyMediaIsNetworkFS(t *testing.T) {
 	}
 	if !IsNetworkFSMagic(MagicNFS) || IsNetworkFSMagic(magicEXT4) {
 		t.Errorf("IsNetworkFSMagic misclassified NFS/ext4")
+	}
+}
+
+// TestSemanticSearchAndTrackObjects pins the #1039 knobs: both blocks are OPT-IN
+// (absent by default so existing output is unchanged); semantic_search emits
+// enabled/model/model_size but NEVER reindex (a static reindex:true would re-run on
+// every reconcile); and objects.track emits the normalized label list.
+func TestSemanticSearchAndTrackObjects(t *testing.T) {
+	cases := []struct {
+		name         string
+		semantic     bool
+		track        []string
+		wantSemantic bool     // semantic_search block present
+		wantTrack    []string // nil => objects block absent
+	}{
+		{"default: neither block (output unchanged)", false, nil, false, nil},
+		{"semantic on, track untouched", true, nil, true, nil},
+		{"track widened, semantic off", false, []string{"person", "dog", "cat"}, false, []string{"person", "dog", "cat"}},
+		{"both on, messy input normalized", true, ParseTrackObjects("person, DOG ,cat,, dog ,Person"), true, []string{"person", "dog", "cat"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := parseGenerated(t, Config{
+				RetentionDays:  12,
+				Detector:       DetectorOpenVINO,
+				Storage:        StorageSpec{Mode: StorageLocal, Target: "/srv/nvr"},
+				SemanticSearch: tc.semantic,
+				TrackObjects:   tc.track,
+			}, nil)
+
+			ss, hasSS := m["semantic_search"]
+			if tc.wantSemantic {
+				ssm, ok := ss.(map[string]any)
+				if !ok {
+					t.Fatalf("semantic_search block missing/wrong type: %T", ss)
+				}
+				if ssm["enabled"] != true {
+					t.Errorf("semantic_search.enabled = %v, want true", ssm["enabled"])
+				}
+				if ssm["model"] != DefaultSemanticSearchModel {
+					t.Errorf("semantic_search.model = %v, want %s", ssm["model"], DefaultSemanticSearchModel)
+				}
+				if ssm["model_size"] != DefaultSemanticSearchModelSize {
+					t.Errorf("semantic_search.model_size = %v, want %s", ssm["model_size"], DefaultSemanticSearchModelSize)
+				}
+				if _, hasReindex := ssm["reindex"]; hasReindex {
+					t.Errorf("semantic_search MUST NOT emit reindex (a static reindex:true re-runs every reconcile); got %v", ssm["reindex"])
+				}
+			} else if hasSS {
+				t.Errorf("semantic_search block must be absent when disabled; got %v", ss)
+			}
+
+			objs, hasObjs := m["objects"]
+			if tc.wantTrack == nil {
+				if hasObjs {
+					t.Errorf("objects block must be absent when no objects tracked; got %v", objs)
+				}
+			} else {
+				om, ok := objs.(map[string]any)
+				if !ok {
+					t.Fatalf("objects block missing/wrong type: %T", objs)
+				}
+				rawTrack, ok := om["track"].([]any)
+				if !ok {
+					t.Fatalf("objects.track missing/wrong type: %T", om["track"])
+				}
+				got := make([]string, len(rawTrack))
+				for i, v := range rawTrack {
+					got[i], _ = v.(string)
+				}
+				if !reflect.DeepEqual(got, tc.wantTrack) {
+					t.Errorf("objects.track = %v, want %v", got, tc.wantTrack)
+				}
+			}
+		})
+	}
+}
+
+// TestParseTrackObjects covers the NVR_TRACK_OBJECTS parse: trim, lowercase, drop
+// blanks, dedupe (preserving first-seen order), and nil for an empty result.
+func TestParseTrackObjects(t *testing.T) {
+	got := ParseTrackObjects("person, DOG ,cat,, dog ,Person")
+	want := []string{"person", "dog", "cat"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ParseTrackObjects = %v, want %v", got, want)
+	}
+	if got := ParseTrackObjects("   "); got != nil {
+		t.Errorf("all-blank input should yield nil, got %v", got)
+	}
+	if got := ParseTrackObjects(""); got != nil {
+		t.Errorf("empty input should yield nil, got %v", got)
 	}
 }
 

@@ -61,6 +61,15 @@ services:
       - NVR_RETENTION_DAYS=${NVR_RETENTION_DAYS:-12}
       - NVR_STORAGE_MODE=${NVR_STORAGE_MODE:-local}
       - NVR_STORAGE_TARGET=${NVR_STORAGE_TARGET:-}
+      # Frigate semantic search + tracked objects (#1039). These now survive a
+      # reconcile (the generator owns them) instead of being clobbered when set by
+      # hand / via Frigate's config UI. The two are COUPLED: semantic search only
+      # embeds thumbnails of TRACKED objects, so enabling search while only `person`
+      # is tracked embeds nothing else. reindex is NOT emitted (it is a CPU-heavy
+      # one-shot done manually via Frigate's UI; a static reindex:true would re-run
+      # on every reconcile). Embeddings persist in /config (SQLite), not config.yml.
+      - NVR_SEMANTIC_SEARCH=${NVR_SEMANTIC_SEARCH:-false}
+      - NVR_TRACK_OBJECTS=${NVR_TRACK_OBJECTS:-person}
       - NVR_CAMERAS=${NVR_CAMERAS:?nvr requires NVR_CAMERAS (comma-separated camera stream names)}
       # MQTT is Frigate's only real-time event egress (it has no generic outbound
       # webhook), so the module runs a broker and points Frigate at it by default.
