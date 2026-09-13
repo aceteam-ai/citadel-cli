@@ -78,7 +78,7 @@ This model scales from a single workstation under a desk to hundreds of GPU serv
 
 ## Performance
 
-The mesh network is built on the WireGuard protocol, an open standard for encrypted tunneling. In most deployments, nodes establish **direct peer-to-peer connections**, meaning traffic flows directly between machines without passing through any intermediary server. This results in near-native network latency -- typically adding less than 1ms overhead compared to unencrypted connections on the same network.
+The mesh network uses a modern, open encrypted-tunneling standard under the hood. In most deployments, nodes establish **direct peer-to-peer connections**, meaning traffic flows directly between machines without passing through any intermediary server. This results in near-native network latency -- typically adding less than 1ms overhead compared to unencrypted connections on the same network.
 
 When direct connections are not possible (for example, when both nodes are behind symmetric NAT), the network falls back to relay servers that forward encrypted traffic. Relay connections add latency proportional to the distance between the node and the relay, but this is the exception rather than the rule. In practice, the vast majority of node-to-node traffic uses direct connections.
 

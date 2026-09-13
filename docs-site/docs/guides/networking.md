@@ -108,13 +108,13 @@ This sets up a local proxy that forwards requests to a remote node's services, a
 
 Citadel's own commands (`citadel ssh`, `citadel call`, `citadel ping`,
 `citadel proxy`) route over the mesh with no extra setup, because the network
-client is built into the binary. You do not need to install Tailscale or any
-other VPN app to use them.
+client is built into the binary. You do not need to install a separate VPN
+app to use them.
 
-That membership is scoped to the Citadel process, not to your whole machine.
-So an unrelated host tool -- a plain `ssh`, `curl`, `psql`, or your browser --
-will not resolve a peer's network address on its own. Bring the port to
-localhost first:
+By default, that membership is scoped to the Citadel process, not to your
+whole machine. So an unrelated host tool -- a plain `ssh`, `curl`, `psql`, or
+your browser -- will not resolve a peer's network address on its own. Bring
+the port to localhost first:
 
 ```bash
 # Make the peer's port 22 available at localhost:2222, then use plain ssh.
@@ -122,9 +122,10 @@ citadel proxy 2222 gpu-server-01:22
 ssh -p 2222 user@localhost
 ```
 
-`citadel proxy` is the supported answer whenever a non-Citadel program needs to
-talk to a peer service. (Machine-wide routing, which would let any program on
-the host address peers directly, is in development.)
+`citadel proxy` is the supported answer whenever a non-Citadel program needs
+to talk to a peer service. If you want *every* program on the machine --
+`ssh`, a browser, anything -- to reach the network directly with no proxy in
+the middle, see [Machine-Wide Network Mode](./machine-wide-mode.md).
 
 ## Security Model
 
@@ -143,10 +144,25 @@ Expose and proxy commands operate within the mesh network's access control layer
 
 ```
 Traffic flow:
-  Node A (expose :5432)  ──[WireGuard tunnel]──>  Node B (proxy localhost:5432)
+  Node A (expose :5432)  ──[encrypted tunnel]──>  Node B (proxy localhost:5432)
                               │
                          Coordination Server
                          (ACL check + audit log)
 ```
 
-All traffic between nodes is encrypted by the WireGuard protocol. There is no point in the path where data is transmitted in plaintext.
+All traffic between nodes is encrypted end-to-end. There is no point in the path where data is transmitted in plaintext.
+
+## Browser-Based Terminal
+
+For remote shell access that doesn't require an SSH key exchange, a node can
+run a WebSocket terminal server that the AceTeam web console connects to
+directly:
+
+```bash
+citadel terminal-server --org-id my-org-id
+```
+
+This is most commonly used automatically -- `citadel work --terminal` starts
+it alongside the worker, so a node online for jobs is also reachable from the
+console's "Terminal" tab with no extra setup. Sessions are token-authenticated
+and time out after a configurable idle period (default 30 minutes).
