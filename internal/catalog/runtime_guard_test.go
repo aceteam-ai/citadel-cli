@@ -150,7 +150,12 @@ func scanLiteralEngineExecs(t *testing.T, root string) []engineExecSite {
 		}
 		if info.IsDir() {
 			switch info.Name() {
-			case ".git", "vendor", "testdata", "node_modules":
+			// .claude/worktrees holds full nested COPIES of the repo (background
+			// agent worktrees) on a dev checkout; without skipping it the scan
+			// counts their engine execs too and false-fails a LOCAL `go test` /
+			// release, even though CI (a clean checkout with no .claude) is
+			// unaffected (citadel-cli#1051).
+			case ".git", "vendor", "testdata", "node_modules", ".claude":
 				return filepath.SkipDir
 			}
 			return nil
@@ -193,6 +198,39 @@ func scanLiteralEngineExecs(t *testing.T, root string) []engineExecSite {
 		t.Fatalf("walk repo: %v", err)
 	}
 	return sites
+}
+
+// writeGoFileForTest writes content to path, creating parent dirs.
+func writeGoFileForTest(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanLiteralEngineExecs_SkipsNestedClaudeWorktrees pins that the scan does
+// NOT descend into .claude — background-agent worktrees there are full nested
+// repo copies, and counting their engine execs false-failed a local release
+// (citadel-cli#1051). CI is unaffected (clean checkout), so only this hermetic
+// test exercises the skip.
+func TestScanLiteralEngineExecs_SkipsNestedClaudeWorktrees(t *testing.T) {
+	root := t.TempDir()
+	writeGoFileForTest(t, filepath.Join(root, "cmd", "real.go"),
+		"package cmd\nimport \"os/exec\"\nfunc x() { _ = exec.Command(\"docker\", \"ps\") }\n")
+	// A nested worktree copy under .claude that must be skipped in its entirety.
+	writeGoFileForTest(t, filepath.Join(root, ".claude", "worktrees", "agent-x", "cmd", "nested.go"),
+		"package cmd\nimport \"os/exec\"\nfunc y() { _ = exec.Command(\"docker\", \"run\"); _ = exec.CommandContext(nil, \"podman\", \"ps\") }\n")
+
+	sites := scanLiteralEngineExecs(t, root)
+	if len(sites) != 1 {
+		t.Fatalf("expected exactly 1 site (the real one under cmd/), got %d: %+v", len(sites), sites)
+	}
+	if !strings.Contains(sites[0].relPath, "real.go") {
+		t.Fatalf("counted the wrong file (should be the real one, not a .claude copy): %+v", sites[0])
+	}
 }
 
 // literalEngineExecArg reports whether call is exec.Command / exec.CommandContext
