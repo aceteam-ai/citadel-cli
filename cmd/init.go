@@ -143,6 +143,15 @@ and system user configuration (requires sudo).`,
 			os.Exit(1)
 		}
 
+		// On macOS, leave a running, self-updating launchd service behind so the
+		// node worker survives reboot/login (citadel-cli#1043). Registered once,
+		// at the top of Run so it fires on EVERY normal-return success path
+		// (network-only exits and the --provision path alike). os.Exit failure
+		// paths deliberately skip it; the helper additionally refuses to install
+		// when the node isn't configured to run a worker (no creds / network
+		// skipped), so a KeepAlive service can never crash-loop. No-op off darwin.
+		defer maybeInstallDarwinNodeService(choice)
+
 		// If device authorization was selected, run the flow immediately
 		// This shows the authorization box first, before other setup prompts
 		var deviceAuthResult *DeviceAuthResult

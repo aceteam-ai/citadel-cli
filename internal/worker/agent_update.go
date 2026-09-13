@@ -93,6 +93,15 @@ type AgentUpdateConfig struct {
 	// we self-restart; otherwise we report "restart required".
 	IsService func() bool
 
+	// BrewManaged reports whether the running binary is a Homebrew-managed
+	// install on macOS. When true, AGENT_UPDATE does NOT swap the binary in
+	// place (that would corrupt Homebrew's Cellar receipt) -- it returns a
+	// structured "deferred to brew" result instead (citadel-cli#1043). A remote
+	// update deliberately does not shell out to `brew` unattended. Defaults to
+	// update.CurrentBinaryIsHomebrewManaged; on Linux/Windows it is always
+	// false, so this is a no-op there.
+	BrewManaged func() bool
+
 	// Drain stops the runner from fetching new jobs so no work is picked up
 	// between our ack and the restart. Wired to runner.Drain.
 	Drain func()
@@ -173,6 +182,9 @@ func NewAgentUpdateHandler(cfg AgentUpdateConfig) *AgentUpdateHandler {
 	if cfg.IsService == nil {
 		cfg.IsService = defaultIsService
 	}
+	if cfg.BrewManaged == nil {
+		cfg.BrewManaged = update.CurrentBinaryIsHomebrewManaged
+	}
 	if cfg.Restart == nil {
 		cfg.Restart = update.RestartProcess
 	}
@@ -234,6 +246,21 @@ func (h *AgentUpdateHandler) Execute(ctx context.Context, job *Job, stream Strea
 			"reason":      "already-latest",
 			"old_version": h.cfg.Version,
 			"new_version": h.cfg.Version,
+		}), nil
+	}
+
+	// Homebrew-managed nodes (macOS) update through `brew upgrade`, not a remote
+	// in-place swap that would corrupt the Cellar receipt (citadel-cli#1043).
+	// Report a structured, non-error "deferred to brew" terminal state before
+	// downloading anything. ApplyUpdate enforces the same rule as a backstop.
+	if h.cfg.BrewManaged != nil && h.cfg.BrewManaged() {
+		h.cfg.Log("AGENT_UPDATE: %s available but node is Homebrew-managed; deferring to `brew upgrade`", release.TagName)
+		return h.success(map[string]any{
+			"updated":           false,
+			"reason":            "homebrew-managed; update via `brew upgrade citadel`",
+			"old_version":       h.cfg.Version,
+			"new_version":       h.cfg.Version,
+			"available_version": release.TagName,
 		}), nil
 	}
 

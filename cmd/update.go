@@ -188,6 +188,23 @@ func installUpdate() {
 
 	checkSpinner.StopWithSuccess(fmt.Sprintf("Update available: %s -> %s", Version, release.TagName))
 
+	// Homebrew-managed nodes (macOS) update through `brew upgrade`, not an
+	// in-place swap that would corrupt Homebrew's Cellar receipt
+	// (citadel-cli#1043). Detect early -- before downloading an asset we would
+	// never apply -- and print brew guidance instead. ApplyUpdate enforces the
+	// same rule as a backstop.
+	if update.CurrentBinaryIsHomebrewManaged() {
+		fmt.Println()
+		fmt.Println("citadel is installed via Homebrew. Update it through Homebrew so its")
+		fmt.Println("Cellar receipt stays consistent (an in-place binary swap would corrupt it):")
+		fmt.Println()
+		fmt.Printf("  brew upgrade citadel      # updates to %s\n", release.TagName)
+		fmt.Println()
+		fmt.Println("If a managed launchd service is running, restart it afterward to load the")
+		fmt.Println("new binary:  citadel service stop && citadel service start")
+		return
+	}
+
 	// Download update
 	dlSpinner := whimsy.NewSimpleSpinner(whimsy.DownloadMessages)
 	dlSpinner.Start()

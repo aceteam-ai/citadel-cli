@@ -11,7 +11,8 @@ import (
 	"strings"
 )
 
-const launchdLabel = "ai.aceteam.citadel"
+// launchdLabel is defined in launchd_plist.go (non-tagged) so the pure helpers
+// there can share it.
 
 type launchdManager struct{}
 
@@ -43,7 +44,9 @@ func logDir() (string, error) {
 }
 
 // GeneratePlist produces a launchd plist XML string from the given config.
-// Exported so tests can verify the output.
+// Exported so tests can verify the output. It resolves the real home/log dirs
+// and delegates the pure rendering (including the RunAtLoad/KeepAlive
+// reboot-survival keys) to renderLaunchdPlist.
 func GeneratePlist(cfg ServiceConfig) (string, error) {
 	if cfg.Description == "" {
 		cfg.Description = DefaultDescription
@@ -59,42 +62,15 @@ func GeneratePlist(cfg ServiceConfig) (string, error) {
 		return "", err
 	}
 
-	// Build ProgramArguments array.
-	var progArgs strings.Builder
-	progArgs.WriteString(fmt.Sprintf("        <string>%s</string>\n", cfg.ExecPath))
-	for _, a := range cfg.Args {
-		progArgs.WriteString(fmt.Sprintf("        <string>%s</string>\n", a))
-	}
-
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>%s</string>
-    <key>ProgramArguments</key>
-    <array>
-%s    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>%s/citadel.log</string>
-    <key>StandardErrorPath</key>
-    <string>%s/citadel-error.log</string>
-    <key>WorkingDirectory</key>
-    <string>%s</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>%s</string>
-        <key>CITADEL_SERVICE</key>
-        <string>true</string>
-    </dict>
-</dict>
-</plist>
-`, launchdLabel, progArgs.String(), ld, ld, home, home), nil
+	return renderLaunchdPlist(launchdPlistInput{
+		Label:     launchdLabel,
+		ExecPath:  cfg.ExecPath,
+		Args:      cfg.Args,
+		HomeDir:   home,
+		LogDir:    ld,
+		RunAtLoad: true,
+		KeepAlive: true,
+	}), nil
 }
 
 func (m *launchdManager) Install(cfg ServiceConfig) error {
@@ -129,14 +105,25 @@ func (m *launchdManager) Install(cfg ServiceConfig) error {
 		return fmt.Errorf("failed to create log directory: %w", err)
 	}
 
+	// Idempotency: if the plist on disk is already byte-identical and the
+	// service is running, re-running install (e.g. a second `citadel init`)
+	// must not bootout/bootstrap a healthy worker and drop its in-flight jobs.
+	if existing, rerr := os.ReadFile(pp); rerr == nil && string(existing) == plistContent {
+		if st, _ := m.Status(); st != nil && st.Running {
+			fmt.Printf("Citadel service already installed and running (%s).\n", pp)
+			return nil
+		}
+	}
+
 	if err := os.WriteFile(pp, []byte(plistContent), 0644); err != nil {
 		return fmt.Errorf("failed to write plist: %w", err)
 	}
 	fmt.Printf("Created plist: %s\n", pp)
 
-	// Load the service.
-	if err := runCmd("launchctl", "load", pp); err != nil {
-		return fmt.Errorf("launchctl load failed: %w", err)
+	// (Re)load the service via bootout+bootstrap (falling back to legacy
+	// load/unload where bootstrap into a gui/<uid> domain is unavailable).
+	if err := m.reload(pp, cfg.UserMode); err != nil {
+		return fmt.Errorf("launchctl (re)load failed: %w", err)
 	}
 
 	fmt.Println("Citadel service installed and started.")
@@ -148,7 +135,7 @@ func (m *launchdManager) Install(cfg ServiceConfig) error {
 
 	fmt.Println("\nUseful commands:")
 	fmt.Printf("  launchctl list %s            - Check status\n", launchdLabel)
-	fmt.Printf("  launchctl unload %s          - Stop service\n", pp)
+	fmt.Printf("  citadel service stop         - Stop service\n")
 	fmt.Printf("  tail -f %s/citadel.log       - View logs\n", ld)
 	return nil
 }
@@ -161,8 +148,12 @@ func (m *launchdManager) Uninstall() error {
 		return err
 	}
 
-	// Unload (ignore errors — may already be unloaded).
-	_ = runCmd("launchctl", "unload", pp)
+	// Bootout (ignore errors — may already be booted out / not loaded), with a
+	// legacy unload fallback.
+	target := launchdDomainTarget(userMode, resolveLaunchUID())
+	if err := runCmdQuiet("launchctl", bootoutArgs(target, pp)...); err != nil {
+		_ = runCmdQuiet("launchctl", "unload", pp)
+	}
 	fmt.Println("Unloaded citadel service")
 
 	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
@@ -179,7 +170,13 @@ func (m *launchdManager) Start() error {
 	if err != nil {
 		return err
 	}
-	return runCmd("launchctl", "load", pp)
+	target := launchdDomainTarget(userMode, resolveLaunchUID())
+	if err := runCmd("launchctl", bootstrapArgs(target, pp)...); err != nil {
+		// Fallback to the legacy verb (e.g. an SSH session with no Aqua/GUI
+		// session where bootstrap into gui/<uid> fails).
+		return runCmd("launchctl", "load", pp)
+	}
+	return nil
 }
 
 func (m *launchdManager) Stop() error {
@@ -188,7 +185,33 @@ func (m *launchdManager) Stop() error {
 	if err != nil {
 		return err
 	}
-	return runCmd("launchctl", "unload", pp)
+	target := launchdDomainTarget(userMode, resolveLaunchUID())
+	if err := runCmd("launchctl", bootoutArgs(target, pp)...); err != nil {
+		return runCmd("launchctl", "unload", pp)
+	}
+	return nil
+}
+
+// reload (re)loads the plist via bootout+bootstrap, the modern launchctl verbs.
+// bootout is best-effort (the service may not currently be loaded); bootstrap
+// is the meaningful step. If bootstrap fails (e.g. no Aqua session for a
+// gui/<uid> target over SSH), it falls back to the legacy unload+load pair so a
+// manual `citadel service install` still works in those environments.
+func (m *launchdManager) reload(pp string, userMode bool) error {
+	target := launchdDomainTarget(userMode, resolveLaunchUID())
+	_ = runCmdQuiet("launchctl", bootoutArgs(target, pp)...)
+	if err := runCmd("launchctl", bootstrapArgs(target, pp)...); err != nil {
+		_ = runCmdQuiet("launchctl", "unload", pp)
+		return runCmd("launchctl", "load", pp)
+	}
+	return nil
+}
+
+// runCmdQuiet runs a command discarding its output, for best-effort calls (a
+// bootout/unload of a service that may not be loaded prints a noisy
+// "No such process" that should not reach the operator).
+func runCmdQuiet(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
 }
 
 func (m *launchdManager) Status() (*ServiceStatus, error) {

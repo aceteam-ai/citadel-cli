@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -323,6 +324,44 @@ func TestAgentUpdateInstallFailure(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if restarted {
 		t.Error("Restart was armed despite the install failing")
+	}
+}
+
+// TestAgentUpdateHomebrewManagedDefers: on a Homebrew-managed node the handler
+// must NOT download or swap the binary (that would corrupt the Cellar receipt).
+// It returns a structured, non-error "deferred to brew" result and leaves
+// Download/Apply/Restart untouched (citadel-cli#1043).
+func TestAgentUpdateHomebrewManagedDefers(t *testing.T) {
+	var downloaded, applied, restarted bool
+	h := newTestHandler(t, func(c *AgentUpdateConfig) {
+		c.BrewManaged = func() bool { return true }
+		c.Download = func(*update.Release, string) error { downloaded = true; return nil }
+		c.Apply = func(string) error { applied = true; return nil }
+		c.Restart = func() error { restarted = true; return nil }
+	})
+	res, err := h.Execute(context.Background(), agentUpdateJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != JobStatusSuccess {
+		t.Fatalf("status = %v, want success", res.Status)
+	}
+	if downloaded || applied {
+		t.Errorf("brew-managed node must not download/apply (downloaded=%v applied=%v)", downloaded, applied)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if restarted {
+		t.Error("brew-managed node must not self-restart")
+	}
+	if updated, _ := res.Output["updated"].(bool); updated {
+		t.Error(`Output["updated"] must be false when deferring to brew`)
+	}
+	reason, _ := res.Output["reason"].(string)
+	if !strings.Contains(strings.ToLower(reason), "homebrew") {
+		t.Errorf(`Output["reason"] = %q, want it to mention homebrew`, reason)
+	}
+	if av, _ := res.Output["available_version"].(string); av != "v2.47.0" {
+		t.Errorf(`Output["available_version"] = %q, want v2.47.0`, av)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
 // Manager is the platform-specific interface for managing the Citadel
@@ -85,6 +87,16 @@ func DefaultConfig() (ServiceConfig, error) {
 	exePath, err = filepath.EvalSymlinks(exePath)
 	if err != nil {
 		return ServiceConfig{}, fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
+	// On macOS, a Homebrew install resolves (via EvalSymlinks) to a VERSIONED
+	// Cellar path that `brew upgrade` later removes. Bake the STABLE
+	// <prefix>/bin/citadel symlink into the service instead, so a launchd
+	// plist keeps pointing at a valid binary across `brew upgrade`
+	// (citadel-cli#1043). A non-Homebrew install (curl|bash into ~/.local/bin
+	// or /usr/local/bin) is already stable and left unchanged.
+	if runtime.GOOS == "darwin" {
+		exePath, _ = update.StableDarwinExecPath(exePath)
 	}
 
 	cfg := ServiceConfig{

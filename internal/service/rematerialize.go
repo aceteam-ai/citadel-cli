@@ -3,7 +3,6 @@
 package service
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -307,43 +306,4 @@ func RematerializeManagedUnits(logf func(format string, args ...any)) ([]string,
 	}
 
 	return rewritten, nil
-}
-
-// backupUnit copies the current unit to <path>.citadel-bak so an operator can
-// restore their exact prior file. Best-effort atomicity: we write the backup
-// fully before the caller overwrites the original.
-func backupUnit(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path+".citadel-bak", data, 0o644)
-}
-
-// writeUnitFile atomically writes unit content, preserving the 0644 perms systemd
-// units use. Writes to a temp file in the same directory then renames, so a crash
-// mid-write can never leave a truncated (unparseable) unit.
-func writeUnitFile(path, content string) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".citadel-unit-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename unit into place: %w", err)
-	}
-	return nil
 }

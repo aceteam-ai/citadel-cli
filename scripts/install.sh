@@ -287,6 +287,31 @@ main() {
   if [ "$INSTALL_MODE" = "user" ]; then
     echo "  Location: ${INSTALL_DIR}/${BINARY_NAME}" >&2
 
+    # macOS: run `citadel init` now so it connects to the network AND installs
+    # the launchd service that keeps the node worker running across reboot/login
+    # (citadel-cli#1043). `citadel init` installs the service ONLY after it has
+    # connected and confirmed credentials, so this never leaves a crash-looping
+    # worker behind. Mirrors the system-mode auto-init branch below.
+    local os
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    if [ "$os" = "darwin" ]; then
+      # Persist PATH for future terminals first (best-effort).
+      if ! is_in_path "$INSTALL_DIR"; then
+        add_to_path || true
+      fi
+      if [ -t 0 ] && [ -t 1 ]; then
+        echo "" >&2
+        msg "Starting device setup (installs the background launchd service)..."
+        echo "" >&2
+        "${INSTALL_DIR}/${BINARY_NAME}" init
+      else
+        echo "" >&2
+        echo "  To provision this node and install the background service, run:" >&2
+        echo "      ${INSTALL_DIR}/${BINARY_NAME} init" >&2
+      fi
+      return
+    fi
+
     if is_in_path "$INSTALL_DIR"; then
       # Already on PATH: the bare `citadel` command works immediately.
       echo "" >&2

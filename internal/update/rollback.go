@@ -53,6 +53,17 @@ func ApplyUpdate(newBinaryPath string) error {
 		return fmt.Errorf("failed to get current binary path: %w", err)
 	}
 
+	// Homebrew guard (citadel-cli#1043): refuse the in-place swap when the
+	// running binary is Homebrew-managed on macOS -- overwriting the Cellar file
+	// would corrupt Homebrew's receipt. This check goes BEFORE BackupCurrent so
+	// we don't copy the Cellar binary to .previous for an update we won't apply.
+	// It is the single chokepoint that protects every caller (the CLI, the
+	// auto-updater, the AGENT_UPDATE handler); callers branch on ErrHomebrewManaged
+	// to render `brew upgrade` guidance instead of a generic failure.
+	if IsHomebrewManagedPath(currentPath, runtime.GOOS) {
+		return ErrHomebrewManaged
+	}
+
 	// 1. Backup current binary
 	if err := BackupCurrent(); err != nil {
 		return fmt.Errorf("failed to backup current binary: %w", err)
@@ -101,6 +112,15 @@ func Rollback() error {
 	currentPath, err := GetCurrentBinaryPath()
 	if err != nil {
 		return fmt.Errorf("failed to get current binary path: %w", err)
+	}
+
+	// Same Homebrew guard as ApplyUpdate (citadel-cli#1043): never swap the
+	// Cellar binary in place, even on a rollback. In practice a Homebrew node
+	// never has a .previous binary to roll back to (ApplyUpdate refuses before
+	// creating one), so this is defense-in-depth against a .previous left by an
+	// older, pre-guard binary.
+	if IsHomebrewManagedPath(currentPath, runtime.GOOS) {
+		return ErrHomebrewManaged
 	}
 
 	// Restore previous binary
