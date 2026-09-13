@@ -326,6 +326,97 @@ func TestSettingsRender_CheckboxReflectsState(t *testing.T) {
 	}
 }
 
+// newTestEgressRelaySettings wires a SettingsPage to an in-memory egress-relay
+// store, mirroring newTestSettings above.
+func newTestEgressRelaySettings() (*SettingsPage, *config.EgressRelay) {
+	store := config.DefaultEgressRelay()
+	cb := SettingsCallbacks{
+		LoadEgressRelay: func() *config.EgressRelay {
+			cp := *store
+			return &cp
+		},
+		SaveEgressRelay: func(e *config.EgressRelay) error {
+			*store = *e
+			return nil
+		},
+	}
+	p := NewSettingsPage(cb, fakeConnStatus{endpoint: "wss://aceteam.ai", state: ConnConnected})
+	return p, store
+}
+
+// TestSettingsToggleEgressRelay_PersistsToLoadEgressRelaySaveEgressRelay pins
+// that the egress-relay toggles actually call SaveEgressRelay: reverting the
+// toggle to a load-only no-op (dropping the Save call) leaves store.Enabled
+// false and fails this test.
+func TestSettingsToggleEgressRelay_PersistsToLoadEgressRelaySaveEgressRelay(t *testing.T) {
+	p, store := newTestEgressRelaySettings()
+	p.reloadEgressRelay()
+
+	if p.egressRelay.Enabled || p.egressRelay.AllowLAN {
+		t.Fatalf("expected default off/off, got %+v", p.egressRelay)
+	}
+
+	p.toggleEgressRelay()
+	if !p.egressRelay.Enabled {
+		t.Error("in-memory state should be enabled after toggle")
+	}
+	if !store.Enabled {
+		t.Error("persisted store should be enabled after toggle")
+	}
+
+	p.toggleEgressRelay()
+	if p.egressRelay.Enabled {
+		t.Error("in-memory state should be disabled after second toggle")
+	}
+	if store.Enabled {
+		t.Error("persisted store should be disabled after second toggle")
+	}
+}
+
+// TestSettingsToggleEgressAllowLAN_PreservesEnabledField pins that toggling
+// allow_lan does not clobber a previously-persisted enabled=true (the
+// copy-and-flip-one-field pattern, mirroring toggleMeeting's own comment).
+func TestSettingsToggleEgressAllowLAN_PreservesEnabledField(t *testing.T) {
+	p, store := newTestEgressRelaySettings()
+	p.reloadEgressRelay()
+
+	p.toggleEgressRelay() // enabled=true, allow_lan=false
+	if !store.Enabled || store.AllowLAN {
+		t.Fatalf("expected enabled=true, allow_lan=false after first toggle, got %+v", store)
+	}
+
+	p.toggleEgressAllowLAN() // allow_lan=true, enabled must stay true
+	if !store.Enabled {
+		t.Error("toggling allow_lan must not clear enabled")
+	}
+	if !store.AllowLAN {
+		t.Error("persisted store should have allow_lan enabled after toggle")
+	}
+}
+
+func TestSettingsToggleEgressRelay_SaveErrorKeepsState(t *testing.T) {
+	saved := false
+	cb := SettingsCallbacks{
+		LoadEgressRelay: config.DefaultEgressRelay,
+		SaveEgressRelay: func(*config.EgressRelay) error {
+			saved = true
+			return errTestSave
+		},
+	}
+	p := NewSettingsPage(cb, nil)
+	p.Build(nil)
+	p.reloadEgressRelay()
+
+	p.toggleEgressRelay()
+	if !saved {
+		t.Fatal("expected SaveEgressRelay to be called")
+	}
+	got := p.view.GetText(true)
+	if !strings.Contains(got, "Failed to save") {
+		t.Errorf("expected save-error message in rendered view, got:\n%s", got)
+	}
+}
+
 func TestWSSEndpoint_HidesRedisTransport(t *testing.T) {
 	cases := map[string]string{
 		"https://aceteam.ai":          "wss://aceteam.ai",
