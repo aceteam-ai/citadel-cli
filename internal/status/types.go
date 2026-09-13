@@ -533,6 +533,16 @@ type GPUMetrics struct {
 	UtilizationPercent float64 `json:"utilization_percent,omitempty"`
 	TemperatureCelsius int     `json:"temperature_celsius,omitempty"`
 	Driver             string  `json:"driver,omitempty"`
+	// Unified is true for an Apple Silicon integrated GPU that shares one
+	// unified memory pool with the CPU (citadel-cli#1042). When set, the
+	// Memory*MB fields report the SYSTEM's total/used/available RAM (the actual
+	// shared pool) rather than dedicated VRAM. Consumers that must distinguish
+	// dedicated VRAM from a shared pool gate on this flag.
+	Unified bool `json:"unified,omitempty"`
+	// Cores is the GPU core count for an Apple Silicon integrated GPU
+	// (system_profiler's "Total Number of Cores:"). Zero for a discrete GPU or
+	// when unknown.
+	Cores int `json:"cores,omitempty"`
 }
 
 // ServiceInfo contains information about a running service.

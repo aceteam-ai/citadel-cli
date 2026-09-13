@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // GPUInfo represents information about a detected GPU
@@ -26,6 +28,18 @@ type GPUInfo struct {
 	// exists to prevent an OOM placement. Empty when unknown (e.g. the Metal
 	// detector on macOS, which does not query it).
 	MemoryFree string
+	// Cores is the GPU core count reported by the macOS Metal detector
+	// (system_profiler's "Total Number of Cores:"). Apple Silicon reports a GPU
+	// core count instead of a discrete VRAM figure; it is kept here as a
+	// structured integer rather than being formatted into Memory as text
+	// (citadel-cli#1042 — the old code wrote "N cores" into Memory, which then
+	// failed the numeric MemoryTotalMB parse downstream). Zero when unknown.
+	Cores int
+	// Unified is true for an Apple Silicon integrated GPU that shares one
+	// unified memory pool with the CPU (no discrete VRAM). Consumers use it to
+	// report a unified-memory budget instead of dedicated VRAM and to avoid
+	// treating the node as a discrete-GPU node for CUDA queue routing.
+	Unified bool
 }
 
 // GPUDetector interface defines operations for GPU detection
@@ -267,39 +281,21 @@ func (d *DarwinGPUDetector) getGPUInfoText() ([]GPUInfo, error) {
 		return nil, fmt.Errorf("failed to query GPU info: %w", err)
 	}
 
-	lines := strings.Split(string(output), "\n")
-	gpus := []GPUInfo{}
-	var currentGPU *GPUInfo
+	gpus := parseDarwinGPUInfo(string(output))
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		if strings.HasPrefix(line, "Chipset Model:") {
-			if currentGPU != nil {
-				gpus = append(gpus, *currentGPU)
-			}
-			currentGPU = &GPUInfo{
-				Name: strings.TrimSpace(strings.TrimPrefix(line, "Chipset Model:")),
-			}
-		} else if currentGPU != nil {
-			if strings.HasPrefix(line, "VRAM (Total):") || strings.HasPrefix(line, "Total Number of Cores:") {
-				memStr := strings.TrimSpace(strings.TrimPrefix(line, "VRAM (Total):"))
-				if memStr == "" {
-					memStr = strings.TrimSpace(strings.TrimPrefix(line, "Total Number of Cores:"))
-					if memStr != "" {
-						currentGPU.Memory = memStr + " cores"
-					}
-				} else {
-					currentGPU.Memory = memStr
-				}
-			} else if strings.HasPrefix(line, "Metal:") {
-				currentGPU.Driver = "Metal " + strings.TrimSpace(strings.TrimPrefix(line, "Metal:"))
+	// Apple Silicon reports no discrete VRAM line, so parseDarwinGPUInfo leaves
+	// Memory empty for a unified GPU. Enrich it here (live-host only, kept out
+	// of the pure parser) with the total unified-memory pool so `citadel status`
+	// shows a real memory figure instead of nothing. This is the TRUE pool (the
+	// display=heartbeat=full-pool half of the three-quantity contract on
+	// unifiedMemoryBudgetFraction; the vram:<n>gb routing tag uses the 0.75x
+	// budget instead).
+	if total := TotalRAMBytes(); total > 0 {
+		for i := range gpus {
+			if gpus[i].Unified && gpus[i].Memory == "" {
+				gpus[i].Memory = fmt.Sprintf("%d MB", total/(1024*1024))
 			}
 		}
-	}
-
-	if currentGPU != nil {
-		gpus = append(gpus, *currentGPU)
 	}
 
 	if len(gpus) == 0 {
@@ -307,6 +303,111 @@ func (d *DarwinGPUDetector) getGPUInfoText() ([]GPUInfo, error) {
 	}
 
 	return gpus, nil
+}
+
+// parseDarwinGPUInfo parses the output of `system_profiler SPDisplaysDataType`
+// into GPUInfo values. It is pure (no exec, no host state) so the parsing is
+// unit-testable off a captured fixture. It keys only on the four line prefixes
+// the macOS tool emits that this codebase already relies on: "Chipset Model:",
+// "Total Number of Cores:", "VRAM (Total):", and "Metal:".
+//
+// Apple Silicon reports a GPU core count and NO discrete VRAM line, so the core
+// count is stored in GPUInfo.Cores (not formatted into Memory — citadel-cli#1042)
+// and Unified is set. An Intel Mac's discrete GPU reports a real "VRAM (Total):"
+// line, which populates Memory with Unified left false.
+func parseDarwinGPUInfo(output string) []GPUInfo {
+	lines := strings.Split(output, "\n")
+	gpus := []GPUInfo{}
+	var currentGPU *GPUInfo
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		switch {
+		case strings.HasPrefix(line, "Chipset Model:"):
+			if currentGPU != nil {
+				gpus = append(gpus, *currentGPU)
+			}
+			name := strings.TrimSpace(strings.TrimPrefix(line, "Chipset Model:"))
+			currentGPU = &GPUInfo{
+				Name:    name,
+				Unified: isAppleSiliconChipset(name),
+			}
+		case currentGPU == nil:
+			// Ignore any lines before the first "Chipset Model:".
+		case strings.HasPrefix(line, "VRAM (Total):"):
+			if v := strings.TrimSpace(strings.TrimPrefix(line, "VRAM (Total):")); v != "" {
+				currentGPU.Memory = v
+			}
+		case strings.HasPrefix(line, "Total Number of Cores:"):
+			if v := strings.TrimSpace(strings.TrimPrefix(line, "Total Number of Cores:")); v != "" {
+				if fields := strings.Fields(v); len(fields) > 0 {
+					if n, err := strconv.Atoi(fields[0]); err == nil {
+						currentGPU.Cores = n
+					}
+				}
+			}
+		case strings.HasPrefix(line, "Metal:"):
+			currentGPU.Driver = "Metal " + strings.TrimSpace(strings.TrimPrefix(line, "Metal:"))
+		}
+	}
+
+	if currentGPU != nil {
+		gpus = append(gpus, *currentGPU)
+	}
+
+	return gpus
+}
+
+// isAppleSiliconChipset reports whether a system_profiler "Chipset Model" names
+// an Apple Silicon integrated GPU (e.g. "Apple M1", "Apple M2 Max", "Apple M3
+// Pro"). An Intel Mac reports an Intel/AMD chipset here instead, so this stays
+// false for a discrete GPU with a real VRAM line.
+func isAppleSiliconChipset(name string) bool {
+	return strings.HasPrefix(strings.TrimSpace(name), "Apple M")
+}
+
+// AppleGPUFamily normalizes an Apple Silicon chipset model into a lowercase,
+// tag-safe family identifier used for the gpu:apple-<family> capability tag:
+// "Apple M2 Max" -> "m2-max", "Apple M1" -> "m1". Returns "" for a chipset that
+// is not Apple Silicon (e.g. an Intel Mac's discrete GPU), so callers never
+// mint an apple tag for non-Apple-Silicon hardware.
+func AppleGPUFamily(chipset string) string {
+	chipset = strings.TrimSpace(chipset)
+	if !isAppleSiliconChipset(chipset) {
+		return ""
+	}
+	fam := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(chipset, "Apple")))
+	return strings.Join(strings.Fields(fam), "-")
+}
+
+// unifiedMemoryBudgetFraction is the conservative fraction of total unified
+// memory advertised as the usable GPU budget for the vram:<n>gb routing tag on
+// Apple Silicon. macOS lets Metal use most of unified memory but reserves a
+// portion for the OS (Metal's recommendedMaxWorkingSetSize is roughly this on
+// current Apple Silicon). This is a provisioning ESTIMATE, not a measured value
+// (citadel-cli#1042) — it should be calibrated against a real Mac's
+// recommendedMaxWorkingSetSize. Pinned by TestUnifiedMemoryBudgetMB.
+//
+// Three DELIBERATELY-DIFFERENT unified-memory quantities exist for a Mac; this
+// is the single place that states the contract so `citadel status` (24 GB) vs
+// `citadel capabilities` (18 GB) does not read as a bug:
+//   - `citadel status` display (GPUInfo.Memory, enriched in getGPUInfoText) and
+//     the heartbeat (status.GPUMetrics.MemoryTotalMB) both report the FULL pool
+//     (total RAM) — the honest true size of the shared memory.
+//   - the vram:<n>gb ROUTING tag reports this 0.75x budget — the conservative
+//     usable capacity a scheduler should place against.
+const unifiedMemoryBudgetFraction = 0.75
+
+// UnifiedMemoryBudgetMB returns a conservative usable GPU memory budget in MB
+// for an Apple Silicon node with totalRAMBytes of unified memory. Returns 0 for
+// a zero/unknown input (no fabricated value).
+func UnifiedMemoryBudgetMB(totalRAMBytes uint64) int {
+	if totalRAMBytes == 0 {
+		return 0
+	}
+	totalMB := float64(totalRAMBytes) / (1024 * 1024)
+	return int(totalMB * unifiedMemoryBudgetFraction)
 }
 
 // FormatGPUInfo returns a human-readable string representation of GPU info
@@ -333,6 +434,17 @@ func FormatGPUInfo(gpus []GPUInfo) string {
 	}
 
 	return sb.String()
+}
+
+// TotalRAMBytes returns total physical RAM in bytes, or 0 when unavailable. It
+// uses gopsutil's mem.VirtualMemory().Total — the same source internal/status
+// uses for MemoryTotalGB — so the unified-memory figures reported by the
+// capabilities layer and the heartbeat agree.
+func TotalRAMBytes() uint64 {
+	if v, err := mem.VirtualMemory(); err == nil {
+		return v.Total
+	}
+	return 0
 }
 
 // GetGPUCountSimple is a helper function that returns the number of GPUs or 0 if detection fails
