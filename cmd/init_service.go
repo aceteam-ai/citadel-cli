@@ -62,8 +62,13 @@ func maybeInstallDarwinNodeService(choice nexus.NetworkChoice) {
 
 	mgr := service.NewManager()
 	if err := mgr.Install(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Could not install the launchd node service: %v\n", err)
-		fmt.Fprintln(os.Stderr, "   Install it manually with: citadel service install")
+		// The plist is written before the launchctl (re)load is attempted, so a
+		// load failure here (e.g. bootstrap into gui/<uid> from an SSH session
+		// with no Aqua session) still leaves a RunAtLoad service that launchd
+		// will start at the next login/reboot -- it just isn't loaded right now.
+		fmt.Fprintf(os.Stderr, "⚠️  Installed the launchd service but could not start it now: %v\n", err)
+		fmt.Fprintln(os.Stderr, "   It will start automatically at the next login/reboot.")
+		fmt.Fprintln(os.Stderr, "   To start it now, run: citadel service start")
 		return
 	}
 	if cfg.UserMode {

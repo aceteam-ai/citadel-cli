@@ -20,6 +20,12 @@ import (
 // here.
 const launchdLabel = "ai.aceteam.citadel"
 
+// launchdServicePATH is the PATH baked into the launchd service so `citadel
+// work` can resolve `docker` (Docker Desktop, /usr/local/bin) and `brew`
+// (/opt/homebrew/bin on Apple Silicon) -- neither is on launchd's minimal
+// default PATH. Ordered Homebrew-first so an Apple-Silicon `brew` wins.
+const launchdServicePATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 // launchdPlistInput is the fully-resolved set of values needed to render a
 // launchd plist, with no I/O -- the darwin Manager resolves the real home/log
 // dirs and calls renderLaunchdPlist, so rendering stays pure.
@@ -31,6 +37,12 @@ type launchdPlistInput struct {
 	LogDir    string
 	RunAtLoad bool
 	KeepAlive bool
+	// PathEnv, when non-empty, is set as the service's PATH environment
+	// variable. launchd hands a job a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+	// that does NOT include Homebrew (/opt/homebrew/bin) or Docker Desktop
+	// (/usr/local/bin), so `citadel work` cannot resolve `docker`/`brew` without
+	// this -- the service would heartbeat but fail every compose/service job.
+	PathEnv string
 }
 
 // xmlEscape escapes a value for inclusion in a plist <string>. A home dir or
@@ -62,6 +74,14 @@ func renderLaunchdPlist(in launchdPlistInput) string {
 		progArgs.WriteString(fmt.Sprintf("        <string>%s</string>\n", xmlEscape(a)))
 	}
 
+	// Environment variables: HOME + CITADEL_SERVICE always; PATH only when set.
+	var envVars strings.Builder
+	envVars.WriteString(fmt.Sprintf("        <key>HOME</key>\n        <string>%s</string>\n", xmlEscape(in.HomeDir)))
+	if in.PathEnv != "" {
+		envVars.WriteString(fmt.Sprintf("        <key>PATH</key>\n        <string>%s</string>\n", xmlEscape(in.PathEnv)))
+	}
+	envVars.WriteString("        <key>CITADEL_SERVICE</key>\n        <string>true</string>\n")
+
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -83,16 +103,12 @@ func renderLaunchdPlist(in launchdPlistInput) string {
     <string>%s</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>HOME</key>
-        <string>%s</string>
-        <key>CITADEL_SERVICE</key>
-        <string>true</string>
-    </dict>
+%s    </dict>
 </dict>
 </plist>
 `, xmlEscape(in.Label), progArgs.String(),
 		plistBool(in.RunAtLoad), plistBool(in.KeepAlive),
-		xmlEscape(in.LogDir), xmlEscape(in.LogDir), xmlEscape(in.HomeDir), xmlEscape(in.HomeDir))
+		xmlEscape(in.LogDir), xmlEscape(in.LogDir), xmlEscape(in.HomeDir), envVars.String())
 }
 
 // launchdDomainTarget returns the launchctl domain target for a service:

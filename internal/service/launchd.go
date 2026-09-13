@@ -70,6 +70,7 @@ func GeneratePlist(cfg ServiceConfig) (string, error) {
 		LogDir:    ld,
 		RunAtLoad: true,
 		KeepAlive: true,
+		PathEnv:   launchdServicePATH,
 	}), nil
 }
 

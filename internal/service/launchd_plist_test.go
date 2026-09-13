@@ -18,19 +18,22 @@ func TestRenderLaunchdPlist(t *testing.T) {
 		LogDir:    "/Users/jason/Library/Logs/citadel",
 		RunAtLoad: true,
 		KeepAlive: true,
+		PathEnv:   launchdServicePATH,
 	})
 
 	mustContain := []string{
 		"<string>ai.aceteam.citadel</string>",
 		"<string>/opt/homebrew/bin/citadel</string>",
 		"<string>work</string>",
-		"<key>RunAtLoad</key>",
-		"<key>KeepAlive</key>",
 		"<key>CITADEL_SERVICE</key>",
 		"<string>true</string>",
 		"/Users/jason/Library/Logs/citadel/citadel.log",
 		"/Users/jason/Library/Logs/citadel/citadel-error.log",
 		`<?xml version="1.0"`,
+		// PATH must include Homebrew + Docker Desktop dirs (launchd's minimal
+		// default PATH omits both, breaking every docker/brew job).
+		"<key>PATH</key>",
+		"/opt/homebrew/bin:/usr/local/bin",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(out, want) {
@@ -38,12 +41,14 @@ func TestRenderLaunchdPlist(t *testing.T) {
 		}
 	}
 
-	// RunAtLoad and KeepAlive must be <true/> (reboot/login survival), not <false/>.
-	if strings.Contains(out, "<key>RunAtLoad</key>\n    <false/>") {
-		t.Error("RunAtLoad must be true for boot/login survival")
+	// RunAtLoad and KeepAlive must be present AND true (reboot/login survival):
+	// assert the exact key+value pair so a template emitting the key with a
+	// missing/false value fails.
+	if !strings.Contains(out, "<key>RunAtLoad</key>\n    <true/>") {
+		t.Errorf("RunAtLoad must be <true/> for boot/login survival:\n%s", out)
 	}
-	if strings.Contains(out, "<key>KeepAlive</key>\n    <false/>") {
-		t.Error("KeepAlive must be true so the worker is relaunched on exit")
+	if !strings.Contains(out, "<key>KeepAlive</key>\n    <true/>") {
+		t.Errorf("KeepAlive must be <true/> so the worker is relaunched on exit:\n%s", out)
 	}
 }
 
