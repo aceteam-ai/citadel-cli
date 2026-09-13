@@ -3,8 +3,8 @@ package jobs
 
 import (
 	"fmt"
-	"os/exec"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -16,6 +16,6 @@ func (h *OllamaPullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, err
 		return nil, fmt.Errorf("job payload missing 'model' field")
 	}
 	ctx.Log("info", "     - [Job %s] Pulling Ollama model '%s'", job.ID, model)
-	cmd := exec.Command("docker", "exec", "citadel-ollama", "ollama", "pull", model)
+	cmd := catalog.SelectContainerRuntime().EngineCommand("exec", "citadel-ollama", "ollama", "pull", model)
 	return cmd.CombinedOutput()
 }

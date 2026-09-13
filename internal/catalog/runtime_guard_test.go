@@ -35,7 +35,7 @@ import (
 // may tighten it to `==` once the baseline reaches its irreducible carve-outs.
 // Those carve-outs (why each remains) are documented in the PR and summarized in
 // remainingCarveOuts below.
-const literalEngineExecBaseline = 55
+const literalEngineExecBaseline = 42
 
 // remainingCarveOuts documents, by "path:function" hint, the sites intended to
 // remain on the baseline after conversion and why. It is informational; the

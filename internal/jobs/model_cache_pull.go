@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
@@ -45,7 +46,7 @@ func runOllamaPull(modelName string) ([]byte, error) {
 func runOllamaPullViaDocker(containerName, modelName string) ([]byte, error) {
 	cctx, cancel := context.WithTimeout(context.Background(), ollamaPullTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "docker", "exec", containerName, "ollama", "pull", modelName)
+	cmd := catalog.SelectContainerRuntime().EngineCommandContext(cctx, "exec", containerName, "ollama", "pull", modelName)
 	return cmd.CombinedOutput()
 }
 
