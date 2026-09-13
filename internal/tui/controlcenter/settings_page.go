@@ -45,6 +45,17 @@ type SettingsCallbacks struct {
 	LoadMeeting func() *config.Meeting
 	// SaveMeeting persists an updated meeting-capability setting.
 	SaveMeeting func(*config.Meeting) error
+
+	// LoadEgressRelay returns the current persisted egress-relay setting.
+	// Wired from cmd against network.GetNodeConfigDir() -- NOT
+	// platform.ConfigDir() like the other Settings callbacks -- so this page
+	// converges on the SAME persisted value as the CLI (`citadel
+	// egress-relay`), the local MCP tools, and APPLY_DEVICE_CONFIG (citadel
+	// #787/#980/#979).
+	LoadEgressRelay func() *config.EgressRelay
+	// SaveEgressRelay persists an updated egress-relay setting.
+	SaveEgressRelay func(*config.EgressRelay) error
+
 	// SetFullscreenEnabled is the injection seam for applying the fullscreen
 	// preference on the running app. Unlike mouse capture, tview cannot swap the
 	// terminal's alternate-screen mode mid-run, so today this is a no-op seam that
@@ -71,11 +82,12 @@ type SettingsPage struct {
 	connStatus connStatusProvider
 
 	// State
-	telemetry *config.Telemetry
-	keepAwake *config.KeepAwake
-	mouse     *config.Mouse
-	rendering *config.Rendering
-	meeting   *config.Meeting
+	telemetry   *config.Telemetry
+	keepAwake   *config.KeepAwake
+	mouse       *config.Mouse
+	rendering   *config.Rendering
+	meeting     *config.Meeting
+	egressRelay *config.EgressRelay
 
 	// UI
 	root *tview.Flex
@@ -122,6 +134,7 @@ func (p *SettingsPage) OnActivate() {
 	p.reloadMouse()
 	p.reloadRendering()
 	p.reloadMeeting()
+	p.reloadEgressRelay()
 	p.render()
 	if p.app != nil && p.view != nil {
 		p.app.SetFocus(p.view)
@@ -133,8 +146,8 @@ func (p *SettingsPage) OnDeactivate() {}
 
 // HandleInput implements Page. Numbered toggles (numbers + arrows convention, no
 // letter shortcuts): 1=mouse control, 2=fullscreen rendering, 3=anonymous
-// telemetry opt-out, 4=keep-awake-on-AC, 5=meeting capability opt-out.
-// Space/Enter also toggle telemetry.
+// telemetry opt-out, 4=keep-awake-on-AC, 5=meeting capability opt-out,
+// 6=egress relay, 7=egress relay allow-LAN. Space/Enter also toggle telemetry.
 func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch {
 	case event.Key() == tcell.KeyRune && event.Rune() == '1':
@@ -151,6 +164,12 @@ func (p *SettingsPage) HandleInput(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case event.Key() == tcell.KeyRune && event.Rune() == '5':
 		p.toggleMeeting()
+		return nil
+	case event.Key() == tcell.KeyRune && event.Rune() == '6':
+		p.toggleEgressRelay()
+		return nil
+	case event.Key() == tcell.KeyRune && event.Rune() == '7':
+		p.toggleEgressAllowLAN()
 		return nil
 	case event.Key() == tcell.KeyRune && event.Rune() == ' ':
 		p.toggleTelemetry()
@@ -253,6 +272,64 @@ func (p *SettingsPage) toggleMeeting() {
 		}
 	}
 	p.meeting = next
+	p.render()
+}
+
+// reloadEgressRelay refreshes the in-memory egress-relay setting from disk.
+func (p *SettingsPage) reloadEgressRelay() {
+	if p.cb.LoadEgressRelay != nil {
+		p.egressRelay = p.cb.LoadEgressRelay()
+	}
+	if p.egressRelay == nil {
+		p.egressRelay = config.DefaultEgressRelay()
+	}
+}
+
+// toggleEgressRelay flips the egress relay's enabled setting and persists it.
+// Takes effect on the next `citadel work` start (the relay listener is
+// started once at worker startup, not re-evaluated live).
+func (p *SettingsPage) toggleEgressRelay() {
+	if p.egressRelay == nil {
+		p.reloadEgressRelay()
+	}
+
+	// Copy and flip only Enabled -- a fresh &config.EgressRelay{Enabled: ...}
+	// would zero AllowLAN on save (no omitempty), silently reverting it.
+	nextVal := *p.egressRelay
+	nextVal.Enabled = !p.egressRelay.Enabled
+	next := &nextVal
+
+	if p.cb.SaveEgressRelay != nil {
+		if err := p.cb.SaveEgressRelay(next); err != nil {
+			p.egressRelay = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.egressRelay = next
+	p.render()
+}
+
+// toggleEgressAllowLAN flips the egress relay's allow-LAN setting and
+// persists it. Takes effect on the next `citadel work` start, same as
+// toggleEgressRelay.
+func (p *SettingsPage) toggleEgressAllowLAN() {
+	if p.egressRelay == nil {
+		p.reloadEgressRelay()
+	}
+
+	nextVal := *p.egressRelay
+	nextVal.AllowLAN = !p.egressRelay.AllowLAN
+	next := &nextVal
+
+	if p.cb.SaveEgressRelay != nil {
+		if err := p.cb.SaveEgressRelay(next); err != nil {
+			p.egressRelay = next
+			p.renderWithError(fmt.Sprintf("Failed to save: %v", err))
+			return
+		}
+	}
+	p.egressRelay = next
 	p.render()
 }
 
@@ -416,6 +493,17 @@ func (p *SettingsPage) renderWithError(errMsg string) {
 	sb.WriteString("   the audio + browser deps are present. Opting out drops the tag so\n")
 	sb.WriteString("   the node stops receiving meeting jobs.\n\n")
 	sb.WriteString("   [yellow::b]5[-:-:-] [gray]toggle meeting capability (applies on next worker start)[-]\n")
+
+	// -- Egress relay --
+	egressEnabled := p.egressRelay != nil && p.egressRelay.Enabled
+	egressAllowLAN := p.egressRelay != nil && p.egressRelay.AllowLAN
+	sb.WriteString("\n [yellow::b]Egress Relay[-:-:-]\n\n")
+	sb.WriteString(fmt.Sprintf("   %s [white::b]Relay enabled[-:-:-]           Lets another node on your network tunnel\n", checkbox(egressEnabled)))
+	sb.WriteString("                                its outbound traffic through this node.\n")
+	sb.WriteString(fmt.Sprintf("   %s [white::b]Allow LAN destinations[-:-:-]  Lets relayed traffic reach this node's own\n", checkbox(egressAllowLAN)))
+	sb.WriteString("                                LAN/mesh instead of only the public internet.\n\n")
+	sb.WriteString("   [yellow::b]6[-:-:-] toggle relay enabled, [yellow::b]7[-:-:-] toggle allow LAN\n")
+	sb.WriteString("   [gray]saved; applies on the next citadel work start[-]\n")
 
 	// -- Connection status (read-only) --
 	sb.WriteString("\n [yellow::b]Connection[-:-:-]\n\n")

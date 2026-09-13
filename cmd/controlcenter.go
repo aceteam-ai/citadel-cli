@@ -329,6 +329,18 @@ func runControlCenter() {
 			SaveMeeting: func(m *config.Meeting) error {
 				return config.SaveMeeting(platform.ConfigDir(), m)
 			},
+			// Egress relay deliberately reads/writes network.GetNodeConfigDir(),
+			// NOT platform.ConfigDir() like every other Settings callback above:
+			// the CLI (`citadel egress-relay`), the local MCP tools, and
+			// APPLY_DEVICE_CONFIG all persist to network.GetNodeConfigDir(), and
+			// this page must converge on that same value or the four surfaces
+			// disagree (citadel #787/#980/#979).
+			LoadEgressRelay: func() *config.EgressRelay {
+				return config.LoadEgressRelay(network.GetNodeConfigDir())
+			},
+			SaveEgressRelay: func(e *config.EgressRelay) error {
+				return config.SaveEgressRelay(network.GetNodeConfigDir(), e)
+			},
 			// SetFullscreenEnabled is intentionally left nil: tview cannot swap the
 			// terminal's alternate-screen mode on a running app. Today the toggle only
 			// persists the preference; wiring a launch-time consumer that reads it at
