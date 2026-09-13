@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -710,7 +709,15 @@ func bridgeComposeEnv() []string {
 // runCosignVerify) so tests can assert the exact argv -- including that a pull
 // precedes the up -- without a Docker daemon.
 var runBridgeCompose = func(ctx context.Context, args ...string) ([]byte, error) {
-	dc := exec.CommandContext(ctx, "docker", args...)
+	// args always begin with "compose" (bridgeComposeArgs); strip that leading
+	// element and let rt.ComposeCommandContext re-add the runtime's own compose
+	// front-end prefix (docker/`podman compose`/podman-compose). Byte-identical
+	// to the prior exec.CommandContext(ctx, "docker", args...) on a docker node.
+	sub := args
+	if len(sub) > 0 && sub[0] == "compose" {
+		sub = sub[1:]
+	}
+	dc := catalog.SelectContainerRuntime().ComposeCommandContext(ctx, sub...)
 	dc.Env = bridgeComposeEnv()
 	return dc.CombinedOutput()
 }
@@ -739,7 +746,7 @@ func bridgeContainerRunning(project string) bool {
 // the `bridge` service's container id(s); `-q` prints ids of containers for the
 // project (running ones), so an empty result means the stack is down.
 func bridgeContainerID(ctx context.Context, project string) (string, error) {
-	out, err := exec.CommandContext(ctx, "docker", "compose", "-p", project,
+	out, err := catalog.SelectContainerRuntime().ComposeCommandContext(ctx, "-p", project,
 		"ps", "-q", whatsapp.BridgeService).Output()
 	if err != nil {
 		return "", err
@@ -776,7 +783,7 @@ func bridgeImageIDForNode() string {
 	if err != nil || id == "" {
 		return ""
 	}
-	out, err := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.Image}}", id).Output()
+	out, err := catalog.SelectContainerRuntime().EngineCommandContext(ctx, "inspect", "--format", "{{.Image}}", id).Output()
 	if err != nil {
 		return ""
 	}
@@ -796,7 +803,7 @@ func shortImageID(id string) string {
 // containerRunning reports whether a container (by name or ID) is in the running
 // state.
 func containerRunning(nameOrID string) bool {
-	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", nameOrID).Output()
+	out, err := catalog.SelectContainerRuntime().EngineCommand("inspect", "--format", "{{.State.Status}}", nameOrID).Output()
 	if err != nil {
 		return false
 	}

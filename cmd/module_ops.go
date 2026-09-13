@@ -448,7 +448,7 @@ func composeServiceContainerRunning(project, service string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "compose", "-p", project, "ps", "-q", service).Output()
+	out, err := catalog.SelectContainerRuntime().ComposeCommandContext(ctx, "-p", project, "ps", "-q", service).Output()
 	if err != nil {
 		return false
 	}

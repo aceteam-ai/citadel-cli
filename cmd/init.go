@@ -14,6 +14,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
@@ -789,7 +790,8 @@ func saveOriginalHostnameToConfig(hostname string) error {
 }
 
 func checkForRunningServicesQuiet(serviceToStart string) error {
-	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
+	rt := catalog.SelectContainerRuntime()
+	cmd := rt.EngineCommand("ps", "--filter", "name=citadel-", "--format", "json")
 	output, err := cmd.Output()
 	if err != nil {
 		// Could not query Docker, skip check silently
@@ -823,7 +825,7 @@ func checkForRunningServicesQuiet(serviceToStart string) error {
 
 	// Stop services quietly
 	for _, s := range runningServices {
-		stopCmd := exec.Command("docker", "stop", s.Name)
+		stopCmd := rt.EngineCommand("stop", s.Name)
 		if err := stopCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "⚠️  Could not stop %s: %v\n", s.Name, err)
 		}
@@ -833,7 +835,8 @@ func checkForRunningServicesQuiet(serviceToStart string) error {
 
 func checkForRunningServices(serviceToStart string) error {
 	fmt.Println("--- 🔍 Checking for existing services ---")
-	cmd := exec.Command("docker", "ps", "--filter", "name=citadel-", "--format", "json")
+	rt := catalog.SelectContainerRuntime()
+	cmd := rt.EngineCommand("ps", "--filter", "name=citadel-", "--format", "json")
 	output, err := cmd.Output()
 	if err != nil {
 		fmt.Println("     - Could not query Docker, skipping check.")
@@ -882,7 +885,7 @@ func checkForRunningServices(serviceToStart string) error {
 	fmt.Println("     - Stopping services...")
 	for _, s := range runningServices {
 		fmt.Printf("       - Stopping %s...\n", s.Name)
-		stopCmd := exec.Command("docker", "stop", s.Name)
+		stopCmd := rt.EngineCommand("stop", s.Name)
 		if err := stopCmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "       - ⚠️  Could not stop %s: %v\n", s.Name, err)
 		}

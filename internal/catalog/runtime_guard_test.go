@@ -35,29 +35,40 @@ import (
 // may tighten it to `==` once the baseline reaches its irreducible carve-outs.
 // Those carve-outs (why each remains) are documented in the PR and summarized in
 // remainingCarveOuts below.
-const literalEngineExecBaseline = 42
+const literalEngineExecBaseline = 19
 
-// remainingCarveOuts documents, by "path:function" hint, the sites intended to
-// remain on the baseline after conversion and why. It is informational; the
-// authoritative remaining list is whatever the scan prints on each run.
+// remainingCarveOuts documents, by "path:function" hint, the 19 sites that
+// remain on the baseline after this pass and why each was NOT converted. It is
+// informational; the authoritative remaining list is whatever the scan prints on
+// each run. The categories:
 var remainingCarveOuts = []string{
-	// import-graph cycle: internal/catalog imports internal/platform, so
+	// (a) import-graph cycle: internal/catalog imports internal/platform, so
 	// internal/platform cannot import internal/catalog to reach the seam. Both
 	// are `docker info` daemon-readiness probes (docker-specific by definition).
+	// (2 sites)
 	"internal/platform/docker.go: WindowsDockerManager.Start (docker info readiness, x2)",
-	// podman `manifest inspect` operates on manifest LISTS with different
-	// semantics than docker's; converting needs separate compat validation.
-	"internal/catalog/lockfile.go: resolveImageDigest (docker manifest inspect)",
-	// docker-availability DETECTION primitives. Routing these through the
-	// resolved runtime changes what "available" means per node; deferred with the
-	// other detection carve-outs to keep this pass behavior-preserving.
+
+	// (b) podman `manifest inspect` operates on local manifest LISTS with
+	// different semantics than docker's registry manifest inspect, so it is not a
+	// drop-in substitute; the local `image inspect` in the same function IS
+	// converted. (1 site)
+	"internal/catalog/lockfile.go: resolveImageDigest (docker manifest inspect fallback)",
+
+	// (c) docker-availability DETECTION primitives. Routing these through the
+	// resolved runtime changes what "available" means per node; deferred to keep
+	// this pass behavior-preserving. (2 sites)
 	"internal/services/native.go: IsDockerAvailable (docker info)",
 	"internal/jobs/service_payload.go: defaultDockerRuntimes (docker info --format Runtimes)",
-	// raw `docker run` instance path (service_payload / storage gateway) builds a
-	// docker-specific argv (runtime/network flags); podman-run compat is separate
-	// follow-up work. Kept literal for now.
-	"internal/jobs/service_payload.go: serviceStartPayload (docker run instance path)",
-	"internal/storage/gateway.go: Start (docker run -d gateway path)",
+
+	// (d) cohesive raw `docker run` subsystems (deploy / instance-payload /
+	// storage gateway). Each builds a docker-specific run argv (--runtime=nvidia,
+	// --gpus, --add-host, restart policy) whose podman-run equivalence is
+	// unvalidated, and converting only their run would leave create/inspect/rm
+	// split across runtimes on a dual-runtime node. Kept as whole all-docker
+	// units; podman-run support is separate follow-up work. (14 sites total)
+	"cmd/deploy.go: runLocalDeploy (docker pull/inspect/stop/rm/run, x5)",
+	"internal/jobs/service_payload.go: serviceStart/StopPayload + dockerContainerExists (raw docker run instance path, x4)",
+	"internal/storage/gateway.go: Start/Stop/containerRunning/containerExists (raw docker run gateway path, x5)",
 }
 
 var engineLiterals = map[string]bool{

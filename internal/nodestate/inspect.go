@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 )
 
@@ -19,7 +20,7 @@ type dockerInspector struct{}
 // status/health UNSPECIFIED rather than ERROR — "I can't observe run-state" is
 // not a per-module failure.
 func DockerInspector() ModuleInspector {
-	if _, err := exec.LookPath("docker"); err != nil {
+	if _, err := exec.LookPath(catalog.SelectContainerRuntime().EngineBin); err != nil {
 		return nil
 	}
 	return dockerInspector{}
@@ -40,7 +41,7 @@ func (dockerInspector) Inspect(ctx context.Context, moduleName string) (Observat
 	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "docker", "inspect",
+	out, err := catalog.SelectContainerRuntime().EngineCommandContext(ctx, "inspect",
 		"--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
 		container).Output()
 	if err != nil {

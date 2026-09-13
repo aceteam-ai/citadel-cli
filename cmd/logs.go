@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
 )
@@ -111,7 +112,7 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 	// 2. Try direct container access (for 'citadel run' services)
 	containerName := fmt.Sprintf("citadel-%s", serviceName)
-	inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+	inspectCmd := catalog.SelectContainerRuntime().EngineCommand("inspect", "--format", "{{.State.Status}}", containerName)
 	if _, err := inspectCmd.Output(); err == nil {
 		return runDockerLogs(serviceName, containerName, effectiveTail)
 	}
@@ -122,7 +123,8 @@ func runLogs(cmd *cobra.Command, args []string) error {
 
 // runDockerComposeLogs streams logs from a docker compose service.
 func runDockerComposeLogs(serviceName, composePath, tailLines string) error {
-	dockerArgs := []string{"compose", "-f", composePath, "logs"}
+	// No leading "compose": rt.ComposeCommand supplies the front-end prefix.
+	dockerArgs := []string{"-f", composePath, "logs"}
 	if logsFollow {
 		dockerArgs = append(dockerArgs, "--follow")
 	}
@@ -133,7 +135,7 @@ func runDockerComposeLogs(serviceName, composePath, tailLines string) error {
 		dockerArgs = append(dockerArgs, "--since", logsSince)
 	}
 
-	logCmd := exec.Command("docker", dockerArgs...)
+	logCmd := catalog.SelectContainerRuntime().ComposeCommand(dockerArgs...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
 	logCmd.Env = composeEnv()
@@ -158,7 +160,7 @@ func runDockerLogs(serviceName, containerName, tailLines string) error {
 	}
 	dockerArgs = append(dockerArgs, containerName)
 
-	logCmd := exec.Command("docker", dockerArgs...)
+	logCmd := catalog.SelectContainerRuntime().EngineCommand(dockerArgs...)
 	logCmd.Stdout = os.Stdout
 	logCmd.Stderr = os.Stderr
 

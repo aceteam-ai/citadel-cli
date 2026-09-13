@@ -2,12 +2,12 @@ package status
 
 import (
 	"context"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/desktop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
@@ -734,9 +734,10 @@ func (c *Collector) getDockerComposeStatus(composeFile, serviceName string) stri
 	// interpolates the file even for `ps`, so a ${VAR:?...}-guarded service
 	// (claudecode, livekit) would report a false ServiceStatusError on every
 	// heartbeat without it.
-	args := append([]string{"compose", "-f", composeFile}, compose.EnvFileArgs(composeFile)...)
+	// No leading "compose": rt.ComposeCommand supplies the front-end prefix.
+	args := append([]string{"-f", composeFile}, compose.EnvFileArgs(composeFile)...)
 	args = append(args, "ps", "--format", "json")
-	cmd := exec.Command("docker", args...)
+	cmd := catalog.SelectContainerRuntime().ComposeCommand(args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return ServiceStatusError

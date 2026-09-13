@@ -4,10 +4,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/spf13/cobra"
@@ -229,11 +229,12 @@ func stopSingleService(serviceName string) {
 	fmt.Printf("✅ Service '%s' stopped.\n", serviceName)
 }
 
-// stopComposeArgs builds the compose args for `... down` (everything after
-// the literal "compose" subcommand selector -- stopServiceByCompose hardcodes
-// the "docker" binary, so unlike startService there is no rt.ComposeArgs
-// prefix to apply separately), including the --node-dir project-scoping
-// (composeArgsWithProject, citadel#856). Pure and separated from
+// stopComposeArgs builds the FULL compose args for `... down`, including the
+// leading "compose" selector and the --node-dir project-scoping
+// (composeArgsWithProject, citadel#856). stopServiceByCompose strips that
+// leading "compose" and routes the rest through rt.ComposeCommand, which re-adds
+// the resolved runtime's own front-end prefix -- byte-identical to the prior
+// hardcoded `docker compose ...` on a docker node. Pure and separated from
 // stopServiceByCompose so the argv contract is unit-testable without invoking
 // docker (see TestStopComposeArgs*).
 //
@@ -262,7 +263,13 @@ func stopServiceByCompose(composePath string, remove bool) error {
 		return fmt.Errorf("compose file '%s' not found", composePath)
 	}
 
-	cmd := exec.Command("docker", stopComposeArgs(composePath, remove)...)
+	// stopComposeArgs already applies composeArgsWithProject (#856) and the
+	// sibling --env-file (#624) and prepends "compose"; strip that leading
+	// "compose" and let rt.ComposeCommand re-add the runtime's own front-end
+	// prefix (docker/`podman compose`/podman-compose). Byte-identical to the
+	// prior exec.Command("docker", ...) on a docker node.
+	rt := catalog.SelectContainerRuntime()
+	cmd := rt.ComposeCommand(stopComposeArgs(composePath, remove)[1:]...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
 	cmd.Env = composeEnv()
@@ -298,9 +305,10 @@ func stopServiceByContainer(serviceName string) error {
 	}
 
 	containerName := fmt.Sprintf("citadel-%s", serviceName)
+	rt := catalog.SelectContainerRuntime()
 
 	// Check if container exists
-	inspectCmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+	inspectCmd := rt.EngineCommand("inspect", "--format", "{{.State.Status}}", containerName)
 	output, err := inspectCmd.Output()
 	if err != nil {
 		return fmt.Errorf("container '%s' not found. Run 'citadel status' to see running services", containerName)
@@ -316,7 +324,7 @@ func stopServiceByContainer(serviceName string) error {
 	}
 
 	// Stop the container
-	stopCmd := exec.Command("docker", "stop", containerName)
+	stopCmd := rt.EngineCommand("stop", containerName)
 	stopCmd.Stdout = os.Stdout
 	stopCmd.Stderr = os.Stderr
 	if err := stopCmd.Run(); err != nil {
@@ -332,7 +340,7 @@ func stopServiceByContainer(serviceName string) error {
 // removeContainerByName removes a container by name.
 func removeContainerByName(containerName string) error {
 	fmt.Printf("--- Removing container '%s' ---\n", containerName)
-	rmCmd := exec.Command("docker", "rm", containerName)
+	rmCmd := catalog.SelectContainerRuntime().EngineCommand("rm", containerName)
 	rmCmd.Stdout = os.Stdout
 	rmCmd.Stderr = os.Stderr
 	if err := rmCmd.Run(); err != nil {
