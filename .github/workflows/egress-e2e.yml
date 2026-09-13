@@ -21,10 +21,6 @@ name: Egress E2E (dual public IP)
 # Runner setup + monthly mesh-key refresh: docs/ci-dual-ip-egress-runner.md.
 
 on:
-  # TEMP (removed before merge): validate on the self-hosted runner pre-merge,
-  # since workflow_dispatch requires the workflow to exist on the default branch.
-  push:
-    branches: [ci/dual-ip-egress-runner]
   schedule:
     # 09:17 UTC (~05:17 America/Toronto) — off the top of the hour to dodge
     # GitHub's cron scheduling congestion.
