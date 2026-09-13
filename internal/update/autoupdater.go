@@ -88,6 +88,13 @@ type AutoUpdaterConfig struct {
 	// Defaults to RestartProcess. Overridable for testing.
 	Restart func() error
 
+	// HomebrewManaged reports whether the running binary is a Homebrew-managed
+	// install on macOS, in which case the auto-updater skips the in-place swap
+	// (which would corrupt Homebrew's Cellar receipt) and defers to `brew
+	// upgrade` (citadel-cli#1043). Defaults to CurrentBinaryIsHomebrewManaged;
+	// on Linux/Windows it is always false, so this is a no-op there.
+	HomebrewManaged func() bool
+
 	// PendingPath is where the downloaded binary is staged.
 	// Defaults to GetPendingBinaryPath().
 	PendingPath string
@@ -122,6 +129,9 @@ func NewAutoUpdater(cfg AutoUpdaterConfig) *AutoUpdater {
 	}
 	if cfg.Restart == nil {
 		cfg.Restart = RestartProcess
+	}
+	if cfg.HomebrewManaged == nil {
+		cfg.HomebrewManaged = CurrentBinaryIsHomebrewManaged
 	}
 	if cfg.PendingPath == "" {
 		cfg.PendingPath = GetPendingBinaryPath()
@@ -180,6 +190,15 @@ func (a *AutoUpdater) runOnce(ctx context.Context) (restarted bool) {
 	}
 	if release == nil {
 		a.cfg.Log("auto-update: up to date")
+		return false
+	}
+
+	// Homebrew-managed nodes (macOS) update through `brew upgrade`, not an
+	// in-place swap that would corrupt the Cellar receipt (citadel-cli#1043).
+	// Skip BEFORE downloading so a brew node doesn't fetch an asset it will
+	// never apply. ApplyUpdate enforces the same rule as a backstop.
+	if a.cfg.HomebrewManaged != nil && a.cfg.HomebrewManaged() {
+		a.cfg.Log("auto-update: %s available but citadel is Homebrew-managed; update with `brew upgrade citadel` (skipping in-place swap)", release.TagName)
 		return false
 	}
 

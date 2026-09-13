@@ -128,6 +128,36 @@ func TestRunOnce_DownloadError_NoApply(t *testing.T) {
 	}
 }
 
+// TestRunOnce_HomebrewManaged_SkipsBeforeDownload: on a Homebrew-managed node
+// the auto-updater must not download or apply -- the in-place swap would corrupt
+// the Cellar receipt, so updates flow through `brew upgrade` (citadel-cli#1043).
+// The skip happens BEFORE download, so no asset is fetched for an update that
+// would never be applied.
+func TestRunOnce_HomebrewManaged_SkipsBeforeDownload(t *testing.T) {
+	applied := false
+	drained := false
+	checker := &fakeChecker{release: &Release{TagName: "v9.9.9"}}
+	u := NewAutoUpdater(AutoUpdaterConfig{
+		Checker:         checker,
+		HomebrewManaged: func() bool { return true },
+		Apply:           func(string) error { applied = true; return nil },
+		Restart:         func() error { return nil },
+		Drain:           func() { drained = true },
+	})
+	if u.runOnce(context.Background()) {
+		t.Error("runOnce should return false (no restart) when Homebrew-managed")
+	}
+	if applied {
+		t.Error("apply must not run on a Homebrew-managed node")
+	}
+	if drained {
+		t.Error("must not drain when skipping a Homebrew-managed update")
+	}
+	if got := atomic.LoadInt32(&checker.downloadHits); got != 0 {
+		t.Errorf("download must be skipped for a Homebrew-managed node, got %d hits", got)
+	}
+}
+
 func TestRunOnce_HappyPath_DrainsAppliesRestarts(t *testing.T) {
 	var order []string
 	var mu sync.Mutex

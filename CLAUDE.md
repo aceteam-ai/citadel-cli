@@ -3211,6 +3211,70 @@ node's own worker over loopback — there is still no cross-process signal for
 whether the jobs it is waiting on are individually safe to interrupt, only a
 count.
 
+### macOS launchd node service + Homebrew-aware updates (citadel-cli#1043)
+
+`citadel init` installs and starts the node worker as a managed launchd service
+on macOS so a fresh install leaves a running, self-updating service that
+survives reboot/login. On Linux the equivalent unit ships via install.sh
+(`citadel-worker.service`); macOS previously had a launchd `service.Manager`
+that **no installer ever called**.
+
+**`cmd/init_service.go:maybeInstallDarwinNodeService` owns the WHEN and WHICH
+FORM.** It is a top-of-`Run` defer (`cmd/init.go`), so it fires on every
+normal-return success path (network-only and `--provision` alike) and is skipped
+by `os.Exit` failure paths. It refuses to install unless `hasDeviceConfigured()`
+is true and the network wasn't skipped — otherwise a `KeepAlive` `citadel work`
+with no creds crash-loops at launchd's throttle. `platform.IsRoot()` decides the
+form: **root → system LaunchDaemon** (`/Library/LaunchDaemons`, domain `system`,
+boot-time), **non-root → user LaunchAgent** (`~/Library/LaunchAgents`, domain
+`gui/<uid>`, LOGIN-time — "survives reboot" for the no-sudo path means
+"re-registers at next login"). The root-daemon path emits no `UserName` (runs as
+root with whatever HOME `os.UserHomeDir()` gave under sudo) and relies on
+`ensureMachineStatePointerForRootWorker`/`createGlobalConfig` to converge the
+node dir — **untested on darwin**; the exercised path is the no-sudo LaunchAgent.
+
+**The launchd plist's `ExecPath` and `PATH` are both load-bearing and easy to
+get wrong.** `internal/update.StableDarwinExecPath` (the single brew authority)
+is what `service.DefaultConfig` uses on darwin to bake the STABLE
+`<prefix>/bin/citadel` symlink instead of the versioned Cellar path
+`EvalSymlinks` resolves to — a Cellar path is deleted by the next `brew upgrade`,
+silently breaking the service. `renderLaunchdPlist` (non-tagged, so the
+RunAtLoad/KeepAlive/PATH contract is tested on the Linux CI host, not just a
+never-run darwin-tagged test) sets `PATH=launchdServicePATH`
+(`/opt/homebrew/bin:/usr/local/bin:...`) because launchd hands a job a minimal
+PATH that omits Homebrew and Docker Desktop — without it the worker heartbeats
+but every `docker`/`brew` job fails.
+
+**`launchdManager` uses modern bootstrap/bootout with a legacy load/unload
+fallback.** `bootstrap gui/<uid>` fails from an SSH session with no Aqua session
+(`Bootstrap failed: 5: Input/output error`), so `reload`/`Start`/`Stop` fall
+back to `launchctl load`/`unload`. `Install` is idempotent (skips the
+bootout/bootstrap when the plist is byte-identical AND running, so a re-run
+`citadel init` never drops a healthy worker's jobs).
+
+**Darwin `RematerializeManagedUnits` (`rematerialize_darwin.go`) is FILE-ONLY —
+it never calls launchctl.** It heals only a Cellar-baked `ExecPath` (repointing
+it to the stable symlink), and rewrites the plist without reloading, because it
+runs at worker boot (`cmd/work.go`) as well as on `citadel update install`: a
+bootout from inside the running worker would kill the caller and restart-loop.
+The rewritten plist is re-read when the update flow restarts the service on its
+own terms (`mgr.Stop`+`Start`), same "never restart here" contract as the
+systemd path. `rematerialize_other.go` is retagged `!linux && !darwin` (Windows
+stays a no-op).
+
+**Homebrew-managed nodes defer to `brew upgrade`, never an in-place swap.**
+`update.IsHomebrewManagedPath(resolved, goos)` (true only on darwin AND under a
+Cellar — which distinguishes a brew symlink from a curl|bash plain file at the
+same `/usr/local/bin` path on Intel) gates this. `update.ApplyUpdate`/`Rollback`
+return `ErrHomebrewManaged` as the single backstop; on top of it `citadel update
+install`, the `AGENT_UPDATE` handler (`BrewManaged` config field), and the
+auto-updater (`HomebrewManaged` config field) each check BEFORE downloading so a
+brew node never fetches an asset it will never apply. A remote `AGENT_UPDATE`
+deliberately does NOT shell `brew` unattended — it returns a structured
+`{updated:false, reason:"homebrew-managed..."}`. The default installer
+(`scripts/install.sh`, curl|bash) is NOT brew, so its self-update path is
+unaffected and the acceptance ("self-updating service") holds there.
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json
