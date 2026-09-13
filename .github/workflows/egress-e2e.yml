@@ -1,0 +1,98 @@
+name: Egress E2E (dual public IP)
+
+# Nightly end-to-end canary for the on-node SOCKS5 egress relay
+# (#787/#980/#1037). Two jobs:
+#
+#   egress-unit     — hosted, hermetic. Builds + unit-tests the egress-relay
+#                     code paths. Runs even when the lab is offline, so a code
+#                     regression is caught independently of the canary.
+#   egress-liveness — self-hosted runner INSIDE the Bell-uplink client CT
+#                     (label: dual-ip-egress). Tunnels an outbound request
+#                     through the Cogeco-uplink relay CT and asserts the public
+#                     egress IP actually CHANGES. This assertion is only
+#                     meaningful on a fabric with two independent public IPs,
+#                     which is exactly what the aceteam dual-uplink pve host has.
+#
+# Trigger is the trust boundary: because a self-hosted runner sits on a home
+# LAN, this workflow deliberately has NO pull_request trigger (a fork PR must
+# never make the LAN runner execute its code). It runs on a nightly schedule
+# (always trusted main) and on manual dispatch only.
+#
+# Runner setup + monthly mesh-key refresh: docs/ci-dual-ip-egress-runner.md.
+
+on:
+  schedule:
+    # 09:17 UTC (~05:17 America/Toronto) — off the top of the hour to dodge
+    # GitHub's cron scheduling congestion.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      proxy_endpoint:
+        description: "Local SOCKS5 endpoint the client exposes for the relay (host:port)"
+        required: false
+        default: "127.0.0.1:1055"
+      ip_echo_primary:
+        description: "Primary public-IP echo URL"
+        required: false
+        default: "https://api.ipify.org"
+      expect_relay_ip:
+        description: "Optional: assert the relayed egress equals this exact IP"
+        required: false
+        default: ""
+      expect_client_ip:
+        description: "Optional: assert the direct egress equals this exact IP"
+        required: false
+        default: ""
+
+# Serialize on the single-slot self-hosted runner; a manual dispatch supersedes
+# an in-flight nightly rather than queueing behind it.
+concurrency:
+  group: egress-e2e
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  egress-unit:
+    name: Build + unit (egress paths)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Unit test egress relay + config
+        run: |
+          # egressrelay tests are named TestAuthorize*/TestPolicy*/TestIsDestination*
+          # (no "Egress" substring), so run that package in full; filter the
+          # larger config/cmd suites to the Egress-specific tests only.
+          go test ./internal/egressrelay/... -count=1
+          go test ./internal/config/... ./cmd/ -run 'Egress' -count=1
+
+  egress-liveness:
+    name: Live egress flip (Bell → Cogeco)
+    runs-on: [self-hosted, dual-ip-egress]
+    timeout-minutes: 10
+    # Independent of egress-unit on purpose: a hosted-runner hiccup must not
+    # suppress the cross-IP canary, and vice versa.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run dual-public-IP egress canary
+        env:
+          PROXY_ENDPOINT: ${{ github.event.inputs.proxy_endpoint || vars.EGRESS_PROXY_ENDPOINT || '127.0.0.1:1055' }}
+          IP_ECHO_PRIMARY: ${{ github.event.inputs.ip_echo_primary || vars.EGRESS_IP_ECHO_PRIMARY || 'https://api.ipify.org' }}
+          IP_ECHO_SECONDARY: ${{ vars.EGRESS_IP_ECHO_SECONDARY || 'https://ifconfig.me/ip' }}
+          # Optional hard checks. Unset by default so a residential ISP IP change
+          # never causes a false red; the flip assertion (direct != relayed) is
+          # the drift-proof gate that always runs.
+          EXPECT_RELAY_IP: ${{ github.event.inputs.expect_relay_ip || vars.EGRESS_EXPECT_RELAY_IP || '' }}
+          EXPECT_CLIENT_IP: ${{ github.event.inputs.expect_client_ip || vars.EGRESS_EXPECT_CLIENT_IP || '' }}
+        run: |
+          chmod +x scripts/egress-relay-ci.sh
+          ./scripts/egress-relay-ci.sh
