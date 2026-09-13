@@ -596,12 +596,12 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 	// (citadel init -> onboarding wizard -> autoStartServices), the exact
 	// scenario the issue reports (macOS, docker installed via Homebrew but
 	// not linked while colima ran healthy). Checked once, not per-service --
-	// every iteration below drives "docker" directly. Refuse ONLY when the
-	// CLI is missing (every exec.Command("docker", ...) below would fail
-	// immediately anyway); a daemon that failed to answer the preflight's
+	// every iteration below drives the resolved runtime (rt.ComposeCommand).
+	// Refuse ONLY when the engine CLI is missing (the compose exec below would
+	// fail immediately anyway); a daemon that failed to answer the preflight's
 	// probe is logged as a warning and every service below still attempts to
 	// start, since it may simply be slow and each compose-up call already
-	// surfaces docker's own error if it truly is unreachable -- see
+	// surfaces the engine's own error if it truly is unreachable -- see
 	// platform.PreflightDockerStart.
 	//
 	// Resolve the container runtime once, before the loop, and drive the
