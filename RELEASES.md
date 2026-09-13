@@ -2476,3 +2476,23 @@ Auto-generated log of every release.
   - feat(egress): 'citadel egress-relay serve' relay-only mode (no worker/Redis) (#1037)
 
 
+---
+
+## v2.159.0 — 2026-09-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 220 |
+| Lines added | +5673 |
+
+**Changes:**
+
+  - feat(macos): install & manage the node service via launchd (#1050)
+  - fix(macos): honest hardware capabilities on Apple silicon (#1049)
+  - refactor(runtime): ContainerRuntime seam + CI guard for engine execs (#1047)
+  - docs: four-act Sovereign Compute Fabric demo runbook (#1038)
+  - docs: fill mesh chat / machine-wide mode / trust receipt gaps in docs-site (#1036)
+  - chore: sync generated files after v2.158.0 release
+
+
