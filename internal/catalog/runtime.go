@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -68,6 +69,113 @@ func (rt ContainerRuntime) ComposeArgs(args ...string) []string {
 	out := make([]string, 0, len(rt.ComposePrefix)+len(args))
 	out = append(out, rt.ComposePrefix...)
 	return append(out, args...)
+}
+
+// engineBin returns the engine CLI binary for a plain sub-command, defaulting to
+// "docker" when unset (matching the pre-seam behavior of the many call sites
+// that hardcoded "docker"). SelectContainerRuntime never returns an empty
+// EngineBin, so this default only matters for a zero-value ContainerRuntime.
+func (rt ContainerRuntime) engineBin() string {
+	if rt.EngineBin != "" {
+		return rt.EngineBin
+	}
+	return "docker"
+}
+
+// composeBin returns the binary to exec for a compose invocation, defaulting to
+// "docker" when unset.
+func (rt ContainerRuntime) composeBin() string {
+	if rt.Bin != "" {
+		return rt.Bin
+	}
+	return "docker"
+}
+
+// EngineCommand builds an *unrun* *exec.Cmd for a plain engine sub-command
+// (inspect / rm / ps / info / run / exec / pull / stop / start / pause / ...)
+// against this runtime's engine binary. It is the single seam through which
+// engine execs are constructed: callers must not build exec.Command("docker",
+// ...) / exec.Command("podman", ...) directly (enforced by the guard test in
+// runtime_guard_test.go).
+//
+// It returns the command WITHOUT running it, so the caller keeps its exact
+// wiring (.Output() / .Run() / .CombinedOutput() / Stdout / Stderr / Env / Dir).
+// Use EngineCommand where the pre-seam site used exec.Command (no context);
+// EngineCommandContext where it used exec.CommandContext. The two differ
+// observably (kill-on-cancel), so a converted site must preserve which it used.
+func (rt ContainerRuntime) EngineCommand(args ...string) *exec.Cmd {
+	return exec.Command(rt.engineBin(), args...)
+}
+
+// EngineCommandContext is EngineCommand bound to ctx (kill-on-cancel).
+func (rt ContainerRuntime) EngineCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, rt.engineBin(), args...)
+}
+
+// ComposeCommand builds an *unrun* *exec.Cmd for a compose invocation on this
+// runtime: rt.Bin exec'd with rt.ComposeArgs(args...). The caller passes the
+// compose args WITHOUT the leading "compose" — the ComposePrefix supplies the
+// correct front-end selector for docker vs `podman compose` vs `podman-compose`.
+//
+// This applies NO project-name override. The #856 --node-dir project scoping
+// lives in cmd/service.go's composeCommandFor wrapper; routing a raw compose
+// site (e.g. an internal/jobs handler) through that wrapper instead of this
+// method would silently add the override and change behavior.
+func (rt ContainerRuntime) ComposeCommand(args ...string) *exec.Cmd {
+	return exec.Command(rt.composeBin(), rt.ComposeArgs(args...)...)
+}
+
+// ComposeCommandContext is ComposeCommand bound to ctx (kill-on-cancel).
+func (rt ContainerRuntime) ComposeCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, rt.composeBin(), rt.ComposeArgs(args...)...)
+}
+
+// The following named helpers are thin, ctx-taking wrappers over EngineCommand
+// for the sub-commands the ContainerRuntime seam issue (citadel-cli#1041)
+// enumerates. They exist for NEW callers and for readability; existing sites
+// that used exec.Command (no ctx) should convert to EngineCommand rather than be
+// forced into a ctx-taking wrapper, which would change Command→CommandContext.
+// Each prepends its sub-command to the caller's args.
+
+// Run builds `<engine> run <args...>`.
+func (rt ContainerRuntime) Run(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"run"}, args...)...)
+}
+
+// Exec builds `<engine> exec <args...>`.
+func (rt ContainerRuntime) Exec(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"exec"}, args...)...)
+}
+
+// Info builds `<engine> info <args...>`.
+func (rt ContainerRuntime) Info(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"info"}, args...)...)
+}
+
+// ImagePull builds `<engine> pull <args...>`.
+func (rt ContainerRuntime) ImagePull(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"pull"}, args...)...)
+}
+
+// Volume builds `<engine> volume <args...>`.
+func (rt ContainerRuntime) Volume(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"volume"}, args...)...)
+}
+
+// PodCreate builds `<engine> pod create <args...>` (podman pods; docker has no
+// pods, so this is a forward-looking helper for the rootless-podman work).
+func (rt ContainerRuntime) PodCreate(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"pod", "create"}, args...)...)
+}
+
+// PodStart builds `<engine> pod start <args...>`.
+func (rt ContainerRuntime) PodStart(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"pod", "start"}, args...)...)
+}
+
+// PodStop builds `<engine> pod stop <args...>`.
+func (rt ContainerRuntime) PodStop(ctx context.Context, args ...string) *exec.Cmd {
+	return rt.EngineCommandContext(ctx, append([]string{"pod", "stop"}, args...)...)
 }
 
 // runtimeProbes are the host probes the runtime selector depends on. They are an
