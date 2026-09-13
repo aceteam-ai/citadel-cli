@@ -110,7 +110,7 @@ models, and run inference on your own hardware.
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `citadel aep verify <receipt.json>` | Verify the ECDSA signature of a signed AEP (AceTeam Execution Proof) receipt, entirely offline | `--json`, `--pubkey`, `--cert`, `--show-canonical` |
+| `citadel aep verify <receipt.json>` | Verify the ECDSA signature of a signed AEP (Agentic Execution Protocol) receipt, entirely offline | `--json`, `--pubkey`, `--cert`, `--show-canonical` |
 
 See [Trust Receipts & Grounding Checks](/guides/trust-receipts) for the full receipt format and how signing is enabled.
 

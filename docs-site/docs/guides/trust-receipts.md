@@ -65,7 +65,7 @@ Signing fails safe: if the node's signing key is ever unavailable for any
 reason, the response is still returned normally, just without the
 `aep_receipt` field attached.
 
-`aep_receipt` stands for **AceTeam Execution Proof** -- the receipt is a
+`aep_receipt` stands for **Agentic Execution Protocol** -- the receipt is a
 signed proof of what a node's inference execution actually produced.
 
 ## Verifying a Receipt: `citadel aep verify`
