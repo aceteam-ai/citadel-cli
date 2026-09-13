@@ -1,7 +1,7 @@
 // cmd/aep.go
 //
 // `citadel aep verify <receipt.json>` verifies the ECDSA signature of a signed
-// AEP ("AceTeam Execution Proof") receipt — the signed grounding/trust receipt
+// AEP ("Agentic Execution Protocol") receipt — the signed grounding/trust receipt
 // internal/aep produces and internal/worker attaches to a chat-completion job's
 // output when CITADEL_SIGN_AEP_RECEIPTS is on (see the "Node identity
 // persistence + signed AEP receipt" section of CLAUDE.md and
@@ -55,8 +55,8 @@ var errAEPVerifyFailed = errors.New("aep receipt verification failed")
 
 var aepCmd = &cobra.Command{
 	Use:   "aep",
-	Short: "AceTeam Execution Proof receipt tools",
-	Long: "Tools for working with signed AEP (AceTeam Execution Proof) receipts.\n\n" +
+	Short: "Agentic Execution Protocol receipt tools",
+	Long: "Tools for working with signed AEP (Agentic Execution Protocol) receipts.\n\n" +
 		"An AEP receipt is the signed grounding/trust proof a Citadel node attaches to\n" +
 		"an inference job's output. `citadel aep verify` checks its ECDSA signature\n" +
 		"offline against a node's public identity.",
