@@ -193,14 +193,15 @@ func BuildLockImages(imageRefs []string) []LockImage {
 // resolveImageDigest tries to resolve a sha256 digest for an image reference via
 // docker. It is best-effort and time-bounded: on any failure it returns "".
 func resolveImageDigest(ref string) string {
-	if _, err := exec.LookPath("docker"); err != nil {
+	rt := SelectContainerRuntime()
+	if _, err := exec.LookPath(rt.EngineBin); err != nil {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	// Prefer a local inspect (works once the image is pulled, no registry auth).
-	local := exec.CommandContext(ctx, "docker", "image", "inspect", ref,
+	local := rt.EngineCommandContext(ctx, "image", "inspect", ref,
 		"--format", "{{index .RepoDigests 0}}")
 	if out, err := local.Output(); err == nil {
 		if d := digestFromRepoDigest(strings.TrimSpace(string(out))); d != "" {
@@ -210,6 +211,12 @@ func resolveImageDigest(ref string) string {
 
 	// Fall back to a registry manifest inspect (needs the image to be reachable;
 	// may need auth for private registries -- omitted on failure).
+	//
+	// This one stays hardcoded "docker" (guard baseline carve-out): podman's
+	// `manifest inspect` operates on local manifest LISTS with different
+	// semantics than docker's registry manifest inspect, so it is not a drop-in
+	// substitute. On a podman-only node this remote fallback is simply skipped
+	// (the local inspect above already used the resolved runtime).
 	remote := exec.CommandContext(ctx, "docker", "manifest", "inspect", ref,
 		"--format", "{{.Descriptor.Digest}}")
 	if out, err := remote.Output(); err == nil {
@@ -241,12 +248,13 @@ func ContainerNameConflict(name string) bool {
 	if name == "" {
 		return false
 	}
-	if _, err := exec.LookPath("docker"); err != nil {
+	rt := SelectContainerRuntime()
+	if _, err := exec.LookPath(rt.EngineBin); err != nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "ps", "-a", "--format", "{{.Names}}").Output()
+	out, err := rt.EngineCommandContext(ctx, "ps", "-a", "--format", "{{.Names}}").Output()
 	if err != nil {
 		return false
 	}

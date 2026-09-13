@@ -8,10 +8,10 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -51,14 +51,15 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	// refusal -- it may just be slow, and the compose-up call below already
 	// surfaces docker's own error if it truly is unreachable. See
 	// platform.PreflightDockerStart.
-	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+	rt := catalog.SelectContainerRuntime()
+	if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
 		return nil, fmt.Errorf("failed to restart llama.cpp service with new model: %s", refuseErr)
 	} else if warning != "" {
 		ctx.Log("warn", "     - [Job %s] docker preflight: %s", job.ID, warning)
 	}
 
 	newCommand := fmt.Sprintf("--model /models/%s --host 0.0.0.0 --port 8080 --n-gpu-layers -1", modelFile)
-	restartCmd := exec.Command("docker", "compose", "-f", composeFile, "up", "-d", "--force-recreate")
+	restartCmd := rt.ComposeCommand("-f", composeFile, "up", "-d", "--force-recreate")
 	restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))
 	// Supply the citadel-owned host port so the compose ports line
 	// (127.0.0.1:${CITADEL_LLAMACPP_HOST_PORT}:8080) resolves.

@@ -19,7 +19,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
@@ -306,24 +305,25 @@ func composeUpDetached(name, composePath string) error {
 	// modules) so an updated/rolled-back sandboxed module restarts hardened.
 	// No -p: default compose project (dir basename), the standardized convention
 	// production containers run under (#528).
-	args := []string{"compose"}
-	args = append(args, composeFileArgs(composePath, composePath)...)
+	// No leading "compose": rt.ComposeCommand supplies the front-end prefix.
+	args := composeFileArgs(composePath, composePath)
 	args = append(args, "up", "-d")
+	rt := catalog.SelectContainerRuntime()
 	// Preflight (citadel #767 follow-up, #781): this module-restart-on-update
-	// path execs "docker" directly with no prior check. Refuse ONLY when the
+	// path execs the engine directly with no prior check. Refuse ONLY when the
 	// CLI is missing (that exec would fail immediately anyway) and report a
 	// friendly diagnosis instead of the raw
 	// `exec: "docker": executable file not found in $PATH`-style error. A
 	// daemon that failed to answer the preflight's probe is a WARNING, not a
 	// refusal -- it may just be slow, and the compose-up call below already
-	// surfaces docker's own error if it truly is unreachable. See
+	// surfaces the engine's own error if it truly is unreachable. See
 	// platform.PreflightDockerStart.
-	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+	if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
 		return fmt.Errorf("docker compose up failed: %s", refuseErr)
 	} else if warning != "" {
 		fmt.Printf("⚠️  docker preflight for %s: %s\n", name, warning)
 	}
-	c := exec.Command("docker", args...)
+	c := rt.ComposeCommand(args...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
 	c.Env = composeEnv()
@@ -336,7 +336,7 @@ func composeUpDetached(name, composePath string) error {
 // containerRunning reports whether a container with the given name is currently
 // running. Best-effort: false if docker is unavailable.
 func moduleContainerRunning(containerName string) bool {
-	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName).Output()
+	out, err := catalog.SelectContainerRuntime().EngineCommand("inspect", "--format", "{{.State.Status}}", containerName).Output()
 	if err != nil {
 		return false
 	}

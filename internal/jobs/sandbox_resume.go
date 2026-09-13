@@ -4,9 +4,9 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -31,7 +31,7 @@ func (h *SandboxResumeHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 
 	ctx.Log("info", "     - [Job %s] SANDBOX_RESUME sandbox=%s container=%s", job.ID, sandboxID, containerID)
 
-	cmd := exec.Command("docker", "unpause", containerID)
+	cmd := catalog.SelectContainerRuntime().EngineCommand("unpause", containerID)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		errMsg := fmt.Sprintf("docker unpause failed: %s", strings.TrimSpace(string(output)))

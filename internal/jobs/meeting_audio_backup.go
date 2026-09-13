@@ -30,12 +30,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -115,10 +115,10 @@ func transcodeDockerArgs(container, wavContainerPath, opusContainerPath string, 
 }
 
 // runDockerExecReal is the production docker runner used when a handler does not
-// inject a fake. args is the full docker argv (args[0] == "exec"). It honors the
+// inject a fake. args is the full engine argv (args[0] == "exec"). It honors the
 // context so a per-job deadline or cancellation actually terminates ffmpeg.
 func runDockerExecReal(ctx context.Context, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	return catalog.SelectContainerRuntime().EngineCommandContext(ctx, args...).CombinedOutput()
 }
 
 // SetAudioBackup configures the sovereign audio-backup path: the default-on

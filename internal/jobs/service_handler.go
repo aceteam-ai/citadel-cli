@@ -402,6 +402,12 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		// Resolve the container runtime once for this docker-branch start and drive
+		// every engine/compose sub-command below through it (preflight, legacy
+		// cleanup, compose up). On a docker node rt.EngineBin/rt.Bin are "docker",
+		// so this is byte-identical to the prior hardcoded path; on a podman node
+		// it drives podman consistently. Mirrors cmd/service.go's startService.
+		rt := catalog.SelectContainerRuntime()
 		// ramOverridePath is the citadel#831 per-service RAM ceiling override
 		// (empty when resource isolation is off, the target isn't GPU, or the
 		// target is already running -- see applyRAMIsolation and the gate
@@ -434,11 +440,13 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// starts that passed `-p citadel-<name>`). The no-`-p` up below would
 		// otherwise conflict on the pinned container_name -- a cross-project name
 		// conflict that --force-recreate does NOT resolve.
-		compose.RemoveLegacyProjectContainers("docker", svc.Name)
+		compose.RemoveLegacyProjectContainers(rt.EngineBin, svc.Name)
 		// Include the least-privilege sandbox override when present (untrusted/
 		// Tier-2 modules) so a remotely-started module also runs hardened -- the
 		// override would otherwise be bypassed by this start site.
-		composeArgs := []string{"compose", "-f", composePath}
+		// Args are the compose args WITHOUT the leading "compose": rt.ComposeCommand
+		// supplies the correct front-end prefix (docker/podman) below.
+		composeArgs := []string{"-f", composePath}
 		if override := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
 			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
 			composeArgs = append(composeArgs, "-f", override)
@@ -466,18 +474,18 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// missing (that exec would fail immediately anyway) and report a
 		// friendly diagnosis instead of the raw
 		// `exec: "docker": executable file not found in $PATH`-style error
-		// (this handler always drives "docker" directly, see the
-		// exec.Command("docker", ...) below). A daemon that failed to answer
-		// the preflight's probe is a WARNING, not a refusal: it may just be
-		// slow, and the compose-up call below already surfaces docker's own
-		// error if it truly is unreachable -- see platform.PreflightDockerStart.
-		if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+		// (this handler drives the resolved runtime, see rt.ComposeCommand
+		// below). A daemon that failed to answer the preflight's probe is a
+		// WARNING, not a refusal: it may just be slow, and the compose-up call
+		// below already surfaces the engine's own error if it truly is
+		// unreachable -- see platform.PreflightDockerStart.
+		if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
 			err = fmt.Errorf("docker compose up failed: %s", refuseErr)
 		} else {
 			if warning != "" {
 				ctx.Log("warn", "     - docker preflight: %s", warning)
 			}
-			cmd := exec.Command("docker", composeArgs...)
+			cmd := rt.ComposeCommand(composeArgs...)
 			cmd.Env = h.composeEnv()
 			out, cmdErr := cmd.CombinedOutput()
 			if cmdErr != nil {
@@ -546,13 +554,15 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		rt := catalog.SelectContainerRuntime()
 		// The sibling env is passed on down too (mirrors composeFileArgs) so a
 		// compose file whose interpolation hard-requires a config var still
-		// resolves; a no-op when no <name>.env exists.
-		downArgs := []string{"compose", "-f", composePath}
+		// resolves; a no-op when no <name>.env exists. Args carry no leading
+		// "compose": rt.ComposeCommand supplies the front-end prefix.
+		downArgs := []string{"-f", composePath}
 		downArgs = append(downArgs, compose.EnvFileArgs(composePath)...)
 		downArgs = append(downArgs, "down")
-		cmd := exec.Command("docker", downArgs...)
+		cmd := rt.ComposeCommand(downArgs...)
 		cmd.Env = h.composeEnv()
 		out, cmdErr := cmd.CombinedOutput()
 		if cmdErr != nil {
@@ -561,7 +571,7 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		// Transitional (#528): also remove containers a pre-fix start left under
 		// the legacy "citadel-<name>" compose project, which the no-`-p` down
 		// above cannot see (that mismatch was the silent stop no-op of #528).
-		compose.RemoveLegacyProjectContainers("docker", svc.Name)
+		compose.RemoveLegacyProjectContainers(rt.EngineBin, svc.Name)
 	}
 
 	if err != nil {
@@ -1283,10 +1293,11 @@ func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
 	// dockerContainer stays "" (the pre-existing host-binary path) unless the
 	// host binary is genuinely absent AND the container is confirmed
 	// running -- never invent or start a container just to pull into it.
+	rt := catalog.SelectContainerRuntime()
 	dockerContainer := ""
 	if _, err := exec.LookPath("ollama"); err != nil {
 		candidate := embeddedContainerNameFor("ollama")
-		out, inspectErr := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", candidate).Output()
+		out, inspectErr := rt.EngineCommand("inspect", "--format", "{{.State.Status}}", candidate).Output()
 		if inspectErr != nil || strings.TrimSpace(string(out)) != "running" {
 			return fmt.Errorf("cannot pull model %q: ollama binary not found in PATH, and no running %q docker container found", model, candidate)
 		}
@@ -1297,7 +1308,7 @@ func ensureOllamaModel(ctx JobContext, model string, waitForServer bool) error {
 		for time.Now().Before(deadline) {
 			var probeErr error
 			if dockerContainer != "" {
-				probeErr = exec.Command("docker", "exec", dockerContainer, "ollama", "list").Run()
+				probeErr = rt.EngineCommand("exec", dockerContainer, "ollama", "list").Run()
 			} else {
 				probeErr = exec.Command("ollama", "list").Run()
 			}
@@ -1776,7 +1787,7 @@ func embeddedContainerNameFor(svcName string) string {
 
 func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
 	containerName := embeddedContainerNameFor(svcName)
-	cmd := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", containerName)
+	cmd := catalog.SelectContainerRuntime().EngineCommand("inspect", "--format", "{{.State.Status}}", containerName)
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -1793,7 +1804,7 @@ func (h *ServiceHandler) isDockerServiceRunning(svcName string) bool {
 // mode (a container that came up with NetworkSettings.Ports == {}).
 func (h *ServiceHandler) dockerServiceEndpoint(svcName string) string {
 	containerName := embeddedContainerNameFor(svcName)
-	cmd := exec.Command("docker", "inspect",
+	cmd := catalog.SelectContainerRuntime().EngineCommand("inspect",
 		"--format", "{{json .NetworkSettings.Ports}}", containerName)
 	out, err := cmd.Output()
 	if err != nil {

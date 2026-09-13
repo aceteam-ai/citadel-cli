@@ -6,23 +6,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 )
 
-// dockerInspector observes module run-state via `docker inspect` on the
+// dockerInspector observes module run-state via `<engine> inspect` on the
 // conventionally-named container (citadel-<module>, matching
 // internal/jobs.ServiceHandler). It implements ModuleInspector.
-type dockerInspector struct{}
+//
+// The container runtime is resolved ONCE, in DockerInspector(), and cached on
+// rt: Inspect runs per lockfile module per emitter tick, and
+// catalog.SelectContainerRuntime re-probes the host (on a podman node it execs
+// `podman compose version` + `podman info`), so resolving per Inspect call would
+// mean two extra subprocesses per module per tick on a podman node.
+type dockerInspector struct{ rt catalog.ContainerRuntime }
 
-// DockerInspector returns the live docker-backed ModuleInspector. If docker is
-// not on PATH it returns nil, and BuildActualState then reports every module as
-// status/health UNSPECIFIED rather than ERROR — "I can't observe run-state" is
-// not a per-module failure.
+// DockerInspector returns the live engine-backed ModuleInspector. If the
+// resolved engine is not on PATH it returns nil, and BuildActualState then
+// reports every module as status/health UNSPECIFIED rather than ERROR — "I can't
+// observe run-state" is not a per-module failure.
 func DockerInspector() ModuleInspector {
-	if _, err := exec.LookPath("docker"); err != nil {
+	rt := catalog.SelectContainerRuntime()
+	if _, err := exec.LookPath(rt.EngineBin); err != nil {
 		return nil
 	}
-	return dockerInspector{}
+	return dockerInspector{rt: rt}
 }
 
 const inspectTimeout = 3 * time.Second
@@ -34,13 +42,13 @@ const inspectTimeout = 3 * time.Second
 // not spam the report with ERROR. An error is returned only when docker itself
 // fails in a way that leaves run-state genuinely unknown — that is the path that
 // surfaces as MODULE_HEALTH_ERROR in the report, isolated to this one module.
-func (dockerInspector) Inspect(ctx context.Context, moduleName string) (Observation, error) {
+func (d dockerInspector) Inspect(ctx context.Context, moduleName string) (Observation, error) {
 	container := "citadel-" + moduleName
 
 	ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "docker", "inspect",
+	out, err := d.rt.EngineCommandContext(ctx, "inspect",
 		"--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
 		container).Output()
 	if err != nil {

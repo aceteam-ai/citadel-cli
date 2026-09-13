@@ -231,7 +231,7 @@ func detectRunningEngines() []string {
 	defer cancel()
 
 	// Check for running docker containers matching known engine names
-	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{.Names}}")
+	cmd := catalog.SelectContainerRuntime().EngineCommandContext(ctx, "ps", "--format", "{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil

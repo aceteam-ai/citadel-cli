@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 
+	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
@@ -596,14 +596,19 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 	// (citadel init -> onboarding wizard -> autoStartServices), the exact
 	// scenario the issue reports (macOS, docker installed via Homebrew but
 	// not linked while colima ran healthy). Checked once, not per-service --
-	// every iteration below drives "docker" directly. Refuse ONLY when the
-	// CLI is missing (every exec.Command("docker", ...) below would fail
-	// immediately anyway); a daemon that failed to answer the preflight's
+	// every iteration below drives the resolved runtime (rt.ComposeCommand).
+	// Refuse ONLY when the engine CLI is missing (the compose exec below would
+	// fail immediately anyway); a daemon that failed to answer the preflight's
 	// probe is logged as a warning and every service below still attempts to
 	// start, since it may simply be slow and each compose-up call already
-	// surfaces docker's own error if it truly is unreachable -- see
+	// surfaces the engine's own error if it truly is unreachable -- see
 	// platform.PreflightDockerStart.
-	if refuseErr, warning := platform.PreflightDockerStart("docker"); refuseErr != nil {
+	//
+	// Resolve the container runtime once, before the loop, and drive the
+	// preflight, legacy cleanup, and each compose up through it. Byte-identical
+	// to the prior hardcoded "docker" path on a docker node; consistent on podman.
+	rt := catalog.SelectContainerRuntime()
+	if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
 		return refuseErr
 	} else if warning != "" {
 		clilog.Writef("warning", "docker preflight before APPLY_DEVICE_CONFIG service start: %s", warning)
@@ -625,7 +630,7 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// Transitional (#528): remove any container still under the legacy
 		// "citadel-<svcName>" project so the no-`-p` up below does not conflict
 		// on the pinned container_name.
-		compose.RemoveLegacyProjectContainers("docker", svcName)
+		compose.RemoveLegacyProjectContainers(rt.EngineBin, svcName)
 
 		// Start the service. No -p: the default compose project (dir basename,
 		// "services") is the standardized convention shared with the boot/run/
@@ -634,11 +639,12 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// see.
 		// Pass the sibling config env (<name>.env) explicitly so a previously
 		// persisted model selection (#530) and any install-time config resolve;
-		// docker compose only auto-loads a file literally named ".env".
-		composeArgs := []string{"compose", "-f", composeFile}
+		// docker compose only auto-loads a file literally named ".env". Args carry
+		// no leading "compose": rt.ComposeCommand supplies the front-end prefix.
+		composeArgs := []string{"-f", composeFile}
 		composeArgs = append(composeArgs, compose.EnvFileArgs(composeFile)...)
 		composeArgs = append(composeArgs, "up", "-d")
-		cmd := exec.Command("docker", composeArgs...)
+		cmd := rt.ComposeCommand(composeArgs...)
 
 		// Set working directory for relative paths in compose files
 		cmd.Dir = configDir
