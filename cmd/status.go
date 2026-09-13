@@ -811,7 +811,15 @@ func printGPUInfo(w *tabwriter.Writer) {
 		fmt.Fprintf(w, "  %s %d:\t%s\n", labelColor.Sprint("GPU"), i, gpu.Name)
 
 		if gpu.Memory != "" {
-			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint("Memory"), gpu.Memory)
+			label := "Memory"
+			if gpu.Unified {
+				label = "Unified Memory"
+			}
+			fmt.Fprintf(w, "    - %s:\t%s\n", labelColor.Sprint(label), gpu.Memory)
+		}
+
+		if gpu.Cores > 0 {
+			fmt.Fprintf(w, "    - %s:\t%d\n", labelColor.Sprint("GPU Cores"), gpu.Cores)
 		}
 
 		if gpu.Temperature != "" {

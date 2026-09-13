@@ -606,6 +606,24 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 			Driver: gpu.Driver,
 		}
 
+		// Apple Silicon: the GPU shares the system's unified memory pool, which
+		// system_profiler does not report as VRAM (citadel-cli#1042). Report the
+		// real total/used/available system RAM as the GPU memory figures, flagged
+		// unified:true. Available (not total-minus-used) is the honest free
+		// signal — the same argument MemoryFreeMB makes for nvidia-smi (#833) —
+		// so freeVRAMBytes reads a truthful free number for a Mac.
+		if gpu.Unified {
+			metrics.Unified = true
+			metrics.Cores = gpu.Cores
+			if v, err := mem.VirtualMemory(); err == nil {
+				metrics.MemoryTotalMB = int(v.Total / (1024 * 1024))
+				metrics.MemoryUsedMB = int(v.Used / (1024 * 1024))
+				metrics.MemoryFreeMB = int(v.Available / (1024 * 1024))
+			}
+			gpuMetrics = append(gpuMetrics, metrics)
+			continue
+		}
+
 		// Parse total memory (e.g., "24576 MB" or "24 GB")
 		if gpu.Memory != "" {
 			memStr := strings.TrimSuffix(gpu.Memory, " MB")

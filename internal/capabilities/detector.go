@@ -36,6 +36,12 @@ type GPUDevice struct {
 	VRAMMb  int    `json:"vram_mb" yaml:"vram_mb"`
 	Tag     string `json:"tag" yaml:"tag"`           // normalized tag e.g. "rtx3090"
 	VRAMTag string `json:"vram_tag" yaml:"vram_tag"` // e.g. "24gb"
+	// Unified is true for an Apple Silicon integrated GPU sharing a unified
+	// memory pool with the CPU (no discrete VRAM). Queue routing keys on this:
+	// a unified-only node does NOT join the discrete-GPU inference queues
+	// (see GPUInferenceQueues), so adding an apple device advertises honest
+	// hardware without changing which queues the node consumes.
+	Unified bool `json:"unified,omitempty" yaml:"unified,omitempty"`
 }
 
 // GPUCapabilities holds the full GPU capability summary for a node.
@@ -53,12 +59,21 @@ type NodeCapabilities struct {
 	Tags    []string         `json:"tags,omitempty" yaml:"tags,omitempty"`       // all capability tags
 }
 
-// DetectGPUCapabilities runs nvidia-smi and returns structured GPU information.
-// When nvidia-smi fails but lspci detects NVIDIA hardware, a GPUCapabilities
-// is still returned with the hardware name but empty Tag/VRAMTag fields so
-// the GPU is visible in status displays without producing routing tags.
-// Returns nil only if no NVIDIA hardware is detected at all.
+// DetectGPUCapabilities returns structured GPU information for this node.
+//
+// On darwin it reports the Apple Silicon integrated GPU as a unified-memory
+// device (gpu:apple-<family> + a usable unified-memory budget); see
+// detectAppleGPUCapabilities. Returns nil on a non-Apple-Silicon Mac.
+//
+// On every other OS it runs nvidia-smi. When nvidia-smi fails but lspci detects
+// NVIDIA hardware, a GPUCapabilities is still returned with the hardware name
+// but empty Tag/VRAMTag fields so the GPU is visible in status displays without
+// producing routing tags. Returns nil when no NVIDIA hardware is detected at all.
 func DetectGPUCapabilities() *GPUCapabilities {
+	if runtime.GOOS == "darwin" {
+		return detectAppleGPUCapabilities()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=name,memory.total,count", "--format=csv,noheader,nounits")
@@ -136,6 +151,55 @@ func DetectGPUCapabilities() *GPUCapabilities {
 	return &GPUCapabilities{
 		Devices:      devices,
 		Count:        totalCount,
+		DriverStatus: "ok",
+	}
+}
+
+// detectAppleGPUCapabilities reports the Apple Silicon integrated GPU as a
+// unified-memory device. It is the live-host wiring: it reads the chipset via
+// the macOS Metal detector and total RAM via gopsutil, then defers the actual
+// assembly to the pure buildAppleGPUCapabilities. Returns nil on a Mac that is
+// not Apple Silicon (e.g. an Intel Mac), which has no unified GPU to advertise.
+func detectAppleGPUCapabilities() *GPUCapabilities {
+	detector := &platform.DarwinGPUDetector{}
+	if !detector.HasGPU() {
+		return nil
+	}
+	infos, err := detector.GetGPUInfo()
+	if err != nil {
+		return nil
+	}
+	for _, g := range infos {
+		if g.Unified {
+			return buildAppleGPUCapabilities(g.Name, platform.TotalRAMBytes())
+		}
+	}
+	return nil
+}
+
+// buildAppleGPUCapabilities assembles the GPUCapabilities for an Apple Silicon
+// node from its chipset model and total unified memory. It is pure (no host
+// access), so it is unit-testable on any platform by injecting the chipset and
+// RAM figure. Returns nil if the chipset is not Apple Silicon.
+func buildAppleGPUCapabilities(chipset string, totalRAMBytes uint64) *GPUCapabilities {
+	family := platform.AppleGPUFamily(chipset)
+	if family == "" {
+		return nil
+	}
+	budgetMB := platform.UnifiedMemoryBudgetMB(totalRAMBytes)
+	vramTag := ""
+	if gb := NormalizeVRAM(strconv.Itoa(budgetMB)); gb != "" {
+		vramTag = gb + "gb"
+	}
+	return &GPUCapabilities{
+		Devices: []GPUDevice{{
+			Name:    chipset,
+			VRAMMb:  budgetMB,
+			Tag:     "apple-" + family,
+			VRAMTag: vramTag,
+			Unified: true,
+		}},
+		Count:        1,
 		DriverStatus: "ok",
 	}
 }
@@ -363,10 +427,32 @@ func ResolveQueues(caps []Capability, baseQueue string) []string {
 	return queues
 }
 
+// hasDiscreteGPU reports whether any device is a discrete (non-unified) GPU —
+// dedicated VRAM, as opposed to an Apple Silicon unified-memory GPU. Queue
+// routing keys on this so an Apple Silicon node does NOT join the discrete-GPU
+// inference queues just because it now advertises an apple GPU device: its
+// inference path stays the serving-gated gpu-general subscription in
+// InferenceQueues (citadel-cli#606), byte-identical to before an apple device
+// was reported.
+func (g *GPUCapabilities) hasDiscreteGPU() bool {
+	if g == nil {
+		return false
+	}
+	for _, d := range g.Devices {
+		if !d.Unified {
+			return true
+		}
+	}
+	return false
+}
+
 // GPUInferenceQueues returns the GPU inference queues a node should consume when
-// it has at least one GPU: the gpu-general base queue plus every gpu/engine/vram
-// capability tag queue. It returns nil for a node with no GPU, which must NOT
-// join the gpu-general base queue.
+// it has at least one DISCRETE GPU: the gpu-general base queue plus every
+// gpu/engine/vram capability tag queue. It returns nil for a node with no GPU —
+// and for an Apple Silicon (unified-memory only) node, which must NOT join the
+// discrete-GPU queues; such a node reaches inference via InferenceQueues'
+// serving-gated gpu-general subscription instead (citadel-cli#606). Neither
+// case may join gpu-general here.
 //
 // This lets an API-mode worker self-subscribe to the GPU queues from its own
 // locally-detected hardware. In API mode the server's worker-config currently
@@ -374,7 +460,7 @@ func ResolveQueues(caps []Capability, baseQueue string) []string {
 // jobs:v1:gpu-general (+ gpu tag queues) with a target_node would otherwise never
 // reach a GPU node (issue #6315).
 func GPUInferenceQueues(caps *NodeCapabilities) []string {
-	if caps == nil || caps.GPU == nil || len(caps.GPU.Devices) == 0 {
+	if caps == nil || caps.GPU == nil || !caps.GPU.hasDiscreteGPU() {
 		return nil
 	}
 	tagCaps := make([]Capability, 0, len(caps.Tags))

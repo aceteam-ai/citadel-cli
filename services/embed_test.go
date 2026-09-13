@@ -40,7 +40,7 @@ func TestSGLangComposeRegistered(t *testing.T) {
 // TestGetAvailableServicesIncludesSGLang ensures sglang appears in the
 // sorted available services list.
 func TestGetAvailableServicesIncludesSGLang(t *testing.T) {
-	available := GetAvailableServices()
+	available := availableServicesFor("linux")
 	found := false
 	for _, s := range available {
 		if s == "sglang" {
@@ -104,7 +104,7 @@ func TestTEIComposeContract(t *testing.T) {
 // TestGetAvailableServicesIncludesTEI ensures tei is advertised as a deployable
 // service so the fabric can schedule the sovereign-embedding module to a node.
 func TestGetAvailableServicesIncludesTEI(t *testing.T) {
-	for _, s := range GetAvailableServices() {
+	for _, s := range availableServicesFor("linux") {
 		if s == "tei" {
 			return
 		}
@@ -124,7 +124,7 @@ func TestDiffusersComposeRegistered(t *testing.T) {
 // TestGetAvailableServicesIncludesDiffusers ensures diffusers appears in the
 // sorted available services list.
 func TestGetAvailableServicesIncludesDiffusers(t *testing.T) {
-	available := GetAvailableServices()
+	available := availableServicesFor("linux")
 	found := false
 	for _, s := range available {
 		if s == "diffusers" {
@@ -160,7 +160,7 @@ func TestBonsaiComposeRegistered(t *testing.T) {
 		t.Fatal("bonsai not found in ServiceMap")
 	}
 	found := false
-	for _, s := range GetAvailableServices() {
+	for _, s := range availableServicesFor("linux") {
 		if s == "bonsai" {
 			found = true
 			break
@@ -227,7 +227,7 @@ func TestKokoroComposeRegistered(t *testing.T) {
 		t.Fatal("kokoro not found in ServiceMap")
 	}
 	found := false
-	for _, s := range GetAvailableServices() {
+	for _, s := range availableServicesFor("linux") {
 		if s == "kokoro" {
 			found = true
 			break
@@ -280,7 +280,7 @@ func TestOmniVoiceComposeRegistered(t *testing.T) {
 		t.Fatal("omnivoice not found in ServiceMap")
 	}
 	found := false
-	for _, s := range GetAvailableServices() {
+	for _, s := range availableServicesFor("linux") {
 		if s == "omnivoice" {
 			found = true
 			break

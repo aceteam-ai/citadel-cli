@@ -228,3 +228,62 @@ func TestRunDoctorChecksNoCrash(t *testing.T) {
 		t.Fatalf("expected renderDoctorReport to write output")
 	}
 }
+
+// TestDoctorReportOK_DarwinDockerOptional pins citadel-cli#1042: on macOS Docker
+// Desktop is optional, so an unusable engine must NOT fail the exit code.
+func TestDoctorReportOK_DarwinDockerOptional(t *testing.T) {
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{
+			OK:      false,
+			Code:    "cli_missing",
+			Message: "docker CLI not found on PATH.",
+		},
+		doctor:         healthyDoctorPayload(),
+		dockerOptional: true,
+	}
+	if !r.ok() {
+		t.Fatalf("expected ok()=true on darwin (Docker optional) even with docker unusable")
+	}
+}
+
+// TestRunDoctorChecksForWiresDockerOptional pins that runDoctorChecks resolves
+// dockerOptional FROM the isDarwin signal (not a hardcoded false), so a future
+// refactor dropping that wiring is caught even though CI runs on Linux where the
+// darwin branch never executes end-to-end.
+func TestRunDoctorChecksForWiresDockerOptional(t *testing.T) {
+	if r := runDoctorChecksFor(true); !r.dockerOptional {
+		t.Errorf("runDoctorChecksFor(true) must set dockerOptional")
+	}
+	if r := runDoctorChecksFor(false); r.dockerOptional {
+		t.Errorf("runDoctorChecksFor(false) must not set dockerOptional")
+	}
+}
+
+// TestRenderDoctorReport_DarwinDockerOptional pins the render: an unusable
+// engine on darwin is a [WARN] with an explanatory note and an overall OK, not
+// a [FAIL]/PROBLEMS DETECTED.
+func TestRenderDoctorReport_DarwinDockerOptional(t *testing.T) {
+	var buf bytes.Buffer
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{
+			OK:      false,
+			Code:    "cli_missing",
+			Message: "docker CLI not found on PATH.",
+		},
+		doctor:         healthyDoctorPayload(),
+		dockerOptional: true,
+	}
+	renderDoctorReport(&buf, r)
+	out := buf.String()
+
+	for _, want := range []string{"[WARN]", "optional on macOS", "Overall: OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered darwin report missing %q\nfull output:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"[FAIL]", "PROBLEMS DETECTED"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("darwin (docker optional) report should not contain %q\nfull output:\n%s", unwanted, out)
+		}
+	}
+}

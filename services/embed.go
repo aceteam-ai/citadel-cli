@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 )
 
@@ -108,12 +109,63 @@ func WriteAuxFiles(servicesDir, name string) error {
 	return nil
 }
 
-// GetAvailableServices returns a sorted list of service names.
-func GetAvailableServices() []string {
+// darwinCapableServices is the ALLOW-LIST of embedded engines that can run on
+// macOS (darwin). It is deliberately an allow-list, not a deny-list
+// (citadel-cli#1042): a newly added engine is hidden on darwin by default until
+// it is explicitly classified, so a CUDA-only engine can never be advertised on
+// a Mac by omission. TestServiceMapDarwinClassificationExhaustive forces every
+// ServiceMap key to be classified as darwin-capable or linux-only.
+//
+// This reflects engine SOFTWARE capability on macOS, per the issue's explicit
+// direction (keep ollama/llama.cpp, drop vLLM/CUDA-only). CAVEAT: the LLM engine
+// compose files (ollama, llamacpp, lmstudio) currently declare an NVIDIA GPU
+// reservation and llamacpp pins a CUDA image tag; whether they start unmodified
+// under Docker Desktop on Apple Silicon is unverified and tracked as a follow-up
+// (needs a real Mac to confirm). This filter's job is to stop advertising the
+// unambiguously CUDA-only engines a Mac can never run.
+var darwinCapableServices = map[string]bool{
+	"ollama":     true,
+	"llamacpp":   true,
+	"lmstudio":   true,
+	"transcribe": true,
+	"kokoro":     true,
+	"tei":        true,
+	"extraction": true,
+}
+
+// linuxOnlyServices names the embedded engines that are CUDA-only (a CUDA image
+// and/or a mandatory NVIDIA runtime) and therefore never advertised on darwin.
+// It exists only so TestServiceMapDarwinClassificationExhaustive can prove every
+// ServiceMap key is classified exactly once — the runtime filter keys off
+// darwinCapableServices (the allow-list) alone.
+var linuxOnlyServices = map[string]bool{
+	"vllm":          true,
+	"sglang":        true,
+	"bonsai":        true,
+	"diffusers":     true,
+	"unlimited-ocr": true,
+	"omnivoice":     true,
+}
+
+// availableServicesFor returns the sorted service names available on the given
+// GOOS. On darwin, engines not in darwinCapableServices are filtered out; every
+// other OS gets the full ServiceMap. It is split from GetAvailableServices so
+// the GOOS filter is unit-testable off-host (this build runs on linux CI).
+func availableServicesFor(goos string) []string {
 	keys := make([]string, 0, len(ServiceMap))
 	for k := range ServiceMap {
+		if goos == "darwin" && !darwinCapableServices[k] {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// GetAvailableServices returns a sorted list of service names this build can
+// deploy on the current OS. On macOS the list excludes CUDA-only engines so a
+// Mac never advertises an engine it cannot start (citadel-cli#1042).
+func GetAvailableServices() []string {
+	return availableServicesFor(runtime.GOOS)
 }

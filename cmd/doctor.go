@@ -40,6 +40,12 @@ import (
 type doctorReport struct {
 	dockerHealth platform.DockerHealth
 	doctor       map[string]any
+	// dockerOptional is true on platforms where a working container engine is
+	// not required for a healthy node — darwin (citadel-cli#1042): Docker
+	// Desktop is optional on a Mac, and a Mac cannot run the CUDA engines that
+	// need it anyway (see services.GetAvailableServices' GOOS filter). When set,
+	// an unusable engine is a WARN, not a FAIL, and does not fail the exit code.
+	dockerOptional bool
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Only the
@@ -50,17 +56,26 @@ type doctorReport struct {
 // would make the exit code fire on every idle node if it were included --
 // that is expected standalone state, not a problem to report.
 func (r doctorReport) ok() bool {
-	return r.dockerHealth.OK
+	return r.dockerHealth.OK || r.dockerOptional
 }
 
 // runDoctorChecks gathers the checks doctorReport wires together. Split out
 // from doctorRunE so tests can exercise rendering/exit-code logic against a
 // hand-built doctorReport without touching a real docker/podman install.
 func runDoctorChecks() doctorReport {
+	return runDoctorChecksFor(platform.IsDarwin())
+}
+
+// runDoctorChecksFor is the seam runDoctorChecks wraps: isDarwin is passed in so
+// a test can pin that the darwin branch (Docker optional) is wired to
+// platform.IsDarwin() without needing to run on a Mac. runDoctorChecks resolves
+// the real value; a hand-built doctorReport in a test would bypass this wiring.
+func runDoctorChecksFor(isDarwin bool) doctorReport {
 	bin := catalog.SelectContainerRuntime().EngineBin
 	return doctorReport{
-		dockerHealth: platform.CheckDockerUsable(bin),
-		doctor:       agentDoctor(worker.WorkerSnapshot{}),
+		dockerHealth:   platform.CheckDockerUsable(bin),
+		doctor:         agentDoctor(worker.WorkerSnapshot{}),
+		dockerOptional: isDarwin,
 	}
 }
 
@@ -69,9 +84,15 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 	headerColor.Fprintln(w, "--- 🩺 Citadel Doctor ---")
 
 	headerColor.Fprintln(w, "\nDOCKER / ENGINE")
-	if r.dockerHealth.OK {
+	switch {
+	case r.dockerHealth.OK:
 		fmt.Fprintf(w, "  %s docker/engine usable\n", goodColor.Sprint("[OK]"))
-	} else {
+	case r.dockerOptional:
+		// Docker Desktop is optional on macOS (citadel-cli#1042); an unusable
+		// engine is not a failure there.
+		fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[WARN]"), r.dockerHealth.String())
+		fmt.Fprintln(w, faintColor.Sprint("  (Docker Desktop is optional on macOS; install it only to run container-based services)"))
+	default:
 		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("[FAIL]"), r.dockerHealth.String())
 	}
 
