@@ -1,0 +1,65 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module-reservations-release - Release a GPU reservation, restoring the services it evicted
+
+
+.SH SYNOPSIS
+\fBcitadel module reservations release  [flags]\fP
+
+
+.SH DESCRIPTION
+Restarts every service still tagged evicted_by_job==, restores each
+one's prior desired_status, and clears the reservation tag -- exactly what
+\&'citadel run --exclusive' does automatically on Ctrl-C. Safe to call more
+than once: a service that already came back (or was never evicted) is
+skipped.  for an exclusive run is "exclusive:" (see
+\&'citadel module reservations list' to read it back, or reconstruct it
+directly -- the format is a stable, documented contract).
+
+
+.SH OPTIONS
+\fB--dry-run\fP[=false]
+	Print what would be restored without doing it
+
+.PP
+\fB--expect-node\fP=""
+	Refuse to act unless the resolved node's identity (name, hostname, or mesh ID) matches this value
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for release
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  citadel module reservations release exclusive:bonsai
+  citadel module reservations release exclusive:bonsai --dry-run
+  citadel module reservations release exclusive:bonsai --expect-node my-test-node
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-module-reservations(1)\fP

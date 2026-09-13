@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-work - Start services and run the job worker (primary node command)
@@ -85,6 +85,10 @@ Examples:
 .PP
 \fB--device-code\fP=""
 	Device authorization code for config lookup (or set CITADEL_DEVICE_CODE env)
+
+.PP
+\fB--egress-relay\fP[=false]
+	Force-enable the on-node SOCKS5 egress relay regardless of persisted config/env (see 'citadel egress-relay')
 
 .PP
 \fB--gateway\fP[=true]
@@ -226,6 +230,10 @@ Examples:
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

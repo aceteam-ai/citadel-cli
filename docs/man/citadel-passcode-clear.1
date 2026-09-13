@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-passcode-clear - Clear the node passcode
@@ -11,8 +11,8 @@ citadel-passcode-clear - Clear the node passcode
 
 .SH DESCRIPTION
 Clears the per-node passcode. This FAILS CLOSED: with no passcode set, every
-sensitive remote-access surface (Console/Desktop/Files) stays denied even if
-it is enabled, until 'citadel passcode set' is run again.
+sensitive remote-access surface (Console/Desktop/Files/Shell) stays denied even
+if it is enabled, until 'citadel passcode set' is run again.
 
 .PP
 Takes effect immediately, without restarting the worker.
@@ -34,6 +34,10 @@ Takes effect immediately, without restarting the worker.
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

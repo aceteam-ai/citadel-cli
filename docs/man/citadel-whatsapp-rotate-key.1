@@ -1,0 +1,65 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-whatsapp-rotate-key - Rotate the WhatsApp bridge admin secret (ADMIN_API_KEY)
+
+
+.SH SYNOPSIS
+\fBcitadel whatsapp rotate-key [flags]\fP
+
+
+.SH DESCRIPTION
+Generate a fresh admin secret for the bridge control plane, atomically
+rewrite its 0600 env file (preserving the tenant keys and every other setting),
+recreate the bridge so it picks up the new key, and verify the new key
+authenticates against the bridge's admin API.
+
+.PP
+Only the ADMIN key is rotated. The per-tenant data-plane keys the AceTeam
+platform stores are left untouched, so an already-linked WhatsApp session and
+its registered api_key keep working.
+
+.PP
+The admin key bytes are never printed; only the old and new key fingerprints
+(sha256:...) are shown.
+
+.PP
+Privileges: the bridge env file is written 0600 and is usually owned by the
+root \fBcitadel work\fR worker. Run rotate-key with the SAME privileges that
+started the worker (e.g. sudo) so it can rewrite that file and recreate the
+bridge.
+
+
+.SH OPTIONS
+\fB--dry-run\fP[=false]
+	Show what would rotate (env file path, current fingerprint) without touching anything.
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for rotate-key
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-whatsapp(1)\fP

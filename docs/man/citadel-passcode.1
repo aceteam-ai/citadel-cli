@@ -1,8 +1,8 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-passcode - Manage the node passcode that gates Console/Desktop/Files access
+citadel-passcode - Manage the node passcode that gates Console/Desktop/Files/Shell access
 
 
 .SH SYNOPSIS
@@ -11,9 +11,10 @@ citadel-passcode - Manage the node passcode that gates Console/Desktop/Files acc
 
 .SH DESCRIPTION
 The node passcode (aceteam#6524) gates the sensitive remote-access surfaces
-(Console/terminal, Desktop/VNC/screen, and Files) once an operator has
-enabled them. Enabling a surface is not enough by itself: without a passcode
-set, that surface fails closed (access denied) even though it is enabled.
+(Console/terminal, Desktop/VNC/screen, Files, and Shell/SHELL_COMMAND) once an
+operator has enabled them. Enabling a surface is not enough by itself: without
+a passcode set, that surface fails closed (access denied) even though it is
+enabled.
 
 .PP
 Use 'citadel passcode set' to set or change it, and 'citadel passcode clear'
@@ -38,9 +39,13 @@ to remove it (which re-locks every enabled sensitive surface).
 	Disable colorized output
 
 .PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
 \fB--runtime\fP=""
 	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-passcode-clear(1)\fP, \fBcitadel-passcode-set(1)\fP
+\fBcitadel(1)\fP, \fBcitadel-passcode-clear(1)\fP, \fBcitadel-passcode-enroll(1)\fP, \fBcitadel-passcode-rotate(1)\fP, \fBcitadel-passcode-set(1)\fP, \fBcitadel-passcode-status(1)\fP

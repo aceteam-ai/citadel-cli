@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-passcode-set - Set or change the node passcode
@@ -10,8 +10,8 @@ citadel-passcode-set - Set or change the node passcode
 
 
 .SH DESCRIPTION
-Sets the per-node passcode that gates Console/Desktop/Files remote access
-(aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
+Sets the per-node passcode that gates Console/Desktop/Files/Shell remote
+access (aceteam#6524). This is what a client (e.g. 'citadel connect') must present,
 in addition to a valid token or verified mesh-peer identity, before an
 enabled sensitive surface will actually respond.
 
@@ -44,6 +44,10 @@ visible to other users on the machine via 'ps'.
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

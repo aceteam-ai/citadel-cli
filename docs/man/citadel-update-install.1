@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-update-install - Download and install the latest version
@@ -17,10 +17,21 @@ backs up the current version, and installs the new binary.
 If the new version fails to start, it will automatically roll back
 to the previous version.
 
+.PP
+If citadel is running as a managed service (systemd/launchd/Windows
+service), swapping the binary on disk does NOT restart the already-running
+process -- it keeps executing the old code until something restarts it
+(citadel#454). This command detects that and warns loudly by default; pass
+--restart to have it restart the managed service for you.
+
 
 .SH OPTIONS
 \fB-h\fP, \fB--help\fP[=false]
 	help for install
+
+.PP
+\fB--restart\fP[=false]
+	Restart the managed citadel service (if any) after installing, so the new binary actually runs. Before restarting, waits up to 30s for the running worker's in-flight jobs to finish (best-effort, via GET /worker; citadel#887) -- restarts anyway once that elapses. If /worker is unreachable (an older worker predating the route, or no status listener at all) the wait is skipped entirely and this restarts immediately, same as before #887. Unlike the automatic AGENT_UPDATE/auto-updater paths, this is not a hard drain: it does not stop new jobs from being picked up while waiting.
 
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
@@ -34,6 +45,10 @@ to the previous version.
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

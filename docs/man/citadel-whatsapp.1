@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-whatsapp - Deploy and manage the WhatsApp bridge community module
@@ -43,9 +43,13 @@ Typical flow:
 	Disable colorized output
 
 .PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
 \fB--runtime\fP=""
 	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-whatsapp-connect(1)\fP, \fBcitadel-whatsapp-down(1)\fP, \fBcitadel-whatsapp-qr(1)\fP, \fBcitadel-whatsapp-status(1)\fP, \fBcitadel-whatsapp-up(1)\fP
+\fBcitadel(1)\fP, \fBcitadel-whatsapp-connect(1)\fP, \fBcitadel-whatsapp-down(1)\fP, \fBcitadel-whatsapp-qr(1)\fP, \fBcitadel-whatsapp-rotate-key(1)\fP, \fBcitadel-whatsapp-status(1)\fP, \fBcitadel-whatsapp-up(1)\fP

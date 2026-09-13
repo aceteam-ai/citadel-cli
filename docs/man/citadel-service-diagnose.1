@@ -1,0 +1,68 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-service-diagnose - Diagnose why a managed service is down or unhealthy
+
+
+.SH SYNOPSIS
+\fBcitadel service diagnose  [flags]\fP
+
+
+.SH DESCRIPTION
+Reports, in one command, why a MANAGED service (declared in citadel.yaml or
+available from the embedded catalog) is down or behaving unexpectedly:
+.IP \(bu 2
+Container state + exit code, and the salient root-error line pulled from
+the tail of its log.
+.IP \(bu 2
+The effective compose command + resolved environment (secrets redacted).
+.IP \(bu 2
+Best-effort preflight checks: a missing/empty required compose variable,
+whether the service's declared VRAM need fits current free VRAM, and
+cheap error-pattern hints (OOM, trust_remote_code, port-in-use, ...).
+.IP \(bu 2
+A single synthesized most-likely cause and suggested next action.
+
+.PP
+This is read-only: it never starts, stops, restarts, or reconfigures
+anything. Every check degrades to "unknown" rather than failing the command
+when its input (docker, GPU, a log) isn't available.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for diagnose
+
+.PP
+\fB--json\fP[=false]
+	Output the diagnosis as JSON
+
+.PP
+\fB--tail\fP=200
+	Number of log lines to fetch/scan from the container's log tail
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-service(1)\fP

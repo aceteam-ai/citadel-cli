@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-run - Start services (all if no service specified, or a specific one)
@@ -24,12 +24,16 @@ Note: For production use, consider 'citadel work' which starts services AND runs
 the job worker in a single command.
 
 .PP
-Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, sglang, tei, transcribe, unlimited-ocr, vllm
+Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, ollama, omnivoice, sglang, tei, transcribe, unlimited-ocr, vllm
 
 
 .SH OPTIONS
 \fB-d\fP, \fB--detach\fP[=true]
 	Run in detached mode (background).
+
+.PP
+\fB--exclusive\fP[=false]
+	Reserve the GPU exclusively for this service: durably evict every other non-pinned service first, then start this one. Restores evicted peers on Ctrl-C (or immediately, under --detach=true, once the service is up -- see --detach). See 'citadel module reservations' to inspect or manually release a stuck reservation.
 
 .PP
 \fB-f\fP, \fB--force\fP[=false]
@@ -43,6 +47,10 @@ Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, o
 \fB-r\fP, \fB--restart\fP[=false]
 	Restart services instead of starting fresh.
 
+.PP
+\fB--vram\fP=0
+	With --exclusive, reserve exactly this many GB (an ordinary, satisfiable Reserve) instead of the default of evicting every non-pinned service unconditionally.
+
 
 .SH OPTIONS INHERITED FROM PARENT COMMANDS
 \fB--debug\fP[=false]
@@ -55,6 +63,10 @@ Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, o
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""
@@ -74,6 +86,9 @@ Available services: bonsai, diffusers, extraction, kokoro, llamacpp, lmstudio, o
 
   # Start in foreground mode
   citadel run ollama --detach=false
+
+  # Reserve the GPU exclusively for one service, evicting everything else non-pinned first
+  citadel run bonsai --exclusive --detach=false
 
   # Recommended: Start services + worker together
   citadel work --mode=nexus

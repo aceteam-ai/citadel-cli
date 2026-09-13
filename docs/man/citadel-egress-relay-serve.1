@@ -1,0 +1,59 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-egress-relay-serve - Run as a pure egress relay (no worker, no Redis) until interrupted
+
+
+.SH SYNOPSIS
+\fBcitadel egress-relay serve [flags]\fP
+
+
+.SH DESCRIPTION
+Run this node as a PURE mesh egress relay: it joins the AceTeam Network,
+starts the same SOCKS5 egress-relay listener 'citadel work --egress-relay'
+starts, and stays up until Ctrl-C -- with NO Redis job source and NO worker
+loop. This is for a headless node behind a restrictive firewall that should be
+an egress exit for other same-org nodes without also being a full job worker
+(citadel #1033).
+
+.PP
+Unlike the 'citadel work' auto-start path, this command force-enables the relay
+(running it IS the intent), so it does NOT consult the 'egress-relay enable'
+toggle. The LAN/mesh deny-list still defaults ON and is only relaxed via
+\&'citadel egress-relay allow-lan on' or CITADEL_EGRESS_ALLOW_LAN -- there is
+deliberately no flag to force it off.
+
+.PP
+The node must already be logged in ('citadel login' or 'citadel init'); the
+relay is mesh-only and needs a network identity.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for serve
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-egress-relay(1)\fP

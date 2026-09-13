@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-module - Install service modules from any standardized git repo
@@ -51,9 +51,13 @@ an SSH key, or a configured git credential helper).
 	Disable colorized output
 
 .PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
 \fB--runtime\fP=""
 	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-module-gc(1)\fP, \fBcitadel-module-info(1)\fP, \fBcitadel-module-install(1)\fP, \fBcitadel-module-list(1)\fP, \fBcitadel-module-search(1)\fP, \fBcitadel-module-trust(1)\fP, \fBcitadel-module-trusted(1)\fP, \fBcitadel-module-untrust(1)\fP, \fBcitadel-module-update(1)\fP
+\fBcitadel(1)\fP, \fBcitadel-module-gc(1)\fP, \fBcitadel-module-info(1)\fP, \fBcitadel-module-install(1)\fP, \fBcitadel-module-list(1)\fP, \fBcitadel-module-reservations(1)\fP, \fBcitadel-module-restart(1)\fP, \fBcitadel-module-search(1)\fP, \fBcitadel-module-start(1)\fP, \fBcitadel-module-stop(1)\fP, \fBcitadel-module-trust(1)\fP, \fBcitadel-module-trusted(1)\fP, \fBcitadel-module-untrust(1)\fP, \fBcitadel-module-update(1)\fP

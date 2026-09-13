@@ -1,0 +1,58 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-doctor - Diagnose common node problems (docker/engine usability, job-routing health)
+
+
+.SH SYNOPSIS
+\fBcitadel doctor [flags]\fP
+
+
+.SH DESCRIPTION
+citadel doctor runs a quick, scriptable health check by wiring together
+existing diagnostics rather than reimplementing detection logic:
+.IP \(bu 2
+Docker/engine usability (the same preflight used before starting a
+docker-based service): is the CLI on PATH, is the daemon reachable, and
+if not, what's the platform-specific fix?
+.IP \(bu 2
+Job-routing / worker health (the same diagnosis served by a live
+\&'citadel work'/'citadel up' at /agent/doctor): identity resolution,
+per-node stream subscription, and recent poll activity. Since a
+standalone 'citadel doctor' has no live worker to inspect, this section
+is shown for context only and does not affect the exit code.
+
+.PP
+Exits non-zero if the docker/engine preflight fails, so it can be used in
+scripts and health checks.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for doctor
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

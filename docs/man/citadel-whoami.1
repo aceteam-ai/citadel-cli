@@ -1,0 +1,61 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-whoami - Show this node's self-identity (name, mesh ID, org, version)
+
+
+.SH SYNOPSIS
+\fBcitadel whoami [flags]\fP
+
+
+.SH DESCRIPTION
+citadel whoami answers "am I on a Citadel node, and what is its identity?"
+using local/persisted state. It requires neither sudo nor a live
+\&'citadel work'/'citadel up' process -- an unregistered or offline host still
+prints a well-formed report with the unavailable fields called out.
+
+.PP
+It also refreshes a stable local cache at
+/identity.json (network.GetNodeConfigDir()) so an agent or
+script can read a node's identity with a single file read instead of
+re-deriving it every time.
+
+.PP
+Note: there is currently no numeric AceTeam fabric/platform node ID available
+locally -- only the mesh (Headscale) node ID can be resolved from this host.
+See aceteam #8139.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for whoami
+
+.PP
+\fB--json\fP[=false]
+	Output in JSON format
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP

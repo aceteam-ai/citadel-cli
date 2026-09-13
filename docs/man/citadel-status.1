@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-status - Shows a comprehensive status of the Citadel node
@@ -13,6 +13,13 @@ citadel-status - Shows a comprehensive status of the Citadel node
 Provides a full health check and resource overview of the Citadel node.
 It checks network connectivity, system vitals (CPU, RAM, Disk), GPU status,
 and the state of all managed services.
+
+.PP
+The Backend: line reports whether this node's durable heartbeat write is
+reaching the AceTeam control plane (reachable/degraded/DOWN/unknown). Note:
+in direct-Redis mode this measures reachability of redis.aceteam.ai, not the
+HTTPS API; in the normal API mode (post-'citadel init'), they are the same
+backend.
 
 
 .SH OPTIONS
@@ -39,6 +46,10 @@ and the state of all managed services.
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

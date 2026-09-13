@@ -1,0 +1,48 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-agents - Discover vendor coding agents installed on this node
+
+
+.SH SYNOPSIS
+\fBcitadel agents [flags]\fP
+
+
+.SH DESCRIPTION
+Detects vendor coding-agent CLIs already installed and authenticated on this
+node, for the node's own account — not a container or binary AceTeam ships.
+
+.PP
+This is discovery only. It never spawns, drives, or runs a turn of any
+vendor agent.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for agents
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel(1)\fP, \fBcitadel-agents-probe(1)\fP

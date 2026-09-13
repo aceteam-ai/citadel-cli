@@ -1,0 +1,68 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-passcode-enroll - Migrate this node to the master PIN (one-time, deletes the legacy passcode)
+
+
+.SH SYNOPSIS
+\fBcitadel passcode enroll [flags]\fP
+
+
+.SH DESCRIPTION
+Enrolls the node master PIN (aceteam-ai/citadel-cli#796).
+
+.PP
+The master PIN both gates online access (Console/Desktop/Files/Shell) AND is the
+only key to any data this node encrypts at rest. Enrollment is a one-time
+migration off the legacy bcrypt passcode: you re-enter the current passcode (to
+prove ownership) and choose a new master PIN, after which the legacy passcode
+hash is deleted — a bcrypt hash cannot yield an encryption key, and leaving it
+behind would remain a cheap offline brute-force target.
+
+.PP
+WARNING: if you forget the master PIN, or the node's on-disk pepper file is
+lost, any data encrypted under it is permanently unrecoverable — not by you, not
+by AceTeam. This is the zero-knowledge property working as designed.
+
+.PP
+The master PIN also grants full remote access to this machine (console, screen,
+files, shell). Anyone who holds it has the same power. Set it locally only.
+
+
+.SH OPTIONS
+\fB--ack-data-loss\fP[=false]
+	acknowledge that forgetting the master PIN (or losing the node pepper) permanently destroys encrypted data (required for non-interactive/piped use)
+
+.PP
+\fB--assume-no-legacy-passcode\fP[=false]
+	override a failed check for an existing legacy node passcode (e.g. a candidate config location could not be read) and enroll as if none was ever set; only pass this if you are certain
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for enroll
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-passcode(1)\fP

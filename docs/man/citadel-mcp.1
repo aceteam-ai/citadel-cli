@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-mcp - Start a local MCP server for AI tool integration
@@ -25,7 +25,7 @@ Authentication uses an AceTeam API key. Generate one at:
 The API key is read from (in priority order):
   1. --api-key flag
   2. ACETEAM_API_KEY environment variable
-  3. ~/.citadel-cli/config.yaml (device_api_token from 'citadel init')
+  3. the node's device config saved by 'citadel init' (device_api_token)
 
 .PP
 Usage with Claude Code:
@@ -68,6 +68,10 @@ Usage with environment variable:
 .PP
 \fB--no-color\fP[=false]
 	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
 
 .PP
 \fB--runtime\fP=""

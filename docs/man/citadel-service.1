@@ -1,5 +1,5 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
 citadel-service - Manage Citadel as a system service
@@ -39,9 +39,13 @@ On Windows: Creates a Windows Service (always system-wide)
 	Disable colorized output
 
 .PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
 \fB--runtime\fP=""
 	Container runtime for module containers: docker or podman (default: auto-detect)
 
 
 .SH SEE ALSO
-\fBcitadel(1)\fP, \fBcitadel-service-catalog(1)\fP, \fBcitadel-service-expose(1)\fP, \fBcitadel-service-install(1)\fP, \fBcitadel-service-start(1)\fP, \fBcitadel-service-status(1)\fP, \fBcitadel-service-stop(1)\fP, \fBcitadel-service-unexpose(1)\fP, \fBcitadel-service-uninstall(1)\fP
+\fBcitadel(1)\fP, \fBcitadel-service-catalog(1)\fP, \fBcitadel-service-diagnose(1)\fP, \fBcitadel-service-expose(1)\fP, \fBcitadel-service-install(1)\fP, \fBcitadel-service-start(1)\fP, \fBcitadel-service-status(1)\fP, \fBcitadel-service-stop(1)\fP, \fBcitadel-service-unexpose(1)\fP, \fBcitadel-service-uninstall(1)\fP

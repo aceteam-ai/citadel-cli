@@ -1,0 +1,80 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module-start - Start a single module (scoped: no other module is touched, the worker is not restarted)
+
+
+.SH SYNOPSIS
+\fBcitadel module start  [flags]\fP
+
+
+.SH DESCRIPTION
+Starts one module by name.
+
+.PP
+Clears the module's durable desired_status:stopped marker in the manifest
+(so it also starts again on the next boot), then brings up only that
+module's compose stack. Sibling modules are untouched -- this does NOT
+restart 'citadel work'/'citadel up' and does NOT touch any other module.
+
+.PP
+Already-running is a clean no-op success.
+
+.PP
+Add --dry-run to preview what would happen (resolved node dir, compose file,
+container(s)) without doing it. Add --expect-node  to refuse the
+action (fail closed) unless the resolved node's identity matches -- a safety
+check for scripted/agent use against a specific node.
+
+.PP
+This IS the blessed recovery path for a stopped/crashed service, embedded
+engine (vllm, bonsai, unlimited-ocr, ...) or catalog module alike -- never
+hand-run 'docker compose up' directly: several embedded compose files require
+citadel-injected env vars (e.g. host ports) that only citadel supplies.
+
+
+.SH OPTIONS
+\fB--dry-run\fP[=false]
+	Print what would happen (resolved node dir, compose file, container(s)) without doing it
+
+.PP
+\fB--expect-node\fP=""
+	Refuse to act unless the resolved node's identity (name, hostname, or mesh ID) matches this value
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for start
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  citadel module start vllm
+  citadel module start vllm --dry-run
+  citadel module start vllm --expect-node my-test-node
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-module(1)\fP

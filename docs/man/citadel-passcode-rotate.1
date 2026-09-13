@@ -1,0 +1,49 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-passcode-rotate - Change the master PIN (re-wraps the encryption key; no data re-encryption)
+
+
+.SH SYNOPSIS
+\fBcitadel passcode rotate [flags]\fP
+
+
+.SH DESCRIPTION
+Rotates the node master PIN. Re-derives the key from the new PIN and re-wraps
+the existing data-encryption key — already-encrypted data is untouched and is
+NOT re-encrypted. Requires the current master PIN.
+
+
+.SH OPTIONS
+\fB--ack-data-loss\fP[=false]
+	acknowledge the data-loss risk (required for non-interactive/piped use)
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for rotate
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-passcode(1)\fP

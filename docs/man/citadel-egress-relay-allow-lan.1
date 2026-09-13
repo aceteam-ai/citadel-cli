@@ -1,0 +1,46 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-egress-relay-allow-lan - Allow (or deny) the relay CONNECTing into this node's own LAN/mesh
+
+
+.SH SYNOPSIS
+\fBcitadel egress-relay allow-lan  [flags]\fP
+
+
+.SH DESCRIPTION
+By default the relay refuses to CONNECT to RFC1918 private addresses,
+loopback, link-local, and the 100.64.0.0/10 CGNAT/mesh range -- an authorized
+peer can egress to the public internet through this node but cannot pivot
+into this node's own LAN or mesh. 'allow-lan on' disables that deny-list.
+
+
+.SH OPTIONS
+\fB-h\fP, \fB--help\fP[=false]
+	help for allow-lan
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH SEE ALSO
+\fBcitadel-egress-relay(1)\fP

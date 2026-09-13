@@ -1,8 +1,8 @@
 .nh
-.TH "CITADEL" "1" "Aug 2026" "AceTeam" "Citadel CLI Manual"
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
 
 .SH NAME
-citadel-service-expose - Expose a local service on the AceTeam Network gateway
+citadel-service-expose - Expose a local service or directory on the AceTeam Network gateway
 
 
 .SH SYNOPSIS
@@ -10,14 +10,21 @@ citadel-service-expose - Expose a local service on the AceTeam Network gateway
 
 
 .SH DESCRIPTION
-Serves a local port on this node's gateway at /expose//, gated by a
-visibility level.
+Serves a local port, or a read-only static directory, on this node's gateway
+at /expose//, gated by a visibility level. --port and --path are
+mutually exclusive.
 
 .PP
 private  only the creator (requires a caller identity the backend supplies,
            so a local CLI cannot grant it — use org or link)
   org      any member of your organization on the network
   link     anyone holding the signed, expiring link token
+
+.PP
+A --path directory is confined to this node's workspace
+(--workspace/CITADEL_WORKSPACE on \fBcitadel work\fR) and served with an
+auto-generated index when it has no index.html of its own — no need to run
+your own web server.
 
 .PP
 Requires the node gateway to be running (citadel work).
@@ -28,8 +35,12 @@ Requires the node gateway to be running (citadel work).
 	help for expose
 
 .PP
+\fB--path\fP=""
+	Workspace directory to share read-only, auto-indexed (mutually exclusive with --port)
+
+.PP
 \fB--port\fP=0
-	Local port the service listens on (required)
+	Local port the service listens on (mutually exclusive with --path)
 
 .PP
 \fB--ttl\fP=24h0m0s
@@ -53,6 +64,10 @@ Requires the node gateway to be running (citadel work).
 	Disable colorized output
 
 .PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
 \fB--runtime\fP=""
 	Container runtime for module containers: docker or podman (default: auto-detect)
 
@@ -64,6 +79,9 @@ Requires the node gateway to be running (citadel work).
 
   # Share a dashboard by link for 2 hours
   citadel service expose grafana --port 3000 --visibility link --ttl 2h
+
+  # Share a workspace directory (e.g. OCR results) by link
+  citadel service expose scans --path results/ocr --visibility link --ttl 2h
 .EE
 
 

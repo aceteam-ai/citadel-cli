@@ -1,0 +1,83 @@
+.nh
+.TH "CITADEL" "1" "Sep 2026" "AceTeam" "Citadel CLI Manual"
+
+.SH NAME
+citadel-module-stop - Stop a single module (scoped: no other module is touched, the worker is not restarted)
+
+
+.SH SYNOPSIS
+\fBcitadel module stop  [flags]\fP
+
+
+.SH DESCRIPTION
+Stops one module by name.
+
+.PP
+Sets the module's durable desired_status:stopped marker in the manifest,
+then brings down only that module's compose stack. The stop survives a
+citadel process restart or a reboot -- 'citadel work'/'citadel run' both
+honor the marker and skip the module on boot. Sibling modules keep
+running and the node stays on the fabric -- this does NOT restart
+\&'citadel work'/'citadel up' and does NOT touch any other module.
+
+.PP
+Note: if this node also runs the desired-state PULL reconcile loop and the
+control plane's assignment for this module is still "running", that loop
+will start it again on its next pass -- this command only sets the
+node-local desired state, it does not change what the control plane has
+assigned for the module.
+
+.PP
+Already-stopped is a clean no-op success.
+
+.PP
+Add --dry-run to preview what would happen (resolved node dir, compose file,
+container(s)) without doing it. Add --expect-node  to refuse the
+action (fail closed) unless the resolved node's identity matches -- a safety
+check for scripted/agent use against a specific node.
+
+
+.SH OPTIONS
+\fB--dry-run\fP[=false]
+	Print what would happen (resolved node dir, compose file, container(s)) without doing it
+
+.PP
+\fB--expect-node\fP=""
+	Refuse to act unless the resolved node's identity (name, hostname, or mesh ID) matches this value
+
+.PP
+\fB-h\fP, \fB--help\fP[=false]
+	help for stop
+
+
+.SH OPTIONS INHERITED FROM PARENT COMMANDS
+\fB--debug\fP[=false]
+	Enable debug output
+
+.PP
+\fB--no-auto-update\fP[=false]
+	Disable automatic update checks and installs for this run (or set CITADEL_NO_AUTO_UPDATE=1)
+
+.PP
+\fB--no-color\fP[=false]
+	Disable colorized output
+
+.PP
+\fB--node-dir\fP=""
+	Override the node config directory (citadel.yaml + services/), bypassing $HOME/ConfigDir resolution. Also settable via CITADEL_NODE_DIR. Scope: manifest/services resolution only -- does NOT redirect network state, the module lockfile, or nodevault.
+
+.PP
+\fB--runtime\fP=""
+	Container runtime for module containers: docker or podman (default: auto-detect)
+
+
+.SH EXAMPLE
+.EX
+  citadel module stop vllm
+  citadel module stop vllm --dry-run
+  citadel module stop vllm --expect-node my-test-node
+.EE
+
+
+.SH SEE ALSO
+\fBcitadel-module(1)\fP
