@@ -1,4 +1,4 @@
-// Package aep builds and signs the AEP ("AceTeam Execution Proof") receipt
+// Package aep builds and signs the AEP ("Agentic Execution Protocol") receipt
 // for a single job's output — v1 scope is exactly one receipt kind, the
 // on-node grounding-guardrail result (internal/trust, aceteam #8253's
 // guardrail half, citadel-cli#847). Signing was deferred at that merge (see
