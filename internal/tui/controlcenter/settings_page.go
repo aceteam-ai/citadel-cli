@@ -47,8 +47,8 @@ type SettingsCallbacks struct {
 	SaveMeeting func(*config.Meeting) error
 
 	// LoadEgressRelay returns the current persisted egress-relay setting.
-	// Wired from cmd against network.GetNodeConfigDir() -- NOT
-	// platform.ConfigDir() like the other Settings callbacks -- so this page
+	// Wired from cmd against network.GetNodeConfigDir(), NOT
+	// platform.ConfigDir() like the other Settings callbacks, so this page
 	// converges on the SAME persisted value as the CLI (`citadel
 	// egress-relay`), the local MCP tools, and APPLY_DEVICE_CONFIG (citadel
 	// #787/#980/#979).
@@ -293,7 +293,7 @@ func (p *SettingsPage) toggleEgressRelay() {
 		p.reloadEgressRelay()
 	}
 
-	// Copy and flip only Enabled -- a fresh &config.EgressRelay{Enabled: ...}
+	// Copy and flip only Enabled: a fresh &config.EgressRelay{Enabled: ...}
 	// would zero AllowLAN on save (no omitempty), silently reverting it.
 	nextVal := *p.egressRelay
 	nextVal.Enabled = !p.egressRelay.Enabled
