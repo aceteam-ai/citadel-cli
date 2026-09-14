@@ -1,9 +1,14 @@
-faster-whisper==1.0.3
-# faster-whisper 1.0.3 imports `requests` at module load (faster_whisper/utils.py)
-# but does not declare it, and recent huggingface_hub no longer pulls it in
-# transitively -- so it must be pinned explicitly or the first /transcribe call
-# 500s with ModuleNotFoundError while /health still passes (model is lazy-loaded).
-requests==2.32.3
+# Node-local whisperx STT + speaker-diarization sidecar.
+#
+# whisperx bundles the full pipeline: faster-whisper transcription, wav2vec2
+# forced alignment, and pyannote speaker diarization. It pulls transformers,
+# ctranslate2, faster-whisper and pyannote.audio transitively. torch,
+# torchaudio and torchvision are installed separately in the Dockerfile from
+# the CPU wheel index (whisperx 3.8.x pins ~=2.8.0) to keep the image lean and
+# avoid CUDA (cuDNN/ctranslate2) version drift; the service auto-detects device
+# at runtime.
+whisperx==3.8.6
+
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.4
