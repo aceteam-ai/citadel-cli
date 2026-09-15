@@ -3275,6 +3275,58 @@ deliberately does NOT shell `brew` unattended — it returns a structured
 (`scripts/install.sh`, curl|bash) is NOT brew, so its self-update path is
 unaffected and the acceptance ("self-updating service") holds there.
 
+### Node transcription: sidecar is the SENSOR, Go is the POLICY (citadel #1045)
+
+`TRANSCRIBE_AUDIO` on low-SNR/distant-mic audio used to emit confident
+training-prior hallucinations ("Thank you very much." for a 38-min silent clip,
+a looped Welsh gibberish, "It's a pleasure to meet you." on repeat) with no
+caller control and no "no speech" signal. The fix splits cleanly:
+
+- **`services/whisper-service/app.py` is the SENSOR.** It loads a caller-chosen
+  `model_size` on demand (single-slot cache under `_model_lock` — one model
+  resident at a time so a memory-tight node doesn't OOM; a concurrent
+  transcribe keeps its own reference across a swap), optionally denoises via
+  ffmpeg (`_denoise_to_tmp`, afftdn+band-pass → a CONTAINER-local temp file,
+  never under the read-only `/workspace` mount), passes `vad_filter` /
+  `no_speech_threshold` / `compression_ratio_threshold` / `logprob_threshold`
+  (→ faster-whisper's `log_prob_threshold`) / `condition_on_previous_text`
+  through to decoding, and EXPOSES per-segment `no_speech_prob` / `avg_logprob`
+  / `compression_ratio`. It makes no verdict.
+
+- **`internal/jobs/transcribe_guard.go` is the POLICY.**
+  `evaluateTranscriptionGuard` is a pure, deterministic verdict over those
+  signals + the transcript text; `attachTranscriptionGuard` adds it as the
+  additive `transcription_guard` object on the relayed result (top level decoded
+  as `json.RawMessage`, so every other field is byte-preserved; any parse
+  failure relays verbatim). Thresholds are consts mirroring faster-whisper
+  1.0.3's own decoding defaults. Repetition detection is signal-INDEPENDENT
+  (pure text), so it catches looped filler even against an OLD sidecar image
+  that emits no signals; `signalsPresent` per segment ensures absent signals are
+  never read as a confident `no_speech`. The guard is always-on and advisory —
+  it never alters the transcript.
+
+Param plumbing/validation lives in `applyTranscribeOptions`
+(`internal/jobs/transcribe_audio.go`): only adds a key the payload actually
+carries (so a no-new-param request is byte-identical — pinned by
+`TestApplyTranscribeOptions_NoNewParamsByteIdentical`), validates `model_size`
+against `allowedWhisperModelSizes` (kept in sync with `app.py`'s
+`ALLOWED_MODELS` and faster-whisper's `_MODELS`), and validation runs BEFORE
+`waitForReady` so a bad param fails fast. **The request budget is model-aware:**
+`transcribeTimeoutFor(sizeBytes, modelSize)` scales the base
+(`transcribeTimeoutForAudioBytes`) by a per-model factor + one-time load
+allowance, because a larger model runs several-x slower and downloads+loads its
+weights INSIDE the first `/transcribe` call — a short clip with `medium` would
+otherwise abort at the 2-min floor mid-download. `modelSize==""` reduces to
+exactly the base budget (existing tests unchanged).
+
+**Rebuild + pull required for the sensor half.** The compose pins
+`whisper-service:latest` (a FLOATING tag), so a `SERVICE_START`/`up` alone won't
+upgrade it (the #718 lesson). CI (`.github/workflows/build-whisper-service.yml`)
+rebuilds+pushes on any `services/whisper-service/**` change to main; a node must
+then `docker compose pull` transcribe to get the per-segment signals. Until it
+does, the Go guard still runs but reports `signals_available:false` and relies
+only on the text-repetition / empty-transcript / uncertain-language checks.
+
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
 ```json

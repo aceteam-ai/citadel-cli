@@ -18,7 +18,11 @@ services:
       #   CITADEL_WORKSPACE=/home/<user>/citadel-node/workspace
       - ${CITADEL_WORKSPACE:?set CITADEL_WORKSPACE to an absolute workspace path}:/workspace:ro
     environment:
-      # faster-whisper model size: base = good CPU speed/accuracy tradeoff.
+      # faster-whisper DEFAULT model size: base = good CPU speed/accuracy
+      # tradeoff. A TRANSCRIBE_AUDIO job may override this per-request via the
+      # `model_size` param (citadel#1045); the sidecar loads the requested model
+      # on demand and caches one at a time. This env var is only the fallback
+      # when no per-request model_size is given.
       - WHISPER_MODEL=base
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8

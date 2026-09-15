@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -188,6 +189,11 @@ func transcribeTimeoutForAudioBytes(sizeBytes int64) time.Duration {
 // validatedPath. On stat failure it returns the generous ceiling rather than a
 // small default: under-timing is precisely the failure mode being fixed, and a
 // missing file surfaces as a transcribe error anyway.
+//
+// This is the MODEL-AGNOSTIC budget (today's behavior, kept for the existing
+// tests). The Execute path uses requestTimeoutForModel, which layers a
+// per-model factor + one-time load allowance on top for the larger, slower
+// on-demand models (citadel#1045).
 func (h *TranscribeAudioHandler) requestTimeout(validatedPath string) time.Duration {
 	info, err := os.Stat(validatedPath)
 	if err != nil {
@@ -196,12 +202,175 @@ func (h *TranscribeAudioHandler) requestTimeout(validatedPath string) time.Durat
 	return transcribeTimeoutForAudioBytes(info.Size())
 }
 
+// Model-aware request budget (citadel#1045). The base sizing above assumes
+// faster-whisper "base" (int8) on CPU runs near real time. A caller-selected
+// larger model (small/medium/large-v3) runs several-x slower AND downloads +
+// loads its weights INSIDE the first /transcribe call (health reports ok
+// regardless, since the model is lazy-loaded), so a short clip transcribed with
+// "medium" would otherwise hit the 2-minute floor mid-download. These factors
+// scale the base budget and add a one-time load allowance so the client does
+// not abort a legitimately-slow larger-model pass. Package vars, not consts, so
+// a future operator override is a one-line change and tests can pin them.
+var (
+	// transcribeModelTimeoutFactors multiplies the base (size-derived) budget
+	// per model family. An empty modelSize (the default, no caller override)
+	// and the base tier both resolve to factor 1 with no load allowance, so
+	// requestTimeoutForModel(size, "") == requestTimeoutForAudioBytes(size)
+	// exactly — the byte-identical no-op the "no new params" contract requires.
+	transcribeModelTimeoutFactors = map[string]int{
+		"tiny": 1, "tiny.en": 1,
+		"base": 1, "base.en": 1,
+		"small": 2, "small.en": 2, "distil-small.en": 2,
+		"medium": 4, "medium.en": 4, "distil-medium.en": 4,
+		"large": 8, "large-v1": 8, "large-v2": 8, "large-v3": 8,
+		"distil-large-v2": 6, "distil-large-v3": 6,
+	}
+	// transcribeModelLoadAllowance is the extra one-time budget added for a
+	// larger model's first-request download+load. Keyed by the same names; the
+	// base tier and unset default add nothing.
+	transcribeModelLoadAllowance = map[string]time.Duration{
+		"small": 5 * time.Minute, "small.en": 5 * time.Minute, "distil-small.en": 5 * time.Minute,
+		"medium": 15 * time.Minute, "medium.en": 15 * time.Minute, "distil-medium.en": 15 * time.Minute,
+		"large": 30 * time.Minute, "large-v1": 30 * time.Minute, "large-v2": 30 * time.Minute, "large-v3": 30 * time.Minute,
+		"distil-large-v2": 20 * time.Minute, "distil-large-v3": 20 * time.Minute,
+	}
+)
+
+// transcribeTimeoutFor sizes the per-request budget from the audio byte length
+// AND the selected model. modelSize == "" (or an unrecognized value) reduces to
+// exactly transcribeTimeoutForAudioBytes(sizeBytes), preserving today's default
+// behavior; a larger model scales the budget and adds a load allowance, clamped
+// to [min, max]. Pure and table-testable.
+func transcribeTimeoutFor(sizeBytes int64, modelSize string) time.Duration {
+	base := transcribeTimeoutForAudioBytes(sizeBytes)
+	factor := transcribeModelTimeoutFactors[modelSize]
+	if factor < 1 {
+		factor = 1
+	}
+	budget := time.Duration(factor)*base + transcribeModelLoadAllowance[modelSize]
+	if budget < transcribeMinRequestTimeout {
+		return transcribeMinRequestTimeout
+	}
+	if budget > transcribeMaxRequestTimeout {
+		return transcribeMaxRequestTimeout
+	}
+	return budget
+}
+
+// requestTimeoutForModel sizes the request budget from the file at
+// validatedPath and the selected model (citadel#1045). On stat failure it
+// falls back to the model-aware ceiling, same fail-generous direction as
+// requestTimeout.
+func (h *TranscribeAudioHandler) requestTimeoutForModel(validatedPath, modelSize string) time.Duration {
+	info, err := os.Stat(validatedPath)
+	if err != nil {
+		return transcribeTimeoutFor(0, modelSize)
+	}
+	return transcribeTimeoutFor(info.Size(), modelSize)
+}
+
+// allowedWhisperModelSizes whitelists the model_size values accepted from the
+// payload, matching faster-whisper 1.0.3's _MODELS keys (verified against the
+// pinned tag, faster_whisper/utils.py). The Python sidecar enforces the same
+// set as defense in depth. A value outside this set is a hard error (fail fast
+// with a clear message) rather than a silent fall-back to the default model —
+// the caller asked for a specific model and should be told it is unavailable.
+var allowedWhisperModelSizes = []string{
+	"tiny", "tiny.en",
+	"base", "base.en",
+	"small", "small.en",
+	"medium", "medium.en",
+	"large-v1", "large-v2", "large-v3", "large",
+	"distil-large-v2", "distil-medium.en", "distil-small.en", "distil-large-v3",
+}
+
+func isAllowedModelSize(v string) bool {
+	for _, m := range allowedWhisperModelSizes {
+		if v == m {
+			return true
+		}
+	}
+	return false
+}
+
+// applyTranscribeOptions validates the optional tuning params and copies them
+// onto the request payload sent to the whisper sidecar (citadel#1045). It is
+// pure (map in, map out, error) so param plumbing + validation are unit-testable
+// without a running sidecar. It only ADDS a key when the payload actually
+// carries it, so a request with none of the new params produces a byte-identical
+// request to before this change:
+//
+//	{audio_path[, language][, diarize]}
+//
+// language/diarize keep their exact pre-existing semantics (diarize is a literal
+// "true" string compare, NOT lenient bool parsing); only the new params use
+// strconv parsing and are validated.
+func applyTranscribeOptions(req map[string]any, payload map[string]string) error {
+	if lang, ok := payload["language"]; ok && lang != "" {
+		req["language"] = lang
+	}
+	if diarize, ok := payload["diarize"]; ok && diarize == "true" {
+		req["diarize"] = true
+	}
+
+	if v, ok := payload["model_size"]; ok && v != "" {
+		if !isAllowedModelSize(v) {
+			return fmt.Errorf("invalid model_size %q (allowed: %s)", v, strings.Join(allowedWhisperModelSizes, ", "))
+		}
+		req["model_size"] = v
+	}
+
+	// Optional booleans: denoise (ffmpeg afftdn preprocessing), vad_filter
+	// (faster-whisper VAD gate), condition_on_previous_text (the mechanism
+	// behind the looped-filler hallucination — a caller can turn it off).
+	for _, key := range []string{"denoise", "vad_filter", "condition_on_previous_text"} {
+		v, ok := payload[key]
+		if !ok || v == "" {
+			continue
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: must be true or false", key, v)
+		}
+		req[key] = b
+	}
+
+	// Optional float thresholds passed through to faster-whisper decoding.
+	// logprob_threshold maps to the engine's log_prob_threshold kwarg
+	// (renamed on the Python side); no_speech_threshold and
+	// compression_ratio_threshold keep their names.
+	for _, key := range []string{"no_speech_threshold", "compression_ratio_threshold", "logprob_threshold"} {
+		v, ok := payload[key]
+		if !ok || v == "" {
+			continue
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: must be a number", key, v)
+		}
+		req[key] = f
+	}
+
+	return nil
+}
+
 // Execute transcribes a workspace-local audio file via the whisper sidecar.
 //
 // Payload fields (all strings via nexus.Job):
 //   - audio_path: workspace-relative or absolute path to the recorded audio.
 //   - language:   optional ISO language hint (e.g. "en"); empty = auto-detect.
 //   - diarize:    optional "true"/"false"; basic per-segment speaker labels.
+//   - model_size: optional faster-whisper model (tiny|base|small|medium|
+//     large-v3|...); empty = the sidecar's configured default. Loaded on demand.
+//   - denoise:    optional "true"/"false"; ffmpeg afftdn denoise preprocessing.
+//   - vad_filter, no_speech_threshold, compression_ratio_threshold,
+//     logprob_threshold, condition_on_previous_text: optional faster-whisper
+//     decoding tuning, passed through to the sidecar.
+//
+// Every param above beyond audio_path is OPTIONAL and backward-compatible: a
+// request carrying none of them behaves exactly as before. The result always
+// carries an additive `transcription_guard` advisory (citadel#1045); it never
+// alters the transcript itself.
 //
 // Response JSON (relayed verbatim from the sidecar):
 //
@@ -252,32 +421,35 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return nil, fmt.Errorf("cannot compute workspace-relative path: %w", err)
 	}
 
-	ctx.Log("info", "     - [Job %s] Waiting for transcription service to become ready...", job.ID)
-	if err := h.waitForReady(); err != nil {
-		return nil, err
-	}
-	ctx.Log("info", "     - [Job %s] TRANSCRIBE_AUDIO %s", job.ID, rel)
-
+	// Build + validate the request payload BEFORE waiting on the sidecar, so an
+	// invalid model_size/threshold fails fast with a clear error instead of
+	// burning the readiness budget first.
 	requestPayload := map[string]any{
 		"audio_path": rel,
 	}
-	if lang, ok := job.Payload["language"]; ok && lang != "" {
-		requestPayload["language"] = lang
+	if err := applyTranscribeOptions(requestPayload, job.Payload); err != nil {
+		return nil, err
 	}
-	if diarize, ok := job.Payload["diarize"]; ok && diarize == "true" {
-		requestPayload["diarize"] = true
-	}
+	languageHinted := job.Payload["language"] != ""
+	modelSize := job.Payload["model_size"]
 
 	reqBody, err := json.Marshal(requestPayload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Size the whole-request budget from the audio's byte length so a long
-	// meeting's full-file transcription is not cut off mid-flight. The context
-	// governs the entire request including the body read below, so cancel only
-	// after Execute is done with the response.
-	reqTimeout := h.requestTimeout(validated)
+	ctx.Log("info", "     - [Job %s] Waiting for transcription service to become ready...", job.ID)
+	if err := h.waitForReady(); err != nil {
+		return nil, err
+	}
+	ctx.Log("info", "     - [Job %s] TRANSCRIBE_AUDIO %s", job.ID, rel)
+
+	// Size the whole-request budget from the audio's byte length AND the chosen
+	// model so a long meeting's full-file transcription — or a slow, larger
+	// on-demand model's first-request load+decode — is not cut off mid-flight.
+	// The context governs the entire request including the body read below, so
+	// cancel only after Execute is done with the response.
+	reqTimeout := h.requestTimeoutForModel(validated, modelSize)
 	reqCtx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 	defer cancel()
 
@@ -298,7 +470,9 @@ func (h *TranscribeAudioHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		return bodyBytes, fmt.Errorf("transcription API returned non-200 status: %s", resp.Status)
 	}
 
-	return bodyBytes, nil
+	// Attach the additive no-speech/low-confidence guard (citadel#1045). On any
+	// parse failure attachTranscriptionGuard returns bodyBytes verbatim.
+	return attachTranscriptionGuard(bodyBytes, languageHinted), nil
 }
 
 func (h *TranscribeAudioHandler) waitForReady() error {

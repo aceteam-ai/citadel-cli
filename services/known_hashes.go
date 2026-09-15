@@ -67,6 +67,10 @@ var KnownComposeHashes = map[string]map[string]bool{
 	"transcribe": {
 		"26407f6fde85b0f6af362b25e23b1b3be3342ecc4f47ac38ee43abf96bd719ee": true,
 		"e365f728ef81782455a2a18a00a6f7e41d377ae2375d6f6660816cc7f3e0c77d": true,
+		// citadel #1045: documents the per-request model_size override (on-demand
+		// model loading); WHISPER_MODEL stays the fallback default. Comment-only
+		// change to the template.
+		"8afe0d514760ab96a5289f1b56de278e7d57af761de716aeb76e1d41c29ebdbf": true,
 	},
 	"diffusers": {
 		"3f2059400959adcc0f55ea8134cb492530ca65d4faf51778a68f35d0d5d9c93a": true,
