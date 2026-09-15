@@ -214,7 +214,7 @@ func runningPublishedHostPort(engineBin, containerName string) (int, bool) {
 // (aceteam-ai/citadel-cli#1030). It is deliberately NARROWER than
 // services.ServiceMap membership: extraction/diffusers/transcribe/lmstudio are
 // still intended to publish on all interfaces in v1 (their loopback move is
-// tracked in aceteam-ai/citadel-cli#1023), so they must NOT be recreated here.
+// tracked in aceteam-ai/citadel-cli#1060), so they must NOT be recreated here.
 // TestLoopbackDriftEnginesPublishLoopback pins this set against the actual
 // compose templates so it cannot silently disagree with what #1025 edited.
 var loopbackDriftEngines = map[string]struct{}{
