@@ -412,7 +412,10 @@ func TestCacheServe_HFRejections(t *testing.T) {
 	}{
 		{"unknown-model", "/cache/hf/org/other/resolve/main/config.json"},
 		{"unknown-revision", "/cache/hf/org/repo/resolve/nope/config.json"},
-		{"traversal-revision", "/cache/hf/org/repo/resolve/../config.json"},
+		// The mux cleans "../" and 301s before the handler runs; this only proves
+		// the request-as-issued isn't served. The handler-level revision-traversal
+		// defense is covered directly by TestCacheServe_ResolveHFCommit.
+		{"mux-cleans-traversal", "/cache/hf/org/repo/resolve/../config.json"},
 		{"escaping-symlink", "/cache/hf/org/repo/resolve/main/evil.txt"},
 		{"unindexed-file", "/cache/hf/org/repo/resolve/main/nonexistent.bin"},
 	} {
@@ -422,7 +425,47 @@ func TestCacheServe_HFRejections(t *testing.T) {
 			if rec.Code == http.StatusOK {
 				t.Fatalf("%s: got 200, want a rejection (body=%s)", tc.target, rec.Body.String())
 			}
+			// The escaping symlink resolves to a real file OUTSIDE the cache root;
+			// confinement must reject it, so its content must never leak — not merely
+			// "not 200".
+			if tc.name == "escaping-symlink" && strings.Contains(rec.Body.String(), "top-secret") {
+				t.Fatalf("escaping symlink leaked out-of-root content: %q", rec.Body.String())
+			}
 		})
+	}
+}
+
+// TestCacheServe_ResolveHFCommit exercises the revision resolver's traversal and
+// refs-content validation directly (the mux cleans "../" out of an HTTP request
+// before the handler ever sees it, so these defenses need unit coverage).
+func TestCacheServe_ResolveHFCommit(t *testing.T) {
+	_, cacheRoot := buildCacheFixture(t)
+	entryRoot, err := resolveConfinedRoot(filepath.Join(cacheRoot, "huggingface", "hub", "models--org--repo"))
+	if err != nil {
+		t.Fatalf("resolve entry root: %v", err)
+	}
+
+	// A branch ref resolves to its commit; an explicit commit hash resolves to
+	// itself.
+	if c, ok := resolveHFCommit(entryRoot, "main"); !ok || c != testCommit {
+		t.Errorf("resolveHFCommit(main) = %q,%v, want %q,true", c, ok, testCommit)
+	}
+	if c, ok := resolveHFCommit(entryRoot, testCommit); !ok || c != testCommit {
+		t.Errorf("resolveHFCommit(<commit>) = %q,%v, want %q,true", c, ok, testCommit)
+	}
+
+	// Traversal / unknown revisions are refused.
+	for _, rev := range []string{"..", ".", "", "nope", "does-not-exist"} {
+		if c, ok := resolveHFCommit(entryRoot, rev); ok {
+			t.Errorf("resolveHFCommit(%q) = %q,true, want false", rev, c)
+		}
+	}
+
+	// A tampered refs file whose CONTENT is a traversal string must not resolve —
+	// the content is validated as hex before being joined into a snapshots path.
+	mustWrite(t, filepath.Join(entryRoot, "refs", "tampered"), "../../../../etc/passwd")
+	if c, ok := resolveHFCommit(entryRoot, "tampered"); ok {
+		t.Errorf("resolveHFCommit(tampered refs content) = %q,true, want false", c)
 	}
 }
 
