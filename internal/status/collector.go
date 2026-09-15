@@ -14,7 +14,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/services"
-	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -571,7 +570,7 @@ func (c *Collector) collectSystemMetrics() SystemMetrics {
 	}
 
 	// CPU
-	if percentages, err := cpu.Percent(100*time.Millisecond, false); err == nil && len(percentages) > 0 {
+	if percentages, err := CPUPercent(100*time.Millisecond, false); err == nil && len(percentages) > 0 {
 		metrics.CPUPercent = percentages[0]
 	}
 
