@@ -49,7 +49,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/aceteam-ai/citadel-cli/services"
 	"github.com/google/uuid"
-	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
@@ -1306,7 +1305,7 @@ func gatherControlCenterData() (controlcenter.StatusData, error) {
 	}
 
 	// System vitals - CPU
-	if percentages, err := cpu.Percent(200*time.Millisecond, false); err == nil && len(percentages) > 0 {
+	if percentages, err := status.CPUPercent(200*time.Millisecond, false); err == nil && len(percentages) > 0 {
 		data.CPUPercent = percentages[0]
 	}
 

@@ -32,7 +32,6 @@ import (
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 	"github.com/fatih/color"
 	"github.com/redis/go-redis/v9"
-	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/spf13/cobra"
@@ -461,7 +460,7 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	}
 
 	// System vitals - CPU
-	if percentages, err := cpu.Percent(500*time.Millisecond, false); err == nil && len(percentages) > 0 {
+	if percentages, err := statuspkg.CPUPercent(500*time.Millisecond, false); err == nil && len(percentages) > 0 {
 		data.CPUPercent = percentages[0]
 	}
 
@@ -761,7 +760,7 @@ func printMemInfo(w *tabwriter.Writer) {
 }
 
 func printCPUInfo(w *tabwriter.Writer) {
-	percentages, err := cpu.Percent(time.Second, false)
+	percentages, err := statuspkg.CPUPercent(time.Second, false)
 	if err != nil || len(percentages) == 0 {
 		fmt.Fprintf(w, "  ⚡️ CPU Usage:\t%s\n", badColor.Sprintf("Error getting CPU info: %v", err))
 		return
