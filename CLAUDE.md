@@ -1098,6 +1098,64 @@ command, it force-enables the relay (ignores the `egress-relay enable` toggle)
 but still resolves allow_lan only from config/env. #1006's egress harness can
 use `serve` instead of side-installing Redis on the relay host.
 
+### Mesh-ingress reverse proxy (`citadel ingress`, `internal/ingress`, citadel #1055)
+
+`citadel ingress` (`cmd/ingress.go`) is a public HTTPS reverse proxy that fronts
+hosted app pods at `<slug>.<apps-domain>` and dials them over the mesh. It joins
+the AceTeam Network by the SAME path `citadel egress-relay serve` uses
+(`VerifyOrReconnect` + `recoverStaleVPN` on `ErrStaleState`, never `Logout` on
+exit — `ingressServe` is a near-copy of `egressRelayServe`), so an ingress
+enrolls like any node and holds ZERO mesh-control secrets.
+
+**THE ROUTES MAP IS THE AUTHORIZATION BOUNDARY, enforced in two places, both in
+`internal/ingress`.** `decodeRoute` (`routes.go`) rejects any map entry whose
+address is outside `meshPrefix` (`100.64.0.0/10`) or whose port is out of range
+— per-entry DROP, never a whole-map reject, so one control-plane typo can't dark
+every app. `Client.Resolve` returning `ok=false` is a 404 with NO upstream dial;
+`TestProxy_UnknownSlug404NoDial` pins that the injected dialer is never called
+for an unknown slug. An on-miss single-slug lookup happens at most once per
+`negativeCache` TTL (a slug scan can't amplify into control-plane traffic).
+
+**Three injectable seams keep it testable with no live infra** (the DoR's
+requirement): `RoutesSource` (the control-plane feed), `Authorizer` (the gated
+server-to-server check), and `CertProvider` (`Start(ctx) error` + `TLSConfig()`
+— `Start` is separate so the ACME provider can BLOCK on `ManageSync` or fail
+loudly). `ingressServe` also takes the listener factory and `isConnected` as
+params, so no test ever binds a public port or touches the real node.
+
+**Cross-context rule (CLAUDE.md #787):** `internal/ingress` never calls
+`network.GetNodeConfigDir()`. The cert-cache storage dir is resolved in the cmd
+layer (`resolveIngressCertProvider`) and passed into `ACMEConfig.StorageDir`.
+
+**Gated-app header discipline** (`authz.go`, pinned by `TestStripInbound*` /
+`TestRewriteSetCookie`): `stripInbound` deletes every trust header
+(`X-Forwarded-*`/`X-Ingress-*`/`X-Citadel-*`/`X-Auth-*`/`Forwarded`/`X-Real-IP`)
+and the named session cookies before the pod sees the request — hop-by-hop
+`Connection`/`Upgrade` deliberately survive (WebSocket), unrelated cookies
+survive; then only the vouched-for headers (incl. `X-Ingress-Subject` from the
+authz decision) are set. `ModifyResponse` runs `rewriteSetCookie` to strip
+`Domain=` and add `Secure` on every upstream `Set-Cookie`.
+
+**TLS:** wildcard via certmagic DNS-01. certmagic's `DNS01Solver` does NOT follow
+CNAMEs (verified against v0.25.x), so `ACMEConfig.DNSZone` is set as
+`DNSManager.OverrideDomain` — publish the challenge TXT directly on the delegated
+zone the scoped RFC 2136 / TSIG credential can write. `StaticFileCertProvider`
+(mount an already-issued wildcard) is the recommended FIRST deployment; the ACME
+path lights up once the delegated zone + nameserver (separate design) exist.
+certmagic + `libdns/rfc2136` are new deps (+15 modules); the DNS provider is
+behind certmagic's own `DNSProvider` interface, so swapping it is one line.
+
+**Health lives on the public :443 listener under the reserved host
+`_health.<apps-domain>`** (`server.go`), not a loopback endpoint — a completed
+wildcard-TLS handshake IS the origin-authenticity signal a redundancy nameserver
+(separate design) checks. `_health` can't collide with a slug (underscore fails
+`slugRegexp`). The `http.Server` sets `ReadHeaderTimeout`/`IdleTimeout` but
+leaves `WriteTimeout` at 0 — a non-zero `WriteTimeout` silently kills SSE and
+WebSocket.
+
+Deliberately out of scope (tracked separately in #1055): the redundancy-DNS
+strategy and the rootless per-app pod runtime.
+
 ### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
 
 `executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/
