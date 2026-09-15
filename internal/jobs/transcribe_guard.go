@@ -51,6 +51,22 @@ const (
 	guardMinSegmentsForRepetition = 4
 	guardRepetitionDistinctRatio  = 0.5
 	guardDominantPhraseFraction   = 0.6
+	// guardMinRepeatedPhraseWords: the repeated phrase must be at least this
+	// many words for a loop to register, so a backchannel-heavy transcript
+	// ("Yeah." / "Okay." / "Mm-hmm.") is never mislabeled a hallucination loop.
+	// "Thank you very much." / "It's a pleasure to meet you." / "Diolch yn fawr"
+	// all clear it.
+	guardMinRepeatedPhraseWords = 3
+
+	// guardMinSpeechCoverage: the fraction of the recording's DURATION covered
+	// by transcribed segments below which the transcript is treated as
+	// no-speech. This catches the incident's own signature — one short segment
+	// ("Thank you very much.") standing in for a 38-minute recording — even when
+	// that lone segment's probabilities happen to sit inside faster-whisper's
+	// own thresholds. Deliberately very conservative (2%): only a recording that
+	// produced almost NO transcribed speech trips it. Fail-open when duration is
+	// unknown (0).
+	guardMinSpeechCoverage = 0.02
 )
 
 // guardSegment is the per-segment signal subset the guard reasons over.
@@ -59,6 +75,8 @@ const (
 // mistaken for a confident zero.
 type guardSegment struct {
 	Text             string
+	Start            float64
+	End              float64
 	NoSpeechProb     float64
 	AvgLogprob       float64
 	CompressionRatio float64
@@ -91,6 +109,9 @@ type TranscriptionGuard struct {
 	NoSpeechProb        float64 `json:"no_speech_prob"`
 	CompressionRatio    float64 `json:"compression_ratio"`
 	LanguageProbability float64 `json:"language_probability"`
+	// SpeechCoverage is transcribed-seconds / recording-duration, for
+	// observability. -1 when duration is unknown (never computed).
+	SpeechCoverage float64 `json:"speech_coverage"`
 }
 
 // reason codes.
@@ -101,16 +122,19 @@ const (
 	guardReasonHighCompression = "high_compression_ratio"
 	guardReasonRepetitionLoop  = "repetition_loop"
 	guardReasonUncertainLang   = "uncertain_language"
+	guardReasonLowCoverage     = "low_speech_coverage"
 )
 
 // evaluateTranscriptionGuard is the pure verdict function. It takes the parsed
 // per-segment signals, the full transcript text, the detected-language
-// probability, and whether the caller supplied a language hint. It never
-// touches the network or the filesystem.
-func evaluateTranscriptionGuard(segs []guardSegment, fullText string, languageProbability float64, languageHinted bool) TranscriptionGuard {
+// probability, whether the caller supplied a language hint, and the recording
+// duration in seconds (0 = unknown). It never touches the network or the
+// filesystem.
+func evaluateTranscriptionGuard(segs []guardSegment, fullText string, languageProbability float64, languageHinted bool, durationSeconds float64) TranscriptionGuard {
 	g := TranscriptionGuard{
 		Reasons:             []string{},
 		LanguageProbability: languageProbability,
+		SpeechCoverage:      -1,
 	}
 
 	text := strings.TrimSpace(fullText)
@@ -174,6 +198,26 @@ func evaluateTranscriptionGuard(segs []guardSegment, fullText string, languagePr
 		g.Reasons = append(g.Reasons, guardReasonRepetitionLoop)
 	}
 
+	// Signal-independent low-speech-coverage detection (the incident's own
+	// signature: one short segment standing in for a long recording). Only
+	// evaluated when the sidecar reported a positive duration — fail-open when
+	// it is unknown. This uses only segment timings + duration, so it works
+	// against an old sidecar image too.
+	if durationSeconds > 0 {
+		var speech float64
+		for _, s := range segs {
+			if d := s.End - s.Start; d > 0 {
+				speech += d
+			}
+		}
+		g.SpeechCoverage = speech / durationSeconds
+		if g.SpeechCoverage < guardMinSpeechCoverage {
+			g.NoSpeech = true
+			g.LowConfidence = true
+			g.Reasons = append(g.Reasons, guardReasonLowCoverage)
+		}
+	}
+
 	// Uncertain detected language with no caller hint (the "misdetected as
 	// Welsh" case). Only meaningful when a probability was actually reported
 	// (>0); a missing field (0) is not treated as low confidence.
@@ -211,9 +255,12 @@ func normalizePhrase(s string) string {
 
 // detectRepetitionLoop reports a degenerate repeated-phrase loop across
 // segments using only the text (no probability signals). It fires when either
-// the distinct-phrase ratio is low across enough segments, or a single phrase
-// dominates the transcript. It deliberately does NOT try to catch a single
-// segment whose OWN text repeats internally — that is what the
+// a single phrase dominates the transcript or the distinct-phrase ratio is low,
+// both gated on (a) at least guardMinSegmentsForRepetition segments and (b) the
+// repeated content being a real phrase (>= guardMinRepeatedPhraseWords words) —
+// so a short or backchannel-heavy transcript ("Yeah." / "Okay." / "Mm-hmm.") is
+// never mislabeled a hallucination loop. It deliberately does NOT try to catch a
+// single segment whose OWN text repeats internally — that is what the
 // compression-ratio signal covers when signals are available, and a text-only
 // heuristic there risks false positives on legitimately repetitive speech.
 func detectRepetitionLoop(segs []guardSegment) bool {
@@ -224,17 +271,25 @@ func detectRepetitionLoop(segs []guardSegment) bool {
 		}
 	}
 	total := len(phrases)
-	if total < 3 {
+	if total < guardMinSegmentsForRepetition {
 		return false
 	}
 
 	counts := make(map[string]int, total)
 	var maxCount int
+	var maxPhrase string
 	for _, p := range phrases {
 		counts[p]++
 		if counts[p] > maxCount {
 			maxCount = counts[p]
+			maxPhrase = p
 		}
+	}
+
+	// The repeated content must be substantial, or a run of short backchannels
+	// would register as a loop.
+	if len(strings.Fields(maxPhrase)) < guardMinRepeatedPhraseWords {
+		return false
 	}
 
 	// Dominant single phrase (e.g. "It's a pleasure to meet you." looped).
@@ -242,23 +297,22 @@ func detectRepetitionLoop(segs []guardSegment) bool {
 		return true
 	}
 
-	// Low distinct-phrase ratio across enough segments (e.g. a short Welsh
-	// gibberish loop cycling a handful of phrases).
-	if total >= guardMinSegmentsForRepetition {
-		distinct := len(counts)
-		if float64(distinct)/float64(total) <= guardRepetitionDistinctRatio {
-			return true
-		}
+	// Low distinct-phrase ratio (e.g. a Welsh gibberish loop cycling a handful
+	// of phrases).
+	if float64(len(counts))/float64(total) <= guardRepetitionDistinctRatio {
+		return true
 	}
 	return false
 }
 
 // attachTranscriptionGuard parses a sidecar transcribe response, computes the
 // advisory guard, and re-emits the JSON with an additive `transcription_guard`
-// object. Every OTHER field is preserved byte-for-byte (the top level is
-// decoded as raw messages), so this never re-serializes the transcript's own
-// floats. On any parse/marshal failure it returns the original bytes unchanged
-// — relaying verbatim, exactly as the handler did before this fix.
+// object. Every OTHER field is VALUE-preserved: the top level is decoded as raw
+// messages, so no field's VALUE changes and the transcript's own floats are
+// never re-serialized (json.Marshal does compact the raw messages — stripping
+// insignificant whitespace and HTML-escaping strings — but values are intact).
+// On any parse/marshal failure it returns the original bytes unchanged —
+// relaying verbatim, exactly as the handler did before this fix.
 func attachTranscriptionGuard(raw []byte, languageHinted bool) []byte {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
@@ -282,10 +336,14 @@ func attachTranscriptionGuard(raw []byte, languageHinted bool) []byte {
 	if rm, ok := top["language_probability"]; ok {
 		_ = json.Unmarshal(rm, &languageProbability)
 	}
+	var durationSeconds float64
+	if rm, ok := top["duration"]; ok {
+		_ = json.Unmarshal(rm, &durationSeconds)
+	}
 
 	segs := parseGuardSegments(top["segments"])
 
-	guard := evaluateTranscriptionGuard(segs, fullText, languageProbability, languageHinted)
+	guard := evaluateTranscriptionGuard(segs, fullText, languageProbability, languageHinted, durationSeconds)
 	guardJSON, err := json.Marshal(guard)
 	if err != nil {
 		return raw
@@ -314,6 +372,12 @@ func parseGuardSegments(rawSegments json.RawMessage) []guardSegment {
 		var gs guardSegment
 		if rm, ok := rs["text"]; ok {
 			_ = json.Unmarshal(rm, &gs.Text)
+		}
+		if rm, ok := rs["start"]; ok {
+			_ = json.Unmarshal(rm, &gs.Start)
+		}
+		if rm, ok := rs["end"]; ok {
+			_ = json.Unmarshal(rm, &gs.End)
 		}
 		present := false
 		if rm, ok := rs["no_speech_prob"]; ok {

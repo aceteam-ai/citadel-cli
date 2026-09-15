@@ -82,10 +82,16 @@ _model_lock = threading.Lock()
 
 
 def _resolve_model_name(requested: str | None) -> str:
-    name = requested or WHISPER_MODEL
-    if name not in ALLOWED_MODELS:
-        raise HTTPException(400, f"invalid model_size {name!r}")
-    return name
+    # Only the CALLER-supplied model_size is whitelisted. The env default
+    # (WHISPER_MODEL) is returned untouched: an operator may legitimately set it
+    # to a HuggingFace repo id or a local path (both accepted by WhisperModel),
+    # and whitelisting it would 400 every default request on such a node —
+    # breaking the "no new params behaves exactly as today" contract there.
+    if requested:
+        if requested not in ALLOWED_MODELS:
+            raise HTTPException(400, f"invalid model_size {requested!r}")
+        return requested
+    return WHISPER_MODEL
 
 
 def _get_model(model_size: str | None):

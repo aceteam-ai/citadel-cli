@@ -24,7 +24,7 @@ func TestEvaluateGuard_FabricatedFillerFlaggedFromSignals(t *testing.T) {
 	segs := []guardSegment{
 		{Text: "Thank you very much.", NoSpeechProb: 0.92, AvgLogprob: -1.8, CompressionRatio: 0.9, signalsPresent: true},
 	}
-	g := evaluateTranscriptionGuard(segs, "Thank you very much.", 0.98, false)
+	g := evaluateTranscriptionGuard(segs, "Thank you very much.", 0.98, false, 0)
 	if !g.NoSpeech {
 		t.Errorf("expected NoSpeech=true for high no_speech_prob, got %+v", g)
 	}
@@ -42,7 +42,7 @@ func TestEvaluateGuard_FabricatedFillerFlaggedFromSignals(t *testing.T) {
 // TestEvaluateGuard_EmptyTranscriptIsNoSpeech: an empty transcript is
 // unambiguous no-speech and needs no signals at all.
 func TestEvaluateGuard_EmptyTranscriptIsNoSpeech(t *testing.T) {
-	g := evaluateTranscriptionGuard(nil, "   ", 0, false)
+	g := evaluateTranscriptionGuard(nil, "   ", 0, false, 0)
 	if !g.NoSpeech || !g.LowConfidence {
 		t.Errorf("expected empty transcript flagged, got %+v", g)
 	}
@@ -62,7 +62,7 @@ func TestEvaluateGuard_CleanSpeechNotFlagged(t *testing.T) {
 		{Text: "Hello, thanks for joining the call today.", NoSpeechProb: 0.02, AvgLogprob: -0.2, CompressionRatio: 1.3, signalsPresent: true},
 		{Text: "Let's start with the quarterly numbers.", NoSpeechProb: 0.03, AvgLogprob: -0.25, CompressionRatio: 1.4, signalsPresent: true},
 	}
-	g := evaluateTranscriptionGuard(segs, "Hello, thanks for joining the call today. Let's start with the quarterly numbers.", 0.99, false)
+	g := evaluateTranscriptionGuard(segs, "Hello, thanks for joining the call today. Let's start with the quarterly numbers.", 0.99, false, 0)
 	if g.NoSpeech || g.LowConfidence || g.Repetition {
 		t.Errorf("clean speech should not be flagged, got %+v", g)
 	}
@@ -80,7 +80,7 @@ func TestEvaluateGuard_RepetitionLoopWithoutSignals(t *testing.T) {
 	for i := range segs {
 		segs[i] = guardSegment{Text: "It's a pleasure to meet you.", signalsPresent: false}
 	}
-	g := evaluateTranscriptionGuard(segs, "", 0, false)
+	g := evaluateTranscriptionGuard(segs, "", 0, false, 0)
 	if !g.Repetition || !g.LowConfidence {
 		t.Errorf("expected repetition loop flagged, got %+v", g)
 	}
@@ -103,7 +103,7 @@ func TestEvaluateGuard_LowDistinctRatioLoop(t *testing.T) {
 		{Text: "Diolch yn fawr", signalsPresent: false},
 		{Text: "Diolch yn fawr iawn", signalsPresent: false},
 	}
-	g := evaluateTranscriptionGuard(segs, "", 0, false)
+	g := evaluateTranscriptionGuard(segs, "", 0, false, 0)
 	if !g.Repetition {
 		t.Errorf("expected low distinct-ratio loop flagged, got %+v", g)
 	}
@@ -116,12 +116,12 @@ func TestEvaluateGuard_UncertainLanguageOnlyWithoutHint(t *testing.T) {
 	segs := []guardSegment{
 		{Text: "some plausible words here", NoSpeechProb: 0.1, AvgLogprob: -0.5, CompressionRatio: 1.2, signalsPresent: true},
 	}
-	noHint := evaluateTranscriptionGuard(segs, "some plausible words here", 0.30, false)
+	noHint := evaluateTranscriptionGuard(segs, "some plausible words here", 0.30, false, 0)
 	if !noHint.LowConfidence || !hasReason(noHint, guardReasonUncertainLang) {
 		t.Errorf("expected uncertain_language low-confidence without a hint, got %+v", noHint)
 	}
 
-	withHint := evaluateTranscriptionGuard(segs, "some plausible words here", 0.30, true)
+	withHint := evaluateTranscriptionGuard(segs, "some plausible words here", 0.30, true, 0)
 	if hasReason(withHint, guardReasonUncertainLang) {
 		t.Errorf("uncertain_language must NOT fire when the caller supplied a language hint, got %v", withHint.Reasons)
 	}
@@ -136,7 +136,7 @@ func TestEvaluateGuard_AbsentSignalsNeverAssertNoSpeech(t *testing.T) {
 	segs := []guardSegment{
 		{Text: "a normal sentence of speech", signalsPresent: false},
 	}
-	g := evaluateTranscriptionGuard(segs, "a normal sentence of speech", 0, false)
+	g := evaluateTranscriptionGuard(segs, "a normal sentence of speech", 0, false, 0)
 	if g.NoSpeech {
 		t.Errorf("must not assert NoSpeech from absent signals, got %+v", g)
 	}
@@ -155,12 +155,76 @@ func TestEvaluateGuard_HighCompressionSingleSegment(t *testing.T) {
 	segs := []guardSegment{
 		{Text: "ha ha ha ha ha ha ha ha ha ha ha", NoSpeechProb: 0.1, AvgLogprob: -0.4, CompressionRatio: 3.1, signalsPresent: true},
 	}
-	g := evaluateTranscriptionGuard(segs, "ha ha ha ha ha ha ha ha ha ha ha", 0.9, false)
+	g := evaluateTranscriptionGuard(segs, "ha ha ha ha ha ha ha ha ha ha ha", 0.9, false, 0)
 	if !g.Repetition || !g.LowConfidence {
 		t.Errorf("expected high-compression repetition flagged, got %+v", g)
 	}
 	if !hasReason(g, guardReasonHighCompression) {
 		t.Errorf("expected high_compression_ratio reason, got %v", g.Reasons)
+	}
+}
+
+// TestEvaluateGuard_LowSpeechCoverageFlagged is the incident's own signature:
+// one short segment standing in for a long recording. Even though this lone
+// segment's probabilities sit INSIDE faster-whisper's thresholds (it survived
+// the engine's skip rule and reached the output), the speech-coverage floor
+// catches it.
+func TestEvaluateGuard_LowSpeechCoverageFlagged(t *testing.T) {
+	segs := []guardSegment{
+		{Text: "Thank you very much.", Start: 0.0, End: 2.0, NoSpeechProb: 0.3, AvgLogprob: -0.4, CompressionRatio: 0.8, signalsPresent: true},
+	}
+	// 2 seconds of speech across a 38-minute (2280s) recording -> ~0.09% coverage.
+	g := evaluateTranscriptionGuard(segs, "Thank you very much.", 0.95, true, 2280)
+	if !g.NoSpeech || !g.LowConfidence {
+		t.Errorf("expected low-coverage transcript flagged as no-speech, got %+v", g)
+	}
+	if !hasReason(g, guardReasonLowCoverage) {
+		t.Errorf("expected low_speech_coverage reason, got %v", g.Reasons)
+	}
+
+	// A short clip that is mostly speech must NOT be flagged (coverage high).
+	dense := []guardSegment{
+		{Text: "quick note before we wrap up", Start: 0.0, End: 25.0, NoSpeechProb: 0.05, AvgLogprob: -0.3, CompressionRatio: 1.2, signalsPresent: true},
+	}
+	gd := evaluateTranscriptionGuard(dense, "quick note before we wrap up", 0.98, true, 30)
+	if hasReason(gd, guardReasonLowCoverage) {
+		t.Errorf("dense short clip must not trip low_speech_coverage, got %+v", gd)
+	}
+
+	// Unknown duration (0) must fail open: coverage is never evaluated.
+	gu := evaluateTranscriptionGuard(segs, "Thank you very much.", 0.95, true, 0)
+	if hasReason(gu, guardReasonLowCoverage) {
+		t.Errorf("unknown duration must not trip low_speech_coverage, got %+v", gu)
+	}
+	if gu.SpeechCoverage != -1 {
+		t.Errorf("unknown duration should leave SpeechCoverage=-1, got %v", gu.SpeechCoverage)
+	}
+}
+
+// TestEvaluateGuard_BackchannelNotFlaggedAsRepetition guards the #4 false
+// positive: short backchannel exchanges must never register as a hallucination
+// loop, even with several identical single-word segments. The repeated content
+// must be a real phrase (>=3 words) for the loop rules to fire.
+func TestEvaluateGuard_BackchannelNotFlaggedAsRepetition(t *testing.T) {
+	// The advisor's example: three segments, 2/3 dominant — must NOT flag (below
+	// the segment floor).
+	short := []guardSegment{
+		{Text: "Yeah.", signalsPresent: false},
+		{Text: "Yeah.", signalsPresent: false},
+		{Text: "Okay, let's go.", signalsPresent: false},
+	}
+	if g := evaluateTranscriptionGuard(short, "", 0, false, 0); g.Repetition {
+		t.Errorf("short backchannel exchange must not flag repetition, got %+v", g)
+	}
+
+	// Even five identical single-word backchannels must not flag: the repeated
+	// phrase is one word, below guardMinRepeatedPhraseWords.
+	many := make([]guardSegment, 5)
+	for i := range many {
+		many[i] = guardSegment{Text: "Yeah.", signalsPresent: false}
+	}
+	if g := evaluateTranscriptionGuard(many, "", 0, false, 0); g.Repetition {
+		t.Errorf("repeated single-word backchannel must not flag repetition, got %+v", g)
 	}
 }
 

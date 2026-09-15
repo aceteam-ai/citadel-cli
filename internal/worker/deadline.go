@@ -46,9 +46,21 @@ const (
 
 // longSessionJobTypes get the generous long-tier fallback. These legitimately
 // run for the length of a human session but are still bounded in the real world.
+//
+// JobTypeTranscribeAudio is here (citadel#1045) because a caller-selected larger
+// model (medium/large-v3, int8 on CPU) transcribing a long recording runs
+// several-x slower than real time — a ~38-minute clip at medium can take a few
+// hours — which the default 60-minute tier would abandon mid-transcription (the
+// exact case #1045 exists to make work). 4h is under the 5h self-heal STUCK
+// ceiling. This also routes a CPU-node (tracker-less) transcribe onto the #489
+// always-async goroutine instead of blocking the fetch loop inline; on a GPU
+// node it is unchanged — needsGPUSlot routes it to the inference lane, which the
+// dispatch switch checks before longSession (runner.go). The in-process meeting
+// transcribe rides MEETING_JOIN's own long tier and is unaffected.
 var longSessionJobTypes = map[string]struct{}{
-	JobTypeMeetingJoin: {},
-	JobTypeCobrowse:    {},
+	JobTypeMeetingJoin:     {},
+	JobTypeCobrowse:        {},
+	JobTypeTranscribeAudio: {},
 }
 
 // unboundedJobTypes get NO fallback deadline: their duration is dominated by

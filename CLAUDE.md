@@ -2430,10 +2430,12 @@ node showed green while executing nothing. Three defenses (`internal/worker/`):
    precedence: an explicit payload `timeout_ms` (backend budget, PR #552) wins;
    otherwise a **generous per-class fallback** applies so the wedge is bounded even
    when the backend sends no budget (the exact wedge condition). Classes:
-   - Default 60min (`WORKER_JOB_TIMEOUT_SECONDS`): inference, shell, file, VNC,
-     transcribe (its own single-shot self-bound is ~32min, comfortably under).
+   - Default 60min (`WORKER_JOB_TIMEOUT_SECONDS`): inference, shell, file, VNC.
    - Long 4h (`WORKER_JOB_TIMEOUT_LONG_SECONDS`): `MEETING_JOIN`, `COBROWSE` —
-     real human-session length; 4h catches a wedge without killing a live meeting.
+     real human-session length; 4h catches a wedge without killing a live meeting
+     — plus `TRANSCRIBE_AUDIO` (citadel#1045): a caller-selected larger model on
+     CPU transcribing a long recording runs several-x slower than real time and
+     the default 60min tier would abandon it mid-transcription.
    - Unbounded (no fallback cap): model pulls/downloads, builds, `SERVICE_START`,
      `INSTANCE_PROVISION`, `AGENT_UPDATE`, `WHATSAPP_PROVISION` — opaque long
      progress; a blanket cap would risk killing a legit job. Set either env to `0`
@@ -3297,8 +3299,9 @@ caller control and no "no speech" signal. The fix splits cleanly:
   `evaluateTranscriptionGuard` is a pure, deterministic verdict over those
   signals + the transcript text; `attachTranscriptionGuard` adds it as the
   additive `transcription_guard` object on the relayed result (top level decoded
-  as `json.RawMessage`, so every other field is byte-preserved; any parse
-  failure relays verbatim). Thresholds are consts mirroring faster-whisper
+  as `json.RawMessage`, so every other field is VALUE-preserved — its floats are
+  never re-serialized, though `json.Marshal` does compact the raw messages; any
+  parse failure relays verbatim). Thresholds are consts mirroring faster-whisper
   1.0.3's own decoding defaults. Repetition detection is signal-INDEPENDENT
   (pure text), so it catches looped filler even against an OLD sidecar image
   that emits no signals; `signalsPresent` per segment ensures absent signals are
@@ -3323,9 +3326,12 @@ exactly the base budget (existing tests unchanged).
 `whisper-service:latest` (a FLOATING tag), so a `SERVICE_START`/`up` alone won't
 upgrade it (the #718 lesson). CI (`.github/workflows/build-whisper-service.yml`)
 rebuilds+pushes on any `services/whisper-service/**` change to main; a node must
-then `docker compose pull` transcribe to get the per-segment signals. Until it
-does, the Go guard still runs but reports `signals_available:false` and relies
-only on the text-repetition / empty-transcript / uncertain-language checks.
+then `docker compose pull` transcribe to get the per-segment signals AND the
+`duration` field. Until it does, the Go guard still runs but reports
+`signals_available:false` and relies only on the checks that need neither
+(text-repetition, empty-transcript, and — since `language_probability` already
+existed — uncertain-language). The low-speech-coverage check needs the new
+`duration` field, so it too only activates post-rebuild (fail-open without it).
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:

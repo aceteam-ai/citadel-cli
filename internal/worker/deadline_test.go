@@ -263,10 +263,10 @@ func TestResolveJobTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("transcribe uses the default tier and exceeds its own 32min self-bound", func(t *testing.T) {
+	t.Run("transcribe uses the long tier (large model on CPU runs hours, #1045)", func(t *testing.T) {
 		d, ok := r.resolveJobTimeout(&Job{Type: JobTypeTranscribeAudio})
-		if !ok || d <= 33*time.Minute {
-			t.Fatalf("got (%s, %v), want a bound comfortably above ~32min", d, ok)
+		if !ok || d != defaultLongJobTimeoutSeconds*time.Second {
+			t.Fatalf("got (%s, %v), want (%ds, true) long tier", d, ok, defaultLongJobTimeoutSeconds)
 		}
 	})
 
