@@ -2440,6 +2440,21 @@ func runWork(cmd *cobra.Command, args []string) {
 		// by status.Collector.nodeRoutedIdle via the shared process-wide log.
 		gw.SetRequestRecorder(status.RecordEngineRequest)
 
+		// Authenticated read-only model-cache serving (citadel-cli#1013): let an
+		// authorized same-owner mesh peer inspect and retrieve ALREADY-cached
+		// artifacts from this node's durable cache index (no fresh upstream
+		// download). Reuses this same gateway's mesh resolver + permissions (wired
+		// above) as the gate; the provider reads the process-wide cache index store
+		// (jobs.InitCacheIndexStore, called at startup) per request. A nil store
+		// (index disabled) makes the routes 404 after the gate, never crash.
+		gw.SetCacheServer(func() (*cacheindex.Index, string) {
+			store := jobs.CacheIndexStore()
+			if store == nil {
+				return nil, ""
+			}
+			return store.Snapshot(), cacheindex.DefaultCacheRoot()
+		})
+
 		gw.AddUpstream("/vnc", &gateway.Upstream{
 			Address:     vncAddr,
 			StripPrefix: true,

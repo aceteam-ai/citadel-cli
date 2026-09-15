@@ -235,6 +235,15 @@ type Server struct {
 	// http.ServeMux has no deregister, so the mux pattern for a prefix can only
 	// ever be claimed by one dispatcher.
 	dirExposures map[string]*dirRoot
+
+	// cacheProvider, when non-nil, enables the authenticated read-only model-cache
+	// serving routes (/cache/...) — the server side of citadel-cli#1013. It
+	// returns a read-only snapshot of the node's cache index plus the resolved
+	// on-disk cache root, called per request so serving reflects live index
+	// state. Set via SetCacheServer; see cache_serve.go for the gate (mesh
+	// same-owner identity + Files capability + node passcode) and the per-family
+	// read surface. Registered from Start alongside the chat routes.
+	cacheProvider CacheIndexProvider
 }
 
 // NewServer creates a new gateway server.
@@ -418,6 +427,16 @@ func categoryForPath(path string) string {
 	if strings.HasPrefix(path, ExposeRoutePrefix) {
 		return ""
 	}
+	// Model-cache serving routes (/cache/...) are gated SOLELY by the cache
+	// handler's own authorize check (mesh same-owner identity + Files capability
+	// + node passcode), which — unlike this capability layer — fails CLOSED on
+	// nil permissions. Always-allow here so permissionMiddleware's allow-all-on-
+	// nil path never runs a passcode check BEFORE the handler's identity-first
+	// gate (a bcrypt/vault call an unauthenticated caller must never reach). See
+	// cache_serve.go (citadel-cli#1013).
+	if strings.HasPrefix(path, CacheRoutePrefix) {
+		return ""
+	}
 	// Terminal/console
 	if path == "/terminal" || strings.HasPrefix(path, "/terminal/") {
 		return "console"
@@ -537,6 +556,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// Same mux, so they are reachable on both the LAN and the VPN listener.
 	if s.chatLister != nil {
 		s.registerChatRoutes()
+	}
+	// Authenticated read-only model-cache serving (citadel-cli#1013): like the
+	// chat routes, these serve per request from live index state and ride the
+	// same mux (LAN + VPN listeners), gated by the cache handler's own
+	// identity-first authorize check. See cache_serve.go.
+	if s.cacheProvider != nil {
+		s.registerCacheRoutes()
 	}
 	// Any route added after this point (WireModuleRoute) must register its own
 	// proxy handler live, since this loop has already run.
