@@ -2516,3 +2516,22 @@ Auto-generated log of every release.
   - test(runtime): #1041 engine-exec guard skips nested .claude worktrees (#1052)
 
 
+---
+
+## v2.161.0 — 2026-09-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 54 |
+| Lines added | +7510 |
+
+**Changes:**
+
+  - feat(ingress): citadel ingress mesh reverse proxy for hosted apps (#1067)
+  - chore(macos): darwin CPU/arm64 compose variants for engines (#1064)
+  - feat(aep): RFC 8785 JCS canon as receipt v3, ready-but-not-default (#1065)
+  - feat(gateway): authenticated read-only model-cache serving for authorized peers (#1063)
+  - feat(transcribe): model selection + denoise + no-speech guard (#1058)
+
+
