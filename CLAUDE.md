@@ -2449,10 +2449,12 @@ node showed green while executing nothing. Three defenses (`internal/worker/`):
    precedence: an explicit payload `timeout_ms` (backend budget, PR #552) wins;
    otherwise a **generous per-class fallback** applies so the wedge is bounded even
    when the backend sends no budget (the exact wedge condition). Classes:
-   - Default 60min (`WORKER_JOB_TIMEOUT_SECONDS`): inference, shell, file, VNC,
-     transcribe (its own single-shot self-bound is ~32min, comfortably under).
+   - Default 60min (`WORKER_JOB_TIMEOUT_SECONDS`): inference, shell, file, VNC.
    - Long 4h (`WORKER_JOB_TIMEOUT_LONG_SECONDS`): `MEETING_JOIN`, `COBROWSE` —
-     real human-session length; 4h catches a wedge without killing a live meeting.
+     real human-session length; 4h catches a wedge without killing a live meeting
+     — plus `TRANSCRIBE_AUDIO` (citadel#1045): a caller-selected larger model on
+     CPU transcribing a long recording runs several-x slower than real time and
+     the default 60min tier would abandon it mid-transcription.
    - Unbounded (no fallback cap): model pulls/downloads, builds, `SERVICE_START`,
      `INSTANCE_PROVISION`, `AGENT_UPDATE`, `WHATSAPP_PROVISION` — opaque long
      progress; a blanket cap would risk killing a legit job. Set either env to `0`
@@ -2491,7 +2493,7 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WORKER_JOB_TIMEOUT_SECONDS` | `3600` | Fallback per-job deadline for ordinary job types. `0` = unbounded. |
-| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE). `0` = unbounded. |
+| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE, TRANSCRIBE_AUDIO). `0` = unbounded. |
 | `WORKER_SELF_HEAL` | on | Set falsey (`0`/`false`/`no`/`off`) to disable the self-heal monitor. |
 | `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
 | `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
@@ -2593,9 +2595,12 @@ site, if another job type turns out to genuinely contend for engine VRAM.
 ### Long-session and GPU-bound jobs get a dedicated always-async lane (citadel #489, extended by #903 Stage 1)
 
 `Runner.Run` (`internal/worker/runner.go`) dispatches a job whose type is in
-`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE)
-on its own goroutine UNCONDITIONALLY, checked before the `concurrency > 1`
-branch. It **also** dispatches a job satisfying `needsGPUSlot`
+`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE,
+and TRANSCRIBE_AUDIO since citadel#1045) on its own goroutine UNCONDITIONALLY,
+checked before the `concurrency > 1` branch. TRANSCRIBE_AUDIO is NOT in
+`gpuBoundJobTypes`, so this membership (not the inference lane) is what makes it
+always-async on every node; see the `longSessionJobTypes` comment in
+`deadline.go` for why that is safe and what it changes. It **also** dispatches a job satisfying `needsGPUSlot`
 (`internal/worker/gpu_tracker.go` — `llm_inference`, `LLAMACPP_INFERENCE`,
 `VLLM_INFERENCE`, `OLLAMA_INFERENCE`) the same way, but ONLY when
 `r.gpuTracker` is non-nil — see the nil-tracker gate below before assuming
@@ -3293,6 +3298,62 @@ deliberately does NOT shell `brew` unattended — it returns a structured
 `{updated:false, reason:"homebrew-managed..."}`. The default installer
 (`scripts/install.sh`, curl|bash) is NOT brew, so its self-update path is
 unaffected and the acceptance ("self-updating service") holds there.
+
+### Node transcription: sidecar is the SENSOR, Go is the POLICY (citadel #1045)
+
+`TRANSCRIBE_AUDIO` on low-SNR/distant-mic audio used to emit confident
+training-prior hallucinations ("Thank you very much." for a 38-min silent clip,
+a looped Welsh gibberish, "It's a pleasure to meet you." on repeat) with no
+caller control and no "no speech" signal. The fix splits cleanly:
+
+- **`services/whisper-service/app.py` is the SENSOR.** It loads a caller-chosen
+  `model_size` on demand (single-slot cache under `_model_lock` — one model
+  resident at a time so a memory-tight node doesn't OOM; a concurrent
+  transcribe keeps its own reference across a swap), optionally denoises via
+  ffmpeg (`_denoise_to_tmp`, afftdn+band-pass → a CONTAINER-local temp file,
+  never under the read-only `/workspace` mount), passes `vad_filter` /
+  `no_speech_threshold` / `compression_ratio_threshold` / `logprob_threshold`
+  (→ faster-whisper's `log_prob_threshold`) / `condition_on_previous_text`
+  through to decoding, and EXPOSES per-segment `no_speech_prob` / `avg_logprob`
+  / `compression_ratio`. It makes no verdict.
+
+- **`internal/jobs/transcribe_guard.go` is the POLICY.**
+  `evaluateTranscriptionGuard` is a pure, deterministic verdict over those
+  signals + the transcript text; `attachTranscriptionGuard` adds it as the
+  additive `transcription_guard` object on the relayed result (top level decoded
+  as `json.RawMessage`, so every other field is VALUE-preserved — its floats are
+  never re-serialized, though `json.Marshal` does compact the raw messages; any
+  parse failure relays verbatim). Thresholds are consts mirroring faster-whisper
+  1.0.3's own decoding defaults. Repetition detection is signal-INDEPENDENT
+  (pure text), so it catches looped filler even against an OLD sidecar image
+  that emits no signals; `signalsPresent` per segment ensures absent signals are
+  never read as a confident `no_speech`. The guard is always-on and advisory —
+  it never alters the transcript.
+
+Param plumbing/validation lives in `applyTranscribeOptions`
+(`internal/jobs/transcribe_audio.go`): only adds a key the payload actually
+carries (so a no-new-param request is byte-identical — pinned by
+`TestApplyTranscribeOptions_NoNewParamsByteIdentical`), validates `model_size`
+against `allowedWhisperModelSizes` (kept in sync with `app.py`'s
+`ALLOWED_MODELS` and faster-whisper's `_MODELS`), and validation runs BEFORE
+`waitForReady` so a bad param fails fast. **The request budget is model-aware:**
+`transcribeTimeoutFor(sizeBytes, modelSize)` scales the base
+(`transcribeTimeoutForAudioBytes`) by a per-model factor + one-time load
+allowance, because a larger model runs several-x slower and downloads+loads its
+weights INSIDE the first `/transcribe` call — a short clip with `medium` would
+otherwise abort at the 2-min floor mid-download. `modelSize==""` reduces to
+exactly the base budget (existing tests unchanged).
+
+**Rebuild + pull required for the sensor half.** The compose pins
+`whisper-service:latest` (a FLOATING tag), so a `SERVICE_START`/`up` alone won't
+upgrade it (the #718 lesson). CI (`.github/workflows/build-whisper-service.yml`)
+rebuilds+pushes on any `services/whisper-service/**` change to main; a node must
+then `docker compose pull` transcribe to get the per-segment signals AND the
+`duration` field. Until it does, the Go guard still runs but reports
+`signals_available:false` and relies only on the checks that need neither
+(text-repetition, empty-transcript, and — since `language_probability` already
+existed — uncertain-language). The low-speech-coverage check needs the new
+`duration` field, so it too only activates post-rebuild (fail-open without it).
 
 ### Docker Runtime Requirements
 vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:

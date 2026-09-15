@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -675,5 +676,245 @@ func TestTranscribeAudio_VRAMPreflightFailsOpenOnUnknownVRAM(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("expected fail-open (proceed) on an unknown VRAM signal, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// citadel#1045: model selection + denoise/VAD passthrough + no-speech guard
+// ---------------------------------------------------------------------------
+
+// TestApplyTranscribeOptions_NoNewParamsByteIdentical is the backward-compat
+// pin: a payload with none of the new params must produce EXACTLY the same
+// request the pre-#1045 handler sent — {audio_path[, language][, diarize]} and
+// nothing else.
+func TestApplyTranscribeOptions_NoNewParamsByteIdentical(t *testing.T) {
+	req := map[string]any{"audio_path": "rec.wav"}
+	if err := applyTranscribeOptions(req, map[string]string{
+		"language": "en",
+		"diarize":  "true",
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]any{"audio_path": "rec.wav", "language": "en", "diarize": true}
+	if !reflect.DeepEqual(req, want) {
+		t.Errorf("request = %#v, want %#v", req, want)
+	}
+
+	// A truly empty options payload adds nothing at all.
+	req2 := map[string]any{"audio_path": "rec.wav"}
+	if err := applyTranscribeOptions(req2, map[string]string{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(req2) != 1 {
+		t.Errorf("empty options must add nothing, got %#v", req2)
+	}
+	// diarize=="false" (not the literal "true") must add nothing, preserving the
+	// exact pre-existing string-compare semantics.
+	req3 := map[string]any{"audio_path": "rec.wav"}
+	if err := applyTranscribeOptions(req3, map[string]string{"diarize": "false"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := req3["diarize"]; ok {
+		t.Errorf(`diarize "false" must not be forwarded, got %#v`, req3)
+	}
+}
+
+// TestApplyTranscribeOptions_NewParamsForwarded checks every new param is
+// validated and copied onto the request with the right type.
+func TestApplyTranscribeOptions_NewParamsForwarded(t *testing.T) {
+	req := map[string]any{"audio_path": "rec.wav"}
+	err := applyTranscribeOptions(req, map[string]string{
+		"model_size":                  "medium",
+		"denoise":                     "true",
+		"vad_filter":                  "true",
+		"condition_on_previous_text":  "false",
+		"no_speech_threshold":         "0.7",
+		"compression_ratio_threshold": "2.6",
+		"logprob_threshold":           "-0.8",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]any{
+		"audio_path":                  "rec.wav",
+		"model_size":                  "medium",
+		"denoise":                     true,
+		"vad_filter":                  true,
+		"condition_on_previous_text":  false,
+		"no_speech_threshold":         0.7,
+		"compression_ratio_threshold": 2.6,
+		"logprob_threshold":           -0.8,
+	}
+	if !reflect.DeepEqual(req, want) {
+		t.Errorf("request = %#v, want %#v", req, want)
+	}
+}
+
+// TestApplyTranscribeOptions_Validation covers the reject cases: an
+// unrecognized model_size, a non-bool flag, and a non-numeric threshold each
+// error rather than being silently ignored or forwarded.
+func TestApplyTranscribeOptions_Validation(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]string
+	}{
+		{"bad model_size", map[string]string{"model_size": "gigantic"}},
+		{"bad denoise", map[string]string{"denoise": "yesplease"}},
+		{"bad vad_filter", map[string]string{"vad_filter": "maybe"}},
+		{"bad no_speech_threshold", map[string]string{"no_speech_threshold": "high"}},
+		{"bad logprob_threshold", map[string]string{"logprob_threshold": "low"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := map[string]any{"audio_path": "rec.wav"}
+			if err := applyTranscribeOptions(req, tc.payload); err == nil {
+				t.Fatalf("expected validation error for %v", tc.payload)
+			}
+		})
+	}
+}
+
+// TestApplyTranscribeOptions_AllWhitelistedModelsAccepted guards the whitelist
+// against drift: every advertised model size must validate.
+func TestApplyTranscribeOptions_AllWhitelistedModelsAccepted(t *testing.T) {
+	for _, m := range allowedWhisperModelSizes {
+		req := map[string]any{"audio_path": "rec.wav"}
+		if err := applyTranscribeOptions(req, map[string]string{"model_size": m}); err != nil {
+			t.Errorf("whitelisted model %q rejected: %v", m, err)
+		}
+		if got := transcribeModelTimeoutFactors[m]; got < 1 {
+			t.Errorf("model %q has no timeout factor entry (defaults would apply); add it to keep the budget sane", m)
+		}
+	}
+}
+
+// TestTranscribeTimeoutFor_ModelAware pins the model-aware budget: the empty
+// default is byte-identical to the model-agnostic sizing, while a larger model
+// gets a strictly larger budget (factor + one-time load allowance) so a short
+// clip is not aborted mid-download.
+func TestTranscribeTimeoutFor_ModelAware(t *testing.T) {
+	// 43-minute recording — comfortably inside [min,max] for base.
+	size := int64(43 * 60 * transcribeBytesPerSecond)
+
+	if got, want := transcribeTimeoutFor(size, ""), transcribeTimeoutForAudioBytes(size); got != want {
+		t.Errorf("empty model must equal the model-agnostic budget: got %v want %v", got, want)
+	}
+	if got, want := transcribeTimeoutFor(size, "base"), transcribeTimeoutForAudioBytes(size); got != want {
+		t.Errorf("base model must equal the model-agnostic budget: got %v want %v", got, want)
+	}
+
+	base := transcribeTimeoutFor(size, "base")
+	medium := transcribeTimeoutFor(size, "medium")
+	if medium <= base {
+		t.Errorf("medium budget %v should exceed base %v", medium, base)
+	}
+
+	// The advisor's exact concern: a SHORT clip with a large model must clear
+	// the base floor by at least the model's load allowance, so the first-request
+	// download+load is not aborted at 2 minutes.
+	shortClip := int64(20 * transcribeBytesPerSecond) // ~20s of audio
+	shortMedium := transcribeTimeoutFor(shortClip, "medium")
+	if shortMedium <= transcribeMinRequestTimeout {
+		t.Errorf("short-clip medium budget %v must exceed the %v floor to survive first-load", shortMedium, transcribeMinRequestTimeout)
+	}
+	if shortMedium < transcribeModelLoadAllowance["medium"] {
+		t.Errorf("short-clip medium budget %v must include the model load allowance %v", shortMedium, transcribeModelLoadAllowance["medium"])
+	}
+
+	// Still clamped to the ceiling for absurd inputs.
+	if got := transcribeTimeoutFor(int64(1000*60*transcribeBytesPerSecond), "large-v3"); got != transcribeMaxRequestTimeout {
+		t.Errorf("oversized large-v3 budget = %v, want ceiling %v", got, transcribeMaxRequestTimeout)
+	}
+}
+
+// TestTranscribeAudio_InvalidModelSizeFailsFast: a bad model_size must error
+// BEFORE the sidecar is ever contacted (validation precedes waitForReady).
+func TestTranscribeAudio_InvalidModelSizeFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.webm"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	sidecarHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sidecarHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+
+	_, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "tm",
+		Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{
+			"audio_path": "a.webm",
+			"model_size": "not-a-model",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected an error for an invalid model_size")
+	}
+	if sidecarHit {
+		t.Error("sidecar was contacted despite an invalid model_size; validation must fail fast")
+	}
+}
+
+// TestTranscribeAudio_NewParamsReachSidecar drives the full handler and asserts
+// the new params arrive on the wire, and that the relayed result gains the
+// additive transcription_guard.
+func TestTranscribeAudio_NewParamsReachSidecar(t *testing.T) {
+	dir := t.TempDir()
+	audioRel := "rec.wav"
+	if err := os.WriteFile(filepath.Join(dir, audioRel), []byte("fakeaudio"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	var gotReq map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotReq)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"hello","language":"en","segments":[{"text":"hello","no_speech_prob":0.02,"avg_logprob":-0.2,"compression_ratio":1.1}]}`))
+	}))
+	defer srv.Close()
+
+	h := NewTranscribeAudioHandler(dir)
+	h.ServiceURL = srv.URL
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:   "tp",
+		Type: "TRANSCRIBE_AUDIO",
+		Payload: map[string]string{
+			"audio_path":          audioRel,
+			"model_size":          "small",
+			"denoise":             "true",
+			"vad_filter":          "true",
+			"no_speech_threshold": "0.65",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotReq["model_size"] != "small" {
+		t.Errorf("model_size not forwarded: %#v", gotReq)
+	}
+	if gotReq["denoise"] != true || gotReq["vad_filter"] != true {
+		t.Errorf("denoise/vad_filter not forwarded: %#v", gotReq)
+	}
+	if gotReq["no_speech_threshold"] != 0.65 {
+		t.Errorf("no_speech_threshold not forwarded: %#v", gotReq)
+	}
+
+	var res map[string]json.RawMessage
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("result not JSON: %v", err)
+	}
+	if _, ok := res["transcription_guard"]; !ok {
+		t.Error("result missing additive transcription_guard")
 	}
 }

@@ -46,9 +46,34 @@ const (
 
 // longSessionJobTypes get the generous long-tier fallback. These legitimately
 // run for the length of a human session but are still bounded in the real world.
+//
+// JobTypeTranscribeAudio is here (citadel#1045) because a caller-selected larger
+// model (medium/large-v3, int8 on CPU) transcribing a long recording runs
+// several-x slower than real time — a ~38-minute clip at medium can take a few
+// hours — which the default 60-minute tier would abandon mid-transcription (the
+// exact case #1045 exists to make work). 4h is under the 5h self-heal STUCK
+// ceiling.
+//
+// Because TRANSCRIBE_AUDIO is NOT in gpuBoundJobTypes (deliberately excluded —
+// the faster-whisper sidecar does not share the GPU-serving path the tracker
+// models), it never took the inference lane, so membership HERE routes it onto
+// the #489 always-async goroutine on EVERY node (GPU and CPU alike), changing it
+// from the prior inline (maxConcurrency=1) / semaphore-pool (maxConcurrency>1)
+// dispatch. That is SAFE — the async lane is the identical claim/execute path
+// (same per-job watchdog, terminal events, cancellation, in-flight accounting;
+// only the concurrency gate is bypassed) — and DESIRABLE: a multi-hour
+// transcription no longer blocks the fetch loop inline (the #489 head-of-line
+// rationale, now applied to transcribe too). The one real consequence: the prior
+// inline serialization of concurrent TRANSCRIBE_AUDIO on a maxConcurrency=1 node
+// is removed, so two can now run at once. That is bounded downstream by the
+// whisper sidecar's single-slot _model_lock (services/whisper-service/app.py):
+// two concurrent transcribes requesting DIFFERENT model_sizes evict+reload each
+// other (thrash) rather than corrupt anything — accepted for v1. The in-process
+// meeting transcribe rides MEETING_JOIN's own long tier and is unaffected.
 var longSessionJobTypes = map[string]struct{}{
-	JobTypeMeetingJoin: {},
-	JobTypeCobrowse:    {},
+	JobTypeMeetingJoin:     {},
+	JobTypeCobrowse:        {},
+	JobTypeTranscribeAudio: {},
 }
 
 // unboundedJobTypes get NO fallback deadline: their duration is dominated by
