@@ -46,6 +46,13 @@ type doctorReport struct {
 	// need it anyway (see services.GetAvailableServices' GOOS filter). When set,
 	// an unusable engine is a WARN, not a FAIL, and does not fail the exit code.
 	dockerOptional bool
+	// bindWarnings lists embedded engines (from the node manifest) that will be
+	// published on ALL network interfaces with no auth (aceteam-ai/citadel-cli#1023
+	// — an opt-in `bind: all`, or an engine defaulting to all-interfaces like
+	// ollama). Informational only: it does NOT affect the exit code, matching the
+	// posture of the job-routing section (a deliberate `bind: all` is a valid
+	// operator choice, not a failure).
+	bindWarnings []string
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Only the
@@ -76,6 +83,7 @@ func runDoctorChecksFor(isDarwin bool) doctorReport {
 		dockerHealth:   platform.CheckDockerUsable(bin),
 		doctor:         agentDoctor(worker.WorkerSnapshot{}),
 		dockerOptional: isDarwin,
+		bindWarnings:   engineBindExposureWarnings(),
 	}
 }
 
@@ -123,6 +131,16 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 	}
 	if diagnosis, ok := r.doctor["diagnosis"].(string); ok && diagnosis != "" {
 		fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("Diagnosis:"), diagnosis)
+	}
+
+	headerColor.Fprintln(w, "\nENGINE NETWORK EXPOSURE")
+	fmt.Fprintln(w, faintColor.Sprint("  (informational: an engine on all interfaces has no auth of its own; does not affect exit code)"))
+	if len(r.bindWarnings) == 0 {
+		fmt.Fprintf(w, "  %s no embedded engine is published on all interfaces\n", goodColor.Sprint("[OK]"))
+	} else {
+		for _, warning := range r.bindWarnings {
+			fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[WARN]"), warning)
+		}
 	}
 
 	fmt.Fprintln(w)

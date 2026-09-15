@@ -1012,6 +1012,25 @@ regardless. vllm/llamacpp/bonsai/unlimited-ocr/sglang are now loopback-only
 (`aceteam-ai/aceteam#9523`; see `TestServiceMapBindSweep` in
 `services/embed_test.go` for the current bind of every `ServiceMap` entry).
 
+**The per-service `bind:` escape hatch (aceteam-ai/citadel-cli#1023).**
+`services.ResolvePortSpecBind` / `services.ComposePublishesLoopbackOnly`
+(`services/bind.go`) are the SINGLE authority for a compose port spec's effective
+host bind, resolving the two-substitution form
+`${CITADEL_<SVC>_BIND:-<default>}:${HOST}:<cport>` the 5 loopback engines (+
+ollama) now publish. The `Service.Bind` manifest field (`"all"`/`"loopback"`)
+becomes a `CITADEL_<SVC>_BIND` env var (`services.BindEnv`, injected at
+`docker compose up` by `startService`/`serviceStart`) ONLY when set — unset falls
+through to the compose `:-` default (loopback for the 5 no-auth engines,
+all-interfaces for ollama's `host.docker.internal` catalog-app consumer).
+`TestServiceMapBindSweep` and the #1030 drift loop-guard
+(`cmd/compose_refresh.go`'s `composePublishesLoopbackOnly`, now bind-env-aware so
+a `bind: all` engine is never drift-recreated into a boot loop) both resolve
+through that same authority. `citadel doctor`/`citadel status` warn (never refuse)
+when an embedded engine will publish on all interfaces
+(`engineBindExposureWarning`, `cmd/service_bind.go`). Which engines carry the
+hatch is `services.serviceBindEnv` (NOT kokoro/omnivoice — co-located-only; NOT
+the deferred extraction/diffusers/transcribe/lmstudio sweep).
+
 **Fix (#581, node-side complement of aceteam #6236):** the gateway now routes
 `/v1/chat/completions` (plus `/v1/completions` and `/v1/models`) by model. Both
 `citadel work --gateway` and `citadel serve` register a dynamic chat handler

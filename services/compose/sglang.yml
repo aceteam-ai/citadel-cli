@@ -13,8 +13,15 @@ services:
     # stays available through the gateway's model-routed
     # /v1/chat/completions (internal/gateway/chat_route.go), which resolves
     # the model to this engine and reverse-proxies to 127.0.0.1 itself.
+    #
+    # The `${CITADEL_SGLANG_BIND:-127.0.0.1}` IP prefix is the #1023 escape
+    # hatch: the bind defaults to loopback, but `bind: all` on this service in
+    # citadel.yaml makes citadel inject CITADEL_SGLANG_BIND=0.0.0.0 at `up`
+    # (services.BindEnv). Unset, the `:-127.0.0.1` default keeps loopback
+    # byte-identical. The host port stays the literal 30000 (sglang has no
+    # citadel-injected host-port var). services.ResolvePortSpecBind is the authority.
     ports:
-      - "127.0.0.1:30000:30000"
+      - "${CITADEL_SGLANG_BIND:-127.0.0.1}:30000:30000"
     volumes:
       # Mount a user-accessible directory to cache Hugging Face models
       - ~/citadel-cache/huggingface:/root/.cache/huggingface

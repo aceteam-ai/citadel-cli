@@ -327,31 +327,72 @@ func TestOmniVoiceComposeContract(t *testing.T) {
 	}
 }
 
-// loopbackBoundEngineHostPorts maps each engine ServiceMap entry that this
-// test asserts is loopback-only to the bare (no `:?`/`:-` guard) host-port
-// token its compose file must publish behind a literal "127.0.0.1:" prefix
-// (aceteam-ai/aceteam#9523). sglang has no citadel-injected host-port var (its
-// compose publishes the literal 30000), so its expected token is empty and the
-// assertion below checks the literal "127.0.0.1:30000:" prefix directly instead.
-var loopbackBoundEngineHostPorts = map[string]string{
-	"vllm":          "${" + EnvVLLMHostPort + "}",
-	"llamacpp":      "${" + EnvLlamacppHostPort + "}",
-	"bonsai":        "${" + EnvBonsaiHostPort + "}",
-	"unlimited-ocr": "${" + EnvUnlimitedOCRHostPort + "}",
-	"kokoro":        "${" + EnvTTSHostPort + "}",
-	"omnivoice":     "${" + EnvOmniVoiceHostPort + "}",
+// bindHatchEngineHostPorts maps each engine ServiceMap entry that carries the
+// aceteam-ai/citadel-cli#1023 bind escape hatch to (its bind env var, its bare
+// host-port token). The compose publish is the two-substitution form
+// ${CITADEL_<SVC>_BIND:-127.0.0.1}:<hostToken>:<cport>: the DEFAULT bind (env
+// unset) is loopback (aceteam-ai/aceteam#9523's posture), and an operator can
+// inject CITADEL_<SVC>_BIND=0.0.0.0 to open it to all interfaces. sglang is
+// checked separately below (it has no ${...HOST_PORT} var; its host port is the
+// literal 30000).
+var bindHatchEngineHostPorts = map[string]struct {
+	bindVar   string
+	hostToken string
+}{
+	"vllm":          {EnvVLLMBind, "${" + EnvVLLMHostPort + "}"},
+	"llamacpp":      {EnvLlamacppBind, "${" + EnvLlamacppHostPort + "}"},
+	"bonsai":        {EnvBonsaiBind, "${" + EnvBonsaiHostPort + "}"},
+	"unlimited-ocr": {EnvUnlimitedOCRBind, "${" + EnvUnlimitedOCRHostPort + "}"},
 }
 
-// TestEngineComposeFilesLoopbackBound is the aceteam-ai/aceteam#9523 contract
-// test: every OpenAI-compatible inference engine compose file with no auth of
-// its own must publish its host port on 127.0.0.1 only, using the bare-token
-// idiom (no `:?`/`:-` guard, which would
-// smear across this parser's colon handling; see the kokoro.yml/
-// omnivoice.yml comments this pattern mirrors). Table-driven per Acceptance
-// criterion 4 in the parent issue ("extend a TestEngineCacheDirsMatchComposeMounts
-// -style test to assert the bind for every ServiceMap entry").
+// literalLoopbackEngineHostPorts maps each engine ServiceMap entry hardcoded to
+// the literal 127.0.0.1 prefix with NO bind hatch (kokoro/omnivoice are
+// co-located-consumer-only; their compose comments forbid off-host reach) to its
+// bare host-port token.
+var literalLoopbackEngineHostPorts = map[string]string{
+	"kokoro":    "${" + EnvTTSHostPort + "}",
+	"omnivoice": "${" + EnvOmniVoiceHostPort + "}",
+}
+
+// TestEngineComposeFilesLoopbackBound is the aceteam-ai/aceteam#9523 +
+// aceteam-ai/citadel-cli#1023 contract test: every OpenAI-compatible inference
+// engine compose file with no auth of its own must, BY DEFAULT, publish its host
+// port on 127.0.0.1 only. The 5 hatch engines do so via the two-substitution
+// ${CITADEL_<SVC>_BIND:-127.0.0.1} form (default loopback, opt-in all-interfaces
+// via CITADEL_<SVC>_BIND=0.0.0.0); kokoro/omnivoice via the literal prefix.
 func TestEngineComposeFilesLoopbackBound(t *testing.T) {
-	for name, token := range loopbackBoundEngineHostPorts {
+	// Hatch engines: assert the two-substitution form is present, its DEFAULT
+	// resolves loopback-only, and a bind:all env flips it to all-interfaces.
+	for name, spec := range bindHatchEngineHostPorts {
+		t.Run(name, func(t *testing.T) {
+			content, ok := ServiceMap[name]
+			if !ok {
+				t.Fatalf("%q not found in ServiceMap", name)
+			}
+			want := "${" + spec.bindVar + ":-127.0.0.1}:" + spec.hostToken + ":"
+			if !strings.Contains(content, want) {
+				t.Errorf("compose %q must publish via the #1023 bind hatch %q; got:\n%s", name, want, content)
+			}
+			// Registry agreement: the bind var must be the one services.BindEnv
+			// resolves for this service, so the compose token and the injector
+			// can never drift.
+			if got, ok := BindEnvVarName(name); !ok || got != spec.bindVar {
+				t.Errorf("BindEnvVarName(%q) = (%q,%v), want (%q,true)", name, got, ok, spec.bindVar)
+			}
+			// Default (env unset) is loopback-only.
+			if lb, has := ComposePublishesLoopbackOnly(content, nil); !lb || !has {
+				t.Errorf("compose %q default bind must be loopback-only; got (loopbackOnly=%v,hasPublish=%v)", name, lb, has)
+			}
+			// bind:all env opens it to all interfaces.
+			if lb, _ := ComposePublishesLoopbackOnly(content, map[string]string{spec.bindVar: AllInterfacesBindAddr}); lb {
+				t.Errorf("compose %q with %s=0.0.0.0 must NOT be loopback-only", name, spec.bindVar)
+			}
+		})
+	}
+
+	// Literal-loopback engines (no hatch): assert the 127.0.0.1 literal prefix
+	// and that no bind var is registered for them.
+	for name, token := range literalLoopbackEngineHostPorts {
 		t.Run(name, func(t *testing.T) {
 			content, ok := ServiceMap[name]
 			if !ok {
@@ -361,25 +402,22 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 			if !strings.Contains(content, want) {
 				t.Errorf("compose %q must publish its host port loopback-only via %q; got:\n%s", name, want, content)
 			}
-			// The guarded form must be absent. If present, either this
-			// engine's compose was reverted to the old ${VAR:?msg} shape, or a
-			// hand-edit reintroduced a guard that would break the loopback
-			// host-port parsers (services/embed_test.go's composeHostPorts,
-			// internal/apps/hostport_collision_test.go's hostPortField).
-			if strings.Contains(content, token+":?") || strings.Contains(content, token+":-") {
-				t.Errorf("compose %q must use the bare %q token (no :?/:- guard) behind the loopback prefix", name, token)
+			if _, ok := BindEnvVarName(name); ok {
+				t.Errorf("%q must NOT carry a bind hatch (co-located-consumer-only)", name)
 			}
 		})
 	}
 
-	// sglang: no citadel-injected host-port var, so its loopback literal is
-	// checked directly rather than via the token map above.
+	// sglang: bind hatch behind a literal host port (no ${...HOST_PORT} var).
 	sglang, ok := ServiceMap["sglang"]
 	if !ok {
 		t.Fatal("sglang not found in ServiceMap")
 	}
-	if !strings.Contains(sglang, "127.0.0.1:30000:30000") {
-		t.Errorf("sglang compose must publish its host port loopback-only (127.0.0.1:30000:30000); got:\n%s", sglang)
+	if !strings.Contains(sglang, "${"+EnvSGLangBind+":-127.0.0.1}:30000:30000") {
+		t.Errorf("sglang compose must publish via the #1023 bind hatch (${%s:-127.0.0.1}:30000:30000); got:\n%s", EnvSGLangBind, sglang)
+	}
+	if lb, has := ComposePublishesLoopbackOnly(sglang, nil); !lb || !has {
+		t.Errorf("sglang default bind must be loopback-only; got (loopbackOnly=%v,hasPublish=%v)", lb, has)
 	}
 }
 
@@ -398,10 +436,12 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 // copies are the citadel-services catalog modules (services/claudecode,
 // services/hermes), per this repo's CLAUDE.md.
 var nonLoopbackServiceMapAllowlist = map[string]string{
-	"ollama": "internal/apps/catalog.go sets OLLAMA_BASE_URL=http://host.docker.internal:11434 " +
-		"for a catalog app; a container reaching the host via host.docker.internal lands on the " +
-		"docker0 bridge gateway, not 127.0.0.1, so a loopback-only publish would break that consumer. " +
-		"Tracked in aceteam-ai/citadel-cli#1023.",
+	"ollama": "aceteam-ai/citadel-cli#1023: bind hatch DEFAULTS to all-interfaces " +
+		"(${CITADEL_OLLAMA_BIND:-0.0.0.0}) because internal/apps/catalog.go sets " +
+		"OLLAMA_BASE_URL=http://host.docker.internal:11434 for a catalog app; a container reaching " +
+		"the host via host.docker.internal lands on the docker0 bridge gateway, not 127.0.0.1, so a " +
+		"loopback-only default would break that consumer. An operator can tighten it with " +
+		"`bind: loopback` (CITADEL_OLLAMA_BIND=127.0.0.1); doctor/status flag the default as LAN-exposed.",
 	"extraction": "out of scope for aceteam-ai/aceteam#9523 (issue named vllm/sglang/llamacpp/bonsai/" +
 		"unlimited-ocr/ollama only); same 0.0.0.0-with-no-auth shape, tracked as a broader-sweep " +
 		"candidate in aceteam-ai/citadel-cli#1023.",
@@ -426,27 +466,11 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 func TestServiceMapBindSweep(t *testing.T) {
 	for name, content := range ServiceMap {
 		t.Run(name, func(t *testing.T) {
-			var doc struct {
-				Services map[string]struct {
-					Ports []string `yaml:"ports"`
-				} `yaml:"services"`
-			}
-			if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
-				t.Fatalf("compose %q is not valid YAML: %v", name, err)
-			}
-			hasHostPublish := false
-			loopbackOnly := true
-			for _, svc := range doc.Services {
-				for _, spec := range svc.Ports {
-					if !strings.Contains(spec, ":") {
-						continue // container-port-only, no host publish
-					}
-					hasHostPublish = true
-					if !strings.HasPrefix(spec, "127.0.0.1:") {
-						loopbackOnly = false
-					}
-				}
-			}
+			// Resolve the DEFAULT bind (empty env) through the single authority
+			// ComposePublishesLoopbackOnly so the #1023 two-substitution form
+			// ${CITADEL_<SVC>_BIND:-127.0.0.1} reads as loopback-by-default and
+			// ollama's ${...:-0.0.0.0} reads as all-interfaces-by-default.
+			loopbackOnly, hasHostPublish := ComposePublishesLoopbackOnly(content, nil)
 			if !hasHostPublish {
 				return // nothing published on the host; nothing to check
 			}
@@ -493,30 +517,28 @@ func composeHostPorts(t *testing.T, composeYAML string) []int {
 	var hosts []int
 	for _, svc := range doc.Services {
 		for _, mapping := range svc.Ports {
-			// The host side is everything before the container colon, but a
-			// ${CITADEL_*_HOST_PORT:?...} expansion carries its own colons, so
-			// peel a leading ${...} group intact and resolve it via the registry.
-			if strings.HasPrefix(mapping, "${") {
-				if end := strings.IndexByte(mapping, '}'); end >= 0 {
-					inner := mapping[2:end]
-					varName := inner
-					if c := strings.IndexByte(inner, ':'); c >= 0 {
-						varName = inner[:c]
-					}
-					if port, ok := envVarHostPort[varName]; ok {
-						hosts = append(hosts, port)
-					}
+			// ComposePortHostToken (services/bind.go) is the single authority for
+			// pulling the host-port field out of any port-spec form, including the
+			// #1023 two-substitution ${BIND:-127.0.0.1}:${HOST}:<cport> shape.
+			tok := ComposePortHostToken(mapping)
+			if tok == "" {
+				continue // container-port-only, no host publish
+			}
+			// A ${CITADEL_*_HOST_PORT} host token resolves via the registry so the
+			// collision assertions validate the port citadel actually injects.
+			if strings.HasPrefix(tok, "${") {
+				inner := strings.TrimSuffix(strings.TrimPrefix(tok, "${"), "}")
+				varName := inner
+				if c := strings.IndexByte(inner, ':'); c >= 0 {
+					varName = inner[:c]
+				}
+				if port, ok := envVarHostPort[varName]; ok {
+					hosts = append(hosts, port)
 				}
 				continue
 			}
-			// "HOST:CONTAINER" (optionally "HOST:CONTAINER/proto"); the host side
-			// is everything before the first colon.
-			hostStr := mapping
-			if i := strings.IndexByte(mapping, ':'); i >= 0 {
-				hostStr = mapping[:i]
-			}
 			var p int
-			if _, err := fmt.Sscanf(hostStr, "%d", &p); err == nil && p > 0 {
+			if _, err := fmt.Sscanf(tok, "%d", &p); err == nil && p > 0 {
 				hosts = append(hosts, p)
 			}
 		}

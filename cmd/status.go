@@ -1313,6 +1313,13 @@ func printServiceInfo(w *tabwriter.Writer) {
 		default:
 			fmt.Fprintf(w, "  - %s:\t%s\n", service.Name, labelColor.Sprint("⚫ STOPPED"))
 		}
+
+		// aceteam-ai/citadel-cli#1023: warn when an embedded engine is published
+		// on all interfaces with no auth of its own (an opt-in `bind: all`, or an
+		// engine defaulting to all-interfaces like ollama).
+		if warning := serviceBindExposureWarning(service, configDir); warning != "" {
+			fmt.Fprintf(w, "    %s %s\n", warnColor.Sprint("⚠️  network exposure:"), warning)
+		}
 	}
 }
 

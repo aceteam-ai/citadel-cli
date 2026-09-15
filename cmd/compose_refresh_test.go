@@ -95,21 +95,32 @@ func TestIsWildcardHostIP(t *testing.T) {
 }
 
 func TestComposePublishesLoopbackOnly(t *testing.T) {
-	if !composePublishesLoopbackOnly(loopbackComposeContent) {
+	if !composePublishesLoopbackOnly(loopbackComposeContent, nil) {
 		t.Error("loopback template must be reported loopback-only")
 	}
-	if composePublishesLoopbackOnly(handEditedWildcardComposeContent) {
+	if composePublishesLoopbackOnly(handEditedWildcardComposeContent, nil) {
 		t.Error("hand-edited 0.0.0.0 template must NOT be reported loopback-only")
 	}
 	// No host publish at all (container-port-only) is not loopback-only: there
 	// is nothing to remediate, so the drift check must not fire.
-	if composePublishesLoopbackOnly("services:\n  x:\n    ports:\n      - \"8000\"\n") {
+	if composePublishesLoopbackOnly("services:\n  x:\n    ports:\n      - \"8000\"\n", nil) {
 		t.Error("container-port-only compose has no host publish; must not report loopback-only")
 	}
-	// Every real #1025 engine template must read as loopback-only.
+	// Every real #1025 engine template must read as loopback-only BY DEFAULT
+	// (bind unset -> the #1023 ${...:-127.0.0.1} default resolves to loopback).
 	for name := range loopbackDriftEngines {
-		if !composePublishesLoopbackOnly(services.ServiceMap[name]) {
-			t.Errorf("services.ServiceMap[%q] must publish loopback-only", name)
+		if !composePublishesLoopbackOnly(services.ServiceMap[name], nil) {
+			t.Errorf("services.ServiceMap[%q] must publish loopback-only by default", name)
+		}
+		// A `bind: all` env flips the SAME template to non-loopback (the drift
+		// loop guard: don't drift-recreate a bind:all engine into a boot loop).
+		bindVar, ok := services.BindEnvVarName(name)
+		if !ok {
+			t.Errorf("BindEnvVarName(%q) missing; drift engines must be hatch-capable", name)
+			continue
+		}
+		if composePublishesLoopbackOnly(services.ServiceMap[name], map[string]string{bindVar: services.AllInterfacesBindAddr}) {
+			t.Errorf("services.ServiceMap[%q] with %s=0.0.0.0 must NOT be loopback-only", name, bindVar)
 		}
 	}
 }
@@ -120,10 +131,11 @@ func TestEngineBindDriftRequiresRecreate(t *testing.T) {
 		service  string
 		content  string
 		bindings []hostBinding
+		env      map[string]string
 		want     bool
 	}{
 		{
-			name:     "vllm on 0.0.0.0 with loopback template recreates",
+			name:     "vllm on 0.0.0.0 with loopback default recreates",
 			service:  "vllm",
 			content:  services.ServiceMap["vllm"],
 			bindings: []hostBinding{{HostIP: "0.0.0.0", HostPort: 8201}, {HostIP: "::", HostPort: 8201}},
@@ -165,6 +177,17 @@ func TestEngineBindDriftRequiresRecreate(t *testing.T) {
 			want:     false,
 		},
 		{
+			// #1023 loop guard: an operator set `bind: all`, so the injected env
+			// resolves the template to 0.0.0.0 and the running wildcard binding is
+			// EXPECTED -- must NOT drift-recreate (that would loop every boot).
+			name:     "bind:all env makes wildcard binding expected, no recreate",
+			service:  "vllm",
+			content:  services.ServiceMap["vllm"],
+			bindings: []hostBinding{{HostIP: "0.0.0.0", HostPort: 8201}},
+			env:      map[string]string{services.EnvVLLMBind: services.AllInterfacesBindAddr},
+			want:     false,
+		},
+		{
 			name:     "ServiceMap engine outside the #1025 set is left alone",
 			service:  "extraction",
 			content:  services.ServiceMap["extraction"],
@@ -181,7 +204,7 @@ func TestEngineBindDriftRequiresRecreate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := engineBindDriftRequiresRecreate(tt.service, tt.content, tt.bindings)
+			got := engineBindDriftRequiresRecreate(tt.service, tt.content, tt.bindings, tt.env)
 			if got != tt.want {
 				t.Errorf("engineBindDriftRequiresRecreate(%q, ...) = %v, want %v", tt.service, got, tt.want)
 			}
@@ -200,8 +223,8 @@ func TestLoopbackDriftEnginesPublishLoopback(t *testing.T) {
 			t.Errorf("loopbackDriftEngines[%q] is not a services.ServiceMap entry", name)
 			continue
 		}
-		if !composePublishesLoopbackOnly(content) {
-			t.Errorf("loopbackDriftEngines[%q] template does not publish loopback-only", name)
+		if !composePublishesLoopbackOnly(content, nil) {
+			t.Errorf("loopbackDriftEngines[%q] template does not publish loopback-only by default", name)
 		}
 	}
 }

@@ -47,6 +47,16 @@ type Service struct {
 	// then failed, leaving it still running and a preemption candidate) must
 	// not be silently flipped to start-on-boot by an unrelated reservation.
 	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
+	// Bind is the aceteam-ai/citadel-cli#1023 per-service host-bind escape hatch
+	// for the no-auth inference engines that aceteam-ai/aceteam#9523 defaulted to
+	// loopback (vllm/llamacpp/bonsai/unlimited-ocr/sglang, plus ollama which
+	// defaults to all-interfaces). "all" (or "0.0.0.0") opts the engine into an
+	// all-interfaces (0.0.0.0) host publish; "loopback" (or "127.0.0.1") pins it
+	// to localhost-only. Empty/absent => the compose default applies (loopback for
+	// the 5 engines, all-interfaces for ollama). Only services.BindEnvVarName
+	// hatch-capable engines honor it; it is injected as CITADEL_<SVC>_BIND at
+	// `docker compose up` via services.BindEnv. See services/bind.go.
+	Bind string `yaml:"bind,omitempty"`
 }
 
 // serviceStartDisabled reports whether a service is marked "stopped" and must be

@@ -25,8 +25,14 @@ services:
     # internal/apps/hostport_collision_test.go, and citadel ALWAYS injects the
     # var (services.HostPortEnv) at every `docker compose up` site, so it
     # resolves; do not add a default/guard back.
+    #
+    # The `${CITADEL_LLAMACPP_BIND:-127.0.0.1}` IP prefix is the #1023 escape
+    # hatch: the bind defaults to loopback, but `bind: all` on this service in
+    # citadel.yaml makes citadel inject CITADEL_LLAMACPP_BIND=0.0.0.0 at `up`
+    # (services.BindEnv). Unset, the `:-127.0.0.1` default keeps loopback
+    # byte-identical. services.ResolvePortSpecBind is the authority.
     ports:
-      - "127.0.0.1:${CITADEL_LLAMACPP_HOST_PORT}:8080"
+      - "${CITADEL_LLAMACPP_BIND:-127.0.0.1}:${CITADEL_LLAMACPP_HOST_PORT}:8080"
     volumes:
       - ~/citadel-cache/llamacpp:/models
     # LLAMACPP_MODEL (citadel-cli#685 §1a) optionally points the server at a

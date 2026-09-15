@@ -18,6 +18,9 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// aceteam-ai/aceteam#9523: documents why ollama is NOT loopback-bound
 		// (unlike its siblings below); no functional change.
 		"6d0779e549255b52eb40d4f78a0a581a9cabf2bd712f645a2eae00a3fa8c7583": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch defaulting to all-interfaces
+		// (${CITADEL_OLLAMA_BIND:-0.0.0.0}), tightenable via `bind: loopback`.
+		"de8c7513caf02c4685d69fa8b28c4a5d2cfb97897ac6463ed970fd830908c1bd": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
@@ -34,6 +37,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"fbb22432970140a45794760f0775be51d40555aa66aa3a96142b91438776a2ae": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
 		"58b4576aa49864067d040e719c929f8d19ee74ca137c4c83350f9c3c3f71df54": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_VLLM_BIND:-127.0.0.1}).
+		"937570137f5758ddd72fd20d0d24e5b78c84ae31e486cf34c9b89bd4c1fb8a19": true,
 	},
 	"llamacpp": {
 		"03985065ef91d7ea3a512b3dc3029f08e57ca72a9d6ac96e5a6c3d52d1d9f249": true,
@@ -48,6 +53,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"ea38cf731d5330b96aacee62ad787b1b2ebfd1679df01b508a08638acb4f01f2": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
 		"73503ad8531bffd4bcf1774d81ddf5e53e4c34b3ab0ea23c64cd1e0ac638d680": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_LLAMACPP_BIND:-127.0.0.1}).
+		"a093bfc26312a2c1fdf79b03fa5712154d586e94948c635d4a3db91ed84c6866": true,
 	},
 	"lmstudio": {
 		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,
@@ -58,6 +65,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"2e46554d84a142f549b0481b068b14d2bc65fd02829956ea2288c089b5ad518a": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
 		"53bb28a964349de503495857d0f73368a0489109f273822ee5b91c87dacb6f1f": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_SGLANG_BIND:-127.0.0.1}).
+		"59af61468b3d158164e9725ed57f6fbadef160e58d7e707da13d8cc71f35689e": true,
 	},
 	"extraction": {
 		"3f7f02536458773d7f8b22da3e7d4213b943db47c457ce669d9270ff2e0a7260": true,
@@ -82,6 +91,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"50132811ec60f1d628599cd0c971cb2732087ee11bca58a3bda1312a8ef13ff0": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
 		"a97ea6b823df5fde3cb20c8d53d2e486b55833900a949f49851bb934405bb78d": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_BONSAI_BIND:-127.0.0.1}).
+		"3eebefe135279f62e56d984de0454c9ba69c20c3d8c9af848a78861c738948af": true,
 	},
 	"kokoro": {
 		"3ce764e232b286c75f776872bb3554e15b2e03b229863abce271324a815ab777": true,
@@ -93,6 +104,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"2f1e1f1ffae72db007b65d1b8d275f69c33c0c7e3207f8139ee8c2c1c8d2c9c0": true,
 		// aceteam-ai/aceteam#9523: loopback-only host publish (127.0.0.1).
 		"75fe75f1342aedc35fad293a8836baab47048c00f35c6dab0b3c288282fc73e0": true,
+		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_UNLIMITED_OCR_BIND:-127.0.0.1}).
+		"baa1d24e1729af469aaf3cd6b7e171b73dcf8e99dfce99cb8209fa83bbc9b387": true,
 	},
 	"omnivoice": {
 		"5a58ceded5200f2dd1d67a199b407edddd3bfe1bd91dd2700cbbed55ee2abe39": true,
