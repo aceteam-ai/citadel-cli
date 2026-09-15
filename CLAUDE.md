@@ -1758,18 +1758,23 @@ guard). `CanonicalizeJCS` (the ONE canonicalizer, over `gowebpki/jcs`) is
 injective by construction and shared by both `CanonicalizeV3` (the receipt) and
 `VerdictHashV3` (the verdict object). It is ready-but-not-default: **v2 stays the
 emitted default** — the sole emission site is `buildAEPReceiptV2`
-(`internal/worker/llm_inference.go`), and the cutover is a one-line flip there,
-gated on the aceteam verifier (aceteam #9287) and its goldens moving to JCS
-first. `cmd/aep.go`'s verifier already branches `receipt_version "3"`. Two rules
+(`internal/worker/llm_inference.go`), gated on the aceteam verifier (aceteam
+#9287) and its goldens moving to JCS first. The cutover is a SMALL COORDINATED
+flip, not one line: `BuildSignedReceiptV2`→`V3`, `V2Inputs`→`V3Inputs`, AND the
+`VerdictHash` must switch from `verdict.VerdictHash` (trust's canonical_json
+port) to `aep.VerdictHashV3` in BOTH the signed receipt and `trustVerdictMap`
+(the v3 golden pins the JCS verdict_hash, so skipping the third edit emits a
+receipt whose verdict_hash disagrees with the golden AND the unsigned
+`trust_verdict`). `cmd/aep.go`'s verifier already branches `receipt_version "3"`. Two rules
 JCS leaves to the implementation are enforced in `CanonicalizeJCS` by walking the
 Go value (a large float and a large int are indistinguishable in marshaled JSON,
 so the check must be by Go type): non-finite floats rejected, and integers
 outside the I-JSON safe range `[-(2^53)+1, 2^53-1]` rejected — `jcsMaxSafeInteger`
 rejects `|n| >= 2^53` to match Python `rfc8785` (which refuses 2^53 itself, per
 design §9.2), NOT the design prose's `<= 2^53`. Goldens + a cross-language
-conformance corpus live at `internal/aep/testdata/v3/` (`corpus.json`'s five
-`sha256_16` fields are independent references from design §9.2's three-library
-run, asserted on every regen); regenerate with `go test ./internal/aep -run
+conformance corpus live at `internal/aep/testdata/v3/` (`corpus.json`'s
+`sha256_16` fields — six cases, five distinct — are independent references from
+design §9.2's three-library run, asserted on every regen); regenerate with `go test ./internal/aep -run
 'TestGoldenReceiptV3|TestJCSConformanceCorpus' -update-golden` (NOT `-run Golden`,
 which also rewrites the v2 golden's randomized signature).
 
