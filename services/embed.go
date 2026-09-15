@@ -10,14 +10,14 @@ import (
 	"sort"
 )
 
-//go:embed compose/ollama.yml
-var OllamaCompose string
+// OllamaCompose and LlamacppCompose are embedded in build-tagged files
+// (compose_variants_other.go for linux/windows, compose_variants_darwin.go for
+// macOS) so darwin can swap in CPU/arm64 variants that drop the nvidia GPU
+// reservation Docker Desktop for macOS cannot satisfy (citadel-cli#1048). Every
+// other engine's compose is embedded directly below.
 
 //go:embed compose/vllm.yml
 var VLLMCompose string
-
-//go:embed compose/llamacpp.yml
-var LlamacppCompose string
 
 //go:embed compose/lmstudio.yml
 var LMStudioCompose string
@@ -117,27 +117,41 @@ func WriteAuxFiles(servicesDir, name string) error {
 // ServiceMap key to be classified as darwin-capable or linux-only.
 //
 // This reflects engine SOFTWARE capability on macOS, per the issue's explicit
-// direction (keep ollama/llama.cpp, drop vLLM/CUDA-only). CAVEAT: the LLM engine
-// compose files (ollama, llamacpp, lmstudio) currently declare an NVIDIA GPU
-// reservation and llamacpp pins a CUDA image tag; whether they start unmodified
-// under Docker Desktop on Apple Silicon is unverified and tracked as a follow-up
-// (needs a real Mac to confirm). This filter's job is to stop advertising the
-// unambiguously CUDA-only engines a Mac can never run.
+// direction (keep ollama/llama.cpp, drop vLLM/CUDA-only). The compose-file side
+// of that promise was verified via registry-manifest checks and resolved in
+// citadel-cli#1048 (follow-up to #1042):
+//
+//   - ollama, llamacpp: the linux compose files carry a mandatory nvidia GPU
+//     reservation that fails container creation on Docker Desktop for macOS, and
+//     llamacpp additionally pins a CUDA/amd64 image. Both now ship a darwin
+//     CPU/arm64 compose variant (build-tagged, see compose_variants_darwin.go)
+//     that drops the reservation and, for llamacpp, uses the native-arm64 CPU
+//     `:server` image. They stay darwin-capable, backed by a real variant.
+//
+//   - transcribe, kokoro, tei, extraction: no GPU reservation, so no known
+//     start failure — but their images are amd64-only (verified) or unavailable
+//     to check anonymously (extraction), so on Apple Silicon they run under
+//     Rosetta/QEMU emulation. Emulated start of these MKL/PyTorch-based images is
+//     UNVERIFIED (Rosetta does not translate AVX/AVX2 pre-Sequoia, a common SIGILL
+//     source); kept advertised because "unknown" is not "known to fail", but flag
+//     it — see the Mac step in #1048 before relying on them.
+//
+// lmstudio was DROPPED to linuxOnlyServices: see its note there.
 var darwinCapableServices = map[string]bool{
 	"ollama":     true,
 	"llamacpp":   true,
-	"lmstudio":   true,
 	"transcribe": true,
 	"kokoro":     true,
 	"tei":        true,
 	"extraction": true,
 }
 
-// linuxOnlyServices names the embedded engines that are CUDA-only (a CUDA image
-// and/or a mandatory NVIDIA runtime) and therefore never advertised on darwin.
-// It exists only so TestServiceMapDarwinClassificationExhaustive can prove every
-// ServiceMap key is classified exactly once — the runtime filter keys off
-// darwinCapableServices (the allow-list) alone.
+// linuxOnlyServices names the embedded engines NOT advertised on darwin: the
+// CUDA-only inference engines (a CUDA image and/or a mandatory NVIDIA runtime),
+// plus lmstudio (see below). It exists only so
+// TestServiceMapDarwinClassificationExhaustive can prove every ServiceMap key is
+// classified exactly once — the runtime filter keys off darwinCapableServices
+// (the allow-list) alone.
 var linuxOnlyServices = map[string]bool{
 	"vllm":          true,
 	"sglang":        true,
@@ -145,6 +159,14 @@ var linuxOnlyServices = map[string]bool{
 	"diffusers":     true,
 	"unlimited-ocr": true,
 	"omnivoice":     true,
+	// lmstudio: dropped from darwin in citadel-cli#1048. Unlike ollama/llamacpp
+	// it gets no darwin variant because there is nothing verifiable to ship — the
+	// pinned image (technovangelist/lm-studio:latest) does not exist on Docker Hub
+	// at all ("object not found"), so it cannot pull on any OS, and there is no
+	// known arm64 image to swap in. It also carries a mandatory nvidia reservation,
+	// and LM Studio on macOS is a native desktop app rather than a container. If a
+	// real, pullable macOS-capable image lands, revisit.
+	"lmstudio": true,
 }
 
 // availableServicesFor returns the sorted service names available on the given

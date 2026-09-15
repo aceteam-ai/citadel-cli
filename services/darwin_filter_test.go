@@ -12,14 +12,18 @@ func TestAvailableServicesFor_DarwinFiltersCUDAEngines(t *testing.T) {
 		inDarwin[s] = true
 	}
 
-	mustInclude := []string{"ollama", "llamacpp", "lmstudio"}
+	// ollama/llamacpp are backed by darwin CPU/arm64 compose variants
+	// (citadel-cli#1048); the four utility services carry no GPU reservation.
+	mustInclude := []string{"ollama", "llamacpp", "transcribe", "kokoro", "tei", "extraction"}
 	for _, s := range mustInclude {
 		if !inDarwin[s] {
 			t.Errorf("darwin available services missing %q; got %v", s, darwin)
 		}
 	}
 
-	mustExclude := []string{"vllm", "sglang", "bonsai", "diffusers", "unlimited-ocr", "omnivoice"}
+	// lmstudio is excluded (citadel-cli#1048): no pullable image + nvidia
+	// reservation, and no verifiable darwin variant to ship.
+	mustExclude := []string{"lmstudio", "vllm", "sglang", "bonsai", "diffusers", "unlimited-ocr", "omnivoice"}
 	for _, s := range mustExclude {
 		if inDarwin[s] {
 			t.Errorf("darwin available services must NOT advertise CUDA-only engine %q; got %v", s, darwin)

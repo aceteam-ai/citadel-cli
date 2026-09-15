@@ -21,6 +21,11 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// aceteam-ai/citadel-cli#1023: bind hatch defaulting to all-interfaces
 		// (${CITADEL_OLLAMA_BIND:-0.0.0.0}), tightenable via `bind: loopback`.
 		"de8c7513caf02c4685d69fa8b28c4a5d2cfb97897ac6463ed970fd830908c1bd": true,
+		// aceteam-ai/citadel-cli#1048: darwin CPU/arm64 variant
+		// (compose/ollama.darwin.yml, GPU reservation dropped). Registered so a
+		// darwin node's composerefresh recognizes the materialized variant as
+		// citadel-written; pinned by TestKnownComposeHashesCoverDarwinVariants.
+		"35eded55d912833bb7076c144ed58722a72019c471817de75cd40dc4ff6e7a5b": true,
 	},
 	"vllm": {
 		"07588f4ef245f011396874bcdd7c6aa0c463a356c5f6601618c3b4e213be812a": true,
@@ -55,6 +60,11 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"73503ad8531bffd4bcf1774d81ddf5e53e4c34b3ab0ea23c64cd1e0ac638d680": true,
 		// aceteam-ai/citadel-cli#1023: bind hatch (${CITADEL_LLAMACPP_BIND:-127.0.0.1}).
 		"a093bfc26312a2c1fdf79b03fa5712154d586e94948c635d4a3db91ed84c6866": true,
+		// aceteam-ai/citadel-cli#1048: darwin CPU/arm64 variant
+		// (compose/llamacpp.darwin.yml, GPU reservation dropped + :server CPU
+		// image). Registered for a darwin node's composerefresh; pinned by
+		// TestKnownComposeHashesCoverDarwinVariants.
+		"097cdb8500b3f9b5e2c2f018a5124578744e2e0364a5b9c3e390239af8ef12c3": true,
 	},
 	"lmstudio": {
 		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,

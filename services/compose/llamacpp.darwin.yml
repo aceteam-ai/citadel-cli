@@ -1,0 +1,37 @@
+# services/compose/llamacpp.darwin.yml
+#
+# macOS (Apple Silicon / Intel) CPU variant of services/compose/llamacpp.yml,
+# selected at build time by the `//go:build darwin` embed in
+# services/compose_variants_darwin.go (the linux/windows path embeds
+# llamacpp.yml, byte-identical to before). citadel-cli#1048.
+#
+# TWO deliberate differences from llamacpp.yml, and ONLY these two (pinned by
+# TestDarwinComposeVariantsOnlyDropGPU in services/darwin_variants_test.go):
+#
+#  1. image: `ghcr.io/ggml-org/llama.cpp:server` (the CPU server build) instead
+#     of `:server-cuda`. The CUDA image needs the nvidia container runtime,
+#     which Docker Desktop for macOS does not provide; the plain `:server` tag is
+#     multi-arch and ships a native linux/arm64 manifest, so it runs natively on
+#     Apple Silicon rather than under emulation. The server binary, its CLI
+#     flags, and the /models mount are identical between the two tags, so the
+#     command/ports/volumes below are unchanged.
+#
+#  2. the mandatory `deploy.resources.reservations.devices: [{driver: nvidia,
+#     ...}]` block is dropped. macOS exposes no GPU to Linux containers, so that
+#     reservation makes `docker compose up` fail container creation with
+#     `could not select device driver "nvidia" with capabilities: [[gpu]]`.
+#     llama.cpp runs CPU-only here (Metal is not available inside the container).
+#
+# All bind/port/model comments in llamacpp.yml apply verbatim; see that file.
+services:
+  llamacpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: citadel-llamacpp
+    ports:
+      - "${CITADEL_LLAMACPP_BIND:-127.0.0.1}:${CITADEL_LLAMACPP_HOST_PORT}:8080"
+    volumes:
+      - ~/citadel-cache/llamacpp:/models
+    command: >-
+      --host 0.0.0.0
+      --port 8080
+      ${LLAMACPP_MODEL:+--model} ${LLAMACPP_MODEL:+/models/}${LLAMACPP_MODEL}
