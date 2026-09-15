@@ -1,0 +1,35 @@
+# services/compose/ollama.darwin.yml
+#
+# macOS (Apple Silicon / Intel) CPU variant of services/compose/ollama.yml,
+# selected at build time by the `//go:build darwin` embed in
+# services/compose_variants_darwin.go (the linux/windows path embeds
+# ollama.yml, byte-identical to before). citadel-cli#1048.
+#
+# WHY A SEPARATE FILE: Docker Desktop for macOS exposes NO GPU to Linux
+# containers (there is no nvidia device driver, and Metal is not passed through
+# to the Linux VM), so the mandatory `deploy.resources.reservations.devices:
+# [{driver: nvidia, ...}]` block in ollama.yml makes `docker compose up` fail
+# container creation with `could not select device driver "nvidia" with
+# capabilities: [[gpu]]`. This variant drops that block so ollama runs CPU-only,
+# which is how Ollama itself documents running in Docker on a Mac (no `--gpus`).
+# The `ollama/ollama` image is multi-arch (native linux/arm64), so it runs
+# natively on Apple Silicon rather than under emulation.
+#
+# Everything else is kept identical to ollama.yml so the two files differ ONLY
+# by the removed GPU reservation (pinned by TestDarwinComposeVariantsOnlyDropGPU
+# in services/darwin_variants_test.go). In particular the bind default stays
+# all-interfaces (${CITADEL_OLLAMA_BIND:-0.0.0.0}) for the same reason ollama.yml
+# documents: internal/apps/catalog.go points a catalog app's OLLAMA_BASE_URL at
+# host.docker.internal, which lands on the docker bridge gateway (also on macOS),
+# not 127.0.0.1, so a loopback-only default would break that consumer. An
+# operator can still tighten it with `bind: loopback` in citadel.yaml.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: citadel-ollama
+    ports:
+      - "${CITADEL_OLLAMA_BIND:-0.0.0.0}:11434:11434"
+    volumes:
+      # Mount a user-accessible directory for Ollama models
+      - ~/citadel-cache/ollama:/root/.ollama

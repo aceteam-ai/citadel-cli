@@ -3552,7 +3552,6 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 **macOS**:
 - Uses Homebrew for package management (auto-installs if missing)
 - Installs Docker Desktop via `brew install --cask docker`
-- GPU support handled automatically by Docker Desktop (especially on Apple Silicon)
 - No NVIDIA Container Toolkit (not applicable)
 - Creates users with dscl (Directory Service command line)
 - Global config path differs (see `ConfigDir()` above) — but only when running as root; a normal invocation uses `~/.citadel-cli` like everywhere else
@@ -3561,12 +3560,16 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 
 **Linux**: Full NVIDIA GPU support via NVIDIA Container Toolkit. Compose files use `driver: nvidia` specification.
 
-**macOS**:
-- Docker Desktop on Apple Silicon (M1/M2/M3) has built-in GPU support via Metal framework
-- Intel Macs do not have GPU acceleration for containers
-- The `driver: nvidia` specifications in compose files are Linux-specific and ignored on macOS
-- Services will still run on macOS but without explicit GPU device reservations
-- Docker Desktop automatically handles GPU access for Metal-compatible workloads
+**macOS — no GPU in containers, and the nvidia reservation is NOT ignored (citadel-cli#1048, corrects a stale claim this section made).**
+Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal is not passed through to the Linux VM, and there is no nvidia device driver, on Apple Silicon or Intel. The previous claim here ("Metal GPU support in containers", "`driver: nvidia` is ignored", "services still run") was wrong on all three counts: Docker Compose v2 honors `deploy.resources.reservations.devices` outside swarm, so a mandatory `driver: nvidia` reservation makes `docker compose up` **fail container creation** with `could not select device driver "nvidia" with capabilities: [[gpu]]`.
+
+Consequence, owned by `services.darwinCapableServices` / `linuxOnlyServices` (`services/embed.go`) plus the build-tagged `services.OllamaCompose`/`LlamacppCompose` embeds (`services/compose_variants_{other,darwin}.go`):
+- CUDA-only engines (vllm, sglang, bonsai, diffusers, unlimited-ocr, omnivoice) are not advertised on darwin.
+- ollama and llamacpp ship a **darwin CPU/arm64 compose variant** (`compose/{ollama,llamacpp}.darwin.yml`) that drops the reservation (and, for llamacpp, uses the native-arm64 `:server` CPU image instead of `:server-cuda`). `TestDarwinComposeVariantsOnlyDropGPU` pins that the variant differs from its linux original by exactly that.
+- lmstudio is dropped from darwin entirely: its pinned image does not exist on Docker Hub, so there is nothing to ship.
+- The CPU utility services (transcribe, kokoro, tei, extraction) carry no reservation and stay advertised, but their images are amd64-only, so on Apple Silicon they run under Rosetta/QEMU emulation.
+
+**Unverified pending a real Apple Silicon Mac:** whether ollama/llamacpp actually start end-to-end via the variants, and whether the emulated amd64 utility images start (Rosetta does not translate AVX/AVX2 pre-Sequoia — a common SIGILL source for MKL/PyTorch builds). See the Mac-verification steps in citadel-cli#1048's PR before relying on any of these on macOS.
 
 ### Known Limitations on macOS
 
@@ -3574,7 +3577,7 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
 - systemctl commands are not used (Docker Desktop manages the daemon)
 - User/group management uses different commands (dscl vs useradd)
 - Passwordless sudo configuration only applies to Linux
-- GPU device reservations in compose files are Linux-specific
+- No GPU inside Linux containers; GPU-dependent engines are either dropped or shipped as CPU/arm64 variants on darwin (see GPU Support Notes above)
 
 ## Windows Support
 
