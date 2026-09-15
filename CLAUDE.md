@@ -2474,7 +2474,7 @@ should render the new `{ok:true, restarting:true}` response instead of the old
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `WORKER_JOB_TIMEOUT_SECONDS` | `3600` | Fallback per-job deadline for ordinary job types. `0` = unbounded. |
-| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE). `0` = unbounded. |
+| `WORKER_JOB_TIMEOUT_LONG_SECONDS` | `14400` | Fallback deadline for long-session types (MEETING_JOIN, COBROWSE, TRANSCRIBE_AUDIO). `0` = unbounded. |
 | `WORKER_SELF_HEAL` | on | Set falsey (`0`/`false`/`no`/`off`) to disable the self-heal monitor. |
 | `WORKER_SELF_HEAL_STALL_SECONDS` | `600` | No-poll gap (with nothing in flight) before self-heal restarts. |
 | `WORKER_SELF_HEAL_STUCK_SECONDS` | `18000` | Single-job in-flight ceiling before self-heal restarts. `0` = disabled. |
@@ -2576,9 +2576,12 @@ site, if another job type turns out to genuinely contend for engine VRAM.
 ### Long-session and GPU-bound jobs get a dedicated always-async lane (citadel #489, extended by #903 Stage 1)
 
 `Runner.Run` (`internal/worker/runner.go`) dispatches a job whose type is in
-`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE)
-on its own goroutine UNCONDITIONALLY, checked before the `concurrency > 1`
-branch. It **also** dispatches a job satisfying `needsGPUSlot`
+`longSessionJobTypes` (`internal/worker/deadline.go` — MEETING_JOIN, COBROWSE,
+and TRANSCRIBE_AUDIO since citadel#1045) on its own goroutine UNCONDITIONALLY,
+checked before the `concurrency > 1` branch. TRANSCRIBE_AUDIO is NOT in
+`gpuBoundJobTypes`, so this membership (not the inference lane) is what makes it
+always-async on every node; see the `longSessionJobTypes` comment in
+`deadline.go` for why that is safe and what it changes. It **also** dispatches a job satisfying `needsGPUSlot`
 (`internal/worker/gpu_tracker.go` — `llm_inference`, `LLAMACPP_INFERENCE`,
 `VLLM_INFERENCE`, `OLLAMA_INFERENCE`) the same way, but ONLY when
 `r.gpuTracker` is non-nil — see the nil-tracker gate below before assuming

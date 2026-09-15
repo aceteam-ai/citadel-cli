@@ -52,11 +52,24 @@ const (
 // several-x slower than real time — a ~38-minute clip at medium can take a few
 // hours — which the default 60-minute tier would abandon mid-transcription (the
 // exact case #1045 exists to make work). 4h is under the 5h self-heal STUCK
-// ceiling. This also routes a CPU-node (tracker-less) transcribe onto the #489
-// always-async goroutine instead of blocking the fetch loop inline; on a GPU
-// node it is unchanged — needsGPUSlot routes it to the inference lane, which the
-// dispatch switch checks before longSession (runner.go). The in-process meeting
-// transcribe rides MEETING_JOIN's own long tier and is unaffected.
+// ceiling.
+//
+// Because TRANSCRIBE_AUDIO is NOT in gpuBoundJobTypes (deliberately excluded —
+// the faster-whisper sidecar does not share the GPU-serving path the tracker
+// models), it never took the inference lane, so membership HERE routes it onto
+// the #489 always-async goroutine on EVERY node (GPU and CPU alike), changing it
+// from the prior inline (maxConcurrency=1) / semaphore-pool (maxConcurrency>1)
+// dispatch. That is SAFE — the async lane is the identical claim/execute path
+// (same per-job watchdog, terminal events, cancellation, in-flight accounting;
+// only the concurrency gate is bypassed) — and DESIRABLE: a multi-hour
+// transcription no longer blocks the fetch loop inline (the #489 head-of-line
+// rationale, now applied to transcribe too). The one real consequence: the prior
+// inline serialization of concurrent TRANSCRIBE_AUDIO on a maxConcurrency=1 node
+// is removed, so two can now run at once. That is bounded downstream by the
+// whisper sidecar's single-slot _model_lock (services/whisper-service/app.py):
+// two concurrent transcribes requesting DIFFERENT model_sizes evict+reload each
+// other (thrash) rather than corrupt anything — accepted for v1. The in-process
+// meeting transcribe rides MEETING_JOIN's own long tier and is unaffected.
 var longSessionJobTypes = map[string]struct{}{
 	JobTypeMeetingJoin:     {},
 	JobTypeCobrowse:        {},
