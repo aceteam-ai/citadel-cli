@@ -2496,3 +2496,23 @@ Auto-generated log of every release.
   - chore: sync generated files after v2.158.0 release
 
 
+---
+
+## v2.160.0 — 2026-09-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 40 |
+| Lines added | +2115 |
+
+**Changes:**
+
+  - feat(security): per-service bind: escape hatch + all-interfaces warning (#1059)
+  - fix(macos): report real CPU usage % in status via top fallback (#1057)
+  - fix(install): resolve owner home for init idempotency check (#1056)
+  - feat(nvr): NVR_SEMANTIC_SEARCH + NVR_TRACK_OBJECTS survive reconcile (#1040)
+  - ci: nightly dual-public-IP egress relay canary (#787/#980/#1037) (#1054)
+  - test(runtime): #1041 engine-exec guard skips nested .claude worktrees (#1052)
+
+
