@@ -69,6 +69,15 @@ const (
 	DefaultMQTTPort = 1883
 	// DefaultMQTTTopicPrefix matches Frigate's own default topic namespace.
 	DefaultMQTTTopicPrefix = "frigate"
+
+	// DefaultSemanticSearchModel / DefaultSemanticSearchModelSize are Frigate's
+	// recommended CPU-friendly embedding model (jina CLIP v1, small). jinav2/large
+	// targets multilingual search and wants more RAM, so it is not the default.
+	DefaultSemanticSearchModel     = "jinav1"
+	DefaultSemanticSearchModelSize = "small"
+
+	// DefaultTrackObject is Frigate's own default tracked object.
+	DefaultTrackObject = "person"
 )
 
 // wyzeBridgeRTSPHost is the address Frigate uses to pull camera RTSP streams from
@@ -118,6 +127,16 @@ type Config struct {
 	// the alternative is polling /api/events. The module ships a node-local
 	// broker for this (#637).
 	MQTT MQTTSpec
+	// SemanticSearch enables Frigate's semantic_search block (#1039). It embeds
+	// thumbnails of TRACKED objects only, so it is near-useless without widening
+	// TrackObjects. Off by default; the emitted block never sets `reindex` (see
+	// semanticSearchSpec).
+	SemanticSearch bool
+	// TrackObjects is the list of object labels Frigate tracks (#1039). Empty means
+	// no `objects:` block is emitted and Frigate applies its own default (`person`).
+	// Labels are normalized (trim/lowercase/dedupe) but NOT validated here — the
+	// valid set depends on the detector's labelmap, so Frigate is the authority.
+	TrackObjects []string
 }
 
 // MQTTSpec points Frigate at the module's broker. The broker is node-local and
@@ -147,12 +166,14 @@ type MQTTSpec struct {
 // ---- Frigate config.yml shape (only the fields we set) ----
 
 type frigateConfig struct {
-	MQTT      map[string]any          `yaml:"mqtt"`
-	Detectors map[string]detectorSpec `yaml:"detectors"`
-	Model     *modelSpec              `yaml:"model,omitempty"`
-	FFmpeg    ffmpegSpec              `yaml:"ffmpeg"`
-	Record    recordSpec              `yaml:"record"`
-	Cameras   map[string]cameraSpec   `yaml:"cameras"`
+	MQTT           map[string]any          `yaml:"mqtt"`
+	Detectors      map[string]detectorSpec `yaml:"detectors"`
+	Model          *modelSpec              `yaml:"model,omitempty"`
+	SemanticSearch *semanticSearchSpec     `yaml:"semantic_search,omitempty"`
+	Objects        *objectsSpec            `yaml:"objects,omitempty"`
+	FFmpeg         ffmpegSpec              `yaml:"ffmpeg"`
+	Record         recordSpec              `yaml:"record"`
+	Cameras        map[string]cameraSpec   `yaml:"cameras"`
 }
 
 type detectorSpec struct {
@@ -168,6 +189,29 @@ type modelSpec struct {
 	Height           int    `yaml:"height"`
 	InputTensor      string `yaml:"input_tensor"`
 	InputPixelFormat string `yaml:"input_pixel_format"`
+}
+
+// semanticSearchSpec renders Frigate's `semantic_search:` block. Frigate embeds a
+// thumbnail of every TRACKED object into an on-disk vector index so recordings can
+// be searched by description. We deliberately DO NOT emit `reindex`: this generator
+// is stateless and rewrites config.yml on EVERY reconcile, so a static
+// `reindex: true` would re-embed the entire object history on every container
+// restart — a CPU-heavy loop on a detector-less (CPU-only) node. Reindexing is a
+// MANUAL one-shot via Frigate's UI/API; the computed embeddings live in the /config
+// SQLite DB, which reconcile never rewrites (only config.yml is regenerated), so
+// they survive a reconcile that would otherwise orphan them (the #1039 scar).
+type semanticSearchSpec struct {
+	Enabled   bool   `yaml:"enabled"`
+	Model     string `yaml:"model"`
+	ModelSize string `yaml:"model_size"`
+}
+
+// objectsSpec renders the top-level `objects: track:` list. Frigate tracks only
+// `person` by default, so a dog/cat/package is otherwise never detected — and,
+// with semantic_search on, never searchable, since search only embeds thumbnails of
+// TRACKED objects (the two knobs are coupled).
+type objectsSpec struct {
+	Track []string `yaml:"track"`
 }
 
 type ffmpegSpec struct {
@@ -250,6 +294,12 @@ func mqttBlock(m MQTTSpec) map[string]any {
 //
 // It does NOT transcode: each camera records the raw H.264 wyze-bridge already
 // emits (~1 Mbit/s). Retention is bounded by days only.
+//
+// semantic_search and objects.track are OPT-IN (#1039): the semantic_search block
+// is emitted only when cfg.SemanticSearch is set, and the objects.track block only
+// when cfg.TrackObjects is non-empty, so an unconfigured caller gets byte-identical
+// output to before. Both survive reconcile precisely because they are now generator
+// inputs rather than hand edits the next reconcile would clobber.
 func GenerateFrigateConfig(cfg Config, cameras []Camera) (string, error) {
 	if cfg.RetentionDays <= 0 {
 		return "", fmt.Errorf("nvr: retention_days must be positive, got %d", cfg.RetentionDays)
@@ -289,6 +339,19 @@ func GenerateFrigateConfig(cfg Config, cameras []Camera) (string, error) {
 		// No model: block — Frigate bundles the cpu tflite model.
 	default:
 		return "", fmt.Errorf("nvr: unknown detector %q (want %q or %q)", cfg.Detector, DetectorOpenVINO, DetectorCPU)
+	}
+
+	// semantic_search + objects.track are OPT-IN (#1039): both blocks are omitted
+	// unless explicitly configured, so the default output is unchanged.
+	if cfg.SemanticSearch {
+		fc.SemanticSearch = &semanticSearchSpec{
+			Enabled:   true,
+			Model:     DefaultSemanticSearchModel,
+			ModelSize: DefaultSemanticSearchModelSize,
+		}
+	}
+	if objs := normalizeTrackObjects(cfg.TrackObjects); len(objs) > 0 {
+		fc.Objects = &objectsSpec{Track: objs}
 	}
 
 	for _, cam := range cameras {
@@ -345,6 +408,33 @@ func ParseCameras(raw string) []Camera {
 			cam.StreamPath = strings.TrimSpace(stream)
 		}
 		out = append(out, cam)
+	}
+	return out
+}
+
+// ParseTrackObjects parses the NVR_TRACK_OBJECTS env value (comma-separated object
+// labels, e.g. "person,dog,cat") into a normalized label list. Mirrors
+// ParseCameras: it trims, lowercases, drops blanks, and de-duplicates while
+// preserving order. Labels are NOT validated here — the valid set depends on the
+// detector's labelmap (the bundled cpu model is coco80, the openvino model is
+// coco_91cl), so Frigate is the authority and rejects an unknown label itself.
+func ParseTrackObjects(raw string) []string {
+	return normalizeTrackObjects(strings.Split(raw, ","))
+}
+
+// normalizeTrackObjects trims/lowercases/dedupes a label slice, dropping blanks and
+// preserving first-seen order. Returns nil for an empty result so the caller emits
+// no `objects:` block (Frigate then applies its own `person` default).
+func normalizeTrackObjects(in []string) []string {
+	var out []string
+	seen := make(map[string]bool, len(in))
+	for _, o := range in {
+		o = strings.ToLower(strings.TrimSpace(o))
+		if o == "" || seen[o] {
+			continue
+		}
+		seen[o] = true
+		out = append(out, o)
 	}
 	return out
 }

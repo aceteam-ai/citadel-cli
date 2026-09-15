@@ -77,7 +77,7 @@ func TestNVRServiceManifest(t *testing.T) {
 			t.Errorf("secret %q must not carry a default value", secret)
 		}
 	}
-	for _, name := range []string{"NVR_RETENTION_DAYS", "NVR_DETECTOR", "NVR_STORAGE_MODE", "NVR_STORAGE_TARGET", "NVR_CAMERAS"} {
+	for _, name := range []string{"NVR_RETENTION_DAYS", "NVR_DETECTOR", "NVR_STORAGE_MODE", "NVR_STORAGE_TARGET", "NVR_CAMERAS", "NVR_SEMANTIC_SEARCH", "NVR_TRACK_OBJECTS"} {
 		if _, ok := cfg[name]; !ok {
 			t.Errorf("config is missing %q", name)
 		}

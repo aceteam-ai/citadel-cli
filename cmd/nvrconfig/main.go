@@ -19,8 +19,9 @@
 //
 // Env inputs (from the module .env / assignment): NVR_DETECTOR (openvino|cpu),
 // NVR_RETENTION_DAYS, NVR_STORAGE_MODE (local|nas|volume), NVR_CAMERAS
-// (comma-separated `name` / `name=stream`). Wyze credentials are NOT read here —
-// only docker-wyze-bridge sees them.
+// (comma-separated `name` / `name=stream`), NVR_SEMANTIC_SEARCH (bool, default
+// false) and NVR_TRACK_OBJECTS (comma-separated labels, default `person`) — #1039.
+// Wyze credentials are NOT read here — only docker-wyze-bridge sees them.
 package main
 
 import (
@@ -72,6 +73,32 @@ func run() error {
 		}
 	}
 
+	// Semantic search is OFF by default (#1039). Parse strictly and fail loud on a
+	// malformed value (the RETENTION_DAYS pattern), per this command's contract of
+	// exiting non-zero on any bad input — do not silently treat garbage as false.
+	semanticSearch := false
+	if raw := strings.TrimSpace(os.Getenv("NVR_SEMANTIC_SEARCH")); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("NVR_SEMANTIC_SEARCH %q is not a boolean (true/false)", raw)
+		}
+		semanticSearch = v
+	}
+
+	// Tracked objects default to `person` (Frigate's own default). Widening this is
+	// what makes a dog/cat/package detectable and, with semantic search, searchable.
+	trackObjects := nvr.ParseTrackObjects(getenvDefault("NVR_TRACK_OBJECTS", nvr.DefaultTrackObject))
+
+	// Semantic search embeds thumbnails of TRACKED objects only, so it is
+	// near-useless when only `person` is tracked. Warn loudly rather than silently
+	// widening the track list: more tracked objects = more detection + embedding
+	// work, which is costly on a detector-less (CPU-only) node.
+	if semanticSearch && len(trackObjects) == 1 && trackObjects[0] == nvr.DefaultTrackObject {
+		fmt.Fprintln(os.Stderr, "nvrconfig: WARNING NVR_SEMANTIC_SEARCH is on but only 'person' is tracked; "+
+			"semantic search embeds thumbnails of TRACKED objects only. Set NVR_TRACK_OBJECTS "+
+			"(e.g. \"person,dog,cat\") to make other objects searchable.")
+	}
+
 	// MQTT is on by default: the module ships a node-local broker, and Frigate
 	// has no other real-time event egress (#637). NVR_MQTT=false opts out.
 	mqttEnabled := strings.ToLower(strings.TrimSpace(getenvDefault("NVR_MQTT", "true"))) != "false"
@@ -83,9 +110,11 @@ func run() error {
 	}
 
 	cfg := nvr.Config{
-		RetentionDays: retention,
-		Detector:      detector,
-		Storage:       nvr.StorageSpec{Mode: mode, Target: os.Getenv("NVR_STORAGE_TARGET")},
+		RetentionDays:  retention,
+		Detector:       detector,
+		Storage:        nvr.StorageSpec{Mode: mode, Target: os.Getenv("NVR_STORAGE_TARGET")},
+		SemanticSearch: semanticSearch,
+		TrackObjects:   trackObjects,
 		MQTT: nvr.MQTTSpec{
 			Enabled:     mqttEnabled,
 			Host:        getenvDefault("NVR_MQTT_HOST", "mosquitto"),
@@ -106,8 +135,8 @@ func run() error {
 	if err := os.WriteFile(configPath, []byte(yamlOut), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", configPath, err)
 	}
-	fmt.Printf("nvrconfig: wrote %s (detector=%s retention=%dd storage=%s cameras=%v)\n",
-		configPath, detector, retention, mode, nvr.CameraNames(cameras))
+	fmt.Printf("nvrconfig: wrote %s (detector=%s retention=%dd storage=%s semantic_search=%t track=%v cameras=%v)\n",
+		configPath, detector, retention, mode, semanticSearch, trackObjects, nvr.CameraNames(cameras))
 	return nil
 }
 
