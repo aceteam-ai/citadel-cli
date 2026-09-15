@@ -10,7 +10,7 @@
 // The verify math is exactly the round-trip internal/aep's own tests pin:
 //
 //	sigDER = base64.StdEncoding.DecodeString(receipt.signature)
-//	digest = sha256(CanonicalizeV2(&r))   // or Canonicalize(&r) for v1
+//	digest = sha256(CanonicalizeV2(&r))   // Canonicalize(&r) for v1; CanonicalizeV3(&r) for v3 (RFC 8785 JCS)
 //	ecdsa.VerifyASN1(pub, digest[:], sigDER)
 //
 // signature and public_key_fingerprint are excluded from the canonical bytes by
@@ -225,6 +225,26 @@ func verifyAEPReceipt(opts verifyOptions) verifyOutcome {
 	)
 
 	switch probe.ReceiptVersion {
+	case "3":
+		var r aep.AEPReceiptV3
+		if err := json.Unmarshal(data, &r); err != nil {
+			return verifyOutcome{Valid: false, Reason: fmt.Sprintf("malformed v3 receipt: %v", err)}
+		}
+		// v3 canonicalization can fail (RFC 8785 JCS enforces the number-domain
+		// and finite-float rules) -- surface that as a distinct invalid outcome
+		// rather than verifying against empty bytes.
+		c, err := aep.CanonicalizeV3(&r)
+		if err != nil {
+			return verifyOutcome{Valid: false, Reason: fmt.Sprintf("cannot canonicalize v3 receipt: %v", err)}
+		}
+		canonical = c
+		signatureB64 = r.Signature
+		fingerprint = r.PublicKeyFingerprint
+		version = aep.ReceiptVersionV3
+		summary = &receiptSummary{
+			engine: r.Engine, model: r.Model, grounded: r.Grounded, score: r.Score,
+			claimsChecked: r.ClaimsChecked, action: r.Action, verdictHash: r.VerdictHash,
+		}
 	case "2":
 		var r aep.AEPReceiptV2
 		if err := json.Unmarshal(data, &r); err != nil {
@@ -252,7 +272,7 @@ func verifyAEPReceipt(opts verifyOptions) verifyOutcome {
 			claimsChecked: r.ClaimsChecked,
 		}
 	default:
-		return verifyOutcome{Valid: false, Reason: fmt.Sprintf("unsupported receipt_version %q (expected \"1\" or \"2\")", probe.ReceiptVersion)}
+		return verifyOutcome{Valid: false, Reason: fmt.Sprintf("unsupported receipt_version %q (expected \"1\", \"2\", or \"3\")", probe.ReceiptVersion)}
 	}
 
 	base := verifyOutcome{

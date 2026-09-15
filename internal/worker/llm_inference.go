@@ -1148,6 +1148,18 @@ func (h *LLMInferenceHandler) buildAEPReceiptV2(jobID string, payload *jobs.LLMI
 	if err != nil {
 		return nil, err
 	}
+	// This is THE emission site, and v2 is THE emitted default. The RFC 8785
+	// JCS canon (aep.BuildSignedReceiptV3 / receipt_version "3", citadel-cli
+	// #1021) is ready but deliberately NOT emitted, gated on the aceteam verifier
+	// (aceteam #9287) and its goldens moving to JCS first. The cutover is a small
+	// coordinated flip, NOT one line: (1) BuildSignedReceiptV2 -> V3 here, (2)
+	// V2Inputs -> V3Inputs at the applyTrustEngine call site, and (3) the
+	// VerdictHash there must switch from verdict.VerdictHash (trust's
+	// canonical_json port) to aep.VerdictHashV3(...) (the shared JCS
+	// canonicalizer) -- in BOTH this signed receipt AND trustVerdictMap, so the
+	// signed and unsigned verdict_hash stay in lockstep. The v3 golden pins the
+	// JCS verdict_hash, so a flip that skips (3) would emit a receipt whose
+	// verdict_hash disagrees with testdata/v3.
 	return aep.BuildSignedReceiptV2(h.signer, nodeID, jobID, payload.Backend, payload.Model, in, result, time.Now())
 }
 

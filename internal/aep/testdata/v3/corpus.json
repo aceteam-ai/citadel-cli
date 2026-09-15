@@ -1,0 +1,118 @@
+{
+  "description": "RFC 8785 (JCS) cross-language conformance corpus for the AEP v3 receipt canon (citadel-cli#1021). Each case: `input` is raw JSON fed to the canonicalizer; `jcs` is the expected RFC 8785 output; `sha256` is sha256(jcs) as lowercase hex. `sha256_16` (when present) is an INDEPENDENT reference from docs/design-canon-framework.md section 9.2 -- a three-library run (Go gowebpki/jcs + Python jcs + Python rfc8785) -- so matching it is real cross-language evidence, not Go self-consistency. Go verifier: `go test ./internal/aep -run TestJCSConformanceCorpus`. Python verifier (future, aceteam #9287), noting c['input'] is already a decoded value after json.load(corpus.json): for c in cases: assert rfc8785.dumps(c['input']) == c['jcs'].encode(); assert hashlib.sha256(rfc8785.dumps(c['input'])).hexdigest() == c['sha256']. Regenerate jcs/sha256 with -update-golden (which asserts every committed sha256_16 still matches).",
+  "cases": [
+    {
+      "name": "collision_pair_a",
+      "note": "v1 newline-canon collision pair, half A: engine has an embedded newline. Under the v1 newline-delimited canon this collides with collision_pair_b to identical signed bytes (design section 9.4); under JCS the newline is escaped as backslash-n inside the string and the two are DISTINCT.",
+      "input": {
+        "model": "y",
+        "engine": "bonsai\nx"
+      },
+      "jcs": "{\"engine\":\"bonsai\\nx\",\"model\":\"y\"}",
+      "sha256": "1b0f13e60d3dd507ab7418278c58d3ea03d7e37c882a0b6f7dc699cf9c45aed3"
+    },
+    {
+      "name": "collision_pair_b",
+      "note": "v1 newline-canon collision pair, half B: model has an embedded newline. Distinct from collision_pair_a under JCS.",
+      "input": {
+        "engine": "bonsai",
+        "model": "x\ny"
+      },
+      "jcs": "{\"engine\":\"bonsai\",\"model\":\"x\\ny\"}",
+      "sha256": "df1fe24772bcb7e5cb76d5f6bf9a6f1f6075f257f1052f3be41494606f5e069c"
+    },
+    {
+      "name": "number_int_one",
+      "note": "score as JSON integer 1. Canonicalizes identically to number_float_one -- JCS numbers are value-based, so the transport hop that erases Go's float-ness is harmless (design section 3.2 / P3). Matches the design section 9.2 v2-receipt-subset row.",
+      "input": {
+        "score": 1,
+        "grounded": true,
+        "claims_checked": 0
+      },
+      "jcs": "{\"claims_checked\":0,\"grounded\":true,\"score\":1}",
+      "sha256": "30ac435f4c15af993fc30246b4027ca2e124f8a39a15c2e8c91a1ec45606fb89",
+      "sha256_16": "30ac435f4c15af99"
+    },
+    {
+      "name": "number_float_one",
+      "note": "score as JSON float 1.0. Same canonical bytes as number_int_one.",
+      "input": {
+        "score": 1.0,
+        "grounded": true,
+        "claims_checked": 0
+      },
+      "jcs": "{\"claims_checked\":0,\"grounded\":true,\"score\":1}",
+      "sha256": "30ac435f4c15af993fc30246b4027ca2e124f8a39a15c2e8c91a1ec45606fb89",
+      "sha256_16": "30ac435f4c15af99"
+    },
+    {
+      "name": "number_two_thirds",
+      "note": "score = 2/3, the shortest round-tripping double 0.6666666666666666. design section 9.2.",
+      "input": {
+        "grounded": false,
+        "score": 0.6666666666666666,
+        "claims_checked": 3
+      },
+      "jcs": "{\"claims_checked\":3,\"grounded\":false,\"score\":0.6666666666666666}",
+      "sha256": "e4877bd27b4507b4794c29ea81f705c72c49c787e0551b2e2cde4773b5be439d",
+      "sha256_16": "e4877bd27b4507b4"
+    },
+    {
+      "name": "runtime_doubles",
+      "note": "Nine runtime-computed doubles spanning the 1e21 / 1e-6 notation boundaries (arrays are not key-sorted). design section 9.2. Note 123456789012345680000 is a FLOAT that renders in fixed notation with no decimal point -- fed raw to the canonicalizer, not through the integer-domain check.",
+      "input": [
+        0.30000000000000004,
+        0.6666666666666666,
+        123456789012345680000,
+        123456789012345680000,
+        0.30000000000000004,
+        0.3333333333333333,
+        1e+21,
+        0.000001,
+        0.000001
+      ],
+      "jcs": "[0.30000000000000004,0.6666666666666666,123456789012345680000,123456789012345680000,0.30000000000000004,0.3333333333333333,1e+21,0.000001,0.000001]",
+      "sha256": "91db614e8a302da9f8a58fd3fbc886ca9fc91c320ac477c5423edeb6dc02ee2b",
+      "sha256_16": "91db614e8a302da9"
+    },
+    {
+      "name": "key_order_utf16",
+      "note": "Object keys sorted by UTF-16 code units (input deliberately scrambled). The emoji U+1F600 sorts BEFORE the fullwidth tilde U+FF5E because its leading surrogate 0xD83D \u003c 0xFF5E. design section 9.2.",
+      "input": {
+        "😀": 4,
+        "b": 1,
+        "aa": 5,
+        "a": 2,
+        "～": 8,
+        "éx": 7,
+        "B": 6,
+        "é": 3
+      },
+      "jcs": "{\"B\":6,\"a\":2,\"aa\":5,\"b\":1,\"é\":3,\"éx\":7,\"😀\":4,\"～\":8}",
+      "sha256": "fb5f25a65b7b5926b340cff22fecf8d92f5a8fdd4624f71d226e853a78a083c8",
+      "sha256_16": "fb5f25a65b7b5926"
+    },
+    {
+      "name": "null_empty",
+      "note": "null / empty-string / empty-array / empty-object all preserved (RFC 8785 does NOT drop null map values, unlike the trust canonical_json port). Input scrambled to prove sorting. design section 9.2.",
+      "input": {
+        "z": [],
+        "y": "",
+        "x": null,
+        "w": {}
+      },
+      "jcs": "{\"w\":{},\"x\":null,\"y\":\"\",\"z\":[]}",
+      "sha256": "31530b18bfa7be0cf318ff50a52551ac462aeca4a25bcefa669f92ed281af834",
+      "sha256_16": "31530b18bfa7be0c"
+    },
+    {
+      "name": "string_escaping",
+      "note": "ECMAScript JSON.stringify escaping: short escapes for the quote, backslash, and the newline/return/tab/backspace/formfeed controls; NO HTML escaping of \u003c \u003e \u0026 (Go encoding/json would emit backslash-u003c etc., normalized away by the JCS round-trip); raw UTF-8 for non-ASCII (accented e and emoji). Self-consistent case (no cross-language reference pinned).",
+      "input": {
+        "s": "a\"b\\c\n\r\t\b\f\u003c\u003e\u0026/é😀"
+      },
+      "jcs": "{\"s\":\"a\\\"b\\\\c\\n\\r\\t\\b\\f\u003c\u003e\u0026/é😀\"}",
+      "sha256": "fb6fc4013fb18deeaf7f1d9021fa4f40e96e024f0da57942263b8bc6316df227"
+    }
+  ]
+}

@@ -26,7 +26,7 @@ import (
 // Use it only when the v2 canon or the sample is deliberately changed; the
 // committed fixtures are the contract a follow-up aceteam PR asserts its
 // verifier reproduces.
-var updateGolden = flag.Bool("update-golden", false, "regenerate internal/aep/testdata/v2 golden fixtures")
+var updateGolden = flag.Bool("update-golden", false, "regenerate internal/aep/testdata/v2 and v3 golden fixtures")
 
 // The fixed golden sample. Deliberately PROMPT-based (not messages): input.bin
 // is the exact prompt bytes, so BOTH the production node path (sha256Hex of
