@@ -1748,6 +1748,31 @@ at `internal/aep/testdata/v2/` (regenerate with
 deliberately deferred open question, so `content_bound` on a messages payload
 stays false today; a bare-`prompt` payload already matches.
 
+**A v3 RFC 8785 JCS canon exists but is NOT emitted (citadel-cli#1021,
+`internal/aep/jcs.go` + `receipt_v3.go`).** The v1/v2 newline-delimited
+`Canonicalize`/`CanonicalizeV2` are non-injective — a `\n` inside a free-string
+field (engine/model are request-derived) shifts field boundaries without
+changing the signed bytes, so one signature can vouch for two receipts (design
+`docs/design-canon-framework.md` §2/§9.4; v2 mitigates with a refuse-to-sign
+guard). `CanonicalizeJCS` (the ONE canonicalizer, over `gowebpki/jcs`) is
+injective by construction and shared by both `CanonicalizeV3` (the receipt) and
+`VerdictHashV3` (the verdict object). It is ready-but-not-default: **v2 stays the
+emitted default** — the sole emission site is `buildAEPReceiptV2`
+(`internal/worker/llm_inference.go`), and the cutover is a one-line flip there,
+gated on the aceteam verifier (aceteam #9287) and its goldens moving to JCS
+first. `cmd/aep.go`'s verifier already branches `receipt_version "3"`. Two rules
+JCS leaves to the implementation are enforced in `CanonicalizeJCS` by walking the
+Go value (a large float and a large int are indistinguishable in marshaled JSON,
+so the check must be by Go type): non-finite floats rejected, and integers
+outside the I-JSON safe range `[-(2^53)+1, 2^53-1]` rejected — `jcsMaxSafeInteger`
+rejects `|n| >= 2^53` to match Python `rfc8785` (which refuses 2^53 itself, per
+design §9.2), NOT the design prose's `<= 2^53`. Goldens + a cross-language
+conformance corpus live at `internal/aep/testdata/v3/` (`corpus.json`'s five
+`sha256_16` fields are independent references from design §9.2's three-library
+run, asserted on every regen); regenerate with `go test ./internal/aep -run
+'TestGoldenReceiptV3|TestJCSConformanceCorpus' -update-golden` (NOT `-run Golden`,
+which also rewrites the v2 golden's randomized signature).
+
 **Machine-convergent AND the same key the CA registered — one convergent
 identity store (K-A, `docs/design-trust-receipt-v2.md` §4, citadel-cli#1002 /
 aceteam#8253).** `nodeidentity.Convergent(nodeConfigDir)`

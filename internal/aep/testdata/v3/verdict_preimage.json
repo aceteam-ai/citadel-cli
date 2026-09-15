@@ -1,0 +1,39 @@
+{
+  "action": "flag",
+  "checks": [
+    {
+      "action": "flag",
+      "evidence_hash": "88a1ace2b270d5e5edba25c4b5c64335edcaeba6edade4bdb97c2246bff6afc4",
+      "name": "grounding",
+      "severity": "",
+      "version": 1
+    },
+    {
+      "action": "pass",
+      "evidence_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "name": "secrets",
+      "severity": "",
+      "version": 1
+    },
+    {
+      "action": "pass",
+      "evidence_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "name": "pii",
+      "severity": "",
+      "version": 1
+    },
+    {
+      "action": "pass",
+      "evidence_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "name": "ferpa",
+      "severity": "",
+      "version": 1
+    }
+  ],
+  "grounding": {
+    "claims_checked": 2,
+    "grounded": false,
+    "score": "0.500000"
+  },
+  "policy_hash": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+}

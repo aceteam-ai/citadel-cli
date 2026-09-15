@@ -1148,6 +1148,11 @@ func (h *LLMInferenceHandler) buildAEPReceiptV2(jobID string, payload *jobs.LLMI
 	if err != nil {
 		return nil, err
 	}
+	// This is THE emission site, and v2 is THE emitted default. The RFC 8785
+	// JCS canon (aep.BuildSignedReceiptV3 / receipt_version "3", citadel-cli
+	// #1021) is ready but deliberately NOT emitted: the cutover is a one-line
+	// flip here (BuildSignedReceiptV2 -> V3, V2Inputs -> V3Inputs), gated on the
+	// aceteam verifier (aceteam #9287) and its goldens moving to JCS first.
 	return aep.BuildSignedReceiptV2(h.signer, nodeID, jobID, payload.Backend, payload.Model, in, result, time.Now())
 }
 

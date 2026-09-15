@@ -228,6 +228,68 @@ func TestVerifyAEPReceipt_V1RoundTrip(t *testing.T) {
 	}
 }
 
+// TestVerifyAEPReceipt_V3RoundTrip exercises the RFC 8785 JCS canon branch:
+// a v3 receipt (not the emitted default; ready-but-not-default per citadel-cli
+// #1021) signs and verifies through the same CLI verify path.
+func TestVerifyAEPReceipt_V3RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	signer := newAEPTestSigner(t)
+	nodeID, _ := aep.ResolveNodeID(signer, "")
+	result := trust.GroundingResult{Grounded: false, Score: 0.5, ClaimsChecked: 2, Flagged: []trust.Claim{{Value: "68%", Kind: trust.ClaimPercent, Reason: "no support in input"}}}
+	in := aep.V3Inputs{
+		InputSHA256:  "sha256:" + strings.Repeat("a", 64),
+		OutputSHA256: "sha256:" + strings.Repeat("b", 64),
+		PolicyHash:   aep.EmptyPolicyHash,
+		Action:       "flag",
+		VerdictHash:  "sha256:" + strings.Repeat("c", 64),
+	}
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	// A newline in the model would refuse under v2's guard but signs fine under
+	// v3's injective canon -- exercise that here too.
+	r, err := aep.BuildSignedReceiptV3(signer, nodeID, "job-v3", "bonsai", "bonsai\n27b", in, result, now)
+	if err != nil {
+		t.Fatalf("BuildSignedReceiptV3: %v", err)
+	}
+	m, err := r.ToMap()
+	if err != nil {
+		t.Fatalf("ToMap: %v", err)
+	}
+	receiptPath := writeReceiptJSON(t, dir, "receipt.json", m)
+	pubPath := writePubKeyPEM(t, dir, &signer.key.PublicKey)
+
+	out := verifyAEPReceipt(verifyOptions{receiptPath: receiptPath, pubkeyPath: pubPath, nodeKeyFn: mustNotReachNodeIdentity(t)})
+	if !out.Valid {
+		t.Fatalf("v3 receipt failed to verify: %q", out.Reason)
+	}
+	if out.ReceiptVersion != "3" {
+		t.Errorf("ReceiptVersion = %q, want 3", out.ReceiptVersion)
+	}
+	if out.summary == nil || out.summary.action != "flag" || out.summary.engine != "bonsai" {
+		t.Errorf("summary = %+v, want action=flag engine=bonsai", out.summary)
+	}
+}
+
+// TestVerifyAEPReceipt_V3GoldenCertPath verifies the committed v3 golden receipt
+// against its committed leaf cert (independent cert->pubkey parse + fingerprint
+// match), the v3 analogue of TestVerifyAEPReceipt_GoldenCertPath.
+func TestVerifyAEPReceipt_V3GoldenCertPath(t *testing.T) {
+	receiptPath := filepath.Join("..", "internal", "aep", "testdata", "v3", "receipt.json")
+	certPath := filepath.Join("..", "internal", "aep", "testdata", "v3", "leaf.pem")
+	if _, err := os.Stat(receiptPath); err != nil {
+		t.Fatalf("golden fixture not present at %s: %v", receiptPath, err)
+	}
+	out := verifyAEPReceipt(verifyOptions{receiptPath: receiptPath, certPath: certPath, nodeKeyFn: mustNotReachNodeIdentity(t)})
+	if !out.Valid {
+		t.Fatalf("v3 golden receipt failed to verify against committed leaf: %q", out.Reason)
+	}
+	if out.PublicKeyFingerprint != "sha256:16ba770506093ee68f65541316d1298fdf48800f4d9a402c0863b55c056082bd" {
+		t.Errorf("fingerprint = %q, want the v3 golden fingerprint", out.PublicKeyFingerprint)
+	}
+	if out.ReceiptVersion != "3" {
+		t.Errorf("ReceiptVersion = %q, want 3", out.ReceiptVersion)
+	}
+}
+
 func TestVerifyAEPReceipt_UnsignedIsDistinct(t *testing.T) {
 	dir := t.TempDir()
 	signer := newAEPTestSigner(t)
