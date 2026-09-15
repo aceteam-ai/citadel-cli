@@ -62,6 +62,12 @@ type manifestService struct {
 	// struct) by Reserve/Release/ReconcileOrphanedReservations (reservation.go).
 	EvictedByJob       string `yaml:"evicted_by_job,omitempty"`
 	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
+	// Bind mirrors cmd/manifest.go Service.Bind: the aceteam-ai/citadel-cli#1023
+	// per-service host-bind escape hatch ("all"/"loopback"). serviceStart's docker
+	// branch injects it as CITADEL_<SVC>_BIND at `docker compose up` via
+	// services.BindEnv so the compose ${CITADEL_<SVC>_BIND:-...} substitution
+	// resolves. Empty => the compose default applies. See services/bind.go.
+	Bind string `yaml:"bind,omitempty"`
 }
 
 // ServiceHandler manages start/stop/status of services declared in the node's
@@ -402,6 +408,15 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		// Warn (never refuse) when an embedded engine will be published on all
+		// interfaces (aceteam-ai/citadel-cli#1023) -- an opt-in `bind: all`, or an
+		// engine whose compose defaults to all-interfaces (ollama). Reads the
+		// materialized compose so a hand-edit is reflected too.
+		if composeContent, readErr := os.ReadFile(composePath); readErr == nil {
+			if warning := bindExposureWarning(svc.Name, svc.Bind, string(composeContent)); warning != "" {
+				ctx.Log("warn", "     - %s", warning)
+			}
+		}
 		// Resolve the container runtime once for this docker-branch start and drive
 		// every engine/compose sub-command below through it (preflight, legacy
 		// cleanup, compose up). On a docker node rt.EngineBin/rt.Bin are "docker",
@@ -486,10 +501,18 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				ctx.Log("warn", "     - docker preflight: %s", warning)
 			}
 			cmd := rt.ComposeCommand(composeArgs...)
-			cmd.Env = h.composeEnv()
-			out, cmdErr := cmd.CombinedOutput()
-			if cmdErr != nil {
-				err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+			// Inject the #1023 CITADEL_<SVC>_BIND entry (from the manifest bind:)
+			// so the compose bind-hatch substitution resolves to the operator's
+			// chosen interface. An unrecognized bind value fails the start loudly
+			// rather than silently falling through to the compose default.
+			if env, bindErr := h.composeEnvWithBind(svc.Name, svc.Bind); bindErr != nil {
+				err = fmt.Errorf("docker compose up failed: %s", bindErr)
+			} else {
+				cmd.Env = env
+				out, cmdErr := cmd.CombinedOutput()
+				if cmdErr != nil {
+					err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+				}
 			}
 		}
 	}
@@ -1887,6 +1910,46 @@ func (h *ServiceHandler) composeEnv() []string {
 		env = append(env, fmt.Sprintf("PUID=%d", uid), fmt.Sprintf("PGID=%d", os.Getgid()))
 	}
 	return env
+}
+
+// composeEnvWithBind returns composeEnv() plus the aceteam-ai/citadel-cli#1023
+// CITADEL_<SVC>_BIND entry for a hatch-capable service (from the manifest bind:
+// value), so the compose ${CITADEL_<SVC>_BIND:-...} substitution resolves to the
+// operator's chosen interface. A non-hatch service or an empty bind injects
+// nothing (the compose default applies). An unrecognized bind value is a hard
+// error the caller surfaces as a start failure.
+func (h *ServiceHandler) composeEnvWithBind(serviceName, bind string) ([]string, error) {
+	entry, inject, err := embeddedservices.BindEnv(serviceName, bind)
+	if err != nil {
+		return nil, err
+	}
+	env := h.composeEnv()
+	if inject {
+		env = append(env, entry)
+	}
+	return env, nil
+}
+
+// bindExposureWarning returns a warning line when an embedded engine will be
+// published on all interfaces given its manifest bind (aceteam-ai/citadel-cli#1023
+// -- an opt-in `bind: all`, or an engine defaulting to all-interfaces like
+// ollama), or "" otherwise. Scoped to embedded ServiceMap engines; a
+// catalog/third-party module authors its own bind and is out of scope. An
+// unrecognized bind value yields "" (the start itself surfaces that error).
+func bindExposureWarning(serviceName, bind, composeContent string) string {
+	if _, ok := embeddedservices.ServiceMap[serviceName]; !ok {
+		return ""
+	}
+	env, err := embeddedservices.BindEnvMapForService(serviceName, bind)
+	if err != nil {
+		return ""
+	}
+	loopbackOnly, hasPublish := embeddedservices.ComposePublishesLoopbackOnly(composeContent, env)
+	if hasPublish && !loopbackOnly {
+		return fmt.Sprintf("%s is published on ALL network interfaces (0.0.0.0) with no authentication "+
+			"of its own; set `bind: loopback` on the service in citadel.yaml to restrict it to localhost", serviceName)
+	}
+	return ""
 }
 
 func (h *ServiceHandler) resolveComposePath(svc manifestService) (string, error) {

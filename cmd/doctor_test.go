@@ -229,6 +229,47 @@ func TestRunDoctorChecksNoCrash(t *testing.T) {
 	}
 }
 
+// TestRenderDoctorReport_BindExposureWarns pins the aceteam-ai/citadel-cli#1023
+// section: an engine published on all interfaces renders a [WARN] line under
+// ENGINE NETWORK EXPOSURE, but (like the job-routing section) does NOT flip the
+// exit code -- a deliberate `bind: all` is a valid operator choice.
+func TestRenderDoctorReport_BindExposureWarns(t *testing.T) {
+	var buf bytes.Buffer
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{OK: true},
+		doctor:       healthyDoctorPayload(),
+		bindWarnings: []string{"vllm is published on ALL network interfaces (0.0.0.0) with no authentication of its own; set `bind: loopback` ..."},
+	}
+	if !r.ok() {
+		t.Fatalf("bind exposure warnings must NOT flip ok() to false")
+	}
+	renderDoctorReport(&buf, r)
+	out := buf.String()
+	for _, want := range []string{"ENGINE NETWORK EXPOSURE", "[WARN]", "vllm is published on ALL network interfaces", "Overall: OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered report missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderDoctorReport_NoBindExposure pins the OK line when no engine is
+// exposed on all interfaces.
+func TestRenderDoctorReport_NoBindExposure(t *testing.T) {
+	var buf bytes.Buffer
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{OK: true},
+		doctor:       healthyDoctorPayload(),
+	}
+	renderDoctorReport(&buf, r)
+	out := buf.String()
+	if !strings.Contains(out, "ENGINE NETWORK EXPOSURE") {
+		t.Errorf("expected the ENGINE NETWORK EXPOSURE section:\n%s", out)
+	}
+	if !strings.Contains(out, "no embedded engine is published on all interfaces") {
+		t.Errorf("expected the no-exposure OK line:\n%s", out)
+	}
+}
+
 // TestDoctorReportOK_DarwinDockerOptional pins citadel-cli#1042: on macOS Docker
 // Desktop is optional, so an unusable engine must NOT fail the exit code.
 func TestDoctorReportOK_DarwinDockerOptional(t *testing.T) {

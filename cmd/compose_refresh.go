@@ -32,8 +32,6 @@ import (
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -130,7 +128,10 @@ func enginePortRecreator(service, composePath string, wantHostPort int) (bool, e
 	composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
 	args := rt.ComposeArgs(composeArgs...)
 	cmd := exec.Command(rt.Bin, args...)
-	cmd.Env = composeEnv()
+	// Include the #1023 CITADEL_<SVC>_BIND entry (best-effort) so a port-move
+	// recreate of a `bind: all` engine comes up on the operator's chosen
+	// interface, not the compose loopback default.
+	cmd.Env = composeEnvForService(service)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return false, fmt.Errorf("%s", strings.TrimSpace(string(out)))
 	}
@@ -213,7 +214,7 @@ func runningPublishedHostPort(engineBin, containerName string) (int, bool) {
 // (aceteam-ai/citadel-cli#1030). It is deliberately NARROWER than
 // services.ServiceMap membership: extraction/diffusers/transcribe/lmstudio are
 // still intended to publish on all interfaces in v1 (their loopback move is
-// tracked in aceteam-ai/citadel-cli#1023), so they must NOT be recreated here.
+// tracked in aceteam-ai/citadel-cli#1060), so they must NOT be recreated here.
 // TestLoopbackDriftEnginesPublishLoopback pins this set against the actual
 // compose templates so it cannot silently disagree with what #1025 edited.
 var loopbackDriftEngines = map[string]struct{}{
@@ -238,41 +239,23 @@ func isWildcardHostIP(ip string) bool {
 }
 
 // composePublishesLoopbackOnly reports whether a materialized compose file's
-// content publishes every host port on the loopback interface (a "127.0.0.1:"
-// prefix on each `ports:` host-publish entry). It mirrors
-// services.embed_test.go's TestServiceMapBindSweep parse deliberately -- a
-// minimal `services[].ports` YAML read, NOT the broader portspec parser
-// aceteam-ai/citadel-cli#1023 introduces. Returns false when there is no host
-// publish at all, or when any host publish is not loopback-prefixed.
+// content publishes every host port on a loopback interface, resolving the
+// #1023 bind hatch (${CITADEL_<SVC>_BIND:-127.0.0.1}) against env -- the SAME
+// env the recreate `up` will inject (from the manifest bind:), so the loop
+// guard and the recreate can never disagree. It delegates to the single
+// authority services.ComposePublishesLoopbackOnly. Returns false when there is
+// no host publish at all, or when any host publish resolves to a non-loopback
+// interface.
 //
-// This is the loop guard for the drift recreate: it must read the ON-DISK
-// materialized template, so that after a one-time recreate the running
-// container matches the file and the next boot sees no drift. A file an
-// operator has hand-edited to publish on 0.0.0.0 (hash-preserved by
-// composerefresh.Sweep) therefore is NOT recreated -- that is an explicit
-// operator decision, not drift to heal.
-func composePublishesLoopbackOnly(content string) bool {
-	var doc struct {
-		Services map[string]struct {
-			Ports []string `yaml:"ports"`
-		} `yaml:"services"`
-	}
-	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
-		return false
-	}
-	hasHostPublish := false
-	for _, svc := range doc.Services {
-		for _, spec := range svc.Ports {
-			if !strings.Contains(spec, ":") {
-				continue // container-port-only, no host publish
-			}
-			hasHostPublish = true
-			if !strings.HasPrefix(spec, "127.0.0.1:") {
-				return false
-			}
-		}
-	}
-	return hasHostPublish
+// This is the loop guard for the drift recreate: it must resolve the ON-DISK
+// materialized template exactly as the recreate will, so that after a one-time
+// recreate the running container matches and the next boot sees no drift. A
+// file an operator has hand-edited to publish on 0.0.0.0 (hash-preserved by
+// composerefresh.Sweep) -- or a service the operator set `bind: all` on -- is
+// therefore NOT recreated: an explicit operator decision, not drift to heal.
+func composePublishesLoopbackOnly(content string, env map[string]string) bool {
+	loopbackOnly, hasPublish := services.ComposePublishesLoopbackOnly(content, env)
+	return hasPublish && loopbackOnly
 }
 
 // engineBindDriftRequiresRecreate is the pure decision behind the one-time
@@ -286,13 +269,20 @@ func composePublishesLoopbackOnly(content string) bool {
 //
 // A container already on loopback (or an explicit non-wildcard IP) is left
 // alone, so the remediation fires at most once per node and never becomes a
-// restart loop. Kept pure (content + bindings passed in) so it is unit-testable
-// without a live container runtime.
-func engineBindDriftRequiresRecreate(service, composeContent string, bindings []hostBinding) bool {
+// restart loop. Kept pure (content + bindings + bind env passed in) so it is
+// unit-testable without a live container runtime.
+//
+// env is the #1023 CITADEL_<SVC>_BIND map the recreate would inject (from the
+// manifest bind:). A service the operator set `bind: all` on resolves the
+// on-disk template to 0.0.0.0, so composePublishesLoopbackOnly returns false
+// and this returns false too -- the recreate that would bring it up on 0.0.0.0
+// (matching the running wildcard binding) must NOT fire, or it would loop every
+// boot.
+func engineBindDriftRequiresRecreate(service, composeContent string, bindings []hostBinding, env map[string]string) bool {
 	if _, ok := loopbackDriftEngines[service]; !ok {
 		return false
 	}
-	if !composePublishesLoopbackOnly(composeContent) {
+	if !composePublishesLoopbackOnly(composeContent, env) {
 		return false
 	}
 	for _, b := range bindings {
@@ -310,8 +300,11 @@ func engineBindDriftRequiresRecreate(service, composeContent string, bindings []
 // engineBindDriftRequiresRecreate decision, and short-circuits BEFORE the extra
 // docker inspect for any service outside loopbackDriftEngines so the common
 // already-running healthy service pays nothing. composeFilePath must be the
-// ORIGINAL materialized compose path (not a GPU-stripped temp copy).
-func shouldRecreateForEngineBindDrift(engineBin, service, containerName, composeFilePath string) bool {
+// ORIGINAL materialized compose path (not a GPU-stripped temp copy). bindEnv is
+// the #1023 CITADEL_<SVC>_BIND map startService resolved from the manifest bind:
+// -- the SAME env the recreate `up` uses -- so an operator `bind: all` service
+// is never drift-recreated into a boot loop.
+func shouldRecreateForEngineBindDrift(engineBin, service, containerName, composeFilePath string, bindEnv map[string]string) bool {
 	if !recreateOnUpgradeEnabled() {
 		return false
 	}
@@ -326,5 +319,5 @@ func shouldRecreateForEngineBindDrift(engineBin, service, containerName, compose
 	if !running {
 		return false
 	}
-	return engineBindDriftRequiresRecreate(service, string(content), bindings)
+	return engineBindDriftRequiresRecreate(service, string(content), bindings, bindEnv)
 }

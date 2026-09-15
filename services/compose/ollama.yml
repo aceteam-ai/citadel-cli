@@ -1,22 +1,27 @@
 # services/compose/ollama.yml
 #
-# NOT loopback-bound, deliberately, unlike vllm/llamacpp/bonsai/unlimited-ocr/
-# sglang (aceteam-ai/aceteam#9523): internal/apps/catalog.go points at least
-# one catalog app's OLLAMA_BASE_URL at `http://host.docker.internal:11434`,
-# and a container reaching the host via host.docker.internal lands on the
-# docker0 bridge gateway (e.g. 172.17.0.1 on Linux), not 127.0.0.1. A bare
-# loopback publish would refuse that connection and break the app. Fixing
-# ollama's exposure needs a bind that still answers the bridge gateway (or a
-# shared user-defined network so that path skips the host publish entirely),
-# tracked in aceteam-ai/citadel-cli#1023 rather than a naive loopback swap
-# here.
+# Defaults to an ALL-INTERFACES (0.0.0.0) host publish, deliberately, unlike
+# vllm/llamacpp/bonsai/unlimited-ocr/sglang (aceteam-ai/aceteam#9523):
+# internal/apps/catalog.go points at least one catalog app's OLLAMA_BASE_URL at
+# `http://host.docker.internal:11434`, and a container reaching the host via
+# host.docker.internal lands on the docker0 bridge gateway (e.g. 172.17.0.1 on
+# Linux), not 127.0.0.1. A bare loopback publish would refuse that connection
+# and break the app, so ollama's #1023 bind hatch defaults to all-interfaces
+# (`${CITADEL_OLLAMA_BIND:-0.0.0.0}`) rather than loopback -- this keeps the
+# catalog-app consumer working byte-identically to before while still giving an
+# operator who does NOT use that path an explicit way to tighten it: set
+# `bind: loopback` on this service in citadel.yaml and citadel injects
+# CITADEL_OLLAMA_BIND=127.0.0.1 at `up` (services.BindEnv). Because the default
+# is all-interfaces (ollama has no auth of its own), `citadel doctor`/`citadel
+# status` flag this service as LAN-exposed so the operator is aware.
+# services.ResolvePortSpecBind is the bind authority.
 
 services:
   ollama:
     image: ollama/ollama:latest
     container_name: citadel-ollama
     ports:
-      - "11434:11434"
+      - "${CITADEL_OLLAMA_BIND:-0.0.0.0}:11434:11434"
     volumes:
       # Mount a user-accessible directory for Ollama models
       - ~/citadel-cache/ollama:/root/.ollama

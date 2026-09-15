@@ -42,8 +42,15 @@ services:
     # services/embed_test.go and internal/apps/hostport_collision_test.go, and
     # citadel ALWAYS injects the var (services.HostPortEnv) at every
     # `docker compose up` site, so it resolves; do not add a default/guard back.
+    #
+    # The `${CITADEL_UNLIMITED_OCR_BIND:-127.0.0.1}` IP prefix is the #1023
+    # escape hatch: the bind defaults to loopback, but `bind: all` on this
+    # service in citadel.yaml makes citadel inject
+    # CITADEL_UNLIMITED_OCR_BIND=0.0.0.0 at `up` (services.BindEnv). Unset, the
+    # `:-127.0.0.1` default keeps loopback byte-identical.
+    # services.ResolvePortSpecBind is the authority.
     ports:
-      - "127.0.0.1:${CITADEL_UNLIMITED_OCR_HOST_PORT}:8000"
+      - "${CITADEL_UNLIMITED_OCR_BIND:-127.0.0.1}:${CITADEL_UNLIMITED_OCR_HOST_PORT}:8000"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
     # The served model is interpolated from OCR_MODEL so a SERVICE_START job

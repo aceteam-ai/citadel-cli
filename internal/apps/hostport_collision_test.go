@@ -153,38 +153,15 @@ func publishedHostPorts(composeYAML string) ([]int, error) {
 }
 
 // hostPortField extracts the host-port token from a compose short-syntax ports
-// entry. Handles the forms:
+// entry. It delegates to services.ComposePortHostToken (the single authority,
+// services/bind.go), which handles every form the embedded templates use:
 //
 //	"HOST:CONTAINER"
 //	"IP:HOST:CONTAINER"
-//	"CONTAINER"                        (no host publish -> "")
-//	"${VAR:?msg}:CONTAINER"            (env var host port whose default/required
-//	                                    suffix itself contains colons)
-//
-// The host field may be a `${...}` expansion that contains its own colons
-// (compose's `:?`/`:-` operators), so we peel off a leading `${...}` group
-// intact before splitting the remainder on ":".
+//	"CONTAINER"                            (no host publish -> "")
+//	"${VAR:?msg}:CONTAINER"                (env-var host port whose suffix has colons)
+//	"127.0.0.1:${VAR}:CONTAINER"
+//	"${BIND:-127.0.0.1}:${VAR}:CONTAINER"  (aceteam-ai/citadel-cli#1023 bind hatch)
 func hostPortField(spec string) string {
-	if strings.HasPrefix(spec, "${") {
-		if end := strings.Index(spec, "}"); end >= 0 {
-			// The `${...}` group is the host field. Anything after it is
-			// ":CONTAINER" (and possibly a bind-mode suffix we ignore).
-			return spec[:end+1]
-		}
-		return spec
-	}
-	parts := strings.Split(spec, ":")
-	switch len(parts) {
-	case 1:
-		// Only a container port; no host publish.
-		return ""
-	case 2:
-		// HOST:CONTAINER
-		return parts[0]
-	default:
-		// IP:HOST:CONTAINER (IP may itself contain colons for IPv6, but the
-		// compose files here use IPv4 / no IP, so the host port is the
-		// second-to-last field).
-		return parts[len(parts)-2]
-	}
+	return services.ComposePortHostToken(spec)
 }

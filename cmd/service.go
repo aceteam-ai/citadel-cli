@@ -145,6 +145,26 @@ func startService(serviceName, composeFilePath string) error {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
 
+	// Resolve the #1023 host-bind hatch ONCE (manifest bind: -> CITADEL_<SVC>_BIND
+	// env), then reuse it for the drift decision, the compose-up env, and the
+	// exposure warning below so they can never disagree. An unrecognized bind
+	// value refuses loudly here (an operator can fix it) rather than silently
+	// falling through to the compose default.
+	bindEnv, bindErr := serviceBindEnvMap(serviceName, manifestServiceBind(serviceName))
+	if bindErr != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, bindErr)
+	}
+
+	// Warn (never refuse) when an embedded engine will be published on all
+	// interfaces (aceteam-ai/citadel-cli#1023) -- either an opt-in `bind: all` or
+	// an engine whose compose defaults to all-interfaces (ollama). Reads the
+	// materialized compose so a hand-edit is reflected too.
+	if composeContent, readErr := os.ReadFile(composeFilePath); readErr == nil {
+		if warning := engineBindExposureWarning(serviceName, string(composeContent), bindEnv); warning != "" {
+			fmt.Printf("   ⚠️  %s\n", warning)
+		}
+	}
+
 	// Check for Mac-specific warnings
 	if warning := macServiceWarning(serviceName); warning != "" {
 		fmt.Printf("   ⚠️  %s\n", warning)
@@ -212,7 +232,7 @@ func startService(serviceName, composeFilePath string) error {
 				// on the #1025 engine set, the materialized file being loopback-only
 				// (loop guard), a live wildcard binding, and the
 				// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE opt-out.
-				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath) {
+				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath, bindEnv) {
 					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind (aceteam-ai/citadel-cli#1030)...\n", containerName)
 					forceRecreateForBindDrift = true
 					// Fall through to the compose-up below with --force-recreate.
@@ -291,8 +311,11 @@ func startService(serviceName, composeFilePath string) error {
 	// publish to ${CITADEL_*_HOST_PORT:?...} (llamacpp/vllm/extraction/diffusers)
 	// resolve. Without this, the :? guard added in #410 makes `docker compose up`
 	// fail at this boot-path site (only the SERVICE_START job handler injected it
-	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426).
-	composeCmd.Env = composeEnv()
+	// before). Mirrors internal/jobs.ServiceHandler.composeEnv (#426). Also append
+	// the #1023 CITADEL_<SVC>_BIND entry so the compose bind-hatch substitution
+	// resolves to the operator's chosen interface (empty bindEnv -> compose
+	// default).
+	composeCmd.Env = append(composeEnv(), bindEnvEntries(bindEnv)...)
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))

@@ -326,7 +326,11 @@ func composeUpDetached(name, composePath string) error {
 	c := rt.ComposeCommand(args...)
 	// Inject CITADEL_WORKSPACE + host-port vars so compose files guarded with
 	// ${VAR:?...} (transcribe/meeting workspace mount, #525) interpolate.
-	c.Env = composeEnv()
+	// composeEnvForService also supplies the #1023 CITADEL_<SVC>_BIND entry when
+	// this name is an embedded hatch engine (a no-op for ordinary git/catalog
+	// modules, which author their own bind), so a `module update` of such an
+	// engine does not silently drop a `bind: all` opt-in.
+	c.Env = composeEnvForService(name)
 	if out, err := c.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
 	}

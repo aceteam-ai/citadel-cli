@@ -1672,11 +1672,21 @@ func ccStartService(name string) error {
 			// the no-`-p` status reads (#528).
 			composeArgs := composeFileArgs(fullComposePath, fullComposePath)
 			composeArgs = append(composeArgs, "up", "-d")
+			// Warn (never refuse) when an embedded engine will be published on
+			// all interfaces (aceteam-ai/citadel-cli#1023) so a TUI-started
+			// `bind: all` (or ollama's default) engine isn't silently exposed.
+			if w := serviceBindExposureWarning(service, configDir); w != "" {
+				clilog.Writef("warning", "%s", w)
+			}
 			// composeCommand injects the citadel-owned host ports so the
 			// ${CITADEL_*_HOST_PORT:?...} guard resolves; without this the TUI
 			// start button dies for llamacpp/vllm/extraction/diffusers on
-			// v2.57.0 (#426).
-			return composeCommandFor(rt, composeArgs...).Run()
+			// v2.57.0 (#426). composeEnvForService additionally supplies the
+			// #1023 CITADEL_<SVC>_BIND entry so a `bind: all` engine started
+			// from the TUI is not silently reverted to loopback.
+			ccCmd := composeCommandFor(rt, composeArgs...)
+			ccCmd.Env = composeEnvForService(name)
+			return ccCmd.Run()
 		}
 	}
 
@@ -1747,8 +1757,16 @@ func ccRestartService(name string) error {
 			// `restart` alone would no-op in that case.
 			removeLegacyCitadelProject(name)
 			fullComposePath := filepath.Join(configDir, service.ComposeFile)
+			// Warn (never refuse) on all-interfaces exposure, and inject the
+			// #1023 CITADEL_<SVC>_BIND entry (via composeEnvForService) so a
+			// restarted `bind: all` engine keeps its chosen interface instead of
+			// being silently reverted to loopback.
+			if w := serviceBindExposureWarning(service, configDir); w != "" {
+				clilog.Writef("warning", "%s", w)
+			}
 			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "up", "-d", "--force-recreate")
 			cmd := composeCommandFor(rt, restartArgs...)
+			cmd.Env = composeEnvForService(name)
 			return cmd.Run()
 		}
 	}
