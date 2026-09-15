@@ -468,8 +468,21 @@ setup_citadel() {
         return 0
     fi
 
-    # Check if there's existing network state (already initialized once)
-    if [ -d "/root/citadel-node/network" ] && [ "$(ls /root/citadel-node/network 2>/dev/null | wc -l)" -gt 0 ]; then
+    # Check if there's existing network state (already initialized once).
+    #
+    # `citadel init` writes tsnet state under the INVOKING user's home, not
+    # /root: internal/network.getOwnerHomeDir prefers SUDO_USER's home over
+    # $HOME, and this installer is run as `curl ... | sudo -E ... bash` (so
+    # SUDO_USER is set). Resolve the same owner home here, or this check only
+    # ever matches on a true-root `ssh root@` install and re-runs init on the
+    # common sudo path (risking a re-run against a single-use authkey).
+    owner_home=""
+    if [ -n "${SUDO_USER:-}" ]; then
+        owner_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    fi
+    [ -n "$owner_home" ] || owner_home="$HOME"
+
+    if [ -d "${owner_home}/citadel-node/network" ] && [ "$(ls "${owner_home}/citadel-node/network" 2>/dev/null | wc -l)" -gt 0 ]; then
         ok "Existing network state found - skipping init (authkey may be single-use)"
         return 0
     fi
