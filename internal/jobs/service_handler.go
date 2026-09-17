@@ -109,10 +109,11 @@ type ServiceHandler struct {
 	// uses os.WriteFile.
 	writeManifestFn func(path string, data []byte) error
 	// dockerServiceRunningFn / externalEngineServingFn, when non-nil, override the
-	// two probes the external-engine adoption decision (#1081,
-	// maybeAdoptExternalEngine) makes, so that decision is unit-testable without a
-	// container runtime or a live engine. When dockerServiceRunningFn is set the
-	// "is our managed container running?" question is treated as always
+	// two probes the shared external-engine adoption decision (#1081/#1084,
+	// adoptedExternalEngine -- which drives serviceStart's maybeAdoptExternalEngine
+	// AND serviceStop/serviceStatus) makes, so that decision is unit-testable
+	// without a container runtime or a live engine. When dockerServiceRunningFn is
+	// set the "is our managed container running?" question is treated as always
 	// determinable (its bool is trusted); externalEngineServingFn returns the
 	// served model id(s) and whether an OpenAI-compat engine is answering. nil
 	// (production) uses isDockerServiceRunningDeterminable and
@@ -401,14 +402,16 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 
 	case "docker":
 		// Adopt an already-running EXTERNAL OpenAI-compat engine instead of
-		// launching a competing container (aceteam-ai/citadel-cli#1081, RM-01).
-		// Checked FIRST, before persisting a model or touching compose: when
-		// something is already serving this engine's citadel-resolved host port
-		// and it is NOT citadel's own managed container, the node advertises and
-		// dispatches to it as-is (#1076) and must not start its own vLLM. A no-op
-		// on a normal node (nothing external serving) and, deliberately, when the
-		// container runtime is unavailable so ownership can't be determined -- see
-		// maybeAdoptExternalEngine.
+		// launching a competing container (aceteam-ai/citadel-cli#1081/#1084,
+		// RM-01). Checked FIRST, before persisting a model or touching compose:
+		// when something is already serving this engine's citadel-resolved host
+		// port and it is NOT citadel's own managed container, the node advertises
+		// and dispatches to it as-is (#1076) and must not start its own vLLM. A
+		// no-op on a normal node (nothing external serving); and, the #1084 change,
+		// it ADOPTS even when the container runtime is unavailable (the docker-less
+		// RM-01, whose vLLM runs under its own systemd) -- a runtime-less box cannot
+		// be running our container, so a live engine there is necessarily external.
+		// See maybeAdoptExternalEngine / adoptedExternalEngine.
 		if out, adopted := h.maybeAdoptExternalEngine(ctx, svc, model, kind); adopted {
 			return out, nil
 		}

@@ -193,6 +193,10 @@ func TestServiceStart_NoExternalNoDockerErrorsClearly(t *testing.T) {
 func TestServiceStatus_AdoptedExternalReportsServing(t *testing.T) {
 	// dockerServiceRunningFn=false -> ourContainerRunning determinable && !running,
 	// so the external probe decides; externalEngineServingFn reports serving.
+	// Neuter PATH so the un-seamed isDockerServiceRunning can shell nothing even if
+	// reached -- a hard guarantee the adopted path never touches the container
+	// runtime, not just an inference from the message.
+	t.Setenv("PATH", t.TempDir())
 	h := serviceHandlerWithAdoptSeams(t, false, true, []string{"Qwen/Qwen3-8B"})
 	svc := manifestService{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}
 
@@ -220,6 +224,10 @@ func TestServiceStatus_AdoptedExternalReportsServing(t *testing.T) {
 // adopted external engine is externally managed, so STOP is a clear no-op that
 // leaves it running and does NOT consult/compose-down a citadel container.
 func TestServiceStop_AdoptedExternalIsNoOp(t *testing.T) {
+	// Neuter PATH so the un-seamed isDockerServiceRunning / compose-down can shell
+	// nothing even if reached -- a hard guarantee the adopted no-op never touches
+	// the container runtime, not just an inference from the returned message.
+	t.Setenv("PATH", t.TempDir())
 	h := serviceHandlerWithAdoptSeams(t, false, true, []string{"Qwen/Qwen3-8B"})
 	svc := manifestService{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}
 
