@@ -958,8 +958,10 @@ func openAIToolCallsToOllama(raw json.RawMessage) []map[string]any {
 //     never lossily re-typed.
 //   - {"type":"json_object"} -> ollama's structured-output shorthand string
 //     "json".
-//   - {"type":"text"} / unknown / unparseable / empty schema -> nil, so the
-//     caller sets no `format` key and the request stays byte-identical to today.
+//   - {"type":"text"} / unknown / unparseable / absent-or-null schema -> nil,
+//     so the caller sets no `format` key and the request stays byte-identical to
+//     today. (A literal `{}` schema passes hasJSONValue and IS forwarded as an
+//     unconstrained format -- only an absent/null json_schema.schema yields nil.)
 //
 // hasJSONValue gates presence (an explicit `null` must read as absent, the
 // citadel-cli#933 lesson); a returned nil ALWAYS means "add no format key".
