@@ -1442,6 +1442,19 @@ func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	destPath := filepath.Join(servicesDir, name+".yml")
 	override := strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))
 	if _, err := os.Stat(destPath); err == nil {
+		// citadel-cli#1069: on darwin, heal a stale embedded-engine compose that
+		// still carries the pre-#1064 nvidia GPU reservation the current darwin
+		// template dropped, so a worker SERVICE_START for ollama/llamacpp doesn't
+		// keep failing with `could not select device driver "nvidia"`. content is
+		// the current template (embeddedservices.ServiceMap[name], the darwin
+		// variant on a darwin build). No-op on non-darwin and on hand-edited files
+		// (see embeddedservices.HealStaleGPUReservationOnDisk). Runs before the
+		// override namespacing so a healed rewrite is re-namespaced afterward.
+		if platform.IsDarwin() {
+			if _, err := embeddedservices.HealStaleGPUReservationOnDisk(destPath, content, embeddedservices.KnownComposeHashes[name]); err != nil {
+				return fmt.Errorf("heal stale GPU reservation for %q: %w", name, err)
+			}
+		}
 		if override != "" {
 			existing, err := os.ReadFile(destPath)
 			if err != nil {
