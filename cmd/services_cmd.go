@@ -23,7 +23,7 @@ sitting idle (holding CPU/RAM/VRAM with no recent activity), how long it has
 been idle, and its live resource footprint.
 
 This is the operator-facing view of the idle-detection telemetry that rides the
-node heartbeat (citadel #416). It answers "is anyone actually using this engine,
+node heartbeat. It answers "is anyone actually using this engine,
 or is it pinning VRAM for nothing?" so you can safely reclaim a contended GPU.
 
 Idle signal sources:

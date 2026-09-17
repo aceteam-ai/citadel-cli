@@ -1711,7 +1711,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort
 					controlPortForVPN = controlPort
-					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints (#5028)\n", controlPort)
+					fmt.Printf("   - Coordinator mTLS control listener enabled on :%d for mutating endpoints\n", controlPort)
 				}
 			}
 		}
@@ -2536,7 +2536,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 		fmt.Printf("     /workflow/...             -> %s (workflow API)\n", statusAddr)
 		fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
-		fmt.Printf("     /v1/chat/completions     -> local engine by model (#581)\n")
+		fmt.Printf("     /v1/chat/completions     -> local engine by model\n")
 		fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 		fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 		for _, e := range provisionedEntries {

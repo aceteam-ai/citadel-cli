@@ -155,7 +155,7 @@ func refuseIfReservationNodeDirUnsupported(cmdLabel string) error {
 	return fmt.Errorf(
 		"%s does not yet support --node-dir as a FLAG: it calls internal/jobs.ServiceHandler "+
 			"directly, which only sees CITADEL_NODE_DIR via the environment, not this flag -- "+
-			"container-name namespacing (citadel#860) would silently NOT apply while eviction/"+
+			"container-name namespacing would silently NOT apply while eviction/"+
 			"start actions still target %q. Set CITADEL_NODE_DIR=%q in the environment instead of "+
 			"--node-dir to run this command, or unset the override to run it against this machine's "+
 			"real node",

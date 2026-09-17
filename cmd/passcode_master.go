@@ -28,7 +28,7 @@ var assumeNoLegacyPasscodeFlag bool
 var passcodeEnrollCmd = &cobra.Command{
 	Use:   "enroll",
 	Short: "Migrate this node to the master PIN (one-time, deletes the legacy passcode)",
-	Long: `Enrolls the node master PIN (aceteam-ai/citadel-cli#796).
+	Long: `Enrolls the node master PIN.
 
 The master PIN both gates online access (Console/Desktop/Files/Shell) AND is the
 only key to any data this node encrypts at rest. Enrollment is a one-time

@@ -276,7 +276,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Printf("     /api/screenshot, /api/actions -> %s\n", statusAddr)
 	fmt.Printf("     /ssh/authorized-keys     -> %s (SSH key deploy)\n", statusAddr)
 	fmt.Printf("     /v1/embeddings           -> %s (TEI embeddings)\n", embeddingAddr)
-	fmt.Printf("     /v1/chat/completions     -> local engine by model (#581)\n")
+	fmt.Printf("     /v1/chat/completions     -> local engine by model\n")
 	fmt.Printf("     /vnc/...                 -> %s (websockify)\n", vncAddr)
 	fmt.Printf("     /terminal/...            -> %s (terminal)\n", termAddr)
 

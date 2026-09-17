@@ -23,7 +23,7 @@ import (
 
 var moduleReservationsCmd = &cobra.Command{
 	Use:   "reservations",
-	Short: "Inspect and manually release job-scoped GPU reservations (aceteam#8248/#8249)",
+	Short: "Inspect and manually release job-scoped GPU reservations",
 	Long: `A GPU reservation (created by 'citadel run --exclusive' or a local_run_exclusive
 MCP tool call) durably evicts non-pinned services and restores them when
 released. These commands are the manual escape hatch when that release

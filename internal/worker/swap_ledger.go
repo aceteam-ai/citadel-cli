@@ -138,7 +138,7 @@ func (e *SwapRateLimitedError) Error() string {
 	return fmt.Sprintf(
 		"cannot swap in %s: this node is at its swap limit (%d evicting swaps in the last %s, limit %d). "+
 			"Loading another model would evict a resident one and spend more time loading than serving; "+
-			"refusing instead of thrashing (citadel-cli#687)",
+			"refusing instead of thrashing",
 		e.Backend, e.Swaps, e.Window, e.Max)
 }
 

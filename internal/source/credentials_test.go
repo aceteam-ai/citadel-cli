@@ -178,8 +178,11 @@ func TestControlPlaneProvider_Deferred(t *testing.T) {
 	if err == nil {
 		t.Fatal("ControlPlaneProvider should return a not-implemented error")
 	}
-	if !strings.Contains(err.Error(), "4273") {
-		t.Errorf("deferred error should reference aceteam#4273, got %q", err.Error())
+	if !strings.Contains(err.Error(), "not implemented yet") {
+		t.Errorf("deferred error should explain availability, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "#") {
+		t.Errorf("deferred error must not expose internal issue references: %q", err.Error())
 	}
 	if !cred.IsNone() {
 		t.Errorf("deferred cred should be none, got %v", cred.Kind)

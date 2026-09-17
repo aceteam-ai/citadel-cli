@@ -285,7 +285,7 @@ func runDefaultServeReconcile(manifest *CitadelManifest, nodeConfigDir string, d
 	if model != "" {
 		target = fmt.Sprintf("%s (%s)", engine, model)
 	}
-	deps.log("default-serve: appliance mode auto-serving %s on this blank %d MB-VRAM GPU node (citadel-cli#628, opt-in; see 'citadel run --service %s' or the AceTeam dashboard to change it later)", target, vramMB, engine)
+	deps.log("default-serve: appliance mode auto-serving %s on this blank %d MB-VRAM GPU node (opt-in; see 'citadel run --service %s' or the AceTeam dashboard to change it later)", target, vramMB, engine)
 
 	if err := deps.executeServiceStart(engine, model); err != nil {
 		deps.log("default-serve: FAILED to auto-serve %s: %v (will not retry -- see %s)", target, err, filepath.Join(nodeConfigDir, defaultServeMarkerFile))
