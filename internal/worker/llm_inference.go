@@ -676,6 +676,29 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 		reqPayload["tools"] = payload.Tools
 	}
 
+	// Structured output + thinking toggle (aceteam-ai/aceteam#9817 S2). Both are
+	// additive: an absent field leaves the outbound body byte-identical to the
+	// pre-S2 request (pinned by
+	// TestLLMInferenceHandler_OllamaFormatAndThinkByteIdenticalWithout).
+	//
+	// response_format -> ollama `format`: the OpenAI-shaped response_format
+	// object is translated at the boundary (ollamaFormatFromResponseFormat) to
+	// what ollama's /api/chat expects -- the inner JSON Schema object for a
+	// json_schema, or the string "json" for a json_object. hasJSONValue (not a
+	// bare len()) gates presence for the same reason as tools above (a literal
+	// `null` is 4 bytes).
+	if format := ollamaFormatFromResponseFormat(payload.ResponseFormat); format != nil {
+		reqPayload["format"] = format
+	}
+	// think -> ollama top-level `think` boolean. Tri-state: only forwarded when
+	// the payload set it (nil = absent). We forward false as well as true --
+	// ollama only demands the thinking capability from the model when `think` is
+	// truthy, so think:false is accepted by a non-thinking model and is exactly
+	// what a structured/deterministic call sends to suppress reasoning.
+	if payload.Think != nil {
+		reqPayload["think"] = *payload.Think
+	}
+
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/chat", reqPayload)
 	if err != nil {
 		return h.engineRequestFailure(payload, err, "failed to connect to Ollama"), nil
@@ -709,6 +732,7 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	chunkIndex := 0
 	var fullContent strings.Builder
+	var fullThinking strings.Builder
 	var promptTokens, completionTokens int
 	var toolCalls json.RawMessage
 
@@ -720,6 +744,7 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 		var chunk struct {
 			Message struct {
 				Content   string           `json:"content"`
+				Thinking  string           `json:"thinking"`
 				ToolCalls []ollamaToolCall `json:"tool_calls"`
 			} `json:"message"`
 			Done            bool `json:"done"`
@@ -733,6 +758,12 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 			fullContent.WriteString(chunk.Message.Content)
 			stream.WriteChunk(chunk.Message.Content, chunkIndex)
 			chunkIndex++
+		}
+		// Accumulate the separate thinking channel (aceteam-ai/aceteam#9817 S2);
+		// it is NOT streamed as a chunk here -- it only backstops an otherwise
+		// blank reply below.
+		if chunk.Message.Thinking != "" {
+			fullThinking.WriteString(chunk.Message.Thinking)
 		}
 		if len(chunk.Message.ToolCalls) > 0 {
 			if converted := ollamaToolCallsToOpenAI(chunk.Message.ToolCalls); converted != nil {
@@ -752,10 +783,21 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 	if err := scanner.Err(); err != nil {
 		return h.failure(err), nil
 	}
-	finishReason := "stop"
+	finalContent := fullContent.String()
+	// Fall back to the accumulated thinking when the model streamed no visible
+	// answer and made no tool call -- a thinking model that spent its
+	// num_predict budget mid-reasoning would otherwise be a blank reply
+	// (aceteam-ai/aceteam#9817 S2). Mirrors streamChatCompletions'
+	// reasoning_content fallback exactly, including emitting a terminal chunk so
+	// a chunk-accumulating consumer renders it (not just the end-event content).
+	if finalContent == "" && len(toolCalls) == 0 {
+		if finalContent = fullThinking.String(); finalContent != "" {
+			stream.WriteChunk(finalContent, chunkIndex)
+		}
+	}
 	output := map[string]any{
-		"content":       fullContent.String(),
-		"finish_reason": finishReason,
+		"content":       finalContent,
+		"finish_reason": "stop",
 		"usage":         ollamaUsage(promptTokens, completionTokens),
 	}
 	if len(toolCalls) > 0 {
@@ -775,6 +817,7 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 	var response struct {
 		Message struct {
 			Content   string           `json:"content"`
+			Thinking  string           `json:"thinking"`
 			ToolCalls []ollamaToolCall `json:"tool_calls"`
 		} `json:"message"`
 		PromptEvalCount int `json:"prompt_eval_count"`
@@ -784,14 +827,26 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 		return h.failure(fmt.Errorf("failed to parse Ollama response: %w", err)), nil
 	}
 	toolCalls := ollamaToolCallsToOpenAI(response.Message.ToolCalls)
+	// Surface message.thinking as the reply ONLY when there is no visible answer
+	// and no tool call -- a thinking model that spent its num_predict budget
+	// mid-reasoning returns empty content, and dropping the reasoning too (the
+	// pre-S2 behavior) is the blank reply this closes (aceteam-ai/aceteam#9817
+	// S2). Mirrors parseChatCompletionResponse's reasoning_content fallback:
+	// when content is present, or the model instead emitted a tool call,
+	// thinking is NOT surfaced (rendering chain-of-thought as the answer, or
+	// alongside a tool call, is exactly wrong).
+	content := response.Message.Content
+	if content == "" && len(toolCalls) == 0 {
+		content = response.Message.Thinking
+	}
 	// A tool_calls-only reply has nothing worth publishing as a chunk --
 	// mirrors bufferedChatCompletions' identical rule for the OpenAI-
 	// compatible engines.
-	if response.Message.Content != "" || len(toolCalls) == 0 {
-		writeSingleChunk(stream, response.Message.Content)
+	if content != "" || len(toolCalls) == 0 {
+		writeSingleChunk(stream, content)
 	}
 	output := map[string]any{
-		"content":       response.Message.Content,
+		"content":       content,
 		"finish_reason": "stop",
 		"usage":         ollamaUsage(response.PromptEvalCount, response.EvalCount),
 	}
@@ -892,6 +947,46 @@ func openAIToolCallsToOllama(raw json.RawMessage) []map[string]any {
 		return nil
 	}
 	return out
+}
+
+// ollamaFormatFromResponseFormat translates an OpenAI-shaped `response_format`
+// value into ollama's /api/chat `format` field (aceteam-ai/aceteam#9817 S2).
+// OpenAI's response_format is an object keyed on `type`:
+//   - {"type":"json_schema","json_schema":{"schema":{...}}} -> ollama's `format`
+//     takes the JSON Schema OBJECT directly (json_schema.schema), returned raw
+//     (json.RawMessage) so an engine-specific schema shape is forwarded verbatim,
+//     never lossily re-typed.
+//   - {"type":"json_object"} -> ollama's structured-output shorthand string
+//     "json".
+//   - {"type":"text"} / unknown / unparseable / empty schema -> nil, so the
+//     caller sets no `format` key and the request stays byte-identical to today.
+//
+// hasJSONValue gates presence (an explicit `null` must read as absent, the
+// citadel-cli#933 lesson); a returned nil ALWAYS means "add no format key".
+func ollamaFormatFromResponseFormat(raw json.RawMessage) any {
+	if !hasJSONValue(raw) {
+		return nil
+	}
+	var rf struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if err := json.Unmarshal(raw, &rf); err != nil {
+		return nil
+	}
+	switch rf.Type {
+	case "json_schema":
+		if hasJSONValue(rf.JSONSchema.Schema) {
+			return rf.JSONSchema.Schema
+		}
+		return nil
+	case "json_object":
+		return "json"
+	default:
+		return nil
+	}
 }
 
 // ollamaUsage maps Ollama's prompt_eval_count/eval_count onto the platform's

@@ -95,6 +95,29 @@ type LLMInferencePayload struct {
 	// bare string ("auto"/"none"/"required") OR an object naming a specific
 	// function -- forwarded raw for the same reason as Tools.
 	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+
+	// ResponseFormat carries the OpenAI `response_format` object for
+	// structured-output requests (aceteam-ai/aceteam#9817 S2), e.g.
+	// {"type":"json_schema","json_schema":{"name","schema","strict"}} or
+	// {"type":"json_object"}. Kept as raw JSON -- like Tools -- so an
+	// engine-specific JSON Schema shape in `json_schema.schema` is never lossily
+	// re-typed. The ollama path translates it to ollama's `format` field
+	// (executeOllamaChat -> ollamaFormatFromResponseFormat: the inner schema
+	// object for a json_schema, or the string "json" for a json_object); other
+	// backends ignore it for now. nil/absent means no structured constraint (the
+	// pre-S2 text path), gated node-side by hasJSONValue -- a literal `null` is
+	// 4 bytes and passes a bare len() check (the citadel-cli#933 lesson).
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+
+	// Think is the tri-state thinking toggle (aceteam-ai/aceteam#9817 S2):
+	// nil/absent leaves the model default (unchanged behavior), otherwise the
+	// bool is forwarded to ollama's top-level `think`. A structured or
+	// deterministic call sends think:false so a Qwen3-style thinking model does
+	// not spend its token budget emitting reasoning before the JSON. omitempty
+	// on a *bool omits only the nil case, so an explicit false is still
+	// forwarded (ollama only demands the thinking capability when `think` is
+	// truthy, so think:false is accepted by a non-thinking model).
+	Think *bool `json:"think,omitempty"`
 }
 
 // ChatMessage represents a message in chat-style APIs.
