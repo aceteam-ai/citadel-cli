@@ -117,7 +117,7 @@ func (c *Completer) completeServices(prefix string) []string {
 
 	// Also add common service names if no services are known
 	if len(c.services) == 0 {
-		defaultServices := []string{"vllm", "ollama", "llamacpp", "lmstudio"}
+		defaultServices := []string{"vllm", "ollama", "llamacpp"}
 		for _, svc := range defaultServices {
 			if strings.HasPrefix(svc, prefix) {
 				matches = append(matches, svc)

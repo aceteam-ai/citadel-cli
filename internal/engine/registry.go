@@ -86,7 +86,6 @@ var loadEstimateByEngine = map[string]time.Duration{
 	"transcribe": 60 * time.Second,
 	"kokoro":     60 * time.Second,
 	"tei":        60 * time.Second,
-	"lmstudio":   60 * time.Second,
 	"omnivoice":  60 * time.Second,
 }
 
@@ -116,8 +115,7 @@ var nativeProcessEngines = map[string]bool{
 // dialectByEngine assigns each engine's PRIMARY request dialect per design
 // doc §1e/§2. This is new synthesis, not a translation of an existing table
 // (none exists) -- see RequestDialect's doc comment in types.go for what the
-// zero value means and why lmstudio/tei/diffusers/extraction/transcribe/
-// kokoro get it.
+// zero value means and why tei/diffusers/extraction/transcribe/kokoro get it.
 //
 // vllm is deliberately assigned OpenAIChat even though
 // internal/worker/llm_inference.go's executeVLLM dynamically picks BETWEEN

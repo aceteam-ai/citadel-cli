@@ -212,7 +212,7 @@ func runningPublishedHostPort(engineBin, containerName string) (int, bool) {
 // auto-update is the unauthenticated-LLM-on-the-LAN exposure #1025 closed for
 // fresh materializations but could not reach on already-running containers
 // (aceteam-ai/citadel-cli#1030). It is deliberately NARROWER than
-// services.ServiceMap membership: extraction/diffusers/transcribe/lmstudio are
+// services.ServiceMap membership: extraction/diffusers/transcribe are
 // still intended to publish on all interfaces in v1 (their loopback move is
 // tracked in aceteam-ai/citadel-cli#1060), so they must NOT be recreated here.
 // TestLoopbackDriftEnginesPublishLoopback pins this set against the actual

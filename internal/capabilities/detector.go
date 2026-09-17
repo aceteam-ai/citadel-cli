@@ -329,7 +329,6 @@ func matchEngines(names []string) []string {
 			{"sglang", "sglang"},
 			{"ollama", "ollama"},
 			{"llamacpp", "llamacpp"},
-			{"lmstudio", "lmstudio"},
 		}
 
 		for _, r := range rules {

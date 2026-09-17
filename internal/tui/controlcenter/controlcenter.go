@@ -1649,7 +1649,7 @@ func (cc *ControlCenter) startSelectedService() {
 // avoid a heavy import for one predicate).
 func isFabricManagedEngine(name string) bool {
 	n := strings.ToLower(name)
-	for _, e := range []string{"vllm", "ollama", "llamacpp", "llama.cpp", "llama-cpp", "bonsai", "sglang", "lmstudio"} {
+	for _, e := range []string{"vllm", "ollama", "llamacpp", "llama.cpp", "llama-cpp", "bonsai", "sglang"} {
 		if strings.Contains(n, e) {
 			return true
 		}

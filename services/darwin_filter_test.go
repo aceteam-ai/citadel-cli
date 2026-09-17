@@ -21,9 +21,8 @@ func TestAvailableServicesFor_DarwinFiltersCUDAEngines(t *testing.T) {
 		}
 	}
 
-	// lmstudio is excluded (citadel-cli#1048): no pullable image + nvidia
-	// reservation, and no verifiable darwin variant to ship.
-	mustExclude := []string{"lmstudio", "vllm", "sglang", "bonsai", "diffusers", "unlimited-ocr", "omnivoice"}
+	// CUDA-only engines are never advertised on darwin.
+	mustExclude := []string{"vllm", "sglang", "bonsai", "diffusers", "unlimited-ocr", "omnivoice"}
 	for _, s := range mustExclude {
 		if inDarwin[s] {
 			t.Errorf("darwin available services must NOT advertise CUDA-only engine %q; got %v", s, darwin)

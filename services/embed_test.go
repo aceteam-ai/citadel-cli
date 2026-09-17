@@ -448,8 +448,6 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 	"diffusers": "out of scope for aceteam-ai/aceteam#9523; same shape, tracked in aceteam-ai/citadel-cli#1023.",
 	"transcribe": "out of scope for aceteam-ai/aceteam#9523; fixed native port (8101), not a citadel-" +
 		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
-	"lmstudio": "out of scope for aceteam-ai/aceteam#9523; fixed native port (1234), not a citadel-" +
-		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
 	"tei": "already loopback-bound (127.0.0.1:8102:80), not an oversight, just not matched by the " +
 		"exact-token check below since it has no citadel-injected host-port var either.",
 }

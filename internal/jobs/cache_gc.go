@@ -182,7 +182,7 @@ func deleteGGUFDirFile(cacheRoot, cacheDirName, relFile string) error {
 // planned, already-Verified cacheindex.Entry rather than a job payload.
 // Only ever called with entries cacheindex.PlanGC actually returned as
 // candidates, so a native-family entry here is always a real ollama model
-// (PlanGC excludes the lmstudio/tei "_store" aggregate row structurally).
+// (PlanGC excludes the tei "_store" aggregate row structurally).
 func defaultCacheGCDeleteEntry(cacheRoot string, e cacheindex.Entry) error {
 	switch e.Family {
 	case services.CacheFamilyHFHub:
@@ -202,7 +202,7 @@ func defaultCacheGCDeleteEntry(cacheRoot string, e cacheindex.Entry) error {
 	case services.CacheFamilyNative:
 		// Guard the destructive dispatch against the assumption chain that
 		// makes it safe today (only ollama's "_store" family member has
-		// per-model rows at all; lmstudio/tei's aggregate row is excluded
+		// per-model rows at all; tei's aggregate row is excluded
 		// from PlanGC's candidates structurally) -- rather than trust that
 		// chain silently, refuse a native entry outside ollama's own dir.
 		if e.CacheDir != services.EngineCacheDirs["ollama"].Dir {
@@ -318,7 +318,7 @@ func buildGCResidencyExemptions(running []status.LocalEngine, containerRunning f
 			}
 		case services.CacheFamilyNative:
 			if engine != "ollama" {
-				// lmstudio/tei have no per-model tracking, and their "_store"
+				// tei has no per-model tracking, and its "_store"
 				// aggregate row is never a GC candidate in the first place
 				// (cacheindex.PlanGC) -- nothing meaningful to exempt here.
 				continue

@@ -236,7 +236,7 @@ func (s *Server) handleCacheIndex(w http.ResponseWriter, r *http.Request) {
 // cacheEntryAvailability decides whether an indexed entry can actually be served
 // from local state, and if not, why. Supported families: hf-hub, gguf-dir, and
 // native ONLY for ollama's per-model entries. A native aggregate row
-// (lmstudio/tei "_store") or any unknown family is unsupported.
+// (tei "_store") or any unknown family is unsupported.
 func cacheEntryAvailability(index *cacheindex.Index, e cacheindex.Entry, cacheRoot string) (bool, string) {
 	switch e.Family {
 	case services.CacheFamilyHFHub:

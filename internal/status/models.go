@@ -83,7 +83,7 @@ var engineDisplayLabel = map[string]string{
 // OpenAICompletions, CompletionsOnly -- sglang) goes to
 // discoverOpenAIModels, since all of them expose the same GET /v1/models
 // listing. An unregistered name or one with no dialect (tei, diffusers,
-// lmstudio, ...) reproduces the old switch's default branch exactly.
+// ...) reproduces the old switch's default branch exactly.
 //
 // llama.cpp can be up with NO model loaded (router mode / deferred load):
 // that is an empty list, not an error. Without a sglang/unlimited-ocr

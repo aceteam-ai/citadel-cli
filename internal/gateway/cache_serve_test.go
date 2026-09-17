@@ -83,8 +83,8 @@ func buildCacheFixture(t *testing.T) (CacheIndexProvider, string) {
 		Model: "llama3", Engine: "ollama", SizeBytes: 100,
 	})
 	mustUpsert(t, store, cacheindex.Entry{
-		CacheDir: "lmstudio", Family: services.CacheFamilyNative,
-		Model: "_store", Engine: "lmstudio", SizeBytes: 999,
+		CacheDir: "tei", Family: services.CacheFamilyNative,
+		Model: "_store", Engine: "tei", SizeBytes: 999,
 	})
 
 	provider := func() (*cacheindex.Index, string) { return store.Snapshot(), cacheRoot }
@@ -305,7 +305,7 @@ func TestCacheServe_Index(t *testing.T) {
 			t.Errorf("entry %q: available=%v ok=%v, want available", want, e.Available, ok)
 		}
 	}
-	agg := byModel["lmstudio/_store"]
+	agg := byModel["tei/_store"]
 	if agg.Available || agg.Reason != "unsupported" {
 		t.Errorf("aggregate row: available=%v reason=%q, want unavailable/unsupported", agg.Available, agg.Reason)
 	}

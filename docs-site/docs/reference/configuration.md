@@ -36,7 +36,7 @@ services:
 | `node.tags` | list | Tags for classification and filtering |
 | `node.org_id` | string | Organization identifier (set during device authorization) |
 | `services` | list | Services to run on this node |
-| `services[].name` | string | Service name (vllm, ollama, llamacpp, lmstudio, extraction) |
+| `services[].name` | string | Service name (vllm, ollama, llamacpp, extraction) |
 | `services[].type` | string | `"docker"` or `"native"` (default: auto-detect) |
 | `services[].compose_file` | string | Path to Docker Compose file (for docker services) |
 | `services[].port` | int | Port number (for native services) |

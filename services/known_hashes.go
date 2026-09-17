@@ -66,10 +66,6 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// TestKnownComposeHashesCoverDarwinVariants.
 		"097cdb8500b3f9b5e2c2f018a5124578744e2e0364a5b9c3e390239af8ef12c3": true,
 	},
-	"lmstudio": {
-		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,
-		"cd7b791871ae4cd2b9a8a90803aeb630d5a7282445c20e69928d1defbf412946": true,
-	},
 	"sglang": {
 		"2531d9e78484785543f196082ce38e46ef21dd1d6cd380b69665c331bc21acfb": true,
 		"2e46554d84a142f549b0481b068b14d2bc65fd02829956ea2288c089b5ad518a": true,
