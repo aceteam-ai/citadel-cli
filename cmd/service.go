@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	svcports "github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -190,6 +192,28 @@ func startService(serviceName, composeFilePath string) error {
 	rt := catalog.SelectContainerRuntime()
 	fmt.Printf("   Container runtime: %s\n", rt.Label())
 
+	// Adopt an already-running EXTERNAL OpenAI-compat engine instead of launching
+	// a competing container on its citadel-resolved host port
+	// (aceteam-ai/citadel-cli#1081, RM-01). Checked before the inspect/preflight/
+	// compose-up below so the boot-time start path (startManagedServices) does not
+	// stand up a second vLLM on a port the vendor engine already owns. No-op unless
+	// the engine is on the adoption allowlist, the runtime is reachable, our own
+	// managed container is not running, and an OpenAI-compat engine answers there.
+	// Skipped under a --node-dir/CITADEL_NODE_DIR override (containerName is
+	// namespaced there; keep this off the shared-port probe to avoid surprising an
+	// isolated target), matching the inspect block's own override caution below.
+	if composeProjectOverride() == "" {
+		runtimeAvailable := func() bool { _, err := exec.LookPath(rt.EngineBin); return err == nil }()
+		if msg, adopt := maybeAdoptExternalEngineOnStart(
+			context.Background(), serviceName, runtimeAvailable,
+			func() bool { return managedContainerRunningForStart(rt.EngineBin, containerName) },
+			status.OpenAICompatServing,
+		); adopt {
+			fmt.Printf("   ✅ %s; not launching a citadel container (aceteam-ai/citadel-cli#1081)\n", msg)
+			return nil
+		}
+	}
+
 	// Preflight (citadel #767): fail fast ONLY when the engine CLI is missing
 	// (that exec would fail immediately anyway). A daemon that failed to
 	// answer within the preflight's probe timeout is a warning, not a
@@ -323,6 +347,56 @@ func startService(serviceName, composeFilePath string) error {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
 	return nil
+}
+
+// maybeAdoptExternalEngineOnStart is the aceteam-ai/citadel-cli#1081 adoption
+// decision for the boot-time / `citadel run` startService path. It returns a
+// human-readable adoption message (and true) when startService should SKIP
+// launching serviceName's container because an external OpenAI-compat engine is
+// already serving on its citadel-resolved host port; otherwise ("", false) and
+// startService launches as before.
+//
+// Pure and seam-injected (runtimeAvailable, ourContainerRunning, servingCheck)
+// so the decision is unit-testable without a container runtime or a live engine.
+// Adopt iff: serviceName is on the adoption allowlist (AdoptableExternalEnginePort
+// -- vLLM today), the container runtime is reachable (so ownership is
+// determinable -- mirrors serviceStart's ourContainerRunning fail-safe), our own
+// managed container is not running, and an OpenAI-compat engine answers there.
+func maybeAdoptExternalEngineOnStart(
+	ctx context.Context,
+	serviceName string,
+	runtimeAvailable bool,
+	ourContainerRunning func() bool,
+	servingCheck func(ctx context.Context, engineType string, port int) ([]string, bool),
+) (string, bool) {
+	port, ok := status.AdoptableExternalEnginePort(serviceName)
+	if !ok || !runtimeAvailable {
+		return "", false
+	}
+	if ourContainerRunning() {
+		return "", false
+	}
+	models, serving := servingCheck(ctx, serviceName, port)
+	if !serving {
+		return "", false
+	}
+	msg := fmt.Sprintf("Adopted external %s already serving on :%d", serviceName, port)
+	if len(models) > 0 {
+		msg = fmt.Sprintf("%s serving %s", msg, strings.Join(models, ", "))
+	}
+	return msg, true
+}
+
+// managedContainerRunningForStart reports whether citadel's own managed container
+// (containerName) is currently running under engineBin. Used only as the
+// ourContainerRunning gate for #1081 adoption; an inspect error (container absent
+// or daemon unreachable) reads as "not running" so the port probe decides.
+func managedContainerRunningForStart(engineBin, containerName string) bool {
+	out, err := exec.Command(engineBin, "inspect", "--format", "{{.State.Status}}", containerName).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "running"
 }
 
 // startServiceComposeArgs builds the compose args for `... up -d` (everything

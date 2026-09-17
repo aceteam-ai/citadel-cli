@@ -1434,6 +1434,37 @@ automatically, keeping the compose publish, the native heartbeat probe, and
 advertising in agreement. `TestResolveVLLMHostPort` pins the fallback rules; don't
 "fix" it back to a const for symmetry with its sibling ports.
 
+**Adopt an already-running EXTERNAL vLLM instead of launching one
+(citadel-cli#1081, RM-01 / aceteam#9945).** `status.AdoptableExternalEnginePort`
+(the allowlist — vLLM only) + `status.OpenAICompatServing` (the probe) are the
+authority. The consequence: a `SERVICE_START vllm` (or a boot-time start) on a box
+where an external OpenAI-compat engine already answers `GET /v1/models` on
+`services.VLLMHostPort` and citadel has NO managed `citadel-vllm` container running
+means ADOPT (report success, do not launch), never start a competing container on
+that port. `internal/jobs.ServiceHandler.maybeAdoptExternalEngine` gates the docker
+branch of `serviceStart`; `cmd.maybeAdoptExternalEngineOnStart` gates `startService`
+(the boot / `citadel run` path). Advertise + dispatch were ALREADY handled by #1076
+(`enginePortIfRunning` → `IsNativeServiceServing` → the `CITADEL_VLLM_HOST_PORT`
+probe → `DiscoverModels`, and `llm_inference`'s `baseURLs["vllm"]`), so #1081 is
+only the "don't launch a competing container" half. Two rules that are load-bearing
+and easy to get wrong: (1) adoption is scoped to the docker KIND — if the manifest
+does NOT pin `type` AND the vendor `vllm` CLI is on PATH, `resolveKind` returns
+"native" and the pre-existing #649 `IsNativeServiceServing` short-circuit already
+skips the launch (a `type: docker` entry pins docker regardless of PATH, so it
+reaches the #1081 branch); (2) adoption DECLINES when the container runtime is
+unreachable (`ourContainerRunning`'s two-state return / the `runtimeAvailable`
+gate) — not because ownership is truly unknowable there, but because a runtime-less
+box cannot launch a competing container anyway (declining is harmless, the normal
+path fails loudly) and it keeps neutered-PATH docker-branch unit tests hermetic on
+a host where the port answers. TCP reachability is necessary but not sufficient: the body must
+decode as OpenAI-shaped `{"data":[...]}` (an empty list still counts — a live
+engine with no model loaded, consistent with `DiscoverLocalEngines`). Known, out of
+scope: `SERVICE_STOP`/`SERVICE_STATUS` for an adopted engine still consult the
+citadel container (stop is a no-op, status says not running); a requested model the
+external engine doesn't serve is logged as a mismatch and adopted anyway (launching
+would collide on the port). No feature flag — adoption only fires when something is
+genuinely serving OpenAI-compat on the resolved port.
+
 ### WhatsApp bridge deploys must pull (#718)
 
 The bridge compose pins a FLOATING tag, so `docker compose up -d` alone can never
