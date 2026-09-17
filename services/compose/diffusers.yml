@@ -20,8 +20,24 @@ services:
   diffusers:
     image: ghcr.io/aceteam-ai/diffusers-service:latest
     container_name: citadel-diffusers
+    # Host port is owned by citadel (services/ports.go), supplied via
+    # CITADEL_DIFFUSERS_HOST_PORT. Loopback-only publish (127.0.0.1) by default
+    # (aceteam-ai/citadel-cli#1060, completing the aceteam-ai/aceteam#9523 sweep):
+    # this sidecar has NO auth of its own and its only consumer is a HOST process
+    # (internal/jobs/media_generate.go dials http://localhost:<port>), so the
+    # prior 0.0.0.0 bind bought LAN reach, not mesh reach, on the common
+    # embedded-tsnet node (see vllm.yml and CLAUDE.md's "Chat reachability"
+    # note). The bare `${CITADEL_DIFFUSERS_HOST_PORT}` token (no `:?`/`:-` guard)
+    # mirrors vllm.yml: citadel ALWAYS injects the var (services.HostPortEnv) at
+    # every `docker compose up` site, so it resolves.
+    #
+    # The `${CITADEL_DIFFUSERS_BIND:-127.0.0.1}` IP prefix is the #1023 escape
+    # hatch: the bind defaults to loopback, but `bind: all` on this service in
+    # citadel.yaml makes citadel inject CITADEL_DIFFUSERS_BIND=0.0.0.0 at `up`
+    # (services.BindEnv). Unset, the `:-127.0.0.1` default keeps loopback
+    # byte-identical. services.ResolvePortSpecBind is the authority.
     ports:
-      - "${CITADEL_DIFFUSERS_HOST_PORT:?citadel must supply CITADEL_DIFFUSERS_HOST_PORT}:7860"
+      - "${CITADEL_DIFFUSERS_BIND:-127.0.0.1}:${CITADEL_DIFFUSERS_HOST_PORT}:7860"
     volumes:
       # Share the HuggingFace model cache with the other HF-based services
       # (vllm, sglang, whisper) so weights are downloaded once per node.

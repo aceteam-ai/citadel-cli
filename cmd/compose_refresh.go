@@ -207,22 +207,25 @@ func runningPublishedHostPort(engineBin, containerName string) (int, bool) {
 
 // loopbackDriftEngines is the set of services.ServiceMap engines whose embedded
 // compose templates were changed to publish on 127.0.0.1 (loopback) instead of
-// 0.0.0.0 by aceteam-ai/aceteam#9523 (PR #1025). These engines have no auth of
-// their own, so a running container left bound to all interfaces after an
-// auto-update is the unauthenticated-LLM-on-the-LAN exposure #1025 closed for
-// fresh materializations but could not reach on already-running containers
-// (aceteam-ai/citadel-cli#1030). It is deliberately NARROWER than
-// services.ServiceMap membership: extraction/diffusers/transcribe are
-// still intended to publish on all interfaces in v1 (their loopback move is
-// tracked in aceteam-ai/citadel-cli#1060), so they must NOT be recreated here.
-// TestLoopbackDriftEnginesPublishLoopback pins this set against the actual
-// compose templates so it cannot silently disagree with what #1025 edited.
+// 0.0.0.0 by aceteam-ai/aceteam#9523 (PR #1025) and its follow-up sweep
+// aceteam-ai/citadel-cli#1060 (extraction/diffusers/transcribe). These
+// engines have no auth of their own, so a running container left bound to all
+// interfaces after an auto-update is the unauthenticated-LLM-on-the-LAN exposure
+// #1025 closed for fresh materializations but could not reach on already-running
+// containers (aceteam-ai/citadel-cli#1030). It is deliberately NARROWER than
+// services.ServiceMap membership (kokoro/omnivoice publish loopback via a literal
+// prefix, not a driftable 0.0.0.0 default). TestLoopbackDriftEnginesPublishLoopback
+// pins this set against the actual compose templates so it cannot silently
+// disagree with what #1025/#1060 edited.
 var loopbackDriftEngines = map[string]struct{}{
 	"vllm":          {},
 	"llamacpp":      {},
 	"bonsai":        {},
 	"unlimited-ocr": {},
 	"sglang":        {},
+	"extraction":    {},
+	"diffusers":     {},
+	"transcribe":    {},
 }
 
 // isWildcardHostIP reports whether a published HostIp means "all interfaces".

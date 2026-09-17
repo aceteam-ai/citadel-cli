@@ -3,11 +3,25 @@ services:
     image: ghcr.io/aceteam-ai/gliner2-service:latest
     container_name: citadel-extraction
     # Host port is owned by citadel (services/ports.go), supplied via
-    # CITADEL_EXTRACTION_HOST_PORT; the :? guard fails loudly if it is missing.
-    # Left on the default 0.0.0.0 bind for consistency with the other engines
-    # (peers may reach it over the mesh). The container still serves on :8100.
+    # CITADEL_EXTRACTION_HOST_PORT. Loopback-only publish (127.0.0.1) by default
+    # (aceteam-ai/citadel-cli#1060, completing the aceteam-ai/aceteam#9523 sweep):
+    # this sidecar has NO auth of its own and its only consumer is a HOST process
+    # (internal/jobs/extraction_handler.go dials http://localhost:<port>), so the
+    # prior "peers may reach it over the mesh" 0.0.0.0 rationale never held on an
+    # embedded-tsnet node (citadel's userspace netstack never forwards inbound
+    # mesh traffic to a host-bound port it did not explicitly ListenVPN -- see
+    # vllm.yml and CLAUDE.md's "Chat reachability" note); it only bought LAN
+    # reach. The bare `${CITADEL_EXTRACTION_HOST_PORT}` token (no `:?`/`:-`
+    # guard) mirrors vllm.yml: citadel ALWAYS injects the var (services.HostPortEnv)
+    # at every `docker compose up` site, so it resolves.
+    #
+    # The `${CITADEL_EXTRACTION_BIND:-127.0.0.1}` IP prefix is the #1023 escape
+    # hatch: the bind defaults to loopback, but `bind: all` on this service in
+    # citadel.yaml makes citadel inject CITADEL_EXTRACTION_BIND=0.0.0.0 at `up`
+    # (services.BindEnv). Unset, the `:-127.0.0.1` default keeps loopback
+    # byte-identical. services.ResolvePortSpecBind is the authority.
     ports:
-      - "${CITADEL_EXTRACTION_HOST_PORT:?citadel must supply CITADEL_EXTRACTION_HOST_PORT}:8100"
+      - "${CITADEL_EXTRACTION_BIND:-127.0.0.1}:${CITADEL_EXTRACTION_HOST_PORT}:8100"
     volumes:
       - ~/citadel-cache/huggingface:/root/.cache/huggingface
     environment:
