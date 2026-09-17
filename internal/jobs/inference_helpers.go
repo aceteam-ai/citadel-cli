@@ -17,8 +17,10 @@ import (
 )
 
 // vllmBaseURL returns the host-local base URL for the vLLM engine using the
-// citadel-owned host port (services/ports.go) rather than a hardcoded literal,
-// honoring the CITADEL_VLLM_HOST_PORT override. Used by meeting_summary.go.
+// citadel-owned host port (services/ports.go) rather than a hardcoded literal.
+// services.VLLMHostPort resolves from CITADEL_VLLM_HOST_PORT at process init
+// (citadel-cli#1076), so this honors a per-node host-port override. Used by
+// meeting_summary.go.
 func vllmBaseURL() string {
 	return fmt.Sprintf("http://localhost:%d", services.VLLMHostPort)
 }

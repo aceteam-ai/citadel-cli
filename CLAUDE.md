@@ -1424,6 +1424,16 @@ sibling services too. Anything reasoning about "is THIS service up" must filter 
 container name rather than trusting project scoping — see #692, which this stale
 doc helped hide.
 
+**The vLLM host port is the ONE 8200-block port that is env-resolvable, not a
+const (citadel-cli#1076).** `services.resolveVLLMHostPort` (`services/ports.go`)
+decides `services.VLLMHostPort` at process init from `CITADEL_VLLM_HOST_PORT`,
+defaulting to 8201 — so a node serving vLLM off the default (e.g. the RM-01 Jetson
+on :58000) is reached and advertised. It is a package `var`, so it flows to
+`ServiceHostPorts`/`InferenceMetricsPorts`/`HostPortEnv` and every Go dialer
+automatically, keeping the compose publish, the native heartbeat probe, and
+advertising in agreement. `TestResolveVLLMHostPort` pins the fallback rules; don't
+"fix" it back to a const for symmetry with its sibling ports.
+
 ### WhatsApp bridge deploys must pull (#718)
 
 The bridge compose pins a FLOATING tag, so `docker compose up -d` alone can never
