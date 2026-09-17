@@ -2060,19 +2060,19 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 		{
 			name:    "Console",
 			desc:    "Remote terminal access (default OFF)",
-			detail:  "Provides WebSocket-based terminal access to this machine.\nRemote users can open a shell session through the AceTeam web UI.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose a terminal. When enabled it still requires the node\npasscode, so enabling is not the same as opening it to the org mesh.\nGateway route: /terminal",
+			detail:  "Provides WebSocket-based terminal access to this machine.\nRemote users can open a shell session through the AceTeam web UI.\n\n[red]Default OFF (opt-in) + passcode-gated:[-] a fresh node\ndoes not expose a terminal. When enabled it still requires the node\npasscode, so enabling is not the same as opening it to the org mesh.\nGateway route: /terminal",
 			enabled: &perms.Console,
 		},
 		{
 			name:    "Desktop",
 			desc:    "VNC, screenshots, remote actions (default OFF)",
-			detail:  "Enables remote desktop access via VNC and screenshot capture.\nIncludes remote keyboard/mouse actions.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose its screen. When enabled it still requires the node\npasscode.\nGateway routes: /vnc, /api/screenshot, /api/actions",
+			detail:  "Enables remote desktop access via VNC and screenshot capture.\nIncludes remote keyboard/mouse actions.\n\n[red]Default OFF (opt-in) + passcode-gated:[-] a fresh node\ndoes not expose its screen. When enabled it still requires the node\npasscode.\nGateway routes: /vnc, /api/screenshot, /api/actions",
 			enabled: &perms.Desktop,
 		},
 		{
 			name:    "Files",
 			desc:    "File browser API (default OFF)",
-			detail:  "Exposes a file browser API for remote file access.\nAllows reading, writing, and searching files on this machine.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\ndoes not expose its filesystem. When enabled it still requires the\nnode passcode.\nGateway routes: /api/files/*",
+			detail:  "Exposes a file browser API for remote file access.\nAllows reading, writing, and searching files on this machine.\n\n[red]Default OFF (opt-in) + passcode-gated:[-] a fresh node\ndoes not expose its filesystem. When enabled it still requires the\nnode passcode.\nGateway routes: /api/files/*",
 			enabled: &perms.Files,
 		},
 		{
@@ -2090,7 +2090,7 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 		{
 			name:    "Shell",
 			desc:    "Remote shell command execution",
-			detail:  "Allows dispatched SHELL_COMMAND jobs to run through /bin/sh on this node.\nGoverns the platform node-management tabs (logs/services/docker).\nDisable to make the node refuse all remote shell execution.\n\n[red]Default OFF (opt-in) + passcode-gated (aceteam#6524):[-] a fresh node\nrefuses shell. When enabled it still requires the node passcode\npresented per command, so enabling alone does not open it.\nInherited secrets are always scrubbed from the command environment.",
+			detail:  "Allows dispatched SHELL_COMMAND jobs to run through /bin/sh on this node.\nGoverns the platform node-management tabs (logs/services/docker).\nDisable to make the node refuse all remote shell execution.\n\n[red]Default OFF (opt-in) + passcode-gated:[-] a fresh node\nrefuses shell. When enabled it still requires the node passcode\npresented per command, so enabling alone does not open it.\nInherited secrets are always scrubbed from the command environment.",
 			enabled: &perms.Shell,
 		},
 	}

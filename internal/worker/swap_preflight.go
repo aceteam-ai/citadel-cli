@@ -49,7 +49,7 @@ type SwapPreflightBlockedError struct {
 
 func (e *SwapPreflightBlockedError) Error() string {
 	return fmt.Sprintf(
-		"cannot swap in %s: not serveable (%s) -- refusing rather than attempting a doomed pull (citadel-cli#956)",
+		"cannot swap in %s: not serveable (%s) -- refusing rather than attempting a doomed pull",
 		e.Backend, e.Reason)
 }
 

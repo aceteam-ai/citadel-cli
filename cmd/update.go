@@ -64,8 +64,8 @@ to the previous version.
 
 If citadel is running as a managed service (systemd/launchd/Windows
 service), swapping the binary on disk does NOT restart the already-running
-process -- it keeps executing the old code until something restarts it
-(citadel#454). This command detects that and warns loudly by default; pass
+process -- it keeps executing the old code until something restarts it.
+This command detects that and warns loudly by default; pass
 --restart to have it restart the managed service for you.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		installUpdate()
@@ -116,9 +116,9 @@ func init() {
 	updateInstallCmd.Flags().BoolVar(&updateInstallRestart, "restart", false,
 		fmt.Sprintf("Restart the managed citadel service (if any) after installing, so the new binary actually runs. "+
 			"Before restarting, waits up to %s for the running worker's in-flight jobs to finish (best-effort, "+
-			"via GET /worker; citadel#887) -- restarts anyway once that elapses. If /worker is unreachable "+
+			"via GET /worker) -- restarts anyway once that elapses. If /worker is unreachable "+
 			"(an older worker predating the route, or no status listener at all) the wait is skipped entirely "+
-			"and this restarts immediately, same as before #887. Unlike the automatic AGENT_UPDATE/auto-updater "+
+			"and this restarts immediately. Unlike the automatic AGENT_UPDATE/auto-updater "+
 			"paths, this is not a hard drain: it does not stop new jobs from being picked up while waiting.",
 			managedServiceDrainTimeout))
 

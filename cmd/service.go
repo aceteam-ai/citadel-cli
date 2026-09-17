@@ -212,7 +212,7 @@ func startService(serviceName, composeFilePath string) error {
 			func() bool { return managedContainerRunningForStart(rt.EngineBin, containerName) },
 			status.OpenAICompatServing,
 		); adopt {
-			fmt.Printf("   ✅ %s; not launching a citadel container (aceteam-ai/citadel-cli#1081)\n", msg)
+			fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
 			return nil
 		}
 	}
@@ -262,7 +262,7 @@ func startService(serviceName, composeFilePath string) error {
 				// (loop guard), a live wildcard binding, and the
 				// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE opt-out.
 				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath, bindEnv) {
-					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind (aceteam-ai/citadel-cli#1030)...\n", containerName)
+					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind...\n", containerName)
 					forceRecreateForBindDrift = true
 					// Fall through to the compose-up below with --force-recreate.
 				} else {

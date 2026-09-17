@@ -31,7 +31,7 @@ var connectCmd = &cobra.Command{
 
 BARE TARGET (no port):
   This is an alias of 'citadel ssh <peer>' (see 'citadel ssh --help'): both
-  commands route a bare target through the exact same logic (issue #754).
+  commands route a bare target through the exact same logic.
 
   By default this tries the AceTeam Network terminal endpoint first,
   collapsing the old multi-hop SSH chain (ssh a -> ssh b -> tmux) into a
@@ -41,11 +41,11 @@ BARE TARGET (no port):
   failure to fall back on: you are prompted for it interactively instead.
   Only when the terminal endpoint itself is unreachable does this fall back
   to a real OpenSSH connection (tunneled through the mesh to the peer's
-  sshd, port 22 by default), the pre-#754 behavior of 'citadel ssh'.
+  sshd, port 22 by default).
 
   The terminal endpoint is started by 'citadel work' by default (disable
   with --no-terminal). No token is needed there: the node trusts your
-  verified mesh-peer identity over the VPN (citadel #585). A --token (or
+  verified mesh-peer identity over the VPN. A --token (or
   CITADEL_TERMINAL_TOKEN) is still accepted for the platform terminal path or
   when the target disables mesh trust.
 

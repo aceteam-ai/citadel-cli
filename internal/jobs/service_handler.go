@@ -2003,7 +2003,7 @@ func (h *ServiceHandler) maybeAdoptExternalEngine(ctx JobContext, svc manifestSe
 	if len(models) > 0 {
 		msg = fmt.Sprintf("%s serving %s", msg, strings.Join(models, ", "))
 	}
-	ctx.Log("info", "     - Adopted external %s already serving on :%d; not launching a citadel container (aceteam-ai/citadel-cli#1081)", svc.Name, port)
+	ctx.Log("info", "     - Adopted external %s already serving on :%d; not launching a citadel container", svc.Name, port)
 	out, err := json.Marshal(serviceResult{
 		Name:     svc.Name,
 		Running:  true,
