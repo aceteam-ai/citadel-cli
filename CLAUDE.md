@@ -1156,6 +1156,49 @@ WebSocket.
 Deliberately out of scope (tracked separately in #1055): the redundancy-DNS
 strategy and the rootless per-app pod runtime.
 
+### Verified mesh identity + mesh-only transport for cache-transfer (`internal/meshtransfer`, citadel-cli#1068, aceteam#8553 S3.0)
+
+The first, identity-only slice of source-local peer-cache delegation. It preserves
+a rename- and IP-reuse-stable device id and owner id through the mesh identity
+paths and provides the client-side transport a later cache-transfer flow (S3.1)
+will use — but adds NO lease, passcode bypass, Redis credential, cache-serving
+change, or HF transfer.
+
+`network.PeerIdentity` / `gateway.MeshPeerIdentity` now also carry `StableID`
+(tailcfg.StableNodeID) and `OwnerID` (tailcfg.UserID string). `NetworkServer.WhoIs`
+populates them from the WhoIs response the coordination server vouches; the cmd
+adapter (`gatewayMeshResolver`) threads them. They are ADDITIVE: `SameOwner` /
+`LoginName` are still the gate for org exposures and the #1013 cache-serving gate,
+unchanged. `NodeName`/`LoginName` are display values (change on rename); `StableID`
+/`OwnerID` are the trust keys, and EMPTY means unverified.
+
+`internal/meshtransfer` is a stdlib-only leaf (injected `PeerResolver` +
+`Dialer`; cmd will wire `network.WhoIsPeer`/`network.Dial` at S3.1's first caller —
+the client-resolver path is a tested seam today, the standalone-by-design pattern
+of `internal/mesh`/`internal/ingress`, not a gap):
+- **`meshtransfer.Verify` is the authority for who a target peer is** — fails
+  closed on a non-mesh address (a non-mesh RemoteAddr never resolves), resolver
+  error/nil, non-same-owner, missing stable/owner id, or a device/owner mismatch.
+  A rename that keeps the SAME `StableID` still verifies (name is never a trust
+  key). Identity comes ONLY from the resolver, never a header (the gateway's
+  `resolvePeer` keys on `RemoteAddr`, so a spoofed `X-Forwarded-For` is ignored).
+- **`VerifiedPeer.Client` is the strict mesh-only transport** — dials ONLY the
+  verified peer's pinned mesh IP (refuses non-mesh IPs, hostnames — so no public
+  DNS — proxies, and redirects), and pins the bootstrapped leaf (rejects any
+  other/unverified cert). Request URLs MUST use the mesh IP literal.
+- **`meshtransfer.BootstrapPeerCert` verifies identity BEFORE dialing**, then
+  captures the peer's self-signed leaf at the TLS handshake to the existing
+  status endpoint. `want.StableID` is REQUIRED here (the cert-pin is the
+  trust-commitment point), which makes "IP reuse fails closed" unconditional at
+  bootstrap; post-bootstrap a different device is also caught by the cert pin.
+  Trust-on-first-use is sound because WhoIs binds the mesh IP to the verified
+  device and embedded tsnet answers only on ports the node itself `ListenVPN`s.
+
+Test gotcha worth an hour: every `httptest.NewTLSServer` presents the SAME
+built-in certificate, so a second test server is NOT a distinct cert — the
+pinned-cert-mismatch test mints its own self-signed leaf
+(`genSelfSignedLeaf`).
+
 ### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
 
 `executeChatCompletionsAt` (`internal/worker/llm_inference.go` — vllm/

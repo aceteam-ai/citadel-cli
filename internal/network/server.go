@@ -334,12 +334,33 @@ func (s *NetworkServer) Hostname() string {
 // user the coordination server vouches for.
 type PeerIdentity struct {
 	// NodeName is the peer's MagicDNS/computed node name, for the audit log.
+	// It is a DISPLAY value: it changes on rename, so it must never be used as a
+	// trust key. Use StableID to bind to a specific device.
 	NodeName string
 
 	// LoginName is the tailnet user login the peer belongs to (e.g. an email).
 	// Used both for the audit log and to derive a stable per-user terminal
-	// session so a reconnecting peer re-attaches to its own shell.
+	// session so a reconnecting peer re-attaches to its own shell. Like NodeName
+	// it is display-oriented (a login can change); OwnerID is the stable owner
+	// trust key.
 	LoginName string
+
+	// StableID is the coordination server's stable node identifier
+	// (tailcfg.StableNodeID) for the peer. Unlike NodeName and the mesh IP it
+	// SURVIVES a rename and is not reassigned when an IP is reused, so it is the
+	// correct key for binding a delegation/transfer to a specific device
+	// (aceteam#8553 S3.0). Empty when the coordination server did not vouch a
+	// stable id; a caller binding on device identity MUST treat empty as
+	// unverified and fail closed.
+	StableID string
+
+	// OwnerID is the stable numeric identifier (tailcfg.UserID in string form)
+	// of the tailnet user that owns the peer. It is derived from the same field
+	// the SameOwner check uses, so on a same-owner peer it equals this node's
+	// owner. Unlike LoginName (a display login that can change) it is a stable
+	// trust key. Empty when unknown; a caller binding on owner identity MUST
+	// treat empty as unverified and fail closed.
+	OwnerID string
 
 	// SameOwner reports whether the peer belongs to the same tailnet user/org as
 	// this node. This mirrors GetPeers' `peer.UserID == selfUserID` filter and is
@@ -374,6 +395,17 @@ func (s *NetworkServer) WhoIs(ctx context.Context, remoteAddr string) (*PeerIden
 
 	id := &PeerIdentity{
 		NodeName: who.Node.ComputedName,
+		// StableID/OwnerID are the rename- and IP-reuse-stable trust keys
+		// (aceteam#8553 S3.0). Both come straight from the WhoIs response the
+		// coordination server vouched for; a display value (NodeName/LoginName)
+		// is never substituted for them.
+		StableID: string(who.Node.StableID),
+	}
+	// User is the owning tailnet user. UserID(0) is the zero value the string
+	// form renders as "userid:0"; guard so an absent owner stays "" (empty ⇒
+	// unverified) rather than a misleading concrete id.
+	if !who.Node.User.IsZero() {
+		id.OwnerID = who.Node.User.String()
 	}
 	if who.UserProfile != nil {
 		id.LoginName = who.UserProfile.LoginName
