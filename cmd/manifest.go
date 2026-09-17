@@ -527,6 +527,16 @@ func ensureComposeFile(configDir, serviceName string) error {
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
+		// citadel-cli#1069: on darwin, heal a stale embedded-engine compose that
+		// still carries the pre-#1064 nvidia GPU reservation the current darwin
+		// template dropped, so `docker compose up` for ollama/llamacpp doesn't
+		// keep failing with `could not select device driver "nvidia"`. Runs
+		// BEFORE the container-name reconcile so a healed (un-namespaced) rewrite
+		// is re-namespaced afterward; a no-op on non-darwin and on hand-edited
+		// files (see services.HealStaleGPUReservationOnDisk).
+		if err := healStaleGPUReservationOnDisk(destPath, serviceName); err != nil {
+			return err
+		}
 		if err := ensureNamespacedContainerNameOnDisk(destPath, serviceName); err != nil {
 			return err
 		}
@@ -621,4 +631,32 @@ func ensureNamespacedContainerNameOnDisk(destPath, serviceName string) error {
 		return nil
 	}
 	return os.WriteFile(destPath, []byte(rewritten), 0600)
+}
+
+// healStaleGPUReservationOnDisk re-materializes an already-materialized embedded
+// engine compose that still carries the pre-#1064 nvidia GPU reservation the
+// current (darwin) template dropped (citadel-cli#1069). It is the start-path
+// complement to composerefresh.Sweep (which only heals at a version-changed
+// `citadel work` boot): `citadel run <service>` and the control-center start
+// path materialize through ensureComposeFile's create-once fast path, which
+// otherwise leaves the stale file untouched forever, so `docker compose up`
+// keeps failing with `could not select device driver "nvidia"`.
+//
+// Guarded darwin-only (the stated "linux/windows byte-identical" requirement)
+// and to services.ServiceMap engines only. The actual decision — and the
+// hand-edit-preserving hash guard — lives in services.HealStaleGPUReservationOnDisk;
+// this wrapper only supplies the current template and known-hash set for the
+// service and is a no-op for anything else.
+func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
+	if !platform.IsDarwin() || !isEmbeddedService(serviceName) {
+		return nil
+	}
+	current, ok := services.ServiceMap[serviceName]
+	if !ok {
+		return nil
+	}
+	if _, err := services.HealStaleGPUReservationOnDisk(destPath, current, services.KnownComposeHashes[serviceName]); err != nil {
+		return fmt.Errorf("heal stale GPU reservation for %q: %w", serviceName, err)
+	}
+	return nil
 }
