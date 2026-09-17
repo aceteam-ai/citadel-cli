@@ -25,6 +25,9 @@ type fakeBackend struct {
 	ping      *ipnstate.PingResult
 	pingErr   error
 
+	whois    *apitype.WhoIsResponse
+	whoisErr error
+
 	closed      bool
 	reauthedKey string
 	reauthErr   error
@@ -60,7 +63,10 @@ func (f *fakeBackend) Ping(context.Context, netip.Addr, tailcfg.PingType) (*ipns
 }
 
 func (f *fakeBackend) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	return nil, errors.New("not implemented")
+	if f.whois == nil && f.whoisErr == nil {
+		return nil, errors.New("not implemented")
+	}
+	return f.whois, f.whoisErr
 }
 
 func (f *fakeBackend) Reauth(_ context.Context, authKey string) error {

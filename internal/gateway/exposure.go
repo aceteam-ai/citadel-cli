@@ -95,11 +95,24 @@ func (v Visibility) Valid() bool {
 // mesh/VPN listener, produced by a MeshIdentityResolver and consumed by
 // exposureMiddleware to authorize private/org access without a token.
 type MeshPeerIdentity struct {
-	// NodeName is the peer's node name (audit log).
+	// NodeName is the peer's node name (audit log). Display-only: it changes on
+	// rename, so it is never a trust key (use StableID).
 	NodeName string
 	// LoginName is the peer's tailnet user login (e.g. an email). It is the
-	// identity compared against a private exposure's Creator.
+	// identity compared against a private exposure's Creator. Display-oriented;
+	// OwnerID is the stable owner trust key.
 	LoginName string
+	// StableID is the coordination server's stable node identifier for the peer
+	// (network.PeerIdentity.StableID). It survives a rename and is not reassigned
+	// on IP reuse, so it is the correct device-binding key for cache-transfer
+	// delegation (aceteam#8553 S3.0). Additive: the exposure gates here still key
+	// on SameOwner/LoginName and are unchanged; this carries the stable id
+	// through to later consumers. Empty ⇒ unverified for a device-binding caller.
+	StableID string
+	// OwnerID is the stable numeric owner identifier
+	// (network.PeerIdentity.OwnerID). A stable trust key unlike LoginName. Empty
+	// ⇒ unverified for an owner-binding caller.
+	OwnerID string
 	// SameOwner reports whether the peer belongs to the same tailnet owner/org as
 	// this node. It is the gate for `org` visibility.
 	SameOwner bool

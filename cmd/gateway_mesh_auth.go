@@ -36,6 +36,8 @@ func (gatewayMeshResolver) ResolvePeer(ctx context.Context, remoteAddr string) (
 	return &gateway.MeshPeerIdentity{
 		NodeName:  id.NodeName,
 		LoginName: id.LoginName,
+		StableID:  id.StableID,
+		OwnerID:   id.OwnerID,
 		SameOwner: id.SameOwner,
 	}, nil
 }
