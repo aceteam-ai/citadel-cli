@@ -35,6 +35,13 @@ func nodeHasPasscode() bool {
 	return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
 }
 
+// nodeShellEnabled is the live shell kill-switch. Reloading the small
+// permissions file per SHELL_COMMAND makes both local Control Center toggles
+// and APPLY_DEVICE_CONFIG effective on the next job without a worker restart.
+func nodeShellEnabled() bool {
+	return config.LoadPermissions(platform.ConfigDir()).Shell
+}
+
 // executeJob finds the right handler and runs a job.
 func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	var output []byte
@@ -81,6 +88,7 @@ func init() {
 	// run commands as root regardless of the permission (aceteam #6149, Phase 0).
 	shellHandler := jobs.NewShellCommandHandler("")
 	shellHandler.Disabled = !config.LoadPermissions(platform.ConfigDir()).Shell
+	shellHandler.Enabled = nodeShellEnabled
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
 	// verifier nil here would run enabled shell with no passcode. Fail closed.

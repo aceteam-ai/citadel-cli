@@ -480,7 +480,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// a single node log line per rejected connection. One line at startup, not
 	// buried per-connection, so an operator who enabled a surface without also
 	// setting a passcode sees it immediately.
-	if warning := sensitiveCapabilityPasscodeWarning(config.LoadPermissions(platform.ConfigDir())); warning != "" {
+	// Capture the permission set used for construction-time gates once. The
+	// heartbeat reports this separately from the live persisted intent so the
+	// control plane never calls a restart-bound change applied prematurely.
+	workAppliedPermissions := config.LoadPermissions(platform.ConfigDir())
+	if warning := sensitiveCapabilityPasscodeWarning(workAppliedPermissions); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 
@@ -1631,7 +1635,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// The handlers perform per-request readiness checks, so VNC does not need
 		// to be running at startup -- a VNC server started later will be picked up
 		// automatically without restarting citadel work.
-		permsForDesktop := config.LoadPermissions(platform.ConfigDir())
+		permsForDesktop := workAppliedPermissions
 		if permsForDesktop.Desktop {
 			if serverCfg.TokenValidator != nil {
 				serverCfg.EnableDesktop = true
@@ -2010,7 +2014,9 @@ func runWork(cmd *cobra.Command, args []string) {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create API publisher: %v\n", err)
 				} else {
 					// Include current permissions in heartbeat
-					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
+					apiPublisher.SetPermissionsProvider(func() *heartbeat.PermissionState {
+						return currentPermissionsForHeartbeat(workAppliedPermissions)
+					})
 					if autoStop != nil {
 						apiPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 					}
@@ -2083,7 +2089,9 @@ func runWork(cmd *cobra.Command, args []string) {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create Redis publisher: %v\n", err)
 			} else {
 				// Include current permissions in heartbeat
-				redisPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
+				redisPublisher.SetPermissionsProvider(func() *heartbeat.PermissionState {
+					return currentPermissionsForHeartbeat(workAppliedPermissions)
+				})
 				if autoStop != nil {
 					redisPublisher.SetOnStatus(func(s *status.NodeStatus) { autoStop.Reconcile(s) })
 				}
@@ -2154,7 +2162,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// --terminal flag. A fresh node has `console` default-DENY, so it does NOT
 	// stand up a terminal listener on the org mesh. When enabled, the passcode
 	// verifier below additionally gates every connection.
-	terminalPerms := config.LoadPermissions(platform.ConfigDir())
+	terminalPerms := workAppliedPermissions
 	if workTerminal && !terminalPerms.Console {
 		fmt.Fprintln(os.Stderr, "   - Terminal (console) disabled: enable the 'console' permission + set a node passcode to allow remote terminal access")
 		workTerminal = false
@@ -2345,7 +2353,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// The bridge is started unconditionally when desktop is permitted.
 		// Per-connection VNC dial uses retry with backoff, so a VNC server
 		// started after "citadel work" is picked up automatically.
-		gatewayPerms := config.LoadPermissions(platform.ConfigDir())
+		gatewayPerms := workAppliedPermissions
 		if gatewayPerms.Desktop {
 			gatewayVNC := platform.GetVNCManager()
 			vncPort := gatewayVNC.Port()
@@ -2374,7 +2382,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		})
 
 		// Load and apply permissions
-		perms := config.LoadPermissions(platform.ConfigDir())
+		perms := workAppliedPermissions
 		gw.SetPermissions(perms)
 
 		// Model swapper (citadel-cli#686, construction-order fix): wired here, at
@@ -2582,12 +2590,13 @@ func runWork(cmd *cobra.Command, args []string) {
 	// WHATSAPP_PROVISION registered on the runner below) is built via the shared
 	// helper so the control-center TUI registers the exact same set when it is the
 	// only worker on the node.
-	workPerms := config.LoadPermissions(platform.ConfigDir())
+	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
+		ShellEnabled:              nodeShellEnabled,
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
@@ -3855,8 +3864,26 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 // to remove. config.LoadPermissions is a small YAML file read (the same cost
 // every passcode/permission enforcement path already pays per request), so
 // re-reading every heartbeat is cheap.
-func currentPermissionsForHeartbeat() *heartbeat.PermissionState {
-	return permissionsToHeartbeat(config.LoadPermissions(platform.ConfigDir()))
+func currentPermissionsForHeartbeat(applied *config.Permissions) *heartbeat.PermissionState {
+	desired := config.LoadPermissions(platform.ConfigDir())
+	return permissionsToHeartbeatWithApplied(desired, applied)
+}
+
+func permissionsToHeartbeatWithApplied(desired, applied *config.Permissions) *heartbeat.PermissionState {
+	state := permissionsToHeartbeat(desired)
+	if state != nil && applied != nil {
+		state.Applied = &heartbeat.AppliedPermissionState{
+			Console:  applied.Console,
+			Desktop:  applied.Desktop,
+			Files:    applied.Files,
+			Services: applied.Services,
+			SSH:      applied.SSH,
+			// SHELL_COMMAND reloads this permission for every job, so its
+			// applied value advances with persisted intent without a restart.
+			Shell: desired.Shell,
+		}
+	}
+	return state
 }
 
 // ensureManagedTmux best-effort provisions a Citadel-managed tmux binary so the

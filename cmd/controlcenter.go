@@ -2058,6 +2058,11 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			override)
 	}
 
+	// Construction-time gates use this immutable snapshot. Heartbeats compare
+	// it with current persisted intent so restart-bound changes remain pending
+	// until a new worker confirms them after startup.
+	ccAppliedPermissions := config.LoadPermissions(platform.ConfigDir())
+
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 
@@ -2320,7 +2325,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					collector,
 				); err == nil {
 					// Include current permissions in heartbeat
-					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
+					apiPublisher.SetPermissionsProvider(func() *heartbeat.PermissionState {
+						return currentPermissionsForHeartbeat(ccAppliedPermissions)
+					})
 
 					if inferenceQueueReconciler != nil {
 						inferenceQueueReconciler.Log = func(format string, args ...any) {
@@ -2420,7 +2427,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create handlers with activity callback to route job output through TUI.
 	wsDir := resolveWorkspaceDir()
-	ccPerms := config.LoadPermissions(platform.ConfigDir())
+	ccPerms := ccAppliedPermissions
 
 	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
 	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
@@ -2438,6 +2445,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:                 ccConfigDir,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
+		ShellEnabled:              nodeShellEnabled,
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,

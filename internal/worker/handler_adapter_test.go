@@ -287,6 +287,41 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	}
 }
 
+func TestCreateLegacyHandlers_ShellEnabledIsLive(t *testing.T) {
+	enabled := false
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellDisabled:       true,
+		ShellEnabled:        func() bool { return enabled },
+		ShellHasPasscode:    func() bool { return true },
+		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
+	})
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must remain registered")
+	}
+
+	job := &Job{ID: "job-live-shell", Type: JobTypeShellCommand, Payload: map[string]any{"command": "echo live", "passcode": "2468"}}
+	if _, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil {
+		t.Fatal("live-disabled shell should refuse")
+	}
+
+	enabled = true
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("live enable should apply without rebuilding handlers: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+}
+
 // TestCreateLegacyHandlers_ShellEnabledWithPasscode confirms that an enabled
 // shell (ShellDisabled=false) whose HasPasscode + passcode verifier are wired
 // runs a command that presents the correct passcode.

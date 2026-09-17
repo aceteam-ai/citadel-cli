@@ -130,6 +130,10 @@ type LegacyHandlerOpts struct {
 	// "disabled" error rather than "unsupported job type"), but every command
 	// is rejected. Wired from the persisted `shell` node permission.
 	ShellDisabled bool
+	// ShellEnabled is the live shell-permission source. When non-nil it
+	// supersedes ShellDisabled at execution time, allowing permission changes
+	// to apply without rebuilding the worker handler set.
+	ShellEnabled func() bool
 	// ShellHasPasscode reports whether a node passcode is configured, letting the
 	// handler distinguish "no passcode set" (passcode_not_set) from "wrong passcode
 	// presented" (passcode_invalid). Wired from config.LoadPermissions(...).HasPasscode.
@@ -183,6 +187,7 @@ func CreateLegacyHandlers(logFn ...func(level, msg string)) []JobHandler {
 func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler := jobs.NewShellCommandHandler(opts.WorkspaceDir)
 	shellHandler.Disabled = opts.ShellDisabled
+	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
 

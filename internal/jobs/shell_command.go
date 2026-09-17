@@ -38,7 +38,7 @@ const (
 // so the handler and its tests agree on the wording without duplicating the
 // literals.
 const (
-	msgShellDisabled   = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center, then restart the worker)"
+	msgShellDisabled   = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center)"
 	msgPasscodeNotSet  = "shell command execution requires a node passcode, but none is set; set a node passcode (APPLY_DEVICE_CONFIG `nodePasscode` or the AceTeam control center) before dispatching shell commands"
 	msgPasscodeInvalid = "shell command execution requires the node passcode; present the correct passcode in the SHELL_COMMAND payload `passcode` field"
 )
@@ -256,6 +256,12 @@ type ShellCommandHandler struct {
 	// `shell` node permission, which is default-deny (opt-in): unless a node
 	// explicitly enables Shell, callers set Disabled=true (aceteam #6149).
 	Disabled bool
+	// Enabled, when non-nil, is the live permission source and supersedes the
+	// construction-time Disabled snapshot. Production workers wire it to a
+	// fresh permissions.yaml read so APPLY_DEVICE_CONFIG and Control Center
+	// changes take effect on the next job without restarting the worker. A nil
+	// callback preserves the static behavior for embedders and tests.
+	Enabled func() bool
 	// HasPasscode reports whether a node passcode is configured at all, WITHOUT
 	// leaking the hash. It lets Execute distinguish "no passcode set"
 	// (ReasonPasscodeNotSet: the operator must set one) from "wrong passcode
@@ -290,7 +296,11 @@ func (h *ShellCommandHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, e
 	// operator precisely. Fail CLOSED throughout: a nil HasPasscode or a nil
 	// VerifyPasscode still refuses, so a forgotten gate never silently opens root
 	// shell to anyone who can dispatch a job.
-	if h.Disabled {
+	disabled := h.Disabled
+	if h.Enabled != nil {
+		disabled = !h.Enabled()
+	}
+	if disabled {
 		refusal := &ShellRefusal{Reason: ReasonShellDisabled, Message: msgShellDisabled}
 		ctx.Log("warn", "     - [Job %s] Refusing shell command: %s", job.ID, refusal.Message)
 		return nil, refusal
