@@ -158,6 +158,17 @@ and system user configuration (requires sudo).`,
 		var earlyNetworkConnected bool
 		var nodeName string // Declare early for reuse throughout init
 
+		// citadel-cli#1080: on Linux, finish worker setup after a successful
+		// enroll -- scaffold node_config_dir + a minimal manifest so
+		// whoami/status stop warning, then enable/start the worker so a single
+		// `citadel init` yields a serving node (the RM-01/Jetson demo path).
+		// Mirrors maybeInstallDarwinNodeService above; no-op off Linux and
+		// skipped (like the darwin hook) when the node has no worker creds, so
+		// it never fires inside install.sh's `--authkey` init. Deferred via a
+		// closure so nodeName is read at exit rather than here (it is "" now),
+		// and only on os.Exit-free normal-return success paths.
+		defer func() { maybeFinishLinuxNodeSetup(choice, nodeName) }()
+
 		if choice == nexus.NetChoiceDevice {
 			// Preflight: verify API is reachable before starting interactive auth
 			Debug("checking API reachability at %s...", authServiceURL)
@@ -908,17 +919,12 @@ func createGlobalConfig(nodeConfigDir string) error {
 		fmt.Println("--- Registering node configuration system-wide ---")
 	}
 
-	globalConfigDir := platform.ConfigDir()
-	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
 
-	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
-		return fmt.Errorf("failed to create global config directory %s: %w", globalConfigDir, err)
-	}
-
-	configContent := fmt.Sprintf("node_config_dir: %s\n", nodeConfigDir)
-
-	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0600); err != nil {
-		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
+	// Merge-preserving write (citadel-cli#1080): keep any hostname/original_hostname
+	// saveHostnameToConfig already wrote to this same file instead of clobbering it.
+	if err := writeGlobalConfigFile(globalConfigFile, nodeConfigDir); err != nil {
+		return err
 	}
 
 	// Record the canonical node_config_dir in the machine-global, world-readable

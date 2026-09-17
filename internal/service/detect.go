@@ -55,6 +55,33 @@ func (u ManagedUnit) Restart() error {
 	return runCmd("systemctl", append(ctl, "restart", u.Name)...)
 }
 
+// EnableNowCommand returns the exact shell command that enables the unit and
+// starts it immediately (and on future boots). Mirrors RestartCommand's format
+// so callers can print a consistent, copy-pasteable next step.
+func (u ManagedUnit) EnableNowCommand() string {
+	if u.UserMode {
+		return fmt.Sprintf("systemctl --user enable --now %s", u.Name)
+	}
+	return fmt.Sprintf("sudo systemctl enable --now %s", u.Name)
+}
+
+// EnableNow enables and starts the unit immediately (`systemctl enable --now`),
+// so an already-installed-but-not-running citadel worker unit begins serving
+// now and on future boots.
+//
+// `enable --now` on an ALREADY-active unit does NOT restart it -- it is a
+// no-op for the running process, dropping no in-flight jobs. That idempotency
+// is exactly why `citadel init`'s worker-setup hook uses this on an existing
+// unit rather than Install (which rewrites the unit file + daemon-reloads).
+// System units require root, matching every other systemd.go mutation.
+func (u ManagedUnit) EnableNow() error {
+	if !u.UserMode && os.Geteuid() != 0 {
+		return fmt.Errorf("enabling %s requires root; run: %s", u.Name, u.EnableNowCommand())
+	}
+	ctl := systemctlArgs(u.UserMode)
+	return runCmd("systemctl", append(ctl, "enable", "--now", u.Name)...)
+}
+
 // ActiveManagedUnit reports whether any citadel-managed systemd unit is
 // currently active -- either the install.sh/packer fleet unit
 // (citadel-worker.service, the actual production deployment path) or a unit
@@ -85,6 +112,36 @@ func ActiveManagedUnit() (ManagedUnit, bool) {
 		if strings.TrimSpace(string(out)) == "active" {
 			return ManagedUnit{Name: name, UserMode: cand.userMode}, true
 		}
+	}
+	return ManagedUnit{}, false
+}
+
+// InstalledManagedUnit reports the first citadel-managed systemd unit that
+// EXISTS ON DISK on this host, whether or not it is currently active -- the
+// counterpart to ActiveManagedUnit, which additionally requires the unit to be
+// running.
+//
+// `citadel init`'s Linux worker-setup hook (citadel-cli#1080) uses this to
+// choose between `enable --now`-ing a unit that is already installed
+// (install.sh/packer's citadel-worker.service, or a prior `citadel service
+// install`) and installing a fresh one. Enabling an existing unit must never
+// rewrite its file, so the two cases need to be distinguished BEFORE any
+// mutation -- which the active-only ActiveManagedUnit cannot do for a unit that
+// is installed but stopped.
+//
+// Same enumeration + ownership check as ActiveManagedUnit (candidateManagedUnits
+// + isCitadelManagedUnit), minus the is-active probe.
+func InstalledManagedUnit() (ManagedUnit, bool) {
+	for _, cand := range candidateManagedUnits() {
+		data, err := os.ReadFile(cand.path)
+		if err != nil {
+			continue // not present on this host
+		}
+		if !isCitadelManagedUnit(string(data)) {
+			continue
+		}
+		name := strings.TrimSuffix(filepath.Base(cand.path), ".service")
+		return ManagedUnit{Name: name, UserMode: cand.userMode}, true
 	}
 	return ManagedUnit{}, false
 }
