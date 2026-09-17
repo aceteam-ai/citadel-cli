@@ -217,7 +217,7 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 
 	switch job.Type {
 	case "SERVICE_STATUS":
-		return h.serviceStatus(svc)
+		return h.serviceStatus(ctx.Context(), svc)
 	case "SERVICE_START":
 		// An explicit remote start clears the durable stopped marker (mirrors
 		// liveModuleOps.Start) so the service also starts on the next boot.
@@ -296,7 +296,7 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 // Operations
 // ---------------------------------------------------------------------------
 
-func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
+func (h *ServiceHandler) serviceStatus(ctx context.Context, svc manifestService) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	running := false
 
@@ -307,6 +307,26 @@ func (h *ServiceHandler) serviceStatus(svc manifestService) ([]byte, error) {
 		// it decides to keep routing inference here.
 		running = services.IsNativeServiceServing(svc.Name)
 	case "docker":
+		// #1084: an ADOPTED external engine has no citadel container, so
+		// isDockerServiceRunning would report it stopped forever. Checked FIRST
+		// (before the container inspect) so the status reflects the engine the
+		// node is actually advertising and dispatching to (#1076), and so an
+		// adopted engine never shells the container runtime. adoptedExternalEngine
+		// declines for our own running container, so the normal case is unchanged.
+		if port, models, adopted := h.adoptedExternalEngine(ctx, svc.Name); adopted {
+			msg := fmt.Sprintf("%s is serving externally on :%d (externally managed, not a citadel container)", svc.Name, port)
+			if len(models) > 0 {
+				msg = fmt.Sprintf("%s serving %s", msg, strings.Join(models, ", "))
+			}
+			return json.Marshal(serviceResult{
+				Name:     svc.Name,
+				Running:  true,
+				Kind:     kind,
+				Action:   "status",
+				Message:  msg,
+				Endpoint: fmt.Sprintf("127.0.0.1:%d", port),
+			})
+		}
 		running = h.isDockerServiceRunning(svc.Name)
 	}
 
@@ -591,6 +611,19 @@ func (h *ServiceHandler) serviceStop(ctx JobContext, svc manifestService) ([]byt
 		err = services.StopNativeService(svc.Name)
 
 	case "docker":
+		// #1084: an ADOPTED external engine (serving on this adoptable port but
+		// NOT citadel's own container) is externally managed -- there is no
+		// citadel container to compose-down. Checked FIRST so STOP is a clear
+		// no-op instead of consulting/failing on a container that doesn't exist
+		// (the RM-01's vendor vLLM runs under its own systemd). adoptedExternalEngine
+		// declines for our own container, so a real citadel service still stops.
+		if port, _, adopted := h.adoptedExternalEngine(ctx.Context(), svc.Name); adopted {
+			return json.Marshal(serviceResult{
+				Name: svc.Name, Running: true, Kind: kind,
+				Action:  "stop",
+				Message: fmt.Sprintf("%s is externally managed (serving on :%d); not stopping", svc.Name, port),
+			})
+		}
 		if !h.isDockerServiceRunning(svc.Name) {
 			return json.Marshal(serviceResult{
 				Name: svc.Name, Running: false, Kind: kind,
@@ -1866,14 +1899,20 @@ func (h *ServiceHandler) dockerServiceRunning(svcName string) bool {
 }
 
 // ourContainerRunning answers "is citadel's own managed container for svcName
-// running?" as a TWO-state signal for the #1081 adoption decision: running, and
-// whether the container runtime was even reachable to ask. When the runtime CLI
-// is missing, adoption declines (determinable=false) for two concrete reasons,
-// NOT because ownership is genuinely unknowable: (a) a runtime-less box cannot
-// launch a competing container anyway, so declining changes nothing there and
-// the normal path fails loudly; and (b) it keeps neutered-PATH unit tests that
-// reach the docker branch hermetic on a host where the port answers (this dev
-// box serves vLLM on :8201) -- no network probe fires.
+// running?" as a TWO-state signal for the #1081/#1084 adoption decision: running,
+// and whether the container runtime was even reachable to ask (determinable).
+// When the runtime CLI is missing, determinable=false.
+//
+// The adoption decision (adoptedExternalEngine) treats determinable=false as "our
+// container CANNOT be running" -- a box with no container runtime has no citadel
+// container -- and so PROCEEDS to the port probe rather than declining. This is
+// the #1084 reversal of #1083: on the docker-less RM-01 a live OpenAI-compat
+// engine is necessarily external and must be adopted, not error out. Only
+// determinable && running means "the thing on this port is ours, do not adopt."
+// Hermeticity is preserved by the test seams (dockerServiceRunningFn /
+// externalEngineServingFn), NOT by declining here: a neutered-PATH test that
+// wants no real network probe injects externalEngineServingFn (see
+// newModelTestHandler and service_handler_adopt_test.go).
 func (h *ServiceHandler) ourContainerRunning(svcName string) (running, determinable bool) {
 	if h.dockerServiceRunningFn != nil {
 		return h.dockerServiceRunningFn(svcName), true
@@ -1900,32 +1939,58 @@ func (h *ServiceHandler) openAICompatServing(ctx context.Context, engineType str
 	return status.OpenAICompatServing(ctx, engineType, port)
 }
 
-// maybeAdoptExternalEngine implements the aceteam-ai/citadel-cli#1081 adoption
-// decision for serviceStart's docker branch. It returns a marshaled "adopted"
-// serviceResult (and true) when the worker should SKIP launching svc's container
-// because an external OpenAI-compat engine is already serving on its
-// citadel-resolved host port; otherwise (nil, false) and serviceStart launches
-// as before.
+// adoptedExternalEngine reports whether an EXTERNAL OpenAI-compat engine -- one
+// that is NOT citadel's own managed container -- is currently serving svcName's
+// citadel-resolved host port, i.e. the aceteam-ai/citadel-cli#1081/#1084 adopted
+// state. It returns the resolved port, the served model id(s), and adopted.
 //
-// Adopt iff ALL hold: svc is on the adoption allowlist (AdoptableExternalEnginePort
-// -- vLLM today), citadel's own managed container is determinably NOT running
-// (see ourContainerRunning), and an OpenAI-compat engine answers /v1/models on
-// the port. A requested model the external engine does not serve is logged as a
-// mismatch but STILL adopted -- launching our own container on the same port
-// would only collide.
-func (h *ServiceHandler) maybeAdoptExternalEngine(ctx JobContext, svc manifestService, model, kind string) ([]byte, bool) {
-	port, ok := status.AdoptableExternalEnginePort(svc.Name)
+// It is the SHARED decision behind serviceStart's adoption gate
+// (maybeAdoptExternalEngine) AND serviceStop/serviceStatus's external-engine
+// handling, so all three agree on what "adopted" means. Adopt iff ALL hold:
+//   - svcName is on the adoption allowlist (AdoptableExternalEnginePort, vLLM today);
+//   - citadel's own managed container is not determinably running; and
+//   - an OpenAI-compat engine answers GET /v1/models on the port.
+//
+// The middle condition is the #1084 change from #1083: ownership DECLINES
+// adoption only when the runtime is reachable AND our container is running
+// (determinable && running) -- that alone means "the thing on this port is ours."
+// A runtime that is UNREACHABLE (determinable==false, the docker-less RM-01) no
+// longer declines: a box with no container runtime cannot be running our
+// container, so a live OpenAI-compat engine there is necessarily external and
+// safe to adopt. See ourContainerRunning.
+func (h *ServiceHandler) adoptedExternalEngine(ctx context.Context, svcName string) (port int, models []string, adopted bool) {
+	port, ok := status.AdoptableExternalEnginePort(svcName)
 	if !ok {
-		return nil, false
+		return 0, nil, false
 	}
-	running, determinable := h.ourContainerRunning(svc.Name)
-	if !determinable || running {
-		// Our own container is (or may be) the thing on this port: not adoption.
-		// The ordinary already-running / recreate path below handles it.
-		return nil, false
+	running, determinable := h.ourContainerRunning(svcName)
+	if determinable && running {
+		// Our own container is the thing on this port: not adoption. The
+		// ordinary already-running / status / compose-down paths own it.
+		return port, nil, false
 	}
-	models, serving := h.openAICompatServing(ctx.Context(), svc.Name, port)
+	models, serving := h.openAICompatServing(ctx, svcName, port)
 	if !serving {
+		return port, nil, false
+	}
+	return port, models, true
+}
+
+// maybeAdoptExternalEngine implements the aceteam-ai/citadel-cli#1081/#1084
+// adoption decision for serviceStart's docker branch. It returns a marshaled
+// "adopted" serviceResult (and true) when the worker should SKIP launching svc's
+// container because an external OpenAI-compat engine is already serving on its
+// citadel-resolved host port -- INCLUDING on a box with no container runtime at
+// all (the RM-01, #1084); otherwise (nil, false) and serviceStart launches (or,
+// on a runtime-less box with nothing external serving, fails loudly at the
+// compose-up preflight -- there is nothing to adopt and nothing can be launched).
+//
+// A requested model the external engine does not serve is logged as a mismatch
+// but STILL adopted -- launching our own container on the same port would only
+// collide.
+func (h *ServiceHandler) maybeAdoptExternalEngine(ctx JobContext, svc manifestService, model, kind string) ([]byte, bool) {
+	port, models, adopted := h.adoptedExternalEngine(ctx.Context(), svc.Name)
+	if !adopted {
 		return nil, false
 	}
 	if model != "" && !containsFold(models, model) {

@@ -1434,36 +1434,54 @@ automatically, keeping the compose publish, the native heartbeat probe, and
 advertising in agreement. `TestResolveVLLMHostPort` pins the fallback rules; don't
 "fix" it back to a const for symmetry with its sibling ports.
 
-**Adopt an already-running EXTERNAL vLLM instead of launching one
-(citadel-cli#1081, RM-01 / aceteam#9945).** `status.AdoptableExternalEnginePort`
-(the allowlist — vLLM only) + `status.OpenAICompatServing` (the probe) are the
-authority. The consequence: a `SERVICE_START vllm` (or a boot-time start) on a box
-where an external OpenAI-compat engine already answers `GET /v1/models` on
-`services.VLLMHostPort` and citadel has NO managed `citadel-vllm` container running
-means ADOPT (report success, do not launch), never start a competing container on
-that port. `internal/jobs.ServiceHandler.maybeAdoptExternalEngine` gates the docker
-branch of `serviceStart`; `cmd.maybeAdoptExternalEngineOnStart` gates `startService`
-(the boot / `citadel run` path). Advertise + dispatch were ALREADY handled by #1076
-(`enginePortIfRunning` → `IsNativeServiceServing` → the `CITADEL_VLLM_HOST_PORT`
-probe → `DiscoverModels`, and `llm_inference`'s `baseURLs["vllm"]`), so #1081 is
-only the "don't launch a competing container" half. Two rules that are load-bearing
-and easy to get wrong: (1) adoption is scoped to the docker KIND — if the manifest
-does NOT pin `type` AND the vendor `vllm` CLI is on PATH, `resolveKind` returns
-"native" and the pre-existing #649 `IsNativeServiceServing` short-circuit already
-skips the launch (a `type: docker` entry pins docker regardless of PATH, so it
-reaches the #1081 branch); (2) adoption DECLINES when the container runtime is
-unreachable (`ourContainerRunning`'s two-state return / the `runtimeAvailable`
-gate) — not because ownership is truly unknowable there, but because a runtime-less
-box cannot launch a competing container anyway (declining is harmless, the normal
-path fails loudly) and it keeps neutered-PATH docker-branch unit tests hermetic on
-a host where the port answers. TCP reachability is necessary but not sufficient: the body must
-decode as OpenAI-shaped `{"data":[...]}` (an empty list still counts — a live
-engine with no model loaded, consistent with `DiscoverLocalEngines`). Known, out of
-scope: `SERVICE_STOP`/`SERVICE_STATUS` for an adopted engine still consult the
-citadel container (stop is a no-op, status says not running); a requested model the
-external engine doesn't serve is logged as a mismatch and adopted anyway (launching
-would collide on the port). No feature flag — adoption only fires when something is
-genuinely serving OpenAI-compat on the resolved port.
+**Adopt an already-running EXTERNAL vLLM instead of launching one — even with NO
+docker runtime (citadel-cli#1081 + #1084, RM-01 / aceteam#9945).**
+`status.AdoptableExternalEnginePort` (the allowlist — vLLM only) +
+`status.OpenAICompatServing` (the probe) are the authority. The consequence: a
+`SERVICE_START vllm` (or a boot-time start) on a box where an external OpenAI-compat
+engine already answers `GET /v1/models` on `services.VLLMHostPort` and citadel has NO
+managed `citadel-vllm` container running means ADOPT (report success, do not launch),
+never start a competing container on that port.
+`internal/jobs.ServiceHandler.adoptedExternalEngine` is the SINGLE shared decision;
+`maybeAdoptExternalEngine` wraps it for the docker branch of `serviceStart`, and
+`serviceStatus`/`serviceStop` consult it too (see below); `cmd.maybeAdoptExternalEngineOnStart`
+mirrors it for `startService` (the boot / `citadel run` path). Advertise + dispatch
+were ALREADY handled by #1076 (`enginePortIfRunning` → `IsNativeServiceServing` → the
+`CITADEL_VLLM_HOST_PORT` probe → `DiscoverModels`, and `llm_inference`'s
+`baseURLs["vllm"]`; none of which reads `desired_status`), so this is only the
+"don't launch a competing container, and don't fight an externally-managed one" half.
+
+Rules that are load-bearing and easy to get wrong: (1) adoption is scoped to the
+docker KIND — if the manifest does NOT pin `type` AND the vendor `vllm` CLI is on
+PATH, `resolveKind` returns "native" and the pre-existing #649
+`IsNativeServiceServing` short-circuit already skips the launch (a `type: docker`
+entry pins docker regardless of PATH, so it reaches this branch); (2) **#1084 fixed
+#1083's docker-reachability gate.** #1083 DECLINED adoption whenever the container
+runtime was unreachable — which meant the docker-less RM-01 (vendor vLLM under its
+own systemd on `CITADEL_VLLM_HOST_PORT`) errored on `SERVICE_START vllm` instead of
+adopting. Ownership (`ourContainerRunning`'s two-state return / the `runtimeAvailable`
+seam) now DECLINES adoption ONLY when the runtime is reachable AND our own container
+is running (`determinable && running` — "the thing on this port is ours"). An
+unreachable runtime no longer declines: a box with no container runtime cannot be
+running our container, so a live OpenAI-compat engine there is necessarily external
+and is adopted. Consequence for hermeticity: post-#1084 the external probe fires on
+a neutered-PATH box, so a docker-branch unit test that must not hit the real
+`127.0.0.1:<VLLMHostPort>` (node 1297 serves a real vLLM) injects the probe via
+`externalEngineServingFn` (jobs) / the `servingCheck` seam (cmd) — `newModelTestHandler`
+seams it to "nothing serving" for exactly this reason. TCP reachability is necessary
+but not sufficient: the body must decode as OpenAI-shaped `{"data":[...]}` (an empty
+list still counts — a live engine with no model loaded, consistent with
+`DiscoverLocalEngines`). (3) **`SERVICE_STOP`/`SERVICE_STATUS` now treat an adopted
+engine as external (the #1083 follow-up #1084 closed).** For an adopted vLLM,
+`serviceStatus` reports `running:true` + "externally managed" sourced from the
+`/v1/models` probe (not a citadel container that doesn't exist), and `serviceStop` is
+a clear no-op ("externally managed … not stopping", `running:true`) instead of
+consulting/compose-downing a nonexistent container. A remote `SERVICE_STOP` still sets
+the durable `desired_status: stopped` marker first (operator intent), but that does
+NOT stop advertising — the #1076 advertise path never reads `desired_status`; a
+requested model the external engine doesn't serve is logged as a mismatch and adopted
+anyway (launching would collide on the port). No feature flag — adoption only fires
+when something is genuinely serving OpenAI-compat on the resolved port.
 
 ### WhatsApp bridge deploys must pull (#718)
 

@@ -194,11 +194,14 @@ func startService(serviceName, composeFilePath string) error {
 
 	// Adopt an already-running EXTERNAL OpenAI-compat engine instead of launching
 	// a competing container on its citadel-resolved host port
-	// (aceteam-ai/citadel-cli#1081, RM-01). Checked before the inspect/preflight/
-	// compose-up below so the boot-time start path (startManagedServices) does not
-	// stand up a second vLLM on a port the vendor engine already owns. No-op unless
-	// the engine is on the adoption allowlist, the runtime is reachable, our own
-	// managed container is not running, and an OpenAI-compat engine answers there.
+	// (aceteam-ai/citadel-cli#1081/#1084, RM-01). Checked before the inspect/
+	// preflight/compose-up below so the boot-time start path (startManagedServices)
+	// does not stand up a second vLLM on a port the vendor engine already owns, AND
+	// so a docker-less box (the RM-01, whose vLLM runs under its own systemd) adopts
+	// the external engine instead of failing the preflight. No-op unless the engine
+	// is on the adoption allowlist and an OpenAI-compat engine answers there; when
+	// the runtime IS reachable, a running citadel container of our own on the port
+	// is ours and declines adoption (see maybeAdoptExternalEngineOnStart).
 	// Skipped under a --node-dir/CITADEL_NODE_DIR override (containerName is
 	// namespaced there; keep this off the shared-port probe to avoid surprising an
 	// isolated target), matching the inspect block's own override caution below.
@@ -349,19 +352,24 @@ func startService(serviceName, composeFilePath string) error {
 	return nil
 }
 
-// maybeAdoptExternalEngineOnStart is the aceteam-ai/citadel-cli#1081 adoption
-// decision for the boot-time / `citadel run` startService path. It returns a
-// human-readable adoption message (and true) when startService should SKIP
-// launching serviceName's container because an external OpenAI-compat engine is
-// already serving on its citadel-resolved host port; otherwise ("", false) and
-// startService launches as before.
+// maybeAdoptExternalEngineOnStart is the aceteam-ai/citadel-cli#1081/#1084
+// adoption decision for the boot-time / `citadel run` startService path. It
+// returns a human-readable adoption message (and true) when startService should
+// SKIP launching serviceName's container because an external OpenAI-compat engine
+// is already serving on its citadel-resolved host port -- INCLUDING on a box with
+// no container runtime at all (the RM-01, #1084); otherwise ("", false) and
+// startService launches (or, runtime-less with nothing external, fails loudly at
+// its own preflight below).
 //
 // Pure and seam-injected (runtimeAvailable, ourContainerRunning, servingCheck)
 // so the decision is unit-testable without a container runtime or a live engine.
 // Adopt iff: serviceName is on the adoption allowlist (AdoptableExternalEnginePort
-// -- vLLM today), the container runtime is reachable (so ownership is
-// determinable -- mirrors serviceStart's ourContainerRunning fail-safe), our own
-// managed container is not running, and an OpenAI-compat engine answers there.
+// -- vLLM today), our own managed container is not running, and an OpenAI-compat
+// engine answers there. The #1084 change from #1083: an UNAVAILABLE runtime no
+// longer short-circuits before the probe -- a box with no container runtime
+// cannot be running our container, so ownership is only consulted (and can only
+// decline) when the runtime IS available. This mirrors serviceStart's
+// adoptedExternalEngine gate exactly.
 func maybeAdoptExternalEngineOnStart(
 	ctx context.Context,
 	serviceName string,
@@ -370,10 +378,14 @@ func maybeAdoptExternalEngineOnStart(
 	servingCheck func(ctx context.Context, engineType string, port int) ([]string, bool),
 ) (string, bool) {
 	port, ok := status.AdoptableExternalEnginePort(serviceName)
-	if !ok || !runtimeAvailable {
+	if !ok {
 		return "", false
 	}
-	if ourContainerRunning() {
+	// Consult ownership ONLY when the runtime is reachable: a determinably-running
+	// citadel container on this port is ours, not adoption. When the runtime is
+	// unavailable, our container cannot be running, so skip straight to the probe
+	// (short-circuit && never calls ourContainerRunning). #1084.
+	if runtimeAvailable && ourContainerRunning() {
 		return "", false
 	}
 	models, serving := servingCheck(ctx, serviceName, port)
