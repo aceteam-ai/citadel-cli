@@ -1,6 +1,10 @@
 package services
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"testing"
+)
 
 // TestMeetingHostPortsRegistered pins the meeting media-stack module's two
 // loopback host ports (aceteam-ai/citadel-cli#514): they must be registered,
@@ -393,6 +397,81 @@ func TestOmniVoiceHostPortRegistered(t *testing.T) {
 	}
 	// HostPortEnv must emit the omnivoice var so its compose resolves.
 	want := EnvOmniVoiceHostPort + "=8214"
+	found := false
+	for _, kv := range HostPortEnv() {
+		if kv == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("HostPortEnv() did not emit %q", want)
+	}
+}
+
+// TestResolveVLLMHostPort pins the CITADEL_VLLM_HOST_PORT resolution
+// (aceteam-ai/citadel-cli#1076). VLLMHostPort is set from resolveVLLMHostPort()
+// at package init, which t.Setenv cannot re-trigger, so the resolver is exercised
+// directly. Back-compat: an unset var must yield the historical 8201, and any
+// invalid value must fall back to 8201 rather than a broken 0.
+func TestResolveVLLMHostPort(t *testing.T) {
+	// Baseline: the package-init var must equal the default when the test
+	// process was started without the override (CI never sets it).
+	if _, set := os.LookupEnv(EnvVLLMHostPort); !set {
+		if VLLMHostPort != defaultVLLMHostPort {
+			t.Fatalf("VLLMHostPort = %d at init, want default %d with the env var unset", VLLMHostPort, defaultVLLMHostPort)
+		}
+	}
+
+	t.Run("unset", func(t *testing.T) {
+		// Register a restore, then genuinely unset (t.Setenv("") is empty, not unset).
+		t.Setenv(EnvVLLMHostPort, "")
+		os.Unsetenv(EnvVLLMHostPort)
+		if got := resolveVLLMHostPort(); got != defaultVLLMHostPort {
+			t.Errorf("resolveVLLMHostPort() unset = %d, want %d", got, defaultVLLMHostPort)
+		}
+	})
+
+	cases := []struct {
+		name string
+		val  string
+		want int
+	}{
+		{"empty", "", defaultVLLMHostPort},
+		{"zero", "0", defaultVLLMHostPort},
+		{"negative", "-1", defaultVLLMHostPort},
+		{"non-numeric", "abc", defaultVLLMHostPort},
+		{"trailing junk", "58000x", defaultVLLMHostPort},
+		{"above max port", "65536", defaultVLLMHostPort},
+		{"default value", "8201", 8201},
+		{"rm-01 port", "58000", 58000},
+		{"max port", "65535", 65535},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvVLLMHostPort, tc.val)
+			if got := resolveVLLMHostPort(); got != tc.want {
+				t.Errorf("resolveVLLMHostPort(%q) = %d, want %d", tc.val, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVLLMHostPortFlowsToRegistries proves the resolved var (not a stale copy)
+// reaches the maps/registries every consumer reads through, so an operator's
+// CITADEL_VLLM_HOST_PORT reaches the compose publish, the native probe, and
+// advertising in agreement.
+func TestVLLMHostPortFlowsToRegistries(t *testing.T) {
+	if ServiceHostPorts["vllm"] != VLLMHostPort {
+		t.Errorf("ServiceHostPorts[vllm] = %d, want VLLMHostPort %d", ServiceHostPorts["vllm"], VLLMHostPort)
+	}
+	if InferenceMetricsPorts()["vllm"] != VLLMHostPort {
+		t.Errorf("InferenceMetricsPorts()[vllm] = %d, want VLLMHostPort %d", InferenceMetricsPorts()["vllm"], VLLMHostPort)
+	}
+	if port, ok := ManagedServiceHostPort("vllm"); !ok || port != VLLMHostPort {
+		t.Errorf("ManagedServiceHostPort(vllm) = %d (ok=%v), want VLLMHostPort %d", port, ok, VLLMHostPort)
+	}
+	// HostPortEnv must emit the same value it would inject at `docker compose up`.
+	want := fmt.Sprintf("%s=%d", EnvVLLMHostPort, VLLMHostPort)
 	found := false
 	for _, kv := range HostPortEnv() {
 		if kv == want {

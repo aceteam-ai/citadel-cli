@@ -21,7 +21,11 @@
 // allocated app can never collide with a module's fixed port.
 package services
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 // Host-port env-var names referenced by services/compose/*.yml. Kept as
 // exported constants so consumers (Go code that reaches these services) and the
@@ -117,11 +121,11 @@ const (
 	// an OpenAI-compatible server with no auth of its own. Mesh reach is via
 	// the gateway's model-routed /v1/chat/completions, not this port directly.
 	LlamacppHostPort = 8200
-	// vllm: was host 8100 (collided with extraction and the apps range). Bound
-	// to 127.0.0.1 only (aceteam-ai/aceteam#9523; services/compose/vllm.yml),
-	// an OpenAI-compatible server with no auth of its own. Mesh reach is via
-	// the gateway's model-routed /v1/chat/completions, not this port directly.
-	VLLMHostPort = 8201
+	// vllm's host port is NOT a const in this block: unlike every other
+	// 8200-block port it resolves from CITADEL_VLLM_HOST_PORT at process init
+	// (see VLLMHostPort / resolveVLLMHostPort below). It keeps 8201 as its
+	// default, so a node with the env var unset is unaffected.
+	//
 	// extraction: was host 8100 (collided with vllm and the apps range).
 	ExtractionHostPort = 8202
 	// diffusers: was host 8102 (collided with the TEI embedding upstream).
@@ -207,6 +211,39 @@ const (
 	// co-located citadel worker).
 	OmniVoiceHostPort = 8214
 )
+
+// defaultVLLMHostPort is the vLLM host port when CITADEL_VLLM_HOST_PORT is unset.
+// It stays 8201 (its long-standing 8200-block slot) so an unset node behaves
+// byte-identically to before this became env-resolvable.
+const defaultVLLMHostPort = 8201
+
+// VLLMHostPort is the effective vLLM host port. It is the ONE 8200-block port
+// that is a var rather than a const, because some nodes serve vLLM on a
+// non-default port -- notably the RM-01 (Jetson AGX Orin) demo node on :58000
+// (aceteam-ai/citadel-cli#1076). resolveVLLMHostPort reads CITADEL_VLLM_HOST_PORT
+// at process init, defaulting to 8201. Every consumer reads this var (directly at
+// call time, or via ServiceHostPorts/InferenceMetricsPorts/HostPortEnv, which are
+// built from it), so the resolved value flows to the compose publish, the native
+// heartbeat probe, and every Go dialer automatically -- keeping the published
+// port, the probed port, and the advertised port in agreement.
+//
+// Do NOT "restore" this to a const for symmetry with its siblings: that
+// reintroduces the RM-01 blocker (a node serving vLLM off 8201 is never reached
+// or advertised).
+var VLLMHostPort = resolveVLLMHostPort()
+
+// resolveVLLMHostPort returns the vLLM host port from CITADEL_VLLM_HOST_PORT,
+// falling back to defaultVLLMHostPort (8201) when the var is unset, empty, or not
+// a valid TCP port (non-numeric, zero, negative, or above 65535). It never
+// returns a broken 0.
+func resolveVLLMHostPort() int {
+	if v := os.Getenv(EnvVLLMHostPort); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p <= 65535 {
+			return p
+		}
+	}
+	return defaultVLLMHostPort
+}
 
 // WyzeBridgeRTSPPort is docker-wyze-bridge's RTSP server port in the nvr module
 // (#597). wyze-bridge MUST run with host networking (TUTK P2P needs LAN broadcast
