@@ -2554,3 +2554,19 @@ Auto-generated log of every release.
   - feat: forward response_format + think to ollama in the LLM inference worker (aceteam#9817 S2) (#1071)
 
 
+---
+
+## v2.163.0 — 2026-09-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 7 |
+| Lines added | +376 |
+
+**Changes:**
+
+  - feat(worker): forward OpenAI response_format + think to vLLM chat path (#1077) (#1079)
+  - fix: resolve vLLM host port from CITADEL_VLLM_HOST_PORT (RM-01 :58000) (#1078)
+
+
