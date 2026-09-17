@@ -4,6 +4,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -150,6 +151,43 @@ func TestEnsureComposeFile_NoOverrideWritesVerbatim(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "container_name: citadel-vllm") {
 		t.Fatalf("materialized compose file missing the unnamespaced container_name line, got: %s", got)
+	}
+}
+
+// TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged pins that the
+// citadel-cli#1069 darwin GPU-reservation heal is a no-op on the linux CI host:
+// an already-materialized nvidia-reserving ollama.yml (the exact state a Mac at
+// v2.150-v2.160 has on disk, and the current linux template here) must be left
+// byte-identical when ensureComposeFile takes its create-once fast path. The
+// heal only fires on a darwin build, where ServiceMap["ollama"] is the
+// no-nvidia darwin variant.
+func TestEnsureComposeFile_LinuxLeavesNvidiaReservingFileUnchanged(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("linux-only byte-identity assertion; GOOS=%s", runtime.GOOS)
+	}
+	setNodeDirOverrideForTest(t, "")
+	tmpDir := t.TempDir()
+	servicesDir := filepath.Join(tmpDir, "services")
+	if err := os.MkdirAll(servicesDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Seed the current linux ollama template (carries the nvidia reservation).
+	seed := services.ServiceMap["ollama"]
+	destPath := filepath.Join(servicesDir, "ollama.yml")
+	if err := os.WriteFile(destPath, []byte(seed), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := ensureComposeFile(tmpDir, "ollama"); err != nil {
+		t.Fatalf("ensureComposeFile() error = %v", err)
+	}
+
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != seed {
+		t.Fatal("nvidia-reserving ollama.yml was rewritten on linux; the #1069 heal must be darwin-only")
 	}
 }
 
