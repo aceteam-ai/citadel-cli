@@ -2586,3 +2586,18 @@ Auto-generated log of every release.
   - feat: citadel init finishes Linux worker setup (#1080) (#1082)
 
 
+---
+
+## v2.165.0 — 2026-09-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +382 |
+
+**Changes:**
+
+  - fix: adopt an external vLLM even with NO docker runtime (complete Gap C #1084) (#1085)
+
+
