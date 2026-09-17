@@ -1969,6 +1969,333 @@ func TestLLMInferenceHandler_OllamaStreamingToolCallsResponse(t *testing.T) {
 	}
 }
 
+// --- Structured output `format` + `think` toggle (aceteam-ai/aceteam#9817 S2) ---
+
+// TestLLMInferenceHandler_OllamaFormatAndThinkByteIdenticalWithout mirrors
+// TestLLMInferenceHandler_OllamaToolsRequestByteIdenticalWithoutTools for the
+// two S2 fields: a request that sets neither response_format nor think must
+// gain no "format" and no "think" key on the outbound /api/chat body, so an
+// old-shaped request is byte-identical to the pre-S2 behavior.
+func TestLLMInferenceHandler_OllamaFormatAndThinkByteIdenticalWithout(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"ok"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-no-format-think",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "ollama",
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if _, present := gotReq["format"]; present {
+		t.Errorf("outbound request = %+v, want no \"format\" key", gotReq)
+	}
+	if _, present := gotReq["think"]; present {
+		t.Errorf("outbound request = %+v, want no \"think\" key", gotReq)
+	}
+}
+
+// TestLLMInferenceHandler_OllamaResponseFormatJSONSchemaForwarded asserts an
+// OpenAI-shaped response_format of type json_schema is translated to ollama's
+// `format` as the INNER json_schema.schema object (not the OpenAI wrapper),
+// forwarded verbatim.
+func TestLLMInferenceHandler_OllamaResponseFormatJSONSchemaForwarded(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"{\"years_of_experience\":0}"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-response-format-schema",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "ollama",
+			"response_format": map[string]any{
+				"type": "json_schema",
+				"json_schema": map[string]any{
+					"name": "resume",
+					"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"years_of_experience": map[string]any{"type": "number"},
+						},
+						"required": []any{"years_of_experience"},
+					},
+					"strict": true,
+				},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "extract"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	format, ok := gotReq["format"].(map[string]any)
+	if !ok {
+		t.Fatalf("outbound format = %#v (%T), want the inner JSON Schema object", gotReq["format"], gotReq["format"])
+	}
+	// It must be the inner schema, NOT the OpenAI response_format wrapper.
+	if _, present := format["json_schema"]; present {
+		t.Errorf("format = %+v, want the inner schema, not the OpenAI wrapper (has json_schema key)", format)
+	}
+	if format["type"] != "object" {
+		t.Errorf("format.type = %v, want object (the schema's own type)", format["type"])
+	}
+	props, _ := format["properties"].(map[string]any)
+	yoe, _ := props["years_of_experience"].(map[string]any)
+	if yoe["type"] != "number" {
+		t.Errorf("format.properties.years_of_experience.type = %v, want number", yoe["type"])
+	}
+}
+
+// TestLLMInferenceHandler_OllamaResponseFormatJSONObjectForwarded asserts an
+// OpenAI-shaped response_format of type json_object is translated to ollama's
+// `format: "json"` structured-output shorthand.
+func TestLLMInferenceHandler_OllamaResponseFormatJSONObjectForwarded(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"{}"},"done":true}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	job := &Job{
+		ID:   "job-ollama-response-format-object",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":           "m",
+			"backend":         "ollama",
+			"response_format": map[string]any{"type": "json_object"},
+			"messages":        []map[string]any{{"role": "user", "content": "json please"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := gotReq["format"].(string); got != "json" {
+		t.Errorf("outbound format = %#v, want the string \"json\"", gotReq["format"])
+	}
+}
+
+// TestLLMInferenceHandler_OllamaThinkForwarded asserts the tri-state think
+// toggle: a payload think:true forwards think:true, and (critically) a payload
+// think:false forwards think:false rather than omitting it -- ollama accepts
+// think:false on a non-thinking model, and a structured/deterministic call
+// relies on it to suppress reasoning.
+func TestLLMInferenceHandler_OllamaThinkForwarded(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		want := want
+		t.Run(fmt.Sprintf("think=%v", want), func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"message":{"role":"assistant","content":"ok"},"done":true}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["ollama"] = ts.URL
+
+			job := &Job{
+				ID:   "job-ollama-think",
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model":    "m",
+					"backend":  "ollama",
+					"think":    want,
+					"messages": []map[string]any{{"role": "user", "content": "hi"}},
+				},
+			}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+			got, present := gotReq["think"]
+			if !present {
+				t.Fatalf("outbound request = %+v, want a \"think\" key (tri-state: false must still forward)", gotReq)
+			}
+			if gotBool, _ := got.(bool); gotBool != want {
+				t.Errorf("outbound think = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestLLMInferenceHandler_OllamaBufferedThinkingFallback asserts the buffered
+// path surfaces message.thinking as the reply when content is empty and no tool
+// call was made (a thinking model that spent its budget mid-reasoning) -- and
+// does NOT surface it when content is present. Before S2, bufferedOllamaChat
+// decoded only message.content, so this was a blank reply.
+func TestLLMInferenceHandler_OllamaBufferedThinkingFallback(t *testing.T) {
+	t.Run("empty content falls back to thinking", func(t *testing.T) {
+		body := `{"message":{"role":"assistant","content":"","thinking":"the reasoning"},` +
+			`"done":true,"prompt_eval_count":10,"eval_count":5}`
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+
+		h := NewLLMInferenceHandler()
+		h.baseURLs["ollama"] = ts.URL
+
+		stream := &MockStreamWriter{}
+		job := &Job{
+			ID:   "job-ollama-thinking-fallback",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":    "m",
+				"backend":  "ollama",
+				"messages": []map[string]any{{"role": "user", "content": "hi"}},
+			},
+		}
+		result, err := h.Execute(context.Background(), job, stream)
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if result == nil || result.Status != JobStatusSuccess {
+			t.Fatalf("result = %+v, want success", result)
+		}
+		if got, _ := result.Output["content"].(string); got != "the reasoning" {
+			t.Errorf("content = %q, want the thinking fallback \"the reasoning\"", got)
+		}
+		if len(stream.chunks) != 1 || stream.chunks[0] != "the reasoning" {
+			t.Errorf("chunks = %v, want a single \"the reasoning\" chunk", stream.chunks)
+		}
+	})
+
+	t.Run("content present ignores thinking", func(t *testing.T) {
+		body := `{"message":{"role":"assistant","content":"the answer","thinking":"the reasoning"},` +
+			`"done":true}`
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if serveReadinessProbe(w, r) {
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+
+		h := NewLLMInferenceHandler()
+		h.baseURLs["ollama"] = ts.URL
+
+		stream := &MockStreamWriter{}
+		job := &Job{
+			ID:   "job-ollama-thinking-ignored",
+			Type: JobTypeLLMInference,
+			Payload: map[string]any{
+				"model":    "m",
+				"backend":  "ollama",
+				"messages": []map[string]any{{"role": "user", "content": "hi"}},
+			},
+		}
+		result, err := h.Execute(context.Background(), job, stream)
+		if err != nil {
+			t.Fatalf("Execute error: %v", err)
+		}
+		if got, _ := result.Output["content"].(string); got != "the answer" {
+			t.Errorf("content = %q, want the visible answer \"the answer\" (thinking must not override)", got)
+		}
+	})
+}
+
+// TestLLMInferenceHandler_OllamaStreamingThinkingFallback asserts the streaming
+// path surfaces accumulated message.thinking on the terminal result (and as a
+// terminal chunk) when no content frame ever arrived and no tool call was made.
+func TestLLMInferenceHandler_OllamaStreamingThinkingFallback(t *testing.T) {
+	frames := []string{
+		`{"message":{"role":"assistant","content":"","thinking":"think "},"done":false}`,
+		`{"message":{"role":"assistant","content":"","thinking":"harder"},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":7,"eval_count":3}`,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		for _, f := range frames {
+			_, _ = w.Write([]byte(f + "\n"))
+		}
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["ollama"] = ts.URL
+
+	stream := &MockStreamWriter{}
+	job := &Job{
+		ID:   "job-ollama-streaming-thinking-fallback",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":    "m",
+			"backend":  "ollama",
+			"stream":   true,
+			"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, stream)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	if got, _ := result.Output["content"].(string); got != "think harder" {
+		t.Errorf("content = %q, want accumulated thinking \"think harder\"", got)
+	}
+	if len(stream.chunks) != 1 || stream.chunks[0] != "think harder" {
+		t.Errorf("chunks = %v, want a single terminal \"think harder\" chunk", stream.chunks)
+	}
+}
+
 // --- Consolidated Trust Engine hook (citadel #1001, aceteam #8253 S1) ------
 
 // trustEngineHookCase describes one of the ten buffered/streaming engine
