@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -89,20 +90,164 @@ func TestMaybeAdoptExternalEngine_Decision(t *testing.T) {
 		}
 	})
 
-	t.Run("undeterminable ownership (no runtime CLI) does not adopt", func(t *testing.T) {
+	t.Run("docker-less box (no runtime CLI) with external serving ADOPTS (#1084)", func(t *testing.T) {
 		// No dockerServiceRunningFn seam -> ourContainerRunning does the real
 		// exec.LookPath, which fails with PATH neutered, so ownership is
-		// undeterminable and adoption declines (the production fail-safe that also
-		// keeps neutered-PATH docker-branch tests hermetic).
+		// undeterminable -- the docker-less RM-01 shape. Post-#1084 a box with no
+		// container runtime cannot be running our container, so a serving external
+		// engine there is adopted rather than declined. The external probe is
+		// seamed so no real 127.0.0.1:<port> request fires.
 		t.Setenv("PATH", t.TempDir())
 		h := NewServiceHandler(t.TempDir())
 		h.externalEngineServingFn = func(_ context.Context, _ string, _ int) ([]string, bool) {
 			return []string{"Qwen/Qwen3-8B"}, true
 		}
-		if _, adopted := h.maybeAdoptExternalEngine(testCtx(), svc, "", "docker"); adopted {
-			t.Fatal("expected adopted=false when the container runtime is unavailable")
+		out, adopted := h.maybeAdoptExternalEngine(testCtx(), svc, "", "docker")
+		if !adopted {
+			t.Fatal("expected adopted=true on a docker-less box with an external engine serving (#1084)")
+		}
+		var res serviceResult
+		if err := json.Unmarshal(out, &res); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !res.Running || !strings.Contains(res.Message, "adopted external vllm") {
+			t.Fatalf("unexpected result: %+v", res)
 		}
 	})
+
+	t.Run("docker-less box (no runtime CLI) with nothing serving does not adopt", func(t *testing.T) {
+		// The other #1084 branch: a runtime-less box with no external engine has
+		// nothing to adopt and must fall through (serviceStart then fails loudly at
+		// the compose-up preflight -- there is nothing that can be launched either).
+		t.Setenv("PATH", t.TempDir())
+		h := NewServiceHandler(t.TempDir())
+		h.externalEngineServingFn = func(_ context.Context, _ string, _ int) ([]string, bool) {
+			return nil, false
+		}
+		if _, adopted := h.maybeAdoptExternalEngine(testCtx(), svc, "", "docker"); adopted {
+			t.Fatal("expected adopted=false on a docker-less box with nothing serving")
+		}
+	})
+}
+
+// TestServiceStart_AdoptsExternalOnDockerlessBox is the aceteam-ai/citadel-cli#1084
+// acceptance: a full serviceStart on a box with NO container runtime (PATH
+// neutered) and an external vLLM serving must ADOPT -- return success, never
+// attempt a docker launch. The manifestService has NO compose_file, so any
+// fall-through to the launch path would error at resolveComposePath; the clean
+// adopted return is the proof no compose action was taken on a runtime-less box.
+func TestServiceStart_AdoptsExternalOnDockerlessBox(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // docker-less box: no runtime CLI reachable
+	h := NewServiceHandler(t.TempDir())
+	h.externalEngineServingFn = func(_ context.Context, _ string, _ int) ([]string, bool) {
+		return []string{"Qwen/Qwen3-8B"}, true
+	}
+	svc := manifestService{Name: "vllm", Type: "docker", ComposeFile: ""}
+
+	out, err := h.serviceStart(testCtx(), svc, "", 0, 0, trustRemoteCodeUnspecified)
+	if err != nil {
+		t.Fatalf("serviceStart returned error (attempted a launch on a docker-less box?): %v", err)
+	}
+	var res serviceResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !res.Running || !strings.Contains(res.Message, "adopted external vllm") {
+		t.Fatalf("expected an adopted result on a docker-less box, got %+v", res)
+	}
+	if res.Error != "" {
+		t.Fatalf("adopted result must carry no error, got %q", res.Error)
+	}
+}
+
+// TestServiceStart_NoExternalNoDockerErrorsClearly is the #1084 acceptance #2: a
+// box with NO container runtime and NO external engine has nothing to adopt and
+// nothing to launch, so serviceStart must fail loudly with the docker-missing
+// diagnosis (never a silent success). Driven through Execute with a materialized
+// compose file so it reaches the compose-up preflight.
+func TestServiceStart_NoExternalNoDockerErrorsClearly(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())  // docker-less box
+	h, _ := newModelTestHandler(t) // seams externalEngineServingFn -> nothing serving
+
+	out, err := h.Execute(JobContext{}, &nexus.Job{
+		ID:      "job-noadopt-nodocker",
+		Type:    "SERVICE_START",
+		Payload: map[string]string{"service": "vllm"},
+	})
+	if err != nil {
+		t.Fatalf("Execute SERVICE_START: %v", err)
+	}
+	if !strings.Contains(string(out), "docker compose up failed") ||
+		!strings.Contains(string(out), "docker CLI not found on PATH") {
+		t.Fatalf("expected the docker-missing failure (nothing to adopt, nothing to launch), got: %s", out)
+	}
+	if strings.Contains(string(out), "adopted external") {
+		t.Fatalf("must not adopt when nothing external is serving, got: %s", out)
+	}
+}
+
+// TestServiceStatus_AdoptedExternalReportsServing pins the #1084 SERVICE_STATUS
+// half: an adopted external engine (our container not running, external serving)
+// is reported RUNNING and externally-managed, sourced from the /v1/models probe
+// rather than a citadel container that does not exist.
+func TestServiceStatus_AdoptedExternalReportsServing(t *testing.T) {
+	// dockerServiceRunningFn=false -> ourContainerRunning determinable && !running,
+	// so the external probe decides; externalEngineServingFn reports serving.
+	// Neuter PATH so the un-seamed isDockerServiceRunning can shell nothing even if
+	// reached -- a hard guarantee the adopted path never touches the container
+	// runtime, not just an inference from the message.
+	t.Setenv("PATH", t.TempDir())
+	h := serviceHandlerWithAdoptSeams(t, false, true, []string{"Qwen/Qwen3-8B"})
+	svc := manifestService{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}
+
+	out, err := h.serviceStatus(context.Background(), svc)
+	if err != nil {
+		t.Fatalf("serviceStatus: %v", err)
+	}
+	var res serviceResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !res.Running {
+		t.Fatalf("expected an adopted external engine to report running, got %+v", res)
+	}
+	if !strings.Contains(res.Message, "externally managed") || !strings.Contains(res.Message, "Qwen/Qwen3-8B") {
+		t.Errorf("message = %q, want externally-managed + the served model", res.Message)
+	}
+	wantEndpoint := fmt.Sprintf("127.0.0.1:%d", mustAdoptPort(t, "vllm"))
+	if res.Endpoint != wantEndpoint {
+		t.Errorf("endpoint = %q, want %q", res.Endpoint, wantEndpoint)
+	}
+}
+
+// TestServiceStop_AdoptedExternalIsNoOp pins the #1084 SERVICE_STOP half: an
+// adopted external engine is externally managed, so STOP is a clear no-op that
+// leaves it running and does NOT consult/compose-down a citadel container.
+func TestServiceStop_AdoptedExternalIsNoOp(t *testing.T) {
+	// Neuter PATH so the un-seamed isDockerServiceRunning / compose-down can shell
+	// nothing even if reached -- a hard guarantee the adopted no-op never touches
+	// the container runtime, not just an inference from the returned message.
+	t.Setenv("PATH", t.TempDir())
+	h := serviceHandlerWithAdoptSeams(t, false, true, []string{"Qwen/Qwen3-8B"})
+	svc := manifestService{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}
+
+	out, err := h.serviceStop(testCtx(), svc)
+	if err != nil {
+		t.Fatalf("serviceStop: %v", err)
+	}
+	var res serviceResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !res.Running {
+		t.Errorf("adopted external engine is not stopped, expected Running=true, got %+v", res)
+	}
+	if !strings.Contains(res.Message, "externally managed") || !strings.Contains(res.Message, "not stopping") {
+		t.Errorf("message = %q, want an externally-managed no-op", res.Message)
+	}
+	if res.Error != "" {
+		t.Errorf("no-op stop must carry no error, got %q", res.Error)
+	}
 }
 
 // TestServiceStart_AdoptShortCircuitsBeforeLaunch drives the full serviceStart
