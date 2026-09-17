@@ -2570,3 +2570,19 @@ Auto-generated log of every release.
   - fix: resolve vLLM host port from CITADEL_VLLM_HOST_PORT (RM-01 :58000) (#1078)
 
 
+---
+
+## v2.164.0 — 2026-09-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 13 |
+| Lines added | +1291 |
+
+**Changes:**
+
+  - feat: adopt an existing external vLLM instead of launching a container (#1081) (#1083)
+  - feat: citadel init finishes Linux worker setup (#1080) (#1082)
+
+
