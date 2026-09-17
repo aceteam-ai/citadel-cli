@@ -3416,13 +3416,53 @@ node's own worker over loopback — there is still no cross-process signal for
 whether the jobs it is waiting on are individually safe to interrupt, only a
 count.
 
+### `citadel init` finishes Linux worker setup (citadel-cli#1080)
+
+Before this, a network-only `citadel init` on Linux joined the mesh but left
+`whoami`/`status` warning "missing node_config_dir" (no global pointer + no
+manifest, so `findAndReadManifest` errored) and started no worker — an enrolled
+node that served nothing. `cmd/init_service.go:maybeFinishLinuxNodeSetup` is the
+Linux counterpart to `maybeInstallDarwinNodeService`: deferred from `cmd/init.go`
+via a closure (so `nodeName` is read at exit, not at register time), no-op off
+Linux, and **guarded exactly like the darwin hook** — skips on `NetChoiceSkip`
+or `!hasDeviceConfigured()`, so a `Restart=always` worker never crash-loops
+credless. That guard is ALSO why it never fires inside install.sh: install.sh
+runs `citadel init --authkey`, which writes NO device creds
+(`saveDeviceConfigToFile` is reached only on the device-auth path), so
+`hasDeviceConfigured()` is false there and install.sh keeps sole ownership of
+`citadel-worker.service` — there is no competing-unit race. It fires on the
+interactive device-auth enroll (the RM-01/Jetson demo path).
+
+Two halves:
+- **Scaffold (`ensureNodeScaffoldAt`, root or not):** writes a minimal
+  `citadel.yaml` (only when ABSENT — never clobbers a provisioned manifest) at
+  `network.GetNodeConfigDir()` plus the merge-preserving global `node_config_dir`
+  pointer, so `findAndReadManifest` resolves. The pure core takes
+  `globalConfigFile` as a param (the ConfigDir/#787 rule — a test must never
+  write through the real resolved path on a box with a live node).
+- **Worker start (`decideLinuxWorkerSetup`, the pure root-vs-non-root decision):**
+  root + an existing citadel-managed unit on disk (`service.InstalledManagedUnit`
+  — the installed-not-just-active counterpart to `ActiveManagedUnit`) →
+  `ManagedUnit.EnableNow()` (`systemctl enable --now`, idempotent — never
+  restarts a running worker, so no dropped jobs, which is why it must NOT
+  `Install`); root + no unit → `service.Manager.Install` a fresh system unit,
+  refusing via the existing `competingManagedUnit` guard; non-root → print the
+  EXACT next command (`unit.EnableNowCommand()` for an installed unit, else
+  `sudo citadel service install --system`), never a silent half-enrollment.
+
+`writeGlobalConfig`/`createGlobalConfig` are now **merge-preserving**
+(`writeGlobalConfigFile`, `cmd/manifest.go`): the pre-#1080 clobber wiped the
+`hostname` key `saveHostnameToConfig` writes to the same file (a
+`getSavedHostname` re-run-stability regression).
+
 ### macOS launchd node service + Homebrew-aware updates (citadel-cli#1043)
 
 `citadel init` installs and starts the node worker as a managed launchd service
 on macOS so a fresh install leaves a running, self-updating service that
 survives reboot/login. On Linux the equivalent unit ships via install.sh
-(`citadel-worker.service`); macOS previously had a launchd `service.Manager`
-that **no installer ever called**.
+(`citadel-worker.service`) and `citadel init` itself now enables/starts it (see
+the citadel-cli#1080 section above); macOS previously had a launchd
+`service.Manager` that **no installer ever called**.
 
 **`cmd/init_service.go:maybeInstallDarwinNodeService` owns the WHEN and WHICH
 FORM.** It is a top-of-`Run` defer (`cmd/init.go`), so it fires on every

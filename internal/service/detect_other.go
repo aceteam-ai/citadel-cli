@@ -27,9 +27,24 @@ func (u ManagedUnit) Restart() error {
 	return fmt.Errorf("systemd unit restart is not supported on this platform; use `citadel service stop && citadel service start` instead")
 }
 
+func (u ManagedUnit) EnableNowCommand() string {
+	return "citadel service install"
+}
+
+func (u ManagedUnit) EnableNow() error {
+	return fmt.Errorf("systemd unit enable is not supported on this platform; use `citadel service install` instead")
+}
+
 // ActiveManagedUnit is a no-op on non-Linux platforms (systemd-unit-specific
 // scanning). It always reports "not found" so callers fall back to the
 // cross-platform service.Manager.Status() check.
 func ActiveManagedUnit() (ManagedUnit, bool) {
+	return ManagedUnit{}, false
+}
+
+// InstalledManagedUnit is a no-op on non-Linux platforms (systemd-unit-specific
+// scanning). It always reports "not found"; the darwin worker-setup path
+// (maybeInstallDarwinNodeService) goes through service.Manager directly.
+func InstalledManagedUnit() (ManagedUnit, bool) {
 	return ManagedUnit{}, false
 }

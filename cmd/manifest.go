@@ -341,17 +341,43 @@ func writeManifest(path string, manifest *CitadelManifest) error {
 	return nil
 }
 
-// writeGlobalConfig creates the global config file pointing to the node's config directory.
+// writeGlobalConfig sets the node_config_dir pointer in the global config file,
+// PRESERVING any other keys already present (hostname/original_hostname written
+// by saveHostnameToConfig, a legacy aceteam_api_key). It previously clobbered
+// the whole file with just node_config_dir, which silently wiped the hostname
+// and broke getSavedHostname re-run stability once init/login started writing
+// both (citadel-cli#1080).
 func writeGlobalConfig(nodeConfigDir string) error {
-	globalConfigDir := platform.ConfigDir()
-	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
+	return writeGlobalConfigFile(filepath.Join(platform.ConfigDir(), "config.yaml"), nodeConfigDir)
+}
 
+// writeGlobalConfigFile is the pure, path-parameterized core of
+// writeGlobalConfig (and createGlobalConfig), split out so a test can point it
+// at a temp file instead of platform.ConfigDir() -- mirroring
+// clearDeviceFieldsPreservingNodeConfigDir. It merges node_config_dir into any
+// existing config map rather than overwriting the file.
+func writeGlobalConfigFile(globalConfigFile, nodeConfigDir string) error {
+	globalConfigDir := filepath.Dir(globalConfigFile)
 	if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
 		return fmt.Errorf("failed to create global config directory %s: %w", globalConfigDir, err)
 	}
 
-	configContent := fmt.Sprintf("node_config_dir: %s\n", nodeConfigDir)
-	if err := os.WriteFile(globalConfigFile, []byte(configContent), 0600); err != nil {
+	var config map[string]interface{}
+	if data, err := os.ReadFile(globalConfigFile); err == nil {
+		if unmarshalErr := yaml.Unmarshal(data, &config); unmarshalErr != nil {
+			config = nil
+		}
+	}
+	if config == nil {
+		config = make(map[string]interface{})
+	}
+	config["node_config_dir"] = nodeConfigDir
+
+	newData, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal global config: %w", err)
+	}
+	if err := os.WriteFile(globalConfigFile, newData, 0600); err != nil {
 		return fmt.Errorf("failed to write global config file %s: %w", globalConfigFile, err)
 	}
 	return nil
