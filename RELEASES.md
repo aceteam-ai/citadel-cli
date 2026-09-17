@@ -2535,3 +2535,22 @@ Auto-generated log of every release.
   - feat(transcribe): model selection + denoise + no-speech guard (#1058)
 
 
+---
+
+## v2.162.0 — 2026-09-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 74 |
+| Lines added | +2511 |
+
+**Changes:**
+
+  - chore(bind): #1060 loopback sweep for extraction/diffusers/transcribe/lmstudio + wire two secondary start paths (#1075)
+  - fix(services): retire lmstudio — its pinned image is unpullable on every OS (#1073)
+  - feat: preserve verified mesh identity + mesh-only transport for cache-transfer delegation (#1068) (#1074)
+  - fix(macos): heal stale nvidia-reserving embedded compose on darwin (#1069) (#1072)
+  - feat: forward response_format + think to ollama in the LLM inference worker (aceteam#9817 S2) (#1071)
+
+
