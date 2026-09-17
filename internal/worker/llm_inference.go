@@ -1173,6 +1173,34 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 		}
 	}
 
+	// Structured output + thinking toggle (aceteam-ai/aceteam#9817 S4b), the
+	// vLLM/OpenAI-compat complement of the ollama S2 block in executeOllamaChat.
+	// This function is shared across vllm/llamacpp/bonsai/unlimited-ocr, exactly
+	// as #603 already forwards tools/tool_choice through it. Both fields are
+	// additive: an absent field leaves the outbound body byte-identical to the
+	// pre-S4b request (pinned by
+	// TestLLMInferenceHandler_ChatCompletionsFormatAndThinkByteIdenticalWithout).
+	//
+	// response_format is forwarded VERBATIM -- deliberately NOT translated the way
+	// ollama needs (ollamaFormatFromResponseFormat reshapes it into ollama's
+	// `format`), and NOT rewritten to vLLM's older `guided_json`. vLLM v0.12+
+	// normalizes the OpenAI `response_format: {type: json_schema, ...}` object
+	// natively and the request body is extra=allow, so the raw JSON passes through
+	// unchanged. Do not "unify" this with the ollama path. hasJSONValue (not a
+	// bare len()) gates presence for the same reason as tools above: the literal
+	// JSON `null` is 4 bytes (citadel-cli#933).
+	if hasJSONValue(payload.ResponseFormat) {
+		reqPayload["response_format"] = payload.ResponseFormat
+	}
+	// think -> vLLM chat_template_kwargs.enable_thinking (NOT ollama's top-level
+	// `think` boolean). Tri-state: only set when the payload set it (nil = absent).
+	// We forward false as well as true -- a structured/deterministic call sends
+	// enable_thinking:false to suppress a reasoning model's <think> block; engines
+	// whose chat template doesn't read the kwarg simply ignore it (extra=allow).
+	if payload.Think != nil {
+		reqPayload["chat_template_kwargs"] = map[string]any{"enable_thinking": *payload.Think}
+	}
+
 	resp, err := h.postJSON(ctx, baseURL+"/v1/chat/completions", reqPayload)
 	if err != nil {
 		return h.engineRequestFailure(payload, err, "failed to connect to chat endpoint"), nil

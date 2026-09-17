@@ -1199,6 +1199,213 @@ func TestLLMInferenceHandler_ToolsRequestByteIdenticalWithExplicitNullTools(t *t
 	}
 }
 
+// TestLLMInferenceHandler_ChatCompletionsFormatAndThinkByteIdenticalWithout is
+// the S4b (aceteam-ai/aceteam#9817) analogue of the ollama S2 byte-identical
+// test, for the shared OpenAI-compat chat path (executeChatCompletionsAt,
+// vllm/llamacpp/bonsai/unlimited-ocr): a request that sets neither
+// response_format nor think must gain NO "response_format" and NO
+// "chat_template_kwargs" key on the outbound /v1/chat/completions body. The
+// "explicit null" subcase carries a LITERAL `"response_format": null` (which
+// parseLLMInferencePayload lands as the 4-byte `null` json.RawMessage), so it
+// is the assertion that fails if a future edit swaps hasJSONValue for a bare
+// len() check (citadel-cli#933).
+func TestLLMInferenceHandler_ChatCompletionsFormatAndThinkByteIdenticalWithout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{
+			name: "no fields",
+			payload: map[string]any{
+				"model":    "m",
+				"backend":  "vllm",
+				"messages": []map[string]any{{"role": "user", "content": "hi"}},
+			},
+		},
+		{
+			name: "explicit null response_format",
+			payload: map[string]any{
+				"model":           "m",
+				"backend":         "vllm",
+				"messages":        []map[string]any{{"role": "user", "content": "hi"}},
+				"response_format": nil,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["vllm"] = ts.URL
+
+			job := &Job{
+				ID:      "job-vllm-no-format-think",
+				Type:    JobTypeLLMInference,
+				Payload: tc.payload,
+			}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+			if _, present := gotReq["response_format"]; present {
+				t.Errorf("outbound request = %+v, want no \"response_format\" key", gotReq)
+			}
+			if _, present := gotReq["chat_template_kwargs"]; present {
+				t.Errorf("outbound request = %+v, want no \"chat_template_kwargs\" key", gotReq)
+			}
+		})
+	}
+}
+
+// TestLLMInferenceHandler_ChatCompletionsResponseFormatForwardedVerbatim
+// asserts that an OpenAI-shaped response_format reaches vLLM's outbound
+// /v1/chat/completions body VERBATIM -- the full wrapper (type: json_schema
+// AND the json_schema object) intact, NOT reshaped to ollama's inner-schema
+// `format` and NOT rewritten to vLLM's older `guided_json`. The json_schema
+// wrapper-present assertion is the deliberate inverse of the ollama test's
+// "no json_schema key" assertion, pinning that the ollama translation was not
+// copied onto this path.
+func TestLLMInferenceHandler_ChatCompletionsResponseFormatForwardedVerbatim(t *testing.T) {
+	var gotReq map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveReadinessProbe(w, r) {
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"years_of_experience\":0}"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	h := NewLLMInferenceHandler()
+	h.baseURLs["vllm"] = ts.URL
+
+	job := &Job{
+		ID:   "job-vllm-response-format-verbatim",
+		Type: JobTypeLLMInference,
+		Payload: map[string]any{
+			"model":   "m",
+			"backend": "vllm",
+			"response_format": map[string]any{
+				"type": "json_schema",
+				"json_schema": map[string]any{
+					"name": "resume",
+					"schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"years_of_experience": map[string]any{"type": "number"},
+						},
+						"required": []any{"years_of_experience"},
+					},
+					"strict": true,
+				},
+			},
+			"messages": []map[string]any{{"role": "user", "content": "extract"}},
+		},
+	}
+	result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	rf, ok := gotReq["response_format"].(map[string]any)
+	if !ok {
+		t.Fatalf("outbound response_format = %#v (%T), want the OpenAI response_format object", gotReq["response_format"], gotReq["response_format"])
+	}
+	if rf["type"] != "json_schema" {
+		t.Errorf("response_format.type = %v, want json_schema (verbatim)", rf["type"])
+	}
+	// The full OpenAI wrapper must survive -- the inverse of the ollama path,
+	// which strips down to json_schema.schema.
+	js, ok := rf["json_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("response_format.json_schema = %#v, want the wrapper object present (verbatim, not reshaped to the inner schema)", rf["json_schema"])
+	}
+	if js["name"] != "resume" {
+		t.Errorf("response_format.json_schema.name = %v, want resume", js["name"])
+	}
+	// vLLM's OWN older shorthand must never be synthesized here.
+	if _, present := gotReq["guided_json"]; present {
+		t.Errorf("outbound request = %+v, want no \"guided_json\" key (response_format is forwarded verbatim, not translated)", gotReq)
+	}
+	// The ollama-shaped `format` key must never appear on the OpenAI path.
+	if _, present := gotReq["format"]; present {
+		t.Errorf("outbound request = %+v, want no \"format\" key (that is the ollama translation)", gotReq)
+	}
+}
+
+// TestLLMInferenceHandler_ChatCompletionsThinkForwarded asserts the tri-state
+// think toggle on the vLLM/OpenAI-compat path: a payload think:true or
+// think:false both set chat_template_kwargs.enable_thinking to that bool
+// (false must still forward -- a deterministic call relies on it to suppress a
+// reasoning model's <think> block). The no-top-level-"think"-key assertion pins
+// that the ollama block's `reqPayload["think"]` line was not copy-pasted here.
+func TestLLMInferenceHandler_ChatCompletionsThinkForwarded(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		want := want
+		t.Run(fmt.Sprintf("think=%v", want), func(t *testing.T) {
+			var gotReq map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				_ = json.NewDecoder(r.Body).Decode(&gotReq)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+			}))
+			defer ts.Close()
+
+			h := NewLLMInferenceHandler()
+			h.baseURLs["vllm"] = ts.URL
+
+			job := &Job{
+				ID:   "job-vllm-think",
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model":    "m",
+					"backend":  "vllm",
+					"think":    want,
+					"messages": []map[string]any{{"role": "user", "content": "hi"}},
+				},
+			}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result = %+v, want success", result)
+			}
+			ctk, ok := gotReq["chat_template_kwargs"].(map[string]any)
+			if !ok {
+				t.Fatalf("outbound chat_template_kwargs = %#v (%T), want a map (tri-state: false must still forward)", gotReq["chat_template_kwargs"], gotReq["chat_template_kwargs"])
+			}
+			et, present := ctk["enable_thinking"]
+			if !present {
+				t.Fatalf("chat_template_kwargs = %+v, want an \"enable_thinking\" key", ctk)
+			}
+			if gotBool, _ := et.(bool); gotBool != want {
+				t.Errorf("chat_template_kwargs.enable_thinking = %v, want %v", et, want)
+			}
+			// vLLM uses chat_template_kwargs.enable_thinking, NOT ollama's
+			// top-level `think` boolean.
+			if _, present := gotReq["think"]; present {
+				t.Errorf("outbound request = %+v, want no top-level \"think\" key (that is the ollama shape)", gotReq)
+			}
+		})
+	}
+}
+
 // TestLLMInferenceHandler_BufferedToolCallsResponse asserts that a buffered
 // (non-streaming) engine response carrying message.tool_calls surfaces them
 // on JobResult.Output, with finish_reason forwarded as "tool_calls" and no
