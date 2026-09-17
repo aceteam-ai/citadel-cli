@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	citadelconfig "github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/services"
 	"gopkg.in/yaml.v3"
 )
 
@@ -162,6 +163,111 @@ services:
 	// change to the field type silently produces a DeepEqual-but-omitted encode.
 	if !strings.Contains(string(data), "pinned_services:") {
 		t.Fatalf("round-tripped manifest is missing the pinned_services key entirely:\n%s", data)
+	}
+}
+
+// TestUpdateManifest_PreservesServiceBind pins the aceteam-ai/citadel-cli#1060
+// half of the same field-drop failure mode as PinnedServices above: the
+// per-service `bind:` escape hatch (#1023) must round-trip through
+// APPLY_DEVICE_CONFIG. Before ManifestService gained a Bind field, an operator's
+// `bind: all` opt-in was silently DROPPED on every device-config save, dropping
+// the engine back to the compose loopback default.
+func TestUpdateManifest_PreservesServiceBind(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "citadel.yaml")
+
+	initial := `node:
+  name: existing-node
+  tags: [gpu]
+services:
+  - name: vllm
+    compose_file: ./services/vllm.yml
+    bind: all
+`
+	if err := os.WriteFile(manifestPath, []byte(initial), 0600); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	h := NewConfigHandler(dir)
+	// A device config that does not mention services at all -- the normal
+	// onboarding-wizard shape -- must leave the existing bind: opt-in untouched.
+	config := &DeviceConfig{DeviceName: "existing-node"}
+	if err := h.updateManifest(dir, config); err != nil {
+		t.Fatalf("updateManifest: %v", err)
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+
+	var got CitadelManifest
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal round-tripped manifest: %v", err)
+	}
+	var bind string
+	for _, s := range got.Services {
+		if s.Name == "vllm" {
+			bind = s.Bind
+		}
+	}
+	if bind != "all" {
+		t.Fatalf("service bind did not survive the APPLY_DEVICE_CONFIG round-trip: got %q, want %q", bind, "all")
+	}
+	if !strings.Contains(string(data), "bind: all") {
+		t.Fatalf("round-tripped manifest is missing the bind: all key entirely:\n%s", data)
+	}
+}
+
+// TestManifestServiceBindFromFile pins the shared best-effort helper the two
+// secondary embedded-engine start paths (llamacpp_inference.go's model-swap
+// restart, config_handler.go's APPLY_DEVICE_CONFIG compose-up) use to thread an
+// operator's #1023 bind opt-in into CITADEL_<SVC>_BIND, plus the bindEnvForService
+// flattening. A "" bind / missing service / unreadable file must fall through to
+// nothing injected (the compose ${...:-127.0.0.1} loopback default then wins).
+func TestManifestServiceBindFromFile(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "citadel.yaml")
+	manifest := `node:
+  name: n
+services:
+  - name: vllm
+    compose_file: ./services/vllm.yml
+    bind: all
+  - name: llamacpp
+    compose_file: ./services/llamacpp.yml
+`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	if got := manifestServiceBindFromFile(manifestPath, "vllm"); got != "all" {
+		t.Errorf("bind for vllm = %q, want %q", got, "all")
+	}
+	if got := manifestServiceBindFromFile(manifestPath, "llamacpp"); got != "" {
+		t.Errorf("bind for llamacpp (unset) = %q, want \"\"", got)
+	}
+	if got := manifestServiceBindFromFile(manifestPath, "absent"); got != "" {
+		t.Errorf("bind for absent service = %q, want \"\"", got)
+	}
+	if got := manifestServiceBindFromFile(filepath.Join(dir, "nope.yaml"), "vllm"); got != "" {
+		t.Errorf("bind from missing file = %q, want \"\"", got)
+	}
+
+	// bindEnvForService: set -> the injected entry; unset -> nil; unrecognized
+	// (typo) -> nil (best-effort: compose default wins, not a start failure);
+	// non-hatch service -> nil.
+	if got := bindEnvForService("vllm", "all"); len(got) != 1 || got[0] != services.EnvVLLMBind+"=0.0.0.0" {
+		t.Errorf("bindEnvForService(vllm, all) = %v, want [%s=0.0.0.0]", got, services.EnvVLLMBind)
+	}
+	if got := bindEnvForService("vllm", ""); got != nil {
+		t.Errorf("bindEnvForService(vllm, \"\") = %v, want nil", got)
+	}
+	if got := bindEnvForService("vllm", "bogus"); got != nil {
+		t.Errorf("bindEnvForService(vllm, bogus) = %v, want nil (best-effort skip)", got)
+	}
+	if got := bindEnvForService("kokoro", "all"); got != nil {
+		t.Errorf("bindEnvForService(kokoro, all) = %v, want nil (no hatch)", got)
 	}
 }
 

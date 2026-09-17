@@ -62,8 +62,18 @@ func (h *LlamaCppInferenceHandler) Execute(ctx JobContext, job *nexus.Job) ([]by
 	restartCmd := rt.ComposeCommand("-f", composeFile, "up", "-d", "--force-recreate")
 	restartCmd.Env = append(os.Environ(), fmt.Sprintf("LLAMACPP_COMMAND=%s", newCommand))
 	// Supply the citadel-owned host port so the compose ports line
-	// (127.0.0.1:${CITADEL_LLAMACPP_HOST_PORT}:8080) resolves.
+	// (${CITADEL_LLAMACPP_BIND:-127.0.0.1}:${CITADEL_LLAMACPP_HOST_PORT}:8080)
+	// resolves.
 	restartCmd.Env = append(restartCmd.Env, services.HostPortEnv()...)
+	// Honor an operator's aceteam-ai/citadel-cli#1023 `bind:` opt-in here too
+	// (this force-recreate path does not go through ServiceHandler.serviceStart,
+	// the primary bind-injection site). Best-effort: without it the compose
+	// ${CITADEL_LLAMACPP_BIND:-127.0.0.1} default keeps this loopback-only, so a
+	// bind unset / unreadable manifest simply falls through to loopback. The
+	// manifest is the sibling of the compose file's ~/citadel-node dir.
+	manifestPath := filepath.Join(homeDir, "citadel-node/citadel.yaml")
+	restartCmd.Env = append(restartCmd.Env,
+		bindEnvForService("llamacpp", manifestServiceBindFromFile(manifestPath, "llamacpp"))...)
 
 	if output, err := restartCmd.CombinedOutput(); err != nil {
 		return output, fmt.Errorf("failed to restart llama.cpp service with new model: %w", err)

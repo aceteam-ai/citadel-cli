@@ -56,9 +56,12 @@ func composeEnv() []string {
 //     (rootless podman preferred over docker, #348) and drives the invocation
 //     through rt.Bin + rt.ComposeArgs(...), never a hardcoded "docker".
 //  2. The citadel-owned host-port env (composeEnv -> services.HostPortEnv), so
-//     compose templates that defer their host publish to the guarded
-//     ${CITADEL_*_HOST_PORT:?...} form (llamacpp/vllm/extraction/diffusers, #410)
-//     resolve instead of dying on the :? guard.
+//     compose templates that defer their host publish to a ${CITADEL_*_HOST_PORT}
+//     token (llamacpp/vllm/extraction/diffusers, #410; the bare bind-hatch form
+//     since #1023/#1060) resolve instead of an empty/broken host port. vllm's
+//     guard was dropped for the two-substitution bind hatch (#1023); the same for
+//     extraction/diffusers (#1060). citadel ALWAYS injects the var, so the bare
+//     token is safe.
 //
 // Callers pass their compose args verbatim (e.g. "-f", path, "restart" or
 // "-f", path, "ps", "--format", "json") and invoke

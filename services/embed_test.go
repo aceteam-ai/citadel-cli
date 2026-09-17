@@ -343,6 +343,11 @@ var bindHatchEngineHostPorts = map[string]struct {
 	"llamacpp":      {EnvLlamacppBind, "${" + EnvLlamacppHostPort + "}"},
 	"bonsai":        {EnvBonsaiBind, "${" + EnvBonsaiHostPort + "}"},
 	"unlimited-ocr": {EnvUnlimitedOCRBind, "${" + EnvUnlimitedOCRHostPort + "}"},
+	// aceteam-ai/citadel-cli#1060 sweep: extraction/diffusers joined the hatch
+	// with the same bare ${...HOST_PORT} token form (their :? guards were
+	// dropped to mirror #1023's vllm/llamacpp exactly).
+	"extraction": {EnvExtractionBind, "${" + EnvExtractionHostPort + "}"},
+	"diffusers":  {EnvDiffusersBind, "${" + EnvDiffusersHostPort + "}"},
 }
 
 // literalLoopbackEngineHostPorts maps each engine ServiceMap entry hardcoded to
@@ -408,17 +413,43 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 		})
 	}
 
-	// sglang: bind hatch behind a literal host port (no ${...HOST_PORT} var).
-	sglang, ok := ServiceMap["sglang"]
-	if !ok {
-		t.Fatal("sglang not found in ServiceMap")
+	// Literal-host-port hatch engines: bind hatch behind a LITERAL host port (no
+	// ${...HOST_PORT} var). sglang (30000) plus the aceteam-ai/citadel-cli#1060
+	// sweep of transcribe (8101) and lmstudio (1234).
+	for name, spec := range bindHatchLiteralHostPortEngines {
+		t.Run(name, func(t *testing.T) {
+			content, ok := ServiceMap[name]
+			if !ok {
+				t.Fatalf("%q not found in ServiceMap", name)
+			}
+			want := "${" + spec.bindVar + ":-127.0.0.1}:" + spec.hostPort + ":" + spec.hostPort
+			if !strings.Contains(content, want) {
+				t.Errorf("%q compose must publish via the #1023 bind hatch (%q); got:\n%s", name, want, content)
+			}
+			if got, ok := BindEnvVarName(name); !ok || got != spec.bindVar {
+				t.Errorf("BindEnvVarName(%q) = (%q,%v), want (%q,true)", name, got, ok, spec.bindVar)
+			}
+			if lb, has := ComposePublishesLoopbackOnly(content, nil); !lb || !has {
+				t.Errorf("%q default bind must be loopback-only; got (loopbackOnly=%v,hasPublish=%v)", name, lb, has)
+			}
+			if lb, _ := ComposePublishesLoopbackOnly(content, map[string]string{spec.bindVar: AllInterfacesBindAddr}); lb {
+				t.Errorf("%q with %s=0.0.0.0 must NOT be loopback-only", name, spec.bindVar)
+			}
+		})
 	}
-	if !strings.Contains(sglang, "${"+EnvSGLangBind+":-127.0.0.1}:30000:30000") {
-		t.Errorf("sglang compose must publish via the #1023 bind hatch (${%s:-127.0.0.1}:30000:30000); got:\n%s", EnvSGLangBind, sglang)
-	}
-	if lb, has := ComposePublishesLoopbackOnly(sglang, nil); !lb || !has {
-		t.Errorf("sglang default bind must be loopback-only; got (loopbackOnly=%v,hasPublish=%v)", lb, has)
-	}
+}
+
+// bindHatchLiteralHostPortEngines maps each engine ServiceMap entry that carries
+// the aceteam-ai/citadel-cli#1023 bind hatch behind a LITERAL host port (no
+// ${...HOST_PORT} var) to (its bind env var, its literal host port). The compose
+// publish is ${CITADEL_<SVC>_BIND:-127.0.0.1}:<port>:<port>.
+var bindHatchLiteralHostPortEngines = map[string]struct {
+	bindVar  string
+	hostPort string
+}{
+	"sglang":     {EnvSGLangBind, "30000"},
+	"transcribe": {EnvTranscribeBind, "8101"},
+	"lmstudio":   {EnvLMStudioBind, "1234"},
 }
 
 // nonLoopbackServiceMapAllowlist documents every services.ServiceMap entry
@@ -442,14 +473,9 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 		"the host via host.docker.internal lands on the docker0 bridge gateway, not 127.0.0.1, so a " +
 		"loopback-only default would break that consumer. An operator can tighten it with " +
 		"`bind: loopback` (CITADEL_OLLAMA_BIND=127.0.0.1); doctor/status flag the default as LAN-exposed.",
-	"extraction": "out of scope for aceteam-ai/aceteam#9523 (issue named vllm/sglang/llamacpp/bonsai/" +
-		"unlimited-ocr/ollama only); same 0.0.0.0-with-no-auth shape, tracked as a broader-sweep " +
-		"candidate in aceteam-ai/citadel-cli#1023.",
-	"diffusers": "out of scope for aceteam-ai/aceteam#9523; same shape, tracked in aceteam-ai/citadel-cli#1023.",
-	"transcribe": "out of scope for aceteam-ai/aceteam#9523; fixed native port (8101), not a citadel-" +
-		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
-	"lmstudio": "out of scope for aceteam-ai/aceteam#9523; fixed native port (1234), not a citadel-" +
-		"injected host-port var. Tracked in aceteam-ai/citadel-cli#1023.",
+	// extraction/diffusers/transcribe/lmstudio moved to a loopback default in the
+	// aceteam-ai/citadel-cli#1060 sweep (bind hatch), so they are no longer
+	// non-loopback and hit the loopbackOnly early-return in TestServiceMapBindSweep.
 	"tei": "already loopback-bound (127.0.0.1:8102:80), not an oversight, just not matched by the " +
 		"exact-token check below since it has no citadel-injected host-port var either.",
 }

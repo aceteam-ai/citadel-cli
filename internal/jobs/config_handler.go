@@ -484,6 +484,14 @@ type ManifestService struct {
 	DesiredStatus      string `yaml:"desired_status,omitempty"`
 	EvictedByJob       string `yaml:"evicted_by_job,omitempty"`
 	EvictedPriorStatus string `yaml:"evicted_prior_status,omitempty"`
+	// Bind is the aceteam-ai/citadel-cli#1023 per-service host-bind escape hatch
+	// ("all"/"loopback"), mirroring cmd/manifest.go Service.Bind. It MUST be
+	// modeled here for the same #528/#850 reason as DesiredStatus above:
+	// updateManifest round-trips the whole citadel.yaml through this struct, so a
+	// field missing here is silently DROPPED on every APPLY_DEVICE_CONFIG -- an
+	// operator's `bind: all` opt-in would vanish on the next dashboard config
+	// save (aceteam-ai/citadel-cli#1060).
+	Bind string `yaml:"bind,omitempty"`
 }
 
 // ManifestConfig represents additional configuration in the manifest.
@@ -653,6 +661,14 @@ func (h *ConfigHandler) startServices(configDir string, serviceNames []string) e
 		// compose files that defer their host publish to ${CITADEL_*_HOST_PORT}
 		// (llamacpp/vllm/extraction) resolve.
 		env := append(os.Environ(), services.HostPortEnv()...)
+		// Honor an operator's aceteam-ai/citadel-cli#1023 `bind:` opt-in here too
+		// (this APPLY_DEVICE_CONFIG compose-up does not route through
+		// ServiceHandler.serviceStart, the primary bind-injection site). Best-effort
+		// per-service: without it the compose ${CITADEL_<SVC>_BIND:-127.0.0.1}
+		// default keeps the engine loopback-only, so a bind unset / unreadable
+		// manifest simply falls through to loopback (aceteam-ai/citadel-cli#1060).
+		manifestPath := filepath.Join(configDir, "citadel.yaml")
+		env = append(env, bindEnvForService(svcName, manifestServiceBindFromFile(manifestPath, svcName))...)
 		// PUID/PGID = this node process's uid/gid, so the meeting media stack runs
 		// as the node owner and writes node-owned files into bind-mounted dirs
 		// (see composeEnv in service_handler.go). Guarded so a non-POSIX host never

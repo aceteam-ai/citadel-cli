@@ -188,10 +188,24 @@ func TestEngineBindDriftRequiresRecreate(t *testing.T) {
 			want:     false,
 		},
 		{
-			name:     "ServiceMap engine outside the #1025 set is left alone",
+			// aceteam-ai/citadel-cli#1060 extended the drift set to
+			// extraction/diffusers/transcribe/lmstudio: a running 0.0.0.0
+			// container of one of these (from a pre-#1060 binary) is now recreated.
+			name:     "extraction (added in #1060) on 0.0.0.0 recreates",
 			service:  "extraction",
 			content:  services.ServiceMap["extraction"],
-			bindings: []hostBinding{{HostIP: "0.0.0.0", HostPort: 8100}},
+			bindings: []hostBinding{{HostIP: "0.0.0.0", HostPort: 8202}},
+			want:     true,
+		},
+		{
+			// ollama is a ServiceMap engine with the bind hatch but deliberately
+			// NOT in loopbackDriftEngines: its default IS all-interfaces
+			// (host.docker.internal catalog consumer), so a 0.0.0.0 binding is
+			// expected, never drift to recreate.
+			name:     "ollama (deliberately outside the drift set) is left alone",
+			service:  "ollama",
+			content:  services.ServiceMap["ollama"],
+			bindings: []hostBinding{{HostIP: "0.0.0.0", HostPort: 11434}},
 			want:     false,
 		},
 		{

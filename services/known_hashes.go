@@ -69,6 +69,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 	"lmstudio": {
 		"01a478e9a65d0e895830a1dda476874a9d22c416aa73f48cb46f3ceda3f74d20": true,
 		"cd7b791871ae4cd2b9a8a90803aeb630d5a7282445c20e69928d1defbf412946": true,
+		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_LMSTUDIO_BIND:-127.0.0.1}).
+		"0b37ffdae49f7a027247b913671be6b6b29f87bafbf0eef47b8d80b2a822ea36": true,
 	},
 	"sglang": {
 		"2531d9e78484785543f196082ce38e46ef21dd1d6cd380b69665c331bc21acfb": true,
@@ -82,6 +84,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		"3f7f02536458773d7f8b22da3e7d4213b943db47c457ce669d9270ff2e0a7260": true,
 		"62e82d9afdd1fb109942a71d6f33f9289af21e9391091f5f33103423ee4f854c": true,
 		"9f826faa089bf5cba91c9437c1d9feb9e376332f15cdd6fb21539e80ebf3d45e": true,
+		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_EXTRACTION_BIND:-127.0.0.1}).
+		"5f3ffcbf8256d40c5abfa26302a09b2618593edca5a4380ab03b17c8420d13e7": true,
 	},
 	"transcribe": {
 		"26407f6fde85b0f6af362b25e23b1b3be3342ecc4f47ac38ee43abf96bd719ee": true,
@@ -90,6 +94,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// model loading); WHISPER_MODEL stays the fallback default. Comment-only
 		// change to the template.
 		"8afe0d514760ab96a5289f1b56de278e7d57af761de716aeb76e1d41c29ebdbf": true,
+		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_TRANSCRIBE_BIND:-127.0.0.1}).
+		"6e6ac50fcc5b911e08931759f0e4a0f5b622b66c5d034e065adb6461e2b9daa7": true,
 	},
 	"diffusers": {
 		"3f2059400959adcc0f55ea8134cb492530ca65d4faf51778a68f35d0d5d9c93a": true,
@@ -99,6 +105,8 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// citadel #958: adds the DIFFUSERS_VIDEO_MODEL passthrough env var
 		// (text-to-video, Wan2.1) alongside the existing DIFFUSERS_MODEL one.
 		"91649ba0dc4f9817c05782ea90066f601f8ba0b1d86584cb03dcd6ed7ea7fbcc": true,
+		// aceteam-ai/citadel-cli#1060: bind hatch (${CITADEL_DIFFUSERS_BIND:-127.0.0.1}).
+		"55a62093c8cfdb8fd0165cf4ad35d34fa1a916c673927abfa737a8a9298528d0": true,
 	},
 	"bonsai": {
 		"124af757f45e93b689bc6a59f08187d48f59c0e62eb2d10c6a006c8ac4d24609": true,
