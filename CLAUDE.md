@@ -37,7 +37,7 @@ Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It 
 - **Citadel**: The CLI agent that runs on user hardware
 - **Nexus**: The cloud coordination server (nexus.aceteam.ai) that manages the distributed compute network
 - **Node**: A physical/virtual machine running the Citadel agent
-- **Services**: Dockerized AI inference engines (vLLM, Ollama, llama.cpp, LM Studio)
+- **Services**: Dockerized AI inference engines (vLLM, Ollama, llama.cpp)
 
 **User-Facing Terminology Convention:**
 When writing user-facing content (CLI help text, README, error messages), use these terms:
@@ -293,7 +293,7 @@ type JobHandler interface {
 ```
 Handlers in `internal/jobs/` implement specific job types (shell commands, model downloads, inference requests). The agent polls Nexus, dispatches to appropriate handler, and reports status back.
 
-**Embedded Services**: Docker Compose files for services are embedded in the binary at `services/compose/*.yml` using Go's `embed` package. The `services.ServiceMap` provides lookup by name (vllm, ollama, llamacpp, lmstudio).
+**Embedded Services**: Docker Compose files for services are embedded in the binary at `services/compose/*.yml` using Go's `embed` package. The `services.ServiceMap` provides lookup by name (vllm, ollama, llamacpp, sglang, bonsai, ...). (lmstudio was retired in citadel-cli#1066: its pinned image `technovangelist/lm-studio:latest` does not exist on Docker Hub — "object not found" — and LM Studio ships no maintained multi-arch headless server image, so the engine was removed from `ServiceMap` entirely rather than left failing at image pull on every OS.)
 
 **Docker Compose Management**: Services are managed through `docker compose` commands. The code uses subprocess calls to docker/docker-compose CLI for container lifecycle.
 
@@ -1009,8 +1009,8 @@ reasoning for the engine compose files' old `0.0.0.0` bind ("peers reach this
 engine directly over the mesh"), which held only on a full-Tailscale/kernel-TUN
 node, not embedded tsnet, and bought unauthenticated LAN reach on every node
 regardless. vllm/llamacpp/bonsai/unlimited-ocr/sglang are now loopback-only
-(`aceteam-ai/aceteam#9523`), as are extraction/diffusers/transcribe/lmstudio
-(the `aceteam-ai/citadel-cli#1060` follow-up sweep — all four are dialed only by
+(`aceteam-ai/aceteam#9523`), as are extraction/diffusers/transcribe
+(the `aceteam-ai/citadel-cli#1060` follow-up sweep — all three are dialed only by
 HOST processes over localhost, so no `host.docker.internal` bridge consumer
 blocks loopback the way it does for ollama); see `TestServiceMapBindSweep` in
 `services/embed_test.go` for the current bind of every `ServiceMap` entry.
@@ -1034,9 +1034,8 @@ through that same authority. `citadel doctor`/`citadel status` warn (never refus
 when an embedded engine will publish on all interfaces
 (`engineBindExposureWarning`, `cmd/service_bind.go`). Which engines carry the
 hatch is `services.serviceBindEnv` (NOT kokoro/omnivoice — co-located-only). The
-`aceteam-ai/citadel-cli#1060` sweep added extraction/diffusers/transcribe/lmstudio
-to the hatch (loopback default); lmstudio's default is inert until #1066 supplies
-a pullable image. `ManifestService.Bind` must be modeled in BOTH
+`aceteam-ai/citadel-cli#1060` sweep added extraction/diffusers/transcribe
+to the hatch (loopback default). `ManifestService.Bind` must be modeled in BOTH
 `cmd/manifest.go` and `internal/jobs/config_handler.go` (the APPLY_DEVICE_CONFIG
 round-trip struct), or a `bind:` opt-in is silently dropped on the next device
 config save (the #528/#850 field-drop failure mode).
@@ -1165,6 +1164,49 @@ WebSocket.
 
 Deliberately out of scope (tracked separately in #1055): the redundancy-DNS
 strategy and the rootless per-app pod runtime.
+
+### Verified mesh identity + mesh-only transport for cache-transfer (`internal/meshtransfer`, citadel-cli#1068, aceteam#8553 S3.0)
+
+The first, identity-only slice of source-local peer-cache delegation. It preserves
+a rename- and IP-reuse-stable device id and owner id through the mesh identity
+paths and provides the client-side transport a later cache-transfer flow (S3.1)
+will use — but adds NO lease, passcode bypass, Redis credential, cache-serving
+change, or HF transfer.
+
+`network.PeerIdentity` / `gateway.MeshPeerIdentity` now also carry `StableID`
+(tailcfg.StableNodeID) and `OwnerID` (tailcfg.UserID string). `NetworkServer.WhoIs`
+populates them from the WhoIs response the coordination server vouches; the cmd
+adapter (`gatewayMeshResolver`) threads them. They are ADDITIVE: `SameOwner` /
+`LoginName` are still the gate for org exposures and the #1013 cache-serving gate,
+unchanged. `NodeName`/`LoginName` are display values (change on rename); `StableID`
+/`OwnerID` are the trust keys, and EMPTY means unverified.
+
+`internal/meshtransfer` is a stdlib-only leaf (injected `PeerResolver` +
+`Dialer`; cmd will wire `network.WhoIsPeer`/`network.Dial` at S3.1's first caller —
+the client-resolver path is a tested seam today, the standalone-by-design pattern
+of `internal/mesh`/`internal/ingress`, not a gap):
+- **`meshtransfer.Verify` is the authority for who a target peer is** — fails
+  closed on a non-mesh address (a non-mesh RemoteAddr never resolves), resolver
+  error/nil, non-same-owner, missing stable/owner id, or a device/owner mismatch.
+  A rename that keeps the SAME `StableID` still verifies (name is never a trust
+  key). Identity comes ONLY from the resolver, never a header (the gateway's
+  `resolvePeer` keys on `RemoteAddr`, so a spoofed `X-Forwarded-For` is ignored).
+- **`VerifiedPeer.Client` is the strict mesh-only transport** — dials ONLY the
+  verified peer's pinned mesh IP (refuses non-mesh IPs, hostnames — so no public
+  DNS — proxies, and redirects), and pins the bootstrapped leaf (rejects any
+  other/unverified cert). Request URLs MUST use the mesh IP literal.
+- **`meshtransfer.BootstrapPeerCert` verifies identity BEFORE dialing**, then
+  captures the peer's self-signed leaf at the TLS handshake to the existing
+  status endpoint. `want.StableID` is REQUIRED here (the cert-pin is the
+  trust-commitment point), which makes "IP reuse fails closed" unconditional at
+  bootstrap; post-bootstrap a different device is also caught by the cert pin.
+  Trust-on-first-use is sound because WhoIs binds the mesh IP to the verified
+  device and embedded tsnet answers only on ports the node itself `ListenVPN`s.
+
+Test gotcha worth an hour: every `httptest.NewTLSServer` presents the SAME
+built-in certificate, so a second test server is NOT a distinct cert — the
+pinned-cert-mismatch test mints its own self-signed leaf
+(`genSelfSignedLeaf`).
 
 ### OpenAI tool calling through `llm_inference` (citadel #603, aceteam #6555)
 
@@ -3634,7 +3676,7 @@ Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal
 Consequence, owned by `services.darwinCapableServices` / `linuxOnlyServices` (`services/embed.go`) plus the build-tagged `services.OllamaCompose`/`LlamacppCompose` embeds (`services/compose_variants_{other,darwin}.go`):
 - CUDA-only engines (vllm, sglang, bonsai, diffusers, unlimited-ocr, omnivoice) are not advertised on darwin.
 - ollama and llamacpp ship a **darwin CPU/arm64 compose variant** (`compose/{ollama,llamacpp}.darwin.yml`) that drops the reservation (and, for llamacpp, uses the native-arm64 `:server` CPU image instead of `:server-cuda`). `TestDarwinComposeVariantsOnlyDropGPU` pins that the variant differs from its linux original by exactly that.
-- lmstudio is dropped from darwin entirely: its pinned image does not exist on Docker Hub, so there is nothing to ship.
+- lmstudio was retired from `ServiceMap` entirely (citadel-cli#1066): its pinned image `technovangelist/lm-studio:latest` does not exist on Docker Hub ("object not found"), so it could never pull on any OS, and LM Studio ships no maintained multi-arch headless *server* image (`linuxserver/lm-studio` is an amd64-only Selkies desktop-GUI container, not a headless OpenAI server). Removed rather than left dead. If a real, pullable server image lands, re-add it.
 - The CPU utility services (transcribe, kokoro, tei, extraction) carry no reservation and stay advertised, but their images are amd64-only, so on Apple Silicon they run under Rosetta/QEMU emulation.
 
 **Unverified pending a real Apple Silicon Mac:** whether ollama/llamacpp actually start end-to-end via the variants, and whether the emulated amd64 utility images start (Rosetta does not translate AVX/AVX2 pre-Sequoia — a common SIGILL source for MKL/PyTorch builds). See the Mac-verification steps in citadel-cli#1048's PR before relying on any of these on macOS.

@@ -415,7 +415,7 @@ func TestEngineComposeFilesLoopbackBound(t *testing.T) {
 
 	// Literal-host-port hatch engines: bind hatch behind a LITERAL host port (no
 	// ${...HOST_PORT} var). sglang (30000) plus the aceteam-ai/citadel-cli#1060
-	// sweep of transcribe (8101) and lmstudio (1234).
+	// sweep of transcribe (8101).
 	for name, spec := range bindHatchLiteralHostPortEngines {
 		t.Run(name, func(t *testing.T) {
 			content, ok := ServiceMap[name]
@@ -449,7 +449,6 @@ var bindHatchLiteralHostPortEngines = map[string]struct {
 }{
 	"sglang":     {EnvSGLangBind, "30000"},
 	"transcribe": {EnvTranscribeBind, "8101"},
-	"lmstudio":   {EnvLMStudioBind, "1234"},
 }
 
 // nonLoopbackServiceMapAllowlist documents every services.ServiceMap entry
@@ -473,7 +472,7 @@ var nonLoopbackServiceMapAllowlist = map[string]string{
 		"the host via host.docker.internal lands on the docker0 bridge gateway, not 127.0.0.1, so a " +
 		"loopback-only default would break that consumer. An operator can tighten it with " +
 		"`bind: loopback` (CITADEL_OLLAMA_BIND=127.0.0.1); doctor/status flag the default as LAN-exposed.",
-	// extraction/diffusers/transcribe/lmstudio moved to a loopback default in the
+	// extraction/diffusers/transcribe moved to a loopback default in the
 	// aceteam-ai/citadel-cli#1060 sweep (bind hatch), so they are no longer
 	// non-loopback and hit the loopbackOnly early-return in TestServiceMapBindSweep.
 	"tei": "already loopback-bound (127.0.0.1:8102:80), not an oversight, just not matched by the " +

@@ -104,7 +104,7 @@ type GCPlan struct {
 // SourceBackfill entries are NOT exempt here (Jason's 2026-08-25 decision,
 // design doc §11 "Backfill evictability" -- see SourceBackfill's doc
 // comment in cacheindex.go): this function applies no source-based
-// exemption at all. A "_store" native aggregate row (lmstudio/tei, no
+// exemption at all. A "_store" native aggregate row (tei, no
 // per-model tracking -- see scanNativeDir's doc comment) is never a
 // candidate; it is silently skipped before the exemption counters below,
 // since it was never a real "found and exempted" case, just structurally

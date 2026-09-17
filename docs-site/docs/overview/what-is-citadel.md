@@ -69,7 +69,7 @@ block-beta
   style infra fill:#E67E22,color:#fff
 ```
 
-**Your Infrastructure** is the bottom layer -- the physical or virtual machines you control. Citadel runs here as a lightweight agent alongside your AI inference engines (vLLM, Ollama, llama.cpp, or LM Studio).
+**Your Infrastructure** is the bottom layer -- the physical or virtual machines you control. Citadel runs here as a lightweight agent alongside your AI inference engines (vLLM, Ollama, or llama.cpp).
 
 **AceTeam Network** provides encrypted connectivity between your nodes and the platform. No VPN appliances, no firewall rules, no port forwarding. Nodes behind NAT, corporate firewalls, or on residential connections all work seamlessly.
 

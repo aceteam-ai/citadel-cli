@@ -52,7 +52,7 @@ func TestRunningEmbeddedServices_RuntimeFailureIsEmpty(t *testing.T) {
 // TestCollectRunningEmbeddedServices_CoversEveryEmbeddedEngine is the
 // regression the issue asks for by name: EVERY embedded-compose engine must be
 // reportable, not just the six that happen to have a probe. Before #7148,
-// kokoro/transcribe/diffusers/extraction/sglang/lmstudio had no path into the
+// kokoro/transcribe/diffusers/extraction/sglang had no path into the
 // heartbeat at all.
 func TestCollectRunningEmbeddedServices_CoversEveryEmbeddedEngine(t *testing.T) {
 	for name := range services.ServiceMap {

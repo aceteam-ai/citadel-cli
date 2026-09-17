@@ -76,10 +76,8 @@ const (
 // internal/worker/llm_inference.go.
 //
 // The zero value ("") is deliberate, not an oversight: it marks an engine
-// this concept does not apply to (tei/diffusers are not chat-completions
-// engines; lmstudio has no dispatch path anywhere in the codebase today --
-// design doc §2's coverage table calls it "unclear/likely OpenAIChat" and
-// leaves it an open question, §6 Q2). Assigning it a real dialect here would
+// this concept does not apply to (tei/diffusers/extraction/transcribe/kokoro
+// are not chat-completions engines). Assigning one a real dialect here would
 // be inventing a fact this slice's "translation only" policy forbids.
 type RequestDialect string
 
@@ -129,7 +127,7 @@ type EngineSpec struct {
 	HostPort int
 	// HostPortEnvVar is the compose env-var name that carries HostPort, when
 	// citadel injects it via ${CITADEL_*_HOST_PORT} substitution (empty for
-	// engines with a fixed/native port, e.g. ollama, sglang, lmstudio, tei,
+	// engines with a fixed/native port, e.g. ollama, sglang, tei,
 	// transcribe -- see services/ports.go's HostPortEnvVarName).
 	HostPortEnvVar string
 	// CacheDir is the subdirectory of ~/citadel-cache this engine's weights
@@ -195,8 +193,7 @@ type EngineSpec struct {
 // (Start/Stop/Probe/Serve) -- those land in later slices (Phase B/C), once
 // this shape has proven it can express all twelve ServiceMap engines,
 // including the asymmetric ones (bonsai's build files, sglang's
-// completions-only dialect, ollama's native protocol, lmstudio's
-// near-total absence).
+// completions-only dialect, ollama's native protocol).
 type Engine interface {
 	Name() string
 	Kind() EngineKind

@@ -121,7 +121,7 @@ The Citadel binary embeds everything it needs to operate. There are no sidecar p
 
 **What is embedded:**
 
-- **Docker Compose files** for all supported services (vLLM, Ollama, llama.cpp, LM Studio) via Go's `embed` package. The `services/compose/` directory is compiled into the binary.
+- **Docker Compose files** for all supported services (vLLM, Ollama, llama.cpp) via Go's `embed` package. The `services/compose/` directory is compiled into the binary.
 - **Network stack** via tsnet -- the entire WireGuard implementation runs in userspace within the process.
 - **Platform abstractions** -- OS detection, package manager selection, Docker management, GPU detection all happen at runtime with no external tooling.
 

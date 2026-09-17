@@ -19,7 +19,7 @@
 // an unset field falls through to the compose `:-` default:
 //
 //   - the no-auth engines (vllm/llamacpp/bonsai/unlimited-ocr/sglang, and the
-//     #1060 sweep of extraction/diffusers/transcribe/lmstudio) default to
+//     #1060 sweep of extraction/diffusers/transcribe) default to
 //     127.0.0.1 (loopback),
 //   - ollama defaults to 0.0.0.0 because at least one catalog app reaches it via
 //     host.docker.internal, which lands on the docker0 bridge gateway a loopback
@@ -59,20 +59,19 @@ const (
 	EnvUnlimitedOCRBind = "CITADEL_UNLIMITED_OCR_BIND"
 	EnvSGLangBind       = "CITADEL_SGLANG_BIND"
 	EnvOllamaBind       = "CITADEL_OLLAMA_BIND"
-	// The aceteam-ai/citadel-cli#1060 sweep: extraction/diffusers/transcribe/
-	// lmstudio moved from an all-interfaces publish to the same loopback-default
+	// The aceteam-ai/citadel-cli#1060 sweep: extraction/diffusers/transcribe
+	// moved from an all-interfaces publish to the same loopback-default
 	// hatch as the engines above.
 	EnvExtractionBind = "CITADEL_EXTRACTION_BIND"
 	EnvDiffusersBind  = "CITADEL_DIFFUSERS_BIND"
 	EnvTranscribeBind = "CITADEL_TRANSCRIBE_BIND"
-	EnvLMStudioBind   = "CITADEL_LMSTUDIO_BIND"
 )
 
 // serviceBindEnv maps each embedded ServiceMap engine that supports the
 // manifest `bind:` escape hatch to its compose bind env var. It is deliberately
 // NARROWER than ServiceMap: kokoro/omnivoice are co-located-consumer-only and
 // must never be reachable off-host (see their compose comments), so they carry
-// no hatch. extraction/diffusers/transcribe/lmstudio joined the hatch in the
+// no hatch. extraction/diffusers/transcribe joined the hatch in the
 // aceteam-ai/citadel-cli#1060 sweep (each defaults to loopback like the no-auth
 // engines above; their only consumers are HOST processes dialing localhost).
 var serviceBindEnv = map[string]string{
@@ -85,7 +84,6 @@ var serviceBindEnv = map[string]string{
 	"extraction":    EnvExtractionBind,
 	"diffusers":     EnvDiffusersBind,
 	"transcribe":    EnvTranscribeBind,
-	"lmstudio":      EnvLMStudioBind,
 }
 
 // BindEnvVarName returns the compose bind env var for a hatch-supporting

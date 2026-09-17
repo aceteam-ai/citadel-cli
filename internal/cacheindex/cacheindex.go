@@ -84,7 +84,7 @@ const (
 )
 
 // nativeAggregateModel is the synthetic Model key used for a native-family
-// engine with no Go-side pull path (lmstudio, tei) -- one aggregate
+// engine with no Go-side pull path (tei) -- one aggregate
 // size-only row per store, per design doc §8.1. Ollama gets real per-model
 // entries via its own pull/evict call sites instead (see cache_index.go in
 // internal/jobs); this constant is not used for ollama entries.

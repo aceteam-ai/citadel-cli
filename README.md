@@ -52,7 +52,7 @@ Citadel auto-detects GPUs and running inference engines at startup, then uses th
 
 When `citadel work` starts, it:
 1. Queries `nvidia-smi` to discover GPU model, VRAM, and count
-2. Inspects running Docker containers for known inference engines (vLLM, Ollama, llama.cpp, LM Studio)
+2. Inspects running Docker containers for known inference engines (vLLM, Ollama, llama.cpp)
 3. Generates capability tags (e.g., `gpu:rtx3090`, `vram:24gb`, `engine:vllm`)
 
 ### Manual Declaration

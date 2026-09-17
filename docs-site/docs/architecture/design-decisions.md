@@ -57,7 +57,7 @@ This page documents the key architectural decisions in Citadel CLI, the alternat
 
 ## Why Docker Compose for Services?
 
-**Decision:** Inference engines (vLLM, Ollama, llama.cpp, LM Studio) run as Docker Compose services, with compose files embedded in the binary.
+**Decision:** Inference engines (vLLM, Ollama, llama.cpp) run as Docker Compose services, with compose files embedded in the binary.
 
 **Context:** Citadel needs to manage AI inference engines on user hardware. These engines have complex dependencies (CUDA, cuDNN, model files) that are impractical to install natively.
 

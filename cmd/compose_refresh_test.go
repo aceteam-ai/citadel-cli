@@ -189,7 +189,7 @@ func TestEngineBindDriftRequiresRecreate(t *testing.T) {
 		},
 		{
 			// aceteam-ai/citadel-cli#1060 extended the drift set to
-			// extraction/diffusers/transcribe/lmstudio: a running 0.0.0.0
+			// extraction/diffusers/transcribe: a running 0.0.0.0
 			// container of one of these (from a pre-#1060 binary) is now recreated.
 			name:     "extraction (added in #1060) on 0.0.0.0 recreates",
 			service:  "extraction",
