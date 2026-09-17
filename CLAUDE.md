@@ -37,7 +37,7 @@ Citadel CLI is an on-premise agent for the AceTeam Sovereign Compute Fabric. It 
 - **Citadel**: The CLI agent that runs on user hardware
 - **Nexus**: The cloud coordination server (nexus.aceteam.ai) that manages the distributed compute network
 - **Node**: A physical/virtual machine running the Citadel agent
-- **Services**: Dockerized AI inference engines (vLLM, Ollama, llama.cpp, LM Studio)
+- **Services**: Dockerized AI inference engines (vLLM, Ollama, llama.cpp)
 
 **User-Facing Terminology Convention:**
 When writing user-facing content (CLI help text, README, error messages), use these terms:
@@ -293,7 +293,7 @@ type JobHandler interface {
 ```
 Handlers in `internal/jobs/` implement specific job types (shell commands, model downloads, inference requests). The agent polls Nexus, dispatches to appropriate handler, and reports status back.
 
-**Embedded Services**: Docker Compose files for services are embedded in the binary at `services/compose/*.yml` using Go's `embed` package. The `services.ServiceMap` provides lookup by name (vllm, ollama, llamacpp, lmstudio).
+**Embedded Services**: Docker Compose files for services are embedded in the binary at `services/compose/*.yml` using Go's `embed` package. The `services.ServiceMap` provides lookup by name (vllm, ollama, llamacpp, sglang, bonsai, ...). (lmstudio was retired in citadel-cli#1066: its pinned image `technovangelist/lm-studio:latest` does not exist on Docker Hub — "object not found" — and LM Studio ships no maintained multi-arch headless server image, so the engine was removed from `ServiceMap` entirely rather than left failing at image pull on every OS.)
 
 **Docker Compose Management**: Services are managed through `docker compose` commands. The code uses subprocess calls to docker/docker-compose CLI for container lifecycle.
 
@@ -1029,7 +1029,7 @@ through that same authority. `citadel doctor`/`citadel status` warn (never refus
 when an embedded engine will publish on all interfaces
 (`engineBindExposureWarning`, `cmd/service_bind.go`). Which engines carry the
 hatch is `services.serviceBindEnv` (NOT kokoro/omnivoice — co-located-only; NOT
-the deferred extraction/diffusers/transcribe/lmstudio sweep).
+the deferred extraction/diffusers/transcribe sweep).
 
 **Fix (#581, node-side complement of aceteam #6236):** the gateway now routes
 `/v1/chat/completions` (plus `/v1/completions` and `/v1/models`) by model. Both
@@ -3624,7 +3624,7 @@ Docker Desktop for macOS exposes **no GPU to Linux containers** at all — Metal
 Consequence, owned by `services.darwinCapableServices` / `linuxOnlyServices` (`services/embed.go`) plus the build-tagged `services.OllamaCompose`/`LlamacppCompose` embeds (`services/compose_variants_{other,darwin}.go`):
 - CUDA-only engines (vllm, sglang, bonsai, diffusers, unlimited-ocr, omnivoice) are not advertised on darwin.
 - ollama and llamacpp ship a **darwin CPU/arm64 compose variant** (`compose/{ollama,llamacpp}.darwin.yml`) that drops the reservation (and, for llamacpp, uses the native-arm64 `:server` CPU image instead of `:server-cuda`). `TestDarwinComposeVariantsOnlyDropGPU` pins that the variant differs from its linux original by exactly that.
-- lmstudio is dropped from darwin entirely: its pinned image does not exist on Docker Hub, so there is nothing to ship.
+- lmstudio was retired from `ServiceMap` entirely (citadel-cli#1066): its pinned image `technovangelist/lm-studio:latest` does not exist on Docker Hub ("object not found"), so it could never pull on any OS, and LM Studio ships no maintained multi-arch headless *server* image (`linuxserver/lm-studio` is an amd64-only Selkies desktop-GUI container, not a headless OpenAI server). Removed rather than left dead. If a real, pullable server image lands, re-add it.
 - The CPU utility services (transcribe, kokoro, tei, extraction) carry no reservation and stay advertised, but their images are amd64-only, so on Apple Silicon they run under Rosetta/QEMU emulation.
 
 **Unverified pending a real Apple Silicon Mac:** whether ollama/llamacpp actually start end-to-end via the variants, and whether the emulated amd64 utility images start (Rosetta does not translate AVX/AVX2 pre-Sequoia — a common SIGILL source for MKL/PyTorch builds). See the Mac-verification steps in citadel-cli#1048's PR before relying on any of these on macOS.

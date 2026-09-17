@@ -21,7 +21,7 @@ import (
 // six AND answered a probe. Deploying TEI to node 1314 left `service_status`
 // saying "tei is running (docker)" while `fabric_node_status` said "Running
 // Services: none", and every embedded compose engine other than TEI (kokoro,
-// transcribe, diffusers, extraction, sglang, lmstudio) had no path into the
+// transcribe, diffusers, extraction, sglang) had no path into the
 // inventory at all.
 //
 // The fix is to enumerate the running containers and report them, so the
@@ -101,7 +101,7 @@ func embeddedServiceType(name string) string {
 	switch name {
 	case "tei":
 		return ServiceTypeEmbedding
-	case "vllm", "ollama", "llamacpp", "lmstudio", "sglang", "bonsai", "unlimited-ocr":
+	case "vllm", "ollama", "llamacpp", "sglang", "bonsai", "unlimited-ocr":
 		return ServiceTypeLLM
 	default:
 		return ServiceTypeOther

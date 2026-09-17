@@ -6,7 +6,7 @@ import "testing"
 // restart this" stop warning: inference engines match, plain media/tool services
 // do not.
 func TestIsFabricManagedEngine(t *testing.T) {
-	engines := []string{"vllm", "ollama", "llamacpp", "llama.cpp", "bonsai", "sglang", "lmstudio", "citadel-vllm", "VLLM"}
+	engines := []string{"vllm", "ollama", "llamacpp", "llama.cpp", "bonsai", "sglang", "citadel-vllm", "VLLM"}
 	for _, n := range engines {
 		if !isFabricManagedEngine(n) {
 			t.Errorf("isFabricManagedEngine(%q) = false, want true", n)

@@ -63,7 +63,7 @@ const (
 // manifest `bind:` escape hatch to its compose bind env var. It is deliberately
 // NARROWER than ServiceMap: kokoro/omnivoice are co-located-consumer-only and
 // must never be reachable off-host (see their compose comments), and
-// extraction/diffusers/transcribe/lmstudio are the deferred loopback sweep
+// extraction/diffusers/transcribe are the deferred loopback sweep
 // (still all-interfaces in v1, tracked in aceteam-ai/citadel-cli#1060), so none
 // of them carry the hatch.
 var serviceBindEnv = map[string]string{

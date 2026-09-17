@@ -29,7 +29,6 @@ var servicePorts = map[string]int{
 	"vllm":     services.VLLMHostPort,
 	"ollama":   11434,
 	"llamacpp": services.LlamacppHostPort,
-	"lmstudio": 1234,
 	// wechat is the per-person WeChat REST API (WeChatFerry on a Windows VM) on
 	// its own :8000; the map is keyed by name so it coexists with the others.
 	"wechat": 8000,
@@ -103,7 +102,7 @@ func getExposePort(args []string) int {
 		port, ok := servicePorts[exposeService]
 		if !ok {
 			fmt.Fprintf(os.Stderr, "Error: unknown service '%s'\n", exposeService)
-			fmt.Fprintln(os.Stderr, "Known services: vllm, ollama, llamacpp, lmstudio, wechat")
+			fmt.Fprintln(os.Stderr, "Known services: vllm, ollama, llamacpp, wechat")
 			os.Exit(1)
 		}
 		return port
@@ -369,7 +368,7 @@ func checkServicePort(ip string, port int, serviceName string, isOwnNode bool) {
 
 func init() {
 	rootCmd.AddCommand(exposeCmd)
-	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Show access info for a known service (vllm, ollama, llamacpp, lmstudio, wechat)")
+	exposeCmd.Flags().StringVar(&exposeService, "service", "", "Show access info for a known service (vllm, ollama, llamacpp, wechat)")
 	exposeCmd.Flags().BoolVar(&exposePeers, "peers", false, "Show services available on all network peers")
 	exposeCmd.Flags().BoolVar(&exposeCheck, "check", false, "Verify service reachability (can combine with --peers)")
 	exposeCmd.Flags().BoolVar(&exposeList, "list", false, "List currently exposed ports (deprecated)")

@@ -20,7 +20,6 @@ func TestSkipEngineOnDarwin(t *testing.T) {
 
 		// Non-GPU engines are never skipped, even on darwin.
 		{"ollama on darwin", "darwin", "ollama", false, false},
-		{"lmstudio on darwin", "darwin", "lmstudio", false, false},
 		{"unknown service on darwin", "darwin", "something-else", false, false},
 
 		// Other platforms always start these engines.

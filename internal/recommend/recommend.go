@@ -40,11 +40,6 @@ func GetRecommendations() []ServiceRecommendation {
 			Reason:      "Requires NVIDIA GPU (Linux only)",
 			Recommended: false,
 		})
-		recommendations = append(recommendations, ServiceRecommendation{
-			Service:     "lmstudio",
-			Reason:      "Use native macOS app instead",
-			Recommended: false,
-		})
 		return recommendations
 	}
 

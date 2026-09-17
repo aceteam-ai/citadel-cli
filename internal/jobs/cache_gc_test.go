@@ -561,7 +561,7 @@ func TestRunCacheGCPass_AllCandidatesSkippedIsReportedAccurately(t *testing.T) {
 // TestDefaultCacheGCDeleteEntry_RefusesNonOllamaNativeCacheDir pins the
 // PR-review hardening: the CacheFamilyNative branch used to run `ollama rm`
 // for ANY native entry on the strength of an assumption chain across two
-// files (PlanGC structurally excludes lmstudio/tei's aggregate "_store" row
+// files (PlanGC structurally excludes tei's aggregate "_store" row
 // today, so only ollama entries ever reach here) rather than a guard in this
 // function itself.
 func TestDefaultCacheGCDeleteEntry_RefusesNonOllamaNativeCacheDir(t *testing.T) {

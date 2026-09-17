@@ -355,7 +355,7 @@ func TestApplyNodeRoutedRequestSignal_SkipsStartingServices(t *testing.T) {
 // TestApplyNodeRoutedRequestSignal_CoversBackstopEngines is the fix for the
 // gap the scattered per-producer fallback missed: an engine reported ONLY by
 // the collectRunningEmbeddedServices backstop (diffusers, sglang, kokoro,
-// transcribe, extraction, lmstudio -- none of which had a fallback wired
+// transcribe, extraction -- none of which had a fallback wired
 // in-line) still gets a last_request_at once it is in status.Services and
 // running, because this pass runs once over the fully-assembled list.
 func TestApplyNodeRoutedRequestSignal_CoversBackstopEngines(t *testing.T) {

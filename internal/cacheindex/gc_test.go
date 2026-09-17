@@ -231,7 +231,7 @@ func TestPlanGC_NativeStoreAggregateRowNeverACandidate(t *testing.T) {
 	now := mustTime(t, "2026-08-30T12:00:00Z")
 	old := mustTime(t, "2026-01-01T00:00:00Z")
 	entries := []Entry{
-		{CacheDir: "lmstudio", Family: services.CacheFamilyNative, Model: nativeAggregateModel, PulledAt: old, SizeBytes: 1000},
+		{CacheDir: "tei", Family: services.CacheFamilyNative, Model: nativeAggregateModel, PulledAt: old, SizeBytes: 1000},
 	}
 	plan := PlanGC(entries, GCInputs{Now: now, PinnedModels: map[string]bool{}})
 	if len(plan.Candidates) != 0 {

@@ -405,7 +405,7 @@ func hasHiddenPathComponent(rel string) bool {
 
 // scanNativeDir records ONE aggregate row (nativeAggregateModel) for a
 // native-family cache directory's total size, per design doc §8.1's "other
-// native (lmstudio, tei)" case. Native entries are never subject to the
+// native (tei)" case. Native entries are never subject to the
 // scannedDirs/foundFiles staleness machinery (ReconcileScan's staleness
 // cleanup only iterates hf-hub/gguf-dir families), so this does not call
 // res.markScanned/markFound -- only res.discovered.

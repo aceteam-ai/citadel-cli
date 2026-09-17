@@ -20,7 +20,7 @@ sudo citadel init --provision
 This walks you through an interactive setup:
 
 1. **Network** -- prompts for device authorization (or accepts an authkey)
-2. **Service selection** -- choose which AI inference engine to run (vLLM, Ollama, llama.cpp, LM Studio)
+2. **Service selection** -- choose which AI inference engine to run (vLLM, Ollama, llama.cpp)
 3. **Node naming** -- set a display name for your node
 4. **System provisioning** -- installs dependencies (only what is missing):
    - Docker Engine (Linux) or Docker Desktop (macOS/Windows)
@@ -43,7 +43,7 @@ sudo citadel init --provision \
 | Flag | Description |
 |---|---|
 | `--authkey <key>` | Pre-generated single-use auth key from the AceTeam admin panel. Skips interactive device authorization. |
-| `--service <name>` | Inference engine to configure: `vllm`, `ollama`, `llamacpp`, or `lmstudio`. |
+| `--service <name>` | Inference engine to configure: `vllm`, `ollama`, or `llamacpp`. |
 | `--node-name <name>` | Display name for this node. |
 | `--verbose` | Show detailed output during provisioning. |
 

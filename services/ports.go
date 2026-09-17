@@ -108,7 +108,7 @@ const (
 //
 // Only services whose old hardcoded host port collided are managed here.
 // Services that already sat on a unique, well-known host port (ollama 11434,
-// sglang 30000, lmstudio 1234, transcribe 8101) keep their native port and are
+// sglang 30000, transcribe 8101) keep their native port and are
 // still covered by the collision guard test so future edits can't reintroduce a
 // clash.
 const (
@@ -309,7 +309,7 @@ const SGLangHostPort = 30000
 // them on. This is the discovery source for the heartbeat stats scraper
 // (internal/pulse, citadel-cli#587): scrape targets come from this registry,
 // never from hardcoded literals. Engines without a Prometheus endpoint
-// (ollama, llamacpp, lmstudio) are deliberately absent.
+// (ollama, llamacpp) are deliberately absent.
 func InferenceMetricsPorts() map[string]int {
 	return map[string]int{
 		"vllm":   VLLMHostPort,

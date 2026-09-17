@@ -19,9 +19,6 @@ import (
 //go:embed compose/vllm.yml
 var VLLMCompose string
 
-//go:embed compose/lmstudio.yml
-var LMStudioCompose string
-
 //go:embed compose/sglang.yml
 var SGLangCompose string
 
@@ -61,7 +58,6 @@ var ServiceMap = map[string]string{
 	"ollama":        OllamaCompose,
 	"vllm":          VLLMCompose,
 	"llamacpp":      LlamacppCompose,
-	"lmstudio":      LMStudioCompose,
 	"sglang":        SGLangCompose,
 	"extraction":    ExtractionCompose,
 	"transcribe":    TranscribeCompose,
@@ -135,8 +131,6 @@ func WriteAuxFiles(servicesDir, name string) error {
 //     UNVERIFIED (Rosetta does not translate AVX/AVX2 pre-Sequoia, a common SIGILL
 //     source); kept advertised because "unknown" is not "known to fail", but flag
 //     it — see the Mac step in #1048 before relying on them.
-//
-// lmstudio was DROPPED to linuxOnlyServices: see its note there.
 var darwinCapableServices = map[string]bool{
 	"ollama":     true,
 	"llamacpp":   true,
@@ -147,11 +141,10 @@ var darwinCapableServices = map[string]bool{
 }
 
 // linuxOnlyServices names the embedded engines NOT advertised on darwin: the
-// CUDA-only inference engines (a CUDA image and/or a mandatory NVIDIA runtime),
-// plus lmstudio (see below). It exists only so
-// TestServiceMapDarwinClassificationExhaustive can prove every ServiceMap key is
-// classified exactly once — the runtime filter keys off darwinCapableServices
-// (the allow-list) alone.
+// CUDA-only inference engines (a CUDA image and/or a mandatory NVIDIA runtime).
+// It exists only so TestServiceMapDarwinClassificationExhaustive can prove every
+// ServiceMap key is classified exactly once — the runtime filter keys off
+// darwinCapableServices (the allow-list) alone.
 var linuxOnlyServices = map[string]bool{
 	"vllm":          true,
 	"sglang":        true,
@@ -159,14 +152,6 @@ var linuxOnlyServices = map[string]bool{
 	"diffusers":     true,
 	"unlimited-ocr": true,
 	"omnivoice":     true,
-	// lmstudio: dropped from darwin in citadel-cli#1048. Unlike ollama/llamacpp
-	// it gets no darwin variant because there is nothing verifiable to ship — the
-	// pinned image (technovangelist/lm-studio:latest) does not exist on Docker Hub
-	// at all ("object not found"), so it cannot pull on any OS, and there is no
-	// known arm64 image to swap in. It also carries a mandatory nvidia reservation,
-	// and LM Studio on macOS is a native desktop app rather than a container. If a
-	// real, pullable macOS-capable image lands, revisit.
-	"lmstudio": true,
 }
 
 // availableServicesFor returns the sorted service names available on the given

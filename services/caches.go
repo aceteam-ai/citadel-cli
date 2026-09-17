@@ -43,8 +43,8 @@ const (
 	// belongs to.
 	CacheFamilyGGUFDir CacheFamily = "gguf-dir"
 	// CacheFamilyNative is an engine-owned store whose internal layout this
-	// table does not model (ollama's content-addressed blob store,
-	// lmstudio's own cache format). The directory is still worth recording
+	// table does not model (ollama's content-addressed blob store, tei's
+	// own /data hub-cache). The directory is still worth recording
 	// (disk-usage reporting, future GC), just not one MODEL_CACHE_PULL writes
 	// into via the HF-hub or raw-GGUF code paths.
 	CacheFamilyNative CacheFamily = "native"
@@ -104,8 +104,7 @@ var EngineCacheDirs = map[string]EngineCache{
 
 	// Native/engine-owned stores -- location only, not a MODEL_CACHE_PULL
 	// target this table's HF-hub or GGUF code paths route through.
-	"ollama":   {Dir: "ollama", Family: CacheFamilyNative},
-	"lmstudio": {Dir: "lmstudio", Family: CacheFamilyNative},
+	"ollama": {Dir: "ollama", Family: CacheFamilyNative},
 	// tei mounts ~/citadel-cache/tei at /data and points
 	// HUGGINGFACE_HUB_CACHE=/data inside that mount (services/compose/tei.yml)
 	// -- its internal layout is hub-shaped, but the DIRECTORY is tei's own,

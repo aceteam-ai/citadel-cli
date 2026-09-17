@@ -156,7 +156,7 @@ func (c *Collector) nodeRoutedIdle(engine string) *IdleState {
 // footprint-derived signal they could (Collect() ordering). Centralizing here
 // (rather than a fallback wired into each producer) is what makes the
 // backstop-reported engines (diffusers, sglang, kokoro, transcribe,
-// extraction, lmstudio -- see collectRunningEmbeddedServices) get the same
+// extraction -- see collectRunningEmbeddedServices) get the same
 // last_request_at coverage as the explicitly-probed ones: iterating
 // status.Services once, after assembly, does not care which producer emitted
 // a given entry.
@@ -348,7 +348,7 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	}
 
 	// Backstop: every OTHER running embedded-compose service (kokoro, transcribe,
-	// diffusers, extraction, sglang, lmstudio). None of these has a probe above,
+	// diffusers, extraction, sglang). None of these has a probe above,
 	// so before #7148 a node running them reported nothing at all: the operator
 	// saw an empty node right after a successful deploy, and an unreported
 	// service can never be flagged idle or reclaimable either.
@@ -785,7 +785,7 @@ func InferServiceType(serviceName string) string {
 	name := strings.ToLower(serviceName)
 
 	// LLM services
-	llmKeywords := []string{"vllm", "ollama", "llamacpp", "llama.cpp", "lmstudio", "llm", "inference"}
+	llmKeywords := []string{"vllm", "ollama", "llamacpp", "llama.cpp", "llm", "inference"}
 	for _, keyword := range llmKeywords {
 		if strings.Contains(name, keyword) {
 			return ServiceTypeLLM
@@ -885,7 +885,6 @@ func InferServicePort(serviceName string) int {
 		"vllm":          services.VLLMHostPort,
 		"ollama":        11434,
 		"llamacpp":      services.LlamacppHostPort,
-		"lmstudio":      1234,
 		"postgres":      5432,
 		"mysql":         3306,
 		"redis":         6379,

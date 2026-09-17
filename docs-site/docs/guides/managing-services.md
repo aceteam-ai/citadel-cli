@@ -14,7 +14,6 @@ Services are AI inference engines that run as Docker containers on your node. Ci
 | **vLLM** | High-throughput LLM inference server | Yes (NVIDIA) |
 | **Ollama** | Easy-to-use model runner | No (GPU optional) |
 | **llama.cpp** | Lightweight CPU/GPU inference | Yes (NVIDIA) |
-| **LM Studio** | Desktop-friendly model server | No (GPU optional) |
 | **Extraction** | Generic extraction service | No |
 
 ## Starting Services
@@ -93,7 +92,7 @@ vLLM and llama.cpp require the NVIDIA Container Toolkit and a properly configure
 
 If you used `sudo citadel init --provision`, this configuration was applied automatically. For manual setups, install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) and restart Docker after updating the daemon configuration.
 
-Ollama, LM Studio, and Extraction run without GPU access, though Ollama will use a GPU if one is available.
+Ollama and Extraction run without GPU access, though Ollama will use a GPU if one is available.
 
 ## How It Works
 
