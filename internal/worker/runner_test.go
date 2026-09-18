@@ -862,7 +862,7 @@ func TestRunnerSupportedJobTypesReflectsRegistration(t *testing.T) {
 	}
 	runner := NewRunner(source, handlers, RunnerConfig{WorkerID: "test"})
 
-	got := runner.supportedJobTypes()
+	got := runner.SupportedJobTypes()
 	want := map[string]bool{JobTypeCobrowse: true, JobTypeShellCommand: true}
 	if len(got) != len(want) {
 		t.Fatalf("supportedJobTypes() = %v, want %d entries", got, len(want))

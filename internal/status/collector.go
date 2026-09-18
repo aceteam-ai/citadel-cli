@@ -40,6 +40,7 @@ type Collector struct {
 	laneActivity    func() []LaneActivity            // live bounded-execution-lane activity (citadel #908), optional
 	pairingDisplay  func() *PairingDisplayCapability // live pairing-display capability probe (citadel #659), optional
 	cacheReport     func() *CacheReport              // live cache-index attribution (citadel #682 P3), optional
+	jobTypes        func() []string                  // live registered worker job types (aceteam #9962), optional
 }
 
 // ServiceConfig holds the configuration for a service from the manifest.
@@ -106,6 +107,10 @@ type CollectorConfig struct {
 	// cache index store is wired (any process other than `citadel work`, or
 	// a legacy build).
 	CacheReport func() *CacheReport
+	// JobTypes, when set, returns the exact registered worker handler set for
+	// capability-aware dispatch. nil or an empty result leaves job_types omitted
+	// until the live runner is fully registered.
+	JobTypes func() []string
 }
 
 // NewCollector creates a new status collector.
@@ -130,6 +135,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		laneActivity:    cfg.LaneActivity,
 		pairingDisplay:  cfg.PairingDisplay,
 		cacheReport:     cfg.CacheReport,
+		jobTypes:        cfg.JobTypes,
 	}
 }
 
@@ -450,6 +456,14 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// keys) so the fabric can schedule engine-specific deploys only to capable
 	// nodes (aceteam#4483).
 	populateServices(status.Capabilities)
+
+	// Advertise the live registered handler set rather than a static version or
+	// platform matrix. The provider is wired only after permission/configuration
+	// gates have selected the actual handlers, so disabled or unavailable
+	// surfaces never appear dispatchable.
+	if c.jobTypes != nil {
+		status.Capabilities.JobTypes = c.jobTypes()
+	}
 
 	// Attach live worker consume-loop liveness so the platform can distinguish a
 	// heartbeating-but-wedged node from one actually draining jobs (issue #548).

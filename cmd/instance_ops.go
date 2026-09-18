@@ -45,3 +45,22 @@ func newInstanceProviderFactory(configDir string, log func(format string, args .
 		return proxmox.NewProvisioner(client, pcfg, nil, log)
 	}
 }
+
+// instanceProvisioningEnabled reports whether INSTANCE_* can be dispatched at
+// worker construction time. The handler is absent otherwise so
+// capabilities.job_types never turns a missing/disabled Proxmox config into a
+// false scheduling claim.
+func instanceProvisioningEnabled(configDir string) bool {
+	if configDir == "" {
+		return false
+	}
+	cfg, err := proxmox.LoadConfig(configDir)
+	if err != nil || cfg == nil || cfg.BaseURL == "" || cfg.Provisioning == nil || !cfg.Provisioning.Enabled {
+		return false
+	}
+	pveNode := cfg.Provisioning.PVENode
+	if pveNode == "" {
+		pveNode = cfg.NodeName
+	}
+	return cfg.Provisioning.TemplateVMID > 0 && pveNode != ""
+}
