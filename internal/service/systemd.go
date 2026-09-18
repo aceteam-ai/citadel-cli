@@ -161,12 +161,10 @@ func (m *systemdManager) Install(cfg ServiceConfig) error {
 	if !cfg.UserMode && os.Geteuid() != 0 {
 		return fmt.Errorf("installing a system service requires root privileges.\nRun: sudo citadel service install --system")
 	}
-	if !cfg.UserMode {
-		var err error
-		cfg, err = materializeEphemeralSystemExec(cfg)
-		if err != nil {
-			return err
-		}
+	var err error
+	cfg, err = materializeEphemeralExec(cfg)
+	if err != nil {
+		return err
 	}
 
 	unitContent, err := GenerateUnitFile(cfg)

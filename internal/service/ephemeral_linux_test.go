@@ -28,7 +28,7 @@ func TestMaterializeEphemeralSystemExecCopiesToDurablePath(t *testing.T) {
 	original := durableSystemExecPath
 	durableSystemExecPath = filepath.Join(t.TempDir(), "usr", "local", "bin", "citadel")
 	t.Cleanup(func() { durableSystemExecPath = original })
-	cfg, err := materializeEphemeralSystemExec(ServiceConfig{ExecPath: source})
+	cfg, err := materializeEphemeralExec(ServiceConfig{ExecPath: source})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,6 +38,36 @@ func TestMaterializeEphemeralSystemExecCopiesToDurablePath(t *testing.T) {
 	got, err := os.ReadFile(cfg.ExecPath)
 	if err != nil || string(got) != "binary bytes" {
 		t.Fatalf("durable executable = %q, %v", got, err)
+	}
+}
+
+func TestMaterializeEphemeralUserExecCopiesToUserLocalBin(t *testing.T) {
+	sourceFile, err := os.CreateTemp("/tmp", "citadel-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := sourceFile.Name()
+	if _, err := sourceFile.Write([]byte("user binary")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(source) })
+	originalHome := userHomeDirForExec
+	home := t.TempDir()
+	userHomeDirForExec = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDirForExec = originalHome })
+	cfg, err := materializeEphemeralExec(ServiceConfig{ExecPath: source, UserMode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".local", "bin", "citadel")
+	if cfg.ExecPath != want {
+		t.Fatalf("ExecPath = %q, want %q", cfg.ExecPath, want)
+	}
+	if got, err := os.ReadFile(want); err != nil || string(got) != "user binary" {
+		t.Fatalf("user durable executable = %q, %v", got, err)
 	}
 }
 
@@ -73,5 +103,16 @@ func TestCopyExecutableAndEphemeralExecStart(t *testing.T) {
 	}
 	if strings.Contains(destination, "/tmp/citadel") {
 		t.Fatal("test destination must be independent of the ephemeral source")
+	}
+}
+
+func TestEphemeralExecWarningUsesUnitScope(t *testing.T) {
+	user := ephemeralExecWarning(managedUnitCandidate{path: "/home/a/.config/systemd/user/citadel.service", userMode: true}, "/tmp/citadel", "/tmp")
+	if !strings.Contains(user, "`citadel service install`") || strings.Contains(user, "sudo") {
+		t.Fatalf("user remediation = %q", user)
+	}
+	system := ephemeralExecWarning(managedUnitCandidate{path: "/etc/systemd/system/citadel.service"}, "/dev/shm/citadel", "/dev/shm")
+	if !strings.Contains(system, "`sudo citadel service install --system`") {
+		t.Fatalf("system remediation = %q", system)
 	}
 }

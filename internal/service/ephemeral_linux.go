@@ -12,6 +12,7 @@ import (
 )
 
 var durableSystemExecPath = "/usr/local/bin/citadel"
+var userHomeDirForExec = os.UserHomeDir
 
 const tmpfsMagic = 0x01021994
 
@@ -30,15 +31,23 @@ func ephemeralExecPath(path string) (bool, string) {
 	return false, ""
 }
 
-func materializeEphemeralSystemExec(cfg ServiceConfig) (ServiceConfig, error) {
+func materializeEphemeralExec(cfg ServiceConfig) (ServiceConfig, error) {
 	ephemeral, _ := ephemeralExecPath(cfg.ExecPath)
 	if !ephemeral {
 		return cfg, nil
 	}
-	if err := copyExecutable(cfg.ExecPath, durableSystemExecPath); err != nil {
-		return ServiceConfig{}, fmt.Errorf("copy ephemeral executable from %s to %s: %w", cfg.ExecPath, durableSystemExecPath, err)
+	destination := durableSystemExecPath
+	if cfg.UserMode {
+		home, err := userHomeDirForExec()
+		if err != nil {
+			return ServiceConfig{}, fmt.Errorf("determine home for durable user executable: %w", err)
+		}
+		destination = filepath.Join(home, ".local", "bin", "citadel")
 	}
-	cfg.ExecPath = durableSystemExecPath
+	if err := copyExecutable(cfg.ExecPath, destination); err != nil {
+		return ServiceConfig{}, fmt.Errorf("copy ephemeral executable from %s to %s: %w", cfg.ExecPath, destination, err)
+	}
+	cfg.ExecPath = destination
 	return cfg, nil
 }
 
@@ -87,10 +96,18 @@ func EphemeralManagedExecStarts() []string {
 			continue
 		}
 		if path, location, ok := ephemeralExecStart(string(content)); ok {
-			warnings = append(warnings, fmt.Sprintf("%s runs %s from ephemeral %s; reinstall with `sudo citadel service install --system` before reboot", candidate.path, path, location))
+			warnings = append(warnings, ephemeralExecWarning(candidate, path, location))
 		}
 	}
 	return warnings
+}
+
+func ephemeralExecWarning(candidate managedUnitCandidate, path, location string) string {
+	command := "citadel service install"
+	if !candidate.userMode {
+		command = "sudo citadel service install --system"
+	}
+	return fmt.Sprintf("%s runs %s from ephemeral %s; reinstall with `%s` before reboot", candidate.path, path, location, command)
 }
 
 func ephemeralExecStart(content string) (path, location string, ok bool) {
