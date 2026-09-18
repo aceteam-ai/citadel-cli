@@ -6,6 +6,35 @@ import (
 	"testing"
 )
 
+func TestPermissionStateAppliedWireContract(t *testing.T) {
+	state := &PermissionState{
+		Shell: true,
+		Applied: &AppliedPermissionState{
+			Console:  false,
+			Desktop:  false,
+			Files:    false,
+			Services: true,
+			SSH:      true,
+			Shell:    true,
+		},
+	}
+	b, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	applied, ok := got["applied"].(map[string]any)
+	if !ok {
+		t.Fatalf("applied block missing from %s", b)
+	}
+	if applied["shell"] != true || applied["console"] != false {
+		t.Fatalf("applied = %#v, want shell=true and console=false", applied)
+	}
+}
+
 // TestPermissionStateHasPasscodeJSONKey pins the exact wire key for
 // PermissionState.HasPasscode (citadel #758). There is no live backend
 // consumer yet (aceteam PR #7532 ships the dashboard side as a documented

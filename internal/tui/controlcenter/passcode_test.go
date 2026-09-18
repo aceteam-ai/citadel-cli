@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/rivo/tview"
 )
 
 // newTestControlCenterWithPermissions wires a ControlCenter to an in-memory
@@ -214,5 +215,31 @@ func TestBuiltinServicesActionDesc(t *testing.T) {
 				t.Errorf("builtinServicesActionDesc(%+v) = %q, wantWarning=%v", tc.perms, got, tc.wantWarning)
 			}
 		})
+	}
+}
+
+func TestSaveBuiltinPermissionsRefreshesActionsSummary(t *testing.T) {
+	store := config.DefaultPermissions()
+	cc := New(Config{Permissions: PermissionsCallbacks{
+		Load: func() *config.Permissions { return store },
+		Save: func(p *config.Permissions) error {
+			copy := *p
+			store = &copy
+			return nil
+		},
+	}})
+	cc.actionsView = tview.NewTable()
+	cc.updateActionsPanel()
+	if got := cc.actionsView.GetCell(0, 2).Text; !strings.Contains(got, "2/5 enabled") {
+		t.Fatalf("initial summary = %q, want 2/5 enabled", got)
+	}
+
+	next := *store
+	next.Console = true
+	if err := cc.saveBuiltinPermissions(&next, "Console", true); err != nil {
+		t.Fatalf("saveBuiltinPermissions: %v", err)
+	}
+	if got := cc.actionsView.GetCell(0, 2).Text; !strings.Contains(got, "3/5 enabled") {
+		t.Fatalf("refreshed summary = %q, want 3/5 enabled", got)
 	}
 }

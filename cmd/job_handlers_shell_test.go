@@ -6,7 +6,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // TestLegacyShellHandlerHonorsKillSwitch verifies the legacy Nexus/diagnostic
@@ -26,7 +25,7 @@ func TestLegacyShellHandlerHonorsKillSwitch(t *testing.T) {
 
 	// Disabled must track the persisted permission (default-deny), not be
 	// hardcoded to the always-enabled zero value.
-	wantDisabled := !config.LoadPermissions(platform.ConfigDir()).Shell
+	wantDisabled := !loadNodePermissions().Shell
 	if shell.Disabled != wantDisabled {
 		t.Errorf("legacy SHELL_COMMAND handler Disabled=%v, want %v (from persisted shell permission)",
 			shell.Disabled, wantDisabled)

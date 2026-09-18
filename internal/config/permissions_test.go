@@ -178,13 +178,15 @@ func TestSavePermissions_FileMode0600(t *testing.T) {
 
 func TestLoadPermissions_InvalidYAML(t *testing.T) {
 	dir := t.TempDir()
-	data := []byte("not: [valid: yaml: {{{")
+	// Put a valid opt-in before the syntax error to prove a partially decoded
+	// policy is discarded rather than accidentally enabling a sensitive gate.
+	data := []byte("shell: true\nnot: [valid: yaml: {{{")
 	if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), data, 0600); err != nil {
 		t.Fatalf("write invalid yaml: %v", err)
 	}
 	p := LoadPermissions(dir)
 	// Should still return the (locked-down) defaults on parse error.
-	if p.Console || p.Desktop || p.Files {
+	if p.Console || p.Desktop || p.Files || p.Shell {
 		t.Errorf("invalid YAML should return locked-down defaults, got %+v", p)
 	}
 }

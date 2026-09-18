@@ -20,10 +20,16 @@ type nodeJobHandlerOpts struct {
 	// ConfigDir is the citadel.yaml manifest directory (enables service handlers).
 	// May be empty (the control center historically ran without it).
 	ConfigDir string
+	// PermissionsDir is the authoritative machine-level node configuration
+	// directory. It must not depend on which user launched the worker.
+	PermissionsDir string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
 	// ShellDisabled registers SHELL_COMMAND in a refusing state (still dispatchable).
 	ShellDisabled bool
+	// ShellEnabled reloads the persisted shell permission for each job so a
+	// config push applies without a worker restart.
+	ShellEnabled func() bool
 	// ShellHasPasscode reports whether a node passcode is configured, so an enabled
 	// shell can distinguish passcode_not_set from passcode_invalid. Required whenever
 	// ShellDisabled is false: a nil signal makes shell fail closed. Wired from the
@@ -71,8 +77,10 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		LogFn:                     opts.LogFn,
 		WorkspaceDir:              opts.WorkspaceDir,
 		ConfigDir:                 opts.ConfigDir,
+		PermissionsDir:            opts.PermissionsDir,
 		AllowReadOutsideWorkspace: opts.AllowReadOutsideWorkspace,
 		ShellDisabled:             opts.ShellDisabled,
+		ShellEnabled:              opts.ShellEnabled,
 		ShellHasPasscode:          opts.ShellHasPasscode,
 		ShellVerifyPasscode:       opts.ShellVerifyPasscode,
 		DesktopDisabled:           opts.DesktopDisabled,

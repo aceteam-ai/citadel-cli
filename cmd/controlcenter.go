@@ -275,10 +275,10 @@ func runControlCenter() {
 		},
 		Permissions: controlcenter.PermissionsCallbacks{
 			Load: func() *config.Permissions {
-				return config.LoadPermissions(platform.ConfigDir())
+				return loadNodePermissions()
 			},
 			Save: func(p *config.Permissions) error {
-				return config.SavePermissions(platform.ConfigDir(), p)
+				return saveNodePermissions(p)
 			},
 		},
 		OnConnect:       ccOnNetworkConnect,
@@ -658,7 +658,7 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 		// just on being connected. A fresh node has `console` default-DENY, so no
 		// terminal listener goes on the org mesh. When enabled, the passcode
 		// verifier wired in startTerminalServer gates every connection.
-		if config.LoadPermissions(platform.ConfigDir()).Console {
+		if loadNodePermissions().Console {
 			if err := startTerminalServer(orgID, activityFn); err != nil {
 				activityFn("warning", fmt.Sprintf("Terminal server failed: %v", err))
 			} else {
@@ -669,7 +669,7 @@ func ccOnNetworkConnect(activityFn func(level, msg string)) {
 		}
 	}
 
-	perms := config.LoadPermissions(platform.ConfigDir())
+	perms := loadNodePermissions()
 	if perms.Desktop {
 		if err := startVNCServer(); err != nil {
 			activityFn("warning", fmt.Sprintf("VNC server failed: %v", err))
@@ -719,12 +719,12 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	// (config is the internal/config package; the local terminal config is
 	// termCfg to avoid shadowing it here.)
 	termCfg.PasscodeVerifier = func(pin string) bool {
-		return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+		return loadNodePermissions().VerifyPasscode(pin)
 	}
 	// Lets the reject response distinguish passcode_not_set from
 	// passcode_invalid (citadel#753); see terminal.Config.PasscodeHasPasscode.
 	termCfg.PasscodeHasPasscode = func() bool {
-		return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+		return loadNodePermissions().HasPasscode()
 	}
 
 	// Create the caching token validator
@@ -2036,27 +2036,23 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 
-	// citadel#853/#856: mirrors runWork's boot-time --node-dir refusal
-	// (cmd/work.go). This is the control center's OTHER path into
-	// buildNodeJobHandlers (below), which registers the SAME
-	// jobs.NewConfigHandler("") (internal/worker/handler_adapter.go) --
-	// hardcoded to "", NOT threaded from nodeJobHandlerOpts.ConfigDir, so it
-	// is NOT --node-dir-aware regardless of which entry point constructed it.
-	// Without this check here too, a bare `citadel` (TUI, the default when no
-	// dedicated worker holds the lock) run under an active
-	// --node-dir/CITADEL_NODE_DIR would silently apply an APPLY_DEVICE_CONFIG
-	// job against this machine's REAL ~/citadel-node instead of the
-	// override -- exactly the split runWork's refusal exists to prevent, via
-	// a different entry point that reaches the same unguarded handler.
+	// Mirrors runWork's boot-time --node-dir refusal. APPLY_DEVICE_CONFIG now
+	// receives the resolved node directory, but module reconciliation still
+	// writes both the redirected manifest and the invoker-scoped module lockfile.
+	// Refuse the split state until that separate subsystem is override-aware.
 	if override := resolveNodeDirOverride(); override != "" {
 		return fmt.Errorf(
-			"--node-dir/CITADEL_NODE_DIR (%q) is not supported by the control center's worker mode: like "+
-				"'citadel work', it wires jobs.NewConfigHandler(\"\") (internal/worker/handler_adapter.go), "+
-				"which is not --node-dir-aware and would resolve APPLY_DEVICE_CONFIG jobs against this "+
-				"machine's real config directory regardless of the override. Unset the override to use the "+
-				"control center, or use 'citadel module stop|start|restart' for targeted node operations.",
+			"--node-dir/CITADEL_NODE_DIR (%q) is not supported by the control center's worker mode: "+
+				"module reconciliation would split the redirected node manifest from the invoker-scoped "+
+				"module lockfile. Unset the override to use the control center, or use "+
+				"'citadel module stop|start|restart' for targeted node operations.",
 			override)
 	}
+
+	// Construction-time gates use this immutable snapshot. Heartbeats compare
+	// it with current persisted intent so restart-bound changes remain pending
+	// until a new worker confirms them after startup.
+	ccAppliedPermissions := loadNodePermissions()
 
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
@@ -2320,7 +2316,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 					collector,
 				); err == nil {
 					// Include current permissions in heartbeat
-					apiPublisher.SetPermissionsProvider(currentPermissionsForHeartbeat)
+					apiPublisher.SetPermissionsProvider(func() *heartbeat.PermissionState {
+						return currentPermissionsForHeartbeat(ccAppliedPermissions)
+					})
 
 					if inferenceQueueReconciler != nil {
 						inferenceQueueReconciler.Log = func(format string, args ...any) {
@@ -2420,7 +2418,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create handlers with activity callback to route job output through TUI.
 	wsDir := resolveWorkspaceDir()
-	ccPerms := config.LoadPermissions(platform.ConfigDir())
+	ccPerms := ccAppliedPermissions
 
 	// Workflow executor for WORKFLOW_RUN jobs, mirroring runWork's wiring.
 	ccWfExec := workflow.NewExecutor(workflow.ExecutorConfig{
@@ -2436,8 +2434,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		LogFn:                     activity,
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 ccConfigDir,
+		PermissionsDir:            nodePermissionsDir(),
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !ccPerms.Shell,
+		ShellEnabled:              nodeShellEnabled,
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
