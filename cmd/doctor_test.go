@@ -270,6 +270,27 @@ func TestRenderDoctorReport_NoBindExposure(t *testing.T) {
 	}
 }
 
+func TestRenderDoctorReport_EphemeralServiceExecWarns(t *testing.T) {
+	var buf bytes.Buffer
+	r := doctorReport{
+		dockerHealth: platform.DockerHealth{OK: true},
+		doctor:       healthyDoctorPayload(),
+		serviceExecWarnings: []string{
+			"/etc/systemd/system/citadel.service runs /tmp/citadel from ephemeral /tmp; reinstall before reboot",
+		},
+	}
+	if !r.ok() {
+		t.Fatal("an unsafe service path must be a warning, not hide docker health")
+	}
+	renderDoctorReport(&buf, r)
+	out := buf.String()
+	for _, want := range []string{"SERVICE EXECUTABLE", "[WARN]", "/tmp/citadel", "Overall: OK"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered report missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
 // TestDoctorReportOK_DarwinDockerOptional pins citadel-cli#1042: on macOS Docker
 // Desktop is optional, so an unusable engine must NOT fail the exit code.
 func TestDoctorReportOK_DarwinDockerOptional(t *testing.T) {
