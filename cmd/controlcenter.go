@@ -2252,11 +2252,24 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		activity("warning", "Per-node shell stream skipped (node ID unavailable); node-targeted jobs fall back to the shared stream")
 	}
 
+	// The control-center heartbeat starts before entering runner.Run, but must
+	// not publish until the full handler set (including privileged handlers) is
+	// installed. The collector reads through this pointer on every heartbeat.
+	var ccNodeRunner atomic.Pointer[worker.Runner]
+	var startHeartbeatPublisher func()
+
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
 		NodeName:  nodeName,
 		ConfigDir: "",
 		Services:  nil,
+		JobTypes: func() []string {
+			runner := ccNodeRunner.Load()
+			if runner == nil {
+				return nil
+			}
+			return runner.SupportedJobTypes()
+		},
 	})
 
 	// Start heartbeat publisher if we have API mode
@@ -2349,34 +2362,36 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 						go pulseStats.Run(ctx)
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
-					go func() {
-						activity("info", "Heartbeat publishing started")
-
-						// Update TUI heartbeat indicator periodically
-						heartbeatTicker := time.NewTicker(30 * time.Second)
-						defer heartbeatTicker.Stop()
-
+					startHeartbeatPublisher = func() {
 						go func() {
-							// Initial heartbeat indicator
-							if ccHeartbeatFn != nil {
-								ccHeartbeatFn(true)
-							}
-							for {
-								select {
-								case <-ctx.Done():
-									return
-								case <-heartbeatTicker.C:
-									if ccHeartbeatFn != nil {
-										ccHeartbeatFn(true)
+							activity("info", "Heartbeat publishing started")
+
+							// Update TUI heartbeat indicator periodically
+							heartbeatTicker := time.NewTicker(30 * time.Second)
+							defer heartbeatTicker.Stop()
+
+							go func() {
+								// Initial heartbeat indicator
+								if ccHeartbeatFn != nil {
+									ccHeartbeatFn(true)
+								}
+								for {
+									select {
+									case <-ctx.Done():
+										return
+									case <-heartbeatTicker.C:
+										if ccHeartbeatFn != nil {
+											ccHeartbeatFn(true)
+										}
 									}
 								}
+							}()
+
+							if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+								activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
 							}
 						}()
-
-						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
-							activity("warning", fmt.Sprintf("Heartbeat error: %v", err))
-						}
-					}()
+					}
 				}
 			}
 		}
@@ -2441,10 +2456,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !ccPerms.Desktop,
+		DesktopEnabled:            nodeDesktopEnabled,
 		FilesDisabled:             !ccPerms.Files,
+		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              ccWfExec,
 		HandlerLog:                func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 		PinnedServices:            ccPinnedServices,
+		InstanceEnabled:           instanceProvisioningEnabled(ccConfigDir),
 	}
 	// Swap manager (if any) is discarded here: this collector does not wire
 	// WorkerLiveness/PinnedServices/ModelHotswap either (a pre-existing gap —
@@ -2483,6 +2501,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// on the live runner, shared with runWork. This closes the "no handler" hazard for
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
 
 	activity("success", "Worker started, listening for jobs...")
 

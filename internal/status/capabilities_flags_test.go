@@ -165,6 +165,39 @@ func TestAvailableServicesJSONContract(t *testing.T) {
 	}
 }
 
+func TestCollectorPublishesLiveJobTypes(t *testing.T) {
+	calls := 0
+	collector := NewCollector(CollectorConfig{
+		JobTypes: func() []string {
+			calls++
+			return []string{"FILE_LIST", "FILE_READ", "SERVICE_STATUS"}
+		},
+	})
+	status, err := collector.Collect()
+	if err != nil {
+		t.Fatalf("Collect() error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("JobTypes provider calls = %d, want 1", calls)
+	}
+	got := strings.Join(status.Capabilities.JobTypes, ",")
+	if got != "FILE_LIST,FILE_READ,SERVICE_STATUS" {
+		t.Fatalf("capabilities.job_types = %q, want live handler set", got)
+	}
+}
+
+func TestJobTypesJSONContract(t *testing.T) {
+	caps := &NodeCapabilities{JobTypes: []string{"FILE_LIST", "FILE_READ", "SERVICE_STATUS"}}
+	b, err := json.Marshal(caps)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, `"job_types":["FILE_LIST","FILE_READ","SERVICE_STATUS"]`) {
+		t.Errorf("capabilities JSON missing job_types array; got %s", got)
+	}
+}
+
 // TestNodeStatusCapabilitiesKeyPresent verifies the capabilities block is
 // emitted under the "capabilities" key on NodeStatus (the heartbeat payload),
 // matching CitadelStatus.capabilities on the backend.

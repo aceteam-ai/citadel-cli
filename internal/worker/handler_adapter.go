@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
@@ -18,6 +19,17 @@ type LegacyHandlerAdapter struct {
 	jobType string
 	handler jobs.JobHandler
 	logFn   func(level, msg string)
+	enabled func() bool
+}
+
+// newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
+// a live permission source. CanHandle drives both runner routing and heartbeat
+// capability advertisement; Execute checks again to close the revoke race
+// between handler selection and execution.
+func newGatedLegacyHandlerAdapter(jobType string, handler jobs.JobHandler, enabled func() bool) *LegacyHandlerAdapter {
+	a := NewLegacyHandlerAdapter(jobType, handler)
+	a.enabled = enabled
+	return a
 }
 
 // NewLegacyHandlerAdapter creates an adapter for an existing job handler.
@@ -35,12 +47,16 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
-	return a.jobType == jobType
+	return a.jobType == jobType && (a.enabled == nil || a.enabled())
 }
 
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
+	if a.enabled != nil && !a.enabled() {
+		err := fmt.Errorf("job type %s is disabled by current node permissions", job.Type)
+		return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+	}
 
 	// Convert worker.Job to nexus.Job for the legacy handler
 	nexusJob := &nexus.Job{
@@ -129,10 +145,8 @@ type LegacyHandlerOpts struct {
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
 	AllowReadOutsideWorkspace bool
-	// ShellDisabled, when true, registers the SHELL_COMMAND handler in a
-	// refusing state: it is still dispatchable (so the node returns the
-	// "disabled" error rather than "unsupported job type"), but every command
-	// is rejected. Wired from the persisted `shell` node permission.
+	// ShellDisabled, when true, skips the SHELL_COMMAND handler because every
+	// command would be refused. Wired from the persisted `shell` permission.
 	ShellDisabled bool
 	// ShellEnabled is the live shell-permission source. When non-nil it
 	// supersedes ShellDisabled at execution time, allowing permission changes
@@ -159,6 +173,10 @@ type LegacyHandlerOpts struct {
 	// job type") until the operator opts in. Wired from the persisted `desktop`
 	// node permission.
 	DesktopDisabled bool
+	// DesktopEnabled is the live desktop-permission source. When non-nil,
+	// desktop handlers stay registered behind a per-dispatch fail-closed gate so
+	// APPLY_DEVICE_CONFIG changes take effect without restarting the worker.
+	DesktopEnabled func() bool
 	// FilesDisabled, when true, SKIPS registration of the file browse/host job
 	// handlers (FILE_READ/READ_BYTES/WRITE/WRITE_BYTES/EDIT/LIST/SEARCH/INDEX/
 	// SEMANTIC_SEARCH). A fresh node has `files` default-DENY (aceteam#6524).
@@ -167,6 +185,13 @@ type LegacyHandlerOpts struct {
 	// capability and are NOT gated here. Wired from the persisted `files`
 	// node permission.
 	FilesDisabled bool
+	// FilesEnabled is the live files-permission source. When non-nil, file
+	// handlers stay registered behind a per-dispatch fail-closed gate so both
+	// capability advertisement and execution track permission revocation.
+	FilesEnabled func() bool
+	// GOOS overrides the host OS for handler-registration tests. Empty uses the
+	// running binary's OS.
+	GOOS string
 	// MeetingProfileDir overrides the persistent, signed-in bot Chrome profile
 	// directory used by MEETING_JOIN (issue #5122). If empty, the handler falls
 	// back to platform.EnvMeetingProfileDir, then platform's ConfigDir()-rooted
@@ -196,9 +221,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
 	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
 	configHandler.PermissionsDir = opts.PermissionsDir
+	goos := opts.GOOS
+	if goos == "" {
+		goos = runtime.GOOS
+	}
 
 	handlers := []*LegacyHandlerAdapter{
-		NewLegacyHandlerAdapter(JobTypeShellCommand, shellHandler),
 		NewLegacyHandlerAdapter(JobTypeTmuxSession, jobs.NewTmuxSessionHandler("")),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),
@@ -225,7 +253,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		NewLegacyHandlerAdapter(JobTypeSandboxResume, &jobs.SandboxResumeHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCachePull, &jobs.ModelCachePullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeModelCacheEvict, &jobs.ModelCacheEvictHandler{}),
-		NewLegacyHandlerAdapter(JobTypeIOSBuild, jobs.NewIOSBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeAndroidBuild, jobs.NewAndroidBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeGomobileBuild, jobs.NewGomobileBuildHandler(opts.WorkspaceDir)),
 		NewLegacyHandlerAdapter(JobTypeCobrowse, jobs.NewCobrowseHandler()),
@@ -267,6 +294,17 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// closed rather than mis-delivering.
 		NewLegacyHandlerAdapter(JobTypeInstanceMessage, jobs.NewInstanceMessageHandler()),
 	}
+	// /bin/sh is not a native Windows execution surface. On other platforms the
+	// live gate keeps routing and advertised capabilities synchronized with
+	// APPLY_DEVICE_CONFIG permission changes, including immediate revocation.
+	if goos != "windows" && (opts.ShellEnabled != nil || !opts.ShellDisabled) {
+		handlers = append(handlers, newGatedLegacyHandlerAdapter(JobTypeShellCommand, shellHandler, opts.ShellEnabled))
+	}
+	// IOS_BUILD itself rejects every job off macOS. Keep other build and
+	// read-only handlers available on all supported platforms.
+	if goos == "darwin" {
+		handlers = append(handlers, NewLegacyHandlerAdapter(JobTypeIOSBuild, jobs.NewIOSBuildHandler(opts.WorkspaceDir)))
+	}
 
 	// Screen/VNC/desktop handlers (issue #4179, #4180) — the screen-share
 	// surface. Default-DENY (aceteam#6524): registered ONLY when the operator has
@@ -276,13 +314,14 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	// operator's screen. FILE_SCREENSHOT and VNC_SCREENSHOT share one capture
 	// path (the internal/desktop X11 capture); there is no separate VNC
 	// framebuffer source.
-	if !opts.DesktopDisabled {
+	if opts.DesktopEnabled != nil || !opts.DesktopDisabled {
+		gate := opts.DesktopEnabled
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}),
-			NewLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}),
-			NewLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}),
-			NewLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}),
-			NewLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}),
+			newGatedLegacyHandlerAdapter(JobTypeFileScreenshot, &jobs.ScreenshotHandler{}, gate),
+			newGatedLegacyHandlerAdapter(JobTypeVNCScreenshot, &jobs.ScreenshotHandler{}, gate),
+			newGatedLegacyHandlerAdapter(JobTypeVNCType, &jobs.TypeHandler{}, gate),
+			newGatedLegacyHandlerAdapter(JobTypeVNCKeys, &jobs.KeysHandler{}, gate),
+			newGatedLegacyHandlerAdapter(JobTypeVNCActions, &jobs.ActionsHandler{}, gate),
 		)
 	}
 
@@ -295,7 +334,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// operator's filesystem. NOTE: TRANSCRIBE_AUDIO and MEETING_JOIN below
 		// also use the workspace but belong to the default-ON meeting capability,
 		// so they are deliberately OUTSIDE this gate.
-		if !opts.FilesDisabled {
+		if opts.FilesEnabled != nil || !opts.FilesDisabled {
+			gate := opts.FilesEnabled
 			readHandler := jobs.NewFileReadHandler(opts.WorkspaceDir)
 			readHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
@@ -318,15 +358,15 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 			indexHandler.AllowOutsideWorkspace = opts.AllowReadOutsideWorkspace
 
 			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeFileRead, readHandler),
-				NewLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler),
-				NewLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir)),
-				NewLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir)),
-				NewLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir)),
-				NewLegacyHandlerAdapter(JobTypeFileList, listHandler),
-				NewLegacyHandlerAdapter(JobTypeFileSearch, searchHandler),
-				NewLegacyHandlerAdapter(JobTypeFileIndex, indexHandler),
-				NewLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, "")),
+				newGatedLegacyHandlerAdapter(JobTypeFileRead, readHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir), gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileWriteBytes, jobs.NewFileWriteBytesHandler(opts.WorkspaceDir), gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir), gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileList, listHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileSearch, searchHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileIndex, indexHandler, gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileSemanticSearch, jobs.NewFileSemanticSearchHandler(opts.WorkspaceDir, ""), gate),
 			)
 		}
 
