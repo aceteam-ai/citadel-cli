@@ -13,6 +13,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/service"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -52,7 +53,8 @@ type doctorReport struct {
 	// ollama). Informational only: it does NOT affect the exit code, matching the
 	// posture of the job-routing section (a deliberate `bind: all` is a valid
 	// operator choice, not a failure).
-	bindWarnings []string
+	bindWarnings        []string
+	serviceExecWarnings []string
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Only the
@@ -80,10 +82,11 @@ func runDoctorChecks() doctorReport {
 func runDoctorChecksFor(isDarwin bool) doctorReport {
 	bin := catalog.SelectContainerRuntime().EngineBin
 	return doctorReport{
-		dockerHealth:   platform.CheckDockerUsable(bin),
-		doctor:         agentDoctor(worker.WorkerSnapshot{}),
-		dockerOptional: isDarwin,
-		bindWarnings:   engineBindExposureWarnings(),
+		dockerHealth:        platform.CheckDockerUsable(bin),
+		doctor:              agentDoctor(worker.WorkerSnapshot{}),
+		dockerOptional:      isDarwin,
+		bindWarnings:        engineBindExposureWarnings(),
+		serviceExecWarnings: service.EphemeralManagedExecStarts(),
 	}
 }
 
@@ -139,6 +142,15 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 		fmt.Fprintf(w, "  %s no embedded engine is published on all interfaces\n", goodColor.Sprint("[OK]"))
 	} else {
 		for _, warning := range r.bindWarnings {
+			fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[WARN]"), warning)
+		}
+	}
+
+	headerColor.Fprintln(w, "\nSERVICE EXECUTABLE")
+	if len(r.serviceExecWarnings) == 0 {
+		fmt.Fprintf(w, "  %s no Citadel service ExecStart points at ephemeral storage\n", goodColor.Sprint("[OK]"))
+	} else {
+		for _, warning := range r.serviceExecWarnings {
 			fmt.Fprintf(w, "  %s %s\n", warnColor.Sprint("[WARN]"), warning)
 		}
 	}
