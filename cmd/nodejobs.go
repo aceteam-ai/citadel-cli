@@ -25,7 +25,7 @@ type nodeJobHandlerOpts struct {
 	PermissionsDir string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
-	// ShellDisabled registers SHELL_COMMAND in a refusing state (still dispatchable).
+	// ShellDisabled omits SHELL_COMMAND because it cannot execute while disabled.
 	ShellDisabled bool
 	// ShellEnabled reloads the persisted shell permission for each job so a
 	// config push applies without a worker restart.
@@ -43,10 +43,16 @@ type nodeJobHandlerOpts struct {
 	// (aceteam#6524). Wired from the persisted `desktop` node permission
 	// (default-DENY on a fresh node).
 	DesktopDisabled bool
+	// DesktopEnabled reloads the persisted desktop permission for each routing
+	// decision so configuration pushes take effect without a restart.
+	DesktopEnabled func() bool
 	// FilesDisabled skips registration of the file browse/host handlers
 	// (aceteam#6524). Wired from the persisted `files` node permission
 	// (default-DENY on a fresh node).
 	FilesDisabled bool
+	// FilesEnabled reloads the persisted files permission for each routing
+	// decision so revocation immediately removes execution authority.
+	FilesEnabled func() bool
 	// LogFn routes legacy handler job output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkflowExec backs the WORKFLOW_RUN handler. Required.
@@ -58,6 +64,9 @@ type nodeJobHandlerOpts struct {
 	// by the model-hotswap swap manager (#632) so a pinned engine is never
 	// evicted to swap in another. Optional.
 	PinnedServices []string
+	// InstanceEnabled is true only when this node has enabled Proxmox
+	// provisioning configuration. INSTANCE_* is otherwise not dispatchable.
+	InstanceEnabled bool
 }
 
 // buildNodeJobHandlers returns the base node-job handler set: the legacy Nexus
@@ -84,7 +93,9 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		ShellHasPasscode:          opts.ShellHasPasscode,
 		ShellVerifyPasscode:       opts.ShellVerifyPasscode,
 		DesktopDisabled:           opts.DesktopDisabled,
+		DesktopEnabled:            opts.DesktopEnabled,
 		FilesDisabled:             opts.FilesDisabled,
+		FilesEnabled:              opts.FilesEnabled,
 	})
 	if opts.WorkflowExec != nil {
 		handlers = append(handlers, workflow.NewHandler(opts.WorkflowExec))
@@ -197,12 +208,13 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Log: opts.HandlerLog,
 	}))
 
-	// INSTANCE_* (aceteam#5963): fabric instance provisioning on this node's
-	// Proxmox hypervisor. Registered unconditionally so nodes without a proxmox
-	// provisioning config fail these jobs with a clear message; the lazy factory
-	// gates on proxmox.json's provisioning.enabled.
-	runner.RegisterHandler(worker.NewInstanceHandler(worker.InstanceHandlerConfig{
-		Provider: newInstanceProviderFactory(opts.ConfigDir, opts.HandlerLog),
-		Log:      opts.HandlerLog,
-	}))
+	// INSTANCE_* is a mutating hypervisor capability: only register it when the
+	// required Proxmox configuration is enabled. A node without that config must
+	// not advertise work it will refuse.
+	if opts.InstanceEnabled {
+		runner.RegisterHandler(worker.NewInstanceHandler(worker.InstanceHandlerConfig{
+			Provider: newInstanceProviderFactory(opts.ConfigDir, opts.HandlerLog),
+			Log:      opts.HandlerLog,
+		}))
+	}
 }

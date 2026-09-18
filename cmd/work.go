@@ -1496,6 +1496,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		return laneActivityFrom(rn.LaneSnapshots())
 	}
 
+	jobTypesFn := func() []string {
+		rn := nodeRunner.Load()
+		if rn == nil {
+			return nil
+		}
+		return rn.SupportedJobTypes()
+	}
 	// Pairing-display capability probe for the heartbeat (citadel-cli#659
 	// P0): can this node render a platform-pushed node:exec pairing code
 	// right now? Independent of the pairingdisplay.Manager singleton's
@@ -1555,6 +1562,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			LaneActivity:    laneActivityFn,
 			PairingDisplay:  pairingDisplayFn,
 			CacheReport:     cacheReportFn,
+			JobTypes:        jobTypesFn,
 		})
 	}
 
@@ -1851,6 +1859,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "   - ⚠️ SSH sync enabled but no API key configured")
 	}
 
+	// Construct the status publisher now, but start it only after the runner has
+	// every handler registered below. Start publishes immediately, so starting
+	// here used to emit a capabilities-less initial heartbeat.
+	var startStatusPublisher func()
 	// Start status publisher if enabled
 	if workRedisStatus {
 		// Create collector if not already created
@@ -1869,6 +1881,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				LaneActivity:    laneActivityFn,
 				PairingDisplay:  pairingDisplayFn,
 				CacheReport:     cacheReportFn,
+				JobTypes:        jobTypesFn,
 			})
 		}
 
@@ -2058,12 +2071,14 @@ func runWork(cmd *cobra.Command, args []string) {
 					if pulseStats != nil {
 						apiPublisher.SetStatsProvider(pulseStats.Latest)
 					}
-					go func() {
-						fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
-						if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
-							fmt.Fprintf(os.Stderr, "   - ⚠️ API status publisher error: %v\n", err)
-						}
-					}()
+					startStatusPublisher = func() {
+						go func() {
+							fmt.Printf("   - API status: %s (every 30s)\n", apiPublisher.PubSubChannel())
+							if err := apiPublisher.Start(ctx); err != nil && err != context.Canceled {
+								fmt.Fprintf(os.Stderr, "   - ⚠️ API status publisher error: %v\n", err)
+							}
+						}()
+					}
 				}
 			}
 		} else if workRedisURL != "" {
@@ -2108,15 +2123,17 @@ func runWork(cmd *cobra.Command, args []string) {
 				if pulseStats != nil {
 					redisPublisher.SetStatsProvider(pulseStats.Latest)
 				}
-				go func() {
-					fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
-					if deviceCode != "" {
-						fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
-					}
-					if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
-						fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
-					}
-				}()
+				startStatusPublisher = func() {
+					go func() {
+						fmt.Printf("   - Redis status: %s (every 30s)\n", redisPublisher.PubSubChannel())
+						if deviceCode != "" {
+							fmt.Printf("   - Device code: %s (for config lookup)\n", deviceCode[:8]+"...")
+						}
+						if err := redisPublisher.Start(ctx); err != nil && err != context.Canceled {
+							fmt.Fprintf(os.Stderr, "   - ⚠️ Redis status publisher error: %v\n", err)
+						}
+					}()
+				}
 			}
 
 			// Start config queue consumer for device configuration jobs
@@ -2601,10 +2618,13 @@ func runWork(cmd *cobra.Command, args []string) {
 		ShellHasPasscode:          nodeHasPasscode,
 		ShellVerifyPasscode:       nodePasscodeVerifier,
 		DesktopDisabled:           !workPerms.Desktop,
+		DesktopEnabled:            nodeDesktopEnabled,
 		FilesDisabled:             !workPerms.Files,
+		FilesEnabled:              nodeFilesEnabled,
 		WorkflowExec:              wfExec,
 		HandlerLog:                func(format string, args ...any) { Log(format, args...) },
 		PinnedServices:            manifestPinnedServices(workManifest),
+		InstanceEnabled:           instanceProvisioningEnabled(workConfigDir),
 	}
 	handlers, swapMgr := buildNodeJobHandlers(nodeJobOpts)
 	// Published via atomic.Store, not a plain assignment: status-publisher
@@ -2661,7 +2681,6 @@ func runWork(cmd *cobra.Command, args []string) {
 	// already-started status-publisher goroutines) can read its lane activity.
 	// Atomic Store paired with the atomic Load in that closure — see the
 	// nodeRunner declaration above for why a plain var would race (citadel-cli#908).
-	nodeRunner.Store(runner)
 
 	// Add stream writer factory if available
 	if streamFactory != nil {
@@ -2675,6 +2694,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	// Publish only after every handler is registered so heartbeats expose one
+	// complete immutable set, never a partial capability advertisement.
+	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
 
 	// Start the periodic auto-updater. The goroutine always runs; whether it
 	// actually checks/installs on a given tick is decided per-tick by
@@ -2714,6 +2736,16 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+}
+
+// startStatusPublisherAfterRunner establishes the startup ordering contract:
+// the publisher's synchronous initial heartbeat can only run after the runner
+// (and therefore its complete dispatchable job-type set) is visible.
+func startStatusPublisherAfterRunner(nodeRunner *atomic.Pointer[worker.Runner], runner *worker.Runner, start func()) {
+	nodeRunner.Store(runner)
+	if start != nil {
+		start()
 	}
 }
 

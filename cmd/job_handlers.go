@@ -40,6 +40,14 @@ func nodeShellEnabled() bool {
 	return loadNodePermissions().Shell
 }
 
+func nodeDesktopEnabled() bool {
+	return loadNodePermissions().Desktop
+}
+
+func nodeFilesEnabled() bool {
+	return loadNodePermissions().Files
+}
+
 // executeJob finds the right handler and runs a job.
 func executeJob(client *nexus.Client, job *nexus.Job) (string, error) {
 	var output []byte

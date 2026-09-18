@@ -1030,7 +1030,7 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 		"unsupported_job_type": true,
 		"job_type":             job.Type,
 		"agent_version":        agentVersion,
-		"supported_types":      r.supportedJobTypes(),
+		"supported_types":      r.SupportedJobTypes(),
 	}
 
 	r.recordJob(buildUsageRecord(job, "failed", startTime, time.Now(), nil, err))
@@ -1054,10 +1054,10 @@ func (r *Runner) failUnsupportedJobType(ctx context.Context, job *Job, startTime
 	}
 }
 
-// supportedJobTypes returns the sorted set of job types this node's registered
-// handlers can process. It is included in the unsupported-type failure so the
-// backend (and operators) can see exactly what the node build supports.
-func (r *Runner) supportedJobTypes() []string {
+// SupportedJobTypes returns the sorted set of job types this node's registered
+// handlers can process. It is the canonical live capability set used by both
+// unsupported-type failures and heartbeat advertisement.
+func (r *Runner) SupportedJobTypes() []string {
 	seen := make(map[string]struct{})
 	for _, jt := range allKnownJobTypes {
 		for _, h := range r.handlers {
