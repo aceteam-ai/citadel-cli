@@ -180,6 +180,10 @@ actual access:
 - **Control Center:** the Built-in Services modal toggles
   console/desktop/files/shell. Enabling one with no passcode set warns that
   access stays denied until a passcode is set.
+- **Local CLI:** `citadel permission` reports the Shell policy and passcode
+  presence. `citadel permission shell enable` and `citadel permission shell
+  disable` update the same node policy without exposing a secret on the command
+  line.
 - **Programmatic (`APPLY_DEVICE_CONFIG`):** `DeviceConfig` carries
   `consoleEnabled` / `desktopEnabled` / `filesEnabled` / `shellEnabled` (`*bool`,
   nil = untouched) and `nodePasscode` (`*string`, bcrypt-hashed before persist;
@@ -190,7 +194,8 @@ actual access:
 
 Shell permission and passcode changes are read from that file for each shell
 job, so they take effect without restarting the worker. A local Shell disable
-is therefore an immediate kill switch.
+is therefore an immediate kill switch. A `node:exec` grant authorizes a caller
+but never changes this file on its own.
 
 ### Cross-repo follow-up (aceteam web console, not in this repo)
 

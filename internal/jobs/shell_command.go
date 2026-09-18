@@ -38,7 +38,7 @@ const (
 // so the handler and its tests agree on the wording without duplicating the
 // literals.
 const (
-	msgShellDisabled   = "shell command execution is not enabled on this node; enable the `shell` permission (set `shell: true` in permissions.yaml or toggle Shell in the AceTeam control center)"
+	msgShellDisabled   = "shell command execution is not enabled on this node; enable Shell in the AceTeam control center or run `citadel permission shell enable` on the node (no worker restart is needed)"
 	msgPasscodeNotSet  = "shell command execution requires a node passcode, but none is set; set a node passcode (APPLY_DEVICE_CONFIG `nodePasscode` or the AceTeam control center) before dispatching shell commands"
 	msgPasscodeInvalid = "shell command execution requires the node passcode; present the correct passcode in the SHELL_COMMAND payload `passcode` field"
 )
