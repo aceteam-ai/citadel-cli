@@ -200,7 +200,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	})
 
 	// Load and apply permissions
-	perms := config.LoadPermissions(platform.ConfigDir())
+	perms := loadNodePermissions()
 	gw.SetPermissions(perms)
 
 	// Service ingress / exposure (issue #598): wire the identity resolver

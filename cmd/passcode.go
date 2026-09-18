@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -85,7 +84,7 @@ func runPasscodeSet(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	perms, err := setNodePasscode(platform.ConfigDir(), pin)
+	perms, err := setNodePasscode(nodePermissionsDir(), pin)
 	if err != nil {
 		return err
 	}
@@ -99,7 +98,7 @@ func runPasscodeSet(cmd *cobra.Command, args []string) error {
 }
 
 func runPasscodeClear(cmd *cobra.Command, args []string) error {
-	perms, err := clearNodePasscode(platform.ConfigDir())
+	perms, err := clearNodePasscode(nodePermissionsDir())
 	if err != nil {
 		return err
 	}

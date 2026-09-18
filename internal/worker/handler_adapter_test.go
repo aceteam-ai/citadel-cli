@@ -49,6 +49,37 @@ func TestNewLegacyHandlerAdapter(t *testing.T) {
 	}
 }
 
+func TestApplyDeviceConfigHandlerUsesExplicitPermissionDirectory(t *testing.T) {
+	manifestDir := t.TempDir()
+	permissionsDir := t.TempDir()
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ConfigDir:      manifestDir,
+		PermissionsDir: permissionsDir,
+	})
+
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeApplyDeviceConfig) {
+			continue
+		}
+		adapter, ok := handler.(*LegacyHandlerAdapter)
+		if !ok {
+			t.Fatalf("APPLY_DEVICE_CONFIG handler type = %T", handler)
+		}
+		configHandler, ok := adapter.handler.(*jobs.ConfigHandler)
+		if !ok {
+			t.Fatalf("wrapped APPLY_DEVICE_CONFIG handler type = %T", adapter.handler)
+		}
+		if configHandler.ConfigDir != manifestDir {
+			t.Errorf("ConfigDir = %q, want %q", configHandler.ConfigDir, manifestDir)
+		}
+		if configHandler.PermissionsDir != permissionsDir {
+			t.Errorf("PermissionsDir = %q, want %q", configHandler.PermissionsDir, permissionsDir)
+		}
+		return
+	}
+	t.Fatal("APPLY_DEVICE_CONFIG handler not registered")
+}
+
 func TestLegacyHandlerAdapterCanHandle(t *testing.T) {
 	handler := &TestLegacyHandler{}
 	adapter := NewLegacyHandlerAdapter("TEST_JOB", handler)

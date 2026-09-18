@@ -483,7 +483,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Capture the permission set used for construction-time gates once. The
 	// heartbeat reports this separately from the live persisted intent so the
 	// control plane never calls a restart-bound change applied prematurely.
-	workAppliedPermissions := config.LoadPermissions(platform.ConfigDir())
+	workAppliedPermissions := loadNodePermissions()
 	if warning := sensitiveCapabilityPasscodeWarning(workAppliedPermissions); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
@@ -1643,7 +1643,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				// (aceteam#6524). Loaded fresh per request so a rotated passcode is
 				// honored without a worker restart; fails closed when unset.
 				serverCfg.PasscodeVerifier = func(pin string) bool {
-					return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+					return loadNodePermissions().VerifyPasscode(pin)
 				}
 				Debug("desktop API enabled (per-request VNC readiness checks)")
 				// Bundle VNC startup so the shared desktop works with zero
@@ -2199,12 +2199,12 @@ func runWork(cmd *cobra.Command, args []string) {
 				// APPLY_DEVICE_CONFIG or the Control Center) is honored without a
 				// worker restart. Fails closed when no passcode is set.
 				termConfig.PasscodeVerifier = func(pin string) bool {
-					return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+					return loadNodePermissions().VerifyPasscode(pin)
 				}
 				// Lets the reject response distinguish passcode_not_set from
 				// passcode_invalid (citadel#753); see terminal.Config.PasscodeHasPasscode.
 				termConfig.PasscodeHasPasscode = func() bool {
-					return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+					return loadNodePermissions().HasPasscode()
 				}
 
 				// Best-effort: provision a Citadel-managed tmux binary so persistent
@@ -2594,6 +2594,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	nodeJobOpts := nodeJobHandlerOpts{
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
+		PermissionsDir:            nodePermissionsDir(),
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		ShellDisabled:             !workPerms.Shell,
 		ShellEnabled:              nodeShellEnabled,
@@ -3865,7 +3866,7 @@ func permissionsToHeartbeat(p *config.Permissions) *heartbeat.PermissionState {
 // every passcode/permission enforcement path already pays per request), so
 // re-reading every heartbeat is cheap.
 func currentPermissionsForHeartbeat(applied *config.Permissions) *heartbeat.PermissionState {
-	desired := config.LoadPermissions(platform.ConfigDir())
+	desired := loadNodePermissions()
 	return permissionsToHeartbeatWithApplied(desired, applied)
 }
 

@@ -121,6 +121,10 @@ type LegacyHandlerOpts struct {
 	// ConfigDir is the path to the citadel.yaml manifest directory.
 	// If empty, service-management handlers are not registered.
 	ConfigDir string
+	// PermissionsDir is the machine-convergent node directory containing
+	// permissions.yaml. Production callers must resolve it independently of
+	// ConfigDir, which follows the invoking user's manifest search path.
+	PermissionsDir string
 	// AllowReadOutsideWorkspace, when true, lets read-only file handlers
 	// (FILE_READ, FILE_READ_BYTES, FILE_LIST, FILE_SEARCH) access paths
 	// outside the workspace sandbox. Write handlers are unaffected.
@@ -190,6 +194,8 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	shellHandler.Enabled = opts.ShellEnabled
 	shellHandler.HasPasscode = opts.ShellHasPasscode
 	shellHandler.VerifyPasscode = opts.ShellVerifyPasscode
+	configHandler := jobs.NewConfigHandler(opts.ConfigDir)
+	configHandler.PermissionsDir = opts.PermissionsDir
 
 	handlers := []*LegacyHandlerAdapter{
 		NewLegacyHandlerAdapter(JobTypeShellCommand, shellHandler),
@@ -205,15 +211,10 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// don't run TEI simply never receive `embedding` jobs (they only land on
 		// nodes carrying the task:embedding capability tag).
 		NewLegacyHandlerAdapter(JobTypeEmbedding, &jobs.EmbeddingHandler{}),
-		// citadel-cli#853/#856: "" is NOT --node-dir/CITADEL_NODE_DIR-aware
-		// (falls back to $HOME/citadel-node inside ConfigHandler.Execute) --
-		// safe only because both callers of CreateLegacyHandlersWithOpts
-		// (cmd/work.go's runWork, cmd/controlcenter.go's runTUIWorker) now
-		// refuse to start at all under an active override. See the fuller
-		// note at ConfigHandler.Execute's configDir resolution
-		// (internal/jobs/config_handler.go) before assuming this is safe
-		// from a new call site.
-		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, jobs.NewConfigHandler("")),
+		// Thread both resolved paths into ConfigHandler: ConfigDir owns the
+		// manifest, while PermissionsDir owns the machine-level policy enforced
+		// by this worker.
+		NewLegacyHandlerAdapter(JobTypeApplyDeviceConfig, configHandler),
 		NewLegacyHandlerAdapter(JobTypeExtraction, &jobs.ExtractionHandler{}),
 		NewLegacyHandlerAdapter(JobTypeHTTPProxy, &jobs.HTTPProxyHandler{}),
 		// WEB_FETCH is the SSRF-guarded successor to HTTP_PROXY (aceteam#5995).

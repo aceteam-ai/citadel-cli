@@ -305,7 +305,7 @@ func runPasscodeStatus(cmd *cobra.Command, args []string) error {
 	v := masterVault()
 	st := v.Status()
 	if !st.Configured {
-		perms := config.LoadPermissions(platform.ConfigDir())
+		perms := loadNodePermissions()
 		if perms.PasscodeHash != "" {
 			fmt.Println("Master PIN: not enrolled (legacy node passcode is set; run 'citadel passcode enroll' to migrate).")
 		} else {

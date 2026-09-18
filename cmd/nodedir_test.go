@@ -332,16 +332,10 @@ func TestComposeFailureMessage_CrossProjectHintOnlyUnderOverride(t *testing.T) {
 	}
 }
 
-// TestRunTUIWorker_RefusesUnderNodeDirOverride pins the second half of the
-// config_handler.go fold-in (citadel#856 review): jobs.NewConfigHandler("")
-// (internal/worker/handler_adapter.go) is reached from TWO node-worker entry
-// points, not one -- `citadel work` (runWork) AND the control center's
-// worker mode (runTUIWorker). Both must refuse under an active
-// --node-dir/CITADEL_NODE_DIR override, or APPLY_DEVICE_CONFIG could still
-// silently land on the real machine's $HOME/citadel-node via the entry point
-// that forgot to check. The refusal is the very first statement in
-// runTUIWorker, before any file/network access, so this is safe to call
-// directly in a test.
+// TestRunTUIWorker_RefusesUnderNodeDirOverride keeps the control-center worker
+// aligned with `citadel work`: module reconciliation still cannot atomically
+// redirect both its manifest and lockfile. The refusal is the first statement
+// in runTUIWorker, before any file or network access.
 func TestRunTUIWorker_RefusesUnderNodeDirOverride(t *testing.T) {
 	setNodeDirOverrideForTest(t, t.TempDir())
 

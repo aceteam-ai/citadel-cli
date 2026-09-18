@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
-	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // A map to hold all our registered job handlers.
@@ -23,7 +21,7 @@ var jobHandlers map[string]jobs.JobHandler
 // unless the correct node passcode is presented. VerifyPasscode itself fails
 // closed (no passcode set, or empty/wrong pin, returns false).
 func nodePasscodeVerifier(pin string) bool {
-	return config.LoadPermissions(platform.ConfigDir()).VerifyPasscode(pin)
+	return loadNodePermissions().VerifyPasscode(pin)
 }
 
 // nodeHasPasscode reports whether a node passcode is configured (aceteam#6524).
@@ -32,14 +30,14 @@ func nodePasscodeVerifier(pin string) bool {
 // from "wrong passcode presented" (passcode_invalid) without a worker restart.
 // HasPasscode reports only presence, never the hash.
 func nodeHasPasscode() bool {
-	return config.LoadPermissions(platform.ConfigDir()).HasPasscode()
+	return loadNodePermissions().HasPasscode()
 }
 
 // nodeShellEnabled is the live shell kill-switch. Reloading the small
 // permissions file per SHELL_COMMAND makes both local Control Center toggles
 // and APPLY_DEVICE_CONFIG effective on the next job without a worker restart.
 func nodeShellEnabled() bool {
-	return config.LoadPermissions(platform.ConfigDir()).Shell
+	return loadNodePermissions().Shell
 }
 
 // executeJob finds the right handler and runs a job.
@@ -87,7 +85,7 @@ func init() {
 	// `shell` permission. Without this the legacy Nexus/diagnostic path would
 	// run commands as root regardless of the permission (aceteam #6149, Phase 0).
 	shellHandler := jobs.NewShellCommandHandler("")
-	shellHandler.Disabled = !config.LoadPermissions(platform.ConfigDir()).Shell
+	shellHandler.Disabled = !loadNodePermissions().Shell
 	shellHandler.Enabled = nodeShellEnabled
 	// Even on this legacy Nexus/diagnostic path an enabled shell is passcode-gated
 	// (aceteam#6524): executeJob polls remote jobs and reports back, so leaving the
