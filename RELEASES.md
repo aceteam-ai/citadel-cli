@@ -2601,3 +2601,20 @@ Auto-generated log of every release.
   - fix: adopt an external vLLM even with NO docker runtime (complete Gap C #1084) (#1085)
 
 
+---
+
+## v2.166.0 — 2026-09-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 32 |
+| Lines added | +838 |
+
+**Changes:**
+
+  - feat: add local shell permission control (#1097)
+  - fix(service): durable ExecStart for ephemeral bootstrap binaries (#1096)
+  - fix: apply shell permission changes live (#1086)
+
+
