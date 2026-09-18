@@ -184,6 +184,11 @@ type ConfigHandler struct {
 	// ConfigDir is the directory where citadel configuration is stored.
 	// If empty, defaults to ~/citadel-node
 	ConfigDir string
+	// PermissionsDir is the authoritative node directory containing
+	// permissions.yaml. When empty, the legacy invoker-scoped location is kept
+	// for embedders. Production workers always pass their resolved node config
+	// directory explicitly.
+	PermissionsDir string
 }
 
 // NewConfigHandler creates a new config handler.
@@ -209,24 +214,10 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 
 	// Determine config directory
 	//
-	// citadel-cli#853/#856: this $HOME-based fallback is NOT
-	// --node-dir/CITADEL_NODE_DIR-aware (this package cannot import cmd, where
-	// that override lives, without a cycle). It is safe TODAY only because
-	// every construction site passes h.ConfigDir == "" (see
-	// internal/worker/handler_adapter.go's `jobs.NewConfigHandler("")`) is
-	// reached exclusively through the two node-worker entry points --
-	// `citadel work` (cmd/work.go's runWork) and the control center's worker
-	// mode (cmd/controlcenter.go's runTUIWorker) -- and BOTH now refuse to
-	// start at all when --node-dir/CITADEL_NODE_DIR is active, before
-	// buildNodeJobHandlers (and therefore this handler) is ever constructed.
-	// If APPLY_DEVICE_CONFIG ever gets a second entry point that does NOT
-	// route through one of those two refusals (e.g. a future standalone
-	// config-apply CLI command, or a construction site that starts passing a
-	// non-empty ConfigDir sourced from something other than the override-aware
-	// resolution), this fallback reopens the same "silently touched the real
-	// $HOME/citadel-node instead of the intended node" gap --node-dir exists
-	// to close. Do not assume this is fixed without re-checking both call
-	// sites still refuse.
+	// Production workers pass their already-resolved node directory explicitly
+	// through LegacyHandlerOpts. The $HOME fallback remains only for legacy
+	// embedders that construct ConfigHandler directly with an empty path; new
+	// worker entry points must always pass the resolved directory.
 	configDir := h.ConfigDir
 	if configDir == "" {
 		homeDir, err := os.UserHomeDir()
@@ -320,11 +311,17 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 	// platform pushed any of them. Load-modify-save the same permissions.yaml the
 	// gateway, terminal/desktop listeners, and Redis handlers read, so the
 	// programmatic path and the Control Center converge on one persisted value.
-	// Written to platform.ConfigDir() (the per-concern config location the gates
-	// read), not h.ConfigDir (the manifest dir). Only the fields the platform set
-	// are touched; nil pointers leave the persisted value intact.
+	// Written to h.PermissionsDir, which production workers resolve from the enrolled
+	// node's machine-convergent config directory. This is deliberately not
+	// platform.ConfigDir(): that path is invoker-scoped and can diverge between a
+	// system service and an interactive command. Only fields the platform set are
+	// touched; nil pointers leave the persisted value intact.
 	if config.ConsoleEnabled != nil || config.DesktopEnabled != nil || config.FilesEnabled != nil || config.ShellEnabled != nil || config.NodePasscode != nil {
-		perms := citadelconfig.LoadPermissions(platform.ConfigDir())
+		permissionsDir := h.PermissionsDir
+		if permissionsDir == "" {
+			permissionsDir = platform.ConfigDir()
+		}
+		perms := citadelconfig.LoadPermissions(permissionsDir)
 		if config.ConsoleEnabled != nil {
 			perms.Console = *config.ConsoleEnabled
 		}
@@ -351,7 +348,7 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 				}
 			}
 		}
-		if err := citadelconfig.SavePermissions(platform.ConfigDir(), perms); err != nil {
+		if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
 			result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
 		} else {
 			if config.ConsoleEnabled != nil {

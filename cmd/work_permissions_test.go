@@ -62,3 +62,24 @@ func TestPermissionsToHeartbeatHasPasscode(t *testing.T) {
 		}
 	})
 }
+
+func TestPermissionsToHeartbeatWithAppliedKeepsRestartBoundary(t *testing.T) {
+	applied := config.DefaultPermissions()
+	desired := *applied
+	desired.Console = true
+	desired.Shell = true
+
+	state := permissionsToHeartbeatWithApplied(&desired, applied)
+	if state == nil || state.Applied == nil {
+		t.Fatal("expected desired and applied permission state")
+	}
+	if !state.Console || !state.Shell {
+		t.Fatalf("desired state = %+v, want console and shell enabled", state)
+	}
+	if state.Applied.Console {
+		t.Fatal("console must remain at its startup snapshot until restart")
+	}
+	if !state.Applied.Shell {
+		t.Fatal("shell should advance with its live per-job permission gate")
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/recommend"
@@ -2014,6 +2015,27 @@ type builtinServiceDef struct {
 	enabled *bool
 }
 
+// saveBuiltinPermissions persists a modal toggle and immediately rebuilds the
+// always-visible Actions panel from the saved state. Keeping the refresh in the
+// save seam prevents a successful write from leaving the N/5 summary stale.
+func (cc *ControlCenter) saveBuiltinPermissions(perms *config.Permissions, name string, enabled bool) error {
+	if err := cc.permissions.Save(perms); err != nil {
+		return err
+	}
+
+	applyState := "restart pending"
+	if name == "Shell" {
+		applyState = "applied live"
+	}
+	state := "enabled"
+	if !enabled {
+		state = "disabled"
+	}
+	cc.AddActivity("info", fmt.Sprintf("%s %s (%s)", name, state, applyState))
+	cc.updateActionsPanel()
+	return nil
+}
+
 // showBuiltinServicesModal displays the unified Built-in Services panel.
 // Combines the old permissions modal with per-service status and details.
 // Each service can be toggled on/off; a detail pane updates as you navigate.
@@ -2148,15 +2170,9 @@ func (cc *ControlCenter) showBuiltinServicesModal() {
 		table.Select(row, 0)
 		updateDetail(row)
 
-		if err := cc.permissions.Save(perms); err != nil {
+		if err := cc.saveBuiltinPermissions(perms, services[row].name, *services[row].enabled); err != nil {
 			cc.AddActivity("error", fmt.Sprintf("Failed to save permissions: %v", err))
 		} else {
-			state := "enabled"
-			if !*services[row].enabled {
-				state = "disabled"
-			}
-			cc.AddActivity("info", fmt.Sprintf("%s %s (applies on restart)", services[row].name, state))
-
 			// Passcode reminder (aceteam#6524): a sensitive surface
 			// (Console/Desktop/Files/Shell) that is enabled without a node
 			// passcode fails CLOSED — enabling it does not open it. Warn so the

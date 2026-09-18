@@ -179,6 +179,40 @@ func TestApplyDeviceConfig_EnablesShellAndSetsPasscode(t *testing.T) {
 	}
 }
 
+func TestApplyDeviceConfig_UsesWorkerPermissionDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+	legacyDir := filepath.Join(home, ".citadel-cli")
+	workerDir := filepath.Join(home, "resolved-node")
+	for _, dir := range []string{legacyDir, workerDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	legacy := citadelconfig.DefaultPermissions()
+	legacy.Shell = false
+	if err := citadelconfig.SavePermissions(legacyDir, legacy); err != nil {
+		t.Fatalf("save legacy permissions: %v", err)
+	}
+
+	h := NewConfigHandler(workerDir)
+	h.PermissionsDir = workerDir
+	payload, _ := json.Marshal(map[string]any{"shellEnabled": true})
+	job := &nexus.Job{Type: "APPLY_DEVICE_CONFIG", Payload: map[string]string{"config": string(payload)}}
+	if _, err := h.Execute(JobContext{}, job); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !citadelconfig.LoadPermissions(workerDir).Shell {
+		t.Fatal("worker permission directory was not updated")
+	}
+	if citadelconfig.LoadPermissions(legacyDir).Shell {
+		t.Fatal("invoker-scoped permission directory must remain untouched")
+	}
+}
+
 // TestApplyDeviceConfig_ShellOmittedLeavesPermissionUntouched confirms a device
 // config that does not mention shellEnabled preserves an already-enabled shell
 // permission (nil pointer = no-op), matching the other *Enabled flags.

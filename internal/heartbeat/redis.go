@@ -78,6 +78,25 @@ type PermissionState struct {
 	// the meaningful "not set" state, not an absent field — same as the
 	// other capability bools in this struct.
 	HasPasscode bool `json:"has_passcode"`
+
+	// Applied is the permission set the running process has actually installed.
+	// The top-level booleans are persisted intent and can change while a worker
+	// is running. Consumers must compare them with Applied before claiming a
+	// restart-bound surface is live. Omitted by legacy publishers that cannot
+	// distinguish configured from applied state.
+	Applied *AppliedPermissionState `json:"applied,omitempty"`
+}
+
+// AppliedPermissionState is the permission snapshot enforced by the running
+// worker. Shell is refreshed dynamically and can advance without a restart;
+// listener and handler-registration gates remain at their startup values.
+type AppliedPermissionState struct {
+	Console  bool `json:"console"`
+	Desktop  bool `json:"desktop"`
+	Files    bool `json:"files"`
+	Services bool `json:"services"`
+	SSH      bool `json:"ssh"`
+	Shell    bool `json:"shell"`
 }
 
 // RedisPublisher publishes node status to Redis for real-time updates and reliable processing.

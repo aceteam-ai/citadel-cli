@@ -93,8 +93,11 @@ func LoadPermissions(configDir string) *Permissions {
 	}
 
 	// yaml.Unmarshal only overwrites keys present in the file, so absent keys
-	// keep their default value.
-	_ = yaml.Unmarshal(data, p)
+	// keep their default value. Discard the partially decoded value on any parse
+	// error: a malformed file that starts with "shell: true" must fail closed.
+	if err := yaml.Unmarshal(data, p); err != nil {
+		return DefaultPermissions()
+	}
 	return p
 }
 

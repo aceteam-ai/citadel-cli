@@ -67,8 +67,10 @@ The auto-join meeting notetaker is the first capability wired this way:
 ## The default-OFF (opt-in) + passcode posture (aceteam#6524)
 
 The sensitive remote-access surfaces live in a single per-node config,
-`internal/config/permissions.go` (`permissions.yaml`), which the HTTPS gateway
-and the mesh listeners read:
+`internal/config/permissions.go` (`permissions.yaml`) under
+`network.GetNodeConfigDir()`. The machine-convergent directory is intentional:
+the system worker and an interactive control center must enforce the same local
+policy even when their users and home directories differ.
 
 | Permission  | Surface                                  | Default |
 |-------------|------------------------------------------|---------|
@@ -185,6 +187,10 @@ actual access:
   enable remote shell for the node-management tabs, send
   `{"shellEnabled": true, "nodePasscode": "<pin>"}`; the tabs must then present
   that same `<pin>` in each `SHELL_COMMAND` payload's `passcode` field.
+
+Shell permission and passcode changes are read from that file for each shell
+job, so they take effect without restarting the worker. A local Shell disable
+is therefore an immediate kill switch.
 
 ### Cross-repo follow-up (aceteam web console, not in this repo)
 

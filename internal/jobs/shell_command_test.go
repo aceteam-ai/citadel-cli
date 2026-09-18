@@ -256,6 +256,36 @@ func TestShellCommand_DisabledRefusesAndDoesNotExec(t *testing.T) {
 	}
 }
 
+func TestShellCommand_LivePermissionOverridesStartupSnapshot(t *testing.T) {
+	enabled := false
+	h := &ShellCommandHandler{
+		Disabled:       true,
+		Enabled:        func() bool { return enabled },
+		HasPasscode:    passcodeIsSet,
+		VerifyPasscode: allowPasscode,
+	}
+
+	if _, err := runShell(t, h, "echo blocked"); err == nil || refusalReason(t, err) != ReasonShellDisabled {
+		t.Fatalf("live disabled permission: err = %v, want reason %q", err, ReasonShellDisabled)
+	}
+
+	// Mutate only the live source. If Execute accidentally falls back to the
+	// stale Disabled snapshot, this second dispatch remains refused.
+	enabled = true
+	out, err := runShell(t, h, "echo live")
+	if err != nil {
+		t.Fatalf("live enabled permission should override stale startup snapshot: %v", err)
+	}
+	if string(out) != "live\n" {
+		t.Fatalf("output = %q, want %q", out, "live\\n")
+	}
+
+	enabled = false
+	if _, err := runShell(t, h, "echo blocked-again"); err == nil || refusalReason(t, err) != ReasonShellDisabled {
+		t.Fatalf("live re-disable: err = %v, want reason %q", err, ReasonShellDisabled)
+	}
+}
+
 func TestShellCommand_EnabledByDefault(t *testing.T) {
 	// An enabled handler (Disabled=false) with a satisfied passcode gate executes
 	// normally.

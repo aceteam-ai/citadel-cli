@@ -49,6 +49,37 @@ func TestNewLegacyHandlerAdapter(t *testing.T) {
 	}
 }
 
+func TestApplyDeviceConfigHandlerUsesExplicitPermissionDirectory(t *testing.T) {
+	manifestDir := t.TempDir()
+	permissionsDir := t.TempDir()
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ConfigDir:      manifestDir,
+		PermissionsDir: permissionsDir,
+	})
+
+	for _, handler := range handlers {
+		if !handler.CanHandle(JobTypeApplyDeviceConfig) {
+			continue
+		}
+		adapter, ok := handler.(*LegacyHandlerAdapter)
+		if !ok {
+			t.Fatalf("APPLY_DEVICE_CONFIG handler type = %T", handler)
+		}
+		configHandler, ok := adapter.handler.(*jobs.ConfigHandler)
+		if !ok {
+			t.Fatalf("wrapped APPLY_DEVICE_CONFIG handler type = %T", adapter.handler)
+		}
+		if configHandler.ConfigDir != manifestDir {
+			t.Errorf("ConfigDir = %q, want %q", configHandler.ConfigDir, manifestDir)
+		}
+		if configHandler.PermissionsDir != permissionsDir {
+			t.Errorf("PermissionsDir = %q, want %q", configHandler.PermissionsDir, permissionsDir)
+		}
+		return
+	}
+	t.Fatal("APPLY_DEVICE_CONFIG handler not registered")
+}
+
 func TestLegacyHandlerAdapterCanHandle(t *testing.T) {
 	handler := &TestLegacyHandler{}
 	adapter := NewLegacyHandlerAdapter("TEST_JOB", handler)
@@ -284,6 +315,41 @@ func TestCreateLegacyHandlers_ShellDisabled(t *testing.T) {
 	// report success.
 	if result != nil && result.Status == JobStatusSuccess {
 		t.Error("disabled shell handler must not report success")
+	}
+}
+
+func TestCreateLegacyHandlers_ShellEnabledIsLive(t *testing.T) {
+	enabled := false
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		ShellDisabled:       true,
+		ShellEnabled:        func() bool { return enabled },
+		ShellHasPasscode:    func() bool { return true },
+		ShellVerifyPasscode: func(pin string) bool { return pin == "2468" },
+	})
+
+	var shell JobHandler
+	for _, h := range handlers {
+		if h.CanHandle(JobTypeShellCommand) {
+			shell = h
+			break
+		}
+	}
+	if shell == nil {
+		t.Fatal("SHELL_COMMAND handler must remain registered")
+	}
+
+	job := &Job{ID: "job-live-shell", Type: JobTypeShellCommand, Payload: map[string]any{"command": "echo live", "passcode": "2468"}}
+	if _, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{}); err == nil {
+		t.Fatal("live-disabled shell should refuse")
+	}
+
+	enabled = true
+	result, err := shell.Execute(context.Background(), job, &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("live enable should apply without rebuilding handlers: %v", err)
+	}
+	if result == nil || result.Status != JobStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
 	}
 }
 
