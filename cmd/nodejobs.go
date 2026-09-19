@@ -3,7 +3,9 @@ package cmd
 import (
 	"context"
 
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -15,6 +17,8 @@ import (
 // as the dedicated worker — no more "node vX has no handler for WHATSAPP_PROVISION"
 // when only the control center runs (the competing-consumer incident).
 type nodeJobHandlerOpts struct {
+	// OrgID is the organization chosen for this worker's per-node queue.
+	OrgID string
 	// WorkspaceDir is the sandbox root for file-operation handlers.
 	WorkspaceDir string
 	// ConfigDir is the citadel.yaml manifest directory (enables service handlers).
@@ -174,6 +178,17 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 	runner.RegisterHandler(worker.NewModuleSetHandler(worker.ModuleSetConfig{
 		Ops: newLiveModuleOps(opts.HandlerLog),
 		Log: opts.HandlerLog,
+		External: &worker.ExternalModuleConfig{
+			NodeID:             runner.NodeID(),
+			OrgID:              opts.OrgID,
+			Dir:                network.GetNodeConfigDir(),
+			Ops:                newLiveModuleOps(opts.HandlerLog),
+			ManagedVLLMRunning: status.ManagedVLLMContainerRunning,
+			Drain:              runner.Drain,
+			Resume:             runner.Resume,
+			ActiveJobs:         runner.ActiveJobs,
+			Log:                opts.HandlerLog,
+		},
 	}))
 
 	// EXPOSE_SET (issue #598): expose a local node service on the gateway with
@@ -205,4 +220,15 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Provider: newInstanceProviderFactory(opts.ConfigDir, opts.HandlerLog),
 		Log:      opts.HandlerLog,
 	}))
+}
+
+// nodeJobOrgID mirrors the per-node queue builder's device-first org choice.
+func nodeJobOrgID() string {
+	if device := getDeviceConfigFromFile(); device != nil && device.OrgID != "" {
+		return device.OrgID
+	}
+	if manifest, _, err := findAndReadManifest(); err == nil {
+		return manifest.Node.OrgID
+	}
+	return ""
 }

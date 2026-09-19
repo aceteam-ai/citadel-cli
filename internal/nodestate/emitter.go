@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	fabricpb "github.com/aceteam-ai/fabric-protocol/gen/go/aceteam/fabric/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -35,7 +36,7 @@ type Emitter struct {
 	inspector       ModuleInspector
 	bridgeEndpoints BridgeEndpointsProvider
 	configDir       string // where telemetry.yaml lives; the opt-out flag is re-read here per cycle
-	nodeID          string // Headscale hostname (server auth/identity key)
+	nodeID          string // canonical Headscale numeric ID
 	version         string // citadel-cli version (agent_version)
 	interval        time.Duration
 }
@@ -57,7 +58,7 @@ type Config struct {
 	// ConfigDir is where telemetry.yaml lives; the opt-out flag is re-read from
 	// here each cycle so a runtime toggle takes effect without a restart.
 	ConfigDir string
-	// NodeID is the Headscale hostname.
+	// NodeID is the canonical Headscale numeric ID.
 	NodeID string
 	// Version is the citadel-cli version, reported as agent_version.
 	Version string
@@ -140,6 +141,7 @@ func (e *Emitter) reportOnce(parent context.Context) {
 		state = newEnvelope(e.nodeID, e.version)
 	}
 	AppendBridgeModule(ctx, state, e.bridgeEndpoints)
+	externalengine.AttachObservedModule(ctx, state)
 
 	if !telemetryOn && len(state.GetModules()) == 0 {
 		return

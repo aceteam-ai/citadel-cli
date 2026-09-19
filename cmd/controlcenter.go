@@ -2286,13 +2286,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 				// Periodically report the node's ActualState (installed-module
 				// set + per-module health) to the control plane (#353,
 				// report-only v1). Same device-authed client, same opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname so
+				// as activity telemetry; node_id is the canonical Headscale ID so
 				// the server can re-derive org and ignore any payload org claim.
 				if emitter := nodestate.New(nodestate.Config{
 					Poster:    apiSource.Client(),
 					Inspector: nodestate.DockerInspector(),
 					ConfigDir: platform.ConfigDir(),
-					NodeID:    nodeName,
+					NodeID:    headscaleNodeID,
 					Version:   Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
@@ -2431,6 +2431,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccPinnedServices = manifestPinnedServices(m)
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
+		OrgID:                     nodeJobOrgID(),
 		LogFn:                     activity,
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 ccConfigDir,

@@ -63,7 +63,8 @@ type ModuleSetConfig struct {
 	// The live adapter is wired in cmd (it needs cmd-level catalog/manifest edges
 	// the worker package cannot import); a nil Ops makes Execute fail with a clear
 	// error rather than panic.
-	Ops reconcile.ModuleOps
+	Ops      reconcile.ModuleOps
+	External *ExternalModuleConfig
 
 	// Log reports progress. Nil is a no-op.
 	Log func(format string, args ...any)
@@ -91,6 +92,9 @@ func (h *ModuleSetHandler) CanHandle(jobType string) bool {
 // reconcile engine. See the package doc for the privilege gate and the
 // single-module-scoped-actual trick.
 func (h *ModuleSetHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if status, _ := job.Payload["desired_status"].(string); status == "adopt_external" || status == "detach_external" {
+		return h.executeExternal(ctx, job), nil
+	}
 	// Privilege gate: MODULE_SET must arrive on the per-node stream, not the
 	// shared org pool -- installing/uninstalling a compose stack on the user's
 	// node is privileged and node-targeted. Fail closed.

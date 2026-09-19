@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/engine"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 // ModelDiscoveryTimeout bounds a single model-discovery probe. Discovery runs
@@ -29,7 +32,9 @@ type ModelDiscovery struct {
 func NewModelDiscovery() *ModelDiscovery {
 	return &ModelDiscovery{
 		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout:       5 * time.Second,
+			Transport:     &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext},
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		host: "localhost",
 	}
@@ -104,13 +109,46 @@ func (m *ModelDiscovery) DiscoverModels(ctx context.Context, serviceType string,
 	if label == "" {
 		label = serviceType
 	}
+	if serviceType == "vllm" {
+		endpoint, enabled, err := externalengine.VLLMEndpoint()
+		if err != nil {
+			return nil, err
+		}
+		if !enabled {
+			return nil, fmt.Errorf("explicit external vllm detached")
+		}
+		// The call-site port remains injectable for legacy/managed tests; an
+		// explicit adopted record is authoritative for both host and port.
+		if state, _ := externalengine.Current(); state != nil {
+			port = endpoint.Port
+		} else if m.host != "localhost" {
+			endpoint.Host = m.host // injected discovery host in hermetic tests
+		}
+		models, err := m.discoverOpenAIModelsAt(ctx, label, endpoint.Host, port)
+		if err != nil {
+			return nil, err
+		}
+		if state, _ := externalengine.Current(); state != nil && state.Mode == "adopted" {
+			for _, model := range models {
+				if model == state.Model {
+					return []string{model}, nil
+				}
+			}
+			return nil, fmt.Errorf("adopted vllm model is not served")
+		}
+		return models, nil
+	}
 	return m.discoverOpenAIModels(ctx, label, port)
 }
 
 // discoverOpenAIModels queries an OpenAI-compatible API for loaded models.
 // Used for vLLM and llama.cpp, both of which expose: GET /v1/models
 func (m *ModelDiscovery) discoverOpenAIModels(ctx context.Context, engineLabel string, port int) ([]string, error) {
-	url := fmt.Sprintf("http://%s:%d/v1/models", m.host, port)
+	return m.discoverOpenAIModelsAt(ctx, engineLabel, m.host, port)
+}
+
+func (m *ModelDiscovery) discoverOpenAIModelsAt(ctx context.Context, engineLabel, host string, port int) ([]string, error) {
+	url := "http://" + net.JoinHostPort(host, fmt.Sprint(port)) + "/v1/models"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -135,7 +173,7 @@ func (m *ModelDiscovery) discoverOpenAIModels(ctx context.Context, engineLabel s
 		} `json:"data"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&listResp); err != nil {
 		return nil, fmt.Errorf("failed to parse %s response: %w", engineLabel, err)
 	}
 
@@ -256,13 +294,32 @@ func (m *ModelDiscovery) CheckServiceHealth(ctx context.Context, serviceType str
 	if eng.Spec().Dialect == engine.OllamaNative {
 		return m.checkOllamaHealth(ctx, port)
 	}
+	if serviceType == "vllm" {
+		endpoint, enabled, err := externalengine.VLLMEndpoint()
+		if err != nil {
+			return HealthStatusUnknown, err
+		}
+		if !enabled {
+			return HealthStatusUnknown, fmt.Errorf("explicit external vllm detached")
+		}
+		if state, _ := externalengine.Current(); state != nil {
+			port = endpoint.Port
+		} else if m.host != "localhost" {
+			endpoint.Host = m.host
+		}
+		return m.checkHTTPHealthAt(ctx, endpoint.Host, port)
+	}
 	return m.checkHTTPHealth(ctx, port)
 }
 
 // checkHTTPHealth checks engine health via the /health endpoint (vLLM,
 // llama.cpp).
 func (m *ModelDiscovery) checkHTTPHealth(ctx context.Context, port int) (string, error) {
-	url := fmt.Sprintf("http://%s:%d/health", m.host, port)
+	return m.checkHTTPHealthAt(ctx, m.host, port)
+}
+
+func (m *ModelDiscovery) checkHTTPHealthAt(ctx context.Context, host string, port int) (string, error) {
+	url := "http://" + net.JoinHostPort(host, fmt.Sprint(port)) + "/health"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

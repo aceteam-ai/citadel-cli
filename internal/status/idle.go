@@ -5,12 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 )
 
 // DefaultIdleThresholdSeconds is the number of seconds a managed service may go
@@ -92,7 +95,7 @@ func NewIdleTracker(thresholdSeconds int) *IdleTracker {
 		thresholdSeconds = IdleThresholdSeconds()
 	}
 	return &IdleTracker{
-		client:    &http.Client{Timeout: 3 * time.Second},
+		client:    &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		threshold: time.Duration(thresholdSeconds) * time.Second,
 		now:       time.Now,
 		entries:   make(map[string]*idleEntry),
@@ -221,7 +224,18 @@ func (t *IdleTracker) scrape(ctx context.Context, engineType string, port int) (
 	if !ok {
 		return engineMetrics{}, fmt.Errorf("no idle metrics dialect for engine %q", engineType)
 	}
-	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, dialect.path)
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	if strings.EqualFold(engineType, "vllm") {
+		endpoint, enabled, err := externalengine.VLLMEndpoint()
+		if err != nil || !enabled {
+			return engineMetrics{}, fmt.Errorf("vllm is detached or has invalid endpoint")
+		}
+		if state, _ := externalengine.Current(); state == nil {
+			endpoint.Port = port
+		}
+		baseURL = endpoint.BaseURL()
+	}
+	url := baseURL + dialect.path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return engineMetrics{}, err
