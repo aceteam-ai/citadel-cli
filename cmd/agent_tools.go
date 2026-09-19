@@ -31,6 +31,11 @@ import (
 // without touching this host's real ~/citadel-node/update/state.json.
 var loadUpdateState = update.LoadState
 
+// getAgentNodeConfigDir is a seam over network.GetNodeConfigDir. The agent
+// config endpoint must report the same machine-convergent directory the worker
+// uses, rather than reconstructing a path from the invoking user's HOME.
+var getAgentNodeConfigDir = network.GetNodeConfigDir
+
 // agentProviderDeps carries everything buildAgentProviders needs from runWork.
 type agentProviderDeps struct {
 	state           *worker.WorkerState
@@ -483,7 +488,7 @@ func agentConfig(nodeName, baseURL, orgID string, queues []string) map[string]an
 		"node_name":       nodeName,
 		"api_base_url":    baseURL,
 		"org_id":          orgID,
-		"node_config_dir": filepath.Join(home, ".citadel-node"),
+		"node_config_dir": getAgentNodeConfigDir(),
 		"log_dir":         filepath.Join(home, ".citadel-cli", "logs"),
 		"queues":          queues,
 		"version":         Version,
