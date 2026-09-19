@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"gopkg.in/yaml.v3"
@@ -126,6 +127,9 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 	if err := leafBoundToUID(leafPEM, nodeUID); err != nil {
 		return loginBundleOutcome{}, err
 	}
+	if err := leafValidNow(leafPEM); err != nil {
+		return loginBundleOutcome{}, err
+	}
 
 	// Validate the complete issuer chain before the never-overwrite shortcut.
 	if err := validateChainPEM(leafPEM, chainPEM); err != nil {
@@ -147,6 +151,10 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 		}
 		if err := leafBoundToUID(string(existing), nodeUID); err != nil {
 			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate has a different node id; refusing to proceed")
+		}
+		chain, cErr := os.ReadFile(store.CAChainPath())
+		if cErr != nil || validateChainPEM(string(existing), string(chain)) != nil || leafValidNow(string(existing)) != nil {
+			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate is incomplete or expired; refusing to proceed")
 		}
 		return loginBundleOutcome{NodeUID: nodeUID}, nil
 	}
@@ -188,6 +196,15 @@ func leafBoundToUID(leafPEM, nodeUID string) error {
 		}
 	}
 	return fmt.Errorf("identity bundle leaf node id does not match response")
+}
+
+func leafValidNow(leafPEM string) error {
+	block, _ := pem.Decode([]byte(leafPEM))
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || time.Now().Before(cert.NotBefore) || time.Now().After(cert.NotAfter) {
+		return fmt.Errorf("identity bundle leaf is outside its validity window")
+	}
+	return nil
 }
 
 // validateChainPEM confirms data is one or more parseable X.509 certificates.
