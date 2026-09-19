@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,6 +44,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
@@ -138,7 +140,7 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 			// vllm/llamacpp/bonsai host ports come from the citadel registry so a
 			// per-node CITADEL_*_HOST_PORT override is honored (same source the
 			// engines' compose publishes resolve).
-			"vllm":     fmt.Sprintf("http://localhost:%d", services.VLLMHostPort),
+			"vllm":     externalengine.VLLMBaseURL(),
 			"llamacpp": fmt.Sprintf("http://localhost:%d", services.LlamacppHostPort),
 			"bonsai":   fmt.Sprintf("http://localhost:%d", services.BonsaiHostPort),
 			// unlimited-ocr (Baidu Unlimited-OCR) is served by vLLM on its own
@@ -150,7 +152,7 @@ func NewLLMInferenceHandler() *LLMInferenceHandler {
 			"sglang": "http://localhost:30000",
 			"ollama": "http://localhost:11434",
 		},
-		httpClient:      http.DefaultClient,
+		httpClient:      &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		requestRecorder: status.RecordEngineRequest,
 		signer:          defaultAEPSigner(),
 		fabricNodeID:    func() string { return config.LoadDeviceCredsConverged().FabricNodeID },
@@ -244,6 +246,20 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
 	}
+	configuredExternal := false
+	if payload.Backend == "vllm" {
+		if external, err := externalengine.Current(); err != nil {
+			return h.failure(fmt.Errorf("external vllm configuration: %w", err)), nil
+		} else if external != nil {
+			if external.Mode == "detached" {
+				return h.failure(fmt.Errorf("vllm is explicitly detached")), nil
+			}
+			if payload.Model != external.Model {
+				return h.failure(fmt.Errorf("requested model is not the adopted vllm model")), nil
+			}
+			configuredExternal = true
+		}
+	}
 
 	// Model hotswap (citadel-cli#632): when enabled (swapper injected), an
 	// installed-but-not-resident target engine is swapped in before routing. If it
@@ -251,7 +267,7 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	// normally; otherwise we return a structured model_warming result (a normal
 	// success JobResult carrying no content) for the platform to relay + retry. A
 	// nil swapper (flag off) skips this block entirely — unchanged behavior.
-	if h.swapper != nil {
+	if h.swapper != nil && !configuredExternal {
 		outcome, swapErr := h.swapper.EnsureResident(ctx, payload.Backend, payload.Model)
 		if swapErr != nil {
 			// A node at its swap limit is refusing, not malfunctioning
@@ -367,6 +383,9 @@ func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, e
 
 // executeVLLM handles inference via vLLM's OpenAI-compatible API.
 func (h *LLMInferenceHandler) executeVLLM(ctx context.Context, stream StreamWriter, payload *jobs.LLMInferencePayload, jobID string) (*JobResult, error) {
+	if h.baseURL("vllm") == "" {
+		return nil, fmt.Errorf("vllm is explicitly detached")
+	}
 	// Chat-style requests (gateway `messages`) use /v1/chat/completions so vLLM
 	// applies the served model's chat template; the legacy /v1/completions prompt
 	// path is kept for prompt-style jobs.

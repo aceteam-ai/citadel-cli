@@ -82,6 +82,12 @@ func runningEmbeddedServices(engineBin string) map[string]bool {
 	return set
 }
 
+// ManagedVLLMContainerRunning identifies Citadel's own vLLM container without
+// mistaking a vendor listener on the same port for a managed service.
+func ManagedVLLMContainerRunning() bool {
+	return runningEmbeddedServices(containerRuntimeBin())["vllm"]
+}
+
 // containerRuntimeBin resolves the container runtime binary once per collection,
 // mirroring the start path (cmd/service.go). GPU/inference containers are the
 // ones most likely to run under the hardened podman runtime (#348); a

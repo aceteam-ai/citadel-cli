@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/engine"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	nativesvc "github.com/aceteam-ai/citadel-cli/internal/services"
 )
 
@@ -370,6 +371,21 @@ func managedEnginePortIfRunning(engineBin, name string) (port int, running bool)
 // running-container set, so one heartbeat pass makes ONE container-runtime call
 // instead of one per engine.
 func enginePortIfRunning(running map[string]bool, name string) (port int, isRunning bool) {
+	if name == "vllm" {
+		if c, err := externalengine.Current(); err == nil && c != nil {
+			if c.Mode == "detached" {
+				return 0, false
+			}
+			return c.Endpoint.Port, true
+		}
+		if !running[name] {
+			if endpoint, enabled, err := externalengine.VLLMEndpoint(); err == nil && enabled {
+				if _, serving := OpenAICompatServing(context.Background(), "vllm", endpoint.Port); serving {
+					return endpoint.Port, true
+				}
+			}
+		}
+	}
 	if running[name] {
 		return managedEngineHostPort(name), true
 	}

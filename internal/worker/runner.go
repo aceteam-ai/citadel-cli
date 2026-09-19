@@ -210,6 +210,12 @@ func (r *Runner) Drain() {
 	atomic.StoreInt32(&r.draining, 1)
 }
 
+// Resume reopens consumption when a planned self-reexec could not run.
+func (r *Runner) Resume() { atomic.StoreInt32(&r.draining, 0) }
+
+// NodeID is the local identity used by the runner's target filter.
+func (r *Runner) NodeID() string { return r.config.NodeID }
+
 // isDraining reports whether Drain has been called.
 func (r *Runner) isDraining() bool {
 	return atomic.LoadInt32(&r.draining) == 1

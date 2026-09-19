@@ -1938,7 +1938,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				// to the control plane (#353, report-only v1). Headless `citadel
 				// work` is the production node entrypoint, so it must report too
 				// — not just the TUI. Same device-authed client and opt-out gate
-				// as activity telemetry; node_id is the Headscale hostname. The
+				// as activity telemetry; node_id is the canonical Headscale ID. The
 				// bridge row is exempt from that opt-out gate — see
 				// nodestate.Emitter.reportOnce's doc comment.
 				if emitter := nodestate.New(nodestate.Config{
@@ -1946,7 +1946,7 @@ func runWork(cmd *cobra.Command, args []string) {
 					Inspector:       nodestate.DockerInspector(),
 					BridgeEndpoints: bridgeEndpoints,
 					ConfigDir:       platform.ConfigDir(),
-					NodeID:          nodeName,
+					NodeID:          headscaleNodeID,
 					Version:         Version,
 				}); emitter != nil {
 					go emitter.Run(ctx)
@@ -2592,6 +2592,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	// only worker on the node.
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
+		OrgID:                     nodeJobOrgID(),
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		PermissionsDir:            nodePermissionsDir(),
