@@ -1,13 +1,17 @@
 package cmd
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -536,5 +540,47 @@ func TestLoginBundleRejectsUIDNotSignedIntoLeaf(t *testing.T) {
 	}
 	if store.HasLeaf() {
 		t.Fatal("mismatched UID persisted a leaf")
+	}
+}
+
+func TestLoginUIDRegistersAndDeregistersSameServingName(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore := nodeConfigDirFn, loginIdentityStore
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	t.Cleanup(func() { nodeConfigDirFn, loginIdentityStore = originalDir, originalStore })
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	out, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveLoginNodeUID(out.NodeUID); err != nil {
+		t.Fatal(err)
+	}
+	registered := servingIdentityHostname(out.NodeUID, "display-name")
+	if registered != "node-uid-abc" {
+		t.Fatalf("registration name = %q", registered)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/fabric/device-auth/deregister" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var request nexus.DeregisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+		}
+		if request.NodeName != registered {
+			t.Errorf("logout node_name = %q, registered = %q", request.NodeName, registered)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	if err := nexus.NewDeregisterClient(server.URL, "test-token").Deregister(context.Background(), nexus.DeregisterRequest{NodeName: logoutServingNodeName("display-name")}); err != nil {
+		t.Fatal(err)
 	}
 }

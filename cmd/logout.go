@@ -103,6 +103,10 @@ func deregisterFromBackend(ctx context.Context) {
 			nodeName = status.Hostname
 		}
 	}
+	// A CSR-enrolled login serves as node-{uid}. The manifest keeps the
+	// display name, so an offline logout must resolve the signed serving
+	// identity before asking the backend to deregister that exact node.
+	nodeName = logoutServingNodeName(nodeName)
 
 	// Skip if we have no identity information
 	if nodeName == "" {
@@ -132,6 +136,10 @@ func deregisterFromBackend(ctx context.Context) {
 	} else {
 		fmt.Println("   - Deregistered from coordination server")
 	}
+}
+
+func logoutServingNodeName(fallback string) string {
+	return servingIdentityHostname(loadLoginNodeUID(), fallback)
 }
 
 func init() {
