@@ -41,6 +41,14 @@ func TestNonLoopbackRequiresAssignedInterface(t *testing.T) {
 	}
 }
 
+func TestConfigRefGoldenVector(t *testing.T) {
+	c := Config{Mode: "adopted", Endpoint: Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "example/model", Revision: "7"}
+	const want = "external-vllm-sha256:ec2c0933d8fa3eab999db8d5f1d4c45c74afc1d7a583dbf2890388c4116d7f8b"
+	if got := Ref(c); got != want {
+		t.Fatalf("config_ref = %q, want %q", got, want)
+	}
+}
+
 func TestAtomicPersistenceAndDetachTombstone(t *testing.T) {
 	dir := t.TempDir()
 	first, err := Validate(Config{Version: 1, Mode: "adopted", Endpoint: Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, true)
