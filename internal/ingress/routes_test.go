@@ -21,22 +21,33 @@ func mustBody(t *testing.T, v any) []byte {
 }
 
 func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
-	prev := &RouteMap{etag: "old", routes: map[string]Route{"old": {Slug: "old"}}}
+	now := time.Unix(1000, 0)
+	prev := &RouteMap{etag: "old", routes: map[string]Route{"old": {Slug: "old"}}, fetchedAt: time.Unix(500, 0)}
 
-	// 304 keeps last-good.
-	got, err := applyRoutesResponse(prev, 304, "", nil)
-	if err != nil || got != prev {
-		t.Fatalf("304: got=%v err=%v, want prev unchanged", got, err)
+	// 304 re-stamps last-good fresh: a NEW map sharing prev's routes/etag with
+	// fetchedAt advanced to now (so a healthy 304 feed does not expire).
+	got, err := applyRoutesResponse(prev, 304, "", nil, now)
+	if err != nil {
+		t.Fatalf("304: unexpected err %v", err)
+	}
+	if got == prev {
+		t.Fatal("304: expected a re-stamped clone, got the same pointer")
+	}
+	if got.ETag() != "old" || got.routes["old"].Slug != "old" {
+		t.Fatalf("304: content should be preserved, got etag=%q routes=%v", got.ETag(), got.routes)
+	}
+	if !got.fetchedAt.Equal(now) {
+		t.Fatalf("304: fetchedAt = %v, want %v (freshness reset)", got.fetchedAt, now)
 	}
 
-	// 5xx keeps last-good and returns an error.
-	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"))
+	// 5xx keeps last-good UNCHANGED (no re-stamp) and returns an error.
+	got, err = applyRoutesResponse(prev, 503, "", []byte("nope"), now)
 	if err == nil || got != prev {
 		t.Fatalf("5xx: got=%v err=%v, want prev + error", got, err)
 	}
 
 	// Malformed JSON keeps last-good and returns an error.
-	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"))
+	got, err = applyRoutesResponse(prev, 200, "e1", []byte("{"), now)
 	if err == nil || got != prev {
 		t.Fatalf("malformed: got=%v err=%v, want prev + error", got, err)
 	}
@@ -54,9 +65,12 @@ func TestApplyRoutesResponse_ReplaceKeepDrop(t *testing.T) {
 		LoginURL:       "https://login.example.com",
 		SessionCookies: []string{"sess"},
 	})
-	got, err = applyRoutesResponse(prev, 200, "e2", body)
+	got, err = applyRoutesResponse(prev, 200, "e2", body, now)
 	if err != nil {
 		t.Fatalf("200: unexpected err %v", err)
+	}
+	if !got.fetchedAt.Equal(now) {
+		t.Fatalf("200: fetchedAt = %v, want %v", got.fetchedAt, now)
 	}
 	if got == prev {
 		t.Fatal("200: expected a new map, got prev")
@@ -208,6 +222,104 @@ func TestNegativeCache_ExpiresAndIsBounded(t *testing.T) {
 	}
 	if len(n.entries) > 3 {
 		t.Fatalf("negative cache grew to %d, want <= 3", len(n.entries))
+	}
+}
+
+func TestDecodeRoute_UnknownVisibilityDefaultsGated(t *testing.T) {
+	now := time.Unix(1, 0)
+	body := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"absent": {MeshIP: "100.64.0.1", Port: 8080, Visibility: ""},
+		"weird":  {MeshIP: "100.64.0.2", Port: 8080, Visibility: "somethingelse"},
+		"public": {MeshIP: "100.64.0.3", Port: 8080, Visibility: "public"},
+		"gated":  {MeshIP: "100.64.0.4", Port: 8080, Visibility: "GATED"}, // case-insensitive
+	}})
+	m, err := applyRoutesResponse(nil, 200, "e", body, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unknown/absent fails CLOSED to gated (requires authz), never to public.
+	if m.routes["absent"].Visibility != VisibilityGated {
+		t.Errorf("absent visibility should default gated, got %q", m.routes["absent"].Visibility)
+	}
+	if m.routes["weird"].Visibility != VisibilityGated {
+		t.Errorf("unknown visibility should default gated, got %q", m.routes["weird"].Visibility)
+	}
+	if m.routes["public"].Visibility != VisibilityPublic {
+		t.Errorf("explicit public should stay public, got %q", m.routes["public"].Visibility)
+	}
+	if m.routes["gated"].Visibility != VisibilityGated {
+		t.Errorf("gated (any case) should be gated, got %q", m.routes["gated"].Visibility)
+	}
+}
+
+func TestClientFresh_NilMapAndExpiryFailClosed(t *testing.T) {
+	full := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"app": {MeshIP: "100.64.0.1", Port: 8080, Visibility: "public"},
+	}})
+	src := &fakeSource{
+		fetchFn:    func(context.Context, string) (int, string, []byte, error) { return 200, "e1", full, nil },
+		fetchOneFn: func(context.Context, string) (int, []byte, error) { return 404, nil, nil },
+	}
+	c := NewClient(ClientConfig{Source: src, MaxAge: time.Minute})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	// Config-absent: never fetched -> not fresh, Resolve fails closed (no dial).
+	if c.Fresh() {
+		t.Fatal("a never-fetched client must not be fresh")
+	}
+	if _, ok := c.Resolve(context.Background(), "app"); ok {
+		t.Fatal("resolve must fail closed before any successful fetch")
+	}
+
+	c.pollOnce(context.Background()) // 200 -> fetchedAt = now
+	if !c.Fresh() {
+		t.Fatal("fresh right after a 200 fetch")
+	}
+	if _, ok := c.Resolve(context.Background(), "app"); !ok {
+		t.Fatal("resolve should hit within maxAge")
+	}
+
+	// Advance past maxAge: expired -> fail closed on both Fresh and Resolve.
+	now = now.Add(time.Minute + time.Second)
+	if c.Fresh() {
+		t.Fatal("must expire past maxAge")
+	}
+	if _, ok := c.Resolve(context.Background(), "app"); ok {
+		t.Fatal("resolve must fail closed once the map is expired")
+	}
+}
+
+func TestClient_304RefreshesFreshness(t *testing.T) {
+	full := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"app": {MeshIP: "100.64.0.1", Port: 8080, Visibility: "public"},
+	}})
+	var calls int32
+	src := &fakeSource{
+		fetchFn: func(_ context.Context, _ string) (int, string, []byte, error) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return 200, "e1", full, nil
+			}
+			return 304, "e1", nil, nil // unchanged but re-validated
+		},
+		fetchOneFn: func(context.Context, string) (int, []byte, error) { return 404, nil, nil },
+	}
+	c := NewClient(ClientConfig{Source: src, MaxAge: time.Minute})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	c.pollOnce(context.Background()) // 200 at t=1000 -> fetchedAt=1000
+	now = time.Unix(1050, 0)
+	c.pollOnce(context.Background()) // 304 at t=1050 -> re-stamped fetchedAt=1050
+
+	// t=1100: 50s since the 304 (fresh). Would have been 100s since the 200
+	// (expired) had the 304 not reset the clock.
+	now = time.Unix(1100, 0)
+	if !c.Fresh() {
+		t.Fatal("a 304 must reset the freshness clock so a healthy feed does not expire")
+	}
+	if _, ok := c.Resolve(context.Background(), "app"); !ok {
+		t.Fatal("resolve should still hit after a 304 re-stamp")
 	}
 }
 

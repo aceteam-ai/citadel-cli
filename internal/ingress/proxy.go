@@ -21,10 +21,13 @@ var slugRegexp = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 // Resolver is the slug->route boundary the proxy consults. *Client implements
 // it; a fake is used in proxy tests. Resolve returning ok=false is a 404 and
 // MUST NOT cause any upstream dial -- the map is the authorization boundary.
+// Fresh reports whether the route data is present and within its max-age bound;
+// a false Fresh fails closed (503, no dial) before Resolve is consulted.
 type Resolver interface {
 	Resolve(ctx context.Context, slug string) (Route, bool)
 	LoginURL() string
 	CookieNames() []string
+	Fresh() bool
 }
 
 type routeCtxKey struct{}
@@ -41,6 +44,11 @@ type Proxy struct {
 	defaultCookieNames []string
 	logf               func(format string, args ...any)
 	rp                 *httputil.ReverseProxy
+	// stripFn removes trust headers and session cookies before the pod sees the
+	// request. It is a seam (defaults to stripInbound) so a test can no-op it and
+	// exercise the guaranteed-removal-or-reject backstop, which is otherwise a
+	// tautology against the real deterministic strip.
+	stripFn func(r *http.Request, augment []string)
 }
 
 // ProxyConfig configures a Proxy.
@@ -84,6 +92,7 @@ func NewProxy(cfg ProxyConfig) *Proxy {
 		decisions:          newDecisionCache(cfg.AuthzTTL, cfg.AuthzMax),
 		defaultCookieNames: cfg.DefaultCookieNames,
 		logf:               logf,
+		stripFn:            stripInbound,
 	}
 	transport := &http.Transport{
 		DialContext:       dial,
@@ -146,6 +155,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		notFound(w)
 		return
 	}
+
+	// Route freshness gate (invariant: bounded route max-age). A nil map
+	// (config-absent, never fetched) or one past RouteMaxAge fails closed: 503
+	// and NO upstream dial, so the ingress never proxies to a pod named by stale
+	// route data. This is also what the health check reads, so a stale ingress is
+	// pulled from rotation rather than serving dark.
+	if !p.resolver.Fresh() {
+		p.logf("[ingress] routes not fresh; refusing slug=%q", slug)
+		serviceUnavailable(w)
+		return
+	}
+
 	route, ok := p.resolver.Resolve(r.Context(), slug)
 	if !ok {
 		// Unknown / torn-down / malformed slug: 404, no dial.
@@ -153,25 +174,38 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cookieNames := p.cookieNames()
+	augment := p.cookieNames()
 	subject := ""
 	if route.Visibility == VisibilityGated {
-		cookieVal := firstCookieValue(r, cookieNames)
-		if cookieVal == "" {
+		// Always consult authz, even with no session presented: the control plane
+		// is the authority on visibility. A link-visible / unlisted app allows an
+		// anonymous viewer (authz returns allow); a private app does not. The
+		// session cookie is read here and MUST be stripped before the pod below.
+		sessionCookie := gatedSessionCookie(r, augment)
+		allow, subj, err := p.authorize(r.Context(), slug, sessionCookie)
+		switch {
+		case err == nil && allow:
+			subject = subj
+		case err == nil && sessionCookie == "":
+			// Denied with no session presented: steer the visitor to log in.
 			p.loginRedirect(w)
 			return
-		}
-		allow, subj, err := p.authorize(r.Context(), slug, cookieVal)
-		if err != nil || !allow {
+		default:
+			// Denied with a session, or an authz error: fail closed.
 			forbidden(w)
 			return
 		}
-		subject = subj
 	}
 
-	// Strip before the pod sees the request (both public and gated), then set
-	// only the headers we vouch for.
-	stripInbound(r, cookieNames)
+	// Strip session credentials and trust headers before the pod sees the request
+	// (both public and gated), then verify no platform session cookie survived --
+	// if one did, refuse rather than forward (guaranteed removal or reject).
+	p.stripFn(r, augment)
+	if outboundSessionCookieLeaked(r) {
+		p.logf("[ingress] session isolation failed for slug=%q; refusing", slug)
+		sessionIsolationFailed(w)
+		return
+	}
 	setForwardHeaders(r, host, subject)
 
 	ctx := context.WithValue(r.Context(), routeCtxKey{}, route)
@@ -225,13 +259,20 @@ func notFound(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("not found\n"))
 }
 
-func firstCookieValue(r *http.Request, names []string) string {
-	for _, n := range names {
-		if c, err := r.Cookie(n); err == nil {
-			return c.Value
-		}
-	}
-	return ""
+// serviceUnavailable refuses a request the ingress cannot safely serve yet: the
+// route map is absent (never fetched) or expired past RouteMaxAge. Fail closed
+// with 503 and no upstream dial.
+func serviceUnavailable(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte("service unavailable\n"))
+}
+
+// sessionIsolationFailed refuses a request the ingress could not sanitize: a
+// platform session cookie survived stripping, so forwarding it would leak
+// platform credentials to the pod. Fail closed with 500 rather than proxy.
+func sessionIsolationFailed(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write([]byte("session isolation failed\n"))
 }
 
 // hostWithoutPort lowercases the Host, strips a trailing dot, and removes any
