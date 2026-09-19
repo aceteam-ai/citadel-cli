@@ -129,7 +129,7 @@ func reconnectWithNewName(newName string) error {
 	_ = network.Disconnect()
 
 	config := network.ServerConfig{
-		Hostname:   newName,
+		Hostname:   servingIdentityHostname(loadLoginNodeUID(), newName),
 		ControlURL: nexusURL,
 		StateDir:   network.GetStateDir(),
 	}

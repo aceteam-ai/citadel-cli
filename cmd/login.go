@@ -190,6 +190,12 @@ func runInteractiveLogin() {
 			fmt.Fprintf(os.Stderr, "⚠️  Identity enrollment rejected: %v\n", bErr)
 		} else {
 			servingNodeUID = outcome.NodeUID
+			if servingNodeUID != "" {
+				if err := saveLoginNodeUID(servingNodeUID); err != nil {
+					fmt.Fprintln(os.Stderr, "⚠️  Identity enrollment could not save serving identity.")
+					servingNodeUID = ""
+				}
+			}
 			if outcome.Persisted {
 				fmt.Println("   Identity certificate stored.")
 			}

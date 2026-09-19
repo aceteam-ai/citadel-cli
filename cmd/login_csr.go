@@ -6,10 +6,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"gopkg.in/yaml.v3"
 )
 
 // CSR-enrolled interactive device-grant login (citadel-cli#1062, companion to
@@ -86,9 +88,7 @@ func generateLoginCSR(store *nodeidentity.Store) (csrPEM string, pub *ecdsa.Publ
 //     still returns the validated NodeUID so the serving identity is applied.
 //   - Otherwise: StoreLeaf(leaf, chain), Persisted=true.
 //
-// chain_pem is treated as optional: leaf_pem + node_uid are the load-bearing
-// pair (the cert to persist, and the serving identity). This is a deliberate
-// interpretation of the draft platform contract (documented in the PR).
+// The issuer returns all three fields together; a missing chain is incomplete.
 func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicKey, leafPEM, chainPEM, nodeUID string) (loginBundleOutcome, error) {
 	leafPEM = strings.TrimSpace(leafPEM)
 	chainPEM = strings.TrimSpace(chainPEM)
@@ -111,7 +111,7 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 	// Fail closed on anything but a complete bundle: leaf AND node_uid are both
 	// load-bearing (leaf → the cert we persist; node_uid → the serving
 	// identity). This also catches a chain-only response (no leaf, no uid).
-	if !hasLeaf || !hasUID {
+	if !hasLeaf || !hasUID || chainPEM == "" {
 		return loginBundleOutcome{}, fmt.Errorf("incomplete identity bundle from server; refusing to enroll")
 	}
 
@@ -123,13 +123,13 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 	if err := leafBoundToKey(leafPEM, csrPub); err != nil {
 		return loginBundleOutcome{}, err
 	}
+	if err := leafBoundToUID(leafPEM, nodeUID); err != nil {
+		return loginBundleOutcome{}, err
+	}
 
-	// Validate the chain (if any) BEFORE the never-overwrite short-circuit so a
-	// malformed bundle fails closed regardless of on-disk state.
-	if chainPEM != "" {
-		if err := validateChainPEM(chainPEM); err != nil {
-			return loginBundleOutcome{}, fmt.Errorf("identity bundle chain: %w", err)
-		}
+	// Validate the complete issuer chain before the never-overwrite shortcut.
+	if err := validateChainPEM(leafPEM, chainPEM); err != nil {
+		return loginBundleOutcome{}, fmt.Errorf("identity bundle chain: %w", err)
 	}
 
 	// Never overwrite an existing cert. If it is bound to our key it is
@@ -145,6 +145,9 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 		if err := leafBoundToKey(string(existing), csrPub); err != nil {
 			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate is not bound to this node's key; refusing to proceed")
 		}
+		if err := leafBoundToUID(string(existing), nodeUID); err != nil {
+			return loginBundleOutcome{}, fmt.Errorf("existing identity certificate has a different node id; refusing to proceed")
+		}
 		return loginBundleOutcome{NodeUID: nodeUID}, nil
 	}
 
@@ -158,8 +161,8 @@ func persistLoginIdentityBundle(store *nodeidentity.Store, csrPub *ecdsa.PublicK
 // public key equals pub. Mirrors internal/devicemode/renew.go:parseLeafForKey —
 // a mismatched cert is worse than none, so it is rejected rather than stored.
 func leafBoundToKey(leafPEM string, pub *ecdsa.PublicKey) error {
-	block, _ := pem.Decode([]byte(leafPEM))
-	if block == nil || block.Type != "CERTIFICATE" {
+	block, rest := pem.Decode([]byte(leafPEM))
+	if block == nil || block.Type != "CERTIFICATE" || len(strings.TrimSpace(string(rest))) != 0 {
 		return fmt.Errorf("identity bundle leaf is not a PEM certificate")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
@@ -173,28 +176,119 @@ func leafBoundToKey(leafPEM string, pub *ecdsa.PublicKey) error {
 	return nil
 }
 
+func leafBoundToUID(leafPEM, nodeUID string) error {
+	block, _ := pem.Decode([]byte(leafPEM))
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || cert.Subject.CommonName != nodeUID {
+		return fmt.Errorf("identity bundle leaf node id does not match response")
+	}
+	for _, uri := range cert.URIs {
+		if uri.String() == "aceteam:node:"+nodeUID {
+			return nil
+		}
+	}
+	return fmt.Errorf("identity bundle leaf node id does not match response")
+}
+
 // validateChainPEM confirms data is one or more parseable X.509 certificates.
-func validateChainPEM(data string) error {
+func validateChainPEM(leafPEM, data string) error {
 	rest := []byte(data)
-	found := 0
+	var certs []*x509.Certificate
 	for {
 		var block *pem.Block
+		before := rest
 		block, rest = pem.Decode(rest)
 		if block == nil {
+			if len(strings.TrimSpace(string(rest))) != 0 {
+				return fmt.Errorf("unexpected data in chain PEM")
+			}
 			break
+		}
+		if !strings.HasPrefix(strings.TrimSpace(string(before)), "-----BEGIN CERTIFICATE-----") {
+			return fmt.Errorf("unexpected data in chain PEM")
 		}
 		if block.Type != "CERTIFICATE" {
 			return fmt.Errorf("unexpected PEM block type %q", block.Type)
 		}
-		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
 			return fmt.Errorf("parse certificate: %w", err)
 		}
-		found++
+		certs = append(certs, cert)
 	}
-	if found == 0 {
-		return fmt.Errorf("no certificate found in chain PEM")
+	if len(certs) != 3 {
+		return fmt.Errorf("expected leaf, intermediate, and root certificates")
+	}
+	leafBlock, _ := pem.Decode([]byte(leafPEM))
+	if leafBlock == nil || string(certs[0].Raw) != string(leafBlock.Bytes) {
+		return fmt.Errorf("chain leaf does not match bundle leaf")
+	}
+	if !certs[1].IsCA || !certs[2].IsCA || certs[0].CheckSignatureFrom(certs[1]) != nil || certs[1].CheckSignatureFrom(certs[2]) != nil || certs[2].CheckSignatureFrom(certs[2]) != nil {
+		return fmt.Errorf("invalid certificate chain")
 	}
 	return nil
+}
+
+// saveLoginNodeUID records login enrollment independently of device-mode's
+// device.json. The shared config is machine-convergent across login and work.
+func saveLoginNodeUID(nodeUID string) error {
+	if !nodeUIDPattern.MatchString(nodeUID) {
+		return fmt.Errorf("invalid login node id")
+	}
+	path := filepath.Join(nodeConfigDirFn(), "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	config := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("read login node config: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if config == nil {
+		config = map[string]interface{}{}
+	}
+	config["login_node_uid"] = nodeUID
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	fixStatePermissionsFn()
+	return nil
+}
+
+// loadLoginNodeUID only trusts the persisted UID while the local leaf remains
+// bound to the convergent key. A missing or replaced cert cannot claim it.
+func loadLoginNodeUID() string {
+	data, err := os.ReadFile(filepath.Join(nodeConfigDirFn(), "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	var config struct {
+		LoginNodeUID string `yaml:"login_node_uid"`
+	}
+	if yaml.Unmarshal(data, &config) != nil || !nodeUIDPattern.MatchString(config.LoginNodeUID) {
+		return ""
+	}
+	store := loginIdentityStore()
+	pub, err := store.PublicKey()
+	if err != nil {
+		return ""
+	}
+	leaf, err := os.ReadFile(store.LeafPath())
+	if err != nil || leafBoundToKey(string(leaf), pub) != nil || leafBoundToUID(string(leaf), config.LoginNodeUID) != nil {
+		return ""
+	}
+	chain, err := os.ReadFile(store.CAChainPath())
+	if err != nil || validateChainPEM(string(leaf), string(chain)) != nil {
+		return ""
+	}
+	return config.LoginNodeUID
 }
 
 // servingIdentityHostname is the deterministic Headscale givenName a login node

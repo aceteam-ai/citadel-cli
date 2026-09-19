@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
+	"gopkg.in/yaml.v3"
 )
 
 const testLoginCSR = "-----BEGIN CERTIFICATE REQUEST-----\nMIIBcsrbytes\n-----END CERTIFICATE REQUEST-----\n"
@@ -80,6 +82,49 @@ func selfSignedLeafPEM(t *testing.T, key *ecdsa.PrivateKey, serial int64) string
 		t.Fatalf("create leaf: %v", err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// testLoginChain mirrors the issuer's leaf || intermediate || root contract.
+func testLoginChain(t *testing.T, leafKey *ecdsa.PrivateKey, serial int64) (string, string) {
+	t.Helper()
+	rootKey, intermediateKey := newKey(t), newKey(t)
+	now := time.Now()
+	ca := func(name string, n int64) *x509.Certificate {
+		return &x509.Certificate{SerialNumber: big.NewInt(n), Subject: pkix.Name{CommonName: name}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	}
+	root := ca("root", serial+2)
+	rootDER, err := x509.CreateCertificate(rand.Reader, root, root, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCert, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediate := ca("intermediate", serial+1)
+	interDER, err := x509.CreateCertificate(rand.Reader, intermediate, rootCert, &intermediateKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interCert, err := x509.ParseCertificate(interDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "uid-abc"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
+	nodeURI, err := url.Parse("aceteam:node:uid-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf.URIs = []*url.URL{nodeURI}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leaf, interCert, &leafKey.PublicKey, intermediateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encode := func(der []byte) string {
+		return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	}
+	leafPEM := encode(leafDER)
+	return leafPEM, leafPEM + encode(interDER) + encode(rootDER)
 }
 
 func newKey(t *testing.T) *ecdsa.PrivateKey {
@@ -172,8 +217,7 @@ func TestPersistLoginIdentityBundle_ValidBundlePersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateKey: %v", err)
 	}
-	leaf := selfSignedLeafPEM(t, key, 1)
-	chain := selfSignedLeafPEM(t, key, 2)
+	leaf, chain := testLoginChain(t, key, 1)
 
 	out, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc")
 	if err != nil {
@@ -293,8 +337,8 @@ func TestPersistLoginIdentityBundle_DoesNotOverwriteExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateKey: %v", err)
 	}
-	first := selfSignedLeafPEM(t, key, 1)
-	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, first, "", "uid-abc"); err != nil {
+	first, firstChain := testLoginChain(t, key, 1)
+	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, first, firstChain, "uid-abc"); err != nil {
 		t.Fatalf("first persist: %v", err)
 	}
 	before, err := os.ReadFile(store.LeafPath())
@@ -303,8 +347,8 @@ func TestPersistLoginIdentityBundle_DoesNotOverwriteExisting(t *testing.T) {
 	}
 
 	// A DIFFERENT (still valid) leaf on a second login must not overwrite.
-	second := selfSignedLeafPEM(t, key, 2)
-	out, err := persistLoginIdentityBundle(store, &key.PublicKey, second, "", "uid-abc")
+	second, secondChain := testLoginChain(t, key, 2)
+	out, err := persistLoginIdentityBundle(store, &key.PublicKey, second, secondChain, "uid-abc")
 	if err != nil {
 		t.Fatalf("second persist: %v", err)
 	}
@@ -338,8 +382,8 @@ func TestPersistLoginIdentityBundle_ExistingMismatchedLeafRefused(t *testing.T) 
 		t.Fatalf("seed stranger leaf: %v", err)
 	}
 
-	valid := selfSignedLeafPEM(t, key, 2)
-	out, err := persistLoginIdentityBundle(store, &key.PublicKey, valid, "", "uid-abc")
+	valid, chain := testLoginChain(t, key, 2)
+	out, err := persistLoginIdentityBundle(store, &key.PublicKey, valid, chain, "uid-abc")
 	if err == nil {
 		t.Fatalf("expected refusal on mismatched existing leaf, got %+v", out)
 	}
@@ -372,5 +416,125 @@ func TestServingIdentityHostname(t *testing.T) {
 	}
 	if a, b := servingIdentityHostname("abc123", "my-laptop"), servingIdentityHostname("abc123", "renamed"); a != b {
 		t.Errorf("serving name must be deterministic in node_uid, got %q vs %q", a, b)
+	}
+}
+
+func TestLoginNodeUIDSurvivesWorkAndReconnectWithoutDeviceEnrollment(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore, originalWorkName := nodeConfigDirFn, loginIdentityStore, workNodeName
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	workNodeName = "display-name"
+	t.Cleanup(func() {
+		nodeConfigDirFn, loginIdentityStore, workNodeName = originalDir, originalStore, originalWorkName
+	})
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("device_api_token: preserved\nhostname: display-name\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveLoginNodeUID("uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "node-uid-abc" {
+		t.Fatalf("work/reconnect hostname = %q", got)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]interface{}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg["device_api_token"] != "preserved" || cfg["hostname"] != "display-name" || cfg["login_node_uid"] != "uid-abc" {
+		t.Fatalf("merged config keys = %v", cfg)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "device.json")); !os.IsNotExist(err) {
+		t.Fatalf("device-mode config unexpectedly created: %v", err)
+	}
+	if err := os.Remove(store.LeafPath()); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "display-name" {
+		t.Fatalf("stale enrollment hostname = %q", got)
+	}
+}
+
+func TestLoginNodeUIDIgnoresIncompleteStoredChain(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, originalStore, originalWorkName := nodeConfigDirFn, loginIdentityStore, workNodeName
+	nodeConfigDirFn = func() string { return dir }
+	loginIdentityStore = func() *nodeidentity.Store { return nodeidentity.New(filepath.Join(dir, "identity")) }
+	workNodeName = "display-name"
+	t.Cleanup(func() {
+		nodeConfigDirFn, loginIdentityStore, workNodeName = originalDir, originalStore, originalWorkName
+	})
+	store := loginIdentityStore()
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveLoginNodeUID("uid-abc"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.CAChainPath()); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkHostname(); got != "display-name" {
+		t.Fatalf("incomplete chain hostname = %q", got)
+	}
+}
+
+func TestLoginBundleRequiresCompleteChain(t *testing.T) {
+	store := hermeticStore(t)
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	blocks := strings.SplitAfter(chain, "-----END CERTIFICATE-----\n")
+	for name, bad := range map[string]string{
+		"missing":        "",
+		"leaf_only":      leaf,
+		"missing_root":   blocks[0] + blocks[1],
+		"different_leaf": selfSignedLeafPEM(t, key, 10) + blocks[1] + blocks[2],
+		"trailing_junk":  chain + "garbage",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, bad, "uid-abc"); err == nil {
+				t.Fatal("incomplete or mismatched chain accepted")
+			}
+			if store.HasLeaf() {
+				t.Fatal("invalid chain persisted a leaf")
+			}
+		})
+	}
+}
+
+func TestLoginBundleRejectsUIDNotSignedIntoLeaf(t *testing.T) {
+	store := hermeticStore(t)
+	key, err := store.GetOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, chain := testLoginChain(t, key, 1)
+	if _, err := persistLoginIdentityBundle(store, &key.PublicKey, leaf, chain, "different-uid"); err == nil {
+		t.Fatal("response UID not asserted by signed leaf was accepted")
+	}
+	if store.HasLeaf() {
+		t.Fatal("mismatched UID persisted a leaf")
 	}
 }
