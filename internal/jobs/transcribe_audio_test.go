@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -244,6 +245,79 @@ func TestTranscribeTimeout_MissingFileUsesCeiling(t *testing.T) {
 	got := h.requestTimeout(filepath.Join(t.TempDir(), "does-not-exist.wav"))
 	if got != transcribeMaxRequestTimeout {
 		t.Errorf("requestTimeout(missing) = %v, want ceiling %v", got, transcribeMaxRequestTimeout)
+	}
+}
+
+// TestTranscribeTimeout_UsesProbedDurationForCompressedAudio reproduces #1101
+// without a real codec or node: 4.5 MB of Opus-like bytes can contain 38
+// minutes of audio. The PCM fallback would budget only about seven minutes;
+// the probe must instead allow the slower-node 3x duration budget.
+func TestTranscribeTimeout_UsesProbedDurationForCompressedAudio(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "long.opus")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 4_500_000); err != nil {
+		t.Fatal(err)
+	}
+	h := NewTranscribeAudioHandler(dir)
+	h.probeAudioDurationFn = func(got string) (time.Duration, error) {
+		if got != path {
+			t.Errorf("probe path = %q, want %q", got, path)
+		}
+		return 38 * time.Minute, nil
+	}
+	if got, want := h.requestTimeoutForModel(path, "base"), 114*time.Minute; got != want {
+		t.Fatalf("compressed 38m budget = %v, want %v", got, want)
+	}
+	if old := transcribeTimeoutForAudioBytes(4_500_000); old >= 114*time.Minute {
+		t.Fatalf("fixture no longer demonstrates PCM under-estimate: byte budget %v", old)
+	}
+}
+
+func TestTranscribeTimeout_ProbeFailureFallsBackToBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "malformed.opus")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 4_500_000); err != nil {
+		t.Fatal(err)
+	}
+	h := NewTranscribeAudioHandler(dir)
+	h.probeAudioDurationFn = func(string) (time.Duration, error) { return 0, errors.New("no duration") }
+	if got, want := h.requestTimeoutForModel(path, "base"), transcribeTimeoutForAudioBytes(4_500_000); got != want {
+		t.Fatalf("probe failure budget = %v, want byte fallback %v", got, want)
+	}
+}
+
+func TestTranscribeTimeout_PCMProbeAndByteEstimateAgree(t *testing.T) {
+	const duration = 38 * time.Minute
+	h := NewTranscribeAudioHandler(t.TempDir())
+	h.probeAudioDurationFn = func(string) (time.Duration, error) { return duration, nil }
+	// The file need not contain valid audio: the injected probe keeps this test
+	// hermetic while its size models the recorder's 16 kHz mono PCM contract.
+	path := filepath.Join(t.TempDir(), "recording.wav")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, int64(duration/time.Second)*transcribeBytesPerSecond); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := h.requestTimeout(path), transcribeTimeoutForAudioBytes(int64(duration/time.Second)*transcribeBytesPerSecond); got != want {
+		t.Fatalf("PCM duration budget = %v, want byte-equivalent %v", got, want)
+	}
+}
+
+func TestRequestTimeoutWithJobBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
+	defer cancel()
+	if got := requestTimeoutWithJobBudget(ctx, 114*time.Minute); got < 3*time.Hour+59*time.Minute {
+		t.Fatalf("job-authorized deadline was shortened to %v", got)
+	}
+	if got := requestTimeoutWithJobBudget(context.Background(), 114*time.Minute); got != 114*time.Minute {
+		t.Fatalf("unbounded job budget = %v, want media budget", got)
 	}
 }
 
