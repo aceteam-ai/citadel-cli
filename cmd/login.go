@@ -118,6 +118,12 @@ func runInteractiveLogin() {
 
 	var authKey string
 	var nodeName string
+	// servingNodeUID is set only when an interactive device-grant login submits
+	// a CSR and the backend returns a validated enrollment bundle (#1062). It
+	// switches this login's serving identity to the deterministic "node-<uid>"
+	// name. Empty on every login today (backend companion aceteam#9576 unmerged),
+	// so the serving identity stays the display hostname exactly as before.
+	var servingNodeUID string
 
 	switch choice {
 	case nexus.NetChoiceVerified:
@@ -134,8 +140,22 @@ func runInteractiveLogin() {
 			os.Exit(1)
 		}
 
-		// Device authorization flow
-		authResult, err := runDeviceAuthFlow(authServiceURL, false)
+		// Enroll the existing receipt-signer identity key: derive ONE CSR from
+		// the machine-convergent identity store and submit it on every token
+		// poll (#1062). Fail-open — a node that cannot build a CSR still logs in
+		// exactly as before, just without CSR enrollment (the whole identity
+		// path is fail-open until the fabric CA is activated).
+		store := loginIdentityStore()
+		csrPEM, csrPub, csrErr := generateLoginCSR(store)
+		if csrErr != nil {
+			// Do NOT log csrErr: it can be an os.PathError naming node.key,
+			// and this codebase never logs private-key paths.
+			Debug("login CSR unavailable (non-fatal, continuing without enrollment)")
+			csrPEM, csrPub = "", nil
+		}
+
+		// Device authorization flow (carries the CSR when we have one)
+		authResult, err := runDeviceAuthFlowWithCSR(authServiceURL, false, csrPEM)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 			if nexus.IsNetworkError(err) {
@@ -159,6 +179,22 @@ func runInteractiveLogin() {
 			}
 		}
 
+		// Validate + persist any CSR-enrollment bundle. Fail CLOSED on a bad or
+		// partial bundle: reject it (never persist a mismatched/partial cert,
+		// never overwrite a known-good one) and fall back to the display
+		// hostname so the node is honestly unverified rather than mis-enrolled.
+		// Login itself still proceeds — the authkey is valid.
+		outcome, bErr := persistLoginIdentityBundle(store, csrPub,
+			authResult.Token.LeafPem, authResult.Token.ChainPem, authResult.Token.NodeUID)
+		if bErr != nil {
+			fmt.Fprintf(os.Stderr, "⚠️  Identity enrollment rejected: %v\n", bErr)
+		} else {
+			servingNodeUID = outcome.NodeUID
+			if outcome.Persisted {
+				fmt.Println("   Identity certificate stored.")
+			}
+		}
+
 	case nexus.NetChoiceAuthkey:
 		fmt.Println("--- Authenticating with authkey ---")
 		authKey = key
@@ -173,14 +209,29 @@ func runInteractiveLogin() {
 		nodeName, _ = os.Hostname()
 	}
 
-	// Persist hostname for reboot stability
+	// Persist hostname for reboot stability. nodeName is the user's DISPLAY
+	// hostname and is kept separate from the serving identity below.
 	if err := saveHostnameToConfig(nodeName); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not save hostname: %v\n", err)
 	}
 
-	// Try to reclaim stale node with the same hostname
+	// A CSR-enrolled login registers under the deterministic "node-<uid>"
+	// serving identity the verifier maps to fabric_node_certs.node_uid; every
+	// other login keeps its display hostname (servingNodeUID == "").
+	servingHostname := servingIdentityHostname(servingNodeUID, nodeName)
+
+	// Try to reclaim a stale node registered under the SERVING identity so the
+	// coordination server does not suffix the new one (node-<uid>-1), which
+	// would break the verifier's exact-match rule.
 	if savedConfig := getDeviceConfigFromFile(); savedConfig != nil {
-		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
+		reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, servingHostname)
+		// When we just switched this node's serving identity to node-<uid>,
+		// also sweep the prior registration under the display hostname so it
+		// is not orphaned (scoped to CSR-enrolled login: servingHostname
+		// differs from nodeName only then).
+		if servingHostname != nodeName {
+			reclaimStaleNodeByHostname(savedConfig.DeviceAPIToken, nodeName)
+		}
 	}
 
 	// Disconnect any existing connection first
@@ -194,7 +245,7 @@ func runInteractiveLogin() {
 	defer cancel()
 
 	config := network.ServerConfig{
-		Hostname:   nodeName,
+		Hostname:   servingHostname,
 		ControlURL: nexusURL,
 		AuthKey:    authKey,
 	}

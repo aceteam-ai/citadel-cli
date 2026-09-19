@@ -152,6 +152,18 @@ type TokenResponse struct {
 	// the backend starts populating it: an empty value here is the expected,
 	// universal case, not an error.
 	FabricNodeID string `json:"fabric_node_id,omitempty"`
+	// LeafPem / ChainPem / NodeUID are the CSR-enrollment bundle a device-grant
+	// login receives when it submits a CSR (citadel-cli#1062, companion to the
+	// draft platform aceteam#9576). LeafPem is the fabric CA leaf bound to the
+	// submitted CSR's public key; ChainPem is the CA trust chain; NodeUID is the
+	// server-assigned fabric node id used to derive the deterministic serving
+	// identity ("node-"+NodeUID). All THREE are additive and inert until the
+	// backend starts populating them: an empty value is the expected, universal
+	// case today (a legacy backend or an un-activated CA returns none), NOT an
+	// error. These mirror internal/devicemode's pairing bundle keys.
+	LeafPem  string `json:"leaf_pem,omitempty"`
+	ChainPem string `json:"chain_pem,omitempty"`
+	NodeUID  string `json:"node_uid,omitempty"`
 }
 
 // TokenError represents an error response from the /token endpoint
@@ -179,6 +191,12 @@ type StartFlowOptions struct {
 type TokenRequest struct {
 	DeviceCode string `json:"device_code"`
 	GrantType  string `json:"grant_type"`
+	// CSRPem, when non-empty, is a PEM PKCS#10 certificate signing request the
+	// backend may sign into a fabric CA leaf (citadel-cli#1062). Only interactive
+	// device-grant `citadel login` sends it; every legacy caller leaves it empty,
+	// and `omitempty` keeps their request bodies byte-identical (the key is
+	// absent, not present-and-empty). NEVER logged.
+	CSRPem string `json:"csr_pem,omitempty"`
 }
 
 // NewDeviceAuthClient creates a new device authorization client
@@ -261,15 +279,26 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	return &response, nil
 }
 
-// PollForToken polls the /token endpoint until authorization is complete or timeout occurs
+// PollForToken polls the /token endpoint until authorization is complete or
+// timeout occurs. Legacy no-CSR path: delegates to PollForTokenWithCSR with an
+// empty CSR so the request body stays byte-identical to before #1062.
 func (c *DeviceAuthClient) PollForToken(deviceCode string, interval int) (*TokenResponse, error) {
+	return c.PollForTokenWithCSR(deviceCode, interval, "")
+}
+
+// PollForTokenWithCSR is PollForToken plus a CSR (citadel-cli#1062). The SAME
+// csrPEM is sent on EVERY poll retry (it is captured once by the caller, before
+// polling begins), so an approved grant signs the identity key the caller
+// already committed to. An empty csrPEM reproduces the legacy no-CSR request
+// exactly. RFC 8628 pending/slow_down/expired/denied semantics are unchanged.
+func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, csrPEM string) (*TokenResponse, error) {
 	pollingInterval := time.Duration(interval) * time.Second
 	timeout := 10 * time.Minute // Match backend expiration
 	startTime := time.Now()
 
 	for time.Since(startTime) < timeout {
-		// Make token request
-		token, err := c.CheckToken(deviceCode)
+		// Make token request (same CSR on every retry).
+		token, err := c.CheckTokenWithCSR(deviceCode, csrPEM)
 
 		// Success case
 		if token != nil && token.Authkey != "" {
@@ -308,14 +337,22 @@ func (c *DeviceAuthClient) PollForToken(deviceCode string, interval int) (*Token
 }
 
 // CheckToken makes a single request to the /token endpoint.
-// This is useful for non-blocking polling in UIs.
+// This is useful for non-blocking polling in UIs. Legacy no-CSR path.
 func (c *DeviceAuthClient) CheckToken(deviceCode string) (*TokenResponse, error) {
+	return c.CheckTokenWithCSR(deviceCode, "")
+}
+
+// CheckTokenWithCSR is CheckToken plus an optional PEM CSR (citadel-cli#1062).
+// An empty csrPEM omits the csr_pem field entirely, so the request body is
+// byte-identical to the legacy CheckToken request.
+func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/token"
 
 	// Create request body
 	reqBody := TokenRequest{
 		DeviceCode: deviceCode,
 		GrantType:  "urn:ietf:params:oauth:grant-type:device_code",
+		CSRPem:     csrPEM,
 	}
 
 	jsonData, err := json.Marshal(reqBody)

@@ -3,6 +3,7 @@ package nexus
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -17,6 +18,16 @@ type MockDeviceAuthServer struct {
 	lastHostname      string
 	lastMachineID     string
 	lastForceNew      bool
+	// Token-request capture (citadel-cli#1062): every /token request body is
+	// recorded raw so a test can assert csr_pem presence/absence and the same
+	// CSR across retries without decoding assumptions.
+	tokenBodies []string
+	tokenCSRs   []string
+	// Optional CSR-enrollment bundle echoed back on the success response. Empty
+	// by default so existing tests see a byte-identical success TokenResponse.
+	bundleLeaf    string
+	bundleChain   string
+	bundleNodeUID string
 }
 
 // StartMockDeviceAuthServer creates and starts a mock device authorization server
@@ -73,9 +84,17 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Capture the raw request body and any CSR before responding.
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	var parsed TokenRequest
+	_ = json.Unmarshal(raw, &parsed)
+
 	m.pollMutex.Lock()
 	m.pollCount++
 	currentCount := m.pollCount
+	m.tokenBodies = append(m.tokenBodies, string(raw))
+	m.tokenCSRs = append(m.tokenCSRs, parsed.CSRPem)
+	bundleLeaf, bundleChain, bundleUID := m.bundleLeaf, m.bundleChain, m.bundleNodeUID
 	m.pollMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -88,13 +107,40 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 			ErrorDescription: "User has not yet authorized the device",
 		})
 	} else {
-		// Return success with authkey
+		// Return success with authkey (plus a CSR-enrollment bundle when the
+		// test configured one via SetEnrollmentBundle).
 		json.NewEncoder(w).Encode(TokenResponse{
 			Authkey:   "tskey-auth-mock-key-123456789",
 			ExpiresIn: 3600,
 			NexusURL:  "https://nexus.aceteam.ai",
+			LeafPem:   bundleLeaf,
+			ChainPem:  bundleChain,
+			NodeUID:   bundleUID,
 		})
 	}
+}
+
+// SetEnrollmentBundle configures the leaf/chain/node_uid the mock echoes on the
+// success response (citadel-cli#1062). Default empty ⇒ no bundle (legacy shape).
+func (m *MockDeviceAuthServer) SetEnrollmentBundle(leafPEM, chainPEM, nodeUID string) {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	m.bundleLeaf, m.bundleChain, m.bundleNodeUID = leafPEM, chainPEM, nodeUID
+}
+
+// TokenRequestBodies returns the raw JSON bodies of every /token request seen.
+func (m *MockDeviceAuthServer) TokenRequestBodies() []string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return append([]string(nil), m.tokenBodies...)
+}
+
+// TokenRequestCSRs returns the csr_pem value from every /token request seen
+// (empty string for a request that carried none).
+func (m *MockDeviceAuthServer) TokenRequestCSRs() []string {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	return append([]string(nil), m.tokenCSRs...)
 }
 
 // URL returns the base URL of the mock server
