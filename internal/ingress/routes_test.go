@@ -323,6 +323,69 @@ func TestClient_304RefreshesFreshness(t *testing.T) {
 	}
 }
 
+// TestClient_OverlayEntryExpiresIndependentlyUnderPerpetual304 pins FIX 3: an
+// on-miss overlay entry must expire on its own maxAge even when the whole-map
+// poll never advances past 304 (so the full map stays fresh forever). After
+// expiry a tombstoned slug must stop resolving, re-validated by one FetchOne.
+func TestClient_OverlayEntryExpiresIndependentlyUnderPerpetual304(t *testing.T) {
+	full := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"known": {MeshIP: "100.64.0.1", Port: 8080, Visibility: "public"},
+	}})
+	lateBody := mustBody(t, routesPayload{Routes: map[string]routeEntry{
+		"late": {MeshIP: "100.64.0.7", Port: 3000, Visibility: "public"},
+	}})
+	var fetchN, oneN int32
+	var tombstoned atomic.Bool
+	src := &fakeSource{
+		fetchFn: func(_ context.Context, _ string) (int, string, []byte, error) {
+			if atomic.AddInt32(&fetchN, 1) == 1 {
+				return 200, "e1", full, nil
+			}
+			return 304, "e1", nil, nil // whole map stays fresh (re-stamped) forever
+		},
+		fetchOneFn: func(_ context.Context, _ string) (int, []byte, error) {
+			atomic.AddInt32(&oneN, 1)
+			if tombstoned.Load() {
+				return 404, nil, nil
+			}
+			return 200, lateBody, nil
+		},
+	}
+	c := NewClient(ClientConfig{Source: src, MaxAge: time.Minute})
+	now := time.Unix(1000, 0)
+	c.now = func() time.Time { return now }
+
+	c.pollOnce(context.Background()) // 200 at t=1000
+
+	// On-miss positive: "late" resolves and enters the overlay (fetchedAt=1000).
+	if _, ok := c.Resolve(context.Background(), "late"); !ok {
+		t.Fatal("late should resolve via on-miss FetchOne")
+	}
+	if got := atomic.LoadInt32(&oneN); got != 1 {
+		t.Fatalf("FetchOne calls = %d, want 1", got)
+	}
+
+	// A 304 poll keeps the WHOLE map fresh at t=1030, but must not refresh the
+	// overlay entry's own 1000 stamp.
+	now = time.Unix(1030, 0)
+	c.pollOnce(context.Background())
+	if !c.Fresh() {
+		t.Fatal("whole map should be fresh after a 304")
+	}
+
+	// Tombstone "late" and advance to 61s past the overlay INSERT (t=1061), while
+	// the whole map is still fresh (last re-stamped at 1030). The overlay entry
+	// must expire and re-validate to a 404 -> no longer resolves.
+	tombstoned.Store(true)
+	now = time.Unix(1061, 0)
+	if _, ok := c.Resolve(context.Background(), "late"); ok {
+		t.Fatal("an expired overlay entry must not resolve past RouteMaxAge under a perpetual-304 feed")
+	}
+	if got := atomic.LoadInt32(&oneN); got != 2 {
+		t.Fatalf("expired overlay must trigger one re-validating FetchOne; calls = %d, want 2", got)
+	}
+}
+
 func TestLookup_Decisions(t *testing.T) {
 	m := &RouteMap{routes: map[string]Route{"x": {Slug: "x", MeshIP: netip.MustParseAddr("100.64.0.1"), Port: 1}}}
 	neg := newNegativeCache(time.Minute, 10)

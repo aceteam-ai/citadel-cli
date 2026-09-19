@@ -5,7 +5,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestStripInbound_RemovesTrustHeadersAndSessionCookiePreservesRest(t *testing.T) {
@@ -187,22 +186,22 @@ func TestRewriteSetCookie(t *testing.T) {
 	}
 }
 
-func TestDecisionCache_HitAndExpiry(t *testing.T) {
-	now := time.Unix(0, 0)
-	d := newDecisionCache(time.Second, 8)
-	d.now = func() time.Time { return now }
-	d.put("app", "cookieval", true, "subj")
-	e, ok := d.get("app", "cookieval")
-	if !ok || !e.allow || e.subject != "subj" {
-		t.Fatalf("expected cached allow: %+v ok=%v", e, ok)
+func TestDecisionKey(t *testing.T) {
+	// The singleflight de-dup key is stable, and distinguishes both slug and
+	// cookie (so two different sessions never collapse into one authz call), and
+	// never embeds the raw session token.
+	k := decisionKey("app", "cookieval")
+	if k != decisionKey("app", "cookieval") {
+		t.Fatal("decisionKey must be deterministic")
 	}
-	// Different cookie -> different key -> miss.
-	if _, ok := d.get("app", "other"); ok {
-		t.Fatal("different cookie should not hit")
+	if k == decisionKey("app", "other") {
+		t.Fatal("different cookie must yield a different key")
 	}
-	now = now.Add(2 * time.Second)
-	if _, ok := d.get("app", "cookieval"); ok {
-		t.Fatal("entry should have expired")
+	if k == decisionKey("other", "cookieval") {
+		t.Fatal("different slug must yield a different key")
+	}
+	if strings.Contains(k, "cookieval") {
+		t.Fatalf("key must not embed the raw session token: %q", k)
 	}
 }
 

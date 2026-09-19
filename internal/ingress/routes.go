@@ -348,6 +348,14 @@ type RoutesSource interface {
 	FetchOne(ctx context.Context, slug string) (status int, body []byte, err error)
 }
 
+// overlayEntry is one on-miss positive result plus the time it was fetched, so
+// the entry can expire independently of the (possibly perpetually-304-fresh)
+// full map.
+type overlayEntry struct {
+	route     Route
+	fetchedAt time.Time
+}
+
 // Client holds the live routes map, polls the source, and resolves slugs. It is
 // safe for concurrent use: the full map is swapped via an atomic pointer, and
 // on-miss positive results are stored in a separate mutex-guarded overlay
@@ -369,7 +377,12 @@ type Client struct {
 	neg *negativeCache
 
 	overlayMu sync.RWMutex
-	overlay   map[string]Route // positive on-miss inserts; cleared on a fresh full map
+	// overlay holds positive on-miss single-slug results. Cleared on a fresh full
+	// map (200), AND each entry carries its own fetchedAt so it expires after
+	// maxAge on its own -- otherwise, under a perpetual-304 feed (whole map
+	// re-stamped fresh but never replaced), a slug absent from the full map and
+	// later tombstoned could resolve forever.
+	overlay map[string]overlayEntry
 
 	// lastState tracks the last-logged feed health so we log at most once per
 	// state change (healthy <-> failing), not on every failed poll.
@@ -409,7 +422,7 @@ func NewClient(cfg ClientConfig) *Client {
 		now:          time.Now,
 		maxAge:       maxAge,
 		neg:          newNegativeCache(cfg.NegativeTTL, cfg.NegativeMax),
-		overlay:      make(map[string]Route),
+		overlay:      make(map[string]overlayEntry),
 	}
 	return c
 }
@@ -464,7 +477,7 @@ func (c *Client) pollOnce(ctx context.Context) {
 		c.fetchedOnce.Store(true)
 		// A fresh authoritative map supersedes any on-miss overlay entries.
 		c.overlayMu.Lock()
-		c.overlay = make(map[string]Route)
+		c.overlay = make(map[string]overlayEntry)
 		c.overlayMu.Unlock()
 	}
 }
@@ -510,12 +523,14 @@ func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
 	}
 
 	// decisionMiss: check the overlay (a prior on-miss positive) before making
-	// another control-plane call.
+	// another control-plane call. An overlay entry past its own maxAge is treated
+	// as a miss and re-validated via FetchOne below -- so a tombstoned slug stops
+	// resolving after maxAge even when the full-map poll never advances past 304.
 	c.overlayMu.RLock()
-	or, ok := c.overlay[slug]
+	oe, ok := c.overlay[slug]
 	c.overlayMu.RUnlock()
-	if ok {
-		return or, true
+	if ok && c.now().Sub(oe.fetchedAt) <= c.maxAge {
+		return oe.route, true
 	}
 
 	status, body, err := c.src.FetchOne(ctx, slug)
@@ -540,7 +555,7 @@ func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
 		return Route{}, false
 	}
 	c.overlayMu.Lock()
-	c.overlay[slug] = route
+	c.overlay[slug] = overlayEntry{route: route, fetchedAt: c.now()}
 	c.overlayMu.Unlock()
 	return route, true
 }

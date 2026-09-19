@@ -7,8 +7,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 )
 
 // trustHeaderPrefixes and trustHeaderExact enumerate the headers a client must
@@ -230,79 +228,23 @@ type Authorizer interface {
 	Authorize(ctx context.Context, slug, cookie string) (allow bool, subject string, err error)
 }
 
-// decisionCache memoizes allow decisions per (slug, cookie hash) for a short
-// TTL so a burst of requests for one gated app makes at most one authz call per
-// TTL window. It is bounded so a cookie-spray cannot grow it without limit, and
-// keys on sha256(cookie) so raw session tokens are never held in memory as map
-// keys.
-type decisionCache struct {
-	mu         sync.Mutex
-	ttl        time.Duration
-	maxEntries int
-	entries    map[string]decisionEntry
-	now        func() time.Time
-}
+// maxGatedSessionCookieBytes caps the assembled session-cookie material sent to
+// the authz endpoint. It matches Node's default --max-http-header-size (16384),
+// the real wall the aceteam authz request hits: @supabase/ssr chunks the session
+// at ~3180 B/cookie with NO chunk-count cap, so a large multi-chunk session can
+// exceed it. Rather than send a doomed request the control plane rejects with an
+// opaque 4xx (which the ingress would surface as a confusing 403), an oversize
+// session is detected locally and routed to a clean re-login (see ServeHTTP).
+const maxGatedSessionCookieBytes = 16384
 
-type decisionEntry struct {
-	allow   bool
-	subject string
-	expiry  time.Time
-}
-
-func newDecisionCache(ttl time.Duration, maxEntries int) *decisionCache {
-	if ttl <= 0 {
-		ttl = 60 * time.Second
-	}
-	if maxEntries <= 0 {
-		maxEntries = 4096
-	}
-	return &decisionCache{
-		ttl:        ttl,
-		maxEntries: maxEntries,
-		entries:    make(map[string]decisionEntry),
-		now:        time.Now,
-	}
-}
-
+// decisionKey is the singleflight de-dup key for a gated authz call: sha256 over
+// (slug, session cookie) so concurrent identical requests collapse into ONE
+// upstream call WITHOUT the raw session token ever being held as an in-memory
+// map key. NOTE: the authz verdict is deliberately NOT cached across requests
+// (the control plane marks it Cache-Control: no-store); this key exists only to
+// dedup in-flight calls, so a revoked or downgraded session loses access on the
+// very next request.
 func decisionKey(slug, cookie string) string {
 	sum := sha256.Sum256([]byte(slug + "\x00" + cookie))
 	return hex.EncodeToString(sum[:])
-}
-
-func (d *decisionCache) get(slug, cookie string) (decisionEntry, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	e, ok := d.entries[decisionKey(slug, cookie)]
-	if !ok {
-		return decisionEntry{}, false
-	}
-	if d.now().After(e.expiry) {
-		delete(d.entries, decisionKey(slug, cookie))
-		return decisionEntry{}, false
-	}
-	return e, true
-}
-
-func (d *decisionCache) put(slug, cookie string, allow bool, subject string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.entries) >= d.maxEntries {
-		now := d.now()
-		for k, e := range d.entries {
-			if now.After(e.expiry) {
-				delete(d.entries, k)
-			}
-		}
-		if len(d.entries) >= d.maxEntries {
-			for k := range d.entries {
-				delete(d.entries, k)
-				break
-			}
-		}
-	}
-	d.entries[decisionKey(slug, cookie)] = decisionEntry{
-		allow:   allow,
-		subject: subject,
-		expiry:  d.now().Add(d.ttl),
-	}
 }

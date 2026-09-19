@@ -571,3 +571,182 @@ func TestProxy_StaleRoutesFailClosed503(t *testing.T) {
 		t.Fatalf("dialer called %d times; a stale route map must not dial", n)
 	}
 }
+
+// TestProxy_OversizeSessionCookie401NoAuthzNoDial pins FIX 2: an over-cap session
+// (too many Supabase chunks to fit the control plane's header wall) is routed to
+// a clean re-login BEFORE any authz call or pod dial.
+func TestProxy_OversizeSessionCookie401NoAuthzNoDial(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{allow: true} // would allow, but must never be consulted
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+
+	big := strings.Repeat("x", maxGatedSessionCookieBytes+1000) // exceeds the cap
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=" + big})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for an oversize session", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "https://login.example.com/start" {
+		t.Fatalf("Location = %q, want the login URL", loc)
+	}
+	if atomic.LoadInt32(&authz.calls) != 0 {
+		t.Fatal("oversize session must not call authz")
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("oversize session must not dial the pod")
+	}
+}
+
+// TestProxy_AuthzUnavailableFailsClosed503 pins FIX 1c: an authz-backend error
+// (transport/timeout/5xx all map to err in httpAuthorizer) fails closed as a
+// retryable 503, never a serve, never a redirect loop.
+func TestProxy_AuthzUnavailableFailsClosed503(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"server 5xx", errors.New("authz: unexpected status 503")},
+		{"transport timeout", context.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+			authz := &fakeAuthorizer{err: tc.err}
+			ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+			resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (authz unavailable fails closed)", resp.StatusCode)
+			}
+			if atomic.LoadInt32(&d.calls) != 0 {
+				t.Fatal("authz-unavailable request must not dial the pod")
+			}
+		})
+	}
+}
+
+// blockingAuthorizer signals on entry and blocks until released, so a test can
+// hold one authz call in-flight and observe whether a concurrent identical
+// request makes a second upstream call.
+type blockingAuthorizer struct {
+	calls   int32
+	entered chan struct{}
+	release chan struct{}
+	allow   bool
+	subject string
+}
+
+func (b *blockingAuthorizer) Authorize(_ context.Context, _, _ string) (bool, string, error) {
+	atomic.AddInt32(&b.calls, 1)
+	b.entered <- struct{}{}
+	<-b.release
+	return b.allow, b.subject, nil
+}
+
+// TestProxy_ConcurrentIdenticalAuthzCollapsesToOneCall pins FIX 1b: two
+// concurrent identical (slug, session) requests collapse into exactly ONE
+// upstream authz call via singleflight.
+func TestProxy_ConcurrentIdenticalAuthzCollapsesToOneCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}}
+	authz := &blockingAuthorizer{entered: make(chan struct{}, 2), release: make(chan struct{}), allow: true, subject: "u"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	done := make(chan int, 2)
+	fire := func() {
+		resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+		done <- resp.StatusCode
+		resp.Body.Close()
+	}
+	go fire()
+	<-authz.entered // first request is the singleflight leader, now in-flight
+	go fire()
+	// The second identical request must join the in-flight singleflight, NOT make
+	// its own upstream call. Assert no second entry within a window.
+	select {
+	case <-authz.entered:
+		t.Fatal("second identical request must NOT make a second upstream authz call (singleflight)")
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(authz.release)
+	for i := 0; i < 2; i++ {
+		if code := <-done; code != 200 {
+			t.Fatalf("request %d status = %d, want 200", i, code)
+		}
+	}
+	if n := atomic.LoadInt32(&authz.calls); n != 1 {
+		t.Fatalf("authz calls = %d, want exactly 1 (singleflight collapse)", n)
+	}
+}
+
+// TestProxy_SequentialAuthzNotCached pins FIX 1a: a second identical request
+// AFTER the first completes makes a NEW upstream call (no cross-request cache).
+func TestProxy_SequentialAuthzNotCached(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}}
+	authz := &fakeAuthorizer{allow: true, subject: "u"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r1.Body.Close()
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r2.Body.Close()
+	if n := atomic.LoadInt32(&authz.calls); n != 2 {
+		t.Fatalf("authz calls = %d, want 2 (no cross-request caching)", n)
+	}
+}
+
+// TestProxy_AuthzDecisionNotCached_ImmediateRevocation pins FIX 1a end-to-end: a
+// session allowed on one request is denied on the very next once authz flips,
+// with no cached allow keeping it in.
+func TestProxy_AuthzDecisionNotCached_ImmediateRevocation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{allow: true, subject: "u"}
+	ts, d := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	if r1.StatusCode != 200 {
+		t.Fatalf("first request status = %d, want 200 (allowed)", r1.StatusCode)
+	}
+	r1.Body.Close()
+
+	// Session revoked upstream: authz now denies. The next request must be denied
+	// immediately -- no cached allow.
+	authz.allow = false
+	dialsBefore := atomic.LoadInt32(&d.calls)
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	if r2.StatusCode != http.StatusForbidden {
+		t.Fatalf("second request status = %d, want 403 (immediate revocation)", r2.StatusCode)
+	}
+	r2.Body.Close()
+	if atomic.LoadInt32(&d.calls) != dialsBefore {
+		t.Fatal("a revoked session must not reach the pod")
+	}
+}
+
+// TestHTTPAuthorizer_FailsClosedOnServerErrorAndCanceledContext pins FIX 1c at
+// the production authorizer: a 5xx response and a transport/context failure both
+// map to (allow=false, err!=nil), never to a silent allow.
+func TestHTTPAuthorizer_FailsClosedOnServerErrorAndCanceledContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	a := NewHTTPAuthorizer(srv.URL, "tok", srv.Client())
+
+	allow, _, err := a.Authorize(context.Background(), "app", "sess=abc")
+	if err == nil || allow {
+		t.Fatalf("5xx must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // stands in for a transport/timeout failure
+	allow, _, err = a.Authorize(ctx, "app", "sess=abc")
+	if err == nil || allow {
+		t.Fatalf("canceled context must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
+	}
+}
