@@ -62,6 +62,15 @@ func TestAgentDoctorConsume400(t *testing.T) {
 }
 
 func TestAgentConfigRedacts(t *testing.T) {
+	// The agent-facing config response must use the same resolver as the
+	// worker/CLI. In particular, it must not synthesize ~/.citadel-node from
+	// the current process HOME: the configured machine node directory may be
+	// /home/jason/citadel-node instead.
+	original := getAgentNodeConfigDir
+	t.Cleanup(func() { getAgentNodeConfigDir = original })
+	const resolvedNodeDir = "/home/jason/citadel-node"
+	getAgentNodeConfigDir = func() string { return resolvedNodeDir }
+
 	cfg := agentConfig("node-1", "https://aceteam.ai", "org-x", []string{"jobs:v1:shell:org_x"})
 	// Should never include secret fields.
 	for k := range cfg {
@@ -72,6 +81,9 @@ func TestAgentConfigRedacts(t *testing.T) {
 	}
 	if cfg["org_id"] != "org-x" || cfg["api_base_url"] != "https://aceteam.ai" {
 		t.Fatalf("agentConfig missing expected fields: %+v", cfg)
+	}
+	if got := cfg["node_config_dir"]; got != resolvedNodeDir {
+		t.Fatalf("node_config_dir = %q, want worker/CLI-resolved path %q", got, resolvedNodeDir)
 	}
 }
 
