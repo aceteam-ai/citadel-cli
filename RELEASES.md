@@ -2634,3 +2634,18 @@ Auto-generated log of every release.
   - fix: report resolved node config directory (#1103)
 
 
+---
+
+## v2.168.0 — 2026-09-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 9 |
+| Lines added | +1042 |
+
+**Changes:**
+
+  - feat: ingress session-isolation, authz fail-closed, route-freshness bound (#1100)
+
+
