@@ -20,10 +20,19 @@ import (
 	"fmt"
 	"math/rand"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// RouteMaxAge bounds how long a fetched route map may be served after it was
+// last confirmed fresh by the control plane. Past this age the map is EXPIRED:
+// every request fails closed (503, no upstream dial) until a poll refreshes it.
+// This is the request-path half of the map-is-authz rule -- a stale map must not
+// keep steering dials indefinitely through a control-plane outage. 60s is the
+// owner-chosen bound (citadel-cli#1099).
+const RouteMaxAge = 60 * time.Second
 
 // jitter returns d perturbed by up to +/-10% so a fleet of ingresses polling
 // the same control plane does not synchronize into a thundering herd.
@@ -68,6 +77,38 @@ type RouteMap struct {
 	routes      map[string]Route
 	loginURL    string
 	cookieNames []string
+	// fetchedAt is when the control plane last confirmed this map fresh (a 200
+	// that built it, or a 304 that re-validated it). The request path enforces
+	// RouteMaxAge against it; a zero value is never fresh.
+	fetchedAt time.Time
+}
+
+// fresh reports whether the map is present and within maxAge of now. A nil map
+// (never fetched) is never fresh. maxAge <= 0 disables the bound (defensive; the
+// default is RouteMaxAge).
+func (m *RouteMap) fresh(now time.Time, maxAge time.Duration) bool {
+	if m == nil {
+		return false
+	}
+	if maxAge <= 0 {
+		return true
+	}
+	return now.Sub(m.fetchedAt) <= maxAge
+}
+
+// refreshed returns a shallow copy of m with fetchedAt advanced to now. routes,
+// loginURL, and cookieNames are shared by reference (immutable after
+// construction), so this is cheap. Used on a 304 Not Modified: the content is
+// unchanged but the control plane has just CONFIRMED it is current, so the
+// freshness clock resets -- otherwise a healthy feed returning 304 every poll
+// would expire after RouteMaxAge and dark the ingress.
+func (m *RouteMap) refreshed(now time.Time) *RouteMap {
+	if m == nil {
+		return nil
+	}
+	cp := *m
+	cp.fetchedAt = now
+	return &cp
 }
 
 // ETag returns the ETag the map was fetched with (for If-None-Match).
@@ -113,22 +154,29 @@ type routeEntry struct {
 
 // applyRoutesResponse is the PURE core of the poller. Given the previous map
 // and the raw HTTP result, it decides the next map. It mirrors the repo's
-// resolveEgressRelayFrom convention (a pure function tested without HTTP):
+// resolveEgressRelayFrom convention (a pure function tested without HTTP); now
+// is threaded in (not read from the clock inside) so freshness stamping is
+// deterministic under test:
 //
-//   - 304 Not Modified            -> keep last-good (return prev, nil).
-//   - 200 OK                      -> parse and build a fresh map. Individual
-//     malformed entries (missing/non-mesh IP, bad port) are DROPPED, not fatal:
-//     one control-plane typo must not take down every other app. A body that
-//     fails to parse at all keeps last-good and returns the error.
-//   - anything else (5xx, etc.)   -> keep last-good and return an error so the
-//     caller logs the state change.
+//   - 304 Not Modified            -> re-stamp last-good fresh (a new map sharing
+//     prev's routes, fetchedAt = now). The content is unchanged but was just
+//     re-validated, so the freshness clock must reset.
+//   - 200 OK                      -> parse and build a fresh map (fetchedAt =
+//     now). Individual malformed entries (missing/non-mesh IP, bad port) are
+//     DROPPED, not fatal: one control-plane typo must not take down every other
+//     app. A body that fails to parse at all keeps last-good and returns the
+//     error.
+//   - anything else (5xx, etc.)   -> keep last-good UNCHANGED (a 5xx is not a
+//     freshness confirmation, so fetchedAt is NOT advanced) and return an error
+//     so the caller logs the state change; RouteMaxAge still expires it.
 //
 // It never returns a nil map together with a nil error on a non-200: last-good
-// is preserved so the ingress keeps serving through a control-plane outage.
-func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte) (*RouteMap, error) {
+// is preserved so the ingress keeps serving through a control-plane outage,
+// bounded by RouteMaxAge.
+func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte, now time.Time) (*RouteMap, error) {
 	switch {
 	case status == 304:
-		return prev, nil
+		return prev.refreshed(now), nil
 	case status == 200:
 		var p routesPayload
 		if err := json.Unmarshal(body, &p); err != nil {
@@ -139,6 +187,7 @@ func applyRoutesResponse(prev *RouteMap, status int, etag string, body []byte) (
 			routes:      make(map[string]Route, len(p.Routes)),
 			loginURL:    p.LoginURL,
 			cookieNames: p.SessionCookies,
+			fetchedAt:   now,
 		}
 		for slug, e := range p.Routes {
 			r, ok := decodeRoute(slug, e)
@@ -163,16 +212,26 @@ func decodeRoute(slug string, e routeEntry) (Route, bool) {
 	if e.Port <= 0 || e.Port > 65535 {
 		return Route{}, false
 	}
-	vis := Visibility(e.Visibility)
-	if vis != VisibilityGated {
-		// Anything not explicitly "gated" is public. An unknown visibility
-		// string fails safe toward public because gating is enforced by the
-		// authz call, and defaulting an unknown value to gated would 401 a
-		// public app; the safe direction here is to treat only the explicit
-		// "gated" marker as gated.
-		vis = VisibilityPublic
+	return Route{Slug: slug, MeshIP: ip, Port: uint16(e.Port), Visibility: normalizeVisibility(e.Visibility)}, true
+}
+
+// normalizeVisibility maps a wire visibility string to a Route visibility,
+// failing closed. Only the explicit "public" marker skips the gated authz call;
+// EVERYTHING else -- "gated" and, crucially, any unknown or absent value --
+// resolves to VisibilityGated so an unrecognized value requires authz rather
+// than silently bypassing it. This is the deliberate fail-closed direction: the
+// control plane folds private/org/unlisted into "gated" and the authz endpoint
+// is the authority on who may view (it allows an anonymous viewer for a
+// link-visible app and denies one for a private app), so defaulting the unknown
+// case to gated costs at most one authz call, while defaulting to public would
+// expose a mislabeled app with no check.
+func normalizeVisibility(s string) Visibility {
+	switch Visibility(strings.ToLower(strings.TrimSpace(s))) {
+	case VisibilityPublic:
+		return VisibilityPublic
+	default:
+		return VisibilityGated
 	}
-	return Route{Slug: slug, MeshIP: ip, Port: uint16(e.Port), Visibility: vis}, true
 }
 
 // decision is the outcome of the pure lookup: hit, needs an on-miss lookup, or
@@ -289,6 +348,14 @@ type RoutesSource interface {
 	FetchOne(ctx context.Context, slug string) (status int, body []byte, err error)
 }
 
+// overlayEntry is one on-miss positive result plus the time it was fetched, so
+// the entry can expire independently of the (possibly perpetually-304-fresh)
+// full map.
+type overlayEntry struct {
+	route     Route
+	fetchedAt time.Time
+}
+
 // Client holds the live routes map, polls the source, and resolves slugs. It is
 // safe for concurrent use: the full map is swapped via an atomic pointer, and
 // on-miss positive results are stored in a separate mutex-guarded overlay
@@ -301,10 +368,21 @@ type Client struct {
 	current     atomic.Pointer[RouteMap]
 	fetchedOnce atomic.Bool
 
+	// now and maxAge back the request-path freshness gate (Fresh/Resolve). now is
+	// injectable so tests drive staleness deterministically; maxAge defaults to
+	// RouteMaxAge.
+	now    func() time.Time
+	maxAge time.Duration
+
 	neg *negativeCache
 
 	overlayMu sync.RWMutex
-	overlay   map[string]Route // positive on-miss inserts; cleared on a fresh full map
+	// overlay holds positive on-miss single-slug results. Cleared on a fresh full
+	// map (200), AND each entry carries its own fetchedAt so it expires after
+	// maxAge on its own -- otherwise, under a perpetual-304 feed (whole map
+	// re-stamped fresh but never replaced), a slug absent from the full map and
+	// later tombstoned could resolve forever.
+	overlay map[string]overlayEntry
 
 	// lastState tracks the last-logged feed health so we log at most once per
 	// state change (healthy <-> failing), not on every failed poll.
@@ -318,7 +396,9 @@ type ClientConfig struct {
 	PollInterval time.Duration
 	NegativeTTL  time.Duration
 	NegativeMax  int
-	Logf         func(format string, args ...any)
+	// MaxAge bounds route freshness on the request path; 0 uses RouteMaxAge.
+	MaxAge time.Duration
+	Logf   func(format string, args ...any)
 }
 
 // NewClient builds a routes Client. It does not start polling; call Poll.
@@ -331,12 +411,18 @@ func NewClient(cfg ClientConfig) *Client {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	maxAge := cfg.MaxAge
+	if maxAge <= 0 {
+		maxAge = RouteMaxAge
+	}
 	c := &Client{
 		src:          cfg.Source,
 		pollInterval: poll,
 		logf:         logf,
+		now:          time.Now,
+		maxAge:       maxAge,
 		neg:          newNegativeCache(cfg.NegativeTTL, cfg.NegativeMax),
-		overlay:      make(map[string]Route),
+		overlay:      make(map[string]overlayEntry),
 	}
 	return c
 }
@@ -352,9 +438,18 @@ func (c *Client) LoginURL() string { return c.current.Load().LoginURL() }
 func (c *Client) CookieNames() []string { return c.current.Load().CookieNames() }
 
 // FetchedOnce reports whether at least one 200 full-map fetch has succeeded.
-// The health check gates on this: an ingress that has never loaded routes must
-// not be advertised as ready.
+// An ingress that has never loaded routes must not be advertised as ready.
 func (c *Client) FetchedOnce() bool { return c.fetchedOnce.Load() }
+
+// Fresh implements Resolver: it reports whether the live route map is present
+// AND within RouteMaxAge of the last time the control plane confirmed it fresh.
+// A nil map (never fetched) or an expired one fails closed, so the proxy serves
+// 503 and dials nothing, and the health check pulls a stale ingress from
+// rotation (invariant: bounded route freshness). It subsumes FetchedOnce: a
+// never-fetched map is not fresh.
+func (c *Client) Fresh() bool {
+	return c.current.Load().fresh(c.now(), c.maxAge)
+}
 
 // pollOnce performs one fetch cycle and swaps the map on a 200. It is separated
 // from Poll so tests can drive a single cycle deterministically.
@@ -365,18 +460,24 @@ func (c *Client) pollOnce(ctx context.Context) {
 		c.noteFailure(fmt.Sprintf("routes fetch failed: %v", err))
 		return
 	}
-	next, aerr := applyRoutesResponse(prev, status, etag, body)
+	next, aerr := applyRoutesResponse(prev, status, etag, body, c.now())
 	if aerr != nil {
 		c.noteFailure(fmt.Sprintf("routes response rejected: %v", aerr))
 		return
 	}
 	c.noteHealthy()
-	if status == 200 && next != prev {
-		c.current.Store(next)
+	if next == prev {
+		return // 5xx path: last-good kept, no re-stamp
+	}
+	// Store on any change, INCLUDING a 304's re-stamped clone -- that is what
+	// resets the freshness clock so a healthy feed returning 304 every poll does
+	// not expire after RouteMaxAge.
+	c.current.Store(next)
+	if status == 200 {
 		c.fetchedOnce.Store(true)
 		// A fresh authoritative map supersedes any on-miss overlay entries.
 		c.overlayMu.Lock()
-		c.overlay = make(map[string]Route)
+		c.overlay = make(map[string]overlayEntry)
 		c.overlayMu.Unlock()
 	}
 }
@@ -406,6 +507,13 @@ func (c *Client) Poll(ctx context.Context) {
 // AUTHORIZATION BOUNDARY -- ok=false means no dial.
 func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
 	m := c.current.Load()
+	if !m.fresh(c.now(), c.maxAge) {
+		// Config-absent (never fetched) or expired past RouteMaxAge: fail closed.
+		// The proxy's Fresh() gate returns 503 before reaching here; this is the
+		// defensive backstop for any direct caller and stops a stale overlay
+		// lookup too.
+		return Route{}, false
+	}
 	r, dec := lookup(m, slug, c.neg)
 	switch dec {
 	case decisionHit:
@@ -415,12 +523,14 @@ func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
 	}
 
 	// decisionMiss: check the overlay (a prior on-miss positive) before making
-	// another control-plane call.
+	// another control-plane call. An overlay entry past its own maxAge is treated
+	// as a miss and re-validated via FetchOne below -- so a tombstoned slug stops
+	// resolving after maxAge even when the full-map poll never advances past 304.
 	c.overlayMu.RLock()
-	or, ok := c.overlay[slug]
+	oe, ok := c.overlay[slug]
 	c.overlayMu.RUnlock()
-	if ok {
-		return or, true
+	if ok && c.now().Sub(oe.fetchedAt) <= c.maxAge {
+		return oe.route, true
 	}
 
 	status, body, err := c.src.FetchOne(ctx, slug)
@@ -445,7 +555,7 @@ func (c *Client) Resolve(ctx context.Context, slug string) (Route, bool) {
 		return Route{}, false
 	}
 	c.overlayMu.Lock()
-	c.overlay[slug] = route
+	c.overlay[slug] = overlayEntry{route: route, fetchedAt: c.now()}
 	c.overlayMu.Unlock()
 	return route, true
 }

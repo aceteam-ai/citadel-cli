@@ -52,6 +52,7 @@ type fakeResolver struct {
 	routes  map[string]Route
 	login   string
 	cookies []string
+	stale   bool // when true, Fresh() reports not-fresh (config-absent / expired)
 }
 
 func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool) {
@@ -60,16 +61,19 @@ func (f *fakeResolver) Resolve(_ context.Context, slug string) (Route, bool) {
 }
 func (f *fakeResolver) LoginURL() string      { return f.login }
 func (f *fakeResolver) CookieNames() []string { return f.cookies }
+func (f *fakeResolver) Fresh() bool           { return !f.stale }
 
 type fakeAuthorizer struct {
-	allow   bool
-	subject string
-	err     error
-	calls   int32
+	allow      bool
+	subject    string
+	err        error
+	calls      int32
+	lastCookie string // the cookie material the proxy forwarded (read after the round trip)
 }
 
-func (f *fakeAuthorizer) Authorize(_ context.Context, _, _ string) (bool, string, error) {
+func (f *fakeAuthorizer) Authorize(_ context.Context, _, cookie string) (bool, string, error) {
 	atomic.AddInt32(&f.calls, 1)
+	f.lastCookie = cookie
 	return f.allow, f.subject, f.err
 }
 
@@ -292,9 +296,14 @@ func TestProxy_WebSocketEcho(t *testing.T) {
 	}
 }
 
-func TestProxy_GatedNoCookie401Redirect(t *testing.T) {
+func TestProxy_GatedNoCookieDeniedIs401Redirect(t *testing.T) {
+	// A gated route with no session presented consults authz (the control plane
+	// is the authority on visibility); when authz DENIES, an anonymous visitor is
+	// steered to log in. Note authz IS called now (calls==1): the pre-auth
+	// short-circuit was removed so a link-visible app that authz would allow is
+	// reachable anonymously (see TestProxy_GatedAnonymousAllowedIsProxied).
 	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, login: "https://login.example.com/start"}
-	authz := &fakeAuthorizer{}
+	authz := &fakeAuthorizer{allow: false}
 	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
 	resp := get(t, ts, "app.apps.example.com", "/", nil) // no cookie
 	defer resp.Body.Close()
@@ -304,11 +313,74 @@ func TestProxy_GatedNoCookie401Redirect(t *testing.T) {
 	if loc := resp.Header.Get("Location"); loc != "https://login.example.com/start" {
 		t.Fatalf("Location = %q, want the login URL", loc)
 	}
-	if atomic.LoadInt32(&authz.calls) != 0 {
-		t.Fatal("authz must not be called when no cookie is present")
+	if atomic.LoadInt32(&authz.calls) != 1 {
+		t.Fatalf("authz calls = %d, want 1 (authz is the visibility authority even for anonymous)", atomic.LoadInt32(&authz.calls))
 	}
 	if atomic.LoadInt32(&d.calls) != 0 {
-		t.Fatal("no dial should happen for an unauthenticated gated request")
+		t.Fatal("no dial should happen for a denied gated request")
+	}
+}
+
+// TestProxy_GatedAnonymousAllowedIsProxied is the link-visible / unlisted case:
+// a gated route, NO session cookie at all, but authz ALLOWS the anonymous viewer
+// (aceteam's canGatewayServeApp(slug, "") contract). The request is proxied with
+// no X-Ingress-Subject, and the authorizer received an empty cookie.
+func TestProxy_GatedAnonymousAllowedIsProxied(t *testing.T) {
+	var sawSubject string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawSubject = r.Header.Get("X-Ingress-Subject")
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}}
+	authz := &fakeAuthorizer{allow: true, subject: ""} // anonymous allow
+	ts, d := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	resp := get(t, ts, "app.apps.example.com", "/", nil) // no cookie at all
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (authz allowed the anonymous viewer)", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&authz.calls) != 1 {
+		t.Fatalf("authz calls = %d, want 1", atomic.LoadInt32(&authz.calls))
+	}
+	if authz.lastCookie != "" {
+		t.Fatalf("authz received cookie %q, want empty (the aceteam anonymous contract)", authz.lastCookie)
+	}
+	if atomic.LoadInt32(&d.calls) == 0 {
+		t.Fatal("an allowed request should dial the pod")
+	}
+	if sawSubject != "" {
+		t.Fatalf("pod saw subject %q, want empty for an anonymous viewer", sawSubject)
+	}
+}
+
+// TestProxy_GatedAllowedStripsPlatformSessionCookie pins that a stray platform
+// session cookie is stripped even on an allowed gated request, while an unrelated
+// cookie survives.
+func TestProxy_GatedAllowedStripsPlatformSessionCookie(t *testing.T) {
+	var sawCookie string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawCookie = r.Header.Get("Cookie")
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}}
+	authz := &fakeAuthorizer{allow: true, subject: "real-user"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{
+		"Cookie": "sb-projref-auth-token=leak; keep=1",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(sawCookie, "sb-projref-auth-token") {
+		t.Fatalf("platform session cookie leaked to pod: %q", sawCookie)
+	}
+	if !strings.Contains(sawCookie, "keep=1") {
+		t.Fatalf("unrelated cookie should survive, got %q", sawCookie)
 	}
 }
 
@@ -407,5 +479,274 @@ func TestProxy_ModifyResponseStripsCookieDomain(t *testing.T) {
 	}
 	if !strings.Contains(sc, "Secure") {
 		t.Fatalf("Set-Cookie should have Secure added: %q", sc)
+	}
+}
+
+// TestProxy_StripsPlatformSessionCookiesWithEmptyPayload is the core invariant-1
+// regression: even when the routes payload names NO session cookies (the default
+// empty case that used to no-op stripCookies), the hardcoded platform family --
+// including the chunked sb-<ref>-auth-token.0 / .1 pair -- is stripped from the
+// pod-forwarded request, while an unrelated cookie survives.
+func TestProxy_StripsPlatformSessionCookiesWithEmptyPayload(t *testing.T) {
+	var sawCookie string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawCookie = r.Header.Get("Cookie")
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": publicRoute()}} // no cookies configured
+	// Build a proxy with NO default cookie names either, so nothing but the
+	// hardcoded family can drive the strip.
+	d := &countingDialer{target: upstream.Listener.Addr().String()}
+	p := NewProxy(ProxyConfig{
+		AppsDomain:  "apps.example.com",
+		Resolver:    res,
+		DialContext: d.dial,
+		// DefaultCookieNames deliberately empty.
+	})
+	ts := httptest.NewServer(p)
+	defer ts.Close()
+
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{
+		"Cookie": "sb-projref-auth-token.0=aaa; sb-projref-auth-token.1=bbb; theme=dark",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(sawCookie, "sb-projref-auth-token") {
+		t.Fatalf("chunked platform session cookie leaked to pod with empty payload: %q", sawCookie)
+	}
+	if !strings.Contains(sawCookie, "theme=dark") {
+		t.Fatalf("unrelated cookie should survive, got %q", sawCookie)
+	}
+}
+
+// TestProxy_RejectsWhenSessionCookieLeaks pins the guaranteed-removal-or-reject
+// backstop: if stripping fails to remove a platform session cookie, the request
+// is refused (500) and NO pod dial happens. The strip is no-op'd via the stripFn
+// seam because the real strip is deterministic and could never leave a leak.
+func TestProxy_RejectsWhenSessionCookieLeaks(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": publicRoute()}}
+	d := &countingDialer{target: "127.0.0.1:1"}
+	p := NewProxy(ProxyConfig{
+		AppsDomain:  "apps.example.com",
+		Resolver:    res,
+		DialContext: d.dial,
+	})
+	p.stripFn = func(*http.Request, []string) {} // simulate a strip that fails to remove anything
+	ts := httptest.NewServer(p)
+	defer ts.Close()
+
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{
+		"Cookie": "sb-projref-auth-token=stillhere",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (fail closed when a session cookie survives)", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&d.calls); n != 0 {
+		t.Fatalf("dialer called %d times; a leaked session cookie must not reach the pod", n)
+	}
+}
+
+// TestProxy_StaleRoutesFailClosed503 pins the route-freshness gate: when the
+// resolver reports not-fresh (config-absent or expired), the request is 503 with
+// no dial and no Resolve consultation.
+func TestProxy_StaleRoutesFailClosed503(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": publicRoute()}, stale: true}
+	ts, d := startProxy(t, res, nil, "127.0.0.1:1")
+	resp := get(t, ts, "app.apps.example.com", "/", nil)
+	defer resp.Body.Close()
+	// Config-absent (never fetched) and expired (past RouteMaxAge) are
+	// indistinguishable to the proxy and must BOTH be 503 -- never a 404 a client
+	// might cache as "this app does not exist".
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (stale/absent routes fail closed, not 404)", resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatal("stale routes must not 404 (cacheable); they must 503")
+	}
+	if n := atomic.LoadInt32(&d.calls); n != 0 {
+		t.Fatalf("dialer called %d times; a stale route map must not dial", n)
+	}
+}
+
+// TestProxy_OversizeSessionCookie401NoAuthzNoDial pins FIX 2: an over-cap session
+// (too many Supabase chunks to fit the control plane's header wall) is routed to
+// a clean re-login BEFORE any authz call or pod dial.
+func TestProxy_OversizeSessionCookie401NoAuthzNoDial(t *testing.T) {
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{allow: true} // would allow, but must never be consulted
+	ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+
+	big := strings.Repeat("x", maxGatedSessionCookieBytes+1000) // exceeds the cap
+	resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=" + big})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for an oversize session", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "https://login.example.com/start" {
+		t.Fatalf("Location = %q, want the login URL", loc)
+	}
+	if atomic.LoadInt32(&authz.calls) != 0 {
+		t.Fatal("oversize session must not call authz")
+	}
+	if atomic.LoadInt32(&d.calls) != 0 {
+		t.Fatal("oversize session must not dial the pod")
+	}
+}
+
+// TestProxy_AuthzUnavailableFailsClosed503 pins FIX 1c: an authz-backend error
+// (transport/timeout/5xx all map to err in httpAuthorizer) fails closed as a
+// retryable 503, never a serve, never a redirect loop.
+func TestProxy_AuthzUnavailableFailsClosed503(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"server 5xx", errors.New("authz: unexpected status 503")},
+		{"transport timeout", context.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+			authz := &fakeAuthorizer{err: tc.err}
+			ts, d := startProxy(t, res, authz, "127.0.0.1:1")
+			resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (authz unavailable fails closed)", resp.StatusCode)
+			}
+			if atomic.LoadInt32(&d.calls) != 0 {
+				t.Fatal("authz-unavailable request must not dial the pod")
+			}
+		})
+	}
+}
+
+// blockingAuthorizer signals on entry and blocks until released, so a test can
+// hold one authz call in-flight and observe whether a concurrent identical
+// request makes a second upstream call.
+type blockingAuthorizer struct {
+	calls   int32
+	entered chan struct{}
+	release chan struct{}
+	allow   bool
+	subject string
+}
+
+func (b *blockingAuthorizer) Authorize(_ context.Context, _, _ string) (bool, string, error) {
+	atomic.AddInt32(&b.calls, 1)
+	b.entered <- struct{}{}
+	<-b.release
+	return b.allow, b.subject, nil
+}
+
+// TestProxy_ConcurrentIdenticalAuthzCollapsesToOneCall pins FIX 1b: two
+// concurrent identical (slug, session) requests collapse into exactly ONE
+// upstream authz call via singleflight.
+func TestProxy_ConcurrentIdenticalAuthzCollapsesToOneCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}}
+	authz := &blockingAuthorizer{entered: make(chan struct{}, 2), release: make(chan struct{}), allow: true, subject: "u"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	done := make(chan int, 2)
+	fire := func() {
+		resp := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+		done <- resp.StatusCode
+		resp.Body.Close()
+	}
+	go fire()
+	<-authz.entered // first request is the singleflight leader, now in-flight
+	go fire()
+	// The second identical request must join the in-flight singleflight, NOT make
+	// its own upstream call. Assert no second entry within a window.
+	select {
+	case <-authz.entered:
+		t.Fatal("second identical request must NOT make a second upstream authz call (singleflight)")
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(authz.release)
+	for i := 0; i < 2; i++ {
+		if code := <-done; code != 200 {
+			t.Fatalf("request %d status = %d, want 200", i, code)
+		}
+	}
+	if n := atomic.LoadInt32(&authz.calls); n != 1 {
+		t.Fatalf("authz calls = %d, want exactly 1 (singleflight collapse)", n)
+	}
+}
+
+// TestProxy_SequentialAuthzNotCached pins FIX 1a: a second identical request
+// AFTER the first completes makes a NEW upstream call (no cross-request cache).
+func TestProxy_SequentialAuthzNotCached(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}}
+	authz := &fakeAuthorizer{allow: true, subject: "u"}
+	ts, _ := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r1.Body.Close()
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	r2.Body.Close()
+	if n := atomic.LoadInt32(&authz.calls); n != 2 {
+		t.Fatalf("authz calls = %d, want 2 (no cross-request caching)", n)
+	}
+}
+
+// TestProxy_AuthzDecisionNotCached_ImmediateRevocation pins FIX 1a end-to-end: a
+// session allowed on one request is denied on the very next once authz flips,
+// with no cached allow keeping it in.
+func TestProxy_AuthzDecisionNotCached_ImmediateRevocation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer upstream.Close()
+	res := &fakeResolver{routes: map[string]Route{"app": gatedRoute()}, cookies: []string{"sess"}, login: "https://login.example.com/start"}
+	authz := &fakeAuthorizer{allow: true, subject: "u"}
+	ts, d := startProxy(t, res, authz, upstream.Listener.Addr().String())
+
+	r1 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	if r1.StatusCode != 200 {
+		t.Fatalf("first request status = %d, want 200 (allowed)", r1.StatusCode)
+	}
+	r1.Body.Close()
+
+	// Session revoked upstream: authz now denies. The next request must be denied
+	// immediately -- no cached allow.
+	authz.allow = false
+	dialsBefore := atomic.LoadInt32(&d.calls)
+	r2 := get(t, ts, "app.apps.example.com", "/", map[string]string{"Cookie": "sess=abc"})
+	if r2.StatusCode != http.StatusForbidden {
+		t.Fatalf("second request status = %d, want 403 (immediate revocation)", r2.StatusCode)
+	}
+	r2.Body.Close()
+	if atomic.LoadInt32(&d.calls) != dialsBefore {
+		t.Fatal("a revoked session must not reach the pod")
+	}
+}
+
+// TestHTTPAuthorizer_FailsClosedOnServerErrorAndCanceledContext pins FIX 1c at
+// the production authorizer: a 5xx response and a transport/context failure both
+// map to (allow=false, err!=nil), never to a silent allow.
+func TestHTTPAuthorizer_FailsClosedOnServerErrorAndCanceledContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	a := NewHTTPAuthorizer(srv.URL, "tok", srv.Client())
+
+	allow, _, err := a.Authorize(context.Background(), "app", "sess=abc")
+	if err == nil || allow {
+		t.Fatalf("5xx must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // stands in for a transport/timeout failure
+	allow, _, err = a.Authorize(ctx, "app", "sess=abc")
+	if err == nil || allow {
+		t.Fatalf("canceled context must map to (allow=false, err!=nil); got allow=%v err=%v", allow, err)
 	}
 }

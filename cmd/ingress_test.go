@@ -108,3 +108,30 @@ func TestResolveIngressOptions_RequiresRoutesURLAndDomain(t *testing.T) {
 		t.Fatalf("expected StaticFileCertProvider, got %T", opts.cert)
 	}
 }
+
+func TestResolveIngressOptions_RefusesLargePollInterval(t *testing.T) {
+	// resolveIngressOptions reads the ingressPollInterval flag var first; keep the
+	// env-driven path hermetic regardless of test ordering.
+	prevPoll := ingressPollInterval
+	ingressPollInterval = 0
+	t.Cleanup(func() { ingressPollInterval = prevPoll })
+
+	t.Setenv("CITADEL_INGRESS_ROUTES_URL", "https://cp.example.com/ingress/routes")
+	t.Setenv("CITADEL_INGRESS_APPS_DOMAIN", "apps.example.com")
+	t.Setenv("CITADEL_INGRESS_CERT_FILE", "/tmp/does-not-need-to-exist.crt")
+	t.Setenv("CITADEL_INGRESS_KEY_FILE", "/tmp/does-not-need-to-exist.key")
+
+	// A poll interval at or above half the route max-age lets the map expire
+	// between polls: refuse loudly rather than ship a silent config-dependent
+	// outage.
+	t.Setenv("CITADEL_INGRESS_POLL_INTERVAL", "60s")
+	if _, err := resolveIngressOptions(context.Background()); err == nil {
+		t.Fatal("expected an error for a poll interval >= RouteMaxAge/2")
+	}
+
+	// A small interval resolves cleanly.
+	t.Setenv("CITADEL_INGRESS_POLL_INTERVAL", "5s")
+	if _, err := resolveIngressOptions(context.Background()); err != nil {
+		t.Fatalf("a small poll interval should resolve cleanly: %v", err)
+	}
+}
