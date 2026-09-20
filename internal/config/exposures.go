@@ -41,6 +41,9 @@ type ExposureRecord struct {
 	// Port is the loopback host port the route proxies to. Mutually exclusive
 	// with Path (issue #943) — exactly one is non-zero/non-empty.
 	Port int `json:"port,omitempty"`
+	// ForwardTarget is the optional node-local TCP destination for a platform
+	// listener. An empty value means loopback on Port.
+	ForwardTarget string `json:"forward_target,omitempty"`
 	// Path is the resolved, workspace-confined directory served as a static
 	// file share instead of a proxy target. Mutually exclusive with Port.
 	// Restoring this verbatim on restart is what makes a directory share (like

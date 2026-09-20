@@ -56,6 +56,10 @@ import (
 // local to avoid a gateway->catalog dependency).
 var exposeNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
+// ValidExposeName applies the gateway's exposure-name rule to listeners that
+// publish directly on a mesh port instead of under /expose/<name>/.
+func ValidExposeName(name string) bool { return exposeNamePattern.MatchString(name) }
+
 // ExposeRoutePrefix is the namespace under which EVERY exposed service is served
 // on the gateway. It is deliberately distinct from ModuleRoutePrefix
 // ("/modules/") so the capability layer can always-allow it (categoryForPath)

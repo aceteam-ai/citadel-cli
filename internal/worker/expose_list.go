@@ -23,7 +23,8 @@ type ExposureInfo struct {
 	Name string `json:"name"`
 	// Port is the loopback host port the route proxies to. Mutually exclusive
 	// with Path (issue #943) — exactly one is non-zero/non-empty.
-	Port int `json:"port,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	ForwardTarget string `json:"forward_target,omitempty"`
 	// Path is the workspace-confined directory served as a static file share,
 	// when this exposure is a directory source instead of a port.
 	Path string `json:"path,omitempty"`

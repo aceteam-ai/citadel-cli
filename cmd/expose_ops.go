@@ -150,8 +150,20 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		Creator:    req.Creator,
 		TokenEpoch: effective,
 	}
-
-	if req.Path != "" {
+	var platformLive *platformExposure
+	if req.Visibility == "platform" {
+		if req.Path != "" {
+			return nil, fmt.Errorf("platform visibility requires a port")
+		}
+		var err error
+		platformLive, err = startPlatformExposure(req.Name, req.Port, req.ForwardTarget)
+		if err != nil {
+			return nil, err
+		}
+		ref.gw.Unexpose(req.Name)
+		rec.Port = req.Port
+		rec.ForwardTarget = req.ForwardTarget
+	} else if req.Path != "" {
 		// Directory source (#943). Confine req.Path to the node workspace
 		// BEFORE it ever reaches the gateway -- the same boundary FILE_READ/
 		// FILE_LIST enforce, and deliberately NOT the AllowReadOutsideWorkspace
@@ -175,6 +187,9 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		}
 		rec.Port = req.Port
 	}
+	if req.Visibility != "platform" {
+		stopPlatformExposure(req.Name)
+	}
 
 	// Persist so the exposure survives a worker restart (#647). Every caller --
 	// the CLI, the MCP verb, the EXPOSE_SET job -- funnels through here, so this
@@ -186,7 +201,12 @@ func (liveExposeOps) Expose(_ context.Context, req worker.ExposeRequest) (*worke
 		Log("warning: exposure %q is live but was not persisted (it will not survive a restart): %v", req.Name, err)
 	}
 
-	res := &worker.ExposeResult{URL: exposeMeshURL(req.Name), Epoch: effective}
+	res := &worker.ExposeResult{Epoch: effective}
+	if platformLive != nil {
+		res.URL = platformMeshURL(platformLive.ip, req.Port)
+	} else {
+		res.URL = exposeMeshURL(req.Name)
+	}
 
 	if policy.Visibility == gateway.VisibilityLink {
 		key, err := config.LoadOrCreateExposeSigningKey(configDir)
@@ -240,6 +260,9 @@ func (liveExposeOps) Unexpose(_ context.Context, name string) (*worker.UnexposeR
 	}
 
 	wasExposed := ref.gw.Unexpose(name)
+	if stopPlatformExposure(name) {
+		wasExposed = true
+	}
 
 	// Delete the durable record even when nothing was live: a record can outlive
 	// its route (restored for a port that no longer listens, or written by an
@@ -278,23 +301,37 @@ func (liveExposeOps) List(_ context.Context) (*worker.ExposeListResult, error) {
 			liveNames[n] = true
 		}
 	}
+	for n := range platformExposures {
+		liveNames[n] = true
+	}
 
 	out := &worker.ExposeListResult{Exposures: make([]worker.ExposureInfo, 0, len(recs))}
 	seen := make(map[string]bool, len(recs))
 	for _, r := range recs {
 		seen[r.Name] = true
+		var url string
+		if r.Visibility == "platform" {
+			if live := platformExposures[r.Name]; live != nil {
+				url = platformMeshURL(live.ip, r.Port)
+			} else {
+				url = platformURLForPort(r.Port)
+			}
+		} else {
+			url = exposeMeshURL(r.Name)
+		}
 		out.Exposures = append(out.Exposures, worker.ExposureInfo{
-			Name:       r.Name,
-			Port:       r.Port,
-			Path:       r.Path,
-			Visibility: r.Visibility,
-			Creator:    r.Creator,
-			Epoch:      r.TokenEpoch,
-			CreatedAt:  r.CreatedAt,
-			Live:       liveNames[r.Name],
+			Name:          r.Name,
+			Port:          r.Port,
+			ForwardTarget: r.ForwardTarget,
+			Path:          r.Path,
+			Visibility:    r.Visibility,
+			Creator:       r.Creator,
+			Epoch:         r.TokenEpoch,
+			CreatedAt:     r.CreatedAt,
+			Live:          liveNames[r.Name],
 			// Same URL construction EXPOSE_SET's ExposeResult.URL uses — one
 			// format, two callers. "" when off-mesh, matching that contract.
-			URL: exposeMeshURL(r.Name),
+			URL: url,
 		})
 	}
 	for n := range liveNames {
@@ -315,6 +352,8 @@ func (liveExposeOps) List(_ context.Context) (*worker.ExposeListResult, error) {
 // unreadable must still come up serving its builtin routes; refusing to start
 // would turn a lost side-feature into an outage.
 func restoreExposures(gw *gateway.Server) {
+	exposeOpsMu.Lock()
+	defer exposeOpsMu.Unlock()
 	recs, err := config.LoadExposures(platform.ConfigDir())
 	if err != nil {
 		Log("warning: could not restore gateway exposures: %v", err)
@@ -326,6 +365,14 @@ func restoreExposures(gw *gateway.Server) {
 
 	restored := 0
 	for _, r := range recs {
+		if r.Visibility == "platform" {
+			if _, err := startPlatformExposure(r.Name, r.Port, r.ForwardTarget); err != nil {
+				Log("warning: skipping persisted platform exposure %q: %v", r.Name, err)
+				continue
+			}
+			restored++
+			continue
+		}
 		// Floor the restored epoch to the high-water store (#945 review). A
 		// best-effort SaveExposure failure can leave a stale, lower-epoch
 		// record on disk after a rotate that already advanced high-water; a

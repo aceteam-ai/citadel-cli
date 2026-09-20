@@ -80,7 +80,8 @@ type ExposeSpec struct {
 	Name string `json:"name"`
 	// Port is the service's loopback host port (e.g. 8212 for the nvr module's
 	// Frigate UI). Mutually exclusive with Path (issue #943).
-	Port int `json:"port"`
+	Port          int    `json:"port"`
+	ForwardTarget string `json:"forward_target,omitempty"`
 	// Path is a workspace-relative or absolute directory to serve as a
 	// read-only, auto-indexed static file share instead of a proxy target.
 	// Mutually exclusive with Port.
