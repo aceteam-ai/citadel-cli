@@ -2618,3 +2618,34 @@ Auto-generated log of every release.
   - fix: apply shell permission changes live (#1086)
 
 
+---
+
+## v2.167.0 — 2026-09-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 4 |
+| Lines added | +190 |
+
+**Changes:**
+
+  - fix(transcribe): size node timeout from audio duration (#1105)
+  - fix: report resolved node config directory (#1103)
+
+
+---
+
+## v2.168.0 — 2026-09-20
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 9 |
+| Lines added | +1042 |
+
+**Changes:**
+
+  - feat: ingress session-isolation, authz fail-closed, route-freshness bound (#1100)
+
+

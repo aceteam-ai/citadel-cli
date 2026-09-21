@@ -5,7 +5,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestStripInbound_RemovesTrustHeadersAndSessionCookiePreservesRest(t *testing.T) {
@@ -60,6 +59,92 @@ func TestStripCookies_DeletesHeaderWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestIsPlatformSessionCookie(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"sb-projref-auth-token", true},               // base Supabase auth cookie
+		{"sb-projref-auth-token.0", true},             // chunk
+		{"sb-projref-auth-token.1", true},             // chunk
+		{"sb-projref-auth-token.42", true},            // higher chunk
+		{"sb-projref-auth-token-code-verifier", true}, // PKCE verifier
+		{"SB-PROJREF-AUTH-TOKEN", true},               // case-insensitive
+		{"sb-access-token", true},                     // legacy exact
+		{"sb-refresh-token", true},                    // legacy exact
+		{"supabase-auth-token", true},                 // legacy exact
+		{"sess", false},                               // unrelated app session cookie
+		{"theme", false},                              // unrelated
+		{"sb-feature-flag", false},                    // sb- prefix but not an auth token
+		{"my-auth-token", false},                      // has auth-token but not sb- prefix
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isPlatformSessionCookie(tc.name); got != tc.want {
+			t.Errorf("isPlatformSessionCookie(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestStripCookies_StripsPlatformFamilyWithEmptyAugment is the direct unit-level
+// version of the invariant-1 no-op bug: with an EMPTY augment list (the routes
+// payload's default), the hardcoded platform family -- including chunked cookies
+// -- is still stripped, while unrelated cookies survive.
+func TestStripCookies_StripsPlatformFamilyWithEmptyAugment(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	r.Header.Set("Cookie", "sb-projref-auth-token.0=aaa; sb-projref-auth-token.1=bbb; theme=dark; sess=keep")
+	stripInbound(r, nil) // empty augment: only the hardcoded family can drive the strip
+
+	if _, err := r.Cookie("sb-projref-auth-token.0"); err == nil {
+		t.Error("chunk .0 should be stripped with an empty augment")
+	}
+	if _, err := r.Cookie("sb-projref-auth-token.1"); err == nil {
+		t.Error("chunk .1 should be stripped with an empty augment")
+	}
+	if c, err := r.Cookie("theme"); err != nil || c.Value != "dark" {
+		t.Errorf("unrelated cookie theme should survive: %v", err)
+	}
+	if c, err := r.Cookie("sess"); err != nil || c.Value != "keep" {
+		t.Errorf("unrelated cookie sess should survive (not named, not platform): %v", err)
+	}
+}
+
+func TestOutboundSessionCookieLeaked(t *testing.T) {
+	leaked := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	leaked.Header.Set("Cookie", "keep=1; sb-projref-auth-token=stillhere")
+	if !outboundSessionCookieLeaked(leaked) {
+		t.Error("a surviving platform session cookie must be detected as leaked")
+	}
+	clean := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	clean.Header.Set("Cookie", "keep=1; theme=dark")
+	if outboundSessionCookieLeaked(clean) {
+		t.Error("unrelated cookies must not be reported as a leak")
+	}
+}
+
+func TestGatedSessionCookie(t *testing.T) {
+	// Chunked Supabase cookie is conveyed whole (header form), plus an augment
+	// name, but unrelated cookies are NOT forwarded to the control plane.
+	r := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	r.Header.Set("Cookie", "sb-projref-auth-token.0=aaa; sb-projref-auth-token.1=bbb; app-sess=xyz; theme=dark")
+	got := gatedSessionCookie(r, []string{"app-sess"})
+	for _, want := range []string{"sb-projref-auth-token.0=aaa", "sb-projref-auth-token.1=bbb", "app-sess=xyz"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gatedSessionCookie missing %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, "theme") {
+		t.Errorf("unrelated cookie must not be forwarded to authz: %q", got)
+	}
+
+	// No session present -> empty (triggers the login redirect, no authz allow).
+	none := httptest.NewRequest(http.MethodGet, "https://x/", nil)
+	none.Header.Set("Cookie", "theme=dark")
+	if v := gatedSessionCookie(none, nil); v != "" {
+		t.Errorf("gatedSessionCookie with no session material = %q, want empty", v)
+	}
+}
+
 func TestSetForwardHeaders_UsesHostOnlyForXFF(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://app.apps.example.com/", nil)
 	r.RemoteAddr = "203.0.113.7:54321"
@@ -101,22 +186,22 @@ func TestRewriteSetCookie(t *testing.T) {
 	}
 }
 
-func TestDecisionCache_HitAndExpiry(t *testing.T) {
-	now := time.Unix(0, 0)
-	d := newDecisionCache(time.Second, 8)
-	d.now = func() time.Time { return now }
-	d.put("app", "cookieval", true, "subj")
-	e, ok := d.get("app", "cookieval")
-	if !ok || !e.allow || e.subject != "subj" {
-		t.Fatalf("expected cached allow: %+v ok=%v", e, ok)
+func TestDecisionKey(t *testing.T) {
+	// The singleflight de-dup key is stable, and distinguishes both slug and
+	// cookie (so two different sessions never collapse into one authz call), and
+	// never embeds the raw session token.
+	k := decisionKey("app", "cookieval")
+	if k != decisionKey("app", "cookieval") {
+		t.Fatal("decisionKey must be deterministic")
 	}
-	// Different cookie -> different key -> miss.
-	if _, ok := d.get("app", "other"); ok {
-		t.Fatal("different cookie should not hit")
+	if k == decisionKey("app", "other") {
+		t.Fatal("different cookie must yield a different key")
 	}
-	now = now.Add(2 * time.Second)
-	if _, ok := d.get("app", "cookieval"); ok {
-		t.Fatal("entry should have expired")
+	if k == decisionKey("other", "cookieval") {
+		t.Fatal("different slug must yield a different key")
+	}
+	if strings.Contains(k, "cookieval") {
+		t.Fatalf("key must not embed the raw session token: %q", k)
 	}
 }
 
