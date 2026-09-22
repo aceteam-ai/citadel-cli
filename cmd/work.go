@@ -716,7 +716,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	// (Store.ReconcileScan's staleness cleanup); running it from a second
 	// concurrent process could delete entries a sibling process just wrote.
 	if workerLockHeld {
-		scanOpts := cacheindex.ScanOptions{LegacyHFHubDir: jobs.LegacyHFHubDirForScan()}
+		rt := catalog.SelectContainerRuntime()
+		scanOpts := cacheindex.ScanOptions{
+			LegacyHFHubDir:      jobs.LegacyHFHubDirForScan(),
+			RuntimeStorageRoots: cacheindex.RuntimeStorageRoots(rt.EngineBin),
+		}
 		if err := jobs.CacheIndexStore().ReconcileScan(cacheindex.DefaultCacheRoot(), scanOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: cache index backfill scan: %v\n", err)
 		}

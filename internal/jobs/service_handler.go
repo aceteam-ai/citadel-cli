@@ -470,6 +470,35 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// so this is byte-identical to the prior hardcoded path; on a podman node
 		// it drives podman consistently. Mirrors cmd/service.go's startService.
 		rt := catalog.SelectContainerRuntime()
+		sandboxOverridePath := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
+			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath))))
+		requiredControllers, limitsErr := compose.RequiredLimitControllersFromFiles(composePath, sandboxOverridePath)
+		if limitsErr != nil {
+			return nil, fmt.Errorf("cannot inspect %s resource limits: %w", svc.Name, limitsErr)
+		}
+		// Resource isolation may materialize a memory limit later in this start.
+		// Include it in the preflight now so a rootless Podman node fails before
+		// VRAM preemption or any compose mutation.
+		if resourceIsolationEnabled() {
+			if baseContent, readErr := os.ReadFile(composePath); readErr == nil {
+				if gpu, parseErr := catalog.ComposeDeclaresGPU(string(baseContent)); parseErr == nil && gpu {
+					requiredControllers = append(requiredControllers, "memory")
+				}
+			}
+		}
+		if limitsErr := rt.PreflightLimitControllers(requiredControllers...); limitsErr != nil {
+			return nil, fmt.Errorf("cannot start %s: %w", svc.Name, limitsErr)
+		}
+		actualComposePath := composePath
+		cleanupPodmanCompose := func() {}
+		if rt.EngineBin == "podman" {
+			var rewriteErr error
+			actualComposePath, cleanupPodmanCompose, rewriteErr = compose.MaterializePodmanGPUCompose(composePath)
+			if rewriteErr != nil {
+				return nil, fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", svc.Name, rewriteErr)
+			}
+		}
+		defer cleanupPodmanCompose()
 		// ramOverridePath is the citadel#831 per-service RAM ceiling override
 		// (empty when resource isolation is off, the target isn't GPU, or the
 		// target is already running -- see applyRAMIsolation and the gate
@@ -508,10 +537,9 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// override would otherwise be bypassed by this start site.
 		// Args are the compose args WITHOUT the leading "compose": rt.ComposeCommand
 		// supplies the correct front-end prefix (docker/podman) below.
-		composeArgs := []string{"-f", composePath}
-		if override := catalog.ExistingSandboxOverride(filepath.Dir(composePath),
-			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))); override != "" {
-			composeArgs = append(composeArgs, "-f", override)
+		composeArgs := []string{"-f", actualComposePath}
+		if sandboxOverridePath != "" {
+			composeArgs = append(composeArgs, "-f", sandboxOverridePath)
 		}
 		// citadel#831 RAM ceiling override (empty when not applicable — see the
 		// ramOverridePath assignment above and applyRAMIsolation).

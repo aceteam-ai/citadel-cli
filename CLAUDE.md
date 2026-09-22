@@ -3594,8 +3594,10 @@ then `docker compose pull` transcribe to get the per-segment signals AND the
 existed — uncertain-language). The low-speech-coverage check needs the new
 `duration` field, so it too only activates post-rebuild (fail-open without it).
 
-### Docker Runtime Requirements
-vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json`:
+### Container Runtime GPU and Limit Requirements
+
+Docker retains the legacy NVIDIA runtime configured in
+`/etc/docker/daemon.json`:
 ```json
 {
   "default-runtime": "nvidia",
@@ -3607,7 +3609,24 @@ vLLM and llama.cpp require NVIDIA runtime configured in `/etc/docker/daemon.json
   }
 }
 ```
-The `init` command configures this automatically.
+The current `init` command configures that Docker path automatically.
+
+Rootless Podman does not use Docker's `default-runtime` setting. At launch,
+Citadel rewrites Compose GPU requests (`deploy` reservations, `gpus:`, and
+`runtime: nvidia`) into NVIDIA CDI devices such as
+`nvidia.com/gpu=all`; `ContainerRuntime.GPUArgs` performs the equivalent
+translation for direct engine runs. The host must have an NVIDIA CDI spec and
+GPU device nodes readable by the Citadel user. `citadel doctor` verifies this
+with a one-line CUDA-container probe on Linux GPU nodes.
+
+CPU, memory, and PID limits under rootless Podman require cgroup v2 controller
+delegation to the user's systemd service. A start that declares one of those
+limits fails closed when its required controller is not delegated, and
+`citadel doctor` reports the complete delegated-controller list. Cache-index
+scans and disk-pressure GC account for Podman's rootless graph root at
+`$XDG_DATA_HOME/containers/storage` (or
+`~/.local/share/containers/storage`) rather than assuming Docker's
+`/var/lib/docker`.
 
 ### Authentication Patterns
 Two auth flows supported:

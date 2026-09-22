@@ -128,6 +128,26 @@ func TestCacheGCEnabled_TruthyValues(t *testing.T) {
 	}
 }
 
+func TestHighestDiskPressureIncludesPodmanGraphRoot(t *testing.T) {
+	usage := map[string]float64{"/cache": 42, "/home/citadel/.local/share/containers/storage": 94}
+	path, percent, ok := highestDiskPressure("/cache", []string{"/cache", "/home/citadel/.local/share/containers/storage"}, func(path string) (float64, bool) {
+		value, found := usage[path]
+		return value, found
+	})
+	if !ok || path != "/home/citadel/.local/share/containers/storage" || percent != 94 {
+		t.Fatalf("highestDiskPressure() = %q, %.1f, %v", path, percent, ok)
+	}
+}
+
+func TestHighestDiskPressureFailsClosedOnUnreadableRoot(t *testing.T) {
+	_, _, ok := highestDiskPressure("/cache", []string{"/cache", "/podman"}, func(path string) (float64, bool) {
+		return 42, path != "/podman"
+	})
+	if ok {
+		t.Fatal("highestDiskPressure() ok = true with unreadable configured root")
+	}
+}
+
 // --- Resident model is never evicted, even as the LRU candidate over high-water ---
 
 func TestRunCacheGCPass_ResidentModelNeverEvicted(t *testing.T) {

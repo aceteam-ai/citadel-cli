@@ -8,8 +8,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -19,13 +23,14 @@ import (
 )
 
 // doctorReport is the rendered result of `citadel doctor`. It wires together
-// two independently-owned checks rather than reimplementing either:
+// independently-owned checks rather than reimplementing their detection:
 //
 //  1. platform.CheckDockerUsable -- the engine/daemon preflight (citadel
 //     #767). This is the CLI-runnable signal: it works from a bare terminal
-//     with no other citadel process required, so it is what decides the
-//     command's exit code.
-//  2. agentDoctor (cmd/agent_tools.go) -- the job-routing / worker-health
+//     with no other citadel process required.
+//  2. platform.CheckRootlessCgroupDelegation and the Podman CDI probe -- the
+//     enforcement checks that keep rootless limits and GPU access fail-closed.
+//  3. agentDoctor (cmd/agent_tools.go) -- the job-routing / worker-health
 //     diagnosis normally served at /agent/doctor by a LIVE `citadel work` /
 //     `citadel up` process. A standalone `citadel doctor` invocation has no
 //     such process to introspect, so it feeds agentDoctor a zero-value
@@ -41,6 +46,8 @@ import (
 type doctorReport struct {
 	dockerHealth platform.DockerHealth
 	doctor       map[string]any
+	cgroupHealth platform.CgroupDelegationHealth
+	gpuHealth    gpuProbeHealth
 	// dockerOptional is true on platforms where a working container engine is
 	// not required for a healthy node — darwin (citadel-cli#1042): Docker
 	// Desktop is optional on a Mac, and a Mac cannot run the CUDA engines that
@@ -57,15 +64,70 @@ type doctorReport struct {
 	serviceExecWarnings []string
 }
 
-// ok reports whether doctor found a problem worth a non-zero exit. Only the
-// docker/engine preflight decides this: it is the one check in this report
-// that means something for a standalone invocation. The job-routing checks
-// inside r.doctor essentially always read "unhealthy" here (no live worker
-// to resolve Headscale identity, subscribe the per-node stream, etc.), which
-// would make the exit code fire on every idle node if it were included --
-// that is expected standalone state, not a problem to report.
+// ok reports whether doctor found a problem worth a non-zero exit. Engine
+// usability and applicable rootless-limit/CDI checks are actionable from a
+// standalone invocation. Job-routing checks inside r.doctor essentially
+// always read "unhealthy" here (no live worker to inspect), so they remain
+// informational and do not affect the result.
 func (r doctorReport) ok() bool {
-	return r.dockerHealth.OK || r.dockerOptional
+	engineOK := r.dockerHealth.OK || r.dockerOptional
+	delegationOK := !r.cgroupHealth.Applicable || r.cgroupHealth.OK
+	gpuOK := !r.gpuHealth.Applicable || r.gpuHealth.OK
+	return engineOK && delegationOK && gpuOK
+}
+
+func (r doctorReport) problem() string {
+	if !r.dockerHealth.OK && !r.dockerOptional {
+		return r.dockerHealth.String()
+	}
+	if r.cgroupHealth.Applicable && !r.cgroupHealth.OK {
+		return r.cgroupHealth.String()
+	}
+	if r.gpuHealth.Applicable && !r.gpuHealth.OK {
+		return r.gpuHealth.Message
+	}
+	return "unknown problem"
+}
+
+type gpuProbeHealth struct {
+	Applicable bool
+	OK         bool
+	Message    string
+}
+
+const doctorCUDAProbeImage = "docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04"
+
+type doctorCommandRunner func(context.Context, string, ...string) ([]byte, error)
+
+func runPodmanGPUProbe(rt catalog.ContainerRuntime, lookPath func(string) (string, error), run doctorCommandRunner) gpuProbeHealth {
+	if rt.EngineBin != "podman" || !rt.Rootless || !platform.IsLinux() {
+		return gpuProbeHealth{Message: "NVIDIA CDI probe is only applicable to rootless Podman on Linux"}
+	}
+	if _, err := lookPath("nvidia-smi"); err != nil {
+		return gpuProbeHealth{Message: "no host NVIDIA GPU detected; CDI probe not applicable"}
+	}
+	gpuArgs, err := rt.GPUArgs("all")
+	if err != nil {
+		return gpuProbeHealth{Applicable: true, Message: err.Error()}
+	}
+	args := []string{"run", "--rm", "--pull=never"}
+	args = append(args, gpuArgs...)
+	args = append(args, "--security-opt=label=disable", doctorCUDAProbeImage, "nvidia-smi", "-L")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := run(ctx, rt.EngineBin, args...)
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return gpuProbeHealth{Applicable: true, Message: "Podman NVIDIA CDI probe failed: " + detail}
+	}
+	detail := strings.TrimSpace(string(out))
+	if detail == "" {
+		detail = "CUDA device is visible in the container"
+	}
+	return gpuProbeHealth{Applicable: true, OK: true, Message: detail}
 }
 
 // runDoctorChecks gathers the checks doctorReport wires together. Split out
@@ -80,10 +142,19 @@ func runDoctorChecks() doctorReport {
 // platform.IsDarwin() without needing to run on a Mac. runDoctorChecks resolves
 // the real value; a hand-built doctorReport in a test would bypass this wiring.
 func runDoctorChecksFor(isDarwin bool) doctorReport {
-	bin := catalog.SelectContainerRuntime().EngineBin
+	rt := catalog.SelectContainerRuntime()
+	cgroupHealth := platform.CgroupDelegationHealth{OK: true, Message: "not applicable to the selected runtime"}
+	if rt.EngineBin == "podman" && rt.Rootless && platform.IsLinux() {
+		cgroupHealth = platform.CheckRootlessCgroupDelegation([]string{"cpu", "memory", "pids"})
+	}
+	gpuHealth := runPodmanGPUProbe(rt, exec.LookPath, func(ctx context.Context, binary string, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	})
 	return doctorReport{
-		dockerHealth:        platform.CheckDockerUsable(bin),
+		dockerHealth:        platform.CheckDockerUsable(rt.EngineBin),
 		doctor:              agentDoctor(worker.WorkerSnapshot{}),
+		cgroupHealth:        cgroupHealth,
+		gpuHealth:           gpuHealth,
 		dockerOptional:      isDarwin,
 		bindWarnings:        engineBindExposureWarnings(),
 		serviceExecWarnings: service.EphemeralManagedExecStarts(),
@@ -105,6 +176,27 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 		fmt.Fprintln(w, faintColor.Sprint("  (Docker Desktop is optional on macOS; install it only to run container-based services)"))
 	default:
 		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("[FAIL]"), r.dockerHealth.String())
+	}
+
+	headerColor.Fprintln(w, "\nROOTLESS RESOURCE LIMITS")
+	if !r.cgroupHealth.Applicable {
+		fmt.Fprintf(w, "  %s %s\n", faintColor.Sprint("[N/A]"), r.cgroupHealth.String())
+	} else if r.cgroupHealth.OK {
+		fmt.Fprintf(w, "  %s delegated controllers: %s\n", goodColor.Sprint("[OK]"), strings.Join(r.cgroupHealth.Controllers, ", "))
+	} else {
+		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("[FAIL]"), r.cgroupHealth.String())
+		if r.cgroupHealth.Hint != "" {
+			fmt.Fprintf(w, "       %s\n", r.cgroupHealth.Hint)
+		}
+	}
+
+	headerColor.Fprintln(w, "\nPODMAN NVIDIA CDI")
+	if !r.gpuHealth.Applicable {
+		fmt.Fprintf(w, "  %s %s\n", faintColor.Sprint("[N/A]"), r.gpuHealth.Message)
+	} else if r.gpuHealth.OK {
+		fmt.Fprintf(w, "  %s %s\n", goodColor.Sprint("[OK]"), r.gpuHealth.Message)
+	} else {
+		fmt.Fprintf(w, "  %s %s\n", badColor.Sprint("[FAIL]"), r.gpuHealth.Message)
 	}
 
 	headerColor.Fprintln(w, "\nJOB ROUTING / WORKER HEALTH")
@@ -166,7 +258,7 @@ func renderDoctorReport(w io.Writer, r doctorReport) {
 var doctorCmd = &cobra.Command{
 	Use:     "doctor",
 	Aliases: []string{"dr"},
-	Short:   "Diagnose common node problems (docker/engine usability, job-routing health)",
+	Short:   "Diagnose engine, Podman isolation, GPU, and job-routing health",
 	Long: `citadel doctor runs a quick, scriptable health check by wiring together
 existing diagnostics rather than reimplementing detection logic:
 
@@ -179,13 +271,14 @@ existing diagnostics rather than reimplementing detection logic:
     standalone 'citadel doctor' has no live worker to inspect, this section
     is shown for context only and does not affect the exit code.
 
-Exits non-zero if the docker/engine preflight fails, so it can be used in
-scripts and health checks.`,
+Exits non-zero if the engine preflight, required rootless cgroup delegation,
+or an applicable Podman NVIDIA CDI probe fails, so it can be used in scripts
+and health checks.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		report := runDoctorChecks()
 		renderDoctorReport(cmd.OutOrStdout(), report)
 		if !report.ok() {
-			return fmt.Errorf("citadel doctor found a problem: %s", report.dockerHealth.String())
+			return fmt.Errorf("citadel doctor found a problem: %s", report.problem())
 		}
 		return nil
 	},

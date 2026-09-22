@@ -302,7 +302,28 @@ func startService(serviceName, composeFilePath string) error {
 	}
 
 	// Start the service (container either doesn't exist or was just removed)
+	sandboxOverridePath := sandboxOverridePathFor(composeFilePath)
+	requiredControllers, limitsErr := compose.RequiredLimitControllersFromFiles(composeFilePath, sandboxOverridePath)
+	if limitsErr != nil {
+		return fmt.Errorf("cannot inspect %s resource limits: %w", serviceName, limitsErr)
+	}
+	if limitsErr := rt.PreflightLimitControllers(requiredControllers...); limitsErr != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, limitsErr)
+	}
+
+	// Podman consumes NVIDIA devices through CDI rather than Docker's --gpus /
+	// deploy reservation vocabulary. Rewrite a private temporary copy and leave
+	// the installed compose source untouched.
 	actualComposePath := composeFilePath
+	if rt.EngineBin == "podman" {
+		var cleanup func()
+		var rewriteErr error
+		actualComposePath, cleanup, rewriteErr = compose.MaterializePodmanGPUCompose(composeFilePath)
+		if rewriteErr != nil {
+			return fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", serviceName, rewriteErr)
+		}
+		defer cleanup()
+	}
 
 	// On non-Linux platforms, strip GPU device reservations from compose file
 	if !platform.IsLinux() {

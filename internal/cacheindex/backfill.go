@@ -73,6 +73,9 @@ type ScanOptions struct {
 	// explains why): ReconcileScan does not re-derive or re-validate this
 	// path, it only sizes whatever is passed.
 	LegacyHFHubDir string
+	// RuntimeStorageRoots are engine graph roots to measure into Meta. Missing
+	// roots are omitted rather than recorded as zero-sized.
+	RuntimeStorageRoots []string
 }
 
 // ReconcileScan reconciles what is actually on disk under cacheRoot (see
@@ -142,11 +145,12 @@ func (s *Store) ReconcileScan(cacheRoot string, opts ScanOptions) error {
 	// are pure reads independent of s.idx.entries.
 	dirScans := buildDirScans(cacheRoot, res)
 	legacyHF := probeLegacyHFCache(opts.LegacyHFHubDir)
+	runtimeStorage := scanRuntimeStorage(opts.RuntimeStorageRoots)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.idx.meta = Meta{ScannedAt: s.now(), Dirs: dirScans, LegacyHF: legacyHF}
+	s.idx.meta = Meta{ScannedAt: s.now(), Dirs: dirScans, LegacyHF: legacyHF, RuntimeStorage: runtimeStorage}
 
 	// Every file already claimed by an EXISTING entry, per cache_dir --
 	// computed BEFORE any mutation below, so a candidate's own about-to-be-
@@ -211,6 +215,24 @@ func (s *Store) ReconcileScan(cacheRoot string, opts ScanOptions) error {
 	}
 
 	return s.flushLocked()
+}
+
+func scanRuntimeStorage(roots []string) []RuntimeStorageScan {
+	seen := map[string]bool{}
+	var scans []RuntimeStorageScan
+	for _, root := range roots {
+		root = filepath.Clean(strings.TrimSpace(root))
+		if root == "." || seen[root] {
+			continue
+		}
+		seen[root] = true
+		if info, err := os.Stat(root); err != nil || !info.IsDir() {
+			continue
+		}
+		scans = append(scans, RuntimeStorageScan{Path: root, MeasuredBytes: dirSize(root)})
+	}
+	sort.Slice(scans, func(i, j int) bool { return scans[i].Path < scans[j].Path })
+	return scans
 }
 
 // allClaimed reports whether every entry in files is present in claimed. A
