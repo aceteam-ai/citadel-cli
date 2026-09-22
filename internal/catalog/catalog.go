@@ -39,9 +39,10 @@ type Registry struct {
 // entries are accepted only from the built-in default catalog. Community
 // sources cannot extend or replace this trusted pre-pull list.
 type RuntimeImage struct {
-	Name          string   `yaml:"name"`
-	Image         string   `yaml:"image"`
-	Architectures []string `yaml:"architectures"`
+	Name           string   `yaml:"name"`
+	Image          string   `yaml:"image"`
+	DiscoveryAlias string   `yaml:"discovery_alias,omitempty"`
+	Architectures  []string `yaml:"architectures"`
 }
 
 // RegistryEntry is a summary of a single service in the registry index.
@@ -432,7 +433,8 @@ func LoadRegistry() (*Registry, error) {
 	return &Registry{Version: 1, RuntimeImages: runtimeImages, Services: mergeRegistries(regs)}, nil
 }
 
-var runtimeImagePattern = regexp.MustCompile(`^ghcr\.io/aceteam-ai/aceteam-app-([a-z0-9]+(?:-[a-z0-9]+)*):[A-Za-z0-9._-]+$`)
+var runtimeImagePattern = regexp.MustCompile(`^ghcr\.io/aceteam-ai/aceteam-app-([a-z0-9]+(?:-[a-z0-9]+)*)@sha256:[0-9a-f]{64}$`)
+var runtimeDiscoveryAliasPattern = regexp.MustCompile(`^ghcr\.io/aceteam-ai/aceteam-app-([a-z0-9]+(?:-[a-z0-9]+)*):stable$`)
 
 // validateRuntimeImages copies and validates trusted default-catalog entries.
 // Keeping this boundary in the loader prevents any command from accidentally
@@ -443,7 +445,11 @@ func validateRuntimeImages(images []RuntimeImage) ([]RuntimeImage, error) {
 	for _, image := range images {
 		matches := runtimeImagePattern.FindStringSubmatch(image.Image)
 		if image.Name == "" || len(matches) != 2 || matches[1] != image.Name {
-			return nil, fmt.Errorf("runtime image %q must match ghcr.io/aceteam-ai/aceteam-app-<name>:<tag>", image.Name)
+			return nil, fmt.Errorf("runtime image %q must match ghcr.io/aceteam-ai/aceteam-app-<name>@sha256:<64 hex digest>", image.Name)
+		}
+		aliasMatches := runtimeDiscoveryAliasPattern.FindStringSubmatch(image.DiscoveryAlias)
+		if len(aliasMatches) != 2 || aliasMatches[1] != image.Name {
+			return nil, fmt.Errorf("runtime image %q discovery alias must be its first-party stable tag", image.Name)
 		}
 		if seenNames[image.Name] {
 			return nil, fmt.Errorf("duplicate runtime image name %q", image.Name)

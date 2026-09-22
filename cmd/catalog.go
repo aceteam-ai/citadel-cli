@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 
@@ -147,18 +148,24 @@ func runCatalogPrePullRuntimes(cmd *cobra.Command, args []string) error {
 		return pullCmd.Run()
 	}
 
-	return prePullRuntimeImages(cmd.Context(), reg.RuntimeImages, catalogPrePullRuntimesDryRun, out, pull)
+	return prePullRuntimeImages(
+		cmd.Context(), reg.RuntimeImages, runtime.GOARCH, catalogPrePullRuntimesDryRun, out, pull,
+	)
 }
 
 func prePullRuntimeImages(
 	ctx context.Context,
 	images []catalog.RuntimeImage,
+	hostArchitecture string,
 	dryRun bool,
 	out io.Writer,
 	pull func(context.Context, string) error,
 ) error {
 	if len(images) == 0 {
 		return fmt.Errorf("trusted catalog has no app runtime images")
+	}
+	if err := preflightRuntimeImageArchitectures(images, hostArchitecture); err != nil {
+		return err
 	}
 
 	for _, runtimeImage := range images {
@@ -174,6 +181,35 @@ func prePullRuntimeImages(
 
 	if !dryRun {
 		fmt.Fprintln(out, "App runtime images cached successfully.")
+	}
+	return nil
+}
+
+// preflightRuntimeImageArchitectures checks the complete trusted set before a
+// pull is attempted. A mixed compatible/incompatible catalog therefore fails
+// atomically instead of partially warming the node cache.
+func preflightRuntimeImageArchitectures(
+	images []catalog.RuntimeImage, hostArchitecture string,
+) error {
+	var unsupported []string
+	for _, runtimeImage := range images {
+		supported := false
+		for _, architecture := range runtimeImage.Architectures {
+			if architecture == hostArchitecture {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			unsupported = append(unsupported, runtimeImage.Name)
+		}
+	}
+	if len(unsupported) > 0 {
+		return fmt.Errorf(
+			"host architecture %q is unsupported by trusted app runtimes: %s",
+			hostArchitecture,
+			strings.Join(unsupported, ", "),
+		)
 	}
 	return nil
 }

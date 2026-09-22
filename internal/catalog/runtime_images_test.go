@@ -12,7 +12,8 @@ func TestLoadRegistryRuntimeImagesOnlyFromTrustedDefault(t *testing.T) {
 	defaultRegistry := `version: 1
 runtime_images:
   - name: python
-    image: ghcr.io/aceteam-ai/aceteam-app-python:stable
+    image: ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    discovery_alias: ghcr.io/aceteam-ai/aceteam-app-python:stable
     architectures: [amd64, arm64]
 services: []
 `
@@ -37,7 +38,7 @@ services: []
 	if len(reg.RuntimeImages) != 1 {
 		t.Fatalf("RuntimeImages = %+v, want one trusted entry", reg.RuntimeImages)
 	}
-	if got := reg.RuntimeImages[0].Image; got != "ghcr.io/aceteam-ai/aceteam-app-python:stable" {
+	if got := reg.RuntimeImages[0].Image; got != "ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("trusted runtime image = %q", got)
 	}
 }
@@ -49,15 +50,19 @@ func TestValidateRuntimeImagesRejectsUntrustedOrMismatchedReferences(t *testing.
 	}{
 		{
 			name:  "other namespace",
-			image: RuntimeImage{Name: "python", Image: "ghcr.io/example/python:stable", Architectures: []string{"amd64"}},
+			image: RuntimeImage{Name: "python", Image: "ghcr.io/example/python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Architectures: []string{"amd64"}},
 		},
 		{
 			name:  "name mismatch",
-			image: RuntimeImage{Name: "node", Image: "ghcr.io/aceteam-ai/aceteam-app-python:stable", Architectures: []string{"amd64"}},
+			image: RuntimeImage{Name: "node", Image: "ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Architectures: []string{"amd64"}},
+		},
+		{
+			name:  "mutable stable tag",
+			image: RuntimeImage{Name: "python", Image: "ghcr.io/aceteam-ai/aceteam-app-python:stable", Architectures: []string{"amd64"}},
 		},
 		{
 			name:  "unsupported architecture",
-			image: RuntimeImage{Name: "python", Image: "ghcr.io/aceteam-ai/aceteam-app-python:stable", Architectures: []string{"s390x"}},
+			image: RuntimeImage{Name: "python", Image: "ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Architectures: []string{"s390x"}},
 		},
 	}
 
@@ -72,9 +77,10 @@ func TestValidateRuntimeImagesRejectsUntrustedOrMismatchedReferences(t *testing.
 
 func TestValidateRuntimeImagesRejectsDuplicateNamesAndArchitectures(t *testing.T) {
 	base := RuntimeImage{
-		Name:          "python",
-		Image:         "ghcr.io/aceteam-ai/aceteam-app-python:stable",
-		Architectures: []string{"amd64", "arm64"},
+		Name:           "python",
+		Image:          "ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		DiscoveryAlias: "ghcr.io/aceteam-ai/aceteam-app-python:stable",
+		Architectures:  []string{"amd64", "arm64"},
 	}
 	if _, err := validateRuntimeImages([]RuntimeImage{base, base}); err == nil {
 		t.Fatal("duplicate name accepted")
@@ -83,6 +89,21 @@ func TestValidateRuntimeImagesRejectsDuplicateNamesAndArchitectures(t *testing.T
 	base.Architectures = []string{"amd64", "amd64"}
 	if _, err := validateRuntimeImages([]RuntimeImage{base}); err == nil {
 		t.Fatal("duplicate architecture accepted")
+	}
+}
+
+func TestValidateRuntimeImagesRequiresMatchingDiscoveryAlias(t *testing.T) {
+	base := RuntimeImage{
+		Name:          "python",
+		Image:         "ghcr.io/aceteam-ai/aceteam-app-python@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Architectures: []string{"amd64"},
+	}
+	if _, err := validateRuntimeImages([]RuntimeImage{base}); err == nil {
+		t.Fatal("missing discovery alias accepted")
+	}
+	base.DiscoveryAlias = "ghcr.io/aceteam-ai/aceteam-app-node:stable"
+	if _, err := validateRuntimeImages([]RuntimeImage{base}); err == nil {
+		t.Fatal("mismatched discovery alias accepted")
 	}
 }
 
