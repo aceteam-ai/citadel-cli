@@ -14,6 +14,8 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/services"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -145,6 +147,9 @@ func prepareCacheDirectories() error {
 
 // startService starts a docker-based service using docker compose.
 func startService(serviceName, composeFilePath string) error {
+	if err := refuseManagedVLLMStart(serviceName); err != nil {
+		return err
+	}
 	if composeFilePath == "" {
 		return fmt.Errorf("service %s has no compose_file defined", serviceName)
 	}
@@ -348,6 +353,31 @@ func startService(serviceName, composeFilePath string) error {
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
+	}
+	return nil
+}
+
+func refuseManagedVLLMStart(serviceName string) error {
+	if composeProjectOverride() != "" {
+		return nil
+	}
+	return refuseManagedVLLMWhileExternal(serviceName, network.GetNodeConfigDir())
+}
+
+// refuseManagedVLLMWhileExternal keeps the explicit ownership record
+// authoritative across every managed start path (boot, local CLI, and desired
+// state). A detached record is an intentional tombstone, not permission to
+// launch a competing Citadel-managed container.
+func refuseManagedVLLMWhileExternal(serviceName, configDir string) error {
+	if serviceName != "vllm" {
+		return nil
+	}
+	c, err := externalengine.LoadPersisted(configDir)
+	if err != nil {
+		return fmt.Errorf("cannot inspect external vllm ownership: %w", err)
+	}
+	if c != nil {
+		return fmt.Errorf("cannot start managed vllm: external %s ownership record exists", c.Mode)
 	}
 	return nil
 }

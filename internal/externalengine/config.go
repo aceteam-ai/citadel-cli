@@ -145,7 +145,7 @@ func Validate(c Config, localOnly bool) (Config, error) {
 
 func Path(dir string) string { return filepath.Join(dir, FileName) }
 
-func Load(dir string) (*Config, error) {
+func load(dir string, localOnly bool) (*Config, error) {
 	b, err := os.ReadFile(Path(dir))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -160,7 +160,7 @@ func Load(dir string) (*Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, err
 	}
-	validated, err := Validate(c, true)
+	validated, err := Validate(c, localOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +169,16 @@ func Load(dir string) (*Config, error) {
 	}
 	return &validated, nil
 }
+
+// Load validates the persisted record for use by the current process. Adopted
+// non-loopback endpoints must still be assigned to this node at load time.
+func Load(dir string) (*Config, error) { return load(dir, true) }
+
+// LoadPersisted validates a record for reconciliation without requiring its
+// former endpoint to remain assigned. This lets a newer desired revision
+// replace or detach an otherwise valid record after an interface-address
+// change; the new adopted candidate still receives strict local validation.
+func LoadPersisted(dir string) (*Config, error) { return load(dir, false) }
 
 // Save uses a restrictive temporary file, fsync, rename and parent fsync.
 // A previous-state copy is retained for operator recovery.

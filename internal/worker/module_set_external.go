@@ -41,7 +41,7 @@ func (h *ModuleSetHandler) executeExternal(ctx context.Context, job *Job) *JobRe
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 	if cfg.Load == nil {
-		cfg.Load = externalengine.Load
+		cfg.Load = externalengine.LoadPersisted
 	}
 	if cfg.Save == nil {
 		cfg.Save = externalengine.Save
@@ -68,7 +68,11 @@ func (h *ModuleSetHandler) executeExternal(ctx context.Context, job *Job) *JobRe
 		cfg.Snapshot = func() error { _, err := externalengine.Current(); return err }
 	}
 	if err := cfg.Snapshot(); err != nil {
-		return h.failure(fmt.Errorf("current external engine config: %w", err))
+		// Snapshot is still valuable when startup state is invalid: Current has
+		// cached that failure, so this process cannot route through a newly
+		// written record before the successful re-exec. Continue so a newer
+		// desired revision can repair a stale interface binding.
+		cfg.Log("current external engine config is unavailable; continuing recovery: %v", err)
 	}
 	if job == nil || job.Payload == nil {
 		return h.failure(fmt.Errorf("missing job payload"))

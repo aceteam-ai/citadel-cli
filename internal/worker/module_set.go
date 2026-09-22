@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
 )
 
@@ -122,6 +123,19 @@ func (h *ModuleSetHandler) Execute(ctx context.Context, job *Job, stream StreamW
 	case "", string(reconcile.StatusRunning), string(reconcile.StatusStopped), statusAbsent:
 	default:
 		return h.failure(fmt.Errorf("MODULE_SET: unknown desired_status %q (want running|stopped|absent)", m.DesiredStatus)), nil
+	}
+	if h.cfg.External != nil && (m.Source == "vllm" || m.Key() == "vllm") {
+		// Serialize the ownership check through the managed reconciliation so an
+		// adopt cannot race between this read and the managed side effects.
+		h.cfg.External.mu.Lock()
+		defer h.cfg.External.mu.Unlock()
+		external, err := externalengine.LoadPersisted(h.cfg.External.Dir)
+		if err != nil {
+			return h.failure(fmt.Errorf("MODULE_SET: inspect external vllm ownership: %w", err)), nil
+		}
+		if external != nil {
+			return h.failure(fmt.Errorf("MODULE_SET: external vllm ownership record exists; managed action refused")), nil
+		}
 	}
 
 	h.cfg.Log("MODULE_SET: source=%q desired_status=%q", m.Source, statusRaw)

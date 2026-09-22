@@ -83,6 +83,24 @@ func TestAtomicPersistenceAndDetachTombstone(t *testing.T) {
 	}
 }
 
+func TestLoadPersistedAllowsFormerLocalAddressForRecovery(t *testing.T) {
+	dir := t.TempDir()
+	stored, err := Validate(Config{Version: 1, Mode: "adopted", Endpoint: Endpoint{Host: "192.0.2.10", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err == nil {
+		t.Fatal("runtime load accepted an endpoint that is not assigned to this node")
+	}
+	loaded, err := LoadPersisted(dir)
+	if err != nil || loaded == nil || *loaded != stored {
+		t.Fatalf("reconciliation load = %+v, %v", loaded, err)
+	}
+}
+
 func TestProbeRequiresExactModelAndDoesNotRedirect(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"data":[{"id":"vendor/model"}]}`)) }))
 	defer target.Close()

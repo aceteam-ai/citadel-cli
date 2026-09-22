@@ -123,6 +123,68 @@ func TestExternalModuleFailedWriteKeepsPreviousRecord(t *testing.T) {
 	}
 }
 
+func TestExternalModuleCanDetachAfterPersistedAddressDisappears(t *testing.T) {
+	dir := t.TempDir()
+	old, err := externalengine.Validate(externalengine.Config{Version: 1, Mode: "adopted", Endpoint: externalengine.Endpoint{Host: "192.0.2.10", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := externalengine.Save(dir, old); err != nil {
+		t.Fatal(err)
+	}
+	ops := newFakeModuleOps()
+	var logged bool
+	cfg := &ExternalModuleConfig{
+		NodeID: "12", OrgID: "org1", Dir: dir, Ops: ops,
+		Snapshot: func() error { return errors.New("host is not assigned to this node") },
+		Probe:    func(context.Context, externalengine.Endpoint, string) error { return nil },
+		Log:      func(string, ...any) { logged = true },
+	}
+	h := NewModuleSetHandler(ModuleSetConfig{Ops: ops, External: cfg})
+	r, _ := h.Execute(context.Background(), externalJob("detach_external", "2", "two"), nil)
+	if r.Status != JobStatusSuccess || !logged {
+		t.Fatalf("detach recovery: %+v, logged=%v", r, logged)
+	}
+	loaded, err := externalengine.Load(dir)
+	if err != nil || loaded == nil || loaded.Mode != "detached" || loaded.Revision != "2" {
+		t.Fatalf("detached state: %+v, %v", loaded, err)
+	}
+	r, _ = h.Execute(context.Background(), externalJob("adopt_external", "3", "three"), nil)
+	if r.Status != JobStatusSuccess {
+		t.Fatalf("adopt recovery: %+v", r)
+	}
+	loaded, err = externalengine.Load(dir)
+	if err != nil || loaded == nil || loaded.Mode != "adopted" || loaded.Revision != "3" || loaded.Endpoint.Host != "127.0.0.1" {
+		t.Fatalf("adopted state: %+v, %v", loaded, err)
+	}
+}
+
+func TestManagedVLLMActionRefusedWhileExternalRecordExists(t *testing.T) {
+	for _, mode := range []string{"adopted", "detached"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			stored, err := externalengine.Validate(externalengine.Config{Version: 1, Mode: mode, Endpoint: externalengine.Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := externalengine.Save(dir, stored); err != nil {
+				t.Fatal(err)
+			}
+			ops := newFakeModuleOps()
+			h := NewModuleSetHandler(ModuleSetConfig{Ops: ops, External: &ExternalModuleConfig{NodeID: "12", OrgID: "org1", Dir: dir, Ops: ops}})
+			for _, status := range []string{"running", "stopped", "absent"} {
+				r, err := h.Execute(context.Background(), &Job{Type: JobTypeModuleSet, SourceQueue: "jobs:v1:shell:org_org1:node:12", Payload: map[string]any{"source": "vllm", "desired_status": status}}, nil)
+				if err != nil || r.Status != JobStatusFailure {
+					t.Fatalf("status %s: %+v, %v", status, r, err)
+				}
+			}
+			if len(ops.calls) != 0 {
+				t.Fatalf("managed effects under external ownership: %v", ops.calls)
+			}
+		})
+	}
+}
+
 func TestExternalModulePortOnlyDefaultsLoopback(t *testing.T) {
 	dir := t.TempDir()
 	ops := newFakeModuleOps()
