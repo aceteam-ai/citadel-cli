@@ -50,6 +50,10 @@ const defaultLinkTTL = 24 * time.Hour
 // is not a lane-blocking concern.
 var exposeOpsMu sync.Mutex
 
+// exposeMeshIP is a seam over meshIPv4 so exposure tests never reconnect with
+// a machine's persisted mesh identity while exercising otherwise-local state.
+var exposeMeshIP = meshIPv4
+
 // resolveEffectiveEpoch computes the node-owned effective epoch for an
 // EXPOSE_SET call (issue #944 design doc §5.3): the caller expresses INTENT
 // (a fast-forward hint via reqEpoch, or an explicit revoke via rotate), the
@@ -464,7 +468,7 @@ func localPortListening(port int) bool {
 // the persisted gateway facts so it is correct whether or not this process runs
 // the gateway.
 func exposeMeshURL(name string) string {
-	ip := meshIPv4()
+	ip := exposeMeshIP()
 	if ip == "" {
 		return ""
 	}

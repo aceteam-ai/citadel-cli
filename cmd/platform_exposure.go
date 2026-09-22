@@ -100,7 +100,7 @@ func platformMeshURL(ip string, port int) string {
 func platformURLForPort(port int) string {
 	ip := gatewayFactsForURL().MeshIP
 	if ip == "" {
-		ip = meshIPv4()
+		ip = exposeMeshIP()
 	}
 	return platformMeshURL(ip, port)
 }
@@ -210,7 +210,12 @@ func (p *platformExposure) forward(conn net.Conn) {
 		Log("platform exposure %q: node allowlist unavailable: %v", p.name, err)
 		return
 	}
-	if !id.SameOwner && !allowed[id.LoginName] {
+	// SameOwner is derived from control-plane user IDs, but the identity
+	// contract still requires a non-empty stable OwnerID before a caller may
+	// bind authorization to that relationship. This also fails closed if an
+	// incomplete WhoIs response ever compares two zero-value user IDs as equal.
+	sameOwner := id.SameOwner && id.OwnerID != ""
+	if !sameOwner && !allowed[id.LoginName] {
 		Log("platform exposure %q: peer %q denied", p.name, id.NodeName)
 		return
 	}

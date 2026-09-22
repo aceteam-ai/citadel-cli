@@ -90,9 +90,13 @@ func TestPlatformExposureIdentityAndLifecycle(t *testing.T) {
 		body, err := io.ReadAll(response.Body)
 		return string(body), err
 	}
-	setPeer(&network.PeerIdentity{NodeName: "peer", SameOwner: true}, nil)
+	setPeer(&network.PeerIdentity{NodeName: "peer", OwnerID: "userid:7", SameOwner: true}, nil)
 	if body, err := request(); err != nil || body != "example.test" {
 		t.Fatalf("same owner: %q, %v", body, err)
+	}
+	setPeer(&network.PeerIdentity{NodeName: "peer", SameOwner: true}, nil)
+	if body, err := request(); err == nil {
+		t.Fatalf("same-owner claim without a stable owner ID admitted %q", body)
 	}
 	if err := os.WriteFile(filepath.Join(platformConfigDir(), "platform-exposure.json"), []byte(`{invalid`), 0o600); err != nil {
 		t.Fatal(err)
@@ -156,6 +160,21 @@ func TestPlatformExposureBindModeAndTargetValidation(t *testing.T) {
 	}
 	if _, err := platformTarget(80, "8.8.8.8:80"); err == nil {
 		t.Fatal("public target accepted")
+	}
+	if target, err := platformTarget(80, "10.0.0.8:8080"); err != nil || target != "10.0.0.8:8080" {
+		t.Fatalf("private target = %q, %v", target, err)
+	}
+	if err := os.WriteFile(filepath.Join(platformConfigDir(), "platform-exposure.json"), []byte(`{"allowed_logins":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (liveExposeOps{}).Expose(context.Background(), worker.ExposeRequest{Name: "web", Port: 80, Visibility: "platform"}); err == nil || !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("malformed allowlist startup error = %v", err)
+	}
+	if len(platformExposures) != 0 {
+		t.Fatal("listener started with a malformed allowlist")
+	}
+	if err := os.Remove(filepath.Join(platformConfigDir(), "platform-exposure.json")); err != nil {
+		t.Fatal(err)
 	}
 	platformListenVPN = func(_, _ string) (net.Listener, string, error) { return nil, "", errors.New("permission denied") }
 	platformMode = func() network.BackendMode { return network.ModeTUN }
