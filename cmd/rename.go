@@ -128,9 +128,12 @@ func reconnectWithNewName(newName string) error {
 	// Drop any existing connection so we can re-establish with the new hostname.
 	_ = network.Disconnect()
 
+	// This is a reconnect of an already-enrolled node, not an enroll, so honor
+	// the persisted control plane rather than the --nexus flag default
+	// (citadel-cli#1110, founder decision D7).
 	config := network.ServerConfig{
 		Hostname:   newName,
-		ControlURL: nexusURL,
+		ControlURL: network.ResolveControlURL(),
 		StateDir:   network.GetStateDir(),
 	}
 

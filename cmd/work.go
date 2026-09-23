@@ -3655,6 +3655,14 @@ type DeviceConfig struct {
 	// today -- see docs/design-node-identity-receipts.md §2 and
 	// cmd/whoami.go's NodeIdentity.PlatformNodeID, which reads this field.
 	FabricNodeID string `yaml:"fabric_node_id"`
+	// NexusURL is the nexus/control URL this node enrolled against
+	// (citadel-cli#1110). Written by saveNexusURLToConfig at every enroll site;
+	// read-side convenience here. The reconnect paths deliberately resolve it
+	// via network.ResolveControlURL (which reads the same config.yaml directly),
+	// NOT via this field, so an authkey-only node whose config has no device
+	// token (getDeviceConfigFromFile returns nil) still reconnects to the right
+	// control plane.
+	NexusURL string `yaml:"nexus_url"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the

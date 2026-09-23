@@ -2649,3 +2649,18 @@ Auto-generated log of every release.
   - feat: ingress session-isolation, authz fail-closed, route-freshness bound (#1100)
 
 
+---
+
+## v2.169.0 — 2026-09-23
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +581 |
+
+**Changes:**
+
+  - fix: persist and honor nexus URL node-side (#1110)
+
+
