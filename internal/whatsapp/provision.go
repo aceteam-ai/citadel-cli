@@ -49,6 +49,17 @@ type ProvisionRequest struct {
 	// citadel's own 8080 listener (aceteam-ai/citadel-cli#438). A positive value
 	// is an explicit operator override and is honored verbatim.
 	Port int
+	// Force upgrades a bridge that is stuck on a stale image
+	// (aceteam-ai/citadel-cli#1124, aceteam#10220). When true and
+	// ProvisionDeps.ForceRecreateCompose is wired, Provision routes the deploy
+	// through that edge instead of DeployCompose: it re-pulls the resolved bridge
+	// image tag and `docker compose up -d --no-deps --force-recreate` the BRIDGE
+	// service only -- never `down -v`, never the Postgres auth-state volume, so the
+	// WhatsApp session survives with no re-QR. It exists because the #624 D5
+	// delegation short-circuits the ordinary deploy on a module-managed node (no
+	// pull, no recreate), leaving a stuck bridge with no self-service upgrade.
+	// Absent (the default) leaves every existing path byte-identical.
+	Force bool
 }
 
 // ProvisionDeps injects the effectful, environment-specific edges so the core
@@ -71,6 +82,22 @@ type ProvisionDeps struct {
 	// locally is a no-op and a provisioned bridge can never be upgraded
 	// (aceteam-ai/citadel-cli#718).
 	DeployCompose func(servicesDir string, env map[string]string) error
+
+	// ForceRecreateCompose is the force-upgrade deploy edge, used INSTEAD of
+	// DeployCompose when ProvisionRequest.Force is set (aceteam-ai/citadel-cli#1124,
+	// aceteam#10220). It re-pulls the resolved bridge image tag and runs
+	// `docker compose up -d --no-deps --force-recreate` on the BRIDGE service only,
+	// so a node stuck on a stale image (e.g. the #624 D5 delegation deployed no new
+	// pull) self-upgrades. It MUST NOT run `down`, pass `-v`, or otherwise touch the
+	// Postgres auth-state volume -- the WhatsApp session must survive with no re-QR.
+	// Unlike DeployCompose's pull (best-effort), a pull failure here is FATAL: force
+	// is an explicit upgrade ask, and recreating onto the same stale image after a
+	// failed pull would report an upgrade that never happened.
+	//
+	// Nil means force is not wired: Provision then falls back to DeployCompose and
+	// leaves ProvisionResult.Forced false (the "older Citadel ignored the flag"
+	// shape the backend already handles distinctly), rather than claiming an upgrade.
+	ForceRecreateCompose func(servicesDir string, env map[string]string) error
 
 	// BridgeImageID reports the docker image ID (sha256:...) the bridge container
 	// is CURRENTLY running, or "" when the bridge is not running or Docker is
@@ -216,6 +243,15 @@ type ProvisionResult struct {
 	// still succeeds (the bridge is up and linked), but the caller must not read
 	// that success as "running the latest image".
 	ImagePullError string
+	// Forced is true when ProvisionRequest.Force was honored -- i.e. the deploy ran
+	// through ForceRecreateCompose (re-pull + force-recreate of the bridge service).
+	// The handler maps a forced provision of an already-linked bridge to
+	// status="upgraded" (aceteam#10220). It is DISTINCT from Upgraded: Upgraded
+	// says the image digest actually moved; Forced says the operator requested and
+	// the node honored a force-recreate, which is reported as an upgrade even when a
+	// good pull left the digest unchanged (a no-op-but-still-report). False when
+	// Force was absent, or requested but ForceRecreateCompose was not wired.
+	Forced bool
 }
 
 // persistedBridgePort returns the bridge's previously-persisted BRIDGE_PORT from
@@ -342,12 +378,26 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		imageIDBefore = deps.BridgeImageID()
 	}
 
+	// A force upgrade (#1124) routes the deploy through ForceRecreateCompose (pull
+	// + force-recreate of the bridge service only) INSTEAD of the ordinary
+	// DeployCompose, which the #624 D5 delegation can short-circuit into a no-op on
+	// a module-managed node. When force is requested but no ForceRecreateCompose is
+	// wired (older wiring), fall back to DeployCompose and leave Forced false rather
+	// than fabricate an upgrade.
+	deploy := deps.DeployCompose
+	forced := false
+	if req.Force && deps.ForceRecreateCompose != nil {
+		deploy = deps.ForceRecreateCompose
+		forced = true
+		log("force upgrade requested: re-pulling and force-recreating the bridge service")
+	}
+
 	const maxDeployAttempts = 4
 	autoSelected := req.Port <= 0
 	for attempt := 1; ; attempt++ {
 		env["BRIDGE_PORT"] = fmt.Sprintf("%d", port)
 		log("deploying WhatsApp bridge on port %d", port)
-		derr := deps.DeployCompose(servicesDir, env)
+		derr := deploy(servicesDir, env)
 		if derr == nil {
 			break
 		}
@@ -462,6 +512,7 @@ func Provision(ctx context.Context, req ProvisionRequest, deps ProvisionDeps) (*
 		ImageIDAfter:   imageIDAfter,
 		Upgraded:       upgraded,
 		ImagePullError: pullErr,
+		Forced:         forced,
 	}
 	// Publish the gateway cert (so the backend can trust the https api_url) and the
 	// plaintext refresh URL (so it re-fetches on rotation). Both deps are optional:
