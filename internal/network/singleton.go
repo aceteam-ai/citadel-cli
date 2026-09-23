@@ -308,8 +308,17 @@ func PersistedControlURL() string {
 // live node must never be written/read through by a test — see CLAUDE.md's
 // ConfigDir()/GetNodeConfigDir() section). A missing/unparseable file yields "".
 func readPersistedControlURL(configDir string) string {
-	data, err := os.ReadFile(filepath.Join(configDir, "config.yaml"))
+	configFile := filepath.Join(configDir, "config.yaml")
+	data, err := os.ReadFile(configFile)
 	if err != nil {
+		// A missing file is the expected case for a node enrolled before this
+		// landed. Any OTHER read error (e.g. EACCES on a root-written 0600
+		// config read by a non-root invocation -- the #845 scenario) is logged
+		// rather than swallowed, so a silent fallback to DefaultControlURL is
+		// traceable instead of mysterious.
+		if !os.IsNotExist(err) && logf != nil {
+			logf("readPersistedControlURL: cannot read %s: %v", configFile, err)
+		}
 		return ""
 	}
 	var c struct {
