@@ -204,7 +204,7 @@ func recoverStaleVPN(ctx context.Context, deviceConfig *DeviceConfig, hostname, 
 	defer freshCancel()
 	config := network.ServerConfig{
 		Hostname:   hostname,
-		ControlURL: network.DefaultControlURL,
+		ControlURL: network.ResolveControlURL(),
 		StateDir:   network.GetStateDir(),
 		AuthKey:    freshKey,
 	}

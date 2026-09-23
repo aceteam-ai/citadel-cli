@@ -106,6 +106,14 @@ and system user configuration (requires sudo).`,
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())
 
+		// Refuse an explicit --nexus that differs from the control plane this
+		// node is already enrolled against (citadel-cli#1110). Moving fabrics is
+		// an explicit logout+re-enroll, never a silent state-clearing churn.
+		if err := refuseNexusFlagMismatch(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Establish the node's cryptographic identity (EC P-256 keypair) and
 		// best-effort cache the fabric CA trust chain. Prerequisite for mTLS
 		// self-reenrollment (P2, #4583). Fully fail-open: any error here is
@@ -1744,6 +1752,13 @@ func connectToNetwork(nodeName, authKey string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+
+	// Persist the control URL we just enrolled against so every later reconnect
+	// (citadel work, control center, recoverStaleVPN) targets the SAME control
+	// plane instead of the compiled-in default (citadel-cli#1110). We persist
+	// the URL actually used to connect (nexusURL), guaranteeing persisted ==
+	// connected.
+	persistNexusURLBestEffort(nexusURL)
 
 	ip, _ := srv.GetIPv4()
 	if ip != "" {

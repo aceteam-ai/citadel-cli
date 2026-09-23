@@ -287,6 +287,56 @@ func ListenVPN(network, port string) (net.Listener, string, error) {
 	return ln, ip4, nil
 }
 
+// PersistedControlURL returns the nexus/control URL this node persisted at
+// enroll time (network.GetNodeConfigDir()/config.yaml `nexus_url`), or "" when
+// none is persisted.
+//
+// citadel-cli#1110: a node enrolled against a self-hosted nexus must reconnect
+// to THAT control plane, not the compiled-in DefaultControlURL. Reconnecting to
+// the wrong control plane invalidates the saved state and churns the node's
+// identity on every restart. The value is written only to GetNodeConfigDir()
+// (by cmd.saveNexusURLToConfig), so — unlike the device token — there is no
+// legacy platform.ConfigDir() fallback to consult: a config carrying nexus_url
+// always lives at the machine-convergent location.
+func PersistedControlURL() string {
+	return readPersistedControlURL(GetNodeConfigDir())
+}
+
+// readPersistedControlURL is the pure core of PersistedControlURL, taking the
+// config dir explicitly so a test can point it at a t.TempDir() instead of the
+// machine-convergent GetNodeConfigDir() (whose resolution on a box running a
+// live node must never be written/read through by a test — see CLAUDE.md's
+// ConfigDir()/GetNodeConfigDir() section). A missing/unparseable file yields "".
+func readPersistedControlURL(configDir string) string {
+	data, err := os.ReadFile(filepath.Join(configDir, "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	var c struct {
+		NexusURL string `yaml:"nexus_url"`
+	}
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(c.NexusURL)
+}
+
+// ResolveControlURL returns the persisted control URL, falling back to
+// DefaultControlURL when none is persisted. This is the single source of truth
+// every reconnect path uses so a node always reconnects to the control plane it
+// enrolled against (citadel-cli#1110).
+func ResolveControlURL() string {
+	return resolveControlURL(PersistedControlURL())
+}
+
+// resolveControlURL is the pure core of ResolveControlURL.
+func resolveControlURL(persisted string) string {
+	if strings.TrimSpace(persisted) != "" {
+		return persisted
+	}
+	return DefaultControlURL
+}
+
 // VerifyOrReconnect checks connection and reconnects if state exists but not connected.
 // Returns (connected, error). No error if simply not logged in.
 //
@@ -304,7 +354,7 @@ func VerifyOrReconnect(ctx context.Context) (bool, error) {
 	hostname := getHostnameForReconnect()
 	config := ServerConfig{
 		Hostname:   hostname,
-		ControlURL: DefaultControlURL,
+		ControlURL: ResolveControlURL(),
 		StateDir:   GetStateDir(),
 	}
 
@@ -361,7 +411,7 @@ func ReconnectWithAuthKey(ctx context.Context, authKey string) (bool, error) {
 	hostname := getHostnameForReconnect()
 	config := ServerConfig{
 		Hostname:   hostname,
-		ControlURL: DefaultControlURL,
+		ControlURL: ResolveControlURL(),
 		StateDir:   GetStateDir(),
 		AuthKey:    authKey,
 	}
