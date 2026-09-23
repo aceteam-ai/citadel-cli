@@ -106,6 +106,14 @@ and system user configuration (requires sudo).`,
 		Debug("nexus: %s", nexusURL)
 		Debug("config dir: %s", platform.ConfigDir())
 
+		// Refuse an explicit --nexus that differs from the control plane this
+		// node is already enrolled against (citadel-cli#1110). Moving fabrics is
+		// an explicit logout+re-enroll, never a silent state-clearing churn.
+		if err := refuseNexusFlagMismatch(cmd); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+
 		// Establish the node's cryptographic identity (EC P-256 keypair) and
 		// best-effort cache the fabric CA trust chain. Prerequisite for mTLS
 		// self-reenrollment (P2, #4583). Fully fail-open: any error here is
@@ -1036,14 +1044,49 @@ func clearDeviceFieldsPreservingNodeConfigDir(globalConfigFile string) {
 	_ = os.WriteFile(globalConfigFile, newData, 0600)
 }
 
-// clearNodeDeviceConfig removes network.GetNodeConfigDir()/config.yaml
-// entirely -- unlike the legacy file, this one (written only by
-// saveDeviceConfigToFile/saveRedisURLToConfig, post-#845) holds device-auth
-// fields exclusively, so a full removal is safe and there is nothing to
-// preserve. Best-effort: a missing file is not an error.
+// clearNodeDeviceConfig clears the device-auth fields from
+// network.GetNodeConfigDir()/config.yaml on a --relogin, PRESERVING nexus_url
+// (citadel-cli#1110). nexus_url is the node's control-plane binding, not a
+// credential: --relogin re-authenticates the SAME node against the SAME
+// fabric (it deliberately preserves the tsnet machine key/IP), so wiping the
+// binding would strand a self-hosted-nexus node on the compiled-in default if
+// the relogin were interrupted before connectToNetwork re-persists it. When
+// nexus_url is the only key left the file is removed, matching the pre-#1110
+// full-removal for a device-auth-only file. Best-effort: a missing file is
+// not an error.
 func clearNodeDeviceConfig() {
-	globalConfigFile := filepath.Join(network.GetNodeConfigDir(), "config.yaml")
-	_ = os.Remove(globalConfigFile)
+	clearNodeDeviceFieldsPreservingNexusURL(filepath.Join(network.GetNodeConfigDir(), "config.yaml"))
+}
+
+// clearNodeDeviceFieldsPreservingNexusURL is the pure, path-parameterized core
+// of clearNodeDeviceConfig, split out (mirroring
+// clearDeviceFieldsPreservingNodeConfigDir) so a test can pass a temp-dir path
+// directly instead of resolving the machine-convergent GetNodeConfigDir().
+func clearNodeDeviceFieldsPreservingNexusURL(globalConfigFile string) {
+	data, err := os.ReadFile(globalConfigFile)
+	if err != nil {
+		return // nothing to clear
+	}
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		_ = os.Remove(globalConfigFile) // unparseable: remove wholesale (pre-#1110 behavior)
+		return
+	}
+
+	nexus, hasNexus := config["nexus_url"]
+	if !hasNexus {
+		_ = os.Remove(globalConfigFile) // no binding to preserve: pre-#1110 full removal
+		return
+	}
+
+	// Preserve only the control-plane binding; drop every device-auth field.
+	preserved := map[string]interface{}{"nexus_url": nexus}
+	newData, err := yaml.Marshal(preserved)
+	if err != nil {
+		_ = os.Remove(globalConfigFile)
+		return
+	}
+	_ = os.WriteFile(globalConfigFile, newData, 0600)
 }
 
 // maskToken masks a token for safe logging, showing only first/last few chars.
@@ -1744,6 +1787,13 @@ func connectToNetwork(nodeName, authKey string) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+
+	// Persist the control URL we just enrolled against so every later reconnect
+	// (citadel work, control center, recoverStaleVPN) targets the SAME control
+	// plane instead of the compiled-in default (citadel-cli#1110). We persist
+	// the URL actually used to connect (nexusURL), guaranteeing persisted ==
+	// connected.
+	persistNexusURLBestEffort(nexusURL)
 
 	ip, _ := srv.GetIPv4()
 	if ip != "" {

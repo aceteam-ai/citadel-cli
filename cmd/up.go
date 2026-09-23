@@ -57,6 +57,12 @@ the network and restores routing and DNS.`,
 			}
 			return
 		}
+		// Refuse an explicit --nexus that differs from the control plane this
+		// node is already enrolled against (citadel-cli#1110).
+		if err := refuseNexusFlagMismatch(cmd); err != nil {
+			badColor.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
 		if err := runUp(); err != nil {
 			badColor.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -142,6 +148,9 @@ func runUp() error {
 		}
 		return err
 	}
+
+	// Persist the control URL this machine joined against (citadel-cli#1110).
+	persistNexusURLBestEffort(nexusURL)
 
 	ip, _ := srv.GetIPv4()
 	goodColor.Printf("\n✓ %s is on the AceTeam Network\n", nodeName)

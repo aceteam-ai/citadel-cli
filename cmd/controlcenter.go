@@ -429,7 +429,7 @@ func runControlCenter() {
 							freshCtx, freshCancel := context.WithTimeout(ctx, 15*time.Second)
 							config := network.ServerConfig{
 								Hostname:   hostname,
-								ControlURL: nexusURL,
+								ControlURL: network.ResolveControlURL(),
 								AuthKey:    freshKey,
 							}
 							if _, connectErr := network.Connect(freshCtx, config); connectErr == nil {
@@ -1945,6 +1945,11 @@ func ccConnectWithAuthkey(authkey string) error {
 	}
 
 	_, err := network.Connect(ctx, config)
+	if err == nil {
+		// Persist the control URL enrolled against (citadel-cli#1110) so later
+		// reconnects target this control plane, not the compiled-in default.
+		persistNexusURLBestEffort(nexusURL)
+	}
 	return err
 }
 
