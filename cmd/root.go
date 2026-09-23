@@ -13,7 +13,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
-	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -171,19 +170,23 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 		Log("command: %s", fullCmd)
 
-		// Check for updates (skip for update/version/help commands)
+		// Check for updates (skip for update/version/help commands). A bare
+		// non-interactive invocation has a stable one-line status contract; a
+		// cached update banner before that line would corrupt pipes and scripts.
 		cmdName := cmd.Name()
 		parentName := ""
 		if cmd.Parent() != nil {
 			parentName = cmd.Parent().Name()
 		}
-		skipUpdateCheck := cmdName == "update" || parentName == "update" ||
+		bareNonInteractive := cmdName == "citadel" && len(args) == 0 && !bareInvocationIsInteractive()
+		skipUpdateCheck := bareNonInteractive ||
+			cmdName == "update" || parentName == "update" ||
 			cmdName == "version" || cmdName == "help" ||
 			autoUpdateOptedOut()
 
 		// Detect if we're about to launch TUI control center
 		// In this case, suppress stdout printing and defer to TUI activity log
-		isTUIContext := cmdName == "citadel" && len(args) == 0 && tui.IsTTY()
+		isTUIContext := cmdName == "citadel" && len(args) == 0 && bareInvocationIsInteractive()
 
 		// MCP uses stdout as transport -- suppress update print to stdout.
 		if cmdName == "mcp" {
@@ -191,10 +194,16 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 
 		if !skipUpdateCheck {
-			checkForUpdateOnStartup(isTUIContext)
+			checkForUpdateOnStartupFn(isTUIContext)
 		}
 	},
 }
+
+// checkForUpdateOnStartupFn lets the root invocation path be tested without
+// reading or writing the real update cache. Production always uses the real
+// checker; tests replace it only to prove a bare status invocation suppresses
+// the checker before it could print a cached banner.
+var checkForUpdateOnStartupFn = checkForUpdateOnStartup
 
 // autoUpdateOptedOut reports whether the user has opted out of automatic update
 // checks/installs for this invocation, via the --no-auto-update persistent flag

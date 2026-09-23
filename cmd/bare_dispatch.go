@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/tui"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // enrollmentTier is the local-only classification used by the zero-argument
@@ -66,31 +68,59 @@ func bareCommandStatusLine(tier enrollmentTier) string {
 }
 
 var (
-	bareIsTTYFn                  = tui.IsTTY
+	bareStdoutIsTTYFn            = tui.IsTTY
+	bareStdinIsTTYFn             = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
 	bareHasMeshStateFn           = network.HasState
 	bareHasDeviceCredentialsFn   = hasDeviceConfigured
 	bareResolveControlURLFn      = network.ResolveControlURL
-	bareRunGuidedEnrollFn        = runControlCenter
+	bareRunEnrollCommandFn       = func() { enrollCmd.Run(enrollCmd, nil) }
+	bareRunGuidedEnrollFn        = runExistingGuidedEnroll
 	bareRunSessionDispatchStubFn = runEnrolledSessionDispatchStub
 )
+
+// bareInvocationIsInteractive is deliberately stricter than tui.IsTTY: the
+// device-authorisation flow reads stdin, so a pipe feeding stdin is not a safe
+// interactive invocation even if stdout happens to be a terminal. Treat it as
+// a status-only invocation instead of stealing or blocking the pipe.
+func bareInvocationIsInteractive() bool {
+	return bareStdoutIsTTYFn() && bareStdinIsTTYFn()
+}
 
 // runBareCitadel is the sole implementation of bare `citadel` (S1 of #1109).
 // Expert subcommands keep their own Cobra Run functions and do not pass
 // through here.
 func runBareCitadel(cmd *cobra.Command, _ []string) {
 	tier := enrollmentTierFor(bareHasMeshStateFn(), bareHasDeviceCredentialsFn())
-	switch bareCommandActionFor(bareIsTTYFn(), tier) {
+	switch bareCommandActionFor(bareInvocationIsInteractive(), tier) {
 	case bareCommandStatus:
 		fmt.Fprintln(cmd.OutOrStdout(), bareCommandStatusLine(tier))
 	case bareCommandGuidedEnroll:
-		// The control center already owns the QR/device-auth experience. Reuse
-		// it rather than creating a second enrollment protocol in the dispatcher.
+		// Reuse the existing QR/device-auth command rather than the control
+		// center's optional Login/Continue Offline prompt. A fresh bare machine
+		// must go straight into guided enrollment, not offer an offline detour.
 		bareRunGuidedEnrollFn()
 	case bareCommandSession:
 		// S0 made the persisted control URL the one reconnect source of truth.
 		// Pass that value into the S1 run/attach seam; do not reintroduce a
 		// compiled production default here. S2/S3 replace this stub with the
 		// durable presence/worker session and client attach transport.
+		bareRunSessionDispatchStubFn(tier, bareResolveControlURLFn())
+	}
+}
+
+// runExistingGuidedEnroll delegates to the established `citadel enroll` QR
+// flow. That command owns the device-auth protocol, config persistence and
+// mesh join; this dispatcher deliberately contributes none of them.
+func runExistingGuidedEnroll() {
+	bareRunEnrollCommandFn()
+
+	// A successful device-auth flow joined the mesh and persisted device
+	// credentials. Reclassify rather than assuming that outcome, then take the
+	// same S1 session seam as a node that was enrolled before this invocation.
+	// (The defensive no-op preserves the enrollment command's own behavior if a
+	// future implementation returns without joining.)
+	tier := enrollmentTierFor(bareHasMeshStateFn(), bareHasDeviceCredentialsFn())
+	if tier != enrollmentUnenrolled {
 		bareRunSessionDispatchStubFn(tier, bareResolveControlURLFn())
 	}
 }

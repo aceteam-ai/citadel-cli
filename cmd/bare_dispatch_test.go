@@ -9,20 +9,46 @@ import (
 
 func resetBareDispatchState(t *testing.T) {
 	t.Helper()
-	origTTY := bareIsTTYFn
+	origStdoutTTY := bareStdoutIsTTYFn
+	origStdinTTY := bareStdinIsTTYFn
 	origState := bareHasMeshStateFn
 	origCreds := bareHasDeviceCredentialsFn
 	origResolve := bareResolveControlURLFn
+	origEnrollCommand := bareRunEnrollCommandFn
 	origEnroll := bareRunGuidedEnrollFn
 	origSession := bareRunSessionDispatchStubFn
 	t.Cleanup(func() {
-		bareIsTTYFn = origTTY
+		bareStdoutIsTTYFn = origStdoutTTY
+		bareStdinIsTTYFn = origStdinTTY
 		bareHasMeshStateFn = origState
 		bareHasDeviceCredentialsFn = origCreds
 		bareResolveControlURLFn = origResolve
+		bareRunEnrollCommandFn = origEnrollCommand
 		bareRunGuidedEnrollFn = origEnroll
 		bareRunSessionDispatchStubFn = origSession
 	})
+}
+
+func TestRunExistingGuidedEnrollReusesEnrollCommandThenSessionSeam(t *testing.T) {
+	resetBareDispatchState(t)
+	calledEnroll := 0
+	bareRunEnrollCommandFn = func() { calledEnroll++ }
+	bareHasMeshStateFn = func() bool { return true }
+	bareHasDeviceCredentialsFn = func() bool { return true }
+	bareResolveControlURLFn = func() string { return "https://self-hosted.example" }
+	var gotTier enrollmentTier
+	var gotURL string
+	bareRunSessionDispatchStubFn = func(tier enrollmentTier, url string) {
+		gotTier, gotURL = tier, url
+	}
+
+	runExistingGuidedEnroll()
+	if calledEnroll != 1 {
+		t.Fatalf("existing enroll command called %d times, want 1", calledEnroll)
+	}
+	if gotTier != enrollmentPlatform || gotURL != "https://self-hosted.example" {
+		t.Fatalf("post-enroll session dispatch = (%q, %q), want (%q, persisted URL)", gotTier, gotURL, enrollmentPlatform)
+	}
 }
 
 func TestEnrollmentTierFor(t *testing.T) {
@@ -70,7 +96,8 @@ func TestBareCommandActionFor(t *testing.T) {
 
 func TestRunBareCitadelNonTTYIsObservational(t *testing.T) {
 	resetBareDispatchState(t)
-	bareIsTTYFn = func() bool { return false }
+	bareStdoutIsTTYFn = func() bool { return false }
+	bareStdinIsTTYFn = func() bool { return false }
 	bareHasMeshStateFn = func() bool { return true }
 	bareHasDeviceCredentialsFn = func() bool { return true }
 	bareRunGuidedEnrollFn = func() { t.Fatal("non-TTY bare command must not start enrollment") }
@@ -89,7 +116,8 @@ func TestRunBareCitadelNonTTYIsObservational(t *testing.T) {
 
 func TestRunBareCitadelUnenrolledUsesExistingGuidedFlow(t *testing.T) {
 	resetBareDispatchState(t)
-	bareIsTTYFn = func() bool { return true }
+	bareStdoutIsTTYFn = func() bool { return true }
+	bareStdinIsTTYFn = func() bool { return true }
 	bareHasMeshStateFn = func() bool { return false }
 	bareHasDeviceCredentialsFn = func() bool { return false }
 	called := 0
@@ -106,7 +134,8 @@ func TestRunBareCitadelUnenrolledUsesExistingGuidedFlow(t *testing.T) {
 
 func TestRunBareCitadelEnrolledUsesSessionSeamAndPersistedControlURL(t *testing.T) {
 	resetBareDispatchState(t)
-	bareIsTTYFn = func() bool { return true }
+	bareStdoutIsTTYFn = func() bool { return true }
+	bareStdinIsTTYFn = func() bool { return true }
 	bareHasMeshStateFn = func() bool { return true }
 	bareHasDeviceCredentialsFn = func() bool { return false }
 	bareResolveControlURLFn = func() string { return "https://self-hosted.example" }
@@ -123,5 +152,25 @@ func TestRunBareCitadelEnrolledUsesSessionSeamAndPersistedControlURL(t *testing.
 	}
 	if gotURL != "https://self-hosted.example" {
 		t.Fatalf("session control URL = %q, want persisted self-hosted URL", gotURL)
+	}
+}
+
+func TestRunBareCitadelPipedStdinIsNonInteractive(t *testing.T) {
+	resetBareDispatchState(t)
+	bareStdoutIsTTYFn = func() bool { return true }
+	bareStdinIsTTYFn = func() bool { return false }
+	bareHasMeshStateFn = func() bool { return false }
+	bareHasDeviceCredentialsFn = func() bool { return false }
+	bareRunGuidedEnrollFn = func() { t.Fatal("piped stdin must not start device authorization") }
+	bareRunSessionDispatchStubFn = func(enrollmentTier, string) {
+		t.Fatal("piped stdin must not start or attach a session")
+	}
+
+	var out bytes.Buffer
+	cmd := &cobra.Command{Use: "citadel"}
+	cmd.SetOut(&out)
+	runBareCitadel(cmd, nil)
+	if got, want := out.String(), "Citadel enrollment: unenrolled\n"; got != want {
+		t.Fatalf("piped-stdin output = %q, want %q", got, want)
 	}
 }
