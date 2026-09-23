@@ -570,7 +570,7 @@ func (r *Runner) claimJob(ctx context.Context, job *Job) (proceed bool, stream S
 	// streams (aceteam#6889) remove most of the blast radius, but it still falls
 	// back to the shared stream during a mixed-version rollout, where this pin is
 	// the only thing routing the job.
-	if targetNode, ok := job.Payload["target_node"].(string); ok && targetNode != "" && targetNode != r.config.NodeID {
+	if targetNode, ok := job.Payload["target_node"].(string); job.Type != JobTypeWorkerControl && ok && targetNode != "" && targetNode != r.config.NodeID {
 		if r.config.NodeID == "" {
 			r.log("warning", "Declining job %s: addressed to target_node=%s but this node's Headscale ID is unresolved, "+
 				"so it cannot claim addressed work", job.ID, targetNode)
@@ -881,7 +881,39 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		result = r.attachLatencyMetrics(result, queueWaitMs, startTime, execStart, endTime)
 	}
 	r.log("success", "Job %s completed (%v)", job.ID, duration)
+	if job.Type == JobTypeWorkerControl {
+		return r.finishWorkerControl(ctx, job, stream, handler, result, startTime, endTime)
+	}
 	r.finishSuccess(ctx, job, stream, result, startTime, endTime)
+	return true
+}
+
+// finishWorkerControl is deliberately stricter than the ordinary success tail.
+// A control result must reach the dispatcher and leave the queue before the
+// post-ack callback may terminate this process. On a publish failure the same
+// job is retried; on an ACK failure Redis may redeliver it. The handler's
+// persistent marker makes both cases safe.
+func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream StreamWriter, handler JobHandler, result *JobResult, startTime, endTime time.Time) bool {
+	if result == nil {
+		r.source.Nack(ctx, job, errors.New("WORKER_CONTROL returned no result"))
+		return false
+	}
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
+		r.log("error", "WORKER_CONTROL %s result publish failed: %v", job.ID, err)
+		r.source.Nack(ctx, job, err)
+		return false
+	}
+	if err := r.source.Ack(ctx, job); err != nil {
+		r.log("error", "WORKER_CONTROL %s queue ack failed: %v", job.ID, err)
+		return false
+	}
+	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
+	accepted, _ := result.Output["accepted"].(bool)
+	if postAck, ok := handler.(interface{ AfterAck(*Job) error }); ok && accepted {
+		if err := postAck.AfterAck(job); err != nil {
+			r.log("error", "WORKER_CONTROL %s restart failed after ack: %v", job.ID, err)
+		}
+	}
 	return true
 }
 

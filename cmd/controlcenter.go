@@ -2452,6 +2452,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
 		OrgID:                     nodeJobOrgID(),
+		NodeID:                    headscaleNodeID,
 		LogFn:                     activity,
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 ccConfigDir,

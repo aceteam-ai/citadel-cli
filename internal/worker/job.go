@@ -142,6 +142,7 @@ const (
 	JobTypeSynthesizeSpeech   = "SYNTHESIZE_SPEECH"    // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
 	JobTypeMediaGenerate      = "MEDIA_GENERATE"       // Generate an image or video node-locally via the diffusers sidecar (issue #968/#970)
 	JobTypeAgentUpdate        = "AGENT_UPDATE"         // Remotely update + restart this node's own citadel agent (aceteam#4427)
+	JobTypeWorkerControl      = "WORKER_CONTROL"       // Acknowledged, node-targeted worker restart (aceteam#9974)
 	JobTypeWhatsAppProvision  = "WHATSAPP_PROVISION"   // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
 	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
 	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
@@ -213,6 +214,7 @@ var allKnownJobTypes = []string{
 	JobTypeSynthesizeSpeech,
 	JobTypeMediaGenerate,
 	JobTypeAgentUpdate,
+	JobTypeWorkerControl,
 	JobTypeWhatsAppProvision,
 	JobTypeResourceSnapshot,
 	JobTypeInstanceMessage,

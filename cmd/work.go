@@ -2614,6 +2614,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	workPerms := workAppliedPermissions
 	nodeJobOpts := nodeJobHandlerOpts{
 		OrgID:                     nodeJobOrgID(),
+		NodeID:                    headscaleNodeID,
 		WorkspaceDir:              wsDir,
 		ConfigDir:                 workConfigDir,
 		PermissionsDir:            nodePermissionsDir(),
