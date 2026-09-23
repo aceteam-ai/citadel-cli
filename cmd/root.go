@@ -88,16 +88,7 @@ var rootCmd = &cobra.Command{
 Just run 'citadel' — it handles login, network connection, and launches the
 control center. All other subcommands are for scripting and advanced use.`,
 	Version: Version,
-	Run: func(cmd *cobra.Command, args []string) {
-		// Default behavior: launch control center if TTY, otherwise show help.
-		// Headless/background operation is provided by 'citadel work' (run under
-		// systemd or another supervisor); there is deliberately no --daemon flag.
-		if tui.IsTTY() {
-			runControlCenter()
-		} else {
-			cmd.Help()
-		}
-	},
+	Run:     runBareCitadel,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
