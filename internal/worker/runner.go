@@ -888,33 +888,81 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 	return true
 }
 
-// finishWorkerControl is deliberately stricter than the ordinary success tail.
-// A control result must reach the dispatcher and leave the queue before the
-// post-ack callback may terminate this process. On a publish failure the same
-// job is retried; on an ACK failure Redis may redeliver it. The handler's
-// persistent marker makes both cases safe.
+// finishWorkerControl ACKs before reporting acceptance. Scheduling is prepared
+// behind a gate before the accepted event, and the gate opens only after that
+// event has been published. Thus neither an ACK nor scheduling failure can
+// produce an accepted result or initiate a restart.
 func (r *Runner) finishWorkerControl(ctx context.Context, job *Job, stream StreamWriter, handler JobHandler, result *JobResult, startTime, endTime time.Time) bool {
 	if result == nil {
 		r.source.Nack(ctx, job, errors.New("WORKER_CONTROL returned no result"))
 		return false
 	}
-	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
-		r.log("error", "WORKER_CONTROL %s result publish failed: %v", job.ID, err)
-		r.source.Nack(ctx, job, err)
-		return false
-	}
+	accepted, _ := result.Output["accepted"].(bool)
+	control, ok := handler.(interface {
+		PrepareAfterAck(*Job) (func(), func(), error)
+		Abort(*Job) error
+	})
 	if err := r.source.Ack(ctx, job); err != nil {
 		r.log("error", "WORKER_CONTROL %s queue ack failed: %v", job.ID, err)
+		if accepted && ok {
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
+				return false
+			}
+		}
+		r.publishWorkerControlRefusal(ctx, stream, "ack_failed", "worker restart queue acknowledgment failed")
 		return false
 	}
-	r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
-	accepted, _ := result.Output["accepted"].(bool)
-	if postAck, ok := handler.(interface{ AfterAck(*Job) error }); ok && accepted {
-		if err := postAck.AfterAck(job); err != nil {
-			r.log("error", "WORKER_CONTROL %s restart failed after ack: %v", job.ID, err)
+	var commit, cancel func()
+	if accepted {
+		if !ok {
+			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart scheduler is unavailable")
+			return false
+		}
+		var err error
+		commit, cancel, err = control.PrepareAfterAck(job)
+		if err != nil {
+			r.log("error", "WORKER_CONTROL %s restart preparation failed: %v", job.ID, err)
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
+				return false
+			}
+			r.publishWorkerControlRefusal(ctx, stream, "schedule_failed", "worker restart could not be scheduled")
+			return false
 		}
 	}
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(result.Output) }); err != nil {
+		r.log("error", "WORKER_CONTROL %s result publish failed: %v", job.ID, err)
+		if accepted {
+			cancel()
+			if abortErr := control.Abort(job); abortErr != nil {
+				r.log("error", "WORKER_CONTROL %s abort failed: %v", job.ID, abortErr)
+			}
+		}
+		return false
+	}
+	if accepted {
+		// Acceptance is already visible to the caller. Release the prepared
+		// restart gate before optional usage accounting, which may block or
+		// panic and must not strand an accepted restart.
+		commit()
+	}
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				r.log("error", "WORKER_CONTROL %s optional usage accounting panicked: %v", job.ID, recovered)
+			}
+		}()
+		r.recordJob(buildUsageRecord(job, "success", startTime, endTime, result, nil))
+	}()
 	return true
+}
+
+func (r *Runner) publishWorkerControlRefusal(ctx context.Context, stream StreamWriter, code, message string) {
+	output := map[string]any{"action": "restart", "accepted": false, "restarting": false, "code": code, "message": message}
+	if err := retryStreamWrite(ctx, func() error { return stream.WriteEnd(output) }); err != nil {
+		r.log("error", "WORKER_CONTROL refusal publish failed: %v", err)
+	}
 }
 
 // finishSuccess is the ONE implementation of the success terminal tail: usage

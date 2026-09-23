@@ -163,8 +163,10 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		NodeID:   opts.NodeID,
 		StateDir: opts.PermissionsDir,
 		Managed:  managedByServiceManager,
-		Restart:  func() error { processExiter(1); return nil },
-		Log:      opts.HandlerLog,
+		Schedule: func() (func(), func(), error) {
+			return worker.PrepareWorkerRestart(func() { processExiter(1) })
+		},
+		Log: opts.HandlerLog,
 	}))
 	// AGENT_UPDATE (aceteam#4427): remote agent update + restart for this node.
 	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{

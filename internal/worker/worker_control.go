@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,8 @@ type WorkerControlConfig struct {
 	NodeID   string
 	StateDir string
 	Managed  func() bool
-	Restart  func() error
+	// Schedule prepares a restart that cannot fire until commit is called.
+	Schedule func() (commit func(), cancel func(), err error)
 	Log      func(string, ...any)
 }
 
@@ -50,7 +52,7 @@ func (h *WorkerControlHandler) reject(code, message string) (*JobResult, error) 
 // Redis stream. The producer's node:update/step-up authorization is upstream;
 // the node independently checks the transport, queue, target, and action.
 // A durable reservation is written before claiming acceptance. The runner is
-// responsible for publishing the returned result and ACKing before AfterAck.
+// responsible for ACKing, scheduling, and publishing before the restart fires.
 func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWriter) (*JobResult, error) {
 	if job == nil || job.ID == "" {
 		return h.reject("invalid_job", "WORKER_CONTROL requires a job ID")
@@ -72,8 +74,13 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 		}
 	}
 	if timeout, exists := job.Payload["timeout_ms"]; exists {
-		if value, ok := timeout.(string); !ok || value == "" {
-			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a nonempty string")
+		value, ok := timeout.(string)
+		if !ok {
+			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a positive integer string")
+		}
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed <= 0 {
+			return h.reject("invalid_payload", "WORKER_CONTROL timeout_ms must be a positive integer string")
 		}
 	}
 	if ray, exists := job.Payload["rayId"]; exists {
@@ -89,7 +96,7 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 	if !targetOK || target != h.cfg.NodeID {
 		return h.reject("invalid_target", "WORKER_CONTROL target_node must match this node")
 	}
-	if h.cfg.Managed == nil || !h.cfg.Managed() || h.cfg.Restart == nil {
+	if h.cfg.Managed == nil || !h.cfg.Managed() || h.cfg.Schedule == nil {
 		return h.reject("unmanaged_worker", "worker restart requires a managed service")
 	}
 	if h.cfg.StateDir == "" {
@@ -101,6 +108,15 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 	}
 	workerControlReserveMu.Lock()
 	defer workerControlReserveMu.Unlock()
+	aborted, err := h.marker(job.ID, "aborted")
+	if err != nil {
+		return h.reject("state_unavailable", "worker restart state directory is unavailable")
+	}
+	if _, err := os.Stat(aborted); err == nil {
+		return h.reject("aborted_control", "this restart request was not accepted; dispatch a new job")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return h.reject("state_unavailable", "worker restart state could not be checked")
+	}
 	if _, err := os.Stat(reserved); errors.Is(err, os.ErrNotExist) {
 		busy, checkErr := recentWorkerControlMarker(filepath.Dir(reserved), filepath.Base(reserved))
 		if checkErr != nil {
@@ -111,15 +127,19 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 		}
 	} else if err != nil {
 		return h.reject("state_unavailable", "worker restart state could not be checked")
+	} else {
+		return h.reject("duplicate_control", "this restart request is already reserved or completed")
 	}
 	duplicate, err := createDurableMarker(reserved)
 	if err != nil {
 		return h.reject("state_unavailable", "worker restart reservation could not be persisted")
 	}
+	if duplicate {
+		return h.reject("duplicate_control", "this restart request is already reserved or completed")
+	}
 	return &JobResult{Status: JobStatusSuccess, Output: map[string]any{
 		"action": "restart", "accepted": true, "restarting": true,
-		"duplicate": duplicate,
-		"message":   "worker restart accepted; verify a fresh heartbeat after reconnect",
+		"message": "worker restart accepted; verify a fresh heartbeat after reconnect",
 	}}, nil
 }
 
@@ -136,6 +156,10 @@ func recentWorkerControlMarker(dir, own string) (bool, error) {
 		name := entry.Name()
 		if entry.IsDir() || strings.TrimSuffix(strings.TrimSuffix(name, ".reserved"), ".fired") == ownStem ||
 			(!strings.HasSuffix(name, ".reserved") && !strings.HasSuffix(name, ".fired")) {
+			continue
+		}
+		stem := strings.TrimSuffix(strings.TrimSuffix(name, ".reserved"), ".fired")
+		if _, err := os.Stat(filepath.Join(dir, stem+".aborted")); err == nil {
 			continue
 		}
 		info, err := entry.Info()
@@ -191,25 +215,83 @@ func createDurableMarker(path string) (bool, error) {
 	return false, d.Sync()
 }
 
-// AfterAck runs only after the runner has published the typed result and
-// acknowledged the queue message. A durable fired marker grants one restart
-// attempt for this job ID, including across duplicate deliveries and reboot.
-func (h *WorkerControlHandler) AfterAck(job *Job) error {
+// PrepareAfterAck schedules the exit behind a gate. It is called only after a
+// successful queue ACK. The runner opens the gate after the accepted result is
+// published. The fired marker prevents a second schedule for this job ID.
+func (h *WorkerControlHandler) PrepareAfterAck(job *Job) (commit func(), cancel func(), err error) {
 	if job == nil || job.ID == "" {
-		return errors.New("missing WORKER_CONTROL job ID")
+		return nil, nil, errors.New("missing WORKER_CONTROL job ID")
+	}
+	commit, cancel, err = h.cfg.Schedule()
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, nil, err
+	}
+	if commit == nil || cancel == nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, nil, errors.New("restart schedule returned no commit or cancel")
 	}
 	fired, err := h.marker(job.ID, "fired")
 	if err != nil {
-		return err
+		cancel()
+		return nil, nil, err
 	}
 	already, err := createDurableMarker(fired)
 	if err != nil || already {
+		cancel()
+		if already {
+			err = errors.New("restart already prepared for this job")
+		}
+		return nil, nil, err
+	}
+	return commit, cancel, nil
+}
+
+// Abort persistently refuses a job whose ACK or scheduling failed. This makes
+// a later redelivery inert while releasing the cooldown for a fresh job ID.
+func (h *WorkerControlHandler) Abort(job *Job) error {
+	aborted, err := h.marker(job.ID, "aborted")
+	if err != nil {
 		return err
 	}
-	h.cfg.Log("WORKER_CONTROL: restarting managed worker after result and queue ack (job %s)", job.ID)
-	if err := h.cfg.Restart(); err != nil {
-		h.cfg.Log("WORKER_CONTROL: restart failed for job %s: %v", job.ID, err)
+	if _, err := createDurableMarker(aborted); err != nil {
 		return err
+	}
+	for _, suffix := range []string{"fired", "reserved"} {
+		path, err := h.marker(job.ID, suffix)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
+}
+
+// PrepareWorkerRestart creates a delayed process exit behind an infallible
+// commit gate. Production's exit callback is the existing processExiter(1),
+// which does not return. A cancel before commit prevents the exit entirely.
+func PrepareWorkerRestart(exit func()) (func(), func(), error) {
+	if exit == nil {
+		return nil, nil, errors.New("worker exit callback is unavailable")
+	}
+	commitCh := make(chan struct{})
+	cancelCh := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-cancelCh:
+			return
+		case <-commitCh:
+			time.Sleep(500 * time.Millisecond)
+			exit()
+		}
+	}()
+	return func() { once.Do(func() { close(commitCh) }) },
+		func() { once.Do(func() { close(cancelCh) }) }, nil
 }
