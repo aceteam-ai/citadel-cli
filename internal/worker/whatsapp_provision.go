@@ -23,7 +23,7 @@
 //	  "api_key": "<per-tenant wab_ key>",
 //	  "qr":      "data:image/png;base64,...",  // "" when already linked
 //	  "tenant":  "<name>",
-//	  "status":  "provisioned" | "already_linked",
+//	  "status":  "provisioned" | "already_linked" | "upgraded",
 //	  // Upgrade legibility (#718), always present:
 //	  "upgraded": true,                        // the deploy moved the bridge onto a new image
 //	  "image_id_before": "sha256:...",         // omitted when unknown (first deploy / unreadable)
@@ -34,15 +34,21 @@
 //	  "cert_refresh_url": "http://<mesh-ip>:<status-port>/gateway-cert.pem"
 //	}
 //
-// # Upgrade vs. no-op (aceteam-ai/citadel-cli#718)
+// # Upgrade vs. no-op (aceteam-ai/citadel-cli#718, #1124)
 //
-// `status` deliberately keeps its two original values. The aceteam backend
-// branches on `status == "already_linked"` by equality, so a third value would
-// silently fall through to the generic branch. The upgrade signal is carried
-// additively instead: read `upgraded` (and the two image IDs) alongside `status`.
-// A two-second `already_linked` with `upgraded: false` and identical image IDs is
-// a no-op re-provision, not an upgrade -- and `image_pull_error` says when the
-// node could not even reach the registry to try.
+// For an ORDINARY (non-force) provision `status` keeps its two original values:
+// the aceteam backend branches on `status == "already_linked"` by equality, and
+// the image-change signal is carried additively via `upgraded` (and the two image
+// IDs). A two-second `already_linked` with `upgraded: false` and identical image
+// IDs is a no-op re-provision, not an upgrade -- and `image_pull_error` says when
+// the node could not even reach the registry to try.
+//
+// A FORCE upgrade (payload `force: true`, aceteam#10220 PR #10226) is the one case
+// that emits the third value `status: "upgraded"`: the aceteam PR recognizes it as
+// "the node honored force -- credential stored, no QR needed". It is emitted only
+// when the force-recreate ran on an already-linked bridge (the session survives,
+// so no QR); an older Citadel that ignores `force` still returns `already_linked`
+// under the same request, which the backend reports distinctly as "not upgraded".
 //
 // # Privilege gating
 //
@@ -141,6 +147,12 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 		// auto-selects a free host port so the bridge does not collide with
 		// citadel's own 8080 listener (aceteam-ai/citadel-cli#438).
 		Port: payloadInt(job.Payload, "port"),
+		// Force upgrade (#1124): re-pull + force-recreate a bridge stuck on a stale
+		// image, preserving the auth-state volume (no re-QR). The aceteam side sends
+		// this as the STRING "true" (payload["force"] = "true"), omitted entirely on
+		// the default path; payloadBool coerces the truthy string, so an absent flag
+		// is never treated as set.
+		Force: payloadBool(job.Payload, "force"),
 	}
 	if req.Tenant == "" {
 		req.Tenant = "default"
@@ -169,6 +181,15 @@ func (h *WhatsAppProvisionHandler) Execute(ctx context.Context, job *Job, stream
 	if res.AlreadyLinked {
 		status = "already_linked"
 		qrDataURL = ""
+	}
+	// A force upgrade of an already-linked bridge (#1124) reports the third value
+	// `upgraded`: the recreate ran, the session survived (so qr stays ""), and the
+	// aceteam backend reads `upgraded` as "credential stored, no QR needed". Gated
+	// on AlreadyLinked: a forced recreate of a NOT-linked bridge still needs its
+	// pairing QR, so it stays `provisioned` with the QR (the recreate itself is
+	// still visible via `upgraded`/the image IDs).
+	if res.Forced && res.AlreadyLinked {
+		status = "upgraded"
 	}
 
 	doc := map[string]any{

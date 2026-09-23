@@ -264,11 +264,12 @@ func TestWhatsAppProvisionOmitsEmptyCertFields(t *testing.T) {
 	}
 }
 
-// TestWhatsAppProvisionReportsUpgrade verifies the #718 contract: an upgrade and
-// a no-op re-provision must be distinguishable in the returned document. `status`
-// keeps its original values (the aceteam backend branches on
-// `status == "already_linked"` by equality), so the signal rides on `upgraded`
-// plus the two image IDs.
+// TestWhatsAppProvisionReportsUpgrade verifies the #718 contract for an ORDINARY
+// (non-force) provision: an image change and a no-op re-provision must be
+// distinguishable. On this path `status` keeps its two original values (the
+// aceteam backend branches on `status == "already_linked"` by equality), so the
+// image-change signal rides on `upgraded` plus the two image IDs. The third value
+// `upgraded` is emitted only on the force path (see TestWhatsAppProvisionForceUpgrade).
 func TestWhatsAppProvisionReportsUpgrade(t *testing.T) {
 	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
 		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
@@ -318,6 +319,117 @@ func TestWhatsAppProvisionReportsNoOp(t *testing.T) {
 	}
 	if doc["image_id_before"] != doc["image_id_after"] {
 		t.Errorf("image ids should match on a no-op, got %v / %v", doc["image_id_before"], doc["image_id_after"])
+	}
+}
+
+// TestWhatsAppProvisionForceUpgrade pins the #1124 handler contract: a
+// `force: "true"` STRING payload (the exact shape the aceteam side sends,
+// payload["force"] = "true") is parsed into req.Force, and a forced provision of
+// an already-linked bridge returns the third status value "upgraded" with no QR
+// (the session survived the recreate), while still carrying the credential.
+func TestWhatsAppProvisionForceUpgrade(t *testing.T) {
+	var gotReq whatsapp.ProvisionRequest
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			gotReq = req
+			return &whatsapp.ProvisionResult{
+				APIURL: "http://100.64.0.9:8080", APIKey: "wab_key", Tenant: "default",
+				AlreadyLinked: true, Forced: true,
+				ImageIDBefore: "sha256:old", ImageIDAfter: "sha256:new", Upgraded: true,
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"force": "true"}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gotReq.Force {
+		t.Error("req.Force = false, want true when the payload carries force=\"true\"")
+	}
+	doc := decodeOutput(t, res)
+	if doc["status"] != "upgraded" {
+		t.Errorf("status = %v, want upgraded", doc["status"])
+	}
+	if doc["qr"] != "" {
+		t.Errorf("qr = %v, want empty on a forced upgrade of a linked bridge (no re-QR)", doc["qr"])
+	}
+	if doc["upgraded"] != true {
+		t.Errorf("upgraded = %v, want true", doc["upgraded"])
+	}
+	if doc["api_key"] != "wab_key" {
+		t.Errorf("api_key = %v, want the credential still carried", doc["api_key"])
+	}
+}
+
+// TestWhatsAppProvisionForceAsBool: the handler also accepts a JSON bool `force:
+// true` (payloadBool coerces both the bool and the truthy string), so the wire
+// contract is robust to either shape.
+func TestWhatsAppProvisionForceAsBool(t *testing.T) {
+	var gotReq whatsapp.ProvisionRequest
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			gotReq = req
+			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: "default", AlreadyLinked: true, Forced: true}, nil
+		},
+	})
+	if _, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"force": true}), &NoOpStreamWriter{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gotReq.Force {
+		t.Error("req.Force = false, want true when payload carries force=true (bool)")
+	}
+}
+
+// TestWhatsAppProvisionForceNotLinkedKeepsQR: a forced recreate of a bridge that
+// is NOT linked still needs its pairing QR, so it stays `provisioned` (with the
+// QR), NOT `upgraded` -- the upgraded status is gated on an already-linked session.
+func TestWhatsAppProvisionForceNotLinkedKeepsQR(t *testing.T) {
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			return &whatsapp.ProvisionResult{
+				APIURL: "u", APIKey: "k", Tenant: "default",
+				QR: "2@payload", Forced: true, // recreate ran, but the tenant is not linked
+			}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(),
+		whatsappJob(perNodeQueue, map[string]any{"force": "true"}), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	doc := decodeOutput(t, res)
+	if doc["status"] != "provisioned" {
+		t.Errorf("status = %v, want provisioned (a forced recreate of an unlinked bridge still needs a QR)", doc["status"])
+	}
+	qr, _ := doc["qr"].(string)
+	if !strings.HasPrefix(qr, "data:image/png;base64,") {
+		t.Errorf("qr = %q, want the pairing QR data-url", qr)
+	}
+}
+
+// TestWhatsAppProvisionDefaultDoesNotForce: the default path (no force key) parses
+// req.Force=false and stays already_linked -- byte-identical to today, so a node
+// is never pulled/recreated unless force is explicitly set.
+func TestWhatsAppProvisionDefaultDoesNotForce(t *testing.T) {
+	var gotReq whatsapp.ProvisionRequest
+	h := NewWhatsAppProvisionHandler(WhatsAppProvisionConfig{
+		Provision: func(ctx context.Context, req whatsapp.ProvisionRequest) (*whatsapp.ProvisionResult, error) {
+			gotReq = req
+			return &whatsapp.ProvisionResult{APIURL: "u", APIKey: "k", Tenant: "default", AlreadyLinked: true}, nil
+		},
+	})
+	res, err := h.Execute(context.Background(), whatsappJob(perNodeQueue, nil), &NoOpStreamWriter{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotReq.Force {
+		t.Error("req.Force = true, want false when the payload omits force")
+	}
+	doc := decodeOutput(t, res)
+	if doc["status"] != "already_linked" {
+		t.Errorf("status = %v, want already_linked (unchanged default path)", doc["status"])
 	}
 }
 

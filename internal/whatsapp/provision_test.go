@@ -163,6 +163,77 @@ func TestProvisionDeployErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestProvisionForceRoutesThroughForceRecreateCompose pins the #1124 routing:
+// Force=true with ForceRecreateCompose wired runs THAT edge (not DeployCompose)
+// and marks the result Forced, so the handler can report status=upgraded.
+func TestProvisionForceRoutesThroughForceRecreateCompose(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, deployed := baseDeps(t, bridge)
+	forceCalled := false
+	deps.ForceRecreateCompose = func(servicesDir string, env map[string]string) error {
+		forceCalled = true
+		return nil
+	}
+	res, err := Provision(context.Background(), ProvisionRequest{Force: true}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !forceCalled {
+		t.Error("ForceRecreateCompose was not called for a Force request")
+	}
+	if *deployed {
+		t.Error("DeployCompose must NOT run when the force edge handled the deploy")
+	}
+	if !res.Forced {
+		t.Error("result.Forced = false, want true after a force deploy")
+	}
+}
+
+// TestProvisionWithoutForceUsesDeployCompose: the default path is unchanged --
+// DeployCompose runs, the force edge does not, and Forced is false. (That the
+// default DeployCompose issues no --force-recreate is exercised at the cmd layer.)
+func TestProvisionWithoutForceUsesDeployCompose(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, deployed := baseDeps(t, bridge)
+	forceCalled := false
+	deps.ForceRecreateCompose = func(servicesDir string, env map[string]string) error {
+		forceCalled = true
+		return nil
+	}
+	res, err := Provision(context.Background(), ProvisionRequest{}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !*deployed {
+		t.Error("DeployCompose must run on the default (non-force) path")
+	}
+	if forceCalled {
+		t.Error("ForceRecreateCompose must NOT run when Force is absent")
+	}
+	if res.Forced {
+		t.Error("result.Forced = true, want false on the default path")
+	}
+}
+
+// TestProvisionForceWithoutEdgeFallsBackToDeployCompose: Force requested but no
+// ForceRecreateCompose wired (older wiring) falls back to DeployCompose and does
+// NOT claim an upgrade -- the "older Citadel ignored the flag" shape the backend
+// already handles distinctly.
+func TestProvisionForceWithoutEdgeFallsBackToDeployCompose(t *testing.T) {
+	bridge := &fakeBridge{health: &Health{LoggedIn: true}}
+	deps, deployed := baseDeps(t, bridge) // no ForceRecreateCompose wired
+	res, err := Provision(context.Background(), ProvisionRequest{Force: true}, deps)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if !*deployed {
+		t.Error("DeployCompose must run as the fallback when the force edge is not wired")
+	}
+	if res.Forced {
+		t.Error("result.Forced = true, want false when the force edge is not wired")
+	}
+}
+
 func TestProvisionReusesExistingTenant(t *testing.T) {
 	bridge := &fakeBridge{health: &Health{LoggedIn: false}, qr: "q"}
 	deps, _ := baseDeps(t, bridge)

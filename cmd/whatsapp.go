@@ -219,7 +219,7 @@ func (r *deployReport) PullError() string {
 	return r.pullErr
 }
 
-func deployWhatsAppCompose(source, image string, report *deployReport) func(servicesDir string, env map[string]string) error {
+func deployWhatsAppCompose(source, image string, force bool, report *deployReport) func(servicesDir string, env map[string]string) error {
 	return func(servicesDir string, env map[string]string) error {
 		// Fail fast on a private-repo clone with missing credentials instead of
 		// blocking on an interactive git prompt (which would hang a headless job).
@@ -245,7 +245,7 @@ func deployWhatsAppCompose(source, image string, report *deployReport) func(serv
 		type result struct{ err error }
 		done := make(chan result, 1)
 		go func() {
-			done <- result{err: deployWhatsAppComposeOnce(ctx, source, image, servicesDir, env, report)}
+			done <- result{err: deployWhatsAppComposeOnce(ctx, source, image, servicesDir, env, force, report)}
 		}()
 
 		select {
@@ -325,14 +325,25 @@ func refuseBridgeProvisionUnderNodeDir() error {
 }
 
 // deployWhatsAppComposeOnce performs the actual resolve + write + compose-up. It
-// is split out so deployWhatsAppCompose can run it under a hard deadline.
-func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, report *deployReport) error {
+// is split out so deployWhatsAppCompose can run it under a hard deadline. When
+// force is set it takes the force-upgrade path instead (see forceRecreateWhatsAppBridge).
+func deployWhatsAppComposeOnce(ctx context.Context, source, image, servicesDir string, env map[string]string, force bool, report *deployReport) error {
 	// Refuse the bespoke deploy under an active --node-dir override (citadel#624
 	// FIX A hardening): the delegation signal and the compose project both resolve
 	// unsafely under an override and a bespoke deploy could compose over the real
-	// node's bridge. See refuseBridgeProvisionUnderNodeDir.
+	// node's bridge. See refuseBridgeProvisionUnderNodeDir. Force takes the same
+	// project/compose file, so it is refused under an override for the same reason.
 	if err := refuseBridgeProvisionUnderNodeDir(); err != nil {
 		return err
+	}
+
+	// Force upgrade (#1124): re-pull + force-recreate the bridge service to move a
+	// node off a stale image. It deliberately BYPASSES the D5 delegation below --
+	// that delegation is exactly what leaves a module-managed bridge stuck (it
+	// pulls/recreates nothing) -- and it never resolves the module source or the
+	// bespoke deploy, so the default (non-force) paths are untouched.
+	if force {
+		return forceRecreateWhatsAppBridge(ctx, image, servicesDir, env, report)
 	}
 
 	// Delegation (citadel#624 D5): when the bridge is a first-class module (a
@@ -420,6 +431,65 @@ func startBridgeStack(ctx context.Context, project, composePath, envPath string,
 	return bridgeComposeUp(ctx, project, composePath, envPath)
 }
 
+// forceRecreateWhatsAppBridge is the force-upgrade deploy edge (aceteam-ai/citadel-cli
+// #1124, aceteam#10220). It re-pulls the resolved bridge image tag and recreates
+// the BRIDGE service only, so a node stuck on a stale image (typically a #624
+// module-managed bridge whose ordinary deploy pulls/recreates nothing) can
+// self-upgrade.
+//
+// It deliberately does NOT resolve the module source or clone anything: force is
+// an UPGRADE of a bridge that is already deployed, so the compose file already
+// exists (a module install materializes it at whatsapp.ComposePath, and the module
+// system brings it up under whatsapp.ProjectName -- both of which this reuses). A
+// not-yet-deployed node is refused rather than materialized, which keeps force
+// git-credential-free on a module-managed node and leaves the bespoke/D5 paths
+// untouched. The env (admin key / port / optional image override) is persisted so
+// the recreated container serves it.
+func forceRecreateWhatsAppBridge(ctx context.Context, image, servicesDir string, env map[string]string, report *deployReport) error {
+	if !whatsapp.IsDeployed(servicesDir) {
+		return fmt.Errorf("cannot force-upgrade the WhatsApp bridge: it is not deployed on this node yet (no compose file at %s). Run a normal provision first, then force-upgrade", whatsapp.ComposePath(servicesDir))
+	}
+	if image != "" {
+		env["BRIDGE_IMAGE"] = image
+	}
+	if err := whatsapp.SaveEnv(servicesDir, env); err != nil {
+		return fmt.Errorf("write bridge config (force upgrade): %w", err)
+	}
+	return forceRecreateBridgeStack(ctx, whatsapp.ProjectName(servicesDir),
+		whatsapp.ComposePath(servicesDir), whatsapp.EnvPath(servicesDir), report)
+}
+
+// forceRecreateBridgeStack re-pulls the bridge image and force-recreates ONLY the
+// bridge service (aceteam-ai/citadel-cli#1124). Two deliberate differences from
+// startBridgeStack:
+//
+//   - The up carries `--no-deps --force-recreate` so compose replaces the running
+//     bridge container even when the compose config is unchanged (the #718 no-op
+//     that a plain `up -d` hits on an already-present floating tag). `--no-deps` is
+//     REQUIRED: compose v2 applies `--force-recreate` to the dependency set too, so
+//     without it the Postgres sidecar would also be recreated -- churning the DB
+//     under the bridge mid-upgrade. The named auth-state volume survives a recreate
+//     regardless, but "the BRIDGE service ONLY" means never touching `db`. It never
+//     runs `down` and never passes `-v`, so the Baileys session is preserved (no
+//     re-QR).
+//   - The pull is FATAL, not best-effort. Force is an explicit upgrade ask: a
+//     force-recreate onto the SAME stale image after a failed pull would report
+//     status=upgraded for an upgrade that never happened -- the exact #718
+//     false-green, now with a status the backend trusts. So a pull failure returns
+//     here (no up issued) with the `docker login ghcr.io` hint. A SUCCESSFUL pull
+//     whose digest did not move still recreates and still reports upgraded (the
+//     no-op-but-still-report case), which is honest.
+func forceRecreateBridgeStack(ctx context.Context, project, composePath, envPath string, report *deployReport) error {
+	pullErr := bridgeComposePull(ctx, project, composePath, envPath)
+	if report != nil {
+		report.setPullError(pullErr)
+	}
+	if pullErr != nil {
+		return pullErr
+	}
+	return bridgeComposeForceRecreateUp(ctx, project, composePath, envPath)
+}
+
 // whatsappProvisionDeps builds the ProvisionDeps for the local CLI, wiring the
 // real catalog / docker / network edges. source/image are the CLI flag values.
 func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
@@ -428,7 +498,12 @@ func whatsappProvisionDeps(source, image string) whatsapp.ProvisionDeps {
 	report := &deployReport{}
 	return whatsapp.ProvisionDeps{
 		ServicesDir:   servicesDirForNode,
-		DeployCompose: deployWhatsAppCompose(source, image, report),
+		DeployCompose: deployWhatsAppCompose(source, image, false, report),
+		// Force-upgrade edge (#1124): re-pull + `up -d --no-deps --force-recreate`
+		// the bridge service only, used INSTEAD of DeployCompose when the request
+		// sets Force. Shares the same source/image/report, so the pull outcome is
+		// still surfaced via ImagePullError.
+		ForceRecreateCompose: deployWhatsAppCompose(source, image, true, report),
 		// Image identity before/after the deploy, so an `already_linked` result
 		// can be told apart from a real upgrade (#718).
 		BridgeImageID:  bridgeImageIDForNode,
@@ -649,6 +724,28 @@ func bridgeComposeUp(ctx context.Context, project, composePath, envPath string) 
 				deployTimeout, strings.TrimSpace(string(out)))
 		}
 		return fmt.Errorf("docker compose up failed:\n%s\n   Hint: is Docker running? Check with 'docker info'", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// bridgeComposeForceRecreateUp runs `docker compose ... up -d --no-deps
+// --force-recreate bridge`: the force-upgrade variant of bridgeComposeUp
+// (aceteam-ai/citadel-cli#1124). `--force-recreate` replaces the running bridge
+// container even when compose sees no config change (the #718 floating-tag no-op),
+// and `--no-deps` scopes the recreate to the bridge service so the Postgres sidecar
+// holding the Baileys auth state is never recreated. It NEVER runs `down` and NEVER
+// passes `-v` or `--remove-orphans`, so the auth-state volume -- and the WhatsApp
+// session -- is preserved (no re-QR). See forceRecreateBridgeStack for the cascade
+// reason `--no-deps` guards against.
+func bridgeComposeForceRecreateUp(ctx context.Context, project, composePath, envPath string) error {
+	out, err := runBridgeCompose(ctx, bridgeComposeArgs(project, composePath, envPath,
+		"up", "-d", "--no-deps", "--force-recreate", whatsapp.BridgeService)...)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("docker compose up --force-recreate timed out after %s (is the image registry reachable and is Docker running? check with 'docker info'):\n%s",
+				deployTimeout, strings.TrimSpace(string(out)))
+		}
+		return fmt.Errorf("docker compose up --force-recreate failed:\n%s\n   Hint: is Docker running? Check with 'docker info'", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

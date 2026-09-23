@@ -1493,10 +1493,38 @@ went on to report `already_linked` success on the stale image. `startBridgeStack
 best-effort (a node without `docker login` still serves its cached image) but
 never silent: `whatsapp.ProvisionDeps.BridgeImageID` samples the RUNNING
 CONTAINER's image before and after the deploy, and `ProvisionResult` carries
-`Upgraded` + both IDs + `ImagePullError`. The `status` string deliberately still
-has only two values (`provisioned` / `already_linked`): the aceteam backend
-branches on `status == "already_linked"` by equality, so upgrade information is
-additive, never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
+`Upgraded` + both IDs + `ImagePullError`. On the ORDINARY (non-force) provision
+path the `status` string keeps its two original values (`provisioned` /
+`already_linked`) — the aceteam backend branches on `status == "already_linked"`
+by equality, so the #718 image-change signal is additive (`Upgraded` + the two
+IDs), never a new status. `TestStartBridgeStackPullsBeforeUp` pins the argv.
+
+**The FORCE upgrade path (#1124, aceteam#10220) is the one case that emits the
+third value `status: "upgraded"`.** A `WHATSAPP_PROVISION` payload with `force:
+"true"` (a truthy STRING, as the aceteam PR #10226 sends it —
+`payload["force"]="true"`, omitted entirely on the default path so an older
+Citadel sees an unchanged payload) routes `whatsapp.Provision` through the new
+`ProvisionDeps.ForceRecreateCompose` edge INSTEAD of `DeployCompose`. That edge
+(`forceRecreateBridgeStack`/`bridgeComposeForceRecreateUp`, `cmd/whatsapp.go`)
+re-pulls the resolved bridge tag then `up -d --no-deps --force-recreate bridge` —
+never `down`, never `-v`, never `--remove-orphans`, so the Postgres auth-state
+volume (the Baileys session) is preserved with no re-QR. It deliberately BYPASSES
+the #624 D5 delegation short-circuit (which pulls/recreates nothing on a
+module-managed node — the exact reason a stuck bridge had no self-service
+upgrade), and REFUSES rather than clones when the bridge is not already deployed
+(`!whatsapp.IsDeployed`), keeping force git-credential-free on a D5 node. Two
+force-only rules, both load-bearing: `--no-deps` is REQUIRED (compose v2 cascades
+`--force-recreate` to the dependency set, so without it the Postgres sidecar is
+recreated too), and the force pull is FATAL (unlike `startBridgeStack`'s
+best-effort pull) — a force-recreate onto the same stale image after a failed
+pull would report an upgrade that never happened. `ProvisionResult.Forced` (set
+by `Provision` when the force edge ran) is what the handler maps to
+`status="upgraded"`, gated on `AlreadyLinked` (a forced recreate of a NOT-linked
+bridge stays `provisioned` with its QR). `TestForceRecreateBridgeStackPullsThenForceRecreatesBridgeOnly`
++ `TestForceRecreateBridgeStackPullFailureIsFatal` pin the argv/fatal-pull;
+`TestProvisionForceRoutesThroughForceRecreateCompose` pins the routing;
+`TestWhatsAppProvisionForceUpgrade` pins `status="upgraded"`. Default path
+(force absent) is byte-identical.
 
 ### Canonical per-engine cache paths (citadel #682 P0/P1, #906, model-cache ownership design)
 
