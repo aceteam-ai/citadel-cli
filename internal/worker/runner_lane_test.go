@@ -32,6 +32,7 @@ func TestSerializedLaneJobTypes(t *testing.T) {
 		// Manifest/lockfile writers that are NOT unbounded but still must
 		// serialize (they read-modify-write citadel.yaml / modules.lock).
 		JobTypeModuleSet:         {},
+		JobTypeFineTuneStart:     {},
 		JobTypeServiceStop:       {},
 		JobTypeApplyDeviceConfig: {},
 		// Per-run workspace writer with a long-tier watchdog fallback.

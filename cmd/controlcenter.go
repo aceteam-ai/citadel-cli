@@ -2463,6 +2463,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ccPinnedServices = manifestPinnedServices(m)
 	}
 	nodeJobOpts := nodeJobHandlerOpts{
+		Source:                    source,
 		OrgID:                     nodeJobOrgID(),
 		NodeID:                    headscaleNodeID,
 		LogFn:                     activity,

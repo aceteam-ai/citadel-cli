@@ -174,6 +174,59 @@ func fullGPUStatus(services ...status.ServiceInfo) *status.NodeStatus {
 
 const testJobID = "job-1"
 
+const fineTuneReservationManifestYAML = `node:
+  name: test-node
+services:
+  - name: unlimited-ocr
+    type: docker
+    compose_file: ./services/unlimited-ocr.yml
+    desired_status: running
+  - name: ollama
+    type: docker
+    compose_file: ./services/ollama.yml
+    desired_status: running
+  - name: paw-compile
+    type: docker
+    compose_file: ./services/paw-compile.yml
+    desired_status: running
+`
+
+func TestReserveNamedStopsOnlyApprovedServicesAndRestores(t *testing.T) {
+	h, exec := newReservationTestHandlerWithManifest(t, fineTuneReservationManifestYAML,
+		fullGPUStatus(svcInfo("unlimited-ocr", false, 3), svcInfo("ollama", false, 5), svcInfo("paw-compile", false, 2)))
+	res, err := h.ReserveNamed(testCtx(), testJobID, []string{"unlimited-ocr", "ollama"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(res.Evicted, ","); got != "ollama,unlimited-ocr" {
+		t.Fatalf("evicted %q", got)
+	}
+	if got := strings.Join(exec.stopped, ","); got != "ollama,unlimited-ocr" {
+		t.Fatalf("stopped %q", got)
+	}
+	if _, err := h.Release(testCtx(), testJobID); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(exec.started, ","); got != "unlimited-ocr,ollama" {
+		t.Fatalf("restored %q", got)
+	}
+}
+
+func TestReserveNamedPartialStopFailureCanRestore(t *testing.T) {
+	h, exec := newReservationTestHandlerWithManifest(t, fineTuneReservationManifestYAML,
+		fullGPUStatus(svcInfo("unlimited-ocr", false, 3), svcInfo("ollama", false, 5)))
+	exec.failStop = map[string]bool{"unlimited-ocr": true}
+	if _, err := h.ReserveNamed(testCtx(), testJobID, []string{"unlimited-ocr", "ollama"}); err == nil {
+		t.Fatal("expected partial stop failure")
+	}
+	if _, err := h.Release(testCtx(), testJobID); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(exec.started, ","); got != "unlimited-ocr,ollama" {
+		t.Fatalf("restored %q", got)
+	}
+}
+
 func testCtx() JobContext {
 	return JobContext{LogFn: func(string, string) {}}
 }

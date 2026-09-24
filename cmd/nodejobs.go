@@ -2,7 +2,10 @@ package cmd
 
 import (
 	"context"
+	"path/filepath"
+	"runtime"
 
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -17,6 +20,7 @@ import (
 // as the dedicated worker — no more "node vX has no handler for WHATSAPP_PROVISION"
 // when only the control center runs (the competing-consumer incident).
 type nodeJobHandlerOpts struct {
+	Source worker.JobSource
 	// OrgID is the organization chosen for this worker's per-node queue.
 	OrgID string
 	// NodeID is the exact Headscale node identifier used for control jobs.
@@ -169,6 +173,28 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		},
 		Log: opts.HandlerLog,
 	}))
+
+	// Both direct Redis and API-proxy workers use the platform's canonical
+	// fine-tune hash and cancel key. API mode requires the scoped companion
+	// endpoint; it never falls back to the generic KV route.
+	var control worker.FineTuneControl
+	switch src := opts.Source.(type) {
+	case *worker.RedisSource:
+		control = worker.NewRedisFineTuneControl(src, opts.OrgID, runner.NodeID())
+	case *worker.APISource:
+		control = worker.NewAPIFineTuneControl(src)
+	}
+	if control != nil && runtime.GOOS == "linux" && opts.ConfigDir != "" && opts.WorkspaceDir != "" {
+		service := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
+		runner.RegisterHandler(worker.NewFineTuneHandler(worker.FineTuneConfig{
+			NodeID: runner.NodeID(), WorkspaceDir: opts.WorkspaceDir,
+			OutputRoot:  filepath.Join(opts.ConfigDir, "finetune", "adapters"),
+			CacheDir:    filepath.Join(opts.ConfigDir, "finetune", "cache"),
+			Image:       "citadel-finetune:local",
+			Control:     control,
+			Reservation: &fineTuneServiceReservation{service: service},
+		}))
+	}
 	// AGENT_UPDATE (aceteam#4427): remote agent update + restart for this node.
 	runner.RegisterHandler(worker.NewAgentUpdateHandler(worker.AgentUpdateConfig{
 		Version:    Version,
@@ -262,6 +288,21 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 			Log:      opts.HandlerLog,
 		}))
 	}
+}
+
+type fineTuneServiceReservation struct{ service *jobs.ServiceHandler }
+
+func (r *fineTuneServiceReservation) Reserve(ctx context.Context, jobID string) ([]string, error) {
+	res, err := r.service.ReserveNamed(jobs.JobContext{Ctx: ctx}, jobID, []string{"unlimited-ocr", "ollama"})
+	if res == nil {
+		return nil, err
+	}
+	return res.Evicted, err
+}
+
+func (r *fineTuneServiceReservation) Release(ctx context.Context, jobID string) error {
+	_, err := r.service.Release(jobs.JobContext{Ctx: ctx}, jobID)
+	return err
 }
 
 // nodeJobOrgID mirrors the per-node queue builder's device-first org choice.
