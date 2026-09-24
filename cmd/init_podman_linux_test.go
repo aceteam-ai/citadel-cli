@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -354,10 +355,149 @@ func TestPackerToolkitOnlyCPUArm64SkipsGPUSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	code := string(source)
-	if !strings.Contains(code, "if has_nvidia_hardware; then\nfor group in video render") {
-		t.Fatal("Packer GPU groups are not gated by hardware")
+	start := strings.Index(code, "if command -v nvidia-ctk >/dev/null; then\nif has_nvidia_hardware; then")
+	end := strings.Index(code, "\nfi\nfi\npodman --version")
+	if start < 0 || end <= start {
+		t.Fatal("Packer GPU groups and all CDI artifacts must share the hardware gate")
 	}
-	if !strings.Contains(code, "if ! has_nvidia_hardware; then\n    exit 0") {
-		t.Fatal("CDI boot helper does not skip CPU-only nodes")
+	root := t.TempDir()
+	tool := filepath.Join(root, "nvidia-ctk")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	block := code[start : end+len("\nfi\nfi")]
+	for _, path := range []string{"/etc/cdi", "/etc/systemd/system/citadel-nvidia-cdi.service", "/etc/udev/rules.d/70-citadel-nvidia.rules", "/usr/local/libexec"} {
+		block = strings.ReplaceAll(block, path, filepath.Join(root, strings.TrimPrefix(path, "/")))
+	}
+	mutation := filepath.Join(root, "mutation")
+	script := `has_nvidia_hardware() { return 1; }
+uname() { printf 'aarch64\n'; }
+systemctl() { printf 'systemctl\n' >> "` + mutation + `"; }
+usermod() { printf 'usermod\n' >> "` + mutation + `"; }
+udevadm() { printf 'udevadm\n' >> "` + mutation + `"; }
+install() { printf 'install\n' >> "` + mutation + `"; }
+` + block
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = append(os.Environ(), "PATH="+root+":"+os.Getenv("PATH"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("CPU-only Packer GPU block failed: %v: %s", err, out)
+	}
+	for _, path := range []string{mutation, filepath.Join(root, "etc/cdi"), filepath.Join(root, "etc/systemd/system/citadel-nvidia-cdi.service"), filepath.Join(root, "usr/local/libexec/citadel-nvidia-cdi-refresh")} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("toolkit-only CPU arm64 created GPU mutation/artifact %s: %v", path, err)
+		}
+	}
+}
+
+func TestPackerWorkerMarkerRejectsHostileParentAndLeaf(t *testing.T) {
+	source, err := os.ReadFile("../packer/scripts/03-podman.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := strings.SplitN(string(source), "# End independently testable marker-boundary functions.", 2)
+	if len(boundary) != 2 {
+		t.Fatal("Packer worker marker boundary unavailable")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "citadel")
+	if err := os.Mkdir(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "rootless-worker-user")
+	if err := os.WriteFile(marker, []byte("1001\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	check := func(path, owner string, want bool) {
+		t.Helper()
+		script := boundary[0] + "\nworker_marker_safe \"$1\" 1001 \"$2\"\n"
+		cmd := exec.Command("bash", "-c", script, "--", path, owner)
+		err := cmd.Run()
+		if (err == nil) != want {
+			t.Fatalf("marker path %s owner %s safe=%v, want %v (err=%v)", path, owner, err == nil, want, err)
+		}
+	}
+	owner := fmt.Sprint(os.Getuid())
+	check(marker, owner, true)
+	check(marker, "99999", false)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	check(marker, owner, false)
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(marker, 0644); err != nil {
+		t.Fatal(err)
+	}
+	check(marker, owner, false)
+	if err := os.Chmod(marker, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked-citadel")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	check(filepath.Join(link, "rootless-worker-user"), owner, false)
+	leafLink := filepath.Join(dir, "linked-marker")
+	if err := os.Symlink(marker, leafLink); err != nil {
+		t.Fatal(err)
+	}
+	check(leafLink, owner, false)
+}
+
+func TestFirstbootRetryRefusesActiveWorkerBeforeManagerRestart(t *testing.T) {
+	source, err := os.ReadFile("../packer/scripts/06-firstboot.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(source)
+	start := strings.Index(code, "require_drained_firstboot_worker() {")
+	end := strings.Index(code, "\nrequire_drained_firstboot_worker ||")
+	if start < 0 || end <= start {
+		t.Fatal("firstboot drain guard missing")
+	}
+	if auth := strings.Index(code, `AUTHKEY=""`); auth < 0 || end > auth {
+		t.Fatal("firstboot drain guard must run before authkey or manifest replay")
+	}
+	if restart := strings.Index(code, `systemctl restart "user@${citadel_uid}.service"`); restart < end {
+		t.Fatal("firstboot drain guard follows user-manager restart")
+	}
+	root := t.TempDir()
+	mutation := filepath.Join(root, "manager-restart")
+	config := filepath.Join(root, "citadel.yaml")
+	pid := filepath.Join(root, "worker.pid")
+	if err := os.WriteFile(config, []byte("node: unchanged\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pid, []byte("4172\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	script := `citadel_uid=1001
+log() { :; }
+systemctl() {
+    if [ "$1" = show ]; then printf 'active\n'; else printf 'restart\n' >> "` + mutation + `"; fi
+}
+as_citadel() {
+    if [ "$3" = show-environment ]; then return 0; fi
+    if [ "$3" = is-active ] && [ "$5" = citadel-worker.service ]; then return 0; fi
+    return 1
+}
+` + code[start:end] + `
+if require_drained_firstboot_worker; then
+    printf 'node: changed\n' > "` + config + `"
+    printf '0\n' > "` + pid + `"
+    systemctl restart user@1001.service
+fi
+`
+	if out, err := exec.Command("bash", "-c", script).CombinedOutput(); err != nil {
+		t.Fatalf("guard fixture failed: %v: %s", err, out)
+	}
+	if _, err := os.Stat(mutation); !os.IsNotExist(err) {
+		t.Fatalf("active worker retry restarted user manager: %v", err)
+	}
+	gotConfig, _ := os.ReadFile(config)
+	gotPID, _ := os.ReadFile(pid)
+	if string(gotConfig) != "node: unchanged\n" || string(gotPID) != "4172\n" {
+		t.Fatal("active-worker firstboot retry mutated config or PID")
 	}
 }

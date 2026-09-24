@@ -34,6 +34,27 @@ log() {
 
 log "Starting Citadel first-boot initialization..."
 
+# On a retry after worker startup, stop before authkey, manifest, or user-
+# manager changes. An operator must drain the worker for an explicit repair.
+citadel_uid=$(id -u citadel)
+as_citadel() {
+    runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" "$@"
+}
+require_drained_firstboot_worker() {
+    local state unit
+    state=$(systemctl show "user@${citadel_uid}.service" -p ActiveState --value) || return 1
+    if [ "$state" = active ]; then
+        as_citadel systemctl --user show-environment >/dev/null || return 1
+        for unit in citadel-worker.service citadel.service; do
+            if as_citadel systemctl --user is-active --quiet "$unit"; then
+                log "ERROR: ${unit} is active; drain it before retrying firstboot."
+                return 1
+            fi
+        done
+    fi
+}
+require_drained_firstboot_worker || { log "ERROR: Cannot prove the worker is drained; refusing firstboot replay."; exit 1; }
+
 # -----------------------------------------------------------------------
 # 1. Read authkey
 # -----------------------------------------------------------------------
@@ -96,12 +117,8 @@ fi
 # 4. Enable and start the worker
 # -----------------------------------------------------------------------
 log "Preparing rootless Podman and starting the Citadel user worker..."
-citadel_uid=$(id -u citadel)
 loginctl enable-linger citadel
 systemctl start "user@${citadel_uid}.service"
-as_citadel() {
-    runuser -u citadel -- env HOME=/home/citadel XDG_RUNTIME_DIR="/run/user/${citadel_uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${citadel_uid}/bus" "$@"
-}
 as_citadel systemctl --user enable --now podman.socket
 as_citadel podman info >/dev/null
 has_nvidia_hardware() {
@@ -127,12 +144,17 @@ KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
     udevadm control --reload-rules
     install -d -m 755 /etc/cdi
-    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
-       nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
-        log "NVIDIA CDI devices verified."
-    else
-        log "NVIDIA CDI pending; boot refresh service retries driver readiness."
-    fi
+    cdi_ready=false
+    for attempt in $(seq 1 30); do
+        if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+           nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
+            cdi_ready=true
+            break
+        fi
+        sleep 2
+    done
+    $cdi_ready || { log "ERROR: NVIDIA CDI unavailable; keeping firstboot pending for a safe retry."; exit 1; }
+    log "NVIDIA CDI devices verified."
 fi
 as_citadel systemctl --user daemon-reload
 as_citadel systemctl --user enable --now citadel-worker.service
