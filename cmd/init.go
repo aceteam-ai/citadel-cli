@@ -88,9 +88,14 @@ and system user configuration (requires sudo).`,
 		// E5 owns migration of existing system workers. This read-only gate must
 		// precede identity, auth, network and configuration writes.
 		if initProvision && platform.IsLinux() {
-			if err := prepareLinuxPodmanProvision(); err != nil {
+			ready, err := prepareLinuxPodmanProvision()
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
 				os.Exit(1)
+			}
+			if ready {
+				fmt.Println("✅ Existing rootless Citadel worker is healthy; provisioning is already complete.")
+				return
 			}
 		}
 		// Root is only required for full provisioning (--provision flag)

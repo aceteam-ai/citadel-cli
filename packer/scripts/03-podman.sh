@@ -8,11 +8,36 @@ apt-get install -y --no-install-recommends podman podman-compose uidmap fuse-ove
 if apt-cache show passt >/dev/null 2>&1; then
     apt-get install -y --no-install-recommends passt
 fi
-id citadel >/dev/null 2>&1 || useradd --create-home --shell /bin/bash citadel
+if id citadel >/dev/null 2>&1; then
+    marker=/etc/citadel/rootless-worker-user
+    [ -f "$marker" ] && [ ! -L "$marker" ] &&
+        [ "$(stat -c %u "$marker")" = 0 ] && [ "$(stat -c %a "$marker")" = 600 ] &&
+        [ "$(<"$marker")" = "$(id -u citadel)" ] || {
+            echo 'ERROR: Refusing pre-existing citadel account without trusted provenance' >&2; exit 1;
+        }
+else
+    useradd --create-home --shell /bin/bash citadel
+    install -d -m 755 /etc/citadel
+    [ -d /etc/citadel ] && [ ! -L /etc/citadel ] && [ "$(stat -c %u /etc/citadel)" = 0 ] || {
+        echo 'ERROR: Worker marker directory is unsafe' >&2; exit 1;
+    }
+    ( set -C; id -u citadel > /etc/citadel/rootless-worker-user )
+    chmod 600 /etc/citadel/rootless-worker-user
+fi
 test "$(getent passwd citadel | cut -d: -f6)" = /home/citadel
 for group in $(id -nG citadel); do
     case "$group" in sudo|wheel|docker) echo "ERROR: dedicated citadel user has privileged $group membership" >&2; exit 1 ;; esac
 done
+if command -v sudo >/dev/null 2>&1; then
+    if sudo_listing=$(runuser -u citadel -- env LC_ALL=C sudo -n -l 2>&1); then
+        echo 'ERROR: Dedicated citadel account has sudo grants' >&2; exit 1
+    fi
+    case "${sudo_listing,,}" in
+        *"may run the following commands"*|*"nopasswd:"*) echo 'ERROR: Dedicated citadel account has sudo grants' >&2; exit 1 ;;
+        *"not allowed to run sudo"*|*"may not run sudo"*) ;;
+        *) echo 'ERROR: Cannot prove citadel account has no sudo grants' >&2; exit 1 ;;
+    esac
+fi
 ensure_subid() {
     local file="$1" type="$2" start
     if awk -F: '$1=="citadel" && $3>=65536 {found=1} END {exit !found}' "$file"; then return; fi
@@ -70,7 +95,13 @@ elif [ "$(uname -m)" != aarch64 ] && [ "$(uname -m)" != arm64 ]; then
     apt-get update -y
     apt-get install -y --no-install-recommends nvidia-container-toolkit
 fi
+has_nvidia_hardware() {
+    if [ "$is_jetson" = true ]; then return 0; fi
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then return 0; fi
+    [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]
+}
 if command -v nvidia-ctk >/dev/null; then
+if has_nvidia_hardware; then
 for group in video render; do
     getent group "$group" >/dev/null || { echo "ERROR: Required GPU group $group is missing" >&2; exit 1; }
 done
@@ -84,10 +115,20 @@ KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
 udevadm control --reload-rules
+fi
 install -d -m 755 /usr/local/libexec /etc/cdi
 cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
 #!/bin/sh
 set -eu
+has_nvidia_hardware() {
+    if [ -s /etc/nv_tegra_release ]; then return 0; fi
+    if grep -qiE 'jetson|tegra' /proc/device-tree/model /sys/firmware/devicetree/base/model 2>/dev/null; then return 0; fi
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then return 0; fi
+    [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]
+}
+if ! has_nvidia_hardware; then
+    exit 0
+fi
 for attempt in $(seq 1 30); do
     if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
        nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
