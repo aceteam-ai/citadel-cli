@@ -323,6 +323,110 @@ func TestFineTuneExplicitRunAndTUIAddRefuseBeforeMaterialization(t *testing.T) {
 	}
 }
 
+// The global node pointer, not a successfully parsed manifest, determines
+// which reservation.lock and active.hold protect local entrypoints. A damaged
+// manifest must not make them bootstrap ~/citadel-node instead.
+func TestFineTuneConfiguredNodeManifestFailureNeverFallsBack(t *testing.T) {
+	for _, manifestState := range []string{"missing", "malformed"} {
+		t.Run(manifestState, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CITADEL_NODE_DIR", "")
+			configDir := filepath.Join(home, "configured-node")
+			defaultDir := filepath.Join(home, "citadel-node")
+			pointerPath := filepath.Join(home, ".citadel-cli", "config.yaml")
+			if err := os.MkdirAll(filepath.Dir(pointerPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+				t.Fatal(err)
+			}
+			pointer := []byte("node_config_dir: " + configDir + "\n")
+			if err := os.WriteFile(pointerPath, pointer, 0600); err != nil {
+				t.Fatal(err)
+			}
+			hold := []byte("train-job\n")
+			if err := os.WriteFile(finetunesafety.Path(configDir), hold, 0600); err != nil {
+				t.Fatal(err)
+			}
+			// Warm the local catalog so each CLI/TUI installer reaches node-dir
+			// admission without a network refresh or an unrelated source error.
+			catalogServiceDir := filepath.Join(catalog.GetCatalogPath(), "services", "vllm")
+			if err := os.MkdirAll(catalogServiceDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(catalogServiceDir, "service.yaml"), []byte("name: vllm\nversion: 1.0.0\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(catalogServiceDir, "compose.yml"), []byte("services:\n  vllm:\n    image: example/vllm\n    gpus: all\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(configDir, "citadel.yaml")
+			if manifestState == "malformed" {
+				if err := os.WriteFile(manifestPath, []byte("node: [\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			resolved, err := localServiceConfigDir()
+			if err != nil || resolved != configDir {
+				t.Fatalf("local node dir = %q, %v; want %q", resolved, err, configDir)
+			}
+			started := false
+			if err := runSingleServiceApply(resolved, "vllm", func(string, string) error { started = true; return nil }); err == nil {
+				t.Fatal("run admitted without a usable configured manifest")
+			}
+			if err := ccAddService("vllm"); err == nil {
+				t.Fatal("TUI add admitted without a usable configured manifest")
+			}
+			if err := runCatalogInstall(nil, []string{"vllm"}); err == nil {
+				t.Fatal("catalog install admitted without a usable configured manifest")
+			}
+			if err := runModuleInstall(nil, []string{"vllm"}); err == nil {
+				t.Fatal("module install admitted without a usable configured manifest")
+			}
+			if _, err := buildModuleInstallCallbacks().Install("vllm", nil, false); err == nil {
+				t.Fatal("TUI module install admitted without a usable configured manifest")
+			}
+			ops, calls := newControlTestOps(map[string]bool{})
+			ops.resolveSource = func(catalog.Source) (*catalog.ServiceManifest, string, *catalog.ResolvedModule, error) {
+				return &catalog.ServiceManifest{Name: "vllm"}, "", nil, nil
+			}
+			if err := ops.Install(context.Background(), reconcile.ModuleAssignment{Source: "vllm"}); err == nil {
+				t.Fatal("MODULE_SET install admitted without a usable configured manifest")
+			}
+			if err := withLocalServiceMutationLock(resolved, func() error {
+				_, _, err := findOrCreateManifest()
+				return err
+			}); err == nil {
+				t.Fatal("CLI/TUI install bootstrap admitted without a usable configured manifest")
+			}
+			if started || len(*calls) != 0 {
+				t.Fatalf("started=%t module calls=%v", started, *calls)
+			}
+			if _, err := os.Stat(filepath.Join(defaultDir, "citadel.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("default manifest created: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(configDir, "services", "vllm.yml")); !os.IsNotExist(err) {
+				t.Fatalf("configured service materialized: %v", err)
+			}
+			if got, err := os.ReadFile(pointerPath); err != nil || string(got) != string(pointer) {
+				t.Fatalf("global pointer changed: %q, %v", got, err)
+			}
+			if got, err := os.ReadFile(finetunesafety.Path(configDir)); err != nil || string(got) != string(hold) {
+				t.Fatalf("active hold changed: %q, %v", got, err)
+			}
+			if manifestState == "missing" {
+				if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+					t.Fatalf("configured manifest created: %v", err)
+				}
+			} else if got, err := os.ReadFile(manifestPath); err != nil || string(got) != "node: [\n" {
+				t.Fatalf("configured manifest changed: %q, %v", got, err)
+			}
+		})
+	}
+}
+
 func TestFineTuneCPUStartSerializesWithIncomingUpdateAndInstallWriter(t *testing.T) {
 	configDir := heldFineTuneModuleFixture(t)
 	path := filepath.Join(configDir, "services", "paw-compile.yml")

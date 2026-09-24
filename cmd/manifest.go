@@ -159,64 +159,17 @@ func manifestPinnedModels(m *CitadelManifest) []string {
 // entirely and citadel.yaml is read directly from the override directory. See
 // cmd/nodedir.go for why this exists and its exact scope.
 func findAndReadManifest() (*CitadelManifest, string, error) {
-	if override := resolveNodeDirOverride(); override != "" {
-		return readManifestFromDir(override)
-	}
-
-	globalConfigFile := filepath.Join(platform.ConfigDir(), "config.yaml")
-
-	// Step 1: Read the global config file to find the node's directory.
-	globalConfigData, err := os.ReadFile(globalConfigFile)
+	configDir, source, err := resolveNodeConfigDirReadOnly()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, "", fmt.Errorf("global config not found at %s. Please run 'citadel init'", globalConfigFile)
-		}
-		return nil, "", fmt.Errorf("could not read global config %s: %w", globalConfigFile, err)
+		return nil, "", err
 	}
-
-	var globalConf struct {
-		NodeConfigDir string `yaml:"node_config_dir"`
+	if source == nodeDirDefault {
+		return nil, "", fmt.Errorf("global config not found at %s. Please run 'citadel init'", filepath.Join(platform.ConfigDir(), "config.yaml"))
 	}
-	if err := yaml.Unmarshal(globalConfigData, &globalConf); err != nil {
-		return nil, "", fmt.Errorf("could not parse global config %s: %w", globalConfigFile, err)
+	if source == nodeDirOverride {
+		return readManifestFromDir(configDir)
 	}
-
-	if globalConf.NodeConfigDir == "" {
-		// Try to auto-fix by checking default location
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
-		}
-
-		defaultNodeDir := filepath.Join(homeDir, "citadel-node")
-		defaultManifest := filepath.Join(defaultNodeDir, "citadel.yaml")
-
-		if _, err := os.Stat(defaultManifest); err == nil {
-			// Found manifest in default location - auto-fix the config
-			globalConf.NodeConfigDir = defaultNodeDir
-
-			// Read existing config to preserve other fields. A successful
-			// unmarshal of an empty/whitespace/null file yields a nil map (e.g.
-			// when the config was truncated by a disk-full event), so guard
-			// against nil before writing or the assignment below panics.
-			var config map[string]interface{}
-			if err := yaml.Unmarshal(globalConfigData, &config); err != nil || config == nil {
-				config = make(map[string]interface{})
-			}
-			config["node_config_dir"] = defaultNodeDir
-
-			// Write back
-			if newData, err := yaml.Marshal(config); err == nil {
-				_ = os.WriteFile(globalConfigFile, newData, 0600)
-			}
-		} else {
-			return nil, "", fmt.Errorf("global config %s is invalid: missing 'node_config_dir'", globalConfigFile)
-		}
-	}
-
-	// Step 2: Load the manifest from the path specified in the global config.
-	nodeConfigDir := globalConf.NodeConfigDir
-	manifestPath := filepath.Join(nodeConfigDir, "citadel.yaml")
+	manifestPath := filepath.Join(configDir, "citadel.yaml")
 
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -232,16 +185,14 @@ func findAndReadManifest() (*CitadelManifest, string, error) {
 	}
 
 	// Return the manifest and the absolute path to its directory.
-	return &manifest, nodeConfigDir, nil
+	return &manifest, configDir, nil
 }
 
 // readManifestFromDir loads citadel.yaml directly from configDir, bypassing the
 // global config.yaml indirection entirely. This is the --node-dir/
 // CITADEL_NODE_DIR override path (citadel#853): a caller that wants to target
 // an explicit node directory without depending on $HOME or platform.ConfigDir()
-// gets EXACTLY that directory, with no auto-fix/fallback behavior layered on
-// top (unlike the default path above, which self-heals a missing
-// node_config_dir key).
+// gets EXACTLY that directory, with no fallback behavior layered on top.
 func readManifestFromDir(configDir string) (*CitadelManifest, string, error) {
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
 	manifestData, err := os.ReadFile(manifestPath)
@@ -259,8 +210,61 @@ func readManifestFromDir(configDir string) (*CitadelManifest, string, error) {
 	return &manifest, configDir, nil
 }
 
+type nodeDirSource uint8
+
+const (
+	nodeDirDefault nodeDirSource = iota
+	nodeDirPointer
+	nodeDirOverride
+)
+
+// Resolve the canonical node dir without reading or rewriting citadel.yaml.
+// A configured pointer owns the node even when its manifest is missing or
+// malformed; callers must never silently fall back to ~/citadel-node then.
+func resolveNodeConfigDirReadOnly() (string, nodeDirSource, error) {
+	if override := resolveNodeDirOverride(); override != "" {
+		dir, err := filepath.Abs(override)
+		if err != nil {
+			return "", nodeDirOverride, err
+		}
+		return filepath.Clean(dir), nodeDirOverride, nil
+	}
+	globalPath := filepath.Join(platform.ConfigDir(), "config.yaml")
+	info, err := os.Lstat(globalPath)
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return "", nodeDirPointer, fmt.Errorf("global config %s is not a regular file", globalPath)
+		}
+		data, readErr := os.ReadFile(globalPath)
+		if readErr != nil {
+			return "", nodeDirPointer, fmt.Errorf("read global config %s: %w", globalPath, readErr)
+		}
+		var config struct {
+			NodeConfigDir string `yaml:"node_config_dir"`
+		}
+		if parseErr := yaml.Unmarshal(data, &config); parseErr != nil {
+			return "", nodeDirPointer, fmt.Errorf("parse global config %s: %w", globalPath, parseErr)
+		}
+		dir := strings.TrimSpace(config.NodeConfigDir)
+		if dir == "" || !filepath.IsAbs(dir) {
+			return "", nodeDirPointer, fmt.Errorf("global config %s has missing or non-absolute node_config_dir", globalPath)
+		}
+		return filepath.Clean(dir), nodeDirPointer, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", nodeDirPointer, fmt.Errorf("inspect global config %s: %w", globalPath, err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", nodeDirDefault, err
+	}
+	return filepath.Join(home, "citadel-node"), nodeDirDefault, nil
+}
+
 // findOrCreateManifest returns the manifest if it exists, or creates a bootstrap
-// configuration if it doesn't. This enables `citadel run` to work without `citadel init`.
+// configuration if no global node pointer exists. This enables a fresh
+// `citadel run` to work without `citadel init`, but never changes the node
+// identity when a configured manifest is missing or damaged.
 //
 // EXCEPTION (citadel#853): when --node-dir/CITADEL_NODE_DIR is set, a missing
 // manifest is bootstrapped AT the override directory instead of
@@ -269,24 +273,29 @@ func readManifestFromDir(configDir string) (*CitadelManifest, string, error) {
 // probe), not a new permanent default for every future un-overridden
 // invocation on this machine.
 func findOrCreateManifest() (*CitadelManifest, string, error) {
-	// Try to find existing manifest
-	manifest, configDir, err := findAndReadManifest()
-	if err == nil {
-		return manifest, configDir, nil
-	}
-
-	override := resolveNodeDirOverride()
-	if override != "" {
-		configDir = override
-	} else {
-		homeDir, homeErr := os.UserHomeDir()
-		if homeErr != nil {
-			return nil, "", fmt.Errorf("failed to get home directory: %w", homeErr)
-		}
-		configDir = filepath.Join(homeDir, "citadel-node")
+	configDir, source, err := resolveNodeConfigDirReadOnly()
+	if err != nil {
+		return nil, "", err
 	}
 	servicesDir := filepath.Join(configDir, "services")
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
+	if data, readErr := os.ReadFile(manifestPath); readErr == nil {
+		var manifest CitadelManifest
+		if parseErr := yaml.Unmarshal(data, &manifest); parseErr != nil {
+			return nil, "", fmt.Errorf("parse manifest %s: %w", manifestPath, parseErr)
+		}
+		if source == nodeDirDefault {
+			if err := writeGlobalConfig(configDir); err != nil {
+				return nil, "", err
+			}
+		}
+		return &manifest, configDir, nil
+	} else if !os.IsNotExist(readErr) {
+		return nil, "", fmt.Errorf("read manifest %s: %w", manifestPath, readErr)
+	}
+	if source == nodeDirPointer {
+		return nil, "", fmt.Errorf("configured node manifest missing at %s; refusing to bootstrap a different node", manifestPath)
+	}
 
 	// Create directories
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
@@ -300,7 +309,7 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 	}
 
 	// Create minimal manifest
-	manifest = &CitadelManifest{
+	manifest := &CitadelManifest{
 		Node: struct {
 			Name  string   `yaml:"name"`
 			Tags  []string `yaml:"tags"`
@@ -319,7 +328,7 @@ func findOrCreateManifest() (*CitadelManifest, string, error) {
 
 	// Only point the machine-wide global config at this dir when there is no
 	// override active -- see the function doc comment above.
-	if override == "" {
+	if source == nodeDirDefault {
 		if err := writeGlobalConfig(configDir); err != nil {
 			return nil, "", err
 		}
