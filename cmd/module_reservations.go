@@ -55,7 +55,9 @@ one's prior desired_status, and clears the reservation tag -- exactly what
 than once: a service that already came back (or was never evicted) is
 skipped. <jobID> for an exclusive run is "exclusive:<service-name>" (see
 'citadel module reservations list' to read it back, or reconstruct it
-directly -- the format is a stable, documented contract).`,
+directly -- the format is a stable, documented contract). An active fine-tune
+safety hold blocks manual release until trainer termination and cleanup have
+been verified; this command cannot override that hold.`,
 	Example: `  citadel module reservations release exclusive:bonsai
   citadel module reservations release exclusive:bonsai --dry-run
   citadel module reservations release exclusive:bonsai --expect-node my-test-node`,

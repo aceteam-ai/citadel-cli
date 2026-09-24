@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -27,15 +28,10 @@ import (
 // nothing else that could drift out of sync with it.
 //
 // One-process-per-node precondition: "any evicted_by_job tag found at startup
-// is orphaned" is only true because a citadel node runs (at most) one active
-// job-consuming worker at a time. ReconcileOrphanedReservations therefore
-// takes an explicit holdsWorkerLock bool instead of assuming its caller
-// checked — see that function's doc for the exact contract, INCLUDING a
-// currently-latent gap: internal/worklock only guards `citadel work` against
-// a second `citadel work`, not against the control-center TUI's own worker
-// path (cmd/controlcenter.go), which consumes jobs off the same handler set
-// WITHOUT ever acquiring that lock. Read that doc fully before wiring any
-// caller (e.g. #8248) into a handler reachable from the control-center path.
+// is orphaned" is only true while the caller owns the worker lock shared by
+// `citadel work` and the control-center TUI's job consumer. Fine-tune holds
+// additionally veto reconciliation even after a crashed worker releases that
+// lock: its named trainer may still be running outside the worker process.
 
 // Reservation is the result of a job-scoped GPU VRAM hold (citadel-cli#832).
 type Reservation struct {
@@ -258,12 +254,55 @@ func (h *ServiceHandler) ReserveNamed(ctx JobContext, jobID string, names []stri
 // an operator independently stopped for another reason — an explicit
 // SERVICE_STOP/SERVICE_START clears the tag (see Execute()), which is exactly
 // what makes that service invisible to every future Release call.
+// An active fine-tune safety hold blocks this generic API, even when jobID
+// names another tag. Only the fine-tune worker's verified-termination cleanup
+// API may restore its matching tag while the hold remains.
 func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error) {
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return nil, fmt.Errorf("release: job id is required")
 	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
 
+// ReleaseAfterVerifiedFineTuneTermination is only for the fine-tune worker
+// after its named training container has been confirmed absent (or before a
+// container was ever launched). It permits restoring THIS job's reservation
+// while its durable hold still protects the node from generic/manual release.
+// The worker clears the hold only after canonical terminal persistence.
+func (h *ServiceHandler) ReleaseAfterVerifiedFineTuneTermination(ctx JobContext, jobID string) ([]string, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("fine-tune release: job id is required")
+	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireOwned(h.ConfigDir, jobID); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("fine-tune release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
+
+func (h *ServiceHandler) releaseReservation(ctx JobContext, jobID string) ([]string, error) {
 	manifest, err := h.loadManifest()
 	if err != nil {
 		return nil, fmt.Errorf("release %s: failed to load manifest: %w", jobID, err)
@@ -327,48 +366,25 @@ func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error)
 // non-empty evicted_by_job tag at the moment it is called, grouped and
 // restored per job id via Release.
 //
-// holdsWorkerLock is a REQUIRED, explicit assertion from the caller — not a
-// convenience default — that this process currently holds
-// internal/worklock's single-instance lock for this node. That is the ONLY
-// thing that makes "any tag found here is orphaned" true: this ServiceHandler
-// has created no reservations of its own yet (Reserve only ever runs from job
-// dispatch, which starts after this call), so if exactly one worker can ever
-// be live for a node, every tag found here was necessarily written by a
-// PREVIOUS process invocation that exited (crashed, was killed, or was
-// restarted) before calling Release for it — there is no live job anywhere
-// else to wait for. The only correct call site today is cmd/work.go's
-// runWork, immediately after a successful worklock.Acquire, before the job
-// consume loop starts.
-//
-// IMPORTANT — this parameter guards only ONE of the two ways a second
-// job-consuming process can exist for a node. worklock guards `citadel work`
-// vs a SECOND `citadel work`: a genuinely live holder makes Acquire fail, so a
-// second invocation either exits (attach/no-op) or refuses, and never reaches
-// this function with holdsWorkerLock==true while another citadel-work process
-// is also live. It does NOT cover the control-center TUI's OWN worker path:
-// when no dedicated `citadel work` holds the lock (workerHeld==false in
-// cmd/controlcenter.go), the control center runs its own consume loop off the
-// SAME buildNodeJobHandlers handler set — WITHOUT ever calling
-// worklock.Acquire. If a future caller (e.g. #8248) wires Reserve/Release into
-// a handler reachable from that path, a control-center reservation and a
-// LATER `citadel work` startup (which legitimately Acquires — nobody is
-// holding it) collide exactly the way this parameter is meant to prevent: the
-// new worker's reconcile would see the tag, conclude "orphaned", and
-// destructively restart a service the still-live control-center job is
-// actively using. holdsWorkerLock does not detect this case; it is a
-// documented, currently-latent gap (nothing calls Reserve yet). A future
-// caller reachable from the control-center path MUST NOT rely on this
-// parameter alone — either make the control center's own worker path
-// Acquire the lock too, or extend the marker with owner identity (pid +
-// start time, classified the way worklock.decideStaleLock already classifies
-// a stale lock's recorded PID) so reconcile can tell "orphaned" from "owned by
-// a still-live sibling process" without assuming single-process exclusivity.
+// holdsWorkerLock is a REQUIRED assertion that this process owns the lock
+// shared by both job consumers. A previous worker's fine-tune container can
+// outlive its process and lock, so an active fine-tune safety hold independently
+// vetoes ALL reconciliation before any tag is released or service restarted.
+// Only verified trainer termination, reservation restore, and canonical status
+// persistence can remove that hold; startup must never infer cleanup from a
+// stale lock or an absent worker.
 //
 // Idempotent: a service already restored (tag cleared) is not visited again,
 // so calling this twice restores nothing the second time — see Release.
 func (h *ServiceHandler) ReconcileOrphanedReservations(ctx JobContext, holdsWorkerLock bool) ([]string, error) {
 	if !holdsWorkerLock {
 		return nil, fmt.Errorf("reconcile reservations: refusing to run without the node's single-instance worker lock (internal/worklock) -- see cmd/work.go's runWork for the only safe call site")
+	}
+	// Check before reading or acting on ANY job tag. A hold can survive a worker
+	// crash while the trainer container remains alive, so even other tagged jobs
+	// must wait for explicit recovery rather than risk a GPU service restart.
+	if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+		return nil, fmt.Errorf("reconcile reservations: %w", err)
 	}
 
 	manifest, err := h.loadManifest()

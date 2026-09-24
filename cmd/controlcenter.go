@@ -2033,6 +2033,21 @@ func ccStopWorker() error {
 	return nil
 }
 
+// acquireTUIWorkerOwnership closes the IsHeld-then-consume race with runWork.
+// Contention means monitor-only; any other lock error fails closed instead of
+// allowing an unlocked job consumer to create a reservation.
+func acquireTUIWorkerOwnership(stateDir string) (*worklock.Lock, bool, int, error) {
+	lock, err := worklock.Acquire(stateDir, Version, Log)
+	if err == nil {
+		return lock, false, 0, nil
+	}
+	var running *worklock.ErrAlreadyRunning
+	if errors.As(err, &running) {
+		return nil, true, running.PID, nil
+	}
+	return nil, false, 0, fmt.Errorf("control-center worker: cannot acquire node worker lock: %w", err)
+}
+
 // runTUIWorker runs the worker for the TUI (simplified version of runWork)
 func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error {
 	activity := func(level, msg string) {
@@ -2062,6 +2077,18 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// Load device config from file
 	deviceConfig := getDeviceConfigFromFile()
 
+	// Atomically claim the same worker lock as `citadel work` before this TUI can
+	// consume jobs. A read-only IsHeld probe would race a later work startup:
+	// both could consume jobs, and work's reservation reconcile could restore a
+	// still-live fine-tune reservation owned by this TUI.
+	workerLock, workerHeld, workerPID, err := acquireTUIWorkerOwnership(network.GetStateDir())
+	if err != nil {
+		return err
+	}
+	if workerLock != nil {
+		defer workerLock.Release()
+	}
+
 	// Detect a dedicated `citadel work` worker already serving this node. If one
 	// holds the single-instance lock (issues #443/#435/#455), the control center
 	// MUST NOT compete for this node's jobs: two consumers in the same consumer
@@ -2072,14 +2099,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// is present the control center stays a read-only monitor (heartbeat/telemetry
 	// only) and lets the real worker own all job consumption.
 	//
-	// Detection is a one-shot at TUI-worker startup: the systemd worker is normally
-	// already running before the TUI opens. If a worker starts or stops later the
-	// mode is not re-evaluated until the TUI worker restarts, but that residual is
-	// benign — the "no handler" hazard is removed unconditionally by the shared
-	// handler set below (both modes register WHATSAPP_PROVISION / AGENT_UPDATE), so a
-	// transient double-consumer only reproduces the pre-existing split, never a job
-	// failure. A worker that later dies is systemd-restarted (re-taking the lock).
-	workerHeld, workerPID := worklock.IsHeld(network.GetStateDir())
+	// The mode is one-shot: a monitor stays a monitor until restarted. A TUI
+	// consumer holds the lock for its entire lifetime, so later work startups
+	// cannot race its reservations or claim the same queue.
 	if workerHeld {
 		activity("info", fmt.Sprintf("Dedicated worker detected (PID %d); control center runs in monitor-only mode (no job consumption)", workerPID))
 	}

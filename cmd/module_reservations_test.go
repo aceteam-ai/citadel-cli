@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 )
 
 // TestModuleReservationsListDisplaysActiveReservations exercises the real
@@ -88,6 +90,25 @@ func TestModuleReservationsReleaseNoActiveReservationIsANoOp(t *testing.T) {
 	}
 	if !strings.Contains(out, "No services were tagged") {
 		t.Errorf("output = %q, want a clear no-op message", out)
+	}
+}
+
+func TestModuleReservationsReleaseRefusesFineTuneSafetyHold(t *testing.T) {
+	configDir := writeManifestWithServices(t, []Service{
+		{Name: "unlimited-ocr", ComposeFile: filepath.Join("services", "unlimited-ocr.yml"), DesiredStatus: "stopped", EvictedByJob: "train-job"},
+	})
+	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runModuleReservationsRelease(context.Background(), "train-job"); err == nil || !strings.Contains(err.Error(), "safety hold") {
+		t.Fatalf("manual release under active trainer hold = %v, want refusal", err)
+	}
+	data, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
+	if err != nil || !strings.Contains(string(data), "evicted_by_job: train-job") {
+		t.Fatalf("manual release changed held reservation: %s, %v", data, err)
 	}
 }
 

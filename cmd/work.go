@@ -644,9 +644,11 @@ func runWork(cmd *cobra.Command, args []string) {
 	if workConfigDir != "" {
 		// Restore anything still tagged evicted_by_job from a previous process
 		// invocation that crashed or was killed before releasing it (#832's
-		// crash-safety leg). Gated on workerLockHeld -- see that variable's doc
-		// and ReconcileOrphanedReservations' doc for why this is a hard
-		// precondition, not a convenience default.
+		// crash-safety leg). Gated on workerLockHeld -- now also held by the
+		// control-center TUI's job consumer -- and by the durable fine-tune
+		// safety hold check inside ReconcileOrphanedReservations. A trainer
+		// container may outlive its worker process, so a free worklock alone
+		// does not prove its reservation is orphaned.
 		//
 		// NOTE: this does NOT run before startManagedServices' async goroutine
 		// (started above, in the default: branch of the switch a few dozen

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
@@ -176,7 +177,7 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		runner.RegisterHandler(worker.NewFineTuneHandler(worker.FineTuneConfig{
 			NodeID: runner.NodeID(), WorkspaceDir: opts.WorkspaceDir,
 			OutputRoot:  filepath.Join(opts.ConfigDir, "finetune", "adapters"),
-			SafetyDir:   filepath.Join(opts.ConfigDir, "finetune", "safety"),
+			SafetyDir:   finetunesafety.Dir(opts.ConfigDir),
 			CacheDir:    filepath.Join(opts.ConfigDir, "finetune", "cache"),
 			Image:       "citadel-finetune:local",
 			Control:     control,
@@ -271,7 +272,7 @@ func (r *fineTuneServiceReservation) Reserve(ctx context.Context, jobID string) 
 }
 
 func (r *fineTuneServiceReservation) Release(ctx context.Context, jobID string) error {
-	_, err := r.service.Release(jobs.JobContext{Ctx: ctx}, jobID)
+	_, err := r.service.ReleaseAfterVerifiedFineTuneTermination(jobs.JobContext{Ctx: ctx}, jobID)
 	return err
 }
 
