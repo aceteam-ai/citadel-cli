@@ -3,8 +3,8 @@
 # Citadel Node Installer
 #
 # One-liner setup for fresh Ubuntu machines. Installs NVIDIA drivers (if GPU),
-# Docker CE, NVIDIA Container Toolkit, the citadel binary, systemd service,
-# and pre-pulls the vLLM image.
+# rootless Podman, NVIDIA CDI, the citadel binary, a systemd user service,
+# and pre-pulls inference and hosted-app runtime images.
 #
 # Usage:
 #   curl -fsSL https://get.aceteam.ai/citadel | sudo -E CITADEL_AUTHKEY=xxx bash
@@ -23,7 +23,9 @@ CONFIG_DIR="/etc/citadel"
 LOG_FILE="/var/log/citadel-install.log"
 VLLM_IMAGE="vllm/vllm-openai:latest"
 SERVICE_NAME="citadel-worker"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE_USER="citadel"
+SERVICE_HOME="/home/${SERVICE_USER}"
+SERVICE_FILE="/etc/systemd/user/${SERVICE_NAME}.service"
 
 # ---------------------------------------------------------------------------
 # Color helpers (only for terminal, plain text for log)
@@ -148,6 +150,12 @@ preflight() {
     esac
 
     ok "Architecture: $ARCH"
+
+    # E5 owns the data-preserving migration of running Docker nodes. Replacing
+    # the old root unit here would strand its root-owned volumes and state.
+    if [ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        die "A legacy system worker unit exists. Keep it running and use 'citadel runtime migrate' when E5 is available; this fresh-node installer will not replace it."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -178,7 +186,10 @@ HAS_GPU=false
 detect_gpu() {
     step "Detecting GPU"
 
-    if lspci 2>/dev/null | grep -qi nvidia; then
+    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+        HAS_GPU=true
+        ok "NVIDIA GPU detected (via PCI sysfs)"
+    elif lspci 2>/dev/null | grep -qi nvidia; then
         HAS_GPU=true
         ok "NVIDIA GPU detected"
     elif [ -d /proc/driver/nvidia/gpus ] && [ "$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l)" -gt 0 ]; then
@@ -226,47 +237,58 @@ install_nvidia_drivers() {
 }
 
 # ---------------------------------------------------------------------------
-# Docker CE
+# Rootless Podman
 # ---------------------------------------------------------------------------
-install_docker() {
-    step "Installing Docker CE"
+as_service_user() {
+    local uid
+    uid=$(id -u "$SERVICE_USER") || return 1
+    runuser -u "$SERVICE_USER" -- env -u SUDO_USER -u SUDO_UID -u SUDO_GID HOME="$SERVICE_HOME" \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" "$@"
+}
 
-    if command -v docker &>/dev/null; then
-        ok "Docker already installed ($(docker --version 2>/dev/null | head -1))"
+ensure_subid_range() {
+    local map_file="$1" kind="$2" start
+    if awk -F: -v user="$SERVICE_USER" '$1 == user && $3 >= 65536 {found=1} END {exit !found}' "$map_file"; then
+        return 0
+    fi
+    # Allocate beyond every range in both maps to avoid another user's IDs.
+    start=$(awk -F: 'NF == 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {end=$2+$3; if (end>max) max=end} END {if (max<100000) max=100000; print int((max+65535)/65536)*65536}' /etc/subuid /etc/subgid)
+    if [ "$kind" = uid ]; then
+        usermod --add-subuids "${start}-$((start+65535))" "$SERVICE_USER" || die "Could not allocate subordinate UIDs"
     else
-        msg "Installing Docker CE..."
-
-        # Use Docker's official convenience script
-        if ! apt-get update -qq >> "$LOG_FILE" 2>&1; then
-            warn "apt-get update had errors, continuing"
-        fi
-
-        if ! apt-get install -y -qq ca-certificates curl gnupg >> "$LOG_FILE" 2>&1; then
-            die "Failed to install Docker prerequisites"
-        fi
-
-        local docker_script
-        docker_script=$(mktemp)
-        if ! curl -fsSL https://get.docker.com -o "$docker_script"; then
-            die "Failed to download Docker install script"
-        fi
-
-        if ! sh "$docker_script" >> "$LOG_FILE" 2>&1; then
-            rm -f "$docker_script"
-            die "Docker installation failed. Check $LOG_FILE for details."
-        fi
-        rm -f "$docker_script"
-
-        ok "Docker CE installed"
+        usermod --add-subgids "${start}-$((start+65535))" "$SERVICE_USER" || die "Could not allocate subordinate GIDs"
     fi
+}
 
-    # Ensure Docker is running
-    if ! systemctl is-active --quiet docker; then
-        systemctl start docker >> "$LOG_FILE" 2>&1 || true
-        systemctl enable docker >> "$LOG_FILE" 2>&1 || true
+install_podman() {
+    step "Installing rootless Podman"
+    apt-get update -qq >> "$LOG_FILE" 2>&1 || die "apt-get update failed"
+    apt-get install -y -qq podman podman-compose uidmap fuse-overlayfs crun slirp4netns dbus-user-session git gnupg >> "$LOG_FILE" 2>&1 || die "Podman dependency installation failed"
+    # Ubuntu 22.04 can use slirp4netns when passt/pasta is unavailable.
+    if apt-cache show passt >/dev/null 2>&1; then
+        apt-get install -y -qq passt >> "$LOG_FILE" 2>&1 || die "passt installation failed"
     fi
+    if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+        useradd --create-home --shell /bin/bash "$SERVICE_USER" || die "Could not create ${SERVICE_USER} user"
+    fi
+    [ "$(getent passwd "$SERVICE_USER" | cut -d: -f6)" = "$SERVICE_HOME" ] || die "${SERVICE_USER} must have home ${SERVICE_HOME}"
+    ensure_subid_range /etc/subuid uid
+    ensure_subid_range /etc/subgid gid
 
-    ok "Docker daemon is running"
+    install -d -m 755 /etc/systemd/system/user@.service.d
+    cat > /etc/systemd/system/user@.service.d/50-citadel-delegate.conf <<'UNIT'
+[Service]
+Delegate=cpu memory pids
+UNIT
+    systemctl daemon-reload || die "Could not load cgroup delegation unit"
+    loginctl enable-linger "$SERVICE_USER" || die "Could not enable linger for ${SERVICE_USER}"
+    local uid
+    uid=$(id -u "$SERVICE_USER")
+    systemctl start "user@${uid}.service" || die "Could not start ${SERVICE_USER} user manager"
+    as_service_user systemctl --user enable --now podman.socket >> "$LOG_FILE" 2>&1 || die "Could not enable rootless Podman socket"
+    as_service_user podman info >> "$LOG_FILE" 2>&1 || die "Rootless Podman is not usable"
+    ok "Rootless Podman ready for ${SERVICE_USER}"
 }
 
 # ---------------------------------------------------------------------------
@@ -277,21 +299,19 @@ install_nvidia_toolkit() {
 
     step "Installing NVIDIA Container Toolkit"
 
-    if dpkg -l 2>/dev/null | grep -q nvidia-container-toolkit; then
+    if command -v nvidia-ctk >/dev/null 2>&1; then
         ok "NVIDIA Container Toolkit already installed"
     else
         msg "Adding NVIDIA container toolkit repository..."
 
         # Add NVIDIA GPG key and repo
         if ! curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-             gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>> "$LOG_FILE"; then
+             gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>> "$LOG_FILE"; then
             warn "Failed to add NVIDIA GPG key - skipping toolkit install"
             return 0
         fi
 
-        local dist
-        dist=$(. /etc/os-release && echo "$ID$VERSION_ID")
-        if ! curl -fsSL "https://nvidia.github.io/libnvidia-container/${dist}/libnvidia-container.list" | \
+        if ! curl -fsSL "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list" | \
              sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
              tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>> "$LOG_FILE"; then
             warn "Failed to add NVIDIA repo - skipping toolkit install"
@@ -310,40 +330,41 @@ install_nvidia_toolkit() {
         ok "NVIDIA Container Toolkit installed"
     fi
 
-    # Configure Docker daemon for NVIDIA runtime
-    msg "Configuring Docker NVIDIA runtime..."
-    local daemon_json="/etc/docker/daemon.json"
+    command -v nvidia-ctk >/dev/null || die "NVIDIA toolkit installed without nvidia-ctk"
+    # The worker owns only its own GPU access. The CDI spec is shared read-only
+    # with Podman; never configure a Docker default runtime on a fresh node.
+    usermod -aG video,render "$SERVICE_USER" || die "Could not grant ${SERVICE_USER} GPU groups"
+    install -d -m 755 /etc/udev/rules.d /etc/cdi
+    cat > /etc/udev/rules.d/70-citadel-nvidia.rules <<'RULE'
+KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
+KERNEL=="nvidiactl", GROUP="video", MODE="0660"
+KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
+KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
+RULE
+    udevadm control --reload-rules || die "Could not reload GPU device rules"
+    cat > /etc/systemd/system/citadel-nvidia-cdi.service <<'UNIT'
+[Unit]
+Description=Refresh Citadel NVIDIA CDI devices after driver initialization
+After=systemd-udev-settle.service
+ConditionPathExists=/dev/nvidiactl
 
-    if [ -f "$daemon_json" ] && grep -q '"nvidia"' "$daemon_json" 2>/dev/null; then
-        ok "Docker NVIDIA runtime already configured"
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable citadel-nvidia-cdi.service >> "$LOG_FILE" 2>&1 || die "Could not enable GPU CDI refresh"
+    if nvidia-smi >/dev/null 2>&1; then
+        udevadm trigger --subsystem-match=misc || true
+        nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >> "$LOG_FILE" 2>&1 || die "Could not generate NVIDIA CDI spec"
+        nvidia-ctk cdi list >> "$LOG_FILE" 2>&1 || die "NVIDIA CDI devices unavailable"
     else
-        # Use nvidia-ctk to configure (handles merging with existing daemon.json)
-        if command -v nvidia-ctk &>/dev/null; then
-            nvidia-ctk runtime configure --runtime=docker >> "$LOG_FILE" 2>&1 || true
-            # Set nvidia as default runtime for GPU workloads
-            if [ -f "$daemon_json" ]; then
-                # Add default-runtime if not present
-                if ! grep -q '"default-runtime"' "$daemon_json"; then
-                    local tmp
-                    tmp=$(mktemp)
-                    python3 -c "
-import json, sys
-with open('$daemon_json') as f:
-    d = json.load(f)
-d['default-runtime'] = 'nvidia'
-with open('$tmp', 'w') as f:
-    json.dump(d, f, indent=2)
-" 2>/dev/null && mv "$tmp" "$daemon_json" || rm -f "$tmp"
-                fi
-            fi
-
-            # Restart Docker to pick up changes
-            systemctl restart docker >> "$LOG_FILE" 2>&1 || warn "Docker restart failed"
-            ok "Docker configured with NVIDIA runtime"
-        else
-            warn "nvidia-ctk not found - Docker NVIDIA runtime not configured"
-        fi
+        warn "GPU driver is not active yet; generate /etc/cdi/nvidia.yaml after reboot with sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
     fi
+    ok "NVIDIA CDI configured"
 }
 
 # ---------------------------------------------------------------------------
@@ -463,34 +484,22 @@ setup_citadel() {
     mkdir -p "$CONFIG_DIR"
 
     # Skip init if already connected (idempotent)
-    if "${INSTALL_DIR}/${BINARY_NAME}" status --json 2>/dev/null | grep -q '"connected":true' 2>/dev/null; then
+    if as_service_user "${INSTALL_DIR}/${BINARY_NAME}" status --json 2>/dev/null | grep -q '"connected":true' 2>/dev/null; then
         ok "Node already connected to AceTeam Network"
         return 0
     fi
 
     # Check if there's existing network state (already initialized once).
     #
-    # `citadel init` writes tsnet state under the INVOKING user's home, not
-    # /root: internal/network.getOwnerHomeDir prefers SUDO_USER's home over
-    # $HOME, and this installer is run as `curl ... | sudo -E ... bash` (so
-    # SUDO_USER is set). Resolve the same owner home here, or this check only
-    # ever matches on a true-root `ssh root@` install and re-runs init on the
-    # common sudo path (risking a re-run against a single-use authkey).
-    owner_home=""
-    if [ -n "${SUDO_USER:-}" ]; then
-        owner_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    fi
-    [ -n "$owner_home" ] || owner_home="$HOME"
-
-    if [ -d "${owner_home}/citadel-node/network" ] && [ "$(ls "${owner_home}/citadel-node/network" 2>/dev/null | wc -l)" -gt 0 ]; then
+    # Always initialize under the same uid and HOME as the user worker.
+    if [ -d "${SERVICE_HOME}/citadel-node/network" ] && [ "$(ls "${SERVICE_HOME}/citadel-node/network" 2>/dev/null | wc -l)" -gt 0 ]; then
         ok "Existing network state found - skipping init (authkey may be single-use)"
         return 0
     fi
 
     msg "Running citadel init..."
-    if ! "${INSTALL_DIR}/${BINARY_NAME}" init --authkey "${CITADEL_AUTHKEY}" >> "$LOG_FILE" 2>&1; then
-        warn "citadel init failed - you may need to run 'citadel init' manually after install"
-        return 0
+    if ! as_service_user "${INSTALL_DIR}/${BINARY_NAME}" init --authkey "${CITADEL_AUTHKEY}" >> "$LOG_FILE" 2>&1; then
+        die "citadel init failed; the worker was not started. Check ${LOG_FILE} and retry enrollment."
     fi
 
     ok "Node initialized and connected to AceTeam Network"
@@ -502,11 +511,12 @@ setup_citadel() {
 setup_systemd_service() {
     step "Setting up systemd service"
 
+    install -d -m 755 /etc/systemd/user
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
 Description=Citadel Worker - AceTeam Sovereign Compute
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=podman.socket
+Wants=podman.socket
 # Defense in depth against a crash-loop self-DoS (#443): if the process keeps
 # failing fast, enter a cooldown instead of a 10s restart storm.
 StartLimitIntervalSec=300
@@ -521,8 +531,8 @@ Restart=on-failure
 RestartSec=10
 RestartSteps=5
 RestartMaxDelaySec=300
-Environment=HOME=/root
-WorkingDirectory=/root
+Environment=HOME=${SERVICE_HOME}
+WorkingDirectory=${SERVICE_HOME}
 
 # Logging
 StandardOutput=journal
@@ -534,17 +544,18 @@ LimitNOFILE=65535
 LimitNPROC=65535
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 UNIT
 
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" >> "$LOG_FILE" 2>&1
+    as_service_user systemctl --user daemon-reload >> "$LOG_FILE" 2>&1 || die "Could not reload user units"
+    as_service_user systemctl --user enable "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || die "Could not enable user worker"
 
     ok "Systemd service ${SERVICE_NAME} created and enabled"
 }
 
 # ---------------------------------------------------------------------------
-# Pre-pull vLLM image
+# Pre-pull inference and trusted hosted-app runtime images
 # ---------------------------------------------------------------------------
 prepull_vllm() {
     if ! $HAS_GPU; then
@@ -552,20 +563,31 @@ prepull_vllm() {
         return 0
     fi
 
-    step "Pre-pulling vLLM Docker image"
+    step "Pre-pulling vLLM Podman image"
 
-    if docker image inspect "$VLLM_IMAGE" &>/dev/null; then
+    if as_service_user podman image inspect "$VLLM_IMAGE" &>/dev/null; then
         ok "vLLM image already present"
         return 0
     fi
 
     msg "Pulling ${VLLM_IMAGE} (this may take a while)..."
-    if ! docker pull "$VLLM_IMAGE" >> "$LOG_FILE" 2>&1; then
-        warn "Failed to pull vLLM image - you can pull it later: docker pull ${VLLM_IMAGE}"
+    if ! as_service_user podman pull "$VLLM_IMAGE" >> "$LOG_FILE" 2>&1; then
+        warn "Failed to pull vLLM image - you can pull it later as ${SERVICE_USER}: podman pull ${VLLM_IMAGE}"
         return 0
     fi
 
     ok "vLLM image pulled"
+}
+
+prepull_app_runtimes() {
+    step "Pre-pulling trusted hosted-app runtime images"
+    if ! as_service_user "${INSTALL_DIR}/${BINARY_NAME}" service catalog update >> "$LOG_FILE" 2>&1; then
+        warn "Trusted catalog update unavailable; retry when connected"
+        return 0
+    fi
+    if ! as_service_user "${INSTALL_DIR}/${BINARY_NAME}" service catalog pre-pull-runtimes >> "$LOG_FILE" 2>&1; then
+        warn "Trusted runtime pre-pull unavailable; retry after catalog publication with: sudo -u ${SERVICE_USER} citadel service catalog pre-pull-runtimes"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -574,21 +596,21 @@ prepull_vllm() {
 start_worker() {
     step "Starting Citadel worker"
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl restart "$SERVICE_NAME" >> "$LOG_FILE" 2>&1
+    if as_service_user systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        as_service_user systemctl --user restart "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || die "Could not restart worker"
         ok "Worker restarted"
     else
-        systemctl start "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || true
+        as_service_user systemctl --user start "$SERVICE_NAME" >> "$LOG_FILE" 2>&1 || die "Could not start worker"
         ok "Worker started"
     fi
 
     # Brief wait for service to settle
     sleep 2
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if as_service_user systemctl --user is-active --quiet "$SERVICE_NAME"; then
         ok "Worker is running"
     else
-        warn "Worker may not have started cleanly. Check: journalctl -u ${SERVICE_NAME} -f"
+        warn "Worker may not have started cleanly. Check: journalctl --user -u ${SERVICE_NAME} -f"
     fi
 }
 
@@ -601,7 +623,7 @@ print_summary() {
     node_name=$(hostname)
     ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
 
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if as_service_user systemctl --user is-active --quiet "$SERVICE_NAME"; then
         worker_status="running"
     else
         worker_status="not running"
@@ -644,8 +666,8 @@ print_summary() {
     fi
     msg "Useful commands:"
     printf "  citadel status        # check node health\n" >&2
-    printf "  journalctl -u %s -f  # follow worker logs\n" "$SERVICE_NAME" >&2
-    printf "  systemctl restart %s # restart worker\n" "$SERVICE_NAME" >&2
+    printf "  sudo -u %s journalctl --user -u %s -f  # follow worker logs\n" "$SERVICE_USER" "$SERVICE_NAME" >&2
+    printf "  sudo -u %s systemctl --user restart %s # restart worker\n" "$SERVICE_USER" "$SERVICE_NAME" >&2
 
     if $HAS_GPU && ! nvidia-smi &>/dev/null; then
         printf "\n" >&2
@@ -662,13 +684,14 @@ main() {
     resolve_authkey
     detect_gpu
     install_nvidia_drivers
-    install_docker
+    install_podman
     install_nvidia_toolkit
     install_node_tools
     install_citadel_binary
     setup_citadel
     setup_systemd_service
     prepull_vllm
+    prepull_app_runtimes
     start_worker
     print_summary
 
