@@ -299,6 +299,11 @@ Handlers in `internal/jobs/` implement specific job types (shell commands, model
 
 **Capability-Based Queue Routing**: Nodes auto-detect hardware (GPUs via `nvidia-smi`, engines via `docker ps`) and generate tags (e.g., `gpu:rtx3090`, `engine:vllm`). Tags map to Redis Streams queues (`jobs:v1:tag:gpu:rtx3090`) via `capabilities.TagQueueName()`. Capabilities can also be declared manually in the `capabilities:` section of `citadel.yaml`, which takes precedence over auto-detection.
 
+**Job-Type Capability Contract**: `worker.Runner.SupportedJobTypes` is the
+authority for the live handler set after platform, configuration, and permission
+gates. `cmd/work.go` publishes that set as `capabilities.job_types` through the
+status collector; do not infer handler availability from a version threshold.
+
 **Node Installer**: `install.sh` is a standalone script served at `get.aceteam.ai/citadel` that provisions a fresh Ubuntu machine end-to-end (NVIDIA drivers, Docker, citadel binary, systemd service, vLLM pre-pull). `uninstall.sh` reverses it. The Packer template (`packer/`) bakes the same stack into a qcow2 VM image for Proxmox-based fleet deployment.
 
 ### Key Packages
