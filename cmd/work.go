@@ -2849,7 +2849,9 @@ func startManagedServices(ctx context.Context) []startedService {
 
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
-			if err := startNativeService(service.Name, configDir); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startNativeService(service.Name, configDir)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}
@@ -2862,7 +2864,9 @@ func startManagedServices(ctx context.Context) []startedService {
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
-			if err := startService(service.Name, fullComposePath); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startService(service.Name, fullComposePath)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "     Warning: %s: %v\n", service.Name, err)
 				continue
 			}

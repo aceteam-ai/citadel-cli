@@ -105,7 +105,9 @@ func runAllServices() {
 
 		if serviceType == internalServices.ServiceTypeNative {
 			fmt.Printf("🚀 Starting service: %s (native)\n", service.Name)
-			if err := startNativeService(service.Name, configDir); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startNativeService(service.Name, configDir)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
 				fmt.Fprintf(os.Stderr, "   Hint: Run 'citadel logs %s' to see detailed output.\n", service.Name)
 				os.Exit(1)
@@ -118,7 +120,9 @@ func runAllServices() {
 				os.Exit(1)
 			}
 			fmt.Printf("🚀 Starting service: %s\n", service.Name)
-			if err := startService(service.Name, fullComposePath); err != nil {
+			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
+				return startService(service.Name, fullComposePath)
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "   ❌ Failed to start service %s: %v\n", service.Name, err)
 				fmt.Fprintf(os.Stderr, "   Hint: Run 'citadel logs %s' to see detailed output.\n", service.Name)
 				os.Exit(1)
@@ -211,14 +215,7 @@ func runSingleService(serviceName string) {
 	// (mirrors liveModuleOps.Start, #528) so the service starts on the next boot
 	// again. Cleared FIRST so a transiently-failed start still records the
 	// operator's run intent. Best-effort: the service is in the manifest by now.
-	if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
-	}
-
-	// Start the service
-	fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
-
-	if err := startService(serviceName, composePath); err != nil {
+	if err := startRunService(configDir, serviceName, composePath, startService); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to start service '%s': %v\n", serviceName, err)
 		os.Exit(1)
 	}
@@ -228,6 +225,19 @@ func runSingleService(serviceName string) {
 		fmt.Printf("   - To see logs, run: citadel logs %s -f\n", serviceName)
 		fmt.Printf("   - To stop, run: citadel stop %s\n", serviceName)
 	}
+}
+
+// startRunService keeps `citadel run <name>`'s explicit start intent and
+// compose-up in the same fine-tune reservation critical section. The start
+// function is injectable so a denied held tag is tested without Docker.
+func startRunService(configDir, serviceName, composePath string, startFn func(string, string) error) error {
+	return withLocalServiceStartGuard(configDir, serviceName, func() error {
+		if err := setServiceDesiredStatus(configDir, serviceName, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️  Could not clear stopped marker for %s: %v\n", serviceName, err)
+		}
+		fmt.Printf("--- 🚀 Starting service: %s ---\n", serviceName)
+		return startFn(serviceName, composePath)
+	})
 }
 
 // restartAllServices restarts all services defined in the manifest.
@@ -271,9 +281,14 @@ func restartAllServices() {
 
 		restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "restart")
 		composeCmd := composeCommandFor(rt, restartArgs...)
-		output, err := composeCmd.CombinedOutput()
+		var output []byte
+		err = withLocalServiceStartGuard(configDir, service.Name, func() error {
+			var startErr error
+			output, startErr = composeCmd.CombinedOutput()
+			return startErr
+		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %s\n", service.Name, string(output))
+			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %v %s\n", service.Name, err, string(output))
 		} else {
 			fmt.Printf("   ✅ Service %s restarted.\n", service.Name)
 		}
