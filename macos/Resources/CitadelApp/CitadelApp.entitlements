@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference entitlements for Citadel.app. Not wired into a build step — see
+  Resources/CitadelApp/Info.plist's header comment. #672 owns applying these
+  during codesign.
+-->
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox is intentionally OFF: the app spawns the `citadel`
+         binary as a subprocess (CitadelKit/CLIBridge.swift) and connects to
+         an XPC mach service outside its own container
+         (HelperConstants.machServiceName), neither of which a sandboxed app
+         can do without entitlements this app does not otherwise need. -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>
