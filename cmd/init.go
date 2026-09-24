@@ -57,6 +57,8 @@ var fixStatePermissionsFn = network.FixStatePermissions
 // this machine's real citadel-node/config.yaml.
 var nodeConfigDirFn = network.GetNodeConfigDir
 
+const podmanServiceUser = "citadel"
+
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Provisions a fresh server to become a Citadel Node",
@@ -83,6 +85,14 @@ and system user configuration (requires sudo).`,
   # Full provisioning with verbose output (for debugging)
   sudo citadel init --provision --verbose`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// E5 owns migration of existing system workers. This read-only gate must
+		// precede identity, auth, network and configuration writes.
+		if initProvision && platform.IsLinux() {
+			if err := prepareLinuxPodmanProvision(); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+				os.Exit(1)
+			}
+		}
 		// Root is only required for full provisioning (--provision flag)
 		// Default mode only joins the network using embedded tsnet (no root required)
 		if initProvision && !isRoot() {
@@ -408,6 +418,9 @@ and system user configuration (requires sudo).`,
 		}
 
 		originalUser := platform.GetSudoUser()
+		if platform.IsLinux() {
+			originalUser = podmanServiceUser
+		}
 		if originalUser == "" {
 			fmt.Fprintln(os.Stderr, "❌ Could not determine the original user from $SUDO_USER.")
 			os.Exit(1)
@@ -425,6 +438,12 @@ and system user configuration (requires sudo).`,
 		if err := createGlobalConfig(configDir); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to create global system configuration: %v\n", err)
 			os.Exit(1)
+		}
+		if platform.IsLinux() {
+			if err := ownProvisionedLinuxState(configDir); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Could not hand node state to the dedicated worker: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 		// --- 2. Provision System ---
@@ -456,6 +475,11 @@ and system user configuration (requires sudo).`,
 						name     string
 						checkCmd string
 						run      func() error
+					}{"System User", "", setupUser},
+					struct {
+						name     string
+						checkCmd string
+						run      func() error
 					}{"Rootless Podman", "", installRootlessPodmanLinux},
 				)
 			} else {
@@ -467,13 +491,13 @@ and system user configuration (requires sudo).`,
 					}{"Docker", "docker", installDocker},
 				)
 			}
-			provisionSteps = append(provisionSteps,
-				struct {
+			if !platform.IsLinux() {
+				provisionSteps = append(provisionSteps, struct {
 					name     string
 					checkCmd string
 					run      func() error
-				}{"System User", "", setupUser},
-			)
+				}{"System User", "", setupUser})
+			}
 			provisionSteps = append(provisionSteps,
 				struct {
 					name     string
@@ -1647,6 +1671,9 @@ func installDocker() error {
 }
 
 func setupUser() error {
+	if platform.IsLinux() {
+		return ensureDedicatedPodmanUser()
+	}
 	originalUser := platform.GetSudoUser()
 	if originalUser == "" || originalUser == "root" {
 		if initVerbose {
@@ -1669,28 +1696,8 @@ func setupUser() error {
 			return fmt.Errorf("failed to create user %s: %w", originalUser, err)
 		}
 
-		// On Linux, add to sudo group
-		if platform.IsLinux() {
-			if err := userMgr.AddUserToGroup(originalUser, "sudo"); err != nil {
-				if initVerbose {
-					fmt.Printf("     - Warning: Could not add user to sudo group: %v\n", err)
-				}
-			}
-		}
 	} else if initVerbose {
 		fmt.Printf("     - User '%s' already exists.\n", originalUser)
-	}
-
-	// Grant passwordless sudo (Linux only - on macOS/Windows, this is handled differently)
-	if platform.IsLinux() {
-		if initVerbose {
-			fmt.Printf("     - Granting passwordless sudo to user '%s'...\n", originalUser)
-		}
-		sudoersFileContent := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", originalUser)
-		err := os.WriteFile(fmt.Sprintf("/etc/sudoers.d/99-citadel-%s", originalUser), []byte(sudoersFileContent), 0440)
-		if err != nil {
-			return fmt.Errorf("failed to configure passwordless sudo: %w", err)
-		}
 	}
 
 	return nil
@@ -1703,6 +1710,15 @@ func installNvidiaToolkit() error {
 			fmt.Println("     - Skipping NVIDIA Container Toolkit (not required on macOS/Windows).")
 		}
 		return nil
+	}
+	if !hasNvidiaHardwareLinux() {
+		return nil
+	}
+	if isJetsonLinux() {
+		if isCommandAvailable("nvidia-ctk") {
+			return nil
+		}
+		return fmt.Errorf("Jetson/L4T toolkit is missing nvidia-ctk; install the JetPack-matched toolkit, not the generic upstream package")
 	}
 
 	if initVerbose {

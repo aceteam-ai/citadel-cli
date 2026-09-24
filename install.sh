@@ -104,6 +104,15 @@ ok() {
 # Pre-flight
 # ---------------------------------------------------------------------------
 preflight() {
+    # Read-only E5 migration guard: do not even create a log or alter HOME on
+    # an existing system worker. Both historical managed unit names count.
+    local legacy_unit
+    for legacy_unit in /etc/systemd/system/citadel-worker.service /etc/systemd/system/citadel.service; do
+        if [ -e "$legacy_unit" ] || [ -L "$legacy_unit" ]; then
+            printf 'ERROR: Existing system worker %s requires E5 migration; fresh installer made no changes.\n' "$legacy_unit" >&2
+            return 1
+        fi
+    done
     # Must be root
     if [ "$(id -u)" -ne 0 ]; then
         die "This installer must be run as root. Try: curl -fsSL https://get.aceteam.ai/citadel | sudo -E CITADEL_AUTHKEY=xxx bash"
@@ -151,11 +160,6 @@ preflight() {
 
     ok "Architecture: $ARCH"
 
-    # E5 owns the data-preserving migration of running Docker nodes. Replacing
-    # the old root unit here would strand its root-owned volumes and state.
-    if [ -e "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-        die "A legacy system worker unit exists. Keep it running and use 'citadel runtime migrate' when E5 is available; this fresh-node installer will not replace it."
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -182,11 +186,25 @@ resolve_authkey() {
 # GPU detection
 # ---------------------------------------------------------------------------
 HAS_GPU=false
+IS_JETSON=false
+
+is_jetson() {
+    if [ -s /etc/nv_tegra_release ]; then return 0; fi
+    local model
+    for model in /proc/device-tree/model /sys/firmware/devicetree/base/model; do
+        if [ -r "$model" ] && grep -qiE 'jetson|tegra' "$model"; then return 0; fi
+    done
+    return 1
+}
 
 detect_gpu() {
     step "Detecting GPU"
 
-    if grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+    if is_jetson; then
+        HAS_GPU=true
+        IS_JETSON=true
+        ok "Jetson/L4T GPU detected (no PCI or nvidia-smi required)"
+    elif grep -qs '^0x10de$' /sys/bus/pci/devices/*/vendor 2>/dev/null; then
         HAS_GPU=true
         ok "NVIDIA GPU detected (via PCI sysfs)"
     elif lspci 2>/dev/null | grep -qi nvidia; then
@@ -205,6 +223,11 @@ detect_gpu() {
 # ---------------------------------------------------------------------------
 install_nvidia_drivers() {
     if ! $HAS_GPU; then return 0; fi
+
+    if $IS_JETSON; then
+        ok "Keeping JetPack-provided NVIDIA driver and userspace on Jetson/L4T"
+        return 0
+    fi
 
     step "Installing NVIDIA drivers"
 
@@ -247,6 +270,45 @@ as_service_user() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" "$@"
 }
 
+require_service_groups() {
+    local group
+    for group in "$@"; do
+        getent group "$group" >/dev/null || die "Required GPU group ${group} is missing"
+    done
+}
+
+verify_user_manager() {
+    local uid="$1" group pid gid groups controllers
+    shift
+    controllers=$(<"/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers") || die "Cannot read active user-manager delegation"
+    for group in cpu memory pids; do
+        [[ " ${controllers} " == *" ${group} "* ]] || die "Active user manager lacks delegated ${group} controller"
+    done
+    if [ "$#" -eq 0 ]; then return 0; fi
+    pid=$(systemctl show "user@${uid}.service" -p MainPID --value) || die "Cannot inspect active user manager"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "Dedicated user manager is inactive"
+    groups=$(sed -n 's/^Groups:[[:space:]]*//p' "/proc/${pid}/status") || die "Cannot inspect active user-manager groups"
+    for group in "$@"; do
+        gid=$(getent group "$group" | cut -d: -f3) || die "Required group ${group} is missing"
+        [[ " ${groups} " == *" ${gid} "* ]] || die "Active user manager lacks supplementary group ${group}; restart it before worker startup"
+    done
+}
+
+refresh_user_manager() {
+    local uid="$1"
+    shift
+    if systemctl is-active --quiet "user@${uid}.service"; then
+        if as_service_user systemctl --user is-active --quiet "$SERVICE_NAME" ||
+           as_service_user systemctl --user is-active --quiet citadel.service; then
+            die "Existing ${SERVICE_USER} worker is active; refusing to restart its user manager during reprovision"
+        fi
+        systemctl restart "user@${uid}.service" || die "Could not refresh ${SERVICE_USER} user manager"
+    else
+        systemctl start "user@${uid}.service" || die "Could not start ${SERVICE_USER} user manager"
+    fi
+    verify_user_manager "$uid" "$@"
+}
+
 ensure_subid_range() {
     local map_file="$1" kind="$2" start
     if awk -F: -v user="$SERVICE_USER" '$1 == user && $3 >= 65536 {found=1} END {exit !found}' "$map_file"; then
@@ -273,6 +335,16 @@ install_podman() {
         useradd --create-home --shell /bin/bash "$SERVICE_USER" || die "Could not create ${SERVICE_USER} user"
     fi
     [ "$(getent passwd "$SERVICE_USER" | cut -d: -f6)" = "$SERVICE_HOME" ] || die "${SERVICE_USER} must have home ${SERVICE_HOME}"
+    local group
+    for group in $(id -nG "$SERVICE_USER"); do
+        case "$group" in sudo|wheel|docker) die "Dedicated ${SERVICE_USER} user has privileged ${group} membership" ;; esac
+    done
+    if [ -e "/etc/sudoers.d/99-citadel-${SERVICE_USER}" ]; then
+        die "Dedicated ${SERVICE_USER} user has a legacy passwordless sudo grant; remove it before provisioning"
+    fi
+    if runuser -u "$SERVICE_USER" -- sudo -n true >/dev/null 2>&1; then
+        die "Dedicated ${SERVICE_USER} user has passwordless sudo; remove that grant before provisioning"
+    fi
     ensure_subid_range /etc/subuid uid
     ensure_subid_range /etc/subgid gid
 
@@ -285,7 +357,7 @@ UNIT
     loginctl enable-linger "$SERVICE_USER" || die "Could not enable linger for ${SERVICE_USER}"
     local uid
     uid=$(id -u "$SERVICE_USER")
-    systemctl start "user@${uid}.service" || die "Could not start ${SERVICE_USER} user manager"
+    refresh_user_manager "$uid"
     as_service_user systemctl --user enable --now podman.socket >> "$LOG_FILE" 2>&1 || die "Could not enable rootless Podman socket"
     as_service_user podman info >> "$LOG_FILE" 2>&1 || die "Rootless Podman is not usable"
     ok "Rootless Podman ready for ${SERVICE_USER}"
@@ -302,6 +374,9 @@ install_nvidia_toolkit() {
     if command -v nvidia-ctk >/dev/null 2>&1; then
         ok "NVIDIA Container Toolkit already installed"
     else
+        if $IS_JETSON; then
+            die "Jetson/L4T needs its JetPack-matched NVIDIA toolkit (nvidia-ctk); refusing generic upstream package"
+        fi
         msg "Adding NVIDIA container toolkit repository..."
 
         # Add NVIDIA GPG key and repo
@@ -333,7 +408,9 @@ install_nvidia_toolkit() {
     command -v nvidia-ctk >/dev/null || die "NVIDIA toolkit installed without nvidia-ctk"
     # The worker owns only its own GPU access. The CDI spec is shared read-only
     # with Podman; never configure a Docker default runtime on a fresh node.
+    require_service_groups video render
     usermod -aG video,render "$SERVICE_USER" || die "Could not grant ${SERVICE_USER} GPU groups"
+    refresh_user_manager "$(id -u "$SERVICE_USER")" video render
     install -d -m 755 /etc/udev/rules.d /etc/cdi
     cat > /etc/udev/rules.d/70-citadel-nvidia.rules <<'RULE'
 KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
@@ -342,27 +419,40 @@ KERNEL=="nvidia-uvm*", GROUP="video", MODE="0660"
 KERNEL=="nvidia-cap*", GROUP="video", MODE="0660"
 RULE
     udevadm control --reload-rules || die "Could not reload GPU device rules"
+    install -d -m 755 /usr/local/libexec
+    cat > /usr/local/libexec/citadel-nvidia-cdi-refresh <<'SCRIPT'
+#!/bin/sh
+set -eu
+for attempt in $(seq 1 30); do
+    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml &&
+       nvidia-ctk cdi list | grep -F 'nvidia.com/gpu' >/dev/null; then
+        exit 0
+    fi
+    sleep 2
+done
+echo 'NVIDIA CDI devices unavailable after readiness retries' >&2
+exit 1
+SCRIPT
+    chmod 755 /usr/local/libexec/citadel-nvidia-cdi-refresh
     cat > /etc/systemd/system/citadel-nvidia-cdi.service <<'UNIT'
 [Unit]
 Description=Refresh Citadel NVIDIA CDI devices after driver initialization
 After=systemd-udev-settle.service
-ConditionPathExists=/dev/nvidiactl
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+ExecStart=/usr/local/libexec/citadel-nvidia-cdi-refresh
 
 [Install]
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
     systemctl enable citadel-nvidia-cdi.service >> "$LOG_FILE" 2>&1 || die "Could not enable GPU CDI refresh"
-    if nvidia-smi >/dev/null 2>&1; then
-        udevadm trigger --subsystem-match=misc || true
-        nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >> "$LOG_FILE" 2>&1 || die "Could not generate NVIDIA CDI spec"
-        nvidia-ctk cdi list >> "$LOG_FILE" 2>&1 || die "NVIDIA CDI devices unavailable"
+    if nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >> "$LOG_FILE" 2>&1 &&
+       nvidia-ctk cdi list | tee -a "$LOG_FILE" | grep -F 'nvidia.com/gpu' >/dev/null; then
+        ok "NVIDIA CDI devices verified"
     else
-        warn "GPU driver is not active yet; generate /etc/cdi/nvidia.yaml after reboot with sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
+        warn "GPU driver is not ready; boot refresh retries NVIDIA CDI without nvidia-smi"
     fi
     ok "NVIDIA CDI configured"
 }
@@ -669,7 +759,7 @@ print_summary() {
     printf "  sudo -u %s journalctl --user -u %s -f  # follow worker logs\n" "$SERVICE_USER" "$SERVICE_NAME" >&2
     printf "  sudo -u %s systemctl --user restart %s # restart worker\n" "$SERVICE_USER" "$SERVICE_NAME" >&2
 
-    if $HAS_GPU && ! nvidia-smi &>/dev/null; then
+    if $HAS_GPU && ! $IS_JETSON && ! nvidia-smi &>/dev/null; then
         printf "\n" >&2
         warn "NVIDIA drivers were installed but may need a reboot to activate."
         warn "Run: sudo reboot"
@@ -680,7 +770,7 @@ print_summary() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    preflight
+    preflight || exit 1
     resolve_authkey
     detect_gpu
     install_nvidia_drivers
