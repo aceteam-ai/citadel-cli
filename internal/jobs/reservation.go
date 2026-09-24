@@ -93,14 +93,21 @@ type ReservationSummary struct {
 // fine-tune reservation from tagging the service mid-start. Remote
 // SERVICE_START jobs use their existing Runner demand-yield path.
 func (h *ServiceHandler) WithHeldServiceGuard(name string, start func() error) error {
-	return h.withHeldServiceGuard(name, true, start)
+	return h.withHeldServiceGuard(name, true, "", false, start)
+}
+
+// WithHeldServiceGuardIncoming includes the definition about to replace the
+// on-disk compose. The caller must perform every write and start inside fn;
+// checking only the old file would admit a CPU-to-GPU update under a hold.
+func (h *ServiceHandler) WithHeldServiceGuardIncoming(name, incomingComposePath string, incomingRequiresGPU bool, fn func() error) error {
+	return h.withHeldServiceGuard(name, true, incomingComposePath, incomingRequiresGPU, fn)
 }
 
 // A stop may still proceed for an untagged serving module; it only needs to
 // preserve a tag it would otherwise erase. Start operations additionally
 // block any GPU/model-serving service even when it was already stopped and
 // therefore had no eviction tag.
-func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, mutation func() error) error {
+func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, incomingComposePath string, incomingRequiresGPU bool, mutation func() error) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("local service start: name is required")
 	}
@@ -112,7 +119,10 @@ func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, 
 		if held {
 			manifest, err := h.loadManifest()
 			if err != nil {
-				return fmt.Errorf("local service start %s: cannot inspect held reservation: %w", name, err)
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("local service start %s: cannot inspect held reservation: %w", name, err)
+				}
+				manifest = &serviceManifest{}
 			}
 			for _, service := range manifest.Services {
 				if service.Name == name && service.EvictedByJob == holdJob {
@@ -120,7 +130,24 @@ func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, 
 				}
 			}
 			if blockGPUDemand {
-				gpu, inspectErr := h.serviceMayDemandGPU(name, manifest)
+				if incomingRequiresGPU {
+					return fmt.Errorf("local service start %s: incoming service is reserved by active fine-tune job; verified cleanup required", name)
+				}
+				incomingKnown := incomingComposePath != ""
+				if incomingKnown {
+					contents, readErr := os.ReadFile(incomingComposePath)
+					if readErr != nil {
+						return fmt.Errorf("local service start %s: cannot inspect incoming compose: %w", name, readErr)
+					}
+					incomingGPU, parseErr := catalog.ComposeDeclaresGPU(string(contents))
+					if parseErr != nil {
+						return fmt.Errorf("local service start %s: cannot parse incoming compose: %w", name, parseErr)
+					}
+					if incomingGPU {
+						return fmt.Errorf("local service start %s: incoming service is reserved by active fine-tune job; verified cleanup required", name)
+					}
+				}
+				gpu, inspectErr := h.serviceMayDemandGPU(name, manifest, incomingKnown)
 				if inspectErr != nil {
 					return fmt.Errorf("local service start %s: cannot prove service is non-GPU while fine-tune is active: %w", name, inspectErr)
 				}
@@ -139,7 +166,7 @@ func (h *ServiceHandler) withHeldServiceGuard(name string, blockGPUDemand bool, 
 // budget and both embedded/on-disk compose GPU declarations. Catalog requires
 // metadata catches catalog-only modules. Unknown custom services with no
 // inspectable compose or catalog metadata fail closed under an active hold.
-func (h *ServiceHandler) serviceMayDemandGPU(name string, manifest *serviceManifest) (bool, error) {
+func (h *ServiceHandler) serviceMayDemandGPU(name string, manifest *serviceManifest, incomingKnown bool) (bool, error) {
 	if finetunesafety.CouldEvict(name) || status.EngineVRAMEstimateMB(name) > 0 {
 		return true, nil
 	}
@@ -182,10 +209,10 @@ func (h *ServiceHandler) serviceMayDemandGPU(name string, manifest *serviceManif
 		if definition.Requires.GPU || definition.Requires.VRAMMinGB > 0 {
 			return true, nil
 		}
-	} else if !errors.Is(err, catalog.ErrServiceNotFound) && !inspected {
+	} else if !errors.Is(err, catalog.ErrServiceNotFound) {
 		return false, fmt.Errorf("inspect catalog metadata: %w", err)
 	}
-	if !inspected {
+	if !inspected && !incomingKnown {
 		return false, fmt.Errorf("no inspectable GPU declaration for %q", name)
 	}
 	return false, nil

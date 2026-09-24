@@ -278,7 +278,7 @@ func (h *ServiceHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error)
 		// trainer for it. Keep a held fine-tune tag intact; otherwise a
 		// subsequent local start would no longer know this service is reserved.
 		var result []byte
-		err := h.withHeldServiceGuard(svc.Name, false, func() error {
+		err := h.withHeldServiceGuard(svc.Name, false, "", false, func() error {
 			// A remote SERVICE_STOP is operator/cloud intent: mark the service
 			// durably stopped FIRST (mirrors liveModuleOps.Stop) so the stop
 			// survives a worker restart / reboot even if the compose down below is

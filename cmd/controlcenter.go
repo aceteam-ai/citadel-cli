@@ -1853,23 +1853,19 @@ func ccGetServiceLogs(name string) ([]string, error) {
 
 // ccAddService adds a new service to the manifest and extracts its compose file
 func ccAddService(name string) error {
-	// Find or create config directory
-	_, configDir, err := findOrCreateManifest()
+	configDir, err := localServiceConfigDir()
 	if err != nil {
 		return fmt.Errorf("failed to get config directory: %w", err)
 	}
-
-	// Ensure compose file exists
-	if err := ensureComposeFile(configDir, name); err != nil {
-		return err
-	}
-
-	// Add to manifest
-	if err := addServiceToManifest(configDir, name); err != nil {
-		return err
-	}
-
-	return nil
+	return withLocalServiceStartGuard(configDir, name, func() error {
+		if _, _, err := findOrCreateManifest(); err != nil {
+			return err
+		}
+		if err := ensureComposeFile(configDir, name); err != nil {
+			return err
+		}
+		return addServiceToManifest(configDir, name)
+	})
 }
 
 // ccGetConfiguredServices returns the list of services already configured in the manifest

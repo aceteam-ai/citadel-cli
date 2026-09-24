@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/reconcile"
@@ -237,4 +238,153 @@ func TestFineTuneHeldTagBlocksUpdateRefreshAndGatewaySwapStarts(t *testing.T) {
 		t.Fatalf("gateway swap start under hold = %v", err)
 	}
 	assertHeldTagUnchanged(t, configDir)
+}
+
+func TestFineTuneIncomingGPUInstallRefusesBeforeMutation(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "fresh", true: "cpu-to-gpu"}[existing], func(t *testing.T) {
+			services := []Service{{Name: "paw-compile", Type: "docker", ComposeFile: "services/paw-compile.yml"}}
+			if existing {
+				services = append(services, Service{Name: "custom-model", Type: "docker", ComposeFile: "services/custom-model.yml"})
+			}
+			configDir := writeManifestWithServices(t, services)
+			if err := os.WriteFile(filepath.Join(configDir, "services", "paw-compile.yml"), []byte("services:\n  paw-compile:\n    image: example/cpu\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if existing {
+				if err := os.WriteFile(filepath.Join(configDir, "services", "custom-model.yml"), []byte("services:\n  custom-model:\n    image: example/cpu\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			incoming := filepath.Join(t.TempDir(), "incoming.yml")
+			if err := os.WriteFile(incoming, []byte("services:\n  custom-model:\n    image: example/gpu\n    gpus: all\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ops, calls := newControlTestOps(map[string]bool{})
+			ops.resolveSource = func(catalog.Source) (*catalog.ServiceManifest, string, *catalog.ResolvedModule, error) {
+				return &catalog.ServiceManifest{Name: "custom-model"}, incoming, nil, nil
+			}
+			if err := ops.Install(context.Background(), reconcile.ModuleAssignment{Source: "custom-model"}); err == nil {
+				t.Fatal("incoming GPU install admitted under hold")
+			}
+			if len(*calls) != 0 {
+				t.Fatalf("incoming GPU install touched runtime: %v", *calls)
+			}
+			after, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
+			if err != nil || string(before) != string(after) {
+				t.Fatalf("manifest changed: %v", err)
+			}
+			if existing {
+				got, err := os.ReadFile(filepath.Join(configDir, "services", "custom-model.yml"))
+				if err != nil || strings.Contains(string(got), "gpus:") {
+					t.Fatalf("old CPU compose changed: %q %v", got, err)
+				}
+			} else if _, err := os.Stat(filepath.Join(configDir, "services", "custom-model.yml")); !os.IsNotExist(err) {
+				t.Fatalf("fresh GPU compose materialized: %v", err)
+			}
+		})
+	}
+}
+
+func TestFineTuneExplicitRunAndTUIAddRefuseBeforeMaterialization(t *testing.T) {
+	configDir := writeManifestWithServices(t, nil)
+	if err := os.MkdirAll(finetunesafety.Dir(configDir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(configDir), []byte("train-job"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runSingleServiceApply(configDir, "vllm", func(string, string) error { t.Fatal("run reached start"); return nil }); err == nil {
+		t.Fatal("held run admitted")
+	}
+	if err := ccAddService("vllm"); err == nil {
+		t.Fatal("held TUI add admitted")
+	}
+	if _, err := os.Stat(filepath.Join(configDir, "services", "vllm.yml")); !os.IsNotExist(err) {
+		t.Fatalf("GPU compose materialized: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("manifest changed: %v", err)
+	}
+}
+
+func TestFineTuneCPUStartSerializesWithIncomingUpdateAndInstallWriter(t *testing.T) {
+	configDir := heldFineTuneModuleFixture(t)
+	path := filepath.Join(configDir, "services", "paw-compile.yml")
+	incoming := filepath.Join(t.TempDir(), "gpu.yml")
+	gpuCompose := []byte("services:\n  paw-compile:\n    image: example/gpu\n    gpus: all\n")
+	if err := os.WriteFile(incoming, gpuCompose, 0600); err != nil {
+		t.Fatal(err)
+	}
+	entered, finish := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- withLocalServiceStartGuard(configDir, "paw-compile", func() error { close(entered); <-finish; return nil })
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CPU start did not enter")
+	}
+	updateCalled := false
+	if err := withModuleUpdateTransaction(configDir, "paw-compile", &catalog.ServiceManifest{Name: "paw-compile"}, incoming, func() error { updateCalled = true; return os.WriteFile(path, gpuCompose, 0600) }); err == nil || updateCalled {
+		t.Fatalf("GPU update interleaved with CPU start: called=%t err=%v", updateCalled, err)
+	}
+	writerCalled := false
+	if err := withLocalServiceMutationLock(configDir, func() error { writerCalled = true; return os.WriteFile(path, gpuCompose, 0600) }); err == nil || writerCalled {
+		t.Fatalf("no-start installer overwrote CPU compose mid-start: called=%t err=%v", writerCalled, err)
+	}
+	close(finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CPU start hung")
+	}
+	if err := withModuleUpdateTransaction(configDir, "paw-compile", &catalog.ServiceManifest{Name: "paw-compile"}, incoming, func() error { t.Fatal("held GPU update mutation reached"); return nil }); err == nil {
+		t.Fatal("GPU update admitted after CPU start")
+	}
+	if err := withLocalServiceMutationLock(configDir, func() error { return os.WriteFile(path, gpuCompose, 0600) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := withLocalServiceStartGuard(configDir, "paw-compile", func() error { t.Fatal("GPU file started after installer overwrite"); return nil }); err == nil {
+		t.Fatal("GPU file did not invalidate subsequent start")
+	}
+}
+
+func TestFineTuneHeldComposeRefreshDefersBeforeRewrite(t *testing.T) {
+	configDir := heldFineTuneModuleFixture(t)
+	called := 0
+	sweep := func(composerefresh.Options) (composerefresh.Result, error) {
+		called++
+		return composerefresh.Result{}, nil
+	}
+	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	if called != 0 {
+		t.Fatal("compose refresh rewrote under fine-tune hold")
+	}
+	if err := os.Remove(finetunesafety.Path(configDir)); err != nil {
+		t.Fatal(err)
+	}
+	refreshManagedComposeFilesWithSweep(configDir, sweep)
+	if called != 1 {
+		t.Fatalf("compose refresh did not resume after hold: %d", called)
+	}
 }

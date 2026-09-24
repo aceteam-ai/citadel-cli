@@ -148,6 +148,13 @@ func TestHeldGuardInspectsCustomComposeAndCatalogGPURequirements(t *testing.T) {
 	if err := h.WithHeldServiceGuard("custom-cpu", func() error { called = true; return nil }); err != nil || !called {
 		t.Fatalf("custom CPU wrongly blocked: called=%t err=%v", called, err)
 	}
+	malformedCatalogDir := filepath.Join(catalog.GetCatalogPath(), "services", "custom-cpu")
+	if err := os.MkdirAll(malformedCatalogDir, 0700); err != nil { t.Fatal(err) }
+	if err := os.WriteFile(filepath.Join(malformedCatalogDir, "service.yaml"), []byte("requires: [malformed"), 0600); err != nil { t.Fatal(err) }
+	if err := h.WithHeldServiceGuard("custom-cpu", func() error { t.Fatal("malformed catalog metadata admitted"); return nil }); err == nil {
+		t.Fatal("malformed catalog metadata did not fail closed against CPU compose")
+	}
+	if err := os.Remove(filepath.Join(malformedCatalogDir, "service.yaml")); err != nil { t.Fatal(err) }
 	if err := os.WriteFile(filepath.Join(servicesDir, "custom-cpu.yml"), []byte("services: [malformed"), 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -198,63 +198,71 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Find or create the node manifest to get the services directory.
-	nodeManifest, configDir, err := findOrCreateManifest()
+	// Acquire the shared mutation lock before even bootstrapping the manifest:
+	// a guarded CPU start must not classify an old compose while this install
+	// replaces it with a GPU definition.
+	configDir, err := localServiceConfigDir()
 	if err != nil {
-		return fmt.Errorf("failed to initialize configuration: %w", err)
+		return fmt.Errorf("failed to resolve configuration: %w", err)
 	}
-	if hasService(nodeManifest, manifest.Name) {
-		fmt.Printf("Module '%s' is already in the node manifest.\n", manifest.Name)
-		return nil
-	}
-
-	servicesDir := filepath.Join(configDir, "services")
-
-	// Untrusted (Tier-2) sources get the least-privilege sandbox: bind-mount
-	// confinement + a generated hardening override. Trusted (Tier 0/1) run as-is.
-	// --no-harden opts out of the override (not the bind-mount confinement).
-	untrusted := !trusted
-	if untrusted {
-		if moduleNoHarden {
-			fmt.Printf("\n%s\n", color.YellowString("--no-harden: skipping the least-privilege sandbox override "+
-				"(bind-mount confinement still applies). GPU/inference services are exempt regardless."))
-		} else {
-			fmt.Printf("\n%s\n", color.YellowString("Applying least-privilege sandbox (drop caps, no-new-privileges, "+
-				"read-only rootfs, resource limits). GPU/inference services are exempt."))
+	return withLocalServiceMutationLock(configDir, func() error {
+		nodeManifest, _, err := findOrCreateManifest()
+		if err != nil {
+			return fmt.Errorf("failed to initialize configuration: %w", err)
 		}
-	}
+		if hasService(nodeManifest, manifest.Name) {
+			fmt.Printf("Module '%s' is already in the node manifest.\n", manifest.Name)
+			return nil
+		}
 
-	fmt.Printf("\nInstalling %s ...\n", manifest.Name)
-	result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged, untrusted, moduleNoHarden)
-	if err != nil {
-		return fmt.Errorf("install failed: %w", err)
-	}
+		servicesDir := filepath.Join(configDir, "services")
 
-	// Register in the node manifest, merging the module's declared routing tags
-	// so a third-party engine becomes routable without a CLI change.
-	if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
-		return fmt.Errorf("failed to update manifest: %w", err)
-	}
+		// Untrusted (Tier-2) sources get the least-privilege sandbox: bind-mount
+		// confinement + a generated hardening override. Trusted (Tier 0/1) run as-is.
+		// --no-harden opts out of the override (not the bind-mount confinement).
+		untrusted := !trusted
+		if untrusted {
+			if moduleNoHarden {
+				fmt.Printf("\n%s\n", color.YellowString("--no-harden: skipping the least-privilege sandbox override "+
+					"(bind-mount confinement still applies). GPU/inference services are exempt regardless."))
+			} else {
+				fmt.Printf("\n%s\n", color.YellowString("Applying least-privilege sandbox (drop caps, no-new-privileges, "+
+					"read-only rootfs, resource limits). GPU/inference services are exempt."))
+			}
+		}
 
-	// Record provenance into the lockfile (best-effort: never fail the install),
-	// carrying the verified-signature flag computed above and whether a sandbox
-	// override was written.
-	recordModuleLock(src, resolved, lockImages, result.Sandboxed)
+		fmt.Printf("\nInstalling %s ...\n", manifest.Name)
+		result, err := catalog.InstallFromManifest(manifest, resolved.ComposePath, servicesDir, overrides, true, moduleAllowPrivileged, untrusted, moduleNoHarden)
+		if err != nil {
+			return fmt.Errorf("install failed: %w", err)
+		}
 
-	fmt.Printf("\nInstalled %s successfully.\n", result.Name)
-	fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
-	if result.EnvDestPath != "" {
-		fmt.Printf("  Config:  %s\n", result.EnvDestPath)
-	}
-	if result.Sandboxed {
-		fmt.Printf("  Sandbox: %s\n", result.SandboxOverridePath)
-	}
-	if len(manifest.NodeTags) > 0 {
-		fmt.Printf("  Routing tags: %s\n", strings.Join(manifest.NodeTags, ", "))
-	}
-	fmt.Printf("\nTo start the module:\n")
-	fmt.Printf("  citadel run %s\n", result.Name)
-	return nil
+		// Register in the node manifest, merging the module's declared routing tags
+		// so a third-party engine becomes routable without a CLI change.
+		if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
+			return fmt.Errorf("failed to update manifest: %w", err)
+		}
+
+		// Record provenance into the lockfile (best-effort: never fail the install),
+		// carrying the verified-signature flag computed above and whether a sandbox
+		// override was written.
+		recordModuleLock(src, resolved, lockImages, result.Sandboxed)
+
+		fmt.Printf("\nInstalled %s successfully.\n", result.Name)
+		fmt.Printf("  Compose: %s\n", result.ComposeDestPath)
+		if result.EnvDestPath != "" {
+			fmt.Printf("  Config:  %s\n", result.EnvDestPath)
+		}
+		if result.Sandboxed {
+			fmt.Printf("  Sandbox: %s\n", result.SandboxOverridePath)
+		}
+		if len(manifest.NodeTags) > 0 {
+			fmt.Printf("  Routing tags: %s\n", strings.Join(manifest.NodeTags, ", "))
+		}
+		fmt.Printf("\nTo start the module:\n")
+		fmt.Printf("  citadel run %s\n", result.Name)
+		return nil
+	})
 }
 
 // recordModuleLock upserts a provenance entry for a freshly resolved+installed
@@ -745,14 +753,9 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 				return "", err
 			}
 
-			nodeManifest, configDir, err := findOrCreateManifest()
+			configDir, err := localServiceConfigDir()
 			if err != nil {
 				return "", err
-			}
-			// Parity with the CLI: report an already-installed module cleanly
-			// instead of letting it surface as a confusing port conflict.
-			if hasService(nodeManifest, manifest.Name) {
-				return "", fmt.Errorf("module '%s' is already in the node manifest", manifest.Name)
 			}
 			servicesDir := filepath.Join(configDir, "services")
 
@@ -784,19 +787,29 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			// Untrusted (Tier-2) sources get the least-privilege sandbox in the
 			// shared core, matching the CLI path. Catalog/trusted run as-is.
 			untrusted := !catalog.IsTrusted(src)
-			result, err := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow, untrusted, false)
-			if err != nil {
-				return "", err
-			}
-			// Merge the module's declared routing tags so it becomes routable.
-			if err := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); err != nil {
-				return "", fmt.Errorf("failed to update manifest: %w", err)
-			}
-			// Record provenance for external sources (best-effort).
-			if resolved != nil {
-				recordModuleLock(src, resolved, lockImages, result.Sandboxed)
-			}
-			return result.Name, nil
+			var installedName string
+			err = withLocalServiceMutationLock(configDir, func() error {
+				nodeManifest, _, manifestErr := findOrCreateManifest()
+				if manifestErr != nil {
+					return manifestErr
+				}
+				if hasService(nodeManifest, manifest.Name) {
+					return fmt.Errorf("module '%s' is already in the node manifest", manifest.Name)
+				}
+				result, installErr := catalog.InstallFromManifest(manifest, composeSrc, servicesDir, overrides, false, allow, untrusted, false)
+				if installErr != nil {
+					return installErr
+				}
+				if registerErr := addServiceToManifestWithTags(configDir, result.Name, manifest.NodeTags); registerErr != nil {
+					return fmt.Errorf("failed to update manifest: %w", registerErr)
+				}
+				if resolved != nil {
+					recordModuleLock(src, resolved, lockImages, result.Sandboxed)
+				}
+				installedName = result.Name
+				return nil
+			})
+			return installedName, err
 		},
 	}
 }
