@@ -2,23 +2,71 @@ mod auth;
 mod node;
 
 use auth::{AuthState, AuthView};
-use tauri::{AppHandle, State};
+use serde::Serialize;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_opener::OpenerExt;
 
-#[tauri::command]
-fn begin_login(app: AppHandle) -> Result<(), String> {
-    app.opener()
-        .open_url(auth::login_url(), None::<&str>)
-        .map_err(|_| "Could not open the browser for sign in".to_string())
+#[derive(Clone, Serialize)]
+struct AuthEvent {
+    view: Option<AuthView>,
+    error: Option<String>,
+}
+
+fn handle_auth_urls(app: AppHandle, urls: Vec<url::Url>, last: Arc<Mutex<Option<String>>>) {
+    for url in urls {
+        if url.scheme() != "citadel" {
+            continue;
+        }
+        let raw = url.to_string();
+        if let Ok(mut seen) = last.lock() {
+            if seen.as_deref() == Some(raw.as_str()) {
+                continue;
+            }
+            *seen = Some(raw.clone());
+        }
+        let app_for_exchange = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let auth = app_for_exchange.state::<AuthState>();
+            let result = auth.exchange_callback(&raw).await;
+            let event = match result {
+                Ok(view) => AuthEvent {
+                    view: Some(view),
+                    error: None,
+                },
+                Err(error) => AuthEvent {
+                    view: None,
+                    error: Some(error),
+                },
+            };
+            let _ = app_for_exchange.emit("citadel:auth", event);
+        });
+    }
 }
 
 #[tauri::command]
-async fn complete_login(
+async fn begin_login(app: AppHandle, auth: State<'_, AuthState>) -> Result<(), String> {
+    let url = auth.begin_login().await?;
+    if app.opener().open_url(url, None::<&str>).is_err() {
+        let _ = auth.cancel_login().await;
+        return Err("Could not open the browser for sign in".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_login(auth: State<'_, AuthState>) -> Result<(), String> {
+    auth.cancel_login().await
+}
+
+#[tauri::command]
+async fn verify_mfa(
     auth: State<'_, AuthState>,
-    callback_url: String,
+    factor_id: String,
+    code: String,
 ) -> Result<AuthView, String> {
-    let code = auth::code_from_callback(&callback_url)?;
-    auth.exchange_code(&code).await
+    auth.verify_mfa(&factor_id, &code).await
 }
 
 #[tauri::command]
@@ -45,9 +93,18 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AuthState::new())
         .manage(node::InitState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let last = Arc::new(Mutex::new(None));
+            app.deep_link().on_open_url(move |event| {
+                handle_auth_urls(handle.clone(), event.urls(), last.clone());
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             begin_login,
-            complete_login,
+            cancel_login,
+            verify_mfa,
             session_status,
             sign_out,
             node::list_nodes,
@@ -57,7 +114,16 @@ pub fn run() {
             node::service_action,
             node::diagnostics,
             node::init_this_computer,
+            node::cancel_init,
         ])
-        .run(tauri::generate_context!())
-        .expect("Citadel desktop failed to start");
+        .build(tauri::generate_context!())
+        .expect("Citadel desktop failed to start")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                app.state::<node::InitState>().cancel();
+            }
+        });
 }

@@ -3,14 +3,47 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_shell::{process::CommandEvent, ShellExt};
+use tauri_plugin_shell::{
+    process::{CommandChild, CommandEvent},
+    ShellExt,
+};
+use tokio::sync::watch;
 
-pub struct InitState(pub AtomicBool);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(180);
+
+pub struct InitState {
+    active: AtomicBool,
+    cancelled: AtomicBool,
+    child: Mutex<Option<CommandChild>>,
+    cancel_signal: watch::Sender<bool>,
+}
 
 impl Default for InitState {
     fn default() -> Self {
-        Self(AtomicBool::new(false))
+        Self {
+            active: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            child: Mutex::new(None),
+            cancel_signal: watch::channel(false).0,
+        }
+    }
+}
+
+impl InitState {
+    pub fn cancel(&self) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel_signal.send_replace(true);
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(process) = child.take() {
+                let _ = process.kill();
+            }
+        }
     }
 }
 
@@ -113,12 +146,15 @@ pub fn init_this_computer(
         return Err("Enter a node name of at most 64 characters".to_string());
     }
     if state
-        .0
+        .active
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return Err("Node setup is already running".to_string());
     }
+    state.cancelled.store(false, Ordering::SeqCst);
+    state.cancel_signal.send_replace(false);
+    let mut cancel_rx = state.cancel_signal.subscribe();
     let command = match sidecar(&app) {
         Ok(command) => command.args([
             "init",
@@ -129,44 +165,83 @@ pub fn init_this_computer(
             name,
         ]),
         Err(error) => {
-            state.0.store(false, Ordering::SeqCst);
+            state.active.store(false, Ordering::SeqCst);
             return Err(error);
         }
     };
     let (mut receiver, child) = match command.spawn() {
         Ok(pair) => pair,
         Err(_) => {
-            state.0.store(false, Ordering::SeqCst);
+            state.active.store(false, Ordering::SeqCst);
             return Err("Could not start the bundled Citadel node helper".to_string());
         }
     };
+    match state.child.lock() {
+        Ok(mut slot) => *slot = Some(child),
+        Err(_) => {
+            let _ = child.kill();
+            state.active.store(false, Ordering::SeqCst);
+            return Err("Node setup state is unavailable".to_string());
+        }
+    }
+    if state.cancelled.load(Ordering::SeqCst) {
+        state.cancel();
+    }
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut child = Some(child);
         emit(&app_for_task, "registering", "Registering this computer");
         let mut approved = false;
         let mut exit_code = None;
         let mut had_error = false;
-        while let Some(event) = receiver.recv().await {
+        let timeout = tokio::time::sleep(SETUP_TIMEOUT);
+        tokio::pin!(timeout);
+        loop {
+            let state = app_for_task.state::<InitState>();
+            if state.cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            let event = tokio::select! {
+                biased;
+                _ = cancel_rx.changed() => break,
+                _ = &mut timeout => {
+                    had_error = true;
+                    emit(&app_for_task, "error", "Node setup timed out. Please try again");
+                    break;
+                }
+                event = receiver.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
             match event {
                 CommandEvent::Stdout(bytes) if !approved => {
                     if let Some(code) = code_from_line(&String::from_utf8_lossy(&bytes)) {
+                        if state.cancelled.load(Ordering::SeqCst) {
+                            break;
+                        }
                         approved = true;
                         emit(&app_for_task, "approving", "Approving this computer");
                         let auth = app_for_task.state::<AuthState>();
-                        if auth
-                            .request(
-                                Method::POST,
-                                "/api/fabric/device-auth/approve",
-                                Some(json!({ "user_code": code })),
-                            )
-                            .await
-                            .is_err()
-                        {
-                            had_error = true;
-                            if let Some(process) = child.take() {
-                                let _ = process.kill();
+                        let approval = auth.request(
+                            Method::POST,
+                            "/api/fabric/device-auth/approve",
+                            Some(json!({ "user_code": code })),
+                        );
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel_rx.changed() => break,
+                            _ = &mut timeout => {
+                                had_error = true;
+                                emit(&app_for_task, "error", "Node setup timed out. Please try again");
+                                break;
                             }
+                            result = approval => result,
+                        };
+                        if state.cancelled.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if result.is_err() {
+                            had_error = true;
                             emit(
                                 &app_for_task,
                                 "error",
@@ -181,7 +256,17 @@ pub fn init_this_computer(
                 _ => {}
             }
         }
-        if !had_error && exit_code == Some(0) {
+        let state = app_for_task.state::<InitState>();
+        if let Ok(mut slot) = state.child.lock() {
+            if let Some(process) = slot.take() {
+                if exit_code != Some(0) {
+                    let _ = process.kill();
+                }
+            }
+        }
+        if state.cancelled.load(Ordering::SeqCst) {
+            emit(&app_for_task, "cancelled", "Node setup cancelled");
+        } else if !had_error && exit_code == Some(0) {
             emit(
                 &app_for_task,
                 "ready",
@@ -194,17 +279,20 @@ pub fn init_this_computer(
                 format!("Node setup stopped ({})", exit_code.unwrap_or(-1)),
             );
         }
-        app_for_task
-            .state::<InitState>()
-            .0
-            .store(false, Ordering::SeqCst);
+        state.active.store(false, Ordering::SeqCst);
     });
     Ok(())
 }
 
+#[tauri::command]
+pub fn cancel_init(state: State<'_, InitState>) {
+    state.cancel();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::code_from_line;
+    use super::{code_from_line, InitState};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn parses_only_the_device_auth_line() {
@@ -217,5 +305,16 @@ mod tests {
             None
         );
         assert_eq!(code_from_line("ABCDis-1234"), None);
+    }
+
+    #[test]
+    fn cancellation_signals_an_active_setup() {
+        let state = InitState::default();
+        let receiver = state.cancel_signal.subscribe();
+        state.active.store(true, Ordering::SeqCst);
+        state.cancel();
+        assert!(state.cancelled.load(Ordering::SeqCst));
+        assert!(receiver.has_changed().unwrap());
+        assert!(*receiver.borrow());
     }
 }

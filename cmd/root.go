@@ -7,7 +7,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -76,6 +75,22 @@ func Log(format string, args ...interface{}) {
 // It always logs to file, and prints to console only if --debug is enabled.
 func Debug(format string, args ...interface{}) {
 	Log(format, args...)
+}
+
+func invocationSummary(cmd *cobra.Command, args []string) string {
+	fullCmd := "citadel"
+	if cmd.Name() != "citadel" {
+		fullCmd += " " + cmd.Name()
+	}
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		if f.Name != "debug" {
+			fullCmd += " --" + f.Name
+		}
+	})
+	if len(args) > 0 {
+		fullCmd += fmt.Sprintf(" (%d positional arguments)", len(args))
+	}
+	return fullCmd
 }
 
 // rootCmd represents the base command when called without any subcommands
@@ -150,25 +165,7 @@ control center. All other subcommands are for scripting and advanced use.`,
 		}
 
 		// Always log the command (Log() handles console output based on --debug)
-		fullCmd := "citadel"
-		if cmd.Name() != "citadel" {
-			fullCmd += " " + cmd.Name()
-		}
-		// Add flags that were set
-		cmd.Flags().Visit(func(f *pflag.Flag) {
-			if f.Name == "debug" {
-				return // Skip the debug flag itself
-			}
-			if f.Value.Type() == "bool" {
-				fullCmd += " --" + f.Name
-			} else {
-				fullCmd += " --" + f.Name + "=" + f.Value.String()
-			}
-		})
-		if len(args) > 0 {
-			fullCmd += " " + strings.Join(args, " ")
-		}
-		Log("command: %s", fullCmd)
+		Log("command: %s", invocationSummary(cmd, args))
 
 		// Check for updates (skip for update/version/help commands). A bare
 		// non-interactive invocation has a stable one-line status contract; a

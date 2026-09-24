@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "Citadel node cockpit",
   "windows": ["main"],
-  "permissions": ["core:default", "deep-link:default"]
+  "permissions": ["core:default"]
 }

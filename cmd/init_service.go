@@ -61,7 +61,7 @@ func maybeInstallDarwinNodeService(choice nexus.NetworkChoice) {
 		fmt.Fprintf(os.Stderr, "⚠️  Could not resolve service config for launchd install: %v\n", err)
 		return
 	}
-	cfg.Args = []string{"work"}
+	// DefaultConfig adds the managed-helper update guard for the desktop app.
 	// Root -> system LaunchDaemon (boot-time); non-root -> user LaunchAgent
 	// (login-time). Never a gui/0 LaunchAgent for root (that GUI domain doesn't
 	// exist).

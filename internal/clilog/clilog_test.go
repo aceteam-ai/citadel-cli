@@ -120,3 +120,29 @@ func TestLatestSymlinkPointsAtToday(t *testing.T) {
 		t.Errorf("latest.log -> %q, want citadel-2026-06-29.log", target)
 	}
 }
+
+func TestWriteRestrictsExistingLogs(t *testing.T) {
+	day := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+	dir := reset(t, day)
+	old := filepath.Join(dir, "citadel-2026-06-28.log")
+	if err := os.WriteFile(old, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	Write("", "current")
+	for _, path := range []string{dir, old, Path()} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := os.FileMode(0o600)
+		if path == dir {
+			want = 0o700
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %o, want %o", path, got, want)
+		}
+	}
+}

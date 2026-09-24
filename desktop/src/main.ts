@@ -1,11 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { listen } from "@tauri-apps/api/event";
 import "./style.css";
 
 interface AuthView {
   signed_in: boolean;
   email: string | null;
+  mfa_pending: boolean;
+  factors: { id: string; friendly_name: string | null }[];
 }
+
+const signedOut = (): AuthView => ({ signed_in: false, email: null, mfa_pending: false, factors: [] });
 
 interface FabricNode {
   id: number | string;
@@ -34,19 +38,21 @@ const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Missing app root");
 
 const state = {
-  auth: { signed_in: false, email: null } as AuthView,
+  auth: signedOut(),
   nodes: [] as FabricNode[],
   local: null as LocalStatus | null,
   service: "",
   nodeName: "",
   pairCode: "",
   setup: "",
+  setupRunning: false,
   notice: "",
   busy: false,
   diagnostics: "",
+  loginStarted: false,
+  mfaFactor: "",
+  mfaCode: "",
 };
-const handledCallbacks = new Set<string>();
-
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -109,17 +115,6 @@ async function refresh(): Promise<void> {
   render();
 }
 
-async function acceptCallback(url: string): Promise<void> {
-  if (!url.startsWith("citadel://auth/callback?")) return;
-  if (handledCallbacks.has(url)) return;
-  handledCallbacks.add(url);
-  await action(async () => {
-    state.auth = await invoke<AuthView>("complete_login", { callbackUrl: url });
-    state.notice = "Signed in. Your nodes are loading.";
-    await refresh();
-  });
-}
-
 function renderWelcome(main: HTMLElement): void {
   const welcome = document.createElement("div");
   welcome.className = "welcome card";
@@ -128,9 +123,69 @@ function renderWelcome(main: HTMLElement): void {
     text("p", "CITADEL", "eyebrow"),
     text("h1", "Your hardware. Your AI."),
     text("p", "Connect your computer or a Citadel box to AceTeam, then watch it work from one place.", "muted"),
-    button("Sign in to AceTeam", () => action(async () => invoke("begin_login")), "primary"),
+    button("Sign in to AceTeam", () => action(async () => {
+      await invoke("begin_login");
+      state.loginStarted = true;
+      state.notice = "Finish sign in in your browser.";
+    }), "primary"),
   );
+  if (state.loginStarted) welcome.append(button("Cancel sign in", () => action(async () => {
+    try {
+      await invoke("cancel_login");
+    } finally {
+      state.loginStarted = false;
+      state.auth = signedOut();
+    }
+  }), "quiet"));
   main.append(welcome);
+}
+
+function renderMfa(main: HTMLElement): void {
+  const section = card("Verify sign in", "Enter a code from the authenticator for this AceTeam account.");
+  const factors = document.createElement("select");
+  factors.setAttribute("aria-label", "Authenticator");
+  if (!state.auth.factors.some((factor) => factor.id === state.mfaFactor)) {
+    state.mfaFactor = state.auth.factors[0]?.id ?? "";
+  }
+  for (const factor of state.auth.factors) {
+    const option = document.createElement("option");
+    option.value = factor.id;
+    option.textContent = factor.friendly_name || "Authenticator";
+    option.selected = factor.id === state.mfaFactor;
+    factors.append(option);
+  }
+  factors.addEventListener("change", () => { state.mfaFactor = factors.value; });
+  const code = document.createElement("input");
+  code.inputMode = "numeric";
+  code.autocomplete = "one-time-code";
+  code.maxLength = 8;
+  code.placeholder = "Verification code";
+  code.setAttribute("aria-label", "Verification code");
+  code.value = state.mfaCode;
+  code.addEventListener("input", () => { state.mfaCode = code.value; });
+  const controls = document.createElement("div");
+  controls.className = "controls";
+  controls.append(factors, code, button("Verify", () => action(async () => {
+    try {
+      state.auth = await invoke<AuthView>("verify_mfa", { factorId: state.mfaFactor, code: state.mfaCode });
+      state.mfaCode = "";
+      state.notice = "Signed in. Your nodes are loading.";
+      await refresh();
+    } catch (error) {
+      state.auth = signedOut();
+      state.mfaCode = "";
+      throw error;
+    }
+  }), "primary"), button("Cancel", () => action(async () => {
+    try {
+      await invoke("cancel_login");
+    } finally {
+      state.auth = signedOut();
+      state.mfaCode = "";
+    }
+  }), "quiet"));
+  section.append(controls);
+  main.append(section);
 }
 
 function renderNodes(main: HTMLElement): void {
@@ -187,7 +242,14 @@ function renderLocal(main: HTMLElement): void {
   controls.append(input, button("Set up this computer", () => action(async () => {
     await invoke("init_this_computer", { nodeName: state.nodeName || "Citadel Mac" });
     state.setup = "Registering this computer";
+    state.setupRunning = true;
   }), "primary"));
+  if (state.setupRunning) controls.append(button("Cancel setup", async () => {
+    await invoke("cancel_init");
+    state.setupRunning = false;
+    state.setup = "Node setup cancelled";
+    render();
+  }, "quiet"));
   section.append(controls);
   if (state.setup) section.append(text("p", state.setup, "progress"));
   const service = document.createElement("details");
@@ -248,15 +310,20 @@ function render(): void {
   if (state.auth.signed_in) {
     header.append(text("span", state.auth.email || "Signed in", "account"));
     header.append(button("Sign out", () => action(async () => {
-      await invoke("sign_out");
-      state.auth = { signed_in: false, email: null };
-      state.nodes = [];
-      state.local = null;
+      try {
+        await invoke("sign_out");
+      } finally {
+        state.auth = signedOut();
+        state.nodes = [];
+        state.local = null;
+      }
     }), "quiet"));
   }
   const main = document.createElement("main");
   if (state.notice) main.append(text("p", state.notice, "notice"));
-  if (!state.auth.signed_in) {
+  if (state.auth.mfa_pending) {
+    renderMfa(main);
+  } else if (!state.auth.signed_in) {
     renderWelcome(main);
   } else {
     const intro = document.createElement("div");
@@ -273,14 +340,26 @@ function render(): void {
   app.append(header, main, text("footer", "Citadel runs on your hardware. Your node keeps running when you close this window.", "muted"));
 }
 
-void onOpenUrl((urls) => { for (const url of urls) void acceptCallback(url); });
-void getCurrent().then((urls) => { for (const url of urls ?? []) void acceptCallback(url); });
 void refresh().catch((error) => { state.notice = errorMessage(error); render(); });
 setInterval(() => { if (state.auth.signed_in && !state.busy) void refresh().catch(() => {}); }, 30_000);
 
-import { listen } from "@tauri-apps/api/event";
+void listen<{ view: AuthView | null; error: string | null }>("citadel:auth", (event) => {
+  state.loginStarted = false;
+  if (event.payload.error) {
+    state.notice = event.payload.error;
+  } else if (event.payload.view) {
+    state.auth = event.payload.view;
+    state.notice = state.auth.mfa_pending
+      ? "Confirm this sign in with your authenticator."
+      : "Signed in. Your nodes are loading.";
+    if (state.auth.signed_in) void refresh().catch((error) => { state.notice = errorMessage(error); render(); });
+  }
+  render();
+});
+
 void listen<{ stage: string; message: string }>("citadel:init", (event) => {
   state.setup = event.payload.message;
+  if (["error", "ready", "cancelled"].includes(event.payload.stage)) state.setupRunning = false;
   if (event.payload.stage === "error") state.notice = event.payload.message;
   if (event.payload.stage === "ready") {
     void (async () => {
