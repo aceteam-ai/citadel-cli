@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -34,6 +35,9 @@ import (
 // worker now holds the same lock while it consumes jobs, but reconcile is still
 // wired only in `citadel work`; a future control-center reservation caller
 // must decide how to restore orphaned tags on its own startup.
+// A fine-tune safety hold additionally vetoes reconciliation even after a
+// crashed worker releases that lock: its named trainer may still be running
+// outside the worker process.
 
 // Reservation is the result of a job-scoped GPU VRAM hold (citadel-cli#832).
 type Reservation struct {
@@ -256,12 +260,55 @@ func (h *ServiceHandler) ReserveNamed(ctx JobContext, jobID string, names []stri
 // an operator independently stopped for another reason — an explicit
 // SERVICE_STOP/SERVICE_START clears the tag (see Execute()), which is exactly
 // what makes that service invisible to every future Release call.
+// An active fine-tune safety hold blocks this generic API, even when jobID
+// names another tag. Only the fine-tune worker's verified-termination cleanup
+// API may restore its matching tag while the hold remains.
 func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error) {
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return nil, fmt.Errorf("release: job id is required")
 	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
 
+// ReleaseAfterVerifiedFineTuneTermination is only for the fine-tune worker
+// after its named training container has been confirmed absent (or before a
+// container was ever launched). It permits restoring THIS job's reservation
+// while its durable hold still protects the node from generic/manual release.
+// The worker clears the hold only after canonical terminal persistence.
+func (h *ServiceHandler) ReleaseAfterVerifiedFineTuneTermination(ctx JobContext, jobID string) ([]string, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("fine-tune release: job id is required")
+	}
+	var restored []string
+	err := finetunesafety.WithExclusive(finetunesafety.Dir(h.ConfigDir), func() error {
+		if err := finetunesafety.RequireOwned(h.ConfigDir, jobID); err != nil {
+			return err
+		}
+		var releaseErr error
+		restored, releaseErr = h.releaseReservation(ctx, jobID)
+		return releaseErr
+	})
+	if err != nil {
+		return restored, fmt.Errorf("fine-tune release %s: %w", jobID, err)
+	}
+	return restored, nil
+}
+
+func (h *ServiceHandler) releaseReservation(ctx JobContext, jobID string) ([]string, error) {
 	manifest, err := h.loadManifest()
 	if err != nil {
 		return nil, fmt.Errorf("release %s: failed to load manifest: %w", jobID, err)
@@ -346,12 +393,24 @@ func (h *ServiceHandler) Release(ctx JobContext, jobID string) ([]string, error)
 // must decide whether and when to call it after taking the lock, before jobs
 // can create new reservations. Local CLI/MCP reservation calls do not hold this
 // worker lock and remain a separate ownership consideration.
+// A previous worker's fine-tune container can outlive its process and lock, so
+// an active fine-tune safety hold independently vetoes ALL reconciliation
+// before any tag is released or service restarted. Only verified trainer
+// termination, reservation restore, and canonical status persistence can
+// remove that hold; startup must never infer cleanup from a stale lock or an
+// absent worker.
 //
 // Idempotent: a service already restored (tag cleared) is not visited again,
 // so calling this twice restores nothing the second time — see Release.
 func (h *ServiceHandler) ReconcileOrphanedReservations(ctx JobContext, holdsWorkerLock bool) ([]string, error) {
 	if !holdsWorkerLock {
 		return nil, fmt.Errorf("reconcile reservations: refusing to run without the node's single-instance worker lock (internal/worklock) -- see cmd/work.go's runWork for the only safe call site")
+	}
+	// Check before reading or acting on ANY job tag. A hold can survive a worker
+	// crash while the trainer container remains alive, so even other tagged jobs
+	// must wait for explicit recovery rather than risk a GPU service restart.
+	if err := finetunesafety.RequireAbsent(h.ConfigDir); err != nil {
+		return nil, fmt.Errorf("reconcile reservations: %w", err)
 	}
 
 	manifest, err := h.loadManifest()

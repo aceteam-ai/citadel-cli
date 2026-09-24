@@ -21,19 +21,17 @@
 // after acquiring internal/worklock, before its consume loop starts -- so a
 // CLI/MCP process that dies mid-exclusive-run does not strand evicted
 // services forever; the NEXT `citadel work` boot on this node restores them.
-// But reservation.go's own doc comment (ReconcileOrphanedReservations, see
-// "IMPORTANT" paragraph) names EXACTLY this shape as the hazard it warns
-// about: "any tag found here is orphaned" is only true when nothing else is
-// still using the reservation, and neither this CLI/MCP process NOR the
-// control-center TUI's consume loop holds worklock. A `citadel work` that
+// But "any tag found here is orphaned" is only true when nothing else is
+// still using the reservation, and this standalone CLI/MCP process does not
+// hold worklock (the control-center TUI's consume loop does). A `citadel work` that
 // boots WHILE an exclusive run/deploy from this file is still legitimately
 // in progress will conclude the tag is orphaned and restart the evicted
 // peers out from under it. This is a real, live race on any node that might
 // also run `citadel work` (or the control-center) concurrently with a
 // standalone exclusive run -- not merely a latent one closed off by this
 // design. Closing it needs owner identity on the marker (pid + start time,
-// mirroring worklock's own stale-lock classification) or making every
-// job-consuming path acquire worklock; both are deferred, tracked follow-up
+// mirroring worklock's own stale-lock classification) or making these local
+// reservation callers acquire worklock; both are deferred, tracked follow-up
 // work, not solved here. `citadel module reservations release <jobID>`
 // (cmd/module_reservations.go) is the operator escape hatch if this race (or
 // any other stuck reservation) needs a manual out.

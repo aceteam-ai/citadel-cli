@@ -2082,7 +2082,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// only) and lets the real worker own all job consumption.
 	//
 	// Hold this lease through runner and updater shutdown, so a later work
-	// invocation cannot become a second consumer or automatic installer.
+	// invocation cannot become a second consumer, automatic installer, or
+	// reservation reconciler while a fine-tune job is active here.
 	ccWorkerLock, workerHeld, workerPID, err := acquireControlCenterWorkerLock(network.GetStateDir(),
 		func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) })
 	if err != nil {

@@ -8,7 +8,38 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 )
+
+func TestFineTuneHoldCannotArmDuringReservationRelease(t *testing.T) {
+	cfg, job, _, _ := fineTuneFixture(t)
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	guardDone := make(chan error, 1)
+	go func() {
+		guardDone <- finetunesafety.WithExclusive(cfg.SafetyDir, func() error {
+			close(entered)
+			<-unblock
+			return nil
+		})
+	}()
+	<-entered
+	h := NewFineTuneHandler(cfg)
+	if err := h.armSafetyHold(job.ID); err == nil {
+		t.Fatal("trainer hold armed while generic reservation release lock was held")
+	}
+	if _, err := os.Lstat(filepath.Join(cfg.SafetyDir, fineTuneSafetyHold)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe hold created during concurrent release: %v", err)
+	}
+	close(unblock)
+	if err := <-guardDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := h.armSafetyHold(job.ID); err != nil {
+		t.Fatalf("hold after release completes: %v", err)
+	}
+}
 
 type fineTuneYieldSource struct {
 	*MockJobSource

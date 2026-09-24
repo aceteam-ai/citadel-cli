@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 )
 
-const fineTuneSafetyHold = "active.hold"
+const fineTuneSafetyHold = finetunesafety.HoldFile
 
 func (h *FineTuneHandler) safetyHoldPath() (string, error) {
 	if h.cfg.SafetyDir == "" {
@@ -27,28 +29,27 @@ func (h *FineTuneHandler) armSafetyHold(jobID string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(h.cfg.SafetyDir, 0700); err != nil {
-		return err
-	}
-	if err := syncFineTuneSafetyDir(filepath.Dir(h.cfg.SafetyDir)); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(jobID + "\n"); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return syncFineTuneSafetyDir(h.cfg.SafetyDir)
+	return finetunesafety.WithExclusive(h.cfg.SafetyDir, func() error {
+		if err := syncFineTuneSafetyDir(filepath.Dir(h.cfg.SafetyDir)); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return err
+		}
+		if _, err := f.WriteString(jobID + "\n"); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return syncFineTuneSafetyDir(h.cfg.SafetyDir)
+	})
 }
 
 func (h *FineTuneHandler) clearSafetyHold(jobID string) error {
