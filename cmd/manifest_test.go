@@ -654,8 +654,8 @@ func TestFindOrCreateManifestNoPointerBootstrapsDefault(t *testing.T) {
 	if err != nil || dir != filepath.Join(home, "citadel-node") {
 		t.Fatalf("fresh node dir = %q, %v", dir, err)
 	}
-	if err := withLocalServiceMutationLock(dir, func() error {
-		_, createdDir, err := findOrCreateManifest()
+	if err := withLocalServiceMutationLockSource(dir, func(source nodeDirSource) error {
+		_, createdDir, err := findOrCreateManifestLockedAt(dir, source)
 		if err != nil {
 			return err
 		}

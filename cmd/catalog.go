@@ -462,8 +462,8 @@ func runCatalogInstall(cmd *cobra.Command, args []string) error {
 	// --no-harden escape hatch, so untrusted community installs are always
 	// hardened (the safe default for the primary untrusted surface).
 	var result *catalog.InstallResult
-	err = withLocalServiceMutationLock(configDir, func() error {
-		manifest, _, manifestErr := findOrCreateManifest()
+	err = withLocalServiceMutationLockSource(configDir, func(source nodeDirSource) error {
+		manifest, _, manifestErr := findOrCreateManifestLockedAt(configDir, source)
 		if manifestErr != nil {
 			return manifestErr
 		}

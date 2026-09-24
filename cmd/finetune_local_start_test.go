@@ -395,8 +395,8 @@ func TestFineTuneConfiguredNodeManifestFailureNeverFallsBack(t *testing.T) {
 			if err := ops.Install(context.Background(), reconcile.ModuleAssignment{Source: "vllm"}); err == nil {
 				t.Fatal("MODULE_SET install admitted without a usable configured manifest")
 			}
-			if err := withLocalServiceMutationLock(resolved, func() error {
-				_, _, err := findOrCreateManifest()
+			if err := withLocalServiceMutationLockSource(resolved, func(source nodeDirSource) error {
+				_, _, err := findOrCreateManifestLockedAt(resolved, source)
 				return err
 			}); err == nil {
 				t.Fatal("CLI/TUI install bootstrap admitted without a usable configured manifest")
@@ -424,6 +424,108 @@ func TestFineTuneConfiguredNodeManifestFailureNeverFallsBack(t *testing.T) {
 				t.Fatalf("configured manifest changed: %q, %v", got, err)
 			}
 		})
+	}
+}
+
+func TestFineTunePointerRetargetCannotInterleaveWithCapturedNodeStart(t *testing.T) {
+	for _, writer := range []struct {
+		name string
+		flip func(string, string) error
+	}{
+		{"global pointer writer", func(path, target string) error { return writeGlobalConfigFile(path, target) }},
+		{"init scaffold writer", func(path, target string) error { return ensureNodeScaffoldAt(target, "held-b", path) }},
+	} {
+		t.Run(writer.name, func(t *testing.T) {
+			a := writeManifestWithServices(t, nil)
+			b := filepath.Join(os.Getenv("HOME"), "held-b")
+			pointer := filepath.Join(os.Getenv("HOME"), ".citadel-cli", "config.yaml")
+			if err := os.MkdirAll(finetunesafety.Dir(b), 0700); err != nil {
+				t.Fatal(err)
+			}
+			hold := []byte("train-job\n")
+			if err := os.WriteFile(finetunesafety.Path(b), hold, 0600); err != nil {
+				t.Fatal(err)
+			}
+			beforePointer, _ := os.ReadFile(pointer)
+			beforeA, _ := os.ReadFile(filepath.Join(a, "citadel.yaml"))
+			resolved, err := localServiceConfigDir()
+			if err != nil || resolved != a {
+				t.Fatalf("captured A = %q, %v", resolved, err)
+			}
+			started := false
+			// afterLock executes after jobs acquired A's reservation.lock but
+			// before any manifest/compose/status mutation or start callback.
+			err = withLocalServiceStartGuardAfterLock(a, "vllm", func() error {
+				return writer.flip(pointer, b)
+			}, func(source nodeDirSource) error {
+				return runSingleServiceApplyLocked(a, source, "vllm", func(string, string) error { started = true; return nil })
+			})
+			if err == nil || started {
+				t.Fatalf("pointer flip under A lock admitted start: started=%t err=%v", started, err)
+			}
+			if got, _ := os.ReadFile(pointer); string(got) != string(beforePointer) {
+				t.Fatalf("pointer changed: %q", got)
+			}
+			if got, _ := os.ReadFile(filepath.Join(a, "citadel.yaml")); string(got) != string(beforeA) {
+				t.Fatalf("A manifest changed: %q", got)
+			}
+			for _, path := range []string{filepath.Join(a, "services", "vllm.yml"), filepath.Join(b, "citadel.yaml"), filepath.Join(b, "services", "vllm.yml")} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("unexpected mutation at %s: %v", path, err)
+				}
+			}
+			if got, _ := os.ReadFile(finetunesafety.Path(b)); string(got) != string(hold) {
+				t.Fatalf("B hold changed: %q", got)
+			}
+		})
+	}
+}
+
+func TestFineTunePointerFlipBeforeAdmissionRefusesAndAtStartIsSerialized(t *testing.T) {
+	a := writeManifestWithServices(t, nil)
+	b := filepath.Join(os.Getenv("HOME"), "held-b")
+	pointer := filepath.Join(os.Getenv("HOME"), ".citadel-cli", "config.yaml")
+	if err := os.MkdirAll(finetunesafety.Dir(b), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(b), []byte("train-job\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entered, finish := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runSingleServiceApply(a, "vllm", func(string, string) error {
+			close(entered)
+			<-finish
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("start callback not reached")
+	}
+	if err := writeGlobalConfigFile(pointer, b); err == nil {
+		t.Fatal("pointer retargeted while A start callback was active")
+	}
+	if dir, err := localServiceConfigDir(); err != nil || dir != a {
+		t.Fatalf("pointer moved during start: %q, %v", dir, err)
+	}
+	close(finish)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("start did not finish")
+	}
+	if err := writeGlobalConfigFile(pointer, b); err != nil {
+		t.Fatalf("pointer writer did not recover after start: %v", err)
+	}
+	started := false
+	if err := runSingleServiceApply(a, "vllm", func(string, string) error { started = true; return nil }); err == nil || started {
+		t.Fatalf("stale captured A admitted after pointer changed to held B: started=%t err=%v", started, err)
 	}
 }
 

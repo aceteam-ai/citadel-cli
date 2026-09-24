@@ -667,7 +667,13 @@ func realLocalReservationOps() localReservationOps {
 					return nil, "", "", fmt.Errorf("pull model %q for %q: %w", model, serviceName, pullErr)
 				}
 			}
-			res, out, startErr := h.StartExclusiveWithModel(jctx, jobID, serviceName, model, requiredVRAMBytes, budgeted)
+			var res *jobs.Reservation
+			var out []byte
+			startErr := withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var err error
+				res, out, err = h.StartExclusiveWithModel(jctx, jobID, serviceName, model, requiredVRAMBytes, budgeted)
+				return err
+			})
 			if res == nil {
 				return nil, "", string(out), startErr
 			}
@@ -684,7 +690,12 @@ func realLocalReservationOps() localReservationOps {
 					return "", fmt.Errorf("pull model %q for %q: %w", model, serviceName, pullErr)
 				}
 			}
-			out, startErr := h.StartServiceWithModel(jctx, serviceName, model, requiredVRAMBytes)
+			var out []byte
+			startErr := withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var err error
+				out, err = h.StartServiceWithModel(jctx, serviceName, model, requiredVRAMBytes)
+				return err
+			})
 			if startErr != nil {
 				return "", startErr
 			}
@@ -695,7 +706,13 @@ func realLocalReservationOps() localReservationOps {
 			if err != nil {
 				return nil, err
 			}
-			return h.Release(jctx, jobID)
+			var restored []string
+			err = withCanonicalNodePointerLock(h.ConfigDir, func(nodeDirSource) error {
+				var releaseErr error
+				restored, releaseErr = h.Release(jctx, jobID)
+				return releaseErr
+			})
+			return restored, err
 		},
 		hasActiveReservation: func(jobID string) (bool, error) {
 			h, err := resolve()

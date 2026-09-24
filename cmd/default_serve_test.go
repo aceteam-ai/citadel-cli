@@ -67,6 +67,30 @@ func TestResolveDefaultServe_NilManifest(t *testing.T) {
 	}
 }
 
+func TestRealDefaultServeCallbackRefusesRetargetedHeldNode(t *testing.T) {
+	a := writeManifestWithServices(t, nil)
+	b := filepath.Join(os.Getenv("HOME"), "held-default-serve")
+	if err := os.MkdirAll(finetunesafety.Dir(b), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finetunesafety.Path(b), []byte("train-job\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGlobalConfigFile(filepath.Join(platform.ConfigDir(), "config.yaml"), b); err != nil {
+		t.Fatal(err)
+	}
+	deps := realDefaultServeDeps(jobs.NewServiceHandler(a))
+	if err := deps.executeServiceStart("vllm", "some-model"); err == nil {
+		t.Fatal("production default-serve callback followed stale node A after pointer moved to held B")
+	}
+	if _, err := os.Stat(filepath.Join(a, "services", "vllm.yml")); !os.IsNotExist(err) {
+		t.Fatalf("stale node A compose materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(b, "citadel.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("held node B manifest materialized: %v", err)
+	}
+}
+
 // TestBlankNodeCheckForDefaultServe_ManifestServiceBlocks verifies a manifest
 // entry naming any candidate serving engine is treated as "not blank",
 // regardless of the on-disk cache state.

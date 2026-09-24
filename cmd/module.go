@@ -205,8 +205,8 @@ func runModuleInstall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to resolve configuration: %w", err)
 	}
-	return withLocalServiceMutationLock(configDir, func() error {
-		nodeManifest, _, err := findOrCreateManifest()
+	return withLocalServiceMutationLockSource(configDir, func(source nodeDirSource) error {
+		nodeManifest, _, err := findOrCreateManifestLockedAt(configDir, source)
 		if err != nil {
 			return fmt.Errorf("failed to initialize configuration: %w", err)
 		}
@@ -788,8 +788,8 @@ func buildModuleInstallCallbacks() controlcenter.ModuleInstallCallbacks {
 			// shared core, matching the CLI path. Catalog/trusted run as-is.
 			untrusted := !catalog.IsTrusted(src)
 			var installedName string
-			err = withLocalServiceMutationLock(configDir, func() error {
-				nodeManifest, _, manifestErr := findOrCreateManifest()
+			err = withLocalServiceMutationLockSource(configDir, func(source nodeDirSource) error {
+				nodeManifest, _, manifestErr := findOrCreateManifestLockedAt(configDir, source)
 				if manifestErr != nil {
 					return manifestErr
 				}
