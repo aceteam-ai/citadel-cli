@@ -141,9 +141,9 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		reservations:    cfg.Reservations,
 		laneActivity:    cfg.LaneActivity,
 		pairingDisplay:  cfg.PairingDisplay,
-	cacheReport:     cfg.CacheReport,
-	jobTypes:        cfg.JobTypes,
-	permissions:     cfg.PermissionsProvider,
+		cacheReport:     cfg.CacheReport,
+		jobTypes:        cfg.JobTypes,
+		permissions:     cfg.PermissionsProvider,
 	}
 }
 
