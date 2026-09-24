@@ -3410,6 +3410,23 @@ process — swapping the on-disk binary there does nothing to the already-runnin
 managed worker, which keeps executing the pre-swap code indefinitely
 (citadel#454's split-brain incident).
 
+**Updater drain ownership (citadel-cli#1133):** `Runner.Drain()` is permanent
+for shutdown and remote `AGENT_UPDATE`. The periodic updater instead calls
+`Runner.BeginDrain()` through `cmd/work.go` and owns the returned release
+function. `AutoUpdater.runOnce` releases that scope after idle timeout,
+cancellation, apply failure, or restart failure; on a successful restart it
+keeps the scope until process replacement. Runner serializes drain acquisition
+with claim processing and cancels an in-progress source poll before a drain
+call returns, so no new claim begins while the updater owns its scope. A
+separate permanent drain or another scope remains effective when one scope
+is released. `Runner.ActiveJobs()` also counts the gap between claim and
+dispatch, plus a job returned by a poll cancelled at drain acquisition. The
+updater cannot observe false idle while it owns a source-claimed job. The
+control-center worker has no periodic updater; its shared remote-update
+handler keeps the permanent drain. External-engine `MODULE_SET` also owns a
+separate `BeginDrain()` scope: its failed re-exec path releases only that
+scope after rollback, rather than clearing a concurrent permanent drain.
+
 **`service.ActiveManagedUnit`** (`internal/service/detect.go`, Linux; a no-op
 stub on `!linux`) is the authority for "is a managed citadel service running
 **on this host**", not "is *this process* service-managed". It scans the

@@ -2718,7 +2718,7 @@ func runWork(cmd *cobra.Command, args []string) {
 			Interval:   interval,
 			Enabled:    resolveAutoUpdateEnabled,
 			ActiveJobs: runner.ActiveJobs,
-			Drain:      func() { runner.Drain() },
+			BeginDrain: runner.BeginDrain,
 			Log: func(format string, args ...any) {
 				fmt.Printf("   - "+format+"\n", args...)
 			},
