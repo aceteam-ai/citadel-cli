@@ -664,7 +664,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// ordering guarantee if you touch this again.
 		if workerLockHeld {
 			reconcileCtx := jobs.JobContext{LogFn: func(_ string, msg string) { Log("%s", msg) }}
-			if restored, err := reservationHandler.ReconcileOrphanedReservations(reconcileCtx, workerLockHeld); err != nil {
+			if restored, err := reconcileStartupReservations(reservationHandler, reconcileCtx, workerLockHeld); err != nil {
 				fmt.Fprintf(os.Stderr, "   - Warning: reservation reconcile: %v\n", err)
 			} else if len(restored) > 0 {
 				fmt.Printf("   - Restored %d service(s) from an orphaned GPU reservation: %s\n", len(restored), strings.Join(restored, ", "))

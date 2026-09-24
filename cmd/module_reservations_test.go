@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
 
 // TestModuleReservationsListDisplaysActiveReservations exercises the real
@@ -109,6 +110,78 @@ func TestModuleReservationsReleaseRefusesFineTuneSafetyHold(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(configDir, "citadel.yaml"))
 	if err != nil || !strings.Contains(string(data), "evicted_by_job: train-job") {
 		t.Fatalf("manual release changed held reservation: %s, %v", data, err)
+	}
+}
+
+func TestCapturedManualAndStartupRestoreRefuseRetargetedHeldNode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*jobs.ServiceHandler) ([]string, error)
+	}{
+		{"manual release", func(h *jobs.ServiceHandler) ([]string, error) {
+			return releaseManualReservation(h, jobs.JobContext{}, "exclusive:bonsai")
+		}},
+		{"startup reconcile", func(h *jobs.ServiceHandler) ([]string, error) {
+			return reconcileStartupReservations(h, jobs.JobContext{}, true)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := writeManifestWithServices(t, []Service{{Name: "unlimited-ocr", ComposeFile: "services/unlimited-ocr.yml", DesiredStatus: "stopped", EvictedByJob: "exclusive:bonsai"}})
+			b := filepath.Join(os.Getenv("HOME"), "held-b")
+			if err := os.MkdirAll(finetunesafety.Dir(b), 0700); err != nil {
+				t.Fatal(err)
+			}
+			hold := []byte("train-job\n")
+			if err := os.WriteFile(finetunesafety.Path(b), hold, 0600); err != nil {
+				t.Fatal(err)
+			}
+			manifestBefore, err := os.ReadFile(filepath.Join(a, "citadel.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := jobs.NewServiceHandler(a) // captured before A→B retarget
+			pointer := filepath.Join(os.Getenv("HOME"), ".citadel-cli", "config.yaml")
+			if err := writeGlobalConfigFile(pointer, b); err != nil {
+				t.Fatal(err)
+			}
+			pointerBefore, err := os.ReadFile(pointer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := tc.run(h)
+			if err == nil || !strings.Contains(err.Error(), "node configuration changed") || len(restored) != 0 {
+				t.Fatalf("stale A restoration = %v, %v; want fail-closed", restored, err)
+			}
+			if got, _ := os.ReadFile(filepath.Join(a, "citadel.yaml")); string(got) != string(manifestBefore) {
+				t.Fatalf("A reservation tag/status mutated: %q", got)
+			}
+			if got, _ := os.ReadFile(pointer); string(got) != string(pointerBefore) {
+				t.Fatalf("pointer mutated during refused restoration: %q", got)
+			}
+			if got, _ := os.ReadFile(finetunesafety.Path(b)); string(got) != string(hold) {
+				t.Fatalf("B hold mutated: %q", got)
+			}
+			if _, err := os.Stat(filepath.Join(b, "citadel.yaml")); !os.IsNotExist(err) {
+				t.Fatalf("B manifest created: %v", err)
+			}
+		})
+	}
+}
+
+func TestCapturedRestoreBlocksPointerWriterDuringCallback(t *testing.T) {
+	a := writeManifestWithServices(t, nil)
+	b := filepath.Join(os.Getenv("HOME"), "held-b")
+	pointer := filepath.Join(os.Getenv("HOME"), ".citadel-cli", "config.yaml")
+	called := false
+	_, err := withCapturedNodeRestore(a, func() ([]string, error) {
+		called = true
+		return nil, writeGlobalConfigFile(pointer, b)
+	})
+	if !called || err == nil {
+		t.Fatalf("in-flight pointer retarget = called %t, err %v; want lock refusal", called, err)
+	}
+	if dir, err := localServiceConfigDir(); err != nil || dir != a {
+		t.Fatalf("pointer moved during restore callback: %q, %v", dir, err)
 	}
 }
 
