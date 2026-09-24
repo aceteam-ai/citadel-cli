@@ -20,6 +20,7 @@ var workerControlReserveMu sync.Mutex
 // WorkerControlConfig supplies the trusted node identity and the existing
 // service-manager restart mechanism. StateDir must survive process restarts.
 type WorkerControlConfig struct {
+	OrgID    string
 	NodeID   string
 	StateDir string
 	Managed  func() bool
@@ -60,7 +61,7 @@ func (h *WorkerControlHandler) Execute(_ context.Context, job *Job, _ StreamWrit
 	if job.Source != "redis" && job.Source != "redis-api" {
 		return h.reject("invalid_source", "WORKER_CONTROL requires a Redis job source")
 	}
-	if h.cfg.NodeID == "" || !workerControlQueueMatches(job.SourceQueue, h.cfg.NodeID) {
+	if !workerControlQueueMatches(job.SourceQueue, h.cfg.OrgID, h.cfg.NodeID) {
 		return h.reject("invalid_queue", "WORKER_CONTROL requires this node's per-node queue")
 	}
 	if len(job.Payload) == 0 {
@@ -173,11 +174,9 @@ func recentWorkerControlMarker(dir, own string) (bool, error) {
 	return false, nil
 }
 
-func workerControlQueueMatches(queue, nodeID string) bool {
-	parts := strings.Split(queue, ":")
-	return len(parts) == 6 && parts[0] == "jobs" && parts[1] == "v1" &&
-		parts[2] == "shell" && strings.HasPrefix(parts[3], "org_") &&
-		len(parts[3]) > len("org_") && parts[4] == "node" && parts[5] == nodeID
+func workerControlQueueMatches(queue, orgID, nodeID string) bool {
+	return orgID != "" && nodeID != "" &&
+		queue == fmt.Sprintf("jobs:v1:shell:org_%s:node:%s", orgID, nodeID)
 }
 
 func (h *WorkerControlHandler) marker(jobID, suffix string) (string, error) {

@@ -15,6 +15,8 @@ import (
 // "node vX has no handler", the exact bug this change removes.
 func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 	opts := nodeJobHandlerOpts{
+		OrgID:        "example",
+		NodeID:       "758",
 		WorkspaceDir: t.TempDir(),
 		// A fresh node has no persisted shell opt-in, so the production callers
 		// pass ShellDisabled=true. Keep this fixture aligned with that default-deny

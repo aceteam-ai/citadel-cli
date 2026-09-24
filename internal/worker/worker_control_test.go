@@ -69,7 +69,7 @@ func testSchedule(afterCommit func()) func() (func(), func(), error) {
 
 func TestWorkerControlAcksAndPublishesBeforeActualRestart(t *testing.T) {
 	events := []string{}
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { events = append(events, "restart") })})
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { events = append(events, "restart") })})
 	job := controlJob("restart-1")
 	got, result, ok := runControl(t, h, job, nil, nil, &events)
 	if !ok || result["accepted"] != true || result["restarting"] != true || !reflect.DeepEqual(got, []string{"ack", "result", "restart"}) {
@@ -83,7 +83,7 @@ func TestWorkerControlAcksAndPublishesBeforeActualRestart(t *testing.T) {
 }
 
 func TestWorkerControlRejectsMalformedControls(t *testing.T) {
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { t.Fatal("unexpected restart") })})
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { t.Fatal("unexpected restart") })})
 	cases := []struct {
 		name string
 		edit func(*Job)
@@ -93,6 +93,7 @@ func TestWorkerControlRejectsMalformedControls(t *testing.T) {
 		{"wrong target", func(j *Job) { j.Payload["target_node"] = "759" }},
 		{"malformed target", func(j *Job) { j.Payload["target_node"] = 758 }},
 		{"wrong queue", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_example:node:759" }},
+		{"wrong organization, same node", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_other:node:758" }},
 		{"shared queue", func(j *Job) { j.SourceQueue = "jobs:v1:shell:org_example" }},
 		{"non redis", func(j *Job) { j.Source = "nexus" }},
 		{"unknown field", func(j *Job) { j.Payload["command"] = "reboot" }},
@@ -112,9 +113,21 @@ func TestWorkerControlRejectsMalformedControls(t *testing.T) {
 	}
 }
 
+func TestWorkerControlMissingConfiguredOrgRefusesBeforeScheduling(t *testing.T) {
+	h := NewWorkerControlHandler(WorkerControlConfig{
+		NodeID: "758", StateDir: t.TempDir(),
+		Managed:  func() bool { return true },
+		Schedule: testSchedule(func() { t.Fatal("unexpected restart") }),
+	})
+	_, result, ok := runControl(t, h, controlJob("missing-org"), nil, nil, nil)
+	if !ok || result["accepted"] != false || result["code"] != "invalid_queue" {
+		t.Fatalf("missing configured org: result=%v ok=%v", result, ok)
+	}
+}
+
 func TestWorkerControlDuplicateAndCooldownNeverScheduleTwice(t *testing.T) {
 	count := 0
-	cfg := WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { count++ })}
+	cfg := WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { count++ })}
 	for i, id := range []string{"same-job", "same-job", "other-job"} {
 		_, result, ok := runControl(t, NewWorkerControlHandler(cfg), controlJob(id), nil, nil, nil)
 		if !ok {
@@ -137,7 +150,7 @@ func TestWorkerControlDuplicateAndCooldownNeverScheduleTwice(t *testing.T) {
 
 func TestWorkerControlAckFailureNeverPublishesAcceptance(t *testing.T) {
 	count := 0
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { count++ })})
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { count++ })})
 	job := controlJob("ack-failed")
 	events, result, ok := runControl(t, h, job, nil, errors.New("ack unavailable"), nil)
 	if ok || result["accepted"] != false || result["restarting"] != false || result["code"] != "ack_failed" || count != 0 || !reflect.DeepEqual(events, []string{"ack", "result"}) {
@@ -159,7 +172,7 @@ func TestWorkerControlSchedulingFailureDoesNotAcceptOrTombstone(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stateDir := t.TempDir()
-			h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: stateDir, Managed: func() bool { return true }, Schedule: tc.schedule})
+			h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: stateDir, Managed: func() bool { return true }, Schedule: tc.schedule})
 			job := controlJob("schedule-failed")
 			events, result, ok := runControl(t, h, job, nil, nil, nil)
 			if ok || result["accepted"] != false || result["restarting"] != false || result["code"] != "schedule_failed" || !reflect.DeepEqual(events, []string{"ack", "result"}) {
@@ -170,7 +183,7 @@ func TestWorkerControlSchedulingFailureDoesNotAcceptOrTombstone(t *testing.T) {
 			} else if _, err := os.Stat(fired); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("fired marker survived schedule failure: %v", err)
 			}
-			good := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: stateDir, Managed: func() bool { return true }, Schedule: testSchedule(func() {})})
+			good := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: stateDir, Managed: func() bool { return true }, Schedule: testSchedule(func() {})})
 			_, next, ok := runControl(t, good, controlJob("new-job"), nil, nil, nil)
 			if !ok || next["accepted"] != true {
 				t.Fatalf("fresh retry result=%v ok=%v", next, ok)
@@ -181,7 +194,7 @@ func TestWorkerControlSchedulingFailureDoesNotAcceptOrTombstone(t *testing.T) {
 
 func TestWorkerControlPublishFailureKeepsPreparedRestart(t *testing.T) {
 	count, cancelled := 0, 0
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: func() (func(), func(), error) { return func() { count++ }, func() { cancelled++ }, nil }})
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: func() (func(), func(), error) { return func() { count++ }, func() { cancelled++ }, nil }})
 	job := controlJob("publish-failed")
 	_, result, ok := runControl(t, h, job, errors.New("publish unavailable"), nil, nil)
 	if ok || result != nil || count != 1 || cancelled != 0 {
@@ -207,7 +220,7 @@ func (w *uncertainControlWriter) WriteEnd(result map[string]any) error {
 func TestWorkerControlDeliveredAcceptanceStillRestartsWhenPublishReportsError(t *testing.T) {
 	events := []string{}
 	restarted := 0
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { restarted++ })})
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true }, Schedule: testSchedule(func() { restarted++ })})
 	source := &controlSource{MockJobSource: NewMockJobSource("redis", nil), events: &events}
 	writer := &uncertainControlWriter{controlWriter: controlWriter{events: &events}}
 	runner := NewRunner(source, []JobHandler{h}, RunnerConfig{NodeID: "758", State: NewWorkerState()})
@@ -225,7 +238,7 @@ func TestWorkerControlDeliveredAcceptanceStillRestartsWhenPublishReportsError(t 
 
 func TestWorkerControlSchedulerErrorCancelsPreparedWork(t *testing.T) {
 	cancelled := 0
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
 		Schedule: func() (func(), func(), error) {
 			return nil, func() { cancelled++ }, errors.New("prepare failed")
 		}})
@@ -245,7 +258,7 @@ func TestWorkerControlBlockedAccountingCannotDelayAcceptedRestart(t *testing.T) 
 			close(release)
 		}
 	}()
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
 		Schedule: testSchedule(func() { close(restarted) })})
 	events := []string{}
 	source := &controlSource{MockJobSource: NewMockJobSource("redis", nil), events: &events}
@@ -278,7 +291,7 @@ func TestWorkerControlBlockedAccountingCannotDelayAcceptedRestart(t *testing.T) 
 
 func TestWorkerControlPanickingAccountingCannotPreventAcceptedRestart(t *testing.T) {
 	restarted := false
-	h := NewWorkerControlHandler(WorkerControlConfig{NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
+	h := NewWorkerControlHandler(WorkerControlConfig{OrgID: "example", NodeID: "758", StateDir: t.TempDir(), Managed: func() bool { return true },
 		Schedule: testSchedule(func() { restarted = true })})
 	events := []string{}
 	source := &controlSource{MockJobSource: NewMockJobSource("redis", nil), events: &events}

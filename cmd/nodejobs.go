@@ -160,6 +160,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 // runner's Drain/ActiveJobs to drain in-flight work before a self-restart.
 func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandlerOpts) {
 	runner.RegisterHandler(worker.NewWorkerControlHandler(worker.WorkerControlConfig{
+		OrgID:    opts.OrgID,
 		NodeID:   opts.NodeID,
 		StateDir: opts.PermissionsDir,
 		Managed:  managedByServiceManager,
